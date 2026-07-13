@@ -19,7 +19,19 @@ void main() {
     }
 
     const uint q_idx = 8*il;
+
+#ifdef DEQUANT_TRANSPOSE
+    // fused dequant+transpose for FA quant-KV: per-head-contiguous f16 scratch (see dequant_q8_0.comp)
+    const uint HS = p.M, NH = p.K, KVn = p.stride_a;
+    const uint e0 = ib * 32;
+    const uint b_idx = (e0 % HS)
+                     + ((e0 / (HS * NH)) % KVn) * HS
+                     + ((e0 / HS) % NH) * (HS * KVn)
+                     + (e0 / (HS * NH * KVn)) * (HS * KVn * NH)
+                     + q_idx;
+#else
     const uint b_idx = 1024*i + 32*ir + q_idx;
+#endif
 
     const float d = float(data_a[ib].d);
 
