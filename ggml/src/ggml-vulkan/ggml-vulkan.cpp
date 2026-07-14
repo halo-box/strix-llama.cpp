@@ -8314,6 +8314,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 #else
     const bool y_decode_vector_staging = false;
 #endif
+    // EXPERIMENT (GGML_VK_MMID_F16B=1): route quantized MUL_MAT_ID through the f16-B
+    // kernels. Treating contiguous f32 B as y_non_contig reuses the existing
+    // convert-to-prealloc_y plumbing (to_fp16_vk_1), exactly like coopmat2 does.
+    // Gated on coopmat_support because the f16b pipelines are only created there.
+    const bool mmid_f16b = ggml_vk_mmid_f16b_enabled() &&
+                           ctx->device->coopmat_support && !ctx->device->coopmat2 &&
+                           ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
+    if (mmid_f16b) {
+        static bool mmid_f16b_logged = false;
+        if (!mmid_f16b_logged) {
+            mmid_f16b_logged = true;
+            fprintf(stderr, "ggml_vulkan: MUL_MAT_ID f16-B path engaged (GGML_VK_MMID_F16B)\n");
+        }
+    }
+
     const bool y_non_contig = y_decode_vector_staging ||
                               (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               // Intel coopmat1: force f32->f16 conversion so the f16 B-type quant pipeline is used.

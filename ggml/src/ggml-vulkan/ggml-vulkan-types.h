@@ -820,6 +820,10 @@ struct vk_device_struct {
     matmul_tile_selector_t matmul_tile_selector;
     matmul_tile_selector_t matmul_id_tile_selector;
 
+    // EXPERIMENT (GGML_VK_MMID_F16B=1): f16-B mul_mat_id pipelines on KHR_coopmat
+    // devices (upstream only builds f32-B there). Populated only when the env flag
+    // is set; empty otherwise.
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_COUNT];
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
 
@@ -1456,6 +1460,18 @@ struct CompileTask {
     bool require_full_subgroups;
     uint32_t required_subgroup_size;
 };
+// EXPERIMENT (GGML_VK_MMID_F16B=1): convert the contiguous f32 activations (B) of
+// quantized MUL_MAT_ID to f16 and run the f16-B matmul_id kernels instead of the
+// f32-B ones. Halves B bytes and buf_b shared memory (better occupancy) at the
+// f32->f16 rounding cost upstream already accepts on the coopmat2 path.
+static bool ggml_vk_mmid_f16b_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_VK_MMID_F16B");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 
 struct ggml_vk_debug_label {
     // at most one of these is set, depending on the scope the label was opened in
