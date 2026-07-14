@@ -4857,6 +4857,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         auto s_mmq_wg_denoms_id16 = s_mmq_wg_denoms;
         auto m_warptile_mmq_id128 = m_warptile_mmq;
         auto m_mmq_wg_denoms_id128 = m_mmq_wg_denoms;
+        auto l_warptile_mmq_idw = l_warptile_mmq;
+        uint32_t mmid_req_sgs = 0;
         {
             const char * tile16_env = getenv("GGML_VK_MMID_TILE16");
             if (tile16_env && atoi(tile16_env) != 0) {
@@ -4881,12 +4883,68 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 m_warptile_mmq_id128[1] = 128;  // BM
                 m_mmq_wg_denoms_id128[0] = 128;
             }
+            // GGML_VK_MMID_WAVE32=1: force required subgroup size 32 on the mmid
+            // quant coopmat pipelines (RDNA3.x WMMA is wave32-native; probe whether
+            // RADV lowers KHR_coopmat better at wave32). The cm1 path derives its
+            // warp grid from the real subgroup (warp_i = gl_SubgroupID, tiw =
+            // gl_SubgroupInvocationID) and sizes shared arrays (coopmat_stage,
+            // ballots_sh) with NUM_WARPS = BLOCK_SIZE / WARP, so the WARP spec
+            // constant must equal the forced size, and the coverage invariant
+            // NUM_WARPS == (BM/WM)*(BN/WN) must be restored. BLOCK_SIZE is kept
+            // (same workgroup shape, load loops and shmem as the wave64 stack), so
+            // the subgroup count doubles and WM (or WN) is halved until the warp
+            // grid exactly tiles BM x BN again. Per-lane coopmat accumulator
+            // footprint is unchanged: half the lanes per subgroup, half the
+            // (WM/TM)*(WN/TN) fragments per subgroup. Runs after the BM64/M128
+            // gates so it composes with the probe stack. Applies only when the
+            // driver honors a required size (subgroup_size_control covering 32);
+            // otherwise WARP=32 with a real subgroup of 64 would corrupt tiling.
+            const char * wave32_env = getenv("GGML_VK_MMID_WAVE32");
+            if (wave32_env && atoi(wave32_env) != 0 && device->subgroup_size_control &&
+                device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
+                mmid_req_sgs = 32;
+                auto wave32_tile = [](std::vector<uint32_t> &w) {
+                    // {BLOCK_SIZE, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, WARP}
+                    w[10] = 32;  // WARP: must match the forced subgroup size
+                    for (int guard = 0; guard < 4 && w[0] / w[10] != (w[1] / w[4]) * (w[2] / w[5]); ++guard) {
+                        if (w[4] >= w[5] && w[4] > w[7]) {
+                            w[4] /= 2;  // halve WM, keeping WM >= TM
+                        } else {
+                            w[5] /= 2;  // halve WN
+                        }
+                    }
+                    GGML_ASSERT(w[0] / w[10] == (w[1] / w[4]) * (w[2] / w[5]));  // NUM_WARPS == (BM/WM)*(BN/WN)
+                    GGML_ASSERT(w[4] >= w[7] && w[5] >= w[8]);                   // WM >= TM, WN >= TN
+                };
+                wave32_tile(s_warptile_mmq_id16);
+                wave32_tile(m_warptile_mmq_id128);
+                wave32_tile(l_warptile_mmq_idw);
+            }
         }
         {
         const auto &s_warptile_mmq = s_warptile_mmq_id16;
         const auto &s_mmq_wg_denoms = s_mmq_wg_denoms_id16;
         const auto &m_warptile_mmq = m_warptile_mmq_id128;
         const auto &m_mmq_wg_denoms = m_mmq_wg_denoms_id128;
+        const auto &l_warptile_mmq = l_warptile_mmq_idw;
+
+        // Same expansion as CREATE_MM above, plus a trailing required subgroup
+        // size (0 = driver default) for the GGML_VK_MMID_WAVE32 probe. Scoped to
+        // the mmid quant pipelines below; dense pipelines are untouched.
+#undef CREATE_MM
+#define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
+        if (device->mul_mat ## ID ## _l[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
+        if (device->mul_mat ## ID ## _m[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
+        if (device->mul_mat ## ID ## _s[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, mmid_req_sgs);   \
+        if (device->mul_mat ## ID ## _l[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, mmid_req_sgs);   \
+        if (device->mul_mat ## ID ## _m[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, mmid_req_sgs);   \
+        if (device->mul_mat ## ID ## _s[TYPE]) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, mmid_req_sgs);   \
 
         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0], matmul_id_subgroup_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
