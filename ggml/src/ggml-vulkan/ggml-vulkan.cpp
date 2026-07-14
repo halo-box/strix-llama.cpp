@@ -4848,6 +4848,34 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
 #endif
 
+        // EXPERIMENT (GGML_VK_MMID_TILE16=1): narrow the matmul_id small tile to BN=16.
+        // MoE prefill leaves ~nei1*nei0/n_expert rows per expert (~16 at ub512/256E/8a),
+        // so even the 32-wide small tile runs half empty. Only meaningful stacked on
+        // GGML_VK_MMID_SMALLN=1 (routes mmid to the small tile) + the row-list prepass.
+        // Shadows the s-tile config for the mmid quant pipelines only; dense unaffected.
+        auto s_warptile_mmq_id16 = s_warptile_mmq;
+        auto s_mmq_wg_denoms_id16 = s_mmq_wg_denoms;
+        {
+            const char * tile16_env = getenv("GGML_VK_MMID_TILE16");
+            if (tile16_env && atoi(tile16_env) != 0) {
+                s_warptile_mmq_id16[2] = 16;  // BN
+                s_warptile_mmq_id16[5] = 16;  // WN
+                s_mmq_wg_denoms_id16[1] = 16;
+            }
+            // GGML_VK_MMID_BM64=1: taller small tile (BM 32->64, two warps). Same
+            // A-traffic (ic-tile count unchanged), halves per-expert B re-reads
+            // (ir-tile count), larger WGs to hide latency.
+            const char * bm64_env = getenv("GGML_VK_MMID_BM64");
+            if (bm64_env && atoi(bm64_env) != 0) {
+                s_warptile_mmq_id16[0] = 2 * mul_mat_subgroup_size;  // BLOCK_SIZE
+                s_warptile_mmq_id16[1] = 64;  // BM
+                s_mmq_wg_denoms_id16[0] = 64;
+            }
+        }
+        {
+        const auto &s_warptile_mmq = s_warptile_mmq_id16;
+        const auto &s_mmq_wg_denoms = s_mmq_wg_denoms_id16;
+
         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q1_0], matmul_id_subgroup_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q2_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_0], matmul_id_subgroup_q2_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_0], matmul_id_subgroup_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
