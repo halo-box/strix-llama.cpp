@@ -1264,6 +1264,10 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // memoized capacity decision for the FA dequant-once scratch, see ggml_vk_fa_dequant_scratch_fits
+    uint64_t fa_dequant_gate_sz;
+    bool fa_dequant_gate_fits;
+    bool fa_dequant_gate_logged;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
