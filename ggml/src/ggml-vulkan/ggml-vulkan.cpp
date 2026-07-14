@@ -2605,6 +2605,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 cm1_create_quant({type, GGML_TYPE_F32, true, false}, tc_mmq_id, "matmul_id_subgroup_quant_f32",        matmul_id_subgroup_quant_f32_cm1_len,        matmul_id_subgroup_quant_f32_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
                 cm1_create_quant({type, GGML_TYPE_F16, true, false}, tc_mmq_id, "matmul_id_subgroup_quant_f16",        matmul_id_subgroup_quant_f16_cm1_len,        matmul_id_subgroup_quant_f16_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             }
+            // GGML_VK_MMID_M128=1: same idea for the medium tile (BM 64->128, four
+            // warps) — the tile the per-expert-n heuristic picks at n~64 (e.g. ub2048).
+            const char * m128_env = getenv("GGML_VK_MMID_M128");
+            if (m128_env && atoi(m128_env) != 0) {
+                m_warptile_mmq_id128[0] = 4 * mul_mat_subgroup_size;  // BLOCK_SIZE
+                m_warptile_mmq_id128[1] = 128;  // BM
+                m_mmq_wg_denoms_id128[0] = 128;
+            }
         }
         // The _f16 variants provide the f16 B-type pipeline used when y_non_contig converts f32->f16.
 #define X_CM1_ID(TYPE, tstr) \
