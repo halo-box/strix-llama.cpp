@@ -1758,7 +1758,36 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 #endif
 }
 
-void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+// load_shaders walks the pipeline list under compile_mutex and either claims
+// the requested pipeline for compilation or, if another thread is already
+// compiling it, drops the lock and waits on compile_cv. Compiles themselves
+// run unlocked.
+struct CompileTask {
+    vk_pipeline pipeline;
+    size_t spv_size;
+    const void * spv_data;
+    std::string entrypoint;
+    uint32_t parameter_count;
+    std::array<uint32_t, 3> wg_denoms;
+    std::vector<uint32_t> specialization_constants;
+    bool disable_robustness;
+    bool require_full_subgroups;
+    uint32_t required_subgroup_size;
+};
+
+// EXPERIMENT (GGML_VK_MMID_F16B=1): convert the contiguous f32 activations (B) of
+// quantized MUL_MAT_ID to f16 and run the f16-B matmul_id kernels instead of the
+// f32-B ones. Halves B bytes and buf_b shared memory (better occupancy) at the
+// f32->f16 rounding cost upstream already accepts on the coopmat2 path.
+static bool ggml_vk_mmid_f16b_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_VK_MMID_F16B");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
     // some shaders have a minimum subgroup size
@@ -6036,7 +6065,8 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
         return pipelines;
     }
 
-    GGML_ASSERT(src1_type == GGML_TYPE_F32 || (ctx->device->coopmat2 && src1_type == GGML_TYPE_F16));
+    GGML_ASSERT(src1_type == GGML_TYPE_F32 ||
+                ((ctx->device->coopmat2 || ggml_vk_mmid_f16b_enabled()) && src1_type == GGML_TYPE_F16));
 
     switch (src0_type) {
         case GGML_TYPE_Q1_0:
@@ -6073,7 +6103,11 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
             return nullptr;
     }
 
-    vk_matmul_pipeline2& mmp = ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
+    // GGML_VK_MMID_F16B: on KHR_coopmat devices the f16-B mmid pipelines live in a
+    // parallel array (coopmat2's main array already holds f16-B pipelines).
+    vk_matmul_pipeline2& mmp = (src1_type == GGML_TYPE_F16 && !ctx->device->coopmat2)
+        ? ctx->device->pipeline_dequant_mul_mat_mat_id_f16b[src0_type]
+        : ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
     // XXX TODO 'prec' is not actually allowed in mul_mat_id.
     bool prefer_fp16acc = ctx->device->fp16 /*&& prec == GGML_PREC_DEFAULT*/;
     bool support_fp16acc = !mmp.f16acc->is_empty();
