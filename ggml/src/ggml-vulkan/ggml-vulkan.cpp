@@ -2613,6 +2613,43 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 m_warptile_mmq_id128[1] = 128;  // BM
                 m_mmq_wg_denoms_id128[0] = 128;
             }
+            // GGML_VK_MMID_WAVE32=1: force required subgroup size 32 on the mmid
+            // quant coopmat pipelines (RDNA3.x WMMA is wave32-native; probe whether
+            // RADV lowers KHR_coopmat better at wave32). The cm1 path derives its
+            // warp grid from the real subgroup (warp_i = gl_SubgroupID, tiw =
+            // gl_SubgroupInvocationID) and sizes shared arrays (coopmat_stage,
+            // ballots_sh) with NUM_WARPS = BLOCK_SIZE / WARP, so the WARP spec
+            // constant must equal the forced size, and the coverage invariant
+            // NUM_WARPS == (BM/WM)*(BN/WN) must be restored. BLOCK_SIZE is kept
+            // (same workgroup shape, load loops and shmem as the wave64 stack), so
+            // the subgroup count doubles and WM (or WN) is halved until the warp
+            // grid exactly tiles BM x BN again. Per-lane coopmat accumulator
+            // footprint is unchanged: half the lanes per subgroup, half the
+            // (WM/TM)*(WN/TN) fragments per subgroup. Runs after the BM64/M128
+            // gates so it composes with the probe stack. Applies only when the
+            // driver honors a required size (subgroup_size_control covering 32);
+            // otherwise WARP=32 with a real subgroup of 64 would corrupt tiling.
+            const char * wave32_env = getenv("GGML_VK_MMID_WAVE32");
+            if (wave32_env && atoi(wave32_env) != 0 && device->subgroup_size_control &&
+                device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
+                mmid_req_sgs = 32;
+                auto wave32_tile = [](std::vector<uint32_t> &w) {
+                    // {BLOCK_SIZE, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, WARP}
+                    w[10] = 32;  // WARP: must match the forced subgroup size
+                    for (int guard = 0; guard < 4 && w[0] / w[10] != (w[1] / w[4]) * (w[2] / w[5]); ++guard) {
+                        if (w[4] >= w[5] && w[4] > w[7]) {
+                            w[4] /= 2;  // halve WM, keeping WM >= TM
+                        } else {
+                            w[5] /= 2;  // halve WN
+                        }
+                    }
+                    GGML_ASSERT(w[0] / w[10] == (w[1] / w[4]) * (w[2] / w[5]));  // NUM_WARPS == (BM/WM)*(BN/WN)
+                    GGML_ASSERT(w[4] >= w[7] && w[5] >= w[8]);                   // WM >= TM, WN >= TN
+                };
+                wave32_tile(s_warptile_mmq_id16);
+                wave32_tile(m_warptile_mmq_id128);
+                wave32_tile(l_warptile_mmq_idw);
+            }
         }
         // The _f16 variants provide the f16 B-type pipeline used when y_non_contig converts f32->f16.
 #define X_CM1_ID(TYPE, tstr) \
