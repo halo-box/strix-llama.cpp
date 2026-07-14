@@ -2390,6 +2390,10 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // memoized capacity decision for the FA dequant-once scratch, see ggml_vk_fa_dequant_scratch_fits
+    uint64_t fa_dequant_gate_sz;
+    bool fa_dequant_gate_fits;
+    bool fa_dequant_gate_logged;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -7697,6 +7701,9 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    ctx->fa_dequant_gate_sz = 0;
+    ctx->fa_dequant_gate_fits = false;
+    ctx->fa_dequant_gate_logged = false;
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
 
@@ -10949,6 +10956,69 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
+// Capacity gate for the dequant-once f16 K/V scratch. On discrete devices the scratch can push the
+// working set past free VRAM, and the driver then silently pages device-local memory (~15x prefill
+// regression measured on an 8 GB card at long context). UMA has no separate pool to overflow.
+//
+// Gates our own device-local usage against the physical heap size, less a reserve for memory not
+// visible in-process. heapBudget is deliberately not the signal: ggml_backend_vk_get_device_memory
+// computes heapBudget - heapUsage unsigned, which wraps when the device is oversubscribed. Nor can
+// the allocation gate itself: on WDDM vkAllocateMemory only fails near physical heap size, above
+// the free-VRAM level where paging starts. The reserve is necessarily conservative because other
+// processes' VRAM use is invisible to us. GGML_VK_FA_DEQUANT=0/1 forces the path off/on;
+// GGML_VK_FA_DEQUANT_RESERVE_MB overrides the reserve.
+static bool ggml_vk_fa_dequant_scratch_fits(ggml_backend_vk_context * ctx, uint64_t scratch_sz) {
+    const vk_device& device = ctx->device;
+
+    if (device->uma) {
+        return true;
+    }
+
+    // Decided once per scratch size, so the decision cannot flip between layers as usage grows.
+    if (ctx->fa_dequant_gate_sz == scratch_sz) {
+        return ctx->fa_dequant_gate_fits;
+    }
+
+    static const uint64_t reserve = [] {
+        const char * env = getenv("GGML_VK_FA_DEQUANT_RESERVE_MB");
+        return (uint64_t)(env ? atoi(env) : 1024) * 1024 * 1024;
+    }();
+
+    bool fits = false;
+
+    // Without VK_EXT_memory_budget our usage is unknowable, so leave the path disabled.
+    if (vk_instance.device_supports_membudget[device->idx]) {
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgetprops;
+        vk::PhysicalDeviceMemoryProperties2 memprops = {};
+        memprops.pNext = &budgetprops;
+        device->physical_device.getMemoryProperties2(&memprops);
+
+        uint64_t heap_size = 0;
+        uint64_t heap_used = 0;
+        for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount; ++i) {
+            const vk::MemoryHeap & heap = memprops.memoryProperties.memoryHeaps[i];
+            if (heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                heap_size += heap.size;
+                heap_used += budgetprops.heapUsage[i];
+            }
+        }
+        // heap_used already covers scratch allocated on a previous ubatch, so counting scratch_sz
+        // in full is conservative by up to the current scratch size.
+        fits = heap_size > reserve && heap_used + scratch_sz + reserve <= heap_size;
+    }
+
+    if (!fits && !ctx->fa_dequant_gate_logged) {
+        ctx->fa_dequant_gate_logged = true;
+        GGML_LOG_INFO("ggml_vulkan: flash attention dequant-once disabled: %llu MiB K/V scratch does not fit "
+                      "device-local memory with a %llu MiB reserve. Set GGML_VK_FA_DEQUANT=1 to force it on.\n",
+                      (unsigned long long)(scratch_sz >> 20), (unsigned long long)(reserve >> 20));
+    }
+
+    ctx->fa_dequant_gate_sz = scratch_sz;
+    ctx->fa_dequant_gate_fits = fits;
+    return fits;
+}
+
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -11008,7 +11078,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
 
-    // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
+    // For prefill with quantized K/V, dequantize+transpose K/V once into a per-head-contiguous
+    // f16 scratch and run the f16 FA path, instead of the coopmat1 shader re-dequantizing the
+    // whole KV inside every Q-workgroup. The KV-cache view reaching FA is [0,2,1,3]-permuted but
+    // dense, so we require dense allocation (not ggml_is_contiguous) and block-contiguous dim0,
+    // and only engage where a fused dequant-transpose shader exists. Prefill only
+    // (n_rows >= 64); measured neutral at shallow depth and up to ~2x at long context.
+    // The scratch is bound as a single storage buffer holding K and V back to back, so the SUM of
+    // the two must fit maxStorageBufferRange, not each half independently.
     auto is_dense_kv_cache = [](const ggml_tensor * t) {
         return t->nb[0] == ggml_type_size(t->type) &&
                t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
@@ -11017,19 +11094,21 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
+    const uint64_t kv_f16_sz = ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * sizeof(ggml_fp16_t);
     static const char * fa_dequant_env = getenv("GGML_VK_FA_DEQUANT");
     const bool fa_dequant_off = fa_dequant_env && fa_dequant_env[0] == '0';
+    const bool fa_dequant_on  = fa_dequant_env && fa_dequant_env[0] == '1';
     const bool use_dequant_kv = !fa_dequant_off && k_quant && v_quant && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
-                                (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                                kv_f16_sz <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
                                 ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
                                 // coopmat2 path does not benefit from the f16 scratch
                                 !ctx->device->coopmat2 &&
                                 // Intel Xe1 regresses, see PR 25494
                                 (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
-                                 (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
+                                 (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1)) &&
+                                (fa_dequant_on || ggml_vk_fa_dequant_scratch_fits(ctx, kv_f16_sz));
     const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
     const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
 
