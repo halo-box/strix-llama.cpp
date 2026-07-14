@@ -74,6 +74,8 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
         // Shadows the s-tile config for the mmid quant pipelines only; dense unaffected.
         auto s_warptile_mmq_id16 = s_warptile_mmq;
         auto s_mmq_wg_denoms_id16 = s_mmq_wg_denoms;
+        auto m_warptile_mmq_id128 = m_warptile_mmq;
+        auto m_mmq_wg_denoms_id128 = m_mmq_wg_denoms;
         {
             const char * tile16_env = getenv("GGML_VK_MMID_TILE16");
             if (tile16_env && atoi(tile16_env) != 0) {
@@ -90,10 +92,20 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
                 s_warptile_mmq_id16[1] = 64;  // BM
                 s_mmq_wg_denoms_id16[0] = 64;
             }
+            // GGML_VK_MMID_M128=1: same idea for the medium tile (BM 64->128, four
+            // warps) — the tile the per-expert-n heuristic picks at n~64 (e.g. ub2048).
+            const char * m128_env = getenv("GGML_VK_MMID_M128");
+            if (m128_env && atoi(m128_env) != 0) {
+                m_warptile_mmq_id128[0] = 4 * mul_mat_subgroup_size;  // BLOCK_SIZE
+                m_warptile_mmq_id128[1] = 128;  // BM
+                m_mmq_wg_denoms_id128[0] = 128;
+            }
         }
         {
         const auto &s_warptile_mmq = s_warptile_mmq_id16;
         const auto &s_mmq_wg_denoms = s_mmq_wg_denoms_id16;
+        const auto &m_warptile_mmq = m_warptile_mmq_id128;
+        const auto &m_mmq_wg_denoms = m_mmq_wg_denoms_id128;
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_f16,
             "flash_attn_top_k_f16", flash_attn_top_k_f16_len, flash_attn_top_k_f16_data, "main", 6,
             sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {512, device->subgroup_size}, 1, true, true,
