@@ -10383,7 +10383,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // Gated on coopmat_support because the f16b pipelines are only created there.
     const bool mmid_f16b = ggml_vk_mmid_f16b_enabled() &&
                            ctx->device->coopmat_support && !ctx->device->coopmat2 &&
-                           ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
+                           ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
+                           // only take the f16-B path if a pipeline exists for this src0 type
+                           // (e.g. Q2_0 has none); otherwise fall through to the normal f32-B path.
+                           !(ctx->device->pipeline_dequant_mul_mat_mat_id_f16b[src0->type].f16acc->is_empty() &&
+                             ctx->device->pipeline_dequant_mul_mat_mat_id_f16b[src0->type].f32acc->is_empty());
     if (mmid_f16b) {
         static bool mmid_f16b_logged = false;
         if (!mmid_f16b_logged) {
