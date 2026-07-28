@@ -10957,6 +10957,27 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
+// K/V types the FA shaders can read directly (scalar/coopmat1 select the dequant code via the
+// FaTypeK/FaTypeV spec constants; a type outside this list silently reads garbage). Types that
+// are FA-supported but not listed here (iq4_nl) are only correct through the dequant-once
+// scratch path, so supports_op and the dispatch-time gate must agree on when that path runs.
+static bool ggml_vk_fa_kv_native(ggml_type t, bool coopmat2) {
+    switch (t) {
+    case GGML_TYPE_F32:
+    case GGML_TYPE_F16:
+    case GGML_TYPE_BF16:
+    case GGML_TYPE_Q4_0:
+    case GGML_TYPE_Q4_1:
+    case GGML_TYPE_Q5_0:
+    case GGML_TYPE_Q5_1:
+    case GGML_TYPE_Q8_0:
+    case GGML_TYPE_IQ4_NL: // native FA support since upstream 8161641
+        return true;
+    default:
+        return false;
+    }
+}
+
 // Capacity gate for the dequant-once f16 K/V scratch. On discrete devices the scratch can push the
 // working set past free VRAM, and the driver then silently pages device-local memory (~15x prefill
 // regression measured on an 8 GB card at long context). UMA has no separate pool to overflow.
@@ -11111,17 +11132,27 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                 (k->nb[1] != (uint64_t)HSK * sizeof(ggml_fp16_t) ||
                                  v->nb[1] != (uint64_t)HSV * sizeof(ggml_fp16_t)) &&
                                 (HSK % 8) == 0 && (HSV % 8) == 0;
-    const bool use_dequant_kv = !fa_dequant_off && ((k_quant && v_quant) || (fa_kv_contig && kv_f16_strided)) && neq1 >= 64 &&
+    // A K/V type the FA shaders cannot read directly (iq4_nl) is only correct through the
+    // dequant path. supports_op only admits such types when the hard conditions below hold,
+    // and the VRAM heuristic must not veto them (there is no fallback), so force the path on.
+    const bool kv_needs_dequant = !ggml_vk_fa_kv_native(k->type, ctx->device->coopmat2) ||
+                                  !ggml_vk_fa_kv_native(v->type, ctx->device->coopmat2);
+    const bool use_dequant_kv = !fa_dequant_off &&
+                                ((k_quant && v_quant) || kv_needs_dequant || (fa_kv_contig && kv_f16_strided)) && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 kv_f16_sz <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
                                 ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
-                                // coopmat2 path does not benefit from the f16 scratch
-                                !ctx->device->coopmat2 &&
+                                // coopmat2 reads its native types directly; non-native still needs the scratch
+                                (kv_needs_dequant || !ctx->device->coopmat2) &&
                                 // Intel Xe1 regresses, see PR 25494
-                                (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
+                                (kv_needs_dequant ||
+                                 ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
                                  (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1)) &&
-                                (fa_dequant_on || ggml_vk_fa_dequant_scratch_fits(ctx, kv_f16_sz));
+                                (fa_dequant_on || kv_needs_dequant || ggml_vk_fa_dequant_scratch_fits(ctx, kv_f16_sz));
+    // If this fires, supports_op admitted a non-native K/V type the gate then rejected; the
+    // native shader would return garbage rather than fail, so abort instead.
+    GGML_ASSERT(use_dequant_kv || !kv_needs_dequant);
     const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
     const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
 
@@ -18678,24 +18709,33 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                auto fa_kv_ok = [](ggml_type t) {
-                    switch (t) {
-                    case GGML_TYPE_F32:
-                    case GGML_TYPE_F16:
-                    case GGML_TYPE_BF16:
-                    case GGML_TYPE_Q8_0:
-                    case GGML_TYPE_Q5_1:
-                    case GGML_TYPE_Q5_0:
-                    case GGML_TYPE_Q4_1:
-                    case GGML_TYPE_Q4_0:
-                    case GGML_TYPE_IQ4_NL:
-                        return true;
-                    default:
-                        return false;
-                    }
+                auto fa_kv_ok = [&](ggml_type t) {
+                    // ggml_vk_fa_kv_native is the single source of truth; on this base every
+                    // admitted type is native, and the non-native hard-gate below is dormant
+                    // hardening for any future type routed through the dequant-once scratch.
+                    return ggml_vk_fa_kv_native(t, coopmat2);
                 };
                 if (!fa_kv_ok(op->src[1]->type) || !fa_kv_ok(op->src[2]->type)) {
                     return false;
+                }
+                if (!ggml_vk_fa_kv_native(op->src[1]->type, coopmat2) || !ggml_vk_fa_kv_native(op->src[2]->type, coopmat2)) {
+                    // Only correct through the dequant-once scratch path; admit only when every
+                    // hard condition of the dispatch-time gate holds, so dispatch can never fall
+                    // back to the native shader (it reads garbage for these types, not an error).
+                    const ggml_tensor * k = op->src[1];
+                    const ggml_tensor * v = op->src[2];
+                    static const char * fa_dequant_env = getenv("GGML_VK_FA_DEQUANT");
+                    const bool fa_dequant_off = fa_dequant_env && fa_dequant_env[0] == '0';
+                    const uint64_t kv_f16_sz = ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * sizeof(ggml_fp16_t);
+                    if (fa_dequant_off ||
+                        op->src[0]->ne[1] < 64 ||
+                        device->pipeline_dequant_transpose[k->type] == nullptr ||
+                        device->pipeline_dequant_transpose[v->type] == nullptr ||
+                        k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type) ||
+                        !ggml_is_contiguously_allocated(k) || !ggml_is_contiguously_allocated(v) ||
+                        kv_f16_sz > device->properties.limits.maxStorageBufferRange) {
+                        return false;
+                    }
                 }
                 if ((op->src[1]->type == GGML_TYPE_BF16) != (op->src[2]->type == GGML_TYPE_BF16)) {
                     return false;
