@@ -11099,13 +11099,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     static const char * fa_dequant_env = getenv("GGML_VK_FA_DEQUANT");
     const bool fa_dequant_off = fa_dequant_env && fa_dequant_env[0] == '0';
     const bool fa_dequant_on  = fa_dequant_env && fa_dequant_env[0] == '1';
-    // EXPERIMENT (GGML_VK_FA_KV_CONTIG=1): run the same contiguize pass for f16 K/V. The
-    // KV-cache view reaching FA is head-interleaved ([HS, NH, KV] physically), and the cm1
+    // Contiguize pass for f16 K/V (GGML_VK_FA_KV_CONTIG=0 opts out). The KV-cache view
+    // reaching FA is head-interleaved ([HS, NH, KV] physically), and the cm1
     // direct-from-global coopMatLoads run ~2-5x slower on those strided rows than on
     // per-head-contiguous K/V. Copy K/V once into the scratch instead (dequant_f16_transpose
-    // is a pure strided copy). Only engages when the rows are actually strided.
+    // is a pure strided copy). Only engages when the rows are actually strided, and shares
+    // the quant path's prefill/allocation/scratch-capacity gates below.
     static const char * fa_kv_contig_env = getenv("GGML_VK_FA_KV_CONTIG");
-    const bool fa_kv_contig = fa_kv_contig_env && fa_kv_contig_env[0] == '1';
+    const bool fa_kv_contig = !(fa_kv_contig_env && fa_kv_contig_env[0] == '0');
     const bool kv_f16_strided = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
                                 (k->nb[1] != (uint64_t)HSK * sizeof(ggml_fp16_t) ||
                                  v->nb[1] != (uint64_t)HSV * sizeof(ggml_fp16_t)) &&
