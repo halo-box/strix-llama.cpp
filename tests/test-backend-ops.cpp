@@ -7258,6 +7258,117 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with a top-k sparse selection hint (DeepSeek V4 CSA shape).
+// The kq_mask encodes the same selection as the top_k indices, so a backend that ignores
+// the hint (CPU) computes the identical result densely — this is exactly the contract
+// that keeps sparse and dense paths interchangeable, and what this test verifies.
+struct test_flash_attn_ext_top_k : public test_case {
+    const int64_t kv;       // total KV size (compressed region + dense prefix)
+    const int64_t nb;       // batch size (query tokens)
+    const int64_t n_kv_raw; // dense prefix always attended
+    const int64_t n_top_k;  // selected keys per query token
+    const bool    sinks;
+
+    static constexpr int64_t hs = 512; // V4 CSA head size, K == V latent
+    static constexpr int64_t nh = 64;  // V4 CSA query heads (MQA)
+
+    std::string vars() override {
+        return VARS_TO_STR5(kv, nb, n_kv_raw, n_top_k, sinks);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // only the active keys contribute compute on a sparse backend; count those so
+        // perf mode reports the useful-work rate
+        return 2 * nh * nb * (hs + hs) * (n_kv_raw + n_top_k);
+    }
+
+    test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128, bool sinks = false)
+        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, 1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, 1, 1);
+        ggml_set_name(k, "k");
+
+        // V4 CSA attends over the K latent itself: V is the same cache tensor
+        ggml_tensor * v = ggml_view_4d(ctx, k, hs, kv, 1, 1, k->nb[1], k->nb[2], k->nb[3], 0);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * t = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, nb, 1, 1);
+        ggml_set_name(t, "top_k");
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_add_top_k(out, t, n_kv_raw);
+        ggml_flash_attn_ext_set_prec (out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t range = kv - n_kv_raw; // size of the selectable compressed region
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "top_k") == 0 || strcmp(t->name, "m") == 0) {
+                continue; // filled together below
+            }
+            if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+
+        // build a consistent (top_k, mask) pair: a deterministic per-token selection,
+        // strided so adjacent tokens select overlapping-but-different keys, with one
+        // deliberately invalid index (-1) whose mask slot stays -inf
+        std::vector<int32_t> top(n_top_k * nb);
+        std::vector<ggml_fp16_t> mask(kv * nb);
+        const ggml_fp16_t minus_inf = ggml_fp32_to_fp16(-INFINITY);
+        const ggml_fp16_t zero      = ggml_fp32_to_fp16(0.0f);
+
+        for (int64_t b = 0; b < nb; ++b) {
+            for (int64_t i = 0; i < kv; ++i) {
+                mask[b * kv + i] = i < n_kv_raw ? zero : minus_inf;
+            }
+            for (int64_t j = 0; j < n_top_k; ++j) {
+                int32_t idx = (int32_t) ((j * range) / n_top_k + b) % (int32_t) range;
+                if (j == n_top_k - 1 && b == 0) {
+                    idx = -1; // exercise the ignore-invalid-index path
+                } else {
+                    mask[b * kv + n_kv_raw + idx] = zero;
+                }
+                top[b * n_top_k + j] = idx;
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "top_k") == 0) {
+                ggml_backend_tensor_set(t, top.data(), 0, top.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                ggml_backend_tensor_set(t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -10239,6 +10350,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // sparse top-k FA: (kv, nb, n_kv_raw, n_top_k, sinks). The Vulkan sparse path engages
+    // when kv >= 3*(n_kv_raw + n_top_k) AND nb >= 64 (prefill-only); the nb < 64 cases
+    // and the kv=512 case verify dense-fallback parity with the hint attached, the
+    // nb=64/128 cases exercise the sparse shader itself.
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  1, 256, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  8,  64, 128, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768, 17,  64, 128, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 512,  4,  64, 128, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 128, 256, 512, false));
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -10651,6 +10774,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+
+    // sparse top-k FA at V4 decode/prefill shapes — the A/B instrument for the
+    // gather-to-compact work (n_active = n_kv_raw + n_top_k stays fixed as kv grows).
+    // nb 1/8 currently takes the DENSE path (the sparse shader gates on nb >= 64):
+    // those rows measure the decode cost gather-to-compact must beat. nb 64/512
+    // measures the existing sparse prefill shader.
+    for (int kv : { 8192, 32768, 65536 }) {
+        for (int nb : { 1, 8, 64, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 1024, 512, false));
         }
     }
 
