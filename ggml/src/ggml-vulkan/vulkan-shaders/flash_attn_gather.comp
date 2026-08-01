@@ -1,0 +1,70 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Gathers the active KV rows of a top-k sparse attention (DeepSeek V4 CSA decode) into a
+// compact contiguous scratch: rows [0, n_kv_raw) of the source (the dense prefix), then the
+// n_top_k selected rows, then zero padding up to kv_c. The gathered mask row keeps the
+// per-key mask values so causality/validity survive compaction; invalid top-k indices and
+// padding get -inf mask and zeroed K (softmax-neutral either way, zeroed so no NaN*0).
+// One workgroup per compact row; V is the K latent (V==K), so a single gather serves both.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer KBuf   { float16_t data_k[];   };
+layout(binding = 1) readonly  buffer TopBuf { int       data_top[]; };
+layout(binding = 2) readonly  buffer MBuf   { float16_t data_m[];   };
+layout(binding = 3) writeonly buffer KcBuf  { float16_t data_kc[];  };
+layout(binding = 4) writeonly buffer McBuf  { float16_t data_mc[];  };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;     // total source KV rows
+    uint n_kv_raw; // dense prefix length
+    uint n_top_k;  // selected rows for the (single) query token
+    uint kv_c;     // padded compact row count == dispatch row range
+    uint nbk1;     // K source row stride, elements
+    uint nbk3;     // K source stream stride, elements
+    uint nbt3;     // top_k stream stride, elements
+    uint nbm3;     // mask source stream stride, elements
+    uint nem3;     // mask ne[3], for stream broadcast
+} p;
+
+const uint HEAD_SIZE = 512;
+const uint LANES = 64;
+
+void main() {
+    const uint row    = gl_WorkGroupID.x;
+    const uint stream = gl_WorkGroupID.z;
+    const uint tid    = gl_LocalInvocationIndex;
+
+    // map compact row -> source row; p.n_kv is the invalid sentinel
+    uint src = p.n_kv;
+    if (row < p.n_kv_raw) {
+        src = row;
+    } else if (row < p.n_kv_raw + p.n_top_k) {
+        const int idx = data_top[stream * p.nbt3 + (row - p.n_kv_raw)];
+        if (idx >= 0 && uint(idx) < p.n_kv - p.n_kv_raw) {
+            src = p.n_kv_raw + uint(idx);
+        }
+    }
+
+    const uint dst_base = (stream * p.kv_c + row) * HEAD_SIZE;
+    if (src < p.n_kv) {
+        const uint src_base = stream * p.nbk3 + src * p.nbk1;
+        [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+            data_kc[dst_base + tid + i * LANES] = data_k[src_base + tid + i * LANES];
+        }
+        if (tid == 0) {
+            data_mc[stream * p.kv_c + row] = data_m[(stream % p.nem3) * p.nbm3 + src];
+        }
+    } else {
+        [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+            data_kc[dst_base + tid + i * LANES] = float16_t(0.0);
+        }
+        if (tid == 0) {
+            data_mc[stream * p.kv_c + row] = float16_t(uintBitsToFloat(0xff800000));
+        }
+    }
+}
