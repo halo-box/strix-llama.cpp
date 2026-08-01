@@ -85,7 +85,11 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             }
         }
     }
+    // batch 1 = Vulkan decode-cm variant, 4/15 = scalar subgroup variant (below the cm
+    // threshold of 16, 15 is the boundary), 17/512 = cm prefill variant
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,   1, 1, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,   4, 1, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  15, 1, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  17, 1, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 512, 512, 1, 1, GGML_TYPE_F16));
 
