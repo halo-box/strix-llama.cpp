@@ -710,6 +710,29 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+// push constants for the fork's wave64 f16 lightning-indexer kernels (scalar-64 + CM family)
+struct vk_op_lightning_indexer_cm_push_constants {
+    uint32_t n_kv, n_batch, n_stream, nem3;
+    uint32_t nb1, nb3;
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk2, nbk3;
+    uint32_t nbw1, nbw3;
+    uint32_t nbm1, nbm3;
+};
+static_assert(sizeof(vk_op_lightning_indexer_cm_push_constants) <= 128);
+
+struct vk_op_flash_attn_top_k_push_constants {
+    uint32_t n_batch, n_kv, n_kv_raw, n_top_k, n_head;
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk1, nbk3;
+    uint32_t nbm1, nbm3;
+    uint32_t nbt1, nbt3;
+    uint32_t nb1, nb2, nb3;
+    float scale;
+    uint32_t has_sinks;
+};
+static_assert(sizeof(vk_op_flash_attn_top_k_push_constants) <= 128);
+
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
     uint32_t nb21, nb22, nb31;
