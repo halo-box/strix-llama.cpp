@@ -2457,6 +2457,11 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // sparse attention hint: attend only to the first n_kv_raw keys (dense prefix) plus the
+    // keys selected by top_k. top_k is I32 [n_top_k, n_tokens, 1, n_streams]; each index i
+    // selects absolute key n_kv_raw + i. Negative or out-of-range indices are ignored.
+    // Backends may ignore the hint: the kq_mask must still encode the same selection, so a
+    // dense fallback computes the identical result.
     GGML_API void ggml_flash_attn_ext_add_top_k(
             struct ggml_tensor * a,
             struct ggml_tensor * top_k,
