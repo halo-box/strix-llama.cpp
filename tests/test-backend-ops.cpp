@@ -12784,6 +12784,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,   1, 1, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  17, 1, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 512, 512, 1, 1, GGML_TYPE_F16));
 
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
@@ -12838,6 +12841,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // LEAKY_RELU at FFN activation width, for direct comparison with RELU
     for (int64_t n_tokens : {512, 2048}) {
         test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
+    }
+
+    for (ggml_type type_a : { GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS }) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 2048, 512, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 4096, 512, 2048));
     }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
@@ -13354,7 +13362,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 2048, 1, 1, false, true));
 
     // lightning_indexer
-    for (int kv : { 256, 4096, 65536 }) {
+    for (int kv : { 256, 512, 4096, 65536 }) {
         for (int bs : { 1, 512, 2048 }) {
             for (int nh : { 4, 32, 64 }) {
                 for (int ns : { 1, 4 }) {
