@@ -721,6 +721,12 @@ struct vk_op_lightning_indexer_cm_push_constants {
 };
 static_assert(sizeof(vk_op_lightning_indexer_cm_push_constants) <= 128);
 
+struct vk_op_flash_attn_gather_push_constants {
+    uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
+    uint32_t nbk1, nbk3, nbt3, nbm3, nem3;
+};
+static_assert(sizeof(vk_op_flash_attn_gather_push_constants) <= 128);
+
 struct vk_op_flash_attn_top_k_push_constants {
     uint32_t n_batch, n_kv, n_kv_raw, n_top_k, n_head;
     uint32_t nbq1, nbq2, nbq3;
