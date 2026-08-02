@@ -1,0 +1,37 @@
+#version 450
+
+// DeepSeek V4 fused hyper-connection "pre": mix the HC input streams down to one embedding,
+// dst[i0, it] = sum_ih x[i0, ih, it] * w[ih, it]. Port of ggml-cuda/dsv4-hc.cu (hc_pre).
+// Flat elementwise kernel over n_embd * n_tokens; strides are in f32 elements.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer XBuf { float data_x[]; };
+layout(binding = 1) readonly  buffer WBuf { float data_w[]; };
+layout(binding = 2) writeonly buffer DBuf { float data_d[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_embd;
+    uint hc;
+    uint nr;      // n_embd * n_tokens
+    uint sx0, sx1, sx2;
+    uint sw0, sw1;
+    uint sd0, sd1;
+} p;
+
+void main() {
+    const uint ir = gl_GlobalInvocationID.x;
+    if (ir >= p.nr) {
+        return;
+    }
+
+    const uint i0 = ir % p.n_embd;
+    const uint it = ir / p.n_embd;
+
+    float sum = data_x[i0 * p.sx0 + it * p.sx2] * data_w[it * p.sw1];
+    for (uint ih = 1; ih < p.hc; ++ih) {
+        sum += data_x[i0 * p.sx0 + ih * p.sx1 + it * p.sx2] * data_w[ih * p.sw0 + it * p.sw1];
+    }
+
+    data_d[i0 * p.sd0 + it * p.sd1] = sum;
+}
