@@ -721,6 +721,35 @@ struct vk_op_lightning_indexer_cm_push_constants {
 };
 static_assert(sizeof(vk_op_lightning_indexer_cm_push_constants) <= 128);
 
+struct vk_op_dsv4_hc_pre_push_constants {
+    uint32_t n_embd, hc, nr;
+    uint32_t sx0, sx1, sx2;
+    uint32_t sw0, sw1;
+    uint32_t sd0, sd1;
+};
+static_assert(sizeof(vk_op_dsv4_hc_pre_push_constants) <= 128);
+
+struct vk_op_dsv4_hc_comb_push_constants {
+    uint32_t n_tokens;
+    uint32_t sm0, sm1;
+    uint32_t ss0;
+    uint32_t sb0;
+    uint32_t sd0, sd1, sd2;
+    float    eps;
+    int32_t  n_iter;
+};
+static_assert(sizeof(vk_op_dsv4_hc_comb_push_constants) <= 128);
+
+struct vk_op_dsv4_hc_post_push_constants {
+    uint32_t n_embd, hc, nr;
+    uint32_t sx0, sx1;
+    uint32_t sr0, sr1, sr2;
+    uint32_t sp0, sp1;
+    uint32_t sc0, sc1, sc2;
+    uint32_t sd0, sd1, sd2;
+};
+static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
+
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
     uint32_t nbk1, nbk3, nbt3, nbm3, nem3;
