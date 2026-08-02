@@ -196,7 +196,1043 @@ void ggml_vk_print_device_fault_info(const vk_device& device) {
                 (unsigned long long)info.vendorFaultData);
     }
 }
-uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
+
+struct vk_buffer_struct {
+    vk::Buffer buffer = VK_NULL_HANDLE;
+    vk::DeviceMemory device_memory = VK_NULL_HANDLE;
+    vk::MemoryPropertyFlags memory_property_flags;
+    void * ptr;
+    size_t size = 0;
+    vk::DeviceAddress bda_addr {};
+
+    vk_device device;
+
+    ~vk_buffer_struct() {
+        if (size == 0) {
+            return;
+        }
+        VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+
+        device->device.freeMemory(device_memory);
+        device->device.destroyBuffer(buffer);
+    }
+};
+
+struct vk_subbuffer {
+    vk_buffer buffer;
+    uint64_t offset;
+    uint64_t size;
+
+    operator vk::DescriptorBufferInfo() const {
+        return { buffer->buffer, offset, size };
+    }
+};
+
+struct vk_semaphore {
+    vk::Semaphore s;
+    uint64_t value;
+};
+
+// vk_event is used for the event-related backend interfaces. It uses vk::Events for
+// event_wait and a timeline semaphore for event_synchronize. Polling on an event for
+// event_synchronize wouldn't be sufficient to wait for command buffers to complete,
+// and would lead to validation errors.
+struct vk_event {
+    std::vector<vk::Event> events_free; // Events available for reuse
+    std::vector<vk::Event> events_submitted; // Events that are fully submitted and can be reused on next synchronize
+    vk::Event event;
+    bool has_event;
+
+    vk_semaphore tl_semaphore;
+    vk_command_buffer* cmd_buffer = nullptr;
+    uint64_t cmd_buffer_use_counter = 0;
+};
+
+struct vk_submission {
+    vk_command_buffer* buffer = nullptr;
+    std::vector<vk_semaphore> wait_semaphores;
+    std::vector<vk_semaphore> signal_semaphores;
+};
+
+typedef std::vector<vk_submission> vk_sequence;
+
+struct vk_mat_mat_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
+    uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
+    uint32_t base_work_group_z; uint32_t num_batches;
+    uint32_t k_split;
+    uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
+    uint32_t padded_N;
+};
+
+#define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
+#define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
+#define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
+#define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+
+struct vk_mat_vec_push_constants {
+    uint32_t ncols;
+    uint32_t stride_a;
+    uint32_t stride_b;
+    uint32_t stride_d;
+    uint32_t batch_stride_a;
+    uint32_t batch_stride_b;
+    uint32_t batch_stride_d;
+    uint32_t fusion_flags;
+    uint32_t base_work_group_y;
+    uint32_t ne02;
+    uint32_t ne12;
+    uint32_t broadcast2;
+    uint32_t broadcast3;
+};
+
+struct vk_mat_vec_p021_push_constants {
+    uint32_t ncols_x;
+    uint32_t nrows_x;
+    uint32_t nchannels_x;
+    uint32_t nchannels_y;
+    uint32_t b_offset;
+    uint32_t d_offset;
+    uint32_t fusion_flags;
+};
+
+struct vk_mat_vec_nc_push_constants {
+    uint32_t ncols_x;
+    uint32_t nrows_x;
+    uint32_t row_stride_x;
+    uint32_t channel_stride_x;
+    uint32_t channel_stride_y;
+    uint32_t channel_x_divisor;
+    uint32_t ne12;
+    uint32_t b_offset;
+    uint32_t d_offset;
+    uint32_t nb03;
+    uint32_t nb13;
+    uint32_t nb23;
+    uint32_t fusion_flags;
+};
+
+struct vk_mat_mat_id_push_constants {
+    uint32_t M; uint32_t N; uint32_t K;
+    uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
+    uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
+    uint32_t nei0; uint32_t nei1; uint32_t nbi1; uint32_t ne11;
+    uint32_t n_experts;
+    uint32_t hoist_row_ids;
+    uint32_t fusion_flags;
+};
+struct vk_mat_vec_id_push_constants {
+    uint32_t ncols;
+    uint32_t stride_a;
+    uint32_t stride_b;
+    uint32_t stride_d;
+    uint32_t batch_stride_a;
+    uint32_t batch_stride_b;
+    uint32_t batch_stride_d;
+    uint32_t fusion_flags;
+    uint32_t nei0;
+    uint32_t ne11;
+    uint32_t expert_i1;
+    uint32_t nbi1;
+};
+
+struct vk_flash_attn_push_constants {
+    uint32_t N;
+    uint32_t KV;
+
+    uint32_t ne1;
+    uint32_t ne2;
+    uint32_t ne3;
+
+    uint32_t neq2;
+    uint32_t neq3;
+    uint32_t nek2;
+    uint32_t nek3;
+    uint32_t nev2;
+    uint32_t nev3;
+    uint32_t nem1;
+    uint32_t nem2;
+    uint32_t nem3;
+
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb13;
+    uint32_t nb21;
+    uint32_t nb22;
+    uint32_t nb23;
+
+    float scale;
+    float max_bias;
+    float logit_softcap;
+
+    uint32_t mask_n_head_log2;
+    float m0;
+    float m1;
+
+    uint32_t gqa_ratio;
+    uint32_t split_kv;
+    uint32_t k_num;
+};
+static_assert(sizeof(vk_flash_attn_push_constants) <= 128, "sizeof(vk_flash_attn_push_constants) must be <= 128");
+
+struct vk_op_push_constants {
+    uint32_t KX;
+    uint32_t KY;
+    float param1;
+    float param2;
+    float param3;
+    float param4;
+};
+
+struct vk_op_fwht_push_constants {
+    uint32_t n_rows;
+    uint32_t src_offset;
+    uint32_t dst_offset;
+    float scale;
+};
+
+struct vk_op_count_experts_push_constants {
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t a_offset;
+    uint32_t n_experts;
+    uint32_t hoist_row_ids;
+    uint32_t ne00mp;
+    uint32_t ne00L;
+};
+
+struct vk_op_glu_push_constants {
+    uint32_t N;
+    uint32_t ne00;
+    uint32_t ne20;
+    uint32_t mode;  // 0: default, 1: swapped, 2: split
+    float alpha; // for swiglu_oai
+    float limit;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+    uint32_t nb10;
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb13;
+    uint32_t nb20;
+    uint32_t nb21;
+    uint32_t nb22;
+    uint32_t nb23;
+    uint32_t ne21;
+    uint32_t ne22;
+    uint32_t misalign_offsets;
+    uint32_t ne2_012mp; uint32_t ne2_012L;
+    uint32_t ne2_01mp;  uint32_t ne2_01L;
+    uint32_t ne2_0mp;   uint32_t ne2_0L;
+};
+static_assert(sizeof(vk_op_glu_push_constants) <= 128, "sizeof(vk_op_glu_push_constants) must be <= 128");
+
+struct vk_op_unary_push_constants {
+    uint32_t ne;
+    uint32_t ne00; uint32_t ne01; uint32_t ne02; uint32_t ne03; uint32_t nb00; uint32_t nb01; uint32_t nb02; uint32_t nb03;
+    uint32_t ne10; uint32_t ne11; uint32_t ne12; uint32_t ne13; uint32_t nb10; uint32_t nb11; uint32_t nb12; uint32_t nb13;
+    uint32_t misalign_offsets;
+    float param1; float param2; float param3; float param4;
+    uint32_t ne0_012mp; uint32_t ne0_01mp; uint32_t ne0_0mp; uint32_t ne0_Ls;
+    uint32_t ne1_012mp; uint32_t ne1_01mp; uint32_t ne1_0mp; uint32_t ne1_Ls;
+};
+static_assert(sizeof(vk_op_unary_push_constants) <= 128, "sizeof(vk_op_unary_push_constants) must be <= 128");
+
+static vk_op_unary_push_constants vk_op_unary_push_constants_init(const ggml_tensor * src0, const ggml_tensor * dst, int64_t ne = 0) {
+    GGML_ASSERT(ne != 0 || (ggml_nelements(src0) == ggml_nelements(dst)));
+    ne = ne != 0 ? ne : ggml_nelements(dst);
+    GGML_ASSERT(ne <= (int64_t)std::numeric_limits<uint32_t>::max());
+
+    vk_op_unary_push_constants p{};
+    p.ne = (uint32_t)ne;
+
+    size_t src0_tsize = ggml_type_size(src0->type);
+    p.ne00 = (uint32_t)src0->ne[0];
+    p.ne01 = (uint32_t)src0->ne[1];
+    p.ne02 = (uint32_t)src0->ne[2];
+    p.ne03 = (uint32_t)src0->ne[3];
+    p.nb00 = (uint32_t)(src0->nb[0] / src0_tsize);
+    p.nb01 = (uint32_t)(src0->nb[1] / src0_tsize);
+    p.nb02 = (uint32_t)(src0->nb[2] / src0_tsize);
+    p.nb03 = (uint32_t)(src0->nb[3] / src0_tsize);
+
+    size_t dst_tsize = ggml_type_size(dst->type);
+    p.ne10 = (uint32_t)dst->ne[0];
+    p.ne11 = (uint32_t)dst->ne[1];
+    p.ne12 = (uint32_t)dst->ne[2];
+    p.ne13 = (uint32_t)dst->ne[3];
+    p.nb10 = (uint32_t)(dst->nb[0] / dst_tsize);
+    p.nb11 = (uint32_t)(dst->nb[1] / dst_tsize);
+    p.nb12 = (uint32_t)(dst->nb[2] / dst_tsize);
+    p.nb13 = (uint32_t)(dst->nb[3] / dst_tsize);
+
+    return p; // offsets are initialized later in ggml_vk_op
+}
+
+struct vk_op_pad_push_constants {
+    uint32_t ne;
+    uint32_t ne00; uint32_t ne01; uint32_t ne02; uint32_t ne03; uint32_t nb00; uint32_t nb01; uint32_t nb02; uint32_t nb03;
+    uint32_t ne10; uint32_t ne11; uint32_t ne12; uint32_t ne13; uint32_t nb10; uint32_t nb11; uint32_t nb12; uint32_t nb13;
+    uint32_t misalign_offsets;
+    uint32_t circular;
+
+    uint32_t lp0; uint32_t rp0;
+    uint32_t lp1; uint32_t rp1;
+    uint32_t lp2; uint32_t rp2;
+    uint32_t lp3; uint32_t rp3;
+};
+
+static vk_op_pad_push_constants vk_op_pad_push_constants_init(const ggml_tensor * src0, const ggml_tensor * dst) {
+    int64_t ne = ggml_nelements(dst);
+    GGML_ASSERT(ne <= (int64_t)std::numeric_limits<uint32_t>::max());
+
+    vk_op_pad_push_constants p{};
+    p.ne = (uint32_t)ne;
+
+    size_t src0_tsize = ggml_type_size(src0->type);
+    p.ne00 = (uint32_t)src0->ne[0];
+    p.ne01 = (uint32_t)src0->ne[1];
+    p.ne02 = (uint32_t)src0->ne[2];
+    p.ne03 = (uint32_t)src0->ne[3];
+    p.nb00 = (uint32_t)(src0->nb[0] / src0_tsize);
+    p.nb01 = (uint32_t)(src0->nb[1] / src0_tsize);
+    p.nb02 = (uint32_t)(src0->nb[2] / src0_tsize);
+    p.nb03 = (uint32_t)(src0->nb[3] / src0_tsize);
+
+    size_t dst_tsize = ggml_type_size(dst->type);
+    p.ne10 = (uint32_t)dst->ne[0];
+    p.ne11 = (uint32_t)dst->ne[1];
+    p.ne12 = (uint32_t)dst->ne[2];
+    p.ne13 = (uint32_t)dst->ne[3];
+    p.nb10 = (uint32_t)(dst->nb[0] / dst_tsize);
+    p.nb11 = (uint32_t)(dst->nb[1] / dst_tsize);
+    p.nb12 = (uint32_t)(dst->nb[2] / dst_tsize);
+    p.nb13 = (uint32_t)(dst->nb[3] / dst_tsize);
+
+    p.lp0 = dst->op_params[0];
+    p.rp0 = dst->op_params[1];
+    p.lp1 = dst->op_params[2];
+    p.rp1 = dst->op_params[3];
+    p.lp2 = dst->op_params[4];
+    p.rp2 = dst->op_params[5];
+    p.lp3 = dst->op_params[6];
+    p.rp3 = dst->op_params[7];
+    p.circular = dst->op_params[8];
+
+    return p; // fastdiv values and offsets are initialized later in ggml_vk_op
+}
+
+// See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
+// Precompute mp (m' in the paper) and L such that division
+// can be computed using a multiply (high 32b of 64b result)
+// and a shift:
+//
+// n/d = (mulhi(n, mp) + n) >> L;
+static void init_fastdiv_values(uint32_t d, uint32_t &mp, uint32_t &L)
+{
+    // compute L = ceil(log2(d));
+    L = 0;
+    while (L < 32 && (uint32_t{1} << L) < d) {
+        L++;
+    }
+
+    mp = (uint32_t)((uint64_t{1} << 32) * ((uint64_t{1} << L) - d) / d + 1);
+}
+
+static uint32_t pack_fastdiv_L(uint32_t L0, uint32_t L1, uint32_t L2) {
+    return L0 | (L1 << 8) | (L2 << 16);
+}
+
+template <typename T> void init_pushconst_fastdiv(T &p) {
+    GGML_UNUSED(p);
+    static_assert(!std::is_const<T>::value, "unexpected type");
+}
+
+template <> void init_pushconst_fastdiv(vk_op_unary_push_constants &p) {
+    // Compute magic values to divide by these six numbers.
+    uint32_t ne0_012L;
+    uint32_t ne0_01L;
+    uint32_t ne0_0L;
+    uint32_t ne1_012L;
+    uint32_t ne1_01L;
+    uint32_t ne1_0L;
+
+    init_fastdiv_values(p.ne02*p.ne01*p.ne00,  p.ne0_012mp,    ne0_012L);
+    init_fastdiv_values(p.ne01*p.ne00,         p.ne0_01mp,     ne0_01L);
+    init_fastdiv_values(p.ne00,                p.ne0_0mp,      ne0_0L);
+    init_fastdiv_values(p.ne12*p.ne11*p.ne10,  p.ne1_012mp,    ne1_012L);
+    init_fastdiv_values(p.ne11*p.ne10,         p.ne1_01mp,     ne1_01L);
+    init_fastdiv_values(p.ne10,                p.ne1_0mp,      ne1_0L);
+
+    p.ne0_Ls = pack_fastdiv_L(ne0_012L, ne0_01L, ne0_0L);
+    p.ne1_Ls = pack_fastdiv_L(ne1_012L, ne1_01L, ne1_0L);
+}
+
+template <> void init_pushconst_fastdiv(vk_op_glu_push_constants &p) {
+    // GLU linearizes over dst, then uses dst coordinates for src0/src1.
+    init_fastdiv_values(p.ne22*p.ne21*p.ne20,  p.ne2_012mp,    p.ne2_012L);
+    init_fastdiv_values(p.ne21*p.ne20,         p.ne2_01mp,     p.ne2_01L);
+    init_fastdiv_values(p.ne20,                p.ne2_0mp,      p.ne2_0L);
+}
+
+template <> void init_pushconst_fastdiv(vk_op_count_experts_push_constants &p) {
+    init_fastdiv_values(p.ne00, p.ne00mp, p.ne00L);
+}
+
+struct vk_op_binary_push_constants {
+    uint32_t ne;
+    uint32_t ne00; uint32_t ne01; uint32_t ne02; uint32_t ne03; uint32_t nb00; uint32_t nb01; uint32_t nb02; uint32_t nb03;
+    uint32_t ne10; uint32_t ne11; uint32_t ne12; uint32_t ne13; uint32_t nb10; uint32_t nb11; uint32_t nb12; uint32_t nb13;
+    uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23; uint32_t nb20; uint32_t nb21; uint32_t nb22; uint32_t nb23;
+    uint32_t misalign_offsets;
+    float param1; float param2; int32_t param3;
+};
+
+// Distinct type with the same layout so concat can overload tensor offset initialization.
+struct vk_op_concat_push_constants : vk_op_binary_push_constants {};
+static_assert(sizeof(vk_op_concat_push_constants) == sizeof(vk_op_binary_push_constants));
+static_assert(std::is_standard_layout_v<vk_op_concat_push_constants>);
+
+struct vk_op_multi_add_push_constants {
+    // shape for dst
+    uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23;
+
+    // strides for srcs+dst
+    uint32_t nb[MAX_PARAMETER_COUNT][4];
+
+    uint32_t rms_partials;
+};
+// update multi_add.comp if this changes
+static_assert(MAX_PARAMETER_COUNT == 12);
+static_assert(sizeof(vk_op_multi_add_push_constants) <= 256);
+
+struct vk_op_topk_moe_push_constants {
+    uint32_t n_rows;
+    uint32_t n_experts_push;
+    uint32_t n_expert_used;
+    float clamp_min;
+    float clamp_max;
+    uint32_t gating_func;
+    uint32_t has_bias;
+    uint32_t with_norm;
+    float output_scale;
+    float output_bias;
+};
+
+struct vk_op_add_id_push_constants {
+    uint32_t ne0;
+    uint32_t ne1;
+    uint32_t s01;
+    uint32_t s02;
+    uint32_t s11;
+    uint32_t s21;
+};
+
+struct vk_op_diag_mask_push_constants {
+    uint32_t ncols;
+    uint32_t rows_per_channel;
+    int32_t n_past;
+};
+
+struct vk_op_rope_push_constants {
+    uint32_t rope_mode;
+    uint32_t nrows;
+    uint32_t n_dims;
+    uint32_t n_offs;
+    float freq_scale;
+    float freq_base;
+    float ext_factor;
+    float attn_factor;
+    float corr_dims[2];
+    float theta_scale;
+    uint32_t has_ff;
+    int32_t sections[4];
+    uint32_t is_imrope;
+    uint32_t is_back;
+    uint32_t set_rows_stride;
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t ne02;
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb13;
+    uint32_t a_offset;
+    uint32_t d_offset;
+};
+static_assert(sizeof(vk_op_rope_push_constants) <= 128, "sizeof(vk_op_rope_push_constants) must be <= 128");
+
+// For fused rms_norm+mul+rope(+view+set_rows)
+struct vk_op_rms_norm_mul_rope_push_constants {
+    vk_op_binary_push_constants bin;
+    vk_op_rope_push_constants rope;
+};
+
+struct vk_op_soft_max_push_constants {
+    uint32_t KX;
+    uint32_t KY;
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t ne02;
+    uint32_t ne12;
+    uint32_t ne13;
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb13;
+    float scale;
+    float max_bias;
+    float m0;
+    float m1;
+    uint32_t n_head_log2;
+    uint32_t nrows_x;
+    uint32_t has_sinks;
+};
+
+struct vk_op_argsort_push_constants {
+    uint32_t ncols;
+    uint32_t ncols_padded;
+    uint32_t ncols_padded_log2;
+    uint32_t nrows;
+    uint32_t order;
+    uint32_t outer_start;
+    uint32_t outer_end;
+    uint32_t inner_start;
+    uint32_t inner_end;
+};
+
+struct vk_op_topk_push_constants {
+    uint32_t orig_ncols;
+    uint32_t ncols_input;
+    uint32_t ncols_output;
+    uint32_t k;
+    uint32_t nrows;
+    uint32_t first_pass;
+    uint32_t last_pass;
+};
+
+struct vk_op_topk_radix_push_constants {
+    uint32_t ncols;
+    uint32_t k;
+    uint32_t nrows;
+    uint32_t n_tps;    // QSA only
+    uint32_t n_blocks; // QSA only
+    uint32_t n_stream; // QSA only
+};
+
+struct vk_op_im2col_push_constants {
+    uint64_t dst_addr;
+    uint32_t batch_offset; uint32_t offset_delta;
+    uint32_t IC;
+    uint32_t IW; uint32_t IH;
+    uint32_t OW; uint32_t OH;
+    uint32_t KW; uint32_t KH;
+    uint32_t OH_batch;
+    uint32_t CHW;
+    int32_t s0; int32_t s1;
+    int32_t p0; int32_t p1;
+    int32_t d0; int32_t d1;
+    uint32_t batch_IC;
+};
+
+struct vk_op_im2col_3d_push_constants {
+    uint64_t dst_addr;
+    uint32_t nb10;
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb13;
+    uint32_t s0;
+    uint32_t s1;
+    uint32_t s2;
+    uint32_t p0;
+    uint32_t p1;
+    uint32_t p2;
+    uint32_t d0;
+    uint32_t d1;
+    uint32_t d2;
+    uint32_t IW;
+    uint32_t IH;
+    uint32_t ID;
+    uint32_t IC;
+    uint32_t KW;
+    uint32_t OH;
+    uint32_t KD_KH_KW;
+    uint32_t KH_KW;
+    uint32_t IC_KD_KH_KW;
+    uint32_t N_OD_OH;
+    uint32_t OD_OH;
+    uint32_t OD_OH_OW_IC_KD_KH_KW;
+    uint32_t OH_OW_IC_KD_KH_KW;
+    uint32_t OW_IC_KD_KH_KW;
+    uint32_t misalign_offsets;
+};
+
+struct vk_op_timestep_embedding_push_constants {
+    uint32_t nb1;
+    uint32_t dim;
+    uint32_t max_period;
+};
+
+struct vk_op_col2im_1d_push_constants {
+    uint32_t T_out;
+    uint32_t OC;
+    uint32_t K_OC;
+    uint32_t T_in;
+    uint32_t K;
+    int32_t  stride;
+    int32_t  p0;
+};
+
+struct vk_op_conv_transpose_1d_push_constants {
+    uint32_t Cout;
+    uint32_t Cin;
+    uint32_t K;
+    uint32_t L;
+    uint32_t KL;
+
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb11;
+    uint32_t nb1;
+
+    int32_t s0;
+};
+
+struct vk_op_snake_push_constants {
+    uint32_t ne0;
+    uint32_t ne1;
+};
+
+struct vk_op_pool1d_push_constants {
+    uint32_t IL;
+    uint32_t OL;
+    uint32_t OC;
+    uint32_t pelements;
+    uint32_t op;
+    int32_t k0;
+    int32_t s0;
+    int32_t p0;
+};
+
+struct vk_op_pool2d_push_constants {
+    uint32_t IW; uint32_t IH;
+    uint32_t OW; uint32_t OH;
+    uint32_t OC;
+    uint32_t pelements;
+    uint32_t op;
+    int32_t k0; int32_t k1;
+    int32_t s0; int32_t s1;
+    int32_t p0; int32_t p1;
+};
+
+struct vk_op_rwkv_wkv6_push_constants {
+    uint32_t B;
+    uint32_t T;
+    uint32_t C;
+    uint32_t H;
+};
+
+struct vk_op_rwkv_wkv7_push_constants {
+    uint32_t B;
+    uint32_t T;
+    uint32_t C;
+    uint32_t H;
+};
+struct vk_op_gated_linear_attn_push_constants {
+    uint32_t B;
+    uint32_t T;
+    uint32_t C;
+    uint32_t H;
+    float scale;
+};
+struct vk_op_lightning_indexer_push_constants {
+    uint32_t n_kv;
+    uint32_t n_heads;
+    uint32_t n_tokens;
+    uint32_t n_streams;
+    uint32_t n_masks;
+    uint32_t dispatch_x;
+    uint32_t q_nb1;
+    uint32_t q_nb2;
+    uint32_t q_nb3;
+    uint32_t k_nb2;
+    uint32_t k_nb3;
+    uint32_t w_nb1;
+    uint32_t w_nb3;
+    uint32_t m_nb1;
+    uint32_t m_nb3;
+    uint32_t d_nb1;
+    uint32_t d_nb3;
+};
+static_assert(sizeof(vk_op_lightning_indexer_push_constants) <= 128);
+struct vk_op_gated_delta_net_push_constants {
+    uint32_t H;
+    uint32_t n_tokens;
+    uint32_t n_seqs;
+    uint32_t s_off;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sv1, sv2, sv3;
+    uint32_t sb1, sb2, sb3;
+    uint32_t neq1, rq3;
+    float scale;
+    uint32_t K;
+};
+
+// push constants for the fork's wave64 f16 lightning-indexer kernels (scalar-64 + CM family)
+struct vk_op_lightning_indexer_cm_push_constants {
+    uint32_t n_kv, n_batch, n_stream, nem3;
+    uint32_t nb1, nb3;
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk2, nbk3;
+    uint32_t nbw1, nbw3;
+    uint32_t nbm1, nbm3;
+};
+static_assert(sizeof(vk_op_lightning_indexer_cm_push_constants) <= 128);
+
+struct vk_op_dsv4_hc_pre_push_constants {
+    uint32_t n_embd, hc, nr;
+    uint32_t sx0, sx1, sx2;
+    uint32_t sw0, sw1;
+    uint32_t sd0, sd1;
+};
+static_assert(sizeof(vk_op_dsv4_hc_pre_push_constants) <= 128);
+
+struct vk_op_dsv4_hc_comb_push_constants {
+    uint32_t n_tokens;
+    uint32_t sm0, sm1;
+    uint32_t ss0;
+    uint32_t sb0;
+    uint32_t sd0, sd1, sd2;
+    float    eps;
+    int32_t  n_iter;
+};
+static_assert(sizeof(vk_op_dsv4_hc_comb_push_constants) <= 128);
+
+struct vk_op_dsv4_hc_post_push_constants {
+    uint32_t n_embd, hc, nr;
+    uint32_t sx0, sx1;
+    uint32_t sr0, sr1, sr2;
+    uint32_t sp0, sp1;
+    uint32_t sc0, sc1, sc2;
+    uint32_t sd0, sd1, sd2;
+};
+static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
+
+struct vk_op_flash_attn_union_push_constants {
+    uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to, count_only;
+};
+// nbk1/nbk3 are in 4-byte WORDS, not elements: the gather relocates K rows verbatim and never
+// interprets what is in them, so it works for any type whose row is a whole number of words.
+struct vk_op_flash_attn_gather_union_push_constants {
+    uint32_t n_kv, n_kv_raw, kv_c_max, nbk1, nbm1, n_batch, row_words;
+};
+struct vk_op_flash_attn_gather_push_constants {
+    uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
+    uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, nem3, n_batch, row_words;
+};
+static_assert(sizeof(vk_op_flash_attn_gather_push_constants) <= 128);
+
+struct vk_op_flash_attn_top_k_push_constants {
+    uint32_t n_batch, n_kv, n_kv_raw, n_top_k, n_head;
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk1, nbk3;
+    uint32_t nbm1, nbm3;
+    uint32_t nbt1, nbt3;
+    uint32_t nb1, nb2, nb3;
+    float scale;
+    uint32_t has_sinks;
+    uint32_t split_mode;
+};
+static_assert(sizeof(vk_op_flash_attn_top_k_push_constants) <= 128);
+
+struct vk_op_ssm_scan_push_constants {
+    uint32_t nb02, nb03, nb12, nb13;
+    uint32_t nb21, nb22, nb31;
+    uint32_t nb42, nb43, nb52, nb53;
+    uint32_t s_off;
+    uint32_t n_head, d_head, n_group, n_tok;
+    uint32_t n_seq, K;
+};
+struct vk_op_ssm_conv_push_constants {
+    uint32_t nb01, nb02;
+    uint32_t nb11;
+    uint32_t dst_nb0, dst_nb1, dst_nb2;
+    uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+struct vk_op_conv2d_push_constants {
+    uint32_t Cout;
+    uint32_t Cin;
+    uint32_t N;
+
+    uint32_t W;
+    uint32_t H;
+    uint32_t OW;
+    uint32_t OH;
+
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb13;
+
+    uint32_t nb1;
+    uint32_t nb2;
+    uint32_t nb3;
+
+    // init_fastdiv_values constants for dividing by OW, OW*OH
+    uint32_t OWmp;   uint32_t OWL;
+    uint32_t OWOHmp; uint32_t OWOHL;
+};
+
+template <> void init_pushconst_fastdiv(vk_op_conv2d_push_constants &p) {
+    // Compute magic values to divide by OW, OW*OH
+    init_fastdiv_values(p.OW,       p.OWmp,    p.OWL);
+    init_fastdiv_values(p.OW*p.OH,  p.OWOHmp,  p.OWOHL);
+}
+
+struct vk_op_conv3d_push_constants {
+    uint32_t OC;
+    uint32_t IC;
+    uint32_t N;
+
+    uint32_t IW;
+    uint32_t IH;
+    uint32_t ID;
+    uint32_t OW;
+    uint32_t OH;
+    uint32_t OD;
+
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb13;
+
+    uint32_t nb1;
+    uint32_t nb2;
+    uint32_t nb3;
+
+    uint32_t OWmp;     uint32_t OWL;
+    uint32_t OWOHmp;   uint32_t OWOHL;
+    uint32_t OWOHODmp; uint32_t OWOHODL;
+};
+
+template <> void init_pushconst_fastdiv(vk_op_conv3d_push_constants &p) {
+    init_fastdiv_values(p.OW,             p.OWmp,     p.OWL);
+    init_fastdiv_values(p.OW*p.OH,        p.OWOHmp,   p.OWOHL);
+    init_fastdiv_values(p.OW*p.OH*p.OD,   p.OWOHODmp, p.OWOHODL);
+}
+
+struct vk_op_conv2d_dw_push_constants {
+    uint32_t ne;
+    uint32_t batches;
+    uint32_t channels;
+    uint32_t dst_w;
+    uint32_t dst_h;
+    uint32_t src_w;
+    uint32_t src_h;
+    uint32_t knl_w;
+    uint32_t knl_h;
+    int32_t stride_x;
+    int32_t stride_y;
+    int32_t pad_x;
+    int32_t pad_y;
+    int32_t dilation_x;
+    int32_t dilation_y;
+};
+
+struct vk_op_upscale_push_constants {
+    uint32_t ne; uint32_t a_offset; uint32_t d_offset;
+    uint32_t ne00; uint32_t ne01;
+    uint32_t nb00; uint32_t nb01; uint32_t nb02; uint32_t nb03;
+    uint32_t ne10; uint32_t ne11; uint32_t ne12; uint32_t ne13;
+    float sf0; float sf1; float sf2; float sf3;
+    float pixel_offset;
+};
+
+struct vk_op_sum_rows_push_constants
+{
+    uint32_t n_cols;
+    uint32_t ne01, ne02;
+    uint32_t nb01, nb02, nb03;
+    uint32_t nb11, nb12, nb13;
+    float weight;
+    uint32_t misalign_offsets;
+    uint32_t ne0_12mp, ne0_12L;
+    uint32_t ne0_1mp, ne0_1L;
+};
+
+static vk_op_sum_rows_push_constants vk_op_sum_rows_push_constants_init(const ggml_tensor * src, const ggml_tensor * dst, int64_t n_cols) {
+    uint32_t type_size = (uint32_t)ggml_type_size(src->type);
+    vk_op_sum_rows_push_constants p = {};
+    p.n_cols = (uint32_t)n_cols;
+    p.ne01 = (uint32_t)src->ne[1];
+    p.ne02 = (uint32_t)src->ne[2];
+    p.nb01 = (uint32_t)src->nb[1] / type_size;
+    p.nb02 = (uint32_t)src->nb[2] / type_size;
+    p.nb03 = (uint32_t)src->nb[3] / type_size;
+    p.nb11 = (uint32_t)dst->nb[1] / type_size;
+    p.nb12 = (uint32_t)dst->nb[2] / type_size;
+    p.nb13 = (uint32_t)dst->nb[3] / type_size;
+    p.weight = 1.0f;
+    return p;
+}
+
+template <> void init_pushconst_fastdiv(vk_op_sum_rows_push_constants &p) {
+    init_fastdiv_values(p.ne01*p.ne02, p.ne0_12mp, p.ne0_12L);
+    init_fastdiv_values(p.ne01,        p.ne0_1mp,  p.ne0_1L);
+}
+
+struct vk_quantize_q8_1_push_constants {
+    uint32_t ne;
+    uint32_t num_blocks;
+};
+
+struct vk_op_flash_attn_split_k_reduce_push_constants {
+    uint32_t D;
+    uint32_t ne1;
+    // ne2 describes the SPLIT BUFFER (which may cover only a tile of queries); dst_ne2 is the
+    // destination's query count. They differ only when the caller tiles the split buffer, and
+    // the destination stride between streams must always use the full count.
+    uint32_t ne2;
+    uint32_t dst_ne2;
+    uint32_t ne3;
+    uint32_t k_num;
+    uint32_t sinks;
+};
+
+struct vk_op_flash_attn_mask_opt_push_constants {
+    uint32_t nem0;
+    uint32_t nem1;
+    uint32_t nem2;
+    uint32_t nbm1;
+    uint32_t nbm2;
+    uint32_t nbm3;
+    uint32_t nbd1;
+    uint32_t nbd2;
+    uint32_t nbd3;
+};
+
+// Allow pre-recording command buffers
+struct vk_staging_memcpy {
+    vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
+
+    void * dst;
+    const void * src;
+    size_t n;
+};
+
+struct vk_staging_memset {
+    vk_staging_memset(void * _dst, uint32_t _val, size_t _n) : dst(_dst), val(_val), n(_n) {}
+
+    void * dst;
+    uint32_t val;
+    size_t n;
+};
+
+struct vk_context_struct {
+    vk_submission * s;
+    std::vector<vk_sequence> seqs;
+
+    int exit_tensor_idx;
+
+    std::vector<vk_staging_memcpy> in_memcpys;
+    std::vector<vk_staging_memcpy> out_memcpys;
+    std::vector<vk_staging_memset> memsets;
+
+    vk_command_pool * p {};
+};
+typedef std::shared_ptr<vk_context_struct> vk_context;
+typedef std::weak_ptr<vk_context_struct> vk_context_ref;
+
+struct ggml_vk_garbage_collector {
+    std::vector<vk_semaphore> tl_semaphores;
+    std::vector<vk_semaphore> semaphores;
+    std::vector<vk::Event> events;
+    std::vector<vk_context> contexts;
+};
+
+static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx);
+static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr);
+static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx);
+static bool ggml_vk_intel_windows_driver_in_range(uint32_t driver_version, uint32_t lower_major, uint32_t lower_minor, uint32_t upper_major, uint32_t upper_minor);
+
+static bool vk_memory_logger_enabled = false;
+
+#define VK_LOG_MEMORY(msg) if (vk_memory_logger_enabled) { std::cerr << "ggml_vulkan memory: " << msg << std::endl; }
+
+static std::string format_size(size_t size) {
+    const size_t kib = 1024;
+    const size_t mib = kib * 1024;
+    const size_t gib = mib * 1024;
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+
+    if (size >= gib) {
+        oss << static_cast<double>(size) / gib << " GiB";
+    } else if (size >= mib) {
+        oss << static_cast<double>(size) / mib << " MiB";
+    } else if (size >= kib) {
+        oss << static_cast<double>(size) / kib << " KiB";
+    } else {
+        oss << size << " B";
+    }
+
+    return oss.str();
+}
+
+class vk_memory_logger {
+public:
+    vk_memory_logger(): total_device(0), total_host(0) {}
+    void log_allocation(vk_buffer_ref buf_ref, size_t size);
+    void log_deallocation(vk_buffer_ref buf_ref);
+
+private:
+    std::map<vk::Buffer, size_t> allocations; // Track allocations
+    size_t total_device;
+    size_t total_host;
+    static std::mutex log_mutex;
+};
+
+std::mutex vk_memory_logger::log_mutex;
+
+static bool vk_perf_logger_enabled = false;
+static bool vk_perf_logger_concurrent = false;
+static bool vk_enable_sync_logger = false;
+// number of calls between perf logger prints
+static uint32_t vk_perf_logger_frequency = 1;
+static std::string vk_pipeline_stats_filter;
+
+// Total memory traffic of a node (dst + srcs). Used to bound command buffer
+// execution time for bandwidth-bound ops with no flops estimate (large copies,
+// set_rows, mask fills at long context) - packing too many of them into one
+// submission can exceed the driver timeout.
+static uint64_t ggml_vk_get_node_bytes(const ggml_tensor * node) {
+    uint64_t bytes = ggml_nbytes(node);
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node->src[i]) {
+            bytes += ggml_nbytes(node->src[i]);
+        }
+    }
+    return bytes;
+}
+
+static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
         const uint64_t m     = node->ne[0];
         const uint64_t n     = node->ne[1];
@@ -4919,6 +5955,15 @@ vk_device ggml_vk_get_device(size_t idx) {
         if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
+        }
+
+        // Also submit once a batch has accumulated enough memory traffic, so that
+        // bandwidth-bound nodes with no flops estimate cannot grow a command buffer
+        // past the driver timeout. 0 disables the limit.
+        device->max_bytes_per_submit = 8ull * 1024 * 1024 * 1024;
+        const char* GGML_VK_MAX_MB_PER_SUBMIT = getenv("GGML_VK_MAX_MB_PER_SUBMIT");
+        if (GGML_VK_MAX_MB_PER_SUBMIT != nullptr) {
+            device->max_bytes_per_submit = std::stoull(GGML_VK_MAX_MB_PER_SUBMIT) * 1024 * 1024;
         }
 
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
@@ -16464,6 +17509,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint32_t submitted_nodes = 0;
     uint32_t submit_count = 0;
     uint64_t batch_flops = 0;
+    uint64_t batch_bytes = 0;
     uint64_t total_flops = 0;
     uint64_t flops_cap = 200'000'000'000ULL;
 
@@ -16501,6 +17547,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         first_node_in_batch = true;
         submitted_nodes = 0;
         batch_flops = 0;
+        batch_bytes = 0;
         if (submit_count < 3) {
             flops_per_submit *= 2;
         }
@@ -16515,9 +17562,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         {
             auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
             total_flops += node_flops;
+            auto node_bytes = ggml_vk_get_node_bytes(cgraph->nodes[i]);
 
-            // Flush the current batch before recording a node that would push it over the flop threshold
-            if (flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) {
+            // Flush the current batch before recording a node that would push it over the flop or byte threshold
+            if ((flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) ||
+                (ctx->device->max_bytes_per_submit != 0 && submitted_nodes > 0 && batch_bytes + node_bytes >= ctx->device->max_bytes_per_submit)) {
                 vk_context flush_ctx = ggml_vk_get_compute_ctx(ctx);
                 ggml_vk_ctx_end(flush_ctx);
                 flush_ctx->exit_tensor_idx = -1;
@@ -16528,6 +17577,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
 
             batch_flops += node_flops;
+            batch_bytes += node_bytes;
         }
 
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
@@ -16791,6 +17841,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
+                      (ctx->device->max_bytes_per_submit != 0 && batch_bytes >= ctx->device->max_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
