@@ -1,0 +1,101 @@
+#version 450
+
+// DeepSeek V4 fused hyper-connection "comb": build the 4x4 stream-mixing matrix per token —
+// per-source softmax over scaled+biased logits, then eps-stabilized alternating column/row
+// (sinkhorn) normalization. Port of ggml-cuda/dsv4-hc.cu (hc_comb): one THREAD per token,
+// the whole 4x4 lives in registers. At decode this is a single active thread by design —
+// the fusion's value is collapsing the ~dozen decomposed graph ops (and their intermediate
+// tensors) into one dispatch, not throughput.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer MBuf { float data_mixes[]; };
+layout(binding = 1) readonly  buffer SBuf { float data_scale[]; };
+layout(binding = 2) readonly  buffer BBuf { float data_base[];  };
+layout(binding = 3) writeonly buffer DBuf { float data_d[];     };
+
+layout(push_constant) uniform Parameters {
+    uint  n_tokens;
+    uint  sm0, sm1;
+    uint  ss0;
+    uint  sb0;
+    uint  sd0, sd1, sd2;
+    float eps;
+    int   n_iter;
+} p;
+
+const uint HC = 4;
+const uint COMB_OFFSET = 2 * HC; // comb logits start after the pre/post blocks of the mix vector
+
+void norm_cols(inout float comb[HC * HC]) {
+    for (uint idst = 0; idst < HC; ++idst) {
+        float sum = p.eps;
+        for (uint isrc = 0; isrc < HC; ++isrc) {
+            sum += comb[idst + HC * isrc];
+        }
+        const float inv_sum = 1.0 / sum;
+        for (uint isrc = 0; isrc < HC; ++isrc) {
+            comb[idst + HC * isrc] *= inv_sum;
+        }
+    }
+}
+
+void norm_rows(inout float comb[HC * HC]) {
+    for (uint isrc = 0; isrc < HC; ++isrc) {
+        float sum = p.eps;
+        for (uint idst = 0; idst < HC; ++idst) {
+            sum += comb[idst + HC * isrc];
+        }
+        const float inv_sum = 1.0 / sum;
+        for (uint idst = 0; idst < HC; ++idst) {
+            comb[idst + HC * isrc] *= inv_sum;
+        }
+    }
+}
+
+void main() {
+    const uint it = gl_GlobalInvocationID.x;
+    if (it >= p.n_tokens) {
+        return;
+    }
+
+    const float scale_comb = data_scale[2 * p.ss0];
+    float comb[HC * HC];
+
+    for (uint isrc = 0; isrc < HC; ++isrc) {
+        float vmax = uintBitsToFloat(0xff800000); // -inf
+        for (uint idst = 0; idst < HC; ++idst) {
+            const uint idx = idst + HC * isrc;
+            const float v = data_mixes[(COMB_OFFSET + idx) * p.sm0 + it * p.sm1] * scale_comb
+                          + data_base[(COMB_OFFSET + idx) * p.sb0];
+            comb[idx] = v;
+            vmax = max(vmax, v);
+        }
+
+        float sum = 0.0;
+        for (uint idst = 0; idst < HC; ++idst) {
+            const uint idx = idst + HC * isrc;
+            const float v = exp(comb[idx] - vmax);
+            comb[idx] = v;
+            sum += v;
+        }
+
+        const float inv_sum = 1.0 / sum;
+        for (uint idst = 0; idst < HC; ++idst) {
+            const uint idx = idst + HC * isrc;
+            comb[idx] = comb[idx] * inv_sum + p.eps;
+        }
+    }
+
+    norm_cols(comb);
+    for (int i = 1; i < p.n_iter; ++i) {
+        norm_rows(comb);
+        norm_cols(comb);
+    }
+
+    for (uint isrc = 0; isrc < HC; ++isrc) {
+        for (uint idst = 0; idst < HC; ++idst) {
+            data_d[idst * p.sd0 + isrc * p.sd1 + it * p.sd2] = comb[idst + HC * isrc];
+        }
+    }
+}
