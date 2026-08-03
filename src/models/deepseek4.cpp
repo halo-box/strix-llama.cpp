@@ -1205,6 +1205,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
     out = ggml_permute(ctx0, out, 0, 2, 1, 3);
+    // small multi-token batches (speculative verify) hit a pathological strided-B
+    // path in the grouped matmul below; a contiguous copy is much cheaper
+    if (nt > 1 && nt <= 8) {
+        out = ggml_cont(ctx0, out);
+    }
     ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
     cb(oa, "attn_wo_a", il);
     oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
