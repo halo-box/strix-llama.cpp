@@ -68,6 +68,9 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+// Fused MUL epilogue: one scale per (expert slot, token), broadcast down the M dimension.
+// Always bound; p.fusion_flags == 0 means ignore it.
+layout (binding = 5) readonly buffer FusedScale {float data_fscale[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -90,6 +93,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint hoist_row_ids;
+    uint fusion_flags;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -394,9 +398,13 @@ void main() {
                 if (row_i >= _ne1) break;
 
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
-
                 if (dr + cm_row * TM + store_r < p.M) {
-                    data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r;
+                    if (p.fusion_flags != 0) {
+                        data_d[didx] = D_TYPE(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]) * data_fscale[row_idx.y * p.nei0 + row_idx.x]);
+                    } else {
+                        data_d[didx] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    }
                 }
             }
             barrier();
@@ -449,15 +457,19 @@ void main() {
                 if (row_i >= _ne1) break;
 
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
+                const bool do_scale = p.fusion_flags != 0;
+                const float fscale = do_scale ? data_fscale[row_idx.y * p.nei0 + row_idx.x] : 1.0f;
 #endif // MUL_MAT_ID
                 [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
                     const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
 #ifdef MUL_MAT_ID
                     if (dr_warp + 2 * cr < p.M) {
-                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);
+                        const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr;
+                        data_d[didx] = do_scale ? D_TYPE(float(sums[sums_idx].x) * fscale) : D_TYPE(sums[sums_idx].x);
                     }
                     if (dr_warp + 2 * cr + 1 < p.M) {
-                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
+                        const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1;
+                        data_d[didx] = do_scale ? D_TYPE(float(sums[sums_idx].y) * fscale) : D_TYPE(sums[sums_idx].y);
                     }
 #else
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {
