@@ -18727,8 +18727,10 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
             if (get_misalign_bytes(ctx, scale) != 0) {
                 return false;
             }
-            return scale->ne[0] == 1 &&
-                   scale->ne[1] == mmid->ne[1] && scale->ne[2] == mmid->ne[2] && scale->ne[3] == mmid->ne[3] &&
+            // The shader indexes the scale as [token * nei0 + expert_slot] from row_ids, which
+            // carries no 4th dimension, so ne[3] must be 1 or later batches read the wrong scale.
+            return scale->ne[0] == 1 && mmid->ne[3] == 1 && scale->ne[3] == 1 &&
+                   scale->ne[1] == mmid->ne[1] && scale->ne[2] == mmid->ne[2] &&
                    ggml_are_same_shape(mul, mmid);
         }
         // shaders assume the types match
