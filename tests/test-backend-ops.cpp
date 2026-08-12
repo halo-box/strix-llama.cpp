@@ -915,6 +915,7 @@ struct test_operation_info {
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 512,  4,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(1024,  64,  65, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 128, 256, 512, false));
 
 
