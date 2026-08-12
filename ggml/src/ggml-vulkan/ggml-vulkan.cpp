@@ -1091,6 +1091,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_cm_f16;
     vk_pipeline pipeline_lightning_indexer_decode_cm_f16;
     vk_pipeline pipeline_flash_attn_top_k_f16;
+    vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
@@ -6079,6 +6080,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_decode_cm_f16,
                 "lightning_indexer_decode_cm_f16", lightning_indexer_decode_cm_f16_len, lightning_indexer_decode_cm_f16_data, "main", 5,
                 sizeof(vk_op_lightning_indexer_cm_push_constants), {16, 1, 1}, {device->subgroup_size}, 1, true, true,
+                device->subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_cm_f16,
+                "flash_attn_top_k_cm_f16", flash_attn_top_k_cm_f16_len, flash_attn_top_k_cm_f16_data, "main", 6,
+                sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {512, device->subgroup_size}, 1, true, true,
                 device->subgroup_size);
         }
 #endif
@@ -11175,7 +11180,9 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
         const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     const ggml_tensor * top_k = dst->src[5];
-    if (!top_k || !ctx->device->pipeline_flash_attn_top_k_f16 ||
+    static const char * top_k_env = getenv("GGML_VK_FA_TOPK");
+    if ((top_k_env && top_k_env[0] == '0') ||
+        !top_k || (!ctx->device->pipeline_flash_attn_top_k_f16 && !ctx->device->pipeline_flash_attn_top_k_cm_f16) ||
         q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
         !mask || mask->type != GGML_TYPE_F16 || top_k->type != GGML_TYPE_I32 ||
         q->ne[0] != 512 || q->ne[1] < 64 || k->ne[0] != 512 || v->ne[0] != 512 ||
@@ -11225,12 +11232,15 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
 
     const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
     const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
-    vk_pipeline pipeline = ctx->device->pipeline_flash_attn_top_k_f16;
+    static const char * top_k_cm_env = getenv("GGML_VK_FA_TOPK_CM");
+    const bool use_cm = (!top_k_cm_env || top_k_cm_env[0] != '0') && ctx->device->pipeline_flash_attn_top_k_cm_f16;
+    vk_pipeline pipeline = use_cm ? ctx->device->pipeline_flash_attn_top_k_cm_f16 : ctx->device->pipeline_flash_attn_top_k_f16;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, mask), sinks_buf,
          ggml_vk_tensor_subbuffer(ctx, top_k), ggml_vk_tensor_subbuffer(ctx, dst)},
-        pc, {(uint32_t) q->ne[1], (uint32_t) CEIL_DIV(q->ne[2], 8), (uint32_t) q->ne[3]});
+        pc, {(uint32_t) q->ne[1], (uint32_t) CEIL_DIV(q->ne[2], use_cm ? 32 : 8), (uint32_t) q->ne[3]});
+    ggml_vk_perf_mark_subop(ctx, subctx, use_cm ? "FA_TOP_K_CM (sub-op)" : "FA_TOP_K_SPARSE (sub-op)");
     return true;
 }
 
