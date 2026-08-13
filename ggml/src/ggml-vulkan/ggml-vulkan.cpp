@@ -11349,8 +11349,14 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     }
 
     const uint32_t n_batch = (uint32_t) q->ne[1];
-    // every token gets its own top-k block; bounded by n_kv_raw + n_batch*n_top_k regardless
-    // of context depth, which is the whole point at decode
+    // Every token gets its own top-k block, so the compact set is n_kv_raw + n_batch*n_top_k:
+    // independent of context depth, which is the point, but GROWING WITH BATCH. Attention work
+    // is then n_batch * (n_kv_raw + n_batch*n_top_k), i.e. quadratic in batch, against dense's
+    // n_batch * n_kv. Break-even is n_batch = (n_kv - n_kv_raw) / n_top_k, and the
+    // kv >= 2*kv_c gate below caps the useful batch at (n_kv/2 - n_kv_raw) / n_top_k --
+    // about 6 at 32k depth, ~30 at 128k, batch-capped at 512k. Beyond that the gate declines
+    // and dense runs, so this can never be slower; it just stops helping. A deduplicated union
+    // would lift that ceiling wherever draft tokens select overlapping keys.
     const uint32_t kv_c = GGML_PAD((uint32_t)(n_kv_raw + (int64_t) n_batch * top_k->ne[0]), 256u);
     // the gather writes then re-reads ~the active bytes; dense reads the source KV once,
     // so compaction only pays when the source is comfortably larger than the active set
