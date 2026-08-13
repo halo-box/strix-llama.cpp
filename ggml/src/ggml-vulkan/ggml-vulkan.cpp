@@ -1971,7 +1971,6 @@ struct vk_op_flash_attn_top_k_push_constants {
     uint32_t nb1, nb2, nb3;
     float scale;
     uint32_t has_sinks;
-    uint32_t profile_stage;
     uint32_t split_mode;
 };
 static_assert(sizeof(vk_op_flash_attn_top_k_push_constants) <= 128);
@@ -11210,7 +11209,14 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         return false;
     }
     const int64_t n_kv_active = n_kv_raw + top_k->ne[0];
-    if (k->ne[1] <= n_kv_active) {
+    // Crossover against ordinary dense FA. The coopmat sparse path (and especially the
+    // raw/selected split below) is cheap enough to win as soon as any key is pruned; the
+    // scalar fallback shader is not, and regresses against dense FA until the pruned
+    // fraction is large, so it keeps its original 3x margin. Equality always uses dense
+    // FA because nothing is pruned.
+    const bool have_cm_sparse = ctx->device->pipeline_flash_attn_top_k_cm_f16 != nullptr;
+    const int64_t min_total_k = have_cm_sparse ? n_kv_active + 1 : 3 * n_kv_active;
+    if (k->ne[1] < min_total_k) {
         return false;
     }
 
@@ -11229,15 +11235,13 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         (uint32_t) (dst->nb[1] / sizeof(float)),
         (uint32_t) (dst->nb[2] / sizeof(float)),
         (uint32_t) (dst->nb[3] / sizeof(float)),
-        scale, sinks != nullptr, 0, 0,
+        scale, sinks != nullptr, 0,
     };
 
     const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
     const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     static const char * top_k_cm_env = getenv("GGML_VK_FA_TOPK_CM");
     const bool use_cm = (!top_k_cm_env || top_k_cm_env[0] != '0') && ctx->device->pipeline_flash_attn_top_k_cm_f16;
-    static const char * top_k_profile_env = getenv("GGML_VK_FA_TOPK_PROFILE");
-    pc.profile_stage = use_cm && top_k_profile_env ? atoi(top_k_profile_env) : 0;
     vk_pipeline pipeline = use_cm ? ctx->device->pipeline_flash_attn_top_k_cm_f16 : ctx->device->pipeline_flash_attn_top_k_f16;
 
     static const char * top_k_split_env = getenv("GGML_VK_FA_TOPK_SPLIT");
@@ -11277,13 +11281,12 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                     pipelines[raw_state] = raw_pipeline = std::make_shared<vk_pipeline_struct>();
                 }
             }
-            ggml_pipeline_request_descriptor_sets(ctx, raw_pipeline, n_tiles);
-            ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_tiles);
-            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, n_tiles);
-
             const uint64_t partition_size = ((uint64_t) D * NH + NH * 2) * sizeof(float) * tile_size * NS;
             const uint64_t split_size = partition_size * partitions;
             if (split_size <= ctx->device->properties.limits.maxStorageBufferRange) {
+                ggml_pipeline_request_descriptor_sets(ctx, raw_pipeline, n_tiles);
+                ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_tiles);
+                ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, n_tiles);
                 if (ctx->prealloc_size_split_k < split_size) {
                     ctx->prealloc_size_split_k = split_size;
                     ggml_vk_preallocate_buffers(ctx, subctx);
@@ -11292,7 +11295,14 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                     ggml_vk_sync_buffers(ctx, subctx);
                 }
 
-                const uint32_t n_head_log2 = 64;
+                // ALiBi is disabled (max_bias == 0), so n_head_log2 is never read; keep it 0
+                // rather than a value that looks computed.
+                const uint32_t n_head_log2 = 0;
+                // The raw dispatch smuggles the mask row stride through split_kv, which the FA
+                // shader also uses to derive its KV range as min(KV, (split_k_index+1)*split_kv).
+                // That is only safe while split_k_index == 0 and the stride covers the whole raw
+                // prefix -- both hold here, but assert rather than rely on it silently.
+                GGML_ASSERT(mask_stride >= raw_kv && "split_kv carries the mask stride; it must not clip the raw KV range");
                 const uint32_t mask_stride_in_split_kv = 1u << 31;
                 const uint32_t packed_gqa = mask_stride_in_split_kv | 1u;
                 const uint32_t packed_partitions = (partitions << 16) | 1;
