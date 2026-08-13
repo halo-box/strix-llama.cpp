@@ -753,7 +753,7 @@ static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
-    uint32_t nbk1, nbk3, nbt3, nbm3, nem3;
+    uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, nem3, n_batch;
 };
 static_assert(sizeof(vk_op_flash_attn_gather_push_constants) <= 128);
 
