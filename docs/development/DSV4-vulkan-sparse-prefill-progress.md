@@ -262,7 +262,7 @@ Always run these sequentially. Do not run a compiler concurrently on this APU.
 
 An uncommitted follow-up prototype was tested after commit `24c7ead76cc1a9631fa1b42b0bfa53a15169e1ba`. Check `git status` before continuing. It was initially tested with `GGML_VK_FA_TOPK_SPLIT=1`. After the successful 32k run, the split path was changed to default-on for a llama-server coherence test. Set `GGML_VK_FA_TOPK_SPLIT=0` to restore the single cooperative sparse kernel.
 
-Stage profiling on the exact production sparse shape (`kv=19200,nb=2048,n_kv_raw=2304,n_top_k=512,sinks=0`) showed:
+Stage profiling on the previously used 19,200-row sparse shape (`kv=19200,nb=2048,n_kv_raw=2304,n_top_k=512,sinks=0`) showed:
 
 ```text
 cooperative QK and selected-K gather:   88.885 ms
@@ -362,7 +362,7 @@ After:   67,371,008 bytes (64.25 MiB)
 Change:  8x reduction
 ```
 
-The exact production-shape microbenchmark (`kv=19200,nb=2048,n_kv_raw=2304,n_top_k=512,sinks=0`) measured:
+The previously used 19,200-row microbenchmark (`kv=19200,nb=2048,n_kv_raw=2304,n_top_k=512,sinks=0`) measured:
 
 ```text
 Full-batch two partitions: 114.65 ms
@@ -408,7 +408,7 @@ Logs:
 
 ## Selected PV probability reuse
 
-The selected cooperative-matrix stage remained the largest split sparse-FA component. Profiling the exact tiled production shape showed:
+The selected cooperative-matrix stage remained the largest split sparse-FA component. Profiling the tiled 19,200-row shape showed:
 
 ```text
 selected K gather and cooperative QK:  about 20.0 ms
@@ -429,7 +429,7 @@ LDS                      36,864    28,672 bytes
 static instructions      11,524    11,358
 ```
 
-The exact production-shape microbenchmark changed from 113.70 ms for the committed tiled path to 110.11 ms. The selected stage fell from about 45.5 ms to about 43.7 ms. The raw-prefix and reduction implementations are unchanged.
+The 19,200-row microbenchmark changed from 113.70 ms for the committed tiled path to 110.11 ms. The selected stage fell from about 45.5 ms to about 43.7 ms. The raw-prefix and reduction implementations are unchanged.
 
 Two canonical 32k runs after this change measured:
 
@@ -490,3 +490,98 @@ Logs:
 - `/tmp/dsv4-vulkan-32k-pmat-repeat.log`
 
 The next sparse-FA optimization should continue to target the selected PV/output half. The retained probability fragments remove redundant cooperative loads without increasing reported VGPR allocation. More invasive changes such as doubling the PV dimension tile can reduce barriers but must be designed around the eight available wave64 subgroups, 64 KiB LDS limit, and already high 192-VGPR allocation. Do not build a crossover matrix until the next kernel layout is settled because an optimization can shift the crossover.
+
+## Selected mask caching and deep-context micro matrix
+
+The sparse FA `kv` dimension is compressed K/V rows, not source-token context depth. For the tested DeepSeek V4 graph, a PP2048 batch uses 2,304 raw rows and approximately one compressed row per four source tokens. The useful synthetic mapping is:
+
+```text
+Source context    Sparse FA kv rows
+32k               11,008
+64k               19,200
+128k              35,584
+256k              68,352
+512k             133,888
+```
+
+The performance test registry now contains PP2048 cases at all five K extents with `n_kv_raw=2304` and `n_top_k=512`. Use this command template and replace `KV` with a value from the table:
+
+```bash
+GGML_VK_PERF_LOGGER=1 ./build/bin/test-backend-ops perf \
+  -b Vulkan0 -o FLASH_ATTN_EXT \
+  -p 'kv=KV,nb=2048,n_kv_raw=2304,n_top_k=512,sinks=0'
+```
+
+These are synthetic sparse-FA depth tests. They do not include the Lightning Indexer or the rest of the model graph and do not replace the canonical 32k llama-bench.
+
+The selected shader previously loaded the same selected-key mask value independently for all 32 heads during both softmax passes. The shader now loads each mask value once per 64-key block and reuses it from LDS. Q and probability storage also share one LDS allocation, while K and V staging share another because both pairs have disjoint lifetimes.
+
+Shader resources changed from the probability-reuse commit:
+
+```text
+                         Before    After
+VGPRs                    192       192
+VGPR spills              0         0
+LDS                      28,672    24,576 bytes
+static instructions      11,358    11,233
+```
+
+A 128-dimension V staging experiment was correct but rejected. With operand aliasing it used exactly 32 KiB LDS. It was 2.3% slower at simulated 32k, approximately equal at 64k, and 1.6% faster at 128k. The retained 64-dimension layout is better for the canonical 32k target and is simpler.
+
+Selected-mask caching improved every synthetic depth relative to the same 64-dimension operand-alias layout:
+
+```text
+Depth    Selected before    Selected after    Split total before    Split total after
+32k      43.16 ms           41.23 ms          109.45 ms             108.07 ms
+64k      43.22 ms           41.42 ms          110.45 ms             109.11 ms
+128k     52.26 ms           48.74 ms          119.15 ms             116.92 ms
+256k     51.64 ms           49.02 ms          118.06 ms             116.93 ms
+512k     51.33 ms           49.20 ms          117.87 ms             116.27 ms
+```
+
+The 256k case exposed a separate path-selection cutoff. The raw-prefix ordinary FA dispatch encoded its mask row stride in 16 bits and disabled split sparse FA above 65,535 K rows. It now uses a flagged convention that carries the full 32-bit mask stride in the existing `split_kv` push constant for this one-partition partial-output dispatch. No push-constant structure was enlarged. At simulated 256k, this changes the selected path from unsplit cooperative sparse FA at 206.22 ms to split sparse FA at 118.06 ms before mask caching, a 42.8% reduction. The 512k case also uses the split path successfully.
+
+Canonical 32k PP2048 after operand aliasing and selected-mask caching:
+
+```text
+Previous commit, two runs:
+209.57-211.03 tok/s
+Total Vulkan:             9.664-9.730 s
+Split sparse FA:          1.128-1.136 s
+  raw-prefix FA:          0.192-0.193 s
+  selected sparse FA:     0.850-0.860 s
+  split reduction:        0.083-0.086 s
+
+Current result:
+210.47 tok/s
+Total Vulkan:             9.68921 s
+Split sparse FA:          1.10160 s
+  raw-prefix FA:          0.192860 s
+  selected sparse FA:     0.821381 s
+  split reduction:        0.087354 s
+Lightning Indexer:        1.102230 s
+TOP_K:                    0.072488 s
+```
+
+The selected stage improves 3.4-4.5% and complete split sparse FA improves 2.3-3.0% relative to the previous commit's two canonical runs. End-to-end throughput remains within model-wide benchmark noise.
+
+Correctness:
+
+- focused sparse top-K suite: 9/9 passed
+- complete Vulkan Flash Attention suite: 13,297/13,297 passed
+- no NaN or Inf failure
+- simulated 256k and 512k performance cases both selected the split path and completed successfully
+
+Benchmark policy for this laptop APU: do not repeat llama-bench when the exact-shape microbenchmarks and the first canonical profiler block agree. Sustained load can lower GPU clocks and bias a repeat. Repeat only when the first result is anomalous or contradicts the microbenchmarks. Never build and benchmark concurrently.
+
+Logs:
+
+- `/tmp/dsv4-fa-mask-cache-32k.log`
+- `/tmp/dsv4-fa-mask-cache-64k.log`
+- `/tmp/dsv4-fa-mask-cache-128k.log`
+- `/tmp/dsv4-fa-mask-cache-256k.log`
+- `/tmp/dsv4-fa-mask-cache-512k.log`
+- `/tmp/dsv4-fa-final-micro-32k.log`
+- `/tmp/dsv4-fa-final-focused-correctness.log`
+- `/tmp/dsv4-fa-mask-cache-all-correctness.log`
+- `/tmp/dsv4-vulkan-32k-mask-cache.log`

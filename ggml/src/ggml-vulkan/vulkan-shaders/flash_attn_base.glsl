@@ -211,8 +211,9 @@ void init_indices()
     q_stride = gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
+    const bool mask_stride_in_split_kv = (p.gqa_ratio & 0x80000000u) != 0;
     const uint32_t mask_stride_override = p.gqa_ratio >> 16;
-    m_stride = mask_stride_override != 0 ? mask_stride_override : (gqa_ratio > 1 ? 0 : KV);
+    m_stride = mask_stride_in_split_kv ? p.split_kv : (mask_stride_override != 0 ? mask_stride_override : (gqa_ratio > 1 ? 0 : KV));
 }
 
 // Bias applied to softmax to stay in fp16 range.

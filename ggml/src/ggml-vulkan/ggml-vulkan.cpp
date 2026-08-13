@@ -11160,7 +11160,7 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
 
     static const char * top_k_split_env = getenv("GGML_VK_FA_TOPK_SPLIT");
     const uint32_t mask_stride = (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t));
-    const bool try_split = use_cm && (!top_k_split_env || top_k_split_env[0] != '0') && n_kv_raw > 0 && top_k->ne[0] > 0 && mask_stride <= 0xffff;
+    const bool try_split = use_cm && (!top_k_split_env || top_k_split_env[0] != '0') && n_kv_raw > 0 && top_k->ne[0] > 0;
     if (try_split) {
         const uint32_t N = (uint32_t) q->ne[1];
         const uint32_t D = 512;
@@ -11206,7 +11206,8 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                 }
 
                 const uint32_t n_head_log2 = 64;
-                const uint32_t packed_gqa = (mask_stride << 16) | 1;
+                const uint32_t mask_stride_in_split_kv = 1u << 31;
+                const uint32_t packed_gqa = mask_stride_in_split_kv | 1u;
                 const uint32_t packed_partitions = (partitions << 16) | 1;
                 const vk_subbuffer split_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
                 const vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
@@ -11239,7 +11240,7 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                         k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
                         scale, 0.0f, 0.0f,
                         n_head_log2, 1.0f, 1.0f,
-                        packed_gqa, raw_kv, packed_partitions,
+                        packed_gqa, mask_stride, packed_partitions,
                     };
 
                     ggml_vk_dispatch_pipeline(ctx, subctx, raw_pipeline,
