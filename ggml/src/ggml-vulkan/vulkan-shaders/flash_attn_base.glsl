@@ -128,7 +128,7 @@ ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in A
 // Load the slope matrix, indexed by Q's dimension 2.
 ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t h = iq2 + (r % (p.gqa_ratio & 0xffff));
 
     uint32_t n_head_log2 = p.mask_n_head_log2 & N_LOG2_MASK;
 
@@ -141,7 +141,7 @@ ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const i
 // Load the sink value, indexed by Q's dimension 2.
 ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t h = iq2 + (r % (p.gqa_ratio & 0xffff));
 
     return ACC_TYPE(data_s[h]);
 }
@@ -154,19 +154,26 @@ void init_indices()
 {
     N = p.N;
     KV = p.KV;
+    gqa_ratio = p.gqa_ratio & 0xffff;
+    split_k_num = p.k_num & 0xffff;
+    output_k_num = p.k_num >> 16;
+    partial_output = output_k_num != 0;
+    if (!partial_output) {
+        output_k_num = split_k_num;
+    }
 
-    if (p.k_num > 1) {
-        if (p.gqa_ratio > 1) {
+    if (split_k_num > 1) {
+        if (gqa_ratio > 1) {
             i = 0;
             // batch and split_k share gl_WorkGroupID.x
-            gqa_iq1 = gl_WorkGroupID.x / p.k_num;
-            split_k_index = gl_WorkGroupID.x % p.k_num;
+            gqa_iq1 = gl_WorkGroupID.x / split_k_num;
+            split_k_index = gl_WorkGroupID.x % split_k_num;
         } else {
             gqa_iq1 = 0;
-            split_k_index = gl_WorkGroupID.x % p.k_num;
-            i = gl_WorkGroupID.x / p.k_num;
+            split_k_index = gl_WorkGroupID.x % split_k_num;
+            i = gl_WorkGroupID.x / split_k_num;
         }
-    } else if (p.gqa_ratio > 1) {
+    } else if (gqa_ratio > 1) {
         i = 0;
         gqa_iq1 = gl_WorkGroupID.x;
         split_k_index = 0;
@@ -183,7 +190,7 @@ void init_indices()
 
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
-    iq2 = gl_WorkGroupID.y * p.gqa_ratio;
+    iq2 = gl_WorkGroupID.y * gqa_ratio;
     iq3 = gl_WorkGroupID.z;
 
     // broadcast factors
@@ -204,14 +211,11 @@ void init_indices()
     // nb?1 are already divided by the type size and are in units of elements.
     // When using grouped query attention, Q is indexed by iq2, so the stride
     // should be nb02 (which is in bytes).
-    q_stride = p.gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
+    q_stride = gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
-    // When using grouped query attention, all rows use the same mask (stride 0).
-    // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
-    // that prevents the compiler from folding the "&" through the select
-    // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+    const uint32_t mask_stride_override = p.gqa_ratio >> 16;
+    m_stride = mask_stride_override != 0 ? mask_stride_override : (gqa_ratio > 1 ? 0 : KV);
 
     // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
     // partitions the n_kv_max blocks.

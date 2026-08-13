@@ -765,6 +765,8 @@ struct vk_op_flash_attn_top_k_push_constants {
     uint32_t nb1, nb2, nb3;
     float scale;
     uint32_t has_sinks;
+    uint32_t profile_stage;
+    uint32_t split_mode;
 };
 static_assert(sizeof(vk_op_flash_attn_top_k_push_constants) <= 128);
 
