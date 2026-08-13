@@ -1970,6 +1970,8 @@ struct vk_op_flash_attn_top_k_push_constants {
     uint32_t nb1, nb2, nb3;
     float scale;
     uint32_t has_sinks;
+    uint32_t profile_stage;
+    uint32_t split_mode;
 };
 static_assert(sizeof(vk_op_flash_attn_top_k_push_constants) <= 128);
 
@@ -11126,11 +11128,11 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         return false;
     }
     const int64_t n_kv_active = n_kv_raw + top_k->ne[0];
-    if (k->ne[1] < 3 * n_kv_active) {
+    if (k->ne[1] <= n_kv_active) {
         return false;
     }
 
-    const vk_op_flash_attn_top_k_push_constants pc = {
+    vk_op_flash_attn_top_k_push_constants pc = {
         (uint32_t) q->ne[1], (uint32_t) k->ne[1], (uint32_t) n_kv_raw,
         (uint32_t) top_k->ne[0], (uint32_t) q->ne[2],
         (uint32_t) (q->nb[1] / sizeof(float)),
@@ -11145,14 +11147,105 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         (uint32_t) (dst->nb[1] / sizeof(float)),
         (uint32_t) (dst->nb[2] / sizeof(float)),
         (uint32_t) (dst->nb[3] / sizeof(float)),
-        scale, sinks != nullptr,
+        scale, sinks != nullptr, 0, 0,
     };
 
     const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
     const vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
     static const char * top_k_cm_env = getenv("GGML_VK_FA_TOPK_CM");
     const bool use_cm = (!top_k_cm_env || top_k_cm_env[0] != '0') && ctx->device->pipeline_flash_attn_top_k_cm_f16;
+    static const char * top_k_profile_env = getenv("GGML_VK_FA_TOPK_PROFILE");
+    pc.profile_stage = use_cm && top_k_profile_env ? atoi(top_k_profile_env) : 0;
     vk_pipeline pipeline = use_cm ? ctx->device->pipeline_flash_attn_top_k_cm_f16 : ctx->device->pipeline_flash_attn_top_k_f16;
+
+    static const char * top_k_split_env = getenv("GGML_VK_FA_TOPK_SPLIT");
+    const uint32_t mask_stride = (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t));
+    const bool try_split = use_cm && (!top_k_split_env || top_k_split_env[0] != '0') && n_kv_raw > 0 && top_k->ne[0] > 0 && mask_stride <= 0xffff;
+    if (try_split) {
+        const uint32_t N = (uint32_t) q->ne[1];
+        const uint32_t D = 512;
+        const uint32_t NH = 64;
+        const uint32_t NS = (uint32_t) q->ne[3];
+        const uint32_t raw_kv = (uint32_t) n_kv_raw;
+        const uint32_t partitions = 2;
+        const bool f32acc = true;
+        vk_fa_tuning_params tuning = get_fa_tuning_params(ctx->device, D, D, N, raw_kv, GGML_TYPE_F16, GGML_TYPE_F16, f32acc);
+
+        const uint32_t q_stride = (uint32_t) (q->nb[1] / sizeof(float));
+        const uint32_t k_stride = (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t));
+        const bool aligned = raw_kv % tuning.block_cols == 0 && (q_stride & 7) == 0 && (k_stride & 7) == 0;
+        const vk_fa_pipeline_state raw_state = get_fa_pipeline_state(ctx->device, tuning, D, D, aligned, f32acc,
+                                                                     true, false, false, GGML_TYPE_F16, GGML_TYPE_F16);
+        if (raw_state.path == FA_COOPMAT1 && ctx->device->pipeline_flash_attn_split_k_reduce) {
+            vk_pipeline raw_pipeline;
+            {
+                std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+                auto & pipelines = ctx->device->pipeline_flash_attn_f32_f16;
+                auto it = pipelines.find(raw_state);
+                if (it != pipelines.end()) {
+                    raw_pipeline = it->second;
+                } else {
+                    pipelines[raw_state] = raw_pipeline = std::make_shared<vk_pipeline_struct>();
+                }
+            }
+            ggml_pipeline_request_descriptor_sets(ctx, raw_pipeline, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+
+            const uint64_t split_size = ((uint64_t) D * NH * sizeof(float) + NH * 2 * sizeof(float)) * partitions * N * NS;
+            if (split_size <= ctx->device->properties.limits.maxStorageBufferRange) {
+                if (ctx->prealloc_size_split_k < split_size) {
+                    ctx->prealloc_size_split_k = split_size;
+                    ggml_vk_preallocate_buffers(ctx, subctx);
+                }
+                if (ctx->prealloc_split_k_need_sync) {
+                    ggml_vk_sync_buffers(ctx, subctx);
+                }
+
+                const vk_subbuffer split_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+                const uint32_t n_head_log2 = 64;
+                const uint32_t packed_gqa = (mask_stride << 16) | 1;
+                const uint32_t packed_partitions = (partitions << 16) | 1;
+                const vk_flash_attn_push_constants raw_pc = {
+                    N, raw_kv,
+                    NH, N, NS,
+                    NH, NS,
+                    1, NS,
+                    1, NS,
+                    (uint32_t) mask->ne[1], (uint32_t) mask->ne[2], (uint32_t) mask->ne[3],
+                    q_stride, (uint32_t) q->nb[2], (uint32_t) q->nb[3],
+                    k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
+                    k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
+                    scale, 0.0f, 0.0f,
+                    n_head_log2, 1.0f, 1.0f,
+                    packed_gqa, raw_kv, packed_partitions,
+                };
+
+                ggml_vk_dispatch_pipeline(ctx, subctx, raw_pipeline,
+                    {q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, k),
+                     ggml_vk_tensor_subbuffer(ctx, mask), q_buf, split_buf, q_buf},
+                    raw_pc, {N, NH, NS});
+                ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_RAW (sub-op)");
+
+                pc.split_mode = 1;
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                    {q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, mask), sinks_buf,
+                     ggml_vk_tensor_subbuffer(ctx, top_k), split_buf},
+                    pc, {N, (uint32_t) CEIL_DIV(q->ne[2], 32), NS});
+                ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_SELECTED (sub-op)");
+
+                ggml_vk_sync_buffers(ctx, subctx);
+                const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = {D, NH, N, NS, partitions, sinks != nullptr};
+                ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+                    {split_buf, sinks_buf, ggml_vk_tensor_subbuffer(ctx, dst)},
+                    reduce_pc, {NH, D, N * NS});
+                ctx->prealloc_split_k_need_sync = true;
+                ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_REDUCE (sub-op)");
+                return true;
+            }
+        }
+    }
+
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, mask), sinks_buf,
