@@ -4,9 +4,15 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-// Gathers the active KV rows of a top-k sparse attention (DeepSeek V4 CSA decode) into a
-// compact contiguous scratch: rows [0, n_kv_raw) of the source (the dense prefix), then the
-// n_top_k selected rows, then zero padding up to kv_c. The gathered mask row keeps the
+// Gathers the active KV rows of a top-k sparse attention (DeepSeek V4 CSA) into a compact
+// contiguous scratch: rows [0, n_kv_raw) of the source (the dense prefix), then, for each of
+// the n_batch query tokens, that token's n_top_k selected rows, then zero padding up to kv_c.
+//
+// n_batch > 1 (small-batch decode, e.g. speculative drafts) gives every token its own block
+// rather than deduplicating into a union. That costs n_batch*n_top_k gathered rows instead of
+// |union|, but needs no dedup pass and no atomics, and the size is bounded by the worst case
+// the caller already allocates for. Cross-token rows are neutralised through the mask: token t
+// sees -inf on any block that is not its own, so nothing is double counted in the softmax. The gathered mask row keeps the
 // per-key mask values so causality/validity survive compaction; invalid top-k indices and
 // padding get -inf mask and zeroed K (softmax-neutral either way, zeroed so no NaN*0).
 // One workgroup per compact row; V is the K latent (V==K), so a single gather serves both.
@@ -26,9 +32,12 @@ layout(push_constant) uniform Parameters {
     uint kv_c;     // padded compact row count == dispatch row range
     uint nbk1;     // K source row stride, elements
     uint nbk3;     // K source stream stride, elements
+    uint nbt1;     // top_k row (per query token) stride, elements
     uint nbt3;     // top_k stream stride, elements
+    uint nbm1;     // mask source row (per query token) stride, elements
     uint nbm3;     // mask source stream stride, elements
     uint nem3;     // mask ne[3], for stream broadcast
+    uint n_batch;  // query tokens sharing this gather; <= LANES
 } p;
 
 const uint HEAD_SIZE = 512;
@@ -39,14 +48,23 @@ void main() {
     const uint stream = gl_WorkGroupID.z;
     const uint tid    = gl_LocalInvocationIndex;
 
-    // map compact row -> source row; p.n_kv is the invalid sentinel
-    uint src = p.n_kv;
+    // map compact row -> source row; p.n_kv is the invalid sentinel.
+    // owner is the token whose block this row belongs to, or ALL_TOKENS for the shared prefix.
+    const uint ALL_TOKENS = 0xffffffffu;
+    uint src   = p.n_kv;
+    uint owner = ALL_TOKENS;
     if (row < p.n_kv_raw) {
         src = row;
-    } else if (row < p.n_kv_raw + p.n_top_k) {
-        const int idx = data_top[stream * p.nbt3 + (row - p.n_kv_raw)];
-        if (idx >= 0 && uint(idx) < p.n_kv - p.n_kv_raw) {
-            src = p.n_kv_raw + uint(idx);
+    } else {
+        const uint off  = row - p.n_kv_raw;
+        const uint tok  = off / p.n_top_k;
+        const uint slot = off - tok * p.n_top_k;
+        if (tok < p.n_batch) {
+            owner = tok;
+            const int idx = data_top[stream * p.nbt3 + tok * p.nbt1 + slot];
+            if (idx >= 0 && uint(idx) < p.n_kv - p.n_kv_raw) {
+                src = p.n_kv_raw + uint(idx);
+            }
         }
     }
 
@@ -56,15 +74,21 @@ void main() {
         [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
             data_kc[dst_base + tid + i * LANES] = data_k[src_base + tid + i * LANES];
         }
-        if (tid == 0) {
-            data_mc[stream * p.kv_c + row] = data_m[(stream % p.nem3) * p.nbm3 + src];
-        }
     } else {
         [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
             data_kc[dst_base + tid + i * LANES] = float16_t(0.0);
         }
-        if (tid == 0) {
-            data_mc[stream * p.kv_c + row] = float16_t(uintBitsToFloat(0xff800000));
+    }
+
+    // Compact mask is token-major [n_batch][kv_c], which is what the GQA mask path expects
+    // (m_stride 0, rows stepped by gqa_iq1 * m_row_len). One lane per token; n_batch <= LANES.
+    const float NEG_INF = uintBitsToFloat(0xff800000);
+    if (tid < p.n_batch) {
+        const uint mc_idx = (stream * p.n_batch + tid) * p.kv_c + row;
+        float mv = NEG_INF;
+        if (src < p.n_kv && (owner == ALL_TOKENS || owner == tid)) {
+            mv = float(data_m[(stream % p.nem3) * p.nbm3 + tid * p.nbm1 + src]);
         }
+        data_mc[mc_idx] = float16_t(mv);
     }
 }
