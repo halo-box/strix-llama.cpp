@@ -10372,6 +10372,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 257, 256, 512, false));
     // ns > 1: the split-K partial-output path indexes O and L/M by stream, so these cover
     // the stream stride in both regions (single tile and multi-tile).
+    // small-batch decode (speculative drafts): each token gets its own gathered top-k block,
+    // so cross-token rows must be masked out or the softmax double counts. kv must be large
+    // enough that compaction is worth it (the gather gates on kv >= 2*kv_c).
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   2, 1024, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   3, 1024, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   8, 1024, 512, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 16, 2304, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(65536, 63, 2304, 512, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true,  2));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 300, 256, 512, false, 3));
@@ -10813,6 +10823,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // PP2048 compressed-K rows for source context depths 32k through 512k.
     for (int kv : { 11008, 19200, 35584, 68352, 133888 }) {
         test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 2048, 2304, 512, false));
+    }
+    // small-batch decode at depth: the speculative-draft regime (batch 2-8), where the old
+    // path fell through to dense attention over the whole compressed KV.
+    for (int kv : { 11008, 35584, 133888 }) {
+        for (int nb : { 1, 2, 4, 8 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 2304, 512, false));
+        }
     }
 
     return test_cases;

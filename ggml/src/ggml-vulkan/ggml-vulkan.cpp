@@ -1959,7 +1959,7 @@ static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
-    uint32_t nbk1, nbk3, nbt3, nbm3, nem3;
+    uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, nem3, n_batch;
 };
 static_assert(sizeof(vk_op_flash_attn_gather_push_constants) <= 128);
 
@@ -11388,6 +11388,7 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
 struct vk_fa_compact_state {
     bool active = false;
     uint32_t kv_c = 0;
+    uint32_t n_batch = 1;
     vk_subbuffer kc_buf, mc_buf;
 };
 
@@ -11405,7 +11406,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     static const char * gather_env = getenv("GGML_VK_FA_TOPK_GATHER");
     if ((gather_env && gather_env[0] == '0') ||
         !top_k || !ctx->device->pipeline_flash_attn_gather_f16 ||
-        q->ne[1] != 1 ||    // single-token decode only; batched queries need a union gather
+        q->ne[1] < 1 || q->ne[1] >= 64 ||   // 1..63: >=64 goes to the sparse prefill path
         q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
         !mask || mask->type != GGML_TYPE_F16 || top_k->type != GGML_TYPE_I32 ||
         q->ne[0] != 512 || k->ne[0] != 512 || v->ne[0] != 512 || q->ne[2] != 64 ||
@@ -11429,7 +11430,10 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         return false;
     }
 
-    const uint32_t kv_c = GGML_PAD((uint32_t)(n_kv_raw + top_k->ne[0]), 256u);
+    const uint32_t n_batch = (uint32_t) q->ne[1];
+    // every token gets its own top-k block; bounded by n_kv_raw + n_batch*n_top_k regardless
+    // of context depth, which is the whole point at decode
+    const uint32_t kv_c = GGML_PAD((uint32_t)(n_kv_raw + (int64_t) n_batch * top_k->ne[0]), 256u);
     // the gather writes then re-reads ~the active bytes; dense reads the source KV once,
     // so compaction only pays when the source is comfortably larger than the active set
     if ((uint64_t) k->ne[1] < 2ull * kv_c) {
@@ -11438,7 +11442,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
 
     const uint32_t ns    = (uint32_t) q->ne[3];
     const size_t   kc_sz = (size_t) ns * kv_c * 512 * sizeof(ggml_fp16_t);
-    const size_t   mc_sz = (size_t) ns * kv_c * sizeof(ggml_fp16_t);
+    const size_t   mc_sz = (size_t) ns * n_batch * kv_c * sizeof(ggml_fp16_t);
 
     if (ctx->prealloc_size_y < kc_sz + mc_sz) {
         ctx->prealloc_size_y = kc_sz + mc_sz;
@@ -11455,9 +11459,12 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         (uint32_t) k->ne[1], (uint32_t) n_kv_raw, (uint32_t) top_k->ne[0], kv_c,
         (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)),
         (uint32_t) (k->nb[3] / sizeof(ggml_fp16_t)),
+        (uint32_t) (top_k->nb[1] / sizeof(int32_t)),
         (uint32_t) (top_k->nb[3] / sizeof(int32_t)),
+        (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
         (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
         (uint32_t) mask->ne[3],
+        n_batch,
     };
 
     st.kc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
@@ -11471,6 +11478,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
 
     st.active = true;
     st.kv_c = kv_c;
+    st.n_batch = n_batch;
     return true;
 }
 
@@ -11535,6 +11543,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     if (ggml_vk_flash_attn_gather_compact(ctx, subctx, q, k, v, mask, dst, fa_compact)) {
         KV   = fa_compact.kv_c;
         nem0 = fa_compact.kv_c;
+        nem1 = fa_compact.n_batch;
+        nem2 = 1;
+        nem3 = (uint32_t) q->ne[3];
         nem1 = N;
         nem2 = 1;
         nem3 = (uint32_t) q->ne[3];
