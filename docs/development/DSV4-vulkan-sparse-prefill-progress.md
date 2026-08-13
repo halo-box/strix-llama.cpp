@@ -320,7 +320,7 @@ TOP_K:               0.077394 s total,  3.685 ms/layer
 
 Relative to the committed cooperative path, throughput improved 37.0%, total Vulkan time fell 27.1%, and sparse FA time fell 73.0%. Relative to the old scalar path, throughput improved 85.9%, total Vulkan time fell 46.3%, and sparse FA time fell 86.4%.
 
-The main unresolved tradeoff is scratch memory. At PP2048, the two output partitions use about 539 MiB because each stores an f32 partial output for 512 dimensions x 64 heads x 2048 queries, plus L/M data. The device maximum storage-buffer range is checked and the code falls back when the allocation is unavailable. The path is temporarily default-on for a llama-server coherence test but should not be finalized without discussing this footprint. A likely next step is to avoid materializing both full output partitions, for example by directly merging the selected partition into the raw result or processing query tiles, while retaining the measured split-path speed.
+The initial split implementation used 538,968,064 bytes (514 MiB) of scratch at PP2048 because each of two partitions stored an f32 partial output for 512 dimensions x 64 heads x 2048 queries, plus L/M data. This was subsequently reduced by query tiling as described below.
 
 The old sparse selection heuristic required `total_k >= 3 * active_k`. For the coherence test it now selects sparse attention whenever `total_k > active_k`; equality still uses dense FA because no keys are pruned. The shape, capability, and allocation gates remain unchanged.
 
@@ -349,3 +349,59 @@ Total Vulkan:        9.797560 s
 ```
 
 This closely matches the canonical PP2048 llama-bench result of 9.770 s total and 1.202 s split sparse FA. The focused sparse CPU-reference test was rerun after the crossover change and passed 8/8 cases.
+
+## Tiled split scratch optimization
+
+Commit `4bbe53e4775f0707de8158e4977a16ab770829da` used two full PP2048 output partitions. The same two-partition algorithm now processes at most 256 query tokens per tile and reuses the split scratch between tiles. Q, mask, top-K, and destination descriptors are offset to the tile while K/V remain shared. A Vulkan pipeline barrier separates reuse of each scratch tile.
+
+Scratch at PP2048 changed from:
+
+```text
+Before: 538,968,064 bytes (514 MiB)
+After:   67,371,008 bytes (64.25 MiB)
+Change:  8x reduction
+```
+
+The exact production-shape microbenchmark (`kv=19200,nb=2048,n_kv_raw=2304,n_top_k=512,sinks=0`) measured:
+
+```text
+Full-batch two partitions: 114.65 ms
+256-query tiled path:      113.70 ms
+```
+
+Two one-partition alternatives were tested and discarded. Merging the raw partial directly inside the cooperative selected shader measured 119.17 ms. Writing selected output separately and using a lightweight merge kernel measured 120.45 ms. Both cut scratch in half but regressed because writing selected output outside the contiguous split layout increased the selected stage from about 44 ms to about 51 ms. Query tiling preserves the faster memory layout.
+
+Canonical 32k result after tiling:
+
+```text
+32k context, PP 2048, ub 2048
+
+Full-batch split: 208.70 tok/s, 9.77039 s total, 1.20170 s sparse FA
+Tiled split:      209.62 tok/s, 9.72897 s total, 1.18721 s sparse FA
+
+Tiled split stages:
+raw-prefix FA:       0.192879 s total, 168 tile dispatches
+selected sparse FA:  0.910153 s total, 168 tile dispatches
+split reduction:     0.084179 s total, 168 tile dispatches
+Lightning Indexer:   1.100230 s total
+TOP_K:               0.075158 s total
+```
+
+The 168 dispatch count is eight tiles x 21 sparse-attention layers. Relative to the full-batch split path, throughput improved 0.44%, total Vulkan time fell 0.42%, and sparse FA time fell 1.21%. The main result is the 8x scratch reduction without a performance regression.
+
+Final correctness after removing the discarded merge prototypes:
+
+- focused sparse top-K suite: 9/9 passed against the CPU reference, including a 257-query tile-boundary case
+- complete Vulkan Flash Attention suite: 13,296/13,296 passed
+- no NaN or Inf failure
+
+Logs:
+
+- `/tmp/dsv4-fa-exact-fused.log`
+- `/tmp/dsv4-fa-exact-merge.log`
+- `/tmp/dsv4-fa-exact-two-part-current.log`
+- `/tmp/dsv4-fa-exact-tiled.log`
+- `/tmp/dsv4-fa-tiled-final-correctness.log`
+- `/tmp/dsv4-fa-tiled-boundary-correctness.log`
+- `/tmp/dsv4-fa-tiled-all-correctness.log`
+- `/tmp/dsv4-vulkan-tiled-32k.log`
