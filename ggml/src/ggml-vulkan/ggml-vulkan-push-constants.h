@@ -88,6 +88,7 @@ struct vk_flash_attn_push_constants {
 
     uint32_t ne1;
     uint32_t ne2;
+    uint32_t dst_ne2;
     uint32_t ne3;
 
     uint32_t neq2;
@@ -929,6 +930,9 @@ struct vk_quantize_q8_1_push_constants {
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;
+    // ne2 describes the SPLIT BUFFER (which may cover only a tile of queries); dst_ne2 is the
+    // destination's query count. They differ only when the caller tiles the split buffer, and
+    // the destination stride between streams must always use the full count.
     uint32_t ne2;
     uint32_t ne3;
     uint32_t k_num;
