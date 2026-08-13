@@ -39,6 +39,8 @@ layout(push_constant) uniform Parameters {
     uint nb3;
     float scale;
     uint has_sinks;
+    uint profile_stage;
+    uint split_mode;
 } p;
 
 const uint TILE = 16;
@@ -71,7 +73,7 @@ void main() {
     const uint stream = gl_WorkGroupID.z;
     const uint mask_base = stream * p.nbm3 + token * p.nbm1;
     const uint top_base = stream * p.nbt3 + token * p.nbt1;
-    const uint total_keys = p.n_kv_raw + p.n_top_k;
+    const uint total_keys = p.split_mode != 0 ? p.n_top_k : p.n_kv_raw + p.n_top_k;
 
     float accum[HEADS_PER_GROUP * HEAD_SIZE / WORKGROUP_SIZE];
     [[unroll]] for (uint i = 0; i < accum.length(); ++i) {
@@ -88,10 +90,11 @@ void main() {
         if (tid < KEYS_PER_BLOCK) {
             const uint selected = kb + tid;
             uint key = p.n_kv;
-            if (selected < p.n_kv_raw) {
+            if (p.split_mode == 0 && selected < p.n_kv_raw) {
                 key = selected;
             } else if (selected < total_keys) {
-                const int compressed = data_top[top_base + selected - p.n_kv_raw];
+                const uint top_pos = p.split_mode != 0 ? selected : selected - p.n_kv_raw;
+                const int compressed = data_top[top_base + top_pos];
                 if (compressed >= 0 && uint(compressed) < p.n_kv - p.n_kv_raw) {
                     key = p.n_kv_raw + uint(compressed);
                 }
@@ -144,6 +147,10 @@ void main() {
             SCORE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
 
+        if (p.profile_stage == 1) {
+            continue;
+        }
+
         {
             const uint head_local = tid / (SUBGROUP_SIZE / 4);
             const uint softmax_lane = tid % (SUBGROUP_SIZE / 4);
@@ -194,6 +201,10 @@ void main() {
             accum[i] *= old_scale_sh[head_local];
         }
 
+        if (p.profile_stage == 2) {
+            continue;
+        }
+
         [[unroll]] for (uint dim_base = 0; dim_base < HEAD_SIZE; dim_base += DIMS_PER_BLOCK) {
             [[unroll]] for (uint idx = tid; idx < KEYS_PER_BLOCK * (DIMS_PER_BLOCK / 4); idx += WORKGROUP_SIZE) {
                 const uint key_local = idx / (DIMS_PER_BLOCK / 4);
@@ -242,7 +253,7 @@ void main() {
         }
     }
 
-    if (p.has_sinks != 0 && tid < HEADS_PER_GROUP) {
+    if (p.split_mode == 0 && p.has_sinks != 0 && tid < HEADS_PER_GROUP) {
         const float sink = data_s[head_base + tid];
         const float new_max = max(row_max_sh[tid], sink);
         const float old_scale = row_sum_sh[tid] == 0.0 ? 0.0 : exp(row_max_sh[tid] - new_max);
@@ -252,7 +263,7 @@ void main() {
     }
     barrier();
 
-    if (p.has_sinks != 0) {
+    if (p.split_mode == 0 && p.has_sinks != 0) {
         [[unroll]] for (uint i = 0; i < accum.length(); ++i) {
             const uint out_idx = tid + i * WORKGROUP_SIZE;
             accum[i] *= old_scale_sh[out_idx / HEAD_SIZE];
@@ -262,8 +273,19 @@ void main() {
         const uint out_idx = tid + i * WORKGROUP_SIZE;
         const uint head_local = out_idx / HEAD_SIZE;
         const uint dim = out_idx % HEAD_SIZE;
-        const uint dst_base = stream * p.nb3 + token * p.nb2 + (head_base + head_local) * p.nb1;
-        const float inv_sum = row_sum_sh[head_local] == 0.0 ? 0.0 : 1.0 / row_sum_sh[head_local];
-        data_dst[dst_base + dim] = accum[i] * inv_sum;
+        if (p.split_mode != 0) {
+            const uint part_idx = 1;
+            const uint matrix_base = HEAD_SIZE * p.n_head * (part_idx + 2 * (token + p.n_batch * stream));
+            const uint lm_base = HEAD_SIZE * p.n_head * p.n_batch * 2 + p.n_head * 2 * (part_idx + 2 * (token + p.n_batch * stream));
+            data_dst[matrix_base + (head_base + head_local) * HEAD_SIZE + dim] = accum[i];
+            if (dim == 0) {
+                data_dst[lm_base + head_base + head_local] = row_sum_sh[head_local];
+                data_dst[lm_base + p.n_head + head_base + head_local] = row_max_sh[head_local];
+            }
+        } else {
+            const uint dst_base = stream * p.nb3 + token * p.nb2 + (head_base + head_local) * p.nb1;
+            const float inv_sum = row_sum_sh[head_local] == 0.0 ? 0.0 : 1.0 / row_sum_sh[head_local];
+            data_dst[dst_base + dim] = accum[i] * inv_sum;
+        }
     }
 }

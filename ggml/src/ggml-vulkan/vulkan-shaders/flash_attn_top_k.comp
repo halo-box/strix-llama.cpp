@@ -37,6 +37,8 @@ layout(push_constant) uniform Parameters {
     uint nb3;
     float scale;
     uint has_sinks;
+    uint profile_stage;
+    uint split_mode;
 } p;
 
 // Shape constants pinned by the dispatch gate in ggml_vk_flash_attn_top_k: DeepSeek V4
