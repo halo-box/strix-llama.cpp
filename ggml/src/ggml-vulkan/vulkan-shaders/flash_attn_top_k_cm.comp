@@ -276,8 +276,15 @@ void main() {
         const uint dim = out_idx % HEAD_SIZE;
         if (p.split_mode != 0) {
             const uint part_idx = 1;
+            // Split-K buffer layout, shared with flash_attn_cm1.comp and
+            // flash_attn_split_k_reduce.comp: all O matrices [HSV, ne1, k_num, ne2, ne3]
+            // first, then the L/M rows [ne1, k_num, ne2, ne3]. Here ne1 = n_head,
+            // ne2 = n_batch and ne3 = the stream count, so the L/M base must span every
+            // stream -- omitting gl_NumWorkGroups.z lands L/M inside the O region as soon
+            // as there is more than one sequence.
+            const uint n_streams = gl_NumWorkGroups.z;
             const uint matrix_base = HEAD_SIZE * p.n_head * (part_idx + 2 * (token + p.n_batch * stream));
-            const uint lm_base = HEAD_SIZE * p.n_head * p.n_batch * 2 + p.n_head * 2 * (part_idx + 2 * (token + p.n_batch * stream));
+            const uint lm_base = HEAD_SIZE * p.n_head * p.n_batch * n_streams * 2 + p.n_head * 2 * (part_idx + 2 * (token + p.n_batch * stream));
             data_dst[matrix_base + (head_base + head_local) * HEAD_SIZE + dim] = accum[i];
             if (dim == 0) {
                 data_dst[lm_base + head_base + head_local] = row_sum_sh[head_local];

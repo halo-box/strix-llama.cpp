@@ -144,7 +144,7 @@ ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC
 
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride, gqa_ratio, split_k_num, output_k_num;
+         q_stride, k_stride, v_stride, m_stride, m_row_len, gqa_ratio, split_k_num, output_k_num;
 bool partial_output;
 
 void init_indices()
@@ -211,9 +211,21 @@ void init_indices()
     q_stride = gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
+    // Bit 31 of gqa_ratio means "the mask row stride is in split_kv", used by the DeepSeek V4
+    // sparse split path where the mask spans the full K range but this dispatch only covers the
+    // raw prefix, so m_stride != KV. That path always sets split_k_num == 1, which is what keeps
+    // split_kv free to carry the stride; ggml_vk_flash_attn_top_k asserts the invariant.
+    // Otherwise: when using grouped query attention all rows share the same mask (stride 0).
+    // "p.gqa_ratio >> 16" is just a roundabout way of writing zero that prevents the compiler
+    // from folding the "&" through the select and breaking the alignment detection.
     const bool mask_stride_in_split_kv = (p.gqa_ratio & 0x80000000u) != 0;
-    const uint32_t mask_stride_override = p.gqa_ratio >> 16;
-    m_stride = mask_stride_in_split_kv ? p.split_kv : (mask_stride_override != 0 ? mask_stride_override : (gqa_ratio > 1 ? 0 : KV));
+    m_stride = mask_stride_in_split_kv ? p.split_kv : ((gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV);
+    // Distinct from m_stride: m_stride is the row-to-row step INSIDE this tile (0 under GQA,
+    // where every row shares one mask row), while m_row_len is the mask tensor's actual row
+    // length, used to step between tokens and between streams. They differ under GQA and
+    // under the sparse split path, where this dispatch only covers the raw prefix (KV) but
+    // the mask rows span the whole K range.
+    m_row_len = mask_stride_in_split_kv ? p.split_kv : KV;
 }
 
 // Bias applied to softmax to stay in fp16 range.
