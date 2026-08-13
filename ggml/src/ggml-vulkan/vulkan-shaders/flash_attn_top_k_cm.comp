@@ -56,11 +56,10 @@ const uint PV_STRIDE = DIMS_PER_BLOCK / 4;
 const float MASK_NEG_INF = -65500.0;
 
 shared uint key_idx[KEYS_PER_BLOCK];
-shared f16vec4 q_sh[HEADS_PER_GROUP * QK_STRIDE];
-shared f16vec4 k_sh[KEYS_PER_BLOCK * QK_STRIDE];
+shared float key_mask[KEYS_PER_BLOCK];
+shared f16vec4 q_p_sh[HEADS_PER_GROUP * P_STRIDE];
+shared f16vec4 k_v_sh[KEYS_PER_BLOCK * V_STRIDE];
 shared vec4 matrix_sh[KEYS_PER_BLOCK * SCORE_STRIDE];
-shared f16vec4 p_sh[HEADS_PER_GROUP * P_STRIDE];
-shared f16vec4 v_sh[KEYS_PER_BLOCK * V_STRIDE];
 shared float old_scale_sh[HEADS_PER_GROUP];
 shared float row_max_sh[HEADS_PER_GROUP];
 shared float row_sum_sh[HEADS_PER_GROUP];
@@ -99,6 +98,7 @@ void main() {
                 }
             }
             key_idx[tid] = key;
+            key_mask[tid] = key < p.n_kv ? float(data_m[mask_base + key]) : uintBitsToFloat(0xff800000);
         }
         barrier();
 
@@ -117,23 +117,23 @@ void main() {
                     const uint offset = stream * p.nbk3 + key * p.nbk1 + d + d4 * 4;
                     value = f16vec4(data_k[offset], data_k[offset + 1], data_k[offset + 2], data_k[offset + 3]);
                 }
-                k_sh[key_local * QK_STRIDE + d4] = value;
+                k_v_sh[key_local * QK_STRIDE + d4] = value;
             }
             if (tid < HEADS_PER_GROUP * (TILE / 4)) {
                 const uint head_local = tid / (TILE / 4);
                 const uint d4 = tid % (TILE / 4);
                 const uint head = head_base + head_local;
                 const uint offset = stream * p.nbq3 + head * p.nbq2 + token * p.nbq1 + d + d4 * 4;
-                q_sh[head_local * QK_STRIDE + d4] = f16vec4(
+                q_p_sh[head_local * QK_STRIDE + d4] = f16vec4(
                     data_q[offset], data_q[offset + 1], data_q[offset + 2], data_q[offset + 3]);
             }
             barrier();
 
             const uint key_chunk = gl_SubgroupID % (KEYS_PER_BLOCK / TILE);
             const uint head_tile = gl_SubgroupID / (KEYS_PER_BLOCK / TILE);
-            coopMatLoad(kmat, k_sh, key_chunk * TILE * QK_STRIDE,
+            coopMatLoad(kmat, k_v_sh, key_chunk * TILE * QK_STRIDE,
                 QK_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(qmat, q_sh, head_tile * TILE * QK_STRIDE,
+            coopMatLoad(qmat, q_p_sh, head_tile * TILE * QK_STRIDE,
                 QK_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
             scores = coopMatMulAdd(kmat, qmat, scores);
             barrier();
@@ -156,8 +156,7 @@ void main() {
             float block_max = uintBitsToFloat(0xff800000);
             [[unroll]] for (uint i = 0; i < KEYS_PER_BLOCK / (SUBGROUP_SIZE / 4); ++i) {
                 const uint key_local = softmax_lane + i * (SUBGROUP_SIZE / 4);
-                const uint key = key_idx[key_local];
-                const float mask = key < p.n_kv ? float(data_m[mask_base + key]) : uintBitsToFloat(0xff800000);
+                const float mask = key_mask[key_local];
                 const float score = float(matrix_sh[key_local * SCORE_STRIDE + head_local / 4][head_local % 4]) * p.scale + mask;
                 block_max = mask < MASK_NEG_INF ? block_max : max(block_max, score);
             }
@@ -172,15 +171,14 @@ void main() {
             float block_sum = 0.0;
             [[unroll]] for (uint i = 0; i < KEYS_PER_BLOCK / (SUBGROUP_SIZE / 4); ++i) {
                 const uint key_local = softmax_lane + i * (SUBGROUP_SIZE / 4);
-                const uint key = key_idx[key_local];
-                const float mask = key < p.n_kv ? float(data_m[mask_base + key]) : uintBitsToFloat(0xff800000);
+                const float mask = key_mask[key_local];
                 float weight = 0.0;
                 if (mask >= MASK_NEG_INF) {
                     const float score = float(matrix_sh[key_local * SCORE_STRIDE + head_local / 4][head_local % 4]) * p.scale + mask;
                     weight = exp(score - new_max);
                     block_sum += weight;
                 }
-                p_sh[head_local * P_STRIDE + key_local / 4][key_local % 4] = float16_t(weight);
+                q_p_sh[head_local * P_STRIDE + key_local / 4][key_local % 4] = float16_t(weight);
             }
             [[unroll]] for (uint delta = 1; delta < SUBGROUP_SIZE / 4; delta *= 2) {
                 block_sum += subgroupShuffleXor(block_sum, delta);
@@ -207,7 +205,7 @@ void main() {
         coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> pmats[KEYS_PER_BLOCK / TILE];
         [[unroll]] for (uint key_chunk = 0; key_chunk < KEYS_PER_BLOCK / TILE; ++key_chunk) {
             const uint pv_head_tile = gl_SubgroupID / (DIMS_PER_BLOCK / TILE);
-            coopMatLoad(pmats[key_chunk], p_sh,
+            coopMatLoad(pmats[key_chunk], q_p_sh,
                 pv_head_tile * TILE * P_STRIDE + key_chunk * (TILE / 4),
                 P_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
         }
@@ -222,7 +220,7 @@ void main() {
                     const uint offset = stream * p.nbk3 + key * p.nbk1 + dim_base + d4 * 4;
                     value = f16vec4(data_k[offset], data_k[offset + 1], data_k[offset + 2], data_k[offset + 3]);
                 }
-                v_sh[key_local * V_STRIDE + d4] = value;
+                k_v_sh[key_local * V_STRIDE + d4] = value;
             }
             barrier();
 
@@ -233,7 +231,7 @@ void main() {
             const uint pv_head_tile = gl_SubgroupID / (DIMS_PER_BLOCK / TILE);
             const uint pv_dim_tile = gl_SubgroupID % (DIMS_PER_BLOCK / TILE);
             [[unroll]] for (uint key_chunk = 0; key_chunk < KEYS_PER_BLOCK / TILE; ++key_chunk) {
-                coopMatLoad(vmat, v_sh,
+                coopMatLoad(vmat, k_v_sh,
                     key_chunk * TILE * V_STRIDE + pv_dim_tile * (TILE / 4),
                     V_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
                 pv = coopMatMulAdd(pmats[key_chunk], vmat, pv);
