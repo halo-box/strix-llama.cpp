@@ -45,6 +45,16 @@ const uint VEC_PER_HEAD = HEAD_SIZE / 4;
 const uint TILE_STRIDE = VEC_PER_HEAD + 2;
 const uint SCORE_STRIDE = TILE / 4 + 1;
 
+// Shared-memory budget, N_WAVES=8 / HEADS_PER_TILE=4 (TILE 16, HEAD_SIZE 128):
+//   k_sh      8 * 16 * 34 * 8 B = 34816
+//   q_sh      4 * 16 * 34 * 8 B = 17408
+//   score_sh  8 * 16 *  5 * 16 B = 10240
+//   weight_sh 4 * 16 *      4 B =   256
+//                        total  = 62720 of 65536 (95.7%)
+// Only one workgroup fits per CU at that size, which is the intended trade. Raising either
+// constant overruns: HEADS_PER_TILE=8 needs 80128 B and the pipeline then fails to create,
+// silently falling back to the small variant. The host gates on
+// maxComputeSharedMemorySize >= 64 KiB; keep that gate and this arithmetic in sync.
 shared f16vec4 q_sh[HEADS_PER_TILE][TILE * TILE_STRIDE];
 shared f16vec4 k_sh[N_WAVES][TILE * TILE_STRIDE];
 shared vec4 score_sh[N_WAVES][TILE * SCORE_STRIDE];
