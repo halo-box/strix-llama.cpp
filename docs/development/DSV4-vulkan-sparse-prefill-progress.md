@@ -405,3 +405,88 @@ Logs:
 - `/tmp/dsv4-fa-tiled-boundary-correctness.log`
 - `/tmp/dsv4-fa-tiled-all-correctness.log`
 - `/tmp/dsv4-vulkan-tiled-32k.log`
+
+## Selected PV probability reuse
+
+The selected cooperative-matrix stage remained the largest split sparse-FA component. Profiling the exact tiled production shape showed:
+
+```text
+selected K gather and cooperative QK:  about 20.0 ms
+QK plus softmax:                       about 22.3 ms
+full selected stage:                   about 45.5 ms
+cooperative PV and output increment:   about 23.2 ms
+```
+
+PV and output were about 51% of the selected stage. The shader previously loaded each of four 16x16 probability cooperative-matrix fragments again for every one of the eight 64-dimension PV passes. The optimized shader loads these four fragments once per 64-key block and retains them across all PV dimension passes. This follows the probability-fragment lifetime used by ordinary cooperative Vulkan FA.
+
+The shader also aliases the shared score and PV-output matrices because their lifetimes do not overlap. Shader resource statistics changed as follows:
+
+```text
+                         Before    After
+VGPRs                    192       192
+VGPR spills              0         0
+LDS                      36,864    28,672 bytes
+static instructions      11,524    11,358
+```
+
+The exact production-shape microbenchmark changed from 113.70 ms for the committed tiled path to 110.11 ms. The selected stage fell from about 45.5 ms to about 43.7 ms. The raw-prefix and reduction implementations are unchanged.
+
+Two canonical 32k runs after this change measured:
+
+```text
+32k context, PP 2048, ub 2048
+
+Committed tiled reference:
+209.62 tok/s
+Total Vulkan:             9.72897 s
+Split sparse FA:          1.18721 s
+  raw-prefix FA:          0.192879 s
+  selected sparse FA:     0.910153 s
+  split reduction:        0.084179 s
+Lightning Indexer:        1.100230 s
+TOP_K:                    0.075158 s
+
+Probability reuse, run 1:
+211.03 tok/s
+Total Vulkan:             9.66363 s
+Split sparse FA:          1.12776 s
+  raw-prefix FA:          0.192078 s
+  selected sparse FA:     0.849862 s
+  split reduction:        0.085821 s
+Lightning Indexer:        1.098980 s
+TOP_K:                    0.071036 s
+
+Probability reuse, run 2:
+209.57 tok/s
+Total Vulkan:             9.72968 s
+Split sparse FA:          1.13553 s
+  raw-prefix FA:          0.192987 s
+  selected sparse FA:     0.859890 s
+  split reduction:        0.082653 s
+Lightning Indexer:        1.102550 s
+TOP_K:                    0.071474 s
+```
+
+The two-run selected-stage improvement is 5.5-6.6%, and the complete split sparse-FA improvement is 4.4-5.0%. The two-run throughput mean is 210.30 tok/s, 0.32% above the 209.62 tok/s reference. End-to-end noise in unrelated model kernels is larger than this small total-throughput change, but both profiler runs isolate a consistent gain in the modified selected stage.
+
+Correctness after the change:
+
+- focused sparse top-K suite: 9/9 passed against the CPU reference
+- complete Vulkan Flash Attention suite: 13,297/13,297 passed
+- pipeline statistics probe: 1/1 passed, with no SGPR or VGPR spills
+- no NaN or Inf failure
+
+Logs:
+
+- `/tmp/dsv4-fa-selected-qk-tiled.log`
+- `/tmp/dsv4-fa-selected-softmax-tiled.log`
+- `/tmp/dsv4-fa-lds-alias-stats.log`
+- `/tmp/dsv4-fa-pmat-stats.log`
+- `/tmp/dsv4-fa-exact-lds-alias.log`
+- `/tmp/dsv4-fa-exact-pmat.log`
+- `/tmp/dsv4-fa-pmat-correctness.log`
+- `/tmp/dsv4-fa-pmat-all-correctness.log`
+- `/tmp/dsv4-vulkan-32k-pmat.log`
+- `/tmp/dsv4-vulkan-32k-pmat-repeat.log`
+
+The next sparse-FA optimization should continue to target the selected PV/output half. The retained probability fragments remove redundant cooperative loads without increasing reported VGPR allocation. More invasive changes such as doubling the PV dimension tile can reduce barriers but must be designed around the eight available wave64 subgroups, 64 KiB LDS limit, and already high 192-VGPR allocation. Do not build a crossover matrix until the next kernel layout is settled because an optimization can shift the crossover.
