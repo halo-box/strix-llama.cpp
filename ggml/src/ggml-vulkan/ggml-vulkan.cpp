@@ -11168,7 +11168,12 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         const uint32_t NS = (uint32_t) q->ne[3];
         const uint32_t raw_kv = (uint32_t) n_kv_raw;
         const uint32_t partitions = 2;
-        const uint32_t tile_size = std::min(N, 256u);
+        // Query tiling keeps the split scratch small, but flash_attn_split_k_reduce derives the
+        // destination row from ne2, which it is handed as the TILE height. With one tile that
+        // equals N and the stream stride is right; with several tiles and more than one stream
+        // it would write stream s at s*tile_size instead of s*N. Only tile when there is a
+        // single stream, which is the prefill case the tiling exists for.
+        const uint32_t tile_size = (NS == 1) ? std::min(N, 256u) : N;
         const uint32_t n_tiles = CEIL_DIV(N, tile_size);
         const bool f32acc = true;
         vk_fa_tuning_params tuning = get_fa_tuning_params(ctx->device, D, D, N, raw_kv, GGML_TYPE_F16, GGML_TYPE_F16, f32acc);
