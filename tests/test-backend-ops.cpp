@@ -10789,7 +10789,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 1024, 512, false));
         }
     }
-    test_cases.emplace_back(new test_flash_attn_ext_top_k(19200, 2048, 2304, 512, false));
+    // PP2048 compressed-K rows for source context depths 32k through 512k.
+    for (int kv : { 11008, 19200, 35584, 68352, 133888 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 2048, 2304, 512, false));
+    }
 
     return test_cases;
 }
