@@ -58,10 +58,9 @@ const float MASK_NEG_INF = -65500.0;
 shared uint key_idx[KEYS_PER_BLOCK];
 shared f16vec4 q_sh[HEADS_PER_GROUP * QK_STRIDE];
 shared f16vec4 k_sh[KEYS_PER_BLOCK * QK_STRIDE];
-shared vec4 score_sh[KEYS_PER_BLOCK * SCORE_STRIDE];
+shared vec4 matrix_sh[KEYS_PER_BLOCK * SCORE_STRIDE];
 shared f16vec4 p_sh[HEADS_PER_GROUP * P_STRIDE];
 shared f16vec4 v_sh[KEYS_PER_BLOCK * V_STRIDE];
-shared vec4 pv_sh[HEADS_PER_GROUP * PV_STRIDE];
 shared float old_scale_sh[HEADS_PER_GROUP];
 shared float row_max_sh[HEADS_PER_GROUP];
 shared float row_sum_sh[HEADS_PER_GROUP];
@@ -142,7 +141,7 @@ void main() {
 
         const uint score_key_chunk = gl_SubgroupID % (KEYS_PER_BLOCK / TILE);
         const uint score_head_tile = gl_SubgroupID / (KEYS_PER_BLOCK / TILE);
-        coopMatStore(scores, score_sh,
+        coopMatStore(scores, matrix_sh,
             score_key_chunk * TILE * SCORE_STRIDE + score_head_tile * (TILE / 4),
             SCORE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
@@ -159,7 +158,7 @@ void main() {
                 const uint key_local = softmax_lane + i * (SUBGROUP_SIZE / 4);
                 const uint key = key_idx[key_local];
                 const float mask = key < p.n_kv ? float(data_m[mask_base + key]) : uintBitsToFloat(0xff800000);
-                const float score = float(score_sh[key_local * SCORE_STRIDE + head_local / 4][head_local % 4]) * p.scale + mask;
+                const float score = float(matrix_sh[key_local * SCORE_STRIDE + head_local / 4][head_local % 4]) * p.scale + mask;
                 block_max = mask < MASK_NEG_INF ? block_max : max(block_max, score);
             }
             [[unroll]] for (uint delta = 1; delta < SUBGROUP_SIZE / 4; delta *= 2) {
@@ -177,7 +176,7 @@ void main() {
                 const float mask = key < p.n_kv ? float(data_m[mask_base + key]) : uintBitsToFloat(0xff800000);
                 float weight = 0.0;
                 if (mask >= MASK_NEG_INF) {
-                    const float score = float(score_sh[key_local * SCORE_STRIDE + head_local / 4][head_local % 4]) * p.scale + mask;
+                    const float score = float(matrix_sh[key_local * SCORE_STRIDE + head_local / 4][head_local % 4]) * p.scale + mask;
                     weight = exp(score - new_max);
                     block_sum += weight;
                 }
@@ -205,6 +204,14 @@ void main() {
             continue;
         }
 
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> pmats[KEYS_PER_BLOCK / TILE];
+        [[unroll]] for (uint key_chunk = 0; key_chunk < KEYS_PER_BLOCK / TILE; ++key_chunk) {
+            const uint pv_head_tile = gl_SubgroupID / (DIMS_PER_BLOCK / TILE);
+            coopMatLoad(pmats[key_chunk], p_sh,
+                pv_head_tile * TILE * P_STRIDE + key_chunk * (TILE / 4),
+                P_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        }
+
         [[unroll]] for (uint dim_base = 0; dim_base < HEAD_SIZE; dim_base += DIMS_PER_BLOCK) {
             [[unroll]] for (uint idx = tid; idx < KEYS_PER_BLOCK * (DIMS_PER_BLOCK / 4); idx += WORKGROUP_SIZE) {
                 const uint key_local = idx / (DIMS_PER_BLOCK / 4);
@@ -221,22 +228,18 @@ void main() {
 
             coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> pv =
                 coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
-            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> pmat;
             coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> vmat;
 
             const uint pv_head_tile = gl_SubgroupID / (DIMS_PER_BLOCK / TILE);
             const uint pv_dim_tile = gl_SubgroupID % (DIMS_PER_BLOCK / TILE);
             [[unroll]] for (uint key_chunk = 0; key_chunk < KEYS_PER_BLOCK / TILE; ++key_chunk) {
-                coopMatLoad(pmat, p_sh,
-                    pv_head_tile * TILE * P_STRIDE + key_chunk * (TILE / 4),
-                    P_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(vmat, v_sh,
                     key_chunk * TILE * V_STRIDE + pv_dim_tile * (TILE / 4),
                     V_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-                pv = coopMatMulAdd(pmat, vmat, pv);
+                pv = coopMatMulAdd(pmats[key_chunk], vmat, pv);
             }
 
-            coopMatStore(pv, pv_sh,
+            coopMatStore(pv, matrix_sh,
                 pv_head_tile * TILE * PV_STRIDE + pv_dim_tile * (TILE / 4), PV_STRIDE,
                 gl_CooperativeMatrixLayoutRowMajor);
             barrier();
@@ -246,7 +249,7 @@ void main() {
                 const uint head_local = out_idx / HEAD_SIZE;
                 const uint dim = out_idx % HEAD_SIZE;
                 if (dim >= dim_base && dim < dim_base + DIMS_PER_BLOCK) {
-                    accum[i] += pv_sh[head_local * PV_STRIDE + (dim - dim_base) / 4][dim % 4];
+                    accum[i] += matrix_sh[head_local * PV_STRIDE + (dim - dim_base) / 4][dim % 4];
                 }
             }
             barrier();
