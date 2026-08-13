@@ -10376,6 +10376,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true,  2));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 300, 256, 512, false, 3));
 
+    for (int kv : { 127, 128, 129 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, GGML_TYPE_F16));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -10789,6 +10793,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 }
             }
         }
+    }
+    // DSV4 PP2048 indexer rows after filling source contexts from 8k through 512k.
+    // The zero-depth kv=512 shape is covered above.
+    for (int kv : { 2560, 4608, 8704, 16896, 33280, 66048, 131584 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 2048, 1, 1, GGML_TYPE_F16));
     }
 
     // sparse top-k FA at V4 decode/prefill shapes — the A/B instrument for the
