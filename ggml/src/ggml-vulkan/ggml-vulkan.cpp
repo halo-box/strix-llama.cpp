@@ -11250,6 +11250,8 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         const uint32_t NS = (uint32_t) q->ne[3];
         const uint32_t raw_kv = (uint32_t) n_kv_raw;
         const uint32_t partitions = 2;
+        const uint32_t tile_size = std::min(N, 256u);
+        const uint32_t n_tiles = CEIL_DIV(N, tile_size);
         const bool f32acc = true;
         vk_fa_tuning_params tuning = get_fa_tuning_params(ctx->device, D, D, N, raw_kv, GGML_TYPE_F16, GGML_TYPE_F16, f32acc);
 
@@ -11270,11 +11272,12 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                     pipelines[raw_state] = raw_pipeline = std::make_shared<vk_pipeline_struct>();
                 }
             }
-            ggml_pipeline_request_descriptor_sets(ctx, raw_pipeline, 1);
-            ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+            ggml_pipeline_request_descriptor_sets(ctx, raw_pipeline, n_tiles);
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_tiles);
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, n_tiles);
 
-            const uint64_t split_size = ((uint64_t) D * NH * sizeof(float) + NH * 2 * sizeof(float)) * partitions * N * NS;
+            const uint64_t partition_size = ((uint64_t) D * NH + NH * 2) * sizeof(float) * tile_size * NS;
+            const uint64_t split_size = partition_size * partitions;
             if (split_size <= ctx->device->properties.limits.maxStorageBufferRange) {
                 if (ctx->prealloc_size_split_k < split_size) {
                     ctx->prealloc_size_split_k = split_size;
@@ -11284,45 +11287,63 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                     ggml_vk_sync_buffers(ctx, subctx);
                 }
 
-                const vk_subbuffer split_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
                 const uint32_t n_head_log2 = 64;
                 const uint32_t packed_gqa = (mask_stride << 16) | 1;
                 const uint32_t packed_partitions = (partitions << 16) | 1;
-                const vk_flash_attn_push_constants raw_pc = {
-                    N, raw_kv,
-                    NH, N, NS,
-                    NH, NS,
-                    1, NS,
-                    1, NS,
-                    (uint32_t) mask->ne[1], (uint32_t) mask->ne[2], (uint32_t) mask->ne[3],
-                    q_stride, (uint32_t) q->nb[2], (uint32_t) q->nb[3],
-                    k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
-                    k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
-                    scale, 0.0f, 0.0f,
-                    n_head_log2, 1.0f, 1.0f,
-                    packed_gqa, raw_kv, packed_partitions,
+                const vk_subbuffer split_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+                const vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+                const vk_subbuffer mask_buf = ggml_vk_tensor_subbuffer(ctx, mask);
+                const vk_subbuffer top_buf = ggml_vk_tensor_subbuffer(ctx, top_k);
+                const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+                const auto sliced = [](const vk_subbuffer & buf, uint64_t offset) {
+                    return vk_subbuffer{buf.buffer, buf.offset + offset, buf.size - offset};
                 };
 
-                ggml_vk_dispatch_pipeline(ctx, subctx, raw_pipeline,
-                    {q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, k),
-                     ggml_vk_tensor_subbuffer(ctx, mask), q_buf, split_buf, q_buf},
-                    raw_pc, {N, NH, NS});
-                ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_RAW (sub-op)");
+                for (uint32_t tile = 0; tile < n_tiles; ++tile) {
+                    if (tile != 0) {
+                        ggml_vk_sync_buffers(ctx, subctx);
+                    }
+                    const uint32_t token_offset = tile * tile_size;
+                    const uint32_t tile_n = std::min(tile_size, N - token_offset);
+                    const vk_subbuffer tile_q = sliced(q_buf, (uint64_t) token_offset * q->nb[1]);
+                    const vk_subbuffer tile_mask = sliced(mask_buf, (uint64_t) token_offset * mask->nb[1]);
+                    const vk_subbuffer tile_top = sliced(top_buf, (uint64_t) token_offset * top_k->nb[1]);
+                    const vk_subbuffer tile_dst = sliced(dst_buf, (uint64_t) token_offset * dst->nb[2]);
+                    const vk_flash_attn_push_constants raw_pc = {
+                        tile_n, raw_kv,
+                        NH, tile_n, NS,
+                        NH, NS,
+                        1, NS,
+                        1, NS,
+                        (uint32_t) mask->ne[1], (uint32_t) mask->ne[2], (uint32_t) mask->ne[3],
+                        q_stride, (uint32_t) q->nb[2], (uint32_t) q->nb[3],
+                        k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
+                        k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
+                        scale, 0.0f, 0.0f,
+                        n_head_log2, 1.0f, 1.0f,
+                        packed_gqa, raw_kv, packed_partitions,
+                    };
 
-                pc.split_mode = 1;
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                    {q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, mask), sinks_buf,
-                     ggml_vk_tensor_subbuffer(ctx, top_k), split_buf},
-                    pc, {N, (uint32_t) CEIL_DIV(q->ne[2], 32), NS});
-                ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_SELECTED (sub-op)");
+                    ggml_vk_dispatch_pipeline(ctx, subctx, raw_pipeline,
+                        {tile_q, k_buf, k_buf, tile_mask, tile_q, split_buf, tile_q},
+                        raw_pc, {tile_n, NH, NS});
+                    ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_RAW (sub-op)");
 
-                ggml_vk_sync_buffers(ctx, subctx);
-                const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = {D, NH, N, NS, partitions, sinks != nullptr};
-                ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
-                    {split_buf, sinks_buf, ggml_vk_tensor_subbuffer(ctx, dst)},
-                    reduce_pc, {NH, D, N * NS});
-                ctx->prealloc_split_k_need_sync = true;
-                ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_REDUCE (sub-op)");
+                    pc.n_batch = tile_n;
+                    pc.split_mode = 1;
+                    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                        {tile_q, k_buf, tile_mask, sinks_buf, tile_top, split_buf},
+                        pc, {tile_n, (uint32_t) CEIL_DIV(q->ne[2], 32), NS});
+                    ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_SELECTED (sub-op)");
+
+                    ctx->prealloc_split_k_need_sync = true;
+                    ggml_vk_sync_buffers(ctx, subctx);
+                    const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = {D, NH, tile_n, NS, partitions, sinks != nullptr};
+                    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+                        {split_buf, sinks_buf, tile_dst}, reduce_pc, {NH, D, tile_n * NS});
+                    ctx->prealloc_split_k_need_sync = true;
+                    ggml_vk_perf_mark_subop(ctx, subctx, "FA_TOP_K_REDUCE (sub-op)");
+                }
                 return true;
             }
         }
