@@ -257,3 +257,95 @@ GGML_VK_PERF_LOGGER=1 ./build/bin/test-backend-ops perf \
 ```
 
 Always run these sequentially. Do not run a compiler concurrently on this APU.
+
+## Experimental raw-prefix split prototype
+
+An uncommitted follow-up prototype was tested after commit `24c7ead76cc1a9631fa1b42b0bfa53a15169e1ba`. Check `git status` before continuing. It was initially tested with `GGML_VK_FA_TOPK_SPLIT=1`. After the successful 32k run, the split path was changed to default-on for a llama-server coherence test. Set `GGML_VK_FA_TOPK_SPLIT=0` to restore the single cooperative sparse kernel.
+
+Stage profiling on the exact production sparse shape (`kv=19200,nb=2048,n_kv_raw=2304,n_top_k=512,sinks=0`) showed:
+
+```text
+cooperative QK and selected-K gather:   88.885 ms
+softmax increment:                       4.909 ms
+cooperative PV and output increment:   128.399 ms
+full cooperative sparse kernel:        222.193 ms
+```
+
+PV and output were 57.8% of the kernel. More importantly, most active keys are not sparse: all 2,304 raw-prefix rows are contiguous, while only 512 compressed rows use top-K indices. The prototype therefore makes two attention partitions:
+
+1. Ordinary optimized Vulkan cooperative FA processes the contiguous raw prefix.
+2. The cooperative top-K shader processes only the 512 selected compressed rows.
+3. The existing split-K reduction combines both online-softmax partitions and applies sinks.
+
+This preserves the exact raw-prefix, sparse top-K, causal mask, and softmax semantics. It reuses the existing ordinary FA and split-K reduction rather than adding a new subsystem.
+
+The exact-shape microbenchmark improved from 222.19 ms to 111.33 ms. Its steady split stages were about 62-64 ms raw-prefix FA, 43-46 ms selected sparse FA, and 3.6-3.9 ms reduction.
+
+Correctness validation:
+
+```bash
+GGML_VK_FA_TOPK_SPLIT=1 ./build/bin/test-backend-ops test \
+  -b Vulkan0 -o FLASH_ATTN_EXT -p 'n_top_k='
+
+./build/bin/test-backend-ops test -b Vulkan0 -o FLASH_ATTN_EXT
+```
+
+Results were 8/8 sparse top-K cases and 13,296/13,296 complete Vulkan FA cases against the CPU reference. No NaN or Inf failure occurred.
+
+Canonical 32k prototype command:
+
+```bash
+GGML_VK_FA_TOPK_SPLIT=1 GGML_VK_PERF_LOGGER=1 ./build/bin/llama-bench \
+  -m ~/Projects/docker/localLLaMA/models/models--unsloth--DeepSeek-V4-Flash-0731-GGUF/snapshots/109848da2469efe1f1aab9e11acea08a065ccd4f/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf \
+  -r 1 -d 32768 -p 2048 -ub 2048 -fa 1 -n 0 \
+  > /tmp/dsv4-vulkan-split-32k.log 2>&1
+```
+
+Final 32k result:
+
+```text
+32k context, PP 2048, ub 2048
+
+Old scalar:          112.29 tok/s, 18.1957 s total, 8.84496 s sparse FA
+Committed coopmat:   152.32 tok/s, 13.4032 s total, 4.44701 s sparse FA
+Experimental split: 208.70 tok/s,  9.7704 s total, 1.20170 s split sparse FA
+
+Experimental split stages:
+raw-prefix FA:       0.210775 s total, 10.037 ms/layer
+selected sparse FA:  0.908190 s total, 43.247 ms/layer
+split reduction:     0.082732 s total,  3.940 ms/layer
+Lightning Indexer:   1.110410 s total, 52.877 ms/layer
+TOP_K:               0.077394 s total,  3.685 ms/layer
+```
+
+Relative to the committed cooperative path, throughput improved 37.0%, total Vulkan time fell 27.1%, and sparse FA time fell 73.0%. Relative to the old scalar path, throughput improved 85.9%, total Vulkan time fell 46.3%, and sparse FA time fell 86.4%.
+
+The main unresolved tradeoff is scratch memory. At PP2048, the two output partitions use about 539 MiB because each stores an f32 partial output for 512 dimensions x 64 heads x 2048 queries, plus L/M data. The device maximum storage-buffer range is checked and the code falls back when the allocation is unavailable. The path is temporarily default-on for a llama-server coherence test but should not be finalized without discussing this footprint. A likely next step is to avoid materializing both full output partitions, for example by directly merging the selected partition into the raw result or processing query tiles, while retaining the measured split-path speed.
+
+The old sparse selection heuristic required `total_k >= 3 * active_k`. For the coherence test it now selects sparse attention whenever `total_k > active_k`; equality still uses dense FA because no keys are pruned. The shape, capability, and allocation gates remain unchanged.
+
+Prototype logs:
+
+- `/tmp/dsv4-fa-exact-qk.log`
+- `/tmp/dsv4-fa-exact-softmax.log`
+- `/tmp/dsv4-fa-exact-full.log`
+- `/tmp/dsv4-fa-exact-split.log`
+- `/tmp/dsv4-fa-split-correctness.log`
+- `/tmp/dsv4-fa-all-correctness.log`
+- `/tmp/dsv4-vulkan-split-32k.log`
+
+## Llama-server coherence check
+
+After making the split path default-on and changing the sparse crossover to `total_k > active_k`, `llama-server` produced a coherent response from a 2,044-token prompt at significant context depth. The final profiler block confirmed that all 21 sparse-attention layers used the split path:
+
+```text
+FA_TOP_K_RAW:       0.179223 s total,  8.534 ms/layer
+FA_TOP_K_SELECTED:  0.886629 s total, 42.220 ms/layer
+FA_TOP_K_REDUCE:    0.083240 s total,  3.964 ms/layer
+Split sparse FA:    1.149092 s total, 54.719 ms/layer
+Lightning Indexer:  1.054610 s total, 50.220 ms/layer
+TOP_K:               0.044540 s total,  2.121 ms/layer
+Total Vulkan:        9.797560 s
+```
+
+This closely matches the canonical PP2048 llama-bench result of 9.770 s total and 1.202 s split sparse FA. The focused sparse CPU-reference test was rerun after the crossover change and passed 8/8 cases.

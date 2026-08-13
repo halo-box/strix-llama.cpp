@@ -10788,6 +10788,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 1024, 512, false));
         }
     }
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(19200, 2048, 2304, 512, false));
 
     return test_cases;
 }
