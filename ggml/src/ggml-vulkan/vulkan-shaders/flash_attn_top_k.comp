@@ -37,7 +37,6 @@ layout(push_constant) uniform Parameters {
     uint nb3;
     float scale;
     uint has_sinks;
-    uint profile_stage;
     uint split_mode;
 } p;
 
