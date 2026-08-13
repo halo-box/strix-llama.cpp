@@ -39,10 +39,15 @@ layout(push_constant) uniform Parameters {
     uint nb3;
     float scale;
     uint has_sinks;
-    uint profile_stage;
     uint split_mode;
 } p;
 
+// This shader is hard-wired to a 512-thread workgroup of eight 64-wide subgroups:
+// the softmax segments SUBGROUP_SIZE/4 = 16 lanes per head (so head_local stays < 32),
+// and the QK/PV tiling assumes gl_NumSubgroups == 8 via gl_SubgroupID % 4 / gl_SubgroupID / 4.
+// A different subgroup size indexes past row_max_sh/q_p_sh and corrupts the score tiles, so
+// the pipeline is only created under `device->subgroup_size == 64` in ggml_vk_load_shaders.
+// Keep that gate in sync with these constants.
 const uint TILE = 16;
 const uint HEAD_SIZE = 512;
 const uint HEADS_PER_GROUP = 32;
@@ -146,10 +151,6 @@ void main() {
             SCORE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
 
-        if (p.profile_stage == 1) {
-            continue;
-        }
-
         {
             const uint head_local = tid / (SUBGROUP_SIZE / 4);
             const uint softmax_lane = tid % (SUBGROUP_SIZE / 4);
@@ -196,10 +197,6 @@ void main() {
             const uint out_idx = tid + i * WORKGROUP_SIZE;
             const uint head_local = out_idx / HEAD_SIZE;
             accum[i] *= old_scale_sh[head_local];
-        }
-
-        if (p.profile_stage == 2) {
-            continue;
         }
 
         coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> pmats[KEYS_PER_BLOCK / TILE];
