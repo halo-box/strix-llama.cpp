@@ -2125,7 +2125,11 @@ struct vk_quantize_q8_1_push_constants {
 struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t D;
     uint32_t ne1;
+    // ne2 describes the SPLIT BUFFER (which may cover only a tile of queries); dst_ne2 is the
+    // destination's query count. They differ only when the caller tiles the split buffer, and
+    // the destination stride between streams must always use the full count.
     uint32_t ne2;
+    uint32_t dst_ne2;
     uint32_t ne3;
     uint32_t k_num;
     uint32_t sinks;
@@ -11172,12 +11176,10 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         const uint32_t NS = (uint32_t) q->ne[3];
         const uint32_t raw_kv = (uint32_t) n_kv_raw;
         const uint32_t partitions = 2;
-        // Query tiling keeps the split scratch small, but flash_attn_split_k_reduce derives the
-        // destination row from ne2, which it is handed as the TILE height. With one tile that
-        // equals N and the stream stride is right; with several tiles and more than one stream
-        // it would write stream s at s*tile_size instead of s*N. Only tile when there is a
-        // single stream, which is the prefill case the tiling exists for.
-        const uint32_t tile_size = (NS == 1) ? std::min(N, 256u) : N;
+        // Query tiling caps the split scratch at 256 queries regardless of batch or stream
+        // count. The reduce takes the tile height as ne2 and the full query count as dst_ne2,
+        // so the destination stream stride stays correct across tiles.
+        const uint32_t tile_size = std::min(N, 256u);
         const uint32_t n_tiles = CEIL_DIV(N, tile_size);
         const bool f32acc = true;
         vk_fa_tuning_params tuning = get_fa_tuning_params(ctx->device, D, D, N, raw_kv, GGML_TYPE_F16, GGML_TYPE_F16, f32acc);
@@ -11272,7 +11274,7 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
 
                     ctx->prealloc_split_k_need_sync = true;
                     ggml_vk_sync_buffers(ctx, subctx);
-                    const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = {D, NH, tile_n, NS, partitions, sinks != nullptr};
+                    const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = {D, NH, tile_n, N, NS, partitions, sinks != nullptr};
                     ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
                         {split_buf, sinks_buf, tile_dst}, reduce_pc, {NH, D, tile_n * NS});
                     ctx->prealloc_split_k_need_sync = true;
@@ -11789,7 +11791,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     pc, { dispatch_x, workgroups_y, workgroups_z });
 
         ggml_vk_sync_buffers(ctx, subctx);
-        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
+        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
                                     {split_k_buf, sinks_buf, dst_buf},
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
