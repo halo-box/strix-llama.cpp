@@ -214,9 +214,21 @@ void init_indices()
     q_stride = gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
+    // Bit 31 of gqa_ratio means "the mask row stride is in split_kv", used by the DeepSeek V4
+    // sparse split path where the mask spans the full K range but this dispatch only covers the
+    // raw prefix, so m_stride != KV. That path always sets split_k_num == 1, which is what keeps
+    // split_kv free to carry the stride; ggml_vk_flash_attn_top_k asserts the invariant.
+    // Otherwise: when using grouped query attention all rows share the same mask (stride 0).
+    // "p.gqa_ratio >> 16" is just a roundabout way of writing zero that prevents the compiler
+    // from folding the "&" through the select and breaking the alignment detection.
     const bool mask_stride_in_split_kv = (p.gqa_ratio & 0x80000000u) != 0;
-    const uint32_t mask_stride_override = p.gqa_ratio >> 16;
-    m_stride = mask_stride_in_split_kv ? p.split_kv : (mask_stride_override != 0 ? mask_stride_override : (gqa_ratio > 1 ? 0 : KV));
+    m_stride = mask_stride_in_split_kv ? p.split_kv : ((gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV);
+    // Distinct from m_stride: m_stride is the row-to-row step INSIDE this tile (0 under GQA,
+    // where every row shares one mask row), while m_row_len is the mask tensor's actual row
+    // length, used to step between tokens and between streams. They differ under GQA and
+    // under the sparse split path, where this dispatch only covers the raw prefix (KV) but
+    // the mask rows span the whole K range.
+    m_row_len = mask_stride_in_split_kv ? p.split_kv : KV;
 
     // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
     // partitions the n_kv_max blocks.
