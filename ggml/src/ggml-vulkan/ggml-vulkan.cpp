@@ -1088,6 +1088,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_delta_net[4][2];
     vk_pipeline pipeline_lightning_indexer_f16;
     vk_pipeline pipeline_lightning_indexer_cm_f16;
+    vk_pipeline pipeline_lightning_indexer_cm_small_f16;
     vk_pipeline pipeline_lightning_indexer_decode_cm_f16;
     vk_pipeline pipeline_flash_attn_top_k_f16;
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
@@ -6076,10 +6077,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             device->subgroup_size);
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
         if (device->coopmat_support && device->coopmat_support_16x16x16_f32acc && device->subgroup_size_control) {
-            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_f16,
-                "lightning_indexer_cm_f16", lightning_indexer_cm_f16_len, lightning_indexer_cm_f16_data, "main", 5,
+            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_small_f16,
+                "lightning_indexer_cm_small_f16", lightning_indexer_cm_small_f16_len, lightning_indexer_cm_small_f16_data, "main", 5,
                 sizeof(vk_op_lightning_indexer_cm_push_constants), {16, 16, 1}, {device->subgroup_size}, 1, true, true,
                 device->subgroup_size);
+            if (device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
+                device->properties.limits.maxComputeWorkGroupSize[0] >= 512 &&
+                device->properties.limits.maxComputeSharedMemorySize >= 64 * 1024) {
+                ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_f16,
+                    "lightning_indexer_cm_f16", lightning_indexer_cm_f16_len, lightning_indexer_cm_f16_data, "main", 5,
+                    sizeof(vk_op_lightning_indexer_cm_push_constants), {128, 16, 1}, {device->subgroup_size}, 1, true, true,
+                    device->subgroup_size);
+            }
             ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_decode_cm_f16,
                 "lightning_indexer_decode_cm_f16", lightning_indexer_decode_cm_f16_len, lightning_indexer_decode_cm_f16_data, "main", 5,
                 sizeof(vk_op_lightning_indexer_cm_push_constants), {16, 1, 1}, {device->subgroup_size}, 1, true, true,
@@ -12379,8 +12388,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             if (ctx->device->pipeline_lightning_indexer_decode_cm_f16 && src0->ne[2] == 1) {
                 return ctx->device->pipeline_lightning_indexer_decode_cm_f16;
             }
-            return ctx->device->pipeline_lightning_indexer_cm_f16 && src0->ne[2] >= 16 ?
-                ctx->device->pipeline_lightning_indexer_cm_f16 : ctx->device->pipeline_lightning_indexer_f16;
+            vk_pipeline cm = ctx->device->pipeline_lightning_indexer_cm_f16 ?
+                ctx->device->pipeline_lightning_indexer_cm_f16 : ctx->device->pipeline_lightning_indexer_cm_small_f16;
+            return cm && src0->ne[2] >= 16 ? cm : ctx->device->pipeline_lightning_indexer_f16;
         }
         // only the k type selects a pipeline, the other types are fixed by ggml_lightning_indexer()
         if (ggml_vk_lightning_indexer_k_type_supported(src1->type)) {
