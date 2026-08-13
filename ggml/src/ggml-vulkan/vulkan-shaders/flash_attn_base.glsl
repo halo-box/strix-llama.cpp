@@ -215,38 +215,9 @@ void init_indices()
     q_stride = gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
-    // When using grouped query attention, all rows use the same mask (stride 0).
-    // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
-    // that prevents the compiler from folding the "&" through the select
-    // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
-
-    // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
-    // partitions the n_kv_max blocks.
-    if (USE_SPARSE) {
-        uint32_t qrow = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br);
-        sparse_base = (((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 + qrow) * p.split_kv;
-
-        uint32_t total_blocks = CEIL_DIV(p.split_kv, Bc);
-        uint32_t per_blocks   = CEIL_DIV(total_blocks, p.k_num);
-        start_j = min(split_k_index * per_blocks, total_blocks);
-        end_j   = min((split_k_index + 1) * per_blocks, total_blocks);
-    }
-}
-
-// Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).
-bool fa_kv_index(uint lin, out uint kv_col) {
-    if (USE_SPARSE) {
-        if (lin >= p.split_kv) {
-            kv_col = 0;
-            return false;
-        }
-        int idx = data_sparse[sparse_base + lin];
-        kv_col = idx >= 0 ? uint(idx) : 0;
-        return idx >= 0;
-    }
-    kv_col = lin;
-    return !KV_bounds_check || lin < KV;
+    const bool mask_stride_in_split_kv = (p.gqa_ratio & 0x80000000u) != 0;
+    const uint32_t mask_stride_override = p.gqa_ratio >> 16;
+    m_stride = mask_stride_in_split_kv ? p.split_kv : (mask_stride_override != 0 ? mask_stride_override : (gqa_ratio > 1 ? 0 : KV));
 }
 
 // Bias applied to softmax to stay in fp16 range.
