@@ -19,6 +19,15 @@
 // (a multiple of every FA block width) is what lets flash-attention keep its "aligned"
 // pipeline variant even though the row count is now a runtime value.
 //
+// Also emits the raw union size, the candidate count and the batch it came from. The host
+// reads those back to decide whether compaction is worth it at all, and files the sample under
+// the batch reported here rather than the one it is pricing: it cannot tell which call last
+// wrote the slot, and the overlap it is measuring depends on the batch.
+//
+// count_only skips the list writes. The scan still has to run to produce the count, but with
+// nothing to write the index buffer need not exist, which is what lets the host price the
+// union on a call it is not going to compact.
+//
 // One workgroup: the bitmap and the running offset both live in shared memory.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -36,6 +45,7 @@ layout(push_constant) uniform Parameters {
     uint nbt1;
     uint max_words;   // capacity of the shared bitmap, host-checked
     uint pad_to;
+    uint count_only;  // 1: produce the count, write no index list
 } p;
 
 // 12288 words = 393216 compressed rows, ~48 KiB of shared memory.
@@ -97,7 +107,7 @@ void main() {
         }
 
         uint slot = base_sh + prefix + wave_off;
-        uint rem  = bits;
+        uint rem  = p.count_only != 0 ? 0u : bits;
         while (rem != 0) {
             const uint b = findLSB(rem);
             rem &= rem - 1;
@@ -118,5 +128,7 @@ void main() {
         const uint rows = p.n_kv_raw + u;
         data_c[0] = ((rows + p.pad_to - 1) / p.pad_to) * p.pad_to;
         data_c[1] = u;
+        data_c[2] = n_cand;
+        data_c[3] = p.n_batch;
     }
 }
