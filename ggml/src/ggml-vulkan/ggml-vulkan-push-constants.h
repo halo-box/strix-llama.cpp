@@ -750,6 +750,12 @@ struct vk_op_dsv4_hc_post_push_constants {
     uint32_t sd0, sd1, sd2;
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
+struct vk_op_flash_attn_union_push_constants {
+    uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to;
+};
+struct vk_op_flash_attn_gather_union_push_constants {
+    uint32_t n_kv, n_kv_raw, kv_c_max, nbk1, nbm1, n_batch;
+};
 
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
