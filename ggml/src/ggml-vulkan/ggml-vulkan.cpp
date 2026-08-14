@@ -631,6 +631,8 @@ struct vk_fa_compact_state {
     bool dynamic_kv = false;      // KV row count lives in kv_buf, not the push constant
     uint32_t kv_c = 0;            // upper bound; the real count is runtime when dynamic_kv
     uint32_t n_batch = 1;
+    uint32_t row_bytes = 0;       // bytes per compact K row; K may be quantised
+    uint32_t row_elems = 0;       // K row stride in ELEMENTS/blocks, for the FA push constant
     vk_subbuffer kv_buf;
     vk_subbuffer kc_buf, mc_buf;
 };
@@ -721,10 +723,22 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         const ggml_tensor * mask, ggml_tensor * dst, vk_fa_compact_state & st) {
     const ggml_tensor * top_k = dst->src[5];
     static const char * gather_env = getenv("GGML_VK_FA_TOPK_GATHER");
+    // K/V type: the gather relocates rows verbatim and never reads a value out of them, so it
+    // does not have to be f16 - it has to be a type whose row is a whole number of 4-byte words,
+    // and one flash-attention has a NATIVE shader for. The dequant/contiguize pass is disabled
+    // while this scratch is active and asserts if it turns out to be needed, so admitting a
+    // non-native type here would abort rather than fall back.
+    const bool kv_word_addressable =
+        k->type == v->type &&
+        ggml_vk_fa_kv_native(k->type, ctx->device->coopmat2) &&
+        k->ne[0] % ggml_blck_size(k->type) == 0 &&
+        ggml_row_size(k->type, k->ne[0]) % 4 == 0 &&
+        k->nb[1] % 4 == 0 && k->nb[3] % 4 == 0;
+
     if ((gather_env && gather_env[0] == '0') ||
         !top_k || !ctx->device->pipeline_flash_attn_gather_f16 ||
         q->ne[1] < 1 || q->ne[1] >= 64 ||   // 1..63: >=64 goes to the sparse prefill path
-        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        q->type != GGML_TYPE_F32 || !kv_word_addressable ||
         !mask || mask->type != GGML_TYPE_F16 || top_k->type != GGML_TYPE_I32 ||
         q->ne[0] != 512 || k->ne[0] != 512 || v->ne[0] != 512 || q->ne[2] != 64 ||
         k->ne[2] != 1 || v->ne[2] != 1 ||
@@ -733,6 +747,9 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         !ggml_is_contiguous(mask) || !ggml_is_contiguous(top_k)) {
         return false;
     }
+
+    const uint32_t k_row_bytes = (uint32_t) ggml_row_size(k->type, k->ne[0]);
+    const uint32_t k_row_words = k_row_bytes / 4;
     // ---- deduplicated union (default on, GGML_VK_FA_TOPK_UNION=0 disables) --------------
     // Same compact layout, but one row per DISTINCT selected key instead of one block per
     // token. Measured on real draft tokens the union is 0.56 of the selections at batch 4,
@@ -817,7 +834,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
             goto union_unavailable;
         }
 
-        const size_t   ukc_sz = (size_t) kv_c * 512 * sizeof(ggml_fp16_t);
+        const size_t   ukc_sz = (size_t) kv_c * k_row_bytes;
         const size_t   umc_sz = (size_t) n_batch * kv_c * sizeof(ggml_fp16_t);
         const size_t   ul_sz  = (size_t) max_union * sizeof(uint32_t);
         const size_t   need   = ukc_sz + umc_sz + ul_sz;
@@ -850,7 +867,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
 
         const vk_op_flash_attn_gather_union_push_constants gpc = {
             (uint32_t) k->ne[1], (uint32_t) n_kv_raw, kv_c,
-            (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)),
+            (uint32_t) (k->nb[1] / 4),
             (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
             n_batch,
         };
@@ -864,6 +881,8 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         st.dynamic_kv = true;
         st.kv_c       = kv_c;
         st.n_batch    = n_batch;
+        st.row_bytes  = k_row_bytes;
+        st.row_elems  = (uint32_t) (k->ne[0] / ggml_blck_size(k->type));
         st.kc_buf     = kc_buf;
         st.mc_buf     = mc_buf;
         st.kv_buf     = uc_buf;
@@ -906,7 +925,7 @@ union_unavailable:;
     const uint32_t kv_c = GGML_PAD((uint32_t) (n_kv_raw + (int64_t) n_cand), 256u);
 
     const uint32_t ns    = (uint32_t) q->ne[3];
-    const size_t   kc_sz = (size_t) ns * kv_c * 512 * sizeof(ggml_fp16_t);
+    const size_t   kc_sz = (size_t) ns * kv_c * k_row_bytes;
     const size_t   mc_sz = (size_t) ns * n_batch * kv_c * sizeof(ggml_fp16_t);
 
     if (ctx->prealloc_size_y < kc_sz + mc_sz) {
@@ -922,8 +941,8 @@ union_unavailable:;
 
     const vk_op_flash_attn_gather_push_constants pc = {
         (uint32_t) k->ne[1], (uint32_t) n_kv_raw, (uint32_t) top_k->ne[0], kv_c,
-        (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)),
-        (uint32_t) (k->nb[3] / sizeof(ggml_fp16_t)),
+        (uint32_t) (k->nb[1] / 4),
+        (uint32_t) (k->nb[3] / 4),
         (uint32_t) (top_k->nb[3] / sizeof(int32_t)),
         (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
         (uint32_t) mask->ne[3],
@@ -9202,8 +9221,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
     uint32_t v_stride = (uint32_t)(nbv1 / ggml_type_size(v->type));
     if (fa_compact.active) {
-        k_stride = 512;
-        v_stride = 512;
+        // rows are tightly packed in the compact scratch; for a quantised K this is the block
+        // count per row, which is what nbk1 / ggml_type_size would have given for the source
+        k_stride = fa_compact.row_elems;
+        v_stride = fa_compact.row_elems;
     }
 
     // For F32, the shader treats it as a block of size 4 (for vec4 loads)
@@ -9481,9 +9502,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                   { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem2 * nem3 });
         ggml_vk_sync_buffers(ctx, subctx);
     }
-    // compact scratch layout: [512, kv_c, 1, ns] f16, tightly packed
-    const uint32_t eff_nbk2 = fa_compact.active ? fa_compact.kv_c * 512 * (uint32_t)sizeof(ggml_fp16_t) : nbk2_eff;
-    const uint32_t eff_nbk3 = fa_compact.active ? fa_compact.kv_c * 512 * (uint32_t)sizeof(ggml_fp16_t) : nbk3_eff;
+    // compact scratch layout: [512, kv_c, 1, ns] tightly packed, in K's own type
+    const uint32_t eff_nbk2 = fa_compact.active ? fa_compact.kv_c * fa_compact.row_bytes : nbk2_eff;
+    const uint32_t eff_nbk3 = fa_compact.active ? fa_compact.kv_c * fa_compact.row_bytes : nbk3_eff;
     const uint32_t eff_nbv2 = fa_compact.active ? eff_nbk2 : nbv2_eff;
     const uint32_t eff_nbv3 = fa_compact.active ? eff_nbk3 : nbv3_eff;
 
