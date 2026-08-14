@@ -1961,7 +1961,7 @@ struct vk_op_dsv4_hc_post_push_constants {
 static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 
 struct vk_op_flash_attn_union_push_constants {
-    uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to;
+    uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to, count_only;
 };
 struct vk_op_flash_attn_gather_union_push_constants {
     uint32_t n_kv, n_kv_raw, kv_c_max, nbk1, nbm1, n_batch;
@@ -2483,6 +2483,14 @@ struct ggml_backend_vk_context {
     uint64_t fa_dequant_gate_sz;
     bool fa_dequant_gate_fits;
     bool fa_dequant_gate_logged;
+    // DeepSeek V4 small-batch union: the compact row count is produced on the device, so the
+    // host prices compaction from the last count it wrote. See ggml_vk_fa_union_estimate.
+    // Per batch size, because the overlap depends on it (measured 0.64 at 2 tokens, 0.40 at 4,
+    // 0.24 at 8) and because a speculative decode varies the batch with the accept count, so a
+    // single slot would be invalidated on nearly every step. This path caps the batch at 64.
+    vk_buffer fa_union_stat;
+    float     fa_union_est_ratio[64]; // union / candidates, decaying peak; 0 = unseeded
+    uint64_t  fa_union_declines;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -7859,6 +7867,8 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->fa_dequant_gate_sz = 0;
     ctx->fa_dequant_gate_fits = false;
     ctx->fa_dequant_gate_logged = false;
+    memset(ctx->fa_union_est_ratio, 0, sizeof(ctx->fa_union_est_ratio));
+    ctx->fa_union_declines = 0;
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
 
@@ -11465,6 +11475,80 @@ struct vk_fa_compact_state {
     vk_subbuffer kc_buf, mc_buf;
 };
 
+// Small host-visible buffer holding the last union count the device produced:
+// [0] padded compact rows (also read by the gather and by the FA), [1] raw union size,
+// [2] the candidate count it came from, [3] the batch it came from. Host-visible is a
+// requirement rather than a preference here - the whole point is that the host can read it
+// without submitting.
+static bool ggml_vk_fa_union_stat_init(ggml_backend_vk_context * ctx) {
+    if (ctx->fa_union_stat) {
+        return ctx->fa_union_stat->ptr != nullptr;
+    }
+    try {
+        ctx->fa_union_stat = ggml_vk_create_buffer(ctx->device, 64,
+            {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+    } catch (const vk::SystemError &) {
+        return false;
+    }
+    if (ctx->fa_union_stat->ptr == nullptr) {
+        return false;
+    }
+    memset(ctx->fa_union_stat->ptr, 0, 64);
+    return true;
+}
+
+// Host-coherent memory still needs the write made available to the host domain. This is the
+// only barrier in the path that names eHost, and it is cheap: nothing waits on it, it just
+// lets the next graph's host-side read see the count this one produced.
+static void ggml_vk_fa_union_stat_host_barrier(vk_context & subctx) {
+    subctx->s->buffer->buf.pipelineBarrier(
+        vk::PipelineStageFlagBits::eComputeShader,
+        vk::PipelineStageFlagBits::eHost,
+        {},
+        { { vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead } },
+        {}, {});
+}
+
+// Price the union without synchronising for it. The count read here belongs to whichever call
+// last wrote the slot, which under a decode is the final flash-attention op of the previous
+// graph - one token stale, and that is fine: selection overlap is a property of the model and
+// the draft, not of an individual op, and a wrong estimate costs part of one step rather than
+// correctness (the compact buffers are still sized for the worst case).
+//
+// Tracks the latest measurement, lightly smoothed. The asymmetry runs the other way from what
+// a conservative estimator would assume: an estimate that is too HIGH declines compaction and
+// forgoes 2-3x for as long as it stays high, while one that is too low costs a single step at
+// roughly dense cost and is corrected by the count that step produces. An earlier version held
+// a decaying peak instead and measured 1992 us where the union delivers 900, because a spell of
+// genuinely low overlap pinned the estimate and 0.999 per read took hundreds of steps to relax.
+//
+// The words are read without ordering against the device write, so they can come from
+// different calls. The sample is filed under the batch the device reported rather than the
+// batch being priced, so a torn read costs one mispriced step for that batch and then
+// corrects, which is the same failure the estimate already tolerates.
+//
+// Returns the padded compact row count to gate on, or 0 when this batch is unseeded.
+static uint32_t ggml_vk_fa_union_estimate(ggml_backend_vk_context * ctx, uint32_t n_kv_raw,
+                                          uint32_t n_batch, uint32_t n_cand) {
+    const volatile uint32_t * stat = (const volatile uint32_t *) ctx->fa_union_stat->ptr;
+    const uint32_t u      = stat[1];
+    const uint32_t cand   = stat[2];
+    const uint32_t nb_obs = stat[3];
+
+    if (u > 0 && cand > 0 && nb_obs > 0 && nb_obs < 64) {
+        const float r = std::min(1.0f, (float) u / (float) cand);
+        float &     e = ctx->fa_union_est_ratio[nb_obs];
+        e = e > 0.0f ? 0.5f * r + 0.5f * e : r;
+    }
+
+    const float ratio = ctx->fa_union_est_ratio[n_batch];
+    if (ratio <= 0.0f) {
+        return 0;
+    }
+    return GGML_PAD(n_kv_raw + (uint32_t) ceilf(ratio * (float) n_cand), 256u);
+}
+
 // V4 sparse decode (gather-to-compact): the sparse prefill shader above gates on
 // q->ne[1] >= 64, so single-token decode otherwise attends densely over the whole
 // compressed KV, at a cost that grows with context. Instead, gather the active rows
@@ -11504,20 +11588,17 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     }
 
     const uint32_t n_batch = (uint32_t) q->ne[1];
-    // Every token gets its own top-k block, so the compact set is n_kv_raw + n_batch*n_top_k:
-    // independent of context depth, which is the point, but GROWING WITH BATCH. Attention work
-    // is then n_batch * (n_kv_raw + n_batch*n_top_k), i.e. quadratic in batch, against dense's
-    // n_batch * n_kv. Break-even is n_batch = (n_kv - n_kv_raw) / n_top_k, and the
-    // kv >= 2*kv_c gate below caps the useful batch at (n_kv/2 - n_kv_raw) / n_top_k --
-    // about 6 at 32k depth, ~30 at 128k, batch-capped at 512k. Beyond that the gate declines
-    // and dense runs, so this can never be slower; it just stops helping. A deduplicated union
-    // would lift that ceiling wherever draft tokens select overlapping keys.
-    const uint32_t kv_c = GGML_PAD((uint32_t)(n_kv_raw + (int64_t) n_batch * top_k->ne[0]), 256u);
-    // the gather writes then re-reads ~the active bytes; dense reads the source KV once,
-    // so compaction only pays when the source is comfortably larger than the active set
-    if ((uint64_t) k->ne[1] < 2ull * kv_c) {
-        return false;
-    }
+    const uint32_t n_cand  = (uint32_t) ((int64_t) n_batch * top_k->ne[0]);
+    // Worst case: every token gets its own top-k block, so the compact set is
+    // n_kv_raw + n_batch*n_top_k -- independent of context depth, which is the point, but
+    // GROWING WITH BATCH. Attention work is then n_batch * (n_kv_raw + n_batch*n_top_k), i.e.
+    // quadratic in batch, against dense's n_batch * n_kv. Break-even is
+    // n_batch = (n_kv - n_kv_raw) / n_top_k, and a kv >= 2*kv_c gate on this worst case caps
+    // the useful batch at (n_kv/2 - n_kv_raw) / n_top_k -- about 6 at 32k depth, ~30 at 128k.
+    // Beyond that the gate declines and dense runs, so this can never be slower; it just stops
+    // helping. The union below lifts that ceiling by gating on what the selections actually
+    // deduplicate to; kv_c remains the bound for every allocation and dispatch count.
+    const uint32_t kv_c = GGML_PAD((uint32_t) (n_kv_raw + (int64_t) n_cand), 256u);
 
     // ---- deduplicated union (GGML_VK_FA_TOPK_UNION=1) ----------------------------------
     // Same compact layout, but one row per DISTINCT selected key instead of one block per
@@ -11526,39 +11607,101 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     // reads its KV bound from a buffer (the DYNAMIC_KV pipeline flag) rather than a push
     // constant; padding the count to 256 keeps KV % Bc == 0 so the aligned variant still
     // applies. Single stream only: the FA takes one KV for all streams.
+    //
+    // Gated on the ESTIMATED union rather than on kv_c, which is why this sits above the
+    // worst-case gate: at batch 8 and 32k depth the worst case is 6400 rows against 11008
+    // source rows and would decline, while the union measures around 3300 and is well worth
+    // compacting. kv_c stays the worst case for every allocation and dispatch bound, so a
+    // wrong estimate is a slow step, never a wrong answer.
+    const uint32_t max_words  = 12288;   // shared bitmap capacity in flash_attn_union.comp
+    const bool     bitmap_fits = (uint64_t) ((k->ne[1] - n_kv_raw) + 31) / 32 <= max_words;
+
     static const char * union_env = getenv("GGML_VK_FA_TOPK_UNION");
-    if (union_env && union_env[0] == '1' && q->ne[3] == 1 && n_batch > 1 &&
-        ctx->device->pipeline_flash_attn_union_f16 && ctx->device->pipeline_flash_attn_gather_union_f16) {
-        const uint32_t max_union = (uint32_t) ((int64_t) n_batch * top_k->ne[0]);
-        // shared bitmap capacity in flash_attn_union.comp
-        const uint32_t max_words = 12288;
-        const uint32_t need_words = (uint32_t) (((k->ne[1] - n_kv_raw) + 31) / 32);
-        if (need_words > max_words) {
-            goto union_unavailable;   // fall through to the per-token block form
+    if (union_env && union_env[0] == '1' && q->ne[3] == 1 && n_batch > 1 && bitmap_fits &&
+        ctx->device->pipeline_flash_attn_union_f16 && ctx->device->pipeline_flash_attn_gather_union_f16 &&
+        ggml_vk_fa_union_stat_init(ctx)) {
+        const uint32_t max_union = n_cand;
+        const uint32_t kv_c_est  = ggml_vk_fa_union_estimate(ctx, (uint32_t) n_kv_raw, n_batch, n_cand);
+        // Two separate questions. Does the compact set fit under the gate at all, and does
+        // deduplicating actually shrink it: with no overlap to exploit the union is the same
+        // size as the per-token blocks and the scan is pure cost, measured at 1.2% of the op
+        // at 512k depth. The worst-case bound on the source keeps a collapse in overlap to
+        // roughly dense cost for the one step it takes the estimate to catch up.
+        const bool worth_it = kv_c_est != 0 && kv_c_est < kv_c &&
+                              (uint64_t) k->ne[1] >= 2ull * kv_c_est &&
+                              (uint64_t) k->ne[1] >= (uint64_t) kv_c;
+
+        // GGML_VK_FA_UNION_STATS=1: what the gate actually decided and on what measurement.
+        // The alternative is inferring engagement from a timing, which is how a sparse path
+        // gets credited for a run it never took.
+        static const char * stats_env = getenv("GGML_VK_FA_UNION_STATS");
+        if (stats_env && stats_env[0] == '1') {
+            static uint64_t calls = 0;
+            if ((calls++ % 256) == 0) {
+                fprintf(stderr, "[fa-union] n_kv=%lld n_kv_raw=%d n_batch=%u cand=%u  "
+                                "union/cand=%.3f  kv_c %u -> est %u  %s\n",
+                        (long long) k->ne[1], n_kv_raw, n_batch, n_cand, (double) ctx->fa_union_est_ratio[n_batch],
+                        kv_c, kv_c_est, worth_it ? "UNION" : "declined");
+            }
         }
+
+        if (!worth_it) {
+            // Nothing is known about this batch shape, or the last count says compaction does
+            // not pay. Either way the count is what settles it, so produce one: the scan is a
+            // single workgroup and depth-independent, and count_only needs no index list. Dense
+            // runs this step; the next one decides on a measurement instead of a bound.
+            //
+            // Every declined step, not a sample: a decline is exactly the state in which the
+            // estimate stops being refreshed by the compact path, so sampling it leaves a stale
+            // estimate latched for as many steps as the sampling period. The dispatch is one
+            // workgroup against the ~2.2 ms dense op it is riding along with.
+            ctx->fa_union_declines++;
+            {
+                const vk_op_flash_attn_union_push_constants ppc = {
+                    (uint32_t) k->ne[1], (uint32_t) n_kv_raw, n_batch, (uint32_t) top_k->ne[0], max_union,
+                    (uint32_t) (top_k->nb[1] / sizeof(int32_t)), max_words, 256u, 1u,
+                };
+                const vk_subbuffer stat_buf = ggml_vk_subbuffer(ctx, ctx->fa_union_stat);
+                ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_union_f16, 1);
+                // The probe writes the same slot a taken union path reads back as its row
+                // count, and a graph can contain both: the estimate is refreshed from the
+                // device as the graph is recorded, so an op late in the graph can be admitted
+                // after an earlier one was declined. Order it explicitly rather than rely on
+                // the compact path's own sync, which this path does not go through.
+                ggml_vk_sync_buffers(ctx, subctx);
+                ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_union_f16,
+                    { ggml_vk_tensor_subbuffer(ctx, top_k), stat_buf, stat_buf }, ppc, { 1, 1, 1 });
+                ggml_vk_fa_union_stat_host_barrier(subctx);
+            }
+            goto union_unavailable;
+        }
+
         const size_t   ukc_sz = (size_t) kv_c * 512 * sizeof(ggml_fp16_t);
         const size_t   umc_sz = (size_t) n_batch * kv_c * sizeof(ggml_fp16_t);
         const size_t   ul_sz  = (size_t) max_union * sizeof(uint32_t);
-        const size_t   uc_sz  = 2 * sizeof(uint32_t);
-        const size_t   need   = ukc_sz + umc_sz + ul_sz + uc_sz;
+        const size_t   need   = ukc_sz + umc_sz + ul_sz;
         if (ctx->prealloc_size_y < need) {
             ctx->prealloc_size_y = need;
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
-        if (ctx->prealloc_y_need_sync) {
-            ggml_vk_sync_buffers(ctx, subctx);
-        }
+        // Unconditional, not gated on prealloc_y_need_sync: this also orders the count slot
+        // against a probe dispatched earlier in the same graph, which leaves that flag clear.
+        ggml_vk_sync_buffers(ctx, subctx);
         const vk_subbuffer kc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
         const vk_subbuffer mc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, ukc_sz);
         const vk_subbuffer ul_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, ukc_sz + umc_sz);
-        const vk_subbuffer uc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, ukc_sz + umc_sz + ul_sz);
+        // The count lives in the stat buffer rather than in prealloc_y so that the same write
+        // that the gather and the FA consume is also the one the host prices the next step from.
+        // Both are single-slot and rewritten by every layer, so the WAR hazard is unchanged: the
+        // prealloc_y sync above is a global barrier and orders the previous layer's read.
+        const vk_subbuffer uc_buf = ggml_vk_subbuffer(ctx, ctx->fa_union_stat);
 
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_union_f16, 1);
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_gather_union_f16, 1);
 
         const vk_op_flash_attn_union_push_constants upc = {
             (uint32_t) k->ne[1], (uint32_t) n_kv_raw, n_batch, (uint32_t) top_k->ne[0], max_union,
-            (uint32_t) (top_k->nb[1] / sizeof(int32_t)), max_words, 256u,
+            (uint32_t) (top_k->nb[1] / sizeof(int32_t)), max_words, 256u, 0u,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_union_f16,
             { ggml_vk_tensor_subbuffer(ctx, top_k), ul_buf, uc_buf }, upc, { 1, 1, 1 });
@@ -11574,6 +11717,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
             { ggml_vk_tensor_subbuffer(ctx, k), ul_buf, ggml_vk_tensor_subbuffer(ctx, mask),
               kc_buf, mc_buf, uc_buf }, gpc, { kv_c, 1, 1 });
         ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_fa_union_stat_host_barrier(subctx);
         ctx->prealloc_y_need_sync = true;
 
         st.active     = true;
@@ -11586,6 +11730,13 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         return true;
     }
 union_unavailable:;
+
+    // Per-token blocks have no dedup, so this form really does cost kv_c: the gather writes
+    // then re-reads ~the active bytes while dense reads the source KV once, so compaction only
+    // pays when the source is comfortably larger than the active set.
+    if ((uint64_t) k->ne[1] < 2ull * kv_c) {
+        return false;
+    }
 
     const uint32_t ns    = (uint32_t) q->ne[3];
     const size_t   kc_sz = (size_t) ns * kv_c * 512 * sizeof(ggml_fp16_t);
@@ -17243,7 +17394,10 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_y);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
+    ggml_vk_destroy_buffer(ctx->fa_union_stat);
     ggml_vk_destroy_buffer(ctx->sync_staging);
+
+    memset(ctx->fa_union_est_ratio, 0, sizeof(ctx->fa_union_est_ratio));
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
