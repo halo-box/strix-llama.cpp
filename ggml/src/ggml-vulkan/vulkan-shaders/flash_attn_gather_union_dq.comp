@@ -1,0 +1,99 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "types.glsl"
+
+// Gather + DEQUANTISE in one pass, for the DeepSeek V4 small-batch decode path with a
+// quantised KV cache.
+//
+// The sibling flash_attn_gather_union.comp relocates rows verbatim, which leaves flash
+// attention to dequantise them in its inner loop. That costs a MEASURED 0.15 us per KV row
+// attended - constant across batch 2/4/8 and across the dense and gathered regimes alike, and
+// large enough to make q8_0 attention 1.78x slower than f16 despite reading half the bytes.
+// It is redundant work: the FA re-decodes the same row for every query block that reads it,
+// whereas the gather already touches each selected row exactly once.
+//
+// So dequantise here instead. The compact scratch becomes f16, flash attention takes its f16
+// path, and the decode is paid once per row rather than once per use. The extra cost is
+// writing f16 instead of q8_0 into the scratch; the pass itself already existed.
+//
+// q8_0 only. Other quantised types keep the verbatim path, which is correct for them and was
+// validated; generalising means one variant per type through dequant_funcs.glsl, which is only
+// worth doing if this shape of win holds up.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer KBuf  { block_q8_0_packed16 data_k[]; };
+layout(binding = 1) readonly  buffer UBuf  { uint      data_u[];  };
+layout(binding = 2) readonly  buffer MBuf  { float16_t data_m[];  };
+layout(binding = 3) writeonly buffer KcBuf { float16_t data_kc[]; };
+layout(binding = 4) writeonly buffer McBuf { float16_t data_mc[]; };
+layout(binding = 5) readonly  buffer CBuf  { uint      data_c[];  };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_kv_raw;
+    uint kv_c_max;
+    uint nbk1;       // K source row stride, BLOCKS
+    uint nbm1;
+    uint n_batch;
+    uint row_elems;  // elements per K row (== head size)
+} p;
+
+const uint LANES = 64;
+const uint QK8_0 = 32;
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+
+    const uint kv_c  = data_c[0];   // padded compact rows, the FA's runtime KV
+    const uint n_uni = data_c[1];   // unpadded union size
+
+    if (row >= kv_c) {
+        return;
+    }
+
+    uint src = p.n_kv;              // sentinel: invalid
+    if (row < p.n_kv_raw) {
+        src = row;
+    } else if (row - p.n_kv_raw < n_uni) {
+        src = p.n_kv_raw + data_u[row - p.n_kv_raw];
+    }
+
+    // 64 lanes x 8 elements covers a 512-element row exactly; a q8_0 block is 32 elements, so
+    // each lane stays inside one block and reads four int16 pairs from it.
+    const uint dst_base = row * p.row_elems;
+    const uint e0 = tid * 8;
+    if (src < p.n_kv) {
+        const uint ib  = src * p.nbk1 + e0 / QK8_0;
+        const uint iqs = e0 % QK8_0;
+        const float d  = float(data_k[ib].d);
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            const i8vec2 v = unpack8(int32_t(data_k[ib].qs[iqs / 2 + j])).xy;
+            data_kc[dst_base + e0 + 2 * j]     = float16_t(d * float(v.x));
+            data_kc[dst_base + e0 + 2 * j + 1] = float16_t(d * float(v.y));
+        }
+    } else {
+        [[unroll]] for (uint j = 0; j < 8; ++j) {
+            data_kc[dst_base + e0 + j] = float16_t(0.0);
+        }
+    }
+
+    // Compact mask is token-major [n_batch][kv_c], stride the RUNTIME kv_c: the FA derives
+    // m_row_len from KV, which is that same runtime value.
+    const float NEG_INF = uintBitsToFloat(0xff800000);
+    if (tid < p.n_batch) {
+        float mv = NEG_INF;
+        if (src < p.n_kv) {
+            mv = float(data_m[tid * p.nbm1 + src]);
+        }
+        data_mc[tid * kv_c + row] = float16_t(mv);
+    }
+}

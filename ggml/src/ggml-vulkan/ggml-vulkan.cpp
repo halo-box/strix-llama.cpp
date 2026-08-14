@@ -1096,6 +1096,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_union_f16;
     vk_pipeline pipeline_flash_attn_gather_union_f16;
+    vk_pipeline pipeline_flash_attn_gather_union_dq_q8_0;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -6135,6 +6136,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_union_f16,
                 "flash_attn_gather_union_f16", flash_attn_gather_union_f16_len, flash_attn_gather_union_f16_data, "main", 6,
+                sizeof(vk_op_flash_attn_gather_union_push_constants), {1, 1, 1}, {}, 1, true, true,
+                device->subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_union_dq_q8_0,
+                "flash_attn_gather_union_dq_q8_0", flash_attn_gather_union_dq_q8_0_len, flash_attn_gather_union_dq_q8_0_data, "main", 6,
                 sizeof(vk_op_flash_attn_gather_union_push_constants), {1, 1, 1}, {}, 1, true, true,
                 device->subgroup_size);
         }
@@ -11393,6 +11398,7 @@ struct vk_fa_compact_state {
     uint32_t n_batch = 1;
     uint32_t row_bytes = 0;       // bytes per compact K row; K may be quantised
     uint32_t row_elems = 0;       // K row stride in ELEMENTS/blocks, for the FA push constant
+    bool dequantized = false;     // scratch holds f16 because the gather decoded on the way in
     vk_subbuffer kv_buf;
     vk_subbuffer kc_buf, mc_buf;
 };
@@ -11621,7 +11627,12 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
             goto union_unavailable;
         }
 
-        const size_t   ukc_sz = (size_t) kv_c * k_row_bytes;
+        // Decoding on the way in makes the scratch f16 and hands flash attention its f16 path,
+        // which is worth far more than the extra scratch bytes: the inline decode it replaces
+        // costs a measured 0.15 us per KV row attended, every step.
+        const bool     dq       = k->type == GGML_TYPE_Q8_0 && ctx->device->pipeline_flash_attn_gather_union_dq_q8_0;
+        const uint32_t u_row_by = dq ? (uint32_t) (k->ne[0] * sizeof(ggml_fp16_t)) : k_row_bytes;
+        const size_t   ukc_sz = (size_t) kv_c * u_row_by;
         const size_t   umc_sz = (size_t) n_batch * kv_c * sizeof(ggml_fp16_t);
         const size_t   ul_sz  = (size_t) max_union * sizeof(uint32_t);
         const size_t   need   = ukc_sz + umc_sz + ul_sz;
@@ -11641,8 +11652,10 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         // prealloc_y sync above is a global barrier and orders the previous layer's read.
         const vk_subbuffer uc_buf = ggml_vk_subbuffer(ctx, ctx->fa_union_stat);
 
+        vk_pipeline gather_pipe = dq ? ctx->device->pipeline_flash_attn_gather_union_dq_q8_0
+                                     : ctx->device->pipeline_flash_attn_gather_union_f16;
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_union_f16, 1);
-        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_gather_union_f16, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, gather_pipe, 1);
 
         const vk_op_flash_attn_union_push_constants upc = {
             (uint32_t) k->ne[1], (uint32_t) n_kv_raw, n_batch, (uint32_t) top_k->ne[0], max_union,
@@ -11652,13 +11665,14 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
             { ggml_vk_tensor_subbuffer(ctx, top_k), ul_buf, uc_buf }, upc, { 1, 1, 1 });
         ggml_vk_sync_buffers(ctx, subctx);
 
+        // the fused decoder steps K in BLOCKS and writes elements; the verbatim one does words
         const vk_op_flash_attn_gather_union_push_constants gpc = {
             (uint32_t) k->ne[1], (uint32_t) n_kv_raw, kv_c,
-            (uint32_t) (k->nb[1] / 4),
+            dq ? (uint32_t) (k->nb[1] / ggml_type_size(k->type)) : (uint32_t) (k->nb[1] / 4),
             (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
-            n_batch, k_row_words,
+            n_batch, dq ? (uint32_t) k->ne[0] : k_row_words,
         };
-        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_gather_union_f16,
+        ggml_vk_dispatch_pipeline(ctx, subctx, gather_pipe,
             { ggml_vk_tensor_subbuffer(ctx, k), ul_buf, ggml_vk_tensor_subbuffer(ctx, mask),
               kc_buf, mc_buf, uc_buf }, gpc, { kv_c, 1, 1 });
         ggml_vk_sync_buffers(ctx, subctx);
@@ -11669,8 +11683,9 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         st.dynamic_kv = true;
         st.kv_c       = kv_c;
         st.n_batch    = n_batch;
-        st.row_bytes  = k_row_bytes;
-        st.row_elems  = (uint32_t) (k->ne[0] / ggml_blck_size(k->type));
+        st.row_bytes   = u_row_by;
+        st.row_elems   = dq ? (uint32_t) k->ne[0] : (uint32_t) (k->ne[0] / ggml_blck_size(k->type));
+        st.dequantized = dq;
         st.kc_buf     = kc_buf;
         st.mc_buf     = mc_buf;
         st.kv_buf     = uc_buf;
@@ -11908,8 +11923,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // If this fires, supports_op admitted a non-native K/V type the gate then rejected; the
     // native shader would return garbage rather than fail, so abort instead.
     GGML_ASSERT(use_dequant_kv || !kv_needs_dequant);
-    const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
-    const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
+    const ggml_type k_type_eff = (use_dequant_kv || fa_compact.dequantized) ? GGML_TYPE_F16 : k->type;
+    const ggml_type v_type_eff = (use_dequant_kv || fa_compact.dequantized) ? GGML_TYPE_F16 : v->type;
 
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
