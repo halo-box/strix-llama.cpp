@@ -10313,6 +10313,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   8, 1024, 512, true));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 16, 2304, 512, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(65536, 63, 2304, 512, false));
+    // overlapping selections at the shapes where the compaction gate is tightest: with a
+    // deduplicated union these are admitted on the estimated union size rather than the
+    // worst case, so they cover the estimator's gate as well as the union itself.
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  8, 2304, 512, false, 1, 60));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 60));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true,  2));
@@ -10766,10 +10772,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Same shapes with realistic adjacent-token overlap. Measured on DeepSeek-V4-Flash the
     // real overlap is 60% over 4 adjacent tokens and 76% over 8; the default generator is
     // near 0%, which would make a deduplicated union look worthless by construction.
-    for (int kv : { 35584, 133888 }) {
-        for (int nb : { 2, 4, 8 }) {
+    // kv=11008 (~32k source) and nb=16 are where the compaction gate is tightest: the
+    // worst-case compact set 2304 + nb*512 crosses kv/2 at nb=6, so those cells measure
+    // whether the gate can be opened by the union rather than by the worst case.
+    for (int kv : { 11008, 35584, 133888 }) {
+        for (int nb : { 2, 4, 8, 16 }) {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, nb, 2304, 512, false, 1, 60));
         }
+    }
+    // ov is a per-token share, not the union/selected ratio the model was measured by: at nb
+    // tokens it gives a union of (ov + (1-ov)*nb)/nb of the selections, so ov=60 is 0.475 at
+    // nb=8 where the model measured 0.243. ov=86 is the setting that reproduces the model, and
+    // at kv=11008 it is the difference between a union that fits under the gate and one that
+    // does not.
+    for (int nb : { 8, 16 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, 1, 86));
     }
 
     return test_cases;
