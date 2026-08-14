@@ -10801,8 +10801,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // q8_0 K/V at the same shapes: DSv4 with -ctk q8_0 took the dense fallback before the
     // gather became type-agnostic, so this is the cell that says whether it now pays there.
-    for (int nb : { 2, 4, 8, 16 }) {
-        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, 1, 60, GGML_TYPE_Q8_0));
+    for (ggml_type tk : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int nb : { 2, 4, 8, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, 1, 60, tk));
+        }
     }
 
     return test_cases;
