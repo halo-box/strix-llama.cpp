@@ -18,10 +18,14 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(binding = 0) readonly  buffer KBuf  { float16_t data_k[];  };
+// K is addressed as raw 4-byte WORDS, never as values. A gather relocates rows; it does not
+// need to know whether they hold f16 elements or quantised blocks, so the same shader serves
+// every K type whose row is a whole number of words. Only the MASK is typed, and a mask is
+// always f16.
+layout(binding = 0) readonly  buffer KBuf  { uint      data_k[];  };
 layout(binding = 1) readonly  buffer UBuf  { uint      data_u[];  };
 layout(binding = 2) readonly  buffer MBuf  { float16_t data_m[];  };
-layout(binding = 3) writeonly buffer KcBuf { float16_t data_kc[]; };
+layout(binding = 3) writeonly buffer KcBuf { uint      data_kc[]; };
 layout(binding = 4) writeonly buffer McBuf { float16_t data_mc[]; };
 layout(binding = 5) readonly  buffer CBuf  { uint      data_c[];  };
 
@@ -29,12 +33,12 @@ layout(push_constant) uniform Parameters {
     uint n_kv;
     uint n_kv_raw;
     uint kv_c_max;
-    uint nbk1;
+    uint nbk1;       // K source row stride, WORDS
     uint nbm1;
     uint n_batch;
+    uint row_words;  // bytes per K row / 4
 } p;
 
-const uint HEAD_SIZE = 512;
 const uint LANES = 64;
 
 void main() {
@@ -55,15 +59,18 @@ void main() {
         src = p.n_kv_raw + data_u[row - p.n_kv_raw];
     }
 
-    const uint dst_base = row * HEAD_SIZE;
+    // Zeroing an unused row writes zero BYTES, which decode to zero for every block-quantised
+    // type here (a zero scale zeroes the block) as well as for f16. The row is -inf in the mask
+    // either way; zeroing only keeps a garbage dot product from reaching the softmax as a NaN.
+    const uint dst_base = row * p.row_words;
     if (src < p.n_kv) {
         const uint src_base = src * p.nbk1;
-        [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
-            data_kc[dst_base + tid + i * LANES] = data_k[src_base + tid + i * LANES];
+        for (uint i = tid; i < p.row_words; i += LANES) {
+            data_kc[dst_base + i] = data_k[src_base + i];
         }
     } else {
-        [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
-            data_kc[dst_base + tid + i * LANES] = float16_t(0.0);
+        for (uint i = tid; i < p.row_words; i += LANES) {
+            data_kc[dst_base + i] = 0u;
         }
     }
 
