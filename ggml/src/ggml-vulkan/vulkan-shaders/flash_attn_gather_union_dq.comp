@@ -7,29 +7,32 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 
+// iq4_nl's value table lives in shared memory and is typed FLOAT_TYPE
+#define FLOAT_TYPE float
 #include "types.glsl"
 
 // Gather + DEQUANTISE in one pass, for the DeepSeek V4 small-batch decode path with a
-// quantised KV cache.
+// quantised KV cache. One variant per K type, via DATA_A_*.
 //
 // The sibling flash_attn_gather_union.comp relocates rows verbatim, which leaves flash
-// attention to dequantise them in its inner loop. That costs a MEASURED 0.15 us per KV row
-// attended - constant across batch 2/4/8 and across the dense and gathered regimes alike, and
-// large enough to make q8_0 attention 1.78x slower than f16 despite reading half the bytes.
-// It is redundant work: the FA re-decodes the same row for every query block that reads it,
-// whereas the gather already touches each selected row exactly once.
+// attention to decode them in its inner loop - once per query block that reads a row, rather
+// than once per row. Measured, that is a constant per KV row attended:
 //
-// So dequantise here instead. The compact scratch becomes f16, flash attention takes its f16
-// path, and the decode is paid once per row rather than once per use. The extra cost is
-// writing f16 instead of q8_0 into the scratch; the pass itself already existed.
+//   q8_0  0.148 - 0.153 us/row      q4_0  0.172 - 0.179 us/row
 //
-// q8_0 only. Other quantised types keep the verbatim path, which is correct for them and was
-// validated; generalising means one variant per type through dequant_funcs.glsl, which is only
-// worth doing if this shape of win holds up.
+// flat across batch 2/4/8 and across the dense and gathered regimes alike. It is what made
+// quantised attention slower than f16 despite reading fewer bytes, and q4_0 worse than q8_0
+// despite reading fewer bytes still: unpacking nibbles costs more ALU than the bytes save.
+//
+// The gather already touches each selected row exactly once, so decoding here converts per-use
+// work into per-row work. The compact scratch becomes f16 and flash attention takes its f16
+// path. The pass itself already existed, so the only added cost is writing f16 rather than
+// blocks into the scratch.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(binding = 0) readonly  buffer KBuf  { block_q8_0_packed16 data_k[]; };
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+
 layout(binding = 1) readonly  buffer UBuf  { uint      data_u[];  };
 layout(binding = 2) readonly  buffer MBuf  { float16_t data_m[];  };
 layout(binding = 3) writeonly buffer KcBuf { float16_t data_kc[]; };
@@ -47,9 +50,12 @@ layout(push_constant) uniform Parameters {
 } p;
 
 const uint LANES = 64;
-const uint QK8_0 = 32;
 
 void main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    // barrier inside; must run before any divergent return below
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
     const uint row = gl_WorkGroupID.x;
     const uint tid = gl_LocalInvocationIndex;
 
@@ -67,19 +73,37 @@ void main() {
         src = p.n_kv_raw + data_u[row - p.n_kv_raw];
     }
 
-    // 64 lanes x 8 elements covers a 512-element row exactly; a q8_0 block is 32 elements, so
-    // each lane stays inside one block and reads four int16 pairs from it.
+    // 64 lanes x 8 elements covers a 512-element row exactly, and QUANT_K is 32, so a lane's 8
+    // elements sit wholly inside one block AND wholly inside one nibble half.
+    //
+    // Deliberately NOT dequantize4() from dequant_funcs.glsl. That helper is permutation
+    // AGNOSTIC: mul_mat_vec only ever feeds it into a dot product, where any consistent element
+    // order gives the same answer, so for q4_0 it returns nibbles in packed order rather than
+    // element order. Materialising a row to memory is the one use where the order matters, and
+    // using it here produced NMSE 1.17 on q4_0 while q8_0 passed - q8_0's layout just happens to
+    // be contiguous. Each type's true element mapping is written out below instead.
     const uint dst_base = row * p.row_elems;
     const uint e0 = tid * 8;
     if (src < p.n_kv) {
-        const uint ib  = src * p.nbk1 + e0 / QK8_0;
-        const uint iqs = e0 % QK8_0;
-        const float d  = float(data_k[ib].d);
-        [[unroll]] for (uint j = 0; j < 4; ++j) {
-            const i8vec2 v = unpack8(int32_t(data_k[ib].qs[iqs / 2 + j])).xy;
-            data_kc[dst_base + e0 + 2 * j]     = float16_t(d * float(v.x));
-            data_kc[dst_base + e0 + 2 * j + 1] = float16_t(d * float(v.y));
+        const uint ib  = src * p.nbk1 + e0 / QUANT_K;
+        const uint iqs = e0 % QUANT_K;
+        const float d  = float(data_a[ib].d);
+#if defined(DATA_A_Q8_0)
+        // element e is qs[e]
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            data_kc[dst_base + e0 + l] = float16_t(d * float(data_a[ib].qs[iqs + l]));
         }
+#elif defined(DATA_A_Q4_0)
+        // byte j carries element j in its low nibble and element j+16 in its high one
+        const uint shift = (iqs >> 4) * 4;   // 0 for elements 0..15, 4 for 16..31
+        const uint byte0 = iqs & 0xF;
+        [[unroll]] for (uint l = 0; l < 8; ++l) {
+            const float q = float((data_a[ib].qs[byte0 + l] >> shift) & 0xF) - 8.0f;
+            data_kc[dst_base + e0 + l] = float16_t(d * q);
+        }
+#else
+#error "no element mapping written for this K type"
+#endif
     } else {
         [[unroll]] for (uint j = 0; j < 8; ++j) {
             data_kc[dst_base + e0 + j] = float16_t(0.0);
