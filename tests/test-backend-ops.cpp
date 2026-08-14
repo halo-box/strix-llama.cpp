@@ -7270,12 +7270,13 @@ struct test_flash_attn_ext_top_k : public test_case {
     const bool    sinks;
     const int64_t ns;       // sequences (ne3); >1 exercises the split-K stream stride
     const int64_t ov;       // % of each token's picks shared with its neighbours (dedup-union realism)
+    const ggml_type type_K; // K/V cache type; V is the same tensor, so one type covers both
 
     static constexpr int64_t hs = 512; // V4 CSA head size, K == V latent
     static constexpr int64_t nh = 64;  // V4 CSA query heads (MQA)
 
     std::string vars() override {
-        return VARS_TO_STR7(kv, nb, n_kv_raw, n_top_k, sinks, ns, ov);
+        return VARS_TO_STR8(kv, nb, n_kv_raw, n_top_k, sinks, ns, ov, type_K);
     }
 
     double max_nmse_err() override {
@@ -7289,14 +7290,15 @@ struct test_flash_attn_ext_top_k : public test_case {
         return 2 * nh * nb * ns * (hs + hs) * (n_kv_raw + n_top_k);
     }
 
-    test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128, bool sinks = false, int64_t ns = 1, int64_t ov = 0)
-        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), ns(ns), ov(ov) {}
+    test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128, bool sinks = false, int64_t ns = 1, int64_t ov = 0,
+                              ggml_type type_K = GGML_TYPE_F16)
+        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), ns(ns), ov(ov), type_K(type_K) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, ns);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, kv, 1, ns);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hs, kv, 1, ns);
         ggml_set_name(k, "k");
 
         // V4 CSA attends over the K latent itself: V is the same cache tensor
@@ -10391,6 +10393,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  8, 2304, 512, false, 1, 60));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 60));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86));
+    // quantised K/V: the gather relocates rows verbatim, so it should serve any type whose row
+    // is a whole number of 4-byte words. These are the shapes a DSv4 decode with -ctk q8_0 hits,
+    // which took the dense fallback entirely before the gather learned to address rows as bytes.
+    for (ggml_type tk : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false, 1,  0, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  8, 2304, 512, false, 1, 60, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   1, 1024, 512, false, 1,  0, tk));
+    }
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, true,  2));
@@ -10859,6 +10870,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // does not.
     for (int nb : { 8, 16 }) {
         test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, 1, 86));
+    }
+    // q8_0 K/V at the same shapes: DSv4 with -ctk q8_0 took the dense fallback before the
+    // gather became type-agnostic, so this is the cell that says whether it now pays there.
+    for (int nb : { 2, 4, 8, 16 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, 1, 60, GGML_TYPE_Q8_0));
     }
 
     return test_cases;
