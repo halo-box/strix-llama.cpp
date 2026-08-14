@@ -11600,10 +11600,10 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     // deduplicate to; kv_c remains the bound for every allocation and dispatch count.
     const uint32_t kv_c = GGML_PAD((uint32_t) (n_kv_raw + (int64_t) n_cand), 256u);
 
-    // ---- deduplicated union (GGML_VK_FA_TOPK_UNION=1) ----------------------------------
+    // ---- deduplicated union (default on, GGML_VK_FA_TOPK_UNION=0 disables) --------------
     // Same compact layout, but one row per DISTINCT selected key instead of one block per
-    // token. Measured adjacent-token overlap on the real model is 60% at 4 tokens and 76% at
-    // 8, so the union is materially smaller. Its size is only known on the GPU, so the FA
+    // token. Measured on real draft tokens the union is 0.56 of the selections at batch 4,
+    // so it is materially smaller. Its size is only known on the GPU, so the FA
     // reads its KV bound from a buffer (the DYNAMIC_KV pipeline flag) rather than a push
     // constant; padding the count to 256 keeps KV % Bc == 0 so the aligned variant still
     // applies. Single stream only: the FA takes one KV for all streams.
@@ -11617,7 +11617,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     const bool     bitmap_fits = (uint64_t) ((k->ne[1] - n_kv_raw) + 31) / 32 <= max_words;
 
     static const char * union_env = getenv("GGML_VK_FA_TOPK_UNION");
-    if (union_env && union_env[0] == '1' && q->ne[3] == 1 && n_batch > 1 && bitmap_fits &&
+    if ((!union_env || union_env[0] != '0') && q->ne[3] == 1 && n_batch > 1 && bitmap_fits &&
         ctx->device->pipeline_flash_attn_union_f16 && ctx->device->pipeline_flash_attn_gather_union_f16 &&
         ggml_vk_fa_union_stat_init(ctx)) {
         const uint32_t max_union = n_cand;
