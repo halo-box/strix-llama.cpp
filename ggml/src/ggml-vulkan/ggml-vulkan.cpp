@@ -11549,17 +11549,25 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
                               (uint64_t) k->ne[1] >= 2ull * kv_c_est &&
                               (uint64_t) k->ne[1] >= (uint64_t) kv_c;
 
-        // GGML_VK_FA_UNION_STATS=1: what the gate actually decided and on what measurement.
-        // The alternative is inferring engagement from a timing, which is how a sparse path
-        // gets credited for a run it never took.
+        // GGML_VK_FA_UNION_STATS=N: report every Nth call (N=1 means every call) what the gate
+        // decided and on what measurement. The alternative is inferring engagement from a
+        // timing, which is how a sparse path gets credited for a run it never took.
+        //
+        // The period is a parameter because a fixed one is a way to miss the answer: a 64-token
+        // speculative decode over 25k of context produced ONE line at a period of 256, which
+        // said only that the first call was unseeded. Running totals rather than instants, so a
+        // single late line still reports whether the path engaged.
         static const char * stats_env = getenv("GGML_VK_FA_UNION_STATS");
-        if (stats_env && stats_env[0] == '1') {
-            static uint64_t calls = 0;
-            if ((calls++ % 256) == 0) {
+        if (stats_env && stats_env[0] != '\0' && stats_env[0] != '0') {
+            static uint64_t calls = 0, taken = 0;
+            const uint64_t  period = std::max(1ull, (unsigned long long) atoll(stats_env));
+            taken += worth_it ? 1 : 0;
+            if ((calls++ % period) == 0) {
                 fprintf(stderr, "[fa-union] n_kv=%lld n_kv_raw=%d n_batch=%u cand=%u  "
-                                "union/cand=%.3f  kv_c %u -> est %u  %s\n",
+                                "union/cand=%.3f  kv_c %u -> est %u  %s   (%llu/%llu taken)\n",
                         (long long) k->ne[1], n_kv_raw, n_batch, n_cand, (double) ctx->fa_union_est_ratio[n_batch],
-                        kv_c, kv_c_est, worth_it ? "UNION" : "declined");
+                        kv_c, kv_c_est, worth_it ? "UNION" : "declined",
+                        (unsigned long long) taken, (unsigned long long) calls);
             }
         }
 
