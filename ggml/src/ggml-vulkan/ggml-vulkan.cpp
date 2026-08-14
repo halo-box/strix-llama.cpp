@@ -1097,7 +1097,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_union_f16;
     vk_pipeline pipeline_flash_attn_gather_union_f16;
-    vk_pipeline pipeline_flash_attn_gather_union_dq_q8_0;
+    vk_pipeline pipeline_flash_attn_gather_union_dq[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -6140,10 +6140,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 "flash_attn_gather_union_f16", flash_attn_gather_union_f16_len, flash_attn_gather_union_f16_data, "main", 6,
                 sizeof(vk_op_flash_attn_gather_union_push_constants), {1, 1, 1}, {}, 1, true, true,
                 device->subgroup_size);
-            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_union_dq_q8_0,
-                "flash_attn_gather_union_dq_q8_0", flash_attn_gather_union_dq_q8_0_len, flash_attn_gather_union_dq_q8_0_data, "main", 6,
-                sizeof(vk_op_flash_attn_gather_union_push_constants), {1, 1, 1}, {}, 1, true, true,
+#define CREATE_FA_GATHER_DQ(TYPE, NAMED) \
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_union_dq[TYPE], \
+                "flash_attn_gather_union_dq_" #NAMED, flash_attn_gather_union_dq_ ## NAMED ## _len, \
+                flash_attn_gather_union_dq_ ## NAMED ## _data, "main", 6, \
+                sizeof(vk_op_flash_attn_gather_union_push_constants), {1, 1, 1}, {}, 1, true, true, \
                 device->subgroup_size);
+            CREATE_FA_GATHER_DQ(GGML_TYPE_Q4_0, q4_0)
+            CREATE_FA_GATHER_DQ(GGML_TYPE_Q8_0, q8_0)
+#undef CREATE_FA_GATHER_DQ
         }
     }
 
@@ -11712,7 +11717,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         // Decoding on the way in makes the scratch f16 and hands flash attention its f16 path,
         // which is worth far more than the extra scratch bytes: the inline decode it replaces
         // costs a measured 0.15 us per KV row attended, every step.
-        const bool     dq       = k->type == GGML_TYPE_Q8_0 && ctx->device->pipeline_flash_attn_gather_union_dq_q8_0;
+        const bool     dq       = ggml_is_quantized(k->type) && ctx->device->pipeline_flash_attn_gather_union_dq[k->type];
         const uint32_t u_row_by = dq ? (uint32_t) (k->ne[0] * sizeof(ggml_fp16_t)) : k_row_bytes;
         const size_t   ukc_sz = (size_t) kv_c * u_row_by;
         const size_t   umc_sz = (size_t) n_batch * kv_c * sizeof(ggml_fp16_t);
@@ -11734,7 +11739,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         // prealloc_y sync above is a global barrier and orders the previous layer's read.
         const vk_subbuffer uc_buf = ggml_vk_subbuffer(ctx, ctx->fa_union_stat);
 
-        vk_pipeline gather_pipe = dq ? ctx->device->pipeline_flash_attn_gather_union_dq_q8_0
+        vk_pipeline gather_pipe = dq ? ctx->device->pipeline_flash_attn_gather_union_dq[k->type]
                                      : ctx->device->pipeline_flash_attn_gather_union_f16;
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_union_f16, 1);
         ggml_pipeline_request_descriptor_sets(ctx, gather_pipe, 1);
