@@ -24,6 +24,11 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
+// KV comes from a buffer instead of the push constant. Used by paths that compact K/V on the
+// GPU, where the row count is only known after a dedup pass and so cannot be pushed. The
+// workgroup counts derive from neq1/neq2/neq3 and never from KV, so no indirect dispatch is
+// needed: only this loop bound changes. Folds away for every other pipeline.
+const bool DYNAMIC_KV       = (Flags & 16) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -81,6 +86,7 @@ layout (binding = 5) writeonly buffer O {D_TYPE data_o[];};
 layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
+layout (binding = 7) readonly buffer KVB {uint32_t data_kv_dyn[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -150,7 +156,7 @@ bool partial_output;
 void init_indices()
 {
     N = p.N;
-    KV = p.KV;
+    KV = DYNAMIC_KV ? data_kv_dyn[0] : p.KV;
     gqa_ratio = p.gqa_ratio & 0xffff;
     split_k_num = p.k_num & 0xffff;
     output_k_num = p.k_num >> 16;

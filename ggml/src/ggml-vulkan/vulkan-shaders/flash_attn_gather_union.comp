@@ -1,0 +1,82 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Gathers K/V and the mask for the DeepSeek V4 small-batch decode path, using the deduplicated
+// union produced by flash_attn_union.comp: rows [0, n_kv_raw) of the source, then one row per
+// distinct selected compressed row, then padding.
+//
+// Simpler than the block-per-token form it replaces, because a union row appears exactly once:
+// there is no owner to track and no cross-token masking to apply. Each token just reads its own
+// mask value for the gathered source row, which is already -inf where that token did not select
+// it, so the softmax still cannot double count.
+//
+// Row count is a runtime value in data_c[0]; rows past the union are zeroed K and -inf mask,
+// which is softmax-neutral and keeps the padded tail harmless.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer KBuf  { float16_t data_k[];  };
+layout(binding = 1) readonly  buffer UBuf  { uint      data_u[];  };
+layout(binding = 2) readonly  buffer MBuf  { float16_t data_m[];  };
+layout(binding = 3) writeonly buffer KcBuf { float16_t data_kc[]; };
+layout(binding = 4) writeonly buffer McBuf { float16_t data_mc[]; };
+layout(binding = 5) readonly  buffer CBuf  { uint      data_c[];  };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_kv_raw;
+    uint kv_c_max;
+    uint nbk1;
+    uint nbm1;
+    uint n_batch;
+} p;
+
+const uint HEAD_SIZE = 512;
+const uint LANES = 64;
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+
+    const uint kv_c  = data_c[0];   // padded compact rows, the FA's runtime KV
+    const uint n_uni = data_c[1];   // unpadded union size
+
+    if (row >= kv_c) {
+        return;
+    }
+
+    uint src = p.n_kv;              // sentinel: invalid
+    if (row < p.n_kv_raw) {
+        src = row;
+    } else if (row - p.n_kv_raw < n_uni) {
+        src = p.n_kv_raw + data_u[row - p.n_kv_raw];
+    }
+
+    const uint dst_base = row * HEAD_SIZE;
+    if (src < p.n_kv) {
+        const uint src_base = src * p.nbk1;
+        [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+            data_kc[dst_base + tid + i * LANES] = data_k[src_base + tid + i * LANES];
+        }
+    } else {
+        [[unroll]] for (uint i = 0; i < HEAD_SIZE / LANES; ++i) {
+            data_kc[dst_base + tid + i * LANES] = float16_t(0.0);
+        }
+    }
+
+    // Compact mask is token-major [n_batch][kv_c]. The stride must be the RUNTIME kv_c, not
+    // kv_c_max: the FA derives m_row_len from KV, which is now that same runtime value, and a
+    // mismatch would step the mask by the wrong amount for every token past the first. The
+    // buffer is allocated for kv_c_max, so a smaller stride simply leaves a tail unused.
+    const float NEG_INF = uintBitsToFloat(0xff800000);
+    if (tid < p.n_batch) {
+        float mv = NEG_INF;
+        if (src < p.n_kv) {
+            mv = float(data_m[tid * p.nbm1 + src]);
+        }
+        data_mc[tid * kv_c + row] = float16_t(mv);
+    }
+}
