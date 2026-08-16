@@ -1471,6 +1471,11 @@ static bool ggml_vk_mmid_f16b_enabled() {
         const char * env = getenv("GGML_VK_MMID_F16B");
         return env == nullptr || atoi(env) != 0;   // on by default; =0 disables
     }();
+// GGML_VK_DENSE_F16B=1: same idea as GGML_VK_MMID_F16B but for plain MUL_MAT. Halves the B
+// bytes, which keeps the activations inside the LLC at large ubatch and moves their row stride
+// off the 1-of-16 channel pattern. Off by default, it is a loss when B already fits.
+static bool ggml_vk_dense_f16b_enabled() {
+    static const bool enabled = getenv("GGML_VK_DENSE_F16B") != nullptr;
     return enabled;
 }
 

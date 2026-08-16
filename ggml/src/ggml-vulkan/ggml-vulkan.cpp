@@ -7283,7 +7283,23 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         quantize_y = false;
     }
 
-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+    // Route quantized MUL_MAT through the f16-B kernels. Treating contiguous f32 B as
+    // y_non_contig reuses the convert-to-prealloc_y plumbing, like coopmat2 does.
+    const bool dense_f16b = ggml_vk_dense_f16b_enabled() &&
+                            ctx->device->coopmat_support && !ctx->device->coopmat2 &&
+                            ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
+                            !(ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type].f16acc->is_empty() &&
+                              ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type].f32acc->is_empty());
+    if (dense_f16b) {
+        static bool dense_f16b_logged = false;
+        if (!dense_f16b_logged) {
+            dense_f16b_logged = true;
+            fprintf(stderr, "ggml_vulkan: MUL_MAT f16-B path engaged (GGML_VK_DENSE_F16B)\n");
+        }
+    }
+
+    const bool y_non_contig = dense_f16b ||
+                              (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               // coopmat1: force f32->f16 conversion so the f16 B-type quant pipeline is
                               // used, but only when the int8 MMQ path above is not taken.
                               (ctx->device->coopmat_support && !ctx->device->coopmat2 && !quantize_y &&
