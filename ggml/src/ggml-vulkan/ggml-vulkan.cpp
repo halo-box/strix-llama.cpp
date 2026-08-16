@@ -4458,13 +4458,24 @@ static bool ggml_vk_mmid_f16b_enabled() {
         const char * env = getenv("GGML_VK_MMID_F16B");
         return env == nullptr || atoi(env) != 0;   // on by default; =0 disables
     }();
-// GGML_VK_DENSE_F16B=1: same idea as GGML_VK_MMID_F16B but for plain MUL_MAT. Halves the B
-// bytes, which keeps the activations inside the LLC at large ubatch and moves their row stride
-// off the 1-of-16 channel pattern. Off by default, it is a loss when B already fits.
-static bool ggml_vk_dense_f16b_enabled() {
-    static const bool enabled = getenv("GGML_VK_DENSE_F16B") != nullptr;
     return enabled;
 }
+
+// GGML_VK_DENSE_F16B: same idea as GGML_VK_MMID_F16B but for plain MUL_MAT. Halves the B bytes
+// moved. Numerically identical: mul_mm stages B into shared FLOAT_TYPE either way, so the f32-B
+// kernel already rounds B to f16. Helps wide dense models, costs ~1% on narrow ones.
+// 0 = off, 1 = all quantized dense matmuls, 2 = auto (only the K we have positive data for)
+static int ggml_vk_dense_f16b_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_VK_DENSE_F16B");
+        if (e == nullptr) return 0;
+        if (e[0] == 'a') return 2;
+        return atoi(e) != 0 ? 1 : 0;
+    }();
+    return mode;
+}
+
+static bool ggml_vk_dense_f16b_enabled() { return ggml_vk_dense_f16b_mode() != 0; }
 
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
@@ -9898,7 +9909,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                               !ggml_vk_dim01_contiguous(src0);
     // Route quantized MUL_MAT through the f16-B kernels. Treating contiguous f32 B as
     // y_non_contig reuses the convert-to-prealloc_y plumbing, like coopmat2 does.
+    // auto mode restricts to ne10 == 5120: the only width measured to gain. Narrow on purpose,
+    // so widths measured as losses (3584 dense, 2048 MoE) cannot trigger it.
     const bool dense_f16b = ggml_vk_dense_f16b_enabled() &&
+                            (ggml_vk_dense_f16b_mode() == 1 || ne10 == 5120) &&
                             ctx->device->coopmat_support && !ctx->device->coopmat2 &&
                             ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
                             !(ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type].f16acc->is_empty() &&
