@@ -3082,6 +3082,11 @@ static bool ggml_vk_mmid_f16b_enabled() {
         const char * env = getenv("GGML_VK_MMID_F16B");
         return env == nullptr || atoi(env) != 0;   // on by default; =0 disables
     }();
+// GGML_VK_DENSE_F16B=1: same idea as GGML_VK_MMID_F16B but for plain MUL_MAT. Halves the B
+// bytes, which keeps the activations inside the LLC at large ubatch and moves their row stride
+// off the 1-of-16 channel pattern. Off by default, it is a loss when B already fits.
+static bool ggml_vk_dense_f16b_enabled() {
+    static const bool enabled = getenv("GGML_VK_DENSE_F16B") != nullptr;
     return enabled;
 }
 
@@ -7277,7 +7282,8 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return pipelines;
     }
 
-    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2) {
+    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2 &&
+        !(src1_type == GGML_TYPE_F16 && ggml_vk_dense_f16b_enabled())) {
         return nullptr;
     }
 
@@ -7321,7 +7327,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
     }
     if (ctx->device->coopmat_support) {
-        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+        vk_matmul_pipeline2 & p = (src1_type == GGML_TYPE_F16) ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type]
+                                                              : ctx->device->pipeline_dequant_mul_mat_mat[src0_type];
+        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? p.f16acc : p.f32acc;
     }
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
 }
