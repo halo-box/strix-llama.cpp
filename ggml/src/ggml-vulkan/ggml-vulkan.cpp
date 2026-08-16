@@ -7285,7 +7285,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     // Route quantized MUL_MAT through the f16-B kernels. Treating contiguous f32 B as
     // y_non_contig reuses the convert-to-prealloc_y plumbing, like coopmat2 does.
+    // auto mode restricts to ne10 == 5120: the only width measured to gain. Narrow on purpose,
+    // so widths measured as losses (3584 dense, 2048 MoE) cannot trigger it.
     const bool dense_f16b = ggml_vk_dense_f16b_enabled() &&
+                            (ggml_vk_dense_f16b_mode() == 1 || ne10 == 5120) &&
                             ctx->device->coopmat_support && !ctx->device->coopmat2 &&
                             ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
                             !(ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type].f16acc->is_empty() &&
