@@ -12816,13 +12816,15 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
     }
 }
 
-// EXPERIMENT (GGML_VK_CONCAT_TRANSPOSE=1): the delta-net conv-state path does
-// ggml_transpose() straight into a dim-0 ggml_concat(), so the generic concat kernel reads
-// src1 fully de-coalesced. Measured on Qwen3.6-35B-A3B: CONCAT is ~22% of pp2048 at ub=2048
-// and grows 3.1x for a 2x ubatch. Route that exact shape to a tiled-transpose kernel.
+// The delta-net conv-state path does ggml_transpose() straight into a dim-0 ggml_concat(), so
+// the generic concat kernel walks src1 with a conv_channels * 4 byte stride. On qwen35 that is
+// 40960 B = 160 * 256 B and 160 % 16 == 0, so every read lands on one of the 16 memory channels:
+// 13.7 GB/s against 138.9 GB/s for the tiled path. Route that exact shape to a tiled-transpose
+// kernel. On by default; GGML_VK_CONCAT_TRANSPOSE=0 opts out.
+// Qwen3.8-27B pp2048: +0.4% at ub 256, +4.7% at ub 1024, +7.2% at ub 2048.
 static bool ggml_vk_concat_is_transposed(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     static const char * env = getenv("GGML_VK_CONCAT_TRANSPOSE");
-    if (!(env && atoi(env) != 0)) {
+    if (env && env[0] == '0') {
         return false;
     }
     if (ggml_get_op_params_i32(dst, 0) != 0) {           // dim 0 only
