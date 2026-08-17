@@ -63,13 +63,29 @@ void main() {
     // type here (a zero scale zeroes the block) as well as for f16. The row is -inf in the mask
     // either way; zeroing only keeps a garbage dot product from reaching the softmax as a NaN.
     const uint dst_base = row * p.row_words;
+    // Stepped 4*LANES for the same reason as flash_attn_gather.comp: row_words is a push
+    // constant, so the copy cannot be [[unroll]]ed, and an f16 row is one iteration this way.
     if (src < p.n_kv) {
         const uint src_base = src * p.nbk1;
-        for (uint i = tid; i < p.row_words; i += LANES) {
+        uint i = tid;
+        for (; i + 3 * LANES < p.row_words; i += 4 * LANES) {
+            data_kc[dst_base + i]             = data_k[src_base + i];
+            data_kc[dst_base + i + LANES]     = data_k[src_base + i + LANES];
+            data_kc[dst_base + i + 2 * LANES] = data_k[src_base + i + 2 * LANES];
+            data_kc[dst_base + i + 3 * LANES] = data_k[src_base + i + 3 * LANES];
+        }
+        for (; i < p.row_words; i += LANES) {
             data_kc[dst_base + i] = data_k[src_base + i];
         }
     } else {
-        for (uint i = tid; i < p.row_words; i += LANES) {
+        uint i = tid;
+        for (; i + 3 * LANES < p.row_words; i += 4 * LANES) {
+            data_kc[dst_base + i]             = 0u;
+            data_kc[dst_base + i + LANES]     = 0u;
+            data_kc[dst_base + i + 2 * LANES] = 0u;
+            data_kc[dst_base + i + 3 * LANES] = 0u;
+        }
+        for (; i < p.row_words; i += LANES) {
             data_kc[dst_base + i] = 0u;
         }
     }
