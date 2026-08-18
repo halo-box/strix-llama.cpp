@@ -4143,6 +4143,44 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
     };
 }
 
+// LDS bank spread for the coopmat matmul tiles. buf_a/buf_b are FLOAT_TYPEV2 (4 B), so the shared
+// stride in elements IS the stride in LDS banks, and RDNA has 32 of them:
+// SHMEM_STRIDE = BK/2 + pad reaches 32/gcd(BK/2+pad, 32) banks.
+//
+// The stride must stay EVEN or the 8/16-byte ds_read_b64/b128 loads lose alignment - every odd pad
+// measured -53% on gfx1151. Among even pads the quantised path (BK=32) tracks bank spread:
+// pad 2 (stride 18, 16 banks) is +13% mean over pad 4 (stride 20, 8 banks) in a standalone MUL_MAT
+// sweep, and pad 0 (stride 16, 2 banks) is -31%.
+//
+// The float path does NOT follow that rule and the bank model does NOT explain why. f32/f16
+// shaders `#define BK 32` regardless of the host spec constant, so they run the SAME stride as
+// the quantised ones - yet pad 2 measures -18% on f16 and -14% on f32. Same stride, same bank
+// pattern, opposite preference; the remaining difference is BK_STEP (4 on the float path, 2 on
+// the quant path), i.e. the access pattern inside the loop, which is not modelled here.
+// So this ships the MEASURED optimum per path, not the theory: pad 2 quantised, pad 4 float.
+// The discriminator is the host warptile's BK (16 float / 32 quant), which is a reliable label
+// for which pipeline is being built even though the shader overrides the value for f32/f16.
+// GGML_VK_SHMEM_PAD=N overrides both, for probing.
+static uint32_t ggml_vk_coopmat_shmem_pad(const vk_device& device, uint32_t bk) {
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+        device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+        return 0;
+    }
+    static const int env_pad = [] {
+        const char * e = getenv("GGML_VK_SHMEM_PAD");
+        return e ? atoi(e) : -1;
+    }();
+    if (env_pad >= 0) {
+        return (uint32_t) env_pad;
+    }
+    const bool amd_radv = device->vendor_id == VK_VENDOR_ID_AMD &&
+                          device->driver_id != vk::DriverId::eAmdProprietary;
+    if (device->coopmat_support && amd_radv && bk >= 32) {
+        return 2;
+    }
+    return 4;
+}
+
 static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
 
     uint32_t lut_size = 0;
@@ -4182,10 +4220,11 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     }
 
     // Needs to be kept up to date on shader changes
-    // Needs to stay aligned with ggml_vk_mul_mm_spec.
-    const bool intel_shmem_stride_pad_zero = device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
-                                              device->driver_id == vk::DriverId::eIntelProprietaryWindows;
-    const uint32_t bank_conflict_offset = intel_shmem_stride_pad_zero ? 0 : (device->coopmat_support ? 8 : 1);
+    // Shared-memory budget: BM*(BK + 2*pad)*type_size, so the offset is 2x the pad that
+    // ggml_vk_mul_mm_spec will actually push. Both call ggml_vk_coopmat_shmem_pad to stay aligned.
+    const uint32_t bank_conflict_offset = device->coopmat_support
+                                          ? 2 * ggml_vk_coopmat_shmem_pad(device, warptile[3])
+                                          : 1;
     const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
     const uint32_t warps = warptile[0] / warptile[10];
 
@@ -4822,10 +4861,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
-        if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
-            device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
-            spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
-            spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
+        const uint32_t bk  = spec[3];
+        const uint32_t pad = ggml_vk_coopmat_shmem_pad(device, bk);
+        const bool intel_slm = device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+                               device->driver_id == vk::DriverId::eIntelProprietaryWindows;
+        if (intel_slm || pad != 4) {
+            spec.push_back(pad);                    // constantID=12: SHMEM_STRIDE_PAD
+            spec.push_back(intel_slm ? 1u : 0u);    // constantID=13: APPLY_SLM_A_RESHAPE
         }
         return spec;
     };
