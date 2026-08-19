@@ -127,6 +127,9 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
     const struct ggml_tensor * selector_meta = ml->get_tensor_meta("selector_hidden.weight");
     if (selector_meta) {
+        if (hparams.dsv4_hc_mult > 0) {
+            throw std::runtime_error("DFlash2 selector is not supported on the DSV4 backbone");
+        }
         const int64_t rank = hparams.dflash_selector_rank;
         if (rank <= 0 || hparams.dflash_block_size <= 0 || hparams.dflash_selector_top_k <= 0 ||
                 hparams.dflash_conv_kernel_size <= 0 || hparams.dflash_conv_group_size <= 0) {

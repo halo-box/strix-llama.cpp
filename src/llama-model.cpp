@@ -2735,6 +2735,10 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
+    // must match build_arch_graph: the DSV4 decode graph does not build the selector lattice
+    if (model->dflash_selector_hidden == nullptr || model->hparams.dsv4_hc_mult > 0) {
+        return 0;
+    }
     return model->hparams.dflash_selector_top_k;
 }
 
