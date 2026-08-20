@@ -66,6 +66,15 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
             "flash_attn_gather_f16", flash_attn_gather_f16_len, flash_attn_gather_f16_data, "main", 5,
             sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true,
             device->subgroup_size);
+#define CREATE_FA_GATHER_TOK_DQ(TYPE, NAMED) \
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_dq[TYPE], \
+            "flash_attn_gather_dq_" #NAMED, flash_attn_gather_dq_ ## NAMED ## _len, \
+            flash_attn_gather_dq_ ## NAMED ## _data, "main", 5, \
+            sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true, \
+            device->subgroup_size);
+        CREATE_FA_GATHER_TOK_DQ(GGML_TYPE_Q4_0, q4_0)
+        CREATE_FA_GATHER_TOK_DQ(GGML_TYPE_Q8_0, q8_0)
+#undef CREATE_FA_GATHER_TOK_DQ
         if (device->subgroup_arithmetic) {
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_union_f16,
                 "flash_attn_union_f16", flash_attn_union_f16_len, flash_attn_union_f16_data, "main", 3,
@@ -399,6 +408,12 @@ bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor * src1
     if (src0->type != src1->type || src0->type != dst->type) {
         return false;
     }
+    // Decode on the way in, as the union path does: the gather touches each row once, while
+    // flash attention decodes once per query block that reads it. The union only covers
+    // n_batch > 1, so single-token decode lands here.
+    const bool     tok_dq   = ggml_is_quantized(k->type) && ctx->device->pipeline_flash_attn_gather_dq[k->type];
+    const uint32_t row_by   = tok_dq ? (uint32_t) (k->ne[0] * sizeof(ggml_fp16_t)) : k_row_bytes;
+
     // ---- diagnostic: adjacent-token top-k overlap (GGML_VK_TOPK_OVERLAP=1) ---------------
     // Decides whether a deduplicated union is worth building for the small-batch path. A
     // speculative draft attends at adjacent POSITIONS, so overlap between adjacent prefill
@@ -944,7 +959,7 @@ union_unavailable:;
     const uint32_t kv_c = GGML_PAD((uint32_t) (n_kv_raw + (int64_t) n_cand), 256u);
 
     const uint32_t ns    = (uint32_t) q->ne[3];
-    const size_t   kc_sz = (size_t) ns * kv_c * k_row_bytes;
+    const size_t   kc_sz = (size_t) ns * kv_c * row_by;
     const size_t   mc_sz = (size_t) ns * n_batch * kv_c * sizeof(ggml_fp16_t);
 
     if (ctx->prealloc_size_y < kc_sz + mc_sz) {
@@ -955,13 +970,14 @@ union_unavailable:;
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    vk_pipeline pipeline = ctx->device->pipeline_flash_attn_gather_f16;
+    vk_pipeline pipeline = tok_dq ? ctx->device->pipeline_flash_attn_gather_dq[k->type]
+                                  : ctx->device->pipeline_flash_attn_gather_f16;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const vk_op_flash_attn_gather_push_constants pc = {
         (uint32_t) k->ne[1], (uint32_t) n_kv_raw, (uint32_t) top_k->ne[0], kv_c,
-        (uint32_t) (k->nb[1] / 4),
-        (uint32_t) (k->nb[3] / 4),
+        tok_dq ? (uint32_t) (k->nb[1] / ggml_type_size(k->type)) : (uint32_t) (k->nb[1] / 4),
+        tok_dq ? (uint32_t) (k->nb[3] / ggml_type_size(k->type)) : (uint32_t) (k->nb[3] / 4),
         (uint32_t) (top_k->nb[3] / sizeof(int32_t)),
         (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
         (uint32_t) mask->ne[3],

@@ -1007,6 +1007,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_top_k_f16;
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
+    vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
     vk_pipeline pipeline_flash_attn_union_f16;
     vk_pipeline pipeline_flash_attn_gather_union_f16;
     vk_pipeline pipeline_flash_attn_gather_union_dq[GGML_TYPE_COUNT];
