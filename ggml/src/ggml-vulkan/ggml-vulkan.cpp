@@ -11166,9 +11166,22 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     const ggml_tensor * top_k = dst->src[5];
     static const char * top_k_env = getenv("GGML_VK_FA_TOPK");
+    // The sparse shaders read f16 only. Serve a quantised cache by dequantising it once into
+    // the f16 scratch, the same pass the dense path uses. K and V are the same tensor here, so
+    // one pass covers both. Without this a quantised cache declines to dense FA, which costs
+    // O(kv) where the sparse path costs O(n_kv_raw + n_top_k).
+    static const char * fa_dequant_env = getenv("GGML_VK_FA_DEQUANT");
+    const uint64_t kv_f16_sz = (uint64_t) ggml_nelements(k) * sizeof(ggml_fp16_t);
+    const bool dequant_kv = top_k && k->type != GGML_TYPE_F16 &&
+                            !(fa_dequant_env && fa_dequant_env[0] == '0') &&
+                            ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
+                            k->nb[0] == ggml_type_size(k->type) &&
+                            ggml_is_contiguously_allocated(k) &&
+                            kv_f16_sz <= ctx->device->properties.limits.maxStorageBufferRange &&
+                            ggml_vk_fa_dequant_scratch_fits(ctx, kv_f16_sz);
     if ((top_k_env && top_k_env[0] == '0') ||
         !top_k || (!ctx->device->pipeline_flash_attn_top_k_f16 && !ctx->device->pipeline_flash_attn_top_k_cm_f16) ||
-        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+        q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F16 && !dequant_kv) || v->type != k->type ||
         !mask || mask->type != GGML_TYPE_F16 || top_k->type != GGML_TYPE_I32 ||
         q->ne[0] != 512 || q->ne[1] < 64 || k->ne[0] != 512 || v->ne[0] != 512 ||
         q->ne[2] != 64 || k->ne[2] != 1 || v->ne[2] != 1 ||
@@ -11254,14 +11267,43 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         }
     }
 
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    if (dequant_kv) {
+        if (ctx->prealloc_size_x < kv_f16_sz) {
+            ctx->prealloc_size_x = kv_f16_sz;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        vk_pipeline tr_k = ctx->device->pipeline_dequant_transpose[k->type];
+        ggml_pipeline_request_descriptor_sets(ctx, tr_k, 1);
+        if (ctx->prealloc_x_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        const vk_subbuffer k_dst = vk_subbuffer{ ctx->prealloc_x, 0, kv_f16_sz };
+        const uint32_t k_nel = (uint32_t) ggml_nelements(k);
+        const std::vector<uint32_t> tr_pc = { (uint32_t) k->ne[0], (uint32_t) k->ne[2], (uint32_t) k->ne[1], 0, k_nel };
+        ggml_vk_dispatch_pipeline(ctx, subctx, tr_k, { k_buf, k_dst }, tr_pc, { k_nel, 1, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+        ctx->prealloc_x_need_sync = true;
+        k_buf = k_dst;
+        ggml_vk_perf_mark_subop(ctx, subctx, "FA_KV_DEQUANT (sub-op)");
+    }
+    // strides of what the shaders actually read: the source cache, or the contiguous
+    // [HS, KV, n_head_kv, ns] f16 scratch the dequant just wrote
+    const uint32_t k_stride   = dequant_kv ? (uint32_t) k->ne[0] : (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t));
+    const uint32_t k_nb3_el   = dequant_kv ? (uint32_t) ((uint64_t) k->ne[0] * k->ne[1] * k->ne[2])
+                                           : (uint32_t) (k->nb[3] / sizeof(ggml_fp16_t));
+    const uint32_t k_nb2_byte = dequant_kv ? (uint32_t) ((uint64_t) k->ne[0] * k->ne[1] * sizeof(ggml_fp16_t))
+                                           : (uint32_t) k->nb[2];
+    const uint32_t k_nb3_byte = dequant_kv ? (uint32_t) (k_nb3_el * sizeof(ggml_fp16_t)) : (uint32_t) k->nb[3];
+
     vk_op_flash_attn_top_k_push_constants pc = {
         (uint32_t) q->ne[1], (uint32_t) k->ne[1], (uint32_t) n_kv_raw,
         (uint32_t) top_k->ne[0], (uint32_t) q->ne[2],
         (uint32_t) (q->nb[1] / sizeof(float)),
         (uint32_t) (q->nb[2] / sizeof(float)),
         (uint32_t) (q->nb[3] / sizeof(float)),
-        (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)),
-        (uint32_t) (k->nb[3] / sizeof(ggml_fp16_t)),
+        k_stride,
+        k_nb3_el,
         (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
         (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
         (uint32_t) (top_k->nb[1] / sizeof(int32_t)),
@@ -11297,7 +11339,6 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         vk_fa_tuning_params tuning = get_fa_tuning_params(ctx->device, D, D, N, raw_kv, GGML_TYPE_F16, GGML_TYPE_F16, f32acc);
 
         const uint32_t q_stride = (uint32_t) (q->nb[1] / sizeof(float));
-        const uint32_t k_stride = (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t));
         const bool aligned = raw_kv % tuning.block_cols == 0 && (q_stride & 7) == 0 && (k_stride & 7) == 0;
         const vk_fa_pipeline_state raw_state = get_fa_pipeline_state(ctx->device, tuning, D, D, aligned, f32acc,
                                                                      true, false, false, GGML_TYPE_F16, GGML_TYPE_F16);
@@ -11339,7 +11380,6 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                 const uint32_t packed_gqa = mask_stride_in_split_kv | 1u;
                 const uint32_t packed_partitions = (partitions << 16) | 1;
                 const vk_subbuffer split_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
-                const vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
                 const vk_subbuffer mask_buf = ggml_vk_tensor_subbuffer(ctx, mask);
                 const vk_subbuffer top_buf = ggml_vk_tensor_subbuffer(ctx, top_k);
                 const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
@@ -11365,8 +11405,8 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
                         1, NS,
                         (uint32_t) mask->ne[1], (uint32_t) mask->ne[2], (uint32_t) mask->ne[3],
                         q_stride, (uint32_t) q->nb[2], (uint32_t) q->nb[3],
-                        k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
-                        k_stride, (uint32_t) k->nb[2], (uint32_t) k->nb[3],
+                        k_stride, k_nb2_byte, k_nb3_byte,
+                        k_stride, k_nb2_byte, k_nb3_byte,
                         scale, 0.0f, 0.0f,
                         n_head_log2, 1.0f, 1.0f,
                         packed_gqa, mask_stride, packed_partitions,
@@ -11399,7 +11439,7 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, mask), sinks_buf,
+        {q_buf, k_buf, ggml_vk_tensor_subbuffer(ctx, mask), sinks_buf,
          ggml_vk_tensor_subbuffer(ctx, top_k), ggml_vk_tensor_subbuffer(ctx, dst)},
         pc, {(uint32_t) q->ne[1], (uint32_t) CEIL_DIV(q->ne[2], use_cm ? 32 : 8), (uint32_t) q->ne[3]});
     ggml_vk_perf_mark_subop(ctx, subctx, use_cm ? "FA_TOP_K_CM (sub-op)" : "FA_TOP_K_SPARSE (sub-op)");
