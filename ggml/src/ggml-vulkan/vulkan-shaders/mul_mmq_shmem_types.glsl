@@ -65,7 +65,13 @@ struct block_a_cache {
     int32_t qs[8];
     FLOAT_TYPE d;
 };
-#elif defined(DATA_A_IQ3_S)
+#elif defined(DATA_A_ROCMFP4)
+#define QUANT_R_MMQ 2
+struct block_a_cache {
+    int32_t qs[8];
+    FLOAT_TYPEV2 d;   // one UE4M3 scale per half block
+};
+#elif defined(DATA_A_ROCMFP4_FAST)
 #define QUANT_R_MMQ 2
 struct block_a_cache {
     int32_t qs[8];
