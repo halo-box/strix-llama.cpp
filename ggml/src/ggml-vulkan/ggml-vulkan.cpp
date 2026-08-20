@@ -1094,6 +1094,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_top_k_f16;
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
+    vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
     vk_pipeline pipeline_flash_attn_union_f16;
     vk_pipeline pipeline_flash_attn_gather_union_f16;
     vk_pipeline pipeline_flash_attn_gather_union_dq[GGML_TYPE_COUNT];
@@ -6129,6 +6130,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             "flash_attn_gather_f16", flash_attn_gather_f16_len, flash_attn_gather_f16_data, "main", 5,
             sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true,
             device->subgroup_size);
+#define CREATE_FA_GATHER_TOK_DQ(TYPE, NAMED) \
+        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_dq[TYPE], \
+            "flash_attn_gather_dq_" #NAMED, flash_attn_gather_dq_ ## NAMED ## _len, \
+            flash_attn_gather_dq_ ## NAMED ## _data, "main", 5, \
+            sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true, \
+            device->subgroup_size);
+        CREATE_FA_GATHER_TOK_DQ(GGML_TYPE_Q4_0, q4_0)
+        CREATE_FA_GATHER_TOK_DQ(GGML_TYPE_Q8_0, q8_0)
+#undef CREATE_FA_GATHER_TOK_DQ
         if (device->subgroup_arithmetic) {
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_union_f16,
                 "flash_attn_union_f16", flash_attn_union_f16_len, flash_attn_union_f16_data, "main", 3,
@@ -11705,8 +11715,14 @@ union_unavailable:;
         return false;
     }
 
+    // Decode on the way in, as the union path does: the gather touches each row once, while
+    // flash attention decodes once per query block that reads it. The union only covers
+    // n_batch > 1, so single-token decode lands here.
+    const bool     tok_dq   = ggml_is_quantized(k->type) && ctx->device->pipeline_flash_attn_gather_dq[k->type];
+    const uint32_t row_by   = tok_dq ? (uint32_t) (k->ne[0] * sizeof(ggml_fp16_t)) : k_row_bytes;
+
     const uint32_t ns    = (uint32_t) q->ne[3];
-    const size_t   kc_sz = (size_t) ns * kv_c * k_row_bytes;
+    const size_t   kc_sz = (size_t) ns * kv_c * row_by;
     const size_t   mc_sz = (size_t) ns * n_batch * kv_c * sizeof(ggml_fp16_t);
 
     if (ctx->prealloc_size_y < kc_sz + mc_sz) {
@@ -11717,19 +11733,21 @@ union_unavailable:;
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    vk_pipeline pipeline = ctx->device->pipeline_flash_attn_gather_f16;
+    vk_pipeline pipeline = tok_dq ? ctx->device->pipeline_flash_attn_gather_dq[k->type]
+                                  : ctx->device->pipeline_flash_attn_gather_f16;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
+    // the fused decoder steps K in BLOCKS and writes elements; the verbatim one does words
     const vk_op_flash_attn_gather_push_constants pc = {
         (uint32_t) k->ne[1], (uint32_t) n_kv_raw, (uint32_t) top_k->ne[0], kv_c,
-        (uint32_t) (k->nb[1] / 4),
-        (uint32_t) (k->nb[3] / 4),
+        tok_dq ? (uint32_t) (k->nb[1] / ggml_type_size(k->type)) : (uint32_t) (k->nb[1] / 4),
+        tok_dq ? (uint32_t) (k->nb[3] / ggml_type_size(k->type)) : (uint32_t) (k->nb[3] / 4),
         (uint32_t) (top_k->nb[1] / sizeof(int32_t)),
         (uint32_t) (top_k->nb[3] / sizeof(int32_t)),
         (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
         (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
         (uint32_t) mask->ne[3],
-        n_batch, k_row_words,
+        n_batch, tok_dq ? (uint32_t) k->ne[0] : k_row_words,
     };
 
     st.kc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
@@ -11791,8 +11809,9 @@ union_unavailable:;
     st.active = true;
     st.kv_c = kv_c;
     st.n_batch = n_batch;
-    st.row_bytes = k_row_bytes;
-    st.row_elems = (uint32_t) (k->ne[0] / ggml_blck_size(k->type));
+    st.row_bytes = row_by;
+    st.row_elems = tok_dq ? (uint32_t) k->ne[0] : (uint32_t) (k->ne[0] / ggml_blck_size(k->type));
+    st.dequantized = tok_dq;
     return true;
 }
 
