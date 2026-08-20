@@ -10401,6 +10401,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  8, 2304, 512, false, 1, 60, tk));
         test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86, tk));
         test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   1, 1024, 512, false, 1,  0, tk));
+        // prefill widths (nb >= 64), where the sparse shaders run on a dequantised f16 scratch
+        // instead of the cache. ns=2 covers the scratch's stream stride, and the 4096 case is
+        // wide enough for the raw/selected split form.
+        test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,   64, 128, false, 1,  0, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,   64, 128, false, 2,  0, tk));
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(4096, 128,  256, 512, false, 1,  0, tk));
     }
     test_cases.emplace_back(new test_flash_attn_ext_top_k(8192,   4, 1024, 512, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  64,  64, 128, false, 2));
@@ -10878,6 +10884,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type tk : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         for (int nb : { 1, 2, 4, 8, 16 }) {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, 1, 60, tk));
+        }
+    }
+    // PREFILL widths with quantised K/V, which the sparse path now serves through a one-shot
+    // dequant into the f16 scratch; quantised should sit within ~1% of f16 at every kv here.
+    // nb=1024 is the reporting user's --ubatch-size; the kv list is their four source depths
+    // (17k/33k/67k/134k) in compressed-K rows. GGML_VK_FA_DEQUANT=0 reproduces the old dense
+    // fallback, whose gap GROWS with kv (dense is O(kv), sparse O(n_kv_raw + n_top_k)); f16
+    // under GGML_VK_FA_TOPK=0 is the falsification arm for attributing that gap to the gate.
+    for (ggml_type tk : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int kv : { 5504, 11008, 19200, 35584 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 1024, 2304, 512, false, 1, 0, tk));
         }
     }
 
