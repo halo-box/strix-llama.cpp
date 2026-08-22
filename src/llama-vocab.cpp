@@ -1949,6 +1949,30 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 id_to_token.resize(n_tokens);
             }
 
+            // models without a tokenizer can still declare special token ids (e.g. the mask token of a diffusion drafter)
+            const std::vector<std::pair<enum llm_kv, int32_t &>> special_token_types = {
+                { LLM_KV_TOKENIZER_BOS_ID,  special_bos_id  },
+                { LLM_KV_TOKENIZER_EOS_ID,  special_eos_id  },
+                { LLM_KV_TOKENIZER_UNK_ID,  special_unk_id  },
+                { LLM_KV_TOKENIZER_SEP_ID,  special_sep_id  },
+                { LLM_KV_TOKENIZER_PAD_ID,  special_pad_id  },
+                { LLM_KV_TOKENIZER_MASK_ID, special_mask_id },
+            };
+
+            for (const auto & it : special_token_types) {
+                int32_t & id = std::get<1>(it);
+
+                uint32_t new_id;
+                if (!ml.get_key(std::get<0>(it), new_id, false)) {
+                    continue;
+                }
+                if (new_id >= id_to_token.size()) {
+                    LLAMA_LOG_WARN("%s: bad special token: '%s' = %u, ignoring\n", __func__, kv(std::get<0>(it)).c_str(), new_id);
+                } else {
+                    id = new_id;
+                }
+            }
+
             return;
         }
 
