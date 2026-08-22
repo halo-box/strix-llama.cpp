@@ -4678,6 +4678,19 @@ private:
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
+                } else if (slot.spec_is_replay) {
+                    // replayed tokens were accepted before the restore; re-verifying them can
+                    // disagree when logits depend on batch shape, and each disagreement restores
+                    // the same checkpoint again - the slot stops making progress
+                    accepted = slot.spec_draft;
+                    for (const llama_token id : accepted) {
+                        common_sampler_accept(slot.smpl.get(), id, true);
+                    }
+                    accepted.push_back(common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch.back()));
+                    common_sampler_accept(slot.smpl.get(), accepted.back(), true);
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
