@@ -4147,20 +4147,22 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
 // stride in elements IS the stride in LDS banks, and RDNA has 32 of them:
 // SHMEM_STRIDE = BK/2 + pad reaches 32/gcd(BK/2+pad, 32) banks.
 //
-// The stride must stay EVEN or the 8/16-byte ds_read_b64/b128 loads lose alignment - every odd pad
-// measured -53% on gfx1151. Among even pads the quantised path (BK=32) tracks bank spread:
-// pad 2 (stride 18, 16 banks) is +13% mean over pad 4 (stride 20, 8 banks) in a standalone MUL_MAT
-// sweep, and pad 0 (stride 16, 2 banks) is -31%.
+// The pad is NOT free to chase bank spread: the coopmat path hands SHMEM_STRIDE to coopMatLoad
+// as its Stride operand, and VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986 requires the
+// pointer and stride to be 16 B aligned for the 16x16 f16 tiles. Stride bytes are
+// (BK/2 + pad) * 4, so only pad % 4 == 0 is in contract, and the 16-bank stride 18 (72 B)
+// never is.
 //
-// The float path does NOT follow that rule and the bank model does NOT explain why. f32/f16
-// shaders `#define BK 32` regardless of the host spec constant, so they run the SAME stride as
-// the quantised ones - yet pad 2 measures -18% on f16 and -14% on f32. Same stride, same bank
-// pattern, opposite preference; the remaining difference is BK_STEP (4 on the float path, 2 on
-// the quant path), i.e. the access pattern inside the loop, which is not modelled here.
-// So this ships the MEASURED optimum per path, not the theory: pad 2 quantised, pad 4 float.
-// The discriminator is the host warptile's BK (16 float / 32 quant), which is a reliable label
-// for which pipeline is being built even though the shader overrides the value for f32/f16.
-// GGML_VK_SHMEM_PAD=N overrides both, for probing.
+// What a driver does with the out-of-contract stride is codegen luck, ISA-verified on gfx1151:
+// RADV <= 25.2 lowers coopMatLoad with ds_read_b128 (the 16 B the contract guarantees), so the
+// misaligned rows pay runtime splits: Qwen3.6-35B pp512 597 vs 1426 t/s, Qwen3.8-27B 107 vs
+// 333. RADV >= 25.3 lowers to ds_read_b64, for which 72 B is always aligned, and the extra
+// bank spread nets +5-7% pp512 (measured on 25.3.0, 25.3.6, 26.0.8, 26.1.8, 26.2.1, 26.3-dev).
+// The codegen is pad-invariant per driver, so the effect is runtime address patterns, not
+// instruction selection.
+//
+// So: pad 2 for the quant tiles (BK 32) only on RADV >= 25.3.0; the spec-aligned pad 4
+// everywhere else. GGML_VK_SHMEM_PAD=N still overrides both paths, for probing.
 static uint32_t ggml_vk_coopmat_shmem_pad(const vk_device& device, uint32_t bk) {
     if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
         device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
@@ -4173,9 +4175,9 @@ static uint32_t ggml_vk_coopmat_shmem_pad(const vk_device& device, uint32_t bk) 
     if (env_pad >= 0) {
         return (uint32_t) env_pad;
     }
-    const bool amd_radv = device->vendor_id == VK_VENDOR_ID_AMD &&
-                          device->driver_id != vk::DriverId::eAmdProprietary;
-    if (device->coopmat_support && amd_radv && bk >= 32) {
+    if (device->coopmat_support && bk >= 32 &&
+        device->driver_id == vk::DriverId::eMesaRadv &&
+        device->properties.driverVersion >= VK_MAKE_API_VERSION(0, 25, 3, 0)) {
         return 2;
     }
     return 4;
