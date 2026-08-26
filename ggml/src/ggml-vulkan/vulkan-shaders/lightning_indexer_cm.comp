@@ -8,6 +8,10 @@
 #extension GL_KHR_shader_subgroup_basic : require
 
 layout(constant_id = 0) const uint SUBGROUP_SIZE = 64;
+// Head count is a SPECIALIZATION constant, not a push constant: the head loop's trip
+// count must stay visible to the compiler. As a push constant it cannot unroll and
+// decode costs ~55% more (measured, gfx1151, kv=131584).
+layout(constant_id = 1) const uint N_HEAD = 64;
 #if N_WAVES == 1
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 #else
@@ -40,7 +44,6 @@ layout(push_constant) uniform Parameters {
 
 const uint TILE = 16;
 const uint HEAD_SIZE = 128;
-const uint N_HEAD = 64;
 const uint VEC_PER_HEAD = HEAD_SIZE / 4;
 const uint TILE_STRIDE = VEC_PER_HEAD + 2;
 const uint SCORE_STRIDE = TILE / 4 + 1;
@@ -105,7 +108,7 @@ void main() {
             const uint d4 = head_idx % VEC_PER_HEAD;
             const uint token = token_base + token_local;
             f16vec4 value = f16vec4(0.0);
-            if (token < p.n_batch) {
+            if (token < p.n_batch && (N_HEAD % HEADS_PER_TILE == 0 || head_base + head_local < N_HEAD)) {
                 const uint offset = stream * p.nbq3 + token * p.nbq2 + (head_base + head_local) * p.nbq1 + d4 * 4;
                 value = f16vec4(data_q[offset], data_q[offset + 1], data_q[offset + 2], data_q[offset + 3]);
             }
@@ -115,7 +118,8 @@ void main() {
             const uint head_local = tid / TILE;
             const uint token_local = tid % TILE;
             const uint token = token_base + token_local;
-            weight_sh[head_local][token_local] = token < p.n_batch ? data_w[stream * p.nbw3 + token * p.nbw1 + head_base + head_local] : 0.0;
+            weight_sh[head_local][token_local] = (token < p.n_batch && (N_HEAD % HEADS_PER_TILE == 0 || head_base + head_local < N_HEAD))
+                ? data_w[stream * p.nbw3 + token * p.nbw1 + head_base + head_local] : 0.0;
         }
         barrier();
 

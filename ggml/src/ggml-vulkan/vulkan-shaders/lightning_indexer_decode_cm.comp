@@ -7,6 +7,10 @@
 #extension GL_KHR_memory_scope_semantics : require
 
 layout(constant_id = 0) const uint SUBGROUP_SIZE = 64;
+// Head count is a SPECIALIZATION constant, not a push constant: the head loop's trip
+// count must stay visible to the compiler. As a push constant it cannot unroll and
+// decode costs ~55% more (measured, gfx1151, kv=131584).
+layout(constant_id = 1) const uint N_HEAD = 64;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly  buffer QBuf   { float     data_q[];    };
@@ -35,7 +39,6 @@ layout(push_constant) uniform Parameters {
 
 const uint TILE = 16;
 const uint HEAD_SIZE = 128;
-const uint N_HEAD = 64;
 const uint VEC_PER_HEAD = HEAD_SIZE / 4;
 const uint TILE_STRIDE = VEC_PER_HEAD + 2;
 const uint SCORE_STRIDE = TILE / 4 + 1;
@@ -80,9 +83,19 @@ void main() {
             const uint head_local = idx / VEC_PER_HEAD;
             const uint d4 = idx % VEC_PER_HEAD;
             const uint head = head_base + head_local;
-            const uint offset = stream * p.nbq3 + token * p.nbq2 + head * p.nbq1 + d4 * 4;
-            q_sh[head_local * TILE_STRIDE + d4] =
-                f16vec4(data_q[offset], data_q[offset + 1], data_q[offset + 2], data_q[offset + 3]);
+            // n_head need not be a multiple of TILE (Qwen4-exp indexers are nh=4), so the tail
+            // tile stages zeros rather than reading past the end of Q. Zero q gives score 0,
+            // and relu(0) * w = 0, so the padded heads drop out of the sum on their own.
+            // The guard exists only when N_HEAD is not tile-aligned (nh=4). The condition is a
+            // specialization-constant expression, so at nh=64 it folds to true and this compiles
+            // to the original unguarded load - measured: relying on the compiler to range-prove
+            // head < N_HEAD instead costs ~45% at nh=64.
+            f16vec4 value = f16vec4(0.0);
+            if (N_HEAD % TILE == 0 || head < N_HEAD) {
+                const uint offset = stream * p.nbq3 + token * p.nbq2 + head * p.nbq1 + d4 * 4;
+                value = f16vec4(data_q[offset], data_q[offset + 1], data_q[offset + 2], data_q[offset + 3]);
+            }
+            q_sh[head_local * TILE_STRIDE + d4] = value;
         }
         barrier();
 
@@ -100,8 +113,13 @@ void main() {
 
         if (tid < TILE && kv_base + tid < p.n_kv) {
             [[unroll]] for (uint head_local = 0; head_local < TILE; ++head_local) {
+                // Padded heads staged q as zero, so their score is 0 and the term dies in the
+                // multiply. Only the weight READ needs bounding, and clamping the index does that
+                // without a branch - a dynamic break here forces the loop rolled and costs ~60%.
+                const uint head = N_HEAD % TILE == 0 ? head_base + head_local
+                                                      : min(head_base + head_local, N_HEAD - 1);
                 const float score = score_sh[tid * SCORE_STRIDE + head_local / 4][head_local % 4];
-                const float weight = data_w[stream * p.nbw3 + token * p.nbw1 + head_base + head_local];
+                const float weight = data_w[stream * p.nbw3 + token * p.nbw1 + head];
                 total += max(score, 0.0) * weight;
             }
         }
