@@ -3847,28 +3847,36 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     if (device->subgroup_arithmetic && device->subgroup_size == 64) {
-        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f16,
-            "lightning_indexer_f16", lightning_indexer_f16_len, lightning_indexer_f16_data, "main", 5,
-            sizeof(vk_op_lightning_indexer_cm_push_constants), {8, 1, 1}, {device->subgroup_size}, 1, true, true,
-            device->subgroup_size);
+        for (size_t nhi = 0; nhi < LI_NH_COUNT; ++nhi) {
+            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f16[nhi],
+                "lightning_indexer_f16", lightning_indexer_f16_len, lightning_indexer_f16_data, "main", 5,
+                sizeof(vk_op_lightning_indexer_cm_push_constants), {8, 1, 1}, {device->subgroup_size, LI_NH_VALUES[nhi]}, 1, true, true,
+                device->subgroup_size);
+        }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
         if (device->coopmat_support && device->coopmat_support_16x16x16_f32acc && device->subgroup_size_control) {
-            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_small_f16,
-                "lightning_indexer_cm_small_f16", lightning_indexer_cm_small_f16_len, lightning_indexer_cm_small_f16_data, "main", 5,
-                sizeof(vk_op_lightning_indexer_cm_push_constants), {16, 16, 1}, {device->subgroup_size}, 1, true, true,
-                device->subgroup_size);
+            for (size_t nhi = 0; nhi < LI_NH_COUNT; ++nhi) {
+                ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_small_f16[nhi],
+                    "lightning_indexer_cm_small_f16", lightning_indexer_cm_small_f16_len, lightning_indexer_cm_small_f16_data, "main", 5,
+                    sizeof(vk_op_lightning_indexer_cm_push_constants), {16, 16, 1}, {device->subgroup_size, LI_NH_VALUES[nhi]}, 1, true, true,
+                    device->subgroup_size);
+            }
             if (device->properties.limits.maxComputeWorkGroupInvocations >= 512 &&
                 device->properties.limits.maxComputeWorkGroupSize[0] >= 512 &&
                 device->properties.limits.maxComputeSharedMemorySize >= 64 * 1024) {
-                ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_f16,
-                    "lightning_indexer_cm_f16", lightning_indexer_cm_f16_len, lightning_indexer_cm_f16_data, "main", 5,
-                    sizeof(vk_op_lightning_indexer_cm_push_constants), {128, 16, 1}, {device->subgroup_size}, 1, true, true,
+                for (size_t nhi = 0; nhi < LI_NH_COUNT; ++nhi) {
+                    ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_f16[nhi],
+                        "lightning_indexer_cm_f16", lightning_indexer_cm_f16_len, lightning_indexer_cm_f16_data, "main", 5,
+                        sizeof(vk_op_lightning_indexer_cm_push_constants), {128, 16, 1}, {device->subgroup_size, LI_NH_VALUES[nhi]}, 1, true, true,
+                        device->subgroup_size);
+                }
+            }
+            for (size_t nhi = 0; nhi < LI_NH_COUNT; ++nhi) {
+                ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_decode_cm_f16[nhi],
+                    "lightning_indexer_decode_cm_f16", lightning_indexer_decode_cm_f16_len, lightning_indexer_decode_cm_f16_data, "main", 5,
+                    sizeof(vk_op_lightning_indexer_cm_push_constants), {16, 1, 1}, {device->subgroup_size, LI_NH_VALUES[nhi]}, 1, true, true,
                     device->subgroup_size);
             }
-            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_decode_cm_f16,
-                "lightning_indexer_decode_cm_f16", lightning_indexer_decode_cm_f16_len, lightning_indexer_decode_cm_f16_data, "main", 5,
-                sizeof(vk_op_lightning_indexer_cm_push_constants), {16, 1, 1}, {device->subgroup_size}, 1, true, true,
-                device->subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_cm_f16,
                 "flash_attn_top_k_cm_f16", flash_attn_top_k_cm_f16_len, flash_attn_top_k_cm_f16_data, "main", 6,
                 sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {512, device->subgroup_size}, 1, true, true,
@@ -10520,10 +10528,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_LIGHTNING_INDEXER:
         // fork fast path: f16 K on wave64 subgroup-arithmetic devices routes to the tuned
-        // scalar-64/CM kernels; anything else falls through to the generic pipeline table
+        // scalar-64/CM kernels (head counts in LI_NH_VALUES); anything else falls through to
+        // the generic pipeline table
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32 &&
-            src0->ne[0] == 128 && src0->ne[1] == 64 && src1->ne[1] == 1 &&
-            ctx->device->pipeline_lightning_indexer_f16) {
+            src0->ne[0] == 128 && src1->ne[1] == 1 &&
+            ggml_vk_li_nh_index(src0->ne[1]) >= 0 && ctx->device->pipeline_lightning_indexer_f16[0]) {
+            const int nhi = ggml_vk_li_nh_index(src0->ne[1]);
             // Small-batch routing. Three arms, one env var each, most specific first:
             //
             //   default                            decode CM for the whole 2-15 window
@@ -10548,20 +10558,20 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             static const char * decode_cm_batch_env = getenv("GGML_VK_LIGHTNING_INDEXER_DECODE_CM_BATCH");
             static const bool   decode_cm_batch_on  = !decode_cm_batch_env || decode_cm_batch_env[0] != '0';
             const int64_t decode_cm_max = decode_cm_batch_on ? 15 : 1;
-            if (ctx->device->pipeline_lightning_indexer_decode_cm_f16 && src0->ne[2] <= decode_cm_max) {
-                return ctx->device->pipeline_lightning_indexer_decode_cm_f16;
+            if (ctx->device->pipeline_lightning_indexer_decode_cm_f16[nhi] && src0->ne[2] <= decode_cm_max) {
+                return ctx->device->pipeline_lightning_indexer_decode_cm_f16[nhi];
             }
             // PR #6 as its author proposed it, now default-on so that the kill switch above is
             // enough on its own to reach it.
             static const char * small_cm_env = getenv("GGML_VK_LIGHTNING_INDEXER_SMALL_CM");
             static const bool   small_cm_on  = !small_cm_env || small_cm_env[0] != '0';
-            if (ctx->device->pipeline_lightning_indexer_cm_small_f16 && small_cm_on &&
+            if (ctx->device->pipeline_lightning_indexer_cm_small_f16[nhi] && small_cm_on &&
                 src0->ne[2] >= 4 && src0->ne[2] < 16) {
-                return ctx->device->pipeline_lightning_indexer_cm_small_f16;
+                return ctx->device->pipeline_lightning_indexer_cm_small_f16[nhi];
             }
-            vk_pipeline cm = ctx->device->pipeline_lightning_indexer_cm_f16 ?
-                ctx->device->pipeline_lightning_indexer_cm_f16 : ctx->device->pipeline_lightning_indexer_cm_small_f16;
-            return cm && src0->ne[2] >= 16 ? cm : ctx->device->pipeline_lightning_indexer_f16;
+            vk_pipeline cm = ctx->device->pipeline_lightning_indexer_cm_f16[nhi] ?
+                ctx->device->pipeline_lightning_indexer_cm_f16[nhi] : ctx->device->pipeline_lightning_indexer_cm_small_f16[nhi];
+            return cm && src0->ne[2] >= 16 ? cm : ctx->device->pipeline_lightning_indexer_f16[nhi];
         }
         // only the k type selects a pipeline, the other types are fixed by ggml_lightning_indexer()
         if (ggml_vk_lightning_indexer_k_type_supported(src1->type)) {
@@ -11603,9 +11613,14 @@ static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context&
     GGML_ASSERT(pipeline != nullptr);
 
     // the fork's wave64 f16 kernels take their own push-constant layout
-    if (pipeline == ctx->device->pipeline_lightning_indexer_f16 ||
-        pipeline == ctx->device->pipeline_lightning_indexer_cm_f16 ||
-        pipeline == ctx->device->pipeline_lightning_indexer_decode_cm_f16) {
+    bool fork_li = false;
+    for (size_t nhi = 0; nhi < LI_NH_COUNT && !fork_li; ++nhi) {
+        fork_li = pipeline == ctx->device->pipeline_lightning_indexer_f16[nhi] ||
+                  pipeline == ctx->device->pipeline_lightning_indexer_cm_f16[nhi] ||
+                  pipeline == ctx->device->pipeline_lightning_indexer_cm_small_f16[nhi] ||
+                  pipeline == ctx->device->pipeline_lightning_indexer_decode_cm_f16[nhi];
+    }
+    if (fork_li) {
         ggml_vk_lightning_indexer_cm(ctx, subctx, dst, pipeline);
         return;
     }
