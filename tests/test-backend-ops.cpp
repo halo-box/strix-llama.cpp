@@ -1192,6 +1192,14 @@ struct console_printer : public printer {
     // The zero-depth kv=512 shape is covered above.
     for (int kv : { 2560, 4608, 8704, 16896, 33280, 66048, 131584 }) {
         test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 2048, 1, 1, GGML_TYPE_F16));
+    }
+
+    // DSpark verify-step indexer rows: batch 1-32 across the 4-15 small-CM routing window,
+    // at the compressed key counts a 128k/491k source context produces (source/4).
+    for (int kv : { 8704, 33280, 131584 }) {
+        for (int bs : { 1, 2, 3, 4, 5, 6, 8, 12, 15, 16, 32 }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, bs, 1, 1, GGML_TYPE_F16));
+        }
 
         // Handle gradient info
         if (info.has_gradient_info) {
@@ -12545,7 +12553,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // lightning_indexer
     for (int kv : { 256 }) {
-        for (int bs : { 1, 512 }) {
+        for (int bs : { 1, 4, 8, 15, 512 }) {
             for (int nh : { 32, 64 }) {
                 for (auto [ns, nm] : { std::pair{1, 1}, std::pair{4, 4}, std::pair{4, 1} }) {
                     for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
