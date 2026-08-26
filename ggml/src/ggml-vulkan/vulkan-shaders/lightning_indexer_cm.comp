@@ -88,6 +88,15 @@ void main() {
     }
     barrier();
 
+    // k_sh[wave] is written once above and never touched again, but coopMatLoad sits inside both
+    // the head_base and head_local loops, so the same 8 A fragments are re-read from shared
+    // memory N_HEAD times per wave (512 loads where 8 would do). Each wave64 fragment load moves
+    // 1 KiB of LDS traffic because the 16x16 f16 fragment is replicated 4x across the subgroup.
+    coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> kmat_h[HEAD_SIZE / TILE];
+    [[unroll]] for (uint d = 0; d < HEAD_SIZE; d += TILE) {
+        coopMatLoad(kmat_h[d / TILE], k_sh[wave], d / 4, TILE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+    }
+
     for (uint head_base = 0; head_base < N_HEAD; head_base += HEADS_PER_TILE) {
         for (uint idx = tid; idx < HEADS_PER_TILE * TILE * VEC_PER_HEAD; idx += gl_WorkGroupSize.x) {
             const uint head_local = idx / (TILE * VEC_PER_HEAD);
@@ -113,13 +122,11 @@ void main() {
         [[unroll]] for (uint head_local = 0; head_local < HEADS_PER_TILE; ++head_local) {
             coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> scores =
                 coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
-            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> kmat;
             coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> qmat;
 
             [[unroll]] for (uint d = 0; d < HEAD_SIZE; d += TILE) {
-                coopMatLoad(kmat, k_sh[wave], d / 4, TILE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
                 coopMatLoad(qmat, q_sh[head_local], d / 4, TILE_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
-                scores = coopMatMulAdd(kmat, qmat, scores);
+                scores = coopMatMulAdd(kmat_h[d / TILE], qmat, scores);
             }
 
             coopMatStore(scores, score_sh[wave], 0, SCORE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
