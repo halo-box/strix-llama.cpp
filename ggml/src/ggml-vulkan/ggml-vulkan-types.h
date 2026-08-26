@@ -1000,10 +1000,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
-    vk_pipeline pipeline_lightning_indexer_f16;
-    vk_pipeline pipeline_lightning_indexer_cm_f16;
-    vk_pipeline pipeline_lightning_indexer_cm_small_f16;
-    vk_pipeline pipeline_lightning_indexer_decode_cm_f16;
+    // One pipeline per supported indexer head count; see LI_NH_VALUES.
+    vk_pipeline pipeline_lightning_indexer_f16[LI_NH_COUNT];
+    vk_pipeline pipeline_lightning_indexer_cm_f16[LI_NH_COUNT];
+    vk_pipeline pipeline_lightning_indexer_cm_small_f16[LI_NH_COUNT];
+    vk_pipeline pipeline_lightning_indexer_decode_cm_f16[LI_NH_COUNT];
     vk_pipeline pipeline_flash_attn_top_k_f16;
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
