@@ -12938,12 +12938,39 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32 &&
             src0->ne[0] == 128 && src0->ne[1] == 64 && src1->ne[1] == 1 &&
             ctx->device->pipeline_lightning_indexer_f16) {
-            if (ctx->device->pipeline_lightning_indexer_decode_cm_f16 && src0->ne[2] == 1) {
+            // Small-batch routing. Three arms, one env var each, most specific first:
+            //
+            //   default                            decode CM for the whole 2-15 window
+            //   ..._DECODE_CM_BATCH=0              small CM for 4-15, scalar for 2-3 (PR #6)
+            //   ..._DECODE_CM_BATCH=0 SMALL_CM=0   scalar for 2-15 (pre-PR #6 baseline)
+            //
+            // The decode CM shader puts 16 HEADS in the coopmat N dimension and dispatches one
+            // workgroup per token, so it issues 4*n_batch tiles per 16 KV rows - the arithmetic
+            // minimum, since 64 heads fill its 16 columns exactly. The small CM shader puts 16
+            // TOKENS in N and pays a flat 64 tiles no matter how small the batch. Routing the
+            // whole window to decode CM is 2.7x at batch 5 and 4.8x at batch 2-3 (526k source
+            // tokens, gfx1151); the shader body has no n_batch == 1 assumption, token is
+            // gl_WorkGroupID.y, so the old ne[2] == 1 gate was an artefact.
+            //
+            // That measurement only exists because of pepuscz's PR #6 and issue #10: their
+            // per-kernel table (43.8 us scalar vs 27.9 us small CM per 1k scanned rows at batch
+            // 5, the same ratio at every depth) is what showed the cost is a per-tile constant,
+            // which is what makes the tile count the thing to minimise. Their small CM route is
+            // kept as the opt-out arm rather than deleted: the tile-count argument is hardware
+            // independent, but decode CM re-reads the K tile once per token, and that part is
+            // bandwidth dependent, so the crossover need not sit here on other devices.
+            static const char * decode_cm_batch_env = getenv("GGML_VK_LIGHTNING_INDEXER_DECODE_CM_BATCH");
+            static const bool   decode_cm_batch_on  = !decode_cm_batch_env || decode_cm_batch_env[0] != '0';
+            const int64_t decode_cm_max = decode_cm_batch_on ? 15 : 1;
+            if (ctx->device->pipeline_lightning_indexer_decode_cm_f16 && src0->ne[2] <= decode_cm_max) {
                 return ctx->device->pipeline_lightning_indexer_decode_cm_f16;
             }
+            // PR #6 as its author proposed it, now default-on so that the kill switch above is
+            // enough on its own to reach it.
             static const char * small_cm_env = getenv("GGML_VK_LIGHTNING_INDEXER_SMALL_CM");
-            if (ctx->device->pipeline_lightning_indexer_cm_small_f16 &&
-                src0->ne[2] >= 4 && src0->ne[2] < 16 && small_cm_env && small_cm_env[0] == '1') {
+            static const bool   small_cm_on  = !small_cm_env || small_cm_env[0] != '0';
+            if (ctx->device->pipeline_lightning_indexer_cm_small_f16 && small_cm_on &&
+                src0->ne[2] >= 4 && src0->ne[2] < 16) {
                 return ctx->device->pipeline_lightning_indexer_cm_small_f16;
             }
             vk_pipeline cm = ctx->device->pipeline_lightning_indexer_cm_f16 ?
