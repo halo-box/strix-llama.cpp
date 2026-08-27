@@ -5,9 +5,7 @@
 #include "ggml-cuda.h"
 
 #include <cstdint>
-#include <cstdlib>
 #include <memory>
-#include <mutex>
 
 #if defined(GGML_USE_HIP)
 #define GGML_COMMON_DECL_HIP
@@ -21,6 +19,8 @@
 #endif
 #endif
 #include "ggml-common.h"
+#include "../../rocmfp4/rocmfp4.h"
+#include "../../rocmfpx/rocmfpx.h"
 
 #include <array>
 #include <algorithm>
@@ -29,8 +29,27 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
+
+#ifndef GGML_ROCMFP6_EXPANDED_DEVICE
+#define GGML_ROCMFP6_EXPANDED_DEVICE 0
+#endif
+
+// Optional device-only ROCmFP6 layout. GGUF/CPU storage remains the packed
+// block_rocmfp6 layout; experimental ROCm builds may expand qs to signed
+// bytes to avoid bit unpacking in hot matmul/FA kernels.
+struct block_rocmfp6_expanded {
+    int8_t  qs[QK_ROCMFP6];
+    uint8_t e[2];
+};
+
+static_assert(sizeof(block_rocmfp6_expanded) == QK_ROCMFP6 + 2*sizeof(uint8_t), "wrong expanded rocmfp6 block size/padding");
+
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+using block_rocmfp6_device = block_rocmfp6_expanded;
+#else
+using block_rocmfp6_device = block_rocmfp6;
+#endif
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
@@ -111,14 +130,11 @@
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 
-// PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
-// However, this has been bugged in CTK < 12.3 for MSVC builds, see
-// https://github.com/ggml-org/llama.cpp/pull/22522#discussion_r3302393293
-// __CUDA_ARCH__  is undefined in host passes; GPU arch check happens in device-side code.
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && \
-    (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
+// PDL host-side support requires CUDA 11.8+ and is disabled for HIP/MUSA.
+// The helper is intentionally a no-op on AMD so shared CUDA/HIP kernels compile cleanly.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
 #    define GGML_CUDA_USE_PDL
-#endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
+#endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
 
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
 #if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
@@ -189,7 +205,6 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     } while (0)
 
 #define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString)
-
 
 #if CUDART_VERSION >= 12000 || defined(GGML_USE_MUSA)
     static const char * cublas_get_error_str(const cublasStatus_t err) {
@@ -579,6 +594,10 @@ struct block_reduce_policy;
 template <typename T, typename... Ts>
 inline constexpr bool is_any = (std::is_same_v<T, Ts> || ...);
 
+static __device__ __forceinline__ float ggml_cuda_negative_infinity() {
+    return __int_as_float(0xff800000);
+}
+
 template<typename...>
 inline constexpr bool ggml_cuda_dependent_false_v = false;
 
@@ -617,9 +636,9 @@ template <typename T> struct block_reduce_policy<block_reduce_method::MAX, T> {
 
     static __device__ T sentinel() {
         if constexpr (std::is_same_v<T, float>) {
-            return -INFINITY;
+            return ggml_cuda_negative_infinity();
         } else if constexpr (std::is_same_v<T, half2>) {
-            return make_half2(-INFINITY, -INFINITY);
+            return make_half2(ggml_cuda_negative_infinity(), ggml_cuda_negative_infinity());
         } else {
             static_assert(ggml_cuda_dependent_false_v<T>, "Unsupported type for block reduce max");
         }
@@ -850,18 +869,23 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
     const __nv_fp8_e4m3 xf = *reinterpret_cast<const __nv_fp8_e4m3 *>(&bits);
     return static_cast<float>(xf) / 2;
 #else
-    if (x == 0 || (x == 0x7F && x != 0xFF)) { // Convert NaN to 0.0f
+    if (x == 0 || x == 0x7F || x == 0xFF) { // Convert NaN to 0.0f
         return 0.0f;
     }
+
     const int exp = (x >> 3) & 0xF;
     const int man = x & 0x7;
-    float raw;
+
     if (exp == 0) {
-        raw = ldexpf((float) man, -9);
-    } else {
-        raw = ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+        return (float) man * (1.0f / 1024.0f);
     }
-    return static_cast<float>(raw / 2);
+
+    // UE4M3 normals are 2^(exp - 7) * (1 + man/8). ROCmFP4 stores integer
+    // codebook values at half scale, so build the already-halved FP32 value.
+    const uint32_t bits = ((uint32_t) exp + 119u) << 23 | ((uint32_t) man << 20);
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
 #endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
@@ -1025,6 +1049,55 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
     static constexpr int qi = QI_MXFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMFP4_FAST> {
+    static constexpr int qk = QK_ROCMFP4;
+    static constexpr int qr = QR_ROCMFP4;
+    static constexpr int qi = QI_ROCMFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q3_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP3;
+    static constexpr int qr = QR_ROCMFP3;
+    static constexpr int qi = QI_ROCMFP3;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP2;
+    static constexpr int qr = QR_ROCMFP2;
+    static constexpr int qi = QI_ROCMFP2;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q6_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP6;
+    static constexpr int qr = QR_ROCMFP6;
+    static constexpr int qi = QI_ROCMFP6;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP8;
+    static constexpr int qr = QR_ROCMFP8;
+    static constexpr int qi = QI_ROCMFP8;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q7_0_ROCMFPX> {
+    static constexpr int qk = QK_ROCMFP7;
+    static constexpr int qr = QR_ROCMFP7;
+    static constexpr int qi = QI_ROCMFP7;
 };
 
 template<>
@@ -1588,62 +1661,6 @@ struct ggml_cuda_pdl_config {
     ggml_cuda_pdl_config& operator=(ggml_cuda_pdl_config&&) = delete;
 
 };
-
-static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
-    const int device = ggml_cuda_get_device();
-
-    struct cache_key {
-        int          device;
-        const void * kernel;
-
-        bool operator==(const cache_key & other) const { return device == other.device && kernel == other.kernel; }
-    };
-
-    struct cache_key_hash {
-        // MurmurHash3 mixing function for better hash distribution (vs. just std::hash which in some implementations simply returns the identity)
-        static size_t hash_mix(size_t x) {
-            std::uint64_t       y = x;
-            const std::uint64_t m = 0xe9846af9b1a615d;
-
-            y ^= y >> 32;
-            y *= m;
-            y ^= y >> 32;
-            y *= m;
-            y ^= y >> 28;
-
-            return static_cast<size_t>(y);
-        }
-
-        size_t operator()(const cache_key & key) const {
-            // Use a nonzero seed to avoid mapping all-zero keys to zero
-            size_t h = 42;
-            h        = hash_mix(h + key.device);
-            h        = hash_mix(h + reinterpret_cast<size_t>(key.kernel));
-            return h;
-        }
-    };
-
-    static std::mutex                                          cache_mutex;
-    static std::unordered_map<cache_key, bool, cache_key_hash> cache;
-
-    const cache_key             key = { device, kernel };
-    std::lock_guard<std::mutex> lock(cache_mutex);
-    const auto                  it = cache.find(key);
-    if (it != cache.end()) {
-        return it->second;
-    }
-
-    cudaFuncAttributes attr = {};
-    CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
-
-    // PDL device-side primitives are emitted only for PTX versions >= 90.
-    // We have to guard on a loaded kernel's PTX version so a kernel forward-JIT'ed
-    // from pre-Hopper PTX to a Hopper-or-newer GPU does not opt into PDL.
-    const bool can_use_pdl = attr.ptxVersion >= 90;
-    cache.emplace(key, can_use_pdl);
-    return can_use_pdl;
-}
-
 #endif //defined(GGML_CUDA_USE_PDL)
 
 // PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
@@ -1662,7 +1679,8 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
         return env == nullptr || std::atoi(env) != 0;
     }();
 
-    if (env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (env_pdl_enabled && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_HOPPER) {
         auto pdl_cfg = ggml_cuda_pdl_config(launch_params);
 
         CUDA_CHECK(cudaLaunchKernelEx(&pdl_cfg.cfg, kernel, std::forward<Args>(args)... ));
@@ -1673,4 +1691,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

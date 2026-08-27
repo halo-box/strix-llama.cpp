@@ -63,7 +63,7 @@ static __global__ void dsv4_hc_comb_f32(
     float comb[DSV4_HC*DSV4_HC];
 
     for (int isrc = 0; isrc < DSV4_HC; ++isrc) {
-        float max = -INFINITY;
+        float max = ggml_cuda_negative_infinity();
         for (int idst = 0; idst < DSV4_HC; ++idst) {
             const int idx = idst + DSV4_HC*isrc;
             const float v = mixes[(comb_offset + idx)*sm0 + it*sm1] * scale_comb + base[(comb_offset + idx)*sb0];

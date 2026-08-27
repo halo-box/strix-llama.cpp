@@ -10,7 +10,9 @@ layout (constant_id =  5) const uint32_t Clamp = 0;
 layout (constant_id =  6) const uint32_t D_split = 16;
 layout (constant_id =  7) const uint32_t row_split = 1;
 layout (constant_id =  8) const uint32_t SubGroupSize = 32;
-layout (constant_id =  9) const uint32_t SHMEM_STAGING = 0;
+layout (constant_id =  9) const uint32_t SHMEM_STAGING = 0; // 0=none, 1=K+V, 2=K-only
+#define K_SHMEM_STAGING ((SHMEM_STAGING == 1u) || (SHMEM_STAGING == 2u))
+#define V_SHMEM_STAGING (SHMEM_STAGING == 1u)
 layout (constant_id = 10) const uint32_t Flags = 0;
 layout (constant_id = 11) const uint32_t LIMIT_OCCUPANCY_SHMEM = 0;
 // ggml_type enumerant for K/V
@@ -107,6 +109,16 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 // through dequantize4 / the MMQ helpers to unpack from the packed block layout.
 #define USE_DECODE_K (FaTypeK != FA_TYPE_F16)
 #define USE_DECODE_V (FaTypeV != FA_TYPE_F16)
+
+// ROCm quant V types that keep packed i8 in vblocksh and apply scale at Pf multiply.
+#define FA_V_MMQ_TYPE(ty) ((ty) == FA_TYPE_Q4_0_ROCMFP4 || (ty) == FA_TYPE_Q4_0_ROCMFP4_FAST || \
+                           (ty) == FA_TYPE_Q3_0_ROCMFPX || (ty) == FA_TYPE_Q6_0_ROCMFPX || \
+                           (ty) == FA_TYPE_Q8_0_ROCMFPX)
+#ifdef MMQ
+#define USE_V_MMQ FA_V_MMQ_TYPE(FaTypeV)
+#else
+#define USE_V_MMQ false
+#endif
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 

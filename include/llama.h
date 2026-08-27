@@ -157,6 +157,27 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
 
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4               = 100,
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN          = 101,
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT      = 102,
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST          = 103,
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT = 104,
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX         = 105,
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN    = 106,
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX               = 110,
+        LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX               = 111,
+        LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX               = 112,
+        LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT         = 113,
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT         = 114,
+        LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT         = 115,
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_LEAN    = 116,
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_SPEED   = 117,
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_STRIX_QUALITY = 118,
+        LLAMA_FTYPE_MOSTLY_Q7_0_ROCMFPX               = 119,
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN          = 120,
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN    = 121,
+        LLAMA_FTYPE_MOSTLY_Q2_0_ROCMFPX               = 122,
+
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
 
@@ -935,6 +956,34 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // Owns the device buffers backing one sequence-state snapshot. Supplying
+    // distinct storage objects keeps multiple ON_DEVICE checkpoints independent.
+    struct llama_state_seq_storage;
+
+    LLAMA_API struct llama_state_seq_storage * llama_state_seq_storage_init(void);
+    LLAMA_API struct llama_state_seq_storage * llama_state_seq_storage_clone(
+            const struct llama_state_seq_storage * storage);
+    LLAMA_API void llama_state_seq_storage_free(
+            struct llama_state_seq_storage * storage);
+    LLAMA_API size_t llama_state_seq_storage_size(
+            const struct llama_state_seq_storage * storage);
+
+    LLAMA_API size_t llama_state_seq_get_data_ext_storage(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+    struct llama_state_seq_storage * storage);
+
+    LLAMA_API size_t llama_state_seq_set_data_ext_storage(
+            struct llama_context * ctx,
+                   const uint8_t * src,
+                          size_t   size,
+                    llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags,
+      const struct llama_state_seq_storage * storage);
 
     //
     // Decoding

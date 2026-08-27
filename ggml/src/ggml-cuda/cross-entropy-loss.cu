@@ -14,7 +14,7 @@ static __global__ void cross_entropy_loss_f32(
     labels += int64_t(blockIdx.x)*nclasses;
 
     // Find maximum for softmax:
-    float max_logit = -INFINITY;
+    float max_logit = ggml_cuda_negative_infinity();
     for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
         const float val = logits[i];
         max_logit = fmaxf(max_logit, val);
@@ -59,7 +59,7 @@ static __global__ void cross_entropy_loss_back_f32(
     labels += int64_t(blockIdx.x)*nclasses;
     dst    += int64_t(blockIdx.x)*nclasses;
 
-    float maxval = -INFINITY;
+    float maxval = ggml_cuda_negative_infinity();
     for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
         const float val = logits[i];
         maxval = fmaxf(maxval, val);

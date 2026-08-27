@@ -16,7 +16,7 @@ struct topk_moe_config {
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
-    float max_val = -INFINITY;
+    float max_val = ggml_cuda_negative_infinity();
 
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
@@ -64,7 +64,7 @@ __device__ void sigmoid_warp_inplace(float (&vals)[experts_per_thread], const in
     for (int i = 0; i < experts_per_thread; i++) {
         const int  idx    = lane + i * WARP_SIZE;
         const bool active = !use_limit || (idx < limit);
-        vals[i]           = active ? 1.f / (1.f + expf(-vals[i])) : -INFINITY;
+        vals[i]           = active ? 1.f / (1.f + expf(-vals[i])) : ggml_cuda_negative_infinity();
     }
 }
 
@@ -74,7 +74,7 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
     for (int i = 0; i < experts_per_thread; i++) {
         const int  idx    = lane + i * WARP_SIZE;
         const bool active = !use_limit || (idx < limit);
-        vals[i]           = active ? sqrtf(vals[i] > 20.0f ? vals[i] : logf(1.0f + expf(vals[i]))) : -INFINITY;
+        vals[i]           = active ? sqrtf(vals[i] > 20.0f ? vals[i] : logf(1.0f + expf(vals[i]))) : ggml_cuda_negative_infinity();
     }
 }
 
@@ -113,14 +113,14 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     // Initialize all slots to -INFINITY
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
-        wt[i] = -INFINITY;
+        wt[i] = ggml_cuda_negative_infinity();
     }
 
     ggml_cuda_pdl_sync();
 #pragma unroll
     for (int i = 0; i < n_experts; i += WARP_SIZE) {
         const int expert  = i + threadIdx.x;
-        wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
+        wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : ggml_cuda_negative_infinity();
     }
 
     if (!config.delayed_softmax) {
@@ -152,13 +152,13 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     if constexpr (has_bias) {
 #pragma unroll
         for (int i = 0; i < experts_per_thread; i++) {
-            selection_wt[i] = -INFINITY;
+            selection_wt[i] = ggml_cuda_negative_infinity();
         }
 #pragma unroll
         for (int i = 0; i < n_experts; i += WARP_SIZE) {
             const int expert = i + threadIdx.x;
             selection_wt[i / WARP_SIZE] =
-                (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : -INFINITY;
+                (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : ggml_cuda_negative_infinity();
         }
     }
 
@@ -206,7 +206,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
             }
 
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                selection_wt[max_expert / WARP_SIZE] = -INFINITY;
+                selection_wt[max_expert / WARP_SIZE] = ggml_cuda_negative_infinity();
             }
         } else {
 #pragma unroll
@@ -229,7 +229,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
             }
 
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                wt[max_expert / WARP_SIZE] = -INFINITY;
+                wt[max_expert / WARP_SIZE] = ggml_cuda_negative_infinity();
             }
         }
 
@@ -371,7 +371,7 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
 
     const bool with_norm = clamp != nullptr;
 
-    float clamp_val = -INFINITY;
+    float clamp_val = 0.0f;
     if (clamp) {
         clamp_val = ggml_get_op_params_f32(clamp, 0);
     }

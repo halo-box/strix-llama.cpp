@@ -61,11 +61,18 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+list(APPEND GGML_SOURCES_ROCM
+    "../../rocmfp4/rocmfp4_hip.cu"
+    "fattn-kv-batched.cu"
+    "fattn-vec-turbo-mixed.cu")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
+# Q2_0 MMQ landed after the ROCmFPX MMQ fork and needs a separate forward
+# port. Keep Q2_0 on the supported dequantize/BLAS path for now.
+list(FILTER SRCS EXCLUDE REGEX "mmq-instance-q2_0\\.cu$")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
@@ -78,8 +85,15 @@ else()
     list(APPEND GGML_SOURCES_ROCM
         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0_rocmfp4-q4_0_rocmfp4.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0_rocmfp4_fast-q4_0_rocmfp4_fast.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q3_0_rocmfpx-q3_0_rocmfpx.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q6_0_rocmfpx-q6_0_rocmfpx.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0_rocmfpx-q8_0_rocmfpx.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu)
 endif()
 
 ggml_add_backend_library(ggml-hip
@@ -94,7 +108,7 @@ endif()
 
 add_compile_definitions(GGML_USE_HIP)
 
-if (GGML_CUDA_FORCE_MMQ)
+if (GGML_HIP_FORCE_MMQ OR GGML_CUDA_FORCE_MMQ)
     add_compile_definitions(GGML_CUDA_FORCE_MMQ)
 endif()
 
@@ -151,3 +165,5 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+target_compile_options(ggml-hip PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:-ffast-math>")

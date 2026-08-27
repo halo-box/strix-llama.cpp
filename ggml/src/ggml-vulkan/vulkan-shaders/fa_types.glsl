@@ -12,6 +12,14 @@
 #define FA_TYPE_Q8_0  8u
 #define FA_TYPE_IQ4_NL 20u
 #define FA_TYPE_BF16 30u
+#define FA_TYPE_Q1_0 41u
+#define FA_TYPE_Q4_0_ROCMFP4      100u
+#define FA_TYPE_Q4_0_ROCMFP4_FAST 101u
+#define FA_TYPE_Q6_0_ROCMFPX      102u
+#define FA_TYPE_Q8_0_ROCMFPX      103u
+#define FA_TYPE_Q3_0_ROCMFPX      104u
+#define FA_TYPE_TURBO3_0          105u
+#define FA_TYPE_TURBO4_0          106u
 
 // Number of matrix elements per buffer block, derived from the K/V type spec
 // constant. F32 is treated as a vec4 "block" of 4 floats. F16 uses block size 1
@@ -27,6 +35,16 @@ uint fa_block_elems(uint ty) {
         case FA_TYPE_Q8_0: return uint(QUANT_K_Q8_0);
         case FA_TYPE_IQ4_NL: return uint(QUANT_K_IQ4_NL);
         case FA_TYPE_BF16: return 1u;
+        case FA_TYPE_Q1_0: return uint(QUANT_K_Q1_0);
+        case FA_TYPE_Q4_0_ROCMFP4:
+        case FA_TYPE_Q4_0_ROCMFP4_FAST:
+            return uint(QUANT_K_ROCMFP4);
+        case FA_TYPE_Q3_0_ROCMFPX:
+        case FA_TYPE_Q6_0_ROCMFPX:
+        case FA_TYPE_Q8_0_ROCMFPX:
+            return uint(QUANT_K_ROCMFPX_FP8);
+        case FA_TYPE_TURBO3_0: return uint(QUANT_K_TURBO3_0);
+        case FA_TYPE_TURBO4_0: return uint(QUANT_K_TURBO4_0);
         default:           return 1u;
     }
 }
@@ -41,6 +59,11 @@ uint fa_quant_r_mmq(uint ty) {
         case FA_TYPE_Q5_0: return uint(QUANT_R_Q5_0);
         case FA_TYPE_Q5_1: return uint(QUANT_R_Q5_1);
         case FA_TYPE_Q8_0: return uint(QUANT_R_Q8_0);
+        case FA_TYPE_Q4_0_ROCMFP4:
+        case FA_TYPE_Q4_0_ROCMFP4_FAST:
+        case FA_TYPE_Q3_0_ROCMFPX:
+        case FA_TYPE_Q6_0_ROCMFPX:
+        case FA_TYPE_Q8_0_ROCMFPX: return 1u;
         default:           return 1u;
     }
 }
@@ -48,6 +71,11 @@ uint fa_quant_r_mmq(uint ty) {
 bool fa_type_needs_shmem(uint ty) {
     switch (ty) {
         case FA_TYPE_IQ4_NL: return true;
+#if defined(FA_ROCMFPX_FAMILY)
+        case FA_TYPE_Q3_0_ROCMFPX:
+        case FA_TYPE_Q6_0_ROCMFPX:
+        case FA_TYPE_Q8_0_ROCMFPX: return true;
+#endif
         default:             return false;
     }
 }
