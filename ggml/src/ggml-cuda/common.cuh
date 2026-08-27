@@ -1570,6 +1570,27 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
+    // The ROCmFPX split-buffer paths still drive several devices from one context and
+    // need a handle for a device other than this->device, which upstream's zero-argument
+    // accessor cannot express. Mirrors the pool(int)/pool() pair directly below.
+    cublasHandle_t cublas_handle(int dev) {
+        if (cublas_handles[dev][curr_stream_no] == nullptr) {
+            ggml_cuda_set_device(dev);
+            CUBLAS_CHECK(cublasCreate(&cublas_handles[dev][curr_stream_no]));
+            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[dev][curr_stream_no], CUBLAS_TF32_TENSOR_OP_MATH));
+            CUBLAS_CHECK(cublasSetStream(cublas_handles[dev][curr_stream_no], stream(dev, curr_stream_no)));
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUBLAS_VER_MAJOR > 11 || (CUBLAS_VER_MAJOR == 11 && CUBLAS_VER_MINOR >= 2))
+            if (cublas_workspace_sizes[dev] == 0) {
+                const int cc = ggml_cuda_info().devices[dev].cc;
+                cublas_workspace_sizes[dev] = (cc >= GGML_CUDA_CC_HOPPER) ? 32 * 1024 * 1024 : 4 * 1024 * 1024;
+            }
+            CUDA_CHECK(cudaMalloc(&cublas_workspaces[dev][curr_stream_no], cublas_workspace_sizes[dev]));
+            CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[dev][curr_stream_no], cublas_workspaces[dev][curr_stream_no], cublas_workspace_sizes[dev]));
+#endif
+        }
+        return cublas_handles[dev][curr_stream_no];
+    }
+
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);
