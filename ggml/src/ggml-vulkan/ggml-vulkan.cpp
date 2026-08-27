@@ -9508,6 +9508,12 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     if (src0_type == GGML_TYPE_Q6_K && !mmvq_q6) {
         return false;
     }
+    // q8_0 with two columns through the q8_1 integer-dot path: 272-336 us against 17.5 us
+    // for the f32 path on the same 320x10240 (Strix Halo / RADV, GGML_VK_PERF_LOGGER),
+    // 824 vs 146 us on 12288x2560. Every other column count of q8_0 is fine on it.
+    if (src0_type == GGML_TYPE_Q8_0 && n == 2 && device->vendor_id == VK_VENDOR_ID_AMD) {
+        return false;
+    }
 
     // MMVQ is generally good for batches
     if (n > 1) {
@@ -9576,7 +9582,7 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     GGML_UNUSED(m);
 }
 
-static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, uint32_t col0, uint32_t ncols, bool allow_quantize_y) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -9594,7 +9600,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const uint64_t ne03 = src0->ne[3];
 
     const uint64_t ne10 = src1->ne[0];
-    const uint64_t ne11 = src1->ne[1];
+    const uint64_t ne11 = ncols;   // a chunk of src1's columns starting at col0 (see ggml_vk_mul_mat_vec_q_f16)
     const uint64_t ne12 = src1->ne[2];
     const uint64_t ne13 = src1->ne[3];
 
@@ -9615,7 +9621,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
+    bool quantize_y = allow_quantize_y && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -9694,6 +9700,12 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
     vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
     vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
+    if (col0 > 0) {
+        const uint64_t off_y = (uint64_t) col0 * src1->nb[1];
+        const uint64_t off_d = (uint64_t) col0 * dst->nb[1];
+        d_Qy.offset += off_y; d_Qy.size -= off_y;
+        d_D.offset  += off_d; d_D.size  -= off_d;
+    }
     vk_subbuffer d_X, d_Y;
 
     if (qx_needs_dequant) {
@@ -9817,6 +9829,66 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     if (y_non_contig || quantize_y) {
         ctx->prealloc_y_need_sync = true;
     }
+}
+
+
+// Column chunking for batched mat-vec. On Strix Halo (RADV, Mesa 26.1) the NUM_COLS
+// shader variants for 3, 5 and 6 columns -- and 4 for q4_K -- run several times slower
+// per call than 1, 2 and 4. Measured with GGML_VK_PERF_LOGGER on Qwen3.8-Flash-Next:
+// q8_0 10240x2560 122 us at n=1, 127 at 2, 129 at 4, but 734 at 3, 1177 at 5, 360 at 6;
+// the q6_K LM head (248320x2560) 2.24 ms at n=1, 2 and 4, but 12.8 at 3 and 18.5 at 5;
+// q4_K 12288x2560 85 us at n=1, 180 at 4, 290 at 6. Speculative verification runs at
+// n=2..6, so such batches are dispatched as chunks of column counts measured to scale,
+// at the cost of re-reading the weights once per chunk. Chunks never take the q8_1
+// integer-dot path (its prealloc cache is keyed by tensor, not by column; and that path
+// has the same pathology). GGML_VK_MMV_NO_SPLIT=1 restores the single dispatch.
+static uint32_t ggml_vk_mmv_good_cols(ggml_type type, uint32_t n) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q6_K:
+            return n >= 4 ? 4 : (n >= 2 ? 2 : 1);
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
+            return n >= 2 ? 2 : 1;
+        default:
+            return n;   // f32/f16/bf16 and the i-quants: no pathology measured
+    }
+}
+
+// Batches of 9..16 columns of a quantized weight also go through chunked mat-vec: the
+// mat-mat kernels are far slower at these widths on this GPU (q8_0 320x10240 at n=21:
+// 756 us against 17.5 us per mat-vec column), and this is where several concurrent
+// slots with speculative verification land. Mirrors the conditions the chunk path needs.
+static constexpr uint32_t mul_mat_vec_chunk_max_cols = 16;
+static bool ggml_vk_mmv_can_chunk(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const bool no_split = getenv("GGML_VK_MMV_NO_SPLIT") != nullptr;
+    return !no_split && ggml_is_quantized(src0->type) &&
+           dst->ne[1] > mul_mat_vec_max_cols && dst->ne[1] <= mul_mat_vec_chunk_max_cols &&
+           src1->ne[2] * src1->ne[3] == 1 && src1->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ctx->num_additional_fused_ops == 0;
+}
+
+static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const uint32_t ne11 = (uint32_t) src1->ne[1];
+
+    static const bool no_split = getenv("GGML_VK_MMV_NO_SPLIT") != nullptr;
+    const bool plain = ne11 > 1 && src1->ne[2] * src1->ne[3] == 1 &&
+                       src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+                       ctx->num_additional_fused_ops == 0;
+    GGML_ASSERT(ne11 <= mul_mat_vec_max_cols || plain);
+    if (!no_split && plain && std::min(ggml_vk_mmv_good_cols(src0->type, ne11), mul_mat_vec_max_cols) < ne11) {
+        uint32_t col0 = 0;
+        while (col0 < ne11) {
+            const uint32_t n = std::min(ggml_vk_mmv_good_cols(src0->type, ne11 - col0), mul_mat_vec_max_cols);
+            ggml_vk_mul_mat_vec_q_f16_cols(ctx, subctx, cgraph, node_idx, col0, n, /*allow_quantize_y=*/ false);
+            col0 += n;
+        }
+        return;
+    }
+    ggml_vk_mul_mat_vec_q_f16_cols(ctx, subctx, cgraph, node_idx, 0, ne11, /*allow_quantize_y=*/ true);
 }
 
 static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -10123,7 +10195,8 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
+    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1) ||
+                ggml_vk_mmv_can_chunk(ctx, src0, src1, dst)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
