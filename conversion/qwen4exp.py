@@ -66,8 +66,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
+        # one entry per block INCLUDING nextn layers, or the loader rejects the array
+        # length. The MTP block gets 0: it carries indexer weights but the draft graph
+        # gates QSA off and runs dense (deepseek32's MTP precedent), so it has no
+        # compression stride of its own.
+        n_mtp = self.block_count - n_layer
         self.gguf_writer.add_attention_compress_ratios(
             [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+            + [0] * n_mtp
         )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
