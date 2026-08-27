@@ -5510,6 +5510,13 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    Q4_0_ROCMFP4      = 100
+    Q4_0_ROCMFP4_FAST = 101
+    Q6_0_ROCMFPX      = 102
+    Q8_0_ROCMFPX      = 103
+    Q3_0_ROCMFPX      = 104
+    Q7_0_ROCMFPX      = 107
+    Q2_0_ROCMFPX      = 108
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -5566,6 +5573,26 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_Q4_0_ROCMFP4          = 100
+    MOSTLY_Q4_0_ROCMFP4_LEAN     = 101
+    MOSTLY_Q4_0_ROCMFP4_COHERENT = 102
+    MOSTLY_Q4_0_ROCMFP4_FAST     = 103
+    MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT = 104
+    MOSTLY_Q4_0_ROCMFP4_STRIX    = 105
+    MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN = 106
+    MOSTLY_Q6_0_ROCMFPX          = 110
+    MOSTLY_Q8_0_ROCMFPX          = 111
+    MOSTLY_Q3_0_ROCMFPX          = 112
+    MOSTLY_Q3_0_ROCMFPX_AGENT    = 113
+    MOSTLY_Q6_0_ROCMFPX_AGENT    = 114
+    MOSTLY_Q8_0_ROCMFPX_AGENT    = 115
+    MOSTLY_Q6_0_ROCMFPX_STRIX_LEAN = 116
+    MOSTLY_Q6_0_ROCMFPX_STRIX_SPEED = 117
+    MOSTLY_Q6_0_ROCMFPX_STRIX_QUALITY = 118
+    MOSTLY_Q7_0_ROCMFPX          = 119
+    MOSTLY_Q6_0_ROCMFPX_LEAN     = 120
+    MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN = 121
+    MOSTLY_Q2_0_ROCMFPX          = 122
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -5702,6 +5729,13 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.Q4_0_ROCMFP4:      (32, 2 + 16),
+    GGMLQuantizationType.Q4_0_ROCMFP4_FAST: (32, 1 + 16),
+    GGMLQuantizationType.Q6_0_ROCMFPX:      (32, 24 + 2),
+    GGMLQuantizationType.Q8_0_ROCMFPX:      (32, 32 + 1),
+    GGMLQuantizationType.Q3_0_ROCMFPX:      (32, 12 + 2),
+    GGMLQuantizationType.Q7_0_ROCMFPX:      (256, 224 + 16),
+    GGMLQuantizationType.Q2_0_ROCMFPX:      (32, 8 + 2),
 }
 
 

@@ -11,7 +11,22 @@ find_package(Vulkan COMPONENTS glslc REQUIRED)
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
 endif()
-find_package(SPIRV-Headers CONFIG REQUIRED)
+find_package(SPIRV-Headers CONFIG QUIET)
+if (NOT TARGET SPIRV-Headers::SPIRV-Headers)
+    find_path(GGML_VULKAN_SPIRV_HEADERS_INCLUDE_DIR
+        NAMES
+            spirv/unified1/spirv.hpp
+            spirv-headers/spirv.hpp
+            spirv.hpp
+        HINTS
+            ${Vulkan_INCLUDE_DIRS}
+            "$ENV{VULKAN_SDK}/Include"
+    )
+    if (NOT GGML_VULKAN_SPIRV_HEADERS_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "SPIR-V headers were not found. Install SPIRV-Headers or a complete Vulkan SDK.")
+    endif()
+endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     # Parallel build object files
@@ -111,6 +126,11 @@ if (Vulkan_FOUND)
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    if (TARGET SPIRV-Headers::SPIRV-Headers)
+        target_link_libraries(ggml-vulkan PRIVATE SPIRV-Headers::SPIRV-Headers)
+    else()
+        target_include_directories(ggml-vulkan PRIVATE ${GGML_VULKAN_SPIRV_HEADERS_INCLUDE_DIR})
+    endif()
 
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector

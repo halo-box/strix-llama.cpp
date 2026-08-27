@@ -430,7 +430,16 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q4_0_ROCMFP4      = 100, // ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
+        GGML_TYPE_Q4_0_ROCMFP4_FAST = 101, // ROCmFP4 single-scale speed layout
+        GGML_TYPE_Q6_0_ROCMFPX      = 102, // ROCmFPX experimental 6-bit UE4M3-scale reference layout
+        GGML_TYPE_Q8_0_ROCMFPX      = 103, // ROCmFPX experimental 8-bit UE4M3-scale reference layout
+        GGML_TYPE_Q3_0_ROCMFPX      = 104, // ROCmFPX experimental 3-bit UE4M3-scale reference layout
+        GGML_TYPE_TURBO3_0          = 105, // TurboQuant 3-bit KV cache (3.5 bpw)
+        GGML_TYPE_TURBO4_0          = 106, // TurboQuant 4-bit KV cache (4.5 bpw)
+        GGML_TYPE_Q7_0_ROCMFPX      = 107, // ROCmFPX packed signed-Q7 + FP16 group scales
+        GGML_TYPE_Q2_0_ROCMFPX      = 108, // ROCmFPX 2-bit S40 codebook + dual UE4M3 scales
+        GGML_TYPE_COUNT             = 109,
     };
 
     // precision
@@ -475,6 +484,18 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4               = 100,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN          = 101,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT      = 102,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST          = 103,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT = 104,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX         = 105,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN    = 106,
+        GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX               = 110,
+        GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX               = 111,
+        GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX               = 112,
+        GGML_FTYPE_MOSTLY_Q7_0_ROCMFPX               = 119,
+        GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX               = 122,
     };
 
     // available tensor operations:

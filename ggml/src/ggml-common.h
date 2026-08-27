@@ -226,6 +226,26 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+// TurboQuant 3-bit KV-cache quantization (3.5 bpw)
+#define TURBO3_BLOCK_SIZE 32
+#define QK_TURBO3 32
+#define QR_TURBO3 2
+typedef struct {
+    ggml_half d;        // FP16 L2-norm
+    uint8_t qs[12];     // 32 x 3-bit packed indices
+} block_turbo3_0;
+static_assert(sizeof(block_turbo3_0) == 14, "wrong turbo3 block size");
+
+// TurboQuant 4-bit KV-cache quantization (4.5 bpw)
+#define TURBO4_BLOCK_SIZE 32
+#define QK_TURBO4 32
+#define QR_TURBO4 2
+typedef struct {
+    ggml_half d;        // FP16 L2-norm
+    uint8_t qs[16];     // 32 x 4-bit packed indices
+} block_turbo4_0;
+static_assert(sizeof(block_turbo4_0) == 18, "wrong turbo4 block size");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -1127,6 +1147,14 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
 #define kvalues_mxfp4 kvalues_fp4
+
+// ROCmFP4 uses an E2M1-derived value set with the largest level retuned from
+// 12 to 10, plus dual half-block UE4M3 scales. Keeping this separate from
+// MXFP4 lets the experimental Strix Halo format evolve without changing stock
+// MXFP4/NVFP4 behavior.
+GGML_TABLE_BEGIN(int8_t, kvalues_rocmfp4, 16)
+    0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10,
+GGML_TABLE_END()
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f

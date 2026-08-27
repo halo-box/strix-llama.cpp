@@ -5,6 +5,8 @@
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
+#include "../rocmfp4/rocmfp4.h"
+#include "../rocmfpx/rocmfpx.h"
 
 #include <math.h>
 #include <string.h>
@@ -12,10 +14,6 @@
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
-
-#ifdef GGML_USE_OPENMP
-#include <omp.h>
-#endif
 
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
@@ -276,6 +274,10 @@ void quantize_row_q5_1_ref(const float * GGML_RESTRICT x, block_q5_1 * GGML_REST
 void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK8_0 == 0);
     const int nb = k / QK8_0;
+    const char * safe_search_env = getenv("GGML_Q8_0_SAFE_SCALE_SEARCH");
+    const bool safe_search = safe_search_env != NULL &&
+        safe_search_env[0] != '\0' &&
+        strcmp(safe_search_env, "0") != 0;
 
     for (int i = 0; i < nb; i++) {
         float amax = 0.0f; // absolute max
@@ -294,6 +296,78 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
             const float x0 = x[i*QK8_0 + j]*id;
 
             y[i].qs[j] = roundf(x0);
+        }
+
+        if (!safe_search || amax == 0.0f || !isfinite(amax)) {
+            continue;
+        }
+
+        // Offline-only Q8_0 scale search.  Each accepted candidate has lower
+        // block SSE without increasing that block's maximum absolute error.
+        // The wire format and all inference kernels remain ordinary Q8_0.
+        const float baseline_scale = GGML_FP16_TO_FP32(y[i].d);
+        double best_sse = 0.0;
+        double baseline_max_error = 0.0;
+        for (int j = 0; j < QK8_0; ++j) {
+            const double error = (double) x[i*QK8_0 + j] -
+                (double) baseline_scale * y[i].qs[j];
+            best_sse += error * error;
+            baseline_max_error = MAX(baseline_max_error, fabs(error));
+        }
+
+        float signed_amax = 0.0f;
+        for (int j = 0; j < QK8_0; ++j) {
+            const float value = x[i*QK8_0 + j];
+            if (fabsf(value) > fabsf(signed_amax)) {
+                signed_amax = value;
+            }
+        }
+
+        for (int denominator = 96; denominator <= 136; denominator += 2) {
+            float scale = -signed_amax / denominator;
+            ggml_fp16_t stored_scale = GGML_FP32_TO_FP16(scale);
+            int8_t codes[QK8_0] = { 0 };
+
+            for (int iteration = 0; iteration < 3; ++iteration) {
+                const float inverse_scale = scale != 0.0f ? 1.0f/scale : 0.0f;
+                double numerator = 0.0;
+                double denominator2 = 0.0;
+                for (int j = 0; j < QK8_0; ++j) {
+                    int code = (int) roundf(x[i*QK8_0 + j] * inverse_scale);
+                    code = MAX(-128, MIN(127, code));
+                    codes[j] = (int8_t) code;
+                    numerator += (double) x[i*QK8_0 + j] * code;
+                    denominator2 += (double) code * code;
+                }
+                if (!(denominator2 > 0.0)) {
+                    scale = 0.0f;
+                    break;
+                }
+                stored_scale = GGML_FP32_TO_FP16(
+                    (float) (numerator / denominator2));
+                scale = GGML_FP16_TO_FP32(stored_scale);
+                if (scale == 0.0f || !isfinite(scale)) {
+                    break;
+                }
+            }
+            if (scale == 0.0f || !isfinite(scale)) {
+                continue;
+            }
+
+            double candidate_sse = 0.0;
+            double candidate_max_error = 0.0;
+            for (int j = 0; j < QK8_0; ++j) {
+                const double error = (double) x[i*QK8_0 + j] -
+                    (double) scale * codes[j];
+                candidate_sse += error * error;
+                candidate_max_error = MAX(candidate_max_error, fabs(error));
+            }
+            if (candidate_sse < best_sse &&
+                    candidate_max_error <= baseline_max_error) {
+                best_sse = candidate_sse;
+                y[i].d = stored_scale;
+                memcpy(y[i].qs, codes, QK8_0);
+            }
         }
     }
 }
@@ -609,6 +683,346 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
             }
         }
     }
+}
+
+// ============================================================
+// TurboQuant codebook data (Lloyd-Max optimal for d=128 after WHT)
+// ============================================================
+
+static const float turbo_codebook_3bit[8] = {
+    -0.1883972972f, -0.1181399059f, -0.0665857641f, -0.0216044751f,
+     0.0216041461f,  0.0665854520f,  0.1181396281f,  0.1883970748f
+};
+
+static const float turbo_codebook_4bit[16] = {
+    -0.2376389871f, -0.1808080141f, -0.1417777640f, -0.1102646123f,
+    -0.0828112376f, -0.0577640422f, -0.0341540905f, -0.0113168380f,
+     0.0112761586f,  0.0341139667f,  0.0577250301f,  0.0827738972f,
+     0.1102295202f,  0.1417455465f,  0.1807794468f,  0.2376153882f
+};
+
+// ============================================================
+// TurboQuant helper: pack/unpack bit-packed indices
+// ============================================================
+
+static void turbo_pack3(const uint8_t *indices, uint8_t *out) {
+    // Pack 32 x 3-bit values into 12 bytes (96 bits)
+    memset(out, 0, 12);
+    for (int i = 0; i < 32; i++) {
+        int bit_off = i * 3;
+        int byte_idx = bit_off / 8;
+        int shift = bit_off % 8;
+        out[byte_idx] |= (uint8_t)((indices[i] & 0x07) << shift);
+        if (shift > 5 && byte_idx + 1 < 12) {
+            out[byte_idx + 1] |= (uint8_t)((indices[i] & 0x07) >> (8 - shift));
+        }
+    }
+}
+
+static void turbo_unpack3(const uint8_t *packed, uint8_t *indices) {
+    // Unpack 12 bytes into 32 x 3-bit values
+    for (int i = 0; i < 32; i++) {
+        int bit_off = i * 3;
+        int byte_idx = bit_off / 8;
+        int shift = bit_off % 8;
+        uint16_t raw = (uint16_t)packed[byte_idx] >> shift;
+        if (shift > 5 && byte_idx + 1 < 12) {
+            raw |= (uint16_t)packed[byte_idx + 1] << (8 - shift);
+        }
+        indices[i] = (uint8_t)(raw & 0x07);
+    }
+}
+
+static void turbo_pack4(const uint8_t *indices, uint8_t *out) {
+    // Pack 32 x 4-bit values into 16 bytes
+    for (int i = 0; i < 16; i++) {
+        out[i] = (indices[2*i] & 0x0F) | ((indices[2*i + 1] & 0x0F) << 4);
+    }
+}
+
+static void turbo_unpack4(const uint8_t *packed, uint8_t *indices) {
+    // Unpack 16 bytes into 32 x 4-bit values
+    for (int i = 0; i < 16; i++) {
+        indices[2*i]     = packed[i] & 0x0F;
+        indices[2*i + 1] = (packed[i] >> 4) & 0x0F;
+    }
+}
+
+static uint8_t turbo_quantize_scalar(float val, const float *codebook, int n_codes) {
+    // Find nearest codebook entry (linear scan - codebook is sorted)
+    float best_dist = fabsf(val - codebook[0]);
+    uint8_t best_idx = 0;
+    for (int i = 1; i < n_codes; i++) {
+        float dist = fabsf(val - codebook[i]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx = (uint8_t)i;
+        }
+    }
+    return best_idx;
+}
+
+// ============================================================
+// TurboQuant FWHT (Fast Walsh-Hadamard Transform)
+// Self-inverse with 1/sqrt(n) normalization.
+// ============================================================
+
+#define TURBO_HEAD_DIM 128
+#define TURBO_BLOCKS_PER_CHUNK (TURBO_HEAD_DIM / 32)  // 4 blocks of 32 = 128
+
+static void turbo_fwht_f32(float *x, int n) {
+    // Butterfly sums
+    for (int h = 1; h < n; h *= 2) {
+        for (int i = 0; i < n; i += h * 2) {
+            for (int j = i; j < i + h; j++) {
+                float a = x[j];
+                float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    // Normalize by 1/sqrt(n)
+    float scale = 1.0f / sqrtf((float)n);
+    for (int i = 0; i < n; i++) {
+        x[i] *= scale;
+    }
+}
+
+// ============================================================
+// TurboQuant TURBO3_0 (3-bit, 3.5 bpw)
+// ============================================================
+
+void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT src, block_turbo3_0 * GGML_RESTRICT dst, int64_t k) {
+    assert(k % TURBO3_BLOCK_SIZE == 0);
+    assert(k % TURBO_HEAD_DIM == 0);
+
+    float tmp[TURBO_HEAD_DIM];
+    int64_t blocks_done = 0;
+
+    for (int64_t offset = 0; offset < k; offset += TURBO_HEAD_DIM) {
+        // Step 1: Compute L2 norm of this head_dim chunk
+        float sum_sq = 0.0f;
+        for (int i = 0; i < TURBO_HEAD_DIM; i++) {
+            sum_sq += src[offset + i] * src[offset + i];
+        }
+        float norm = sqrtf(sum_sq);
+
+        // Step 2: Normalize the chunk
+        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+        for (int i = 0; i < TURBO_HEAD_DIM; i++) {
+            tmp[i] = src[offset + i] * inv_norm;
+        }
+
+        // Step 3: Apply FWHT rotation
+        turbo_fwht_f32(tmp, TURBO_HEAD_DIM);
+
+        // Step 4: Scalar quantize + pack, one block at a time
+        for (int blk = 0; blk < TURBO_BLOCKS_PER_CHUNK; blk++) {
+            uint8_t indices[32];
+            for (int i = 0; i < TURBO3_BLOCK_SIZE; i++) {
+                indices[i] = turbo_quantize_scalar(tmp[blk * TURBO3_BLOCK_SIZE + i], turbo_codebook_3bit, 8);
+            }
+            // Store same norm in every block of this chunk
+            dst[blocks_done].d = GGML_FP32_TO_FP16(norm);
+            turbo_pack3(indices, dst[blocks_done].qs);
+            blocks_done++;
+        }
+    }
+}
+
+static void quantize_row_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_turbo3_0_ref(src, (block_turbo3_0 *)dst, k);
+}
+
+void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % TURBO3_BLOCK_SIZE == 0);
+    const int64_t num_blocks = k / TURBO3_BLOCK_SIZE;
+
+    // Pass 1: Unpack all blocks and look up centroids
+    for (int64_t b = 0; b < num_blocks; b++) {
+        uint8_t indices[32];
+        turbo_unpack3(x[b].qs, indices);
+        for (int i = 0; i < TURBO3_BLOCK_SIZE; i++) {
+            y[b * TURBO3_BLOCK_SIZE + i] = turbo_codebook_3bit[indices[i]];
+        }
+    }
+
+    // Pass 2: Inverse FWHT per head_dim chunk, then scale by norm
+    for (int64_t offset = 0; offset < k; offset += TURBO_HEAD_DIM) {
+        int chunk = TURBO_HEAD_DIM;
+        if (offset + chunk > k) chunk = (int)(k - offset);
+
+        // Inverse FWHT (self-inverse with 1/sqrt(n) normalization)
+        turbo_fwht_f32(y + offset, chunk);
+
+        // Read norm from the first block of this chunk
+        float norm = GGML_FP16_TO_FP32(x[offset / TURBO3_BLOCK_SIZE].d);
+        for (int i = 0; i < chunk; i++) {
+            y[offset + i] *= norm;
+        }
+    }
+}
+
+// ============================================================
+// TurboQuant TURBO4_0 (4-bit, 4.5 bpw)
+// ============================================================
+
+void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT src, block_turbo4_0 * GGML_RESTRICT dst, int64_t k) {
+    assert(k % TURBO4_BLOCK_SIZE == 0);
+    assert(k % TURBO_HEAD_DIM == 0);
+
+    float tmp[TURBO_HEAD_DIM];
+    int64_t blocks_done = 0;
+
+    for (int64_t offset = 0; offset < k; offset += TURBO_HEAD_DIM) {
+        // Step 1: Compute L2 norm of this head_dim chunk
+        float sum_sq = 0.0f;
+        for (int i = 0; i < TURBO_HEAD_DIM; i++) {
+            sum_sq += src[offset + i] * src[offset + i];
+        }
+        float norm = sqrtf(sum_sq);
+
+        // Step 2: Normalize the chunk
+        float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+        for (int i = 0; i < TURBO_HEAD_DIM; i++) {
+            tmp[i] = src[offset + i] * inv_norm;
+        }
+
+        // Step 3: Apply FWHT rotation
+        turbo_fwht_f32(tmp, TURBO_HEAD_DIM);
+
+        // Step 4: Scalar quantize + pack, one block at a time
+        for (int blk = 0; blk < TURBO_BLOCKS_PER_CHUNK; blk++) {
+            uint8_t indices[32];
+            for (int i = 0; i < TURBO4_BLOCK_SIZE; i++) {
+                indices[i] = turbo_quantize_scalar(tmp[blk * TURBO4_BLOCK_SIZE + i], turbo_codebook_4bit, 16);
+            }
+            // Store same norm in every block of this chunk
+            dst[blocks_done].d = GGML_FP32_TO_FP16(norm);
+            turbo_pack4(indices, dst[blocks_done].qs);
+            blocks_done++;
+        }
+    }
+}
+
+static void quantize_row_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t k) {
+    quantize_row_turbo4_0_ref(src, (block_turbo4_0 *)dst, k);
+}
+
+void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % TURBO4_BLOCK_SIZE == 0);
+    const int64_t num_blocks = k / TURBO4_BLOCK_SIZE;
+
+    // Pass 1: Unpack all blocks and look up centroids
+    for (int64_t b = 0; b < num_blocks; b++) {
+        uint8_t indices[32];
+        turbo_unpack4(x[b].qs, indices);
+        for (int i = 0; i < TURBO4_BLOCK_SIZE; i++) {
+            y[b * TURBO4_BLOCK_SIZE + i] = turbo_codebook_4bit[indices[i]];
+        }
+    }
+
+    // Pass 2: Inverse FWHT per head_dim chunk, then scale by norm
+    for (int64_t offset = 0; offset < k; offset += TURBO_HEAD_DIM) {
+        int chunk = TURBO_HEAD_DIM;
+        if (offset + chunk > k) chunk = (int)(k - offset);
+
+        // Inverse FWHT (self-inverse with 1/sqrt(n) normalization)
+        turbo_fwht_f32(y + offset, chunk);
+
+        // Read norm from the first block of this chunk
+        float norm = GGML_FP16_TO_FP32(x[offset / TURBO4_BLOCK_SIZE].d);
+        for (int i = 0; i < chunk; i++) {
+            y[offset + i] *= norm;
+        }
+    }
+}
+
+// ============================================================
+// TurboQuant vec_dot (for flash attention compatibility)
+// ============================================================
+
+void ggml_vec_dot_turbo3_0(int n, float * GGML_RESTRICT s, size_t bs,
+                            const void * GGML_RESTRICT vx, size_t bx,
+                            const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const block_turbo3_0 *x = (const block_turbo3_0 *)vx;
+    const float *y = (const float *)vy;
+
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);
+    GGML_ASSERT(n % TURBO_HEAD_DIM == 0);
+    GGML_ASSERT(nrc == 1);
+
+    // Dequantize x into temp buffer (includes inverse FWHT + norm scaling),
+    // then compute dot product with y.
+    float tmp[TURBO_HEAD_DIM];
+    float sum = 0.0f;
+
+    for (int64_t offset = 0; offset < n; offset += TURBO_HEAD_DIM) {
+        int chunk = TURBO_HEAD_DIM;
+        if (offset + chunk > n) chunk = (int)(n - offset);
+        int64_t base_block = offset / TURBO3_BLOCK_SIZE;
+
+        // Unpack + centroid lookup for this chunk
+        for (int blk = 0; blk < chunk / TURBO3_BLOCK_SIZE; blk++) {
+            uint8_t indices[32];
+            turbo_unpack3(x[base_block + blk].qs, indices);
+            for (int i = 0; i < TURBO3_BLOCK_SIZE; i++) {
+                tmp[blk * TURBO3_BLOCK_SIZE + i] = turbo_codebook_3bit[indices[i]];
+            }
+        }
+
+        // Inverse FWHT
+        turbo_fwht_f32(tmp, chunk);
+
+        // Scale by norm and accumulate dot product
+        float norm = GGML_FP16_TO_FP32(x[base_block].d);
+        for (int i = 0; i < chunk; i++) {
+            sum += tmp[i] * norm * y[offset + i];
+        }
+    }
+    *s = sum;
+}
+
+void ggml_vec_dot_turbo4_0(int n, float * GGML_RESTRICT s, size_t bs,
+                            const void * GGML_RESTRICT vx, size_t bx,
+                            const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const block_turbo4_0 *x = (const block_turbo4_0 *)vx;
+    const float *y = (const float *)vy;
+
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);
+    GGML_ASSERT(n % TURBO_HEAD_DIM == 0);
+    GGML_ASSERT(nrc == 1);
+
+    // Dequantize x into temp buffer (includes inverse FWHT + norm scaling),
+    // then compute dot product with y.
+    float tmp[TURBO_HEAD_DIM];
+    float sum = 0.0f;
+
+    for (int64_t offset = 0; offset < n; offset += TURBO_HEAD_DIM) {
+        int chunk = TURBO_HEAD_DIM;
+        if (offset + chunk > n) chunk = (int)(n - offset);
+        int64_t base_block = offset / TURBO4_BLOCK_SIZE;
+
+        // Unpack + centroid lookup for this chunk
+        for (int blk = 0; blk < chunk / TURBO4_BLOCK_SIZE; blk++) {
+            uint8_t indices[32];
+            turbo_unpack4(x[base_block + blk].qs, indices);
+            for (int i = 0; i < TURBO4_BLOCK_SIZE; i++) {
+                tmp[blk * TURBO4_BLOCK_SIZE + i] = turbo_codebook_4bit[indices[i]];
+            }
+        }
+
+        // Inverse FWHT
+        turbo_fwht_f32(tmp, chunk);
+
+        // Scale by norm and accumulate dot product
+        float norm = GGML_FP16_TO_FP32(x[base_block].d);
+        for (int i = 0; i < chunk; i++) {
+            sum += tmp[i] * norm * y[offset + i];
+        }
+    }
+    *s = sum;
 }
 
 //
@@ -3140,121 +3554,70 @@ void iq2xs_init_impl(enum ggml_type type) {
         }
         kmap_q2xs[index] = i;
     }
-    // The neighbour search runs in three passes:
-    //   1. Parallel: for each i, qsort and count its neighbours into n_per_i,
-    //      and reduce the totals (num_neighbors, num_not_in_map).
-    //   2. Serial: prefix-sum n_per_i into offsets[], so each i has a
-    //      pre-assigned slice of kneighbors_q2xs to write into.
-    //   3. Parallel: redo the qsort and write each i's neighbour list at
-    //      offsets[i].
-    int * n_per_i = (int *)malloc(kmap_size*sizeof(int));
-    GGML_ASSERT(n_per_i);
+    int8_t pos[8];
+    int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
     int num_neighbors = 0, num_not_in_map = 0;
-#ifdef GGML_USE_OPENMP
-    #pragma omp parallel reduction(+:num_neighbors,num_not_in_map)
-#endif
-    {
-        int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
-        GGML_ASSERT(dist2);
-        int8_t pos[8];
-        int i;
-#ifdef GGML_USE_OPENMP
-        #pragma omp for schedule(dynamic, 64)
-#endif
-        for (i = 0; i < kmap_size; ++i) {
-            if (kmap_q2xs[i] >= 0) {
-                n_per_i[i] = 0;
-                continue;
-            }
-            ++num_not_in_map;
-            for (int k = 0; k < 8; ++k) {
-                int l = (i >> 2*k) & 0x3;
-                pos[k] = 2*l + 1;
-            }
-            for (int j = 0; j < grid_size; ++j) {
-                const int8_t * pg = (const int8_t *)(kgrid_q2xs + j);
-                int d2 = 0;
-                for (int k = 0; k < 8; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
-                dist2[2*j+0] = d2;
-                dist2[2*j+1] = j;
-            }
-            qsort(dist2, grid_size, 2*sizeof(int), iq2_compare_func);
-            int n = 0; int d2 = dist2[0];
-            int nhave = 1;
-            for (int j = 0; j < grid_size; ++j) {
-                if (dist2[2*j] > d2) {
-                    if (nhave == nwant) break;
-                    d2 = dist2[2*j];
-                    ++nhave;
-                }
-                ++n;
-            }
-            n_per_i[i] = n;
-            num_neighbors += n;
+    for (int i = 0; i < kmap_size; ++i) {
+        if (kmap_q2xs[i] >= 0) continue;
+        ++num_not_in_map;
+        for (int k = 0; k < 8; ++k) {
+            int l = (i >> 2*k) & 0x3;
+            pos[k] = 2*l + 1;
         }
-        free(dist2);
+        for (int j = 0; j < grid_size; ++j) {
+            const int8_t * pg = (const int8_t *)(kgrid_q2xs + j);
+            int d2 = 0;
+            for (int k = 0; k < 8; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
+            dist2[2*j+0] = d2;
+            dist2[2*j+1] = j;
+        }
+        qsort(dist2, grid_size, 2*sizeof(int), iq2_compare_func);
+        int n = 0; int d2 = dist2[0];
+        int nhave = 1;
+        for (int j = 0; j < grid_size; ++j) {
+            if (dist2[2*j] > d2) {
+                if (nhave == nwant) break;
+                d2 = dist2[2*j];
+                ++nhave;
+            }
+            ++n;
+        }
+        num_neighbors += n;
     }
     //printf("%s: %d neighbours in total\n", __func__, num_neighbors);
     kneighbors_q2xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
     iq2_data[gindex].neighbours = kneighbors_q2xs;
-
-    int * offsets = (int *)malloc(kmap_size*sizeof(int));
-    GGML_ASSERT(offsets);
     int counter = 0;
     for (int i = 0; i < kmap_size; ++i) {
-        if (kmap_q2xs[i] >= 0) {
-            offsets[i] = -1;
-            continue;
+        if (kmap_q2xs[i] >= 0) continue;
+        for (int k = 0; k < 8; ++k) {
+            int l = (i >> 2*k) & 0x3;
+            pos[k] = 2*l + 1;
         }
-        offsets[i] = counter;
-        counter += 1 + n_per_i[i];
-    }
-
-#ifdef GGML_USE_OPENMP
-    #pragma omp parallel
-#endif
-    {
-        int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
-        GGML_ASSERT(dist2);
-        int8_t pos[8];
-        int i;
-#ifdef GGML_USE_OPENMP
-        #pragma omp for schedule(dynamic, 64)
-#endif
-        for (i = 0; i < kmap_size; ++i) {
-            if (kmap_q2xs[i] >= 0) continue;
-            for (int k = 0; k < 8; ++k) {
-                int l = (i >> 2*k) & 0x3;
-                pos[k] = 2*l + 1;
-            }
-            for (int j = 0; j < grid_size; ++j) {
-                const int8_t * pg = (const int8_t *)(kgrid_q2xs + j);
-                int d2 = 0;
-                for (int k = 0; k < 8; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
-                dist2[2*j+0] = d2;
-                dist2[2*j+1] = j;
-            }
-            qsort(dist2, grid_size, 2*sizeof(int), iq2_compare_func);
-            int local_counter = offsets[i];
-            kmap_q2xs[i] = -(local_counter + 1);
-            int d2 = dist2[0];
-            uint16_t * start = &kneighbors_q2xs[local_counter++];
-            int n = 0, nhave = 1;
-            for (int j = 0; j < grid_size; ++j) {
-                if (dist2[2*j] > d2) {
-                    if (nhave == nwant) break;
-                    d2 = dist2[2*j];
-                    ++nhave;
-                }
-                kneighbors_q2xs[local_counter++] = dist2[2*j+1];
-                ++n;
-            }
-            *start = n;
+        for (int j = 0; j < grid_size; ++j) {
+            const int8_t * pg = (const int8_t *)(kgrid_q2xs + j);
+            int d2 = 0;
+            for (int k = 0; k < 8; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
+            dist2[2*j+0] = d2;
+            dist2[2*j+1] = j;
         }
-        free(dist2);
+        qsort(dist2, grid_size, 2*sizeof(int), iq2_compare_func);
+        kmap_q2xs[i] = -(counter + 1);
+        int d2 = dist2[0];
+        uint16_t * start = &kneighbors_q2xs[counter++];
+        int n = 0, nhave = 1;
+        for (int j = 0; j < grid_size; ++j) {
+            if (dist2[2*j] > d2) {
+                if (nhave == nwant) break;
+                d2 = dist2[2*j];
+                ++nhave;
+            }
+            kneighbors_q2xs[counter++] = dist2[2*j+1];
+            ++n;
+        }
+        *start = n;
     }
-    free(offsets);
-    free(n_per_i);
+    free(dist2);
 }
 
 void iq2xs_free_impl(enum ggml_type type) {
@@ -3790,115 +4153,70 @@ void iq3xs_init_impl(int grid_size) {
         }
         kmap_q3xs[index] = i;
     }
-    // See explanation of parallelism in iq2xs_init_impl
-    int * n_per_i = (int *)malloc(kmap_size*sizeof(int));
-    GGML_ASSERT(n_per_i);
+    int8_t pos[4];
+    int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
     int num_neighbors = 0, num_not_in_map = 0;
-#ifdef GGML_USE_OPENMP
-    #pragma omp parallel reduction(+:num_neighbors,num_not_in_map)
-#endif
-    {
-        int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
-        GGML_ASSERT(dist2);
-        int8_t pos[4];
-        int i;
-#ifdef GGML_USE_OPENMP
-        #pragma omp for schedule(dynamic, 64)
-#endif
-        for (i = 0; i < kmap_size; ++i) {
-            if (kmap_q3xs[i] >= 0) {
-                n_per_i[i] = 0;
-                continue;
-            }
-            ++num_not_in_map;
-            for (int k = 0; k < 4; ++k) {
-                int l = (i >> 3*k) & 0x7;
-                pos[k] = 2*l + 1;
-            }
-            for (int j = 0; j < grid_size; ++j) {
-                const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
-                int d2 = 0;
-                for (int k = 0; k < 4; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
-                dist2[2*j+0] = d2;
-                dist2[2*j+1] = j;
-            }
-            qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
-            int n = 0; int d2 = dist2[0];
-            int nhave = 1;
-            for (int j = 0; j < grid_size; ++j) {
-                if (dist2[2*j] > d2) {
-                    if (nhave == nwant) break;
-                    d2 = dist2[2*j];
-                    ++nhave;
-                }
-                ++n;
-            }
-            n_per_i[i] = n;
-            num_neighbors += n;
+    for (int i = 0; i < kmap_size; ++i) {
+        if (kmap_q3xs[i] >= 0) continue;
+        ++num_not_in_map;
+        for (int k = 0; k < 4; ++k) {
+            int l = (i >> 3*k) & 0x7;
+            pos[k] = 2*l + 1;
         }
-        free(dist2);
+        for (int j = 0; j < grid_size; ++j) {
+            const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
+            int d2 = 0;
+            for (int k = 0; k < 4; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
+            dist2[2*j+0] = d2;
+            dist2[2*j+1] = j;
+        }
+        qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
+        int n = 0; int d2 = dist2[0];
+        int nhave = 1;
+        for (int j = 0; j < grid_size; ++j) {
+            if (dist2[2*j] > d2) {
+                if (nhave == nwant) break;
+                d2 = dist2[2*j];
+                ++nhave;
+            }
+            ++n;
+        }
+        num_neighbors += n;
     }
     //printf("%s: %d neighbours in total\n", __func__, num_neighbors);
     kneighbors_q3xs = (uint16_t *)malloc((num_neighbors + num_not_in_map)*sizeof(uint16_t));
     iq3_data[gindex].neighbours = kneighbors_q3xs;
-
-    int * offsets = (int *)malloc(kmap_size*sizeof(int));
-    GGML_ASSERT(offsets);
     int counter = 0;
     for (int i = 0; i < kmap_size; ++i) {
-        if (kmap_q3xs[i] >= 0) {
-            offsets[i] = -1;
-            continue;
+        if (kmap_q3xs[i] >= 0) continue;
+        for (int k = 0; k < 4; ++k) {
+            int l = (i >> 3*k) & 0x7;
+            pos[k] = 2*l + 1;
         }
-        offsets[i] = counter;
-        counter += 1 + n_per_i[i];
-    }
-
-#ifdef GGML_USE_OPENMP
-    #pragma omp parallel
-#endif
-    {
-        int * dist2 = (int *)malloc(2*grid_size*sizeof(int));
-        GGML_ASSERT(dist2);
-        int8_t pos[4];
-        int i;
-#ifdef GGML_USE_OPENMP
-        #pragma omp for schedule(dynamic, 64)
-#endif
-        for (i = 0; i < kmap_size; ++i) {
-            if (kmap_q3xs[i] >= 0) continue;
-            for (int k = 0; k < 4; ++k) {
-                int l = (i >> 3*k) & 0x7;
-                pos[k] = 2*l + 1;
-            }
-            for (int j = 0; j < grid_size; ++j) {
-                const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
-                int d2 = 0;
-                for (int k = 0; k < 4; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
-                dist2[2*j+0] = d2;
-                dist2[2*j+1] = j;
-            }
-            qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
-            int local_counter = offsets[i];
-            kmap_q3xs[i] = -(local_counter + 1);
-            int d2 = dist2[0];
-            uint16_t * start = &kneighbors_q3xs[local_counter++];
-            int n = 0, nhave = 1;
-            for (int j = 0; j < grid_size; ++j) {
-                if (dist2[2*j] > d2) {
-                    if (nhave == nwant) break;
-                    d2 = dist2[2*j];
-                    ++nhave;
-                }
-                kneighbors_q3xs[local_counter++] = dist2[2*j+1];
-                ++n;
-            }
-            *start = n;
+        for (int j = 0; j < grid_size; ++j) {
+            const int8_t * pg = (const int8_t *)(kgrid_q3xs + j);
+            int d2 = 0;
+            for (int k = 0; k < 4; ++k) d2 += (pg[k] - pos[k])*(pg[k] - pos[k]);
+            dist2[2*j+0] = d2;
+            dist2[2*j+1] = j;
         }
-        free(dist2);
+        qsort(dist2, grid_size, 2*sizeof(int), iq3_compare_func);
+        kmap_q3xs[i] = -(counter + 1);
+        int d2 = dist2[0];
+        uint16_t * start = &kneighbors_q3xs[counter++];
+        int n = 0, nhave = 1;
+        for (int j = 0; j < grid_size; ++j) {
+            if (dist2[2*j] > d2) {
+                if (nhave == nwant) break;
+                d2 = dist2[2*j];
+                ++nhave;
+            }
+            kneighbors_q3xs[counter++] = dist2[2*j+1];
+            ++n;
+        }
+        *start = n;
     }
-    free(offsets);
-    free(n_per_i);
+    free(dist2);
 }
 
 void iq3xs_free_impl(int grid_size) {
@@ -5541,6 +5859,55 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_0, data, nb);
             } break;
+        case GGML_TYPE_Q4_0_ROCMFP4:
+            {
+                if (!rocmfp4_validate_row_data(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFP4 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            {
+                if (!rocmfp4_validate_row_data_fast(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFP4 fast row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q3_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp3(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx FP3 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q2_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp2(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx FP2 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q6_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp6(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx FP6 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q8_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp8(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx FP8 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q7_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp7(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx Q7-DOT32 row data\n", __func__);
+                    return false;
+                }
+            } break;
         case GGML_TYPE_Q4_1:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q4_1, data, nb, d, m);
@@ -5603,6 +5970,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TURBO3_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_turbo3_0, data, nb);
+            } break;
+        case GGML_TYPE_TURBO4_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_turbo4_0, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {

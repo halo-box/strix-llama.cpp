@@ -38,7 +38,11 @@
 #define LOAD_VEC_B 1
 #endif
 
+#ifdef ALIGNED_BUILD
+const uint ALIGNED = 1;
+#else
 layout (constant_id = 11) const uint ALIGNED = 0;
+#endif
 
 #if !defined(TO_FLOAT_TYPE)
 #define TO_FLOAT_TYPE FLOAT_TYPE
