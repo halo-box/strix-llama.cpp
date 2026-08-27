@@ -25,14 +25,17 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
+    # The MTP block is a separate draft head (HF and vLLM both drop it), but it is
+    # the drafter for spec decode, so we export it: default build omits it, --mtp
+    # keeps it in-file, --mtp-only writes a sidecar. Upstream's converter cannot
+    # produce either, so a qwen4exp drafter has to come from somewhere.
+    supports_mtp_export = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
+        self._mtp_fc: dict[str, Tensor] = {}
         self._ple_row_dim: int | None = None
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
@@ -68,9 +71,11 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
-        # so emit no PLE keys rather than optional ones
+        # so emit no PLE keys rather than optional ones. A --mtp sidecar carries only
+        # the draft block, which has no PLE layer and whose hash constants were filtered
+        # out with the rest of the target, so the whole group is skipped there too.
         ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
-        if not ple_layers:
+        if not ple_layers or self.mtp_only:
             return
         self.gguf_writer.add_ple_layers(ple_layers)
         self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
@@ -105,7 +110,48 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             raise ValueError("eos_token_id is required: the PLE hash resets its n-grams on it")
         return int(eos)
 
+    # -- MTP / NextN draft head ------------------------------------------
+    #
+    # _QwenMtpMixin.filter_tensors renames mtp.layers.0.* onto the block after the
+    # last real layer (blk.48 here) and handles enorm/hnorm. Two things are ours:
+    #
+    #   * this arch splits the eh projection into fc_embedding + fc_hidden, where
+    #     other Qwen MTP heads carry a single fused `fc`. The graph concatenates
+    #     [enorm(embedding) ; hnorm(hidden)] on dim 0, so eh_proj must be
+    #     cat(embedding, hidden) on the INPUT axis, embedding first. Verified
+    #     byte-exact against the reference checkpoint, not assumed.
+    #   * qwen4exp has no output_norm: the hyper-connection head mixer is the final
+    #     norm. The MTP block carries its OWN mixer under mtp.hyper_connection_mixer,
+    #     so the sidecar is self-contained, but those names sit outside the mixin's
+    #     mtp.layers.N rewrite and have to be mapped onto output_hc_* here.
+
+    def _mtp_eh_proj(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
+        which = "embedding" if "fc_embedding" in name else "hidden"
+        self._mtp_fc[which] = data_torch
+        if len(self._mtp_fc) < 2:
+            return []
+        fused = torch.cat([self._mtp_fc["embedding"], self._mtp_fc["hidden"]], dim=1)
+        self._mtp_fc.clear()
+        bid = self.hparams["num_hidden_layers"]  # the MTP block sits after the last real layer
+        return [(self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ, bid, ".weight"), fused)]
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # the MTP eh projection arrives as two halves; fuse them (see _mtp_eh_proj)
+        if ".fc_embedding.weight" in name or ".fc_hidden.weight" in name:
+            return self._mtp_eh_proj(data_torch, name)
+
+        if name.startswith("mtp.hyper_connection_mixer."):
+            head = {
+                "hc_norm.weight":                gguf.MODEL_TENSOR.HC_HEAD_NORM,
+                "input_mix_weight_down.weight":  gguf.MODEL_TENSOR.HC_HEAD_DOWN,
+                "input_mix_weight_up.weight":    gguf.MODEL_TENSOR.HC_HEAD_UP,
+            }[name.split("mtp.hyper_connection_mixer.", 1)[1]]
+            # the inherited rule folds gammas to (1 + w) by matching `norm.weight`;
+            # this name reaches us before that, so fold it here to stay consistent
+            if head == gguf.MODEL_TENSOR.HC_HEAD_NORM:
+                data_torch = data_torch + 1
+            return [(gguf.TENSOR_NAMES[head] + ".weight", data_torch)]
+
         # int64 hash constants must stay exact; 1-D tensors force F32, so use KV
         if name.endswith("ple_embedding.layer_multipliers"):
             self._ple_multipliers = [int(x) for x in data_torch.tolist()]
