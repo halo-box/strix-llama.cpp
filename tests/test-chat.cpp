@@ -7058,6 +7058,55 @@ static void test_reasoning_budget_message_per_request() {
     }
 }
 
+static void test_reasoning_budget_enabled_per_request() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/Qwen-Qwen3-0.6B.jinja");
+
+    server_chat_params opt;
+    opt.tmpls            = std::move(tmpls);
+    opt.use_jinja        = true;
+    opt.enable_thinking  = true;
+    opt.reasoning_budget = -1;
+    opt.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+
+    {
+        json body = {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+            {"reasoning_budget_enabled", true},
+        };
+        std::vector<raw_buffer> out_files;
+        auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+        if (!llama_params.contains("reasoning_budget_enabled") ||
+            !llama_params["reasoning_budget_enabled"].get<bool>()) {
+            throw std::runtime_error("reasoning_budget_enabled=true not forwarded to llama_params");
+        }
+    }
+
+    {
+        json body = {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+            {"reasoning_budget_enabled", false},
+        };
+        std::vector<raw_buffer> out_files;
+        auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+        if (!llama_params.contains("reasoning_budget_enabled") ||
+            llama_params["reasoning_budget_enabled"].get<bool>()) {
+            throw std::runtime_error("reasoning_budget_enabled=false not forwarded to llama_params");
+        }
+    }
+
+    {
+        json body = {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+        };
+        std::vector<raw_buffer> out_files;
+        auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+        if (llama_params.contains("reasoning_budget_enabled")) {
+            throw std::runtime_error("reasoning_budget_enabled must not be set in llama_params when omitted from the request body");
+        }
+    }
+}
+
 static void test_reasoning_effort_caps() {
     LOG_DBG("%s\n", __func__);
 
@@ -7238,6 +7287,7 @@ int main(int argc, char ** argv) {
         test_reasoning_effort_caps();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_reasoning_budget_enabled_per_request();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }
