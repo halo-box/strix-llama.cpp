@@ -362,14 +362,25 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
+int32_t server_task_result_cmpl_final::count_reasoning_tokens() {
+    if (n_reasoning_tokens == 0 && vocab_usage && !oaicompat_msg.reasoning_content.empty()) {
+        n_reasoning_tokens = (int32_t) common_tokenize(vocab_usage, oaicompat_msg.reasoning_content, false).size();
+    }
+    return n_reasoning_tokens;
+}
+
 json server_task_result_cmpl_final::usage_json_oaicompat() {
+    const int32_t n_reasoning = count_reasoning_tokens();
     return json {
         {"completion_tokens", n_decoded},
         {"prompt_tokens",     n_prompt_tokens},
         {"total_tokens",      n_decoded + n_prompt_tokens},
         {"prompt_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
+        {"completion_tokens_details", json { {"reasoning_tokens", n_reasoning} }},
+        {"reasoning", n_reasoning},
     };
 }
+
 
 json server_task_result_cmpl_final::to_json_oaicompat() {
     std::time_t t = std::time(0);
@@ -590,6 +601,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             {"output_tokens", n_decoded},
             {"total_tokens",  n_decoded + n_prompt_tokens},
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
+            {"output_tokens_details", json { {"reasoning_tokens", count_reasoning_tokens() } }},
+            {"reasoning", count_reasoning_tokens()},
         }},
     };
 
