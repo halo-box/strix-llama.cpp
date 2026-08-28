@@ -286,12 +286,31 @@ struct common_params_sampling {
 
     // reasoning budget sampler parameters
     // these are populated by the server/CLI based on chat template params
+    bool reasoning_budget_enabled =
+        false;  // Master switch for the budget, soft warnings, intro, grace, and reasoning control.
     int32_t                   reasoning_budget_tokens   = -1;  // -1 = disabled, >= 0 = token budget
-    std::vector<llama_token>  reasoning_budget_start;          // start tag token sequence
-    std::vector<llama_tokens> reasoning_budget_end;            // end tag token sequences; the first tag is used as the forcing sequence
-    std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
-    std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
-    bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+    std::vector<llama_token>  reasoning_budget_start;          // Start tag token sequence.
+    std::vector<llama_tokens> reasoning_budget_end;            // End tag token sequences. First is forced.
+    std::vector<llama_token>  reasoning_budget_forced;         // Forced sequence: message and first end tag.
+    std::string               reasoning_budget_message;        // Message injected before the forced end tag.
+    bool                      reasoning_control = false;       // Create sampler for runtime reasoning control.
+
+    float reasoning_budget_soft_ratio = -1.0f;  // <= 0 disables the first soft warning.
+    std::vector<llama_token> reasoning_budget_soft_forced;
+    std::string              reasoning_budget_soft_message;
+
+    float                    reasoning_budget_soft2_ratio = -1.0f;
+    std::vector<llama_token> reasoning_budget_soft2_forced;
+    std::string              reasoning_budget_soft2_message;
+
+    std::vector<llama_token> reasoning_budget_intro_forced;
+    std::string reasoning_budget_intro_message =
+        "I'll keep this reasoning under {budget} tokens, so I'll stay focused and efficient. ";
+    std::string reasoning_budget_intro_mode =
+        "every";
+
+    int32_t reasoning_budget_grace_tokens =
+        0;  // <= 0 forces immediately. Positive values wait for a paragraph break.
 
     bool backend_sampling = false;
 
