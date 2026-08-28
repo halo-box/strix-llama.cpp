@@ -428,7 +428,7 @@ statistics draft: #calls = 10, #gen drafts = 10, #acc drafts = 10, #gen tokens =
 
 ```
 draft acceptance rate = 0.70312 (   90 accepted /   128 generated)
-statistics ngram_mod: #calls = 810, #gen drafts = 15, #acc drafts = 15, #gen tokens = 960, #acc tokens = 730, dur(b,g,a) = 0.149, 0.347, 0.005 ms
+statistics ngram-mod: #calls = 810, #gen drafts = 15, #acc drafts = 15, #gen tokens = 960, #acc tokens = 730, dur(b,g,a) = 0.149, 0.347, 0.005 ms
 ```
 
 ```

@@ -233,8 +233,16 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |
 | `-rea, --reasoning [on\|off\|auto]` | Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto' (detect from template))<br/>(env: LLAMA_ARG_REASONING) |
 | `--reasoning-effort LEVEL` | reasoning effort level given to the chat template: 'default' to keep the template default,<br/>or a level such as 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max' (default: default)<br/>(env: LLAMA_ARG_REASONING_EFFORT) |
+| `--reasoning-budget-enable, --no-reasoning-budget-enable` | master switch for hard cutoff, soft warnings, intro message, grace period, and runtime reasoning control (default: disabled)<br/>(env: LLAMA_ARG_THINK_BUDGET_ENABLE) |
 | `--reasoning-budget N` | token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)<br/>(env: LLAMA_ARG_THINK_BUDGET) |
-| `--reasoning-budget-message MESSAGE` | message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)<br/>(env: LLAMA_ARG_THINK_BUDGET_MESSAGE) |
+| `--reasoning-budget-message MESSAGE` | message forced when the reasoning budget is exhausted; include the model's closing tag when required by the template (default: none)<br/>(env: LLAMA_ARG_THINK_BUDGET_MESSAGE) |
+| `--reasoning-budget-soft-ratio N` | fraction of the budget consumed before the first soft warning; <= 0 disables (default: -1) |
+| `--reasoning-budget-soft-message MESSAGE` | first soft-warning message, injected at a newline boundary |
+| `--reasoning-budget-soft2-ratio N` | fraction of the budget consumed before the second soft warning; <= 0 disables (default: -1) |
+| `--reasoning-budget-soft2-message MESSAGE` | second soft-warning message, injected at a newline boundary |
+| `--reasoning-budget-intro-mode MODE` | `every` forces the intro for every reasoning block; `once` suppresses it when already present in the prompt (default: every) |
+| `--reasoning-budget-intro-message MESSAGE` | message forced at the start of reasoning; `{budget}` is replaced by the configured budget |
+| `--reasoning-budget-grace-tokens N` | tokens to allow after budget exhaustion while waiting for a paragraph break (default: 0) |
 | `--reasoning-preserve, --no-reasoning-preserve` | preserve reasoning trace in the full history, not just the last assistant message (default: template default)<br/>compatible with certain templates having 'supports_preserve_reasoning' capability<br/>example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking<br/>(env: LLAMA_ARG_REASONING_PRESERVE) |
 | `--chat-template JINJA_TEMPLATE` | set custom jinja chat template (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE) |
 | `--chat-template-file JINJA_TEMPLATE_FILE` | set custom jinja chat template file (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_FILE) |
@@ -1324,6 +1332,8 @@ The `response_format` parameter supports both plain JSON output (e.g. `{"type": 
 
 `reasoning_control`: Arms realtime reasoning control for this completion so it can be ended early via `/v1/chat/completions/control`. Defaults to `false`.
 
+`reasoning_budget_enabled`: Explicit master switch for reasoning budget, soft-warning, intro, grace, and runtime reasoning control fields. Omit it to keep the server or CLI default.
+
 `generation_prompt`: The generation prompt that was prefilled in by the template. Prepended to model output before parsing.
 
 `parse_tool_calls`: Whether to parse the generated tool call.
@@ -1432,7 +1442,11 @@ The response also includes a standard `usage` object:
         "total_tokens": 92,
         "prompt_tokens_details": {
             "cached_tokens": 0
-        }
+        },
+        "completion_tokens_details": {
+            "reasoning_tokens": 12
+        },
+        "reasoning": 12
     }
 }
 ```
@@ -1443,6 +1457,10 @@ The server supports parsing and returning reasoning via the `reasoning_content` 
 
 Reasoning input (preserve reasoning in history) is also supported by some specific templates. For more details, please refer to [PR#18994](https://github.com/ggml-org/llama.cpp/pull/18994).
 
+Reasoning budget controls can force a hard cutoff, insert soft warnings, insert an intro message, and wait for a paragraph break after budget exhaustion. Set `reasoning_budget_enabled` in a request to override the server or CLI default.
+
+Chat Completions usage reports reasoning tokens in `usage.reasoning` and `usage.completion_tokens_details.reasoning_tokens`. Responses usage reports them in `usage.reasoning` and `usage.output_tokens_details.reasoning_tokens`.
+
 ### POST `/v1/chat/completions/control`: Control a running chat completion in real time
 
 Acts on an in-flight completion identified by its `id` (the `id` field streamed back by `/v1/chat/completions`). The request is processed in parallel with the SSE stream, so the client sends it while still reading tokens.
@@ -1451,7 +1469,7 @@ Acts on an in-flight completion identified by its `id` (the `id` field streamed 
 
 `id`: (Required) The chat completion id to act on. A completion that has already finished matches nothing and the call is a no-op.
 
-`action`: (Required) The control action to perform. Currently the only supported value is `reasoning_end`, which forces the end of the current reasoning block so the model moves on to the final answer. Requires `reasoning_control: true` on the original completion request.
+`action`: (Required) The control action to perform. Currently the only supported value is `reasoning_end`, which forces the end of the current reasoning block so the model moves on to the final answer. Requires the reasoning budget master switch and `reasoning_control: true` on the original completion request.
 
 `model`: (Required in router mode) The model name, used to route the request to the right instance. Ignored in single model mode.
 

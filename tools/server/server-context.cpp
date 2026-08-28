@@ -1464,6 +1464,13 @@ private:
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
+                /* reasoning_budget_soft_ratio */ params_base.sampling.reasoning_budget_soft_ratio,
+                /* reasoning_budget_soft_msg   */ params_base.sampling.reasoning_budget_soft_message,
+                /* reasoning_budget_soft2_ratio */ params_base.sampling.reasoning_budget_soft2_ratio,
+                /* reasoning_budget_soft2_msg  */ params_base.sampling.reasoning_budget_soft2_message,
+                /* reasoning_budget_intro_msg  */ params_base.sampling.reasoning_budget_intro_message,
+                /* reasoning_budget_intro_mode */ params_base.sampling.reasoning_budget_intro_mode,
+                /* reasoning_budget_grace_toks */ params_base.sampling.reasoning_budget_grace_tokens,
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };
@@ -1744,6 +1751,26 @@ private:
         }
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
+
+        if (task.params.sampling.reasoning_budget_intro_mode == "once" &&
+            !task.params.sampling.reasoning_budget_intro_forced.empty() &&
+            task.tokens.size() >= task.params.sampling.reasoning_budget_intro_forced.size()) {
+            const auto * vocab_dedupe = llama_model_get_vocab(model_tgt);
+            auto detok = [&](const auto & toks) {
+                std::string text;
+                for (size_t i = 0; i < toks.size(); i++) {
+                    if (toks[i] != LLAMA_TOKEN_NULL) {
+                        text += common_token_to_piece(vocab_dedupe, toks[i], false);
+                    }
+                }
+                return text;
+            };
+            const std::string needle = detok(task.params.sampling.reasoning_budget_intro_forced);
+            if (!needle.empty() && detok(task.tokens).find(needle) != std::string::npos) {
+                task.params.sampling.reasoning_budget_intro_forced.clear();
+                SLT_DBG(slot, "%s", "reasoning-budget intro already present in prompt, suppressed (intro-mode=once)\n");
+            }
+        }
 
         // initialize samplers
         if (task.need_sampling()) {
@@ -2081,6 +2108,7 @@ private:
 
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.stats.n_gen;
+        res->vocab_usage           = llama_model_get_vocab(model_tgt);
         res->n_prompt_tokens       = slot.task->n_tokens();
         res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
         res->n_tokens_cached       = slot.prompt.n_tokens();
