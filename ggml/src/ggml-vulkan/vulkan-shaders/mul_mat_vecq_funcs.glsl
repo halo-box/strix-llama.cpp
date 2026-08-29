@@ -175,21 +175,33 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 #endif
 
 #if defined(DATA_A_ROCMFP4_FAST)
+// K_PER_ITER is 32 for this type: one call consumes a whole block, so the
+// single UE4M3 scale is decoded once per block rather than once per 8 weights.
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
-    const i32vec2 data_a_qs = repack(ib_a, iqs);
+    int32_t q_sum = 0;
 
-    const int32_t q_sum = dotPacked4x8EXT(data_a_qs.x, cache_b_qs[0]) +
-                          dotPacked4x8EXT(data_a_qs.y, cache_b_qs[1]);
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const i32vec2 data_a_qs = repack(ib_a, k);
+        q_sum += dotPacked4x8EXT(data_a_qs.x, cache_b_qs[k]) +
+                dotPacked4x8EXT(data_a_qs.y, cache_b_qs[k + 4]);
+    }
 
     const FLOAT_TYPE d = FLOAT_TYPE(ue4m3_to_fp32(data_a[ib_a].e));
     return FLOAT_TYPE(cache_b_ds.x * float(q_sum) * d);
 }
 #elif defined(DATA_A_ROCMFP4)
+// K_PER_ITER is 32 for this type: one call consumes a whole block, so the
+// two UE4M3 scales are decoded once per block rather than once per 8 weights.
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
-    const i32vec2 data_a_qs = repack(ib_a, iqs);
+    // the two halves carry different scales, so they cannot share an accumulator
+    int32_t q_sum0 = 0;
+    int32_t q_sum1 = 0;
 
-    const int32_t q_sum0 = dotPacked4x8EXT(data_a_qs.x, cache_b_qs[0]);
-    const int32_t q_sum1 = dotPacked4x8EXT(data_a_qs.y, cache_b_qs[1]);
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const i32vec2 data_a_qs = repack(ib_a, k);
+        q_sum0 += dotPacked4x8EXT(data_a_qs.x, cache_b_qs[k]);
+        q_sum1 += dotPacked4x8EXT(data_a_qs.y, cache_b_qs[k + 4]);
+    }
 
     const FLOAT_TYPEV2 d = get_dm(ib_a);
     return FLOAT_TYPE(cache_b_ds.x * (float(q_sum0) * d.x + float(q_sum1) * d.y));
