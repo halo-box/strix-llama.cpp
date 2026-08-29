@@ -329,7 +329,8 @@ struct common_sampler * common_sampler_init(
             reasoning_budget_active ? params.reasoning_budget_intro_forced : llama_tokens();
         rbudget = common_reasoning_budget_init(vocab, { params.reasoning_budget_start }, params.reasoning_budget_end,
                                                params.reasoning_budget_forced, soft_points, intro_tokens, budget_tokens,
-                                               params.reasoning_budget_grace_tokens);
+                                               params.reasoning_budget_grace_tokens, REASONING_BUDGET_IDLE,
+                                               params.reasoning_budget_intro_mode == "once");
 
         for (const auto & token : prefill_tokens) {
             llama_sampler_accept(rbudget, token);
