@@ -438,6 +438,29 @@ static void test_reasoning_budget_intro_rearms_on_multiblock() {
     llama_sampler_free(sampler);
 }
 
+static void test_reasoning_budget_intro_once_does_not_rearm() {
+    const std::vector<llama_token> start        = { 100 };
+    const std::vector<llama_token> end          = { 101 };
+    const std::vector<llama_token> forced       = { 102, 101 };
+    const std::vector<llama_token> intro_forced = { 300, 301 };
+
+    auto * sampler = common_reasoning_budget_init(nullptr, { start }, { end }, forced, {}, intro_forced, 5, 0, REASONING_BUDGET_IDLE, true);
+
+    llama_sampler_accept(sampler, 100);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_INTRO_FORCING);
+    llama_sampler_accept(sampler, 300);
+    llama_sampler_accept(sampler, 301);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+    llama_sampler_accept(sampler, 101);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+    // second reasoning block: intro must not fire again in once mode
+    llama_sampler_accept(sampler, 100);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+
+    llama_sampler_free(sampler);
+}
+
 static void test_reasoning_budget_hard_pending_grace_expires() {
     const std::vector<llama_token> start  = { 100 };
     const std::vector<llama_token> end    = { 101 };
@@ -769,6 +792,7 @@ int main(void) {
     test_reasoning_budget_intro_forcing_budget_zero();
     test_reasoning_budget_force_manual_from_intro();
     test_reasoning_budget_intro_rearms_on_multiblock();
+    test_reasoning_budget_intro_once_does_not_rearm();
     test_reasoning_budget_hard_pending_grace_expires();
     test_reasoning_budget_hard_pending_natural_end();
     test_reasoning_budget_force_manual_from_hard_pending();
