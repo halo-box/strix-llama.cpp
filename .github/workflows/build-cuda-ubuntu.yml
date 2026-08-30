@@ -41,6 +41,7 @@ env:
 
 jobs:
   cuda:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     container: nvidia/cuda:12.6.2-devel-ubuntu24.04
 
@@ -148,6 +149,7 @@ jobs:
           save: true
 
   musa:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/musa_sdk:5.2.0-devel-ubuntu22.04-s5000
 
