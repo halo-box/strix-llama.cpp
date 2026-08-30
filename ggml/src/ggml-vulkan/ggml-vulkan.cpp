@@ -854,6 +854,7 @@ struct vk_device_struct {
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
     uint32_t max_nodes_per_submit;
+    uint64_t max_bytes_per_submit;
 
     bool shader_64b_indexing;
 
@@ -2274,6 +2275,20 @@ static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
+
+// Total memory traffic of a node (dst + srcs). Used to bound command buffer
+// execution time for bandwidth-bound ops with no flops estimate (large copies,
+// set_rows, mask fills at long context) - packing too many of them into one
+// submission can exceed the driver timeout.
+static uint64_t ggml_vk_get_node_bytes(const ggml_tensor * node) {
+    uint64_t bytes = ggml_nbytes(node);
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node->src[i]) {
+            bytes += ggml_nbytes(node->src[i]);
+        }
+    }
+    return bytes;
+}
 
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
@@ -7092,6 +7107,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
         }
 
+        // Also submit once a batch has accumulated enough memory traffic, so that
+        // bandwidth-bound nodes with no flops estimate cannot grow a command buffer
+        // past the driver timeout. 0 disables the limit.
+        device->max_bytes_per_submit = 8ull * 1024 * 1024 * 1024;
+        const char* GGML_VK_MAX_MB_PER_SUBMIT = getenv("GGML_VK_MAX_MB_PER_SUBMIT");
+        if (GGML_VK_MAX_MB_PER_SUBMIT != nullptr) {
+            device->max_bytes_per_submit = std::stoull(GGML_VK_MAX_MB_PER_SUBMIT) * 1024 * 1024;
+        }
+
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
 
         device->fp16 = !force_disable_f16 && fp16_storage && fp16_compute;
@@ -9266,7 +9290,12 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
     // the HW device to host copy path.
-    if(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && src->device->uma) {
+    // On UMA, direct CPU reads are only fast from host-cached mappings. Write-combined/uncached
+    // mappings (e.g. GTT without HOST_CACHED) read at uncached speed (~200 MB/s), so bulk reads
+    // must go through the device copy path. Small reads stay direct to avoid the fence round-trip.
+    const bool host_cached = bool(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached);
+    if((src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && src->device->uma &&
+       (host_cached || width * height <= 64 * 1024)) {
         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
@@ -19298,6 +19327,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
+        // Under partial offload the scheduler's async input copies between graph
+        // splits can leave commands in a pending compute ctx. Flush it so the
+        // timestamp stream starts on a fresh command buffer.
+        if (!ctx->compute_ctx.expired()) {
+            ggml_vk_synchronize(ctx);
+        }
         GGML_ASSERT(ctx->compute_ctx.expired());
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
@@ -19324,6 +19359,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint32_t submitted_nodes = 0;
     uint32_t submit_count = 0;
     uint64_t batch_flops = 0;
+    uint64_t batch_bytes = 0;
     uint64_t total_flops = 0;
     uint64_t flops_cap = 200'000'000'000ULL;
 
@@ -19361,6 +19397,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         first_node_in_batch = true;
         submitted_nodes = 0;
         batch_flops = 0;
+        batch_bytes = 0;
         if (submit_count < 3) {
             flops_per_submit *= 2;
         }
@@ -19375,9 +19412,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         {
             auto node_flops = ggml_vk_get_node_flops(cgraph->nodes[i]);
             total_flops += node_flops;
+            auto node_bytes = ggml_vk_get_node_bytes(cgraph->nodes[i]);
 
-            // Flush the current batch before recording a node that would push it over the flop threshold
-            if (flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) {
+            // Flush the current batch before recording a node that would push it over the flop or byte threshold
+            if ((flops_per_submit != 0 && submitted_nodes > 0 && batch_flops + node_flops >= flops_per_submit) ||
+                (ctx->device->max_bytes_per_submit != 0 && submitted_nodes > 0 && batch_bytes + node_bytes >= ctx->device->max_bytes_per_submit)) {
                 vk_context flush_ctx = ggml_vk_get_compute_ctx(ctx);
                 ggml_vk_ctx_end(flush_ctx);
                 flush_ctx->exit_tensor_idx = -1;
@@ -19388,6 +19427,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
 
             batch_flops += node_flops;
+            batch_bytes += node_bytes;
         }
 
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
@@ -19613,6 +19653,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
+                      (ctx->device->max_bytes_per_submit != 0 && batch_bytes >= ctx->device->max_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
