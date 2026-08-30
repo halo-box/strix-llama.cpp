@@ -1,0 +1,61 @@
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <numeric>
+#include <string>
+#include <vector>
+
+struct sample {
+    int id;
+    float weight;
+    std::array<int, 4> shape;
+};
+
+static float weighted_sum(const std::vector<sample> & values) {
+    float result = 0.0f;
+    for (const sample & value : values) {
+        const int volume = std::accumulate(value.shape.begin(), value.shape.end(), 1, std::multiplies<int>());
+        result += value.weight * static_cast<float>(volume);
+    }
+    return result;
+}
+
+int main() {
+    std::vector<sample> values = {
+        { 7,  0.125f, { 1, 31, 32, 33 } },
+        { 11, 0.500f, { 2, 16, 64,  1 } },
+        { 19, 1.250f, { 4,  8, 17, 65 } },
+    };
+
+    std::stable_sort(values.begin(), values.end(), [](const sample & a, const sample & b) {
+        return a.id < b.id;
+    });
+
+    return weighted_sum(values) > 0.0f ? 0 : 1;
+}
+
+def chunk_rows(rows, width):
+    output = []
+    for start in range(0, len(rows), width):
+        stop = min(start + width, len(rows))
+        output.append(rows[start:stop])
+    return output
+
+def checksum(values):
+    state = 2166136261
+    for value in values:
+        state = (state ^ value) * 16777619
+        state &= 0xffffffff
+    return state
+
+SELECT model_id, backend, AVG(tokens_per_second) AS mean_rate
+FROM benchmark_results
+WHERE prompt_tokens = 2048
+  AND depth IN (0, 12000, 32000, 64000)
+GROUP BY model_id, backend
+ORDER BY model_id, backend;
+
+curl --fail --silent --show-error \
+  --header "Content-Type: application/json" \
+  --data '{"prompt":"deterministic input","temperature":0,"seed":123}' \
+  http://127.0.0.1:8080/v1/completions
