@@ -9,7 +9,6 @@ on:
       '**/*.py'
     ]
   pull_request:
-    branches-ignore: ['**']
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/python-lint.yml',

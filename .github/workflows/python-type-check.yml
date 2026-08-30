@@ -9,7 +9,6 @@ on:
       - '**/requirements*.txt'
       # - 'pyrightconfig.json'
   pull_request:
-    branches-ignore: ['**']
     paths:
       - '.github/workflows/python-type-check.yml'
       - 'ty.toml'

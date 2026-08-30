@@ -8,7 +8,6 @@ on:
       - 'convert*.py'
       - '**/requirements*.txt'
   pull_request:
-    branches-ignore: ['**']
     paths:
       - '.github/workflows/python-check-requirements.yml'
       - 'scripts/check-requirements.sh'
