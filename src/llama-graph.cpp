@@ -2546,8 +2546,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * kq_mask,
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
-               float   kq_scale,
-                 int   il) const {
+                float   kq_scale,
+                  int   il,
+         ggml_tensor * top_k,
+             int64_t   n_kv_raw) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2583,6 +2585,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        if (top_k) {
+            ggml_flash_attn_ext_add_top_k(cur, top_k, n_kv_raw);
+        }
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
         if (v_mla) {
