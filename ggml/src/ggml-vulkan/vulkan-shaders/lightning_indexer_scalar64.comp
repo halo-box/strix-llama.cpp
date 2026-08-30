@@ -7,6 +7,10 @@
 #extension GL_KHR_shader_subgroup_basic : require
 
 layout(constant_id = 0) const uint SUBGROUP_SIZE = 64;
+// Head count is a SPECIALIZATION constant, not a push constant: the head loop's trip
+// count must stay visible to the compiler. As a push constant it cannot unroll and
+// decode costs ~55% more (measured, gfx1151, kv=131584).
+layout(constant_id = 1) const uint N_HEAD = 64;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly  buffer QBuf    { float     data_q[];   };
@@ -34,7 +38,6 @@ layout(push_constant) uniform Parameters {
 } p;
 
 const uint K_PER_GROUP = 8;
-const uint N_HEAD = 64;
 
 void main() {
     const uint lane = gl_SubgroupInvocationID;
