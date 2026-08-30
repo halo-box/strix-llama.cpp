@@ -1467,7 +1467,7 @@ struct CompileTask {
 static bool ggml_vk_mmid_f16b_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_VK_MMID_F16B");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0;   // on by default; =0 disables
     }();
     return enabled;
 }
