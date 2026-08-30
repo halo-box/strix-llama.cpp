@@ -1148,6 +1148,17 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // gather tables that really came out of a mapping, resolved from gather_tables() during load.
+    // empty unless a table was nominated and lazily read, which is the only cost when it is off.
+    struct gather_range {
+        const ggml_tensor * tensor;
+        uint16_t            idx;  // source file, and so the mapping
+        size_t              offs; // byte offset into that file
+        size_t              len;
+    };
+
+    std::vector<gather_range> gather_ranges;
+
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
@@ -1678,6 +1689,58 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // kept local until the mappings exist: pimpl->gather_ranges must only ever hold ranges that
+    // were checked against a live mapping, since everything downstream indexes one.
+    //
+    // The LOADER owns the decision (TENSOR_READ_LAZY + --lazy-mode), not an env var. It already
+    // advised these ranges random and kept them out of the eager pull-in; all we do here is
+    // recover the tensor -> range mapping it does not keep, so prefetch_rows() can aim its
+    // batched readahead at exactly the tensors that got the advice.
+    std::vector<impl::gather_range> nominated;
+    for (const ggml_tensor * t : gather_tables()) {
+        const auto * w = t ? ml.get_weight(ggml_get_name(t)) : nullptr;
+        if (!w) {
+            continue;
+        }
+        const auto it = ml.lazy_tensor_ranges.find(w->idx);
+        if (it == ml.lazy_tensor_ranges.end()) {
+            continue;
+        }
+        // match on the START offset alone. The loader records the range as
+        // [w.offs, w.offs + ggml_nbytes(CREATED tensor)) while ggml_nbytes(w->tensor) is the
+        // FILE tensor's size, and an arch that reshapes on create (qwen4exp does) makes those
+        // two ends disagree -- which silently nominated nothing and reverted the feature.
+        // A tensor's offset is unique within its file, so the start is the reliable key.
+        for (const auto & [beg, end] : it->second) {
+            if (beg == w->offs) {
+                nominated.push_back({ t, w->idx, beg, end - beg });
+                break;
+            }
+        }
+    }
+
+    // NEVER advise a range random without arming the batched prefetch for it. MADV_RANDOM
+    // suppresses the kernel's own readahead, and upstream measured the advice ALONE at 94.4 s
+    // against 36.7 s for an untouched mapping -- suppressing readahead only pays if it is
+    // replaced. An arch that marks a tensor TENSOR_READ_LAZY without also returning it from
+    // gather_tables() (and calling prefetch_rows) would get exactly that losing half, so drop
+    // those ranges here, before init_mappings() acts on them. gemma4 is marked upstream and has
+    // no prefetch path, so without this a >4 GiB Gemma table would regress under the default.
+    for (auto & [idx, ranges] : ml.lazy_tensor_ranges) {
+        ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
+                [&](const std::pair<size_t, size_t> & r) {
+                    for (const auto & n : nominated) {
+                        if (n.idx == idx && n.offs == r.first) {
+                            return false;
+                        }
+                    }
+                    LLAMA_LOG_INFO("%s: lazy read declined for a %.2f MiB range: this arch does "
+                            "not prefetch its gathers, and the advice alone is slower\n",
+                            __func__, (r.second - r.first) / 1024.0 / 1024.0);
+                    return true;
+                }), ranges.end());
+    }
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -1811,9 +1874,36 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+
+        // a nominated tensor that did not end up served from its mapping was offloaded or copied
+        // into a buffer, and nothing will gather out of the file. drop it rather than track it.
+        // The advice itself already happened in the mmap constructor; this list exists only so
+        // prefetch_rows() knows which tensors it may aim at.
+        for (const auto & r : nominated) {
+            if (r.idx < pimpl->mappings.size() && pimpl->mappings[r.idx]->contains(r.tensor->data, r.len)) {
+                pimpl->gather_ranges.push_back(r);
+
+                LLAMA_LOG_INFO("%s: %s: lazy read, batched gather prefetch armed, %.2f MiB\n",
+                        __func__, ggml_get_name(r.tensor), r.len / 1024.0 / 1024.0);
+            }
+        }
     }
 
     return true;
+}
+
+void llama_model::prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const {
+    if (pimpl->gather_ranges.empty() || t == nullptr || t->data == nullptr || n_rows == 0) {
+        return;
+    }
+    // keyed off the tensor, not off its mapping: the readahead must land where the advice did,
+    // and the mapping now holds ranges that still want the kernel's own readahead
+    for (const auto & r : pimpl->gather_ranges) {
+        if (r.tensor == t) {
+            pimpl->mappings[r.idx]->prefetch_rows(t->data, t->nb[1], ggml_row_size(t->type, t->ne[0]), rows, n_rows);
+            return;
+        }
+    }
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {

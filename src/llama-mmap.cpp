@@ -5,7 +5,9 @@
 #include "ggml.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <climits>
+#include <vector>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
@@ -461,6 +463,60 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 }
 #endif
 
+static size_t llama_mmap_page_size() {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (size_t) si.dwPageSize;
+#elif defined(_SC_PAGESIZE)
+    return (size_t) sysconf(_SC_PAGESIZE);
+#else
+    return 4096;
+#endif
+}
+
+// the distinct pages the given rows fall on, as offsets into the mapping, merged into runs.
+// a row is much smaller than a page and rows repeat within a batch, so this is what turns a
+// hint per row into a hint per page. platform independent: the callers differ only in which
+// syscall they hand the result to.
+static std::vector<std::pair<size_t, size_t>> llama_mmap_row_pages(
+        size_t base_off, size_t stride, size_t row_size, size_t map_size,
+        const int32_t * rows, size_t n_rows, size_t page_size) {
+    std::vector<size_t> pages;
+    pages.reserve(n_rows);
+
+    for (size_t i = 0; i < n_rows; ++i) {
+        if (rows[i] < 0) {
+            continue;
+        }
+        const size_t first = base_off + (size_t) rows[i] * stride;
+        const size_t last  = first + row_size;
+        // a corrupt or unexpected index must not turn into a hint outside the mapping
+        if (row_size == 0 || last > map_size || first < base_off) {
+            continue;
+        }
+        for (size_t p = first / page_size; p <= (last - 1) / page_size; ++p) {
+            pages.push_back(p);
+        }
+    }
+
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+
+    std::vector<std::pair<size_t, size_t>> ranges;
+    for (size_t i = 0; i < pages.size(); ) {
+        size_t j = i + 1;
+        while (j < pages.size() && pages[j] == pages[j - 1] + 1) {
+            ++j;
+        }
+        const size_t off = pages[i] * page_size;
+        ranges.emplace_back(off, std::min((pages[j - 1] - pages[i] + 1) * page_size, map_size - off));
+        i = j;
+    }
+
+    return ranges;
+}
+
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
@@ -468,6 +524,7 @@ struct llama_mmap::impl {
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
         int fd = file->file_id();
+        fd_advise = fd;
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
@@ -512,6 +569,32 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
+    }
+
+    void prefetch_range(size_t offset, size_t len) const {
+        if (posix_madvise((char *) addr + offset, len, POSIX_MADV_WILLNEED)) {
+            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n", strerror(errno));
+        }
+    }
+
+    void prefetch_rows(const void * base, size_t stride, size_t row_size,
+                       const int32_t * rows, size_t n_rows) const {
+#if defined(_POSIX_MAPPED_FILES)
+        const size_t base_off = (const char *) base - (const char *) addr;
+
+        for (const auto & [off, len] : llama_mmap_row_pages(
+                    base_off, stride, row_size, size, rows, n_rows, llama_mmap_page_size())) {
+            // deliberately unchecked: this is a hint issued thousands of times per batch, and a
+            // failed hint only costs the fault it would have avoided
+            posix_madvise((char *) addr + off, len, POSIX_MADV_WILLNEED);
+        }
+#else
+        GGML_UNUSED(base);
+        GGML_UNUSED(stride);
+        GGML_UNUSED(row_size);
+        GGML_UNUSED(rows);
+        GGML_UNUSED(n_rows);
+#endif
     }
 
     static void align_range(size_t * first, size_t * last, size_t page_size) {
@@ -626,6 +709,43 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    // PrefetchVirtualMemory takes the whole set of ranges in one call, which is exactly the
+    // batching this wants: the reads are issued together instead of one fault at a time.
+    void prefetch_rows(const void * base, size_t stride, size_t row_size,
+                       const int32_t * rows, size_t n_rows) const {
+#if _WIN32_WINNT >= 0x602
+        BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+
+        pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
+        if (!pPrefetchVirtualMemory) {
+            return;
+        }
+
+        const size_t base_off = (const char *) base - (const char *) addr;
+
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+        for (const auto & [off, len] : llama_mmap_row_pages(
+                    base_off, stride, row_size, size, rows, n_rows, llama_mmap_page_size())) {
+            WIN32_MEMORY_RANGE_ENTRY e;
+            e.VirtualAddress = (char *) addr + off;
+            e.NumberOfBytes  = (SIZE_T) len;
+            entries.push_back(e);
+        }
+
+        if (!entries.empty()) {
+            // unchecked for the same reason as the POSIX branch: it is only a hint
+            pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0);
+        }
+#else
+        GGML_UNUSED(base);
+        GGML_UNUSED(stride);
+        GGML_UNUSED(row_size);
+        GGML_UNUSED(rows);
+        GGML_UNUSED(n_rows);
+#endif
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -656,10 +776,31 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void prefetch_rows(const void * base, size_t stride, size_t row_size,
+                       const int32_t * rows, size_t n_rows) const {
+        GGML_UNUSED(base);
+        GGML_UNUSED(stride);
+        GGML_UNUSED(row_size);
+        GGML_UNUSED(rows);
+        GGML_UNUSED(n_rows);
+
+        throw std::runtime_error("mmap not supported");
+    }
 #endif
+
+    bool contains(const void * ptr, size_t len) const {
+        const char * p = (const char *) ptr;
+        const char * b = (const char *) addr;
+
+        return p >= b && len <= size && (size_t) (p - b) <= size - len;
+    }
 
     void * addr;
     size_t size;
+
+    // the fd is kept only to re-advise the file; the mapping owns no reference to it
+    int fd_advise = -1;
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
@@ -670,6 +811,13 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+bool llama_mmap::contains(const void * ptr, size_t len) const { return pimpl->contains(ptr, len); }
+
+void llama_mmap::prefetch_rows(const void * base, size_t stride, size_t row_size,
+                               const int32_t * rows, size_t n_rows) const {
+    pimpl->prefetch_rows(base, stride, row_size, rows, n_rows);
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
