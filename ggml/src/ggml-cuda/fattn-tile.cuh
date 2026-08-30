@@ -1230,14 +1230,18 @@ static void launch_fattn_tile_case(
     bool use_q8_0_KV = false;
     fattn_kernel_t fattn_kernel;
 #ifdef GGML_USE_HIP
-    if constexpr (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256)) {
+#if defined(RDNA3_5)
+    if constexpr (DKQ == 256 && ncols1 == 1 && ncols2 == 3) {
         use_q8_0_KV = dst->src[0]->ne[1] == 1 && dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0;
         fattn_kernel = use_q8_0_KV
             ? flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>
             : flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
     } else {
+#endif // defined(RDNA3_5)
         fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
+#if defined(RDNA3_5)
     }
+#endif // defined(RDNA3_5)
     if constexpr (DKQ == 256 && DV == 256 && ncols1 == 4 && ncols2 == 8) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
@@ -1344,7 +1348,6 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
     float max_bias = 0.0f;
@@ -1404,13 +1407,14 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
 
     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
         if constexpr (DKQ == 256 && DV == 256) {
-#ifdef GGML_USE_HIP
+#if defined(RDNA3_5)
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const ggml_tensor * V = dst->src[2];
             if (use_gqa_opt && Q->ne[1] == 1 && gqa_ratio == 6 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && GGML_CUDA_CC_IS_RDNA3_5(cc)) {
                 launch_fattn_tile_switch_ncols1<DKQ, DV, 3, use_logit_softcap>(ctx, dst);
                 return;
             }
-#endif // GGML_USE_HIP
+#endif // defined(RDNA3_5)
         }
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
