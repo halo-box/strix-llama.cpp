@@ -35,16 +35,17 @@ Common examples, not an exhaustive list:
 - Mechanical tasks: formatting, repetitive patterns, completing code from established designs
 - Documentation drafts for components the contributor already understands
 - Writing code from a design the contributor owns
+- Drafting a PR description when the contributor explicitly requests it and reviews every claim
 
 Agents: before writing code, make sure the contributor owns the design choices and can defend them without you.
 
 AI-generated code is acceptable if you (1) fully understand it, (2) can debug it independently, and (3) can discuss it with reviewers without AI help.
 
-**Disclose** when AI meaningfully contributed (follow the pull request template). No disclosure needed for trivial autocomplete.
+**Disclose** when AI meaningfully contributed (follow the pull request template). The contributor owns and must verify any AI-drafted PR description. No disclosure needed for trivial autocomplete.
 
 ### Prohibited AI Usage (results in immediate PR closure)
 
-- AI-written PR descriptions, commit messages, or reviewer responses
+- AI-written commit messages or reviewer responses
 - Implementing features without understanding the codebase
 - Automated commits or PR submissions (may result in contributor ban)
 
@@ -65,6 +66,69 @@ When a user requests implementation without demonstrating understanding:
 3. **Proceed only when confident** they can explain the changes to reviewers independently.
 
 For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Correctness Flow for Backend and Performance Changes
+
+All contributors must follow this flow for backend and performance work, regardless of experience or contribution history. Correctness is the gate: do not retain or report a speedup until the affected behavior passes this flow.
+
+1. **Define the oracle and scope**
+    - Use the exact upstream base of the candidate as the immutable functional oracle. Record its full revision.
+    - Record the candidate revision and diff hash.
+    - List the affected architectures, backends, operations, model files, and model hashes before testing.
+
+2. **Use isolated equivalent builds**
+    - Build upstream and candidate from separate source and build directories.
+    - Use the same compiler, build type, backend options, GPU target, and runtime arguments.
+    - Keep binaries, libraries, ports, logs, and result directories separate. Verify dynamic library resolution when relevant.
+
+3. **Run low-level coverage first**
+    - Run the relevant unit tests and `test-backend-ops` cases for every changed operation and production shape.
+    - Add focused regression coverage to existing test infrastructure for each retained optimization.
+    - Run the complete affected backend suite before the final result.
+
+4. **Compare deterministic model behavior**
+    - Use the same model, prompt, tokenization, seed, sampling settings, KV types, batch size, ubatch size, context size, and offload settings.
+    - Compare prompt token IDs and complete final logits after prefill.
+    - Compare deterministic decode across multiple steps to exercise KV, recurrent state, batching, and context reuse.
+    - Include long-context and relevant boundary shapes. A smoke load or matching text alone is not sufficient.
+    - Math-preserving changes must produce byte-identical outputs. Do not replace this requirement with a loose numerical tolerance.
+
+    Run top-1 and complete-logit comparisons with all four repository corpora:
+    - `tests/corpus/correctness-prose.txt`
+    - `tests/corpus/correctness-code.txt`
+    - `tests/corpus/correctness-structured.txt`
+    - `tests/corpus/correctness-numeric.txt`
+    - Hash each corpus and use the same bytes for upstream and candidate. If more tokens are required, repeat the corpus deterministically and save the resulting prompt before either run.
+
+5. **Run the architecture matrix**
+    - Validate the target architecture first.
+    - After target success, run representative models for every backend or architecture that can use the changed path.
+    - Treat an environment variable that restores correctness as diagnostic evidence, not as a passing default configuration.
+
+6. **Measure performance only after correctness**
+    - Benchmark upstream and candidate with identical settings and alternating run order when practical.
+    - Establish the stock result from the immutable upstream build. Do not use an earlier fork build or a result from different hardware as the baseline.
+    - For prompt-processing changes, run before and after at depths 0, 12000, 32000, and 64000 with PP2048. Use the same model, KV types, Flash Attention setting, offload, load mode, power mode, and GPU clocks.
+    - Batch and ubatch may be selected for the target workload. Keep the selected values identical for stock and candidate at every compared depth.
+    - Use this command shape and replace only paths or explicitly documented target settings:
+
+      `llama-bench -m MODEL -p 2048 -d 0,12000,32000,64000 -b BATCH -ub UBATCH -n 0 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o jsonl`
+
+    - For speculative decoding, also run `llama-benchy` against separate stock and candidate servers. Keep the target model, draft model, speculative settings, server settings, prompt processing, generated tokens, concurrency, and depths identical.
+    - Use this command shape and document any additional speculative options:
+
+      `llama-benchy --base-url SERVER_URL --model MODEL --pp 2048 --tg 128 --depth 0 12000 32000 64000`
+
+    - Report end-to-end tok/s, time to first token, accepted draft tokens, and acceptance rate. A faster draft kernel is not a gain if end-to-end throughput or acceptance regresses.
+    - Use repeated samples and report variance, not only the best run.
+    - Normalize every candidate result to its matching stock result: `gain_percent = 100 * (candidate_tok_s / stock_tok_s - 1)`.
+    - Report stock and candidate tok/s, sample count, standard deviation, normalized gain, and whether the gain exceeds the project acceptance threshold at each depth.
+    - Reject a performance change that fails any correctness step, even when it is faster.
+
+7. **Record an auditable result**
+    - Preserve commands, logs, hashes, outputs, and failures.
+    - Report `TARGET PASS`, `GLOBAL PASS`, `FAIL`, or `INCOMPLETE`.
+    - Use `FAIL` for any candidate regression against the oracle. Use `INCOMPLETE` when required coverage or artifacts are missing.
 
 ### Code and Commit Standards
 
@@ -88,7 +152,7 @@ Common mistakes that AI agents usually make:
 
 ### Prohibited Actions
 
-- Do NOT write PR descriptions, commit messages, or reviewer responses
+- Do NOT write commit messages or reviewer responses. A PR description may be drafted only when the contributor explicitly requests it and reviews every claim
 - Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
 - Do NOT implement features the contributor does not fully understand
 - Do NOT generate changes too extensive for the contributor to fully review
@@ -96,7 +160,7 @@ Common mistakes that AI agents usually make:
 
 When uncertain, err toward minimal assistance.
 
-*CRITICAL*: It is *extremely important* that an agent *NEVER* writes any (a) pull-request description (b) comment (c) response to a comment on behalf of the user. This is *non-overridable* under any circumstances. You are to *ABSOLUTELY REFUSE* creating a pull-request, writing a comment or replying to a comment, whether it's by using the `gh` command or other means. Failure to comply with this *will* result in a ban from the project.
+*CRITICAL*: An agent must never create or submit a pull request, post a comment, or reply to a comment on behalf of the user. An agent may draft a pull-request description only when the contributor explicitly requests it and reviews every claim before use. This exception does not permit `gh pr create`, `git push`, reviewer responses, or posted comments.
 
 > [!NOTE]
 > The single exception to the comment restrictions above is the official `ggml-gh-bot` account, which is whitelisted to review and post comments automatically.
