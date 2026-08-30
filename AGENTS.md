@@ -93,16 +93,16 @@ All contributors must follow this flow for backend and performance work, regardl
     - Include long-context and relevant boundary shapes. A smoke load or matching text alone is not sufficient.
     - Math-preserving changes must produce byte-identical outputs. Do not replace this requirement with a loose numerical tolerance.
 
-    Run top-1 and complete-logit comparisons with all four repository corpora:
+    Run top-1 and complete-logit comparisons for the current target model with all four repository corpora. Do not multiply this corpus matrix across unrelated models:
     - `tests/corpus/correctness-prose.txt`
     - `tests/corpus/correctness-code.txt`
     - `tests/corpus/correctness-structured.txt`
     - `tests/corpus/correctness-numeric.txt`
     - Hash each corpus and use the same bytes for upstream and candidate. If more tokens are required, repeat the corpus deterministically and save the resulting prompt before either run.
 
-5. **Run the architecture matrix**
-    - Validate the target architecture first.
-    - After target success, run representative models for every backend or architecture that can use the changed path.
+5. **Run the target model matrix**
+    - Validate the current target model on every affected backend.
+    - Do not test unrelated models unless the change affects a shared path and the contributor explicitly expands the scope.
     - Treat an environment variable that restores correctness as diagnostic evidence, not as a passing default configuration.
 
 6. **Measure performance only after correctness**
