@@ -44,8 +44,11 @@ shared float tmpsh[row_split];
 const uint32_t qstride = HSK_pad / 4 + 2;
 shared FLOAT_TYPEV4 Qf[Br * qstride];
 
-const uint psh_stride = Br / 4 + 2;
-shared FLOAT_TYPEV4 Psh[Bc * psh_stride];
+// P is stored query-major with KV contiguous so the GEMM2 UseA load can be RowMajor:
+// RADV flips the requested layout for UseA, and only the resulting internal column-major
+// case gets an alignment hint, which is what lets the 16 element loads vectorize.
+const uint psh_stride = Bc / 4 + 2;
+shared FLOAT_TYPEV4 Psh[Br * psh_stride];
 
 // Avoid padding for hsk==256 to make it fit in 48KB shmem.
 const uint32_t sfshstride = (HSK <= 128) ? (Br / 4 + 2) : Br / 4;
@@ -382,15 +385,19 @@ void main() {
 
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; r += 4) {
                 const uint row = tile_row(r);
+                const uint pcol_vec  = col / 4;
+                const uint pcol_comp = col % 4;
                 if (KV_bounds_check && j * Bc + col >= KV) {
-                    Psh[col * psh_stride + row / 4] = FLOAT_TYPEV4(0.0f);
+                    [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                        Psh[(row + vec_idx) * psh_stride + pcol_vec][pcol_comp] = FLOAT_TYPE(0.0f);
+                    }
                 } else {
                     const vec4 mfvec = vec4(Mf[r], Mf[r + 1], Mf[r + 2], Mf[r + 3]);
                     const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
                         Lf[r + vec_idx] += Pf[vec_idx];
+                        Psh[(row + vec_idx) * psh_stride + pcol_vec][pcol_comp] = Pf[vec_idx];
                     }
-                    Psh[col * psh_stride + row / 4] = Pf;
                 }
             }
         }
@@ -422,6 +429,13 @@ void main() {
         barrier();
 
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
+
+        // Psh is not written again until the next KV block, so the P fragments are the same
+        // for every hsv_tile. Load them once instead of re-reading LDS per tile.
+        coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> PMat[Bc / MatBc];
+        [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
+            coopMatLoad(PMat[bc_chunk], Psh, bc_chunk * (MatBc / 4), psh_stride, gl_CooperativeMatrixLayoutRowMajor);
+        }
 
         // Each subgroup handles HSV/4 columns
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
@@ -476,8 +490,6 @@ void main() {
 
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
-                    coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
-
                     if (SHMEM_STAGING == 0) {
                     if (!USE_DECODE_V && !KV_bounds_check) {
                         // F16/BF16 values can be loaded directly from global memory
@@ -493,7 +505,7 @@ void main() {
                         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
                     }
 
-                    PVMat = coopMatMulAdd(KMat, QMat, PVMat);
+                    PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
                 }
 
                 // Store PVMat to pvsh and load into Of
