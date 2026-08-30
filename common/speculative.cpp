@@ -3058,6 +3058,10 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
+                        // keep the proposal distributions aligned with the truncated draft
+                        if (dp.dists && dp.dists->size() > result.size()) {
+                            dp.dists->resize(result.size());
+                        }
                     }
                 }
 
