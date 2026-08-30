@@ -169,6 +169,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._ple_head_vocab_sizes = [int(x) for x in data_torch.tolist()]
             return []
 
+        if name.endswith("ngram_embedding.weight_scale"):
+            return []  # scalar FP8 table scale; consumed lazily in _load_ple_shard
+
         if ".ngram_embedding.shard_" in name:
             return self._place_ple_shard(data_torch, name)
 
@@ -223,13 +226,38 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         gguf_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD]
         return [(gguf_name + ".weight", cast(Tensor, table))]
 
+    def _ple_fp8_scale(self) -> float:
+        """Per-tensor scale for an FP8-quantized PLE table (FP8 checkpoints only).
+
+        The FP8 repo stores the shards as F8_E4M3 with ONE scalar
+        `ngram_embedding.weight_scale` at the fused name, which pairs with no
+        weight named `ngram_embedding.weight`, so none of the dequant_model()
+        branches consume it. The shards reach _load_ple_shard still in e4m3
+        (the raw lazy re-read bypasses base.py's f32 upcast); a value-preserving
+        cast yields the raw +-448-range codes, so the scale must be applied here.
+        Never gate this on dtype: by modify_tensors time the upcast HAS happened
+        and a dtype check silently never fires. 1.0 for bf16 checkpoints.
+        Diagnostic for a suspect table: values should be O(0.01), not O(50).
+        """
+        if getattr(self, "_ple_scale_cached", None) is None:
+            self._ple_scale_cached = 1.0
+            for name, gen in self.model_tensors.items():
+                if name.endswith("ngram_embedding.weight_scale"):
+                    self._ple_scale_cached = float(gen().to(torch.float32).item())
+                    break
+        return self._ple_scale_cached
+
     def _load_ple_shard(self, name: str):
         def load() -> np.ndarray:
             from .base import LazyTorchTensor
 
             # a fresh lazy tensor every call, or to_eager() memoizes every shard
             eager = LazyTorchTensor.to_eager(self.model_tensors[name]())
-            return eager.to(torch.float32).contiguous().numpy()
+            eager = eager.to(torch.float32)
+            scale = self._ple_fp8_scale()
+            if scale != 1.0:
+                eager = eager * scale
+            return eager.contiguous().numpy()
         return load
 
     def prepare_tensors(self):
