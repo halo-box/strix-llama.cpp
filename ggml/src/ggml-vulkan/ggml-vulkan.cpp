@@ -1782,7 +1782,7 @@ struct CompileTask {
 static bool ggml_vk_mmid_f16b_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_VK_MMID_F16B");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0;   // on by default; =0 disables
     }();
     return enabled;
 }
@@ -2637,7 +2637,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // GGML_VK_MMID_M128=1: same idea for the medium tile (BM 64->128, four
             // warps) — the tile the per-expert-n heuristic picks at n~64 (e.g. ub2048).
             const char * m128_env = getenv("GGML_VK_MMID_M128");
-            if (m128_env && atoi(m128_env) != 0) {
+            if (!m128_env || atoi(m128_env) != 0) {   // on by default; =0 disables
                 m_warptile_mmq_id128[0] = 4 * mul_mat_subgroup_size;  // BLOCK_SIZE
                 m_warptile_mmq_id128[1] = 128;  // BM
                 m_mmq_wg_denoms_id128[0] = 128;
@@ -2659,7 +2659,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // driver honors a required size (subgroup_size_control covering 32);
             // otherwise WARP=32 with a real subgroup of 64 would corrupt tiling.
             const char * wave32_env = getenv("GGML_VK_MMID_WAVE32");
-            if (wave32_env && atoi(wave32_env) != 0 && device->subgroup_size_control &&
+            if ((!wave32_env || atoi(wave32_env) != 0) && device->subgroup_size_control &&   // on by default; =0 disables
                 device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
                 mmid_req_sgs = 32;
                 auto wave32_tile = [](std::vector<uint32_t> &w) {
