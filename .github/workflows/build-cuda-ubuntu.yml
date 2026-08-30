@@ -145,6 +145,7 @@ jobs:
           save: true
 
   musa:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
 
