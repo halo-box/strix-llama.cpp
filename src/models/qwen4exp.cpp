@@ -1022,6 +1022,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
 // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
 
+// The table is a CPU tensor far too big to offload, so ggml_get_rows on it puts a CPU node in
+// the middle of the graph: the scheduler splits there and every token pays a GPU->CPU->GPU
+// round trip inside this layer. The hash the gather depends on is host-side anyway, so do the
+// gather host-side too. LLAMA_PLE_HOST_GATHER=0 restores the in-graph gather.
+static bool ple_host_gather() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_PLE_HOST_GATHER");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
@@ -1032,10 +1044,15 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+        if (emb != nullptr) {
+            return emb->buffer != nullptr && emb->ne[1] == params.ubatch.n_tokens;
+        }
+        return rows != nullptr && rows->buffer != nullptr &&
+               rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens], in-graph get_rows
+    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim * ple_n_heads, n_tokens], host gather
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1106,7 +1123,33 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    if (rows) {
+        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+        return;
+    }
+
+    // Gather host-side. Head varies fastest within a token, the layout ggml_get_rows produced for
+    // the same index vector, so the flattened [head_dim * n_heads] row per token is unchanged.
+    const ggml_tensor * tbl      = pmodel.per_layer_tok_embd;
+    const int64_t       head_dim = tbl->ne[0];
+    const size_t        row_sz   = ggml_row_size(tbl->type, head_dim);
+    const char *        base     = (const char *) tbl->data;
+
+    // get_rows dequantised to F32; keep that so the downstream matmuls are bit-identical
+    std::vector<float> vals((size_t) head_dim * idx.size());
+    if (tbl->type == GGML_TYPE_F32) {
+        for (size_t k = 0; k < idx.size(); ++k) {
+            memcpy(vals.data() + k*head_dim, base + (size_t) idx[k]*row_sz, head_dim*sizeof(float));
+        }
+    } else {
+        const ggml_type_traits * traits = ggml_get_type_traits(tbl->type);
+        GGML_ASSERT(traits->to_float && "PLE table type has no to_float");
+        for (size_t k = 0; k < idx.size(); ++k) {
+            traits->to_float(base + (size_t) idx[k]*row_sz, vals.data() + k*head_dim, head_dim);
+        }
+    }
+
+    ggml_backend_tensor_set(emb, vals.data(), 0, vals.size()*sizeof(float));
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1165,14 +1208,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
-
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
-    emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+    // heads lie slowest within a token either way, as the reference does
+    ggml_tensor * emb = nullptr;
+    if (ple_host_gather()) {
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
+                hparams.ple_head_dim * n_heads, n_tokens);
+        ggml_set_input(ple_inp->emb);
+        emb = ple_inp->emb;
+        res->add_input(std::move(ple_inp));
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+        res->add_input(std::move(ple_inp));
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+    }
     cb(emb, "ple_embd", -1);
 
     return emb;
