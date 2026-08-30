@@ -1,0 +1,23 @@
+At sunrise the research vessel left the harbor and followed the eastern channel. The sea was calm, but a narrow bank of fog covered the distant markers. The crew checked the compass, compared the paper chart with the digital display, and recorded the time of each observation.
+
+Mara kept the log. She wrote short sentences because every statement had to be checked later. At 06:15 the engine speed was steady. At 06:40 the wind shifted north. At 07:05 a red buoy appeared on the port side, exactly where the chart predicted.
+
+The purpose of the trip was simple: repeat the same survey under controlled conditions. The instruments measured temperature, pressure, salinity, and current speed. Each reading was stored twice, once in the local recorder and once in a sealed backup unit.
+
+During the second hour, the fog lifted. Low hills became visible beyond the water, and sunlight reached the deck. The crew did not change the plan. They continued along the numbered stations, stopped for three minutes at each point, and used the same procedure for every sample.
+
+A good experiment depends on ordinary discipline. Names must remain consistent. Units must be written beside values. Missing observations must be marked as missing rather than replaced with convenient estimates. If a device reports an impossible value, the operator must preserve the original record before investigating the cause.
+
+At noon the vessel turned west. The return route crossed the morning track at two places. Those intersections provided useful checks because the water should have similar properties when measured only a few hours apart. Small differences were expected; large differences would require another survey.
+
+The final station was close to the harbor wall. Traffic had increased, and the wake from a ferry disturbed the surface. Mara noted the disturbance, waited until the waves had passed, and repeated the measurement. Both readings stayed in the log.
+
+Back on shore, the team copied the files to a workstation. One person verified file sizes and hashes while another compared timestamps against the paper log. They found no missing stations. The duplicate records matched byte for byte.
+
+The analysis began the next morning. The team first plotted the raw measurements without smoothing them. Then they applied the planned calibration and produced a second set of plots. The order mattered: raw evidence had to remain available so that every later transformation could be explained.
+
+The report separated observations from conclusions. It described the route, weather, instruments, and procedure before discussing patterns in the data. It also listed the limitations of the survey. A single calm day could describe local conditions, but it could not represent every season or every storm.
+
+When the review was complete, Mara archived the input files, scripts, plots, and written notes together. A future team should be able to repeat the work without guessing which settings had been used. Reproducibility was treated as part of the result, not as an optional task after the result.
+
+The harbor lights came on as the team left the building. The vessel was already prepared for another trip. Nothing about the process was dramatic, yet the careful sequence of checks made the measurements trustworthy.

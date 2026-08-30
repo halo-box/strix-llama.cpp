@@ -1,0 +1,61 @@
+{
+  "suite": "backend-correctness",
+  "seed": 123,
+  "temperature": 0,
+  "prompt_tokens": 2048,
+  "depths": [0, 12000, 32000, 64000],
+  "cache": {"key": "f16", "value": "f16"},
+  "backends": ["Vulkan", "ROCm"],
+  "checks": ["token_ids", "top_1", "complete_logits", "decode_state"]
+}
+
+suite: backend-correctness
+oracle: immutable-upstream
+candidate: working-tree
+settings:
+  seed: 123
+  temperature: 0
+  prompt_tokens: 2048
+  batch: selected-per-target
+  ubatch: selected-per-target
+checks:
+  - prompt-token-ids
+  - prefill-final-logits
+  - deterministic-decode
+  - kv-and-recurrent-state
+  - long-context-boundaries
+
+| case | backend | depth | prompt | generation | expected |
+| stock-0 | Vulkan | 0 | 2048 | 0 | reference |
+| stock-12 | Vulkan | 12000 | 2048 | 0 | reference |
+| stock-32 | ROCm | 32000 | 2048 | 0 | reference |
+| stock-64 | ROCm | 64000 | 2048 | 0 | reference |
+
+model_id,backend,depth,prompt_tokens,generation_tokens,seed
+qwen38,Vulkan,0,2048,0,123
+qwen35,Vulkan,12000,2048,0,123
+gemma4,ROCm,32000,2048,0,123
+gptoss20,ROCm,64000,2048,0,123
+
+[request]
+method = POST
+path = /v1/completions
+content_type = application/json
+
+[sampling]
+temperature = 0
+seed = 123
+top_k = 1
+
+[validation]
+compare_tokens = true
+compare_top_1 = true
+compare_complete_logits = true
+compare_decode = true
+
+BEGIN RECORD
+id=0001 status=pending backend=Vulkan depth=0
+id=0002 status=pending backend=Vulkan depth=12000
+id=0003 status=pending backend=ROCm depth=32000
+id=0004 status=pending backend=ROCm depth=64000
+END RECORD
