@@ -2550,21 +2550,25 @@ struct llama_model_clef : public llama_model_qwen35 {
 };
 
 
+struct llama_ple_disk;
+
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_kpool;
 
+    // Set when the n-gram table is left on disk (--ngram-on-disk): per_layer_tok_embd is
+    // counted as created but never allocated, mapped or read, and build_ple takes its
+    // rows from this reader instead of ggml_get_rows.
+    std::shared_ptr<llama_ple_disk> ple_disk;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
-        // the helpers alone, graph_mtp builds its own body
-        struct no_build {};
-        graph(const llama_model & model, const llm_graph_params & params, no_build) :
-            llm_build_delta_net_base(params), model(model) {}
+        // members only, no trunk: graph_mtp builds its own single block
+        graph(const llama_model & model, const llm_graph_params & params, bool mtp);
 
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
@@ -2659,7 +2663,6 @@ struct llama_model_qwen4exp : public llama_model_base {
         const llama_model & model;
     };
 
-    // MTP draft head: one QSA block after the trunk, fed by the trunk's hc-wide residual
     struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
