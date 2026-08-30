@@ -3861,11 +3861,11 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     // instructions for the same number of SIMD passes, which loses on an issue-bound kernel:
     // hd256 measures 6 to 18 percent slower. The test depends on HSV only; HSK does not enter
     // d_per_thread. On a 64-wide device it reduces exactly to hsv <= 128.
-    // =1 applies the rule; =2 forces the pin regardless of head size, for measuring the
-    // configurations the rule rejects. Diagnostic only.
+    // On by default (=1, applies the rule); =0 disables. =2 forces the pin regardless of
+    // head size, for measuring the configurations the rule rejects. Diagnostic only.
     static const int fa_wave32 = [] {
         const char * e = getenv("GGML_VK_FA_WAVE32");
-        return e ? atoi(e) : 0;
+        return e ? atoi(e) : 1;
     }();
     if (fa_wave32 != 0 &&
         device->subgroup_size_control &&
