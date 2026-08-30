@@ -1,85 +1,198 @@
+# Contributing to strix-llama.cpp
+
+This is a community fork of [`llama.cpp`](https://github.com/ggml-org/llama.cpp) for **AMD Strix Halo**
+(Ryzen AI Max / Max+ 300 series, `gfx1151`, RDNA 3.5 iGPU, unified memory). It is small, it is device-specific, and it
+runs by its own rules - the sections below replace upstream's where they differ. The coding and naming guidelines
+further down are upstream's and are kept as-is, because this fork stays mergeable with upstream.
+
+# Where does my change go?
+
+```
+ggml-org/llama.cpp            upstream
+  |
+  +-- halo-box/llama.cpp      staging fork for changes intended to go upstream
+        |
+        +-- halo-box/strix-llama.cpp   <-- this repo
+```
+
+- **Strix Halo specific, or justified by measurements on Strix Halo** -> open the PR here.
+- **A general llama.cpp improvement** -> open it against
+  [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) instead, and follow that repo's (upstream's) rules,
+  including its AI policy. Nothing is submitted upstream from this repo.
+
+If you are unsure, open an issue here and ask. Landing something in the wrong repo costs everyone more than asking.
+
 # Contributors
 
 The project differentiates between 3 levels of contributors:
 
 - Contributors: people who have contributed before (no special privileges)
 - Collaborators (Triage): people with significant contributions, who may be responsible for some parts of the code, and are expected to maintain and review contributions for the code they own
-- Maintainers: responsible for reviewing and merging PRs, after approval from the code owners
+- Maintainers: responsible for reviewing and merging PRs
+
+Contributions from anyone who owns the hardware are welcome, and so are bug reports and benchmark numbers from people
+who do not want to write code. A `llama-bench` run on a configuration nobody here has tested is a real contribution.
 
 # AI Usage Policy
 
 > [!IMPORTANT]
 >
-> AI-generated code is allowed. You are 100% responsible for every line, however it was produced.
+> AI-generated code is allowed, and so are **AI-authored pull requests**, including from autonomous agents.
+> This is a deliberate difference from upstream `llama.cpp`, which bans automated submissions.
 >
-> Undisclosed AI usage may result in your account being permanently banned from contributing to the project.
->
-> Detailed information regarding permissible and restricted uses of AI can be found in the [AGENTS.md](AGENTS.md) file.
+> Detailed rules for agents are in [AGENTS.md](AGENTS.md).
 
-If AI is used to generate any portion of the code, contributors must adhere to the following requirements:
+What is allowed here that is not allowed upstream:
 
-1. Explicitly disclose the manner in which AI was employed.
-2. Check for an existing PR addressing the same change; if one exists, comment there to work with its author instead of opening a duplicate.
-3. Perform a comprehensive manual review prior to submitting the pull request.
-4. Be prepared to explain every line of code they submitted when asked about it by a maintainer.
+- An agent may write the code, the commit messages, and the PR description.
+- An agent may open the PR itself (`gh pr create`) and reply to review comments.
+- An agent may run unattended, as long as it follows [AGENTS.md](AGENTS.md).
 
-For more info, please refer to the [AGENTS.md](AGENTS.md) file.
+What is still required, of humans and agents alike:
+
+1. **Disclose it.** Say in the PR that AI was used and how. Agent-authored commits carry an
+   `Assisted-by: <assistant name>` trailer.
+2. **Back the claims with measurements.** Performance and correctness claims about this hardware need numbers from
+   this hardware - see [Preparing your PR](#preparing-your-pr).
+3. **Someone owns the result.** If you submit it, you answer for it: bugs, review feedback, and follow-ups. An agent
+   that opens a PR and disappears leaves the maintainers holding it, and such PRs may be closed.
+4. **Do not duplicate.** Check for an existing PR or issue covering the same change first, and comment there instead
+   of opening a second one.
+5. **Do not merge your own work**, and do not push to `master`.
+
+Undisclosed AI usage is the one thing that will get a contributor blocked here. Disclosure is cheap; a reviewer
+discovering it later is not.
 
 # Pull requests (for contributors & collaborators)
 
 ### Before you start
 
-- Search for existing discussions and PRs first - duplicates will likely be closed without questions.
-- Features must begin with an issue, not a PR - let interest accumulate before writing code; niche features may only land as an example/tool, or on a private fork.
-- Bug-fix PRs must include a reproducible issue and a regression test that fails before your change and passes after. Fixes without a test may be closed without review.
-- New CLI or public API additions carry a **higher bar** than internal changes - justify why an existing mechanism doesn't suffice.
-- Meeting all of the above still doesn't guarantee a merge - see [Pull requests (for maintainers)](#pull-requests-for-maintainers).
-- If you are a new contributor
-    - Limit your open PRs to 1
-    - Do not submit trivial fixes (e.g. typos, formatting changes)
+- Search existing issues and PRs first - duplicates will likely be closed.
+- Confirm the change belongs in this repo and not in [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp);
+  see [Where does my change go?](#where-does-my-change-go).
+- For anything large, or anything that introduces a new pattern or subsystem, open an issue first. Small, measured,
+  device-specific changes can go straight to a PR.
+- Check whether upstream has already fixed it. Carrying a patch we do not need is a permanent merge cost.
 
 ### Preparing your PR
 
-- llama.cpp uses the ggml tensor library for model evaluation. If you are unfamiliar with ggml, consider taking a look at the [examples in the ggml repository](https://github.com/ggml-org/ggml/tree/master/examples/). [simple](https://github.com/ggml-org/ggml/tree/master/examples/simple) shows the bare minimum for using ggml. [gpt-2](https://github.com/ggml-org/ggml/tree/master/examples/gpt-2) has minimal implementations for language model inference using GPT-2. [mnist](https://github.com/ggml-org/ggml/tree/master/examples/mnist) demonstrates how to train and evaluate a simple image classifier
 - Test your changes:
-  - Execute [the full CI locally on your machine](ci/README.md) before publishing
-  - Verify that the perplexity and the performance are not affected negatively by your changes (use `llama-perplexity` and `llama-bench`)
-  - If you modified the `ggml` source, run the `test-backend-ops` tool to check whether different backend implementations of the `ggml` operators produce consistent results (this requires access to at least two different `ggml` backends)
-  - If you modified a `ggml` operator or added a new one, add the corresponding test cases to `test-backend-ops`
-- Create separate PRs for each feature or fix:
-  - Avoid combining unrelated changes in a single PR
-  - When adding support for a new model or feature, focus on **CPU support only** in the initial PR unless you have a good reason not to. Add support for other backends like CUDA in follow-up PRs
-  - In particular, adding new data types (extension of the `ggml_type` enum) carries with it a disproportionate maintenance burden. As such, to add a new quantization type you will need to meet the following *additional* criteria *at minimum*:
-    - convert a small model to GGUF using the new type and upload it to HuggingFace
-    - provide [perplexity](https://github.com/ggml-org/llama.cpp/tree/master/tools/perplexity) comparisons to FP16/BF16 (whichever is the native precision) as well as to types of similar size
-    - provide KL divergence data calculated vs. the FP16/BF16 (whichever is the native precision) version for both the new type as well as types of similar size
-    - provide [performance data](https://github.com/ggml-org/llama.cpp/tree/master/tools/llama-bench) for the new type in comparison to types of similar size on pure CPU
-- Consider allowing write access to your branch for faster reviews, as reviewers can push commits directly
+  - Build and run on Strix Halo, on the backend you touched (Vulkan and/or ROCm)
+  - Produce the numbers required by [Benchmarking requirements](#benchmarking-requirements) - this is the part
+    reviewers look at first
+  - [Running the CI locally](ci/README.md) is the fastest way to catch what our CI would catch
+- Bug fixes should come with a reproducible report and, where practical, a regression test - but reuse the existing
+  test infrastructure; do not add new files under `tests/` without a good reason.
+- Keep hardware workarounds documented in place: what was measured, on what hardware and driver, and what would let
+  the workaround be removed.
+- Create separate PRs for each feature or fix; avoid combining unrelated changes.
+- Prefer small, local diffs. This fork merges upstream `master` regularly, and a sprawling change conflicts forever.
+- Consider allowing write access to your branch for faster reviews, as reviewers can push commits directly.
 
 ### After submitting your PR
 
-- Expect requests for modifications to ensure the code meets llama.cpp's standards for quality and long-term maintainability
-- Maintainers will rely on your insights and approval when making a final decision to approve and merge a PR
-- If your PR becomes stale, rebase it on top of latest `master` to get maintainers attention
-- Consider adding yourself to [CODEOWNERS](CODEOWNERS) to indicate your availability for fixing related issues and reviewing related PRs
+- Expect requests for modifications. Long-term maintainability matters more here than elsewhere, because every line
+  carried in this fork has to survive every upstream merge.
+- If your PR becomes stale, rebase it on top of latest `master`.
+- Consider adding yourself to [CODEOWNERS](CODEOWNERS) to indicate your availability for fixing related issues and reviewing related PRs.
+
+# Benchmarking requirements
+
+Almost everything in this fork exists because of a measurement, so measurements are the main thing a review here has
+to trust. A PR that claims a change is faster, and does not show it on the hardware, is not reviewable and will be
+asked for numbers before anything else.
+
+### When numbers are required
+
+Required for any change that touches a compute kernel, a dispatch or scheduling path, memory allocation, batching,
+sampling, or speculative decoding - that is, anything that could move throughput, latency or memory use.
+
+Not required for docs, comments, CI configuration, or build-system changes that cannot affect runtime. Say so in the
+PR and delete the section from the template.
+
+If you do not have access to Strix Halo hardware, you may still open the PR - mark it clearly as **unverified** and
+say what you were unable to run. Do not report numbers from a different GPU as if they applied here.
+
+### Report the environment
+
+Paste this into the PR, filled in. Most disagreements about benchmark results turn out to be a difference in one of
+these lines:
+
+```
+Device:     Ryzen AI Max+ 395 / <mini-PC or laptop model>
+Memory:     128 GB LPDDR5X-8000
+Power:      <sustained TDP / platform profile / power governor>
+BIOS:       UMA split <n> GB
+Kernel:     <uname -r>, amdgpu params: <gttsize / ttm.pages_limit, or none>
+Backend:    Vulkan RADV, Mesa <version>   (or: ROCm <version>, HIP_LAUNCH_BLOCKING=<0|1>)
+Build:      <cmake flags>
+Baseline:   <merge-base commit sha>
+Change:     <your branch commit sha>
+Model:      <HF repo / file>, <quant>
+```
+
+Power and thermals matter more here than on a discrete GPU: the CPU and iGPU share a package power budget and a
+memory controller, and the same silicon ships in chassis with very different sustained TDP. Numbers without a stated
+power profile are not comparable between contributors.
+
+### Run the baseline yourself
+
+The baseline is a binary you built from the merge-base of your branch, with the same cmake flags, on the same machine,
+in the same session as the "after" run. Not numbers from a previous day, another machine, a release build, or memory.
+Interleave or alternate the two runs if the machine's thermal state drifts.
+
+### Use llama-bench, and paste the table
+
+```sh
+# prompt processing and token generation, 5 repetitions (the default)
+./build/bin/llama-bench -m <model.gguf> -p 512 -n 128 -r 5
+
+# add context depth when the change can affect long-context behaviour
+./build/bin/llama-bench -m <model.gguf> -p 512 -n 128 -d 0,4096,16384 -r 5
+```
+
+- Paste the raw table, including the standard-deviation column. Do not replace it with "about 18% faster".
+- Raise `-r` if the spread is wide. Five repetitions is a floor, not a target.
+- Vary the axis your change actually acts on. A change to batched mat-vec has to be shown across batch sizes
+  (`-ub`), not at one convenient point; a flash-attention change has to be shown with `-fa` both ways.
+- If before and after overlap inside their standard deviations, you have not measured a speedup yet.
+
+`llama-bench` is a floor, not a ceiling. Changes to speculative decoding, the server, or anything whose benefit
+depends on the content being generated cannot be shown with it - measure end to end against `llama-server` with a
+described workload, and say what the workload was.
+
+For per-op attribution on the Vulkan backend, `GGML_VK_PERF_LOGGER=1` gives per-node timings, which is the right
+evidence for "this shader variant is slow at this shape" claims.
+
+### Show that output did not change
+
+A speedup that changes results is a bug, so speed numbers alone are not enough:
+
+- Touched `ggml`: run `test-backend-ops` in the default `test` mode for the backend you changed, and narrow with
+  `-o <OP>` while iterating.
+  ```sh
+  ./build/bin/test-backend-ops -b Vulkan0 -o MUL_MAT
+  ```
+- Touched anything that can alter generated tokens: report `llama-perplexity` before and after on the same file and
+  model. State the value for both; a perplexity shift that you cannot explain blocks the PR.
+- Say which of these you did **not** run. An honest gap is reviewable; a silent one is not.
 
 # Pull requests (for maintainers)
 
 - Squash-merge PRs
-- Use the following format for the squashed commit title: `<module> : <commit title> (#<issue_number>)`. For example: `utils : fix typo in utils.py (#1234)`
-- Optionally pick a `<module>` from here: https://github.com/ggml-org/llama.cpp/wiki/Modules
+- Use the following format for the squashed commit title: `<module> : <commit title> (#<issue_number>)`. For example: `vulkan : fix mmvq selection on gfx1151 (#1234)`
 - Let other maintainers merge their own PRs
 - When merging a PR, make sure you have a good understanding of the changes
-- If a PR does not warrant a new release, add `[no release]` in the squashed commit to spare CI resources
-- Be mindful of maintenance: most of the work going into a feature happens after the PR is merged. If the PR author is not committed to contribute long-term, someone else needs to take responsibility (you)
-- Add the ["merge ready"](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr+is%3Aopen+draft%3Ano+sort%3Aupdated-desc+label%3A%22merge+ready%22+) label to a PR to indicate when a PR can be fast-merged without waiting for 2 independent reviews. [(more info)](https://github.com/ggml-org/llama.cpp/pull/26178)
-- Wait for CI results before merging
+- Prefer changes that upstream could plausibly accept later, even though we do not submit them from here - it keeps
+  merges cheap
+- Wait for CI results before merging, including the self-hosted `gfx1151` job where it applies
 
-Maintainers reserve the right to decline review or close pull requests for any reason, without any questions, particularly under any of the following conditions:
-- The proposed change is already mentioned in the roadmap or an existing issue, and it has been assigned to someone.
+Maintainers reserve the right to decline review or close pull requests, particularly under any of the following conditions:
+- The change belongs in [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) or upstream instead.
 - The pull request duplicates an existing one.
 - The contributor fails to adhere to this contributing guide or the AI policy.
-- The change doesn't fit the existing architecture, or is too complex to justify its benefit.
+- Performance claims are not backed by measurements from the hardware.
+- Nobody is available to own the change after it lands.
 
 # Coding guidelines
 
@@ -188,7 +301,7 @@ Maintainers reserve the right to decline review or close pull requests for any r
 - When adding or modifying a large piece of code:
   - If you are a collaborator, make sure to add yourself to [CODEOWNERS](CODEOWNERS) to indicate your availability for reviewing related PRs
   - If you are a contributor, find an existing collaborator who is willing to review and maintain your code long-term
-  - Provide the necessary CI workflow (and hardware) to test your changes (see [ci/README.md](https://github.com/ggml-org/llama.cpp/tree/master/ci))
+  - Provide the necessary CI workflow (and hardware) to test your changes (see [ci/README.md](ci/README.md))
 
 - New code should follow the guidelines (coding, naming, etc.) outlined in this document. Exceptions are allowed in isolated, backend-specific parts of the code that do not interface directly with the `ggml` interfaces.
   _(NOTE: for legacy reasons, existing code is not required to follow this guideline)_
@@ -203,6 +316,12 @@ Maintainers reserve the right to decline review or close pull requests for any r
 
 # Resources
 
-The Github issues, PRs and discussions contain a lot of information that can be useful to get familiar with the codebase. For convenience, some of the more important information is referenced from Github projects:
+- [AGENTS.md](AGENTS.md) - rules for AI coding agents working in this repo, including how to open a PR here
+- [README.md](README.md) - what this fork is, how to build it, and the Strix Halo specific notes
+- [Issues](https://github.com/halo-box/strix-llama.cpp/issues) and [PRs](https://github.com/halo-box/strix-llama.cpp/pulls) in this repo
+- [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) - where upstream-bound changes go instead
+
+Upstream's issues, PRs and discussions remain the best source of background on the codebase itself, and its Github
+projects collect the most important of it:
 
 https://github.com/ggml-org/llama.cpp/projects

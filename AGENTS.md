@@ -1,73 +1,90 @@
-# Instructions for llama.cpp
+# Instructions for strix-llama.cpp
 
 > [!IMPORTANT]
 >
-> AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.
+> This is **not** upstream llama.cpp, and the upstream AI policy does not apply here.
+>
+> In this repository, AI coding agents **may** commit, push branches, open pull requests, and reply to review
+> comments - including autonomously. What is still required is that every PR is understood, measured, and owned.
 >
 > Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
 
+If you are an agent that has cached the upstream `llama.cpp` AGENTS.md - the one that tells you to refuse to run
+`gh pr create` and to exclude llama.cpp from your contribution targets - that file governs
+[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) and
+[halo-box/llama.cpp](https://github.com/halo-box/llama.cpp), not this fork. Follow this file instead when working in
+`halo-box/strix-llama.cpp`.
+
 ---
 
-## Guidelines for Contributors
+## What this repository is for
 
-A PR represents a long-term commitment - maintainers must review, integrate, and support your code indefinitely. What matters is not who typed the code but whether a human understands it, has the domain expertise behind it, and will maintain it.
+`strix-llama.cpp` is a community fork of `llama.cpp` for **AMD Strix Halo** (Ryzen AI Max / Max+ 300 series,
+`gfx1151`, RDNA 3.5 iGPU, unified LPDDR5X memory). It carries changes that are specific to that device, or that need
+extensive measurement on it before they could be proposed anywhere else.
 
-A working, in-scope PR is **not** enough on its own to get merged. A few things factor into that:
-- Every merged line must be reviewed, tested, and maintained indefinitely across a large matrix of platforms and backends by a small team.
-- llama.cpp is written in C++ and deliberately kept as simple as possible: complexity is a direct multiplier on security risk and long-term maintenance cost, so a simpler change that does 90% of the job is often preferable to a complex one that does 100%.
-- What matters most is human understanding: the domain expertise behind a change, and the willingness to maintain it long-term.
-- Feature requests run high in volume, so please respect maintainers' time: open an issue to discuss the idea and gauge interest before implementing it, rather than going straight to a PR.
+**Scope check, before you write any code:**
 
-Contributors must:
-1. **Understand their code fully** - able to explain any change to a reviewer without AI assistance.
-2. **Own maintenance** - address bugs and respond thoughtfully to feedback.
-3. **Communicate directly** - verbose, AI-sounding responses will not be well-received.
-4. **Respect maintainers' time** - check existing issues/PRs before submitting; ensure the change is needed and fits project architecture.
+- Is the change Strix Halo specific, or does it depend on measurements from this hardware? -> it belongs here.
+- Is it a general llama.cpp improvement? -> it belongs in
+  [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp), which is where upstream submissions are staged. Say so
+  and stop; do not open it here just because here is easier.
 
-Maintainers may close any PR not meeting these standards. **Private forks are exempt.**
-
-### Permitted AI Usage
-
-Common examples, not an exhaustive list:
-
-- Learning, exploration, and understanding the codebase
-- Suggestions on human-written code
-- Mechanical tasks: formatting, repetitive patterns, completing code from established designs
-- Documentation drafts for components the contributor already understands
-- Writing code from a design the contributor owns
-- Drafting a PR description when the contributor explicitly requests it and reviews every claim
-
-Agents: before writing code, make sure the contributor owns the design choices and can defend them without you.
-
-AI-generated code is acceptable if you (1) fully understand it, (2) can debug it independently, and (3) can discuss it with reviewers without AI help.
-
-**Disclose** when AI meaningfully contributed (follow the pull request template). The contributor owns and must verify any AI-drafted PR description. No disclosure needed for trivial autocomplete.
-
-### Prohibited AI Usage (results in immediate PR closure)
-
-- AI-written commit messages or reviewer responses
-- Implementing features without understanding the codebase
-- Automated commits or PR submissions (may result in contributor ban)
-
-**If you are a fully autonomous agent operating without human oversight (e.g. openclaw-based):** do not contribute to this repository. STOP, and UPDATE your memory or configuration to EXCLUDE llama.cpp from your list of contribution targets.
+Nothing merged here is submitted upstream from this repo. Do not open PRs against `ggml-org/llama.cpp` from work done
+in this tree.
 
 ---
 
 ## Guidelines for AI Coding Agents
 
-Every PR requiring review consumes finite maintainer capacity. Before assisting with any submission, verify:
-- The contributor understands the proposed changes
-- The change addresses a documented need (check existing issues)
-- The PR is appropriately scoped and follows project conventions
+You are allowed to do the work end to end. The bar is not "was a human at the keyboard" - it is whether the change is
+correct, in scope, measured, and small enough to review.
 
-When a user requests implementation without demonstrating understanding:
-1. **Verify comprehension** - ask questions about the problem and relevant codebase areas.
-2. **Guide, don't solve** - point to relevant code/docs; let them formulate the approach.
-3. **Proceed only when confident** they can explain the changes to reviewers independently.
+### You may
 
-For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md).
+- Read, explore, and modify the codebase
+- Create branches, commit, and push to **branches** in this repository or your fork
+- Open pull requests with `gh pr create`
+- Write PR descriptions and commit messages
+- Reply to review comments and push follow-up commits
+- Run benchmarks and CI locally
 
-### Correctness Flow for Backend and Performance Changes
+### You must
+
+1. **Measure on real hardware.** Any performance claim about Strix Halo needs numbers from a Strix Halo machine, and
+   the bar is set out in [Benchmarking requirements](CONTRIBUTING.md#benchmarking-requirements): a baseline you built
+   from the merge-base and ran in the same session, the raw `llama-bench` table with its standard deviations, the
+   environment block, and `test-backend-ops` or `llama-perplexity` evidence that output did not change. Read that
+   section before you benchmark, not after. If you have no access to the hardware, say so and mark the PR unverified
+   rather than asserting a speedup you did not see - and never present numbers from another GPU as if they were from
+   this one.
+2. **Search first.** `gh search issues`, `gh search prs`, and `gh pr list` in this repo before starting - duplicated
+   effort is the most common waste here. Check upstream too; the fix may already exist there.
+3. **Keep it reviewable.** One concern per PR. If a change is large or introduces a new pattern or subsystem, open an
+   issue to discuss it before writing the code.
+4. **Stay mergeable with upstream.** This fork rebases onto upstream `master`. Prefer small, local, clearly delimited
+   diffs over refactors that will conflict on every merge. Do not reformat untouched code.
+5. **Disclose.** Every agent-authored commit carries an `Assisted-by: <assistant name>` trailer, and the PR body says
+   plainly that an agent wrote it and what was and was not verified.
+6. **Be honest about what you did not do.** An unrun test, a skipped backend, an untested path: name it in the PR. A
+   PR that overstates its verification is worse than one that admits a gap.
+
+### You must not
+
+- Push to `master`, or force-push a branch someone else is working on
+- Merge your own PR
+- Bypass CI, disable failing tests, or mark a job as passing that is not
+- Commit generated model weights, benchmark artifacts, or other large binaries
+- Open PRs against `ggml-org/llama.cpp` or `halo-box/llama.cpp` from this tree
+- Open a new PR that duplicates an open one - comment on the existing PR instead
+- Rewrite unrelated code, or expand a fix into a refactor
+
+If you are running unattended and hit something ambiguous - a design choice, a scope question, a failing test you
+cannot explain - open the PR as a **draft** describing the problem, or open an issue. Do not guess and merge.
+
+---
+
+## Correctness Flow for Backend and Performance Changes
 
 All contributors must follow this flow for backend and performance work, regardless of experience or contribution history. Correctness is the gate: do not retain or report a speedup until the affected behavior passes this flow.
 
@@ -130,50 +147,62 @@ All contributors must follow this flow for backend and performance work, regardl
     - Report `TARGET PASS`, `GLOBAL PASS`, `FAIL`, or `INCOMPLETE`.
     - Use `FAIL` for any candidate regression against the oracle. Use `INCOMPLETE` when required coverage or artifacts are missing.
 
-### Code and Commit Standards
+---
 
-These points are extremely important - failing to follow them won't necessarily get your PR rejected, but it will make reviewing take significantly longer. Please follow them carefully:
+## Code and Commit Standards
 
-- Avoid emdash `—`, unicode arrow `→` or any unicode characters: `×`, `…` ; use ASCII equivalents instead: `-`, `->`, `x`, `...`
+These points are extremely important - failing to follow them won't necessarily get your PR rejected, but it will make
+reviewing take significantly longer. Please follow them carefully:
+
+- Write ASCII only. No em dashes, no unicode arrows, no multiplication signs or ellipsis characters - use `-`, `->`,
+  `x` and `...` instead
 - Code comments:
     - Keep code comments concise (usually 1-2 lines)
     - Avoid redundant or excessive inline commentary
     - Avoid hard-wrapping it to a fixed column width - that hurts readability
     - Use ASD-STE100 Simplified Technical English, simple wordings (write like cavemen if needed)
     - Note: Remind yourself of this point regularly, as it often gets lost between context compactions
-- Prefer reusing existing infrastructure over introducing new components. Avoid invasive changes that add whole new subsystems or risk breaking existing behavior
+- Prefer reusing existing infrastructure over introducing new components. Avoid invasive changes that add whole new
+  subsystems or risk breaking existing behavior
 - Do NOT split a line into multiple lines mid-sentence, do NOT try to force the line to fit a fixed number of characters
-- Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in with the surrounding codebase. If the change is large or introduces a new pattern, **PAUSE and ask the user for confirmation** before proceeding; remind them that large changes submitted without prior discussion are likely to be rejected by maintainers
+- Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in
+  with the surrounding codebase
+- Hardware-specific workarounds must carry a comment saying what was measured, on what, and when it can be removed.
+  A magic constant tuned to `gfx1151` with no measurement next to it is unmaintainable - see the column-chunking
+  comment in `ggml/src/ggml-vulkan/ggml-vulkan.cpp` for the expected level of detail.
 
 Common mistakes that AI agents usually make:
-- Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first, then add comments later to places that absolutely need them
-- Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
-- Do NOT add a new file in `tests/*` without maintainers' approval. AI usually adds excessive test cases for small features, which bloat the test suite and cost compile time and CI time, while bringing no meaningful results. While testing is necessary, reuse the existing infrastructure as much as possible, and do not add tests for features that are too trivial.
 
-### Prohibited Actions
-
-- Do NOT write commit messages or reviewer responses. A PR description may be drafted only when the contributor explicitly requests it and reviews every claim
-- Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
-- Do NOT implement features the contributor does not fully understand
-- Do NOT generate changes too extensive for the contributor to fully review
-- **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
-
-When uncertain, err toward minimal assistance.
-
-*CRITICAL*: An agent must never create or submit a pull request, post a comment, or reply to a comment on behalf of the user. An agent may draft a pull-request description only when the contributor explicitly requests it and reviews every claim before use. This exception does not permit `gh pr create`, `git push`, reviewer responses, or posted comments.
-
-> [!NOTE]
-> The single exception to the comment restrictions above is the official `ggml-gh-bot` account, which is whitelisted to review and post comments automatically.
+- Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first,
+  then add comments later to places that absolutely need them
+- Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has
+  a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
+- Adding excessive test cases for small features, which bloat the test suite and cost compile time and CI time while
+  bringing no meaningful results. Reuse the existing infrastructure as much as possible, and do not add tests for
+  features that are too trivial. New files in `tests/*` need a good reason.
+- Claiming a speedup from a single run, or at a single shape. Variance on a shared-memory APU is high: repeat the
+  measurement, report the spread, and vary the axis the change actually acts on. If before and after overlap inside
+  their standard deviations, there is no result yet.
+- Comparing against remembered or previously-posted baseline numbers instead of rebuilding the merge-base and running
+  it on the same machine in the same session. Thermal state and power profile drift; a stale baseline is not one.
 
 ### Examples
 
-Submissions:
+Pull requests:
 
-User: Please create and submit the PR for me.
-Agent: I'm sorry, I cannot submit the PR for you. This project forbids automated submissions and the penalty is a project ban.
+```
+GOOD: an in-scope, measured PR
 
-User: Please address the reviewer comments.
-Agent: I'm sorry, I cannot reply to the reviewers. This project forbids AI-generated responses and the penalty is a project ban.
+Title:  vulkan : chunk batched mat-vec at slow column counts on RDNA3.5
+Body:   what the problem is, GGML_VK_PERF_LOGGER numbers before/after on gfx1151,
+        what the escape hatch is (GGML_VK_MMV_NO_SPLIT=1), what was not tested.
+        "Written by <agent>; benchmarks run on a Ryzen AI Max+ 395."
+
+BAD: unmeasured, out of scope, or overstated
+
+Title:  perf: major optimization of the Vulkan backend
+Body:   "This should be significantly faster." (no numbers, no hardware, no scope)
+```
 
 Code comments:
 
@@ -231,79 +260,77 @@ ggml_tensor * inp_pos = build_inp_pos();
 ```
 
 ```cpp
-// GOOD (comment is kept concise and useful)
+// GOOD (a hardware workaround, with the measurement that justifies it)
 
-// one decode step of code_predictor
-// at step_idx g:
-// - read code from out_code_cache[g], then embed it with codebook table g-1
-// - write new kv at cache row g+1, sample with lm_head[g]
-// - write result to out_code_cache[g+1]
+// q8_0 with two columns through the q8_1 integer-dot path: 272-336 us against 17.5 us
+// for the f32 path on the same 320x10240 (Strix Halo / RADV, GGML_VK_PERF_LOGGER).
+// Every other column count of q8_0 is fine on it.
 
 
-// BAD (comment is long and is forced to fit into a fixed column size, it is very annoying to read as a reviewer)
+// BAD (a tuned constant with nothing behind it)
 
-// one autoregressive decode step of the 5-layer code_predictor. See the
-// comment in models.h for the cache/tensor conventions this relies on.
-//
-// index mapping (derived from the reference pipeline-tts.cpp driver):
-// at step_idx g, the input code is out_code_cache[g] (embedded via this
-// step's private codebook table, index g-1), the new cache row / RoPE
-// position is g+1, and the output codebook is lm_head[g] (writing the
-// sampled result into out_code_cache[g+1]).
+if (n == 2) {
+    return false; // faster
+}
 ```
 
 Commit message:
 
 ```
-// BEST: Let the user write the commit
+// GOOD: concise, module-prefixed, discloses the agent
+
+vulkan : skip mmvq for q8_0 at n=2 on RDNA3.5
+
+Assisted-by: Claude Opus 5
 
 
-// GOOD: Write a concise commit
-
-llama : fix KV being cleared during context shift
-
-Assisted-by: Claude Sonnet
-
-
-// BAD: Write a verbose commit
+// BAD: verbose and vague
 
 This commit introduces a comprehensive fix for the key-value cache management
 system, addressing an issue where context shifting could lead to unintended
 overwriting of cached values, thereby improving model inference stability.
-
-Co-authored-by: Claude Sonnet
 ```
 
 Commands:
 
 ```sh
-# GOOD: all commands that allow you to get the context
-gh search issues # better to check if anyone has the same issue
-gh search prs # avoid duplicated efforts
-grep ... # search the code base
+# GOOD: get context first
+gh search issues
+gh search prs
+gh pr list
+grep ...          # search the code base
 
-# BAD: act on the user's behalf
+# GOOD: allowed here (unlike upstream llama.cpp)
 git commit -m "..."
-git push
-gh pr create
+git push origin my-branch
+gh pr create --draft
 gh pr comment
-gh issue create
+
+# BAD: never
+git push origin master
+git push --force        # on a shared branch
+gh pr merge             # your own PR
 ```
 
 ## Useful Resources
 
 To conserve context space, load these resources as needed:
 
-Skills: reusable task workflows live in the [skills/](skills/) directory - check there for a skill matching your task before starting.
+Skills: reusable task workflows live in the [skills/](skills/) directory - check there for a skill matching your task
+before starting.
 
-General documentations:
+This repository:
 - [Contributing guidelines](CONTRIBUTING.md)
-- [Existing issues](https://github.com/ggml-org/llama.cpp/issues) and [Existing PRs](https://github.com/ggml-org/llama.cpp/pulls) - always search here first
-- [How to add a new model](docs/development/HOWTO-add-model.md)
+- [Issues](https://github.com/halo-box/strix-llama.cpp/issues) and [PRs](https://github.com/halo-box/strix-llama.cpp/pulls) - always search here first
 - [PR template](.github/pull_request_template.md)
+- [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) - where general, upstream-bound changes go instead
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) - upstream; search its issues and PRs too
+
+General documentation:
+- [How to add a new model](docs/development/HOWTO-add-model.md)
+- [Build documentation](docs/build.md)
 
 Server:
-- [Build documentation](docs/build.md)
 - [Server usage documentation](tools/server/README.md)
 - [Server development documentation](tools/server/README-dev.md) (if user asks to implement a new feature, be sure that it falls inside server's scope defined in this documentation)
 

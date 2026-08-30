@@ -56,7 +56,8 @@ struct llama_sampler * common_reasoning_budget_init(
     const llama_tokens &                                    intro_forced_tokens,
     int32_t                                                 budget,
     int32_t                                                 grace_tokens  = 0,
-    common_reasoning_budget_state                           initial_state = REASONING_BUDGET_IDLE);
+    common_reasoning_budget_state                           initial_state = REASONING_BUDGET_IDLE,
+    bool                                                    intro_once    = false);
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
 

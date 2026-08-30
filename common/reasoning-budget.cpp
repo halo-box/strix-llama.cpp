@@ -77,6 +77,7 @@ struct common_reasoning_budget_ctx {
 
     llama_tokens intro_forced_tokens;
     size_t       intro_force_pos;
+    bool         intro_once;
 
     int32_t grace_tokens;
     int32_t grace_remaining;
@@ -154,6 +155,11 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
         case REASONING_BUDGET_INTRO_FORCING:
             ctx->intro_force_pos++;
             if (ctx->intro_force_pos >= ctx->intro_forced_tokens.size()) {
+                if (ctx->intro_once) {
+                    // intro-mode once: do not re-fire on later reasoning blocks
+                    ctx->intro_forced_tokens.clear();
+                    ctx->intro_force_pos = 0;
+                }
                 if (ctx->remaining <= 0) {
                     ctx->state = REASONING_BUDGET_FORCING;
                     ctx->force_pos = 0;
@@ -354,7 +360,8 @@ static struct llama_sampler * common_reasoning_budget_init_state(
     const llama_tokens &                                    intro_forced_tokens,
     int32_t                                                 budget,
     int32_t                                                 grace_tokens,
-    common_reasoning_budget_state                           initial_state);
+    common_reasoning_budget_state                           initial_state,
+    bool                                                    intro_once);
 
 static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl);
 
@@ -395,7 +402,8 @@ static struct llama_sampler * common_reasoning_budget_init_state(
     const llama_tokens &                                    intro_forced_tokens,
     int32_t                                                 budget,
     int32_t                                                 grace_tokens,
-    common_reasoning_budget_state                           initial_state) {
+    common_reasoning_budget_state                           initial_state,
+    bool                                                    intro_once) {
     if (initial_state == REASONING_BUDGET_COUNTING && budget <= 0) {
         initial_state = REASONING_BUDGET_FORCING;
     }
@@ -426,6 +434,7 @@ static struct llama_sampler * common_reasoning_budget_init_state(
             /* .active_soft          = */ 0,
             /* .intro_forced_tokens  = */ intro_forced_tokens,
             /* .intro_force_pos      = */ 0,
+            /* .intro_once           = */ intro_once,
             /* .grace_tokens         = */ grace_tokens,
             /* .grace_remaining      = */ grace_tokens,
             /* .hard_pending_prev_nl = */ false,
@@ -441,9 +450,10 @@ struct llama_sampler * common_reasoning_budget_init(
         const llama_tokens &                                    intro_forced_tokens,
         int32_t                                                 budget,
         int32_t                                                 grace_tokens,
-        common_reasoning_budget_state                           initial_state) {
+        common_reasoning_budget_state                           initial_state,
+        bool                                                    intro_once) {
     return common_reasoning_budget_init_state(vocab, start_seqs, end_seqs, forced_tokens, soft_points,
-                                              intro_forced_tokens, budget, grace_tokens, initial_state);
+                                              intro_forced_tokens, budget, grace_tokens, initial_state, intro_once);
 }
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl) {
