@@ -9862,7 +9862,14 @@ static uint32_t ggml_vk_mmv_good_cols(ggml_type type, uint32_t n) {
 static constexpr uint32_t mul_mat_vec_chunk_max_cols = 16;
 static bool ggml_vk_mmv_can_chunk(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     static const bool no_split = getenv("GGML_VK_MMV_NO_SPLIT") != nullptr;
+
+    // Chunking cannot reuse the whole-tensor Q8_1 activation cache with a column offset.
+    // Keep the unsplit integer-dot path rather than silently changing its arithmetic.
+    const bool would_quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(src1) && (src1->ne[1] * src1->ne[0]) % 4 == 0 &&
+        ggml_vk_should_use_mmvq(ctx->device, src0->ne[1], src1->ne[1], src1->ne[0], src0->type);
     return !no_split && ggml_is_quantized(src0->type) &&
+           !would_quantize_y &&
            dst->ne[1] > mul_mat_vec_max_cols && dst->ne[1] <= mul_mat_vec_chunk_max_cols &&
            src1->ne[2] * src1->ne[3] == 1 && src1->type == GGML_TYPE_F32 &&
            ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ctx->num_additional_fused_ops == 0;
