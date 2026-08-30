@@ -4142,6 +4142,46 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
     };
 }
 
+// LDS bank spread for the coopmat matmul tiles. buf_a/buf_b are FLOAT_TYPEV2 (4 B), so the shared
+// stride in elements IS the stride in LDS banks, and RDNA has 32 of them:
+// SHMEM_STRIDE = BK/2 + pad reaches 32/gcd(BK/2+pad, 32) banks.
+//
+// The pad is NOT free to chase bank spread: the coopmat path hands SHMEM_STRIDE to coopMatLoad
+// as its Stride operand, and VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986 requires the
+// pointer and stride to be 16 B aligned for the 16x16 f16 tiles. Stride bytes are
+// (BK/2 + pad) * 4, so only pad % 4 == 0 is in contract, and the 16-bank stride 18 (72 B)
+// never is.
+//
+// What a driver does with the out-of-contract stride is codegen luck, ISA-verified on gfx1151:
+// RADV <= 25.2 lowers coopMatLoad with ds_read_b128 (the 16 B the contract guarantees), so the
+// misaligned rows pay runtime splits: Qwen3.6-35B pp512 597 vs 1426 t/s, Qwen3.8-27B 107 vs
+// 333. RADV >= 25.3 lowers to ds_read_b64, for which 72 B is always aligned, and the extra
+// bank spread nets +5-7% pp512 (measured on 25.3.0, 25.3.6, 26.0.8, 26.1.8, 26.2.1, 26.3-dev).
+// The codegen is pad-invariant per driver, so the effect is runtime address patterns, not
+// instruction selection.
+//
+// So: pad 2 for the quant tiles (BK 32) only on RADV >= 25.3.0; the spec-aligned pad 4
+// everywhere else. GGML_VK_SHMEM_PAD=N still overrides both paths, for probing.
+static uint32_t ggml_vk_coopmat_shmem_pad(const vk_device& device, uint32_t bk) {
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+        device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+        return 0;
+    }
+    static const int env_pad = [] {
+        const char * e = getenv("GGML_VK_SHMEM_PAD");
+        return e ? atoi(e) : -1;
+    }();
+    if (env_pad >= 0) {
+        return (uint32_t) env_pad;
+    }
+    if (device->coopmat_support && bk >= 32 &&
+        device->driver_id == vk::DriverId::eMesaRadv &&
+        device->properties.driverVersion >= VK_MAKE_API_VERSION(0, 25, 3, 0)) {
+        return 2;
+    }
+    return 4;
+}
+
 static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
 
     uint32_t lut_size = 0;
@@ -4181,10 +4221,11 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     }
 
     // Needs to be kept up to date on shader changes
-    // Needs to stay aligned with ggml_vk_mul_mm_spec.
-    const bool intel_shmem_stride_pad_zero = device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
-                                              device->driver_id == vk::DriverId::eIntelProprietaryWindows;
-    const uint32_t bank_conflict_offset = intel_shmem_stride_pad_zero ? 0 : (device->coopmat_support ? 8 : 1);
+    // Shared-memory budget: BM*(BK + 2*pad)*type_size, so the offset is 2x the pad that
+    // ggml_vk_mul_mm_spec will actually push. Both call ggml_vk_coopmat_shmem_pad to stay aligned.
+    const uint32_t bank_conflict_offset = device->coopmat_support
+                                          ? 2 * ggml_vk_coopmat_shmem_pad(device, warptile[3])
+                                          : 1;
     const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
     const uint32_t warps = warptile[0] / warptile[10];
 
@@ -4387,6 +4428,22 @@ static bool ggml_vk_mmid_f16b_enabled() {
     }();
     return enabled;
 }
+
+// GGML_VK_DENSE_F16B: same idea as GGML_VK_MMID_F16B but for plain MUL_MAT. Halves the B bytes
+// moved. Numerically identical: mul_mm stages B into shared FLOAT_TYPE either way, so the f32-B
+// kernel already rounds B to f16. Helps wide dense models, costs ~1% on narrow ones.
+// 0 = off, 1 = all quantized dense matmuls, 2 = auto (only the K we have positive data for)
+static int ggml_vk_dense_f16b_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_VK_DENSE_F16B");
+        if (e == nullptr) return 0;
+        if (e[0] == 'a') return 2;
+        return atoi(e) != 0 ? 1 : 0;
+    }();
+    return mode;
+}
+
+static bool ggml_vk_dense_f16b_enabled() { return ggml_vk_dense_f16b_mode() != 0; }
 
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
@@ -4821,10 +4878,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     auto const &ggml_vk_mul_mm_spec = [&device](std::vector<uint32_t> spec, bool aligned) {
         spec.push_back(aligned ? 1u : 0u);  // constantID=11: ALIGNED
-        if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
-            device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
-            spec.push_back(0u);  // constantID=12: SHMEM_STRIDE_PAD = 0
-            spec.push_back(1u);  // constantID=13: APPLY_SLM_A_RESHAPE = true
+        const uint32_t bk  = spec[3];
+        const uint32_t pad = ggml_vk_coopmat_shmem_pad(device, bk);
+        const bool intel_slm = device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support &&
+                               device->driver_id == vk::DriverId::eIntelProprietaryWindows;
+        if (intel_slm || pad != 4) {
+            spec.push_back(pad);                    // constantID=12: SHMEM_STRIDE_PAD
+            spec.push_back(intel_slm ? 1u : 0u);    // constantID=13: APPLY_SLM_A_RESHAPE
         }
         return spec;
     };
@@ -4944,20 +5004,91 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif  // defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat_support) {
+        // Deterministic subgroup sizing for the dense coopmat pipelines. Two parts:
+        //
+        // (1) The required subgroup size is the tile's own WARP, not the driver's choice. The cm1
+        //     shaders derive their warp grid from the real subgroup (warp_i = gl_SubgroupID) and
+        //     size shared arrays with NUM_WARPS = BLOCK_SIZE / WARP, so WARP and the actual
+        //     subgroup must agree - leaving that to the driver makes the agreement incidental.
+        //
+        // (2) The QUANTISED dense tiles run at wave32. RDNA3.x WMMA is wave32-native, so a wave64
+        //     subgroup issues each coopmat op as two halves. BLOCK_SIZE is kept, so the subgroup
+        //     count doubles and WM (or WN) halves until the warp grid tiles BM x BN again:
+        //     NUM_WARPS == (BM/WM)*(BN/WN). A tile that cannot be retiled is left at wave64.
+        //
+        // The FLOAT tiles are deliberately excluded. Measured on gfx1151 with a standalone
+        // MUL_MAT microbench at both dense FFN shapes (m=25600 k=5120, m=5120 k=25600):
+        // q6_K +5.2..+10.8%, q8_0 +5.4..+8.4%, q4_K +0.7..+9.1%, q4_0 -1.5..+1.8%, but
+        // f16 -6.7..+6.4% and bf16 ~0. The win tracks inline dequant instruction count
+        // (q6_K 3907 -> 3433 instructions at wave32, identical 192 VGPRs and 8 subgroups/SIMD),
+        // so it lands on the issue-bound quantised kernels and not on the float ones, which are
+        // bandwidth-bound on the weight stream.
+        //
+        // Scoped to AMD coopmat1 on a wave64 default; other vendors keep the driver default,
+        // since none of the above is validated there.
+        // GGML_VK_DENSE_WAVE32=0 disables, =2 additionally retiles the float tiles (probe).
+        const bool dense_sgs_scope =
+            device->vendor_id == VK_VENDOR_ID_AMD &&
+            device->driver_id != vk::DriverId::eAmdProprietary &&
+            device->subgroup_size_control;
+        const bool dense_wave32_possible =
+            dense_sgs_scope &&
+            device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size &&
+            device->subgroup_size > 32;
+        const char * dense_wave32_env = getenv("GGML_VK_DENSE_WAVE32");
+        const int    dense_wave32     = dense_wave32_env ? atoi(dense_wave32_env) : 1;
+
+        if (dense_wave32_possible && dense_wave32 != 0) {
+            auto wave32_tile = [](std::vector<uint32_t> & w) -> bool {
+                // {BLOCK_SIZE, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, WARP}
+                std::vector<uint32_t> t = w;
+                t[10] = 32;
+                for (int guard = 0; guard < 4 && t[0] / t[10] != (t[1] / t[4]) * (t[2] / t[5]); ++guard) {
+                    if (t[4] >= t[5] && t[4] > t[7]) {
+                        t[4] /= 2;  // halve WM, keeping WM >= TM
+                    } else {
+                        t[5] /= 2;  // halve WN
+                    }
+                }
+                if (t[0] / t[10] != (t[1] / t[4]) * (t[2] / t[5]) || t[4] < t[7] || t[5] < t[8]) {
+                    return false;
+                }
+                w = t;
+                return true;
+            };
+            wave32_tile(l_warptile_mmq);
+            wave32_tile(m_warptile_mmq);
+            wave32_tile(s_warptile_mmq);
+            if (dense_wave32 >= 2) {
+                wave32_tile(l_warptile);
+                wave32_tile(m_warptile);
+                wave32_tile(s_warptile);
+            }
+        }
+
+        // WARP -> required subgroup size, or 0 where the device cannot honor one.
+        auto dense_req_sgs = [dense_sgs_scope, &device](const std::vector<uint32_t> & w) -> uint32_t {
+            const uint32_t warp = w[10];
+            if (!dense_sgs_scope || warp < device->subgroup_min_size || warp > device->subgroup_max_size) {
+                return 0;
+            }
+            return warp;
+        };
+
         // Create 6 variants, {s,m,l}x{unaligned,aligned}
 #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, dense_req_sgs(l_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, dense_req_sgs(m_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, dense_req_sgs(s_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, dense_req_sgs(l_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, dense_req_sgs(m_ ## WARPTILE));   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, dense_req_sgs(s_ ## WARPTILE));   \
 
         // Create 2 variants, {f16,f32} accumulator
 #define CREATE_MM2(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
@@ -4992,6 +5123,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_K], matmul_q4_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_K], matmul_q5_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_K], matmul_q6_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+
+        // f16-B variants of the same quant pipelines. The _f16 SPIR-V is already built for
+        // every type; upstream only instantiates it in the coopmat2 branch.
+        if (ggml_vk_dense_f16b_enabled()) {
+        CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_0], matmul_q4_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_1], matmul_q4_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_0], matmul_q5_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_1], matmul_q5_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q8_0], matmul_q8_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q2_K], matmul_q2_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q3_K], matmul_q3_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_K], matmul_q4_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_K], matmul_q5_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q6_K], matmul_q6_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        }
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_S],   matmul_iq1_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_M],   matmul_iq1_m_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ2_XXS, pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ2_XXS], matmul_iq2_xxs_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -8195,7 +8341,8 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return pipelines;
     }
 
-    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2) {
+    if (src1_type != GGML_TYPE_F32 && !ctx->device->coopmat2 &&
+        !(src1_type == GGML_TYPE_F16 && ggml_vk_dense_f16b_enabled())) {
         return nullptr;
     }
 
@@ -8234,7 +8381,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
     }
     if (ctx->device->coopmat_support) {
-        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+        vk_matmul_pipeline2 & p = (src1_type == GGML_TYPE_F16) ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type]
+                                                              : ctx->device->pipeline_dequant_mul_mat_mat[src0_type];
+        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? p.f16acc : p.f32acc;
     }
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
 }
@@ -9692,7 +9841,26 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // Reformat and convert to fp16 if non-contiguous, or for coopmat2 for better perf
     const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||
                               !ggml_vk_dim01_contiguous(src0);
-    const bool y_non_contig = (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
+    // Route quantized MUL_MAT through the f16-B kernels. Treating contiguous f32 B as
+    // y_non_contig reuses the convert-to-prealloc_y plumbing, like coopmat2 does.
+    // auto mode restricts to ne10 == 5120: the only width measured to gain. Narrow on purpose,
+    // so widths measured as losses (3584 dense, 2048 MoE) cannot trigger it.
+    const bool dense_f16b = ggml_vk_dense_f16b_enabled() &&
+                            (ggml_vk_dense_f16b_mode() == 1 || ne10 == 5120) &&
+                            ctx->device->coopmat_support && !ctx->device->coopmat2 &&
+                            ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
+                            !(ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type].f16acc->is_empty() &&
+                              ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type].f32acc->is_empty());
+    if (dense_f16b) {
+        static bool dense_f16b_logged = false;
+        if (!dense_f16b_logged) {
+            dense_f16b_logged = true;
+            fprintf(stderr, "ggml_vulkan: MUL_MAT f16-B path engaged (GGML_VK_DENSE_F16B)\n");
+        }
+    }
+
+    const bool y_non_contig = dense_f16b ||
+                              (ctx->device->coopmat2 && src1->type == GGML_TYPE_F32) ||
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
                               !ggml_vk_dim01_contiguous(src1);
 
