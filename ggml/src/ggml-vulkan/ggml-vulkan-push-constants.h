@@ -12,7 +12,8 @@ struct vk_mat_mat_push_constants {
     uint32_t base_work_group_z; uint32_t num_batches;
     uint32_t k_split;
     uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
-    uint32_t padded_N;
+    uint32_t n_experts;
+    uint32_t hoist_row_ids;
 };
 
 struct vk_mat_vec_push_constants {
@@ -393,6 +394,10 @@ template <> inline void init_pushconst_fastdiv(vk_op_glu_push_constants &p) {
     init_fastdiv_values(p.ne22*p.ne21*p.ne20,  p.ne2_012mp,    p.ne2_012L);
     init_fastdiv_values(p.ne21*p.ne20,         p.ne2_01mp,     p.ne2_01L);
     init_fastdiv_values(p.ne20,                p.ne2_0mp,      p.ne2_0L);
+}
+
+template <> void init_pushconst_fastdiv(vk_op_count_experts_push_constants &p) {
+    init_fastdiv_values(p.ne00, p.ne00mp, p.ne00L);
 }
 
 template <> inline void init_pushconst_fastdiv(vk_op_count_experts_push_constants &p) {
