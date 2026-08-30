@@ -1644,6 +1644,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
+        { "--kv-unified-per-slot" }, "N",
+        "context limit per parallel slot (default: unset, behavior unchanged).\n"
+        "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",
+        [](common_params & params, int value) {
+            params.kv_unified_per_slot = value;
+        }
+    ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION
@@ -2727,9 +2735,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- auto: on, but only for tensors larger than 4 GiB\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
-            /**/ if (value == "on")   { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_ON;   }
-            else if (value == "auto") { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; }
-            else if (value == "off")  { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;  }
+            /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
+            else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
+            else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_TENSOR_READ_LAZY"));
@@ -2770,6 +2778,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
+    add_opt(common_arg(
+        {"--ngram-on-disk"},
+        "keep the model's n-gram hash-embedding table (per_layer_token_embd, 28.8 GB on Qwen3.8-Flash-Next)\n"
+        "on disk: it is never mapped or loaded, each batch reads just the rows it gathers from the GGUF.\n"
+        "Only qwen4exp has such a table; on any other model this is a no-op",
+        [](common_params & params) {
+            params.ple_on_disk = true;
+        }
+    ).set_env("LLAMA_ARG_NGRAM_ON_DISK"));
+    add_opt(common_arg(
+        {"--ngram-io-threads"}, "N",
+        string_format("threads reading n-gram rows for --ngram-on-disk (default: %d)", params.ple_io_threads),
+        [](common_params & params, int value) {
+            params.ple_io_threads = value;
+        }
+    ).set_env("LLAMA_ARG_NGRAM_IO_THREADS"));
+    add_opt(common_arg(
+        {"--ngram-cache"}, "MiB",
+        string_format("in-memory cache of recently read n-gram rows for --ngram-on-disk, 0 disables (default: %d)", params.ple_cache_mb),
+        [](common_params & params, int value) {
+            params.ple_cache_mb = value;
+        }
+    ).set_env("LLAMA_ARG_NGRAM_CACHE"));
+    add_opt(common_arg(
+        {"--ngram-direct-io"},
+        {"--no-ngram-direct-io"},
+        string_format("read n-gram rows with O_DIRECT so they bypass the page cache (default: %s)", params.ple_direct_io ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.ple_direct_io = value;
+        }
+    ).set_env("LLAMA_ARG_NGRAM_DIRECT_IO"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
