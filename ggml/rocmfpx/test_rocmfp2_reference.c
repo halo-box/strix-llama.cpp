@@ -1,3 +1,11 @@
+// ROCmFPx quant formats, hand-ported into this fork.
+//
+// Origin:      https://github.com/charlie12345/ROCmFPX - creator of the ROCmFP4 format.
+// Ported from: https://github.com/ciru-ai/ROCmFPX - a fork of the above.
+//
+// Both upstream projects are MIT licensed and based on llama.cpp; upstream authors
+// retain their authorship and MIT license credit. See LICENSE.
+
 #include "rocmfp2_reference.h"
 
 #include <inttypes.h>
