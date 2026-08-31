@@ -15923,7 +15923,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return device->pipeline_topk_radix_f32 != nullptr;
             }
-            return true;
         case GGML_OP_UPSCALE:
             if (op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS) {
                 if ((op->op_params[0] & 0xFF) != GGML_SCALE_MODE_BILINEAR) {
