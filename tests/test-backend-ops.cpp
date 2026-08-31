@@ -8305,13 +8305,17 @@ struct test_flash_attn_ext_top_k : public test_case {
     const bool    sinks;
     const int64_t ns;       // sequences (ne3); >1 exercises the split-K stream stride
     const int64_t ov;       // % of each token's picks shared with its neighbours (dedup-union realism)
-    const ggml_type type_K; // K/V cache type; V is the same tensor, so one type covers both
-
-    static constexpr int64_t hs = 512; // V4 CSA head size, K == V latent
-    static constexpr int64_t nh = 64;  // V4 CSA query heads (MQA)
+    const ggml_type type_K; // K/V cache type; with shared_kv one type covers K and V
+    // Defaults are the DeepSeek V4 CSA shape (hs 512, 64 MQA query heads, V == the K latent).
+    // qwen4exp's QSA is an ordinary GQA cache instead: hs 256, 24 query heads over 2 KV heads,
+    // and a V tensor of its own - which the compact gather has to gather separately.
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t nh_kv;
+    const bool    shared_kv;
 
     std::string vars() override {
-        return VARS_TO_STR8(kv, nb, n_kv_raw, n_top_k, sinks, ns, ov, type_K);
+        return VARS_TO_STR12(kv, nb, n_kv_raw, n_top_k, sinks, ns, ov, type_K, hs, nh, nh_kv, shared_kv);
     }
 
     double max_nmse_err() override {
@@ -8326,18 +8330,23 @@ struct test_flash_attn_ext_top_k : public test_case {
     }
 
     test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128, bool sinks = false, int64_t ns = 1, int64_t ov = 0,
-                              ggml_type type_K = GGML_TYPE_F16)
-        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), ns(ns), ov(ov), type_K(type_K) {}
+                              ggml_type type_K = GGML_TYPE_F16,
+                              int64_t hs = 512, int64_t nh = 64, int64_t nh_kv = 1, bool shared_kv = true)
+        : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), ns(ns), ov(ov), type_K(type_K),
+          hs(hs), nh(nh), nh_kv(nh_kv), shared_kv(shared_kv && nh_kv == 1) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, ns);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hs, kv, 1, ns);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hs, kv, nh_kv, ns);
         ggml_set_name(k, "k");
 
-        // V4 CSA attends over the K latent itself: V is the same cache tensor
-        ggml_tensor * v = ggml_view_4d(ctx, k, hs, kv, 1, ns, k->nb[1], k->nb[2], k->nb[3], 0);
+        // V4 CSA attends over the K latent itself: V is the same cache tensor. An ordinary
+        // GQA cache has a V of its own, which is the second thing the gather has to compact.
+        ggml_tensor * v = shared_kv
+            ? ggml_view_4d(ctx, k, hs, kv, nh_kv, ns, k->nb[1], k->nb[2], k->nb[3], 0)
+            : ggml_new_tensor_4d(ctx, type_K, hs, kv, nh_kv, ns);
         ggml_set_name(v, "v");
 
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
@@ -11782,6 +11791,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // worst case, so they cover the estimator's gate as well as the union itself.
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008,  8, 2304, 512, false, 1, 60));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 60));
+    // qwen4exp QSA (Qwen3.8-Flash-Next): hs 256, 24 query heads over 2 KV heads, separate V,
+    // no dense prefix, 2051 selected cells. nb=1 is the decode case the arch actually runs;
+    // nb=4 covers a draft batch; kv=4096 sits under the gather's kv >= 2*kv_c gate and so
+    // verifies dense-fallback parity with the hint attached. The nh_kv=1/separate-V case
+    // isolates the second gather from the head dimension.
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 4096, 1, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192, 1, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 1, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 4, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 1, 0, 2051, false, 2, 0, GGML_TYPE_F16, 256, 24, 2, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 1, 0, 2051, true,  1, 0, GGML_TYPE_F16, 256, 24, 2, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 1, 512, 512, false, 1, 0, GGML_TYPE_F16, 512, 64, 1, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86));
     // quantised K/V: the gather relocates rows verbatim, so it should serve any type whose row
     // is a whole number of 4-byte words. These are the shapes a DSv4 decode with -ctk q8_0 hits,
@@ -12252,6 +12273,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // qwen4exp QSA depth terms, per attention layer per decoded token. The FA op is only part
+    // of the decode-at-depth cost; these are the other n_kv-sized ops in the same block:
+    //   top_k   - select 2051 of n_kv cell scores
+    //   get_rows f16 [128 x n_kv] gathering every indexer key for the block pooling
+    //   get_rows f32 [1 x n_blocks] expanding block scores back to cell granularity
+    // multiply any of these by 12 layers to compare against the FA numbers.
+    for (auto cols : {8192, 32768, 65536, 131072}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 1, 1, 1}, 2051));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 128, cols, cols, 1, 1, false));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, cols/4, cols, 1, 1, false));
+    }
+
     for (auto nrows : {1, 4, 8, 16}) {
         for (auto cols : {128, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000, 2000000}) {
             test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, {cols, nrows, 1, 1}));
@@ -12368,6 +12401,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // does not.
     for (int nb : { 8, 16 }) {
         test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, nb, 2304, 512, false, 1, 86));
+    }
+    // qwen4exp QSA (Qwen3.8-Flash-Next): hs 256, 24 query heads over 2 KV heads, a V tensor of
+    // its own, no dense prefix, 2051 selected cells. nb=1 IS the decode case here - the arch
+    // attends densely over the whole cache at every step today, so this pair of cells is what
+    // says whether the compact gather engages at that shape and what it is worth at depth.
+    for (int kv : { 8192, 32768, 65536, 131072 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 1, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false));
     }
     // q8_0 K/V at the same shapes: DSv4 with -ctk q8_0 took the dense fallback before the
     // gather became type-agnostic, so this is the cell that says whether it now pays there.

@@ -2069,6 +2069,9 @@ struct vk_op_flash_attn_gather_union_push_constants {
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
     uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, nem3, n_batch, row_words;
+    // nbk2/n_head_kv carry the KV-head dimension a GQA cache has and MLA does not; write_mask
+    // is 0 on the second (V) pass when K and V are separate tensors.
+    uint32_t nbk2, n_head_kv, write_mask;
 };
 static_assert(sizeof(vk_op_flash_attn_gather_push_constants) <= 128);
 
@@ -12567,8 +12570,14 @@ struct vk_fa_compact_state {
     uint32_t row_bytes = 0;       // bytes per compact K row; K may be quantised
     uint32_t row_elems = 0;       // K row stride in ELEMENTS/blocks, for the FA push constant
     bool dequantized = false;     // scratch holds f16 because the gather decoded on the way in
+    // A GQA cache gathers each KV head into its own compact block, and its V is a separate
+    // tensor rather than the K latent. MLA leaves these at 1 / equal-to-K and behaves as before.
+    uint32_t n_head_kv = 1;
+    bool separate_v = false;      // vc_buf holds V; otherwise V is read from kc_buf
+    uint32_t v_row_bytes = 0;
+    uint32_t v_row_elems = 0;
     vk_subbuffer kv_buf;
-    vk_subbuffer kc_buf, mc_buf;
+    vk_subbuffer kc_buf, mc_buf, vc_buf;
 };
 
 // Small host-visible buffer holding the last union count the device produced:
@@ -12667,17 +12676,29 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         ggml_vk_fa_kv_native(k->type, ctx->device->coopmat2) &&
         k->ne[0] % ggml_blck_size(k->type) == 0 &&
         ggml_row_size(k->type, k->ne[0]) % 4 == 0 &&
-        k->nb[1] % 4 == 0 && k->nb[3] % 4 == 0;
+        k->nb[1] % 4 == 0 && k->nb[2] % 4 == 0 && k->nb[3] % 4 == 0;
+
+    // V is the K latent for MLA (one gather serves both); a GQA cache carries a separate V
+    // tensor and more than one KV head, so it needs a second gather and a head dimension.
+    const bool same_kv    = k->buffer == v->buffer && k->data == v->data;
+    const bool separate_v = !same_kv;
+    const uint32_t n_head_kv = (uint32_t) k->ne[2];
+    // The dequantise-on-gather variant is still written for the single-head MLA row, so a
+    // quantised GQA cache declines here and runs dense rather than gathering wrong rows.
+    const bool v_word_addressable = !separate_v ||
+        (v->nb[1] % 4 == 0 && v->nb[2] % 4 == 0 && v->nb[3] % 4 == 0 &&
+         v->ne[0] % ggml_blck_size(v->type) == 0 && ggml_row_size(v->type, v->ne[0]) % 4 == 0);
 
     if ((gather_env && gather_env[0] == '0') ||
         !top_k || !ctx->device->pipeline_flash_attn_gather_f16 ||
         q->ne[1] < 1 || q->ne[1] >= 64 ||   // 1..63: >=64 goes to the sparse prefill path
-        q->type != GGML_TYPE_F32 || !kv_word_addressable ||
+        q->type != GGML_TYPE_F32 || !kv_word_addressable || !v_word_addressable ||
         !mask || mask->type != GGML_TYPE_F16 || top_k->type != GGML_TYPE_I32 ||
-        q->ne[0] != 512 || k->ne[0] != 512 || v->ne[0] != 512 || q->ne[2] != 64 ||
-        k->ne[2] != 1 || v->ne[2] != 1 ||
+        q->ne[0] != k->ne[0] || k->ne[2] != v->ne[2] || n_head_kv == 0 ||
+        q->ne[2] % n_head_kv != 0 ||
+        ((n_head_kv != 1 || separate_v) && k->type != GGML_TYPE_F16) ||
         q->ne[1] != top_k->ne[1] || q->ne[3] != top_k->ne[3] ||
-        k->ne[1] != v->ne[1] || k->buffer != v->buffer || k->data != v->data ||
+        k->ne[1] != v->ne[1] || (separate_v && v->ne[3] != k->ne[3]) ||
         !ggml_is_contiguous(mask) || !ggml_is_contiguous(top_k)) {
         return false;
     }
@@ -12728,7 +12749,10 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     const bool     bitmap_fits = (uint64_t) ((k->ne[1] - n_kv_raw) + 31) / 32 <= max_words;
 
     static const char * union_env = getenv("GGML_VK_FA_TOPK_UNION");
+    // The deduplicated union still assumes the MLA row (one KV head, V == K), so a GQA cache
+    // takes the per-token form below. That only costs it the small-batch/draft case.
     if ((!union_env || union_env[0] != '0') && q->ne[3] == 1 && n_batch > 1 && bitmap_fits &&
+        n_head_kv == 1 && !separate_v &&
         ctx->device->pipeline_flash_attn_union_f16 && ctx->device->pipeline_flash_attn_gather_union_f16 &&
         ggml_vk_fa_union_stat_init(ctx)) {
         const uint32_t max_union = n_cand;
@@ -12853,8 +12877,11 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         st.n_batch    = n_batch;
         st.row_bytes   = u_row_by;
         st.row_elems   = dq ? (uint32_t) k->ne[0] : (uint32_t) (k->ne[0] / ggml_blck_size(k->type));
+        st.v_row_bytes = st.row_bytes;   // MLA: V is the K latent, one head, one scratch
+        st.v_row_elems = st.row_elems;
         st.dequantized = dq;
         st.kc_buf     = kc_buf;
+        st.vc_buf     = kc_buf;   // V is the K latent here, so it reads the same scratch
         st.mc_buf     = mc_buf;
         st.kv_buf     = uc_buf;
         return true;
@@ -12874,12 +12901,15 @@ union_unavailable:;
     const bool     tok_dq   = ggml_is_quantized(k->type) && ctx->device->pipeline_flash_attn_gather_dq[k->type];
     const uint32_t row_by   = tok_dq ? (uint32_t) (k->ne[0] * sizeof(ggml_fp16_t)) : k_row_bytes;
 
+    const uint32_t v_row_by = separate_v ? (uint32_t) ggml_row_size(v->type, v->ne[0]) : row_by;
+
     const uint32_t ns    = (uint32_t) q->ne[3];
-    const size_t   kc_sz = (size_t) ns * kv_c * row_by;
+    const size_t   kc_sz = (size_t) ns * n_head_kv * kv_c * row_by;
+    const size_t   vc_sz = separate_v ? (size_t) ns * n_head_kv * kv_c * v_row_by : 0;
     const size_t   mc_sz = (size_t) ns * n_batch * kv_c * sizeof(ggml_fp16_t);
 
-    if (ctx->prealloc_size_y < kc_sz + mc_sz) {
-        ctx->prealloc_size_y = kc_sz + mc_sz;
+    if (ctx->prealloc_size_y < kc_sz + vc_sz + mc_sz) {
+        ctx->prealloc_size_y = kc_sz + vc_sz + mc_sz;
         ggml_vk_preallocate_buffers(ctx, subctx);
     }
     if (ctx->prealloc_y_need_sync) {
@@ -12888,27 +12918,40 @@ union_unavailable:;
 
     vk_pipeline pipeline = tok_dq ? ctx->device->pipeline_flash_attn_gather_dq[k->type]
                                   : ctx->device->pipeline_flash_attn_gather_f16;
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
-    // the fused decoder steps K in BLOCKS and writes elements; the verbatim one does words
-    const vk_op_flash_attn_gather_push_constants pc = {
-        (uint32_t) k->ne[1], (uint32_t) n_kv_raw, (uint32_t) top_k->ne[0], kv_c,
-        tok_dq ? (uint32_t) (k->nb[1] / ggml_type_size(k->type)) : (uint32_t) (k->nb[1] / 4),
-        tok_dq ? (uint32_t) (k->nb[3] / ggml_type_size(k->type)) : (uint32_t) (k->nb[3] / 4),
-        (uint32_t) (top_k->nb[1] / sizeof(int32_t)),
-        (uint32_t) (top_k->nb[3] / sizeof(int32_t)),
-        (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
-        (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
-        (uint32_t) mask->ne[3],
-        n_batch, tok_dq ? (uint32_t) k->ne[0] : k_row_words,
-    };
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, separate_v ? 2 : 1);
 
     st.kc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0);
-    st.mc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, kc_sz);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, top_k),
-          ggml_vk_tensor_subbuffer(ctx, mask), st.kc_buf, st.mc_buf },
-        pc, { kv_c, 1, ns });
+    st.vc_buf = separate_v ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, kc_sz) : st.kc_buf;
+    st.mc_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_y, kc_sz + vc_sz);
+
+    // One pass per source tensor. The K pass also compacts the mask; the V pass reuses the
+    // same row mapping, so it only relocates rows.
+    auto run_gather = [&](const ggml_tensor * src, vk_subbuffer & dst_buf, uint32_t write_mask) {
+        // the fused decoder steps K in BLOCKS and writes elements; the verbatim one does words
+        const vk_op_flash_attn_gather_push_constants pc = {
+            (uint32_t) k->ne[1], (uint32_t) n_kv_raw, (uint32_t) top_k->ne[0], kv_c,
+            tok_dq ? (uint32_t) (src->nb[1] / ggml_type_size(src->type)) : (uint32_t) (src->nb[1] / 4),
+            tok_dq ? (uint32_t) (src->nb[3] / ggml_type_size(src->type)) : (uint32_t) (src->nb[3] / 4),
+            (uint32_t) (top_k->nb[1] / sizeof(int32_t)),
+            (uint32_t) (top_k->nb[3] / sizeof(int32_t)),
+            (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
+            (uint32_t) (mask->nb[3] / sizeof(ggml_fp16_t)),
+            (uint32_t) mask->ne[3],
+            n_batch,
+            tok_dq ? (uint32_t) src->ne[0] : (uint32_t) (ggml_row_size(src->type, src->ne[0]) / 4),
+            tok_dq ? (uint32_t) (src->nb[2] / ggml_type_size(src->type)) : (uint32_t) (src->nb[2] / 4),
+            n_head_kv, write_mask,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, src), ggml_vk_tensor_subbuffer(ctx, top_k),
+              ggml_vk_tensor_subbuffer(ctx, mask), dst_buf, st.mc_buf },
+            pc, { kv_c, n_head_kv, ns });
+    };
+
+    run_gather(k, st.kc_buf, 1);
+    if (separate_v) {
+        run_gather(v, st.vc_buf, 0);
+    }
     ggml_vk_sync_buffers(ctx, subctx);
     ctx->prealloc_y_need_sync = true;
 
@@ -12965,6 +13008,10 @@ union_unavailable:;
     st.row_bytes = row_by;
     st.row_elems = tok_dq ? (uint32_t) k->ne[0] : (uint32_t) (k->ne[0] / ggml_blck_size(k->type));
     st.dequantized = tok_dq;
+    st.n_head_kv = n_head_kv;
+    st.separate_v = separate_v;
+    st.v_row_bytes = v_row_by;
+    st.v_row_elems = separate_v ? (uint32_t) (v->ne[0] / ggml_blck_size(v->type)) : st.row_elems;
     return true;
 }
 
@@ -13127,7 +13174,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         // rows are tightly packed in the compact scratch; for a quantised K this is the block
         // count per row, which is what nbk1 / ggml_type_size would have given for the source
         k_stride = fa_compact.row_elems;
-        v_stride = fa_compact.row_elems;
+        v_stride = fa_compact.v_row_elems;
     }
 
     // For F32, the shader treats it as a block of size 4 (for vec4 loads)
@@ -13279,7 +13326,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
     if (fa_compact.active) {
         k_buf    = fa_compact.kc_buf;
-        v_buf    = fa_compact.kc_buf; // V is the K latent; one gather serves both
+        v_buf    = fa_compact.vc_buf; // == kc_buf when V is the K latent (MLA)
         mask_buf = fa_compact.mc_buf;
     }
     vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
@@ -13342,9 +13389,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // compact scratch layout: [512, kv_c, 1, ns] tightly packed, in K's own type
     const uint32_t eff_nbk2 = fa_compact.active ? fa_compact.kv_c * fa_compact.row_bytes : nbk2_eff;
-    const uint32_t eff_nbk3 = fa_compact.active ? fa_compact.kv_c * fa_compact.row_bytes : nbk3_eff;
-    const uint32_t eff_nbv2 = fa_compact.active ? eff_nbk2 : nbv2_eff;
-    const uint32_t eff_nbv3 = fa_compact.active ? eff_nbk3 : nbv3_eff;
+    const uint32_t eff_nbk3 = fa_compact.active ? fa_compact.n_head_kv * fa_compact.kv_c * fa_compact.row_bytes : nbk3_eff;
+    const uint32_t eff_nbv2 = fa_compact.active ? fa_compact.kv_c * fa_compact.v_row_bytes : nbv2_eff;
+    const uint32_t eff_nbv3 = fa_compact.active ? fa_compact.n_head_kv * fa_compact.kv_c * fa_compact.v_row_bytes : nbv3_eff;
 
     const vk_flash_attn_push_constants pc = { N, KV,
                                               (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3,
