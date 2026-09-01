@@ -457,20 +457,6 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
-        // Measured on gfx1151 with 4096x14336 MMVQ on 2026-09-01. Wider blocks regress the other types.
-        if (ncols_dst == 1) {
-            switch (type) {
-                case GGML_TYPE_Q5_K:
-                case GGML_TYPE_Q6_K:
-                    return 4;
-                case GGML_TYPE_Q5_1:
-                case GGML_TYPE_MXFP4:
-                case GGML_TYPE_Q4_K:
-                    return 2;
-                default:
-                    break;
-            }
-        }
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
@@ -599,12 +585,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static_assert(calc_nwarps(GGML_TYPE_Q5_1, 1, MMVQ_PARAMETERS_RDNA3_5) == 2);
+static_assert(calc_nwarps(GGML_TYPE_Q5_1, 1, MMVQ_PARAMETERS_RDNA3_5) == 1);
 static_assert(calc_nwarps(GGML_TYPE_Q8_0, 1, MMVQ_PARAMETERS_RDNA3_5) == 1);
-static_assert(calc_nwarps(GGML_TYPE_MXFP4, 1, MMVQ_PARAMETERS_RDNA3_5) == 2);
-static_assert(calc_nwarps(GGML_TYPE_Q4_K, 1, MMVQ_PARAMETERS_RDNA3_5) == 2);
-static_assert(calc_nwarps(GGML_TYPE_Q5_K, 1, MMVQ_PARAMETERS_RDNA3_5) == 4);
-static_assert(calc_nwarps(GGML_TYPE_Q6_K, 1, MMVQ_PARAMETERS_RDNA3_5) == 4);
+static_assert(calc_nwarps(GGML_TYPE_MXFP4, 1, MMVQ_PARAMETERS_RDNA3_5) == 1);
+static_assert(calc_nwarps(GGML_TYPE_Q4_K, 1, MMVQ_PARAMETERS_RDNA3_5) == 1);
+static_assert(calc_nwarps(GGML_TYPE_Q5_K, 1, MMVQ_PARAMETERS_RDNA3_5) == 1);
+static_assert(calc_nwarps(GGML_TYPE_Q6_K, 1, MMVQ_PARAMETERS_RDNA3_5) == 1);
 static_assert(calc_nwarps(GGML_TYPE_Q1_0, 1, MMVQ_PARAMETERS_RDNA3_5) == 1);
 static_assert(calc_nwarps(GGML_TYPE_Q2_0, 1, MMVQ_PARAMETERS_RDNA3_5) == 1);
 static_assert(calc_nwarps(GGML_TYPE_Q4_0, 1, MMVQ_PARAMETERS_RDNA3_5) == 1);
