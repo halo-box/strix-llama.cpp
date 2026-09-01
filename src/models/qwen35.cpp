@@ -231,6 +231,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);
+    if (cparams.embeddings_nextn && n_tokens <= 16 && cur->op == GGML_OP_MUL_MAT) {
+        ggml_mul_mat_set_hint(cur, GGML_HINT_EXACT_BATCH);
+    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
