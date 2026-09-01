@@ -2,6 +2,13 @@
 
 #include <stdint.h>
 
+static constexpr int concat_transposed_tile_y(int cc) {
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) ? 16 : 8;
+}
+
+static_assert(concat_transposed_tile_y(GGML_CUDA_CC_RDNA3_5) == 16);
+static_assert(concat_transposed_tile_y(GGML_CUDA_CC_RDNA3) == 8);
+
 // contiguous kernels
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(const T * x,
@@ -79,6 +86,54 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
+template <typename T>
+static __global__ void concat_transposed_src1_dim0(
+        const char * src0, const char * src1, char * dst,
+        int64_t ne00, int64_t ne10, int64_t ne11,
+        uint64_t nb00, uint64_t nb01, uint64_t nb02,
+        uint64_t nb10, uint64_t nb11, uint64_t nb12,
+        uint64_t nb0, uint64_t nb1, uint64_t nb2) {
+    constexpr int tile = 32;
+    __shared__ T values[tile][tile + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int64_t channel0 = blockIdx.x * tile;
+    const int64_t token0 = blockIdx.y * tile;
+    const int64_t i2 = blockIdx.z;
+
+    ggml_cuda_pdl_sync();
+
+    for (int j = 0; j < tile; j += blockDim.y) {
+        const int64_t token = token0 + ty + j;
+        const int64_t channel = channel0 + tx;
+        if (token < ne10 && channel < ne11) {
+            values[ty + j][tx] = *reinterpret_cast<const T *>(src1 + i2 * nb12 + channel * nb11 + token * nb10);
+        }
+    }
+    __syncthreads();
+
+    for (int j = 0; j < tile; j += blockDim.y) {
+        const int64_t token = token0 + tx;
+        const int64_t channel = channel0 + ty + j;
+        if (token < ne10 && channel < ne11) {
+            *reinterpret_cast<T *>(dst + i2 * nb2 + channel * nb1 + (ne00 + token) * nb0) = values[tx][ty + j];
+        }
+    }
+
+    if (blockIdx.y == 0) {
+        for (int j = 0; j < tile; j += blockDim.y) {
+            const int64_t channel = channel0 + ty + j;
+            if (channel < ne11) {
+                for (int64_t state = tx; state < ne00; state += tile) {
+                    *reinterpret_cast<T *>(dst + i2 * nb2 + channel * nb1 + state * nb0) =
+                        *reinterpret_cast<const T *>(src0 + i2 * nb02 + channel * nb01 + state * nb00);
+                }
+            }
+        }
+    }
+}
+
 // non-contiguous kernel (slow)
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -141,6 +196,24 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+    if (dim == 0 && src1->ne[0] >= 32 && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
+            src0->nb[0] == sizeof(T) && src0->nb[1] == src0->ne[0] * sizeof(T) &&
+            src1->nb[1] == sizeof(T) && src1->nb[0] == src1->ne[1] * sizeof(T) &&
+            dst->nb[0] == sizeof(T) && dst->nb[1] == dst->ne[0] * sizeof(T) &&
+            src0->ne[1] == src1->ne[1] && src0->ne[2] == src1->ne[2]) {
+        constexpr int tile = 32;
+        const int tile_y = concat_transposed_tile_y(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+        const dim3 block_dims(tile, tile_y, 1);
+        const dim3 block_nums((src1->ne[1] + tile - 1) / tile, (src1->ne[0] + tile - 1) / tile, src1->ne[2]);
+        concat_transposed_src1_dim0<T><<<block_nums, block_dims, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src1->ne[0], src1->ne[1],
+            src0->nb[0], src0->nb[1], src0->nb[2],
+            src1->nb[0], src1->nb[1], src1->nb[2],
+            dst->nb[0], dst->nb[1], dst->nb[2]);
+        return;
+    }
+
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;

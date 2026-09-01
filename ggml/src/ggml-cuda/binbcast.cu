@@ -26,6 +26,43 @@ static __device__ __forceinline__ float op_div(const float a, const float b) {
     return a / b;
 }
 
+template <float (*bin_op)(const float, const float)>
+static __global__ void binary_contiguous_f32(const float * src0, const float * src1, float * dst, int64_t n) {
+    ggml_cuda_pdl_lc();
+    int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = int64_t(blockDim.x) * gridDim.x;
+    ggml_cuda_pdl_sync();
+    for (; i < n; i += stride) {
+        dst[i] = bin_op(src0[i], src1[i]);
+        if (n - i <= stride) {
+            break;
+        }
+    }
+}
+
+template <float (*bin_op)(const float, const float)>
+static bool try_binary_contiguous_f32(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src0->ne[0] != 2048 ||
+        !ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, dst) ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int threads = 256;
+    const int64_t n = ggml_nelements(dst);
+    if (n == 0) {
+        return true;
+    }
+    const int blocks = std::min<int64_t>((n - 1) / threads + 1, 65535);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(binary_contiguous_f32<bin_op>, launch_params,
+        (const float *) src0->data, (const float *) src1->data, (float *) dst->data, n);
+    return true;
+}
+
 template <float (*bin_op)(const float, const float),
           typename src0_t,
           typename src1_t,
@@ -435,6 +472,9 @@ void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (try_binary_contiguous_f32<op_add>(ctx, dst)) {
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
@@ -443,6 +483,9 @@ void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (try_binary_contiguous_f32<op_mul>(ctx, dst)) {
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
@@ -540,6 +583,86 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         default:
             GGML_ASSERT(false && "Unsupported n_fuse value");
     }
+}
+
+template <int n_expert_used>
+static __global__ void weighted_expert_sum_f32(
+        const float * experts, const float * weights, float * dst,
+        int64_t n_embd, int64_t n_tokens, int64_t experts_s1, int64_t experts_s2,
+        int64_t weights_s1, int64_t weights_s2) {
+    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= n_embd * n_tokens) {
+        return;
+    }
+
+    const int64_t token = index / n_embd;
+    const int64_t channel = index - token * n_embd;
+    // Keep MUL rounding separate from ADD to match the unfused graph.
+    volatile float product = experts[token * experts_s2 + channel] * weights[token * weights_s2];
+    float sum = product;
+#pragma unroll
+    for (int i = 1; i < n_expert_used; ++i) {
+        product = experts[token * experts_s2 + i * experts_s1 + channel] * weights[token * weights_s2 + i * weights_s1];
+        sum += product;
+    }
+    dst[index] = sum;
+}
+
+void ggml_cuda_op_weighted_expert_sum(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * dst, int n_expert_used) {
+    const ggml_tensor * experts = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * weights = experts == mul->src[0] ? mul->src[1] : mul->src[0];
+    const int64_t n_embd = experts->ne[0];
+    const int64_t n_tokens = experts->ne[2];
+    const int threads = 256;
+    const int blocks = (n_embd * n_tokens + threads - 1) / threads;
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    // MUL output may alias experts, so stage until all expert reads finish.
+    ggml_cuda_pool_alloc<float> result(ctx.pool(), n_embd * n_tokens);
+
+#define launch_weighted_expert_sum(n) \
+    ggml_cuda_kernel_launch(weighted_expert_sum_f32<n>, launch_params, \
+        (const float *) experts->data, (const float *) weights->data, result.get(), \
+        n_embd, n_tokens, experts->nb[1] / sizeof(float), experts->nb[2] / sizeof(float), \
+        weights->nb[1] / sizeof(float), weights->nb[2] / sizeof(float))
+    switch (n_expert_used) {
+        case 2: launch_weighted_expert_sum(2); break;
+        case 3: launch_weighted_expert_sum(3); break;
+        case 4: launch_weighted_expert_sum(4); break;
+        case 5: launch_weighted_expert_sum(5); break;
+        case 6: launch_weighted_expert_sum(6); break;
+        case 7: launch_weighted_expert_sum(7); break;
+        case 8: launch_weighted_expert_sum(8); break;
+        default: GGML_ABORT("unsupported expert count");
+    }
+#undef launch_weighted_expert_sum
+
+    CUDA_CHECK(cudaMemcpyAsync(dst->data, result.get(), ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+}
+
+static __global__ void shared_mul_add_f32(
+        const float * src, const float * gate, const float * other, const float * residual, float * dst,
+        int64_t n_embd, int64_t nelements) {
+    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= nelements) {
+        return;
+    }
+    volatile float product = src[index] * gate[index / n_embd];
+    float value = other[index] + product;
+    dst[index] = value + residual[index];
+}
+
+void ggml_cuda_op_shared_mul_add(
+        ggml_backend_cuda_context & ctx, ggml_tensor * mul, const ggml_tensor * other,
+        const ggml_tensor * residual, ggml_tensor * dst) {
+    const ggml_tensor * src = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * gate = src == mul->src[0] ? mul->src[1] : mul->src[0];
+    const int threads = 256;
+    const int64_t nelements = ggml_nelements(dst);
+    const int blocks = (nelements + threads - 1) / threads;
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(shared_mul_add_f32, launch_params,
+        (const float *) src->data, (const float *) gate->data, (const float *) other->data,
+        (const float *) residual->data, (float *) dst->data, dst->ne[0], nelements);
 }
 
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
