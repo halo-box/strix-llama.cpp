@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 #include "log.h"
 #include "llama-cpp.h"
 #include "llama.h"
@@ -12,6 +13,9 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -200,6 +204,25 @@ static test_status test_multi_seq_split_replay(const common_params & params, lla
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, true);
         }
     }
+    // the in-place recurrent state is only enabled for qwen35 and qwen35moe
+    char arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    if (strcmp(arch, "qwen35") != 0 && strcmp(arch, "qwen35moe") != 0) {
+        fprintf(stderr, "%s : skipping test_seq_cp_graph_reuse for %s\n", __func__, arch);
+        return 0;
+    }
+
+    llama_model * model_scaled = load_model_scaled(params);
+    if (model_scaled == nullptr) {
+        fprintf(stderr, "%s : failed to create scaled model\n", __func__);
+        return 1;
+    }
+    const bool ok = test_seq_cp_graph_reuse(params, model_scaled);
+    llama_model_free(model_scaled);
+    if (!ok) {
+        return 1;
+    }
+
     ok = llama_decode(ctx_roll.get(), batch) == 0;
     ok = ok && llama_decode(ctx_ref.get(), batch) == 0;
     llama_batch_free(batch);
