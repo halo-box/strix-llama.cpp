@@ -307,7 +307,8 @@ static void launch_gated_delta_net(
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
-    const int num_warps = GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && H == 64 && !KDA ? 32 :
+    // Qwen3.6 PP2048 measured faster on gfx1151 on 2026-09-02. Retest if occupancy changes.
+    const int num_warps = GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && (H == 32 || H == 64) && !KDA ? 32 :
         (GGML_CUDA_CC_IS_RDNA3_5(cc) ? 16 : gated_delta_net_num_warps(cc));
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
