@@ -242,6 +242,41 @@ static ggml_cuda_device_info ggml_cuda_init() {
             GGML_LOG_WARN("%s: ignoring invalid GGML_CUDA_DEVICES=\"%s\"\n", __func__, devices_env);
         }
     }
+    // Qwen3.5 shared expert gate for one token: mul_mat(w [2048, 1], y) -> sigmoid -> mul -> add -> add
+    if (node->op == GGML_OP_MUL_MAT && i + 4 < cgraph->n_nodes && node->type == GGML_TYPE_F32 &&
+        node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+        node->src[0]->ne[0] == 2048 && ggml_nelements(node->src[0]) == 2048 && ggml_nelements(node->src[1]) == 2048 &&
+        ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) && ggml_nelements(node) == 1 &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD }, { i + 4 }) &&
+        ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID && cgraph->nodes[i + 1]->src[0] == node &&
+        GGML_CUDA_CC_IS_AMD(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        const ggml_tensor * sigmoid = cgraph->nodes[i + 1];
+        ggml_tensor * mul  = cgraph->nodes[i + 2];
+        ggml_tensor * add0 = cgraph->nodes[i + 3];
+        ggml_tensor * add1 = cgraph->nodes[i + 4];
+        const ggml_tensor * gate = mul->src[0] == sigmoid ? mul->src[0] : mul->src[1];
+        const ggml_tensor * src  = gate == mul->src[0] ? mul->src[1] : mul->src[0];
+        const ggml_tensor * other = add0->src[0];
+        const ggml_tensor * residual = add1->src[1];
+        const uintptr_t dst_begin = (uintptr_t) add1->data;
+        const uintptr_t dst_end = dst_begin + ggml_backend_buft_get_alloc_size(add1->buffer->buft, add1);
+        const auto safe_output_alias = [&](const ggml_tensor * input) {
+            const uintptr_t begin = (uintptr_t) input->data;
+            const uintptr_t end = begin + ggml_backend_buft_get_alloc_size(input->buffer->buft, input);
+            return !(begin < dst_end && dst_begin < end) || (input->data == add1->data && ggml_are_same_layout(input, add1));
+        };
+        if (gate == sigmoid && ggml_nelements(sigmoid) == 1 && add0->src[1] == mul && add1->src[0] == add0 &&
+            other != mul && residual != mul && residual != add0 &&
+            mul->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32 &&
+            mul->ne[0] == 2048 && ggml_nelements(mul) == 2048 && ggml_are_same_shape(mul, src) && ggml_are_same_shape(mul, other) &&
+            ggml_are_same_shape(mul, residual) && ggml_are_same_shape(mul, add1) &&
+            ggml_is_contiguous(src) && ggml_is_contiguous(other) && ggml_is_contiguous(residual) && ggml_is_contiguous(add1) &&
+            safe_output_alias(src) && safe_output_alias(other) && safe_output_alias(residual)) {
+            ggml_cuda_op_shared_gate_mul_add(*cuda_ctx, node, src, other, residual, add1);
+            return 4;
+        }
+    }
+
 
     if (info.device_count > GGML_CUDA_MAX_DEVICES) {
         GGML_LOG_WARN("%s: requested %d devices, clamping to GGML_CUDA_MAX_DEVICES=%d\n",

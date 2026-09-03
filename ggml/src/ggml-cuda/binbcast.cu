@@ -731,6 +731,65 @@ void ggml_cuda_op_shared_mul_add(
         (const float *) residual->data, (float *) dst->data, dst->ne[0], nelements);
 }
 
+// Qwen3.5 shared-expert gate for one token: gate = sigmoid(w . y) computed exactly like
+// mul_mat_vec_f<float, float, 1, 256> (same per-thread fma chain and the same two-level warp reduction),
+// then dst = (other + src*gate) + residual as in shared_mul_add_f32. One block, so the activation vector is
+// fully read before the reduction barrier and the output may alias it.
+static __global__ void __launch_bounds__(256, 1) shared_gate_mul_add_f32(
+        const float * w, const float * y, const float * src, const float * other, const float * residual, float * dst,
+        const int ncols2, const int64_t n_embd) {
+    constexpr int block_size = 256;
+    constexpr int warp_size  = 32;
+    __shared__ float buf_iw[warp_size];
+    __shared__ float gate_s;
+
+    const int tid = threadIdx.x;
+    if (tid < warp_size) {
+        buf_iw[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const float2 * x2 = (const float2 *) w;
+    const float2 * y2 = (const float2 *) y;
+    float sumf = 0.0f;
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const float2 tmpx = x2[col2];
+        const float2 tmpy = y2[col2];
+        ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+        ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+    }
+    sumf = warp_reduce_sum<warp_size>(sumf);
+    buf_iw[tid/warp_size] = sumf;
+    __syncthreads();
+    if (tid < warp_size) {
+        sumf = buf_iw[tid];
+        sumf = warp_reduce_sum<warp_size>(sumf);
+        if (tid == 0) {
+            gate_s = 1.0f / (1.0f + expf(-sumf));
+        }
+    }
+    __syncthreads();
+
+    const float gate = gate_s;
+    for (int64_t i = tid; i < n_embd; i += block_size) {
+        const float product = rounded_mul_f32(src[i], gate);
+        const float value   = rounded_add_f32(other[i], product);
+        dst[i] = rounded_add_f32(value, residual[i]);
+    }
+}
+
+void ggml_cuda_op_shared_gate_mul_add(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * src, const ggml_tensor * other,
+        const ggml_tensor * residual, ggml_tensor * dst) {
+    const ggml_tensor * w = gate_mm->src[0];
+    const ggml_tensor * y = gate_mm->src[1];
+    GGML_ASSERT(w->ne[0] % 2 == 0);
+    const ggml_cuda_kernel_launch_params launch_params(1, 256, 0, ctx.stream());
+    ggml_cuda_kernel_launch(shared_gate_mul_add_f32, launch_params,
+        (const float *) w->data, (const float *) y->data, (const float *) src->data, (const float *) other->data,
+        (const float *) residual->data, (float *) dst->data, (int) (w->ne[0] / 2), dst->ne[0]);
+}
+
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
