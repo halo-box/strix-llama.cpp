@@ -2,6 +2,8 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
 
 #include "types.glsl"
 
@@ -31,7 +33,7 @@ layout (push_constant) uniform parameter {
 shared uint histo[RADIX_SIZE];
 shared uint sh_bucket;
 shared uint sh_above;
-shared uint out_count;
+shared uint sg_cnt[64];  // per-subgroup hit counts for the slot scan
 
 // order-preserving float -> uint mapping
 uint f2ui(float x) {
@@ -114,25 +116,44 @@ void topk(const uint row) {
         barrier();
     }
 
-    if (tid == 0) {
-        out_count = 0;
-    }
-    barrier();
 
-    // emit everything above the threshold, then fill the rest from ties
+    // Emit everything above the threshold, then fill the rest from ties. Slots come from
+    // an exclusive scan over the candidate flags, one BLOCK_SIZE chunk at a time in ascending
+    // index order, so the output is identical on every run. The previous atomicAdd slot
+    // counter made the ORDER scheduling-dependent, and at the tie boundary the SET as well:
+    // the QSA width is top_k + ratio - 1, so the boundary block's ratio tied cells race for
+    // ratio - 1 slots and a different cell lost each run (non-repeatable output at depth).
+    // With the scan the lowest-indexed tied cells win.
     const uint threshold = prefix;
-    for (uint i = tid; i < ncols; i += BLOCK_SIZE) {
-        if (f2ui(load(row, i, false)) > threshold) {
-            data_d[row_out + atomicAdd(out_count, 1u)] = int(i);
-        }
-    }
-    barrier();
-    for (uint i = tid; i < ncols; i += BLOCK_SIZE) {
-        if (f2ui(load(row, i, false)) == threshold) {
-            const uint pos = atomicAdd(out_count, 1u);
-            if (pos < p.k) {
-                data_d[row_out + pos] = int(i);
+    uint base = 0;
+    [[dont_unroll]] for (uint pass = 0; pass < 2; ++pass) {
+        for (uint c = 0; c < ncols; c += BLOCK_SIZE) {
+            const uint i   = c + tid;
+            bool hit = false;
+            if (i < ncols) {
+                const uint key = f2ui(load(row, i, false));
+                hit = (pass == 0) ? (key > threshold) : (key == threshold);
             }
+            const uvec4 ballot  = subgroupBallot(hit);
+            const uint  rank_sg = subgroupBallotExclusiveBitCount(ballot);
+            const uint  cnt_sg  = subgroupBallotBitCount(ballot);
+            if (subgroupElect()) {
+                sg_cnt[gl_SubgroupID] = cnt_sg;
+            }
+            barrier();
+            uint sg_base = 0;
+            uint total   = 0;
+            for (uint sg = 0; sg < gl_NumSubgroups; ++sg) {
+                const uint v = sg_cnt[sg];
+                sg_base += (sg < gl_SubgroupID) ? v : 0;
+                total   += v;
+            }
+            const uint slot = base + sg_base + rank_sg;
+            if (hit && slot < p.k) {
+                data_d[row_out + slot] = int(i);
+            }
+            base += total;
+            barrier();
         }
     }
 }
