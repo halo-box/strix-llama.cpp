@@ -718,6 +718,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // On RDNA3.5 the D=256 tile kernel is FMA-bound for prefill batches; the WMMA kernel with 64 columns is ~30-45% faster.
+    // For smaller batches (ncols 16/32 configs) the tile kernel is still faster.
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] * gqa_ratio_eff > 32) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
