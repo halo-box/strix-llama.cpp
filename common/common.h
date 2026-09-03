@@ -438,12 +438,25 @@ struct common_params_speculative {
     bool has_prefill() const {
         return prefill.enabled && !prefill.model.empty();
     }
+
+    // cap on the rollback snapshot slots, -1 = follow draft.n_max (see need_n_rs_seq)
+    int32_t n_rs_seq_max = -1;
+
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+
+        // the recurrent cache holds (1 + n_rs_seq) copies of every sequence's state, which on a
+        // large linear-attention model is GiBs. Capping trades speed for memory: a rollback
+        // deeper than n_rs_seq is still correct, it just falls back to the host checkpoint.
+        const int32_t n = n_rs_seq_max >= 0 ? std::min(n_rs_seq_max, draft.n_max) : draft.n_max;
+
+        return (uint32_t) std::max(0, n);
     }
 };
 
