@@ -26,11 +26,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, args, stream);
             break;
         case GGML_TYPE_Q8_0:
-            if (use_rdna3_5_q8_id_narrow(args)) {
-                launch_mul_mat_q_q8_0_j48(ctx, args, stream);
-            } else {
-                mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
-            }
+            mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
         case GGML_TYPE_Q2_K:
@@ -40,23 +36,17 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, args, stream);
             break;
         case GGML_TYPE_Q4_K:
-            if (use_rdna3_5_q45_id_narrow(args)) {
-                launch_mul_mat_q_q4_k_j48(ctx, args, stream);
-            } else {
-                mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, args, stream);
-            }
+            mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, args, stream);
             break;
         case GGML_TYPE_Q5_K:
             if (use_rdna3_5_q5_ling(args)) {
-                launch_mul_mat_q_q5_k_j32(ctx, args, stream);
-            } else if (use_rdna3_5_q45_id_narrow(args)) {
                 launch_mul_mat_q_q5_k_j32(ctx, args, stream);
             } else {
                 mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, args, stream);
             }
             break;
         case GGML_TYPE_Q6_K:
-            if (use_rdna3_5_q6_ling_j32(args) || use_rdna3_5_q6_id_narrow(args)) {
+            if (use_rdna3_5_q6_ling_j32(args)) {
                 launch_mul_mat_q_q6_k_j32(ctx, args, stream);
             } else {
                 mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, args, stream);

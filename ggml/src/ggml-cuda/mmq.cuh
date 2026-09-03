@@ -1593,6 +1593,40 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
+// RDNA3.5 tile selection for MoE (mul_mat_id) with 256 experts.
+// The per-expert row count is n_tokens*n_expert_used/256 (16/32/64 for ubatch 512/1024/2048 with 8 active experts),
+// but the generic selection below only sees ncols_max == n_tokens*n_expert_used and picks J=128, so most of every
+// tile is padding. Use a narrow J and the routed-compact kernel, which only enumerates real per-expert tiles.
+// J per type/row count was measured on gfx1151 for the 2048x512 and 3072x1024 expert shapes.
+static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t rows_per_expert) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+            return rows_per_expert == 16 || rows_per_expert == 32 || rows_per_expert == 64 ? 48 : 0;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return rows_per_expert == 16 || rows_per_expert == 64 ? 32 : rows_per_expert == 32 ? 48 : 0;
+        default:
+            return 0;
+    }
+}
+
+static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int J) {
+    return (type == GGML_TYPE_Q8_0 && J == 48) ||
+        ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) && (J == 32 || J == 48));
+}
+
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0, 16) == 48);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q6_K, 16) == 32);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q4_K, 32) == 48);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q5_K, 64) == 32);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0, 48) == 0);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q4_0, 16) == 0);
+static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 48));
+static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 32));
+static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q6_K, 32));
+static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ2_XS, 48));
+
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -1628,8 +1662,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
     const bool use_compact_routed = args.ids_dst != nullptr && args.nchannels_y == 256 && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
-        !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc) &&
-        ((type == GGML_TYPE_Q6_K && J == 32) || (type == GGML_TYPE_Q8_0 && J == 48));
+        !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc) && mmq_rdna3_5_id_use_compact(type, J);
     if (use_compact_routed) {
         const int max_descriptors = (args.ncols_dst + J - 1) / J + args.nchannels_y;
         ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
@@ -1693,20 +1726,6 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
          ntx_fd);
 }
-static constexpr bool mmq_use_rdna3_5_q8_id_j48(
-        ggml_type type, int cc, bool fallback, bool has_ids, int64_t ncols_dst, int64_t nchannels_y) {
-    return type == GGML_TYPE_Q8_0 && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback && has_ids && nchannels_y > 0 &&
-        (ncols_dst + nchannels_y - 1) / nchannels_y == 32;
-}
-
-static_assert(mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, true, 8192, 256));
-static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3, false, true, 8192, 256));
-static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q4_0, GGML_CUDA_CC_RDNA3_5, false, true, 8192, 256));
-static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, true, true, 8192, 256));
-static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, false, 8192, 256));
-static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, true, 7936, 256));
-static_assert(!mmq_use_rdna3_5_q8_id_j48(GGML_TYPE_Q8_0, GGML_CUDA_CC_RDNA3_5, false, true, 8193, 256));
-
 static constexpr bool mmq_use_rdna3_5_iq_id_j48(
         ggml_type type, int cc, bool fallback, bool has_ids, int64_t ncols_dst, int64_t nchannels_y) {
     return (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS) && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
@@ -1733,12 +1752,15 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             J_best = J_rdna3_5;
             ntiles_J_best = 1;
         }
-    } else if (mmq_use_rdna3_5_q8_id_j48(type, cc, fallback, args.ids_dst != nullptr, args.ncols_dst, args.nchannels_y)) {
-        constexpr int J_rdna3_5 = 48;
-        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_rdna3_5, fallback, cc);
-        if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
-            J_best = J_rdna3_5;
-            ntiles_J_best = 1;
+    } else if (GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback && args.ids_dst != nullptr && args.nchannels_y == 256) {
+        const int64_t rows_per_expert = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
+        const int J_rdna3_5 = mmq_rdna3_5_id_get_J(type, rows_per_expert);
+        if (J_rdna3_5 != 0) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_rdna3_5, fallback, cc);
+            if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                J_best = J_rdna3_5;
+                ntiles_J_best = 1;
+            }
         }
     }
 
