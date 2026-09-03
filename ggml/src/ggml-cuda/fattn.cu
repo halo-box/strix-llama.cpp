@@ -355,6 +355,19 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
+static bool ggml_cuda_fattn_tile_q8_0_KV_supported(const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    return Q->ne[1] == 1 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && Q->ne[0] == K->ne[0] && K->ne[0] == V->ne[0] &&
+        (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256);
+#else
+    GGML_UNUSED(dst);
+    return false;
+#endif // GGML_USE_HIP
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -488,6 +501,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
+    if (ggml_cuda_fattn_tile_q8_0_KV_supported(dst) && gqa_opt_applies && gqa_ratio_eff >= 2) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
@@ -513,6 +530,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+
+    // On RDNA3.5 the D=256 tile kernel is FMA-bound for prefill batches; the WMMA kernel with 64 columns is ~30-45% faster.
+    // For smaller batches (ncols 16/32 configs) the tile kernel is still faster.
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] * gqa_ratio_eff > 32) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
@@ -549,6 +572,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            if (ggml_cuda_fattn_tile_q8_0_KV_supported(dst)) {
+                break;
+            }
+            need_f16_K = true;
+            need_f16_V = true;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;

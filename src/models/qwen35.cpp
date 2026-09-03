@@ -221,6 +221,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     // LM head
     cur = build_lora_mm(model.output, cur, model.output_s);
+    if (cparams.embeddings_nextn && n_tokens <= 16 && cur->op == GGML_OP_MUL_MAT) {
+        ggml_mul_mat_set_hint(cur, GGML_HINT_EXACT_BATCH);
+    }
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
@@ -268,6 +271,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+    if (cparams.embeddings_nextn && n_tokens <= 16 && Qcur_full->op == GGML_OP_MUL_MAT) {
+        ggml_mul_mat_set_hint(Qcur_full, GGML_HINT_EXACT_BATCH);
+    }
     cb(Qcur_full, "Qcur_full", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
@@ -280,9 +286,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Qcur, "Qcur_normed", il);
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    if (cparams.embeddings_nextn && n_tokens <= 16 && Kcur->op == GGML_OP_MUL_MAT) {
+        ggml_mul_mat_set_hint(Kcur, GGML_HINT_EXACT_BATCH);
+    }
     cb(Kcur, "Kcur", il);
 
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    if (cparams.embeddings_nextn && n_tokens <= 16 && Vcur->op == GGML_OP_MUL_MAT) {
+        ggml_mul_mat_set_hint(Vcur, GGML_HINT_EXACT_BATCH);
+    }
     cb(Vcur, "Vcur", il);
 
     // Apply K normalization

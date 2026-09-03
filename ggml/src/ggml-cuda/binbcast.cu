@@ -26,6 +26,43 @@ static __device__ __forceinline__ float op_div(const float a, const float b) {
     return a / b;
 }
 
+template <float (*bin_op)(const float, const float)>
+static __global__ void binary_contiguous_f32(const float * src0, const float * src1, float * dst, int64_t n) {
+    ggml_cuda_pdl_lc();
+    int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = int64_t(blockDim.x) * gridDim.x;
+    ggml_cuda_pdl_sync();
+    for (; i < n; i += stride) {
+        dst[i] = bin_op(src0[i], src1[i]);
+        if (n - i <= stride) {
+            break;
+        }
+    }
+}
+
+template <float (*bin_op)(const float, const float)>
+static bool try_binary_contiguous_f32(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src0->ne[0] != 2048 ||
+        !ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, dst) ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int threads = 256;
+    const int64_t n = ggml_nelements(dst);
+    if (n == 0) {
+        return true;
+    }
+    const int blocks = std::min<int64_t>((n - 1) / threads + 1, 65535);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(binary_contiguous_f32<bin_op>, launch_params,
+        (const float *) src0->data, (const float *) src1->data, (float *) dst->data, n);
+    return true;
+}
+
 template <float (*bin_op)(const float, const float),
           typename src0_t,
           typename src1_t,
@@ -435,6 +472,9 @@ void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (try_binary_contiguous_f32<op_add>(ctx, dst)) {
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
@@ -443,6 +483,9 @@ void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (try_binary_contiguous_f32<op_mul>(ctx, dst)) {
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
@@ -540,6 +583,211 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
         default:
             GGML_ASSERT(false && "Unsupported n_fuse value");
     }
+}
+
+#if defined(__HIP_PLATFORM_AMD__)
+static __device__ __forceinline__ float rounded_mul_f32(const float a, const float b) {
+    float result;
+    asm("v_mul_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+
+static __device__ __forceinline__ float rounded_add_f32(const float a, const float b) {
+    float result;
+    asm("v_add_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+#else
+static __device__ __forceinline__ float rounded_mul_f32(const float a, const float b) {
+    return __fmul_rn(a, b);
+}
+
+static __device__ __forceinline__ float rounded_add_f32(const float a, const float b) {
+    return __fadd_rn(a, b);
+}
+#endif
+
+template <int n_expert_used, bool sync_before_store>
+static __global__ void weighted_expert_sum_f32(
+        const float * experts, const float * weights, float * dst,
+        int64_t n_embd, int64_t n_tokens, int64_t experts_s1, int64_t experts_s2,
+        int64_t weights_s1, int64_t weights_s2) {
+    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t n_embd4 = n_embd / 4;
+    if (index >= n_embd4 * n_tokens) {
+        return;
+    }
+
+    const int64_t token = index / n_embd4;
+    const int64_t channel = 4 * (index - token * n_embd4);
+    float4 expert = *reinterpret_cast<const float4 *>(experts + token * experts_s2 + channel);
+    const float weight = weights[token * weights_s2];
+    // Keep MUL rounding separate from ADD to match the unfused graph without forcing products through scratch memory.
+    float4 sum = {
+        rounded_mul_f32(expert.x, weight),
+        rounded_mul_f32(expert.y, weight),
+        rounded_mul_f32(expert.z, weight),
+        rounded_mul_f32(expert.w, weight),
+    };
+#pragma unroll
+    for (int i = 1; i < n_expert_used; ++i) {
+        expert = *reinterpret_cast<const float4 *>(experts + token * experts_s2 + i * experts_s1 + channel);
+        const float weight_i = weights[token * weights_s2 + i * weights_s1];
+        sum.x = rounded_add_f32(sum.x, rounded_mul_f32(expert.x, weight_i));
+        sum.y = rounded_add_f32(sum.y, rounded_mul_f32(expert.y, weight_i));
+        sum.z = rounded_add_f32(sum.z, rounded_mul_f32(expert.z, weight_i));
+        sum.w = rounded_add_f32(sum.w, rounded_mul_f32(expert.w, weight_i));
+    }
+    if constexpr (sync_before_store) {
+        // single block: all expert and weight reads of the block are complete, so dst may alias them
+        __syncthreads();
+    }
+    reinterpret_cast<float4 *>(dst)[index] = sum;
+}
+
+void ggml_cuda_op_weighted_expert_sum(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * dst, int n_expert_used) {
+    const ggml_tensor * experts = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * weights = experts == mul->src[0] ? mul->src[1] : mul->src[0];
+    const int64_t n_embd = experts->ne[0];
+    const int64_t n_tokens = experts->ne[2];
+    GGML_ASSERT(n_embd % 4 == 0);
+    const int64_t n_items = n_embd / 4 * n_tokens;
+
+    // The graph allocator may place the output over the expert or weight buffers (both die inside the fused
+    // range). A single block can read everything before a barrier and then write in place; larger grids
+    // stage the sum until all reads have finished.
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data;
+        const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    const bool aliased      = overlaps(dst, experts) || overlaps(dst, weights);
+    const bool single_block = n_items <= 1024;
+    const bool stage        = aliased && !single_block;
+
+    const int threads = single_block ? (int) n_items : 256;
+    const int blocks  = (int) ((n_items + threads - 1) / threads);
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+
+    ggml_cuda_pool_alloc<float> result(ctx.pool());
+    float * out = stage ? result.alloc(n_embd * n_tokens) : (float *) dst->data;
+
+#define launch_weighted_expert_sum(n) \
+    do { \
+        if (single_block) { \
+            ggml_cuda_kernel_launch(weighted_expert_sum_f32<n, true>, launch_params, \
+                (const float *) experts->data, (const float *) weights->data, out, \
+                n_embd, n_tokens, experts->nb[1] / sizeof(float), experts->nb[2] / sizeof(float), \
+                weights->nb[1] / sizeof(float), weights->nb[2] / sizeof(float)); \
+        } else { \
+            ggml_cuda_kernel_launch(weighted_expert_sum_f32<n, false>, launch_params, \
+                (const float *) experts->data, (const float *) weights->data, out, \
+                n_embd, n_tokens, experts->nb[1] / sizeof(float), experts->nb[2] / sizeof(float), \
+                weights->nb[1] / sizeof(float), weights->nb[2] / sizeof(float)); \
+        } \
+    } while (0)
+    switch (n_expert_used) {
+        case 2: launch_weighted_expert_sum(2); break;
+        case 3: launch_weighted_expert_sum(3); break;
+        case 4: launch_weighted_expert_sum(4); break;
+        case 5: launch_weighted_expert_sum(5); break;
+        case 6: launch_weighted_expert_sum(6); break;
+        case 7: launch_weighted_expert_sum(7); break;
+        case 8: launch_weighted_expert_sum(8); break;
+        default: GGML_ABORT("unsupported expert count");
+    }
+#undef launch_weighted_expert_sum
+
+    if (stage) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, result.get(), ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+}
+
+static __global__ void shared_mul_add_f32(
+        const float * src, const float * gate, const float * other, const float * residual, float * dst,
+        int64_t n_embd, int64_t nelements) {
+    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= nelements) {
+        return;
+    }
+    volatile float product = src[index] * gate[index / n_embd];
+    float value = other[index] + product;
+    dst[index] = value + residual[index];
+}
+
+void ggml_cuda_op_shared_mul_add(
+        ggml_backend_cuda_context & ctx, ggml_tensor * mul, const ggml_tensor * other,
+        const ggml_tensor * residual, ggml_tensor * dst) {
+    const ggml_tensor * src = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * gate = src == mul->src[0] ? mul->src[1] : mul->src[0];
+    const int threads = 256;
+    const int64_t nelements = ggml_nelements(dst);
+    const int blocks = (nelements + threads - 1) / threads;
+    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(shared_mul_add_f32, launch_params,
+        (const float *) src->data, (const float *) gate->data, (const float *) other->data,
+        (const float *) residual->data, (float *) dst->data, dst->ne[0], nelements);
+}
+
+// Qwen3.5 shared-expert gate for one token: gate = sigmoid(w . y) computed exactly like
+// mul_mat_vec_f<float, float, 1, 256> (same per-thread fma chain and the same two-level warp reduction),
+// then dst = (other + src*gate) + residual as in shared_mul_add_f32. One block, so the activation vector is
+// fully read before the reduction barrier and the output may alias it.
+static __global__ void __launch_bounds__(256, 1) shared_gate_mul_add_f32(
+        const float * w, const float * y, const float * src, const float * other, const float * residual, float * dst,
+        const int ncols2, const int64_t n_embd) {
+    constexpr int block_size = 256;
+    constexpr int warp_size  = 32;
+    __shared__ float buf_iw[warp_size];
+    __shared__ float gate_s;
+
+    const int tid = threadIdx.x;
+    if (tid < warp_size) {
+        buf_iw[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const float2 * x2 = (const float2 *) w;
+    const float2 * y2 = (const float2 *) y;
+    float sumf = 0.0f;
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const float2 tmpx = x2[col2];
+        const float2 tmpy = y2[col2];
+        ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+        ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+    }
+    sumf = warp_reduce_sum<warp_size>(sumf);
+    buf_iw[tid/warp_size] = sumf;
+    __syncthreads();
+    if (tid < warp_size) {
+        sumf = buf_iw[tid];
+        sumf = warp_reduce_sum<warp_size>(sumf);
+        if (tid == 0) {
+            gate_s = 1.0f / (1.0f + expf(-sumf));
+        }
+    }
+    __syncthreads();
+
+    const float gate = gate_s;
+    for (int64_t i = tid; i < n_embd; i += block_size) {
+        const float product = rounded_mul_f32(src[i], gate);
+        const float value   = rounded_add_f32(other[i], product);
+        dst[i] = rounded_add_f32(value, residual[i]);
+    }
+}
+
+void ggml_cuda_op_shared_gate_mul_add(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * src, const ggml_tensor * other,
+        const ggml_tensor * residual, ggml_tensor * dst) {
+    const ggml_tensor * w = gate_mm->src[0];
+    const ggml_tensor * y = gate_mm->src[1];
+    GGML_ASSERT(w->ne[0] % 2 == 0);
+    const ggml_cuda_kernel_launch_params launch_params(1, 256, 0, ctx.stream());
+    ggml_cuda_kernel_launch(shared_gate_mul_add_f32, launch_params,
+        (const float *) w->data, (const float *) y->data, (const float *) src->data, (const float *) other->data,
+        (const float *) residual->data, (float *) dst->data, (int) (w->ne[0] / 2), dst->ne[0]);
 }
 
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

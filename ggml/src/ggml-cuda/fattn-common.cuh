@@ -1174,6 +1174,12 @@ void launch_fattn(
             }
         }
 
+        if constexpr (ncols2 == 3) {
+            if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+                parallel_blocks = std::min(18, ntiles_KV);
+            }
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
