@@ -1249,6 +1249,9 @@ static __global__ void mul_mat_vec_q(
 static constexpr __host__ __device__ bool mmvq_fq_type_ok(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q6_K:
+            // Q4_K/Q5_K (block sum via mmvq_fq_block_sum) are exact too but measured neutral on gfx1151
+            // with the generic, non-prefetched loop (Qwen3.6 UD-Q4_K_XL TG128 60.69 -> 60.63 t/s).
             return true;
         default:
             return false;
@@ -1259,6 +1262,7 @@ static constexpr __host__ __device__ bool mmvq_fq_type_ok(ggml_type type) {
 static constexpr __host__ __device__ bool mmvq_fq_needs_sum(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q6_K:
             return false;
         default:
             return true;
@@ -1342,7 +1346,8 @@ static __global__ void mul_mat_vec_q_fq(
         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
-    static_assert(type == GGML_TYPE_Q8_0, "fused activation quantization is only implemented for Q8_0");
+    static_assert(mmvq_fq_type_ok(type));
+    constexpr bool q8_0_path = type == GGML_TYPE_Q8_0;
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
@@ -1352,7 +1357,8 @@ static __global__ void mul_mat_vec_q_fq(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int blocks_per_iter = vdr * warp_size / qi;
-    static_assert(qk == QK8_1);
+    static_assert(!q8_0_path || qk == QK8_1);
+    [[maybe_unused]] constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     extern __shared__ char mmvq_fq_smem[];
     block_q8_1 * y_q8 = (block_q8_1 *) mmvq_fq_smem;
@@ -1397,16 +1403,18 @@ static __global__ void mul_mat_vec_q_fq(
     const int kqs  = vdr * (lane % (qi/vdr));
     const int kbx0 = lane / (qi/vdr);
 
-    const block_q8_0 * x = (const block_q8_0 *) vx + kbx_offset;
+    [[maybe_unused]] const block_q8_0 * x  = (const block_q8_0 *) vx + kbx_offset;
     [[maybe_unused]] const block_q8_0 * xg = nullptr;
 
-    mmvq_fq_q8_0_chunk cx;
+    [[maybe_unused]] mmvq_fq_q8_0_chunk cx;
     [[maybe_unused]] mmvq_fq_q8_0_chunk cg;
-    mmvq_fq_q8_0_load(cx, x, kbx0, kqs, blocks_per_row_x);
-    if constexpr (has_fusion) {
-        if (use_gate) {
-            xg = (const block_q8_0 *) vgate + kbx_offset;
-            mmvq_fq_q8_0_load(cg, xg, kbx0, kqs, blocks_per_row_x);
+    if constexpr (q8_0_path) {
+        mmvq_fq_q8_0_load(cx, x, kbx0, kqs, blocks_per_row_x);
+        if constexpr (has_fusion) {
+            if (use_gate) {
+                xg = (const block_q8_0 *) vgate + kbx_offset;
+                mmvq_fq_q8_0_load(cg, xg, kbx0, kqs, blocks_per_row_x);
+            }
         }
     }
 
@@ -1472,8 +1480,20 @@ static __global__ void mul_mat_vec_q_fq(
     float tmp_gate = 0.0f;
 
     const block_q8_1 * y = y_q8;
+    if constexpr (!q8_0_path) {
+        // generic types: the per-wave loop of mul_mat_vec_q<type, 1> against the shared-memory activations
+        for (int kbx = kbx0; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            tmp += vec_dot_q_cuda(vx, &y[kby], kbx_offset + kbx, kqs);
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    tmp_gate += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + kbx, kqs);
+                }
+            }
+        }
+    }
     constexpr int chunk_blocks = MMVQ_FQ_PF*blocks_per_iter;
-    for (int c0 = kbx0; c0 < blocks_per_row_x; c0 += chunk_blocks) {
+    for (int c0 = kbx0; q8_0_path && c0 < blocks_per_row_x; c0 += chunk_blocks) {
         mmvq_fq_q8_0_chunk nx;
         [[maybe_unused]] mmvq_fq_q8_0_chunk ng;
         const int c1 = c0 + chunk_blocks;
@@ -1586,6 +1606,11 @@ static void mul_mat_vec_q_fq_switch_type(
     switch (type_x) {
         case GGML_TYPE_Q8_0:
             mul_mat_vec_q_fq_launch<GGML_TYPE_Q8_0>(vx, y, ids, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_dst,
+                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            mul_mat_vec_q_fq_launch<GGML_TYPE_Q6_K>(vx, y, ids, fusion, dst, ncols_x, nrows_x, stride_row_x, stride_col_dst,
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
             break;
