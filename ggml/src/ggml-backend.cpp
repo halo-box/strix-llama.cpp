@@ -1340,7 +1340,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // check if the split has too many inputs
                     // FIXME: count the number of inputs instead of only checking when full
-                    if (split->n_inputs >= split->inputs_capacity) {
+                    // cut on the constant, not on inputs_capacity: capacity doubles on demand and
+                    // is never reset, so using it lets the cut point drift up and keeps every input
+                    // copy of an ever-longer split live at once
+                    if (split->n_inputs >= GGML_SCHED_MAX_SPLIT_INPUTS) {
                         const size_t id = hash_id(src);
                         int src_backend_id = sched->hv_tensor_backend_ids[id];
                         bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
