@@ -607,7 +607,7 @@ static __device__ __forceinline__ float rounded_add_f32(const float a, const flo
 }
 #endif
 
-template <int n_expert_used>
+template <int n_expert_used, bool sync_before_store>
 static __global__ void weighted_expert_sum_f32(
         const float * experts, const float * weights, float * dst,
         int64_t n_embd, int64_t n_tokens, int64_t experts_s1, int64_t experts_s2,
@@ -638,6 +638,10 @@ static __global__ void weighted_expert_sum_f32(
         sum.z = rounded_add_f32(sum.z, rounded_mul_f32(expert.z, weight_i));
         sum.w = rounded_add_f32(sum.w, rounded_mul_f32(expert.w, weight_i));
     }
+    if constexpr (sync_before_store) {
+        // single block: all expert and weight reads of the block are complete, so dst may alias them
+        __syncthreads();
+    }
     reinterpret_cast<float4 *>(dst)[index] = sum;
 }
 
@@ -646,18 +650,44 @@ void ggml_cuda_op_weighted_expert_sum(ggml_backend_cuda_context & ctx, ggml_tens
     const ggml_tensor * weights = experts == mul->src[0] ? mul->src[1] : mul->src[0];
     const int64_t n_embd = experts->ne[0];
     const int64_t n_tokens = experts->ne[2];
-    const int threads = 256;
     GGML_ASSERT(n_embd % 4 == 0);
-    const int blocks = (n_embd / 4 * n_tokens + threads - 1) / threads;
+    const int64_t n_items = n_embd / 4 * n_tokens;
+
+    // The graph allocator may place the output over the expert or weight buffers (both die inside the fused
+    // range). A single block can read everything before a barrier and then write in place; larger grids
+    // stage the sum until all reads have finished.
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data;
+        const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    const bool aliased      = overlaps(dst, experts) || overlaps(dst, weights);
+    const bool single_block = n_items <= 1024;
+    const bool stage        = aliased && !single_block;
+
+    const int threads = single_block ? (int) n_items : 256;
+    const int blocks  = (int) ((n_items + threads - 1) / threads);
     const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
-    // MUL output may alias experts, so stage until all expert reads finish.
-    ggml_cuda_pool_alloc<float> result(ctx.pool(), n_embd * n_tokens);
+
+    ggml_cuda_pool_alloc<float> result(ctx.pool());
+    float * out = stage ? result.alloc(n_embd * n_tokens) : (float *) dst->data;
 
 #define launch_weighted_expert_sum(n) \
-    ggml_cuda_kernel_launch(weighted_expert_sum_f32<n>, launch_params, \
-        (const float *) experts->data, (const float *) weights->data, result.get(), \
-        n_embd, n_tokens, experts->nb[1] / sizeof(float), experts->nb[2] / sizeof(float), \
-        weights->nb[1] / sizeof(float), weights->nb[2] / sizeof(float))
+    do { \
+        if (single_block) { \
+            ggml_cuda_kernel_launch(weighted_expert_sum_f32<n, true>, launch_params, \
+                (const float *) experts->data, (const float *) weights->data, out, \
+                n_embd, n_tokens, experts->nb[1] / sizeof(float), experts->nb[2] / sizeof(float), \
+                weights->nb[1] / sizeof(float), weights->nb[2] / sizeof(float)); \
+        } else { \
+            ggml_cuda_kernel_launch(weighted_expert_sum_f32<n, false>, launch_params, \
+                (const float *) experts->data, (const float *) weights->data, out, \
+                n_embd, n_tokens, experts->nb[1] / sizeof(float), experts->nb[2] / sizeof(float), \
+                weights->nb[1] / sizeof(float), weights->nb[2] / sizeof(float)); \
+        } \
+    } while (0)
     switch (n_expert_used) {
         case 2: launch_weighted_expert_sum(2); break;
         case 3: launch_weighted_expert_sum(3); break;
@@ -670,7 +700,9 @@ void ggml_cuda_op_weighted_expert_sum(ggml_backend_cuda_context & ctx, ggml_tens
     }
 #undef launch_weighted_expert_sum
 
-    CUDA_CHECK(cudaMemcpyAsync(dst->data, result.get(), ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+    if (stage) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, result.get(), ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
 }
 
 static __global__ void shared_mul_add_f32(
