@@ -1575,34 +1575,46 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
 }
 
 // RDNA3.5 tile selection for MoE (mul_mat_id) with 256 experts.
-// The per-expert row count is n_tokens*n_expert_used/256 (16/32/64 for ubatch 512/1024/2048 with 8 active experts),
-// but the generic selection below only sees ncols_max == n_tokens*n_expert_used and picks J=128, so most of every
-// tile is padding. Use a narrow J and the routed-compact kernel, which only enumerates real per-expert tiles.
-// J per type/row count was measured on gfx1151 for the 2048x512 and 3072x1024 expert shapes.
+// The per-expert row count is n_tokens*n_expert_used/256 (e.g. 16/32/64 for ubatch 512/1024/2048 with 8 active
+// experts), but the generic selection below only sees ncols_max == n_tokens*n_expert_used and picks J=128, so most
+// of every tile is padding and the grid contains ncols_max/J*n_experts mostly-empty blocks. Use a J matched to the
+// row count and the routed-compact kernel, which only enumerates real per-expert tiles.
+// J per type/row range was measured on gfx1151 for the 2048x512 and 3072x1024 expert shapes.
 static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t rows_per_expert) {
     switch (type) {
         case GGML_TYPE_Q8_0:
-            return rows_per_expert == 16 || rows_per_expert == 32 || rows_per_expert == 64 ? 48 : 0;
+            return rows_per_expert <= 12 ? 16 : rows_per_expert <= 64 ? 48 : 128;
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
-            return rows_per_expert == 16 || rows_per_expert == 64 ? 32 : rows_per_expert == 32 ? 48 : 0;
+            return rows_per_expert <= 12 ? 16 : rows_per_expert <= 24 ? 32 : rows_per_expert <= 48 ? 48 :
+                rows_per_expert <= 64 ? 32 : 128;
         default:
             return 0;
     }
 }
 
 static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int J) {
-    return (type == GGML_TYPE_Q8_0 && J == 48) ||
-        ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) && (J == 32 || J == 48));
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+            return J == 16 || J == 48 || J == 128;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return J == 16 || J == 32 || J == 48 || J == 128;
+        default:
+            return false;
+    }
 }
 
-static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0, 16) == 48);
-static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q6_K, 16) == 32);
-static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q4_K, 32) == 48);
-static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q5_K, 64) == 32);
-static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0, 48) == 0);
-static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q4_0, 16) == 0);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0,   4) ==  16);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0,  16) ==  48);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0,  64) ==  48);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0, 128) == 128);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q6_K,  16) ==  32);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q4_K,  32) ==  48);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q5_K,  64) ==  32);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q4_0,  16) ==   0);
 static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 48));
 static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 32));
 static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q6_K, 32));
