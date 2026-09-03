@@ -7242,6 +7242,39 @@ struct test_topk_moe : public test_case {
     // Verify two outputs
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
 
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "exp_probs_b") == 0) {
+                std::vector<float> data(t->ne[0]);
+                const float amplitude =
+                    gating_func == GATING_FUNC_SOFTMAX         ? 0.1f :
+                    gating_func == GATING_FUNC_SIGMOID         ? 0.5f :
+                    gating_func == GATING_FUNC_SOFTMAX_WEIGHT  ? 4.5f : 1.0f;
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    data[i] = i < t->ne[0] / 2 ? amplitude : -amplitude;
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                continue;
+            }
+
+            for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                std::vector<float> data(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    data[i] = -4.0f + 8.0f * i / std::max<int64_t>(1, t->ne[0] - 1);
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), row * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+
     // allow output in arbitrary order
     double err(const float * a, const float * b, size_t n) override {
         std::vector<float> a2(n);
