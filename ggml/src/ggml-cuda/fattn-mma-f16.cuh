@@ -1781,7 +1781,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        if (np > 1) {
+        // Warps read columns of tile_Q that were written by other warps, so a barrier is needed before tile_Q is
+        // reused: by the next nbatch_combine batch (DV/2 > nbatch_combine) or by the Q load of the next tile.
+        if (np > 1 || DV/2 > nbatch_combine) {
             __syncthreads();
         }
     }
