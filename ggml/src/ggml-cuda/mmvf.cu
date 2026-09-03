@@ -411,6 +411,79 @@ static __global__ void mul_mat_vec_f(
     }
 }
 
+
+#if defined(GGML_USE_HIP)
+// One wave per output row emulating mul_mat_vec_f<nv_bfloat16, float, 1, 256>: lane l accumulates the partial
+// sums of the eight virtual warps' lane l (columns 2*(32*w + l) + 256*i) in the same fma order, reduces each
+// with the same butterfly and combines the eight partials exactly like block_reduce does over lanes 0..7 (the
+// other lanes hold zero). The standard kernel launches 8 waves per row that each issue a single 4-byte load,
+// which on gfx1151 leaves K=512 MoE down projections at ~145 GB/s; here each lane keeps 8 loads in flight
+// (measured: 93 -> 67 us for 8 x 2048 rows of K=512; slower than the standard kernel for K=2048).
+template <int rows_per_block>
+__launch_bounds__(32 * rows_per_block, 1)
+static __global__ void mul_mat_vec_bf16_wave(
+        const nv_bfloat16 * x_ptr, const float * y_ptr, const int32_t * ids_ptr, float * dst_ptr,
+        const int ncols2, const int nrows, const uint3 nchannels_y, const int stride_row, const int stride_col_dst,
+        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    constexpr int warp_size = 32;
+    constexpr int nvw       = 256 / warp_size; // virtual warps of the emulated 256-thread block
+    const int lane = threadIdx.x;
+    const int row  = blockIdx.x * rows_per_block + threadIdx.y;
+    if (row >= nrows) {
+        return;
+    }
+    const int channel_dst = blockIdx.y;
+    const int channel_x   = ids_ptr ? ids_ptr[channel_dst] : (int) fastdiv((uint32_t) channel_dst, channel_ratio);
+    const int channel_y   = ids_ptr ? (int) fastmodulo(channel_dst, nchannels_y) : channel_dst;
+    const int sample_dst  = 0;
+    const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
+    const int sample_y    = sample_dst;
+
+    const int   * x2  = (const int *) (x_ptr + int64_t(sample_x)*stride_sample_x + channel_x*stride_channel_x + int64_t(row)*stride_row);
+    const float2 * y2 = (const float2 *) (y_ptr + int64_t(sample_y)*stride_sample_y + channel_y*stride_channel_y);
+    float * dst = dst_ptr + int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
+
+    float sumf[nvw];
+#pragma unroll
+    for (int w = 0; w < nvw; ++w) {
+        sumf[w] = 0.0f;
+    }
+    for (int col0 = 0; col0 < ncols2; col0 += 256) {
+        int    tmpx[nvw];
+        float2 tmpy[nvw];
+#pragma unroll
+        for (int w = 0; w < nvw; ++w) {
+            const int col2 = col0 + w*warp_size + lane;
+            if (col2 < ncols2) {
+                tmpx[w] = x2[col2];
+                tmpy[w] = y2[col2];
+            }
+        }
+#pragma unroll
+        for (int w = 0; w < nvw; ++w) {
+            const int col2 = col0 + w*warp_size + lane;
+            if (col2 < ncols2) {
+                const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx[w])[0]);
+                const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx[w])[1]);
+                ggml_cuda_mad(sumf[w], tmpx0, tmpy[w].x);
+                ggml_cuda_mad(sumf[w], tmpx1, tmpy[w].y);
+            }
+        }
+    }
+#pragma unroll
+    for (int w = 0; w < nvw; ++w) {
+        // per-warp butterfly, then the two zero-lane steps (offsets 16 and 8) of the second-level reduction
+        sumf[w] = (warp_reduce_sum<warp_size>(sumf[w]) + 0.0f) + 0.0f;
+    }
+    const float value = ((sumf[0] + sumf[4]) + (sumf[2] + sumf[6])) + ((sumf[1] + sumf[5]) + (sumf[3] + sumf[7]));
+    if (lane == 0) {
+        dst[row] = value;
+    }
+    GGML_UNUSED(stride_col_dst);
+}
+#endif // defined(GGML_USE_HIP)
+
 template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false, bool tokens_in_block = false>
 static void mul_mat_vec_f_switch_fusion(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -477,6 +550,24 @@ void launch_mul_mat_vec_f_cuda(
         }
     }
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+#if defined(GGML_USE_HIP)
+    if constexpr (std::is_same_v<T, nv_bfloat16> && ncols_dst == 1 && !is_multi_token_id && !tokens_in_block) {
+        // only where the emulated block does a single K iteration: for longer rows the 8x lower wave count loses
+        if (!has_fusion && block_size_best == 256 && ncols <= 512 && warp_size == 32 && nsamples_or_ntokens == 1 && nsamples_dst == 1 &&
+                GGML_CUDA_CC_IS_RDNA(ggml_cuda_info().devices[device].cc)) {
+            constexpr int rows_per_block = 4;
+            const dim3 block_nums((nrows + rows_per_block - 1) / rows_per_block, nchannels_dst, 1);
+            const dim3 block_dims(warp_size, rows_per_block, 1);
+            const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+            ggml_cuda_kernel_launch(mul_mat_vec_bf16_wave<rows_per_block>, launch_params,
+                x, y, ids, dst, (int) (ncols/2), (int) nrows, nchannels_y_fd, (int) stride_row, (int) stride_col_dst,
+                channel_ratio_fd, (int) stride_channel_x, (int) stride_channel_y, (int) stride_channel_dst,
+                sample_ratio_fd, (int) stride_sample_x, (int) stride_sample_y, (int) stride_sample_dst);
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     const int nbytes_shared = (warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0)) * (tokens_in_block ? nsamples_or_ntokens : 1);
     const dim3 block_nums(nrows, nchannels_dst, tokens_in_block ? nsamples_dst : nsamples_or_ntokens);
