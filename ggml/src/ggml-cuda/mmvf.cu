@@ -135,7 +135,35 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        int col2 = tid;
+#if defined(GGML_USE_HIP)
+        // Issue the weight loads of four K iterations before consuming them: the runtime trip count keeps the
+        // compiler from pipelining the loop, and with one 8-byte load in flight per lane the single-column
+        // f32 matvecs (e.g. MoE routers) reach barely half the memory bandwidth. The accumulation order is
+        // unchanged, so the results are bit-identical.
+        if constexpr (ncols_dst == 1 && !has_fusion) {
+            constexpr int pf = 4;
+            for (; col2 + (pf - 1)*block_size < ncols2; col2 += pf*block_size) {
+                float2 tmpx[pf];
+                float2 tmpy[pf];
+#pragma unroll
+                for (int i = 0; i < pf; ++i) {
+                    tmpx[i] = x2[col2 + i*block_size];
+                }
+#pragma unroll
+                for (int i = 0; i < pf; ++i) {
+                    tmpy[i] = y2[col2 + i*block_size];
+                }
+#pragma unroll
+                for (int i = 0; i < pf; ++i) {
+                    ggml_cuda_mad(sumf[0], tmpx[i].x, tmpy[i].x);
+                    ggml_cuda_mad(sumf[0], tmpx[i].y, tmpy[i].y);
+                }
+            }
+        }
+#endif // defined(GGML_USE_HIP)
+
+        for (; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
             if constexpr (has_fusion) {
