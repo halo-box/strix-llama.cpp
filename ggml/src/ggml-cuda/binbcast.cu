@@ -585,27 +585,60 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     }
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+static __device__ __forceinline__ float rounded_mul_f32(const float a, const float b) {
+    float result;
+    asm("v_mul_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+
+static __device__ __forceinline__ float rounded_add_f32(const float a, const float b) {
+    float result;
+    asm("v_add_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+#else
+static __device__ __forceinline__ float rounded_mul_f32(const float a, const float b) {
+    return __fmul_rn(a, b);
+}
+
+static __device__ __forceinline__ float rounded_add_f32(const float a, const float b) {
+    return __fadd_rn(a, b);
+}
+#endif
+
 template <int n_expert_used>
 static __global__ void weighted_expert_sum_f32(
         const float * experts, const float * weights, float * dst,
         int64_t n_embd, int64_t n_tokens, int64_t experts_s1, int64_t experts_s2,
         int64_t weights_s1, int64_t weights_s2) {
     const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= n_embd * n_tokens) {
+    const int64_t n_embd4 = n_embd / 4;
+    if (index >= n_embd4 * n_tokens) {
         return;
     }
 
-    const int64_t token = index / n_embd;
-    const int64_t channel = index - token * n_embd;
-    // Keep MUL rounding separate from ADD to match the unfused graph.
-    volatile float product = experts[token * experts_s2 + channel] * weights[token * weights_s2];
-    float sum = product;
+    const int64_t token = index / n_embd4;
+    const int64_t channel = 4 * (index - token * n_embd4);
+    float4 expert = *reinterpret_cast<const float4 *>(experts + token * experts_s2 + channel);
+    const float weight = weights[token * weights_s2];
+    // Keep MUL rounding separate from ADD to match the unfused graph without forcing products through scratch memory.
+    float4 sum = {
+        rounded_mul_f32(expert.x, weight),
+        rounded_mul_f32(expert.y, weight),
+        rounded_mul_f32(expert.z, weight),
+        rounded_mul_f32(expert.w, weight),
+    };
 #pragma unroll
     for (int i = 1; i < n_expert_used; ++i) {
-        product = experts[token * experts_s2 + i * experts_s1 + channel] * weights[token * weights_s2 + i * weights_s1];
-        sum += product;
+        expert = *reinterpret_cast<const float4 *>(experts + token * experts_s2 + i * experts_s1 + channel);
+        const float weight_i = weights[token * weights_s2 + i * weights_s1];
+        sum.x = rounded_add_f32(sum.x, rounded_mul_f32(expert.x, weight_i));
+        sum.y = rounded_add_f32(sum.y, rounded_mul_f32(expert.y, weight_i));
+        sum.z = rounded_add_f32(sum.z, rounded_mul_f32(expert.z, weight_i));
+        sum.w = rounded_add_f32(sum.w, rounded_mul_f32(expert.w, weight_i));
     }
-    dst[index] = sum;
+    reinterpret_cast<float4 *>(dst)[index] = sum;
 }
 
 void ggml_cuda_op_weighted_expert_sum(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * dst, int n_expert_used) {
@@ -614,7 +647,8 @@ void ggml_cuda_op_weighted_expert_sum(ggml_backend_cuda_context & ctx, ggml_tens
     const int64_t n_embd = experts->ne[0];
     const int64_t n_tokens = experts->ne[2];
     const int threads = 256;
-    const int blocks = (n_embd * n_tokens + threads - 1) / threads;
+    GGML_ASSERT(n_embd % 4 == 0);
+    const int blocks = (n_embd / 4 * n_tokens + threads - 1) / threads;
     const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
     // MUL output may alias experts, so stage until all expert reads finish.
     ggml_cuda_pool_alloc<float> result(ctx.pool(), n_embd * n_tokens);
