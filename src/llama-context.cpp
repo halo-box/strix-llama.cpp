@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -232,6 +233,10 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
+    // LLAMA_FUSED_GDN_CH=0 selects the ggml-op chunked delta-net formulation for multi-token ubatches
+    if (const char * env = getenv("LLAMA_FUSED_GDN_CH")) {
+        cparams.fused_gdn_ch = atoi(env) != 0;
+    }
 
     cparams.fused_lid = true;
     cparams.auto_flid = false;

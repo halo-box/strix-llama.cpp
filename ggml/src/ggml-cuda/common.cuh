@@ -111,6 +111,14 @@
 #    define GGML_CUDA_USE_CUB
 #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 
+// hipCUB (rocPRIM) offers the same device-wide radix sort / scan / reduce entry points as CUB. Using it lifts the
+// ncols <= 1024 limit of ARGSORT / TOP_K on HIP, which otherwise falls back to the CPU (e.g. the QSA indexer top-k
+// of qwen4exp / DeepSeek-V3.2 at contexts beyond 2k tokens).
+#if defined(GGML_USE_HIP) && !defined(GGML_HIP_NO_CUB) && __has_include(<hipcub/hipcub.hpp>)
+#    define GGML_CUDA_USE_CUB
+#    define GGML_CUDA_CUB_IS_HIPCUB
+#endif
+
 // PDL host-side support (cudaLaunchKernelEx) requires CUDART >= 11.8.
 // However, this has been bugged in CTK < 12.3 for MSVC builds, see
 // https://github.com/ggml-org/llama.cpp/pull/22522#discussion_r3302393293
@@ -1540,6 +1548,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // RDNA3.5 fused-quantize matvec prologue (y_op == 3), see ggml_cuda_mm_fusion_args_device
+    const ggml_tensor * y_gate = nullptr;
+    const ggml_tensor * y_norm_w = nullptr;
+    float y_eps = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1549,6 +1561,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // RDNA3.5 fused-quantize matvec prologue (y_op == 3): y' = sigmoid(y_gate) * (rms_norm_128(y) * y_norm_w)
+    const void * y_gate = nullptr;
+    const void * y_norm_w = nullptr;
+    float y_eps = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {

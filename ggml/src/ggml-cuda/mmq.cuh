@@ -1346,10 +1346,21 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
+// routed-compact MoE tiles: one descriptor per real (expert, tile) pair; the builder runs as a single block with one
+// thread per expert
+#define MMQ_ROUTED_MAX_EXPERTS 1024
+#ifndef MMQ_IQ_ID_J_MID
+#define MMQ_IQ_ID_J_MID 64
+#endif
+
+static constexpr bool mmq_rdna3_5_id_n_experts_ok(const int64_t n_experts) {
+    return n_experts >= 8 && n_experts <= MMQ_ROUTED_MAX_EXPERTS;
+}
+
 template <int J>
 static __global__ void build_mmq_routed_descriptors(
         const int32_t * expert_bounds, uint32_t * descriptors, int n_experts, int max_descriptors) {
-    __shared__ int tile_counts[256];
+    __shared__ int tile_counts[MMQ_ROUTED_MAX_EXPERTS];
     const int expert = threadIdx.x;
 
     for (int i = expert; i < max_descriptors; i += blockDim.x) {
@@ -1594,6 +1605,11 @@ static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t ro
     switch (type) {
         case GGML_TYPE_Q8_0:
             return rows_per_expert <= 12 ? 16 : rows_per_expert <= 64 ? 48 : 128;
+        // the IQ expert types of the Unsloth qwen4exp mixes (512 experts, 10 active: 40 rows per expert at ubatch 2048)
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return rows_per_expert <= 12 ? 16 : rows_per_expert <= 32 ? 48 : rows_per_expert <= 64 ? MMQ_IQ_ID_J_MID : 128;
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
@@ -1608,10 +1624,14 @@ static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int
     switch (type) {
         case GGML_TYPE_Q8_0:
             return J == 16 || J == 48 || J == 128;
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return J == 16 || J == 48 || J == MMQ_IQ_ID_J_MID || J == 128;
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
-            return J == 16 || J == 32 || J == 48 || J == 128;
+            return J == 16 || J == 32 || J == 48 || J == 64 || J == 96 || J == 128;
         default:
             return false;
     }
@@ -1664,12 +1684,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    const bool use_compact_routed = args.ids_dst != nullptr && args.nchannels_y == 256 && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
+    const bool use_compact_routed = args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
         !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc) && mmq_rdna3_5_id_use_compact(type, J);
     if (use_compact_routed) {
         const int max_descriptors = (args.ncols_dst + J - 1) / J + args.nchannels_y;
         ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
-        build_mmq_routed_descriptors<J><<<1, 256, 0, stream>>>
+        build_mmq_routed_descriptors<J><<<1, MMQ_ROUTED_MAX_EXPERTS, 0, stream>>>
             (args.expert_bounds, descriptors.get(), args.nchannels_y, max_descriptors);
 
         const int descriptor_blocks = (args.ncols_dst + J - 1) / J;
@@ -1754,9 +1774,15 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             J_best = J_rdna3_5;
             ntiles_J_best = 1;
         }
-    } else if (GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback && args.ids_dst != nullptr && args.nchannels_y == 256) {
+    } else if (GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback && args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y)) {
         const int64_t rows_per_expert = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
-        const int J_rdna3_5 = mmq_rdna3_5_id_get_J(type, rows_per_expert);
+        int J_rdna3_5 = type == GGML_TYPE_Q6_K && args.nchannels_y == 128 && rows_per_expert >= 96 && rows_per_expert <= 160 ?
+            48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);
+        if constexpr (type == GGML_TYPE_Q6_K) {
+            if (getenv("GGML_Q6_COMPACT_J")) {
+                J_rdna3_5 = atoi(getenv("GGML_Q6_COMPACT_J"));
+            }
+        }
         if (J_rdna3_5 != 0) {
             const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_rdna3_5, fallback, cc);
             if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {

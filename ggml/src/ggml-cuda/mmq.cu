@@ -266,7 +266,7 @@ static void ggml_cuda_mul_mat_q_impl(
     const ggml_tensor * gate = swiglu ? swiglu->src[0] : nullptr;
     const ggml_tensor * up   = swiglu ? swiglu->src[1] : nullptr;
     if (swiglu) {
-        GGML_ASSERT(src0->type == GGML_TYPE_Q8_0);
+        GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_IQ4_NL);
         GGML_ASSERT(gate && up && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, src1));
     }
@@ -446,6 +446,7 @@ void ggml_cuda_mul_mat_q_swiglu(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * swiglu) {
     ggml_cuda_mul_mat_q_impl(ctx, src0, swiglu, ids, dst, swiglu);
 }
+
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 #ifdef GGML_CUDA_FORCE_CUBLAS

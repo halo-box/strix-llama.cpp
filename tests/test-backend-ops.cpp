@@ -4945,9 +4945,11 @@ struct test_swiglu_q8_mmq : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const ggml_type type_down;
 
-    test_swiglu_q8_mmq(bool use_id, int n_mats, int n_used, int64_t m, int64_t n, int64_t k)
-        : use_id(use_id), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {}
+    test_swiglu_q8_mmq(bool use_id, int n_mats, int n_used, int64_t m, int64_t n, int64_t k,
+            ggml_type type_down = GGML_TYPE_Q8_0)
+        : use_id(use_id), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), type_down(type_down) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4955,7 +4957,7 @@ struct test_swiglu_q8_mmq : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(use_id, n_mats, n_used, m, n, k);
+        return VARS_TO_STR7(use_id, n_mats, n_used, m, n, k, type_down);
     }
 
     bool run_whole_graph() override { return true; }
@@ -4965,13 +4967,13 @@ struct test_swiglu_q8_mmq : public test_case {
         if (!use_id) {
             ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
             ggml_tensor * up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
-            ggml_tensor * down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
+            ggml_tensor * down = ggml_new_tensor_2d(ctx, type_down, k, m);
             return ggml_mul_mat(ctx, down, ggml_swiglu_split(ctx, gate, up));
         }
 
         ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
         ggml_tensor * up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
-        ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, k, m, n_mats);
+        ggml_tensor * down = ggml_new_tensor_3d(ctx, type_down, k, m, n_mats);
         ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
         ggml_set_name(ids_all, "ids");
         ggml_tensor * ids = ggml_view_2d(ctx, ids_all, n_used, n, ids_all->nb[1], 0);
@@ -4980,6 +4982,43 @@ struct test_swiglu_q8_mmq : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// Qwen3.8-Flash-Next decode hot path: IQ3_S gate and up projections are
+// fused with SwiGLU by ggml-cuda, with 512 experts and 10 selected experts.
+struct test_swiglu_iq3_mmvq : public test_case {
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SWIGLU_IQ3_MMVQ";
+    }
+
+    std::string vars() override {
+        return "n_mats=512,n_used=10,m=640,n=1,k=2560";
+    }
+
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int n_mats = 512;
+        constexpr int n_used = 10;
+        constexpr int64_t m = 640;
+        constexpr int64_t n = 1;
+        constexpr int64_t k = 2560;
+
+        ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_S, k, m, n_mats);
+        ggml_tensor * up_w   = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_S, k, m, n_mats);
+        ggml_tensor * input  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids_all, "ids");
+        ggml_tensor * ids = ggml_view_2d(ctx, ids_all, n_used, n, ids_all->nb[1], 0);
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, input, ids);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, up_w,   input, ids);
+        return ggml_swiglu_split(ctx, gate, up);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 512);
     }
 };
 
@@ -5065,6 +5104,113 @@ struct test_mul_mat_id_fusion : public test_case {
 };
 
 // GGML_OP_OUT_PROD
+// GGML_OP_MUL_MAT group: independent single-column matvecs on one activation vector
+// (RDNA3.5 CUDA launches [Q8_0 | Q8_0 gate/up + GLU | F32 ...] as one grouped kernel)
+struct test_mmv_group : public test_case {
+    const int64_t k;
+    const int64_t m_q8;   // rows of a plain Q8_0 segment (0 = none)
+    const int64_t m_glu;  // rows of a Q8_0 gate/up + swiglu segment (0 = none)
+    const int64_t m_f32a; // rows of an F32 segment (0 = none)
+    const int64_t m_f32b; // rows of a second F32 segment (0 = none)
+
+    std::string vars() override { return VARS_TO_STR5(k, m_q8, m_glu, m_f32a, m_f32b); }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MMV_GROUP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_mmv_group(int64_t k, int64_t m_q8, int64_t m_glu, int64_t m_f32a, int64_t m_f32b)
+        : k(k), m_q8(m_q8), m_glu(m_glu), m_f32a(m_f32a), m_f32b(m_f32b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(y, "y");
+
+        ggml_tensor * out = nullptr;
+        auto append = [&](ggml_tensor * t) {
+            out = out ? ggml_concat(ctx, out, t, 0) : t;
+        };
+
+        if (m_q8 > 0) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m_q8);
+            ggml_set_name(w, "w_q8");
+            append(ggml_mul_mat(ctx, w, y));
+        }
+        if (m_glu > 0) {
+            ggml_tensor * wg = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m_glu);
+            ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m_glu);
+            ggml_set_name(wg, "w_gate");
+            ggml_set_name(wu, "w_up");
+            append(ggml_swiglu_split(ctx, ggml_mul_mat(ctx, wg, y), ggml_mul_mat(ctx, wu, y)));
+        }
+        if (m_f32a > 0) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m_f32a);
+            ggml_set_name(w, "w_f32a");
+            append(ggml_mul_mat(ctx, w, y));
+        }
+        if (m_f32b > 0) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m_f32b);
+            ggml_set_name(w, "w_f32b");
+            append(ggml_mul_mat(ctx, w, y));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// qwen4exp hyper-connection up projection + stream mix chain (decode):
+//   silu(scale(lo)) -> mul_mat(W_up) -> sigmoid -> mul(xn) -> reshape -> view/cont -> adds -> scale
+struct test_hc_up_mix : public test_case {
+    const ggml_type type_w;
+    const int64_t k;       // low-rank width (columns of W_up)
+    const int64_t n_embd;
+    const int64_t hc;
+    const int64_t n_tokens;
+
+    std::string vars() override { return VARS_TO_STR5(type_w, k, n_embd, hc, n_tokens); }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_UP_MIX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_hc_up_mix(ggml_type type_w, int64_t k, int64_t n_embd, int64_t hc, int64_t n_tokens)
+        : type_w(type_w), k(k), n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_set_name(lo, "lo");
+        ggml_tensor * xn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc * n_embd, n_tokens);
+        ggml_set_name(xn, "xn");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, k, hc * n_embd);
+        ggml_set_name(w, "w_up");
+
+        ggml_tensor * act  = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc));
+        ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w, act));
+        ggml_tensor * gated = ggml_mul(ctx, xn, gate);
+        gated = ggml_reshape_3d(ctx, gated, n_embd, hc, n_tokens);
+        ggml_tensor * mixed = ggml_view_2d(ctx, gated, n_embd, n_tokens, ggml_row_size(gated->type, n_embd) * hc, 0);
+        mixed = ggml_cont(ctx, mixed);
+        for (int64_t c = 1; c < hc; ++c) {
+            ggml_tensor * s = ggml_view_2d(ctx, gated, n_embd, n_tokens, ggml_row_size(gated->type, n_embd) * hc,
+                    ggml_row_size(gated->type, n_embd) * c);
+            mixed = ggml_add(ctx, mixed, s);
+        }
+        mixed = ggml_scale(ctx, mixed, 1.0f / (float) hc);
+        ggml_set_name(mixed, "mixed");
+        return mixed;
+    }
+};
+
 struct test_out_prod : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -9412,6 +9558,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_shared_mul_add(2048, 32));
     test_cases.emplace_back(new test_swiglu_q8_mmq(false, 1, 1, 2048, 32, 512));
     test_cases.emplace_back(new test_swiglu_q8_mmq(true, 16, 8, 2048, 32, 512));
+    test_cases.emplace_back(new test_swiglu_q8_mmq(false, 1, 1, 2560, 128, 640));
+    test_cases.emplace_back(new test_swiglu_q8_mmq(true, 512, 10, 2560, 128, 640));
+    test_cases.emplace_back(new test_swiglu_q8_mmq(true, 512, 10, 2560, 128, 640, GGML_TYPE_IQ4_NL));
 
     for (auto multi_add : {false, true}) {
         for (auto set_rows : {false, true}) {
@@ -9517,7 +9666,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // qwen4exp hyper-connection up projection + stream mix (fused on RDNA3.5 for one token)
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 320, 2560, 4, 1));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 320, 2560, 4, 3));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 256, 1000, 3, 1));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 512, 640, 4, 1));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_F32,  320, 2560, 4, 1));
+
+    // grouped single-column matvecs on one activation vector (qwen4exp decode: GDN qkv/z/beta/alpha,
+    // hyper-connection down + inject, shared-expert gate/up + router)
+    test_cases.emplace_back(new test_mmv_group(2560, 10240, 0, 48, 48));
+    test_cases.emplace_back(new test_mmv_group(2560, 10240, 6144, 0, 0));
+    test_cases.emplace_back(new test_mmv_group(2560, 1024, 6144, 48, 48));
+    test_cases.emplace_back(new test_mmv_group(10240, 320, 0, 4, 0));
+    test_cases.emplace_back(new test_mmv_group(2560, 0, 640, 512, 0));
+    test_cases.emplace_back(new test_mmv_group(2560, 0, 640, 512, 1));
+    test_cases.emplace_back(new test_mmv_group(2560, 0, 0, 48, 48));
+    test_cases.emplace_back(new test_mmv_group(640, 2560, 0, 33, 0));
+    test_cases.emplace_back(new test_mmv_group(256, 17, 5, 3, 129));
+
     // 256-expert MoE with 4/16/32/128 rows per expert, exercises the RDNA3.5 mul_mat_id tile selection
+    // Qwen3.8-Flash-Next (qwen4exp) UD-IQ4_XS experts: 512 experts, 10 active, gate/up IQ3_S [2560 -> 640], down IQ4_NL [640 -> 2560]
+    for (int n : {1, 8, 64, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false, 640,  n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,   GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, 128, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, 512, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, 1024, 2048));
@@ -10141,6 +10315,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // QSA (qwen4exp / DeepSeek-V3.2 style indexer): k == n_kv while the context fits the budget, [n_kv, n_tokens, 1, n_stream]
+    for (int n : {256, 512, 1024, 2048, 2304}) {
+        for (int nt : {1, 2, 512}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, nt, 1, 1}, std::min(n, 2051)));
+        }
+    }
     for (int k : {4, 8, 16, 32}) {
         for (int nrows : {1, 8, 16}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k));
@@ -10495,6 +10675,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_topk_moe({129, 1, 1, 1}, 128, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
+                    test_cases.emplace_back(new test_topk_moe({512, 22, 1, 1}, 10, with_norm, bias_probs, gate, scale_w)); // Used by Qwen3.8-Flash-Next (qwen4exp)
                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
                 }
             }
@@ -10589,6 +10770,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Qwen3.8-Flash-Next decode hot path: fused gate/up uses this exact shape.
+    test_cases.emplace_back(new test_mul_mat_id(
+        GGML_TYPE_IQ3_S, GGML_TYPE_F32, 512, 10, false, 640, 1, 2560));
+    test_cases.emplace_back(new test_swiglu_iq3_mmvq());
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
@@ -10989,6 +11175,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 2048, 1)); // PP-2048
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 2048, 1)); // qwen4exp H48/S128 PP-2048
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 1024, 1)); // H64/S128 PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 64, 128, 2048, 1)); // H64/S128 PP-2048
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)

@@ -2281,6 +2281,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_qsa;
+    class llm_graph_input_qsa_k;
 
     // Set when the n-gram table is left on disk (--ngram-on-disk): per_layer_tok_embd is
     // counted as created but never allocated, mapped or read, and build_ple takes its
@@ -2332,6 +2333,13 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        llm_graph_input_qsa_k * qsa_k_inp = nullptr;
+
+        // QSA: store this ubatch's raw indexer keys in the indexer cache (no selection)
+        void build_qsa_store_k(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * cur,
+                            int   il);
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(

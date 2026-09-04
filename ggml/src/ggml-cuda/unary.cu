@@ -736,3 +736,47 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+/* fused scale + unary */
+
+template <float (*op)(float)>
+static __global__ void scale_unary_kernel(const float * x, float * dst, const float scale, const float bias, const int k) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    // identical expression to scale_f32 in scale.cu, followed by the unary op
+    dst[i] = op(scale * x[i] + bias);
+}
+
+template <float (*op)(float)>
+static void scale_unary_cuda(const float * x, float * dst, const float scale, const float bias, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(scale_unary_kernel<op>, launch_params, x, dst, scale, bias, k);
+}
+
+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node) {
+    const ggml_tensor * src = scale_node->src[0];
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32 && unary_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(unary_node));
+    GGML_ASSERT(unary_node->src[0] == scale_node);
+
+    const float scale = ggml_get_op_params_f32(scale_node, 0);
+    const float bias  = ggml_get_op_params_f32(scale_node, 1);
+    const int   k     = ggml_nelements(src);
+
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SILU:
+            scale_unary_cuda<op_silu>((const float *) src->data, (float *) unary_node->data, scale, bias, k, ctx.stream());
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            scale_unary_cuda<op_sigmoid>((const float *) src->data, (float *) unary_node->data, scale, bias, k, ctx.stream());
+            break;
+        default:
+            GGML_ABORT("unsupported unary op for fused scale+unary");
+    }
+}

@@ -515,7 +515,7 @@ static void launch_gated_delta_net(
     const int cc = ggml_cuda_info().devices[id].cc;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     // Qwen3.6 PP2048 measured faster on gfx1151 on 2026-09-02. Retest if occupancy changes.
-    const int num_warps = GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && (H == 32 || H == 64) && !KDA ? 32 :
+    const int num_warps = GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && (H == 32 || H == 48 || H == 64) && !KDA ? 32 :
         (GGML_CUDA_CC_IS_RDNA3_5(cc) ? 16 : gated_delta_net_num_warps(cc));
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
@@ -538,16 +538,22 @@ static void launch_gated_delta_net(
         if (GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && num_warps == 32 && n_tokens >= 16) {
             // 16 warps x 4 columns per block, 16-token tiles: best of the swept configurations on gfx1151
             //     (2048 tokens, H=32: 5.03 ms -> 2.2 ms; H=64: 9.29 ms -> 4.5 ms).
-            constexpr int tiled_warps = 16;
-            constexpr int tiled_cols  = 4;
-            constexpr int tiled_tile  = 16;
-            const dim3 tiled_grid(H, n_seqs, S_v / (tiled_warps*tiled_cols));
-            const dim3 tiled_block(warp_size, tiled_warps, 1);
-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(tiled_grid, tiled_block, 0, stream);
-            ggml_cuda_kernel_launch(gated_delta_net_tiled_cuda<128, tiled_warps, tiled_cols, tiled_tile, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
-                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
-                neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            const int cfg = getenv("GGML_GDN_TILE_CFG") ? atoi(getenv("GGML_GDN_TILE_CFG")) : (H == 48 ? 1 : 0);
+            auto launch_tiled = [&](auto kernel, int warps, int cols) {
+                const dim3 tiled_grid(H, n_seqs, S_v / (warps * cols));
+                const dim3 tiled_block(warp_size, warps, 1);
+                const ggml_cuda_kernel_launch_params launch_params(tiled_grid, tiled_block, 0, stream);
+                ggml_cuda_kernel_launch(kernel, launch_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+                    sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                    neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            };
+            switch (cfg) {
+                case 1: launch_tiled(gated_delta_net_tiled_cuda<128, 8,  8, 16, keep_rs_t>, 8,  8); break;
+                case 2: launch_tiled(gated_delta_net_tiled_cuda<128, 32, 2, 16, keep_rs_t>, 32, 2); break;
+                case 3: launch_tiled(gated_delta_net_tiled_cuda<128, 16, 4,  8, keep_rs_t>, 16, 4); break;
+                default: launch_tiled(gated_delta_net_tiled_cuda<128, 16, 4, 16, keep_rs_t>, 16, 4); break;
+            }
             return;
         }
     }
@@ -902,17 +908,25 @@ gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, cons
     out[(int64_t) h * S + tid] = scale * xi * norm_w[tid];
 }
 
-void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in) {
+void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in, float * attn_scratch) {
     GGML_ASSERT(args_in.S == 128 && args_in.d_conv == 4);
-    ggml_cuda_pool_alloc<float> attn(ctx.pool(), args_in.S * args_in.H_v);
     ggml_cuda_gdn_decode_args args = args_in;
-    args.attn_out = attn.get();
+    args.attn_out = attn_scratch;
 
     const dim3 grid(args.H_v, 1, 1);
     const dim3 block(32, 32, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, ctx.stream());
     ggml_cuda_kernel_launch(gdn_decode_fused_cuda<128, 4>, launch_params, args);
+}
 
+void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in) {
+    GGML_ASSERT(args_in.S == 128 && args_in.d_conv == 4);
+    ggml_cuda_pool_alloc<float> attn(ctx.pool(), args_in.S * args_in.H_v);
+    ggml_cuda_gdn_decode_args args = args_in;
+    args.attn_out = attn.get();
+    ggml_cuda_op_gdn_decode_fused_prenorm(ctx, args, attn.get());
+
+    const dim3 grid(args.H_v, 1, 1);
     const dim3 norm_block(128, 1, 1);
     const ggml_cuda_kernel_launch_params norm_params = ggml_cuda_kernel_launch_params(grid, norm_block, 0, ctx.stream());
     ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get(), args.norm_w, args.out, args.eps_rms);
