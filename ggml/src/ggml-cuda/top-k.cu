@@ -2,12 +2,17 @@
 #include "top-k.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
-#    include <cub/cub.cuh>
-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
-#        define CUB_TOP_K_AVAILABLE
-#        include <cuda/iterator>
+#    ifdef GGML_CUDA_CUB_IS_HIPCUB
+#        include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#    else
+#        include <cub/cub.cuh>
+#        if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
+#            define CUB_TOP_K_AVAILABLE
+#            include <cuda/iterator>
 using namespace cub;
-#    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
+#        endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
+#    endif  // GGML_CUDA_CUB_IS_HIPCUB
 #endif      // GGML_CUDA_USE_CUB
 
 #ifdef CUB_TOP_K_AVAILABLE

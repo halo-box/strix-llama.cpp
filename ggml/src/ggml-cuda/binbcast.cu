@@ -696,6 +696,14 @@ void ggml_cuda_op_weighted_expert_sum(ggml_backend_cuda_context & ctx, ggml_tens
         case 6: launch_weighted_expert_sum(6); break;
         case 7: launch_weighted_expert_sum(7); break;
         case 8: launch_weighted_expert_sum(8); break;
+        case 9: launch_weighted_expert_sum(9); break;
+        case 10: launch_weighted_expert_sum(10); break;
+        case 11: launch_weighted_expert_sum(11); break;
+        case 12: launch_weighted_expert_sum(12); break;
+        case 13: launch_weighted_expert_sum(13); break;
+        case 14: launch_weighted_expert_sum(14); break;
+        case 15: launch_weighted_expert_sum(15); break;
+        case 16: launch_weighted_expert_sum(16); break;
         default: GGML_ABORT("unsupported expert count");
     }
 #undef launch_weighted_expert_sum
@@ -774,7 +782,7 @@ static __global__ void __launch_bounds__(256, 1) shared_gate_mul_add_f32(
     for (int64_t i = tid; i < n_embd; i += block_size) {
         const float product = rounded_mul_f32(src[i], gate);
         const float value   = rounded_add_f32(other[i], product);
-        dst[i] = rounded_add_f32(value, residual[i]);
+        dst[i] = residual ? rounded_add_f32(value, residual[i]) : value;
     }
 }
 
@@ -787,7 +795,7 @@ void ggml_cuda_op_shared_gate_mul_add(
     const ggml_cuda_kernel_launch_params launch_params(1, 256, 0, ctx.stream());
     ggml_cuda_kernel_launch(shared_gate_mul_add_f32, launch_params,
         (const float *) w->data, (const float *) y->data, (const float *) src->data, (const float *) other->data,
-        (const float *) residual->data, (float *) dst->data, (int) (w->ne[0] / 2), dst->ne[0]);
+        residual ? (const float *) residual->data : nullptr, (float *) dst->data, (int) (w->ne[0] / 2), dst->ne[0]);
 }
 
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

@@ -36,6 +36,7 @@ struct ggml_cuda_gdn_decode_args {
     float         scale;          // 1/sqrt(S)
     // gated rms norm
     const float * norm_w;         // [S]
+    const ggml_tensor * norm_w_tensor = nullptr;
     float         eps_rms;
     float *       out;            // [S, H_v]
     float *       attn_out;       // [S, H_v] pre-norm scratch (set by the host)
@@ -43,3 +44,5 @@ struct ggml_cuda_gdn_decode_args {
 };
 
 void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args);
+// first kernel only: writes the pre-norm attention output [S, H_v] to attn_scratch (the gated norm is applied by the consumer)
+void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args, float * attn_scratch);

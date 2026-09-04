@@ -2,7 +2,12 @@
 #include "reduce_rows.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
+#ifdef GGML_CUDA_CUB_IS_HIPCUB
+#include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#else
 #include <cub/cub.cuh>
+#endif  // GGML_CUDA_CUB_IS_HIPCUB
 using namespace cub;
 #endif  // GGML_CUDA_USE_CUB
 
