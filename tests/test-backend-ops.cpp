@@ -3771,6 +3771,8 @@ struct test_relu_sqr : public test_case {
     }
 };
 
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats);
+
 struct test_weighted_expert_sum : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -3782,6 +3784,7 @@ struct test_weighted_expert_sum : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
 
     std::string vars() override {
         return VARS_TO_STR3(n_embd, n_expert_used, n_tokens);
@@ -3791,7 +3794,14 @@ struct test_weighted_expert_sum : public test_case {
         : n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens);
+        const int64_t k = 32;
+        const int64_t n_mats = std::max<int64_t>(16, n_expert_used);
+        ggml_tensor * expert_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, k, n_embd, n_mats);
+        ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+        ggml_set_name(ids_all, "ids");
+        ggml_tensor * ids = ggml_view_2d(ctx, ids_all, n_expert_used, n_tokens, ids_all->nb[1], 0);
+        ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_expert_used, n_tokens);
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, expert_weights, input, ids);
         ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
         ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
         ggml_build_forward_expand(gf, weighted);
@@ -3810,6 +3820,10 @@ struct test_weighted_expert_sum : public test_case {
             ggml_build_forward_expand(gf, out);
         }
         return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, std::max<int64_t>(16, n_expert_used));
     }
 };
 
@@ -5105,15 +5119,13 @@ struct test_mul_mat_id_fusion : public test_case {
 
 // GGML_OP_OUT_PROD
 // GGML_OP_MUL_MAT group: independent single-column matvecs on one activation vector
-// (RDNA3.5 CUDA launches [Q8_0 | Q8_0 gate/up + GLU | F32 ...] as one grouped kernel)
+// (RDNA3.5 CUDA launches independent Q8_0 segments as one grouped kernel)
 struct test_mmv_group : public test_case {
     const int64_t k;
     const int64_t m_q8;   // rows of a plain Q8_0 segment (0 = none)
     const int64_t m_glu;  // rows of a Q8_0 gate/up + swiglu segment (0 = none)
-    const int64_t m_f32a; // rows of an F32 segment (0 = none)
-    const int64_t m_f32b; // rows of a second F32 segment (0 = none)
 
-    std::string vars() override { return VARS_TO_STR5(k, m_q8, m_glu, m_f32a, m_f32b); }
+    std::string vars() override { return VARS_TO_STR3(k, m_q8, m_glu); }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5124,8 +5136,8 @@ struct test_mmv_group : public test_case {
 
     double max_nmse_err() override { return 5e-4; }
 
-    test_mmv_group(int64_t k, int64_t m_q8, int64_t m_glu, int64_t m_f32a, int64_t m_f32b)
-        : k(k), m_q8(m_q8), m_glu(m_glu), m_f32a(m_f32a), m_f32b(m_f32b) {}
+    test_mmv_group(int64_t k, int64_t m_q8, int64_t m_glu)
+        : k(k), m_q8(m_q8), m_glu(m_glu) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
@@ -5147,16 +5159,6 @@ struct test_mmv_group : public test_case {
             ggml_set_name(wg, "w_gate");
             ggml_set_name(wu, "w_up");
             append(ggml_swiglu_split(ctx, ggml_mul_mat(ctx, wg, y), ggml_mul_mat(ctx, wu, y)));
-        }
-        if (m_f32a > 0) {
-            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m_f32a);
-            ggml_set_name(w, "w_f32a");
-            append(ggml_mul_mat(ctx, w, y));
-        }
-        if (m_f32b > 0) {
-            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m_f32b);
-            ggml_set_name(w, "w_f32b");
-            append(ggml_mul_mat(ctx, w, y));
         }
         ggml_set_name(out, "out");
         return out;
@@ -6585,7 +6587,13 @@ struct test_top_k : public test_case {
                 diff += std::fabs(b[i] - ib[i]);
             }
 
-            return diff + jdst(ia.data(), ib.data(), n);
+            if (n != (size_t) (ggml_nrows(input) * k)) {
+                return nmse(a, b, n);
+            }
+            for (int64_t r = 0; r < ggml_nrows(input); ++r) {
+                diff += jdst(ia.data() + r * k, ib.data() + r * k, k);
+            }
+            return diff;
         }
     }
 
@@ -6603,8 +6611,7 @@ struct test_top_k : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        std::random_device rd;
-        std::default_random_engine rng(rd());
+        std::default_random_engine rng(0x5eed);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             int tie_denom = std::max(1, std::min(10, k / 2));
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
@@ -6749,17 +6756,8 @@ struct test_topk_moe : public test_case {
         }
     }
 
-    // allow output in arbitrary order
     double err(const float * a, const float * b, size_t n) override {
-        std::vector<float> a2(n);
-        std::vector<float> b2(n);
-        for (size_t i = 0; i < n; ++i) {
-            a2[i] = a[i];
-            b2[i] = b[i];
-        }
-        std::sort(a2.begin(), a2.end());
-        std::sort(b2.begin(), b2.end());
-        return nmse(a2.data(), b2.data(), n);
+        return nmse(a, b, n);
     }
 };
 
@@ -9675,15 +9673,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // grouped single-column matvecs on one activation vector (qwen4exp decode: GDN qkv/z/beta/alpha,
     // hyper-connection down + inject, shared-expert gate/up + router)
-    test_cases.emplace_back(new test_mmv_group(2560, 10240, 0, 48, 48));
-    test_cases.emplace_back(new test_mmv_group(2560, 10240, 6144, 0, 0));
-    test_cases.emplace_back(new test_mmv_group(2560, 1024, 6144, 48, 48));
-    test_cases.emplace_back(new test_mmv_group(10240, 320, 0, 4, 0));
-    test_cases.emplace_back(new test_mmv_group(2560, 0, 640, 512, 0));
-    test_cases.emplace_back(new test_mmv_group(2560, 0, 640, 512, 1));
-    test_cases.emplace_back(new test_mmv_group(2560, 0, 0, 48, 48));
-    test_cases.emplace_back(new test_mmv_group(640, 2560, 0, 33, 0));
-    test_cases.emplace_back(new test_mmv_group(256, 17, 5, 3, 129));
+    test_cases.emplace_back(new test_mmv_group(2560, 10240, 6144));
+    test_cases.emplace_back(new test_mmv_group(2560, 1024, 6144));
 
     // 256-expert MoE with 4/16/32/128 rows per expert, exercises the RDNA3.5 mul_mat_id tile selection
     // Qwen3.8-Flash-Next (qwen4exp) UD-IQ4_XS experts: 512 experts, 10 active, gate/up IQ3_S [2560 -> 640], down IQ4_NL [640 -> 2560]

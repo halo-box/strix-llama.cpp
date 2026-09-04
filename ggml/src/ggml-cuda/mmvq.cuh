@@ -36,12 +36,6 @@ struct ggml_cuda_mmv_group_seg {
 bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y);
 void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, int nseg);
 
-// RDNA3.5 qwen4exp hyper-connection up projection fused with the stream mix (one token):
-//   mixed[e] = mix_scale * sum_c xn[c*n_embd+e] * sigmoid((W_up * op(y_scale*y + y_bias))[c*n_embd+e]) + mix_bias
-bool ggml_cuda_mul_mat_vec_q_fq_hcmix_ok(const ggml_tensor * w, const ggml_tensor * y, const ggml_tensor * xn, const ggml_tensor * dst, int hc);
-void ggml_cuda_mul_mat_vec_q_fq_hcmix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * y, const ggml_tensor * xn,
-        ggml_tensor * dst, int hc, float y_scale, float y_bias, int y_op, float mix_scale, float mix_bias);
-
 // RDNA3.5 qwen4exp GDN output projection with the gated per-head norm in the prologue:
 //   y' = sigmoid(z) * (rms_norm_128(attn) * norm_w), then the fused-quantize matvec of dst->src[0] with y'
 bool ggml_cuda_mul_mat_vec_q_fq_gdn_gate_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const ggml_tensor * z);

@@ -202,7 +202,8 @@ static void launch_mm_ids_helper(
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
-    if (n_experts == 512 && n_expert_used == 10 && getenv("GGML_CUDA_DISABLE_MMID_512") == nullptr) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && n_experts == 512 && n_expert_used == 10 && getenv("GGML_CUDA_DISABLE_MMID_512") == nullptr) {
         mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
             ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
         return;

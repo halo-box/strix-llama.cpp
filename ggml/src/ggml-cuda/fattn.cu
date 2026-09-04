@@ -357,10 +357,11 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
 
 static bool ggml_cuda_fattn_tile_q8_0_KV_supported(const ggml_tensor * dst) {
 #ifdef GGML_USE_HIP
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    return Q->ne[1] == 1 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && Q->ne[0] == K->ne[0] && K->ne[0] == V->ne[0] &&
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) && Q->ne[1] == 1 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && Q->ne[0] == K->ne[0] && K->ne[0] == V->ne[0] &&
         (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256);
 #else
     GGML_UNUSED(dst);

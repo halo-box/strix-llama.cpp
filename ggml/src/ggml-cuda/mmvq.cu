@@ -1960,25 +1960,19 @@ static void mul_mat_vec_q_fq_switch_type(
 
 // ---------------------------------------------------------------------------------------------
 // RDNA3.5 grouped single-column matvec: several independent matvecs that share the same activation vector
-// (e.g. the qwen4exp GDN qkv / gate / alpha / beta projections, or a hyper-connection down projection with its
-// F32 inject rows) are launched as one kernel. Each segment is a plain [ncols x nrows] weight matrix (Q8_0, with
-// an optional Q8_0 gate + GLU epilogue, or F32) with its own destination; blocks are assigned to segments by a
-// prefix over the per-segment block counts. Q8_0 rows use the fused-quantize path of mul_mat_vec_q_fq (same
-// per-lane accumulation order), F32 rows are one wave per row with float4 loads.
+// Q8_0 matvecs are launched as one kernel. Each segment is a plain [ncols x nrows] weight matrix with an optional
+// Q8_0 gate and GLU epilogue. Blocks are assigned to segments by a prefix over the segment block counts.
 
 #define MMVQ_GROUP_MAX 4
-#define MMVQ_GROUP_TYPE_Q8_0 0
-#define MMVQ_GROUP_TYPE_F32  1
 
 struct mmvq_group_seg_dev {
     const void * vx;
     const void * gate;
     float      * dst;
     int          nrows;
-    int          stride_row;      // in blocks (Q8_0) or floats (F32)
+    int          stride_row;      // in Q8_0 blocks
     int          gate_stride_row; // in blocks
     int          blocks_begin;
-    int          type;
     int          glu_op;
     float        glu_limit;
 };
@@ -2017,38 +2011,6 @@ static __global__ void mul_mat_vec_fq_group(
 
     const int  row    = ((int) blockIdx.x - seg.blocks_begin)*nwarps + threadIdx.y;
     const bool row_ok = row < seg.nrows;
-
-    if (seg.type == MMVQ_GROUP_TYPE_F32) {
-        if (!row_ok) {
-            return;
-        }
-        const float4 * w = (const float4 *) ((const float *) seg.vx + (size_t) row*seg.stride_row);
-        const float4 * y = (const float4 *) y_ptr;
-        float acc = 0.0f;
-#pragma unroll 4
-        for (int k = lane; k < ncols_x/4; k += warp_size) {
-            float4 w4 = w[k];
-            float4 y4 = y[k];
-            if (y_op != 0) {
-                float v[4] = {y4.x, y4.y, y4.z, y4.w};
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float t = y_scale * v[j] + y_bias;
-                    v[j] = y_op == 1 ? ggml_cuda_op_silu_single(t) : 1.0f / (1.0f + expf(-t));
-                }
-                y4 = make_float4(v[0], v[1], v[2], v[3]);
-            }
-            acc = fmaf(w4.x, y4.x, acc);
-            acc = fmaf(w4.y, y4.y, acc);
-            acc = fmaf(w4.z, y4.z, acc);
-            acc = fmaf(w4.w, y4.w, acc);
-        }
-        acc = warp_reduce_sum<warp_size>(acc);
-        if (lane == 0) {
-            seg.dst[row] = acc;
-        }
-        return;
-    }
 
     // Q8_0 path: identical to mul_mat_vec_q_fq<GGML_TYPE_Q8_0, ...>
     const int  row_safe = row_ok ? row : seg.nrows - 1;
@@ -2209,9 +2171,7 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
                 ggml_are_same_shape(segs[i].w, segs[i].gate) && segs[i].gate->nb[0] == sizeof(block_q8_0) &&
                 segs[i].gate->nb[1] % sizeof(block_q8_0) == 0);
         }
-        if (segs[i].w->type == GGML_TYPE_Q8_0) {
-            total_q8_rows += segs[i].w->ne[1];
-        }
+        total_q8_rows += segs[i].w->ne[1];
         max_rows = std::max<int64_t>(max_rows, segs[i].w->ne[1]);
     }
 
@@ -2231,7 +2191,6 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
         d.gate         = segs[i].gate ? segs[i].gate->data : nullptr;
         d.dst          = (float *) segs[i].dst->data;
         d.nrows        = (int) w->ne[1];
-        d.type         = w->type == GGML_TYPE_Q8_0 ? MMVQ_GROUP_TYPE_Q8_0 : MMVQ_GROUP_TYPE_F32;
         d.stride_row   = (int) (w->nb[1] / ggml_type_size(w->type));
         d.gate_stride_row = segs[i].gate ? (int) (segs[i].gate->nb[1] / sizeof(block_q8_0)) : 0;
         d.blocks_begin = nblocks;
@@ -2265,234 +2224,6 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
         default:
             GGML_ABORT("fatal error");
     }
-}
-
-// ---------------------------------------------------------------------------------------------
-// qwen4exp hyper-connection up projection + stream mix, one token (RDNA3.5):
-//     gate = W_up * y'   (y' = op(y_scale*y + y_bias), Q8_0 weights [ncols, hc*n_embd], fused quantization)
-//     mixed[e] = mix_scale * ( sum_c xn[c*n_embd + e] * sigmoid(gate[c*n_embd + e]) ) + mix_bias
-// One wave owns element e and computes its hc gate rows {c*n_embd + e}: the hc*blocks_per_row Q8_0 blocks
-// of those rows are spread flat over the lanes (4 lanes per block, 8 blocks per pass), so the short rows
-// (ncols = 320 -> 10 blocks) keep all lanes busy. The gate itself is never written; the mix uses the same
-// rounding sequence as hc_mix_reduce_f32 (separate mul / add roundings, streams summed in order).
-
-#define MMVQ_HCMIX_MAX_PASSES 16
-#define MMVQ_HCMIX_MAX_HC     4
-#define MMVQ_HCMIX_EPW        2   // elements (mixed outputs) per wave: 2*hc adjacent-row pairs stream per wave
-
-#if defined(__HIP_PLATFORM_AMD__)
-static __device__ __forceinline__ float mmvq_hc_mul_rn(const float a, const float b) {
-    float result;
-    asm("v_mul_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
-    return result;
-}
-static __device__ __forceinline__ float mmvq_hc_add_rn(const float a, const float b) {
-    float result;
-    asm("v_add_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
-    return result;
-}
-#else
-static __device__ __forceinline__ float mmvq_hc_mul_rn(const float a, const float b) { return __fmul_rn(a, b); }
-static __device__ __forceinline__ float mmvq_hc_add_rn(const float a, const float b) { return __fadd_rn(a, b); }
-#endif
-
-template <int nwarps>
-__launch_bounds__(nwarps * ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void mul_mat_vec_q_fq_hcmix(
-        const void * GGML_CUDA_RESTRICT vx_ptr, const float * GGML_CUDA_RESTRICT y_ptr, const float * xn, float * dst,
-        const int ncols_x, const int n_embd, const int hc, const int stride_row_x,
-        const float y_scale, const float y_bias, const int y_op, const float mix_scale, const float mix_bias) {
-    constexpr int qi  = QI8_0;
-    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int lanes_per_row = qi / vdr;                 // 4
-    constexpr int rows_per_wave = warp_size / lanes_per_row; // 8 = hc_max * epw
-    constexpr int epw = MMVQ_HCMIX_EPW;
-    static_assert(rows_per_wave == MMVQ_HCMIX_MAX_HC * epw, "lane layout");
-
-    extern __shared__ char mmvq_fq_smem[];
-    block_q8_1 * y_q8 = (block_q8_1 *) mmvq_fq_smem;
-
-    const int lane = threadIdx.x;
-    const int tid  = warp_size*threadIdx.y + lane;
-
-    const int e0 = (blockIdx.x*nwarps + threadIdx.y) * epw;   // first element of this wave
-
-    // lane group g = lane/4 owns wave row r = g: stream c = r / epw, element e0 + (r % epw)
-    const int r   = lane / lanes_per_row;
-    const int kqs = vdr * (lane % lanes_per_row);
-    const int c   = r / epw;
-    const int j   = r - c*epw;
-    const bool row_ok = c < hc && e0 + j < n_embd;
-    const int row = c*n_embd + min(e0 + j, n_embd - 1); // clamped so that every lane reads valid memory
-
-    const block_q8_0 * x = (const block_q8_0 *) vx_ptr + (size_t) (row_ok ? row : 0)*stride_row_x;
-    const int blocks_per_row = ncols_x / QK8_0;
-
-    // 1. the whole row of this lane group first (the DRAM stream; everything else is tiny)
-    int  qs[MMVQ_HCMIX_MAX_PASSES][vdr];
-    half d[MMVQ_HCMIX_MAX_PASSES];
-#pragma unroll
-    for (int p = 0; p < MMVQ_HCMIX_MAX_PASSES; ++p) {
-        if (p < blocks_per_row) {
-#pragma unroll
-            for (int jj = 0; jj < vdr; ++jj) {
-                qs[p][jj] = get_int_b2(x[p].qs, kqs + jj);
-            }
-            d[p] = x[p].d;
-        }
-    }
-
-    // 2. quantize the activation vector into shared memory (same as mul_mat_vec_q_fq)
-    {
-        const int nby = ncols_x / QK8_1;
-        for (int i = tid; i < 4*nby; i += nwarps*warp_size) {
-            const int ib  = i >> 2;
-            const int sub = i & 3;
-            const float4 * yv = (const float4 *) (y_ptr + ib*QK8_1 + sub*8);
-            const float4 v0 = yv[0];
-            const float4 v1 = yv[1];
-            float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
-            if (y_op != 0) {
-#pragma unroll
-                for (int k = 0; k < 8; ++k) {
-                    const float t = y_scale * v[k] + y_bias;
-                    v[k] = y_op == 1 ? ggml_cuda_op_silu_single(t) : 1.0f / (1.0f + expf(-t));
-                }
-            }
-            float amax = fabsf(v[0]);
-#pragma unroll
-            for (int k = 1; k < 8; ++k) {
-                amax = fmaxf(amax, fabsf(v[k]));
-            }
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, warp_size));
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, warp_size));
-            const float dq = amax / 127.0f;
-            int q[8];
-#pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                const int8_t qk8 = amax == 0.0f ? 0 : roundf(v[k] / dq);
-                q[k] = (int) qk8 & 0xff;
-            }
-            int * qsy = (int *) y_q8[ib].qs;
-            qsy[2*sub + 0] = q[0] | (q[1] << 8) | (q[2] << 16) | (q[3] << 24);
-            qsy[2*sub + 1] = q[4] | (q[5] << 8) | (q[6] << 16) | (q[7] << 24);
-            if (sub == 0) {
-                y_q8[ib].ds = make_half2(dq, 0.0f);
-            }
-        }
-        __syncthreads();
-    }
-
-    if (e0 >= n_embd) {
-        return;
-    }
-
-    // 3. dot product of this lane group's row
-    float acc = 0.0f;
-#pragma unroll
-    for (int p = 0; p < MMVQ_HCMIX_MAX_PASSES; ++p) {
-        if (p < blocks_per_row) {
-            const block_q8_1 * bq8_1 = &y_q8[p];
-            int u[vdr];
-#pragma unroll
-            for (int jj = 0; jj < vdr; ++jj) {
-                u[jj] = get_int_b4(bq8_1->qs, kqs + jj);
-            }
-            acc += vec_dot_q8_0_q8_1_impl<float, vdr>(qs[p], u, d[p], __low2half(bq8_1->ds));
-        }
-    }
-    acc += __shfl_xor_sync(0xffffffff, acc, 1, warp_size);
-    acc += __shfl_xor_sync(0xffffffff, acc, 2, warp_size);
-    // lane 4*r now holds the gate of wave row r = c*epw + j
-
-    float g[MMVQ_HCMIX_MAX_HC];
-#pragma unroll
-    for (int cc = 0; cc < MMVQ_HCMIX_MAX_HC; ++cc) {
-        // element j = lane (for lane < epw): its stream-cc gate sits in lane group cc*epw + lane
-        g[cc] = __shfl_sync(0xffffffff, acc, lanes_per_row * (cc*epw + (lane % epw)), warp_size);
-    }
-
-    if (lane < epw && e0 + lane < n_embd) {
-        const int e = e0 + lane;
-        // same expressions as hc_mix_reduce_f32: sigmoid, rounded mul, streams added in order, then scale_f32
-        float mixed = mmvq_hc_mul_rn(xn[e], 1.0f / (1.0f + expf(-g[0])));
-#pragma unroll
-        for (int cc = 1; cc < MMVQ_HCMIX_MAX_HC; ++cc) {
-            if (cc < hc) {
-                mixed = mmvq_hc_add_rn(mixed, mmvq_hc_mul_rn(xn[cc*n_embd + e], 1.0f / (1.0f + expf(-g[cc]))));
-            }
-        }
-        dst[e] = mix_scale * mixed + mix_bias;
-    }
-}
-
-bool ggml_cuda_mul_mat_vec_q_fq_hcmix_ok(const ggml_tensor * w, const ggml_tensor * y, const ggml_tensor * xn, const ggml_tensor * dst, const int hc) {
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (!GGML_CUDA_CC_IS_RDNA3_5(cc) || hc < 1 || hc > MMVQ_HCMIX_MAX_HC) {
-        return false;
-    }
-    if (w->type != GGML_TYPE_Q8_0 || w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != sizeof(block_q8_0) || w->nb[1] % sizeof(block_q8_0) != 0 ||
-            (w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
-        return false;
-    }
-    const int64_t ncols  = w->ne[0];
-    const int64_t n_embd = dst->ne[0];
-    if (ncols % QK8_0 != 0 || w->ne[1] != hc * n_embd || (ncols / QK8_0) > MMVQ_HCMIX_MAX_PASSES) {
-        return false;
-    }
-    if (y->type != GGML_TYPE_F32 || !ggml_is_contiguous(y) || ggml_nelements(y) != ncols || (uintptr_t) y->data % 16 != 0) {
-        return false;
-    }
-    if (xn->type != GGML_TYPE_F32 || !ggml_is_contiguous(xn) || ggml_nelements(xn) != hc * n_embd ||
-            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || ggml_nelements(dst) != n_embd) {
-        return false;
-    }
-    // every block reads y: dst must not overlap it
-    {
-        const char * d0 = (const char *) dst->data;
-        const char * d1 = d0 + ggml_backend_buft_get_alloc_size(dst->buffer->buft, dst);
-        const char * y0 = (const char *) y->data;
-        const char * y1 = y0 + ggml_backend_buft_get_alloc_size(y->buffer->buft, y);
-        if (d0 < y1 && y0 < d1) {
-            return false;
-        }
-    }
-    // dst may alias xn only on a whole stream (element e is then read and written by the same wave)
-    {
-        const char * d0 = (const char *) dst->data;
-        const char * d1 = d0 + ggml_backend_buft_get_alloc_size(dst->buffer->buft, dst);
-        const char * x0 = (const char *) xn->data;
-        const char * x1 = x0 + ggml_backend_buft_get_alloc_size(xn->buffer->buft, xn);
-        if (d0 < x1 && x0 < d1) {
-            const ptrdiff_t off = d0 - x0;
-            if (off < 0 || off % (n_embd * (ptrdiff_t) sizeof(float)) != 0 || off + (ptrdiff_t) ggml_nbytes(dst) > (ptrdiff_t) ggml_nbytes(xn)) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-void ggml_cuda_mul_mat_vec_q_fq_hcmix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * y, const ggml_tensor * xn,
-        ggml_tensor * dst, const int hc, const float y_scale, const float y_bias, const int y_op, const float mix_scale, const float mix_bias) {
-    GGML_ASSERT(ggml_cuda_mul_mat_vec_q_fq_hcmix_ok(w, y, xn, dst, hc));
-    const int device    = ggml_cuda_get_device();
-    const int warp_size = ggml_cuda_info().devices[device].warp_size;
-    GGML_ASSERT(warp_size == 32);
-
-    const int ncols  = (int) w->ne[0];
-    const int n_embd = (int) dst->ne[0];
-
-    constexpr int nwarps = 32;
-    const int n_waves = (n_embd + MMVQ_HCMIX_EPW - 1) / MMVQ_HCMIX_EPW;
-    const dim3 block_nums((n_waves + nwarps - 1) / nwarps, 1, 1);
-    const dim3 block_dims(warp_size, nwarps, 1);
-    const int  nbytes_shared = (ncols / QK8_1) * sizeof(block_q8_1);
-    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, nbytes_shared, ctx.stream());
-    ggml_cuda_kernel_launch(mul_mat_vec_q_fq_hcmix<nwarps>, launch_params,
-        w->data, (const float *) y->data, (const float *) xn->data, (float *) dst->data,
-        ncols, n_embd, hc, (int) (w->nb[1] / sizeof(block_q8_0)), y_scale, y_bias, y_op, mix_scale, mix_bias);
 }
 
 // Dedicated MoE multi-token kernel.
@@ -3072,7 +2803,9 @@ static bool mul_mat_vec_q_fq_try(
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int64_t ncols_dst_fq = ids ? ne2 : ne1;
     const bool aligned = (uintptr_t) src1->data % 16 == 0 && nb11 % 16 == 0 && nb12 % 16 == 0 && nb13 % 16 == 0;
-    const bool fusion_ok = !fusion || (fusion->x_scale == nullptr && fusion->gate_scale == nullptr);
+    const bool fusion_ok = !fusion ||
+        (fusion->x_scale == nullptr && fusion->gate_scale == nullptr &&
+         (!ids || (fusion->x_bias == nullptr && fusion->gate_bias == nullptr)));
     if (!(GGML_CUDA_CC_IS_RDNA3_5(cc) && ncols_dst_fq == 1 && mmvq_fq_type_ok(src0->type) && aligned && fusion_ok &&
             ne10 % QK8_1 == 0 && (ne10 / QK8_1) * sizeof(block_q8_1) <= 16384)) {
         return false;
@@ -3185,6 +2918,23 @@ void ggml_cuda_mul_mat_vec_q_fq_gdn_gate(ggml_backend_cuda_context & ctx, ggml_t
     const bool ok = mul_mat_vec_q_fq_try(ctx, dst->src[0], &y, nullptr, dst, &fusion, 1.0f, 0.0f, 3, /*launch=*/true);
     GGML_ASSERT(ok);
 }
+
+#if defined(__HIP_PLATFORM_AMD__)
+static __device__ __forceinline__ float mmvq_hc_mul_rn(const float a, const float b) {
+    float result;
+    asm("v_mul_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+
+static __device__ __forceinline__ float mmvq_hc_add_rn(const float a, const float b) {
+    float result;
+    asm("v_add_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+#else
+static __device__ __forceinline__ float mmvq_hc_mul_rn(const float a, const float b) { return __fmul_rn(a, b); }
+static __device__ __forceinline__ float mmvq_hc_add_rn(const float a, const float b) { return __fadd_rn(a, b); }
+#endif
 
 template <int n_expert_used>
 __launch_bounds__(32, 8)

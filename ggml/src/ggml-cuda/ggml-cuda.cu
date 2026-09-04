@@ -726,71 +726,17 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
-#if defined(GGML_USE_HIP) && defined(__linux__)
-#include <sys/mman.h>
-#include <cerrno>
-#include <cstring>
-// Integrated GPUs (UMA): large buffers can be backed by transparent-huge-page host memory that is registered
-// with the device. The GPU then maps 2 MiB fragments instead of the 4 KiB pages of hipMalloc'd GTT memory,
-// which removes most of the TLB misses of the small-matrix weight streams during token generation
-// (gfx1151: 3.5 MiB Q8_0 matvec 22 -> 18 us). Enabled with GGML_CUDA_THP_BUFFERS=1.
-static bool ggml_cuda_thp_buffers_enabled() {
-    static const bool enabled = getenv("GGML_CUDA_THP_BUFFERS") != nullptr && atoi(getenv("GGML_CUDA_THP_BUFFERS")) != 0;
-    return enabled;
-}
-
-static void * ggml_cuda_thp_alloc(size_t size, size_t * alloc_size_out) {
-    const size_t huge = 2u << 20;
-    const size_t asz  = (size + huge - 1) / huge * huge;
-    void * h = mmap(nullptr, asz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (h == MAP_FAILED) {
-        return nullptr;
-    }
-    if (madvise(h, asz, MADV_HUGEPAGE) != 0) {
-        GGML_LOG_WARN("%s: madvise(MADV_HUGEPAGE) failed: %s\n", __func__, strerror(errno));
-    }
-    // fault the pages in on the host side (THP allocation happens here) before the GPU mapping is built
-    for (size_t off = 0; off < asz; off += huge) {
-        ((volatile char *) h)[off] = 0;
-    }
-    if (hipHostRegister(h, asz, hipHostRegisterDefault) != hipSuccess) {
-        (void) hipGetLastError();
-        GGML_LOG_WARN("%s: hipHostRegister of %.2f MiB failed, falling back to hipMalloc\n", __func__, asz / 1024.0 / 1024.0);
-        munmap(h, asz);
-        return nullptr;
-    }
-    void * dptr = nullptr;
-    if (hipHostGetDevicePointer(&dptr, h, 0) != hipSuccess || dptr == nullptr) {
-        (void) hipGetLastError();
-        hipHostUnregister(h);
-        munmap(h, asz);
-        return nullptr;
-    }
-    GGML_ASSERT(dptr == h); // UMA: the device pointer is the host pointer, tensor data is copied with plain memcpys
-    *alloc_size_out = asz;
-    return h;
-}
-#endif
-
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
-    size_t thp_size = 0; // != 0: dev_ptr is registered THP host memory of this size (see ggml_cuda_thp_alloc)
 
-    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, size_t thp_size = 0) :
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
-        name(GGML_CUDA_NAME + std::to_string(device)), thp_size(thp_size) {
+        name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-#if defined(GGML_USE_HIP) && defined(__linux__)
-        if (thp_size != 0) {
-            CUDA_CHECK(hipHostUnregister(dev_ptr));
-            munmap(dev_ptr, thp_size);
-            return;
-        }
-#endif
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -943,16 +889,6 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
     void * dev_ptr;
-#if defined(GGML_USE_HIP) && defined(__linux__)
-    if (ggml_cuda_thp_buffers_enabled() && ggml_cuda_info().devices[buft_ctx->device].integrated && size >= (64u << 20)) {
-        size_t thp_size = 0;
-        dev_ptr = ggml_cuda_thp_alloc(size, &thp_size);
-        if (dev_ptr != nullptr) {
-            ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr, thp_size);
-            return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
-        }
-    }
-#endif
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
@@ -3309,6 +3245,27 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     args.H_v   = H_v;
     args.d_conv = d_conv;
 
+    // Every skipped node except the three outputs must have all of its consumers inside this range.
+    // Include view nodes in the count even though they are not compute nodes.
+    for (int j = node_idx; j <= last; ++j) {
+        if (j == idx[0] || j == idx[11] || j == idx[13]) {
+            continue;
+        }
+        const ggml_tensor * candidate = cgraph->nodes[j];
+        if (candidate->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+        int internal_uses = 0;
+        for (int k = node_idx; k <= last; ++k) {
+            for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                internal_uses += cgraph->nodes[k]->src[src] == candidate;
+            }
+        }
+        if (internal_uses != ggml_node_get_use_count(cgraph, j)) {
+            return 0;
+        }
+    }
+
     return last - node_idx;
 }
 
@@ -3800,6 +3757,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
         if (nodes_to_skip > 0) {
+            bool uses_ok = true;
+            for (int j = i; uses_ok && j <= i + nodes_to_skip; ++j) {
+                if (j == i + nodes_to_skip) {
+                    continue;
+                }
+                const ggml_tensor * candidate = cgraph->nodes[j];
+                int internal_uses = 0;
+                for (int k = i; k <= i + nodes_to_skip; ++k) {
+                    for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                        internal_uses += cgraph->nodes[k]->src[src] == candidate;
+                    }
+                }
+                // The attention-score view is the one expected consumer after the snapshot copy.
+                const int allowed_external = j == i ? 1 : 0;
+                uses_ok = internal_uses + allowed_external == ggml_node_get_use_count(cgraph, j);
+            }
+            if (!uses_ok) {
+                return 0;
+            }
 #ifdef GGML_CUDA_DEBUG
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
@@ -4766,8 +4742,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_hc_mix_args args;
         enum ggml_op ops[5 + 2 * 15 + 1];
         int n_ops = ggml_cuda_match_hc_mix(cgraph, i, args, ops);
-        if (n_ops > 0 && args.dst->ne[1] == 1 && getenv("GGML_CUDA_ENABLE_HCMIX") == nullptr) {
-            n_ops = 0; // decode: preserve bit-identical routing; prefill retains the exact fused reduction
+        if (n_ops > 0 && args.dst->ne[1] == 1) {
+            n_ops = 0; // Decode preserves bit-identical routing. Prefill uses the fused reduction.
         }
         if (n_ops > 0) {
             const int out_nodes[] = { i + n_ops - 1 };
@@ -5006,26 +4982,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_mul_mat_vec_q_fq_prologue_ok(*cuda_ctx, cgraph->nodes[i + 2], node->src[0])) {
         const int y_op = ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU ? 1 : 2;
         ggml_tensor * mm = cgraph->nodes[i + 2];
-
-        // qwen4exp hyper-connection: the matvec is the up projection whose result only feeds the stream mix
-        // (sigmoid -> mul(xn) -> ... -> scale): one kernel computes the gate rows of each element and the mix
-        if (getenv("GGML_CUDA_ENABLE_HCMIX") != nullptr &&
-                i + 3 < cgraph->n_nodes && cgraph->nodes[i + 3]->src[0] == mm) {
-            ggml_cuda_hc_mix_args mix;
-            enum ggml_op ops[3 + 5 + 2 * 15 + 1];
-            const int n_mix = ggml_cuda_match_hc_mix(cgraph, i + 3, mix, ops + 3);
-            if (n_mix > 0 && mix.gate == mm &&
-                    ggml_cuda_mul_mat_vec_q_fq_hcmix_ok(mm->src[0], node->src[0], mix.xn, mix.dst, mix.hc)) {
-                ops[0] = GGML_OP_SCALE; ops[1] = GGML_OP_UNARY; ops[2] = GGML_OP_MUL_MAT;
-                const int out_nodes[] = { i + 3 + n_mix - 1 };
-                // (aliasing of the output with y / xn is checked by ggml_cuda_mul_mat_vec_q_fq_hcmix_ok)
-                if (ggml_can_fuse_subgraph(cgraph, i, 3 + n_mix, ops, out_nodes, 1)) {
-                    ggml_cuda_mul_mat_vec_q_fq_hcmix(*cuda_ctx, mm->src[0], node->src[0], mix.xn, mix.dst, mix.hc,
-                        ggml_get_op_params_f32(node, 0), ggml_get_op_params_f32(node, 1), y_op, mix.scale, mix.bias);
-                    return 2 + n_mix;
-                }
-            }
-        }
 
         ggml_cuda_mul_mat_vec_q_fq_prologue(*cuda_ctx, mm, node->src[0],
             ggml_get_op_params_f32(node, 0), ggml_get_op_params_f32(node, 1), y_op);
