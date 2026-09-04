@@ -1057,7 +1057,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_argsort_f32[num_argsort_pipelines];
     vk_pipeline pipeline_argsort_large_f32[num_argsort_pipelines];
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
-    vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
@@ -5855,13 +5854,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline2(device, device->pipeline_topk_f32[i], "topk_f32_"+std::to_string(i), topk_argsort_f32_len, topk_argsort_f32_data, "main", 2, sizeof(vk_op_topk_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, NCOLS_PADDED_LOG2}, 1, true);
             }
         }
-    }
-
-    // radix selection for k beyond the shared-memory shaders' single-workgroup reach:
-    // one workgroup per row, single dispatch, no scratch buffers
-    {
-        const uint32_t RADIX_WG = std::min<uint32_t>(1024, 1u << device->max_workgroup_size_log2);
-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_f32_len, topk_radix_f32_data, "main", 2, sizeof(vk_op_topk_push_constants), {RADIX_WG, 1, 1}, {RADIX_WG}, 1, true);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -14027,7 +14019,7 @@ static void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, c
     std::array<uint32_t, 3> elements;
 
     elements[0] = ncolsp2;
-    elements[1] = std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    elements[1] = std::min((uint32_t)ggml_nrows(src0), ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
     elements[2] = 1;
 
     // First dispatch initializes tmp_idx and does the first N passes where
@@ -14071,10 +14063,7 @@ static void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, c
     }
 }
 
-// Tournament-reduction top_k, only correct while k fits a single workgroup's
-// tournament pipeline (see ggml_vk_topk's dispatcher and the large-k path below
-// for why this can't just be given a bigger workgroup).
-static void ggml_vk_topk_small(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     uint32_t ncols = src0->ne[0];
     uint32_t nrows = ggml_nrows(src0);
     uint32_t k = dst->ne[0];
@@ -14180,48 +14169,6 @@ static void ggml_vk_topk_small(ggml_backend_vk_context * ctx, vk_context& subctx
         done_one_iter = true;
     }
     ctx->prealloc_x_need_sync = true;
-}
-
-// Large-k top_k: the tournament reduction above can only discard elements a
-// workgroup can see all of at once, so it can never make progress once k is
-// >= the max deployable workgroup size (~1024 on real hardware) - any element
-// in a smaller chunk could belong to the true global top-k. Radix selection
-// discards on a *global* bucket boundary instead, so it converges regardless
-// of the workgroup-size-vs-k relationship: one workgroup per row, a single
-// dispatch, no scratch buffers.
-static void ggml_vk_topk_large(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    const uint32_t ncols = (uint32_t) src0->ne[0];
-    const uint32_t nrows = (uint32_t) ggml_nrows(src0);
-    const uint32_t k     = (uint32_t) dst->ne[0];
-
-    vk_pipeline pipeline = ctx->device->pipeline_topk_radix_f32;
-    GGML_ASSERT(pipeline != nullptr);
-
-    vk_op_topk_push_constants pc { ncols, ncols, ncols, k, nrows, 0, 0 };
-
-    vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0);
-    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
-
-    // one workgroup per row
-    std::array<uint32_t, 3> elements = { nrows*pipeline->wg_denoms[0], 1, 1 };
-
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, dst_buf }, pc, elements);
-}
-
-// true when k fits a single-workgroup tournament pipeline; the index is only
-// valid to probe after the range check, hence the explicit ordering here
-static bool ggml_vk_topk_k_fits_pipeline(const vk_device_struct * device, uint32_t k) {
-    const uint32_t min_pipeline = (uint32_t) log2f(float(k)) + 1;
-    return min_pipeline < num_topk_pipelines && device->pipeline_topk_f32[min_pipeline] != nullptr;
-}
-
-static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    if (ggml_vk_topk_k_fits_pipeline(ctx->device.get(), (uint32_t) dst->ne[0])) {
-        ggml_vk_topk_small(ctx, subctx, src0, dst);
-    } else {
-        ggml_vk_topk_large(ctx, subctx, src0, dst);
-    }
 }
 
 static void ggml_vk_sum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -18904,13 +18851,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[0])) {
                     return false;
                 }
-                // op is the dst tensor here, so op->ne[0] == k (ggml_top_k builds dst
-                // as ggml_new_tensor_4d(..., k, a->ne[1], ...)), not the candidate pool
-                // width - ggml_vk_topk_small's multi-pass loop already handles arbitrarily
-                // large ncols correctly as long as k fits a single tournament pipeline.
-                // Beyond that, the radix path takes over, which has no extra requirements.
-                return true;
+                // We could potentially support larger, using argsort to sort the
+                // whole thing. Not clear if this is needed.
+                uint32_t min_pipeline = (uint32_t)log2f(float(op->ne[0])) + 1;
+                if (min_pipeline >= num_topk_pipelines ||
+                    !device->pipeline_topk_f32[min_pipeline]) {
+                    return false;
+                }
             }
+            return true;
         case GGML_OP_UPSCALE:
             if (op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS) {
                 if ((op->op_params[0] & 0xFF) != GGML_SCALE_MODE_BILINEAR) {
