@@ -213,6 +213,7 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+template <int H>
 __global__ void __launch_bounds__(512, 2)
 gated_delta_net_kda_tiled_128_cuda(const float * q,
                                    const float * k,
@@ -236,7 +237,6 @@ gated_delta_net_kda_tiled_128_cuda(const float * q,
                                    const uint3   rq3_magic,
                                    float         scale) {
     constexpr int S_v = 128;
-    constexpr int H = 32;
     constexpr int token_tile = 16;
     constexpr int warp_size = 32;
     constexpr int rows_per_lane = S_v / warp_size;
@@ -314,7 +314,7 @@ gated_delta_net_kda_tiled_128_cuda(const float * q,
             }
             const float attn_col = gdn_warp_reduce_sum<warp_size>(attn_partial);
             if (lane == 0) {
-                dst[t * S_v * H + col] = attn_col * scale;
+                dst[(int64_t) t * S_v * H + col] = attn_col * scale;
             }
         }
         __syncthreads();
@@ -524,9 +524,10 @@ static void launch_gated_delta_net(
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
     if constexpr (KDA && !keep_rs_t) {
-        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && H == 32 && n_tokens >= 16 && n_seqs == 1) {
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && (H == 16 || H == 32) && n_tokens >= 16 && n_seqs == 1) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
-            ggml_cuda_kernel_launch(gated_delta_net_kda_tiled_128_cuda, launch_params,
+            auto kernel = H == 16 ? gated_delta_net_kda_tiled_128_cuda<16> : gated_delta_net_kda_tiled_128_cuda<32>;
+            ggml_cuda_kernel_launch(kernel, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, n_tokens,
                 sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
                 neqk1_magic, rq3_magic, scale);

@@ -5173,8 +5173,9 @@ struct test_hc_up_mix : public test_case {
     const int64_t n_embd;
     const int64_t hc;
     const int64_t n_tokens;
+    const bool external_consumer;
 
-    std::string vars() override { return VARS_TO_STR5(type_w, k, n_embd, hc, n_tokens); }
+    std::string vars() override { return VARS_TO_STR6(type_w, k, n_embd, hc, n_tokens, external_consumer); }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5185,8 +5186,9 @@ struct test_hc_up_mix : public test_case {
 
     double max_nmse_err() override { return 5e-4; }
 
-    test_hc_up_mix(ggml_type type_w, int64_t k, int64_t n_embd, int64_t hc, int64_t n_tokens)
-        : type_w(type_w), k(k), n_embd(n_embd), hc(hc), n_tokens(n_tokens) {}
+    test_hc_up_mix(ggml_type type_w, int64_t k, int64_t n_embd, int64_t hc, int64_t n_tokens,
+            bool external_consumer = false)
+        : type_w(type_w), k(k), n_embd(n_embd), hc(hc), n_tokens(n_tokens), external_consumer(external_consumer) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
@@ -5202,6 +5204,7 @@ struct test_hc_up_mix : public test_case {
         gated = ggml_reshape_3d(ctx, gated, n_embd, hc, n_tokens);
         ggml_tensor * mixed = ggml_view_2d(ctx, gated, n_embd, n_tokens, ggml_row_size(gated->type, n_embd) * hc, 0);
         mixed = ggml_cont(ctx, mixed);
+        ggml_tensor * external = external_consumer ? mixed : nullptr;
         for (int64_t c = 1; c < hc; ++c) {
             ggml_tensor * s = ggml_view_2d(ctx, gated, n_embd, n_tokens, ggml_row_size(gated->type, n_embd) * hc,
                     ggml_row_size(gated->type, n_embd) * c);
@@ -5209,6 +5212,9 @@ struct test_hc_up_mix : public test_case {
         }
         mixed = ggml_scale(ctx, mixed, 1.0f / (float) hc);
         ggml_set_name(mixed, "mixed");
+        if (external) {
+            mixed = ggml_add(ctx, mixed, external);
+        }
         return mixed;
     }
 };
@@ -9552,6 +9558,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_weighted_expert_sum(127, 2, 3));
     test_cases.emplace_back(new test_weighted_expert_sum(128, 4, 5));
     test_cases.emplace_back(new test_weighted_expert_sum(2048, 8, 32));
+    test_cases.emplace_back(new test_weighted_expert_sum(128, 16, 3));
     test_cases.emplace_back(new test_shared_mul_add(127, 3));
     test_cases.emplace_back(new test_shared_mul_add(2048, 32));
     test_cases.emplace_back(new test_swiglu_q8_mmq(false, 1, 1, 2048, 32, 512));
@@ -9670,6 +9677,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 256, 1000, 3, 1));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 512, 640, 4, 1));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_F32,  320, 2560, 4, 1));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 14, 3));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 16, 3));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 16, 3, true));
 
     // grouped single-column matvecs on one activation vector (qwen4exp decode: GDN qkv/z/beta/alpha,
     // hyper-connection down + inject, shared-expert gate/up + router)
@@ -9717,6 +9727,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, 2048, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 512, 2080, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, 2048, 512));
+    // 128-expert J48 dispatch boundaries. Small matrix dimensions keep CPU reference time practical.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 64, 1521, 256));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, false, 64, 1520, 256));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, false, 64, 2545, 256));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, false, 64, 2561, 256));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 512, 8, false, 768, 1984, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 512, 8, false, 768, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 512, 8, false, 768, 2112, 2560));
@@ -10703,6 +10720,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
+    for (int n_tokens : {15, 16, 17, 64, 65, 2048}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 1, false, true));
+    }
+    // Multiple sequences must remain on the generic fallback.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 16, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 17, 1, 1, false, true));
@@ -11175,6 +11197,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 1, 1, false, true)); // Ling-like KDA PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 16, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 17, 1, 1, false, true));

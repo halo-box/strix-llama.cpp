@@ -1422,7 +1422,7 @@ static __global__ void mul_mat_q_routed_compact(
             if (j0 + nwarps * warp_size > J && j >= J) {
                 break;
             }
-            ids_dst_shared[j] = ids_dst[col_low + jt * J + j];
+            ids_dst_shared[j] = jt * J + j < col_diff ? ids_dst[col_low + jt * J + j] : 0;
         }
         __syncthreads();
 
@@ -1637,6 +1637,11 @@ static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int
     }
 }
 
+static constexpr bool mmq_rdna3_5_id_use_j48_128e(const ggml_type type, const int64_t n_experts, const int64_t rows_per_expert) {
+    return n_experts == 128 && rows_per_expert >= 96 && rows_per_expert <= 160 &&
+        (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0);
+}
+
 static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0,   4) ==  16);
 static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0,  16) ==  48);
 static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0,  64) ==  48);
@@ -1649,6 +1654,22 @@ static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 48));
 static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 32));
 static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q6_K, 32));
 static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ2_XS, 48));
+static_assert(!mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q4_K, 128, 95) &&
+              !mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q5_K, 128, 95) &&
+              !mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q6_K, 128, 95) &&
+              !mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q8_0, 128, 95));
+static_assert(mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q4_K, 128, 96) &&
+              mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q5_K, 128, 96) &&
+              mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q6_K, 128, 96) &&
+              mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q8_0, 128, 96) &&
+              mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q4_K, 128, 160) &&
+              mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q5_K, 128, 160) &&
+              mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q6_K, 128, 160) &&
+              mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q8_0, 128, 160));
+static_assert(!mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q4_K, 128, 161) &&
+              !mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q5_K, 128, 161) &&
+              !mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q6_K, 128, 161) &&
+              !mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q8_0, 128, 161));
 
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -1776,8 +1797,8 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         }
     } else if (GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback && args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y)) {
         const int64_t rows_per_expert = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
-        int J_rdna3_5 = type == GGML_TYPE_Q6_K && args.nchannels_y == 128 && rows_per_expert >= 96 && rows_per_expert <= 160 ?
-            48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);
+        const bool use_j48_128e = mmq_rdna3_5_id_use_j48_128e(type, args.nchannels_y, rows_per_expert);
+        int J_rdna3_5 = use_j48_128e ? 48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);
         if constexpr (type == GGML_TYPE_Q6_K) {
             if (getenv("GGML_Q6_COMPACT_J")) {
                 J_rdna3_5 = atoi(getenv("GGML_Q6_COMPACT_J"));

@@ -4746,8 +4746,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             n_ops = 0; // Decode preserves bit-identical routing. Prefill uses the fused reduction.
         }
         if (n_ops > 0) {
+            int node_idxs[5 + 2 * 15 + 1];
+            for (int j = 0; j < n_ops; ++j) {
+                node_idxs[j] = i + j;
+            }
             const int out_nodes[] = { i + n_ops - 1 };
-            if (ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1)) {
+            if (ggml_can_fuse_subgraph_ext(cgraph, node_idxs, n_ops, ops, out_nodes, 1)) {
                 ggml_cuda_op_hc_mix_reduce(*cuda_ctx, args);
                 return n_ops - 1;
             }
