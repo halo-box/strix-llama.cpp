@@ -27,13 +27,6 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
                 shader_float8 = true;
             }
         }
-    }
-
-    // radix selection for k beyond the shared-memory shaders' single-workgroup reach:
-    // one workgroup per row, single dispatch, no scratch buffers
-    {
-        const uint32_t RADIX_WG = std::min<uint32_t>(1024, 1u << device->max_workgroup_size_log2);
-        ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_f32_len, topk_radix_f32_data, "main", 2, sizeof(vk_op_topk_push_constants), {RADIX_WG, 1, 1}, {RADIX_WG}, 1, true);
 
         if (!amd_shader_core_properties || !integer_dot_product || !subgroup_size_control) {
             return vk_device_architecture::OTHER;
@@ -11360,7 +11353,7 @@ void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, const gg
     std::array<uint32_t, 3> elements;
 
     elements[0] = ncolsp2;
-    elements[1] = std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    elements[1] = std::min((uint32_t)ggml_nrows(src0), ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
     elements[2] = 1;
 
     // First dispatch initializes tmp_idx and does the first N passes where
@@ -11535,48 +11528,6 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
         done_one_iter = true;
     }
     ctx->prealloc_x_need_sync = true;
-}
-
-// Large-k top_k: the tournament reduction above can only discard elements a
-// workgroup can see all of at once, so it can never make progress once k is
-// >= the max deployable workgroup size (~1024 on real hardware) - any element
-// in a smaller chunk could belong to the true global top-k. Radix selection
-// discards on a *global* bucket boundary instead, so it converges regardless
-// of the workgroup-size-vs-k relationship: one workgroup per row, a single
-// dispatch, no scratch buffers.
-static void ggml_vk_topk_large(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    const uint32_t ncols = (uint32_t) src0->ne[0];
-    const uint32_t nrows = (uint32_t) ggml_nrows(src0);
-    const uint32_t k     = (uint32_t) dst->ne[0];
-
-    vk_pipeline pipeline = ctx->device->pipeline_topk_radix_f32;
-    GGML_ASSERT(pipeline != nullptr);
-
-    vk_op_topk_push_constants pc { ncols, ncols, ncols, k, nrows, 0, 0 };
-
-    vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0);
-    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
-
-    // one workgroup per row
-    std::array<uint32_t, 3> elements = { nrows*pipeline->wg_denoms[0], 1, 1 };
-
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, dst_buf }, pc, elements);
-}
-
-// true when k fits a single-workgroup tournament pipeline; the index is only
-// valid to probe after the range check, hence the explicit ordering here
-static bool ggml_vk_topk_k_fits_pipeline(const vk_device_struct * device, uint32_t k) {
-    const uint32_t min_pipeline = (uint32_t) log2f(float(k)) + 1;
-    return min_pipeline < num_topk_pipelines && device->pipeline_topk_f32[min_pipeline] != nullptr;
-}
-
-static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
-    if (ggml_vk_topk_k_fits_pipeline(ctx->device.get(), (uint32_t) dst->ne[0])) {
-        ggml_vk_topk_small(ctx, subctx, src0, dst);
-    } else {
-        ggml_vk_topk_large(ctx, subctx, src0, dst);
-    }
 }
 
 void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -14849,6 +14800,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             if (dst->src[s] == src) {
                 return true;
             }
+            return true;
             if (is_empty(dst) || is_empty(src)) {
                 continue;
             }
