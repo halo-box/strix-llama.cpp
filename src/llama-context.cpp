@@ -1531,9 +1531,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         reused = true;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
+        // Pipeline-parallel graphs may still read input tensors when set_inputs updates them below.
+        if (cparams.pipeline_parallel) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
+        // The previous asynchronous graph may still use allocations that reset releases.
+        ggml_backend_sched_synchronize(sched.get());
+
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
