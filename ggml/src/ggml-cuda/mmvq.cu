@@ -1880,10 +1880,12 @@ static __global__ void mul_mat_vec_q_fq(
                 mmvq_fq_q8_0_dot(tmp_gate, cg, y, c0, kqs, blocks_per_row_x);
             }
         }
-        cx = nx;
-        if constexpr (has_fusion) {
-            if (use_gate) {
-                cg = ng;
+        if (c1 < blocks_per_row_x) {
+            cx = nx;
+            if constexpr (has_fusion) {
+                if (use_gate) {
+                    cg = ng;
+                }
             }
         }
     }
@@ -2166,9 +2168,11 @@ static __global__ void mul_mat_vec_fq_group(
         if (use_gate) {
             mmvq_fq_q8_0_dot(tmp_gate, cg, y, c0, kqs, blocks_per_row_x);
         }
-        cx = nx;
-        if (use_gate) {
-            cg = ng;
+        if (c1 < blocks_per_row_x) {
+            cx = nx;
+            if (use_gate) {
+                cg = ng;
+            }
         }
     }
 

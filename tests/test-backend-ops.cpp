@@ -4387,6 +4387,7 @@ struct test_mul_mat_exact_batch : public test_case {
     const int64_t n;
     const int64_t k;
     const ggml_type type_down;
+    const bool zero_inputs;
 
     test_mul_mat_exact_batch(ggml_type type_a, int64_t m, int64_t n, int64_t k) : type_a(type_a), m(m), n(n), k(k) {}
 
@@ -4500,8 +4501,8 @@ struct test_swiglu_q8_mmq : public test_case {
     const int64_t k;
 
     test_swiglu_q8_mmq(bool use_id, int n_mats, int n_used, int64_t m, int64_t n, int64_t k,
-            ggml_type type_down = GGML_TYPE_Q8_0)
-        : use_id(use_id), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), type_down(type_down) {}
+            ggml_type type_down = GGML_TYPE_Q8_0, bool zero_inputs = false)
+        : use_id(use_id), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), type_down(type_down), zero_inputs(zero_inputs) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4509,7 +4510,7 @@ struct test_swiglu_q8_mmq : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR7(use_id, n_mats, n_used, m, n, k, type_down);
+        return VARS_TO_STR8(use_id, n_mats, n_used, m, n, k, type_down, zero_inputs);
     }
 
     bool run_whole_graph() override { return true; }
@@ -5593,6 +5594,13 @@ struct test_mul_mat_id_fusion : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
+        if (zero_inputs) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->type != GGML_TYPE_I32 && !ggml_is_view_op(t->op)) {
+                    init_tensor_uniform(t, 0.0f, 0.0f);
+                }
+            }
+        }
     }
 };
 
@@ -10370,6 +10378,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_shared_mul_add(2048, 32));
     test_cases.emplace_back(new test_swiglu_q8_mmq(false, 1, 1, 2048, 32, 512));
     test_cases.emplace_back(new test_swiglu_q8_mmq(true, 16, 8, 2048, 32, 512));
+    test_cases.emplace_back(new test_swiglu_q8_mmq(false, 1, 1, 128, 3, 256, GGML_TYPE_Q8_0, true));
+    test_cases.emplace_back(new test_swiglu_q8_mmq(true, 16, 8, 128, 3, 256, GGML_TYPE_Q8_0, true));
     test_cases.emplace_back(new test_swiglu_q8_mmq(false, 1, 1, 2560, 128, 640));
     test_cases.emplace_back(new test_swiglu_q8_mmq(true, 512, 10, 2560, 128, 640));
     test_cases.emplace_back(new test_swiglu_q8_mmq(true, 512, 10, 2560, 128, 640, GGML_TYPE_IQ4_NL));
