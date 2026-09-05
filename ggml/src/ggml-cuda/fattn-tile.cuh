@@ -893,6 +893,13 @@ static __global__ void flash_attn_tile(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
 #ifdef FLASH_ATTN_AVAILABLE
+#if defined(GGML_USE_HIP) && !defined(RDNA3_5)
+    if constexpr (q8_0_KV) {
+        NO_DEVICE_CODE;
+        return;
+    }
+#endif // defined(GGML_USE_HIP) && !defined(RDNA3_5)
+
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
     const char * GGML_CUDA_RESTRICT V        = V_ptr;
