@@ -277,6 +277,44 @@ static __global__ void l2_norm_f32(
     }
 }
 
+static __global__ void l2_norm_dual_f32_s128(
+        const float * x_q, float * dst_q, const int64_t stride_q_row, const int64_t stride_q_channel,
+        const int64_t stride_q_sample, const float eps_q,
+        const float * x_k, float * dst_k, const int64_t stride_k_row, const int64_t stride_k_channel,
+        const int64_t stride_k_sample, const float eps_k) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y / 2;
+    const bool is_k     = blockIdx.y >= nchannels;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y % nchannels;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    const float * x = is_k ? x_k : x_q;
+    float * dst = is_k ? dst_k : dst_q;
+    const int64_t stride_row     = is_k ? stride_k_row     : stride_q_row;
+    const int64_t stride_channel = is_k ? stride_k_channel : stride_q_channel;
+    const int64_t stride_sample  = is_k ? stride_k_sample  : stride_q_sample;
+    const float eps = is_k ? eps_k : eps_q;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*128;
+
+    float tmp = 0.0f;
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < 128; col += WARP_SIZE) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+    tmp = warp_reduce_sum(tmp);
+    ggml_cuda_pdl_lc();
+
+    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+    for (int col = tid; col < 128; col += WARP_SIZE) {
+        dst[col] = scale * x[col];
+    }
+}
+
 static void norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
@@ -360,7 +398,14 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
         const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
-        if (ncols < 1024) {
+        if (ncols == 128) {
+            const dim3 block_dims(128, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
+            ggml_cuda_kernel_launch(rms_norm_f32<128, true>, launch_params,
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
+        } else if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
             ggml_cuda_kernel_launch(rms_norm_f32<256, true>, launch_params,
@@ -695,4 +740,29 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_l2_norm_dual_s128(ggml_backend_cuda_context & ctx, ggml_tensor * dst_q, ggml_tensor * dst_k) {
+    const ggml_tensor * src_q = dst_q->src[0];
+    const ggml_tensor * src_k = dst_k->src[0];
+
+    GGML_ASSERT(src_q->type == GGML_TYPE_F32 && src_k->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst_q->type == GGML_TYPE_F32 && dst_k->type == GGML_TYPE_F32);
+    GGML_ASSERT(src_q->ne[0] == 128 && ggml_are_same_shape(src_q, src_k));
+    GGML_ASSERT(src_q->nb[0] == sizeof(float) && src_k->nb[0] == sizeof(float));
+
+    float eps_q;
+    float eps_k;
+    memcpy(&eps_q, dst_q->op_params, sizeof(float));
+    memcpy(&eps_k, dst_k->op_params, sizeof(float));
+    GGML_ASSERT(eps_q >= 0.0f && eps_k >= 0.0f);
+
+    const dim3 blocks_num(src_q->ne[1], 2*src_q->ne[2], src_q->ne[3]);
+    const dim3 block_dims(WARP_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = { blocks_num, block_dims, 0, ctx.stream() };
+    ggml_cuda_kernel_launch(l2_norm_dual_f32_s128, launch_params,
+        (const float *) src_q->data, (float *) dst_q->data,
+        src_q->nb[1]/sizeof(float), src_q->nb[2]/sizeof(float), src_q->nb[3]/sizeof(float), eps_q,
+        (const float *) src_k->data, (float *) dst_k->data,
+        src_k->nb[1]/sizeof(float), src_k->nb[2]/sizeof(float), src_k->nb[3]/sizeof(float), eps_k);
 }

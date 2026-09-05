@@ -450,8 +450,40 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 
+static __global__ void convert_f32_f16_cont(const float * x, half * y, int64_t k) {
+    const int64_t i = 2 * ((int64_t) blockDim.x * blockIdx.x + threadIdx.x);
+    if (i + 1 < k) {
+        const float2 value = ((const float2 *) x)[i / 2];
+        ((half2 *) y)[i / 2] = make_half2(value.x, value.y);
+    } else if (i < k) {
+        y[i] = x[i];
+    }
+}
+
+static __global__ void convert_f16_f32_cont(const half * x, float * y, int64_t k) {
+    const int64_t i = 2 * ((int64_t) blockDim.x * blockIdx.x + threadIdx.x);
+    if (i + 1 < k) {
+        ((float2 *) y)[i / 2] = __half22float2(((const half2 *) x)[i / 2]);
+    } else if (i < k) {
+        y[i] = x[i];
+    }
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nblocks = (k + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE);
+    if constexpr (std::is_same<src_t, float>::value && std::is_same<dst_t, half>::value) {
+        if ((uintptr_t) vx % alignof(float2) == 0 && (uintptr_t) y % alignof(half2) == 0) {
+            convert_f32_f16_cont<<<nblocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>((const float *) vx, (half *) y, k);
+            return;
+        }
+    }
+    if constexpr (std::is_same<src_t, half>::value && std::is_same<dst_t, float>::value) {
+        if ((uintptr_t) vx % alignof(half2) == 0 && (uintptr_t) y % alignof(float2) == 0) {
+            convert_f16_f32_cont<<<nblocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>((const half *) vx, (float *) y, k);
+            return;
+        }
+    }
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 

@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -232,6 +233,10 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
+    // LLAMA_FUSED_GDN_CH=0 selects the ggml-op chunked delta-net formulation for multi-token ubatches
+    if (const char * env = getenv("LLAMA_FUSED_GDN_CH")) {
+        cparams.fused_gdn_ch = atoi(env) != 0;
+    }
 
     cparams.fused_lid = true;
     cparams.auto_flid = false;
@@ -1359,19 +1364,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     static const bool graph_timing = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")) != 0;
     int64_t t_build = 0, t_alloc = 0, t_inputs = 0;
     bool reused = false;
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         reused = true;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
+        // Pipeline-parallel graphs may still read input tensors when set_inputs updates them below.
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
         n_reused++;
     } else {
+        // The previous asynchronous graph may still use allocations that reset releases.
+        ggml_backend_sched_synchronize(sched.get());
+
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
