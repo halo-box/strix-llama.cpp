@@ -116,7 +116,7 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache() override;
 
     //
     // llama_memory_i
@@ -188,6 +188,14 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // zero the K rows (and the V rows when V is stored row-major) [r0, r1) of stream strm in
+    // every layer, including the layers of the caches that mirror these cells (sharers).
+    // Called for every cell that becomes free, so a masked-out cell never holds stale content:
+    // on gfx11 WMMA, P*V with P == +0.0 is not exact for V != +0.0, so the FA output would
+    // otherwise depend on whatever the masked-out cells last held.
+    void zero_rows(uint32_t strm, uint32_t r0, uint32_t r1);
+    void zero_idxs(uint32_t strm, const std::vector<uint32_t> & idxs);   // ascending cell indices
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -294,6 +302,14 @@ private:
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
+
+    // one past the highest cell row ever written, per stream. Rows above it are still zero
+    // from the buffer clear at construction, so clear() only has to wipe [0, rows_hw).
+    std::vector<uint32_t> rows_hw;
+    void rows_hw_init();
+
+    // caches that mirror our cells (see `other`): their rows go stale exactly when ours do
+    std::vector<llama_kv_cache *> sharers;
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
