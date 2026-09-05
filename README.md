@@ -23,14 +23,12 @@ Upstream behaviour is unchanged - this is a superset, not a rewrite. On top of i
 
 - **Speculative prefill** (`--spec-prefill`) - a small draft model scores prompt tokens by attention importance so
   the target model only prefills the ones that matter, cutting time-to-first-token on long prompts.
-- **MTP draft head for speculative decoding** - use a model's own multi-token-prediction head as the draft model,
-  instead of loading a second model alongside it.
 - **N-gram table on disk** (`--ngram-on-disk`) - keeps a model's n-gram hash-embedding table (28.8 GB on
   Qwen3.8-Flash-Next) off the memory budget entirely, reading only the rows each batch actually gathers.
+- **Adaptive speculation** speed up MTP and DFLASH by automatically adjusting the N-max
 - **Vulkan fixes and tuning for RDNA 3.5** - driver-gated coopmat LDS stride padding, UMA bulk readback gated on
   host-cached mappings, IQ3_S mat-vec at batch sizes > 4, and a radix top-k kernel.
-- **A `hidden` server preset option** - keep a model loadable by name while omitting it from `GET /models`.
-- **`LLAMA_GRAPH_TIMING=1`** - report where the CPU time of a decode actually goes (graph build, alloc, inputs).
+- **A `hidden` server preset option** - keep a model loadable by name while omitting it from `GET /models` in the .ini file.
 
 Work lands on `halo/*` branches, and upstream is merged in regularly. Anything generally useful is sent upstream;
 what stays here is either not yet ready to go up, or too niche for mainline.
