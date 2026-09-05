@@ -117,6 +117,80 @@ upstreamable and is the single biggest win in this fork.
 | **Vulkan LDS stride fix** — `SHMEM_STRIDE` pad, +7.3 % prefill on any quant, +10–20 % at the kernel | New here. One constant. Upstreamable. Now driver-gated, see below |
 | **Vulkan prefill gates** — tiled concat-transpose, f16 B operand for quantized matmul and matmul\_id | Ported from [Nathanw1014/llama.cpp](https://github.com/Nathanw1014/llama.cpp/tree/strix-halo-vulkan). Re-measured here, see [`bench/`](bench/) |
 
+## Configuring adaptive speculation
+
+`--spec-draft-adaptive` sizes each draft from measured acceptance instead of always drafting
+`n_max`. `n_max` becomes a ceiling rather than a target, so a value that is catastrophic
+under fixed drafting is safe under adaptive.
+
+As a `--models-preset` entry:
+
+```ini
+[unsloth/Qwen3.8-Flash-Next-GGUF:Q4_K_XL]
+spec-type            = draft-mtp
+spec-draft-hf        = agentionai/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF
+spec-draft-adaptive  = on
+spec-draft-n-min     = 2
+spec-draft-n-max     = 4
+```
+
+or on the command line:
+
+```bash
+llama-server -m model.gguf -ngl 99 -fa 1 \
+  --spec-type draft-mtp \
+  --spec-draft-hf agentionai/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF \
+  --spec-draft-adaptive --spec-draft-n-min 2 --spec-draft-n-max 4
+```
+
+`--spec-draft-hf` is only needed when the head ships **separately**. A target whose GGUF
+already embeds the MTP block (`blk.N.nextn.*`, with `<arch>.nextn_predict_layers` set) needs
+`--spec-type draft-mtp` alone. `--mtp` is a *download* flag for `-hf`, not a runtime switch.
+
+### Why the bounds matter
+
+Acceptance falls monotonically as `n_max` rises, while throughput peaks and then declines —
+the optimum sits where marginal accepted tokens stop paying for the extra verification. That
+point is **content-dependent**. Measured on Qwen3.8-27B with an embedded Q8_0 MTP head,
+greedy, 200 tokens, one interleaved session:
+
+| `n_max` | prose t/s | prose acceptance | structured t/s | structured acceptance |
+|---:|---:|---:|---:|---:|
+| 1 | 18.45 | 0.784 | 19.66 | 0.913 |
+| 2 | 20.26 | 0.612 | 23.62 | 0.809 |
+| **3** | **20.63** | 0.526 | 25.93 | 0.777 |
+| **4** | 17.75 | 0.383 | **25.98** | 0.692 |
+| 6 | 14.06 | 0.264 | 23.47 | 0.567 |
+
+Against ~12.3 t/s bare decode that is **1.68× on prose and 2.11× on structured output**.
+
+The asymmetry is the argument for adaptive. Prose peaks at `n_max 3` and loses 32 % by
+`n_max 6`; structured peaks at 4 and loses only 10 % by 6. A fixed bound must therefore be
+tuned to the *worse* case: fixed `n=4` costs prose 14 %, while fixed `n=3` costs structured
+0.2 %. Adaptive bounded 2–4 covers both, because every depth in that range is profitable on
+either content.
+
+Structured output accepts far better than prose at every depth — 0.913 against 0.784 even at
+`n_max 1` — so JSON, code and tool-call workloads gain most.
+
+### Head precision
+
+The MTP head is ~1.5 % of parameters, and its precision is invisible to KLD or perplexity:
+the head never runs in a normal forward pass, so it can only be judged on acceptance.
+Measured at `n_max 3`, varying only `blk.64`:
+
+| head | size | prose acceptance | structured acceptance |
+|---|---:|---:|---:|
+| Q8_0 | 452 MB | 0.526 | 0.777 |
+| **Q6_K** | **349 MB** | **0.526** | **0.777** |
+| Q5_K | 292 MB | 0.517 | 0.741 |
+| Q4_K | 239 MB | 0.506 | 0.707 |
+
+**Q6_K is acceptance-identical to Q8_0 for 103 MB less** — the same accepted/generated counts
+on both contents. Below Q6_K it degrades, and structured output is ~2.4× more sensitive than
+prose (−9.0 % against −3.8 % at Q4_K), because exact syntax tokens are what low-precision
+drafting blurs first.
+
 ## Against mainline — Vulkan only, stock K-quants
 
 Same CMake flags, clean worktree, interleaved on an idle GPU. No ROCmFPx,
