@@ -613,6 +613,30 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+void dequantize_row_q4_0_rocmfp4(const block_rocmfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfp4_dequantize_row_q4_0(x, y, k);
+}
+
+void dequantize_row_q4_0_rocmfp4_fast(const block_rocmfp4_fast * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfp4_dequantize_row_q4_0_fast(x, y, k);
+}
+
+void dequantize_row_q2_0_rocmfpx(const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp2(x, y, k);
+}
+
+void dequantize_row_q3_0_rocmfpx(const block_rocmfp3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp3(x, y, k);
+}
+
+void dequantize_row_q6_0_rocmfpx(const block_rocmfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp6(x, y, k);
+}
+
+void dequantize_row_q8_0_rocmfpx(const block_rocmfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp8(x, y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
