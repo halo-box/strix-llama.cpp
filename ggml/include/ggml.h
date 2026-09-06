@@ -437,6 +437,9 @@ extern "C" {
         GGML_TYPE_Q6_0_ROCMFPX      = 102, // ROCmFPx experimental 6-bit UE4M3-scale reference layout
         GGML_TYPE_Q8_0_ROCMFPX      = 103, // ROCmFPx experimental 8-bit UE4M3-scale reference layout
         GGML_TYPE_Q3_0_ROCMFPX      = 104, // ROCmFPx experimental 3-bit UE4M3-scale reference layout
+        // 105, 106 are TURBO3_0 / TURBO4_0 and 108 is Q4_0_ROCMI4 in charlie12345/ROCmFPX;
+        // left unassigned here so a GGUF from that tree is rejected rather than misread.
+        // Note ciru-ai/ROCmFPX diverges: it puts Q7_0_ROCMFPX at 107 and Q2_0_ROCMFPX at 108.
         GGML_TYPE_Q2_0_ROCMFPX      = 107, // ROCmFPx experimental 2-bit S40 codebook + dual UE4M3 scales
         GGML_TYPE_COUNT   = 108,
     };
