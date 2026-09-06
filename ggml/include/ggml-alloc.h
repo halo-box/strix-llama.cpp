@@ -73,6 +73,9 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+GGML_API void ggml_gallocr_pin_tensor(ggml_gallocr_t galloc, struct ggml_tensor * t);
+GGML_API void ggml_gallocr_clear_pins(ggml_gallocr_t galloc);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 

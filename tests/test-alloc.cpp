@@ -1099,6 +1099,41 @@ static void test_buft_get_alloc_size_n_does_not_allocate() {
     GGML_ASSERT(x[1]->data == nullptr);
 }
 
+static void test_pinned_no_inplace() {
+    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * input  = make_input_1d(ctx, 4);
+    ggml_tensor * parent = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * child  = ggml_scale(ctx, parent, 3.0f);
+
+    ggml_set_output(child);
+    ggml_build_forward_expand(graph, child);
+
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_pin_tensor(galloc.get(), parent);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+    GGML_ASSERT(!memory_overlap(parent, child));
+}
+
+static void test_pinned_view_root_no_inplace() {
+    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * input  = make_input_1d(ctx, 4);
+    ggml_tensor * root   = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * view   = ggml_view_1d(ctx, root, 4, 0);
+    ggml_tensor * child  = ggml_scale(ctx, view, 3.0f);
+
+    ggml_set_output(child);
+    ggml_build_forward_expand(graph, child);
+
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_pin_tensor(galloc.get(), root);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+    GGML_ASSERT(!memory_overlap(root, child));
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1139,5 +1174,7 @@ int main() {
     run("test_buft_get_alloc_size_n_custom_override", test_buft_get_alloc_size_n_custom_override);
     run("test_buft_get_alloc_size_n_custom_override_ctx_size", test_buft_get_alloc_size_n_custom_override_ctx_size);
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
+    run("test_pinned_no_inplace", test_pinned_no_inplace);
+    run("test_pinned_view_root_no_inplace", test_pinned_view_root_no_inplace);
     return 0;
 }
