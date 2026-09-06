@@ -79,7 +79,7 @@ static void check_weighted_imatrix_fp3(void) {
     const float plain_err = weighted_mse(src, plain, imatrix, N);
     const float weighted_err = weighted_mse(src, weighted, imatrix, N);
 
-    printf("ROCmFP3 imatrix weighted_mse: plain=%g weighted=%g\n", plain_err, weighted_err);
+    printf("ROCmFP3 imatrix weighted_mse: plain=%g weighted=%g\n", (double) plain_err, (double) weighted_err);
     assert(weighted_err < plain_err);
 }
 
@@ -103,7 +103,7 @@ static void check_weighted_imatrix_fp6(void) {
     const float plain_err = weighted_mse(src, plain, imatrix, N);
     const float weighted_err = weighted_mse(src, weighted, imatrix, N);
 
-    printf("ROCmFP6 imatrix weighted_mse: plain=%g weighted=%g\n", plain_err, weighted_err);
+    printf("ROCmFP6 imatrix weighted_mse: plain=%g weighted=%g\n", (double) plain_err, (double) weighted_err);
     assert(weighted_err < plain_err);
 }
 
@@ -127,7 +127,7 @@ static void check_weighted_imatrix_fp8(void) {
     const float plain_err = weighted_mse(src, plain, imatrix, N);
     const float weighted_err = weighted_mse(src, weighted, imatrix, N);
 
-    printf("ROCmFP8 imatrix weighted_mse: plain=%g weighted=%g\n", plain_err, weighted_err);
+    printf("ROCmFP8 imatrix weighted_mse: plain=%g weighted=%g\n", (double) plain_err, (double) weighted_err);
     assert(weighted_err < plain_err);
 }
 
@@ -163,13 +163,13 @@ int main(void) {
 
     printf("ROCmFP3: block=%zu row=%zu bpw=%.2f mse=%g\n",
             sizeof(block_rocmfp3), rocmfpx_row_size_fp3(N),
-            8.0f*(float) sizeof(block_rocmfp3)/(float) QK_ROCMFP3, mse3);
+            8.0*(double) sizeof(block_rocmfp3)/(double) QK_ROCMFP3, (double) mse3);
     printf("ROCmFP6: block=%zu row=%zu bpw=%.2f mse=%g\n",
             sizeof(block_rocmfp6), rocmfpx_row_size_fp6(N),
-            8.0f*(float) sizeof(block_rocmfp6)/(float) QK_ROCMFP6, mse6);
+            8.0*(double) sizeof(block_rocmfp6)/(double) QK_ROCMFP6, (double) mse6);
     printf("ROCmFP8: block=%zu row=%zu bpw=%.2f mse=%g\n",
             sizeof(block_rocmfp8), rocmfpx_row_size_fp8(N),
-            8.0f*(float) sizeof(block_rocmfp8)/(float) QK_ROCMFP8, mse8);
+            8.0*(double) sizeof(block_rocmfp8)/(double) QK_ROCMFP8, (double) mse8);
 
     assert(isfinite(mse3));
     assert(isfinite(mse6));
