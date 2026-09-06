@@ -2,6 +2,7 @@
 #include "cp-async.cuh"
 #include "mma.cuh"
 #include "fattn-common.cuh"
+#include "fattn-swizzle.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -1246,6 +1247,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
     constexpr int stride_tile_KV_max = stride_tile_K > stride_tile_V ? stride_tile_K : stride_tile_V;
+    constexpr bool swz_K = ggml_cuda_fattn_smem_swizzle::enabled(nbatch_K2);
+    constexpr bool swz_V = V_is_K_view ? swz_K : ggml_cuda_fattn_smem_swizzle::enabled(nbatch_V2);
 
     extern __shared__ half2 tile_Q[];
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
@@ -1506,6 +1509,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     constexpr int tile_stride = nbatch_combine + 4;
     static_assert((DV/2) % nbatch_combine == 0, "bad nbatch_combine");
+
+    constexpr bool combine_needs_sync = swz_K || swz_V;
 
     if constexpr (cols_per_warp == 8) {
         const int jc_cwmo = (threadIdx.x % (2*T_C_VKQ::J)) / T_C_VKQ::J; // jc combine write meta offset

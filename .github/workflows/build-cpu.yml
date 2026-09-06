@@ -105,6 +105,15 @@ jobs:
           folder: llama.cpp
           hf_bucket: ggml-org/cache
 
+      - name: ccache-buckets-restore
+        uses: ./.github/actions/ccache-buckets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
+        with:
+          key: cpu-${{ matrix.os }}
+          folder: llama.cpp
+          hf_bucket: ggml-org/cache
+
       - name: Build
         id: cmake_build
         run: |

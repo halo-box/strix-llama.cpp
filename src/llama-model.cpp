@@ -3519,6 +3519,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_NANBEIGE:
         case LLM_ARCH_POCKETTTS:
+        // HY_V4 rotates consecutive pairs, matching the reference implementation
+        case LLM_ARCH_HY_V4:
             return LLAMA_ROPE_TYPE_NORM;
         case LLM_ARCH_BAILINGMOE3:
             // VL files carry mrope sections; text-only files keep NORM rope
