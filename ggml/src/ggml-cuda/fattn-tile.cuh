@@ -1259,7 +1259,7 @@ static void launch_fattn_tile_case(
     fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
 #endif // GGML_USE_HIP
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !use_q8_0_KV, !use_q8_0_KV, false, warp_size);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !use_q8_0_KV, !use_q8_0_KV, false, false, warp_size);
 }
 
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
