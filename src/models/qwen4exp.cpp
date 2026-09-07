@@ -882,12 +882,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
     members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
 
-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
+    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows.
+    // the slices are strided views of members. ggml_add has no contiguity requirement (the Vulkan
+    // backend gates it on type alone) and ggml_dup_tensor gives the sum a contiguous home, so the
+    // per-slice ggml_cont was materialising the whole of members a second time for nothing:
+    // r reads plus r writes of [idx_dim, n_blocks] f32 per layer per ubatch, about 34 MB at 33k
+    // context and 12 layers. the addition order is unchanged, so the arithmetic is identical.
     ggml_tensor * pooled = nullptr;
     for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
+        ggml_tensor * slice = ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+                        members->nb[2], members->nb[3], i*members->nb[1]);
         pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
     }
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
