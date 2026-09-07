@@ -5,6 +5,10 @@
 
 #include "ggml.h"
 
+// ROCmFPx block layouts, for the dequantize_row_* wrappers below
+#include "../rocmfp4/rocmfp4.h"
+#include "../rocmfpx/rocmfpx.h"
+
 // GGML internal header
 
 #ifdef __cplusplus
@@ -54,6 +58,16 @@ GGML_API void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GG
 
 GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
+// ROCmFPx types under the ggml naming convention (dequantize_row_<type_name>),
+// so tooling that resolves dequantizers by type name (gguf-py/tests/test_quants.py)
+// reaches them. The codecs themselves live in ggml/rocmfp4 and ggml/rocmfpx.
+GGML_API void dequantize_row_q4_0_rocmfp4     (const block_rocmfp4      * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_q4_0_rocmfp4_fast(const block_rocmfp4_fast * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_q2_0_rocmfpx     (const block_rocmfp2      * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_q3_0_rocmfpx     (const block_rocmfp3      * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_q6_0_rocmfpx     (const block_rocmfp6      * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_q8_0_rocmfpx     (const block_rocmfp8      * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
 GGML_API void dequantize_row_q2_K(const block_q2_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q3_K(const block_q3_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
