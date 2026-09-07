@@ -629,7 +629,9 @@ uint rocmfpx_fp6_quantize_code(float x, float inv_scale) {
     }
 
     // asymmetric signed range [-32, 31]; -32 is encoded as sign|0
-    const int q = clamp(int(round(x * inv_scale)), -32, 31);
+    // Clamp in float before the int conversion: int() of an out-of-range float is
+    // undefined in GLSL, so an extreme finite weight could flip sign or vanish.
+    const int q = int(clamp(round(x * inv_scale), -32.0, 31.0));
     if (q == 0) {
         return 0u;
     }
@@ -746,8 +748,7 @@ int rocmfpx_fp8_quantize_code(float x, float inv_scale) {
         return 0;
     }
 
-    int q = int(round(x * inv_scale));
-    return clamp(q, -127, 127);
+    return int(clamp(round(x * inv_scale), -127.0, 127.0));
 }
 
 void quantize(uint dst_idx, uint src_idx)
