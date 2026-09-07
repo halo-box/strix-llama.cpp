@@ -306,9 +306,17 @@ static uint8_t rocmfpx_choose_scale_fp2_mse(
     }
 
     const float * weights = quant_weights ? mse_weights : NULL;
+
+    // The S40 codebook {-4, -1, +1, +4} has no zero code, so at any nonzero scale
+    // the smallest magnitude ROCmFP2 can emit is one scale step. A block that sits
+    // below half of the smallest UE4M3 scale is therefore encoded better by the
+    // zero scale than by e = 1, which would amplify every value. Seed the search
+    // with that candidate so scales 1..126 have to beat it; ties keep byte 0,
+    // matching the lower-byte rule the rest of the search uses.
+    uint8_t best_e = 0;
+    float best_err = rocmfpx_fp2_group_mse_for_scale(x, weights, n, 0, INFINITY);
+
     const uint8_t start_e = rocmfpx_nearest_scale_ue4m3(max_abs / 4.0f);
-    uint8_t best_e = start_e;
-    float best_err = INFINITY;
     bool lower_done = false;
 
     for (int delta = 0; delta <= 125; ++delta) {
