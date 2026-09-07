@@ -680,7 +680,11 @@ uint rocmfpx_choose_scale_fp6_mse(uint src_idx, uint offset) {
         const int e0 = int(start_e) - int(delta);
         if (!lower_done && e0 >= 1 && e0 <= 126) {
             const float scale = ue4m3_to_fp32(uint8_t(uint(e0)));
-            const float clip_delta = max_abs - 31.0 * scale;
+            // ROCmFP6 reaches -32, not just 31, so bound the unavoidable clipping
+            // error by 32 - matching rocmfpx_choose_scale_fp6_mse_impl() on the CPU.
+            // At 31 the bound is too pessimistic for a block whose largest magnitude
+            // is negative and the search stops before the scale that actually wins.
+            const float clip_delta = max_abs - 32.0 * scale;
             if (clip_delta > 0.0 && clip_delta*clip_delta > best_err) {
                 lower_done = true;
             } else {
