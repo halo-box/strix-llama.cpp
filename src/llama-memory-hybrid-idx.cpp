@@ -53,6 +53,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
 
+        // Nothing reads this cache's V. build_qsa_top_k only ever calls cpy_k and get_k on it:
+        // the indexer scores blocks against a key, and has no value side at all. llama_kv_cache
+        // allocates a V anyway (it only skips one for MLA), and at the model's own value width
+        // that is n_head_kv(1) * n_embd_head_v(256) per cell per layer of dead weight -- 482 MiB
+        // at ctx=154624 over 12 QSA layers with a q8_0 cache, 1.6 GiB at ctx=262144 with f16.
+        //
+        // Narrow it to a single element. The type has to go with it: a quantised row must be a
+        // whole number of blocks, and one element of q8_0 is not, so ask for F32 below and the
+        // whole V costs 4 bytes per cell per layer.
+        hparams_idx.n_embd_head_v_full = 1;
+        hparams_idx.n_embd_head_v_swa  = 1;
+
         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
         // K-shift must not rotate them while the stream copies in the same update still apply
         hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
@@ -64,7 +76,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, type_k, GGML_TYPE_F32, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()),
