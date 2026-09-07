@@ -9942,17 +9942,20 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
 // at the cost of re-reading the weights once per chunk. Chunks never take the q8_1
 // integer-dot path (its prealloc cache is keyed by tensor, not by column; and that path
 // has the same pathology). GGML_VK_MMV_NO_SPLIT=1 restores the single dispatch.
+// Only q8_0 and q6_K are chunked: those are the types where the slow variants were
+// measured. The K-quants were chunked to 2 columns without a measurement, and on a dense
+// Qwen3.8-27B UD-Q4_K_XL (RADV, Mesa 26.1.7) that made things worse, not better: pp3/pp5/pp8
+// 23.0/28.5/28.8 t/s chunked against 32.9/43.1/47.4 t/s with the single dispatch, which
+// halved MTP decode (issue #25). Leave the other types on upstream's path until measured.
+static bool ggml_vk_mmv_chunk_type(ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q6_K;
+}
+
 static uint32_t ggml_vk_mmv_good_cols(ggml_type type, uint32_t n) {
-    switch (type) {
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q6_K:
-            return n >= 4 ? 4 : (n >= 2 ? 2 : 1);
-        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
-            return n >= 2 ? 2 : 1;
-        default:
-            return n;   // f32/f16/bf16 and the i-quants: no pathology measured
+    if (!ggml_vk_mmv_chunk_type(type)) {
+        return n;
     }
+    return n >= 4 ? 4 : (n >= 2 ? 2 : 1);
 }
 
 // Batches of 9..16 columns of a quantized weight also go through chunked mat-vec: the
@@ -9968,7 +9971,7 @@ static bool ggml_vk_mmv_can_chunk(ggml_backend_vk_context * ctx, const ggml_tens
     const bool would_quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(src1) && (src1->ne[1] * src1->ne[0]) % 4 == 0 &&
         ggml_vk_should_use_mmvq(ctx->device, src0->ne[1], src1->ne[1], src1->ne[0], src0->type);
-    return !no_split && ggml_is_quantized(src0->type) &&
+    return !no_split && ggml_vk_mmv_chunk_type(src0->type) &&
            !would_quantize_y &&
            dst->ne[1] > mul_mat_vec_max_cols && dst->ne[1] <= mul_mat_vec_chunk_max_cols &&
            src1->ne[2] * src1->ne[3] == 1 && src1->type == GGML_TYPE_F32 &&
