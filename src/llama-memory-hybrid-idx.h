@@ -75,6 +75,26 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // QSA pooled-key cache: one row per block, holding the mean-pooled, RMS-normalised and
+    // rotated indexer key that build_qsa_top_k scores against. A block that is full never
+    // changes again -- its cells are written once and pooling, normalisation and rotation are
+    // all position-determined -- so only the tail of the cache is recomputed per ubatch.
+    // Anything that moves cells (a shift, a removal, a copy, a state load) drops the lot.
+    llama_kv_cache * get_mem_pool() const;  // nullptr when the model carries no indexer
+
+    // how many trailing blocks the next graph must recompute. n_blocks while the cache is
+    // invalid, otherwise the tail this ubatch can touch: the blocks its own tokens land in,
+    // plus the blocks n_kv gains when it next grows by a padding step.
+    uint32_t qsa_pool_n_recomp(uint32_t ratio, uint32_t n_tokens, uint32_t n_kv, uint32_t n_pad_kv) const;
+
+    // Blocks are cut on the position line, so what a cache-disturbing operation costs is a
+    // watermark, not a flag: everything below the first position it touches is still right.
+    // Speculative decoding drops its rejected tail with seq_rm on every single step, and
+    // treating that as "forget everything" made the cache recompute the whole table each time.
+    void qsa_pool_invalidate() const;                    // forget the lot
+    void qsa_pool_invalidate_from(llama_pos p0) const;   // forget positions >= p0
+    void qsa_pool_validate(uint32_t n_pos) const;        // positions < n_pos are now pooled
+
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
@@ -83,8 +103,13 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    // pool_* are null when the caller wants every block recomputed inline (the pre-cache path):
+    //   pool_idxs  I64 [n_recomp]        rows of the pooled cache this ubatch rewrites
+    //   pool_cells I32 [ratio*n_recomp]  cells making up each rewritten block
+    //   pool_pos   I32 [4*n_recomp]      mrope position rows of each rewritten block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * bias, ggml_tensor * pool_idxs, ggml_tensor * pool_cells,
+                       ggml_tensor * pool_pos, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
 
 private:
@@ -97,6 +122,14 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    // the pooled-key cache is addressed by block, so it needs its own hparams too
+    llama_hparams hparams_pool;
+
+    const std::unique_ptr<llama_kv_cache> mem_pool;
+
+    // pooled keys are correct for the blocks that cover positions below this
+    mutable uint32_t pool_valid_pos = 0;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -138,11 +171,20 @@ public:
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
 
+    // the QSA pooled-key cache, and how many trailing blocks the graph must rewrite into it
+    llama_kv_cache * get_mem_pool() const;
+    uint32_t qsa_pool_n_recomp(uint32_t ratio, uint32_t n_tokens, uint32_t n_kv, uint32_t n_pad_kv) const;
+
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
+    // pool_* are null when the caller wants every block recomputed inline (the pre-cache path):
+    //   pool_idxs  I64 [n_recomp]        rows of the pooled cache this ubatch rewrites
+    //   pool_cells I32 [ratio*n_recomp]  cells making up each rewritten block
+    //   pool_pos   I32 [4*n_recomp]      mrope position rows of each rewritten block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * bias, ggml_tensor * pool_idxs, ggml_tensor * pool_cells,
+                       ggml_tensor * pool_pos, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
 
 private:
