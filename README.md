@@ -1,6 +1,6 @@
 # strix-llama.cpp
 
-<div align="center">
+<img src="halo-box.png" alt="Halo Box" width="260">
 
 <b>llama.cpp for AMD Strix Halo</b>
 
@@ -8,7 +8,21 @@
 
 [upstream llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) / [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp)
 
-</div>
+## Halo Box
+
+The goal is simple: more functionality, and the fastest llama.cpp around. And help the community with a single fast
+llama.cpp fork instead of many competing ones.
+
+Halo Box keeps two forks, and which one you want depends on your hardware:
+
+| Fork | What it is |
+| --- | --- |
+| [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) | Stays close to mainline. Tracks upstream `master` and adds features and speedups on top, without diverging from how upstream works. |
+| [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) (this repo) | Purely optimised for AMD Strix Halo machines (Ryzen AI Max+, RDNA 3.5 / gfx1151). Free to diverge from upstream wherever that buys speed. |
+
+Use `halo-box/llama.cpp` if you want upstream behaviour plus extras. Use this repo if you run a Strix Halo box and
+want every last token/s out of it. Everything in `halo-box/llama.cpp` is merged in here regularly, so this repo is a
+superset of it.
 
 ## What this is
 
@@ -19,23 +33,6 @@ Strix Halo is an unusual target. It has more addressable memory than almost any 
 bandwidth; the iGPU shares its memory controller with the CPU; and both the Vulkan (RADV) and ROCm/HIP paths have
 RDNA 3.5 specific behaviour that upstream has no hardware to reproduce. Changes that only make sense on this one
 device - or that need a lot of measurement on it before they are ready to propose anywhere else - live here.
-
-This fork tracks upstream `master` and stays mergeable with it. It is not a rewrite.
-
-## Relationship to upstream
-
-```
-ggml-org/llama.cpp            upstream, the real project
-  |
-  +-- halo-box/llama.cpp      staging fork for changes intended to go upstream
-        |
-        +-- halo-box/strix-llama.cpp   <-- you are here: the Strix Halo community fork
-```
-
-**Nothing in this repository goes upstream from here.** If a change is general enough for upstream, it belongs in
-[halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) and is submitted from there, under the upstream project's
-contribution and AI-usage rules. That separation is the whole point: it keeps upstream's review queue free of
-device-specific work, and it lets this repo move fast on the things only Strix Halo owners care about.
 
 Practically, that means this repo has its own rules - most visibly, **AI coding agents may open pull requests here**.
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md).
@@ -97,12 +94,31 @@ expected to carry them - see [Benchmarking requirements](CONTRIBUTING.md#benchma
 
 Everything else is upstream `llama.cpp`. The additions currently carried here:
 
+**Inherited from [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp)** (general features, sent upstream from there)
+
 | Change | Flag / switch | What it does |
 | --- | --- | --- |
-| Vulkan batched mat-vec chunking | `GGML_VK_MMV_NO_SPLIT=1` to disable | Dispatches batched mat-vec at the column counts that actually scale on RDNA 3.5, instead of the slow NUM_COLS shader variants |
-| Adaptive speculative draft length | `--spec-draft-adaptive` | Sizes each draft from a measured per-sequence acceptance EMA rather than always drafting `--spec-draft-n-max` |
-| Multi-point reasoning budget | `--reasoning-budget-*` | Intro message, two soft warnings, a grace period to finish a paragraph after the budget runs out, and reasoning-token usage telemetry |
+| Speculative prefill | `--spec-prefill` | A small draft model scores prompt tokens by attention importance so the target model only prefills the ones that matter, cutting time-to-first-token on long prompts |
+| N-gram table on disk | `--ngram-on-disk`, `--ngram-cache`, `--ngram-io-threads` | Keeps a model's n-gram hash-embedding table (28.8 GB on Qwen3.8-Flash-Next) off the memory budget entirely, reading only the rows each batch actually gathers |
+| Adaptive speculative draft length | `--spec-draft-adaptive` | Sizes each draft from a measured per-sequence acceptance EMA rather than always drafting `--spec-draft-n-max`; speeds up MTP and DFlash |
+| Vulkan fixes and tuning for RDNA 3.5 | | Driver-gated coopmat LDS stride padding, UMA bulk readback gated on host-cached mappings, IQ3_S mat-vec at batch sizes > 4, and a radix top-k kernel for large k |
+| Hidden server presets | `hidden` in the models `.ini` | Keep a model loadable by name while omitting it from `GET /models` |
 
+**Strix Halo only** (lives here, measured on `gfx1151`)
+
+| Change | Flag / switch | What it does |
+| --- | --- | --- |
+| Multi-point reasoning budget | `--reasoning-budget-*` (upstream has the hard budget only) | Intro message, two soft warnings, a grace period to finish a paragraph after the budget runs out, and reasoning-token usage telemetry |
+| Vulkan batched mat-vec chunking | `GGML_VK_MMV_NO_SPLIT=1` to disable | Dispatches batched mat-vec at the column counts that actually scale on RDNA 3.5, instead of the slow NUM_COLS shader variants |
+| ROCm/HIP quantized matmul on RDNA 3.5 | | MMQ/MMVQ tile configurations and register prefetching, compact `MUL_MAT_ID` with quant- and shape-specific tiles for 256-expert MoE prefill, fused activation quantization for Q8_0 and Q6_K decode |
+| ROCm/HIP MoE decode fusion | `GGML_CUDA_DISABLE_WEIGHTED_DOWN=1`, `GGML_CUDA_DISABLE_MMID_512=1` | Fused routing, weighted expert reduction and shared-expert gate for Qwen3.5/3.6 and Ling style MoE |
+| ROCm/HIP Gated DeltaNet | `GGML_CUDA_DISABLE_GDN_GATE=1` | DPP reductions and a tiled multi-column kernel for prefill; the whole conv -> norm -> gate -> recurrence -> state copy decode chain as one kernel |
+| ROCm/HIP grouped decode matvecs | `GGML_CUDA_DISABLE_MMV_GROUP=1` | Consecutive single-column matvecs that read the same activation (gate/up pairs, hyper-connection projections) launch as one kernel |
+| ROCm/HIP flash attention on RDNA 3.5 | | WMMA path for D=256 prefill at depth, Q8_0 KV tile kernel for decode |
+| Speculative checkpoints on device | | `llama-server` keeps speculative-decoding checkpoints in device memory instead of copying them to the host |
+| Repeatable output at depth | | Freed KV cells are zeroed so masked-out rows never carry stale K/V, and the Vulkan radix top-k assigns output slots deterministically |
+
+Every ROCm/HIP change above is guarded on architecture, shape and layout, so other devices see upstream behaviour.
 Run `--help`, or see [tools/server/README.md](tools/server/README.md), for the full options.
 
 ## Supported backends
