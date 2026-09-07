@@ -690,6 +690,15 @@ static uint8_t rocmfpx_choose_scale_fp3_weighted_mse(const float * x, int n, con
     return rocmfpx_choose_scale_fp3_mse_impl(x, n, mse_weights, max_abs, max_abs_weight, all_finite);
 }
 
+// Round to the nearest integer inside [lo, hi], clamping *before* the conversion.
+// Converting first and clamping afterwards overflows int (and, for large enough
+// inputs, long) so an extreme finite weight could flip sign or collapse to zero.
+// For in-range values this is identical to rounding then clamping.
+static inline int rocmfpx_round_clamp(float v, float lo, float hi) {
+    const float c = v < lo ? lo : (v > hi ? hi : v);
+    return (int) lroundf(c);
+}
+
 static int rocmfpx_decode_fp6_code(uint8_t code) {
     const int mag = code & 31u;
     return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
@@ -700,12 +709,7 @@ static uint8_t rocmfpx_quantize_fp6_code(float x, float inv_scale) {
         return 0;
     }
 
-    int q = (int) lroundf(x * inv_scale);
-    if (q > 31) {
-        q = 31;
-    } else if (q < -32) {
-        q = -32;
-    }
+    const int q = rocmfpx_round_clamp(x * inv_scale, -32.0f, 31.0f);
 
     return q == 0 ? 0 : (uint8_t) (q < 0 ? (32u | ((uint8_t) -q & 31u)) : (uint8_t) q);
 }
@@ -714,14 +718,7 @@ static uint8_t rocmfpx_quantize_fp6_code(float x, float inv_scale) {
 // current main's asymmetric signed range [-32, 31], including the encoded -32
 // endpoint, rather than the older experimental branch's [-31, 31] behavior.
 static inline float rocmfpx_fp6_decoded_value(float x, float inv_scale) {
-    int q = (int) lroundf(x * inv_scale);
-    if (q > 31) {
-        q = 31;
-    } else if (q < -32) {
-        q = -32;
-    }
-
-    return (float) q;
+    return (float) rocmfpx_round_clamp(x * inv_scale, -32.0f, 31.0f);
 }
 
 static float rocmfpx_fp6_block_mse_for_scale(const float * x, int n, uint8_t e, float best_err) {
@@ -890,14 +887,7 @@ static int8_t rocmfpx_quantize_fp8_code(float x, float inv_scale) {
         return 0;
     }
 
-    int q = (int) lroundf(x * inv_scale);
-    if (q > 127) {
-        q = 127;
-    } else if (q < -127) {
-        q = -127;
-    }
-
-    return (int8_t) q;
+    return (int8_t) rocmfpx_round_clamp(x * inv_scale, -127.0f, 127.0f);
 }
 
 static float rocmfpx_fp8_block_weighted_mse_for_scale(const float * x, int n, const float * mse_weights, uint8_t e, float best_err) {
