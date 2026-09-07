@@ -2,6 +2,8 @@
 #include "ggml-common.h"
 
 #include "ggml-quants.h"
+#include "../rocmfp4/rocmfp4.h"
+#include "../rocmfpx/rocmfpx.h"
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
@@ -609,6 +611,30 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
             }
         }
     }
+}
+
+void dequantize_row_q4_0_rocmfp4(const block_rocmfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfp4_dequantize_row_q4_0(x, y, k);
+}
+
+void dequantize_row_q4_0_rocmfp4_fast(const block_rocmfp4_fast * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfp4_dequantize_row_q4_0_fast(x, y, k);
+}
+
+void dequantize_row_q2_0_rocmfpx(const block_rocmfp2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp2(x, y, k);
+}
+
+void dequantize_row_q3_0_rocmfpx(const block_rocmfp3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp3(x, y, k);
+}
+
+void dequantize_row_q6_0_rocmfpx(const block_rocmfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp6(x, y, k);
+}
+
+void dequantize_row_q8_0_rocmfpx(const block_rocmfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    rocmfpx_dequantize_row_fp8(x, y, k);
 }
 
 //
@@ -5540,6 +5566,48 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q4_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_0, data, nb);
+            } break;
+        case GGML_TYPE_Q4_0_ROCMFP4:
+            {
+                if (!rocmfp4_validate_row_data(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFP4 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            {
+                if (!rocmfp4_validate_row_data_fast(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFP4 fast row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q3_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp3(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx FP3 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q2_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp2(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx FP2 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q6_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp6(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx FP6 row data\n", __func__);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_Q8_0_ROCMFPX:
+            {
+                if (!rocmfpx_validate_row_data_fp8(data, nbytes)) {
+                    fprintf(stderr, "%s: invalid ROCmFPx FP8 row data\n", __func__);
+                    return false;
+                }
             } break;
         case GGML_TYPE_Q4_1:
             {

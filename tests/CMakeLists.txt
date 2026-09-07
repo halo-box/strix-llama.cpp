@@ -325,6 +325,18 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
+
+    # ROCmFPx codec self-tests, kept next to the codecs under ggml/rocmfpx.
+    # test-rocmfpx exercises the ROCmFP3/6/8 codecs; test-rocmfp2-reference
+    # checks the standalone ROCmFP2 reference encoder.
+    llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/rocmfpx/test_rocmfpx.c
+                         ${PROJECT_SOURCE_DIR}/ggml/rocmfpx/rocmfpx.c
+                         NAME test-rocmfpx)
+    target_include_directories(test-rocmfpx PRIVATE ${PROJECT_SOURCE_DIR}/ggml/rocmfpx)
+    llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/rocmfpx/test_rocmfp2_reference.c
+                         ${PROJECT_SOURCE_DIR}/ggml/rocmfpx/rocmfp2_reference.c
+                         NAME test-rocmfp2-reference)
+    target_include_directories(test-rocmfp2-reference PRIVATE ${PROJECT_SOURCE_DIR}/ggml/rocmfpx)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
 endif()
