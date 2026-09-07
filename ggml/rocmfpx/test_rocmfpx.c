@@ -8,6 +8,11 @@
 
 #include "rocmfpx.h"
 
+// Every check below is an assert(), so keep them alive in Release builds -
+// otherwise the test would validate nothing and still exit 0.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
