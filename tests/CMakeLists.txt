@@ -329,8 +329,14 @@ if (NOT GGML_BACKEND_DL)
     # ROCmFPx codec self-tests, kept next to the codecs under ggml/rocmfpx.
     # test-rocmfpx exercises the ROCmFP3/6/8 codecs; test-rocmfp2-reference
     # checks the standalone ROCmFP2 reference encoder.
+    #
+    # rocmfpx.c is already part of ggml-base and its entry points are GGML_API,
+    # so link it rather than compiling a second copy: in a shared build the
+    # inherited GGML_SHARED would make those declarations __declspec(dllimport)
+    # in the very translation unit that defines them, which MSVC rejects.
+    # rocmfp2_reference.c is standalone and carries no GGML_API, so it is still
+    # compiled straight into its test.
     llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/rocmfpx/test_rocmfpx.c
-                         ${PROJECT_SOURCE_DIR}/ggml/rocmfpx/rocmfpx.c
                          NAME test-rocmfpx)
     target_include_directories(test-rocmfpx PRIVATE ${PROJECT_SOURCE_DIR}/ggml/rocmfpx)
     llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/rocmfpx/test_rocmfp2_reference.c
