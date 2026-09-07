@@ -311,11 +311,10 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
-    GGML_TYPE_Q4_0_ROCMFP4,
-    GGML_TYPE_Q4_0_ROCMFP4_FAST,
-    GGML_TYPE_Q3_0_ROCMFPX,
-    GGML_TYPE_Q6_0_ROCMFPX,
-    GGML_TYPE_Q8_0_ROCMFPX,
+    // ROCmFPx types are weight formats here, not KV cache types: flash attention
+    // has no decode path for them (fa_kv_ok in ggml-vulkan.cpp rejects them), and
+    // a quantized V cache force-enables flash attention in llama_init_from_model,
+    // which skips the support probe that would otherwise turn it back off.
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
