@@ -364,6 +364,23 @@ void llama_memory_hybrid_idx::qsa_pool_validate(uint32_t n_pos) const {
     pool_valid_pos = n_pos;
 }
 
+bool llama_memory_hybrid_idx::qsa_pool_one_seq() const {
+    GGML_ASSERT(mem_idx != nullptr);
+
+    // the pooled path is single stream, so every sequence maps to the cells of stream 0
+    const auto & cells = mem_idx->get_cells(0);
+
+    int n_seq_present = 0;
+
+    for (llama_seq_id sq = 0; sq < (llama_seq_id) LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
+        if (cells.seq_pos_min(sq) >= 0) {
+            n_seq_present++;
+        }
+    }
+
+    return n_seq_present <= 1;
+}
+
 uint32_t llama_memory_hybrid_idx::qsa_pool_n_recomp(
         uint32_t ratio, uint32_t n_tokens, uint32_t n_kv, uint32_t n_pad_kv) const {
     GGML_ASSERT(ratio > 0);
@@ -371,6 +388,15 @@ uint32_t llama_memory_hybrid_idx::qsa_pool_n_recomp(
     const uint32_t n_blocks = (n_kv + ratio - 1)/ratio;
 
     if (mem_pool == nullptr) {
+        return n_blocks;
+    }
+
+    // more than one sequence in the stream: recompute every block (the inline behaviour,
+    // just routed through the cache) and forget whatever the cache held. The graph asks
+    // this again in can_reuse, so it is rebuilt when a second slot becomes active and
+    // again when the stream is back to one sequence.
+    if (!qsa_pool_one_seq()) {
+        pool_valid_pos = 0;
         return n_blocks;
     }
 
@@ -761,7 +787,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
 
-        qsa_pool_validate((uint32_t) n_kv);
+        if (qsa_pool_one_seq()) {
+            qsa_pool_validate((uint32_t) n_kv);
+        } else {
+            // the whole table was rewritten (n_recomp == n_blocks), but in an order that
+            // the next ubatch's sequence set may not reproduce, so it is not kept
+            GGML_ASSERT(n_recomp == n_blocks);
+            qsa_pool_invalidate();
+        }
     }
 }
 

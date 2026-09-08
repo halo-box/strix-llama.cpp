@@ -130,6 +130,13 @@ private:
 
     // pooled keys are correct for the blocks that cover positions below this
     mutable uint32_t pool_valid_pos = 0;
+
+    // the pooled rows are addressed by block index, and set_input_qsa numbers blocks
+    // bucket-major across the sequence groups of a stream. With two sequences in one
+    // (unified) stream a block gained by either shifts every later index, and the shorter
+    // sequence's tail blocks sit mid-table where the recompute window cannot reach them.
+    // So the cache is only trusted while a single sequence is present in the stream.
+    bool qsa_pool_one_seq() const;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
