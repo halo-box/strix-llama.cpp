@@ -4056,7 +4056,12 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
         const char * e = getenv("GGML_VK_FA_WAVE32");
         return e ? atoi(e) : 1;
     }();
+    // Multi-row dispatches only. Decode dispatches carry N = gqa_ratio rows (8 on
+    // Qwen3-Coder-30B) and there the narrow subgroup loses: tg64 at d8192/d32768 measured
+    // 3.5 to 4 percent slower with the pin (q8_0 KV), while prefill gains up to 10 percent
+    // at d8192. Keep the pin to the prefill shapes it was measured on.
     if (fa_wave32 != 0 &&
+        n_rows >= 32 &&
         device->subgroup_size_control &&
         32 < device->subgroup_size &&                              // narrow only, never widen
         device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size &&
