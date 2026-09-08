@@ -306,6 +306,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_16_q8_1_
 
 #define VDR_MXFP4_Q8_1_MMVQ 2
 #define VDR_MXFP4_Q8_1_MMQ  4
+#define VDR_ROCMFP4_FAST_Q8_1_MMQ 4
 
 static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
