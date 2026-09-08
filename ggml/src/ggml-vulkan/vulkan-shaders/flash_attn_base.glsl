@@ -24,6 +24,11 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
+// KV comes from a buffer instead of the push constant. Used by paths that compact K/V on the
+// GPU, where the row count is only known after a dedup pass and so cannot be pushed. The
+// workgroup counts derive from neq1/neq2/neq3 and never from KV, so no indirect dispatch is
+// needed: only this loop bound changes. Folds away for every other pipeline.
+const bool DYNAMIC_KV       = (Flags & 16) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -81,6 +86,7 @@ layout (binding = 5) writeonly buffer O {D_TYPE data_o[];};
 layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
+layout (binding = 7) readonly buffer KVB {uint32_t data_kv_dyn[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
@@ -124,7 +130,7 @@ ACC_TYPE perElemOpStoreCol0(const in uint32_t r, const in uint32_t c, const in A
 // Load the slope matrix, indexed by Q's dimension 2.
 ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t h = iq2 + (r % (p.gqa_ratio & 0xffff));
 
     uint32_t n_head_log2 = p.mask_n_head_log2 & N_LOG2_MASK;
 
@@ -137,32 +143,40 @@ ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const i
 // Load the sink value, indexed by Q's dimension 2.
 ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
 {
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    const uint32_t h = iq2 + (r % (p.gqa_ratio & 0xffff));
 
     return ACC_TYPE(data_s[h]);
 }
 
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
-         q_stride, k_stride, v_stride, m_stride;
+         q_stride, k_stride, v_stride, m_stride, m_row_len, gqa_ratio, split_k_num, output_k_num;
+bool partial_output;
 
 void init_indices()
 {
     N = p.N;
-    KV = p.KV;
+    KV = DYNAMIC_KV ? data_kv_dyn[0] : p.KV;
+    gqa_ratio = p.gqa_ratio & 0xffff;
+    split_k_num = p.k_num & 0xffff;
+    output_k_num = p.k_num >> 16;
+    partial_output = output_k_num != 0;
+    if (!partial_output) {
+        output_k_num = split_k_num;
+    }
 
-    if (p.k_num > 1) {
-        if (p.gqa_ratio > 1) {
+    if (split_k_num > 1) {
+        if (gqa_ratio > 1) {
             i = 0;
             // batch and split_k share gl_WorkGroupID.x
-            gqa_iq1 = gl_WorkGroupID.x / p.k_num;
-            split_k_index = gl_WorkGroupID.x % p.k_num;
+            gqa_iq1 = gl_WorkGroupID.x / split_k_num;
+            split_k_index = gl_WorkGroupID.x % split_k_num;
         } else {
             gqa_iq1 = 0;
-            split_k_index = gl_WorkGroupID.x % p.k_num;
-            i = gl_WorkGroupID.x / p.k_num;
+            split_k_index = gl_WorkGroupID.x % split_k_num;
+            i = gl_WorkGroupID.x / split_k_num;
         }
-    } else if (p.gqa_ratio > 1) {
+    } else if (gqa_ratio > 1) {
         i = 0;
         gqa_iq1 = gl_WorkGroupID.x;
         split_k_index = 0;
@@ -179,7 +193,7 @@ void init_indices()
 
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
-    iq2 = gl_WorkGroupID.y * p.gqa_ratio;
+    iq2 = gl_WorkGroupID.y * gqa_ratio;
     iq3 = gl_WorkGroupID.z;
 
     // broadcast factors
@@ -200,14 +214,24 @@ void init_indices()
     // nb?1 are already divided by the type size and are in units of elements.
     // When using grouped query attention, Q is indexed by iq2, so the stride
     // should be nb02 (which is in bytes).
-    q_stride = p.gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
+    q_stride = gqa_ratio > 1 ? (p.nb02 / 4) : p.nb01;
     k_stride = p.nb11;
     v_stride = p.nb21;
-    // When using grouped query attention, all rows use the same mask (stride 0).
-    // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
-    // that prevents the compiler from folding the "&" through the select
-    // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+    // Bit 31 of gqa_ratio means "the mask row stride is in split_kv", used by the DeepSeek V4
+    // sparse split path where the mask spans the full K range but this dispatch only covers the
+    // raw prefix, so m_stride != KV. That path always sets split_k_num == 1, which is what keeps
+    // split_kv free to carry the stride; ggml_vk_flash_attn_top_k asserts the invariant.
+    // Otherwise: when using grouped query attention all rows share the same mask (stride 0).
+    // "p.gqa_ratio >> 16" is just a roundabout way of writing zero that prevents the compiler
+    // from folding the "&" through the select and breaking the alignment detection.
+    const bool mask_stride_in_split_kv = (p.gqa_ratio & 0x80000000u) != 0;
+    m_stride = mask_stride_in_split_kv ? p.split_kv : ((gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV);
+    // Distinct from m_stride: m_stride is the row-to-row step INSIDE this tile (0 under GQA,
+    // where every row shares one mask row), while m_row_len is the mask tensor's actual row
+    // length, used to step between tokens and between streams. They differ under GQA and
+    // under the sparse split path, where this dispatch only covers the raw prefix (KV) but
+    // the mask rows span the whole K range.
+    m_row_len = mask_stride_in_split_kv ? p.split_kv : KV;
 }
 
 // Bias applied to softmax to stay in fp16 range.

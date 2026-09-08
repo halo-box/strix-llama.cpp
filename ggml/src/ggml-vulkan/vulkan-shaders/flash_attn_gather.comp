@@ -1,0 +1,117 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Gathers the active KV rows of a top-k sparse attention (DeepSeek V4 CSA) into a compact
+// contiguous scratch: rows [0, n_kv_raw) of the source (the dense prefix), then, for each of
+// the n_batch query tokens, that token's n_top_k selected rows, then zero padding up to kv_c.
+//
+// n_batch > 1 (small-batch decode, e.g. speculative drafts) gives every token its own block
+// rather than deduplicating into a union. That costs n_batch*n_top_k gathered rows instead of
+// |union|, but needs no dedup pass and no atomics, and the size is bounded by the worst case
+// the caller already allocates for. Cross-token rows are neutralised through the mask: token t
+// sees -inf on any block that is not its own, so nothing is double counted in the softmax. The gathered mask row keeps the
+// per-key mask values so causality/validity survive compaction; invalid top-k indices and
+// padding get -inf mask and zeroed K (softmax-neutral either way, zeroed so no NaN*0).
+// One workgroup per compact row; V is the K latent (V==K), so a single gather serves both.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// K is addressed as raw 4-byte WORDS, never as values: a gather relocates rows and does not
+// need to know whether they hold f16 elements or quantised blocks. Only the MASK is typed.
+layout(binding = 0) readonly  buffer KBuf   { uint      data_k[];   };
+layout(binding = 1) readonly  buffer TopBuf { int       data_top[]; };
+layout(binding = 2) readonly  buffer MBuf   { float16_t data_m[];   };
+layout(binding = 3) writeonly buffer KcBuf  { uint      data_kc[];  };
+layout(binding = 4) writeonly buffer McBuf  { float16_t data_mc[];  };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;     // total source KV rows
+    uint n_kv_raw; // dense prefix length
+    uint n_top_k;  // selected rows for the (single) query token
+    uint kv_c;     // padded compact row count == dispatch row range
+    uint nbk1;     // K source row stride, WORDS
+    uint nbk3;     // K source stream stride, WORDS
+    uint nbt1;     // top_k row (per query token) stride, elements
+    uint nbt3;     // top_k stream stride, elements
+    uint nbm1;     // mask source row (per query token) stride, elements
+    uint nbm3;     // mask source stream stride, elements
+    uint nem3;     // mask ne[3], for stream broadcast
+    uint n_batch;  // query tokens sharing this gather; <= LANES
+    uint row_words; // bytes per K row / 4
+} p;
+
+const uint LANES = 64;
+
+void main() {
+    const uint row    = gl_WorkGroupID.x;
+    const uint stream = gl_WorkGroupID.z;
+    const uint tid    = gl_LocalInvocationIndex;
+
+    // map compact row -> source row; p.n_kv is the invalid sentinel.
+    // owner is the token whose block this row belongs to, or ALL_TOKENS for the shared prefix.
+    const uint ALL_TOKENS = 0xffffffffu;
+    uint src   = p.n_kv;
+    uint owner = ALL_TOKENS;
+    if (row < p.n_kv_raw) {
+        src = row;
+    } else {
+        const uint off  = row - p.n_kv_raw;
+        const uint tok  = off / p.n_top_k;
+        const uint slot = off - tok * p.n_top_k;
+        if (tok < p.n_batch) {
+            owner = tok;
+            const int idx = data_top[stream * p.nbt3 + tok * p.nbt1 + slot];
+            if (idx >= 0 && uint(idx) < p.n_kv - p.n_kv_raw) {
+                src = p.n_kv_raw + uint(idx);
+            }
+        }
+    }
+
+    // Zeroing writes zero BYTES, which decode to zero for every block-quantised type here (a
+    // zero scale zeroes the block) as well as for f16. The row is -inf in the mask either way;
+    // zeroing only keeps a garbage dot product from reaching the softmax as a NaN.
+    const uint dst_base = (stream * p.kv_c + row) * p.row_words;
+    // row_words is a push constant, so this cannot be [[unroll]]ed the way it was when the row
+    // was a fixed 512 f16 elements. Stepping 4*LANES recovers that: each access stays contiguous
+    // across the lanes, and an f16 row (256 words == 4*LANES) is one iteration with no loop
+    // overhead. The tail carries the quantised row sizes, which are not multiples of 4*LANES.
+    if (src < p.n_kv) {
+        const uint src_base = stream * p.nbk3 + src * p.nbk1;
+        uint i = tid;
+        for (; i + 3 * LANES < p.row_words; i += 4 * LANES) {
+            data_kc[dst_base + i]             = data_k[src_base + i];
+            data_kc[dst_base + i + LANES]     = data_k[src_base + i + LANES];
+            data_kc[dst_base + i + 2 * LANES] = data_k[src_base + i + 2 * LANES];
+            data_kc[dst_base + i + 3 * LANES] = data_k[src_base + i + 3 * LANES];
+        }
+        for (; i < p.row_words; i += LANES) {
+            data_kc[dst_base + i] = data_k[src_base + i];
+        }
+    } else {
+        uint i = tid;
+        for (; i + 3 * LANES < p.row_words; i += 4 * LANES) {
+            data_kc[dst_base + i]             = 0u;
+            data_kc[dst_base + i + LANES]     = 0u;
+            data_kc[dst_base + i + 2 * LANES] = 0u;
+            data_kc[dst_base + i + 3 * LANES] = 0u;
+        }
+        for (; i < p.row_words; i += LANES) {
+            data_kc[dst_base + i] = 0u;
+        }
+    }
+
+    // Compact mask is token-major [n_batch][kv_c], which is what the GQA mask path expects
+    // (m_stride 0, rows stepped by gqa_iq1 * m_row_len). One lane per token; n_batch <= LANES.
+    const float NEG_INF = uintBitsToFloat(0xff800000);
+    if (tid < p.n_batch) {
+        const uint mc_idx = (stream * p.n_batch + tid) * p.kv_c + row;
+        float mv = NEG_INF;
+        if (src < p.n_kv && (owner == ALL_TOKENS || owner == tid)) {
+            mv = float(data_m[(stream % p.nem3) * p.nbm3 + tid * p.nbm1 + src]);
+        }
+        data_mc[mc_idx] = float16_t(mv);
+    }
+}

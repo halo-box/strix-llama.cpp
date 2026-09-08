@@ -1,0 +1,168 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 64;
+// Head count is a SPECIALIZATION constant, not a push constant: the head loop's trip
+// count must stay visible to the compiler. As a push constant it cannot unroll and
+// decode costs ~55% more (measured, gfx1151, kv=131584).
+layout(constant_id = 1) const uint N_HEAD = 64;
+#if N_WAVES == 1
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+#else
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+#endif
+
+layout(binding = 0) readonly  buffer QBuf   { float     data_q[];    };
+layout(binding = 1) readonly  buffer KBuf   { float16_t data_k[];    };
+layout(binding = 2) readonly  buffer WBuf   { float     data_w[];    };
+layout(binding = 3) readonly  buffer MBuf   { float16_t data_m[];    };
+layout(binding = 4) writeonly buffer DstBuf { float     data_dst[];  };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_batch;
+    uint n_stream;
+    uint nem3;
+    uint nb1;
+    uint nb3;
+    uint nbq1;
+    uint nbq2;
+    uint nbq3;
+    uint nbk2;
+    uint nbk3;
+    uint nbw1;
+    uint nbw3;
+    uint nbm1;
+    uint nbm3;
+} p;
+
+const uint TILE = 16;
+const uint HEAD_SIZE = 128;
+const uint VEC_PER_HEAD = HEAD_SIZE / 4;
+const uint TILE_STRIDE = VEC_PER_HEAD + 2;
+const uint SCORE_STRIDE = TILE / 4 + 1;
+
+// Shared-memory budget, N_WAVES=8 / HEADS_PER_TILE=4 (TILE 16, HEAD_SIZE 128):
+//   k_sh      8 * 16 * 34 * 8 B = 34816
+//   q_sh      4 * 16 * 34 * 8 B = 17408
+//   score_sh  8 * 16 *  5 * 16 B = 10240
+//   weight_sh 4 * 16 *      4 B =   256
+//                        total  = 62720 of 65536 (95.7%)
+// Only one workgroup fits per CU at that size, which is the intended trade. Raising either
+// constant overruns: HEADS_PER_TILE=8 needs 80128 B and the pipeline then fails to create,
+// silently falling back to the small variant. The host gates on
+// maxComputeSharedMemorySize >= 64 KiB; keep that gate and this arithmetic in sync.
+shared f16vec4 q_sh[HEADS_PER_TILE][TILE * TILE_STRIDE];
+shared f16vec4 k_sh[N_WAVES][TILE * TILE_STRIDE];
+shared vec4 score_sh[N_WAVES][TILE * SCORE_STRIDE];
+shared float weight_sh[HEADS_PER_TILE][TILE];
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint wave = gl_SubgroupID;
+    const uint kv_base = (gl_WorkGroupID.x * N_WAVES + wave) * TILE;
+    const uint token_base = gl_WorkGroupID.y * TILE;
+    const uint stream = gl_WorkGroupID.z;
+
+    float totals[4];
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        totals[i] = 0.0;
+    }
+
+    for (uint idx = tid; idx < N_WAVES * TILE * VEC_PER_HEAD; idx += gl_WorkGroupSize.x) {
+        const uint load_wave = idx / (TILE * VEC_PER_HEAD);
+        const uint wave_idx = idx % (TILE * VEC_PER_HEAD);
+        const uint key = wave_idx / VEC_PER_HEAD;
+        const uint d4 = wave_idx % VEC_PER_HEAD;
+        const uint kv = (gl_WorkGroupID.x * N_WAVES + load_wave) * TILE + key;
+        f16vec4 value = f16vec4(0.0);
+        if (kv < p.n_kv) {
+            const uint offset = stream * p.nbk3 + kv * p.nbk2 + d4 * 4;
+            value = f16vec4(data_k[offset], data_k[offset + 1], data_k[offset + 2], data_k[offset + 3]);
+        }
+        k_sh[load_wave][key * TILE_STRIDE + d4] = value;
+    }
+    barrier();
+
+    // k_sh[wave] is written once above and never touched again, but coopMatLoad sits inside both
+    // the head_base and head_local loops, so the same 8 A fragments are re-read from shared
+    // memory N_HEAD times per wave (512 loads where 8 would do). Each wave64 fragment load moves
+    // 1 KiB of LDS traffic because the 16x16 f16 fragment is replicated 4x across the subgroup.
+    coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> kmat_h[HEAD_SIZE / TILE];
+    [[unroll]] for (uint d = 0; d < HEAD_SIZE; d += TILE) {
+        coopMatLoad(kmat_h[d / TILE], k_sh[wave], d / 4, TILE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+    }
+
+    for (uint head_base = 0; head_base < N_HEAD; head_base += HEADS_PER_TILE) {
+        for (uint idx = tid; idx < HEADS_PER_TILE * TILE * VEC_PER_HEAD; idx += gl_WorkGroupSize.x) {
+            const uint head_local = idx / (TILE * VEC_PER_HEAD);
+            const uint head_idx = idx % (TILE * VEC_PER_HEAD);
+            const uint token_local = head_idx / VEC_PER_HEAD;
+            const uint d4 = head_idx % VEC_PER_HEAD;
+            const uint token = token_base + token_local;
+            f16vec4 value = f16vec4(0.0);
+            if (token < p.n_batch && (N_HEAD % HEADS_PER_TILE == 0 || head_base + head_local < N_HEAD)) {
+                const uint offset = stream * p.nbq3 + token * p.nbq2 + (head_base + head_local) * p.nbq1 + d4 * 4;
+                value = f16vec4(data_q[offset], data_q[offset + 1], data_q[offset + 2], data_q[offset + 3]);
+            }
+            q_sh[head_local][token_local * TILE_STRIDE + d4] = value;
+        }
+        if (tid < HEADS_PER_TILE * TILE) {
+            const uint head_local = tid / TILE;
+            const uint token_local = tid % TILE;
+            const uint token = token_base + token_local;
+            weight_sh[head_local][token_local] = (token < p.n_batch && (N_HEAD % HEADS_PER_TILE == 0 || head_base + head_local < N_HEAD))
+                ? data_w[stream * p.nbw3 + token * p.nbw1 + head_base + head_local] : 0.0;
+        }
+        barrier();
+
+        [[unroll]] for (uint head_local = 0; head_local < HEADS_PER_TILE; ++head_local) {
+            coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> scores =
+                coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> qmat;
+
+            [[unroll]] for (uint d = 0; d < HEAD_SIZE; d += TILE) {
+                coopMatLoad(qmat, q_sh[head_local], d / 4, TILE_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                scores = coopMatMulAdd(kmat_h[d / TILE], qmat, scores);
+            }
+
+            coopMatStore(scores, score_sh[wave], 0, SCORE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                const uint idx = lane + i * SUBGROUP_SIZE;
+                const uint key = idx / TILE;
+                const uint token_local = idx % TILE;
+                const uint token = token_base + token_local;
+                if (token < p.n_batch && kv_base + key < p.n_kv) {
+                    const float score = score_sh[wave][key * SCORE_STRIDE + token_local / 4][token_local % 4];
+                    totals[i] += max(score, 0.0) * weight_sh[head_local][token_local];
+                }
+            }
+            if (head_local + 1 < HEADS_PER_TILE) {
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint idx = lane + i * SUBGROUP_SIZE;
+        const uint key = idx / TILE;
+        const uint token_local = idx % TILE;
+        const uint kv = kv_base + key;
+        const uint token = token_base + token_local;
+        if (kv < p.n_kv && token < p.n_batch) {
+            const uint mask_base = (stream % p.nem3) * p.nbm3 + token * p.nbm1;
+            const uint dst_base = stream * p.nb3 + token * p.nb1;
+            data_dst[dst_base + kv] = totals[i] + float(data_m[mask_base + kv]);
+        }
+    }
+}

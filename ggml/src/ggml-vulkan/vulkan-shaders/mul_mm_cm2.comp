@@ -106,6 +106,9 @@ layout (binding = 1) readonly buffer B4 {B_TYPEV4 data_b_v4[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+// Bound for descriptor-layout parity with the other mul_mat_id shaders. The fused MUL
+// epilogue is not implemented here, so the host never enables it on coopmat2 devices.
+layout (binding = 5) readonly buffer FusedScale {float data_fscale[];};
 
 shared u16vec4 row_ids[BN];
 

@@ -1,0 +1,95 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 64;
+// Head count is a SPECIALIZATION constant, not a push constant: the head loop's trip
+// count must stay visible to the compiler. As a push constant it cannot unroll and
+// decode costs ~55% more (measured, gfx1151, kv=131584).
+layout(constant_id = 1) const uint N_HEAD = 64;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer QBuf    { float     data_q[];   };
+layout(binding = 1) readonly  buffer KBuf    { float16_t data_k[];   };
+layout(binding = 2) readonly  buffer WBuf    { float     data_w[];   };
+layout(binding = 3) readonly  buffer MaskBuf { float16_t data_m[];   };
+layout(binding = 4) writeonly buffer DstBuf  { float     data_dst[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_batch;
+    uint n_stream;
+    uint nem3;
+    uint nb1;
+    uint nb3;
+    uint nbq1;
+    uint nbq2;
+    uint nbq3;
+    uint nbk2;
+    uint nbk3;
+    uint nbw1;
+    uint nbw3;
+    uint nbm1;
+    uint nbm3;
+} p;
+
+const uint K_PER_GROUP = 8;
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint token = gl_WorkGroupID.y;
+    const uint stream = gl_WorkGroupID.z;
+    const uint kv_base = gl_WorkGroupID.x * K_PER_GROUP;
+
+    if (token >= p.n_batch || stream >= p.n_stream) {
+        return;
+    }
+
+    float k0[K_PER_GROUP];
+    float k1[K_PER_GROUP];
+    [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
+        const uint kv = kv_base + j;
+        if (kv < p.n_kv) {
+            const uint k_base = stream * p.nbk3 + kv * p.nbk2;
+            k0[j] = float(data_k[k_base + lane]);
+            k1[j] = float(data_k[k_base + lane + SUBGROUP_SIZE]);
+        } else {
+            k0[j] = 0.0;
+            k1[j] = 0.0;
+        }
+    }
+
+    float score[K_PER_GROUP];
+    [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
+        score[j] = 0.0;
+    }
+
+    for (uint head = 0; head < N_HEAD; ++head) {
+        const uint q_base = stream * p.nbq3 + token * p.nbq2 + head * p.nbq1;
+        const float q0 = data_q[q_base + lane];
+        const float q1 = data_q[q_base + lane + SUBGROUP_SIZE];
+        const float weight = data_w[stream * p.nbw3 + token * p.nbw1 + head];
+
+        [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
+            const float qk = subgroupAdd(q0 * k0[j] + q1 * k1[j]);
+            if (lane == 0) {
+                score[j] += max(qk, 0.0) * weight;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        const uint mask_base = (stream % p.nem3) * p.nbm3 + token * p.nbm1;
+        const uint dst_base = stream * p.nb3 + token * p.nb1;
+        [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
+            const uint kv = kv_base + j;
+            if (kv < p.n_kv) {
+                data_dst[dst_base + kv] = score[j] + float(data_m[mask_base + kv]);
+            }
+        }
+    }
+}

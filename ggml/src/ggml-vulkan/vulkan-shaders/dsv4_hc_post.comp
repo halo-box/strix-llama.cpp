@@ -1,0 +1,44 @@
+#version 450
+
+// DeepSeek V4 fused hyper-connection "post": redistribute the layer output back into the HC
+// streams with the sinkhorn-mixed residual,
+// dst[i0, idst, it] = x[i0, it] * post[idst, it] + sum_isrc residual[i0, isrc, it] * comb[idst, isrc, it].
+// Port of ggml-cuda/dsv4-hc.cu (hc_post). Flat elementwise over n_embd * hc * n_tokens.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer XBuf { float data_x[]; };
+layout(binding = 1) readonly  buffer RBuf { float data_r[]; };
+layout(binding = 2) readonly  buffer PBuf { float data_p[]; };
+layout(binding = 3) readonly  buffer CBuf { float data_c[]; };
+layout(binding = 4) writeonly buffer DBuf { float data_d[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_embd;
+    uint hc;
+    uint nr;      // n_embd * hc * n_tokens
+    uint sx0, sx1;
+    uint sr0, sr1, sr2;
+    uint sp0, sp1;
+    uint sc0, sc1, sc2;
+    uint sd0, sd1, sd2;
+} p;
+
+void main() {
+    const uint ir = gl_GlobalInvocationID.x;
+    if (ir >= p.nr) {
+        return;
+    }
+
+    const uint i0   = ir % p.n_embd;
+    const uint idst = (ir / p.n_embd) % p.hc;
+    const uint it   = ir / (p.n_embd * p.hc);
+
+    float sum = data_x[i0 * p.sx0 + it * p.sx1] * data_p[idst * p.sp0 + it * p.sp1];
+    for (uint isrc = 0; isrc < p.hc; ++isrc) {
+        sum += data_r[i0 * p.sr0 + isrc * p.sr1 + it * p.sr2]
+             * data_c[idst * p.sc0 + isrc * p.sc1 + it * p.sc2];
+    }
+
+    data_d[i0 * p.sd0 + idst * p.sd1 + it * p.sd2] = sum;
+}

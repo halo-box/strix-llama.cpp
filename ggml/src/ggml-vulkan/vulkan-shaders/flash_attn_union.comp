@@ -1,0 +1,134 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// Builds the deduplicated union of the compressed rows selected by any of the n_batch query
+// tokens, for the DeepSeek V4 small-batch decode path.
+//
+// Marks a bitmap from the top-k index lists, then compacts by scanning bitmap WORDS. The
+// marking is O(n_batch * n_top_k), independent of context depth, and the compaction touches
+// R/32 words instead of R rows. An earlier version scanned the mask row by row instead: that
+// is simpler, but it made dedup cost scale with depth and measured 0.71x (ie a loss) at
+// kv=133888, which defeats the purpose. Do not go back to it.
+//
+// Ascending source order falls out of the bitmap scan, so the result is deterministic.
+//
+// Emits the index list plus the PADDED compact row count. Padding to a multiple of pad_to
+// (a multiple of every FA block width) is what lets flash-attention keep its "aligned"
+// pipeline variant even though the row count is now a runtime value.
+//
+// Also emits the raw union size, the candidate count and the batch it came from. The host
+// reads those back to decide whether compaction is worth it at all, and files the sample under
+// the batch reported here rather than the one it is pricing: it cannot tell which call last
+// wrote the slot, and the overlap it is measuring depends on the batch.
+//
+// count_only skips the list writes. The scan still has to run to produce the count, but with
+// nothing to write the index buffer need not exist, which is what lets the host price the
+// union on a call it is not going to compact.
+//
+// One workgroup: the bitmap and the running offset both live in shared memory.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer TBuf { int  data_top[]; };
+layout(binding = 1) writeonly buffer UBuf { uint data_u[];   };
+layout(binding = 2) writeonly buffer CBuf { uint data_c[];   };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_kv_raw;
+    uint n_batch;
+    uint n_top_k;
+    uint max_union;
+    uint nbt1;
+    uint max_words;   // capacity of the shared bitmap, host-checked
+    uint pad_to;
+    uint count_only;  // 1: produce the count, write no index list
+} p;
+
+// 12288 words = 393216 compressed rows, ~48 KiB of shared memory.
+const uint MAX_WORDS = 12288;
+
+shared uint  bitmap[MAX_WORDS];
+shared uint  wave_totals[16];
+shared uint  base_sh;
+
+void main() {
+    const uint tid   = gl_LocalInvocationIndex;
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint wave  = gl_SubgroupID;
+    const uint nwave = gl_NumSubgroups;
+    const uint R     = p.n_kv - p.n_kv_raw;
+    const uint words = min((R + 31) / 32, p.max_words);
+
+    // phase 1: clear
+    for (uint w = tid; w < words; w += gl_WorkGroupSize.x) {
+        bitmap[w] = 0;
+    }
+    if (tid == 0) {
+        base_sh = 0;
+    }
+    barrier();
+
+    // phase 2: mark. Depth-independent: one pass over the top-k lists.
+    const uint n_cand = p.n_batch * p.n_top_k;
+    for (uint c = tid; c < n_cand; c += gl_WorkGroupSize.x) {
+        const uint  t   = c / p.n_top_k;
+        const uint  j   = c - t * p.n_top_k;
+        const int   idx = data_top[t * p.nbt1 + j];
+        if (idx >= 0 && uint(idx) < R) {
+            atomicOr(bitmap[uint(idx) >> 5], 1u << (uint(idx) & 31u));
+        }
+    }
+    barrier();
+
+    // phase 3: compact. R/32 iterations, ascending, exact running offset in shared memory.
+    for (uint chunk = 0; chunk < words; chunk += gl_WorkGroupSize.x) {
+        const uint w    = chunk + tid;
+        const uint bits = w < words ? bitmap[w] : 0u;
+        const uint cnt  = bitCount(bits);
+
+        const uint wave_off = subgroupExclusiveAdd(cnt);
+        const uint wave_tot = subgroupAdd(cnt);
+        if (lane == 0) {
+            wave_totals[wave] = wave_tot;
+        }
+        barrier();
+
+        uint prefix = 0;
+        for (uint i = 0; i < wave; ++i) {
+            prefix += wave_totals[i];
+        }
+        uint total = 0;
+        for (uint i = 0; i < nwave; ++i) {
+            total += wave_totals[i];
+        }
+
+        uint slot = base_sh + prefix + wave_off;
+        uint rem  = p.count_only != 0 ? 0u : bits;
+        while (rem != 0) {
+            const uint b = findLSB(rem);
+            rem &= rem - 1;
+            if (slot < p.max_union) {
+                data_u[slot] = w * 32 + b;
+            }
+            ++slot;
+        }
+        barrier();
+        if (tid == 0) {
+            base_sh += total;
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        const uint u    = min(base_sh, p.max_union);
+        const uint rows = p.n_kv_raw + u;
+        data_c[0] = ((rows + p.pad_to - 1) / p.pad_to) * p.pad_to;
+        data_c[1] = u;
+        data_c[2] = n_cand;
+        data_c[3] = p.n_batch;
+    }
+}
