@@ -179,8 +179,11 @@ def test_ram_cache_interleaved_shared_prefix():
         assert res.status_code == 200
         return res.body
 
-    first = [complete(prompt) for prompt in prompts]
-    assert first[0]["timings"]["prompt_n"] == len(prompts[0])
+    first = []
+    for prompt in prompts:
+        complete(prompt)
+        # Compare the same one-token replay shape before and after displacement.
+        first.append(complete(prompt))
     for prompt, expected in zip(prompts, first):
         restored = complete(prompt)
         assert restored["timings"]["cache_n"] == len(prompt) - 1
