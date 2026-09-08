@@ -457,7 +457,7 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 // - save the seq 1 state, free the interleaved seq 0 cells, and restore via the given io path
 // - the restore destination is non-contiguous: scatter reads are batched per contiguous run
 // - save again on the host and compare the two blobs byte for byte
-static bool test_seq_cp_scatter(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, int test_num, bool on_device) {
+static bool test_seq_cp_scatter(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, int test_num, bool on_device, bool compact = false) {
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_ctx      = 256;
     params_ctx.n_seq_max  = 2;
@@ -522,10 +522,20 @@ static bool test_seq_cp_scatter(struct llama_model * model, const struct common_
         return false;
     }
 
+    if (compact) {
+        // Saved ranges [2, 1] must restore into one contiguous range, including quantized KV blocks.
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+    }
+
     // restore via the io path under test
     const size_t nset = llama_state_seq_set_data_ext(ctx.get(), state_save.data(), state_save.size(), 1, flags);
     if (nset != state_save.size()) {
         LOG_ERR("%s: seq set data length %zu does not match expected length %zu\n", __func__, nset, state_save.size());
+        return false;
+    }
+
+    // Test 9: on-device restore with different source and destination chunking.
+    if (!test_seq_cp_scatter(model, params, tokens, 9, true, true)) {
         return false;
     }
     LOG_TRC("%s: seq 1 restored via %s, %zu bytes\n", __func__, on_device ? "device" : "host", nset);
