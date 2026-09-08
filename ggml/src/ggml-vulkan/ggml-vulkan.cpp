@@ -4580,18 +4580,65 @@ static bool ggml_vk_mmid_f16b_enabled() {
 // GGML_VK_DENSE_F16B: same idea as GGML_VK_MMID_F16B but for plain MUL_MAT. Halves the B bytes
 // moved. Numerically identical: mul_mm stages B into shared FLOAT_TYPE either way, so the f32-B
 // kernel already rounds B to f16. Helps wide dense models, costs ~1% on narrow ones.
-// 0 = off, 1 = all quantized dense matmuls, 2 = auto (only the K we have positive data for)
+// 0 = off, 1 = all quantized dense matmuls, 2 = auto (the measured set, see
+// ggml_vk_dense_f16b_auto_ok), 3 = type (kept only to reproduce a falsified hypothesis).
+// Env unset means auto: that is the shipping default.
 static int ggml_vk_dense_f16b_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_VK_DENSE_F16B");
-        if (e == nullptr) return 0;
+        if (e == nullptr) return 2;
         if (e[0] == 'a') return 2;
+        if (e[0] == 't') return 3;
         return atoi(e) != 0 ? 1 : 0;
     }();
     return mode;
 }
 
 static bool ggml_vk_dense_f16b_enabled() { return ggml_vk_dense_f16b_mode() != 0; }
+
+/* auto-mode predicate. Fitted on an op-level grid of 23 real (ne01, ne10) shapes taken from a
+ * gguf tensor census of the models on this box, crossed with 4 quant types and 3 ubatch widths
+ * (276 cells), 3 timed reps plus a discarded warmup. Median run-to-run spread 0.78%.
+ *
+ * Two terms, both mechanism-shaped:
+ *
+ * (1) The conversion must actually move B's row stride off a channel camp.
+ *     This memory system interleaves across 16 channels on a 256 B granule. B is [ne10, ne11]
+ *     f32, so a B row is ne10*4 bytes = ne10/64 granules; when that granule count is a multiple
+ *     of 16, every row starts on the same channel. Converting B to f16 halves the stride, which
+ *     only helps if it breaks that alignment - i.e. ne10*4 is a multiple of 16 granules and
+ *     ne10*2 is not. Since gcd(x,16)==16 is just x%16==0, that reduces exactly to:
+ *     ne10 is an ODD multiple of 1024.
+ *     This is what separates the widths: at ne01=8192, ne11=256 only ne10=5120 gains (+3.2%),
+ *     while ne10 = 2048, 3584 and 4096 all lose - and those are precisely the widths this term
+ *     rejects. Dropping this term admits 10 losing cells, worst -5.3%.
+ *
+ * (2) The weight row must be long enough in BYTES. Converting B costs ~6 bytes per element
+ *     (read 4, write 2) and that cost does not shrink with the weight quant, while the matmul
+ *     it accelerates moves ne01*ne10*bpw weight bytes. The conversion's share of the work
+ *     therefore goes as 1/(ne01*bpw), so a lighter quant needs more rows to break even. That is
+ *     why at ne01=8192, ne10=5120 q4_K is -4.1% while q8_0 is +3.8% - same shape, different bpw.
+ *     Threshold: ne01 * bpw >= 6144 bytes, i.e. ne01 >= 10923 (q4_K), 8937 (q5_K),
+ *     7490 (q6_K), 5783 (q8_0).
+ *     This is also what kills the old "t" mode: the type looked decisive only because bpw
+ *     enters through this term. It is not a property of the quant format itself.
+ *
+ * The rule deliberately leaves wins on the table (40 cells above +2% are not engaged, mostly at
+ * ne10 = 2048/3584/4096 where the sign is not consistent): the gate's job is to avoid
+ * regressing a real model, not to capture every cell.
+ *
+ * KNOWN LIMITATION: among *engaged* cells only ne10=5120 is represented. ne10=17408 satisfies
+ * term (1) but no grid shape has enough rows to pass term (2). Term (1) is validated as an
+ * exclusion (it correctly rejects 512/2048/3584/4096/6144/18944), not as an inclusion.
+ */
+static bool ggml_vk_dense_f16b_auto_ok(ggml_type type_a, uint64_t ne01, uint64_t ne10) {
+    // (1) ne10 an odd multiple of 1024
+    if (ne10 % 1024 != 0 || ne10 % 2048 == 0) {
+        return false;
+    }
+    // (2) ne01 * bpw >= 6144 bytes, in exact integer arithmetic
+    return ne01 * (uint64_t) ggml_type_size(type_a) >= 6144u * (uint64_t) ggml_blck_size(type_a);
+}
 
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
@@ -10367,10 +10414,15 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                               !ggml_vk_dim01_contiguous(src0);
     // Route quantized MUL_MAT through the f16-B kernels. Treating contiguous f32 B as
     // y_non_contig reuses the convert-to-prealloc_y plumbing, like coopmat2 does.
-    // auto mode restricts to ne10 == 5120: the only width measured to gain. Narrow on purpose,
-    // so widths measured as losses (3584 dense, 2048 MoE) cannot trigger it.
+    // auto mode is the default; see ggml_vk_dense_f16b_auto_ok for the measured set.
+    // mode 3 (=type): gate on weight quant alone. FALSIFIED by the op-level grid - once shape
+    // is crossed with type, no type rule separates the winners; kept for reproducing the check.
+    const bool f16b_type_ok = src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q8_0;
+    const int  f16b_mode    = ggml_vk_dense_f16b_mode();
     const bool dense_f16b = ggml_vk_dense_f16b_enabled() &&
-                            (ggml_vk_dense_f16b_mode() == 1 || ne10 == 5120) &&
+                            (f16b_mode == 1 ||
+                             (f16b_mode == 2 && ggml_vk_dense_f16b_auto_ok(src0->type, ne01, ne10)) ||
+                             (f16b_mode == 3 && f16b_type_ok)) &&
                             ctx->device->coopmat_support && !ctx->device->coopmat2 &&
                             ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
                             !(ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type].f16acc->is_empty() &&
