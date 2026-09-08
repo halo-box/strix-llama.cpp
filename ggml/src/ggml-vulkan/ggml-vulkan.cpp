@@ -3839,6 +3839,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const char * dense_wave32_env = getenv("GGML_VK_DENSE_WAVE32");
         const int    dense_wave32     = dense_wave32_env ? atoi(dense_wave32_env) : 1;
 
+        // The mul_mat_id tiles below start from these. Snapshot them before the dense
+        // wave32 rewrite so an mmid pipeline created without a required subgroup size
+        // (GGML_VK_MMID_WAVE32=0) keeps a WARP that matches the real wave64 subgroup.
+        const auto l_warptile_mmq_w64 = l_warptile_mmq;
+        const auto m_warptile_mmq_w64 = m_warptile_mmq;
+        const auto s_warptile_mmq_w64 = s_warptile_mmq;
         if (dense_wave32_possible && dense_wave32 != 0) {
             auto wave32_tile = [](std::vector<uint32_t> & w) -> bool {
                 // {BLOCK_SIZE, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, WARP}
@@ -4076,6 +4082,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 wave32_tile(s_warptile_mmq_id16);
                 wave32_tile(m_warptile_mmq_id128);
                 wave32_tile(l_warptile_mmq_idw);
+            } else {
+                // Wave64 stack: the tiles are the dense wave64 tiles plus the BM64/M128 reshapes,
+                // which keep NUM_WARPS == (BM/WM)*(BN/WN). Pin the subgroup to the tile's WARP
+                // where the driver honours it, so the spec constant can never disagree with
+                // the real subgroup size.
+                for (const auto * w : { &s_warptile_mmq_id16, &m_warptile_mmq_id128, &l_warptile_mmq_idw }) {
+                    GGML_ASSERT((*w)[0] / (*w)[10] == ((*w)[1] / (*w)[4]) * ((*w)[2] / (*w)[5]));
+                }
+                const uint32_t warp = s_warptile_mmq_id16[10];
+                if (device->subgroup_size_control && warp == m_warptile_mmq_id128[10] && warp == l_warptile_mmq_idw[10] &&
+                    device->subgroup_min_size <= warp && warp <= device->subgroup_max_size) {
+                    mmid_req_sgs = warp;
+                }
             }
         }
         // The _f16 variants provide the f16 B-type pipeline used when y_non_contig converts f32->f16.
