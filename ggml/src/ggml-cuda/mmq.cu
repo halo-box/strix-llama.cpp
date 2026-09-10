@@ -553,6 +553,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                 case GGML_TYPE_Q2_K:
                     return ne11 <= 128;
                 case GGML_TYPE_Q6_K:
+                    // RDNA 3.5 (gfx1151): dequantize + hipBLASLt loses to MMQ up to ne11 = 1024; at 2048 the two
+                    // paths trade places per shape (K = 4096 favours hipBLASLt, K >= 12288 favours MMQ), see PR.
+                    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+                        return ne11 <= 1024;
+                    }
                     return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
