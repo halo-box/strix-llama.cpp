@@ -829,6 +829,15 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Benchmarking helper: occupy the cells for positions [p0, p1) of `seq_id` without running the
+    // model. Positions, cell layout and masks match a real prefill; the contents do not, so any
+    // decode that attends to them is meaningless. Returns false if the memory type cannot do it.
+    LLAMA_API bool llama_memory_seq_fill_synthetic(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
     //
     // State / sessions
     //

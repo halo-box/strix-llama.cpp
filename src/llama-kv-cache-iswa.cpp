@@ -139,6 +139,15 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
     kv_swa ->seq_div(seq_id, p0, p1, d);
 }
 
+bool llama_kv_cache_iswa::seq_fill_synthetic(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    bool res = true;
+
+    res = kv_base->seq_fill_synthetic(seq_id, p0, p1) && res;
+    res = kv_swa ->seq_fill_synthetic(seq_id, p0, p1) && res;
+
+    return res;
+}
+
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
     // the base cache is a superset of the SWA cache, so we can just check the SWA cache
     return kv_swa->seq_pos_min(seq_id);

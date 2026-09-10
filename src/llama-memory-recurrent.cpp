@@ -375,6 +375,33 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
     }
 }
 
+bool llama_memory_recurrent::seq_fill_synthetic(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // a recurrent state is a fixed-size summary: being at a depth is just owning the last cell
+    if (p1 <= p0) {
+        return true;
+    }
+
+    seq_rm(seq_id, -1, -1);
+
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+
+    llama_ubatch ubatch = balloc.ubatch_reserve(1, 1);
+
+    ubatch.pos     [0] = p1 - 1;
+    ubatch.n_seq_id[0] = 1;
+    ubatch.seq_id  [0] = &seq_id;
+
+    if (!find_slot(ubatch)) {
+        LLAMA_LOG_ERROR("%s: failed to find an available cell\n", __func__);
+        return false;
+    }
+
+    // make sure the state of the cell is kept, as state_read_meta() does after a restore
+    cells[head].src = head;
+
+    return true;
+}
+
 llama_pos llama_memory_recurrent::seq_pos_min(llama_seq_id seq_id) const {
     llama_pos result = std::numeric_limits<llama_pos>::max();
 

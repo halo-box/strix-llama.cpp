@@ -113,6 +113,11 @@ struct llama_memory_i {
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
+    // benchmarking helper: occupy the cells for positions [p0, p1) of seq_id without running the
+    // model - the contents are meaningless. see llama_memory_seq_fill_synthetic()
+    // not pure: a memory type that cannot do this simply reports so
+    virtual bool seq_fill_synthetic(llama_seq_id /*seq_id*/, llama_pos /*p0*/, llama_pos /*p1*/) { return false; }
+
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 

@@ -1022,6 +1022,29 @@ void llama_dsv4_comp_state::clear(llama_seq_id seq_id, bool data) {
     }
 }
 
+void llama_dsv4_comp_state::fill_rand(llama_seq_id seq_id) {
+    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < n_stream);
+
+    llama_kv_rand_fill filler;
+
+    for (const auto & layer : layers) {
+        for (uint32_t d = 0; d <= n_rs_seq; ++d) {
+            const uint32_t stream = d*n_stream + (uint32_t) seq_id;
+
+            for (ggml_tensor * t : { layer.kv, layer.score }) {
+                if (!t) {
+                    continue;
+                }
+
+                GGML_ASSERT(ggml_is_contiguous(t));
+                GGML_ASSERT(stream < (uint32_t) t->ne[2]);
+
+                filler.fill(t, stream*t->nb[2], t->nb[2]);
+            }
+        }
+    }
+}
+
 void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
     GGML_ASSERT(seq_id_src >= 0 && (uint32_t) seq_id_src < n_stream);
     GGML_ASSERT(seq_id_dst >= 0 && (uint32_t) seq_id_dst < n_stream);
@@ -1673,6 +1696,52 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
     }
+}
+
+bool llama_kv_cache_dsv4::seq_fill_synthetic(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (seq_id < 0) {
+        return false;
+    }
+
+    GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+
+    if (p1 <= p0) {
+        return true;
+    }
+
+    if (!kv_raw->seq_fill_synthetic(seq_id, p0, p1)) {
+        return false;
+    }
+
+    // storage only: rows are addressed by block index, so there are no cells to claim
+    clear_compressed(seq_id, true);
+
+    const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
+
+    const auto fill_k_rows = [seq_id, pos_max](llama_kv_cache * kv, uint32_t ratio) {
+        uint32_t s0;
+        uint32_t ns;
+        dsv4_state_src_stream_range(kv->get_n_stream(), seq_id, s0, ns);
+
+        const uint32_t n_rows = dsv4_state_n_used_k_rows(pos_max, ratio, kv->get_size());
+
+        for (uint32_t s = s0; s < s0 + ns; ++s) {
+            kv->fill_rows_rand(s, 0, n_rows);
+        }
+    };
+
+    fill_k_rows(kv_csa.get(), DSV4_CSA_RATIO);
+    fill_k_rows(kv_hca.get(), DSV4_HCA_RATIO);
+    fill_k_rows(kv_lid.get(), DSV4_CSA_RATIO);
+
+    // block selection reads these scores: all-equal would gather one block over and over
+    csa_state->fill_rand(seq_id);
+    hca_state->fill_rand(seq_id);
+    lid_state->fill_rand(seq_id);
+
+    rs_idx[seq_id] = 0;
+
+    return true;
 }
 
 llama_kv_cache_iswa * llama_kv_cache_dsv4::get_raw() const {
