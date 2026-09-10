@@ -27,6 +27,10 @@ public:
         const llama_memory_i::layer_filter_cb & filter);
 
     void clear(llama_seq_id seq_id, bool data);
+
+    // fill the running state of `seq_id` with meaningless but plausible values, so that a
+    // synthetic depth does not leave the block scores degenerate. see seq_fill_synthetic()
+    void fill_rand(llama_seq_id seq_id);
     void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
     void apply_copies(const stream_copy_info & sc_info) const;
 
@@ -127,6 +131,8 @@ public:
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+
+    bool seq_fill_synthetic(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;

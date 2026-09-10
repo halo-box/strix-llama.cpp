@@ -157,6 +157,16 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_hybrid_idx::seq_fill_synthetic(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    bool res = llama_memory_hybrid::seq_fill_synthetic(seq_id, p0, p1);
+
+    if (mem_idx) {
+        res = mem_idx->seq_fill_synthetic(seq_id, p0, p1) && res;
+    }
+
+    return res;
+}
+
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 

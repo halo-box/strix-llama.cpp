@@ -34,6 +34,7 @@ options:
   -v, --verbose                             verbose output
   --progress                                print test progress indicators
   --no-warmup                               skip warmup runs before benchmarking
+  --depth-fill <real|fast>                  how to reach the -d depth (default: real)
   -fitt, --fit-target <MiB>                 fit model to device memory with this margin per device in MiB (default: off)
   -fitc, --fit-ctx <n>                      minimum ctx size for --fit-target (default: 4096)
   -rpc, --rpc <rpc_servers>                 register RPC devices (comma separated)
@@ -93,6 +94,17 @@ With the exception of `-r`, `-o` and `-v`, all options can be specified multiple
 Each test is repeated the number of times given by `-r`, and the results are averaged. The results are given in average tokens per second (t/s) and standard deviation. Some output formats (e.g. json) also include the individual results of each repetition.
 
 Using the `-d <n>` option, each test can be run at a specified context depth, prefilling the KV cache with `<n>` tokens.
+
+At large depths that prefill dominates the run time (a 200k-token depth can take tens of minutes before
+the first measurement). `--depth-fill fast` skips it: the KV cache is filled with synthetic data
+instead of being prefilled by the model. The cells, their positions and therefore the attention masks
+are the ones a real prefill would have produced, so the measured pp/tg work is the same, but the cell
+contents are meaningless - which also makes the output of the benchmarked decodes meaningless (it
+already is, since the depth is prefilled with random tokens).
+
+Rows measured this way are marked with a `*` after the depth (`pp512 @ d200000*`). Validate `fast`
+against `real` for a model before reporting numbers produced with it. A model whose memory type does
+not implement the synthetic fill prints a warning and falls back to a real prefill.
 
 For a description of the other options, see the [completion example](../completion/README.md).
 
