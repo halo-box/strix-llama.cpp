@@ -45,7 +45,7 @@ static bool try_binary_contiguous_f32(ggml_backend_cuda_context & ctx, ggml_tens
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-        src0->ne[0] != 2048 ||
+        (src0->ne[0] != 2048 && src0->ne[0] != 2560) ||
         !ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, dst) ||
         !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
         return false;

@@ -45,6 +45,56 @@ static __device__ __forceinline__ float op_relu(float x) {
     return fmaxf(x, 0);
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+static __device__ __forceinline__ float relu_sum4_add_rn(const float a, const float b) {
+    float result;
+    asm volatile("v_add_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+
+static __global__ void relu_sum4_f32(const float * src, float * dst, const int64_t nb, const int64_t nrows) {
+    const int64_t row = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+    const int64_t base = (row / nb) * (4 * nb) + row % nb;
+    float h[4];
+#pragma unroll
+    for (int head = 0; head < 4; ++head) {
+        // reduce_rows.cuh: sum_temp[0], then sum over eight sum_temp slots.
+        float u = relu_sum4_add_rn(0.0f, op_relu(src[base + head * nb]));
+        u = relu_sum4_add_rn(0.0f, u);
+#pragma unroll
+        for (int j = 0; j < 7; ++j) {
+            u = relu_sum4_add_rn(u, 0.0f);
+        }
+        // The 32-thread branch has zero partners at xor offsets 16, 8, 4.
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            u = relu_sum4_add_rn(u, 0.0f);
+        }
+        h[head] = u;
+    }
+    dst[row] = relu_sum4_add_rn(relu_sum4_add_rn(h[0], h[2]), relu_sum4_add_rn(h[1], h[3]));
+}
+
+void ggml_cuda_op_relu_sum4(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
+    const int64_t nrows = ggml_nelements(dst);
+    const uintptr_t in = reinterpret_cast<uintptr_t>(src->data);
+    const uintptr_t out = reinterpret_cast<uintptr_t>(dst->data);
+    const bool overlap = in <= out ? out - in < ggml_nbytes(src) : in - out < ggml_nbytes(dst);
+    // CONT can end the input lifetime before SUM_ROWS reuses its allocation.
+    ggml_cuda_pool_alloc<float> staged(ctx.pool());
+    float * result = overlap ? staged.alloc(nrows) : static_cast<float *>(dst->data);
+    constexpr int block_size = 256; // Initial launch size, not hardware-tuned.
+    const ggml_cuda_kernel_launch_params params((nrows + block_size - 1) / block_size, block_size, 0, ctx.stream());
+    ggml_cuda_kernel_launch(relu_sum4_f32, params, static_cast<const float *>(src->data), result, src->ne[0], nrows);
+    if (overlap) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, result, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+}
+#endif
+
 static __device__ __forceinline__ float op_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }

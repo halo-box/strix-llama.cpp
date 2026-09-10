@@ -669,7 +669,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // On RDNA3.5 the D=256 tile kernel is FMA-bound for prefill batches; the WMMA kernel with 64 columns is ~30-45% faster.
     // For smaller batches (ncols 16/32 configs) the tile kernel is still faster.
-    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] * gqa_ratio_eff > 32) {
+    // Without GQA reuse, queries alone can fill the tile; keep ALiBi on its existing fallback.
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && max_bias == 0.0f && Q->ne[0] == 256 && V->ne[0] == 256 &&
+            Q->ne[1] * (gqa_opt_applies ? gqa_ratio_eff : 1) > 32) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 

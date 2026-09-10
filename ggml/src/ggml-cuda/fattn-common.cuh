@@ -972,7 +972,72 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-template <int DV, int ncols1, int ncols2>
+#include "fattn-masked-qk-layout.h"
+
+#if defined(GGML_USE_HIP)
+// KV_max[a], Q finite[a], K finite[2*b], mask empty[a*b].
+static __global__ void masked_qk_q_finite(const char * q, int * flags, size_t nb1, size_t nb2, float scale,
+        int t, int * full_bound, int n) {
+    int valid = 1;
+    for (int i = threadIdx.x; i < 8*24*128; i += blockDim.x) {
+        const int row = blockIdx.x*8 + i/(24*128);
+        if (row >= t) { continue; } // The main kernel zero-pads Q, without reading it.
+        const float2 x = ((const float2 *) (q + row*nb1 + (i/128%24)*nb2))[i%128];
+        const half2 h = make_half2(scale, scale) * make_half2(x.x, x.y);
+        valid &= (__half_as_ushort(__low2half(h)) & 0x7c00) != 0x7c00;
+        valid &= (__half_as_ushort(__high2half(h)) & 0x7c00) != 0x7c00;
+    }
+    const int all_valid = __syncthreads_and(valid);
+    if (threadIdx.x == 0) {
+        flags[blockIdx.x] = all_valid;
+        if (full_bound) { full_bound[blockIdx.x] = n; }
+    }
+}
+
+static __global__ void masked_qk_k_finite(const char * k, int * flags, size_t nb1, size_t nb2, int b) {
+    int valid = 1;
+    for (int i = threadIdx.x; i < 32*256; i += blockDim.x) {
+        const auto * row = (const unsigned short *) (k + (blockIdx.x%b*32 + i/256)*nb1 + (blockIdx.x/b)*nb2);
+        valid &= (row[i%256] & 0x7c00) != 0x7c00;
+    }
+    const int all_valid = __syncthreads_and(valid);
+    if (threadIdx.x == 0) { flags[blockIdx.x] = all_valid; }
+}
+
+static __global__ void masked_qk_mask_empty(const unsigned short * mask, int * flags, int t, int n, int b) {
+    const int tile = blockIdx.x*8 + threadIdx.y;
+    int empty = 1;
+    for (int j = 0; j < 8; ++j) {
+        empty &= mask[((size_t(tile/b)*8 + j)%t)*n + tile%b*32 + threadIdx.x] == 0xfc00;
+    }
+    const int all_empty = __all(empty);
+    if (threadIdx.x == 0) { flags[tile] = all_empty; }
+}
+#endif
+
+static constexpr bool fattn_query_pieces_eligible(int64_t q, int64_t kv, int cc) {
+    return q == 2048 && (kv == 2048 || kv >= 32768) && masked_qk_flag_count(q, kv) != 0 &&
+        cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+}
+static_assert( fattn_query_pieces_eligible(2048, 66048, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert(!fattn_query_pieces_eligible(2047, 66048, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert(!fattn_query_pieces_eligible(2049, 66048, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert( fattn_query_pieces_eligible(2048, 32768, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert(!fattn_query_pieces_eligible(2048, 32512, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert(!fattn_query_pieces_eligible(2048, 32769, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert( fattn_query_pieces_eligible(2048, 65792, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert( fattn_query_pieces_eligible(2048, 66304, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert( fattn_query_pieces_eligible(2048, 130048, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert( fattn_query_pieces_eligible(2048, 1002240, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert( fattn_query_pieces_eligible(2048, 1050624, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert(!fattn_query_pieces_eligible(2048, INT64_MAX, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert( fattn_query_pieces_eligible(2048, 2048,  GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert(!fattn_query_pieces_eligible(2048, 2304,  GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert(!fattn_query_pieces_eligible(1,    66048, GGML_CUDA_CC_OFFSET_AMD + 0x1151));
+static_assert(!fattn_query_pieces_eligible(2048, 66048, GGML_CUDA_CC_OFFSET_AMD + 0x1150));
+static_assert(!fattn_query_pieces_eligible(2048, 66048, GGML_CUDA_CC_OFFSET_AMD + 0x942));
+
+template <int DV, int ncols1, int ncols2, bool masked_qk = false>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
@@ -1105,7 +1170,14 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (!use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    const bool scan_KV_max = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    if constexpr (masked_qk) {
+        const size_t count = masked_qk_flag_count(Q->ne[1], K->ne[1]);
+        GGML_ASSERT(count);
+        KV_max.alloc(count);
+    }
+    if (scan_KV_max) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1115,7 +1187,7 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
+        if constexpr (!masked_qk) { KV_max.alloc(ne_KV_max); }
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
@@ -1217,6 +1289,21 @@ void launch_fattn(
         scale /= logit_softcap;
     }
 
+#if defined(GGML_USE_HIP)
+    if constexpr (masked_qk) {
+        GGML_ASSERT(KV_max.ptr);
+        const int a = ntiles_x, b = K->ne[1]/32;
+        ggml_cuda_kernel_launch(masked_qk_q_finite, ggml_cuda_kernel_launch_params(dim3(a), dim3(256), 0, main_stream),
+            (const char *) Q->data, KV_max.ptr + a, Q->nb[1], Q->nb[2], scale,
+            int(Q->ne[1]), scan_KV_max ? nullptr : KV_max.ptr, int(K->ne[1]));
+        ggml_cuda_kernel_launch(masked_qk_k_finite, ggml_cuda_kernel_launch_params(dim3(2*b), dim3(256), 0, main_stream),
+            K_data, KV_max.ptr + 2*a, nb11, nb12, b);
+        ggml_cuda_kernel_launch(masked_qk_mask_empty, ggml_cuda_kernel_launch_params(dim3(a*b/8), dim3(32, 8), 0, main_stream),
+            (const unsigned short *) mask->data, KV_max.ptr + 2*a + 2*b, int(Q->ne[1]), int(K->ne[1]), b);
+        CUDA_CHECK(cudaGetLastError());
+    }
+#endif
+
     const uint32_t n_head      = Q->ne[2];
     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
 
@@ -1228,7 +1315,28 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
-        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+    dim3 main_blocks_num = blocks_num;
+#if defined(GGML_USE_HIP)
+    if constexpr (DV == 256 && ncols1 == 8 && ncols2 == 8) {
+        // Derive the physical grid from the current ranges, not a fixed context length.
+        // Keep the logical grid for partial allocation and fixup.
+        if ((masked_qk || K->ne[1] == 2048) &&
+            fattn_query_pieces_eligible(Q->ne[1], K->ne[1], cc) && stream_k && nbatch_fa == 32 &&
+            Q->ne[0] == 256 && Q->ne[2] == 24 && Q->ne[3] == 1 &&
+            K->ne[0] == 256 && K->ne[2] == 2 && K->ne[3] == 1 &&
+            !V_is_K_view && !sinks && max_bias == 0.0f && logit_softcap == 0.0f && scan_KV_max &&
+            block_dim.x == 32 && block_dim.y == 8 && block_dim.z == 1 && nbytes_shared == 51328 &&
+            blocks_num.x > 0 && blocks_num.y == 1 && blocks_num.z == 1) {
+            main_blocks_num.y = fattn_query_piece_count(ntiles_dst, ntiles_KV, blocks_num.x);
+        }
+    }
+#endif
+
+    // The masked path requires a singleton mask-head axis. Its unused stride
+    // can exceed int32 for long contexts; pass zero instead of narrowing it.
+    const size_t mask_head_stride = mask && !(masked_qk && mask->ne[2] == 1) ? mask->nb[2] : 0;
+
+        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(main_blocks_num, block_dim, nbytes_shared, main_stream);
         ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,
@@ -1242,7 +1350,7 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask_head_stride, mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
 
