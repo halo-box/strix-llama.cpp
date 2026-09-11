@@ -19,6 +19,10 @@
 #define CUDA_GLU_BLOCK_SIZE 256
 #define CUDA_XIELU_BLOCK_SIZE 256
 
+#if defined(__HIP_PLATFORM_AMD__)
+void ggml_cuda_op_relu_sum4(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst);
+#endif
+
 void ggml_cuda_op_abs(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_sgn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

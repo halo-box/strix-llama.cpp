@@ -29,6 +29,7 @@ const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // workgroup counts derive from neq1/neq2/neq3 and never from KV, so no indirect dispatch is
 // needed: only this loop bound changes. Folds away for every other pipeline.
 const bool DYNAMIC_KV       = (Flags & 16) != 0;
+const bool QUERY_HEAD_INTERLEAVE = (Flags & 32) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -195,6 +196,14 @@ void init_indices()
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
     iq2 = gl_WorkGroupID.y * gqa_ratio;
     iq3 = gl_WorkGroupID.z;
+
+    // Host enables this only for non-GQA, unsplit prefill. All original tile
+    // coordinates occur once; each retains the same KV loop and arithmetic.
+    if (QUERY_HEAD_INTERLEAVE) {
+        const uint32_t tile = gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.y;
+        i = tile / p.neq2;
+        iq2 = tile % p.neq2;
+    }
 
     // broadcast factors
     rk2 = p.neq2/p.nek2;

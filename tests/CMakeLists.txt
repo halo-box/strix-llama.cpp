@@ -1,5 +1,12 @@
 llama_add_compile_flags()
 
+if (GGML_VULKAN)
+    add_executable(test-vulkan-fa-order test-vulkan-fa-order.cpp)
+    target_link_libraries(test-vulkan-fa-order PRIVATE ggml)
+    add_test(NAME test-vulkan-fa-order COMMAND test-vulkan-fa-order)
+    set_tests_properties(test-vulkan-fa-order PROPERTIES LABELS "vulkan" TIMEOUT 120 SKIP_RETURN_CODE 77)
+endif()
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
@@ -298,6 +305,7 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+llama_build_and_test(test-flash-attn-reference.cpp)
 
 # the tensor API kernels come from a separate metallib - check they produce correct results
 # ref: https://github.com/ggml-org/llama.cpp/issues/27473

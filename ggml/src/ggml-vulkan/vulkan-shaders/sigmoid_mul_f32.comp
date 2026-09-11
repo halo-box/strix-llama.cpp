@@ -1,0 +1,28 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer A { float data_a[]; };
+layout(binding = 1, std430) readonly buffer B { float data_b[]; };
+layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+    uint a_offset;
+    uint b_offset;
+    uint d_offset;
+} pc;
+
+void main() {
+    const uint base = gl_WorkGroupID.x * 1024 + gl_LocalInvocationID.x;
+    for (uint lane = 0; lane < 4; ++lane) {
+        const uint i = base + lane * 256;
+        if (i < pc.n) {
+            const float a = data_a[pc.a_offset + i];
+            const float b = data_b[pc.b_offset + i];
+            precise float sigmoid = 1.0 / (1.0 + exp(-a));
+            precise float result = sigmoid * b;
+            data_d[pc.d_offset + i] = result;
+        }
+    }
+}

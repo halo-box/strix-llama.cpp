@@ -1407,6 +1407,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         const auto t_inputs_us = ggml_time_us();
 
+        // Integrated backends can read host inputs directly, even without pipeline parallelism.
+        // Finish their previous reads before overwriting masks or recurrent-state indices.
+        ggml_backend_sched_synchronize(sched.get());
+
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 

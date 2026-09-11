@@ -3784,6 +3784,47 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+#if defined(__HIP_PLATFORM_AMD__)
+    // Do not skip a fork/join or change stream assignment in the execution loop.
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_RELU &&
+        GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+        cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty() &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_UNARY, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_SUM_ROWS }, { i + 3 })) {
+        const ggml_tensor * src = node->src[0];
+        const ggml_tensor * perm = cgraph->nodes[i + 1];
+        const ggml_tensor * cont = cgraph->nodes[i + 2];
+        ggml_tensor * sum = cgraph->nodes[i + 3];
+        bool ok = src && perm->src[0] == node && cont->src[0] == perm && sum->src[0] == cont &&
+            node->view_src == nullptr && cont->view_src == nullptr && perm->view_src == node && perm->view_offs == 0;
+        for (const ggml_tensor * t : { src, static_cast<const ggml_tensor *>(node), perm, cont, static_cast<const ggml_tensor *>(sum) }) {
+            ok = ok && t && t->type == GGML_TYPE_F32 && t->data && t->buffer &&
+                t->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device);
+        }
+        for (const ggml_tensor * t : { static_cast<const ggml_tensor *>(node), perm, cont, static_cast<const ggml_tensor *>(sum) }) {
+            for (int j = 1; j < GGML_MAX_SRC; ++j) {
+                ok = ok && t->src[j] == nullptr;
+            }
+        }
+        if (ok) {
+            ok = src->ne[1] == 4 && ggml_are_same_shape(src, node) && ggml_is_contiguous(src) &&
+                ggml_is_contiguous(node) && ggml_is_contiguous(cont) && ggml_is_contiguous(sum);
+            const int axes[4] = { 1, 0, 2, 3 };
+            for (int d = 0; d < 4; ++d) {
+                ok = ok && ggml_get_op_params_i32(perm, d) == axes[d] &&
+                    perm->ne[d] == node->ne[axes[d]] && perm->nb[d] == node->nb[axes[d]] &&
+                    cont->ne[d] == perm->ne[d] && sum->ne[d] == (d == 0 ? 1 : cont->ne[d]);
+            }
+            const int nsm = ggml_cuda_info().devices[cuda_ctx->device].nsm;
+            // sumrows.cu uses 512 threads below this boundary; only reproduce its 32-thread branch.
+            ok = ok && nsm > 0 && ggml_nrows(cont) / nsm >= 2 && ggml_nelements(cont) <= INT_MAX;
+        }
+        if (ok) {
+            ggml_cuda_op_relu_sum4(*cuda_ctx, src, sum);
+            return 3;
+        }
+    }
+#endif
+
     // RDNA3.5 decode: consecutive single-column MUL_MATs that read the same activation vector (plain Q8_0/F32
     // matvecs, or a [mul_mat, mul_mat, glu] gate/up pair) are launched as one grouped kernel. The segments are
     // mutually independent, so the launch position of the first one is valid for all of them.
