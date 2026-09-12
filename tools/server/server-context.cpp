@@ -1808,8 +1808,8 @@ private:
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
+                // A replaced branch can share most of a tool schema and still need its own cached suffix.
+                if (ret->prompt.tokens.get_common_prefix(task.tokens) < ret->prompt.tokens.size()) {
                     update_cache = true;
                 }
             }
