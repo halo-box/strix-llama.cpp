@@ -306,9 +306,17 @@ static uint8_t rocmfpx_choose_scale_fp2_mse(
     }
 
     const float * weights = quant_weights ? mse_weights : NULL;
+
+    // The S40 codebook {-4, -1, +1, +4} has no zero code, so at any nonzero scale
+    // the smallest magnitude ROCmFP2 can emit is one scale step. A block that sits
+    // below half of the smallest UE4M3 scale is therefore encoded better by the
+    // zero scale than by e = 1, which would amplify every value. Seed the search
+    // with that candidate so scales 1..126 have to beat it; ties keep byte 0,
+    // matching the lower-byte rule the rest of the search uses.
+    uint8_t best_e = 0;
+    float best_err = rocmfpx_fp2_group_mse_for_scale(x, weights, n, 0, INFINITY);
+
     const uint8_t start_e = rocmfpx_nearest_scale_ue4m3(max_abs / 4.0f);
-    uint8_t best_e = start_e;
-    float best_err = INFINITY;
     bool lower_done = false;
 
     for (int delta = 0; delta <= 125; ++delta) {
@@ -682,6 +690,15 @@ static uint8_t rocmfpx_choose_scale_fp3_weighted_mse(const float * x, int n, con
     return rocmfpx_choose_scale_fp3_mse_impl(x, n, mse_weights, max_abs, max_abs_weight, all_finite);
 }
 
+// Round to the nearest integer inside [lo, hi], clamping *before* the conversion.
+// Converting first and clamping afterwards overflows int (and, for large enough
+// inputs, long) so an extreme finite weight could flip sign or collapse to zero.
+// For in-range values this is identical to rounding then clamping.
+static inline int rocmfpx_round_clamp(float v, float lo, float hi) {
+    const float c = v < lo ? lo : (v > hi ? hi : v);
+    return (int) lroundf(c);
+}
+
 static int rocmfpx_decode_fp6_code(uint8_t code) {
     const int mag = code & 31u;
     return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
@@ -692,12 +709,7 @@ static uint8_t rocmfpx_quantize_fp6_code(float x, float inv_scale) {
         return 0;
     }
 
-    int q = (int) lroundf(x * inv_scale);
-    if (q > 31) {
-        q = 31;
-    } else if (q < -32) {
-        q = -32;
-    }
+    const int q = rocmfpx_round_clamp(x * inv_scale, -32.0f, 31.0f);
 
     return q == 0 ? 0 : (uint8_t) (q < 0 ? (32u | ((uint8_t) -q & 31u)) : (uint8_t) q);
 }
@@ -706,14 +718,7 @@ static uint8_t rocmfpx_quantize_fp6_code(float x, float inv_scale) {
 // current main's asymmetric signed range [-32, 31], including the encoded -32
 // endpoint, rather than the older experimental branch's [-31, 31] behavior.
 static inline float rocmfpx_fp6_decoded_value(float x, float inv_scale) {
-    int q = (int) lroundf(x * inv_scale);
-    if (q > 31) {
-        q = 31;
-    } else if (q < -32) {
-        q = -32;
-    }
-
-    return (float) q;
+    return (float) rocmfpx_round_clamp(x * inv_scale, -32.0f, 31.0f);
 }
 
 static float rocmfpx_fp6_block_mse_for_scale(const float * x, int n, uint8_t e, float best_err) {
@@ -804,7 +809,11 @@ static uint8_t rocmfpx_choose_scale_fp6_mse_impl(
         const int e0 = (int) start_e - delta;
         if (!lower_done && e0 >= 1 && e0 <= 126) {
             const float scale = rocmfpx_scale_lookup((uint8_t) e0);
-            const float clip_delta = max_abs - 31.0f*scale;
+            // ROCmFP6 reaches -32, not just 31, so bound the unavoidable clipping
+            // error by 32: at 31 the bound is too pessimistic for a block whose
+            // largest magnitude is negative, and the search stops before reaching
+            // the scale that actually wins.
+            const float clip_delta = max_abs - 32.0f*scale;
             const float clip_err = mse_weights ? max_abs_weight*clip_delta*clip_delta : clip_delta*clip_delta;
             if (clip_delta > 0.0f && clip_err > best_err) {
                 lower_done = true;
@@ -878,14 +887,7 @@ static int8_t rocmfpx_quantize_fp8_code(float x, float inv_scale) {
         return 0;
     }
 
-    int q = (int) lroundf(x * inv_scale);
-    if (q > 127) {
-        q = 127;
-    } else if (q < -127) {
-        q = -127;
-    }
-
-    return (int8_t) q;
+    return (int8_t) rocmfpx_round_clamp(x * inv_scale, -127.0f, 127.0f);
 }
 
 static float rocmfpx_fp8_block_weighted_mse_for_scale(const float * x, int n, const float * mse_weights, uint8_t e, float best_err) {
