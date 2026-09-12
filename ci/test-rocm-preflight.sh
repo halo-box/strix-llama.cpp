@@ -75,8 +75,8 @@ function expect_fail {
     fi
 }
 
-preflight=(bash "${sd}/run.sh" --rocm-preflight)
-stub_env=(env PATH="${tmpdir}/bin:${PATH}")
+preflight=(/bin/bash "${sd}/run.sh" --rocm-preflight)
+stub_env=(env -i PATH="${tmpdir}/bin:/usr/bin:/bin")
 
 expect_pass "valid gfx1151 environment" \
     "${stub_env[@]}" HIP_LAUNCH_BLOCKING=1 GG_BUILD_AMDGPU_TARGETS='gfx1100;gfx1151' TEST_ROCMINFO_OUTPUT="${rocminfo_gfx1151}" \
@@ -95,11 +95,11 @@ expect_fail "missing gfx1151 agent" "rocminfo did not report a gfx1151 agent" \
     "${preflight[@]}"
 
 expect_fail "missing hipconfig command" "hipconfig was not found in PATH" \
-    env PATH="${tmpdir}/rocm-only" HIP_LAUNCH_BLOCKING=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 \
+    env -i PATH="${tmpdir}/rocm-only" HIP_LAUNCH_BLOCKING=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 \
     /bin/bash "${sd}/run.sh" --rocm-preflight
 
 expect_fail "missing rocminfo command" "rocminfo was not found in PATH" \
-    env PATH="${tmpdir}/hip-only" HIP_LAUNCH_BLOCKING=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 \
+    env -i PATH="${tmpdir}/hip-only" HIP_LAUNCH_BLOCKING=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 \
     /bin/bash "${sd}/run.sh" --rocm-preflight
 
 expect_fail "hipconfig command failure" "hipconfig --version exited with status 6" \
@@ -111,11 +111,11 @@ expect_fail "rocminfo command failure" "rocminfo exited with status 7" \
     "${preflight[@]}"
 
 expect_fail "generic ROCm target validation" "Missing GG_BUILD_AMDGPU_TARGETS" \
-    "${stub_env[@]}" GG_BUILD_ROCM=1 GG_BUILD_ROCM_STRIX_PREFLIGHT= HIP_LAUNCH_BLOCKING= \
-    bash "${sd}/run.sh" "${tmpdir}/results" "${tmpdir}/mnt"
+    "${stub_env[@]}" GG_BUILD_ROCM=1 \
+    /bin/bash "${sd}/run.sh" "${tmpdir}/results" "${tmpdir}/mnt"
 
 expect_fail "self-hosted opt-in before build" "HIP_LAUNCH_BLOCKING must be exactly 1" \
     "${stub_env[@]}" GG_BUILD_ROCM=1 GG_BUILD_ROCM_STRIX_PREFLIGHT=1 HIP_LAUNCH_BLOCKING=0 GG_BUILD_AMDGPU_TARGETS=gfx1151 \
-    bash "${sd}/run.sh" "${tmpdir}/results" "${tmpdir}/mnt"
+    /bin/bash "${sd}/run.sh" "${tmpdir}/results" "${tmpdir}/mnt"
 
 echo "ROCm preflight self-test passed (10 cases)"

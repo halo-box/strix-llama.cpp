@@ -15,6 +15,9 @@ bash ./ci/run.sh ./tmp/results ./tmp/mnt
 # with CUDA support
 GG_BUILD_CUDA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
+# with ROCm support
+GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1100 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+
 # with SYCL support
 source /opt/intel/oneapi/setvars.sh
 GG_BUILD_SYCL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
@@ -24,6 +27,8 @@ GG_BUILD_MUSA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 
 # etc.
 ```
+
+The Strix Halo self-hosted job also sets `GG_BUILD_ROCM_STRIX_PREFLIGHT=1`. This opt-in requires `HIP_LAUNCH_BLOCKING=1`, a `gfx1151` build target, and a working `gfx1151` agent reported by `rocminfo` before the ROCm build starts. Other ROCm runs do not use this device-specific check.
 
 # Adding self-hosted runners
 
