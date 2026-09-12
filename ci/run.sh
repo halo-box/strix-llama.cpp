@@ -13,6 +13,9 @@
 # # with ROCm support
 # GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
+# ROCm preflight only
+# HIP_LAUNCH_BLOCKING=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh --rocm-preflight
+#
 # # with SYCL support
 # GG_BUILD_SYCL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
@@ -37,6 +40,78 @@
 # with OPENVINO support
 # GG_BUILD_OPENVINO=1 GG_BUILD_LOW_PERF=1 GGML_OPENVINO_DEVICE=CPU bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
+
+function gg_rocm_preflight {
+    local targets="${GG_BUILD_AMDGPU_TARGETS:-}"
+    local rocminfo_output
+    local rocminfo_status
+    local hipconfig_output
+    local hipconfig_status
+    local hip_version
+    local runtime_version
+    local agent_name
+
+    echo ">>===== ROCm gfx1151 preflight"
+
+    if [ "${HIP_LAUNCH_BLOCKING:-}" != "1" ]; then
+        echo "ROCm preflight failed: HIP_LAUNCH_BLOCKING must be exactly 1 (got '${HIP_LAUNCH_BLOCKING:-<unset>}')."
+        return 1
+    fi
+
+    if [[ ! "${targets}" =~ (^|[[:space:],;])gfx1151($|[[:space:],;]) ]]; then
+        echo "ROCm preflight failed: GG_BUILD_AMDGPU_TARGETS must include gfx1151 (got '${targets:-<unset>}')."
+        return 1
+    fi
+
+    if ! command -v hipconfig >/dev/null 2>&1; then
+        echo "ROCm preflight failed: hipconfig was not found in PATH."
+        return 1
+    fi
+
+    hipconfig_output=$(hipconfig --version 2>&1)
+    hipconfig_status=$?
+    if [ ${hipconfig_status} -ne 0 ]; then
+        echo "ROCm preflight failed: hipconfig --version exited with status ${hipconfig_status}."
+        printf '%s\n' "${hipconfig_output}" | head -n 10
+        return 1
+    fi
+
+    if ! command -v rocminfo >/dev/null 2>&1; then
+        echo "ROCm preflight failed: rocminfo was not found in PATH."
+        return 1
+    fi
+
+    rocminfo_output=$(rocminfo 2>&1)
+    rocminfo_status=$?
+    if [ ${rocminfo_status} -ne 0 ]; then
+        echo "ROCm preflight failed: rocminfo exited with status ${rocminfo_status}."
+        printf '%s\n' "${rocminfo_output}" | head -n 10
+        return 1
+    fi
+
+    if ! printf '%s\n' "${rocminfo_output}" | grep -Eq '^[[:space:]]*Name:[[:space:]]*gfx1151([[:space:]:]|$)'; then
+        echo "ROCm preflight failed: rocminfo did not report a gfx1151 agent."
+        echo "rocminfo agent names:"
+        printf '%s\n' "${rocminfo_output}" | grep -E '^[[:space:]]*Name:' | head -n 20
+        return 1
+    fi
+
+    hip_version=$(printf '%s\n' "${hipconfig_output}" | head -n 1)
+    runtime_version=$(printf '%s\n' "${rocminfo_output}" | grep -E '^[[:space:]]*Runtime Version:' | head -n 1 | sed -E 's/^[[:space:]]*//')
+    agent_name=$(printf '%s\n' "${rocminfo_output}" | grep -E '^[[:space:]]*Name:[[:space:]]*gfx1151([[:space:]:]|$)' | head -n 1 | sed -E 's/^[[:space:]]*//; s/[[:space:]]+$//')
+
+    echo "ROCm preflight passed:"
+    echo "  HIP_LAUNCH_BLOCKING=1"
+    echo "  GG_BUILD_AMDGPU_TARGETS=${targets}"
+    echo "  HIP version: ${hip_version:-unavailable}"
+    echo "  ${runtime_version:-Runtime Version: unavailable}"
+    echo "  ${agent_name}"
+}
+
+if [ "${1:-}" = "--rocm-preflight" ]; then
+    gg_rocm_preflight
+    exit $?
+fi
 
 if [ -z "$2" ]; then
     echo "usage: $0 <output-dir> <mnt-dir>"
@@ -100,6 +175,10 @@ if [ ! -z ${GG_BUILD_CUDA} ]; then
 fi
 
 if [ ! -z ${GG_BUILD_ROCM} ]; then
+    if [ "${GG_BUILD_ROCM_STRIX_PREFLIGHT:-}" = "1" ]; then
+        gg_rocm_preflight || exit 1
+    fi
+
     CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang -DGGML_HIP=ON"
     if [ -z ${GG_BUILD_AMDGPU_TARGETS} ]; then
         echo "Missing GG_BUILD_AMDGPU_TARGETS, please set it to your GPU architecture (e.g. gfx90a, gfx1100, etc.)"

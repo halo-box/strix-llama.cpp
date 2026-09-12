@@ -7,6 +7,8 @@ on:
       - master
     paths: [
       '.github/workflows/build-self-hosted.yml',
+      'ci/run.sh',
+      'ci/test-rocm-preflight.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
@@ -28,6 +30,8 @@ on:
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/build-self-hosted.yml',
+      'ci/run.sh',
+      'ci/test-rocm-preflight.sh',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
@@ -88,8 +92,9 @@ jobs:
         # restores correctness. Remove once the underlying ROCm/HIP issue is fixed.
         env:
           HIP_LAUNCH_BLOCKING: "1"
+          GG_BUILD_ROCM_STRIX_PREFLIGHT: "1"
         run: |
-          rocminfo
+          bash ./ci/test-rocm-preflight.sh
           GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
   gpu-vulkan-nvidia-cm:
