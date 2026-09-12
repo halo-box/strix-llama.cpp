@@ -373,6 +373,7 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             depth_fill_fast;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -418,6 +419,7 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* depth_fill_fast      */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -437,6 +439,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --depth-fill <real|fast>                    how to reach the -d depth (default: real)\n");
+    printf("                                              fast: fill the KV cache without running the model\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -536,6 +540,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.depth_fill_fast      = cmd_params_defaults.depth_fill_fast;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1082,6 +1087,19 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
+            } else if (arg == "--depth-fill") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                if (std::string(argv[i]) == "real") {
+                    params.depth_fill_fast = false;
+                } else if (std::string(argv[i]) == "fast") {
+                    params.depth_fill_fast = true;
+                } else {
+                    invalid_param = true;
+                    break;
+                }
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1524,6 +1542,7 @@ struct test {
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
+    bool                     depth_synthetic = false;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
 
@@ -2097,7 +2116,9 @@ struct markdown_printer : public printer {
                 }
                 if (t.n_depth > 0) {
                     int len = strlen(buf);
-                    snprintf(buf + len, sizeof(buf) - len, " @ d%d", t.n_depth);
+                    // the trailing '*' marks a depth that was not reached by running the model
+                    snprintf(buf + len, sizeof(buf) - len, " @ d%d%s", t.n_depth,
+                             t.depth_synthetic ? "*" : "");
                 }
                 value = buf;
             } else if (field == "t/s") {
@@ -2166,6 +2187,8 @@ struct sql_printer : public printer {
 
 struct ctx_state {
     int depth = 0; // in tokens
+
+    bool synthetic = false;
 
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
@@ -2268,6 +2291,12 @@ int llama_bench(int argc, char ** argv) {
     ggml_backend_load_all();
 
     cmd_params params = parse_cmd_params(argc, argv);
+
+    if (params.depth_fill_fast) {
+        fprintf(stderr, "warning: --depth-fill fast: the KV cache at -d is filled with synthetic data instead of\n");
+        fprintf(stderr, "warning: being prefilled by the model. affected results are marked with '*' - compare them\n");
+        fprintf(stderr, "warning: against --depth-fill real before reporting them anywhere\n");
+    }
 
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
@@ -2437,22 +2466,50 @@ int llama_bench(int argc, char ** argv) {
             }
         }
 
+        bool try_synthetic = params.depth_fill_fast;
+
         for (int i = 0; i < params.reps; i++) {
             llama_memory_clear(llama_get_memory(ctx), false);
 
             if (t.n_depth > 0) {
-                bool is_cached = t.n_depth == cstate.depth;
+                bool have_depth = false;
 
-                if (is_cached) {
-                    // if previously we have computed at this depth, just restore the state
-                    const size_t ret = llama_state_seq_set_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
-                    if (ret == 0) {
-                        // if the old state is incompatible with the current context - reprocess from scratch
-                        is_cached = false;
+                if (t.n_depth == cstate.depth) {
+                    // if the old state is incompatible with the current context - reprocess from scratch
+                    have_depth = llama_state_seq_set_data(ctx, cstate.buf.data(), cstate.buf.size(), 0) != 0;
+
+                    if (have_depth) {
+                        t.depth_synthetic = cstate.synthetic;
+
+                        if (params.progress) {
+                            fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (cached)\n", params_idx, params_count,
+                                    i + 1, params.reps);
+                        }
+                    } else {
+                        cstate.depth = 0;
                     }
                 }
 
-                if (!is_cached) {
+                if (!have_depth && try_synthetic) {
+                    have_depth = llama_memory_seq_fill_synthetic(llama_get_memory(ctx), 0, 0, t.n_depth);
+
+                    if (have_depth) {
+                        t.depth_synthetic = true;
+
+                        if (params.progress) {
+                            fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (synthetic)\n",
+                                    params_idx, params_count, i + 1, params.reps);
+                        }
+                    } else {
+                        try_synthetic = false;
+
+                        fprintf(stderr,
+                                "%s: warning: synthetic depth fill is not supported for this model, prefilling instead\n",
+                                __func__);
+                    }
+                }
+
+                if (!have_depth) {
                     if (params.progress) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
@@ -2464,16 +2521,14 @@ int llama_bench(int argc, char ** argv) {
                         llama_model_free(lmodel);
                         exit(1);
                     }
+                }
 
+                if (t.n_depth != cstate.depth) {
                     // store the context state for reuse in later runs
-                    cstate.depth = t.n_depth;
+                    cstate.depth     = t.n_depth;
+                    cstate.synthetic = t.depth_synthetic;
                     cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
                     llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
-                } else {
-                    if (params.progress) {
-                        fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (cached)\n", params_idx, params_count,
-                                i + 1, params.reps);
-                    }
                 }
             }
 

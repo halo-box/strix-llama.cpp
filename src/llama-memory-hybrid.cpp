@@ -169,6 +169,15 @@ void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
     mem_recr->seq_div(seq_id, p0, p1, d);
 }
 
+bool llama_memory_hybrid::seq_fill_synthetic(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    bool res = true;
+
+    res = mem_attn->seq_fill_synthetic(seq_id, p0, p1) && res;
+    res = mem_recr->seq_fill_synthetic(seq_id, p0, p1) && res;
+
+    return res;
+}
+
 llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
     // the min of the total cache is the max of the two caches' min values
     return std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));

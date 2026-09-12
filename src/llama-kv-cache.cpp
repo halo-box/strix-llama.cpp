@@ -699,6 +699,198 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     }
 }
 
+bool llama_kv_cache::seq_fill_synthetic(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        // a cache that mirrors another one does not own the cells it holds
+        return false;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    if (p0 < 0) {
+        p0 = 0;
+    }
+
+    if (p1 <= p0) {
+        return true;
+    }
+
+    // keep the positions a real prefill would leave: a SWA cache its window, any other the whole
+    // range - the same filter state_write() uses
+    llama_pos p_beg = p0;
+
+    if (swa_type != LLAMA_SWA_TYPE_NONE) {
+        for (llama_pos p = p1 - 1; p >= p0; --p) {
+            if (llama_hparams::is_masked_swa(n_swa, swa_type, p, p1 - 1)) {
+                break;
+            }
+
+            p_beg = p;
+        }
+    }
+
+    const uint32_t strm    = seq_to_stream[seq_id];
+    const uint32_t n_cells = (uint32_t) (p1 - p_beg);
+
+    if (n_cells > v_cells[strm].size()) {
+        LLAMA_LOG_ERROR("%s: cannot hold %u cells, the cache has %u\n", __func__, n_cells, v_cells[strm].size());
+        return false;
+    }
+
+    // claim the cells the way a state restore does: same positions, same layout, same masks as a
+    // real prefill of [p0, p1)
+    seq_rm(seq_id, -1, -1);
+
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+
+    llama_ubatch ubatch = balloc.ubatch_reserve(n_cells, 1);
+
+    ubatch.seq_id_unq[0] = seq_id;
+
+    for (uint32_t i = 0; i < n_cells; ++i) {
+        const llama_pos pos = p_beg + (llama_pos) i;
+
+        ubatch.token   [i] = 0;
+        ubatch.pos     [i] = pos;
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id  [i] = &seq_id;
+
+        if (hparams.n_pos_per_embd() > 1) {
+            // no image tokens here: every position dimension carries the sequential position
+            ubatch.pos[i + ubatch.n_tokens]   = pos;
+            ubatch.pos[i + ubatch.n_tokens*2] = pos;
+        }
+    }
+
+    const slot_info sinfo = find_slot(ubatch, true);
+    if (sinfo.empty()) {
+        LLAMA_LOG_ERROR("%s: failed to find %u available cells\n", __func__, n_cells);
+        return false;
+    }
+
+    apply_ubatch(sinfo, ubatch);
+
+    fill_rows_rand(strm, sinfo.head(), sinfo.head() + n_cells);
+
+    return true;
+}
+
+// how much random data the filler makes before it repeats: the distinct K/V rows a fill holds
+static size_t llama_kv_fill_tile(size_t size) {
+    return std::min<size_t>(size, 128ull*1024*1024);
+}
+
+void llama_kv_rand_fill::fill(ggml_tensor * t, size_t offset, size_t size) {
+    if (!t || !t->buffer || size == 0) {
+        return;
+    }
+
+    if (offset + size > ggml_nbytes(t)) {
+        return;
+    }
+
+    const size_t ts  = ggml_type_size(t->type);
+    const size_t bs  = ggml_blck_size(t->type);
+
+    if (size % ts != 0) {
+        // not a whole number of blocks - leave the range as it is rather than write garbage
+        return;
+    }
+
+    // one block of random data, repeated over the range: one conversion per type, not per row
+    const size_t n_bytes = llama_kv_fill_tile(size)/ts*ts;
+
+    // a tile that covers the whole range has nothing to repeat, so regenerate it per tensor
+    if (type != t->type || buf.size() < n_bytes || n_bytes == size) {
+        type = t->type;
+
+        const auto * traits = ggml_get_type_traits(type);
+
+        if (type != GGML_TYPE_F32 && !traits->from_float_ref) {
+            buf.clear();
+            type = GGML_TYPE_COUNT;
+            return;
+        }
+
+        buf.resize(n_bytes);
+
+        // convert one chunk at a time, so the float staging stays small whatever the tile size
+        const size_t chunk = std::max<size_t>(ts, 1024*1024/ts*ts);
+
+        for (size_t done = 0; done < n_bytes; done += chunk) {
+            const size_t n  = std::min(chunk, n_bytes - done);
+            const size_t ne = n/ts*bs;
+
+            src.resize(ne);
+
+            for (size_t i = 0; i < ne; ++i) {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+
+                src[i] = (float) (rng >> 8)/(float) (1u << 23) - 1.0f; // [-1, 1)
+            }
+
+            if (type == GGML_TYPE_F32) {
+                memcpy(buf.data() + done, src.data(), n);
+            } else {
+                traits->from_float_ref(src.data(), buf.data() + done, ne);
+            }
+        }
+    }
+
+    for (size_t done = 0; done < size; done += buf.size()) {
+        const size_t n = std::min(buf.size(), size - done);
+
+        ggml_backend_tensor_set(t, buf.data(), offset + done, n);
+    }
+}
+
+void llama_kv_cache::fill_rows_rand(uint32_t strm, uint32_t r0, uint32_t r1) {
+    r1 = std::min(r1, get_size());
+
+    if (r0 >= r1) {
+        return;
+    }
+
+    llama_kv_rand_fill filler;
+
+    for (const auto & layer : layers) {
+        if (strm >= layer.k_stream.size()) {
+            continue;
+        }
+
+        ggml_tensor * k = layer.k_stream[strm];
+        ggml_tensor * v = layer.v_stream[strm];
+
+        // K, and V when it is stored row-major: a cell is one contiguous row
+        for (ggml_tensor * t : { k, v_trans ? nullptr : v }) {
+            if (!t || !t->buffer) {
+                continue;
+            }
+
+            const size_t row_size = ggml_row_size(t->type, t->ne[0]);
+
+            if (t->nb[1] != row_size) {
+                // padded layout we do not know how to write - leave these rows alone
+                continue;
+            }
+
+            filler.fill(t, (size_t) r0*row_size, (size_t) (r1 - r0)*row_size);
+        }
+
+        // V column-major (no flash attention): [kv_size, n_embd_v_gqa], as in state_read_data()
+        if (v_trans && v && v->buffer && !ggml_is_quantized(v->type)) {
+            const size_t ts = ggml_type_size(v->type);
+
+            for (int64_t j = 0; j < v->ne[0]; ++j) {
+                filler.fill(v, ((size_t) r0 + (size_t) j*get_size())*ts, (size_t) (r1 - r0)*ts);
+            }
+        }
+    }
+}
+
 llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

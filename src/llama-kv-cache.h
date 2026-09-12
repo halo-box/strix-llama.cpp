@@ -17,6 +17,21 @@ struct llama_context;
 // llama_kv_cache
 //
 
+// pseudo-random, type-correct filler for KV-cache tensors. the values only have to be finite and
+// of a plausible magnitude - no NaNs, no denormals. see llama_memory_seq_fill_synthetic()
+class llama_kv_rand_fill {
+public:
+    // offset and size must be whole blocks of t's type
+    void fill(ggml_tensor * t, size_t offset, size_t size);
+
+private:
+    uint32_t  rng  = 0x9e3779b9u;
+    ggml_type type = GGML_TYPE_COUNT;
+
+    std::vector<float>   src; // random floats
+    std::vector<uint8_t> buf; // the same data converted to `type`, repeated over the target range
+};
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -141,6 +156,8 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    bool seq_fill_synthetic(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
@@ -196,6 +213,10 @@ public:
     // otherwise depend on whatever the masked-out cells last held.
     void zero_rows(uint32_t strm, uint32_t r0, uint32_t r1);
     void zero_idxs(uint32_t strm, const std::vector<uint32_t> & idxs);   // ascending cell indices
+
+    // fill the K and V rows [r0, r1) of stream strm in every layer. see seq_fill_synthetic()
+    // note: also used to materialize the block rows of the DSV4 compressed caches
+    void fill_rows_rand(uint32_t strm, uint32_t r0, uint32_t r1);
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;

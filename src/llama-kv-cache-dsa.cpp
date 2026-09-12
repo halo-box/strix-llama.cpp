@@ -90,6 +90,15 @@ void llama_kv_cache_dsa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     kv_lid->seq_div(seq_id, p0, p1, d);
 }
 
+bool llama_kv_cache_dsa::seq_fill_synthetic(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    bool res = true;
+
+    res = kv_mla->seq_fill_synthetic(seq_id, p0, p1) && res;
+    res = kv_lid->seq_fill_synthetic(seq_id, p0, p1) && res;
+
+    return res;
+}
+
 llama_pos llama_kv_cache_dsa::seq_pos_min(llama_seq_id seq_id) const {
     return kv_mla->seq_pos_min(seq_id);
 }
