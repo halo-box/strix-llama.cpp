@@ -360,14 +360,14 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 // - save the seq 1 state, free the interleaved seq 0 cells, and restore via the given io path
 // - the restore destination is non-contiguous: scatter reads are batched per contiguous run
 // - save again on the host and compare the two blobs byte for byte
-static bool test_seq_cp_scatter(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, int test_num, bool on_device) {
+static bool test_seq_cp_scatter(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, int test_num, bool on_device, bool compact = false) {
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_ctx      = 256;
     params_ctx.n_seq_max  = 2;
     params_ctx.kv_unified = true;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
 
-    LOG("\n=== Test %d: seq copy (%s, scatter) ===\n", test_num, on_device ? "device" : "host");
+    LOG("\n=== Test %d: seq copy (%s, %s) ===\n", test_num, on_device ? "device" : "host", compact ? "scatter to compact" : "scatter");
 
     const uint32_t flags = on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE;
 
@@ -423,6 +423,11 @@ static bool test_seq_cp_scatter(struct llama_model * model, const struct common_
     if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, -1, -1)) {
         LOG_ERR("%s: failed to remove sequence 0\n", __func__);
         return false;
+    }
+
+    if (compact) {
+        // Saved ranges [2, 1] must restore into one contiguous range, including quantized KV blocks.
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
     }
 
     // restore via the io path under test
@@ -508,7 +513,7 @@ static bool test_state_roundtrip(struct llama_model * model, const struct common
 }
 
 
-// Run the full save/load test suite (tests 1-8) for a single model.
+// Run the full save/load test suite (tests 1-9) for a single model.
 // Returns true if all tests pass, false otherwise.
 static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     struct common_params params = base_params;
@@ -587,6 +592,11 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
 
     // Test 8: state blob round-trip
     if (!test_state_roundtrip(model, params, tokens)) {
+        return false;
+    }
+
+    // Test 9: on-device restore with different source and destination chunking.
+    if (!test_seq_cp_scatter(model, params, tokens, 9, true, true)) {
         return false;
     }
 
