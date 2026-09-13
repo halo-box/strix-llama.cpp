@@ -2679,6 +2679,9 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    // the fused top-k's output tensor aliases one of its sources (ggml-alloc reuses the freed
+    // intermediates); write the result to scratch and copy it out instead of dropping the fusion
+    bool fused_topk_qsa_out_scratch {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -16619,8 +16622,12 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_pipeline pipeline = ctx->device->pipeline_topk_radix_qsa;
     GGML_ASSERT(pipeline != nullptr);
 
-    // scratch holds the gathered+masked input, materialized once and reused across passes
-    const size_t scratch_size = size_t{ n_kv } * nrows * sizeof(float);
+    // scratch holds the gathered+masked input, materialized once and reused across passes;
+    // when the output aliases a source it also holds the result, copied to top_k afterwards
+    const size_t gather_size = size_t{ n_kv } * nrows * sizeof(float);
+    const size_t out_off     = (gather_size + 255) & ~size_t{ 255 };
+    const size_t out_size    = size_t{ width } * nrows * sizeof(int32_t);
+    const size_t scratch_size = ctx->fused_topk_qsa_out_scratch ? out_off + out_size : gather_size;
     if (ctx->prealloc_size_x < scratch_size) {
         ctx->prealloc_size_x = scratch_size;
         ggml_vk_preallocate_buffers(ctx, subctx);
@@ -16635,12 +16642,18 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
         1,
     };
-    vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
+    vk_subbuffer scratch_buf { ctx->prealloc_x, 0, gather_size };
+    vk_subbuffer dst_buf     = ggml_vk_tensor_subbuffer(ctx, top_k);
+    vk_subbuffer out_buf     = ctx->fused_topk_qsa_out_scratch ? vk_subbuffer{ ctx->prealloc_x, out_off, out_size } : dst_buf;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
+        { ggml_vk_tensor_subbuffer(ctx, scores), out_buf,
           ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
           scratch_buf }, pc, elements);
+    if (ctx->fused_topk_qsa_out_scratch) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_buffer_copy_async(subctx, dst_buf.buffer, dst_buf.offset, ctx->prealloc_x, out_off, out_size);
+    }
     ctx->prealloc_x_need_sync = true;
 }
 
@@ -20369,6 +20382,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+                ctx->fused_topk_qsa_out_scratch = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -20596,6 +20610,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     }
                 }
             }
+            static const bool topk_qsa_scratch_ok = !(getenv("GGML_VK_TOPK_QSA_SCRATCH") && atoi(getenv("GGML_VK_TOPK_QSA_SCRATCH")) == 0);
+            if (need_disable && ctx->fused_topk_qsa && topk_qsa_scratch_ok) {
+                // The fused kernel writes only top_k, and every workgroup reads all of scores
+                // through the gather, so an aliased output is a real hazard. But the alias is an
+                // allocator artefact (top_k lands on the freed cont/cast intermediates once they
+                // are big enough), and dropping the fusion costs the whole unfused chain: at 49k
+                // context that was a 36 ms transpose + cast + add + top-k per 2048-token ubatch
+                // (2026-09-13 perflog). Route the output through scratch and copy it out instead.
+                ctx->fused_topk_qsa_out_scratch = true;
+                fusion_string = "TOPK_QSA_SCRATCH";
+                need_disable = false;
+            }
             if (need_disable) {
                 ctx->num_additional_fused_ops = 0;
                 ctx->fused_ops_write_mask = 1;
@@ -20604,6 +20630,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
+                ctx->fused_topk_qsa_out_scratch = false;
             }
         }
 
