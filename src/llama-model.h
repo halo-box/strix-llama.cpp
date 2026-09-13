@@ -660,6 +660,12 @@ struct llama_model {
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
+    // MTP draft vocabulary: row subset of `output` and the token id of each row (I64). Built by the first MTP context.
+    mutable struct ggml_tensor * mtp_draft_head = nullptr;
+    mutable struct ggml_tensor * mtp_draft_ids  = nullptr;
+    mutable ggml_context_ptr        mtp_draft_ctx;
+    mutable ggml_backend_buffer_ptr mtp_draft_buf;
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;

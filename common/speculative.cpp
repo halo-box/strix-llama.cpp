@@ -2659,7 +2659,8 @@ common_speculative_init_result::common_speculative_init_result(
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
-        cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.mtp_draft_vocab = params.speculative.draft.mtp_vocab;
     }
 
     // the draft context holds as many tokens per sequence as the target context
