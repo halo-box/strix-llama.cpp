@@ -2550,6 +2550,19 @@ class vk_perf_logger {
                 " (" << node->src[0]->ne[0] << "," << node->src[0]->ne[1] << "," << node->src[0]->ne[2] << "," << node->src[0]->ne[3] << ")";
             return name.str();
         }
+        switch (node->op) {
+        case GGML_OP_CONT: case GGML_OP_CPY: case GGML_OP_DUP: case GGML_OP_REPEAT:
+        case GGML_OP_GET_ROWS: case GGML_OP_SET_ROWS: case GGML_OP_ADD: case GGML_OP_MUL:
+        case GGML_OP_SCALE: case GGML_OP_FILL: case GGML_OP_CONCAT: case GGML_OP_UNARY: {
+            // shape so that a CONT or ADD bucket can be traced back to its graph site
+            std::string name = ggml_op_name(node->op);
+            name += "(" + std::to_string(node->ne[0]) + "," + std::to_string(node->ne[1]) + "," +
+                    std::to_string(node->ne[2]) + "," + std::to_string(node->ne[3]) + ")";
+            return fusion_str + name;
+        }
+        default:
+            break;
+        }
         return fusion_str + ggml_op_name(node->op);
     }
 
