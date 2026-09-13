@@ -32,6 +32,10 @@ const bool DYNAMIC_KV       = (Flags & 16) != 0;
 // V is supplied transposed per head ([HSV][KV], kv contiguous) so the coopmat1 P x V B-operand
 // fragment is a contiguous 32-byte run per lane instead of 16 kv-strided halves (2026-09-13)
 const bool V_TRANSPOSED     = (Flags & 32) != 0;
+// keep the O tile in coopmat accumulators across the KV loop (no per-block LDS round trip); the
+// per-query rescale indexes the accumulator elements by the gfx11 wave64 layout (lane L holds
+// column L%16, rows L/16 + 4i), so the host enables it on RADV RDNA3 only (2026-09-13)
+const bool O_IN_REGS        = (Flags & 64) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

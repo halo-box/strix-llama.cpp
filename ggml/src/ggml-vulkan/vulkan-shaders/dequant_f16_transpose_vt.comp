@@ -6,27 +6,53 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer A {float16_t data_a[];};
+layout (binding = 0) readonly buffer A {f16vec4 data_a[];};
 layout (binding = 1) writeonly buffer D {f16vec4 data_b[];};
 
-// V -> V^T per head for the coopmat1 FA (V_TRANSPOSED): source V[ns=1][nh][kv][hs] with element
-// strides p.stride_a (kv) and p.stride_b (head), hs contiguous; dest [nh][hs][kv] tightly packed
-// (p.M = HS, p.K = NH, kv count = p.nel / (HS * NH)). Each invocation writes 8 consecutive kv of
-// one (nh, hs): one coalesced 16-byte store fed by 8 kv-strided 2-byte loads.
+// V -> V^T per head for the coopmat1 FA (V_TRANSPOSED): source V[nh][kv][hs] with element strides
+// p.stride_a (kv) and p.stride_b (head), hs contiguous; dest [nh][hs][kv] tightly packed
+// (p.M = HS, p.K = dest row stride | NH << 20, kv count = p.nel / (HS * NH)). The dest row stride is
+// KV plus a pad: a stride that is a multiple of 4 KB puts every hd row of a fragment on the same
+// memory channel (16 channels x 256 B). One workgroup transposes a 64 kv x 64 hs tile
+// through LDS so both the reads and the writes are 128-byte coalesced runs (the first version did
+// 2-byte gathers and cost more than the FA kernel gained at depth). Host gate: KV % 64 == 0, HS % 64 == 0.
+shared uint16_t tile[64][65];   // [kv][hs], padded to spread the transposed reads over the banks
+
 void main() {
-    const uint i = gl_GlobalInvocationID.x;
-    const uint d0 = i * 8;
-    if (d0 >= p.nel) {
+    const uint HS = p.M, NH = p.K >> 20, KVs = p.K & 0xFFFFF;
+    const uint KVn = p.nel / (HS * NH);
+    const uint tiles_kv = KVn / 64;
+    const uint tiles_hs = HS / 64;
+    const uint t = gl_WorkGroupID.x;
+    const uint nh  = t / (tiles_kv * tiles_hs);
+    const uint rem = t % (tiles_kv * tiles_hs);
+    const uint tkv = rem / tiles_hs;
+    const uint ths = rem % tiles_hs;
+    if (nh >= NH) {
         return;
     }
-    const uint HS = p.M, NH = p.K;
-    const uint KVn = p.nel / (HS * NH);
-    const uint kv0 = d0 % KVn;
-    const uint hs  = (d0 / KVn) % HS;
-    const uint nh  = d0 / (KVn * HS);
-    const uint src = nh * p.stride_b + kv0 * p.stride_a + hs;
-    f16vec4 lo = f16vec4(data_a[src], data_a[src + p.stride_a], data_a[src + 2 * p.stride_a], data_a[src + 3 * p.stride_a]);
-    f16vec4 hi = f16vec4(data_a[src + 4 * p.stride_a], data_a[src + 5 * p.stride_a], data_a[src + 6 * p.stride_a], data_a[src + 7 * p.stride_a]);
-    data_b[d0 / 4]     = lo;
-    data_b[d0 / 4 + 1] = hi;
+    const uint tid = gl_LocalInvocationID.x;
+    // read: 64 rows x 64 hs = 64 rows x 16 f16vec4; 256 threads -> 4 passes, 16 threads per row
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint idx = i * 256 + tid;
+        const uint r = idx / 16;          // kv row within the tile
+        const uint c = idx % 16;          // f16vec4 column within the tile
+        const uint src = (nh * p.stride_b + (tkv * 64 + r) * p.stride_a + ths * 64) / 4 + c;
+        const f16vec4 v = data_a[src];
+        tile[r][4 * c + 0] = float16BitsToUint16(v.x);
+        tile[r][4 * c + 1] = float16BitsToUint16(v.y);
+        tile[r][4 * c + 2] = float16BitsToUint16(v.z);
+        tile[r][4 * c + 3] = float16BitsToUint16(v.w);
+    }
+    barrier();
+    // write: 64 hs rows x 64 kv = 64 rows x 16 f16vec4
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        const uint idx = i * 256 + tid;
+        const uint h = idx / 16;          // hs row of V^T within the tile
+        const uint c = idx % 16;          // f16vec4 column (kv) within the tile
+        const f16vec4 v = f16vec4(uint16BitsToFloat16(tile[4 * c + 0][h]), uint16BitsToFloat16(tile[4 * c + 1][h]),
+                                  uint16BitsToFloat16(tile[4 * c + 2][h]), uint16BitsToFloat16(tile[4 * c + 3][h]));
+        const uint dst = (nh * HS * KVs + (ths * 64 + h) * KVs + tkv * 64) / 4 + c;
+        data_b[dst] = v;
+    }
 }

@@ -60,6 +60,7 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
 // dword view of A for the 8-wide loaders (block sizes 210 / 110 bytes: only 2-byte aligned, so the
 // loaders fetch whole dwords and shift; see mul_mm_funcs.glsl)
 layout (binding = 0) readonly buffer A_U32 {uint data_a_u32[];};
+layout (binding = 0) readonly buffer A_U16 {uint16_t data_a_u16[];};
 #endif
 #endif
 #if defined(A_TYPE_PACKED32)

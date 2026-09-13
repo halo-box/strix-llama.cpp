@@ -39,6 +39,8 @@ layout (binding = 2) readonly buffer V {FLOAT_TYPE data_v[];};
 layout (binding = 2) readonly buffer VV4 {FLOAT_TYPEV4 data_vv4[];};
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 
+shared float eMsh[16];   // O_IN_REGS: per-query rescale factors of the current KV block (Br <= 16 on this path)
+
 shared float tmpsh[row_split];
 
 const uint32_t qstride = HSK_pad / 4 + 2;
@@ -153,6 +155,13 @@ void main() {
     uint32_t mask_opt_bits = 0;
     f16vec4 mask_cache[Bc * Br / 4 / WorkGroupSize];
 
+    // O_IN_REGS: one accumulator per hsv tile of this subgroup, [Br queries x 16 hd], kept across the KV loop
+    const uint o_num_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split);
+    coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> OAcc[o_num_tiles];
+    [[unroll]] for (uint32_t t = 0; t < o_num_tiles; ++t) {
+        OAcc[t] = coopmat<O_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+    }
+
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
 
@@ -257,7 +266,16 @@ void main() {
         // K * Q^T -> S^T: Bc x HSK_pad * HSK_pad x Br -> Bc x Br
         // Bc split across workgroup (four subgroups), loop over HSK in chunks of 16: 16 x 16 * 16 x 16 -> 16 x 16
         // This is written transposed in order to allow for N being 8 if implementations need it
-        coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfMat = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+#ifndef FA_S_SPLIT
+#define FA_S_SPLIT 2   // 2: loop 1232 -> 1140 instructions, copies 188 -> 96 on gfx1151; 4 is worse again
+#endif
+        // FA_S_SPLIT independent accumulators over the HSK chunks: with one, the HSK/16 WMMAs of a KV
+        // block form a single dependent chain (2026-09-13 ISA audit: 16 chained v_wmma on gfx1151)
+        coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfAcc[FA_S_SPLIT];
+        [[unroll]] for (uint32_t si = 0; si < FA_S_SPLIT; ++si) {
+            SfAcc[si] = coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+        }
+        coopmat<ACC_TYPE, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfMat;
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> KMat;
         coopmat<FLOAT_TYPE, gl_ScopeSubgroup, 16, MatBr, gl_MatrixUseB> QMat;
 
@@ -311,7 +329,11 @@ void main() {
 
             coopMatLoad(QMat, Qf, d * 16 / 4, qstride, gl_CooperativeMatrixLayoutColumnMajor);
 
-            SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+            SfAcc[d % FA_S_SPLIT] = coopMatMulAdd(KMat, QMat, SfAcc[d % FA_S_SPLIT]);
+        }
+        SfMat = SfAcc[0];
+        [[unroll]] for (uint32_t si = 1; si < FA_S_SPLIT; ++si) {
+            SfMat = SfMat + SfAcc[si];
         }
 
         uint coord = gl_SubgroupID * MatBc * sfshstride;
@@ -372,10 +394,18 @@ void main() {
             Lf[r] = eMf[r]*Lf[r];
         }
 
-        [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
-            const uint d_local = d0 / threads_per_rowgroup;
+        if (O_IN_REGS) {
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                Of[r][d_local] = O_TYPE(eMf[r]) * Of[r][d_local];
+                if (tile_row(r) < 16) {
+                    eMsh[tile_row(r)] = eMf[r];
+                }
+            }
+        } else {
+            [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
+                const uint d_local = d0 / threads_per_rowgroup;
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    Of[r][d_local] = O_TYPE(eMf[r]) * Of[r][d_local];
+                }
             }
         }
 
@@ -488,6 +518,12 @@ void main() {
 
             const uint o_offset = gl_SubgroupID * MatBr / 4;
 
+            if (O_IN_REGS && hsv_offset < HSV_pad) {
+                // O = eM (per query row) * O: lane L holds column L%16 and rows L/16 + 4i (gfx11 wave64)
+                [[unroll]] for (uint32_t i = 0; i < OAcc[hsv_tile].length(); ++i) {
+                    OAcc[hsv_tile][i] *= O_TYPE(eMsh[(gl_SubgroupInvocationID / 16) + 4 * i]);
+                }
+            }
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                     if (SHMEM_STAGING == 0) {
@@ -514,11 +550,21 @@ void main() {
                         coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
                     }
 
-                    PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
+                    if (O_IN_REGS) {
+                        OAcc[hsv_tile] = coopMatMulAdd(PMat[bc_chunk], QMat, OAcc[hsv_tile]);
+                    } else {
+                        PVMat = coopMatMulAdd(PMat[bc_chunk], QMat, PVMat);
+                    }
                 }
 
                 // Store PVMat to pvsh and load into Of
-                coopMatStore(PVMat, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                if (!O_IN_REGS) {
+                    coopMatStore(PVMat, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+
+            if (O_IN_REGS) {
+                continue;   // O stays in registers; kvsh/pvsh are not touched on this path
             }
 
             barrier();
@@ -546,6 +592,32 @@ void main() {
         }
 
         barrier();
+    }
+
+    if (O_IN_REGS) {
+        // drain the register-resident O tiles through pvsh once (same path the per-block code used)
+        const uint o_offset = gl_SubgroupID * MatBr / 4;
+        [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < o_num_tiles; ++hsv_tile) {
+            barrier();
+            const uint hsv_offset = (hsv_tile * row_split + gl_SubgroupID) * 16;
+            if (hsv_offset < HSV_pad) {
+                coopMatStore(OAcc[hsv_tile], pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            barrier();
+            const uint hsv_per_tile = row_split * MatBc;
+            const uint hsv_base = hsv_tile * hsv_per_tile;
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                const uint row = tile_row(r);
+                [[unroll]] for (uint32_t d_local = 0; d_local < d_per_thread; ++d_local) {
+                    const uint d = d_local * threads_per_rowgroup + col_tid;
+                    const uint hsv_col = 4 * d;
+                    if (hsv_col >= hsv_base && hsv_col < hsv_base + hsv_per_tile && hsv_col < HSV) {
+                        const uint local_hsv = (hsv_col - hsv_base) / 4;
+                        Of[r][d_local] += pvsh[row * osh_stride + local_hsv];
+                    }
+                }
+            }
+        }
     }
 
     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {

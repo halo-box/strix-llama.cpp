@@ -63,16 +63,31 @@ vec4 rocmfpx_mm_fp6_vec4(uint ib, uint idx) {
                 rocmfpx_mm_fp6_value(ib, idx + 2u),
                 rocmfpx_mm_fp6_value(ib, idx + 3u));
 // ---- 8-wide q6_K / q3_K / q8_0 / q5_0 loaders (LOAD_VEC_A == 8, KHR coopmat variants) -------------
-// One call covers 8 consecutive k of one row. Blocks are 210 / 110 / 34 / 22 bytes (2-byte aligned),
-// so the fetch reads whole dwords around the bytes it needs through the uint view and the store
-// shifts them into place. Index math is split into a uniform part (pos_a: superblock column and the
-// position inside the block are the same for every lane) and a lane-invariant part computed once
-// before the K loop (a_lane_off / a_store_idx, see mul_mm.comp); the 2-wide loaders below cost
-// 32 16-bit global loads and ~40 VALU of index arithmetic per lane per BK step.
+// One call covers 8 consecutive k of one row. Blocks are 210 / 110 / 34 / 22 bytes (2-byte aligned).
+// fetch8 reads the 8 bytes at a 2-aligned byte offset b as two dwords when b is 4-aligned, else as
+// dword(b-2), dword(b+2) and a 16-bit load of b+6: it never touches a byte outside [b-2, b+8), which
+// stays inside the block for every group these loaders use (the misaligned case only occurs for
+// odd block indices, whose groups start >= 2 bytes into the block). The first version read whole
+// dwords past the group and faulted on the last block of an mmap'd tensor (GPUVM fault, 2026-09-13).
+// Scales and d are read through the typed block members. Index math is split into a uniform part
+// (pos_a: superblock column and the position inside the block are the same for every lane) and a
+// lane-invariant part computed once before the K loop (a_lane_off / a_store_idx, see mul_mm.comp).
 // pos_a is in LOAD_VEC_A units and a multiple of 4 (rows are multiples of 32 k, BK = 32).
+#if LOAD_VEC_A == 8 && (defined(DATA_A_Q6_K) || defined(DATA_A_Q3_K) || defined(DATA_A_Q8_0) || defined(DATA_A_Q5_0))
+uvec3 fetch8(const uint b) {
+    // branchless: dwords at (b & ~3) and +4 cover [b-2, b+8) when b is misaligned and [b, b+8) when
+    // aligned; the 16-bit load at b+6 is only consumed in the misaligned case (it is inside either way)
+    const uint b4 = b & ~3u;
+    return uvec3(data_a_u32[b4 / 4], data_a_u32[b4 / 4 + 1], uint(data_a_u16[(b + 6) / 2]));
+}
+// the 8 bytes as two dwords (low dword first)
+uvec2 unpack8b(const uvec3 r, const bool odd) {
+    return odd ? uvec2((r.x >> 16) | (r.y << 16), (r.y >> 16) | (r.z << 16)) : r.xy;
+}
+#endif
 #if LOAD_VEC_A == 8 && defined(DATA_A_Q6_K)
 #define A_PREFETCH 1
-#define A_RAW_T uvec4[2]   // [0] = ql dwords 0..2, qh dword 0; [1] = qh dwords 1..2, scale dword, d dword
+#define A_RAW_T uvec4[2]   // [0] = ql fetch8, qh.x; [1] = qh.yz, d bits | scale << 16, 0
 uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 256)) * 210 + 8 * row; }   // byte offset of the lane's row within its superblock column, plus its 8-byte group
 void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw[2]) {
     const uint kb = pos_a / 32;            // superblock column
@@ -80,32 +95,29 @@ void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_o
     const uint n  = g / 4;
     const uint m  = g % 4;
     const uint base = kb * 210 + lane_off - 8 * row;     // block byte base for this lane (lane_off carries 8*row)
+    const uint ib   = base / 210;
     const uint bql = base + 64 * n + 32 * (m & 1) + 8 * row;
     const uint bqh = base + 128 + 32 * n + 8 * row;
-    const uint bsc = base + 192 + 8 * n + 2 * m + row / 2;
-    const uint bd  = base + 208;
-    raw[0] = uvec4(data_a_u32[bql / 4], data_a_u32[bql / 4 + 1], data_a_u32[bql / 4 + 2], data_a_u32[bqh / 4]);
-    raw[1] = uvec4(data_a_u32[bqh / 4 + 1], data_a_u32[bqh / 4 + 2], data_a_u32[bsc / 4], data_a_u32[bd / 4]);
+    const uint is  = 8 * n + 2 * m + row / 2;
+    const uvec3 ql = fetch8(bql);
+    const uvec3 qh = fetch8(bqh);
+    raw[0] = uvec4(ql.x, ql.y, ql.z, qh.x);
+    raw[1] = uvec4(qh.y, qh.z, uint(float16BitsToUint16(data_a[ib].d)) | (uint(uint8_t(data_a[ib].scales[is])) << 16), 0);
 }
 void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw[2]) {
-    const uint kb = pos_a / 32;
     const uint g  = (pos_a % 32) / 4;
-    const uint n  = g / 4;
     const uint m  = g % 4;
-    const uint base = kb * 210 + (col * (p.stride_a / 256)) * 210;
+    const uint base = (pos_a / 32) * 210 + (col * (p.stride_a / 256)) * 210;
     const bool odd = (base & 2) != 0;      // every odd block starts 2 bytes into a dword
-    const uint ql0 = odd ? ((raw[0].x >> 16) | (raw[0].y << 16)) : raw[0].x;
-    const uint ql1 = odd ? ((raw[0].y >> 16) | (raw[0].z << 16)) : raw[0].y;
-    const uint qh0 = odd ? ((raw[0].w >> 16) | (raw[1].x << 16)) : raw[0].w;
-    const uint qh1 = odd ? ((raw[1].x >> 16) | (raw[1].y << 16)) : raw[1].x;
-    const uint bsc = base + 192 + 8 * n + 2 * m + row / 2;
-    const int   sc = int(int8_t(uint8_t(raw[1].z >> (8 * (bsc & 3)))));
-    const float d  = float(uint16BitsToFloat16(uint16_t(raw[1].w >> (8 * ((base + 208) & 3)))));
+    const uvec2 ql = unpack8b(raw[0].xyz, odd);
+    const uvec2 qh = unpack8b(uvec3(raw[0].w, raw[1].x, raw[1].y), odd);
+    const int   sc = int(int8_t(uint8_t(raw[1].z >> 16)));
+    const float d  = float(uint16BitsToFloat16(uint16_t(raw[1].z & 0xFFFF)));
     const float dscale = d * float(sc);
     const uint nib = 4 * (m >> 1);
     const uint hsh = 2 * m;
-    const uint q0 = ((ql0 >> nib) & 0x0F0F0F0F) | (((qh0 >> hsh) & 0x03030303) << 4);
-    const uint q1 = ((ql1 >> nib) & 0x0F0F0F0F) | (((qh1 >> hsh) & 0x03030303) << 4);
+    const uint q0 = ((ql.x >> nib) & 0x0F0F0F0F) | (((qh.x >> hsh) & 0x03030303) << 4);
+    const uint q1 = ((ql.y >> nib) & 0x0F0F0F0F) | (((qh.y >> hsh) & 0x03030303) << 4);
     const vec4 v0 = (vec4(unpack8(q0)) - 32.0f) * dscale;
     const vec4 v1 = (vec4(unpack8(q1)) - 32.0f) * dscale;
     buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
@@ -115,48 +127,41 @@ void store_a_raw(const uint pos_a, const uint row, const uint col, const uint si
 }
 #elif LOAD_VEC_A == 8 && defined(DATA_A_Q3_K)
 #define A_PREFETCH 1
-#define A_RAW_T uvec4[3]   // [0] = qs dwords 0..2, hmask dword 0; [1] = hmask dwords 1..2, tail dwords 0..1; [2].xy = tail dwords 2..3
+#define A_RAW_T uvec4[2]   // [0] = qs fetch8, hmask.x; [1] = hmask.yz, sc0 | sc1 << 8 | d bits << 16, 0
 uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 256)) * 110 + 8 * row; }
-void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw[3]) {
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw[2]) {
     const uint kb = pos_a / 32;
     const uint g  = (pos_a % 32) / 4;      // n = g/4, j = g%4
     const uint n  = g / 4;
     const uint base = kb * 110 + lane_off - 8 * row;
+    const uint ib   = base / 110;
     const uint bqs = base + 32 + 32 * n + 8 * row;
     const uint bhm = base + 8 * row;
-    const uint bt  = base + 96;             // scales[12] then d
-    raw[0] = uvec4(data_a_u32[bqs / 4], data_a_u32[bqs / 4 + 1], data_a_u32[bqs / 4 + 2], data_a_u32[bhm / 4]);
-    raw[1] = uvec4(data_a_u32[bhm / 4 + 1], data_a_u32[bhm / 4 + 2], data_a_u32[bt / 4], data_a_u32[bt / 4 + 1]);
-    raw[2] = uvec4(data_a_u32[bt / 4 + 2], data_a_u32[bt / 4 + 3], 0, 0);
+    const uint is  = 2 * g + row / 2;       // 16-element scale index 0..15
+    const uvec3 qs = fetch8(bqs);
+    const uvec3 hm = fetch8(bhm);
+    raw[0] = uvec4(qs.x, qs.y, qs.z, hm.x);
+    raw[1] = uvec4(hm.y, hm.z, uint(data_a[ib].scales[is % 8]) | (uint(data_a[ib].scales[8 + (is % 4)]) << 8) | (uint(float16BitsToUint16(data_a[ib].d)) << 16), 0);
 }
-void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw[3]) {
-    const uint kb = pos_a / 32;
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw[2]) {
     const uint g  = (pos_a % 32) / 4;
     const uint n  = g / 4;
     const uint j  = g % 4;
-    const uint is = 2 * g + row / 2;        // 16-element scale index 0..15
-    const uint base = kb * 110 + (col * (p.stride_a / 256)) * 110;
+    const uint is = 2 * g + row / 2;
+    const uint base = (pos_a / 32) * 110 + (col * (p.stride_a / 256)) * 110;
     const bool odd = (base & 2) != 0;
-    const uint qs0 = odd ? ((raw[0].x >> 16) | (raw[0].y << 16)) : raw[0].x;
-    const uint qs1 = odd ? ((raw[0].y >> 16) | (raw[0].z << 16)) : raw[0].y;
-    const uint hm0 = odd ? ((raw[0].w >> 16) | (raw[1].x << 16)) : raw[0].w;
-    const uint hm1 = odd ? ((raw[1].x >> 16) | (raw[1].y << 16)) : raw[1].x;
-    // tail bytes 96..109 of the block: byte t lives at dword (t + (base & 2)) / 4 of raw[1].zw, raw[2].xy
-    const uint tail[4] = {raw[1].z, raw[1].w, raw[2].x, raw[2].y};
-    const uint t0 = (is % 8) + (base & 2);          // scales[is % 8]
-    const uint t1 = 8 + (is % 4) + (base & 2);      // scales[8 + is % 4]
-    const uint td = 12 + (base & 2);                // d
-    const uint sc0 = (tail[t0 / 4] >> (8 * (t0 % 4))) & 0xFF;
-    const uint sc1 = (tail[t1 / 4] >> (8 * (t1 % 4))) & 0xFF;
-    const uint dw  = (tail[td / 4] >> (8 * (td % 4))) & 0xFFFF;
+    const uvec2 qs = unpack8b(raw[0].xyz, odd);
+    const uvec2 hm = unpack8b(uvec3(raw[0].w, raw[1].x, raw[1].y), odd);
+    const uint sc0 = raw[1].z & 0xFF;
+    const uint sc1 = (raw[1].z >> 8) & 0xFF;
     const int  us  = int(((sc0 >> (4 * (is / 8))) & 0xF) | (((sc1 >> (2 * (is / 4))) & 3) << 4));
-    const float dl = float(uint16BitsToFloat16(uint16_t(dw))) * float(us - 32);
+    const float dl = float(uint16BitsToFloat16(uint16_t(raw[1].z >> 16))) * float(us - 32);
     const uint qsh = 2 * j;
     const uint hsh = 4 * n + j;
-    const uint q0 = (qs0 >> qsh) & 0x03030303;
-    const uint q1 = (qs1 >> qsh) & 0x03030303;
-    const uint h0 = ((((hm0 >> hsh) & 0x01010101) ^ 0x01010101) << 2);
-    const uint h1 = ((((hm1 >> hsh) & 0x01010101) ^ 0x01010101) << 2);
+    const uint q0 = (qs.x >> qsh) & 0x03030303;
+    const uint q1 = (qs.y >> qsh) & 0x03030303;
+    const uint h0 = ((((hm.x >> hsh) & 0x01010101) ^ 0x01010101) << 2);
+    const uint h1 = ((((hm.y >> hsh) & 0x01010101) ^ 0x01010101) << 2);
     const vec4 v0 = (vec4(unpack8(q0)) - vec4(unpack8(h0))) * dl;
     const vec4 v1 = (vec4(unpack8(q1)) - vec4(unpack8(h1))) * dl;
     buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
@@ -166,22 +171,22 @@ void store_a_raw(const uint pos_a, const uint row, const uint col, const uint si
 }
 #elif LOAD_VEC_A == 8 && defined(DATA_A_Q8_0)
 #define A_PREFETCH 1
-#define A_RAW_T uvec4   // xyz: the dwords holding the 8 int8 (2-byte aligned block of 34 B), w: the dword holding d
+#define A_RAW_T uvec4   // xyz: qs fetch8 (block of 34 B), w: d bits
 uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 32)) * 34 + 8 * row; }   // block row base + 8-byte group
 void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw) {
     const uint base = (pos_a / 4) * 34 + lane_off - 8 * row;   // block byte base (pos_a/4 = block column)
-    const uint bq = base + 2 + 8 * row;
-    raw = uvec4(data_a_u32[bq / 4], data_a_u32[bq / 4 + 1], data_a_u32[bq / 4 + 2], data_a_u32[base / 4]);
+    const uint ib   = base / 34;
+    const uvec3 qs = fetch8(base + 2 + 8 * row);
+    raw = uvec4(qs.x, qs.y, qs.z, uint(float16BitsToUint16(data_a_packed16[ib].d)));
 }
 void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw) {
     const uint base = (pos_a / 4 + col * (p.stride_a / 32)) * 34;
     const bool odd = ((base + 2) & 2) != 0;
-    const uint q0 = odd ? ((raw.x >> 16) | (raw.y << 16)) : raw.x;
-    const uint q1 = odd ? ((raw.y >> 16) | (raw.z << 16)) : raw.y;
-    const float d = float(uint16BitsToFloat16(uint16_t(raw.w >> (8 * (base & 3)))));
+    const uvec2 q = unpack8b(raw.xyz, odd);
+    const float d = float(uint16BitsToFloat16(uint16_t(raw.w)));
     // int8 via unsigned bytes: (q ^ 0x80) - 128
-    const vec4 v0 = fma(vec4(unpack8(q0 ^ 0x80808080)), vec4(d), vec4(-128.0f * d));
-    const vec4 v1 = fma(vec4(unpack8(q1 ^ 0x80808080)), vec4(d), vec4(-128.0f * d));
+    const vec4 v0 = fma(vec4(unpack8(q.x ^ 0x80808080)), vec4(d), vec4(-128.0f * d));
+    const vec4 v1 = fma(vec4(unpack8(q.y ^ 0x80808080)), vec4(d), vec4(-128.0f * d));
     buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
     buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(v0.zw));
     buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
@@ -189,29 +194,27 @@ void store_a_raw(const uint pos_a, const uint row, const uint col, const uint si
 }
 #elif LOAD_VEC_A == 8 && defined(DATA_A_Q5_0)
 #define A_PREFETCH 1
-#define A_RAW_T uvec4[2]   // [0].xyz: dwords holding the 8 qs bytes, [0].w + [1].x: dwords holding d and qh (block of 22 B)
+#define A_RAW_T uvec4[2]   // [0].xyz: qs fetch8 (block of 22 B), [0].w: d bits; [1].x: qh
 uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 32)) * 22 + 8 * (row % 2); }
 void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw[2]) {
     const uint base = (pos_a / 4) * 22 + lane_off - 8 * (row % 2);
-    const uint bq = base + 6 + 8 * (row % 2);      // row >= 2 are the high nibbles of the same bytes
-    raw[0] = uvec4(data_a_u32[bq / 4], data_a_u32[bq / 4 + 1], data_a_u32[bq / 4 + 2], data_a_u32[base / 4]);
-    raw[1] = uvec4(data_a_u32[base / 4 + 1], 0, 0, 0);
+    const uint ib   = base / 22;
+    const uvec3 qs = fetch8(base + 6 + 8 * (row % 2));      // row >= 2 are the high nibbles of the same bytes
+    raw[0] = uvec4(qs.x, qs.y, qs.z, uint(float16BitsToUint16(data_a_packed16[ib].d)));
+    raw[1] = uvec4(uint(data_a_packed16[ib].qh[0]) | (uint(data_a_packed16[ib].qh[1]) << 16), 0, 0, 0);
 }
 void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw[2]) {
     const uint base = (pos_a / 4 + col * (p.stride_a / 32)) * 22;
     const bool odd = ((base + 6) & 2) != 0;
-    const uint qs0 = odd ? ((raw[0].x >> 16) | (raw[0].y << 16)) : raw[0].x;
-    const uint qs1 = odd ? ((raw[0].y >> 16) | (raw[0].z << 16)) : raw[0].y;
-    // d then qh occupy bytes base .. base+5
-    const uint dw  = (base & 2) != 0 ? (raw[0].w >> 16) : (raw[0].w & 0xFFFF);
-    const uint qh  = (base & 2) != 0 ? raw[1].x : ((raw[0].w >> 16) | (raw[1].x << 16));
-    const float d = float(uint16BitsToFloat16(uint16_t(dw)));
+    const uvec2 qs = unpack8b(raw[0].xyz, odd);
+    const float d = float(uint16BitsToFloat16(uint16_t(raw[0].w)));
+    const uint qh = raw[1].x;
     const uint nib = 4 * (row / 2);
     const uint hb  = (qh >> (8 * row)) & 0xFF;                     // the 8 high bits of this group
     const uint h0  = ((hb & 0xF) * 0x00204081u) & 0x01010101u;    // spread bits 0..3 into bytes
     const uint h1  = (((hb >> 4) & 0xF) * 0x00204081u) & 0x01010101u;
-    const uint q0 = ((qs0 >> nib) & 0x0F0F0F0F) | (h0 << 4);
-    const uint q1 = ((qs1 >> nib) & 0x0F0F0F0F) | (h1 << 4);
+    const uint q0 = ((qs.x >> nib) & 0x0F0F0F0F) | (h0 << 4);
+    const uint q1 = ((qs.y >> nib) & 0x0F0F0F0F) | (h1 << 4);
     const vec4 v0 = fma(vec4(unpack8(q0)), vec4(d), vec4(-16.0f * d));
     const vec4 v1 = fma(vec4(unpack8(q1)), vec4(d), vec4(-16.0f * d));
     buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
