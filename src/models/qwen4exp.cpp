@@ -1354,6 +1354,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     return cur;
 }
 
+// LLAMA_PLE_HOST_GATHER=0 restores the in-graph get_rows for a host-resident table, for A/B.
+// An on-disk table (--ngram-on-disk) has no tensor to gather from and always stays host-side.
+static bool ple_host_gather() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_PLE_HOST_GATHER");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 // PLE n-gram hash embedding: each token gathers ple_n_heads rows of a shared table.
 //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
 // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
@@ -1458,6 +1468,14 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    // the table is far too big to offload, so it is gathered straight out of the mapping: one
+    // fault per row, 16 per token, no two of them on the same page. left to the gather those
+    // faults happen one at a time; queued here as one sorted, page-merged batch they are in
+    // flight before the copy loop (or the graph) runs. only fires for a table the loader reads
+    // lazily (--lazy-mode); the per-page madvise loops below cover a table pulled in eagerly.
+    const bool prefetched = pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+    (void) prefetched;
+
     if (embd != nullptr && !pmodel.ple_disk) {
         // host-resident table: dequantize the rows exactly as the CPU get_rows would (same to_float)
         const ggml_tensor * tab = pmodel.per_layer_tok_embd;
@@ -1471,7 +1489,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 #if defined(__linux__) || defined(__APPLE__)
         // memory-mapped table, random rows: queue every page read at once instead of taking the
         // faults one after another (~0.2 ms each from NVMe) while dequantizing below
-        {
+        if (!prefetched) {
             const long page = sysconf(_SC_PAGESIZE);
             if (page > 0) {
                 const uintptr_t base = (uintptr_t) tab->data;
@@ -1522,7 +1540,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // page fault the CPU get_rows would otherwise take one after another (~0.2 ms each from NVMe).
     // Ask the kernel to read all of them in parallel now; the gather then finds them (or the I/O in
     // flight) in the page cache.
-    if (const ggml_tensor * tab = pmodel.per_layer_tok_embd; tab && tab->data) {
+    if (const ggml_tensor * tab = pmodel.per_layer_tok_embd; !prefetched && tab && tab->data) {
         const long page = sysconf(_SC_PAGESIZE);
         if (page > 0) {
             const uintptr_t base     = (uintptr_t) tab->data;
@@ -1617,9 +1635,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // A host-resident table (memory-mapped or loaded into RAM) is gathered on the host too: a
     // get_rows node on the CPU backend would cut the graph into three splits (GPU, CPU, GPU) with
     // an extra graph launch and a device sync per ubatch. Only a table that lives on a device is
-    // gathered by the graph.
+    // gathered by the graph. LLAMA_PLE_HOST_GATHER=0 forces the in-graph gather for A/B.
     const bool host_gather = qmodel.ple_disk ||
-        (model.per_layer_tok_embd && model.per_layer_tok_embd->buffer && ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer));
+        (ple_host_gather() && model.per_layer_tok_embd && model.per_layer_tok_embd->buffer && ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer));
 
     if (host_gather) {
         // the gather happens in set_input and arrives as an F32 input,
