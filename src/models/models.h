@@ -2352,6 +2352,7 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     class llm_graph_input_qsa;
     class llm_graph_input_qsa_k;
+    class llm_graph_input_hc_consts;
 
     // Set when the n-gram table is left on disk (--ngram-on-disk): per_layer_tok_embd is
     // counted as created but never allocated, mapped or read, and build_ple takes its
@@ -2419,6 +2420,10 @@ struct llama_model_qwen4exp : public llama_model_base {
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                             int   il);
+
+        // hc fast path constants (I32 iota [hc], F32 identity [hc, hc]), created on first use
+        llm_graph_input_hc_consts * hc_consts = nullptr;
+        llm_graph_input_hc_consts * build_hc_consts();
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(

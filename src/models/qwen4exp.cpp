@@ -456,6 +456,84 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
+// Hyper-connection fast path (inject mat-vec, hc_post combine, no stream copy). Measured 2026-09-13
+// on Vulkan (Q3KEXP ub512 d0): the glue was 22% of prefill GPU time, the w_inject matmul alone 4.8%,
+// and the fast path is +8.9% prefill; see ~/strix-results/pwilkin-review-20260913/REVIEW.md.
+// The HIP backend in this tree fuses the stock chain (grouped inject/down matvec, combine+norm
+// kernel) instead, so the default is on only when no CUDA/HIP device is in the model's device
+// list. LLAMA_HC_FASTPATH=1/0 forces it either way.
+static bool qwen4exp_hc_fastpath(const llama_model & model) {
+    static const bool on = [&]() {
+        if (const char * e = getenv("LLAMA_HC_FASTPATH")) {
+            return atoi(e) != 0;
+        }
+        for (const auto & d : model.devices) {
+            if (d.dev == nullptr) {
+                continue;
+            }
+            const std::string reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(d.dev));
+            if (reg == "CUDA" || reg == "ROCm" || reg == "HIP") {
+                return false;
+            }
+        }
+        return true;
+    }();
+    return on;
+}
+
+// w_inject is [hc_dim, hc]: hc (4) output rows. ggml_mul_mat(w_inject, xn) is a quantized GEMM with a
+// 4-row A operand, which the Vulkan coopmat path pads to a full tile: 1.05 ms per call at 512 tokens
+// (40 GFLOPS), 48 calls per graph. Swapping the operands makes it a mat-vec over xn with hc columns,
+// which wants the hc weight rows in f32; get_rows dequantises them (Vulkan CPY cannot cast K-quants),
+// and the row index is this input so it lives on the backend with the rest of the graph inputs.
+// The combine, cur = residual + block_out (x) w, is ggml_dsv4_hc_post with an identity mixing matrix:
+// one pass over the residual instead of repeat_4d + mul + add (six full-width passes). The identity
+// is the second constant here; both are graph inputs so they live with the other inputs on the
+// backend and are written once per ubatch (hc ints and hc*hc floats).
+class llama_model_qwen4exp::llm_graph_input_hc_consts : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_hc_consts(int64_t hc) : hc(hc) {}
+    virtual ~llm_graph_input_hc_consts() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        std::vector<int32_t> v(hc);
+        for (int64_t i = 0; i < hc; ++i) {
+            v[i] = (int32_t) i;
+        }
+        ggml_backend_tensor_set(iota, v.data(), 0, hc*sizeof(int32_t));
+
+        std::vector<float> e(hc*hc, 0.0f);
+        for (int64_t i = 0; i < hc; ++i) {
+            e[i*hc + i] = 1.0f;
+        }
+        ggml_backend_tensor_set(eye, e.data(), 0, hc*hc*sizeof(float));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return true;
+    }
+
+    ggml_tensor * iota = nullptr;   // I32 [hc]
+    ggml_tensor * eye  = nullptr;   // F32 [hc, hc]
+    const int64_t hc;
+};
+
+llama_model_qwen4exp::llm_graph_input_hc_consts * llama_model_qwen4exp::graph::build_hc_consts() {
+    if (hc_consts == nullptr) {
+        const int64_t hc = hparams.dsv4_hc_mult;
+        auto in = std::make_unique<llm_graph_input_hc_consts>(hc);
+        in->iota = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, hc);
+        in->eye  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc, hc);
+        ggml_set_input(in->iota);
+        ggml_set_input(in->eye);
+        hc_consts = in.get();
+        res->add_input(std::move(in));
+    }
+    return hc_consts;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,
@@ -484,10 +562,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     if (inject) {
-        // the inject projection reads the same xn as the down projection: emit the two matvecs back to back so
-        // that the backend can launch them as one grouped kernel (the inject result is only used by hc_combine)
-        ggml_build_forward_expand(gf, lo);
-        *inject = build_lora_mm(w_inject, xn);
+        if (qwen4exp_hc_fastpath(model) && loras->empty()) {
+            ggml_tensor * w_rows = ggml_get_rows(ctx0, w_inject, build_hc_consts()->iota); // f32 [hc_dim, hc]
+            ggml_tensor * inj_t  = ggml_mul_mat(ctx0, xn, w_rows);              // [nt, hc]
+            *inject = ggml_cont(ctx0, ggml_transpose(ctx0, inj_t));             // [hc, nt]
+        } else {
+            // the inject projection reads the same xn as the down projection: emit the two matvecs back to back so
+            // that the backend can launch them as one grouped kernel (the inject result is only used by hc_combine)
+            ggml_build_forward_expand(gf, lo);
+            *inject = build_lora_mm(w_inject, xn);
+        }
         cb(*inject, "hc_inject", il);
         ggml_build_forward_expand(gf, *inject);
     }
@@ -501,7 +585,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // collapse the streams by their mean
     ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
             ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
+    if (!qwen4exp_hc_fastpath(model)) {
+        // ggml_add takes a strided src0 on every backend (the result is a fresh contiguous
+        // tensor), so this copy of one stream per mix was a full-width pass for nothing
+        mixed = ggml_cont(ctx0, mixed);
+    }
     for (int64_t c = 1; c < hc; ++c) {
         ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
                 ggml_row_size(gated->type, n_embd) * hc,
@@ -531,19 +619,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);
-    w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
-    // Emit the block output first and the scatter-weight chain right after it, so that
-    // scale -> sigmoid -> scale -> repeat -> mul -> add is one contiguous node run that
-    // backends can fuse into a single kernel.
-    ggml_build_forward_expand(gf, residual);
-    ggml_build_forward_expand(gf, block_out);
-    ggml_build_forward_expand(gf, w);
+    ggml_tensor * cur;
+    if (qwen4exp_hc_fastpath(model)) {
+        // cur[i, h, t] = block_out[i, t]*w[h, t] + sum_s residual[i, s, t]*I[h, s]: the DeepSeek V4
+        // hc_post op with an identity mix. One kernel reading the residual once, instead of
+        // repeat_4d + mul + add materialising hc copies of block_out (96 combines per graph).
+        ggml_tensor * x    = ggml_reshape_2d(ctx0, block_out, n_embd, nt);
+        ggml_tensor * comb = ggml_repeat_4d(ctx0, build_hc_consts()->eye, hc, hc, nt, 1);
+        cur = ggml_dsv4_hc_post(ctx0, x, residual, ggml_reshape_2d(ctx0, w, hc, nt), comb);
+    } else {
+        w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
-    ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
-    b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+        // Emit the block output first and the scatter-weight chain right after it, so that
+        // scale -> sigmoid -> scale -> repeat -> mul -> add is one contiguous node run that
+        // backends can fuse into a single kernel.
+        ggml_build_forward_expand(gf, residual);
+        ggml_build_forward_expand(gf, block_out);
+        ggml_build_forward_expand(gf, w);
 
-    ggml_tensor * cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
+        ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
+        b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+
+        cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
+    }
     cb(cur, "hc_combine", il);
 
     return cur;
