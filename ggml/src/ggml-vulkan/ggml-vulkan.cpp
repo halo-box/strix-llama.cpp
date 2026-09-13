@@ -1851,6 +1851,13 @@ struct vk_op_topk_radix_push_constants {
     uint32_t n_tps;    // QSA only
     uint32_t n_blocks; // QSA only
     uint32_t n_stream; // QSA only
+    // QSA only: element strides of the block-score tensor over (token, block, stream). The graph
+    // hands the fusion scores as cont(permute(score)) = [n_tps, n_blocks]; reading that per row
+    // is an n_tps*4-byte stride per block (uncoalesced and channel-camped: 50 ms at 49k context).
+    // When the source of that cont is reachable the kernel reads score [n_blocks, n_tps] directly.
+    uint32_t a_st_t;
+    uint32_t a_st_b;
+    uint32_t a_st_s;
 };
 
 struct vk_op_im2col_push_constants {
@@ -16636,7 +16643,20 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
-    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream };
+    // read the untransposed block scores when the graph's cont(permute(score)) exposes them:
+    // consecutive blocks are then consecutive floats, so the gather coalesces
+    const ggml_tensor * a = scores;
+    uint32_t a_st_t = 1, a_st_b = n_tps, a_st_s = n_tps * n_blocks;
+    if (scores->op == GGML_OP_CONT && scores->src[0]->op == GGML_OP_PERMUTE) {
+        const ggml_tensor * src = scores->src[0]->src[0];
+        if (src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) &&
+            src->ne[0] == n_blocks && src->ne[1] == n_tps && src->ne[2] == n_stream && src->ne[3] == 1) {
+            a = src;
+            a_st_t = n_blocks; a_st_b = 1; a_st_s = n_blocks * n_tps;
+        }
+    }
+
+    vk_op_topk_radix_push_constants pc { n_kv, width, nrows, n_tps, n_blocks, n_stream, a_st_t, a_st_b, a_st_s };
     std::array<uint32_t, 3> elements {
         pipeline->wg_denoms[0],
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
@@ -16647,7 +16667,7 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_subbuffer out_buf     = ctx->fused_topk_qsa_out_scratch ? vk_subbuffer{ ctx->prealloc_x, out_off, out_size } : dst_buf;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { ggml_vk_tensor_subbuffer(ctx, scores), out_buf,
+        { ggml_vk_tensor_subbuffer(ctx, a), out_buf,
           ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
           scratch_buf }, pc, elements);
     if (ctx->fused_topk_qsa_out_scratch) {

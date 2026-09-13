@@ -25,6 +25,9 @@ layout (push_constant) uniform parameter {
     uint n_tps;    // QSA only
     uint n_blocks; // QSA only
     uint n_stream; // QSA only
+    uint a_st_t;   // QSA only: block-score strides over (token, block, stream), in elements
+    uint a_st_b;
+    uint a_st_s;
 } p;
 
 #define RADIX_BITS 8
@@ -51,7 +54,7 @@ float gather(uint row, uint i) {
     const uint t = row % p.n_tps;
     const uint s = row / p.n_tps;
     const uint block = uint(cell_blk[s * p.ncols + i]);
-    const float a = data_a[(s * p.n_blocks + block) * p.n_tps + t];
+    const float a = data_a[s * p.a_st_s + block * p.a_st_b + t * p.a_st_t];
     const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
     return a + m;
 }
