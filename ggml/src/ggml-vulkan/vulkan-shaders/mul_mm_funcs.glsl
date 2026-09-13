@@ -14,7 +14,7 @@ uint a_shmem_stride() {
 }
 
 void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
-    buf_a[a_shmem_index(m, k_pair)] = value;
+    buf_a[a_shmem_index(m, k_pair)] = TO_BUF(value);
 }
 
 #if defined(DATA_A_ROCMFPX_FP3)
@@ -62,6 +62,162 @@ vec4 rocmfpx_mm_fp6_vec4(uint ib, uint idx) {
                 rocmfpx_mm_fp6_value(ib, idx + 1u),
                 rocmfpx_mm_fp6_value(ib, idx + 2u),
                 rocmfpx_mm_fp6_value(ib, idx + 3u));
+// ---- 8-wide q6_K / q3_K / q8_0 / q5_0 loaders (LOAD_VEC_A == 8, KHR coopmat variants) -------------
+// One call covers 8 consecutive k of one row. Blocks are 210 / 110 / 34 / 22 bytes (2-byte aligned),
+// so the fetch reads whole dwords around the bytes it needs through the uint view and the store
+// shifts them into place. Index math is split into a uniform part (pos_a: superblock column and the
+// position inside the block are the same for every lane) and a lane-invariant part computed once
+// before the K loop (a_lane_off / a_store_idx, see mul_mm.comp); the 2-wide loaders below cost
+// 32 16-bit global loads and ~40 VALU of index arithmetic per lane per BK step.
+// pos_a is in LOAD_VEC_A units and a multiple of 4 (rows are multiples of 32 k, BK = 32).
+#if LOAD_VEC_A == 8 && defined(DATA_A_Q6_K)
+#define A_PREFETCH 1
+#define A_RAW_T uvec4[2]   // [0] = ql dwords 0..2, qh dword 0; [1] = qh dwords 1..2, scale dword, d dword
+uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 256)) * 210 + 8 * row; }   // byte offset of the lane's row within its superblock column, plus its 8-byte group
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw[2]) {
+    const uint kb = pos_a / 32;            // superblock column
+    const uint g  = (pos_a % 32) / 4;      // 32-k group in the block: n = g/4, m = g%4
+    const uint n  = g / 4;
+    const uint m  = g % 4;
+    const uint base = kb * 210 + lane_off - 8 * row;     // block byte base for this lane (lane_off carries 8*row)
+    const uint bql = base + 64 * n + 32 * (m & 1) + 8 * row;
+    const uint bqh = base + 128 + 32 * n + 8 * row;
+    const uint bsc = base + 192 + 8 * n + 2 * m + row / 2;
+    const uint bd  = base + 208;
+    raw[0] = uvec4(data_a_u32[bql / 4], data_a_u32[bql / 4 + 1], data_a_u32[bql / 4 + 2], data_a_u32[bqh / 4]);
+    raw[1] = uvec4(data_a_u32[bqh / 4 + 1], data_a_u32[bqh / 4 + 2], data_a_u32[bsc / 4], data_a_u32[bd / 4]);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw[2]) {
+    const uint kb = pos_a / 32;
+    const uint g  = (pos_a % 32) / 4;
+    const uint n  = g / 4;
+    const uint m  = g % 4;
+    const uint base = kb * 210 + (col * (p.stride_a / 256)) * 210;
+    const bool odd = (base & 2) != 0;      // every odd block starts 2 bytes into a dword
+    const uint ql0 = odd ? ((raw[0].x >> 16) | (raw[0].y << 16)) : raw[0].x;
+    const uint ql1 = odd ? ((raw[0].y >> 16) | (raw[0].z << 16)) : raw[0].y;
+    const uint qh0 = odd ? ((raw[0].w >> 16) | (raw[1].x << 16)) : raw[0].w;
+    const uint qh1 = odd ? ((raw[1].x >> 16) | (raw[1].y << 16)) : raw[1].x;
+    const uint bsc = base + 192 + 8 * n + 2 * m + row / 2;
+    const int   sc = int(int8_t(uint8_t(raw[1].z >> (8 * (bsc & 3)))));
+    const float d  = float(uint16BitsToFloat16(uint16_t(raw[1].w >> (8 * ((base + 208) & 3)))));
+    const float dscale = d * float(sc);
+    const uint nib = 4 * (m >> 1);
+    const uint hsh = 2 * m;
+    const uint q0 = ((ql0 >> nib) & 0x0F0F0F0F) | (((qh0 >> hsh) & 0x03030303) << 4);
+    const uint q1 = ((ql1 >> nib) & 0x0F0F0F0F) | (((qh1 >> hsh) & 0x03030303) << 4);
+    const vec4 v0 = (vec4(unpack8(q0)) - 32.0f) * dscale;
+    const vec4 v1 = (vec4(unpack8(q1)) - 32.0f) * dscale;
+    buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
+    buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(v0.zw));
+    buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
+    buf_a[sidx + 3] = TO_BUF(FLOAT_TYPEV2(v1.zw));
+}
+#elif LOAD_VEC_A == 8 && defined(DATA_A_Q3_K)
+#define A_PREFETCH 1
+#define A_RAW_T uvec4[3]   // [0] = qs dwords 0..2, hmask dword 0; [1] = hmask dwords 1..2, tail dwords 0..1; [2].xy = tail dwords 2..3
+uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 256)) * 110 + 8 * row; }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw[3]) {
+    const uint kb = pos_a / 32;
+    const uint g  = (pos_a % 32) / 4;      // n = g/4, j = g%4
+    const uint n  = g / 4;
+    const uint base = kb * 110 + lane_off - 8 * row;
+    const uint bqs = base + 32 + 32 * n + 8 * row;
+    const uint bhm = base + 8 * row;
+    const uint bt  = base + 96;             // scales[12] then d
+    raw[0] = uvec4(data_a_u32[bqs / 4], data_a_u32[bqs / 4 + 1], data_a_u32[bqs / 4 + 2], data_a_u32[bhm / 4]);
+    raw[1] = uvec4(data_a_u32[bhm / 4 + 1], data_a_u32[bhm / 4 + 2], data_a_u32[bt / 4], data_a_u32[bt / 4 + 1]);
+    raw[2] = uvec4(data_a_u32[bt / 4 + 2], data_a_u32[bt / 4 + 3], 0, 0);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw[3]) {
+    const uint kb = pos_a / 32;
+    const uint g  = (pos_a % 32) / 4;
+    const uint n  = g / 4;
+    const uint j  = g % 4;
+    const uint is = 2 * g + row / 2;        // 16-element scale index 0..15
+    const uint base = kb * 110 + (col * (p.stride_a / 256)) * 110;
+    const bool odd = (base & 2) != 0;
+    const uint qs0 = odd ? ((raw[0].x >> 16) | (raw[0].y << 16)) : raw[0].x;
+    const uint qs1 = odd ? ((raw[0].y >> 16) | (raw[0].z << 16)) : raw[0].y;
+    const uint hm0 = odd ? ((raw[0].w >> 16) | (raw[1].x << 16)) : raw[0].w;
+    const uint hm1 = odd ? ((raw[1].x >> 16) | (raw[1].y << 16)) : raw[1].x;
+    // tail bytes 96..109 of the block: byte t lives at dword (t + (base & 2)) / 4 of raw[1].zw, raw[2].xy
+    const uint tail[4] = {raw[1].z, raw[1].w, raw[2].x, raw[2].y};
+    const uint t0 = (is % 8) + (base & 2);          // scales[is % 8]
+    const uint t1 = 8 + (is % 4) + (base & 2);      // scales[8 + is % 4]
+    const uint td = 12 + (base & 2);                // d
+    const uint sc0 = (tail[t0 / 4] >> (8 * (t0 % 4))) & 0xFF;
+    const uint sc1 = (tail[t1 / 4] >> (8 * (t1 % 4))) & 0xFF;
+    const uint dw  = (tail[td / 4] >> (8 * (td % 4))) & 0xFFFF;
+    const int  us  = int(((sc0 >> (4 * (is / 8))) & 0xF) | (((sc1 >> (2 * (is / 4))) & 3) << 4));
+    const float dl = float(uint16BitsToFloat16(uint16_t(dw))) * float(us - 32);
+    const uint qsh = 2 * j;
+    const uint hsh = 4 * n + j;
+    const uint q0 = (qs0 >> qsh) & 0x03030303;
+    const uint q1 = (qs1 >> qsh) & 0x03030303;
+    const uint h0 = ((((hm0 >> hsh) & 0x01010101) ^ 0x01010101) << 2);
+    const uint h1 = ((((hm1 >> hsh) & 0x01010101) ^ 0x01010101) << 2);
+    const vec4 v0 = (vec4(unpack8(q0)) - vec4(unpack8(h0))) * dl;
+    const vec4 v1 = (vec4(unpack8(q1)) - vec4(unpack8(h1))) * dl;
+    buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
+    buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(v0.zw));
+    buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
+    buf_a[sidx + 3] = TO_BUF(FLOAT_TYPEV2(v1.zw));
+}
+#elif LOAD_VEC_A == 8 && defined(DATA_A_Q8_0)
+#define A_PREFETCH 1
+#define A_RAW_T uvec4   // xyz: the dwords holding the 8 int8 (2-byte aligned block of 34 B), w: the dword holding d
+uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 32)) * 34 + 8 * row; }   // block row base + 8-byte group
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw) {
+    const uint base = (pos_a / 4) * 34 + lane_off - 8 * row;   // block byte base (pos_a/4 = block column)
+    const uint bq = base + 2 + 8 * row;
+    raw = uvec4(data_a_u32[bq / 4], data_a_u32[bq / 4 + 1], data_a_u32[bq / 4 + 2], data_a_u32[base / 4]);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw) {
+    const uint base = (pos_a / 4 + col * (p.stride_a / 32)) * 34;
+    const bool odd = ((base + 2) & 2) != 0;
+    const uint q0 = odd ? ((raw.x >> 16) | (raw.y << 16)) : raw.x;
+    const uint q1 = odd ? ((raw.y >> 16) | (raw.z << 16)) : raw.y;
+    const float d = float(uint16BitsToFloat16(uint16_t(raw.w >> (8 * (base & 3)))));
+    // int8 via unsigned bytes: (q ^ 0x80) - 128
+    const vec4 v0 = fma(vec4(unpack8(q0 ^ 0x80808080)), vec4(d), vec4(-128.0f * d));
+    const vec4 v1 = fma(vec4(unpack8(q1 ^ 0x80808080)), vec4(d), vec4(-128.0f * d));
+    buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
+    buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(v0.zw));
+    buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
+    buf_a[sidx + 3] = TO_BUF(FLOAT_TYPEV2(v1.zw));
+}
+#elif LOAD_VEC_A == 8 && defined(DATA_A_Q5_0)
+#define A_PREFETCH 1
+#define A_RAW_T uvec4[2]   // [0].xyz: dwords holding the 8 qs bytes, [0].w + [1].x: dwords holding d and qh (block of 22 B)
+uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 32)) * 22 + 8 * (row % 2); }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw[2]) {
+    const uint base = (pos_a / 4) * 22 + lane_off - 8 * (row % 2);
+    const uint bq = base + 6 + 8 * (row % 2);      // row >= 2 are the high nibbles of the same bytes
+    raw[0] = uvec4(data_a_u32[bq / 4], data_a_u32[bq / 4 + 1], data_a_u32[bq / 4 + 2], data_a_u32[base / 4]);
+    raw[1] = uvec4(data_a_u32[base / 4 + 1], 0, 0, 0);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw[2]) {
+    const uint base = (pos_a / 4 + col * (p.stride_a / 32)) * 22;
+    const bool odd = ((base + 6) & 2) != 0;
+    const uint qs0 = odd ? ((raw[0].x >> 16) | (raw[0].y << 16)) : raw[0].x;
+    const uint qs1 = odd ? ((raw[0].y >> 16) | (raw[0].z << 16)) : raw[0].y;
+    // d then qh occupy bytes base .. base+5
+    const uint dw  = (base & 2) != 0 ? (raw[0].w >> 16) : (raw[0].w & 0xFFFF);
+    const uint qh  = (base & 2) != 0 ? raw[1].x : ((raw[0].w >> 16) | (raw[1].x << 16));
+    const float d = float(uint16BitsToFloat16(uint16_t(dw)));
+    const uint nib = 4 * (row / 2);
+    const uint hb  = (qh >> (8 * row)) & 0xFF;                     // the 8 high bits of this group
+    const uint h0  = ((hb & 0xF) * 0x00204081u) & 0x01010101u;    // spread bits 0..3 into bytes
+    const uint h1  = (((hb >> 4) & 0xF) * 0x00204081u) & 0x01010101u;
+    const uint q0 = ((qs0 >> nib) & 0x0F0F0F0F) | (h0 << 4);
+    const uint q1 = ((qs1 >> nib) & 0x0F0F0F0F) | (h1 << 4);
+    const vec4 v0 = fma(vec4(unpack8(q0)), vec4(d), vec4(-16.0f * d));
+    const vec4 v1 = fma(vec4(unpack8(q1)), vec4(d), vec4(-16.0f * d));
+    buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
+    buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(v0.zw));
+    buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
+    buf_a[sidx + 3] = TO_BUF(FLOAT_TYPEV2(v1.zw));
 }
 #endif
 
@@ -150,6 +306,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             store_a(col, k_pair + 8, FLOAT_TYPEV2(v1.xy));
             store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.zw));
 #elif defined(DATA_A_Q5_0)
+#if LOAD_VEC_A == 8
+            A_RAW_T raw;
+            fetch_a(pos_a, row, col, a_lane_off(row, col), raw);
+            store_a_raw(pos_a, row, col, a_shmem_index(col, row * LOAD_VEC_A / 2), raw);
+#else
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
             const uint ib = idx / 8;
@@ -164,6 +325,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const vec4 v = (vec4((vui & 0xF) | qh0.x, ((vui >> 4) & 0xF) | qh0.y, ((vui >> 8) & 0xF) | qh1.x, (vui >> 12) | qh1.y) - 16.0f) * d;
             store_a(col, row,     FLOAT_TYPEV2(v.xz));
             store_a(col, row + 8, FLOAT_TYPEV2(v.yw));
+#endif
 #elif defined(DATA_A_Q5_1)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
@@ -187,6 +349,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             store_a(col, k_pair + 8, FLOAT_TYPEV2(v0.yw));
             store_a(col, k_pair + 9, FLOAT_TYPEV2(v1.yw));
 #elif defined(DATA_A_Q8_0)
+#if LOAD_VEC_A == 8
+            A_RAW_T raw;
+            fetch_a(pos_a, row, col, a_lane_off(row, col), raw);
+            store_a_raw(pos_a, row, col, a_shmem_index(col, row * LOAD_VEC_A / 2), raw);
+#else
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
             const uint ib = idx / 8;
@@ -200,6 +367,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
             store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+#endif
 #elif defined(DATA_A_Q1_0)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
@@ -280,6 +448,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
 #elif defined(DATA_A_Q3_K)
+#if LOAD_VEC_A == 8
+            A_RAW_T raw;
+            fetch_a(pos_a, row, col, a_lane_off(row, col), raw);
+            store_a_raw(pos_a, row, col, a_shmem_index(col, row * LOAD_VEC_A / 2), raw);
+#else
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
             const uint ib = idx / 128;                   // 2 values per idx
@@ -302,6 +475,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             store_a(col, row * LOAD_VEC_A / 2, FLOAT_TYPEV2(dl * (qs.x - hm.x),
                                                               dl * (qs.y - hm.y)));
+#endif
 #elif defined(DATA_A_Q4_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
@@ -310,6 +484,14 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const uint n = iqs / 32;                   // 0,1,2,3
             const uint b = (iqs % 32) / 16;            // 0,1
+            const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
+
+#ifdef SCACHE_DM
+            // (d, m) precomputed per (tile row, sub-block) at superblock boundaries
+            const vec2 dm = vec2(scache_dm[col * 8 + 2 * n + b]);
+            const float d = dm.x;
+            const float m = dm.y;
+#else
             const uint is = 2 * n + b;                 // 0..7
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
 
@@ -350,6 +532,14 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
             const uint qhi = (iqs % 16) * 2;           // 0,2,4..30
 
+#ifdef SCACHE_DM
+            // (d, m) precomputed per (tile row, sub-block) at superblock boundaries
+            const vec2 dm = vec2(scache_dm[col * 8 + 2 * n + b]);
+            const float d = dm.x;
+            const float m = dm.y;
+#else
+            const uint is = 2 * n + b;                 // 0..7
+
             const vec2 loadd = vec2(data_a[ib].dm);
 
             const uvec3 scales = uvec3(data_a_packed32[ib].scales[0],
@@ -378,6 +568,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             store_a(col, k_pair,     FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m)));
             store_a(col, k_pair + 1, FLOAT_TYPEV2(fma(d, q.z, m), fma(d, q.w, m)));
 #elif defined(DATA_A_Q6_K)
+#if LOAD_VEC_A == 8
+            A_RAW_T raw;
+            fetch_a(pos_a, row, col, a_lane_off(row, col), raw);
+            store_a_raw(pos_a, row, col, a_shmem_index(col, row * LOAD_VEC_A / 2), raw);
+#else
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
             const uint ib = idx / 128;                  // 2 values per idx
@@ -398,6 +593,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const vec2 q = (vec2(unpack8(ql | (qh << 4)).xy) - 32) * dscale;
 
             store_a(col, row * LOAD_VEC_A / 2, FLOAT_TYPEV2(q.x, q.y));
+#endif
 #elif defined(DATA_A_IQ1_S)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
@@ -706,6 +902,189 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #endif
 }
 
+// ---- register prefetch (dense coopmat path, aligned pipelines) ----------------------------------
+// The fused load_*_to_shmem functions issue the global load and immediately consume it, so every BK
+// step stalls for the full memory latency before the tile reaches LDS (ISA audit 2026-09-13: the
+// f32-accumulator loop dropped from 526 to 340 instructions for +4% at n=512, i.e. the loop is
+// latency-bound, not issue-bound). fetch_* only issue the loads for the NEXT tile into registers;
+// store_*_raw dequantize/convert those registers into LDS one iteration later, after the WMMAs of
+// the current tile have covered the latency. Types are added as their fetch/store split is written.
+#if defined(COOPMAT) && (defined(DATA_A_F16) || defined(DATA_A_F32)) && LOAD_VEC_A == 8
+// f16 / f32 A, aligned pipelines only (the unaligned ones keep the fused scalar loader; see mul_mm.comp)
+#define A_PREFETCH 1
+#define A_RAW_T FLOAT_TYPEV8
+uint a_lane_off(const uint row, const uint col) { return col * p.stride_a / LOAD_VEC_A + row; }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out A_RAW_T raw) {
+    raw = FLOAT_TYPEV8(data_a[pos_a + lane_off]);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const A_RAW_T raw) {
+    buf_a[sidx]     = TO_BUF(raw[0].xy);
+    buf_a[sidx + 1] = TO_BUF(raw[0].zw);
+    buf_a[sidx + 2] = TO_BUF(raw[1].xy);
+    buf_a[sidx + 3] = TO_BUF(raw[1].zw);
+}
+#elif defined(COOPMAT) && (defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)) && defined(SCACHE_DM)
+#define A_PREFETCH 1
+// Index math with the uniform part split out. For K-quants stride_a is a multiple of 256 and pos_a
+// advances by BK/LOAD_VEC_A = 8 per step, so idx/64 = pos_a/64 + col*stride_a/256 and idx%64 =
+// pos_a%64 + row (row < 8, no carry). pos_a is uniform, so the superblock column kb and the 32-wide
+// sub-block sub are scalar; the per-lane part comes in precomputed (a_lane_off = the lane's
+// superblock row offset in dwords, a_store_idx = its LDS index).
+#if defined(DATA_A_Q4_K)
+#define A_RAW_T uint
+#else
+#define A_RAW_T uvec2   // x: qs dword, y: qh dword
+#endif
+#if defined(DATA_A_Q4_K)
+uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 256)) * 36 + row; }   // block_q4_K = 36 dwords
+#else
+uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 256)) * 44 + row; }   // block_q5_K = 44 dwords
+#endif
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out A_RAW_T raw) {
+    const uint kb  = pos_a / 64;
+    const uint sub = (pos_a % 64) / 8;
+#if defined(DATA_A_Q4_K)
+    // dword layout of block_q4_K: dm (1), scales (3), qs (32)
+    raw = data_a_u32[kb * 36 + lane_off + 4 + 8 * (sub / 2)];
+#else
+    // dword layout of block_q5_K: dm (1), scales (3), qh (8), qs (32); lane_off counts 44-dword blocks
+    raw.x = data_a_u32[kb * 44 + lane_off + 12 + 8 * (sub / 2)];
+    raw.y = data_a_u32[kb * 44 + lane_off + 4];
+#endif
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const A_RAW_T raw) {
+    const uint sub = (pos_a % 64) / 8;
+    const vec2 dm = vec2(scache_dm[col * 8 + sub]);
+#if defined(DATA_A_Q4_K)
+    const vec4 q = vec4(unpack8((raw >> (4 * (sub % 2))) & 0x0F0F0F0F));
+#else
+    const uint qs = (raw.x >> (4 * (sub % 2))) & 0x0F0F0F0F;
+    const uint qh = ((raw.y >> sub) & 0x01010101) << 4;
+    const vec4 q = vec4(unpack8(qs | qh));
+#endif
+    buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(fma(dm.x, q.x, dm.y), fma(dm.x, q.y, dm.y)));
+    buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(fma(dm.x, q.z, dm.y), fma(dm.x, q.w, dm.y)));
+}
+#elif defined(COOPMAT) && defined(DATA_A_Q8_0) && LOAD_VEC_A != 8
+#define A_PREFETCH 1
+#define A_RAW_T uvec2   // x: d bits, y: the lane's 4 int8 values
+uint a_lane_off(const uint row, const uint col) { return 0; }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out A_RAW_T raw) {
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint ib = idx / 8;
+    const uint iqs = idx & 0x07;
+    raw.x = uint(float16BitsToUint16(data_a_packed16[ib].d));
+    raw.y = pack32(u16vec2(data_a_packed16[ib].qs[2*iqs], data_a_packed16[ib].qs[2*iqs + 1]));
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const A_RAW_T raw) {
+    const float d = float(uint16BitsToFloat16(uint16_t(raw.x)));
+    const i8vec4 q = unpack8(int(raw.y));
+    const vec4 v = vec4(q) * d;
+    const uint k_pair = row * LOAD_VEC_A / 2;
+    store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
+    store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+}
+#elif defined(COOPMAT) && defined(DATA_A_Q5_0) && LOAD_VEC_A != 8
+#define A_PREFETCH 1
+#define A_RAW_T uvec2   // x: d bits | qs<<16, y: qh
+uint a_lane_off(const uint row, const uint col) { return 0; }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out A_RAW_T raw) {
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint ib = idx / 8;
+    const uint iqs = idx & 0x07;
+    raw.x = uint(float16BitsToUint16(data_a_packed16[ib].d)) | (uint(data_a_packed16[ib].qs[iqs]) << 16);
+    raw.y = uint(data_a_packed16[ib].qh[1]) << 16 | uint(data_a_packed16[ib].qh[0]);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const A_RAW_T raw) {
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint iqs = idx & 0x07;
+    const float d = float(uint16BitsToFloat16(uint16_t(raw.x & 0xFFFF)));
+    const uint uint_qh = raw.y;
+    const ivec2 qh0 = ivec2(((uint_qh >> 2*iqs) << 4) & 0x10, (uint_qh >> (2*iqs + 12)) & 0x10);
+    const ivec2 qh1 = ivec2(((uint_qh >> (2*iqs + 1)) << 4) & 0x10, (uint_qh >> (2*iqs + 13)) & 0x10);
+    const uint vui = raw.x >> 16;
+    const vec4 v = (vec4((vui & 0xF) | qh0.x, ((vui >> 4) & 0xF) | qh0.y, ((vui >> 8) & 0xF) | qh1.x, (vui >> 12) | qh1.y) - 16.0f) * d;
+    store_a(col, row,     FLOAT_TYPEV2(v.xz));
+    store_a(col, row + 8, FLOAT_TYPEV2(v.yw));
+}
+#elif defined(COOPMAT) && defined(DATA_A_Q6_K) && LOAD_VEC_A != 8
+#define A_PREFETCH 1
+#define A_RAW_T uvec2   // x: d bits | ql<<16, y: qh | scale<<16
+uint a_lane_off(const uint row, const uint col) { return 0; }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out A_RAW_T raw) {
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint ib = idx / 128;
+    const uint iqs = idx % 128;
+    const uint n = iqs / 64;
+    const uint is_b = (iqs % 16) / 8;
+    const uint qhshift = ((iqs % 64) / 16) * 2;
+    const uint is = 8 * n + qhshift + is_b;
+    const uint qsi = n * 32 + (iqs % 32);
+    const uint qhi = n * 16 + (iqs % 16);
+    raw.x = uint(float16BitsToUint16(data_a[ib].d)) | (uint(data_a_packed16[ib].ql[qsi]) << 16);
+    raw.y = uint(data_a_packed16[ib].qh[qhi]) | (uint(uint8_t(data_a[ib].scales[is])) << 16);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const A_RAW_T raw) {
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint iqs = idx % 128;
+    const uint b = ((iqs % 64) / 32) * 4;
+    const uint qhshift = ((iqs % 64) / 16) * 2;
+    const float dscale = float(uint16BitsToFloat16(uint16_t(raw.x & 0xFFFF))) * float(int8_t(uint8_t(raw.y >> 16)));
+    const uint ql = ((raw.x >> 16) >> b) & 0x0F0F;
+    const uint qh = ((raw.y & 0xFFFF) >> qhshift) & 0x0303;
+    const vec2 q = (vec2(unpack8(ql | (qh << 4)).xy) - 32) * dscale;
+    store_a(col, row * LOAD_VEC_A / 2, FLOAT_TYPEV2(q.x, q.y));
+}
+#elif defined(COOPMAT) && defined(DATA_A_Q3_K) && LOAD_VEC_A != 8
+#define A_PREFETCH 1
+#define A_RAW_T uvec2   // x: d bits | qs<<16, y: hmask | sc0<<16 | sc1<<24
+uint a_lane_off(const uint row, const uint col) { return 0; }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out A_RAW_T raw) {
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint ib = idx / 128;
+    const uint iqs = idx % 128;
+    const uint n = iqs / 64;
+    const uint qsi = n * 32 + (iqs % 16) * 2;
+    const uint hmi =          (iqs % 16) * 2;
+    const uint is = iqs / 8;
+    raw.x = uint(float16BitsToUint16(data_a[ib].d)) | (uint(data_a_packed16[ib].qs[qsi / 2]) << 16);
+    raw.y = uint(data_a_packed16[ib].hmask[hmi / 2]) | (uint(data_a[ib].scales[is % 8]) << 16) | (uint(data_a[ib].scales[8 + (is % 4)]) << 24);
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const A_RAW_T raw) {
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint iqs = idx % 128;
+    const uint n = iqs / 64;
+    const uint is = iqs / 8;
+    const uint halfsplit = ((iqs % 64) / 16);
+    const uint qsshift = halfsplit * 2;
+    const uint sc0 = (raw.y >> 16) & 0xFF;
+    const uint sc1 = (raw.y >> 24) & 0xFF;
+    const int8_t us = int8_t(((sc0 >> (4 * int(is / 8))) & 0xF) | (((sc1 >> (2 * int(is / 4))) & 3) << 4));
+    const float dl = float(uint16BitsToFloat16(uint16_t(raw.x & 0xFFFF))) * float(us - 32);
+    const vec2 qs = vec2(unpack8(((raw.x >> 16) >> qsshift) & 0x0303).xy);
+    const vec2 hm = vec2(unpack8((((raw.y & 0xFFFF) >> (4 * n + halfsplit)) & 0x0101 ^ 0x0101) << 2).xy);
+    store_a(col, row * LOAD_VEC_A / 2, FLOAT_TYPEV2(dl * (qs.x - hm.x), dl * (qs.y - hm.y)));
+}
+#endif
+#if defined(COOPMAT) && LOAD_VEC_B == 8 && !defined(DATA_B_BF16)
+#define B_PREFETCH 1
+void fetch_b(const uint pos_b, const uint row, const uint col, out B_TYPE raw) {
+#ifdef MUL_MAT_ID
+    const u16vec2 row_idx = row_ids[col];
+    raw = data_b[pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row];
+#else
+    raw = data_b[pos_b + col * p.stride_b / LOAD_VEC_B + row];
+#endif
+}
+void store_b_raw(const uint buf_idx, const B_TYPE raw) {
+    FLOAT_TYPEV8 bb = FLOAT_TYPEV8(raw);
+    buf_b[buf_idx + 0] = TO_BUF(bb[0].xy);
+    buf_b[buf_idx + 1] = TO_BUF(bb[0].zw);
+    buf_b[buf_idx + 2] = TO_BUF(bb[1].xy);
+    buf_b[buf_idx + 3] = TO_BUF(bb[1].zw);
+}
+#endif
+
 #if !defined(MUL_MAT_ID)
 void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint idx_n, const uint block, const uint end_k) {
 #if LOAD_VEC_B == 8
@@ -714,10 +1093,10 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
                 const uint idx = pos_b + col * p.stride_b / LOAD_VEC_B + row;
                 const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
                 FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
-                buf_b[buf_idx + 0] = bb[0].xy;
-                buf_b[buf_idx + 1] = bb[0].zw;
-                buf_b[buf_idx + 2] = bb[1].xy;
-                buf_b[buf_idx + 3] = bb[1].zw;
+                buf_b[buf_idx + 0] = TO_BUF(bb[0].xy);
+                buf_b[buf_idx + 1] = TO_BUF(bb[0].zw);
+                buf_b[buf_idx + 2] = TO_BUF(bb[1].xy);
+                buf_b[buf_idx + 3] = TO_BUF(bb[1].zw);
                 return;
             }
 #elif LOAD_VEC_B == 4
@@ -729,20 +1108,20 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 #else
                 FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
 #endif
-                buf_b[buf_idx + 0] = bb.xy;
-                buf_b[buf_idx + 1] = bb.zw;
+                buf_b[buf_idx + 0] = TO_BUF(bb.xy);
+                buf_b[buf_idx + 1] = TO_BUF(bb.zw);
                 return;
             }
 #endif
             const uint idx = pos_b + col * p.stride_b + row * 2;
             const uint buf_idx = col * SHMEM_STRIDE + row;
             if (idx_n < p.N && block + row * 2 + 1 < end_k) {
-                buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
-                                              TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
+                buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
+                                              TO_FLOAT_TYPE(data_b_scalar[idx + 1])));
             } else if (idx_n < p.N && block + row * 2 < end_k) {
-                buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
+                buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f));
             } else {
-                buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
+                buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(0.0f));
             }
 }
 #else
@@ -754,10 +1133,10 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
                 const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
                 const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
                 FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
-                buf_b[buf_idx + 0] = bb[0].xy;
-                buf_b[buf_idx + 1] = bb[0].zw;
-                buf_b[buf_idx + 2] = bb[1].xy;
-                buf_b[buf_idx + 3] = bb[1].zw;
+                buf_b[buf_idx + 0] = TO_BUF(bb[0].xy);
+                buf_b[buf_idx + 1] = TO_BUF(bb[0].zw);
+                buf_b[buf_idx + 2] = TO_BUF(bb[1].xy);
+                buf_b[buf_idx + 3] = TO_BUF(bb[1].zw);
                 return;
             }
 #elif LOAD_VEC_B == 4
@@ -770,8 +1149,8 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 #else
                 FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
 #endif
-                buf_b[buf_idx + 0] = bb.xy;
-                buf_b[buf_idx + 1] = bb.zw;
+                buf_b[buf_idx + 0] = TO_BUF(bb.xy);
+                buf_b[buf_idx + 1] = TO_BUF(bb.zw);
                 return;
             }
 #endif
@@ -780,14 +1159,14 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
             if (row_i < _ne1 && block + row * 2 + 1 < end_k) {
                 const u16vec2 row_idx = row_ids[col];
                 const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
-                buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
-                                              TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
+                buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
+                                              TO_FLOAT_TYPE(data_b_scalar[idx + 1])));
             } else if (row_i < _ne1 && block + row * 2 < end_k) {
                 const u16vec2 row_idx = row_ids[col];
                 const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
-                buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
+                buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f));
             } else {
-                buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
+                buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(0.0f));
             }
 }
 #endif

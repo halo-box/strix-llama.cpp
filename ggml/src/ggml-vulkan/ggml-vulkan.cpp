@@ -996,6 +996,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
+    vk_pipeline pipeline_dequant_f16_transpose_vt; // f16 V -> V^T per head for the coopmat1 FA (V_TRANSPOSED)
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -3185,6 +3186,12 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     GGML_ASSERT(parameter_count > 0);
     GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
+    if (getenv("GGML_VK_DUMP_SPEC")) {
+        fprintf(stderr, "VK_SPEC %s params=%u spv=%zu wg=(%u,%u,%u) subgroup=%u spec=", pipeline->name.c_str(), parameter_count, spv_size,
+                wg_denoms[0], wg_denoms[1], wg_denoms[2], required_subgroup_size);
+        for (uint32_t c : specialization_constants) fprintf(stderr, "%u,", c);
+        fprintf(stderr, "\n");
+    }
 
     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
 
@@ -4263,7 +4270,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
                                                   bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type,
-                                                  bool use_dynamic_kv = false) {
+                                                  bool use_dynamic_kv = false, bool use_vt = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -4271,7 +4278,8 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
                      (use_mask          ? 2 : 0) |
                      (use_logit_softcap ? 4 : 0) |
                      (old_amd_windows   ? 8 : 0) |
-                     (use_dynamic_kv    ? 16 : 0);
+                     (use_dynamic_kv    ? 16 : 0) |
+                     (use_vt            ? 32 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -4616,7 +4624,11 @@ static bool ggml_vk_mmid_f16b_enabled() {
 static int ggml_vk_dense_f16b_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_VK_DENSE_F16B");
-        if (e == nullptr) return 2;
+        // 2026-09-13: with the prefetch loaders + f32 accumulator the f16-B kernels win or tie on every shape in
+        // the FN/27B op grid (+4..7% at n=512 K=14336, +30% on 320x2048x10240, never below the 3% noise floor),
+        // and PPL is bit-identical (B is f16 inside the tile either way). Default is now 1 (all quantized dense
+        // matmuls); GGML_VK_DENSE_F16B=a restores the fitted auto predicate.
+        if (e == nullptr) return 1;
         if (e[0] == 'a') return 2;
         if (e[0] == 't') return 3;
         return atoi(e) != 0 ? 1 : 0;
@@ -5323,6 +5335,31 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 wave32_tile(m_warptile);
                 wave32_tile(s_warptile);
             }
+            // GGML_VK_WARPTILE_L / _M / _ID_L / _ID_M = "BLOCK_SIZE,BM,BN,BK,WM,WN,WMITER,TM,TN,TK,WARP": replace a
+            // warptile outright (kernel-rewrite experiments, 2026-09-13). No validation beyond the count.
+            auto warptile_env = [](const char * name, std::vector<uint32_t> & tile) {
+                const char * wt = getenv(name);
+                if (!wt) return;
+                std::vector<uint32_t> t;
+                std::string str(wt);
+                size_t pos = 0;
+                while (pos <= str.size()) {
+                    size_t c = str.find(',', pos);
+                    if (c == std::string::npos) c = str.size();
+                    if (c > pos) t.push_back((uint32_t) std::stoul(str.substr(pos, c - pos)));
+                    pos = c + 1;
+                }
+                if (t.size() == 11) {
+                    tile = t;
+                    GGML_LOG_INFO("ggml_vulkan: %s override %s\n", name, wt);
+                } else {
+                    GGML_LOG_WARN("ggml_vulkan: %s needs 11 values, ignored\n", name);
+                }
+            };
+            warptile_env("GGML_VK_WARPTILE_L", l_warptile);
+            warptile_env("GGML_VK_WARPTILE_M", m_warptile);
+            warptile_env("GGML_VK_WARPTILE_ID_L", l_warptile_id);
+            warptile_env("GGML_VK_WARPTILE_ID_M", m_warptile_id);
         }
 
         // WARP -> required subgroup size, or 0 where the device cannot honor one.
@@ -6269,6 +6306,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q8_0], "dequant_q8_0", dequant_q8_0_len, dequant_q8_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q8_0], "dequant_q8_0_transpose", dequant_q8_0_transpose_len, dequant_q8_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_F16], "dequant_f16_transpose", dequant_f16_transpose_len, dequant_f16_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 8, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_f16_transpose_vt, "dequant_f16_transpose_vt", dequant_f16_transpose_vt_len, dequant_f16_transpose_vt_data, "main", 2, 5 * sizeof(uint32_t), {256 * 8, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q2_K], "dequant_q2_k", dequant_q2_k_len, dequant_q2_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ2_0], "dequant_tq2_0", dequant_tq2_0_len, dequant_tq2_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ1_0], "dequant_tq1_0", dequant_tq1_0_len, dequant_tq1_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
@@ -7954,6 +7992,18 @@ static vk_device ggml_vk_get_device(size_t idx) {
                     device->coopmat_int_m = prop.MSize;
                     device->coopmat_int_n = prop.NSize;
                     device->coopmat_int_k = prop.KSize;
+                }
+                // f32 accumulator for the KHR coopmat matmuls on RADV (GGML_VK_F32ACC, default on for RADV; =0 restores
+                // the f16 accumulator). RADV lowers the f16 coopmat accumulator to 16-bit phis and ACO pays ~190
+                // register copies per BK step in mul_mm (2026-09-13 ISA audit); the f32-accumulator WMMA runs at the same
+                // rate with none of them. Measured: dense +4..18% per op, Qwen3.8-Flash-Next pp2048 +1% on top of the
+                // prefetch loaders, and PPL 5.0393 vs 5.0452 (f16acc) on Qwen3.8-27B UD-Q4_K_XL.
+                {
+                    static const int f32acc_env = [] { const char * e = getenv("GGML_VK_F32ACC"); return e ? atoi(e) : -1; }();
+                    const bool f32acc = f32acc_env >= 0 ? f32acc_env != 0 : device->driver_id == vk::DriverId::eMesaRadv;
+                    if (f32acc) {
+                        device->coopmat_acc_f16_support = false;
+                    }
                 }
 #if defined(VK_KHR_shader_bfloat16) && defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
                 if (bfloat16_support &&
@@ -13409,9 +13459,19 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // small by construction
     bool use_mask_opt = mask && !fa_compact.active && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+    // V^T for the coopmat1 prefill FA (GGML_VK_FA_VT, default on): transpose f16 V per head into a
+    // [HSV][KV] scratch so the P x V B-operand fragments are contiguous per lane. Aligned pipelines only
+    // (the clamped path stages V row-major), no shmem staging, one sequence, not on the compact paths.
+    static const char * fa_vt_env = getenv("GGML_VK_FA_VT");
+    const bool use_vt = !(fa_vt_env && fa_vt_env[0] == '0') &&
+                        tuning_params.path == FA_COOPMAT1 && aligned && !tuning_params.shmem_staging &&
+                        v_type_eff == GGML_TYPE_F16 && (!fa_compact.active || fa_compact.separate_v) && neq1 >= 64 && nev3 == 1 &&
+                        (KV % 8) == 0 && (HSV % 8) == 0 && ctx->device->pipeline_dequant_f16_transpose_vt != nullptr &&
+                        (use_dequant_kv || fa_compact.active || ((nbv1 % sizeof(ggml_fp16_t)) == 0 && (nbv2 % sizeof(ggml_fp16_t)) == 0)) &&
+                        (uint64_t)HSV * KV * nev2 * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange;
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
-                                                                   fa_compact.dynamic_kv);
+                                                                   fa_compact.dynamic_kv, use_vt);
 
     vk_pipeline pipeline = nullptr;
 
@@ -13524,8 +13584,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         const uint64_t fp = sizeof(ggml_fp16_t);
         const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * fp;
         const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * fp;
-        if (ctx->prealloc_size_x < k_f16_sz + v_f16_sz) {
-            ctx->prealloc_size_x = k_f16_sz + v_f16_sz;
+        // size vs maxStorageBufferRange is enforced by the use_dequant_kv gate above (falls back rather than aborting)
+        if (ctx->prealloc_size_x < k_f16_sz + v_f16_sz + (use_vt ? v_f16_sz : 0)) {
+            ctx->prealloc_size_x = k_f16_sz + v_f16_sz + (use_vt ? v_f16_sz : 0);
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
         vk_pipeline tr_k = ctx->device->pipeline_dequant_transpose[k->type];
@@ -13551,6 +13612,36 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         ggml_vk_perf_mark_subop(ctx, subctx, kv_needs_dequant || (k_quant && v_quant)
                                              ? "FA_KV_DEQUANT (sub-op)"
                                              : "FA_KV_CONTIGUIZE (sub-op)");
+    }
+
+    if (use_vt) {
+        // V -> V^T [nev2][HSV][KV] in prealloc_x (after the K/V contiguize scratch when that ran)
+        const uint64_t v_f16_sz = (uint64_t)HSV * KV * nev2 * sizeof(ggml_fp16_t);
+        const uint64_t vt_off = use_dequant_kv ? ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * sizeof(ggml_fp16_t) : 0;
+        if (ctx->prealloc_size_x < vt_off + v_f16_sz) {
+            ctx->prealloc_size_x = vt_off + v_f16_sz;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        vk_pipeline tr_vt = ctx->device->pipeline_dequant_f16_transpose_vt;
+        ggml_pipeline_request_descriptor_sets(ctx, tr_vt, 1);
+        if (ctx->prealloc_x_need_sync && !use_dequant_kv) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        vk_subbuffer vt_dst = vk_subbuffer{ ctx->prealloc_x, vt_off, v_f16_sz };
+        // source element strides: contiguized scratch is [HS, KV, NH]; the compact (gathered) V is
+        // [n_head_kv][kv_c][HSV] f16 with v_row_elems per row (KV == kv_c here); the tensor itself has nbv1 / nbv2
+        const uint32_t src_kv_stride   = fa_compact.active ? fa_compact.v_row_elems      : use_dequant_kv ? HSV      : (uint32_t)(nbv1 / sizeof(ggml_fp16_t));
+        const uint32_t src_head_stride = fa_compact.active ? fa_compact.v_row_elems * KV : use_dequant_kv ? HSV * KV : (uint32_t)(nbv2 / sizeof(ggml_fp16_t));
+        const uint32_t vt_nel = (uint32_t)(HSV * KV * nev2);
+        const std::vector<uint32_t> pc = { (uint32_t)HSV, (uint32_t)nev2, src_kv_stride, src_head_stride, vt_nel };
+        ggml_vk_dispatch_pipeline(ctx, subctx, tr_vt, { v_buf, vt_dst }, pc, { vt_nel, 1, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+        ctx->prealloc_x_need_sync = true;
+        v_buf = vt_dst;
+        v_stride = KV;
+        nbv2_eff = (uint32_t)((uint64_t)HSV * KV * sizeof(ggml_fp16_t));
+        nbv3_eff = (uint32_t)((uint64_t)HSV * KV * nev2 * sizeof(ggml_fp16_t));
+        ggml_vk_perf_mark_subop(ctx, subctx, "FA_V_TRANSPOSE (sub-op)");
     }
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;

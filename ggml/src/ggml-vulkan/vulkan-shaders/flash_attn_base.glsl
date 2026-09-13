@@ -29,6 +29,9 @@ const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // workgroup counts derive from neq1/neq2/neq3 and never from KV, so no indirect dispatch is
 // needed: only this loop bound changes. Folds away for every other pipeline.
 const bool DYNAMIC_KV       = (Flags & 16) != 0;
+// V is supplied transposed per head ([HSV][KV], kv contiguous) so the coopmat1 P x V B-operand
+// fragment is a contiguous 32-byte run per lane instead of 16 kv-strided halves (2026-09-13)
+const bool V_TRANSPOSED     = (Flags & 32) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

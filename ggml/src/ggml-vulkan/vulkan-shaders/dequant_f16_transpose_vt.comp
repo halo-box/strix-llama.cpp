@@ -1,0 +1,32 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float16_t data_a[];};
+layout (binding = 1) writeonly buffer D {f16vec4 data_b[];};
+
+// V -> V^T per head for the coopmat1 FA (V_TRANSPOSED): source V[ns=1][nh][kv][hs] with element
+// strides p.stride_a (kv) and p.stride_b (head), hs contiguous; dest [nh][hs][kv] tightly packed
+// (p.M = HS, p.K = NH, kv count = p.nel / (HS * NH)). Each invocation writes 8 consecutive kv of
+// one (nh, hs): one coalesced 16-byte store fed by 8 kv-strided 2-byte loads.
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint d0 = i * 8;
+    if (d0 >= p.nel) {
+        return;
+    }
+    const uint HS = p.M, NH = p.K;
+    const uint KVn = p.nel / (HS * NH);
+    const uint kv0 = d0 % KVn;
+    const uint hs  = (d0 / KVn) % HS;
+    const uint nh  = d0 / (KVn * HS);
+    const uint src = nh * p.stride_b + kv0 * p.stride_a + hs;
+    f16vec4 lo = f16vec4(data_a[src], data_a[src + p.stride_a], data_a[src + 2 * p.stride_a], data_a[src + 3 * p.stride_a]);
+    f16vec4 hi = f16vec4(data_a[src + 4 * p.stride_a], data_a[src + 5 * p.stride_a], data_a[src + 6 * p.stride_a], data_a[src + 7 * p.stride_a]);
+    data_b[d0 / 4]     = lo;
+    data_b[d0 / 4 + 1] = hi;
+}

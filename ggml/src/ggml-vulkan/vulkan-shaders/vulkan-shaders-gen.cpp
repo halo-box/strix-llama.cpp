@@ -482,6 +482,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 
     if (coopmat) {
         base_dict["COOPMAT"] = "1";
+        // gfx11 fragment assembly from 32-bit LDS reads (see mul_mm.comp); GGML_VK_MANUAL_FRAG=0 at generation time restores coopMatLoad
+        if (!(getenv("GGML_VK_MANUAL_FRAG") && getenv("GGML_VK_MANUAL_FRAG")[0] == '0')) {
+            base_dict["COOPMAT_MANUAL_FRAG"] = "1";
+        }
     }
 #if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
     if (coopmat2) {
@@ -603,6 +607,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         std::string data_a_key = "DATA_A_" + to_uppercase(tname);
         // For aligned matmul loads
         std::string load_vec_a = (coopmat2 || tname == "f32" || tname == "f16" || tname == "bf16") ? load_vec : load_vec_quant;
+        // KHR coopmat q6_K / q3_K: 8 k-values per lane per load (whole-dword fetches + register prefetch, mul_mm_funcs.glsl)
+        if (coopmat && (tname == "q6_k" || tname == "q3_k" || tname == "q8_0" || tname == "q5_0")) {
+            load_vec_a = "8";
+        }
 
         const std::map<std::string, std::string> float_type_dict = {
             {"FLOAT_TYPE",   FLOAT_TYPE(1, tname)},
@@ -798,6 +806,7 @@ void process_shaders() {
         // Strided-copy counterpart for f16 KV (contiguize the head-interleaved cache layout).
         if (tname == "f16") {
             string_to_spv("dequant_f16_transpose", "dequant_f16_transpose.comp", {});
+            string_to_spv("dequant_f16_transpose_vt", "dequant_f16_transpose_vt.comp", {});
         }
 
         shader = (tname == "f32" || tname == "f16" || tname == "bf16") ? "get_rows.comp" : "get_rows_quant.comp";
