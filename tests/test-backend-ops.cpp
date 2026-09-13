@@ -11801,6 +11801,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 1, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 4, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 1, 0, 2051, false, 2, 0, GGML_TYPE_F16, 256, 24, 2, false));
+    // qwen4exp QSA PREFILL tiles: nb >= 64 takes the per-tile union path (GQA, separate V); a tile
+    // boundary inside the batch (200), whole tiles (256), heavy neighbour overlap (ov 80) and none
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192,  64, 0,  512, false, 1, 80, GGML_TYPE_F16, 256, 24, 2, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192, 200, 0,  512, false, 1,  0, GGML_TYPE_F16, 256, 24, 2, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 256, 0, 2051, false, 1, 50, GGML_TYPE_F16, 256, 24, 2, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 1, 0, 2051, true,  1, 0, GGML_TYPE_F16, 256, 24, 2, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 1, 512, 512, false, 1, 0, GGML_TYPE_F16, 512, 64, 1, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86));
