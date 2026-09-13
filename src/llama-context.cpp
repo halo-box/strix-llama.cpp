@@ -15,6 +15,9 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include "ggml-alloc.h"
+
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -166,6 +169,107 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+// A token id cutoff selects common tokens only if ids follow BPE merge order (an earlier merge is a more frequent pair).
+// Check it: the vocab must be BPE, and ids must increase with the rank of the first merge that makes each token.
+static bool mtp_draft_vocab_ids_follow_merge_order(const llama_vocab & vocab, std::string & why) {
+    if (vocab.get_type() != LLAMA_VOCAB_TYPE_BPE) {
+        why = "the tokenizer is not BPE";
+        return false;
+    }
+    const std::vector<std::string> merges = vocab.get_bpe_merges();
+    const int n_vocab = (int) vocab.n_tokens();
+    if (merges.size() < (size_t) n_vocab / 2) {
+        why = format("the tokenizer has only %zu merges for %d tokens", merges.size(), n_vocab);
+        return false;
+    }
+    std::vector<uint8_t> seen((size_t) n_vocab, 0);
+    llama_token last = -1;
+    size_t n_first = 0;
+    size_t n_out_of_order = 0;
+    for (const std::string & m : merges) {
+        const size_t sp = m.find(' ');
+        if (sp == std::string::npos) {
+            continue;
+        }
+        const llama_token id = vocab.text_to_token(m.substr(0, sp) + m.substr(sp + 1));
+        if (id == LLAMA_TOKEN_NULL || id < 0 || id >= n_vocab || seen[(size_t) id]) {
+            continue;
+        }
+        seen[(size_t) id] = 1;
+        n_first++;
+        if (id < last) {
+            n_out_of_order++;
+        }
+        last = std::max(last, id);
+    }
+    if (n_first < (size_t) n_vocab / 2 || n_out_of_order > 0) {
+        why = format("token ids do not follow BPE merge order (%zu of %zu merge-produced tokens out of order)", n_out_of_order, n_first);
+        return false;
+    }
+    return true;
+}
+
+// Copy the LM head rows of token ids < n_keep plus control and user-defined tokens into model.mtp_draft_head.
+static void mtp_draft_vocab_build(const llama_model & model, int n_keep) {
+    const ggml_tensor * out = model.output;
+    // probe contexts (common_fit_params) use a model with unallocated weights: skip them
+    if (out == nullptr || out->buffer == nullptr || out->data == nullptr || model.mtp_draft_head != nullptr) {
+        return;
+    }
+    const int n_vocab = (int) model.vocab.n_tokens();
+    if (n_keep >= n_vocab) {
+        return;
+    }
+    std::string why;
+    if (!mtp_draft_vocab_ids_follow_merge_order(model.vocab, why)) {
+        LLAMA_LOG_ERROR("%s: mtp_draft_vocab = %d ignored: %s\n", __func__, n_keep, why.c_str());
+        return;
+    }
+    std::vector<int64_t> ids;
+    ids.reserve(n_vocab);
+    for (int t = 0; t < n_vocab; ++t) {
+        const int attr = (int) model.vocab.token_get_attr(t);
+        if (t < n_keep || (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
+            ids.push_back(t);
+        }
+    }
+    const int64_t n_sel = (int64_t) ids.size();
+    if (n_sel >= out->ne[1]) {
+        return;
+    }
+    const size_t row_bytes = out->nb[1];
+    std::vector<uint8_t> host((size_t) n_sel * row_bytes);
+    for (size_t j = 0; j < ids.size(); ) {
+        size_t k = j;
+        while (k + 1 < ids.size() && ids[k + 1] == ids[k] + 1) {
+            k++;
+        }
+        ggml_backend_tensor_get(out, host.data() + j * row_bytes, (size_t) ids[j] * row_bytes, (k - j + 1) * row_bytes);
+        j = k + 1;
+    }
+
+    ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr gctx(ggml_init(ip));
+    ggml_tensor * head = ggml_new_tensor_2d(gctx.get(), out->type, out->ne[0], n_sel);
+    ggml_tensor * tids = ggml_new_tensor_1d(gctx.get(), GGML_TYPE_I64, n_sel);
+    ggml_set_name(head, "mtp_draft_head");
+    ggml_set_name(tids, "mtp_draft_ids");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(gctx.get(), ggml_backend_buffer_get_type(out->buffer));
+    if (buf == nullptr) {
+        LLAMA_LOG_ERROR("%s: mtp_draft_vocab: buffer allocation failed, draft head unchanged\n", __func__);
+        return;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(head, host.data(), 0, host.size());
+    ggml_backend_tensor_set(tids, ids.data(), 0, ids.size() * sizeof(int64_t));
+    model.mtp_draft_head = head;
+    model.mtp_draft_ids  = tids;
+    model.mtp_draft_ctx  = std::move(gctx);
+    model.mtp_draft_buf.reset(buf);
+    LLAMA_LOG_INFO("%s: mtp_draft_vocab = %d: MTP draft head uses %lld of %lld rows (%.2f MiB of %s)\n", __func__, n_keep,
+                   (long long) n_sel, (long long) out->ne[1], (double) (n_sel * row_bytes) / 1048576.0, ggml_type_name(out->type));
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -567,6 +671,10 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+        }
+
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.mtp_draft_vocab > 0) {
+            mtp_draft_vocab_build(model, params.mtp_draft_vocab);
         }
 
         sched_reserve();
@@ -4030,6 +4138,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.mtp_draft_vocab             =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
