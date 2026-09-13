@@ -13137,8 +13137,13 @@ static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_c
     const uint32_t N       = (uint32_t) q->ne[1];
     const uint32_t n_tiles = (N + TILE - 1) / TILE;
 
-    const uint32_t row_bytes   = (uint32_t) k->nb[1];  // f16 rows are contiguous
-    const uint32_t v_row_bytes = (uint32_t) v->nb[1];
+    // The compact scratch packs rows at their row SIZE; the source stride k->nb[1] is only equal to it
+    // when the cache holds one KV head. Qwen3.8-Flash-Next interleaves its 2 KV heads (nb[1] = 2x the
+    // row), and using nb[1] here put KV head 1's rows at twice the right head stride: every query head
+    // over KV head 1 read the wrong K/V, PPL 543-723 vs 3.01 at c8192 (found 2026-09-13; the op tests
+    // use contiguous single-stride K/V and could not see it).
+    const uint32_t row_bytes   = (uint32_t) ggml_row_size(k->type, k->ne[0]);
+    const uint32_t v_row_bytes = (uint32_t) ggml_row_size(v->type, v->ne[0]);
     const uint32_t row_words   = (uint32_t) ggml_row_size(k->type, k->ne[0]) / 4;
     const uint32_t v_row_words = (uint32_t) ggml_row_size(v->type, v->ne[0]) / 4;
     const uint32_t max_union   = std::min<uint32_t>(TILE * n_top_k, n_kv - n_kv_raw);

@@ -8313,9 +8313,10 @@ struct test_flash_attn_ext_top_k : public test_case {
     const int64_t nh;
     const int64_t nh_kv;
     const bool    shared_kv;
+    const bool    kv_interleaved; // K/V as permuted views of a [hs, nh_kv, kv] cache (nb[1] = nh_kv rows): the llama.cpp GQA cache layout
 
     std::string vars() override {
-        return VARS_TO_STR12(kv, nb, n_kv_raw, n_top_k, sinks, ns, ov, type_K, hs, nh, nh_kv, shared_kv);
+        return VARS_TO_STR13(kv, nb, n_kv_raw, n_top_k, sinks, ns, ov, type_K, hs, nh, nh_kv, shared_kv, kv_interleaved);
     }
 
     double max_nmse_err() override {
@@ -8331,22 +8332,26 @@ struct test_flash_attn_ext_top_k : public test_case {
 
     test_flash_attn_ext_top_k(int64_t kv = 768, int64_t nb = 8, int64_t n_kv_raw = 64, int64_t n_top_k = 128, bool sinks = false, int64_t ns = 1, int64_t ov = 0,
                               ggml_type type_K = GGML_TYPE_F16,
-                              int64_t hs = 512, int64_t nh = 64, int64_t nh_kv = 1, bool shared_kv = true)
+                              int64_t hs = 512, int64_t nh = 64, int64_t nh_kv = 1, bool shared_kv = true, bool kv_interleaved = false)
         : kv(kv), nb(nb), n_kv_raw(n_kv_raw), n_top_k(n_top_k), sinks(sinks), ns(ns), ov(ov), type_K(type_K),
-          hs(hs), nh(nh), nh_kv(nh_kv), shared_kv(shared_kv && nh_kv == 1) {}
+          hs(hs), nh(nh), nh_kv(nh_kv), shared_kv(shared_kv && nh_kv == 1), kv_interleaved(kv_interleaved) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, ns);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hs, kv, nh_kv, ns);
+        ggml_tensor * k = kv_interleaved
+            ? ggml_permute(ctx, ggml_new_tensor_4d(ctx, type_K, hs, nh_kv, kv, ns), 0, 2, 1, 3)
+            : ggml_new_tensor_4d(ctx, type_K, hs, kv, nh_kv, ns);
         ggml_set_name(k, "k");
 
         // V4 CSA attends over the K latent itself: V is the same cache tensor. An ordinary
         // GQA cache has a V of its own, which is the second thing the gather has to compact.
         ggml_tensor * v = shared_kv
             ? ggml_view_4d(ctx, k, hs, kv, nh_kv, ns, k->nb[1], k->nb[2], k->nb[3], 0)
-            : ggml_new_tensor_4d(ctx, type_K, hs, kv, nh_kv, ns);
+            : kv_interleaved
+                ? ggml_permute(ctx, ggml_new_tensor_4d(ctx, type_K, hs, nh_kv, kv, ns), 0, 2, 1, 3)
+                : ggml_new_tensor_4d(ctx, type_K, hs, kv, nh_kv, ns);
         ggml_set_name(v, "v");
 
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, ns);
@@ -11806,6 +11811,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192,  64, 0,  512, false, 1, 80, GGML_TYPE_F16, 256, 24, 2, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192, 200, 0,  512, false, 1,  0, GGML_TYPE_F16, 256, 24, 2, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 256, 0, 2051, false, 1, 50, GGML_TYPE_F16, 256, 24, 2, false));
+    // 2026-09-13: the model's actual prefill tile geometry at c8192 (32 tiles of 64, top-2051 per token,
+    // no neighbour overlap in the test's selection): llama-perplexity gives PPL 543-723 vs 3.01 with the
+    // union path off, so the op-level tests above were not reaching whatever breaks
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192, 2048, 0, 2051, false, 1,  0, GGML_TYPE_F16, 256, 24, 2, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192, 2048, 0, 2051, false, 1, 80, GGML_TYPE_F16, 256, 24, 2, false));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192,  512, 0, 2051, false, 1,  0, GGML_TYPE_F16, 256, 24, 2, false));
+    // the same with the cache's interleaved-head layout (K/V permuted views, nb[1] = nh_kv rows): the
+    // union path read KV head 1 at the wrong head stride until 2026-09-13 and only this layout shows it
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192, 2048, 0, 2051, false, 1,  0, GGML_TYPE_F16, 256, 24, 2, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_top_k( 8192,  256, 0,  512, false, 1, 50, GGML_TYPE_F16, 256, 24, 2, false, true));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 1, 0, 2051, true,  1, 0, GGML_TYPE_F16, 256, 24, 2, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(16384, 1, 512, 512, false, 1, 0, GGML_TYPE_F16, 512, 64, 1, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(11008, 16, 2304, 512, false, 1, 86));
