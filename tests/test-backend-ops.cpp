@@ -2343,6 +2343,10 @@ struct test_get_rows : public test_case {
         return VARS_TO_STR8(type, n, m, r, be1, be2, v, vs0);
     }
 
+    double max_nmse_err() override {
+        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ? 0.0 : test_case::max_nmse_err();
+    }
+
     test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false)
         : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0) {}
 
@@ -9642,6 +9646,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
     }
 
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int width : {1, 3, 7, 15, 31, 32, 33, 64, 65, 90, 127, 128, 129}) {
+            for (int rows : {127, 128, 129}) {
+                test_cases.emplace_back(new test_get_rows(type, width, 257, rows, 1, 1, false));
+            }
+        }
+        for (bool view_ids : {false, true}) {
+            for (bool view_src : {false, true}) {
+                test_cases.emplace_back(new test_get_rows(type, 128, 257, 512, 3, 2, view_ids, view_src));
+            }
+        }
+        test_cases.emplace_back(new test_get_rows(type, 1, 3, 128, 1, 65536, false));
+        test_cases.emplace_back(new test_get_rows(type, 128, 65537, 65536, 1, 1, false));
+    }
+
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
@@ -11816,6 +11835,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int width : {90, 128}) {
+            test_cases.emplace_back(new test_get_rows(type, width, 65537, 65536, 1, 1, false));
+        }
+    }
 
     // Qwen3.8-Flash-Next decode hot path: fused gate/up uses this exact shape.
     test_cases.emplace_back(new test_mul_mat_id(
