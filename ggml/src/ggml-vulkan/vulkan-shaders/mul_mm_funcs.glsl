@@ -17,54 +17,6 @@ void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
     buf_a[a_shmem_index(m, k_pair)] = TO_BUF(value);
 }
 
-#if defined(DATA_A_ROCMFPX_FP3)
-int32_t rocmfpx_mm_fp3_pack4_window(uint ib, uint idx) {
-    const uint bit_pos = idx * 3u;
-    const uint byte_pos = bit_pos >> 3u;
-    const uint sh = bit_pos & 7u;
-    uint bits = uint(data_a[ib].qs[byte_pos]) |
-                (uint(data_a[ib].qs[byte_pos + 1u]) << 8);
-    if (sh > 4u) {
-        bits |= uint(data_a[ib].qs[byte_pos + 2u]) << 16;
-    }
-    bits = (bits >> sh) & 0xFFFu;
-    return pack32(i8vec4(kvalues_rocmfpx_fp3_const[ bits        & 7u],
-                         kvalues_rocmfpx_fp3_const[(bits >> 3) & 7u],
-                         kvalues_rocmfpx_fp3_const[(bits >> 6) & 7u],
-                         kvalues_rocmfpx_fp3_const[(bits >> 9) & 7u]));
-}
-
-vec4 rocmfpx_mm_fp3_vec4(uint ib, uint idx) {
-    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
-    return vec4(unpack8(rocmfpx_mm_fp3_pack4_window(ib, idx))) * d;
-}
-#endif
-
-#if defined(DATA_A_ROCMFPX_FP6)
-uint rocmfpx_mm_fp6_get_bits(uint ib, uint idx) {
-    const uint bit_pos  = idx * 6u;
-    const uint byte_pos = bit_pos >> 3u;
-    const uint sh       = bit_pos & 7u;
-    uint bits = uint(data_a[ib].qs[byte_pos]);
-    if (sh > 2u) {
-        bits |= uint(data_a[ib].qs[byte_pos + 1u]) << 8;
-    }
-    return (bits >> sh) & 0x3Fu;
-}
-
-float rocmfpx_mm_fp6_value(uint ib, uint idx) {
-    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
-    return float(rocmfpx_fp6_decode_code(rocmfpx_mm_fp6_get_bits(ib, idx))) * d;
-}
-
-vec4 rocmfpx_mm_fp6_vec4(uint ib, uint idx) {
-    return vec4(rocmfpx_mm_fp6_value(ib, idx + 0u),
-                rocmfpx_mm_fp6_value(ib, idx + 1u),
-                rocmfpx_mm_fp6_value(ib, idx + 2u),
-                rocmfpx_mm_fp6_value(ib, idx + 3u));
-}
-#endif
-
 // ---- 8-wide q6_K / q3_K / q8_0 / q5_0 loaders (LOAD_VEC_A == 8, KHR coopmat variants) -------------
 // One call covers 8 consecutive k of one row. Blocks are 210 / 110 / 34 / 22 bytes (2-byte aligned).
 // fetch8 reads the 8 bytes at a 2-aligned byte offset b as two dwords when b is 4-aligned, else as
@@ -224,6 +176,54 @@ void store_a_raw(const uint pos_a, const uint row, const uint col, const uint si
     buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(v0.zw));
     buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
     buf_a[sidx + 3] = TO_BUF(FLOAT_TYPEV2(v1.zw));
+}
+#endif
+
+#if defined(DATA_A_ROCMFPX_FP3)
+int32_t rocmfpx_mm_fp3_pack4_window(uint ib, uint idx) {
+    const uint bit_pos = idx * 3u;
+    const uint byte_pos = bit_pos >> 3u;
+    const uint sh = bit_pos & 7u;
+    uint bits = uint(data_a[ib].qs[byte_pos]) |
+                (uint(data_a[ib].qs[byte_pos + 1u]) << 8);
+    if (sh > 4u) {
+        bits |= uint(data_a[ib].qs[byte_pos + 2u]) << 16;
+    }
+    bits = (bits >> sh) & 0xFFFu;
+    return pack32(i8vec4(kvalues_rocmfpx_fp3_const[ bits        & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 3) & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 6) & 7u],
+                         kvalues_rocmfpx_fp3_const[(bits >> 9) & 7u]));
+}
+
+vec4 rocmfpx_mm_fp3_vec4(uint ib, uint idx) {
+    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
+    return vec4(unpack8(rocmfpx_mm_fp3_pack4_window(ib, idx))) * d;
+}
+#endif
+
+#if defined(DATA_A_ROCMFPX_FP6)
+uint rocmfpx_mm_fp6_get_bits(uint ib, uint idx) {
+    const uint bit_pos  = idx * 6u;
+    const uint byte_pos = bit_pos >> 3u;
+    const uint sh       = bit_pos & 7u;
+    uint bits = uint(data_a[ib].qs[byte_pos]);
+    if (sh > 2u) {
+        bits |= uint(data_a[ib].qs[byte_pos + 1u]) << 8;
+    }
+    return (bits >> sh) & 0x3Fu;
+}
+
+float rocmfpx_mm_fp6_value(uint ib, uint idx) {
+    const float d = ue4m3_to_fp32(data_a[ib].e[idx >= 16u ? 1u : 0u]);
+    return float(rocmfpx_fp6_decode_code(rocmfpx_mm_fp6_get_bits(ib, idx))) * d;
+}
+
+vec4 rocmfpx_mm_fp6_vec4(uint ib, uint idx) {
+    return vec4(rocmfpx_mm_fp6_value(ib, idx + 0u),
+                rocmfpx_mm_fp6_value(ib, idx + 1u),
+                rocmfpx_mm_fp6_value(ib, idx + 2u),
+                rocmfpx_mm_fp6_value(ib, idx + 3u));
 }
 #endif
 
@@ -499,7 +499,6 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const float m = dm.y;
 #else
             const uint is = 2 * n + b;                 // 0..7
-            const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
 
             const vec2 loadd = vec2(data_a[ib].dm);
 
@@ -520,6 +519,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const float d = loadd.x * sc;
             const float m = -loadd.y * mbyte;
+#endif
 
             const vec4 q = vec4(unpack8((data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F));
 
@@ -534,7 +534,6 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const uint n = iqs / 32;                   // 0,1,2,3
             const uint b = (iqs % 32) / 16;            // 0,1
-            const uint is = 2 * n + b;                 // 0..7
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
             const uint qhi = (iqs % 16) * 2;           // 0,2,4..30
 
@@ -565,6 +564,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const float d = loadd.x * sc;
             const float m = -loadd.y * mbyte;
+#endif
 
             const uint qs = (data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F;
             const uint qh = ((data_a_packed32[ib].qh[qhi / 4] >> (iqs / 16)) & 0x01010101) << 4;
