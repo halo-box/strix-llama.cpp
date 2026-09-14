@@ -19632,12 +19632,13 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
         if (mmid != mul->src[0]) {
             return false;
         }
-        // EXPERIMENT (GGML_VK_MMID_SCALE_EPILOGUE=1): the tile shader can apply the scale as it
-        // writes out, which removes a full write+read of the matmul result at prefill. The
-        // coopmat2 shader has the binding but not the epilogue, so it stays on the old path.
+        // The tile shader applies the MoE weight as it writes out, removing a full write+read of
+        // the expert output at prefill (Flash-Next keep-128, pp2048 ub2048: +3.5%, knobs-e2e
+        // 2026-09-14). Default on; GGML_VK_MMID_SCALE_EPILOGUE=0 disables. The coopmat2 shader has
+        // the binding but not the epilogue, so it stays on the old path.
         if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
             static const char * env = getenv("GGML_VK_MMID_SCALE_EPILOGUE");
-            if (!(env && atoi(env) != 0) || ctx->device->coopmat2) {
+            if ((env && atoi(env) == 0) || ctx->device->coopmat2) {
                 return false;
             }
             // Shader indexes the scale as [token * nei0 + expert_slot].
