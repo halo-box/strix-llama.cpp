@@ -7147,6 +7147,28 @@ struct test_top_k : public test_case {
     }
 };
 
+struct test_top_k_extreme : public test_top_k {
+    test_top_k_extreme(int cols, int k) : test_top_k(GGML_TYPE_F32, {cols, 2, 1, 1}, k) {}
+    std::string vars() override { return test_top_k::vars() + ",extreme=1"; }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_top_k::initialize_tensors(ctx);
+        std::vector<float> data(ggml_nelements(input));
+        for (int row = 0; row < 2; ++row) {
+            auto * values = data.data() + row * ne[0];
+            for (int i = 0; i < ne[0]; ++i) {
+                const uint32_t bits = 0x3f800000u + (uint32_t) i;
+                memcpy(values + i, &bits, sizeof(float));
+            }
+            values[0] = -INFINITY;
+            values[ne[0] - 3] = std::numeric_limits<float>::lowest();
+            values[ne[0] - 2] = std::numeric_limits<float>::max();
+            values[ne[0] - 1] = INFINITY;
+        }
+        ggml_backend_tensor_set(input, data.data(), 0, data.size() * sizeof(float));
+    }
+};
+
+
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
@@ -11398,6 +11420,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Large-k, including multi-row and ties (qwen4exp)
+    for (int cols : {1025, 4097}) {
+        for (int k : {2, 16, 512}) test_cases.emplace_back(new test_top_k_extreme(cols, k));
+    }
+    test_cases.emplace_back(new test_top_k_extreme(4097, 2051));
+    for (auto shape : {std::array<int, 3>{2047, 512, 1024}, {2048, 511, 1024}, {2048, 512, 1024},
+                       {4095, 128, 2051}, {4096, 127, 2051}, {8191, 2, 2051}, {8192, 1, 2051}, {8192, 2, 2051}}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {shape[0], shape[1], 1, 1}, shape[2], true));
+    }
+    for (int cols : {4096, 40064}) {
+        for (int rows : {2, 128}) {
+            for (bool ties : {false, true}) test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 2051, ties));
+        }
+    }
+    for (bool ties : {false, true}) test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 512, 1, 1}, 2051, ties));
+    for (int cols : {1024, 1025}) {
+        for (int rows : {1, 2}) test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 512, true));
+    }
+
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,  1, 1, 1 }, 1024));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 2048,  2, 1, 1 }, 1024));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 4096,  1, 1, 1 }, 2048));
