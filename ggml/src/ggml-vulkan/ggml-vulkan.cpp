@@ -4853,6 +4853,22 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_align = 128;
         m_align =  64;
         s_align =  32;
+        // Large-tile K alignment. Upstream requires K % 128 for the ALIGNED large-tile kernel, but the
+        // aligned loaders only need whole BK=32 K-tiles (K % 8 for the 8-wide f16 B loads), and
+        // ALIGNED=0 also disables the register prefetch, so a GEMM with K % 128 != 0 runs the scalar-
+        // load, no-prefetch variant. Flash-Next's hc up-GEMM (q5_0 10240xNx320, 88 per prefill graph):
+        // 1016 -> 650 us at op level, 1561 -> 1215 us in-model, +1.9% pp2048 e2e; test-backend-ops
+        // MUL_MAT 4962/4962 at 32 (gfx1151, RADV, KHR_coopmat, 2026-09-14). Default 32 on that path;
+        // GGML_VK_MM_ALIGN_L=128 restores upstream, other values 32..128 for probing.
+        if (device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2) {
+            l_align = 32;
+        }
+        {
+            static const uint32_t align_l_env = [] { const char * e = getenv("GGML_VK_MM_ALIGN_L"); return e ? (uint32_t) std::max(0, atoi(e)) : 0u; }();
+            if (align_l_env >= 32 && align_l_env <= 128) {
+                l_align = align_l_env;
+            }
+        }
 
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;
