@@ -62,6 +62,9 @@ vec4 rocmfpx_mm_fp6_vec4(uint ib, uint idx) {
                 rocmfpx_mm_fp6_value(ib, idx + 1u),
                 rocmfpx_mm_fp6_value(ib, idx + 2u),
                 rocmfpx_mm_fp6_value(ib, idx + 3u));
+}
+#endif
+
 // ---- 8-wide q6_K / q3_K / q8_0 / q5_0 loaders (LOAD_VEC_A == 8, KHR coopmat variants) -------------
 // One call covers 8 consecutive k of one row. Blocks are 210 / 110 / 34 / 22 bytes (2-byte aligned).
 // fetch8 reads the 8 bytes at a 2-aligned byte offset b as two dwords when b is 4-aligned, else as
