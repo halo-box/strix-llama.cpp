@@ -783,6 +783,30 @@ public:
     const llama_memory_hybrid_idx_context * mctx;
 };
 
+class llm_graph_input_qsa_cache : public llm_graph_input_i {
+public:
+    llm_graph_input_qsa_cache(const llama_memory_hybrid_idx_context * mctx, int il, bool active, bool fast) :
+        mctx(mctx), il(il), active(active), fast(fast) {}
+    void set_input(const llama_ubatch *) override {
+        if (!active) { return; }
+        if (fast) { mctx->qsa_fill_updates(members, positions, rows); }
+        mctx->qsa_commit(il);
+    }
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+        return mctx->qsa_prefix_matches(params.ubatch) == active &&
+            (!active || mctx->qsa_fast(il, params.ubatch) == fast) &&
+            (!fast || rows->ne[0] == (params.ubatch.n_tokens+3)/4+2);
+    }
+    const llama_memory_hybrid_idx_context * mctx;
+    int il;
+    bool active;
+    bool fast;
+    ggml_tensor * members = nullptr;
+    ggml_tensor * positions = nullptr;
+    ggml_tensor * rows = nullptr;
+};
+
 void llama_model_qwen4exp::graph::build_qsa_store_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -872,31 +896,56 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
-    // gathers per stream: blk_cells row s indexes stream s's own cells
-    ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
-    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
-
-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
-    ggml_tensor * pooled = nullptr;
-    for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
-        pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+    ggml_tensor * storage = r == 4 && blk_bias && n_stream == 1 ? mctx_hyb->qsa_cache(ctx0, il) : nullptr;
+    ggml_tensor * cached = storage && mctx_hyb->qsa_prefix_matches(ubatch) ? storage : nullptr;
+    const bool fast_cache = cached && mctx_hyb->qsa_fast(il, ubatch);
+    const int64_t prep_blocks = fast_cache ? (n_tokens+3)/4+2 : n_blocks;
+    ggml_tensor * member_rows = inp->blk_cells;
+    ggml_tensor * block_positions = inp->blk_pos;
+    ggml_tensor * cache_rows = nullptr;
+    if (storage) {
+        auto cache_input = std::make_unique<llm_graph_input_qsa_cache>(mctx_hyb, il, cached != nullptr, fast_cache);
+        if (fast_cache) {
+            member_rows = cache_input->members = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r*prep_blocks);
+            block_positions = cache_input->positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*prep_blocks);
+            cache_rows = cache_input->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, prep_blocks);
+            ggml_set_input(member_rows); ggml_set_input(block_positions); ggml_set_input(cache_rows);
+        }
+        res->add_input(std::move(cache_input));
     }
-    pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
-    cb(pooled, "indexer_k_pooled", il);
+    const auto prepare_keys = [&](ggml_tensor * member_rows, ggml_tensor * block_positions, int64_t prep_blocks) {
+        ggml_tensor * members = ggml_get_rows(ctx0, k_all, member_rows);
+        members = ggml_reshape_4d(ctx0, members, idx_dim, r, prep_blocks, n_stream);
 
-    // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+        ggml_tensor * pooled = nullptr;
+        for (int64_t i = 0; i < r; ++i) {
+            ggml_tensor * slice = ggml_cont(ctx0,
+                    ggml_view_3d(ctx0, members, idx_dim, prep_blocks, n_stream,
+                            members->nb[2], members->nb[3], i*members->nb[1]));
+            pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+        }
+        pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+        cb(pooled, "indexer_k_pooled", il);
 
-    // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
-    pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, prep_blocks*n_stream, 1);
+        pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, prep_blocks*n_stream);
+        pooled = ggml_rope_multi(ctx0, pooled, block_positions, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, prep_blocks, n_stream);
+        return pooled;
+    };
+    ggml_tensor * pooled = prepare_keys(member_rows, block_positions, prep_blocks);
+    if (cached) {
+        auto * prepared = ggml_reshape_2d(ctx0, pooled, idx_dim, prep_blocks);
+        auto * destination = fast_cache ? cached : ggml_view_2d(ctx0, cached, idx_dim, n_blocks, cached->nb[1], 0);
+        auto * written = fast_cache ? ggml_set_rows(ctx0, destination, prepared, cache_rows) : ggml_cpy(ctx0, prepared, destination);
+        ggml_build_forward_expand(gf, written);
+        pooled = ggml_view_3d(ctx0, written, idx_dim, n_blocks, 1, written->nb[1], written->nb[1]*n_blocks, 0);
+        cb(pooled, "indexer_k_cached", il);
+    }
     cb(pooled, "indexer_k", il);
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
