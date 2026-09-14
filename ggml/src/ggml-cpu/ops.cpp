@@ -11431,6 +11431,83 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// ggml_compute_forward_dsv4_hc_mix
+//   dst[i, t] = scale * sum_c xn[i, c, t] * sigmoid(gate[c*n_embd + i, t])
+
+static void ggml_compute_forward_dsv4_hc_mix_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * xn   = dst->src[0];
+    const ggml_tensor * gate = dst->src[1];
+
+    GGML_ASSERT(xn->type == GGML_TYPE_F32 || xn->type == GGML_TYPE_F16);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+
+    const bool xn_f16  = xn->type == GGML_TYPE_F16;
+    const bool dst_f16 = dst->type == GGML_TYPE_F16;
+
+    const int64_t n_embd   = xn->ne[0];
+    const int64_t hc       = xn->ne[1];
+    const int64_t n_tokens = xn->ne[2];
+
+    GGML_ASSERT(dst->ne[0] == n_embd);
+    GGML_ASSERT(dst->ne[1] == n_tokens);
+    GGML_ASSERT(gate->ne[0] == n_embd * hc);
+    GGML_ASSERT(gate->ne[1] == n_tokens);
+
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(float));
+
+    GGML_TENSOR_LOCALS(size_t, nbx, xn,   nb);
+    GGML_TENSOR_LOCALS(size_t, nbg, gate, nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,  nb);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // rows of the output (tokens) across threads
+    const int64_t dr  = (n_tokens + nth - 1) / nth;
+    const int64_t it0 = dr * ith;
+    const int64_t it1 = MIN(it0 + dr, n_tokens);
+
+    for (int64_t it = it0; it < it1; ++it) {
+        char * d = (char *) dst->data + it*nbd1;
+        for (int64_t i0 = 0; i0 < n_embd; ++i0) {
+            float sum = 0.0f;
+            for (int64_t c = 0; c < hc; ++c) {
+                const char * xp = (const char *) xn->data + i0*nbx0 + c*nbx1 + it*nbx2;
+                const float xv = xn_f16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) xp) : *(const float *) xp;
+                const float gv = *(const float *) ((const char *) gate->data + (c*n_embd + i0)*nbg0 + it*nbg1);
+                sum += xv * (1.0f / (1.0f + expf(-gv)));
+            }
+            if (dst_f16) {
+                ((ggml_fp16_t *) d)[i0] = GGML_CPU_FP32_TO_FP16(scale * sum);
+            } else {
+                ((float *) d)[i0] = scale * sum;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_dsv4_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_dsv4_hc_mix_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

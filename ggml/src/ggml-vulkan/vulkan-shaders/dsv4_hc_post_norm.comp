@@ -1,0 +1,87 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// Hyper-connection combine + the next mix's norm in one pass (qwen4exp, identity mixing matrix):
+//   res_out[i, h, t] = x[i, t] * post[h, t] + res[i, h, t]
+//   xn[i, h, t]      = f16( res_out[i, h, t] * rsqrt(mean_i(res_out^2) + eps) * gamma[i, h] )
+// One workgroup per (stream h, token t) row of n_embd; the row is held in registers between the
+// combine and the normalised f16 write, so the residual is read once and written once and the
+// normalised copy costs only its own write. Replaces DSV4_HC_POST (0.93 ms) + RMS_NORM_MUL_CPY
+// (0.81 ms) per combine at ub2048 with ~1.1 ms of pure traffic (2026-09-14).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer XBuf { vec4      data_x[];  };
+layout(binding = 1) readonly  buffer RBuf { vec4      data_r[];  };
+layout(binding = 2) readonly  buffer PBuf { float     data_p[];  };
+layout(binding = 3) readonly  buffer GBuf { vec4      data_g[];  };
+layout(binding = 4) writeonly buffer OBuf { vec4      data_o[];  };
+layout(binding = 5) writeonly buffer NBuf { f16vec4   data_n[];  };
+
+layout(push_constant) uniform Parameters {
+    uint  n_embd;
+    uint  hc;
+    uint  n_tokens;
+    uint  sx0, sx1;        // x strides (floats): element, token
+    uint  sr0, sr1, sr2;   // residual strides: element, stream, token
+    uint  sp0, sp1;        // post strides: stream, token
+    uint  sg0, sg1;        // gamma strides: element, stream
+    float eps;
+} p;
+
+// vec4 everywhere: n_embd % 4 == 0 and every operand has element stride 1 (host-checked), so the
+// vec4 index of element i0 is base/4 + i0/4. n_embd <= 4096 -> at most 4 vec4 per thread.
+const uint MAX_V4 = 4;
+
+shared float sumsh[256 / 32];
+
+void main() {
+    const uint wg  = gl_WorkGroupID.x;
+    const uint h   = wg % p.hc;
+    const uint t   = wg / p.hc;
+    const uint tid = gl_LocalInvocationIndex;
+    if (t >= p.n_tokens) {
+        return;
+    }
+    const uint  nv4 = p.n_embd / 4;
+    const float pw  = data_p[h * p.sp0 + t * p.sp1];
+    const uint  ob  = ((t * p.hc + h) * p.n_embd) / 4;   // contiguous [n_embd, hc, n_tokens] outputs, vec4 index
+    const uint  xb  = (t * p.sx1) / 4;
+    const uint  rb  = (h * p.sr1 + t * p.sr2) / 4;
+    const uint  gb  = (h * p.sg1) / 4;
+
+    vec4 v[MAX_V4];
+    float sum = 0.0f;
+    [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
+        const uint i4 = tid + k * 256;
+        vec4 r = vec4(0.0f);
+        if (i4 < nv4) {
+            r = data_x[xb + i4] * pw + data_r[rb + i4];
+            data_o[ob + i4] = r;
+        }
+        v[k] = r;
+        sum += dot(r, r);
+    }
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0) {
+        sumsh[gl_SubgroupID] = sum;
+    }
+    barrier();
+    float total = 0.0f;
+    for (uint s = 0; s < gl_NumSubgroups; ++s) {
+        total += sumsh[s];
+    }
+    const float scale = inversesqrt(total / float(p.n_embd) + p.eps);
+
+    [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
+        const uint i4 = tid + k * 256;
+        if (i4 < nv4) {
+            data_n[ob + i4] = f16vec4(v[k] * scale * data_g[gb + i4]);
+        }
+    }
+}

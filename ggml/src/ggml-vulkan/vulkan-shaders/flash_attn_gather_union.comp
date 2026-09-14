@@ -107,14 +107,17 @@ void main() {
     // qwen4exp prefill tile is 128 queries). A single pass left rows >= 64 of the compact mask
     // unwritten - stale scratch, not -inf - and the queries in them attended to unselected and
     // FUTURE rows: keep-320 PPL 2.03/1.89 against the 2.42/2.17 reference (2026-09-14).
+    // write_mask == 2 (slotted prefill): the row stride is the static kv_c_max, so the FA can
+    // address every slot's mask band at i * n_batch * kv_c_max without knowing its runtime count
     const float NEG_INF = uintBitsToFloat(0xff800000);
-    if (p.write_mask == 1 && head == 0) {
+    if (p.write_mask != 0 && head == 0) {
+        const uint mstride = p.write_mask == 2 ? p.kv_c_max : kv_c;
         for (uint t = tid; t < p.n_batch; t += LANES) {
             float mv = NEG_INF;
             if (src < p.n_kv) {
                 mv = float(data_m[t * p.nbm1 + src]);
             }
-            data_mc[t * kv_c + row] = float16_t(mv);
+            data_mc[t * mstride + row] = float16_t(mv);
         }
     }
 }

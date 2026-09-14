@@ -608,6 +608,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_MIX,
 
         GGML_OP_UNARY,
 
@@ -2748,6 +2749,20 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_mix: the hyper-connection "mix" collapse in one pass (qwen4exp / Flash-Next, 2026-09-14):
+    //   xn   [n_embd, hc, n_tokens]  normalised streams
+    //   gate [n_embd*hc, n_tokens]   pre-sigmoid gate logits, stream-major like xn
+    //   -> [n_embd, n_tokens]
+    //   result[i, t] = scale * sum_c xn[i, c, t] * sigmoid(gate[c*n_embd + i, t])
+    // replaces SIGMOID, MUL and the hc-1 strided ADDs plus a SCALE (five full-width passes)
+    //   type: F32 or F16 result (F16 when every consumer is a matmul B operand: no conversion pass)
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xn,
+            struct ggml_tensor  * gate,
+            float                 scale,
+            enum   ggml_type      type);
 
     // custom operators
 

@@ -432,14 +432,19 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * pool_pos,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        int64_t n_kv_ctx,
+        int64_t n_ns_ctx) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    // qwen4exp's dense shortcut graph carries no cell_blk / bias: the scan still runs (it also
+    // produces the block table the pooled-key path reads) with those two in host scratch, and the
+    // geometry comes from the caller
+    GGML_ASSERT(cell_blk == nullptr || cell_blk->buffer == nullptr || ggml_backend_buffer_is_host(cell_blk->buffer));
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+    const int64_t n_kv     = cell_blk ? cell_blk->ne[0] : n_kv_ctx;
+    const int64_t n_ns     = cell_blk ? cell_blk->ne[1] : n_ns_ctx;   // streams in this ubatch
     // not from blk_pos: with the pooled-key cache the graph reads the window, not the whole
     // block table, so blk_cells and blk_pos are not graph tensors at all
     const int64_t n_blocks = (n_kv + (int64_t) ratio - 1)/(int64_t) ratio;
@@ -449,8 +454,19 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
-    float   * dst_bias      = (float   *) bias->data;
+    // qwen4exp's dense shortcut (cache within the top-k budget) builds no node that reads cell_blk
+    // or bias, so ggml-alloc gives them no data; the scan still runs (it also produces the block
+    // table the pooled-key path reads) but writes those two into host scratch instead.
+    std::vector<int32_t> cell_blk_host;
+    std::vector<float>   bias_host;
+    if (cell_blk == nullptr || cell_blk->data == nullptr) {
+        cell_blk_host.resize((size_t) n_kv * n_ns);
+    }
+    if (bias == nullptr || bias->data == nullptr) {
+        bias_host.resize((size_t) (blk_bias ? n_blocks : n_kv) * n_tps * n_ns);
+    }
+    int32_t * dst_cell_blk  = (cell_blk && cell_blk->data) ? (int32_t *) cell_blk->data : cell_blk_host.data();
+    float   * dst_bias      = (bias && bias->data)         ? (float   *) bias->data     : bias_host.data();
 
     // The block table is an intermediate: cell_blk and bias are what the dense path feeds to
     // the graph, and with the pooled-key cache only the window taken from the table is. An
@@ -901,7 +917,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(mem != nullptr);
 
     mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias,
-                       pool_idxs, pool_cells, pool_pos, ubatch, ratio, blk_bias);
+                       pool_idxs, pool_cells, pool_pos, ubatch, ratio, blk_bias,
+                       get_idx()->get_n_kv(), (int64_t) get_n_stream());
 }
 
 llama_kv_cache * llama_memory_hybrid_idx_context::get_mem_pool() const {

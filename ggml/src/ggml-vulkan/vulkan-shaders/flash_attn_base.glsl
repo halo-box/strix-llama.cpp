@@ -36,6 +36,22 @@ const bool V_TRANSPOSED     = (Flags & 32) != 0;
 // per-query rescale indexes the accumulator elements by the gfx11 wave64 layout (lane L holds
 // column L%16, rows L/16 + 4i), so the host enables it on RADV RDNA3 only (2026-09-13)
 const bool O_IN_REGS        = (Flags & 64) != 0;
+// SLOTTED (qwen4exp QSA prefill, 2026-09-14): every Br-row query block of this dispatch has its own
+// compact K/V slot and its own runtime KV count. Slot s = the row block index i: K/V head-3 index
+// is i (p.nb13 / p.nb23 carry the slot strides, p.nek3 == p.nev3 == 1), the count is
+// data_kv_dyn[i * p.ne3] (ne3 carries the count stride in words; the dst has ne3 == 1), the mask
+// is [N rows][split_kv] with the mask-stride-in-split_kv bit set, so block i's rows fall at their
+// natural offsets. One dispatch over 16 tiles of 16 queries instead of 16 dispatches of 24 WGs.
+const bool SLOTTED          = (Flags & 256) != 0;
+// GATHER_KV (2026-09-14, after DwarfStar's kernel_qwen4_attn_mm): PER-TOKEN sparse prefill. The
+// workgroup is one (token, KV head) under the GQA fold (its rows are the group's query heads), and
+// the compact K/V columns are that token's own selected cache rows, read through its top-k list
+// (binding 7 as int32, list stride p.ne3 entries, list length p.KV, cache rows p.split_kv with the
+// mask-stride bit set so m_row_len is the real mask row; p.nb03 carries n_kv_raw: columns below it
+// are the always-attended prefix). Rows are staged through LDS by index; the mask column is
+// gathered the same way, so causality and invalid entries fall out of the mask. Work per token
+// is n_top_k rows, the per-query selection itself: 11% / 6% of dense at 16k / 32k on Flash-Next.
+const bool GATHER_KV        = (Flags & 512) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -159,11 +175,33 @@ uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride, m_row_len, gqa_ratio, split_k_num, output_k_num;
 bool partial_output;
+uint32_t gather_list_base;
+
+// GATHER_KV: cache row for compact column c, or 0xFFFFFFFF when c is past the list or the entry is
+// out of range (the mask column for such a c is -inf and the staged row is zero)
+uint32_t gather_row(uint32_t c) {
+    if (c >= KV) {
+        return 0xFFFFFFFFu;
+    }
+    const uint32_t n_raw = p.nb03;
+    uint32_t r;
+    if (p.ne3 == 0) {
+        r = c;   // identity list (GGML_VK_FA_GATHER_IDENTITY debug mode: the gather plumbing over a dense cache)
+    } else if (c < n_raw) {
+        r = c;
+    } else {
+        const uint32_t e = data_kv_dyn[gather_list_base + (c - n_raw)];
+        r = e + n_raw;
+        if (e >= 0x80000000u) {
+            r = 0xFFFFFFFFu;
+        }
+    }
+    return r < p.split_kv ? r : 0xFFFFFFFFu;
+}
 
 void init_indices()
 {
     N = p.N;
-    KV = DYNAMIC_KV ? data_kv_dyn[0] : p.KV;
     gqa_ratio = p.gqa_ratio & 0xffff;
     split_k_num = p.k_num & 0xffff;
     output_k_num = p.k_num >> 16;
@@ -193,6 +231,12 @@ void init_indices()
         split_k_index = 0;
     }
 
+    // after i: a slotted dispatch reads its own row block's count
+    KV = DYNAMIC_KV ? data_kv_dyn[SLOTTED ? i * p.ne3 : 0] : p.KV;
+    if (GATHER_KV) {
+        gather_list_base = gqa_iq1 * p.ne3;
+    }
+
     Tr = CEIL_DIV(N, Br);
 
     start_j = split_k_index * p.split_kv / Bc;
@@ -210,12 +254,12 @@ void init_indices()
     rv2 = p.neq2/p.nev2;
     rv3 = p.neq3/p.nev3;
 
-    // k indices
-    ik3 = iq3 / rk3;
+    // k indices (slotted: the head-3 index selects the row block's slot)
+    ik3 = SLOTTED ? i : iq3 / rk3;
     ik2 = iq2 / rk2;
 
     // v indices
-    iv3 = iq3 / rv3;
+    iv3 = SLOTTED ? i : iq3 / rv3;
     iv2 = iq2 / rv2;
 
     // nb?1 are already divided by the type size and are in units of elements.
@@ -233,6 +277,10 @@ void init_indices()
     // from folding the "&" through the select and breaking the alignment detection.
     const bool mask_stride_in_split_kv = (p.gqa_ratio & 0x80000000u) != 0;
     m_stride = mask_stride_in_split_kv ? p.split_kv : ((gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV);
+    if (GATHER_KV) {
+        // rows are the token's heads and share its one mask row; the row length is the cache size
+        m_stride = 0;
+    }
     // Distinct from m_stride: m_stride is the row-to-row step INSIDE this tile (0 under GQA,
     // where every row shares one mask row), while m_row_len is the mask tensor's actual row
     // length, used to step between tokens and between streams. They differ under GQA and

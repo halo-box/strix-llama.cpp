@@ -1,0 +1,66 @@
+#version 450
+
+// Hyper-connection "mix" collapse (qwen4exp / Flash-Next): the layer input is the gated mean of
+// the hc residual streams,
+//   dst[i, t] = scale * sum_c xn[i, c, t] * sigmoid(gate[c*n_embd + i, t]).
+// One kernel instead of SIGMOID, MUL, hc-1 strided ADDs and a SCALE: those were five full-width
+// passes (~2.2 ms per mix at ub2048, 96 mixes per graph); this reads xn and gate once (168 MB)
+// and writes n_embd x n_tokens (21 MB). One invocation per 4 consecutive i0 of one token; the
+// n_embd axis is contiguous in both inputs (a norm output and a GEMM output), so the loads are vec4
+// when n_embd % 4 == 0 and scalar at a ragged tail.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// xn is f32 (A_TYPE float) or f16 (A_TYPE float16_t, when the norm wrote the GEMM operand directly)
+layout(binding = 0) readonly  buffer XBuf { A_TYPE data_x[]; };
+layout(binding = 1) readonly  buffer GBuf { float data_g[]; };
+layout(binding = 2) writeonly buffer DBuf { D_TYPE data_d[]; };   // float, or float16_t when every consumer is a GEMM B operand
+
+layout(push_constant) uniform Parameters {
+    uint  n_embd;
+    uint  hc;
+    uint  n_tokens;
+    uint  sx0, sx1, sx2;   // xn strides in floats: element, stream, token
+    uint  sg0, sg1;        // gate strides in floats: element, token (element index = c*n_embd + i0)
+    uint  sd0, sd1;        // dst strides in floats: element, token
+    float scale;
+} p;
+
+float sigmoid(float v) {
+    return 1.0f / (1.0f + exp(-v));
+}
+
+void main() {
+    const uint n_vec = (p.n_embd + 3) / 4;
+    const uint gid   = gl_GlobalInvocationID.x;
+    if (gid >= n_vec * p.n_tokens) {
+        return;
+    }
+    const uint it = gid / n_vec;
+    const uint i0 = (gid - it * n_vec) * 4;
+
+    vec4 sum = vec4(0.0f);
+    if (i0 + 4 <= p.n_embd) {
+        for (uint c = 0; c < p.hc; ++c) {
+            const uint xb = i0 + c * p.sx1 + it * p.sx2;
+            const uint gb = (c * p.n_embd + i0) + it * p.sg1;
+            const vec4 xv = vec4(float(data_x[xb]), float(data_x[xb + 1]), float(data_x[xb + 2]), float(data_x[xb + 3]));
+            const vec4 gv = vec4(data_g[gb], data_g[gb + 1], data_g[gb + 2], data_g[gb + 3]);
+            sum += xv * vec4(sigmoid(gv.x), sigmoid(gv.y), sigmoid(gv.z), sigmoid(gv.w));
+        }
+        const uint db = i0 + it * p.sd1;
+        sum *= p.scale;
+        data_d[db] = D_TYPE(sum.x); data_d[db + 1] = D_TYPE(sum.y); data_d[db + 2] = D_TYPE(sum.z); data_d[db + 3] = D_TYPE(sum.w);
+    } else {
+        for (uint k = i0; k < p.n_embd; ++k) {
+            float s = 0.0f;
+            for (uint c = 0; c < p.hc; ++c) {
+                s += float(data_x[k + c * p.sx1 + it * p.sx2]) * sigmoid(data_g[(c * p.n_embd + k) + it * p.sg1]);
+            }
+            data_d[k + it * p.sd1] = D_TYPE(p.scale * s);
+        }
+    }
+}

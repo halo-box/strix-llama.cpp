@@ -67,6 +67,10 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+// GATHER_KV: the block's Bc gathered cache rows, resolved once per KV block instead of once per
+// K chunk / V tile / mask column (the index reload was 250 of the 320 buffer loads per block)
+shared uint32_t grow_sh[Bc];
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -169,6 +173,14 @@ void main() {
             mask_cache[idx] = f16vec4(0);
         }
 
+        if (GATHER_KV) {
+            barrier();   // the previous block's V staging may still read grow_sh
+            if (tid < Bc) {
+                grow_sh[tid] = gather_row(j * Bc + tid);
+            }
+            barrier();
+        }
+
         if (MASK_ENABLE) {
             if (USE_MASK_OPT && mask_opt_idx != j / 16) {
                 mask_opt_idx = j / 16;
@@ -190,6 +202,13 @@ void main() {
                     if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
                         if ((!KV_bounds_check || j * Bc + c < KV)) {
                             f16vec4 m;
+                            if (GATHER_KV) {
+                                // one shared mask row per token (m_stride == 0), column = the gathered cache row
+                                const uint32_t gr = grow_sh[c];
+                                const float16_t mg = gr != 0xFFFFFFFFu ? data_m[m_offset + gr] : float16_t(-1.0 / 0.0);
+                                m = f16vec4(mg, mg, mg, mg);
+                                max_mask = max(max_mask, float(mg));
+                            } else
                             if (!nem1_bounds_check || i * Br + r * 4 + 3 < p.nem1) {
                                 m = f16vec4(data_m[m_offset + (i * Br + r * 4    ) * m_stride + (j * Bc + c)],
                                             data_m[m_offset + (i * Br + r * 4 + 1) * m_stride + (j * Bc + c)],
@@ -287,7 +306,7 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always need to dequant into kvsh; for f16/bf16 we can load
             // directly from global memory when alignment / bounds allow it.
-            const bool stage_k = USE_DECODE_K || KV_bounds_check || d * 16 + 16 > HSK;
+            const bool stage_k = USE_DECODE_K || KV_bounds_check || d * 16 + 16 > HSK || GATHER_KV;
             if (stage_k) {
                 barrier();
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * MatBr / 4; idx += gl_WorkGroupSize.x) {
@@ -295,17 +314,20 @@ void main() {
                     uint32_t row = (idx + tid) / (MatBr / 4);
                     if (idx + tid < Bc * MatBr / 4) {
                         FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
-                        if ((!KV_bounds_check || j * Bc + row < KV) && (HSK == HSK_pad || d * 16 + col_vec * 4 < HSK)) {
+                        // GATHER_KV: the source row comes from the token's list; an invalid entry stays zero
+                        const uint32_t k_src = GATHER_KV ? grow_sh[row] : (j * Bc + row);
+                        const bool k_ok = GATHER_KV ? (k_src != 0xFFFFFFFFu) : (!KV_bounds_check || j * Bc + row < KV);
+                        if (k_ok && (HSK == HSK_pad || d * 16 + col_vec * 4 < HSK)) {
 #if !defined(BFLOAT16)
                             if (USE_DECODE_K) {
-                                uint coord = (j * Bc + row) * k_stride * BLOCK_SIZE_K + d * 16 + col_vec * 4;
+                                uint coord = k_src * k_stride * BLOCK_SIZE_K + d * 16 + col_vec * 4;
                                 uint ib = coord / BLOCK_SIZE_K;
                                 uint iqs = (coord % BLOCK_SIZE_K);
                                 K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
                             } else
 #endif
                             {
-                                K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + row) * k_stride / 4 + d * 16 / 4 + col_vec]);
+                                K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + k_src * k_stride / 4 + d * 16 / 4 + col_vec]);
                             }
                         }
 
@@ -485,21 +507,22 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check;
+            const bool stage_v = USE_DECODE_V || KV_bounds_check || GATHER_KV;
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
                     const uint row = idx / v_cols;
                     const uint col = idx % v_cols;
 
-                    const uint v_row = j * Bc + row;
+                    const uint v_row = GATHER_KV ? grow_sh[row] : (j * Bc + row);
                     const uint v_col = hsv_tile * MatBc * row_split + col * 4;
 
                     const uint coord = v_row * v_stride * BLOCK_SIZE_V + v_col;
                     const uint ib = coord / BLOCK_SIZE_V;
                     const uint iqs = coord % BLOCK_SIZE_V;
 
-                    if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
+                    const bool v_ok = GATHER_KV ? (v_row != 0xFFFFFFFFu && v_col < HSV) : (!KV_bounds_check || (v_row < KV && v_col < HSV));
+                    if (v_ok) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
@@ -527,7 +550,7 @@ void main() {
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check) {
+                    if (!USE_DECODE_V && !KV_bounds_check && !GATHER_KV) {   // GATHER_KV: V rows were staged by index; never read them directly
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         if (V_TRANSPOSED) {
