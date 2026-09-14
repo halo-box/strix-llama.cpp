@@ -9591,6 +9591,14 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
+        for (int tokens : {4095,4096,4097,8192,16384,32768,32769}) {
+            for (bool broadcast : {false,true}) {
+                test_cases.emplace_back(new test_mul_mat_id(type,GGML_TYPE_F32,512,10,broadcast,32,tokens,256));
+            }
+        }
+    }
+
     for (int blocks : {63,64,65,1024}) {
         for (int heads : {1,2,4,15,16,32}) {
             test_cases.emplace_back(new test_indexer_head_sum(blocks,heads,64));

@@ -183,8 +183,11 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const int si1  = ids->nb[1] / ggml_element_size(ids);
     const int sis1 = src1->nb[2] / src1->nb[1];
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-        src0->ne[2], n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+    if (!ggml_cuda_launch_mm_ids_bounded(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            src0->ne[2], n_tokens, n_expert_used, src1->ne[1], si1, sis1, dedup_bcast, stream)) {
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            src0->ne[2], n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     size_t nbytes_src1_q8_1 = n_tokens*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ;
@@ -372,8 +375,11 @@ static void ggml_cuda_mul_mat_q_impl(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        if (!ggml_cuda_launch_mm_ids_bounded(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+                ne02, ne12, n_expert_used, ne11, si1, sis1, dedup_bcast, stream)) {
+            ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+                ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 
