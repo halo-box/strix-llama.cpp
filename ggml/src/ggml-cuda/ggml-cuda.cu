@@ -62,6 +62,7 @@
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/hyperconn.cuh"
 #include "ggml-cuda/norm-gated.cuh"
+#include "ggml-cuda/idx-relu-sum.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -3766,6 +3767,47 @@ static int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_
     return n_ops;
 }
 
+static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_idx_relu_sum_args & a) {
+    if (i + 4 >= g->n_nodes) return 0;
+    const ggml_tensor * relu = g->nodes[i];
+    if (relu->op != GGML_OP_UNARY || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU) return 0;
+    if (relu->type != GGML_TYPE_F32 || !ggml_is_contiguous(relu)) return 0;
+    const ggml_tensor * src = relu->src[0];
+    if (!src || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) || !ggml_are_same_shape(src, relu)) return 0;
+    const int64_t nb = relu->ne[0], H = relu->ne[1], nt = relu->ne[2], ns = relu->ne[3];
+    if (H < 2 || H > 32 || nb < 64 || nt * ns < 64 || nt * ns > UINT16_MAX) return 0;
+    auto is_slice = [&](const ggml_tensor * v, int64_t h) {
+        return v->op == GGML_OP_VIEW && v->view_src == relu && v->type == GGML_TYPE_F32 &&
+               v->ne[0] == nb && v->ne[1] == nt && v->ne[2] == ns && v->ne[3] == 1 &&
+               v->nb[0] == sizeof(float) && v->nb[1] == relu->nb[2] && v->nb[2] == relu->nb[3] &&
+               v->view_offs == (size_t) h * relu->nb[1];
+    };
+    const ggml_tensor * cont = g->nodes[i + 2];
+    if (!is_slice(g->nodes[i + 1], 0) || cont->op != GGML_OP_CONT || cont->src[0] != g->nodes[i + 1]) return 0;
+    const ggml_tensor * prev = cont;
+    int k = i + 3;
+    for (int64_t h = 1; h < H; ++h) {
+        if (k + 1 >= g->n_nodes) return 0;
+        const ggml_tensor * v = g->nodes[k]; const ggml_tensor * add = g->nodes[k + 1];
+        if (!is_slice(v, h) || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32) return 0;
+        if (add->src[0] != prev || add->src[1] != v || !ggml_are_same_shape(add, cont) || !ggml_is_contiguous(add)) return 0;
+        prev = add; k += 2;
+    }
+    const int count = k - i;
+    if (count > 32) return 0;
+    int indices[32]; ggml_op ops[32];
+    for (int j = 0; j < count; ++j) { indices[j] = i + j; ops[j] = g->nodes[i + j]->op; }
+    const int output = i + count - 1;
+    if (!ggml_can_fuse_subgraph_ext(g, indices, count, ops, &output, 1)) return 0;
+    if (src->data && prev->data) {
+        const uintptr_t av = (uintptr_t) src->data, bv = (uintptr_t) prev->data;
+        const bool overlap = av <= bv ? bv - av < ggml_nbytes(src) : av - bv < ggml_nbytes(prev);
+        if (overlap) { return 0; }
+    }
+    a.score = src; a.dst = (ggml_tensor *) prev; a.heads = (int) H;
+    return count;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3781,6 +3823,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    if (node->op == GGML_OP_UNARY && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        ggml_cuda_idx_relu_sum_args args;
+        const int count = ggml_cuda_match_idx_relu_sum(cgraph, i, args);
+        if (count > 0) {
+            ggml_cuda_op_idx_relu_sum(*cuda_ctx, args);
+            return count - 1;
+        }
+    }
+
 
 
     // RDNA3.5 decode: consecutive single-column MUL_MATs that read the same activation vector (plain Q8_0/F32
@@ -5541,6 +5592,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
+        if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                if (cgraph->nodes[i]->op != GGML_OP_UNARY) continue;
+                ggml_cuda_idx_relu_sum_args args;
+                if (ggml_cuda_match_idx_relu_sum(cgraph, i, args) > 0) {
+                    auto * root = const_cast<ggml_tensor *>(args.score->view_src ? args.score->view_src : args.score);
+                    params->add_alloc_dep(params->user_data, root, args.dst);
+                }
+            }
+        }
+
         if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 if (cgraph->nodes[i]->op != GGML_OP_RMS_NORM) continue;

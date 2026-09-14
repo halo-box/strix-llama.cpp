@@ -3674,6 +3674,32 @@ struct test_rms_norm : public test_case {
     }
 };
 
+struct test_indexer_head_sum : public test_case {
+    const int blocks, heads, tokens, streams;
+    const bool view, escape;
+    const int alias;
+    test_indexer_head_sum(int blocks, int heads, int tokens, int streams=1, bool view=false, bool escape=false, int alias=0)
+        : blocks(blocks), heads(heads), tokens(tokens), streams(streams), view(view), escape(escape), alias(alias) {}
+    std::string op_desc(ggml_tensor *) override { return "INDEXER_HEAD_SUM"; }
+    std::string vars() override { return VARS_TO_STR7(blocks, heads, tokens, streams, view, escape, alias); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 0.0; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * backing = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, view ? 2*blocks : blocks, heads, tokens, streams);
+        auto * src = view ? ggml_view_4d(ctx, backing, blocks, heads, tokens, streams, backing->nb[1], backing->nb[2], backing->nb[3], sizeof(float)) : backing;
+        auto * relu = ggml_relu(ctx, src);
+        ggml_tensor * sum = nullptr, * first = nullptr;
+        for (int h=0;h<heads;++h) {
+            auto * slice = ggml_view_3d(ctx, relu, blocks, tokens, streams, relu->nb[2], relu->nb[3], h*relu->nb[1]);
+            if (!first) first=slice;
+            sum = sum ? ggml_add(ctx, sum, slice) : ggml_cont(ctx, slice);
+        }
+        if (escape) sum=ggml_add(ctx, sum, first);
+        if (alias) { sum->view_src=backing;sum->view_offs=alias==2 ? sizeof(float) : 0; }
+        return sum;
+    }
+};
+
 struct test_rms_norm_narrow : public test_case {
     const int cols, rows;
     const bool gated, view, escape;
@@ -9565,6 +9591,18 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int blocks : {63,64,65,1024}) {
+        for (int heads : {1,2,4,15,16,32}) {
+            test_cases.emplace_back(new test_indexer_head_sum(blocks,heads,64));
+        }
+    }
+    for (int tokens : {63,65,65535,65536}) test_cases.emplace_back(new test_indexer_head_sum(64,2,tokens));
+    test_cases.emplace_back(new test_indexer_head_sum(128,4,32,2));
+    test_cases.emplace_back(new test_indexer_head_sum(128,4,64,2,true));
+    test_cases.emplace_back(new test_indexer_head_sum(128,4,64,2,false,true));
+    for (int alias : {1,2}) test_cases.emplace_back(new test_indexer_head_sum(128,4,64,2,false,false,alias));
+    test_cases.emplace_back(new test_indexer_head_sum(10112,4,64));
+
     for (int cols : {31, 32, 64, 128, 256, 288}) {
         for (int rows : {4095, 4096, 4097}) {
             for (bool gated : {false, true}) {
