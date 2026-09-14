@@ -522,12 +522,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
-    // block_out and inject die at this combine; keep their buffers from being handed to the next grouped norm
-    // output (the backend fuses combine + norm into one kernel whose blocks all read block_out/inject while
-    // writing their own stream of the norm output, so the two must not alias)
-    ggml_set_output(block_out);
-    ggml_set_output(inject);
-
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);

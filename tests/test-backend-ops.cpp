@@ -3674,6 +3674,39 @@ struct test_rms_norm : public test_case {
     }
 };
 
+struct test_hc_combine_norm_lifetime : public test_case {
+    const int embd, hc, tokens;
+    const bool res_inplace;
+    const int alias;
+    ggml_tensor * out_res = nullptr, * out_norm = nullptr;
+    test_hc_combine_norm_lifetime(int embd, int hc, int tokens, bool res_inplace=false, int alias=0)
+        : embd(embd), hc(hc), tokens(tokens), res_inplace(res_inplace), alias(alias) {}
+    std::string op_desc(ggml_tensor *) override { return "HC_COMBINE_NORM_LIFETIME"; }
+    std::string vars() override { return VARS_TO_STR5(embd,hc,tokens,res_inplace,alias); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return alias == 3 ? std::vector<ggml_tensor *>{out_norm} : std::vector<ggml_tensor *>{out_res,out_norm}; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * residual_backing=ggml_new_tensor_1d(ctx,GGML_TYPE_F32,int64_t(embd)*hc*tokens+1);
+        auto * residual=ggml_view_3d(ctx,residual_backing,embd,hc,tokens,embd*sizeof(float),int64_t(embd)*hc*sizeof(float),0);
+        auto * block_backing=ggml_new_tensor_1d(ctx,GGML_TYPE_F32,int64_t(embd)*hc*tokens);
+        auto * block=ggml_view_3d(ctx,block_backing,embd,1,tokens,embd*sizeof(float),embd*sizeof(float),0);
+        auto * inject_backing=ggml_new_tensor_1d(ctx,GGML_TYPE_F32,int64_t(embd)*hc*tokens);
+        auto * inject=ggml_view_2d(ctx,inject_backing,hc,tokens,hc*sizeof(float),0);
+        auto * gamma=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,embd,hc);
+        auto * weight=ggml_scale(ctx,ggml_sigmoid(ctx,ggml_scale(ctx,inject,1.0f/hc)),2.0f);
+        weight=ggml_reshape_3d(ctx,weight,1,hc,tokens);
+        if (gf) { ggml_build_forward_expand(gf,block);ggml_build_forward_expand(gf,weight); }
+        auto * expanded=ggml_repeat(ctx,block,residual);
+        auto * update=ggml_mul(ctx,expanded,weight);
+        out_res=res_inplace ? ggml_add_inplace(ctx,residual,update) : ggml_add(ctx,residual,update);
+        if (alias != 3) ggml_set_output(out_res);
+        out_norm=ggml_mul(ctx,ggml_rms_norm(ctx,out_res,1e-6f),gamma);
+        if(alias == 3) { out_norm->view_src=residual_backing;out_norm->view_offs=sizeof(float); }
+        else if(alias) { out_norm->view_src=alias==1 ? block_backing : inject_backing;out_norm->view_offs=0; }
+        return out_norm;
+    }
+};
+
 struct test_indexer_head_sum : public test_case {
     const int blocks, heads, tokens, streams;
     const bool view, escape;
@@ -9591,6 +9624,17 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for(int embd : {1023,1024,2560,3072,3073}) {
+        for(int hc : {1,4,5,16,17}) {
+            for(int tokens : {1,4,64}) test_cases.emplace_back(new test_hc_combine_norm_lifetime(embd,hc,tokens));
+        }
+    }
+    for(int embd : {1024,2560,3072}) test_cases.emplace_back(new test_hc_combine_norm_lifetime(embd,4,1,true,3));
+    for(int tokens : {1,4,128}) {
+        test_cases.emplace_back(new test_hc_combine_norm_lifetime(2560,4,tokens,true));
+        for(int alias : {1,2}) test_cases.emplace_back(new test_hc_combine_norm_lifetime(2560,4,tokens,false,alias));
+    }
+
     for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
         for (int tokens : {4095,4096,4097,8192,16384,32768,32769}) {
             for (bool broadcast : {false,true}) {

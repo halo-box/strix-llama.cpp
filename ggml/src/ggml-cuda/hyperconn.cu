@@ -235,10 +235,8 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
     }
 }
 
-// Same computation for one token with all streams in a single block, streams processed one after the other
-// with exactly the per-stream expressions and block reduction above. Every input element is loaded into
-// registers before the first store, so the outputs may alias any of the inputs (the graph allocator reuses
-// the block_out buffer for xn when block_out dies at the combine).
+// Read all residual, block and injection values before writing aliased outputs.
+// Gamma must remain disjoint from both outputs.
 #define HC_CN_SINGLE_MAX_HC 4
 
 static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_single_f32(
@@ -307,21 +305,33 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_single_
         tmp[c] = warp_reduce_sum(tmp[c]);
     }
 
-    // 3. stores
+    // Finish residual writes before an overlapping normalized output replaces them.
+#pragma unroll
+    for (int c = 0; c < HC_CN_SINGLE_MAX_HC; ++c) {
+        if (c < hc) {
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                const int col = tid + k * HC_CN_BLOCK;
+                if (col < n_embd) {
+                    out_res[((int64_t) t * hc + c) * n_embd + col] = xs[c][k];
+                }
+            }
+        }
+    }
+    __syncthreads();
+
 #pragma unroll
     for (int c = 0; c < HC_CN_SINGLE_MAX_HC; ++c) {
         if (c < hc) {
             const float mean  = tmp[c] / n_embd;
             const float scale = rsqrtf(mean + eps);
             const int64_t row = (int64_t) t * hc + c;
-            float *       dst = out_res + row * n_embd;
             float *       xn  = out_xn  + row * n_embd;
             const float * g   = gamma   + (int64_t) c * n_embd;
 #pragma unroll
             for (int k = 0; k < 3; ++k) {
                 const int col = tid + k * HC_CN_BLOCK;
                 if (col < n_embd) {
-                    dst[col] = xs[c][k];
                     xn[col]  = scale * xs[c][k] * g[col];
                 }
             }
