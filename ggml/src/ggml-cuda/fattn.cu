@@ -6,6 +6,7 @@
 #include "fattn.cuh"
 #if defined(GGML_USE_HIP)
 #include "qsa-prefill.cuh"
+#include "qsa-decode.cuh"
 #endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -761,6 +762,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 #if defined(GGML_USE_HIP)
+    if (ggml_cuda_flash_attn_ext_qsa_decode_supported(ctx, dst)) {
+        ggml_cuda_flash_attn_ext_qsa_decode(ctx, dst);
+        return;
+    }
     if (ggml_cuda_flash_attn_ext_qsa_prefill_supported(ctx, dst)) {
         ggml_cuda_flash_attn_ext_qsa_prefill(ctx, dst);
         return;

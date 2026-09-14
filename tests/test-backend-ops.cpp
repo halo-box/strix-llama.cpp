@@ -8541,7 +8541,7 @@ struct test_flash_attn_ext_top_k : public test_case {
 struct test_qsa_prefill : public test_case {
     const int dim, queries, keys, selected, streams, ratio;
     const bool interleaved, poison;
-    ggml_tensor * k = nullptr, * v = nullptr, * mask = nullptr, * ids = nullptr;
+    ggml_tensor * q = nullptr, * k = nullptr, * v = nullptr, * mask = nullptr, * ids = nullptr;
     test_qsa_prefill(int queries, int keys, int selected, bool interleaved=true, bool poison=false, int streams=1, int ratio=12, int dim=256)
         : dim(dim), queries(queries), keys(keys), selected(selected), streams(streams), ratio(ratio), interleaved(interleaved), poison(poison) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL"; }
@@ -8549,7 +8549,7 @@ struct test_qsa_prefill : public test_case {
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        auto * q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
+        q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
         q = ggml_permute(ctx,q,0,2,1,3);
         k = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
         v = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
@@ -8571,7 +8571,7 @@ struct test_qsa_prefill : public test_case {
             for (int j=0;j<selected;++j) {
                 int key=1+(j*37+q*13+stream*7)%(keys-4);
                 if (key==3) key=4;
-                if (j==0) key=poison ? 3 : -1;
+                if (j==0) key=selected==1 ? 2 : (poison ? 3 : -1);
                 if (j==1) key=2;
                 picks[(stream*queries+q)*selected+j]=key;
                 if (key>=0 && !(poison && key==3)) masks[(stream*queries+q)*keys+key]=ggml_fp32_to_fp16(0.015625f*(key%5-2));
@@ -8585,6 +8585,55 @@ struct test_qsa_prefill : public test_case {
                 ggml_backend_tensor_set(t,nan.data(),stream*t->nb[3]+head*t->nb[2]+3*t->nb[1],dim*sizeof(ggml_fp16_t));
             }
         }
+    }
+};
+
+struct test_qsa_decode : public test_qsa_prefill {
+    const bool duplicates;
+    test_qsa_decode(int q, int keys, int selected, bool poison=false, int ratio=12, bool duplicates=false)
+        : test_qsa_prefill(q,keys,selected,true,poison,1,ratio), duplicates(duplicates) {}
+    std::string op_desc(ggml_tensor *) override { return "QSA_DECODE"; }
+    std::string vars() override { return test_qsa_prefill::vars()+",duplicates="+std::to_string(duplicates); }
+    double err(const float * actual, const float * cpu, size_t n) override {
+        const double agreement=nmse(actual,cpu,n);
+        if (queries>8 || selected>2560) return agreement;
+        const auto qv=tensor_to_float(q), kv=tensor_to_float(k), vv=tensor_to_float(v), mv=tensor_to_float(mask);
+        std::vector<float> reference(n);
+        for (int query=0;query<queries;++query) {
+            std::vector<int> active;
+            for (int key=0;key<keys;++key) if (mv[size_t(query)*keys+key]!=-INFINITY) active.push_back(key);
+            for (int head=0;head<2*ratio;++head) {
+                std::vector<double> scores(active.size()), values(dim,0.0);
+                double maximum=-INFINITY;
+                for (size_t j=0;j<active.size();++j) {
+                    const int key=active[j];double dot=0;
+                    for (int d=0;d<dim;++d) dot+=double(qv[d+size_t(dim)*(query+queries*head)])*kv[d+size_t(dim)*(key+keys*(head/ratio))];
+                    scores[j]=dot/std::sqrt(double(dim))+mv[size_t(query)*keys+key];
+                    maximum=std::max(maximum,scores[j]);
+                }
+                double sum=0;
+                for (size_t j=0;j<active.size();++j) {
+                    const double weight=std::exp(scores[j]-maximum);sum+=weight;
+                    for (int d=0;d<dim;++d) values[d]+=weight*vv[d+size_t(dim)*(active[j]+keys*(head/ratio))];
+                }
+                for (int d=0;d<dim;++d) reference[d+size_t(dim)*(head+2*ratio*query)]=sum>0 ? float(values[d]/sum) : 0.0f;
+            }
+        }
+        const double gpu_error=nmse(reference.data(),actual,n), cpu_error=nmse(reference.data(),cpu,n);
+        fprintf(stderr,"QSA_FP64 q=%d keys=%d selected=%d ratio=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,ratio,gpu_error,cpu_error);
+        return std::max(agreement,gpu_error);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_qsa_prefill::initialize_tensors(ctx);
+        if (!duplicates) return;
+        std::vector<int32_t> picks(ggml_nelements(ids));
+        std::vector<ggml_fp16_t> masks(ggml_nelements(mask),ggml_fp32_to_fp16(-INFINITY));
+        for (int q=0;q<queries;++q) for (int j=0;j<selected;++j) {
+            const int key=j<selected/2 ? 2 : 4+(j*13+q*7)%(keys-8);
+            picks[q*selected+j]=key;masks[q*keys+key]=ggml_fp32_to_fp16(0.f);
+        }
+        ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
+        ggml_backend_tensor_set(mask,masks.data(),0,ggml_nbytes(mask));
     }
 };
 
@@ -12018,6 +12067,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
+    }
+
+    for (int q : {1,2,4,8,9}) {
+        for (int k : {1,17,64,65,128,129,2051,2560,2561}) test_cases.emplace_back(new test_qsa_decode(q,4096,k));
+    }
+    for (int q : {1,4,8}) {
+        test_cases.emplace_back(new test_qsa_decode(q,40064,2051));
+        test_cases.emplace_back(new test_qsa_decode(q,4096,257,true));
+        test_cases.emplace_back(new test_qsa_decode(q,4096,257,false,4));
+        test_cases.emplace_back(new test_qsa_decode(q,4096,2051,false,12,true));
+        test_cases.emplace_back(new test_qsa_decode(q,4096,257,true,4));
     }
 
     for (bool interleaved : {false,true}) {
