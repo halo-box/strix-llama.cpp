@@ -8538,6 +8538,56 @@ struct test_flash_attn_ext_top_k : public test_case {
     }
 };
 
+struct test_qsa_prefill : public test_case {
+    const int dim, queries, keys, selected, streams, ratio;
+    const bool interleaved, poison;
+    ggml_tensor * k = nullptr, * v = nullptr, * mask = nullptr, * ids = nullptr;
+    test_qsa_prefill(int queries, int keys, int selected, bool interleaved=true, bool poison=false, int streams=1, int ratio=12, int dim=256)
+        : dim(dim), queries(queries), keys(keys), selected(selected), streams(streams), ratio(ratio), interleaved(interleaved), poison(poison) {}
+    std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL"; }
+    std::string vars() override { return VARS_TO_STR8(dim,queries,keys,selected,streams,ratio,interleaved,poison); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
+        q = ggml_permute(ctx,q,0,2,1,3);
+        k = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        v = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        if (interleaved) { k=ggml_permute(ctx,k,0,2,1,3); v=ggml_permute(ctx,v,0,2,1,3); }
+        mask = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,keys,queries,1,streams);
+        ids = ggml_new_tensor_4d(ctx,GGML_TYPE_I32,selected,queries,1,streams);
+        auto * out = ggml_flash_attn_ext(ctx,q,k,v,mask,1.0f/sqrtf(dim),0.0f,0.0f);
+        ggml_flash_attn_ext_add_top_k(out,ids,0);
+        ggml_prec_set_acc(out,GGML_PREC_F32);
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
+            if (t->op==GGML_OP_NONE && t!=mask && t!=ids) init_tensor_uniform(t);
+        }
+        std::vector<int32_t> picks(ggml_nelements(ids));
+        std::vector<ggml_fp16_t> masks(ggml_nelements(mask),ggml_fp32_to_fp16(-INFINITY));
+        for (int stream=0;stream<streams;++stream) for (int q=0;q<queries;++q) {
+            for (int j=0;j<selected;++j) {
+                int key=1+(j*37+q*13+stream*7)%(keys-4);
+                if (key==3) key=4;
+                if (j==0) key=poison ? 3 : -1;
+                if (j==1) key=2;
+                picks[(stream*queries+q)*selected+j]=key;
+                if (key>=0 && !(poison && key==3)) masks[(stream*queries+q)*keys+key]=ggml_fp32_to_fp16(0.015625f*(key%5-2));
+            }
+        }
+        ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
+        ggml_backend_tensor_set(mask,masks.data(),0,ggml_nbytes(mask));
+        if (poison) {
+            std::vector<ggml_fp16_t> nan(dim,ggml_fp32_to_fp16(NAN));
+            for (auto * t : {k,v}) for (int stream=0;stream<streams;++stream) for (int head=0;head<2;++head) {
+                ggml_backend_tensor_set(t,nan.data(),stream*t->nb[3]+head*t->nb[2]+3*t->nb[1],dim*sizeof(ggml_fp16_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11969,6 +12019,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
     }
+
+    for (bool interleaved : {false,true}) {
+        test_cases.emplace_back(new test_qsa_prefill(128,512,17,interleaved));
+        test_cases.emplace_back(new test_qsa_prefill(129,4096,257,interleaved));
+        test_cases.emplace_back(new test_qsa_prefill(512,4096,2051,interleaved));
+        test_cases.emplace_back(new test_qsa_prefill(128,40064,2051,interleaved));
+    }
+    for (int q : {1,4,127}) test_cases.emplace_back(new test_qsa_prefill(q,4096,128));
+    test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,2));
+    test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,4));
+    test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,12,128));
+    test_cases.emplace_back(new test_qsa_prefill(128,4096,2560));
+    test_cases.emplace_back(new test_qsa_prefill(128,4096,2561));
+    test_cases.emplace_back(new test_qsa_prefill(128,512,17,true,true));
+    test_cases.emplace_back(new test_qsa_prefill(129,4096,257,true,true));
 
     // sparse top-k FA: (kv, nb, n_kv_raw, n_top_k, sinks). The Vulkan sparse path engages
     // when kv >= 3*(n_kv_raw + n_top_k) AND nb >= 64 (prefill-only); the nb < 64 cases
