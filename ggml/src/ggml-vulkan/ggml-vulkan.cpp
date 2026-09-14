@@ -21203,16 +21203,31 @@ static bool ggml_vk_can_fuse_mm_cpy16(const ggml_backend_vk_context * ctx, const
     return true;
 }
 static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx);
+// GGML_VK_FUSION_DEBUG=1 also reports why a MUL_MAT_ID(+MUL)+CPY(f16) candidate was not matched
+static void ggml_vk_cpy16_reject(const struct ggml_cgraph * cgraph, int node_idx, const char * why) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    if (dbg) {
+        const ggml_tensor * n = cgraph->nodes[node_idx];
+        fprintf(stderr, "ggml_vulkan: cpy16 fusion not matched at node %d (%s %s): %s\n", node_idx, ggml_op_name(n->op), n->name, why);
+    }
+}
 static bool ggml_vk_can_fuse_mmid_cpy16(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, bool with_mul) {
     if (!ggml_vk_mm_cpy16_enabled() || !ctx->device->coopmat_support || ctx->device->coopmat2) {
         return false;
     }
+    // only report candidates: a MUL_MAT_ID whose chain ends in a CPY(f16) within two nodes
+    const int cpy_idx = node_idx + (with_mul ? 2 : 1);
+    const bool candidate = cpy_idx < cgraph->n_nodes && cgraph->nodes[node_idx]->op == GGML_OP_MUL_MAT_ID &&
+                           cgraph->nodes[cpy_idx]->op == GGML_OP_CPY && cgraph->nodes[cpy_idx]->type == GGML_TYPE_F16 &&
+                           (!with_mul || cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL);
     if (with_mul) {
         if (!ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_CPY }) ||
             !ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL })) {
+            if (candidate) ggml_vk_cpy16_reject(cgraph, node_idx, with_mul ? "can_fuse(MMID,MUL,CPY) or (MMID,MUL) false" : "");
             return false;
         }
     } else if (!ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_CPY })) {
+        if (candidate) ggml_vk_cpy16_reject(cgraph, node_idx, "can_fuse(MMID,CPY) false");
         return false;
     }
     const ggml_tensor * mmid = cgraph->nodes[node_idx];
@@ -21220,16 +21235,15 @@ static bool ggml_vk_can_fuse_mmid_cpy16(const ggml_backend_vk_context * ctx, con
     const ggml_tensor * cpy  = cgraph->nodes[node_idx + (with_mul ? 2 : 1)];
     const ggml_tensor * src0 = mmid->src[0];
     const ggml_tensor * src1 = mmid->src[1];
-    if (!ggml_vk_cpy16_target_ok(last, cpy) || !ggml_vk_mm_d16_type_ok(src0->type) || !ggml_is_contiguous(src0) ||
-        mmid->type != GGML_TYPE_F32) {
-        return false;
-    }
+    if (!ggml_vk_cpy16_target_ok(last, cpy)) { ggml_vk_cpy16_reject(cgraph, node_idx, "cpy target (src/type/contig/shape)"); return false; }
+    if (!ggml_vk_mm_d16_type_ok(src0->type)) { ggml_vk_cpy16_reject(cgraph, node_idx, "weight type"); return false; }
+    if (!ggml_is_contiguous(src0) || mmid->type != GGML_TYPE_F32) { ggml_vk_cpy16_reject(cgraph, node_idx, "src0 layout / dst type"); return false; }
     if (!(src1->type == GGML_TYPE_F16 || (src1->type == GGML_TYPE_F32 && ggml_vk_mmid_f16b_enabled()))) {
-        return false;
+        ggml_vk_cpy16_reject(cgraph, node_idx, "src1 type"); return false;
     }
     // the coopmat mul_mat_id path (prefill), never the mat-vec one
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx) || src1->ne[2] < 32) {
-        return false;
+        ggml_vk_cpy16_reject(cgraph, node_idx, "mat-vec path / short batch"); return false;
     }
     return true;
 }
