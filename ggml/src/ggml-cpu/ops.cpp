@@ -11441,10 +11441,11 @@ static void ggml_compute_forward_dsv4_hc_mix_f32(
     const ggml_tensor * gate = dst->src[1];
 
     GGML_ASSERT(xn->type == GGML_TYPE_F32 || xn->type == GGML_TYPE_F16);
-    GGML_ASSERT(gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 || gate->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
 
     const bool xn_f16  = xn->type == GGML_TYPE_F16;
+    const bool g_f16   = gate->type == GGML_TYPE_F16;
     const bool dst_f16 = dst->type == GGML_TYPE_F16;
 
     const int64_t n_embd   = xn->ne[0];
@@ -11478,7 +11479,8 @@ static void ggml_compute_forward_dsv4_hc_mix_f32(
             for (int64_t c = 0; c < hc; ++c) {
                 const char * xp = (const char *) xn->data + i0*nbx0 + c*nbx1 + it*nbx2;
                 const float xv = xn_f16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) xp) : *(const float *) xp;
-                const float gv = *(const float *) ((const char *) gate->data + (c*n_embd + i0)*nbg0 + it*nbg1);
+                const char * gp = (const char *) gate->data + (c*n_embd + i0)*nbg0 + it*nbg1;
+                const float gv = g_f16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) gp) : *(const float *) gp;
                 sum += xv * (1.0f / (1.0f + expf(-gv)));
             }
             if (dst_f16) {

@@ -1947,6 +1947,17 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// LLAMA_MOE_F16 (default on): at prefill (n_tokens >= 32) keep the MoE expert activations and outputs in f16
+// between the projections, the GLU and the combine. Every consumer reads f16 natively on the Vulkan backend
+// (f16-B matmuls, f16 GLU, f16-source multi-add); other backends run the casts as plain conversions.
+static bool llm_graph_moe_f16(int64_t n_tokens) {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_MOE_F16");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on && n_tokens >= 32;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2188,6 +2199,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
+        // f16 expert activations at prefill (LLAMA_MOE_F16): each projection is followed directly by its
+        // cast so the backend can fuse MUL_MAT_ID+CPY(f16) and store f16 from the accumulator. The block
+        // input stays referenced past the last cast (a view expanded after it): the allocator must not
+        // hand the cast's destination the input's freed bytes while the fused matmul is still reading them.
+        const bool cast_f16 = llm_graph_moe_f16(n_tokens) && gate_exps != nullptr && !up_exps_b && !gate_exps_b;
+        ggml_tensor * moe_inp = cur;
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
@@ -2198,6 +2215,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (up_exps_b) {
             up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
             cb(up, "ffn_moe_up_biased", il);
+        }
+        if (cast_f16) {
+            up = ggml_cast(ctx0, up, GGML_TYPE_F16);
+            cb(up, "ffn_moe_up_f16", il);
         }
 
         if (gate_exps) {
@@ -2214,6 +2235,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps_b) {
             cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
             cb(cur, "ffn_moe_gate_biased", il);
+        }
+        if (cast_f16) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+            cb(cur, "ffn_moe_gate_f16", il);
+            ggml_build_forward_expand(gf, ggml_view_1d(ctx0, moe_inp, 1, 0));   // keep moe_inp alive past the cast
         }
     }
 
@@ -2244,6 +2270,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (has_gate) {
+                if (llm_graph_moe_f16(n_tokens) && (cur->type != GGML_TYPE_F16 || up->type != GGML_TYPE_F16)) {
+                    // f16 expert activations at prefill (fused gate/up or biased paths: the separate path
+                    // cast right after each projection): the GLU runs f16 in / f16 out and the down
+                    // projection takes the f16 B operand directly. LLAMA_MOE_F16=0 restores the f32 chain.
+                    if (cur->type != GGML_TYPE_F16) cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+                    if (up->type  != GGML_TYPE_F16) up  = ggml_cast(ctx0, up,  GGML_TYPE_F16);
+                }
                 cur = ggml_swiglu_split(ctx0, cur, up);
                 cb(cur, "ffn_moe_swiglu", il);
             } else {
@@ -2319,6 +2352,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_weighted", il);
     }
 
+    const bool experts_f16 = llm_graph_moe_f16(n_tokens) && experts->type == GGML_TYPE_F32;
+    if (experts_f16) {
+        // f16 expert outputs: the weighted down projection stores f16 (MUL_MAT_ID+MUL+CPY(f16) fusion) and
+        // the combine below reads f16 and sums in f32 (ggml_add_cast, MULTI_ADD f16in kernel): half the
+        // bytes of the largest elementwise pass in the block. The GLU output (the down projection's B
+        // operand) stays referenced past the cast so its bytes cannot be reused for the cast's destination.
+        experts = ggml_cast(ctx0, experts, GGML_TYPE_F16);
+        cb(experts, "ffn_moe_weighted_f16", il);
+        ggml_build_forward_expand(gf, ggml_view_1d(ctx0, cur, 1, 0));
+    }
+
     ggml_build_forward_expand(gf, experts);
 
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
@@ -2340,14 +2384,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * moe_out = cur_experts[0];
 
     for (uint32_t i = 1; i < n_expert_used_il; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        // f16 expert outputs sum in f32 from the first add on
+        moe_out = (i == 1 && experts_f16) ? ggml_add_cast(ctx0, moe_out, cur_experts[i], GGML_TYPE_F32)
+                                          : ggml_add(ctx0, moe_out, cur_experts[i]);
 
         ggml_build_forward_expand(gf, moe_out);
     }
 
     if (n_expert_used_il == 1) {
-        // avoid returning a non-contiguous tensor
-        moe_out = ggml_cont(ctx0, moe_out);
+        // avoid returning a non-contiguous tensor (and an f16 one)
+        moe_out = experts_f16 ? ggml_cast(ctx0, moe_out, GGML_TYPE_F32) : ggml_cont(ctx0, moe_out);
     }
 
     cb(moe_out, "ffn_moe_out", il);

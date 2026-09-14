@@ -6670,7 +6670,7 @@ struct ggml_tensor * ggml_dsv4_hc_mix(
         float                 scale,
         enum   ggml_type      type) {
     GGML_ASSERT(xn->type == GGML_TYPE_F32 || xn->type == GGML_TYPE_F16);
-    GGML_ASSERT(gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 || gate->type == GGML_TYPE_F16);
     GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16);
 
     const int64_t n_embd   = xn->ne[0];

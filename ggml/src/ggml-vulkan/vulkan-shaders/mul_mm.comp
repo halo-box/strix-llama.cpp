@@ -638,7 +638,11 @@ void main() {
         }
     }
 #else
+#ifdef D_F16
+    const bool is_aligned = p.stride_d % 8 == 0;  // 16-byte rows of float16_t
+#else
     const bool is_aligned = p.stride_d % 4 == 0;  // Assumption: D_TYPE == float
+#endif
 
     [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
         [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {

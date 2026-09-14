@@ -16,7 +16,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 // xn is f32 (A_TYPE float) or f16 (A_TYPE float16_t, when the norm wrote the GEMM operand directly)
 layout(binding = 0) readonly  buffer XBuf { A_TYPE data_x[]; };
-layout(binding = 1) readonly  buffer GBuf { float data_g[]; };
+layout(binding = 1) readonly  buffer GBuf { G_TYPE data_g[]; };   // gate logits f32, or f16 when the up-GEMM wrote f16
 layout(binding = 2) writeonly buffer DBuf { D_TYPE data_d[]; };   // float, or float16_t when every consumer is a GEMM B operand
 
 layout(push_constant) uniform Parameters {
@@ -48,7 +48,7 @@ void main() {
             const uint xb = i0 + c * p.sx1 + it * p.sx2;
             const uint gb = (c * p.n_embd + i0) + it * p.sg1;
             const vec4 xv = vec4(float(data_x[xb]), float(data_x[xb + 1]), float(data_x[xb + 2]), float(data_x[xb + 3]));
-            const vec4 gv = vec4(data_g[gb], data_g[gb + 1], data_g[gb + 2], data_g[gb + 3]);
+            const vec4 gv = vec4(float(data_g[gb]), float(data_g[gb + 1]), float(data_g[gb + 2]), float(data_g[gb + 3]));
             sum += xv * vec4(sigmoid(gv.x), sigmoid(gv.y), sigmoid(gv.z), sigmoid(gv.w));
         }
         const uint db = i0 + it * p.sd1;
@@ -58,7 +58,7 @@ void main() {
         for (uint k = i0; k < p.n_embd; ++k) {
             float s = 0.0f;
             for (uint c = 0; c < p.hc; ++c) {
-                s += float(data_x[k + c * p.sx1 + it * p.sx2]) * sigmoid(data_g[(c * p.n_embd + k) + it * p.sg1]);
+                s += float(data_x[k + c * p.sx1 + it * p.sx2]) * sigmoid(float(data_g[(c * p.n_embd + k) + it * p.sg1]));
             }
             data_d[k + it * p.sd1] = D_TYPE(p.scale * s);
         }

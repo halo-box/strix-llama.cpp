@@ -473,6 +473,16 @@ static bool qwen4exp_hc_xn16() {
     return on;
 }
 
+// LLAMA_HC_GATE16=0 keeps the hc gate logits in f32 (default: the up-GEMM writes f16 and the mix reads f16;
+// needs the xn16 path, since the f16-gate mix kernel reads f16 xn and writes f16).
+static bool qwen4exp_hc_gate16() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_HC_GATE16");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 // LLAMA_HC_MIXOP=0 restores the unfused mix collapse (sigmoid, mul, hc-1 adds, scale).
 static bool qwen4exp_hc_mixop() {
     static const bool on = [] {
@@ -601,6 +611,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     }
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate_logits = build_lora_mm(w_up, lo);
+    if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_mixop() && qwen4exp_hc_xn16() && qwen4exp_hc_gate16() && loras->empty() && nt >= 32) {
+        // f16 gate logits: the up-GEMM writes its result as f16 through the MUL_MAT+CPY(f16) fusion and
+        // DSV4_HC_MIX reads the f16 gate; the 84 MB f32 gate tensor is neither written nor read (prefill only)
+        gate_logits = ggml_cast(ctx0, gate_logits, GGML_TYPE_F16);
+        // the low-rank input stays referenced past the cast: the fused matmul reads it while it writes the
+        // cast's destination, so the allocator must not place the two on the same bytes
+        ggml_build_forward_expand(gf, ggml_view_1d(ctx0, lo, 1, 0));
+    }
 
     ggml_tensor * mixed;
     if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_mixop()) {

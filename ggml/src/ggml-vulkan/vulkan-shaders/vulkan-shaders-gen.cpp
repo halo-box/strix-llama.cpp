@@ -627,6 +627,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (tname != "f16" && tname != "f32") {
             string_to_spv(shader_name + "_" + tname + "_f16" + dot2_sfx, source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
         }
+        // f16-output variants for the MUL_MAT(+MUL)+CPY(f16) fusion (KHR coopmat, f16 B): only the weight types
+        // the Flash-Next graph writes f16 from. D_F16 switches the epilogue's 16-byte store alignment rule.
+        if (coopmat && !coopmat2 && fp16 && !dot2 &&
+            (tname == "q4_k" || tname == "q5_0" || tname == "q8_0" || tname == "q6_k")) {
+            string_to_spv(shader_name + "_" + tname + "_f16_d16", source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}}), fp16, coopmat, coopmat2, f16acc);
+        }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if ((coopmat || coopmat2) && (tname == "mxfp4" || tname == "nvfp4")) {
@@ -847,11 +853,12 @@ void process_shaders() {
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
-    string_to_spv("dsv4_hc_mix_f32",      "dsv4_hc_mix.comp",  {{"A_TYPE", "float"},     {"D_TYPE", "float"}});
-    string_to_spv("dsv4_hc_mix_f32_f16",  "dsv4_hc_mix.comp",  {{"A_TYPE", "float"},     {"D_TYPE", "float16_t"}});
+    string_to_spv("dsv4_hc_mix_f32", "dsv4_hc_mix.comp", {{"A_TYPE", "float"}, {"G_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("dsv4_hc_mix_f32_f16", "dsv4_hc_mix.comp", {{"A_TYPE", "float"}, {"G_TYPE", "float"}, {"D_TYPE", "float16_t"}});
     string_to_spv("dsv4_hc_post_norm_f32", "dsv4_hc_post_norm.comp", {});
-    string_to_spv("dsv4_hc_mix_f16",      "dsv4_hc_mix.comp",  {{"A_TYPE", "float16_t"}, {"D_TYPE", "float"}});
-    string_to_spv("dsv4_hc_mix_f16_f16",  "dsv4_hc_mix.comp",  {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+    string_to_spv("dsv4_hc_mix_f16", "dsv4_hc_mix.comp", {{"A_TYPE", "float16_t"}, {"G_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("dsv4_hc_mix_f16_f16", "dsv4_hc_mix.comp", {{"A_TYPE", "float16_t"}, {"G_TYPE", "float"}, {"D_TYPE", "float16_t"}});
+    string_to_spv("dsv4_hc_mix_f16_g16_f16", "dsv4_hc_mix.comp", {{"A_TYPE", "float16_t"}, {"G_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});   // f16 gate logits from the d16 up-GEMM
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
     string_to_spv("mul_mat_vec_p021_f16_f32",              "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
@@ -1233,6 +1240,7 @@ void process_shaders() {
 
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "0"}});
     string_to_spv("multi_add_rms_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "1"}});
+    string_to_spv("multi_add_f16in_f32", "multi_add.comp", {{"A_TYPE", "float16_t"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "0"}});   // f16 sources, f32 sum (MoE combine)
 
     string_to_spv("ssm_scan_f32",          "ssm_scan.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});

@@ -4470,6 +4470,7 @@ struct test_dsv4_hc_mix : public test_dsv4_hc {
     const int64_t n_tokens;
     const ggml_type type_x;
     const ggml_type type_d;
+    const ggml_type type_g;   // gate logits: f32, or f16 (the up-GEMM wrote f16) with f16 xn and result
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4477,24 +4478,144 @@ struct test_dsv4_hc_mix : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, type_x, type_d);
+        return VARS_TO_STR5(n_embd, n_tokens, type_x, type_d, type_g);
     }
 
     double max_nmse_err() override {
         return type_d == GGML_TYPE_F16 ? 1e-4 : 1e-7;
     }
 
-    test_dsv4_hc_mix(int64_t n_embd = 31, int64_t n_tokens = 17, ggml_type type_x = GGML_TYPE_F32, ggml_type type_d = GGML_TYPE_F32)
-        : n_embd(n_embd), n_tokens(n_tokens), type_x(type_x), type_d(type_d) {}
+    test_dsv4_hc_mix(int64_t n_embd = 31, int64_t n_tokens = 17, ggml_type type_x = GGML_TYPE_F32, ggml_type type_d = GGML_TYPE_F32, ggml_type type_g = GGML_TYPE_F32)
+        : n_embd(n_embd), n_tokens(n_tokens), type_x(type_x), type_d(type_d), type_g(type_g) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * xn = ggml_new_tensor_3d(ctx, type_x, n_embd, hc, n_tokens);
         ggml_set_name(xn, "xn");
 
-        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, n_tokens);
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, type_g, n_embd*hc, n_tokens);
         ggml_set_name(gate, "gate");
 
         out = ggml_dsv4_hc_mix(ctx, xn, gate, 0.25f, type_d);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats);
+
+// MUL_MAT + CPY(f16): a matmul whose only consumer is a cast to f16 (Vulkan stores f16 straight from the
+// accumulator through the d16 coopmat pipelines; the reference computes f32 and rounds). GEMM shapes only.
+struct test_mul_mat_cpy16 : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int64_t m, n, k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_CPY16";
+    }
+    std::string vars() override {
+        return VARS_TO_STR5(type_a, type_b, m, n, k);
+    }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_cpy16(ggml_type type_a = GGML_TYPE_Q5_0, ggml_type type_b = GGML_TYPE_F32, int64_t m = 256, int64_t n = 128, int64_t k = 320)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, k, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * mm = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(mm, "mm");
+        ggml_tensor * out = ggml_cast(ctx, mm, GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// MUL_MAT_ID (+ MUL by the routing weights) + CPY(f16): the MoE gate/up (no mul) and weighted down
+// projections at prefill storing f16 (Vulkan MUL_MAT_ID_CPY16 / MUL_MAT_ID_MUL_CPY16 fusions)
+struct test_mul_mat_id_cpy16 : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const bool with_mul;
+    const int64_t m, n, k;   // n = tokens
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return with_mul ? "MUL_MAT_ID_MUL_CPY16" : "MUL_MAT_ID_CPY16";
+    }
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, with_mul, m, n, k);
+    }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+
+    test_mul_mat_id_cpy16(ggml_type type_a = GGML_TYPE_Q8_0, int n_mats = 8, int n_used = 4, bool with_mul = true,
+            int64_t m = 256, int64_t n = 64, int64_t k = 640)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), with_mul(with_mul), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "mmid");
+        if (with_mul) {
+            ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+            ggml_set_name(w, "w");
+            out = ggml_mul(ctx, out, w);
+            ggml_set_name(out, "weighted");
+        }
+        out = ggml_cast(ctx, out, GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// The MoE combine over f16 expert outputs: views of an f16 [n_embd, n_used, n_tokens] tensor summed in f32
+// (ggml_add_cast then adds); Vulkan fuses the chain into the f16-source MULTI_ADD kernel.
+struct test_multi_add_f16 : public test_case {
+    const int64_t n_embd;
+    const int n_used;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MULTI_ADD_F16";
+    }
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_used, n_tokens);
+    }
+    double max_nmse_err() override { return 1e-6; }
+    bool run_whole_graph() override { return true; }
+
+    test_multi_add_f16(int64_t n_embd = 2560, int n_used = 10, int64_t n_tokens = 64)
+        : n_embd(n_embd), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * e = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd, n_used, n_tokens);
+        ggml_set_name(e, "experts");
+        ggml_tensor * out = ggml_view_2d(ctx, e, n_embd, n_tokens, e->nb[2], 0);
+        for (int i = 1; i < n_used; ++i) {
+            ggml_tensor * v = ggml_view_2d(ctx, e, n_embd, n_tokens, e->nb[2], i*e->nb[1]);
+            out = (i == 1) ? ggml_add_cast(ctx, out, v, GGML_TYPE_F32) : ggml_add(ctx, out, v);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -9829,6 +9950,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_mix(31, 17, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 21, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 21, GGML_TYPE_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_hc_mix(31, 17, GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_hc_mix(2560, 21, GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16));
+    // f16-output matmuls (MUL_MAT(+MUL)+CPY(f16) fusions) at GEMM shapes, and the f16 MoE combine
+    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_mul_mat_cpy16(t, GGML_TYPE_F32, 256, 128, 320));
+        test_cases.emplace_back(new test_mul_mat_cpy16(t, GGML_TYPE_F32, 200, 130, 2560));
+        test_cases.emplace_back(new test_mul_mat_cpy16(t, GGML_TYPE_F16, 256, 128, 640));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  256, 64, 640));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, false, 256, 64, 640));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(t, 8, 4, true,  200, 70, 2560));
+    }
+    test_cases.emplace_back(new test_multi_add_f16(2560, 10, 64));
+    test_cases.emplace_back(new test_multi_add_f16(31, 3, 5));
+    test_cases.emplace_back(new test_multi_add_f16(64, 2, 8));
     test_cases.emplace_back(new test_rms_norm_mul_cpy({ 2560, 4, 21, 1 }, 1e-6f, true));
     test_cases.emplace_back(new test_ssm_conv_direct(64, 7, 1, 4));
     test_cases.emplace_back(new test_rms_norm_mul_mul({128, 48, 9, 1}));
@@ -12119,6 +12254,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 2048, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 2048, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_rms_norm_mul_cpy({2560, 4, 2048, 1}, 1e-6f, true));
+    test_cases.emplace_back(new test_dsv4_hc_mix(2560, 2048, GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q5_0, GGML_TYPE_F32, 10240, 2048, 320));
+    test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q8_0, 128, 10, true, 2560, 2048, 640));
+    test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q4_K, 128, 10, false, 640, 2048, 2560));
+    test_cases.emplace_back(new test_multi_add_f16(2560, 10, 2048));
 
     // SHAPE SWEEP (local, GGML_VK_DENSE_F16B predicate). REAL shapes taken from a perf-logger
     // census of each model, with the quant type each actually uses, plus a few synthetic points.
