@@ -16605,6 +16605,8 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ctx->prealloc_x_need_sync = true;
 }
 
+static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise);
+
 static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
     const ggml_tensor * add      = cgraph->nodes[node_idx + ctx->num_additional_fused_ops - 1];
@@ -16644,15 +16646,38 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
     }
 
     // read the untransposed block scores when the graph's cont(permute(score)) exposes them:
-    // consecutive blocks are then consecutive floats, so the gather coalesces
+    // consecutive blocks are then consecutive floats, so the gather coalesces.
+    //
+    // That source is NOT an input of this node: its allocator lifetime ended at the cont, which
+    // ran before this node, so ggml-alloc may already have placed any node between the cont and
+    // this one (or the fused output itself) on its memory. Reading it then returns overwritten
+    // scores: wrong top-k cells, no crash. Flash-Next keep-320 wiki c8192 PPL 3.36/3.03 vs 2.45/2.19
+    // on the CPU backend (2026-09-14, section 52). Read it only when nothing in that window overlaps.
     const ggml_tensor * a = scores;
     uint32_t a_st_t = 1, a_st_b = n_tps, a_st_s = n_tps * n_blocks;
     if (scores->op == GGML_OP_CONT && scores->src[0]->op == GGML_OP_PERMUTE) {
         const ggml_tensor * src = scores->src[0]->src[0];
         if (src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) &&
-            src->ne[0] == n_blocks && src->ne[1] == n_tps && src->ne[2] == n_stream && src->ne[3] == 1) {
-            a = src;
-            a_st_t = n_blocks; a_st_b = 1; a_st_s = n_blocks * n_tps;
+            src->ne[0] == n_blocks && src->ne[1] == n_tps && src->ne[2] == n_stream && src->ne[3] == 1 &&
+            src->buffer != nullptr) {
+            int cont_idx = -1;
+            for (int j = node_idx - 1; j >= 0; --j) {
+                if (cgraph->nodes[j] == scores) { cont_idx = j; break; }
+            }
+            bool src_live = cont_idx >= 0 && top_k->buffer == src->buffer && !ggml_vk_tensors_overlap(top_k, src, false);
+            if (cont_idx >= 0 && top_k->buffer != src->buffer) {
+                src_live = true;   // different buffers cannot alias
+            }
+            for (int j = cont_idx + 1; src_live && j < node_idx; ++j) {
+                const ggml_tensor * t = cgraph->nodes[j];
+                if (t->buffer != nullptr && t->buffer == src->buffer && ggml_vk_tensors_overlap(t, src, false)) {
+                    src_live = false;
+                }
+            }
+            if (src_live) {
+                a = src;
+                a_st_t = n_blocks; a_st_b = 1; a_st_s = n_blocks * n_tps;
+            }
         }
     }
 
