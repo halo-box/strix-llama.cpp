@@ -103,12 +103,18 @@ void main() {
     // kv_c_max: the FA derives m_row_len from KV, which is now that same runtime value, and a
     // mismatch would step the mask by the wrong amount for every token past the first. The
     // buffer is allocated for kv_c_max, so a smaller stride simply leaves a tail unused.
+    // One lane per token, looped: the workgroup is LANES wide and n_batch may exceed it (the
+    // qwen4exp prefill tile is 128 queries). A single pass left rows >= 64 of the compact mask
+    // unwritten - stale scratch, not -inf - and the queries in them attended to unselected and
+    // FUTURE rows: keep-320 PPL 2.03/1.89 against the 2.42/2.17 reference (2026-09-14).
     const float NEG_INF = uintBitsToFloat(0xff800000);
-    if (p.write_mask == 1 && head == 0 && tid < p.n_batch) {
-        float mv = NEG_INF;
-        if (src < p.n_kv) {
-            mv = float(data_m[tid * p.nbm1 + src]);
+    if (p.write_mask == 1 && head == 0) {
+        for (uint t = tid; t < p.n_batch; t += LANES) {
+            float mv = NEG_INF;
+            if (src < p.n_kv) {
+                mv = float(data_m[t * p.nbm1 + src]);
+            }
+            data_mc[t * kv_c + row] = float16_t(mv);
         }
-        data_mc[tid * kv_c + row] = float16_t(mv);
     }
 }

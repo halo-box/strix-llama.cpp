@@ -13115,7 +13115,12 @@ union_unavailable:;
 // with a per-row membership mask, and run the dense FA on the compact set. This is the decode
 // gather-compact machinery (union bitmap -> list, gather, FA with dynamic KV) driven from a
 // tile loop, with the union gather taught the KV-head dimension and a separate V.
-// GGML_VK_FA_PREFILL_UNION=0 disables; GGML_VK_FA_PREFILL_TILE sets the tile (default 64).
+// GGML_VK_FA_PREFILL_UNION=0 disables; GGML_VK_FA_PREFILL_TILE sets the tile (16..256, default 128).
+// 2026-09-14 sweep on keep-128 Flash-Next, pp2048 vs tile 64: 16 -8%/-10% (d16k/d32k), 32 -7%/-4%
+// (fewer FA workgroups per tile), 128 +2%/0% over two interleaved launch pairs, 256 mixed (the
+// TILE x kv_c mask slot and its gather grow with the tile). Sizes above 64 need the looped mask write
+// in flash_attn_gather_union.comp (a single 64-lane pass left rows >= 64 stale: future-token leak,
+// PPL 2.03 against a 2.42 reference); PPL is at the reference for every size with that fix.
 static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask,
         const ggml_tensor * sinks, ggml_tensor * dst) {
@@ -13157,7 +13162,7 @@ static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_c
     }
 
     static const char * tile_env = getenv("GGML_VK_FA_PREFILL_TILE");
-    const uint32_t TILE = tile_env ? std::max(16u, std::min(64u, (uint32_t) atoi(tile_env))) : 64u;
+    const uint32_t TILE = tile_env ? std::max(16u, std::min(256u, (uint32_t) atoi(tile_env))) : 128u;
     const uint32_t N       = (uint32_t) q->ne[1];
     const uint32_t n_tiles = (N + TILE - 1) / TILE;
 
@@ -13197,6 +13202,63 @@ static bool ggml_vk_flash_attn_prefill_union(ggml_backend_vk_context * ctx, vk_c
     const vk_subbuffer mask_buf = ggml_vk_tensor_subbuffer(ctx, mask);
     const vk_subbuffer k_buf    = ggml_vk_tensor_subbuffer(ctx, k);
     const vk_subbuffer v_buf    = ggml_vk_tensor_subbuffer(ctx, v);
+
+    // GGML_VK_FA_PREFILL_STATS=1: how sparse is the prefill really? Host readback of the top-k lists
+    // (diagnostic only, costs a sync) and the union size of consecutive-query groups of 16/32/64/128
+    // against n_kv, so the per-tile FA work can be compared with dense and with a true per-row
+    // sparse kernel (n_top_k rows per query) before any of that is built.
+    static const char * stats_env = getenv("GGML_VK_FA_PREFILL_STATS");
+    if (stats_env && stats_env[0] == '1') {
+        // ggml_vk_buffer_read does not flush the command buffer being recorded, so this can see the
+        // previous writer of the top-k memory (an earlier layer or ubatch: fine for a census) or, on
+        // the first calls, unwritten memory. A real top-k row is n_top_k distinct in-range indices
+        // (or -1 padding); reject the call if any row is not, rather than count garbage as density.
+        const size_t stride_i = top_k->nb[1] / sizeof(int32_t);
+        std::vector<int32_t> idx((size_t) N * stride_i);
+        vk_buffer top_dev = top_buf.buffer;
+        ggml_vk_buffer_read(top_dev, top_buf.offset, idx.data(), idx.size() * sizeof(int32_t));
+        const int32_t range = (int32_t) (n_kv - n_kv_raw);
+        bool sane = true;
+        {
+            std::vector<uint8_t> seen((size_t) range);
+            for (uint32_t t = 0; t < N && sane; ++t) {
+                std::fill(seen.begin(), seen.end(), 0);
+                for (uint32_t j = 0; j < n_top_k; ++j) {
+                    const int32_t v = idx[(size_t) t * stride_i + j];
+                    if (v == -1) continue;
+                    if (v < 0 || v >= range || seen[v]) { sane = false; break; }
+                    seen[v] = 1;
+                }
+            }
+        }
+        fprintf(stderr, "[fa-prefill-stats] n_kv=%u n_kv_raw=%d N=%u n_top_k=%u:", n_kv, n_kv_raw, N, n_top_k);
+        if (!sane) {
+            fprintf(stderr, "  skipped (top-k memory not a valid selection yet)\n");
+        }
+        for (uint32_t g = 16; sane && g <= 128; g *= 2) {
+            uint64_t uni_total = 0, valid_total = 0;
+            std::vector<uint8_t> seen((size_t) range);
+            for (uint32_t t0 = 0; t0 < N; t0 += g) {
+                std::fill(seen.begin(), seen.end(), 0);
+                uint64_t uni = 0;
+                for (uint32_t t = t0; t < std::min(N, t0 + g); ++t) {
+                    for (uint32_t j = 0; j < n_top_k; ++j) {
+                        const int32_t v = idx[(size_t) t * stride_i + j];
+                        if (v >= 0 && v < range) { ++valid_total; if (!seen[v]) { seen[v] = 1; ++uni; } }
+                    }
+                }
+                uni_total += uni;
+            }
+            // mean union rows per group, as a fraction of the sparse range and of the whole cache
+            const double per_group = (double) uni_total / (double) ((N + g - 1) / g);
+            fprintf(stderr, "  g%u: union %.0f rows = %.1f%% of range, %.1f%% of n_kv (valid/q %.0f)",
+                    g, per_group, 100.0 * per_group / std::max(1, range), 100.0 * (per_group + n_kv_raw) / n_kv,
+                    (double) valid_total / N);
+        }
+        if (sane) {
+            fprintf(stderr, "\n");
+        }
+    }
 
     ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_union_f16, n_tiles);
     ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_gather_union_f16, 2 * n_tiles);
