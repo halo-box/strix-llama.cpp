@@ -61,6 +61,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/hyperconn.cuh"
+#include "ggml-cuda/norm-gated.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -3781,6 +3782,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+
     // RDNA3.5 decode: consecutive single-column MUL_MATs that read the same activation vector (plain Q8_0/F32
     // matvecs, or a [mul_mat, mul_mat, glu] gate/up pair) are launched as one grouped kernel. The segments are
     // mutually independent, so the launch position of the first one is valid for all of them.
@@ -4902,6 +4904,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    if (node->op == GGML_OP_RMS_NORM && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        ggml_cuda_norm_gated_match match;
+        int skip = ggml_cuda_norm_gated_match_at(cgraph, i, match);
+        if (skip == 0) skip = ggml_cuda_norm_rows_match_at(cgraph, i, match);
+        if (skip > 0) {
+            if (match.staged) {
+                for (int j = i; j <= i + skip; ++j) {
+                    if (ggml_cuda_is_view_or_noop(cgraph->nodes[j])) continue;
+                    if (!ggml_cuda_compute_forward(*cuda_ctx, cgraph->nodes[j])) {
+                        GGML_ABORT("norm-gated: staged dispatch failed");
+                    }
+                }
+            } else {
+                if (match.pre >= 0 && !ggml_cuda_compute_forward(*cuda_ctx, cgraph->nodes[match.pre])) {
+                    GGML_ABORT("norm-gated: gate MUL_MAT dispatch failed");
+                }
+                ggml_cuda_op_norm_gated(*cuda_ctx, match);
+            }
+            return skip;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
@@ -5517,6 +5541,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
+        if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                if (cgraph->nodes[i]->op != GGML_OP_RMS_NORM) continue;
+                ggml_cuda_norm_gated_match match;
+                if (ggml_cuda_norm_gated_match_at(cgraph, i, match) > 0 && match.pre >= 0) {
+                    for (const auto * input : {match.x, match.w, match.z}) {
+                        auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
+                        params->add_alloc_dep(params->user_data, root, match.dst);
+                    }
+                }
+            }
+        }
+
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                 continue;

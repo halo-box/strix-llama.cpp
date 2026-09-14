@@ -3674,6 +3674,42 @@ struct test_rms_norm : public test_case {
     }
 };
 
+struct test_rms_norm_narrow : public test_case {
+    const int cols, rows;
+    const bool gated, view, escape;
+    const float eps;
+    const int alias;
+    const bool projection;
+    const std::array<int, 2> batches;
+    test_rms_norm_narrow(int cols, int rows, bool gated, bool view = false, bool escape = false,
+                        float eps = 1e-6f, int alias = 0, bool projection = false, std::array<int, 2> batches = {1, 1})
+        : cols(cols), rows(rows), gated(gated), view(view), escape(escape), eps(eps), alias(alias), projection(projection), batches(batches) {}
+    std::string op_desc(ggml_tensor *) override { return "RMS_NORM_NARROW"; }
+    std::string vars() override { return VARS_TO_STR9(cols, rows, gated, view, escape, eps, alias, projection, batches); }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * backing = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, view || alias == 3 ? 2*cols : cols, rows+(alias != 0), batches[0], batches[1]);
+        auto * x = backing;
+        if (view || alias) { x = ggml_view_4d(ctx, backing, cols, rows, batches[0], batches[1], backing->nb[1], backing->nb[2], backing->nb[3], view ? sizeof(float) : 0); }
+        auto * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cols);
+        auto * gate_backing = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, cols, rows+(alias >= 4), batches[0], batches[1]);
+        auto * z = alias >= 4 ? ggml_view_4d(ctx, gate_backing, cols, rows, batches[0], batches[1], gate_backing->nb[1], gate_backing->nb[2], gate_backing->nb[3], 0) : gate_backing;
+        auto * norm = ggml_rms_norm(ctx, x, eps);
+        auto * out = ggml_mul(ctx, norm, w);
+        if (projection) {
+            z = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols, cols), z);
+            ggml_prec_set_acc(z, GGML_PREC_F32);
+        }
+        if (gated) { out = ggml_mul(ctx, out, ggml_sigmoid(ctx, z)); }
+        if (escape) { out = ggml_add(ctx, out, norm); }
+        if (alias) {
+            out->view_src = alias >= 4 ? gate_backing : backing;
+            out->view_offs = alias == 2 || alias == 5 ? sizeof(float) : 0;
+        }
+        return out;
+    }
+};
+
 // GGML_OP_RMS_NORM_BACK
 struct test_rms_norm_back : public test_case {
     const ggml_type type;
@@ -9529,6 +9565,38 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int cols : {31, 32, 64, 128, 256, 288}) {
+        for (int rows : {4095, 4096, 4097}) {
+            for (bool gated : {false, true}) {
+                test_cases.emplace_back(new test_rms_norm_narrow(cols, rows, gated));
+            }
+        }
+    }
+    for (bool gated : {false, true}) {
+        for (bool view : {false, true}) {
+            test_cases.emplace_back(new test_rms_norm_narrow(128, 48, gated, view, false, 1e-6f, 0, false, std::array<int, 2>{128, 3}));
+            test_cases.emplace_back(new test_rms_norm_narrow(256, 24, gated, view, false, 1e-6f, 0, false, std::array<int, 2>{256, 2}));
+            test_cases.emplace_back(new test_rms_norm_narrow(256, 2, gated, view, false, 1e-6f, 0, false, std::array<int, 2>{2048, 1}));
+            test_cases.emplace_back(new test_rms_norm_narrow(128, 4, gated, view, false, 1e-6f, 0, false, std::array<int, 2>{2048, 1}));
+        }
+    }
+    for (bool gated : {false, true}) {
+        for (int alias : {1, 2, 3}) {
+            test_cases.emplace_back(new test_rms_norm_narrow(128, 4096, gated, false, false, 1e-6f, alias));
+        }
+    }
+    for (int alias : {4, 5}) {
+        test_cases.emplace_back(new test_rms_norm_narrow(128, 4096, true, false, false, 1e-6f, alias));
+    }
+    for (bool view : {false, true}) {
+        test_cases.emplace_back(new test_rms_norm_narrow(128, 4096, true, view, false, 1e-6f, 0, true));
+    }
+    for (bool gated : {false, true}) {
+        test_cases.emplace_back(new test_rms_norm_narrow(128, 8192, gated, true));
+        test_cases.emplace_back(new test_rms_norm_narrow(256, 8192, gated, false, true));
+        test_cases.emplace_back(new test_rms_norm_narrow(256, 8192, gated, false, false, 0.0f));
+    }
+
     std::default_random_engine rng(0);
 
     // unary ops
@@ -11835,6 +11903,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (int width : {90, 128}) {
