@@ -554,3 +554,43 @@ void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     k_get_rows_back_float<<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne10, ne1);
 }
+
+// QSA indexer key pooling: mean of the 4 member rows of every block, 128-wide rows, one thread per column.
+// Fuses get_rows -> reshape -> 4 x (view, cont, add) -> scale on the same summation order as the graph.
+template<typename T>
+static __global__ void get_rows_mean4_128(
+        const char * src, const char * ids, float * dst,
+        size_t src_row_stride, size_t src_stream_stride, size_t ids_stream_stride,
+        float scale, float bias) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t group = blockIdx.x;
+    const int64_t stream = blockIdx.y;
+    const int col = threadIdx.x;
+    const int32_t * selected = (const int32_t *) (ids + stream*ids_stream_stride) + 4*group;
+    const char * input = src + stream*src_stream_stride;
+    float sum = (float) ((const T *) (input + selected[0]*src_row_stride))[col];
+#pragma unroll
+    for (int i = 1; i < 4; ++i) {
+        sum += (float) ((const T *) (input + selected[i]*src_row_stride))[col];
+    }
+    dst[(stream*gridDim.x + group)*128 + col] = scale*sum + bias;
+}
+
+void ggml_cuda_op_get_rows_mean4(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * ids, ggml_tensor * dst) {
+    const dim3 grid(dst->ne[1], dst->ne[2], 1);
+    const ggml_cuda_kernel_launch_params params(grid, dim3(128, 1, 1), 0, ctx.stream());
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const float bias = ggml_get_op_params_f32(dst, 1);
+    if (src->type == GGML_TYPE_F16) {
+        ggml_cuda_kernel_launch(get_rows_mean4_128<half>, params,
+                (const char *) src->data, (const char *) ids->data, (float *) dst->data,
+                src->nb[1], src->nb[2], ids->nb[1], scale, bias);
+    } else {
+        GGML_ASSERT(src->type == GGML_TYPE_F32);
+        ggml_cuda_kernel_launch(get_rows_mean4_128<float>, params,
+                (const char *) src->data, (const char *) ids->data, (float *) dst->data,
+                src->nb[1], src->nb[2], ids->nb[1], scale, bias);
+    }
+}

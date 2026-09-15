@@ -3895,6 +3895,50 @@ struct test_hc_chain : public test_case {
 };
 
 
+// QSA indexer key pooling as the qwen4exp builder emits it: get_rows of 4 member rows per block, reshape to
+// [128, 4, n_blocks, n_stream], the four stream slices summed in order, scaled by 1/4. One fused kernel on HIP.
+struct test_get_rows_mean4 : public test_case {
+    const ggml_type type;
+    const int n_rows, n_blocks, n_stream;
+
+    test_get_rows_mean4(ggml_type type, int n_rows, int n_blocks, int n_stream)
+        : type(type), n_rows(n_rows), n_blocks(n_blocks), n_stream(n_stream) {}
+    std::string op_desc(ggml_tensor *) override { return "GET_ROWS_MEAN4"; }
+    std::string vars() override { return VARS_TO_STR4(type, n_rows, n_blocks, n_stream); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t dim = 128, r = 4;
+        auto * keys = ggml_new_tensor_3d(ctx, type, dim, n_rows, n_stream);
+        auto * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r * n_blocks, n_stream);
+        auto * members = ggml_get_rows(ctx, keys, rows);
+        members = ggml_reshape_4d(ctx, members, dim, r, n_blocks, n_stream);
+        ggml_tensor * pooled = nullptr;
+        for (int64_t i = 0; i < r; ++i) {
+            auto * slice = ggml_cont(ctx, ggml_view_3d(ctx, members, dim, n_blocks, n_stream,
+                    members->nb[2], members->nb[3], i * members->nb[1]));
+            pooled = pooled ? ggml_add(ctx, pooled, slice) : slice;
+        }
+        return ggml_scale(ctx, pooled, 1.0f / (float) r);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) continue;
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) data[i] = rand() % n_rows;
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else if (t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+
 struct test_indexer_head_sum : public test_case {
     const int blocks, heads, tokens, streams;
     const bool view, escape;
@@ -9972,6 +10016,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int tokens : {128, 512, 1024}) {
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_hc_chain(tokens, type));
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        for (int n_stream : {1, 2}) {
+            for (int n_blocks : {1, 7, 512, 2048}) {
+                test_cases.emplace_back(new test_get_rows_mean4(type, 4 * n_blocks + 5, n_blocks, n_stream));
+            }
         }
     }
     for (ggml_type type : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
