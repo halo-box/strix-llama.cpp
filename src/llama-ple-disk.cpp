@@ -10,6 +10,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -37,14 +38,20 @@ struct llama_ple_disk::impl {
     std::vector<uint8_t> slab;
 
     // per-gather scratch, reused
-    std::vector<int32_t>                       uniq;
-    std::vector<uint8_t>                       raw;      // [uniq.size(), rs]
-    std::vector<std::pair<int32_t, uint32_t>>  misses;   // (row, index into uniq)
-    uint8_t *                                  bounce0 = nullptr; // main-thread bounce buffer
+    std::vector<std::pair<int32_t, uint32_t>>  order;    // (row, position in idx) sorted by row: equal rows are adjacent
+    std::vector<uint32_t>                      runs;     // order[runs[u]..runs[u+1]) are the positions of distinct row u
+    std::vector<uint8_t>                       raw;      // [distinct rows, rs]
+    std::vector<std::pair<int32_t, uint32_t>>  misses;   // (row, index into raw)
+    float *                                    dst     = nullptr; // destination of the gather in progress
+    uint8_t *                                  bounce0 = nullptr; // calling-thread bounce buffer
 
     std::mutex mtx; // one gather at a time; a model is shared by every context built on it
 
-    // reader pool, started on first use
+    // worker pool, started on first use; a job is n_items items handed out `grain` at a time
+    enum class job_kind { read, dequant };
+    job_kind                 job       = job_kind::read;
+    size_t                   n_items   = 0;
+    size_t                   grain     = 1;
     int32_t                  n_threads = 1;
     std::vector<std::thread> workers;
     std::mutex               pm;
@@ -187,6 +194,37 @@ struct llama_ple_disk::impl {
         memcpy(dst, bounce + (off - a0), rs);
     }
 
+    // dequantize distinct row u into the first position that asked for it, then copy it to the others
+    void dequant_row(size_t u) const {
+        const uint8_t * src   = raw.data() + u * rs;
+        float *         first = dst + (size_t) order[runs[u]].second * ne0;
+        if (to_float) {
+            to_float(src, first, ne0);
+        } else {
+            memcpy(first, src, rs);
+        }
+        for (uint32_t j = runs[u] + 1; j < runs[u + 1]; ++j) {
+            memcpy(dst + (size_t) order[j].second * ne0, first, (size_t) ne0 * sizeof(float));
+        }
+    }
+
+    void run_items(uint8_t * bounce) {
+        for (;;) {
+            const size_t i0 = next.fetch_add(grain);
+            if (i0 >= n_items) {
+                break;
+            }
+            const size_t i1 = std::min(i0 + grain, n_items);
+            for (size_t i = i0; i < i1; ++i) {
+                if (job == job_kind::read) {
+                    read_row(misses[i].first, raw.data() + (size_t) misses[i].second * rs, bounce);
+                } else {
+                    dequant_row(i);
+                }
+            }
+        }
+    }
+
     void worker() {
         uint8_t * bounce = direct ? alloc_bounce() : nullptr;
         uint64_t  seen   = 0;
@@ -199,13 +237,7 @@ struct llama_ple_disk::impl {
                 }
                 seen = gen;
             }
-            for (;;) {
-                const size_t i = next.fetch_add(1);
-                if (i >= misses.size()) {
-                    break;
-                }
-                read_row(misses[i].first, raw.data() + (size_t) misses[i].second * rs, bounce);
-            }
+            run_items(bounce);
             {
                 std::lock_guard<std::mutex> lk(pm);
                 if (--pending == 0) {
@@ -216,14 +248,18 @@ struct llama_ple_disk::impl {
         free(bounce);
     }
 
-    void run_misses() {
-        if (n_threads <= 1 || misses.size() <= 2) {
-            if (direct && bounce0 == nullptr) {
-                bounce0 = alloc_bounce();
-            }
-            for (const auto & m : misses) {
-                read_row(m.first, raw.data() + (size_t) m.second * rs, bounce0);
-            }
+    // run `kind` over n items; up to serial_max of them stay on the calling thread,
+    // which otherwise works alongside the pool instead of waiting for it
+    void run_job(job_kind kind, size_t n, size_t g, size_t serial_max) {
+        job     = kind;
+        n_items = n;
+        grain   = g;
+        if (direct && bounce0 == nullptr) {
+            bounce0 = alloc_bounce();
+        }
+        if (n_threads <= 1 || n <= serial_max) {
+            next = 0;
+            run_items(bounce0);
             return;
         }
         if (workers.empty()) {
@@ -239,37 +275,51 @@ struct llama_ple_disk::impl {
             ++gen;
         }
         cv_work.notify_all();
+        run_items(bounce0);
         std::unique_lock<std::mutex> lk(pm);
         cv_done.wait(lk, [&] { return pending == 0; });
     }
 
-    void gather(const int32_t * idx, size_t n, float * dst) {
+    void gather(const int32_t * idx, size_t n, float * out) {
         std::lock_guard<std::mutex> lk(mtx);
         const auto t0 = std::chrono::steady_clock::now();
+        GGML_ASSERT(n < UINT32_MAX);
 
-        uniq.assign(idx, idx + n);
-        std::sort(uniq.begin(), uniq.end());
-        uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
-        if (!uniq.empty() && (uniq.front() < 0 || (int64_t) uniq.back() >= nrows)) {
-            GGML_ABORT("llama_ple_disk: row index out of range (%d..%d of %lld rows)",
-                       uniq.front(), uniq.back(), (long long) nrows);
+        // sort the positions by row so equal rows are adjacent: each distinct row is read and dequantized once
+        order.resize(n);
+        for (size_t k = 0; k < n; ++k) {
+            order[k] = { idx[k], (uint32_t) k };
         }
+        std::sort(order.begin(), order.end());
+        if (n && (order.front().first < 0 || (int64_t) order.back().first >= nrows)) {
+            GGML_ABORT("llama_ple_disk: row index out of range (%d..%d of %lld rows)",
+                       order.front().first, order.back().first, (long long) nrows);
+        }
+        runs.clear();
+        for (size_t k = 0; k < n; ++k) {
+            if (k == 0 || order[k].first != order[k - 1].first) {
+                runs.push_back((uint32_t) k);
+            }
+        }
+        const size_t n_uniq = runs.size();
+        runs.push_back((uint32_t) n);
 
-        raw.resize(uniq.size() * rs);
+        raw.resize(n_uniq * rs);
         misses.clear();
-        for (size_t i = 0; i < uniq.size(); ++i) {
+        for (size_t u = 0; u < n_uniq; ++u) {
+            const int32_t row = order[runs[u]].first;
             if (n_slots) {
-                const size_t slot = (size_t) uniq[i] & mask;
-                if (tags[slot] == uniq[i]) {
-                    memcpy(raw.data() + i * rs, slab.data() + slot * rs, rs);
+                const size_t slot = (size_t) row & mask;
+                if (tags[slot] == row) {
+                    memcpy(raw.data() + u * rs, slab.data() + slot * rs, rs);
                     continue;
                 }
             }
-            misses.emplace_back(uniq[i], (uint32_t) i);
+            misses.emplace_back(row, (uint32_t) u);
         }
 
         if (!misses.empty()) {
-            run_misses();
+            run_job(job_kind::read, misses.size(), 1, 2);
             if (n_slots) {
                 for (const auto & m : misses) {
                     const size_t slot = (size_t) m.first & mask;
@@ -279,21 +329,14 @@ struct llama_ple_disk::impl {
             }
         }
 
-        for (size_t k = 0; k < n; ++k) {
-            const size_t    i   = (size_t) (std::lower_bound(uniq.begin(), uniq.end(), idx[k]) - uniq.begin());
-            const uint8_t * src = raw.data() + i * rs;
-            float *         out = dst + k * (size_t) ne0;
-            if (to_float) {
-                to_float(src, out, ne0);
-            } else {
-                memcpy(out, src, rs);
-            }
-        }
+        dst = out;
+        run_job(job_kind::dequant, n_uniq, 64, 256);
+        dst = nullptr;
 
         st_calls += 1;
         st_rows  += n;
-        st_uniq  += uniq.size();
-        st_hits  += uniq.size() - misses.size();
+        st_uniq  += n_uniq;
+        st_hits  += n_uniq - misses.size();
         st_reads += misses.size();
         st_bytes += misses.size() * (direct ? block : rs);
         st_ms    += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
