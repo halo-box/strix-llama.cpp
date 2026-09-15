@@ -3707,6 +3707,66 @@ struct test_hc_combine_norm_lifetime : public test_case {
     }
 };
 
+// qwen4exp conv history: concat(history, x^T), one tail copy per rollback slot, then either the PLE dilated
+// tap chain (F16 weight columns, ADD chain, SiLU) or ssm_conv + SiLU. HIP fuses both for T >= 256 and must
+// still produce every tail copy; an extra reader of the whole concat has to disable the fusion.
+struct test_conv_state_chain : public test_case {
+    const bool ple;
+    const int C, T, n_slots;
+    const bool extra_reader;
+    const bool split_root; // x produced as [C/4, 4, T], as qwen4exp's grouped norm leaves it
+    ggml_tensor * out = nullptr;
+    std::vector<ggml_tensor *> verify;
+    test_conv_state_chain(bool ple, int C, int T, int n_slots, bool extra_reader = false, bool split_root = false)
+        : ple(ple), C(C), T(T), n_slots(n_slots), extra_reader(extra_reader), split_root(split_root) {}
+    std::string op_desc(ggml_tensor *) override { return "CONV_STATE_CHAIN"; }
+    std::string vars() override { return VARS_TO_STR6(ple, C, T, n_slots, extra_reader, split_root); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int K = 4, dil = ple ? 3 : 1, H = (K - 1) * dil;
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, C);
+        ggml_tensor * x     = split_root ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C / 4, 4, T) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) H * C, n_slots);
+        ggml_set_name(state, "history"); ggml_set_name(x, "x"); ggml_set_name(cache, "cache");
+        ggml_tensor * x2 = split_root ? ggml_reshape_2d(ctx, x, C, T) : x;
+        ggml_tensor * cc = ggml_concat(ctx, state, ggml_transpose(ctx, x2), 0);
+        verify.clear();
+        for (int slot = 0; slot < n_slots; ++slot) {
+            const int64_t s_idx = std::max<int64_t>(0, (int64_t) T - slot);
+            ggml_tensor * tail = ggml_view_2d(ctx, cc, H, C, cc->nb[1], s_idx * sizeof(float));
+            ggml_tensor * dst  = ggml_view_1d(ctx, cache, (int64_t) H * C, slot * cache->nb[1]);
+            ggml_tensor * cpy  = ggml_cpy(ctx, tail, dst);
+            if (gf) { ggml_build_forward_expand(gf, cpy); }
+            verify.push_back(cpy);
+        }
+        if (ple) {
+            ggml_tensor * W = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, K, C);
+            ggml_set_name(W, "conv_w");
+            ggml_tensor * acc = nullptr;
+            for (int k = 0; k < K; ++k) {
+                ggml_tensor * shifted = ggml_cont(ctx, ggml_transpose(ctx, ggml_view_2d(ctx, cc, T, C, cc->nb[1], (size_t) k * dil * sizeof(float))));
+                ggml_tensor * wk = ggml_cont(ctx, ggml_view_2d(ctx, W, 1, C, W->nb[1], k * W->nb[0]));
+                wk = ggml_cast(ctx, ggml_reshape_1d(ctx, wk, C), GGML_TYPE_F32);
+                ggml_tensor * term = ggml_mul(ctx, shifted, wk);
+                acc = acc ? ggml_add(ctx, acc, term) : term;
+            }
+            out = ggml_silu(ctx, acc);
+        } else {
+            ggml_tensor * W = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, C);
+            ggml_set_name(W, "conv_w");
+            out = ggml_silu(ctx, ggml_ssm_conv(ctx, ggml_reshape_3d(ctx, cc, T + H, C, 1), W));
+        }
+        verify.push_back(out);
+        if (extra_reader) {
+            ggml_tensor * whole = ggml_scale(ctx, cc, 2.0f);
+            if (gf) { ggml_build_forward_expand(gf, whole); }
+            verify.push_back(whole);
+        }
+        return out;
+    }
+};
+
 struct test_indexer_head_sum : public test_case {
     const int blocks, heads, tokens, streams;
     const bool view, escape;
@@ -9745,6 +9805,17 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (bool ple : {true, false}) {
+        for (int C : {256, 2560}) {
+            for (int T : {255, 256, 257, 300, 2048}) {
+                for (int n_slots : {1, 5}) test_cases.emplace_back(new test_conv_state_chain(ple, C, T, n_slots));
+            }
+        }
+        test_cases.emplace_back(new test_conv_state_chain(ple, 10240, 2048, 5));
+        test_cases.emplace_back(new test_conv_state_chain(ple, 10240, 383, 3));
+        for (int T : {256, 2048}) test_cases.emplace_back(new test_conv_state_chain(ple, 2560, T, 5, true));
+        for (int T : {256, 2048}) test_cases.emplace_back(new test_conv_state_chain(ple, 2560, T, 5, false, true));
+    }
     for(int embd : {1023,1024,2560,3072,3073}) {
         for(int hc : {1,4,5,16,17}) {
             for(int tokens : {1,4,64}) test_cases.emplace_back(new test_hc_combine_norm_lifetime(embd,hc,tokens));

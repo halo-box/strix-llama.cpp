@@ -63,6 +63,8 @@
 #include "ggml-cuda/hyperconn.cuh"
 #include "ggml-cuda/norm-gated.cuh"
 #include "ggml-cuda/idx-relu-sum.cuh"
+#include "ggml-cuda/ple-conv.cuh"
+#include "ggml-cuda/gdn-conv.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -3935,6 +3937,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // qwen4exp prefill convolutions: the concat writes only the columns its history copies read, and one kernel
+    // replaces the tap chain (PLE) or the ssm_conv + SiLU (Gated DeltaNet). Both decisions come from the same matcher.
+    if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_CONT) {
+        ggml_cuda_ple_conv_match pm;
+        if (node->op == GGML_OP_CONCAT && ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) {
+            ggml_cuda_ple_conv_write_tail(*cuda_ctx, pm);
+            return 1; // the concat and the no-op view after it
+        }
+        if (node->op == GGML_OP_CONT && ggml_cuda_ple_conv_match_at_tap(cgraph, i, pm)) {
+            ggml_cuda_ple_conv_direct(*cuda_ctx, pm);
+            return pm.silu_idx - i;
+        }
+    }
+    if (node->op == GGML_OP_CONCAT || node->op == GGML_OP_SSM_CONV) {
+        ggml_cuda_gdn_conv_match gm;
+        if (node->op == GGML_OP_CONCAT && ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
+            ggml_cuda_gdn_conv_write_tail(*cuda_ctx, gm);
+            return 1; // the concat and the no-op view after it
+        }
+        if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
+            ggml_cuda_gdn_conv_direct(*cuda_ctx, gm);
+            return 1;
+        }
+    }
     if (node->op == GGML_OP_UNARY && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         ggml_cuda_idx_relu_sum_args args;
         const int count = ggml_cuda_match_idx_relu_sum(cgraph, i, args);
@@ -5643,6 +5670,28 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
                         params->add_alloc_dep(params->user_data, root, match.dst);
                     }
+                }
+            }
+        }
+
+        // the direct convolution kernels read the history and x while writing the SiLU output
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op != GGML_OP_CONCAT) {
+                continue;
+            }
+            ggml_cuda_ple_conv_match pm;
+            ggml_cuda_gdn_conv_match gm;
+            const ggml_tensor * inputs[2] = { nullptr, nullptr };
+            ggml_tensor * out = nullptr;
+            if (ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) {
+                inputs[0] = pm.x; inputs[1] = pm.state; out = pm.out;
+            } else if (ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
+                inputs[0] = gm.x; inputs[1] = gm.state; out = gm.out;
+            }
+            for (const ggml_tensor * input : inputs) {
+                if (input) {
+                    auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
+                    params->add_alloc_dep(params->user_data, root, out);
                 }
             }
         }
