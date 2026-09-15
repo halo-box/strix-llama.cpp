@@ -105,18 +105,49 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
                     auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param.name)) + ">\n");
 
-                    auto arg_value = schema_info.resolves_to_string(param_schema) ?
-                        arg_string :
-                        p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
-                    if (param_schema.contains("enum") && param_schema.at("enum").is_array() &&
-                        !param_schema.at("enum").empty() &&
-                        std::all_of(param_schema.at("enum").begin(), param_schema.at("enum").end(),
-                                    [](const json & value) { return value.is_string(); })) {
+                    auto types = param.schema->value_types();
+
+                    auto arg_value = p.eps();
+                    if (!types.has(common_chat_schema::TYPE_STRING)) {
+                        arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close;
+                    } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
+                        arg_value = arg_string;
+                    } else {
+                        // The string alternative accepts any text, so the grammar only keeps the raw string
+                        // rule. The parser still tries the JSON alternatives first to type the value.
+                        auto json_value = p.choice();
+                        if (types.has(common_chat_schema::TYPE_OBJECT)) {
+                            json_value |= p.json_object();
+                        }
+                        if (types.has(common_chat_schema::TYPE_ARRAY)) {
+                            json_value |= p.json_array();
+                        }
+                        if (types.has(common_chat_schema::TYPE_NUMBER) || types.has(common_chat_schema::TYPE_INTEGER)) {
+                            json_value |= p.json_number();
+                        }
+                        if (types.has(common_chat_schema::TYPE_BOOLEAN)) {
+                            json_value |= p.json_bool();
+                        }
+                        if (types.has(common_chat_schema::TYPE_NULL)) {
+                            json_value |= p.json_null();
+                        }
+                        arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_close) | arg_string, "xml-arg-string");
+                    }
+
+                    if (param.schema->kind() == common_chat_schema::KIND_ENUM) {
+                        const auto & enum_values = static_cast<const common_chat_schema_enum &>(*param.schema).values;
                         auto values = p.choice();
-                        for (const auto & value : param_schema.at("enum")) {
+                        bool all_strings = true;
+                        for (const auto & value : enum_values) {
+                            if (!value.is_string()) {
+                                all_strings = false;
+                                break;
+                            }
                             values |= p.literal(value.get<std::string>()) + p.peek(p.literal("\n</parameter>\n"));
                         }
-                        arg_value = p.tool_arg_string_value(values) + arg_close;
+                        if (all_strings) {
+                            arg_value = p.tool_arg_string_value(values) + arg_close;
+                        }
                     }
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));

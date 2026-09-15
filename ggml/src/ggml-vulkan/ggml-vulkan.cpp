@@ -1127,6 +1127,16 @@ struct vk_op_flash_attn_mask_opt_push_constants {
     uint32_t nbd3;
 };
 
+struct vk_op_flash_attn_sparse_compact_push_constants {
+    uint32_t KV;
+    uint32_t nem1;
+    uint32_t nem2;
+    uint32_t nbm1;
+    uint32_t nbm2;
+    uint32_t nbm3;
+    uint32_t n_kv_max;
+};
+
 // Allow pre-recording command buffers
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}

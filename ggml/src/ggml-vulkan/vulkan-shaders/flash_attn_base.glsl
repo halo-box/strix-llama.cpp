@@ -92,6 +92,8 @@ layout (binding = 7) readonly buffer KVB {uint32_t data_kv_dyn[];};
 
 layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 
+layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
+
 #define MASK_OPT_ALL_NEG_INF 1
 #define MASK_OPT_ALL_ZERO 2
 
