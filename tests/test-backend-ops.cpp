@@ -1242,6 +1242,7 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    virtual bool use_scheduler_allocation() { return false; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1273,6 +1274,10 @@ struct test_case {
         }
         ggml_tensor * sentinel = ::ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sentinel_size);
         ggml_format_name(sentinel, "sent_%zu", sentinels.size());
+        if (use_scheduler_allocation()) {
+            ggml_set_input(sentinel);
+            ggml_set_output(sentinel);
+        }
         sentinels.push_back(sentinel);
     }
 
@@ -1414,12 +1419,16 @@ struct test_case {
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
-        // allocate
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
-
-        if (buf == NULL) {
-            printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
-            return test_status_t::FAIL;
+        // allocate: through the scheduler when the fusion under test depends on graph_optimize (allocation
+        // dependencies, marks); the scheduler needs the finished graph, so that path allocates below
+        ggml_backend_buffer_ptr buf(nullptr);
+        ggml_backend_sched_ptr sched(nullptr);
+        if (!use_scheduler_allocation()) {
+            buf.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
+            if (buf == NULL) {
+                printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
+                return test_status_t::FAIL;
+            }
         }
 
         // build graph
@@ -1428,6 +1437,18 @@ struct test_case {
         // add sentinels as graph nodes so that they are checked in the callback
         for (ggml_tensor * sentinel : sentinels) {
             ggml_graph_add_node(gf, sentinel);
+        }
+
+        if (use_scheduler_allocation()) {
+            ggml_backend_t backends[] = {backend1, backend2};
+            sched.reset(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
+            for (ggml_tensor * tensor = ggml_get_first_tensor(ctx.get()); tensor; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), tensor, backend1);
+            }
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                printf("failed to allocate graph through the scheduler [%s] ", ggml_backend_name(backend1));
+                return test_status_t::FAIL;
+            }
         }
 
         // randomize tensors
@@ -5511,6 +5532,37 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// quantized-weight BF16 WMMA GEMM (mmb.cu): dense, routed, and the fused routed gate/up + SwiGLU
+struct test_mmb_quant_dense : test_mul_mat {
+    explicit test_mmb_quant_dense(ggml_type type, int tokens, int rows, int inner)
+        : test_mul_mat(type, GGML_TYPE_F32, rows, tokens, inner, {1, 1}, {1, 1}) {}
+    std::string op_desc(ggml_tensor *) override { return "MMB_QUANT"; }
+};
+
+struct test_mmb_quant_routed : test_mul_mat_id {
+    const bool fused;
+    test_mmb_quant_routed(ggml_type type, int tokens, bool broadcast, bool fused, int rows = 128)
+        : test_mul_mat_id(type, GGML_TYPE_F32, 8, 2, broadcast, rows, tokens, 256), fused(fused) {}
+    std::string op_desc(ggml_tensor *) override { return "MMB_QUANT"; }
+    std::string vars() override { return test_mul_mat_id::vars() + "," + VAR_TO_STR(fused); }
+    bool run_whole_graph() override { return fused; }
+    bool use_scheduler_allocation() override { return fused; }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
+            if (t->op==GGML_OP_NONE && t->type!=GGML_TYPE_I32) init_tensor_uniform(t);
+        }
+        init_mul_mat_id_ids(ctx,n_mats);
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * gate = test_mul_mat_id::build_graph(ctx);
+        if (!fused) return gate;
+        auto * uw = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(uw, "uw");
+        auto * up = ggml_mul_mat_id(ctx, uw, gate->src[1], gate->src[2]);
+        return ggml_glu_split(ctx, gate, up, GGML_GLU_OP_SWIGLU);
     }
 };
 
@@ -9805,6 +9857,18 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (ggml_type type : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        test_cases.emplace_back(new test_mmb_quant_dense(type, 512, 128, 256));
+        test_cases.emplace_back(new test_mmb_quant_dense(type, 513, 129, 512));
+        test_cases.emplace_back(new test_mmb_quant_routed(type, 512, false, false));
+        test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, false));
+        test_cases.emplace_back(new test_mmb_quant_routed(type, 512, false, true));
+        test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true));
+        if (type == GGML_TYPE_Q4_K) {
+            test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true, 65));
+            test_cases.emplace_back(new test_mmb_quant_routed(type, 1025, false, true, 129));
+        }
+    }
     for (bool ple : {true, false}) {
         for (int C : {256, 2560}) {
             for (int T : {255, 256, 257, 300, 2048}) {
