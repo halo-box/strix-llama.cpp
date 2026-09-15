@@ -6,6 +6,7 @@
 #include "llama-ple-disk.h"
 
 #include <algorithm>
+#include <thread>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
@@ -234,11 +235,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // on disk the tensor is counted as created but never allocated, mapped or read: each
         // ubatch preads exactly the rows it gathers (llm_graph_input_ple::set_input). A model
         // with no tensor to read from stays on the lazy path.
-        if (params.ple_on_disk && ple_w) {
+        // --lazy-mode on-direct is the same reader through the page cache (explicit preads instead of
+        // demand paging the mmap), with the --ngram-* settings if given
+        const bool ple_on_disk = params.ple_on_disk || params.lazy_mode == LLAMA_LAZY_MODE_DIRECT;
+
+        if (ple_on_disk && ple_w) {
             llama_ple_disk::params dp;
             dp.n_threads   = params.ple_io_threads;
             dp.cache_bytes = params.ple_cache_mb > 0 ? (size_t) params.ple_cache_mb << 20 : 0;
-            dp.direct_io   = params.ple_direct_io;
+            dp.direct_io   = params.ple_on_disk ? params.ple_direct_io : false;
 
             ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
                                                         ple_w->tensor->type, ple_w->tensor->ne[0], ple_rows, dp);
@@ -1733,6 +1738,54 @@ public:
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
 };
+
+// Prefetch hook, called once per llama_decode with the whole batch: the chunk-boundary stall is the PLE row gather
+// (hundreds of thousands of scattered ~90-byte reads with the GPU idle). The same row indices are computed here for
+// a contiguous single-sequence prefill and the page cache is warmed for them while the previous chunk is still on
+// the GPU. Advice only, so a wrong prediction (multiple sequences, an image batch) costs readahead and nothing else.
+void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * tokens, int32_t n_tokens) {
+    if (!tokens || n_tokens < 4096) {
+        return;
+    }
+    const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model_base);
+    if (!pmodel.ple_disk || !pmodel.ple_disk->page_cached()) {
+        return;
+    }
+    const auto & hp = pmodel.hparams;
+    const int64_t n_gram = hp.ple_ngram_size, n_heads = hp.ple_n_heads, per_gram = hp.ple_heads_per_ngram;
+    const int64_t eos = hp.ple_eos_token_id;
+    if (n_heads <= 0 || n_gram < 2) {
+        return;
+    }
+    std::vector<llama_token> toks(tokens, tokens + n_tokens);
+    std::thread([&pmodel, &hp, toks = std::move(toks), n_gram, n_heads, per_gram, eos]() {
+        const int64_t n = (int64_t) toks.size();
+        std::vector<int32_t> idx((size_t) n_heads * n);
+        std::vector<int64_t> ctx(n_gram);
+        for (int64_t i = 0; i < n; ++i) {
+            ctx[0] = toks[i];
+            bool cut = false;
+            for (int64_t s = 1; s < n_gram; ++s) {
+                const int64_t j = i - s;                          // contiguous single-sequence prefill
+                const llama_token t = (cut || j < 0) ? LLAMA_TOKEN_NULL : toks[j];
+                cut = cut || t < 0 || t == eos;
+                ctx[s] = cut ? eos : t;
+            }
+            for (int64_t g = 2; g <= n_gram; ++g) {
+                uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+                for (int64_t j = 1; j < g; ++j) {
+                    mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+                }
+                const int64_t base = (g - 2) * per_gram;
+                for (int64_t q = 0; q < per_gram; ++q) {
+                    const int64_t h_i = base + q;
+                    idx[(size_t) i * n_heads + h_i] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+                }
+            }
+        }
+        pmodel.ple_disk->prefetch(idx.data(), idx.size());
+    }).detach();
+}
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;

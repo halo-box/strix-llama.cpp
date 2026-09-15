@@ -1706,7 +1706,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // With the n-gram table left on disk, a populated mapping would pull the table's
     // third of the file resident for nothing; readahead alone carries the sequential load.
-    ml.init_mappings(!params.ple_on_disk, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(!(params.ple_on_disk || params.lazy_mode == LLAMA_LAZY_MODE_DIRECT), use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers

@@ -365,6 +365,31 @@ void llama_ple_disk::gather(const int32_t * idx, size_t n, float * dst) {
 #endif
 }
 
+void llama_ple_disk::prefetch(const int32_t * idx, size_t n) const {
+#if defined(_WIN32)
+    GGML_UNUSED(idx); GGML_UNUSED(n);
+#else
+    if (pimpl->direct || pimpl->fd < 0 || n == 0) {
+        return;
+    }
+    std::vector<int32_t> uniq;
+    uniq.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (idx[i] >= 0 && (int64_t) idx[i] < pimpl->nrows) {
+            uniq.push_back(idx[i]);
+        }
+    }
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    for (const int32_t row : uniq) {
+        const off_t off = (off_t) pimpl->offs + (off_t) row * (off_t) pimpl->rs;
+        posix_fadvise(pimpl->fd, off, (off_t) pimpl->rs, POSIX_FADV_WILLNEED);
+    }
+#endif
+}
+
+bool llama_ple_disk::page_cached() const { return !pimpl->direct; }
+
 int64_t llama_ple_disk::n_rows()   const { return pimpl->nrows; }
 int64_t llama_ple_disk::ne0()      const { return pimpl->ne0;   }
 size_t  llama_ple_disk::row_size() const { return pimpl->rs;    }
