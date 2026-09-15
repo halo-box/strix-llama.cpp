@@ -325,6 +325,103 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias) const {
+    if (!set_input_qsa_prefix(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias)) {
+        set_input_qsa_scan(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+    }
+}
+
+// On the tracked prefix (qsa_prefix), position k of the one sequence lives in cell qsa_prefix.cells[k] and
+// nothing else occupies the cache, so the arrays the scan derives per cell follow directly: complete blocks
+// are the first L/ratio position blocks, everything else maps to the spare block, and a block's bias is
+// -inf past the complete ones, the "always visible" value from the query's incomplete tail onwards, else 0.
+bool llama_memory_hybrid_idx::set_input_qsa_prefix(
+        ggml_tensor * cell_blk,
+        ggml_tensor * blk_cells,
+        ggml_tensor * blk_pos,
+        ggml_tensor * bias,
+        const llama_ubatch * ubatch,
+        uint32_t ratio,
+        bool blk_bias) const {
+    if (!blk_bias || ratio == 0 || cell_blk->ne[1] != 1 || !qsa_prefix_matches(*ubatch)) {
+        return false;
+    }
+    const int64_t n_kv     = cell_blk->ne[0];
+    const int64_t r        = ratio;
+    const int64_t n_blocks = blk_pos->ne[0]/4;
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t L        = (int64_t) qsa_prefix.cells.size();
+    if (blk_cells->ne[0] != r*n_blocks || blk_cells->ne[1] != 1 || bias->ne[0] != n_blocks || bias->ne[1] != n_tokens ||
+        bias->ne[2] != 1 || bias->type != GGML_TYPE_F32 || qsa_prefix.end != L || L > n_kv || n_blocks*r < n_kv) {
+        return false;
+    }
+    if (!get_mem_idx()) {
+        return false;
+    }
+    const auto & cells = get_mem_idx()->get_cells(ubatch->seq_id[0][0]);
+    if ((int64_t) cells.get_used() != L) {
+        return false;
+    }
+    for (int64_t k = 0; k < L; ++k) {
+        if (qsa_prefix.cells[k] < 0 || qsa_prefix.cells[k] >= n_kv) {
+            return false;
+        }
+    }
+
+    const int64_t n_bid     = L/r;
+    const bool    have_dead = n_bid < n_blocks;
+    const int32_t dead_bid  = (int32_t) (have_dead ? n_bid : n_blocks - 1);
+
+    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
+    int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
+    float   * dst_bias      = (float   *) bias->data;
+    // the incremental key-cache graph leaves the member and position arrays unallocated, as the scan expects
+    if (!dst_cell_blk || !dst_bias) {
+        return false;
+    }
+
+    std::fill(dst_cell_blk, dst_cell_blk + n_kv, dead_bid);
+    if (dst_blk_cells) {
+        std::fill(dst_blk_cells, dst_blk_cells + r*n_blocks, 0);
+    }
+    if (dst_blk_pos) {
+        std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks, 0);
+    }
+    for (int64_t k = 0; k < n_bid*r; ++k) {
+        const int32_t cell = qsa_prefix.cells[k];
+        if (dst_blk_cells) {
+            dst_blk_cells[k] = cell;
+        }
+        dst_cell_blk[cell] = (int32_t) (k/r);
+    }
+    if (dst_blk_pos) {
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            for (int64_t b = 0; b < n_bid; ++b) {
+                dst_blk_pos[sec*n_blocks + b] = (int32_t) (b*r);
+            }
+        }
+    }
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        const int64_t tail_start = ((int64_t) ubatch->pos[i] + 1)/r*r;
+        float * row = dst_bias + i*n_blocks;
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            row[b] = b >= n_bid ? -INFINITY : (b*r >= tail_start ? 1e9f : 0.0f);
+        }
+        if (have_dead) {
+            row[dead_bid] = 1e9f;
+        }
+    }
+    return true;
+}
+
+void llama_memory_hybrid_idx::set_input_qsa_scan(
+        ggml_tensor * cell_blk,
+        ggml_tensor * blk_cells,
+        ggml_tensor * blk_pos,
+        ggml_tensor * bias,
+        const llama_ubatch * ubatch,
+        uint32_t ratio,
+        bool blk_bias) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 

@@ -97,6 +97,13 @@ public:
     void qsa_commit(int il) const;
 
 private:
+    // closed-form metadata for an incremental ubatch on the tracked prefix; false when the scan is needed
+    bool set_input_qsa_prefix(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                              ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+    // the per-cell scan over the whole window
+    void set_input_qsa_scan(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                            ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+
     bool incremental_qsa = false;
     bool qsa_recover_pending = false;
     bool qsa_recover(llama_seq_id seq);
