@@ -370,9 +370,21 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // the draft head's own final mixer, and optional private embeddings / LM head; a shared sidecar has neither
         // of the latter and borrows the target's at graph time
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags);
-        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
-        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
+        // optional: a draft-only file converted before the nextn.hc_head_* names existed stores the draft's
+        // mixer under the trunk's output_hc_* names, and a full file from that converter dropped it
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags | TENSOR_NOT_REQUIRED);
+        if ((layer.nextn.hc_head_norm != nullptr) != (layer.nextn.hc_head_down != nullptr) ||
+            (layer.nextn.hc_head_norm != nullptr) != (layer.nextn.hc_head_up   != nullptr)) {
+            throw std::runtime_error(format("MTP block %d has an incomplete nextn.hc_head_* mixer", il));
+        }
+        if (layer.nextn.hc_head_norm == nullptr && hc_head_norm == nullptr) {
+            throw std::runtime_error(format("MTP block %d has no final mixer (neither nextn.hc_head_* nor output_hc_*)", il));
+        }
+        if (layer.nextn.hc_head_norm == nullptr && !mtp_only) {
+            LLAMA_LOG_WARN("%s: MTP block %d has no nextn.hc_head_* mixer, using the trunk's output_hc_* mixer for the draft (reconvert for the draft's own)\n", __func__, il);
+        }
 
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
@@ -384,7 +396,8 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
-    if (hc_head_norm == nullptr) {
+    // a draft-only file may still carry a mixer under output_hc_*, so test the trunk itself
+    if (hc_head_norm == nullptr || layers.empty() || layers[0].hc_attn_norm == nullptr) {
         throw std::runtime_error("this model is an MTP draft head without a trunk; "
                                  "load it as a draft of its target model (-md), not on its own");
     }
@@ -505,8 +518,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     }
 
     // the draft head's own final mixer (the trunk's is trained for the trunk's residual, not the draft's)
-    GGML_ASSERT(layer.nextn.hc_head_norm && layer.nextn.hc_head_down && layer.nextn.hc_head_up && "MTP block missing nextn.hc_head_*");
-    cur = build_hc_mix(inpL, layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up, nullptr, nullptr, -1);
+    // a draft-only file from the older converter holds the draft's mixer under output_hc_* instead
+    const bool own_mix = layer.nextn.hc_head_norm != nullptr;
+    GGML_ASSERT((own_mix || model.hc_head_norm) && "MTP block has no final mixer");
+    cur = build_hc_mix(inpL,
+                       own_mix ? layer.nextn.hc_head_norm : model.hc_head_norm,
+                       own_mix ? layer.nextn.hc_head_down : model.hc_head_down,
+                       own_mix ? layer.nextn.hc_head_up   : model.hc_head_up, nullptr, nullptr, -1);
     cb(cur, "mtp_hc_head", -1);
 
     // no res->t_embd: it is n_embd wide, but the context sizes that buffer by n_embd_out.

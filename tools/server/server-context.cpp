@@ -1108,6 +1108,14 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        // A zero draft length means no speculation. Without this the context is sized from
+        // common_speculative_n_max() == 0 while the draft path is still initialized, and the
+        // first decode trips GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max).
+        if (params_base.speculative.has_dft() && common_speculative_n_max(&params_base.speculative) <= 0) {
+            SRV_WRN("%s", "draft length is 0 - disabling speculative decoding\n");
+            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+        }
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
