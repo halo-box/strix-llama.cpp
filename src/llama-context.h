@@ -307,6 +307,9 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
+    // MTP draft vocabulary subset used by this context's graphs (nullptr = full vocabulary)
+    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft;
+
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 
