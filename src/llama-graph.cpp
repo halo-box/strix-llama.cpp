@@ -1521,6 +1521,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
+    mtp_draft        (params.mtp_draft),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),

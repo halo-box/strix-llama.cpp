@@ -613,6 +613,18 @@ struct llama_meta_device_get_split_state_userdata {
 };
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
+// MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep
+// plus control and user-defined tokens. Immutable once built. Contexts that request the same n_keep share one.
+struct llama_mtp_draft_vocab {
+    int32_t n_keep = 0;
+
+    ggml_tensor * head = nullptr; // [n_embd, n_rows], same type as the LM head
+    ggml_tensor * ids  = nullptr; // [n_rows] I64, token id of each row
+
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+};
+
 
 struct llama_prec_policy {
     // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op (unused for now)
@@ -659,12 +671,6 @@ struct llama_model {
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
-
-    // MTP draft vocabulary: row subset of `output` and the token id of each row (I64). Built by the first MTP context.
-    mutable struct ggml_tensor * mtp_draft_head = nullptr;
-    mutable struct ggml_tensor * mtp_draft_ids  = nullptr;
-    mutable ggml_context_ptr        mtp_draft_ctx;
-    mutable ggml_backend_buffer_ptr mtp_draft_buf;
 
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
@@ -778,6 +784,10 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    // draft vocabulary subset for mtp_draft_vocab = n_keep, built on first request and freed with the last context
+    // holding it; nullptr if the subset cannot be used with this model (thread-safe)
+    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep) const;
+
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
