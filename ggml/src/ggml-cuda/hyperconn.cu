@@ -1,4 +1,5 @@
 #include "hyperconn.cuh"
+#include "mmb.cuh"
 #include "ggml-backend-impl.h"
 
 // Explicitly rounded mul/add: keeps the fused kernels from being contracted into FMAs so that
@@ -79,6 +80,48 @@ static __global__ void hc_combine_f32(
     dst[index] = hc_add_rn(residual[index], m);
 }
 
+
+static __global__ void hc_mix_reduce_f32_hc4_parallel(
+        const float * __restrict__ xn, const float * __restrict__ gate, float * __restrict__ dst,
+        const int64_t n_embd, const int64_t n_tokens, const float scale, const float bias) {
+    const int lane = threadIdx.x % 32;
+    const int stream = threadIdx.x / 32;
+    const int64_t index = int64_t(blockIdx.x) * 32 + lane;
+    const int64_t count = n_embd * n_tokens;
+    __shared__ float products[4][32];
+    float value = 0.0f;
+    if (index < count) {
+        const int64_t token = index / n_embd;
+        const int64_t embd = index - token * n_embd;
+        const int64_t offset = token * (4 * n_embd) + stream * n_embd + embd;
+        value = hc_mul_rn(xn[offset], hc_sigmoid(gate[offset]));
+    }
+    products[stream][lane] = value;
+    __syncthreads();
+    if (stream == 0 && index < count) {
+        float sum = products[0][lane];
+        sum = hc_add_rn(sum, products[1][lane]);
+        sum = hc_add_rn(sum, products[2][lane]);
+        sum = hc_add_rn(sum, products[3][lane]);
+        dst[index] = scale * sum + bias;
+    }
+}
+
+__device__ __forceinline__ float hc_bf2f32(const uint16_t h) { return __uint_as_float(((uint32_t) h) << 16); }
+__device__ __forceinline__ uint16_t hc_f2bf32(const float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
+
+// same reduction as hc_mix_reduce_f32, reading BF16 copies of xn and gate (16-bit HC intermediates)
+static __global__ void hc_mix_reduce_bf16(
+        const uint16_t * __restrict__ xn, const uint16_t * __restrict__ gate, float * __restrict__ dst,
+        const int64_t n_embd, const int64_t n_tokens, const int hc, const float scale, const float bias) {
+    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= n_embd * n_tokens) return;
+    const int64_t t = index / n_embd, e = index - t * n_embd, base = t * (int64_t) n_embd * hc + e;
+    float acc = hc_mul_rn(hc_bf2f32(xn[base]), hc_sigmoid(hc_bf2f32(gate[base])));
+    for (int c = 1; c < hc; ++c) { const int64_t i = base + int64_t(c) * n_embd; acc = hc_add_rn(acc, hc_mul_rn(hc_bf2f32(xn[i]), hc_sigmoid(hc_bf2f32(gate[i])))); }
+    dst[index] = scale * acc + bias;
+}
+
 static bool hc_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
     const char * a0 = (const char *) a->data;
     const char * a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -123,11 +166,25 @@ void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda
     float * out = stage ? staged.alloc(n_embd * n_tokens) : (float *) dst->data;
 
     const int64_t n_items = n_embd * n_tokens;
-    const int     threads = 256;
-    const int     blocks  = (int) ((n_items + threads - 1) / threads);
-    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
-    ggml_cuda_kernel_launch(hc_mix_reduce_f32, launch_params,
-        (const float *) xn->data, (const float *) gate->data, out, n_embd, n_tokens, args.hc, args.scale, args.bias);
+    const uint16_t * xn16 = ggml_cuda_mmb_cache_lookup(xn);
+    const uint16_t * g16  = ggml_cuda_mmb_cache_lookup(gate);
+    if (xn16 && g16) {
+        const int threads = 256; const int blocks = (int) ((n_items + threads - 1) / threads);
+        const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+        ggml_cuda_kernel_launch(hc_mix_reduce_bf16, launch_params, xn16, g16, out, n_embd, n_tokens, args.hc, args.scale, args.bias);
+    } else if (args.hc == 4 && n_tokens <= 32) {
+        // one wave per stream, the same in-order sum: bit-identical to the serial kernel with more blocks in flight for decode
+        const int blocks = (int) ((n_items + 31) / 32);
+        const ggml_cuda_kernel_launch_params launch_params(blocks, 128, 0, ctx.stream());
+        ggml_cuda_kernel_launch(hc_mix_reduce_f32_hc4_parallel, launch_params,
+            (const float *) xn->data, (const float *) gate->data, out, n_embd, n_tokens, args.scale, args.bias);
+    } else {
+        const int threads = 256;
+        const int blocks = (int) ((n_items + threads - 1) / threads);
+        const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+        ggml_cuda_kernel_launch(hc_mix_reduce_f32, launch_params,
+            (const float *) xn->data, (const float *) gate->data, out, n_embd, n_tokens, args.hc, args.scale, args.bias);
+    }
 
     if (stage) {
         CUDA_CHECK(cudaMemcpyAsync(dst->data, out, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
@@ -339,6 +396,82 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_single_
     }
 }
 
+#define HC_CN_BLOCK2 256
+__device__ __forceinline__ float hc_lo(const uint32_t u) { return __uint_as_float(u << 16); }
+__device__ __forceinline__ float hc_hi(const uint32_t u) { return __uint_as_float(u & 0xffff0000u); }
+__device__ __forceinline__ uint32_t hc_pack2(const float a, const float b) {
+    return (uint32_t) hc_f2bf32(a) | ((uint32_t) hc_f2bf32(b) << 16);
+}
+
+// two elements per thread per iteration, packed 32-bit accesses; optional BF16 residual / block_out in and BF16 outputs
+static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256(
+        const float * inject, const float * residual,
+        const float * block_out, const float * gamma,
+        float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
+        const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
+        const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps) {
+    __shared__ float s_sum[32];
+    const int c = blockIdx.x, t = blockIdx.y, hc = gridDim.x, tid = threadIdx.x;
+    const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
+    const float x2 = hc_sigmoid(x1);
+    const float w  = s2 * x2 + b2;
+    const int64_t row = (int64_t) t * hc + c;
+    const float *    res   = residual + row * n_embd;
+    const uint16_t * res16 = res_in_bf16  ? res_in_bf16  + row * n_embd : nullptr;
+    float *          dst   = out_res      + row * n_embd;
+    uint16_t *       dst16 = res_out_bf16 ? res_out_bf16 + row * n_embd : nullptr;
+    const float *    blk   = block_out + (int64_t) t * n_embd;
+    const uint16_t * blk16 = blk_in_bf16 ? blk_in_bf16 + (int64_t) t * n_embd : nullptr;
+    constexpr int KP = (HC_CN_MAX_EMB / 2 + HC_CN_BLOCK2 - 1) / HC_CN_BLOCK2;
+    float xs[2 * KP];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < KP; ++k) {
+        const int col = (tid + k * HC_CN_BLOCK2) * 2;
+        xs[2 * k] = 0.0f; xs[2 * k + 1] = 0.0f;
+        if (col + 1 < n_embd) {
+            float r0, r1, m0, m1;
+            if (res16) { const uint32_t u = *(const uint32_t *)(res16 + col); r0 = hc_lo(u); r1 = hc_hi(u); }
+            else       { const float2   v = *(const float2 *)(res + col);     r0 = v.x;      r1 = v.y; }
+            if (blk16) { const uint32_t u = *(const uint32_t *)(blk16 + col); m0 = hc_lo(u); m1 = hc_hi(u); }
+            else       { const float2   v = *(const float2 *)(blk + col);     m0 = v.x;      m1 = v.y; }
+            const float a0 = hc_add_rn(r0, hc_mul_rn(m0, w));
+            const float a1 = hc_add_rn(r1, hc_mul_rn(m1, w));
+            if (dst16) *(uint32_t *)(dst16 + col) = hc_pack2(a0, a1);
+            else       *(float2 *)(dst + col)     = make_float2(a0, a1);
+            xs[2 * k] = a0; xs[2 * k + 1] = a1;
+            tmp += a0 * a0 + a1 * a1;
+        } else if (col < n_embd) {
+            const float r0 = res16 ? hc_bf2f32(res16[col]) : res[col];
+            const float m0 = blk16 ? hc_bf2f32(blk16[col]) : blk[col];
+            const float a0 = hc_add_rn(r0, hc_mul_rn(m0, w));
+            if (dst16) dst16[col] = hc_f2bf32(a0); else dst[col] = a0;
+            xs[2 * k] = a0;
+            tmp += a0 * a0;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, HC_CN_BLOCK2>(tmp, s_sum);
+    const float mean  = tmp / n_embd;
+    const float scale = rsqrtf(mean + eps);
+    const float * g  = gamma  + (int64_t) c * n_embd;
+    float *       xn = out_xn + row * n_embd;
+    uint16_t *    xh = out_xn_bf16 ? out_xn_bf16 + row * n_embd : nullptr;
+#pragma unroll
+    for (int k = 0; k < KP; ++k) {
+        const int col = (tid + k * HC_CN_BLOCK2) * 2;
+        if (col + 1 < n_embd) {
+            const float2 gv = *(const float2 *)(g + col);
+            const float v0 = scale * xs[2 * k] * gv.x, v1 = scale * xs[2 * k + 1] * gv.y;
+            if (store_xn_f32) *(float2 *)(xn + col) = make_float2(v0, v1);
+            if (xh) *(uint32_t *)(xh + col) = hc_pack2(v0, v1);
+        } else if (col < n_embd) {
+            const float v0 = scale * xs[2 * k] * g[col];
+            if (store_xn_f32) xn[col] = v0;
+            if (xh) xh[col] = hc_f2bf32(v0);
+        }
+    }
+}
+
 bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & a, const int warp_size) {
     const int64_t n_embd = a.out_res->ne[0];
     const int64_t hc     = a.out_res->ne[1];
@@ -358,6 +491,7 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
 
     if (a.single_block) {
         GGML_ASSERT(hc <= HC_CN_SINGLE_MAX_HC);
+        GGML_ASSERT(a.store_xn_f32 && !a.out_xn_bf16 && !a.res_in_bf16 && !a.res_out_bf16 && !a.blk_in_bf16);
         const ggml_cuda_kernel_launch_params launch_params(dim3((int) n_tokens, 1, 1), HC_CN_BLOCK, 0, ctx.stream());
         ggml_cuda_kernel_launch(hc_combine_norm_single_f32, launch_params,
             (const float *) a.inject->data, (const float *) a.residual->data,
@@ -367,10 +501,12 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
         return;
     }
 
-    const ggml_cuda_kernel_launch_params launch_params(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK, 0, ctx.stream());
-    ggml_cuda_kernel_launch(hc_combine_norm_f32, launch_params,
+    // 256 threads x 2 packed elements per iteration (the shipped layout); the BF16 options ride on this kernel
+    const ggml_cuda_kernel_launch_params lp2(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK2, 0, ctx.stream());
+    ggml_cuda_kernel_launch(hc_combine_norm_f32_b256, lp2,
         (const float *) a.inject->data, (const float *) a.residual->data,
         (const float *) a.block_out->data, (const float *) a.gamma->data,
-        (float *) a.out_res->data, (float *) a.out_xn->data,
+        (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,
+        a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
         (int) n_embd, a.s1, a.b1, a.s2, a.b2, a.eps);
 }

@@ -3788,6 +3788,113 @@ struct test_conv_state_chain : public test_case {
     }
 };
 
+struct test_mmb_quant_hc : test_case {
+    const ggml_type type;
+    explicit test_mmb_quant_hc(ggml_type type) : type(type) {}
+    std::string op_desc(ggml_tensor *) override { return "MMB_QUANT_HC"; }
+    std::string vars() override { return VAR_TO_STR(type); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
+            if (t->op==GGML_OP_NONE) init_tensor_uniform(t);
+        }
+    }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int embd=2560, hc=4, tokens=512, k=256;
+        auto * residual=ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        auto * block=ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
+        auto * injection=ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        // gamma is [embd, hc] and applied to the 3D norm output: RMS_NORM and MUL adjacent, as the model builder emits them
+        auto * gamma=ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc);
+        auto * weight=ggml_reshape_3d(ctx,ggml_scale(ctx,ggml_sigmoid(ctx,ggml_scale(ctx,injection,.25f)),2.f),1,hc,tokens);
+        if(gf){ggml_build_forward_expand(gf,block);ggml_build_forward_expand(gf,weight);}
+        auto * combined=ggml_add(ctx,residual,ggml_mul(ctx,ggml_repeat(ctx,block,residual),weight));
+        auto * xn=ggml_reshape_2d(ctx,ggml_mul(ctx,ggml_rms_norm(ctx,combined,1e-6f),gamma),embd*hc,tokens);
+        if(gf)ggml_build_forward_expand(gf,xn);
+        auto * lo=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,k,tokens);
+        auto * w=ggml_new_tensor_2d(ctx,type,k,embd*hc);
+        auto * gate=ggml_sigmoid(ctx,ggml_mul_mat(ctx,w,lo));
+        auto * gated=ggml_reshape_3d(ctx,ggml_mul(ctx,xn,gate),embd,hc,tokens);
+        auto * mixed=ggml_cont(ctx,ggml_view_2d(ctx,gated,embd,tokens,embd*hc*sizeof(float),0));
+        for(int c=1;c<hc;++c)mixed=ggml_add(ctx,mixed,ggml_view_2d(ctx,gated,embd,tokens,embd*hc*sizeof(float),embd*c*sizeof(float)));
+        return ggml_scale(ctx,mixed,.25f);
+    }
+};
+
+
+struct test_hc_f32_consumer : public test_case {
+    const int tokens;
+    const ggml_type type_w;
+
+    test_hc_f32_consumer(int tokens, ggml_type type_w) : tokens(tokens), type_w(type_w) {}
+    std::string op_desc(ggml_tensor *) override { return "HC_F32_CONSUMER"; }
+    std::string vars() override { return VARS_TO_STR2(tokens, type_w); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return type_w == GGML_TYPE_F32 ? 1e-5 : 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int embd = 2560, hc = 4;
+        auto * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        auto * block = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
+        auto * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        auto * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc);   // RMS_NORM and MUL adjacent, as the model builder emits them
+        auto * weight = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 0.25f)), 2.0f);
+        weight = ggml_reshape_3d(ctx, weight, 1, hc, tokens);
+        if (gf) { ggml_build_forward_expand(gf, block); ggml_build_forward_expand(gf, weight); }
+        auto * update = ggml_mul(ctx, ggml_repeat(ctx, block, residual), weight);
+        auto * combined = ggml_add(ctx, residual, update);
+        auto * norm = ggml_mul(ctx, ggml_rms_norm(ctx, combined, 1e-6f), gamma);
+        norm = ggml_reshape_2d(ctx, norm, embd * hc, tokens);
+        ggml_set_name(norm, "test_hc_norm");
+        auto * projection = ggml_new_tensor_2d(ctx, type_w, embd * hc, 4);
+        ggml_set_name(projection, "test_hc_projection");
+        return ggml_mul_mat(ctx, projection, norm);
+    }
+};
+
+
+// HC16: two chained combine-norms at 512 tokens. The first combined stream is read only by its own norm and the next
+// combine (BF16-only residual stream), the second is dead after its norm, so without the out_res -> out_xn allocation
+// dependency the allocator hands its buffer to the normalized output, the alias check refuses the fused kernel, and the
+// fallback would read the BF16-only stream as F32 (the last-layer perplexity failure).
+struct test_hc_chain : public test_case {
+    const int tokens;
+    const ggml_type type_w;
+
+    test_hc_chain(int tokens, ggml_type type_w) : tokens(tokens), type_w(type_w) {}
+    std::string op_desc(ggml_tensor *) override { return "HC_CHAIN"; }
+    std::string vars() override { return VARS_TO_STR2(tokens, type_w); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int embd = 2560, hc = 4;
+        auto * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        ggml_tensor * out = nullptr;
+        for (int layer = 0; layer < 2; ++layer) {
+            auto * block  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
+            auto * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+            auto * gamma  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc);   // RMS_NORM and MUL adjacent
+            auto * weight = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 0.25f)), 2.0f);
+            weight = ggml_reshape_3d(ctx, weight, 1, hc, tokens);
+            if (gf) { ggml_build_forward_expand(gf, residual); ggml_build_forward_expand(gf, block); ggml_build_forward_expand(gf, weight); }
+            auto * combined = ggml_add(ctx, residual, ggml_mul(ctx, ggml_repeat(ctx, block, residual), weight));
+            auto * norm = ggml_reshape_2d(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, combined, 1e-6f), gamma), embd * hc, tokens);
+            auto * projection = ggml_new_tensor_2d(ctx, type_w, embd * hc, 4);
+            auto * proj = ggml_mul_mat(ctx, projection, norm);
+            if (gf) ggml_build_forward_expand(gf, proj);
+            out = out ? ggml_add(ctx, out, proj) : proj;
+            residual = combined;
+        }
+        return out;
+    }
+};
+
+
 struct test_indexer_head_sum : public test_case {
     const int blocks, heads, tokens, streams;
     const bool view, escape;
@@ -9857,6 +9964,16 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    for (int tokens : {128, 511, 512, 513, 1024}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_hc_f32_consumer(tokens, type));
+        }
+    }
+    for (int tokens : {128, 512, 1024}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_hc_chain(tokens, type));
+        }
+    }
     for (ggml_type type : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         test_cases.emplace_back(new test_mmb_quant_dense(type, 512, 128, 256));
         test_cases.emplace_back(new test_mmb_quant_dense(type, 513, 129, 512));
@@ -9864,6 +9981,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, false));
         test_cases.emplace_back(new test_mmb_quant_routed(type, 512, false, true));
         test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true));
+        test_cases.emplace_back(new test_mmb_quant_hc(type));
         if (type == GGML_TYPE_Q4_K) {
             test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true, 65));
             test_cases.emplace_back(new test_mmb_quant_routed(type, 1025, false, true, 129));
