@@ -21208,7 +21208,22 @@ static void ggml_vk_cpy16_reject(const struct ggml_cgraph * cgraph, int node_idx
     static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
     if (dbg) {
         const ggml_tensor * n = cgraph->nodes[node_idx];
-        fprintf(stderr, "ggml_vulkan: cpy16 fusion not matched at node %d (%s %s): %s\n", node_idx, ggml_op_name(n->op), n->name, why);
+        // who consumes the node (the generic fuse rule needs exactly one use, no view, no output flag)
+        std::string users;
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (cgraph->nodes[j]->src[k] == n) {
+                    users += std::string(" ") + ggml_op_name(cgraph->nodes[j]->op) + ":" + cgraph->nodes[j]->name + "@" + std::to_string(j);
+                }
+            }
+        }
+        std::string order;
+        for (int j = std::max(0, node_idx - 5); j < node_idx + 4 && j < cgraph->n_nodes; ++j) {
+            order += std::string(" ") + ggml_op_name(cgraph->nodes[j]->op) + ":" + cgraph->nodes[j]->name;
+        }
+        fprintf(stderr, "ggml_vulkan: cpy16 fusion not matched at node %d (%s %s): %s [uses=%d view=%d out=%d users:%s | next:%s]\n",
+                node_idx, ggml_op_name(n->op), n->name, why, ggml_node_get_use_count(cgraph, node_idx), n->view_src != nullptr,
+                (n->flags & GGML_TENSOR_FLAG_OUTPUT) != 0, users.c_str(), order.c_str());
     }
 }
 static bool ggml_vk_can_fuse_mmid_cpy16(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, bool with_mul) {
@@ -22091,6 +22106,12 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    // a matmul followed by its f16 cast (MUL_MAT(_ID)(+MUL)+CPY(f16) fusions): keep the cast behind the matmul,
+                    // otherwise the grab pulls the next independent matmul in between and the pair never fuses
+                    !(j == c+1 && c == current_set.back() && (graph->nodes[c]->op == GGML_OP_MUL_MAT || graph->nodes[c]->op == GGML_OP_MUL_MAT_ID) &&
+                      graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c]) &&
+                    !(j == c+1 && c == current_set.back() && j >= 2 && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[c-1]->op == GGML_OP_MUL_MAT_ID &&
+                      graph->nodes[j]->op == GGML_OP_CPY && graph->nodes[j]->type == GGML_TYPE_F16 && graph->nodes[j]->src[0] == graph->nodes[c]) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY)) {

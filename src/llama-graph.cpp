@@ -2195,6 +2195,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
+        if (llm_graph_moe_f16(n_tokens, down_exps)) {
+            // f16 expert activations at prefill: one cast of the merged projection, pinned right behind its
+            // matmul so the backend fuses MUL_MAT_ID+CPY(f16) and stores f16 from the accumulator; the gate
+            // and up views below are then f16 and the GLU runs f16 in / f16 out. The block input stays
+            // referenced past the cast (view expanded after it) so its bytes cannot become the destination.
+            ggml_tensor * moe_inp = cur;
+            gate_up = ggml_cast(ctx0, gate_up, GGML_TYPE_F16);
+            cb(gate_up, "ffn_moe_gate_up_f16", il);
+            ggml_build_forward_expand(gf, gate_up);
+            ggml_build_forward_expand(gf, ggml_view_1d(ctx0, moe_inp, 1, 0));
+        }
+
         const int64_t n_ff = gate_up->ne[0] / 2;
         cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
         cb(cur, "ffn_moe_gate", il);
@@ -2220,8 +2232,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up_biased", il);
         }
         if (cast_f16) {
+            static const bool dbg = getenv("LLAMA_MOE_DEBUG") != nullptr;
+            const int n0 = ggml_graph_n_nodes(gf);
             up = ggml_cast(ctx0, up, GGML_TYPE_F16);
             cb(up, "ffn_moe_up_f16", il);
+            // pin the cast right behind its matmul in the graph: the fusion needs the pair adjacent, and
+            // the plain DFS from the GLU emits both projections before either cast
+            ggml_build_forward_expand(gf, up);
+            if (dbg) {
+                const int n1 = ggml_graph_n_nodes(gf);
+                const ggml_tensor * last = n1 > 0 ? ggml_graph_node(gf, n1 - 1) : nullptr;
+                const ggml_tensor * prev = n1 > 1 ? ggml_graph_node(gf, n1 - 2) : nullptr;
+                fprintf(stderr, "moe_f16 il=%d up: nodes %d -> %d (last: %s %s, prev: %s %s)\n", il, n0, n1,
+                        last ? ggml_op_name(last->op) : "-", last ? last->name : "-",
+                        prev ? ggml_op_name(prev->op) : "-", prev ? prev->name : "-");
+            }
         }
 
         if (gate_exps) {
@@ -2242,6 +2267,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (cast_f16) {
             cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
             cb(cur, "ffn_moe_gate_f16", il);
+            ggml_build_forward_expand(gf, cur);
             ggml_build_forward_expand(gf, ggml_view_1d(ctx0, moe_inp, 1, 0));   // keep moe_inp alive past the cast
         }
     }
