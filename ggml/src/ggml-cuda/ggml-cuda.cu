@@ -5884,7 +5884,35 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 static bool         g_gt_after_compute = true;
 static const void * g_gt_first_split   = nullptr;
 
+// the marks are keyed by tensor pointer and belong to the graphs graph_optimize last saw. A graph computed without
+// that optimize (test-backend-ops, any direct ggml_backend_graph_compute caller) can recycle those addresses, so a
+// producer would store BF16 into a tensor of another graph and a plain reader would abort. Fingerprint each optimized
+// split and drop the marks when a graph arrives that none of them match; a reused (identical) graph keeps them.
+static std::vector<uint64_t> g_gt_graph_sigs;
+
+static uint64_t ggml_cuda_graph_sig(const ggml_cgraph * cgraph) {
+    // no data pointers: the scheduler allocates after graph_optimize, so they differ between optimize and compute
+    uint64_t h = 1469598103934665603ull ^ (uint64_t) cgraph->n_nodes;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        h = (h ^ (uint64_t) (uintptr_t) t) * 1099511628211ull;
+        h = (h ^ (uint64_t) t->op ^ ((uint64_t) t->ne[0] << 8) ^ ((uint64_t) t->ne[1] << 24)) * 1099511628211ull;
+        for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+            h = (h ^ (uint64_t) (uintptr_t) t->src[s]) * 1099511628211ull;
+        }
+    }
+    return h;
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    if (ggml_cuda_mmb_marks_count() > 0) {
+        const uint64_t sig = ggml_cuda_graph_sig(cgraph);
+        if (std::find(g_gt_graph_sigs.begin(), g_gt_graph_sigs.end(), sig) == g_gt_graph_sigs.end()) {
+            ggml_cuda_mmb_marks_clear();
+            g_gt_graph_sigs.clear();
+            g_gt_first_split = nullptr;
+        }
+    }
     ggml_cuda_mmb_begin_graph();
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -6005,7 +6033,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     {   // marks live for the whole scheduled graph (all splits): clear at the first optimize after a compute, or when the first split repeats
         const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
-        if (g_gt_after_compute || g_gt_first_split == nullptr || key == g_gt_first_split) { ggml_cuda_mmb_marks_clear(); g_gt_first_split = key; g_gt_after_compute = false; }
+        if (g_gt_after_compute || g_gt_first_split == nullptr || key == g_gt_first_split) { ggml_cuda_mmb_marks_clear(); g_gt_graph_sigs.clear(); g_gt_first_split = key; g_gt_after_compute = false; }
     }
     {   // HC16: mark tensors whose readers all take the BF16 copy, so their producers skip the F32 store
         if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
@@ -6302,6 +6330,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     GGML_UNUSED(cuda_ctx);
     GGML_UNUSED(cgraph);
 #endif
+
+    // the marks for this split are complete here; the fingerprint must be recorded before the early returns below
+    g_gt_graph_sigs.push_back(ggml_cuda_graph_sig(cgraph));
 
     static bool enable_graph_optimization = [] {
         const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
