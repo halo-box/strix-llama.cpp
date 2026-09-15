@@ -1,3 +1,4 @@
+#include <thread>
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -1773,15 +1774,36 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 #endif
 
         embd_buf.resize(idx.size() * (size_t) dim);
-        for (size_t k = 0; k < idx.size(); ++k) {
-            const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
-            float *      dst = embd_buf.data() + k * (size_t) dim;
-            if (tab->type == GGML_TYPE_F32) {
-                memcpy(dst, src, dim * sizeof(float));
-            } else {
-                GGML_ASSERT(traits->to_float != nullptr);
-                traits->to_float(src, dst, dim);
+        // every row is its own page of a mapping far larger than RAM, so this loop is bound by page
+        // faults, not bytes: gather on a pool so the faults overlap (measured 2026-09-15: 32768 rows
+        // 65 ms single-threaded, 9-12 ms on the pool). LLAMA_PLE_GATHER_THREADS overrides the size.
+        auto gather_range = [&](size_t k0, size_t k1) {
+            for (size_t k = k0; k < k1; ++k) {
+                const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
+                float *      dst = embd_buf.data() + k * (size_t) dim;
+                if (tab->type == GGML_TYPE_F32) {
+                    memcpy(dst, src, dim * sizeof(float));
+                } else {
+                    GGML_ASSERT(traits->to_float != nullptr);
+                    traits->to_float(src, dst, dim);
+                }
             }
+        };
+        static const int ple_threads = [] {
+            const char * e = getenv("LLAMA_PLE_GATHER_THREADS");
+            const int hw = (int) std::thread::hardware_concurrency();
+            return e ? std::max(1, atoi(e)) : std::max(1, std::min(32, 2 * hw));
+        }();
+        if (ple_threads <= 1 || idx.size() < 4096) {
+            gather_range(0, idx.size());
+        } else {
+            std::vector<std::thread> pool;
+            const size_t chunk = (idx.size() + ple_threads - 1) / ple_threads;
+            for (int t = 0; t < ple_threads; ++t) {
+                const size_t k0 = (size_t) t * chunk, k1 = std::min(idx.size(), k0 + chunk);
+                if (k0 < k1) pool.emplace_back(gather_range, k0, k1);
+            }
+            for (auto & th : pool) th.join();
         }
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
         return;
