@@ -5485,11 +5485,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_K], matmul_q4_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_K], matmul_q5_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q6_K], matmul_q6_k_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_IQ4_NL, pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_NL], matmul_iq4_nl_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );   // 8-wide loader + d16 need the f16-B kernel
         // f16-output variants (MUL_MAT+CPY(f16) fusion)
         CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat_f16_d16[GGML_TYPE_Q4_K], matmul_q4_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_f16_d16[GGML_TYPE_Q5_0], matmul_q5_0_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_f16_d16[GGML_TYPE_Q8_0], matmul_q8_0_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_f16_d16[GGML_TYPE_Q6_K], matmul_q6_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_IQ4_NL, pipeline_dequant_mul_mat_mat_f16_d16[GGML_TYPE_IQ4_NL], matmul_iq4_nl_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         }
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_S],   matmul_iq1_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_M],   matmul_iq1_m_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -5699,6 +5701,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q5_0], matmul_id_subgroup_q5_0_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q8_0], matmul_id_subgroup_q8_0_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_Q6_K], matmul_id_subgroup_q6_k_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
+        CREATE_MM2(GGML_TYPE_IQ4_NL, pipeline_dequant_mul_mat_mat_id_f16b_d16[GGML_TYPE_IQ4_NL], matmul_id_subgroup_iq4_nl_f16_d16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_IQ1_S],   matmul_id_subgroup_iq1_s_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_IQ1_M],   matmul_id_subgroup_iq1_m_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
         CREATE_MM2(GGML_TYPE_IQ2_XXS, pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_IQ2_XXS], matmul_id_subgroup_iq2_xxs_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id);
@@ -10605,8 +10608,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // is crossed with type, no type rule separates the winners; kept for reproducing the check.
     const bool f16b_type_ok = src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q8_0;
     const int  f16b_mode    = ggml_vk_dense_f16b_mode();
+    // IQ4_NL: its f32-B kernel (8-wide loader) beats convert + f16-B by 6-8% at the Flash-Next dense shapes
+    // (2026-09-15 op grid: 2483 vs 2695 us at 2560x2048x6144, 3980 vs 4220 at 10240x2048x2560), so under mode 1 it
+    // takes the fitted auto predicate. An f16 output (fused CPY) always takes f16 B, whatever the mode: the fusion
+    // predicate only admits it when the conversion is enabled and this type has an f16-B kernel.
+    const bool f16b_all = f16b_mode == 1 && (src0->type != GGML_TYPE_IQ4_NL || ggml_vk_dense_f16b_auto_ok(src0->type, ne01, ne10));
     const bool dense_f16b = ggml_vk_dense_f16b_enabled() &&
-                            (f16b_mode == 1 ||
+                            (d16 || f16b_all ||
                              (f16b_mode == 2 && ggml_vk_dense_f16b_auto_ok(src0->type, ne01, ne10)) ||
                              (f16b_mode == 3 && f16b_type_ok)) &&
                             ctx->device->coopmat_support && !ctx->device->coopmat2 &&
@@ -10645,6 +10653,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
+    // an f16 output has no fallback: the dequant-A path below would run a f32-output kernel into the f16 buffer
+    GGML_ASSERT(!d16 || (mmp != nullptr && !qx_needs_dequant));
 
     if (qx_needs_dequant) {
         // Fall back to dequant + f16 mulmat
@@ -21170,7 +21180,7 @@ static bool ggml_vk_mm_cpy16_enabled() {
     return on;
 }
 static bool ggml_vk_mm_d16_type_ok(ggml_type t) {
-    return t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q6_K;
+    return t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_0 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q6_K || t == GGML_TYPE_IQ4_NL;
 }
 static bool ggml_vk_cpy16_target_ok(const ggml_tensor * prod, const ggml_tensor * cpy) {
     return cpy->op == GGML_OP_CPY && cpy->src[0] == prod && cpy->type == GGML_TYPE_F16 &&
@@ -21190,8 +21200,12 @@ static bool ggml_vk_can_fuse_mm_cpy16(const ggml_backend_vk_context * ctx, const
     if (!ggml_vk_cpy16_target_ok(mm, cpy) || !ggml_vk_mm_d16_type_ok(src0->type) || !ggml_is_contiguous(src0)) {
         return false;
     }
-    // f16 B only: either the graph hands f16 in, or the dense f16-B conversion is on
-    if (!(src1->type == GGML_TYPE_F16 || (src1->type == GGML_TYPE_F32 && ggml_vk_dense_f16b_enabled())) ||
+    // f16 B only: either the graph hands f16 in, or the dense f16-B conversion is on AND this weight type has an
+    // f16-B kernel on this path (IQ4_NL had none on KHR coopmat until 2026-09-15: the d16 lookup then returned null
+    // and the dispatch fell back to a f32-output kernel writing into the f16 buffer)
+    const vk_matmul_pipeline2 & pf16 = ctx->device->pipeline_dequant_mul_mat_mat_f16[src0->type];
+    const bool f16b_kernel = !(pf16.f16acc->is_empty() && pf16.f32acc->is_empty());
+    if (!(src1->type == GGML_TYPE_F16 || (src1->type == GGML_TYPE_F32 && ggml_vk_dense_f16b_enabled() && f16b_kernel)) ||
         !ggml_vk_dim01_contiguous(src1)) {
         return false;
     }

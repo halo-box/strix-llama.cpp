@@ -9953,7 +9953,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_mix(31, 17, GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_mix(2560, 21, GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16));
     // f16-output matmuls (MUL_MAT(+MUL)+CPY(f16) fusions) at GEMM shapes, and the f16 MoE combine
-    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K}) {
+    // large-tile dense GEMMs (the per-type eval loops above stop at m=16 / m=1): f16 B direct and the f32-B conversion path
+    for (ggml_type t : {GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 256, 128, 320, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 200, 130, 2560, {1, 1}, {1, 1}));
+    }
+    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_mul_mat_cpy16(t, GGML_TYPE_F32, 256, 128, 320));
         test_cases.emplace_back(new test_mul_mat_cpy16(t, GGML_TYPE_F32, 200, 130, 2560));
         test_cases.emplace_back(new test_mul_mat_cpy16(t, GGML_TYPE_F16, 256, 128, 640));
@@ -12259,6 +12264,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q8_0, 128, 10, true, 2560, 2048, 640));
     test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q4_K, 128, 10, false, 640, 2048, 2560));
     test_cases.emplace_back(new test_multi_add_f16(2560, 10, 2048));
+    // IQ4_NL at the Flash-Next ub2048 shapes (pwilkin's published file type): experts and the dense projections
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 10, false,  640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 10, false, 2560, 2048,  640));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32,  2560, 2048, 6144, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 10240, 2048, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 10240, 2048,  320, {1, 1}, {1, 1}));
 
     // SHAPE SWEEP (local, GGML_VK_DENSE_F16B predicate). REAL shapes taken from a perf-logger
     // census of each model, with the quant type each actually uses, plus a few synthetic points.

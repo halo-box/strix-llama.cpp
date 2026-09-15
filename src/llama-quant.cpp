@@ -286,8 +286,17 @@ static void llama_tensor_dequantize_impl(
 //
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
-    // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+    // COPY + --tensor-type: requantize only the tensors an override names, copy everything else through
+    if (params->only_copy) {
+        bool overridden = false;
+        if (params->tt_overrides) {
+            const std::string name = ggml_get_name(tensor);
+            for (const auto * p = params->tt_overrides; p->pattern != nullptr; p++) {
+                if (std::regex_search(name, std::regex(p->pattern))) { overridden = true; break; }
+            }
+        }
+        if (!overridden) return false;
+    }
 
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
@@ -1027,30 +1036,32 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 
     ggml_type new_type = default_type;
 
-    // get more optimal quantization type based on the tensor shape, layer, etc.
-    if (ggml_is_quantized(default_type)) {
-        // if the user provided tensor types - use those
-        bool manual = false;
-        if (!qs.tensor_type_patterns.empty()) {
-            const std::string tensor_name(tensor->name);
-            for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
-                if (std::regex_search(tensor_name, pattern)) {
-                    if (qtype != new_type) {
-                        LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
-                                       __func__, tensor_name.c_str(), ggml_type_name(new_type), ggml_type_name(qtype));
-                        new_type = qtype;
-                    }
-                    manual = true;
-                    break;
+    // if the user provided tensor types - use those (also under COPY / F32 / F16 ftypes, where the
+    // default type is not quantized: the override is then the only way a tensor gets quantized)
+    bool manual = false;
+    if (!qs.tensor_type_patterns.empty()) {
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (std::regex_search(tensor_name, pattern)) {
+                if (qtype != new_type) {
+                    LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
+                                   __func__, tensor_name.c_str(), ggml_type_name(new_type), ggml_type_name(qtype));
+                    new_type = qtype;
                 }
+                manual = true;
+                break;
             }
         }
+    }
 
+    // get more optimal quantization type based on the tensor shape, layer, etc.
+    if (ggml_is_quantized(default_type)) {
         // if not manual - use the standard logic for choosing the quantization type based on the selected mixture
         if (!manual && !params->pure) {
             new_type = llama_tensor_get_type_impl(qs, new_type, tensor, params->ftype, tm.category);
         }
-
+    }
+    if (ggml_is_quantized(new_type)) {
         // incompatible tensor shapes are handled here - fallback to a compatible type
         new_type = tensor_type_fallback(qs, tensor, new_type);
     }
@@ -1474,8 +1485,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
-    // Set split info if needed
-    if (n_split > 1) {
+    // Set split info if needed (also for a single split under --keep-split: the output is named as a split
+    // and a shard re-quantized alone must keep its keys to be re-paired with its siblings)
+    if (n_split > 1 || params->keep_split) {
         for (size_t i = 0; i < ctx_outs.size(); ++i) {
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str(), i);
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str(), n_split);

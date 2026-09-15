@@ -608,7 +608,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         // For aligned matmul loads
         std::string load_vec_a = (coopmat2 || tname == "f32" || tname == "f16" || tname == "bf16") ? load_vec : load_vec_quant;
         // KHR coopmat q6_K / q3_K: 8 k-values per lane per load (whole-dword fetches + register prefetch, mul_mm_funcs.glsl)
-        if (coopmat && (tname == "q6_k" || tname == "q3_k" || tname == "q8_0" || tname == "q5_0")) {
+        if (coopmat && (tname == "q6_k" || tname == "q3_k" || tname == "q8_0" || tname == "q5_0" || tname == "iq4_nl")) {
             load_vec_a = "8";
         }
 
@@ -630,7 +630,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         // f16-output variants for the MUL_MAT(+MUL)+CPY(f16) fusion (KHR coopmat, f16 B): only the weight types
         // the Flash-Next graph writes f16 from. D_F16 switches the epilogue's 16-byte store alignment rule.
         if (coopmat && !coopmat2 && fp16 && !dot2 &&
-            (tname == "q4_k" || tname == "q5_0" || tname == "q8_0" || tname == "q6_k")) {
+            (tname == "q4_k" || tname == "q5_0" || tname == "q8_0" || tname == "q6_k" || tname == "iq4_nl")) {
             string_to_spv(shader_name + "_" + tname + "_f16_d16", source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}}), fp16, coopmat, coopmat2, f16acc);
         }
 

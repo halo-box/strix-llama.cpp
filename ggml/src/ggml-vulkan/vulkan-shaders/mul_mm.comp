@@ -56,7 +56,7 @@ layout (binding = 0) readonly buffer A_SCALAR {uint16_t data_a_scalar[];};
 #endif
 #if defined(A_TYPE_PACKED16)
 layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16[];};
-#if defined(DATA_A_Q6_K) || defined(DATA_A_Q3_K) || defined(DATA_A_Q8_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+#if defined(DATA_A_Q6_K) || defined(DATA_A_Q3_K) || defined(DATA_A_Q8_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K) || defined(DATA_A_IQ4_NL)
 // dword view of A for the 8-wide loaders (block sizes 210 / 110 bytes: only 2-byte aligned, so the
 // loaders fetch whole dwords and shift; see mul_mm_funcs.glsl)
 layout (binding = 0) readonly buffer A_U32 {uint data_a_u32[];};

@@ -28,7 +28,7 @@ void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
 // (pos_a: superblock column and the position inside the block are the same for every lane) and a
 // lane-invariant part computed once before the K loop (a_lane_off / a_store_idx, see mul_mm.comp).
 // pos_a is in LOAD_VEC_A units and a multiple of 4 (rows are multiples of 32 k, BK = 32).
-#if LOAD_VEC_A == 8 && (defined(DATA_A_Q6_K) || defined(DATA_A_Q3_K) || defined(DATA_A_Q8_0) || defined(DATA_A_Q5_0))
+#if LOAD_VEC_A == 8 && (defined(DATA_A_Q6_K) || defined(DATA_A_Q3_K) || defined(DATA_A_Q8_0) || defined(DATA_A_Q5_0) || defined(DATA_A_IQ4_NL))
 uvec3 fetch8(const uint b) {
     // branchless: dwords at (b & ~3) and +4 cover [b-2, b+8) when b is misaligned and [b, b+8) when
     // aligned; the 16-bit load at b+6 is only consumed in the misaligned case (it is inside either way)
@@ -172,6 +172,33 @@ void store_a_raw(const uint pos_a, const uint row, const uint col, const uint si
     const uint q1 = ((qs.y >> nib) & 0x0F0F0F0F) | (h1 << 4);
     const vec4 v0 = fma(vec4(unpack8(q0)), vec4(d), vec4(-16.0f * d));
     const vec4 v1 = fma(vec4(unpack8(q1)), vec4(d), vec4(-16.0f * d));
+    buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
+    buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(v0.zw));
+    buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
+    buf_a[sidx + 3] = TO_BUF(FLOAT_TYPEV2(v1.zw));
+}
+#elif LOAD_VEC_A == 8 && defined(DATA_A_IQ4_NL)
+// same byte layout as q4_0 (18 B: d, 16 nibble bytes; low nibbles = k 0..15, high = k 16..31), values through
+// the shared kvalues_iq4nl table (init_iq_shmem runs before the K loop)
+#define A_PREFETCH 1
+#define A_RAW_T uvec4   // xyz: qs fetch8 (block of 18 B), w: d bits
+uint a_lane_off(const uint row, const uint col) { return (col * (p.stride_a / 32)) * 18 + 8 * (row % 2); }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out uvec4 raw) {
+    const uint base = (pos_a / 4) * 18 + lane_off - 8 * (row % 2);
+    const uint ib   = base / 18;
+    const uvec3 qs = fetch8(base + 2 + 8 * (row % 2));      // row >= 2 are the high nibbles of the same bytes
+    raw = uvec4(qs.x, qs.y, qs.z, uint(float16BitsToUint16(data_a_packed16[ib].d)));
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const uvec4 raw) {
+    const uint base = (pos_a / 4 + col * (p.stride_a / 32)) * 18;
+    const bool odd = ((base + 2) & 2) != 0;
+    const uvec2 qs = unpack8b(raw.xyz, odd);
+    const float d = float(uint16BitsToFloat16(uint16_t(raw.w)));
+    const uint nib = 4 * (row / 2);
+    const uint q0 = (qs.x >> nib) & 0x0F0F0F0F;
+    const uint q1 = (qs.y >> nib) & 0x0F0F0F0F;
+    const vec4 v0 = d * vec4(float(kvalues_iq4nl[q0 & 0xFF]), float(kvalues_iq4nl[(q0 >> 8) & 0xFF]), float(kvalues_iq4nl[(q0 >> 16) & 0xFF]), float(kvalues_iq4nl[q0 >> 24]));
+    const vec4 v1 = d * vec4(float(kvalues_iq4nl[q1 & 0xFF]), float(kvalues_iq4nl[(q1 >> 8) & 0xFF]), float(kvalues_iq4nl[(q1 >> 16) & 0xFF]), float(kvalues_iq4nl[q1 >> 24]));
     buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(v0.xy));
     buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(v0.zw));
     buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
@@ -791,6 +818,11 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
             store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
 #elif defined(DATA_A_IQ4_NL)
+#if LOAD_VEC_A == 8
+            A_RAW_T raw;
+            fetch_a(pos_a, row, col, a_lane_off(row, col), raw);
+            store_a_raw(pos_a, row, col, a_shmem_index(col, row * LOAD_VEC_A / 2), raw);
+#else
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
             const uint ib = idx / 8;
@@ -804,6 +836,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                                        kvalues_iq4nl[bitfieldExtract(vui, 8, 4)]));
             store_a(col, k_pair + 8, d * FLOAT_TYPEV2(kvalues_iq4nl[bitfieldExtract(vui, 4, 4)],
                                                        kvalues_iq4nl[vui >> 12]));
+#endif
 #elif defined(DATA_A_MXFP4)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
