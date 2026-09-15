@@ -450,3 +450,37 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
 }
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_rocmfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+
+    const block_rocmfp4 * x = (const block_rocmfp4 *) vx + ibs*(QK_K/QK_ROCMFP4);
+
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + 32*ib + 4*il;
+    const uint8_t * q4 = x[ib].qs + 4*il;
+    // dual UE4M3 scales: low nibbles are weights j (e[0]), high nibbles are weights j+16 (e[1])
+    const float d0 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[0]);
+    const float d1 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[1]);
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = ggml_cuda_cast<dst_t>(d0 * kvalues_rocmfp4[q4[j] & 0xf]);
+        y[j+16] = ggml_cuda_cast<dst_t>(d1 * kvalues_rocmfp4[q4[j] >>  4]);
+    }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_rocmfp4_fast(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+
+    const block_rocmfp4_fast * x = (const block_rocmfp4_fast *) vx + ibs*(QK_K/QK_ROCMFP4);
+
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + 32*ib + 4*il;
+    const uint8_t * q4 = x[ib].qs + 4*il;
+    const float d = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e);
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_rocmfp4[q4[j] & 0xf]);
+        y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_rocmfp4[q4[j] >>  4]);
+    }
+}
