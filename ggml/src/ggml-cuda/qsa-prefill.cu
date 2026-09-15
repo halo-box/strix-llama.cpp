@@ -26,11 +26,13 @@ __global__ __launch_bounds__(256) void qsa3_rows_kernel(
     const int * row = reinterpret_cast<const int *>(reinterpret_cast<const char *>(ids) + (size_t) q * i1);
     if (tid == 0) { unsorted = 0; }
     __syncthreads();
-    const auto * mq = reinterpret_cast<const uint16_t *>(mask + (size_t) q * m1);
+    // without a mask the row itself is the visibility record: the graph only lists cells the query may see
+    // and writes -1 elsewhere (complete-block selection with tails)
+    const auto * mq = mask ? reinterpret_cast<const uint16_t *>(mask + (size_t) q * m1) : nullptr;
     for (int j = tid; j < ns; j += 256) {
         const int key = row[j];
         const bool valid = key >= 0 && key < nk;
-        const bool visible = valid && mq[key] != 0xfc00u;
+        const bool visible = valid && (!mq || mq[key] != 0xfc00u);
         ent[j] = visible ? key : QSA3_SENT;
         if (valid && !visible) { atomicOr(&unsorted, 1); }
     }
@@ -418,21 +420,22 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
 
 bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
-    if (!q || !k || !v || !m || !ids || dst->src[4] || ggml_get_op_params_i32(dst, 4) != 0 ||
+    if (!q || !k || !v || !ids || dst->src[4] || ggml_get_op_params_i32(dst, 4) != 0 ||
             !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) return false;
     float bias, softcap; memcpy(&bias, (const char *) dst->op_params+4, 4); memcpy(&softcap, (const char *) dst->op_params+8, 4);
+    // the mask is optional: a maskless op relies on the index rows naming only visible cells (-1 elsewhere)
+    if (m && (m->type!=GGML_TYPE_F16 || m->nb[0]!=2 || m->ne[0]<k->ne[1] || m->ne[1]<q->ne[1] || m->ne[2]!=1 || m->ne[3]!=1)) return false;
     return bias==0 && softcap==0 && q->type==GGML_TYPE_F32 && k->type==GGML_TYPE_F16 && v->type==GGML_TYPE_F16 &&
-        dst->type==GGML_TYPE_F32 && ids->type==GGML_TYPE_I32 && m->type==GGML_TYPE_F16 &&
+        dst->type==GGML_TYPE_F32 && ids->type==GGML_TYPE_I32 &&
         q->ne[0]==256 && k->ne[0]==256 && v->ne[0]==256 && q->ne[1]>=128 && q->ne[1]<=INT_MAX &&
         k->ne[1]>0 && k->ne[1]<=262140 && k->ne[1]%4==0 && v->ne[1]==k->ne[1] &&
         k->ne[2]>0 && k->ne[2]<=65535 && q->ne[2]==12*k->ne[2] && v->ne[2]==k->ne[2] &&
         q->ne[3]==1 && k->ne[3]==1 && v->ne[3]==1 && ggml_nelements(k)/4<=INT_MAX &&
-        q->nb[0]==4 && k->nb[0]==2 && v->nb[0]==2 && ids->nb[0]==4 && m->nb[0]==2 &&
+        q->nb[0]==4 && k->nb[0]==2 && v->nb[0]==2 && ids->nb[0]==4 &&
         q->nb[1]%16==0 && q->nb[2]%16==0 && uintptr_t(q->data)%16==0 &&
         k->nb[1]%16==0 && k->nb[2]%16==0 && uintptr_t(k->data)%16==0 &&
         ids->nb[1]%4==0 && uintptr_t(ids->data)%4==0 && ids->ne[0]>0 && ids->ne[0]<=2560 &&
-        ids->ne[1]>=q->ne[1] && ids->ne[2]==1 && ids->ne[3]==1 &&
-        m->ne[0]>=k->ne[1] && m->ne[1]>=q->ne[1] && m->ne[2]==1 && m->ne[3]==1 && ggml_is_contiguous(dst);
+        ids->ne[1]>=q->ne[1] && ids->ne[2]==1 && ids->ne[3]==1 && ggml_is_contiguous(dst);
 }
 
 static __global__ void qsa_pack_k(const char * src, uint16_t * dst, size_t nb1, size_t nb2, int nk, uint32_t count) {
@@ -474,7 +477,7 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
     ggml_cuda_pool_alloc<int>      sflag(ctx.pool(), (size_t) n_q);
     {
         const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) ns * sizeof(int), ctx.stream());
-        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get(), (const char *)m->data, m->nb[1]);
+        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get(), m ? (const char *)m->data : nullptr, m ? m->nb[1] : 0);
         CUDA_CHECK(cudaGetLastError());
         const ggml_cuda_kernel_launch_params launch2(dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), ctx.stream());
         ggml_cuda_kernel_launch(qsa3_merge_kernel, launch2, (const int *) ids->data, ids->nb[1], n_q, ns, nk,

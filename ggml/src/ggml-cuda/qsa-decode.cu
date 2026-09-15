@@ -81,7 +81,8 @@ static __global__ __launch_bounds__(256) void qsa_decode_merge(
 bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) { return false; }
     const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];
-    if (!q || !k || !v || !m || !ids || dst->src[4] || dst->src[6] || dst->src[7] || ggml_get_op_params_i32(dst, 4) != 0) { return false; }
+    // the mask is optional: the launcher and both kernels take a null mask (visibility from the index rows alone)
+    if (!q || !k || !v || !ids || dst->src[4] || dst->src[6] || dst->src[7] || ggml_get_op_params_i32(dst, 4) != 0) { return false; }
     float bias, cap;
     memcpy(&bias, (const char *) dst->op_params + 4, 4);
     memcpy(&cap, (const char *) dst->op_params + 8, 4);

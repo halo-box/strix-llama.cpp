@@ -87,6 +87,10 @@ public:
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
+    // complete-block selection metadata: tails and, when the bias is I32, compact limits
+    void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                              ggml_tensor * bias, ggml_tensor * tail_idxs,
+                              const llama_ubatch * ubatch, uint32_t ratio) const;
 
     void qsa_apply(const llama_ubatch & ubatch, const llama_kv_cache::slot_info & slots);
     void qsa_invalidate();
@@ -100,9 +104,14 @@ private:
     // closed-form metadata for an incremental ubatch on the tracked prefix; false when the scan is needed
     bool set_input_qsa_prefix(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                               ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
-    // the per-cell scan over the whole window
+    // the per-cell scan over the whole window; with tail_idxs it also writes each query's own partial block
+    // (r-1 cells, -1 padded) and, for an I32 bias, the compact visibility limits [n_blocks + n_tokens]
     void set_input_qsa_scan(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                            ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
+                            ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch,
+                            uint32_t ratio, bool blk_bias) const;
+    // closed-form block metadata on the tracked prefix for the compact I32 bias; false when the scan is needed
+    bool qsa_metadata(ggml_tensor * cells, ggml_tensor * positions, ggml_tensor * bias,
+                      ggml_tensor * tails, const llama_ubatch & ubatch, uint32_t ratio) const;
 
     bool incremental_qsa = false;
     bool qsa_recover_pending = false;
@@ -175,6 +184,13 @@ public:
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
+    void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                              ggml_tensor * bias, ggml_tensor * tail_idxs,
+                              const llama_ubatch * ubatch, uint32_t ratio) const;
+    // one sequence, scalar positions in range, no 2d rope extents: the compact visibility rule applies
+    bool qsa_scalar_visibility(const llama_ubatch & ubatch) const;
+    // scalar visibility and the cached cells form a single-sequence prefix with unique positions
+    bool qsa_position_prefix(const llama_ubatch & ubatch) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

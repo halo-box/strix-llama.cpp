@@ -771,6 +771,18 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 #endif
+    // a selected-key op without a mask carries its visibility only in src[5], which the dense kernels ignore:
+    // reaching them would attend to the whole padded cache
+    if (dst->src[5] && !dst->src[3]) {
+        const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * ids = dst->src[5];
+        GGML_ABORT("flash_attn_ext: maskless selected-key attention was not taken by a QSA kernel (%s): q [%lld,%lld,%lld,%lld] %s nb %zu/%zu, "
+                   "k [%lld,%lld,%lld,%lld] %s nb %zu/%zu/%zu, v %s nb %zu/%zu, ids [%lld,%lld,%lld,%lld] nb %zu, src6 %d src7 %d p4 %d dst contiguous %d",
+                   dst->name, (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3], ggml_type_name(q->type), q->nb[1], q->nb[2],
+                   (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3], ggml_type_name(k->type), k->nb[0], k->nb[1], k->nb[2],
+                   ggml_type_name(v->type), v->nb[1], v->nb[2], (long long) ids->ne[0], (long long) ids->ne[1], (long long) ids->ne[2], (long long) ids->ne[3], ids->nb[1],
+                   dst->src[6] != nullptr, dst->src[7] != nullptr, ggml_get_op_params_i32(dst, 4), ggml_is_contiguous(dst));
+    }
+
 
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:

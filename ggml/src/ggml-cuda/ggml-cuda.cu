@@ -66,6 +66,7 @@
 #include "ggml-cuda/ple-conv.cuh"
 #include "ggml-cuda/gdn-conv.cuh"
 #include "ggml-cuda/mmb.cuh"
+#include "ggml-cuda/expand.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -4033,6 +4034,105 @@ static bool ggml_cuda_mean4_ranges_overlap(const ggml_tensor * a, const ggml_ten
     return av <= bv ? bv-av < ggml_nbytes(a) : av-bv < ggml_nbytes(b);
 }
 
+// QSA complete-block selection (qwen4exp_select_complete_blocks): top-512 blocks -> ascending order -> cells with
+// validity -> concat tail, as one kernel. Matches the 20/21-node subgraph the builder emits for 512 blocks / 2051 cells.
+static int ggml_cuda_match_qsa_expand(const ggml_cgraph * graph, int first, ggml_cuda_qsa_expand_args & args) {
+    if (first + 19 >= graph->n_nodes) return 0;
+    if (graph->nodes[first]->op != GGML_OP_CONT || !graph->nodes[first]->src[0] || graph->nodes[first]->src[0]->op != GGML_OP_TOP_K) return 0;
+    static const bool debug = getenv("GGML_QSA_EXPAND_DEBUG") != nullptr;
+    static int debug_left = 3;
+    auto reject = [&](int line) {
+        if (debug && debug_left-- > 0) {
+            fprintf(stderr, "qsa_expand: reject at line %d, node %d (%s)\n", line, first, graph->nodes[first]->name);
+            for (int j = 0; j < 22 && first + j < graph->n_nodes; ++j) {
+                const ggml_tensor * t = graph->nodes[first + j];
+                fprintf(stderr, "  [%2d] %-10s %-6s [%lld,%lld,%lld,%lld] %s\n", j, ggml_op_name(t->op), ggml_type_name(t->type),
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->name);
+            }
+        }
+        return 0;
+    };
+    const ggml_op expected[] = {GGML_OP_CONT, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_ARGSORT,
+        GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
+        GGML_OP_CPY, GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_SCALE, GGML_OP_UNARY,
+        GGML_OP_MUL, GGML_OP_SCALE, GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_CONCAT};
+    const ggml_tensor * n[21];
+    for (int j = 0; j < 19; ++j) {
+        n[j] = graph->nodes[first+j];
+        if (n[j]->op != expected[j]) return reject(__LINE__);
+    }
+    // the tail may arrive through a view (a strip of the tail input) or a reshape of the whole input
+    const bool tail_view = graph->nodes[first+19]->op == GGML_OP_VIEW || graph->nodes[first+19]->op == GGML_OP_RESHAPE;
+    const int node_count = tail_view ? 21 : 20;
+    if (first + node_count > graph->n_nodes) return reject(__LINE__);
+    n[20] = graph->nodes[first+node_count-1];
+    if (n[20]->op != GGML_OP_CONCAT) return reject(__LINE__);
+    // the tail the concat reads: the scheduler may substitute an input copy for the graph's own view node (the tail
+    // indices are a host input), so take the concat's actual source rather than nodes[first+19]
+    n[19] = n[20]->src[1];
+    if (!n[19]) return reject(__LINE__);
+    auto source = [&](int node, int src, int producer) { return n[node]->src[src] == n[producer]; };
+    for (const auto & edge : {std::array<int,3>{1,0,0}, {2,0,0}, {3,0,2}, {4,0,1}, {4,1,3},
+            {5,0,4}, {6,0,5}, {7,1,6}, {8,0,7}, {9,0,8}, {10,0,9}, {12,0,11}, {12,1,5},
+            {13,0,12}, {14,0,13}, {15,0,10}, {15,1,14}, {16,0,15}, {17,0,16}, {18,0,17},
+            {20,0,18}}) {
+        if (!source(edge[0], edge[1], edge[2])) { if (debug) fprintf(stderr, "qsa_expand: edge n[%d]->src[%d] != n[%d] (is %s)\n", edge[0], edge[1], edge[2], n[edge[0]]->src[edge[1]] ? n[edge[0]]->src[edge[1]]->name : "null"); return reject(__LINE__); }
+    }
+    const auto * blocks = n[0]->src[0];
+    const auto * scores = n[11]->src[0];
+    const auto * cells = n[7]->src[0];
+    const auto * tail = n[19];
+    if (!blocks || !scores || !cells || blocks->op != GGML_OP_TOP_K || blocks->src[0] != scores ||
+            blocks->type != GGML_TYPE_I32 || scores->type != GGML_TYPE_F32 || cells->type != GGML_TYPE_I32 ||
+            tail->type != GGML_TYPE_I32 || n[20]->type != GGML_TYPE_I32 ||
+            ggml_get_op_params_i32(n[3],0) != GGML_SORT_ORDER_ASC ||
+            ggml_get_unary_op(n[14]) != GGML_UNARY_OP_STEP || ggml_get_op_params_i32(n[20],0) != 0) return reject(__LINE__);
+    auto shape = [](const ggml_tensor * t, int64_t a, int64_t b, int64_t c=1, int64_t d=1) {
+        return t->ne[0]==a && t->ne[1]==b && t->ne[2]==c && t->ne[3]==d;
+    };
+    const int64_t nq = blocks->ne[1], nb = scores->ne[0];
+    if (nq < 1 || nq > INT_MAX || nb < 512 || nb > 16777216 ||
+            !shape(blocks,512,nq) || !shape(scores,nb,nq) || !shape(cells,4,nb) || !shape(tail,3,nq) ||
+            !shape(n[0],512,nq) || !shape(n[1],1,512,nq) || !shape(n[2],512,nq) ||
+            !shape(n[3],512,nq) || !shape(n[4],1,512,nq) || !shape(n[5],512,nq) ||
+            !shape(n[6],512*nq,1) || !shape(n[7],4,512*nq) || !shape(n[8],4,512,nq) ||
+            !shape(n[9],4,512,nq) || !shape(n[10],4,512,nq) || !shape(n[11],1,nb,nq) ||
+            !shape(n[12],1,512,nq) || !shape(n[13],1,512,nq) || !shape(n[14],1,512,nq) ||
+            !shape(n[15],4,512,nq) || !shape(n[16],4,512,nq) || !shape(n[17],4,512,nq) ||
+            !shape(n[18],2048,nq) || !shape(n[20],2051,nq)) return reject(__LINE__);
+    for (int j : {2,9,10,11,12,13,14,15,16}) if (n[j]->type != GGML_TYPE_F32) return reject(__LINE__);
+    for (int j : {0,1,3,4,5,6,7,8,17,18,19,20}) if (n[j]->type != GGML_TYPE_I32) return reject(__LINE__);
+    for (int j : {10,13,16}) {
+        if (ggml_get_op_params_f32(n[j],0) != 1.0f || ggml_get_op_params_f32(n[j],1) != (j==16 ? -1.0f : 1.0f)) return reject(__LINE__);
+    }
+    for (const auto * t : {blocks,scores,cells,tail,n[20]}) {
+        if (!ggml_is_contiguous(t) || t->nb[0] != 4) return reject(__LINE__);
+    }
+    if (n[1]->view_offs != 0 || n[11]->view_offs != 0 ||
+            n[1]->nb[1] != 4 || n[1]->nb[2] != size_t(512)*4 ||
+            n[11]->nb[1] != 4 || n[11]->nb[2] != size_t(nb)*4) return reject(__LINE__);
+    int indices[21], count=0; ggml_op ops[21];
+    for (int j=0;j<node_count;++j) {
+        if (j==11 || (tail_view && j==19)) continue;
+        indices[count]=first+j;ops[count++]=graph->nodes[first+j]->op;
+    }
+    const int outputs[] = {first+2,first+9,first+17,first+18,first+node_count-1};
+    if (!ggml_can_fuse_subgraph_ext(graph, indices, count, ops, outputs, 5)) return reject(__LINE__);
+    args = {blocks,scores,cells,tail,graph->nodes[first+2],graph->nodes[first+9],graph->nodes[first+17],graph->nodes[first+node_count-1]};
+    return node_count-1;
+}
+
+static bool ggml_cuda_qsa_expand_alias_ok(const ggml_cuda_qsa_expand_args & args) {
+    const ggml_tensor * outputs[] = {args.cast_blocks,args.cast_cells,args.expanded,args.output};
+    for (int i=0;i<4;++i) {
+        for (const auto * input : {args.blocks,args.scores,args.cells,args.tail}) {
+            if (ggml_cuda_mean4_ranges_overlap(input,outputs[i])) return false;
+        }
+        for (int j=0;j<i;++j) if (ggml_cuda_mean4_ranges_overlap(outputs[i],outputs[j])) return false;
+    }
+    return true;
+}
+
 // true when the BF16 WMMA GEMM would take this MUL_MAT / MUL_MAT_ID, so MMQ-based fusions leave it alone
 static bool ggml_cuda_mmb_claims(const ggml_tensor * t) {
     if (!t || !t->src[0] || !t->src[1]) {
@@ -5295,6 +5395,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // qwen4exp complete-block selection: sort the chosen blocks, gather their cells, validity, tail, in one kernel
+    if (node->op == GGML_OP_CONT && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        ggml_cuda_qsa_expand_args args;
+        const int skip = ggml_cuda_match_qsa_expand(cgraph, i, args);
+        if (skip && ggml_cuda_qsa_expand_alias_ok(args)) {
+            ggml_cuda_op_qsa_expand(*cuda_ctx, args);
+            return skip;
+        }
+    }
+
     // qwen4exp indexer key pooling: get_rows of the four member rows per block, summed and scaled in one kernel
     if (node->op == GGML_OP_GET_ROWS && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         ggml_cuda_get_rows_mean4_match match;
@@ -5860,6 +5970,37 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+
+// true when every use of x, and of the views of x present in this split, is a node of this split graph. The scheduler
+// optimizes each split separately and the split graph view shares the full graph's use counts, so a reader that lives
+// in a later split (llama-bench's zero-output prefill ubatches place the final get_rows elsewhere) shows up as a use
+// count the local scan cannot account for; such a tensor must keep its F32 store.
+static bool ggml_cuda_marks_is_view(const ggml_tensor * t) {
+    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+}
+
+static bool ggml_cuda_marks_readers_local(const ggml_cgraph * g, const ggml_tensor * x) {
+    auto uses = [g](const ggml_tensor * t) -> int {
+        const size_t h = ggml_hash_find(&g->visited_hash_set, t);
+        return h == GGML_HASHSET_FULL || !ggml_bitset_get(g->visited_hash_set.used, h) ? -1 : g->use_counts[h];
+    };
+    int expected = uses(x), found = 0;
+    if (expected < 0) return false;
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * t = g->nodes[i];
+        if (t != x && ggml_cuda_marks_is_view(t) && t->view_src == x) {
+            const int u = uses(t);
+            if (u < 0) return false;
+            expected += u;
+        }
+        for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+            const ggml_tensor * src = t->src[s];
+            if (src == x || (ggml_cuda_marks_is_view(src) && src->view_src == x)) ++found;
+        }
+    }
+    return expected == found;
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     {   // marks live for the whole scheduled graph (all splits): clear at the first optimize after a compute, or when the first split repeats
@@ -5887,7 +6028,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                     ok = false;
                 }
-                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(xn);
+                if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, xn)) ggml_cuda_mmb_mark_bf16_only(xn);
             }
             if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
                 std::vector<const ggml_tensor *> blks;
@@ -5925,7 +6066,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (t->op == GGML_OP_MUL || t->op == GGML_OP_ADD) continue;
                         ok = false;
                     }
-                    if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(b);
+                    if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, b)) ggml_cuda_mmb_mark_bf16_only(b);
                 }
             }
             if (ggml_cuda_mmb_res16()) {   // residual stream: the only readers are the fused norm and the next combine
@@ -5955,7 +6096,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (next_combine) continue;
                         ok = false;
                     }
-                    if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(r);
+                    if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, r)) ggml_cuda_mmb_mark_bf16_only(r);
                 }
             }
             for (int i = 0; i < cgraph->n_nodes; ++i) {   // fused stream mix output read only by MMB GEMMs
@@ -5973,7 +6114,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                     ok = false;
                 }
-                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(d);
+                if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, d)) ggml_cuda_mmb_mark_bf16_only(d);
             }
             for (int i = 0; i < cgraph->n_nodes; ++i) {   // the HC gate GEMM feeding only the fused mix keeps its BF16 epilogue
                 const ggml_tensor * t = cgraph->nodes[i];
@@ -5986,7 +6127,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (u->op == GGML_OP_UNARY && ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n, ma) > 0 && ma.gate == t) continue; }
                     ok = false;
                 }
-                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(t);
+                if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, t)) ggml_cuda_mmb_mark_bf16_only(t);
             }
             if (ggml_cuda_mmb_down16()) {   // IQ4_NL routed down GEMM read only by the weighted reduction keeps BF16 outputs
                 for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -6000,7 +6141,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (ex->src[0]->type != GGML_TYPE_IQ4_NL) continue;   // other formats keep F32 expert outputs
                     if (!ggml_node_has_n_uses(cgraph, xi, 1)) continue;
                     if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) continue;
-                    ggml_cuda_mmb_mark_bf16_only(ex);
+                    if (ggml_cuda_marks_readers_local(cgraph, ex)) ggml_cuda_mmb_mark_bf16_only(ex);
                 }
             }
             if (ggml_cuda_mmb_res16()) {   // 16-bit residual stream: producer and consumer on different buffers
@@ -6037,7 +6178,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] == glu && ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t)) continue;
                 ok = false;
             }
-            if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(glu);
+            if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, glu)) ggml_cuda_mmb_mark_bf16_only(glu);
         }
     }
 
@@ -6058,6 +6199,21 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 // otherwise dead after its own norm, so the allocator would hand its buffer to out_xn)
                 params->add_alloc_dep(params->user_data, args.out_res, args.out_xn);
                 i += skip;
+            }
+        }
+        // fused block selection: every input and intermediate output stays allocated through the final output
+        if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                ggml_cuda_qsa_expand_args args;
+                const int skip = ggml_cuda_match_qsa_expand(cgraph, i, args);
+                if (skip) {
+                    for (const auto * input : {args.blocks, args.scores, args.cells, args.tail,
+                            (const ggml_tensor *) args.cast_blocks, (const ggml_tensor *) args.cast_cells, (const ggml_tensor *) args.expanded}) {
+                        auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
+                        params->add_alloc_dep(params->user_data, root, args.output);
+                    }
+                    i += skip;
+                }
             }
         }
         // fused indexer key pooling: the key cache view and the member rows stay allocated through the pooled output
