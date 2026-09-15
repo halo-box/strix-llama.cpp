@@ -85,6 +85,23 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
+    {   // The converted GGUF leaves the nextn/MTP layer's compress ratio at 0, but the MTP sidecar ships
+        // blk.N.indexer.* and the reference runs that layer with the same sparse attention as the trunk, so
+        // inherit the trunk's ratio.
+        if (hparams.n_layer_nextn > 0 && hparams.indexer_head_size > 0) {
+            int32_t trunk_r = 0;
+            for (uint32_t j = 0; j < hparams.n_layer(); ++j) {
+                if (hparams.dsv4_compress_ratios[j] > 0) { trunk_r = hparams.dsv4_compress_ratios[j]; }
+            }
+            for (uint32_t j = hparams.n_layer(); j < hparams.n_layer_all && trunk_r > 0; ++j) {
+                if (hparams.dsv4_compress_ratios[j] == 0) {
+                    hparams.dsv4_compress_ratios[j] = trunk_r;
+                    LLAMA_LOG_INFO("%s: nextn layer %u compress ratio 0 -> %d\n", __func__, j, trunk_r);
+                }
+            }
+        }
+    }
+
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
     hparams.is_ple_impl.reset();
     hparams.ple_n_heads = 0;
@@ -329,8 +346,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
 
-        // the draft attends dense, so the indexer weights are present but never read
-        const int idx_flags = flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+        // the draft runs the trunk's sparse attention when its context carries an indexer cache, so load the
+        // indexer weights when the sidecar ships them (a sidecar without them attends dense)
+        const int idx_flags = flags | TENSOR_NOT_REQUIRED;
         layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", il), { n_embd, hparams.indexer_n_head * idx_dim }, idx_flags);
         layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", il), { n_embd, idx_dim }, idx_flags);
         layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il), { idx_dim }, idx_flags);
@@ -419,9 +437,19 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
-    // The draft block is the only layer in an MTP context and attends dense, so it takes a
-    // plain attention input. create_memory gives that context an attention-only filter.
-    auto        * inp_attn    = build_attn_inp_kv();
+    // The draft block is the only layer in an MTP context. With an indexer the context holds a hybrid-idx
+    // memory (create_memory) and the block runs the trunk's sparse attention; otherwise a plain attention input.
+    llm_graph_input_attn_kv * inp_attn = nullptr;
+    const llama_memory_hybrid_idx_context * mctx_hyb = nullptr;
+    if (hparams.indexer_head_size > 0) {
+        auto * inp_hyb = build_inp_mem_hybrid();
+        const auto * m = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
+        if (m->get_idx() != nullptr && layer.index_q_proj && layer.index_k_proj && layer.index_q_norm && layer.index_k_norm) {
+            mctx_hyb = m;
+            inp_attn = inp_hyb->get_attn();
+        }
+    }
+    if (!inp_attn) { inp_attn = build_attn_inp_kv(); }
 
     // Grouped RMSNorm: each hc stream is normed over its own n_embd, and gamma is applied
     // across the whole [hc*n_embd] row. Norming the full row instead couples the streams
@@ -450,9 +478,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
 
-    // dense attention for the draft: a QSA indexer would need a cache of its own, and one
-    // block spends its time reading weights rather than attending
-    cur = build_layer_attn(inp_attn, nullptr, cur, inp_pos, sections, il);
+    // sparse attention for the draft when its context carries an indexer cache (the sidecar ships the
+    // block's indexer projections and the trunk's compress ratio is inherited at load), else dense
+    cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
     inpL = build_hc_combine(inpL, cur, inject, il);
     cb(inpL, "mtp_hc_attn_post", il);
 

@@ -1,6 +1,16 @@
 #include "llama-memory-hybrid-idx.h"
 #include "prefix.h"
 
+// A qwen4exp MTP context is built with a recurrent filter that matches nothing (the nextn layer is not recurrent) so
+// it can carry an indexer cache for sparse draft attention. Skip the recurrent child there: an empty recurrent cache
+// still refuses partial seq_rm, which would leave a rejected draft in the cache.
+static bool hybrid_idx_no_recr(const llama_memory_recurrent * r) {
+    if (!r) { return true; }
+    for (ggml_tensor * t : r->r_l) { if (t) { return false; } }
+    for (ggml_tensor * t : r->s_l) { if (t) { return false; } }
+    return true;
+}
+
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -134,7 +144,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
         }
 
         // prepare the recurrent batches first
-        if (!get_mem_recr()->prepare(ubatches)) {
+        if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -182,7 +192,7 @@ void llama_memory_hybrid_idx::clear(bool data) {
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
-    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
+    if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
     }
 
@@ -252,7 +262,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    llama_memory_hybrid::state_write(io, seq_id, flags);
+    // note: repeats llama_memory_hybrid::state_write so the recurrent section can be skipped in step with state_read
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        get_mem_attn()->state_write(io, seq_id, flags);
+    }
+    if (!hybrid_idx_no_recr(get_mem_recr())) { get_mem_recr()->state_write(io, seq_id, flags); }
 
     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
@@ -279,7 +293,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         }
 
-        get_mem_recr()->state_read(io, seq_id, flags);
+        if (!hybrid_idx_no_recr(get_mem_recr())) { get_mem_recr()->state_read(io, seq_id, flags); }
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
@@ -307,7 +321,7 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     }
 
     get_mem_attn()->seq_rm(seq_id, -1, -1);
-    get_mem_recr()->seq_rm(seq_id, -1, -1);
+    if (!hybrid_idx_no_recr(get_mem_recr())) { get_mem_recr()->seq_rm(seq_id, -1, -1); }
 
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, -1, -1);
