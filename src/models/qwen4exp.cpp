@@ -952,8 +952,8 @@ public:
         const auto * attn = mctx->get_attn();
         const bool blocks = attn && qwen4exp_use_block_selection(blk_bias, n_stream, ratio, n_kv,
                 params.ubatch, params.cparams, params.hparams, attn->type_k(), attn->type_v());
-        res &= (tail_idxs != nullptr) == blocks;
         const bool scalar = blocks && params.hparams.n_swa == 0 && mctx->qsa_scalar_visibility(params.ubatch);
+        res &= (tail_idxs != nullptr) == scalar;
         res &= compact == scalar;
         res &= maskless == scalar;
         if (tail_idxs) { res &= tail_idxs->ne[1] == params.ubatch.n_tokens/n_stream; }
@@ -1120,7 +1120,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
-        if (blocks) {
+        // complete-block selection lists cells with -1 sentinels (invisible blocks, empty tail slots) that only the
+        // maskless kernel understands; when the visibility is not scalar (2-D image positions in the cache, several
+        // sequences) the attention takes the masked path, whose set_rows would write row -1, so the block-expanded
+        // top-k with the per-block bias is used there instead
+        if (scalar) {
             GGML_ASSERT(hparams.indexer_top_k % r == 0);
             qsa->tail_idxs = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r-1, n_tps, n_stream);
             ggml_set_input(qsa->tail_idxs);
