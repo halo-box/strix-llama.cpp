@@ -177,6 +177,8 @@ set(LLAMA_CONTEXT_TEST_SRC
     llama-context/test-util.cpp
 )
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
+llama_build_and_test(test-qsa-prefix.cpp)
+llama_build_and_test(test-ple-disk.cpp)
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 

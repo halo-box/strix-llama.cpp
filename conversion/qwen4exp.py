@@ -136,9 +136,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # no trunk, so that one becomes the file's mixer; a full model already has the
         # trunk's, and graph_mtp reads it, so this copy is dropped.
         if name.startswith("mtp.hyper_connection_mixer."):
-            if cls.no_mtp or not cls.mtp_only:
+            if cls.no_mtp:
                 return None
-            return (name.replace("mtp.", "model.", 1), item[1])
+            # the draft's mixer is its own (it differs from the trunk's), so it stays
+            # with the draft block as blk.N.nextn.hc_head_* in both file layouts
+            assert cls._original_block_count is not None
+            return (f"model.layers.{cls._original_block_count}.{name[len('mtp.'):]}", item[1])
         return super().filter_tensors(item)
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
