@@ -1,4 +1,5 @@
 #include "server-common.h"
+#include "server-child-protocol.h"
 #include "http.h"
 #include "server-models.h"
 #include "server-context.h"
@@ -42,7 +43,6 @@ extern char **environ;
 #define DEFAULT_STOP_TIMEOUT 10 // seconds
 
 #define CMD_ROUTER_TO_CHILD_EXIT  "cmd_router_to_child:exit"
-#define CMD_CHILD_TO_ROUTER_STATE "cmd_child_to_router:state:" // followed by json string
 
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
@@ -1053,9 +1053,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
             if (stdout_file) {
                 while (fgets(buffer, vec_buf.size(), stdout_file) != nullptr) {
                     std::string str(buffer);
-                    if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_STATE)) {
-                        LOG_DBG("[%5d] %s", port, buffer); // prevent spamming the log
-                        this->handle_child_state(name, str);
+                    std::string state_line(server_child_state_line(str));
+                    if (!state_line.empty()) {
+                        LOG_DBG("[%5d] %s", port, state_line.c_str()); // prevent spamming the log
+                        this->handle_child_state(name, state_line);
                     } else {
                         // forward log
                         LOG("[%5d] %s", port, buffer);
@@ -1066,42 +1067,45 @@ void server_models::load(const std::string & name, const load_options & opts) {
             }
         });
 
-        std::thread stopping_thread([&]() {
-            // thread to monitor explicit stop requests; child crash is signalled via child_proc->stopped
-            auto is_stopping = [this, &name]() {
-                return this->stopping_models.find(name) != this->stopping_models.end();
-            };
-            {
-                std::unique_lock<std::mutex> lk(this->mutex);
-                this->cv_stop.wait(lk, [&]() {
-                    return is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
-                });
-            }
-            // child crashed or finished on its own, skip graceful shutdown sequence
-            if (child_proc->stopped.load(std::memory_order_acquire)) {
-                return;
-            }
-            SRV_INF("stopping model instance name=%s\n", name.c_str());
-            fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
-            fflush(stdin_file);
-            int64_t start_time = ggml_time_ms();
-            while (true) {
-                std::unique_lock<std::mutex> lk(this->mutex);
-                if (!is_stopping() || child_proc->stopped.load(std::memory_order_acquire)) {
+        std::thread stopping_thread;
+        if (child_mode != SERVER_CHILD_MODE_DOWNLOAD) {
+            stopping_thread = std::thread([&]() {
+                // thread to monitor explicit stop requests; child crash is signalled via child_proc->stopped
+                auto is_stopping = [this, &name]() {
+                    return this->stopping_models.find(name) != this->stopping_models.end();
+                };
+                {
+                    std::unique_lock<std::mutex> lk(this->mutex);
+                    this->cv_stop.wait(lk, [&]() {
+                        return is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
+                    });
+                }
+                // child crashed or finished on its own, skip graceful shutdown sequence
+                if (child_proc->stopped.load(std::memory_order_acquire)) {
                     return;
                 }
-                int64_t elapsed = ggml_time_ms() - start_time;
-                if (elapsed >= stop_timeout * 1000) {
-                    lk.unlock();
-                    SRV_WRN("force-killing model instance name=%s after %d seconds timeout\n", name.c_str(), stop_timeout);
-                    child_proc->terminate();
-                    return;
+                SRV_INF("stopping model instance name=%s\n", name.c_str());
+                fprintf(stdin_file, "%s\n", CMD_ROUTER_TO_CHILD_EXIT);
+                fflush(stdin_file);
+                int64_t start_time = ggml_time_ms();
+                while (true) {
+                    std::unique_lock<std::mutex> lk(this->mutex);
+                    if (!is_stopping() || child_proc->stopped.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    int64_t elapsed = ggml_time_ms() - start_time;
+                    if (elapsed >= stop_timeout * 1000) {
+                        lk.unlock();
+                        SRV_WRN("force-killing model instance name=%s after %d seconds timeout\n", name.c_str(), stop_timeout);
+                        child_proc->terminate();
+                        return;
+                    }
+                    this->cv_stop.wait_for(lk, std::chrono::seconds(1), [&]() {
+                        return !is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
+                    });
                 }
-                this->cv_stop.wait_for(lk, std::chrono::seconds(1), [&]() {
-                    return !is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
-                });
-            }
-        });
+            });
+        }
 
         // we reach here when the child process exits (stdout EOF)
         // note: we cannot join() prior to this point because it will close stdin_file
@@ -1110,7 +1114,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
 
         child_proc->stopped.store(true, std::memory_order_release);
-        {
+        if (child_mode == SERVER_CHILD_MODE_DOWNLOAD) {
+            // Download children never enter stopping_models. Avoid the model lock after DOWNLOADED so remove() can join.
+            cv_stop.notify_all();
+        } else {
             std::lock_guard<std::mutex> lk(this->mutex);
             stopping_models.erase(name);
             cv_stop.notify_all();
@@ -1525,7 +1532,7 @@ void server_models::handle_child_state(const std::string & name, const std::stri
     json payload;
 
     try {
-        json data = json::parse(raw_input.substr(strlen(CMD_CHILD_TO_ROUTER_STATE)));
+        json data = json::parse(raw_input.substr(SERVER_CHILD_STATE_PREFIX.size()));
         state = server_state_from_str(json_value(data, "state", std::string()));
         payload = json_value(data, "payload", json{});
     } catch (const std::exception & e) {
@@ -1546,11 +1553,11 @@ void server_models::handle_child_state(const std::string & name, const std::stri
                     }
                 };
                 if (result == "download_finished") {
+                    request_exit();
                     update_download_progress(name, {}, true, true);
-                    request_exit();
                 } else if (result == "download_failed") {
-                    update_download_progress(name, {}, true, false);
                     request_exit();
+                    update_download_progress(name, {}, true, false);
                 } else if (!url.empty()) {
                     common_download_progress p;
                     p.url        = url;
@@ -1716,7 +1723,7 @@ void server_child::notify_to_router(const std::string & state, const json & payl
     std::lock_guard<std::mutex> lk(mtx_stdout);
     common_log_pause(common_log_main());
     fflush(stdout);
-    fprintf(stdout, "%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
+    fprintf(stdout, "%s%s\n", SERVER_CHILD_STATE_PREFIX.data(), safe_json_to_str(data).c_str());
     fflush(stdout);
     common_log_resume(common_log_main());
 }
