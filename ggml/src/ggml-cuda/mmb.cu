@@ -219,12 +219,16 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 template <int BM, int BN, int WTM, int WTN, int WTYPE>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, const int K, const int T) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    NO_DEVICE_CODE; // WMMA kernels are RDNA3-only; the host gate keeps other devices off this path
+#else
     __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
     __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
     const int m0 = blockIdx.x * BM, t0 = blockIdx.y * BN;
     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
         [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
+#endif
 }
 
 #if defined(__HIP_PLATFORM_AMD__)
@@ -242,6 +246,10 @@ __global__ void __launch_bounds__(MMB_NT, 2)
 hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Lo, const uint16_t * __restrict__ Xn, float * __restrict__ Out,
         uint16_t * __restrict__ OutH, const bool store_f32,
         const int E, const int K, const int T, const float scale, const float bias) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    // WMMA (wave32, 16x16x16 bf16/f16 into f32) exists only on RDNA3; the host gate keeps other devices off this path
+    NO_DEVICE_CODE;
+#else
     constexpr int CH = 32, BN = 128, BM = HC * CH;
     static_assert(BM <= MMB_NT, "one A row per thread");
     __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
@@ -326,6 +334,7 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
             if (OutH) OutH[(size_t)t * E + ch] = mmb_f2bf(o);
         }
     }
+#endif
 }
 
 template <int BM, int BN, int WTM, int WTN, int WTYPE = 0>
@@ -334,6 +343,9 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
         uint16_t * __restrict__ Dh, const bool store_f32,
         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
         const uint32_t * __restrict__ desc, const int M, const int K) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    NO_DEVICE_CODE; // WMMA kernels are RDNA3-only; the host gate keeps other devices off this path
+#else
     __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
     __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
     const uint32_t dsc = desc[blockIdx.y];
@@ -344,6 +356,7 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
+#endif
 }
 
 template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, typename XRowFn, typename DRowFn>
@@ -473,6 +486,9 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
         float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
         const uint32_t * __restrict__ desc, const int M, const int K) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    NO_DEVICE_CODE; // WMMA kernels are RDNA3-only; the host gate keeps other devices off this path
+#else
     __shared__ __align__(16) uint16_t Ag[BM * MMB_LDS_STRIDE];
     __shared__ __align__(16) uint16_t Au[BM * MMB_LDS_STRIDE];
     __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
@@ -484,6 +500,7 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
     const size_t wrow_bytes = mmb_row_bytes<WTYPE>(K);
     mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs);
+#endif
 }
 
 // F32 x F32 -> F32 GEMM with F32-equivalent precision on WMMA: each operand is split into F16 hi + F16 lo at tile load and
@@ -494,6 +511,10 @@ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo
 template <int BM, int BN, int WTM, int WTN, bool TWO>
 __global__ void __launch_bounds__(MMB_NT, 2)
 mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, float * __restrict__ D, const int M, const int K, const int T) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    // WMMA (wave32, 16x16x16 bf16/f16 into f32) exists only on RDNA3; the host gate keeps other devices off this path
+    NO_DEVICE_CODE;
+#else
     constexpr int BKs = 32, LS = BKs + 8, WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
     __shared__ __align__(16) uint16_t Ah[BM * LS], Al[BM * LS], Bh[BN * LS], Bl[BN * LS];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, wm = wave % WAVES_M, wn = wave / WAVES_M;
@@ -548,6 +569,7 @@ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, 
         for (int j = 0; j < TN; ++j)
 #pragma unroll
             for (int e = 0; e < 8; ++e) { const int t = t0 + wn * WTN + j * 16 + 2 * e + cn; if (t < T) D[(size_t) t * M + m] = acc[i][j][e]; } }
+#endif
 }
 
 // two tile classes: experts with >= thresh rows get BN_BIG-row tiles, the rest BN_SMALL-row tiles (fewer wasted rows on tiny experts)
@@ -657,7 +679,11 @@ static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
     auto it = g_mmb_shadow.find(w->data); return it == g_mmb_shadow.end() ? nullptr : it->second;
 }
 
-bool mmb_enabled() { return true; }
+// the BF16 WMMA kernels are RDNA3.5 (gfx1151) work: other devices keep the MMQ/MMVQ paths
+bool mmb_enabled() {
+    const int id = ggml_cuda_get_device();
+    return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[id].cc);
+}
 int  mmb_min_t()   { return 512; }
 int  mmb_f32split_mode(){ return 2; }
 bool mmb_f32split() { return true; }
@@ -696,8 +722,8 @@ void ggml_cuda_mmb_release_all() {
     // the shadow weights are raw cudaMalloc, keyed by data pointer and held for the life of the
     // process. A model has finitely many weights so this never mattered, but a long-lived process
     // that sees many distinct tensors (test-backend-ops) keeps every one of them.
-    for (auto & e : g_mmb_shadow)      { if (e.second) cudaFree(e.second); }
-    for (auto & e : g_mmb_shadow_pair) { if (e.second) cudaFree(e.second); }
+    for (auto & e : g_mmb_shadow)      { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
+    for (auto & e : g_mmb_shadow_pair) { if (e.second) CUDA_CHECK(cudaFree(e.second)); }
     g_mmb_shadow.clear();
     g_mmb_shadow_pair.clear();
     g_mmb_shadow_bytes = 0;
