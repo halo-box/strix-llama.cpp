@@ -59,6 +59,10 @@ struct llama_memory_context_i {
     // return false on failure
     virtual bool apply() = 0;
 
+    // publish or discard state prepared by apply()
+    virtual void commit() {}
+    virtual void rollback() {}
+
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
 
@@ -117,6 +121,7 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+    virtual void set_graph_workspace_size(size_t size) { GGML_UNUSED(size); }
 
     //
     // state write/read
