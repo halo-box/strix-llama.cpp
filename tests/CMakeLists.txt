@@ -215,6 +215,34 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -a deepseek41 -s 1
     )
 
+    find_package(Python3 COMPONENTS Interpreter)
+    if (Python3_Interpreter_FOUND)
+        llama_test_cmd(
+            ${Python3_EXECUTABLE}
+            NAME test-deepseek41-trace
+            LABEL main
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-deepseek41-trace.py
+        )
+        if(BUILD_SHARED_LIBS AND LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+            set_property(
+                TEST test-deepseek41-trace
+                APPEND PROPERTY ENVIRONMENT
+                    "DSV41_NATIVE_TRACE_BINARY=$<TARGET_FILE:llama-deepseek-v41-trace>"
+                    "DSV41_NATIVE_MANIFEST_BINARY=$<TARGET_FILE:test-deepseek41-trace-manifest>"
+                    "DSV41_NATIVE_INJECT_LIBRARY=$<TARGET_FILE:test-deepseek41-trace-injected>")
+            if(LLAMA_DEEPSEEK_V41_NATIVE_CONTAINMENT_TESTS)
+                if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+                    message(FATAL_ERROR "Native DeepSeek V4.1 containment tests require Linux")
+                endif()
+                set_property(
+                    TEST test-deepseek41-trace
+                    APPEND PROPERTY ENVIRONMENT
+                        "DSV41_NATIVE_CONTAINMENT_HELPER=$<TARGET_FILE:llama-deepseek-v41-containment-helper>")
+            endif()
+        endif()
+    endif()
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
