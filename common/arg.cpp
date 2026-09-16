@@ -2809,6 +2809,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NGRAM_DIRECT_IO"));
     add_opt(common_arg(
+        {"--expert-cache-slots"}, "N",
+        "DeepSeek V4.1 routed experts resident per layer; requires --expert-cache-mib",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_SLOTS"));
+    add_opt(common_arg(
+        {"--expert-cache-mib"}, "MiB",
+        "aggregate DeepSeek V4.1 fixed expert slot-tensor capacity; requires --expert-cache-slots",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache_mib = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_MIB"));
+    add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {

@@ -9,6 +9,8 @@
 #include <map>
 
 class llama_memory_hybrid_idx_context;
+class llama_dsv41_engram_runtime;
+struct llama_dsv41_expert_runtime;
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
 static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
@@ -1309,6 +1311,31 @@ struct llama_model_deepseek4 : public llama_model_base {
     struct graph_mtp : public graph {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_deepseek41 : public llama_model_deepseek4 {
+    llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
+
+    struct graph : public llama_model_deepseek4::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    struct engram_model;
+    std::shared_ptr<engram_model> engram;
+    std::shared_ptr<llama_dsv41_expert_runtime> experts;
+
+    std::unique_ptr<llama_dsv41_engram_runtime> create_memory_engram_runtime(size_t max_tokens) const;
+
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+    bool requires_synchronous_graph() const override;
+    std::string consume_runtime_error() const override;
+    void release_runtime_work() const override;
+    void release_runtime_work_after_sync(ggml_backend_sched_t sched) const override;
+    void acquire_runtime_context() const override;
+    void release_runtime_context() const override;
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

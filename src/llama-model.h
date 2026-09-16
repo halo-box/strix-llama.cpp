@@ -564,6 +564,10 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    struct ggml_tensor * engram_kv     = nullptr;
+    struct ggml_tensor * engram_q_norm = nullptr;
+    struct ggml_tensor * engram_k_norm = nullptr;
+
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;
     struct ggml_tensor * index_k_proj = nullptr;
@@ -748,6 +752,8 @@ struct llama_model {
     ggml_backend_dev_t dev_output() const;
 
     ggml_backend_buffer_type_t select_buft(int il) const;
+    ggml_backend_buffer_type_t select_moe_buft(
+            int il, enum ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2) const;
 
     bool has_tensor_overrides() const;
 
@@ -766,6 +772,13 @@ struct llama_model {
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;
     virtual bool load_tensors(llama_model_loader & ml) = 0; // returns false if cancelled by progress_callback
+
+    virtual bool requires_synchronous_graph() const { return false; }
+    virtual std::string consume_runtime_error() const { return {}; }
+    virtual void release_runtime_work() const {}
+    virtual void release_runtime_work_after_sync(ggml_backend_sched_t) const { release_runtime_work(); }
+    virtual void acquire_runtime_context() const {}
+    virtual void release_runtime_context() const {}
 
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
