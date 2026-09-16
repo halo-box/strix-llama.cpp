@@ -659,8 +659,18 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
-            LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
-                __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
+            // A hybrid model that filters out every recurrent layer leaves this cache with no tensors.
+            // The hybrid then skips seq_rm on it, so its positions are never rewound and a rejected
+            // speculative draft trips this on every step - with no state to be inconsistent about.
+            bool has_state = false;
+            for (ggml_tensor * t : r_l) { if (t) { has_state = true; break; } }
+            if (!has_state) {
+                for (ggml_tensor * t : s_l) { if (t) { has_state = true; break; } }
+            }
+            if (has_state) {
+                LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
+                    __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
+            }
         }
         cell.pos = last_pos;
         cell.seq_id.clear();

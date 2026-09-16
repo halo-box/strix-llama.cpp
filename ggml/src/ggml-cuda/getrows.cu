@@ -101,6 +101,38 @@ static __global__ void k_get_rows_float(
     }
 }
 
+template<typename src0_t, typename dst_t, int cols, int values_per_lane = 1>
+static __global__ void k_get_rows_float_packed(
+        const src0_t * src0, const int32_t * src1, dst_t * dst,
+        const int64_t ne00, const int64_t ne10, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    constexpr int rows_per_block = CUDA_GET_ROWS_BLOCK_SIZE / cols;
+    const int64_t row = int64_t(blockIdx.x) * rows_per_block + threadIdx.x / cols;
+    const int col = threadIdx.x % cols;
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    if (row >= ne10 || col >= ne00) {
+        return;
+    }
+
+    for (int64_t z = blockIdx.y; z < ne11 * int64_t(ne12_fdv.z); z += gridDim.y) {
+        const uint2 dm = fast_div_modulo(uint32_t(z), ne12_fdv);
+        const int32_t index = src1[row * s10 + dm.x * s11 + dm.y * s12];
+        const src0_t * src_row = (const src0_t *) ((const char *) src0 + index * nb01 + dm.x * nb02 + dm.y * nb03);
+        dst_t * dst_row = dst + row * s1 + dm.x * s2 + dm.y * s3;
+#pragma unroll
+        for (int v = 0; v < values_per_lane; ++v) {
+            const int column = col + v * cols;
+            if (column < ne00) {
+                dst_row[column] = ggml_cuda_cast<dst_t>(src_row[column]);
+            }
+        }
+    }
+}
+
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -253,6 +285,40 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    if constexpr (std::is_same<dst_t, float>::value &&
+                  (std::is_same<src0_t, float>::value || std::is_same<src0_t, half>::value)) {
+        if (ne00 > 0 && ne00 <= 128 && ne10 >= 128 &&
+                GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            auto launch = [&](auto width, auto elements) {
+                constexpr int cols = decltype(width)::value;
+                constexpr int values = decltype(elements)::value;
+                constexpr int rows_per_block = CUDA_GET_ROWS_BLOCK_SIZE / cols;
+                const dim3 grid((ne10 + rows_per_block - 1) / rows_per_block, MIN(ne11 * ne12, UINT16_MAX), 1);
+                const ggml_cuda_kernel_launch_params params{grid, block_dims, 0, stream};
+                ggml_cuda_kernel_launch(k_get_rows_float_packed<src0_t, dst_t, cols, values>, params,
+                    src0_d, src1_d, dst_d, ne00, ne10, ne11, ne12_fdv,
+                    s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+            };
+            constexpr auto one = std::integral_constant<int, 1>{};
+            if constexpr (std::is_same<src0_t, half>::value) {
+                if (ne00 > 32) {
+                    if (ne00 <= 64) launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 2>{});
+                    else            launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 4>{});
+                    return;
+                }
+            }
+            if      (ne00 <=  1) launch(std::integral_constant<int,   1>{}, one);
+            else if (ne00 <=  2) launch(std::integral_constant<int,   2>{}, one);
+            else if (ne00 <=  4) launch(std::integral_constant<int,   4>{}, one);
+            else if (ne00 <=  8) launch(std::integral_constant<int,   8>{}, one);
+            else if (ne00 <= 16) launch(std::integral_constant<int,  16>{}, one);
+            else if (ne00 <= 32) launch(std::integral_constant<int,  32>{}, one);
+            else if (ne00 <= 64) launch(std::integral_constant<int,  64>{}, one);
+            else                launch(std::integral_constant<int, 128>{}, one);
+            return;
+        }
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
@@ -487,4 +553,44 @@ void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const dim3 block_nums(block_num_x, MIN(ne1, (int64_t)UINT16_MAX), 1);
 
     k_get_rows_back_float<<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne10, ne1);
+}
+
+// QSA indexer key pooling: mean of the 4 member rows of every block, 128-wide rows, one thread per column.
+// Fuses get_rows -> reshape -> 4 x (view, cont, add) -> scale on the same summation order as the graph.
+template<typename T>
+static __global__ void get_rows_mean4_128(
+        const char * src, const char * ids, float * dst,
+        size_t src_row_stride, size_t src_stream_stride, size_t ids_stream_stride,
+        float scale, float bias) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t group = blockIdx.x;
+    const int64_t stream = blockIdx.y;
+    const int col = threadIdx.x;
+    const int32_t * selected = (const int32_t *) (ids + stream*ids_stream_stride) + 4*group;
+    const char * input = src + stream*src_stream_stride;
+    float sum = (float) ((const T *) (input + selected[0]*src_row_stride))[col];
+#pragma unroll
+    for (int i = 1; i < 4; ++i) {
+        sum += (float) ((const T *) (input + selected[i]*src_row_stride))[col];
+    }
+    dst[(stream*gridDim.x + group)*128 + col] = scale*sum + bias;
+}
+
+void ggml_cuda_op_get_rows_mean4(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src, const ggml_tensor * ids, ggml_tensor * dst) {
+    const dim3 grid(dst->ne[1], dst->ne[2], 1);
+    const ggml_cuda_kernel_launch_params params(grid, dim3(128, 1, 1), 0, ctx.stream());
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const float bias = ggml_get_op_params_f32(dst, 1);
+    if (src->type == GGML_TYPE_F16) {
+        ggml_cuda_kernel_launch(get_rows_mean4_128<half>, params,
+                (const char *) src->data, (const char *) ids->data, (float *) dst->data,
+                src->nb[1], src->nb[2], ids->nb[1], scale, bias);
+    } else {
+        GGML_ASSERT(src->type == GGML_TYPE_F32);
+        ggml_cuda_kernel_launch(get_rows_mean4_128<float>, params,
+                (const char *) src->data, (const char *) ids->data, (float *) dst->data,
+                src->nb[1], src->nb[2], ids->nb[1], scale, bias);
+    }
 }
