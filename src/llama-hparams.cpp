@@ -1,5 +1,6 @@
 #include "llama-hparams.h"
 
+#include "llama-dsv41.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -45,6 +46,28 @@ bool llama_hparams::is_swa_any() const {
     }
 
     return false;
+}
+
+int32_t llama_hparams::dsv41_kv_source(uint32_t il) const {
+    if (il >= n_layer()) {
+        GGML_ABORT("fatal error");
+    }
+    return dsv41_kv_source_layer[il];
+}
+
+int32_t llama_hparams::dsv41_index_source(uint32_t il) const {
+    if (il >= n_layer()) {
+        GGML_ABORT("fatal error");
+    }
+    return dsv41_index_source_layer[il];
+}
+
+bool llama_hparams::dsv41_is_kv_source(uint32_t il) const {
+    return dsv41_kv_source(il) == (int32_t) il;
+}
+
+bool llama_hparams::dsv41_is_index_source(uint32_t il) const {
+    return dsv41_index_source(il) == (int32_t) il;
 }
 
 uint32_t llama_hparams::n_head(uint32_t il) const {
