@@ -934,7 +934,7 @@ public:
 
         const int64_t n_kv     = idx->get_n_kv();
         const int64_t n_stream = mctx->get_n_stream();
-        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+        const int64_t n_blocks = ((int64_t) mctx->qsa_n_kv_window() + ratio - 1)/ratio;
 
         bool res = true;
 
@@ -1076,7 +1076,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     GGML_ASSERT(r > 0);
 
-    const int64_t n_blocks = (n_kv + r - 1)/r;
+    // blocks are keyed by position, which can run ahead of the occupied cells (see qsa_n_kv_window)
+    const int64_t n_blocks = ((int64_t) mctx_hyb->qsa_n_kv_window() + r - 1)/r;
 
     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
     const int64_t n_stream = mctx_hyb->get_n_stream();

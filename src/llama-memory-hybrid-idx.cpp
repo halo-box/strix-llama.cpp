@@ -957,6 +957,18 @@ bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & u
     return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),get_idx()->get_n_kv(),seq);
 }
 
+uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
+    const uint32_t n_kv = get_idx() ? get_idx()->get_n_kv() : 0;
+    if (!mem || !mem->get_mem_idx()) { return n_kv; }
+    llama_pos pos_max = -1;
+    for (llama_seq_id s = 0; s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
+        pos_max = std::max(pos_max, mem->get_mem_idx()->get_cells(s).seq_pos_max(s));
+    }
+    if (pos_max < 0) { return n_kv; }
+    const uint32_t window = ((uint32_t) pos_max + 1 + 255) / 256 * 256;
+    return std::max(n_kv, window);
+}
+
 bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch) const {
     if (qsa_prefix_matches(ubatch)) { return true; }
     if (get_n_stream()!=1 || !get_idx() || !ubatch.token || !ubatch.pos || !ubatch.n_tokens ||

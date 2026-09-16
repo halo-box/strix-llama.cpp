@@ -172,8 +172,12 @@ public:
 
     bool qsa_prefix_matches(const llama_ubatch & u) const { return mem && mem->qsa_prefix_matches(u); }
     bool qsa_fast(int il, const llama_ubatch & u) const { return mem && mem->qsa_fast(il, u); }
+    // cells the block metadata must cover: the KV view is sized by occupied cells, but a cache whose positions
+    // run ahead of its cells (an MTP draft never receives the image cells an M-RoPE image pins to one position)
+    // has blocks past that view. Never below get_n_kv(), padded like it so graph reuse keeps its cadence.
+    uint32_t qsa_n_kv_window() const;
     ggml_tensor * qsa_cache(ggml_context * ctx, int il) const {
-        return mem ? mem->qsa_cache(ctx, il, (get_idx()->get_n_kv()+3)/4) : nullptr;
+        return mem ? mem->qsa_cache(ctx, il, (qsa_n_kv_window()+3)/4) : nullptr;
     }
     void qsa_fill_updates(ggml_tensor * members, ggml_tensor * pos, ggml_tensor * rows) const { mem->qsa_fill_updates(members, pos, rows); }
     void qsa_commit(int il) const { mem->qsa_commit(il); }
