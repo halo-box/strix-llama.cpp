@@ -203,10 +203,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-deepseek41-expert.cpp)
     llama_build_and_test(test-expert-store.cpp)
     llama_build_and_test(test-deepseek41-memory.cpp)
-    # test-deepseek41-runtime.cpp needs tools/deepseek-v41-trace/trace-components.h
-    # to validate the trace tensor naming contract; that header lands with the
-    # trace harness, so its registration here is deferred to that layer.
+    llama_build_and_test(test-deepseek41-runtime.cpp)
     llama_build_and_test(test-engram.cpp)
+    llama_build_and_test(test-server-child-protocol.cpp)
+    target_include_directories(test-server-child-protocol PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build(test-llama-archs.cpp)
     llama_test(
         test-llama-archs

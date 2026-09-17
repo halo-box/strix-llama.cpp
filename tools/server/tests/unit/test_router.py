@@ -504,6 +504,11 @@ MODEL_DOWNLOAD_ID = "ggml-org/test-model-router-download:F16"
 MODEL_DOWNLOAD_TIMEOUT = 30
 
 
+@pytest.fixture
+def private_router_download_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLAMA_CACHE", str(tmp_path / "llama-cache"))
+
+
 def _listen_sse(
     server: ServerProcess, collected: list, stop: threading.Event, ready: threading.Event | None = None
 ):
@@ -539,7 +544,7 @@ def _wait_for_sse_event(collected: list, event_type: str, model: str, timeout: i
     return False
 
 
-def test_router_download_model():
+def test_router_download_model(private_router_download_cache):
     """Case 1: download a model, verify SSE events and GET /models."""
     global server
     server.start()
@@ -582,7 +587,7 @@ def test_router_download_model():
     assert MODEL_DOWNLOAD_ID in ids, f"{MODEL_DOWNLOAD_ID} not found in /models after download"
 
 
-def test_router_delete_model():
+def test_router_delete_model(private_router_download_cache):
     """Case 2: delete the downloaded model, verify it disappears from GET /models."""
     global server
     server.start()
