@@ -1743,7 +1743,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
         // posix_fadvise only, so a wrong prediction costs readahead and nothing else
         extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
-        if (batch_inp.token && batch_inp.n_tokens >= 4096) { qwen4exp_ple_prefetch(model, batch_inp.token, batch_inp.n_tokens); }
+        if (model.arch == LLM_ARCH_QWEN4EXP && batch_inp.token && batch_inp.n_tokens >= 4096) {
+            qwen4exp_ple_prefetch(model, batch_inp.token, batch_inp.n_tokens);
+        }
     }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
