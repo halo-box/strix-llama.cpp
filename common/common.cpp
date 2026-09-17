@@ -1697,6 +1697,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.ple_direct_io   = params.ple_direct_io;
     mparams.ple_io_threads  = params.ple_io_threads;
     mparams.ple_cache_mb    = params.ple_cache_mb;
+    mparams.expert_cache_slots = params.expert_cache_slots;
+    mparams.expert_cache_bytes = params.expert_cache_mib > 0 ? (size_t) params.expert_cache_mib << 20 : 0;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
