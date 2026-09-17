@@ -5,7 +5,9 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
+#include <vector>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
@@ -322,9 +324,57 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+// LEVER (2026-09-10, results/2026-09-10-lever-mmqrouted/): runtime override of the per-type
+//     MMVQ/MMQ crossover on RDNA3.5, so that one binary can serve both arms of a comparison.
+// Format: GGML_MMVQ_THR="<ggml type id>:<max ne11 kept on MMVQ>[,...]", e.g. "18:6" for IQ3_XXS.
+// Unset (the default) changes nothing; a value of 0 for a type also means "no override".
+// The table below is tuned per type and was measured on a tree that predates the MMVQ
+//     rows-per-block work, hence this switch.
+static const int * ggml_cuda_mmvq_thr_override() {
+    static const std::vector<int> tbl = []() {
+        std::vector<int> t(GGML_TYPE_COUNT, 0);
+        const char * s = getenv("GGML_MMVQ_THR");
+        if (s == nullptr) {
+            return t;
+        }
+        const char * p = s;
+        while (*p) {
+            char * end = nullptr;
+            const long ty = strtol(p, &end, 10);
+            if (end == p || *end != ':') {
+                break;
+            }
+            p = end + 1;
+            const long thr = strtol(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            p = end;
+            if (ty >= 0 && ty < GGML_TYPE_COUNT && thr > 0) {
+                t[ty] = (int) thr;
+            }
+            if (*p == ',') {
+                ++p;
+            } else {
+                break;
+            }
+        }
+        return t;
+    }();
+    return tbl.data();
+}
+
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_t ne11, bool exact_batch) {
     if (!ggml_is_quantized(type)) {
         return false;
+    }
+    // Below one MMQ tile there is no tiled kernel to fill. The smallest MMQ tile on RDNA3.5 is
+    //     I = 64 rows, so ne01 = 48 (the GDN alpha/beta projections) launches a single block and
+    //     leaves 39 of the 40 CUs idle, while MMVQ launches a block per row (or row pair). The
+    //     per-type thresholds below are all crossovers measured at m >= 5120, where MMQ fills the
+    //     device; they do not describe this regime.
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && ne01 < 64 && ne11 <= MMVQ_MAX_BATCH_SIZE) {
+        return true;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
@@ -369,6 +419,165 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q6_K:
                 return ne11 <= 1;
             default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        // Tuned on gfx1151 (Strix Halo) by timing both paths at the same ne11 with a temporary
+        //     dispatch override, on real model shapes. MMVQ re-reads the src1 column and redoes
+        //     the dot per output column while the weight unpack is hoisted out of the ncols_dst
+        //     loop, so its cost is A + ncols_dst*D with D dominated by the type's vec_dot. MMQ's
+        //     smallest instantiated tile here is J = 16, so one column tile covers the whole
+        //     ne11 = 1..16 range and MMQ's cost is flat across it (measured within 5 %). The
+        //     crossover is therefore a per-type constant, and it does not move with m or k once
+        //     MMQ fills a wave (ceil(m/64) >= 80): Q5_K measures 2.34 / 2.33 / 2.31 / 2.35 at
+        //     m = 5120 (k 6144), 5120 (k 17408), 17408 and 248320, i.e. from 1.0 to 48.5 waves.
+        if (exact_batch) {
+            // GGML_HINT_EXACT_BATCH promises that mul_mat over n columns equals n single-column
+            // mul_mats exactly. A per-type threshold inside [1, MMVQ_MAX_BATCH_SIZE] would send the
+            // batch to MMQ while the singles stay on MMVQ, and the two accumulate differently.
+            // Same reasoning as the BF16/MMVF case in ggml-cuda.cu.
+            return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+        // LEVER: per-type crossover override, off unless GGML_MMVQ_THR is set. See above.
+        {
+            const int thr_env = ggml_cuda_mmvq_thr_override()[type];
+            if (thr_env > 0) {
+                return ne11 <= thr_env;
+            }
+        }
+        // 2026-09-11, results/2026-09-10-crossover-retune/: the whole table below was re-measured.
+        //     Instrument: GGML_MMVQ_THR above, so ONE binary served both arms and the only
+        //     difference between them was the environment. Two arms (every type forced to MMVQ,
+        //     every type forced to MMQ), 4-6 position-balanced arms per side, at the (ne00 x ne01)
+        //     pairs each type actually takes in Qwen3.8-27B-UD-IQ4_XS.gguf. An f16 anchor moved
+        //     +0.28 % between arms and ne11 = 1, which no threshold can reach, is null for every
+        //     type, so the arms are comparable.
+        //
+        //     What is recorded per type is the COST FUNCTION, not just the crossover, because a
+        //     crossover is not durable -- it moves whenever either kernel changes, which is how
+        //     this table went stale twice. MMVQ costs A + ne11*D and MMQ costs a flat Q (measured:
+        //     Q varies 0.4-2.6 % over ne11 = 2..8, so "flat" is now checked rather than assumed),
+        //     giving crossover = floor((Q - A)/D). Units are us/run at ne00 = 5120, ne01 = 17408.
+        //
+        //             A       D       Q     (Q-A)/D   bound   previous
+        //     IQ2_S    82.3   34.3   506.8   12.4       8       8   (cap, not a crossover)
+        //     IQ3_XXS 112.3   34.0   406.7    8.7       8       6
+        //     IQ4_XS  156.1   26.9   410.3    9.5       8       6
+        //     IQ3_S   135.2   34.2   428.5    8.6       8       6
+        //     Q8_0    383.8   19.3   498.6    6.0       5       4
+        //     Q6_K    250.7   80.1   635.3    4.8       4       3
+        //     Q3_K    246.1   71.5   497.0    3.5       3       3   RE-MEASURED, UNCHANGED
+        //     Q4_K    119.3  109.7   411.1    2.7       2       2   RE-MEASURED, UNCHANGED
+        //     Q5_K    163.1  109.0   433.4    2.5       2       2   RE-MEASURED, UNCHANGED
+        //
+        //     The k-quants keeping 2-3 is the result, not an omission. Their per-column slope D is
+        //     107-110 us against 27-34 for the IQ types at the same shape, a factor of 3-4, which
+        //     is the "k-quants are expensive to decode and mvq redoes that per column" comment
+        //     above holding up under measurement. Q5_K was additionally measured at output.weight
+        //     (5120 x 248320, 834 MiB, the largest matmul in the file and live at ne11 = 6 during
+        //     speculative verification): D = 1069 us/col there and the crossover is 2.24, i.e. the
+        //     one shape that could have overturned the bound of 2 confirms it hardest.
+        //
+        //     Q4_K, Q5_K and Q6_K were re-measured a second time on top of 6cb4ed016 (the J = 16
+        //     MMQ prefetch, which makes the MMQ side of exactly these three cheaper). Same bounds:
+        //     2, 2 and 4. Q6_K's crossover moves 4.80 -> 4.58, still clear of 4.
+        //
+        //     The eleven types no local GGUF contains were swept afterwards at the generic 27B
+        //     shapes (5120x17408, 17408x5120, 5120x6144), same instrument and design. Their
+        //     bounds below are therefore measured at REPRESENTATIVE shapes, not at shapes from a
+        //     real file, and unlike the nine above they have no end-to-end confirmation, because
+        //     there is no model on the tuning box to run one on. Only Q1_0 and Q2_0 remain
+        //     entirely unmeasured.
+        //
+        //             A       D       Q     (Q-A)/D   bound   previous
+        //     IQ2_XS   83.1   33.0   501.1   12.7       8       8   RE-MEASURED, UNCHANGED
+        //     Q5_0    237.3   26.0   498.0   10.1       8       6
+        //     IQ2_XXS  71.3   33.1   400.3    9.9       8       8   RE-MEASURED, UNCHANGED
+        //     Q4_0    179.0   24.4   413.9    9.6       8       6
+        //     IQ1_S    45.7   31.0   337.0    9.4       8       6
+        //     IQ4_NL  184.4   27.8   407.3    8.0       6       5
+        //     MXFP4   168.3   28.2   386.0    7.7       6       5
+        //     Q4_1    212.4   22.0   378.4    7.5       6       5
+        //     Q2_K     55.5   97.3   736.0    7.0       6       4
+        //     NVFP4   103.7  112.1   572.8    4.2       4       8   LOWERED
+        //     Q5_1     49.9  151.3   437.4    2.6       2       5   LOWERED
+        //
+        //     Two of those are the table being wrong in the direction that costs, not the
+        //     direction that leaves something on the table. Q5_1 has the second-largest
+        //     per-column slope of any type here (151 us, above even Q4_K and Q5_K) and its bound
+        //     of 5 was sending it to MMVQ at ne11 = 3, 4 and 5 where MMVQ measures 25-33 %, 6-8 %
+        //     and 81-102 % SLOWER. NVFP4's bound of 8 was doing the same at ne11 = 5..8, where
+        //     MMVQ is 12-15 % slower at 5 and 37 % slower at 6; the previous comment's "NVFP4
+        //     does not cross below 9" does not reproduce. Both are resolved on all three shapes
+        //     (t = +5.9 .. +49.7).
+        //
+        //     KNOWN INCOMPLETE: the crossover is not a per-type constant, it is a per-(type, ne01)
+        //     constant, and one number per type cannot express that. At ne01 = 1024 (attn_k,
+        //     attn_v) MMQ launches 16 tiles against 40 CUs and the measured crossovers are Q4_K 4,
+        //     Q5_K 5, Q6_K >= 8, Q8_0 >= 8 -- two to four columns above the values below. The
+        //     bounds below are the ne01 >= 5120 values, which is the conservative choice because
+        //     the FFN tensors carry far more bytes; the cost is that attn_k/attn_v stay on MMQ at
+        //     ne11 = 3-5 where MMVQ is 8-18 % faster.
+        switch (type) {
+            case GGML_TYPE_Q5_1:
+                // 5 -> 2. Crossover 2.50-2.58 over three shapes, D = 141-151 us/col. MMVQ is
+                //     3.7-11.0 % faster at ne11 = 2 and 25-33 % SLOWER at 3, so the previous
+                //     bound of 5 was a regression on every Q5_1 tensor at three to five columns.
+                //     Representative shapes; no local GGUF has Q5_1, so no end-to-end check.
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+                // Crossover 2.5-2.8 (Q4_K) and 2.2-2.6 (Q5_K) across four and five shapes
+                //     respectively, on both d6e477a70 and 6cb4ed016. MMVQ is 6-12 % faster at
+                //     ne11 = 2 and 10-25 % slower at ne11 = 3. Unchanged.
+                return ne11 <= 2;
+            case GGML_TYPE_Q3_K:
+                // Crossover 3.5-4.0 over three shapes. MMVQ -9.9 % at ne11 = 3, +0.9 % at 4
+                //     (+6.3 / -3.0 / -0.7 per shape, i.e. no consistent win). Unchanged.
+                return ne11 <= 3;
+            case GGML_TYPE_NVFP4:
+                // 8 -> 4. Crossover 4.19-4.27 over three shapes, D = 41-112 us/col. MMVQ is
+                //     3.7-8.0 % faster at ne11 = 4 and 11.7-14.8 % slower at 5 (t = +5.9 .. +14.5)
+                //     and 36.6-37.5 % slower at 6. The previous bound of 8 also ran the
+                //     ncols_dst 7 and 8 kernels, which rdna3_5_rows4_max_ncols_dst already
+                //     records as spilling 24 and 68 registers under four rows per block.
+                //     Representative shapes; no local GGUF has NVFP4, so no end-to-end check.
+            case GGML_TYPE_Q6_K:
+                // 3 -> 4. Crossover 4.7-4.9 over three shapes. MMVQ is 10.8-11.7 % faster at
+                //     ne11 = 4 (t = -7.6 .. -12.2, every CI clear of zero) and 1.9-5.4 % slower at
+                //     5. Re-measured on 6cb4ed016 as well, where the J = 16 prefetch makes MMQ
+                //     cheaper: crossover 4.58-4.62, bound still 4.
+                return ne11 <= 4;
+            case GGML_TYPE_Q8_0:
+                // 4 -> 5. Crossover 5.7-7.5 over three shapes. MMVQ is 6.4-11.4 % faster at
+                //     ne11 = 5 (t = -9.8 .. -14.7) and mixed at 6 (-6.6 / -1.8 / +2.3), so 5 is
+                //     where the win is consistent. Not affected by the J = 16 prefetch, whose
+                //     Q8_0 entries are J = 48 and J = 128.
+                return ne11 <= 5;
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_MXFP4:
+            case GGML_TYPE_IQ4_NL:
+                // Q2_K 4 -> 6, the other three 5 -> 6. Crossovers 6.5-7.0 (Q2_K), 6.5-8.3 (Q4_1),
+                //     6.9-8.6 (MXFP4), 7.1-9.0 (IQ4_NL); in each case ne11 = 7 wins on two of the
+                //     three shapes but not on 5120x6144, so 6 is where the win is consistent.
+                //     Representative shapes; no local GGUF has them, so no end-to-end check.
+                return ne11 <= 6;
+            default:
+                // IQ4_XS, IQ3_S and IQ3_XXS moved 6 -> 8 here and fall through to this arm.
+                //     MMVQ is faster at ne11 = 7 on all nine (type, shape) cells by 9.7-20.0 %,
+                //     every CI clear of zero, and at ne11 = 8 on all nine by mean, resolved on
+                //     seven. The fitted crossovers are 8.6-9.5, so 8 is MMVQ_MAX_BATCH_SIZE
+                //     biting, not a measured meeting point -- there is no ncols_dst > 8 kernel.
+                //     These three are 68.5 % of a 27B UD-IQ4_XS file's matmul weights and they
+                //     all left the vector path in the same step at a verification width of 7,
+                //     taking the file from 29.6 % to 98.1 % on MMQ, which is why a draft length
+                //     of n_max = 6 measured 9 % SLOWER than 5 on the server before this change.
+                // Q4_0 (6 -> 8), Q5_0 (6 -> 8) and IQ1_S (6 -> 8) also land here: crossovers
+                //     8.4-10.6, 8.8-10.9 and 9.3-10.2 at the generic shapes, MMVQ faster at
+                //     ne11 = 8 by 8.7 %, 8.9 % and 10.5 % on average. IQ2_XS (12.7) and IQ2_XXS
+                //     (9.9) were re-measured and keep 8. IQ2_S was too: crossover 12.4. Q1_0 and
+                //     Q2_0 are the only two types in this function never measured on gfx1151.
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
@@ -595,6 +804,14 @@ static_assert(is_rdna3_5_q4_columns_type(GGML_TYPE_Q5_K));
 static_assert(is_rdna3_5_q4_columns_type(GGML_TYPE_Q6_K));
 static_assert(is_rdna3_5_q4_columns_type(GGML_TYPE_IQ3_S));
 
+// Two adjacent output rows per block for the four-column RDNA3.5 kernels, mirroring what
+// calc_rows_per_block does for the generic MMVQ kernel: a block owns rows row0 and row0+1 and
+// reuses one load of the four q8_1 activation columns for both. The per-lane K decomposition and
+// the accumulation order for a given (row, column) are unchanged, so results are bit-exact.
+#ifndef MMVQ_Q4_COLUMNS_ROWS_PER_BLOCK
+#define MMVQ_Q4_COLUMNS_ROWS_PER_BLOCK 2
+#endif
+
 template <ggml_type type>
 __launch_bounds__(2 * ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q4_columns(
@@ -608,8 +825,9 @@ static __global__ void mul_mat_vec_q4_columns(
     constexpr int qi = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int rpb = MMVQ_Q4_COLUMNS_ROWS_PER_BLOCK;
 
-    const int row = blockIdx.x;
+    const int row0 = rpb * blockIdx.x;
     const int lane = threadIdx.x;
     const int column0 = 0;
     const uint32_t channel_dst = blockIdx.y;
@@ -619,41 +837,57 @@ static __global__ void mul_mat_vec_q4_columns(
 
     const void * vx = vx_ptr;
     const block_q8_1 * y = (const block_q8_1 *) vy_ptr + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
-    float * dst = dst_ptr + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row;
+    float * dst = dst_ptr + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
     const int blocks_per_row_x = ncols_x / qk;
     const int blocks_per_iter = vdr * warp_size / qi;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
-    float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    float tmp[4][rpb] = {{0.0f}};
 
     ggml_cuda_pdl_sync();
     for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (lane % (qi/vdr));
-        const block_q8_0 * bx = (const block_q8_0 *) vx + kbx_offset + kbx;
-        int xv[VDR_Q8_0_Q8_1_MMVQ];
+        int xv[rpb][VDR_Q8_0_Q8_1_MMVQ];
+        float dx[rpb];
 #pragma unroll
-        for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
-            xv[i] = get_int_b2(bx->qs, kqs + i);
+        for (int r = 0; r < rpb; ++r) {
+            const block_q8_0 * bx = (const block_q8_0 *) vx + kbx_offset + r*stride_row_x + kbx;
+#pragma unroll
+            for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+                xv[r][i] = get_int_b2(bx->qs, kqs + i);
+            }
+            dx[r] = __half2float(bx->d);
         }
-        const float dx = __half2float(bx->d);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const block_q8_1 * by = &y[(column0 + j)*stride_col_y + kby];
-            int sumi = 0;
+            const float d8 = __half2float(__low2half(by->ds));
+            int u[VDR_Q8_0_Q8_1_MMVQ];
 #pragma unroll
             for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
-                sumi = ggml_cuda_dp4a(xv[i], get_int_b4(by->qs, kqs + i), sumi);
+                u[i] = get_int_b4(by->qs, kqs + i);
             }
-            tmp[j] += dx * __half2float(__low2half(by->ds)) * (float) sumi;
+#pragma unroll
+            for (int r = 0; r < rpb; ++r) {
+                int sumi = 0;
+#pragma unroll
+                for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+                    sumi = ggml_cuda_dp4a(xv[r][i], u[i], sumi);
+                }
+                tmp[j][r] += dx[r] * d8 * (float) sumi;
+            }
         }
     }
 
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        tmp[j] = warp_reduce_sum<warp_size>(tmp[j]);
-        if (lane == 0) {
-            dst[(column0 + j)*stride_col_dst] = tmp[j];
+#pragma unroll
+        for (int r = 0; r < rpb; ++r) {
+            tmp[j][r] = warp_reduce_sum<warp_size>(tmp[j][r]);
+            if (lane == r && (rpb == 1 || uint32_t(row0 + r) < stride_col_dst)) {
+                dst[(column0 + j)*stride_col_dst + r] = tmp[j][r];
+            }
         }
     }
 }
@@ -672,8 +906,9 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
     constexpr int vdr       = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = calc_nwarps(type, 1, get_device_table_id());
+    constexpr int rpb       = MMVQ_Q4_COLUMNS_ROWS_PER_BLOCK;
 
-    const int row  = blockIdx.x;
+    const int row0 = rpb * blockIdx.x;
     const int lane = threadIdx.x;
     const int tid  = warp_size*threadIdx.y + lane;
     const uint32_t channel_dst = blockIdx.y;
@@ -682,12 +917,12 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
 
     const block_q8_1 * y = (const block_q8_1 *) vy_ptr + sample_dst*stride_sample_y + channel_dst*stride_channel_y;
-    float * dst = dst_ptr + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row;
+    float * dst = dst_ptr + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
     const int blocks_per_row_x = ncols_x / qk;
     const int blocks_per_iter  = vdr * nwarps*warp_size / qi;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row*stride_row_x;
-    float tmp[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    float tmp[4][rpb] = {{0.0f}};
 
     ggml_cuda_pdl_sync();
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
@@ -695,115 +930,156 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
         const int kqs = vdr * (tid % (qi/vdr));
 
         if constexpr (type == GGML_TYPE_Q1_0) {
-            const block_q1_0 * bx = (const block_q1_0 *) vx_ptr + kbx_offset + kbx;
-            const int16_t * qs = (const int16_t *) bx->qs + kqs*2;
-            int xv[8];
+            int   xv[rpb][8];
+            float dx[rpb];
 #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                const int q = qs[i];
-                const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
-                const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
-                const int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
-                const int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
-                const int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
-                const int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
-                xv[4*i+0] = __byte_perm(s0, s1, 0x5410);
-                xv[4*i+1] = __byte_perm(s0, s1, 0x7632);
-                xv[4*i+2] = __byte_perm(s2, s3, 0x5410);
-                xv[4*i+3] = __byte_perm(s2, s3, 0x7632);
-            }
-            const float dx = bx->d;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const block_q8_1 * by = &y[j*stride_col_y + kby + kqs];
-                int sumi = 0;
+            for (int r = 0; r < rpb; ++r) {
+                const block_q1_0 * bx = (const block_q1_0 *) vx_ptr + kbx_offset + r*stride_row_x + kbx;
+                const int16_t * qs = (const int16_t *) bx->qs + kqs*2;
 #pragma unroll
                 for (int i = 0; i < 2; ++i) {
-                    sumi = ggml_cuda_dp4a(xv[4*i+0], get_int_b4(by->qs, i*4+0), sumi);
-                    sumi = ggml_cuda_dp4a(xv[4*i+1], get_int_b4(by->qs, i*4+1), sumi);
-                    sumi = ggml_cuda_dp4a(xv[4*i+2], get_int_b4(by->qs, i*4+2), sumi);
-                    sumi = ggml_cuda_dp4a(xv[4*i+3], get_int_b4(by->qs, i*4+3), sumi);
+                    const int q = qs[i];
+                    const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
+                    const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
+                    const int s0 = __byte_perm(0x01FF, 0x01FF, n0 >>  0);
+                    const int s1 = __byte_perm(0x01FF, 0x01FF, n1 >>  0);
+                    const int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+                    const int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+                    xv[r][4*i+0] = __byte_perm(s0, s1, 0x5410);
+                    xv[r][4*i+1] = __byte_perm(s0, s1, 0x7632);
+                    xv[r][4*i+2] = __byte_perm(s2, s3, 0x5410);
+                    xv[r][4*i+3] = __byte_perm(s2, s3, 0x7632);
                 }
-                const float d8 = __low2float(by->ds);
-                tmp[j] += dx * d8 * sumi;
+                dx[r] = bx->d;
             }
-        } else if constexpr (type == GGML_TYPE_Q2_0) {
-            const block_q2_0 * bx = (const block_q2_0 *) vx_ptr + kbx_offset + kbx;
-            const int16_t * qs = (const int16_t *) bx->qs + kqs*4;
-            int xv[4];
-            int xw[4];
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int q = qs[i];
-#if defined(GGML_USE_HIP)
-                const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
-                const uint32_t qy_bits    = q >> 8;
-                const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
-                xv[i] = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
-                xw[i] = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
-#else
-                const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
-                const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
-                xv[i] = __byte_perm(qe, qo, 0x5140);
-                xw[i] = __byte_perm(qe, qo, 0x7362);
-#endif // defined(GGML_USE_HIP)
-            }
-            const float dx = bx->d;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const block_q8_1 * by = &y[j*stride_col_y + kby + kqs];
-                int sumi = 0;
+                const float d8 = __low2float(by->ds);
+                int u[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    u[i] = get_int_b4(by->qs, i);
+                }
+#pragma unroll
+                for (int r = 0; r < rpb; ++r) {
+                    int sumi = 0;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        sumi = ggml_cuda_dp4a(xv[r][4*i+0], u[i*4+0], sumi);
+                        sumi = ggml_cuda_dp4a(xv[r][4*i+1], u[i*4+1], sumi);
+                        sumi = ggml_cuda_dp4a(xv[r][4*i+2], u[i*4+2], sumi);
+                        sumi = ggml_cuda_dp4a(xv[r][4*i+3], u[i*4+3], sumi);
+                    }
+                    tmp[j][r] += dx[r] * d8 * sumi;
+                }
+            }
+        } else if constexpr (type == GGML_TYPE_Q2_0) {
+            int   xv[rpb][4];
+            int   xw[rpb][4];
+            float dx[rpb];
+#pragma unroll
+            for (int r = 0; r < rpb; ++r) {
+                const block_q2_0 * bx = (const block_q2_0 *) vx_ptr + kbx_offset + r*stride_row_x + kbx;
+                const int16_t * qs = (const int16_t *) bx->qs + kqs*4;
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    sumi = ggml_cuda_dp4a(get_int_b4(by->qs, i*2+0), xv[i], sumi);
-                    sumi = ggml_cuda_dp4a(get_int_b4(by->qs, i*2+1), xw[i], sumi);
+                    const int q = qs[i];
+#if defined(GGML_USE_HIP)
+                    const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
+                    const uint32_t qy_bits    = q >> 8;
+                    const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
+                    xv[r][i] = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
+                    xw[r][i] = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
+#else
+                    const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+                    const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+                    xv[r][i] = __byte_perm(qe, qo, 0x5140);
+                    xw[r][i] = __byte_perm(qe, qo, 0x7362);
+#endif // defined(GGML_USE_HIP)
                 }
+                dx[r] = bx->d;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const block_q8_1 * by = &y[j*stride_col_y + kby + kqs];
                 const float d8 = __low2float(by->ds);
-                tmp[j] += dx * d8 * sumi;
+                int u[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    u[i] = get_int_b4(by->qs, i);
+                }
+#pragma unroll
+                for (int r = 0; r < rpb; ++r) {
+                    int sumi = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        sumi = ggml_cuda_dp4a(u[i*2+0], xv[r][i], sumi);
+                        sumi = ggml_cuda_dp4a(u[i*2+1], xw[r][i], sumi);
+                    }
+                    tmp[j][r] += dx[r] * d8 * sumi;
+                }
             }
         } else if constexpr (type == GGML_TYPE_IQ3_S) {
-            const block_iq3_s * bx = (const block_iq3_s *) vx_ptr + kbx_offset + kbx;
-            const int2 qs_packed = make_int2(get_int_b2(bx->qs, kqs + 0), get_int_b2(bx->qs, kqs + 1));
-            const uint8_t * qs = (const uint8_t *) &qs_packed;
-            const int qh = bx->qh[kqs/2];
-            const int signs_packed_32 = get_int_b2(bx->signs, kqs/2);
-            const uint8_t * signs_packed_8 = (const uint8_t *) &signs_packed_32;
-            int2 xv[4];
+            int2  xv[rpb][4];
+            float dx[rpb];
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int l0 = 2*i;
-                const int2 grid_pos = make_int2(
-                    iq3s_grid[qs[l0 + 0] | ((qh << (8-l0)) & 0x100)],
-                    iq3s_grid[qs[l0 + 1] | ((qh << (7-l0)) & 0x100)]);
-                const int signs0 = __vcmpne4(((signs_packed_8[i] & 0x03) << 7) | ((signs_packed_8[i] & 0x0C) << 21), 0x00000000);
-                const int signs1 = __vcmpne4(((signs_packed_8[i] & 0x30) << 3) | ((signs_packed_8[i] & 0xC0) << 17), 0x00000000);
-                xv[i] = make_int2(__vsub4(grid_pos.x ^ signs0, signs0), __vsub4(grid_pos.y ^ signs1, signs1));
+            for (int r = 0; r < rpb; ++r) {
+                const block_iq3_s * bx = (const block_iq3_s *) vx_ptr + kbx_offset + r*stride_row_x + kbx;
+                const int2 qs_packed = make_int2(get_int_b2(bx->qs, kqs + 0), get_int_b2(bx->qs, kqs + 1));
+                const uint8_t * qs = (const uint8_t *) &qs_packed;
+                const int qh = bx->qh[kqs/2];
+                const int signs_packed_32 = get_int_b2(bx->signs, kqs/2);
+                const uint8_t * signs_packed_8 = (const uint8_t *) &signs_packed_32;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int l0 = 2*i;
+                    const int2 grid_pos = make_int2(
+                        iq3s_grid[qs[l0 + 0] | ((qh << (8-l0)) & 0x100)],
+                        iq3s_grid[qs[l0 + 1] | ((qh << (7-l0)) & 0x100)]);
+                    xv[r][i] = make_int2(apply_signs4_nz(grid_pos.x, signs_packed_8[i]), apply_signs4_nz(grid_pos.y, signs_packed_8[i] >> 4));
+                }
+                // L-EPI (results/2026-09-10-lever-mmvq6/): the integer block scale is folded
+                // into the float scale here exactly as vec_dot_iq3_s_q8_1 now does it, so the
+                // four-column kernel and the generic kernel stay in agreement.
+                const int ls = 1 + 2*((bx->scales[kqs/4] >> ((kqs << 1) & 0x04)) & 0x0F);
+                dx[r] = __half2float(bx->d) * (float) ls;
             }
-            const int ls = 1 + 2*((bx->scales[kqs/4] >> ((kqs << 1) & 0x04)) & 0x0F);
-            const float dx = __half2float(bx->d);
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const block_q8_1 * by = &y[j*stride_col_y + kby + kqs/2];
-                int sumi = 0;
+                const float d8 = __low2float(by->ds);
+                int u[8];
 #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    sumi = ggml_cuda_dp4a(xv[i].x, get_int_b4(by->qs, 2*i + 0), sumi);
-                    sumi = ggml_cuda_dp4a(xv[i].y, get_int_b4(by->qs, 2*i + 1), sumi);
+                for (int i = 0; i < 8; ++i) {
+                    u[i] = get_int_b4(by->qs, i);
                 }
-                sumi *= ls;
-                const float d = dx * __low2float(by->ds);
-                tmp[j] += d * sumi;
+#pragma unroll
+                for (int r = 0; r < rpb; ++r) {
+                    int sumi = 0;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        sumi = ggml_cuda_dp4a(xv[r][i].x, u[2*i + 0], sumi);
+                        sumi = ggml_cuda_dp4a(xv[r][i].y, u[2*i + 1], sumi);
+                    }
+                    const float d = dx[r] * d8;
+                    tmp[j][r] += d * (float) sumi;
+                }
             }
         } else if constexpr (type == GGML_TYPE_Q5_1) {
-            const block_q5_1 * bx = (const block_q5_1 *) vx_ptr + kbx_offset + kbx;
-            int vl[VDR_Q5_1_Q8_1_MMVQ];
-            int vh[VDR_Q5_1_Q8_1_MMVQ];
+            int   vl[rpb][VDR_Q5_1_Q8_1_MMVQ];
+            int   vh[rpb][VDR_Q5_1_Q8_1_MMVQ];
+            half2 dm[rpb];
 #pragma unroll
-            for (int i = 0; i < VDR_Q5_1_Q8_1_MMVQ; ++i) {
-                vl[i] = get_int_b4(bx->qs, kqs + i);
-                vh[i] = get_int_b4(bx->qh, 0) >> (4 * (kqs + i));
+            for (int r = 0; r < rpb; ++r) {
+                const block_q5_1 * bx = (const block_q5_1 *) vx_ptr + kbx_offset + r*stride_row_x + kbx;
+#pragma unroll
+                for (int i = 0; i < VDR_Q5_1_Q8_1_MMVQ; ++i) {
+                    vl[r][i] = get_int_b4(bx->qs, kqs + i);
+                    vh[r][i] = get_int_b4(bx->qh, 0) >> (4 * (kqs + i));
+                }
+                dm[r] = bx->dm;
             }
-            const half2 dm = bx->dm;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const block_q8_1 * by = &y[j*stride_col_y + kby];
@@ -813,28 +1089,35 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
                     u[2*i+0] = get_int_b4(by->qs, kqs + i);
                     u[2*i+1] = get_int_b4(by->qs, kqs + i + QI5_1);
                 }
-                // ROCm 7.14 changes gfx1151 Q5_1 rounding under four-column register pressure. Keep both paths materialized until LLVM preserves this expression.
-                volatile float dot = vec_dot_q5_1_q8_1_impl<VDR_Q5_1_Q8_1_MMVQ>(vl, vh, u, dm, by->ds);
-                tmp[j] = __fadd_rn(tmp[j], dot);
+#pragma unroll
+                for (int r = 0; r < rpb; ++r) {
+                    // ROCm 7.14 changes gfx1151 Q5_1 rounding under four-column register pressure. Keep both paths materialized until LLVM preserves this expression.
+                    volatile float dot = vec_dot_q5_1_q8_1_impl<VDR_Q5_1_Q8_1_MMVQ>(vl[r], vh[r], u, dm[r], by->ds);
+                    tmp[j][r] = __fadd_rn(tmp[j][r], dot);
+                }
             }
         } else if constexpr (type == GGML_TYPE_Q4_K) {
-            const block_q4_K * bx = (const block_q4_K *) vx_ptr + kbx_offset + kbx;
             const int bq8_offset = QR4_K * ((kqs/2) / (QI8_1/2));
-            const int * q4 = (const int *) (bx->qs + 16*bq8_offset + 4*((kqs/2)%4));
-            int xv[2] = {q4[0], q4[4]};
-            const uint16_t * scales = (const uint16_t *) bx->scales;
-            uint16_t aux[2];
             const int is = bq8_offset/2;
-            if (is < 2) {
-                aux[0] = scales[is+0] & 0x3f3f;
-                aux[1] = scales[is+2] & 0x3f3f;
-            } else {
-                aux[0] = ((scales[is+2] >> 0) & 0x0f0f) | ((scales[is-2] & 0xc0c0) >> 2);
-                aux[1] = ((scales[is+2] >> 4) & 0x0f0f) | ((scales[is-0] & 0xc0c0) >> 2);
+            int      xv[rpb][2];
+            uint16_t aux[rpb][2];
+            half2    dm[rpb];
+#pragma unroll
+            for (int r = 0; r < rpb; ++r) {
+                const block_q4_K * bx = (const block_q4_K *) vx_ptr + kbx_offset + r*stride_row_x + kbx;
+                const int * q4 = (const int *) (bx->qs + 16*bq8_offset + 4*((kqs/2)%4));
+                xv[r][0] = q4[0];
+                xv[r][1] = q4[4];
+                const uint16_t * scales = (const uint16_t *) bx->scales;
+                if (is < 2) {
+                    aux[r][0] = scales[is+0] & 0x3f3f;
+                    aux[r][1] = scales[is+2] & 0x3f3f;
+                } else {
+                    aux[r][0] = ((scales[is+2] >> 0) & 0x0f0f) | ((scales[is-2] & 0xc0c0) >> 2);
+                    aux[r][1] = ((scales[is+2] >> 4) & 0x0f0f) | ((scales[is-0] & 0xc0c0) >> 2);
+                }
+                dm[r] = bx->dm;
             }
-            const uint8_t * sc = (const uint8_t *) aux;
-            const uint8_t * m  = sc + 2;
-            const half2 dm = bx->dm;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const block_q8_1 * by = &y[j*stride_col_y + kby];
@@ -848,28 +1131,39 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
                     u[2*i+0] = q8[0];
                     u[2*i+1] = q8[4];
                 }
-                tmp[j] += vec_dot_q4_K_q8_1_impl_vmmq(xv, u, sc, m, dm, d8);
+#pragma unroll
+                for (int r = 0; r < rpb; ++r) {
+                    const uint8_t * sc = (const uint8_t *) aux[r];
+                    const uint8_t * m  = sc + 2;
+                    tmp[j][r] += vec_dot_q4_K_q8_1_impl_vmmq(xv[r], u, sc, m, dm[r], d8);
+                }
             }
         } else if constexpr (type == GGML_TYPE_Q5_K) {
-            const block_q5_K * bx = (const block_q5_K *) vx_ptr + kbx_offset + kbx;
             const int bq8_offset = QR5_K * ((kqs/2) / (QI8_1/2));
-            const int * ql = (const int *) (bx->qs + 16*bq8_offset + 4*((kqs/2)%4));
-            const int * qh = (const int *) (bx->qh + 4*((kqs/2)%4));
-            int vl[2] = {ql[0], ql[4]};
-            int vh[2] = {qh[0] >> bq8_offset, qh[4] >> bq8_offset};
-            const uint16_t * scales = (const uint16_t *) bx->scales;
-            uint16_t aux[2];
             const int is = bq8_offset/2;
-            if (is < 2) {
-                aux[0] = scales[is+0] & 0x3f3f;
-                aux[1] = scales[is+2] & 0x3f3f;
-            } else {
-                aux[0] = ((scales[is+2] >> 0) & 0x0f0f) | ((scales[is-2] & 0xc0c0) >> 2);
-                aux[1] = ((scales[is+2] >> 4) & 0x0f0f) | ((scales[is-0] & 0xc0c0) >> 2);
+            int      vl[rpb][2];
+            int      vh[rpb][2];
+            uint16_t aux[rpb][2];
+            half2    dm[rpb];
+#pragma unroll
+            for (int r = 0; r < rpb; ++r) {
+                const block_q5_K * bx = (const block_q5_K *) vx_ptr + kbx_offset + r*stride_row_x + kbx;
+                const int * ql = (const int *) (bx->qs + 16*bq8_offset + 4*((kqs/2)%4));
+                const int * qh = (const int *) (bx->qh + 4*((kqs/2)%4));
+                vl[r][0] = ql[0];
+                vl[r][1] = ql[4];
+                vh[r][0] = qh[0] >> bq8_offset;
+                vh[r][1] = qh[4] >> bq8_offset;
+                const uint16_t * scales = (const uint16_t *) bx->scales;
+                if (is < 2) {
+                    aux[r][0] = scales[is+0] & 0x3f3f;
+                    aux[r][1] = scales[is+2] & 0x3f3f;
+                } else {
+                    aux[r][0] = ((scales[is+2] >> 0) & 0x0f0f) | ((scales[is-2] & 0xc0c0) >> 2);
+                    aux[r][1] = ((scales[is+2] >> 4) & 0x0f0f) | ((scales[is-0] & 0xc0c0) >> 2);
+                }
+                dm[r] = bx->dm;
             }
-            const uint8_t * sc = (const uint8_t *) aux;
-            const uint8_t * m  = sc + 2;
-            const half2 dm = bx->dm;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const block_q8_1 * by = &y[j*stride_col_y + kby];
@@ -883,17 +1177,29 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
                     u[2*i+0] = q8[0];
                     u[2*i+1] = q8[4];
                 }
-                tmp[j] += vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, dm, d8);
+#pragma unroll
+                for (int r = 0; r < rpb; ++r) {
+                    const uint8_t * sc = (const uint8_t *) aux[r];
+                    const uint8_t * m  = sc + 2;
+                    tmp[j][r] += vec_dot_q5_K_q8_1_impl_vmmq(vl[r], vh[r], u, sc, m, dm[r], d8);
+                }
             }
         } else if constexpr (type == GGML_TYPE_Q6_K) {
-            const block_q6_K * bx = (const block_q6_K *) vx_ptr + kbx_offset + kbx;
-            const int bq8_offset = 2*QR6_K*(kqs/(QI6_K/2)) + (kqs%(QI6_K/2))/(QI6_K/4);
+            const int bq8_offset   = 2*QR6_K*(kqs/(QI6_K/2)) + (kqs%(QI6_K/2))/(QI6_K/4);
             const int scale_offset = (QI6_K/4)*(kqs/(QI6_K/2)) + (kqs%(QI6_K/2))/(QI6_K/8);
-            const int vh_shift = 2*((kqs%(QI6_K/2))/(QI6_K/4));
-            const int vl = get_int_b2(bx->ql, kqs);
-            const int vh = get_int_b2(bx->qh, (QI6_K/4)*(kqs/(QI6_K/2)) + kqs%(QI6_K/4)) >> vh_shift;
-            const int8_t * scales = bx->scales + scale_offset;
-            const float dx = bx->d;
+            const int vh_shift     = 2*((kqs%(QI6_K/2))/(QI6_K/4));
+            int            vl[rpb];
+            int            vh[rpb];
+            const int8_t * scales[rpb];
+            float          dx[rpb];
+#pragma unroll
+            for (int r = 0; r < rpb; ++r) {
+                const block_q6_K * bx = (const block_q6_K *) vx_ptr + kbx_offset + r*stride_row_x + kbx;
+                vl[r]     = get_int_b2(bx->ql, kqs);
+                vh[r]     = get_int_b2(bx->qh, (QI6_K/4)*(kqs/(QI6_K/2)) + kqs%(QI6_K/4)) >> vh_shift;
+                scales[r] = bx->scales + scale_offset;
+                dx[r]     = bx->d;
+            }
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const block_q8_1 * by = &y[j*stride_col_y + kby];
@@ -904,16 +1210,22 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
                     u[i]  = get_int_b4(by[bq8_offset + 2*i].qs, kqs % QI8_1);
                     d8[i] = __low2float(by[bq8_offset + 2*i].ds);
                 }
-                tmp[j] += vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, dx, d8);
+#pragma unroll
+                for (int r = 0; r < rpb; ++r) {
+                    tmp[j][r] += vec_dot_q6_K_q8_1_impl_mmvq(vl[r], vh[r], u, scales[r], dx[r], d8);
+                }
             }
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][4][warp_size];
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][4][rpb][warp_size];
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            tmp_shared[threadIdx.y-1][j][lane] = tmp[j];
+#pragma unroll
+            for (int r = 0; r < rpb; ++r) {
+                tmp_shared[threadIdx.y-1][j][r][lane] = tmp[j][r];
+            }
         }
     }
     __syncthreads();
@@ -924,12 +1236,15 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
 #pragma unroll
-        for (int i = 0; i < nwarps-1; ++i) {
-            tmp[j] += tmp_shared[i][j][lane];
-        }
-        tmp[j] = warp_reduce_sum<warp_size>(tmp[j]);
-        if (lane == 0) {
-            dst[j*stride_col_dst] = tmp[j];
+        for (int r = 0; r < rpb; ++r) {
+#pragma unroll
+            for (int i = 0; i < nwarps-1; ++i) {
+                tmp[j][r] += tmp_shared[i][j][r][lane];
+            }
+            tmp[j][r] = warp_reduce_sum<warp_size>(tmp[j][r]);
+            if (lane == r && (rpb == 1 || uint32_t(row0 + r) < stride_col_dst)) {
+                dst[j*stride_col_dst + r] = tmp[j][r];
+            }
         }
     }
 }
@@ -1028,11 +1343,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_grid(
             grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_l = apply_signs4_nz(grid_pos.x, signs_packed_8[l0/2]);
+        const int grid_h = apply_signs4_nz(grid_pos.y, signs_packed_8[l0/2] >> 4);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1041,10 +1353,10 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_grid(
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
 
-    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
-
-    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    // L-EPI: kept in step with vec_dot_iq3_s_q8_1.
+    const int ls = 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    const float d = (__half2float(bq3->d) * (float) ls) * __low2float(bq8_1[iqs/2].ds);
+    return d * (float) sumi;
 }
 
 // Direct kernel (same lane layout and accumulation order as mul_mat_vec_iq3_s_rows_rdna3_5) with the codebook
@@ -1241,9 +1553,83 @@ static __global__ void mul_mat_vec_iq3_s_lds_rdna3_5(
     GGML_UNUSED(ncols_x);
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+// RDNA3.5 only: the largest ncols_dst at which a block should own FOUR output rows instead of the
+// two that shipped in 5bc829e0c. 0 means "never promote", i.e. the type keeps two rows everywhere.
+//
+// Source of the numbers: results/rocm-fa-depth/night43/05-round2.md, lever "R2B", which set four
+// rows for EVERY type and every ncols_dst 2..8 and measured (a) the change in the per-column cost
+// slope D on top of the shipped two-row stack and (b) the static VGPR count of
+// mul_mat_vec_q<type,6> read out of the built object. Waves/SIMD below are derived from the VGPR
+// count (gfx11 wave32, 1536 VGPR per SIMD, granule 8, hardware ceiling 16).
+//
+// R2B was NOT shipped as a blanket change because two of its cells are negative, and both of those
+// are excluded here rather than averaged away. This table is the surviving subset.
+static constexpr __host__ __device__ int rdna3_5_rows4_max_ncols_dst(ggml_type type) {
+    switch (type) {
+        // Codebook / IQ types: D fell 13.2-28.6 % and the register growth still leaves 7-12 waves
+        //     per SIMD. D: iq1_m -28.6, iq2_xs -20.7, iq2_s -19.8, iq1_s -18.1, iq2_xxs -17.8,
+        //     iq4_xs -13.6, iq3_s -13.2. VGPR at ncols_dst=6, two rows -> four rows:
+        //     127->199, 105->155, 105->169, 91->118, 104->151, 116->164, 103->166. None spills.
+        // Capped at 6 because the ncols_dst 7 and 8 kernels are where R2B's register cliff sits
+        //     (see the default arm) and nothing in that sweep could price it.
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+            return 6;
+
+        // Q2_K: D fell 18.8 %, the largest gain outside the IQ set, but it is also the type with
+        //     the worst register growth -- 124->252 VGPR at ncols_dst=6, i.e. 12->6 waves per SIMD,
+        //     and mul_mat_vec_q<q2_K,8> goes to 256 VGPR with 20 spills / 84 B of scratch.
+        // Bounded at 4, not 6, because 4 is also ggml_cuda_should_use_mmvq's Q2_K threshold on this
+        //     arch: ncols_dst 5..8 for Q2_K is reachable only through the ne01 < 64 GDN path, which
+        //     the R2B sweep contains no case for. The measured -18.8 % comes entirely from
+        //     ncols_dst <= 4, so that is exactly how far it is applied.
+        case GGML_TYPE_Q2_K:
+            return 4;
+
+        // Deliberate negatives, listed so the measurement that excludes them is on the record:
+        //   q5_1  REGRESSED +30.7 % at ncols_dst=2, reproduced on two builds. Never promote.
+        //   q2_0  D rose 3.2 % (slower), so there is nothing to buy.
+        //   q1_0  D fell only 4.9 %, smaller than the 2.55 pp cross-sweep RMS of that experiment,
+        //         and it costs 16->11 waves per SIMD. Not established, so not taken.
+        //   q8_0  the two-point D fit was unusable (13.37 -> 15.30, i.e. pointing the wrong way).
+        //         It is also the one type with a dedicated q4-columns kernel at ncols_dst=4, so the
+        //         generic kernel only sees it at 2 and 3 below its threshold of 4.
+        //   NVFP4 mul_mat_vec_q<NVFP4,7> and <NVFP4,8> spill 24 and 68 registers (100 B / 276 B of
+        //         scratch) under R2B and no case in that sweep reaches them.
+        // Every type not named above -- k-quants other than Q2_K, Q4_0/Q4_1/Q5_0, MXFP4, IQ3_XXS,
+        //     IQ4_NL -- was not moved by R2B outside its noise band and keeps two rows as today.
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_NVFP4:
+        default:
+            return 0;
+    }
+}
+
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
-        return 1;
+        // nwarps is 1 here, so a block is a single wave and every lane re-reads the whole q8_1
+        // activation block for the row it owns. Two rows per block share those loads; the types in
+        // rdna3_5_rows4_max_ncols_dst share them four ways.
+        switch (ncols_dst) {
+            case 2:
+            case 3:
+            case 4:
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return ncols_dst <= rdna3_5_rows4_max_ncols_dst(type) ? 4 : 2;
+            default:
+                return 1;
+        }
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
@@ -1264,6 +1650,38 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+// The promoted cells, one per justification group.
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   2, MMVQ_PARAMETERS_RDNA3_5) == 4);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_RDNA3_5) == 4);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ4_XS,  6, MMVQ_PARAMETERS_RDNA3_5) == 4);
+static_assert(calc_rows_per_block(GGML_TYPE_Q2_K,    4, MMVQ_PARAMETERS_RDNA3_5) == 4);
+
+// The cells the table deliberately refuses.
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   7, MMVQ_PARAMETERS_RDNA3_5) == 2);  // spill risk unpriced at 7/8
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   8, MMVQ_PARAMETERS_RDNA3_5) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_Q2_K,    5, MMVQ_PARAMETERS_RDNA3_5) == 2);  // above Q2_K's MMVQ threshold
+static_assert(calc_rows_per_block(GGML_TYPE_Q2_K,    8, MMVQ_PARAMETERS_RDNA3_5) == 2);  // 20 spills under R2B
+static_assert(calc_rows_per_block(GGML_TYPE_Q5_1,    2, MMVQ_PARAMETERS_RDNA3_5) == 2);  // +30.7 % regression
+static_assert(calc_rows_per_block(GGML_TYPE_Q2_0,    4, MMVQ_PARAMETERS_RDNA3_5) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_Q8_0,    2, MMVQ_PARAMETERS_RDNA3_5) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_NVFP4,   7, MMVQ_PARAMETERS_RDNA3_5) == 2);  // 24 spills under R2B
+static_assert(calc_rows_per_block(GGML_TYPE_Q4_K,    6, MMVQ_PARAMETERS_RDNA3_5) == 2);  // never listed
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   1, MMVQ_PARAMETERS_RDNA3_5) == 1);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   9, MMVQ_PARAMETERS_RDNA3_5) == 1);
+
+// Every other parameter table must be type-independent and bit-identical to what shipped: the type
+// argument is only ever read inside the RDNA3.5 arm.
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_GENERIC) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_Q5_1,    6, MMVQ_PARAMETERS_GENERIC) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   1, MMVQ_PARAMETERS_GENERIC) == 1);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   1, MMVQ_PARAMETERS_GENERIC, true, 4) == 4);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_GCN) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_TURING) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_GB10) == 2);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_RDNA4) == 1);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_RDNA3_0) == 1);
+static_assert(calc_rows_per_block(GGML_TYPE_IQ1_M,   6, MMVQ_PARAMETERS_RDNA2) == 1);
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -1283,8 +1701,12 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    // The epilogue writes row row0 + i from lane i, so a block can never own more rows than a wave
+    // has lanes. Two rows never came close; the RDNA3.5 four-row table makes this worth pinning.
+    static_assert(rows_per_cuda_block <= warp_size);
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
@@ -2445,7 +2867,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -2718,7 +3140,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     fusion.x_scale == nullptr && fusion.gate_scale == nullptr;
                 if (table_id == MMVQ_PARAMETERS_RDNA3_5 && ids == nullptr && no_fusion) {
                     constexpr int c_nwarps = calc_nwarps(type, 1, MMVQ_PARAMETERS_RDNA3_5);
-                    const dim3 block_nums(nrows_x, nchannels_dst, nsamples_dst);
+                    constexpr int c_rpb    = MMVQ_Q4_COLUMNS_ROWS_PER_BLOCK;
+                    const dim3 block_nums((nrows_x + c_rpb - 1) / c_rpb, nchannels_dst, nsamples_dst);
                     const dim3 block_dims(warp_size, c_nwarps, 1);
                     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
                     ggml_cuda_kernel_launch(mul_mat_vec_q4_columns_rdna3_5<type>, launch_params,
@@ -2732,7 +3155,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 const bool no_fusion = fusion.gate == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
                     fusion.x_scale == nullptr && fusion.gate_scale == nullptr;
                 if (table_id == MMVQ_PARAMETERS_RDNA3_5 && ids == nullptr && no_fusion) {
-                    const dim3 block_nums(nrows_x, nchannels_dst, nsamples_dst);
+                    constexpr int c_rpb = MMVQ_Q4_COLUMNS_ROWS_PER_BLOCK;
+                    const dim3 block_nums((nrows_x + c_rpb - 1) / c_rpb, nchannels_dst, nsamples_dst);
                     const dim3 block_dims(warp_size, 1, 1);
                     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
                     ggml_cuda_kernel_launch(mul_mat_vec_q4_columns<type>, launch_params,

@@ -275,30 +275,24 @@ static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
 #endif // __has_builtin(__builtin_elementwise_sub_sat)
 }
 
+// NVIDIA's __vsub4 is a per-byte WRAPPING subtract, not a saturating one; forwarding it to
+// __vsubss4 makes the HIP path disagree with the CUDA path whenever a byte subtraction overflows.
+// Branch-free SWAR: (a|0x80..) never borrows into the next byte because (b&0x7f..) <= 0x7f, and the
+// final XOR restores bit 7 of every byte.
 static __device__ __forceinline__ int __vsub4(const int a, const int b) {
-    return __vsubss4(a, b);
+    const unsigned int ua = (unsigned int) a;
+    const unsigned int ub = (unsigned int) b;
+    return (int) (((ua | 0x80808080u) - (ub & 0x7f7f7f7fu)) ^ ((ua ^ ~ub) & 0x80808080u));
+}
+
+// Branch-free SWAR per-byte != : ((x & 0x7f..) + 0x7f..) cannot carry between bytes, so bit 7 of
+// (that | x) is set exactly for the nonzero bytes of x; the multiply expands 0x80 -> 0xff per byte.
+static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
+    const unsigned int x  = a ^ b;
+    const unsigned int nz = ((((x & 0x7f7f7f7fu) + 0x7f7f7f7fu) | x) & 0x80808080u) >> 7;
+    return nz * 0xffu;
 }
 
 static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigned int b) {
-    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
-    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
-    unsigned int c;
-    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vc[i] = va[i] == vb[i] ? 0xff : 0x00;
-    }
-    return c;
-}
-
-static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
-    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
-    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
-    unsigned int c;
-    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vc[i] = va[i] == vb[i] ? 0x00 : 0xff;
-    }
-    return c;
+    return ~__vcmpne4(a, b);
 }

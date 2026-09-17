@@ -961,6 +961,14 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         }
     }
 
+    // Same one-tile argument as ggml_cuda_should_use_mmvq: below one MMF/MMQ tile the tiled
+    //     kernels launch a single block and leave the device idle, so take the vector kernel
+    //     whatever the type says. src0_ne[1] = 48 is the GDN alpha/beta projection shape.
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && src0_ne[1] < 64 && ne11 <= MMVF_MAX_BATCH_SIZE &&
+            (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
+        return true;
+    }
+
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {

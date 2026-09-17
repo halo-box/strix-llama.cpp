@@ -876,10 +876,40 @@ template <ggml_type type, int J, bool fallback>
 static constexpr __host__ __device__ bool ggml_cuda_mmq_use_prefetch() {
 #if defined(RDNA3_5) && defined(AMD_WMMA_AVAILABLE)
     // Whitelist: the extra registers cause spills in several other specializations.
+    //
+    // The J = 16 entries were added on 2026-09-10 (results/2026-09-10-mmq-j16-prefetch/). J = 16 is
+    //     the only tile MMQ instantiates for ne11 <= 16 on this arch, i.e. all of single-stream
+    //     decode, small-batch decode and speculative verification; the original sweep was
+    //     MUL_MAT_ID at 2048 tokens and never reached it. Q4_K J = 16 and the already-whitelisted
+    //     Q4_K J = 48 both sit at 2 blocks resident per 64 KiB CU (22080 / 26816 B of LDS), so the
+    //     "only 1-2 blocks are resident" argument above applies unchanged at J = 16, while the y
+    //     staging costs 10 VGPRs there against 36 at J = 128.
+    //
+    //     TAKEN, per call at ne11 = 6 (m = 17408, k = 5120), 6 arms per side, balanced order:
+    //       Q4_K J=16  -3.43 % (t = -6.18, CI -4.69 .. -2.16), and -2.5 .. -3.7 % across the whole
+    //                  ne11 = 3..16 range that dispatches this tile, null at ne11 = 1,2 (MMVQ).
+    //       Q5_K J=16  -1.1 % typical, and Q6_K J=16 -0.3 %, neither resolved on its own against a
+    //                  +/-1.3 % control band (untouched q2_K/iq2_s cases moved that much). Taken on
+    //                  the group end-to-end result plus a +7 / +12 VGPR cost, not on their own
+    //                  per-call numbers; they are the weak half of this entry.
+    //     End-to-end decode at 6 sequences, the three cells above being the only changed kernels at
+    //     that batch: +0.80 % (CI +0.18 .. +1.42) on Qwen3.8-27B-UD-IQ4_XS where they are 26.0 % of
+    //     the weights, and +4.65 % (CI +3.51 .. +5.78) on Qwen3.8-27B-Q4_K_M where they are 93.6 %.
+    //     1 sequence and prefill are null on both. Outputs stay bit-identical (equal per-chunk
+    //     perplexity at -ub 16, against a base-vs-base determinism control).
+    //
+    //     REFUSED, and why, so the measurement that excludes them is on the record:
+    //       IQ4_XS J=16, IQ3_S J=16  no per-call effect at any ne11 = 7..16 that reaches this tile
+    //                  (every CI crosses zero), and they are the expensive cells: +33 .. +50 VGPR,
+    //                  which puts IQ4_XS fallback at 247 (mul_mat_q) and 251 (routed_compact) of
+    //                  256. Cost with no measured benefit; not taken.
+    //       Q2_K J=16, Q3_K J=16, IQ2_S J=16  already at 256 VGPR and already spilling on this
+    //                  branch without any prefetch (51 / 3 / 7 registers), so staging more would
+    //                  only deepen the spill. Not measured, not taken.
     return (type == GGML_TYPE_Q8_0    && (J == 48 || J == 128) && !fallback) ||
-           (type == GGML_TYPE_Q6_K    &&  J == 32)              ||
-           (type == GGML_TYPE_Q5_K    &&  J == 32)              ||
-           (type == GGML_TYPE_Q4_K    &&  J == 48)              ||
+           (type == GGML_TYPE_Q6_K    && (J == 16 || J == 32))  ||
+           (type == GGML_TYPE_Q5_K    && (J == 16 || J == 32))  ||
+           (type == GGML_TYPE_Q4_K    && (J == 16 || J == 48))  ||
            (type == GGML_TYPE_IQ2_S   &&  J == 128)             ||
            (type == GGML_TYPE_IQ3_XXS &&  J == 128);
 #else
