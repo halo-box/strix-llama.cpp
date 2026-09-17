@@ -626,6 +626,8 @@ struct common_params {
     bool    ple_direct_io  = true;  // ... read with O_DIRECT
     int32_t ple_io_threads = 64;    // ... parallel readers (random 4 KiB reads: this NVMe gives 62k IOPS at 16, 130k at 64, ~160k at 128+)
     int32_t ple_cache_mb   = 256;   // ... row cache, 0 disables
+    int32_t expert_cache_slots = 0; // DeepSeek V4.1 routed experts resident per layer
+    int32_t expert_cache_mib   = 0; // aggregate fixed slot-tensor capacity
 
     bool single_turn       = false; // single turn chat conversation
 

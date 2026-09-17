@@ -4,6 +4,7 @@
 
 #include "llama-impl.h"
 #include "llama-arch.h"
+#include "llama-expert-store.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
 
@@ -11,6 +12,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -47,6 +49,19 @@ struct llama_model_loader {
             if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
+        }
+
+        llama_tensor_weight(uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+            const int tensor_idx = gguf_find_tensor(gguf_ctx, ggml_get_name(tensor));
+            if (tensor_idx < 0) {
+                throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
+            }
+            const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+            const size_t tensor_offset = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+            if (data_offset > std::numeric_limits<size_t>::max() - tensor_offset) {
+                throw std::runtime_error(format("tensor '%s' offset overflows", ggml_get_name(tensor)));
+            }
+            offs = data_offset + tensor_offset;
         }
     };
 
@@ -116,6 +131,38 @@ struct llama_model_loader {
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
     } lazy;
+
+    struct external_read {
+        void add(const llama_tensor_weight & w);
+
+        bool any() const {
+            return !ranges.empty();
+        }
+
+        bool has(const ggml_tensor * t) const {
+            return tensors.count(ggml_get_name(t)) > 0;
+        }
+
+        const llama_mmap::ranges & for_file(uint32_t idx) const {
+            static const llama_mmap::ranges none;
+
+            const auto it = ranges.find(idx);
+            return it == ranges.end() ? none : it->second;
+        }
+
+        bool intersects(uint32_t idx, size_t first, size_t last) const {
+            for (const auto & range : for_file(idx)) {
+                if (range.first < last && first < range.second) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+    private:
+        std::map<uint32_t, llama_mmap::ranges> ranges;
+        std::set<std::string>                  tensors;
+    } external;
 
     llama_files files;
     std::vector<std::string> fnames; // one per entry of files, for readers that outlive the loader
@@ -239,6 +286,12 @@ struct llama_model_loader {
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
+    llama_expert_store_tensor register_external_tensor(
+            const std::string & name,
+            int32_t layer,
+            llama_expert_projection projection,
+            const std::initializer_list<int64_t> & ne);
+
     void done_getting_tensors(bool partial = false) const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
@@ -256,6 +309,8 @@ struct llama_model_loader {
     bool load_all_data(
             struct ggml_context * ctx,
             llama_buf_map & bufs,
+            bool load_from_mmap,
+            bool discard_file_cache,
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
