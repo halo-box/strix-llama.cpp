@@ -194,7 +194,22 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
+    llama_build_and_test(test-deepseek41-schema.cpp)
+    llama_build_and_test(test-deepseek41-engram.cpp)
+    llama_build_and_test(test-deepseek41-expert.cpp)
+    llama_build_and_test(test-expert-store.cpp)
+    llama_build_and_test(test-deepseek41-memory.cpp)
+    # test-deepseek41-runtime.cpp needs tools/deepseek-v41-trace/trace-components.h
+    # to validate the trace tensor naming contract; that header lands with the
+    # trace harness, so its registration here is deferred to that layer.
+    llama_build_and_test(test-engram.cpp)
     llama_build(test-llama-archs.cpp)
+    llama_test(
+        test-llama-archs
+        NAME test-deepseek41-no-alloc
+        LABEL main
+        ARGS -a deepseek41 -s 1
+    )
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -276,6 +291,17 @@ llama_build_and_test(test-chat-template.cpp)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
+
+find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND Python3_Interpreter_FOUND)
+    llama_test_cmd(
+        ${Python3_EXECUTABLE}
+        NAME test-strix-memory-watchdog
+        LABEL python
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test_strix_memory_watchdog.py
+    )
+endif()
+
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
