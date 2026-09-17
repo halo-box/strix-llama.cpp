@@ -7481,8 +7481,16 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// enable the BF16 WMMA matmul path (mmb); the llama layer calls this per model, by architecture
+static void ggml_backend_cuda_set_mmb_enabled(bool enable) {
+    ggml_cuda_mmb_set_opt_in(enable);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_set_mmb_enabled") == 0) {
+        return (void *)ggml_backend_cuda_set_mmb_enabled;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
