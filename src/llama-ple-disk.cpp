@@ -354,10 +354,12 @@ void llama_ple_disk::prefetch(const int32_t * idx, size_t n) const {
     }
     std::sort(uniq.begin(), uniq.end());
     uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+#if defined(POSIX_FADV_WILLNEED)
     for (const int32_t row : uniq) {
         const off_t off = (off_t) pimpl->offs + (off_t) row * (off_t) pimpl->rs;
         posix_fadvise(pimpl->fd, off, (off_t) pimpl->rs, POSIX_FADV_WILLNEED);
     }
+#endif
 #endif
 }
 
