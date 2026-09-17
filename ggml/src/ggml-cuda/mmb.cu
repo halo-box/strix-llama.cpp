@@ -1,4 +1,6 @@
 #include "mmb.cuh"
+
+#include <atomic>
 #include "unary.cuh"
 #include <unordered_map>
 #include <map>
@@ -679,8 +681,17 @@ static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
     auto it = g_mmb_shadow.find(w->data); return it == g_mmb_shadow.end() ? nullptr : it->second;
 }
 
-// the BF16 WMMA kernels are RDNA3.5 (gfx1151) work: other devices keep the MMQ/MMVQ paths
+// The BF16 WMMA kernels are RDNA3.5 (gfx1151) work, and their tiles and fusions are tuned for the
+// qwen4exp shapes. On other architectures they take MUL_MATs away from MMQ and lose: dense qwen35
+// prefill measured 3.4-3.6x slower on gfx1151 at every ubatch from 512 to 16384, and MoE 1.1-1.2x.
+// So the llama layer opts a model in by arch (ggml_backend_cuda_set_mmb_enabled); default is off.
+// A process that loads several models shares this flag: the last load wins.
+static std::atomic<bool> g_mmb_opt_in{false};
+
 bool mmb_enabled() {
+    if (!g_mmb_opt_in.load(std::memory_order_relaxed)) {
+        return false;
+    }
     const int id = ggml_cuda_get_device();
     return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[id].cc);
 }
@@ -696,6 +707,11 @@ bool mmb_down16_flag() { return true; }
 bool mmb_glu()     { return true; }
 
 } // namespace
+
+// opted in per model by the llama layer, by architecture (see the note on mmb_enabled above)
+void ggml_cuda_mmb_set_opt_in(bool enable) {
+    g_mmb_opt_in.store(enable, std::memory_order_relaxed);
+}
 
 const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t) {
     const ggml_tensor * root = mmb_root(t);

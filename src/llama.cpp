@@ -344,6 +344,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->hparams.vocab_only = params.vocab_only;
         model->hparams.no_alloc   = params.no_alloc;
 
+        // The CUDA/HIP BF16 WMMA matmul path is tuned for the qwen4exp shapes; on other architectures it
+        // takes MUL_MATs away from MMQ and loses (dense qwen35 prefill measured 3.4x slower on gfx1151).
+        // Opt in by architecture rather than by device.
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            auto * set_mmb_fn = (void (*)(bool)) ggml_backend_reg_get_proc_address(
+                    ggml_backend_reg_get(i), "ggml_backend_cuda_set_mmb_enabled");
+            if (set_mmb_fn) {
+                set_mmb_fn(model->arch == LLM_ARCH_QWEN4EXP);
+            }
+        }
+
         try {
             model->load_hparams(ml);
         } catch(const std::exception & e) {
