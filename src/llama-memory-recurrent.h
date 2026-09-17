@@ -177,6 +177,9 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // s_copy(i) == head + i for all i < n_seqs, without side effects; always false with n_rs_seq > 0
+    bool is_s_copy_main_identity(uint32_t n_seqs) const;
+
 private:
     const llama_memory_status status;
 

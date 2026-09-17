@@ -1313,6 +1313,20 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
+bool llama_memory_recurrent_context::is_s_copy_main_identity(uint32_t n_seqs) const {
+    // with n_rs_seq == 0, s_copy(i) is cells[head + i].src0
+    if (is_full || mem->n_rs_seq > 0 || n_seqs > get_n_rs()) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_seqs; ++i) {
+        const uint32_t cell = mem->head + i;
+        if (mem->cells[cell].src0 != (int32_t) cell) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
