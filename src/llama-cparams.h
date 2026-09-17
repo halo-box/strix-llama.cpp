@@ -21,6 +21,8 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    int32_t  mtp_draft_vocab = 0; // MTP draft vocabulary subset in use by this context (0 = full vocabulary)
+
     float rope_freq_base;
     float rope_freq_scale;
 

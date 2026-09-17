@@ -649,7 +649,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (mtp_draft != nullptr && head_w == model.output && n_outputs == 1) {
+        // this context drafts over a row subset of the LM head: scatter its logits into a full-vocab row of -inf
+        GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
+        const int64_t n_sel = mtp_draft->head->ne[1];
+        const int64_t n_row = model.output->ne[1];
+        ggml_tensor * sub = build_lora_mm(mtp_draft->head, cur, head_s);
+        cur = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_row), -INFINITY);
+        cur = ggml_set_rows(ctx0, cur, ggml_reshape_2d(ctx0, sub, 1, n_sel), mtp_draft->ids);
+        cur = ggml_reshape_2d(ctx0, cur, n_row, 1);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

@@ -363,6 +363,9 @@ struct common_params_speculative_draft {
     // size each draft from measured acceptance instead of always drafting n_max
     bool adaptive = false;
 
+    // MTP only: draft over token ids < N plus control tokens (0 = full vocabulary)
+    int32_t mtp_vocab = 0;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

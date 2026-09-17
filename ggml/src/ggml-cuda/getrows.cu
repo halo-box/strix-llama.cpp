@@ -262,6 +262,31 @@ static void get_rows_cuda_kq(
         s10, s11, s12/*, s13*/);
 }
 
+// For small rows (ne00 <= 32) the kernel above launches one workgroup per row with at most ne00 live threads.
+// get_rows f32 with ne00 = 1 over 248320 rows: 986 us with it, 20 us with this flat kernel (gfx1151, ROCm).
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_flat(
+        const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
+        const int64_t ne00, const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    const int64_t n_rows = ne10*ne11*ne12;
+    const int64_t total  = n_rows*ne00;
+    for (int64_t t = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; t < total; t += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t r   = t / ne00;
+        const int64_t i00 = t - r*ne00;
+        const int64_t i10 = r % ne10;
+        const int64_t i11 = (r / ne10) % ne11;
+        const int64_t i12 = r / (ne10*ne11);
+
+        const int i01 = src1_ptr[i10*s10 + i11*s11 + i12*s12];
+
+        const src0_t * src0_row = (const src0_t *)((const char *) src0_ptr + i01*nb01 + i11*nb02 + i12*nb03);
+        dst_ptr[i10*s1 + i11*s2 + i12*s3 + i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+    }
+}
+
 template<typename src0_t, typename dst_t>
 static void get_rows_cuda_float(
         const src0_t * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -270,6 +295,19 @@ static void get_rows_cuda_float(
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+
+    const int64_t flat_total = ne00*ne10*ne11*ne12;
+    const int64_t flat_nblk  = (flat_total + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+    if (ne00 <= 32 && flat_nblk <= 65535) {
+        const dim3 block_nums_flat(flat_nblk, 1, 1);
+        k_get_rows_float_flat<src0_t, dst_t><<<block_nums_flat, block_dims, 0, stream>>>(
+            src0_d, src1_d, dst_d,
+            ne00, ne10, ne11, ne12,
+            nb1 / sizeof(dst_t), nb2 / sizeof(dst_t), nb3 / sizeof(dst_t),
+            nb01, nb02, nb03,
+            nb10 / sizeof(int32_t), nb11 / sizeof(int32_t), nb12 / sizeof(int32_t));
+        return;
+    }
 
     // strides in elements
     // const size_t s0 = nb0 / sizeof(dst_t);
