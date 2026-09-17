@@ -31,6 +31,8 @@ struct llama_file {
     void read_aligned_chunk(void * dest, size_t size);
     uint32_t read_u32();
 
+    void discard_cache(size_t offset, size_t length) const;
+
     void write_raw(const void * ptr, size_t len) const;
     void write_u32(uint32_t val) const;
 
@@ -44,10 +46,12 @@ private:
 struct llama_mmap {
     // list of [first, last) byte ranges within a file
     using ranges = std::vector<std::pair<size_t, size_t>>;
+    using file_advice_override = int (*)(int fd, int advice);
 
     llama_mmap(const llama_mmap &) = delete;
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
-               const ranges & lazy_ranges = {});
+               const ranges & excluded_ranges = {}, bool strict_exclusion = false,
+               file_advice_override file_advice = nullptr);
     ~llama_mmap();
 
     size_t size() const;
@@ -56,6 +60,9 @@ struct llama_mmap {
     void unmap_fragment(size_t first, size_t last);
 
     static const bool SUPPORTED;
+    static bool use_sequential_file_advice(bool strict_exclusion);
+    static ranges planned_prefetch_ranges(
+            size_t file_size, size_t prefetch, const ranges & excluded_ranges, bool strict_exclusion);
 
 private:
     struct impl;
@@ -69,6 +76,7 @@ struct llama_mlock {
     void init(void * ptr);
     void grow_to(size_t target_size);
 
+    static void align_range(size_t * first, size_t * last);
     static const bool SUPPORTED;
 
 private:
