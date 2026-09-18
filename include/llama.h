@@ -157,6 +157,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_PTQ1_0       = 143, // except 1d tensors (Prism group-128 ternary, 1.75 bpw)
 
         // ROCmFPx experimental AMD-native recipes (high ID range, see ggml_ftype)
         LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100, // except 1d tensors
