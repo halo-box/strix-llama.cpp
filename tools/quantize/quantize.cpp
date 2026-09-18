@@ -34,6 +34,7 @@ struct quant_option {
 static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q1_0",     LLAMA_FTYPE_MOSTLY_Q1_0,     " 1.125 bpw quantization",           },
     { "Q2_0",     LLAMA_FTYPE_MOSTLY_Q2_0,     " 2.25 bpw quantization (group 64)",  },
+    { "PTQ1_0",   LLAMA_FTYPE_MOSTLY_PTQ1_0,   " 1.75 bpw ternarization (group 128, Prism)", },
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
     { "Q4_0_ROCMFP4",          LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4,          " 4.50 bpw ROCmFP4 UE4M3-scale experimental", },
     { "Q4_0_ROCMFP4_EVEN",     LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4,          " 4.50 bpw ROCmFP4 even tensor conversion; implies --pure", },
