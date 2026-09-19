@@ -266,8 +266,11 @@ llama_kv_cache::llama_kv_cache(
                 continue;
             }
 
-            if (filter && !filter(il)) {
-                LLAMA_LOG_DEBUG("%s: - layer %3d: filtered\n", __func__, il);
+            // A layer the filter rejected has no storage of its own, which is the case that most
+            // needs to borrow another layer's. Owning storage and reading storage are separate
+            // questions, so only a layer with no KV at all is skipped here.
+            if (!hparams.has_kv(il)) {
+                LLAMA_LOG_DEBUG("%s: - layer %3d: does not have KV cache\n", __func__, il);
                 continue;
             }
 
@@ -345,7 +348,7 @@ llama_kv_cache::llama_kv_cache(
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
+        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41 ||
                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE) &&
                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
@@ -2037,8 +2040,8 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
 }
 
 bool llama_kv_cache::has_cell_ext() const {
-    // M-RoPE needs the 2D position, the PLE n-gram hash needs the token id
-    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
+    // M-RoPE needs the 2D position, the PLE and engram n-gram hashes need the token id
+    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0 || hparams.engram_n_head > 0;
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

@@ -313,6 +313,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("altup")  == std::string::npos;
     quantize &= name.find("laurel") == std::string::npos;
 
+    // DeepSeek-V4.1 engram gate scales: one value per channel, applied with ggml_mul, which has
+    // no quantized path. They are two vectors per engram layer, so keeping them costs nothing.
+    quantize &= name.find("engram_q.weight") == std::string::npos;
+    quantize &= name.find("engram_k.weight") == std::string::npos;
+
     // these are not too big so keep them as it is
     quantize &= name.find("per_layer_model_proj") == std::string::npos;
 
@@ -699,7 +704,8 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) {
                 new_type = GGML_TYPE_IQ3_S;
             }
-            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_Q2_0) {
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 ||
+                     ftype == LLAMA_FTYPE_MOSTLY_Q1_0  || ftype == LLAMA_FTYPE_MOSTLY_Q2_0) {
                 new_type = GGML_TYPE_Q4_K;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_PTQ1_0) {
@@ -729,6 +735,29 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 if (ftype == LLAMA_FTYPE_MOSTLY_IQ1_S || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) new_type = GGML_TYPE_IQ2_XXS;
                 else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M) new_type = GGML_TYPE_IQ3_S;
             }
+        }
+    } else if (ftype == LLAMA_FTYPE_MOSTLY_Q1_0) {
+        // q1_0 gives back every weight in a block at the same magnitude with a sign on it, so
+        // it has no way to express that a weight is small. The other sub-2-bit types stay
+        // usable by spending their bits unevenly rather than by being better per weight, and
+        // this gives q1_0 the same treatment: the projections every later layer reads through
+        // keep enough range to carry a signal, and the bulk of the model stays at one bit.
+        if (category_is_attn_v(category)) {
+            // also covers the MLA kv_b up-projection, which every head reads
+            new_type = GGML_TYPE_Q4_K;
+            ++qs.i_attention_wv;
+        }
+        else if (category == tensor_category::ATTENTION_K && qs.model.hparams.n_expert >= 4) {
+            new_type = GGML_TYPE_Q4_K;
+        }
+        else if (category == tensor_category::FFN_DOWN) {
+            if (qs.i_ffn_down < qs.n_ffn_down/8) {
+                new_type = GGML_TYPE_Q2_K;
+            }
+            ++qs.i_ffn_down;
+        }
+        else if (category == tensor_category::ATTENTION_OUTPUT) {
+            new_type = GGML_TYPE_Q2_K;
         }
     } else if (category_is_attn_v(category)) {
         if (rocmfpx_is_q3_family(ftype)) {

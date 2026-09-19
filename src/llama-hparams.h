@@ -330,6 +330,24 @@ struct llama_hparams {
     // scale of the hyper-connection post gate (DeepSeek-V4 hardcodes 2.0)
     float    hc_magnitude = 0.0f;
 
+    // Engram (n-gram lookup table) for DeepSeek-V4.1
+    uint32_t engram_n_head          = 0;
+    uint32_t engram_key_length      = 0;
+    uint32_t engram_max_ngram_size  = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> engram_layer_ids;
+
+    // DeepSeek-V4.1 compresses KV on a few source layers and shares each stream with the layers
+    // that follow, so for every layer these hold the layer that published what it reads, or -1
+    // when it reads nothing. A layer whose entry is itself is a source. The KV cache needs these
+    // to alias a reader's storage onto its source's, so they live here rather than on the model.
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_source;
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_index_key_source;
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_source;
+
+    bool dsv41_is_kv_source   (uint32_t il) const { return dsv41_kv_source[il]        == (int32_t) il; }
+    bool dsv41_owns_index_k   (uint32_t il) const { return dsv41_index_key_source[il] == (int32_t) il; }
+    bool dsv41_is_index_source(uint32_t il) const { return dsv41_topk_source[il]      == (int32_t) il; }
+
     uint32_t ple_ngram_size      = 0;
     uint32_t ple_heads_per_ngram = 0;
     uint32_t ple_conv_kernel     = 0;
