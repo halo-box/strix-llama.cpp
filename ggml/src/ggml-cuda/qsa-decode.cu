@@ -5,7 +5,7 @@
 static __global__ __launch_bounds__(128) void qsa_decode_partial(
         const char * q, const char * k, const char * v, const char * mask, const char * ids,
         size_t q1, size_t q2, size_t k1, size_t k2, size_t v1, size_t v2, size_t m1, size_t i1,
-        int nk, int ns, int nh, int ratio, int splits, float scale, float * partial) {
+        int nk, int ns, int nh, int ratio, int splits, int chunk, float scale, float * partial) {
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int head = blockIdx.x, query = blockIdx.y, split = blockIdx.z;
     const int kv_head = head / ratio;
@@ -16,7 +16,7 @@ static __global__ __launch_bounds__(128) void qsa_decode_partial(
 #pragma unroll
     for (int d = 0; d < 8; ++d) { qv[d] = qr[lane + d*32]; }
     float mx = -INFINITY, sum = 0.0f;
-    const int begin = split*128, end = min(ns, begin + 128);
+    const int begin = split*chunk, end = min(ns, begin + chunk);
     for (int j = begin + warp; j < end; j += 4) {
         const int key = ir[j];
         if (key < 0 || key >= nk) { continue; }
@@ -88,7 +88,7 @@ bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & c
     memcpy(&cap, (const char *) dst->op_params + 8, 4);
     if (bias != 0.0f || cap != 0.0f || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 ||
         v->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
-        q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 || q->ne[1] < 1 || q->ne[1] > 8 ||
+        q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 || q->ne[1] < 1 || q->ne[1] > QSA_DECODE_MAX_QUERIES ||
         k->ne[1] < 1 || k->ne[1] > 262144 || v->ne[1] != k->ne[1] ||
         k->ne[2] < 1 || q->ne[2] % k->ne[2] || v->ne[2] != k->ne[2] ||
         q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
@@ -127,7 +127,14 @@ void ggml_cuda_flash_attn_ext_qsa_decode(ggml_backend_cuda_context & ctx, ggml_t
     const bool wmma = q->ne[2] == 12*k->ne[2] && k->nb[1]%16 == 0 &&
         k->nb[2]%16 == 0 && uintptr_t(k->data)%16 == 0;
     const int ns = ids->ne[0], nq = q->ne[1], nh = q->ne[2], step = wmma ? 64 : 128;
-    const int splits = (ns + step - 1)/step;
+    // up to 8 queries every split covers `step` keys; with more queries the splits get longer so the grid stays
+    // near its 8-query size and the partial buffer stays small (33 splits x 512 queries would need ~420 MB)
+    int chunk = step;
+    if (nq > 8) {
+        const int target = std::max(1, (8*((ns + step - 1)/step) + nq - 1)/nq);
+        chunk = ((ns + target - 1)/target + 15)/16*16;
+    }
+    const int splits = (ns + chunk - 1)/chunk;
     float scale;
     memcpy(&scale, dst->op_params, sizeof(scale));
     ggml_cuda_pool_alloc<float> partial(ctx.pool(), size_t(nq)*nh*splits*258);
@@ -136,13 +143,13 @@ void ggml_cuda_flash_attn_ext_qsa_decode(ggml_backend_cuda_context & ctx, ggml_t
         (const char *) q->data, (const char *) k->data, (const char *) v->data,
         m ? (const char *) m->data : nullptr, (const char *) unique_ids.get(),
         q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2], m ? m->nb[1] : 0, size_t(ns)*sizeof(int),
-        k->ne[1], ns, nh, splits, scale, partial.get());
+        k->ne[1], ns, nh, splits, chunk, scale, partial.get());
     } else {
     qsa_decode_partial<<<dim3(nh, nq, splits), 128, 0, ctx.stream()>>>(
         (const char *) q->data, (const char *) k->data, (const char *) v->data,
         m ? (const char *) m->data : nullptr, (const char *) unique_ids.get(),
         q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2], m ? m->nb[1] : 0, size_t(ns)*sizeof(int),
-        k->ne[1], ns, nh, nh/k->ne[2], splits, scale, partial.get());
+        k->ne[1], ns, nh, nh/k->ne[2], splits, chunk, scale, partial.get());
     }
     qsa_decode_merge<<<nq*nh, 256, 0, ctx.stream()>>>(partial.get(), (float *) dst->data, splits);
     CUDA_CHECK(cudaGetLastError());

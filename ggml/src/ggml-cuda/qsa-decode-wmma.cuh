@@ -6,7 +6,7 @@ typedef float qd_float8 __attribute__((ext_vector_type(8)));
 static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
         const char * q, const char * k, const char * v, const char * mask, const char * ids,
         size_t q1, size_t q2, size_t k1, size_t k2, size_t v1, size_t v2, size_t m1, size_t i1,
-        int nk, int ns, int nh, int splits, float scale, float * partial) {
+        int nk, int ns, int nh, int splits, int chunk, float scale, float * partial) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     NO_DEVICE_CODE;
 #else
@@ -36,8 +36,8 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
     __syncthreads();
     qd_float8 output[2] = {};
     float maximum = -INFINITY, normalizer = 0.0f;
-    const int end = min(ns, split*64+64);
-    for (int start = split*64; start < end; start += 16) {
+    const int begin = split*chunk, end = min(ns, begin+chunk);
+    for (int start = begin; start < end; start += 16) {
         int keys[16];
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
