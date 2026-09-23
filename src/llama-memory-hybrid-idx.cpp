@@ -1063,7 +1063,10 @@ bool llama_memory_hybrid_idx::qsa_prefix_matches(const llama_ubatch & u) const {
 }
 
 bool llama_memory_hybrid_idx::qsa_fast(int il, const llama_ubatch & u) const {
-    return qsa_prefix_matches(u) && u.n_tokens <= 8 && qsa_keys.at(il) &&
+    // re-pool only the (n+3)/4+2 blocks this ubatch touches instead of every block of the cache. Limited to 127 tokens:
+    // with 128..512-token ubatches the results were not bit-equal to the full re-pool (perplexity at ub 512 changed on
+    // gfx1151, 2026-09-23) and the cause is not known yet
+    return qsa_prefix_matches(u) && u.n_tokens <= 127 && qsa_keys.at(il) &&
         qsa_ready.at(il) >= int64_t(qsa_prefix.previous_size/4) &&
         qsa_prefix.cells.size()/4 >= (u.n_tokens+3)/4+1;
 }
