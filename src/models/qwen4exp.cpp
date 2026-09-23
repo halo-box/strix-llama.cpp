@@ -805,17 +805,17 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
 // Complete-block selection: pick indexer_top_k/ratio whole blocks that lie before the query's own block and
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
 // selected rows then carry the visibility themselves, so attention can run without a mask. Only the selected-key
-// attention kernels understand that layout (F16 K/V, head 256, single stream, decode-sized or >= 128-query
-// ubatches), so the selection is only used where one of them will take the op.
+// attention kernels understand that layout (F16 K/V, head 256, single stream; qsa_decode takes 1..512 queries,
+// qsa_prefill larger ubatches). They exist only in the HIP backend for RDNA3.5; the gate does not check the device, so
+// on any other backend the resulting maskless op is not taken by a QSA kernel.
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
         ggml_type type_k, ggml_type type_v) {
-    const int64_t n_tps = n_stream > 0 ? ubatch.n_tokens/n_stream : 0;
     return blk_bias && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
         n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
-        type_k==GGML_TYPE_F16 && type_v==GGML_TYPE_F16 && (n_tps<=8 || n_tps>=128);
+        type_k==GGML_TYPE_F16 && type_v==GGML_TYPE_F16;
 }
 
 // Visible-prefix scoring bound. For one sequence with unique non-negative positions the indexer enumerates
