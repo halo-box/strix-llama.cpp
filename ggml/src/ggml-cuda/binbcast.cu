@@ -720,7 +720,7 @@ static __global__ void shared_mul_add_f32(
     if (index >= nelements) {
         return;
     }
-    volatile float product = src[index] * gate[index / n_embd];
+    const float product = ggml_cuda_materialize(src[index] * gate[index / n_embd]);
     float value = other[index] + product;
     dst[index] = value + residual[index];
 }

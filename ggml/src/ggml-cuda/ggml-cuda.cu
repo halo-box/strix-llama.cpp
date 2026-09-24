@@ -4117,6 +4117,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
     }
+
+    if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && node->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(node) && !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, node)) {
+        uint16_t * dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i, node);
+        if (dst16) {
+            ggml_cuda_op_swiglu(*cuda_ctx, node, dst16);
+            return GGML_CUDA_FUSED_SELF;
+        }
+    }
     if (node->op == GGML_OP_MUL && node->ne[0] == 2048 && i + 2 < cgraph->n_nodes &&
         ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD }, { i + 2 })) {
         ggml_tensor * add0 = cgraph->nodes[i + 1];
@@ -4976,6 +4985,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (match.pre >= 0 && !ggml_cuda_compute_forward(*cuda_ctx, cgraph->nodes[match.pre])) {
                     GGML_ABORT("norm-gated: gate MUL_MAT dispatch failed");
                 }
+                match.dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i + skip, match.dst);
                 ggml_cuda_op_norm_gated(*cuda_ctx, match);
             }
             return skip;
@@ -5057,6 +5067,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             // HC16: a BF16 copy of xn for its consumers, and BF16 residual / block_out streams where every reader agreed
             args.out_xn_bf16  = ggml_cuda_mmb_cache_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn));
             args.store_xn_f32 = !(args.out_xn_bf16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, args.out_xn));
+            if (!args.store_xn_f32 && !args.out_inject) {
+                ggml_cuda_hc_combine_norm_args sa;
+                ggml_cuda_match_hc_combine_norm(cgraph, i, sa, ggml_cuda_info().devices[cuda_ctx->device].warp_size, false);
+                if (sa.out_inject) {
+                    GGML_ABORT("hc_combine_norm: %s is BF16-only but the fused inject projection was refused (aliasing); "
+                               "the graph_optimize allocation dependencies should have prevented it", args.out_xn->name);
+                }
+            }
             if (ggml_cuda_mmb_res16()) {
                 const ggml_tensor * rin  = args.residual->view_src ? args.residual->view_src : args.residual;
                 const ggml_tensor * rout = args.out_res->view_src  ? args.out_res->view_src  : args.out_res;
@@ -5197,10 +5215,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 (mul->src[0] == unary || mul->src[1] == unary) && gate->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 &&
                 gate->nb[0] == sizeof(float) && gate->nb[1] == 2 * gate->ne[0] * sizeof(float) &&
                 gate->nb[2] == gate->nb[1] * gate->ne[1] && gate->nb[3] == gate->nb[2] * gate->ne[2] &&
-                ggml_is_contiguous(other) && ggml_are_same_shape(gate, other) &&
+                ggml_is_contiguous(other) && ggml_are_same_shape(node, other) && ggml_are_same_shape(unary, node) &&
+                ggml_are_same_shape(mul, other) &&
                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { i + 2 }) &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
-            ggml_cuda_op_cont_sigmoid_mul(*cuda_ctx, node, unary, mul);
+            ggml_cuda_op_cont_sigmoid_mul(*cuda_ctx, node, unary, mul, ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i + 2, mul));
             return 2;
         }
     }
@@ -5246,7 +5265,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         cgraph->nodes[i + 1]->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(cgraph->nodes[i + 1]) &&
         ggml_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY })) {
-        ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1],
+            ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i + 1, cgraph->nodes[i + 1]));
         return 1;
     }
 
@@ -5394,6 +5414,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (nodes_to_skip == GGML_CUDA_FUSED_SELF) {
+                    continue;
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -5648,6 +5671,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     const ggml_tensor * t = cgraph->nodes[n];
                     if (!reads(t, xn)) continue;
                     ++nread;
+                    if (t == ca.out_inject) continue;
                     if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 &&
                         ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                     if (t->op == GGML_OP_MUL && n >= 1) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n - 1, ma) > 0 && (ma.xn == t->src[0] || ma.xn == t->src[1]) && (ma.xn == xn || ma.xn->view_src == xn)) continue; }
