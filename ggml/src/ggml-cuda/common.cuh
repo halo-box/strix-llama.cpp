@@ -1453,6 +1453,8 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_mmb_context;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1464,6 +1466,11 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
+
+    ggml_cuda_mmb_context * mmb = nullptr;
+    bool mmb_after_compute = true;
+    const void * mmb_first_split = nullptr;
+    std::vector<uint64_t> mmb_graph_sigs;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
