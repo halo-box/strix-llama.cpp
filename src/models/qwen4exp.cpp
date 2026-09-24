@@ -832,19 +832,32 @@ static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_
     for (uint32_t i = 1; degenerate_pos && i < ubatch.n_tokens; ++i) {
         if (ubatch.pos[i] != ubatch.pos[0]) { degenerate_pos = false; }
     }
-    if (!compact || ubatch.n_tokens<128 || degenerate_pos || !mctx->qsa_position_prefix(ubatch)) {
+    // the trim assumes one causal visible range; a ubatch that mixes sequences has several, so leave it unbounded
+    bool multi_seq = false;
+    if (ubatch.n_seq_id && ubatch.seq_id && ubatch.n_seq_id[0] > 0) {
+        const llama_seq_id s0 = ubatch.seq_id[0][0];
+        for (uint32_t i = 1; i < ubatch.n_tokens && !multi_seq; ++i) {
+            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != s0) { multi_seq = true; }
+        }
+    }
+    if (!compact || multi_seq || ubatch.n_tokens<128 || degenerate_pos || !mctx->qsa_position_prefix(ubatch)) {
         return {};
     }
     return qsa_prefix_limits(ubatch.pos,ubatch.n_tokens,strip,ratio,blocks,budget);
 }
 
-// compact visibility: limits = [block start position per block (INT32_MAX when unfinished)] ++ [tail start per
-// query]; a block is visible to a query iff its start < the query's tail start. log(step(.)) is 0 or -inf.
+// compact visibility: limits = [block start per seq row (n_seq x blocks, INT32_MAX when the block is not a
+// complete block of that seq)] ++ [tail start per query] ++ [row index per query]. Each query reads the start
+// row of its own sequence, so one graph serves several sequences without a mask. A block is visible to a query
+// iff its start < the query's tail start. log(step(.)) is 0 or -inf. With n_seq=1 this is the old single-seq
+// layout (row_idx all 0) and produces byte-identical scores.
 static ggml_tensor * qwen4exp_apply_compact_visibility(ggml_context *ctx,ggml_tensor *score,
-        ggml_tensor *limits,int64_t blocks,int64_t first,int64_t queries) {
+        ggml_tensor *limits,int64_t blocks,int64_t n_seq,int64_t n_tps,int64_t first,int64_t queries) {
     GGML_ASSERT(limits->type==GGML_TYPE_I32 && score->ne[0]<=blocks && score->ne[1]==queries && score->ne[2]==1);
-    auto *starts=ggml_cast(ctx,ggml_view_1d(ctx,limits,score->ne[0],0),GGML_TYPE_F32);
-    auto *tails=ggml_cast(ctx,ggml_view_1d(ctx,limits,queries,(blocks+first)*sizeof(int32_t)),GGML_TYPE_F32);
+    auto *starts2d=ggml_view_2d(ctx,limits,score->ne[0],n_seq,blocks*sizeof(int32_t),0);
+    auto *row_idx=ggml_view_1d(ctx,limits,queries,(blocks*n_seq+n_tps+first)*sizeof(int32_t));
+    auto *starts=ggml_cast(ctx,ggml_get_rows(ctx,starts2d,row_idx),GGML_TYPE_F32);
+    auto *tails=ggml_cast(ctx,ggml_view_1d(ctx,limits,queries,(blocks*n_seq+first)*sizeof(int32_t)),GGML_TYPE_F32);
     tails=ggml_reshape_2d(ctx,tails,1,queries);
     auto *visible=ggml_step(ctx,ggml_sub(ctx,ggml_repeat(ctx,tails,score),starts));
     return ggml_add(ctx,score,ggml_log(ctx,visible));
@@ -1081,6 +1094,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens/n_stream;
 
+    // maskless multi-seq: one block-start row per sequence, row index = seq id, bounded by n_seq_max so every
+    // runtime seq id lands in range. n_seq=1 (np1) reduces the compact layout to the original single-seq one.
+    const int64_t n_seq = cparams.n_seq_max;
+
     // only the "which block is visible" half of the bias varies per block
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
@@ -1111,7 +1128,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->score_strip = qwen4exp_query_strip(n_tps, n_stream);
         qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, n_blocks, qsa->score_strip, r,
                 hparams.indexer_top_k/r, qsa->compact);
-        qsa->bias = qsa->compact ? ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks + n_tps) :
+        qsa->bias = qsa->compact ? ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks*n_seq + 2*n_tps) :
             ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
         ggml_set_input(qsa->cell_blk);
@@ -1242,7 +1259,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // one value per block, so it is cheaper to bias here than after the cells are expanded
         if (inp->compact) {
-            score = qwen4exp_apply_compact_visibility(ctx0, score, inp->bias, n_blocks, first, n_query);
+            score = qwen4exp_apply_compact_visibility(ctx0, score, inp->bias, n_blocks, n_seq, n_tps, first, n_query);
         } else if (blk_bias) {
             score = ggml_add(ctx0, score, bias);
         }

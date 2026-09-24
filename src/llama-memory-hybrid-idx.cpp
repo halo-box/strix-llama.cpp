@@ -375,11 +375,18 @@ bool llama_memory_hybrid_idx::qsa_metadata(ggml_tensor * members, ggml_tensor * 
             std::fill(p+a*blocks+complete, p+(a+1)*blocks, 0);
         }
     }
-    std::copy_n(qsa_prefix.block_positions.data(), complete, lim);
-    std::fill(lim+complete, lim+blocks, INT32_MAX);
+    const int64_t n_tps = u.n_tokens;
+    const int64_t n_seq = (bias->ne[0] - 2*n_tps) / blocks;
+    const int64_t row   = qsa_prefix.sequence;
+    if (n_seq < 1 || row < 0 || row >= n_seq) { return false; }
+    const int64_t base  = blocks * n_seq;
+    std::fill(lim, lim + base, INT32_MAX);
+    std::copy_n(qsa_prefix.block_positions.data(), complete, lim + row*blocks);
+    std::fill(lim + row*blocks + complete, lim + (row+1)*blocks, INT32_MAX);
     std::fill(tail, tail+3*u.n_tokens, -1);
     for (uint32_t i=0; i<u.n_tokens; ++i) {
-        int32_t end = u.pos[i]+1, start = end/4*4; lim[blocks+i] = start;
+        int32_t end = u.pos[i]+1, start = end/4*4; lim[base+i] = start;
+        lim[base + n_tps + i] = (int32_t) row;
         for (int j=0; j<end-start; ++j) { tail[3*i+j] = qsa_prefix.cells[start+j]; }
     }
     return true;
@@ -500,9 +507,9 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
     float   * dst_bias      = compact ? nullptr : (float *) bias->data;
     int32_t * limits        = compact ? (int32_t *) bias->data : nullptr;
     if (compact) {
-        GGML_ASSERT(tail_idxs && blk_bias && n_ns == 1 && ggml_nelements(bias) == n_blocks+n_tps);
-        for (int64_t i=0;i<n_tokens;++i) { GGML_ASSERT(ubatch->seq_id[i][0] == ubatch->seq_id[0][0]); }
+        GGML_ASSERT(tail_idxs && blk_bias && n_ns == 1 && (ggml_nelements(bias) - 2*n_tps) % n_blocks == 0);
     }
+    const int64_t n_seq = compact ? (ggml_nelements(bias) - 2*n_tps) / n_blocks : 1;
     int32_t * dst_tail = tail_idxs ? (int32_t *) tail_idxs->data : nullptr;
     if (tail_idxs) {
         GGML_ASSERT(blk_bias && r > 1 && ggml_backend_buffer_is_host(tail_idxs->buffer));
@@ -739,9 +746,16 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
         }
 
         if (compact) {
-            const llama_seq_id seq = ubatch->seq_id[0][0];
-            for (int64_t b=0;b<n_blocks;++b) {
-                limits[b] = b<n_bid && cells.seq_has((uint32_t)bid_cell[b],seq) ? bid_idx[b] : INT32_MAX;
+            // one start row per sequence: block b is a complete block of seq s iff its group is a singleton {s}
+            std::fill(limits, limits + n_blocks*n_seq, INT32_MAX);
+            for (int64_t b=0;b<n_bid;++b) {
+                if (cells.seq_count((uint32_t) bid_cell[b]) != 1) { continue; }
+                for (int64_t row=0;row<n_seq;++row) {
+                    if (cells.seq_has((uint32_t) bid_cell[b], (llama_seq_id) row)) {
+                        limits[row*n_blocks + b] = bid_idx[b];
+                        break;
+                    }
+                }
             }
         }
 
@@ -795,7 +809,9 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
 
             if (compact) {
                 GGML_ASSERT(tail_start >= 0 && tail_start <= 16777216);
-                limits[n_blocks+ii] = (int32_t)tail_start;
+                const int64_t base = n_blocks*n_seq;
+                limits[base + ii] = (int32_t)tail_start;
+                limits[base + n_tps + ii] = (int32_t)seq_id;
                 continue;
             }
 
@@ -975,17 +991,32 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
             !ubatch.n_pos || !ubatch.seq_id || !ubatch.n_seq_id) { return false; }
     if (ubatch.n_seq_id[0]<1 || !ubatch.seq_id[0]) { return false; }
     const llama_seq_id seq=ubatch.seq_id[0][0];
+    bool single = true;
     for (uint32_t i=0;i<ubatch.n_tokens;++i) {
-        if (ubatch.n_seq_id[i]<1 || !ubatch.seq_id[i] || ubatch.seq_id[i][0]!=seq ||
-                ubatch.pos[i]<0 || ubatch.pos[i]>=16777216) { return false; }
+        if (ubatch.n_seq_id[i]<1 || !ubatch.seq_id[i] || ubatch.seq_id[i][0]!=seq) { single = false; break; }
+    }
+    if (single) {
+        for (uint32_t i=0;i<ubatch.n_tokens;++i) {
+            if (ubatch.pos[i]<0 || ubatch.pos[i]>=16777216) { return false; }
+            for (uint32_t axis=1;axis<ubatch.n_pos;++axis) {
+                if (ubatch.pos[i+axis*ubatch.n_tokens]!=ubatch.pos[i]) { return false; }
+            }
+        }
+        if (ubatch.is_pos_2d()) {
+            const auto & cells=mem->get_mem_idx()->get_cells(seq);
+            for (uint32_t j=0;j<get_idx()->get_n_kv();++j) {
+                if (!cells.is_empty(j) && cells.seq_has(j,seq) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
+            }
+        }
+        return true;
+    }
+    // multi-seq maskless: exactly one sequence per token, and no 2-D (image) positions in the batch
+    if (ubatch.is_pos_2d()) { return false; }
+    for (uint32_t i=0;i<ubatch.n_tokens;++i) {
+        if (ubatch.n_seq_id[i]!=1 || !ubatch.seq_id[i]) { return false; }
+        if (ubatch.pos[i]<0 || ubatch.pos[i]>=16777216) { return false; }
         for (uint32_t axis=1;axis<ubatch.n_pos;++axis) {
             if (ubatch.pos[i+axis*ubatch.n_tokens]!=ubatch.pos[i]) { return false; }
-        }
-    }
-    if (ubatch.is_pos_2d()) {
-        const auto & cells=mem->get_mem_idx()->get_cells(seq);
-        for (uint32_t j=0;j<get_idx()->get_n_kv();++j) {
-            if (!cells.is_empty(j) && cells.seq_has(j,seq) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
         }
     }
     return true;
