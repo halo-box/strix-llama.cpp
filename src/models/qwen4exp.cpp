@@ -955,7 +955,8 @@ public:
         res &= cell_blk->ne[1]  == n_stream;
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
-        res &= bias->ne[0]      == (compact ? n_blocks + params.ubatch.n_tokens : (blk_bias ? n_blocks : n_kv));
+        const int64_t n_tps = params.ubatch.n_tokens / n_stream;
+        res &= bias->ne[0]      == (compact ? n_blocks * params.cparams.n_seq_max + 2*n_tps : (blk_bias ? n_blocks : n_kv));
         res &= compact || bias->ne[1] == params.ubatch.n_tokens/n_stream;
 
         // the selection mode and the strip bounds are baked into the graph, so a reused graph must agree on them
@@ -982,7 +983,7 @@ public:
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream], or the compact
-                                         // I32 [n_blocks + n_tokens] visibility limits
+                                         // I32 [n_seq_max*n_blocks + 2*n_tps] visibility limits
 
     // complete-block selection (see qwen4exp_use_block_selection): the query's own partial block, -1 padded
     ggml_tensor * tail_idxs = nullptr;   // I32 [ratio-1, n_tokens/n_stream, n_stream]
