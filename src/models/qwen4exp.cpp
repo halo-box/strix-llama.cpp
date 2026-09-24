@@ -575,14 +575,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
-    ggml_tensor * lo = build_lora_mm(w_down, xn);
     if (inject) {
-        // the inject projection reads the same xn as the down projection: emit the two matvecs back to back so
-        // that the backend can launch them as one grouped kernel (the inject result is only used by hc_combine)
-        ggml_build_forward_expand(gf, lo);
         *inject = build_lora_mm(w_inject, xn);
         cb(*inject, "hc_inject", il);
         ggml_build_forward_expand(gf, *inject);
+    }
+    ggml_tensor * lo = build_lora_mm(w_down, xn);
+    if (inject) {
+        ggml_build_forward_expand(gf, lo);
     }
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
