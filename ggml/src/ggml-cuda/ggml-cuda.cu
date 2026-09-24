@@ -709,6 +709,23 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    if (mmb) {
+        // Queued work and captured graphs can still reference the MMB buffers.
+        for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+            for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+                if (streams[i][j]) {
+                    ggml_cuda_set_device(i);
+                    CUDA_CHECK(cudaStreamSynchronize(streams[i][j]));
+                }
+            }
+        }
+        ggml_cuda_set_device(device);
+#ifdef USE_CUDA_GRAPH
+        cuda_graphs.clear();
+#endif
+        ggml_cuda_mmb_release_all(*this);
+    }
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -2082,11 +2099,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     // a tensor marked BF16-only was never written as F32: any reader outside the fused paths is a bug, not a fallback
-    if (ggml_cuda_mmb_marks_count() > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_VIEW &&
+    if (ggml_cuda_mmb_marks_count(ctx) > 0 && dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID && dst->op != GGML_OP_VIEW &&
             dst->op != GGML_OP_RESHAPE && dst->op != GGML_OP_PERMUTE && dst->op != GGML_OP_TRANSPOSE && dst->op != GGML_OP_NONE) {
         for (int s = 0; s < GGML_MAX_SRC && dst->src[s]; ++s) {
             const ggml_tensor * src = dst->src[s];
-            if (ggml_cuda_mmb_is_bf16_only(src) || (src->view_src && ggml_cuda_mmb_is_bf16_only(src->view_src))) {
+            if (ggml_cuda_mmb_is_bf16_only(ctx, src) || (src->view_src && ggml_cuda_mmb_is_bf16_only(ctx, src->view_src))) {
                 GGML_ABORT("MMB: %s(%s) reads BF16-only tensor %s through the unfused path", ggml_op_name(dst->op), dst->name, src->name);
             }
         }
@@ -2462,7 +2479,6 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
-    ggml_cuda_mmb_release_all();   // release cached BF16 conversions before the pool is destroyed (pool leak assert)
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     delete cuda_ctx;
@@ -4372,7 +4388,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_cuda_mmb_blk16() && nadd < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + match.node_count - 1, 1)) {
                     const ggml_tensor * add = cgraph->nodes[nadd];
                     if (add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 && ggml_is_contiguous(add) &&
-                            ggml_are_same_shape(add, match.dst) && ggml_cuda_mmb_is_bf16_only(add)) {
+                            ggml_are_same_shape(add, match.dst) && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, add)) {
                         const ggml_tensor * o = add->src[0] == match.dst ? add->src[1] : (add->src[1] == match.dst ? add->src[0] : nullptr);
                         if (o && o->type == GGML_TYPE_F32 && ggml_is_contiguous(o) && ggml_are_same_shape(o, match.dst)) {
                             merge = o; match.dst = const_cast<ggml_tensor *>(add); count = match.node_count + 1;
@@ -4423,7 +4439,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && node->src[1] &&
-            !ggml_cuda_mmb_is_bf16_only(node) && !ggml_cuda_mmb_claims(cgraph->nodes[i + 1])) {
+            !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, node) && !ggml_cuda_mmb_claims(cgraph->nodes[i + 1])) {
         ggml_tensor * next = cgraph->nodes[i + 1];
         const bool has_ids = next->op == GGML_OP_MUL_MAT_ID;
         if (has_ids || next->op == GGML_OP_MUL_MAT) {
@@ -5467,18 +5483,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (skip > 0 && !args.single_block) {
             // HC16: a BF16 copy of xn for its consumers, and BF16 residual / block_out streams where every reader agreed
             args.out_xn_bf16  = ggml_cuda_mmb_cache_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn));
-            args.store_xn_f32 = !(args.out_xn_bf16 && ggml_cuda_mmb_is_bf16_only(args.out_xn));
+            args.store_xn_f32 = !(args.out_xn_bf16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, args.out_xn));
             if (ggml_cuda_mmb_res16()) {
                 const ggml_tensor * rin  = args.residual->view_src ? args.residual->view_src : args.residual;
                 const ggml_tensor * rout = args.out_res->view_src  ? args.out_res->view_src  : args.out_res;
-                const bool in16  = ggml_cuda_mmb_is_bf16_only(rin)  && args.residual->view_offs == 0;
-                const bool out16 = ggml_cuda_mmb_is_bf16_only(rout) && args.out_res->view_offs == 0;
+                const bool in16  = ggml_cuda_mmb_is_bf16_only(*cuda_ctx, rin)  && args.residual->view_offs == 0;
+                const bool out16 = ggml_cuda_mmb_is_bf16_only(*cuda_ctx, rout) && args.out_res->view_offs == 0;
                 if (args.out_res->data == args.residual->data && in16 != out16) {
                     GGML_ABORT("hc_combine_norm: in-place residual with mismatched BF16 marks (%s); the graph_optimize "
                                "allocation dependency should have separated them", args.out_res->name);
                 }
                 const ggml_tensor * rblk = args.block_out->view_src ? args.block_out->view_src : args.block_out;
-                args.blk_in_bf16  = (ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(rblk) && args.block_out->view_offs == 0)
+                args.blk_in_bf16  = (ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, rblk) && args.block_out->view_offs == 0)
                                   ? (const uint16_t *) args.block_out->data : nullptr;
                 args.res_in_bf16  = in16  ? (const uint16_t *) args.residual->data : nullptr;
                 args.res_out_bf16 = out16 ? (uint16_t *) args.out_res->data : nullptr;
@@ -5491,7 +5507,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_info().devices[cuda_ctx->device].warp_size, false);
             if (structural > 0) {
                 const ggml_cuda_hc_combine_norm_args & a = skip > 0 ? args : sa;
-                auto marked = [](const ggml_tensor * t) { return ggml_cuda_mmb_is_bf16_only(t) || (t->view_src && ggml_cuda_mmb_is_bf16_only(t->view_src)); };
+                auto marked = [cuda_ctx](const ggml_tensor * t) { return ggml_cuda_mmb_is_bf16_only(*cuda_ctx, t) || (t->view_src && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, t->view_src)); };
                 if (marked(a.out_xn) || marked(a.residual) || marked(a.out_res) || marked(a.block_out)) {
                     GGML_ABORT("hc_combine_norm: %s has BF16-only streams but the fused kernel was refused (%s); the graph_optimize "
                                "allocation dependencies should have prevented the aliasing", a.out_res->name,
@@ -5888,16 +5904,10 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
-// tracks when a new split sequence starts, so the mmb marks are cleared once per sequence
-static bool         g_gt_after_compute = true;
-static const void * g_gt_first_split   = nullptr;
-
 // the marks are keyed by tensor pointer and belong to the graphs graph_optimize last saw. A graph computed without
 // that optimize (test-backend-ops, any direct ggml_backend_graph_compute caller) can recycle those addresses, so a
 // producer would store BF16 into a tensor of another graph and a plain reader would abort. Fingerprint each optimized
 // split and drop the marks when a graph arrives that none of them match; a reused (identical) graph keeps them.
-static std::vector<uint64_t> g_gt_graph_sigs;
-
 static uint64_t ggml_cuda_graph_sig(const ggml_cgraph * cgraph) {
     // no data pointers: the scheduler allocates after graph_optimize, so they differ between optimize and compute
     uint64_t h = 1469598103934665603ull ^ (uint64_t) cgraph->n_nodes;
@@ -5913,16 +5923,16 @@ static uint64_t ggml_cuda_graph_sig(const ggml_cgraph * cgraph) {
 }
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
-    if (ggml_cuda_mmb_marks_count() > 0) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ggml_cuda_mmb_marks_count(*cuda_ctx) > 0) {
         const uint64_t sig = ggml_cuda_graph_sig(cgraph);
-        if (std::find(g_gt_graph_sigs.begin(), g_gt_graph_sigs.end(), sig) == g_gt_graph_sigs.end()) {
-            ggml_cuda_mmb_marks_clear();
-            g_gt_graph_sigs.clear();
-            g_gt_first_split = nullptr;
+        if (std::find(cuda_ctx->mmb_graph_sigs.begin(), cuda_ctx->mmb_graph_sigs.end(), sig) == cuda_ctx->mmb_graph_sigs.end()) {
+            ggml_cuda_mmb_marks_clear(*cuda_ctx);
+            cuda_ctx->mmb_graph_sigs.clear();
+            cuda_ctx->mmb_first_split = nullptr;
         }
     }
-    ggml_cuda_mmb_begin_graph();
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_mmb_begin_graph(*cuda_ctx);
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -5977,7 +5987,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
-    g_gt_after_compute = true;
+    cuda_ctx->mmb_after_compute = true;
     return GGML_STATUS_SUCCESS;
 }
 
@@ -6041,7 +6051,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     {   // marks live for the whole scheduled graph (all splits): clear at the first optimize after a compute, or when the first split repeats
         const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
-        if (g_gt_after_compute || g_gt_first_split == nullptr || key == g_gt_first_split) { ggml_cuda_mmb_marks_clear(); g_gt_graph_sigs.clear(); g_gt_first_split = key; g_gt_after_compute = false; }
+        if (cuda_ctx->mmb_after_compute || cuda_ctx->mmb_first_split == nullptr || key == cuda_ctx->mmb_first_split) { ggml_cuda_mmb_marks_clear(*cuda_ctx); cuda_ctx->mmb_graph_sigs.clear(); cuda_ctx->mmb_first_split = key; cuda_ctx->mmb_after_compute = false; }
     }
     {   // HC16: mark tensors whose readers all take the BF16 copy, so their producers skip the F32 store
         if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
@@ -6064,7 +6074,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                     ok = false;
                 }
-                if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, xn)) ggml_cuda_mmb_mark_bf16_only(xn);
+                if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, xn)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, xn);
             }
             if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
                 std::vector<const ggml_tensor *> blks;
@@ -6102,7 +6112,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (t->op == GGML_OP_MUL || t->op == GGML_OP_ADD) continue;
                         ok = false;
                     }
-                    if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, b)) ggml_cuda_mmb_mark_bf16_only(b);
+                    if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, b)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, b);
                 }
             }
             if (ggml_cuda_mmb_res16()) {   // residual stream: the only readers are the fused norm and the next combine
@@ -6132,7 +6142,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (next_combine) continue;
                         ok = false;
                     }
-                    if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, r)) ggml_cuda_mmb_mark_bf16_only(r);
+                    if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, r)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, r);
                 }
             }
             for (int i = 0; i < cgraph->n_nodes; ++i) {   // fused stream mix output read only by MMB GEMMs
@@ -6150,7 +6160,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                     ok = false;
                 }
-                if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, d)) ggml_cuda_mmb_mark_bf16_only(d);
+                if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, d)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, d);
             }
             for (int i = 0; i < cgraph->n_nodes; ++i) {   // the HC gate GEMM feeding only the fused mix keeps its BF16 epilogue
                 const ggml_tensor * t = cgraph->nodes[i];
@@ -6163,7 +6173,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (u->op == GGML_OP_UNARY && ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n, ma) > 0 && ma.gate == t) continue; }
                     ok = false;
                 }
-                if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, t)) ggml_cuda_mmb_mark_bf16_only(t);
+                if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, t)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, t);
             }
             if (ggml_cuda_mmb_down16()) {   // IQ4_NL routed down GEMM read only by the weighted reduction keeps BF16 outputs
                 for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -6177,7 +6187,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (ex->src[0]->type != GGML_TYPE_IQ4_NL) continue;   // other formats keep F32 expert outputs
                     if (!ggml_node_has_n_uses(cgraph, xi, 1)) continue;
                     if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) continue;
-                    if (ggml_cuda_marks_readers_local(cgraph, ex)) ggml_cuda_mmb_mark_bf16_only(ex);
+                    if (ggml_cuda_marks_readers_local(cgraph, ex)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, ex);
                 }
             }
             if (ggml_cuda_mmb_res16()) {   // 16-bit residual stream: producer and consumer on different buffers
@@ -6214,7 +6224,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] == glu && ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t)) continue;
                 ok = false;
             }
-            if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, glu)) ggml_cuda_mmb_mark_bf16_only(glu);
+            if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, glu)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, glu);
         }
     }
 
@@ -6340,7 +6350,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 #endif
 
     // the marks for this split are complete here; the fingerprint must be recorded before the early returns below
-    g_gt_graph_sigs.push_back(ggml_cuda_graph_sig(cgraph));
+    cuda_ctx->mmb_graph_sigs.push_back(ggml_cuda_graph_sig(cgraph));
 
     static bool enable_graph_optimization = [] {
         const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
