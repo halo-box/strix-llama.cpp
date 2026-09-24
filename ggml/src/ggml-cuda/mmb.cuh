@@ -7,6 +7,7 @@ void ggml_cuda_mul_mat_mmb   (ggml_backend_cuda_context & ctx, const ggml_tensor
 void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx);
 // producers that can emit a BF16 copy of an F32 output register it here; returns the BF16 buffer to fill (n elements)
+uint16_t * ggml_cuda_mmb_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n);
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n);
 // BF16 copy of tensor t if one is cached for the current graph (consumers may read it instead of the F32 data)
 const uint16_t * ggml_cuda_mmb_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
