@@ -977,7 +977,10 @@ uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
     const uint32_t n_kv = get_idx() ? get_idx()->get_n_kv() : 0;
     if (!mem || !mem->get_mem_idx()) { return n_kv; }
     llama_pos pos_max = -1;
-    for (llama_seq_id s = 0; s < (llama_seq_id) LLAMA_MAX_SEQ; ++s) {
+    // n_stream == 1 maps every seq id to stream 0, so scan all LLAMA_MAX_SEQ of them;
+    // otherwise seq s maps to stream s and only n_stream seq ids exist in seq_to_stream
+    const llama_seq_id n_seq_scan = get_n_stream() == 1 ? (llama_seq_id) LLAMA_MAX_SEQ : (llama_seq_id) get_n_stream();
+    for (llama_seq_id s = 0; s < n_seq_scan; ++s) {
         pos_max = std::max(pos_max, mem->get_mem_idx()->get_cells(s).seq_pos_max(s));
     }
     if (pos_max < 0) { return n_kv; }
