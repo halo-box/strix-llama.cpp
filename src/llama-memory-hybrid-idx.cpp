@@ -248,6 +248,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
             mb[buft_size.first] += buft_size.second;
         }
     }
+    if (ubatch.is_pos_2d()) {
+        // a 2-D (image) cell whose position exceeds its linear position breaks the scalar test; check every
+        // sequence present in the ubatch, as the single-seq case did
+        const int64_t n_kv = get_idx()->get_n_kv();
+        for (uint32_t i=0;i<ubatch.n_tokens;++i) {
+            const llama_seq_id s = ubatch.seq_id[i][0];
+            const auto & cells = mem->get_mem_idx()->get_cells(s);
+            for (int64_t j=0;j<n_kv;++j) {
+                if (!cells.is_empty(j) && cells.seq_has(j,s) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
+            }
+        }
+    }
     for (const auto & entry : qsa_buffers) {
         mb[ggml_backend_buffer_get_type(entry.second.get())] += ggml_backend_buffer_get_size(entry.second.get());
     }
