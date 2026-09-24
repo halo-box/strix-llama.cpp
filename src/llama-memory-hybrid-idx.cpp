@@ -249,11 +249,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
         }
     }
     if (ubatch.is_pos_2d()) {
-        // a 2-D (image) cell whose position exceeds its linear position breaks the scalar test; check every
-        // sequence present in the ubatch, as the single-seq case did
+        // a 2-D (image) cell whose position exceeds its linear position breaks the scalar test; scan the cells
+        // once per distinct sequence in the ubatch, not once per token
         const int64_t n_kv = get_idx()->get_n_kv();
+        bool seen[LLAMA_MAX_SEQ] = { false };
         for (uint32_t i=0;i<ubatch.n_tokens;++i) {
             const llama_seq_id s = ubatch.seq_id[i][0];
+            if (s < 0 || s >= LLAMA_MAX_SEQ || seen[s]) { continue; }
+            seen[s] = true;
             const auto & cells = mem->get_mem_idx()->get_cells(s);
             for (int64_t j=0;j<n_kv;++j) {
                 if (!cells.is_empty(j) && cells.seq_has(j,s) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
@@ -753,14 +756,13 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
         }
 
         if (compact) {
-            // one start row per sequence: block b is a complete block of seq s iff its group is a singleton {s}
+            // one start row per sequence: block b is visible to seq s iff the group's rep cell carries s,
+            // so blocks shared by several sequences (seq_cp) stay visible to each of them, as in the masked path
             std::fill(limits, limits + n_blocks*n_seq, INT32_MAX);
             for (int64_t b=0;b<n_bid;++b) {
-                if (cells.seq_count((uint32_t) bid_cell[b]) != 1) { continue; }
                 for (int64_t row=0;row<n_seq;++row) {
                     if (cells.seq_has((uint32_t) bid_cell[b], (llama_seq_id) row)) {
                         limits[row*n_blocks + b] = bid_idx[b];
-                        break;
                     }
                 }
             }
