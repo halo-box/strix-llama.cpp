@@ -993,33 +993,25 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
     if (get_n_stream()!=1 || !get_idx() || !ubatch.token || !ubatch.pos || !ubatch.n_tokens ||
             !ubatch.n_pos || !ubatch.seq_id || !ubatch.n_seq_id) { return false; }
     if (ubatch.n_seq_id[0]<1 || !ubatch.seq_id[0]) { return false; }
-    const llama_seq_id seq=ubatch.seq_id[0][0];
-    bool single = true;
-    for (uint32_t i=0;i<ubatch.n_tokens;++i) {
-        if (ubatch.n_seq_id[i]<1 || !ubatch.seq_id[i] || ubatch.seq_id[i][0]!=seq) { single = false; break; }
-    }
-    if (single) {
-        for (uint32_t i=0;i<ubatch.n_tokens;++i) {
-            if (ubatch.pos[i]<0 || ubatch.pos[i]>=16777216) { return false; }
-            for (uint32_t axis=1;axis<ubatch.n_pos;++axis) {
-                if (ubatch.pos[i+axis*ubatch.n_tokens]!=ubatch.pos[i]) { return false; }
-            }
-        }
-        if (ubatch.is_pos_2d()) {
-            const auto & cells=mem->get_mem_idx()->get_cells(seq);
-            for (uint32_t j=0;j<get_idx()->get_n_kv();++j) {
-                if (!cells.is_empty(j) && cells.seq_has(j,seq) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
-            }
-        }
-        return true;
-    }
-    // multi-seq maskless: exactly one sequence per token, and no 2-D (image) positions in the batch
-    if (ubatch.is_pos_2d()) { return false; }
+    // one sequence per token keeps the per-query row mapping well-defined; a token carrying several seq ids
+    // (shared prefix) has no single row to read, so it keeps the masked path
     for (uint32_t i=0;i<ubatch.n_tokens;++i) {
         if (ubatch.n_seq_id[i]!=1 || !ubatch.seq_id[i]) { return false; }
         if (ubatch.pos[i]<0 || ubatch.pos[i]>=16777216) { return false; }
         for (uint32_t axis=1;axis<ubatch.n_pos;++axis) {
             if (ubatch.pos[i+axis*ubatch.n_tokens]!=ubatch.pos[i]) { return false; }
+        }
+    }
+    if (ubatch.is_pos_2d()) {
+        // a 2-D (image) cell whose position exceeds its linear position breaks the scalar test; check every
+        // sequence present in the ubatch, as the single-seq case did
+        const int64_t n_kv = get_idx()->get_n_kv();
+        for (uint32_t i=0;i<ubatch.n_tokens;++i) {
+            const llama_seq_id s = ubatch.seq_id[i][0];
+            const auto & cells = mem->get_mem_idx()->get_cells(s);
+            for (int64_t j=0;j<n_kv;++j) {
+                if (!cells.is_empty(j) && cells.seq_has(j,s) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
+            }
         }
     }
     return true;
