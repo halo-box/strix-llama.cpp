@@ -1387,6 +1387,10 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             case LLM_ARCH_QWEN35:
             case LLM_ARCH_QWEN35MOE:
             case LLM_ARCH_QWEN3NEXT:
+            // qwen4exp (Qwen3.8-Flash-Next): routed experts go through build_moe_ffn ->
+            // build_lora_mm_id (gate / up / gate_up / down); llama_verify_hadamard_graph
+            // still throws if any folded weight reaches a matmul without its transform.
+            case LLM_ARCH_QWEN4EXP:
                 break;
             default:
                 throw std::runtime_error(format(
