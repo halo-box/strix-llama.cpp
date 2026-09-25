@@ -8666,6 +8666,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * ids   = dst->src[5];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8706,6 +8707,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     const int64_t rv2 = neq2/nev2;
     const int64_t rv3 = neq3/nev3;
+
+    // selected keys (src[5]): the first n_kv_raw keys plus key n_kv_raw + i for each valid index i in the query's row.
+    // they are visited in ascending order, so with a mask that encodes the same selection the result is unchanged
+    const int64_t n_kv_raw = ids ? ggml_get_op_params_i32(dst, 4) : nek1;
+    int32_t * keys = ids ? (int32_t *) ((float *) params->wdata + params->nth*(DK + 2*DV + CACHE_LINE_SIZE_F32) +
+            neq2*params->nth*(2 + DV)) + params->ith*ids->ne[0] : nullptr;
 
     // parallelize by q rows using ggml_vec_dot_f32
 
@@ -8773,11 +8780,26 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         q_to_vec_dot(pq, Q_q, DK);
 
+        int64_t n_sel = 0;
+        if (ids) {
+            const int32_t * row = (const int32_t *) ((const char *) ids->data + iq1*ids->nb[1] + (iq3%ids->ne[3])*ids->nb[3]);
+            for (int64_t j = 0; j < ids->ne[0]; ++j) {
+                const int64_t ic = n_kv_raw + row[j];
+                if (row[j] >= 0 && ic >= ic_start && ic < ic_end) {
+                    keys[n_sel++] = (int32_t) ic;
+                }
+            }
+            std::sort(keys, keys + n_sel);
+            n_sel = std::unique(keys, keys + n_sel) - keys;
+        }
+        const int64_t n_dense = std::max<int64_t>(0, std::min(ic_end, n_kv_raw) - ic_start);
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        for (int64_t j = 0; j < n_dense + n_sel; ++j) {
+            const int64_t ic = j < n_dense ? ic_start + j : keys[j - n_dense];
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -9357,11 +9379,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+        // the tiled kernel attends every key the mask allows, so selected keys without a mask need the per-row path
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
-                                neq1 >= Q_TILE_SZ);
+                                neq1 >= Q_TILE_SZ &&
+                                (!dst->src[5] || dst->src[3]));
 #ifdef GGML_SIMD
 #if defined(__ARM_FEATURE_SVE)
         const int64_t f32_epr = svcntw();

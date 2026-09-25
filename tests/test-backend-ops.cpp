@@ -8913,8 +8913,8 @@ struct test_qsa_decode : public test_qsa_prefill {
 };
 
 // Maskless selected-key prefill: the rows name only the visible cells (-1 elsewhere) and no mask is given, as the
-// complete-block selection graph does. The CPU graph cannot express that (its flash attention ignores src[5]), so
-// the check is against a host FP64 oracle over the listed cells; the CPU result is ignored.
+// complete-block selection graph does. Both the backend and the CPU result are checked against a host FP64 oracle
+// over the listed cells.
 struct test_qsa_prefill_maskless : public test_qsa_prefill {
     test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12)
         : test_qsa_prefill(queries,keys,selected,true,false,1,ratio) {}
@@ -8949,7 +8949,6 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
         ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
     }
     double err(const float * actual, const float * cpu, size_t n) override {
-        GGML_UNUSED(cpu);
         const auto qv=tensor_to_float(q), kv=tensor_to_float(k), vv=tensor_to_float(v);
         std::vector<int32_t> picks(ggml_nelements(ids));
         ggml_backend_tensor_get(ids,picks.data(),0,ggml_nbytes(ids));
@@ -8975,8 +8974,9 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
             }
         }
         const double gpu_error=nmse(reference.data(),actual,n);
-        fprintf(stderr,"QSA_MASKLESS_FP64 q=%d keys=%d selected=%d gpu=%.9g\n",queries,keys,selected,gpu_error);
-        return gpu_error;
+        const double cpu_error=nmse(reference.data(),cpu,n);
+        fprintf(stderr,"QSA_MASKLESS_FP64 q=%d keys=%d selected=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,gpu_error,cpu_error);
+        return std::max(gpu_error,cpu_error);
     }
 };
 
