@@ -832,15 +832,7 @@ static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_
     for (uint32_t i = 1; degenerate_pos && i < ubatch.n_tokens; ++i) {
         if (ubatch.pos[i] != ubatch.pos[0]) { degenerate_pos = false; }
     }
-    // the trim assumes one causal visible range; a ubatch that mixes sequences has several, so leave it unbounded
-    bool multi_seq = false;
-    if (ubatch.n_seq_id && ubatch.seq_id && ubatch.n_seq_id[0] > 0) {
-        const llama_seq_id s0 = ubatch.seq_id[0][0];
-        for (uint32_t i = 1; i < ubatch.n_tokens && !multi_seq; ++i) {
-            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != s0) { multi_seq = true; }
-        }
-    }
-    if (!compact || multi_seq || ubatch.n_tokens<128 || degenerate_pos || !mctx->qsa_position_prefix(ubatch, (uint32_t) ratio)) {
+    if (!compact || ubatch.n_tokens<128 || degenerate_pos || !mctx->qsa_position_prefix(ubatch, (uint32_t) ratio)) {
         return {};
     }
     return qsa_prefix_limits(ubatch.pos,ubatch.n_tokens,strip,ratio,blocks,budget);
