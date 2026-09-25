@@ -94,13 +94,101 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
 #endif
 }
 
-static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
-    // v is a 7 bit int, with the 8th sign being encodable as popcnt
-    // with xor we can "correct" the bit instead of having to mask
+// v is a 7 bit int, with the 8th sign being encodable as popcnt
+// with xor we can "correct" the bit instead of having to mask.
+// Returns the 8 sign bits as a byte (bit i = sign of element i); callers hand the two
+// nibbles to apply_signs4. (It used to return that byte broadcast over the word so that
+// 0x08040201 / 0x80402010 could be used as __vcmpne4 selectors; nothing needs that now.)
+static __device__ __forceinline__ uint32_t unpack_ksigns8(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
-    const uint32_t s = v ^ p << 7;
-    // broadcast over uint to allow for 0x08040201 / 0x80402010 as selectors
-    return s * 0x01010101;
+    return v ^ p << 7;
+}
+
+// Apply per-byte signs to 4 packed int8 codebook values.
+//   sign_nib: bits 0..3, bit i == 1 means "negate byte i of g". Bits above 3 are ignored.
+//
+// Bit-exact replacement, for EVERY value of g and sign_nib, for the idiom used throughout the
+// IQ2/IQ3 unpack:
+//     const int s = __vcmpne4(<word whose byte i is nonzero iff bit i of sign_nib>, 0);
+//     out         = __vsub4(g ^ s, s);
+// with __vsub4 taken at its CUDA meaning (per-byte wrapping subtract). No precondition on g.
+//
+// Motivation: on HIP neither __vcmpne4 nor __vsub4 maps to an instruction (RDNA has no packed-byte
+// compare and no packed-byte subtract), so ggml-cuda/vendors/hip.h emulates both as scalar
+// 4-iteration byte loops. Measured on gfx1151, replacing that pair (together with the broadcast
+// sign word it needed) saves ~30 VALU ops per call site in the MMVQ kernels and ~38 in MMQ; the
+// sequence below is 8. E.g. mul_mat_q<IQ2_S,128> goes 2596 -> 1437 instructions, 32 call sites.
+//
+// Note that hip.h routes __vsub4 to __vsubss4, i.e. the HIP emulation *saturates*: for a grid byte
+// of 0x80 it returns +0x7f where CUDA's __vsub4 returns 0x80. That divergence is a property of the
+// emulation, not of the algorithm, and it is unreachable for every grid that reaches this helper
+// (byte alphabet of iq2xxs/iq2xs/iq2s/iq3xxs/iq3s: min 0x01, max 0x3e). The sequence below follows
+// the CUDA semantics on both vendors, which is the stronger of the two behaviours to match.
+static __device__ __forceinline__ int apply_signs4(const int g, const uint32_t sign_nib) {
+#if defined(GGML_USE_HIP)
+    // Negate byte i of g when bit i of sign_nib is set. Per byte that is two's complement:
+    // -x == (x ^ 0xff) + 1. Worked example, sign_nib = 0b1010, g = 0x01020304:
+    // ones = 0x01000100, mask = 0xff00ff00, result = 0xff02fd04 (bytes 1 and 3 negated).
+    //
+    // The mask to 4 bits is load-bearing: 64 of the 256 possible argument bytes are wrong
+    // without it. It folds away wherever the caller passes a value the compiler already
+    // sees is <= 15.
+    const uint32_t nib     = sign_nib & 0x0fu;       // the 4 sign bits, one per byte
+    // 0x00204081 has bits at 0, 7, 14, 21 - one per sign. The multiply adds a copy shifted
+    // by i for each set bit i, so bit i lands at 7i + i = 8i, the low bit of byte i. The four
+    // copies occupy the disjoint ranges {0..3}, {7..10}, {14..17}, {21..24}, so nothing carries.
+    const uint32_t spread  = nib * 0x00204081u;      // bit i -> bit 8i, plus 3 unwanted bits per copy
+    const uint32_t ones    = spread & 0x01010101u;   // keep bit 8i only: 0x01 per negated byte
+    const uint32_t mask    = (ones << 8) - ones;     // ones * 255: 0xff per negated byte
+    const uint32_t flipped = ((uint32_t) g) ^ mask;  // ones' complement of the negated bytes
+    // + 1 completes the two's complement, and must not carry out of its byte -- which it would
+    // for a grid byte of 0x00. Add only into the low 7 bits, where 0x7f + 1 == 0x80 still fits,
+    // and fold bit 7 back in with an XOR: if the low 7 bits carried into bit 7 the true bit 7 is
+    // inverted, which is exactly what the XOR does. No byte can then affect any other byte.
+    return (int) (((flipped & 0x7f7f7f7fu) + ones) ^ (flipped & 0x80808080u));
+#else
+    const int s = __vcmpne4((sign_nib * 0x01010101u) & 0x08040201u, 0);
+    return __vsub4(g ^ s, s);
+#endif // defined(GGML_USE_HIP)
+}
+
+// L-SGN (results/2026-09-10-lever-mmvq6/): apply_signs4 for grids that contain no zero byte.
+// Enumerated from ggml-common.h: iq2xxs_grid / iq2xs_grid / iq2s_grid bytes are {8, 25, 43},
+// iq3xxs_grid {4, 12, 20, 28, 36, 44, 52, 62}, iq3s_grid {1, 3, ..., 15}. Every byte is in
+// [1, 0x7f], so flipped_i = 0xff ^ g_i <= 0xfe and the "+ 1" that completes the two's complement
+// can never carry out of its byte. The three instructions apply_signs4 spends containing that
+// carry (mask to 0x7f7f7f7f, re-XOR the top bits) are therefore dead here, and the 0x00204081
+// spread multiply fits 24x24 bits (15 * 0x204081 = 0x1E3C78F), so it can take the full-rate
+// v_mul_u32_u24 instead of the quarter-rate v_mul_lo_u32.
+// MMVQ only: mmq-load-tiles.cuh keeps the general form, so the prefill path is untouched.
+static __device__ __forceinline__ int apply_signs4_nz(const int g, const uint32_t sign_nib) {
+#if defined(GGML_USE_HIP)
+    const uint32_t nib     = sign_nib & 0x0fu;
+    const uint32_t spread  = (uint32_t) __mul24((int) nib, 0x00204081);
+    const uint32_t ones    = spread & 0x01010101u;
+    const uint32_t mask    = (ones << 8) - ones;
+    return (int) ((((uint32_t) g) ^ mask) + ones);
+#else
+    return apply_signs4(g, sign_nib);
+#endif // defined(GGML_USE_HIP)
+}
+
+// Multiply an accumulated dp4a sum by its integer block scale.
+//
+// On RDNA3 a full 32-bit integer multiply (v_mul_lo_u32) is quarter rate while the 24-bit form
+// (v_mul_i32_i24) is full rate. The multiply is SIGNED: the codebook bytes carry applied signs,
+// so sumi genuinely goes negative, and __umul24 would be wrong.
+//
+// Bit-exact when both operands fit in signed 24 bits, i.e. |x| <= 2^23, and the product fits in
+// int. Every call site bounds sumi as (number of dp4a terms) * (max |codebook byte|) * 128, and
+// the largest of those is the iq2 family at 16 * 43 * 128 = 88064, four hundred times inside the
+// bound; scales are 0..15 (iq2_xs, iq2_s) or 1..31 (iq3_s). See the commit message.
+static __device__ __forceinline__ int mul_scale_24(const int sumi, const int ls) {
+#if defined(GGML_USE_HIP)
+    return __mul24(sumi, ls);
+#else
+    return sumi * ls;
+#endif // defined(GGML_USE_HIP)
 }
 
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
@@ -1058,23 +1146,25 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+        const uint32_t signs = unpack_ksigns8(aux32 >> (7 * k0 / 2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid0 = apply_signs4_nz(grid_pos.x, signs);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid1 = apply_signs4_nz(grid_pos.y, signs >> 4);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }
 
+    // L-EPI (results/2026-09-10-lever-mmvq6/): fold the block scale and the /8 into the float
+    // scale instead of doing a truncating signed integer divide. Everything before the last
+    // multiply now depends only on the weight block, so it hoists out of the ncols_dst loop of
+    // mul_mat_vec_q; the integer divide did not, and cost ~4 int VALU per column per 32 weights.
     const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
-    sumi = sumi * ls / 8;           // (sumi * scale + sumi / 2) / 4
-    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    const float dx = __half2float(bq2->d) * (0.125f * (float) ls);
+    const float d  = dx * __low2float(bq8_1[iqs/2].ds);
+    return d * (float) sumi;
 }
 
 #define VDR_IQ2_XS_Q8_1_MMVQ 2
@@ -1095,14 +1185,12 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
-        const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
+        const uint32_t signs = unpack_ksigns8(q2[l0/2] >> 9);
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_l = apply_signs4_nz(grid_pos.x, signs);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_h = apply_signs4_nz(grid_pos.y, signs >> 4);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
@@ -1113,9 +1201,14 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
             sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
         }
     }
-    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
-    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    // L-EPI: (sumi0*(2*ls0+1) + sumi1*(2*ls1+1))/8 evaluated in float. Both scale factors are
+    // weight-block-only and hoist out of the ncols_dst loop; the two truncating signed divides
+    // that this replaces did not (doc 02 D2.4: ~9 int VALU per column per 32 weights).
+    const float dx  = __half2float(bq2->d) * 0.125f;
+    const float dx0 = dx * (float) ((ls0 << 1) | 1);
+    const float dx1 = dx * (float) ((ls1 << 1) | 1);
+    const float d8  = __low2float(bq8_1[iqs/2].ds);
+    return d8 * (dx0 * (float) sumi0 + dx1 * (float) sumi1);
 }
 
 #define VDR_IQ2_S_Q8_1_MMVQ 2
@@ -1143,11 +1236,8 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-
-        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+        const int grid_l = apply_signs4_nz(grid_pos[0], signs_packed_8[l0/2]);
+        const int grid_h = apply_signs4_nz(grid_pos[1], signs_packed_8[l0/2] >> 4);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1160,10 +1250,13 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
             sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
         }
     }
-    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
-
-    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    // L-EPI: see vec_dot_iq2_xs_q8_1 above. This is the kernel the census blames for 30.9 % of a
+    // six-token decode step, and doc 02 D2.4 blames this epilogue for its per-column excess.
+    const float dx  = __half2float(bq2->d) * 0.125f;
+    const float dx0 = dx * (float) ((ls0 << 1) | 1);
+    const float dx1 = dx * (float) ((ls1 << 1) | 1);
+    const float d8  = __low2float(bq8_1[iqs/2].ds);
+    return d8 * (dx0 * (float) sumi0 + dx1 * (float) sumi1);
 }
 
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
@@ -1182,15 +1275,13 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+        const uint32_t signs = unpack_ksigns8(aux32 >> (7*l0/2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_l = apply_signs4_nz(grid_pos.x, signs);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_h = apply_signs4_nz(grid_pos.y, signs >> 4);
 
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
@@ -1198,10 +1289,11 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
 
+    // L-EPI: sumi*(2*ls+1)/4 in float, hoistable out of the ncols_dst loop.
     const int ls = aux32 >> 28;
-    sumi = (ls*sumi + sumi/2)/2;
-    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    const float dx = __half2float(bq3->d) * (0.25f * (float) ((ls << 1) | 1));
+    const float d  = dx * __low2float(bq8_1[iqs/2].ds);
+    return d * (float) sumi;
 }
 
 #define VDR_IQ3_S_Q8_1_MMVQ 2
@@ -1228,11 +1320,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
-
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_l = apply_signs4_nz(grid_pos.x, signs_packed_8[l0/2]);
+        const int grid_h = apply_signs4_nz(grid_pos.y, signs_packed_8[l0/2] >> 4);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1241,10 +1330,12 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
 
-    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
-
-    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
-    return d * sumi;
+    // L-EPI: the scale multiply moves from a per-(row,column) integer multiply to a
+    // per-weight-block float multiply that hoists out of the ncols_dst loop.
+    const int ls = 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    const float dx = __half2float(bq3->d) * (float) ls;
+    const float d  = dx * __low2float(bq8_1[iqs/2].ds);
+    return d * (float) sumi;
 }
 
 // Two IQ3_S rows against the same activation block. The fused MoE gate/up path
@@ -1280,25 +1371,22 @@ static __device__ __forceinline__ void vec_dot_iq3_s_q8_1_pair(
         const int2 grid0 = make_int2(
             iq3s_grid[qs0[l0 + 0] | ((qh0 << (8 - l0)) & 0x100)],
             iq3s_grid[qs0[l0 + 1] | ((qh0 << (7 - l0)) & 0x100)]);
-        const int s00 = __vcmpne4(((signs0[l0/2] & 0x03) << 7) | ((signs0[l0/2] & 0x0C) << 21), 0x00000000);
-        const int s01 = __vcmpne4(((signs0[l0/2] & 0x30) << 3) | ((signs0[l0/2] & 0xC0) << 17), 0x00000000);
-        sumi0 = ggml_cuda_dp4a(__vsub4(grid0.x ^ s00, s00), u0, sumi0);
-        sumi0 = ggml_cuda_dp4a(__vsub4(grid0.y ^ s01, s01), u1, sumi0);
+        sumi0 = ggml_cuda_dp4a(apply_signs4_nz(grid0.x, signs0[l0/2]), u0, sumi0);
+        sumi0 = ggml_cuda_dp4a(apply_signs4_nz(grid0.y, signs0[l0/2] >> 4), u1, sumi0);
 
         const int2 grid1 = make_int2(
             iq3s_grid[qs1[l0 + 0] | ((qh1 << (8 - l0)) & 0x100)],
             iq3s_grid[qs1[l0 + 1] | ((qh1 << (7 - l0)) & 0x100)]);
-        const int s10 = __vcmpne4(((signs1[l0/2] & 0x03) << 7) | ((signs1[l0/2] & 0x0C) << 21), 0x00000000);
-        const int s11 = __vcmpne4(((signs1[l0/2] & 0x30) << 3) | ((signs1[l0/2] & 0xC0) << 17), 0x00000000);
-        sumi1 = ggml_cuda_dp4a(__vsub4(grid1.x ^ s10, s10), u0, sumi1);
-        sumi1 = ggml_cuda_dp4a(__vsub4(grid1.y ^ s11, s11), u1, sumi1);
+        sumi1 = ggml_cuda_dp4a(apply_signs4_nz(grid1.x, signs1[l0/2]), u0, sumi1);
+        sumi1 = ggml_cuda_dp4a(apply_signs4_nz(grid1.y, signs1[l0/2] >> 4), u1, sumi1);
     }
 
-    sumi0 *= 1 + 2*((bq0->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
-    sumi1 *= 1 + 2*((bq1->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    // L-EPI: same transform as vec_dot_iq3_s_q8_1, kept in step so the two stay comparable.
+    const int ls0 = 1 + 2*((bq0->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    const int ls1 = 1 + 2*((bq1->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
     const float d8 = __low2float(bq8_1[iqs/2].ds);
-    out0 = (__half2float(bq0->d) * d8) * sumi0;
-    out1 = (__half2float(bq1->d) * d8) * sumi1;
+    out0 = (__half2float(bq0->d) * (float) ls0 * d8) * (float) sumi0;
+    out1 = (__half2float(bq1->d) * (float) ls1 * d8) * (float) sumi1;
 }
 
 #define VDR_IQ1_S_Q8_1_MMVQ 1

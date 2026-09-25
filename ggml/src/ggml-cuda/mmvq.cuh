@@ -2,7 +2,10 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
+// exact_batch: the caller set GGML_HINT_EXACT_BATCH, i.e. the batched result must match
+// the per-column results bit-for-bit. Any ne11-dependent kernel switch inside
+// [1, MMVQ_MAX_BATCH_SIZE] would break that, so the per-type tuning is bypassed.
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne01, int64_t ne11, bool exact_batch = false);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
