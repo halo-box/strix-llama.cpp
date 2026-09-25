@@ -446,7 +446,10 @@ extern "C" {
         // is sized to COUNT with 43..99 and 108..142 unused (100..107 are ROCmFPx). PQ2_0 (142) is deliberately not ported:
         // it has no Vulkan kernels upstream of us either.
         GGML_TYPE_PTQ1_0  = 143,
-        GGML_TYPE_COUNT   = 144,
+        // Trellis-coded 2.125 bpw (QTIP-style bitshift trellis, L=16 K=8 V=4, hashed
+        // 2-D "Hyb" codebook), group 128. Written by the agention-infer Rust tooling.
+        GGML_TYPE_TQ2_T   = 144,
+        GGML_TYPE_COUNT   = 145,
     };
 
     // [TAG_GGML_PREC]
@@ -515,6 +518,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX          = 112, // ROCmFPx experimental 3-bit reference layout
         GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX          = 113, // ROCmFPx experimental 2-bit S40 codebook layout
         GGML_FTYPE_MOSTLY_PTQ1_0 = 129, // except 1d tensors (Prism-private group-128 ternary)
+        GGML_FTYPE_MOSTLY_TQ2_T  = 130, // except 1d tensors (trellis-coded, group 128)
     };
 
     // available tensor operations:

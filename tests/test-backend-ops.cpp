@@ -10892,6 +10892,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_PTQ1_0,
+    GGML_TYPE_TQ2_T,
     GGML_TYPE_Q2_0,
     GGML_TYPE_MXFP4, GGML_TYPE_Q4_0_ROCMFP4, GGML_TYPE_Q4_0_ROCMFP4_FAST, GGML_TYPE_NVFP4,
     GGML_TYPE_Q2_0_ROCMFPX, GGML_TYPE_Q3_0_ROCMFPX, GGML_TYPE_Q6_0_ROCMFPX, GGML_TYPE_Q8_0_ROCMFPX,
@@ -10910,6 +10911,7 @@ static const ggml_type base_types[] = {
     GGML_TYPE_Q8_0, // for I8MM tests
     GGML_TYPE_Q1_0,
     GGML_TYPE_PTQ1_0,
+    GGML_TYPE_TQ2_T,
     GGML_TYPE_Q2_0,
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1, // for I8MM tests
@@ -10925,6 +10927,7 @@ static const ggml_type other_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_PTQ1_0,
+    GGML_TYPE_TQ2_T,
     GGML_TYPE_Q2_0,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q5_K,
@@ -12431,6 +12434,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : {1, 3, 8, 32}) {
             for (int64_t k_v : {int64_t(0), k + 128}) {
                 test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32,
+                    17, n, k, {2, 1}, {2, 1}, {0, 1, 2, 3}, k_v));
+            }
+        }
+    }
+
+    // TQ2_T: 128-weight trellis blocks with a tail-biting state and a shared-memory
+    // codebook. Odd block counts (640 = Flash-Next expert rows), partial output
+    // tiles, batched offsets and non-contiguous views through matvec and matmul.
+    for (int64_t k : {128, 384, 640}) {
+        for (int64_t n : {1, 3, 8, 32}) {
+            for (int64_t k_v : {int64_t(0), k + 128}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ2_T, GGML_TYPE_F32,
                     17, n, k, {2, 1}, {2, 1}, {0, 1, 2, 3}, k_v));
             }
         }

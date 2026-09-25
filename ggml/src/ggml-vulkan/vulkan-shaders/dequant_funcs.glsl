@@ -137,6 +137,21 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_TQ2_T)
+// State of trellis step t (0..31): qs[(t+31)%32] << 8 | qs[t] (tail-biting).
+uint tq2_t_state(uint ib, uint a_offset, uint t) {
+    return (uint(data_a[a_offset + ib].qs[(t + 31u) & 31u]) << 8u) | uint(data_a[a_offset + ib].qs[t]);
+}
+// iqs must be even: weights iqs, iqs+1 are one codebook pair.
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return tq2_t_pair(2u*tq2_t_state(ib, a_offset, iqs >> 2u) + ((iqs >> 1u) & 1u));
+}
+// iqs must be a multiple of 4: one whole trellis step.
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    return tq2_t_step(tq2_t_state(ib, a_offset, iqs >> 2u));
+}
+#endif
+
 #if defined(DATA_A_Q1_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint bits = uint(data_a[a_offset + ib].qs[iqs / 8u]) >> (iqs % 8u);
@@ -716,6 +731,12 @@ vec2 get_dm(uint ib, uint a_offset) {
 #endif
 
 #if defined(DATA_A_Q2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].d), 0);
+}
+#endif
+
+#if defined(DATA_A_TQ2_T)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
 }

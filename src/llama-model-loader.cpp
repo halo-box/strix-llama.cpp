@@ -40,6 +40,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q1_0:      name = LLAMA_FTYPE_PREFIX "Q1_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_0:      name = LLAMA_FTYPE_PREFIX "Q2_0"; break;
         case LLAMA_FTYPE_MOSTLY_PTQ1_0: name = LLAMA_FTYPE_PREFIX "PTQ1_0 - 1.75 bpw ternary (group 128)"; break;
+        case LLAMA_FTYPE_MOSTLY_TQ2_T:  name = LLAMA_FTYPE_PREFIX "TQ2_T - 2.125 bpw trellis (group 128)"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4:          name = LLAMA_FTYPE_PREFIX "Q4_0_ROCMFP4"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN:     name = LLAMA_FTYPE_PREFIX "Q4_0_ROCMFP4_LEAN"; break;
@@ -810,6 +811,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
             case GGML_TYPE_PTQ1_0: ftype = LLAMA_FTYPE_MOSTLY_PTQ1_0; break;
+            case GGML_TYPE_TQ2_T:  ftype = LLAMA_FTYPE_MOSTLY_TQ2_T;  break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));

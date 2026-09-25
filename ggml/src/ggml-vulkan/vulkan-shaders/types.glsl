@@ -241,6 +241,33 @@ struct block_ptq1_0_packed32
 #define A_TYPE block_ptq1_0
 #endif
 
+// TQ2_T: trellis-coded 2.125 bpw, group 128. Mirrors block_tq2_t in ggml-common.h:
+// fp16 d first, then 32 path bytes (34-byte stride, 2-byte aligned). Step t reads
+// state qs[(t+31)%32] << 8 | qs[t]; see tq2_t_lut.glsl for the codebook.
+#define QUANT_K_TQ2_T 128
+#define QUANT_R_TQ2_T 1
+
+struct block_tq2_t
+{
+    float16_t d;
+    uint8_t qs[QUANT_K_TQ2_T/4];
+};
+
+struct block_tq2_t_packed16
+{
+    float16_t d;
+    uint16_t qs[QUANT_K_TQ2_T/8];
+};
+
+#if defined(DATA_A_TQ2_T)
+#define QUANT_K QUANT_K_TQ2_T
+#define QUANT_R QUANT_R_TQ2_T
+#define QUANT_AUXF 1
+#define A_TYPE block_tq2_t
+#define A_TYPE_PACKED16 block_tq2_t_packed16
+#include "tq2_t_lut.glsl"
+#endif
+
 #define QUANT_K_Q2_0 64
 #define QUANT_R_Q2_0 1
 

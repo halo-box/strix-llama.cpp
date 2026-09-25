@@ -51,6 +51,7 @@ const std::vector<std::string> type_names = {
     "f16",
     "q1_0",
     "ptq1_0",
+    "tq2_t",
     "q2_0",
     "q4_0",
     "q4_1",
@@ -258,7 +259,7 @@ bool is_rocmfp_quant(const std::string& type_name) {
 
 // Trellis/ternary types (agention): per-type mul_mm SPIR-V like the LUT types, no coopmat2
 bool is_trellis_quant(const std::string& type_name) {
-    return type_name == "ptq1_0";
+    return type_name == "ptq1_0" || type_name == "tq2_t";
 }
 
 // types compiled as their own matmul shader instead of the MmTypeA quant shader
@@ -268,7 +269,7 @@ bool is_lut_quant(const std::string& type_name) {
 
 std::string lut_load_vec_a(const std::string& type_name) {
     if (type_name == "iq1_s" || type_name == "iq1_m" || type_name == "iq2_xxs" || type_name == "iq2_xs" || type_name == "iq2_s" || type_name == "iq4_xs" ||
-        type_name == "ptq1_0") {
+        is_trellis_quant(type_name)) {
         return "8";
     }
     return "4";

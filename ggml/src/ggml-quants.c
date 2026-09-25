@@ -2252,6 +2252,115 @@ size_t quantize_ptq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
     return nrow * row_size;
 }
 
+// ====================== TQ2_T (trellis, 2.125 bpw, group 128) ======================
+// Decoder is the format definition (bit-exact with agention-infer's dequant_tq2_t).
+// Encoder: PLACEHOLDER. Real TQ2_T files come from an offline Viterbi search; this is a
+// greedy coordinate descent over the 32 path bytes (four sweeps, each byte chosen to
+// minimise the error of the two steps that read it), followed by a least-squares
+// refit of d. It is correct -- any byte string decodes -- but far from optimal. It
+// exists so ggml's from_float (test-backend-ops, CPU reference paths) has something.
+
+static inline float tq2t_lut_val(uint32_t i) {
+    return GGML_FP16_TO_FP32(tq2t_lut_f16[i]);
+}
+
+// Squared error of step t (weights 4t..4t+3 of y) under state (a << 8) | b.
+static float tq2t_step_err(const float * GGML_RESTRICT y, int t, uint32_t a, uint32_t b) {
+    const uint32_t s = (a << 8) | b;
+    float err = 0.0f;
+    for (int h = 0; h < 2; ++h) {
+        const uint32_t idx = tq2t_hyb_index(2*s + h);
+        const float dx = y[4*t + 2*h + 0] - tq2t_lut_val(2*idx + 0);
+        const float dy = y[4*t + 2*h + 1] - tq2t_lut_val(2*idx + 1);
+        err += dx*dx + dy*dy;
+    }
+    return err;
+}
+
+void quantize_row_tq2_t_ref(const float * GGML_RESTRICT x, block_tq2_t * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ2_T == 0);
+    const int64_t nb = k / QK_TQ2_T;
+    const int nsteps = QK_TQ2_T/4;
+
+    for (int64_t i = 0; i < nb; i++, x += QK_TQ2_T) {
+        float sumsq = 0.0f;
+        for (int j = 0; j < QK_TQ2_T; j++) {
+            sumsq += x[j]*x[j];
+        }
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        if (sumsq == 0.0f) {
+            y[i].d = GGML_FP32_TO_FP16(0.0f);
+            continue;
+        }
+        const float rms = sqrtf(sumsq / QK_TQ2_T);
+        float yn[QK_TQ2_T];
+        for (int j = 0; j < QK_TQ2_T; j++) {
+            yn[j] = x[j] / rms;
+        }
+
+        uint8_t * qs = y[i].qs;
+        for (int pass = 0; pass < 4; ++pass) {
+            for (int t = 0; t < nsteps; ++t) {
+                const uint32_t prev = qs[(t + nsteps - 1) % nsteps];
+                const uint32_t next = qs[(t + 1) % nsteps];
+                float best = INFINITY;
+                int best_c = 0;
+                for (int c = 0; c < 256; ++c) {
+                    const float e = tq2t_step_err(yn, t, prev, c) + tq2t_step_err(yn, (t + 1) % nsteps, c, next);
+                    if (e < best) {
+                        best = e;
+                        best_c = c;
+                    }
+                }
+                qs[t] = (uint8_t) best_c;
+            }
+        }
+
+        // least-squares scale for the chosen path
+        float sxc = 0.0f, scc = 0.0f;
+        for (int t = 0; t < nsteps; ++t) {
+            const uint32_t s = ((uint32_t) qs[(t + nsteps - 1) % nsteps] << 8) | qs[t];
+            for (int j = 0; j < 4; ++j) {
+                const float c = tq2t_lut_val(2*tq2t_hyb_index(2*s + (j >> 1)) + (j & 1));
+                sxc += x[4*t + j] * c;
+                scc += c * c;
+            }
+        }
+        y[i].d = GGML_FP32_TO_FP16(scc > 0.0f ? sxc / scc : rms);
+    }
+}
+
+void dequantize_row_tq2_t(const block_tq2_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ2_T == 0);
+    const int64_t nb = k / QK_TQ2_T;
+    const int nsteps = QK_TQ2_T/4;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const uint8_t * qs = x[i].qs;
+        for (int t = 0; t < nsteps; ++t) {
+            const uint32_t s = ((uint32_t) qs[(t + nsteps - 1) % nsteps] << 8) | qs[t];
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t idx = tq2t_hyb_index(2*s + h);
+                *y++ = d * tq2t_lut_val(2*idx + 0);
+                *y++ = d * tq2t_lut_val(2*idx + 1);
+            }
+        }
+    }
+}
+
+size_t quantize_tq2_t(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // placeholder encoder ignores importance weights
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ2_T, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_tq2_t_ref(src, (block_tq2_t *)qrow, n_per_row);
+        src  += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
         quantize_row_q4_0_ref(src, dst, (int64_t)nrow*n_per_row);
@@ -5743,6 +5852,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TQ2_T:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_t, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {

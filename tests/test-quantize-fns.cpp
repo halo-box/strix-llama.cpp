@@ -221,6 +221,10 @@ static int test_vec_dot_q(bool verbose) {
             const float max_quantization_error =
                 type == GGML_TYPE_Q1_0    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_PTQ1_0  ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                // TQ2_T's from_float is a greedy placeholder (real files come from an
+                // offline Viterbi encoder), and this cosine data is far from the Gaussian
+                // its codebook targets: hold it to the binary-class bounds.
+                type == GGML_TYPE_TQ2_T   ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
@@ -251,7 +255,7 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S ||
                 type == GGML_TYPE_Q3_0_ROCMFPX
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
-                : type == GGML_TYPE_Q1_0
+                : type == GGML_TYPE_Q1_0 || type == GGML_TYPE_TQ2_T
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
                 : type == GGML_TYPE_PTQ1_0 || type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 ||
                   type == GGML_TYPE_Q2_0_ROCMFPX
