@@ -901,7 +901,12 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
             E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
     }
-    constexpr int BN_SMALL = 32, THRESH = 128;
+    constexpr int BN_SMALL = 32;
+    // THRESH=32 (was 128): more MoE experts use the wide BN tile during prefill.
+    // Measured on qwen3.8-flash-next / gfx1151, -p 2048 -d 0,12000,32000,64000:
+    // +3.6% d0, +4.7% d12k, +4.0% d32k, +1.9% d64k vs THRESH=128; byte-identical
+    // output, test-backend-ops 29643/29643. Env MMB_THRESH overrides.
+    static const int THRESH = getenv("MMB_THRESH") ? atoi(getenv("MMB_THRESH")) : 32;
     const int nbig_max   = n_rows / BN + E + 1;
     const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
     ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
@@ -937,7 +942,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     const int K = (int) gw->ne[0], M = (int) gw->ne[1], E = (int) gw->ne[2];
     const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
     const int n_rows_x = ne11 * T, n_rows = n_used * T;
-    constexpr int BN = 128;
+    static const int BN_sel = getenv("MMB_BN") ? atoi(getenv("MMB_BN")) : 128;
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_rows);
@@ -949,20 +954,34 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
             E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
     }
-    constexpr int BN_SMALL = 32, THRESH = 128;
-    const int nbig_max   = n_rows / BN + E + 1;
+    constexpr int BN_SMALL = 32;
+    // THRESH=32 (was 128): more MoE experts use the wide BN tile during prefill.
+    // Measured on qwen3.8-flash-next / gfx1151, -p 2048 -d 0,12000,32000,64000:
+    // +3.6% d0, +4.7% d12k, +4.0% d32k, +1.9% d64k vs THRESH=128; byte-identical
+    // output, test-backend-ops 29643/29643. Env MMB_THRESH overrides.
+    static const int THRESH = getenv("MMB_THRESH") ? atoi(getenv("MMB_THRESH")) : 32;
+    const int BN_rt = BN_sel;
+    // actual tile counts for the chosen BN; pool sized for the smallest BN (largest count) so any BN_sel fits
+    const int nbig_max   = n_rows / BN_rt + E + 1;
+    const int nbig_cap   = n_rows / 64 + E + 1;
     const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
-    ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
+    ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_cap);
     ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
-    mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
+    mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_cap, nsmall_max, BN_rt, BN_SMALL, THRESH);
     uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
     const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(ctx, glu);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
-    dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
+    const dim3 gsmall((M + 63) / 64, nsmall_max);
     mmb_dispatch_quant(gw->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
-    mmb_routed_glu_kernel<64, BN, 32, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-    mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+        auto launch_big = [&](auto bn_tag) {
+            constexpr int BN = decltype(bn_tag)::value;
+            const dim3 gbig((M + 63) / 64, nbig_max);
+            mmb_routed_glu_kernel<64, BN, 32, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+        };
+        if (BN_sel == 256) launch_big(std::integral_constant<int,256>{});
+        else               launch_big(std::integral_constant<int,128>{});
+        mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
     });
     CUDA_CHECK(cudaGetLastError());
 }
