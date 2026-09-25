@@ -361,7 +361,7 @@ bool llama_memory_hybrid_idx::qsa_metadata(ggml_tensor * members, ggml_tensor * 
         ggml_tensor * tails, const llama_ubatch & u, uint32_t ratio) const {
     if (ratio != 4 || bias->type != GGML_TYPE_I32 || !qsa_prefix_matches(u)) { return false; }
     const size_t blocks = pos->ne[0]/4, complete = qsa_prefix.cells.size()/4;
-    if (complete > blocks) { return false; }
+    if (blocks == 0 || complete > blocks) { return false; }
     auto * c = members ? (int32_t *) members->data : nullptr; auto * p = pos ? (int32_t *) pos->data : nullptr;
     auto * lim = (int32_t *) bias->data; auto * tail = (int32_t *) tails->data;
     if (!lim || !tail) { return false; }
@@ -376,9 +376,10 @@ bool llama_memory_hybrid_idx::qsa_metadata(ggml_tensor * members, ggml_tensor * 
         }
     }
     const int64_t n_tps = u.n_tokens;
-    const int64_t n_seq = (bias->ne[0] - 2*n_tps) / blocks;
+    const int64_t n_lim = bias->ne[0] - 2*n_tps;
+    const int64_t n_seq = n_lim / (int64_t) blocks;
     const int64_t row   = qsa_prefix.sequence;
-    if (n_seq < 1 || row < 0 || row >= n_seq) { return false; }
+    if (n_lim % (int64_t) blocks != 0 || n_seq < 1 || row < 0 || row >= n_seq) { return false; }
     const int64_t base  = blocks * n_seq;
     std::fill(lim, lim + base, INT32_MAX);
     std::copy_n(qsa_prefix.block_positions.data(), complete, lim + row*blocks);
@@ -747,10 +748,18 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
 
         if (compact) {
             // one start row per sequence: block b is visible to seq s iff the group's rep cell carries s,
-            // so blocks shared by several sequences (seq_cp) stay visible to each of them, as in the masked path
+            // so blocks shared by several sequences (seq_cp) stay visible to each of them, as in the masked path.
+            // only the rows the queries read are filled
             std::fill(limits, limits + n_blocks*n_seq, INT32_MAX);
-            for (int64_t b=0;b<n_bid;++b) {
-                for (int64_t row=0;row<n_seq;++row) {
+            llama_kv_cells::seq_set_t rows;
+            for (int64_t ii=0;ii<n_tps;++ii) {
+                const llama_seq_id row = ubatch->seq_id[s*n_tps + ii][0];
+                GGML_ASSERT(row >= 0 && row < n_seq);
+                rows.set(row);
+            }
+            for (int64_t row=0;row<n_seq;++row) {
+                if (!rows.test(row)) { continue; }
+                for (int64_t b=0;b<n_bid;++b) {
                     if (cells.seq_has((uint32_t) bid_cell[b], (llama_seq_id) row)) {
                         limits[row*n_blocks + b] = bid_idx[b];
                     }
