@@ -192,10 +192,11 @@ public:
     void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                               ggml_tensor * bias, ggml_tensor * tail_idxs,
                               const llama_ubatch * ubatch, uint32_t ratio) const;
-    // one sequence, scalar positions in range, no 2d rope extents: the compact visibility rule applies
-    bool qsa_scalar_visibility(const llama_ubatch & ubatch) const;
+    // one stream, scalar positions in range, no 2d rope extents, no block split over sequence sets
+    // (qsa_scalar_visibility_cells): the compact visibility rule applies
+    bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
     // scalar visibility and the cached cells form a single-sequence prefix with unique positions
-    bool qsa_position_prefix(const llama_ubatch & ubatch) const;
+    bool qsa_position_prefix(const llama_ubatch & ubatch, uint32_t ratio) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
