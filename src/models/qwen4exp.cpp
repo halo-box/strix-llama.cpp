@@ -840,7 +840,7 @@ static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_
             if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != s0) { multi_seq = true; }
         }
     }
-    if (!compact || multi_seq || ubatch.n_tokens<128 || degenerate_pos || !mctx->qsa_position_prefix(ubatch)) {
+    if (!compact || multi_seq || ubatch.n_tokens<128 || degenerate_pos || !mctx->qsa_position_prefix(ubatch, (uint32_t) ratio)) {
         return {};
     }
     return qsa_prefix_limits(ubatch.pos,ubatch.n_tokens,strip,ratio,blocks,budget);
@@ -963,7 +963,7 @@ public:
         const auto * attn = mctx->get_attn();
         const bool blocks = attn && qwen4exp_use_block_selection(blk_bias, n_stream, ratio, n_kv,
                 params.ubatch, params.cparams, params.hparams, attn->type_k(), attn->type_v());
-        const bool scalar = blocks && params.hparams.n_swa == 0 && mctx->qsa_scalar_visibility(params.ubatch);
+        const bool scalar = blocks && params.hparams.n_swa == 0 && mctx->qsa_scalar_visibility(params.ubatch, ratio);
         res &= (tail_idxs != nullptr) == scalar;
         res &= compact == scalar;
         res &= maskless == scalar;
@@ -1123,7 +1123,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const auto * attn_ctx = mctx_hyb->get_attn();
         const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, n_stream, r, n_kv, ubatch, cparams, hparams,
                 attn_ctx->type_k(), attn_ctx->type_v());
-        const bool scalar = blocks && hparams.n_swa == 0 && mctx_hyb->qsa_scalar_visibility(ubatch);
+        const bool scalar = blocks && hparams.n_swa == 0 && mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
         qsa->compact  = scalar;
         qsa->maskless = scalar;
         qsa->score_strip = qwen4exp_query_strip(n_tps, n_stream);
@@ -1137,9 +1137,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
         // complete-block selection lists cells with -1 sentinels (invisible blocks, empty tail slots) that only the
-        // maskless kernel understands; when the visibility is not scalar (2-D image positions in the cache, several
-        // sequences) the attention takes the masked path, whose set_rows would write row -1, so the block-expanded
-        // top-k with the per-block bias is used there instead
+        // maskless kernel understands; when the visibility is not scalar (2-D image positions in the cache, a block
+        // split over sequence sets) the attention takes the masked path, whose set_rows would write row -1, so the
+        // block-expanded top-k with the per-block bias is used there instead
         if (scalar) {
             GGML_ASSERT(hparams.indexer_top_k % r == 0);
             qsa->tail_idxs = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r-1, n_tps, n_stream);
