@@ -1894,7 +1894,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
+    if (ggml_cuda_mmb_supported_mm(ctx, src0, src1, dst)) {
         ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
         return;
     }
@@ -1966,7 +1966,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_mmb_supported_mmid(src0, src1, ids, dst)) {
+        if (ggml_cuda_mmb_supported_mmid(ctx, src0, src1, ids, dst)) {
             ggml_cuda_mul_mat_id_mmb(ctx, src0, src1, ids, dst);
             return;
         }
@@ -4158,14 +4158,14 @@ static bool ggml_cuda_qsa_expand_alias_ok(const ggml_cuda_qsa_expand_args & args
 }
 
 // true when the BF16 WMMA GEMM would take this MUL_MAT / MUL_MAT_ID, so MMQ-based fusions leave it alone
-static bool ggml_cuda_mmb_claims(const ggml_tensor * t) {
+static bool ggml_cuda_mmb_claims(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
     if (!t || !t->src[0] || !t->src[1]) {
         return false;
     }
     if (t->op == GGML_OP_MUL_MAT_ID) {
-        return t->src[2] && ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t);
+        return t->src[2] && ggml_cuda_mmb_supported_mmid(ctx, t->src[0], t->src[1], t->src[2], t);
     }
-    return t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t);
+    return t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(ctx, t->src[0], t->src[1], t);
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
@@ -4192,7 +4192,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * gate = glu->src[0];
         ggml_tensor * up   = glu->src[1];
         const bool paired = (gate == node && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == node);
-        if (paired && ggml_cuda_mmb_supported_glu(gate->src[0], up->src[0], up->src[1], up->src[2], glu) &&
+        if (paired && ggml_cuda_mmb_supported_glu(*cuda_ctx, gate->src[0], up->src[0], up->src[1], up->src[2], glu) &&
                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { i + 2 })) {
             const int out_nodes[] = { i + 2 };
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 1)) {
@@ -4439,7 +4439,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && node->src[1] &&
-            !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, node) && !ggml_cuda_mmb_claims(cgraph->nodes[i + 1])) {
+            !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, node) && !ggml_cuda_mmb_claims(*cuda_ctx, cgraph->nodes[i + 1])) {
         ggml_tensor * next = cgraph->nodes[i + 1];
         const bool has_ids = next->op == GGML_OP_MUL_MAT_ID;
         if (has_ids || next->op == GGML_OP_MUL_MAT) {
@@ -4705,7 +4705,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // [n_embd, n_used] intermediate and its separate reduction launch.
     if (getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN") == nullptr &&
             node->op == GGML_OP_MUL_MAT_ID && i + 20 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
-            !ggml_cuda_mmb_claims(node)) {
+            !ggml_cuda_mmb_claims(*cuda_ctx, node)) {
         constexpr int n_used = 10;
         constexpr int n_ops  = 2 + n_used + (n_used - 1);
         ggml_tensor * mul = cgraph->nodes[i + 1];
@@ -4844,7 +4844,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const bool use_mmq = shared_inputs &&
             ggml_cuda_should_use_mmq(src0->type, cc, mmq_cols, n_experts) &&
             ggml_cuda_should_use_mmq(src0_next->type, cc, mmq_cols, n_experts);
-        const bool compatible = use_mmq && !ggml_cuda_mmb_claims(node) && node->src[1]->type == GGML_TYPE_F32 &&
+        const bool compatible = use_mmq && !ggml_cuda_mmb_claims(*cuda_ctx, node) && node->src[1]->type == GGML_TYPE_F32 &&
             node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 &&
             ggml_are_same_shape(src0, src0_next) && ggml_are_same_shape(node, next) &&
             mmq_get_q8_1_ds_layout(src0->type) == mmq_get_q8_1_ds_layout(src0_next->type) &&
@@ -5178,7 +5178,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
-            if (op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmb_supported_glu(gate->src[0], up->src[0], src1, ids, glu)) {
+            if (op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmb_supported_glu(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu)) {
                 ggml_cuda_mul_mat_id_mmb_glu(*cuda_ctx, gate->src[0], up->src[0], src1, ids, glu);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
@@ -5447,7 +5447,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // HC gate GEMM [320 -> 10240] whose only consumer is the fused stream mix: GEMM + sigmoid + mix in one kernel
     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         const ggml_tensor * w = node->src[0], * lo = node->src[1];
-        if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(w, lo, node)) {
+        if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(*cuda_ctx, w, lo, node)) {
             ggml_cuda_hc_mix_args ma;
             const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
             if (count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) return count;
@@ -6069,7 +6069,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (!reads(t, xn)) continue;
                     ++nread;
                     if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 &&
-                        ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
+                        ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) continue;
                     if (t->op == GGML_OP_MUL && n >= 1) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n - 1, ma) > 0 && (ma.xn == t->src[0] || ma.xn == t->src[1]) && (ma.xn == xn || ma.xn->view_src == xn)) continue; }
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                     ok = false;
@@ -6086,7 +6086,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 for (const ggml_tensor * b : blks) {
                     if (ggml_nrows(b) < 512 || b->ne[0] % 8 != 0) continue;
                     bool producer_ok = false;   // only producers that honour a BF16 mark
-                    if (b->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(b->src[0], b->src[1], b)) producer_ok = true;
+                    if (b->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(*cuda_ctx, b->src[0], b->src[1], b)) producer_ok = true;
                     if (!producer_ok) {
                         for (int k = 0; k < cgraph->n_nodes && !producer_ok; ++k) {
                             ggml_cuda_moe_weighted_reduction_match mm;
@@ -6157,14 +6157,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     ++nread;
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                     if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 &&
-                        ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
+                        ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) continue;
                     ok = false;
                 }
                 if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, d)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, d);
             }
             for (int i = 0; i < cgraph->n_nodes; ++i) {   // the HC gate GEMM feeding only the fused mix keeps its BF16 epilogue
                 const ggml_tensor * t = cgraph->nodes[i];
-                if (t->op != GGML_OP_MUL_MAT || t->src[0]->ne[0] != 320 || t->src[0]->ne[1] != 10240 || !ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
+                if (t->op != GGML_OP_MUL_MAT || t->src[0]->ne[0] != 320 || t->src[0]->ne[1] != 10240 || !ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) continue;
                 bool ok = true; int nread = 0;
                 for (int n = i + 1; n < cgraph->n_nodes && ok; ++n) {
                     const ggml_tensor * u = cgraph->nodes[n];
@@ -6183,7 +6183,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     int xi = -1;
                     for (int k = 0; k < i; ++k) { if (cgraph->nodes[k] == ex) { xi = k; break; } }
                     if (xi < 0 || ex->op != GGML_OP_MUL_MAT_ID || ex->type != GGML_TYPE_F32) continue;
-                    if (!ggml_cuda_mmb_supported_mmid(ex->src[0], ex->src[1], ex->src[2], const_cast<ggml_tensor *>(ex))) continue;
+                    if (!ggml_cuda_mmb_supported_mmid(*cuda_ctx, ex->src[0], ex->src[1], ex->src[2], const_cast<ggml_tensor *>(ex))) continue;
                     if (ex->src[0]->type != GGML_TYPE_IQ4_NL) continue;   // other formats keep F32 expert outputs
                     if (!ggml_node_has_n_uses(cgraph, xi, 1)) continue;
                     if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) continue;
@@ -6206,12 +6206,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         auto reads = [](const ggml_tensor * t, const ggml_tensor * x) { for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == x || t->src[s]->view_src == x) return true; return false; };
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * t = cgraph->nodes[i];
-            if (t->op == GGML_OP_MUL_MAT && (t->src[0]->type == GGML_TYPE_IQ4_NL || t->src[0]->type == GGML_TYPE_Q6_K) && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) ggml_cuda_mmb_shadow_prepare(*cuda_ctx, t->src[0]);
+            if (t->op == GGML_OP_MUL_MAT && (t->src[0]->type == GGML_TYPE_IQ4_NL || t->src[0]->type == GGML_TYPE_Q6_K) && ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) ggml_cuda_mmb_shadow_prepare(*cuda_ctx, t->src[0]);
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             const ggml_tensor * glu = cgraph->nodes[i];
             if (glu->op != GGML_OP_GLU || !glu->src[0] || !glu->src[1] || glu->src[0]->op != GGML_OP_MUL_MAT_ID) continue;
-            if (!ggml_cuda_mmb_supported_glu(glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2], glu)) continue;
+            if (!ggml_cuda_mmb_supported_glu(*cuda_ctx, glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2], glu)) continue;
             for (const auto * input : {glu->src[0]->src[0], glu->src[1]->src[0], glu->src[0]->src[1], glu->src[0]->src[2], glu->src[0], glu->src[1]}) {
                 auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
                 params->add_alloc_dep(params->user_data, root, const_cast<ggml_tensor *>(glu));
@@ -6221,7 +6221,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 const ggml_tensor * t = cgraph->nodes[n];
                 if (!reads(t, glu)) continue;
                 ++nread;
-                if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] == glu && ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t)) continue;
+                if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] == glu && ggml_cuda_mmb_supported_mmid(*cuda_ctx, t->src[0], t->src[1], t->src[2], t)) continue;
                 ok = false;
             }
             if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, glu)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, glu);
@@ -7491,9 +7491,10 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-// enable the BF16 WMMA matmul path (mmb); the llama layer calls this per model, by architecture
-static void ggml_backend_cuda_set_mmb_enabled(bool enable) {
-    ggml_cuda_mmb_set_opt_in(enable);
+// opt this backend context in to the BF16 WMMA matmul path (mmb); call before the first graph
+static void ggml_backend_cuda_set_mmb_enabled(ggml_backend_t backend, bool enable) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ((ggml_backend_cuda_context *) backend->context)->mmb_opt_in = enable;
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {

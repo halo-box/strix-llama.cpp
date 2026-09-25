@@ -13637,6 +13637,15 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
+// The CUDA/HIP BF16 WMMA matmul path (mmb) is off unless a context opts in (llama does it for qwen4exp). Turn it on so the tests cover it.
+static void enable_mmb(ggml_backend_t backend) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    auto set_mmb = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_enabled");
+    if (set_mmb) {
+        set_mmb(backend, true);
+    }
+}
+
 // Target and draft contexts must not share mutable MMB scratch, including during graph replay and teardown.
 static bool run_mmb_context_test(ggml_backend_dev_t dev, const char * op_names_filter, printer * output_printer) {
     if (!op_names_filter_selects(op_names_filter, "MMB_CONTEXT") ||
@@ -13656,6 +13665,7 @@ static bool run_mmb_context_test(ggml_backend_dev_t dev, const char * op_names_f
         context(ggml_backend_dev_t dev, int tokens) : backend(ggml_backend_dev_init(dev, nullptr)), cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)), test(tokens, GGML_TYPE_Q4_0) {
             tensors.reset(ggml_init({ggml_tensor_overhead()*128 + ggml_graph_overhead(), nullptr, true}));
             GGML_ASSERT(backend && cpu && tensors);
+            enable_mmb(backend.get());
             test.gf = ggml_new_graph(tensors.get());
             output = test.build_graph(tensors.get());
             for (ggml_tensor * t = ggml_get_first_tensor(tensors.get()); t; t = ggml_get_next_tensor(tensors.get(), t)) {
@@ -13852,6 +13862,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                 if (b == NULL) {
                     return;
                 }
+                enable_mmb(b.get());
 
                 ggml_backend_ptr b_cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL));
                 if (b_cpu == NULL) {
@@ -14159,6 +14170,7 @@ int main(int argc, char ** argv) {
 
         ggml_backend_ptr backend(ggml_backend_dev_init(dev, NULL));
         GGML_ASSERT(backend != NULL);
+        enable_mmb(backend.get());
 
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
