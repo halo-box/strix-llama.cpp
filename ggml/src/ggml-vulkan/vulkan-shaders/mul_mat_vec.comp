@@ -143,6 +143,46 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
 }
 #endif
 
+#if defined(DATA_A_TQ2_T)
+// Eight lanes per 128-weight block, four trellis steps (16 weights) per lane. A lane
+// reads its four path bytes plus the one before (tail-biting wrap to qs[31]) with
+// three 16-bit loads, and each byte feeds both states that contain it. Every step
+// costs two hashes and two shared-memory codebook reads (each read = 2 weights).
+// Weights are decoded once per row and reused across all NUM_COLS columns.
+void accumulate_tq2_t(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
+                      uint first_row, uint num_rows, uint tid) {
+    const uint blocks = p.ncols / 128u;
+    const uint items = blocks * 8u;
+    for (uint item = tid; item < items; item += BLOCK_SIZE) {
+        const uint block = item >> 3u;
+        const uint lane = item & 7u;
+        [[unroll]] for (uint row = 0; row < num_rows; ++row) {
+            const uint ib = a_offset + (first_row + row)*blocks + block;
+            const uint w0 = uint(data_a_packed16[ib].qs[2u*lane]);
+            const uint w1 = uint(data_a_packed16[ib].qs[2u*lane + 1u]);
+            const uint wp = uint(data_a_packed16[ib].qs[(2u*lane + 15u) & 15u]);
+            const uint q0 = w0 & 255u;
+            const uint q1 = w0 >> 8u;
+            const uint q2 = w1 & 255u;
+            const uint q3 = w1 >> 8u;
+            const vec4 x0 = tq2_t_step(((wp >> 8u) << 8u) | q0);
+            const vec4 x1 = tq2_t_step((q0 << 8u) | q1);
+            const vec4 x2 = tq2_t_step((q1 << 8u) | q2);
+            const vec4 x3 = tq2_t_step((q2 << 8u) | q3);
+            const float d = float(data_a_packed16[ib].d);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint base = (j*p.batch_stride_b + b_offset + block*128u + lane*16u) / 4u;
+                const float sum = dot(vec4(data_b_v4[base     ]), x0)
+                                + dot(vec4(data_b_v4[base + 1u]), x1)
+                                + dot(vec4(data_b_v4[base + 2u]), x2)
+                                + dot(vec4(data_b_v4[base + 3u]), x3);
+                temp[j][row] += FLOAT_TYPE(sum * d);
+            }
+        }
+    }
+}
+#endif
+
 #if defined(DATA_A_PTQ1_0)
 // Eight lanes own a whole block: six packed qs words, one qh tail, one
 // inactive lane. Each packed byte is loaded once and supplies all its trits.
@@ -212,6 +252,8 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
 #if defined(DATA_A_PTQ1_0)
     accumulate_ptq1_0(temp, first_row, num_rows, tid);
+#elif defined(DATA_A_TQ2_T)
+    accumulate_tq2_t(temp, first_row, num_rows, tid);
 #else
     uint num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
     if (num_iters * K_PER_ITER * BLOCK_SIZE + K_PER_ITER*tid < p.ncols) {
@@ -298,7 +340,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 #endif
 
-#endif // DATA_A_PTQ1_0
+#endif // DATA_A_PTQ1_0 / DATA_A_TQ2_T
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 

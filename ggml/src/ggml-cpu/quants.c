@@ -34,6 +34,10 @@ void quantize_row_ptq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     quantize_row_ptq1_0_ref(x, y, k);
 }
 
+void quantize_row_tq2_t(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tq2_t_ref(x, y, k);
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }
@@ -1405,6 +1409,53 @@ void ggml_vec_dot_ptq1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
         }
 
         sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
+
+// TQ2_T x Q8_0. Decode the block's 32 trellis steps to floats (same traversal as
+// dequantize_row_tq2_t), then dot against the four Q8_0 blocks covering it.
+void ggml_vec_dot_tq2_t_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK_TQ2_T;
+    const int nb = n / qk;
+    const int nsteps = QK_TQ2_T/4;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_tq2_t * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        float w[QK_TQ2_T];
+        const uint8_t * qs = x[i].qs;
+        for (int t = 0; t < nsteps; ++t) {
+            const uint32_t st = ((uint32_t) qs[(t + nsteps - 1) % nsteps] << 8) | qs[t];
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t idx = tq2t_hyb_index(2*st + h);
+                w[4*t + 2*h + 0] = GGML_CPU_FP16_TO_FP32(tq2t_lut_f16[2*idx + 0]);
+                w[4*t + 2*h + 1] = GGML_CPU_FP16_TO_FP32(tq2t_lut_f16[2*idx + 1]);
+            }
+        }
+
+        float sumb = 0.0f;
+        for (int k = 0; k < QK_TQ2_T/QK8_0; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i*(QK_TQ2_T/QK8_0) + k];
+            float acc = 0.0f;
+            for (int b = 0; b < QK8_0; ++b) {
+                acc += w[k*QK8_0 + b] * (float) yb->qs[b];
+            }
+            sumb += GGML_CPU_FP16_TO_FP32(yb->d) * acc;
+        }
+
+        sumf += GGML_CPU_FP16_TO_FP32(x[i].d) * sumb;
     }
 
     *s = sumf;
