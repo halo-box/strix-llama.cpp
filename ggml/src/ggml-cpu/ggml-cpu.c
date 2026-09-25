@@ -3199,6 +3199,11 @@ struct ggml_cplan ggml_graph_plan(
                         size_t n_chunks = n_tasks;
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
+                        // selected-key rows (src[5]) are gathered per thread after the decode partials
+                        if (node->src[5]) {
+                            decode += sizeof(float)*n_tasks*CACHE_LINE_SIZE_F32 + sizeof(int32_t)*n_tasks*node->src[5]->ne[0];
+                        }
+
                         cur += MAX(prefill, decode);
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
