@@ -807,12 +807,17 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
     if (src0->type == GGML_TYPE_F32) {
         const float * W = (const float *) src0->data, * X = (const float *) src1->data; float * D = (float *) dst->data;
+        // MMB_F32_TILE narrows the M>64 F32 GEMM (e.g. the M=512 MoE router) for more blocks per ubatch chunk.
+        // 0 keeps master's 128x128 tile. Valid geometries satisfy (8/WAVES_M)*WTN == BN (the kernel's static_assert).
+        static const int FT = getenv("MMB_F32_TILE") ? atoi(getenv("MMB_F32_TILE")) : 0;
         if (M <= 64) {
             dim3 grid((M + 63) / 64, (T + 127) / 128);
             mmb_f32split_kernel<64, 128, 16, 64, true, false><<<grid, MMB_NT, 0, stream>>>(W, X, D, M, K, T);
-        } else {
-            dim3 grid((M + 127) / 128, (T + 127) / 128);
-            mmb_f32split_kernel<128, 128, 32, 64, true, false><<<grid, MMB_NT, 0, stream>>>(W, X, D, M, K, T);
+        } else if (FT == 1) { dim3 g((M + 63) / 64,  (T + 127) / 128); mmb_f32split_kernel< 64, 128, 32, 32, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
+        else if (FT == 4)   { dim3 g((M + 31) / 32,  (T + 127) / 128); mmb_f32split_kernel< 32, 128, 32, 16, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
+        else if (FT == 5)   { dim3 g((M + 31) / 32,  (T + 63) / 64);   mmb_f32split_kernel< 32,  64, 16, 16, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
+        else if (FT == 6)   { dim3 g((M + 63) / 64,  (T + 63) / 64);   mmb_f32split_kernel< 64,  64, 32, 16, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T); }
+        else                { dim3 g((M + 127) / 128,(T + 127) / 128); mmb_f32split_kernel<128, 128, 32, 64, true, false><<<g, MMB_NT, 0, stream>>>(W, X, D, M, K, T);
         }
         CUDA_CHECK(cudaGetLastError()); return;
     }
@@ -834,25 +839,33 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
     dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
     const uint16_t * shadow = shadow_pre;
+    // MMB_DENSE_TILE narrows the shared-expert / dense GEMM tiles for more blocks per ubatch chunk.
+#define MMB_SMALL_DENSE(WT, WP) do { \
+    static const int DT_ = getenv("MMB_DENSE_TILE") ? atoi(getenv("MMB_DENSE_TILE")) : 0; \
+    if (DT_ == 1) { dim3 gd((M + 63) / 64, (T + 127) / 128); mmb_dense_kernel<64, 128, 32, 32, WT><<<gd, MMB_NT, 0, stream>>>(WP, xhp, D, Dh, store_f32, M, K, T); } \
+    else if (DT_ == 2) { dim3 gd((M + 31) / 32, (T + 127) / 128); mmb_dense_kernel<32, 128, 32, 16, WT><<<gd, MMB_NT, 0, stream>>>(WP, xhp, D, Dh, store_f32, M, K, T); } \
+    else if (DT_ == 3) { dim3 gd((M + 63) / 64, (T + 63) / 64); mmb_dense_kernel<64, 64, 32, 16, WT><<<gd, MMB_NT, 0, stream>>>(WP, xhp, D, Dh, store_f32, M, K, T); } \
+    else { mmb_dense_kernel<128, 128, 32, 64, WT><<<grid, MMB_NT, 0, stream>>>(WP, xhp, D, Dh, store_f32, M, K, T); } \
+} while (0)
 
     if (shadow) {
         if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) shadow, xhp, D, Dh, store_f32, M, K, T);
-        else     mmb_dense_kernel<128, 128, 32, 64, 2><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) shadow, xhp, D, Dh, store_f32, M, K, T);
+        else     { MMB_SMALL_DENSE(2, (const uint8_t *) shadow); }
     } else if (src0->type == GGML_TYPE_IQ4_NL) {
         if (big) mmb_dense_kernel<128, 256, 64, 64, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
-        else     mmb_dense_kernel<128, 128, 32, 64, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+        else     { MMB_SMALL_DENSE(0, W); }
     } else if (src0->type == GGML_TYPE_Q8_0) {
         if (big) mmb_dense_kernel<128, 256, 64, 64, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
-        else     mmb_dense_kernel<128, 128, 32, 64, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+        else     { MMB_SMALL_DENSE(1, W); }
     } else if (mmb_quant_type(src0->type)) {
         mmb_dispatch_quant(src0->type, [&](auto tag) {
             constexpr int WT = decltype(tag)::value;
             if (big) mmb_dense_kernel<128, 256, 64, 64, WT><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
-            else     mmb_dense_kernel<128, 128, 32, 64, WT><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+            else     { MMB_SMALL_DENSE(WT, W); }
         });
     } else {
         if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
-        else     mmb_dense_kernel<128, 128, 32, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+        else     { MMB_SMALL_DENSE(2, W); }
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -916,11 +929,18 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data; const size_t eb = (size_t) src0->nb[2];
     uint16_t * Dh = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(ctx, dst)) ? (uint16_t *) dst->data : nullptr;
     const bool store_f32 = Dh == nullptr;
+    static const int RT = getenv("MMB_ROUTED_TILE") ? atoi(getenv("MMB_ROUTED_TILE")) : 0;
     dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
     mmb_dispatch_quant(src0->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
+    if (RT == 1) {
+        const dim3 gb((M + 63) / 64, nbig_max), gs((M + 63) / 64, nsmall_max);
+        mmb_routed_kernel<64, BN, 32, 32, WT><<<gb, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+        mmb_routed_kernel<64, BN_SMALL, 16, 16, WT><<<gs, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    } else {
     mmb_routed_kernel<128, BN, 32, 64, WT><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
     mmb_routed_kernel<128, BN_SMALL, 32, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    }
     });
     CUDA_CHECK(cudaGetLastError());
 }
@@ -971,17 +991,31 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
     const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(ctx, glu);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
-    const dim3 gsmall((M + 63) / 64, nsmall_max);
+    // MMB_BM_BIG / MMB_BM_SMALL widen the M tile (n_ff_exp rows per block) to halve the M-tile count and the
+    // B-tile reloads at small rows/expert.  BM=128 needs a matching (WTM,WTN) to keep the 8 waves full.
+    static const int BM_BIG   = getenv("MMB_BM_BIG")   ? atoi(getenv("MMB_BM_BIG"))   : 64;
+    static const int BM_SMALL = getenv("MMB_BM_SMALL") ? atoi(getenv("MMB_BM_SMALL")) : 64;
     mmb_dispatch_quant(gw->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
-        auto launch_big = [&](auto bn_tag) {
-            constexpr int BN = decltype(bn_tag)::value;
-            const dim3 gbig((M + 63) / 64, nbig_max);
-            mmb_routed_glu_kernel<64, BN, 32, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-        };
-        if (BN_sel == 256) launch_big(std::integral_constant<int,256>{});
-        else               launch_big(std::integral_constant<int,128>{});
-        mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+        if (BM_BIG == 128 && BN_sel != 256) {
+            const dim3 gbig((M + 127) / 128, nbig_max);
+            mmb_routed_glu_kernel<128, 128, 64, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+        } else {
+            auto launch_big = [&](auto bn_tag) {
+                constexpr int BN = decltype(bn_tag)::value;
+                const dim3 gbig((M + 63) / 64, nbig_max);
+                mmb_routed_glu_kernel<64, BN, 32, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            };
+            if (BN_sel == 256) launch_big(std::integral_constant<int,256>{});
+            else               launch_big(std::integral_constant<int,128>{});
+        }
+        if (BM_SMALL == 128) {
+            const dim3 gsmall((M + 127) / 128, nsmall_max);
+            mmb_routed_glu_kernel<128, BN_SMALL, 32, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+        } else {
+            const dim3 gsmall((M + 63) / 64, nsmall_max);
+            mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+        }
     });
     CUDA_CHECK(cudaGetLastError());
 }
