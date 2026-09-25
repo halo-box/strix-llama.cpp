@@ -846,9 +846,16 @@ static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_
 static ggml_tensor * qwen4exp_apply_compact_visibility(ggml_context *ctx,ggml_tensor *score,
         ggml_tensor *limits,int64_t blocks,int64_t n_seq,int64_t n_tps,int64_t first,int64_t queries) {
     GGML_ASSERT(limits->type==GGML_TYPE_I32 && score->ne[0]<=blocks && score->ne[1]==queries && score->ne[2]==1);
-    auto *starts2d=ggml_view_2d(ctx,limits,score->ne[0],n_seq,blocks*sizeof(int32_t),0);
-    auto *row_idx=ggml_view_1d(ctx,limits,queries,(blocks*n_seq+n_tps+first)*sizeof(int32_t));
-    auto *starts=ggml_cast(ctx,ggml_get_rows(ctx,starts2d,row_idx),GGML_TYPE_F32);
+    // one row is broadcast over the queries; several rows are cast first (n_seq x blocks) and then gathered per
+    // query, so no pass over the full [blocks, queries] tensor is added
+    ggml_tensor * starts = nullptr;
+    if (n_seq == 1) {
+        starts=ggml_cast(ctx,ggml_view_1d(ctx,limits,score->ne[0],0),GGML_TYPE_F32);
+    } else {
+        auto *starts2d=ggml_cast(ctx,ggml_view_2d(ctx,limits,score->ne[0],n_seq,blocks*sizeof(int32_t),0),GGML_TYPE_F32);
+        auto *row_idx=ggml_view_1d(ctx,limits,queries,(blocks*n_seq+n_tps+first)*sizeof(int32_t));
+        starts=ggml_get_rows(ctx,starts2d,row_idx);
+    }
     auto *tails=ggml_cast(ctx,ggml_view_1d(ctx,limits,queries,(blocks*n_seq+first)*sizeof(int32_t)),GGML_TYPE_F32);
     tails=ggml_reshape_2d(ctx,tails,1,queries);
     auto *visible=ggml_step(ctx,ggml_sub(ctx,ggml_repeat(ctx,tails,score),starts));
@@ -1215,6 +1222,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(q, "indexer_q", il);
 
     const int64_t strip = qwen4exp_query_strip(n_tps, n_stream);
+
+    // the strips slice the block cells and the tails; copy these host inputs to the compute backend once, so no strip
+    // needs an input copy and the scheduler cannot cut a split inside a (fused) block selection
+    ggml_tensor * blk_cells = inp->blk_cells;
+    ggml_tensor * tail_idxs = inp->tail_idxs;
+    if (tail_idxs) {
+        blk_cells = ggml_cont(ctx0, blk_cells);
+        tail_idxs = ggml_cont(ctx0, tail_idxs);
+        ggml_build_forward_expand(gf, blk_cells);
+        ggml_build_forward_expand(gf, tail_idxs);
+    }
+
     std::vector<ggml_tensor *> selected;
     for (int64_t first = 0; first < n_tps; first += strip) {
         const int64_t n_query = std::min(strip, n_tps - first);
@@ -1257,12 +1276,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             score = ggml_add(ctx0, score, bias);
         }
 
-        if (inp->tail_idxs) {
-            ggml_tensor * tail = whole ? ggml_reshape_4d(ctx0, inp->tail_idxs, r-1, n_tps, 1, n_stream)
-                : ggml_view_4d(ctx0, inp->tail_idxs, r-1, n_query, 1, n_stream,
-                    inp->tail_idxs->nb[1], inp->tail_idxs->nb[2], inp->tail_idxs->nb[2], first*inp->tail_idxs->nb[1]);
+        if (tail_idxs) {
+            ggml_tensor * tail = whole ? ggml_reshape_4d(ctx0, tail_idxs, r-1, n_tps, 1, n_stream)
+                : ggml_view_4d(ctx0, tail_idxs, r-1, n_query, 1, n_stream,
+                    tail_idxs->nb[1], tail_idxs->nb[2], tail_idxs->nb[2], first*tail_idxs->nb[1]);
             ggml_tensor * block_cells = score_blocks < n_blocks ?
-                ggml_view_2d(ctx0, inp->blk_cells, r*score_blocks, n_stream, inp->blk_cells->nb[1], 0) : inp->blk_cells;
+                ggml_view_2d(ctx0, blk_cells, r*score_blocks, n_stream, blk_cells->nb[1], 0) : blk_cells;
             ggml_tensor * top_k = qwen4exp_select_complete_blocks(ctx0, score, block_cells, tail,
                     hparams.indexer_top_k/r, r);
             cb(top_k, "indexer_top_k", il);
