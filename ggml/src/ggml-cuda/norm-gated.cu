@@ -10,7 +10,7 @@ static __device__ __forceinline__ float xor_tree(float v) {
 template <bool GATE>
 static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, const float * w, const float * z, float * dst,
         const int ncols, const uint3 row_div, const uint3 channel_div, const int64_t total_rows,
-        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, uint16_t * dst16) {
     const int lane = threadIdx.x & 31;
     const int64_t g = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 5);
     if (g >= total_rows) return;
@@ -22,6 +22,7 @@ static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, cons
     }
     x += sample * stride_sample + channel * stride_channel + row * stride_row;
     dst += g * ncols; if (GATE) z += g * ncols;
+    if (dst16) dst16 += g * ncols;
     float part[8];
 #pragma unroll
     for (int wv = 0; wv < 8; ++wv) {
@@ -40,7 +41,10 @@ static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, cons
         const int col = 32 * wv + lane;
         if (col < ncols) {
             const float t = scale * x[col] * w[col];
-            if (GATE) { const float s = 1.0f / (1.0f + expf(-z[col])); dst[col] = t * s; } else { dst[col] = t; }
+            float v;
+            if (GATE) { const float s = 1.0f / (1.0f + expf(-z[col])); v = t * s; } else { v = t; }
+            dst[col] = v;
+            if (dst16) dst16[col] = ggml_cuda_f32_to_bf16_rne(v);
         }
     }
 }
@@ -128,7 +132,7 @@ void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_no
     const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
     const ggml_cuda_kernel_launch_params lp(grid, block, 0, ctx.stream());
     if (m.z) ggml_cuda_kernel_launch(rms_rows_f32<true>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) m.z->data, (float *) m.dst->data,
-        (int) x->ne[0], row_div, channel_div, total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
+        (int) x->ne[0], row_div, channel_div, total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps, m.dst16);
     else     ggml_cuda_kernel_launch(rms_rows_f32<false>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) nullptr, (float *) m.dst->data,
-        (int) x->ne[0], row_div, channel_div, total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
+        (int) x->ne[0], row_div, channel_div, total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps, m.dst16);
 }

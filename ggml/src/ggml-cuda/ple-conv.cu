@@ -23,9 +23,12 @@ static __global__ void ple_concat_tail(const float * __restrict__ state, const f
     out[(size_t) c * row_stride + j] = (j < H) ? state[c * H + j] : x[(size_t) (j - H) * C + c];
 }
 
-template <int K, int DIL, int TT>
+static __device__ __forceinline__ float ple_weight(const half w) { return __half2float(w); }
+static __device__ __forceinline__ float ple_weight(const float w) { return w; }
+
+template <int K, int DIL, int TT, typename TW>
 static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __restrict__ state, const float * __restrict__ x,
-        const half * __restrict__ w, float * __restrict__ y, const int C, const int T) {
+        const TW * __restrict__ w, float * __restrict__ y, const int C, const int T) {
     constexpr int H = (K - 1) * DIL, WIN = H + 1;
     const int c = blockIdx.x * 256 + threadIdx.x, t0 = blockIdx.y * TT;
     if (c >= C) {
@@ -34,7 +37,7 @@ static __global__ void __launch_bounds__(256) ple_conv_kernel(const float * __re
     float wr[K];
 #pragma unroll
     for (int k = 0; k < K; ++k) {
-        wr[k] = __half2float(w[c * K + k]);
+        wr[k] = ple_weight(w[c * K + k]);
     }
     float win[WIN];
     auto ld = [&](int jp) -> float {
@@ -75,12 +78,13 @@ static int ple_tap_index(const ggml_tensor * t, const ggml_tensor * cc, int64_t 
     return (k >= 0 && k < K) ? (int) k : -1;
 }
 
-// the weight operand of a tap MUL: cast(F32) <- reshape <- CONT <- VIEW of column k of the F16 [K, C] weight
+// the weight operand of a tap MUL: reshape <- CONT <- VIEW of column k of the [K, C] weight, behind a cast(F32) when it is F16
 static const ggml_tensor * ple_weight_root(const ggml_tensor * wk, int64_t C, int k) {
-    if (wk->type != GGML_TYPE_F32 || ggml_nelements(wk) != C || wk->op != GGML_OP_CPY) {
+    if (wk->type != GGML_TYPE_F32 || ggml_nelements(wk) != C) {
         return nullptr;
     }
-    const ggml_tensor * src = wk->src[0];
+    const bool cast = wk->op == GGML_OP_CPY;
+    const ggml_tensor * src = cast ? wk->src[0] : wk;
     while (src && (src->op == GGML_OP_RESHAPE || src->op == GGML_OP_VIEW)) {
         src = src->src[0];
     }
@@ -92,8 +96,9 @@ static const ggml_tensor * ple_weight_root(const ggml_tensor * wk, int64_t C, in
         return nullptr;
     }
     const ggml_tensor * W = wv->view_src;
-    if (W->type != GGML_TYPE_F16 || W->ne[1] != C || W->ne[2] != 1 || W->ne[3] != 1 || !ggml_is_contiguous(W) ||
-        wv->ne[0] != 1 || wv->ne[1] != C || wv->nb[1] != W->nb[1] || wv->view_offs != (size_t) k * sizeof(ggml_fp16_t)) {
+    if ((cast ? W->type != GGML_TYPE_F16 : W->type != GGML_TYPE_F32) || W->ne[1] != C || W->ne[2] != 1 || W->ne[3] != 1 ||
+        !ggml_is_contiguous(W) || wv->ne[0] != 1 || wv->ne[1] != C || wv->nb[1] != W->nb[1] ||
+        wv->view_offs != (size_t) k * ggml_element_size(W)) {
         return nullptr;
     }
     return W;
@@ -293,7 +298,12 @@ void ggml_cuda_ple_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_
     constexpr int TT = 128;
     GGML_ASSERT(m.K == 4 && m.dil == 3);
     dim3 grid((unsigned) (m.C / 256), (unsigned) ((m.T + TT - 1) / TT));
-    ple_conv_kernel<4, 3, TT><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
-        (const half *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
+    if (m.w->type == GGML_TYPE_F16) {
+        ple_conv_kernel<4, 3, TT, half><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
+            (const half *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
+    } else {
+        ple_conv_kernel<4, 3, TT, float><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
+            (const float *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
+    }
     CUDA_CHECK(cudaGetLastError());
 }

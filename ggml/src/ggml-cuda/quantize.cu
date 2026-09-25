@@ -572,8 +572,7 @@ static __global__ void quantize_mmq_q8_1_swiglu(
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         if (i0 + i < ne00) {
-            volatile float value = ggml_cuda_op_silu_single(gate[gate_base + i0 + i]) * up[up_base + i0 + i];
-            values[i] = value;
+            values[i] = ggml_cuda_materialize(ggml_cuda_op_silu_single(gate[gate_base + i0 + i]) * up[up_base + i0 + i]);
         } else {
             values[i] = 0.0f;
         }
