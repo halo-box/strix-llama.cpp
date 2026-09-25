@@ -105,7 +105,8 @@ private:
     bool set_input_qsa_prefix(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                               ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio, bool blk_bias) const;
     // the per-cell scan over the whole window; with tail_idxs it also writes each query's own partial block
-    // (r-1 cells, -1 padded) and, for an I32 bias, the compact visibility limits [n_blocks + n_tokens]
+    // (r-1 cells, -1 padded) and, for an I32 bias, the compact visibility limits
+    // [n_seq x n_blocks starts] ++ [n_tps tails] ++ [n_tps row idx]
     void set_input_qsa_scan(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                             ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch,
                             uint32_t ratio, bool blk_bias) const;
@@ -191,10 +192,11 @@ public:
     void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                               ggml_tensor * bias, ggml_tensor * tail_idxs,
                               const llama_ubatch * ubatch, uint32_t ratio) const;
-    // one sequence, scalar positions in range, no 2d rope extents: the compact visibility rule applies
-    bool qsa_scalar_visibility(const llama_ubatch & ubatch) const;
+    // one stream, scalar positions in range, no 2d rope extents, no block split over sequence sets
+    // (qsa_scalar_visibility_cells): the compact visibility rule applies
+    bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
     // scalar visibility and the cached cells form a single-sequence prefix with unique positions
-    bool qsa_position_prefix(const llama_ubatch & ubatch) const;
+    bool qsa_position_prefix(const llama_ubatch & ubatch, uint32_t ratio) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

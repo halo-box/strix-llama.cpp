@@ -245,6 +245,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+    # non-unified multi-seq decodes reach the QSA path with one stream per ubatch (#73)
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-qwen4exp
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-qwen4exp PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
 
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(

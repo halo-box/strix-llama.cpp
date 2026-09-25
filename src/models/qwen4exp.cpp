@@ -832,19 +832,31 @@ static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_
     for (uint32_t i = 1; degenerate_pos && i < ubatch.n_tokens; ++i) {
         if (ubatch.pos[i] != ubatch.pos[0]) { degenerate_pos = false; }
     }
-    if (!compact || ubatch.n_tokens<128 || degenerate_pos || !mctx->qsa_position_prefix(ubatch)) {
+    if (!compact || ubatch.n_tokens<128 || degenerate_pos || !mctx->qsa_position_prefix(ubatch, (uint32_t) ratio)) {
         return {};
     }
     return qsa_prefix_limits(ubatch.pos,ubatch.n_tokens,strip,ratio,blocks,budget);
 }
 
-// compact visibility: limits = [block start position per block (INT32_MAX when unfinished)] ++ [tail start per
-// query]; a block is visible to a query iff its start < the query's tail start. log(step(.)) is 0 or -inf.
+// compact visibility: limits = [block start per seq row (n_seq x blocks, INT32_MAX when the block is not a
+// complete block of that seq)] ++ [tail start per query] ++ [row index per query]. Each query reads the start
+// row of its own sequence, so one graph serves several sequences without a mask. A block is visible to a query
+// iff its start < the query's tail start. log(step(.)) is 0 or -inf. With n_seq=1 this is the old single-seq
+// layout (row_idx all 0) and produces byte-identical scores.
 static ggml_tensor * qwen4exp_apply_compact_visibility(ggml_context *ctx,ggml_tensor *score,
-        ggml_tensor *limits,int64_t blocks,int64_t first,int64_t queries) {
+        ggml_tensor *limits,int64_t blocks,int64_t n_seq,int64_t n_tps,int64_t first,int64_t queries) {
     GGML_ASSERT(limits->type==GGML_TYPE_I32 && score->ne[0]<=blocks && score->ne[1]==queries && score->ne[2]==1);
-    auto *starts=ggml_cast(ctx,ggml_view_1d(ctx,limits,score->ne[0],0),GGML_TYPE_F32);
-    auto *tails=ggml_cast(ctx,ggml_view_1d(ctx,limits,queries,(blocks+first)*sizeof(int32_t)),GGML_TYPE_F32);
+    // one row is broadcast over the queries; several rows are cast first (n_seq x blocks) and then gathered per
+    // query, so no pass over the full [blocks, queries] tensor is added
+    ggml_tensor * starts = nullptr;
+    if (n_seq == 1) {
+        starts=ggml_cast(ctx,ggml_view_1d(ctx,limits,score->ne[0],0),GGML_TYPE_F32);
+    } else {
+        auto *starts2d=ggml_cast(ctx,ggml_view_2d(ctx,limits,score->ne[0],n_seq,blocks*sizeof(int32_t),0),GGML_TYPE_F32);
+        auto *row_idx=ggml_view_1d(ctx,limits,queries,(blocks*n_seq+n_tps+first)*sizeof(int32_t));
+        starts=ggml_get_rows(ctx,starts2d,row_idx);
+    }
+    auto *tails=ggml_cast(ctx,ggml_view_1d(ctx,limits,queries,(blocks*n_seq+first)*sizeof(int32_t)),GGML_TYPE_F32);
     tails=ggml_reshape_2d(ctx,tails,1,queries);
     auto *visible=ggml_step(ctx,ggml_sub(ctx,ggml_repeat(ctx,tails,score),starts));
     return ggml_add(ctx,score,ggml_log(ctx,visible));
@@ -942,14 +954,15 @@ public:
         res &= cell_blk->ne[1]  == n_stream;
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
-        res &= bias->ne[0]      == (compact ? n_blocks + params.ubatch.n_tokens : (blk_bias ? n_blocks : n_kv));
+        const int64_t n_tps = params.ubatch.n_tokens / n_stream;
+        res &= bias->ne[0]      == (compact ? n_blocks * params.cparams.n_seq_max + 2*n_tps : (blk_bias ? n_blocks : n_kv));
         res &= compact || bias->ne[1] == params.ubatch.n_tokens/n_stream;
 
         // the selection mode and the strip bounds are baked into the graph, so a reused graph must agree on them
         const auto * attn = mctx->get_attn();
         const bool blocks = attn && qwen4exp_use_block_selection(blk_bias, n_stream, ratio, n_kv,
                 params.ubatch, params.cparams, params.hparams, attn->type_k(), attn->type_v());
-        const bool scalar = blocks && params.hparams.n_swa == 0 && mctx->qsa_scalar_visibility(params.ubatch);
+        const bool scalar = blocks && params.hparams.n_swa == 0 && mctx->qsa_scalar_visibility(params.ubatch, ratio);
         res &= (tail_idxs != nullptr) == scalar;
         res &= compact == scalar;
         res &= maskless == scalar;
@@ -969,7 +982,7 @@ public:
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream], or the compact
-                                         // I32 [n_blocks + n_tokens] visibility limits
+                                         // I32 [n_seq_max*n_blocks + 2*n_tps] visibility limits
 
     // complete-block selection (see qwen4exp_use_block_selection): the query's own partial block, -1 padded
     ggml_tensor * tail_idxs = nullptr;   // I32 [ratio-1, n_tokens/n_stream, n_stream]
@@ -1081,6 +1094,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens/n_stream;
 
+    // maskless multi-seq: one block-start row per sequence, row index = seq id, bounded by n_seq_max so every
+    // runtime seq id lands in range. n_seq=1 (np1) reduces the compact layout to the original single-seq one.
+    const int64_t n_seq = cparams.n_seq_max;
+
     // only the "which block is visible" half of the bias varies per block
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
@@ -1105,13 +1122,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const auto * attn_ctx = mctx_hyb->get_attn();
         const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, n_stream, r, n_kv, ubatch, cparams, hparams,
                 attn_ctx->type_k(), attn_ctx->type_v());
-        const bool scalar = blocks && hparams.n_swa == 0 && mctx_hyb->qsa_scalar_visibility(ubatch);
+        const bool scalar = blocks && hparams.n_swa == 0 && mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
         qsa->compact  = scalar;
         qsa->maskless = scalar;
         qsa->score_strip = qwen4exp_query_strip(n_tps, n_stream);
         qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, n_blocks, qsa->score_strip, r,
                 hparams.indexer_top_k/r, qsa->compact);
-        qsa->bias = qsa->compact ? ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks + n_tps) :
+        qsa->bias = qsa->compact ? ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks*n_seq + 2*n_tps) :
             ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
         ggml_set_input(qsa->cell_blk);
@@ -1119,9 +1136,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
         // complete-block selection lists cells with -1 sentinels (invisible blocks, empty tail slots) that only the
-        // maskless kernel understands; when the visibility is not scalar (2-D image positions in the cache, several
-        // sequences) the attention takes the masked path, whose set_rows would write row -1, so the block-expanded
-        // top-k with the per-block bias is used there instead
+        // maskless kernel understands; when the visibility is not scalar (2-D image positions in the cache, a block
+        // split over sequence sets) the attention takes the masked path, whose set_rows would write row -1, so the
+        // block-expanded top-k with the per-block bias is used there instead
         if (scalar) {
             GGML_ASSERT(hparams.indexer_top_k % r == 0);
             qsa->tail_idxs = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r-1, n_tps, n_stream);
@@ -1205,6 +1222,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(q, "indexer_q", il);
 
     const int64_t strip = qwen4exp_query_strip(n_tps, n_stream);
+
+    // the strips slice the block cells and the tails; copy these host inputs to the compute backend once, so no strip
+    // needs an input copy and the scheduler cannot cut a split inside a (fused) block selection
+    ggml_tensor * blk_cells = inp->blk_cells;
+    ggml_tensor * tail_idxs = inp->tail_idxs;
+    if (tail_idxs) {
+        blk_cells = ggml_cont(ctx0, blk_cells);
+        tail_idxs = ggml_cont(ctx0, tail_idxs);
+        ggml_build_forward_expand(gf, blk_cells);
+        ggml_build_forward_expand(gf, tail_idxs);
+    }
+
     std::vector<ggml_tensor *> selected;
     for (int64_t first = 0; first < n_tps; first += strip) {
         const int64_t n_query = std::min(strip, n_tps - first);
@@ -1242,17 +1271,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // one value per block, so it is cheaper to bias here than after the cells are expanded
         if (inp->compact) {
-            score = qwen4exp_apply_compact_visibility(ctx0, score, inp->bias, n_blocks, first, n_query);
+            score = qwen4exp_apply_compact_visibility(ctx0, score, inp->bias, n_blocks, n_seq, n_tps, first, n_query);
         } else if (blk_bias) {
             score = ggml_add(ctx0, score, bias);
         }
 
-        if (inp->tail_idxs) {
-            ggml_tensor * tail = whole ? ggml_reshape_4d(ctx0, inp->tail_idxs, r-1, n_tps, 1, n_stream)
-                : ggml_view_4d(ctx0, inp->tail_idxs, r-1, n_query, 1, n_stream,
-                    inp->tail_idxs->nb[1], inp->tail_idxs->nb[2], inp->tail_idxs->nb[2], first*inp->tail_idxs->nb[1]);
+        if (tail_idxs) {
+            ggml_tensor * tail = whole ? ggml_reshape_4d(ctx0, tail_idxs, r-1, n_tps, 1, n_stream)
+                : ggml_view_4d(ctx0, tail_idxs, r-1, n_query, 1, n_stream,
+                    tail_idxs->nb[1], tail_idxs->nb[2], tail_idxs->nb[2], first*tail_idxs->nb[1]);
             ggml_tensor * block_cells = score_blocks < n_blocks ?
-                ggml_view_2d(ctx0, inp->blk_cells, r*score_blocks, n_stream, inp->blk_cells->nb[1], 0) : inp->blk_cells;
+                ggml_view_2d(ctx0, blk_cells, r*score_blocks, n_stream, blk_cells->nb[1], 0) : blk_cells;
             ggml_tensor * top_k = qwen4exp_select_complete_blocks(ctx0, score, block_cells, tail,
                     hparams.indexer_top_k/r, r);
             cb(top_k, "indexer_top_k", il);

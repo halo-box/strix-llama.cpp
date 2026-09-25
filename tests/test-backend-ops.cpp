@@ -8913,8 +8913,8 @@ struct test_qsa_decode : public test_qsa_prefill {
 };
 
 // Maskless selected-key prefill: the rows name only the visible cells (-1 elsewhere) and no mask is given, as the
-// complete-block selection graph does. The CPU graph cannot express that (its flash attention ignores src[5]), so
-// the check is against a host FP64 oracle over the listed cells; the CPU result is ignored.
+// complete-block selection graph does. Both the backend and the CPU result are checked against a host FP64 oracle
+// over the listed cells.
 struct test_qsa_prefill_maskless : public test_qsa_prefill {
     test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12)
         : test_qsa_prefill(queries,keys,selected,true,false,1,ratio) {}
@@ -8949,7 +8949,6 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
         ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
     }
     double err(const float * actual, const float * cpu, size_t n) override {
-        GGML_UNUSED(cpu);
         const auto qv=tensor_to_float(q), kv=tensor_to_float(k), vv=tensor_to_float(v);
         std::vector<int32_t> picks(ggml_nelements(ids));
         ggml_backend_tensor_get(ids,picks.data(),0,ggml_nbytes(ids));
@@ -8975,8 +8974,9 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
             }
         }
         const double gpu_error=nmse(reference.data(),actual,n);
-        fprintf(stderr,"QSA_MASKLESS_FP64 q=%d keys=%d selected=%d gpu=%.9g\n",queries,keys,selected,gpu_error);
-        return gpu_error;
+        const double cpu_error=nmse(reference.data(),cpu,n);
+        fprintf(stderr,"QSA_MASKLESS_FP64 q=%d keys=%d selected=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,gpu_error,cpu_error);
+        return std::max(gpu_error,cpu_error);
     }
 };
 
@@ -13637,6 +13637,114 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
+// Target and draft contexts must not share mutable MMB scratch, including during graph replay and teardown.
+static bool run_mmb_context_test(ggml_backend_dev_t dev, const char * op_names_filter, printer * output_printer) {
+    if (!op_names_filter_selects(op_names_filter, "MMB_CONTEXT") ||
+            strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") != 0) {
+        return true;
+    }
+
+    struct context {
+        ggml_backend_ptr backend;
+        ggml_backend_ptr cpu;
+        ggml_context_ptr tensors;
+        ggml_backend_sched_ptr sched;
+        test_hc_chain test;
+        ggml_tensor * output = nullptr;
+        std::vector<float> reference;
+
+        context(ggml_backend_dev_t dev, int tokens) : backend(ggml_backend_dev_init(dev, nullptr)), cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr)), test(tokens, GGML_TYPE_Q4_0) {
+            tensors.reset(ggml_init({ggml_tensor_overhead()*128 + ggml_graph_overhead(), nullptr, true}));
+            GGML_ASSERT(backend && cpu && tensors);
+            test.gf = ggml_new_graph(tensors.get());
+            output = test.build_graph(tensors.get());
+            for (ggml_tensor * t = ggml_get_first_tensor(tensors.get()); t; t = ggml_get_next_tensor(tensors.get(), t)) {
+                if (t->op == GGML_OP_NONE) {
+                    ggml_set_input(t);
+                    ggml_set_output(t); // keep inputs intact across graph replays
+                }
+            }
+            ggml_set_output(output);
+            ggml_build_forward_expand(test.gf, output);
+            ggml_backend_t backends[] = {backend.get(), cpu.get()};
+            sched.reset(ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true));
+            for (ggml_tensor * t = ggml_get_first_tensor(tensors.get()); t; t = ggml_get_next_tensor(tensors.get(), t)) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), t, backend.get());
+            }
+            GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), test.gf));
+            for (ggml_tensor * t = ggml_get_first_tensor(tensors.get()); t; t = ggml_get_next_tensor(tensors.get(), t)) {
+                if (t->op == GGML_OP_NONE && t->buffer) {
+                    init_tensor_uniform(t);
+                }
+            }
+            reference.resize(ggml_nelements(output));
+        }
+
+        bool compute() {
+            return ggml_backend_sched_graph_compute_async(sched.get(), test.gf) == GGML_STATUS_SUCCESS;
+        }
+
+        void synchronize() {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+
+        void save() {
+            synchronize();
+            ggml_backend_tensor_get(output, reference.data(), 0, ggml_nbytes(output));
+        }
+
+        bool matches() {
+            synchronize();
+            std::vector<float> actual(reference.size());
+            ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (!std::isfinite(actual[i]) || memcmp(&actual[i], &reference[i], sizeof(float)) != 0) {
+                    fprintf(stderr, "MMB_CONTEXT tokens=%d element=%zu expected=%g actual=%g\n", test.tokens, i, reference[i], actual[i]);
+                    return false;
+                }
+            }
+            return true;
+        }
+    };
+
+    bool ok = true;
+    std::string error;
+    context target(dev, 512);
+    for (int i = 0; i < 4; ++i) {
+        ok &= target.compute();
+        target.synchronize();
+    }
+    target.save();
+    ok &= target.compute() && target.matches();
+    {
+        context draft(dev, 512);
+        for (int i = 0; i < 4; ++i) {
+            ok &= draft.compute();
+            draft.synchronize();
+        }
+        draft.save();
+        ok &= draft.compute() && draft.matches();
+        for (int i = 0; i < 16 && ok; ++i) {
+            ok &= target.compute();
+            ok &= draft.compute();
+            target.synchronize();
+            draft.synchronize();
+            if (!target.matches() || !draft.matches()) {
+                ok = false;
+                error = "overlapping contexts differ from serialized outputs at iteration " + std::to_string(i);
+            }
+        }
+    }
+    if (ok) {
+        ok = target.compute() && target.matches();
+        if (!ok) {
+            error = "destroying the draft context changed the target output";
+        }
+    }
+    output_printer->print_test_result(test_result(ggml_backend_dev_name(dev), "MMB_CONTEXT", "target=512,draft=512", "test", true, ok, error));
+    return ok;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -13776,7 +13884,8 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
 
-        return n_ok == tests_run && slice_ok;
+        const bool context_ok = run_mmb_context_test(dev, op_names_filter, output_printer);
+        return n_ok == tests_run && slice_ok && context_ok;
     }
 
     if (mode == MODE_GRAD) {
