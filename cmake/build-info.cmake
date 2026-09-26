@@ -18,7 +18,7 @@ endif()
 # Get the commit count and hash
 if(Git_FOUND)
     execute_process(
-        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         OUTPUT_VARIABLE HEAD
         OUTPUT_STRIP_TRAILING_WHITESPACE

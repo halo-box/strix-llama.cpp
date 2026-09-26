@@ -13,7 +13,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 find_program(GIT_EXE NAMES git git.exe NO_CMAKE_FIND_ROOT_PATH)
 if(GIT_EXE)
     # Get current git commit hash
-    execute_process(COMMAND ${GIT_EXE} rev-parse --short HEAD
+    execute_process(COMMAND ${GIT_EXE} rev-parse HEAD
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         OUTPUT_VARIABLE GGML_BUILD_COMMIT
         OUTPUT_STRIP_TRAILING_WHITESPACE

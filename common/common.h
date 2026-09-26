@@ -622,6 +622,8 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+    int32_t expert_cache_slots = 0; // DeepSeek V4.1 routed experts resident per layer
+    int32_t expert_cache_mib   = 0; // aggregate fixed slot-tensor capacity
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

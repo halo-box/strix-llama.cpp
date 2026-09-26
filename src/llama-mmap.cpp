@@ -7,6 +7,7 @@
 #include <cstring>
 #include <climits>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
@@ -172,7 +173,13 @@ struct llama_file::impl {
     }
 
     bool has_direct_io() const {
-        return true;
+        // Windows uses cached CRT I/O until FILE_FLAG_NO_BUFFERING support is added.
+        return false;
+    }
+
+    void discard_cache(size_t offset, size_t length) const {
+        GGML_UNUSED(offset);
+        GGML_UNUSED(length);
     }
 
     ~impl() {
@@ -374,6 +381,19 @@ struct llama_file::impl {
         return fd != -1 && alignment > 1;
     }
 
+    void discard_cache(size_t offset, size_t length) const {
+#if defined(POSIX_FADV_DONTNEED)
+        const int file_id = fd == -1 ? fileno(fp) : fd;
+        const int result = posix_fadvise(file_id, offset, length, POSIX_FADV_DONTNEED);
+        if (result != 0) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(result));
+        }
+#else
+        GGML_UNUSED(offset);
+        GGML_UNUSED(length);
+#endif
+    }
+
     ~impl() {
         if (fd != -1) {
             close(fd);
@@ -408,6 +428,7 @@ size_t llama_file::size() const { return pimpl->size; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+void llama_file::discard_cache(size_t offset, size_t length) const { pimpl->discard_cache(offset, length); }
 
 int llama_file::file_id() const {
 #ifdef _WIN32
@@ -439,7 +460,6 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
 // llama_mmap
 
-#if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
 // merge `ranges` and return their complement within [0, limit)
 static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t limit) {
     llama_mmap::ranges res;
@@ -457,27 +477,38 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
     if (pos < limit) {
         res.emplace_back(pos, limit);
     }
-
     return res;
 }
-#endif
 
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa,
+            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion,
+            llama_mmap::file_advice_override file_advice_override) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
-            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
-                    strerror(errno));
+        const bool sequential = llama_mmap::use_sequential_file_advice(strict_exclusion);
+        const int file_advice = sequential ? POSIX_FADV_SEQUENTIAL : POSIX_FADV_RANDOM;
+        const int advice_error = file_advice_override ?
+                file_advice_override(fd, file_advice) : posix_fadvise(fd, 0, 0, file_advice);
+        if (advice_error) {
+            if (strict_exclusion) {
+                throw std::runtime_error(format(
+                        "posix_fadvise(.., POSIX_FADV_RANDOM) failed for external tensor mapping: %s",
+                        strerror(advice_error)));
+            }
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., %s) failed: %s\n",
+                    sequential ? "POSIX_FADV_SEQUENTIAL" : "POSIX_FADV_RANDOM", strerror(advice_error));
         }
-        // MAP_POPULATE would fault in the lazy ranges too
-        if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
+        // MAP_POPULATE would fault in excluded ranges too
+        if (prefetch && excluded_ranges.empty()) { flags |= MAP_POPULATE; }
+#else
+        GGML_UNUSED(file_advice_override);
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
@@ -497,12 +528,11 @@ struct llama_mmap::impl {
             }
         };
 
-        if (prefetch > 0) {
-            for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
-                advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
-            }
+        for (const auto & range :
+                llama_mmap::planned_prefetch_ranges(file->size(), prefetch, excluded_ranges, strict_exclusion)) {
+            advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
         }
-        for (const auto & range : lazy_ranges) {
+        for (const auto & range : excluded_ranges) {
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
         }
         if (numa) {
@@ -573,8 +603,11 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa,
+            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion,
+            llama_mmap::file_advice_override file_advice_override) {
         GGML_UNUSED(numa);
+        GGML_UNUSED(file_advice_override);
 
         size = file->size();
 
@@ -604,7 +637,8 @@ struct llama_mmap::impl {
 
             if (pPrefetchVirtualMemory) {
                 std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-                for (const auto & range : ranges_complement(lazy_ranges, std::min(size, prefetch))) {
+                for (const auto & range :
+                        llama_mmap::planned_prefetch_ranges(size, prefetch, excluded_ranges, strict_exclusion)) {
                     WIN32_MEMORY_RANGE_ENTRY entry;
                     entry.VirtualAddress = (char *) addr + range.first;
                     entry.NumberOfBytes  = (SIZE_T) (range.second - range.first);
@@ -642,11 +676,15 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa,
+            const llama_mmap::ranges & excluded_ranges, bool strict_exclusion,
+            llama_mmap::file_advice_override file_advice_override) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
-        GGML_UNUSED(lazy_ranges);
+        GGML_UNUSED(excluded_ranges);
+        GGML_UNUSED(strict_exclusion);
+        GGML_UNUSED(file_advice_override);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -664,8 +702,21 @@ struct llama_mmap::impl {
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+        const ranges & excluded_ranges, bool strict_exclusion, file_advice_override file_advice) :
+    pimpl(std::make_unique<impl>(file, prefetch, numa, excluded_ranges, strict_exclusion, file_advice)) {}
 llama_mmap::~llama_mmap() = default;
+
+bool llama_mmap::use_sequential_file_advice(bool strict_exclusion) {
+    return !strict_exclusion;
+}
+
+llama_mmap::ranges llama_mmap::planned_prefetch_ranges(
+        size_t file_size, size_t prefetch, const ranges & excluded_ranges, bool strict_exclusion) {
+    if (strict_exclusion || prefetch == 0) {
+        return {};
+    }
+    return ranges_complement(excluded_ranges, std::min(file_size, prefetch));
+}
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
@@ -782,6 +833,18 @@ struct llama_mlock::impl {
 
     impl() : addr(NULL), size(0), failed_already(false) {}
 
+    static void align_range(size_t * first, size_t * last) {
+        const size_t granularity = lock_granularity();
+        *first &= ~(granularity - 1);
+        const size_t remainder = *last & (granularity - 1);
+        if (remainder != 0) {
+            if (*last > std::numeric_limits<size_t>::max() - (granularity - remainder)) {
+                throw std::runtime_error("mlock range overflow");
+            }
+            *last += granularity - remainder;
+        }
+    }
+
     void init(void * ptr) {
         GGML_ASSERT(addr == NULL && size == 0);
         addr = ptr;
@@ -814,6 +877,7 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
+void llama_mlock::align_range(size_t * first, size_t * last) { impl::align_range(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;

@@ -117,6 +117,7 @@ Everything else is upstream `llama.cpp`. The additions currently carried here:
 | Speculative checkpoints on device | | `llama-server` keeps speculative-decoding checkpoints in device memory instead of copying them to the host |
 | ROCmFPx quant types | `llama-quantize` types `Q4_0_ROCMFP4`, `Q4_0_ROCMFP4_FAST`, `Q2/Q3/Q6/Q8_0_ROCMFPX` and the `_LEAN`/`_COHERENT`/`_STRIX` recipes | Loads the ROCmFP4 GGUFs published for Strix Halo. CPU codecs plus Vulkan dequant, mat-vec, matmul and integer-dot kernels. Weight formats only: not accepted as KV-cache types |
 | Repeatable output at depth | | Freed KV cells are zeroed so masked-out rows never carry stale K/V, and the Vulkan radix top-k assigns output slots deterministically |
+| Host-memory watchdog | [`scripts/strix_memory_watchdog.py`](docs/strix-memory-watchdog.md) | Runs a command in a process group, requires zero active swap, and stops before host-wide memory reaches the 120 GiB validation ceiling |
 
 Every ROCm/HIP change above is guarded on architecture, shape and layout, so other devices see upstream behaviour.
 Run `--help`, or see [tools/server/README.md](tools/server/README.md), for the full options.

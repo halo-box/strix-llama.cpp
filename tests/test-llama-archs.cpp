@@ -9,6 +9,8 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-dsv41.h"
+#include "../src/llama-dsv41-expert.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -16,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -324,6 +327,107 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
     }
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        std::vector<uint32_t> compress_ratios;
+        compress_ratios.reserve(LLAMA_DSV41_N_LAYER);
+        for (uint32_t il = 0; il < LLAMA_DSV41_N_LAYER; ++il) {
+            compress_ratios.push_back(llama_dsv41_compress_ratio(il));
+        }
+        std::vector<uint32_t> token_map(LLAMA_DSV41_N_VOCAB, 0);
+        std::vector<uint32_t> primes(LLAMA_DSV41_ENGRAM_PRIMES_COUNT, 2);
+        primes[0] = 384006168 - 2*(LLAMA_ENGRAM_COLS - 1);
+        primes[LLAMA_ENGRAM_COLS] = 384016682 - 2*(LLAMA_ENGRAM_COLS - 1);
+        const std::vector<uint64_t> multipliers = {
+            101, 103, 105, 107,
+            109, 111, 113, 115,
+        };
+
+        ms.add_kv(LLM_KV_DSV41_CONFIG, "{}");
+        ms.add_kv(LLM_KV_DSV41_MAX_POSITION_EMBEDDINGS, LLAMA_DSV41_N_CTX);
+        ms.add_kv(LLM_KV_DSV41_HIDDEN_SIZE, LLAMA_DSV41_N_EMBD);
+        ms.add_kv(LLM_KV_DSV41_NUM_HIDDEN_LAYERS, LLAMA_DSV41_N_LAYER);
+        ms.add_kv(LLM_KV_DSV41_VOCAB_SIZE, LLAMA_DSV41_N_VOCAB);
+        ms.add_kv(LLM_KV_DSV41_NUM_ATTENTION_HEADS, LLAMA_DSV41_N_HEAD);
+        ms.add_kv(LLM_KV_DSV41_NUM_KEY_VALUE_HEADS, LLAMA_DSV41_N_HEAD_KV);
+        ms.add_kv(LLM_KV_DSV41_HEAD_DIM, LLAMA_DSV41_N_HEAD_DIM);
+        ms.add_kv(LLM_KV_DSV41_QK_ROPE_HEAD_DIM, LLAMA_DSV41_N_ROT);
+        ms.add_kv(LLM_KV_DSV41_Q_LORA_RANK, LLAMA_DSV41_N_LORA_Q);
+        ms.add_kv(LLM_KV_DSV41_O_LORA_RANK, LLAMA_DSV41_N_LORA_O);
+        ms.add_kv(LLM_KV_DSV41_O_GROUPS, LLAMA_DSV41_N_O_GROUP);
+        ms.add_kv(LLM_KV_DSV41_MOE_INTERMEDIATE_SIZE, LLAMA_DSV41_N_FF_EXP);
+        ms.add_kv(LLM_KV_DSV41_N_ROUTED_EXPERTS, LLAMA_DSV41_N_EXPERT);
+        ms.add_kv(LLM_KV_DSV41_NUM_EXPERTS_PER_TOK, LLAMA_DSV41_N_EXPERT_USED);
+        ms.add_kv(LLM_KV_DSV41_N_SHARED_EXPERTS, LLAMA_DSV41_N_EXPERT_SHARED);
+        ms.add_kv(LLM_KV_DSV41_INDEX_N_HEADS, LLAMA_DSV41_N_INDEX_HEAD);
+        ms.add_kv(LLM_KV_DSV41_INDEX_HEAD_DIM, LLAMA_DSV41_N_INDEX_HEAD_DIM);
+        ms.add_kv(LLM_KV_DSV41_INDEX_TOPK, LLAMA_DSV41_N_INDEX_TOP_K);
+        ms.add_kv(LLM_KV_DSV41_HC_MULT, LLAMA_DSV41_HC_MULT);
+        ms.add_kv(LLM_KV_DSV41_HC_SINKHORN_ITERS, LLAMA_DSV41_HC_SINKHORN_ITERS);
+        ms.add_kv(LLM_KV_DSV41_SLIDING_WINDOW, LLAMA_DSV41_N_SWA);
+        ms.add_kv(LLM_KV_DSV41_CANDIDATE_SOURCE_LAYER_ID, LLAMA_DSV41_CANDIDATE_SOURCE_LAYER);
+        ms.add_kv(LLM_KV_DSV41_CANDIDATE_TOPK_BLOCKS, LLAMA_DSV41_CANDIDATE_TOPK_BLOCKS);
+        ms.add_kv(LLM_KV_DSV41_CANDIDATE_BLOCK_SIZE, LLAMA_DSV41_CANDIDATE_BLOCK_SIZE);
+        ms.add_kv(LLM_KV_DSV41_RMS_NORM_EPS, 1.0e-20f);
+        ms.add_kv(LLM_KV_DSV41_HC_EPS, 1.0e-6f);
+        ms.add_kv(LLM_KV_DSV41_SWIGLU_LIMIT, 10.0f);
+        ms.add_kv(LLM_KV_DSV41_ROUTED_SCALING_FACTOR, 1.5f);
+        ms.add_kv(LLM_KV_DSV41_ROPE_THETA, uint32_t(10000));
+        ms.add_kv(LLM_KV_DSV41_COMPRESS_ROPE_THETA, uint32_t(160000));
+        ms.add_kv(LLM_KV_DSV41_ROPE_SCALING_FACTOR, 16.0f);
+        ms.add_kv(LLM_KV_DSV41_ROPE_SCALING_BETA_FAST, 32.0f);
+        ms.add_kv(LLM_KV_DSV41_ROPE_SCALING_BETA_SLOW, 1.0f);
+        ms.add_kv(LLM_KV_DSV41_ROPE_SCALING_ORIG_CTX_LEN, 65536.0f);
+        ms.add_kv(LLM_KV_DSV41_NORM_TOPK_PROB, true);
+        ms.add_kv(LLM_KV_DSV41_HIDDEN_ACT, "silu");
+        ms.add_kv(LLM_KV_DSV41_SCORING_FUNC, "sqrtsoftplus");
+        ms.add_kv(LLM_KV_DSV41_TOPK_METHOD, "noaux_tc");
+        ms.add_kv(LLM_KV_DSV41_COMPRESS_RATIOS, compress_ratios);
+        ms.add_kv(LLM_KV_DSV41_KV_SOURCE_LAYER_IDS, std::vector<uint32_t>({ 2, 8, 14, 20 }));
+        ms.add_kv(LLM_KV_DSV41_INDEX_SOURCE_LAYER_IDS, std::vector<uint32_t>({ 2, 8, 14, 20, 24, 28, 32, 36 }));
+        ms.add_kv(LLM_KV_DSV41_ENGRAM_ENCODING, LLAMA_DSV41_ENGRAM_ENCODING);
+        ms.add_kv(LLM_KV_DSV41_ENGRAM_LAYER_IDS, std::vector<uint32_t>({ 1, 14 }));
+        ms.add_kv(LLM_KV_DSV41_ENGRAM_ROWS, std::vector<uint32_t>({ 384006168, 384016682 }));
+        ms.add_kv(LLM_KV_DSV41_ENGRAM_COMPRESSED_VOCAB_SIZE, LLAMA_DSV41_ENGRAM_COMPRESSED_VOCAB);
+        ms.add_kv(LLM_KV_DSV41_ENGRAM_PAD_ID, LLAMA_DSV41_ENGRAM_PAD_ID);
+        ms.add_kv(LLM_KV_DSV41_ENGRAM_TOKEN_MAP, token_map);
+        ms.add_kv(LLM_KV_DSV41_ENGRAM_PRIMES, primes);
+        ms.add_kv(LLM_KV_DSV41_ENGRAM_MULTIPLIERS, multipliers);
+
+        auto add_tensor = [&](const std::string & name, ggml_type type, const std::initializer_list<int64_t> & ne) {
+            ggml_tensor tensor = {};
+            tensor.type = type;
+            tensor.ne[0] = tensor.ne[1] = tensor.ne[2] = tensor.ne[3] = 1;
+            size_t i = 0;
+            for (int64_t dim : ne) {
+                tensor.ne[i++] = dim;
+            }
+            tensor.nb[0] = ggml_type_size(type);
+            tensor.nb[1] = ggml_row_size(type, tensor.ne[0]);
+            tensor.nb[2] = tensor.nb[1]*tensor.ne[1];
+            tensor.nb[3] = tensor.nb[2]*tensor.ne[2];
+            snprintf(tensor.name, sizeof(tensor.name), "%s", name.c_str());
+            gguf_add_tensor(ms.gguf_ctx, &tensor);
+        };
+        llama_dsv41_register_expert_tensors(
+                [&](const std::string & name,
+                    int32_t,
+                    llama_expert_projection projection,
+                    const std::initializer_list<int64_t> & ne) {
+                    add_tensor(
+                            name,
+                            projection == LLAMA_EXPERT_PROJECTION_DOWN ?
+                                GGML_TYPE_Q2_K : GGML_TYPE_IQ2_XXS,
+                            ne);
+                    return llama_expert_store_tensor();
+                });
+        const LLM_TN tn(LLM_ARCH_DEEPSEEK41);
+        for (int32_t il : { 1, 14 }) {
+            add_tensor(
+                    tn(LLM_TENSOR_ENGRAM_EMBD, "weight", il).str(),
+                    GGML_TYPE_I8,
+                    { LLAMA_ENGRAM_ROW_BYTES, il == 1 ? 384006168 : 384016682 });
+        }
+    }
 
     if (arch == LLM_ARCH_MAPLE) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP, 7.0f);
@@ -374,18 +478,20 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,      -5.0f);
 
-    for (uint32_t il = 0; il < n_layer; il++) {
-        ggml_tensor t;
-        memset(&t, 0, sizeof(ggml_tensor));
-        t.type = GGML_TYPE_F16;
-        ggml_format_name(&t, "conv%" PRIu32 "d.weight", il);
-        gguf_add_tensor(ms.gguf_ctx, &t);
-        ggml_format_name(&t, "posnet.%" PRIu32 ".conv1.weight", il);
-        gguf_add_tensor(ms.gguf_ctx, &t);
-        ggml_format_name(&t, "posnet.%" PRIu32 ".conv2.weight", il);
-        gguf_add_tensor(ms.gguf_ctx, &t);
-        ggml_format_name(&t, "convnext.%" PRIu32 ".dw.weight", il);
-        gguf_add_tensor(ms.gguf_ctx, &t);
+    if (arch != LLM_ARCH_DEEPSEEK41) {
+        for (uint32_t il = 0; il < n_layer; il++) {
+            ggml_tensor t;
+            memset(&t, 0, sizeof(ggml_tensor));
+            t.type = GGML_TYPE_F16;
+            ggml_format_name(&t, "conv%" PRIu32 "d.weight", il);
+            gguf_add_tensor(ms.gguf_ctx, &t);
+            ggml_format_name(&t, "posnet.%" PRIu32 ".conv1.weight", il);
+            gguf_add_tensor(ms.gguf_ctx, &t);
+            ggml_format_name(&t, "posnet.%" PRIu32 ".conv2.weight", il);
+            gguf_add_tensor(ms.gguf_ctx, &t);
+            ggml_format_name(&t, "convnext.%" PRIu32 ".dw.weight", il);
+            gguf_add_tensor(ms.gguf_ctx, &t);
+        }
     }
     return ret;
 }
@@ -396,7 +502,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, bool no_alloc = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -404,9 +510,15 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    model_params.no_alloc = no_alloc;
+    if (no_alloc) {
+        model_params.n_gpu_layers = 0;
+        model_params.expert_cache_bytes = std::numeric_limits<size_t>::max();
+        model_params.expert_cache_slots = LLAMA_DSV41_N_EXPERT_USED;
+    }
 
     llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 0;
+    ctx_params.n_ctx = no_alloc ? 256 : 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     if (!encode) {
@@ -425,6 +537,53 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         throw std::runtime_error("failed to create llama context");
     }
     return std::make_pair(std::move(model), std::move(lctx));
+}
+
+static int test_deepseek41_no_alloc(const size_t seed) {
+    gguf_context_ptr malformed = get_gguf_ctx(LLM_ARCH_DEEPSEEK41, true);
+    ggml_tensor malformed_token_embd = {};
+    malformed_token_embd.type = GGML_TYPE_F32;
+    malformed_token_embd.ne[0] = malformed_token_embd.ne[1] =
+        malformed_token_embd.ne[2] = malformed_token_embd.ne[3] = 1;
+    malformed_token_embd.nb[0] = ggml_type_size(malformed_token_embd.type);
+    malformed_token_embd.nb[1] = ggml_row_size(
+            malformed_token_embd.type, malformed_token_embd.ne[0]);
+    malformed_token_embd.nb[2] =
+        malformed_token_embd.nb[1]*malformed_token_embd.ne[1];
+    malformed_token_embd.nb[3] =
+        malformed_token_embd.nb[2]*malformed_token_embd.ne[2];
+    ggml_set_name(
+            &malformed_token_embd,
+            LLM_TN(LLM_ARCH_DEEPSEEK41)(
+                LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str());
+    gguf_add_tensor(malformed.get(), &malformed_token_embd);
+    bool rejected = false;
+    try {
+        auto unused = get_model_and_ctx(
+                malformed.get(), nullptr, seed, {},
+                LLAMA_SPLIT_MODE_LAYER, false, true);
+        GGML_UNUSED(unused);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    if (!rejected) {
+        throw std::runtime_error(
+                "DeepSeek V4.1 no-allocation loader accepted a malformed tensor");
+    }
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_DEEPSEEK41, true);
+    if (gguf_find_tensor(gguf_ctx.get(), "blk.0.ffn_gate_exps.weight") < 0 ||
+            gguf_find_tensor(gguf_ctx.get(), "blk.1.engram_embd.weight") < 0) {
+        throw std::runtime_error("DeepSeek V4.1 no-allocation fixture is incomplete");
+    }
+    auto model_and_ctx = get_model_and_ctx(
+            gguf_ctx.get(), nullptr, seed, {},
+            LLAMA_SPLIT_MODE_LAYER, false, true);
+    if (llama_n_ctx(model_and_ctx.second.get()) != 256) {
+        throw std::runtime_error("DeepSeek V4.1 no-allocation context size mismatch");
+    }
+    printf("deepseek41: no-allocation architecture graph PASS\n");
+    return 0;
 }
 
 static std::vector<float> get_logits(
@@ -481,6 +640,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:
@@ -567,6 +727,9 @@ static bool arch_supported(const llm_arch arch) {
     }
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
+    }
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        return false; // The fixed published geometry is too large for the compact generated-model fixture.
     }
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU
@@ -877,6 +1040,9 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
+        }
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            return test_deepseek41_no_alloc(seed);
         }
         return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {

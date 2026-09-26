@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
+#include "llama-dsv41.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
@@ -17,6 +18,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-dsv41.h"
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
@@ -202,6 +204,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_dots3note(params);
         case LLM_ARCH_DEEPSEEK4:
             return new llama_model_deepseek4(params);
+        case LLM_ARCH_DEEPSEEK41:
+            return new llama_model_deepseek41(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -375,6 +379,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
+        ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
@@ -386,7 +391,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
-    static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
+    static const std::regex pattern_dsv4_state      ("dsv4(1)?_(csa|hca|lid|comp|index)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
@@ -1226,6 +1231,33 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         return;
     }
 
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        std::fill(hparams.n_head_arr.begin(),       hparams.n_head_arr.end(),       0);
+        std::fill(hparams.n_head_kv_arr.begin(),    hparams.n_head_kv_arr.end(),    0);
+        std::fill(hparams.n_ff_arr.begin(),         hparams.n_ff_arr.end(),         0);
+        std::fill(hparams.n_ff_exp_arr.begin(),     hparams.n_ff_exp_arr.end(),     0);
+        std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
+        std::fill(hparams.rope_sections.begin(),    hparams.rope_sections.end(),    0);
+        std::fill(hparams.rope_pattern.begin(),     hparams.rope_pattern.end(),     1);
+        std::fill(hparams.is_swa_impl.begin(),      hparams.is_swa_impl.end(),      0);
+        std::fill(hparams.is_recr_impl.begin(),     hparams.is_recr_impl.end(),     0);
+        std::fill(hparams.is_indexer_full_impl.begin(), hparams.is_indexer_full_impl.end(), 0);
+        std::fill(hparams.dsv41_kv_source_layer.begin(), hparams.dsv41_kv_source_layer.end(), -1);
+        std::fill(hparams.dsv41_index_source_layer.begin(), hparams.dsv41_index_source_layer.end(), -1);
+        std::fill(hparams.dsv4_compress_ratios.begin(), hparams.dsv4_compress_ratios.end(), 0);
+        std::fill(hparams.swiglu_clamp_exp.begin(), hparams.swiglu_clamp_exp.end(), 0.0f);
+        std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
+        hparams.dsv41_engram_layers.reset();
+
+        load_arch_hparams(ml);
+
+        pimpl->n_bytes = ml.n_bytes;
+        pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
+        pimpl->ftype = ml.ftype;
+        hparams.rope_type = llama_model_rope_type(this);
+        return;
+    }
+
     ml.get_key(LLM_KV_CONTEXT_LENGTH,          hparams.n_ctx_train);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,        hparams.n_embd);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT,    hparams.n_embd_out_impl, false);
@@ -1708,12 +1740,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // With the n-gram table read by explicit preads (--lazy-mode on-direct), a populated mapping would pull
     // the table's third of the file resident for nothing; readahead alone carries the sequential load.
-    ml.init_mappings(params.lazy_mode != LLAMA_LAZY_MODE_DIRECT, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // Do not prefetch files with disk-owned tensor holes either: unsafe contexts load their
+    // resident tensors through bounded staging and discard copied source pages.
+    llama_mlocks * mmap_locks = use_mlock && !ml.external.any() ? &pimpl->mlock_mmaps : nullptr;
+    ml.init_mappings(!(params.lazy_mode == LLAMA_LAZY_MODE_DIRECT || ml.external.any()), mmap_locks);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
-    std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
+    struct ctx_buf_map {
+        ggml_context * ctx;
+        llama_buf_map  bufs;
+        bool           load_from_mmap;
+        bool           discard_file_cache;
+    };
+    std::vector<ctx_buf_map> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
+    bool keep_mappings = false;
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
@@ -1749,9 +1791,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+        bool context_mmap_safe = true;
+        if (ml.use_mmap && ml.external.any() && !is_lazy_mapped) {
+            for (uint32_t idx = 0; idx < ml.files.size(); ++idx) {
+                void * addr = nullptr;
+                size_t first;
+                size_t last;
+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                if (first < last && ml.external.intersects(idx, first, last)) {
+                    context_mmap_safe = false;
+                    break;
+                }
+            }
+        }
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if ((ml.use_mmap || is_lazy_mapped) && (use_mmap_buffer || is_lazy_mapped) &&
+                context_mmap_safe && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
+            keep_mappings = true;
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
@@ -1767,6 +1824,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                }
+                if (use_mlock && ml.external.any() && !is_lazy_mapped) {
+                    size_t lock_first = first;
+                    size_t lock_last = last;
+                    llama_mlock::align_range(&lock_first, &lock_last);
+                    pimpl->mlock_mmaps.emplace_back(new llama_mlock);
+                    auto & mlock_mmap = pimpl->mlock_mmaps.back();
+                    mlock_mmap->init((char *) addr + lock_first);
+                    mlock_mmap->grow_to(lock_last - lock_first);
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
@@ -1804,7 +1870,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
-        ctx_buf_maps.emplace_back(ctx, buf_map);
+        const bool load_from_mmap = context_mmap_safe && (ml.use_mmap || is_lazy_mapped);
+        ctx_buf_maps.push_back({ ctx, std::move(buf_map), load_from_mmap, ml.use_mmap && !load_from_mmap });
     }
 
     if (llama_supports_gpu_offload()) {
@@ -1836,21 +1903,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // without mmap, load non-host buffers first: their tensors go through a staging buffer, which is cheapest while the fewest weights are resident
-    if (!ml.use_mmap) {
+    if (!ml.use_mmap || ml.external.any()) {
         std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
-            const auto & buf_map = ctx_buf_map.second;
-            return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
+            const auto & buf_map = ctx_buf_map.bufs;
+            return !ctx_buf_map.load_from_mmap && !buf_map.empty() &&
+                    !ggml_backend_buffer_is_host(buf_map.begin()->second);
         });
     }
 
     // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+    for (auto & ctx_buf_map : ctx_buf_maps) {
+        if (!ml.load_all_data(ctx_buf_map.ctx, ctx_buf_map.bufs, ctx_buf_map.load_from_mmap,
+                    ctx_buf_map.discard_file_cache, mmap_locks,
+                    params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
 
-    if (use_mmap_buffer) {
+    if (keep_mappings) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
@@ -2209,6 +2279,20 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
             });
 }
 
+ggml_backend_buffer_type_t llama_model::select_moe_buft(
+        int il, enum ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2) const {
+    return ::select_buft(
+            *pimpl->dev_layer.at(il).buft_list,
+            [&](ggml_context * ctx) {
+                const int64_t n_expert_used = hparams.n_expert_used_max();
+                GGML_ASSERT(n_expert_used > 0);
+                ggml_tensor * weight = ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2);
+                ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, n_expert_used, 512);
+                ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, 512);
+                return ggml_mul_mat_id(ctx, weight, input, ids);
+            });
+}
+
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
@@ -2481,6 +2565,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr);
                 }
+            } break;
+        case LLM_ARCH_DEEPSEEK41:
+            {
+                const auto & model_dsv41 = static_cast<const llama_model_deepseek41 &>(*this);
+                res = new llama_memory_dsv41(
+                        *this,
+                        params.type_k,
+                        cparams.offload_kqv,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        cparams.n_ubatch,
+                        model_dsv41.create_memory_engram_runtime(cparams.n_ubatch));
             } break;
         case LLM_ARCH_DFLASH:
             {
@@ -2803,6 +2899,8 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
+        /*.expert_cache_bytes          =*/ 0,
+        /*.expert_cache_slots          =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -2869,7 +2967,7 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here
-    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) {
         return 0;
     }
     return model->hparams.n_swa;
@@ -2955,6 +3053,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_MUSE_GLIMMER:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:

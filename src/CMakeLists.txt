@@ -16,6 +16,10 @@ set(LLAMA_CORE_SOURCES
     llama-chat.cpp
     llama-context.cpp
     llama-cparams.cpp
+    llama-dsv41.cpp
+    llama-dsv41-engram.cpp
+    llama-dsv41-expert.cpp
+    llama-expert-store.cpp
     llama-grammar.cpp
     llama-graph.cpp
     llama-hparams.cpp
@@ -28,11 +32,14 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-msa.cpp
     llama-kv-cache-dsv4.cpp
     llama-memory.cpp
+    llama-memory-dsv41.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
     llama-memory-hybrid-idx.cpp
     llama-memory-recurrent.cpp
     llama-mmap.cpp
+    llama-bounded-file.cpp
+    llama-engram.cpp
     llama-ple-disk.cpp
     llama-model-loader.cpp
     llama-model-saver.cpp
