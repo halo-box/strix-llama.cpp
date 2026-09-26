@@ -281,8 +281,10 @@ void init_iq_shmem(uvec3 wgsize)
 }
 
 // Codebook index of trellis entry e = 2*s + p (see tq2t_hyb_index in ggml-common.h).
+const uint TQ_STATE_MASK = 0x7fffu; // 15-bit trellis states (TQ_STATE_BITS in ggml-common.h)
+
 uint tq2_t_hyb(uint e) {
-    const uint x = (e >> 1u) * 0x9e3779b1u;
+    const uint x = ((e >> 1u) & TQ_STATE_MASK) * 0x9e3779b1u;
     return (e & 1u) != 0u ? ((x >> 10u) & 2047u) : (x >> 21u);
 }
 
@@ -294,7 +296,7 @@ vec2 tq2_t_pair(uint e) {
 // The four (unscaled) weights of one trellis step with 16-bit state s = prev << 8 | cur:
 // one multiply serves both pairs.
 vec4 tq2_t_step(uint s) {
-    const uint x = s * 0x9e3779b1u;
+    const uint x = (s & TQ_STATE_MASK) * 0x9e3779b1u;
     return vec4(unpackHalf2x16(tq2t_lut[x >> 21u]), unpackHalf2x16(tq2t_lut[(x >> 10u) & 2047u]));
 }
 

@@ -24,7 +24,7 @@
 #endif
 
 static uint32_t hyb_index(uint32_t e) {
-    const uint32_t x = (e >> 1) * 0x9e3779b1u;
+    const uint32_t x = ((e >> 1) & 0x7fffu) * 0x9e3779b1u; // 15-bit states
     return (e & 1) ? ((x >> 10) & 2047u) : (x >> 21);
 }
 
