@@ -249,6 +249,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    // (optional) per-request draft length controller summary, printed with the statistics
+    virtual void print_ctl_stats() {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1449,6 +1452,437 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// Cost-aware draft length for the single-head MTP drafter. On when --spec-draft-n-min > 0.
+// Each drafted position j costs one draft step (s ms) and one verify column (C_j ms). It yields P_j output tokens
+// (P_j = P(positions 1..j all accepted)), each worth T ms (current time per output token). After sampling position j:
+//   keep j      if  P_j * T >= C_j
+//   draft j+1   if  E[max(0, P_j * g(j+1, p') * T - C_{j+1})] >= s, or a deeper expected-value path pays off
+// g(pos, p) = P(accepted | reached, pos, drafter top-1 p) is learned online from the verify results.
+// s, T and C_j are measured online. n_min and n_max stay hard bounds.
+//
+// C_j = V(j+1) - V(j), where V(w) is the verify cost at verify width w (drafted tokens + 1): the wall time from the end
+// of draft() to accept(), i.e. target decode, MTP catch-up decode and sampling. A level term absorbs drift that moves
+// every width alike (context depth, temperature) and restarts fast at each request; the level-detrended samples are
+// kept per width with decay. V is fit non-decreasing in w (pool adjacent violators) on top of a weak linear prior
+// whose slope is learned from the data, and the differences are smoothed and clamped to a small positive minimum.
+// A verify width next to the stopping point that has had almost no recent samples is drafted now and then.
+struct common_speculative_cost_ctl {
+    bool on = false;
+
+    double step_ms = 3.0;  // EMA of the draft step wall time
+    double tpt_ms  = 35.0; // ratio of the two EMAs below (a mean of per-round ratios is biased high)
+    double rnd_ms  = 100.0;
+    double rnd_tok = 100.0 / 35.0;
+    static constexpr double ema_a = 0.05;
+
+    static constexpr int NPB = 10; // p bins
+    static constexpr int NPC = 4;  // position classes: 1, 2, 3-4, 5+
+    static constexpr int NPV = 4;  // previous token p level: < 0.6, 0.6-0.95, >= 0.95, none (position 1)
+    static constexpr double cap_n = 4000.0;
+
+    double cal_acc[NPC][NPB] = {};
+    double cal_n  [NPC][NPB] = {};
+    double occ[NPC][NPV][NPB] = {};
+
+    // per seq
+    std::vector<std::vector<uint8_t>> drafted_pb; // (pc << 4 | bin) per kept token of the last draft
+    std::vector<double>  pchain;
+    std::vector<int32_t> prev_lvl;
+    std::vector<int64_t> t_last_acc;
+
+    // verify cost model, indexed by verify width w = 2..W (W = n_max + 1)
+    static constexpr double v_decay    = 1.0 - 1.0 / 300.0; // per sample
+    static constexpr double v_prior_n  = 2.0;   // pseudo-samples per width toward the linear prior
+    static constexpr double v_slope_n  = 20.0;  // weight of the prior slope, in samples x width^2
+    static constexpr double v_slope_f  = 0.05;  // prior slope: column cost as a fraction of the verify time
+    static constexpr double c_min      = 0.25;  // ms
+    static constexpr int    v_fast_n   = 8;     // rounds of fast level tracking after a request starts
+    static constexpr double explore_n  = 2.0;   // a width with fewer decayed samples than this is starved
+    static constexpr uint64_t explore_gap = 32; // rounds between forced drafts
+
+    int32_t W = 0;
+    std::vector<double> v_s, v_n; // decayed sum and weight of level-detrended samples
+    std::vector<double> v_fit;    // fitted V(w) - level
+    std::vector<double> c_fit;    // C_j, j = 1..W-1
+    std::vector<double> blk_m, blk_w; // refit scratch
+    std::vector<int>    blk_c;
+    double v_lvl = 0.0, v_dev = 0.0;
+    bool   v_init = false;
+    int    v_fast = 0;
+    uint64_t rounds = 0, last_explore = 0;
+
+    // per seq round state
+    std::vector<int64_t> t_draft_end;
+    std::vector<int32_t> v_width;     // verify width seen by process()
+    std::vector<int32_t> v_seen;      // process() calls since the end of the draft
+    std::vector<int32_t> explore_pos; // position forced by exploration (0 = none)
+
+    // per request (reset after print)
+    std::vector<uint64_t> hist_req;
+    uint64_t stop_cap = 0, stop_keep = 0, stop_next = 0;
+    uint64_t n_req = 0, tok_acc_req = 0, n_explore_req = 0;
+
+    static int bin_of(double p) {
+        static const double edges[NPB] = { 0.30, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.98, 0.995, 2.0 };
+        for (int b = 0; b < NPB; ++b) {
+            if (p < edges[b]) {
+                return b;
+            }
+        }
+        return NPB - 1;
+    }
+    static double bin_mid(int b) {
+        static const double mids[NPB] = { 0.20, 0.40, 0.55, 0.65, 0.75, 0.85, 0.925, 0.965, 0.9875, 0.998 };
+        return mids[b];
+    }
+    static int pc_of(int j) { // j = 1-based draft position
+        return j <= 1 ? 0 : j == 2 ? 1 : j <= 4 ? 2 : 3;
+    }
+    static int lvl_of(double p) {
+        return p < 0.60 ? 0 : p < 0.95 ? 1 : 2;
+    }
+
+    void init(uint32_t n_seq, int32_t n_max, bool enable) {
+        on = enable;
+        if (!on) {
+            return;
+        }
+        // calibration prior: g = p, worth 4 observations per cell
+        for (int pc = 0; pc < NPC; ++pc) {
+            for (int b = 0; b < NPB; ++b) {
+                cal_n[pc][b]   = 4.0;
+                cal_acc[pc][b] = 4.0 * bin_mid(b);
+                for (int v = 0; v < NPV; ++v) {
+                    occ[pc][v][b] = 0.5;
+                }
+            }
+        }
+        drafted_pb.assign(n_seq, {});
+        pchain.assign(n_seq, 1.0);
+        prev_lvl.assign(n_seq, NPV - 1);
+        t_last_acc.assign(n_seq, 0);
+        hist_req.assign((size_t) std::max(1, n_max) + 1, 0);
+
+        W = std::max(1, n_max) + 1;
+        v_s.assign(W + 1, 0.0);
+        v_n.assign(W + 1, 0.0);
+        v_fit.assign(W + 1, 0.0);
+        c_fit.assign(W + 1, 0.0);
+        blk_m.assign(W + 1, 0.0);
+        blk_w.assign(W + 1, 0.0);
+        blk_c.assign(W + 1, 0);
+        t_draft_end.assign(n_seq, 0);
+        v_width.assign(n_seq, 0);
+        v_seen.assign(n_seq, 0);
+        explore_pos.assign(n_seq, 0);
+        refit();
+
+        LOG_INF("%s", "spec cost-ctl: cost-aware draft length on, verify cost measured online\n");
+    }
+
+    double col(int j) const { // 1-based position
+        return c_fit[(size_t) std::clamp(j, 1, std::max(1, W - 1))];
+    }
+
+    // refit V(w) - level and C_j from the per-width statistics
+    void refit() {
+        double sn = 0.0, sw = 0.0, sy = 0.0;
+        for (int w = 2; w <= W; ++w) {
+            sn += v_n[w];
+            sw += v_n[w] * w;
+            sy += v_s[w];
+        }
+        const double wbar = sn > 0.0 ? sw / sn : 0.5 * (2 + W);
+        const double ybar = sn > 0.0 ? sy / sn : 0.0;
+        const double lvl  = v_init ? v_lvl + ybar : rnd_ms;
+
+        // weighted linear fit, slope pulled toward v_slope_f * verify time
+        double sxx = 0.0, sxy = 0.0;
+        for (int w = 2; w <= W; ++w) {
+            const double dx = w - wbar;
+            sxx += v_n[w] * dx * dx;
+            sxy += dx * (v_s[w] - v_n[w] * ybar);
+        }
+        const double b = std::max(c_min, (sxy + v_slope_n * v_slope_f * std::max(0.0, lvl)) / (sxx + v_slope_n));
+
+        // pool adjacent violators over the per-width means blended with the prior line
+        int nb = 0;
+        for (int w = 2; w <= W; ++w) {
+            const double wt = v_n[w] + v_prior_n;
+            blk_m[nb] = (v_s[w] + v_prior_n * (ybar + b * (w - wbar))) / wt;
+            blk_w[nb] = wt;
+            blk_c[nb] = 1;
+            nb++;
+            while (nb > 1 && blk_m[nb - 2] > blk_m[nb - 1]) {
+                blk_m[nb - 2] = (blk_m[nb - 2] * blk_w[nb - 2] + blk_m[nb - 1] * blk_w[nb - 1]) / (blk_w[nb - 2] + blk_w[nb - 1]);
+                blk_w[nb - 2] += blk_w[nb - 1];
+                blk_c[nb - 2] += blk_c[nb - 1];
+                nb--;
+            }
+        }
+        for (int k = 0, w = 2; k < nb; ++k) {
+            for (int i = 0; i < blk_c[k]; ++i, ++w) {
+                v_fit[w] = blk_m[k];
+            }
+        }
+        v_fit[1] = v_fit[std::min(2, W)] - b;
+
+        if (W < 3) {
+            c_fit[1] = b;
+            return;
+        }
+        // C_j = V(j+1) - V(j) for j = 2..W-1, smoothed [1 2 1]; position 1 (always drafted) copies position 2
+        auto d = [&](int j) { j = std::clamp(j, 2, W - 1); return v_fit[j + 1] - v_fit[j]; };
+        for (int j = 2; j <= W - 1; ++j) {
+            c_fit[j] = std::max(c_min, 0.25 * (d(j - 1) + 2.0 * d(j) + d(j + 1)));
+        }
+        c_fit[1] = c_fit[2];
+    }
+
+    void verify_seen(llama_seq_id s_id, int32_t n_rows) {
+        if (s_id >= 0 && (size_t) s_id < v_seen.size()) {
+            v_seen[s_id]++;
+            v_width[s_id] = n_rows;
+        }
+    }
+
+    // one round at verify width w took ms from the end of the draft to accept()
+    void observe_verify(int w, double ms) {
+        if (w < 2 || w > W || !(ms > 0.0 && ms < 5000.0)) {
+            return;
+        }
+        if (!v_init) {
+            v_init = true;
+            v_lvl  = ms - v_fit[w];
+            v_dev  = 0.05 * ms;
+            refit();
+            return;
+        }
+        const double r   = ms - v_lvl - v_fit[w];
+        const double lim = v_fast > 0 ? std::max(2.0, 0.5 * ms) : std::max(2.0, 4.0 * v_dev);
+        const double rc  = std::clamp(r, -lim, lim);
+        if (v_fast > 0) {
+            v_fast--;
+            v_lvl += 0.3 * rc;
+            return;
+        }
+        v_dev += 0.05 * (std::fabs(rc) - v_dev);
+        v_lvl += 0.03 * rc;
+        for (int k = 2; k <= W; ++k) {
+            v_s[k] *= v_decay;
+            v_n[k] *= v_decay;
+        }
+        v_s[w] += v_fit[w] + rc;
+        v_n[w] += 1.0;
+        refit();
+    }
+
+    bool starved(int w) const {
+        return v_init && w >= 2 && w <= W && v_n[w] < explore_n && rounds - last_explore >= explore_gap;
+    }
+    double g(int j, int b) const {
+        const int pc = pc_of(j);
+        return cal_acc[pc][b] / cal_n[pc][b];
+    }
+
+    // mean acceptance at position j over the p-bin occupancy, for previous p level v (v < 0: all levels)
+    double mean_g(int j, int v) const {
+        const int pc = pc_of(j);
+        double tot = 0.0, sum = 0.0;
+        for (int vv = 0; vv < NPV; ++vv) {
+            if (v >= 0 && vv != v) {
+                continue;
+            }
+            for (int k = 0; k < NPB; ++k) {
+                tot += occ[pc][vv][k];
+                sum += occ[pc][vv][k] * g(j, k);
+            }
+        }
+        return tot > 0.0 ? sum / tot : 0.0;
+    }
+
+    void draft_begin(llama_seq_id s_id) {
+        pchain[s_id]   = 1.0;
+        prev_lvl[s_id] = NPV - 1;
+        drafted_pb[s_id].clear();
+        explore_pos[s_id] = 0;
+    }
+
+    void observe_step_ms(double ms) {
+        if (ms > 0.0 && ms < 200.0) {
+            step_ms = (1.0 - ema_a) * step_ms + ema_a * ms;
+        }
+    }
+
+    // position j (1-based) was sampled with top-1 probability p. returns {keep, draft_next}
+    std::pair<bool, bool> decide(llama_seq_id s_id, int j, double p, int n_lo, int n_hi) {
+        const int b  = bin_of(p);
+        const int pc = pc_of(j);
+        {
+            double tot = 0.0;
+            for (int k = 0; k < NPB; ++k) {
+                tot += occ[pc][prev_lvl[s_id]][k];
+            }
+            if (tot > cap_n) {
+                for (int k = 0; k < NPB; ++k) {
+                    occ[pc][prev_lvl[s_id]][k] *= 0.5;
+                }
+            }
+            occ[pc][prev_lvl[s_id]][b] += 1.0;
+        }
+
+        const double T  = tpt_ms;
+        const double s  = step_ms;
+        const double pj = pchain[s_id] * g(j, b);
+
+        const bool forced = explore_pos[s_id] == j;
+        bool keep = forced || j <= n_lo || pj * T >= col(j);
+        bool next = false;
+        if (keep && j < n_hi) {
+            if (j < n_lo) {
+                next = true;
+            } else {
+                // one-step lookahead over the p distribution of the next position
+                const int pc1 = pc_of(j + 1);
+                const int v1  = lvl_of(p);
+                double tot = 0.0, gain = 0.0;
+                for (int k = 0; k < NPB; ++k) {
+                    const double w = occ[pc1][v1][k];
+                    tot  += w;
+                    gain += w * std::max(0.0, pj * g(j + 1, k) * T - col(j + 1));
+                }
+                next = tot > 0.0 && gain / tot >= s;
+                // column cost is not monotone in width, so also try a deeper path with the mean acceptance
+                if (!next) {
+                    double P = pj, net = 0.0;
+                    for (int m = 1; j + m <= n_hi; ++m) {
+                        P   *= mean_g(j + m, m == 1 ? v1 : -1);
+                        net += P * T - col(j + m) - s;
+                        if (net >= 0.0) {
+                            next = true;
+                            break;
+                        }
+                        if (P * T < 0.5) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (keep) {
+            if (!next) {
+                if (j >= n_hi) { stop_cap++; } else { stop_next++; }
+            }
+        } else {
+            stop_keep++;
+        }
+        // exploration: draft one position past the stop when that verify width is starved of samples
+        if (!forced) {
+            if (!keep && starved(j + 1)) {
+                keep = true;
+                last_explore = rounds;
+                n_explore_req++;
+            } else if (keep && !next && j < n_hi && starved(j + 2)) {
+                next = true;
+                explore_pos[s_id] = j + 1;
+                last_explore = rounds;
+                n_explore_req++;
+            }
+        }
+        if (keep) {
+            pchain[s_id]   = pj;
+            prev_lvl[s_id] = lvl_of(p);
+            drafted_pb[s_id].push_back((uint8_t) (pc << 4 | b));
+        }
+        return { keep, next };
+    }
+
+    void draft_end(llama_seq_id s_id, size_t n_result) {
+        hist_req[std::min(n_result, hist_req.size() - 1)]++;
+        drafted_pb[s_id].resize(std::min(drafted_pb[s_id].size(), n_result));
+        rounds++;
+        v_seen[s_id]      = 0;
+        t_draft_end[s_id] = n_result > 0 ? ggml_time_us() : 0;
+    }
+
+    void accepted(llama_seq_id s_id, uint16_t n_accepted) {
+        auto & d = drafted_pb[s_id];
+        for (size_t j = 0; j < d.size() && j <= n_accepted; ++j) {
+            const int pc = d[j] >> 4;
+            const int b  = d[j] & 0xf;
+            if (cal_n[pc][b] > cap_n) {
+                cal_n[pc][b]   *= 0.5;
+                cal_acc[pc][b] *= 0.5;
+            }
+            cal_n[pc][b]   += 1.0;
+            cal_acc[pc][b] += j < n_accepted ? 1.0 : 0.0;
+        }
+        d.clear();
+        tok_acc_req += n_accepted;
+
+        const int64_t now = ggml_time_us();
+        // one verify decode since the draft (a checkpoint restore replays without a new draft)
+        if (t_draft_end[s_id] > 0 && v_seen[s_id] == 1) {
+            observe_verify(v_width[s_id], (now - t_draft_end[s_id]) / 1000.0);
+        }
+        t_draft_end[s_id] = 0;
+        if (t_last_acc[s_id] > 0) {
+            const double ms = (now - t_last_acc[s_id]) / 1000.0;
+            if (ms > 0.0 && ms < 2000.0) {
+                rnd_ms  = (1.0 - ema_a) * rnd_ms  + ema_a * ms;
+                rnd_tok = (1.0 - ema_a) * rnd_tok + ema_a * (double) (n_accepted + 1);
+                tpt_ms  = rnd_ms / rnd_tok;
+            }
+        }
+        t_last_acc[s_id] = now;
+    }
+
+    void begin(llama_seq_id s_id) {
+        if (s_id >= 0 && (size_t) s_id < t_last_acc.size()) {
+            t_last_acc[s_id]  = 0; // the gap before the first round is prefill, not a round
+            t_draft_end[s_id] = 0;
+            v_fast = v_fast_n;     // the context depth changed: let the verify level catch up
+        }
+    }
+
+    void print() {
+        if (!on) {
+            return;
+        }
+        uint64_t n = 0, sum = 0;
+        std::string h;
+        for (size_t k = 0; k < hist_req.size(); ++k) {
+            n   += hist_req[k];
+            sum += hist_req[k] * k;
+            h   += string_format("%s%zu:%llu", h.empty() ? "" : " ", k, (unsigned long long) hist_req[k]);
+        }
+        n_req++;
+        LOG_INF("spec cost-ctl: req %llu rounds=%llu mean_len=%.3f mlen=%.3f hist[%s] stops(cap/keep/next)=%llu/%llu/%llu T=%.2fms s=%.2fms\n",
+                (unsigned long long) n_req, (unsigned long long) n, n ? (double) sum / n : 0.0,
+                n ? 1.0 + (double) tok_acc_req / n : 0.0, h.c_str(),
+                (unsigned long long) stop_cap, (unsigned long long) stop_keep, (unsigned long long) stop_next, tpt_ms, step_ms);
+        std::string vs, cs;
+        for (int w = 2; w <= W; ++w) {
+            vs += string_format(" %d:%.1f/%.0f", w, v_lvl + v_fit[w], v_n[w]);
+        }
+        for (int j = 1; j < W; ++j) {
+            cs += string_format(" %.2f", c_fit[j]);
+        }
+        LOG_INF("spec cost-ctl: verify ms/n by width [%s] column ms by position [%s] explore=%llu\n",
+                vs.c_str(), cs.c_str(), (unsigned long long) n_explore_req);
+        for (int pc = 0; pc < NPC; ++pc) {
+            std::string row;
+            for (int b = 0; b < NPB; ++b) {
+                row += string_format(" %.3f/%.0f", g(pc == 0 ? 1 : pc == 1 ? 2 : pc == 2 ? 3 : 5, b), cal_n[pc][b] - 4.0);
+            }
+            LOG_DBG("spec cost-ctl: cal pos-class %d (g/n per p-bin <.3 <.5 <.6 <.7 <.8 <.9 <.95 <.98 <.995 rest):%s\n", pc, row.c_str());
+        }
+        std::fill(hist_req.begin(), hist_req.end(), 0);
+        stop_cap = stop_keep = stop_next = 0;
+        tok_acc_req = n_explore_req = 0;
+    }
+};
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1484,6 +1918,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+
+    common_speculative_cost_ctl cost; // on when --spec-draft-n-min > 0
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1568,6 +2004,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        const bool cost_ok = !chain_heads && !is_mem_shared;
+        if (this->params.n_min > 0 && !cost_ok) {
+            SPC_WRN("%s", "cost-aware draft length (--spec-draft-n-min > 0) is only supported for single-head MTP with its own KV cache\n");
+        }
+        cost.init(n_seq, this->params.n_max, this->params.n_min > 0 && cost_ok);
+        if (cost.on && adaptive_n) {
+            SPC_WRN("%s", "cost-aware draft length (--spec-draft-n-min > 0) overrides --spec-draft-adaptive\n");
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1593,6 +2038,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
 
         reset_acc_ema(seq_id);
+        if (cost.on) {
+            cost.begin(seq_id);
+        }
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1723,6 +2171,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+
+            if (cost.on) {
+                cost.verify_seen(seq_id, n_rows);
+            }
         }
 
         return true;
@@ -1736,6 +2188,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<int> cost_lo, cost_hi;
+        if (cost.on) {
+            cost_lo.assign(n_seq, 1);
+            cost_hi.assign(n_seq, 1);
+        }
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -1749,6 +2206,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+
+            if (cost.on) {
+                cost_hi[seq_id] = std::max(1, dp.n_max > 0 ? std::min((int) params.n_max, (int) dp.n_max) : (int) params.n_max);
+                cost_lo[seq_id] = std::min(std::max(1, (int) params.n_min), cost_hi[seq_id]);
+                cost.draft_begin(seq_id);
+            }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -1779,6 +2242,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t t_step0 = cost.on ? ggml_time_us() : 0;
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
@@ -1799,7 +2263,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // MTP drafts sequentially, so a shorter draft saves draft passes
                 // as well as target verification work.
-                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+                const int32_t n_draft_eff = cost.on ? 0 : adaptive_n_draft(seq_id, params.n_max, params.n_min);
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
@@ -1823,6 +2287,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                bool cost_next = true;
+                if (cost.on) {
+                    const auto kn = cost.decide(seq_id, (int) dparams[seq_id].result->size() + 1, cur_p->data[0].p,
+                                                cost_lo[seq_id], cost_hi[seq_id]);
+                    if (!kn.first) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+                    cost_next = kn.second;
+                }
+
                 common_sampler_accept(smpl, id, true);
 
                 auto & dp = dparams.at(seq_id);
@@ -1830,7 +2306,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (n_draft_eff <= (int) result.size()) {
+                if (cost.on ? !cost_next : n_draft_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1860,6 +2336,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 i_last[seq_id] = batch.n_tokens - 1;
             }
 
+            if (cost.on) {
+                cost.observe_step_ms((ggml_time_us() - t_step0) / 1000.0);
+            }
+
             if (batch.n_tokens == 0) {
                 break;
             }
@@ -1880,12 +2360,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+
+            if (cost.on) {
+                cost.draft_end(seq_id, dp.result->size());
+            }
         }
+    }
+
+    void print_ctl_stats() override {
+        cost.print();
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (cost.on) {
+            cost.accepted(seq_id, n_accepted);
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
@@ -2676,7 +3168,8 @@ common_speculative_init_result::common_speculative_init_result(
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
-        cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.mtp_draft_vocab = params.speculative.draft.mtp_vocab;
     }
 
     // the draft context holds as many tokens per sequence as the target context
@@ -3117,6 +3610,8 @@ void common_speculative_print_stats(const common_speculative * spec) {
             oss << std::fixed << std::setprecision(2) << mean;
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
         }
+
+        impl->print_ctl_stats();
 
         SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),

@@ -2634,6 +2634,24 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    // nodes[0] alone collides for graphs that share one meta arena (different topologies, or one topology at varying batch width).
+    // Mix in the node count, the last node and the shapes of three nodes. A hash collision only resets warmup, the node properties are still checked.
+    if (cgraph->n_nodes > 0) {
+        uintptr_t k = (uintptr_t) cgraph->nodes[0];
+        k ^= (uintptr_t) cgraph->nodes[cgraph->n_nodes - 1] * (uintptr_t) 0x9E3779B97F4A7C15ull;
+        k ^= (uintptr_t) cgraph->n_nodes << 4;
+        const ggml_tensor * probe[3] = {
+            cgraph->nodes[0],
+            cgraph->nodes[cgraph->n_nodes / 2],
+            cgraph->nodes[cgraph->n_nodes - 1],
+        };
+        for (int i = 0; i < 3; ++i) {
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                k = (k ^ (uintptr_t) probe[i]->ne[d]) * (uintptr_t) 0x100000001B3ull;
+            }
+        }
+        return (const void *) k;
+    }
     return cgraph->nodes[0];
 }
 

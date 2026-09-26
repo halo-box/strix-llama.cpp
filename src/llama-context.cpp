@@ -475,6 +475,14 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // the draft vocabulary subset belongs to this context; contexts that ask for the same N share one copy
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.mtp_draft_vocab > 0) {
+            mtp_draft = model.mtp_draft_vocab_get(params.mtp_draft_vocab);
+            if (mtp_draft) {
+                cparams.mtp_draft_vocab = mtp_draft->n_keep;
+            }
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -2532,6 +2540,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.mtp_draft   =*/ mtp_draft.get(),
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3673,6 +3682,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.mtp_draft_vocab             =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
