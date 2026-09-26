@@ -4379,12 +4379,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // The second node's output is written early, so it must not overlap anything the nodes in between touch.
     if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32 && node->src[0]->ne[1] <= 64 && node->src[1]->type == GGML_TYPE_F32 &&
             node->src[1]->ne[1] * node->src[1]->ne[2] >= 512 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
-            getenv("GGML_CUDA_DISABLE_F32_DUAL") == nullptr && ggml_cuda_mmb_supported_mm(node->src[0], node->src[1], node)) {
+            getenv("GGML_CUDA_DISABLE_F32_DUAL") == nullptr && ggml_cuda_mmb_supported_mm(*cuda_ctx, node->src[0], node->src[1], node)) {
         for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8; ++j) {
             ggml_tensor * n2 = cgraph->nodes[j];
             if (!(n2->op == GGML_OP_MUL_MAT && n2->src[1] == node->src[1] && n2->src[0]->type == GGML_TYPE_F32 &&
                     n2->src[0]->ne[0] == node->src[0]->ne[0] && n2->src[0]->ne[1] <= 64 && n2->src[2] == nullptr &&
-                    ggml_cuda_mmb_supported_mm(n2->src[0], n2->src[1], n2))) {
+                    ggml_cuda_mmb_supported_mm(*cuda_ctx, n2->src[0], n2->src[1], n2))) {
                 continue;
             }
             auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
@@ -6582,7 +6582,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     ++nread;
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                     if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 &&
-                        ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
+                        ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) continue;
                     ok = false;
                 }
                 if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, d)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, d);
