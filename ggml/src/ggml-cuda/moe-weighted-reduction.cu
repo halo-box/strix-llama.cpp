@@ -278,7 +278,8 @@ bool ggml_cuda_op_moe_weighted_reduction_sgma(ggml_backend_cuda_context & ctx, c
     }
     const bool ein16 = ggml_cuda_mmb_down16() && ggml_cuda_mmb_is_bf16_only(ctx, experts);
     const bool out16 = ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(ctx, dst);
-    constexpr int threads = 256;
+    // 640 = n_embd/4 for n_embd 2560: one block per token, no idle lanes (256 left 128 of 768 idle)
+    static const int threads = getenv("MOE_SGMA_THREADS") ? atoi(getenv("MOE_SGMA_THREADS")) : 640;
     const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
     const float * sc = expert_scale ? (const float *) expert_scale->data : nullptr;
     cudaStream_t stream = ctx.stream();
