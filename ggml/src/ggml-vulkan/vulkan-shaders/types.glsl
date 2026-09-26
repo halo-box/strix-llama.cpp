@@ -268,6 +268,53 @@ struct block_tq2_t_packed16
 #include "tq2_t_lut.glsl"
 #endif
 
+// TQK6 / TQK7: bit-packed trellis siblings of TQ2_T, group 128. Mirrors block_tqk6/7 in
+// ggml-common.h: fp16 d, then a 4*K-byte circular bitstream (26 / 30-byte stride, 2-byte
+// aligned). Same codebook and step decode (tq2_t_step) as TQ2_T; the state of step t is
+// the 16-bit LSB-first window at stream bit (31 - t)*K (see tqk.glsl).
+#define QUANT_K_TQK 128
+
+struct block_tqk6
+{
+    float16_t d;
+    uint8_t qs[4*6];
+};
+
+struct block_tqk6_packed16
+{
+    float16_t d;
+    uint16_t qs[2*6];
+};
+
+struct block_tqk7
+{
+    float16_t d;
+    uint8_t qs[4*7];
+};
+
+struct block_tqk7_packed16
+{
+    float16_t d;
+    uint16_t qs[2*7];
+};
+
+#if defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
+#define QUANT_K QUANT_K_TQK
+#define QUANT_R 1
+#define QUANT_AUXF 1
+#if defined(DATA_A_TQK6)
+#define TQK_K 6u
+#define A_TYPE block_tqk6
+#define A_TYPE_PACKED16 block_tqk6_packed16
+#else
+#define TQK_K 7u
+#define A_TYPE block_tqk7
+#define A_TYPE_PACKED16 block_tqk7_packed16
+#endif
+#include "tq2_t_lut.glsl"
+#include "tqk.glsl"
+#endif
+
 #define QUANT_K_Q2_0 64
 #define QUANT_R_Q2_0 1
 
