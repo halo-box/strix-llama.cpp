@@ -1778,6 +1778,12 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
     if (!tokens || n_tokens < 4096) {
         return;
     }
+    // llama_context::decode calls this for every architecture, so the downcast below is only valid
+    // once the arch is known: on any other model it reads ple_disk out of an unrelated object and
+    // dereferences whatever that happens to hold.
+    if (model_base.arch != LLM_ARCH_QWEN4EXP) {
+        return;
+    }
     const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model_base);
     if (!pmodel.ple_disk || !pmodel.ple_disk->page_cached()) {
         return;
