@@ -921,8 +921,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (src0->type == GGML_TYPE_F32) {
         const float * W = (const float *) src0->data, * X = (const float *) src1->data; float * D = (float *) dst->data;
         // MMB_F32_TILE narrows the M>64 F32 GEMM (e.g. the M=512 MoE router) for more blocks per ubatch chunk.
-        // 0 keeps master's 128x128 tile. Valid geometries satisfy (8/WAVES_M)*WTN == BN (the kernel's static_assert).
-        static const int FT = getenv("MMB_F32_TILE") ? atoi(getenv("MMB_F32_TILE")) : 0;
+        // default 5 = 32x64 (-0.5% GPU time at pp4096 on gfx1151, same output); 0 keeps master's 128x128 tile. Valid geometries satisfy (8/WAVES_M)*WTN == BN (the kernel's static_assert).
+        static const int FT = getenv("MMB_F32_TILE") ? atoi(getenv("MMB_F32_TILE")) : 5;
         // MMB_F32_SMALL: M <= 64 (ssm_alpha / ssm_beta [2560 -> 48]) launches only T/128 blocks at 64x128 (32 at 4096 tokens
         // on 40 CUs); narrower token tiles give 2-4x the blocks with the same per-output K order (bit-identical)
         static const int FS = getenv("MMB_F32_SMALL") ? atoi(getenv("MMB_F32_SMALL")) : 2;
