@@ -4302,6 +4302,27 @@ static int ggml_cuda_gdn_qk_norm_match(const ggml_cgraph * cgraph, const int i, 
     return ik_s;
 }
 
+// shared-expert merge after the MoE weighted reduction `red`: SIGMOID(gate [1, T]) -> MUL(shexp, .) -> ADD(red, .).
+// One predicate for the fusion in ggml_cuda_try_fuse and the reorder in graph_optimize, so nodes are only moved
+// when the fusion can fire (use counts are checked by each caller).
+static bool ggml_cuda_moe_sgma_enabled() {
+    static const bool on = getenv("GGML_CUDA_DISABLE_MOE_SGMA") == nullptr && getenv("GGML_CUDA_DISABLE_SGMA") == nullptr &&
+        !(getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION")));
+    return on;
+}
+
+static bool ggml_cuda_moe_sgma_tail(const ggml_cuda_moe_weighted_reduction_match & m, const ggml_tensor * sig,
+                                    const ggml_tensor * mul, const ggml_tensor * add) {
+    const ggml_tensor * red = m.dst;
+    return sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->ne[0] == 1 &&
+        mul->op == GGML_OP_MUL && mul->src[1] == sig && add->op == GGML_OP_ADD &&
+        ((add->src[0] == mul && add->src[1] == red) || (add->src[1] == mul && add->src[0] == red)) &&
+        ggml_are_same_shape(mul->src[0], add) && ggml_are_same_shape(red, add) && ggml_nrows(add) == ggml_nelements(sig) &&
+        (sig->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (mul->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+        (red->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+        ggml_cuda_moe_weighted_reduction_sgma_supported(m.experts, m.expert_scale, m.weights, sig->src[0], mul->src[0], add);
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4697,16 +4718,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             // prefill shared-expert merge right after: SIGMOID(gate [1, T]) -> MUL(shexp, .) -> ADD(reduction, .), the reduction
             // and the product used only there -> one kernel (bit-identical to reduction + sigmoid_gate_mul_add_f32)
-            static const bool moe_sgma = getenv("GGML_CUDA_DISABLE_MOE_SGMA") == nullptr && getenv("GGML_CUDA_DISABLE_SGMA") == nullptr;
-            if (moe_sgma && !merge && i + count + 2 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + count - 1, 1)) {
+            if (ggml_cuda_moe_sgma_enabled() && !merge && i + count + 2 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + count - 1, 1)) {
                 ggml_tensor * sig = cgraph->nodes[i + count], * mul = cgraph->nodes[i + count + 1], * add = cgraph->nodes[i + count + 2];
-                if (sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->ne[0] == 1 &&
-                        mul->op == GGML_OP_MUL && mul->src[1] == sig && add->op == GGML_OP_ADD &&
-                        ((add->src[0] == mul && add->src[1] == match.dst) || (add->src[1] == mul && add->src[0] == match.dst)) &&
-                        ggml_node_has_n_uses(cgraph, i + count, 1) && ggml_node_has_n_uses(cgraph, i + count + 1, 1) &&
-                        ggml_are_same_shape(mul->src[0], add) && ggml_are_same_shape(match.dst, add) && ggml_nrows(add) == ggml_nelements(sig) &&
-                        (sig->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (mul->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
-                        (match.dst->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                if (ggml_cuda_moe_sgma_tail(match, sig, mul, add) &&
+                        ggml_node_has_n_uses(cgraph, i + count, 1) && ggml_node_has_n_uses(cgraph, i + count + 1, 1)) {
                     const int out_idx = i + count + 2;
                     if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count + 3, &out_idx, 1) &&
                             ggml_cuda_op_moe_weighted_reduction_sgma(*cuda_ctx, match.experts, match.expert_scale, match.weights,
@@ -6395,12 +6410,24 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
         if (cuda_ctx->mmb_after_compute || cuda_ctx->mmb_first_split == nullptr || key == cuda_ctx->mmb_first_split) { ggml_cuda_mmb_marks_clear(*cuda_ctx); cuda_ctx->mmb_graph_sigs.clear(); cuda_ctx->mmb_first_split = key; cuda_ctx->mmb_after_compute = false; }
     }
-    // qwen4exp prefill: the MoE weighted reduction is followed by the shared-expert GEMMs and only then by
-    // SIGMOID(gate) -> MUL(shexp, .) -> ADD(moe_out, .). Move the reduction nodes down to just before the SIGMOID (the nodes
-    // in between don't read them) so the fusion computes reduction + merge in one kernel. Runs before allocation, so the
-    // buffer lifetimes follow the new order. GGML_CUDA_DISABLE_MOE_SGMA=1 keeps the original order.
-    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
-            getenv("GGML_CUDA_DISABLE_MOE_SGMA") == nullptr && getenv("GGML_CUDA_DISABLE_SGMA") == nullptr) {
+    // MoE prefill with a sigmoid-gated shared expert (qwen4exp, and any model with the same pattern): the weighted
+    // reduction is followed by the shared-expert GEMMs and only then by SIGMOID(gate) -> MUL(shexp, .) -> ADD(moe_out, .).
+    // Move the reduction nodes down to just before the SIGMOID so the fusion computes reduction + merge in one kernel.
+    // Only done when that fusion can fire (same predicate) and no node in between reads a reduction node or writes
+    // (in place / through a view) memory the reduction reads. Runs before allocation, so buffer lifetimes follow the new
+    // order. GGML_CUDA_DISABLE_MOE_SGMA=1 or GGML_CUDA_DISABLE_FUSION=1 keeps the original order.
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) && ggml_cuda_moe_sgma_enabled()) {
+        auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+        // readers of t in this graph (the use-count table is not guaranteed on a split's graph view)
+        auto n_uses = [&](const ggml_tensor * t) {
+            int c = 0;
+            for (int n = 0; n < cgraph->n_nodes; ++n) {
+                for (int s = 0; s < GGML_MAX_SRC && cgraph->nodes[n]->src[s]; ++s) {
+                    c += cgraph->nodes[n]->src[s] == t;
+                }
+            }
+            return c;
+        };
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL) continue;
             ggml_cuda_moe_weighted_reduction_match mm;
@@ -6409,17 +6436,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             int k = -1;
             for (int n = i + cnt; n + 2 < cgraph->n_nodes && n <= i + cnt + 24; ++n) {
                 const ggml_tensor * sig = cgraph->nodes[n], * mul = cgraph->nodes[n + 1], * add = cgraph->nodes[n + 2];
-                if (sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->ne[0] == 1 &&
-                        mul->op == GGML_OP_MUL && mul->src[1] == sig && add->op == GGML_OP_ADD &&
-                        ((add->src[0] == mul && add->src[1] == mm.dst) || (add->src[1] == mul && add->src[0] == mm.dst))) { k = n; break; }
+                if (ggml_cuda_moe_sgma_tail(mm, sig, mul, add)) { k = n; break; }
             }
             if (k <= i + cnt) continue;   // not found, or already adjacent
-            bool indep = true;            // the nodes in between must not read any reduction node
+            if (n_uses(mm.dst) != 1 || n_uses(cgraph->nodes[k]) != 1 || n_uses(cgraph->nodes[k + 1]) != 1) continue;
+            bool indep = true;
             for (int n = i + cnt; n < k && indep; ++n) {
                 const ggml_tensor * t = cgraph->nodes[n];
-                for (int s = 0; s < GGML_MAX_SRC && t->src[s] && indep; ++s) {
-                    for (int r = i; r < i + cnt; ++r) {
-                        if (t->src[s] == cgraph->nodes[r] || t->src[s]->view_src == cgraph->nodes[r]) { indep = false; break; }
+                for (int r = i; r < i + cnt && indep; ++r) {
+                    const ggml_tensor * red = cgraph->nodes[r];
+                    for (int s = 0; s < GGML_MAX_SRC && t->src[s] && indep; ++s) {          // t reads a reduction node
+                        indep = t->src[s] != red && root(t->src[s]) != red;
+                    }
+                    for (int s = 0; s < GGML_MAX_SRC && red->src[s] && indep; ++s) {        // t writes what the reduction reads
+                        indep = !(t->view_src && root(red->src[s]) == t->view_src) && red->src[s] != t;
                     }
                 }
             }
