@@ -15,7 +15,16 @@ typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
+#if defined(__HIP_DEVICE_COMPILE__)
+// same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or)
+__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) {
+    uint32_t ua = __float_as_uint(a), ub = __float_as_uint(b);
+    ua += 0x7fffu + ((ua >> 16) & 1u); ub += 0x7fffu + ((ub >> 16) & 1u);
+    return __builtin_amdgcn_perm(ub, ua, 0x07060302u);
+}
+#else
 __device__ __forceinline__ uint32_t mmb_pack2(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
+#endif
 __constant__ int8_t mmb_kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 __device__ __forceinline__ float mmb_h2f(uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
 
@@ -405,7 +414,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                         const uint32_t w1 = (uint32_t)*(const uint16_t *)&x->d | ((uint32_t)((x->scales[ib / 2] >> 4 * (ib % 2)) & 0xf) << 16);
                         if (h) { q3u[r][0] = w0; q3u[r][1] = w1; } else { q3g[r][0] = w0; q3g[r][1] = w1; }
                     }
-                } else { q3g[r][0] = q3g[r][1] = q3u[r][0] = q3u[r][1] = 0xffffffffu; }
+                } else { q3g[r][0] = q3g[r][1] = q3u[r][0] = q3u[r][1] = 0u; } // d = 0 -> zero rows (never stored)
             }
         }
 #pragma unroll
@@ -443,21 +452,22 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                 const int row = (tid >> 3) + r * (MMB_NT / 8);
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
+                    // branchless (padding rows decode to zero); d * grid is exact in fp32, rounded to bf16 (RNE) and packed
+                    // with one v_perm per pair; the signs are applied after packing as an XOR of the bf16 sign bits
+                    // (RNE is sign-symmetric: bf16(-v) == bf16(v) ^ 0x8000), bit-identical to dequantize_iq3_s
                     const uint32_t w0 = h ? q3u[r][0] : q3g[r][0], w1 = h ? q3u[r][1] : q3g[r][1];
-                    uint4 o = make_uint4(0, 0, 0, 0);
-                    if (w0 != 0xffffffffu || w1 != 0xffffffffu) {
-                        const int qh = (w0 >> 16) & 0xff, signs = w0 >> 24;
-                        const uint32_t g1 = q3grid[(w0 & 0xff) | ((qh << (8 - 2 * il)) & 256)];
-                        const uint32_t g2 = q3grid[((w0 >> 8) & 0xff) | ((qh << (7 - 2 * il)) & 256)];
-                        const float d = __half2float(__ushort_as_half((unsigned short)(w1 & 0xffff))) * (1 + 2 * (int)(w1 >> 16));
-                        float v[8];
-#pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            v[j + 0] = d * (float)((g1 >> (8 * j)) & 0xff) * (signs & (1 << (j + 0)) ? -1.f : 1.f);
-                            v[j + 4] = d * (float)((g2 >> (8 * j)) & 0xff) * (signs & (1 << (j + 4)) ? -1.f : 1.f);
-                        }
-                        o.x = mmb_pack2(v[0], v[1]); o.y = mmb_pack2(v[2], v[3]); o.z = mmb_pack2(v[4], v[5]); o.w = mmb_pack2(v[6], v[7]);
-                    }
+                    const uint32_t qh = (w0 >> 16) & 0xff, sg = w0 >> 24;
+                    const uint32_t g1 = q3grid[(w0 & 0xff) | ((qh << (8 - 2 * il)) & 256)];
+                    const uint32_t g2 = q3grid[((w0 >> 8) & 0xff) | ((qh << (7 - 2 * il)) & 256)];
+                    const float d = __half2float(__ushort_as_half((unsigned short)(w1 & 0xffff))) * (1 + 2 * (int)(w1 >> 16));
+                    auto rb = [](const float x) { const uint32_t u = __float_as_uint(x); return u + 0x7fffu + ((u >> 16) & 1u); };
+                    auto pk = [&](const uint32_t g, const int j) {
+                        return __builtin_amdgcn_perm(rb(d * (float)((g >> (8 * j + 8)) & 0xff)), rb(d * (float)((g >> (8 * j)) & 0xff)), 0x07060302u); };
+                    uint4 o;
+                    o.x = pk(g1, 0) ^ ((sg &  1u) << 15 | (sg &   2u) << 30);
+                    o.y = pk(g1, 2) ^ ((sg &  4u) << 13 | (sg &   8u) << 28);
+                    o.z = pk(g2, 0) ^ ((sg & 16u) << 11 | (sg &  32u) << 26);
+                    o.w = pk(g2, 2) ^ ((sg & 64u) <<  9 | (sg & 128u) << 24);
                     *(uint4 *)((h ? Au : Ag) + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = o;
                 }
             }
