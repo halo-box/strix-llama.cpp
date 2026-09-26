@@ -217,6 +217,25 @@ typedef struct {
 } block_tq2_t;
 static_assert(sizeof(block_tq2_t) == sizeof(ggml_half) + QK_TQ2_T/4, "wrong tq2_t block size/padding");
 
+// TQK6 / TQK7: bit-packed siblings of TQ2_T (L=16, K=6 / 7 new bits per step, V=4,
+// group 128). Same codebook and value formula as TQ2_T; only the state differs.
+// qs is a circular 32*K-bit stream, stream bit i = (qs[i >> 3] >> (i & 7)) & 1.
+// Step t (weights 4t..4t+3) has 16-bit state s = the 16 stream bits starting at bit
+// (31 - t)*K, read LSB-first and circularly modulo 32*K (tail-biting: the first steps'
+// windows wrap into bit 0..), and weight 4t+j is
+// d * tq2t_lut_f16[2*tq2t_hyb_index(2*s + (j>>1)) + (j&1)]. See tqk_state.
+#define QK_TQK 128
+typedef struct {
+    ggml_half d;              // scale
+    uint8_t   qs[4*6];        // 32 steps x 6 bits
+} block_tqk6;
+static_assert(sizeof(block_tqk6) == sizeof(ggml_half) + 4*6, "wrong tqk6 block size/padding");
+typedef struct {
+    ggml_half d;              // scale
+    uint8_t   qs[4*7];        // 32 steps x 7 bits
+} block_tqk7;
+static_assert(sizeof(block_tqk7) == sizeof(ggml_half) + 4*7, "wrong tqk7 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -2212,6 +2231,20 @@ GGML_TABLE_END()
 static inline uint32_t tq2t_hyb_index(uint32_t e) {
     const uint32_t x = (e >> 1) * 0x9e3779b1u;
     return (e & 1) ? ((x >> 10) & 2047u) : (x >> 21);
+}
+
+// TQK state of step t (0..31) from the 4*k stream bytes qs (k = 6 or 7): the 16 bits
+// starting at stream bit off = (31 - t)*k, LSB-first, circular modulo 32*k bits.
+// 32*k is a multiple of 8, so the bit wrap is a byte wrap: read the three bytes
+// covering bits off..off+15 (indices modulo 4*k) and shift.
+static inline uint32_t tqk_state(const uint8_t * qs, int k, int t) {
+    const uint32_t nbytes = 4u*(uint32_t) k;
+    const uint32_t off    = (uint32_t) (31 - t) * (uint32_t) k;
+    const uint32_t i0     = off >> 3;
+    const uint32_t i1     = (i0 + 1) % nbytes;
+    const uint32_t i2     = (i0 + 2) % nbytes;
+    const uint32_t w      = (uint32_t) qs[i0] | ((uint32_t) qs[i1] << 8) | ((uint32_t) qs[i2] << 16);
+    return (w >> (off & 7)) & 0xffffu;
 }
 #endif
 

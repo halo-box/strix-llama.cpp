@@ -465,6 +465,33 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
     store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
     store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
+#elif defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
+    // LOAD_VEC_A == 8: two trellis steps t0, t0 + 1, each state read from the three
+    // (circular) bytes covering its window (tqk.glsl, mirrors tqk_state).
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+    const uint ib = idx / 16;
+    const uint t0 = (idx & 0xfu) * 2u;
+
+    const float d = float(data_a[ib].d);
+    const uint off0 = tqk_off(t0);
+    const uint j0 = off0 >> 3u;
+    const uint s0 = tqk_state_bytes(uint(data_a[ib].qs[j0]),
+                                    uint(data_a[ib].qs[tqk_byte_wrap(j0 + 1u)]),
+                                    uint(data_a[ib].qs[tqk_byte_wrap(j0 + 2u)]), off0);
+    const uint off1 = tqk_off(t0 + 1u);
+    const uint j1 = off1 >> 3u;
+    const uint s1 = tqk_state_bytes(uint(data_a[ib].qs[j1]),
+                                    uint(data_a[ib].qs[tqk_byte_wrap(j1 + 1u)]),
+                                    uint(data_a[ib].qs[tqk_byte_wrap(j1 + 2u)]), off1);
+    const vec4 lo = tq2_t_step(s0) * d;
+    const vec4 hi = tq2_t_step(s1) * d;
+
+    const uint k_pair = row * LOAD_VEC_A / 2;
+    store_a(col, k_pair,     FLOAT_TYPEV2(lo.xy));
+    store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
+    store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
+    store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
 #elif defined(DATA_A_NVFP4)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
     const uint eff_row = (row & 3) + (row & ~3) * 2;

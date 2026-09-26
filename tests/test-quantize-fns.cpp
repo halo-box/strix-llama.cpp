@@ -29,6 +29,9 @@ constexpr float MAX_DOT_PRODUCT_ERROR_LOWBIT = 0.04f;
 constexpr float MAX_DOT_PRODUCT_ERROR_FP4 = 0.03f;
 constexpr float MAX_DOT_PRODUCT_ERROR_BINARY = 0.40f;
 constexpr float MAX_DOT_PRODUCT_ERROR_TERNARY = 0.15f;
+// TQK6/TQK7 from_float is a greedy placeholder over a Gaussian codebook (real files come
+// from an offline Viterbi); on this cosine (arcsine-distributed) data it lands at 0.40-0.47.
+constexpr float MAX_DOT_PRODUCT_ERROR_TRELLIS_PLACEHOLDER = 0.60f;
 
 static const char* RESULT_STR[] = {"ok", "FAILED"};
 
@@ -225,6 +228,9 @@ static int test_vec_dot_q(bool verbose) {
                 // offline Viterbi encoder), and this cosine data is far from the Gaussian
                 // its codebook targets: hold it to the binary-class bounds.
                 type == GGML_TYPE_TQ2_T   ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
+                // TQK6 / TQK7: same placeholder encoder and codebook, same bounds.
+                type == GGML_TYPE_TQK6    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
+                type == GGML_TYPE_TQK7    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
@@ -257,6 +263,8 @@ static int test_vec_dot_q(bool verbose) {
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                 : type == GGML_TYPE_Q1_0 || type == GGML_TYPE_TQ2_T
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
+                : type == GGML_TYPE_TQK6 || type == GGML_TYPE_TQK7
+                ? MAX_DOT_PRODUCT_ERROR_TRELLIS_PLACEHOLDER
                 : type == GGML_TYPE_PTQ1_0 || type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 ||
                   type == GGML_TYPE_Q2_0_ROCMFPX
                 ? MAX_DOT_PRODUCT_ERROR_TERNARY

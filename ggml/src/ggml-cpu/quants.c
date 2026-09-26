@@ -38,6 +38,14 @@ void quantize_row_tq2_t(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_tq2_t_ref(x, y, k);
 }
 
+void quantize_row_tqk6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tqk6_ref(x, y, k);
+}
+
+void quantize_row_tqk7(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tqk7_ref(x, y, k);
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }
@@ -1459,4 +1467,65 @@ void ggml_vec_dot_tq2_t_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     }
 
     *s = sumf;
+}
+
+// TQK6 / TQK7 x Q8_0. Decode the block's 32 trellis steps (tqk_state, same traversal
+// as dequantize_row_tqk*), then dot against the four Q8_0 blocks covering it.
+static void ggml_vec_dot_tqk_q8_0_impl(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int kb) {
+    const int qk = QK_TQK;
+    const int nb = n / qk;
+    const int nsteps = QK_TQK/4;
+    const size_t bsize = sizeof(ggml_half) + 4*kb;
+
+    assert(n % qk == 0);
+
+    const uint8_t    * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++, x += bsize) {
+        float w[QK_TQK];
+        const uint8_t * qs = x + sizeof(ggml_half);
+        for (int t = 0; t < nsteps; ++t) {
+            const uint32_t st = tqk_state(qs, kb, t);
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t idx = tq2t_hyb_index(2*st + h);
+                w[4*t + 2*h + 0] = GGML_CPU_FP16_TO_FP32(tq2t_lut_f16[2*idx + 0]);
+                w[4*t + 2*h + 1] = GGML_CPU_FP16_TO_FP32(tq2t_lut_f16[2*idx + 1]);
+            }
+        }
+
+        float sumb = 0.0f;
+        for (int k = 0; k < QK_TQK/QK8_0; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i*(QK_TQK/QK8_0) + k];
+            float acc = 0.0f;
+            for (int b = 0; b < QK8_0; ++b) {
+                acc += w[k*QK8_0 + b] * (float) yb->qs[b];
+            }
+            sumb += GGML_CPU_FP16_TO_FP32(yb->d) * acc;
+        }
+
+        sumf += GGML_CPU_FP16_TO_FP32(*(const ggml_half *) x) * sumb;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_tqk6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_tqk_q8_0_impl(n, s, vx, vy, 6);
+}
+
+void ggml_vec_dot_tqk7_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_tqk_q8_0_impl(n, s, vx, vy, 7);
 }

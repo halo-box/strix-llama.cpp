@@ -363,6 +363,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-tq2t.cpp)
     target_compile_definitions(test-tq2t PRIVATE TQ2T_REF_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/data/tq2t_ref.bin")
+    llama_build_and_test(test-tqk.cpp)
+    target_compile_definitions(test-tqk PRIVATE TQK_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
     llama_build_and_test(test-quantize-perf.cpp)
 
     # ROCmFPx codec self-tests, kept next to the codecs under ggml/rocmfpx.

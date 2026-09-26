@@ -183,6 +183,54 @@ void accumulate_tq2_t(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
 }
 #endif
 
+#if defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
+// Same structure as TQ2_T: eight lanes per 128-weight block, four trellis steps per
+// lane. Lane l owns steps t = 4l + i (i = 0..3), whose windows start at stream bits
+// off_i = (31 - 4l - i)*K (see tqk.glsl). They all lie in the 3K + 16 <= 37 bits from
+// off_3 = (28 - 4l)*K, i.e. in the four u16 words from wb = off_3 >> 4 (the span plus
+// off_3 & 15 is at most 52 bits); lane 0's last two words wrap to words 0, 1, which is
+// the tail-biting read of steps 0 and 1. Four 16-bit loads per lane per row, then
+// state i = tqk_state_words(.., rel_i) with rel_i = off_i - 16*wb = (off_3 & 15) + (3 - i)*K.
+void accumulate_tqk(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
+                    uint first_row, uint num_rows, uint tid) {
+    const uint blocks = p.ncols / 128u;
+    const uint items = blocks * 8u;
+    for (uint item = tid; item < items; item += BLOCK_SIZE) {
+        const uint block = item >> 3u;
+        const uint lane = item & 7u;
+        const uint off3 = tqk_off(4u*lane + 3u);
+        const uint wb = off3 >> 4u;
+        const uint r = off3 & 15u;
+        const uint wi1 = tqk_word_wrap(wb + 1u);
+        const uint wi2 = tqk_word_wrap(wb + 2u);
+        const uint wi3 = tqk_word_wrap(wb + 3u);
+        [[unroll]] for (uint row = 0; row < num_rows; ++row) {
+            const uint ib = a_offset + (first_row + row)*blocks + block;
+            const uint w0 = uint(data_a_packed16[ib].qs[wb]);
+            const uint w1 = uint(data_a_packed16[ib].qs[wi1]);
+            const uint w2 = uint(data_a_packed16[ib].qs[wi2]);
+            const uint w3 = uint(data_a_packed16[ib].qs[wi3]);
+            const uint lo  = w0 | (w1 << 16u);
+            const uint mid = w1 | (w2 << 16u);
+            const uint hi  = w2 | (w3 << 16u);
+            const vec4 x0 = tq2_t_step(tqk_state_words(lo, mid, hi, r + 3u*TQK_K)); // step 4l
+            const vec4 x1 = tq2_t_step(tqk_state_words(lo, mid, hi, r + 2u*TQK_K)); // step 4l+1
+            const vec4 x2 = tq2_t_step(tqk_state_words(lo, mid, hi, r +    TQK_K)); // step 4l+2
+            const vec4 x3 = tq2_t_step(tqk_state_words(lo, mid, hi, r));            // step 4l+3
+            const float d = float(data_a_packed16[ib].d);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint base = (j*p.batch_stride_b + b_offset + block*128u + lane*16u) / 4u;
+                const float sum = dot(vec4(data_b_v4[base     ]), x0)
+                                + dot(vec4(data_b_v4[base + 1u]), x1)
+                                + dot(vec4(data_b_v4[base + 2u]), x2)
+                                + dot(vec4(data_b_v4[base + 3u]), x3);
+                temp[j][row] += FLOAT_TYPE(sum * d);
+            }
+        }
+    }
+}
+#endif
+
 #if defined(DATA_A_PTQ1_0)
 // Eight lanes own a whole block: six packed qs words, one qh tail, one
 // inactive lane. Each packed byte is loaded once and supplies all its trits.
@@ -254,6 +302,8 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     accumulate_ptq1_0(temp, first_row, num_rows, tid);
 #elif defined(DATA_A_TQ2_T)
     accumulate_tq2_t(temp, first_row, num_rows, tid);
+#elif defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
+    accumulate_tqk(temp, first_row, num_rows, tid);
 #else
     uint num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
     if (num_iters * K_PER_ITER * BLOCK_SIZE + K_PER_ITER*tid < p.ncols) {
@@ -340,7 +390,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 #endif
 
-#endif // DATA_A_PTQ1_0 / DATA_A_TQ2_T
+#endif // DATA_A_PTQ1_0 / DATA_A_TQ2_T / DATA_A_TQK6 / DATA_A_TQK7
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 
