@@ -280,11 +280,10 @@ void init_iq_shmem(uvec3 wgsize)
     barrier();
 }
 
-// Hyb codebook index of trellis entry e (u32 wrapping arithmetic, 11-bit result).
+// Codebook index of trellis entry e = 2*s + p (see tq2t_hyb_index in ggml-common.h).
 uint tq2_t_hyb(uint e) {
-    uint h = e * 0x9e3779b1u;
-    h ^= h >> 16u;
-    return (h * 0x85ebca6bu) >> 21u;
+    const uint x = (e >> 1u) * 0x9e3779b1u;
+    return (e & 1u) != 0u ? ((x >> 10u) & 2047u) : (x >> 21u);
 }
 
 // The two weights produced by trellis entry e.
@@ -292,9 +291,11 @@ vec2 tq2_t_pair(uint e) {
     return unpackHalf2x16(tq2t_lut[tq2_t_hyb(e)]);
 }
 
-// The four (unscaled) weights of one trellis step with 16-bit state s = prev << 8 | cur.
+// The four (unscaled) weights of one trellis step with 16-bit state s = prev << 8 | cur:
+// one multiply serves both pairs.
 vec4 tq2_t_step(uint s) {
-    return vec4(tq2_t_pair(2u*s), tq2_t_pair(2u*s + 1u));
+    const uint x = s * 0x9e3779b1u;
+    return vec4(unpackHalf2x16(tq2t_lut[x >> 21u]), unpackHalf2x16(tq2t_lut[(x >> 10u) & 2047u]));
 }
 
 #endif // TQ2_T_LUT_GLSL

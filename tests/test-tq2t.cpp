@@ -24,9 +24,8 @@
 #endif
 
 static uint32_t hyb_index(uint32_t e) {
-    uint32_t h = e * 0x9e3779b1u;
-    h ^= h >> 16;
-    return (h * 0x85ebca6bu) >> 21;
+    const uint32_t x = (e >> 1) * 0x9e3779b1u;
+    return (e & 1) ? ((x >> 10) & 2047u) : (x >> 21);
 }
 
 static int compare(const char * what, const float * got, const float * want, size_t n) {
@@ -71,8 +70,8 @@ int main(int argc, char ** argv) {
     fclose(f);
 
     int fails = 0;
-    if (hyb_index(12345) != 871) {
-        fprintf(stderr, "hyb_index(12345) = %u, want 871\n", hyb_index(12345));
+    if (hyb_index(12345) != 1657 || hyb_index(12344) != 1035) {
+        fprintf(stderr, "hyb_index(12345) = %u (want 1657), hyb_index(12344) = %u (want 1035)\n", hyb_index(12345), hyb_index(12344));
         fails++;
     }
 

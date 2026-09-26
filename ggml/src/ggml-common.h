@@ -207,7 +207,8 @@ static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 + (QK_PTQ
 // TQ2_T: trellis-coded 2.125 bpw (QTIP-style bitshift trellis, L=16 K=8 V=4, group 128).
 // The 32 qs bytes are the low bytes of a tail-biting 16-bit state path: step t
 // (weights 4t..4t+3) has state s = qs[(t+31) % 32] << 8 | qs[t], and weight 4t+j is
-// d * tq2t_lut_f16[2*tq2t_hyb_index(2*s + (j>>1)) + (j&1)]. Every byte string is a
+// d * tq2t_lut_f16[2*tq2t_hyb_index(2*s + (j>>1)) + (j&1)] (one multiply per state,
+// see tq2t_hyb_index). Every byte string is a
 // valid path. Encoding (Viterbi) is done offline; see quantize_row_tq2_t_ref.
 #define QK_TQ2_T 128
 typedef struct {
@@ -2204,12 +2205,13 @@ GGML_TABLE_BEGIN(uint16_t, tq2t_lut_f16, 4096)
     0x1038, 0x3f9f, 0xade8, 0x399f, 0x3363, 0xb9da, 0x3909, 0x37c8, 0x3c82, 0xbc4c, 0xbc3a, 0xb788, 0xa897, 0x39da, 0xb6d2, 0x3bee,
 GGML_TABLE_END()
 
-// Hyb codebook index of trellis entry e (u32 wrapping arithmetic, 11-bit result).
-// Sanity: tq2t_hyb_index(12345) == 871.
+// Codebook index (11-bit) of trellis entry e = 2*s + p, s the 16-bit state, p the pair.
+// One u32 wrapping multiply per state serves both pairs: x = s * 0x9e3779b1;
+// p = 0 -> x >> 21, p = 1 -> (x >> 10) & 2047.
+// Sanity: tq2t_hyb_index(12345) == 1657, tq2t_hyb_index(12344) == 1035.
 static inline uint32_t tq2t_hyb_index(uint32_t e) {
-    uint32_t h = e * 0x9e3779b1u;
-    h ^= h >> 16;
-    return (h * 0x85ebca6bu) >> 21;
+    const uint32_t x = (e >> 1) * 0x9e3779b1u;
+    return (e & 1) ? ((x >> 10) & 2047u) : (x >> 21);
 }
 #endif
 
