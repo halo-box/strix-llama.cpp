@@ -4695,6 +4695,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     }
                 }
             }
+            // prefill shared-expert merge right after: SIGMOID(gate [1, T]) -> MUL(shexp, .) -> ADD(reduction, .), the reduction
+            // and the product used only there -> one kernel (bit-identical to reduction + sigmoid_gate_mul_add_f32)
+            static const bool moe_sgma = getenv("GGML_CUDA_DISABLE_MOE_SGMA") == nullptr && getenv("GGML_CUDA_DISABLE_SGMA") == nullptr;
+            if (moe_sgma && !merge && i + count + 2 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + count - 1, 1)) {
+                ggml_tensor * sig = cgraph->nodes[i + count], * mul = cgraph->nodes[i + count + 1], * add = cgraph->nodes[i + count + 2];
+                if (sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->ne[0] == 1 &&
+                        mul->op == GGML_OP_MUL && mul->src[1] == sig && add->op == GGML_OP_ADD &&
+                        ((add->src[0] == mul && add->src[1] == match.dst) || (add->src[1] == mul && add->src[0] == match.dst)) &&
+                        ggml_node_has_n_uses(cgraph, i + count, 1) && ggml_node_has_n_uses(cgraph, i + count + 1, 1) &&
+                        ggml_are_same_shape(mul->src[0], add) && ggml_are_same_shape(match.dst, add) && ggml_nrows(add) == ggml_nelements(sig) &&
+                        (sig->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (mul->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+                        (match.dst->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                    const int out_idx = i + count + 2;
+                    if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count + 3, &out_idx, 1) &&
+                            ggml_cuda_op_moe_weighted_reduction_sgma(*cuda_ctx, match.experts, match.expert_scale, match.weights,
+                                                                     sig->src[0], mul->src[0], add)) {
+                        return count + 2;
+                    }
+                }
+            }
             const int output_idx = i + count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
@@ -6374,6 +6394,39 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     {   // marks live for the whole scheduled graph (all splits): clear at the first optimize after a compute, or when the first split repeats
         const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
         if (cuda_ctx->mmb_after_compute || cuda_ctx->mmb_first_split == nullptr || key == cuda_ctx->mmb_first_split) { ggml_cuda_mmb_marks_clear(*cuda_ctx); cuda_ctx->mmb_graph_sigs.clear(); cuda_ctx->mmb_first_split = key; cuda_ctx->mmb_after_compute = false; }
+    }
+    // qwen4exp prefill: the MoE weighted reduction is followed by the shared-expert GEMMs and only then by
+    // SIGMOID(gate) -> MUL(shexp, .) -> ADD(moe_out, .). Move the reduction nodes down to just before the SIGMOID (the nodes
+    // in between don't read them) so the fusion computes reduction + merge in one kernel. Runs before allocation, so the
+    // buffer lifetimes follow the new order. GGML_CUDA_DISABLE_MOE_SGMA=1 keeps the original order.
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+            getenv("GGML_CUDA_DISABLE_MOE_SGMA") == nullptr && getenv("GGML_CUDA_DISABLE_SGMA") == nullptr) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op != GGML_OP_MUL) continue;
+            ggml_cuda_moe_weighted_reduction_match mm;
+            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, mm) || ggml_nrows(mm.dst) < 512) continue;
+            const int cnt = mm.node_count;
+            int k = -1;
+            for (int n = i + cnt; n + 2 < cgraph->n_nodes && n <= i + cnt + 24; ++n) {
+                const ggml_tensor * sig = cgraph->nodes[n], * mul = cgraph->nodes[n + 1], * add = cgraph->nodes[n + 2];
+                if (sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->ne[0] == 1 &&
+                        mul->op == GGML_OP_MUL && mul->src[1] == sig && add->op == GGML_OP_ADD &&
+                        ((add->src[0] == mul && add->src[1] == mm.dst) || (add->src[1] == mul && add->src[0] == mm.dst))) { k = n; break; }
+            }
+            if (k <= i + cnt) continue;   // not found, or already adjacent
+            bool indep = true;            // the nodes in between must not read any reduction node
+            for (int n = i + cnt; n < k && indep; ++n) {
+                const ggml_tensor * t = cgraph->nodes[n];
+                for (int s = 0; s < GGML_MAX_SRC && t->src[s] && indep; ++s) {
+                    for (int r = i; r < i + cnt; ++r) {
+                        if (t->src[s] == cgraph->nodes[r] || t->src[s]->view_src == cgraph->nodes[r]) { indep = false; break; }
+                    }
+                }
+            }
+            if (!indep) continue;
+            std::rotate(cgraph->nodes + i, cgraph->nodes + i + cnt, cgraph->nodes + k);   // [between][reduction] SIGMOID MUL ADD
+            i = k + 2;
+        }
     }
     {   // HC16: mark tensors whose readers all take the BF16 copy, so their producers skip the F32 store
         if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {

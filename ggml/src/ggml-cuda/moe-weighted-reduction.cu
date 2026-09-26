@@ -210,3 +210,83 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                   (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// prefill: reduction + shared-expert merge in one pass, out = sum_k (e_k * scale_k) * w_k + shexp * sigmoid(gate[t]).
+// The sum is the moe_weighted_reduction_*_v4 expression; the merge is sigmoid_gate_mul_add_f32's (product and sum rounded
+// separately, sigmoid as op_sigmoid) -> bit-identical to the two kernels, without the F32 round trip of the reduction.
+#if defined(GGML_USE_HIP)
+static __device__ __forceinline__ float moe_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
+static __device__ __forceinline__ float moe_add_rn(const float a, const float b) { float r; asm("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
+#else
+static __device__ __forceinline__ float moe_mul_rn(const float a, const float b) { return __fmul_rn(a, b); }
+static __device__ __forceinline__ float moe_add_rn(const float a, const float b) { return __fadd_rn(a, b); }
+#endif
+template <bool EIN16, bool OUT16>
+static __global__ void moe_weighted_reduction_sgma_v4(const void * __restrict__ experts_v,
+                                                      const float * __restrict__ expert_scale,
+                                                      const float * __restrict__ weights,
+                                                      const float * __restrict__ gate,
+                                                      const float * __restrict__ shexp,
+                                                      void * __restrict__ dst_v,
+                                                      const int64_t n_embd, const int n_expert_used) {
+    const int64_t token = blockIdx.x;
+    const int64_t col4  = ((int64_t) blockIdx.y * blockDim.x + threadIdx.x) * 4;
+    if (col4 >= n_embd) return;
+    auto ld = [&](const uint64_t row) -> float4 {
+        if constexpr (EIN16) {
+            const ushort4 h = *(const ushort4 *)((const uint16_t *) experts_v + row * n_embd + col4);
+            return make_float4(moe_bf2f(h.x), moe_bf2f(h.y), moe_bf2f(h.z), moe_bf2f(h.w));
+        } else {
+            return *(const float4 *)((const float *) experts_v + row * n_embd + col4);
+        }
+    };
+    const uint64_t first_row = (uint64_t) token * n_expert_used;
+    const float first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+    const float w0 = weights[first_row];
+    const float4 e0 = ld(first_row);
+    float4 sum; sum.x = (e0.x * first_scale) * w0; sum.y = (e0.y * first_scale) * w0; sum.z = (e0.z * first_scale) * w0; sum.w = (e0.w * first_scale) * w0;
+    for (int expert = 1; expert < n_expert_used; ++expert) {
+        const uint64_t row = first_row + expert;
+        const float scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+        const float w = weights[row];
+        const float4 e = ld(row);
+        sum.x += (e.x * scale) * w; sum.y += (e.y * scale) * w; sum.z += (e.z * scale) * w; sum.w += (e.w * scale) * w;
+    }
+    const float g = 1.0f / (1.0f + expf(-gate[token]));
+    const float4 a = *(const float4 *)(shexp + token * n_embd + col4);
+    const float4 o = make_float4(moe_add_rn(sum.x, moe_mul_rn(a.x, g)), moe_add_rn(sum.y, moe_mul_rn(a.y, g)),
+                                 moe_add_rn(sum.z, moe_mul_rn(a.z, g)), moe_add_rn(sum.w, moe_mul_rn(a.w, g)));
+    if constexpr (OUT16) {
+        *(ushort4 *)((uint16_t *) dst_v + token * n_embd + col4) = make_ushort4(moe_f2bf(o.x), moe_f2bf(o.y), moe_f2bf(o.z), moe_f2bf(o.w));
+    } else {
+        *(float4 *)((float *) dst_v + token * n_embd + col4) = o;
+    }
+}
+
+bool ggml_cuda_op_moe_weighted_reduction_sgma(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
+        const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * gate, const ggml_tensor * shexp,
+        ggml_tensor * dst) {
+    const int64_t n_embd        = experts->ne[0];
+    const int64_t n_expert_used = experts->ne[1];
+    const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
+    if (n_embd % 4 != 0 || experts->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 || shexp->type != GGML_TYPE_F32 ||
+        gate->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(experts) || !ggml_is_contiguous(shexp) ||
+        !ggml_is_contiguous(gate) || !ggml_is_contiguous(dst) || ggml_nelements(gate) != n_tokens ||
+        ggml_nelements(shexp) != n_embd * n_tokens || ggml_nelements(dst) != n_embd * n_tokens ||
+        ((uintptr_t) shexp->data % 16) != 0 || ((uintptr_t) dst->data % 16) != 0 || ((uintptr_t) experts->data % 16) != 0) {
+        return false;
+    }
+    const bool ein16 = ggml_cuda_mmb_down16() && ggml_cuda_mmb_is_bf16_only(ctx, experts);
+    const bool out16 = ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(ctx, dst);
+    constexpr int threads = 256;
+    const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
+    const float * sc = expert_scale ? (const float *) expert_scale->data : nullptr;
+    cudaStream_t stream = ctx.stream();
+#define MOE_SGMA_LAUNCH(A, B) moe_weighted_reduction_sgma_v4<A, B><<<blocks, threads, 0, stream>>>(experts->data, sc, \
+        (const float *) weights->data, (const float *) gate->data, (const float *) shexp->data, dst->data, n_embd, (int) n_expert_used)
+    if (ein16) { if (out16) MOE_SGMA_LAUNCH(true, true);  else MOE_SGMA_LAUNCH(true, false); }
+    else       { if (out16) MOE_SGMA_LAUNCH(false, true); else MOE_SGMA_LAUNCH(false, false); }
+#undef MOE_SGMA_LAUNCH
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
