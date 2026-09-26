@@ -1493,6 +1493,7 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
     ggml_cuda_mmb_context * mmb = nullptr;
+    bool mmb_opt_in = false; // set by ggml_backend_cuda_set_mmb_enabled, before the first graph
     bool mmb_after_compute = true;
     const void * mmb_first_split = nullptr;
     std::vector<uint64_t> mmb_graph_sigs;
