@@ -241,6 +241,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         if (ple_on_disk && ple_w) {
             llama_ple_disk::params dp;
             dp.direct_io = false; // page-cached, so qwen4exp_ple_prefetch's readahead advice can land
+            if (const char * e = getenv("LLAMA_PLE_DIRECT")) { dp.direct_io = atoi(e) != 0; }
 
             ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
                                                         ple_w->tensor->type, ple_w->tensor->ne[0], ple_rows, dp);
@@ -1894,36 +1895,69 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
         const auto * traits = ggml_get_type_traits(tab->type);
 
+        GGML_ASSERT(tab->type == GGML_TYPE_F32 || traits->to_float != nullptr);
+        embd_buf.resize(idx.size() * (size_t) dim);
+
+        // The GPU idles while this runs (65536 rows for a 4096-token ubatch), so it is split over host threads:
+        // phase 1 queues every page read at once (memory-mapped table, random rows: one madvise per row instead of
+        // taking the faults one after another, ~0.2 ms each from NVMe), phase 2 dequantizes. Each row goes through
+        // the same to_float as before, so the result is identical. LLAMA_PLE_HOST_THREADS=1 is the serial loop.
+        static const int n_thr_cfg = [] {
+            const char * e = getenv("LLAMA_PLE_HOST_THREADS");
+            const int hw = (int) std::max(1u, std::thread::hardware_concurrency());
+            return e ? std::max(1, atoi(e)) : std::min(32, hw);
+        }();
+        const size_t n_rows = idx.size();
+        const int    n_thr  = (int) std::max<size_t>(1, std::min<size_t>((size_t) n_thr_cfg, n_rows / 1024));
+        auto advise = [&](size_t k0, size_t k1) {
 #if defined(__linux__) || defined(__APPLE__)
-        // memory-mapped table, random rows: queue every page read at once instead of taking the
-        // faults one after another (~0.2 ms each from NVMe) while dequantizing below
-        {
             const long page = sysconf(_SC_PAGESIZE);
-            if (page > 0) {
-                const uintptr_t base = (uintptr_t) tab->data;
-                const uintptr_t mask = ~((uintptr_t) page - 1);
-                uintptr_t prev_page = 0;
-                for (const int32_t r : idx) {
-                    const uintptr_t a0 = (base + (size_t) r * row_size) & mask;
-                    const uintptr_t a1 = base + (size_t) r * row_size + row_size;
-                    if (a0 != prev_page) {
-                        madvise((void *) a0, a1 - a0, MADV_WILLNEED);
-                        prev_page = a0;
-                    }
+            if (page <= 0) {
+                return;
+            }
+            const uintptr_t base = (uintptr_t) tab->data;
+            const uintptr_t mask = ~((uintptr_t) page - 1);
+            uintptr_t prev_page = 0;
+            for (size_t k = k0; k < k1; ++k) {
+                const int32_t   r  = idx[k];
+                const uintptr_t a0 = (base + (size_t) r * row_size) & mask;
+                const uintptr_t a1 = base + (size_t) r * row_size + row_size;
+                if (a0 != prev_page) {
+                    madvise((void *) a0, a1 - a0, MADV_WILLNEED);
+                    prev_page = a0;
                 }
             }
-        }
+#else
+            GGML_UNUSED(k0); GGML_UNUSED(k1);
 #endif
-
-        embd_buf.resize(idx.size() * (size_t) dim);
-        for (size_t k = 0; k < idx.size(); ++k) {
-            const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
-            float *      dst = embd_buf.data() + k * (size_t) dim;
-            if (tab->type == GGML_TYPE_F32) {
-                memcpy(dst, src, dim * sizeof(float));
-            } else {
-                GGML_ASSERT(traits->to_float != nullptr);
-                traits->to_float(src, dst, dim);
+        };
+        auto dequant = [&](size_t k0, size_t k1) {
+            for (size_t k = k0; k < k1; ++k) {
+                const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
+                float *      dst = embd_buf.data() + k * (size_t) dim;
+                if (tab->type == GGML_TYPE_F32) {
+                    memcpy(dst, src, dim * sizeof(float));
+                } else {
+                    traits->to_float(src, dst, dim);
+                }
+            }
+        };
+        if (n_thr <= 1) {
+            advise(0, n_rows);
+            dequant(0, n_rows);
+        } else {
+            const size_t chunk = (n_rows + n_thr - 1) / n_thr;
+            for (int phase = 0; phase < 2; ++phase) {
+                std::vector<std::thread> workers;
+                workers.reserve(n_thr - 1);
+                for (int t = 1; t < n_thr; ++t) {
+                    const size_t k0 = std::min(n_rows, (size_t) t * chunk), k1 = std::min(n_rows, k0 + chunk);
+                    workers.emplace_back([&, k0, k1, phase] { if (phase == 0) { advise(k0, k1); } else { dequant(k0, k1); } });
+                }
+                if (phase == 0) { advise(0, std::min(n_rows, chunk)); } else { dequant(0, std::min(n_rows, chunk)); }
+                for (auto & w : workers) {
+                    w.join();
+                }
             }
         }
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));

@@ -19,6 +19,8 @@ size_t ggml_cuda_mmb_marks_count(ggml_backend_cuda_context & ctx);
 void ggml_cuda_mmb_mark_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
 bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
 bool ggml_cuda_mmb_gatemix();
+// two F32-weight GEMMs (M1 + M2 <= 128 rows) on the same F32 activations in one pass (qwen4exp ssm_beta + ssm_alpha)
+bool ggml_cuda_mmb_f32_dual(ggml_backend_cuda_context & ctx, const ggml_tensor * w1, const ggml_tensor * w2, const ggml_tensor * x, ggml_tensor * d1, ggml_tensor * d2);
 bool ggml_cuda_mmb_down16();
 bool ggml_cuda_mmb_res16();
 bool ggml_cuda_mmb_blk16();

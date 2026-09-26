@@ -5080,6 +5080,12 @@ struct test_gated_delta_net : public test_case {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
+    // the chunked prefill path (RDNA3.5: S_v = 128, >= 256 tokens, one sequence, final state only) runs its matrix
+    // products on fp16 WMMA operands (NMSE ~2e-7 vs the fp32 reference) instead of the exact fp32 recurrence
+    double max_nmse_err() override {
+        return (head_size == 128 && n_seq_tokens >= 256 && n_seqs == 1 && !kda && K == 1) ? 1e-6 : 1e-7;
+    }
+
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
@@ -5130,6 +5136,70 @@ struct test_gated_delta_net : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// The chunked GDN can calculate q/k/v convolution at the GDN node, after the normal conv/SiLU nodes.
+// The activation x is produced by a preceding op and must remain allocated until that later read.
+struct test_gdn_conv_prefill : public test_case {
+    const int n_tokens;
+    const int n_k_heads;
+    const int n_v_heads;
+    test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads)
+        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads) {}
+    std::string op_desc(ggml_tensor *) override { return "GDN_CONV_PREFILL"; }
+    std::string vars() override { return VARS_TO_STR3(n_tokens, n_k_heads, n_v_heads); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 2e-5; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) continue;
+            if (strcmp(t->name, "gate") == 0)          init_tensor_uniform(t, -3.0f, -0.5f);
+            else if (strcmp(t->name, "beta") == 0)    init_tensor_uniform(t, 0.0f, 0.5f);
+            else if (strcmp(t->name, "history") == 0 || strcmp(t->name, "state") == 0)
+                init_tensor_uniform(t, -0.01f, 0.01f);
+            else                                      init_tensor_uniform(t, -0.25f, 0.25f);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int C = 128 * (2 * n_k_heads + n_v_heads);
+        ggml_tensor * x_src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n_tokens);
+        ggml_set_name(x_src, "x_src");
+        ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, not a permanent input
+        ggml_tensor * history = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, C);
+        ggml_set_name(history, "history");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
+        ggml_set_name(w, "taps");
+        ggml_tensor * cc = ggml_concat(ctx, history, ggml_transpose(ctx, x), 0);
+        ggml_tensor * conv = ggml_ssm_conv(ctx, ggml_reshape_3d(ctx, cc, n_tokens + 3, C, 1), w);
+        ggml_tensor * silu = ggml_silu(ctx, conv);
+        if (gf) ggml_build_forward_expand(gf, silu);
+
+        // An independent full-size allocation between conv and GDN exercises scheduler allocation and fusion order.
+        ggml_tensor * scratch = ggml_scale(ctx, x_src, 0.25f);
+        if (gf) ggml_build_forward_expand(gf, scratch);
+
+        auto view = [&](int heads, int offset) {
+            return ggml_view_4d(ctx, silu, 128, heads, n_tokens, 1,
+                                128 * sizeof(float), (size_t) C * sizeof(float),
+                                (size_t) C * n_tokens * sizeof(float), (size_t) offset * sizeof(float));
+        };
+        ggml_tensor * q = view(n_k_heads, 0);
+        ggml_tensor * k = view(n_k_heads, 128 * n_k_heads);
+        ggml_tensor * v = view(n_v_heads, 256 * n_k_heads);
+        const float eps = 1e-6f;
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps / 128), 1.0f / sqrtf(128.0f));
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps / 128), 1.0f / sqrtf(128.0f));
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, n_tokens, 1);
+        ggml_set_name(g, "gate");
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, n_tokens, 1);
+        ggml_set_name(beta, "beta");
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, n_v_heads, 1);
+        ggml_set_name(state, "state");
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
     }
 };
 
@@ -5906,6 +5976,52 @@ struct test_swiglu_iq3_mmvq : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, 512);
+    }
+};
+
+// Qwen3.8-Flash-Next prefill MoE (512 experts, top-10) with a skewed routing that reproduces the measured
+// tokens-per-expert histogram of a 4096-token ubatch. glu: IQ3_S gate/up + swiglu; !glu: IQ4_NL down.
+struct test_moe_prefill : public test_case {
+    const bool glu; const int64_t n;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_PREFILL"; }
+    std::string vars() override { return VARS_TO_STR2(glu, n); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2560 * 640 * 10 * n * (glu ? 2 : 1); }
+    test_moe_prefill(bool glu, int64_t n) : glu(glu), n(n) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 512, n);
+        ggml_set_name(ids_all, "ids");
+        ggml_tensor * ids = ggml_view_2d(ctx, ids_all, 10, n, ids_all->nb[1], 0);
+        if (glu) {
+            ggml_tensor * gw = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_S, 2560, 640, 512);
+            ggml_tensor * uw = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_S, 2560, 640, 512);
+            ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2560, 1, n);
+            return ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gw, x, ids), ggml_mul_mat_id(ctx, uw, x, ids));
+        }
+        ggml_tensor * dw = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ4_NL, 640, 2560, 512);
+        ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 640, 10, n);
+        return ggml_mul_mat_id(ctx, dw, x, ids);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) continue;
+            if (t->type != GGML_TYPE_I32) { init_tensor_uniform(t); continue; }
+            // counts per expert from the histogram {0:105, 1-15:134, 16-31:61, 32-63:72, 64-127:69, 128-255:39, 256-511:18, >=512:14}
+            const int bins[8][3] = {{0,0,105},{1,15,134},{16,31,61},{32,63,72},{64,127,69},{128,255,39},{256,511,18},{512,1480,14}};
+            std::vector<int> cnt;
+            for (auto & b : bins) for (int i = 0; i < b[2]; ++i) cnt.push_back(b[0] + (b[2] > 1 ? (b[1] - b[0]) * i / (b[2] - 1) : 0));
+            const int64_t total = 10 * n; int64_t sum = 0; for (int c : cnt) sum += c;
+            // scale to 10*n rows, then fix the rounding on the largest expert
+            for (int & c : cnt) c = (int) ((int64_t) c * total / sum);
+            sum = 0; for (int c : cnt) sum += c; cnt[511] += (int) (total - sum);
+            GGML_ASSERT(cnt[511] <= n);
+            std::vector<int> perm(512); for (int i = 0; i < 512; ++i) perm[i] = (i * 197) % 512;   // spread hot experts
+            std::vector<int> slots; for (int e = 0; e < 512; ++e) for (int i = 0; i < cnt[e]; ++i) slots.push_back(perm[e]);
+            std::vector<int32_t> data(512 * n, 0);
+            for (int64_t tok = 0; tok < n; ++tok) for (int j = 0; j < 10; ++j) data[tok * 512 + j] = slots[tok + j * n];
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+        }
     }
 };
 
@@ -7812,6 +7928,137 @@ struct test_moe_weighted_reduction : public test_case {
             }
         }
         ggml_set_name(out, "moe_weighted_reduction");
+        return out;
+    }
+};
+
+// MoE weighted reduction followed by the sigmoid-gated shared-expert merge (qwen4exp, Qwen3-Next, Qwen3.5-MoE):
+// out = reduction + shexp * sigmoid(gate_logit). The CUDA backend fuses the reduction and the merge into one kernel.
+// between = true puts the shared-expert GEMMs between them, as the model builders do; graph_optimize then moves the
+// reduction down (RDNA3.5, >= 512 tokens), so allocation goes through the scheduler and buffer reuse follows the
+// new order. hazard = true adds an in-between node that writes the experts in place after the reduction read them:
+// the reorder must then keep the original order (checked on the node order, since both backends compute the same graph).
+struct test_moe_shexp_merge : public test_case {
+    const ggml_type type_down;   // F32: experts are an input; else produced by MUL_MAT_ID with these weights
+    const int64_t n_embd;
+    const int64_t n_expert_used;
+    const int64_t n_tokens;
+    const bool with_expert_scale;
+    const bool between;
+    const bool hazard;
+    const int n_mats = 16;
+    const int64_t k = 256;
+    ggml_tensor * writer_node = nullptr;
+
+    test_moe_shexp_merge(ggml_type type_down, int64_t n_embd, int64_t n_expert_used, int64_t n_tokens,
+                         bool with_expert_scale, bool between, bool hazard = false)
+        : type_down(type_down), n_embd(n_embd), n_expert_used(n_expert_used), n_tokens(n_tokens),
+          with_expert_scale(with_expert_scale), between(between), hazard(hazard) {}
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_down, n_embd, n_expert_used, n_tokens, with_expert_scale, between, hazard);
+    }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_SHEXP_MERGE"; }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return between; }
+    double max_nmse_err() override { return type_down == GGML_TYPE_F32 ? 1e-6 : 5e-4; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE && t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        // both backends run the (possibly reordered) graph, so check the order itself: every reader of the memory the
+        // writer overwrites must still run before it (the reorder may move nodes that only read unaffected tensors)
+        if (hazard && gf && writer_node) {
+            const ggml_tensor * target = writer_node->view_src;
+            int i_writer = -1;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                i_writer = ggml_graph_node(gf, i) == writer_node ? i : i_writer;
+            }
+            for (int i = i_writer + 1; i < ggml_graph_n_nodes(gf); ++i) {
+                const ggml_tensor * t = ggml_graph_node(gf, i);
+                for (int j = 0; j < GGML_MAX_SRC && t->src[j]; ++j) {
+                    const ggml_tensor * r = t->src[j]->view_src ? t->src[j]->view_src : t->src[j];
+                    if (r == target) {
+                        printf("%s reads %s after the in-place writer ", t->name, target->name);
+                        return 1e9;
+                    }
+                }
+            }
+        }
+        return nmse(a, b, n);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * experts;
+        if (type_down == GGML_TYPE_F32) {
+            experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens);
+        } else {
+            ggml_tensor * down = ggml_new_tensor_3d(ctx, type_down, k, n_embd, n_mats);
+            ggml_set_name(down, "down");
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+            ids = ggml_view_2d(ctx, ids, n_expert_used, n_tokens, ids->nb[1], 0);
+            ggml_tensor * h = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_expert_used, n_tokens);
+            ggml_set_name(h, "h");
+            experts = ggml_mul_mat_id(ctx, down, h, ids);
+        }
+        ggml_set_name(experts, "experts");
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
+        ggml_set_name(weights, "weights");
+
+        ggml_tensor * scaled = experts;
+        if (with_expert_scale) {
+            ggml_tensor * expert_scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
+            ggml_set_name(expert_scale, "expert_scale");
+            scaled = ggml_mul(ctx, experts, expert_scale);
+        }
+        ggml_tensor * weighted = ggml_mul(ctx, scaled, weights);
+        ggml_set_name(weighted, "weighted_experts");
+
+        ggml_tensor * red = nullptr;
+        for (int64_t e = 0; e < n_expert_used; ++e) {
+            ggml_tensor * v = ggml_view_2d(ctx, weighted, n_embd, n_tokens, weighted->nb[2], e * weighted->nb[1]);
+            if (mode == MODE_TEST) { ggml_build_forward_expand(gf, v); }
+            red = red ? ggml_add(ctx, red, v) : v;
+            if (mode == MODE_TEST && e > 0) { ggml_build_forward_expand(gf, red); }
+        }
+        ggml_set_name(red, "moe_out");
+
+        // shared expert and its gate logit
+        ggml_tensor * w_sh = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_embd);
+        ggml_set_name(w_sh, "w_shexp");
+        ggml_tensor * w_g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(w_g, "w_shexp_gate");
+        ggml_tensor * shexp, * logit;
+        if (between) {
+            shexp = ggml_mul_mat(ctx, w_sh, x);
+            if (mode == MODE_TEST) { ggml_build_forward_expand(gf, shexp); }
+            if (hazard) {
+                // overwrites the experts after the reduction read them (in place, a view of the experts)
+                writer_node = type_down == GGML_TYPE_F32 ? ggml_scale_inplace(ctx, experts, 0.5f)
+                                                        : ggml_scale_inplace(ctx, weights, 0.5f);
+                ggml_set_name(writer_node, "writer");
+                if (mode == MODE_TEST) { ggml_build_forward_expand(gf, writer_node); }
+            }
+            logit = ggml_mul_mat(ctx, w_g, x);
+        } else {
+            // precomputed, so SIGMOID -> MUL -> ADD directly follow the reduction
+            shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            logit = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+        }
+        ggml_set_name(shexp, "shexp");
+        ggml_tensor * gated = ggml_mul(ctx, shexp, ggml_sigmoid(ctx, logit));
+        ggml_tensor * out = ggml_add(ctx, red, gated);
+        ggml_set_name(out, "out");
         return out;
     }
 };
@@ -11903,6 +12150,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, false, 512, 129, 256, 2));
+    test_cases.emplace_back(new test_moe_prefill(true, 512));
+    test_cases.emplace_back(new test_moe_prefill(false, 512));
     test_cases.emplace_back(new test_mul_mat_pair());
 
     // gpt-oss issue with Vulkan mmq_id
@@ -12777,6 +13026,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 16, 32, false, true));
 
+    // reduction + sigmoid-gated shared-expert merge: adjacent (fusion only) and with the shared-expert GEMMs in between
+    // (graph_optimize reorder at >= 512 tokens); n_embd 2560 / 2048 / 4608 cover 640, 512 and the 256-thread fallback
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_F32,    64,   8,  33, false, false));
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_F32,    2560, 10, 64, true,  false));
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_F32,    2048, 8,  512, false, true));
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_F32,    4608, 8,  512, true,  true));
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_IQ4_NL, 2560, 10, 512, true,  true));
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_Q8_0,   2048, 8,  512, false, true));
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_F32,    2560, 10, 512, true,  true, true));
+    test_cases.emplace_back(new test_moe_shexp_merge(GGML_TYPE_IQ4_NL, 2560, 10, 512, true,  true, true));
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -12810,6 +13070,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n_tokens : {15, 16, 17, 64, 65, 2048}) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 1, false, true));
     }
+    // chunked prefill path (RDNA3.5): qwen3.8-style 16 k-heads x 3 = 48 v-heads
+    for (int n_tokens : {256, 300, 4096}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3));
+    }
+    // Convolution/SiLU elided into the chunked GDN, allocated through the scheduler.
+    test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 2));
+    test_cases.emplace_back(new test_gdn_conv_prefill(512, 2, 4));
     // Multiple sequences must remain on the generic fallback.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));
@@ -12991,6 +13258,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    if (getenv("GGML_PERF_MOE")) {
+        test_cases.emplace_back(new test_moe_prefill(true, 4096));
+        test_cases.emplace_back(new test_moe_prefill(false, 4096));
+        return test_cases;
+    }
 
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {

@@ -19,7 +19,7 @@ static __device__ __forceinline__ float qsa3_h2f(const uint16_t h) { return (flo
 #define QSA3_SENT 0x7FFFFFFF
 __global__ __launch_bounds__(256) void qsa3_rows_kernel(
         const int * __restrict__ ids, const size_t i1, const int ns, const int nk, int * __restrict__ srow, int * __restrict__ sflag,
-        const char * mask, size_t m1) {
+        const char * mask, size_t m1, const int np2) {
     extern __shared__ int ent[];
     __shared__ int unsorted;
     const int q = blockIdx.x, tid = threadIdx.x;
@@ -43,11 +43,32 @@ __global__ __launch_bounds__(256) void qsa3_rows_kernel(
     __syncthreads();
     if (unsorted) {
         int * dst = srow + (size_t) q * ns;
-        for (int j = tid; j < ns; j += 256) {
-            const int e = ent[j];
-            int rank = 0;
-            for (int k = 0; k < ns; ++k) { const int f = ent[k]; rank += (f < e) || (f == e && k < j); }
-            dst[rank] = e;
+        if (np2 == 0) {
+            for (int j = tid; j < ns; j += 256) {
+                const int e = ent[j];
+                int rank = 0;
+                for (int k = 0; k < ns; ++k) { const int f = ent[k]; rank += (f < e) || (f == e && k < j); }
+                dst[rank] = e;
+            }
+        } else {
+            // bitonic sort of the row padded to np2 with the sentinel (sorts last): O(n log^2 n) instead of the O(n^2)
+            // rank sort; equal entries are equal values, so the sorted row is the same as the rank sort's
+            for (int j = ns + tid; j < np2; j += 256) { ent[j] = QSA3_SENT; }
+            __syncthreads();
+            for (int k = 2; k <= np2; k <<= 1) {
+                for (int jj = k >> 1; jj > 0; jj >>= 1) {
+                    for (int i = tid; i < np2; i += 256) {
+                        const int ixj = i ^ jj;
+                        if (ixj > i) {
+                            const int a = ent[i], b = ent[ixj];
+                            const bool asc = (i & k) == 0;
+                            if ((a > b) == asc) { ent[i] = b; ent[ixj] = a; }
+                        }
+                    }
+                    __syncthreads();
+                }
+            }
+            for (int j = tid; j < ns; j += 256) { dst[j] = ent[j]; }
         }
     }
     if (tid == 0) { sflag[q] = unsorted; }
@@ -476,8 +497,12 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
     ggml_cuda_pool_alloc<int>      srow(ctx.pool(), (size_t) n_q * ns);
     ggml_cuda_pool_alloc<int>      sflag(ctx.pool(), (size_t) n_q);
     {
-        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) ns * sizeof(int), ctx.stream());
-        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get(), m ? (const char *)m->data : nullptr, m ? m->nb[1] : 0);
+        // bitonic row sort over the next power of two (GGML_QSA_RANKSORT=1: the O(n^2) rank sort)
+        static const bool ranksort = getenv("GGML_QSA_RANKSORT") && atoi(getenv("GGML_QSA_RANKSORT")) != 0;
+        int np2 = 1; while (np2 < ns) np2 <<= 1;
+        if (ranksort || (size_t) np2 * sizeof(int) > 60 * 1024) np2 = 0;
+        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) (np2 ? np2 : ns) * sizeof(int), ctx.stream());
+        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get(), m ? (const char *)m->data : nullptr, m ? m->nb[1] : 0, np2);
         CUDA_CHECK(cudaGetLastError());
         const ggml_cuda_kernel_launch_params launch2(dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), ctx.stream());
         ggml_cuda_kernel_launch(qsa3_merge_kernel, launch2, (const int *) ids->data, ids->nb[1], n_q, ns, nk,
