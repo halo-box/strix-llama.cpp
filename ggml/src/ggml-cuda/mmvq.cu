@@ -814,7 +814,7 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
                     u[2*i+1] = get_int_b4(by->qs, kqs + i + QI5_1);
                 }
                 // ROCm 7.14 changes gfx1151 Q5_1 rounding under four-column register pressure. Keep both paths materialized until LLVM preserves this expression.
-                volatile float dot = vec_dot_q5_1_q8_1_impl<VDR_Q5_1_Q8_1_MMVQ>(vl, vh, u, dm, by->ds);
+                const float dot = ggml_cuda_materialize(vec_dot_q5_1_q8_1_impl<VDR_Q5_1_Q8_1_MMVQ>(vl, vh, u, dm, by->ds));
                 tmp[j] = __fadd_rn(tmp[j], dot);
             }
         } else if constexpr (type == GGML_TYPE_Q4_K) {
@@ -1423,8 +1423,8 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
                 if constexpr (type == GGML_TYPE_Q5_1 && table_id == MMVQ_PARAMETERS_RDNA3_5) {
-                    volatile float dot = vec_dot_q_cuda(
-                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    const float dot = ggml_cuda_materialize(vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs));
                     tmp[j][i] = __fadd_rn(tmp[j][i], dot);
                 } else {
                     tmp[j][i] += vec_dot_q_cuda(
@@ -1433,8 +1433,8 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         if constexpr (type == GGML_TYPE_Q5_1 && table_id == MMVQ_PARAMETERS_RDNA3_5) {
-                            volatile float dot_gate = vec_dot_q_cuda(
-                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            const float dot_gate = ggml_cuda_materialize(vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs));
                             tmp_gate[j][i] = __fadd_rn(tmp_gate[j][i], dot_gate);
                         } else {
                             tmp_gate[j][i] += vec_dot_q_cuda(
