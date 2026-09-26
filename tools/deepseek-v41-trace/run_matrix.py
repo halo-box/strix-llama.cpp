@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from preflight import PreflightError, require_nvme_path, resolved, run_strix_preflight
 from trace_format import (
@@ -53,7 +54,7 @@ CORPORA = (
 )
 
 
-def approved_source_root(builder_policy: dict[str, object]) -> Path:
+def approved_source_root(builder_policy: dict[str, Any]) -> Path:
     try:
         return Path(str(builder_policy["source_root"])).expanduser().resolve(strict=True)
     except (KeyError, OSError) as error:
@@ -62,7 +63,7 @@ def approved_source_root(builder_policy: dict[str, object]) -> Path:
 
 def query_prompt_builder_runtime_build(
         builder: Path,
-        builder_policy: dict[str, object]) -> dict[str, object]:
+        builder_policy: dict[str, Any]) -> dict[str, Any]:
     result, _identity = run_approved_executable(
         [str(builder), "--dsv41-attest-build"],
         path=builder,
@@ -110,7 +111,7 @@ def prepare_prompt(
     *,
     builder: Path,
     builder_approval_id: str,
-    builder_policy: dict[str, object],
+    builder_policy: dict[str, Any],
     builder_policy_sha256: str,
     model: Path,
     corpus: Path,
@@ -120,7 +121,7 @@ def prepare_prompt(
     output: Path,
     context: int,
     decode_steps: int,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     target_tokens = context - decode_steps
     expected_prompt = approved_prompt_record(
         builder_policy,
@@ -424,7 +425,7 @@ def main() -> int:
         prompts = inputs / "prompts"
         sources.mkdir(parents=True, exist_ok=True)
         prompts.mkdir(parents=True, exist_ok=True)
-        corpus_records = []
+        corpus_records: list[dict[str, Any]] = []
         for name in CORPORA:
             source = require_nvme_path(repo / "tests" / "corpus" / name, "repository corpus")
             if not source.is_file():

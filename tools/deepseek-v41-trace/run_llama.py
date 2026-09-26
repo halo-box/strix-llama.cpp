@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from preflight import (
     PreflightError,
@@ -68,7 +69,7 @@ from trace_format import (
 )
 
 
-def approved_source_root(prompt_policy: dict[str, object]) -> Path:
+def approved_source_root(prompt_policy: dict[str, Any]) -> Path:
     try:
         return Path(str(prompt_policy["source_root"])).expanduser().resolve(strict=True)
     except (KeyError, OSError) as error:
@@ -103,7 +104,7 @@ def model_descriptor_identity(
         path: Path,
         *,
         hash_bytes: bool,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     try:
         import fcntl
 
@@ -140,7 +141,7 @@ def model_descriptor_identity(
     return identity
 
 
-def open_model_descriptor(path: Path) -> tuple[int, dict[str, object]]:
+def open_model_descriptor(path: Path) -> tuple[int, dict[str, Any]]:
     lexical_path = path.expanduser()
     if not lexical_path.is_absolute():
         lexical_path = Path.cwd() / lexical_path
@@ -191,7 +192,7 @@ def open_model_descriptor(path: Path) -> tuple[int, dict[str, object]]:
 
 def verify_model_descriptor(
         descriptor: int,
-        identity: dict[str, object],
+        identity: dict[str, Any],
 ) -> None:
     path = Path(str(identity["path"]))
     observed = model_descriptor_identity(descriptor, path, hash_bytes=True)
@@ -231,9 +232,9 @@ def candidate_attestation(
         exporter_sha256: str,
         approval_id: str,
         approval_sha256: str,
-        approval: dict[str, object],
+        approval: dict[str, Any],
         verifier_revision: str,
-        install_trust: dict[str, object]) -> dict[str, object]:
+        install_trust: dict[str, Any]) -> dict[str, Any]:
     repo = resolved(args.repo)
     exporter = resolved(exporter)
     observed_verifier_revision = git_output(repo, "rev-parse", "HEAD").decode("ascii").strip()
@@ -298,12 +299,12 @@ def candidate_attestation(
 
 
 def validate_runtime_build(
-        manifest: dict[str, object],
+        manifest: dict[str, Any],
         *,
         exporter: Path,
         exporter_sha256: str,
         candidate_revision: str,
-        approval: dict[str, object]) -> tuple[str, str]:
+        approval: dict[str, Any]) -> tuple[str, str]:
     build = manifest.get("build")
     if not isinstance(build, dict):
         raise PreflightError("llama trace build identity is missing")
@@ -429,7 +430,7 @@ def query_runtime_build_attestation(
         *,
         exporter_sha256: str,
         candidate_revision: str,
-        approval: dict[str, object]) -> dict[str, object]:
+        approval: dict[str, Any]) -> dict[str, Any]:
     result, _identity = run_approved_executable(
         [str(exporter), "--dsv41-attest-build", device],
         path=exporter,
@@ -471,10 +472,10 @@ def query_runtime_build_attestation(
 def bind_candidate_attestation(
         output: Path,
         attestation: dict[str, str],
-        accelerator: dict[str, object],
+        accelerator: dict[str, Any],
         exporter: Path,
         exporter_sha256: str,
-        approval: dict[str, object]) -> None:
+        approval: dict[str, Any]) -> None:
     manifest_path = safe_trace_path(output, "manifest.json")
     try:
         manifest = strict_json_loads(manifest_path.read_text(encoding="ascii"))
@@ -501,7 +502,7 @@ def bind_candidate_attestation(
 def validate_accelerator_attestation(
         record: object,
         *,
-        expected_device: str = "ROCm0") -> dict[str, object]:
+        expected_device: str = "ROCm0") -> dict[str, Any]:
     if not isinstance(record, dict):
         raise PreflightError("accelerator attestation is not an object")
     required_keys = {
@@ -551,7 +552,7 @@ def validate_accelerator_attestation(
 def query_accelerator_attestation(
         exporter: Path,
         device: str,
-        approval: dict[str, object] | None = None) -> dict[str, object]:
+        approval: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         if approval is None:
             result = subprocess.run(

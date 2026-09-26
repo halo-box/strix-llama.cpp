@@ -21,6 +21,7 @@ from argparse import Namespace
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
 from unittest import mock
 
 TRACE_DIR = Path(__file__).parents[1] / "tools" / "deepseek-v41-trace"
@@ -28,13 +29,13 @@ sys.path.insert(0, str(TRACE_DIR))
 MODULE_PATH = TRACE_DIR / "trace_format.py"
 SPEC = importlib.util.spec_from_file_location("dsv41_trace_format", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
-trace = importlib.util.module_from_spec(SPEC)
+trace: Any = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(trace)
-import run_llama
-import run_ds4
-import run_matrix
-import preflight
-import verify_ds4_anchors
+import run_llama  # noqa: E402
+import run_ds4  # noqa: E402
+import run_matrix  # noqa: E402
+import preflight  # noqa: E402
+import verify_ds4_anchors  # noqa: E402
 
 trace.APPROVED_WATCHDOGS[trace.WATCHDOG_SCRIPT_SHA256] = trace.WATCHDOG_REVISION
 FIXTURE_DS4_EXPORTER_SHA256 = "3" * 64
@@ -83,8 +84,8 @@ def receive_native_test_pidfd_packet(connection, max_payload_bytes):
             descriptor_bytes.frombytes(content[:len(content) - len(content) % item_size])
             descriptors.extend(descriptor_bytes)
         truncation_flags = (
-            getattr(socket, "MSG_TRUNC", 0) |
-            getattr(socket, "MSG_CTRUNC", 0)
+            getattr(socket, "MSG_TRUNC", 0)
+            | getattr(socket, "MSG_CTRUNC", 0)
         )
         if flags & truncation_flags:
             raise AssertionError("native test packet was truncated")
@@ -138,6 +139,7 @@ def finish_native_test_supervisor(supervisor, *, kill_if_running):
         for stream in (supervisor.stdin, supervisor.stdout, supervisor.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
+
 
 WATCHDOG_EVENTS = [
     {
@@ -237,7 +239,7 @@ DS4_RUNTIME_RECEIPT = {
         },
     ],
 }
-DS4_RUNTIME_LIBRARIES = [
+DS4_RUNTIME_LIBRARIES: list[dict[str, Any]] = [
     {
         "component": component["component"],
         "filename": component["filename"],
@@ -325,7 +327,7 @@ DS4_INSTALL_TRUST = {
         )
     ],
 }
-DS4_EXPORTER_POLICY = {
+DS4_EXPORTER_POLICY: dict[str, Any] = {
     "runtime": "ds4",
     "repository": trace.DS4_REPOSITORY,
     "revision": trace.DS4_REVISION,
@@ -349,7 +351,7 @@ DS4_RUNTIME_BUILD_SHA256 = trace.runtime_build_evidence_sha256(
 )
 
 
-def storage_record(path: str) -> dict[str, object]:
+def storage_record(path: str) -> dict[str, Any]:
     model_storage = path.startswith("/mnt/models")
     mount_point = "/mnt/models" if model_storage else "/home"
     source = "/dev/nvme1n1" if model_storage else "/dev/nvme0n1p3[/home]"
@@ -382,7 +384,8 @@ STORAGE_ATTESTATION = {
     "temporary_directory": storage_record("/home/tmp"),
 }
 
-def metal_storage_record(path: str, mount_point: str = "/Users") -> dict[str, object]:
+
+def metal_storage_record(path: str, mount_point: str = "/Users") -> dict[str, Any]:
     return {
         "format": "dsv41-storage-attestation",
         "version": 2,
@@ -454,7 +457,7 @@ DS4_RUNNER_ATTESTATION = {
     "command_sha256": "4" * 64,
 }
 
-AUDIT_RECORDS = {
+AUDIT_RECORDS: dict[str, dict[str, Any]] = {
     "memory": {
         "created_unix": 1,
         "kind": "memory",
@@ -581,7 +584,7 @@ def audit_bytes(kind: str, phase: str, runtime: str = "llama.cpp") -> bytes:
     return (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
 
 
-def replace_audit_record(root: Path, phase: str, kind: str, record: dict[str, object]) -> None:
+def replace_audit_record(root: Path, phase: str, kind: str, record: dict[str, Any]) -> None:
     data = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
     digest = trace.sha256_bytes(data)
     path = root / "audits" / phase / f"{digest}.json"
@@ -599,7 +602,7 @@ def replace_audit_record(root: Path, phase: str, kind: str, record: dict[str, ob
     )
 
 
-def replace_watchdog_events(root: Path, phase: str, events: list[dict[str, object]]) -> None:
+def replace_watchdog_events(root: Path, phase: str, events: list[dict[str, Any]]) -> None:
     records = []
     for event in events:
         record = json.loads(json.dumps(event))
@@ -619,7 +622,7 @@ def replace_watchdog_events(root: Path, phase: str, events: list[dict[str, objec
     replace_audit_record(root, phase, "watchdog", record)
 
 
-def fixture_containment_helper(revision: str, digest: str = "d" * 64) -> dict[str, object]:
+def fixture_containment_helper(revision: str, digest: str = "d" * 64) -> dict[str, Any]:
     return {
         "format": "dsv41-containment-helper",
         "version": 2,
@@ -638,7 +641,7 @@ def fixture_prompt_builder_policy(
         decode_steps: int = 1,
         builder_path: str = "/home/repo/build/bin/llama-deepseek-v41-prompt-builder",
         builder_sha256: str = "8" * 64,
-        source_root: str = "/home/repo") -> dict[str, object]:
+        source_root: str = "/home/repo") -> dict[str, Any]:
     runtime_components = [
         ("ggml", "libggml.so", "4", None),
         ("ggml-base", "libggml-base.so", "5", "a" * 40),
@@ -698,7 +701,7 @@ def fixture_prompt_builder_policy(
     }
 
 
-def materialize_policy_runtime(policy: dict[str, object]) -> None:
+def materialize_policy_runtime(policy: dict[str, Any]) -> None:
     library_root = Path(policy["install_root"]) / "lib"
     library_root.mkdir(parents=True, exist_ok=True)
     for component in policy["runtime_receipt"]["components"]:
@@ -720,7 +723,7 @@ def materialize_policy_runtime(policy: dict[str, object]) -> None:
     Path(policy["install_root"]).chmod(0o555)
 
 
-def materialize_ds4_exporter_policy(root: Path) -> tuple[dict[str, object], Path]:
+def materialize_ds4_exporter_policy(root: Path) -> tuple[dict[str, Any], Path]:
     install = root / "ds4-install"
     exporter = install / "bin" / "ds4-trace"
     exporter.parent.mkdir(parents=True)
@@ -735,7 +738,7 @@ def materialize_ds4_exporter_policy(root: Path) -> tuple[dict[str, object], Path
     return policy, exporter
 
 
-def fixture_install_trust(policy: dict[str, object]) -> dict[str, object]:
+def fixture_install_trust(policy: dict[str, Any]) -> dict[str, Any]:
     install_root = Path(policy["install_root"])
     paths = {
         policy["executable_path"]: policy["executable_sha256"],
@@ -796,7 +799,7 @@ def fixture_install_trust(policy: dict[str, object]) -> dict[str, object]:
     }
 
 
-def fixture_runtime_build(policy: dict[str, object]) -> dict[str, object]:
+def fixture_runtime_build(policy: dict[str, Any]) -> dict[str, Any]:
     libraries = []
     for component in policy["runtime_receipt"]["components"]:
         name = component["component"]
@@ -921,7 +924,7 @@ def manifest(
         ("llama", "libllama.so", "7", "llama", None),
         ("llama-common", "libllama-common.so", "9", "build-info", "a" * 40),
     ]
-    runtime_libraries = [
+    runtime_libraries: list[dict[str, Any]] = [
         {
             "component": component,
             "filename": filename,
@@ -947,7 +950,7 @@ def manifest(
             for component, filename, digest, _role, revision in runtime_components
         ],
     }
-    result = {
+    result: dict[str, Any] = {
         "runtime": runtime,
         "revision": trace.DS4_REVISION if is_ds4 else "a" * 40,
         "build": (
@@ -1010,7 +1013,7 @@ def manifest(
                 "sha256": provenance_sha256,
             },
         },
-        "config": {
+        "config": cast(dict[str, Any], {
             "context": context,
             "decode_steps": decode_steps,
             "deepseek41": {
@@ -1028,10 +1031,10 @@ def manifest(
                 "raw_attention_width": trace.RAW_ATTENTION_WIDTH,
                 "candidate_propagation_layers": [24, 28, 32, 36],
             },
-        },
+        }),
         "paths": {
-                label: record["resolved_path"]
-                for label, record in storage.items()
+            label: record["resolved_path"]
+            for label, record in storage.items()
         },
         "storage_policy": json.loads(json.dumps(trace.NO_EXTERNAL_STATE_STORAGE)),
         "comparison": {
@@ -1129,7 +1132,7 @@ def manifest(
                 "private_procfs": True,
             },
         })
-        result["candidate"] = {
+        result["candidate"] = cast(dict[str, Any], {
             "repository": trace.REPOSITORY,
             "revision": "a" * 40,
             "base_revision": "b" * 40,
@@ -1142,7 +1145,7 @@ def manifest(
                     "post": result["build"]["runtime_libraries_post"],
                 }).encode("ascii")),
             "runtime_receipt_sha256": result["build"]["runtime_receipt_sha256"],
-        }
+        })
     else:
         result["host"] = dict(DS4_HOST_ATTESTATION)
         result["oracle"] = {
@@ -1233,7 +1236,7 @@ def manifest(
     return result
 
 
-def add_required_events(writer: object, logits: bytes | None = None, prompt: bytes = b"abc") -> None:
+def add_required_events(writer: Any, logits: bytes | None = None, prompt: bytes = b"abc") -> None:
     runtime = writer.manifest["runtime"]
     audit_kinds = ("memory", "swap", "runner") if runtime == "ds4" else ("memory", "swap", "watchdog")
     for phase in ("pre", "post"):
@@ -1542,7 +1545,7 @@ class TraceFormatTests(unittest.TestCase):
             cls,
             runtime: str,
             *,
-            manifest_record: dict[str, object] | None = None,
+            manifest_record: dict[str, Any] | None = None,
             expected_challenge: str = TEST_CHALLENGE,
             expected_run_id: str | None = None,
             verification_unix: int | None = None,
@@ -1630,10 +1633,10 @@ class TraceFormatTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._require_nvme_path = preflight.require_nvme_path
-        preflight.require_nvme_path = lambda path, label, **kwargs: preflight.resolved(path)
+        preflight.require_nvme_path = lambda path, label, **kwargs: preflight.resolved(path)  # ty: ignore[invalid-assignment] # test monkeypatch, restored in tearDown
         self._trace_bundle_symbol = trace.TraceBundle
 
-        def test_bundle(root: Path, verify_blobs: bool = True, **_kwargs: object) -> object:
+        def test_bundle(root: Path, verify_blobs: bool = True, **_kwargs: object) -> Any:
             self._prune_fixture_extras(Path(root))
             signature = Path(root) / trace.SIGNATURE_NAME
             if signature.exists() or signature.is_symlink():
@@ -1676,7 +1679,7 @@ class TraceFormatTests(unittest.TestCase):
         trace.TraceBundle = test_bundle
 
     def tearDown(self) -> None:
-        preflight.require_nvme_path = self._require_nvme_path
+        preflight.require_nvme_path = self._require_nvme_path  # ty: ignore[invalid-assignment] # restore test monkeypatch
         trace.TraceBundle = self._trace_bundle_symbol
 
     def _seal_test_bundle(self, root: Path) -> str:
@@ -1758,7 +1761,7 @@ class TraceFormatTests(unittest.TestCase):
             if path.is_file() and path.relative_to(root).as_posix() not in expected | {trace.SIGNATURE_NAME}:
                 path.unlink()
 
-    def _read_sealed_bundle(self, root: Path) -> object:
+    def _read_sealed_bundle(self, root: Path) -> Any:
         return self._trace_bundle_class(root, verifier=self.verifier)
 
     def test_seal_requires_external_trust_and_fixed_verifier(self) -> None:
@@ -2499,8 +2502,8 @@ class TraceFormatTests(unittest.TestCase):
             root = Path(temp).resolve()
             policy, exporter = materialize_ds4_exporter_policy(root)
             runtime_path = (
-                Path(policy["install_root"]) / "lib" /
-                policy["runtime_receipt"]["components"][0]["filename"])
+                Path(policy["install_root"]) / "lib"
+                / policy["runtime_receipt"]["components"][0]["filename"])
             primary = subprocess.TimeoutExpired([str(exporter)], 7)
             with isolated_test_install_trust():
                 identity = run_ds4.approved_executable_identity(
@@ -2636,8 +2639,8 @@ class TraceFormatTests(unittest.TestCase):
         start_source = inspect.getsource(trace._start_linux_native_helper)
         spawn_source = inspect.getsource(trace._start_linux_native_helper_process)
         helper_source = (
-            Path(__file__).parents[1] /
-            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+            Path(__file__).parents[1]
+            / "tools/deepseek-v41-trace/linux-containment-helper.cpp"
         ).read_text(encoding="ascii")
         helper_main = helper_source[helper_source.index("int run_linux_helper"):]
         self.assertNotIn("os.fork", start_source + spawn_source)
@@ -2664,8 +2667,8 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_linux_native_helper_requires_zero_group_service(self) -> None:
         helper_source = (
-            Path(__file__).parents[1] /
-            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+            Path(__file__).parents[1]
+            / "tools/deepseek-v41-trace/linux-containment-helper.cpp"
         ).read_text(encoding="ascii")
         run_source = helper_source[
             helper_source.index("int run_linux_helper"):
@@ -2744,8 +2747,8 @@ class TraceFormatTests(unittest.TestCase):
     def test_linux_native_helper_inherited_signal_defenses_are_explicit(self) -> None:
         spawn_source = inspect.getsource(trace._start_linux_native_helper_process)
         helper_source = (
-            Path(__file__).parents[1] /
-            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+            Path(__file__).parents[1]
+            / "tools/deepseek-v41-trace/linux-containment-helper.cpp"
         ).read_text(encoding="ascii")
         self.assertIn("setsigmask=_all_catchable_signals()", spawn_source)
         self.assertIn("setsigdef=_all_catchable_signals()", spawn_source)
@@ -2758,8 +2761,8 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_linux_native_helper_source_isolates_target_privileges_before_exec(self) -> None:
         helper_source = (
-            Path(__file__).parents[1] /
-            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+            Path(__file__).parents[1]
+            / "tools/deepseek-v41-trace/linux-containment-helper.cpp"
         ).read_text(encoding="ascii")
         bootstrap_start = helper_source.index("[[noreturn]] void run_target_bootstrap")
         init_start = helper_source.index("[[noreturn]] void run_namespace_init")
@@ -3060,8 +3063,8 @@ class TraceFormatTests(unittest.TestCase):
         protocol.recvmsg.assert_called_once_with(
             128,
             trace.socket.CMSG_SPACE(
-                array.array("i").itemsize *
-                trace.LINUX_PROTOCOL_MAX_RECEIVED_DESCRIPTORS),
+                array.array("i").itemsize
+                * trace.LINUX_PROTOCOL_MAX_RECEIVED_DESCRIPTORS),
             1073741824,
         )
 
@@ -3091,8 +3094,8 @@ class TraceFormatTests(unittest.TestCase):
         protocol.recvmsg.assert_called_once_with(
             128,
             trace.socket.CMSG_SPACE(
-                array.array("i").itemsize *
-                trace.LINUX_PROTOCOL_MAX_RECEIVED_DESCRIPTORS),
+                array.array("i").itemsize
+                * trace.LINUX_PROTOCOL_MAX_RECEIVED_DESCRIPTORS),
             1073741824,
         )
 
@@ -3505,6 +3508,7 @@ class TraceFormatTests(unittest.TestCase):
             supervisor, kill_if_running=False)
         self.assertEqual(returncode, 0)
         self.assertEqual(stderr, "helper failure")
+        assert supervisor.stderr is not None
         self.assertTrue(supervisor.stderr.closed)
 
     def test_linux_namespace_authority_precedes_release_completion(self) -> None:
@@ -3549,8 +3553,8 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_linux_native_helper_source_binds_supervisor_death_and_namespace_lifecycle(self) -> None:
         helper_source = (
-            Path(__file__).parents[1] /
-            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+            Path(__file__).parents[1]
+            / "tools/deepseek-v41-trace/linux-containment-helper.cpp"
         ).read_text(encoding="ascii")
         self.assertGreaterEqual(helper_source.count("PR_SET_PDEATHSIG"), 2)
         self.assertIn("CLONE_NEWPID", helper_source)
@@ -3563,8 +3567,8 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_linux_native_helper_source_reports_bounded_setup_diagnostics(self) -> None:
         helper_source = (
-            Path(__file__).parents[1] /
-            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+            Path(__file__).parents[1]
+            / "tools/deepseek-v41-trace/linux-containment-helper.cpp"
         ).read_text(encoding="ascii")
         diagnostic_source = helper_source[
             helper_source.index("constexpr uint32_t DIAGNOSTIC_MAGIC"):
@@ -3631,8 +3635,8 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_linux_native_tests_do_not_hide_startup_failures(self) -> None:
         source = (
-            inspect.getsource(self.test_linux_native_helper_parent_death_boundary) +
-            inspect.getsource(self.test_linux_native_helper_forbidden_operations_kill_namespace)
+            inspect.getsource(self.test_linux_native_helper_parent_death_boundary)
+            + inspect.getsource(self.test_linux_native_helper_forbidden_operations_kill_namespace)
         )
         self.assertNotIn("skipTest(", source)
         self.assertNotIn("'stderr':-3", source)
@@ -3641,8 +3645,8 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_linux_native_helper_procfs_overmount_is_verified_and_fail_closed(self) -> None:
         helper_source = (
-            Path(__file__).parents[1] /
-            "tools/deepseek-v41-trace/linux-containment-helper.cpp"
+            Path(__file__).parents[1]
+            / "tools/deepseek-v41-trace/linux-containment-helper.cpp"
         ).read_text(encoding="ascii")
         setup_source = helper_source[
             helper_source.index('stage = "namespace-mount-private"'):
@@ -3677,7 +3681,6 @@ class TraceFormatTests(unittest.TestCase):
         "native Linux containment helper was not executed on this host",
     )
     def test_linux_native_helper_parent_death_boundary(self) -> None:
-        import array
         import socket
 
         helper = Path(os.environ["DSV41_NATIVE_CONTAINMENT_HELPER"]).resolve(strict=True)
@@ -3766,6 +3769,7 @@ class TraceFormatTests(unittest.TestCase):
                             target_state = state
                 self.assertEqual(labels, {"target", "descendant"})
                 self.assertIsNotNone(target_state)
+                assert target_state is not None
                 self.assertEqual(target_state["uids"], [65534] * 3)
                 self.assertEqual(target_state["gids"], [65534] * 3)
                 self.assertEqual(target_state["groups"], [])
@@ -3799,7 +3803,6 @@ class TraceFormatTests(unittest.TestCase):
         "native Linux containment helper was not executed on this host",
     )
     def test_linux_native_helper_forbidden_operations_kill_namespace(self) -> None:
-        import array
         import socket
 
         helper = Path(os.environ["DSV41_NATIVE_CONTAINMENT_HELPER"]).resolve(strict=True)
@@ -5064,9 +5067,9 @@ class TraceFormatTests(unittest.TestCase):
             events = [json.loads(line) for line in events_path.read_text(encoding="ascii").splitlines()]
             for layer, element in ((0, 8), (1, 2)):
                 event = next(item for item in events if (
-                    item["component"] == "expert.ids" and
-                    item["phase"] == "prefill" and
-                    item["layer"] == layer
+                    item["component"] == "expert.ids"
+                    and item["phase"] == "prefill"
+                    and item["layer"] == layer
                 ))
                 values = list(struct.unpack("<iiiiiiiiiiii", (right / event["blob"]).read_bytes()))
                 values[element] = 9
@@ -5211,7 +5214,7 @@ class TraceFormatTests(unittest.TestCase):
                 run_ds4.query_accelerator_attestation(
                     Path("/exporter"),
                     "Metal0",
-                    exporter_identity=object(),
+                    exporter_identity=cast(Any, object()),
                     exporter_policy=DS4_EXPORTER_POLICY,
                     expected_runtime_build=DS4_RUNTIME_BUILD,
                 )
@@ -5229,7 +5232,7 @@ class TraceFormatTests(unittest.TestCase):
             run_ds4.query_accelerator_attestation(
                 Path("/approved/exporter"),
                 "Metal0",
-                exporter_identity=object(),
+                exporter_identity=cast(Any, object()),
                 exporter_policy=DS4_EXPORTER_POLICY,
                 expected_runtime_build=DS4_RUNTIME_BUILD,
             )
@@ -5322,7 +5325,9 @@ class TraceFormatTests(unittest.TestCase):
                     )
             primary = raised.exception.__cause__
             self.assertIsInstance(primary, preflight.PreflightError)
+            assert primary is not None
             self.assertIsInstance(primary.__cause__, UnicodeDecodeError)
+            assert isinstance(raised.exception, run_ds4.InvocationIntegrityError)
             self.assertIs(raised.exception.primary_error, primary)
             self.assertEqual(
                 [failure.component for failure in raised.exception.secondary_errors],
@@ -5336,7 +5341,7 @@ class TraceFormatTests(unittest.TestCase):
                 preflight.PreflightError, "not valid UTF-8"):
             run_ds4.query_runtime_build_attestation(
                 Path("/approved/exporter"),
-                exporter_identity=object(),
+                exporter_identity=cast(Any, object()),
                 exporter_policy=DS4_EXPORTER_POLICY,
             )
         execute.assert_called_once()
@@ -5361,7 +5366,7 @@ class TraceFormatTests(unittest.TestCase):
                 ["/approved/exporter", "--model", "/model.gguf"],
                 operation="ds4 trace execution",
                 exporter=Path("/approved/exporter"),
-                exporter_identity=object(),
+                exporter_identity=cast(Any, object()),
                 exporter_policy=DS4_EXPORTER_POLICY,
                 expected_runtime_build=DS4_RUNTIME_BUILD,
                 timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
@@ -5384,7 +5389,7 @@ class TraceFormatTests(unittest.TestCase):
             run_ds4.query_accelerator_attestation(
                 Path("/approved/exporter"),
                 "Metal0",
-                exporter_identity=object(),
+                exporter_identity=cast(Any, object()),
                 exporter_policy=DS4_EXPORTER_POLICY,
                 expected_runtime_build=DS4_RUNTIME_BUILD,
             )
@@ -5392,7 +5397,7 @@ class TraceFormatTests(unittest.TestCase):
                 run_ds4.query_accelerator_attestation(
                     Path("/approved/exporter"),
                     "Metal0",
-                    exporter_identity=object(),
+                    exporter_identity=cast(Any, object()),
                     exporter_policy=DS4_EXPORTER_POLICY,
                     expected_runtime_build=DS4_RUNTIME_BUILD,
                 )
@@ -5418,7 +5423,7 @@ class TraceFormatTests(unittest.TestCase):
                 ["/approved/exporter", "--model", "/model.gguf"],
                 operation="ds4 trace execution",
                 exporter=Path("/approved/exporter"),
-                exporter_identity=object(),
+                exporter_identity=cast(Any, object()),
                 exporter_policy=DS4_EXPORTER_POLICY,
                 expected_runtime_build=DS4_RUNTIME_BUILD,
                 timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
@@ -5428,7 +5433,9 @@ class TraceFormatTests(unittest.TestCase):
                 decode_stderr_label="ds4 trace stderr",
             )
         self.assertIsInstance(raised.exception.__cause__, preflight.PreflightError)
+        assert raised.exception.__cause__ is not None
         self.assertIsInstance(raised.exception.__cause__.__cause__, UnicodeDecodeError)
+        assert isinstance(raised.exception, run_ds4.InvocationIntegrityError)
         self.assertIs(raised.exception.primary_error, raised.exception.__cause__)
         self.assertEqual(
             [failure.component for failure in raised.exception.secondary_errors],
@@ -5475,7 +5482,7 @@ class TraceFormatTests(unittest.TestCase):
                         ["/approved/exporter", "--model", "/model.gguf"],
                         operation="ds4 trace execution",
                         exporter=Path("/approved/exporter"),
-                        exporter_identity=object(),
+                        exporter_identity=cast(Any, object()),
                         exporter_policy=DS4_EXPORTER_POLICY,
                         expected_runtime_build=DS4_RUNTIME_BUILD,
                         timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
@@ -5506,7 +5513,7 @@ class TraceFormatTests(unittest.TestCase):
                 run_ds4.query_accelerator_attestation(
                     Path("/approved/exporter"),
                     "Metal0",
-                    exporter_identity=object(),
+                    exporter_identity=cast(Any, object()),
                     exporter_policy=DS4_EXPORTER_POLICY,
                     expected_runtime_build=DS4_RUNTIME_BUILD,
                 )
@@ -5536,7 +5543,7 @@ class TraceFormatTests(unittest.TestCase):
             run_ds4.query_accelerator_attestation(
                 Path("/approved/exporter"),
                 "Metal0",
-                exporter_identity=object(),
+                exporter_identity=cast(Any, object()),
                 exporter_policy=DS4_EXPORTER_POLICY,
                 expected_runtime_build=DS4_RUNTIME_BUILD,
             )
@@ -5556,7 +5563,7 @@ class TraceFormatTests(unittest.TestCase):
             run_ds4.query_accelerator_attestation(
                 Path("/approved/exporter"),
                 "Metal0",
-                exporter_identity=object(),
+                exporter_identity=cast(Any, object()),
                 exporter_policy=DS4_EXPORTER_POLICY,
                 expected_runtime_build=DS4_RUNTIME_BUILD,
             )
@@ -5587,7 +5594,7 @@ class TraceFormatTests(unittest.TestCase):
                     ["/approved/exporter", "--dsv41-attest-device", "Metal0"],
                     operation="selected accelerator query",
                     exporter=Path("/approved/exporter"),
-                    exporter_identity=object(),
+                    exporter_identity=cast(Any, object()),
                     exporter_policy=DS4_EXPORTER_POLICY,
                     expected_runtime_build=DS4_RUNTIME_BUILD,
                     timeout_seconds=7,
@@ -5612,7 +5619,7 @@ class TraceFormatTests(unittest.TestCase):
                 ["/approved/exporter", "--model", "/model.gguf"],
                 operation="ds4 trace execution",
                 exporter=Path("/approved/exporter"),
-                exporter_identity=object(),
+                exporter_identity=cast(Any, object()),
                 exporter_policy=DS4_EXPORTER_POLICY,
                 expected_runtime_build=DS4_RUNTIME_BUILD,
                 timeout_seconds=run_ds4.EXPORTER_TRACE_TIMEOUT_SECONDS,
@@ -5631,7 +5638,7 @@ class TraceFormatTests(unittest.TestCase):
 
     def test_ds4_exporter_command_requires_bounded_timeout(self) -> None:
         completed = run_ds4.subprocess.CompletedProcess(["exporter"], 0, b"", b"")
-        identity = object()
+        identity: Any = object()
         with mock.patch.object(
                 run_ds4, "run_approved_executable", return_value=(completed, identity)) as execute:
             result = run_ds4.run_exporter_command(
@@ -5783,7 +5790,7 @@ class TraceFormatTests(unittest.TestCase):
             runner_script.write_bytes(b"runner")
             exporter.write_bytes(b"exporter")
 
-            def disk_info(path: Path) -> dict[str, object]:
+            def disk_info(path: Path) -> dict[str, Any]:
                 return {
                     "MountPoint": str(root.resolve()),
                     "FilesystemType": "apfs",
@@ -5846,7 +5853,7 @@ class TraceFormatTests(unittest.TestCase):
                     ({"DiskImage": True}, "local storage"),
                     ({"BusProtocol": "Network"}, "NVMe-backed"),
                     ({"BusProtocol": "SATA"}, "NVMe-backed")):
-                def invalid_info(path: Path, mutation: dict[str, object] = mutation) -> dict[str, object]:
+                def invalid_info(path: Path, mutation: dict[str, Any] = mutation) -> dict[str, Any]:
                     result = disk_info(path)
                     result.update(mutation)
                     return result
@@ -5919,7 +5926,7 @@ class TraceFormatTests(unittest.TestCase):
             self.assertFalse(os.access(unusable, os.W_OK | os.X_OK))
             self.assertTrue(link.is_symlink())
 
-            def strix_storage(_path: Path, label: str) -> dict[str, object]:
+            def strix_storage(_path: Path, label: str) -> dict[str, Any]:
                 if label == "temporary directory":
                     raise AssertionError("unusable TMPDIR reached storage attestation")
                 return storage_record("/home/test")
@@ -5927,7 +5934,7 @@ class TraceFormatTests(unittest.TestCase):
             def oracle_storage(
                     _path: Path,
                     label: str,
-                    **_kwargs: object) -> dict[str, object]:
+                    **_kwargs: object) -> dict[str, Any]:
                 if label == "temporary directory":
                     raise AssertionError("unusable TMPDIR reached storage attestation")
                 return metal_storage_record("/Users/oracle/test")
@@ -5998,7 +6005,7 @@ class TraceFormatTests(unittest.TestCase):
             repo.mkdir()
             valid_tmpdir = root / "good" / "tmp"
 
-            def valid_strix_storage(path: Path, _label: str) -> dict[str, object]:
+            def valid_strix_storage(path: Path, _label: str) -> dict[str, Any]:
                 return storage_record(str(path.resolve()))
 
             with mock.patch.dict(
@@ -6095,8 +6102,8 @@ class TraceFormatTests(unittest.TestCase):
                 stat(current_pid, child_pid, 3000), encoding="ascii")
 
             watchdog_command = (
-                b"python3\0" + str(script.resolve()).encode("ascii") +
-                b"\0--soft-gib\0" + b"116\0--emergency-gib\0" + b"118\0"
+                b"python3\0" + str(script.resolve()).encode("ascii")
+                + b"\0--soft-gib\0" + b"116\0--emergency-gib\0" + b"118\0"
             )
             child_command = b"python3\0run_matrix.py\0"
             (procfs / str(watchdog_pid) / "cmdline").write_bytes(watchdog_command)
@@ -6224,7 +6231,7 @@ class TraceFormatTests(unittest.TestCase):
                 calls = []
 
                 @classmethod
-                def validate_active_lease(cls, lease_path: Path, **kwargs: object) -> dict[str, object]:
+                def validate_active_lease(cls, lease_path: Path, **kwargs: object) -> dict[str, Any]:
                     cls.calls.append((lease_path, kwargs))
                     return {
                         **AUDIT_RECORDS["watchdog"]["data"],
@@ -6240,7 +6247,7 @@ class TraceFormatTests(unittest.TestCase):
             original_sha256 = preflight.WATCHDOG_SCRIPT_SHA256
             original_approved = dict(preflight.APPROVED_WATCHDOGS)
             try:
-                preflight.WATCHDOG_SCRIPT_SHA256 = preflight.sha256_bytes(script.read_bytes())
+                preflight.WATCHDOG_SCRIPT_SHA256 = preflight.sha256_bytes(script.read_bytes())  # ty: ignore[invalid-assignment] # test swaps the pinned digest, restored in finally
                 preflight.APPROVED_WATCHDOGS[preflight.WATCHDOG_SCRIPT_SHA256] = (
                     preflight.WATCHDOG_REVISION)
                 result = preflight.watchdog_audit(
@@ -6420,7 +6427,7 @@ class TraceFormatTests(unittest.TestCase):
             class TimeoutProcess(FakeProcess):
                 @staticmethod
                 def wait(timeout: float | None = None) -> int:
-                    raise subprocess.TimeoutExpired(child_command, timeout)
+                    raise subprocess.TimeoutExpired(child_command, cast(float, timeout))
 
             timeout_stream = io.StringIO()
             timeout_logger = watchdog.AuditLogger(timeout_stream, wall_clock=lambda: now)
@@ -7118,7 +7125,7 @@ class TraceFormatTests(unittest.TestCase):
             library_directory.mkdir()
             exporter = binary_directory / "llama-deepseek-v41-trace"
             exporter.write_bytes(b"exporter")
-            records = []
+            records: list[dict[str, Any]] = []
             for component, name, role, content in (
                     ("ggml", "libggml.so", "runtime:ggml", b"ggml"),
                     ("ggml-base", "libggml-base.so", "ggml", b"base"),
@@ -7156,7 +7163,7 @@ class TraceFormatTests(unittest.TestCase):
                     key=lambda item: item["component"],
                 ),
             }
-            build_manifest = {
+            build_manifest: dict[str, Any] = {
                 "revision": "a" * 40,
                 "build": {
                     "path": str(exporter.resolve()),
@@ -7578,6 +7585,7 @@ class TraceFormatTests(unittest.TestCase):
                 (procfs / str(watchdog_pid) / "exe").symlink_to(executable)
                 command = b"python3\0watchdog.py\0"
                 (procfs / str(watchdog_pid) / "cmdline").write_bytes(command)
+
                 def fake_pidfd_open(_pid: int, _flags: int) -> int:
                     retained = os.dup(descriptor)
                     (procfs / "self" / "fdinfo" / str(retained)).write_text(
@@ -7628,12 +7636,13 @@ class TraceFormatTests(unittest.TestCase):
                 os.close(descriptor)
 
     @unittest.skipUnless(
-        sys.platform == "linux" and
-        os.environ.get("DSV41_NATIVE_CONTAINMENT_HELPER") and
-        os.environ.get("DSV41_NATIVE_TRACE_BINARY"),
+        sys.platform == "linux"
+        and os.environ.get("DSV41_NATIVE_CONTAINMENT_HELPER")
+        and os.environ.get("DSV41_NATIVE_TRACE_BINARY"),
         "native Linux watchdog namespace validation was not executed on this host",
     )
     def test_native_watchdog_validation_crosses_private_pid_namespace(self) -> None:
+        assert sys.platform == "linux"
         import fcntl
 
         helper = Path(os.environ["DSV41_NATIVE_CONTAINMENT_HELPER"]).resolve(strict=True)
@@ -7852,7 +7861,7 @@ class TraceFormatTests(unittest.TestCase):
             "error": "test internal error",
         })
 
-        def assert_watchdog_final_rejected(candidate: dict[str, object], message: str) -> None:
+        def assert_watchdog_final_rejected(candidate: dict[str, Any], message: str) -> None:
             with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp) / "trace"
                 with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
@@ -7864,7 +7873,7 @@ class TraceFormatTests(unittest.TestCase):
                 with self.assertRaisesRegex(trace.TraceError, message):
                     trace.command_validate(Namespace(bundle=root))
 
-        def assert_watchdog_final_valid(candidate: dict[str, object]) -> None:
+        def assert_watchdog_final_valid(candidate: dict[str, Any]) -> None:
             with tempfile.TemporaryDirectory() as temp:
                 root = Path(temp) / "trace"
                 with trace.TraceBundleWriter(root, manifest("llama.cpp")) as writer:
@@ -8093,8 +8102,8 @@ class TraceFormatTests(unittest.TestCase):
                 "future ubatch row",
                 0,
                 [trace.RAW_ATTENTION_WIDTH, 2],
-                [trace.RAW_ATTENTION_WIDTH + 1] +
-                [trace.RAW_ATTENTION_WIDTH + 2] * (trace.RAW_ATTENTION_WIDTH * 2 - 1),
+                [trace.RAW_ATTENTION_WIDTH + 1]
+                + [trace.RAW_ATTENTION_WIDTH + 2] * (trace.RAW_ATTENTION_WIDTH * 2 - 1),
                 "invalid row",
             ),
             (
@@ -8187,7 +8196,7 @@ class TraceFormatTests(unittest.TestCase):
     def test_rejects_dirty_ds4_checkout(self) -> None:
         original = run_ds4.git_output
         try:
-            run_ds4.git_output = lambda checkout, *args: (
+            run_ds4.git_output = lambda checkout, *args: (  # ty: ignore[invalid-assignment] # test monkeypatch, restored in finally
                 trace.DS4_REVISION if args == ("rev-parse", "HEAD") else " M runtime.py")
             with self.assertRaisesRegex(preflight.PreflightError, "tracked or untracked"):
                 run_ds4.verify_checkout(Path("/tmp/ds4"))
@@ -8203,7 +8212,7 @@ class TraceFormatTests(unittest.TestCase):
             expected = trace.sha256_bytes(b"fixture")
             original = verify_ds4_anchors.git_output
             try:
-                verify_ds4_anchors.git_output = lambda checkout, *args: (
+                verify_ds4_anchors.git_output = lambda checkout, *args: (  # ty: ignore[invalid-assignment] # test monkeypatch, restored in finally
                     trace.DS4_REVISION if args == ("rev-parse", "HEAD") else "")
                 result = verify_ds4_anchors.verify(
                     checkout,

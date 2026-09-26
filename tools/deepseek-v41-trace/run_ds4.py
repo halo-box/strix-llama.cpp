@@ -117,7 +117,7 @@ def verify_checkout(checkout: Path) -> str:
 def validate_accelerator_attestation(
         record: object,
         *,
-        expected_device: str = "Metal0") -> dict[str, object]:
+        expected_device: str = "Metal0") -> dict[str, Any]:
     if not isinstance(record, dict):
         raise PreflightError("accelerator attestation is not an object")
     required_keys = {
@@ -304,7 +304,7 @@ def query_accelerator_attestation(
         *,
         exporter_identity: ExecutableFileReceipt,
         exporter_policy: dict[str, Any],
-        expected_runtime_build: dict[str, Any]) -> dict[str, object]:
+        expected_runtime_build: dict[str, Any]) -> dict[str, Any]:
     result = run_exporter_with_post_attestation(
         [str(exporter), "--dsv41-attest-device", device],
         operation="selected accelerator query",
@@ -345,11 +345,11 @@ def runner_attestation(
         exporter_approval_sha256: str,
         exporter_install_trust_sha256: str,
         exporter_runtime_build_sha256: str,
-        exporter_runtime_profile: dict[str, object],
+        exporter_runtime_profile: dict[str, Any],
         exporter_runtime_receipt_sha256: str,
         verifier_revision: str,
         checkout: Path,
-        command: list[str]) -> dict[str, object]:
+        command: list[str]) -> dict[str, Any]:
     runner_executable = resolved(Path(sys.executable))
     runner_script = resolved(Path(__file__))
     return {
@@ -382,15 +382,15 @@ def runner_attestation(
 
 def bind_oracle_attestation(
         output: Path,
-        audit: dict[str, object],
-        accelerator: dict[str, object],
+        audit: dict[str, Any],
+        accelerator: dict[str, Any],
         command: list[str],
         *,
-        exporter_policy: dict[str, object],
+        exporter_policy: dict[str, Any],
         exporter_approval_id: str,
         exporter_approval_sha256: str,
-        exporter_install_trust: dict[str, object],
-        runtime_build: dict[str, object],
+        exporter_install_trust: dict[str, Any],
+        runtime_build: dict[str, Any],
         verifier_revision: str) -> None:
     manifest_path = output / "manifest.json"
     try:
@@ -493,8 +493,8 @@ def bind_oracle_attestation(
 def preflight(
         args: argparse.Namespace,
         *,
-        accelerator: dict[str, object],
-        runner: dict[str, object]) -> dict[str, object]:
+        accelerator: dict[str, Any],
+        runner: dict[str, Any]) -> dict[str, Any]:
     checkout = resolved(args.checkout)
     revision = verify_checkout(checkout)
     if revision != DS4_REVISION:

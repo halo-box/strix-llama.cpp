@@ -22,7 +22,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator, cast
 
 TRACE_FORMAT = "dsv41-trace"
 TRACE_VERSION = 2
@@ -213,7 +213,7 @@ class TraceVerifier:
     expected_lane: str
     expected_challenge: str
     expected_run_id: str
-    verification_unix: int
+    verification_unix: int | None
     candidate_exporter_policies: dict[str, dict[str, Any]]
     ds4_exporter_policies: dict[str, dict[str, Any]]
     prompt_builder_policies: dict[str, dict[str, Any]]
@@ -672,13 +672,13 @@ def verify_approved_runtime_file_identities(
 
 
 def _windows_error(message: str) -> TraceError:
-    return TraceError(f"{message}: Windows error {ctypes.get_last_error()}")
+    return TraceError(f"{message}: Windows error {ctypes.get_last_error()}")  # ty: ignore[unresolved-attribute] # Windows-only ctypes API
 
 
 def _windows_kernel32() -> Any:
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # ty: ignore[unresolved-attribute] # Windows-only ctypes API
     kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
     kernel32.CreateJobObjectW.restype = wintypes.HANDLE
     kernel32.SetInformationJobObject.argtypes = [
@@ -838,7 +838,7 @@ def _start_windows_job_process(command: list[str], launch: dict[str, Any]) -> _P
     try:
         job = _create_windows_kill_job()
         kernel32 = _windows_kernel32()
-        process_handle = int(process._handle)
+        process_handle = int(process._handle)  # ty: ignore[unresolved-attribute] # CPython Windows Popen handle, not in typeshed
         if not kernel32.AssignProcessToJobObject(job, process_handle):
             raise _windows_error("cannot assign suspended process to containment job")
         job_assigned = True
@@ -905,7 +905,7 @@ def _start_windows_job_process(command: list[str], launch: dict[str, Any]) -> _P
 
 
 @contextmanager
-def _test_only_process_group_containment() -> Iterable[None]:
+def _test_only_process_group_containment() -> Iterator[None]:
     previous = getattr(_TEST_PROCESS_GROUP_CONTAINMENT, "enabled", False)
     _TEST_PROCESS_GROUP_CONTAINMENT.enabled = True
     try:
@@ -946,7 +946,7 @@ class _LinuxNativeHelperProcess:
     def _receive_protocol(self, expected: bytes, *, receive_pidfd: bool = False) -> None:
         item_size = array.array("i").itemsize
         requested_flags = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
-        data, ancillary, flags, _address = self._protocol_socket.recvmsg(
+        data, ancillary, flags, _address = cast(socket.socket, self._protocol_socket).recvmsg(
             128,
             socket.CMSG_SPACE(item_size * LINUX_PROTOCOL_MAX_RECEIVED_DESCRIPTORS),
             requested_flags,
@@ -1026,19 +1026,19 @@ class _LinuxNativeHelperProcess:
 
     def release_exec(self) -> None:
         self._receive_protocol(b"READY")
-        self._protocol_socket.sendall(b"PREPARE")
+        cast(socket.socket, self._protocol_socket).sendall(b"PREPARE")
         self._receive_protocol(b"PREPARED", receive_pidfd=True)
-        self._protocol_socket.sendall(b"EXEC")
+        cast(socket.socket, self._protocol_socket).sendall(b"EXEC")
         self._receive_protocol(b"RELEASED")
 
     def abort_blocked(self) -> _ContainmentCleanup:
         failures = []
         try:
-            self._protocol_socket.shutdown(socket.SHUT_RDWR)
+            cast(socket.socket, self._protocol_socket).shutdown(socket.SHUT_RDWR)
         except BaseException as error:
             failures.append(_IntegrityFailure("linux-helper-protocol-shutdown", error))
             try:
-                self._protocol_socket.close()
+                cast(socket.socket, self._protocol_socket).close()
             except BaseException as close_error:
                 failures.append(_IntegrityFailure(
                     "linux-process-fd-close:protocol", close_error))
@@ -1129,9 +1129,9 @@ class _LinuxNativeHelperProcess:
         deadline = None if timeout is None else time.monotonic() + timeout
         while self.poll() is None:
             if deadline is not None and time.monotonic() >= deadline:
-                raise subprocess.TimeoutExpired(self.args, timeout)
+                raise subprocess.TimeoutExpired(self.args, cast(float, timeout))
             time.sleep(0.01)
-        return int(self.returncode)
+        return int(cast(int, self.returncode))
 
     def kill(self) -> None:
         if self.poll() is None:
@@ -1172,7 +1172,7 @@ class _LinuxNativeHelperProcess:
                     if remaining <= 0:
                         raise subprocess.TimeoutExpired(
                             self.args,
-                            timeout,
+                            cast(float, timeout),
                             output=bytes(output) if self._stdout_fd is not None else None,
                             stderr=bytes(errors) if self._stderr_fd is not None else None,
                         )
@@ -1604,7 +1604,7 @@ def _windows_job_active_processes(job_handle: int) -> int:
     return int(accounting.ActiveProcesses)
 
 
-def _close_windows_process_handle(process: subprocess.Popen[bytes]) -> None:
+def _close_windows_process_handle(process: subprocess.Popen[Any]) -> None:
     process_handle = getattr(process, "_handle", None)
     if process_handle is None:
         return
@@ -1612,7 +1612,7 @@ def _close_windows_process_handle(process: subprocess.Popen[bytes]) -> None:
     if not callable(close):
         raise TraceError("subprocess process handle does not expose owned Close()")
     close()
-    process._handle = None
+    process._handle = None  # ty: ignore[unresolved-attribute] # CPython Windows Popen handle, not in typeshed
 
 
 def _process_tree_is_quiescent(containment: _ProcessContainment) -> bool:
@@ -3146,7 +3146,7 @@ def validate_execution_authorization(
         expected_lane: str,
         expected_challenge: str,
         expected_run_id: str,
-        verification_unix: int,
+        verification_unix: int | None,
         candidate_exporter_policies: dict[str, dict[str, Any]],
         ds4_exporter_policies: dict[str, dict[str, Any]],
         prompt_builder_policies: dict[str, dict[str, Any]],
@@ -4511,13 +4511,13 @@ class TraceBundle:
             if expected_lane == ORACLE_LANE and expected_ds4_exporter_policy_id is None:
                 raise TraceError("external ds4 exporter approval is required")
             verifier = TraceVerifier.production(
-                signer_principal,
-                expected_lane=expected_lane,
-                expected_challenge=expected_challenge,
-                expected_run_id=expected_run_id,
+                cast(str, signer_principal),
+                expected_lane=cast(str, expected_lane),
+                expected_challenge=cast(str, expected_challenge),
+                expected_run_id=cast(str, expected_run_id),
                 expected_candidate_exporter_policy_id=expected_candidate_exporter_policy_id,
                 expected_ds4_exporter_policy_id=expected_ds4_exporter_policy_id,
-                expected_prompt_builder_policy_id=expected_prompt_builder_policy_id,
+                expected_prompt_builder_policy_id=cast(str, expected_prompt_builder_policy_id),
                 verification_unix=verification_unix,
                 seen_run_ids=seen_run_ids,
             )
@@ -6215,10 +6215,10 @@ def command_compare(args: argparse.Namespace) -> int:
         left_bundle = TraceBundle(
             args.left,
             verifier=TraceVerifier.production(
-                left_principal,
+                cast(str, left_principal),
                 expected_lane=ORACLE_LANE,
-                expected_challenge=challenge,
-                expected_run_id=left_run_id,
+                expected_challenge=cast(str, challenge),
+                expected_run_id=cast(str, left_run_id),
                 expected_candidate_exporter_policy_id=None,
                 expected_ds4_exporter_policy_id=args.left_ds4_exporter_policy_id,
                 expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
@@ -6230,10 +6230,10 @@ def command_compare(args: argparse.Namespace) -> int:
         right_bundle = TraceBundle(
             args.right,
             verifier=TraceVerifier.production(
-                right_principal,
+                cast(str, right_principal),
                 expected_lane=CANDIDATE_LANE,
-                expected_challenge=challenge,
-                expected_run_id=right_run_id,
+                expected_challenge=cast(str, challenge),
+                expected_run_id=cast(str, right_run_id),
                 expected_candidate_exporter_policy_id=args.right_candidate_exporter_policy_id,
                 expected_ds4_exporter_policy_id=None,
                 expected_prompt_builder_policy_id=args.prompt_builder_policy_id,
@@ -6346,10 +6346,10 @@ def command_compare_local(args: argparse.Namespace) -> int:
         left_bundle = TraceBundle(
             args.left,
             verifier=TraceVerifier.production(
-                left_principal,
+                cast(str, left_principal),
                 expected_lane=CANDIDATE_LANE,
-                expected_challenge=challenge,
-                expected_run_id=left_run_id,
+                expected_challenge=cast(str, challenge),
+                expected_run_id=cast(str, left_run_id),
                 expected_candidate_exporter_policy_id=args.left_candidate_exporter_policy_id,
                 expected_ds4_exporter_policy_id=None,
                 expected_prompt_builder_policy_id=args.left_prompt_builder_policy_id,
@@ -6361,10 +6361,10 @@ def command_compare_local(args: argparse.Namespace) -> int:
         right_bundle = TraceBundle(
             args.right,
             verifier=TraceVerifier.production(
-                right_principal,
+                cast(str, right_principal),
                 expected_lane=CANDIDATE_LANE,
-                expected_challenge=challenge,
-                expected_run_id=right_run_id,
+                expected_challenge=cast(str, challenge),
+                expected_run_id=cast(str, right_run_id),
                 expected_candidate_exporter_policy_id=args.right_candidate_exporter_policy_id,
                 expected_ds4_exporter_policy_id=None,
                 expected_prompt_builder_policy_id=args.right_prompt_builder_policy_id,

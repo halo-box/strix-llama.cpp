@@ -13,7 +13,8 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from types import ModuleType
+from typing import Any, Callable, cast
 
 from trace_format import (
     NO_EXTERNAL_STATE_STORAGE,
@@ -48,8 +49,8 @@ class PreflightError(RuntimeError):
     pass
 
 
-def strict_json_loads(data: str) -> object:
-    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+def strict_json_loads(data: str) -> Any:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, Any]:
         result = {}
         for key, value in pairs:
             if key in result:
@@ -133,7 +134,7 @@ def storage_attestation(
         mountinfo_path: Path = Path("/proc/self/mountinfo"),
         sys_dev_block_root: Path = Path("/sys/dev/block"),
         sys_class_block_root: Path = Path("/sys/class/block"),
-        forbidden_root: Path = FORBIDDEN_ROOT) -> dict[str, object]:
+        forbidden_root: Path = FORBIDDEN_ROOT) -> dict[str, Any]:
     lexical_path = reject_forbidden_path(path, label, forbidden_root)
     path = resolved(lexical_path)
     try:
@@ -243,7 +244,7 @@ def require_nvme_path(
     return _attested_resolved_path(attestation, label)
 
 
-def _diskutil_info(path: Path) -> dict[str, object]:
+def _diskutil_info(path: Path) -> dict[str, Any]:
     try:
         df = subprocess.check_output(
             ["df", "-P", str(path)],
@@ -273,8 +274,8 @@ def darwin_storage_attestation(
         path: Path,
         label: str,
         *,
-        disk_info: Callable[[Path], dict[str, object]] = _diskutil_info,
-        forbidden_root: Path = FORBIDDEN_ROOT) -> dict[str, object]:
+        disk_info: Callable[[Path], dict[str, Any]] = _diskutil_info,
+        forbidden_root: Path = FORBIDDEN_ROOT) -> dict[str, Any]:
     lexical_path = reject_forbidden_path(path, label, forbidden_root)
     path = resolved(lexical_path)
     try:
@@ -304,7 +305,7 @@ def darwin_storage_attestation(
             raise PreflightError(f"{label} {name} cannot be resolved: {path}")
     if not mount_point.startswith("/"):
         raise PreflightError(f"{label} mount point is invalid: {mount_point}")
-    if bus_protocol.lower() not in {"nvme", "apple fabric"}:
+    if cast(str, bus_protocol).lower() not in {"nvme", "apple fabric"}:
         raise PreflightError(f"{label} storage is not NVMe-backed: {bus_protocol}")
     try:
         filesystem_device = os.stat(existing).st_dev
@@ -332,7 +333,7 @@ def darwin_storage_attestation(
     }
 
 
-def _attested_resolved_path(attestation: dict[str, object], label: str) -> Path:
+def _attested_resolved_path(attestation: dict[str, Any], label: str) -> Path:
     resolved_path = attestation["resolved_path"]
     if not isinstance(resolved_path, str):
         raise PreflightError(f"{label} resolved path evidence is invalid")
@@ -366,7 +367,7 @@ def read_proc_lines(path: Path) -> list[str]:
         raise PreflightError(f"cannot read {path}: {error}") from error
 
 
-def swap_audit() -> dict[str, object]:
+def swap_audit() -> dict[str, Any]:
     lines = read_proc_lines(Path("/proc/swaps"))
     entries = []
     for line in lines[1:]:
@@ -414,7 +415,7 @@ def darwin_host_and_memory_audit(
         *,
         command_text: Callable[..., str] = _command_text,
         system: str | None = None,
-        machine: str | None = None) -> tuple[dict[str, object], dict[str, int]]:
+        machine: str | None = None) -> tuple[dict[str, Any], dict[str, int]]:
     platform_name = platform.system() if system is None else system
     machine_name = platform.machine() if machine is None else machine
     if platform_name != "Darwin" or machine_name != "arm64":
@@ -463,7 +464,7 @@ def darwin_host_and_memory_audit(
 
 def darwin_swap_audit(
         *,
-        command_text: Callable[..., str] = _command_text) -> dict[str, object]:
+        command_text: Callable[..., str] = _command_text) -> dict[str, Any]:
     value = command_text("sysctl", "-n", "vm.swapusage")
     match = re.fullmatch(
         r"total = ([0-9]+(?:\.[0-9]+)?)M\s+used = ([0-9]+(?:\.[0-9]+)?)M\s+"
@@ -531,11 +532,11 @@ def is_descendant(pid: int, ancestor_pid: int, procfs_root: Path) -> bool:
 
 
 def open_watchdog_namespace_authority(
-        watchdog: dict[str, object],
+        watchdog: dict[str, Any],
         *,
         procfs_root: Path = Path("/proc"),
         pidfd_open: Callable[[int, int], int] | None = None,
-) -> tuple[int, dict[str, object]]:
+) -> tuple[int, dict[str, Any]]:
     if sys.platform != "linux":
         raise PreflightError("watchdog namespace authority requires Linux pidfds")
     opener = pidfd_open or getattr(os, "pidfd_open", None)
@@ -608,7 +609,7 @@ def open_watchdog_namespace_authority(
 
 def verify_watchdog_namespace_authority(
         descriptor: int,
-        authority: dict[str, object],
+        authority: dict[str, Any],
         *,
         procfs_root: Path = Path("/proc"),
 ) -> None:
@@ -682,7 +683,7 @@ def _read_json_with_retry(
         *,
         timeout_seconds: float,
         monotonic: Callable[[], float],
-        sleeper: Callable[[float], None]) -> dict[str, object]:
+        sleeper: Callable[[float], None]) -> dict[str, Any]:
     deadline = monotonic() + timeout_seconds
     last_error: Exception | None = None
     while True:
@@ -698,7 +699,7 @@ def _read_json_with_retry(
             sleeper(0.05)
 
 
-def _read_watchdog_events(path: Path) -> list[dict[str, object]]:
+def _read_watchdog_events(path: Path) -> list[dict[str, Any]]:
     try:
         lines = path.read_text(encoding="ascii").splitlines()
     except OSError as error:
@@ -720,7 +721,7 @@ def _read_watchdog_startup_events(
         *,
         timeout_seconds: float,
         monotonic: Callable[[], float],
-        sleeper: Callable[[float], None]) -> list[dict[str, object]]:
+        sleeper: Callable[[float], None]) -> list[dict[str, Any]]:
     deadline = monotonic() + timeout_seconds
     last_error: Exception | None = None
     while True:
@@ -738,7 +739,7 @@ def _read_watchdog_startup_events(
         sleeper(0.05)
 
 
-def _load_watchdog_module(script: Path) -> object:
+def _load_watchdog_module(script: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location("dsv41_strix_memory_watchdog", script)
     if spec is None or spec.loader is None:
         raise PreflightError(f"cannot load canonical watchdog module: {script}")
@@ -752,14 +753,14 @@ def _load_watchdog_module(script: Path) -> object:
 
 
 def _watchdog_audit_result(
-        lease: dict[str, object],
+        lease: dict[str, Any],
         *,
         watchdog_revision: str,
         lease_path: Path,
         heartbeat_path: Path,
         audit_path: Path,
         audit_event_count: int,
-        procfs_root: Path = Path("/proc")) -> dict[str, object]:
+        procfs_root: Path = Path("/proc")) -> dict[str, Any]:
     try:
         heartbeat_record = strict_json_loads(heartbeat_path.read_text(encoding="ascii"))
         updated = datetime.fromisoformat(str(heartbeat_record["updated_at"]).replace("Z", "+00:00"))
@@ -802,7 +803,7 @@ def _canonical_watchdog_audit(
         timeout_seconds: float,
         monotonic: Callable[[], float],
         sleeper: Callable[[float], None],
-        watchdog_module: object | None) -> dict[str, object]:
+        watchdog_module: object | None) -> dict[str, Any]:
     global _WATCHDOG_GUARD
     try:
         lease_path = require_nvme_path(Path(environment[WATCHDOG_LEASE_ENV]), "watchdog lease")
@@ -885,7 +886,7 @@ def watchdog_audit(
         timeout_seconds: float = WATCHDOG_STARTUP_TIMEOUT_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
-        watchdog_module: object | None = None) -> dict[str, object]:
+        watchdog_module: object | None = None) -> dict[str, Any]:
     if watchdog_module is not None or (
             procfs_root == Path("/proc") and current_pid is None and current_pgid is None):
         return _canonical_watchdog_audit(
@@ -1082,7 +1083,7 @@ def matching_workloads(
         patterns: list[str],
         *,
         procfs_root: Path = Path("/proc"),
-        current_pid: int | None = None) -> list[dict[str, object]]:
+        current_pid: int | None = None) -> list[dict[str, Any]]:
     matches = []
     excluded = process_ancestry(os.getpid() if current_pid is None else current_pid, procfs_root)
     lowered = [pattern.lower() for pattern in patterns if pattern]
@@ -1106,7 +1107,7 @@ def darwin_matching_workloads(
         patterns: list[str],
         *,
         command_text: Callable[..., str] = _command_text,
-        current_pid: int | None = None) -> list[dict[str, object]]:
+        current_pid: int | None = None) -> list[dict[str, Any]]:
     pid_to_parent = {}
     pid_to_command = {}
     for line in command_text("ps", "-axo", "pid=,ppid=,command=").splitlines():
@@ -1140,7 +1141,7 @@ def run_strix_preflight(
         output: Path,
         repo: Path,
         busy_patterns: list[str],
-) -> dict[str, object]:
+) -> dict[str, Any]:
     model_storage = storage_attestation(model, "model")
     prompt_storage = storage_attestation(prompt, "prompt")
     output_storage = storage_attestation(output, "trace output")
@@ -1199,12 +1200,12 @@ def run_oracle_preflight(
         repo: Path,
         checkout: Path,
         busy_patterns: list[str],
-        accelerator: dict[str, object],
-        runner: dict[str, object],
-        disk_info: Callable[[Path], dict[str, object]] = _diskutil_info,
+        accelerator: dict[str, Any],
+        runner: dict[str, Any],
+        disk_info: Callable[[Path], dict[str, Any]] = _diskutil_info,
         command_text: Callable[..., str] = _command_text,
         system: str | None = None,
-        machine: str | None = None) -> dict[str, object]:
+        machine: str | None = None) -> dict[str, Any]:
     model_storage = darwin_storage_attestation(model, "model", disk_info=disk_info)
     prompt_storage = darwin_storage_attestation(prompt, "prompt", disk_info=disk_info)
     output_storage = darwin_storage_attestation(output, "trace output", disk_info=disk_info)
@@ -1292,7 +1293,7 @@ def run_oracle_preflight(
     }
 
 
-def write_audits(root: Path, audit: dict[str, object]) -> dict[str, str]:
+def write_audits(root: Path, audit: dict[str, Any]) -> dict[str, str]:
     root = resolved(root)
     if root.exists() and any(root.iterdir()):
         raise PreflightError(f"audit directory is not empty: {root}")
@@ -1385,7 +1386,7 @@ def verify_sealed_audits(audits: dict[str, str], digests: dict[str, str]) -> Non
         raise PreflightError("preflight audit evidence changed during runtime execution")
 
 
-def embed_audits(trace_root: Path, phase: str, audits: dict[str, str]) -> dict[str, dict[str, object]]:
+def embed_audits(trace_root: Path, phase: str, audits: dict[str, str]) -> dict[str, dict[str, Any]]:
     trace_root = safe_trace_path(trace_root, ".")
     embedded_root = safe_trace_path(trace_root, Path("audits") / phase)
     embedded_root.mkdir(parents=True, exist_ok=True)
@@ -1468,10 +1469,10 @@ def validate_prompt_provenance(
     context: int,
     decode_steps: int,
     builder_approval_id: str,
-    builder_policy: dict[str, object],
+    builder_policy: dict[str, Any],
     builder_policy_sha256: str,
     path_resolver: Callable[[Path, str], Path] | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     path = (require_nvme_path if path_resolver is None else path_resolver)(path, "prompt provenance")
     try:
         data = path.read_bytes()
@@ -1556,7 +1557,7 @@ def validate_prompt_provenance(
     return {"path": str(path), "bytes": data, "record": record}
 
 
-def bind_prompt_provenance(trace_root: Path, provenance: dict[str, object]) -> None:
+def bind_prompt_provenance(trace_root: Path, provenance: dict[str, Any]) -> None:
     trace_root = safe_trace_path(trace_root, ".")
     manifest_path = safe_trace_path(trace_root, "manifest.json")
     try:
