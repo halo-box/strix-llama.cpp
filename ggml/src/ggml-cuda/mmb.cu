@@ -921,8 +921,12 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (src0->type == GGML_TYPE_F32) {
         const float * W = (const float *) src0->data, * X = (const float *) src1->data; float * D = (float *) dst->data;
         // MMB_F32_TILE narrows the M>64 F32 GEMM (e.g. the M=512 MoE router) for more blocks per ubatch chunk.
-        // default 5 = 32x64 (-0.5% GPU time at pp4096 on gfx1151, same output); 0 keeps master's 128x128 tile. Valid geometries satisfy (8/WAVES_M)*WTN == BN (the kernel's static_assert).
-        static const int FT = getenv("MMB_F32_TILE") ? atoi(getenv("MMB_F32_TILE")) : 5;
+        // 0 keeps master's 128x128 tile. Valid geometries satisfy (8/WAVES_M)*WTN == BN (the kernel's static_assert).
+        // Default: 5 (32x64) for M <= 1024 (the M=512 router: 87 -> 77 ms per pp4096 on gfx1151, about -0.4% GPU time),
+        // 128x128 above, where the narrow tile would reload the activations ~3x more per output. Every geometry keeps the
+        // per-output K order, so the output is the same.
+        static const int FT_env = getenv("MMB_F32_TILE") ? atoi(getenv("MMB_F32_TILE")) : -1;
+        const int FT = FT_env >= 0 ? FT_env : (M <= 1024 ? 5 : 0);
         // MMB_F32_SMALL: M <= 64 (ssm_alpha / ssm_beta [2560 -> 48]) launches only T/128 blocks at 64x128 (32 at 4096 tokens
         // on 40 CUs); narrower token tiles give 2-4x the blocks with the same per-output K order (bit-identical)
         static const int FS = getenv("MMB_F32_SMALL") ? atoi(getenv("MMB_F32_SMALL")) : 2;
