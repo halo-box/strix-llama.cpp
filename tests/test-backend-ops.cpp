@@ -5080,6 +5080,12 @@ struct test_gated_delta_net : public test_case {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
+    // the chunked prefill path (RDNA3.5: S_v = 128, >= 256 tokens, one sequence, final state only) runs its matrix
+    // products on fp16 WMMA operands (NMSE ~2e-7 vs the fp32 reference) instead of the exact fp32 recurrence
+    double max_nmse_err() override {
+        return (head_size == 128 && n_seq_tokens >= 256 && n_seqs == 1 && !kda && K == 1) ? 1e-6 : 1e-7;
+    }
+
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
@@ -5906,6 +5912,52 @@ struct test_swiglu_iq3_mmvq : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, 512);
+    }
+};
+
+// Qwen3.8-Flash-Next prefill MoE (512 experts, top-10) with a skewed routing that reproduces the measured
+// tokens-per-expert histogram of a 4096-token ubatch. glu: IQ3_S gate/up + swiglu; !glu: IQ4_NL down.
+struct test_moe_prefill : public test_case {
+    const bool glu; const int64_t n;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_PREFILL"; }
+    std::string vars() override { return VARS_TO_STR2(glu, n); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2560 * 640 * 10 * n * (glu ? 2 : 1); }
+    test_moe_prefill(bool glu, int64_t n) : glu(glu), n(n) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 512, n);
+        ggml_set_name(ids_all, "ids");
+        ggml_tensor * ids = ggml_view_2d(ctx, ids_all, 10, n, ids_all->nb[1], 0);
+        if (glu) {
+            ggml_tensor * gw = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_S, 2560, 640, 512);
+            ggml_tensor * uw = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_S, 2560, 640, 512);
+            ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2560, 1, n);
+            return ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gw, x, ids), ggml_mul_mat_id(ctx, uw, x, ids));
+        }
+        ggml_tensor * dw = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ4_NL, 640, 2560, 512);
+        ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 640, 10, n);
+        return ggml_mul_mat_id(ctx, dw, x, ids);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) continue;
+            if (t->type != GGML_TYPE_I32) { init_tensor_uniform(t); continue; }
+            // counts per expert from the histogram {0:105, 1-15:134, 16-31:61, 32-63:72, 64-127:69, 128-255:39, 256-511:18, >=512:14}
+            const int bins[8][3] = {{0,0,105},{1,15,134},{16,31,61},{32,63,72},{64,127,69},{128,255,39},{256,511,18},{512,1480,14}};
+            std::vector<int> cnt;
+            for (auto & b : bins) for (int i = 0; i < b[2]; ++i) cnt.push_back(b[0] + (b[2] > 1 ? (b[1] - b[0]) * i / (b[2] - 1) : 0));
+            const int64_t total = 10 * n; int64_t sum = 0; for (int c : cnt) sum += c;
+            // scale to 10*n rows, then fix the rounding on the largest expert
+            for (int & c : cnt) c = (int) ((int64_t) c * total / sum);
+            sum = 0; for (int c : cnt) sum += c; cnt[511] += (int) (total - sum);
+            GGML_ASSERT(cnt[511] <= n);
+            std::vector<int> perm(512); for (int i = 0; i < 512; ++i) perm[i] = (i * 197) % 512;   // spread hot experts
+            std::vector<int> slots; for (int e = 0; e < 512; ++e) for (int i = 0; i < cnt[e]; ++i) slots.push_back(perm[e]);
+            std::vector<int32_t> data(512 * n, 0);
+            for (int64_t tok = 0; tok < n; ++tok) for (int j = 0; j < 10; ++j) data[tok * 512 + j] = slots[tok + j * n];
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+        }
     }
 };
 
@@ -11903,6 +11955,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, false, 512, 129, 256, 2));
+    test_cases.emplace_back(new test_moe_prefill(true, 512));
+    test_cases.emplace_back(new test_moe_prefill(false, 512));
     test_cases.emplace_back(new test_mul_mat_pair());
 
     // gpt-oss issue with Vulkan mmq_id
@@ -12810,6 +12864,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n_tokens : {15, 16, 17, 64, 65, 2048}) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 1, false, true));
     }
+    // chunked prefill path (RDNA3.5): qwen3.8-style 16 k-heads x 3 = 48 v-heads
+    for (int n_tokens : {256, 300, 4096}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3));
+    }
     // Multiple sequences must remain on the generic fallback.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));
@@ -12991,6 +13049,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    if (getenv("GGML_PERF_MOE")) {
+        test_cases.emplace_back(new test_moe_prefill(true, 4096));
+        test_cases.emplace_back(new test_moe_prefill(false, 4096));
+        return test_cases;
+    }
 
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
