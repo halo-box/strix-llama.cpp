@@ -8965,13 +8965,13 @@ struct test_qsa_prefill : public test_case {
 
 struct test_qsa_decode : public test_qsa_prefill {
     const bool duplicates;
-    test_qsa_decode(int q, int keys, int selected, bool poison=false, int ratio=12, bool duplicates=false)
-        : test_qsa_prefill(q,keys,selected,true,poison,1,ratio), duplicates(duplicates) {}
+    test_qsa_decode(int q, int keys, int selected, bool poison=false, int ratio=12, bool duplicates=false, bool interleaved=true)
+        : test_qsa_prefill(q,keys,selected,interleaved,poison,1,ratio), duplicates(duplicates) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_DECODE"; }
     std::string vars() override { return test_qsa_prefill::vars()+",duplicates="+std::to_string(duplicates); }
     double err(const float * actual, const float * cpu, size_t n) override {
         const double agreement=nmse(actual,cpu,n);
-        if (queries>8 || selected>2560) return agreement;
+        if (queries>512 || selected>2560) return agreement;   // 512 = QSA_DECODE_MAX_QUERIES (ggml-cuda/qsa-decode.cuh)
         const auto qv=tensor_to_float(q), kv=tensor_to_float(k), vv=tensor_to_float(v), mv=tensor_to_float(mask);
         std::vector<float> reference(n);
         for (int query=0;query<queries;++query) {
@@ -9016,15 +9016,15 @@ struct test_qsa_decode : public test_qsa_prefill {
 // complete-block selection graph does. Both the backend and the CPU result are checked against a host FP64 oracle
 // over the listed cells.
 struct test_qsa_prefill_maskless : public test_qsa_prefill {
-    test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12)
-        : test_qsa_prefill(queries,keys,selected,true,false,1,ratio) {}
+    test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true)
+        : test_qsa_prefill(queries,keys,selected,interleaved,false,1,ratio) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL_MASKLESS"; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
         q = ggml_permute(ctx,q,0,2,1,3);
-        k = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,2,keys,streams);
-        v = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,2,keys,streams);
-        k=ggml_permute(ctx,k,0,2,1,3); v=ggml_permute(ctx,v,0,2,1,3);
+        k = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        v = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        if (interleaved) { k=ggml_permute(ctx,k,0,2,1,3); v=ggml_permute(ctx,v,0,2,1,3); }
         mask = nullptr;
         ids = ggml_new_tensor_4d(ctx,GGML_TYPE_I32,selected,queries,1,streams);
         auto * out = ggml_flash_attn_ext(ctx,q,k,v,nullptr,1.0f/sqrtf(dim),0.0f,0.0f);
@@ -9078,6 +9078,11 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
         fprintf(stderr,"QSA_MASKLESS_FP64 q=%d keys=%d selected=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,gpu_error,cpu_error);
         return std::max(gpu_error,cpu_error);
     }
+};
+struct test_qsa_decode_maskless : public test_qsa_prefill_maskless {
+    test_qsa_decode_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true)
+        : test_qsa_prefill_maskless(queries,keys,selected,ratio,interleaved) {}
+    std::string op_desc(ggml_tensor *) override { return "QSA_DECODE_MASKLESS"; }
 };
 
 // Complete-block selection as qwen4exp_select_complete_blocks builds it (512-block budget, ratio 4): the HIP
@@ -12873,14 +12878,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int q : {1,2,4,8,9}) {
         for (int k : {1,17,64,65,128,129,2051,2560,2561}) test_cases.emplace_back(new test_qsa_decode(q,4096,k));
     }
-    for (int q : {1,4,8}) {
-        test_cases.emplace_back(new test_qsa_decode(q,40064,2051));
+    for (int q : {16,64,127,128,512}) {
+        for (int k : {17,2051,2560,2561}) test_cases.emplace_back(new test_qsa_decode(q,4096,k));
+    }
+    for (int q : {1,4,8,16,127}) {
+        if (q <= 16) test_cases.emplace_back(new test_qsa_decode(q,40064,2051));
         test_cases.emplace_back(new test_qsa_decode(q,4096,257,true));
         test_cases.emplace_back(new test_qsa_decode(q,4096,257,false,4));
         test_cases.emplace_back(new test_qsa_decode(q,4096,2051,false,12,true));
         test_cases.emplace_back(new test_qsa_decode(q,4096,257,true,4));
     }
 
+    // QSA_PREFILL cases with <= 512 queries run on qsa_decode (fattn tries it first); qsa_prefill itself is covered by
+    // the > 512 cases below and by the multi-stream case (which qsa_decode rejects)
     for (bool interleaved : {false,true}) {
         test_cases.emplace_back(new test_qsa_prefill(128,512,17,interleaved));
         test_cases.emplace_back(new test_qsa_prefill(129,4096,257,interleaved));
@@ -12891,7 +12901,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_prefill_maskless(128,512,17));
     test_cases.emplace_back(new test_qsa_prefill_maskless(129,4096,257));
     test_cases.emplace_back(new test_qsa_prefill_maskless(130,4096,2051));
-    for (int n_blocks : {512, 700, 2048}) for (int n_query : {1, 3, 130}) test_cases.emplace_back(new test_qsa_expand(n_blocks, n_query));
+    for (int q : {1,8,9,16,64,127,128,256,512}) for (int k : {257,2051}) test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,k));
+    for (int q : {1,9,64,512}) test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,257,4));   // SIMT kernel (GQA 4)
+    for (int q : {9,64,127}) {                                                                          // K/V not interleaved
+        test_cases.emplace_back(new test_qsa_decode(q,4096,2051,false,12,false,false));
+        test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,2051,12,false));
+    }
+    // qsa_prefill takes more than 512 queries (the decode kernel takes the rest)
+    for (bool interleaved : {false,true}) {
+        test_cases.emplace_back(new test_qsa_prefill(513,4096,257,interleaved));
+        test_cases.emplace_back(new test_qsa_prefill(640,40064,2051,interleaved));
+    }
+    test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(640,4096,257));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051,12,false));
+    test_cases.emplace_back(new test_qsa_prefill(513,4096,2560));
+    test_cases.emplace_back(new test_qsa_prefill(513,4096,2561));
+    test_cases.emplace_back(new test_qsa_prefill(513,512,17,true,true));
+    test_cases.emplace_back(new test_qsa_prefill(640,4096,257,true,true));
+    for (int n_blocks : {512, 700, 2048}) for (int n_query : {1, 3, 9, 64, 127, 130}) test_cases.emplace_back(new test_qsa_expand(n_blocks, n_query));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,2));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,4));
     test_cases.emplace_back(new test_qsa_prefill(128,4096,128,true,false,1,12,128));
