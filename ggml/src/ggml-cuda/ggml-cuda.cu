@@ -6743,6 +6743,32 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 inputs[0] = pm.x; inputs[1] = pm.state; out = pm.out;
             } else if (ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
                 inputs[0] = gm.x; inputs[1] = gm.state; out = gm.out;
+
+                // The chunked GDN can elide the conv/SiLU and read x, history and taps at the GDN node instead.
+                // Keeping them only through the SiLU allows the scheduler to reuse x (and corrupt q/k/v) before
+                // gdn_chunk_prep_kernel reads it. Restrict the longer lifetime to the fused prefill pattern.
+                if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                        getenv("GGML_CUDA_DISABLE_GDN_CONV") == nullptr &&
+                        getenv("GGML_CUDA_DISABLE_GDN_QKNORM") == nullptr) {
+                    int i_rms = -1;
+                    for (int j = gm.conv_idx + 2; j < cgraph->n_nodes && j <= gm.conv_idx + 24; ++j) {
+                        const ggml_tensor * t = cgraph->nodes[j];
+                        if (t->op == GGML_OP_RMS_NORM && t->src[0] && t->src[0]->view_src == gm.out) {
+                            i_rms = j;
+                            break;
+                        }
+                    }
+                    int ig = -1;
+                    const ggml_tensor * q_raw = nullptr, * k_raw = nullptr;
+                    float eps = 0.0f, mul = 1.0f;
+                    if (i_rms >= 0 && ggml_cuda_gdn_qk_norm_match(cgraph, i_rms, ig, q_raw, k_raw, eps, mul) > 0 &&
+                            ig >= 0 && cgraph->nodes[ig]->src[2] && cgraph->nodes[ig]->src[2]->view_src == gm.out) {
+                        for (const ggml_tensor * input : {gm.x, gm.state, gm.w}) {
+                            auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
+                            params->add_alloc_dep(params->user_data, root, cgraph->nodes[ig]);
+                        }
+                    }
+                }
             }
             for (const ggml_tensor * input : inputs) {
                 if (input) {

@@ -5139,6 +5139,70 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// The chunked GDN can calculate q/k/v convolution at the GDN node, after the normal conv/SiLU nodes.
+// The activation x is produced by a preceding op and must remain allocated until that later read.
+struct test_gdn_conv_prefill : public test_case {
+    const int n_tokens;
+    const int n_k_heads;
+    const int n_v_heads;
+    test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads)
+        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads) {}
+    std::string op_desc(ggml_tensor *) override { return "GDN_CONV_PREFILL"; }
+    std::string vars() override { return VARS_TO_STR3(n_tokens, n_k_heads, n_v_heads); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 2e-5; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) continue;
+            if (strcmp(t->name, "gate") == 0)          init_tensor_uniform(t, -3.0f, -0.5f);
+            else if (strcmp(t->name, "beta") == 0)    init_tensor_uniform(t, 0.0f, 0.5f);
+            else if (strcmp(t->name, "history") == 0 || strcmp(t->name, "state") == 0)
+                init_tensor_uniform(t, -0.01f, 0.01f);
+            else                                      init_tensor_uniform(t, -0.25f, 0.25f);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int C = 128 * (2 * n_k_heads + n_v_heads);
+        ggml_tensor * x_src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n_tokens);
+        ggml_set_name(x_src, "x_src");
+        ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, not a permanent input
+        ggml_tensor * history = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, C);
+        ggml_set_name(history, "history");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
+        ggml_set_name(w, "taps");
+        ggml_tensor * cc = ggml_concat(ctx, history, ggml_transpose(ctx, x), 0);
+        ggml_tensor * conv = ggml_ssm_conv(ctx, ggml_reshape_3d(ctx, cc, n_tokens + 3, C, 1), w);
+        ggml_tensor * silu = ggml_silu(ctx, conv);
+        if (gf) ggml_build_forward_expand(gf, silu);
+
+        // An independent full-size allocation between conv and GDN exercises scheduler allocation and fusion order.
+        ggml_tensor * scratch = ggml_scale(ctx, x_src, 0.25f);
+        if (gf) ggml_build_forward_expand(gf, scratch);
+
+        auto view = [&](int heads, int offset) {
+            return ggml_view_4d(ctx, silu, 128, heads, n_tokens, 1,
+                                128 * sizeof(float), (size_t) C * sizeof(float),
+                                (size_t) C * n_tokens * sizeof(float), (size_t) offset * sizeof(float));
+        };
+        ggml_tensor * q = view(n_k_heads, 0);
+        ggml_tensor * k = view(n_k_heads, 128 * n_k_heads);
+        ggml_tensor * v = view(n_v_heads, 256 * n_k_heads);
+        const float eps = 1e-6f;
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps / 128), 1.0f / sqrtf(128.0f));
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps / 128), 1.0f / sqrtf(128.0f));
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, n_tokens, 1);
+        ggml_set_name(g, "gate");
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, n_tokens, 1);
+        ggml_set_name(beta, "beta");
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, n_v_heads, 1);
+        ggml_set_name(state, "state");
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -13010,6 +13074,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n_tokens : {256, 300, 4096}) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3));
     }
+    // Convolution/SiLU elided into the chunked GDN, allocated through the scheduler.
+    test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 2));
+    test_cases.emplace_back(new test_gdn_conv_prefill(512, 2, 4));
     // Multiple sequences must remain on the generic fallback.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));
