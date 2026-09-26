@@ -83,7 +83,9 @@ class ParentSignal(RuntimeError):
 
 
 class ProcessHandle(Protocol):
-    pid: int
+    @property
+    def pid(self) -> int:
+        ...
 
     def poll(self) -> int | None:
         ...
@@ -478,7 +480,7 @@ def _launch_guardian(
     environment: dict[str, str],
     pulse_timeout_seconds: float,
     grace_timeout_seconds: float,
-    launch_mask: set[signal.Signals],
+    launch_mask: set[int],
 ) -> GuardianProcess:
     control_read, control_write = os.pipe()
     os.set_blocking(control_read, False)
