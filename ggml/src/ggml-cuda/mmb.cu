@@ -15,16 +15,13 @@ typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 
 __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
-#if defined(__HIP_DEVICE_COMPILE__)
-// same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or)
+// same RNE as mmb_f2bf on both halves, the two high halves joined by one v_perm_b32 (no mov_b16 + and_or). Unguarded
+// like the other __builtin_amdgcn_perm uses in this file: device code here is AMD-only.
 __device__ __forceinline__ uint32_t mmb_pack2(float a, float b) {
     uint32_t ua = __float_as_uint(a), ub = __float_as_uint(b);
     ua += 0x7fffu + ((ua >> 16) & 1u); ub += 0x7fffu + ((ub >> 16) & 1u);
     return __builtin_amdgcn_perm(ub, ua, 0x07060302u);
 }
-#else
-__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
-#endif
 __constant__ int8_t mmb_kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 __device__ __forceinline__ float mmb_h2f(uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
 
