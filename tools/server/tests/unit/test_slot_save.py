@@ -158,6 +158,39 @@ def test_slot_erase():
     assert res.body["timings"]["prompt_n"] == 21  # all tokens are processed
 
 
+def test_ram_cache_interleaved_shared_prefix():
+    server.n_slots = 1
+    server.cache_ram = 16
+    server.n_predict = 8
+    server.start()
+
+    prefix = [1] + [10] * 192
+    prompts = [prefix + [20] * 48, prefix + [30] * 48]
+
+    def complete(prompt):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "cache_prompt": True,
+            "n_predict": 8,
+            "ignore_eos": True,
+            "return_tokens": True,
+            "temperature": 0.0,
+        })
+        assert res.status_code == 200
+        return res.body
+
+    first = []
+    for prompt in prompts:
+        complete(prompt)
+        # Compare the same one-token replay shape before and after displacement.
+        first.append(complete(prompt))
+    for prompt, expected in zip(prompts, first):
+        restored = complete(prompt)
+        assert restored["timings"]["cache_n"] == len(prompt) - 1
+        assert restored["timings"]["prompt_n"] == 1
+        assert restored["tokens"] == expected["tokens"]
+
+
 #
 # Multimodal server (mmproj loaded) slot save/restore.
 #
