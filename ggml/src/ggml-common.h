@@ -2224,12 +2224,17 @@ GGML_TABLE_BEGIN(uint16_t, tq2t_lut_f16, 4096)
     0x1038, 0x3f9f, 0xade8, 0x399f, 0x3363, 0xb9da, 0x3909, 0x37c8, 0x3c82, 0xbc4c, 0xbc3a, 0xb788, 0xa897, 0x39da, 0xb6d2, 0x3bee,
 GGML_TABLE_END()
 
-// Codebook index (11-bit) of trellis entry e = 2*s + p, s the 16-bit state, p the pair.
-// One u32 wrapping multiply per state serves both pairs: x = s * 0x9e3779b1;
+// Trellis states are TQ_STATE_BITS (15) wide: every decoder reads a 16-bit window and the
+// index function masks it, so all call sites share one definition. Files record the width as
+// agention.trellis.state_bits; the loader rejects any other value.
+#define TQ_STATE_BITS 15
+#define TQ_STATE_MASK ((1u << TQ_STATE_BITS) - 1u)
+
+// Codebook index (11-bit) of trellis entry e = 2*s + p, s the state (masked to TQ_STATE_BITS),
+// p the pair. One u32 wrapping multiply per state serves both pairs: x = s * 0x9e3779b1;
 // p = 0 -> x >> 21, p = 1 -> (x >> 10) & 2047.
-// Sanity: tq2t_hyb_index(12345) == 1657, tq2t_hyb_index(12344) == 1035.
 static inline uint32_t tq2t_hyb_index(uint32_t e) {
-    const uint32_t x = (e >> 1) * 0x9e3779b1u;
+    const uint32_t x = ((e >> 1) & TQ_STATE_MASK) * 0x9e3779b1u;
     return (e & 1) ? ((x >> 10) & 2047u) : (x >> 21);
 }
 

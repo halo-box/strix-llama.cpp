@@ -778,6 +778,19 @@ llama_model_loader::llama_model_loader(
             }
         }
 
+        // Trellis types decode with TQ_STATE_BITS-bit states; a file encoded with any other
+        // width would load and silently produce garbage, so require the declared width.
+        if (n_type[GGML_TYPE_TQ2_T] + n_type[GGML_TYPE_TQK6] + n_type[GGML_TYPE_TQK7] > 0) {
+            const int64_t kid = gguf_find_key(metadata, "agention.trellis.state_bits");
+            const uint32_t bits = kid >= 0 ? gguf_get_val_u32(metadata, kid) : 16u;
+            if (bits != 15u) {
+                throw std::runtime_error(format(
+                    "trellis tensors were encoded with %u-bit states (%s); this build decodes 15-bit states. "
+                    "Re-encode the file with a current gguf-hadamard.",
+                    bits, kid >= 0 ? "agention.trellis.state_bits" : "no agention.trellis.state_bits key: pre-2026-09-26 format"));
+            }
+        }
+
         switch (type_max) {
             case GGML_TYPE_F32:     ftype = LLAMA_FTYPE_ALL_F32;        break;
             case GGML_TYPE_F16:     ftype = LLAMA_FTYPE_MOSTLY_F16;     break;
