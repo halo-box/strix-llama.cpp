@@ -345,6 +345,10 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
+        // DeepSeek V4.1 routed-expert cache. Both values must be non-zero.
+        size_t  expert_cache_bytes;
+        int32_t expert_cache_slots;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
