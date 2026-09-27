@@ -326,7 +326,8 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #else                             // GGML_CUDA_USE_CUB
 #if defined(GGML_USE_HIP)
     if (ncols > 1024) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        // Select tied scores by increasing column index: QSA has many exact-zero ties at the cut.
+        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream, true);
     } else {
 #endif // defined(GGML_USE_HIP)
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);

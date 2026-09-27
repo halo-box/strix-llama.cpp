@@ -6150,6 +6150,42 @@ struct test_mul_mat_hadamard : public test_mul_mat {
         return "MUL_MAT_HADAMARD";
     }
 };
+// HIP without hipCUB uses radix top-k for these widths. When the k-th value ties,
+// choosing the first columns must be reproducible across workgroup schedules.
+struct test_top_k_stable_ties : public test_top_k {
+    test_top_k_stable_ties(int cols) : test_top_k(GGML_TYPE_F32, {cols, 2, 1, 1}, 512, true) {}
+
+    std::string vars() override { return test_top_k::vars() + ",stable_zero_cut=1"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_top_k::initialize_tensors(ctx);
+        std::vector<float> scores(ggml_nelements(input), 0.0f);
+        ggml_backend_tensor_set(input, scores.data(), 0, ggml_nbytes(input));
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_UNUSED(a);
+        if (n != size_t(ggml_nrows(input) * k)) return 1.0;
+        for (int64_t r = 0; r < ggml_nrows(input); ++r) {
+            std::vector<int32_t> picked(k);
+            for (int i = 0; i < k; ++i) {
+                const float v = b[r*k + i];
+                picked[i] = int32_t(v);
+                if (v != float(picked[i])) return 1.0;
+            }
+            std::sort(picked.begin(), picked.end());
+            for (int i = 0; i < k; ++i) if (picked[i] != i) return 1.0;
+        }
+        return 0.0;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        // Other backends may legitimately choose a different subset of equal-valued columns.
+        return strcmp(reg, "ROCm") == 0 ? 0.0 : double(k * ne[1]);
+    }
+};
+
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
@@ -13076,6 +13112,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int cols : {1024, 1025}) {
         for (int rows : {1, 2}) test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 512, true));
     }
+    for (int cols : {1025, 2047, 2048, 2049}) test_cases.emplace_back(new test_top_k_stable_ties(cols));
 
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,  1, 1, 1 }, 1024));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 2048,  2, 1, 1 }, 1024));
