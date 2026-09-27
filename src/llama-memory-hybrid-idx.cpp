@@ -1683,9 +1683,11 @@ bool llama_memory_hybrid_idx::qsa_prefix_matches(const llama_ubatch & u) const {
 }
 
 bool llama_memory_hybrid_idx::qsa_fast(int il, const llama_ubatch & u) const {
-    // Re-pool only the (n+3)/4+2 blocks this ubatch touches. At 512 tokens the pooled keys
-    // match full re-pooling exactly; the previous output mismatch came from BF16 residual
-    // marking at a graph split, not from the indexer-key cache. Larger ubatches are untested.
+    // Re-pool only the (n+3)/4+2 blocks this ubatch touches. The pooled keys match full re-pooling
+    // exactly. The earlier 128..512 output mismatch was not the cache: the 3 host inputs this path adds
+    // per layer moved the scheduler's input-count split cuts, and the CUDA backend dropped the BF16
+    // residual mark of any residual whose next combine landed across a cut (fixed there, see
+    // mmb_res16_pending). Larger ubatches are untested; QSA_FAST_MAX=127 restores the old limit.
     static const int max_tokens = getenv("QSA_FAST_MAX") ? atoi(getenv("QSA_FAST_MAX")) : 512;
     return qsa_prefix_matches(u) && int(u.n_tokens) <= max_tokens && u.n_tokens <= 512 && qsa_keys.at(il) &&
         qsa_ready.at(il) >= int64_t(qsa_prefix.previous_size/4) &&
