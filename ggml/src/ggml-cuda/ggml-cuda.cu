@@ -6516,7 +6516,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
                 for (const auto & c : comb) {
                     const ggml_tensor * r = c.second;
-                    if (ggml_nrows(r) < 512) continue;
+                    // A small ubatch may split on either side of the HC residual depending on
+                    // unrelated allocations. Marking it BF16-only in one layout but not the
+                    // other changes model results. ne[2] is the token count; nrows also includes
+                    // the HC stream dimension, so testing nrows alone misses 256/512-token batches.
+                    if (ggml_nrows(r) < 512 || r->ne[2] <= 512) continue;
                     int ri = -1;
                     for (int k = 0; k < cgraph->n_nodes; ++k) if (cgraph->nodes[k] == r) { ri = k; break; }
                     if (ri < 0) continue;
