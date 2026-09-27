@@ -6162,14 +6162,15 @@ struct test_top_k_stable_ties : public test_top_k {
         std::vector<float> scores(ggml_nelements(input), 0.0f);
         ggml_backend_tensor_set(input, scores.data(), 0, ggml_nbytes(input));
     }
+    // a is the backend under test, b is the CPU reference: check the backend's picks.
 
     double err(const float * a, const float * b, size_t n) override {
-        GGML_UNUSED(a);
+        GGML_UNUSED(b);
         if (n != size_t(ggml_nrows(input) * k)) return 1.0;
         for (int64_t r = 0; r < ggml_nrows(input); ++r) {
             std::vector<int32_t> picked(k);
             for (int i = 0; i < k; ++i) {
-                const float v = b[r*k + i];
+                const float v = a[r*k + i];
                 picked[i] = int32_t(v);
                 if (v != float(picked[i])) return 1.0;
             }
