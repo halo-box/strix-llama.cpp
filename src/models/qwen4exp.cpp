@@ -1795,7 +1795,14 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
         return;
     }
     std::vector<llama_token> toks(tokens, tokens + n_tokens);
-    std::thread([&pmodel, &hp, toks = std::move(toks), n_gram, n_heads, per_gram, eos]() {
+    // The prefetch thread may outlive the context and model. Keep the disk table and the
+    // immutable hash parameters alive instead of capturing references into the model.
+    auto disk = pmodel.ple_disk;
+    const auto multipliers = hp.ple_layer_multipliers;
+    const auto vocab_sizes = hp.ple_head_vocab_sizes;
+    const auto offsets = hp.ple_head_offsets;
+    std::thread([disk = std::move(disk), multipliers, vocab_sizes, offsets,
+                 toks = std::move(toks), n_gram, n_heads, per_gram, eos]() {
         const int64_t n = (int64_t) toks.size();
         std::vector<int32_t> idx((size_t) n_heads * n);
         std::vector<int64_t> ctx(n_gram);
@@ -1809,18 +1816,18 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
                 ctx[s] = cut ? eos : t;
             }
             for (int64_t g = 2; g <= n_gram; ++g) {
-                uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+                uint64_t mixed = (uint64_t) ctx[0] * multipliers[0];
                 for (int64_t j = 1; j < g; ++j) {
-                    mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+                    mixed ^= (uint64_t) ctx[j] * multipliers[j];
                 }
                 const int64_t base = (g - 2) * per_gram;
                 for (int64_t q = 0; q < per_gram; ++q) {
                     const int64_t h_i = base + q;
-                    idx[(size_t) i * n_heads + h_i] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+                    idx[(size_t) i * n_heads + h_i] = (int32_t) (mixed % vocab_sizes[h_i] + offsets[h_i]);
                 }
             }
         }
-        pmodel.ple_disk->prefetch(idx.data(), idx.size());
+        disk->prefetch(idx.data(), idx.size());
     }).detach();
 }
 
