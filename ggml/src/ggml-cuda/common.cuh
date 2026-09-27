@@ -1488,6 +1488,8 @@ struct ggml_backend_cuda_context {
     bool mmb_after_compute = true;
     const void * mmb_first_split = nullptr;
     std::vector<uint64_t> mmb_graph_sigs;
+    // HC residuals whose remaining readers live in a later split of the same graph on this device: tensor -> uses left
+    std::unordered_map<const ggml_tensor *, int> mmb_res16_pending;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
