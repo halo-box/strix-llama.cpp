@@ -2894,9 +2894,9 @@ std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(in
     if (n_keep <= 0 || out == nullptr || out->buffer == nullptr || out->data == nullptr) {
         return nullptr;
     }
-    // only the qwen35 and qwen35moe MTP graphs use the subset, and only when the MTP block scores with the model LM head
+    // only the qwen35, qwen35moe and qwen4exp MTP graphs use the subset, and only when the MTP block scores with the model LM head
     // the rows of an EXL3 head are not contiguous in its trellis
-    if ((arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) || hparams.n_layer_nextn == 0 ||
+    if ((arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN4EXP) || hparams.n_layer_nextn == 0 ||
             layers[hparams.n_layer()].nextn.shared_head_head != nullptr || exl3.linears.count(out)) {
         LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d ignored: not supported for this model\n", __func__, n_keep);
         return nullptr;
