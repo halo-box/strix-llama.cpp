@@ -519,8 +519,16 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
             mmq_supported = true;
+            break;
+        case GGML_TYPE_Q4_0_ROCMFP4_FAST:
+            // MMQ tile rows exist only for RDNA3.5 (gfx1151, validated) and the
+            // Ampere config table (validated on RTX 4090 / sm_89). Gate to exactly
+            // those: Blackwell/Rubin have no rows of their own (native FP4 MMQ is
+            // MXFP4/NVFP4-only there) and would otherwise fall through to the
+            // Ampere table unvalidated. Everywhere else falls back to dequant + BLAS.
+            mmq_supported = (ampere_mma_available(cc) && cc < GGML_CUDA_CC_BLACKWELL) ||
+                            GGML_CUDA_CC_IS_RDNA3_5(cc);
             break;
         default:
             mmq_supported = false;
