@@ -267,6 +267,8 @@ const uint tq2t_lut_const[2048] = {
 #ifdef TQ_LUT_DIRECT
 // Experiment: index the constant array directly (no per-workgroup shared copy).
 #define tq2t_lut tq2t_lut_const
+// Some shaders call init_iq_shmem unconditionally; nothing to copy here.
+void init_iq_shmem(uvec3 wgsize) {}
 #else
 // 8 KiB per workgroup; one 32-bit shared load returns both weights of a pair.
 shared uint tq2t_lut[2048];
