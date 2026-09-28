@@ -453,7 +453,13 @@ std::map<std::string, std::string> merge_maps(const std::map<std::string, std::s
 }
 
 static std::deque<std::future<void>> compiles;
-void string_to_spv(std::string name, const std::string& source, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false, const std::string& suffix = "") {
+void string_to_spv(std::string name, const std::string& source, const std::map<std::string, std::string>& defines_in, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false, const std::string& suffix = "") {
+    // Experiment knob (build time): trellis shaders read the codebook straight from the
+    // constant array instead of copying it into shared memory per workgroup.
+    std::map<std::string, std::string> defines = defines_in;
+    if (getenv("GGML_VK_TQ_LUT_DIRECT") && (defines.count("DATA_A_TQ2_T") || defines.count("DATA_A_TQK6") || defines.count("DATA_A_TQK7"))) {
+        defines["TQ_LUT_DIRECT"] = "1";
+    }
     name = name + (f16acc ? "_f16acc" : "") + (coopmat ? "_cm1" : "") + (coopmat2 ? "_cm2" : (fp16 ? "" : "_fp32")) + suffix;
     std::string out_path = join_paths(output_dir, name + ".spv");
 
