@@ -6289,8 +6289,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_hc_mix_args args;
         enum ggml_op ops[5 + 2 * 15 + 1];
         int n_ops = ggml_cuda_match_hc_mix(cgraph, i, args, ops);
-        if (n_ops > 0 && args.dst->ne[1] == 1) {
-            n_ops = 0; // Decode preserves bit-identical routing. Prefill uses the fused reduction.
+        // The fused reduction replays the unfused mul/add roundings exactly (hc_mix_reduce_f32 uses
+        // explicitly rounded mul/add in the same stream order), so it is bit-identical at decode too and
+        // removes ~6 tiny kernels per mix per layer (sigmoid/mul/3x add/scale). HC_NO_MIX_FUSE=1 disables.
+        if (n_ops > 0 && args.dst->ne[1] == 1 && getenv("HC_NO_MIX_FUSE")) {
+            n_ops = 0;
         }
         if (n_ops > 0) {
             int node_idxs[5 + 2 * 15 + 1];
