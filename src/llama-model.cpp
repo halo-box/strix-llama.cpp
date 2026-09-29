@@ -2778,10 +2778,25 @@ static bool mtp_draft_vocab_ids_follow_merge_order(const llama_vocab & vocab, st
     return true;
 }
 
-std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(int32_t n_keep) const {
+std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(int32_t n_keep, const llama_model * head_src) const {
+    if (n_keep <= 0) {
+        return nullptr;
+    }
+    // a shared MTP sidecar (qwen4exp nextn_shared_target_tensors) has no LM head of its own and scores
+    // with the target's: take the subset rows from there. The graph borrows the same tensor.
     const ggml_tensor * out = output;
+    if (out == nullptr && head_src != nullptr && head_src != this) {
+        if (head_src->hparams.n_embd != hparams.n_embd || head_src->vocab.n_tokens() != vocab.n_tokens()) {
+            LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d ignored: draft and target LM heads disagree in shape\n", __func__, n_keep);
+            return nullptr;
+        }
+        out = head_src->output;
+    }
     // probe contexts (common_fit_params) use a model with unallocated weights: no subset
-    if (n_keep <= 0 || out == nullptr || out->buffer == nullptr || out->data == nullptr) {
+    if (out == nullptr || out->buffer == nullptr || out->data == nullptr) {
+        if (output == nullptr && head_src == nullptr) {
+            LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d ignored: the draft has no LM head and no target to borrow one from\n", __func__, n_keep);
+        }
         return nullptr;
     }
     // only the qwen35, qwen35moe and qwen4exp MTP graphs use the subset, and only when the MTP block scores with the model LM head
