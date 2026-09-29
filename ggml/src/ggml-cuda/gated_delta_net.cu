@@ -1371,7 +1371,9 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
 //
 // Every op is spelled with the same operation order and FMA contraction as the kernels it replaces
 // (ssm_conv_f32, l2_norm_dual_f32_s128, unary/binary elementwise, gated_delta_net_cuda, rms_norm_f32<128>),
-// so the outputs are bit-identical to the unfused graph.
+// so the outputs are bit-identical to the unfused graph. When args.qk_rms_scale is set, the q/k norms
+// replay rms_norm_f32<256, false> + scale_f32 (the qwen4exp build_gdn_l2_norm form) with the same thread
+// layout, reduction tree and single-rounding products.
 
 static __device__ __forceinline__ float gdn_decode_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
@@ -1396,7 +1398,7 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
     __shared__ float q_n[S];
     __shared__ float k_n[S];
     __shared__ float attn[S];
-    __shared__ float red[4];
+    __shared__ float qk_red[8]; // q/k rms norm: the 4+4 per-warp partial sums of the standalone 256-thread block
 
     const int h      = blockIdx.x;                 // value head
     const int lane   = threadIdx.x;
@@ -1450,21 +1452,53 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
     }
     __syncthreads();
 
-    // 2. l2_norm_dual_f32_s128 for q (warp 0) and k (warp 1)
-    if (warp < 2) {
-        const float * x = warp == 0 ? q_c : k_c;
-        float *       y = warp == 0 ? q_n : k_n;
-        float tmp = 0.0f;
+    // 2. q/k norm: l2_norm_dual_f32_s128 for q (warp 0) and k (warp 1), or, when the graph uses the
+    //    qwen4exp build_gdn_l2_norm representation RMS_NORM(x, eps) -> SCALE(mul, add), the exact
+    //    replay of the dispatched rms_norm_f32<256, false> + scale_f32 pair
+    if (!args.qk_rms_scale) {
+        if (warp < 2) {
+            const float * x = warp == 0 ? q_c : k_c;
+            float *       y = warp == 0 ? q_n : k_n;
+            float tmp = 0.0f;
 #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const float xi = x[r * warp_size + lane];
-            tmp = fmaf(xi, xi, tmp);
+            for (int r = 0; r < rows_per_lane; r++) {
+                const float xi = x[r * warp_size + lane];
+                tmp = fmaf(xi, xi, tmp);
+            }
+            tmp = gdn_warp_reduce_sum<warp_size>(tmp);
+            const float scale = rsqrtf(fmaxf(tmp, args.eps_l2 * args.eps_l2));
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                y[r * warp_size + lane] = scale * x[r * warp_size + lane];
+            }
         }
-        tmp = gdn_warp_reduce_sum<warp_size>(tmp);
-        const float scale = rsqrtf(fmaxf(tmp, args.eps_l2 * args.eps_l2));
-#pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            y[r * warp_size + lane] = scale * x[r * warp_size + lane];
+    } else {
+        // rms_norm_f32<256, false>: 128 elements over 128 lanes (4 warps, one element per lane; warps 4..7
+        // of the standalone 256-thread block hold exact zeros that drop out of the tree), the warp
+        // butterfly (xor 16/8/4/2/1), the cross-warp tree ((v0 + v2) + (v1 + v3)), mean = sum / 128,
+        // scale = rsqrtf(mean + eps), dst = scale * x; then scale_f32: dst = mul * dst + add. The standalone
+        // scale_f32 compiles its mul+add to a single FMA (v_fma_f32 in the RDNA3.5 build), so the same
+        // contraction is spelled explicitly here.
+        const int iqk = warp < 4 ? 0 : 1;
+        if (warp < 8) {
+            const float * x  = iqk == 0 ? q_c : k_c;
+            const float   xi = x[(warp & 3) * warp_size + lane];
+            float part = fmaf(xi, xi, 0.0f);
+            part = warp_reduce_sum<warp_size>(part);
+            if (lane == 0) {
+                qk_red[warp] = part;
+            }
+        }
+        __syncthreads();
+        const float total = iqk == 0 ? (qk_red[0] + qk_red[2]) + (qk_red[1] + qk_red[3])
+                                     : (qk_red[4] + qk_red[6]) + (qk_red[5] + qk_red[7]);
+        const float scale = rsqrtf(total / (float) args.S + args.qk_rms_eps[iqk]);
+        if (warp < 8) {
+            const float * x = iqk == 0 ? q_c : k_c;
+            float *       y = iqk == 0 ? q_n : k_n;
+            const int     i = (warp & 3) * warp_size + lane;
+            const float rms = scale * x[i];
+            y[i] = fmaf(args.qk_scale_mul[iqk], rms, args.qk_scale_add[iqk]);
         }
     }
 
