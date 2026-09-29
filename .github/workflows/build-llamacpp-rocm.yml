@@ -24,6 +24,11 @@ on:
         description: 'Branch or tag of this repository to build, or "latest" for master'
         required: false
         default: 'latest'
+      vulkan:
+        description: 'Also build the Linux Vulkan zip'
+        required: false
+        default: true
+        type: boolean
       create_release:
         description: 'Create a GitHub release after successful build'
         required: false
@@ -890,6 +895,61 @@ jobs:
 
         echo "Cleanup completed successfully"
 
+  build-ubuntu-vulkan:
+    # Linux Vulkan build of the same commit, packaged next to the ROCm zips in the same release.
+    # Portable: CPU variants and backends are loaded at runtime, RPATH is $ORIGIN, and the system
+    # Vulkan loader and driver (Mesa RADV) are used.
+    runs-on: ubuntu-22.04
+    if: github.event.inputs.vulkan != 'false'
+    outputs:
+      llamacpp_commit_hash: ${{ steps.set-outputs.outputs.llamacpp_commit_hash }}
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ env.BUILD_SHA != '' && env.BUILD_SHA || (env.LLAMACPP_VERSION == 'latest' && 'master' || env.LLAMACPP_VERSION) }}
+        path: llama.cpp
+
+    - name: Install build dependencies
+      run: |
+        wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+        sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+        sudo apt-get update -y
+        sudo apt-get install -y build-essential cmake ninja-build vulkan-sdk zip
+
+    - name: Build Llama.cpp + Vulkan
+      run: |
+        cd llama.cpp
+        echo "LLAMACPP_COMMIT_HASH=$(git rev-parse --short=5 HEAD)" >> $GITHUB_ENV
+        git log --oneline -1
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+          -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+          -DBUILD_SHARED_LIBS=ON \
+          -DLLAMA_BUILD_TESTS=OFF \
+          -DGGML_VULKAN=ON \
+          -DGGML_RPC=ON \
+          -DGGML_NATIVE=OFF \
+          -DGGML_BACKEND_DL=ON \
+          -DGGML_CPU_ALL_VARIANTS=ON \
+          -DLLAMA_BUILD_BORINGSSL=ON
+        cmake --build build -j $(nproc)
+        cp LICENSE build/bin/
+        ls -la build/bin
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: llama-ubuntu-vulkan-x64
+        path: llama.cpp/build/bin/
+        retention-days: 30
+
+    - name: Set job outputs
+      id: set-outputs
+      run: echo "llamacpp_commit_hash=${LLAMACPP_COMMIT_HASH}" >> $GITHUB_OUTPUT
+
   test-stx-halo:
     runs-on: ${{ matrix.runner }}
     needs: [prepare-matrix, build-windows, build-ubuntu]
@@ -949,7 +1009,7 @@ jobs:
         artifact_name: llama-${{ matrix.artifact_prefix }}-rocm-${{ matrix.gfx_target }}-x64
 
   create-release:
-    needs: [prepare-matrix, build-windows, build-ubuntu, test-stx-halo, test-stx]
+    needs: [prepare-matrix, build-windows, build-ubuntu, build-ubuntu-vulkan, test-stx-halo, test-stx]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -958,6 +1018,7 @@ jobs:
       always() &&
       (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
       (needs.build-ubuntu.result == 'success' || needs.build-ubuntu.result == 'skipped') &&
+      (needs.build-ubuntu-vulkan.result == 'success' || needs.build-ubuntu-vulkan.result == 'skipped') &&
       (needs.build-windows.result == 'success' || needs.build-ubuntu.result == 'success') &&
       (needs.test-stx-halo.result == 'success' || needs.test-stx-halo.result == 'skipped') &&
       (needs.test-stx.result == 'success' || needs.test-stx.result == 'skipped') &&
@@ -1058,6 +1119,11 @@ jobs:
           done
         done
 
+        if [ -d "./all-artifacts/llama-ubuntu-vulkan-x64" ]; then
+          echo "Creating archive: llama-${TAG}-ubuntu-vulkan-x64.zip"
+          (cd ./all-artifacts/llama-ubuntu-vulkan-x64 && zip -r "../../llama-${TAG}-ubuntu-vulkan-x64.zip" *)
+        fi
+
         echo "Created archives:"
         ls -la *.zip
 
@@ -1100,6 +1166,12 @@ jobs:
           done
         done
 
+        vulkan_line=""
+        if [ -f "llama-${TAG}-ubuntu-vulkan-x64.zip" ]; then
+          upload_files="${upload_files} llama-${TAG}-ubuntu-vulkan-x64.zip"
+          vulkan_line="**Vulkan**: ubuntu x64"
+        fi
+
         echo "Files to upload: $upload_files"
 
         # Create release with GitHub CLI
@@ -1109,6 +1181,7 @@ jobs:
         **Operating System(s)**: $operating_systems
         **GPU Target(s)**: $targets
         **ROCm Version**: $ROCM_VERSION
+        $vulkan_line
         **Llama.cpp Commit Hash**: $LLAMACPP_COMMIT_HASH
         **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
