@@ -3916,6 +3916,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     sizeof(vk_op_lightning_indexer_cm_push_constants), {16, 1, 1}, {device->subgroup_size, LI_NH_VALUES[nhi]}, 1, true, true,
                     device->subgroup_size);
             }
+            // chunked gated delta net (default on, GGML_VK_GDN_CHUNK=0 off): hand-built wave32 WMMA fragments in the RDNA3 layout
+            // (RDNA4 lays its fragments out differently), so RDNA3 + wave32 only
+            if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == vk_device_architecture::AMD_RDNA3 &&
+                device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
+                ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_prep, "gdn_chunk_prep_f32", gdn_chunk_prep_f32_len, gdn_chunk_prep_f32_data,
+                    "main", 5, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+                // one wave (16 state columns) per workgroup, operands straight from the scratch
+                device->gdn_chunk_scan_nsplit = 8;
+                ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_f32", gdn_chunk_scan_f32_len, gdn_chunk_scan_f32_data,
+                    "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
+            }
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_cm_f16,
                 "flash_attn_top_k_cm_f16", flash_attn_top_k_cm_f16_len, flash_attn_top_k_cm_f16_data, "main", 6,
                 sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {512, device->subgroup_size}, 1, true, true,
@@ -11509,6 +11520,42 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         scale,
         K
     };
+
+    // chunked prefill form (gdn_chunk_prep/scan.comp): S_v 128, scalar gate, final state only (K == 1), q/k/v
+    // rows with unit element stride, q and k with the same strides. f16 WMMA operands, f32 accumulation: not
+    // bit-identical to the sequential scan. Default on where the pipelines exist (RDNA3 wave32); GGML_VK_GDN_CHUNK=0
+    // opts out. Batches under 64 tokens keep the sequential kernel.
+    static const bool chunk_enabled = [] { const char * e = getenv("GGML_VK_GDN_CHUNK"); return !e || atoi(e) != 0; }();
+    constexpr uint32_t chunk_min = 64;
+    const bool kda = dst->src[3]->ne[0] == (int64_t) S_v;
+    if (chunk_enabled && ctx->device->pipeline_gdn_chunk_scan && S_v == 128 && !kda && K == 1 && n_tokens >= chunk_min &&
+        src_q->nb[0] == sizeof(float) && dst->src[1]->nb[0] == sizeof(float) && src_v->nb[0] == sizeof(float) &&
+        dst->src[1]->nb[1] == src_q->nb[1] && dst->src[1]->nb[2] == src_q->nb[2] && dst->src[1]->nb[3] == src_q->nb[3] &&
+        H % neq1 == 0) {
+        constexpr uint32_t CL = 32;
+        const uint32_t nch = (n_tokens + CL - 1) / CL;
+        const size_t qku = 3 * CL * 128 / 2;
+        const size_t tpu = CL * CL + 2 * CL;
+        const size_t scr_size = sizeof(uint32_t) * ((size_t) n_seqs * neq1 * nch * qku + (size_t) n_seqs * H * nch * tpu);
+        if (ctx->prealloc_size_split_k < scr_size) {
+            ctx->prealloc_size_split_k = scr_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        vk_subbuffer scr_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+        const vk_op_gdn_chunk_push_constants cpc = { pc, nch };
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_gdn_chunk_prep, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_gdn_chunk_scan, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_gdn_chunk_prep,
+            { src_buf[0], src_buf[1], src_buf[3], src_buf[4], scr_buf }, cpc, { neq1, nch, n_seqs });
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_gdn_chunk_scan,
+            { src_buf[2], src_buf[5], dst_buf, scr_buf }, cpc, { H * ctx->device->gdn_chunk_scan_nsplit, n_seqs, 1 });
+        ctx->prealloc_split_k_need_sync = true;
+        return;
+    }
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},

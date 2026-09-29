@@ -742,6 +742,12 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+// gdn_chunk_prep.comp / gdn_chunk_scan.comp: the sequential kernel's constants plus the chunk count
+struct vk_op_gdn_chunk_push_constants {
+    vk_op_gated_delta_net_push_constants gdn;
+    uint32_t nch;
+};
+
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
     uint32_t nb21, nb22, nb31;
