@@ -5,6 +5,9 @@ import subprocess
 import os
 import shutil
 import argparse
+import logging
+
+logger = logging.getLogger("gather_required_libs")
 
 
 def find_lib_in_rocm(libname, rocm_dir):
@@ -18,6 +21,7 @@ def find_lib_in_rocm(libname, rocm_dir):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(
         description="Gather required libraries for llama-server"
     )
@@ -41,16 +45,16 @@ def main():
     # Create the destination directory and run the binary
     os.makedirs(dest_dir, exist_ok=True)
     result = subprocess.run([binary], capture_output=True, text=True)
-    print(f"Error Found: {result.stderr}")
+    logger.info(f"Error Found: {result.stderr}")
 
     # Copy the missing libraries to the destination directory
     while "error while loading shared libraries" in result.stderr:
         so_file = result.stderr.split("shared libraries: ")[1].split(": ")[0]
         so_file_path = find_lib_in_rocm(so_file, rocm_dir)
         shutil.copy2(so_file_path, dest_dir)
-        print(f"Copied {so_file_path} -> {dest_dir}")
+        logger.info(f"Copied {so_file_path} -> {dest_dir}")
         result = subprocess.run([binary], capture_output=True, text=True)
-        print(f"Error Found: {result.stderr}")
+        logger.info(f"Error Found: {result.stderr}")
 
 
 if __name__ == "__main__":
