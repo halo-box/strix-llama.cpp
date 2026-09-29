@@ -613,11 +613,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
     }
 
-    if (mtp_draft != nullptr && head_w == model.output && n_outputs == 1) {
-        // this context drafts over a row subset of the LM head: scatter its logits into a full-vocab row of -inf
+    if (mtp_draft != nullptr && layer.nextn.shared_head_head == nullptr && n_outputs == 1) {
+        // this context drafts over a row subset of the LM head (own or borrowed from the target, see
+        // llama_model::mtp_draft_vocab_get): scatter its logits into a full-vocab row of -inf
         GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
+        GGML_ASSERT(mtp_draft->head->type == head_w->type && mtp_draft->head->ne[0] == head_w->ne[0]);
         const int64_t n_sel = mtp_draft->head->ne[1];
-        const int64_t n_row = model.output->ne[1];
+        const int64_t n_row = head_w->ne[1];
         ggml_tensor * sub = build_lora_mm(mtp_draft->head, cur, head_s);
         cur = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_row), -INFINITY);
         cur = ggml_set_rows(ctx0, cur, ggml_reshape_2d(ctx0, sub, 1, n_sel), mtp_draft->ids);
