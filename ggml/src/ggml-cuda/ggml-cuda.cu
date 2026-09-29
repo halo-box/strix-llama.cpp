@@ -5241,6 +5241,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_mul_mat_vec_q_fq_gdn_gate(*cuda_ctx, mm, attn.get(), sig->src[0], args.norm_w_tensor, args.eps_rms);
                     return mm_idx - i;
                 }
+                // otherwise the norm kernel of the fused step also applies the sigmoid(z) gate (one launch less)
+                if (getenv("GGML_CUDA_DISABLE_GDN_NORMGATE") == nullptr && sig && mul &&
+                        sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && mul->op == GGML_OP_MUL &&
+                        ((mul->src[0] == sig && mul->src[1] == norm_out) || (mul->src[1] == sig && mul->src[0] == norm_out)) &&
+                        sig->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) &&
+                        sig->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(sig->src[0]) &&
+                        ggml_nelements(sig->src[0]) == ggml_nelements(norm_out) &&
+                        ggml_are_same_shape(sig, norm_out) && ggml_are_same_shape(mul, norm_out) &&
+                        ggml_nelements(norm_out) == args.S * args.H_v && args.S == 128 &&
+                        ggml_node_get_use_count(cgraph, norm_idx) == 1 && ggml_node_get_use_count(cgraph, sig_idx) == 1 &&
+                        (norm_out->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (sig->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                    // z and the gated output are read/written element for element by the same thread: in-place is fine
+                    ggml_cuda_op_gdn_decode_fused_gated(*cuda_ctx, args, (const float *) sig->src[0]->data, (float *) mul->data);
+                    return mul_idx - i;
+                }
             }
             ggml_cuda_op_gdn_decode_fused(*cuda_ctx, args);
             return nodes_to_skip;
