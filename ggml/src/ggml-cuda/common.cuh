@@ -1494,6 +1494,10 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_mmb_context * mmb = nullptr;
     bool mmb_opt_in = false; // set by ggml_backend_cuda_set_mmb_enabled, before the first graph
+    bool mmb_ids_only = false; // opt-in but route only MUL_MAT_ID through mmb
+    bool mmb_mid_bf16 = false; // allow BF16 weights in the mmb MoE path (qwen35moe)
+    bool mmb_mid_quant = true; // allow quantized weights in the mmb MoE path (qwen4exp)
+    bool mmb_mid_q8_f16 = false; // Q8_0 MoE experts on the F16 WMMA route (qwen35moe)
     bool mmb_after_compute = true;
     const void * mmb_first_split = nullptr;
     std::vector<uint64_t> mmb_graph_sigs;

@@ -7694,10 +7694,43 @@ static void ggml_backend_cuda_set_mmb_enabled(ggml_backend_t backend, bool enabl
     ((ggml_backend_cuda_context *) backend->context)->mmb_opt_in = enable;
 }
 
+// route only MUL_MAT_ID (MoE) ops through mmb while dense MUL_MAT keeps its stock path
+static void ggml_backend_cuda_set_mmb_ids_only(ggml_backend_t backend, bool enable) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ((ggml_backend_cuda_context *) backend->context)->mmb_ids_only = enable;
+}
+
+static void ggml_backend_cuda_set_mmb_mid_bf16(ggml_backend_t backend, bool enable) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ((ggml_backend_cuda_context *) backend->context)->mmb_mid_bf16 = enable;
+}
+
+static void ggml_backend_cuda_set_mmb_mid_quant(ggml_backend_t backend, bool enable) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ((ggml_backend_cuda_context *) backend->context)->mmb_mid_quant = enable;
+}
+
+static void ggml_backend_cuda_set_mmb_mid_q8_f16(ggml_backend_t backend, bool enable) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ((ggml_backend_cuda_context *) backend->context)->mmb_mid_q8_f16 = enable;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_set_mmb_enabled") == 0) {
         return (void *)ggml_backend_cuda_set_mmb_enabled;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_mmb_ids_only") == 0) {
+        return (void *)ggml_backend_cuda_set_mmb_ids_only;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_mmb_mid_bf16") == 0) {
+        return (void *)ggml_backend_cuda_set_mmb_mid_bf16;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_mmb_mid_quant") == 0) {
+        return (void *)ggml_backend_cuda_set_mmb_mid_quant;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_mmb_mid_q8_f16") == 0) {
+        return (void *)ggml_backend_cuda_set_mmb_mid_q8_f16;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

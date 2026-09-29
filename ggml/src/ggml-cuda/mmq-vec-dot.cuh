@@ -155,6 +155,10 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     constexpr int nwarps        = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
     constexpr bool split_j      = type == GGML_TYPE_Q8_0 && J == 128 && !fallback && I == 64 && nwarps == 8;
     constexpr int j_group       = split_j ? J/2 : J;
+#if defined(AMD_WMMA_AVAILABLE)
+    static_assert(split_j || nwarps * rows_per_warp == I,
+        "AMD WMMA: rows_per_warp is fixed at 16, so nthreads/32 must equal I/16 or out-of-tile x rows are read");
+#endif
 
     const int warp_i = split_j ? threadIdx.y % 4 : threadIdx.y;
     const int warp_j = split_j ? threadIdx.y / 4 : 0;

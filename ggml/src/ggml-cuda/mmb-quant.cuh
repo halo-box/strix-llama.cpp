@@ -208,7 +208,7 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
 template <int WTYPE>
 __host__ __device__ constexpr size_t mmb_row_bytes(int k) {
     if constexpr (WTYPE == 0) return (size_t)(k / 32) * 18;
-    else if constexpr (WTYPE == 1) return (size_t)(k / 32) * 34;
+    else if constexpr (WTYPE == 1 || WTYPE == 3) return (size_t)(k / 32) * 34;
     else if constexpr (WTYPE == 2) return (size_t)k * 2;
     else {
         using traits = ggml_cuda_type_traits<(ggml_type)(WTYPE - 32)>;
@@ -222,6 +222,19 @@ __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, siz
         uint16_t * dst = tile + row * STRIDE;
         const int lane = threadIdx.x % 8;
         if (row < rows) mmb_decode_slice<(ggml_type)(WTYPE - 32)>(weights + row * row_bytes, ks * 64, dst, lane);
+        else {
+#pragma unroll
+            for (int k = lane; k < 64; k += 8) dst[k] = 0;
+        }
+    }
+}
+
+template <int BM, int STRIDE>
+__device__ __forceinline__ void mmb_load_bf16_tile(const uint8_t * weights, size_t row_bytes, int rows, int ks, uint16_t * tile) {
+    for (int row = threadIdx.x / 8; row < BM; row += blockDim.x / 8) {
+        uint16_t * dst = tile + row * STRIDE;
+        const int lane = threadIdx.x % 8;
+        if (row < rows) *(uint4 *)(dst + lane * 8) = *(const uint4 *)(weights + row * row_bytes + (size_t)ks * 128 + lane * 16);
         else {
 #pragma unroll
             for (int k = lane; k < 64; k += 8) dst[k] = 0;

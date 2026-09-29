@@ -380,8 +380,31 @@ llama_context::llama_context(
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             auto * set_mmb_fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_enabled") : nullptr;
+            auto * set_mmb_ids_only_fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_ids_only") : nullptr;
+            auto * set_mmb_mid_bf16_fn  = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_mid_bf16")  : nullptr;
+            auto * set_mmb_mid_quant_fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_mid_quant") : nullptr;
+            auto * set_mmb_mid_q8_f16_fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_mid_q8_f16") : nullptr;
+            const char * mmb_enable_env  = getenv("GGML_MMB_ENABLE");
+            const char * mmb_ids_only_env = getenv("GGML_MMB_IDS_ONLY");
+            const bool is_35b     = model.arch == LLM_ARCH_QWEN35MOE;
+            const bool mmb_on     = mmb_enable_env   ? atoi(mmb_enable_env) != 0 : (model.arch == LLM_ARCH_QWEN4EXP || is_35b);
+            const bool ids_only   = mmb_ids_only_env ? atoi(mmb_ids_only_env) != 0 : is_35b;
+            const bool mid_bf16   = is_35b;
+            const bool mid_quant  = !is_35b;
             if (set_mmb_fn) {
-                set_mmb_fn(backend.get(), model.arch == LLM_ARCH_QWEN4EXP);
+                set_mmb_fn(backend.get(), mmb_on);
+            }
+            if (set_mmb_ids_only_fn) {
+                set_mmb_ids_only_fn(backend.get(), ids_only);
+            }
+            if (set_mmb_mid_bf16_fn) {
+                set_mmb_mid_bf16_fn(backend.get(), mid_bf16);
+            }
+            if (set_mmb_mid_quant_fn) {
+                set_mmb_mid_quant_fn(backend.get(), mid_quant);
+            }
+            if (set_mmb_mid_q8_f16_fn) {
+                set_mmb_mid_q8_f16_fn(backend.get(), is_35b);
             }
         }
 

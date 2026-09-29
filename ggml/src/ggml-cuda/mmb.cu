@@ -11,6 +11,7 @@
 namespace {
 
 typedef short v16s __attribute__((ext_vector_type(16)));
+typedef _Float16 v16h __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 
@@ -89,6 +90,77 @@ __device__ __forceinline__ void mmb_dq_row68(const uint4 w0, const uint4 w1, con
     }
 }
 
+// Four bytes of Q8_0 codes -> eight halves q*d: the signed byte travels as q + 128
+// through the mantissa of 1024.0 (0x64646464 magic), one packed subtract and one packed multiply.
+__device__ __forceinline__ void mmb_q8_word_pair_to_f16(const uint32_t c0, const uint32_t c1, const __half2 d2, uint16_t * out8) {
+    const float d = __low2float(d2);
+    const uint32_t cs[2] = {c0, c1};
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t v = cs[i];
+        out8[i*4 + 0] = __builtin_bit_cast(uint16_t, __float2half_rn(d * (float)(int8_t)(v)));
+        out8[i*4 + 1] = __builtin_bit_cast(uint16_t, __float2half_rn(d * (float)(int8_t)(v >>  8)));
+        out8[i*4 + 2] = __builtin_bit_cast(uint16_t, __float2half_rn(d * (float)(int8_t)(v >> 16)));
+        out8[i*4 + 3] = __builtin_bit_cast(uint16_t, __float2half_rn(d * (float)(int8_t)(v >> 24)));
+    }
+}
+
+// One weight row's two consecutive Q8_0 blocks (68 bytes) decoded to 64 halves in LDS (WTYPE=3).
+__device__ __forceinline__ void mmb_dq_row68_f16(const uint4 w0, const uint4 w1, const uint4 w2, const uint4 w3, const uint32_t w4, uint32_t * arow) {
+    const uint32_t ws[17] = {w0.x,w0.y,w0.z,w0.w, w1.x,w1.y,w1.z,w1.w, w2.x,w2.y,w2.z,w2.w, w3.x,w3.y,w3.z,w3.w, w4};
+    const float d0 = mmb_h2f((uint16_t)(ws[0] & 0xffff)), d1 = mmb_h2f((uint16_t)(ws[8] >> 16));
+#pragma unroll
+    for (int blk = 0; blk < 2; ++blk) {
+        const __half2 d2 = __float2half2_rn(blk ? d1 : d0);
+        uint16_t * out16 = (uint16_t *) arow + blk * 32;
+#pragma unroll
+        for (int w = 0; w < 8; w += 2) {
+            const uint32_t c0 = blk ? ws[9 + w]     : ((ws[w]     >> 16) | (ws[w + 1] << 16));
+            const uint32_t c1 = blk ? ws[9 + w + 1] : ((ws[w + 1] >> 16) | (ws[w + 2] << 16));
+            mmb_q8_word_pair_to_f16(c0, c1, d2, out16 + w * 4);
+        }
+    }
+}
+
+// Whole 64-wide Q8_0 slice staged straight from global memory to F16 in LDS, eight lanes per row.
+template <int BM, int STRIDE>
+__device__ __forceinline__ void mmb_load_q8_f16_tile(const uint8_t * weights, size_t row_bytes, int rows, int ks, uint16_t * tile) {
+    for (int row = threadIdx.x / 8; row < BM; row += blockDim.x / 8) {
+        uint16_t * dst = tile + row * STRIDE;
+        const int lane = threadIdx.x % 8;
+        if (row < rows) {
+            const uint8_t * p = weights + (size_t) row * row_bytes + (size_t) ks * 68;
+            const int blk = lane / 4;
+            const __half2 d2 = __float2half2_rn(mmb_h2f(*(const uint16_t *)(p + blk * 34)));
+            const uint32_t * w = (const uint32_t *)(p + blk * 34 + 2) + (lane % 4) * 2;
+            mmb_q8_word_pair_to_f16(w[0], w[1], d2, dst + lane * 8);
+        } else {
+#pragma unroll
+            for (int k = lane; k < 64; k += 8) dst[k] = 0;
+        }
+    }
+}
+
+__global__ void mmb_cvt_bf16_f16(const uint16_t * __restrict__ x, uint16_t * __restrict__ y, const size_t n) {
+    size_t i = (size_t)(blockIdx.x*blockDim.x + threadIdx.x)*8;
+    if (i + 8 <= n) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) { y[i + k] = __builtin_bit_cast(uint16_t, __float2half_rn(__uint_as_float((uint32_t) x[i + k] << 16))); }
+    } else {
+        for (; i < n; ++i) y[i] = __builtin_bit_cast(uint16_t, __float2half_rn(__uint_as_float((uint32_t) x[i] << 16)));
+    }
+}
+
+__global__ void mmb_cvt_f32_f16(const float * __restrict__ x, uint16_t * __restrict__ y, const size_t n) {
+    size_t i = (size_t)(blockIdx.x*blockDim.x + threadIdx.x)*8;
+    if (i + 8 <= n) {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) { y[i + k] = __builtin_bit_cast(uint16_t, __float2half_rn(x[i + k])); }
+    } else {
+        for (; i < n; ++i) y[i] = __builtin_bit_cast(uint16_t, __float2half_rn(x[i]));
+    }
+}
+
 template <typename DRowFn>
 __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restrict__ stg, float * __restrict__ D, uint16_t * __restrict__ Dh,
         const bool store_f32, const int M, DRowFn drow, const int n_base, const int m_base, const int lane) {
@@ -141,7 +213,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
             if (row < BM && row < a_rows) {
                 if constexpr (WTYPE == 0) { const uint8_t * p = Wbase + (size_t)row * wrow_bytes + (size_t)ks * 36;
                     a0[i] = *(const uint4 *)(p); a1[i] = *(const uint4 *)(p + 16); a2[i] = *(const uint32_t *)(p + 32); }
-                else if constexpr (WTYPE == 1) { const uint8_t * p = Wbase + (size_t)row * wrow_bytes + (size_t)ks * 68;
+                else if constexpr (WTYPE == 1 || WTYPE == 3) { const uint8_t * p = Wbase + (size_t)row * wrow_bytes + (size_t)ks * 68;
                     a0[i] = *(const uint4 *)(p); a1[i] = *(const uint4 *)(p + 16); a3[i] = *(const uint4 *)(p + 32); a4[i] = *(const uint4 *)(p + 48); a2[i] = *(const uint32_t *)(p + 64); }
                 else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_1) {
                     const uint4 * p = (const uint4 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 48);
@@ -163,6 +235,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
             if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 1) mmb_dq_row68(a0[i], a1[i], a3[i], a4[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
+            else if constexpr (WTYPE == 3) mmb_dq_row68_f16(a0[i], a1[i], a3[i], a4[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 32 + GGML_TYPE_Q5_1) mmb_dq_q51_pair(a0[i], a1[i], a3[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
             else if constexpr (WTYPE == 2) { uint4 * d = (uint4 *)(As + row * MMB_LDS_STRIDE); d[0] = a0[i]; d[1] = a1[i]; d[2] = a3[i]; d[3] = a4[i]; d[4] = a5[i]; d[5] = a6[i]; d[6] = a7[i]; d[7] = a8[i]; } } }
 #pragma unroll
@@ -196,7 +269,9 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 #pragma unroll
             for (int i = 0; i < TM; ++i)
 #pragma unroll
-                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
+                    if constexpr (WTYPE == 3) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, b[j]), __builtin_bit_cast(v16h, a[i]), acc[i][j]);
+                    else                      acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
         }
         __syncthreads();
         if (ks + 1 < nks) store_lds();
@@ -405,7 +480,13 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
         }
     };
     auto store_lds = [&]() {
-        if constexpr (WTYPE != 0 && WTYPE != 32 + GGML_TYPE_Q4_K) {
+        if constexpr (WTYPE == 3) {
+            mmb_load_q8_f16_tile<BM, MMB_LDS_STRIDE>(Wg, wrow_bytes, a_rows, weight_ks, Ag);
+            mmb_load_q8_f16_tile<BM, MMB_LDS_STRIDE>(Wu, wrow_bytes, a_rows, weight_ks, Au);
+        } else if constexpr (WTYPE == 2) {
+            mmb_load_bf16_tile<BM, MMB_LDS_STRIDE>(Wg, wrow_bytes, a_rows, weight_ks, Ag);
+            mmb_load_bf16_tile<BM, MMB_LDS_STRIDE>(Wu, wrow_bytes, a_rows, weight_ks, Au);
+        } else if constexpr (WTYPE != 0 && WTYPE != 32 + GGML_TYPE_Q4_K) {
             constexpr int LOAD_TYPE = WTYPE == 1 ? 32 + GGML_TYPE_Q8_0 : WTYPE;
             mmb_load_quant_tile<LOAD_TYPE, BM, MMB_LDS_STRIDE>(Wg, wrow_bytes, a_rows, weight_ks, Ag);
             mmb_load_quant_tile<LOAD_TYPE, BM, MMB_LDS_STRIDE>(Wu, wrow_bytes, a_rows, weight_ks, Au);
@@ -456,8 +537,13 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
                 for (int j = 0; j < TN; ++j) {
                     if constexpr (TAIL) { if (!jact[j]) continue; }
-                    accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], ag[i], accg[i][j]);
-                    accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], au[i], accu[i][j]);
+                    if constexpr (WTYPE == 3) {
+                        accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, b[j]), __builtin_bit_cast(v16h, ag[i]), accg[i][j]);
+                        accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, b[j]), __builtin_bit_cast(v16h, au[i]), accu[i][j]);
+                    } else {
+                        accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], ag[i], accg[i][j]);
+                        accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], au[i], accu[i][j]);
+                    }
                 }
         }
         __syncthreads();
@@ -602,6 +688,7 @@ struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; 
 struct ggml_cuda_mmb_context {
     struct workspace {
         std::vector<mmb_cache_entry> cache;
+        std::vector<mmb_cache_entry> cache_f16;
         mmb_cache_entry slots[4] = {};
         size_t slot_cap[4] = {};
     };
@@ -642,6 +729,32 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
     for (auto & e : mmb_workspace(ctx).cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
+    return buf;
+}
+
+static uint16_t * mmb_cache_insert_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const size_t n) {
+    if (mmb_workspace(ctx).cache_f16.size() >= mmb_cache_max()) { delete mmb_workspace(ctx).cache_f16.front().buf; mmb_workspace(ctx).cache_f16.erase(mmb_workspace(ctx).cache_f16.begin()); }
+    auto * buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n);
+    mmb_workspace(ctx).cache_f16.push_back({mmb_root(t), t->data, n, buf});
+    return buf->get();
+}
+static const uint16_t * mmb_f16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
+    const ggml_tensor * root = mmb_root(src1);
+    for (auto & e : mmb_workspace(ctx).cache_f16) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    // A fused producer may have written only the BF16 copy: read it instead of the (unwritten) F32 data.
+    const uint16_t * bf16 = nullptr;
+    for (auto & work : mmb_state(ctx).streams) {
+        for (auto & e : work.slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) bf16 = e.buf->get();
+    }
+    if (bf16 == nullptr) {
+        for (auto & e : mmb_workspace(ctx).cache) if (e.root == root && e.data == src1->data && e.n == n) bf16 = e.buf->get();
+    }
+    uint16_t * buf = mmb_cache_insert_f16(ctx, src1, n);
+    if (bf16 != nullptr) {
+        mmb_cvt_bf16_f16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>(bf16, buf, n);
+    } else {
+        mmb_cvt_f32_f16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
+    }
     return buf;
 }
 
@@ -745,6 +858,8 @@ void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx) {
     for (auto & work : mmb_state(ctx).streams) {
         for (auto & e : work.cache) delete e.buf;
         work.cache.clear();
+        for (auto & e : work.cache_f16) delete e.buf;
+        work.cache_f16.clear();
         for (auto & e : work.slots) { e.root = nullptr; e.data = nullptr; e.n = 0; }
     }
 }
@@ -771,6 +886,7 @@ uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const gg
 
 bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
+    if (ctx.mmb_ids_only) return false;
     const bool quant = mmb_quant_type(src0->type);
     const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
     const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
@@ -787,7 +903,11 @@ bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tens
 
 bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
-    if (!mmb_quant_type(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
+    const char * qenv = getenv("MMB_QUANT_MID");
+    const bool bf16w  = src0->type == GGML_TYPE_BF16 && (ctx.mmb_mid_bf16 || getenv("MMB_BF16") != nullptr);
+    const bool quantw = mmb_quant_type(src0->type) &&
+        (qenv ? atoi(qenv) != 0 : (ctx.mmb_mid_quant || (ctx.mmb_mid_q8_f16 && src0->type == GGML_TYPE_Q8_0)));
+    if ((!quantw && !bf16w) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
     const int64_t K = src0->ne[0], M = src0->ne[1], E = src0->ne[2];
     if (src0->ne[3] != 1 || K % 64 != 0 || E < 1 || E > 1024) return false;
@@ -889,7 +1009,9 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int n_rows_x = ne11 * T, n_rows = n_used * T;
     constexpr int BN = 128;
 
-    const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
+    const bool q8_f16 = src0->type == GGML_TYPE_Q8_0 && (ctx.mmb_mid_q8_f16 || getenv("MMB_Q8_F16") != nullptr);
+    const uint16_t * xhp = q8_f16 ? mmb_f16_activation(ctx, src1, (size_t) n_rows_x * K, stream)
+                                  : mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_rows);
@@ -912,7 +1034,13 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     uint16_t * Dh = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(ctx, dst)) ? (uint16_t *) dst->data : nullptr;
     const bool store_f32 = Dh == nullptr;
     dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
-    mmb_dispatch_quant(src0->type, [&](auto tag) {
+    if (q8_f16) {
+    mmb_routed_kernel<128, BN, 32, 64, 3><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+    mmb_routed_kernel<128, BN_SMALL, 32, 16, 3><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    } else if (src0->type == GGML_TYPE_BF16) {
+    mmb_routed_kernel<128, BN, 32, 64, 2><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+    mmb_routed_kernel<128, BN_SMALL, 32, 16, 2><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    } else mmb_dispatch_quant(src0->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
     mmb_routed_kernel<128, BN, 32, 64, WT><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
     mmb_routed_kernel<128, BN_SMALL, 32, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
@@ -922,7 +1050,11 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
     if (!mmb_enabled(ctx) || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
-    if (!mmb_quant_type(gw->type) || uw->type != gw->type) return false;
+    const char * gwqenv = getenv("MMB_QUANT_MID");
+    const bool gw_bf16  = gw->type == GGML_TYPE_BF16 && (ctx.mmb_mid_bf16 || getenv("MMB_BF16") != nullptr);
+    const bool gw_quant = mmb_quant_type(gw->type) &&
+        (gwqenv ? atoi(gwqenv) != 0 : (ctx.mmb_mid_quant || (ctx.mmb_mid_q8_f16 && gw->type == GGML_TYPE_Q8_0)));
+    if ((!gw_quant && !gw_bf16) || uw->type != gw->type) return false;
     if (!ggml_are_same_shape(gw, uw) || gw->nb[1] != uw->nb[1] || gw->nb[2] != uw->nb[2]) return false;
     if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) return false;
     if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || !glu->src[0] || !glu->src[1]) return false;
@@ -938,7 +1070,9 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
     const int n_rows_x = ne11 * T, n_rows = n_used * T;
     constexpr int BN = 128;
-    const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
+    const bool q8_f16 = gw->type == GGML_TYPE_Q8_0 && (ctx.mmb_mid_q8_f16 || getenv("MMB_Q8_F16") != nullptr);
+    const uint16_t * xhp = q8_f16 ? mmb_f16_activation(ctx, src1, (size_t) n_rows_x * K, stream)
+                                  : mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_rows);
     ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), E + 1);
@@ -959,7 +1093,13 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(ctx, glu);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
     dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
-    mmb_dispatch_quant(gw->type, [&](auto tag) {
+    if (q8_f16) {
+    mmb_routed_glu_kernel<64, BN, 32, 32, 3><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+    mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, 3><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    } else if (gw->type == GGML_TYPE_BF16) {
+    mmb_routed_glu_kernel<64, BN, 32, 32, 2><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+    mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, 2><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    } else mmb_dispatch_quant(gw->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
     mmb_routed_glu_kernel<64, BN, 32, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
     mmb_routed_glu_kernel<64, BN_SMALL, 16, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);

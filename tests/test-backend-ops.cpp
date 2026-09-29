@@ -10594,6 +10594,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // BF16 MoE experts (qwen35moe UD quants): production gate/up [512,2048] and down [2048,512]
+    // shapes, at and around the mmb_min_t = 512 sequence-length guard.
+    for (int tokens : {511, 512, 513, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false,  512, tokens, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 256, 8, false, 2048, tokens,  512));
+    }
+
+    // Q8_0 MoE experts on the F16 WMMA route (qwen35moe), same production shapes and guard.
+    for (int tokens : {511, 512, 513, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false,  512, tokens, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, tokens,  512));
+    }
+
     for (int blocks : {63,64,65,1024}) {
         for (int heads : {1,2,4,15,16,32}) {
             test_cases.emplace_back(new test_indexer_head_sum(blocks,heads,64));
@@ -13855,6 +13868,14 @@ static void set_mmb(ggml_backend_t backend, bool enable) {
     auto set_mmb_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_enabled");
     if (set_mmb_fn) {
         set_mmb_fn(backend, enable);
+    }
+    auto set_mmb_mid_bf16_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_mid_bf16");
+    if (set_mmb_mid_bf16_fn) {
+        set_mmb_mid_bf16_fn(backend, enable);
+    }
+    auto set_mmb_mid_q8_f16_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_mid_q8_f16");
+    if (set_mmb_mid_q8_f16_fn) {
+        set_mmb_mid_q8_f16_fn(backend, enable);
     }
 }
 
