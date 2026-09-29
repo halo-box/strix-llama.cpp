@@ -1,0 +1,210 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+// Chunked gated delta net, part 1 of 2 (part 2: gdn_chunk_scan.comp). Fully parallel: one workgroup per
+// (chunk of CL tokens, q/k head, sequence), serving every value head that reads that q/k head.
+// With G the in-chunk inclusive cumsum of the gate g and D[r][s] = exp(G_r - G_s):
+//   A[r][s] = beta_r (k_r . k_s) D[r][s] (s < r),   T = (I + A)^-1 diag(beta)
+//   P[r][s] = scale (q_r . k_s) D[r][s]       (s <= r)
+// Scratch written for the scan (f16 unless noted), per (seq, chunk, q/k head): Qh [CL][128], Kh [CL][128],
+// KhT [128][CL]; per (seq, chunk, value head): T [CL][CL], P [CL][CL], gam = exp(G) [CL] f32,
+// dec = exp(G_last - G) [CL] f32. Chunk-major, so concurrent workgroups touch adjacent memory (head-major
+// scratch put every workgroup's rows one head stride apart: DRAM channel camping, 3.6x slower).
+// The f16 matrices are stored as WMMA A fragments (FRAG_H): 16x16 tiles row-block-major, each tile 16 rows of
+// 16 contiguous halves, so a scan lane reads its fragment as two adjacent 16-byte units.
+// Tokens past n_tokens are padded with q = k = 0, g = 0, beta = 0: their T rows/columns and updates vanish.
+// Wave32 required (hand-built RDNA3 WMMA fragments, see gdn_chunk_scan.comp).
+// Idea from halo-box/strix-llama.cpp#91 (Gaetan Puleo).
+
+#define S_V 128
+#define CL 32
+#define NVMAX 4
+#define QS 68                                   // LDS row stride of Q/K in uints (64 + 4 pad)
+#define AS 36                                   // LDS row stride of A in floats (16-byte aligned rows)
+#define QKU (3 * CL * S_V / 2)                  // scratch uints per (q/k head, chunk)
+#define TPU (CL * CL + 2 * CL)                  // scratch uints per (value head, chunk)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint H;
+    uint n_tokens;
+    uint n_seqs;
+    uint s_off;
+    uint sq1, sq2, sq3;
+    uint sv1, sv2, sv3;
+    uint sb1, sb2, sb3;
+    uint neq1, rq3;
+    float scale;
+    uint K;
+    uint nch;
+};
+
+layout(binding = 0) readonly  buffer QBuf    { float data_q[];    };
+layout(binding = 1) readonly  buffer KBuf    { float data_k[];    };
+layout(binding = 2) readonly  buffer GBuf    { float data_g[];    };
+layout(binding = 3) readonly  buffer BetaBuf { float data_beta[]; };
+layout(binding = 4) writeonly buffer ScrBuf  { uint data_scr[];   };
+layout(binding = 4) writeonly buffer ScrBuf16 { float16_t data_scr16[]; };
+
+// half index of element (row, col) of a matrix with NCB 16-column blocks, in fragment-tile order
+#define FRAG_H(row, col, NCB) (((((row) / 16) * (NCB) + (col) / 16) * 16 + (row) % 16) * 16 + (col) % 16)
+
+// Q/K rows as packed f16 pairs (K rows 0..CL-1, Q rows CL..2CL-1); reused as A[NVMAX][CL][AS] f32 afterwards
+shared uint U[NVMAX * CL * AS > 2 * CL * QS ? NVMAX * CL * AS : 2 * CL * QS];
+shared float KK[CL * (CL + 1)];
+shared float QK[CL * (CL + 1)];
+shared float Gs[NVMAX][CL];
+shared float Bs[NVMAX][CL];
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MATA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MATB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+void main() {
+    const uint hk   = gl_WorkGroupID.x;             // heads fastest: concurrent workgroups stream adjacent rows
+    const uint c    = gl_WorkGroupID.y;
+    const uint seq  = gl_WorkGroupID.z;             // value sequence (q/k sequence seq / rq3)
+    const uint tid  = gl_LocalInvocationIndex;
+    const uint w    = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint t0   = c * CL;
+    const uint nv   = H / neq1;                              // value heads per q/k head (hk, hk + neq1, ...)
+    const uint iq3  = seq / rq3;
+
+    const uint qk_scr = ((seq * nch + c) * neq1 + hk) * QKU;
+    const uint tp_region = n_seqs * nch * neq1 * QKU;
+
+    // Q/K rows -> f16 pairs in LDS and in the scratch (Qh at +0, Kh at +CL*64)
+    for (uint p = tid; p < CL * S_V / 2; p += 256) {
+        const uint t  = p / (S_V / 2);
+        const uint kp = p % (S_V / 2);
+        vec2 kv = vec2(0.0);
+        vec2 qv = vec2(0.0);
+        if (t0 + t < n_tokens) {
+            const uint off = iq3 * sq3 + (t0 + t) * sq2 + hk * sq1 + 2 * kp;
+            kv = vec2(data_k[off], data_k[off + 1]);
+            qv = vec2(data_q[off], data_q[off + 1]);
+        }
+        const uint ku = packFloat2x16(f16vec2(kv));
+        const uint qu = packFloat2x16(f16vec2(qv));
+        U[t * QS + kp]        = ku;
+        U[(CL + t) * QS + kp] = qu;
+        data_scr[qk_scr + FRAG_H(t, 2 * kp, S_V / 16) / 2]               = qu;
+        data_scr[qk_scr + CL * S_V / 2 + FRAG_H(t, 2 * kp, S_V / 16) / 2] = ku;
+    }
+    barrier();
+
+    // KhT [128][CL] at +CL*128 (in uints): thread (k, t pair)
+    for (uint p = tid; p < S_V * CL / 2; p += 256) {
+        const uint k  = p / (CL / 2);
+        const uint tp = p % (CL / 2);
+        const uint a = U[(2 * tp) * QS + k / 2];
+        const uint b = U[(2 * tp + 1) * QS + k / 2];
+        const uint lo = (k & 1) != 0 ? (a >> 16) : (a & 0xFFFFu);
+        const uint hi = (k & 1) != 0 ? (b >> 16) : (b & 0xFFFFu);
+        data_scr[qk_scr + CL * S_V + FRAG_H(k, 2 * tp, CL / 16) / 2] = lo | (hi << 16);
+    }
+
+    // KK^T and QK^T (CL x CL, f32 accumulation): wave w -> product w / 4 (0 KK, 1 QK), tile (w / 2 % 2, w % 2)
+    {
+        const uint lr = lane % 16;
+        const uint prod = w / 4;
+        const uint rt = (w / 2) % 2;
+        const uint st = w % 2;
+        const uint arow = (prod * CL + rt * 16 + lr) * QS;
+        const uint brow = (st * 16 + lr) * QS;
+        ACC acc = ACC(0.0);
+        [[unroll]] for (uint kt = 0; kt < S_V / 16; kt++) {
+            MATA a;
+            MATB b;
+            [[unroll]] for (uint e = 0; e < 8; e++) {
+                const f16vec2 av = unpackFloat2x16(U[arow + kt * 8 + e]);
+                const f16vec2 bv = unpackFloat2x16(U[brow + kt * 8 + e]);
+                a[2 * e] = av.x; a[2 * e + 1] = av.y;
+                b[2 * e] = bv.x; b[2 * e + 1] = bv.y;
+            }
+            acc = coopMatMulAdd(a, b, acc);
+        }
+        if (prod == 0) {
+            coopMatStore(acc, KK, rt * 16 * (CL + 1) + st * 16, CL + 1, gl_CooperativeMatrixLayoutRowMajor);
+        } else {
+            coopMatStore(acc, QK, rt * 16 * (CL + 1) + st * 16, CL + 1, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+
+    for (uint j0 = 0; j0 < nv; j0 += NVMAX) {
+        barrier();
+        // wave j: gate cumsum and beta of value head j0 + j, lane = token
+        if (w < NVMAX && j0 + w < nv) {
+            const uint h = hk + (j0 + w) * neq1;
+            float g = 0.0;
+            float b = 0.0;
+            if (lane < CL && t0 + lane < n_tokens) {
+                const uint gb_off = seq * sb3 + (t0 + lane) * sb2 + h * sb1;
+                g = data_g[gb_off];
+                b = data_beta[gb_off];
+            }
+            const float G = subgroupInclusiveAdd(g);
+            const float GL = subgroupBroadcast(G, CL - 1);
+            if (lane < CL) {
+                Gs[w][lane] = G;
+                Bs[w][lane] = b;
+                const uint tp = tp_region + ((seq * nch + c) * H + h) * TPU;
+                data_scr[tp + CL * CL + lane]      = floatBitsToUint(exp(G));
+                data_scr[tp + CL * CL + CL + lane] = floatBitsToUint(exp(GL - G));
+            }
+        }
+        barrier();
+        // A (f32, LDS) and P (f16, scratch); thread (j, r, s)
+        for (uint i = tid; i < NVMAX * CL * CL; i += 256) {
+            const uint j = i / (CL * CL);
+            const uint r = (i / CL) % CL;
+            const uint s = i % CL;
+            if (j0 + j < nv) {
+                const uint h = hk + (j0 + j) * neq1;
+                const float e = s <= r ? exp(Gs[j][r] - Gs[j][s]) : 0.0;
+                U[(j * CL + r) * AS + s] = floatBitsToUint(s < r ? Bs[j][r] * KK[r * (CL + 1) + s] * e : 0.0);
+                const uint tp = tp_region + ((seq * nch + c) * H + h) * TPU;
+                data_scr16[2 * (tp + CL * CL / 2) + FRAG_H(r, s, CL / 16)] = float16_t(scale * QK[r * (CL + 1) + s] * e);
+            }
+        }
+        barrier();
+        // T = (I + A)^-1 diag(beta) by forward substitution: thread (j, col) keeps its column in registers
+        if (tid < NVMAX * CL) {
+            const uint j   = tid / CL;
+            const uint col = tid % CL;
+            if (j0 + j < nv) {
+                const uint h = hk + (j0 + j) * neq1;
+                const uint tp = tp_region + ((seq * nch + c) * H + h) * TPU;
+                const float b = Bs[j][col];
+#if CL != 32
+#error TROW list assumes CL 32
+#endif
+                float x[CL];
+                // fully unrolled (a rolled row loop leaves one LDS round trip per FMA): row R of the column
+#define TROW(R) { \
+                    float v = (R) == col ? 1.0 : 0.0; \
+                    [[unroll]] for (uint ss = 0; ss < (R); ss++) { \
+                        v -= uintBitsToFloat(U[(j * CL + (R)) * AS + ss]) * x[ss]; \
+                    } \
+                    x[R] = v; \
+                    data_scr16[2 * tp + FRAG_H(R, col, CL / 16)] = float16_t(v * b); }
+                TROW(0)  TROW(1)  TROW(2)  TROW(3)  TROW(4)  TROW(5)  TROW(6)  TROW(7)
+                TROW(8)  TROW(9)  TROW(10) TROW(11) TROW(12) TROW(13) TROW(14) TROW(15)
+                TROW(16) TROW(17) TROW(18) TROW(19) TROW(20) TROW(21) TROW(22) TROW(23)
+                TROW(24) TROW(25) TROW(26) TROW(27) TROW(28) TROW(29) TROW(30) TROW(31)
+#undef TROW
+            }
+        }
+    }
+}
