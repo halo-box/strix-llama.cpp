@@ -3212,18 +3212,63 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     int idx[n_ops];
     int found = 0;
     int last  = node_idx;
-    for (int j = node_idx + 1; j < cgraph->n_nodes && found < n_ops; ++j) {
+    // qwen4exp (build_gdn_l2_norm) spells the q/k L2 norm as RMS_NORM(x, eps) -> SCALE(mul, add): accept the
+    // pair in place of each single L2_NORM at positions 4/5 without changing the 14-entry op list. The extra
+    // SCALE nodes are absorbed into positions 4/5 and only widen the skipped range, so idx[] keeps pointing
+    // at the logical ops (in particular idx[10] is still the gated delta net).
+    int qk_mode = -1; // -1: undecided, 0: L2_NORM, 1: RMS_NORM + SCALE
+    const ggml_tensor * qk_scale[2] = { nullptr, nullptr };
+    for (int j = node_idx + 1; j < cgraph->n_nodes && found < n_ops; ) {
         const ggml_tensor * t = cgraph->nodes[j];
         if (ggml_cuda_is_view_or_noop(t)) {
+            ++j;
             continue;
         }
-        if (t->op != expected[found] || t->type != GGML_TYPE_F32) {
+        if (t->type != GGML_TYPE_F32) {
+            return 0;
+        }
+        if (found == 4 || found == 5) {
+            const int iqk = found - 4;
+            if (t->op == GGML_OP_L2_NORM) {
+                if (qk_mode == 1) {
+                    return 0;
+                }
+                qk_mode = 0;
+            } else if (t->op == GGML_OP_RMS_NORM && t->src[1] == nullptr) {
+                if (qk_mode == 0) {
+                    return 0;
+                }
+                qk_mode = 1;
+                int j_scale = j + 1;
+                while (j_scale < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j_scale])) {
+                    ++j_scale;
+                }
+                if (j_scale >= cgraph->n_nodes) {
+                    return 0;
+                }
+                const ggml_tensor * s = cgraph->nodes[j_scale];
+                if (s->op != GGML_OP_SCALE || s->type != GGML_TYPE_F32 || s->src[0] != t ||
+                    s->src[1] != nullptr || !ggml_is_contiguous(s) || !ggml_are_same_shape(s, t)) {
+                    return 0;
+                }
+                qk_scale[iqk] = s;
+                n[found]   = t;
+                idx[found] = j;
+                last       = j_scale;
+                ++found;
+                j = j_scale + 1;
+                continue;
+            } else {
+                return 0;
+            }
+        } else if (t->op != expected[found]) {
             return 0;
         }
         n[found]   = t;
         idx[found] = j;
         last       = j;
         ++found;
+        ++j;
     }
     if (found != n_ops) {
         return 0;
@@ -3234,6 +3279,11 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     }
     for (int k = 0; k < n_ops; ++k) {
         if (k != 0 && k != 11 && k != 13 && (n[k]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+    }
+    for (int k = 0; k < 2; ++k) {
+        if (qk_scale[k] && (qk_scale[k]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
             return 0;
         }
     }
@@ -3315,8 +3365,12 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
         return 0;
     }
 
+    // the gated delta net consumes the L2_NORM outputs, or the SCALE outputs of the RMS_NORM + SCALE pair
+    const ggml_tensor * qk_out[2] = { qk_mode == 1 ? qk_scale[0] : l2_q, qk_mode == 1 ? qk_scale[1] : l2_k };
+
     // gated_delta_net(q, k, v, gate, beta, state) with the state gathered from the cache by get_rows
-    if (gdn->src[0] != l2_q || gdn->src[1] != l2_k || !is_view_of(gdn->src[3], mul_a, 0) || !is_view_of(gdn->src[4], sigmoid, 0) ||
+    if (gdn->src[0] != qk_out[0] || gdn->src[1] != qk_out[1] ||
+        !is_view_of(gdn->src[3], mul_a, 0) || !is_view_of(gdn->src[4], sigmoid, 0) ||
         gdn->src[3]->ne[0] != 1 || ggml_nelements(gdn->src[3]) != H_v || ggml_nelements(gdn->src[4]) != H_v ||
         !is_view_of(gdn->src[5], get_rows, 0) || ggml_nelements(get_rows) != S * S * H_v) {
         return 0;
@@ -3381,6 +3435,15 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     args.ssm_a          = (const float *) mul_a->src[1]->data;
     args.beta           = (const float *) sigmoid->src[0]->data;
     args.eps_l2         = eps_q;
+    args.qk_rms_scale   = qk_mode == 1;
+    if (qk_mode == 1) {
+        args.qk_rms_eps[0]   = ggml_get_op_params_f32(l2_q, 0);
+        args.qk_rms_eps[1]   = ggml_get_op_params_f32(l2_k, 0);
+        args.qk_scale_mul[0] = ggml_get_op_params_f32(qk_scale[0], 0);
+        args.qk_scale_mul[1] = ggml_get_op_params_f32(qk_scale[1], 0);
+        args.qk_scale_add[0] = ggml_get_op_params_f32(qk_scale[0], 1);
+        args.qk_scale_add[1] = ggml_get_op_params_f32(qk_scale[1], 1);
+    }
     args.state_cache    = (const float *) get_rows->src[0]->data;
     args.state_ids      = (const int32_t *) get_rows->src[1]->data;
     args.state_row_stride = get_rows->src[0]->nb[1] / sizeof(float);
@@ -4931,7 +4994,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 j++;
                 ggml_tensor * mm  = next_compute(j);
                 const int mm_idx  = j;
-                if (getenv("GGML_CUDA_DISABLE_GDN_GATE") == nullptr &&
+                // The folded gate path (rms_norm<128> + sigmoid + mul in the ssm_out matvec prologue) is only
+                // validated for the L2_NORM spelling. For the qwen4exp RMS_NORM+SCALE representation keep the
+                // plain fused kernel, which applies the gated norm itself: the chain fusion is the win and this
+                // avoids feeding the gate matvec tensors from a chain shape it was not exercised with.
+                if (getenv("GGML_CUDA_DISABLE_GDN_GATE") == nullptr && !args.qk_rms_scale &&
                         sig && mul && mm && sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID &&
                         mul->op == GGML_OP_MUL && mm->op == GGML_OP_MUL_MAT && mm->src[2] == nullptr &&
                         (mm->src[1] == mul || (ggml_cuda_is_view_or_noop(mm->src[1]) && mm->src[1]->view_src == mul &&
