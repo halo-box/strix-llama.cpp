@@ -6,6 +6,13 @@
 #include <set>
 #include <vector>
 
+#ifdef _WIN32
+#include <cstdlib>
+// Windows has no setenv/unsetenv; an empty value removes the variable
+static int setenv(const char * name, const char * value, int) { return _putenv_s(name, value); }
+static int unsetenv(const char * name) { return _putenv_s(name, ""); }
+#endif
+
 // Host-side regression for the qsa_fast gate lifted from 127 to 512 tokens:
 // incremental indexer-key pooling must select exactly the touched blocks, and
 // must stay off when the prefix, the commit state or the size guard does not hold.
