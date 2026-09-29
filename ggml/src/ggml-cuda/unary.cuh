@@ -128,3 +128,7 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
 // fused GGML_OP_SCALE + GGML_UNARY_OP_{SILU,SIGMOID}: dst = op(scale*x + bias)
 void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node, uint16_t * dst16 = nullptr);
+
+// out = other + src * sigmoid(gate[row]) (gate: one value per row)
+void ggml_cuda_op_sigmoid_gate_mul_add(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * src,
+        const ggml_tensor * other, ggml_tensor * out);

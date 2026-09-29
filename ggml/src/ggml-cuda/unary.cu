@@ -791,3 +791,38 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
             GGML_ABORT("unsupported unary op for fused scale+unary");
     }
 }
+
+/* prefill shared-expert merge: out = other + src * sigmoid(gate[t]) with one gate value per row (token); the product
+   and the sum are rounded separately (no fma contraction), as the unfused MUL and ADD nodes -> bit-identical */
+#if defined(GGML_USE_HIP)
+static __device__ __forceinline__ float sgma_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
+static __device__ __forceinline__ float sgma_add_rn(const float a, const float b) { float r; asm("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
+#else
+static __device__ __forceinline__ float sgma_mul_rn(const float a, const float b) { return __fmul_rn(a, b); }
+static __device__ __forceinline__ float sgma_add_rn(const float a, const float b) { return __fadd_rn(a, b); }
+#endif
+static __global__ void sigmoid_gate_mul_add_f32(const float * __restrict__ src, const float * __restrict__ other,
+        const float * __restrict__ gate, float * __restrict__ out, const int64_t ncols, const int64_t n) {
+    const int64_t i = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= n) {
+        return;
+    }
+    if (i + 4 <= n && (ncols % 4) == 0) {
+        const float  g = op_sigmoid(gate[i / ncols]);
+        const float4 a = *(const float4 *) (src + i), b = *(const float4 *) (other + i);
+        *(float4 *) (out + i) = make_float4(sgma_add_rn(b.x, sgma_mul_rn(a.x, g)), sgma_add_rn(b.y, sgma_mul_rn(a.y, g)),
+                                            sgma_add_rn(b.z, sgma_mul_rn(a.z, g)), sgma_add_rn(b.w, sgma_mul_rn(a.w, g)));
+    } else {
+        for (int64_t j = i; j < n && j < i + 4; ++j) {
+            out[j] = sgma_add_rn(other[j], sgma_mul_rn(src[j], op_sigmoid(gate[j / ncols])));
+        }
+    }
+}
+
+void ggml_cuda_op_sigmoid_gate_mul_add(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * src,
+        const ggml_tensor * other, ggml_tensor * out) {
+    const int64_t n = ggml_nelements(out), ncols = out->ne[0];
+    sigmoid_gate_mul_add_f32<<<(unsigned) ((n / 4 + 255) / 256 + 1), 256, 0, ctx.stream()>>>((const float *) src->data,
+        (const float *) other->data, (const float *) gate->data, (float *) out->data, ncols, n);
+    CUDA_CHECK(cudaGetLastError());
+}

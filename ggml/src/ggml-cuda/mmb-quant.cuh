@@ -160,14 +160,30 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
         for (int tid = lane; tid < 32; tid += 8) dequantize_iq3_xxs<float>(row, k0 / QK, out, tid);
     }
     else if constexpr (TYPE == GGML_TYPE_IQ3_S) {
-        const mmb_quant_slice out{dst, k0 % QK};
+        // lane -> (il = lane>>1, ib = ib0 + (lane&1)): 8 consecutive weights, one 16-byte LDS store.
+        // Same arithmetic as dequantize_iq3_s (d * grid * sign in fp32, then RNE bf16) -> bit-identical.
+        const block_iq3_s * x = (const block_iq3_s *) row + k0 / QK;
+        const int ib0 = (k0 % QK) / 32, sub = lane & 1, il = lane >> 1, ib = ib0 + sub;
+        const uint16_t q2 = *(const uint16_t *)(x->qs + 8 * ib + 2 * il);
+        const int qh = x->qh[ib];
+        const uint32_t g1 = iq3s_grid[(q2 & 0xff) | ((qh << (8 - 2 * il)) & 256)];
+        const uint32_t g2 = iq3s_grid[(q2 >> 8)   | ((qh << (7 - 2 * il)) & 256)];
+        const float d = (float) x->d * (1 + 2 * ((x->scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
+        const int signs = x->signs[4 * ib + il];
+        float v[8];
 #pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq3_s<float>(row, k0 / QK, out, tid);
+        for (int j = 0; j < 4; ++j) {
+            v[j + 0] = d * (float)((g1 >> (8 * j)) & 0xff) * (signs & (1 << (j + 0)) ? -1.f : 1.f);
+            v[j + 4] = d * (float)((g2 >> (8 * j)) & 0xff) * (signs & (1 << (j + 4)) ? -1.f : 1.f);
+        }
+        uint4 o; o.x = mmb_pack2(v[0], v[1]); o.y = mmb_pack2(v[2], v[3]); o.z = mmb_pack2(v[4], v[5]); o.w = mmb_pack2(v[6], v[7]);
+        *(uint4 *)(dst + 32 * sub + 8 * il) = o;
     }
     else if constexpr (TYPE == GGML_TYPE_IQ4_XS) {
+        // decode only the two 32-blocks of this 64-wide K slice (tid = il*8 + ib): 1 call/lane instead of 4
         const mmb_quant_slice out{dst, k0 % QK};
-#pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq4_xs<float>(row, k0 / QK, out, tid);
+        const int ib0 = (k0 % QK) / 32;
+        dequantize_iq4_xs<float>(row, k0 / QK, out, (lane >> 1) * 8 + ib0 + (lane & 1));
     }
     else if constexpr (TYPE == GGML_TYPE_IQ4_NL) {
 #pragma unroll
@@ -289,7 +305,8 @@ static void mmb_dispatch_quant(ggml_type type, Fn fn) {
     }
 }
 
-__device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta, int slice, uint32_t * out) {
+template <bool HALF = false>
+__device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta, int slice, uint32_t * out, int half = 0) {
     const float d = mmb_h2f((uint16_t) meta.x), dm = mmb_h2f((uint16_t)(meta.x >> 16));
     auto byte = [&](int i) { const uint32_t word = i < 4 ? meta.y : i < 8 ? meta.z : meta.w; return (word >> (8 * (i & 3))) & 255; };
     auto scale_min = [&](int i, float & ds, float & ms) {
@@ -301,12 +318,13 @@ __device__ __forceinline__ void mmb_dq_q4k_slice(uint4 q0, uint4 q1, uint4 meta,
     scale_min(2 * slice, d0, m0); scale_min(2 * slice + 1, d1, m1);
     const uint32_t words[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
+    for (int j = 0; j < (HALF ? 4 : 8); ++j) {
+        const int wj = HALF ? j + 4 * half : j;
         const uint32_t q = words[j];
-        out[2*j] = mmb_pack2(d0 * (q & 15) - m0, d0 * ((q >> 8) & 15) - m0);
-        out[2*j + 1] = mmb_pack2(d0 * ((q >> 16) & 15) - m0, d0 * ((q >> 24) & 15) - m0);
-        out[16 + 2*j] = mmb_pack2(d1 * ((q >> 4) & 15) - m1, d1 * ((q >> 12) & 15) - m1);
-        out[16 + 2*j + 1] = mmb_pack2(d1 * ((q >> 20) & 15) - m1, d1 * (q >> 28) - m1);
+        out[2*wj] = mmb_pack2(d0 * (q & 15) - m0, d0 * ((q >> 8) & 15) - m0);
+        out[2*wj + 1] = mmb_pack2(d0 * ((q >> 16) & 15) - m0, d0 * ((q >> 24) & 15) - m0);
+        out[16 + 2*wj] = mmb_pack2(d1 * ((q >> 4) & 15) - m1, d1 * ((q >> 12) & 15) - m1);
+        out[16 + 2*wj + 1] = mmb_pack2(d1 * ((q >> 20) & 15) - m1, d1 * (q >> 28) - m1);
     }
 }
 
