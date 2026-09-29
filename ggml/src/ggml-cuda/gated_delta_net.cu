@@ -1584,7 +1584,7 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
 // lanes 0..3 (which reduces to (s0 + s2) + (s1 + s3)), times the norm weight
 template <int S>
 __global__ void __launch_bounds__(S, 1)
-gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, const float eps) {
+gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, const float eps, const float * z) {
     constexpr int warp_size = 32;
     static_assert(S == 4 * warp_size);
     __shared__ float red[4];
@@ -1603,7 +1603,13 @@ gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, cons
     const float tmp   = (red[0] + red[2]) + (red[1] + red[3]);
     const float mean  = tmp / (float) S;
     const float scale = rsqrtf(mean + eps);
-    out[(int64_t) h * S + tid] = scale * xi * norm_w[tid];
+    const float normed = scale * xi * norm_w[tid];
+    if (z != nullptr) {
+        // the following sigmoid(z) * normed of unary_gated_op_kernel<op_sigmoid>, same expression
+        out[(int64_t) h * S + tid] = (1.0f / (1.0f + expf(-z[(int64_t) h * S + tid]))) * normed;
+    } else {
+        out[(int64_t) h * S + tid] = normed;
+    }
 }
 
 void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in, float * attn_scratch) {
@@ -1618,6 +1624,11 @@ void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, cons
 }
 
 void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in) {
+    ggml_cuda_op_gdn_decode_fused_gated(ctx, args_in, nullptr, nullptr);
+}
+
+void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in,
+        const float * z, float * gated_out) {
     GGML_ASSERT(args_in.S == 128 && args_in.d_conv == 4);
     ggml_cuda_pool_alloc<float> attn(ctx.pool(), args_in.S * args_in.H_v);
     ggml_cuda_gdn_decode_args args = args_in;
@@ -1627,5 +1638,5 @@ void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_c
     const dim3 grid(args.H_v, 1, 1);
     const dim3 norm_block(128, 1, 1);
     const ggml_cuda_kernel_launch_params norm_params = ggml_cuda_kernel_launch_params(grid, norm_block, 0, ctx.stream());
-    ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get(), args.norm_w, args.out, args.eps_rms);
+    ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get(), args.norm_w, z ? gated_out : args.out, args.eps_rms, z);
 }
