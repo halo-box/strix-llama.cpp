@@ -9,6 +9,8 @@
 #include <thread>
 #include <cinttypes>
 #include <cstdint>
+#include <map>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 
@@ -808,14 +810,61 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
 // attention kernels understand that layout (F16 K/V, head 256, single stream; qsa_decode takes 1..512 queries,
 // qsa_prefill larger ubatches). They exist only in the HIP backend for RDNA3.5; the gate does not check the device, so
 // on any other backend the resulting maskless op is not taken by a QSA kernel.
+// nullptr when the maskless block-selection path is taken, otherwise the first clause that refused it. The
+// clauses are evaluated in exactly the order the boolean conjunction short-circuited in, so gate and reason can
+// never disagree. The strings are literals of this translation unit: callers may compare them by identity.
+static const char * qwen4exp_block_selection_miss(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
+        const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
+        ggml_type type_k, ggml_type type_v) {
+    if (!blk_bias) {
+        return "no eligible kq_mask";
+    }
+    if (n_stream != 1) {
+        return "n_stream > 1";
+    }
+    if (ratio <= 1) {
+        return "ratio <= 1";
+    }
+    if (hparams.indexer_top_k % ratio != 0) {
+        return "indexer_top_k not a multiple of ratio";
+    }
+    if (n_kv <= hparams.indexer_top_k + ratio - 1) {
+        return "n_kv below top_k window";
+    }
+    if (n_kv > 16777216) {
+        return "n_kv exceeds kernel index limit";
+    }
+    if (!ubatch.token) {
+        return "ubatch has no token input";
+    }
+    if (!cparams.flash_attn) {
+        return "flash_attn off";
+    }
+    if (!cparams.offload_kqv) {
+        return "kqv offload off";
+    }
+    if (hparams.f_max_alibi_bias != 0.0f) {
+        return "alibi bias in use";
+    }
+    if (hparams.attn_soft_cap) {
+        return "attention soft-cap in use";
+    }
+    if (hparams.n_embd_head_k() != 256 || hparams.n_embd_head_v() != 256) {
+        return "head dim not 256";
+    }
+    if (type_k != GGML_TYPE_F16) {
+        return "type_k not F16";
+    }
+    if (type_v != GGML_TYPE_F16) {
+        return "type_v not F16";
+    }
+    return nullptr;
+}
+
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
         ggml_type type_k, ggml_type type_v) {
-    return blk_bias && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
-        n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
-        cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
-        !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
-        type_k==GGML_TYPE_F16 && type_v==GGML_TYPE_F16;
+    return qwen4exp_block_selection_miss(blk_bias, n_stream, ratio, n_kv, ubatch, cparams, hparams, type_k, type_v) == nullptr;
 }
 
 // Visible-prefix scoring bound. For one sequence with unique non-negative positions the indexer enumerates
@@ -1120,11 +1169,55 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         const auto * attn_ctx = mctx_hyb->get_attn();
-        const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, n_stream, r, n_kv, ubatch, cparams, hparams,
-                attn_ctx->type_k(), attn_ctx->type_v());
+        const char * miss = attn_ctx ? qwen4exp_block_selection_miss(blk_bias, n_stream, r, n_kv, ubatch, cparams, hparams,
+                attn_ctx->type_k(), attn_ctx->type_v()) : "no attention context";
+        const bool blocks = miss == nullptr;
         const bool scalar = blocks && hparams.n_swa == 0 && mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
         qsa->compact  = scalar;
         qsa->maskless = scalar;
+
+        // route diagnosis: this else-branch runs once per ubatch (the shared qsa input is keyed by ratio), so the
+        // DBG line is the per-ubatch record and the INF fires only when the route or the refusing clause changes -
+        // an operator sees a silent maskless->masked flip at the default verbosity without a per-token flood.
+        // the can_reuse path recomputes the same gate but does not log: a reused graph repeats the decision that
+        // was recorded when the graph was built.
+        {
+            const char * why = scalar ? "maskless" : (miss != nullptr ? miss :
+                    (hparams.n_swa != 0 ? "swa layers present" : "cell visibility is not scalar"));
+            // keyed per memory object: the trunk and the MTP draft share this function but refuse the maskless
+            // path for different reasons, and a single global would flip on every rebuild between them
+            struct route_log {
+                const char * why = nullptr;
+                int64_t      at  = 0; // steady ms of the last INF line, to cap transition spam
+            };
+
+            static std::map<const void *, route_log> logged;
+
+            if (logged.size() > 64) { // entries live as long as their memory object: keep it bounded across reloads
+                logged.clear();
+            }
+
+            LLAMA_LOG_DEBUG("%s: qsa route: %s (n_tokens = %d, n_kv = %lld, ratio = %lld, n_stream = %lld)\n",
+                    __func__, why, (int) ubatch.n_tokens, (long long) n_kv, (long long) r, (long long) n_stream);
+
+            auto & entry = logged[mctx_hyb];
+
+            // workloads that alternate text and image ubatches flip the route as their steady state, so a
+            // transition line is rate-limited; the DBG record above stays unconditional
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+
+            if (entry.why == nullptr || std::strcmp(entry.why, why) != 0) {
+                if (now_ms - entry.at >= 5000) {
+                    LLAMA_LOG_INFO("%s: qsa route: %s (n_tokens = %d, n_kv = %lld, ratio = %lld, n_stream = %lld)%s\n",
+                            __func__, why, (int) ubatch.n_tokens, (long long) n_kv, (long long) r, (long long) n_stream,
+                            scalar ? "" : " - the masked attention path will allocate the per-layer mask");
+                    entry = route_log { why, now_ms };
+                }
+                // inside the window the change is dropped: the DBG line already carries every decision, and a
+                // suppressed-but-persistent route shows again on the next change after the window
+            }
+        }
         qsa->score_strip = qwen4exp_query_strip(n_tps, n_stream);
         qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, n_blocks, qsa->score_strip, r,
                 hparams.indexer_top_k/r, qsa->compact);
