@@ -1,4 +1,4 @@
-# ROCm release builds
+# ROCm and Vulkan release builds
 
 `.github/workflows/build-llamacpp-rocm.yml` publishes prebuilt ROCm binaries of this fork. It copies the
 pipeline of [lemonade-sdk/llamacpp-rocm](https://github.com/lemonade-sdk/llamacpp-rocm) (MIT) and uses the same
@@ -9,7 +9,11 @@ artifact layout, so tools that consume their releases can consume these ones too
 - One zip per GPU target: `llama-bNNNN-ubuntu-rocm-{target}-x64.zip`. Windows zips
   (`llama-bNNNN-windows-rocm-{target}-x64.zip`) are built only on a manual run that asks for them.
 - Targets: `gfx1151`, `gfx1150`, `gfx120X`, `gfx110X`, `gfx103X`, `gfx90a`, `gfx908`.
-- Each zip holds the llama.cpp binaries and shared libraries, built with `GGML_HIP=ON`, `GGML_RPC=ON` and
+- One Linux Vulkan zip per release: `llama-bNNNN-ubuntu-vulkan-x64.zip`. It is built from the same commit with
+  `GGML_VULKAN=ON`, loads the CPU variants and backends at runtime (`GGML_BACKEND_DL`,
+  `GGML_CPU_ALL_VARIANTS`), sets RPATH to `$ORIGIN`, and uses the system Vulkan loader and driver
+  (Mesa RADV on Strix Halo). A manual run can turn it off with the `vulkan` input.
+- Each ROCm zip holds the llama.cpp binaries and shared libraries, built with `GGML_HIP=ON`, `GGML_RPC=ON` and
   `BUILD_SHARED_LIBS=ON`.
 - Each zip also holds the ROCm runtime libraries it needs (hipBLAS, rocBLAS, hipBLASLt and their kernel
   libraries). On Linux, RPATH is set to `$ORIGIN`, so the zip runs without a system ROCm install.
