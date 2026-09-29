@@ -473,17 +473,19 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     const uint ib = idx / 16;
     const uint t0 = (idx & 0xfu) * 2u;
 
-    const float d = float(data_a[ib].d);
-    const uint off0 = tqk_off(t0);
-    const uint j0 = off0 >> 3u;
-    const uint s0 = tqk_state_bytes(uint(data_a[ib].qs[j0]),
-                                    uint(data_a[ib].qs[tqk_byte_wrap(j0 + 1u)]),
-                                    uint(data_a[ib].qs[tqk_byte_wrap(j0 + 2u)]), off0);
+    // Both windows lie in bits [off1, off1 + K + 16) with off1 = tqk_off(t0 + 1): at most 23 bits from
+    // word wb = off1 >> 4, so three (wrapped) u16 reads replace six byte reads (blocks are 2-byte aligned).
+    const float d = float(data_a_packed16[ib].d);
     const uint off1 = tqk_off(t0 + 1u);
-    const uint j1 = off1 >> 3u;
-    const uint s1 = tqk_state_bytes(uint(data_a[ib].qs[j1]),
-                                    uint(data_a[ib].qs[tqk_byte_wrap(j1 + 1u)]),
-                                    uint(data_a[ib].qs[tqk_byte_wrap(j1 + 2u)]), off1);
+    const uint wb = off1 >> 4u;
+    const uint w0 = uint(data_a_packed16[ib].qs[wb]);
+    const uint w1 = uint(data_a_packed16[ib].qs[tqk_word_wrap(wb + 1u)]);
+    const uint w2 = uint(data_a_packed16[ib].qs[tqk_word_wrap(wb + 2u)]);
+    const uint p01 = w0 | (w1 << 16u);
+    const uint p12 = w1 | (w2 << 16u);
+    const uint rel1 = off1 & 15u;
+    const uint s1 = tqk_state_words(p01, p12, 0u, rel1);           // step t0 + 1
+    const uint s0 = tqk_state_words(p01, p12, 0u, rel1 + TQK_K);   // step t0 (window K bits higher)
     const vec4 lo = tq2_t_step(s0) * d;
     const vec4 hi = tq2_t_step(s1) * d;
 
