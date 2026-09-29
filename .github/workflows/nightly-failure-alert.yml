@@ -13,7 +13,7 @@ env:
 jobs:
   alert:
     if: |
-      github.event.workflow_run.event == 'schedule' &&
+      github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion != 'success'
     runs-on: ubuntu-22.04
     permissions:
@@ -37,7 +37,7 @@ jobs:
         assignees=$(echo $ALERT_USERS | tr ' ' ',')
 
         body=$(cat <<EOF
-        $mentions the nightly llama.cpp + ROCm build **${CONCLUSION}** (started ${RUN_DATE}). No release was published.
+        $mentions the master llama.cpp + ROCm release build **${CONCLUSION}** (started ${RUN_DATE}). No release was published.
 
         **Run:** $RUN_URL
 
@@ -57,10 +57,10 @@ jobs:
         else
           echo "Opening new issue"
           gh issue create \
-            --title "Nightly build failed ($(date -u -d "$RUN_DATE" '+%Y-%m-%d'))" \
+            --title "Release build failed ($(date -u -d "$RUN_DATE" '+%Y-%m-%d'))" \
             --label "$ALERT_LABEL" \
             --assignee "$assignees" \
             --body "$body
 
-        Close this issue once the nightly is fixed. Further failures while it is open are added as comments."
+        Close this issue once the release build is fixed. Further failures while it is open are added as comments."
         fi

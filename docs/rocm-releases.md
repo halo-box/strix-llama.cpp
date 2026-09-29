@@ -6,7 +6,8 @@ artifact layout, so tools that consume their releases can consume these ones too
 
 ## What a release contains
 
-- One zip per OS and GPU target: `llama-bNNNN-{windows,ubuntu}-rocm-{target}-x64.zip`.
+- One zip per GPU target: `llama-bNNNN-ubuntu-rocm-{target}-x64.zip`. Windows zips
+  (`llama-bNNNN-windows-rocm-{target}-x64.zip`) are built only on a manual run that asks for them.
 - Targets: `gfx1151`, `gfx1150`, `gfx120X`, `gfx110X`, `gfx103X`, `gfx90a`, `gfx908`.
 - Each zip holds the llama.cpp binaries and shared libraries, built with `GGML_HIP=ON`, `GGML_RPC=ON` and
   `BUILD_SHARED_LIBS=ON`.
@@ -19,12 +20,13 @@ artifact layout, so tools that consume their releases can consume these ones too
 
 ## When it runs
 
-- Nightly at 13:00 UTC, two hours after TheRock publishes its nightly. This builds `master` and publishes a release.
-- On demand with `workflow_dispatch`. Inputs: OS list, targets, ROCm version, branch or tag, and whether to
-  publish.
+- On every merge to `master`. This builds the merged commit and publishes a release. A newer merge cancels a
+  release that is still building.
+- On demand with `workflow_dispatch`. Inputs: OS list (`ubuntu` by default, `windows,ubuntu` for both), targets,
+  ROCm version, branch or tag, and whether to publish.
 - On pull requests that change the pipeline itself. These runs build but do not publish.
 
-If a nightly run fails, `nightly-failure-alert.yml` opens or updates an issue labelled `nightly-failure`.
+If a release build for a merge fails, `nightly-failure-alert.yml` opens or updates an issue labelled `nightly-failure`.
 
 ## Hardware tests
 
