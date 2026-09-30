@@ -6182,7 +6182,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
 
     auto add_alloc_deps = [&](size_t start, size_t last_node) {
-
+        // last_node is the inclusive index of the final group node.
         for (size_t i = start; i < last_node; ++i) {
             params->add_alloc_dep(params->user_data, cgraph->nodes[i], cgraph->nodes[last_node]);
 
@@ -6259,7 +6259,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                 ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
 
-                            add_alloc_deps(i, i + ops.size());
+                            add_alloc_deps(i, i + ops.size() - 1);
                             i += ops.size() - 1;
                         }
                     }
