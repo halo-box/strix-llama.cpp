@@ -29,6 +29,21 @@ static bool hybrid_idx_no_recr(const llama_memory_recurrent * r) {
 // llama_memory_hybrid_idx
 //
 
+// can dev run maskless selected-key attention with the shapes of QSA layer il? (a probe op, as for weight buffer types)
+static bool qsa_selected_key_supported(ggml_backend_dev_t dev, const llama_hparams & hp, int il) {
+    ggml_init_params params = { 8*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(params) };
+    const int64_t d     = hp.n_embd_head_k();
+    const int64_t n_sel = hp.indexer_top_k + hp.dsv4_compress_ratios[il] - 1;
+    ggml_tensor * q   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, 1, hp.n_head(il), 1);
+    ggml_tensor * k   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, d, 4*n_sel, hp.n_head_kv(il), 1);
+    ggml_tensor * v   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, d, 4*n_sel, hp.n_head_kv(il), 1);
+    ggml_tensor * ids = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_I32, n_sel, 1, 1, 1);
+    ggml_tensor * fa  = ggml_flash_attn_ext(ctx.get(), q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_add_top_k(fa, ids, 0);
+    return ggml_backend_dev_supports_op(dev, fa);
+}
+
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
                             /* attn */
@@ -80,13 +95,15 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
     if (mem_idx) {
-        // the selected-key attention kernels exist only in the HIP backend (RDNA3.5); the QSA layers must all run there
+        // the QSA layers must all run where a kernel reads the selection list: HIP (RDNA3.5), or a backend that takes the probe op
+        // CUDA is not asked: its supports_op does not look at the list
         bool all = true, any = false;
         for (int il = 0; il < (int) model.hparams.n_layer_all; ++il) {
             if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] <= 0) { continue; }
             const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il)));
             any = true;
-            all = all && std::strcmp(reg, "ROCm") == 0;
+            all = all && (std::strcmp(reg, "ROCm") == 0 ||
+                          (std::strcmp(reg, "CUDA") != 0 && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il)));
         }
         selected_key_attn = any && all && offload;
         if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) { selected_key_attn = atoi(e) != 0; }
