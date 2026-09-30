@@ -4281,7 +4281,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
-        string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
+        string_format("minimum number of draft tokens to use for speculative decoding; with draft-mtp, a value > 0 makes the draft length "
+                      "cost-aware between --spec-draft-n-min and --spec-draft-n-max, e.g. 1 and 10 (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
             params.speculative.draft.n_min = value;
         }
