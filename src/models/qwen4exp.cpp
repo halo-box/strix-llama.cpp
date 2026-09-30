@@ -17,6 +17,9 @@
 #include <unistd.h>
 #endif
 
+// [TAG_QWEN4_REIMPLEMENT]
+// TODO: this graph implementation is pending complete reimplementation - do not use it as a reference
+
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
@@ -586,23 +589,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_build_forward_expand(gf, lo);
     }
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
+    ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
 
-    ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
-    gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+    ggml_tensor * mixed = nullptr;
+    if (cparams.fused_dsv4_hc_pre && il >= 0) {
+        // sigmoid gate and mean over the streams in one op
+        mixed = ggml_dsv4_hc_pre_gated(ctx0,
+                ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt),
+                ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
+    } else {
+        ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, gate));
+        gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
-    // collapse the streams by their mean
-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
-            ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
-    for (int64_t c = 1; c < hc; ++c) {
-        ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
-                ggml_row_size(gated->type, n_embd) * hc,
-                ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
+        // collapse the streams by their mean
+        mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
+                ggml_row_size(gated->type, n_embd) * hc, 0);
+        mixed = ggml_cont(ctx0, mixed);
+        for (int64_t c = 1; c < hc; ++c) {
+            ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+                    ggml_row_size(gated->type, n_embd) * hc,
+                    ggml_row_size(gated->type, n_embd) * c);
+            mixed = ggml_add(ctx0, mixed, s);
+        }
+        mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     }
-    mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
     cb(mixed, "hc_mixed", il);
 
     return mixed;
@@ -619,19 +631,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);
-    w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
-    // Emit the block output first and the scatter-weight chain right after it, so that
-    // scale -> sigmoid -> scale -> repeat -> mul -> add is one contiguous node run that
-    // backends can fuse into a single kernel.
-    ggml_build_forward_expand(gf, residual);
-    ggml_build_forward_expand(gf, block_out);
-    ggml_build_forward_expand(gf, w);
+    ggml_tensor * cur = nullptr;
+    if (cparams.fused_dsv4_hc_post && il >= 0) {
+        // identity comb: every stream adds the same block output, scaled by its own weight
+        cur = ggml_dsv4_hc_post(ctx0, block_out, residual, w, nullptr);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
+    } else {
+        w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
-    ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
-    b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+        // Emit the block output first and the scatter-weight chain right after it, so that
+        // scale -> sigmoid -> scale -> repeat -> mul -> add is one contiguous node run that
+        // backends can fuse into a single kernel.
+        ggml_build_forward_expand(gf, residual);
+        ggml_build_forward_expand(gf, block_out);
+        ggml_build_forward_expand(gf, w);
 
-    ggml_tensor * cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
+        ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
+        b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+
+        cur = ggml_add(ctx0, residual, ggml_mul(ctx0, b, w));
+    }
     cb(cur, "hc_combine", il);
 
     return cur;
@@ -807,12 +827,12 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
 // selected rows then carry the visibility themselves, so attention can run without a mask. Only the selected-key
 // attention kernels understand that layout (F16 K/V, head 256, single stream; qsa_decode takes 1..512 queries,
-// qsa_prefill larger ubatches). They exist only in the HIP backend for RDNA3.5; the gate does not check the device, so
-// on any other backend the resulting maskless op is not taken by a QSA kernel.
+// qsa_prefill larger ubatches). They exist only in the HIP backend for RDNA3.5, so the selection needs selected_key_attn
+// (the QSA layers run on ROCm). Other backends do not read the list: ggml-cuda aborts, Vulkan would attend to all cells.
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
-        ggml_type type_k, ggml_type type_v) {
-    return blk_bias && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
+        ggml_type type_k, ggml_type type_v, bool selected_key_attn) {
+    return selected_key_attn && blk_bias && cparams.causal_attn && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
         n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
@@ -921,8 +941,8 @@ static ggml_tensor * qwen4exp_finish_strips(ggml_context * ctx, ggml_cgraph * gr
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool causal_attn) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), causal_attn(causal_attn) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
@@ -930,7 +950,7 @@ public:
         if (tail_idxs) {
             mctx->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio);
         } else {
-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn);
         }
     }
 
@@ -962,7 +982,7 @@ public:
         // the selection mode and the strip bounds are baked into the graph, so a reused graph must agree on them
         const auto * attn = mctx->get_attn();
         const bool blocks = attn && qwen4exp_use_block_selection(blk_bias, n_stream, ratio, n_kv,
-                params.ubatch, params.cparams, params.hparams, attn->type_k(), attn->type_v());
+                params.ubatch, params.cparams, params.hparams, attn->type_k(), attn->type_v(), mctx->qsa_selected_key_attn());
         const bool scalar = blocks && params.hparams.n_swa == 0 && mctx->qsa_scalar_visibility(params.ubatch, ratio);
         res &= (tail_idxs != nullptr) == scalar;
         res &= compact == scalar;
@@ -997,6 +1017,9 @@ public:
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
+
+    // this is fixed for the graph's lifetime, as causal_attn is part of the reuse key (llm_graph_params::allow_reuse)
+    const bool causal_attn;
 };
 
 // indexer-key store only: the cache is written every ubatch, the selection is skipped while it fits the budget
@@ -1101,11 +1124,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // only the "which block is visible" half of the bias varies per block
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
-    // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
+    // alibi writes distances instead of a mask, so it opts out
     // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
     const bool blk_bias = kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
-        cparams.causal_attn && !hparams.use_alibi;
+        !hparams.use_alibi;
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -1114,7 +1137,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, cparams.causal_attn);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
@@ -1122,7 +1145,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         const auto * attn_ctx = mctx_hyb->get_attn();
         const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, n_stream, r, n_kv, ubatch, cparams, hparams,
-                attn_ctx->type_k(), attn_ctx->type_v());
+                attn_ctx->type_k(), attn_ctx->type_v(), mctx_hyb->qsa_selected_key_attn());
         const bool scalar = blocks && hparams.n_swa == 0 && mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
         qsa->compact  = scalar;
         qsa->maskless = scalar;
@@ -1162,7 +1185,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
-    ggml_tensor * storage = r == 4 && blk_bias && n_stream == 1 ? mctx_hyb->qsa_cache(ctx0, il) : nullptr;
+    ggml_tensor * storage = r == 4 && blk_bias && cparams.causal_attn && n_stream == 1 ? mctx_hyb->qsa_cache(ctx0, il) : nullptr;
     ggml_tensor * cached = storage && mctx_hyb->qsa_prefix_matches(ubatch) ? storage : nullptr;
     const bool fast_cache = cached && mctx_hyb->qsa_fast(il, ubatch);
     const int64_t prep_blocks = fast_cache ? (n_tokens+3)/4+2 : n_blocks;
