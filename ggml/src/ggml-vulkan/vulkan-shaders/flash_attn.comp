@@ -455,7 +455,8 @@ void main() {
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                     FLOAT_TYPE mvf = masksh[(c * cols_per_iter + col_tid) * masksh_stride + tile_row(r)];
 
-                    Sf[r][c] += slope[r]*mvf;
+                    // a masked key scores -inf outright, so non-finite K data cannot turn it into NaN
+                    Sf[r][c] = float(mvf) <= FA_MASK_DEAD ? ACC_TYPE(uintBitsToFloat(0xFF800000)) : Sf[r][c] + slope[r]*mvf;
                 }
             }
         }
@@ -516,9 +517,13 @@ void main() {
             }
 
             FLOAT_TYPE Pf[rows_per_thread];
+            bool dead[rows_per_thread];
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 Pf[r] = FLOAT_TYPE(exp(float(Sf[r][c]) - Mf[r]));
                 Lf[r] += Pf[r];
+                // masked keys add nothing, even where their V is not finite (0 * NaN)
+                dead[r] = NAN_SAFE_V && MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO &&
+                    float(masksh[(c * cols_per_iter + col_tid) * masksh_stride + tile_row(r)]) <= FA_MASK_DEAD;
             }
 
             [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
@@ -534,7 +539,9 @@ void main() {
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
                 }
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                    Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
+                    if (!dead[r]) {
+                        Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
+                    }
                 }
             }
         }

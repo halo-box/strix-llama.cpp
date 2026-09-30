@@ -13,6 +13,7 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_vote : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
 
@@ -65,6 +66,11 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+// Keys of block j hidden from every row of the tile: dead_stamp[c] == j + 1, and dead_blk == j + 1 when
+// block j has any. Stamps, so nothing is reset between blocks; only hidden keys write.
+shared uint dead_stamp[Bc];
+shared uint dead_blk;
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -102,6 +108,12 @@ void main() {
             i * Br + r < N) {
             Qf[r * qstride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
         }
+    }
+    if (NAN_SAFE_V && tid < Bc) {
+        dead_stamp[tid] = 0;
+    }
+    if (NAN_SAFE_V && tid == 0) {
+        dead_blk = 0;
     }
     barrier();
 
@@ -155,6 +167,7 @@ void main() {
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+        bool dead_rows = false;
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
             mask_cache[idx] = f16vec4(0);
@@ -178,6 +191,7 @@ void main() {
                 [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
                     uint32_t c = (idx + tid) / (Br / 4);
                     uint32_t r = (idx + tid) % (Br / 4);
+                    bool part_dead = false;
                     if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
                         if ((!KV_bounds_check || j * Bc + c < KV)) {
                             f16vec4 m;
@@ -209,6 +223,27 @@ void main() {
                                 m = f16vec4(0.0);
                             }
                             mask_cache[idx / WorkGroupSize] = m;
+                            // rows past the last query (a partial tile) see nothing; their zero mask fill must not
+                            // count as visibility
+                            vec4 mv = vec4(m);
+                            if (!(gqa_ratio > 1)) {
+                                [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                                    if (i * Br + r * 4 + k >= N) {
+                                        mv[k] = FA_MASK_DEAD;
+                                    }
+                                }
+                            }
+                            part_dead = NAN_SAFE_V && all(lessThanEqual(mv, vec4(FA_MASK_DEAD)));
+                        }
+                    }
+                    // the Br / 4 == 4 consecutive lanes holding key c agree it is hidden from all Br rows
+                    if (NAN_SAFE_V) {
+                        uint col_dead = part_dead ? 1u : 0u;
+                        col_dead &= subgroupShuffleXor(col_dead, 1);
+                        col_dead &= subgroupShuffleXor(col_dead, 2);
+                        if (col_dead != 0 && r == 0) {
+                            dead_stamp[c] = j + 1;
+                            atomicMax(dead_blk, j + 1);
                         }
                     }
                 }
@@ -225,6 +260,7 @@ void main() {
                 if (max_mask <= NEG_FLT_MAX_OVER_2) {
                     continue;
                 }
+                dead_rows = NAN_SAFE_V && dead_blk == j + 1;
             }
         }
 
@@ -338,7 +374,9 @@ void main() {
                         // Mask nem1 bounds check is handled when loading masks
                         ACC_TYPEV4 masks = ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
                         ACC_TYPEV4 slopes = ACC_TYPEV4(slope[r * 4], slope[r * 4 + 1], slope[r * 4 + 2], slope[r * 4 + 3]);
-                        sfsh[c * sfshstride + r] += slopes * masks;
+                        // a masked key scores -inf outright, so non-finite K data cannot turn it into NaN
+                        sfsh[c * sfshstride + r] = mix(sfsh[c * sfshstride + r] + slopes * masks,
+                            ACC_TYPEV4(uintBitsToFloat(0xFF800000)), lessThanEqual(vec4(masks), vec4(FA_MASK_DEAD)));
                     }
                 }
             }
@@ -408,7 +446,9 @@ void main() {
                 uint32_t c = (idx + tid) / (HSV_pad / 4);
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
-                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
+                    // keys hidden from every row stay zero: P is 0 there, but 0 * NaN is not
+                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4) &&
+                        !(dead_rows && dead_stamp[c] == j + 1)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
@@ -455,7 +495,7 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check;
+            const bool stage_v = USE_DECODE_V || KV_bounds_check || dead_rows;
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -469,7 +509,7 @@ void main() {
                     const uint ib = coord / BLOCK_SIZE_V;
                     const uint iqs = coord % BLOCK_SIZE_V;
 
-                    if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
+                    if ((!KV_bounds_check || (v_row < KV && v_col < HSV)) && !(dead_rows && dead_stamp[row] == j + 1)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
@@ -491,7 +531,7 @@ void main() {
             if (hsv_offset < HSV_pad) {
                 [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check) {
+                    if (!USE_DECODE_V && !KV_bounds_check && !dead_rows) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
