@@ -20,6 +20,7 @@ static bool hybrid_idx_no_recr(const llama_memory_recurrent * r) {
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <stdexcept>
@@ -78,6 +79,20 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
+    if (mem_idx) {
+        // the selected-key attention kernels exist only in the HIP backend (RDNA3.5); the QSA layers must all run there
+        bool all = true, any = false;
+        for (int il = 0; il < (int) model.hparams.n_layer_all; ++il) {
+            if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] <= 0) { continue; }
+            const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il)));
+            any = true;
+            all = all && std::strcmp(reg, "ROCm") == 0;
+        }
+        selected_key_attn = any && all && offload;
+        if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) { selected_key_attn = atoi(e) != 0; }
+        LLAMA_LOG_INFO("%s: QSA attention: %s\n", __func__, selected_key_attn ?
+            "selected-key kernels (maskless block selection)" : "masked top-k (no selected-key kernels on this backend)");
+    }
     if (!mem_idx || !offload || n_swa != 0) { return; }
     qsa_prefix = qsa_prefix_state(kv_size);
     const int layers = model.hparams.n_layer_all;
