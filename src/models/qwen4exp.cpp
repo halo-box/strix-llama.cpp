@@ -827,8 +827,8 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
 // selected rows then carry the visibility themselves, so attention can run without a mask. Only the selected-key
 // attention kernels understand that layout (F16 K/V, head 256, single stream; qsa_decode takes 1..512 queries,
-// qsa_prefill larger ubatches). They exist only in the HIP backend for RDNA3.5, so the selection needs selected_key_attn
-// (the QSA layers run on ROCm). Other backends do not read the list: ggml-cuda aborts, Vulkan would attend to all cells.
+// qsa_prefill larger ubatches). The HIP backend (RDNA3.5) and Vulkan (flash_attn_sel) have them, so the selection needs
+// selected_key_attn (all QSA layers run there). Dense kernels do not read the list: ggml-cuda aborts, Vulkan declines.
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
         ggml_type type_k, ggml_type type_v, bool selected_key_attn) {

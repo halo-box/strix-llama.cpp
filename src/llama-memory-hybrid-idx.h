@@ -119,7 +119,7 @@ private:
                       ggml_tensor * tails, const llama_ubatch & ubatch, uint32_t ratio) const;
 
     bool incremental_qsa = false;
-    // the QSA layers run on ROCm, which has the selected-key kernels for the maskless block selection; other backends use the masked top-k
+    // the QSA layers run where a kernel reads the maskless block selection (HIP on RDNA3.5, Vulkan); otherwise the masked top-k
     bool selected_key_attn = false;
     bool qsa_recover_pending = false;
     bool qsa_recover(llama_seq_id seq);

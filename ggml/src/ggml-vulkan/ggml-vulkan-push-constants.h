@@ -691,6 +691,55 @@ struct vk_op_lightning_indexer_push_constants {
 
 static_assert(sizeof(vk_op_lightning_indexer_push_constants) <= 128);
 
+struct vk_op_lightning_indexer_cm_push_constants {
+    uint32_t n_kv, n_batch, n_stream, nem3;
+    uint32_t nb1, nb3;
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk2, nbk3;
+    uint32_t nbw1, nbw3;
+    uint32_t nbm1, nbm3;
+};
+static_assert(sizeof(vk_op_lightning_indexer_cm_push_constants) <= 128);
+
+struct vk_op_flash_attn_union_push_constants {
+    uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to, count_only;
+};
+// nbk1/nbk3 are in 4-byte WORDS, not elements: the gather relocates K rows verbatim and never
+// interprets what is in them, so it works for any type whose row is a whole number of words.
+struct vk_op_flash_attn_gather_union_push_constants {
+    uint32_t n_kv, n_kv_raw, kv_c_max, nbk1, nbm1, n_batch, row_words;
+};
+struct vk_op_flash_attn_gather_push_constants {
+    uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
+    uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, nem3, n_batch, row_words;
+};
+static_assert(sizeof(vk_op_flash_attn_gather_push_constants) <= 128);
+
+struct vk_op_flash_attn_top_k_push_constants {
+    uint32_t n_batch, n_kv, n_kv_raw, n_top_k, n_head;
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk1, nbk3;
+    uint32_t nbm1, nbm3;
+    uint32_t nbt1, nbt3;
+    uint32_t nb1, nb2, nb3;
+    float scale;
+    uint32_t has_sinks;
+    uint32_t split_mode;
+};
+static_assert(sizeof(vk_op_flash_attn_top_k_push_constants) <= 128);
+
+struct vk_op_flash_attn_sel_push_constants {
+    uint32_t n_kv, n_sel, n_sort;
+    uint32_t nbq1, nbq2, nbq3;
+    uint32_t nbk1, nbk2, nbk3;
+    uint32_t nbv1, nbv2, nbv3;
+    uint32_t nbi1, nbi3;
+    uint32_t nb1, nb2, nb3;
+    float scale;
+    uint32_t n_split, chunk, n_head, n_tok, n_stream;
+};
+static_assert(sizeof(vk_op_flash_attn_sel_push_constants) <= 128);
+
 struct vk_op_gated_delta_net_push_constants {
     uint32_t H;
     uint32_t n_tokens;
