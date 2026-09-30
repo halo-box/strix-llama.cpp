@@ -1893,8 +1893,50 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // strixllama: a quantized weight of at most STRIX_Q_VEC_CHUNK_ROWS output rows (1024) at 9-32 columns
+    // (STRIX_Q_VEC_CHUNK_MAX, 0: off) - the hyper-connection down projection [10240 x 320], the attention k and v, the
+    // shared expert - is a handful of MMQ tiles, and MMQ has no stream-k on RDNA: three to five workgroups for the whole
+    // GPU. The vector kernel over 8-column chunks reads the weight twice and still takes about half the time. Taller
+    // weights stay on MMQ: for the [6144 x 2560] projections the second read cost more than the tiles lose.
+    static const int64_t q_vec_chunk_max  = getenv("STRIX_Q_VEC_CHUNK_MAX")  ? atoll(getenv("STRIX_Q_VEC_CHUNK_MAX"))  : 32;
+    static const int64_t q_vec_chunk_rows = getenv("STRIX_Q_VEC_CHUNK_ROWS") ? atoll(getenv("STRIX_Q_VEC_CHUNK_ROWS")) : 1024;
+    if (ggml_is_quantized(src0->type) && ne11 > MMVQ_MAX_BATCH_SIZE && ne11 <= q_vec_chunk_max && ne01 <= q_vec_chunk_rows
+            && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1
+            && ggml_cuda_should_use_mmvq(src0->type, cc, MMVQ_MAX_BATCH_SIZE)) {
+        const int64_t chunk = MMVQ_MAX_BATCH_SIZE;
+        for (int64_t c0 = 0; c0 < ne11; c0 += chunk) {
+            const int64_t nc = std::min<int64_t>(chunk, ne11 - c0);
+            ggml_tensor src1_c = *src1;
+            src1_c.ne[1] = nc;
+            src1_c.data  = (char *) src1->data + c0*src1->nb[1];
+            ggml_tensor dst_c = *dst;
+            dst_c.ne[1] = nc;
+            dst_c.data  = (char *) dst->data + c0*dst->nb[1];
+            ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_c, nullptr, &dst_c);
+        }
+        return;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // strixllama: an F32 weight of any height at 9-32 columns (STRIX_F32_VEC_CHUNK_MAX): the MoE router
+    // [2560 x 512] of a nine-token verify step - three conversations drafting - otherwise falls to the GEMM
+    // path there. Run the vector kernel over column chunks instead.
+    static const int64_t f32_vec_chunk_max = getenv("STRIX_F32_VEC_CHUNK_MAX") ? atoll(getenv("STRIX_F32_VEC_CHUNK_MAX")) : 32;
+    if (src0->type == GGML_TYPE_F32 && ne11 > MMVF_MAX_BATCH_SIZE && ne11 <= f32_vec_chunk_max &&
+            ne2 == 1 && ne3 == 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+            ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, /*ne11 =*/ MMVF_MAX_BATCH_SIZE)) {
+        for (int64_t i = 0; i < ne11; i += MMVF_MAX_BATCH_SIZE) {
+            const int64_t nc = std::min<int64_t>(MMVF_MAX_BATCH_SIZE, ne11 - i);
+            ggml_tensor src1_c = *src1;
+            src1_c.ne[1] = nc;
+            src1_c.data  = (char *) src1->data + i*src1->nb[1];
+            ggml_tensor dst_c = *dst;
+            dst_c.ne[1] = nc;
+            dst_c.data  = (char *) dst->data + i*dst->nb[1];
+            ggml_cuda_mul_mat_vec_f(ctx, src0, &src1_c, nullptr, &dst_c);
+        }
         return;
     }
     if (ggml_cuda_mmb_supported_mm(ctx, src0, src1, dst)) {
@@ -1966,6 +2008,32 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
+            }
+        }
+
+        // strixllama: a verify step of several conversations (5-16 tokens) is more than the vector kernel takes
+        // (IQ3_S 4, IQ4_NL 6), and the tiled kernel pays per expert for staging a tile it barely fills. Chunks of
+        // STRIX_MOE_VEC_CHUNK tokens (0: off) through the vector kernel instead, up to STRIX_MOE_VEC_CHUNK_MAX_T
+        // tokens; past that the tiled kernel's one read of an expert for all its tokens wins.
+        static const int moe_vec_chunk = getenv("STRIX_MOE_VEC_CHUNK") ? atoi(getenv("STRIX_MOE_VEC_CHUNK")) : 4;
+        static const int moe_vec_chunk_max_t = getenv("STRIX_MOE_VEC_CHUNK_MAX_T") ? atoi(getenv("STRIX_MOE_VEC_CHUNK_MAX_T")) : 16;
+        if (moe_vec_chunk > 0 && ggml_is_quantized(src0->type) && ne2 > 1 && ne2 <= moe_vec_chunk_max_t && ne12 == ne2) {
+            const int chunk = std::min(moe_vec_chunk, get_mmvq_mmid_max_batch(src0->type, cc));
+            if (chunk >= 1) {
+                for (int64_t t0 = 0; t0 < ne2; t0 += chunk) {
+                    const int64_t nt = std::min<int64_t>(chunk, ne2 - t0);
+                    ggml_tensor src1_c = *src1;
+                    src1_c.ne[2] = nt;
+                    src1_c.data  = (char *) src1->data + t0*src1->nb[2];
+                    ggml_tensor ids_c = *ids;
+                    ids_c.ne[1] = nt;
+                    ids_c.data  = (char *) ids->data + t0*ids->nb[1];
+                    ggml_tensor dst_c = *dst;
+                    dst_c.ne[2] = nt;
+                    dst_c.data  = (char *) dst->data + t0*dst->nb[2];
+                    ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_c, &ids_c, &dst_c);
+                }
+                return;
             }
         }
 

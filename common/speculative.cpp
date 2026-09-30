@@ -1760,6 +1760,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // strixllama: several sequences drafting at once draft the same number of tokens (STRIX_SPEC_EVEN_DRAFTS=0: each
+        // stops at its own first unconfident token, as upstream). The target's hybrid memory splits a batch into
+        // ubatches of equal tokens per sequence, so drafts of 2, 2 and 1 tokens made the verify three passes of the
+        // whole model, each a graph the HIP graph cache had not seen: 200-440 ms where an even batch takes ~120. A
+        // sequence that turns unconfident keeps drafting while another is still confident, and all are cut to the
+        // longest confident run.
+        static const bool even_env = !getenv("STRIX_SPEC_EVEN_DRAFTS") || atoi(getenv("STRIX_SPEC_EVEN_DRAFTS")) != 0;
+        const bool even = even_env && n_drafting > 1;
+        std::vector<bool> confident(n_seq, true);
+        std::vector<int>  conf_len(n_seq, 0);
+        int n_confident = n_drafting;
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -1817,10 +1829,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
+                    if (!even) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
 
-                    continue;
+                        continue;
+                    }
+                    // an unconfident sequence pads this step; the end of the step stops all once none is confident
+                    if (confident[seq_id]) {
+                        confident[seq_id] = false;
+                        n_confident--;
+                    }
                 }
 
                 common_sampler_accept(smpl, id, true);
@@ -1829,10 +1848,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+                if (confident[seq_id]) {
+                    conf_len[seq_id] = (int) result.size();
+                }
 
                 if (n_draft_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
+                    if (even && confident[seq_id]) {
+                        confident[seq_id] = false;
+                        n_confident--;
+                    }
                     continue;
                 }
 
@@ -1860,7 +1886,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 i_last[seq_id] = batch.n_tokens - 1;
             }
 
-            if (batch.n_tokens == 0) {
+            if (batch.n_tokens == 0 || (even && n_confident == 0)) {
                 break;
             }
 
@@ -1869,6 +1895,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+
+        if (even) {
+            // every draft cut to the longest confident run (and to the shortest draft, when a caller's cap ended one)
+            int len = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    len = std::max(len, conf_len[seq_id]);
+                }
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    len = std::min(len, (int) dparams[seq_id].result->size());
+                }
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting && (int) dparams[seq_id].result->size() > len) {
+                    dparams[seq_id].result->resize(len);
+                }
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

@@ -3398,6 +3398,27 @@ private:
             });
         }
 
+        // strixllama: the drafter makes the drafts of one step the same length (STRIX_SPEC_EVEN_DRAFTS); a generating slot
+        // that drafted nothing this step (its cap ran out, it cannot speculate) would still make the verify batch
+        // uneven, and the hybrid memory would run it as several passes of the whole model. Every draft is cut to the
+        // shortest, unless a slot replays tokens it has already accepted.
+        if (spec && generating.size() > 1) {
+            static const bool even = !getenv("STRIX_SPEC_EVEN_DRAFTS") || atoi(getenv("STRIX_SPEC_EVEN_DRAFTS")) != 0;
+            bool replay = false;
+            size_t len = SIZE_MAX;
+            for (const server_slot * s : generating) {
+                replay = replay || s->spec_is_replay;
+                len = std::min(len, s->spec_draft.size());
+            }
+            if (even && !replay) {
+                for (server_slot * s : generating) {
+                    if (s->spec_draft.size() > len) {
+                        s->spec_draft.resize(len);
+                    }
+                }
+            }
+        }
+
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;

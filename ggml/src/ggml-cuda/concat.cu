@@ -196,7 +196,12 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
-    if (dim == 0 && src1->ne[0] >= 32 && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
+    // strixllama: the tiled transpose from 2 tokens on (STRIX_CONCAT_T_MIN): below 32 the GDN conv input of a verify
+    // step - [3 + tokens, 10240, sequences] - took the non-contiguous kernel, one block of 256 threads per channel and
+    // sequence for 3 + tokens values, ~30K blocks at three conversations. One token is contiguous and unchanged.
+    const int64_t concat_t_min = (sizeof(T) == 4 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc))
+        ? (getenv("STRIX_CONCAT_T_MIN") ? atoll(getenv("STRIX_CONCAT_T_MIN")) : 2) : 32;
+    if (dim == 0 && src1->ne[0] >= concat_t_min && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
             src0->nb[0] == sizeof(T) && src0->nb[1] == src0->ne[0] * sizeof(T) &&
             src1->nb[1] == sizeof(T) && src1->nb[0] == src1->ne[1] * sizeof(T) &&
             dst->nb[0] == sizeof(T) && dst->nb[1] == dst->ne[0] * sizeof(T) &&
