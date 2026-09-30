@@ -9543,7 +9543,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * fp;
         const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * fp;
         if (ctx->prealloc_size_x < k_f16_sz + v_f16_sz) {
-            ctx->prealloc_size_x = k_f16_sz + v_f16_sz;
+            // the view grows with every prompt ubatch; round up so the scratch is not reallocated each time
+            ctx->prealloc_size_x = GGML_PAD(k_f16_sz + v_f16_sz, (size_t) 64*1024*1024);
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
         vk_pipeline tr_k = ctx->device->pipeline_dequant_transpose[k->type];
@@ -12738,7 +12739,8 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
     // scratch holds the gathered+masked input, materialized once and reused across passes
     const size_t scratch_size = size_t{ n_kv } * nrows * sizeof(float);
     if (ctx->prealloc_size_x < scratch_size) {
-        ctx->prealloc_size_x = scratch_size;
+        // grows with the context, like the flash-attention K/V copy: round up so it is not reallocated each ubatch
+        ctx->prealloc_size_x = GGML_PAD(scratch_size, (size_t) 64*1024*1024);
         ggml_vk_preallocate_buffers(ctx, subctx);
     }
     if (ctx->prealloc_x_need_sync) {
