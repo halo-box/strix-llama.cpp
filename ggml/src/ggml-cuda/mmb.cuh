@@ -1,6 +1,6 @@
 #pragma once
 #include "common.cuh"
-// Quantized-weight BF16 WMMA GEMM on gfx1151, from 512 tokens up.
+// Quantized-weight BF16 WMMA GEMM on gfx1151, from 512 GEMM rows up, or 32 with the small-batch opt-in (see mmb_min_t).
 // Off unless the backend context opts in (ggml_backend_cuda_set_mmb_enabled).
 bool ggml_cuda_mmb_supported_mm  (ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);

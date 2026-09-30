@@ -391,6 +391,11 @@ llama_context::llama_context(
             if (set_mmb_fn) {
                 set_mmb_fn(backend.get(), true);
             }
+            // 32-511-row GEMMs on mmb too: measured on qwen4exp only (see mmb_min_t)
+            auto * set_mmb_small_fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_small_batch") : nullptr;
+            if (set_mmb_small_fn) {
+                set_mmb_small_fn(backend.get(), model.arch == LLM_ARCH_QWEN4EXP);
+            }
         }
 
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);

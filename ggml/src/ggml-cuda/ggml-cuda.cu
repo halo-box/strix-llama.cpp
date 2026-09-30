@@ -4668,7 +4668,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // routed gate/up + SwiGLU on the BF16 WMMA path from 512 tokens: ahead of the MMQ-based expert fusions below,
+    // routed gate/up + SwiGLU on the BF16 WMMA path from 512 tokens (32 with the small-batch opt-in): ahead of the MMQ-based expert fusions below,
     // which yield to MMB whenever it supports the GEMM
     if (node->op == GGML_OP_MUL_MAT_ID && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
             cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
@@ -8320,10 +8320,19 @@ static void ggml_backend_cuda_set_mmb_enabled(ggml_backend_t backend, bool enabl
     ((ggml_backend_cuda_context *) backend->context)->mmb_opt_in = enable;
 }
 
+// let the mmb path of this backend context take GEMMs from 32 rows instead of 512 (see mmb_min_t); call before the first graph
+static void ggml_backend_cuda_set_mmb_small_batch(ggml_backend_t backend, bool enable) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ((ggml_backend_cuda_context *) backend->context)->mmb_small_batch = enable;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_set_mmb_enabled") == 0) {
         return (void *)ggml_backend_cuda_set_mmb_enabled;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_mmb_small_batch") == 0) {
+        return (void *)ggml_backend_cuda_set_mmb_small_batch;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

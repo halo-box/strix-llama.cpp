@@ -983,7 +983,10 @@ static const uint16_t * mmb_shadow_lookup(ggml_backend_cuda_context & ctx, const
 bool mmb_enabled(const ggml_backend_cuda_context & ctx) {
     return ctx.mmb_opt_in && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc);
 }
-int  mmb_min_t()   { return 512; }
+// Smallest GEMM row count for the MMB consumers: 32 in a context with the small-batch opt-in (qwen4exp), else 512. The QSA indexer score keeps 512, see below.
+// gfx1151 / ROCm 10, Qwen3.8-Flash-Next UD-Q4_K_XL and UD-IQ4_XS prefill: MMB is about 5% slower than MMQ at 16 tokens, 11-14% faster at 32.
+// Retest when the MMQ or MMB tiles or mmb_quant_type() change.
+int  mmb_min_t(const ggml_backend_cuda_context & ctx) { return ctx.mmb_small_batch ? 32 : 512; }
 int  mmb_f32split_mode(){ return 2; }
 bool mmb_f32split() { return true; }
 bool mmb_bf16w()    { return true; }
@@ -1040,7 +1043,7 @@ uint16_t * ggml_cuda_mmb_cache_produce(ggml_backend_cuda_context & ctx, const gg
     return mmb_cache_insert(ctx, t, n);
 }
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
-    if (!mmb_enabled(ctx) || ggml_nrows(t) < mmb_min_t()) return nullptr;
+    if (!mmb_enabled(ctx) || ggml_nrows(t) < mmb_min_t(ctx)) return nullptr;
     return ggml_cuda_mmb_slot_reserve(ctx, 0, t, n);
 }
 
@@ -1056,7 +1059,10 @@ bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tens
     const int64_t K = src0->ne[0], M = src0->ne[1];
     if ((f32w ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
     const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
-    if (T < mmb_min_t() || T > INT32_MAX / 4) return false;
+    // graph-computed F32 src0 (not a weight) = the QSA indexer score, heads x tokens GEMM rows: keep the 512-row gate.
+    // At 8-31 tokens and 32K depth, MMB changed the scores with no measured speed gain.
+    const bool graph_src0 = f32w && src0->op != GGML_OP_NONE;
+    if (T < (graph_src0 ? 512 : mmb_min_t(ctx)) || T > INT32_MAX / 4) return false;
     return ggml_nrows(dst) == T;
 }
 
@@ -1072,7 +1078,7 @@ bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_te
     if (src1->ne[1] != 1 && src1->ne[1] != n_used) return false;
     if (dst->ne[0] != M || dst->ne[1] != n_used || dst->ne[2] != T || dst->ne[3] != 1) return false;
     if (ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1) return false;
-    if (T < mmb_min_t() || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
+    if (T < mmb_min_t(ctx) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
     return true;
 }
 
@@ -1249,7 +1255,7 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (!mmb_gatemix_flag() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
-    if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) return false;
+    if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t(ctx)) return false;
     const uint16_t * xn16 = ggml_cuda_mmb_cache_lookup(ctx, xn);
     if (!xn16) return false;
     cudaStream_t stream = ctx.stream();
