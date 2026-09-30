@@ -389,7 +389,7 @@ llama_context::llama_context(
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             auto * set_mmb_fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_enabled") : nullptr;
             if (set_mmb_fn) {
-                set_mmb_fn(backend.get(), model.arch == LLM_ARCH_QWEN4EXP);
+                set_mmb_fn(backend.get(), true);
             }
         }
 

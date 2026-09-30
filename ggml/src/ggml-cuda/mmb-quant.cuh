@@ -246,6 +246,7 @@ __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, siz
 }
 
 static bool mmb_quant_type(ggml_type type) {
+    if (type != GGML_TYPE_Q8_0 && type != GGML_TYPE_IQ4_NL) return false;
     switch (type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
