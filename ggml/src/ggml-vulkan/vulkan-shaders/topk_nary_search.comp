@@ -85,7 +85,7 @@ void topk(const uint row) {
                 // compare as floats: the bit patterns of negative values
                 // order the other way as integers
                 if (a.x >= p.orig_ncols ||
-                    b.x < p.orig_ncols && intBitsToFloat(b.y) > intBitsToFloat(a.y)) {
+                    b.x < p.orig_ncols && f2ui(intBitsToFloat(b.y)) > f2ui(intBitsToFloat(a.y))) {
                     dst_row[tid] = b;
                 }
             }
@@ -103,11 +103,10 @@ void topk(const uint row) {
         int shift = 32 - SUBGROUP_SIZE_LOG2;
         uint mask = ((1 << SUBGROUP_SIZE_LOG2) - 1) << shift;
 
-        // The current range, [range_min, range_max). It starts as every value
-        // (+inf maps to 0xFF800000 and NaN was replaced by -inf), so the
-        // buckets always hold at least limit values.
+        // The current range, inclusive at both ends (f2ui(+inf) = 0xFF800000, so an exclusive bound there
+        // could never count +inf).
         uint range_min = 0;
-        uint range_max = 0xFFFFFFFF;
+        uint range_hi = 0xFFFFFFFF;
         // How many are above the current range, and how many we need to find.
         uint total = 0;
         uint limit = min(p.k, p.ncols_input - gl_WorkGroupID.x * BLOCK_SIZE);
@@ -123,7 +122,7 @@ void topk(const uint row) {
             if (tid < p.ncols_input) {
                 float y = intBitsToFloat(dst_row[tid].y);
                 uint fy = f2ui(y);
-                if (fy >= range_min && fy < range_max) {
+                if (fy >= range_min && fy <= range_hi) {
                     uint bucket = (fy & mask) >> shift;
                     atomicAdd(counts[bucket], 1);
                 }
@@ -148,12 +147,8 @@ void topk(const uint row) {
             total = sh_total;
 
             // Update the range, and break if we've found the K-th largest.
-            // The end of the top bucket wraps past 2^32, clamp it instead.
             range_min = range_min + (uint(min_idx) << shift);
-            range_max = range_min + (1u << shift);
-            if (range_max < range_min) {
-                range_max = 0xFFFFFFFF;
-            }
+            range_hi = range_min + ((1u << shift) - 1u);
 
             if (total == p.k) {
                 break;
