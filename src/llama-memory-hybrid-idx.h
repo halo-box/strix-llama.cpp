@@ -122,6 +122,7 @@ private:
     // the QSA layers run where a kernel reads the maskless block selection (HIP on RDNA3.5, Vulkan); otherwise the masked top-k
     bool selected_key_attn = false;
     bool qsa_recover_pending = false;
+    llama_seq_id qsa_recover_failed = -1; // the sequence the last recovery attempt failed for
     bool qsa_recover(llama_seq_id seq);
     qsa_prefix_state qsa_prefix;
     mutable std::vector<int64_t> qsa_ready;
