@@ -118,7 +118,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     for (int il=0; il<layers; ++il) {
         if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] != 4) { continue; }
         auto * dev = model.dev_layer(il);
-        if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") != 0) { continue; }
+        // validated on ROCm and Vulkan; LLAMA_QSA_INCREMENTAL=0 disables it, =1 enables it on any backend
+        static const int mode = [] {
+            const char * e = getenv("LLAMA_QSA_INCREMENTAL");
+            return e != nullptr ? atoi(e) : -1;
+        }();
+        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+        const bool validated = std::strcmp(reg, "ROCm") == 0 || std::strcmp(reg, "Vulkan") == 0;
+        if (mode == 0 || (mode < 0 && !validated)) { continue; }
         incremental_qsa = true;
         auto * buft = ggml_backend_dev_buffer_type(dev);
         auto & ctx = contexts[buft];
