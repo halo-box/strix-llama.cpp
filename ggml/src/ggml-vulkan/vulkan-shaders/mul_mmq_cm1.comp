@@ -46,6 +46,8 @@ layout (binding = 2) writeonly buffer D4 {vec4 data_d4[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+// MUL_MAT_ID + MUL(router weights) epilogue: one f32 weight per (expert slot, token), [1, nei0, nei1] contiguous
+layout (binding = 5) readonly buffer Scale {float data_scale[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -67,7 +69,7 @@ layout (push_constant) uniform parameter
     uint nbi1;
     uint ne11;
     uint n_experts;
-    uint hoist_row_ids;
+    uint hoist_row_ids; // bit 0: hoisted row ids, bit 1: scale each output row by data_scale (MMID_SCALE_ROWS)
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -168,6 +170,8 @@ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, 
 }
 
 #ifdef MUL_MAT_ID
+#define MMID_HOIST_ROW_IDS 1u
+#define MMID_SCALE_ROWS    2u
 #define NUM_WARPS (BLOCK_SIZE / WARP)
 #include "mul_mm_id_funcs.glsl"
 #endif
@@ -257,7 +261,7 @@ void main() {
     const uint loadstride_b = BLOCK_SIZE * LOAD_VEC_B / BK;
 
 #ifdef MUL_MAT_ID
-    if (p.hoist_row_ids != 0) {
+    if ((p.hoist_row_ids & MMID_HOIST_ROW_IDS) != 0) {
         load_row_ids_hoisted(expert_idx, ic);
     } else {
 #ifdef MUL_MAT_ID_USE_SUBGROUPS
@@ -501,6 +505,7 @@ void main() {
     const uint dc = ic * BN + b_col0;
 
 #ifdef MUL_MAT_ID
+    const bool scale_rows = (p.hoist_row_ids & MMID_SCALE_ROWS) != 0;
 #ifndef D16
     if (PACK_F32 != 0) {
         if ((p.stride_d % 4) == 0 && (p.batch_stride_d % 4) == 0) {
@@ -520,7 +525,8 @@ void main() {
                         const uint row_g = dr + r * TM + 2u * e + (lo_half ? 0u : 4u);
                         if (col_i < _ne1) {
                             const u16vec2 row_idx = row_ids[col_i - ic * BN];
-                            store_f32x4(row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g, row_g, v);
+                            const vec4 vs = scale_rows ? v * data_scale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)] : v;
+                            store_f32x4(row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g, row_g, vs);
                         }
                     }
                 }
@@ -541,7 +547,11 @@ void main() {
 
                 const u16vec2 row_idx = row_ids[col_i - ic * BN];
                 const uint store_offset = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g;
-                data_d[store_offset] = D_TYPE(sums[tile_idx * CM_ELEMS + e]);
+                float val = float(sums[tile_idx * CM_ELEMS + e]);
+                if (scale_rows) {
+                    val *= data_scale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)];
+                }
+                data_d[store_offset] = D_TYPE(val);
             }
         }
     }
