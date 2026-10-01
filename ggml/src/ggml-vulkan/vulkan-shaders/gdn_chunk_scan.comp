@@ -148,7 +148,9 @@ void main() {
         const float gam_last = gd(CL - 1);
 
         // phase 1, all reads of the chunk-start state S: KS_j = K_j S, QS_j = Q_j S; S *= gam_last
-        ACC KS[NT], QS[NT];
+        // separate declarations: older glslang (shaderc 2023.8) drops the matrix use from the second declarator
+        ACC KS[NT];
+        ACC QS[NT];
         [[unroll]] for (uint j = 0; j < NT; j++) {
             KS[j] = ACC(0.0);
             QS[j] = ACC(0.0);
