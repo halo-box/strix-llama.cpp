@@ -3933,7 +3933,7 @@ struct test_mmb_quant_hc : test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
             if (t->op!=GGML_OP_NONE) continue;
-            // the down weight at the scale of a trained projection: unit weights over K = 10240 saturate the gate sigmoid
+            // Scale down weights to avoid saturating the gate sigmoid.
             const float r = strcmp(t->name, "w_down") == 0 ? 1.0f/sqrtf((float) t->ne[0]) : 1.0f;
             init_tensor_uniform(t, -r, r);
         }
