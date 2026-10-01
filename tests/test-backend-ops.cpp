@@ -4271,6 +4271,101 @@ struct test_indexer_score : public test_case {
     }
 };
 
+// RMS_NORM + MUL(gamma) [+ MUL(sigmoid gate)], short rows: the qwen3.5/qwen4exp gated GDN norm. Allocated through
+// the scheduler so graph_optimize runs: it moves the gate chain ahead of the norm (Vulkan RMS_NORM_MUL_MUL).
+// proj: the gate is reshape(mul_mat(W, z)) as in the model; v: the input is a strided view.
+struct test_rms_norm_mul_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool gated, proj, v;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, eps, gated, proj, v);
+    }
+
+    test_rms_norm_mul_mul(std::array<int64_t, 4> ne = {128, 48, 9, 1}, float eps = 1e-6f, bool gated = true, bool proj = false, bool v = false)
+        : ne(ne), eps(eps), gated(gated), proj(proj), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * 3, ne[1], ne[2], ne[3]);
+            ggml_set_name(big, "big");
+            a = ggml_view_4d(ctx, big, ne[0], ne[1], ne[2], ne[3], big->nb[1], big->nb[2], big->nb[3], ne[0] * sizeof(float));
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(a, "a");
+        }
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w);
+        if (gated) {
+            ggml_tensor * z;
+            if (proj) {
+                ggml_tensor * zin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, ne[2] * ne[3]);
+                ggml_set_name(zin, "zin");
+                ggml_tensor * wz = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, ne[0] * ne[1]);
+                ggml_set_name(wz, "wz");
+                z = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, wz, zin), ne[0], ne[1], ne[2], ne[3]);
+            } else {
+                z = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+                ggml_set_name(z, "z");
+            }
+            out = ggml_mul(ctx, out, ggml_sigmoid(ctx, z));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// build_gdn_l2_norm: scale(rms_norm(x, eps/n), 1/sqrt(n)), fused on Vulkan as RMS_NORM_SCALE for short rows.
+// v: the input is a strided view (the GDN q/k are column slices of the conv output).
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const bool v;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, eps, v);
+    }
+
+    test_rms_norm_scale(std::array<int64_t, 4> ne = {128, 16, 9, 1}, float eps = 1e-6f, bool v = false)
+        : ne(ne), eps(eps), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a;
+        if (v) {
+            ggml_tensor * big = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] * ne[1] * 3, ne[2], ne[3], 1);
+            ggml_set_name(big, "big");
+            a = ggml_view_4d(ctx, big, ne[0], ne[1], ne[2], ne[3], ne[0] * sizeof(float), big->nb[1], big->nb[2], ne[0] * ne[1] * sizeof(float));
+        } else {
+            a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            ggml_set_name(a, "a");
+        }
+        const float n = (float) ne[0];
+        ggml_tensor * out = ggml_scale(ctx, ggml_rms_norm(ctx, a, eps / n), 1.0f / sqrtf(n));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_rms_norm_narrow : public test_case {
     const int cols, rows;
     const bool gated, view, escape;
@@ -12343,6 +12438,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+
+    // short rows (Vulkan rms_norm_small: one subgroup per row): odd row counts, views, a grid past 65535 workgroups
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 7, 3, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {256, 33, 1, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {255, 3, 5, 2}, false, 1e-5f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {256, 66, 2, 2}, true, 1e-6f));    // view: {128, 33, 1, 1}
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {254, 6, 10, 2}, true, 1e-5f));    // view: {127, 3, 5, 1}
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {256, 1, 1, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 4097, 1, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {16, 270001, 1, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 5, 4, 3}, false, 1e-6f, true));
+    for (bool gated : { false, true }) {
+        test_cases.emplace_back(new test_rms_norm_mul_mul({128, 48, 9, 1}, 1e-6f, gated));
+        test_cases.emplace_back(new test_rms_norm_mul_mul({100, 3, 5, 2}, 1e-6f, gated));
+        test_cases.emplace_back(new test_rms_norm_mul_mul({256, 8, 3, 1}, 1e-6f, gated, false, true));
+        test_cases.emplace_back(new test_rms_norm_mul_mul({128, 48, 33, 1}, 1e-6f, gated, true));
+        test_cases.emplace_back(new test_rms_norm_mul_mul({512, 4, 3, 1}, 1e-6f, gated));   // too wide for the short-row kernel
+    }
+    test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}));
+    test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}, 1e-6f, true));
+    test_cases.emplace_back(new test_rms_norm_scale({100, 3, 5, 2}));
+    test_cases.emplace_back(new test_rms_norm_scale({256, 8, 3, 1}, 1e-5f, true));
+    test_cases.emplace_back(new test_rms_norm_scale({128, 16, 333, 1}));
+    test_cases.emplace_back(new test_rms_norm_scale({512, 4, 3, 1}));   // too wide for the short-row kernel: unfused
 
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
