@@ -1,0 +1,153 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// Maskless selected-key attention, pre-pass: one workgroup per (query, stream) row of the selection list. It drops
+// invalid entries (< 0 or >= n_kv) and repeated cells (the first occurrence is kept, as the CPU path counts a cell
+// once), and writes the surviving cells to the front of a row of list_stride entries, in their original order.
+// The rest of the row is padded with the first surviving cell, so the attention kernels can read whole key blocks
+// without bounds tests (a padded column is masked by its position, never by its contents). The surviving count
+// goes to the end of the buffer, one per row. Each row is cleaned once here instead of once per K/V head and split
+// in the attention kernel.
+//
+// Duplicates are found with an open-addressing hash table of list positions in shared memory: a position whose
+// cell is already in the table lowers the slot to the smaller position (atomicMin), so the first occurrence wins
+// whatever the thread order.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer IdsBuf  { int  data_ids[];  };
+layout(binding = 1) writeonly buffer ListBuf { uint data_list[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_sel;
+    uint list_stride;
+    uint nbq1;
+    uint nbq2;
+    uint nbq3;
+    uint nbk1;
+    uint nbk2;
+    uint nbk3;
+    uint nbv1;
+    uint nbv2;
+    uint nbv3;
+    uint nbi1;
+    uint nbi3;
+    uint nb1;
+    uint nb2;
+    uint nb3;
+    float scale;
+    uint n_split;
+    uint chunk;
+    uint n_head;
+    uint n_tok;
+    uint n_stream;
+} p;
+
+const uint WG = 256;
+const uint MAX_SEL = 4096;          // host gate: n_sel <= 4096
+const uint PER_THREAD = MAX_SEL / WG;
+const uint TABLE = 4096;            // >= n_sel, so every distinct cell finds a slot
+const uint NONE = 0xffffffffu;
+
+shared uint key_sh[MAX_SEL];        // the row's cells, NONE for an invalid entry
+shared uint table_sh[TABLE];        // list positions, NONE = empty slot
+shared uint scan_sh[WG];
+shared uint first_sh;               // the lowest valid position
+
+uint slot_hash(uint key) {
+    return (key * 2654435761u) >> 20; // 12 bits: TABLE == 4096
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint query = gl_WorkGroupID.x;
+    const uint stream = gl_WorkGroupID.y;
+    const uint row = stream * p.n_tok + query;
+    const uint ids_base = stream * p.nbi3 + query * p.nbi1;
+
+    // thread tid owns the contiguous positions [tid * PER_THREAD, tid * PER_THREAD + PER_THREAD), so the scan below
+    // keeps the original order
+    const uint first = tid * PER_THREAD;
+    [[unroll]] for (uint i = 0; i < PER_THREAD; ++i) {
+        const uint s = first + i;
+        uint key = NONE;
+        if (s < p.n_sel) {
+            const int id = data_ids[ids_base + s];
+            if (id >= 0 && uint(id) < p.n_kv) {
+                key = uint(id);
+            }
+        }
+        key_sh[s] = key;
+    }
+    for (uint i = tid; i < TABLE; i += WG) {
+        table_sh[i] = NONE;
+    }
+    if (tid == 0) {
+        first_sh = NONE;
+    }
+    barrier();
+
+    uint slots[PER_THREAD];
+    [[unroll]] for (uint i = 0; i < PER_THREAD; ++i) {
+        const uint s = first + i;
+        const uint key = key_sh[s];
+        uint slot = NONE;
+        if (key != NONE) {
+            uint h = slot_hash(key);
+            // terminates: at most n_sel <= TABLE distinct cells
+            for (;;) {
+                const uint c = atomicCompSwap(table_sh[h], NONE, s);
+                if (c == NONE) {
+                    break;
+                }
+                if (key_sh[c] == key) {
+                    atomicMin(table_sh[h], s);
+                    break;
+                }
+                h = (h + 1) & (TABLE - 1);
+            }
+            slot = h;
+            atomicMin(first_sh, s);
+        }
+        slots[i] = slot;
+    }
+    barrier();
+
+    uint kept = 0;
+    [[unroll]] for (uint i = 0; i < PER_THREAD; ++i) {
+        if (slots[i] != NONE && table_sh[slots[i]] == first + i) {
+            kept |= 1u << i;
+        }
+    }
+    // inclusive scan of the per-thread counts (Hillis-Steele)
+    scan_sh[tid] = bitCount(kept);
+    barrier();
+    for (uint off = 1; off < WG; off <<= 1) {
+        const uint v = tid >= off ? scan_sh[tid - off] : 0;
+        barrier();
+        scan_sh[tid] += v;
+        barrier();
+    }
+    const uint count = scan_sh[WG - 1];
+    uint pos = scan_sh[tid] - bitCount(kept);
+
+    const uint list_base = row * p.list_stride;
+    [[unroll]] for (uint i = 0; i < PER_THREAD; ++i) {
+        if ((kept & (1u << i)) != 0) {
+            data_list[list_base + pos] = key_sh[first + i];
+            pos++;
+        }
+    }
+    // pad with the row's first valid entry, which is always a first occurrence (so it survives)
+    if (count < p.list_stride) {
+        const uint pad = count > 0 ? key_sh[first_sh] : 0;
+        for (uint s = count + tid; s < p.list_stride; s += WG) {
+            data_list[list_base + s] = pad;
+        }
+    }
+    if (tid == 0) {
+        data_list[p.n_tok * p.n_stream * p.list_stride + row] = count;
+    }
+}
