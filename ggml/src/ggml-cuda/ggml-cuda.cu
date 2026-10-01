@@ -4073,6 +4073,12 @@ static int ggml_cuda_hc_mix_closed(const ggml_cgraph * graph, int index, ggml_cu
     return ggml_can_fuse_subgraph_ext(graph, indices, count, ops, &output, 1) ? count : 0;
 }
 
+// the HC gate GEMM can go to ggml_cuda_hc_gate_mix; graph_optimize uses the same test before it drops the F32 xn
+static bool ggml_cuda_hc_gate_mix_gemm_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * gate) {
+    return gate->op == GGML_OP_MUL_MAT && ggml_is_quantized(gate->src[0]->type) &&
+        ggml_cuda_mmb_supported_mm(ctx, gate->src[0], gate->src[1], gate);
+}
+
 static int ggml_cuda_match_hc_combine_norm(ggml_cgraph * cgraph, int i,
         ggml_cuda_hc_combine_norm_args & args, int warp_size, bool check_alias) {
     ggml_tensor * node = cgraph->nodes[i];
@@ -6012,7 +6018,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // HC gate GEMM [320 -> 10240] whose only consumer is the fused stream mix: GEMM + sigmoid + mix in one kernel
     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         const ggml_tensor * w = node->src[0], * lo = node->src[1];
-        if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(*cuda_ctx, w, lo, node)) {
+        if (ggml_cuda_hc_gate_mix_gemm_ok(*cuda_ctx, node) && ggml_node_has_n_uses(cgraph, i, 1)) {
             ggml_cuda_hc_mix_args ma;
             const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
             if (count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) return count;
@@ -6704,7 +6710,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (t == ca.out_inject) continue;
                     if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 &&
                         ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) continue;
-                    if (t->op == GGML_OP_MUL && n >= 1) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n - 1, ma) > 0 && (ma.xn == t->src[0] || ma.xn == t->src[1]) && (ma.xn == xn || ma.xn->view_src == xn)) continue; }
+                    if (t->op == GGML_OP_MUL && n >= 1) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n - 1, ma) > 0 && (ma.xn == t->src[0] || ma.xn == t->src[1]) && (ma.xn == xn || ma.xn->view_src == xn) && ggml_cuda_hc_gate_mix_gemm_ok(*cuda_ctx, ma.gate)) continue; }
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                     ok = false;
                 }
