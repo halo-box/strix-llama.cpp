@@ -11726,7 +11726,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mmb_quant_routed(type, 1025, false, true, 129));
         }
     }
-    // qwen4exp shapes around the 32-token MMB gate, for the weight types MMB takes: MMQ below it, MMB from it
+    // qwen4exp shapes around the 32-row MMB gate, for the weight types MMB takes: MMQ below it, MMB from it
     for (int tokens : {16, 31, 32, 33, 127, 128, 473, 511, 512, 513}) {
         for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
             test_cases.emplace_back(new test_mmb_quant_routed(type, tokens, true, true, 640, 512, 10, 2560));   // routed gate/up + SwiGLU
@@ -15485,8 +15485,8 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
-// The CUDA/HIP BF16 WMMA matmul path (mmb) is off unless a context opts in (llama does it for qwen4exp).
-// --mmb picks which path the >=32-token MUL_MAT/MUL_MAT_ID cases test: mmb with the qwen4exp small-batch gate, or MMQ.
+// The CUDA/HIP BF16 WMMA matmul path (mmb) is off unless a context opts in (llama does it for every arch, with the small-batch gate for qwen4exp).
+// --mmb picks which path the >=32-row MUL_MAT/MUL_MAT_ID cases test: mmb with the qwen4exp small-batch gate, or MMQ.
 static void set_mmb(ggml_backend_t backend, bool enable) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     auto set_mmb_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_enabled");

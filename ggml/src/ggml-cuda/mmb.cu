@@ -979,7 +979,7 @@ static const uint16_t * mmb_shadow_lookup(ggml_backend_cuda_context & ctx, const
 }
 
 // RDNA3.5 (gfx1151) only, tuned for qwen4exp shapes. On gfx1151 (ROCm 7.2.1) it lost to MMQ on other archs: dense qwen35 prefill 3.4-3.9x slower, MoE 14-28% (PR #75).
-// So each backend context opts in by model arch. Drop the opt-in when mmb matches MMQ on those archs.
+// Every context now opts in, limited to the weight types in mmb_quant_type(); only the 32-row small-batch gate (mmb_min_t) is per arch.
 bool mmb_enabled(const ggml_backend_cuda_context & ctx) {
     return ctx.mmb_opt_in && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc);
 }
