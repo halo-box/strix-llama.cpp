@@ -4668,7 +4668,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // routed gate/up + SwiGLU on the BF16 WMMA path from 512 tokens (32 with the small-batch opt-in): ahead of the MMQ-based expert fusions below,
+    // routed gate/up + SwiGLU on the BF16 WMMA path from 512 rows (32 with the small-batch opt-in): ahead of the MMQ-based expert fusions below,
     // which yield to MMB whenever it supports the GEMM
     if (node->op == GGML_OP_MUL_MAT_ID && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
             cgraph->nodes[i + 2]->op == GGML_OP_GLU) {

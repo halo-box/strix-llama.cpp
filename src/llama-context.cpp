@@ -383,7 +383,7 @@ llama_context::llama_context(
             }
         }
 
-        // the CUDA/HIP BF16 WMMA matmul path (mmb) is tuned for qwen4exp: other archs keep MMQ
+        // the CUDA/HIP BF16 WMMA matmul path (mmb): every arch from 512 rows, for the weight types it takes
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
