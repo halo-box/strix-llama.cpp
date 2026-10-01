@@ -3924,14 +3924,18 @@ struct test_conv_state_chain : public test_case {
 
 struct test_mmb_quant_hc : test_case {
     const ggml_type type;
-    explicit test_mmb_quant_hc(ggml_type type) : type(type) {}
+    const ggml_type type_down; // GGML_TYPE_COUNT: lo is an input
+    explicit test_mmb_quant_hc(ggml_type type, ggml_type type_down = GGML_TYPE_COUNT) : type(type), type_down(type_down) {}
     std::string op_desc(ggml_tensor *) override { return "MMB_QUANT_HC"; }
-    std::string vars() override { return VAR_TO_STR(type); }
+    std::string vars() override { return type_down == GGML_TYPE_COUNT ? VAR_TO_STR(type) : VARS_TO_STR2(type, type_down); }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     void initialize_tensors(ggml_context * ctx) override {
         for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
-            if (t->op==GGML_OP_NONE) init_tensor_uniform(t);
+            if (t->op!=GGML_OP_NONE) continue;
+            // the down weight at the scale of a trained projection: unit weights over K = 10240 saturate the gate sigmoid
+            const float r = strcmp(t->name, "w_down") == 0 ? 1.0f/sqrtf((float) t->ne[0]) : 1.0f;
+            init_tensor_uniform(t, -r, r);
         }
     }
     double max_nmse_err() override { return 5e-4; }
@@ -3947,7 +3951,15 @@ struct test_mmb_quant_hc : test_case {
         auto * combined=ggml_add(ctx,residual,ggml_mul(ctx,ggml_repeat(ctx,block,residual),weight));
         auto * xn=ggml_reshape_2d(ctx,ggml_mul(ctx,ggml_rms_norm(ctx,combined,1e-6f),gamma),embd*hc,tokens);
         if(gf)ggml_build_forward_expand(gf,xn);
-        auto * lo=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,k,tokens);
+        // with type_down, lo is the down projection of xn as the model builds it, so xn also has a GEMM reader
+        ggml_tensor * lo=nullptr;
+        if (type_down==GGML_TYPE_COUNT) {
+            lo=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,k,tokens);
+        } else {
+            auto * w_down=ggml_new_tensor_2d(ctx,type_down,embd*hc,k);
+            ggml_set_name(w_down,"w_down");
+            lo=ggml_silu(ctx,ggml_scale(ctx,ggml_mul_mat(ctx,w_down,xn),.25f));
+        }
         auto * w=ggml_new_tensor_2d(ctx,type,k,embd*hc);
         auto * gate=ggml_sigmoid(ctx,ggml_mul_mat(ctx,w,lo));
         auto * gated=ggml_reshape_3d(ctx,ggml_mul(ctx,xn,gate),embd,hc,tokens);
@@ -11112,6 +11124,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // HC mix with a down projection: BF16 gate weight (no fused gate mix), IQ4_XS down weight (no MMB GEMM)
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_BF16, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS));
     for (ggml_type type : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         test_cases.emplace_back(new test_mmb_quant_dense(type, 512, 128, 256));
         test_cases.emplace_back(new test_mmb_quant_dense(type, 513, 129, 512));
@@ -11120,6 +11135,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mmb_quant_routed(type, 512, false, true));
         test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true));
         test_cases.emplace_back(new test_mmb_quant_hc(type));
+        test_cases.emplace_back(new test_mmb_quant_hc(type, GGML_TYPE_Q8_0));
         if (type == GGML_TYPE_Q4_K) {
             test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true, 65));
             test_cases.emplace_back(new test_mmb_quant_routed(type, 1025, false, true, 129));
