@@ -729,8 +729,9 @@ struct vk_op_flash_attn_top_k_push_constants {
 };
 static_assert(sizeof(vk_op_flash_attn_top_k_push_constants) <= 128);
 
+// shared by flash_attn_sel_prep.comp, flash_attn_sel.comp and flash_attn_sel_cm.comp
 struct vk_op_flash_attn_sel_push_constants {
-    uint32_t n_kv, n_sel, n_sort;
+    uint32_t n_kv, n_sel, list_stride;
     uint32_t nbq1, nbq2, nbq3;
     uint32_t nbk1, nbk2, nbk3;
     uint32_t nbv1, nbv2, nbv3;
