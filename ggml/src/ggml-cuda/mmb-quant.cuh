@@ -1,5 +1,6 @@
 #pragma once
 #include "dequantize.cuh"
+#include "tq.cuh"
 #include <type_traits>
 
 struct mmb_quant_slice {
@@ -206,6 +207,28 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
             dst[o + QK / 2] = mmb_f2bf(d * kvalues_mxfp4[b.qs[q] >> 4] * 0.5f);
         }
     }
+    else if constexpr (ggml_cuda_type_is_tq(TYPE)) {
+        // Trellis types (TQ2_T/TQK6/TQK7): a 64-wide K slice is half of a 128-weight block = 16 trellis
+        // steps. mmb lane l (8 per row) decodes steps 2l, 2l+1 (8 consecutive weights, one 16-byte LDS
+        // store). Same fp32 arithmetic as tq_dequant_lane (d * fp16 codebook point), then RNE bf16.
+        typedef typename tq_block_info<TYPE>::block_t block_t;
+        const block_t * b = (const block_t *) row + k0 / QK_TQK;
+        const int tl = ((k0 % QK_TQK) / 64) * 4 + (lane >> 1);   // tq lane = 4 steps = 16 weights
+        uint32_t st[TQ_STEPS_LANE];
+        tq_states4<TYPE>(b->qs, tl, st);
+        const float d = __half2float(b->d);
+        const uint32_t * lut = tq_lut_global();
+        const int i0 = (lane & 1) * 2;
+        float v[8];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            float2 p0, p1;
+            tq_step(lut, st[i0 + i], p0, p1);
+            v[4*i + 0] = d * p0.x; v[4*i + 1] = d * p0.y; v[4*i + 2] = d * p1.x; v[4*i + 3] = d * p1.y;
+        }
+        uint4 o; o.x = mmb_pack2(v[0], v[1]); o.y = mmb_pack2(v[2], v[3]); o.z = mmb_pack2(v[4], v[5]); o.w = mmb_pack2(v[6], v[7]);
+        *(uint4 *)(dst + 8 * lane) = o;
+    }
     else if constexpr (TYPE == GGML_TYPE_NVFP4) {
 #pragma unroll
         for (int p = lane; p < 32; p += 8) {
@@ -245,7 +268,15 @@ __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, siz
     }
 }
 
+// Trellis types have no MMQ kernel: without mmb their batched MUL_MAT_ID falls back to a host-synchronised
+// per-expert dequant + BLAS loop, so mmb takes them unconditionally (GGML_CUDA_MMB_TQ=0 disables, for A/B).
+static bool mmb_tq_enabled() {
+    static const bool v = getenv("GGML_CUDA_MMB_TQ") ? atoi(getenv("GGML_CUDA_MMB_TQ")) != 0 : true;
+    return v;
+}
+
 static bool mmb_quant_type(ggml_type type) {
+    if (ggml_cuda_type_is_tq(type)) return mmb_tq_enabled();
     if (type != GGML_TYPE_Q8_0 && type != GGML_TYPE_IQ4_NL) return false;
     switch (type) {
         case GGML_TYPE_Q1_0:
@@ -302,6 +333,9 @@ static void mmb_dispatch_quant(ggml_type type, Fn fn) {
         case GGML_TYPE_IQ4_NL: fn(std::integral_constant<int, 0>{}); break;
         case GGML_TYPE_MXFP4: fn(std::integral_constant<int, 32 + GGML_TYPE_MXFP4>{}); break;
         case GGML_TYPE_NVFP4: fn(std::integral_constant<int, 32 + GGML_TYPE_NVFP4>{}); break;
+        case GGML_TYPE_TQ2_T: fn(std::integral_constant<int, 32 + GGML_TYPE_TQ2_T>{}); break;
+        case GGML_TYPE_TQK6: fn(std::integral_constant<int, 32 + GGML_TYPE_TQK6>{}); break;
+        case GGML_TYPE_TQK7: fn(std::integral_constant<int, 32 + GGML_TYPE_TQK7>{}); break;
         default: GGML_ABORT("unsupported MMB quant type");
     }
 }
