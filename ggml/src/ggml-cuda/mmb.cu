@@ -979,7 +979,7 @@ static const uint16_t * mmb_shadow_lookup(ggml_backend_cuda_context & ctx, const
 }
 
 // RDNA3.5 (gfx1151) only, tuned for qwen4exp shapes. On gfx1151 (ROCm 7.2.1) it lost to MMQ on other archs: dense qwen35 prefill 3.4-3.9x slower, MoE 14-28% (PR #75).
-// Every context now opts in, limited to the weight types in mmb_quant_type(); only the 32-row small-batch gate (mmb_min_t) is per arch.
+// llama now opts in every backend context it creates, limited to the weight types in mmb_quant_type(); only the 32-row small-batch gate (mmb_min_t) depends on the arch.
 bool mmb_enabled(const ggml_backend_cuda_context & ctx) {
     return ctx.mmb_opt_in && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc);
 }
@@ -1059,7 +1059,7 @@ bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tens
     const int64_t K = src0->ne[0], M = src0->ne[1];
     if ((f32w ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
     const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
-    // graph-computed F32 src0 (not a weight) = the QSA indexer score, heads x tokens GEMM rows: keep the 512-row gate.
+    // graph-computed F32 src0 (not a weight), such as the QSA indexer score with heads x tokens GEMM rows: keep the 512-row gate.
     // At 8-31 tokens and 32K depth, MMB changed the scores with no measured speed gain.
     const bool graph_src0 = f32w && src0->op != GGML_OP_NONE;
     if (T < (graph_src0 ? 512 : mmb_min_t(ctx)) || T > INT32_MAX / 4) return false;
