@@ -465,7 +465,8 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        // keep the sampler registered across releases: unregistering here forces a sched_reserve() on
+        // every next request. unregistration happens in load_task when the sampler is replaced.
 
         // clear alora start
         alora_invocation_start = -1;
@@ -2282,14 +2283,6 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
-            try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
-            } catch (std::exception & e) {
-                std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
-                send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
-                return false;
-            }
-
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
@@ -2300,12 +2293,41 @@ private:
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
-            // TODO: tmp until backend sampling is fully implemented
-            if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
-            } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            // reuse keeps the chain pointer, so llama_context skips sched_reserve().
+            // only meaningful on the backend sampling path; the CPU path reserves nothing.
+            common_sampler * smpl_reused = nullptr;
+
+            // reuse compares the stored chain's effective backend flag; a chain downgraded to the CPU for a grammar is non-backend
+            if (use_backend_sampling && slot.smpl) {
+                try {
+                    if (common_sampler_reuse(slot.smpl.get(), model_tgt, task.params.sampling)) {
+                        smpl_reused = slot.smpl.get();
+                    }
+                } catch (std::exception & e) {
+                    SLT_WRN(slot, "sampler reuse failed (%s), reinitializing\n", e.what());
+                }
             }
+
+            if (!smpl_reused) {
+                // unregister before freeing the old sampler - a no-op when it was never registered
+                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+                slot.smpl.reset(); // the old chain may be backend-initialized: never keep it into init
+
+                try {
+                    slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                } catch (std::exception & e) {
+                    std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
+                    send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+            }
+
+            use_backend_sampling = task.params.sampling.backend_sampling && !need_pre_sample_logits && task.type != SERVER_TASK_TYPE_TTS;
+
+            // re-registering the same pointer is a no-op, so the reuse path skips sched_reserve
+            // TODO: tmp until backend sampling is fully implemented
+            llama_set_sampler(ctx_tgt, slot.id,
+                    use_backend_sampling ? common_sampler_get(slot.smpl.get()) : nullptr);
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
@@ -2317,6 +2339,9 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
         } else {
+            // unregister before freeing smpl so ctx_tgt never holds a dangling registered sampler
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
+
             slot.smpl.reset();
         }
 
