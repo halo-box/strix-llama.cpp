@@ -409,7 +409,7 @@ dl.info dd { margin: 0; font-family: var(--mono); word-break: break-all; }
       ['GPU layers', c.n_gpu_layers],
       ['speculative', spec ? spec.types + ' · n_max ' + spec.n_max + (spec.n_min ? ' · n_min ' + spec.n_min : '') +
         (spec.draft_model ? ' · draft ' + spec.draft_model : '') + (spec.mtp_vocab ? ' · mtp vocab ' + spec.mtp_vocab : '') : (c.n_ctx !== undefined ? 'off' : null)],
-      ['n-gram table on disk (PLE)', c.ple_on_disk ? 'yes' : null],
+      ['lazy tensor reads (PLE)', c.lazy_mode || null],
       ['vocab', info.n_vocab ? int(info.n_vocab) : null],
       ['modalities', info.modalities ? ['text'].concat(Object.keys(info.modalities).filter(function (k) { return info.modalities[k]; })).join(', ') : null],
       ['aliases', m.aliases && m.aliases.length ? m.aliases.join(', ') : null],

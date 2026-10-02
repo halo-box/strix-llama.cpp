@@ -1184,7 +1184,7 @@ Returns the data behind `/dashboard`. Polling it does not reset the `--sleep-idl
       "file": "Qwen3.5-2B-UD-Q4_K_XL.gguf", "arch": "qwen35", "ftype": "Q4_K - Medium",
       "size_bytes": 1328790784, "n_params": 1881825088, "n_ctx_train": 262144,
       "config": { "n_ctx": 8192, "n_ctx_slot": 4096, "n_parallel": 2, "cache_type_k": "f16",
-                  "speculative": { "types": "ngram-simple", "n_max": 3, "n_min": 0 }, "ple_on_disk": false, ... }
+                  "speculative": { "types": "ngram-simple", "n_max": 3, "n_min": 0 }, "lazy_mode": "auto", ... }
     },
     "stats": {                 // null when the model is not running
       "slots":  [{ "id": 0, "state": "generating", "n_ctx": 4096, "n_tokens": 118, "n_gen": 45,

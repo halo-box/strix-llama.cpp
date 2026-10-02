@@ -5490,7 +5490,10 @@ static json get_res_dashboard_info(const server_context_meta & meta, const commo
             {"flash_attn",   llama_flash_attn_type_name(params.flash_attn_type)},
             {"n_gpu_layers", params.n_gpu_layers},
             {"speculative",  jspec},
-            {"ple_on_disk",  params.ple_on_disk},
+            {"lazy_mode",    params.lazy_mode == LLAMA_LAZY_MODE_OFF    ? "off"
+                           : params.lazy_mode == LLAMA_LAZY_MODE_AUTO   ? "auto"
+                           : params.lazy_mode == LLAMA_LAZY_MODE_ON     ? "on"
+                           : params.lazy_mode == LLAMA_LAZY_MODE_DIRECT ? "direct" : "unknown"},
         }},
     };
 }
