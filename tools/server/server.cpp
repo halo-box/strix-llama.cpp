@@ -252,6 +252,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
+        routes.get_dashboard_stats         = models_routes->get_router_dashboard_stats;
 
         ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
@@ -301,6 +302,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
+    // dashboard (the page itself is served by server_http_context, see dashboard.html)
+    ctx_http.get ("/dashboard/stats",          ex_wrapper(routes.get_dashboard_stats));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
 
     // resumable streaming: a child binds the local session factories, the router binds
