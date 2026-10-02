@@ -1,6 +1,5 @@
-import { MODEL_ICON } from './icons.constants';
-import { Search, Settings, SquarePen } from '@lucide/svelte';
-import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
+import { SERVER_DASHBOARD_URL } from './routes.constants';
+import { Gauge, Package, Search, Settings, SquarePen } from '@lucide/svelte';
 import { SidebarAction, ToolSource } from '$lib/enums';
 import type { DesktopIconStripItem } from '$lib/types';
 
@@ -84,6 +83,11 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		action: SidebarAction.MCP,
 		icon: McpLogo,
 		tooltip: 'MCP'
+	},
+	{
+		externalHref: SERVER_DASHBOARD_URL,
+		icon: Gauge,
+		tooltip: 'Server dashboard'
 	},
 	{
 		action: SidebarAction.SETTINGS,

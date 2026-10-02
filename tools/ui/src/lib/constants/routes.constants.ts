@@ -18,3 +18,9 @@ export const ROUTES = {
 	/** Root — start of the app. */
 	START: '#/'
 } as const;
+
+/**
+ * llama-server's monitoring page. Relative so it resolves next to the UI,
+ * including when the server runs under `--api-prefix`.
+ */
+export const SERVER_DASHBOARD_URL = './dashboard';

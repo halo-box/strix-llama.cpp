@@ -14,6 +14,7 @@
 		onclick?: (e?: MouseEvent) => void;
 		size?: ButtonSize;
 		stopPropagationOnClick?: boolean;
+		target?: string;
 		tooltip?: string;
 		tooltipAsTitle?: boolean;
 		tooltipSide?: TooltipSide;
@@ -30,6 +31,7 @@
 		onclick,
 		size = 'sm',
 		stopPropagationOnClick = false,
+		target,
 		tooltip,
 		tooltipAsTitle = false,
 		tooltipSide = TooltipSide.TOP,
@@ -52,7 +54,9 @@
 
 			onclick?.(e);
 		}}
+		rel={href && target === '_blank' ? 'noopener noreferrer' : undefined}
 		{size}
+		{target}
 		title={tooltipAsTitle ? tooltip : undefined}
 		{variant}
 	>
