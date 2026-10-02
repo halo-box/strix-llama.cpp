@@ -1,6 +1,7 @@
 #include "common.h"
 #include "http.h"
 #include "server-http.h"
+#include "dashboard.html.hpp"
 #include "server-common.h"
 #include "ui.h"
 
@@ -240,7 +241,7 @@ bool server_http_context::init_listener(const common_params & params) {
 
     // Frontend paths - all embedded UI assets
     static const std::unordered_set<std::string> frontend_paths = []() {
-        std::unordered_set<std::string> paths { "/" };
+        std::unordered_set<std::string> paths { "/", "/dashboard" };
         for (const llama_ui_asset & a : llama_ui_get_assets()) {
             paths.insert("/" + a.name);
         }
@@ -367,6 +368,15 @@ bool server_http_context::init_listener(const common_params & params) {
     //
     // Web UI setup
     //
+
+    // stats dashboard: a single self-contained page, independent of the chat UI
+    // the page is public (it holds no data), the JSON it polls (/dashboard/stats) needs the API key
+    srv->Get(params.api_prefix + "/dashboard", [](const httplib::Request &, httplib::Response & res) {
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("X-Content-Type-Options", "nosniff");
+        res.set_content(reinterpret_cast<const char *>(dashboard_html), dashboard_html_len, "text/html; charset=utf-8");
+        return false;
+    });
 
     // Use new `params.ui` field (backed by old `params.webui` for compat)
     if (!params.ui) {

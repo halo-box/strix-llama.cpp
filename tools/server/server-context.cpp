@@ -20,6 +20,8 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
+#include <deque>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -996,6 +998,13 @@ public:
         metrics.reset_bucket();
     }
 
+    // live dashboard stats, see dash_to_json()
+    // note: not thread-safe, call from the main loop (or right before sleep)
+    // with_queue = false when the caller holds the task queue lock (sleeping state callback)
+    json get_dashboard_stats(bool with_queue = true) {
+        return dash_to_json(with_queue);
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1051,6 +1060,38 @@ private:
     int64_t  t_decode_start  = 0; // start of the last submitted decode
     int64_t  t_prompt_start  = 0; // start of the oldest queued prompt decode
     uint64_t n_prompt_queued = 0;
+
+    // dashboard stats, see GET /dashboard/stats
+    // note: only touched from the main loop (and from update_cached_responses right before sleep)
+    struct dash_request {
+        int64_t  t_end_ms;    // unix time, ms
+        int32_t  id_slot;
+        uint64_t n_prompt;    // processed prompt tokens (excluding cached)
+        uint64_t n_cached;    // prompt tokens reused from the cache
+        uint64_t n_gen;       // generated tokens
+        double   t_prompt_ms;
+        double   t_gen_ms;
+        double   prompt_tps;
+        double   gen_tps;
+        uint64_t n_draft;
+        uint64_t n_draft_accepted;
+        uint64_t n_draft_verif_steps;
+        int      stop;        // stop_type
+        bool     truncated;
+    };
+    struct dash_sample {
+        int64_t  t_us;     // ggml_time_us()
+        int64_t  t_unix_ms;
+        uint64_t n_gen;    // cumulative generated tokens (finished + in flight)
+        uint64_t n_prompt; // cumulative processed prompt tokens
+    };
+    static constexpr size_t  DASH_MAX_REQUESTS     = 64;
+    static constexpr size_t  DASH_MAX_SAMPLES      = 300;     // 10 minutes at 2 s
+    static constexpr int64_t DASH_SAMPLE_PERIOD_US = 2000000;
+
+    std::deque<dash_request> dash_requests;
+    std::deque<dash_sample>  dash_samples;
+    uint64_t dash_n_requests = 0;
 
     json json_ui_settings = json::object();
 
@@ -1602,6 +1643,7 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+                dash_on_request_done(slot);
             };
 
             slot.reset();
@@ -2040,6 +2082,9 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // anchor the throughput series before the counters start moving after an idle period
+        dash_sample();
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2841,7 +2886,8 @@ private:
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
+                           task.type != SERVER_TASK_TYPE_DASHBOARD) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
@@ -2985,6 +3031,13 @@ private:
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_DASHBOARD:
+                {
+                    auto res = std::make_unique<server_task_result_dashboard>();
+                    res->id   = task.id;
+                    res->data = dash_to_json(true);
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_GET:
@@ -4612,6 +4665,8 @@ private:
                 slot.stats.set_prompt_last(t_now);
             }
         }
+
+        dash_sample();
     }
 
     // flush any queued prompt metrics if all slots are now idle
@@ -4645,6 +4700,236 @@ private:
         for (size_t i = 0; i < src.size(); i++) {
             dst[i] += src[i];
         }
+    }
+
+    //
+    // dashboard
+    //
+
+    static int64_t dash_unix_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    static const char * dash_slot_state_str(slot_state state) {
+        switch (state) {
+            case SLOT_STATE_IDLE:              return "idle";
+            case SLOT_STATE_WAIT_OTHER:        return "waiting";
+            case SLOT_STATE_STARTED:           return "started";
+            case SLOT_STATE_PROCESSING_PROMPT: return "prompt";
+            case SLOT_STATE_DONE_PROMPT:       return "prompt_done";
+            case SLOT_STATE_GENERATING:        return "generating";
+        }
+        return "unknown";
+    }
+
+    static const char * dash_stop_str(int stop) {
+        switch (stop) {
+            case STOP_TYPE_EOS:   return "eos";
+            case STOP_TYPE_WORD:  return "word";
+            case STOP_TYPE_LIMIT: return "limit";
+            default:              return "none";
+        }
+    }
+
+    // cumulative token counters, including the requests that are still running
+    uint64_t dash_gen_total() const {
+        uint64_t n = metrics.predict.count;
+        for (const auto & slot : slots) {
+            n += slot.stats.n_gen;
+        }
+        return n;
+    }
+
+    uint64_t dash_prompt_total() const {
+        return metrics.prompt.count + n_prompt_queued;
+    }
+
+    // take a throughput sample, at most once per DASH_SAMPLE_PERIOD_US
+    void dash_sample() {
+        const int64_t t_now = ggml_time_us();
+        if (!dash_samples.empty() && t_now - dash_samples.back().t_us < DASH_SAMPLE_PERIOD_US) {
+            return;
+        }
+        dash_samples.push_back({ t_now, dash_unix_ms(), dash_gen_total(), dash_prompt_total() });
+        while (dash_samples.size() > DASH_MAX_SAMPLES) {
+            dash_samples.pop_front();
+        }
+    }
+
+    void dash_on_request_done(const server_slot & slot) {
+        const auto & st = slot.stats;
+        if (!st.is_set() || (st.n_gen == 0 && st.n_prompt_processed == 0 && st.n_prompt_cached == 0)) {
+            return;
+        }
+        dash_n_requests++;
+        dash_requests.push_back({
+            /* t_end_ms            */ dash_unix_ms(),
+            /* id_slot             */ slot.id,
+            /* n_prompt            */ st.n_prompt_processed,
+            /* n_cached            */ st.n_prompt_cached,
+            /* n_gen               */ st.n_gen,
+            /* t_prompt_ms         */ st.t_prompt_ms(),
+            /* t_gen_ms            */ st.t_gen_ms(),
+            /* prompt_tps          */ st.n_prompt_tps(),
+            /* gen_tps             */ st.n_gen_tps(),
+            /* n_draft             */ st.n_draft_tokens,
+            /* n_draft_accepted    */ st.n_draft_accepted,
+            /* n_draft_verif_steps */ st.n_draft_verif_steps,
+            /* stop                */ (int) slot.stop,
+            /* truncated           */ slot.truncated,
+        });
+        while (dash_requests.size() > DASH_MAX_REQUESTS) {
+            dash_requests.pop_front();
+        }
+    }
+
+    static json dash_draft_json(uint64_t n_draft, uint64_t n_accepted, uint64_t n_steps) {
+        return json {
+            {"n_draft",           n_draft},
+            {"n_accepted",        n_accepted},
+            {"n_steps",           n_steps},
+            {"acceptance",        n_draft > 0 ? (double) n_accepted / (double) n_draft : 0.0},
+            {"mean_accepted_len", n_steps > 0 ? 1.0 + (double) n_accepted / (double) n_steps : 0.0},
+        };
+    }
+
+    // the live part of GET /dashboard/stats; no prompts or generated text in here
+    json dash_to_json(bool with_queue) {
+        dash_sample();
+
+        const int64_t t_now = ggml_time_us();
+
+        json jslots = json::array();
+        int n_processing = 0;
+        uint64_t n_kv_used = 0;
+        for (const auto & slot : slots) {
+            const auto & st = slot.stats;
+            const bool busy = slot.is_processing();
+            n_processing += busy ? 1 : 0;
+            n_kv_used    += slot.prompt.n_tokens();
+
+            json js = {
+                {"id",          slot.id},
+                {"state",       dash_slot_state_str(slot.state)},
+                {"n_ctx",       slot.n_ctx},
+                {"n_tokens",    slot.prompt.n_tokens()}, // tokens held in the KV cache by this slot
+                {"speculative", slot.can_speculate()},
+            };
+            if (busy && slot.task) {
+                js["id_task"]            = slot.task->id;
+                js["n_prompt_tokens"]    = slot.task->n_tokens();
+                js["n_prompt_processed"] = st.n_prompt_processed;
+                js["n_prompt_cached"]    = st.n_prompt_cached;
+                js["n_gen"]              = st.n_gen;
+                js["n_remaining"]        = slot.n_remaining();
+                js["elapsed_ms"]         = st.is_set() ? st.t_elapsed_us() / 1000.0 : 0.0;
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT && st.is_set()) {
+                    // still processing: rate over the time spent so far
+                    const double t_ms = (t_now - st.t_start) / 1000.0;
+                    js["prompt_tps"] = t_ms > 0.0 ? 1e3 / t_ms * st.n_prompt_processed : 0.0;
+                } else {
+                    js["prompt_tps"] = st.n_prompt_tps();
+                }
+                js["gen_tps"] = st.n_gen_tps();
+                js["draft"]   = dash_draft_json(st.n_draft_tokens, st.n_draft_accepted, st.n_draft_verif_steps);
+            }
+            jslots.push_back(std::move(js));
+        }
+
+        // totals: finished requests (server_metrics) + the in-flight ones
+        uint64_t n_draft = metrics.n_draft_tokens, n_acc = metrics.n_draft_accepted, n_steps = metrics.n_draft_verif_steps;
+        for (const auto & slot : slots) {
+            n_draft += slot.stats.n_draft_tokens;
+            n_acc   += slot.stats.n_draft_accepted;
+            n_steps += slot.stats.n_draft_verif_steps;
+        }
+        json jdraft = dash_draft_json(n_draft, n_acc, n_steps);
+        {
+            json per_pos = json::array();
+            if (metrics.n_draft_verif_steps > 0) {
+                // drop the trailing never-accepted positions (the vector is sized for n_max)
+                size_t n = metrics.n_accepted_per_pos.size();
+                while (n > 0 && metrics.n_accepted_per_pos[n - 1] == 0) {
+                    n--;
+                }
+                for (size_t i = 0; i < n; ++i) {
+                    per_pos.push_back((double) metrics.n_accepted_per_pos[i] / (double) metrics.n_draft_verif_steps);
+                }
+            }
+            jdraft["acceptance_per_pos"] = per_pos;
+        }
+
+        json jrecent = json::array();
+        for (auto it = dash_requests.rbegin(); it != dash_requests.rend(); ++it) {
+            const auto & r = *it;
+            jrecent.push_back({
+                {"t_end_ms",    r.t_end_ms},
+                {"id_slot",     r.id_slot},
+                {"n_prompt",    r.n_prompt},
+                {"n_cached",    r.n_cached},
+                {"n_gen",       r.n_gen},
+                {"t_prompt_ms", r.t_prompt_ms},
+                {"t_gen_ms",    r.t_gen_ms},
+                {"prompt_tps",  r.prompt_tps},
+                {"gen_tps",     r.gen_tps},
+                {"draft",       dash_draft_json(r.n_draft, r.n_draft_accepted, r.n_draft_verif_steps)},
+                {"stop",        dash_stop_str(r.stop)},
+                {"truncated",   r.truncated},
+            });
+        }
+
+        // throughput series: rate between consecutive samples
+        json s_t = json::array(), s_gen = json::array(), s_prompt = json::array();
+        for (size_t i = 1; i < dash_samples.size(); ++i) {
+            const auto & a = dash_samples[i - 1];
+            const auto & b = dash_samples[i];
+            const double dt = (b.t_us - a.t_us) / 1e6;
+            if (dt <= 0.0) {
+                continue;
+            }
+            s_t     .push_back(b.t_unix_ms);
+            s_gen   .push_back(b.n_gen    >= a.n_gen    ? (b.n_gen    - a.n_gen)    / dt : 0.0);
+            s_prompt.push_back(b.n_prompt >= a.n_prompt ? (b.n_prompt - a.n_prompt) / dt : 0.0);
+        }
+
+        const uint64_t t_start_unix_ms = dash_unix_ms() - (t_now - metrics.t_start) / 1000;
+
+        return json {
+            {"t_now_ms",        dash_unix_ms()},
+            {"t_start_ms",      t_start_unix_ms},
+            {"slots",           jslots},
+            {"kv", {
+                {"n_ctx",       n_ctx},
+                {"n_ctx_slot",  n_ctx_slot()},
+                {"n_used",      n_kv_used},
+                {"unified",     params_base.kv_unified},
+            }},
+            {"queue", {
+                {"n_slots",      (int) slots.size()},
+                {"n_processing", n_processing},
+                {"n_deferred",   with_queue ? queue_tasks.queue_tasks_deferred_size() : 0},
+            }},
+            {"totals", {
+                {"n_requests",      dash_n_requests},
+                {"n_prompt",        metrics.prompt.count},
+                {"n_prompt_cached", metrics.n_prompt_cached},
+                {"t_prompt_s",      metrics.prompt.time / 1e6},
+                {"prompt_tps",      metrics.prompt.n_per_second()},
+                {"n_gen",           dash_gen_total()},
+                {"t_gen_s",         metrics.predict.time / 1e6},
+                {"gen_tps",         metrics.predict.n_per_second()},
+                {"n_decode",        metrics.n_decode},
+                {"draft",           jdraft},
+            }},
+            {"recent", jrecent},
+            {"series", {
+                {"period_s",   DASH_SAMPLE_PERIOD_US / 1e6},
+                {"t_ms",       s_t},
+                {"gen_tps",    s_gen},
+                {"prompt_tps", s_prompt},
+            }},
+        };
     }
 };
 
@@ -4684,6 +4969,13 @@ server_context_meta server_context::get_meta() const {
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
 
+    char model_arch[128] = {0};
+    if (llama_model_meta_val_str(impl->model_tgt, "general.architecture", model_arch, sizeof(model_arch)) < 0) {
+        model_arch[0] = '\0';
+    }
+    char model_desc[256] = {0};
+    llama_model_desc(impl->model_tgt, model_desc, sizeof(model_desc));
+
     return server_context_meta {
         /* build_info             */ std::string(llama_build_info()),
         /* model_name             */ impl->model_name,
@@ -4719,6 +5011,8 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params         */ llama_model_n_params(impl->model_tgt),
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
+        /* model_arch             */ std::string(model_arch),
+        /* model_desc             */ std::string(model_desc),
     };
 }
 
@@ -5141,6 +5435,66 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     return props;
 }
 
+// static model / config info for GET /dashboard/stats
+// note: do NOT use ctx_server here, this must be accessible during sleep
+static json get_res_dashboard_info(const server_context_meta & meta, const common_params & params) {
+    const auto & spec = params.speculative;
+    const bool has_spec = !(spec.types.empty() ||
+                            (spec.types.size() == 1 && spec.types[0] == COMMON_SPECULATIVE_TYPE_NONE));
+
+    json jspec = nullptr;
+    if (has_spec) {
+        std::string types;
+        for (const auto t : spec.types) {
+            if (t == COMMON_SPECULATIVE_TYPE_NONE) {
+                continue;
+            }
+            types += (types.empty() ? "" : ",") + common_speculative_type_to_str(t);
+        }
+        jspec = {
+            {"types", types},
+            {"n_max", spec.draft.n_max},
+            {"n_min", spec.draft.n_min},
+        };
+        if (spec.has_dft()) {
+            jspec["draft_model"] = std::filesystem::path(spec.draft.mparams.path).filename().string();
+        }
+        if (spec.draft.mtp_vocab > 0) {
+            jspec["mtp_vocab"] = spec.draft.mtp_vocab;
+        }
+    }
+
+    return json {
+        {"name",        meta.model_name},
+        {"aliases",     meta.model_aliases},
+        {"file",        std::filesystem::path(meta.model_path).filename().string()},
+        {"arch",        meta.model_arch},
+        {"desc",        meta.model_desc},
+        {"ftype",       meta.model_ftype},
+        {"size_bytes",  meta.model_size},
+        {"n_params",    meta.model_n_params},
+        {"n_ctx_train", meta.model_n_ctx_train},
+        {"n_vocab",     meta.model_vocab_n_tokens},
+        {"modalities",  {
+            {"vision", meta.has_inp_image},
+            {"audio",  meta.has_inp_audio},
+            {"video",  meta.has_inp_video},
+        }},
+        {"config", {
+            {"n_ctx",        params.n_ctx},
+            {"n_ctx_slot",   meta.slot_n_ctx},
+            {"n_parallel",   params.n_parallel},
+            {"kv_unified",   params.kv_unified},
+            {"cache_type_k", ggml_type_name(params.cache_type_k)},
+            {"cache_type_v", ggml_type_name(params.cache_type_v)},
+            {"flash_attn",   llama_flash_attn_type_name(params.flash_attn_type)},
+            {"n_gpu_layers", params.n_gpu_layers},
+            {"speculative",  jspec},
+            {"ple_on_disk",  params.ple_on_disk},
+        }},
+    };
+}
+
 json server_routes::get_model_info() const {
     return get_res_model_info(*meta);
 }
@@ -5221,6 +5575,59 @@ void server_routes::init_routes() {
             res->data = res_task->to_metrics();
         }
 
+        return res;
+    };
+
+    this->get_dashboard_stats = [this](const server_http_req & req) {
+        // must not wake the model up, see task_resets_idle_timer()
+        auto res = create_response(true);
+
+        json stats = nullptr;
+        bool is_sleeping = queue_tasks.is_sleeping();
+
+        if (!is_sleeping) {
+            {
+                server_task task(SERVER_TASK_TYPE_DASHBOARD);
+                task.id = res->rd.get_new_id();
+                res->rd.post_task(std::move(task), true); // high-priority task
+            }
+
+            // a task posted right before sleeping is never processed, do not wait for it
+            auto result = res->rd.next([&]{
+                return req.should_stop() || queue_tasks.is_sleeping();
+            });
+            if (!result) {
+                if (req.should_stop()) {
+                    return res;
+                }
+                is_sleeping = true;
+            } else if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            } else {
+                stats = result->to_json();
+            }
+        }
+
+        if (is_sleeping) {
+            std::unique_lock<std::mutex> lock(mutex_cache);
+            stats = cached_dashboard;
+        }
+
+        json model = {
+            {"id",     meta->model_name},
+            {"status", is_sleeping ? "sleeping" : "loaded"},
+            {"info",   get_res_dashboard_info(*meta, params)},
+            {"stats",  stats},
+        };
+
+        res->ok({
+            {"mode",       "single"},
+            {"build_info", meta->build_info},
+            {"t_now_ms",   std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count()},
+            {"models",     json::array({ model })},
+        });
         return res;
     };
 
@@ -6062,6 +6469,8 @@ void server_routes::update_cached_responses(bool is_sleeping) {
         cached_models  = get_res_models(*meta);
         cached_props   = get_res_props(*meta, params, true);
         cached_metrics = ctx_server.get_metrics();
+        // note: called with the task queue locked, so the queue size must not be read
+        cached_dashboard = ctx_server.get_dashboard_stats(false);
 
         should_reset_buckets = false;
 

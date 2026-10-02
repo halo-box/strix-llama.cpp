@@ -33,11 +33,29 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# stats dashboard page (GET /dashboard), embedded as a byte array
+
+set(DASHBOARD_HTML     ${CMAKE_CURRENT_SOURCE_DIR}/dashboard/dashboard.html)
+set(DASHBOARD_HTML_HPP ${CMAKE_CURRENT_BINARY_DIR}/dashboard.html.hpp)
+
+add_custom_command(
+    OUTPUT  ${DASHBOARD_HTML_HPP}
+    COMMAND ${CMAKE_COMMAND}
+        "-DINPUT=${DASHBOARD_HTML}"
+        "-DOUTPUT=${DASHBOARD_HTML_HPP}"
+        "-DNAME=dashboard_html"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/dashboard/embed.cmake"
+    DEPENDS ${DASHBOARD_HTML} ${CMAKE_CURRENT_SOURCE_DIR}/dashboard/embed.cmake
+    COMMENT "Embedding dashboard.html"
+    VERBATIM
+)
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)
 
 add_library(${TARGET}
+    ${DASHBOARD_HTML_HPP}
     server.cpp
     server-http.cpp
     server-http.h

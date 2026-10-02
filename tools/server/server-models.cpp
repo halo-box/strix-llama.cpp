@@ -26,6 +26,7 @@
 #include <chrono>
 #include <queue>
 #include <filesystem>
+#include <future>
 #include <random>
 #include <sstream>
 #include <cstring>
@@ -2093,6 +2094,99 @@ void server_models_routes::init_routes() {
         res_ok(res, {
             {"data", models_json},
             {"object", "list"},
+        });
+        return res;
+    };
+
+    this->get_router_dashboard_stats = [this](const server_http_req &) {
+        // children have no API key (see unset_reserved_args), they only listen on CHILD_ADDR
+        static constexpr int DASHBOARD_CHILD_TIMEOUT_MS = 1500;
+
+        auto res = std::make_unique<server_http_res>();
+        auto all_models = models.get_all_meta();
+
+        // query the running children in parallel, a busy one must not stall the others
+        std::vector<std::future<json>> child_stats;
+        child_stats.reserve(all_models.size());
+        for (const auto & meta : all_models) {
+            if (meta.hidden || !meta.is_ready_or_sleep() || meta.port <= 0) {
+                child_stats.push_back({});
+                continue;
+            }
+            child_stats.push_back(std::async(std::launch::async, [port = meta.port]() -> json {
+                httplib::Client cli(CHILD_ADDR, port);
+                cli.set_connection_timeout(0, DASHBOARD_CHILD_TIMEOUT_MS * 1000);
+                cli.set_read_timeout(0, DASHBOARD_CHILD_TIMEOUT_MS * 1000);
+                cli.set_write_timeout(0, DASHBOARD_CHILD_TIMEOUT_MS * 1000);
+                auto resp = cli.Get("/dashboard/stats");
+                if (!resp || resp->status != 200) {
+                    return nullptr;
+                }
+                try {
+                    json body = json::parse(resp->body);
+                    const auto & arr = body.at("models");
+                    if (arr.is_array() && !arr.empty()) {
+                        return arr.at(0);
+                    }
+                } catch (const std::exception &) {
+                }
+                return nullptr;
+            }));
+        }
+
+        json models_json = json::array();
+        for (size_t i = 0; i < all_models.size(); ++i) {
+            const auto & meta = all_models[i];
+            if (meta.hidden) {
+                continue;
+            }
+
+            json child = nullptr;
+            if (child_stats[i].valid()) {
+                child = child_stats[i].get();
+            }
+
+            json entry = child.is_object() ? child : json::object();
+            entry["id"]      = meta.name;
+            entry["aliases"] = meta.aliases;
+            entry["source"]  = server_model_source_to_string(meta.source);
+            // the router's view of the status wins, it also knows unloaded / loading / failed
+            entry["status"]  = server_model_status_to_string(meta.status);
+            if (meta.is_failed()) {
+                entry["failed"]    = true;
+                entry["exit_code"] = meta.exit_code;
+            }
+            if (meta.status == SERVER_MODEL_STATUS_LOADING && !meta.progress.is_null()) {
+                entry["progress"] = meta.progress;
+            }
+            if (!entry.contains("stats")) {
+                entry["stats"] = nullptr;
+            }
+            if (!entry.contains("info") || !entry["info"].is_object()) {
+                // not running: what the preset says about the file
+                json info = json::object();
+                std::string model_path;
+                if (meta.preset.get_option("LLAMA_ARG_MODEL", model_path) && !model_path.empty()) {
+                    info["file"] = std::filesystem::path(model_path).filename().string();
+                    std::error_code ec;
+                    auto size = std::filesystem::file_size(model_path, ec);
+                    if (!ec) {
+                        info["size_bytes"] = (uint64_t) size;
+                    }
+                } else if (std::string hf_repo; meta.preset.get_option("LLAMA_ARG_HF_REPO", hf_repo)) {
+                    info["file"] = hf_repo;
+                }
+                entry["info"] = info;
+            }
+            models_json.push_back(entry);
+        }
+
+        res_ok(res, {
+            {"mode",       "router"},
+            {"build_info", std::string(llama_build_info())},
+            {"t_now_ms",   std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count()},
+            {"models",     models_json},
         });
         return res;
     };
