@@ -39,6 +39,12 @@ else()
     if(GPU_TARGETS AND NOT CMAKE_HIP_ARCHITECTURES)
         set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGETS})
     endif()
+
+    # This fork only supports Strix Halo (gfx1151), also covering Gorgon Halo.
+    # Without this, cmake/clang defaults to the full ROCm arch list.
+    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES "gfx1151")
+    endif()
     cmake_minimum_required(VERSION 3.21)
     enable_language(HIP)
 endif()
