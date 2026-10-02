@@ -1250,8 +1250,7 @@ bool ggml_cuda_mmb_gatemix() { return mmb_gatemix_flag(); }
 bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
 bool ggml_cuda_mmb_blk16() { return true; }
 bool ggml_cuda_mmb_res16()  { return true; }
-bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
-        const int hc, const float scale, const float bias) {
+bool ggml_cuda_hc_gate_mix_supported(const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, const ggml_tensor * dst, const int hc) {
     if (!mmb_gatemix_flag() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
