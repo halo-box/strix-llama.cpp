@@ -4139,6 +4139,10 @@ void ggml_cpu_init(void) {
 #endif
         }
 
+        // TQ2_T / TQK6 / TQK7 state -> weights table used by their vec_dot
+        // (after the FP16 table: GGML_CPU_FP16_TO_FP32 may be a lookup in it)
+        ggml_cpu_tq_init();
+
 #if defined(__ARM_ARCH)
         ggml_init_arm_arch_features();
 #endif
