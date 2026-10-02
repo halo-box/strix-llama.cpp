@@ -1690,6 +1690,15 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
+    // re-registering the same sampler pointer is a no-op: graph inputs hold it and backend_init asserts
+    // !is_init. callers that reuse sampler objects across requests rely on this to keep graph reuse alive.
+    if (sampler) {
+        auto it = sampling.samplers.find(seq_id);
+        if (it != sampling.samplers.end() && it->second == sampler) {
+            return true;
+        }
+    }
+
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         static bool warned = false;
         if (!warned) {
