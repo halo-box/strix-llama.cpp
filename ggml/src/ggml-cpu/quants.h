@@ -11,6 +11,11 @@
 extern "C" {
 #endif
 
+// TQ2_T / TQK6 / TQK7: trellis state -> 4 codebook weights, int16 at scale GGML_TQ_I16_SCALE
+#define GGML_TQ_I16_SCALE 8192.0f
+extern int16_t ggml_tq_state_i16[];
+void ggml_cpu_tq_init(void);
+
 // Quantization
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);

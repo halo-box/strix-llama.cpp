@@ -1422,62 +1422,57 @@ void ggml_vec_dot_ptq1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sumf;
 }
 
-// TQ2_T x Q8_0. Decode the block's 32 trellis steps to floats (same traversal as
-// dequantize_row_tq2_t), then dot against the four Q8_0 blocks covering it.
-void ggml_vec_dot_tq2_t_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    const int qk = QK_TQ2_T;
-    const int nb = n / qk;
-    const int nsteps = QK_TQ2_T/4;
+// TQ2_T / TQK6 / TQK7 state table: entry s holds the four codebook weights of trellis
+// state s (pair tq2t_hyb_index(2s) then pair tq2t_hyb_index(2s+1)) as int16 at scale
+// GGML_TQ_I16_SCALE (2^13). |codebook| < 4, so every value fits; fp16 codebook values
+// >= 2^-3 in magnitude are exact, smaller ones are off by at most 2^-14. Indexing by
+// state instead of by codebook pair halves the lookups per weight and removes the
+// per-state hash multiply. Filled once by ggml_cpu_tq_init (from ggml_cpu_init).
+int16_t ggml_tq_state_i16[(TQ_STATE_MASK + 1)*4];
 
-    assert(n % qk == 0);
-    assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
-
-    const block_tq2_t * GGML_RESTRICT x = vx;
-    const block_q8_0  * GGML_RESTRICT y = vy;
-
-    float sumf = 0.0f;
-
-    for (int i = 0; i < nb; i++) {
-        float w[QK_TQ2_T];
-        const uint8_t * qs = x[i].qs;
-        for (int t = 0; t < nsteps; ++t) {
-            const uint32_t st = ((uint32_t) qs[(t + nsteps - 1) % nsteps] << 8) | qs[t];
-            for (int h = 0; h < 2; ++h) {
-                const uint32_t idx = tq2t_hyb_index(2*st + h);
-                w[4*t + 2*h + 0] = GGML_CPU_FP16_TO_FP32(tq2t_lut_f16[2*idx + 0]);
-                w[4*t + 2*h + 1] = GGML_CPU_FP16_TO_FP32(tq2t_lut_f16[2*idx + 1]);
+void ggml_cpu_tq_init(void) {
+    for (uint32_t st = 0; st <= TQ_STATE_MASK; ++st) {
+        for (uint32_t h = 0; h < 2; ++h) {
+            const uint32_t idx = tq2t_hyb_index(2*st + h);
+            for (uint32_t j = 0; j < 2; ++j) {
+                const float v = GGML_CPU_FP16_TO_FP32(tq2t_lut_f16[2*idx + j]) * GGML_TQ_I16_SCALE;
+                ggml_tq_state_i16[4*st + 2*h + j] = (int16_t) (v < 0.0f ? v - 0.5f : v + 0.5f);
             }
         }
-
-        float sumb = 0.0f;
-        for (int k = 0; k < QK_TQ2_T/QK8_0; k++) {
-            const block_q8_0 * GGML_RESTRICT yb = &y[i*(QK_TQ2_T/QK8_0) + k];
-            float acc = 0.0f;
-            for (int b = 0; b < QK8_0; ++b) {
-                acc += w[k*QK8_0 + b] * (float) yb->qs[b];
-            }
-            sumb += GGML_CPU_FP16_TO_FP32(yb->d) * acc;
-        }
-
-        sumf += GGML_CPU_FP16_TO_FP32(x[i].d) * sumb;
     }
-
-    *s = sumf;
 }
 
-// TQK6 / TQK7 x Q8_0. Decode the block's 32 trellis steps (tqk_state, same traversal
-// as dequantize_row_tqk*), then dot against the four Q8_0 blocks covering it.
-static void ggml_vec_dot_tqk_q8_0_impl(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int kb) {
+// Shared TQ x Q8_0 kernel. Every trellis step t (0..31) of a 128-weight block yields
+// weights 4t..4t+3 = ggml_tq_state_i16[4*state(t) ...], dotted in int32 against the
+// Q8_0 activations (Q8_0 block k covers steps 8k..8k+7). kb = 8 is TQ2_T's byte stream.
+// States: the stream is copied with its first 4 bytes repeated after it, so every
+// (circular) 16-bit window is one 32-bit little-endian read; same values as tqk_state.
+static inline void tq_states(const uint8_t * GGML_RESTRICT qs, int kb, uint32_t * GGML_RESTRICT st) {
+    if (kb == 8) {
+        for (int t = 0; t < 32; ++t) {
+            st[t] = (((uint32_t) qs[(t + 31) & 31] << 8) | qs[t]) & TQ_STATE_MASK;
+        }
+        return;
+    }
+    const int nbytes = 4*kb;
+    uint8_t buf[4*8 + 4];
+    memcpy(buf, qs, nbytes);
+    memcpy(buf + nbytes, qs, 4);
+    for (int t = 0; t < 32; ++t) {
+        const uint32_t off = (uint32_t) (31 - t) * (uint32_t) kb;
+        const uint8_t * p = buf + (off >> 3);
+        const uint32_t w = (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16);
+        st[t] = (w >> (off & 7)) & TQ_STATE_MASK;
+    }
+}
+
+static void ggml_vec_dot_tq_q8_0_impl(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int kb) {
     const int qk = QK_TQK;
     const int nb = n / qk;
-    const int nsteps = QK_TQK/4;
     const size_t bsize = sizeof(ggml_half) + 4*kb;
 
     assert(n % qk == 0);
+    static_assert(QK_TQK == QK_TQ2_T, "TQ2_T and TQK share the kernel");
 
     const uint8_t    * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
@@ -1485,31 +1480,32 @@ static void ggml_vec_dot_tqk_q8_0_impl(int n, float * GGML_RESTRICT s, const voi
     float sumf = 0.0f;
 
     for (int i = 0; i < nb; i++, x += bsize) {
-        float w[QK_TQK];
-        const uint8_t * qs = x + sizeof(ggml_half);
-        for (int t = 0; t < nsteps; ++t) {
-            const uint32_t st = tqk_state(qs, kb, t);
-            for (int h = 0; h < 2; ++h) {
-                const uint32_t idx = tq2t_hyb_index(2*st + h);
-                w[4*t + 2*h + 0] = GGML_CPU_FP16_TO_FP32(tq2t_lut_f16[2*idx + 0]);
-                w[4*t + 2*h + 1] = GGML_CPU_FP16_TO_FP32(tq2t_lut_f16[2*idx + 1]);
-            }
-        }
-
+        uint32_t st[32];
+        tq_states(x + sizeof(ggml_half), kb, st);
         float sumb = 0.0f;
         for (int k = 0; k < QK_TQK/QK8_0; k++) {
             const block_q8_0 * GGML_RESTRICT yb = &y[i*(QK_TQK/QK8_0) + k];
-            float acc = 0.0f;
-            for (int b = 0; b < QK8_0; ++b) {
-                acc += w[k*QK8_0 + b] * (float) yb->qs[b];
+            int32_t acc = 0;
+            for (int t = 8*k; t < 8*k + 8; ++t) {
+                const int16_t * w = ggml_tq_state_i16 + 4*st[t];
+                const int8_t  * q = yb->qs + 4*(t - 8*k);
+                acc += w[0]*q[0] + w[1]*q[1] + w[2]*q[2] + w[3]*q[3];
             }
-            sumb += GGML_CPU_FP16_TO_FP32(yb->d) * acc;
+            sumb += GGML_CPU_FP16_TO_FP32(yb->d) * (float) acc;
         }
-
         sumf += GGML_CPU_FP16_TO_FP32(*(const ggml_half *) x) * sumb;
     }
 
-    *s = sumf;
+    *s = sumf * (1.0f / GGML_TQ_I16_SCALE);
+}
+
+void ggml_vec_dot_tq2_t_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_tq_q8_0_impl(n, s, vx, vy, 8);
 }
 
 void ggml_vec_dot_tqk6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -1518,7 +1514,7 @@ void ggml_vec_dot_tqk6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     UNUSED(bx);
     UNUSED(by);
     UNUSED(bs);
-    ggml_vec_dot_tqk_q8_0_impl(n, s, vx, vy, 6);
+    ggml_vec_dot_tq_q8_0_impl(n, s, vx, vy, 6);
 }
 
 void ggml_vec_dot_tqk7_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -1527,5 +1523,5 @@ void ggml_vec_dot_tqk7_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     UNUSED(bx);
     UNUSED(by);
     UNUSED(bs);
-    ggml_vec_dot_tqk_q8_0_impl(n, s, vx, vy, 7);
+    ggml_vec_dot_tq_q8_0_impl(n, s, vx, vy, 7);
 }
