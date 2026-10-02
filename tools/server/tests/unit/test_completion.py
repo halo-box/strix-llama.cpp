@@ -598,6 +598,39 @@ def test_n_probs_post_backend_sampling():
         for (aa, bb) in zip(a["top_probs"], b["top_probs"]):
             verify_token(aa, bb)
 
+def test_sampler_reuse_after_failed_init():
+    """A request whose sampler init fails must not leave the slot's backend chain in a state that
+    makes the next matching request return garbage (sampler reuse, PR #274)."""
+    global server
+    server.backend_sampling = True
+    server.start()
+
+    base = {
+        "prompt": "The history of the city of Rome begins",
+        "n_predict": 8,
+        "temperature": 0.8,
+        "seed": 42,
+        "samplers": ["top_k", "top_p", "temperature"],
+        "id_slot": 0,
+    }
+
+    def run_request(**extra):
+        res = server.make_request("POST", "/completion", data={**base, **extra})
+        assert res.status_code == 200
+        return res.body["content"]
+
+    # A (valid), B (sampler init throws -> 400), C (same as A, hits the reuse path)
+    for bad in ({"grammar": "root ::= ("}, {"repeat_penalty": 0}):
+        run_request()
+        res = server.make_request("POST", "/completion", data={**base, **bad})
+        assert res.status_code == 400
+        reused = run_request()
+
+        # C must equal the same request on a fresh server
+        server.stop()
+        server.start()
+        assert reused == run_request()
+
 @pytest.mark.parametrize("tokenize,openai_style", [(False, False), (False, True), (True, False), (True, True)])
 def test_logit_bias(tokenize, openai_style):
     global server
