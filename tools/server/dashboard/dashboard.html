@@ -94,6 +94,13 @@ button, input {
 }
 button { cursor: pointer; }
 button:hover { border-color: var(--text-3); }
+a.back {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: var(--text-2); text-decoration: none; font-size: 13px;
+  padding: 3px 8px; margin-left: -8px; border-radius: 6px; border: 1px solid transparent;
+}
+a.back:hover { color: var(--text); background: var(--surface-2); border-color: var(--border); }
+button:focus-visible, input:focus-visible, a.back:focus-visible { outline: 2px solid var(--decode); outline-offset: 1px; }
 main { max-width: 1280px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
 .card {
   background: var(--surface);
@@ -171,6 +178,7 @@ dl.info dd { margin: 0; font-family: var(--mono); word-break: break-all; }
 </head>
 <body>
 <header class="top">
+  <a class="back" href="./" title="Back to the chat">&larr; Chat</a>
   <h1>llama-server</h1>
   <span class="meta" id="build"></span>
   <span class="spacer"></span>

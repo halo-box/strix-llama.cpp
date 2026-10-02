@@ -1,4 +1,5 @@
-import { Package, Search, Settings, SquarePen } from '@lucide/svelte';
+import { SERVER_DASHBOARD_URL } from './routes.constants';
+import { Gauge, Package, Search, Settings, SquarePen } from '@lucide/svelte';
 import { SidebarAction, ToolSource } from '$lib/enums';
 import type { DesktopIconStripItem } from '$lib/types';
 
@@ -61,6 +62,11 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		tooltip: 'New chat'
 	},
 	{ icon: Search, keys: ['cmd', 'k'], tooltip: 'Search' },
+	{
+		externalHref: SERVER_DASHBOARD_URL,
+		icon: Gauge,
+		tooltip: 'Server dashboard'
+	},
 	{
 		action: SidebarAction.SETTINGS,
 		icon: Settings,

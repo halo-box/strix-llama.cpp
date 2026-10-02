@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Search } from '@lucide/svelte';
+	import { ExternalLink, Search } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { ActionIcon, KeyboardShortcutInfo, SearchInput } from '$lib/components/app';
@@ -110,9 +110,10 @@
 		{#each SIDEBAR_ACTIONS_ITEMS as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
 			{@const isSearchOnMobile = item.icon === Search && deviceStore.isMobile}
-			{@const itemHref = isSearchOnMobile ? ROUTES.SEARCH : item.route}
-			{@const itemOnClick =
-				item.action === SidebarAction.NEW_CHAT
+			{@const itemHref = item.externalHref ?? (isSearchOnMobile ? ROUTES.SEARCH : item.route)}
+			{@const itemOnClick = item.externalHref
+				? undefined
+				: item.action === SidebarAction.NEW_CHAT
 					? () => {
 							onNewChat?.();
 							void conversationsStore.openNewChat();
@@ -141,7 +142,9 @@
 							: ''}"
 						href={itemHref}
 						onclick={itemOnClick}
+						rel={item.externalHref ? 'noopener noreferrer' : undefined}
 						size="default"
+						target={item.externalHref ? '_blank' : undefined}
 						variant="ghost"
 					>
 						<span class="flex min-w-0 items-center px-0.5 gap-2">
@@ -156,6 +159,9 @@
 
 						{#if item.keys}
 							<KeyboardShortcutInfo keys={item.keys} />
+						{:else if item.externalHref}
+							<!-- wrapped: a direct <svg> child would trigger the button's has-[>svg] padding -->
+							<span class="opacity-50"><ExternalLink class="h-3 w-3" /></span>
 						{/if}
 					</Button>
 				</div>
@@ -167,8 +173,9 @@
 		{#each SIDEBAR_ACTIONS_ITEMS as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
 			{@const isSearchOnMobile = item.icon === Search && deviceStore.isMobile}
-			{@const itemOnClick =
-				item.action === SidebarAction.NEW_CHAT
+			{@const itemOnClick = item.externalHref
+				? undefined
+				: item.action === SidebarAction.NEW_CHAT
 					? () => {
 							onNewChat?.();
 							void conversationsStore.openNewChat();
@@ -195,10 +202,12 @@
 						class="h-9 w-9 rounded-full hover:bg-accent! {isActive
 							? 'bg-accent text-accent-foreground'
 							: ''}"
+						href={item.externalHref}
 						icon={item.icon}
 						iconSize={ICON_CLASS_DEFAULT}
 						onclick={itemOnClick}
 						size="lg"
+						target={item.externalHref ? '_blank' : undefined}
 						tooltip={item.tooltip}
 						tooltipSide={TooltipSide.RIGHT}
 					/>
