@@ -16,3 +16,8 @@ void ggml_cuda_op_shared_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * 
 void ggml_cuda_op_shared_gate_mul_add(
         ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * src, const ggml_tensor * other,
         const ggml_tensor * residual, ggml_tensor * dst);
+
+void ggml_cuda_op_shared_gate_mul_add_reduce(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * experts,
+        const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * src, ggml_tensor * dst,
+        int n_expert_used);

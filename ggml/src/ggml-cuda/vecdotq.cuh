@@ -1255,6 +1255,14 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     return d * sumi;
 }
 
+#if defined(GGML_USE_HIP)
+// strixllama: 0xFF in byte i when sign bit i is set, for the 4-weight halves of an IQ3_S sign byte
+static __device__ const uint32_t strixllama_iq3s_sign_mask[16] = {
+    0x00000000u, 0x000000FFu, 0x0000FF00u, 0x0000FFFFu, 0x00FF0000u, 0x00FF00FFu, 0x00FFFF00u, 0x00FFFFFFu,
+    0xFF000000u, 0xFF0000FFu, 0xFF00FF00u, 0xFF00FFFFu, 0xFFFF0000u, 0xFFFF00FFu, 0xFFFFFF00u, 0xFFFFFFFFu,
+};
+#endif
+
 #define VDR_IQ3_S_Q8_1_MMVQ 2
 #define VDR_IQ3_S_Q8_1_MMQ  2
 
@@ -1279,17 +1287,27 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+#if defined(GGML_USE_HIP)
+        // strixllama: __vcmpne4 / __vsub4 are byte loops on HIP. The grid magnitudes are positive, so split
+        // each word by the sign mask and take two native dp4a instead: identical integer result.
+        const uint32_t m0 = strixllama_iq3s_sign_mask[signs_packed_8[l0/2] & 0x0F];
+        const uint32_t m1 = strixllama_iq3s_sign_mask[signs_packed_8[l0/2] >> 4];
+        sumi  = ggml_cuda_dp4a((int) ((uint32_t) grid_pos.x & ~m0), u0, sumi);
+        sumi -= ggml_cuda_dp4a((int) ((uint32_t) grid_pos.x &  m0), u0, 0);
+        sumi  = ggml_cuda_dp4a((int) ((uint32_t) grid_pos.y & ~m1), u1, sumi);
+        sumi -= ggml_cuda_dp4a((int) ((uint32_t) grid_pos.y &  m1), u1, 0);
+#else
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
 
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
 
-        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
-        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
-
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+#endif
     }
 
     sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);

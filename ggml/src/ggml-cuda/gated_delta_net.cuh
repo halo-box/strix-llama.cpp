@@ -44,6 +44,12 @@ struct ggml_cuda_gdn_decode_args {
     const float * ssm_a;          // [H_v]
     const float * beta;           // [H_v]
     float         eps_l2;
+    // q/k normalization: L2_NORM (eps_l2) by default, or, when qk_rms_scale is set, the qwen4exp
+    // build_gdn_l2_norm pair RMS_NORM(x, eps) -> SCALE(mul, add) replayed exactly (see the decode kernel)
+    bool  qk_rms_scale    = false;
+    float qk_rms_eps[2]   = { 0.0f, 0.0f };
+    float qk_scale_mul[2] = { 0.0f, 0.0f };
+    float qk_scale_add[2] = { 0.0f, 0.0f };
     // recurrence
     const float *   state_cache;      // [S*S*H_v, n_slots] cache, row = state_ids[0] (transposed per head: [col][row])
     const int32_t * state_ids;
@@ -60,5 +66,8 @@ struct ggml_cuda_gdn_decode_args {
 };
 
 void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args);
+// same, with the following sigmoid(z) * norm applied by the norm kernel, which then writes gated_out instead of args.out
+void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args,
+        const float * z, float * gated_out);
 // first kernel only: writes the pre-norm attention output [S, H_v] to attn_scratch (the gated norm is applied by the consumer)
 void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args, float * attn_scratch);

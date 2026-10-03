@@ -4,9 +4,13 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-ple-disk.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <thread>
+#include <memory>
+#include <condition_variable>
+#include <mutex>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
@@ -1855,6 +1859,90 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
     }).detach();
 }
 
+// Decode: the PLE rows of a new n-gram are cold reads from disk (~0.5 ms for the 16 rows of one token) and the GPU
+// would idle through them. The gather runs on this worker instead, and the CUDA backend enqueues the upload right in
+// front of the first node that reads the rows (layer 1), so layer 0 runs meanwhile. Same rows, same bytes.
+namespace {
+struct ple_async_gather {
+    std::mutex                      m;
+    std::condition_variable         cv;
+    std::thread                     th;
+    bool                            has_job = false;
+    bool                            done    = true;
+    bool                            stop    = false;
+    std::shared_ptr<llama_ple_disk> disk;
+    std::vector<int32_t>            idx;
+    float *                         dst = nullptr;
+
+    ple_async_gather() : th([this] { run(); }) {}
+    ~ple_async_gather() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stop = true;
+        }
+        cv.notify_all();
+        th.join();
+    }
+    void run() {
+        std::unique_lock<std::mutex> lk(m);
+        for (;;) {
+            cv.wait(lk, [&] { return stop || has_job; });
+            if (stop) {
+                return;
+            }
+            has_job = false;
+            std::shared_ptr<llama_ple_disk> d = disk;
+            std::vector<int32_t> ix;
+            ix.swap(idx);
+            float * out = dst;
+            lk.unlock();
+            d->gather(ix.data(), ix.size(), out);
+            lk.lock();
+            done = true;
+            cv.notify_all();
+        }
+    }
+    void wait() {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return done; });
+    }
+    void start(const std::shared_ptr<llama_ple_disk> & d, const std::vector<int32_t> & ix, float * out) {
+        wait();
+        {
+            std::lock_guard<std::mutex> lk(m);
+            disk    = d;
+            idx     = ix;
+            dst     = out;
+            done    = false;
+            has_job = true;
+        }
+        cv.notify_all();
+    }
+    static const void * wait_cb(void * user_data) {
+        auto * self = (ple_async_gather *) user_data;
+        self->wait();
+        return self->dst;
+    }
+};
+
+typedef bool (*ple_defer_input_fn_t)(ggml_tensor *, const void * (*)(void *), void *);
+
+ple_defer_input_fn_t ple_defer_input_fn(const ggml_tensor * t) {
+    if (t == nullptr || t->buffer == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    return (ple_defer_input_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_defer_input");
+}
+} // namespace
+
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
@@ -2001,7 +2089,21 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         // correct for a table split per head -- on a joined per_layer_token_embd it walks
         // past the end (rows beyond ple_rows) and gather() aborts.
         GGML_ASSERT(embd != nullptr && rows == nullptr);
+        static ple_async_gather async;
+        async.wait(); // embd_buf may still be the destination of the previous ubatch's gather
         embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
+        static const bool async_on = !getenv("LLAMA_PLE_ASYNC") || atoi(getenv("LLAMA_PLE_ASYNC")) != 0;
+        if (async_on && n_tokens <= 32 && ggml_nbytes(embd) == embd_buf.size() * sizeof(float)) {
+            if (ple_defer_input_fn_t defer = ple_defer_input_fn(embd)) {
+                async.start(pmodel.ple_disk, idx, embd_buf.data());
+                if (defer(embd, ple_async_gather::wait_cb, &async)) {
+                    return;
+                }
+                async.wait();
+                ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
+                return;
+            }
+        }
         pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
         return;
