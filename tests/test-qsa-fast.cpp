@@ -11,6 +11,18 @@
 // must stay off when the prefix, the commit state or the size guard does not hold.
 // Runs on CPU only; no model or backend is involved.
 
+static void set_qsa_fast_max(const char * value) {
+#ifdef _WIN32
+    _putenv_s("QSA_FAST_MAX", value ? value : "");
+#else
+    if (value) {
+        setenv("QSA_FAST_MAX", value, 1);
+    } else {
+        unsetenv("QSA_FAST_MAX");
+    }
+#endif
+}
+
 // qsa_prefix.update-equivalent bookkeeping via qsa_prefix_state::apply
 static void feed(qsa_prefix_state & s, int32_t start, int n) {
     // position k lives in cell k (cells in order); apply() places them in sequence
@@ -140,23 +152,23 @@ static void test_gate_failures() {
     {   // QSA_FAST_MAX: values <= 512 shrink the limit; 0 disables; >512 is capped by the hard limit.
         // (The real guard caches the env in a function-local static; this mock re-reads it per call,
         //  and each case uses a fresh prefix so only the limit under test varies.)
-        setenv("QSA_FAST_MAX", "127", 1);
+        set_qsa_fast_max("127");
         qsa_fast_mock a(8192), b(8192);
         feed(a, 0, 512); a.commit(); feed(a, 512, 128);
         GGML_ASSERT(!a.fast(qsa_fast_ubatch(512, 128).u));
         feed(b, 0, 512); b.commit(); feed(b, 512, 127);
         GGML_ASSERT(b.fast(qsa_fast_ubatch(512, 127).u));
-        setenv("QSA_FAST_MAX", "0", 1);
+        set_qsa_fast_max("0");
         qsa_fast_mock b0(8192);
         feed(b0, 0, 512); b0.commit(); feed(b0, 512, 127);
         GGML_ASSERT(!b0.fast(qsa_fast_ubatch(512, 127).u));
-        setenv("QSA_FAST_MAX", "9999", 1);   // still capped at 512
+        set_qsa_fast_max("9999");   // still capped at 512
         qsa_fast_mock c(8192), d(8192);
         feed(c, 0, 512); c.commit(); feed(c, 512, 513);
         GGML_ASSERT(!c.fast(qsa_fast_ubatch(512, 513).u));
         feed(d, 0, 512); d.commit(); feed(d, 512, 512);
         GGML_ASSERT(d.fast(qsa_fast_ubatch(512, 512).u));
-        unsetenv("QSA_FAST_MAX");
+        set_qsa_fast_max(nullptr);
     }
 }
 

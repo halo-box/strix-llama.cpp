@@ -29,6 +29,9 @@ const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
 // workgroup counts derive from neq1/neq2/neq3 and never from KV, so no indirect dispatch is
 // needed: only this loop bound changes. Folds away for every other pipeline.
 const bool DYNAMIC_KV       = (Flags & 16) != 0;
+// Masked keys contribute nothing even where their V rows hold NaN/inf (P is 0, but 0 * NaN is not): set for
+// selected-key (sparse) attention, whose selections can name any cell. Costs occupancy in cm1 (V staging).
+const bool NAN_SAFE_V       = (Flags & 32) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -89,6 +92,8 @@ layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 layout (binding = 7) readonly buffer KVB {uint32_t data_kv_dyn[];};
 
 #define MASK_OPT_ALL_NEG_INF 1
+// a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
+#define FA_MASK_DEAD (-65504.0)
 #define MASK_OPT_ALL_ZERO 2
 
 #define BINDING_IDX_K 0
