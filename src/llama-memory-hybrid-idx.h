@@ -99,6 +99,7 @@ public:
     void qsa_invalidate();
     bool qsa_prefix_matches(const llama_ubatch & ubatch) const;
     bool qsa_fast(int il, const llama_ubatch & ubatch) const;
+    bool qsa_selected_key_attn() const { return selected_key_attn; }
     ggml_tensor * qsa_cache(ggml_context * ctx, int il, int64_t blocks) const;
     void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows) const;
     void qsa_commit(int il) const;
@@ -118,7 +119,10 @@ private:
                       ggml_tensor * tails, const llama_ubatch & ubatch, uint32_t ratio) const;
 
     bool incremental_qsa = false;
+    // the QSA layers run on ROCm, which has the selected-key kernels for the maskless block selection; other backends use the masked top-k
+    bool selected_key_attn = false;
     bool qsa_recover_pending = false;
+    llama_seq_id qsa_recover_failed = -1; // the sequence the last recovery attempt failed for
     bool qsa_recover(llama_seq_id seq);
     qsa_prefix_state qsa_prefix;
     mutable std::vector<int64_t> qsa_ready;
@@ -176,6 +180,7 @@ public:
 
     bool qsa_prefix_matches(const llama_ubatch & u) const { return mem && mem->qsa_prefix_matches(u); }
     bool qsa_fast(int il, const llama_ubatch & u) const { return mem && mem->qsa_fast(il, u); }
+    bool qsa_selected_key_attn() const { return mem && mem->qsa_selected_key_attn(); }
     // cells the block metadata must cover: the KV view is sized by occupied cells, but a cache whose positions
     // run ahead of its cells (an MTP draft never receives the image cells an M-RoPE image pins to one position)
     // has blocks past that view. Never below get_n_kv(), padded like it so graph reuse keeps its cadence.
