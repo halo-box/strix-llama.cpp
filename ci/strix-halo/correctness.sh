@@ -3,8 +3,13 @@
 # based on (merge-base of HEAD and upstream master, i.e. the latest upstream master commit contained in the fork).
 #
 # For every model in $MODELS_DIR:
-#   1. upstream llama-perplexity saves its logits (--kl-divergence-base) and reports PPL
-#   2. this fork's llama-perplexity reads them (--kl-divergence) and reports PPL(Q)/PPL(base), KLD, same-top-p
+#   1. upstream llama-perplexity saves its logits (--kl-divergence-base) and reports its own final PPL
+#   2. this fork's llama-perplexity reads them (--kl-divergence) and reports PPL(Q), KLD, same-top-p
+# The fork's PPL(Q) is compared against the upstream run's own final PPL, NOT against the "Mean PPL(base)"
+# the fork prints: that one is recomputed from the saved base log-probs, which the KL base format stores as
+# uint16 logits inside a 16-nat window (tools/perplexity/perplexity.cpp), so it reads low for models with
+# final logit softcapping (e.g. gemma) even when the fork matches upstream. PPL(Q) and the upstream final PPL
+# are both computed over the same tokens (the second half of every chunk).
 # Fails if |PPL(fork)/PPL(upstream) - 1| > $PPL_TOL or if the top-1 token differs from upstream on more than $TOP_TOL %
 # of the tokens (same top p < 100 - $TOP_TOL), or if the mean KLD vs upstream > $KLD_TOL, for any model.
 #
@@ -60,7 +65,7 @@ SUMMARY=$OUT/summary.md
 {
     echo "### Model correctness: fork \`$FORK_SHA\` vs upstream llama.cpp \`$UP_SHA\` (gfx1151, ROCm)"
     echo
-    echo "wikitext-2 test, ctx $CTX, $CHUNKS chunks. Fails if |PPL ratio - 1| > $PPL_TOL or same top p < $((100 - TOP_TOL)) % or mean KLD > $KLD_TOL."
+    echo "wikitext-2 test, ctx $CTX, $CHUNKS chunks. PPL upstream is upstream's own final estimate. Fails if |PPL ratio - 1| > $PPL_TOL or same top p < $((100 - TOP_TOL)) % or mean KLD > $KLD_TOL."
     echo
     echo "| model | PPL upstream | PPL fork | ratio | mean KLD | max KLD | same top p | result |"
     echo "|---|---|---|---|---|---|---|---|"
@@ -89,13 +94,18 @@ for m in "${models[@]}"; do
 
     val() { grep -m1 "$1" "$fk_log" | sed -E 's/.*: *//; s/ *±.*//; s/ *%//' | tr -d ' '; }
     ppl_q=$(val 'Mean PPL(Q)  ')
-    ppl_b=$(val 'Mean PPL(base)')
-    ratio=$(val 'Mean PPL(Q)/PPL(base)')
+    # upstream's own final PPL; do NOT use the fork's "Mean PPL(base)" (see the note at the top of this file)
+    ppl_b=$(grep -m1 'Final estimate: PPL' "$up_log" | sed -E 's/.*PPL = *//; s/ *\+.*//; s/ //g' || true)
+    if [[ -n $ppl_q && -n $ppl_b ]]; then
+        ratio=$(LC_ALL=C awk -v q="$ppl_q" -v b="$ppl_b" 'BEGIN { printf "%.6f", q/b }')
+    else
+        ratio=""
+    fi
     kld=$(val 'Mean    KLD')
     kld_max=$(val 'Maximum KLD')
     top=$(val 'Same top p:')
 
-    why=$(awk -v r="$ratio" -v t="$PPL_TOL" -v top="$top" -v tt="$TOP_TOL" -v k="$kld" -v kt="$KLD_TOL" 'BEGIN {
+    why=$(LC_ALL=C awk -v r="$ratio" -v t="$PPL_TOL" -v top="$top" -v tt="$TOP_TOL" -v k="$kld" -v kt="$KLD_TOL" 'BEGIN {
         if (r == "" || top == "" || k == "") { print "parse error"; exit }
         d = r - 1; if (d < 0) d = -d
         w = ""
