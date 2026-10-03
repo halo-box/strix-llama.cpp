@@ -16777,6 +16777,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 bool coopmat2 = device->coopmat2;
+                // maskless selected-key attention (src[5] without a mask): no Vulkan kernel reads the list, the dense kernel would attend to all cells
+                if (op->src[5] != nullptr && op->src[3] == nullptr) {
+                    return false;
+                }
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
                 if ((HSK % 8) != 0 || (HSV % 8) != 0) {
