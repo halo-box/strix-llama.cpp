@@ -9692,10 +9692,19 @@ struct test_qsa_decode : public test_qsa_prefill {
 // Maskless selected-key prefill: the rows name only the visible cells (-1 elsewhere) and no mask is given, as the
 // complete-block selection graph does. Both the backend and the CPU result are checked against a host FP64 oracle
 // over the listed cells.
+//
+// blocks > 0 builds the rows as qwen4exp_select_complete_blocks does instead: (selected - 3) / 4 blocks of 4 cells in
+// ascending block order, -1 cells for blocks that are not visible yet, then the query's own partial block (q % 4
+// cells, -1 padded). Query q sees min(blocks + q / 4, keys / 4 - 1) complete blocks, so with a small blocks value the
+// early rows are mostly -1 (a few live cells, partial key blocks; query 0 of a multi-query case sees nothing), and
+// with a deep cache the picks spread over the whole cache. Logical cell c lives in physical cell c * 7919 % keys, so the
+// gathered rows are scattered as in a fragmented cache.
 struct test_qsa_prefill_maskless : public test_qsa_prefill {
-    test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true)
-        : test_qsa_prefill(queries,keys,selected,interleaved,false,1,ratio) {}
+    const int blocks;
+    test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true, int blocks=0)
+        : test_qsa_prefill(queries,keys,selected,interleaved,false,1,ratio), blocks(blocks) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL_MASKLESS"; }
+    std::string vars() override { return test_qsa_prefill::vars() + (blocks ? ",blocks=" + std::to_string(blocks) : ""); }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
         q = ggml_permute(ctx,q,0,2,1,3);
@@ -9714,6 +9723,26 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
             if (t->op==GGML_OP_NONE && t!=ids) init_tensor_uniform(t);
         }
         std::vector<int32_t> picks(ggml_nelements(ids));
+        if (blocks > 0) {
+            GGML_ASSERT(selected > 3 && (selected-3)%4 == 0 && keys%7919 != 0);
+            const int budget=(selected-3)/4;
+            const auto cell=[&](int logical) { return int((int64_t(logical)*7919)%keys); };
+            for (int q=0;q<queries;++q) {
+                int32_t * row=picks.data()+size_t(q)*selected;
+                std::fill(row,row+selected,-1);
+                if (q==0 && queries>1) continue;         // nothing visible
+                const int vis=std::min(blocks+q/4,keys/4-1);
+                const int n=std::min(vis,budget);
+                for (int i=0;i<n;++i) {
+                    // ascending, distinct: vis >= n
+                    const int b=vis<=budget ? i : int((int64_t(i)*vis+(q*131)%vis)/budget);
+                    for (int c=0;c<4;++c) row[4*i+c]=cell(4*b+c);
+                }
+                for (int c=0;c<q%4;++c) row[4*budget+c]=cell(4*vis+c);
+            }
+            ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
+            return;
+        }
         for (int q=0;q<queries;++q) {
             for (int j=0;j<selected;++j) {
                 int key=1+(j*37+q*13)%(keys-4);
@@ -9757,8 +9786,8 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
     }
 };
 struct test_qsa_decode_maskless : public test_qsa_prefill_maskless {
-    test_qsa_decode_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true)
-        : test_qsa_prefill_maskless(queries,keys,selected,ratio,interleaved) {}
+    test_qsa_decode_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true, int blocks=0)
+        : test_qsa_prefill_maskless(queries,keys,selected,ratio,interleaved,blocks) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_DECODE_MASKLESS"; }
 };
 
@@ -13760,6 +13789,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051));
     test_cases.emplace_back(new test_qsa_prefill_maskless(640,4096,257));
     test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051,12,false));
+    // complete-block rows (Flash-Next: 512 blocks of 4 cells + a 3-cell tail, GQA 12): partial and empty rows,
+    // GQA 4 and 8, and deep caches (32k / 64k cells) with scattered picks
+    for (int ratio : {4,8,12}) test_cases.emplace_back(new test_qsa_prefill_maskless(130,4096,2051,ratio,true,40));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(97,4096,2051,12,false,3));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(130,32768,2051,12,true,7000));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(200,65536,2051,12,true,15000));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(70,65536,2051,12,false,16000));
+    for (int q : {1,2,9}) test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,2051,12,true,100));
+    for (int q : {1,4}) test_cases.emplace_back(new test_qsa_decode_maskless(q,32768,2051,12,true,8000));
+    for (int q : {1,9}) test_cases.emplace_back(new test_qsa_decode_maskless(q,65536,2051,12,true,16000));
+    test_cases.emplace_back(new test_qsa_decode_maskless(3,65536,2051,8,false,16000));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2560));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2561));
     test_cases.emplace_back(new test_qsa_prefill(513,512,17,true,true));
