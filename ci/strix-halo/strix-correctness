@@ -7,7 +7,7 @@
 #   strix-correctness my-branch                # a branch or commit of the fork
 #   strix-correctness ~/src/strix-llama.cpp    # a local checkout (its current HEAD)
 #
-# Expects models in ~/models/ci and ~/wikitext-2-raw/wiki.test.raw. Limits: PPL_TOL, TOP_TOL, KLD_TOL, CHUNKS.
+# Expects models in ~/models/ci and ~/wikitext-2-raw/wiki.test.raw. Limits: PPL_TOL, TOP_TOL, KLD_TOL, FLOOR_K, FLOOR_ARGS, CHUNKS.
 # Results: ~/correctness-run/results/<date>-<commit>/summary.md (+ logs)
 set -euo pipefail
 
@@ -40,8 +40,14 @@ mkdir -p "$OUT"
 ln -sfn "$OUT" "$W/results/latest"
 echo "fork $TARGET ($SHA) -> $OUT"
 
+IMAGE_ID=$("$ENGINE" image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || echo unknown)
+ENV_ARGS=(-e IMAGE="$IMAGE" -e IMAGE_ID="$IMAGE_ID")
+for v in PPL_TOL TOP_TOL KLD_TOL FLOOR_K FLOOR_ARGS CHUNKS; do
+    [[ -n ${!v:-} ]] && ENV_ARGS+=(-e "$v=${!v}")
+done
+
 set +e
-"$ENGINE" run --rm "${USER_ARGS[@]}" \
+"$ENGINE" run --rm "${USER_ARGS[@]}" "${ENV_ARGS[@]}" \
     --device /dev/kfd --device /dev/dri/renderD128 --security-opt label=disable \
     -v "$SRC":/src -w /src \
     -v "$SCRIPT":/correctness.sh:ro \
@@ -50,7 +56,6 @@ set +e
     -v "$W/cache":/cache -e CACHE=/cache \
     -v "$OUT":/out -e OUT=/out \
     -e LD_LIBRARY_PATH=/opt/rocm/lib \
-    ${PPL_TOL:+-e PPL_TOL=$PPL_TOL} ${TOP_TOL:+-e TOP_TOL=$TOP_TOL} ${KLD_TOL:+-e KLD_TOL=$KLD_TOL} ${CHUNKS:+-e CHUNKS=$CHUNKS} \
     "$IMAGE" bash /correctness.sh 2>&1 | tee "$OUT/run.log"
 status=${PIPESTATUS[0]}
 set -e
