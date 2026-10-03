@@ -891,9 +891,11 @@ struct ggml_backend_sched {
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
-    int debug_realloc;
-    int debug_graph_size;
-    int debug_prev_graph_size;
+    int    debug_realloc;
+    int    debug_graph_size;
+    int    debug_prev_graph_size;
+    size_t debug_graph_hash;
+    size_t debug_reserve_graph_hash;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1736,6 +1738,33 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+
+    // compute a topology fingerprint of the scheduled graph [GGML_SCHED_DEBUG_REALLOC]
+    // the graph size alone is not enough to tell whether two graphs have the same topology:
+    // different node sequences can coincidentally have the same node/leaf/input counts, so
+    // the reallocation check needs the actual op sequence to avoid false positives
+    {
+        size_t hash = 1469598103934665603ull; // FNV-1a offset basis
+        const auto mix = [&hash](uint64_t v) {
+            hash ^= v;
+            hash *= 1099511628211ull; // FNV-1a prime
+        };
+        const auto mix_tensor = [&mix](const struct ggml_tensor * n) {
+            mix((uint64_t) n->op);
+            mix((uint64_t) n->type);
+            mix(n->view_src ? 1u : 0u);
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                mix((uint64_t) n->ne[d]);
+            }
+        };
+        for (int i = 0; i < graph_copy->n_nodes; i++) {
+            mix_tensor(graph_copy->nodes[i]);
+        }
+        for (int i = 0; i < graph_copy->n_leafs; i++) {
+            mix_tensor(graph_copy->leafs[i]);
+        }
+        sched->debug_graph_hash = hash;
+    }
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1766,7 +1795,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         if (sched->debug_realloc > 0) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
             // example: https://github.com/ggml-org/llama.cpp/pull/17143
-            const bool unexpected = !backend_ids_changed && sched->debug_prev_graph_size == sched->debug_graph_size;
+            // note: also require the same topology as the reserved graph - different op sequences
+            //       can have the same node/leaf/input counts, in which case a reallocation is expected
+            const bool same_size     = sched->debug_prev_graph_size == sched->debug_graph_size;
+            const bool same_topology = sched->debug_reserve_graph_hash == sched->debug_graph_hash;
+            const bool unexpected    = !backend_ids_changed && same_size && same_topology;
 
             if (unexpected || sched->debug_realloc > 1) {
                 GGML_ABORT("%s: unexpected graph reallocation (graph size = %d, nodes = %d, leafs = %d), debug_realloc = %d\n", __func__,
@@ -1784,6 +1817,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }
+
+        // the buffers are now reserved for this topology [GGML_SCHED_DEBUG_REALLOC]
+        sched->debug_reserve_graph_hash = sched->debug_graph_hash;
+
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -2081,6 +2118,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
+    sched->debug_graph_hash = 0;
+    sched->debug_reserve_graph_hash = 0;
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
@@ -2181,6 +2220,9 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
+
+    // remember the topology of the graph the buffers were reserved for [GGML_SCHED_DEBUG_REALLOC]
+    sched->debug_reserve_graph_hash = sched->debug_graph_hash;
 
     ggml_backend_sched_reset(sched);
 
