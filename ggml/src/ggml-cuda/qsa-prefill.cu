@@ -17,6 +17,10 @@ static __device__ __forceinline__ float qsa3_h2f(const uint16_t h) { return (flo
 
 // union builder, kernel A: per query row, check that the (validity-transformed) row is non-decreasing; if not, rank-sort it into srow[q] and set sflag[q]. Sentinel 0x7FFFFFFF for invalid (-1 / >= nk) entries.
 #define QSA3_SENT 0x7FFFFFFF
+
+// padding sentinel in the union's block-id list. The list is uint32 so the id space is not what limits the selected
+// depth (uint16 did: 65535 real blocks * ratio 4 = 262140 keys, which collided with the 0xFFFF padding sentinel).
+#define QSA3_BLK_SENT 0xFFFFFFFFu
 __global__ __launch_bounds__(256) void qsa3_rows_kernel(
         const int * __restrict__ ids, const size_t i1, const int ns, const int nk, int * __restrict__ srow, int * __restrict__ sflag,
         const char * mask, size_t m1, const int np2) {
@@ -83,7 +87,7 @@ static __device__ __forceinline__ int qsa3_get(const int * __restrict__ p, const
 __global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
         const int * __restrict__ ids, const size_t i1, const int n_q, const int ns, const int nk,
         const int * __restrict__ srow, const int * __restrict__ sflag,
-        uint16_t * __restrict__ ublk, uint16_t * __restrict__ umask, int * __restrict__ ucount, const int cap) {
+        uint32_t * __restrict__ ublk, uint16_t * __restrict__ umask, int * __restrict__ ucount, const int cap) {
     extern __shared__ int rows_s[];
     __shared__ int scan_s[QSA3_MERGE_LANES];
     const int lane = threadIdx.x;
@@ -114,7 +118,7 @@ __global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
     for (int qi = 0; qi < QSA3_G; ++qi) {
         if (cnt[qi] > 0) { kmax = max(kmax, qsa3_get(rp[qi], cnt[qi] - 1, nk, raw[qi])); if (ref < 0) { ref = qi; } }
     }
-    uint16_t * ob = ublk + (size_t) g * cap, * om = umask + (size_t) g * cap;
+    uint32_t * ob = ublk + (size_t) g * cap; uint16_t * om = umask + (size_t) g * cap;
     if (kmax < 0) { if (lane == 0) { ucount[g] = 0; } return; }
     const int rc = cnt[ref];
     const int lo = lane == 0 ? 0 : (qsa3_get(rp[ref], (int) (((long long) rc * lane) / QSA3_MERGE_LANES), nk, raw[ref]) & ~3);
@@ -184,12 +188,12 @@ __global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
                     p[qi] = pn; head[qi] = pn < pe[qi] ? rr[pn] : QSA3_SENT;
                 }
             }
-            ob[o] = (uint16_t) b; om[o] = (uint16_t) mk; ++o;
+            ob[o] = (uint32_t) b; om[o] = (uint16_t) mk; ++o;
         }
     }
     if (lane == QSA3_MERGE_LANES - 1) {
         int t = total;
-        while (t & 3) { ob[t] = 0xFFFFu; om[t] = 0; ++t; }
+        while (t & 3) { ob[t] = QSA3_BLK_SENT; om[t] = 0; ++t; }
         ucount[g] = t;
     }
 }
@@ -203,7 +207,7 @@ struct qsa3_layout {
 
 template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
-        const uint16_t * __restrict__ mask, const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
+        const uint16_t * __restrict__ mask, const uint32_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
         const int * __restrict__ ucount, float * __restrict__ out, const qsa3_layout s) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     NO_DEVICE_CODE;
@@ -227,7 +231,7 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         pkg = pk + (size_t) kvh * nblk * 1024;
         pvg = pv + (size_t) kvh * nblk * 1024;
     }
-    const uint16_t * gblk = ublk + (size_t) g * s.cap;
+    const uint32_t * gblk = ublk + (size_t) g * s.cap;
     const uint16_t * gmsk = umask + (size_t) g * s.cap;
     const int nchunks = ucount[g] >> 2;
 
@@ -271,16 +275,16 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     const uint16_t * maskq = (mask && w < 3 && own_query < s.n_q)
         ? reinterpret_cast<const uint16_t *>(reinterpret_cast<const char *>(mask) + (size_t) own_query * s.m1) : nullptr;
 
-    auto load_desc = [&](const int c, uint32_t & b01, uint32_t & b23, uint32_t & m01, uint32_t & m23) {
-        const uint2 bb = *reinterpret_cast<const uint2 *>(gblk + 4*c);
+    auto load_desc = [&](const int c, uint32_t * b, uint32_t & m01, uint32_t & m23) {
+        const uint4 bb = *reinterpret_cast<const uint4 *>(gblk + 4*c);
         const uint2 mm = *reinterpret_cast<const uint2 *>(gmsk + 4*c);
-        b01 = bb.x; b23 = bb.y; m01 = mm.x; m23 = mm.y;
+        b[0] = bb.x; b[1] = bb.y; b[2] = bb.z; b[3] = bb.w; m01 = mm.x; m23 = mm.y;
     };
-    auto blk_of = [&](const uint32_t b01, const uint32_t b23, const int j) -> int {
-        const uint32_t v = (j < 2 ? b01 : b23) >> (16 * (j & 1)) & 0xFFFFu;
-        return v == 0xFFFFu ? 0 : (int) v;
+    // a padded slot reads block 0 but carries no mask bits, so its contribution is discarded downstream
+    auto blk_of = [&](const uint32_t * b, const int j) -> int {
+        return b[j] == QSA3_BLK_SENT ? 0 : (int) b[j];
     };
-    auto load_k = [&](const uint32_t b01, const uint32_t b23, const uint32_t m01, const uint32_t m23, v16s * kf) {
+    auto load_k = [&](const uint32_t * b, const uint32_t m01, const uint32_t m23, v16s * kf) {
         const int j = r >> 2;
         const uint32_t mk = ((j < 2 ? m01 : m23) >> (16 * (j & 1))) & 0xffffu;
         if (((mk >> (r & 3)) & 0x1111u) == 0) {
@@ -288,7 +292,7 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
             kf[1] = v16s{};
             return;
         }
-        const int kb = blk_of(b01, b23, j);
+        const int kb = blk_of(b, j);
         if constexpr (DIRECT) {
             // the packed 16-half chunk at (key, w, t) is dims (2w+t)*16 .. +15 of that key's row
             const int key = 4*kb + (r & 3);
@@ -318,9 +322,10 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         return make_uint2(v.x & lo, v.y & hi);
     };
 
-    uint32_t b01 = 0, b23 = 0, m01 = 0, m23 = 0;
+    uint32_t b[4] = { 0, 0, 0, 0 };
+    uint32_t m01 = 0, m23 = 0;
     v16s kf[2];
-    if (nchunks > 0) { load_desc(0, b01, b23, m01, m23); load_k(b01, b23, m01, m23, kf); }
+    if (nchunks > 0) { load_desc(0, b, m01, m23); load_k(b, m01, m23, kf); }
 
     for (int c = 0; c < nchunks; ++c) {
         v8f sc[3];
@@ -333,7 +338,7 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         }
         v16s vf[2];
         {
-            const int kb0 = blk_of(b01, b23, 0), kb1 = blk_of(b01, b23, 1), kb2 = blk_of(b01, b23, 2), kb3 = blk_of(b01, b23, 3);
+            const int kb0 = blk_of(b, 0), kb1 = blk_of(b, 1), kb2 = blk_of(b, 2), kb3 = blk_of(b, 3);
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
                 const int d = 32*w + 16*t + r;
@@ -360,9 +365,10 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
                 }
             }
         }
-        uint32_t nb01 = 0, nb23 = 0, nm01 = 0, nm23 = 0;
+        uint32_t nb[4] = { 0, 0, 0, 0 };
+        uint32_t nm01 = 0, nm23 = 0;
         v16s kfn[2];
-        if (c + 1 < nchunks) { load_desc(c + 1, nb01, nb23, nm01, nm23); load_k(nb01, nb23, nm01, nm23, kfn); }
+        if (c + 1 < nchunks) { load_desc(c + 1, nb, nm01, nm23); load_k(nb, nm01, nm23, kfn); }
         else { kfn[0] = kf[0]; kfn[1] = kf[1]; }
 #pragma unroll
         for (int i = 0; i < 3; ++i) {
@@ -391,7 +397,7 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
                 const int j = e >> 1, cc = 2*(e & 1) + hi;
                 const uint32_t mk = ((j < 2 ? m01 : m23) >> (16 * (j & 1))) & 0xFFFFu;
                 const bool kv = (mk >> (own_qi * 4 + cc)) & 1u;
-                if (maskq && kv) { scf[e] += qsa3_h2f(maskq[4 * blk_of(b01, b23, j) + cc]); }
+                if (maskq && kv) { scf[e] += qsa3_h2f(maskq[4 * blk_of(b, j) + cc]); }
                 if (!kv) { scf[e] = -INFINITY; }
             }
             float mloc = scf[0];
@@ -447,7 +453,7 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
             for (int t = 0; t < 2; ++t) { O[i][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf[t], pf, O[i][t]); }
         }
         kf[0] = kfn[0]; kf[1] = kfn[1];
-        b01 = nb01; b23 = nb23; m01 = nm01; m23 = nm23;
+        b[0] = nb[0]; b[1] = nb[1]; b[2] = nb[2]; b[3] = nb[3]; m01 = nm01; m23 = nm23;
     }
 
     if (w < 3 && hi == 0) { l_s[own_row] = l; }
@@ -486,7 +492,7 @@ bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(ggml_backend_cuda_context & 
     return bias==0 && softcap==0 && q->type==GGML_TYPE_F32 && k->type==GGML_TYPE_F16 && v->type==GGML_TYPE_F16 &&
         dst->type==GGML_TYPE_F32 && ids->type==GGML_TYPE_I32 &&
         q->ne[0]==256 && k->ne[0]==256 && v->ne[0]==256 && q->ne[1]>=128 && q->ne[1]<=INT_MAX &&
-        k->ne[1]>0 && k->ne[1]<=262140 && k->ne[1]%4==0 && v->ne[1]==k->ne[1] &&
+        k->ne[1]>0 && k->ne[1]<=GGML_QSA_MAX_KEYS && k->ne[1]%4==0 && v->ne[1]==k->ne[1] &&
         k->ne[2]>0 && k->ne[2]<=65535 && q->ne[2]==12*k->ne[2] && v->ne[2]==k->ne[2] &&
         q->ne[3]==1 && k->ne[3]==1 && v->ne[3]==1 && ggml_nelements(k)/4<=INT_MAX &&
         q->nb[0]==4 && k->nb[0]==2 && v->nb[0]==2 && ids->nb[0]==4 &&
@@ -534,7 +540,7 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
     }
     const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
     const int cap = (QSA3_G * ns + 3) & ~3;
-    ggml_cuda_pool_alloc<uint16_t> ublk(ctx.pool(), (size_t) ngroups * cap);
+    ggml_cuda_pool_alloc<uint32_t> ublk(ctx.pool(), (size_t) ngroups * cap);
     ggml_cuda_pool_alloc<uint16_t> umask(ctx.pool(), (size_t) ngroups * cap);
     ggml_cuda_pool_alloc<int>      ucount(ctx.pool(), (size_t) ngroups);
     ggml_cuda_pool_alloc<int>      srow(ctx.pool(), (size_t) n_q * ns);
@@ -557,11 +563,11 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
     const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
     if (qsa_direct) {
         ggml_cuda_kernel_launch(qsa3_attn_kernel<true>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
-                                m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
+                                m ? (const uint16_t *) m->data : nullptr, (const uint32_t *) ublk.get(), (const uint16_t *) umask.get(),
                                 (const int *) ucount.get(), (float *) dst->data, layout);
     } else {
         ggml_cuda_kernel_launch(qsa3_attn_kernel<false>, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
-                                m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
+                                m ? (const uint16_t *) m->data : nullptr, (const uint32_t *) ublk.get(), (const uint16_t *) umask.get(),
                                 (const int *) ucount.get(), (float *) dst->data, layout);
     }
     CUDA_CHECK(cudaGetLastError());
