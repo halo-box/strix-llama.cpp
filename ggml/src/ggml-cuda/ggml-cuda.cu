@@ -4073,6 +4073,18 @@ static int ggml_cuda_hc_mix_closed(const ggml_cgraph * graph, int index, ggml_cu
     return ggml_can_fuse_subgraph_ext(graph, indices, count, ops, &output, 1) ? count : 0;
 }
 
+// node i is an HC gate GEMM that the fused gate mix can take: returns the mix node count after it, else 0
+// (callers also check the executor's reader rule, ggml_node_has_n_uses(cgraph, i, 1))
+static int ggml_cuda_hc_gate_mix_route(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i, ggml_cuda_hc_mix_args & ma) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_MUL_MAT || i + 1 >= cgraph->n_nodes || !ggml_cuda_mmb_gatemix() || !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc) ||
+        !ggml_cuda_mmb_supported_mm(ctx, node->src[0], node->src[1], node)) {
+        return 0;
+    }
+    const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
+    return count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix_supported(ctx, node->src[0], node->src[1], ma.xn, ma.dst, ma.hc) ? count : 0;
+}
+
 static int ggml_cuda_match_hc_combine_norm(ggml_cgraph * cgraph, int i,
         ggml_cuda_hc_combine_norm_args & args, int warp_size, bool check_alias) {
     ggml_tensor * node = cgraph->nodes[i];
@@ -6010,13 +6022,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // qwen4exp hyper-connection stream mix:
     // HC gate GEMM [320 -> 10240] whose only consumer is the fused stream mix: GEMM + sigmoid + mix in one kernel
-    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_gatemix() && i + 1 < cgraph->n_nodes && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
-        const ggml_tensor * w = node->src[0], * lo = node->src[1];
-        if (ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1) && ggml_cuda_mmb_supported_mm(*cuda_ctx, w, lo, node)) {
-            ggml_cuda_hc_mix_args ma;
-            const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
-            if (count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) return count;
-        }
+    if (node->op == GGML_OP_MUL_MAT && ggml_node_has_n_uses(cgraph, i, 1)) {
+        ggml_cuda_hc_mix_args ma;
+        const int count = ggml_cuda_hc_gate_mix_route(*cuda_ctx, cgraph, i, ma);
+        if (count > 0 && ggml_cuda_hc_gate_mix(*cuda_ctx, node->src[0], node->src[1], ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) return count;
     }
 
     //     sigmoid(gate) -> mul(xn, .) -> reshape -> view(stream 0) -> cont -> (view(stream c) -> add) x (hc-1) -> scale
@@ -6690,7 +6699,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
             const int ws = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
             auto reads = [](const ggml_tensor * t, const ggml_tensor * x) { for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == x || t->src[s]->view_src == x) return true; return false; };
-            // normalized stream xn: read only by MMB GEMMs (which take the BF16 copy) and the fused stream mix
+            // normalized stream xn: read only by MMB GEMMs (which take the BF16 copy) and by a stream mix that the fused
+            // gate mix takes; any other mix falls back to hc_mix_reduce, which reads the F32 xn
+            auto n_readers = [&](int from, const ggml_tensor * x) { int c = 0; for (int n = from; n < cgraph->n_nodes; ++n) c += reads(cgraph->nodes[n], x); return c; };
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 ggml_cuda_hc_combine_norm_args ca;
                 if (ggml_cuda_match_hc_combine_norm(cgraph, i, ca, ws, false) <= 0) continue;   // structure only: no data pointers yet
@@ -6704,7 +6715,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     if (t == ca.out_inject) continue;
                     if (t->op == GGML_OP_MUL_MAT && t->src[0]->type != GGML_TYPE_F32 &&
                         ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) continue;
-                    if (t->op == GGML_OP_MUL && n >= 1) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n - 1, ma) > 0 && (ma.xn == t->src[0] || ma.xn == t->src[1]) && (ma.xn == xn || ma.xn->view_src == xn)) continue; }
+                    if (t->op == GGML_OP_MUL && n >= 2) {
+                        const ggml_tensor * g = cgraph->nodes[n - 2];
+                        ggml_cuda_hc_mix_args ma, mg;
+                        if (ggml_cuda_hc_mix_closed(cgraph, n - 1, ma) > 0 && (ma.xn == t->src[0] || ma.xn == t->src[1]) && (ma.xn == xn || ma.xn->view_src == xn) &&
+                            ma.gate == g && ggml_cuda_hc_gate_mix_route(*cuda_ctx, cgraph, n - 2, mg) > 0 &&
+                            // the executor's reader rule: one reader in this split and none in another, not an output
+                            n_readers(n - 1, g) == 1 && ggml_cuda_marks_readers_local(cgraph, g) && (g->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) continue;
+                    }
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                     ok = false;
                 }
