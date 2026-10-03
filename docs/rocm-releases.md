@@ -8,7 +8,7 @@ artifact layout, so tools that consume their releases can consume these ones too
 
 - One zip per GPU target: `llama-bNNNN-ubuntu-rocm-{target}-x64.zip`. Windows zips
   (`llama-bNNNN-windows-rocm-{target}-x64.zip`) are built only on a manual run that asks for them.
-- Targets: `gfx1151`, `gfx1150`, `gfx120X`, `gfx110X`, `gfx103X`, `gfx90a`, `gfx908`.
+- Target: `gfx1151` (Strix Halo) only.
 - One Linux Vulkan zip per release: `llama-bNNNN-ubuntu-vulkan-x64.zip`. It is built from the same commit with
   `GGML_VULKAN=ON`, loads the CPU variants and backends at runtime (`GGML_BACKEND_DL`,
   `GGML_CPU_ALL_VARIANTS`), sets RPATH to `$ORIGIN`, and uses the system Vulkan loader and driver
@@ -34,12 +34,12 @@ If a release build for a merge fails, `nightly-failure-alert.yml` opens or updat
 
 ## Hardware tests
 
-`test-stx-halo` and `test-stx` run the built zip on real hardware. They are skipped unless the repository
-variables `STX_HALO_RUNNERS` and `STX_RUNNERS` are set to `true`, because jobs whose self-hosted runners are
-missing sit in the queue until they time out. To enable them:
+`test-stx-halo` runs the built zip on real hardware. It is skipped unless the repository variable
+`STX_HALO_RUNNERS` is set to `true`, because jobs whose self-hosted runners are missing sit in the queue until
+they time out. To enable it:
 
-1. Register runners with the labels `stx-halo` + `Windows` / `Linux` (and `stx` + `Windows` for gfx1150).
-2. Set the matching variable to `true`.
+1. Register runners with the labels `stx-halo` + `Windows` / `Linux`.
+2. Set `STX_HALO_RUNNERS` to `true`.
 
 `test-llamacpp-rocm.yml` tests an already published release on the same runners.
 

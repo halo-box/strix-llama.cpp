@@ -13,9 +13,9 @@ on:
         required: false
         default: 'ubuntu'
       gfx_target:
-        description: 'AMD GPU targets (comma-separated)'
+        description: 'AMD GPU targets (comma-separated; this fork supports Strix Halo / gfx1151 only)'
         required: false
-        default: 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X,gfx90a,gfx908'
+        default: 'gfx1151'
       rocm_version:
         description: 'ROCm version to use (e.g., 7.13.0a20260318) or "latest" to auto-detect'
         required: false
@@ -54,7 +54,8 @@ concurrency:
 
 env:
   OPERATING_SYSTEMS: ${{ github.event.inputs.operating_systems || 'ubuntu' }}
-  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X,gfx90a,gfx908' }}
+  # this fork only supports Strix Halo (gfx1151)
+  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151' }}
   ROCM_VERSION: ${{ github.event.inputs.rocm_version || 'latest' }}
   LLAMACPP_VERSION: ${{ github.event.inputs.llamacpp_version || 'latest' }}
   # on a push, build exactly the merged commit
@@ -198,12 +199,7 @@ jobs:
         $rocmVersion = "${{ env.ROCM_VERSION }}"
         $currentTarget = "${{ matrix.gfx_target }}"
 
-        # Add appropriate suffixes for different GPU targets
         $s3Target = $currentTarget
-        if ($currentTarget -eq "gfx103X" -or $currentTarget -eq "gfx110X" -or $currentTarget -eq "gfx120X") {
-          $s3Target = "$currentTarget-all"
-          Write-Host "Using target with -all suffix: $s3Target"
-        }
 
         # TheRock now publishes nightlies to the ROCm core tarball index. That
         # index is a static HTML page with an embedded JSON `files` array (name +
@@ -293,24 +289,8 @@ jobs:
       shell: cmd
       run: |
 
-        REM Map GPU targets
         set "current_target=${{ matrix.gfx_target }}"
-        echo Input target: %current_target%
-
-        if "%current_target%"=="gfx110X" (
-          set "mapped_target=gfx1100;gfx1101;gfx1102;gfx1103"
-        ) else if "%current_target%"=="gfx103X" (
-          set "mapped_target=gfx1030;gfx1031;gfx1032;gfx1034"
-        ) else if "%current_target%"=="gfx1151" (
-          set "mapped_target=gfx1151"
-        ) else if "%current_target%"=="gfx1150" (
-          set "mapped_target=gfx1150"
-        ) else if "%current_target%"=="gfx120X" (
-          set "mapped_target=gfx1200;gfx1201"
-        ) else (
-          set "mapped_target=%current_target%"
-        )
-        echo Mapped target: %mapped_target%
+        echo GPU target: %current_target%
 
         REM Set up environment variables and PATH
         set HIP_PATH=C:\opt\rocm
@@ -334,7 +314,7 @@ jobs:
           -DCMAKE_CXX_FLAGS="-IC:\opt\rocm\include" ^
           -DCMAKE_CROSSCOMPILING=ON ^
           -DCMAKE_BUILD_TYPE=Release ^
-          -DGPU_TARGETS="%mapped_target%" ^
+          -DGPU_TARGETS="%current_target%" ^
           -DBUILD_SHARED_LIBS=ON ^
           -DLLAMA_BUILD_TESTS=OFF ^
           -DGGML_HIP=ON ^
@@ -573,12 +553,7 @@ jobs:
         rocm_version="${{ env.ROCM_VERSION }}"
         current_target="${{ matrix.gfx_target }}"
 
-        # Add appropriate suffixes for different GPU targets
         s3_target="$current_target"
-        if [[ "$current_target" = "gfx103X" || "$current_target" = "gfx110X" || "$current_target" = "gfx120X" ]]; then
-          s3_target="${current_target}-all"
-          echo "Using target with -all suffix: $s3_target"
-        fi
 
         # TheRock now publishes nightlies to the ROCm core tarball index. That
         # index is a static HTML page with an embedded JSON `files` array (name +
@@ -683,24 +658,8 @@ jobs:
 
     - name: Build Llama.cpp + ROCm
       run: |
-        # Map GPU targets
         current_target="${{ matrix.gfx_target }}"
-        echo "Input target: $current_target"
-
-        if [ "$current_target" = "gfx110X" ]; then
-          mapped_target="gfx1100;gfx1101;gfx1102;gfx1103"
-        elif [ "$current_target" = "gfx103X" ]; then
-          mapped_target="gfx1030;gfx1031;gfx1032;gfx1034"
-        elif [ "$current_target" = "gfx1151" ]; then
-          mapped_target="gfx1151"
-        elif [ "$current_target" = "gfx1150" ]; then
-          mapped_target="gfx1150"
-        elif [ "$current_target" = "gfx120X" ]; then
-          mapped_target="gfx1200;gfx1201"
-        else
-          mapped_target="$current_target"
-        fi
-        echo "Mapped target: $mapped_target"
+        echo "GPU target: $current_target"
 
         # Create build directory
         cd llama.cpp
@@ -714,7 +673,7 @@ jobs:
           -DCMAKE_CXX_FLAGS="-I/opt/rocm/include" \
           -DCMAKE_CROSSCOMPILING=ON \
           -DCMAKE_BUILD_TYPE=Release \
-          -DGPU_TARGETS="$mapped_target" \
+          -DGPU_TARGETS="$current_target" \
           -DBUILD_SHARED_LIBS=ON \
           -DLLAMA_BUILD_TESTS=OFF \
           -DGGML_HIP=ON \
@@ -956,7 +915,7 @@ jobs:
     if: |
       vars.STX_HALO_RUNNERS == 'true' &&
       (needs.build-windows.result == 'success' || needs.build-ubuntu.result == 'success') &&
-      contains(github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X', 'gfx1151')
+      contains(github.event.inputs.gfx_target || 'gfx1151', 'gfx1151')
     strategy:
       matrix:
         include:
@@ -981,35 +940,8 @@ jobs:
         gfx_target: ${{ matrix.gfx_target }}
         artifact_name: llama-${{ matrix.artifact_prefix }}-rocm-${{ matrix.gfx_target }}-x64
 
-  test-stx:
-    runs-on: ${{ matrix.runner }}
-    needs: [prepare-matrix, build-windows, build-ubuntu]
-    if: |
-      vars.STX_RUNNERS == 'true' &&
-      (needs.build-windows.result == 'success' || needs.build-ubuntu.result == 'success') &&
-      contains(github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X', 'gfx1150')
-    strategy:
-      matrix:
-        include:
-          - os: Windows
-            gfx_target: gfx1150
-            artifact_prefix: windows
-            runner: ["stx", "Windows"]
-      fail-fast: false
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Test llama.cpp build
-      uses: ./.github/actions/test-llamacpp-build
-      with:
-        os_type: ${{ matrix.os }}
-        gfx_target: ${{ matrix.gfx_target }}
-        artifact_name: llama-${{ matrix.artifact_prefix }}-rocm-${{ matrix.gfx_target }}-x64
-
   create-release:
-    needs: [prepare-matrix, build-windows, build-ubuntu, build-ubuntu-vulkan, test-stx-halo, test-stx]
+    needs: [prepare-matrix, build-windows, build-ubuntu, build-ubuntu-vulkan, test-stx-halo]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -1021,7 +953,6 @@ jobs:
       (needs.build-ubuntu-vulkan.result == 'success' || needs.build-ubuntu-vulkan.result == 'skipped') &&
       (needs.build-windows.result == 'success' || needs.build-ubuntu.result == 'success') &&
       (needs.test-stx-halo.result == 'success' || needs.test-stx-halo.result == 'skipped') &&
-      (needs.test-stx.result == 'success' || needs.test-stx.result == 'skipped') &&
       github.event_name != 'pull_request' &&
       (github.event_name == 'workflow_dispatch' &&
        (github.event.inputs.create_release == 'true' || github.event.inputs.create_release == null) ||
@@ -1185,5 +1116,5 @@ jobs:
         **Llama.cpp Commit Hash**: $LLAMACPP_COMMIT_HASH
         **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
-        This release includes compiled llama.cpp binaries with ROCm support for multiple GPU targets and operating systems, with all essential ROCm runtime libraries included." \
+        This release includes compiled llama.cpp binaries with ROCm support for AMD Strix Halo (gfx1151), with all essential ROCm runtime libraries included." \
           $upload_files
