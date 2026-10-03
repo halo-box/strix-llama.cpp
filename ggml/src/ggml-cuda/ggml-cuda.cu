@@ -6870,7 +6870,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 }
                 if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, d)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, d);
             }
-            for (int i = 0; i < cgraph->n_nodes; ++i) {   // the HC gate GEMM feeding only the fused mix keeps its BF16 epilogue
+            // HC gate GEMM read only by the stream mix right after it. If the fused gate mix refuses, hc_mix_reduce reads the F32
+            // gate unless it finds BF16 copies of both inputs. So drop the F32 output only when both copies are expected: this
+            // GEMM's gate copy, and the xn copy from the last combine-norm. A layer-0 mix has no combine-norm and keeps the F32 gate.
+            const ggml_tensor * cn_xn = nullptr;
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                ggml_cuda_hc_combine_norm_args ca;
+                if (ggml_cuda_match_hc_combine_norm(cgraph, i, ca, ws, false) > 0) cn_xn = ca.out_xn;
                 const ggml_tensor * t = cgraph->nodes[i];
                 if (t->op != GGML_OP_MUL_MAT || t->src[0]->ne[0] != 320 || t->src[0]->ne[1] != 10240 || !ggml_cuda_mmb_supported_mm(*cuda_ctx, t->src[0], t->src[1], t)) continue;
                 bool ok = true; int nread = 0;
@@ -6878,7 +6884,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     const ggml_tensor * u = cgraph->nodes[n];
                     if (!reads(u, t)) continue;
                     ++nread;
-                    if (u->op == GGML_OP_UNARY && ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID) { ggml_cuda_hc_mix_args ma; if (ggml_cuda_hc_mix_closed(cgraph, n, ma) > 0 && ma.gate == t) continue; }
+                    if (n == i + 1 && cn_xn && u->op == GGML_OP_UNARY && ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID) {
+                        ggml_cuda_hc_mix_args ma;
+                        if (ggml_cuda_hc_mix_closed(cgraph, n, ma) > 0 && ma.gate == t && (ma.xn == cn_xn || ma.xn->view_src == cn_xn)) continue;
+                    }
                     ok = false;
                 }
                 if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, t)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, t);
