@@ -3925,6 +3925,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             "flash_attn_top_k_f16", flash_attn_top_k_f16_len, flash_attn_top_k_f16_data, "main", 6,
             sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {512, device->subgroup_size}, 1, true, true,
             device->subgroup_size);
+        // shared memory: the sorted row (16 KiB), Q (1 KiB per head), a K and a V block (16 KiB each): at most GQA 12
+        static const char * sel_names[3] = { "flash_attn_sel_f16_gqa4", "flash_attn_sel_f16_gqa8", "flash_attn_sel_f16_gqa12" };
+        for (uint32_t i = 0; i < 3; ++i) {
+            const uint32_t gqa = 4 * (i + 1);
+            if (device->subgroup_shuffle && 64 * gqa <= device->properties.limits.maxComputeWorkGroupInvocations &&
+                device->properties.limits.maxComputeSharedMemorySize >= 65536) {
+                ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_f16[i],
+                    sel_names[i], flash_attn_sel_f16_len, flash_attn_sel_f16_data, "main", 5,
+                    sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {64 * gqa, 64, gqa}, 1, true, true, 64);
+            }
+        }
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_f16,
             "flash_attn_gather_f16", flash_attn_gather_f16_len, flash_attn_gather_f16_data, "main", 5,
             sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true,
@@ -8478,6 +8489,113 @@ static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& s
     subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
 }
 
+// maskless selected-key attention (QSA block selection): the pipeline that takes this op, or nullptr
+static vk_pipeline ggml_vk_flash_attn_sel_pipeline(const vk_device & device, const ggml_tensor * op) {
+    const ggml_tensor * q   = op->src[0];
+    const ggml_tensor * k   = op->src[1];
+    const ggml_tensor * v   = op->src[2];
+    const ggml_tensor * ids = op->src[5];
+    if (ids == nullptr || op->src[3] != nullptr || op->src[4] != nullptr || ggml_get_op_params_i32(op, 4) != 0) {
+        return nullptr;
+    }
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) op->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) op->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) ||
+        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || ids->type != GGML_TYPE_I32 ||
+        q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 ||
+        k->ne[1] != v->ne[1] || k->ne[2] != v->ne[2] || k->ne[3] != q->ne[3] || v->ne[3] != q->ne[3] ||
+        k->ne[2] < 1 || q->ne[2] % k->ne[2] != 0 ||
+        ids->ne[0] < 1 || ids->ne[0] > 4096 || ids->ne[1] < q->ne[1] || ids->ne[2] != 1 ||
+        (ids->ne[3] != 1 && ids->ne[3] != q->ne[3]) ||
+        q->nb[0] != sizeof(float) || k->nb[0] != sizeof(ggml_fp16_t) || v->nb[0] != sizeof(ggml_fp16_t) ||
+        ids->nb[0] != sizeof(int32_t)) {
+        return nullptr;
+    }
+    for (int i = 1; i < 4; ++i) {
+        if (q->nb[i] % sizeof(float) || k->nb[i] % sizeof(ggml_fp16_t) || v->nb[i] % sizeof(ggml_fp16_t) ||
+            ids->nb[i] % sizeof(int32_t)) {
+            return nullptr;
+        }
+    }
+    // the shader indexes with 32-bit element offsets
+    if (ggml_nbytes(k) / sizeof(ggml_fp16_t) > UINT32_MAX || ggml_nbytes(v) / sizeof(ggml_fp16_t) > UINT32_MAX ||
+        ggml_nbytes(q) / sizeof(float) > UINT32_MAX || ggml_nbytes(op) / sizeof(float) > UINT32_MAX) {
+        return nullptr;
+    }
+    switch (q->ne[2] / k->ne[2]) {
+        case 4:  return device->pipeline_flash_attn_sel_f16[0];
+        case 8:  return device->pipeline_flash_attn_sel_f16[1];
+        case 12: return device->pipeline_flash_attn_sel_f16[2];
+        default: return nullptr;
+    }
+}
+
+static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, ggml_tensor * dst) {
+    vk_pipeline pipeline = ggml_vk_flash_attn_sel_pipeline(ctx->device, dst);
+    if (!pipeline) {
+        return false;
+    }
+    const ggml_tensor * ids = dst->src[5];
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    uint32_t n_sort = 1;
+    while (n_sort < (uint32_t) ids->ne[0]) {
+        n_sort <<= 1;
+    }
+    // few queries (decode) give too few workgroups to fill the GPU: split each row, at least 64 keys per split
+    const uint32_t n_sel = (uint32_t) ids->ne[0];
+    const uint32_t n_wg  = (uint32_t) (q->ne[1] * k->ne[2] * q->ne[3]);
+    uint32_t n_split = n_wg < 64 ? std::min(CEIL_DIV(64u, n_wg), CEIL_DIV(n_sel, 64u)) : 1u;
+    const uint32_t chunk = ROUNDUP_POW2(CEIL_DIV(n_sel, std::max(n_split, 1u)), 32u); // whole key blocks
+    n_split = CEIL_DIV(n_sel, chunk);
+    const vk_op_flash_attn_sel_push_constants pc = {
+        (uint32_t) k->ne[1], (uint32_t) ids->ne[0], n_sort,
+        (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)), (uint32_t) (q->nb[3] / sizeof(float)),
+        (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)), (uint32_t) (k->nb[2] / sizeof(ggml_fp16_t)), (uint32_t) (k->nb[3] / sizeof(ggml_fp16_t)),
+        (uint32_t) (v->nb[1] / sizeof(ggml_fp16_t)), (uint32_t) (v->nb[2] / sizeof(ggml_fp16_t)), (uint32_t) (v->nb[3] / sizeof(ggml_fp16_t)),
+        (uint32_t) (ids->nb[1] / sizeof(int32_t)), ids->ne[3] == 1 ? 0u : (uint32_t) (ids->nb[3] / sizeof(int32_t)),
+        (uint32_t) (dst->nb[1] / sizeof(float)), (uint32_t) (dst->nb[2] / sizeof(float)), (uint32_t) (dst->nb[3] / sizeof(float)),
+        scale, n_split, chunk, (uint32_t) q->ne[2], (uint32_t) q->ne[1], (uint32_t) q->ne[3],
+    };
+    const vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, q);
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    const std::array<uint32_t, 3> grid = { (uint32_t) q->ne[1] * n_split, (uint32_t) k->ne[2], (uint32_t) q->ne[3] };
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    if (n_split == 1) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, v), ggml_vk_tensor_subbuffer(ctx, ids), dst_buf },
+            pc, grid);
+        return true;
+    }
+    const uint32_t D  = 256;
+    const uint32_t NH = (uint32_t) q->ne[2];
+    const uint32_t N  = (uint32_t) q->ne[1];
+    const uint32_t NS = (uint32_t) q->ne[3];
+    const size_t split_size = ((size_t) D * NH * N * NS * n_split + (size_t) NH * 2 * N * NS * n_split) * sizeof(float);
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+    if (ctx->prealloc_size_split_k < split_size) {
+        ctx->prealloc_size_split_k = split_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    const vk_subbuffer split_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { q_buf, ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, v), ggml_vk_tensor_subbuffer(ctx, ids), split_buf },
+        pc, grid);
+    ctx->prealloc_split_k_need_sync = true;
+    ggml_vk_sync_buffers(ctx, subctx);
+    const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = { D, NH, N, N, NS, n_split, 0 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+        { split_buf, q_buf, dst_buf }, reduce_pc, { NH, D, N * NS });
+    ctx->prealloc_split_k_need_sync = true;
+    return true;
+}
+
 static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
         const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
@@ -9223,6 +9341,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
+    if (dst->src[5] != nullptr && mask == nullptr) {
+        // supports_op only takes a maskless selected-key op when flash_attn_sel does
+        const bool done = ggml_vk_flash_attn_sel(ctx, subctx, q, k, v, dst);
+        GGML_ASSERT(done);
+        return;
+    }
     if (ggml_vk_flash_attn_top_k(ctx, subctx, q, k, v, mask, sinks, dst)) {
         return;
     }
@@ -16777,6 +16901,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 bool coopmat2 = device->coopmat2;
+                // maskless selected-key attention (src[5] without a mask): only flash_attn_sel reads the list, the dense kernel would attend to all cells
+                if (op->src[5] != nullptr && op->src[3] == nullptr) {
+                    return ggml_vk_flash_attn_sel_pipeline(device, op) != nullptr;
+                }
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
                 if ((HSK % 8) != 0 || (HSV % 8) != 0) {

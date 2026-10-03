@@ -1009,6 +1009,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_cm_small_f16[LI_NH_COUNT];
     vk_pipeline pipeline_lightning_indexer_decode_cm_f16[LI_NH_COUNT];
     vk_pipeline pipeline_flash_attn_top_k_f16;
+    vk_pipeline pipeline_flash_attn_sel_f16[3]; // maskless selected-key FA, GQA 4, 8, 12
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
