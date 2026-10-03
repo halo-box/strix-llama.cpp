@@ -111,7 +111,7 @@ for m in "${models[@]}"; do
         echo "upstream failed on $name"; tail -20 "$up_log"
         rows+=("| $name | error | | | | | | FAIL (upstream run) |"); fail=1; rm -f "$base"; continue
     fi
-    [[ $GPU == unknown ]] && GPU=$(grep -m1 -E 'Device 0: ' "$up_log" | sed -E 's/.*Device 0: *//; s/, VMM.*//' || true)
+    [[ $GPU == unknown ]] && GPU=$(grep -m1 -oE 'ROCm0 \([^)]*\)' "$up_log" || true)
     [[ -n $GPU ]] || GPU=unknown
 
     floor_ok=1
