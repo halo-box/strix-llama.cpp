@@ -14,7 +14,10 @@ on:
       'src/models/**'
     ]
 
+  # disabled for pull requests: the metal job runs on a self-hosted macOS runner and
+  # hangs for the full 24h timeout when the runner is unavailable, blocking PRs
   pull_request:
+    branches-ignore: ['**']
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/fusion.yml',
