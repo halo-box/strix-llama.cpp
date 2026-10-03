@@ -2,7 +2,7 @@
 # Model-level correctness on Strix Halo (gfx1151, ROCm): this fork vs the upstream ggml-org/llama.cpp commit it is
 # based on (merge-base of HEAD and upstream master, i.e. the latest upstream master commit contained in the fork).
 #
-# For every model in $MODELS_DIR:
+# For every model in $MODELS_DIR (wikitext-2 as one token stream, $CHUNKS consecutive chunks of $CTX tokens):
 #   1. upstream llama-perplexity saves its logits (--kl-divergence-base) and reports its own final PPL
 #   2. floor: upstream again, with a benign runtime change ($FLOOR_ARGS, default -ub 256), against those logits.
 #      How far upstream drifts from itself is the noise floor for KLD and top-1: a different ubatch changes the
@@ -31,7 +31,7 @@ MODELS_DIR=${MODELS_DIR:-/models}
 TEXT=${TEXT:-/data/wiki.test.raw}
 CACHE=${CACHE:-/cache}
 CHUNKS=${CHUNKS:-16}
-CTX=${CTX:-512}
+CTX=${CTX:-2048}      # tokens per chunk; only the second half of every chunk is scored (>= CTX/2 tokens of context)
 PPL_TOL=${PPL_TOL:-0.01}    # max relative PPL increase vs upstream
 TOP_TOL=${TOP_TOL:-3}       # min allowed limit, % of tokens whose top-1 token differs from upstream
 KLD_TOL=${KLD_TOL:-0.005}   # min allowed limit, mean KL divergence vs upstream
@@ -109,7 +109,7 @@ for m in "${models[@]}"; do
 
     if ! "$CACHE/build-upstream/bin/llama-perplexity" -m "$m" "${PPL_ARGS[@]}" --kl-divergence-base "$base" > "$up_log" 2>&1; then
         echo "upstream failed on $name"; tail -20 "$up_log"
-        rows+=("| $name | error | | | | | | FAIL (upstream run) |"); fail=1; rm -f "$base"; continue
+        rows+=("| $name | error | | | | | | | | | | FAIL (upstream run) |"); fail=1; rm -f "$base"; continue
     fi
     [[ $GPU == unknown ]] && GPU=$(grep -m1 -oE 'ROCm0 \([^)]*\)' "$up_log" || true)
     [[ -n $GPU ]] || GPU=unknown
@@ -124,7 +124,7 @@ for m in "${models[@]}"; do
     if ! "$SRC/build-correctness/bin/llama-perplexity" -m "$m" "${PPL_ARGS[@]}" \
             --kl-divergence-base "$base" --kl-divergence > "$fk_log" 2>&1; then
         echo "fork failed on $name"; tail -20 "$fk_log"
-        rows+=("| $name | | error | | | | | FAIL (fork run) |"); fail=1; rm -f "$base"; continue
+        rows+=("| $name | | error | | | | | | | | | FAIL (fork run) |"); fail=1; rm -f "$base"; continue
     fi
     rm -f "$base"
 
