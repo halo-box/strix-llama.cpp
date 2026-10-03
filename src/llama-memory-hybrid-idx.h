@@ -119,6 +119,7 @@ private:
 
     bool incremental_qsa = false;
     bool qsa_recover_pending = false;
+    llama_seq_id qsa_recover_failed = -1; // the sequence the last recovery attempt failed for
     bool qsa_recover(llama_seq_id seq);
     qsa_prefix_state qsa_prefix;
     mutable std::vector<int64_t> qsa_ready;

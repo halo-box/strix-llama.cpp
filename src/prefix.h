@@ -2,6 +2,7 @@
 
 #include "llama-batch.h"
 #include "llama-kv-cells.h"
+#include "qsa-prefix-state.h"
 #include <algorithm>
 #include <cstdint>
 #include <unordered_map>
@@ -52,6 +53,25 @@ static bool qsa_single_sequence_prefix(const llama_kv_cells & cells, uint32_t co
     }
     std::sort(positions.begin(),positions.end());
     return std::adjacent_find(positions.begin(),positions.end())==positions.end();
+}
+
+// rebuild the QSA prefix of seq from the cells (out: fresh, sized to the cache): each position in [0, n) must be in one cell that no other sequence shares
+// a unified cache also holds other sequences (other slots of a server): skip their cells, seq does not attend to them
+static bool qsa_rebuild_prefix(const llama_kv_cells & raw, llama_seq_id seq, qsa_prefix_state & out) {
+    out.cells.assign(raw.seq_pos_max(seq) + 1, -1);
+    for (uint32_t cell=raw.used_min(); cell<raw.used_max_p1(); ++cell) {
+        if (raw.is_empty(cell) || !raw.seq_has(cell, seq)) { continue; }
+        const int32_t pos = raw.pos_get(cell);
+        const auto & ext = raw.ext_get(cell);
+        if (pos < 0 || size_t(pos) >= out.cells.size() || out.cells[pos] >= 0 ||
+            raw.seq_get_all(cell).count() != 1 ||
+            !((ext.x == 0 && ext.y == 0) || (ext.x == pos && ext.y == pos))) { return false; }
+        out.cells[pos] = cell; out.positions[cell] = pos;
+    }
+    if (std::find(out.cells.begin(), out.cells.end(), -1) != out.cells.end()) { return false; }
+    out.sequence = seq;
+    for (size_t b=0; b<out.cells.size()/4; ++b) { out.block_positions.push_back(b*4); }
+    return true;
 }
 
 static std::vector<int64_t> qsa_prefix_limits(const llama_pos * pos, int64_t tokens, int64_t strip,
