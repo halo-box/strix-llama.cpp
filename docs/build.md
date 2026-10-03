@@ -374,10 +374,10 @@ This provides GPU acceleration on HIP-supported AMD GPUs.
 Make sure to have ROCm installed.
 You can download it from your Linux distro's package manager or from here: [ROCm Quick Start (Linux)](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/tutorial/quick-start.html#rocm-install-quick).
 
-- Using `CMake` for Linux (assuming a gfx1030-compatible AMD GPU):
+- Using `CMake` for Linux (Strix Halo, `gfx1151`):
   ```bash
   HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
-      cmake -S . -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1030 -DCMAKE_BUILD_TYPE=Release \
+      cmake -S . -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_BUILD_TYPE=Release \
       && cmake --build build --config Release -- -j 16
   ```
 
@@ -394,22 +394,20 @@ You can download it from your Linux distro's package manager or from here: [ROCm
   ```bash
   HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -p)" \
   HIP_DEVICE_LIB_PATH=<directory-you-just-found> \
-      cmake -S . -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1030 -DCMAKE_BUILD_TYPE=Release \
+      cmake -S . -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_BUILD_TYPE=Release \
       && cmake --build build -- -j 16
   ```
 
-- Using `CMake` for Windows (using x64 Native Tools Command Prompt for VS, and assuming a gfx1100-compatible AMD GPU):
+- Using `CMake` for Windows (using x64 Native Tools Command Prompt for VS, Strix Halo, `gfx1151`):
   ```bash
   set PATH=%HIP_PATH%\bin;%PATH%
-  cmake -S . -B build -G Ninja -DGPU_TARGETS=gfx1100 -DGGML_HIP=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+  cmake -S . -B build -G Ninja -DGPU_TARGETS=gfx1151 -DGGML_HIP=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
   cmake --build build
   ```
-  If necessary, adapt `GPU_TARGETS` to the GPU arch you want to compile for. The above example uses `gfx1100` that corresponds to Radeon RX 7900XTX/XT/GRE. You can find a list of targets [here](https://llvm.org/docs/AMDGPUUsage.html#processors)
-  Find your gpu version string by matching the most significant version information from `rocminfo | grep gfx | head -1 | awk '{print $2}'` with the list of processors, e.g. `gfx1035` maps to `gfx1030`.
+  `gfx1151` is the Strix Halo (Ryzen AI Max+) integrated GPU, the only target this fork supports. You can confirm it with `rocminfo | grep gfx | head -1 | awk '{print $2}'`.
 
 
 The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/latest/understand/gpu_isolation.html#hip-visible-devices) can be used to specify which GPU(s) will be used.
-If your GPU is not officially supported you can use the environment variable [`HSA_OVERRIDE_GFX_VERSION`] set to a similar GPU, for example 10.3.0 on RDNA2 (e.g. gfx1030, gfx1031, or gfx1035) or 11.0.0 on RDNA3. Note that [`HSA_OVERRIDE_GFX_VERSION`] is [not supported on Windows](https://github.com/ROCm/ROCm/issues/2654)
 
 ### Unified Memory
 

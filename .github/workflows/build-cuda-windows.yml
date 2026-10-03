@@ -94,9 +94,9 @@ jobs:
     strategy:
       matrix:
         include:
-          # sync with release.yml
+          # sync with release.yml; this fork only supports Strix Halo (gfx1151)
           - name: "radeon"
-            gpu_targets: "gfx1150;gfx1151;gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1030;gfx1031;gfx1032"
+            gpu_targets: "gfx1151"
 
     steps:
       - name: Clone
