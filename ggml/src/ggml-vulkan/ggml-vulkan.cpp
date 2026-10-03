@@ -9478,6 +9478,9 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
                (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16 || ggml_is_quantized(src1->type)) &&
                dst->ne[0] <= mul_mat_vec_max_cols && dst->ne[1] > mul_mat_vec_max_cols &&
+               // more than one output row: transposed write, F32 dst only, and src1 (the swapped mat-vec matrix)
+               // limited to the f32/f16 that test-backend-ops can check against the CPU reference
+               (dst->ne[0] == 1 || (dst->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16))) &&
                src0->ne[2] == 1 && src0->ne[3] == 1 &&
                src1->ne[2] == 1 && src1->ne[3] == 1 &&
                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
