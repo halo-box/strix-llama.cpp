@@ -3955,24 +3955,29 @@ struct test_mmb_quant_hc : test_case {
     const int k, hc, embd;
     const bool gate_output;    // the gate GEMM is a graph output, compared with the result
     const bool split_reader;   // a second reader of the gate GEMM in a later split (after a node on the second backend)
-    ggml_tensor * out_gate = nullptr, * out_mix = nullptr, * cut = nullptr;
+    const bool norm;           // false: xn is an RMS norm of an input, without the combine-norm chain (layer 0)
+    const ggml_type type_inj;  // GGML_TYPE_COUNT: no inject GEMM on xn
+    ggml_tensor * out_gate = nullptr, * out_mix = nullptr, * out_inj = nullptr, * cut = nullptr;
     explicit test_mmb_quant_hc(ggml_type type, ggml_type type_down = GGML_TYPE_COUNT, int k = 256, int hc = 4, int embd = 2560,
-                               bool gate_output = false, bool split_reader = false)
-        : type(type), type_down(type_down), k(k), hc(hc), embd(embd), gate_output(gate_output), split_reader(split_reader) {}
+                               bool gate_output = false, bool split_reader = false, bool norm = true, ggml_type type_inj = GGML_TYPE_COUNT)
+        : type(type), type_down(type_down), k(k), hc(hc), embd(embd), gate_output(gate_output), split_reader(split_reader), norm(norm), type_inj(type_inj) {}
     std::string op_desc(ggml_tensor *) override { return "MMB_QUANT_HC"; }
     std::string vars() override {
         std::string s = type_down == GGML_TYPE_COUNT ? VAR_TO_STR(type) : VARS_TO_STR2(type, type_down);
         if (k != 256 || hc != 4 || embd != 2560) s += "," + VARS_TO_STR3(k, hc, embd);
         if (gate_output) s += "," + VAR_TO_STR(gate_output);
         if (split_reader) s += "," + VAR_TO_STR(split_reader);
+        if (!norm) s += "," + VAR_TO_STR(norm);
+        if (type_inj != GGML_TYPE_COUNT) s += "," + VAR_TO_STR(type_inj);
         return s;
     }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> second_backend_nodes() override { return split_reader ? std::vector<ggml_tensor *>{cut} : std::vector<ggml_tensor *>{}; }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
-        if (!gate_output && !split_reader) return {};
+        if (!gate_output && !split_reader && !out_inj) return {};
         std::vector<ggml_tensor *> v = {out_mix};
         if (gate_output) v.push_back(out_gate);
+        if (out_inj) v.push_back(out_inj);
         return v;
     }
     bool use_scheduler_allocation() override { return true; }
@@ -3980,23 +3985,37 @@ struct test_mmb_quant_hc : test_case {
         for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
             if (t->op!=GGML_OP_NONE) continue;
             // Scale down weights to avoid saturating the gate sigmoid.
-            const float r = strcmp(t->name, "w_down") == 0 ? 1.0f/sqrtf((float) t->ne[0]) : 1.0f;
+            const float r = strcmp(t->name, "w_down") == 0 || strcmp(t->name, "w_inj") == 0 ? 1.0f/sqrtf((float) t->ne[0]) : 1.0f;
             init_tensor_uniform(t, -r, r);
         }
     }
     double max_nmse_err() override { return 5e-4; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int tokens=512;
-        auto * residual=ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
-        auto * block=ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
-        auto * injection=ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        ggml_tensor * combined=nullptr;
+        if (norm) {
+            auto * residual=ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+            auto * block=ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
+            auto * injection=ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+            auto * weight=ggml_reshape_3d(ctx,ggml_scale(ctx,ggml_sigmoid(ctx,ggml_scale(ctx,injection,.25f)),2.f),1,hc,tokens);
+            if(gf){ggml_build_forward_expand(gf,block);ggml_build_forward_expand(gf,weight);}
+            combined=ggml_add(ctx,residual,ggml_mul(ctx,ggml_repeat(ctx,block,residual),weight));
+        } else {
+            combined=ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        }
         // gamma is [embd, hc] and applied to the 3D norm output: RMS_NORM and MUL adjacent, as the model builder emits them
         auto * gamma=ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc);
-        auto * weight=ggml_reshape_3d(ctx,ggml_scale(ctx,ggml_sigmoid(ctx,ggml_scale(ctx,injection,.25f)),2.f),1,hc,tokens);
-        if(gf){ggml_build_forward_expand(gf,block);ggml_build_forward_expand(gf,weight);}
-        auto * combined=ggml_add(ctx,residual,ggml_mul(ctx,ggml_repeat(ctx,block,residual),weight));
         auto * xn=ggml_reshape_2d(ctx,ggml_mul(ctx,ggml_rms_norm(ctx,combined,1e-6f),gamma),embd*hc,tokens);
         if(gf)ggml_build_forward_expand(gf,xn);
+        // inject GEMM: a second xn reader, compared as its own output so it cannot mask an error in the mix
+        out_inj=nullptr;
+        if (type_inj!=GGML_TYPE_COUNT) {
+            auto * w_inj=ggml_new_tensor_2d(ctx,type_inj,embd*hc,2*hc+hc*hc);
+            ggml_set_name(w_inj,"w_inj");
+            out_inj=ggml_mul_mat(ctx,w_inj,xn);
+            ggml_set_output(out_inj);
+            if(gf)ggml_build_forward_expand(gf,out_inj);
+        }
         // with type_down, lo is the down projection of xn as the model builds it, so xn also has a GEMM reader
         ggml_tensor * lo=nullptr;
         if (type_down==GGML_TYPE_COUNT) {
@@ -4021,6 +4040,7 @@ struct test_mmb_quant_hc : test_case {
             out_mix=ggml_add(ctx,out_mix,ggml_scale(ctx,ggml_sum_rows(ctx,out_gate),1e-3f));
             ggml_set_output(out_mix);
         }
+        if (out_inj) ggml_set_output(out_mix);
         return out_mix;
     }
 };
@@ -11194,6 +11214,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int k : {320, 256}) {
         test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, k, 4, 2560, false, true));
     }
+    // layer 0 (no combine-norm): no BF16 xn when inject and down are not MMB GEMMs, a conversion copy when they are
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, 320, 4, 2560, false, false, false));
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, 320, 4, 2560, false, false, false, GGML_TYPE_IQ4_XS));
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 320, 4, 2560, false, false, false, GGML_TYPE_Q8_0));
     for (ggml_type type : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         test_cases.emplace_back(new test_mmb_quant_dense(type, 512, 128, 256));
         test_cases.emplace_back(new test_mmb_quant_dense(type, 513, 129, 512));
