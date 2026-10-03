@@ -8,10 +8,17 @@
 void launch_mul_mat_q_q5_k_j32(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 void launch_mul_mat_q_q6_k_j32(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 
+// GGML_CUDA_DISABLE_MMQ_TUNE=1: upstream's MMQ choices on RDNA3.5, i.e. no j32 kernels and upstream's MMQ vs
+// dequantize + hipBLAS thresholds for Q6_K and IQ2_XS / IQ2_S (see ggml_cuda_should_use_mmq).
+static bool mmq_tune_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_MMQ_TUNE") != nullptr;
+    return disabled;
+}
+
 static bool use_rdna3_5_q5_ling(const mmq_args & args) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
-    return args.type_x == GGML_TYPE_Q5_K && GGML_CUDA_CC_IS_RDNA3_5(cc) && args.ids_dst != nullptr &&
+    return args.type_x == GGML_TYPE_Q5_K && GGML_CUDA_CC_IS_RDNA3_5(cc) && !mmq_tune_disabled() && args.ids_dst != nullptr &&
         ((args.ncols_x == 2560 && args.nrows_x == 768) || (args.ncols_x == 768 && args.nrows_x == 2560)) &&
         args.nchannels_x == 512 && args.nchannels_y > 0 &&
         (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y == 32;
@@ -20,7 +27,7 @@ static bool use_rdna3_5_q5_ling(const mmq_args & args) {
 static bool use_rdna3_5_q6_ling_j32(const mmq_args & args) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
-    return args.type_x == GGML_TYPE_Q6_K && GGML_CUDA_CC_IS_RDNA3_5(cc) && args.ids_dst != nullptr &&
+    return args.type_x == GGML_TYPE_Q6_K && GGML_CUDA_CC_IS_RDNA3_5(cc) && !mmq_tune_disabled() && args.ids_dst != nullptr &&
         args.ncols_x == 768 && args.nrows_x == 2560 && args.nchannels_x == 512 && args.nchannels_y > 0 &&
         (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y == 32;
 }
@@ -632,13 +639,13 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                 case GGML_TYPE_Q6_K:
                     // RDNA 3.5 (gfx1151): dequantize + hipBLASLt loses to MMQ up to ne11 = 1024; at 2048 the two
                     // paths trade places per shape (K = 4096 favours hipBLASLt, K >= 12288 favours MMQ), see PR.
-                    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+                    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && !mmq_tune_disabled()) {
                         return ne11 <= 1024;
                     }
                     return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
-                    return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
+                    return (GGML_CUDA_CC_IS_RDNA3_5(cc) && !mmq_tune_disabled()) || ne11 <= 128;
                 default:
                     return true;
             }

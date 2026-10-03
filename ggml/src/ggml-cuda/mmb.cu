@@ -980,8 +980,11 @@ static const uint16_t * mmb_shadow_lookup(ggml_backend_cuda_context & ctx, const
 
 // RDNA3.5 (gfx1151) only, tuned for qwen4exp shapes. On gfx1151 (ROCm 7.2.1) it lost to MMQ on other archs: dense qwen35 prefill 3.4-3.9x slower, MoE 14-28% (PR #75).
 // llama now opts in every backend context it creates, limited to the weight types in mmb_quant_type(); only the 32-row small-batch gate (mmb_min_t) depends on the arch.
+// GGML_CUDA_DISABLE_MMB=1 turns it off whatever the context asked for (every MMB consumer, the BF16 caches and the
+// fusions built on it go through here or ggml_cuda_mmb_supported_mm), e.g. to compare against upstream's GEMM paths.
 bool mmb_enabled(const ggml_backend_cuda_context & ctx) {
-    return ctx.mmb_opt_in && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc);
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_MMB") != nullptr;
+    return !disabled && ctx.mmb_opt_in && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc);
 }
 // Smallest GEMM row count for the MMB consumers: 32 in a context with the small-batch opt-in (qwen4exp), else 512. The QSA indexer score keeps 512, see below.
 // gfx1151 / ROCm 10, Qwen3.8-Flash-Next UD-Q4_K_XL and UD-IQ4_XS prefill: MMB is about 5% slower than MMQ at 16 tokens, 11-14% faster at 32.
