@@ -5344,10 +5344,15 @@ struct test_gated_delta_net : public test_case {
     // reference) instead of the exact fp32 recurrence: HIP on RDNA3.5 (S_v = 128, >= 256 tokens, one sequence,
     // final state only) and Vulkan on RDNA3 (S_v = 128, >= 64 tokens, final state only)
     double max_nmse_err() override {
-        if (head_size == 128 && n_seq_tokens >= 256 && n_seqs == 1 && !kda && K == 1) {
-            return 1e-6;
+        return (head_size == 128 && n_seq_tokens >= 256 && n_seqs == 1 && !kda && K == 1) ? 1e-6 : 1e-7;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0 && head_size == 128 && n_seq_tokens >= 64 && !kda && K == 1) {
+            return std::max(test_case::max_nmse_err(backend), 5e-7);
         }
-        return (head_size == 128 && n_seq_tokens >= 64 && !kda && K == 1) ? 5e-7 : 1e-7;
+        return test_case::max_nmse_err(backend);
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,

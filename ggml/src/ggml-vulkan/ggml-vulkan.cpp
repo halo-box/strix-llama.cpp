@@ -3917,8 +3917,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     device->subgroup_size);
             }
             // chunked gated delta net (default on, GGML_VK_GDN_CHUNK=0 off): hand-built wave32 WMMA fragments in the RDNA3 layout
-            // (RDNA4 lays its fragments out differently), so RDNA3 + wave32 only
+            // (RDNA4 lays its fragments out differently) as RADV/ACO lowers them, so RDNA3 + RADV + wave32 only
             if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == vk_device_architecture::AMD_RDNA3 &&
+                device->driver_id == vk::DriverId::eMesaRadv &&
                 device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
                 ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_prep, "gdn_chunk_prep_f32", gdn_chunk_prep_f32_len, gdn_chunk_prep_f32_data,
                     "main", 5, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
@@ -11523,7 +11524,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
     // chunked prefill form (gdn_chunk_prep/scan.comp): S_v 128, scalar gate, final state only (K == 1), q/k/v
     // rows with unit element stride, q and k with the same strides. f16 WMMA operands, f32 accumulation: not
-    // bit-identical to the sequential scan. Default on where the pipelines exist (RDNA3 wave32); GGML_VK_GDN_CHUNK=0
+    // bit-identical to the sequential scan. Default on where the pipelines exist (RDNA3 RADV wave32); GGML_VK_GDN_CHUNK=0
     // opts out. Batches under 64 tokens keep the sequential kernel.
     static const bool chunk_enabled = [] { const char * e = getenv("GGML_VK_GDN_CHUNK"); return !e || atoi(e) != 0; }();
     constexpr uint32_t chunk_min = 64;
