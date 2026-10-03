@@ -7,7 +7,8 @@
 #   strix-correctness my-branch                # a branch or commit of the fork
 #   strix-correctness ~/src/strix-llama.cpp    # a local checkout (its current HEAD)
 #
-# Expects models in ~/models/ci and ~/wikitext-2-raw/wiki.test.raw. Limits: PPL_TOL, TOP_TOL, KLD_TOL, FLOOR_K, FLOOR_ARGS, CHUNKS, CTX.
+# Expects models in ~/models/ci and ~/wikitext-2-raw/wiki.test.raw. Limits: PPL_TOL, TOP_TOL, KLD_TOL, TAIL_TOL, FLOOR_K, FLOOR_ARGS
+# (';'-separated), STRICT_ENV, CHUNKS, CTX.
 # Results: ~/correctness-run/results/<date>-<commit>/summary.md (+ logs)
 set -euo pipefail
 
@@ -42,7 +43,7 @@ echo "fork $TARGET ($SHA) -> $OUT"
 
 IMAGE_ID=$("$ENGINE" image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || echo unknown)
 ENV_ARGS=(-e IMAGE="$IMAGE" -e IMAGE_ID="$IMAGE_ID")
-for v in PPL_TOL TOP_TOL KLD_TOL FLOOR_K FLOOR_ARGS CHUNKS CTX; do
+for v in PPL_TOL TOP_TOL KLD_TOL TAIL_TOL FLOOR_K FLOOR_ARGS STRICT_ENV CHUNKS CTX; do
     [[ -n ${!v:-} ]] && ENV_ARGS+=(-e "$v=${!v}")
 done
 
