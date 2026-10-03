@@ -245,8 +245,8 @@ __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, siz
     }
 }
 
-static bool mmb_quant_type(ggml_type type) {
-    if (type != GGML_TYPE_Q8_0 && type != GGML_TYPE_IQ4_NL) return false;
+// every type mmb_decode_slice() handles
+static bool mmb_quant_type_any(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
@@ -272,6 +272,28 @@ static bool mmb_quant_type(ggml_type type) {
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
             return true;
+        default: return false;
+    }
+}
+
+// dense GEMMs: the two types measured faster than MMQ on every arch (#123)
+static bool mmb_quant_type_dense(ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL;
+}
+
+// routed experts: the types measured faster than MMQ at 512-4096 rows on gfx1151 (Q5_K / Q6_K decode the whole super-block and still won)
+static bool mmb_quant_type_routed(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+            return mmb_quant_type_any(type);
         default: return false;
     }
 }

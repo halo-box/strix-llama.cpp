@@ -979,13 +979,13 @@ static const uint16_t * mmb_shadow_lookup(ggml_backend_cuda_context & ctx, const
 }
 
 // RDNA3.5 (gfx1151) only, tuned for qwen4exp shapes. On gfx1151 (ROCm 7.2.1) it lost to MMQ on other archs: dense qwen35 prefill 3.4-3.9x slower, MoE 14-28% (PR #75).
-// llama now opts in every backend context it creates, limited to the weight types in mmb_quant_type(); only the 32-row small-batch gate (mmb_min_t) depends on the arch.
+// llama now opts in every backend context it creates, limited to the weight types in mmb_quant_type_dense() / mmb_quant_type_routed(); only the 32-row small-batch gate (mmb_min_t) depends on the arch.
 bool mmb_enabled(const ggml_backend_cuda_context & ctx) {
     return ctx.mmb_opt_in && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc);
 }
 // Smallest GEMM row count for the MMB consumers: 32 in a context with the small-batch opt-in (qwen4exp), else 512. The QSA indexer score keeps 512, see below.
 // gfx1151 / ROCm 10, Qwen3.8-Flash-Next UD-Q4_K_XL and UD-IQ4_XS prefill: MMB is about 5% slower than MMQ at 16 tokens, 11-14% faster at 32.
-// Retest when the MMQ or MMB tiles or mmb_quant_type() change.
+// Retest when the MMQ or MMB tiles or the mmb_quant_type_*() gates change.
 int  mmb_min_t(const ggml_backend_cuda_context & ctx) { return ctx.mmb_small_batch ? 32 : 512; }
 int  mmb_f32split_mode(){ return 2; }
 bool mmb_f32split() { return true; }
@@ -1049,7 +1049,7 @@ uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const gg
 
 bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
-    const bool quant = mmb_quant_type(src0->type);
+    const bool quant = mmb_quant_type_dense(src0->type);
     const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
     const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
     if (quant && src0->ne[0] % ggml_blck_size(src0->type) != 0) return false;
@@ -1068,7 +1068,7 @@ bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tens
 
 bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
-    if (!mmb_quant_type(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
+    if (!mmb_quant_type_routed(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
     const int64_t K = src0->ne[0], M = src0->ne[1], E = src0->ne[2];
     if (src0->ne[3] != 1 || K % 64 != 0 || E < 1 || E > 1024) return false;
@@ -1215,7 +1215,7 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     } else if (src0->type == GGML_TYPE_Q8_0) {
         if (big) mmb_dense_kernel<128, 256, 64, 64, 1><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
         else     { MMB_SMALL_DENSE(1, W); }
-    } else if (mmb_quant_type(src0->type)) {
+    } else if (mmb_quant_type_dense(src0->type)) {
         mmb_dispatch_quant(src0->type, [&](auto tag) {
             constexpr int WT = decltype(tag)::value;
             if (big) mmb_dense_kernel<128, 256, 64, 64, WT><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
@@ -1251,7 +1251,7 @@ bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
 bool ggml_cuda_mmb_blk16() { return true; }
 bool ggml_cuda_mmb_res16()  { return true; }
 bool ggml_cuda_hc_gate_mix_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, const ggml_tensor * dst, const int hc) {
-    if (!mmb_gatemix_flag() || hc != 4 || !mmb_quant_type(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
+    if (!mmb_gatemix_flag() || hc != 4 || !mmb_quant_type_dense(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
     return !(K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t(ctx));
@@ -1331,7 +1331,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
     if (!mmb_enabled(ctx) || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
-    if (!mmb_quant_type(gw->type) || uw->type != gw->type) return false;
+    if (!mmb_quant_type_routed(gw->type) || uw->type != gw->type) return false;
     if (!ggml_are_same_shape(gw, uw) || gw->nb[1] != uw->nb[1] || gw->nb[2] != uw->nb[2]) return false;
     if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) return false;
     if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || !glu->src[0] || !glu->src[1]) return false;
