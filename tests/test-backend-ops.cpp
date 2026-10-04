@@ -103,10 +103,18 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         }
 
         std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+        // GGML_TEST_QUANT_INIT_BLOCKS=<n>: quantize only the first n blocks and repeat them over the
+        // tensor (perf runs of slow encoders, e.g. the trellis types on 512-expert MoE shapes).
+        static const size_t fast_init_blocks = [] {
+            const char * e = getenv("GGML_TEST_QUANT_INIT_BLOCKS");
+            return e ? (size_t) strtoull(e, nullptr, 10) : (size_t) 0;
+        }();
+        const size_t n_blocks_all = nels / ggml_blck_size(tensor->type);
+        const bool fast_init = fast_init_blocks > 0 && n_blocks_all > fast_init_blocks;
         {
             // parallel quantization by block
             size_t blck_size = ggml_blck_size(tensor->type);
-            size_t n_blocks = nels / blck_size;
+            size_t n_blocks = fast_init ? fast_init_blocks : n_blocks_all;
 
             auto quantize_thread = [&](size_t start, size_t end) {
                 ggml_quantize_chunk(tensor->type, data.data(), dataq.data(),
@@ -131,6 +139,12 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
                 for (auto & t : tasks) {
                     t.get();
                 }
+            }
+        }
+        if (fast_init) {
+            const size_t chunk = ggml_row_size(tensor->type, fast_init_blocks * ggml_blck_size(tensor->type));
+            for (size_t off = chunk; off < dataq.size(); off += chunk) {
+                memcpy(dataq.data() + off, dataq.data(), std::min(chunk, dataq.size() - off));
             }
         }
         ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
