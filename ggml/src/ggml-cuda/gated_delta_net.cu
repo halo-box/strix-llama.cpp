@@ -1620,7 +1620,33 @@ void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, cons
     const dim3 grid(args.H_v, 1, 1);
     const dim3 block(32, 32, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, ctx.stream());
-    ggml_cuda_kernel_launch(gdn_decode_fused_cuda<128, 4>, launch_params, args);
+    if (args.n_tokens == 1 && args.K == 1) {
+        ggml_cuda_kernel_launch(gdn_decode_fused_cuda<128, 4>, launch_params, args);
+        return;
+    }
+
+    GGML_ASSERT(args.n_tokens >= 1 && args.n_tokens <= args.K && args.K <= 8);
+    const int64_t conv_elems = (args.d_conv - 1) * args.S * (2 * args.H_k + args.H_v);
+    for (int64_t slot = args.n_tokens; slot < args.K; ++slot) {
+        CUDA_CHECK(cudaMemcpyAsync(args.conv_state_out + slot * args.conv_slot_stride, args.conv_state_in,
+            conv_elems * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+    for (int64_t t = 0; t < args.n_tokens; ++t) {
+        const int64_t slot = args.n_tokens - 1 - t;
+        ggml_cuda_gdn_decode_args step = args;
+        step.qkv += t * args.qkv_token_stride;
+        step.alpha += t * args.H_v;
+        step.beta += t * args.H_v;
+        step.conv_state_out += slot * args.conv_slot_stride;
+        step.state_out += slot * args.state_slot_stride;
+        step.attn_out += t * args.S * args.H_v;
+        if (t > 0) {
+            step.conv_state_in = args.conv_state_out + (slot + 1) * args.conv_slot_stride;
+            step.state_cache = args.state_out + (slot + 1) * args.state_slot_stride;
+            step.state_row_stride = 0;
+        }
+        ggml_cuda_kernel_launch(gdn_decode_fused_cuda<128, 4>, launch_params, step);
+    }
 }
 
 void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in) {
@@ -1630,7 +1656,7 @@ void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_c
 void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in,
         const float * z, float * gated_out) {
     GGML_ASSERT(args_in.S == 128 && args_in.d_conv == 4);
-    ggml_cuda_pool_alloc<float> attn(ctx.pool(), args_in.S * args_in.H_v);
+    ggml_cuda_pool_alloc<float> attn(ctx.pool(), args_in.S * args_in.H_v * args_in.n_tokens);
     ggml_cuda_gdn_decode_args args = args_in;
     args.attn_out = attn.get();
     ggml_cuda_op_gdn_decode_fused_prenorm(ctx, args, attn.get());
@@ -1638,5 +1664,10 @@ void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const 
     const dim3 grid(args.H_v, 1, 1);
     const dim3 norm_block(128, 1, 1);
     const ggml_cuda_kernel_launch_params norm_params = ggml_cuda_kernel_launch_params(grid, norm_block, 0, ctx.stream());
-    ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get(), args.norm_w, z ? gated_out : args.out, args.eps_rms, z);
+    // Read all token inputs before the norm output can reuse their storage.
+    for (int64_t t = 0; t < args.n_tokens; ++t) {
+        const int64_t offset = t * args.S * args.H_v;
+        ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get() + offset, args.norm_w,
+            (z ? gated_out : args.out) + offset, args.eps_rms, z ? z + offset : nullptr);
+    }
 }

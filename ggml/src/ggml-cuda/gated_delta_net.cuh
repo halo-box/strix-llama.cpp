@@ -63,6 +63,10 @@ struct ggml_cuda_gdn_decode_args {
     float *       out;            // [S, H_v]
     float *       attn_out;       // [S, H_v] pre-norm scratch (set by the host)
     int64_t       S, H_k, H_v, d_conv;
+    int64_t       n_tokens = 1, K = 1;
+    int64_t       qkv_token_stride = 0;
+    int64_t       conv_slot_stride = 0;
+    int64_t       state_slot_stride = 0;
 };
 
 void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args);
