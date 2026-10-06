@@ -12724,6 +12724,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_prefill(true, 512, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(true, 513, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(false, 512, GGML_TYPE_Q5_1));
+    // GSQ qwen4exp mixes: the low-bit expert types on the routed MMB path
+    for (ggml_type type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
+        test_cases.emplace_back(new test_moe_prefill(true, 512, type));
+    }
+    test_cases.emplace_back(new test_moe_prefill(false, 512, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_mul_mat_pair());
 
     // gpt-oss issue with Vulkan mmq_id
@@ -13881,6 +13886,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     if (getenv("GGML_PERF_MOE")) {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
         test_cases.emplace_back(new test_moe_prefill(false, 4096));
+        // GGML_PERF_MOE=gsq: the expert types of the GSQ qwen4exp mixes
+        if (strcmp(getenv("GGML_PERF_MOE"), "gsq") == 0) {
+            for (ggml_type type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
+                test_cases.emplace_back(new test_moe_prefill(true, 4096, type));
+            }
+            test_cases.emplace_back(new test_moe_prefill(false, 4096, GGML_TYPE_Q2_0));
+        }
         return test_cases;
     }
 

@@ -137,10 +137,22 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     int brow[B_ITEMS];
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
+    // Q2_0 (routed down): a lane prefetches its 2 qs bytes and d in the WMMA loop, store_lds decodes its 8 weights
+    constexpr bool Q20 = WTYPE == 32 + GGML_TYPE_Q2_0;
+    constexpr int Q2R = Q20 ? (BM * 8) / MMB_NT : 1;
+    uint32_t q20[Q2R];
 
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
+        if constexpr (Q20) {
+#pragma unroll
+            for (int r = 0; r < Q2R; ++r) {
+                const int row = (tid >> 3) + r * (MMB_NT / 8);
+                const block_q2_0 * x = (const block_q2_0 *)(Wbase + (size_t)row * wrow_bytes) + ks;
+                q20[r] = row < a_rows ? *(const uint16_t *)(x->qs + 2 * (tid & 7)) | ((uint32_t)*(const uint16_t *)&x->d << 16) : 0u;
+            }
+        }
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) {
             const int row = tid + i * MMB_NT;
@@ -164,7 +176,17 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         }
     };
     auto store_lds = [&]() {
-        if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
+        if constexpr (Q20) {
+#pragma unroll
+            for (int r = 0; r < Q2R; ++r) {
+                const int row = (tid >> 3) + r * (MMB_NT / 8);
+                const float d = mmb_h2f((uint16_t)(q20[r] >> 16));
+                float v[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) v[j] = ((int) ((q20[r] >> (2 * j)) & 3) - 1) * d;
+                mmb_store8(As + row * MMB_LDS_STRIDE + 8 * (tid & 7), v);
+            }
+        } else if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
 #pragma unroll
         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
             if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
@@ -387,31 +409,25 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     int brow[B_ITEMS];
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
-    // IQ3_S: prefetch the per-lane block fields into registers during the WMMA loop (8 lanes per row, 8 weights per lane),
-    // grid table in LDS; decode in store_lds. Same fp32 arithmetic as dequantize_iq3_s -> bit-identical.
-    constexpr bool IQ3 = WTYPE == 32 + GGML_TYPE_IQ3_S;
-    constexpr int Q3R = IQ3 ? (BM * 8) / MMB_NT : 1;
-    uint32_t q3g[Q3R][2], q3u[Q3R][2];
-    __shared__ uint32_t q3grid[IQ3 ? 512 : 1];
-    if constexpr (IQ3) { for (int i = tid; i < 512; i += MMB_NT) q3grid[i] = iq3s_grid[i]; }
+    // grid-based types (mmb_lb): block fields prefetched in the WMMA loop, grid table in LDS, decoded in store_lds
+    using LBT = mmb_lb<WTYPE>;
+    constexpr bool LB = LBT::ok;
+    constexpr int LBR = LB ? (BM * 8) / MMB_NT : 1;
+    uint32_t lbg[LBR][2], lbu[LBR][2];
+    __shared__ typename LBT::grid_t lbgrid[LBT::N];
+    if constexpr (LB) { for (int i = tid; i < LBT::N; i += MMB_NT) lbgrid[i] = LBT::entry(i); }
     int weight_ks = 0;
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
-        if constexpr (IQ3) {
-            const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1, ib = ((ks * MMB_BK) % QK_K) / 32 + sub;
+        if constexpr (LB) {
+            const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1;
 #pragma unroll
-            for (int r = 0; r < Q3R; ++r) {
+            for (int r = 0; r < LBR; ++r) {
                 const int row = (tid >> 3) + r * (MMB_NT / 8);
                 if (row < a_rows) {
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        const block_iq3_s * x = (const block_iq3_s *)((h ? Wu : Wg) + (size_t)row * wrow_bytes) + (ks * MMB_BK) / QK_K;
-                        const uint32_t q2 = *(const uint16_t *)(x->qs + 8 * ib + 2 * il);
-                        const uint32_t w0 = q2 | ((uint32_t)x->qh[ib] << 16) | ((uint32_t)x->signs[4 * ib + il] << 24);
-                        const uint32_t w1 = (uint32_t)*(const uint16_t *)&x->d | ((uint32_t)((x->scales[ib / 2] >> 4 * (ib % 2)) & 0xf) << 16);
-                        if (h) { q3u[r][0] = w0; q3u[r][1] = w1; } else { q3g[r][0] = w0; q3g[r][1] = w1; }
-                    }
-                } else { q3g[r][0] = q3g[r][1] = q3u[r][0] = q3u[r][1] = 0u; } // d = 0 -> zero rows (never stored)
+                    LBT::fetch(Wg + (size_t)row * wrow_bytes, ks, sub, il, lbg[r][0], lbg[r][1]);
+                    LBT::fetch(Wu + (size_t)row * wrow_bytes, ks, sub, il, lbu[r][0], lbu[r][1]);
+                } else { lbg[r][0] = lbg[r][1] = lbu[r][0] = lbu[r][1] = 0u; } // d = 0 -> zero rows (never stored)
             }
         }
 #pragma unroll
@@ -444,31 +460,14 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
         }
     };
     auto store_lds = [&]() {
-        if constexpr (IQ3) {
+        if constexpr (LB) {
             const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1;
 #pragma unroll
-            for (int r = 0; r < Q3R; ++r) {
+            for (int r = 0; r < LBR; ++r) {
                 const int row = (tid >> 3) + r * (MMB_NT / 8);
-#pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    // branchless (padding rows decode to zero); d * grid is exact in fp32, rounded to bf16 (RNE) and packed
-                    // with one v_perm per pair; the signs are applied after packing as an XOR of the bf16 sign bits
-                    // (RNE is sign-symmetric: bf16(-v) == bf16(v) ^ 0x8000), bit-identical to dequantize_iq3_s
-                    const uint32_t w0 = h ? q3u[r][0] : q3g[r][0], w1 = h ? q3u[r][1] : q3g[r][1];
-                    const uint32_t qh = (w0 >> 16) & 0xff, sg = w0 >> 24;
-                    const uint32_t g1 = q3grid[(w0 & 0xff) | ((qh << (8 - 2 * il)) & 256)];
-                    const uint32_t g2 = q3grid[((w0 >> 8) & 0xff) | ((qh << (7 - 2 * il)) & 256)];
-                    const float d = __half2float(__ushort_as_half((unsigned short)(w1 & 0xffff))) * (1 + 2 * (int)(w1 >> 16));
-                    auto rb = [](const float x) { const uint32_t u = __float_as_uint(x); return u + 0x7fffu + ((u >> 16) & 1u); };
-                    auto pk = [&](const uint32_t g, const int j) {
-                        return __builtin_amdgcn_perm(rb(d * (float)((g >> (8 * j + 8)) & 0xff)), rb(d * (float)((g >> (8 * j)) & 0xff)), 0x07060302u); };
-                    uint4 o;
-                    o.x = pk(g1, 0) ^ ((sg &  1u) << 15 | (sg &   2u) << 30);
-                    o.y = pk(g1, 2) ^ ((sg &  4u) << 13 | (sg &   8u) << 28);
-                    o.z = pk(g2, 0) ^ ((sg & 16u) << 11 | (sg &  32u) << 26);
-                    o.w = pk(g2, 2) ^ ((sg & 64u) <<  9 | (sg & 128u) << 24);
-                    *(uint4 *)((h ? Au : Ag) + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = o;
-                }
+                // branchless (padding rows decode to zero)
+                *(uint4 *)(Ag + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = LBT::decode(lbgrid, lbg[r][0], lbg[r][1], il);
+                *(uint4 *)(Au + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = LBT::decode(lbgrid, lbu[r][0], lbu[r][1], il);
             }
         } else if constexpr (WTYPE != 0 && WTYPE != 32 + GGML_TYPE_Q4_K) {
             constexpr int LOAD_TYPE = WTYPE == 1 ? 32 + GGML_TYPE_Q8_0 : WTYPE;
@@ -503,7 +502,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
     for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (wn * WTN + j * 16) < n_cols;
     const int nks = K / MMB_BK;
-    load_regs(0); if constexpr (IQ3) __syncthreads(); store_lds(); __syncthreads();
+    load_regs(0); if constexpr (LB) __syncthreads(); store_lds(); __syncthreads();
     for (int ks = 0; ks < nks; ++ks) {
         if (ks + 1 < nks) load_regs(ks + 1);
 #pragma unroll
@@ -1068,7 +1067,7 @@ bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tens
 
 bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
-    if (!mmb_quant_type(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
+    if (!mmb_quant_type(src0->type, /*routed=*/true) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
     const int64_t K = src0->ne[0], M = src0->ne[1], E = src0->ne[2];
     if (src0->ne[3] != 1 || K % 64 != 0 || E < 1 || E > 1024) return false;
@@ -1331,7 +1330,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
     if (!mmb_enabled(ctx) || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
-    if (!mmb_quant_type(gw->type) || uw->type != gw->type) return false;
+    if (!mmb_quant_type(gw->type, /*routed=*/true) || uw->type != gw->type) return false;
     if (!ggml_are_same_shape(gw, uw) || gw->nb[1] != uw->nb[1] || gw->nb[2] != uw->nb[2]) return false;
     if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) return false;
     if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || !glu->src[0] || !glu->src[1]) return false;
