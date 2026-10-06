@@ -1,8 +1,11 @@
 import math
 import os
 import re
+import stat
 import struct
 import time
+
+import pytest
 
 from utils import *
 
@@ -113,6 +116,30 @@ def test_disk_cache_restores_across_server_restart(tmp_path):
     assert timings_restored["cache_n"] > timings_full["prompt_n"] * 0.8
     assert timings_restored["prompt_n"] < timings_full["prompt_n"] * 0.2
     assert cached_files.issubset({path.name for path in cache_files(tmp_path)})
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_disk_cache_files_are_owner_only(tmp_path):
+    cache_dir = tmp_path / "cache"
+    server = make_server()
+    server.cache_ram = 0
+    server.cache_dir = str(cache_dir)
+    server.cache_dir_max = 256
+    server.start()
+
+    completion(server, LONG_PROMPT, 0)
+    completion(server, "This prompt moves the first prompt into the disk cache.", 1)
+
+    assert stat.S_IMODE(cache_dir.stat().st_mode) == 0o700
+    assert cache_data_files(cache_dir)
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in cache_files(cache_dir))
+
+    # metadata left world-readable by an older build is tightened on restore
+    server.stop()
+    for path in cache_meta_files(cache_dir):
+        path.chmod(0o644)
+    server.start()
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in cache_meta_files(cache_dir))
 
 
 def test_disk_cache_removes_incomplete_and_invalid_entries(tmp_path):

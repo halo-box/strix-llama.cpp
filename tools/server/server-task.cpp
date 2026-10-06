@@ -2090,6 +2090,12 @@ bool server_prompt_cache_write_metadata(
         return false;
     }
 
+    // the metadata holds the prompt tokens: owner-only, like the state file, before anything is written
+    std::error_code ec_perm;
+    std::filesystem::permissions(temporary_path,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace, ec_perm);
+
     const uint32_t version = SERVER_PROMPT_CACHE_META_VERSION;
     const uint32_t flags = state.prompt.tokens.has_mtmd ? SERVER_PROMPT_CACHE_META_FLAG_MTMD : 0;
     const uint64_t key_size = cache_key.size();
@@ -2370,6 +2376,11 @@ server_prompt_cache::server_prompt_cache(
         }
 
         if (string_ends_with(filename, ".bin.meta")) {
+            // entries written by older builds were world-readable
+            std::error_code ec_perm;
+            std::filesystem::permissions(entry.path(),
+                    std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                    std::filesystem::perm_options::replace, ec_perm);
             metadata_paths.push_back(entry.path());
         } else if (string_ends_with(filename, ".bin.meta.tmp")) {
             std::filesystem::remove(entry.path(), ec);

@@ -1693,12 +1693,22 @@ private:
 
             if (cache_dir_enabled) {
                 std::error_code ec;
-                std::filesystem::create_directories(params_base.cache_dir_path, ec);
+                const bool cache_dir_created = std::filesystem::create_directories(params_base.cache_dir_path, ec);
                 const bool cache_dir_valid = !ec && std::filesystem::is_directory(params_base.cache_dir_path, ec);
                 if (ec || !cache_dir_valid) {
                     SRV_ERR("failed to create prompt cache directory %s: %s\n",
                             params_base.cache_dir_path.c_str(), ec ? ec.message().c_str() : "path is not a directory");
                     return false;
+                }
+                // cached entries hold prompts: a directory we create is owner-only, an existing one is left as is
+                if (cache_dir_created) {
+                    std::filesystem::permissions(params_base.cache_dir_path, std::filesystem::perms::owner_all,
+                            std::filesystem::perm_options::replace, ec);
+                } else {
+                    const auto perms = std::filesystem::status(params_base.cache_dir_path, ec).permissions();
+                    if (!ec && (perms & (std::filesystem::perms::group_all | std::filesystem::perms::others_all)) != std::filesystem::perms::none) {
+                        SRV_WRN("prompt cache directory %s is accessible to other users\n", params_base.cache_dir_path.c_str());
+                    }
                 }
                 SRV_TRC("prompt cache is enabled on disk: %s\n", params_base.cache_dir_path.c_str());
             } else {
