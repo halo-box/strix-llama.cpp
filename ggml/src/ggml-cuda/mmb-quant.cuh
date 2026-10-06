@@ -460,6 +460,11 @@ static bool mmb_quant_type_routed(ggml_type type) {
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
             return mmb_quant_type_any(type);
         default: return false;
     }
