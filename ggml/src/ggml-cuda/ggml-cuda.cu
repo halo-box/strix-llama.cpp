@@ -2000,6 +2000,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // On gfx1151 a small output-row count that is not a multiple of the WMMA rows-per-block cannot use mul_mat_f, and the matvec
+    // gate above caps AMD at 3 columns, so a wider batch falls through to rocBLAS, which splits K to fill the grid. Measured with
+    // a 4-token MTP verification batch: the qwen4exp [10240, 4] BF16 hyper-connection inject matrices cost 230 us per call through
+    // rocBLAS (0.35 GB/s) against ~5 us for the matvec kernel. Drop this once rocBLAS stops losing that much on small-M GEMM.
+    if (ne11 > 3 && ne11 <= 8 && GGML_CUDA_CC_IS_AMD(cc) && !ggml_is_quantized(src0->type) &&
+            src0->ne[1] <= 64 &&
+            src0->ne[1] % (GGML_CUDA_CC_IS_CDNA(cc) ? MMF_ROWS_PER_BLOCK_CDNA : MMF_ROWS_PER_BLOCK) != 0 &&
+            ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, 3)) {
+        ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
     if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
             && src0->type == GGML_TYPE_F32
