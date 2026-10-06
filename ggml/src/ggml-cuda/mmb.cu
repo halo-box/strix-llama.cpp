@@ -1316,6 +1316,8 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     uint16_t * Dh = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(ctx, dst)) ? (uint16_t *) dst->data : nullptr;
     const bool store_f32 = Dh == nullptr;
     static const int RT = getenv("MMB_ROUTED_TILE") ? atoi(getenv("MMB_ROUTED_TILE")) : 0;
+    // small tile mapped WAVES_M=8 x WAVES_N=1 (<128,32,16,32>), not 4 x 2 (<128,32,32,16>): a <=16-token tile (the
+    // common small-expert case) leaves 4 waves WMMA-idle under the old shape. Bit-identical: same (m,n), same K order.
     dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
     mmb_dispatch_quant(src0->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
@@ -1325,7 +1327,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
         mmb_routed_kernel<64, BN_SMALL, 16, 16, WT><<<gs, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
     } else {
     mmb_routed_kernel<128, BN, 32, 64, WT><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-    mmb_routed_kernel<128, BN_SMALL, 32, 16, WT><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
+    mmb_routed_kernel<128, BN_SMALL, 16, 32, WT><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
     }
     });
     CUDA_CHECK(cudaGetLastError());
