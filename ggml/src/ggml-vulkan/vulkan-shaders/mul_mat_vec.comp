@@ -74,8 +74,13 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             ibi += p.ncols;
 
 #if K_PER_ITER == 8
+#if defined(DATA_A_PTQ1_0)
+            vec4 v, v2;
+            ptq1_0_trits8(ib, a_offset, iqs, v, v2);
+#else
             vec4 v = dequantize4(ib, iqs, a_offset);
             vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
+#endif
 
             const vec2 dm = get_dm(ib, a_offset);
             if (dm.y != 0) { // quant has min component
@@ -138,6 +143,142 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
 }
 #endif
 
+#if defined(DATA_A_TQ2_T)
+// Eight lanes per 128-weight block, four trellis steps (16 weights) per lane. A lane
+// reads its four path bytes plus the one before (tail-biting wrap to qs[31]) with
+// three 16-bit loads, and each byte feeds both states that contain it. Every step
+// costs two hashes and two shared-memory codebook reads (each read = 2 weights).
+// Weights are decoded once per row and reused across all NUM_COLS columns.
+void accumulate_tq2_t(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
+                      uint first_row, uint num_rows, uint tid) {
+    const uint blocks = p.ncols / 128u;
+    const uint items = blocks * 8u;
+    for (uint item = tid; item < items; item += BLOCK_SIZE) {
+        const uint block = item >> 3u;
+        const uint lane = item & 7u;
+        [[unroll]] for (uint row = 0; row < num_rows; ++row) {
+            const uint ib = a_offset + (first_row + row)*blocks + block;
+            const uint w0 = uint(data_a_packed16[ib].qs[2u*lane]);
+            const uint w1 = uint(data_a_packed16[ib].qs[2u*lane + 1u]);
+            const uint wp = uint(data_a_packed16[ib].qs[(2u*lane + 15u) & 15u]);
+            const uint q0 = w0 & 255u;
+            const uint q1 = w0 >> 8u;
+            const uint q2 = w1 & 255u;
+            const uint q3 = w1 >> 8u;
+            const vec4 x0 = tq2_t_step(((wp >> 8u) << 8u) | q0);
+            const vec4 x1 = tq2_t_step((q0 << 8u) | q1);
+            const vec4 x2 = tq2_t_step((q1 << 8u) | q2);
+            const vec4 x3 = tq2_t_step((q2 << 8u) | q3);
+            const float d = float(data_a_packed16[ib].d);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint base = (j*p.batch_stride_b + b_offset + block*128u + lane*16u) / 4u;
+                const float sum = dot(vec4(data_b_v4[base     ]), x0)
+                                + dot(vec4(data_b_v4[base + 1u]), x1)
+                                + dot(vec4(data_b_v4[base + 2u]), x2)
+                                + dot(vec4(data_b_v4[base + 3u]), x3);
+                temp[j][row] += FLOAT_TYPE(sum * d);
+            }
+        }
+    }
+}
+#endif
+
+#if defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
+// Same structure as TQ2_T: eight lanes per 128-weight block, four trellis steps per
+// lane. Lane l owns steps t = 4l + i (i = 0..3), whose windows start at stream bits
+// off_i = (31 - 4l - i)*K (see tqk.glsl). They all lie in the 3K + 16 <= 37 bits from
+// off_3 = (28 - 4l)*K, i.e. in the four u16 words from wb = off_3 >> 4 (the span plus
+// off_3 & 15 is at most 52 bits); lane 0's last two words wrap to words 0, 1, which is
+// the tail-biting read of steps 0 and 1. Four 16-bit loads per lane per row, then
+// state i = tqk_state_words(.., rel_i) with rel_i = off_i - 16*wb = (off_3 & 15) + (3 - i)*K.
+void accumulate_tqk(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
+                    uint first_row, uint num_rows, uint tid) {
+    const uint blocks = p.ncols / 128u;
+    const uint items = blocks * 8u;
+    for (uint item = tid; item < items; item += BLOCK_SIZE) {
+        const uint block = item >> 3u;
+        const uint lane = item & 7u;
+        const uint off3 = tqk_off(4u*lane + 3u);
+        const uint wb = off3 >> 4u;
+        const uint r = off3 & 15u;
+        const uint wi1 = tqk_word_wrap(wb + 1u);
+        const uint wi2 = tqk_word_wrap(wb + 2u);
+        const uint wi3 = tqk_word_wrap(wb + 3u);
+        [[unroll]] for (uint row = 0; row < num_rows; ++row) {
+            const uint ib = a_offset + (first_row + row)*blocks + block;
+            const uint w0 = uint(data_a_packed16[ib].qs[wb]);
+            const uint w1 = uint(data_a_packed16[ib].qs[wi1]);
+            const uint w2 = uint(data_a_packed16[ib].qs[wi2]);
+            const uint w3 = uint(data_a_packed16[ib].qs[wi3]);
+            const uint lo  = w0 | (w1 << 16u);
+            const uint mid = w1 | (w2 << 16u);
+            const uint hi  = w2 | (w3 << 16u);
+            const vec4 x0 = tq2_t_step(tqk_state_words(lo, mid, hi, r + 3u*TQK_K)); // step 4l
+            const vec4 x1 = tq2_t_step(tqk_state_words(lo, mid, hi, r + 2u*TQK_K)); // step 4l+1
+            const vec4 x2 = tq2_t_step(tqk_state_words(lo, mid, hi, r +    TQK_K)); // step 4l+2
+            const vec4 x3 = tq2_t_step(tqk_state_words(lo, mid, hi, r));            // step 4l+3
+            const float d = float(data_a_packed16[ib].d);
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint base = (j*p.batch_stride_b + b_offset + block*128u + lane*16u) / 4u;
+                const float sum = dot(vec4(data_b_v4[base     ]), x0)
+                                + dot(vec4(data_b_v4[base + 1u]), x1)
+                                + dot(vec4(data_b_v4[base + 2u]), x2)
+                                + dot(vec4(data_b_v4[base + 3u]), x3);
+                temp[j][row] += FLOAT_TYPE(sum * d);
+            }
+        }
+    }
+}
+#endif
+
+#if defined(DATA_A_PTQ1_0)
+// Eight lanes own a whole block: six packed qs words, one qh tail, one
+// inactive lane. Each packed byte is loaded once and supplies all its trits.
+// Keep the common reduction and fusion path, including partial output tiles.
+void accumulate_ptq1_0(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS],
+                      uint first_row, uint num_rows, uint tid) {
+    const uint lane = tid & 7u;
+    const uint blocks = p.ncols / 128u;
+    if (lane == 7u) {
+        return;
+    }
+    for (uint block = tid / 8u; block < blocks; block += BLOCK_SIZE / 8u) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint base = j*p.batch_stride_b + b_offset + block*128u;
+            if (lane < 6u) {
+                const uint start = lane < 4u ? lane*4u : 80u + (lane-4u)*4u;
+                const uint step = lane < 4u ? 16u : 8u;
+                vec4 activation[5];
+                [[unroll]] for (uint t = 0; t < 5u; ++t) {
+                    activation[t] = vec4(data_b_v4[(base + start + t*step)/4u]);
+                }
+                [[unroll]] for (uint row = 0; row < num_rows; ++row) {
+                    const uint ib = a_offset + (first_row + row)*blocks + block;
+                    const uint packed = data_a_packed32[ib].qs[lane];
+                    uvec4 bytes = (uvec4(packed) >> uvec4(0u, 8u, 16u, 24u)) & 255u;
+                    float sum = 0.0f;
+                    [[unroll]] for (uint t = 0; t < 5u; ++t) {
+                        bytes *= 3u;
+                        sum += dot(activation[t], vec4(bytes >> 8u) - 1.0f);
+                        bytes &= 255u;
+                    }
+                    temp[j][row] += sum * get_dm(ib - a_offset, a_offset).x;
+                }
+            } else {
+                const vec4 b0 = vec4(data_b_v4[(base + 120u)/4u]);
+                const vec4 b1 = vec4(data_b_v4[(base + 124u)/4u]);
+                [[unroll]] for (uint row = 0; row < num_rows; ++row) {
+                    const uint ib = (first_row + row)*blocks + block;
+                    vec4 lo, hi;
+                    ptq1_0_trits8(ib, a_offset, 120u, lo, hi);
+                    temp[j][row] += (dot(b0, lo) + dot(b1, hi)) * get_dm(ib, a_offset).x;
+                }
+            }
+        }
+    }
+}
+#endif
+
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint tid = gl_LocalInvocationID.x;
 
@@ -157,6 +298,13 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
+#if defined(DATA_A_PTQ1_0)
+    accumulate_ptq1_0(temp, first_row, num_rows, tid);
+#elif defined(DATA_A_TQ2_T)
+    accumulate_tq2_t(temp, first_row, num_rows, tid);
+#elif defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
+    accumulate_tqk(temp, first_row, num_rows, tid);
+#else
     uint num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
     if (num_iters * K_PER_ITER * BLOCK_SIZE + K_PER_ITER*tid < p.ncols) {
         num_iters++;
@@ -242,6 +390,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 #endif
 
+#endif // DATA_A_PTQ1_0 / DATA_A_TQ2_T / DATA_A_TQK6 / DATA_A_TQK7
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 

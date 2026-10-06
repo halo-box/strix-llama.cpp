@@ -428,6 +428,72 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     const uint k_pair = row * LOAD_VEC_A / 2;
     store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
     store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+#elif defined(DATA_A_PTQ1_0)
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+    const uint ib  = idx / 16;
+    const uint grp = idx & 0xfu;      // which 8-element group inside the block
+    const uint e0  = grp * 8u;
+
+    const float d = float(data_a[ib].d);
+
+    const uint k_pair = row * LOAD_VEC_A / 2;
+    vec4 lo, hi;
+    ptq1_0_trits8(ib, 0u, e0, lo, hi);
+    lo *= d;
+    hi *= d;
+    store_a(col, k_pair,     FLOAT_TYPEV2(lo.xy));
+    store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
+    store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
+    store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
+#elif defined(DATA_A_TQ2_T)
+    // LOAD_VEC_A == 8: two trellis steps, which read three consecutive path bytes.
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+    const uint ib = idx / 16;
+    const uint t0 = (idx & 0xfu) * 2u;
+
+    const float d = float(data_a[ib].d);
+    const uint b0 = uint(data_a[ib].qs[(t0 + 31u) & 31u]);
+    const uint b1 = uint(data_a[ib].qs[t0]);
+    const uint b2 = uint(data_a[ib].qs[t0 + 1u]);
+    const vec4 lo = tq2_t_step((b0 << 8u) | b1) * d;
+    const vec4 hi = tq2_t_step((b1 << 8u) | b2) * d;
+
+    const uint k_pair = row * LOAD_VEC_A / 2;
+    store_a(col, k_pair,     FLOAT_TYPEV2(lo.xy));
+    store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
+    store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
+    store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
+#elif defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
+    // LOAD_VEC_A == 8: two trellis steps t0, t0 + 1, each state read from the three
+    // (circular) bytes covering its window (tqk.glsl, mirrors tqk_state).
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+    const uint ib = idx / 16;
+    const uint t0 = (idx & 0xfu) * 2u;
+
+    // Both windows lie in bits [off1, off1 + K + 16) with off1 = tqk_off(t0 + 1): at most 23 bits from
+    // word wb = off1 >> 4, so three (wrapped) u16 reads replace six byte reads (blocks are 2-byte aligned).
+    const float d = float(data_a_packed16[ib].d);
+    const uint off1 = tqk_off(t0 + 1u);
+    const uint wb = off1 >> 4u;
+    const uint w0 = uint(data_a_packed16[ib].qs[wb]);
+    const uint w1 = uint(data_a_packed16[ib].qs[tqk_word_wrap(wb + 1u)]);
+    const uint w2 = uint(data_a_packed16[ib].qs[tqk_word_wrap(wb + 2u)]);
+    const uint p01 = w0 | (w1 << 16u);
+    const uint p12 = w1 | (w2 << 16u);
+    const uint rel1 = off1 & 15u;
+    const uint s1 = tqk_state_words(p01, p12, 0u, rel1);           // step t0 + 1
+    const uint s0 = tqk_state_words(p01, p12, 0u, rel1 + TQK_K);   // step t0 (window K bits higher)
+    const vec4 lo = tq2_t_step(s0) * d;
+    const vec4 hi = tq2_t_step(s1) * d;
+
+    const uint k_pair = row * LOAD_VEC_A / 2;
+    store_a(col, k_pair,     FLOAT_TYPEV2(lo.xy));
+    store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
+    store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
+    store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
 #elif defined(DATA_A_NVFP4)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
     const uint eff_row = (row & 3) + (row & ~3) * 2;

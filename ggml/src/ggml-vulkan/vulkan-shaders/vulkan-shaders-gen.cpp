@@ -50,6 +50,10 @@ const std::vector<std::string> type_names = {
     "f32",
     "f16",
     "q1_0",
+    "ptq1_0",
+    "tq2_t",
+    "tqk6",
+    "tqk7",
     "q2_0",
     "q4_0",
     "q4_1",
@@ -255,13 +259,19 @@ bool is_rocmfp_quant(const std::string& type_name) {
     return string_starts_with(type_name, "rocmfp");
 }
 
+// Trellis/ternary types (agention): per-type mul_mm SPIR-V like the LUT types, no coopmat2
+bool is_trellis_quant(const std::string& type_name) {
+    return type_name == "ptq1_0" || type_name == "tq2_t" || type_name == "tqk6" || type_name == "tqk7";
+}
+
 // types compiled as their own matmul shader instead of the MmTypeA quant shader
 bool is_lut_quant(const std::string& type_name) {
-    return is_iq_quant(type_name) || type_name == "mxfp4" || type_name == "nvfp4" || is_rocmfp_quant(type_name);
+    return is_iq_quant(type_name) || type_name == "mxfp4" || type_name == "nvfp4" || is_rocmfp_quant(type_name) || is_trellis_quant(type_name);
 }
 
 std::string lut_load_vec_a(const std::string& type_name) {
-    if (type_name == "iq1_s" || type_name == "iq1_m" || type_name == "iq2_xxs" || type_name == "iq2_xs" || type_name == "iq2_s" || type_name == "iq4_xs") {
+    if (type_name == "iq1_s" || type_name == "iq1_m" || type_name == "iq2_xxs" || type_name == "iq2_xs" || type_name == "iq2_s" || type_name == "iq4_xs" ||
+        is_trellis_quant(type_name)) {
         return "8";
     }
     return "4";
@@ -443,7 +453,13 @@ std::map<std::string, std::string> merge_maps(const std::map<std::string, std::s
 }
 
 static std::deque<std::future<void>> compiles;
-void string_to_spv(std::string name, const std::string& source, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false, const std::string& suffix = "") {
+void string_to_spv(std::string name, const std::string& source, const std::map<std::string, std::string>& defines_in, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false, const std::string& suffix = "") {
+    // Experiment knob (build time): trellis shaders read the codebook straight from the
+    // constant array instead of copying it into shared memory per workgroup.
+    std::map<std::string, std::string> defines = defines_in;
+    if (getenv("GGML_VK_TQ_LUT_DIRECT") && (defines.count("DATA_A_TQ2_T") || defines.count("DATA_A_TQK6") || defines.count("DATA_A_TQK7"))) {
+        defines["TQ_LUT_DIRECT"] = "1";
+    }
     name = name + (f16acc ? "_f16acc" : "") + (coopmat ? "_cm1" : "") + (coopmat2 ? "_cm2" : (fp16 ? "" : "_fp32")) + suffix;
     std::string out_path = join_paths(output_dir, name + ".spv");
 
@@ -606,6 +622,13 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 
     for (const auto& tname : type_names) {
         if (tname == "bf16") {
+            continue;
+        }
+        // PTQ1_0 has no coopmat2 decoder: dequant_funcs_cm2.glsl carries no PTQ1_0 entry,
+        // so emitting mul_mm_cm2 for it fails shader compilation and takes the whole
+        // Vulkan build down, not just this type. Skip it; it falls back to the scalar and
+        // coopmat1 matmul paths, which are the ones implemented and tested.
+        if (coopmat2 && is_trellis_quant(tname)) {
             continue;
         }
 
