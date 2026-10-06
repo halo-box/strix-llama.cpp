@@ -1068,8 +1068,34 @@ bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tens
     return ggml_nrows(dst) == T;
 }
 
+// true when act is (or derives from) a gate/up view of one fused gate_up MUL_MAT_ID output (ne[0] == 2*n_ff). Split-
+// tensor models build gate and up as their own mul_mat_id, so they are not matched and keep the GLU fusion.
+static bool mmb_act_from_fused_gateup(const ggml_tensor * act, const int n_ff, const int depth = 0) {
+    if (!act || depth > 3) return false;
+    if (act->op == GGML_OP_VIEW) {
+        const ggml_tensor * s = act->view_src;
+        return s && s->op == GGML_OP_MUL_MAT_ID && s->ne[0] == 2 * n_ff;
+    }
+    if (act->op == GGML_OP_MUL_MAT_ID) return false;   // split path: gate / up are their own projections
+    for (int i = 0; i < 4; ++i) {
+        if (!act->src[i]) break;
+        if (mmb_act_from_fused_gateup(act->src[i], n_ff, depth + 1)) return true;
+    }
+    return false;
+}
+
 bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
+    // Fused gate_up is split into gate/up views, so the SwiGLU fusion never fires and MMB pays BF16 precision with no
+    // fused-kernel payoff. gemma-4-26B-A4B / gfx1151 / ROCm 10.0: KL vs master 0.19-0.31, top-1 90-93% (split-tensor
+    // models 0.002-0.065, 97-99%); pp4096 +0.9%. Keep on MMQ; Q8_0 / IQ4_NL already eligible, so exempt.
+    const char * nm = ggml_get_name(dst);
+    if (nm && strncmp(nm, "ffn_moe_gate_up", 15) == 0 &&
+            src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_IQ4_NL) return false;
+    // down projection of a fused gate_up model: its activation is the SwiGLU of two gate_up views, so the whole
+    // expert FFN stays on MMQ (same Q8_0 / IQ4_NL exemption).
+    if (mmb_act_from_fused_gateup(src1, (int) src0->ne[0]) &&
+            src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_IQ4_NL) return false;
     if (!mmb_quant_type_routed(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
     const int64_t K = src0->ne[0], M = src0->ne[1], E = src0->ne[2];
