@@ -30,6 +30,8 @@ pip install gguf[gui]
 
 [gguf/scripts/gguf_new_metadata.py](https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/scripts/gguf_new_metadata.py) — Copies a GGUF file with added/modified/removed metadata values.
 
+[gguf/scripts/gguf_extract_ple.py](https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/scripts/gguf_extract_ple.py) - Writes the per-layer embedding (PLE) tables of a model to their own GGUF, optionally in another type, for `--ple`.
+
 [gguf/scripts/gguf_editor_gui.py](https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/scripts/gguf_editor_gui.py) — Allows for viewing, editing, adding, or removing metadata values within a GGUF file as well as viewing its tensors with a Qt interface.
 
 ## Development

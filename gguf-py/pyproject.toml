@@ -23,6 +23,7 @@ gguf-convert-endian = "gguf.scripts.gguf_convert_endian:main"
 gguf-dump = "gguf.scripts.gguf_dump:main"
 gguf-set-metadata = "gguf.scripts.gguf_set_metadata:main"
 gguf-new-metadata = "gguf.scripts.gguf_new_metadata:main"
+gguf-extract-ple = "gguf.scripts.gguf_extract_ple:main"
 gguf-editor-gui = "gguf.scripts.gguf_editor_gui:main"
 
 [project.optional-dependencies]
