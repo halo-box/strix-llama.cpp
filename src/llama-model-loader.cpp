@@ -1199,6 +1199,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
         }
 
+        // the PLE file may only replace lookup tables (a tied output reaches here as LLM_TENSOR_OUTPUT)
+        if (ple_idx >= 0 && info.op != GGML_OP_GET_ROWS) {
+            const llama_tensor_weight * w = get_weight(tn.str().c_str());
+            if (w && w->idx == ple_idx) {
+                throw std::runtime_error(format("tensor '%s' of the PLE file is used by %s, only get_rows lookup tables can be replaced",
+                        tn.str().c_str(), ggml_op_name(info.op)));
+            }
+        }
+
         // skip unused tensors
         if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
             const size_t nbytes = ggml_nbytes(t_meta);
@@ -1420,7 +1429,8 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
     if (n_created < n_tensors) {
         if (!partial) {
-            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d%s", __func__, n_tensors, n_created,
+                    ple_n_added > 0 ? " (the PLE file has tensors that are not in the model file; this model may not use them)" : ""));
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
@@ -1430,6 +1440,121 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
             __func__, first_tensor_moved_name.c_str(), first_tensor_moved_type_name.c_str(), n_tensors_moved - 1,
             ggml_backend_buft_name(first_moved_from_buft), ggml_backend_buft_name(first_moved_to_buft));
     }
+}
+
+static size_t gguf_elem_size(enum gguf_type type) {
+    switch (type) {
+        case GGUF_TYPE_UINT8:   case GGUF_TYPE_INT8:  case GGUF_TYPE_BOOL:    return 1;
+        case GGUF_TYPE_UINT16:  case GGUF_TYPE_INT16:                         return 2;
+        case GGUF_TYPE_UINT32:  case GGUF_TYPE_INT32: case GGUF_TYPE_FLOAT32: return 4;
+        case GGUF_TYPE_UINT64:  case GGUF_TYPE_INT64: case GGUF_TYPE_FLOAT64: return 8;
+        default:                                                              return 0;
+    }
+}
+
+// same type and same values; nested arrays never match
+static bool gguf_kv_equal(const gguf_context * a, int64_t ia, const gguf_context * b, int64_t ib) {
+    const enum gguf_type type = gguf_get_kv_type(a, ia);
+    if (type != gguf_get_kv_type(b, ib)) {
+        return false;
+    }
+    if (type == GGUF_TYPE_STRING) {
+        return strcmp(gguf_get_val_str(a, ia), gguf_get_val_str(b, ib)) == 0;
+    }
+    if (type != GGUF_TYPE_ARRAY) {
+        return memcmp(gguf_get_val_data(a, ia), gguf_get_val_data(b, ib), gguf_elem_size(type)) == 0;
+    }
+    const enum gguf_type arr_type = gguf_get_arr_type(a, ia);
+    const size_t         n        = gguf_get_arr_n(a, ia);
+    if (arr_type != gguf_get_arr_type(b, ib) || n != gguf_get_arr_n(b, ib) || arr_type == GGUF_TYPE_ARRAY) {
+        return false;
+    }
+    if (arr_type == GGUF_TYPE_STRING) {
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(gguf_get_arr_str(a, ia, i), gguf_get_arr_str(b, ib, i)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return n == 0 || memcmp(gguf_get_arr_data(a, ia), gguf_get_arr_data(b, ib), n*gguf_elem_size(arr_type)) == 0;
+}
+
+void llama_model_loader::load_ple(const std::string & fname) {
+    if (files.empty()) {
+        throw std::runtime_error("a PLE file can only be used with a model loaded from a file");
+    }
+
+    struct ggml_context * ctx = NULL;
+    struct gguf_init_params params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ &ctx,
+    };
+    gguf_context_ptr ctx_gguf { gguf_init_from_file(fname.c_str(), params) };
+    if (!ctx_gguf) {
+        throw std::runtime_error(format("%s: failed to load PLE file %s", __func__, fname.c_str()));
+    }
+    if (gguf_get_n_tensors(ctx_gguf.get()) == 0) {
+        throw std::runtime_error(format("PLE file %s has no tensors", fname.c_str()));
+    }
+
+    // a table is only valid for the layout and hashing it was built with, so every key the PLE file carries must
+    // match the model; split.* is ignored so that a shard of another split model can be used as is
+    int n_checked = 0;
+    for (int64_t i = 0; i < gguf_get_n_kv(ctx_gguf.get()); i++) {
+        const std::string key = gguf_get_key(ctx_gguf.get(), i);
+        if (key.rfind("split.", 0) == 0 || (key.rfind("general.", 0) == 0 && key != "general.architecture")) {
+            continue;
+        }
+        const int64_t kid = gguf_find_key(metadata, key.c_str());
+        if (kid < 0) {
+            LLAMA_LOG_WARN("%s: key %s of the PLE file is not in the model, not checked\n", __func__, key.c_str());
+            continue;
+        }
+        if (!gguf_kv_equal(ctx_gguf.get(), i, metadata, kid)) {
+            throw std::runtime_error(format("PLE file %s does not match the model: %s differs", fname.c_str(), key.c_str()));
+        }
+        n_checked++;
+    }
+    if (n_checked == 0) {
+        LLAMA_LOG_WARN("%s: PLE file %s has no metadata to check against the model\n", __func__, fname.c_str());
+    }
+
+    const uint16_t idx = files.size();
+    ple_idx = idx;
+    files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+    fnames.push_back(fname);
+    contexts.emplace_back(ctx);
+
+    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+        const std::string name = ggml_get_name(cur);
+        llama_tensor_weight w(files.back().get(), idx, ctx_gguf.get(), cur);
+
+        const auto it = weights_map.find(name);
+        if (it != weights_map.end()) {
+            const ggml_tensor * old = it->second.tensor;
+            if (!ggml_are_same_shape(old, cur)) {
+                throw std::runtime_error(format("PLE file %s: tensor '%s' has wrong shape; expected %s, got %s", fname.c_str(),
+                        name.c_str(), llama_format_tensor_shape(old).c_str(), llama_format_tensor_shape(cur).c_str()));
+            }
+            LLAMA_LOG_INFO("%s: %s: %s from %s replaces %s from the model\n", __func__, name.c_str(),
+                    ggml_type_name(cur->type), fname.c_str(), ggml_type_name(old->type));
+
+            ple_replaced[it->second.idx].emplace_back(it->second.offs, it->second.offs + ggml_nbytes(old));
+            n_elements -= ggml_nelements(old);
+            n_bytes    -= ggml_nbytes(old);
+            weights_map.erase(it);
+        } else {
+            LLAMA_LOG_INFO("%s: %s: %s from %s (not in the model file)\n", __func__, name.c_str(),
+                    ggml_type_name(cur->type), fname.c_str());
+            ple_n_added++;
+        }
+        n_elements += ggml_nelements(cur);
+        n_bytes    += ggml_nbytes(cur);
+        weights_map.emplace(name, w);
+    }
+
+    n_tensors = weights_map.size();
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
@@ -1453,8 +1578,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
+            // tensors replaced by the PLE file are never read, so keep them out of the prefetch like lazy ones
+            llama_mmap::ranges no_prefetch = lazy.for_file(idx);
+            if (const auto it = ple_replaced.find(idx); it != ple_replaced.end()) {
+                no_prefetch.insert(no_prefetch.end(), it->second.begin(), it->second.end());
+            }
+
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    no_prefetch);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

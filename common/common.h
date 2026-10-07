@@ -326,6 +326,7 @@ struct common_params_model {
     std::string hf_repo     = ""; // HF repo
     std::string hf_file     = ""; // HF file
     std::string docker_repo = ""; // Docker repo
+    std::string ple         = ""; // GGUF with per-layer embedding tables used instead of the model's own
 
     std::string get_name() const {
         if (!hf_repo.empty()) {

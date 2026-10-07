@@ -319,6 +319,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
+        if (params.path_ple && params.path_ple[0] != '\0' && !params.vocab_only) {
+            ml.load_ple(params.path_ple);
+        }
+
         ml.lazy.mode = params.lazy_mode;
 
         ml.print_info();
