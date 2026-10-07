@@ -4299,6 +4299,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
     add_opt(common_arg(
+        {"--spec-draft-max-slots"}, "N",
+        string_format("draft only while at most N slots are generating; with more, the batch of all slots already "
+                      "keeps the GPU busy and verify rows cost more than they save (default: %d, 0 = no limit)",
+                      params.speculative.draft.max_slots),
+        [](common_params & params, int value) {
+            params.speculative.draft.max_slots = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_MAX_SLOTS"));
+    add_opt(common_arg(
         {"--spec-draft-mtp-vocab"}, "N",
         string_format("MTP: compute draft logits over token ids < N plus control tokens only; verification is unchanged "
                       "(0 = full vocabulary, default: %d)", params.speculative.draft.mtp_vocab),
