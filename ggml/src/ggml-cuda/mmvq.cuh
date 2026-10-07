@@ -36,6 +36,9 @@ struct ggml_cuda_mmv_group_seg {
 bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y);
 void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, int nseg);
 
+// RDNA3.5: consecutive same-type MUL_MATs on the same activations (1 to 8 columns) in one launch
+bool ggml_cuda_mmvq_segs(ggml_backend_cuda_context & ctx, ggml_tensor * const * dsts, int n, bool launch);
+
 // RDNA3.5 qwen4exp GDN output projection with the gated per-head norm in the prologue:
 //   y' = sigmoid(z) * (rms_norm_128(attn) * norm_w), then the fused-quantize matvec of dst->src[0] with y'
 bool ggml_cuda_mul_mat_vec_q_fq_gdn_gate_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const ggml_tensor * z);

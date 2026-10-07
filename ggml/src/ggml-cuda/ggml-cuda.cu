@@ -4858,6 +4858,51 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // RDNA3.5 decode: consecutive same-type MUL_MATs on the same activations in one launch (ggml_cuda_mmvq_segs)
+    // not with concurrent streams: the group's members can be mapped to different streams
+    static const bool mmvq_segs_disabled = getenv("GGML_CUDA_DISABLE_MMVQ_SEGS") != nullptr;
+    if (!mmvq_segs_disabled && cuda_ctx->stream_context().concurrent_events.empty() &&
+            node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr &&
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) && node->src[1]->ne[1] >= 1 && node->src[1]->ne[1] <= 8) {
+        ggml_tensor * dsts[4];
+        int out_nodes[4];
+        int n     = 0;
+        int j_end = i;
+        for (int j = i; j < cgraph->n_nodes && n < 4; ++j) {
+            ggml_tensor * t = cgraph->nodes[j];
+            if (j > i && ggml_cuda_is_view_or_noop(t)) {
+                continue;
+            }
+            if (t->op != GGML_OP_MUL_MAT || t->src[1] != node->src[1] || t->src[2] != nullptr ||
+                    !(t->flags & GGML_TENSOR_FLAG_COMPUTE) || t->src[0]->type != node->src[0]->type ||
+                    ggml_cuda_mmb_is_bf16_only(*cuda_ctx, t) || ggml_cuda_mmb_is_bf16_only(*cuda_ctx, t->src[1])) {
+                break;
+            }
+            // leave a matmul whose next op may fuse into it (GLU of a gate/up pair, bias ADD) to that fusion
+            int k = j + 1;
+            while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                k++;
+            }
+            if (k < cgraph->n_nodes && (cgraph->nodes[k]->op == GGML_OP_GLU || cgraph->nodes[k]->op == GGML_OP_ADD) &&
+                    (cgraph->nodes[k]->src[0] == t || cgraph->nodes[k]->src[1] == t)) {
+                break;
+            }
+            if (k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_MUL_MAT && k + 1 < cgraph->n_nodes &&
+                    cgraph->nodes[k + 1]->op == GGML_OP_GLU && (cgraph->nodes[k + 1]->src[0] == t || cgraph->nodes[k + 1]->src[1] == t)) {
+                break;
+            }
+            dsts[n]      = t;
+            out_nodes[n] = j;
+            n++;
+            j_end = j;
+        }
+        if (n >= 2 && ggml_cuda_mmvq_segs(*cuda_ctx, dsts, n, /*launch=*/false) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, j_end - i + 1, out_nodes, n)) {
+            ggml_cuda_mmvq_segs(*cuda_ctx, dsts, n, /*launch=*/true);
+            return j_end - i;
+        }
+    }
+
     // qwen4exp chunked Gated DeltaNet prefill: q/k L2 norms folded into the chunk kernels (ggml_cuda_gdn_qk_norm_match)
     if (node->op == GGML_OP_RMS_NORM && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
             getenv("GGML_CUDA_DISABLE_GDN_QKNORM") == nullptr) {
