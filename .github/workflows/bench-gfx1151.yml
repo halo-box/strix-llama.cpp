@@ -16,6 +16,12 @@
 # is no merge-base baseline, no corpus or logit comparison and no paired oracle.
 # Use it to get numbers for a branch, then do the paired run separately.
 #
+# A failing test-backend-ops case does not stop the benchmark: the perf and
+# llama-bench steps run whenever the build succeeded, so one marginal numerical
+# failure cannot hide the throughput data. The run still fails overall, so the
+# correctness signal is never lost - per AGENTS.md a speedup from a build that
+# fails correctness must not be retained, only measured and reported as such.
+#
 # Runner labels: `devlab-dispatch` is the opt-in gate that reaches the AMD Ryzen AI
 # Dev Lab ephemeral pool at all, and `strix-halo` narrows it to Strix Halo silicon
 # inside that pool. `strix-halo` on its own reaches nothing. Do not use
@@ -235,8 +241,9 @@ jobs:
             END { exit !(seen && ran) }
           ' "$log" || { echo "::error::$OPS_DEVICE never ran; the -b filter matched nothing" >&2; exit 1; }
 
-          total=$(grep -oE '[0-9]+/[0-9]+ tests passed' "$log" | tail -1 | cut -d/ -f2 | awk '{print $1}')
-          echo "tests passed: ${total:-none}"
+          summary=$(grep -oE '[0-9]+/[0-9]+ tests passed' "$log" | tail -1)
+          total=$(printf '%s\n' "$summary" | cut -d/ -f2 | awk '{print $1}')
+          echo "test-backend-ops summary: ${summary:-none}"
           if [ -z "$total" ] || [ "$total" -le 0 ]; then
             echo "::error::no test-backend-ops cases ran" >&2
             exit 1
@@ -245,7 +252,7 @@ jobs:
           exit "$rc"
 
       - name: test-backend-ops perf
-        if: ${{ !inputs.skip_ops }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && !inputs.skip_ops }}
         run: |
           set +e
           set -uo pipefail
@@ -271,7 +278,7 @@ jobs:
           exit "$rc"
 
       - name: llama-bench
-        if: ${{ !inputs.skip_bench }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && !inputs.skip_bench }}
         env:
           MODELS: ${{ inputs.models }}
           REPS: ${{ inputs.reps }}
