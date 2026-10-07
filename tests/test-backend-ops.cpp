@@ -13315,6 +13315,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 128, n, 640));
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 640, n, 256));
         }
+        // broadcast src1 (ne11 == 1, the gate/up layout) at mat-vec widths, and a row count that is not a
+        // multiple of the rows per workgroup (Vulkan TQK mat-vec-id: 16)
+        for (int n : {2, 3, 5, 8}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, true, 128, n, 640));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, false, 200, n, 384));
+        }
+        // broadcast src1 (ne11 == 1) at batched widths
         for (int n : {16, 63, 513}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 10, true, 128, n, 640));
         }

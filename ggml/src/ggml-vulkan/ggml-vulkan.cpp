@@ -3072,6 +3072,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // default stays rm_iq. GGML_VK_TQ_RM overrides (experiment knob).
     uint32_t rm_tq = rm_iq;
     if (const char * e = getenv("GGML_VK_TQ_RM")) { const int v = atoi(e); if (v >= 1 && v <= 32) rm_tq = (uint32_t) v; }
+    // TQK6/TQK7 expert mat-vec (MUL_MAT_ID): 16 rows per workgroup. Each row is an unrolled,
+    // independent load chain, so more rows give more loads in flight per thread, and the 8 KiB
+    // codebook copy is shared by 4x more rows. Microbench on gfx1151 (512 experts, 10 used):
+    // down (k=640) 40 -> 31 us at n=1, 150 -> 115 us at n=4; gate/up (k=2560) 22 us unchanged
+    // at n=1, 80 -> 68 us at n=4. The k=640 rows have 40 items for 64 threads, so a 4-row
+    // workgroup was mostly copy and latency. GGML_VK_TQK_ID_RM overrides.
+    uint32_t rm_tqk_id = 16;
+    if (const char * e = getenv("GGML_VK_TQK_ID_RM")) { const int v = atoi(e); if (v >= 1 && v <= 64) rm_tqk_id = (uint32_t) v; }
 #endif
 
     const bool use_subgroups = device->subgroup_arithmetic;
@@ -3229,8 +3237,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #ifdef GGML_USE_TRELLIS
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_PTQ1_0], "mul_mat_vec_id_ptq1_0_f32",       arr_dmmv_id_ptq1_0_f32_f32_len[reduc],    arr_dmmv_id_ptq1_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_TQ2_T], "mul_mat_vec_id_tq2_t_f32",       arr_dmmv_id_tq2_t_f32_f32_len[reduc],    arr_dmmv_id_tq2_t_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_tq, 1, 1}, {wg_size_subgroup, rm_tq}, 1, true, use_subgroups, force_subgroup_size);
-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_TQK6], "mul_mat_vec_id_tqk6_f32",       arr_dmmv_id_tqk6_f32_f32_len[reduc],    arr_dmmv_id_tqk6_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_tq, 1, 1}, {wg_size_subgroup, rm_tq}, 1, true, use_subgroups, force_subgroup_size);
-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_TQK7], "mul_mat_vec_id_tqk7_f32",       arr_dmmv_id_tqk7_f32_f32_len[reduc],    arr_dmmv_id_tqk7_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_tq, 1, 1}, {wg_size_subgroup, rm_tq}, 1, true, use_subgroups, force_subgroup_size);
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_TQK6], "mul_mat_vec_id_tqk6_f32",       arr_dmmv_id_tqk6_f32_f32_len[reduc],    arr_dmmv_id_tqk6_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_tqk_id, 1, 1}, {wg_size_subgroup, rm_tqk_id}, 1, true, use_subgroups, force_subgroup_size);
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_TQK7], "mul_mat_vec_id_tqk7_f32",       arr_dmmv_id_tqk7_f32_f32_len[reduc],    arr_dmmv_id_tqk7_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_tqk_id, 1, 1}, {wg_size_subgroup, rm_tqk_id}, 1, true, use_subgroups, force_subgroup_size);
 #endif
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q2_0], "mul_mat_vec_id_q2_0_f32",       arr_dmmv_id_q2_0_f32_f32_len[reduc],    arr_dmmv_id_q2_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[w][GGML_TYPE_Q4_0], "mul_mat_vec_id_q4_0_f32",       arr_dmmv_id_q4_0_f32_f32_len[reduc],    arr_dmmv_id_q4_0_f32_f32_data[reduc],    "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq}, 1, true, use_subgroups, force_subgroup_size);
