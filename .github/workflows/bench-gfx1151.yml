@@ -48,10 +48,15 @@
 # below run anonymously. That works for these public repos but is rate limited;
 # add the secret to get the authenticated path.
 #
-# NOT VERIFIED: this workflow has never been executed. The runner labels come from
-# AMD's own workflows that use the pool, the model repos and sizes from the public
-# Hugging Face API, and every CLI flag from this repository's source. No run has
-# been made, so no throughput number has been measured.
+# Execution history: first run 2026-10-07 (pwilkin/llama.cpp run 37682939495).
+# Checkout, the HIP build, GPU device detection, test-backend-ops and the artifact
+# upload all worked, and a DevLab runner was assigned with exactly the labels
+# self-hosted,Linux,devlab-dispatch,strix-halo. test-backend-ops reported
+# 31003/31004 with one marginal MUL_MAT_ID q4_1 failure (ERR 0.000530464 against
+# a 0.000500000 tolerance), which skipped perf and llama-bench on that run. No
+# throughput number has been measured yet. The runner labels were confirmed by
+# the AMD DevLab operator, and the model repos and byte sizes come from the
+# public Hugging Face API.
 
 name: Benchmark gfx1151 (on-demand)
 
