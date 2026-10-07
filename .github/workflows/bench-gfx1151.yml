@@ -1,0 +1,434 @@
+# On-demand gfx1151 correctness and benchmark lane for the AMD DevLab Dispatch
+# ephemeral runner pool. Dispatch it from the Actions tab with the branch, tag or
+# SHA to measure. It then:
+#
+#   1. checks out that ref
+#   2. builds llama-bench and test-backend-ops for gfx1151 (HIP by default)
+#   3. runs test-backend-ops in `test` mode, then in `perf` mode, on the GPU device
+#   4. downloads the fitting quant of each requested model from Hugging Face and
+#      runs llama-bench over the requested prompt / generation / depth / batch matrix
+#   5. uploads every log plus the raw jsonl as one artifact
+#
+# Dispatch-only on purpose: it holds a GPU for tens of minutes per model and the
+# DevLab pool queue is measured in hours, so it must never become a required check.
+#
+# This lane measures ONE build. It is not the Correctness Flow in AGENTS.md: there
+# is no merge-base baseline, no corpus or logit comparison and no paired oracle.
+# Use it to get numbers for a branch, then do the paired run separately.
+#
+# Runner labels: `devlab-dispatch` is the opt-in gate that reaches the AMD Ryzen AI
+# Dev Lab ephemeral pool at all, and `strix-halo` narrows it to Strix Halo silicon
+# inside that pool. `strix-halo` on its own reaches nothing. Do not use
+# `runs-on: group:` - the pool matches on labels only and does not join runner
+# groups. A wrong label does not fail, it queues silently, so keep both.
+#
+# Model assets, public Hugging Face, byte sizes read from the HF API on 2026-10-07:
+#
+#   flash-next      ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF  IQ3_XXS    2 shards  75839998528
+#                   smaller fallbacks in the same repo: IQ2_XS 68026093024, Q2_0 66423878624
+#   qwen38-27b      unsloth/Qwen3.8-27B-GGUF                    UD-Q4_K_XL 1 file    17559178144
+#   ornith-35b-a3b  ornith-ai/Ornith-1.5-35B-A3B-GGUF           Q4_K_M     1 file    21713463040
+#
+# The defaults are about 115 GB of download. Each model is deleted before the next
+# one is fetched, but the largest single model plus its KV cache must fit in RAM:
+# n_ctx here is 2048 + 256 + 30000 = 32304 tokens. The pre-flight check below is a
+# coarse filter on the file size plus a tunable margin, not a real KV budget - a
+# model that slips through fails loudly at context creation instead.
+#
+# Naming: the request said "Ornith 1.5 30B-A3B". The published model is
+# Ornith-1.5-35B-A3B (41 blocks, 256 experts, 8 used, arch qwen35moe).
+#
+# NOT VERIFIED: this workflow has never been executed. The runner labels come from
+# AMD's own workflows that use the pool, the model repos and sizes from the public
+# Hugging Face API, and every CLI flag from this repository's source. No run has
+# been made, so no throughput number has been measured.
+
+name: Benchmark gfx1151 (on-demand)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to build and benchmark'
+        required: false
+        default: 'master'
+      backend:
+        description: 'GPU backend to build and test'
+        required: true
+        default: 'hip'
+        type: choice
+        options: [hip, vulkan]
+      models:
+        description: 'Comma-separated subset of flash-next,qwen38-27b,ornith-35b-a3b'
+        required: false
+        default: 'flash-next,qwen38-27b,ornith-35b-a3b'
+      reps:
+        description: 'llama-bench repetitions per test (-r)'
+        required: false
+        default: '5'
+      mem_margin_gib:
+        description: 'GiB held back for KV cache and compute buffers when deciding if a model fits'
+        required: false
+        default: '16'
+      skip_ops:
+        description: 'Skip test-backend-ops'
+        required: false
+        default: false
+        type: boolean
+      skip_bench:
+        description: 'Skip llama-bench'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# No cancel-in-progress: the pool queues silently for hours and cancelling kills
+# runs that were never assigned a host. Serialise on the requested ref instead.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
+  GGML_NLOOP: 3
+  GGML_N_THREADS: 1
+  LLAMA_ARG_LOG_COLORS: 0
+  LLAMA_ARG_LOG_PREFIX: 1
+  LLAMA_ARG_LOG_TIMESTAMPS: 1
+
+jobs:
+  bench:
+    name: ${{ inputs.backend }} / ${{ inputs.ref }}
+    runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
+    timeout-minutes: 720
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Report environment
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_BACKEND: ${{ inputs.backend }}
+          INPUT_MODELS: ${{ inputs.models }}
+          INPUT_REPS: ${{ inputs.reps }}
+        run: |
+          # diagnostics only, so never fail the job on a missing probe
+          set +e
+          mkdir -p "$RUNNER_TEMP/logs"
+          {
+            git log --oneline -1
+            uname -a
+            nproc
+            free -g
+            df -h "$RUNNER_TEMP" .
+            rocminfo | grep -E '^  Name|Marketing Name' | head -6
+            rocm-smi --showproductname | head -8
+            cmake --version | head -1
+            hipconfig --version
+            ccache --version | head -1
+          } 2>&1 | tee "$RUNNER_TEMP/logs/environment.log"
+
+          {
+            echo "### Benchmark gfx1151 (on-demand)"
+            echo
+            echo "- ref: \`$INPUT_REF\`"
+            echo "- commit: \`$(git rev-parse HEAD)\`"
+            echo "- backend: \`$INPUT_BACKEND\`"
+            echo "- models: \`$INPUT_MODELS\`"
+            echo "- repetitions: \`$INPUT_REPS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build
+        id: build
+        env:
+          INPUT_BACKEND: ${{ inputs.backend }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/logs"
+
+          backend="$INPUT_BACKEND"
+          case "$backend" in
+            hip)
+              # same shape as .github/workflows/hip-quality-check.yml, which is
+              # this repository's own gfx1151 recipe
+              cmake_extra=(
+                -DGGML_HIP=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF
+                -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang"
+                -DGPU_TARGETS=gfx1151
+                -DGGML_HIP_EXPORT_METRICS=Off
+              )
+              ;;
+            vulkan)
+              cmake_extra=(-DGGML_VULKAN=ON -DGGML_HIP=OFF -DGGML_CUDA=OFF)
+              ;;
+            *)
+              echo "::error::unknown backend '$backend'" >&2
+              exit 2
+              ;;
+          esac
+
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            "${cmake_extra[@]}" \
+            -DLLAMA_BUILD_COMMON=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            2>&1 | tee "$RUNNER_TEMP/logs/build-cmake.log"
+
+          cmake --build build --config Release -j "$(nproc)" \
+            --target llama-bench test-backend-ops \
+            2>&1 | tee "$RUNNER_TEMP/logs/build-make.log"
+
+      - name: Detect GPU device
+        id: device
+        run: |
+          # the runner starts bash with -e; drop it so the failure path below runs
+          set +e
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/logs"
+          ./build/bin/llama-bench --list-devices > "$RUNNER_TEMP/devices.txt"
+          rc=$?
+          cp "$RUNNER_TEMP/devices.txt" "$RUNNER_TEMP/logs/devices.txt"
+          cat "$RUNNER_TEMP/logs/devices.txt"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::llama-bench --list-devices failed (exit $rc)" >&2
+            exit "$rc"
+          fi
+          dev=$(grep -oE '^  (ROCm|Vulkan)[0-9]+:' "$RUNNER_TEMP/devices.txt" | head -1 | tr -d ' :') || dev=""
+          if [ -z "$dev" ]; then
+            echo "::error::no GPU device registered; the requested backend did not build in" >&2
+            exit 1
+          fi
+          echo "OPS_DEVICE=$dev" >> "$GITHUB_ENV"
+          echo "device: $dev"
+
+      - name: test-backend-ops test
+        if: ${{ !inputs.skip_ops }}
+        run: |
+          # the runner starts bash with -e; drop it so the guards below always run
+          set +e
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/logs"
+          log="$RUNNER_TEMP/logs/ops-test.log"
+          ./build/bin/test-backend-ops test -b "$OPS_DEVICE" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+
+          # `-b` with a name that matches no device exits 0 and still prints
+          # "N/N backends passed", so prove the device really ran.
+          awk -v dev="$OPS_DEVICE" '
+            $0 ~ "^Backend [0-9]+/[0-9]+: " dev "$" {
+              seen = 1
+              if ((getline nxt) > 0 && nxt !~ /^  Skipping/) ran = 1
+            }
+            END { exit !(seen && ran) }
+          ' "$log" || { echo "::error::$OPS_DEVICE never ran; the -b filter matched nothing" >&2; exit 1; }
+
+          total=$(grep -oE '[0-9]+/[0-9]+ tests passed' "$log" | tail -1 | cut -d/ -f2 | awk '{print $1}')
+          echo "tests passed: ${total:-none}"
+          if [ -z "$total" ] || [ "$total" -le 0 ]; then
+            echo "::error::no test-backend-ops cases ran" >&2
+            exit 1
+          fi
+
+          exit "$rc"
+
+      - name: test-backend-ops perf
+        if: ${{ !inputs.skip_ops }}
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/logs"
+          log="$RUNNER_TEMP/logs/ops-perf.log"
+          ./build/bin/test-backend-ops perf -b "$OPS_DEVICE" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+
+          awk -v dev="$OPS_DEVICE" '
+            $0 ~ "^Backend [0-9]+/[0-9]+: " dev "$" {
+              seen = 1
+              if ((getline nxt) > 0 && nxt !~ /^  Skipping/) ran = 1
+            }
+            END { exit !(seen && ran) }
+          ' "$log" || { echo "::error::$OPS_DEVICE never ran; the -b filter matched nothing" >&2; exit 1; }
+
+          # perf mode returns 0 even when nothing was measured
+          if ! grep -q 'us/run' "$log"; then
+            echo "::error::no perf rows were produced" >&2
+            exit 1
+          fi
+
+          exit "$rc"
+
+      - name: llama-bench
+        if: ${{ !inputs.skip_bench }}
+        env:
+          MODELS: ${{ inputs.models }}
+          REPS: ${{ inputs.reps }}
+          MARGIN_GIB: ${{ inputs.mem_margin_gib }}
+        run: |
+          set +e
+          set -uo pipefail
+
+          models="$MODELS"
+          reps="$REPS"
+          margin_gib="$MARGIN_GIB"
+
+          case "$reps" in
+            '' | *[!0-9]*)
+              echo "::error::reps must be a positive integer, got '$reps'" >&2
+              exit 2
+              ;;
+          esac
+          if [ "${#reps}" -gt 6 ] || [ "$(( 10#$reps ))" -le 0 ]; then
+            echo "::error::reps must be between 1 and 999999, got '$reps'" >&2
+            exit 2
+          fi
+          reps=$(( 10#$reps ))
+
+          case "$margin_gib" in
+            '' | *[!0-9]*)
+              echo "::error::mem_margin_gib must be a nonnegative integer, got '$margin_gib'" >&2
+              exit 2
+              ;;
+          esac
+          if [ "${#margin_gib}" -gt 5 ] || [ "$(( 10#$margin_gib ))" -gt 4096 ]; then
+            echo "::error::mem_margin_gib must be between 0 and 4096, got '$margin_gib'" >&2
+            exit 2
+          fi
+          margin_gib=$(( 10#$margin_gib ))
+
+          model_root="$RUNNER_TEMP/models"
+          logdir="$RUNNER_TEMP/logs"
+          mkdir -p "$model_root" "$logdir"
+
+          margin_bytes=$(( margin_gib * 1024 * 1024 * 1024 ))
+          avail_bytes=$(awk '/^MemAvailable:/ {print $2 * 1024; exit}' /proc/meminfo)
+
+          # repo|space separated files|expected total bytes
+          model_spec() {
+            case "$1" in
+              flash-next)
+                echo 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF|IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf|75839998528'
+                ;;
+              qwen38-27b)
+                echo 'unsloth/Qwen3.8-27B-GGUF|Qwen3.8-27B-UD-Q4_K_XL.gguf|17559178144'
+                ;;
+              ornith-35b-a3b)
+                echo 'ornith-ai/Ornith-1.5-35B-A3B-GGUF|Ornith-1.5-35B-Q4_K_M.gguf|21713463040'
+                ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # reject a bad name before anything is downloaded
+          IFS=',' read -ra want <<< "$models"
+          for name in "${want[@]}"; do
+            name=$(printf '%s' "$name" | tr -d '[:space:]')
+            [ -n "$name" ] || continue
+            if ! model_spec "$name" > /dev/null; then
+              echo "::error::unknown model '$name'; choose from flash-next,qwen38-27b,ornith-35b-a3b" >&2
+              exit 1
+            fi
+          done
+
+          ran=0
+          for name in "${want[@]}"; do
+            name=$(printf '%s' "$name" | tr -d '[:space:]')
+            [ -n "$name" ] || continue
+
+            spec=$(model_spec "$name")
+            repo=${spec%%|*}
+            rest=${spec#*|}
+            files=${rest%%|*}
+            bytes=${rest##*|}
+
+            need=$(( bytes + margin_bytes ))
+            if [ "$avail_bytes" -gt 0 ] && [ "$need" -gt "$avail_bytes" ]; then
+              echo "::warning::SKIP $name: needs $(( need / 1073741824 )) GiB, $(( avail_bytes / 1073741824 )) GiB available"
+              continue
+            fi
+
+            dest="$model_root/$name"
+            mkdir -p "$dest"
+            free_bytes=$(df -B1 --output=avail "$dest" | tail -1)
+            if [ "$free_bytes" -lt $(( bytes + bytes / 5 )) ]; then
+              echo "::warning::SKIP $name: needs $(( (bytes + bytes / 5) / 1073741824 )) GiB of disk, $(( free_bytes / 1073741824 )) GiB free"
+              continue
+            fi
+
+            for f in $files; do
+              out="$dest/$(basename "$f")"
+              if [ -s "$out" ]; then
+                echo "already present: $out"
+                continue
+              fi
+              url="https://huggingface.co/$repo/resolve/main/$f"
+              echo "fetching $url"
+              if [ -n "${HF_TOKEN:-}" ]; then
+                curl -fL --retry 5 --retry-delay 5 --retry-all-errors -C - \
+                  -H "Authorization: Bearer $HF_TOKEN" -o "$out" "$url" \
+                  || { echo "::error::download failed: $url" >&2; exit 1; }
+              else
+                curl -fL --retry 5 --retry-delay 5 --retry-all-errors -C - \
+                  -o "$out" "$url" \
+                  || { echo "::error::download failed: $url" >&2; exit 1; }
+              fi
+            done
+
+            # llama.cpp resolves the sibling shards from the first shard path
+            model="$dest/$(basename "${files%% *}")"
+            log="$logdir/$name.log"
+            jsonl="$logdir/$name.jsonl"
+            echo "=== llama-bench $name: $model ==="
+
+            # n_ctx is n_prompt + n_gen + n_depth = 2048 + 256 + 30000.
+            # -fa on and -ctk/-ctv f16 are spelled out so the numbers do not move
+            # with the auto defaults. HIP_LAUNCH_BLOCKING is deliberately NOT set:
+            # the gpu-rocm job sets it to work around an async-execution
+            # correctness issue, but it serialises every kernel launch and would
+            # invalidate every throughput number measured here.
+            timeout 7200 ./build/bin/llama-bench \
+              -m "$model" \
+              -p 2048 -n 256 \
+              -b 2048,4096,8192 -ub 2048,4096,8192 \
+              -d 0,30000 \
+              -lzm on-direct \
+              -ngl 99 -fa on -ctk f16 -ctv f16 \
+              -r "$reps" -o jsonl --progress \
+              > "$jsonl" 2> "$log"
+            rc=$?
+            cat "$log"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::llama-bench failed for $name (exit $rc)" >&2
+              exit "$rc"
+            fi
+            if [ ! -s "$jsonl" ]; then
+              echo "::error::llama-bench produced no jsonl rows for $name" >&2
+              exit 1
+            fi
+            echo "jsonl rows: $(wc -l < "$jsonl")"
+            ran=$(( ran + 1 ))
+
+            rm -rf "$dest"
+          done
+
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::no model was benchmarked" >&2
+            exit 1
+          fi
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-gfx1151-${{ github.run_id }}
+          path: ${{ runner.temp }}/logs
+          retention-days: 30
+          if-no-files-found: warn
