@@ -13299,7 +13299,8 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
             const size_t x_sz = dbl_buf_size * 2;
 
             if (ctx->prealloc_size_x < x_sz) {
-                ctx->prealloc_size_x = x_sz;
+                // over KV cells (QSA block selection) this grows with the context: round up like the other scratches
+                ctx->prealloc_size_x = ggml_vk_scratch_size(ctx, x_sz);
                 ggml_vk_preallocate_buffers(ctx, subctx);
             }
         }
