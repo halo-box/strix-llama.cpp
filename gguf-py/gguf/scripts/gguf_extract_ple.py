@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import BinaryIO
 
 import numpy as np
 from tqdm import tqdm
@@ -44,30 +45,21 @@ def model_files(path: Path) -> list[Path]:
     return [path.with_name(f"{m.group(1)}-{i:05d}-of-{n:05d}.gguf") for i in range(1, n + 1)]
 
 
-class RowStream:
-    # duck-types the ndarray that GGUFWriter.write_tensor_data() writes, so a large tensor is written in chunks
-    def __init__(self, rows: np.ndarray, src_type: gguf.GGMLQuantizationType, out_type: gguf.GGMLQuantizationType, out_row_bytes: int, chunk_rows: int):
-        self.rows          = rows
-        self.src_type      = src_type
-        self.out_type      = out_type
-        self.out_row_bytes = out_row_bytes
-        self.chunk_rows    = chunk_rows
-        self.nbytes        = rows.shape[0] * out_row_bytes
-
-    def tofile(self, fout) -> None:
-        bar = tqdm(desc="Writing", total=self.nbytes, unit="byte", unit_scale=True)
-        n_rows = self.rows.shape[0]
-        for r0 in range(0, n_rows, self.chunk_rows):
-            n = min(self.chunk_rows, n_rows - r0)
-            chunk = np.asarray(self.rows[r0:r0 + n])
-            if self.out_type != self.src_type:
-                f32 = gguf.quants.dequantize(chunk, self.src_type).astype(np.float32, copy=False)
-                chunk = gguf.quants.quantize(f32, self.out_type)
-            chunk = np.ascontiguousarray(chunk).view(np.uint8)
-            assert chunk.nbytes == n * self.out_row_bytes
-            chunk.tofile(fout)
-            bar.update(chunk.nbytes)
-        bar.close()
+def write_rows(fout: BinaryIO, rows: np.ndarray, src_type: gguf.GGMLQuantizationType, out_type: gguf.GGMLQuantizationType, out_row_bytes: int, chunk_rows: int) -> None:
+    # converted and written a chunk at a time, so a table larger than RAM is never resident
+    n_rows = rows.shape[0]
+    bar = tqdm(desc="Writing", total=n_rows * out_row_bytes, unit="byte", unit_scale=True)
+    for r0 in range(0, n_rows, chunk_rows):
+        n = min(chunk_rows, n_rows - r0)
+        chunk = np.asarray(rows[r0:r0 + n])
+        if out_type != src_type:
+            f32 = gguf.quants.dequantize(chunk, src_type).astype(np.float32, copy=False)
+            chunk = gguf.quants.quantize(f32, out_type)
+        chunk = np.ascontiguousarray(chunk).view(np.uint8)
+        assert chunk.nbytes == n * out_row_bytes
+        chunk.tofile(fout)
+        bar.update(chunk.nbytes)
+    bar.close()
 
 
 def main() -> None:
@@ -126,7 +118,7 @@ def main() -> None:
     if not keys:
         logger.warning(f"no {arch}.ple.* keys found, llama.cpp cannot check the tables against the model")
 
-    streams = []
+    jobs: list[tuple[np.ndarray, gguf.GGMLQuantizationType, gguf.GGMLQuantizationType, int]] = []
     for name in names:
         t = found[name]
         src_type = t.tensor_type
@@ -146,15 +138,22 @@ def main() -> None:
 
         byte_shape = (*reversed(ne[1:]), out_row_bytes)
         writer.add_tensor_info(name, byte_shape, np.dtype(np.uint8), n_rows * out_row_bytes, raw_dtype=out_type)
-        streams.append(RowStream(rows, src_type, out_type, out_row_bytes, args.chunk_rows))
+        jobs.append((rows, src_type, out_type, out_row_bytes))
         logger.info(f"tensor {name}: {src_type.name} -> {out_type.name}, shape {ne}, {n_rows * out_row_bytes / 1e9:.2f} GB")
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_ti_data_to_file()
-    for s in streams:
-        writer.write_tensor_data(s)  # ty: ignore[invalid-argument-type]
     writer.close()
+
+    # the data section follows the tensor infos; each tensor starts on an alignment boundary, as their offsets assume
+    align = writer.data_alignment
+    with open(args.output, "r+b") as fout:
+        fout.seek(0, os.SEEK_END)
+        for rows, src_type, out_type, out_row_bytes in jobs:
+            fout.write(bytes(-fout.tell() % align))
+            write_rows(fout, rows, src_type, out_type, out_row_bytes, args.chunk_rows)
+        fout.write(bytes(-fout.tell() % align))
 
     logger.info(f"wrote {args.output}")
 
