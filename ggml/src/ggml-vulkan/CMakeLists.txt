@@ -148,6 +148,14 @@ if (Vulkan_FOUND)
         list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_SHADER_DEBUG_INFO=ON)
     endif()
 
+    # vulkan-shaders-gen is an external project: forward the flag (both ways, its cache persists) so the
+    # trellis SPIR-V is generated only when ON
+    if (GGML_TRELLIS)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_TRELLIS=ON)
+    else()
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_TRELLIS=OFF)
+    endif()
+
     if (GGML_VULKAN_VALIDATE)
         add_compile_definitions(GGML_VULKAN_VALIDATE)
     endif()

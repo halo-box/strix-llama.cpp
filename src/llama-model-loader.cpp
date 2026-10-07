@@ -428,9 +428,11 @@ namespace GGUFMeta {
         return get_arr(llm_kv(kid), result, required);
     }
 
+#ifdef GGML_USE_TRELLIS
     // string-key overloads, used by the prism.hadamard.* metadata
     template bool llama_model_loader::get_arr<std::string>(const std::string & key, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<int32_t>(const std::string & key, std::vector<int32_t> & result, bool required);
+#endif
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
@@ -461,7 +463,9 @@ namespace GGUFMeta {
     }
 
     template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
+#ifdef GGML_USE_TRELLIS
     template bool llama_model_loader::get_key<bool>       (const std::string & key, bool & result, bool required);
+#endif
     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
@@ -778,6 +782,7 @@ llama_model_loader::llama_model_loader(
             }
         }
 
+#ifdef GGML_USE_TRELLIS
         // Trellis types decode with TQ_STATE_BITS-bit states; a file encoded with any other
         // width would load and silently produce garbage, so require the declared width.
         if (n_type[GGML_TYPE_TQ2_T] + n_type[GGML_TYPE_TQK6] + n_type[GGML_TYPE_TQK7] > 0) {
@@ -790,6 +795,23 @@ llama_model_loader::llama_model_loader(
                     bits, kid >= 0 ? "agention.trellis.state_bits" : "no agention.trellis.state_bits key: older format"));
             }
         }
+#else
+        // built with GGML_TRELLIS=OFF: no backend has kernels for these types, so fail before anything is allocated
+        {
+            std::string trellis_types;
+            for (const auto & [type, name] : { std::make_pair(GGML_TYPE_TQ2_T, "TQ2_T"), std::make_pair(GGML_TYPE_TQK6, "TQK6"),
+                                               std::make_pair(GGML_TYPE_TQK7, "TQK7"), std::make_pair(GGML_TYPE_PTQ1_0, "PTQ1_0") }) {
+                if (n_type[type] > 0) {
+                    trellis_types += (trellis_types.empty() ? "" : "/") + std::string(name);
+                }
+            }
+            if (!trellis_types.empty()) {
+                throw std::runtime_error(format(
+                    "this model uses trellis weight types (%s); this build has no kernels for them, rebuild with -DGGML_TRELLIS=ON",
+                    trellis_types.c_str()));
+            }
+        }
+#endif // GGML_USE_TRELLIS
 
         switch (type_max) {
             case GGML_TYPE_F32:     ftype = LLAMA_FTYPE_ALL_F32;        break;

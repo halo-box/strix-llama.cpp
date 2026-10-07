@@ -1312,6 +1312,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         gguf_kv.emplace(name, value);
     }
 
+#ifdef GGML_USE_TRELLIS
     uint32_t hadamard_version = 0;
     if (ml.get_key("prism.hadamard.version", hadamard_version, false)) {
         if (hadamard_version != 1) {
@@ -1455,6 +1456,12 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             }
         }
     }
+#else
+    // built with GGML_TRELLIS=OFF: the folded weights would load and silently compute without their rotation
+    if (gguf_find_key(ml.metadata, "prism.hadamard.version") >= 0) {
+        throw std::runtime_error("this model uses prism.hadamard activation rotation; rebuild with -DGGML_TRELLIS=ON");
+    }
+#endif // GGML_USE_TRELLIS
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
@@ -2098,6 +2105,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+#ifdef GGML_USE_TRELLIS
     if (!hadamard_weight_blocks.empty() || !hadamard_inverse_blocks.empty()) {
         struct hadamard_rotation {
             uint32_t block_size;
@@ -2254,6 +2262,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 __func__, hadamard_rotations.size() + hadamard_inverses.size(), hadamard_inverses.size(),
                 rotations.size(), sign_tensors.size());
     }
+#endif // GGML_USE_TRELLIS
 
     return true;
 }

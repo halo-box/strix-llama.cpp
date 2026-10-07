@@ -30,6 +30,7 @@ void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q2_0_ref(x, y, k);
 }
 
+#ifdef GGML_USE_TRELLIS
 void quantize_row_ptq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_ptq1_0_ref(x, y, k);
 }
@@ -45,6 +46,7 @@ void quantize_row_tqk6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 void quantize_row_tqk7(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_tqk7_ref(x, y, k);
 }
+#endif // GGML_USE_TRELLIS
 
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
@@ -1354,6 +1356,7 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
 
+#ifdef GGML_USE_TRELLIS
 // PTQ1_0 x Q8_0. The trits are stored base-3 interleaved rather than in element
 // order, so decode a block into element order first using the same traversal as
 // dequantize_row_ptq1_0 -- that keeps the two provably in step. Four Q8_0 blocks
@@ -1525,3 +1528,4 @@ void ggml_vec_dot_tqk7_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     UNUSED(bs);
     ggml_vec_dot_tq_q8_0_impl(n, s, vx, vy, 7);
 }
+#endif // GGML_USE_TRELLIS

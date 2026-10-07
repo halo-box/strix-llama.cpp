@@ -392,8 +392,10 @@ private:
 
     bool has_evaluated_once = false;
 
+#ifdef GGML_USE_TRELLIS
     // prism.hadamard transform coverage is checked once, on the first built graph
     bool hadamard_verified = false;
+#endif
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

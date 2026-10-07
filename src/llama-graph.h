@@ -17,6 +17,7 @@ struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
+#ifdef GGML_USE_TRELLIS
 // Maps a folded model weight to the activation-side transform applied
 // immediately before the matmul: optional sign flip, then the normalized
 // blockwise Hadamard rotation.
@@ -31,6 +32,7 @@ struct llama_hadamard_transform {
     int64_t perm_rep = 0;
 };
 using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
+#endif // GGML_USE_TRELLIS
 
 struct llama_cparams;
 struct llama_layer;
@@ -806,8 +808,10 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+#ifdef GGML_USE_TRELLIS
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+#endif
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1054,12 +1058,17 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+#ifdef GGML_USE_TRELLIS
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
 
     // Transforms shared by folded weights on the same activation. Key is (input, rotation);
     // both must match. Valid for one graph build only.
     mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
+
+    // the activation-side transform of a Hadamard-folded weight w, applied to its matmul input cur
+    ggml_tensor * build_hadamard_input(ggml_tensor * w, ggml_tensor * cur) const;
+#endif // GGML_USE_TRELLIS
 
     const llama_prec_policy * prec_policy;
 

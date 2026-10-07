@@ -188,6 +188,9 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
+# trellis weight types TQ2_T / TQK6 / TQK7 and PTQ1_0: backend kernels + prism.hadamard activation rotation in llama.
+# OFF: the types stay known (type ids, names, sizes, CPU reference quantize/dequantize), but no backend runs them.
+option(GGML_TRELLIS                         "ggml: enable trellis weight type kernels (TQ2_T, TQK6, TQK7, PTQ1_0)" OFF)
 
 # 3rd party libs / backends
 option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               ON)

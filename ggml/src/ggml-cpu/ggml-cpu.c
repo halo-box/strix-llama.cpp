@@ -401,6 +401,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+#ifdef GGML_USE_TRELLIS
     [GGML_TYPE_PTQ1_0] = {
         .from_float               = quantize_row_ptq1_0,
         .vec_dot                  = ggml_vec_dot_ptq1_0_q8_0,
@@ -425,6 +426,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+#endif // GGML_USE_TRELLIS
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -4139,9 +4141,11 @@ void ggml_cpu_init(void) {
 #endif
         }
 
+#ifdef GGML_USE_TRELLIS
         // TQ2_T / TQK6 / TQK7 state -> weights table used by their vec_dot
         // (after the FP16 table: GGML_CPU_FP16_TO_FP32 may be a lookup in it)
         ggml_cpu_tq_init();
+#endif
 
 #if defined(__ARM_ARCH)
         ggml_init_arm_arch_features();

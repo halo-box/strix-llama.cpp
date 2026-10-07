@@ -211,6 +211,10 @@ struct block_q1_0
 #define A_TYPE block_q1_0
 #endif
 
+// Trellis / ternary types: declared only for their own shaders (DATA_A_*), so no other
+// shader sees these blocks.
+#if defined(DATA_A_PTQ1_0) || defined(DATA_A_TQ2_T) || defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
+
 // PTQ1_0: ternary at group 128, base-3 packed five trits per byte.
 // Field order mirrors block_ptq1_0 in ggml-common.h EXACTLY -- qs, then qh, then d.
 // Unlike q1_0 the scale is LAST, and getting that wrong silently misindexes every
@@ -314,6 +318,8 @@ struct block_tqk7_packed16
 #include "tq2_t_lut.glsl"
 #include "tqk.glsl"
 #endif
+
+#endif // DATA_A_PTQ1_0 || DATA_A_TQ2_T || DATA_A_TQK6 || DATA_A_TQK7
 
 #define QUANT_K_Q2_0 64
 #define QUANT_R_Q2_0 1

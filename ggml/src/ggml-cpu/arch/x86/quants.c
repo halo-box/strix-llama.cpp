@@ -4107,6 +4107,7 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
+#ifdef GGML_USE_TRELLIS
 // TQ2_T / TQK6 / TQK7 x Q8_0.
 //
 // Every trellis step t (0..31) of a 128-weight block yields weights 4t..4t+3, which
@@ -4307,3 +4308,4 @@ void ggml_vec_dot_tqk7_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     ggml_vec_dot_tqk7_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+#endif // GGML_USE_TRELLIS

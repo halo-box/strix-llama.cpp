@@ -1,7 +1,9 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#ifdef GGML_USE_TRELLIS
 #include "tq.cuh"
+#endif
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -263,6 +265,7 @@ static void get_rows_cuda_kq(
         s10, s11, s12/*, s13*/);
 }
 
+#ifdef GGML_USE_TRELLIS
 // Trellis types: TQ_LANES threads per 128-weight block, codebook read through the cache
 // (a get_rows CTA touches too few blocks to amortize a shared-memory copy).
 #define CUDA_GET_ROWS_TQ_BLOCK_SIZE 256
@@ -334,6 +337,7 @@ static void get_rows_cuda_tq(
     k_get_rows_tq<type, dst_t><<<block_nums, block_dims, 0, stream>>>(
         src0_d, src1_d, dst_d, ne00, ne11, ne12_fdv, s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
 }
+#endif // GGML_USE_TRELLIS
 
 template<typename src0_t, typename dst_t>
 static void get_rows_cuda_float(
@@ -551,6 +555,7 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_kq<32, dst_t, dequantize_rocmfp4_fast<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+#ifdef GGML_USE_TRELLIS
         case GGML_TYPE_TQ2_T:
             get_rows_cuda_tq<GGML_TYPE_TQ2_T, dst_t>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
@@ -563,6 +568,7 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_tq<GGML_TYPE_TQK7, dst_t>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+#endif // GGML_USE_TRELLIS
         default:
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
             break;

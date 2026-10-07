@@ -158,6 +158,7 @@ static int test_vec_dot_f32(bool verbose) {
     return num_failed;
 }
 
+#ifdef GGML_USE_TRELLIS
 // Check arithmetic separately from the unavoidable loss of ternary quantization.
 static int test_vec_dot_ptq1_0(bool verbose) {
     const auto * q = ggml_get_type_traits(GGML_TYPE_PTQ1_0);
@@ -188,6 +189,7 @@ static int test_vec_dot_ptq1_0(bool verbose) {
     }
     return num_failed;
 }
+#endif // GGML_USE_TRELLIS
 
 static int test_vec_dot_q(bool verbose) {
     int num_failed = 0;
@@ -261,11 +263,15 @@ static int test_vec_dot_q(bool verbose) {
                 type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S ||
                 type == GGML_TYPE_Q3_0_ROCMFPX
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
-                : type == GGML_TYPE_Q1_0 || type == GGML_TYPE_TQ2_T
+                : type == GGML_TYPE_TQ2_T
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
                 : type == GGML_TYPE_TQK6 || type == GGML_TYPE_TQK7
                 ? MAX_DOT_PRODUCT_ERROR_TRELLIS_PLACEHOLDER
-                : type == GGML_TYPE_PTQ1_0 || type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 ||
+                : type == GGML_TYPE_PTQ1_0
+                ? MAX_DOT_PRODUCT_ERROR_TERNARY
+                : type == GGML_TYPE_Q1_0
+                ? MAX_DOT_PRODUCT_ERROR_BINARY
+                : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 ||
                   type == GGML_TYPE_Q2_0_ROCMFPX
                 ? MAX_DOT_PRODUCT_ERROR_TERNARY
                 : type == GGML_TYPE_NVFP4
@@ -313,7 +319,9 @@ int main(int argc, char * argv[]) {
 
     num_failed += test_vec_dot_f32(verbose);
     num_failed += test_vec_dot_q(verbose);
+#ifdef GGML_USE_TRELLIS
     num_failed += test_vec_dot_ptq1_0(verbose);
+#endif
 
     if (num_failed || verbose) {
         printf("%d tests failed\n", num_failed);

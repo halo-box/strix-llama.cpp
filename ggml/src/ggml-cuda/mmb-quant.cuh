@@ -1,6 +1,8 @@
 #pragma once
 #include "dequantize.cuh"
+#ifdef GGML_USE_TRELLIS
 #include "tq.cuh"
+#endif
 #include <type_traits>
 
 struct mmb_quant_slice {
@@ -374,6 +376,7 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
             dst[o + QK / 2] = mmb_f2bf(d * kvalues_mxfp4[b.qs[q] >> 4] * 0.5f);
         }
     }
+#ifdef GGML_USE_TRELLIS
     else if constexpr (ggml_cuda_type_is_tq(TYPE)) {
         // Trellis types (TQ2_T/TQK6/TQK7): a 64-wide K slice is half of a 128-weight block = 16 trellis
         // steps. mmb lane l (8 per row) decodes steps 2l, 2l+1 (8 consecutive weights, one 16-byte LDS
@@ -396,6 +399,7 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
         uint4 o; o.x = mmb_pack2(v[0], v[1]); o.y = mmb_pack2(v[2], v[3]); o.z = mmb_pack2(v[4], v[5]); o.w = mmb_pack2(v[6], v[7]);
         *(uint4 *)(dst + 8 * lane) = o;
     }
+#endif // GGML_USE_TRELLIS
     else if constexpr (TYPE == GGML_TYPE_NVFP4) {
 #pragma unroll
         for (int p = lane; p < 32; p += 8) {
@@ -435,16 +439,20 @@ __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, siz
     }
 }
 
+#ifdef GGML_USE_TRELLIS
 // Trellis types have no MMQ kernel: without mmb their batched MUL_MAT_ID falls back to a host-synchronised
 // per-expert dequant + BLAS loop, so mmb takes them unconditionally (GGML_CUDA_MMB_TQ=0 disables, for A/B).
 static bool mmb_tq_enabled() {
     static const bool v = getenv("GGML_CUDA_MMB_TQ") ? atoi(getenv("GGML_CUDA_MMB_TQ")) != 0 : true;
     return v;
 }
+#endif
 
 // every type mmb_decode_slice() handles
 static bool mmb_quant_type_any(ggml_type type) {
+#ifdef GGML_USE_TRELLIS
     if (ggml_cuda_type_is_tq(type)) return true;
+#endif
     switch (type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
@@ -476,13 +484,17 @@ static bool mmb_quant_type_any(ggml_type type) {
 
 // dense GEMMs: the two types measured faster than MMQ on every arch (#123)
 static bool mmb_quant_type_dense(ggml_type type) {
+#ifdef GGML_USE_TRELLIS
     if (ggml_cuda_type_is_tq(type)) return mmb_tq_enabled();
+#endif
     return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL;
 }
 
 // routed experts: the types measured faster than MMQ at 512-4096 rows on gfx1151 (Q5_K / Q6_K decode the whole super-block and still won)
 static bool mmb_quant_type_routed(ggml_type type) {
+#ifdef GGML_USE_TRELLIS
     if (ggml_cuda_type_is_tq(type)) return mmb_tq_enabled();
+#endif
     switch (type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -529,9 +541,11 @@ static void mmb_dispatch_quant(ggml_type type, Fn fn) {
         case GGML_TYPE_IQ4_NL: fn(std::integral_constant<int, 0>{}); break;
         case GGML_TYPE_MXFP4: fn(std::integral_constant<int, 32 + GGML_TYPE_MXFP4>{}); break;
         case GGML_TYPE_NVFP4: fn(std::integral_constant<int, 32 + GGML_TYPE_NVFP4>{}); break;
+#ifdef GGML_USE_TRELLIS
         case GGML_TYPE_TQ2_T: fn(std::integral_constant<int, 32 + GGML_TYPE_TQ2_T>{}); break;
         case GGML_TYPE_TQK6: fn(std::integral_constant<int, 32 + GGML_TYPE_TQK6>{}); break;
         case GGML_TYPE_TQK7: fn(std::integral_constant<int, 32 + GGML_TYPE_TQK7>{}); break;
+#endif
         default: GGML_ABORT("unsupported MMB quant type");
     }
 }

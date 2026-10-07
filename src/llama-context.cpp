@@ -27,6 +27,7 @@
 // llama_context
 //
 
+#ifdef GGML_USE_TRELLIS
 // Verify that every Hadamard-folded weight consumed by the graph receives its
 // activation-side transform, and every latent lookup table gets the inverse.
 // An architecture whose matmul path bypasses the transform helpers would
@@ -98,6 +99,7 @@ static void llama_verify_hadamard_graph(
         }
     }
 }
+#endif // GGML_USE_TRELLIS
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -2663,12 +2665,14 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
+#ifdef GGML_USE_TRELLIS
     // verify transform coverage on the pristine graph: after scheduling,
     // cross-backend copies break the producer chain the check follows
     if (!hadamard_verified && gf && (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
         llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
         hadamard_verified = true;
     }
+#endif
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
@@ -2706,8 +2710,10 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+#ifdef GGML_USE_TRELLIS
         /*.hadamard_rotations =*/&model.hadamard_rotations,
         /*.hadamard_inverses  =*/&model.hadamard_inverses,
+#endif
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.mtp_draft   =*/ mtp_draft.get(),

@@ -1,6 +1,8 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#ifdef GGML_USE_TRELLIS
 #include "tq.cuh"
+#endif
 
 #include <cstdint>
 
@@ -441,6 +443,7 @@ static void dequantize_row_nvfp4_cuda(
     dequantize_block_nvfp4<<<nb, 32, 0, stream>>>(vx, y, k);
 }
 
+#ifdef GGML_USE_TRELLIS
 // Trellis types: CUDA_TQ_DEQUANT_THREADS threads, TQ_LANES per 128-weight block, each CTA
 // copies the codebook to shared memory once and then dequantizes CUDA_TQ_DEQUANT_BLOCKS
 // consecutive blocks (in row-major block order over all rows of a possibly strided
@@ -500,6 +503,7 @@ static void dequantize_tq_cuda(const void * vx, dst_t * y, const int64_t k, cuda
     const int64_t nb = k / QK_TQK;
     dequantize_tq_nc_cuda<type>(vx, y, k, 1, 1, 1, nb, nb, nb, stream);
 }
+#endif // GGML_USE_TRELLIS
 
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary(
@@ -659,12 +663,14 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_rocmfp4_fast_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+#ifdef GGML_USE_TRELLIS
         case GGML_TYPE_TQ2_T:
             return dequantize_tq_cuda<GGML_TYPE_TQ2_T>;
         case GGML_TYPE_TQK6:
             return dequantize_tq_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_cuda<GGML_TYPE_TQK7>;
+#endif
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_F16:
@@ -729,12 +735,14 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_rocmfp4_fast_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+#ifdef GGML_USE_TRELLIS
         case GGML_TYPE_TQ2_T:
             return dequantize_tq_cuda<GGML_TYPE_TQ2_T>;
         case GGML_TYPE_TQK6:
             return dequantize_tq_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_cuda<GGML_TYPE_TQK7>;
+#endif
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -796,12 +804,14 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_rocmfp4_fast_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+#ifdef GGML_USE_TRELLIS
         case GGML_TYPE_TQ2_T:
             return dequantize_tq_cuda<GGML_TYPE_TQ2_T>;
         case GGML_TYPE_TQK6:
             return dequantize_tq_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_cuda<GGML_TYPE_TQK7>;
+#endif
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
@@ -831,12 +841,14 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
+#ifdef GGML_USE_TRELLIS
         case GGML_TYPE_TQ2_T:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQ2_T>;
         case GGML_TYPE_TQK6:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK7>;
+#endif
         default:
             return nullptr;
     }
@@ -862,12 +874,14 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, nv_bfloat16>;
+#ifdef GGML_USE_TRELLIS
         case GGML_TYPE_TQ2_T:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQ2_T>;
         case GGML_TYPE_TQK6:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK7>;
+#endif
         default:
             return nullptr;
     }
@@ -893,12 +907,14 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
+#ifdef GGML_USE_TRELLIS
         case GGML_TYPE_TQ2_T:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQ2_T>;
         case GGML_TYPE_TQK6:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK7>;
+#endif
         default:
             return nullptr;
     }

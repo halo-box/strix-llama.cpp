@@ -230,6 +230,11 @@ if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
 endif()
 
+# PUBLIC: reaches every backend, llama and the tests through their ggml-base link
+if (GGML_TRELLIS)
+    target_compile_definitions(ggml-base PUBLIC GGML_USE_TRELLIS)
+endif()
+
 if (GGML_OPENMP_FETCH)
     if (NOT GGML_OPENMP)
         message(FATAL_ERROR "GGML_OPENMP_FETCH requires GGML_OPENMP")

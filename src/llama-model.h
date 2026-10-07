@@ -736,6 +736,7 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+#ifdef GGML_USE_TRELLIS
     // Hadamard-folded GGUF weights are matched with persistent model tensors
     // containing the activation-side transform.  The string map is populated
     // from GGUF metadata while loading hparams; the pointer map is populated
@@ -747,6 +748,7 @@ struct llama_model {
     bool hadamard_gdn_v_grouped = false;
     llama_hadamard_rotations hadamard_rotations;
     llama_hadamard_rotations hadamard_inverses;
+#endif // GGML_USE_TRELLIS
 
     // list of devices used in this model
     std::vector<llama_device> devices;

@@ -1049,6 +1049,7 @@ uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const gg
     return ggml_cuda_mmb_slot_reserve(ctx, 0, t, n);
 }
 
+#ifdef GGML_USE_TRELLIS
 // Smallest token count mmb takes for a weight type. mmb_min_t(ctx) is where it beats MMQ; the trellis types have no MMQ
 // (their alternative is dequant + BLAS, per expert and host-synchronised for MUL_MAT_ID), so they switch
 // over right after MMVQ stops (MMVQ_MAX_BATCH_SIZE). GGML_CUDA_MMB_TQ_MIN_T overrides.
@@ -1059,6 +1060,7 @@ static int64_t mmb_min_t_for(const ggml_backend_cuda_context & ctx, ggml_type ty
     }
     return mmb_min_t(ctx);
 }
+#endif // GGML_USE_TRELLIS
 
 bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
@@ -1075,7 +1077,11 @@ bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tens
     // graph-computed F32 src0 (not a weight), such as the QSA indexer score with heads x tokens GEMM rows: keep the 512-row gate.
     // At 8-31 tokens and 32K depth, MMB changed the scores with no measured speed gain.
     const bool graph_src0 = f32w && src0->op != GGML_OP_NONE;
+#ifdef GGML_USE_TRELLIS
     if (T < (graph_src0 ? 512 : mmb_min_t_for(ctx, src0->type)) || T > INT32_MAX / 4) return false;
+#else
+    if (T < (graph_src0 ? 512 : mmb_min_t(ctx)) || T > INT32_MAX / 4) return false;
+#endif
     return ggml_nrows(dst) == T;
 }
 
@@ -1117,7 +1123,11 @@ bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_te
     if (src1->ne[1] != 1 && src1->ne[1] != n_used) return false;
     if (dst->ne[0] != M || dst->ne[1] != n_used || dst->ne[2] != T || dst->ne[3] != 1) return false;
     if (ids->nb[0] != sizeof(int32_t) || ids->ne[2] != 1 || ids->ne[3] != 1) return false;
+#ifdef GGML_USE_TRELLIS
     if (T < mmb_min_t_for(ctx, src0->type) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
+#else
+    if (T < mmb_min_t(ctx) || n_used > 64 || (T * n_used) >> 16 >= 1024) return false;   // tile index must fit in 16 bits per expert
+#endif
     return true;
 }
 

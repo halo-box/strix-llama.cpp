@@ -7992,9 +7992,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+#ifdef GGML_USE_TRELLIS
                     case GGML_TYPE_TQ2_T:
                     case GGML_TYPE_TQK6:
                     case GGML_TYPE_TQK7:
+#endif
                         return true;
                     default:
                         return false;
@@ -8037,10 +8039,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         // 32-value sub-blocks, the row size does not guarantee
                         // the QK_K super-blocks the get_rows kernel iterates on
                         return op->src[0]->ne[0] % QK_K == 0;
+#ifdef GGML_USE_TRELLIS
                     case GGML_TYPE_TQ2_T:
                     case GGML_TYPE_TQK6:
                     case GGML_TYPE_TQK7:
                         return true;
+#endif
                     default:
                         return false;
                 }
