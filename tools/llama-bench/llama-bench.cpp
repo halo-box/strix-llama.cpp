@@ -357,6 +357,7 @@ struct cmd_params {
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
+    std::vector<std::string>         ple;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
@@ -403,6 +404,7 @@ static const cmd_params cmd_params_defaults = {
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
+    /* ple                  */ { "" },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
@@ -481,6 +483,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -lzm, --lazy-mode <on|on-direct|auto|off>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
+    printf("  --ple <file|none>                                 GGUF with PLE tables to use instead of the model's (default: none)\n");
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
@@ -837,6 +840,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.lazy_mode.insert(params.lazy_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "--ple") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (auto & f : p) {
+                    if (f == "none") {
+                        f = "";
+                    }
+                }
+                params.ple.insert(params.ple.end(), p.begin(), p.end());
             } else if (arg == "-mg" || arg == "--main-gpu") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1160,6 +1175,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.lazy_mode.empty()) {
         params.lazy_mode = cmd_params_defaults.lazy_mode;
     }
+    if (params.ple.empty()) {
+        params.ple = cmd_params_defaults.ple;
+    }
     if (params.main_gpu.empty()) {
         params.main_gpu = cmd_params_defaults.main_gpu;
     }
@@ -1230,6 +1248,7 @@ struct cmd_params_instance {
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
+    std::string        ple;
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
@@ -1253,6 +1272,7 @@ struct cmd_params_instance {
         mparams.split_mode    = split_mode;
         mparams.load_mode     = load_mode;
         mparams.lazy_mode     = lazy_mode;
+        mparams.path_ple      = ple.empty() ? nullptr : ple.c_str();
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
@@ -1301,7 +1321,7 @@ struct cmd_params_instance {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
-               load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
+               load_mode == other.load_mode && lazy_mode == other.lazy_mode && ple == other.ple &&
                devices == other.devices && no_host == other.no_host && repack == other.repack &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
@@ -1337,6 +1357,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & sm : params.split_mode)
     for (const auto & lm : params.load_mode)
     for (const auto & lzm : params.lazy_mode)
+    for (const auto & ple : params.ple)
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
     for (const auto & ts : params.tensor_split)
@@ -1378,6 +1399,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .ple                   = */ ple,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1416,6 +1438,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .ple                   = */ ple,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1454,6 +1477,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .ple                   = */ ple,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1497,6 +1521,7 @@ struct test {
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
     llama_lazy_mode          lazy_mode;
+    std::string              ple;
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
@@ -1538,6 +1563,7 @@ struct test {
         split_mode     = inst.split_mode;
         load_mode      = inst.load_mode;
         lazy_mode      = inst.lazy_mode;
+        ple            = inst.ple;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
@@ -1606,7 +1632,7 @@ struct test {
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
-            "tensor_buft_overrides",            "load_mode",     "lazy_mode",
+            "tensor_buft_overrides",            "load_mode",     "lazy_mode",     "ple",
             "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
@@ -1703,6 +1729,7 @@ struct test {
                                             tensor_buft_overrides_str,
                                             llama_load_mode_name(load_mode),
                                             lazy_mode_str(lazy_mode),
+                                            ple.empty() ? "none" : ple,
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
@@ -2027,6 +2054,9 @@ struct markdown_printer : public printer {
         if (params.lazy_mode.size() > 1 || params.lazy_mode != cmd_params_defaults.lazy_mode) {
             fields.emplace_back("lazy_mode");
         }
+        if (params.ple.size() > 1 || params.ple != cmd_params_defaults.ple) {
+            fields.emplace_back("ple");
+        }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");
         }
@@ -2102,6 +2132,8 @@ struct markdown_printer : public printer {
             } else if (field == "t/s") {
                 snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.avg_ts(), t.stdev_ts());
                 value = buf;
+            } else if (field == "ple") {
+                value = t.ple.empty() ? "none" : t.ple.substr(t.ple.find_last_of('/') + 1);
             } else if (vmap.find(field) != vmap.end()) {
                 value = vmap.at(field);
             } else {
