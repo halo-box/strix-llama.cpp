@@ -355,6 +355,16 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
     return range;
 }
 
+// Size for a scratch that grows with the KV view. A need of 64 MiB or more is rounded up to 64 MiB, so the
+// buffer is not reallocated on every prompt ubatch, but never past what one buffer may hold; smaller needs stay exact.
+static size_t ggml_vk_scratch_size(const ggml_backend_vk_context * ctx, size_t need) {
+    const size_t step = 64*1024*1024;
+    if (need < step) {
+        return need;
+    }
+    return std::max(need, std::min(GGML_PAD(need, step), (size_t) ctx->device->max_buffer_size));
+}
+
 void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
@@ -9949,7 +9959,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint64_t need = k_f16_sz + v_f16_sz + (use_vt ? vt_size : 0);
         if (ctx->prealloc_size_x < need) {
             // the view grows with every prompt ubatch; round up so the scratch is not reallocated each time
-            ctx->prealloc_size_x = GGML_PAD(need, (size_t) 64*1024*1024);
+            ctx->prealloc_size_x = ggml_vk_scratch_size(ctx, need);
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
         vk_pipeline tr_k = ctx->device->pipeline_dequant_transpose[k->type];
@@ -13352,7 +13362,7 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
     const size_t scratch_size = size_t{ n_kv } * nrows * sizeof(float);
     if (ctx->prealloc_size_x < scratch_size) {
         // grows with the context, like the flash-attention K/V copy: round up so it is not reallocated each ubatch
-        ctx->prealloc_size_x = GGML_PAD(scratch_size, (size_t) 64*1024*1024);
+        ctx->prealloc_size_x = ggml_vk_scratch_size(ctx, scratch_size);
         ggml_vk_preallocate_buffers(ctx, subctx);
     }
     if (ctx->prealloc_x_need_sync) {
@@ -13365,7 +13375,7 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
         1,
     };
-    vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
+    vk_subbuffer scratch_buf { ctx->prealloc_x, 0, scratch_size };
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
