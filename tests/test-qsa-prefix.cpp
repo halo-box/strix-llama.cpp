@@ -63,6 +63,25 @@ static void test_scalar_visibility() {
         GGML_ASSERT(!scalar(c, qsa_ubatch({{5, {1}}}, 3)));
         GGML_ASSERT(!scalar(c, qsa_ubatch({{8, {0}}, {5, {1}}}, 3)));
     }
+    {   // one sequence with an image (mrope: the image's cells share one position, extents past it): text after the
+        // image is ranked in the mask's order, so the compact rule holds; a query at the image's own position does not
+        qsa_cells c(64); c.add(0, 6, {0});
+        for (llama_pos k = 0; k < 6; ++k) { c.cells.pos_set(c.next, 6); c.cells.seq_add(c.next, 0); c.cells.ext_set(c.next, { 6 + k%3, 6 + k/3 }); ++c.next; }
+        c.add(9, 12, {0});
+        GGML_ASSERT(scalar(c, qsa_ubatch({{12, {0}}}, 4)));
+        GGML_ASSERT(scalar(c, qsa_ubatch({{12, {0}}, {13, {0}}, {14, {0}}, {15, {0}}}, 4)));
+        GGML_ASSERT(!scalar(c, qsa_ubatch({{6, {0}}}, 4)));
+        GGML_ASSERT(!scalar(c, qsa_ubatch({{12, {0}}, {6, {0}}}, 4)));
+        // another sequence anywhere in the cache: the selection does not rank, keep the masked path
+        qsa_cells d = c; d.add(0, 3, {1});
+        GGML_ASSERT(!scalar(d, qsa_ubatch({{12, {0}}}, 4)));
+        // a cell shared by two sequences
+        qsa_cells e = c; e.cells.seq_add(0, 1);
+        GGML_ASSERT(!scalar(e, qsa_ubatch({{12, {0}}}, 4)));
+        // without 2-D cells nothing changes: a second sequence is fine
+        qsa_cells f(64); f.add(0, 12, {0}); f.add(0, 5, {1});
+        GGML_ASSERT(scalar(f, qsa_ubatch({{12, {0}}}, 4)));
+    }
     {   // no seq id, or a position with 2-D extents in the ubatch
         qsa_cells c(64); c.add(0, 8, {0});
         qsa_ubatch none({{8, {0}}}); none.n_seq_id[0] = 0;

@@ -22,12 +22,29 @@ static bool qsa_scalar_visibility_cells(const llama_kv_cells & cells, uint32_t c
         }
         rows.set(u.seq_id[i][0]);
     }
-    // a 2-D (image) cell past its linear position breaks the scalar test; only blocks with a shared cell can split
+    // a 2-D (image) cell past its linear position can break the scalar test: the mrope mask compares 2-D extents only
+    // between a cell and a query at the same linear position. With one sequence in the cache the selection ranks the
+    // cells in the mask's own order (position, then y, then x), so such a cell is harmless unless a query of this
+    // ubatch sits at its position. Several sequences are not ranked: any 2-D cell keeps the masked path there.
+    // only blocks with a shared cell can split
     std::unordered_map<llama_pos, std::vector<llama_kv_cells::seq_set_t>> shared;
+    std::vector<llama_pos> pos_2d;
+    bool one_seq = rows.count()==1;
     for (uint32_t j=0;j<count;++j) {
-        if (cells.is_empty(j) || (cells.seq_get_all(j) & rows).none()) { continue; }
-        if (u.is_pos_2d() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
+        if (cells.is_empty(j)) { continue; }
+        one_seq = one_seq && cells.seq_get_all(j)==rows;
+        if ((cells.seq_get_all(j) & rows).none()) { continue; }
+        if (u.is_pos_2d() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { pos_2d.push_back(cells.pos_get(j)); }
         if (cells.seq_get_all(j).count()>1) { shared[cells.pos_get(j)/ratio]; }
+    }
+    if (!pos_2d.empty()) {
+        // the same test the selection uses to rank: no other sequence anywhere in the cache
+        for (llama_seq_id s=0;one_seq && s<LLAMA_MAX_SEQ;++s) { one_seq = rows.test(s) || cells.seq_pos_min(s)<0; }
+        if (!one_seq) { return false; }
+        std::sort(pos_2d.begin(), pos_2d.end());
+        for (uint32_t i=0;i<u.n_tokens;++i) {
+            if (std::binary_search(pos_2d.begin(), pos_2d.end(), u.pos[i])) { return false; }
+        }
     }
     for (uint32_t j=0;!shared.empty() && j<count;++j) {
         if (cells.is_empty(j) || (cells.seq_get_all(j) & rows).none()) { continue; }
