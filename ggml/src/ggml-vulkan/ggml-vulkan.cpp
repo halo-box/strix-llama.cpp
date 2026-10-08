@@ -8515,6 +8515,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
 // are FA-supported but not listed here (iq4_nl) are only correct through the dequant-once
 // scratch path, so supports_op and the dispatch-time gate must agree on when that path runs.
 static bool ggml_vk_fa_kv_native(ggml_type t, bool coopmat2) {
+    GGML_UNUSED(coopmat2);
     switch (t) {
     case GGML_TYPE_F32:
     case GGML_TYPE_F16:

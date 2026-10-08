@@ -73,7 +73,9 @@ static ggml_backend_buft_alloc_buffer_n_plan_t ggml_backend_buft_alloc_buffer_n_
         }
 
         // flush the current buffer if adding this tensor would exceed max_size
-        if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
+        // a zero-size tensor (a view, or already allocated) never flushes: after a tensor larger than max_size,
+        // its views would otherwise open a range of size 0 that is never allocated, leaving them uninitialized
+        if (cur_buf_size > 0 && this_size > 0 && (cur_buf_size + this_size) > max_size) {
             plan.push_back({ cur_buf_size, first, i });
             cur_buf_size = this_size;
             first        = i;

@@ -2186,6 +2186,17 @@ struct llama_model_lfm2 : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
     };
 
+    // non-causal trunk without memory, then the decision head
+    struct graph_decision : public llm_graph_context {
+        graph_decision(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_decision_head(
+                const llama_model & model,
+                ggml_tensor * inp,
+                llm_graph_input_attn_no_cache * inp_attn,
+                ggml_tensor * inp_out_ids);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
@@ -2409,6 +2420,9 @@ struct llama_model_qwen35 : public llama_model_base {
 
 
 struct llama_ple_disk;
+
+// readahead for the PLE rows of a batch, called once per llama_decode (see llama_context::decode)
+void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
 // Qwen3.5 backbone evaluated without memory, with a joint decision head on top of its hidden states
 struct llama_model_clef : public llama_model_qwen35 {
     llama_model_clef(const struct llama_model_params & params) : llama_model_qwen35(params) {}
