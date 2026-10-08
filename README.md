@@ -10,19 +10,8 @@
 
 ## Halo Box
 
-The goal is simple: more functionality, and the fastest llama.cpp around. And help the community with a single fast
+The goal is simple: more functionality, and the fastest llama.cpp for strix around. And help the community with a single fast
 llama.cpp fork instead of many competing ones.
-
-Halo Box keeps two forks, and which one you want depends on your hardware:
-
-| Fork | What it is |
-| --- | --- |
-| [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) | Stays close to mainline. Tracks upstream `master` and adds features and speedups on top, without diverging from how upstream works. |
-| [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp) (this repo) | Purely optimised for AMD Strix Halo machines (Ryzen AI Max+, RDNA 3.5 / gfx1151). Free to diverge from upstream wherever that buys speed. |
-
-Use `halo-box/llama.cpp` if you want upstream behaviour plus extras. Use this repo if you run a Strix Halo box and
-want every last token/s out of it. Everything in `halo-box/llama.cpp` is merged in here regularly, so this repo is a
-superset of it.
 
 ## What this is
 
@@ -94,7 +83,7 @@ expected to carry them - see [Benchmarking requirements](CONTRIBUTING.md#benchma
 
 Everything else is upstream `llama.cpp`. The additions currently carried here:
 
-**Inherited from [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp)** (general features, sent upstream from there)
+**Strix Halo only** (lives here, measured on `gfx1151`)
 
 | Change | Flag / switch | What it does |
 | --- | --- | --- |
@@ -102,11 +91,6 @@ Everything else is upstream `llama.cpp`. The additions currently carried here:
 | Adaptive speculative draft length | `--spec-draft-adaptive` | Sizes each draft from a measured per-sequence acceptance EMA rather than always drafting `--spec-draft-n-max`; speeds up MTP and DFlash |
 | Vulkan fixes and tuning for RDNA 3.5 | | Driver-gated coopmat LDS stride padding, UMA bulk readback gated on host-cached mappings, IQ3_S mat-vec at batch sizes > 4, and a radix top-k kernel for large k |
 | Hidden server presets | `hidden` in the models `.ini` | Keep a model loadable by name while omitting it from `GET /models` |
-
-**Strix Halo only** (lives here, measured on `gfx1151`)
-
-| Change | Flag / switch | What it does |
-| --- | --- | --- |
 | Multi-point reasoning budget | `--reasoning-budget-*` (upstream has the hard budget only) | Intro message, two soft warnings, a grace period to finish a paragraph after the budget runs out, and reasoning-token usage telemetry |
 | Vulkan batched mat-vec chunking | `GGML_VK_MMV_NO_SPLIT=1` to disable | Dispatches batched mat-vec at the column counts that actually scale on RDNA 3.5, instead of the slow NUM_COLS shader variants |
 | ROCm/HIP quantized matmul on RDNA 3.5 | | MMQ/MMVQ tile configurations and register prefetching, compact `MUL_MAT_ID` with quant- and shape-specific tiles for 256-expert MoE prefill, fused activation quantization for Q8_0 and Q6_K decode |
