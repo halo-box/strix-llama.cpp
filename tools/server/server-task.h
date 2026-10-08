@@ -614,6 +614,14 @@ int server_prompt_checkpoint_reuse(
         llama_pos             pos_next,
         llama_pos             pos_min_thold);
 
+// Copy a sequence's state between a context and a disk cache mapping through
+// ordinary heap memory. Backends must not read or write the file mapping
+// directly: the ROCm runtime pins the mapped pages for the copy, and writeback
+// then keeps rewriting the file for as long as the server runs. Returns the
+// number of bytes copied, 0 on failure.
+size_t server_prompt_state_get_staged(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id);
+size_t server_prompt_state_set_staged(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id);
+
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;

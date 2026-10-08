@@ -1923,6 +1923,33 @@ static bool server_prompt_cache_alloc_disk(
     }
 }
 
+size_t server_prompt_state_get_staged(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id) {
+    std::vector<uint8_t> staging;
+    try {
+        staging.resize(size);
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate %zu bytes to stage prompt state: %s\n", size, e.what());
+        return 0;
+    }
+    const size_t n = llama_state_seq_get_data_ext(ctx, staging.data(), size, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (n != size) {
+        return n;
+    }
+    memcpy(dst, staging.data(), size);
+    return n;
+}
+
+size_t server_prompt_state_set_staged(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id) {
+    std::vector<uint8_t> staging;
+    try {
+        staging.assign(src, src + size);
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate %zu bytes to stage prompt state: %s\n", size, e.what());
+        return 0;
+    }
+    return llama_state_seq_set_data_ext(ctx, staging.data(), size, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+}
+
 namespace {
 
 constexpr char SERVER_PROMPT_CACHE_META_MAGIC[8] = {'L', 'L', 'P', 'C', 'A', 'C', 'H', 'E'};
@@ -2803,7 +2830,7 @@ bool server_prompt_cache::load(
         if (it_best->data.is_disk()) {
             auto & data = it_best->data;
 
-            const size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, data.mapping, data.main_size, id_slot, 0);
+            const size_t n_tgt = server_prompt_state_set_staged(ctx_tgt, data.mapping, data.main_size, id_slot);
             if (n_tgt != data.main_size) {
                 SRV_ERR("failed to restore state with size %zu\n", data.main_size);
                 data.discard();
@@ -2819,7 +2846,7 @@ bool server_prompt_cache::load(
                     return false;
                 }
 
-                const size_t n_dft = llama_state_seq_set_data_ext(ctx_dft, data.mapping + data.main_size, data.drft_size, id_slot, 0);
+                const size_t n_dft = server_prompt_state_set_staged(ctx_dft, data.mapping + data.main_size, data.drft_size, id_slot);
                 if (n_dft != data.drft_size) {
                     SRV_WRN("failed to restore state with size %zu\n", data.drft_size);
                     data.discard();

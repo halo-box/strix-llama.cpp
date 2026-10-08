@@ -360,16 +360,14 @@ struct server_slot {
         if (cur->data.is_disk()) {
             GGML_ASSERT(cur->data.mapping != nullptr);
 
-            const size_t n_tgt = llama_state_seq_get_data_ext(
-                ctx_tgt, cur->data.mapping, cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            const size_t n_tgt = server_prompt_state_get_staged(ctx_tgt, cur->data.mapping, cur_size_tgt, id);
             if (n_tgt != cur_size_tgt) {
                 SLT_WRN(*this, "failed to save target prompt state: expected %zu bytes, wrote %zu\n", cur_size_tgt, n_tgt);
                 prompt_cache.discard(cur);
                 return false;
             }
             if (ctx_dft) {
-                const size_t n_dft = llama_state_seq_get_data_ext(
-                    ctx_dft, cur->data.mapping + cur_size_tgt, cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                const size_t n_dft = server_prompt_state_get_staged(ctx_dft, cur->data.mapping + cur_size_tgt, cur_size_dft, id);
                 if (n_dft != cur_size_dft) {
                     SLT_WRN(*this, "failed to save draft prompt state: expected %zu bytes, wrote %zu\n", cur_size_dft, n_dft);
                     prompt_cache.discard(cur);
