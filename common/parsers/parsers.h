@@ -59,6 +59,8 @@ common_chat_params common_chat_params_init_gigachat_v3(const common_chat_templat
 
 common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
 
+common_chat_params common_chat_params_init_k2_horizon(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
+
 common_chat_params common_chat_params_init_kimi_k2(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
 
 common_chat_params common_chat_params_init_kimi_k3(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
@@ -67,6 +69,8 @@ common_chat_params common_chat_params_init_ling3(const common_chat_template & tm
 
 // tool_list_tokens preserves the LFM2 system tool-list markers; LFM2.5 renders without them
 common_chat_params common_chat_params_init_lfm2(const common_chat_template & tmpl, const autoparser::generation_params & inputs, bool tool_list_tokens);
+
+common_chat_params common_chat_params_init_llm_jp_harmony(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
 
 common_chat_params common_chat_params_init_minicpm5(const common_chat_template & tmpl, const autoparser::generation_params & inputs);
 
