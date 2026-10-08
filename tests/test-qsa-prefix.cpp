@@ -91,8 +91,74 @@ static void test_scalar_visibility() {
     }
 }
 
+// mrope: an image's cells share one position and run over (y, x); text resumes at the image position + max(h, w).
+// The tracked prefix must hold exactly the live cells in the mask's order (the order the selection ranks them in),
+// be ranked while an image is in it and position-ordered otherwise, and give each rank block its first cell's key.
+static void test_mrope_ranks() {
+    std::mt19937 rng(4711);
+    for (int round=0; round<300; ++round) {
+        qsa_prefix_state s(8192);
+        struct cell_key { int32_t p, y, x; uint32_t cell; };
+        std::vector<cell_key> live;   // reference: every cell the cache holds
+        std::vector<uint32_t> free_cells(8192); for (uint32_t i=0;i<8192;++i) free_cells[i]=8191-i;
+        int32_t next_pos = 0;
+        for (int step=0; step<60; ++step) {
+            const int what = rng()%6;
+            if (what == 0 && !live.empty()) {   // rollback: remove every cell at position >= p (seq_rm)
+                const int32_t p = live[rng()%live.size()].p;
+                s.truncate(s.rank_from(p));
+                for (auto it=live.begin(); it!=live.end();) { if (it->p >= p) { free_cells.push_back(it->cell); it=live.erase(it); } else { ++it; } }
+                next_pos = live.empty() ? 0 : std::max_element(live.begin(), live.end(), [](auto & a, auto & b){ return std::tie(a.p,a.y,a.x) < std::tie(b.p,b.y,b.x); })->p + 1;
+                // after an image the next text position is past the image's extent
+                for (auto & c : live) { next_pos = std::max(next_pos, std::max(c.y, c.x) + 1); }
+                continue;
+            }
+            std::vector<uint32_t> slots; std::vector<int32_t> p, y, x;
+            if (what == 1) {                  // an image of h x w cells
+                const int h = 1+rng()%5, w = 2+rng()%5;
+                for (int r=0;r<h;++r) for (int c=0;c<w;++c) { p.push_back(next_pos); y.push_back(next_pos+r); x.push_back(next_pos+c); }
+                next_pos += std::max(h, w);
+            } else {                          // text
+                const int n = 1+rng()%9;
+                for (int i=0;i<n;++i) { p.push_back(next_pos); y.push_back(next_pos); x.push_back(next_pos); ++next_pos; }
+            }
+            for (size_t i=0;i<p.size();++i) { slots.push_back(free_cells.back()); free_cells.pop_back(); live.push_back({p[i], y[i], x[i], slots[i]}); }
+            GGML_ASSERT(s.apply(0, (int32_t) s.cells.size(), slots, p, y, x));
+        }
+        std::sort(live.begin(), live.end(), [](auto & a, auto & b){ return std::tie(a.p,a.y,a.x) < std::tie(b.p,b.y,b.x); });
+        GGML_ASSERT(s.valid && s.cells.size() == live.size());
+        bool dup = false, ident = true;
+        for (size_t k=0;k<live.size();++k) {
+            GGML_ASSERT(s.cells[k] == int32_t(live[k].cell) && s.positions[live[k].cell] == int32_t(k));
+            GGML_ASSERT(s.pos_of[k] == live[k].p && s.y_of[k] == live[k].y && s.x_of[k] == live[k].x);
+            dup |= k > 0 && live[k].p == live[k-1].p; ident &= live[k].p == int32_t(k);
+        }
+        GGML_ASSERT(s.ranked() == dup && (dup || s.identity()) && (s.identity() == ident || dup));
+        for (size_t b=0;b<live.size()/4;++b) for (int a=0;a<4;++a) {
+            const auto & c = live[4*b];
+            GGML_ASSERT(s.block_axis(b, a) == (dup ? (a == 1 ? c.y : a == 2 ? c.x : c.p) : int32_t(4*b)));
+        }
+    }
+    {   // a position hole without an image matches no selection block layout
+        qsa_prefix_state s(64);
+        GGML_ASSERT(s.apply(0, 0, {1, 2, 3}, {0, 1, 2}, {0, 1, 2}, {0, 1, 2}));
+        GGML_ASSERT(!s.apply(0, 3, {4}, {5}, {5}, {5}));
+        GGML_ASSERT(!s.valid);
+    }
+    {   // keys must keep the mask's order; a rewrite must repeat the cells and keys it overwrites
+        qsa_prefix_state s(64);
+        GGML_ASSERT(s.apply(0, 0, {1, 2, 3, 4}, {0, 1, 1, 1}, {0, 1, 1, 2}, {0, 1, 2, 1}));
+        GGML_ASSERT(s.ranked() && !s.identity());
+        GGML_ASSERT(s.apply(0, 2, {3, 4}, {1, 1}, {1, 2}, {2, 1}));
+        GGML_ASSERT(!s.apply(0, 2, {3, 4}, {1, 1}, {1, 2}, {2, 2}));
+        qsa_prefix_state t(64);
+        GGML_ASSERT(!t.apply(0, 0, {1, 2}, {0, 0}, {0, 0}, {1, 0}));
+    }
+}
+
 int main() {
     test_scalar_visibility();
+    test_mrope_ranks();
     qsa_prefix_state s(4096);
     std::mt19937 rng(414);
     for (int round=0; round<200; ++round) {

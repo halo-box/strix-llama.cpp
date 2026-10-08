@@ -237,8 +237,8 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 
     if (incremental_qsa && !qsa_prefix.valid) { qsa_recover_pending = true; }
     if (incremental_qsa && qsa_prefix.valid && (seq_id < 0 || seq_id == qsa_prefix.sequence)) {
-        if (p1 < 0 || size_t(p1) >= qsa_prefix.cells.size()) {
-            qsa_prefix.truncate(std::max(0, p0));
+        if (p1 < 0 || qsa_prefix.cells.empty() || p1 > qsa_prefix.pos_of.back()) {
+            qsa_prefix.truncate(qsa_prefix.rank_from(std::max(0, p0)));
             for (auto & ready : qsa_ready) { ready = std::min<int64_t>(ready, qsa_prefix.cells.size()/4); }
         } else { qsa_invalidate(); }
     }
@@ -412,7 +412,7 @@ bool llama_memory_hybrid_idx::qsa_metadata(ggml_tensor * members, ggml_tensor * 
     }
     if (p) {
         for (int a=0; a<4; ++a) {
-            std::copy_n(qsa_prefix.block_positions.data(), complete, p+a*blocks);
+            for (size_t b=0; b<complete; ++b) { p[a*blocks+b] = qsa_prefix.block_axis(b, a); }
             std::fill(p+a*blocks+complete, p+(a+1)*blocks, 0);
         }
     }
@@ -427,7 +427,8 @@ bool llama_memory_hybrid_idx::qsa_metadata(ggml_tensor * members, ggml_tensor * 
     std::fill(lim + row*blocks + complete, lim + (row+1)*blocks, INT32_MAX);
     std::fill(tail, tail+3*u.n_tokens, -1);
     for (uint32_t i=0; i<u.n_tokens; ++i) {
-        int32_t end = u.pos[i]+1, start = end/4*4; lim[base+i] = start;
+        // the query's rank (its position on a prefix without an image)
+        int32_t end = qsa_prefix.begin+int32_t(i)+1, start = end/4*4; lim[base+i] = start;
         lim[base + n_tps + i] = (int32_t) row;
         for (int j=0; j<end-start; ++j) { tail[3*i+j] = qsa_prefix.cells[start+j]; }
     }
@@ -458,7 +459,7 @@ bool llama_memory_hybrid_idx::set_input_qsa_prefix(
         bias->ne[2] != 1 || bias->type != GGML_TYPE_F32 || qsa_prefix.end != L || L > n_kv || n_blocks*r < n_kv) {
         return false;
     }
-    if (!get_mem_idx()) {
+    if (!get_mem_idx() || (r != 4 && !qsa_prefix.identity())) {
         return false;
     }
     const auto & cells = get_mem_idx()->get_cells(ubatch->seq_id[0][0]);
@@ -501,12 +502,12 @@ bool llama_memory_hybrid_idx::set_input_qsa_prefix(
     if (dst_blk_pos) {
         for (int64_t sec = 0; sec < 4; ++sec) {
             for (int64_t b = 0; b < n_bid; ++b) {
-                dst_blk_pos[sec*n_blocks + b] = (int32_t) (b*r);
+                dst_blk_pos[sec*n_blocks + b] = r == 4 ? qsa_prefix.block_axis(b, (int) sec) : (int32_t) (b*r);
             }
         }
     }
     for (int64_t i = 0; i < n_tokens; ++i) {
-        const int64_t tail_start = ((int64_t) ubatch->pos[i] + 1)/r*r;
+        const int64_t tail_start = ((int64_t) qsa_prefix.begin + i + 1)/r*r;
         float * row = dst_bias + i*n_blocks;
         for (int64_t b = 0; b < n_blocks; ++b) {
             row[b] = b >= n_bid ? -INFINITY : (b*r >= tail_start ? 1e9f : 0.0f);
@@ -1021,7 +1022,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa_blocks(
 }
 
 bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch, uint32_t ratio) const {
-    if (qsa_prefix_matches(ubatch)) { return true; }
+    // a tracked prefix past an image is ranked: its blocks are not position blocks, so the scoring bound does not apply
+    if (qsa_prefix_matches(ubatch)) { return mem->qsa_prefix_identity(); }
     if (!qsa_scalar_visibility(ubatch, ratio)) { return false; }
     const llama_seq_id seq=ubatch.seq_id[0][0];
     return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),get_idx()->get_n_kv(),seq);
@@ -1073,13 +1075,14 @@ void llama_memory_hybrid_idx::qsa_apply(const llama_ubatch & u, const llama_kv_c
         reject(); return;
     }
     const auto seq = u.seq_id[0][0];
+    // the keys the cache stores for these cells (llama_kv_cache::apply_ubatch): an mrope image's cells share one
+    // position and differ in (y, x); the prefix keeps them in the mask's order
+    const bool pos_2d = u.is_pos_2d();
+    std::vector<int32_t> p(u.n_tokens), y(u.n_tokens, 0), x(u.n_tokens, 0);
     for (uint32_t i=0; i<u.n_tokens; ++i) {
-        if (u.n_seq_id[i] != 1 || !u.seq_id[i] || u.seq_id[i][0] != seq || int64_t(u.pos[i]) != int64_t(u.pos[0])+i) {
-            reject(); return;
-        }
-        for (uint32_t axis=1; axis<u.n_pos; ++axis) {
-            if (u.pos[i+axis*u.n_tokens] != u.pos[i]) { reject(); return; }
-        }
+        if (u.n_seq_id[i] != 1 || !u.seq_id[i] || u.seq_id[i][0] != seq) { reject(); return; }
+        p[i] = u.pos[i];
+        if (pos_2d) { y[i] = u.pos[i+u.n_tokens]; x[i] = u.pos[i+2*u.n_tokens]; }
     }
     // a unified cache serves its sequences in turn: when another sequence comes next, rebuild the prefix from its cells
     // a sequence whose cells do not form a prefix is tried once, until the state changes again
@@ -1093,16 +1096,30 @@ void llama_memory_hybrid_idx::qsa_apply(const llama_ubatch & u, const llama_kv_c
     }
     qsa_recover_pending = false;
     qsa_recover_failed = -1;
-    if (!qsa_prefix.apply(seq, u.pos[0], slots.idxs[0])) { reject(); }
+    // the ubatch goes after the prefix, or rewrites ranks it already holds (same cells and keys)
+    const auto & s = qsa_prefix;
+    const auto k0 = std::make_tuple(p[0], y[0], x[0]);
+    size_t start = s.cells.size();
+    if (!s.cells.empty() && !(s.key(s.cells.size()-1) < k0)) {
+        start = s.rank_from(p[0]);
+        while (start < s.cells.size() && s.key(start) < k0) { ++start; }
+        if (start >= s.cells.size() || s.key(start) != k0) { reject(); return; }
+    }
+    if (!qsa_prefix.apply(seq, (int32_t) start, slots.idxs[0], p, y, x)) { reject(); }
 }
 
 bool llama_memory_hybrid_idx::qsa_prefix_matches(const llama_ubatch & u) const {
+    // u is the ubatch last applied: ranks [begin, end) in order, 1-D tokens only (an image ubatch keeps the scan)
     if (!incremental_qsa || !qsa_prefix.valid || !u.token || !u.pos || !u.n_tokens || !u.n_pos || !u.seq_id || !u.n_seq_id ||
-        u.pos[0] != qsa_prefix.begin || int64_t(u.n_tokens) != qsa_prefix.end-qsa_prefix.begin) { return false; }
+        int64_t(u.n_tokens) != qsa_prefix.end-qsa_prefix.begin || size_t(qsa_prefix.end) > qsa_prefix.cells.size()) { return false; }
     for (uint32_t i=0; i<u.n_tokens; ++i) {
-        if (u.n_seq_id[i] != 1 || !u.seq_id[i] || u.seq_id[i][0] != qsa_prefix.sequence || u.pos[i] != u.pos[0]+int32_t(i)) { return false; }
+        const size_t k = qsa_prefix.begin + i;
+        if (u.n_seq_id[i] != 1 || !u.seq_id[i] || u.seq_id[i][0] != qsa_prefix.sequence || u.pos[i] != u.pos[0]+int32_t(i) ||
+            qsa_prefix.pos_of[k] != u.pos[i]) { return false; }
         for (uint32_t a=1; a<u.n_pos; ++a) { if (u.pos[i+a*u.n_tokens] != u.pos[i]) { return false; } }
     }
+    // rank blocks are the selection's blocks only while this sequence is all the cache holds (otherwise it does not rank)
+    if (qsa_prefix.ranked() && mem_idx->get_cells(qsa_prefix.sequence).get_used() != qsa_prefix.cells.size()) { return false; }
     return true;
 }
 
@@ -1134,7 +1151,7 @@ void llama_memory_hybrid_idx::qsa_fill_updates(ggml_tensor * members, ggml_tenso
     auto * c = (int32_t *) members->data; auto * p = (int32_t *) pos->data; auto * w = (int64_t *) rows->data;
     for (int i=0; i<count; ++i) {
         w[i] = ids[i];
-        for (int j=0; j<4; ++j) { c[4*i+j] = ids[i] == complete ? 0 : qsa_prefix.cells[ids[i]*4+j]; p[j*count+i] = ids[i] == complete ? 0 : ids[i]*4; }
+        for (int j=0; j<4; ++j) { c[4*i+j] = ids[i] == complete ? 0 : qsa_prefix.cells[ids[i]*4+j]; p[j*count+i] = ids[i] == complete ? 0 : qsa_prefix.block_axis(ids[i], j); }
     }
 }
 

@@ -100,6 +100,8 @@ public:
     bool qsa_prefix_matches(const llama_ubatch & ubatch) const;
     bool qsa_fast(int il, const llama_ubatch & ubatch) const;
     bool qsa_selected_key_attn() const { return selected_key_attn; }
+    // the tracked prefix is position-ordered (no image in it): rank == position
+    bool qsa_prefix_identity() const { return qsa_prefix.identity(); }
     ggml_tensor * qsa_cache(ggml_context * ctx, int il, int64_t blocks) const;
     void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows) const;
     void qsa_commit(int il) const;
