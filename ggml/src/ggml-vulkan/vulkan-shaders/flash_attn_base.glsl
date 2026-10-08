@@ -32,6 +32,10 @@ const bool DYNAMIC_KV       = (Flags & 16) != 0;
 // Masked keys contribute nothing even where their V rows hold NaN/inf (P is 0, but 0 * NaN is not): set for
 // selected-key (sparse) attention, whose selections can name any cell. Costs occupancy in cm1 (V staging).
 const bool NAN_SAFE_V       = (Flags & 32) != 0;
+// V is supplied transposed per head ([HSV][v_stride] with KV contiguous, from dequant_f16_transpose_vt), so a
+// coopmat1 P x V B-operand fragment is one contiguous 32-byte run per lane instead of 16 kv-strided halves.
+// coopmat1 only, f16 V, aligned, no shmem staging and no NAN_SAFE_V (both stage V rows from the row-major layout).
+const bool V_TRANSPOSED     = (Flags & 64) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;

@@ -431,6 +431,14 @@ enum FaCodePath {
     FA_COOPMAT2,
 };
 
+// vk_fa_pipeline_state::flags bits beyond the ones get_fa_pipeline_state derives from its arguments (1..32);
+// the shader side is flash_attn_base.glsl / flash_attn_cm1_mr.comp
+static constexpr uint32_t FA_FLAG_V_TRANSPOSED = 64;    // V is read from the per-head V^T scratch
+static constexpr uint32_t FA_FLAG_MULTI_ROW    = 128;   // host only: build the pipeline from flash_attn_cm1_mr
+static constexpr uint32_t FA_FLAG_MR_LAZY      = 256;   // multi-row: skip identity O rescales
+static constexpr uint32_t FA_FLAG_MR_NOEB      = 512;   // multi-row: no loop-end barrier
+static constexpr uint32_t FA_FLAG_MR_VPOST     = 1024;  // multi-row: V^T loads before the softmax barrier
+
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
     uint32_t Br, Bc;
@@ -828,6 +836,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
+    vk_pipeline pipeline_dequant_f16_transpose_vt; // f16 V -> V^T per head for the coopmat1 FA (V_TRANSPOSED)
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];

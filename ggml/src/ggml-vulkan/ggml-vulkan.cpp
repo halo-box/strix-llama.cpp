@@ -2216,6 +2216,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (f32acc) { spv_data = flash_attn_f32_f16_cm1_data;        spv_size = flash_attn_f32_f16_cm1_len; }
                 else        { spv_data = flash_attn_f32_f16_f16acc_cm1_data; spv_size = flash_attn_f32_f16_f16acc_cm1_len; }
                 name = aligned ? "flash_attn_f32_f16_aligned_cm1" : "flash_attn_f32_f16_cm1";
+                if (fa.first.flags & FA_FLAG_MULTI_ROW) {
+                    // multi-row prefill flash attention (GGML_VK_FA_MR): f32 accumulation, aligned only
+                    GGML_ASSERT(f32acc && aligned);
+                    spv_data = flash_attn_f32_f16_mr_cm1_data;
+                    spv_size = flash_attn_f32_f16_mr_cm1_len;
+                    name = "flash_attn_f32_f16_mr_cm1";
+                }
             }
             ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
@@ -3234,6 +3241,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q8_0], "dequant_q8_0", dequant_q8_0_len, dequant_q8_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q8_0], "dequant_q8_0_transpose", dequant_q8_0_transpose_len, dequant_q8_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_F16], "dequant_f16_transpose", dequant_f16_transpose_len, dequant_f16_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 8, 1, 1}, {}, 1);
+    // one 64 kv x 64 hs tile per workgroup, dispatched as (HS / 64, KV / 64, heads)
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_f16_transpose_vt, "dequant_f16_transpose_vt", dequant_f16_transpose_vt_len, dequant_f16_transpose_vt_data, "main", 2, 5 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q2_K], "dequant_q2_k", dequant_q2_k_len, dequant_q2_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ2_0], "dequant_tq2_0", dequant_tq2_0_len, dequant_tq2_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ1_0], "dequant_tq1_0", dequant_tq1_0_len, dequant_tq1_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
@@ -9626,9 +9635,104 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // (e.g. a unified multi-sequence cache, whose masked cells belong to live sequences).
     static const bool fa_nan_safe_all = [] { const char * e = getenv("GGML_VK_FA_NAN_SAFE"); return e && atoi(e) != 0; }();
     const bool nan_safe_v = mask != nullptr && (dst->src[5] != nullptr || fa_nan_safe_all);
+
+    const bool radv_rdna3 = ctx->device->driver_id == vk::DriverId::eMesaRadv &&
+                            ctx->device->architecture == vk_device_architecture::AMD_RDNA3;
+
+    // V^T for the coopmat1 prefill FA: transpose f16 V per head into a [HSV][KV + 128] scratch so a P x V
+    // B-operand fragment is one contiguous 32-byte run per lane instead of 16 kv-strided 16-bit loads.
+    // GGML_VK_FA_VT: unset = on for the cm1 kernel on RADV RDNA3, 1 = on everywhere, 0 = off (this also turns
+    // off the multi-row kernel, which reads V only from the V^T scratch). The cm1 kernel cannot use it under
+    // NAN_SAFE_V or shmem staging, which stage V rows from the row-major layout.
+    static const int fa_vt_env = [] {
+        const char * e = getenv("GGML_VK_FA_VT");
+        return e ? atoi(e) : -1;
+    }();
+    // dest row stride KV + 128: 2 * KV bytes is a multiple of 4 KB for every KV admitted here, which would put
+    // the 16 hd rows of a fragment on one memory channel; +256 B moves consecutive rows to the next channel
+    const uint32_t vt_kv_pad = KV + 128;
+    const uint64_t vt_size = (uint64_t)HSV * vt_kv_pad * nev2 * sizeof(ggml_fp16_t);
+    const uint64_t vt_offset = use_dequant_kv ? kv_f16_sz : 0;
+    const bool vt_ok = fa_vt_env != 0 && tuning_params.path == FA_COOPMAT1 && aligned && !tuning_params.shmem_staging &&
+                       v_type_eff == GGML_TYPE_F16 && !fa_compact.active && gqa_ratio == 1 && neq1 >= 64 && nev3 == 1 &&
+                       (KV % 64) == 0 && (HSV % 64) == 0 && KV < 65536 * 64 &&
+                       ctx->device->pipeline_dequant_f16_transpose_vt != nullptr &&
+                       (use_dequant_kv || ((nbv1 % 8) == 0 && (nbv2 % 8) == 0)) &&
+                       vt_size <= ctx->device->properties.limits.maxStorageBufferRange &&
+                       vt_offset + vt_size <= ctx->device->max_buffer_size;
+
+    // Multi-row prefill FA (flash_attn_cm1_mr.comp): one workgroup of eight wave32 subgroups covers 64 rows =
+    // H heads x 64/H tokens that share a KV head. Q stays in registers and each 16-key K/V tile serves all 64
+    // rows (cm1 pins Br at 16). K is read as per-head f16 rows (the contiguized scratch for a KV cache view),
+    // V from the V^T scratch. GGML_VK_FA_MR_H sets H (default 2 when it divides the GQA ratio, else 1).
+    // GGML_VK_FA_MR: unset = on for head size 256 on RADV RDNA3 (where it was measured: Qwen3.8-27B, FA per
+    // pp2048 ubatch 2067 -> 954 ms at d32768 on gfx1151), 1 = on for every eligible shape, 0 = off.
+    static const int fa_mr_env = [] {
+        const char * e = getenv("GGML_VK_FA_MR");
+        return e ? atoi(e) : -1;
+    }();
+    static const int fa_mr_h_env = [] {
+        const char * e = getenv("GGML_VK_FA_MR_H");
+        return e ? atoi(e) : 0;
+    }();
+    const bool fa_mr_on = fa_mr_env > 0 || (fa_mr_env < 0 && HSK == 256 && radv_rdna3);
+    const uint32_t qk_ratio_mr = nek2 > 0 ? (uint32_t)(neq2 / nek2) : 0;
+    const uint32_t mr_h = fa_mr_h_env > 0 ? (uint32_t)fa_mr_h_env : ((qk_ratio_mr % 2) == 0 ? 2u : 1u);
+    const bool use_mr = fa_mr_on && vt_ok && f32acc &&
+                        k_type_eff == GGML_TYPE_F16 && HSK == HSV && (HSK == 128 || HSK == 256) &&
+                        (mr_h == 1 || mr_h == 2 || mr_h == 4) && qk_ratio_mr > 0 && (qk_ratio_mr % mr_h) == 0 &&
+                        neq2 == (int64_t)qk_ratio_mr * nek2 && nek2 == nev2 &&
+                        (mask == nullptr || (mask->type == GGML_TYPE_F16 && nem2 <= 1 && nem3 <= 1 &&
+                                             mask->nb[1] == (size_t)KV * sizeof(ggml_fp16_t))) &&
+                        (q_stride % 4) == 0 && (nbq2 % 16) == 0 && (nbq3 % 16) == 0 &&
+                        (k_stride % 8) == 0 && (nbk2_eff % 16) == 0 && (nbk3_eff % 16) == 0 &&
+                        ctx->device->subgroup_size_control && ctx->device->subgroup_min_size <= 32 && 32 <= ctx->device->subgroup_max_size &&
+                        ctx->device->subgroup_clustered && ctx->device->subgroup_vote;
+    const bool use_vt = vt_ok && (use_mr || (!nan_safe_v && (fa_vt_env > 0 || radv_rdna3)));
+    if (use_mr) {
+        tuning_params.block_rows = 64 / mr_h;
+        tuning_params.block_cols = 64;
+        tuning_params.row_split = mr_h;
+        tuning_params.subgroup_size = 32;
+        tuning_params.workgroup_size = 256;
+        tuning_params.shmem_staging = 0;
+        tuning_params.disable_subgroups = false;
+        tuning_params.limit_occupancy_shmem = 0;
+        workgroups_y = (uint32_t)neq2 / mr_h;
+        static const bool fa_mr_log = [] {
+            const char * e = getenv("GGML_VK_FA_MR_LOG");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (fa_mr_log) {
+            GGML_LOG_INFO("ggml_vulkan: multi-row FA N=%u KV=%u hs=%u heads=%u H=%u gqa=%u mask=%d mask_opt=%d contig=%d\n",
+                          N, KV, HSK, (uint32_t)neq2, mr_h, qk_ratio_mr, mask != nullptr, (int)use_mask_opt, (int)use_dequant_kv);
+        }
+    }
+
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, k_type_eff, v_type_eff,
                                                                    fa_compact.dynamic_kv, nan_safe_v);
+    if (use_vt) {
+        fa_pipeline_state.flags |= FA_FLAG_V_TRANSPOSED;
+    }
+    if (use_mr) {
+        // schedule knobs, each default on (=0 disables); Qwen3.8-27B pp2048 at d32768, FA op time on gfx1151:
+        //   GGML_VK_FA_MR_LAZY:  skip the O rescale of row blocks whose running max did not move  1171 -> 1095 ms
+        //   GGML_VK_FA_MR_NOEB:  drop the loop-end barrier (no LDS hazard needs it)                1099 -> 1008 ms
+        //   GGML_VK_FA_MR_VPOST: issue the V^T loads between the S store and the softmax barrier   1099 ->  969 ms
+        //   all three: 954 ms
+        const auto fa_mr_knob = [](const char * name) {
+            const char * e = getenv(name);
+            return e == nullptr || atoi(e) != 0;
+        };
+        static const bool fa_mr_lazy  = fa_mr_knob("GGML_VK_FA_MR_LAZY");
+        static const bool fa_mr_noeb  = fa_mr_knob("GGML_VK_FA_MR_NOEB");
+        static const bool fa_mr_vpost = fa_mr_knob("GGML_VK_FA_MR_VPOST");
+        fa_pipeline_state.flags |= FA_FLAG_MULTI_ROW |
+                                   (fa_mr_lazy  ? FA_FLAG_MR_LAZY  : 0) |
+                                   (fa_mr_noeb  ? FA_FLAG_MR_NOEB  : 0) |
+                                   (fa_mr_vpost ? FA_FLAG_MR_VPOST : 0);
+    }
 
     vk_pipeline pipeline = nullptr;
 
@@ -9675,7 +9779,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t Tr = CEIL_DIV(N, Br);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    if (gqa_ratio > 1 && workgroups_x <= Br) {
+    if (use_mr) {
+        // multi-row FA: prefill only, enough workgroups without a split (and the kernel writes dst directly)
+    } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
@@ -9689,7 +9795,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // of "align", so recompute split_k based on that.
         split_kv = ROUNDUP_POW2(std::max(1u, KV / split_k), alignment);
         split_k = CEIL_DIV(KV, split_kv);
-        xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype;
+        // the Xe kernels read V row-major and use prealloc_x as their own scratch
+        xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype && !use_vt;
         if (xe_fa_opt) {
             const uint32_t split_p_size = 32;
             const size_t max_dim = (nek1 + split_p_size - 1) / split_p_size;
@@ -9790,8 +9897,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         const uint64_t fp = sizeof(ggml_fp16_t);
         const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * fp;
         const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * fp;
-        if (ctx->prealloc_size_x < k_f16_sz + v_f16_sz) {
-            ctx->prealloc_size_x = k_f16_sz + v_f16_sz;
+        // the V^T region after K and V is reserved here: growing prealloc_x after the dispatches below would
+        // replace the buffer they wrote
+        const uint64_t need = k_f16_sz + v_f16_sz + (use_vt ? vt_size : 0);
+        if (ctx->prealloc_size_x < need) {
+            ctx->prealloc_size_x = need;
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
         vk_pipeline tr_k = ctx->device->pipeline_dequant_transpose[k->type];
@@ -9817,6 +9927,34 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ggml_vk_perf_mark_subop(ctx, subctx, kv_needs_dequant || (k_quant && v_quant)
                                              ? "FA_KV_DEQUANT (sub-op)"
                                              : "FA_KV_CONTIGUIZE (sub-op)");
+    }
+
+    if (use_vt) {
+        // V -> V^T [nev2][HSV][KV + 128] in prealloc_x, after the K/V contiguize scratch when that ran
+        if (ctx->prealloc_size_x < vt_offset + vt_size) {
+            // only reachable without the contiguize pass, which reserves the V^T region itself
+            GGML_ASSERT(!use_dequant_kv);
+            ctx->prealloc_size_x = vt_offset + vt_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        vk_pipeline tr_vt = ctx->device->pipeline_dequant_f16_transpose_vt;
+        ggml_pipeline_request_descriptor_sets(ctx, tr_vt, 1);
+        if (ctx->prealloc_x_need_sync && !use_dequant_kv) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        vk_subbuffer vt_dst = vk_subbuffer{ ctx->prealloc_x, vt_offset, vt_size };
+        // source element strides: the contiguized scratch is [HSV][KV][nev2], the tensor has nbv1 / nbv2
+        const uint32_t src_kv_stride   = use_dequant_kv ? HSV      : (uint32_t)(nbv1 / sizeof(ggml_fp16_t));
+        const uint32_t src_head_stride = use_dequant_kv ? HSV * KV : (uint32_t)(nbv2 / sizeof(ggml_fp16_t));
+        const std::vector<uint32_t> tr_pc = { HSV, vt_kv_pad, src_kv_stride, src_head_stride, 0 };
+        ggml_vk_dispatch_pipeline(ctx, subctx, tr_vt, { v_buf, vt_dst }, tr_pc, { HSV, KV / 64, (uint32_t)nev2 });
+        ggml_vk_sync_buffers(ctx, subctx);
+        ctx->prealloc_x_need_sync = true;
+        v_buf = vt_dst;
+        v_stride = vt_kv_pad;
+        nbv2_eff = (uint32_t)((uint64_t)HSV * vt_kv_pad * sizeof(ggml_fp16_t));
+        nbv3_eff = (uint32_t)vt_size;
+        ggml_vk_perf_mark_subop(ctx, subctx, "FA_V_TRANSPOSE (sub-op)");
     }
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
