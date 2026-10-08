@@ -1643,6 +1643,17 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * y_gate = nullptr;
     const void * y_norm_w = nullptr;
     float y_eps = 0.0f;
+    // RDNA3.5 fused-quantize Q8_0 matvec: extra blocks at the end of the grid compute small F32 matvecs of the same
+    // F32 activations exactly as mul_mat_vec_f<float, float, 1, 256> would (see mmvq_fq_aux_rows)
+    const float * aux_w[2]      = { nullptr, nullptr };
+    float *       aux_dst[2]    = { nullptr, nullptr };
+    int           aux_rows[2]   = { 0, 0 };
+    int           aux_stride[2] = { 0, 0 };
+    int           aux_nseg      = 0;
+    int           aux_ncols2    = 0;
+    int           aux_blocks    = 0;
+    // RDNA3.5 fused-quantize matvec: block 0 also stores its quantize_q8_1-exact Q8_1 activations (with block sums)
+    void *        y_q8_out      = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

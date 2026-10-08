@@ -798,6 +798,95 @@ void ggml_cuda_op_shared_gate_mul_add(
         residual ? (const float *) residual->data : nullptr, (float *) dst->data, (int) (w->ne[0] / 2), dst->ne[0]);
 }
 
+// Decode MoE epilogue: the same gate dot and merge as shared_gate_mul_add_f32, but the routed-expert weighted
+// sum is computed here instead of read from its output (graph_optimize moved the reduction chain right after
+// the gate matvec). The reduction is moe_weighted_reduction_f32_v4's per-element expression, copied verbatim;
+// the merge keeps the separately rounded product and sum of shared_gate_mul_add_f32.
+static __global__ void __launch_bounds__(1024, 1) shared_gate_mul_add_reduce_f32(
+        const float * w, const float * y, const float * experts, const float * expert_scale, const float * weights,
+        const float * src, float * dst, const int ncols2, const int64_t n_embd, const int n_expert_used) {
+    constexpr int block_size = 256;
+    constexpr int warp_size  = 32;
+    __shared__ float buf_iw[warp_size];
+    __shared__ float gate_s;
+
+    const int tid = threadIdx.x;
+    if (tid < warp_size) {
+        buf_iw[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const float2 * x2 = (const float2 *) w;
+    const float2 * y2 = (const float2 *) y;
+    // the gate dot on the first 256 threads exactly as shared_gate_mul_add_f32 (block 256), the whole block for the columns
+    float sumf = 0.0f;
+    if (tid < block_size) {
+        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+            const float2 tmpx = x2[col2];
+            const float2 tmpy = y2[col2];
+            ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+            ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+        }
+        sumf = warp_reduce_sum<warp_size>(sumf);
+        buf_iw[tid/warp_size] = sumf;
+    }
+    __syncthreads();
+    if (tid < warp_size) {
+        sumf = buf_iw[tid];
+        sumf = warp_reduce_sum<warp_size>(sumf);
+        if (tid == 0) {
+            gate_s = 1.0f / (1.0f + expf(-sumf));
+        }
+    }
+    __syncthreads();
+
+    const float gate = gate_s;
+    const int64_t token = blockIdx.x;
+    const uint64_t first_row = (uint64_t) token * n_expert_used;
+    const float first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+    const float w0 = weights[first_row];
+    for (int64_t col4 = ((int64_t) blockIdx.y * blockDim.x + threadIdx.x) * 4; col4 < n_embd;
+            col4 += (int64_t) blockDim.x * gridDim.y * 4) {
+        const float4 e0 = *(const float4 *)(experts + first_row * n_embd + col4);
+        float4 sum; sum.x = (e0.x * first_scale) * w0; sum.y = (e0.y * first_scale) * w0;
+        sum.z = (e0.z * first_scale) * w0; sum.w = (e0.w * first_scale) * w0;
+        for (int expert = 1; expert < n_expert_used; ++expert) {
+            const uint64_t row = first_row + expert;
+            const float scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+            const float we = weights[row];
+            const float4 e = *(const float4 *)(experts + row * n_embd + col4);
+            sum.x += (e.x * scale) * we; sum.y += (e.y * scale) * we;
+            sum.z += (e.z * scale) * we; sum.w += (e.w * scale) * we;
+        }
+        const float4 a = *(const float4 *)(src + token * n_embd + col4);
+        const float4 o = make_float4(
+            rounded_add_f32(sum.x, rounded_mul_f32(a.x, gate)),
+            rounded_add_f32(sum.y, rounded_mul_f32(a.y, gate)),
+            rounded_add_f32(sum.z, rounded_mul_f32(a.z, gate)),
+            rounded_add_f32(sum.w, rounded_mul_f32(a.w, gate)));
+        *(float4 *)(dst + token * n_embd + col4) = o;
+    }
+}
+
+void ggml_cuda_op_shared_gate_mul_add_reduce(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * gate_mm, const ggml_tensor * experts,
+        const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * src, ggml_tensor * dst,
+        const int n_expert_used) {
+    const ggml_tensor * w = gate_mm->src[0];
+    const ggml_tensor * y = gate_mm->src[1];
+    GGML_ASSERT(w->ne[0] % 2 == 0);
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(expert_scale == nullptr || expert_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(experts) && ggml_is_contiguous(weights) && ggml_is_contiguous(src) &&
+                ggml_is_contiguous(dst));
+    // one block: dst may alias the gate activations y, which are read before any column is written
+    const ggml_cuda_kernel_launch_params launch_params(dim3(1, 1, 1), dim3(1024, 1, 1), 0, ctx.stream());
+    ggml_cuda_kernel_launch(shared_gate_mul_add_reduce_f32, launch_params,
+        (const float *) w->data, (const float *) y->data, (const float *) experts->data,
+        expert_scale ? (const float *) expert_scale->data : nullptr, (const float *) weights->data,
+        (const float *) src->data, (float *) dst->data, (int) (w->ne[0] / 2), dst->ne[0], n_expert_used);
+}
+
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
