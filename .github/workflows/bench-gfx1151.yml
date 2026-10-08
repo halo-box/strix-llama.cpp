@@ -22,6 +22,10 @@
 # correctness signal is never lost - per AGENTS.md a speedup from a build that
 # fails correctness must not be retained, only measured and reported as such.
 #
+# test-backend-ops perf runs with GGML_CUDA_DISABLE_GRAPHS=1 because SOLVE_TRI
+# aborts under HIP graph capture (hipBLAS CUBLAS_STATUS_INTERNAL_ERROR from
+# solve_tri_f32_cublas). Those perf numbers are therefore graphs-off; the
+# llama-bench numbers keep graphs on.
 # Runner labels: `devlab-dispatch` is the opt-in gate that reaches the AMD Ryzen AI
 # Dev Lab ephemeral pool at all, and `strix-halo` narrows it to Strix Halo silicon
 # inside that pool. `strix-halo` on its own reaches nothing. Do not use
@@ -258,6 +262,16 @@ jobs:
 
       - name: test-backend-ops perf
         if: ${{ !cancelled() && steps.build.outcome == 'success' && !inputs.skip_ops }}
+        env:
+          # SOLVE_TRI aborts under HIP graph capture: hipBLAS returns
+          # CUBLAS_STATUS_INTERNAL_ERROR from hipblasStrsmBatched inside
+          # solve_tri_f32_cublas (ggml-cuda/solve_tri.cu:71) and ggml aborts.
+          # Reproduced at 4977288b3 on ROCm 10.0 locally and on ROCm 7.2.1 on
+          # the DevLab host; test mode passes 24/24, so it is specific to the
+          # perf path under capture. Graphs off lets every case run, so the
+          # perf numbers below are a graphs-off measurement. Remove this once
+          # the capture interaction is fixed.
+          GGML_CUDA_DISABLE_GRAPHS: "1"
         run: |
           set +e
           set -uo pipefail
