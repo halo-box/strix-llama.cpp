@@ -134,16 +134,20 @@ static void test_mrope_ranks() {
             dup |= k > 0 && live[k].p == live[k-1].p; ident &= live[k].p == int32_t(k);
         }
         GGML_ASSERT(s.ranked() == dup && (dup || s.identity()) && (s.identity() == ident || dup));
+        GGML_ASSERT(s.complete() == live.size()/4);
         for (size_t b=0;b<live.size()/4;++b) for (int a=0;a<4;++a) {
             const auto & c = live[4*b];
+            GGML_ASSERT(s.blk_rank[b] == int32_t(4*b) && s.blk_start[b] == int32_t(4*b));
             GGML_ASSERT(s.block_axis(b, a) == (dup ? (a == 1 ? c.y : a == 2 ? c.x : c.p) : int32_t(4*b)));
         }
     }
-    {   // a position hole without an image matches no selection block layout
+    {   // a position hole without an image (an MTP draft skips the image's positions): position blocks, only complete ones count
         qsa_prefix_state s(64);
         GGML_ASSERT(s.apply(0, 0, {1, 2, 3}, {0, 1, 2}, {0, 1, 2}, {0, 1, 2}));
-        GGML_ASSERT(!s.apply(0, 3, {4}, {5}, {5}, {5}));
-        GGML_ASSERT(!s.valid);
+        GGML_ASSERT(s.apply(0, 3, {4, 5, 6, 7, 8}, {5, 8, 9, 10, 11}, {5, 8, 9, 10, 11}, {5, 8, 9, 10, 11}));
+        GGML_ASSERT(s.valid && !s.ranked() && !s.identity() && s.complete() == 1 && s.blk_rank[0] == 4 && s.blk_start[0] == 8);
+        GGML_ASSERT(s.tail_start(7) == 12 && s.tail_start(3) == 4 && s.tail_cell(4, 0) == -1 && s.tail_cell(4, 1) == 4);
+        s.truncate(s.rank_from(9)); GGML_ASSERT(s.complete() == 0 && s.cells.size() == 5);
     }
     {   // keys must keep the mask's order; a rewrite must repeat the cells and keys it overwrites
         qsa_prefix_state s(64);
@@ -156,9 +160,54 @@ static void test_mrope_ranks() {
     }
 }
 
+// the draft side of an mrope conversation: text only, but the positions skip each image's extent. The selection
+// pools position blocks that have all four positions; a query's tail is its own position block, holes as -1.
+static void test_position_holes() {
+    std::mt19937 rng(9001);
+    for (int round=0; round<300; ++round) {
+        qsa_prefix_state s(8192);
+        std::vector<std::pair<int32_t, uint32_t>> live;   // (position, cell), increasing
+        std::vector<uint32_t> free_cells(8192); for (uint32_t i=0;i<8192;++i) free_cells[i]=8191-i;
+        int32_t next_pos = 0;
+        for (int step=0; step<80; ++step) {
+            const int what = rng()%6;
+            if (what == 0 && !live.empty()) {          // rollback from a position
+                const int32_t p = live[rng()%live.size()].first;
+                s.truncate(s.rank_from(p));
+                while (!live.empty() && live.back().first >= p) { free_cells.push_back(live.back().second); live.pop_back(); }
+                next_pos = p;
+                continue;
+            }
+            if (what == 1) { next_pos += 1 + rng()%9; }   // an image the draft never sees
+            const int n = 1+rng()%9;
+            std::vector<uint32_t> slots; std::vector<int32_t> p;
+            for (int i=0;i<n;++i) { p.push_back(next_pos++); slots.push_back(free_cells.back()); free_cells.pop_back(); live.push_back({p.back(), slots.back()}); }
+            GGML_ASSERT(s.apply(0, (int32_t) s.cells.size(), slots, p, p, p));
+        }
+        GGML_ASSERT(s.valid && !s.ranked() && s.cells.size() == live.size());
+        // reference: complete position blocks in order, as the scan numbers them
+        std::vector<int32_t> starts;
+        for (size_t k=0;k+3<live.size();++k) { if (live[k].first%4 == 0 && live[k+3].first == live[k].first+3) { starts.push_back(live[k].first); } }
+        GGML_ASSERT(s.complete() == starts.size());
+        for (size_t b=0;b<starts.size();++b) {
+            GGML_ASSERT(s.blk_start[b] == starts[b] && s.pos_of[s.blk_rank[b]] == starts[b]);
+            for (int a=0;a<4;++a) { GGML_ASSERT(s.block_axis(b, a) == starts[b]); }
+        }
+        for (size_t k=0;k<live.size();++k) {
+            const int32_t q = live[k].first, t = (q+1)/4*4;
+            GGML_ASSERT(s.tail_start(k) == t);
+            for (int j=0;j<q+1-t;++j) {
+                const auto it = std::find_if(live.begin(), live.end(), [&](auto & e){ return e.first == t+j; });
+                GGML_ASSERT(s.tail_cell(t, j) == (it == live.end() ? -1 : int32_t(it->second)));
+            }
+        }
+    }
+}
+
 int main() {
     test_scalar_visibility();
     test_mrope_ranks();
+    test_position_holes();
     qsa_prefix_state s(4096);
     std::mt19937 rng(414);
     for (int round=0; round<200; ++round) {

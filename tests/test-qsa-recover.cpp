@@ -78,13 +78,15 @@ int main() {
         qsa_prefix_state u(64);
         GGML_ASSERT(!qsa_rebuild_prefix(c, 0, u));
     }
-    // still refused: a hole in the positions, a cell shared with another sequence, a duplicated position
+    // a hole in the positions (an MTP draft skips an image's positions): position blocks, only complete ones count
     {
         auto c = make_cells(64);
         for (int p = 0; p < 10; ++p) { if (p != 5) { put(c, p, 0, p); } }
         qsa_prefix_state s(64);
-        GGML_ASSERT(!qsa_rebuild_prefix(c, 0, s));
+        GGML_ASSERT(qsa_rebuild_prefix(c, 0, s) && s.cells.size() == 9 && !s.ranked() && !s.identity());
+        GGML_ASSERT(s.complete() == 1 && s.blk_rank[0] == 0 && s.blk_start[0] == 0 && s.tail_start(7) == 8);
     }
+    // still refused: a cell shared with another sequence, a duplicated position
     {
         auto c = make_cells(64);
         for (int p = 0; p < 10; ++p) { put(c, p, 0, p); }
@@ -99,5 +101,5 @@ int main() {
         qsa_prefix_state s(64);
         GGML_ASSERT(!qsa_rebuild_prefix(c, 0, s));
     }
-    std::cout << "PASS: prefixes rebuilt next to other sequences; holes, shared cells and duplicates refused\n";
+    std::cout << "PASS: prefixes rebuilt next to other sequences, with images and holes; shared cells and duplicates refused\n";
 }
