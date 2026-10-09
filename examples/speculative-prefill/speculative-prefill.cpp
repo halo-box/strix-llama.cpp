@@ -184,28 +184,26 @@ int main(int argc, char ** argv) {
 
     const int32_t n_batch_tgt = llama_n_batch(ctx_tgt);
     const int32_t n_kept_total = (int32_t) spec_res.kept_indices.size();
-    llama_batch batch_tgt = llama_batch_init(std::min(n_kept_total, n_batch_tgt), 0, 1);
+    common_batch batch_tgt(ctx_tgt);
 
     int ret = 0;
     for (int32_t i = 0; i < n_kept_total; i += n_batch_tgt) {
         const int32_t n_eval = std::min(n_kept_total - i, n_batch_tgt);
-        common_batch_clear(batch_tgt);
+        batch_tgt.clear();
 
         for (int32_t j = 0; j < n_eval; ++j) {
             const int32_t k = i + j;
             const int32_t orig_idx = spec_res.kept_indices[k];
             const bool is_last = (k == n_kept_total - 1);
-            common_batch_add(batch_tgt, prompt_tokens[orig_idx], (llama_pos) k, { seq_id }, is_last);
+            batch_tgt.add(prompt_tokens[orig_idx], (llama_pos) k, seq_id, is_last);
         }
 
-        ret = llama_decode(ctx_tgt, batch_tgt);
+        ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
         if (ret != 0) {
             LOG_ERR("%s: failed to decode sparse prompt on target model, ret = %d\n", __func__, ret);
-            llama_batch_free(batch_tgt);
             return 1;
         }
     }
-    llama_batch_free(batch_tgt);
 
     llama_synchronize(ctx_tgt);
     llama_synchronize(ctx_dft);
@@ -227,7 +225,7 @@ int main(int argc, char ** argv) {
     int32_t cur_pos = n_kept_total;
     int32_t n_generated = 0;
 
-    llama_batch batch_gen = llama_batch_init(1, 0, 1);
+    common_batch batch_gen(ctx_tgt);
 
     const auto t_gen_start = ggml_time_us();
 
@@ -243,10 +241,10 @@ int main(int argc, char ** argv) {
         LOG("%s", piece.c_str());
         fflush(stdout);
 
-        common_batch_clear(batch_gen);
-        common_batch_add(batch_gen, token_id, (llama_pos) cur_pos++, { seq_id }, true);
+        batch_gen.clear();
+        batch_gen.add(token_id, (llama_pos) cur_pos++, seq_id, true);
 
-        ret = llama_decode(ctx_tgt, batch_gen);
+        ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_gen.get());
         if (ret != 0) {
             LOG_ERR("%s: failed to decode generated token %d, ret = %d\n", __func__, i, ret);
             break;
@@ -263,7 +261,6 @@ int main(int argc, char ** argv) {
     LOG_INF("generated %d tokens in %.2f ms (%.2f tokens/s)\n",
             n_generated, gen_ms, n_generated > 0 ? (n_generated / (gen_ms / 1000.0)) : 0.0);
 
-    llama_batch_free(batch_gen);
     llama_backend_free();
 
     return 0;

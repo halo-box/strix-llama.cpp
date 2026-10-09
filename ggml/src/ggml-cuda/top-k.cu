@@ -495,7 +495,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const size_t shared_mem     = ncols_pad * sizeof(int);
     const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
     const bool   use_bitonic    = shared_mem <= max_shared_mem && ncols <= 1024;
-    const int    chunk_nrows    = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
+    const int    chunk_nrows    = ggml_cuda_chunk_nrows(src0->nb[1], nrows);
 
     ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * chunk_nrows);
     int *                     tmp_dst = temp_dst_alloc.get();
