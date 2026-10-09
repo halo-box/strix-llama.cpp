@@ -150,6 +150,7 @@ endif ()
 
 llama_build_and_test(test-qsa-prefix.cpp)
 llama_build_and_test(test-qsa-fast.cpp)
+llama_build_and_test(test-qsa-recover.cpp)
 llama_build_and_test(test-ple-disk.cpp)
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL

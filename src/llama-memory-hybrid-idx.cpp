@@ -118,7 +118,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     for (int il=0; il<layers; ++il) {
         if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] != 4) { continue; }
         auto * dev = model.dev_layer(il);
-        if (std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") != 0) { continue; }
+        // validated on ROCm and Vulkan; LLAMA_QSA_INCREMENTAL=0 disables it, =1 enables it on any backend
+        static const int mode = [] {
+            const char * e = getenv("LLAMA_QSA_INCREMENTAL");
+            return e != nullptr ? atoi(e) : -1;
+        }();
+        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+        const bool validated = std::strcmp(reg, "ROCm") == 0 || std::strcmp(reg, "Vulkan") == 0;
+        if (mode == 0 || (mode < 0 && !validated)) { continue; }
         incremental_qsa = true;
         auto * buft = ggml_backend_dev_buffer_type(dev);
         auto & ctx = contexts[buft];
@@ -1053,19 +1060,7 @@ bool llama_memory_hybrid_idx::qsa_recover(llama_seq_id seq) {
     const auto & raw = mem_idx->get_cells(seq);
     if (raw.size() != qsa_prefix.positions.size()) { return false; }
     qsa_prefix_state rebuilt(qsa_prefix.positions.size());
-    rebuilt.cells.resize(raw.get_used(), -1);
-    for (uint32_t cell=raw.used_min(); cell<raw.used_max_p1(); ++cell) {
-        if (raw.is_empty(cell)) { continue; }
-        const int32_t pos = raw.pos_get(cell);
-        const auto & ext = raw.ext_get(cell);
-        if (pos < 0 || size_t(pos) >= rebuilt.cells.size() || rebuilt.cells[pos] >= 0 ||
-            !raw.seq_has(cell, seq) || raw.seq_get_all(cell).count() != 1 ||
-            !((ext.x == 0 && ext.y == 0) || (ext.x == pos && ext.y == pos))) { return false; }
-        rebuilt.cells[pos] = cell; rebuilt.positions[cell] = pos;
-    }
-    if (std::find(rebuilt.cells.begin(), rebuilt.cells.end(), -1) != rebuilt.cells.end()) { return false; }
-    rebuilt.sequence = seq;
-    for (size_t b=0; b<rebuilt.cells.size()/4; ++b) { rebuilt.block_positions.push_back(b*4); }
+    if (!qsa_rebuild_prefix(raw, seq, rebuilt)) { return false; }
     qsa_prefix = std::move(rebuilt);
     return true;
 }
@@ -1086,8 +1081,18 @@ void llama_memory_hybrid_idx::qsa_apply(const llama_ubatch & u, const llama_kv_c
             if (u.pos[i+axis*u.n_tokens] != u.pos[i]) { reject(); return; }
         }
     }
-    if (!qsa_prefix.valid && (!qsa_recover_pending || !qsa_recover(seq))) { qsa_recover_pending = false; return; }
+    // a unified cache serves its sequences in turn: when another sequence comes next, rebuild the prefix from its cells
+    // a sequence whose cells do not form a prefix is tried once, until the state changes again
+    if (qsa_prefix.valid && qsa_prefix.sequence >= 0 && qsa_prefix.sequence != seq) {
+        qsa_invalidate(); // another sequence's turn: track this one from its first ubatch on
+    }
+    if (!qsa_prefix.valid) {
+        if (!qsa_recover_pending && seq == qsa_recover_failed) { return; }
+        qsa_recover_pending = false;
+        if (!qsa_recover(seq)) { qsa_recover_failed = seq; return; }
+    }
     qsa_recover_pending = false;
+    qsa_recover_failed = -1;
     if (!qsa_prefix.apply(seq, u.pos[0], slots.idxs[0])) { reject(); }
 }
 
