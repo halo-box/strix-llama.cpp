@@ -354,9 +354,8 @@ static void test_tensor_larger_than_max_size() {
     GGML_ASSERT(backend.context->allocated_total() == 24);
 }
 
-// This test assumes a max of 16 buffer chunks, and tries to allocate tensors that would
-// require more. Expectation is that the last buffer should grow to fit everything,
-// leaving it to the backend to error out if it can't allocate that much.
+// Allocate tensors that need more than the initial 16 chunks. The chunk list grows,
+// and no chunk may exceed max_size (the 16th chunk used to take everything left).
 static void test_not_enough_chunks() {
     const int max_chunks = 16;
     const int max_size   = 8;
@@ -377,6 +376,7 @@ static void test_not_enough_chunks() {
     ggml_gallocr_ptr galloc = allocate_graph(graph, acc, &backend.buffer_type);
     check_all_allocated(graph);
     check_no_overlap(graph);
+    check_max_size(ctx);
     GGML_ASSERT(backend.context->allocated_total() > max_chunks * max_size);
 }
 
