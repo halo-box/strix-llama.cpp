@@ -13583,6 +13583,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                              GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S}) {
         test_cases.emplace_back(new test_mul_mat_exact_batch(type_a, 128, 4, 5120));
     }
+    // exact batches past the 8-column mat-vec limit, and q8_0 around its n == 2 special case:
+    // q4_K takes the q8_1 integer-dot path at n == 1 on AMD, so its chunks must quantize too
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n : {2, 3, 9, 16}) {
+            test_cases.emplace_back(new test_mul_mat_exact_batch(type_a, 128, n, 5120));
+        }
+    }
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {

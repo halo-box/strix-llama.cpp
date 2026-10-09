@@ -7419,6 +7419,13 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     GGML_UNUSED(m);
 }
 
+// GGML_HINT_EXACT_BATCH: every column of the batch must equal the n == 1 result bit for bit
+// (speculative verification of an MTP draft, see qwen35.cpp). Such a batch stays on the
+// mat-vec kernels, whose columns are independent, and takes the integer-dot decision of n == 1.
+static bool ggml_vk_mul_mat_exact_batch(const ggml_tensor * dst) {
+    return dst->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH;
+}
+
 static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, uint32_t col0, uint32_t ncols, bool allow_quantize_y, bool swap_inputs = false) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[swap_inputs ? 1 : 0];
@@ -7462,7 +7469,11 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
 
     const ggml_type y_kernel_type = widen_bf16 ? GGML_TYPE_F32 : src1->type;
     const bool f16_f32_kernel = y_kernel_type == GGML_TYPE_F32;
-    bool quantize_y = allow_quantize_y && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
+    const bool exact_batch = !swap_inputs && ggml_vk_mul_mat_exact_batch(dst);
+    // A chunk quantizes only its own columns (q8_1 blocks never span columns when ne10 % 32 == 0).
+    const bool chunk = col0 > 0 || ncols < (uint32_t) src1->ne[1];
+    bool quantize_y = allow_quantize_y && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 &&
+                      (!chunk || ne10 % 32 == 0) && ggml_vk_should_use_mmvq(ctx->device, ne01, exact_batch ? 1 : ne11, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -7609,15 +7620,17 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
         }
     }
     if (quantize_y) {
-        if (ctx->prealloc_y_last_pipeline_used != to_q8_1.get() ||
+        if (chunk ||
+            ctx->prealloc_y_last_pipeline_used != to_q8_1.get() ||
             ctx->prealloc_y_last_tensor_used != src1 ||
             ctx->prealloc_y_last_k_padded) {
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, d_Qy, d_Y, y_ne);
+            // d_Qy already starts at col0 for a chunk; the cache is keyed by tensor, so a chunk does not fill it
+            ggml_vk_quantize_q8_1(ctx, subctx, d_Qy, d_Y, chunk ? (uint32_t) (ne11 * ne10) : y_ne);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
-            ctx->prealloc_y_last_tensor_used = src1;
+            ctx->prealloc_y_last_tensor_used = chunk ? nullptr : src1;
             ctx->prealloc_y_last_k_padded = false;
         }
     }
@@ -7758,6 +7771,15 @@ static bool ggml_vk_mmv_can_chunk(ggml_backend_vk_context * ctx, const ggml_tens
            ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ctx->num_additional_fused_ops == 0;
 }
 
+// An exact batch wider than mul_mat_vec_max_cols is split into mat-vec chunks for any type.
+// The llama graphs only set the hint for n_tokens <= 16.
+static bool ggml_vk_mmv_exact_batch_chunk(ggml_backend_vk_context * ctx, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return ggml_vk_mul_mat_exact_batch(dst) &&
+           dst->ne[1] > mul_mat_vec_max_cols && dst->ne[1] <= mul_mat_vec_chunk_max_cols &&
+           src1->ne[2] * src1->ne[3] == 1 && src1->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && ctx->num_additional_fused_ops == 0;
+}
+
 static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, bool swap_inputs = false) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     if (swap_inputs) {
@@ -7773,11 +7795,13 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
                        src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                        ctx->num_additional_fused_ops == 0;
     GGML_ASSERT(ne11 <= mul_mat_vec_max_cols || plain);
-    if (!no_split && plain && std::min(ggml_vk_mmv_good_cols(src0->type, ne11), mul_mat_vec_max_cols) < ne11) {
+    // An exact batch keeps n == 1's integer-dot choice in every chunk and is always split past mul_mat_vec_max_cols.
+    const bool exact_batch = ggml_vk_mul_mat_exact_batch(dst);
+    if ((!no_split || ne11 > mul_mat_vec_max_cols) && plain && std::min(ggml_vk_mmv_good_cols(src0->type, ne11), mul_mat_vec_max_cols) < ne11) {
         uint32_t col0 = 0;
         while (col0 < ne11) {
             const uint32_t n = std::min(ggml_vk_mmv_good_cols(src0->type, ne11 - col0), mul_mat_vec_max_cols);
-            ggml_vk_mul_mat_vec_q_f16_cols(ctx, subctx, cgraph, node_idx, col0, n, /*allow_quantize_y=*/ false);
+            ggml_vk_mul_mat_vec_q_f16_cols(ctx, subctx, cgraph, node_idx, col0, n, /*allow_quantize_y=*/ exact_batch);
             col0 += n;
         }
         return;
@@ -8260,7 +8284,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     // (up to mul_mat_vec_max_cols, e.g. a [k, 4] f32 projection over a whole ubatch), the
     // src0 rows become the mat-vec columns and the result is transposed into dst, instead
     // of padding a tiny M to a full mul_mm tile.
-    } else if (ctx->num_additional_fused_ops == 0 &&
+    } else if (ctx->num_additional_fused_ops == 0 && !ggml_vk_mul_mat_exact_batch(dst) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
                (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16 || ggml_is_quantized(src1->type)) &&
                dst->ne[0] <= mul_mat_vec_max_cols && dst->ne[1] > mul_mat_vec_max_cols &&
@@ -8275,7 +8299,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1) ||
-                ggml_vk_mmv_can_chunk(ctx, src0, src1, dst)) &&
+                ggml_vk_mmv_can_chunk(ctx, src0, src1, dst) || ggml_vk_mmv_exact_batch_chunk(ctx, src1, dst)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
