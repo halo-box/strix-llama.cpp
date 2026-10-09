@@ -93,7 +93,7 @@ enum ggml_status ggml_tallocr_alloc(struct ggml_tallocr * talloc, struct ggml_te
 
 // dynamic tensor allocator
 
-#define GGML_VBUFFER_MAX_CHUNKS 16
+#define GGML_VBUFFER_INITIAL_CHUNKS 16
 
 // relative memory address within an allocation that can be split into multiple buffers (chunks)
 struct buffer_address {
@@ -121,8 +121,9 @@ struct tallocr_chunk {
 struct ggml_dyn_tallocr {
     size_t alignment;
     size_t max_chunk_size;
-    struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
+    struct tallocr_chunk ** chunks; // [cap_chunks], grown on demand
     int n_chunks;
+    int cap_chunks;
 
 #ifdef GGML_ALLOCATOR_DEBUG
     struct {
@@ -158,20 +159,23 @@ static void ggml_dyn_tallocr_remove_block(struct tallocr_chunk * chunk, int idx)
 }
 
 static int ggml_dyn_tallocr_new_chunk(struct ggml_dyn_tallocr * alloc, size_t min_size) {
-    if (alloc->n_chunks >= GGML_VBUFFER_MAX_CHUNKS) {
-        return -1;
+    // The chunk list grows as needed. It used to be a fixed array of 16 whose last chunk was unbounded, so a
+    // compute buffer of more than ~16 chunks (16 GiB with Vulkan's 1 GiB chunks) packed everything left into
+    // one oversized chunk that the backend then refused (past RADV's 4 GiB buffer limit, issue 22).
+    if (alloc->n_chunks == alloc->cap_chunks) {
+        const int cap = alloc->cap_chunks ? 2*alloc->cap_chunks : GGML_VBUFFER_INITIAL_CHUNKS;
+        struct tallocr_chunk ** chunks = (struct tallocr_chunk **) realloc(alloc->chunks, cap*sizeof(*chunks));
+        if (chunks == NULL) {
+            return -1;
+        }
+        alloc->chunks = chunks;
+        alloc->cap_chunks = cap;
     }
     struct tallocr_chunk * chunk = calloc(1, sizeof(struct tallocr_chunk));
     chunk->n_free_blocks = 1;
     chunk->free_blocks[0].offset = 0;
-    // available space in a chunk is limited to max_chunk_size, but can be higher if:
-    // 1. a single tensor exceeds the maximum, and cannot fit any other way
-    // 2. we are running out of chunks
-    // backends will either manage to allocate the larger size, or report an error.
+    // available space in a chunk is limited to max_chunk_size, unless a single tensor exceeds it
     chunk->free_blocks[0].size = MAX(min_size, alloc->max_chunk_size);
-    if (alloc->n_chunks == GGML_VBUFFER_MAX_CHUNKS - 1) {
-        chunk->free_blocks[0].size = SIZE_MAX/2;
-    }
     alloc->chunks[alloc->n_chunks] = chunk;
     alloc->n_chunks++;
     return alloc->n_chunks - 1;
@@ -252,7 +256,7 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
         best_fit_block = 0;
     }
     if (best_fit_chunk == -1) {
-        // since the last chunk always has virtually endless memory, this should never happen
+        // only reached if the chunk list itself cannot grow
         GGML_LOG_ERROR("%s: not enough space in the buffer to allocate %zu bytes, largest block available %zu bytes\n",
             __func__, size, max_avail);
         GGML_ABORT("graph allocation: failed to reserve memory");
@@ -350,7 +354,7 @@ static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct 
 }
 
 static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
-    for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; i++) {
+    for (int i = 0; i < alloc->n_chunks; i++) {
         free(alloc->chunks[i]);
         alloc->chunks[i] = NULL;
     }
@@ -369,8 +373,9 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
     *alloc = (struct ggml_dyn_tallocr) {
         /*.alignment      = */ alignment,
         /*.max_chunk_size = */ MIN(max_buffer_size, SIZE_MAX/2), // clamp to avoid overflows
-        /*.chunks         = */ {NULL},
+        /*.chunks         = */ NULL,
         /*.n_chunks       = */ 0,
+        /*.cap_chunks     = */ 0,
 #ifdef GGML_ALLOCATOR_DEBUG
         /*.allocated_tensors = */ {{0}},
 #endif
@@ -385,6 +390,7 @@ static void ggml_dyn_tallocr_free(struct ggml_dyn_tallocr * alloc) {
     for (int i = 0; i < alloc->n_chunks; ++i) {
         free(alloc->chunks[i]);
     }
+    free(alloc->chunks);
     free(alloc);
 }
 
@@ -396,26 +402,45 @@ static size_t ggml_dyn_tallocr_max_size(struct ggml_dyn_tallocr * alloc, int chu
 // virtual buffer with contiguous memory range, split into multiple backend buffers (chunks)
 
 struct vbuffer {
-    ggml_backend_buffer_t chunks[GGML_VBUFFER_MAX_CHUNKS];
+    ggml_backend_buffer_t * chunks; // [n_chunks]
+    int n_chunks;
 };
 
 static void ggml_vbuffer_free(struct vbuffer * buf) {
     if (buf == NULL) {
         return;
     }
-    for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; ++i) {
+    for (int i = 0; i < buf->n_chunks; ++i) {
         ggml_backend_buffer_free(buf->chunks[i]);
     }
+    free(buf->chunks);
     free(buf);
 }
 
+// make room for n chunks (new slots are empty)
+static bool ggml_vbuffer_reserve_chunks(struct vbuffer * buf, int n) {
+    if (n <= buf->n_chunks) {
+        return true;
+    }
+    ggml_backend_buffer_t * chunks = (ggml_backend_buffer_t *) realloc(buf->chunks, n*sizeof(*chunks));
+    if (chunks == NULL) {
+        return false;
+    }
+    for (int i = buf->n_chunks; i < n; ++i) {
+        chunks[i] = NULL;
+    }
+    buf->chunks = chunks;
+    buf->n_chunks = n;
+    return true;
+}
+
 static size_t ggml_vbuffer_chunk_size(struct vbuffer * buf, int chunk) {
-    return buf->chunks[chunk] ? ggml_backend_buffer_get_size(buf->chunks[chunk]) : 0;
+    return chunk < buf->n_chunks && buf->chunks[chunk] ? ggml_backend_buffer_get_size(buf->chunks[chunk]) : 0;
 }
 
 static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     size_t size = 0;
-    for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS && buf->chunks[i]; ++i) {
+    for (int i = 0; i < buf->n_chunks && buf->chunks[i]; ++i) {
         size += ggml_backend_buffer_get_size(buf->chunks[i]);
     }
     return size;
@@ -424,6 +449,10 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
 static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
+        return NULL;
+    }
+    if (!ggml_vbuffer_reserve_chunks(buf, talloc->n_chunks)) {
+        free(buf);
         return NULL;
     }
 
@@ -446,7 +475,7 @@ static void ggml_vbuffer_tensor_alloc(struct vbuffer * buf, struct ggml_tensor *
 }
 
 static void ggml_vbuffer_reset(struct vbuffer * buf) {
-    for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS && buf->chunks[i]; ++i) {
+    for (int i = 0; i < buf->n_chunks && buf->chunks[i]; ++i) {
         ggml_backend_buffer_reset(buf->chunks[i]);
     }
 }
