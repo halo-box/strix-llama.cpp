@@ -3363,6 +3363,14 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // --spec-draft-max-slots: with many slots generating, start no new drafts
+        int n_generating = 0;
+        iterate(slots, [&](server_slot & slot) {
+            n_generating += slot.state == SLOT_STATE_GENERATING;
+        });
+        const int  spec_max_slots = params_base.speculative.draft.max_slots;
+        const bool spec_new_ok    = spec_max_slots <= 0 || n_generating <= spec_max_slots;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3394,7 +3402,7 @@ private:
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
-                    } else {
+                    } else if (spec_new_ok) {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
                         slot.spec_ckpt.update_pos(
