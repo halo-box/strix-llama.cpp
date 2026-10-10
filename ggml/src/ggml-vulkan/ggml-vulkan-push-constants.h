@@ -570,6 +570,19 @@ struct vk_op_topk_push_constants {
     uint32_t last_pass;
 };
 
+// QSA_BLOCK_SELECT (A2): one dispatch per strip for qwen4exp's maskless block selection
+struct vk_op_qsa_block_select_push_constants {
+    uint32_t n_blocks;
+    uint32_t budget;
+    uint32_t n_query;
+    uint32_t n_stream;
+    uint32_t r;
+    uint32_t width;       // r*budget + r-1
+    uint32_t c_stride_s;  // block cells: elements per stream
+    uint32_t t_stride_q;  // tail: elements per query
+    uint32_t t_stride_s;  // tail: elements per stream
+};
+
 struct vk_op_topk_radix_push_constants {
     uint32_t ncols;
     uint32_t k;
