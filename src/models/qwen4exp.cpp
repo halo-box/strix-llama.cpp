@@ -1629,7 +1629,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    // read the recurrent state in place when no row is copied (e3f31cf6d gave qwen35 this; qwen4exp never enabled it): the
+    // per-layer GET_ROWS of the 3 MB state per token goes away, the write-back of the new state stays
+    // LLAMA_GDN_INPLACE=0 restores the copied state read (A/B switch; the in-place read is the default)
+    static const bool gdn_inplace = [] { const char * e = getenv("LLAMA_GDN_INPLACE"); return e == nullptr || atoi(e) != 0; }();
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, ggml_get_rows, /*allow_inplace=*/gdn_inplace);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
