@@ -18,6 +18,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #endif
 
+#ifdef D16
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
+
 #include "types.glsl"
 
 #if defined(DATA_A_Q3_K) || defined(DATA_A_Q6_K) || defined(DATA_A_NVFP4)
@@ -37,6 +41,10 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 #endif
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+#ifdef D16
+// f16 output: pairs of adjacent rows go out as one 32-bit store
+layout (binding = 2) writeonly buffer D2 {f16vec2 data_d2[];};
+#endif
 
 #ifndef D16
 // f32 output: four adjacent rows of a column go out as one 128-bit store
@@ -48,6 +56,12 @@ layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer RowMap {uint data_row_map[];};
 // MUL_MAT_ID + MUL(router weights) epilogue: one f32 weight per (expert slot, token), [1, nei0, nei1] contiguous
 layout (binding = 5) readonly buffer FusedScale {float data_fscale[];};
+#ifdef GLU_UP
+// MUL_MAT_ID+CPY(f16)+SWIGLU: the store writes silu(gate) * up, with the other projection (f16, laid out like D) read
+// here; MMID_GLU_ACC_GATE set: this GEMM is the gate projection, clear: it is the up projection
+layout (binding = 6) readonly buffer UP {float16_t data_up[];};
+layout (binding = 6) readonly buffer UP2 {f16vec2 data_up2[];};
+#endif
 #endif
 
 layout (push_constant) uniform parameter
@@ -171,6 +185,7 @@ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, 
 }
 
 #ifdef MUL_MAT_ID
+#define MMID_GLU_ACC_GATE  8u   // fusion_flags bit 3: the SwiGLU epilogue's GEMM is the gate projection
 #include "mul_mm_id_funcs.glsl"
 #endif
 
@@ -482,7 +497,7 @@ void main() {
     const uint dc = ic * BN + b_col0;
 
 #ifdef MUL_MAT_ID
-    const bool scale_rows = p.fusion_flags != 0;
+    const bool scale_rows = (p.fusion_flags & 1u) != 0;
 #ifndef D16
     if (PACK_F32 != 0) {
         if ((p.stride_d % 4) == 0 && (p.batch_stride_d % 4) == 0) {
@@ -512,6 +527,59 @@ void main() {
         }
     }
 #endif
+#ifdef D16
+    // f16 output (MUL_MAT_ID(+MUL)+CPY(f16)): the RDNA3/3.5 wave32 accumulator pairing of the dense f16 store
+    // below, one f16vec2 per two adjacent rows of an (expert slot, token) column, both scaled by its weight
+    bool packed_id = false;
+    if (DEVICE_ARCH != VK_ARCH_AMD_RDNA4) {
+        if (WARP == 32) {
+            if (TN == 16) {
+                packed_id = (p.stride_d % 2) == 0 && (p.batch_stride_d % 2) == 0;
+            }
+        }
+    }
+    if (packed_id) {
+        const bool lo_half = gl_SubgroupInvocationID < 16;
+        [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+            [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                const uint tile_idx = r * cms_per_col + c;
+                const uint col_i = dc + c * TN + elem_col0;
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; e += 2) {
+                    const float own0 = float(sums[tile_idx * CM_ELEMS + e]);
+                    const float own1 = float(sums[tile_idx * CM_ELEMS + e + 1]);
+                    const float recv = subgroupShuffleXor(lo_half ? own1 : own0, 16);
+                    const uint row_g = dr + r * TM + 2u * e + (lo_half ? 0u : 2u);
+                    const vec2 v = lo_half ? vec2(own0, recv) : vec2(recv, own1);
+                    if (col_i < _ne1) {
+                        const u16vec2 row_idx = row_ids[col_i - ic * BN];
+                        const float w = scale_rows ? data_fscale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)] : 1.0;
+                        const uint idx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g;
+#ifdef GLU_UP
+                        const bool acc_gate = (p.fusion_flags & MMID_GLU_ACC_GATE) != 0;
+                        if (row_g + 1 < p.M) {
+                            const vec2 o = vec2(data_up2[idx / 2]);
+                            const vec2 g = acc_gate ? v : o;
+                            const vec2 u = acc_gate ? o : v;
+                            data_d2[idx / 2] = f16vec2(g.x / (1.0f + exp(-g.x)) * u.x, g.y / (1.0f + exp(-g.y)) * u.y);
+                        } else if (row_g < p.M) {
+                            const float o = float(data_up[idx]);
+                            const float g = acc_gate ? v.x : o;
+                            data_d[idx] = float16_t(g / (1.0f + exp(-g)) * (acc_gate ? o : v.x));
+                        }
+#else
+                        if (row_g + 1 < p.M) {
+                            data_d2[idx / 2] = f16vec2(v * w);
+                        } else if (row_g < p.M) {
+                            data_d[idx] = float16_t(v.x * w);
+                        }
+#endif
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
     [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
         [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
             const uint tile_idx = r * cms_per_col + c;
@@ -528,12 +596,59 @@ void main() {
                 if (scale_rows) {
                     val *= data_fscale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)];
                 }
+#ifdef GLU_UP
+                {
+                    const float o = float(data_up[store_offset]);
+                    const bool acc_gate = (p.fusion_flags & MMID_GLU_ACC_GATE) != 0;
+                    const float g = acc_gate ? val : o;
+                    val = g / (1.0f + exp(-g)) * (acc_gate ? o : val);
+                }
+#endif
                 data_d[store_offset] = D_TYPE(val);
             }
         }
     }
 #else
     const uint offsets = batch_idx * p.batch_stride_d + ik * p.batch_stride_d * p.num_batches;
+
+#ifdef D16
+    // RDNA3/3.5 wave32 accumulator: lane l holds column l % 16, rows (l / 16) + 2e. One shuffle with the lane
+    // 16 away gives each lane two adjacent rows of its column: the low half stores rows 2e, 2e+1 and the high
+    // half rows 2e+2, 2e+3, so every lane writes one f16vec2 per element pair instead of two 16-bit values.
+    bool packed = false;
+    if (DEVICE_ARCH != VK_ARCH_AMD_RDNA4) {
+        if (WARP == 32) {
+            if (TN == 16) {
+                packed = (p.stride_d % 2) == 0 && (offsets % 2) == 0;
+            }
+        }
+    }
+    if (packed) {
+        const bool lo_half = gl_SubgroupInvocationID < 16;
+        [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+            [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                const uint tile_idx = r * cms_per_col + c;
+                const uint col_g = dc + c * TN + elem_col0;
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; e += 2) {
+                    const float own0 = float(sums[tile_idx * CM_ELEMS + e]);
+                    const float own1 = float(sums[tile_idx * CM_ELEMS + e + 1]);
+                    const float recv = subgroupShuffleXor(lo_half ? own1 : own0, 16);
+                    const uint row_g = dr + r * TM + 2u * e + (lo_half ? 0u : 2u);
+                    const vec2 v = lo_half ? vec2(own0, recv) : vec2(recv, own1);
+                    if (col_g < p.N) {
+                        const uint idx = offsets + col_g * p.stride_d + row_g;
+                        if (row_g + 1 < p.M) {
+                            data_d2[idx / 2] = f16vec2(v);
+                        } else if (row_g < p.M) {
+                            data_d[idx] = float16_t(v.x);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
 
 #ifndef D16
     if (PACK_F32 != 0) {

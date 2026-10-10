@@ -2836,6 +2836,26 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_k, "matmul_nvfp4_q8_1",  matmul_nvfp4_q8_1_cm1_len,  matmul_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3); }
         }
 
+        // f16-output twins of the dense int8 MMQ pipelines, for the MUL_MAT+CPY(f16) fusion
+        if (device->coopmat_int_support && (rdna3 || rdna4)) {
+#define CM1_MMQ_D16(TYPE, tstr, TC) \
+            cm1_create_mmq({TYPE, GGML_TYPE_Q8_1, false, false, true}, TC, "matmul_" #tstr "_q8_1_d16", matmul_##tstr##_q8_1_d16_cm1_len, matmul_##tstr##_q8_1_d16_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
+            CM1_MMQ_D16(GGML_TYPE_Q4_0,   q4_0,   tc_mmq_cm1_int)
+            if (!rdna4) { CM1_MMQ_D16(GGML_TYPE_Q4_1, q4_1, tc_mmq_cm1_int) }
+            CM1_MMQ_D16(GGML_TYPE_Q5_0,   q5_0,   tc_mmq_cm1_int)
+            if (!rdna4) { CM1_MMQ_D16(GGML_TYPE_Q5_1, q5_1, tc_mmq_cm1_int) }
+            CM1_MMQ_D16(GGML_TYPE_Q8_0,   q8_0,   tc_mmq_cm1_int)
+            CM1_MMQ_D16(GGML_TYPE_IQ4_NL, iq4_nl, tc_mmq_cm1_int)
+            CM1_MMQ_D16(GGML_TYPE_IQ4_XS, iq4_xs, tc_mmq_cm1_int)
+            CM1_MMQ_D16(GGML_TYPE_MXFP4,  mxfp4,  tc_mmq_cm1_int)
+            CM1_MMQ_D16(GGML_TYPE_Q3_K,   q3_k,   tc_mmq_cm1_int_k)
+            if (!rdna4) { CM1_MMQ_D16(GGML_TYPE_Q4_K, q4_k, tc_mmq_cm1_int) }
+            if (!rdna4) { CM1_MMQ_D16(GGML_TYPE_Q5_K, q5_k, tc_mmq_cm1_int) }
+            CM1_MMQ_D16(GGML_TYPE_Q6_K,   q6_k,   tc_mmq_cm1_int_k)
+            if (!rdna4) { CM1_MMQ_D16(GGML_TYPE_NVFP4, nvfp4, tc_mmq_cm1_int_k) }
+#undef CM1_MMQ_D16
+        }
+
         GGML_ASSERT(device->subgroup_ballot);
 
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, true, false}, tc_mm, "matmul_id_subgroup_f32_f32", matmul_id_subgroup_f32_f32_cm1_len, matmul_id_subgroup_f32_f32_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
@@ -2907,7 +2927,59 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create_mmq({GGML_TYPE_Q5_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q5_k_q8_1",   matmul_id_subgroup_q5_k_q8_1_cm1_len,   matmul_id_subgroup_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
             cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_q6_k_q8_1",   matmul_id_subgroup_q6_k_q8_1_cm1_len,   matmul_id_subgroup_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_nvfp4_q8_1",  matmul_id_subgroup_nvfp4_q8_1_cm1_len,  matmul_id_subgroup_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); }
+
+            // f16-output twins for the MUL_MAT_ID(+MUL)+CPY(f16) fusions (same six bindings: router weights)
+#define CM1_MMQ_ID_D16(TYPE, tstr, TC) \
+            cm1_create_mmq({TYPE, GGML_TYPE_Q8_1, true, false, true}, TC, "matmul_id_subgroup_" #tstr "_q8_1_d16", matmul_id_subgroup_##tstr##_q8_1_d16_cm1_len, matmul_id_subgroup_##tstr##_q8_1_d16_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
+            CM1_MMQ_ID_D16(GGML_TYPE_Q4_0,   q4_0,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_D16(GGML_TYPE_Q4_1,   q4_1,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_D16(GGML_TYPE_Q5_0,   q5_0,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_D16(GGML_TYPE_Q5_1,   q5_1,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_D16(GGML_TYPE_Q8_0,   q8_0,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_D16(GGML_TYPE_IQ4_NL, iq4_nl, tc_mmq_cm1_int)
+            CM1_MMQ_ID_D16(GGML_TYPE_IQ4_XS, iq4_xs, tc_mmq_cm1_int)
+            CM1_MMQ_ID_D16(GGML_TYPE_MXFP4,  mxfp4,  tc_mmq_cm1_int)
+            CM1_MMQ_ID_D16(GGML_TYPE_Q3_K,   q3_k,   tc_mmq_cm1_int_k)
+            CM1_MMQ_ID_D16(GGML_TYPE_Q4_K,   q4_k,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_D16(GGML_TYPE_Q5_K,   q5_k,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_D16(GGML_TYPE_Q6_K,   q6_k,   tc_mmq_cm1_int_k)
+            if (!rdna4) { CM1_MMQ_ID_D16(GGML_TYPE_NVFP4, nvfp4, tc_mmq_cm1_int_k) }
+#undef CM1_MMQ_ID_D16
+            // the gate projection with the SwiGLU in the f16 store: a seventh binding carries the up projection
+#define CM1_MMQ_ID_GLU(TYPE, tstr, TC) \
+            cm1_create_mmq({TYPE, GGML_TYPE_Q8_1, true, false, true, true}, TC, "matmul_id_subgroup_" #tstr "_q8_1_d16_glu", matmul_id_subgroup_##tstr##_q8_1_d16_glu_cm1_len, matmul_id_subgroup_##tstr##_q8_1_d16_glu_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count + 1);
+            CM1_MMQ_ID_GLU(GGML_TYPE_Q4_0,   q4_0,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_GLU(GGML_TYPE_Q4_1,   q4_1,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_GLU(GGML_TYPE_Q5_0,   q5_0,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_GLU(GGML_TYPE_Q5_1,   q5_1,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_GLU(GGML_TYPE_Q8_0,   q8_0,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_GLU(GGML_TYPE_IQ4_NL, iq4_nl, tc_mmq_cm1_int)
+            CM1_MMQ_ID_GLU(GGML_TYPE_IQ4_XS, iq4_xs, tc_mmq_cm1_int)
+            CM1_MMQ_ID_GLU(GGML_TYPE_MXFP4,  mxfp4,  tc_mmq_cm1_int)
+            CM1_MMQ_ID_GLU(GGML_TYPE_Q3_K,   q3_k,   tc_mmq_cm1_int_k)
+            CM1_MMQ_ID_GLU(GGML_TYPE_Q4_K,   q4_k,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_GLU(GGML_TYPE_Q5_K,   q5_k,   tc_mmq_cm1_int)
+            CM1_MMQ_ID_GLU(GGML_TYPE_Q6_K,   q6_k,   tc_mmq_cm1_int_k)
+            if (!rdna4) { CM1_MMQ_ID_GLU(GGML_TYPE_NVFP4, nvfp4, tc_mmq_cm1_int_k) }
+#undef CM1_MMQ_ID_GLU
         }
+
+        // f16-output MUL_MAT_ID for the IQ1-IQ3 expert GEMMs (f32 B, KHR coopmat; no int8 MMQ pipeline), MUL_MAT_ID+CPY(f16)
+#define X_CM1_ID_D16(TYPE, tstr) \
+        if (device->coopmat_acc_f16_support) { \
+            cm1_create({TYPE, GGML_TYPE_F32, true, true, true},  tc_mmq_id, "matmul_id_subgroup_" #tstr "_f32_d16_f16acc", matmul_id_subgroup_##tstr##_f32_d16_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f32_d16_f16acc_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
+        } \
+        if (device->coopmat_acc_f32_support) { \
+            cm1_create({TYPE, GGML_TYPE_F32, true, false, true}, tc_mmq_id, "matmul_id_subgroup_" #tstr "_f32_d16",        matmul_id_subgroup_##tstr##_f32_d16_cm1_len,        matmul_id_subgroup_##tstr##_f32_d16_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
+        }
+        X_CM1_ID_D16(GGML_TYPE_IQ1_S,   iq1_s)
+        X_CM1_ID_D16(GGML_TYPE_IQ1_M,   iq1_m)
+        X_CM1_ID_D16(GGML_TYPE_IQ2_XXS, iq2_xxs)
+        X_CM1_ID_D16(GGML_TYPE_IQ2_XS,  iq2_xs)
+        X_CM1_ID_D16(GGML_TYPE_IQ2_S,   iq2_s)
+        X_CM1_ID_D16(GGML_TYPE_IQ3_XXS, iq3_xxs)
+        X_CM1_ID_D16(GGML_TYPE_IQ3_S,   iq3_s)
+#undef X_CM1_ID_D16
     } else
 #endif  // defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     {
@@ -3634,8 +3706,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
+        ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4_f16, "quantize_q8_1_x4_f16", quantize_q8_1_x4_f16_subgroup_len, quantize_q8_1_x4_f16_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_len, quantize_q8_1_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4_f16, "quantize_q8_1_x4_f16", quantize_q8_1_x4_f16_len, quantize_q8_1_x4_f16_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
     }
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
@@ -3785,6 +3859,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         for (uint32_t i = 0; i < MAX_FUSED_ADDS; ++i) {
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add[i],     "multi_add_f32_"     + std::to_string(i+1), multi_add_f32_len,     multi_add_f32_data,     "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
             ggml_vk_create_pipeline2(device, device->pipeline_multi_add_rms[i], "multi_add_rms_f32_" + std::to_string(i+1), multi_add_rms_f32_len, multi_add_rms_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
+            ggml_vk_create_pipeline2(device, device->pipeline_multi_add_f16in[i], "multi_add_f16in_f32_" + std::to_string(i+1), multi_add_f16in_f32_len, multi_add_f16in_f32_data, "main", MAX_PARAMETER_COUNT, sizeof(vk_op_multi_add_push_constants), {512, 1, 1}, {i+2}, 1);
         }
     }
 
@@ -4022,6 +4097,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_x16_f32, "dsv4_hc_pre_gated_x16_f32", dsv4_hc_pre_x_f16_len, dsv4_hc_pre_x_f16_data, "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants), {256, 1, 1}, { 256, 1 }, 1);
+    if (device->subgroup_arithmetic) {
+        // one 256-thread workgroup per (stream, token) row; the f16 variants store the norm as f16 (CPY f16 fused)
+        for (uint32_t has_post = 0; has_post < 2; ++has_post) {
+            ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm[has_post][0], has_post ? "dsv4_hc_post_norm_f32" : "dsv4_rms_norm_mul_rows_f32",
+                dsv4_hc_post_norm_f32_len, dsv4_hc_post_norm_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { has_post }, 1);
+            if (device->fp16) {
+                ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm[has_post][1], has_post ? "dsv4_hc_post_norm_f16" : "dsv4_rms_norm_mul_rows_f16",
+                    dsv4_hc_post_norm_f16_len, dsv4_hc_post_norm_f16_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { has_post }, 1);
+            }
+        }
+    }
 
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
@@ -6587,9 +6674,9 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
 }
 
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
-        ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false) {
+        ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false, bool d16 = false, bool glu = false) {
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
-    vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc};
+    vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc, d16, glu};
     auto it = ctx->device->pipeline_matmul.find(key);
     if (it == ctx->device->pipeline_matmul.end() || it->second.empty()) {
         // Try without f16acc
@@ -6632,16 +6719,25 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        uint32_t row_ids_offset, uint32_t max_tiles, const vk_subbuffer & fused_scale, uint32_t fusion_flags) {
+        uint32_t row_ids_offset, uint32_t max_tiles, const vk_subbuffer & fused_scale, uint32_t fusion_flags,
+        const vk_subbuffer * glu_up = nullptr, bool glu_acc_gate = false) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
+    // fusion_flags bit 0: scale rows by the router weights (MUL_MAT_ID + MUL); bit 3 (int8 MMQ SwiGLU epilogue only): this GEMM
+    // is the gate projection, else the up projection
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, n_as, row_ids_offset, fusion_flags };
+                                              nei0, nei1, nbi1, ne11, n_as, row_ids_offset, fusion_flags | (glu_up && glu_acc_gate ? 8u : 0u) };
     const uint32_t tiles_y = std::min(max_tiles, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
     const std::array<uint32_t, 3> elements = { m, tiles_y * pipeline->wg_denoms[1], uint32_t(CEIL_DIV(max_tiles, tiles_y)) };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc, elements);
+    if (glu_up != nullptr) {
+        // SwiGLU epilogue (int8 MMQ only): the other projection is the 7th binding, after the router weights
+        GGML_ASSERT((fusion_flags & 1u) == 0 && pipeline->parameter_count == 7);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale, *glu_up }, pc, elements);
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc, elements);
+    }
 }
 
 bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
@@ -6867,20 +6963,20 @@ static void ggml_vk_cpy_to_strided(
     ggml_vk_sync_buffers(ctx, subctx);
 }
 
-vk_pipeline ggml_vk_get_quantize_pipeline(ggml_backend_vk_context * ctx, ggml_type type) {
+vk_pipeline ggml_vk_get_quantize_pipeline(ggml_backend_vk_context * ctx, ggml_type type, ggml_type src_type) {
     switch(type) {
         case GGML_TYPE_Q8_1:
-            return ctx->device->pipeline_quantize_q8_1_x4;
+            return src_type == GGML_TYPE_F16 ? ctx->device->pipeline_quantize_q8_1_x4_f16 : ctx->device->pipeline_quantize_q8_1_x4;
         default:
             std::cerr << "Missing quantize pipeline for type: " << ggml_type_name(type) << std::endl;
             GGML_ABORT("fatal error");
     }
 }
 
-void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne) {
+void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne, ggml_type src_type) {
     VK_LOG_DEBUG("ggml_vk_quantize_q8_1(" << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ", " << ne << ")");
 
-    vk_pipeline pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    vk_pipeline pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1, src_type);
 
     const uint32_t num_blocks = CEIL_DIV(ne, pipeline->wg_denoms[0]);
     // clamp the number of elements to the max workgroup count. The shader will iterate over the total number of blocks.
@@ -6924,7 +7020,20 @@ static ggml_type ggml_vk_mul_mat_b_type(
     return f16_type;
 }
 
-static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
+// DEBUG ONLY (int8-mmq assessment 2026-10-10): GGML_VK_MMQ_F16_Y=0 sends an f16 B to the f16 matmul instead of q8_1, but on this
+// tree that matmul accumulates in f16 (no f32-accumulator gate for the KHR coopmat path yet), so it is a different rounding,
+// not the more precise arm of an A/B. The f32 -> f16 -> q8_1 double rounding it avoids is ~0.3% of the q8_1 noise variance.
+static bool ggml_vk_mmq_f16_y_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMQ_F16_Y");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// out16: the MUL_MAT+CPY(f16) fusion. The result is stored as f16 straight into the cast's destination
+// (contiguous, same shape) by an f16-output int8 MMQ pipeline; dst itself is never written.
+static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, ggml_tensor * out16 = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
@@ -6942,14 +7051,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t ne12 = src1->ne[2];
     const uint64_t ne13 = src1->ne[3];
 
+    const bool d16 = out16 != nullptr;
+    GGML_ASSERT(!d16 || (out16->type == GGML_TYPE_F16 && ggml_is_contiguous(out16) && ggml_are_same_shape(out16, dst)));
+    const ggml_tensor * od = d16 ? out16 : dst;
+
     const uint64_t ne21 = dst->ne[1];
-    const uint32_t stride_d = dst->nb[1] / ggml_type_size(dst->type);
+    const uint32_t stride_d = od->nb[1] / ggml_type_size(od->type);
     const uint32_t stride_batch_d = stride_d*ne21;
 
     const uint64_t r2 = ne12 / ne02;
     const uint64_t r3 = ne13 / ne03;
 
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)od->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
 
@@ -6974,20 +7087,24 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
+    // an f16 B (the f16 activations) is quantized to q8_1 straight from f16 (GGML_VK_MMQ_F16_Y=0: it takes the f16 matmul instead)
+    const bool f16_y = src1->type == GGML_TYPE_F16 && ggml_vk_mmq_f16_y_enabled() && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
     const bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
-                                src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
+                                (src1->type == GGML_TYPE_F32 || f16_y) && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
     const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
                                         (ggml_prec)dst->op_params[0], false, can_quantize_y, prefer_f16_b);
+    // an f16 output exists only on the int8 MMQ path; every fallback below would write f32 into the f16 buffer
+    GGML_ASSERT(!d16 || y_kernel_type == GGML_TYPE_Q8_1);
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
     const bool y_needs_reformat = !quantize_y && (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
-        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0]);
+        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], false, d16);
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
     const bool qy_needs_dequant = y_needs_reformat;
@@ -7015,13 +7132,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+    // the split-K reduce writes f32
+    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || d16, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
-    const uint64_t d_sz = sizeof(float) * d_ne;
+    const uint64_t d_sz = ggml_type_size(od->type) * d_ne;
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -7041,7 +7159,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
 
     if (quantize_y) {
-        to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+        to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1, src1->type);
     }
 
     {
@@ -7081,7 +7199,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    const uint64_t d_buf_offset = vk_tensor_offset(od) + od->view_offs;
     GGML_ASSERT(d_D != nullptr);
     GGML_ASSERT(d_D->size >= d_buf_offset + d_sz);
     vk_buffer d_X;
@@ -7151,7 +7269,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne, src1->type);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_k_padded = false;
@@ -7942,7 +8060,10 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
-    vk_pipeline pipeline = gated ? ctx->device->pipeline_dsv4_hc_pre_gated_f32 : ctx->device->pipeline_dsv4_hc_pre_f32;
+    // supports_op admits an f16 x only for the gated form
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated && x->type == GGML_TYPE_F16));
+    vk_pipeline pipeline = !gated ? ctx->device->pipeline_dsv4_hc_pre_f32 :
+                           x->type == GGML_TYPE_F16 ? ctx->device->pipeline_dsv4_hc_pre_gated_x16_f32 : ctx->device->pipeline_dsv4_hc_pre_gated_f32;
     GGML_ASSERT(pipeline != nullptr);
 
     const uint32_t n_embd   = (uint32_t)x->ne[0];
@@ -8003,6 +8124,67 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
+// Fused hc combine + next hc norm (dsv4_hc_post_norm.comp), selected in ggml_vk_graph_compute:
+//   HC_POST_NORM_GATE:     SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL          (f32 norm)
+//   HC_POST_NORM_GATE_CPY: the same plus CPY(f16) of the MUL                                     (f16 norm)
+//   HC_NORM_ROWS_CPY:      RMS_NORM -> MUL -> CPY(f16), no combine (a mix whose input is not a combine)
+enum {
+    HC_POST_NORM_NONE = 0,
+    HC_POST_NORM_GATE,
+    HC_POST_NORM_GATE_CPY,
+    HC_NORM_ROWS_CPY,
+};
+
+// node_idx: the first fused node (the chain's SCALE, or the RMS_NORM for HC_NORM_ROWS_CPY)
+static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const int  mode     = ctx->fused_hc_post_norm;
+    const bool has_post = mode != HC_NORM_ROWS_CPY;
+    const bool out_f16  = mode != HC_POST_NORM_GATE;
+
+    const ggml_tensor * scale_in = has_post ? cgraph->nodes[node_idx]     : nullptr;
+    ggml_tensor *       hc_post  = has_post ? cgraph->nodes[node_idx + 3] : nullptr;
+    const int r = has_post ? node_idx + 4 : node_idx;
+    const ggml_tensor * rms = cgraph->nodes[r];
+    const ggml_tensor * mul = cgraph->nodes[r + 1];
+    ggml_tensor *       out = cgraph->nodes[r + (out_f16 ? 2 : 1)];
+    GGML_ASSERT(out->type == (out_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32));
+
+    const ggml_tensor * res   = has_post ? hc_post->src[1] : rms->src[0];
+    const ggml_tensor * x     = has_post ? hc_post->src[0] : res;
+    const ggml_tensor * pw    = has_post ? scale_in->src[0] : res;
+    const ggml_tensor * gamma = mul->src[1];
+    const ggml_tensor * o     = has_post ? hc_post : res;
+
+    const uint32_t n_embd = (uint32_t) res->ne[0];
+    const uint32_t hc     = (uint32_t) res->ne[1];
+    const uint32_t nt     = (uint32_t) res->ne[2];
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+
+    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_post_norm[has_post ? 1 : 0][out_f16 ? 1 : 0];
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_dsv4_hc_post_norm_push_constants pc = {
+        n_embd, hc, nt,
+        has_post ? (uint32_t)(x->nb[1] / sizeof(float)) : 0u,
+        (uint32_t)(res->nb[1] / sizeof(float)), (uint32_t)(res->nb[2] / sizeof(float)),
+        has_post ? (uint32_t)(pw->nb[0] / sizeof(float)) : 0u, has_post ? (uint32_t)(pw->nb[1] / sizeof(float)) : 0u,
+        (uint32_t)(gamma->nb[1] / sizeof(float)),
+        has_post ? (uint32_t)(o->nb[1] / sizeof(float)) : 0u, has_post ? (uint32_t)(o->nb[2] / sizeof(float)) : 0u,
+        (uint32_t)(out->nb[1] / ggml_type_size(out->type)), (uint32_t)(out->nb[2] / ggml_type_size(out->type)),
+        eps,
+        has_post ? 1u : 0u,
+        has_post ? ggml_get_op_params_f32(scale_in, 0) : 1.0f,
+        has_post ? ggml_get_op_params_f32(hc_post->src[2], 0) : 1.0f,
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, res), ggml_vk_tensor_subbuffer(ctx, pw),
+          ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, o), ggml_vk_tensor_subbuffer(ctx, out) },
+        pc, { hc * nt, 1, 1 });
+}
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -8015,7 +8197,11 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     // This only supports batchsize == 1.
     const size_t nbytes = ggml_nbytes(src0);
     const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
-    if (needs_split) {
+    if (ctx->fused_mm_cpy16) {
+        // MUL_MAT+CPY(f16): ggml_vk_can_fuse_mm_cpy16 admitted only shapes the int8 MMQ GEMM takes
+        GGML_ASSERT(ctx->num_additional_fused_ops == 1 && !needs_split);
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false, cgraph->nodes[node_idx + 1]);
+    } else if (needs_split) {
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
         const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
         uint32_t m_offset = 0;
@@ -8096,7 +8282,14 @@ static bool ggml_vk_mmid_f16b_enabled() {
     return enabled;
 }
 
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr) {
+
+// fused_scale / fused_dst: the MUL_MAT_ID+MUL fusion (router weights in the epilogue, result in the MUL's destination).
+// out16: the MUL_MAT_ID(+MUL)+CPY(f16) fusions. The result is stored as f16 straight into the cast's destination
+// (contiguous, same shape as dst) by an f16-output pipeline (ggml_vk_mmid_d16_ok); dst itself is never written.
+// glu_up (with out16): the MUL_MAT_ID+CPY(f16)+SWIGLU fusion. The store writes silu(gate) * up into out16, the
+// SWIGLU's destination; glu_up is the other projection (f16, laid out like dst), glu_acc_gate tells whether this
+// GEMM is the gate (true) or the up projection (false).
+static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr, const ggml_tensor * out16 = nullptr, const ggml_tensor * glu_up = nullptr, bool glu_acc_gate = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -8169,7 +8362,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 #else
     const bool y_decode_vector_staging = false;
 #endif
-    const bool can_quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 &&
+    const bool d16 = out16 != nullptr;
+    GGML_ASSERT(!d16 || (out16->type == GGML_TYPE_F16 && ggml_is_contiguous(out16) && ggml_are_same_shape(out16, dst) && ggml_is_contiguous(dst)));
+    const bool glu = glu_up != nullptr;
+    GGML_ASSERT(!glu || (d16 && fused_scale == nullptr && glu_up->type == GGML_TYPE_F16 && ggml_is_contiguous(glu_up) && ggml_are_same_shape(glu_up, dst)));
+
+    // an f16 B (the f16 MoE activations) is quantized to q8_1 straight from f16 (GGML_VK_MMQ_F16_Y=0: f16 matmul)
+    const bool f16_y = src1->type == GGML_TYPE_F16 && ggml_vk_mmq_f16_y_enabled() && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
+    const bool can_quantize_y = ctx->device->integer_dot_product && (src1->type == GGML_TYPE_F32 || f16_y) &&
                                 ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
     // Intel coopmat1 matrix cores prefer f16 activations for quantized weights
     const bool prefer_f16_b = ctx->device->coopmat_support && !ctx->device->coopmat2 &&
@@ -8200,9 +8400,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const bool y_f32_kernel = y_kernel_type == GGML_TYPE_F32;
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
-        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], true);
+        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], true, d16, glu);
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
+    // an f16 output exists only for these two pipeline families; any dequant fallback would write f32 into the f16 buffer
+    GGML_ASSERT(!d16 || (!qx_needs_dequant && (quantize_y || y_f32_kernel)));
 
     if (qx_needs_dequant) {
         // dequant src0 to f16
@@ -8263,7 +8465,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const uint64_t qy_sz = ggml_type_size(src1->type) * ggml_nelements(src1) / ggml_blck_size(src1->type);
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
-    const uint64_t d_sz = sizeof(float) * d_ne;
+    const uint64_t d_sz = (d16 ? sizeof(ggml_fp16_t) : sizeof(float)) * d_ne;
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -8300,7 +8502,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
 
     if (quantize_y) {
-        to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+        to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1, src1->type);
     }
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
 
@@ -8339,8 +8541,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
     }
 
-    vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(out_dst) + out_dst->view_offs;
+    const ggml_tensor * od = d16 ? out16 : out_dst;
+    vk_buffer d_D = ((ggml_backend_vk_buffer_context *)od->buffer->context)->dev_buffer;
+    const uint64_t d_buf_offset = vk_tensor_offset(od) + od->view_offs;
     GGML_ASSERT(d_D != nullptr);
     vk_buffer d_X;
     uint64_t x_buf_offset = 0;
@@ -8445,7 +8648,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne);
+            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne, src1->type);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_k_padded = false;
@@ -8468,6 +8671,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
+    vk_subbuffer d_glu_up;
+    if (glu) {
+        d_glu_up = ggml_vk_tensor_subbuffer(ctx, glu_up);
+    }
+
     // compute
     ggml_vk_matmul_id(
         ctx, subctx, pipeline,
@@ -8477,7 +8685,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         stride_batch_x, stride_batch_y, ne20*ne21,
         n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, row_ids_offset, max_tiles,
         fused_scale ? ggml_vk_tensor_subbuffer(ctx, fused_scale) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
-        fused_scale ? 1u : 0u
+        fused_scale ? 1u : 0u,
+        glu ? &d_glu_up : nullptr, glu_acc_gate
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -8742,7 +8951,25 @@ void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * src2 = dst->src[2];
     VK_LOG_DEBUG("ggml_vk_mul_mat_id(" << src0 << ", " << src1 << ", " << src2 << ", " << dst << ")");
-    if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
+    if (ctx->fused_mmid_cpy16) {
+        // MUL_MAT_ID(+MUL)+CPY(f16): ggml_vk_mmid_d16_ok admitted only GEMM shapes on a pipeline with an f16 twin
+        const ggml_tensor * cpy = cgraph->nodes[node_idx + (ctx->fused_mmid_glu ? 1 : ctx->num_additional_fused_ops)];
+        GGML_ASSERT(!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx) && cpy->op == GGML_OP_CPY);
+        if (ctx->fused_mmid_glu) {
+            // MUL_MAT_ID+CPY(f16)+SWIGLU: the last node is the SWIGLU, written with silu(gate) * up
+            const ggml_tensor * glu = cgraph->nodes[node_idx + 2];
+            GGML_ASSERT(ctx->num_additional_fused_ops == 2 && glu->op == GGML_OP_GLU);
+            const bool acc_gate = glu->src[0] == cpy;
+            ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, nullptr, nullptr, glu, acc_gate ? glu->src[1] : glu->src[0], acc_gate);
+        } else if (ctx->num_additional_fused_ops == 2) {
+            ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+            GGML_ASSERT(mul->op == GGML_OP_MUL && (mul->src[0] == dst || mul->src[1] == dst));
+            ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, mul->src[0] == dst ? mul->src[1] : mul->src[0], mul, cpy);
+        } else {
+            GGML_ASSERT(ctx->num_additional_fused_ops == 1);
+            ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, nullptr, nullptr, cpy);
+        }
+    } else if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
         // Fused scale epilogue: the MUL's other operand is applied as the matmul writes out,
@@ -10656,6 +10883,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         case GGML_OP_ADD:
         {
             if (ctx->num_additional_fused_ops > 0) {
+                if (src0->type == GGML_TYPE_F16) {
+                    // f16 sources (the MoE combine of f16 expert outputs), f32 sum; ggml_vk_fuse_multi_add admits it without partials
+                    GGML_ASSERT(!ctx->do_add_rms_partials && dst->type == GGML_TYPE_F32);
+                    return ctx->device->pipeline_multi_add_f16in[ctx->num_additional_fused_ops];
+                }
                 if (ctx->do_add_rms_partials) {
                     return ctx->device->pipeline_multi_add_rms[ctx->num_additional_fused_ops];
                 } else {
@@ -11902,10 +12134,13 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
 
     for (uint32_t i = 0; i < num_tensors; ++i) {
         const ggml_tensor *t = tensors[i];
-        pc.nb[i][0] = (uint32_t)t->nb[0] / sizeof(float);
-        pc.nb[i][1] = (uint32_t)t->nb[1] / sizeof(float);
-        pc.nb[i][2] = (uint32_t)t->nb[2] / sizeof(float);
-        pc.nb[i][3] = (uint32_t)t->nb[3] / sizeof(float);
+        // element strides: f16 sources on the f16in variant, f32 everywhere else
+        const uint32_t ts = (uint32_t)ggml_type_size(t->type);
+        GGML_ASSERT(t->type == (i < num_srcs ? tensors[0]->type : GGML_TYPE_F32));
+        pc.nb[i][0] = (uint32_t)t->nb[0] / ts;
+        pc.nb[i][1] = (uint32_t)t->nb[1] / ts;
+        pc.nb[i][2] = (uint32_t)t->nb[2] / ts;
+        pc.nb[i][3] = (uint32_t)t->nb[3] / ts;
     }
     pc.rms_partials = ctx->do_add_rms_partials;
 
@@ -14515,6 +14750,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             cgraph->nodes[next_node_idx]->op == GGML_OP_RMS_NORM &&
             cgraph->nodes[next_node_idx]->src[0] == cgraph->nodes[next_node_idx - 1] &&
             ggml_nrows(cgraph->nodes[next_node_idx]) == 1 &&
+            src0->type == GGML_TYPE_F32 &&
             ctx->device->add_rms_fusion) {
             uint32_t size = ggml_vk_rms_partials_size(ctx, cgraph->nodes[node_idx]);
             ctx->do_add_rms_partials_offset_calculation = true;
@@ -14724,7 +14960,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_SCALE:
-        if (ctx->fused_hc_post_gate) {
+        if (ctx->fused_hc_post_norm) {
+            ggml_vk_dsv4_hc_post_norm(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_hc_post_gate) {
             ggml_tensor * hc_post = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
             ggml_vk_dsv4_hc_post(ctx, compute_ctx, hc_post->src[0], hc_post->src[1], hc_post->src[2], hc_post->src[3], hc_post, node);
         } else {
@@ -14799,7 +15037,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_RMS_NORM:
-        ggml_vk_rms_norm(ctx, compute_ctx, cgraph, node_idx, (float *)node->op_params);
+        if (ctx->fused_hc_post_norm) {
+            ggml_vk_dsv4_hc_post_norm(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_rms_norm(ctx, compute_ctx, cgraph, node_idx, (float *)node->op_params);
+        }
         break;
     case GGML_OP_RMS_NORM_BACK:
         ggml_vk_rms_norm_back(ctx, compute_ctx, src0, src1, node);
@@ -15848,6 +16090,16 @@ static bool ggml_vk_mmid_epilogue_enabled() {
     return on;
 }
 
+// HC_POST_NORM_* / HC_NORM_ROWS_CPY (dsv4_hc_post_norm.comp). GGML_VK_FUSE_HC_POST_NORM=0 disables all three
+// (and their graph_optimize ordering), so the graph runs exactly as before.
+static bool ggml_vk_fuse_hc_post_norm_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_HC_POST_NORM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 // true when ggml_vk_mul_mat_id_q_f16 will run this MUL_MAT_ID on an int8 MMQ coopmat1 pipeline (the only MUL_MAT_ID
 // GEMM with the router-weight binding) and the MUL is a per-row scale it can apply
 static bool ggml_vk_mmid_scale_epilogue_ok(const ggml_backend_vk_context * cctx, const ggml_tensor * mmid, const ggml_tensor * mul) {
@@ -15858,8 +16110,10 @@ static bool ggml_vk_mmid_scale_epilogue_ok(const ggml_backend_vk_context * cctx,
     const ggml_tensor * src0  = mmid->src[0];
     const ggml_tensor * src1  = mmid->src[1];
     const ggml_tensor * scale = mul->src[1];
+    // an f16 B is quantized from f16 on the same int8 MMQ path (ggml_vk_mul_mat_id_q_f16 f16_y)
+    const bool f16_y = src1->type == GGML_TYPE_F16 && ggml_vk_mmq_f16_y_enabled() && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
     if (mmid->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
-        !ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32) {
+        !ggml_is_quantized(src0->type) || (src1->type != GGML_TYPE_F32 && !f16_y)) {
         return false;
     }
     // same conditions as quantize_y / !qx_needs_dequant in ggml_vk_mul_mat_id_q_f16
@@ -15886,6 +16140,85 @@ static bool ggml_vk_mmid_scale_epilogue_ok(const ggml_backend_vk_context * cctx,
         scale->ne[0] != 1 || scale->ne[1] != mul->ne[1] || scale->ne[2] != mul->ne[2] || scale->ne[3] != 1 ||
         mul->ne[3] != 1) {
         return false;
+    }
+    return true;
+}
+
+
+static constexpr std::initializer_list<ggml_op> hc_post_norm_cpy_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY };
+static constexpr std::initializer_list<ggml_op> hc_post_norm_pattern     { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL };
+static constexpr std::initializer_list<ggml_op> hc_norm_rows_cpy_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY };
+
+// mode: HC_POST_NORM_GATE, HC_POST_NORM_GATE_CPY or HC_NORM_ROWS_CPY, matched at node_idx
+static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int mode) {
+    if (!ggml_vk_fuse_hc_post_norm_enabled()) {
+        return false;
+    }
+    const bool has_post = mode != HC_NORM_ROWS_CPY;
+    const bool out_f16  = mode != HC_POST_NORM_GATE;
+    if (ctx->device->pipeline_dsv4_hc_post_norm[has_post ? 1 : 0][out_f16 ? 1 : 0] == nullptr) {
+        return false;
+    }
+    const std::initializer_list<ggml_op> & pattern = mode == HC_POST_NORM_GATE_CPY ? hc_post_norm_cpy_pattern :
+                                                     mode == HC_POST_NORM_GATE     ? hc_post_norm_pattern : hc_norm_rows_cpy_pattern;
+    const int n = (int) pattern.size();
+    const int last = node_idx + n - 1;
+    if (last >= cgraph->n_nodes) {
+        return false;
+    }
+    // the elided nodes (the gate chain, the norm, and the MUL when it is cast) must have no other readers;
+    // the combine result keeps its readers (the next combine reads it as the residual)
+    if (has_post) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, pattern, { node_idx + 3, last }) ||
+            !ggml_check_edges(cgraph, node_idx, hc_post_gate_edges) ||
+            !ggml_vk_can_fuse_hc_post_gate(cgraph, node_idx)) {
+            return false;
+        }
+    } else if (!ggml_can_fuse_subgraph(cgraph, node_idx, pattern, { last })) {
+        return false;
+    }
+    const ggml_tensor * hc_post = has_post ? cgraph->nodes[node_idx + 3] : nullptr;
+    const int r = has_post ? node_idx + 4 : node_idx;
+    const ggml_tensor * rms = cgraph->nodes[r];
+    const ggml_tensor * mul = cgraph->nodes[r + 1];
+    const ggml_tensor * out = cgraph->nodes[last];
+    const ggml_tensor * res = has_post ? hc_post->src[1] : rms->src[0];
+
+    if (mul->src[0] != rms || (has_post && rms->src[0] != hc_post)) {
+        return false;
+    }
+    if (out_f16 && (out->src[0] != mul || out->type != GGML_TYPE_F16 || !ggml_is_contiguous(out) || !ggml_are_same_shape(out, mul))) {
+        return false;
+    }
+    const ggml_tensor * gamma = mul->src[1];
+    const int64_t n_embd = res->ne[0], hc = res->ne[1], nt = res->ne[2];
+    if (n_embd > 4096 || n_embd % 4 != 0 || res->ne[3] != 1 || hc * nt > (int64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return false;
+    }
+    if (res->type != GGML_TYPE_F32 || rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(rms, res) || !ggml_are_same_shape(mul, rms) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    // gamma [n_embd, hc] broadcast over tokens
+    if (gamma->ne[0] != n_embd || gamma->ne[1] != hc || gamma->ne[2] != 1 || gamma->ne[3] != 1) {
+        return false;
+    }
+    // vec4 kernel: unit element strides, 16-byte aligned rows, no misalignment
+    if (res->nb[0] != 4 || res->nb[1] % 16 != 0 || res->nb[2] % 16 != 0 || gamma->nb[0] != 4 || gamma->nb[1] % 16 != 0 ||
+        get_misalign_bytes(ctx, res) != 0 || get_misalign_bytes(ctx, gamma) != 0 || get_misalign_bytes(ctx, out) != 0) {
+        return false;
+    }
+    if (has_post) {
+        const ggml_tensor * x  = hc_post->src[0];
+        const ggml_tensor * pw = cgraph->nodes[node_idx]->src[0];
+        // identity mixing only (DSV4_HC_POST without a comb), x [n_embd, nt], post weights [hc, nt]
+        if (hc_post->src[3] != nullptr || hc_post->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(hc_post, res) || hc_post->nb[0] != 4 || hc_post->nb[1] % 16 != 0 || hc_post->nb[2] % 16 != 0 ||
+            x->ne[0] != n_embd || x->ne[1] != nt || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != 4 || x->nb[1] % 16 != 0 ||
+            pw->ne[0] != hc || pw->ne[1] != nt ||
+            get_misalign_bytes(ctx, x) != 0 || get_misalign_bytes(ctx, pw) != 0 || get_misalign_bytes(ctx, hc_post) != 0) {
+            return false;
+        }
     }
     return true;
 }
@@ -16810,6 +17143,14 @@ bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const str
     return true;
 }
 
+static bool ggml_vk_multi_add_f16in_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MULTI_ADD_F16IN");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
 
     const ggml_tensor *first_node = cgraph->nodes[node_idx];
@@ -16829,18 +17170,36 @@ uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml
     }
 
     // The shader currently requires same shapes (but different strides are allowed),
-    // everything f32, and no misalignment
+    // everything f32, and no misalignment.
+    // f16 variant (GGML_VK_MULTI_ADD_F16IN=0 disables): the first ADD sums two f16 tensors into f32
+    // (ggml_add_cast) and every later ADD adds one more f16 tensor to the running f32 sum, so all the
+    // summed sources are f16 and only the chain and the destination are f32 (the f16 MoE expert outputs).
+    const bool f16in = first_node->type == GGML_TYPE_F32 && first_node->src[0]->type == GGML_TYPE_F16 &&
+                       first_node->src[1]->type == GGML_TYPE_F16 && ggml_vk_multi_add_f16in_enabled();
     for (int32_t i = 0; i < num_adds; ++i) {
         const ggml_tensor *next_node = cgraph->nodes[node_idx + i];
-        if (!ggml_are_same_shape(first_node, next_node->src[0]) ||
+        bool types_ok;
+        if (!f16in) {
+            types_ok = next_node->type == GGML_TYPE_F32 &&
+                       next_node->src[0]->type == GGML_TYPE_F32 &&
+                       next_node->src[1]->type == GGML_TYPE_F32;
+        } else if (i == 0) {
+            types_ok = true;
+        } else {
+            // the running sum is f32 and the added tensor f16, in either operand order
+            const ggml_tensor *prev = cgraph->nodes[node_idx + i - 1];
+            const ggml_tensor *other = next_node->src[0] == prev ? next_node->src[1] : next_node->src[0];
+            types_ok = next_node->type == GGML_TYPE_F32 && prev->type == GGML_TYPE_F32 &&
+                       (next_node->src[0] == prev || next_node->src[1] == prev) && other->type == GGML_TYPE_F16;
+        }
+        if (!types_ok ||
+            !ggml_are_same_shape(first_node, next_node->src[0]) ||
             !ggml_are_same_shape(first_node, next_node->src[1]) ||
-            next_node->type != GGML_TYPE_F32 ||
-            next_node->src[0]->type != GGML_TYPE_F32 ||
-            next_node->src[1]->type != GGML_TYPE_F32 ||
             get_misalign_bytes(ctx, next_node) ||
             get_misalign_bytes(ctx, next_node->src[0]) ||
             get_misalign_bytes(ctx, next_node->src[1])) {
             num_adds = i;
+            break;
         }
     }
 
@@ -16872,6 +17231,169 @@ static int32_t find_first_set(uint32_t x) {
         ret++;
     }
     return ret;
+}
+
+// MUL_MAT+CPY(f16): a quantized GEMM whose only consumer is a cast to f16 stores float16_t straight into the
+// cast's destination through an f16-output int8 MMQ pipeline, so the f32 result is never written or read back.
+// GGML_VK_FUSE_MM_F16OUT=0 disables. GEMM shapes on the int8 MMQ path only: the mat-vec, split-K and
+// non-MMQ paths all write f32.
+static bool ggml_vk_mm_f16out_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_MM_F16OUT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// true when this MUL_MAT can store an f16 result (same conditions ggml_vk_mul_mat_q_f16 uses to take the int8 MMQ path)
+static bool ggml_vk_mul_mat_f16out_ok(ggml_backend_vk_context * ctx, const ggml_tensor * mm) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->type != GGML_TYPE_F32 || !ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!(ctx->device->integer_dot_product || ctx->device->coopmat_int_support) ||
+        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)mm->op_params[0], false, true) == nullptr) {
+        return false;
+    }
+    // one plain 2-D GEMM: no batch, no M split, no Hadamard route, contiguous operands
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(mm) ||
+        src0->ne[2] * src0->ne[3] != 1 || src1->ne[2] * src1->ne[3] != 1 ||
+        (src1->ne[0] * src1->ne[1]) % 4 != 0 ||
+        ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange ||
+        ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    // enough columns to stay off the mat-vec paths and rows to stay off the small-M routes
+    return mm->ne[1] > (int64_t) mul_mat_vec_chunk_max_cols && mm->ne[0] > (int64_t) mul_mat_vec_max_cols;
+}
+
+static bool ggml_vk_can_fuse_mm_cpy16(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_mm_f16out_enabled() || !ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_CPY })) {
+        return false;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[node_idx];
+    const ggml_tensor * cpy = cgraph->nodes[node_idx + 1];
+    if (cpy->src[0] != mm || cpy->type != GGML_TYPE_F16 || !ggml_is_contiguous(cpy) || !ggml_are_same_shape(cpy, mm)) {
+        return false;
+    }
+    return ggml_vk_mul_mat_f16out_ok(ctx, mm);
+}
+
+// MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores float16_t straight into the cast's destination (the f16 MoE
+// activations of build_moe_ffn), so the f32 expert outputs are never written or read back.
+// GGML_VK_FUSE_MMID_F16OUT=0 disables. GEMM shapes only, on the two pipeline families with an f16-output twin:
+// int8 MMQ coopmat1 (f32 or f16 B, quantized to q8_1) and the KHR-coopmat IQ1-IQ3 matmul with an f32 B.
+static bool ggml_vk_mmid_f16out_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_MMID_F16OUT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// true when ggml_vk_mul_mat_id_q_f16 would take a pipeline that has an f16-output twin (mirrors its path choice)
+static bool ggml_vk_mmid_d16_ok(ggml_backend_vk_context * ctx, const ggml_tensor * mmid, bool scaled, bool glu = false) {
+    const ggml_tensor * src0 = mmid->src[0];
+    const ggml_tensor * src1 = mmid->src[1];
+    if (mmid->type != GGML_TYPE_F32 || !ggml_is_quantized(src0->type) || ctx->device->coopmat2 ||
+        !ggml_vk_dim01_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(mmid) ||
+        ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange ||
+        (ctx->device->coopmat_support && ctx->device->vendor_id == VK_VENDOR_ID_INTEL)) {
+        return false;
+    }
+    // GEMM path only (ggml_vk_use_mul_mat_vec_id: at most 8 tokens)
+    if (mmid->src[2]->ne[1] <= 8) {
+        return false;
+    }
+    const ggml_prec prec = (ggml_prec) mmid->op_params[0];
+    const bool f16_y = src1->type == GGML_TYPE_F16 && ggml_vk_mmq_f16_y_enabled() && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
+    const bool quantize_y = ctx->device->integer_dot_product && (src1->type == GGML_TYPE_F32 || f16_y) &&
+                            (src1->ne[0] * src1->ne[1]) % 4 == 0;
+    if (quantize_y && ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, prec, true) != nullptr) {
+        const std::vector<vk_matmul_pipeline_pair> * mmp = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_Q8_1, prec, true, true, glu);
+        if (mmp == nullptr) {
+            return false;
+        }
+        for (const auto & pair : *mmp) {
+            if (!pair.unaligned || pair.unaligned->parameter_count != (glu ? 7u : 6u)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    // KHR-coopmat path with an f32 B (no router-weight binding there). No SwiGLU store on it: on the Flash-Next IQ3_XXS
+    // gate/up GEMM it cost more (+0.56 ms per call) than the separate f16 GLU pass it removed (0.33 ms)
+    return !scaled && !glu && src1->type == GGML_TYPE_F32 &&
+           ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_F32, prec, true) != nullptr &&
+           ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_F32, prec, true, true, glu) != nullptr;
+}
+
+static bool ggml_vk_cpy16_of(const ggml_tensor * cpy, const ggml_tensor * src) {
+    return cpy->op == GGML_OP_CPY && cpy->src[0] == src && cpy->type == GGML_TYPE_F16 &&
+           ggml_is_contiguous(cpy) && ggml_are_same_shape(cpy, src);
+}
+
+// MUL_MAT_ID + CPY(f16)
+static bool ggml_vk_can_fuse_mmid_cpy16(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_mmid_f16out_enabled() || !ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_CPY })) {
+        return false;
+    }
+    const ggml_tensor * mmid = cgraph->nodes[node_idx];
+    return ggml_vk_cpy16_of(cgraph->nodes[node_idx + 1], mmid) && ggml_vk_mmid_d16_ok(ctx, mmid, false);
+}
+
+// MUL_MAT_ID + CPY(f16) + SWIGLU(split): the gate projection of an f16 MoE block; the store applies silu(gate) * up
+// (up: the f16 up projection, computed earlier) and writes the SWIGLU's destination, so neither the gate projection
+// nor the separate GLU pass touches memory. GGML_VK_FUSE_MMID_GLU=0 disables (the MUL_MAT_ID_CPY16 fusion remains).
+static bool ggml_vk_mmid_glu_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_MMID_GLU");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// the cast may be either SwiGLU operand: gate (src[0]) or up (src[1]); the other one is read by the fused store
+static bool ggml_vk_mmid_glu_tail_ok(const ggml_tensor * mmid, const ggml_tensor * cpy, const ggml_tensor * glu) {
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->src[1] == nullptr || (glu->src[0] == cpy) == (glu->src[1] == cpy)) {
+        return false;
+    }
+    const ggml_tensor * other = glu->src[0] == cpy ? glu->src[1] : glu->src[0];
+    return other->type == GGML_TYPE_F16 && ggml_is_contiguous(other) && ggml_are_same_shape(other, mmid) &&
+           glu->type == GGML_TYPE_F16 && ggml_is_contiguous(glu) && ggml_are_same_shape(glu, mmid);
+}
+
+static bool ggml_vk_can_fuse_mmid_glu(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_mmid_f16out_enabled() || !ggml_vk_mmid_glu_enabled() || node_idx + 2 >= cgraph->n_nodes ||
+        !ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_CPY })) {
+        return false;
+    }
+    const ggml_tensor * mmid = cgraph->nodes[node_idx];
+    const ggml_tensor * cpy  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * glu  = cgraph->nodes[node_idx + 2];
+    // not ggml_can_fuse: a cast lists itself as src[1], so its use count is the SWIGLU plus that self-reference
+    if (glu->op != GGML_OP_GLU || (glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || cpy->view_src || cpy->src[1] != cpy ||
+        ggml_node_get_use_count(cgraph, node_idx + 1) != 2) {
+        return false;
+    }
+    return ggml_vk_cpy16_of(cpy, mmid) && ggml_vk_mmid_glu_tail_ok(mmid, cpy, glu) &&
+           ggml_vk_mmid_d16_ok(ctx, mmid, false, true);
+}
+
+// MUL_MAT_ID + MUL(router weights) + CPY(f16): the router-weight epilogue, stored as f16
+static bool ggml_vk_can_fuse_mmid_mul_cpy16(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_mmid_f16out_enabled() || node_idx + 2 >= cgraph->n_nodes ||
+        !ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL }) ||
+        !ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_CPY })) {
+        return false;
+    }
+    const ggml_tensor * mmid = cgraph->nodes[node_idx];
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    return ggml_vk_cpy16_of(cgraph->nodes[node_idx + 2], mul) && ggml_vk_mmid_d16_ok(ctx, mmid, true) &&
+           ggml_vk_mmid_scale_epilogue_ok(ctx, mmid, mul);
 }
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -17049,6 +17571,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
+        ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
+        ctx->fused_mm_cpy16 = false;
+        ctx->fused_mmid_cpy16 = false;
+        ctx->fused_mmid_glu = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_concat_tail = -1;
         ctx->fused_ssm_conv_direct = -1;
@@ -17069,6 +17595,38 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ADD";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_mm_cpy16(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_mm_cpy16 = true;
+                fusion_string = "MUL_MAT_CPY16";
+                op_srcs_fused_elementwise[0] = false;
+                // a cast's src[1] is its own destination, so the CPY must count as elementwise or the
+                // overlap check below always disables the fusion
+                op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_mmid_mul_cpy16(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_mmid_cpy16 = true;
+                fusion_string = "MUL_MAT_ID_MUL_CPY16";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                // a cast's src[1] is its own destination: the CPY must count as elementwise or the overlap check
+                // below always disables the fusion
+                op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_mmid_glu(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_mmid_cpy16 = true;
+                ctx->fused_mmid_glu = true;
+                fusion_string = "MUL_MAT_ID_CPY16_SWIGLU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                // the up projection is read at the destination's own index
+                op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_mmid_cpy16(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_mmid_cpy16 = true;
+                fusion_string = "MUL_MAT_ID_CPY16";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
@@ -17110,6 +17668,27 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // rope is approximately elementwise - whole rows are done by a single workgroup and it's row-wise
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, i, HC_POST_NORM_GATE_CPY) ||
+                       ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, i, HC_POST_NORM_GATE)) {
+                // two outputs: the combine (node 3, the next combine's residual) and the norm (the last node).
+                // The kernel reads whole rows of the residual and x while it writes both, so no source may
+                // overlap either output; only the cast's own src[1] (its destination) counts as elementwise.
+                const bool cpy = ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, i, HC_POST_NORM_GATE_CPY);
+                ctx->fused_hc_post_norm = cpy ? HC_POST_NORM_GATE_CPY : HC_POST_NORM_GATE;
+                ctx->num_additional_fused_ops = cpy ? 6 : 5;
+                ctx->fused_ops_write_mask |= 1 << 3;
+                fusion_string = cpy ? "HC_POST_GATE_NORM_CPY" : "HC_POST_GATE_NORM";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                op_srcs_fused_elementwise[6] = cpy;
+            } else if (ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, i, HC_NORM_ROWS_CPY)) {
+                ctx->fused_hc_post_norm = HC_NORM_ROWS_CPY;
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "RMS_NORM_MUL_CPY";
+                // the f16 rows are half the f32 rows' size: an overlap with the norm input would be a race,
+                // so only the cast's src[1] (its own destination) is elementwise
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
                 op_srcs_fused_elementwise[2] = true;
             } else if (ggml_can_fuse_subgraph(cgraph, i, hc_post_gate_pattern, { i + 3 }) &&
                        ggml_check_edges(cgraph, i, hc_post_gate_edges) &&
@@ -17318,6 +17897,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
+                ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
+                ctx->fused_mm_cpy16 = false;
+                ctx->fused_mmid_cpy16 = false;
+                ctx->fused_mmid_glu = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -17365,6 +17948,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         i += ctx->num_additional_fused_ops;
         ctx->num_additional_fused_ops = 0;
         ctx->fused_ops_write_mask = 0;
+        ctx->fused_mm_cpy16 = false;
+        ctx->fused_mmid_cpy16 = false;
+        ctx->fused_mmid_glu = false;
     }
 
     ctx->last_total_flops = total_flops;
@@ -17484,6 +18070,48 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         return true;
     };
+    // MUL_MAT + CPY(f16) of a quantized-weight matmul (the MUL_MAT_CPY16 fusion)
+    const std::initializer_list<ggml_op> mm_cpy16_pattern = { GGML_OP_MUL_MAT, GGML_OP_CPY };
+    auto const &is_mm_cpy16 = [&](int n) -> bool {
+        if (n + 1 >= graph->n_nodes || used[n] || used[n + 1] || !ggml_vk_mm_f16out_enabled()) {
+            return false;
+        }
+        const ggml_tensor * mm  = graph->nodes[n];
+        const ggml_tensor * cpy = graph->nodes[n + 1];
+        return mm->op == GGML_OP_MUL_MAT && ggml_is_quantized(mm->src[0]->type) &&
+               cpy->op == GGML_OP_CPY && cpy->src[0] == mm && cpy->type == GGML_TYPE_F16;
+    };
+
+    // MUL_MAT_ID (+ MUL) + CPY(f16) of a quantized expert GEMM (the MUL_MAT_ID(_MUL)_CPY16 fusions)
+    const std::initializer_list<ggml_op> mmid_cpy16_pattern = { GGML_OP_MUL_MAT_ID, GGML_OP_CPY };
+    const std::initializer_list<ggml_op> mmid_mul_cpy16_pattern = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_CPY };
+    const std::initializer_list<ggml_op> mmid_cpy16_glu_pattern = { GGML_OP_MUL_MAT_ID, GGML_OP_CPY, GGML_OP_GLU };
+    auto const &is_mmid_cpy16 = [&](int n, bool with_mul) -> bool {
+        const int len = with_mul ? 3 : 2;
+        if (n + len > graph->n_nodes || !ggml_vk_mmid_f16out_enabled()) {
+            return false;
+        }
+        for (int j = 0; j < len; ++j) {
+            if (used[n + j]) {
+                return false;
+            }
+        }
+        const ggml_tensor * mmid = graph->nodes[n];
+        if (mmid->op != GGML_OP_MUL_MAT_ID || !ggml_is_quantized(mmid->src[0]->type)) {
+            return false;
+        }
+        const ggml_tensor * last = mmid;
+        if (with_mul) {
+            const ggml_tensor * mul = graph->nodes[n + 1];
+            if (mul->op != GGML_OP_MUL || mul->src[0] != mmid) {
+                return false;
+            }
+            last = mul;
+        }
+        const ggml_tensor * cpy = graph->nodes[n + len - 1];
+        return cpy->op == GGML_OP_CPY && cpy->src[0] == last && cpy->type == GGML_TYPE_F16;
+    };
+
     while (first_unused < graph->n_nodes) {
         std::vector<int> current_set;
 
@@ -17585,8 +18213,89 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
-            add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
+            // HC_POST_GATE_NORM(_CPY): pull the next mix's RMS_NORM -> MUL (-> CPY f16) of this combine in right
+            // behind it (in the graph a reshape of the norm weight sits in between), and keep the combine's inputs
+            // alive through the last of them, since the fused kernel reads them while it writes the norm
+            std::vector<int> tail;
+            if (ggml_vk_fuse_hc_post_norm_enabled()) {
+                const int post_idx = first_unused + (int) hc_post_gate_pattern.size() - 1;
+                const ggml_tensor * want_src = graph->nodes[post_idx];
+                const ggml_op want[3] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY };
+                std::vector<int> skipped;
+                for (int j = post_idx + 1; j < std::min(post_idx + 12, graph->n_nodes) && tail.size() < 3; ++j) {
+                    if (used[j]) {
+                        continue;
+                    }
+                    const ggml_tensor * nj = graph->nodes[j];
+                    if (is_empty(nj)) {
+                        skipped.push_back(j);
+                        continue;
+                    }
+                    const size_t k = tail.size();
+                    if (nj->op != want[k] || nj->src[0] != want_src || (k == 2 && nj->type != GGML_TYPE_F16)) {
+                        break;
+                    }
+                    tail.push_back(j);
+                    want_src = nj;
+                }
+                if (tail.size() < 2) {
+                    tail.clear();
+                }
+                // empty nodes passed over that a tail node reads (the gamma reshape) go in front of the chain;
+                // only views of weights or of already scheduled nodes, so nothing moves ahead of its source
+                if (!tail.empty()) {
+                    for (int v : skipped) {
+                        if (v > tail.back()) {
+                            continue;
+                        }
+                        bool read_by_tail = false;
+                        for (int t : tail) {
+                            read_by_tail = read_by_tail || is_src_of(graph->nodes[t], graph->nodes[v]);
+                        }
+                        const ggml_tensor * vs = graph->nodes[v]->src[0];
+                        if (read_by_tail && vs && (vs->op == GGML_OP_NONE || used_node_set.count(const_cast<ggml_tensor *>(vs)))) {
+                            new_order.push_back(graph->nodes[v]);
+                            used_node_set.insert(graph->nodes[v]);
+                            used[v] = true;
+                        }
+                    }
+                }
+            }
+            add_pattern_alloc_deps(hc_post_gate_pattern, tail.empty() ? first_unused + (int) hc_post_gate_pattern.size() - 1 : tail.back());
             keep_pattern(hc_post_gate_pattern);
+            for (int t : tail) {
+                new_order.push_back(graph->nodes[t]);
+                used_node_set.insert(graph->nodes[t]);
+                used[t] = true;
+            }
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
+            }
+            continue;
+        }
+        if (is_mm_cpy16(first_unused)) {
+            // the fused matmul reads its inputs while it writes the cast's destination
+            add_pattern_alloc_deps(mm_cpy16_pattern, first_unused + 1);
+            keep_pattern(mm_cpy16_pattern);
+            continue;
+        }
+        if (ggml_vk_mmid_glu_enabled() && is_mmid_cpy16(first_unused, false) && first_unused + 2 < graph->n_nodes &&
+            !used[first_unused + 2] && ggml_vk_mmid_glu_tail_ok(graph->nodes[first_unused], graph->nodes[first_unused + 1], graph->nodes[first_unused + 2])) {
+            // gate projection + cast + SwiGLU: the fused GEMM reads its B operand and the up projection while it writes
+            // the SwiGLU's destination
+            add_pattern_alloc_deps(mmid_cpy16_glu_pattern, first_unused + 2);
+            keep_pattern(mmid_cpy16_glu_pattern);
+            continue;
+        }
+        if (is_mmid_cpy16(first_unused, true)) {
+            // the fused expert GEMM reads its B operand, ids and router weights while it writes the cast's destination
+            add_pattern_alloc_deps(mmid_mul_cpy16_pattern, first_unused + 2);
+            keep_pattern(mmid_mul_cpy16_pattern);
+            continue;
+        }
+        if (is_mmid_cpy16(first_unused, false)) {
+            add_pattern_alloc_deps(mmid_cpy16_pattern, first_unused + 1);
+            keep_pattern(mmid_cpy16_pattern);
             continue;
         }
 
@@ -17715,7 +18424,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
                 match_pattern(hc_post_gate_pattern, j) ||
-                !gated_norm_order(j).empty()) {
+                !gated_norm_order(j).empty() ||
+                is_mm_cpy16(j)) {
                 continue;
             }
             bool ok = true;
@@ -17732,7 +18442,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY) &&
                     // RMS_NORM -> SCALE (RMS_NORM_SCALE, the GDN q/k l2 norm): keep the scale behind its norm
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_SCALE &&
-                      graph->nodes[j]->src[0] == graph->nodes[c] && ggml_vk_fuse_norm_extra_enabled())) {
+                      graph->nodes[j]->src[0] == graph->nodes[c] && ggml_vk_fuse_norm_extra_enabled()) &&
+                    // RMS_NORM -> MUL -> CPY(f16) (HC_NORM_ROWS_CPY): keep the cast behind its MUL
+                    !(j == c+1 && c == current_set.back() && c > 0 && graph->nodes[c]->op == GGML_OP_MUL && graph->nodes[j]->op == GGML_OP_CPY &&
+                      graph->nodes[j]->src[0] == graph->nodes[c] && graph->nodes[j]->type == GGML_TYPE_F16 &&
+                      graph->nodes[c]->src[0]->op == GGML_OP_RMS_NORM && ggml_vk_fuse_hc_post_norm_enabled())) {
                     ok = false;
                     break;
                 }
@@ -18268,6 +18982,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     if (ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
                         return false;
                     }
+                    // the mat-vec MUL_MAT_ID (at most 8 tokens) has no f16-B pipeline for quantized experts
+                    if (op->src[1]->type == GGML_TYPE_F16 && ggml_is_quantized(src0_type) && op->src[2]->ne[1] <= 8) {
+                        return false;
+                    }
                 }
                 switch (src0_type) {
                     case GGML_TYPE_F32:
@@ -18677,7 +19395,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 for (uint32_t i = 0; i < GGML_MAX_SRC; ++i) {
-                    if (op->src[i] && op->src[i]->type != GGML_TYPE_F32) {
+                    // the gated HC_PRE also takes an f16 x (src[0], the f16 hc norm), offered where the norm can be stored as
+                    // f16 by the fused combine + norm kernel and the hc down GEMM quantizes f16 directly
+                    const bool f16_x_ok = op->op == GGML_OP_DSV4_HC_PRE && i == 0 && ggml_get_op_params_i32(op, 1) != 0 &&
+                                          device->coopmat_int_support && device->pipeline_dsv4_hc_post_norm[1][1] != nullptr &&
+                                          device->pipeline_quantize_q8_1_x4_f16 != nullptr;
+                    if (op->src[i] && op->src[i]->type != GGML_TYPE_F32 &&
+                        !(f16_x_ok && op->src[i]->type == GGML_TYPE_F16)) {
                         return false;
                     }
                 }

@@ -155,6 +155,22 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// the f16 hc norm: the fused DSV4_HC_PRE reads an f16 x, and the hc inject / down matmuls take an f16 B.
+// n_tokens_per_seq matches the qwen4exp prefill threshold
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_norm_f16_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_NORM_F16,
+    /*.name             =*/ "fused DeepSeek V4 HC pre (f16 norm)",
+    /*.n_tokens_per_seq =*/ 32,
+};
+
+// the f16 MoE activations: the expert down projection takes an f16 B. n_tokens_per_seq matches the build_moe_ffn
+// prefill threshold
+static const llm_fused_op_probe llm_fused_op_moe_f16_probe = {
+    /*.op               =*/ LLM_FUSED_OP_MOE_F16,
+    /*.name             =*/ "f16 MoE activations",
+    /*.n_tokens_per_seq =*/ 32,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COMB,
     /*.name             =*/ "fused DeepSeek V4 HC comb",
@@ -331,6 +347,7 @@ llama_context::llama_context(
     cparams.auto_flid = false;
 
     cparams.fused_dsv4_hc_pre  = true;
+    cparams.fused_dsv4_hc_norm_f16 = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
@@ -340,6 +357,17 @@ llama_context::llama_context(
     }
     if (const char * env = getenv("LLAMA_FUSED_DSV4_HC_POST")) {
         cparams.fused_dsv4_hc_post = atoi(env) != 0;
+    }
+    // LLAMA_HC_NORM_F16=0 keeps the qwen4exp hc norm output in f32 at prefill
+    if (const char * env = getenv("LLAMA_HC_NORM_F16")) {
+        cparams.fused_dsv4_hc_norm_f16 = atoi(env) != 0;
+    }
+
+    cparams.fused_moe_f16 = true;
+    cparams.auto_fmoe16   = true;
+    // LLAMA_MOE_F16=0 keeps the MoE expert activations in f32 at prefill
+    if (const char * env = getenv("LLAMA_MOE_F16")) {
+        cparams.fused_moe_f16 = atoi(env) != 0;
     }
 
     // with causal attention, the batch size is limited by the context size
@@ -703,10 +731,50 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
     if (cparams.auto_fhc) {
         LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
+        // the f16 norm is probed last; the probes before it see the f32 norm graph
+        bool hc_norm_f16 = cparams.fused_dsv4_hc_norm_f16;
+        cparams.fused_dsv4_hc_norm_f16 = false;
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        // The f16 hc norm exists only on the fused HC pre path, for ubatches of 32+ tokens per sequence, and only
+        // when every layer runs on an accelerator (it pays off where the combine kernel stores the norm as f16,
+        // which no CPU path does). The probe keeps it only where the layer's device takes the f16 norm in
+        // DSV4_HC_PRE and in the hc inject / down matmuls; elsewhere the graph is the f32 one.
+        bool hc_pre_f16_devs = true;
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                hc_pre_f16_devs = false;
+                break;
+            }
+        }
+        cparams.fused_dsv4_hc_norm_f16 = hc_norm_f16 && cparams.fused_dsv4_hc_pre && hc_pre_f16_devs &&
+            llm_fused_op_dsv4_hc_norm_f16_probe.n_tokens_per_seq*n_seqs <= cparams.n_ubatch;
+        resolve(llm_fused_op_dsv4_hc_norm_f16_probe, cparams.fused_dsv4_hc_norm_f16);
         cparams.auto_fhc = false;
+    }
+
+    if (cparams.auto_fmoe16) {
+        // The f16 MoE activations pay off where the expert GEMMs store f16 themselves, which no CPU path does, so
+        // they need 32+ tokens per sequence and every layer on a non-CPU device. The probe then keeps them only where
+        // the layer's device takes the f16 B in the expert down projection (CUDA/HIP reject a quantized MUL_MAT_ID
+        // with an f16 B, so they keep the f32 graph).
+        bool moe_f16_devs = true;
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                moe_f16_devs = false;
+                break;
+            }
+        }
+        cparams.fused_moe_f16 = cparams.fused_moe_f16 && moe_f16_devs &&
+            llm_fused_op_moe_f16_probe.n_tokens_per_seq*n_seqs <= cparams.n_ubatch;
+        if (cparams.fused_moe_f16) {
+            LLAMA_LOG_INFO("%s: resolving f16 MoE activations support:\n", func);
+        }
+        resolve(llm_fused_op_moe_f16_probe, cparams.fused_moe_f16);
+        cparams.auto_fmoe16 = false;
     }
 }
 

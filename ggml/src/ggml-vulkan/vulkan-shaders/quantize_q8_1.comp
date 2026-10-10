@@ -23,7 +23,11 @@ layout (push_constant) uniform parameter
 layout(constant_id = 0) const uint GROUP_SIZE = 32;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef A_F16
+layout (binding = 0) readonly buffer A {f16vec4 data_a[];};
+#else
 layout (binding = 0) readonly buffer A {vec4 data_a[];};
+#endif
 #ifndef QBLOCK_X4
 layout (binding = 1) writeonly buffer D {block_q8_1_packed32 data_b[];};
 #else
@@ -57,7 +61,7 @@ void quantize(const uint wgid) {
 
     const uint a_idx = ib * 8 + iqs;
 
-    vec4 vals = a_idx < p.ne / 4 ? data_a[a_idx] : vec4(0.0f);
+    vec4 vals = a_idx < p.ne / 4 ? vec4(data_a[a_idx]) : vec4(0.0f);
     const vec4 abs_vals = abs(vals);
 
     // Find absolute max for each block

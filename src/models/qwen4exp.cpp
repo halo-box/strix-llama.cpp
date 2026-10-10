@@ -576,15 +576,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
     xn = ggml_mul(ctx0, xn, w_norm_hc);
+    // Prefill: the norm output is an [hc_dim, T] tensor written once and read three times (inject, down, HC pre),
+    // 84 MB per pass for Flash-Next at a 2048-token ubatch. Where the backend takes it, store it as f16: the cast
+    // directly follows the MUL, so a backend that fuses the combine (or norm) with the cast writes f16 only.
+    const bool norm_f16 = cparams.fused_dsv4_hc_norm_f16 && cparams.fused_dsv4_hc_pre && il >= 0 && nt >= 32 &&
+                          loras->empty();
+    if (norm_f16) {
+        xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
+    }
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    cb(xn, "hc_norm", il);
+    cb(xn, norm_f16 ? "hc_norm_f16" : "hc_norm", il);
 
     if (inject) {
         *inject = build_lora_mm(w_inject, xn);
         cb(*inject, "hc_inject", il);
         ggml_build_forward_expand(gf, *inject);
+        if (norm_f16) {
+            res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, *inject, il});
+        }
     }
     ggml_tensor * lo = build_lora_mm(w_down, xn);
+    if (norm_f16) {
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, lo, il});
+    }
     if (inject) {
         ggml_build_forward_expand(gf, lo);
     }
@@ -599,6 +613,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
                 ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt),
                 ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
+        if (norm_f16) {
+            res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, mixed, il});
+        }
     } else {
         ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, gate));
         gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);

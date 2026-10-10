@@ -47,9 +47,12 @@ struct llama_cparams {
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;
     bool fused_dsv4_hc_pre;
+    bool fused_dsv4_hc_norm_f16; // hc norm output stored as f16 at prefill (written by the backend's fused combine + norm)
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool fused_moe_f16;      // MoE expert activations and outputs stored as f16 at prefill (written by the backend's fused expert GEMMs)
+    bool auto_fmoe16;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

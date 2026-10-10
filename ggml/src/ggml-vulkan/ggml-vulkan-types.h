@@ -260,10 +260,12 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    bool d16 = false;   // stores float16_t (the MUL_MAT+CPY(f16) fusion)
+    bool glu = false;   // d16 MUL_MAT_ID gate projection storing silu(gate) * up (the MUL_MAT_ID+CPY(f16)+SWIGLU fusion)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu);
     }
 };
 
@@ -815,6 +817,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_quantize_q8_1_x4_f16;   // f16 input (int8 MMQ with an f16 B)
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -848,6 +851,7 @@ struct vk_device_struct {
 
     // indexed by num_additional_fused_ops == num_adds - 1
     vk_pipeline pipeline_multi_add[MAX_FUSED_ADDS];
+    vk_pipeline pipeline_multi_add_f16in[MAX_FUSED_ADDS];   // f16 sources, f32 sum and store (MoE combine of f16 expert outputs)
     vk_pipeline pipeline_multi_add_rms[MAX_FUSED_ADDS];
 
     vk_pipeline pipeline_add_id_f32;
@@ -978,6 +982,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+    vk_pipeline pipeline_dsv4_hc_pre_gated_x16_f32;   // f16 x, f32 gate
+    // HC_POST(_GATE) + RMS_NORM + MUL (+ CPY f16) / RMS_NORM + MUL (+ CPY f16): [has_post][out_f16]
+    vk_pipeline pipeline_dsv4_hc_post_norm[2][2];
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1356,6 +1363,12 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    // hc combine + next hc norm (dsv4_hc_post_norm.comp): HC_POST_NORM_* modes, 0 = none
+    int fused_hc_post_norm {};
+    // MUL_MAT+CPY(f16): the matmul stores f16 into the cast's destination
+    bool fused_mm_cpy16 {};
+    bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
+    bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {

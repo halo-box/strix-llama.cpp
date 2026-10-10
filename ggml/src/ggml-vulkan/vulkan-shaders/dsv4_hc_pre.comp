@@ -1,6 +1,10 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
+#if defined(X_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 // Collapse the hc residual streams of a token into one, weighted per stream:
 //
@@ -9,6 +13,8 @@
 // GATED: weights is a per-element gate [n_embd, hc, n_tokens], applied as sigmoid:
 //
 //   dst[i0, it] = scale * sum_ih x[i0, ih, it] * sigmoid(gate[i0, ih, it])
+//
+// X_F16: x is stored as f16 (the f16 hc norm output at prefill); GATED must be 1.
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
 layout(constant_id = 1) const uint GATED = 0;
@@ -31,7 +37,11 @@ layout(push_constant) uniform parameter
     float scale;
 };
 
+#if defined(X_F16)
+layout(binding = 0, std430) readonly buffer X { float16_t data_x[]; };
+#else
 layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+#endif
 layout(binding = 1, std430) readonly buffer W { float data_w[]; };
 layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
 
@@ -68,7 +78,7 @@ void main() {
         } else {
             wv = w[ih];
         }
-        result = fma(data_x[xb + ih * nbx1], wv, result);
+        result = fma(float(data_x[xb + ih * nbx1]), wv, result);
     }
 
     data_d[d_offset + i0 * nbd0 + it * nbd1] = scale * result;

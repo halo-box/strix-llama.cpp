@@ -212,6 +212,24 @@ struct vk_op_dsv4_hc_post_push_constants {
     float    gate_scale_out;
 };
 
+// dsv4_hc_post_norm.comp: strides in elements; every operand has unit element stride and no misalignment
+struct vk_op_dsv4_hc_post_norm_push_constants {
+    uint32_t n_embd;
+    uint32_t hc;
+    uint32_t n_tokens;
+    uint32_t sx1;
+    uint32_t sr1; uint32_t sr2;
+    uint32_t sp0; uint32_t sp1;
+    uint32_t sg1;
+    uint32_t so1; uint32_t so2;
+    uint32_t sn1; uint32_t sn2;
+    float    eps;
+    uint32_t gate;
+    float    gate_in;
+    float    gate_out;
+};
+static_assert(sizeof(vk_op_dsv4_hc_post_norm_push_constants) <= 128);
+
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
     uint32_t ne01;

@@ -643,6 +643,14 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (!f16acc && coopmat && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
                      || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4")) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
+            if (matmul_id_type == MatMulIdType::NONE || matmul_id_type == MatMulIdType::SUBGROUP) {
+                // f16 output for the MUL_MAT(_ID)(+MUL)+CPY(f16) fusions
+                string_to_spv(shader_name + "_" + tname + "_q8_1_d16", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"D_TYPE_VEC4", "f16vec4"}, {"D16", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            }
+            if (matmul_id_type == MatMulIdType::SUBGROUP) {
+                // the gate projection with the SwiGLU applied in the f16 store (MUL_MAT_ID+CPY(f16)+SWIGLU)
+                string_to_spv(shader_name + "_" + tname + "_q8_1_d16_glu", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"D_TYPE_VEC4", "f16vec4"}, {"D16", "1"}, {"GLU_UP", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            }
         }
 
         if (is_lut_quant(tname)) {
@@ -652,6 +660,13 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 
             if (!coopmat2) {
                 string_to_spv(shader_name + "_" + tname + "_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+            }
+            // f16-output MUL_MAT_ID for the MUL_MAT_ID+CPY(f16) fusion: the KHR-coopmat expert GEMM of the IQ1-IQ3 types
+            // (no int8 MMQ pipeline) stores float16_t through the coopmat staging buffer, f32 B as above
+            if (coopmat && !coopmat2 && !dot2 && matmul_id_type == MatMulIdType::SUBGROUP &&
+                (tname == "iq1_s" || tname == "iq1_m" || tname == "iq2_xxs" || tname == "iq2_xs" || tname == "iq2_s" ||
+                 tname == "iq3_xxs" || tname == "iq3_s")) {
+                string_to_spv(shader_name + "_" + tname + "_f32_d16", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}}), fp16, coopmat, coopmat2, f16acc);
             }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
@@ -1005,6 +1020,8 @@ void process_shaders() {
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
+    string_to_spv("quantize_q8_1_x4_f16", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"A_F16", "1"}});
+    string_to_spv("quantize_q8_1_x4_f16_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}, {"A_F16", "1"}});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
@@ -1172,7 +1189,10 @@ void process_shaders() {
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
+    string_to_spv("dsv4_hc_pre_x_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
+    string_to_spv("dsv4_hc_post_norm_f32", "dsv4_hc_post_norm.comp", {});
+    string_to_spv("dsv4_hc_post_norm_f16", "dsv4_hc_post_norm.comp", {{"OUT_F16", "1"}});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1291,6 +1311,8 @@ void process_shaders() {
 
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "0"}});
     string_to_spv("multi_add_rms_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "1"}});
+    // f16 sources, f32 sum and store: the MoE combine of f16 expert outputs
+    string_to_spv("multi_add_f16in_f32", "multi_add.comp", {{"A_TYPE", "float16_t"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"ADD_RMS" , "0"}});
 
     string_to_spv("ssm_scan_f32",          "ssm_scan.comp", {{"A_TYPE", "float"}});
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
