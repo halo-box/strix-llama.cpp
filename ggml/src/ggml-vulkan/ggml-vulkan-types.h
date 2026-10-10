@@ -263,10 +263,11 @@ struct vk_matmul_pipeline_key {
     bool d16 = false;   // stores float16_t (the MUL_MAT+CPY(f16) fusion)
     bool glu = false;   // d16 MUL_MAT_ID gate projection storing silu(gate) * up (the MUL_MAT_ID+CPY(f16)+SWIGLU fusion)
     bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl, GGML_VK_MM_PREFETCH)
+    bool xl = false;    // the 256x256 XL tile tier of the pf variant (aligned only, ggml_vk_mm_xl_ok)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl);
     }
 };
 

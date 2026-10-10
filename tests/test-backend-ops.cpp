@@ -12410,6 +12410,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_cpy16(t, 201, 33, 256)); // odd M: the unpacked f16 store
     }
     test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, 10240, 2048, 320));
+    // register-prefetch coopmat matmuls and their XL 256x256 tier (GGML_VK_MM_PREFETCH / GGML_VK_MM_XL, engaged on the
+    // f16-B coopmat path, i.e. with GGML_VK_DENSE_F16COOPMAT routing the type off int8): shapes that take the XL gate
+    // (m, k >= 1024, XL waves <= half of l's) and a ragged one, for every prefetch type
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q3_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4096, 512, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4200, 500, 1024, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F16, 4096, 512, 1056, {1, 1}, {1, 1}));   // K % 128 != 0, K % 32 == 0: aligned at 32
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, 2048, 320, {1, 1}, {1, 1}));   // the hc up-GEMM shape, below the XL gate
+    }
     // f16 MoE activations: the whole block (Flash-Next IQ3_XXS/IQ4_XS up/gate + IQ4_NL/Q8_0 down, 35B-style K-quants),
     // each fused piece alone, ragged token counts, an odd ff width (unpacked f16 stores), unweighted down
     for (int64_t nt : {33, 129, 300}) {

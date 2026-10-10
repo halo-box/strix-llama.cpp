@@ -404,6 +404,18 @@ void main() {
 #endif
 
 #if defined(A_PREFETCH) && defined(B_PREFETCH)
+    // The 256x256 XL tier (ggml_vk_mm_xl_ok, port of the fork's e6e793bbd): 512 threads = 16 wave32 subgroups on one CU,
+    // so ACO's budget is 192 VGPRs and each subgroup's 4x4 f32 accumulators take 128 of them. Two spec-constant-folded
+    // measures keep it spill-free: (1) a subgroup-scope shared-memory barrier after each accumulator row, so the four B
+    // fragments are re-read per row instead of held live; (2) XL_IDX_BASE: only the row-0 tile addressing stays in
+    // registers, the other rows add a constant (LDS index) or a uniform (A lane offset); q4_K keeps the arrays (ACO
+    // register shuffles cost more there). Every other tile compiles to the same ISA as before.
+    const bool XL_TILE = BM * BN >= 256 * 256;
+#if defined(DATA_A_Q4_K)
+    const bool XL_IDX_BASE = false;
+#else
+    const bool XL_IDX_BASE = XL_TILE;
+#endif
     // Register double-buffer for the next K tile (mul_mm_pf_funcs.glsl); aligned pipelines only. The raw
     // registers hold the tile at pos_a / pos_b; store_*_raw dequantise it into LDS while the next tile's
     // loads are in flight. The lane-invariant parts of the tile addressing are computed once (NIR does
@@ -415,24 +427,32 @@ void main() {
     uint a_lane[NA_RAW];
     uint a_sidx[NA_RAW];
     uint b_sidx[NB_RAW];
-    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
-        a_lane[l / loadstride_a] = a_lane_off(loadr_a, loadc_a + l);
-        a_sidx[l / loadstride_a] = a_shmem_index(loadc_a + l, loadr_a * LOAD_VEC_A / 2);
+    const uint a_lane0 = a_lane_off(loadr_a, loadc_a);
+    const uint a_sidx0 = a_shmem_index(loadc_a, loadr_a * LOAD_VEC_A / 2);
+    const uint b_sidx0 = loadc_b * SHMEM_STRIDE + loadr_b * LOAD_VEC_B / 2;
+    if (!XL_IDX_BASE) {
+        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+            a_lane[l / loadstride_a] = a_lane_off(loadr_a, loadc_a + l);
+            a_sidx[l / loadstride_a] = a_shmem_index(loadc_a + l, loadr_a * LOAD_VEC_A / 2);
+        }
+        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+            b_sidx[l / loadstride_b] = (loadc_b + l) * SHMEM_STRIDE + loadr_b * LOAD_VEC_B / 2;
+        }
     }
-    [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
-        b_sidx[l / loadstride_b] = (loadc_b + l) * SHMEM_STRIDE + loadr_b * LOAD_VEC_B / 2;
-    }
+#define A_LANE(l) (XL_IDX_BASE ? a_lane0 + a_lane_off(0, (l)) : a_lane[(l) / loadstride_a])
+#define A_SIDX(l) (XL_IDX_BASE ? a_sidx0 + a_shmem_index((l), 0) : a_sidx[(l) / loadstride_a])
+#define B_SIDX(l) (XL_IDX_BASE ? b_sidx0 + (l) * SHMEM_STRIDE : b_sidx[(l) / loadstride_b])
 #ifdef MUL_MAT_ID
 #define PF_B_GUARD if (gl_LocalInvocationID.x < required_work_items)
 #else
 #define PF_B_GUARD
 #endif
 #define PF_FETCH() \
-    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { fetch_a(pos_a, loadr_a, loadc_a + l, a_lane[l / loadstride_a], a_raw[l / loadstride_a]); } \
+    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { fetch_a(pos_a, loadr_a, loadc_a + l, A_LANE(l), a_raw[l / loadstride_a]); } \
     PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); } }
 #define PF_STORE() \
-    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { store_a_raw(pos_a, loadr_a, loadc_a + l, a_sidx[l / loadstride_a], a_raw[l / loadstride_a]); } \
-    PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(b_sidx[l / loadstride_b], b_raw[l / loadstride_b]); } }
+    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { store_a_raw(pos_a, loadr_a, loadc_a + l, A_SIDX(l), a_raw[l / loadstride_a]); } \
+    PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); } }
     const bool prefetch = ALIGNED != 0;
     if (prefetch) {
         a_fetch_all = true;
@@ -459,6 +479,8 @@ void main() {
                         coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
                         sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
                     }
+                    // XL: re-read the B fragments for every row (see XL_TILE)
+                    if (XL_TILE) { subgroupMemoryBarrierShared(); }
                 }
             }
 #ifdef MUL_MAT_ID
