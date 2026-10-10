@@ -5477,6 +5477,8 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    gated;
     const ggml_type type_x;    // f16: the f16 hc norm
+    const int64_t pad;         // > 0: x is a [n_embd, n_hc, n_tokens] view of a [n_embd*n_hc + pad, n_tokens] buffer
+                               // (LLAMA_HC_XN_PAD rows; 128 = the shipped pad, 2048 = a stride that camps again)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5484,17 +5486,27 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 
     std::string vars() override {
+        if (pad != 0) {
+            return VARS_TO_STR6(n_embd, n_hc, n_tokens, gated, type_x, pad);
+        }
         if (type_x != GGML_TYPE_F32) {
             return VARS_TO_STR5(n_embd, n_hc, n_tokens, gated, type_x);
         }
         return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated);
     }
 
-    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type type_x = GGML_TYPE_F32)
-        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), type_x(type_x) {}
+    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type type_x = GGML_TYPE_F32, int64_t pad = 0)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), type_x(type_x), pad(pad) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, type_x, n_embd, n_hc, n_tokens);
+        ggml_tensor * x;
+        if (pad > 0) {
+            ggml_tensor * buf = ggml_new_tensor_2d(ctx, type_x, n_embd * n_hc + pad, n_tokens);
+            ggml_set_name(buf, "buf");
+            x = ggml_view_3d(ctx, buf, n_embd, n_hc, n_tokens, n_embd * ggml_element_size(buf), buf->nb[1], 0);
+        } else {
+            x = ggml_new_tensor_3d(ctx, type_x, n_embd, n_hc, n_tokens);
+        }
         ggml_set_name(x, "x");
 
         if (gated) {
@@ -12790,6 +12802,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 64, true, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 64, true, GGML_TYPE_F16, 128));   // row-padded f16 xn (LLAMA_HC_XN_PAD)
 
     // MUL_MAT + CPY(f16): exact and ragged tiles, the column count at the mat-vec boundary, the Flash-Next hc up GEMM
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
@@ -15790,6 +15803,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // R1 (10-10): is the halo-box hc mix (DSV4_HC_PRE on the f16 xn, ~76 ms per 2048-token ubatch) limited by the
+    // 20480-B row stride of xn? packed vs the shipped 128-element pad vs a 2048-element pad that lands on a camping stride again
+    for (int64_t pad : {0, 128, 2048}) {
+        test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 2048, true, GGML_TYPE_F16, pad));
+    }
 
     if (getenv("GGML_PERF_MOE")) {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
