@@ -24,6 +24,12 @@ struct vk_mat_mat_hcmix_push_constants {
     uint32_t hc_round;  // 1: f16 gate (the unfused chain casts it), 0: f32 gate
 };
 
+// matmul_f32_f32_qsa (QSA_EPI in mul_mm.comp): the plain push constants plus the block-bias addressing
+struct vk_mat_mat_qsa_push_constants {
+    vk_mat_mat_push_constants mm;
+    uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;
+};
+
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
     uint32_t stride_a;

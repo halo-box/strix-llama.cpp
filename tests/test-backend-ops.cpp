@@ -9349,6 +9349,81 @@ struct test_top_k_stable_ties : public test_top_k {
 };
 
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
+// qwen4exp QSA indexer scorer: MUL_MAT(pooled keys, q) -> relu -> 4-head sum (-> + block bias), the chain
+// build_qsa_top_k emits; the Vulkan backend fuses it into one GEMM epilogue (QSA_SCORE, GGML_VK_QSA_SCORE=1).
+// Inputs are multiples of 1/8, so every product and every partial sum is exact in f16 inputs and f32
+// accumulation: the fused result must match the CPU bit for bit.
+struct test_qsa_score : public test_case {
+    const int64_t K;
+    const int64_t n_blocks;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const bool    bias;
+    const bool    exact;   // false: uniform inputs, the NMSE vs the CPU then measures the f16 GEMM rounding
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_SCORE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(K, n_blocks, n_tps, n_stream, bias, exact);
+    }
+
+    test_qsa_score(int64_t K = 128, int64_t n_blocks = 512, int64_t n_tps = 64, int64_t n_stream = 1, bool bias = true, bool exact = true)
+        : K(K), n_blocks(n_blocks), n_tps(n_tps), n_stream(n_stream), bias(bias), exact(exact) {}
+
+    double max_err() override { return exact ? 0.0 : 1e-6; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = 4;
+        ggml_tensor * keys = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_blocks, n_stream);
+        ggml_set_name(keys, "keys");
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, H*n_tps, n_stream);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * score = ggml_mul_mat(ctx, keys, q);
+        score = ggml_reshape_4d(ctx, score, n_blocks, H, n_tps, n_stream);
+        score = ggml_relu(ctx, score);
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < H; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx, score, n_blocks, n_tps, n_stream, score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx, summed, slice) : ggml_cont(ctx, slice);
+        }
+        if (bias) {
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+            ggml_set_name(b, "bias");
+            summed = ggml_add(ctx, summed, b);
+        }
+        out = summed;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            std::vector<float> data(ggml_nelements(t));
+            const bool is_bias = strcmp(t->name, "bias") == 0;
+            if (!exact && !is_bias) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+                continue;
+            }
+            for (auto & v : data) {
+                // the bias is 0 or a large negative (the model's -inf, finite so the error stays defined)
+                v = is_bias ? ((rand() % 4) == 0 ? -1024.0f : 0.0f) : (float) (rand() % 17 - 8) / 8.0f;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+        }
+    }
+};
+
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
     const int64_t n_kv;
@@ -12948,6 +13023,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,    GGML_TYPE_Q8_0,   256, 128, 16, 4, 129, 0, true, true));
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,    GGML_TYPE_Q8_0,   256, 224, 16, 4, 65, 0, true, true));   // ff not a tile multiple
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,   GGML_TYPE_Q8_0,   256, 128, 16, 4, 5, 0));    // mat-vec MMID: no fusion
+    // qwen4exp QSA indexer scorer (MUL_MAT + relu + head sum + block bias), incl. ragged M/N edges and 2 streams
+    test_cases.emplace_back(new test_qsa_score(128, 512,  64, 1, true));
+    test_cases.emplace_back(new test_qsa_score(128, 4608, 512, 1, true));
+    test_cases.emplace_back(new test_qsa_score(128, 300,  50, 1, true));
+    test_cases.emplace_back(new test_qsa_score(128, 777,  33, 2, true));
+    test_cases.emplace_back(new test_qsa_score(128, 512,  64, 1, false));
+    test_cases.emplace_back(new test_qsa_score(96,  200,  20, 1, true));    // K not a multiple of the aligned load
+    test_cases.emplace_back(new test_qsa_score(128, 60,   64, 1, true));    // M <= 64: not fused
+    test_cases.emplace_back(new test_qsa_score(128, 512,  64, 1, true, false));
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
