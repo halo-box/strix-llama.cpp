@@ -777,10 +777,16 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
         // member cells per group, for the tails (a group's slot k holds the cell at position k within the block)
         std::vector<int32_t> group_members;
         if (dst_tail) {
+            llama_kv_cells::seq_set_t tail_seqs;
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                tail_seqs.set(ubatch->seq_id[s*n_tps + ii][0]);
+            }
             group_members.assign(grp_first.size()*r, -1);
             for (int64_t j=0;j<n_kv;++j) {
                 const int32_t g=cell_grp[j];
                 if (g<0) { continue; }
+                // Other sequences' image cells can share a slot; their tails are not read by this ubatch.
+                if ((cells.seq_get_all((uint32_t) j) & tail_seqs).none()) { continue; }
                 const int64_t idx=ranked ? rank[j] : cells.pos_get(j);
                 const int64_t slot=g*r+idx%r;
                 GGML_ASSERT(group_members[slot]<0 || group_members[slot]==j);
