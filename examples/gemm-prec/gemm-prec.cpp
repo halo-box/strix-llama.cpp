@@ -59,7 +59,11 @@ int main(int argc, char ** argv) {
     const size_t na = (size_t) k * m * (ne_exp ? ne_exp : 1), nb = (size_t) k * n * (ne_exp ? n_used : 1);
     auto wa = randf(na, 0.05f, 1), xb = randf(nb, 1.0f, 2);
     std::vector<int32_t> ids; if (ne_exp) { std::mt19937 r(3); ids.resize((size_t) n_used * n); for (int t = 0; t < n; t++) { std::vector<int> p(ne_exp); for (int e = 0; e < ne_exp; e++) p[e] = e; std::shuffle(p.begin(), p.end(), r); for (int u = 0; u < n_used; u++) ids[(size_t) t * n_used + u] = p[u]; } }
-    run_t ref = run_on(cpu, ta, tb, m, n, k, ne_exp, n_used, wa, xb, ids, 1);
+    // the CPU reference always takes an f32 B (ggml-cpu asserts src1 f32 for a quantised A with an f16 B); for the f16-B arm the
+    // Vulkan side gets the f16-rounded values and the reference gets the same values as f32, so the error is the backend's alone
+    std::vector<float> xb_ref = xb;
+    if (tb == GGML_TYPE_F16) { for (auto & v : xb_ref) v = ggml_fp16_to_fp32(ggml_fp32_to_fp16(v)); }
+    run_t ref = run_on(cpu, ta, GGML_TYPE_F32, m, n, k, ne_exp, n_used, wa, xb_ref, ids, 1);
     run_t dev = run_on(gpu, ta, tb, m, n, k, ne_exp, n_used, wa, xb, ids, 10);
     double maxabs = 0, maxref = 0, num = 0, den = 0;
     for (size_t i = 0; i < ref.out.size(); i++) { double d = (double) dev.out[i] - ref.out[i]; maxabs = std::max(maxabs, std::fabs(d)); maxref = std::max(maxref, (double) std::fabs(ref.out[i])); num += d * d; den += (double) ref.out[i] * ref.out[i]; }
