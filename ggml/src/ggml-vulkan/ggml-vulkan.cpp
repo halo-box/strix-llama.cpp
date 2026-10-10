@@ -1856,6 +1856,7 @@ static bool ggml_vk_mm_prefetch_enabled(const vk_device& device);
 static bool ggml_vk_mm_prefetch_type(ggml_type t);
 static bool ggml_vk_dense_f16coopmat(ggml_type t);
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
+static bool ggml_vk_dense_wave32_enabled(const vk_device& device);
 static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type, uint32_t m, uint32_t n, uint32_t k);
 
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -2840,16 +2841,35 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             FOR_EACH_LUT_FP4_TYPE(X_CM1)
         }
 #undef X_CM1
-        // register-prefetch variants (GGML_VK_MM_PREFETCH): same tiles as the quant pipelines, keyed with pf = true
+        // register-prefetch variants (GGML_VK_MM_PREFETCH): same tiles as the quant pipelines, keyed with pf = true; with
+        // GGML_VK_DENSE_WAVE32 (E5) the tiles are retiled for wave32 subgroups at the same BLOCK_SIZE (WM / WN halved until
+        // the warp grid tiles BM x BN again) and the subgroup size is pinned to 32
         if (ggml_vk_mm_prefetch_enabled(device)) {
+            std::vector<vk_tile_config> tc_pf = tc_mmq;
+            const bool pf_w32 = ggml_vk_dense_wave32_enabled(device);
+            if (pf_w32) {
+                for (auto & tc : tc_pf) {
+                    std::vector<uint32_t> & w = tc.warptile;
+                    if (w[10] == 32) continue;
+                    const uint32_t bm = w[1], bn = w[2], nwarps = w[0] / 32;
+                    uint32_t wm = w[4], wn = w[5];
+                    while ((bm / wm) * (bn / wn) < nwarps) { if (wm > w[7] && wm >= wn) wm /= 2; else if (wn > w[8]) wn /= 2; else break; }
+                    if ((bm / wm) * (bn / wn) != nwarps) continue;   // cannot retile: keep the driver default for this config
+                    w[4] = wm; w[5] = wn; w[10] = 32;
+                }
+            }
+            auto cm1_create_pf = [&](vk_matmul_pipeline_key key, const std::string& name, size_t len, const void* data) {
+                auto tc = filter_tc(tc_pf, key.type_a, key.mul_mat_id);
+                if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, sizeof(vk_mat_mat_push_constants), 3, cm1_spec, false, true, 0, true, pf_w32 || cm1_pin);
+            };
 #define X_CM1_PF(TYPE, tstr) \
             if (device->coopmat_acc_f16_support) { \
-                cm1_create({TYPE, GGML_TYPE_F32, false, true, false, false, true},  tc_mmq, "matmul_" #tstr "_f32_pf_f16acc", matmul_##tstr##_f32_pf_f16acc_cm1_len, matmul_##tstr##_f32_pf_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3); \
-                cm1_create({TYPE, GGML_TYPE_F16, false, true, false, false, true},  tc_mmq, "matmul_" #tstr "_f16_pf_f16acc", matmul_##tstr##_f16_pf_f16acc_cm1_len, matmul_##tstr##_f16_pf_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3); \
+                cm1_create_pf({TYPE, GGML_TYPE_F32, false, true, false, false, true},  "matmul_" #tstr "_f32_pf_f16acc", matmul_##tstr##_f32_pf_f16acc_cm1_len, matmul_##tstr##_f32_pf_f16acc_cm1_data); \
+                cm1_create_pf({TYPE, GGML_TYPE_F16, false, true, false, false, true},  "matmul_" #tstr "_f16_pf_f16acc", matmul_##tstr##_f16_pf_f16acc_cm1_len, matmul_##tstr##_f16_pf_f16acc_cm1_data); \
             } \
             if (device->coopmat_acc_f32_support) { \
-                cm1_create({TYPE, GGML_TYPE_F32, false, false, false, false, true}, tc_mmq, "matmul_" #tstr "_f32_pf",        matmul_##tstr##_f32_pf_cm1_len,        matmul_##tstr##_f32_pf_cm1_data,        sizeof(vk_mat_mat_push_constants), 3); \
-                cm1_create({TYPE, GGML_TYPE_F16, false, false, false, false, true}, tc_mmq, "matmul_" #tstr "_f16_pf",        matmul_##tstr##_f16_pf_cm1_len,        matmul_##tstr##_f16_pf_cm1_data,        sizeof(vk_mat_mat_push_constants), 3); \
+                cm1_create_pf({TYPE, GGML_TYPE_F32, false, false, false, false, true}, "matmul_" #tstr "_f32_pf",        matmul_##tstr##_f32_pf_cm1_len,        matmul_##tstr##_f32_pf_cm1_data); \
+                cm1_create_pf({TYPE, GGML_TYPE_F16, false, false, false, false, true}, "matmul_" #tstr "_f16_pf",        matmul_##tstr##_f16_pf_cm1_len,        matmul_##tstr##_f16_pf_cm1_data); \
             }
             X_CM1_PF(GGML_TYPE_Q8_0, q8_0)
             X_CM1_PF(GGML_TYPE_Q5_0, q5_0)
@@ -7185,6 +7205,17 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
     const uint32_t waves_xl = CEIL_DIV(CEIL_DIV(m, 256u) * CEIL_DIV(n, 256u), cu);
     const uint32_t waves_l  = CEIL_DIV(CEIL_DIV(m, 128u) * CEIL_DIV(n, 128u), 2 * cu);
     return 2 * waves_xl <= waves_l;
+}
+
+// E5 wave32 (port of the fork's 25c45fea1): RDNA3.x WMMA is wave32-native, so a wave64 subgroup issues each coopmat op as two
+// halves. The prefetch (and XL) dense pipelines are retiled so the warp grid tiles BM x BN with wave32 subgroups at the same
+// BLOCK_SIZE, and the subgroup size is pinned to 32. GGML_VK_DENSE_WAVE32=0 keeps the driver default (wave64 on RADV).
+static bool ggml_vk_dense_wave32_enabled(const vk_device& device) {
+    static const int env = [] { const char * e = getenv("GGML_VK_DENSE_WAVE32"); return e ? atoi(e) : -1; }();
+    const bool can = device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support && !device->coopmat2 &&
+                     device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32 &&
+                     device->subgroup_size != 32;
+    return can && (env >= 0 ? env != 0 : true);
 }
 
 static bool ggml_vk_mm_prefetch_type(ggml_type t) {
