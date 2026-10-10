@@ -5,6 +5,7 @@
 #include "qsa-prefix-state.h"
 #include <algorithm>
 #include <cstdint>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -22,12 +23,29 @@ static bool qsa_scalar_visibility_cells(const llama_kv_cells & cells, uint32_t c
         }
         rows.set(u.seq_id[i][0]);
     }
-    // a 2-D (image) cell past its linear position breaks the scalar test; only blocks with a shared cell can split
+    // a 2-D (image) cell past its linear position can break the scalar test: the mrope mask compares 2-D extents only
+    // between a cell and a query at the same linear position. With one sequence in the cache the selection ranks the
+    // cells in the mask's own order (position, then y, then x), so such a cell is harmless unless a query of this
+    // ubatch sits at its position. Several sequences are not ranked: any 2-D cell keeps the masked path there.
+    // only blocks with a shared cell can split
     std::unordered_map<llama_pos, std::vector<llama_kv_cells::seq_set_t>> shared;
+    std::vector<llama_pos> pos_2d;
+    bool one_seq = rows.count()==1;
     for (uint32_t j=0;j<count;++j) {
-        if (cells.is_empty(j) || (cells.seq_get_all(j) & rows).none()) { continue; }
-        if (u.is_pos_2d() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
+        if (cells.is_empty(j)) { continue; }
+        one_seq = one_seq && cells.seq_get_all(j)==rows;
+        if ((cells.seq_get_all(j) & rows).none()) { continue; }
+        if (u.is_pos_2d() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { pos_2d.push_back(cells.pos_get(j)); }
         if (cells.seq_get_all(j).count()>1) { shared[cells.pos_get(j)/ratio]; }
+    }
+    if (!pos_2d.empty()) {
+        // the same test the selection uses to rank: no other sequence anywhere in the cache
+        for (llama_seq_id s=0;one_seq && s<LLAMA_MAX_SEQ;++s) { one_seq = rows.test(s) || cells.seq_pos_min(s)<0; }
+        if (!one_seq) { return false; }
+        std::sort(pos_2d.begin(), pos_2d.end());
+        for (uint32_t i=0;i<u.n_tokens;++i) {
+            if (std::binary_search(pos_2d.begin(), pos_2d.end(), u.pos[i])) { return false; }
+        }
     }
     for (uint32_t j=0;!shared.empty() && j<count;++j) {
         if (cells.is_empty(j) || (cells.seq_get_all(j) & rows).none()) { continue; }
@@ -55,22 +73,45 @@ static bool qsa_single_sequence_prefix(const llama_kv_cells & cells, uint32_t co
     return std::adjacent_find(positions.begin(),positions.end())==positions.end();
 }
 
-// rebuild the QSA prefix of seq from the cells (out: fresh, sized to the cache): each position in [0, n) must be in one cell that no other sequence shares
-// a unified cache also holds other sequences (other slots of a server): skip their cells, seq does not attend to them
+// rebuild the QSA prefix of seq from the cells (out: sized to the cache): its cells in the mask's order (position, then y,
+// then x), keyed as the cache stores them; apply checks the order (no two cells with one key) and fills every tracked field
+// a unified cache also holds other sequences (other slots of a server): skip their cells, seq does not attend to them;
+// a cell shared with another sequence is refused
 static bool qsa_rebuild_prefix(const llama_kv_cells & raw, llama_seq_id seq, qsa_prefix_state & out) {
-    out.cells.assign(raw.seq_pos_max(seq) + 1, -1);
+    out.reset();
+    const llama_pos pmax = raw.seq_pos_max(seq);
+    if (pmax < 0) { out.sequence = seq; return true; }
+    // counting sort by position (linear: a switch between sequences rebuilds), then (y, x) among an image's cells
+    std::vector<uint32_t> first(size_t(pmax) + 2, 0);
     for (uint32_t cell=raw.used_min(); cell<raw.used_max_p1(); ++cell) {
         if (raw.is_empty(cell) || !raw.seq_has(cell, seq)) { continue; }
-        const int32_t pos = raw.pos_get(cell);
-        const auto & ext = raw.ext_get(cell);
-        if (pos < 0 || size_t(pos) >= out.cells.size() || out.cells[pos] >= 0 ||
-            raw.seq_get_all(cell).count() != 1 ||
-            !((ext.x == 0 && ext.y == 0) || (ext.x == pos && ext.y == pos))) { return false; }
-        out.cells[pos] = cell; out.positions[cell] = pos;
+        const llama_pos pos = raw.pos_get(cell);
+        if (pos < 0 || pos > pmax || raw.seq_get_all(cell).count() != 1) { return false; }
+        ++first[pos + 1];
     }
-    if (std::find(out.cells.begin(), out.cells.end(), -1) != out.cells.end()) { return false; }
+    for (size_t i = 1; i < first.size(); ++i) { first[i] += first[i-1]; }
+    const size_t n = first.back();
+    std::vector<uint32_t> slots(n); std::vector<int32_t> p(n), y(n), x(n);
+    for (uint32_t cell=raw.used_min(); cell<raw.used_max_p1(); ++cell) {
+        if (raw.is_empty(cell) || !raw.seq_has(cell, seq)) { continue; }
+        const llama_pos pos = raw.pos_get(cell);
+        const auto & ext = raw.ext_get(cell);
+        const uint32_t k = first[pos]++;
+        slots[k] = cell; p[k] = pos; y[k] = ext.y; x[k] = ext.x;
+    }
+    for (size_t i = 0; i < n;) {
+        size_t j = i + 1;
+        while (j < n && p[j] == p[i]) { ++j; }
+        if (j - i > 1) {
+            std::vector<std::tuple<int32_t, int32_t, uint32_t>> group;
+            for (size_t k = i; k < j; ++k) { group.emplace_back(y[k], x[k], slots[k]); }
+            std::sort(group.begin(), group.end());
+            for (size_t k = i; k < j; ++k) { std::tie(y[k], x[k], slots[k]) = group[k - i]; }
+        }
+        i = j;
+    }
+    if (n > 0 && !out.apply(seq, 0, slots, p, y, x)) { return false; }
     out.sequence = seq;
-    for (size_t b=0; b<out.cells.size()/4; ++b) { out.block_positions.push_back(b*4); }
     return true;
 }
 
