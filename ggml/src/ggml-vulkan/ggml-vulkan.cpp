@@ -1855,6 +1855,7 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 static bool ggml_vk_mm_prefetch_enabled(const vk_device& device);
 static bool ggml_vk_mm_prefetch_type(ggml_type t);
 static bool ggml_vk_dense_f16coopmat(ggml_type t);
+static bool ggml_vk_mmid_f16coopmat(ggml_type t);
 static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type, uint32_t m, uint32_t n, uint32_t k);
 
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -7196,15 +7197,21 @@ static bool ggml_vk_mm_prefetch_type(ggml_type t) {
     }
 }
 
-// GGML_VK_DENSE_F16COOPMAT: route these quantized A types off the int8 MMQ path onto the f16-B KHR coopmat matmul
-// (the prefetch variant when enabled). "1" or "all" = every type that has one, else a comma list of type names
-// (q8_0,q5_k,...). Off by default: the per-type default comes from the op-level table (llama-gemm-prec) once measured.
-static bool ggml_vk_dense_f16coopmat(ggml_type t) {
-    static const std::vector<std::string> list = [] {
-        std::vector<std::string> v;
-        const char * e = getenv("GGML_VK_DENSE_F16COOPMAT");
-        if (e == nullptr || *e == 0 || strcmp(e, "0") == 0) return v;
-        std::string str(e);
+// Dense router (PORT-MAP E-stack): which quantized A types leave the int8 MMQ path for the f16-B KHR coopmat matmul (the
+// register-prefetch variant). Default = the types measured faster there at op level on gfx1151 / Mesa 26.2.4 (10-10,
+// f16 B, 27B shapes 17408x2048x5120 / 5120x2048x17408 vs the int8 MMQ pipelines): q4_K -27%, q5_K -27%, iq4_xs -19%;
+// q8_0 stays on int8 (3.72 vs 3.76 ms and 2.40 vs 2.88 ms at the Flash-Next shapes), q6_K / q3_K / q5_0 / iq4_nl stay
+// until measured. GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8, "all" routes every type that has a prefetch
+// pipeline, else a comma list of type names (q8_0,q5_k,...). MUL_MAT_ID has its own, default-off list
+// (GGML_VK_MMID_F16COOPMAT) because the expert GEMMs were not measured on this path.
+static const std::vector<std::string> & ggml_vk_route_list(const char * env_name, const char * dflt) {
+    static std::map<std::string, std::vector<std::string>> cache;
+    auto it = cache.find(env_name);
+    if (it != cache.end()) return it->second;
+    std::vector<std::string> v;
+    const char * e = getenv(env_name);
+    std::string str(e ? e : dflt);
+    if (!(str.empty() || str == "0")) {
         size_t pos = 0;
         while (pos <= str.size()) {
             size_t nxt = str.find(',', pos);
@@ -7212,14 +7219,28 @@ static bool ggml_vk_dense_f16coopmat(ggml_type t) {
             if (nxt > pos) v.push_back(str.substr(pos, nxt - pos));
             pos = nxt + 1;
         }
-        return v;
-    }();
+    }
+    return cache.emplace(env_name, v).first->second;
+}
+
+static bool ggml_vk_route_match(const std::vector<std::string> & list, ggml_type t) {
     if (list.empty()) return false;
     for (const auto& n : list) {
-        if (n == "1" || n == "all" || n == ggml_type_name(t)) return true;
+        if (n == "1" || n == "all") return ggml_vk_mm_prefetch_type(t);
+        if (n == ggml_type_name(t)) return true;
     }
     return false;
 }
+
+static bool ggml_vk_dense_f16coopmat(ggml_type t) {
+    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,iq4_xs"), t);
+}
+
+static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
+    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_MMID_F16COOPMAT", ""), t);
+}
+
+
 
 // out16: the MUL_MAT+CPY(f16) fusion. The result is stored as f16 straight into the cast's destination
 // (contiguous, same shape) by an f16-output int8 MMQ pipeline; dst itself is never written.
@@ -7283,7 +7304,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                                 (src1->type == GGML_TYPE_F32 || f16_y) && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
     // GGML_VK_DENSE_F16COOPMAT: listed types leave the int8 path for the f16-B KHR coopmat matmul (not for the f16-out fusion,
     // which exists on the int8 path only)
-    if (can_quantize_y && !d16 && ggml_vk_dense_f16coopmat(src0->type)) {
+    if (can_quantize_y && !d16 && ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_dense_f16coopmat(src0->type)) {
         can_quantize_y = false;
     }
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
@@ -8610,7 +8631,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const bool f16_y = src1->type == GGML_TYPE_F16 && ggml_vk_mmq_f16_y_enabled() && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
     bool can_quantize_y = ctx->device->integer_dot_product && (src1->type == GGML_TYPE_F32 || f16_y) &&
                                 ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
-    if (can_quantize_y && !d16 && !glu && ggml_vk_dense_f16coopmat(src0->type)) {
+    if (can_quantize_y && !d16 && !glu && ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mmid_f16coopmat(src0->type)) {
         can_quantize_y = false;
     }
     // Intel coopmat1 matrix cores prefer f16 activations for quantized weights
