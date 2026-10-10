@@ -65,6 +65,7 @@ vec4 rocmfpx_mm_fp6_vec4(uint ib, uint idx) {
 }
 #endif
 
+#if !defined(MM_PREFETCH)   // MM_PREFETCH variants take load_a_to_shmem from mul_mm_pf_funcs.glsl
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
 #if LOAD_VEC_A == 8
@@ -740,6 +741,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     }
 #endif
 }
+#endif // !MM_PREFETCH
 
 #if !defined(MUL_MAT_ID)
 void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint idx_n, const uint block, const uint end_k) {

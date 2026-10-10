@@ -1851,6 +1851,11 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 #endif
 }
 
+// register-prefetch coopmat matmul knobs (defined with the other matmul env switches further down)
+static bool ggml_vk_mm_prefetch_enabled(const vk_device& device);
+static bool ggml_vk_mm_prefetch_type(ggml_type t);
+static bool ggml_vk_dense_f16coopmat(ggml_type t);
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -2819,6 +2824,28 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             FOR_EACH_LUT_FP4_TYPE(X_CM1)
         }
 #undef X_CM1
+        // register-prefetch variants (GGML_VK_MM_PREFETCH): same tiles as the quant pipelines, keyed with pf = true
+        if (ggml_vk_mm_prefetch_enabled(device)) {
+#define X_CM1_PF(TYPE, tstr) \
+            if (device->coopmat_acc_f16_support) { \
+                cm1_create({TYPE, GGML_TYPE_F32, false, true, false, false, true},  tc_mmq, "matmul_" #tstr "_f32_pf_f16acc", matmul_##tstr##_f32_pf_f16acc_cm1_len, matmul_##tstr##_f32_pf_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3); \
+                cm1_create({TYPE, GGML_TYPE_F16, false, true, false, false, true},  tc_mmq, "matmul_" #tstr "_f16_pf_f16acc", matmul_##tstr##_f16_pf_f16acc_cm1_len, matmul_##tstr##_f16_pf_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3); \
+            } \
+            if (device->coopmat_acc_f32_support) { \
+                cm1_create({TYPE, GGML_TYPE_F32, false, false, false, false, true}, tc_mmq, "matmul_" #tstr "_f32_pf",        matmul_##tstr##_f32_pf_cm1_len,        matmul_##tstr##_f32_pf_cm1_data,        sizeof(vk_mat_mat_push_constants), 3); \
+                cm1_create({TYPE, GGML_TYPE_F16, false, false, false, false, true}, tc_mmq, "matmul_" #tstr "_f16_pf",        matmul_##tstr##_f16_pf_cm1_len,        matmul_##tstr##_f16_pf_cm1_data,        sizeof(vk_mat_mat_push_constants), 3); \
+            }
+            X_CM1_PF(GGML_TYPE_Q8_0, q8_0)
+            X_CM1_PF(GGML_TYPE_Q5_0, q5_0)
+            X_CM1_PF(GGML_TYPE_Q3_K, q3_k)
+            X_CM1_PF(GGML_TYPE_Q6_K, q6_k)
+            X_CM1_PF(GGML_TYPE_Q4_K, q4_k)
+            X_CM1_PF(GGML_TYPE_Q5_K, q5_k)
+            X_CM1_PF(GGML_TYPE_IQ4_XS, iq4_xs)
+            X_CM1_PF(GGML_TYPE_IQ3_XXS, iq3_xxs)
+            X_CM1_PF(GGML_TYPE_IQ4_NL, iq4_nl)
+#undef X_CM1_PF
+        }
 
         if (device->coopmat_int_support && (rdna3 || rdna4)) {
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
@@ -2912,6 +2939,28 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             FOR_EACH_LUT_FP4_TYPE(X_CM1_ID)
         }
 #undef X_CM1_ID
+        // register-prefetch variants (GGML_VK_MM_PREFETCH): same tiles as the quant pipelines, keyed with pf = true
+        if (ggml_vk_mm_prefetch_enabled(device)) {
+#define X_CM1_ID_PF(TYPE, tstr) \
+            if (device->coopmat_acc_f16_support) { \
+                cm1_create({TYPE, GGML_TYPE_F32, true, true, false, false, true},  tc_mmq_id, "matmul_id_subgroup_" #tstr "_f32_pf_f16acc", matmul_id_subgroup_##tstr##_f32_pf_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f32_pf_f16acc_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
+                cm1_create({TYPE, GGML_TYPE_F16, true, true, false, false, true},  tc_mmq_id, "matmul_id_subgroup_" #tstr "_f16_pf_f16acc", matmul_id_subgroup_##tstr##_f16_pf_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f16_pf_f16acc_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
+            } \
+            if (device->coopmat_acc_f32_support) { \
+                cm1_create({TYPE, GGML_TYPE_F32, true, false, false, false, true}, tc_mmq_id, "matmul_id_subgroup_" #tstr "_f32_pf",        matmul_id_subgroup_##tstr##_f32_pf_cm1_len,        matmul_id_subgroup_##tstr##_f32_pf_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
+                cm1_create({TYPE, GGML_TYPE_F16, true, false, false, false, true}, tc_mmq_id, "matmul_id_subgroup_" #tstr "_f16_pf",        matmul_id_subgroup_##tstr##_f16_pf_cm1_len,        matmul_id_subgroup_##tstr##_f16_pf_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
+            }
+            X_CM1_ID_PF(GGML_TYPE_Q8_0, q8_0)
+            X_CM1_ID_PF(GGML_TYPE_Q5_0, q5_0)
+            X_CM1_ID_PF(GGML_TYPE_Q3_K, q3_k)
+            X_CM1_ID_PF(GGML_TYPE_Q6_K, q6_k)
+            X_CM1_ID_PF(GGML_TYPE_Q4_K, q4_k)
+            X_CM1_ID_PF(GGML_TYPE_Q5_K, q5_k)
+            X_CM1_ID_PF(GGML_TYPE_IQ4_XS, iq4_xs)
+            X_CM1_ID_PF(GGML_TYPE_IQ3_XXS, iq3_xxs)
+            X_CM1_ID_PF(GGML_TYPE_IQ4_NL, iq4_nl)
+#undef X_CM1_ID_PF
+        }
 
         if (device->coopmat_int_support && (rdna3 || rdna4)) {
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q4_0_q8_1",   matmul_id_subgroup_q4_0_q8_1_cm1_len,   matmul_id_subgroup_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
@@ -6689,6 +6738,17 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_t
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
         ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false, bool d16 = false, bool glu = false) {
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
+    if (!d16 && !glu && ggml_vk_mm_prefetch_type(src0_type) && ggml_vk_mm_prefetch_enabled(ctx->device)) {
+        // register-prefetch variant (same tiles, same B type); falls through to the generic pipelines when absent
+        vk_matmul_pipeline_key kp{src0_type, src1_type, mul_mat_id, f16acc, false, false, true};
+        auto itp = ctx->device->pipeline_matmul.find(kp);
+        if (itp != ctx->device->pipeline_matmul.end() && !itp->second.empty()) return &itp->second;
+        if (f16acc) {
+            kp.f16acc = false;
+            itp = ctx->device->pipeline_matmul.find(kp);
+            if (itp != ctx->device->pipeline_matmul.end() && !itp->second.empty()) return &itp->second;
+        }
+    }
     vk_matmul_pipeline_key key{src0_type, src1_type, mul_mat_id, f16acc, d16, glu};
     auto it = ctx->device->pipeline_matmul.find(key);
     if (it == ctx->device->pipeline_matmul.end() || it->second.empty()) {
@@ -7044,6 +7104,50 @@ static bool ggml_vk_mmq_f16_y_enabled() {
     return on;
 }
 
+// Register-prefetch KHR coopmat matmuls (mul_mm_pf_funcs.glsl, port of the nathanw fork GEMM rewrite): the K loop issues the
+// next tile's global loads before the WMMAs and dequantises them one iteration later, with 8-wide dword loaders for the
+// 2-byte-aligned block types. GGML_VK_MM_PREFETCH=0 turns it off (default on for RADV); the pipelines exist for q8_0, q5_0,
+// q3_K, q6_K, q4_K, q5_K, iq4_xs, iq3_xxs and iq4_nl with an f16 or f32 B.
+static bool ggml_vk_mm_prefetch_enabled(const vk_device& device) {
+    static const int env = [] { const char * e = getenv("GGML_VK_MM_PREFETCH"); return e ? atoi(e) : -1; }();
+    return env >= 0 ? env != 0 : device->driver_id == vk::DriverId::eMesaRadv;
+}
+
+static bool ggml_vk_mm_prefetch_type(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q3_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
+        case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// GGML_VK_DENSE_F16COOPMAT: route these quantized A types off the int8 MMQ path onto the f16-B KHR coopmat matmul
+// (the prefetch variant when enabled). "1" or "all" = every type that has one, else a comma list of type names
+// (q8_0,q5_k,...). Off by default: the per-type default comes from the op-level table (llama-gemm-prec) once measured.
+static bool ggml_vk_dense_f16coopmat(ggml_type t) {
+    static const std::vector<std::string> list = [] {
+        std::vector<std::string> v;
+        const char * e = getenv("GGML_VK_DENSE_F16COOPMAT");
+        if (e == nullptr || *e == 0 || strcmp(e, "0") == 0) return v;
+        std::string str(e);
+        size_t pos = 0;
+        while (pos <= str.size()) {
+            size_t nxt = str.find(',', pos);
+            if (nxt == std::string::npos) nxt = str.size();
+            if (nxt > pos) v.push_back(str.substr(pos, nxt - pos));
+            pos = nxt + 1;
+        }
+        return v;
+    }();
+    if (list.empty()) return false;
+    for (const auto& n : list) {
+        if (n == "1" || n == "all" || n == ggml_type_name(t)) return true;
+    }
+    return false;
+}
+
 // out16: the MUL_MAT+CPY(f16) fusion. The result is stored as f16 straight into the cast's destination
 // (contiguous, same shape) by an f16-output int8 MMQ pipeline; dst itself is never written.
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, ggml_tensor * out16 = nullptr) {
@@ -7102,8 +7206,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
     // an f16 B (the f16 activations) is quantized to q8_1 straight from f16 (GGML_VK_MMQ_F16_Y=0: it takes the f16 matmul instead)
     const bool f16_y = src1->type == GGML_TYPE_F16 && ggml_vk_mmq_f16_y_enabled() && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
-    const bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
+    bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
                                 (src1->type == GGML_TYPE_F32 || f16_y) && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
+    // GGML_VK_DENSE_F16COOPMAT: listed types leave the int8 path for the f16-B KHR coopmat matmul (not for the f16-out fusion,
+    // which exists on the int8 path only)
+    if (can_quantize_y && !d16 && ggml_vk_dense_f16coopmat(src0->type)) {
+        can_quantize_y = false;
+    }
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
@@ -8406,8 +8515,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     // an f16 B (the f16 MoE activations) is quantized to q8_1 straight from f16 (GGML_VK_MMQ_F16_Y=0: f16 matmul)
     const bool f16_y = src1->type == GGML_TYPE_F16 && ggml_vk_mmq_f16_y_enabled() && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
-    const bool can_quantize_y = ctx->device->integer_dot_product && (src1->type == GGML_TYPE_F32 || f16_y) &&
+    bool can_quantize_y = ctx->device->integer_dot_product && (src1->type == GGML_TYPE_F32 || f16_y) &&
                                 ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
+    if (can_quantize_y && !d16 && !glu && ggml_vk_dense_f16coopmat(src0->type)) {
+        can_quantize_y = false;
+    }
     // Intel coopmat1 matrix cores prefer f16 activations for quantized weights
     const bool prefer_f16_b = ctx->device->coopmat_support && !ctx->device->coopmat2 &&
                               ctx->device->vendor_id == VK_VENDOR_ID_INTEL &&

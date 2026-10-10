@@ -686,6 +686,25 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         }
     }
 
+    // Register-prefetch variants of the KHR coopmat matmul (mul_mm_pf_funcs.glsl): per-type shaders with the
+    // 8-wide dword loaders (4-wide for q4_K/q5_K, which use the tile-row scale cache), f16 and f32 B, selected
+    // at init by GGML_VK_MM_PREFETCH. Dense and subgroup MUL_MAT_ID only (the default MUL_MAT_ID path has no
+    // coopmat variant on this tree).
+    if (coopmat && !coopmat2 && !dot2 && matmul_id_type != MatMulIdType::DEFAULT) {
+        for (const auto& tname : std::vector<std::string>{"q8_0", "q5_0", "q3_k", "q6_k", "q4_k", "q5_k", "iq4_xs", "iq3_xxs", "iq4_nl"}) {
+            const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+            const std::string lva = (tname == "q4_k" || tname == "q5_k") ? "4" : "8";
+            const std::map<std::string, std::string> float_type_dict = {
+                {"FLOAT_TYPE",   FLOAT_TYPE(1, tname)},
+                {"FLOAT_TYPEV2", FLOAT_TYPE(2, tname)},
+                {"FLOAT_TYPEV4", FLOAT_TYPE(4, tname)},
+                {"FLOAT_TYPEV8", FLOAT_TYPE(8, tname)},
+            };
+            string_to_spv(shader_name + "_" + tname + "_f16_pf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_" + tname + "_f32_pf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+        }
+    }
+
     // Quant shader: one SPIR-V for all quant types, selected via MmTypeA spec constant
     {
         const std::map<std::string, std::string> quant_float_type_dict = {
