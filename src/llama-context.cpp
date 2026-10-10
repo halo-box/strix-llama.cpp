@@ -1945,6 +1945,20 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// qwen4exp.cpp: the PLE row gather of a batch, run ahead of each ubatch on a worker thread (A1)
+void qwen4exp_ple_prefetch(const llama_model & model, const llama_batch & batch, uint32_t n_ubatch);
+void qwen4exp_ple_prefetch_end(const llama_model & model);
+
+struct qwen4exp_ple_prefetch_guard {
+    const llama_model & model;
+    explicit qwen4exp_ple_prefetch_guard(const llama_model & m) : model(m) {}
+    ~qwen4exp_ple_prefetch_guard() {
+        if (model.arch == LLM_ARCH_QWEN4EXP) {
+            qwen4exp_ple_prefetch_end(model);
+        }
+    }
+};
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2010,13 +2024,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
 
-    {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
-        // posix_fadvise only, so a wrong prediction costs readahead and nothing else
-        extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
+    // gather this batch's per-layer-embedding rows one ubatch ahead on a worker thread (A1, qwen4exp.cpp);
+    // the guard ends the ring with this decode, whatever path leaves it
+    qwen4exp_ple_prefetch_guard ple_guard(model);
+    {
         // llama_batch_ext keeps tokens as entries; the allocator's flat view has the token IDs
         const llama_batch & flat = balloc->get_batch();
-        if (model.arch == LLM_ARCH_QWEN4EXP && flat.token && flat.n_tokens >= 4096) {
-            qwen4exp_ple_prefetch(model, flat.token, flat.n_tokens);
+        if (model.arch == LLM_ARCH_QWEN4EXP && flat.token) {
+            qwen4exp_ple_prefetch(model, flat, cparams.n_ubatch);
         }
     }
     const uint32_t n_outputs_all = balloc->get_n_outputs();

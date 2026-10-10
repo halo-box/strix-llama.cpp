@@ -2552,6 +2552,7 @@ struct llama_model_clef : public llama_model_qwen35 {
 };
 
 struct llama_ple_disk;
+struct llama_ple_async;
 
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
@@ -2563,6 +2564,10 @@ struct llama_model_qwen4exp : public llama_model_base {
     // counted as created but never allocated, mapped or read, and build_ple takes its
     // rows from this reader instead of ggml_get_rows.
     std::shared_ptr<llama_ple_disk> ple_disk;
+    // A1 (2026-10-10): the PLE rows of the batch gathered ahead of each ubatch on a worker thread
+    // (llama-ple-async.h); one ring per model, driven from llama_context::decode. LLAMA_PLE_ASYNC=0 disables.
+    mutable std::shared_ptr<llama_ple_async> ple_async;
+    mutable std::mutex ple_async_mutex;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
