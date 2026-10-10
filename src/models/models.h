@@ -7,6 +7,8 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <mutex>
+#include <vector>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2563,6 +2565,16 @@ struct llama_model_qwen4exp : public llama_model_base {
     std::shared_ptr<llama_ple_disk> ple_disk;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    // bf16 twins of the f32 weights that decode reads as mat-vecs (router ffn_gate_inp, ssm_alpha / ssm_beta, the hc inject
+    // projections; B6, 2026-10-10): half the bytes per token where the values are bf16-exact (lower 16 bits zero), built
+    // lazily on the first graph with loaded weights. LLAMA_BF16_TWINS=0 disables. nullptr = no twin for this weight.
+    ggml_tensor * bf16_twin(const ggml_tensor * w) const;
+    mutable std::mutex bf16_twins_mutex;
+    mutable bool bf16_twins_tried = false;
+    mutable std::map<const ggml_tensor *, ggml_tensor *> bf16_twins;
+    mutable std::vector<ggml_context *> bf16_twin_ctxs;
+    mutable std::vector<ggml_backend_buffer_t> bf16_twin_bufs;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
