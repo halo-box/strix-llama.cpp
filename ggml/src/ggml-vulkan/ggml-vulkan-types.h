@@ -1325,6 +1325,7 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
+    uint32_t prealloc_y_last_row_pad {};   // GGML_VK_DENSE_YPAD: row pad (elements) of the staged f16 B in prealloc_y, 0 = contiguous
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
