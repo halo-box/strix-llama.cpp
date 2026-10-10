@@ -1860,6 +1860,7 @@ static bool ggml_vk_mmid_f16coopmat(ggml_type t);
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device);
 static uint32_t ggml_vk_dense_ypad();
 static bool ggml_vk_dense_ypad_camps(uint64_t k);
+static bool ggml_vk_mmid_rega_enabled(const vk_device& device);
 static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type, uint32_t m, uint32_t n, uint32_t k);
 
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -3037,6 +3038,37 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             X_CM1_ID_PF(GGML_TYPE_IQ3_XXS, iq3_xxs)
             X_CM1_ID_PF(GGML_TYPE_IQ4_NL, iq4_nl)
 #undef X_CM1_ID_PF
+            // REG_A tile for the aligned iq3_xxs / iq4_nl MUL_MAT_ID pf pipelines (keyed xl = true on the id keys): 128 threads
+            // = 4 wave32 subgroups, BM 128 x BN 64, each subgroup owns WM 32 rows and all 64 columns; spec constant 15 = 3
+            // (lane-split). Subgroup size pinned to 32 (the loader's fragment layout and the xor-16 shuffle assume wave32).
+            if (ggml_vk_mmid_rega_enabled(device)) {
+                const std::vector<uint32_t> rega_warptile = { 128, 128, 64, 32, 32, 64, 2, 16, 16, 16, 32 };
+                const std::vector<vk_tile_config> tc_rega = {{ rega_warptile, { 128, 64, 1 }, m_align }};
+                spec_fn_t rega_spec = [&](const std::vector<uint32_t>& wt, bool a) {
+                    std::vector<uint32_t> spec = ggml_vk_mul_mm_spec(wt, a);
+                    if (spec.size() == 12) { spec.push_back(ggml_vk_coopmat_shmem_pad(device, wt[3])); spec.push_back(0); }   // 12, 13
+                    if (spec.size() == 14) { spec.push_back(0); }                                                              // 14
+                    spec.push_back(3u);                                                                                        // 15: REG_A
+                    return spec;
+                };
+                auto cm1_create_rega = [&](vk_matmul_pipeline_key key, const std::string& name, size_t len, const void* data) {
+                    if (ggml_vk_matmul_shmem_support(device, rega_warptile, true, key.type_a)) {
+                        create_mm_pipelines(key, tc_rega, name, len, data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count, rega_spec, false, true, 0, true, true);
+                    }
+                };
+#define X_CM1_ID_REGA(TYPE, tstr) \
+                if (device->coopmat_acc_f16_support) { \
+                    cm1_create_rega({TYPE, GGML_TYPE_F32, true, true, false, false, true, true},  "matmul_id_subgroup_" #tstr "_f32_pf_f16acc_rega", matmul_id_subgroup_##tstr##_f32_pf_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f32_pf_f16acc_cm1_data); \
+                    cm1_create_rega({TYPE, GGML_TYPE_F16, true, true, false, false, true, true},  "matmul_id_subgroup_" #tstr "_f16_pf_f16acc_rega", matmul_id_subgroup_##tstr##_f16_pf_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f16_pf_f16acc_cm1_data); \
+                } \
+                if (device->coopmat_acc_f32_support) { \
+                    cm1_create_rega({TYPE, GGML_TYPE_F32, true, false, false, false, true, true}, "matmul_id_subgroup_" #tstr "_f32_pf_rega",        matmul_id_subgroup_##tstr##_f32_pf_cm1_len,        matmul_id_subgroup_##tstr##_f32_pf_cm1_data); \
+                    cm1_create_rega({TYPE, GGML_TYPE_F16, true, false, false, false, true, true}, "matmul_id_subgroup_" #tstr "_f16_pf_rega",        matmul_id_subgroup_##tstr##_f16_pf_cm1_len,        matmul_id_subgroup_##tstr##_f16_pf_cm1_data); \
+                }
+                X_CM1_ID_REGA(GGML_TYPE_IQ3_XXS, iq3_xxs)
+                X_CM1_ID_REGA(GGML_TYPE_IQ4_NL, iq4_nl)
+#undef X_CM1_ID_REGA
+            }
         }
 
         if (device->coopmat_int_support && (rdna3 || rdna4)) {
@@ -7257,6 +7289,14 @@ static bool ggml_vk_dense_ypad_camps(uint64_t k) {
     return std::gcd(bytes / 256, (uint64_t) 16) >= 8;
 }
 
+// REG_A (PORT-MAP F, Halogen (Peonist) expert-loading design via the nathanw fork): register-direct A for the aligned
+// MUL_MAT_ID f16-coopmat tile of iq3_xxs / iq4_nl (mul_mm.comp MMID_REGA). GGML_VK_MMID_REGA=0 turns it off; default on for
+// AMD (the fragment element layout the loader assumes is gfx11's).
+static bool ggml_vk_mmid_rega_enabled(const vk_device& device) {
+    static const int env = [] { const char * e = getenv("GGML_VK_MMID_REGA"); return e ? atoi(e) : -1; }();
+    return env >= 0 ? env != 0 : device->vendor_id == VK_VENDOR_ID_AMD;
+}
+
 static bool ggml_vk_mm_prefetch_type(ggml_type t) {
     switch (t) {
         case GGML_TYPE_Q8_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q3_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
@@ -8996,6 +9036,23 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             fprintf(stderr, "ggml_vulkan: mmid pipeline=%s n_for_tile=%u m=%u wg=(%u,%u,%u)\n",
                     pipeline->name.c_str(), n_for_tile, (uint32_t)ne01,
                     pipeline->wg_denoms[0], pipeline->wg_denoms[1], pipeline->wg_denoms[2]);
+        }
+    }
+
+    // REG_A tile (register-direct A, 128x64, wave32) for the aligned iq3_xxs / iq4_nl expert GEMMs on the f16-B coopmat
+    // pf path, where the tile selector would take the medium tile (about 64 rows per expert at a 2048-token ubatch)
+    if (aligned && !quantize_y && !qx_needs_dequant && !d16 && !glu && (src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_NL) &&
+        ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mmid_rega_enabled(ctx->device) && mmp_map->size() >= 3 &&
+        ctx->device->matmul_id_tile_selector(ne01, nei1, 0, ctx->device->shader_core_count, *mmp_map) == 1) {
+        const ggml_type tb = y_kernel_type;   // the B type this GEMM runs with (master's ggml_vk_mul_mat_b_type)
+        const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, tb, (ggml_prec)dst->op_params[0]);
+        vk_matmul_pipeline_key kr{src0->type, tb, true, f16acc, false, false, true, true};
+        auto itr = ctx->device->pipeline_matmul.find(kr);
+        if (itr == ctx->device->pipeline_matmul.end() || itr->second.empty()) { kr.f16acc = !f16acc; itr = ctx->device->pipeline_matmul.find(kr); }
+        if (itr != ctx->device->pipeline_matmul.end() && !itr->second.empty() && itr->second[0].aligned) {
+            static bool rega_logged = false;
+            if (!rega_logged) { rega_logged = true; fprintf(stderr, "ggml_vulkan: MUL_MAT_ID REG_A tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) nei1, (unsigned) ne10); }
+            pipeline = itr->second[0].aligned;
         }
     }
 

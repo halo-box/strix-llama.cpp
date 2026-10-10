@@ -26,6 +26,9 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
 #endif
+#if defined(COOPMAT) && defined(MUL_MAT_ID)
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
 
 #ifdef MUL_MAT_ID
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
@@ -250,6 +253,71 @@ shared SCACHE_T scache_dm[BM * 8];
 #include "mul_mm_pf_funcs.glsl"
 #endif
 
+// Register-direct A for MUL_MAT_ID (REG_A spec constant, host gate GGML_VK_MMID_REGA; port of the nathanw fork's REG_A, the
+// Halogen (Peonist) expert-loading design): each wave32 subgroup owns WM = 32 rows and all BN columns; lanes 0..15 load and
+// dequantize the first 16-row fragment's rows and lanes 16..31 the second's, one K step ahead, straight into the A fragment
+// elements (gfx11 layout: lane L holds row L % 16, k 0..15 as elements 0..15), and the halves are swapped with one xor-16
+// subgroup shuffle per packed f16 pair. A never goes through shared memory and needs no barrier; B is staged as before.
+// Aligned (prefetch) pipelines only, iq3_xxs and iq4_nl (the Flash-Next expert types on the f16 coopmat path). This port
+// carries the shipped lane-split mode only (the fork's =1 / =2 probes are not carried).
+layout(constant_id = 15) const uint REG_A = 0;
+#if defined(MUL_MAT_ID) && defined(COOPMAT) && defined(FLOAT16) && defined(A_PREFETCH) && LOAD_VEC_A == 8 && (defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ4_NL))
+#define MMID_REGA 1
+struct rega_raw_t { uvec4 q; uint d; };
+#if defined(DATA_A_IQ3_XXS)
+#define REGA_BLK_K 256
+// q.x: grid bytes 0..3, q.y: grid bytes 4..7, q.z: sign/scale dword, q.w: d bits (the lane's row, sub-block ib32)
+rega_raw_t rega_fetch(const uint pos_a, const uint row_off) {
+    const uint sb   = (pos_a / 32 + row_off) * 98;
+    const uint ib32 = (pos_a / 4) % 8;
+    const uint q    = (sb + 2 + 8 * ib32) / 2;
+    const uint so   = (sb + 66 + 4 * ib32) / 2;
+    return rega_raw_t(uvec4(uint(data_a_u16[q])      | (uint(data_a_u16[q + 1]) << 16),
+                            uint(data_a_u16[q + 2])  | (uint(data_a_u16[q + 3]) << 16),
+                            uint(data_a_u16[so])     | (uint(data_a_u16[so + 1]) << 16),
+                            uint(data_a_u16[sb / 2])), 0u);
+}
+#else
+#define REGA_BLK_K 32
+// q: the block's 16 nibble bytes (low nibbles k 0..15, high k 16..31), d: d bits
+rega_raw_t rega_fetch(const uint pos_a, const uint row_off) {
+    const uint base = (pos_a / 4 + row_off) * 18;
+    const bool odd  = ((base + 2) & 2) != 0;
+    return rega_raw_t(uvec4(unpack8b(fetch8(base + 2), odd), unpack8b(fetch8(base + 10), odd)), uint(data_a_u16[base / 2]));
+}
+#endif
+// k 16*h .. 16*h+15 of the sub-block into an A fragment
+void rega_build(const rega_raw_t raw, const uint h, inout coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> a) {
+#if defined(DATA_A_IQ3_XXS)
+    const float db = unpackHalf2x16(raw.q.w).x * 0.5 * (0.5 + float(raw.q.z >> 28));
+    const uint g = h == 0 ? raw.q.x : raw.q.y;
+    [[unroll]] for (uint j = 0; j < 2; j++) {
+        const uint s7 = bitfieldExtract(raw.q.z, int(7 * (2 * h + j)), 7);
+        const uint s8 = s7 | ((bitCount(s7) & 1) << 7);
+        const vec4 v0 = db * vec4(unpack8(iq3xxs_grid[(g >> (16 * j)) & 0xFF]));
+        const vec4 v1 = db * vec4(unpack8(iq3xxs_grid[(g >> (16 * j + 8)) & 0xFF]));
+        const vec4 m0 = vec4(1.0) - 2.0 * vec4(uvec4(s8, s8 >> 1, s8 >> 2, s8 >> 3) & 1u);
+        const vec4 m1 = vec4(1.0) - 2.0 * vec4(uvec4(s8 >> 4, s8 >> 5, s8 >> 6, s8 >> 7) & 1u);
+        const vec4 a0 = v0 * m0;
+        const vec4 a1 = v1 * m1;
+        a[8 * j + 0] = FLOAT_TYPE(a0.x); a[8 * j + 1] = FLOAT_TYPE(a0.y);
+        a[8 * j + 2] = FLOAT_TYPE(a0.z); a[8 * j + 3] = FLOAT_TYPE(a0.w);
+        a[8 * j + 4] = FLOAT_TYPE(a1.x); a[8 * j + 5] = FLOAT_TYPE(a1.y);
+        a[8 * j + 6] = FLOAT_TYPE(a1.z); a[8 * j + 7] = FLOAT_TYPE(a1.w);
+    }
+#else
+    const float d = unpackHalf2x16(raw.d).x;
+    [[unroll]] for (uint w = 0; w < 4; w++) {
+        const uint nb = (raw.q[w] >> (4 * h)) & 0x0F0F0F0F;
+        a[4 * w + 0] = FLOAT_TYPE(d * float(kvalues_iq4nl[nb & 0xFF]));
+        a[4 * w + 1] = FLOAT_TYPE(d * float(kvalues_iq4nl[(nb >> 8) & 0xFF]));
+        a[4 * w + 2] = FLOAT_TYPE(d * float(kvalues_iq4nl[(nb >> 16) & 0xFF]));
+        a[4 * w + 3] = FLOAT_TYPE(d * float(kvalues_iq4nl[nb >> 24]));
+    }
+#endif
+}
+#endif
+
 #ifdef MULMAT_QUANT
 #include "iq_shmem_init.glsl"
 #endif
@@ -469,6 +537,48 @@ void main() {
     [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { store_a_raw(pos_a, loadr_a, loadc_a + l, A_SIDX(l), a_raw[l / loadstride_a]); } \
     PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); } }
     const bool prefetch = ALIGNED != 0;
+#if defined(MMID_REGA)
+    if (REG_A != 0 && prefetch) {
+        // lane-split register-direct A (REG_A == 3): WM == 32, the lane half selects which of the subgroup's two 16-row
+        // blocks it loads; rows past p.M clamp to the last row (never stored)
+        const uint rl = warp_r * WM + (gl_SubgroupInvocationID < 16 ? 0 : TM) + gl_SubgroupInvocationID % 16;
+        const uint row_off1 = min(ir * BM + rl, p.M - 1) * (p.stride_a / REGA_BLK_K) - ir * BM * (p.stride_a / REGA_BLK_K);
+        rega_raw_t a1 = rega_fetch(pos_a, row_off1);
+        PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); } }
+        const bool lo = gl_SubgroupInvocationID < 16;
+        for (uint block = start_k; block < end_k; block += BK) {
+            PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); } }
+            const bool more = block + BK < end_k;
+            pos_a += more ? BK / LOAD_VEC_A_EFF : 0;
+            pos_b += more ? BK / LOAD_VEC_B_EFF : 0;
+            const rega_raw_t a1n = rega_fetch(pos_a, row_off1);
+            PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); } }
+            barrier();
+            if (warp_c < required_warp_c) {
+                coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> ar0, ar1;
+                [[unroll]] for (uint h = 0; h < 2; h++) {
+                    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> mine;
+                    rega_build(a1, h, mine);
+                    [[unroll]] for (uint e = 0; e < 8; e++) {
+                        const uint pm = packFloat2x16(f16vec2(mine[2 * e], mine[2 * e + 1]));
+                        const uint po = subgroupShuffleXor(pm, 16);
+                        const f16vec2 v0 = unpackFloat2x16(lo ? pm : po);
+                        const f16vec2 v1 = unpackFloat2x16(lo ? po : pm);
+                        ar0[2 * e] = v0.x; ar0[2 * e + 1] = v0.y;
+                        ar1[2 * e] = v1.x; ar1[2 * e + 1] = v1.y;
+                    }
+                    [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                        coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + 8 * h, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                        sums[cm_col * cms_per_row]     = coopMatMulAdd(ar0, cache_b, sums[cm_col * cms_per_row]);
+                        sums[cm_col * cms_per_row + 1] = coopMatMulAdd(ar1, cache_b, sums[cm_col * cms_per_row + 1]);
+                    }
+                }
+            }
+            barrier();
+            a1 = a1n;
+        }
+    } else
+#endif
     if (prefetch) {
         a_fetch_all = true;
         PF_FETCH()

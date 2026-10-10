@@ -12695,6 +12695,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_score(96,  200,  20, 1, true));    // K not a multiple of the aligned load
     test_cases.emplace_back(new test_qsa_score(128, 60,   64, 1, true));    // M <= 64: not fused
     test_cases.emplace_back(new test_qsa_score(128, 512,  64, 1, true, false));
+    // REG_A: the aligned medium MUL_MAT_ID tile (about 64 rows per expert) of iq3_xxs / iq4_nl takes the register-direct A
+    // loader (GGML_VK_MMID_REGA); m = 320 leaves a partial 128-row tile, b = true broadcasts B
+    for (int64_t m : {256, 320}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 2, false, m, 256, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 2, true,  m, 256, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 8, 2, false, m, 256, 512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 8, 2, true,  m, 256, 512));
+    }
+    // the Flash-Next REAP-320 expert shapes at small expert counts (the CPU reference stays cheap)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 4, false, 640, 512, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 16, 4, false, 2560, 512, 640));
     // register-prefetch coopmat matmuls and their XL 256x256 tier (GGML_VK_MM_PREFETCH / GGML_VK_MM_XL, engaged on the
     // f16-B coopmat path, i.e. with GGML_VK_DENSE_F16COOPMAT routing the type off int8): shapes that take the XL gate
     // (m, k >= 1024, XL waves <= half of l's) and a ragged one, for every prefetch type
