@@ -1212,6 +1212,10 @@ void process_shaders() {
     for (int npt : {8, 16, 32, 64}) {
         string_to_spv("topk_radix_qsa_reg" + std::to_string(npt), "topk_radix_select.comp", {{"A_TYPE", "float"}, {"NPT", std::to_string(npt)}});
     }
+    // A2: fused maskless QSA block selection
+    for (int npt : {8, 16, 32, 64}) {
+        string_to_spv("qsa_block_select_reg" + std::to_string(npt), "qsa_block_select.comp", {{"NPT", std::to_string(npt)}});
+    }
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

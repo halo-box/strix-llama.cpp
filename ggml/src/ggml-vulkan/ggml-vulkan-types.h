@@ -980,6 +980,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
     vk_pipeline pipeline_topk_radix_qsa_reg[4]; // register-resident rows of up to {8,16,32,64} * BLOCK_SIZE cells (GGML_VK_TOPK_QSA_REG)
+    vk_pipeline pipeline_qsa_block_select_reg[4]; // A2: fused maskless block selection, rows of up to {8,16,32,64} * BLOCK_SIZE blocks (GGML_VK_QSA_BLOCK_SELECT)
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
@@ -1381,6 +1382,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_qsa_score {};        // QSA scorer: MUL_MAT + RELU + head sum (+ block bias) in the GEMM epilogue (GGML_VK_QSA_SCORE)
+    bool fused_qsa_block_select {};   // A2: TOP_K .. CONCAT of qwen4exp_select_complete_blocks in one dispatch (GGML_VK_QSA_BLOCK_SELECT)
     const ggml_tensor * qsa_score_bias {};
     bool fused_hc_post_gate {};
     // hc combine + next hc norm (dsv4_hc_post_norm.comp): HC_POST_NORM_* modes, 0 = none
