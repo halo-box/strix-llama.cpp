@@ -18304,7 +18304,26 @@ static bool ggml_vk_can_fuse_mmid_mul_cpy16(ggml_backend_vk_context * ctx, const
 static std::mutex g_vk_fusion_count_mutex;
 static std::unordered_map<std::string, uint64_t> g_vk_fusion_counts;
 
+// GGML_VK_FUSION_COUNT_LOG=1: print the counters once at exit, for engagement checks on tools without the perf logger
+static void ggml_vk_fusion_count_print() {
+    std::lock_guard<std::mutex> lock(g_vk_fusion_count_mutex);
+    fprintf(stderr, "ggml_vulkan: fused dispatches:");
+    for (const auto & kv : g_vk_fusion_counts) {
+        fprintf(stderr, " %s=%llu", kv.first.c_str(), (unsigned long long) kv.second);
+    }
+    fprintf(stderr, "\n");
+}
+
 static void ggml_vk_fusion_count_add(const char * name) {
+    static const bool log_at_exit = [] {
+        const char * e = getenv("GGML_VK_FUSION_COUNT_LOG");
+        const bool on = e != nullptr && atoi(e) != 0;
+        if (on) {
+            atexit(ggml_vk_fusion_count_print);
+        }
+        return on;
+    }();
+    GGML_UNUSED(log_at_exit);
     std::lock_guard<std::mutex> lock(g_vk_fusion_count_mutex);
     g_vk_fusion_counts[name] += 1;
 }
