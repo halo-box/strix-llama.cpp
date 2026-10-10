@@ -7198,10 +7198,11 @@ static bool ggml_vk_mm_prefetch_type(ggml_type t) {
 }
 
 // Dense router (PORT-MAP E-stack): which quantized A types leave the int8 MMQ path for the f16-B KHR coopmat matmul (the
-// register-prefetch variant). Default = the types measured faster there at op level on gfx1151 / Mesa 26.2.4 (10-10,
-// f16 B, 27B shapes 17408x2048x5120 / 5120x2048x17408 vs the int8 MMQ pipelines): q4_K -27%, q5_K -27%, iq4_xs -19%;
-// q8_0 stays on int8 (3.72 vs 3.76 ms and 2.40 vs 2.88 ms at the Flash-Next shapes), q6_K / q3_K / q5_0 / iq4_nl stay
-// until measured. GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8, "all" routes every type that has a prefetch
+// register-prefetch variant with its XL tier). Default = the types measured faster there at op level on gfx1151 / Mesa
+// 26.2.4 (10-10, f16 B, prefetch + XL vs the int8 MMQ pipelines, ms per call): q5_K 17408x2048x5120 15.28 -> 10.23, q5_K
+// 5120x2048x17408 15.34 -> 9.85, q4_K 14.86 -> 9.52, q6_K 16.51 -> 11.25, iq4_xs 13.67 -> 9.19, q8_0 10240x2048x2560
+// 3.72 -> 2.74 and 2560x2048x6144 2.40 -> 1.86 (without XL, q8_0 and q6_K were a loss or flat, so the XL tier is what
+// qualifies them). q3_K / q5_0 / iq4_nl stay on int8 until measured. GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8, "all" routes every type that has a prefetch
 // pipeline, else a comma list of type names (q8_0,q5_k,...). MUL_MAT_ID has its own, default-off list
 // (GGML_VK_MMID_F16COOPMAT) because the expert GEMMs were not measured on this path.
 static const std::vector<std::string> & ggml_vk_route_list(const char * env_name, const char * dflt) {
@@ -7233,7 +7234,7 @@ static bool ggml_vk_route_match(const std::vector<std::string> & list, ggml_type
 }
 
 static bool ggml_vk_dense_f16coopmat(ggml_type t) {
-    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,iq4_xs"), t);
+    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,q6_K,q8_0,iq4_xs"), t);
 }
 
 static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
