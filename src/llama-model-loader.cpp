@@ -1675,8 +1675,10 @@ bool llama_model_loader::load_all_data(
     // 64MB works well for NVMe drives
     const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
 
-    // pinned staging buffer for mapping->device copies
-    ggml_backend_buffer_t mapped_stage_buf  = nullptr;
+    // pinned staging buffer for mapping->device copies; owned for the whole
+    // loading loop so an exception (check_tensors validation, tensor_set
+    // failure) cannot leak it
+    std::unique_ptr<ggml_backend_buffer, void (*)(ggml_backend_buffer_t)> mapped_stage_buf{nullptr, &ggml_backend_buffer_free};
     void * mapped_stage_ptr  = nullptr;
     size_t mapped_stage_size = 0;
 
@@ -1788,15 +1790,14 @@ bool llama_model_loader::load_all_data(
         if (!host_buft) {
             return false;
         }
-        mapped_stage_buf  = ggml_backend_buft_alloc_buffer(host_buft, 16 * 1024 * 1024);
+        mapped_stage_buf.reset(ggml_backend_buft_alloc_buffer(host_buft, 16 * 1024 * 1024));
         if (!mapped_stage_buf) {
             return false;
         }
-        mapped_stage_ptr  = ggml_backend_buffer_get_base(mapped_stage_buf);
-        mapped_stage_size = ggml_backend_buffer_get_size(mapped_stage_buf);
+        mapped_stage_ptr  = ggml_backend_buffer_get_base(mapped_stage_buf.get());
+        mapped_stage_size = ggml_backend_buffer_get_size(mapped_stage_buf.get());
         if (mapped_stage_ptr == nullptr || mapped_stage_size == 0) {
-            ggml_backend_buffer_free(mapped_stage_buf);
-            mapped_stage_buf = nullptr;
+            mapped_stage_buf.reset(nullptr);
             return false;
         }
         return true;
@@ -1958,10 +1959,7 @@ bool llama_model_loader::load_all_data(
     }
 
     // free temporary resources used for async uploads
-    if (mapped_stage_buf != nullptr) {
-        ggml_backend_buffer_free(mapped_stage_buf);
-        mapped_stage_buf = nullptr;
-    }
+    mapped_stage_buf.reset(nullptr);
     for (auto * event : events) {
         ggml_backend_event_synchronize(event);
         ggml_backend_event_free(event);
