@@ -11546,11 +11546,12 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
     const ggml_tensor * weights = dst->src[1];
 
     const bool gated_x = ggml_get_op_params_i32(dst, 1) != 0;
-    // the gated form also takes an f16 x
+    // the gated form also takes an f16 x and an f16 gate
     GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated_x && x->type == GGML_TYPE_F16));
-    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated_x && weights->type == GGML_TYPE_F16));
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     const bool x_f16 = x->type == GGML_TYPE_F16;
+    const bool g_f16 = weights->type == GGML_TYPE_F16;
 
     const int64_t n_embd   = x->ne[0];
     const int64_t hc       = x->ne[1];
@@ -11592,7 +11593,8 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
             const float xv = x_f16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) xp) : *(const float *) xp;
             float wv;
             if (gated) {
-                const float gv = *(const float *) ((const char *) weights->data + i0*nbw0 + ih*nbw1 + it*nbw2);
+                const char * gp = (const char *) weights->data + i0*nbw0 + ih*nbw1 + it*nbw2;
+                const float gv = g_f16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) gp) : *(const float *) gp;
                 wv = 1.0f / (1.0f + expf(-gv));
             } else {
                 wv = *(const float *) ((const char *) weights->data + ih*nbw0 + it*nbw1);

@@ -1238,6 +1238,7 @@ void process_shaders() {
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_pre_x_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}});
+    string_to_spv("dsv4_hc_pre_x_f16_g_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}, {"G_F16", "1"}});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("dsv4_hc_post_norm_f32", "dsv4_hc_post_norm.comp", {});
     string_to_spv("dsv4_hc_post_norm_f16", "dsv4_hc_post_norm.comp", {{"OUT_F16", "1"}});

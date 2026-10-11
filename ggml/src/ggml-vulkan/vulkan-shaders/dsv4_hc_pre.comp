@@ -1,7 +1,7 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
-#if defined(X_F16)
+#if defined(X_F16) || defined(G_F16)
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
@@ -15,6 +15,7 @@
 //   dst[i0, it] = scale * sum_ih x[i0, ih, it] * sigmoid(gate[i0, ih, it])
 //
 // X_F16: x is stored as f16 (the f16 hc norm output at prefill); GATED must be 1.
+// G_F16: the gate is stored as f16 (the hc up GEMM's f16 store, LLAMA_HC_GATE_F16); GATED must be 1.
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
 layout(constant_id = 1) const uint GATED = 0;
@@ -42,7 +43,11 @@ layout(binding = 0, std430) readonly buffer X { float16_t data_x[]; };
 #else
 layout(binding = 0, std430) readonly buffer X { float data_x[]; };
 #endif
+#if defined(G_F16)
+layout(binding = 1, std430) readonly buffer W { float16_t data_w[]; };
+#else
 layout(binding = 1, std430) readonly buffer W { float data_w[]; };
+#endif
 layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
 
 const uint hc = 4;
@@ -55,7 +60,7 @@ void main() {
 
     if (GATED == 0) {
         if (tid < hc) {
-            w[tid] = data_w[w_offset + tid * nbw0 + it * nbw1];
+            w[tid] = float(data_w[w_offset + tid * nbw0 + it * nbw1]);
         }
         barrier();
     }
@@ -74,7 +79,7 @@ void main() {
     for (uint ih = 0; ih < hc; ++ih) {
         float wv;
         if (GATED == 1) {
-            wv = 1.0f / (1.0f + exp(-data_w[wb + ih * nbw1]));
+            wv = 1.0f / (1.0f + exp(-float(data_w[wb + ih * nbw1])));
         } else {
             wv = w[ih];
         }

@@ -4294,6 +4294,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_x16_f32, "dsv4_hc_pre_gated_x16_f32", dsv4_hc_pre_x_f16_len, dsv4_hc_pre_x_f16_data, "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants), {256, 1, 1}, { 256, 1 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_x16_g16_f32, "dsv4_hc_pre_gated_x16_g16_f32", dsv4_hc_pre_x_f16_g_f16_len, dsv4_hc_pre_x_f16_g_f16_data, "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     if (device->subgroup_arithmetic) {
         // one 256-thread workgroup per (stream, token) row; the f16 variants store the norm as f16 (CPY f16 fused)
         for (uint32_t has_post = 0; has_post < 2; ++has_post) {
@@ -8540,10 +8541,13 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
-    // supports_op admits an f16 x only for the gated form
+    // supports_op admits an f16 x only for the gated form, and an f16 gate only with an f16 x
     GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated && x->type == GGML_TYPE_F16));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated && weights->type == GGML_TYPE_F16 && x->type == GGML_TYPE_F16));
     vk_pipeline pipeline = !gated ? ctx->device->pipeline_dsv4_hc_pre_f32 :
-                           x->type == GGML_TYPE_F16 ? ctx->device->pipeline_dsv4_hc_pre_gated_x16_f32 : ctx->device->pipeline_dsv4_hc_pre_gated_f32;
+                           x->type == GGML_TYPE_F16 ? (weights->type == GGML_TYPE_F16 ? ctx->device->pipeline_dsv4_hc_pre_gated_x16_g16_f32
+                                                                                       : ctx->device->pipeline_dsv4_hc_pre_gated_x16_f32)
+                                                    : ctx->device->pipeline_dsv4_hc_pre_gated_f32;
     GGML_ASSERT(pipeline != nullptr);
 
     const uint32_t n_embd   = (uint32_t)x->ne[0];
@@ -20773,8 +20777,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     const bool f16_x_ok = op->op == GGML_OP_DSV4_HC_PRE && i == 0 && ggml_get_op_params_i32(op, 1) != 0 &&
                                           device->coopmat_int_support && device->pipeline_dsv4_hc_post_norm[1][1] != nullptr &&
                                           device->pipeline_quantize_q8_1_x4_f16 != nullptr;
+                    // the gated HC_PRE also takes an f16 gate (src[1], the hc up GEMM's f16 store) when its x is f16
+                    const bool f16_g_ok = op->op == GGML_OP_DSV4_HC_PRE && i == 1 && ggml_get_op_params_i32(op, 1) != 0 &&
+                                          op->src[0] && op->src[0]->type == GGML_TYPE_F16 &&
+                                          device->pipeline_dsv4_hc_pre_gated_x16_g16_f32 != nullptr;
                     if (op->src[i] && op->src[i]->type != GGML_TYPE_F32 &&
-                        !(f16_x_ok && op->src[i]->type == GGML_TYPE_F16)) {
+                        !((f16_x_ok || f16_g_ok) && op->src[i]->type == GGML_TYPE_F16)) {
                         return false;
                     }
                 }

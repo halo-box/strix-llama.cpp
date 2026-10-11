@@ -6614,9 +6614,9 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
         struct ggml_tensor  * weights,
         float                 scale,
         bool                  gated) {
-    // the gated form also takes an f16 x (backends opt in through supports_op)
+    // the gated form also takes an f16 x and an f16 gate (backends opt in through supports_op)
     GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated && x->type == GGML_TYPE_F16));
-    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated && weights->type == GGML_TYPE_F16));
 
     const int64_t n_embd   = x->ne[0];
     const int64_t hc       = x->ne[1];

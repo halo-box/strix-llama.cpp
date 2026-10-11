@@ -48,6 +48,7 @@ struct llama_cparams {
     bool auto_flid;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_norm_f16; // hc norm output stored as f16 at prefill (written by the backend's fused combine + norm)
+    bool fused_dsv4_hc_gate_f16; // hc up GEMM output (the mix gate) stored as f16 at prefill, read as f16 by the gated HC pre
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;

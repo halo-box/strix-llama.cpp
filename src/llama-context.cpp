@@ -163,6 +163,13 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_norm_f16_probe = {
     /*.n_tokens_per_seq =*/ 32,
 };
 
+// the f16 hc gate: the fused DSV4_HC_PRE reads an f16 gate, written by the hc up GEMM's f16 store (MUL_MAT + CPY(f16) fusion:
+// the 84 MB f32 gate tensor of a 2048-token Flash-Next ubatch is neither written nor read back)
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_gate_f16_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_GATE_F16,
+    /*.name             =*/ "fused DeepSeek V4 HC pre (f16 gate)",
+    /*.n_tokens_per_seq =*/ 32,
+};
 // the f16 MoE activations: the expert down projection takes an f16 B. n_tokens_per_seq matches the build_moe_ffn
 // prefill threshold
 static const llm_fused_op_probe llm_fused_op_moe_f16_probe = {
@@ -355,6 +362,7 @@ llama_context::llama_context(
 
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_norm_f16 = true;
+    cparams.fused_dsv4_hc_gate_f16 = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
@@ -368,6 +376,10 @@ llama_context::llama_context(
     // LLAMA_HC_NORM_F16=0 keeps the qwen4exp hc norm output in f32 at prefill
     if (const char * env = getenv("LLAMA_HC_NORM_F16")) {
         cparams.fused_dsv4_hc_norm_f16 = atoi(env) != 0;
+    }
+    // LLAMA_HC_GATE_F16=0 keeps the qwen4exp hc mix gate (the hc up GEMM output) in f32 at prefill
+    if (const char * env = getenv("LLAMA_HC_GATE_F16")) {
+        cparams.fused_dsv4_hc_gate_f16 = atoi(env) != 0;
     }
 
     cparams.fused_moe_f16 = true;
@@ -745,9 +757,11 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
     if (cparams.auto_fhc) {
         LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
-        // the f16 norm is probed last; the probes before it see the f32 norm graph
+        // the f16 norm is probed last; the probes before it see the f32 norm graph; the f16 gate after that, on the f16 norm graph
         bool hc_norm_f16 = cparams.fused_dsv4_hc_norm_f16;
+        bool hc_gate_f16 = cparams.fused_dsv4_hc_gate_f16;
         cparams.fused_dsv4_hc_norm_f16 = false;
+        cparams.fused_dsv4_hc_gate_f16 = false;
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
@@ -766,6 +780,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.fused_dsv4_hc_norm_f16 = hc_norm_f16 && cparams.fused_dsv4_hc_pre && hc_pre_f16_devs &&
             llm_fused_op_dsv4_hc_norm_f16_probe.n_tokens_per_seq*n_seqs <= cparams.n_ubatch;
         resolve(llm_fused_op_dsv4_hc_norm_f16_probe, cparams.fused_dsv4_hc_norm_f16);
+        // the f16 gate exists only on the f16 norm graph (the kernel takes it with an f16 x); the probe keeps it only where the
+        // layer's device takes the f16 gate in DSV4_HC_PRE
+        cparams.fused_dsv4_hc_gate_f16 = hc_gate_f16 && cparams.fused_dsv4_hc_norm_f16;
+        resolve(llm_fused_op_dsv4_hc_gate_f16_probe, cparams.fused_dsv4_hc_gate_f16);
         cparams.auto_fhc = false;
     }
 

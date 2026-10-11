@@ -739,6 +739,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
+    // Prefill, on the f16 norm graph: store the gate as f16. The cast directly follows the up GEMM, so a backend that fuses
+    // MUL_MAT + CPY(f16) writes f16 from the accumulator and the [hc_dim, T] f32 gate (84 MB on Flash-Next at a 2048-token
+    // ubatch) is neither written nor read: the gated HC pre reads the f16 gate (LLAMA_HC_GATE_F16=0 keeps it f32).
+    const bool gate_f16 = norm_f16 && cparams.fused_dsv4_hc_gate_f16;
+    if (gate_f16) {
+        gate = ggml_cast(ctx0, gate, GGML_TYPE_F16);
+        cb(gate, "hc_gate_f16", il);
+    }
 
     ggml_tensor * mixed = nullptr;
     if (cparams.fused_dsv4_hc_pre && il >= 0) {
@@ -750,6 +758,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
         if (norm_f16) {
             res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, mixed, il});
+        }
+        if (gate_f16) {
+            res->add_fused_node({LLM_FUSED_OP_DSV4_HC_GATE_F16, mixed, il});
         }
     } else {
         ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, gate));
