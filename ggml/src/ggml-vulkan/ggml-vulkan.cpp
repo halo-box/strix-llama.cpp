@@ -1855,7 +1855,7 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 // register-prefetch coopmat matmul knobs (defined with the other matmul env switches further down)
 static bool ggml_vk_mm_prefetch_enabled(const vk_device& device);
 static bool ggml_vk_mm_prefetch_type(ggml_type t);
-static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k);
+static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n);
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device);
 static uint32_t ggml_vk_dense_ypad();
@@ -7291,9 +7291,12 @@ static bool ggml_vk_route_match(const std::vector<std::string> & list, ggml_type
 // (10-11, serialising perf logger, pp2048): the hc up GEMM q8_0 10240x2048x320 took 1.29 ms/call routed vs 0.88 on int8 MMQ
 // (95 calls per 4 ubatches, 39 ms), the one K-step the XL / prefetch tile gets at K=320 cannot amortise its B conversion and
 // prologue; the K=2560 and K=6144 shapes read flat between the paths in-model.
-static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k) {
+static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n) {
     static const uint32_t min_k = [] { const char * e = getenv("GGML_VK_DENSE_F16COOPMAT_MINK"); return e ? (uint32_t) atoi(e) : 1024u; }();
-    if (k < min_k) return false;
+    // GGML_VK_DENSE_F16COOPMAT_MINN (default 32): decode / verify / MTP shapes stay on the int8 or mat-vec paths; the f16-B prefetch
+    // path is a prefill tile and has an open small-n defect (bf16 m=128 n=16/9 k=5120 fail test-backend-ops under route all, 10-11)
+    static const uint32_t min_n = [] { const char * e = getenv("GGML_VK_DENSE_F16COOPMAT_MINN"); return e ? (uint32_t) atoi(e) : 32u; }();
+    if (k < min_k || n < min_n) return false;
     // default OFF (10-11, wave-2 gate): with the f32 B the models feed, the routed types read flat on Flash-Next and -3.5% / -3.0%
     // (d0 / 8k) on Qwen3.6-35B-A3B in-model, against op-level f16-B wins of 12-32%; the int8 MMQ path stays the default for every
     // dense type. Opt in with the type list that was the default before (q4_K,q5_K,q6_K,q8_0,iq4_xs) or "all".
@@ -7368,7 +7371,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                                 (src1->type == GGML_TYPE_F32 || f16_y) && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
     // GGML_VK_DENSE_F16COOPMAT: listed types leave the int8 path for the f16-B KHR coopmat matmul (not for the f16-out fusion,
     // which exists on the int8 path only)
-    if (can_quantize_y && !d16 && ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10)) {
+    if (can_quantize_y && !d16 && ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10, (uint32_t) ne11)) {
         can_quantize_y = false;
     }
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
