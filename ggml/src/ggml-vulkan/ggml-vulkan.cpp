@@ -7467,7 +7467,21 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, src0->type);
     }
     if (y_needs_reformat) {
-        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, y_kernel_type);
+        if (y_row_pad != 0) {
+            // the padded layout needs the STRIDED copy shader: with no destination ggml_vk_get_cpy_pipeline picks the contiguous
+            // shader, which ignores the destination strides, and every padded MUL_MAT reads garbage (NMSE ~2 on the f32-B
+            // routed shapes with K = 5120 / 6144 / 10240 / 17408, 10-11; the release line learnt the same on 10-07). A stand-in
+            // destination with the padded f16 row stride selects the strided shader.
+            ggml_tensor y_padded_dst = *src1;
+            y_padded_dst.type  = y_kernel_type;
+            y_padded_dst.nb[0] = ggml_type_size(y_kernel_type);
+            y_padded_dst.nb[1] = y_padded_dst.nb[0] * y_row;
+            y_padded_dst.nb[2] = y_padded_dst.nb[1] * ne11;
+            y_padded_dst.nb[3] = y_padded_dst.nb[2] * ne12;
+            to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, &y_padded_dst, y_kernel_type);
+        } else {
+            to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, y_kernel_type);
+        }
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
