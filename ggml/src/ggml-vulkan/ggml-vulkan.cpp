@@ -15183,12 +15183,24 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
             if (src->type == GGML_TYPE_I32 && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && si == 0) {
                 continue;
             }
+            // the cells gather reading that RESHAPE/VIEW when the graph builder placed it AHEAD of the TOP_K (the
+            // forward expansion visits the gather's src[0] before the selection it depends on: both in the model and
+            // in test-backend-ops it is node 0, outside the fused window, an empty node either way)
+            if (t->op == GGML_OP_GET_ROWS && si == 0 && src->type == GGML_TYPE_I32 &&
+                (src->op == GGML_OP_RESHAPE || src->op == GGML_OP_VIEW) && src->src[0] != nullptr &&
+                src->src[0]->type == GGML_TYPE_I32 && !in_chain(src->src[0])) {
+                continue;
+            }
             if (src->type == GGML_TYPE_I32 && t->op == GGML_OP_CONCAT && si == 1) {
                 continue;
             }
             ok = false;
         }
         if (!ok || n_src == 0) {
+            if (dbg && ctx) {
+                fprintf(stderr, "ggml_vulkan: QSA_BLOCK_SELECT chain walk stops at node %d (%s %s)%s\n", j, ggml_op_name(t->op), t->name,
+                        n_src == 0 ? ": no sources" : ": a source outside the chain");
+            }
             break;
         }
         idxs[count] = j; ops[count] = t->op; in[count++] = t;
