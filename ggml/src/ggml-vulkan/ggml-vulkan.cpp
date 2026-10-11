@@ -14733,6 +14733,9 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
     if (m.score == nullptr) {
         m.score = score;
     }
+    if (topk_idx - node_idx > 10) {
+        return reject("visibility window too long");
+    }
     idxs[count] = topk_idx; ops[count] = topk->op; in[count++] = topk;
     const ggml_tensor * cells_view = nullptr;
     const ggml_tensor * concat     = nullptr;
@@ -14808,6 +14811,10 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
         return reject("cells / tail / concat shapes");
     }
     const int last = idxs[count - 1];
+    // graph_compute keeps one source flag and one write-mask bit per fused node: at most 31 nodes behind the first
+    if (last - node_idx > 30) {
+        return reject("chain longer than the fusion limit");
+    }
     // Only the CONCAT may be read outside the fusion: every other node's readers are all chain nodes (the graph's
     // use count, which includes a cast's self-reference in src[1], equals the uses found among the chain's sources)
     // and none is a graph output. Not ggml_can_fuse_subgraph_ext: it rejects a view of a tensor outside the subgraph
@@ -18531,7 +18538,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
         // The array is sized to handle the largest fusion (asserted later).
-        bool op_srcs_fused_elementwise[13];
+        // sized to the write mask's bits (int): QSA_BLOCK_SELECT fuses up to 31 nodes (the visibility ops and the selection chain)
+        bool op_srcs_fused_elementwise[32];
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
