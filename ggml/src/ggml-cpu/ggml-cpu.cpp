@@ -433,7 +433,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     // built with GGML_TRELLIS=OFF: the trellis types have no CPU kernels (vec_dot / from_float) in this build
     for (int i = -1; i < GGML_MAX_SRC; i++) {
         const struct ggml_tensor * t = i < 0 ? op : op->src[i];
-        if (t && (t->type == GGML_TYPE_PTQ1_0 || t->type == GGML_TYPE_TQ2_T || t->type == GGML_TYPE_TQK6 || t->type == GGML_TYPE_TQK7)) {
+        if (t && (t->type == GGML_TYPE_PTQ1_0 || t->type == GGML_TYPE_TQ2_T || t->type == GGML_TYPE_TQK6 || t->type == GGML_TYPE_TQK7 ||
+                  t->type == GGML_TYPE_TQP5 || t->type == GGML_TYPE_TQP6 || t->type == GGML_TYPE_TQP7)) {
             return false;
         }
     }

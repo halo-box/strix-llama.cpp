@@ -453,7 +453,12 @@ extern "C" {
         // same codebook): 1.625 / 1.875 bpw, group 128.
         GGML_TYPE_TQK6    = 145,
         GGML_TYPE_TQK7    = 146,
-        GGML_TYPE_COUNT   = 147,
+        // Pair trellis (V=2): 64 steps of 2 weights per 128-weight block, K = 5 / 6 / 7 new bits
+        // per step, TQ2_T codebook (first pair of each state): 2.625 / 3.125 / 3.625 bpw.
+        GGML_TYPE_TQP5    = 147,
+        GGML_TYPE_TQP6    = 148,
+        GGML_TYPE_TQP7    = 149,
+        GGML_TYPE_COUNT   = 150,
     };
 
     // [TAG_GGML_PREC]
@@ -525,6 +530,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_TQ2_T  = 130, // except 1d tensors (trellis-coded, group 128)
         GGML_FTYPE_MOSTLY_TQK6   = 131, // except 1d tensors (trellis-coded K=6, group 128)
         GGML_FTYPE_MOSTLY_TQK7   = 132, // except 1d tensors (trellis-coded K=7, group 128)
+        GGML_FTYPE_MOSTLY_TQP5   = 133, // except 1d tensors (pair trellis K=5, group 128)
+        GGML_FTYPE_MOSTLY_TQP6   = 134, // except 1d tensors (pair trellis K=6, group 128)
+        GGML_FTYPE_MOSTLY_TQP7   = 135, // except 1d tensors (pair trellis K=7, group 128)
     };
 
     // available tensor operations:

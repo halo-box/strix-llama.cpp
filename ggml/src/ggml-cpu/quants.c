@@ -46,6 +46,18 @@ void quantize_row_tqk6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 void quantize_row_tqk7(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_tqk7_ref(x, y, k);
 }
+
+void quantize_row_tqp5(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tqp5_ref(x, y, k);
+}
+
+void quantize_row_tqp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tqp6_ref(x, y, k);
+}
+
+void quantize_row_tqp7(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tqp7_ref(x, y, k);
+}
 #endif // GGML_USE_TRELLIS
 
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -1527,5 +1539,72 @@ void ggml_vec_dot_tqk7_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     UNUSED(by);
     UNUSED(bs);
     ggml_vec_dot_tq_q8_0_impl(n, s, vx, vy, 7);
+}
+
+// TQP x Q8_0. Step t (0..63) yields weights 2t, 2t+1 = the first pair of
+// ggml_tq_state_i16[4*state(t)]; Q8_0 block k covers steps 16k..16k+15.
+static void ggml_vec_dot_tqp_q8_0_impl(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int kb) {
+    const int qk = QK_TQP;
+    const int nb = n / qk;
+    const int nbytes = 8*kb;
+    const size_t bsize = sizeof(ggml_half) + nbytes;
+
+    assert(n % qk == 0);
+
+    const uint8_t    * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++, x += bsize) {
+        // stream copy with its first 4 bytes repeated, so each window is one plain read
+        uint8_t buf[8*7 + 4];
+        memcpy(buf, x + sizeof(ggml_half), nbytes);
+        memcpy(buf + nbytes, x + sizeof(ggml_half), 4);
+        float sumb = 0.0f;
+        for (int k = 0; k < QK_TQP/QK8_0; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i*(QK_TQP/QK8_0) + k];
+            int32_t acc = 0;
+            for (int t = 16*k; t < 16*k + 16; ++t) {
+                const uint32_t off = (uint32_t) (63 - t) * (uint32_t) kb;
+                const uint8_t * p = buf + (off >> 3);
+                const uint32_t w = (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16);
+                const int16_t * wv = ggml_tq_state_i16 + 4*((w >> (off & 7)) & TQ_STATE_MASK);
+                const int8_t  * q = yb->qs + 2*(t - 16*k);
+                acc += wv[0]*q[0] + wv[1]*q[1];
+            }
+            sumb += GGML_CPU_FP16_TO_FP32(yb->d) * (float) acc;
+        }
+        sumf += GGML_CPU_FP16_TO_FP32(*(const ggml_half *) x) * sumb;
+    }
+
+    *s = sumf * (1.0f / GGML_TQ_I16_SCALE);
+}
+
+void ggml_vec_dot_tqp5_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_tqp_q8_0_impl(n, s, vx, vy, 5);
+}
+
+void ggml_vec_dot_tqp6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_tqp_q8_0_impl(n, s, vx, vy, 6);
+}
+
+void ggml_vec_dot_tqp7_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    ggml_vec_dot_tqp_q8_0_impl(n, s, vx, vy, 7);
 }
 #endif // GGML_USE_TRELLIS

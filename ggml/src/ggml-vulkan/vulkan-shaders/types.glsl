@@ -213,7 +213,8 @@ struct block_q1_0
 
 // Trellis / ternary types: declared only for their own shaders (DATA_A_*), so no other
 // shader sees these blocks.
-#if defined(DATA_A_PTQ1_0) || defined(DATA_A_TQ2_T) || defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
+#if defined(DATA_A_PTQ1_0) || defined(DATA_A_TQ2_T) || defined(DATA_A_TQK6) || defined(DATA_A_TQK7) || \
+    defined(DATA_A_TQP5) || defined(DATA_A_TQP6) || defined(DATA_A_TQP7)
 
 // PTQ1_0: ternary at group 128, base-3 packed five trits per byte.
 // Field order mirrors block_ptq1_0 in ggml-common.h EXACTLY -- qs, then qh, then d.
@@ -319,7 +320,68 @@ struct block_tqk7_packed16
 #include "tqk.glsl"
 #endif
 
-#endif // DATA_A_PTQ1_0 || DATA_A_TQ2_T || DATA_A_TQK6 || DATA_A_TQK7
+// TQP5 / TQP6 / TQP7: pair trellis, group 128. Mirrors block_tqp5/6/7 in ggml-common.h:
+// fp16 d, then an 8*K-byte circular bitstream (42 / 50 / 58-byte stride, 2-byte aligned).
+// Step t (2 weights) reads the 16-bit window at stream bit (63 - t)*K (see tqp.glsl).
+#define QUANT_K_TQP 128
+
+struct block_tqp5
+{
+    float16_t d;
+    uint8_t qs[8*5];
+};
+
+struct block_tqp5_packed16
+{
+    float16_t d;
+    uint16_t qs[4*5];
+};
+
+struct block_tqp6
+{
+    float16_t d;
+    uint8_t qs[8*6];
+};
+
+struct block_tqp6_packed16
+{
+    float16_t d;
+    uint16_t qs[4*6];
+};
+
+struct block_tqp7
+{
+    float16_t d;
+    uint8_t qs[8*7];
+};
+
+struct block_tqp7_packed16
+{
+    float16_t d;
+    uint16_t qs[4*7];
+};
+
+#if defined(DATA_A_TQP5) || defined(DATA_A_TQP6) || defined(DATA_A_TQP7)
+#define QUANT_K QUANT_K_TQP
+#define QUANT_R 1
+#define QUANT_AUXF 1
+#if defined(DATA_A_TQP5)
+#define TQP_K 5u
+#define A_TYPE block_tqp5
+#define A_TYPE_PACKED16 block_tqp5_packed16
+#elif defined(DATA_A_TQP6)
+#define TQP_K 6u
+#define A_TYPE block_tqp6
+#define A_TYPE_PACKED16 block_tqp6_packed16
+#else
+#define TQP_K 7u
+#define A_TYPE block_tqp7
+#define A_TYPE_PACKED16 block_tqp7_packed16
+#endif
+#include "tq2_t_lut.glsl"
+#include "tqp.glsl"
+#endif
+#endif // DATA_A_PTQ1_0 || DATA_A_TQ2_T || DATA_A_TQK6 || DATA_A_TQK7 || DATA_A_TQP5/6/7
 
 #define QUANT_K_Q2_0 64
 #define QUANT_R_Q2_0 1

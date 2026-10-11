@@ -236,6 +236,28 @@ typedef struct {
 } block_tqk7;
 static_assert(sizeof(block_tqk7) == sizeof(ggml_half) + 4*7, "wrong tqk7 block size/padding");
 
+// TQP5 / TQP6 / TQP7: pair trellis (L=16, K = 5 / 6 / 7 new bits per step, V=2, group 128).
+// qs is a circular 64*K-bit stream, stream bit i = (qs[i >> 3] >> (i & 7)) & 1.
+// Step t (weights 2t, 2t+1) has state s = the 16 stream bits starting at bit (63 - t)*K,
+// read LSB-first and circularly modulo 64*K, and weight 2t+j is
+// d * tq2t_lut_f16[2*tq2t_hyb_index(2*s) + j] (the first pair of TQ2_T state s). See tqp_state.
+#define QK_TQP 128
+typedef struct {
+    ggml_half d;              // scale
+    uint8_t   qs[8*5];        // 64 steps x 5 bits
+} block_tqp5;
+static_assert(sizeof(block_tqp5) == sizeof(ggml_half) + 8*5, "wrong tqp5 block size/padding");
+typedef struct {
+    ggml_half d;              // scale
+    uint8_t   qs[8*6];        // 64 steps x 6 bits
+} block_tqp6;
+static_assert(sizeof(block_tqp6) == sizeof(ggml_half) + 8*6, "wrong tqp6 block size/padding");
+typedef struct {
+    ggml_half d;              // scale
+    uint8_t   qs[8*7];        // 64 steps x 7 bits
+} block_tqp7;
+static_assert(sizeof(block_tqp7) == sizeof(ggml_half) + 8*7, "wrong tqp7 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -2253,6 +2275,18 @@ static inline uint32_t tq2t_hyb_index(uint32_t e) {
 static inline uint32_t tqk_state(const uint8_t * qs, int k, int t) {
     const uint32_t nbytes = 4u*(uint32_t) k;
     const uint32_t off    = (uint32_t) (31 - t) * (uint32_t) k;
+    const uint32_t i0     = off >> 3;
+    const uint32_t i1     = (i0 + 1) % nbytes;
+    const uint32_t i2     = (i0 + 2) % nbytes;
+    const uint32_t w      = (uint32_t) qs[i0] | ((uint32_t) qs[i1] << 8) | ((uint32_t) qs[i2] << 16);
+    return (w >> (off & 7)) & 0xffffu;
+}
+
+// TQP state of step t (0..63) from the 8*k stream bytes qs (k = 5, 6 or 7): the 16 bits
+// starting at stream bit off = (63 - t)*k, LSB-first, circular modulo 64*k bits.
+static inline uint32_t tqp_state(const uint8_t * qs, int k, int t) {
+    const uint32_t nbytes = 8u*(uint32_t) k;
+    const uint32_t off    = (uint32_t) (63 - t) * (uint32_t) k;
     const uint32_t i0     = off >> 3;
     const uint32_t i1     = (i0 + 1) % nbytes;
     const uint32_t i2     = (i0 + 2) % nbytes;

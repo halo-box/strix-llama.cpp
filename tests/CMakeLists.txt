@@ -367,6 +367,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
         target_compile_definitions(test-tq2t PRIVATE TQ2T_REF_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/data/tq2t_ref.bin")
         llama_build_and_test(test-tqk.cpp)
         target_compile_definitions(test-tqk PRIVATE TQK_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+        llama_build_and_test(test-tqp.cpp)
+        target_compile_definitions(test-tqp PRIVATE TQP_REF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
     endif()
     llama_build_and_test(test-quantize-perf.cpp)
 

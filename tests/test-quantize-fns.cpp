@@ -233,6 +233,8 @@ static int test_vec_dot_q(bool verbose) {
                 // TQK6 / TQK7: same placeholder encoder and codebook, same bounds.
                 type == GGML_TYPE_TQK6    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQK7    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
+                // TQP5 / TQP6 / TQP7: same placeholder scheme (pair codebook), same bounds.
+                type == GGML_TYPE_TQP5 || type == GGML_TYPE_TQP6 || type == GGML_TYPE_TQP7 ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
@@ -265,7 +267,8 @@ static int test_vec_dot_q(bool verbose) {
                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
                 : type == GGML_TYPE_TQ2_T
                 ? MAX_DOT_PRODUCT_ERROR_BINARY
-                : type == GGML_TYPE_TQK6 || type == GGML_TYPE_TQK7
+                : type == GGML_TYPE_TQK6 || type == GGML_TYPE_TQK7 ||
+                  type == GGML_TYPE_TQP5 || type == GGML_TYPE_TQP6 || type == GGML_TYPE_TQP7
                 ? MAX_DOT_PRODUCT_ERROR_TRELLIS_PLACEHOLDER
                 : type == GGML_TYPE_PTQ1_0
                 ? MAX_DOT_PRODUCT_ERROR_TERNARY

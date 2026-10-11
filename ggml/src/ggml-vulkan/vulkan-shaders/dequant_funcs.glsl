@@ -172,6 +172,27 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_TQP5) || defined(DATA_A_TQP6) || defined(DATA_A_TQP7)
+// State of trellis step t (0..63): the circular 16-bit window at stream bit (63 - t)*K
+// (see tqp.glsl; mirrors tqp_state in ggml-common.h).
+uint tqp_state(uint ib, uint a_offset, uint t) {
+    const uint off = tqp_off(t);
+    const uint i0 = off >> 3u;
+    const uint i1 = tqp_byte_wrap(i0 + 1u);
+    const uint i2 = tqp_byte_wrap(i0 + 2u);
+    return tqp_state_bytes(uint(data_a[a_offset + ib].qs[i0]), uint(data_a[a_offset + ib].qs[i1]), uint(data_a[a_offset + ib].qs[i2]), off);
+}
+// iqs must be even: weights iqs, iqs+1 are one step.
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    return tqp_pair(tqp_state(ib, a_offset, iqs >> 1u));
+}
+// iqs must be even: two steps.
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint t = iqs >> 1u;
+    return vec4(tqp_pair(tqp_state(ib, a_offset, t)), tqp_pair(tqp_state(ib, a_offset, t + 1u)));
+}
+#endif
+
 #if defined(DATA_A_Q1_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint bits = uint(data_a[a_offset + ib].qs[iqs / 8u]) >> (iqs % 8u);
@@ -756,7 +777,7 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_TQ2_T) || defined(DATA_A_TQK6) || defined(DATA_A_TQK7)
+#if defined(DATA_A_TQ2_T) || defined(DATA_A_TQK6) || defined(DATA_A_TQK7) || defined(DATA_A_TQP5) || defined(DATA_A_TQP6) || defined(DATA_A_TQP7)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
 }

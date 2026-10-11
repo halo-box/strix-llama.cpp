@@ -494,6 +494,33 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
     store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
     store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
     store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
+#elif defined(DATA_A_TQP5) || defined(DATA_A_TQP6) || defined(DATA_A_TQP7)
+    // LOAD_VEC_A == 8: four trellis steps t0 .. t0 + 3. Their windows lie in the 3K + 16 bits
+    // from S = tqp_off(t0 + 3): four (wrapped) u16 words from S >> 4 (tqp.glsl).
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+    const uint ib = idx / 16;
+    const uint t0 = (idx & 0xfu) * 4u;
+
+    const float d = float(data_a_packed16[ib].d);
+    const uint S = tqp_off(t0 + 3u);
+    const uint wb = S >> 4u;
+    const uint w0 = uint(data_a_packed16[ib].qs[wb]);
+    const uint w1 = uint(data_a_packed16[ib].qs[tqp_word_wrap(wb + 1u)]);
+    const uint w2 = uint(data_a_packed16[ib].qs[tqp_word_wrap(wb + 2u)]);
+    const uint w3 = uint(data_a_packed16[ib].qs[tqp_word_wrap(wb + 3u)]);
+    uint lo, hi;
+    tqp_window64(w0 | (w1 << 16u), w2 | (w3 << 16u), 0u, S & 15u, lo, hi);
+    const vec2 v0 = tqp_pair(tqp_bits15(lo, hi, 3u*TQP_K)) * d;
+    const vec2 v1 = tqp_pair(tqp_bits15(lo, hi, 2u*TQP_K)) * d;
+    const vec2 v2 = tqp_pair(tqp_bits15(lo, hi,    TQP_K)) * d;
+    const vec2 v3 = tqp_pair(tqp_bits15(lo, hi, 0u)) * d;
+
+    const uint k_pair = row * LOAD_VEC_A / 2;
+    store_a(col, k_pair,     FLOAT_TYPEV2(v0));
+    store_a(col, k_pair + 1, FLOAT_TYPEV2(v1));
+    store_a(col, k_pair + 2, FLOAT_TYPEV2(v2));
+    store_a(col, k_pair + 3, FLOAT_TYPEV2(v3));
 #elif defined(DATA_A_NVFP4)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
     const uint eff_row = (row & 3) + (row & ~3) * 2;

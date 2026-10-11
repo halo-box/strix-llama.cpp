@@ -2533,6 +2533,152 @@ size_t quantize_tqk7(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     return nrow * row_size;
 }
 
+// ====================== TQP5 / TQP6 / TQP7 (pair trellis, group 128) ======================
+// 64 steps of 2 weights; the state of step t is the 16-bit circular window at stream bit
+// (63 - t)*K (tqp_state in ggml-common.h), and its pair is TQ2_T's first pair of that state.
+// Decoder is the format definition.
+// Encoder: PLACEHOLDER, a greedy coordinate descent over the 64 K-bit chunks (chunk t is read
+// by the 15-bit windows of steps t, t+1, t+2 mod 64) at three target scales, each followed by a
+// least-squares refit of d; the best is kept. Real model files come from an offline encoder.
+
+static void tqp_set_chunk(uint8_t * GGML_RESTRICT qs, int k, int t, uint32_t v) {
+    const int off = (63 - t) * k;
+    for (int b = 0; b < k; ++b) {
+        const int i = off + b;
+        if ((v >> b) & 1) {
+            qs[i >> 3] |=  (uint8_t) (1u << (i & 7));
+        } else {
+            qs[i >> 3] &= (uint8_t) ~(1u << (i & 7));
+        }
+    }
+}
+
+static inline float tqp_step_err(const float * GGML_RESTRICT y, int t, uint32_t s) {
+    const uint32_t idx = tq2t_hyb_index(2*s);
+    const float dx = y[2*t + 0] - tq2t_lut_val(2*idx + 0);
+    const float dy = y[2*t + 1] - tq2t_lut_val(2*idx + 1);
+    return dx*dx + dy*dy;
+}
+
+static void quantize_row_tqp_impl(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k, int kb) {
+    assert(k % QK_TQP == 0);
+    assert(kb >= 5 && kb <= 7);
+    const int64_t nb = k / QK_TQP;
+    const int nsteps = QK_TQP/2;
+    const size_t qs_bytes = 8*kb;
+    const size_t bsize = sizeof(ggml_half) + qs_bytes;
+    uint8_t * y = (uint8_t *) vy;
+
+    for (int64_t i = 0; i < nb; i++, x += QK_TQP, y += bsize) {
+        ggml_half * dp = (ggml_half *) y;
+        uint8_t * qs = y + sizeof(ggml_half);
+        memset(qs, 0, qs_bytes);
+
+        float sumsq = 0.0f;
+        for (int j = 0; j < QK_TQP; j++) {
+            sumsq += x[j]*x[j];
+        }
+        if (sumsq == 0.0f) {
+            *dp = GGML_FP32_TO_FP16(0.0f);
+            continue;
+        }
+        const float rms = sqrtf(sumsq / QK_TQP);
+
+        static const float scales[3] = { 0.8f, 1.0f, 1.25f };
+        uint8_t cand[8*7];
+        float best_err = INFINITY;
+        float best_d = rms;
+        for (int si = 0; si < 3; ++si) {
+            float yn[QK_TQP];
+            for (int j = 0; j < QK_TQP; j++) {
+                yn[j] = x[j] * scales[si] / rms;
+            }
+            memset(cand, 0, qs_bytes);
+
+            for (int pass = 0; pass < 6; ++pass) {
+                for (int t = 0; t < nsteps; ++t) {
+                    float best = INFINITY;
+                    uint32_t best_v = 0;
+                    for (uint32_t v = 0; v < (1u << kb); ++v) {
+                        tqp_set_chunk(cand, kb, t, v);
+                        float e = 0.0f;
+                        for (int m = 0; m < 3; ++m) {
+                            const int tt = (t + m) % nsteps;
+                            e += tqp_step_err(yn, tt, tqp_state(cand, kb, tt));
+                        }
+                        if (e < best) {
+                            best = e;
+                            best_v = v;
+                        }
+                    }
+                    tqp_set_chunk(cand, kb, t, best_v);
+                }
+            }
+
+            float sxc = 0.0f, scc = 0.0f;
+            for (int t = 0; t < nsteps; ++t) {
+                const uint32_t idx = tq2t_hyb_index(2*tqp_state(cand, kb, t));
+                for (int j = 0; j < 2; ++j) {
+                    const float c = tq2t_lut_val(2*idx + j);
+                    sxc += x[2*t + j] * c;
+                    scc += c * c;
+                }
+            }
+            const float d = scc > 0.0f ? sxc / scc : rms;
+            const float err = sumsq - 2.0f*d*sxc + d*d*scc;
+            if (err < best_err) {
+                best_err = err;
+                best_d = d;
+                memcpy(qs, cand, qs_bytes);
+            }
+        }
+        *dp = GGML_FP32_TO_FP16(best_d);
+    }
+}
+
+static void dequantize_row_tqp_impl(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k, int kb) {
+    assert(k % QK_TQP == 0);
+    const int64_t nb = k / QK_TQP;
+    const int nsteps = QK_TQP/2;
+    const size_t bsize = sizeof(ggml_half) + 8*kb;
+    const uint8_t * x = (const uint8_t *) vx;
+
+    for (int64_t i = 0; i < nb; ++i, x += bsize) {
+        const float d = GGML_FP16_TO_FP32(*(const ggml_half *) x);
+        const uint8_t * qs = x + sizeof(ggml_half);
+        for (int t = 0; t < nsteps; ++t) {
+            const uint32_t idx = tq2t_hyb_index(2*tqp_state(qs, kb, t));
+            *y++ = d * tq2t_lut_val(2*idx + 0);
+            *y++ = d * tq2t_lut_val(2*idx + 1);
+        }
+    }
+}
+
+#define TQP_DEFINE(K)                                                                                  \
+void quantize_row_tqp##K##_ref(const float * GGML_RESTRICT x, block_tqp##K * GGML_RESTRICT y, int64_t k) { \
+    quantize_row_tqp_impl(x, y, k, K);                                                                 \
+}                                                                                                      \
+void dequantize_row_tqp##K(const block_tqp##K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {  \
+    dequantize_row_tqp_impl(x, y, k, K);                                                               \
+}                                                                                                      \
+size_t quantize_tqp##K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) { \
+    (void)quant_weights;                                                                               \
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQP##K, n_per_row);                                \
+    char * qrow = (char *)dst;                                                                         \
+    for (int64_t row = 0; row < nrow; ++row) {                                                         \
+        quantize_row_tqp##K##_ref(src, (block_tqp##K *)qrow, n_per_row);                               \
+        src  += n_per_row;                                                                             \
+        qrow += row_size;                                                                              \
+    }                                                                                                  \
+    return nrow * row_size;                                                                            \
+}
+
+TQP_DEFINE(5)
+TQP_DEFINE(6)
+TQP_DEFINE(7)
+
+#undef TQP_DEFINE
+
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
         quantize_row_q4_0_ref(src, dst, (int64_t)nrow*n_per_row);
@@ -6036,6 +6182,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQK7:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tqk7, data, nb);
+            } break;
+        case GGML_TYPE_TQP5:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tqp5, data, nb);
+            } break;
+        case GGML_TYPE_TQP6:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tqp6, data, nb);
+            } break;
+        case GGML_TYPE_TQP7:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tqp7, data, nb);
             } break;
         case GGML_TYPE_IQ1_S:
             {
