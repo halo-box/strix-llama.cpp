@@ -4439,11 +4439,22 @@ private:
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
+    // LLAMA_SERVER_ALLOW_CTX_BEYOND_TRAIN=1 (or the model metadata carrying rope scaling for a larger
+    // yarn context) lifts the training-context cap: the model was loaded with n_ctx_seq already beyond
+    // n_ctx_train, so the KV pool and rope config were prepared for it.
     int n_ctx_slot() const {
         int res = llama_n_ctx_seq(ctx_tgt);
 
         if (params_base.kv_unified_per_slot > 0) {
             res = std::min(res, params_base.kv_unified_per_slot);
+        }
+
+        static const bool allow_beyond_train = [] {
+            const char * e = getenv("LLAMA_SERVER_ALLOW_CTX_BEYOND_TRAIN");
+            return e && (atoi(e) != 0);
+        }();
+        if (allow_beyond_train) {
+            return res;
         }
 
         return std::min(res, llama_model_n_ctx_train(model_tgt));

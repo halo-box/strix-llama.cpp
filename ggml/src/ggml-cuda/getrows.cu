@@ -225,6 +225,70 @@ static void get_rows_cuda_q(
         s10, s11, s12/*, s13*/);
 }
 
+// same as k_get_rows_kq but iterating 32-value sub-blocks: for quant types whose
+// dequantization is per 32-value block and row sizes that are not multiples of QK_K
+template<typename dst_t, dequantize_kq_t<dst_t> dequantize_32>
+static __global__ void k_get_rows_32(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
+        /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
+        /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
+        /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
+
+    ggml_cuda_pdl_sync();
+    const int64_t nb = ne00/32; // 32-value sub-blocks per row
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int i10 = blockIdx.x;
+        const uint2 dm  = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+        const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+
+        for (int64_t ib = blockIdx.y; ib < nb; ib += gridDim.y) {
+            dequantize_32(src0_row, ib, dst_row + ib*32, threadIdx.x);
+        }
+    }
+}
+
+template<int grain, typename dst_t, dequantize_kq_t<dst_t> dequantize_32>
+static void get_rows_cuda_gr(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % grain == 0);
+    const int64_t nb = ne00/grain;
+
+    const dim3 block_dims(4, 1, 1);
+    const dim3 block_nums(ne10, MIN(nb, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+
+    const size_t s1 = nb1 / sizeof(dst_t);
+    const size_t s2 = nb2 / sizeof(dst_t);
+    const size_t s3 = nb3 / sizeof(dst_t);
+
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    GGML_ASSERT(ne12 > 0);
+    GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    k_get_rows_32<dst_t, dequantize_32><<<block_nums, block_dims, 0, stream>>>(
+        src0_d, src1_d, dst_d,
+        ne00, /*ne01, ne02, ne03,*/
+        /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
+        /* s0,*/ s1, s2, s3,
+        /* nb00,*/ nb01, nb02, nb03,
+        s10, s11, s12/*, s13*/);
+}
+
 template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
 static void get_rows_cuda_kq(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -459,7 +523,7 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_gr<32, dst_t, dequantize_iq4_nl_32<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_XS:
@@ -467,15 +531,15 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_MXFP4:
-            get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_gr<32, dst_t, dequantize_mxfp4_32<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_0_ROCMFP4:
-            get_rows_cuda_kq<32, dst_t, dequantize_rocmfp4<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_gr<32, dst_t, dequantize_rocmfp4_32<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-            get_rows_cuda_kq<32, dst_t, dequantize_rocmfp4_fast<dst_t>>(src0_d, src1_d, dst_d,
+            get_rows_cuda_gr<32, dst_t, dequantize_rocmfp4_fast_32<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         default:

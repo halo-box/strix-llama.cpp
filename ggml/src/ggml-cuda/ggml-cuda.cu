@@ -538,6 +538,19 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void free(void * ptr, size_t size) override {
+        // GGML_CUDA_POOL_FREE_MIN_MB: blocks at or above this size return to the
+        // driver immediately instead of staying cached in the pool. Bounds the
+        // peak+caches ratchet of large transient scratch (e.g. QSA prefill/decode
+        // intermediates that scale with the KV length) at a small cudaFree cost
+        // per released block; small scratch keeps the hot cache path.
+        static const int free_min_mb = getenv("GGML_CUDA_POOL_FREE_MIN_MB")
+            ? std::atoi(getenv("GGML_CUDA_POOL_FREE_MIN_MB")) : 0;
+        if (free_min_mb > 0 && size >= (size_t) free_min_mb * 1024 * 1024 && !pool_pool_full()) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(ptr));
+            pool_size -= size;
+            return;
+        }
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
             if (b.ptr == nullptr) {
@@ -550,6 +563,15 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+    }
+
+    bool pool_pool_full() const {
+        for (int i = 0; i < MAX_BUFFERS; ++i) {
+            if (buffer_pool[i].ptr == nullptr) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -8031,9 +8053,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_Q4_0_ROCMFP4:
                     case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-                        // 32-value sub-blocks, the row size does not guarantee
-                        // the QK_K super-blocks the get_rows kernel iterates on
-                        return op->src[0]->ne[0] % QK_K == 0;
+                        // dequantization is per 32-value sub-block, so any row
+                        // size that is a multiple of 32 works
+                        return op->src[0]->ne[0] % 32 == 0;
                     default:
                         return false;
                 }
