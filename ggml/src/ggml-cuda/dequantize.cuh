@@ -519,10 +519,10 @@ static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const 
 // single 32-value sub-block wrappers for get_rows on rows that are not
 // a multiple of QK_K (e.g. per_layer_token_embd with head_dim % QK_K != 0):
 // one thread writes half the values, 4 threads cover one 32-value block.
-// Invariant: these must stay nibble-verbatim copies of the QK_K-path
-// dequantizers below (same per-sub-block lane order and scale handling);
-// tools/lint or future edits to dequantize_rocmfp4* / dequantize_mxfp4 /
-// dequantize_iq4_nl must be mirrored here or get_rows output diverges.
+// Invariant: this must stay nibble-verbatim with the QK_K-path
+// dequantize_iq4_nl below (same per-sub-block lane order and scale
+// handling); edits to dequantize_iq4_nl must be mirrored here or
+// get_rows output diverges.
 template<typename dst_t>
 static __device__ __forceinline__ void dequantize_iq4_nl_32(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
     const block_iq4_nl * x = (const block_iq4_nl *) vx + ib;
@@ -532,43 +532,6 @@ static __device__ __forceinline__ void dequantize_iq4_nl_32(const void * vx, con
     for (int j = 0; j < 4; ++j) {
         yy[j]      = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
         yy[j + 16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
-    }
-}
-
-template<typename dst_t>
-static __device__ __forceinline__ void dequantize_mxfp4_32(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
-    const block_mxfp4 * x = (const block_mxfp4 *) vx + ib;
-    const int64_t il = tid & 3;
-    const uint8_t * q4 = x->qs + 4*il;
-    const float d = ggml_cuda_e8m0_to_fp32(x->e);
-    for (int j = 0; j < 4; ++j) {
-        yy[j]      = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]*0.5f);
-        yy[j + 16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
-    }
-}
-
-template<typename dst_t>
-static __device__ __forceinline__ void dequantize_rocmfp4_32(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
-    const block_rocmfp4 * x = (const block_rocmfp4 *) vx + ib;
-    const int64_t il = tid & 3;
-    const uint8_t * q4 = x->qs + 4*il;
-    const float d0 = rocmfp4_ue4m3_to_fp32_half_finite(x->e[0]);
-    const float d1 = rocmfp4_ue4m3_to_fp32_half_finite(x->e[1]);
-    for (int j = 0; j < 4; ++j) {
-        yy[j]      = ggml_cuda_cast<dst_t>(d0 * kvalues_rocmfp4[q4[j] & 0xf]);
-        yy[j + 16] = ggml_cuda_cast<dst_t>(d1 * kvalues_rocmfp4[q4[j] >>  4]);
-    }
-}
-
-template<typename dst_t>
-static __device__ __forceinline__ void dequantize_rocmfp4_fast_32(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
-    const block_rocmfp4_fast * x = (const block_rocmfp4_fast *) vx + ib;
-    const int64_t il = tid & 3;
-    const uint8_t * q4 = x->qs + 4*il;
-    const float d = rocmfp4_ue4m3_to_fp32_half_finite(x->e);
-    for (int j = 0; j < 4; ++j) {
-        yy[j]      = ggml_cuda_cast<dst_t>(d * kvalues_rocmfp4[q4[j] & 0xf]);
-        yy[j + 16] = ggml_cuda_cast<dst_t>(d * kvalues_rocmfp4[q4[j] >>  4]);
     }
 }
 

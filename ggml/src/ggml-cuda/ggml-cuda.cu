@@ -8048,12 +8048,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                         return true;
                     case GGML_TYPE_IQ4_NL:
+                        // dequantization is per 32-value sub-block (the
+                        // _32-grain get_rows kernel in getrows.cu), so any row
+                        // size that is a multiple of 32 works. Keeps the
+                        // supports_op gate aligned with what the dispatched
+                        // kernel guarantees for this type only; MXFP4 and the
+                        // ROCmFP4 variants stay on the QK_K path unchanged.
+                        return op->src[0]->ne[0] % 32 == 0;
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_Q4_0_ROCMFP4:
                     case GGML_TYPE_Q4_0_ROCMFP4_FAST:
-                        // dequantization is per 32-value sub-block, so any row
-                        // size that is a multiple of 32 works
-                        return op->src[0]->ne[0] % 32 == 0;
+                        // 32-value sub-blocks, the row size does not guarantee
+                        // the QK_K super-blocks the get_rows kernel iterates on
+                        return op->src[0]->ne[0] % QK_K == 0;
                     default:
                         return false;
                 }
