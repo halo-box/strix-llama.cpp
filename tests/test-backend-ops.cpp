@@ -5593,6 +5593,21 @@ struct test_qsa_block_select : public test_case {
         return 0.0;   // the selection, its order and the cells must match exactly
     }
 
+    // the chain run unfused on Vulkan matches the CPU too: with GGML_VK_TEST_REQUIRE_QSA_BLOCK_SELECT=1 the test fails
+    // unless exactly one QSA_BLOCK_SELECT dispatch ran
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_BLOCK_SELECT", "QSA_BLOCK_SELECT")) {
+            return true;
+        }
+        const int64_t n = dispatch_census_count(backend, "QSA_BLOCK_SELECT");
+        if (n != 1) {
+            msg = "QSA_BLOCK_SELECT dispatches: " + std::to_string(n) + " (expected 1: the chain ran unfused)";
+            return false;
+        }
+        return true;
+    }
+
     test_qsa_block_select(int64_t n_blocks = 512, int64_t n_query = 8, int64_t n_stream = 1, int64_t budget = 128, int64_t r = 4, int64_t n_inf = 0)
         : n_blocks(n_blocks), n_query(n_query), n_stream(n_stream), budget(budget), r(r), n_inf(n_inf) {
         GGML_ASSERT(budget <= n_blocks && n_inf <= n_blocks);

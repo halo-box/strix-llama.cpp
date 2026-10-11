@@ -15062,7 +15062,31 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
         return 0;
     }
     int last = idxs[count - 1];
-    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, &last, 1)) {
+    // ggml_can_fuse_subgraph_ext rejects a view whose source is outside the subgraph unless it is a weight, and the
+    // chain views the score and the block cells (score_view, cells_view). Those two are checked here instead: every
+    // reader is a chain node. The other nodes go through the helper (single use inside the chain, only the CONCAT
+    // read outside, interior views of chain nodes).
+    int     fidxs[MAX_N];
+    ggml_op fops[MAX_N];
+    int     fcount = 0;
+    for (int k = 0; k < count; ++k) {
+        const ggml_tensor * t = in[k];
+        const bool ext_view = t->view_src != nullptr && !in_chain(t->view_src);
+        if (!ext_view) {
+            fidxs[fcount] = idxs[k]; fops[fcount++] = ops[k];
+            continue;
+        }
+        int uses = 0;
+        for (int x = 0; x < count; ++x) {
+            for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                uses += in[x]->src[si] == t;
+            }
+        }
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || uses != ggml_node_get_use_count(cgraph, idxs[k])) {
+            return 0;
+        }
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, fidxs, fcount, fops, &last, 1)) {
         return 0;
     }
     if (ctx && (get_misalign_bytes(ctx, score) || get_misalign_bytes(ctx, cells) || get_misalign_bytes(ctx, tail) || get_misalign_bytes(ctx, concat))) {
