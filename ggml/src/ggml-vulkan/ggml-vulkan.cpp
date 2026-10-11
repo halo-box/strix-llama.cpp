@@ -18479,8 +18479,10 @@ static bool ggml_vk_can_fuse_mmid_glu(ggml_backend_vk_context * ctx, const struc
 
 // MUL_MAT_ID + MUL(router weights) + CPY(f16): the router-weight epilogue, stored as f16
 static bool ggml_vk_can_fuse_mmid_mul_cpy16(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    // not ggml_vk_can_fuse({MUL_MAT_ID, MUL}): that path asks ggml_vk_mmid_scale_epilogue_ok without the d16 flag, which on a
+    // routed type answers for the f32-out pf pipeline (no router-weight binding) and refused every routed MUL_MAT_ID_MUL_CPY16
+    // (wave-4 filler 10-11, 0/25 engaged); the structural check is the three-op ggml_can_fuse, the d16-aware predicate is below
     if (!ggml_vk_mmid_f16out_enabled() || node_idx + 2 >= cgraph->n_nodes ||
-        !ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL }) ||
         !ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_CPY })) {
         return false;
     }
