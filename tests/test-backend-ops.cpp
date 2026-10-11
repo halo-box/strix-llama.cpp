@@ -1291,6 +1291,10 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    // engagement: called on backend1 right before the compare and right after it; a test that requires a fused
+    // dispatch resets the backend's counters in the first and FAILS from the second when the count stayed 0
+    virtual void before_compute(ggml_backend_t backend) { GGML_UNUSED(backend); }
+    virtual bool verify_engagement(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
 
     // nodes the scheduler runs on the second backend: backend1 then computes in several splits, as llama does
     // (needs use_scheduler_allocation(); the nodes to compare must be graph outputs)
@@ -1601,6 +1605,7 @@ struct test_case {
                 ggml_backend_graph_copy_free(copy);
             }
         } else {
+            before_compute(backend1);
             cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                         run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                         fused_nodes_to_verify.size());
@@ -1609,6 +1614,13 @@ struct test_case {
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        if (test_passed) {
+            std::string engage_msg;
+            if (!verify_engagement(backend1, engage_msg)) {
+                test_passed = false;
+                error_msg   = engage_msg;
+            }
+        }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -5307,6 +5319,31 @@ struct test_qsa_block_select : public test_case {
 
     double max_nmse_err() override {
         return 0.0;   // the selection, its order and the cells must match exactly
+    }
+
+    // the chain run unfused on Vulkan matches the CPU too: the test fails unless exactly one QSA_BLOCK_SELECT dispatch ran
+    typedef uint64_t (*fusion_count_t)(const char *);
+    typedef void     (*fusion_reset_t)(void);
+    static void * backend_proc(ggml_backend_t backend, const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+    void before_compute(ggml_backend_t backend) override {
+        if (auto reset = (fusion_reset_t) backend_proc(backend, "ggml_backend_vk_fusion_count_reset")) {
+            reset();
+        }
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        auto count = (fusion_count_t) backend_proc(backend, "ggml_backend_vk_fusion_count");
+        if (count == nullptr) {
+            return true;   // not the Vulkan backend
+        }
+        const uint64_t n = count("QSA_BLOCK_SELECT");
+        if (n != 1) {
+            msg = "QSA_BLOCK_SELECT dispatches: " + std::to_string(n) + " (expected 1: the chain ran unfused)";
+            return false;
+        }
+        return true;
     }
 
     test_qsa_block_select(int64_t n_blocks = 512, int64_t n_query = 8, int64_t n_stream = 1, int64_t budget = 128, int64_t r = 4, int64_t n_inf = 0)

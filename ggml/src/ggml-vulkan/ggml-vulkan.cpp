@@ -14644,7 +14644,31 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
         return 0;
     }
     int last = idxs[count - 1];
-    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, &last, 1)) {
+    // ggml_can_fuse_subgraph_ext rejects a view whose source is outside the subgraph unless it is a weight, and the
+    // chain views the score and the block cells (score_view, cells_view). Those two are checked here instead: every
+    // reader is a chain node. The other nodes go through the helper (single use inside the chain, only the CONCAT
+    // read outside, interior views of chain nodes).
+    int     fidxs[MAX_N];
+    ggml_op fops[MAX_N];
+    int     fcount = 0;
+    for (int k = 0; k < count; ++k) {
+        const ggml_tensor * t = in[k];
+        const bool ext_view = t->view_src != nullptr && !in_chain(t->view_src);
+        if (!ext_view) {
+            fidxs[fcount] = idxs[k]; fops[fcount++] = ops[k];
+            continue;
+        }
+        int uses = 0;
+        for (int x = 0; x < count; ++x) {
+            for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                uses += in[x]->src[si] == t;
+            }
+        }
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || uses != ggml_node_get_use_count(cgraph, idxs[k])) {
+            return 0;
+        }
+    }
+    if (!ggml_can_fuse_subgraph_ext(cgraph, fidxs, fcount, fops, &last, 1)) {
         return 0;
     }
     if (ctx && (get_misalign_bytes(ctx, score) || get_misalign_bytes(ctx, cells) || get_misalign_bytes(ctx, tail) || get_misalign_bytes(ctx, concat))) {
@@ -18131,6 +18155,27 @@ static bool ggml_vk_can_fuse_mmid_mul_cpy16(ggml_backend_vk_context * ctx, const
            ggml_vk_mmid_scale_epilogue_ok(ctx, mmid, mul);
 }
 
+// fused-dispatch engagement counters (see ggml-vulkan.h): a map keyed by the fusion name, bumped once per enqueued
+// fused dispatch. Only read by tests and the engagement checks, so a mutex per bump is fine.
+static std::mutex g_vk_fusion_count_mutex;
+static std::unordered_map<std::string, uint64_t> g_vk_fusion_counts;
+
+static void ggml_vk_fusion_count_add(const char * name) {
+    std::lock_guard<std::mutex> lock(g_vk_fusion_count_mutex);
+    g_vk_fusion_counts[name] += 1;
+}
+
+uint64_t ggml_backend_vk_fusion_count(const char * fusion_name) {
+    std::lock_guard<std::mutex> lock(g_vk_fusion_count_mutex);
+    auto it = g_vk_fusion_counts.find(fusion_name);
+    return it == g_vk_fusion_counts.end() ? 0 : it->second;
+}
+
+void ggml_backend_vk_fusion_count_reset(void) {
+    std::lock_guard<std::mutex> lock(g_vk_fusion_count_mutex);
+    g_vk_fusion_counts.clear();
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -18673,6 +18718,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        if (enqueued && fusion_string) {
+            ggml_vk_fusion_count_add(fusion_string);
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -20584,11 +20632,22 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_vk_fusion_count") == 0) {
+        return (void *) ggml_backend_vk_fusion_count;
+    }
+    if (strcmp(name, "ggml_backend_vk_fusion_count_reset") == 0) {
+        return (void *) ggml_backend_vk_fusion_count_reset;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
