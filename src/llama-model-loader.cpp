@@ -1771,6 +1771,11 @@ bool llama_model_loader::load_all_data(
     // 100% CPU until killed (observed on Strix Halo gfx1151, GGML_HIP_NO_VMM=1).
     // Stage every mapping->device copy through a pinned host buffer instead.
     const bool stage_mapping = [&]() {
+        if (!use_mmap && !lazy.any()) {
+            // no copies from a mapping happen: the file-read path stages through
+            // the upload_backend pinned buffers instead
+            return false;
+        }
         auto * buf0 = bufs.count(0) ? bufs.at(0) : nullptr;
         if (!buf0 || ggml_backend_buffer_is_host(buf0)) {
             return false;
@@ -1859,7 +1864,7 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
-            } else if (!ggml_backend_buffer_is_host(cur->buffer) && mapped_stage_buf != nullptr) {
+            } else if (cur->buffer && !ggml_backend_buffer_is_host(cur->buffer) && mapped_stage_buf != nullptr) {
                 // device destination: map -> pinned staging -> device, in chunks
                 size_t done = 0;
                 while (done < n_size) {

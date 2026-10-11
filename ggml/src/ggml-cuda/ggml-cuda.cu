@@ -543,9 +543,15 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         // peak+caches ratchet of large transient scratch (e.g. QSA prefill/decode
         // intermediates that scale with the KV length) at a small cudaFree cost
         // per released block; small scratch keeps the hot cache path.
+        // Note: the legacy pool has no window to shrink by itself, so once a block
+        // is cached it is reused or replaced only by larger allocations until the
+        // process ends. Only the buffer stores freed here participate after the
+        // QSA/attention scratch is done each step.
+        // Applies to the legacy (non-VMM) pool; the VMM pool keeps its own
+        // management (GGML_HIP_NO_VMM=OFF GPU builds).
         static const int free_min_mb = getenv("GGML_CUDA_POOL_FREE_MIN_MB")
             ? std::atoi(getenv("GGML_CUDA_POOL_FREE_MIN_MB")) : 0;
-        if (free_min_mb > 0 && size >= (size_t) free_min_mb * 1024 * 1024 && !pool_pool_full()) {
+        if (free_min_mb > 0 && size >= (size_t) free_min_mb * 1024 * 1024) {
             ggml_cuda_set_device(device);
             CUDA_CHECK(cudaFree(ptr));
             pool_size -= size;
@@ -565,14 +571,6 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         pool_size -= size;
     }
 
-    bool pool_pool_full() const {
-        for (int i = 0; i < MAX_BUFFERS; ++i) {
-            if (buffer_pool[i].ptr == nullptr) {
-                return false;
-            }
-        }
-        return true;
-    }
 };
 
 // pool with virtual memory
