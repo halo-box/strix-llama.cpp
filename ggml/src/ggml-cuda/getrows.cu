@@ -256,10 +256,11 @@ static __global__ void k_get_rows_32(
 }
 
 // same launcher shape as get_rows_cuda_kq but iterating 32-value sub-blocks:
-// for the per-32-block dequantizers routed here (IQ4_NL / MXFP4 /
-// Q4_0_ROCMFP4+_32, see dequantize.cuh), rows only need ne00 % 32 == 0.
-// That shape gate is enforced by the GET_ROWS supports_op case in
-// ggml-cuda.cu ("% 32"); callers reaching this launcher are guaranteed it.
+// the only routed type is IQ4_NL via dequantize_iq4_nl_32 (dequantize.cuh),
+// whose dequantization is per 32-value block, so rows needing ne00 % 32 == 0
+// are covered. That shape gate is enforced by the GET_ROWS supports_op case
+// in ggml-cuda.cu ("% 32"); callers reaching this launcher are guaranteed it.
+// MXFP4 and the ROCmFP4 variants stay on get_rows_cuda_kq with QK_K rows.
 template<int grain, typename dst_t, dequantize_kq_t<dst_t> dequantize_32>
 static void get_rows_cuda_gr(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
