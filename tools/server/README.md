@@ -75,19 +75,13 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lm, --load-mode MODE` | model loading mode (default: auto)<br/>- auto: mmap, unless a device does not support it<br/>- none: no special loading mode<br/>- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>- mlock: force system to keep model in RAM rather than swapping or compressing<br/>- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing<br/>- dio: use DirectIO if available<br/><br/>(env: LLAMA_ARG_LOAD_MODE) |
 | `-lzm, --lazy-mode MODE` | on-demand reading of certain tensors, for example per-layer embeddings (default: auto)<br/>- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)<br/>- auto: on, but only for tensors larger than 4 GiB<br/>- off: always keep them resident<br/>(env: LLAMA_ARG_LAZY_MODE) |
 | `--ple FNAME` | GGUF with per-layer embedding (PLE) tables to use instead of the tables in the model file; each tensor in it replaces the lookup table of the same name in the model and must have the same shape (default: unused)<br/>(env: LLAMA_ARG_PLE) |
-
-Environment-only knobs (implementation-specific, no CLI argument):
-
-| Environment variable | Effect |
-| -------------------- | ------ |
-| `LLAMA_SERVER_ALLOW_CTX_BEYOND_TRAIN=1` | lifts the per-slot cap at `n_ctx_train` so a slot can use the full KV pool (intended when the model is knowingly run beyond its native context, e.g. with `--rope-scaling yarn`) |
-| `GGML_CUDA_POOL_FREE_MIN_MB=N` | device scratch blocks at or above N MiB (e.g. QSA prefill/decode intermediates that scale with the KV length) are returned to the driver when released instead of staying cached in the pool (legacy/non-VMM pool only); bounds peak-plus-cached growth during very long prefill sessions |
-| `QSA_DIRECT` | `-1/auto` (default) picks direct F16 reads when the batch is small against the cache, `0` always packs, `1` always reads direct; both paths are bit-identical |
-| `GGML_QSA_RANKSORT=1` | force the O(n²) rank sort in the QSA indexer path |
-
 | `--numa TYPE` | attempt optimizations that help on some NUMA systems<br/>- distribute: spread execution evenly over all nodes<br/>- isolate: only spawn threads on CPUs on the node that execution started on<br/>- numactl: use the CPU map provided by numactl<br/>if run without this previously, it is recommended to drop the system page cache before using this<br/>see https://github.com/ggml-org/llama.cpp/issues/1437<br/>(env: LLAMA_ARG_NUMA) |
 | `-dev, --device <dev1,dev2,..>` | comma-separated list of devices to use for offloading (none = don't offload)<br/>use --list-devices to see a list of available devices<br/>(env: LLAMA_ARG_DEVICE) |
 | `--list-devices` | print list of available devices and exit |
+
+
+| Environment variable | Effect |
+| -------------------- | ------ |
 | `-ot, --override-tensor <tensor name pattern>=<buffer type>,...` | override tensor buffer type<br/>(env: LLAMA_ARG_OVERRIDE_TENSOR) |
 | `-cmoe, --cpu-moe` | keep all Mixture of Experts (MoE) weights in the CPU<br/>(env: LLAMA_ARG_CPU_MOE) |
 | `-ncmoe, --n-cpu-moe N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU<br/>(env: LLAMA_ARG_N_CPU_MOE) |
@@ -420,6 +414,16 @@ Recommended `--cors-origins` setting, depending on where the server runs:
 | Same machine | `--cors-origins localhost` (default once `--agent` is set) |
 
 Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-credentials` / `--no-cors-credentials`. Background and rationale: [#25655](https://github.com/ggml-org/llama.cpp/pull/25655).
+
+
+### Environment-only knobs (ggml/ggml-hip internals, no CLI argument)
+
+| Environment variable | Effect |
+| -------------------- | ------ |
+| `GGML_CUDA_POOL_FREE_MIN_MB=N` | device scratch blocks at or above N MiB (e.g. QSA prefill/decode intermediates that scale with the KV length) are freed on release instead of staying cached in the legacy/non-VMM pool |
+| `QSA_DIRECT` | `-1/auto` (default) picks direct F16 reads when the batch is small against the cache, `0` always packs, `1` always reads direct; both paths are bit-identical |
+| `GGML_QSA_RANKSORT=1` | force the O(n^2) rank sort in the QSA indexer path |
+| `HC_NO_MIX_FUSE=1` | disable the hc_mix stream-mix fusion (pre-existing) |
 
 ## Build
 

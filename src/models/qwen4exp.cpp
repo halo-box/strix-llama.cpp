@@ -1782,15 +1782,7 @@ public:
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
     ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]: the gathered rows, when the table is on disk
 
-    // gathered staging buffer, bounded by a high-watermark: grow via reserve()
-    // (no realloc churn on the hot path), and release the peak back to the
-    // allocator only after watermark_age consecutive small gathers, so idle
-    // servers do not hold a transient peak, while bursts reuse the capacity
     std::vector<float>   embd_buf;
-    size_t               embd_buf_peak    = 0;
-    size_t               embd_buf_small   = 0;
-    static constexpr size_t watermark_age = 8;
-
     std::vector<int32_t> rows_global;
 
     const llama_model_qwen4exp & pmodel;
@@ -1999,20 +1991,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
-        // high-watermark release after small-gather aging
-        const size_t n_elems = embd_buf.size();
-        if (n_elems > embd_buf_peak) {
-            embd_buf_peak = n_elems;
-        }
-        if (n_elems * 2 < embd_buf_peak) {
-            if (++embd_buf_small >= watermark_age) {
-                embd_buf.shrink_to_fit();
-                embd_buf_peak = n_elems;
-                embd_buf_small = 0;
-            }
-        } else {
-            embd_buf_small = 0;
-        }
         return;
     }
 
@@ -2026,21 +2004,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
         pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
-        const size_t n_elems = embd_buf.size();
-        if (n_elems > embd_buf_peak) {
-            embd_buf_peak = n_elems;
-            embd_buf_small = 0;
-            return;
-        }
-        if (n_elems * 2 < embd_buf_peak) {
-            if (++embd_buf_small >= watermark_age) {
-                embd_buf.shrink_to_fit();
-                embd_buf_peak = n_elems;
-                embd_buf_small = 0;
-            }
-        } else {
-            embd_buf_small = 0;
-        }
         return;
     }
 

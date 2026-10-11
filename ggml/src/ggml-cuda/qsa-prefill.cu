@@ -486,7 +486,7 @@ bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(ggml_backend_cuda_context & 
     return bias==0 && softcap==0 && q->type==GGML_TYPE_F32 && k->type==GGML_TYPE_F16 && v->type==GGML_TYPE_F16 &&
         dst->type==GGML_TYPE_F32 && ids->type==GGML_TYPE_I32 &&
         q->ne[0]==256 && k->ne[0]==256 && v->ne[0]==256 && q->ne[1]>=128 && q->ne[1]<=INT_MAX &&
-        k->ne[1]>0 && k->ne[1]<=1048576 && k->ne[1]%4==0 && v->ne[1]==k->ne[1] &&
+        k->ne[1]>0 && k->ne[1]<=262140 && k->ne[1]%4==0 && v->ne[1]==k->ne[1] &&
         k->ne[2]>0 && k->ne[2]<=65535 && q->ne[2]==12*k->ne[2] && v->ne[2]==k->ne[2] &&
         q->ne[3]==1 && k->ne[3]==1 && v->ne[3]==1 && ggml_nelements(k)/4<=INT_MAX &&
         q->nb[0]==4 && k->nb[0]==2 && v->nb[0]==2 && ids->nb[0]==4 &&

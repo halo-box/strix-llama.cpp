@@ -516,25 +516,6 @@ static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const 
     dequantize_iq4_nl<dst_t, dst_t *>(vx, ib, yy, tid);
 }
 
-// single 32-value sub-block wrappers for get_rows on rows that are not
-// a multiple of QK_K (e.g. per_layer_token_embd with head_dim % QK_K != 0):
-// one thread writes half the values, 4 threads cover one 32-value block.
-// Invariant: this must stay nibble-verbatim with the QK_K-path
-// dequantize_iq4_nl below (same per-sub-block lane order and scale
-// handling); edits to dequantize_iq4_nl must be mirrored here or
-// get_rows output diverges.
-template<typename dst_t>
-static __device__ __forceinline__ void dequantize_iq4_nl_32(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
-    const block_iq4_nl * x = (const block_iq4_nl *) vx + ib;
-    const int64_t il = tid & 3;
-    const uint8_t * q4 = x->qs + 4*il;
-    const float d = (float)x->d;
-    for (int j = 0; j < 4; ++j) {
-        yy[j]      = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
-        yy[j + 16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
-    }
-}
-
 template<typename dst_t>
 static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
     dequantize_iq4_xs<dst_t, dst_t *>(vx, ib, yy, tid);
