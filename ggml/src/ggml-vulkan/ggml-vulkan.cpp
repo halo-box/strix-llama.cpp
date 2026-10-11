@@ -1857,6 +1857,7 @@ static bool ggml_vk_mm_prefetch_enabled(const vk_device& device);
 static bool ggml_vk_mm_prefetch_type(ggml_type t);
 static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n);
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
+static void ggml_vk_fusion_count_add(const char * name);
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device);
 static uint32_t ggml_vk_dense_ypad();
 static bool ggml_vk_dense_ypad_camps(uint64_t k);
@@ -9060,22 +9061,52 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     // REG_A tile (register-direct A, 128x64, wave32) for the aligned iq3_xxs / iq4_nl expert GEMMs on the f16-B coopmat
-    // pf path, where the tile selector would take the medium tile (about 64 rows per expert at a 2048-token ubatch)
-    if (aligned && !quantize_y && !qx_needs_dequant && !d16 && !glu && (src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_NL) &&
-        ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mmid_rega_enabled(ctx->device) && mmp_map->size() >= 3 &&
-        // the tile question for an expert GEMM is the rows PER EXPERT (nei1 * nei0 / n_as: 2048 tokens x top-10 / 320 experts = 64 on
-        // Flash-Next REAP-320), as the fork's port sizes it; fed the token count (2048) the selector always answers "large" and the
-        // REG_A medium tile never engaged (fillers 10-11: 6355 + 2966 + 12 cases, engaged = 0)
-        ctx->device->matmul_id_tile_selector(ne01, (uint32_t) std::max<uint64_t>(1, (nei1 * nei0 + ne02 - 1) / ne02), 0, ctx->device->shader_core_count, *mmp_map) == 1) {
-        const ggml_type tb = y_kernel_type;   // the B type this GEMM runs with (master's ggml_vk_mul_mat_b_type)
-        const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, tb, (ggml_prec)dst->op_params[0]);
-        vk_matmul_pipeline_key kr{src0->type, tb, true, f16acc, false, false, true, true};
-        auto itr = ctx->device->pipeline_matmul.find(kr);
-        if (itr == ctx->device->pipeline_matmul.end() || itr->second.empty()) { kr.f16acc = !f16acc; itr = ctx->device->pipeline_matmul.find(kr); }
-        if (itr != ctx->device->pipeline_matmul.end() && !itr->second.empty() && itr->second[0].aligned) {
-            static bool rega_logged = false;
-            if (!rega_logged) { rega_logged = true; fprintf(stderr, "ggml_vulkan: MUL_MAT_ID REG_A tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) nei1, (unsigned) ne10); }
-            pipeline = itr->second[0].aligned;
+    // pf path, where the tile selector would take the medium tile (about 64 rows per expert at a 2048-token ubatch).
+    // In the model this needs the expert GEMM routed off int8 MMQ (GGML_VK_MMID_F16COOPMAT, default off) and not fused with its
+    // f16 cast (the d16 store exists on the MMQ and f32-B families only), so the counter below reads 0 on Flash-Next until
+    // both are addressed; GGML_VK_FUSION_DEBUG=1 prints the first reason each distinct rejection happens.
+    if ((src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_NL) && ggml_vk_mmid_rega_enabled(ctx->device)) {
+        static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+        static std::set<std::string> rega_said;
+        auto rega_reject = [&](const char * why) {
+            if (dbg && rega_said.insert(why).second) {
+                fprintf(stderr, "ggml_vulkan: MUL_MAT_ID REG_A not taken (%s m=%u n=%u k=%u experts=%u used=%u): %s\n", ggml_type_name(src0->type),
+                        (unsigned) ne01, (unsigned) nei1, (unsigned) ne10, (unsigned) ne02, (unsigned) nei0, why);
+            }
+        };
+        const uint32_t rows_per_expert = (uint32_t) std::max<uint64_t>(1, (nei1 * nei0 + ne02 - 1) / ne02);
+        if (quantize_y) {
+            rega_reject("int8 MMQ route (GGML_VK_MMID_F16COOPMAT does not route this type, or the f16 cast is fused: d16 lives on MMQ)");
+        } else if (d16 || glu) {
+            rega_reject("f16-out / GLU store requested on the f16-B family");
+        } else if (qx_needs_dequant) {
+            rega_reject("A needs dequant");
+        } else if (!aligned) {
+            rega_reject("not aligned (k vs the tile's align, or m / n <= 8)");
+        } else if (!ggml_vk_mm_prefetch_enabled(ctx->device)) {
+            rega_reject("prefetch pipelines off");
+        } else if (mmp_map->size() < 3) {
+            rega_reject("pipeline map has fewer than 3 tiles");
+        } else if (ctx->device->matmul_id_tile_selector(ne01, rows_per_expert, 0, ctx->device->shader_core_count, *mmp_map) != 1) {
+            rega_reject("tile selector did not pick the medium tile for the rows per expert");
+        } else {
+            // the tile question for an expert GEMM is the rows PER EXPERT (nei1 * nei0 / n_as: 2048 tokens x top-10 / 320 experts
+            // = 64 on Flash-Next REAP-320), as the fork's port sizes it
+            const ggml_type tb = y_kernel_type;   // the B type this GEMM runs with (master's ggml_vk_mul_mat_b_type)
+            const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, tb, (ggml_prec)dst->op_params[0]);
+            vk_matmul_pipeline_key kr{src0->type, tb, true, f16acc, false, false, true, true};
+            auto itr = ctx->device->pipeline_matmul.find(kr);
+            if (itr == ctx->device->pipeline_matmul.end() || itr->second.empty()) { kr.f16acc = !f16acc; itr = ctx->device->pipeline_matmul.find(kr); }
+            if (itr == ctx->device->pipeline_matmul.end() || itr->second.empty()) {
+                rega_reject("no REG_A pipeline for this (type, B type) key: not created (shmem / acc support) or the B type differs");
+            } else if (!itr->second[0].aligned) {
+                rega_reject("REG_A pipeline has no aligned variant");
+            } else {
+                static bool rega_logged = false;
+                if (!rega_logged) { rega_logged = true; fprintf(stderr, "ggml_vulkan: MUL_MAT_ID REG_A tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) nei1, (unsigned) ne10); }
+                ggml_vk_fusion_count_add("MUL_MAT_ID_REGA");
+                pipeline = itr->second[0].aligned;
+            }
         }
     }
 
