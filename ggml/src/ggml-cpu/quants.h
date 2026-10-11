@@ -14,6 +14,8 @@ extern "C" {
 // TQ2_T / TQK6 / TQK7: trellis state -> 4 codebook weights, int16 at scale GGML_TQ_I16_SCALE
 #define GGML_TQ_I16_SCALE 8192.0f
 extern int16_t ggml_tq_state_i16[];
+// TQP: the 2048 codebook pairs (tq2t_lut_f16) as int16 at the same scale; pair i at [2i], [2i+1]
+extern int16_t ggml_tq_pair_i16[];
 void ggml_cpu_tq_init(void);
 
 // Quantization

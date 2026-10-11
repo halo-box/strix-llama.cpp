@@ -1445,7 +1445,18 @@ void ggml_vec_dot_ptq1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs,
 // per-state hash multiply. Filled once by ggml_cpu_tq_init (from ggml_cpu_init).
 int16_t ggml_tq_state_i16[(TQ_STATE_MASK + 1)*4];
 
+// The 2048 codebook pairs, rounded the same way: ggml_tq_state_i16[4*s + j] ==
+// ggml_tq_pair_i16[2*tq2t_hyb_index(2*s) + j]. 8 KiB, so it stays in L1; the TQP SIMD
+// kernels hash the state (one multiply) instead of reading the 256 KiB state table,
+// which is faster once many threads stream weights through L2 (TQP uses one pair per
+// state, so the state table saves no lookups there).
+int16_t ggml_tq_pair_i16[2048*2];
+
 void ggml_cpu_tq_init(void) {
+    for (uint32_t i = 0; i < 2048*2; ++i) {
+        const float v = GGML_CPU_FP16_TO_FP32(tq2t_lut_f16[i]) * GGML_TQ_I16_SCALE;
+        ggml_tq_pair_i16[i] = (int16_t) (v < 0.0f ? v - 0.5f : v + 0.5f);
+    }
     for (uint32_t st = 0; st <= TQ_STATE_MASK; ++st) {
         for (uint32_t h = 0; h < 2; ++h) {
             const uint32_t idx = tq2t_hyb_index(2*st + h);

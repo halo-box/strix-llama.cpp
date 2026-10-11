@@ -4308,4 +4308,107 @@ void ggml_vec_dot_tqk7_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     ggml_vec_dot_tqk7_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+
+// TQP5 / TQP6 / TQP7 x Q8_0.
+//
+// A 128-weight block is 64 steps of one weight pair each; Q8_0 block k covers steps 16k..16k+15.
+// The 8 states of lane l (steps 8l..8l+7, 16 weights) all lie in one 64-bit window of the
+// circular stream starting at byte (7-l)*K (only lane 0 wraps), at constant bit offsets
+// (7-j)*K, so a state is a shift and a mask of a GPR. Each state is hashed to its codebook
+// pair index (tq2t_hyb_index(2*s) = (s * 0x9e3779b1) >> 21) and the pair (two int16) is read
+// from the 8 KiB ggml_tq_pair_i16, which stays in L1, by a broadcast load blended into a YMM
+// (no shuffle port), then VPMADDWD against the sign-extended Q8_0 activations.
+// Zen 5, one thread: ~15 vs ~93 ns per block for the generic kernel. With 16 threads streaming
+// weights the L1 codebook beats lookups in the 256 KiB state table (2.0 vs 2.5-2.7 ns per
+// block) and VPGATHERDD on either table (2.9-3.1); AVX-512 masked broadcasts are faster on one
+// thread only, so AVX-512 builds run this kernel too.
+#if defined(__AVX2__)
+#if defined(_MSC_VER)
+#define TQP_INLINE __forceinline
+#else
+#define TQP_INLINE inline __attribute__((always_inline))
+#endif
+
+static TQP_INLINE uint64_t tqp_ld64(const uint8_t * p) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+}
+
+// stream bits from byte (7-l)*kb, circular modulo 8*kb bytes (kb <= 7, so only lane 0 wraps)
+static TQP_INLINE uint64_t tqp_window(const uint8_t * qs, int kb, int l) {
+    if (l == 0) {
+        return (tqp_ld64(qs + 8*kb - 8) >> (8*(8 - kb))) | (tqp_ld64(qs) << (8*kb));
+    }
+    return tqp_ld64(qs + (7 - l)*kb);
+}
+
+// the two weights of step 8l+j as an int32 (int16 pair)
+static TQP_INLINE int32_t tqp_pair(const int32_t * cb, uint64_t w, int kb, int j) {
+    const uint32_t s = (uint32_t) (w >> ((7 - j)*kb)) & TQ_STATE_MASK;
+    return cb[(s * 0x9e3779b1u) >> 21];
+}
+
+// the 16 weights of lane l as 16 int16
+static TQP_INLINE __m256i tqp_lane(const int32_t * cb, const uint8_t * qs, int kb, int l) {
+    const uint64_t w = tqp_window(qs, kb, l);
+    __m256i v = _mm256_castsi128_si256(_mm_cvtsi32_si128(tqp_pair(cb, w, kb, 0)));
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(tqp_pair(cb, w, kb, 1)), 0x02);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(tqp_pair(cb, w, kb, 2)), 0x04);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(tqp_pair(cb, w, kb, 3)), 0x08);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(tqp_pair(cb, w, kb, 4)), 0x10);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(tqp_pair(cb, w, kb, 5)), 0x20);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(tqp_pair(cb, w, kb, 6)), 0x40);
+    v = _mm256_blend_epi32(v, _mm256_set1_epi32(tqp_pair(cb, w, kb, 7)), 0x80);
+    return v;
+}
+
+static TQP_INLINE void ggml_vec_dot_tqp_q8_0_avx2(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int kb) {
+    const int nb = n / QK_TQP;
+    const size_t bsize = sizeof(ggml_half) + 8*kb;
+    const int32_t * cb = (const int32_t *) ggml_tq_pair_i16;
+
+    const uint8_t    * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i, x += bsize, y += QK_TQP/QK8_0) {
+        const uint8_t * qs = x + sizeof(ggml_half);
+        const float dx = GGML_CPU_FP16_TO_FP32(*(const ggml_half *) x);
+        for (int k = 0; k < QK_TQP/QK8_0; ++k) {
+            const __m256i w0 = tqp_lane(cb, qs, kb, 2*k);
+            const __m256i w1 = tqp_lane(cb, qs, kb, 2*k + 1);
+            const __m256i a0 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *) y[k].qs));
+            const __m256i a1 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *) (y[k].qs + 16)));
+            const __m256i p  = _mm256_add_epi32(_mm256_madd_epi16(w0, a0), _mm256_madd_epi16(w1, a1));
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dx * GGML_CPU_FP16_TO_FP32(y[k].d)), acc);
+        }
+    }
+
+    *s = hsum_float_8(acc) * (1.0f / GGML_TQ_I16_SCALE);
+}
+#endif
+
+#define GGML_VEC_DOT_TQP(K)                                                                                    \
+void ggml_vec_dot_tqp##K##_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,      \
+                                size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {                \
+    assert(n % QK_TQP == 0);                                                                                   \
+    assert(nrc == 1);                                                                                          \
+    UNUSED(nrc);                                                                                               \
+    UNUSED(bx);                                                                                                \
+    UNUSED(by);                                                                                                \
+    UNUSED(bs);                                                                                                \
+    GGML_VEC_DOT_TQP_BODY(K)                                                                                   \
+}
+
+#if defined(__AVX2__)
+#define GGML_VEC_DOT_TQP_BODY(K) ggml_vec_dot_tqp_q8_0_avx2(n, s, vx, vy, K);
+#else
+#define GGML_VEC_DOT_TQP_BODY(K) ggml_vec_dot_tqp##K##_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+
+GGML_VEC_DOT_TQP(5)
+GGML_VEC_DOT_TQP(6)
+GGML_VEC_DOT_TQP(7)
 #endif // GGML_USE_TRELLIS
