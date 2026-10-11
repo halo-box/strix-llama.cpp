@@ -1864,7 +1864,7 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
-            } else if (cur->buffer && !ggml_backend_buffer_is_host(cur->buffer) && mapped_stage_buf != nullptr) {
+            } else if (stage_mapping && cur->buffer && !ggml_backend_buffer_is_host(cur->buffer)) {
                 // device destination: map -> pinned staging -> device, in chunks
                 size_t done = 0;
                 while (done < n_size) {
