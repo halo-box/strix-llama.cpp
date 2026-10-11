@@ -14590,8 +14590,16 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
     if (!ggml_vk_qsa_block_select_enabled()) {
         return 0;
     }
-    if (ctx && (ctx->device->disable_fusion || ctx->device->pipeline_qsa_block_select_reg[0] == nullptr)) {
+    // GGML_VK_FUSION_DEBUG=1: say why a TOP_K (or a visibility cast ahead of one) is not taken; only from graph_compute (ctx set)
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    auto reject = [&](const char * why) -> int {
+        if (dbg && ctx && cgraph->nodes[node_idx]->op == GGML_OP_TOP_K) {
+            fprintf(stderr, "ggml_vulkan: QSA_BLOCK_SELECT not taken at node %d (%s): %s\n", node_idx, cgraph->nodes[node_idx]->name, why);
+        }
         return 0;
+    };
+    if (ctx && (ctx->device->disable_fusion || ctx->device->pipeline_qsa_block_select_reg[0] == nullptr)) {
+        return reject("fusion disabled or no pipeline");
     }
     constexpr int MAX_N = 48;
     int     idxs[MAX_N];
@@ -14708,19 +14716,19 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
 
     const ggml_tensor * topk = cgraph->nodes[topk_idx];
     if (topk->op != GGML_OP_TOP_K || topk->type != GGML_TYPE_I32) {
-        return 0;
+        return reject("not an I32 TOP_K");
     }
     const ggml_tensor * score = topk->src[0];   // the (visibility-applied) score the chain reads
     if (score->type != GGML_TYPE_F32 || !ggml_is_contiguous(score) || score->ne[3] != 1) {
-        return 0;
+        return reject("score type / layout");
     }
     const int64_t n_blocks = score->ne[0], n_query = score->ne[1], n_stream = score->ne[2];
     const int64_t budget   = topk->ne[0];
     if (budget < 1 || budget > n_blocks || n_query < 1 || (m.limits && n_stream != 1)) {
-        return 0;
+        return reject("budget / n_query / n_stream");
     }
     if (ctx && n_blocks > (int64_t) 64 * ctx->device->pipeline_qsa_block_select_reg[0]->wg_denoms[0]) {
-        return 0;   // a row no longer fits the registers: the chain stays
+        return reject("n_blocks past the register limit");   // a row no longer fits the registers: the chain stays
     }
     if (m.score == nullptr) {
         m.score = score;
@@ -14750,7 +14758,7 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
                 continue;
             }
             n_src++;
-            if (in_chain(src) || src == score) {
+            if (in_chain(src) || src == score || src == t) {   // src == t: a cast lists itself as src[1]
                 continue;
             }
             // outside the chain: the block-cells tensor (reached through one RESHAPE/VIEW) or the tail (CONCAT src[1])
@@ -14774,7 +14782,7 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
         }
     }
     if (concat == nullptr || cells_view == nullptr || count < 12) {
-        return 0;
+        return reject(concat == nullptr ? "no CONCAT within the chain window" : cells_view == nullptr ? "no block-cells reshape" : "chain too short");
     }
     const ggml_tensor * cells = cells_view->src[0];
     const ggml_tensor * tail  = concat->src[1];
@@ -14785,7 +14793,7 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
         tail->ne[3] != n_stream || tail->nb[0] != sizeof(int32_t) ||
         concat->type != GGML_TYPE_I32 || !ggml_is_contiguous(concat) || !in_chain(concat->src[0]) ||
         concat->ne[0] != r * budget + r - 1 || concat->ne[1] != n_query || concat->ne[2] != 1 || concat->ne[3] != n_stream) {
-        return 0;
+        return reject("cells / tail / concat shapes");
     }
     const int last = idxs[count - 1];
     // Only the CONCAT may be read outside the fusion: every other node's readers are all chain nodes (the graph's
@@ -14795,6 +14803,7 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
     for (int k = 0; k + 1 < count; ++k) {
         const ggml_tensor * t = in[k];
         if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (dbg && ctx) { fprintf(stderr, "ggml_vulkan: QSA_BLOCK_SELECT not taken: chain node %s is an output or not computed\n", t->name); }
             return 0;
         }
         int uses = 0;
@@ -14804,13 +14813,14 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
             }
         }
         if (uses != ggml_node_get_use_count(cgraph, idxs[k])) {
+            if (dbg && ctx) { fprintf(stderr, "ggml_vulkan: QSA_BLOCK_SELECT not taken: chain node %s (%s) has %d readers outside the chain\n", t->name, ggml_op_name(t->op), ggml_node_get_use_count(cgraph, idxs[k]) - uses); }
             return 0;
         }
     }
     GGML_UNUSED(ops);
     if (ctx && (get_misalign_bytes(ctx, m.score) || get_misalign_bytes(ctx, cells) || get_misalign_bytes(ctx, tail) || get_misalign_bytes(ctx, concat) ||
                 (m.limits && get_misalign_bytes(ctx, m.limits)))) {
-        return 0;
+        return reject("misaligned operand");
     }
     m.cells = cells; m.tail = tail; m.out = cgraph->nodes[last];
     m.last = last; m.r = (uint32_t) r; m.budget = (uint32_t) budget;

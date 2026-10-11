@@ -5340,9 +5340,12 @@ struct test_qsa_block_select : public test_case {
         if (count == nullptr) {
             return true;   // not the Vulkan backend
         }
-        const uint64_t n = count("QSA_BLOCK_SELECT");
-        if (n != 1) {
-            msg = "QSA_BLOCK_SELECT dispatches: " + std::to_string(n) + " (expected 1: the chain ran unfused)";
+        static const bool knob_on = [] { const char * e = getenv("GGML_VK_QSA_BLOCK_SELECT"); return e == nullptr || atoi(e) != 0; }();
+        const uint64_t n    = count("QSA_BLOCK_SELECT");
+        const uint64_t want = knob_on ? 1 : 0;
+        if (n != want) {
+            msg = "QSA_BLOCK_SELECT dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) +
+                  (knob_on ? ": the chain ran unfused; GGML_VK_FUSION_DEBUG=1 prints why)" : ": the knob is off)");
             return false;
         }
         return true;
@@ -5406,6 +5409,9 @@ struct test_qsa_block_select : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         std::mt19937 rng(1234);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->view_src != nullptr) {
+                continue;   // only the inputs: a view of "limits" or "score" written with random values clobbers them
+            }
             const std::string name = ggml_get_name(t);
             if (name == "score") {
                 std::vector<float> v((size_t) ggml_nelements(t));
