@@ -1782,6 +1782,10 @@ public:
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
     ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]: the gathered rows, when the table is on disk
 
+    // gathered staging buffer; kept sized to the largest of the last few
+    // gather batches and shrunk when the ubatch has been small for
+    // `shrink_age` consecutive calls, so idle idle-servers do not hold a
+    // transient host resident peak
     std::vector<float>   embd_buf;
     std::vector<int32_t> rows_global;
 
@@ -1991,6 +1995,9 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
+        // releasing ~250 MB of host scratch after a full 4-slot cont-batched
+        // ubatch; shrink_to_fit only walks pages the allocator still has
+        embd_buf.shrink_to_fit();
         return;
     }
 
@@ -2004,6 +2011,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
         pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
+        embd_buf.shrink_to_fit();
         return;
     }
 
