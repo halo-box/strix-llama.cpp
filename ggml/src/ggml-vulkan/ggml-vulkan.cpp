@@ -7257,7 +7257,7 @@ static bool ggml_vk_mm_prefetch_type(ggml_type t) {
 // 5120x2048x17408 15.34 -> 9.85, q4_K 14.86 -> 9.52, q6_K 16.51 -> 11.25, iq4_xs 13.67 -> 9.19, q8_0 10240x2048x2560
 // 3.72 -> 2.74 and 2560x2048x6144 2.40 -> 1.86 (without XL, q8_0 and q6_K were a loss or flat, so the XL tier is what
 // qualifies them). q3_K / q5_0 / iq4_nl stay on int8 until measured. GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8, "all" routes every type that has a prefetch
-// pipeline, else a comma list of type names (q8_0,q5_k,...). MUL_MAT_ID has its own, default-off list
+// pipeline, else a comma list of type names (q8_0,q5_k,...); default empty = int8 for every type. MUL_MAT_ID has its own, default-off list
 // (GGML_VK_MMID_F16COOPMAT) because the expert GEMMs were not measured on this path.
 static const std::vector<std::string> & ggml_vk_route_list(const char * env_name, const char * dflt) {
     static std::map<std::string, std::vector<std::string>> cache;
@@ -7294,7 +7294,10 @@ static bool ggml_vk_route_match(const std::vector<std::string> & list, ggml_type
 static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k) {
     static const uint32_t min_k = [] { const char * e = getenv("GGML_VK_DENSE_F16COOPMAT_MINK"); return e ? (uint32_t) atoi(e) : 1024u; }();
     if (k < min_k) return false;
-    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,q6_K,q8_0,iq4_xs"), t);
+    // default OFF (10-11, wave-2 gate): with the f32 B the models feed, the routed types read flat on Flash-Next and -3.5% / -3.0%
+    // (d0 / 8k) on Qwen3.6-35B-A3B in-model, against op-level f16-B wins of 12-32%; the int8 MMQ path stays the default for every
+    // dense type. Opt in with the type list that was the default before (q4_K,q5_K,q6_K,q8_0,iq4_xs) or "all".
+    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", ""), t);
 }
 
 static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
