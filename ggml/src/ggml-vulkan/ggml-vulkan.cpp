@@ -8896,6 +8896,19 @@ static bool ggml_vk_mmid_f16b_enabled() {
 // glu_up (with out16): the MUL_MAT_ID+CPY(f16)+SWIGLU fusion. The store writes silu(gate) * up into out16, the
 // SWIGLU's destination; glu_up is the other projection (f16, laid out like dst), glu_acc_gate tells whether this
 // GEMM is the gate (true) or the up projection (false).
+// true when the id tile selector, fed the rows per expert, picks the MEDIUM tier of this map: identified by the tier's
+// 64x64 workgroup tile (s is 32x32, l 128x128 on the coopmat devices that build the REG_A tile), not by its index, because
+// filter_tc drops the tiers a type cannot fit in shared memory (iq3_xxs / iq4_nl lose the large tile with their LUT)
+static bool ggml_vk_mmid_medium_tile(ggml_backend_vk_context * ctx, const std::vector<vk_matmul_pipeline_pair>& configs, uint32_t m, uint32_t n_per_expert) {
+    if (configs.size() < 2) {
+        return false;
+    }
+    uint32_t idx = ctx->device->matmul_id_tile_selector(m, n_per_expert, 0, ctx->device->shader_core_count, configs);
+    if (idx >= configs.size()) idx = (uint32_t) configs.size() - 1;
+    const vk_pipeline & sel = configs[idx].unaligned;
+    return sel != nullptr && sel->wg_denoms[0] == 64 && sel->wg_denoms[1] == 64;
+}
+
 static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr, const ggml_tensor * out16 = nullptr, const ggml_tensor * glu_up = nullptr, bool glu_acc_gate = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -9092,9 +9105,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             rega_reject("not aligned (k vs the tile's align, or m / n <= 8)");
         } else if (!ggml_vk_mm_prefetch_enabled(ctx->device)) {
             rega_reject("prefetch pipelines off");
-        } else if (mmp_map->size() < 3) {
-            rega_reject("pipeline map has fewer than 3 tiles");
-        } else if (ctx->device->matmul_id_tile_selector(ne01, rows_per_expert, 0, ctx->device->shader_core_count, *mmp_map) != 1) {
+        } else if (!ggml_vk_mmid_medium_tile(ctx, *mmp_map, ne01, rows_per_expert)) {
+            // the pf id map of iq3_xxs / iq4_nl carries two tiers (the large tile fails the shared-memory check with the LUT),
+            // so the medium tile is found by its shape, not by index 1 of a three-entry map (tbo-f11: "fewer than 3 tiles")
             rega_reject("tile selector did not pick the medium tile for the rows per expert");
         } else {
             // the tile question for an expert GEMM is the rows PER EXPERT (nei1 * nei0 / n_as: 2048 tokens x top-10 / 320 experts
