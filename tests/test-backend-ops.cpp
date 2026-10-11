@@ -5684,22 +5684,28 @@ struct test_qsa_block_select : public test_case {
                     for (int64_t b = 0; b < n_blocks; ++b) {
                         p[b] = 0.001f * (float) perm[b] - 0.25f;             // distinct, some below -1 is impossible here: keep them above
                     }
-                    for (int64_t k = 0; n_seq == 0 && k < n_inf; ++k) {       // invisible blocks, spread over the row
-                        p[(k * 7 + row) % n_blocks] = -INFINITY;
+                    // invisible blocks: spread over the row while the budget fits in the visible ones; when it does not, the
+                    // chain must select some of them and the CPU top_k picks among equal -inf keys in an unspecified order
+                    // while the kernel takes the lowest indices, so they go to the row's tail, where any pick sorts behind
+                    // every visible block and the -1 cells land in the same slots either way
+                    const bool tail_inf = budget > n_blocks - n_inf;
+                    for (int64_t k = 0; n_seq == 0 && k < n_inf; ++k) {
+                        p[tail_inf ? n_blocks - 1 - k : (k * 7 + row) % n_blocks] = -INFINITY;
                     }
                     p[(row * 13) % n_blocks] += 1e9f;                          // the tail block's bias
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
             } else if (name == "limits") {
-                // starts: block b of row s starts at 4*b + s, n_inf blocks per row unfinished (INT32_MAX); tails: every
-                // other query sees the whole prefix, the others only its first half (positions stay below 2^24)
+                // starts: block b of row s starts at 4*b + s, the last n_inf blocks of each row unfinished (INT32_MAX: at the
+                // tail for the reason above, since a query whose tail cuts the row sees fewer blocks than the budget);
+                // tails: every other query sees the whole prefix, the others only its first half (positions stay below 2^24)
                 std::vector<int32_t> v((size_t) ggml_nelements(t));
                 for (int64_t sidx = 0; sidx < n_seq; ++sidx) {
                     for (int64_t b = 0; b < n_blocks; ++b) {
                         v[sidx * n_blocks + b] = (int32_t) (4 * b + sidx);
                     }
                     for (int64_t k = 0; k < n_inf; ++k) {
-                        v[sidx * n_blocks + (k * 7 + sidx) % n_blocks] = INT32_MAX;
+                        v[sidx * n_blocks + n_blocks - 1 - k] = INT32_MAX;
                     }
                 }
                 for (int64_t q = 0; q < n_query; ++q) {
