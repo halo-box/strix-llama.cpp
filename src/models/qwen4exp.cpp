@@ -2121,6 +2121,34 @@ static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * id
         return e ? std::max(1, atoi(e)) : std::min(32, hw);
     }();
     const int n_thr = (int) std::max<size_t>(1, std::min<size_t>((size_t) n_thr_cfg, n_rows / 1024));
+
+    // A1b (2026-10-11): the first ubatch of a batch pays the whole gather (~120 ms for 32768 rows = 3 MB on Flash-Next, a latency
+    // cost, not bandwidth). On a warm page cache the per-row madvise(MADV_WILLNEED) pass is pure syscall overhead, so sample the
+    // residency of a few rows with mincore() and skip the advice when the table is warm; a cold table keeps it (that is where
+    // the parallel readahead pays, 550+ ms otherwise). LLAMA_PLE_ADVISE=1 always advises (the previous behaviour), 0 never, 2 adaptive.
+    static const int advise_mode = [] { const char * e = getenv("LLAMA_PLE_ADVISE"); return e ? atoi(e) : 2; }();
+    static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
+    const int64_t t0 = ggml_time_us();
+    bool do_advise = advise_mode != 0;
+    int resident = -1;
+#if defined(__linux__) || defined(__APPLE__)
+    if (advise_mode == 2 && n_rows >= 256) {
+        const long page = sysconf(_SC_PAGESIZE);
+        if (page > 0) {
+            const int n_s = 64;
+            resident = 0;
+            for (int k = 0; k < n_s; ++k) {
+                const size_t r = idx[(size_t) k * n_rows / n_s];
+                const uintptr_t a0 = ((uintptr_t) tab->data + r * row_size) & ~((uintptr_t) page - 1);
+                unsigned char vec = 0;
+                if (mincore((void *) a0, (size_t) page, &vec) == 0 && (vec & 1)) {
+                    resident++;
+                }
+            }
+            do_advise = resident < n_s - n_s / 16;   // under ~94% resident: treat the table as cold, keep the readahead
+        }
+    }
+#endif
     auto advise = [&](size_t k0, size_t k1) {
 #if defined(__linux__) || defined(__APPLE__)
         const long page = sysconf(_SC_PAGESIZE);
@@ -2154,23 +2182,35 @@ static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * id
             }
         }
     };
+    int64_t t_adv = t0;
     if (n_thr <= 1) {
-        advise(0, n_rows);
+        if (do_advise) {
+            advise(0, n_rows);
+        }
+        t_adv = ggml_time_us();
         dequant(0, n_rows);
-        return;
+    } else {
+        const size_t chunk = (n_rows + n_thr - 1) / n_thr;
+        for (int phase = do_advise ? 0 : 1; phase < 2; ++phase) {
+            std::vector<std::thread> workers;
+            workers.reserve(n_thr - 1);
+            for (int t = 1; t < n_thr; ++t) {
+                const size_t k0 = std::min(n_rows, (size_t) t * chunk), k1 = std::min(n_rows, k0 + chunk);
+                workers.emplace_back([&, k0, k1, phase] { if (phase == 0) { advise(k0, k1); } else { dequant(k0, k1); } });
+            }
+            if (phase == 0) { advise(0, std::min(n_rows, chunk)); } else { dequant(0, std::min(n_rows, chunk)); }
+            for (auto & w : workers) {
+                w.join();
+            }
+            if (phase == 0) {
+                t_adv = ggml_time_us();
+            }
+        }
     }
-    const size_t chunk = (n_rows + n_thr - 1) / n_thr;
-    for (int phase = 0; phase < 2; ++phase) {
-        std::vector<std::thread> workers;
-        workers.reserve(n_thr - 1);
-        for (int t = 1; t < n_thr; ++t) {
-            const size_t k0 = std::min(n_rows, (size_t) t * chunk), k1 = std::min(n_rows, k0 + chunk);
-            workers.emplace_back([&, k0, k1, phase] { if (phase == 0) { advise(k0, k1); } else { dequant(k0, k1); } });
-        }
-        if (phase == 0) { advise(0, std::min(n_rows, chunk)); } else { dequant(0, std::min(n_rows, chunk)); }
-        for (auto & w : workers) {
-            w.join();
-        }
+    if (stats) {
+        const int64_t t1 = ggml_time_us();
+        fprintf(stderr, "ple_gather(mmap): %zu rows, resident sample %d/64, advise %s %.1f ms, dequant %.1f ms, %d threads\n",
+                n_rows, resident, do_advise ? "on" : "off", (t_adv - t0) / 1000.0, (t1 - t_adv) / 1000.0, n_thr);
     }
 }
 
