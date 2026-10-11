@@ -9043,7 +9043,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // pf path, where the tile selector would take the medium tile (about 64 rows per expert at a 2048-token ubatch)
     if (aligned && !quantize_y && !qx_needs_dequant && !d16 && !glu && (src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_NL) &&
         ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mmid_rega_enabled(ctx->device) && mmp_map->size() >= 3 &&
-        ctx->device->matmul_id_tile_selector(ne01, nei1, 0, ctx->device->shader_core_count, *mmp_map) == 1) {
+        // the tile question for an expert GEMM is the rows PER EXPERT (nei1 * nei0 / n_as: 2048 tokens x top-10 / 320 experts = 64 on
+        // Flash-Next REAP-320), as the fork's port sizes it; fed the token count (2048) the selector always answers "large" and the
+        // REG_A medium tile never engaged (fillers 10-11: 6355 + 2966 + 12 cases, engaged = 0)
+        ctx->device->matmul_id_tile_selector(ne01, (uint32_t) std::max<uint64_t>(1, (nei1 * nei0 + ne02 - 1) / ne02), 0, ctx->device->shader_core_count, *mmp_map) == 1) {
         const ggml_type tb = y_kernel_type;   // the B type this GEMM runs with (master's ggml_vk_mul_mat_b_type)
         const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, tb, (ggml_prec)dst->op_params[0]);
         vk_matmul_pipeline_key kr{src0->type, tb, true, f16acc, false, false, true, true};
