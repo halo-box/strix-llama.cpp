@@ -1855,7 +1855,7 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 // register-prefetch coopmat matmul knobs (defined with the other matmul env switches further down)
 static bool ggml_vk_mm_prefetch_enabled(const vk_device& device);
 static bool ggml_vk_mm_prefetch_type(ggml_type t);
-static bool ggml_vk_dense_f16coopmat(ggml_type t);
+static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k);
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device);
 static uint32_t ggml_vk_dense_ypad();
@@ -7287,7 +7287,13 @@ static bool ggml_vk_route_match(const std::vector<std::string> & list, ggml_type
     return false;
 }
 
-static bool ggml_vk_dense_f16coopmat(ggml_type t) {
+// GGML_VK_DENSE_F16COOPMAT_MINK (default 1024): GEMMs with a shorter K stay on the int8 path. Measured in-model on Flash-Next
+// (10-11, serialising perf logger, pp2048): the hc up GEMM q8_0 10240x2048x320 took 1.29 ms/call routed vs 0.88 on int8 MMQ
+// (95 calls per 4 ubatches, 39 ms), the one K-step the XL / prefetch tile gets at K=320 cannot amortise its B conversion and
+// prologue; the K=2560 and K=6144 shapes read flat between the paths in-model.
+static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k) {
+    static const uint32_t min_k = [] { const char * e = getenv("GGML_VK_DENSE_F16COOPMAT_MINK"); return e ? (uint32_t) atoi(e) : 1024u; }();
+    if (k < min_k) return false;
     return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,q6_K,q8_0,iq4_xs"), t);
 }
 
@@ -7359,7 +7365,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                                 (src1->type == GGML_TYPE_F32 || f16_y) && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
     // GGML_VK_DENSE_F16COOPMAT: listed types leave the int8 path for the f16-B KHR coopmat matmul (not for the f16-out fusion,
     // which exists on the int8 path only)
-    if (can_quantize_y && !d16 && ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_dense_f16coopmat(src0->type)) {
+    if (can_quantize_y && !d16 && ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10)) {
         can_quantize_y = false;
     }
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
