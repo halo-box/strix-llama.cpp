@@ -571,6 +571,12 @@ struct vk_op_qsa_block_select_push_constants {
     uint32_t c_stride_s;  // block cells: elements per stream
     uint32_t t_stride_q;  // tail: elements per query
     uint32_t t_stride_s;  // tail: elements per stream
+    // compact visibility read in the kernel (halo-box #117 limits): block b is visible to query q iff
+    // limits[row(q)*l_blocks + b] < limits[l_tails_off + q], row(q) = limits[l_rowidx_off + q] (0 when l_rowidx_off is ~0u)
+    uint32_t l_mode;        // 0: the scores carry the visibility; 1: apply it from the limits buffer
+    uint32_t l_blocks;      // start-row stride (0 with one sequence row)
+    uint32_t l_tails_off;   // element offset of the per-query tail starts
+    uint32_t l_rowidx_off;  // element offset of the per-query sequence rows, ~0u: one row
 };
 
 struct vk_op_topk_radix_push_constants {

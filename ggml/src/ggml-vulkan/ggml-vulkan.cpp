@@ -4177,10 +4177,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // A2: fused maskless block selection (GGML_VK_QSA_BLOCK_SELECT); 512-thread workgroups at most (GPU rule: no 1024-thread WGs)
         {
             const uint32_t BS = 1u << std::min(9u, device->max_workgroup_size_log2);
-            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_select_reg[0], "qsa_block_select_reg8",  qsa_block_select_reg8_len,  qsa_block_select_reg8_data,  "main", 4, sizeof(vk_op_qsa_block_select_push_constants), {BS, 1, 1}, {BS}, 1, true);
-            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_select_reg[1], "qsa_block_select_reg16", qsa_block_select_reg16_len, qsa_block_select_reg16_data, "main", 4, sizeof(vk_op_qsa_block_select_push_constants), {BS, 1, 1}, {BS}, 1, true);
-            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_select_reg[2], "qsa_block_select_reg32", qsa_block_select_reg32_len, qsa_block_select_reg32_data, "main", 4, sizeof(vk_op_qsa_block_select_push_constants), {BS, 1, 1}, {BS}, 1, true);
-            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_select_reg[3], "qsa_block_select_reg64", qsa_block_select_reg64_len, qsa_block_select_reg64_data, "main", 4, sizeof(vk_op_qsa_block_select_push_constants), {BS, 1, 1}, {BS}, 1, true);
+            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_select_reg[0], "qsa_block_select_reg8",  qsa_block_select_reg8_len,  qsa_block_select_reg8_data,  "main", 5, sizeof(vk_op_qsa_block_select_push_constants), {BS, 1, 1}, {BS}, 1, true);
+            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_select_reg[1], "qsa_block_select_reg16", qsa_block_select_reg16_len, qsa_block_select_reg16_data, "main", 5, sizeof(vk_op_qsa_block_select_push_constants), {BS, 1, 1}, {BS}, 1, true);
+            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_select_reg[2], "qsa_block_select_reg32", qsa_block_select_reg32_len, qsa_block_select_reg32_data, "main", 5, sizeof(vk_op_qsa_block_select_push_constants), {BS, 1, 1}, {BS}, 1, true);
+            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_select_reg[3], "qsa_block_select_reg64", qsa_block_select_reg64_len, qsa_block_select_reg64_data, "main", 5, sizeof(vk_op_qsa_block_select_push_constants), {BS, 1, 1}, {BS}, 1, true);
         }
     }
 
@@ -8593,6 +8593,8 @@ static const std::vector<vk_matmul_pipeline_pair> * ggml_vk_qsa_score_pipelines(
 // matmul_f32_f32_qsa runs the same GEMM and applies the relu, the head sum and the bias in its epilogue, so neither the
 // [M, 4*nt] scores nor the relu copy of them is written. Returns the index of the last fused node (0: no match); *bias gets
 // the bias tensor or nullptr.
+static bool ggml_vk_qsa_block_select_fits(const ggml_backend_vk_context * ctx, int64_t n_blocks);
+
 static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** bias_out) {
     *bias_out = nullptr;
     if (ggml_vk_qsa_score_mode() != 1 || !ctx->device->coopmat_support || ctx->device->coopmat2 || ggml_vk_qsa_score_pipelines(ctx) == nullptr) {
@@ -8653,10 +8655,12 @@ static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const st
             take = n->op == GGML_OP_ADD && is_sum(n) && n->src[0] == cur && is_head_view(n->src[1], heads);
             if (take) { cur = n; heads++; last = j; }
         } else {
-            // the block bias: one value per (block, query), added once after the head sum
+            // the block bias: one value per (block, query), added once after the head sum. The compact visibility's
+            // log(step(.)) ADD is left alone when the block select will read the limits itself (QSA_BLOCK_SELECT)
             const ggml_tensor * b = n->src[1];
             take = n->op == GGML_OP_ADD && is_sum(n) && n->src[0] == cur && b && is_sum(b) && b != relu &&
-                   b->view_src == nullptr && !get_misalign_bytes(ctx, b);
+                   b->view_src == nullptr && !get_misalign_bytes(ctx, b) &&
+                   !(b->op == GGML_OP_LOG && ggml_vk_qsa_block_select_fits(ctx, M));
             if (take) { *bias_out = b; cur = n; last = j; }
         }
         if (!take) {
@@ -14533,13 +14537,18 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
 // up to the CONCAT must draw only on the chain, the score, the block-cells tensor or the tail, and only the CONCAT
 // may be read outside (ggml_can_fuse_subgraph_ext). GGML_VK_QSA_BLOCK_SELECT=0 keeps the chain.
 struct vk_qsa_block_select_match {
-    const ggml_tensor * score = nullptr;   // F32 [n_blocks, n_query, n_stream], contiguous (the QSA_SCORE output, bias applied)
+    const ggml_tensor * score = nullptr;   // F32 [n_blocks, n_query, n_stream], contiguous: the QSA_SCORE output (bias applied),
+                                           // or the raw head sum when the visibility comes from `limits`
     const ggml_tensor * cells = nullptr;   // I32 [r*n_blocks, n_stream]
     const ggml_tensor * tail  = nullptr;   // I32 [r-1, n_query, 1, n_stream]
+    const ggml_tensor * limits = nullptr;  // I32 compact visibility limits (halo-box #117), or null
     ggml_tensor *       out   = nullptr;   // I32 [r*budget + r-1, n_query, 1, n_stream]
     int      last   = 0;
     uint32_t r      = 0;
     uint32_t budget = 0;
+    uint32_t l_blocks     = 0;             // limits: start-row stride (0: one row)
+    uint32_t l_tails_off  = 0;             // limits: element offset of the per-query tail starts
+    uint32_t l_rowidx_off = 0xFFFFFFFFu;   // limits: element offset of the per-query rows, ~0u: one row
 };
 
 static bool ggml_vk_qsa_block_select_enabled() {
@@ -14547,7 +14556,35 @@ static bool ggml_vk_qsa_block_select_enabled() {
     return on;
 }
 
+// true when the block select can take a score row of n_blocks on this device (the chain stays past the register limit)
+static bool ggml_vk_qsa_block_select_fits(const ggml_backend_vk_context * ctx, int64_t n_blocks) {
+    static const bool limits_on = [] { const char * e = getenv("GGML_VK_QSA_BLOCK_SELECT_LIMITS"); return e == nullptr || atoi(e) != 0; }();
+    if (!ggml_vk_qsa_block_select_enabled() || !limits_on) {
+        return false;
+    }
+    if (ctx == nullptr) {
+        return true;
+    }
+    return !ctx->device->disable_fusion && ctx->device->pipeline_qsa_block_select_reg[0] != nullptr &&
+           n_blocks <= (int64_t) 64 * ctx->device->pipeline_qsa_block_select_reg[0]->wg_denoms[0];
+}
+
+// a VIEW of the I32 limits tensor (any view node whose base is the limits), ne[0] elements at element offset `off`
+static bool ggml_vk_qsa_limits_view(const ggml_tensor * v, const ggml_tensor * limits, int64_t ne0, uint32_t * off) {
+    if (v == nullptr || v->op != GGML_OP_VIEW || v->view_src != limits || v->type != GGML_TYPE_I32 || v->ne[0] != ne0 ||
+        v->nb[0] != sizeof(int32_t) || v->view_offs % sizeof(int32_t) != 0) {
+        return false;
+    }
+    *off = (uint32_t) (v->view_offs / sizeof(int32_t));
+    return true;
+}
+
 // returns the index of the CONCAT (0: no match). ctx may be null (graph_optimize): the device limits are then not checked.
+// Entered at the chain's TOP_K (the scores carry the visibility), or at the first cast of the compact visibility ops
+// qwen4exp_apply_compact_visibility emits ahead of it (halo-box #117 limits: cast(starts), cast(tails), reshape,
+// repeat, sub, step, log, add; several sequence rows add a get_rows): then those run inside the fusion too and the
+// kernel reads the limits itself. The fused range is [node_idx, CONCAT]; every visibility op must lie in it (the
+// limits views are empty nodes and may sit ahead of node_idx).
 static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx, vk_qsa_block_select_match & m) {
     m = {};
     if (!ggml_vk_qsa_block_select_enabled()) {
@@ -14556,35 +14593,142 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
     if (ctx && (ctx->device->disable_fusion || ctx->device->pipeline_qsa_block_select_reg[0] == nullptr)) {
         return 0;
     }
-    const ggml_tensor * topk = cgraph->nodes[node_idx];
-    if (topk->op != GGML_OP_TOP_K || topk->type != GGML_TYPE_I32) {
-        return 0;
-    }
-    const ggml_tensor * score = topk->src[0];
-    if (score->type != GGML_TYPE_F32 || !ggml_is_contiguous(score) || score->ne[3] != 1) {
-        return 0;
-    }
-    const int64_t n_blocks = score->ne[0], n_query = score->ne[1], n_stream = score->ne[2];
-    const int64_t budget   = topk->ne[0];
-    if (budget < 1 || budget > n_blocks || n_query < 1) {
-        return 0;
-    }
-    if (ctx && n_blocks > (int64_t) 64 * ctx->device->pipeline_qsa_block_select_reg[0]->wg_denoms[0]) {
-        return 0;   // a row no longer fits the registers: the chain stays
-    }
     constexpr int MAX_N = 48;
     int     idxs[MAX_N];
     ggml_op ops[MAX_N];
     const ggml_tensor * in[MAX_N];
     int count = 0;
-    idxs[count] = node_idx; ops[count] = topk->op; in[count++] = topk;
     auto in_chain = [&](const ggml_tensor * t) {
         for (int k = 0; k < count; ++k) { if (in[k] == t) { return true; } }
         return false;
     };
+
+    int topk_idx = node_idx;
+    const ggml_tensor * entry = cgraph->nodes[node_idx];
+    if (entry->op == GGML_OP_CPY) {
+        // GGML_VK_QSA_BLOCK_SELECT_LIMITS=0: the visibility ops stay (the select then enters at the TOP_K, v1)
+        static const bool limits_on = [] { const char * e = getenv("GGML_VK_QSA_BLOCK_SELECT_LIMITS"); return e == nullptr || atoi(e) != 0; }();
+        // the first visibility cast: F32 of a VIEW of an I32 tensor
+        if (!limits_on || entry->type != GGML_TYPE_F32 || entry->src[0] == nullptr || entry->src[0]->op != GGML_OP_VIEW ||
+            entry->src[0]->type != GGML_TYPE_I32 || entry->src[0]->view_src == nullptr) {
+            return 0;
+        }
+        const ggml_tensor * limits = entry->src[0]->view_src;
+        topk_idx = 0;
+        for (int j = node_idx + 1; j < std::min(node_idx + 14, cgraph->n_nodes); ++j) {
+            if (cgraph->nodes[j]->op == GGML_OP_TOP_K) { topk_idx = j; break; }
+        }
+        if (topk_idx == 0 || limits->type != GGML_TYPE_I32 || !ggml_is_contiguous(limits) || limits->ne[1] != 1) {
+            return 0;
+        }
+        // score2 = add(score, log(step(sub(repeat(reshape(cast(tails)), score), starts))))
+        const ggml_tensor * add = cgraph->nodes[topk_idx]->src[0];
+        if (add == nullptr || add->op != GGML_OP_ADD || add->src[1] == nullptr || add->src[1]->op != GGML_OP_LOG) {
+            return 0;
+        }
+        const ggml_tensor * score = add->src[0];
+        const ggml_tensor * log   = add->src[1];
+        const ggml_tensor * step  = log->src[0];
+        if (step == nullptr || step->op != GGML_OP_UNARY || ggml_get_unary_op(step) != GGML_UNARY_OP_STEP) {
+            return 0;
+        }
+        const ggml_tensor * sub = step->src[0];
+        if (sub == nullptr || sub->op != GGML_OP_SUB || sub->src[0] == nullptr || sub->src[0]->op != GGML_OP_REPEAT ||
+            sub->src[0]->src[1] != score || sub->src[1] == nullptr) {
+            return 0;
+        }
+        const ggml_tensor * rep     = sub->src[0];
+        const ggml_tensor * tails_r = rep->src[0];
+        if (tails_r == nullptr || tails_r->op != GGML_OP_RESHAPE || tails_r->src[0] == nullptr || tails_r->src[0]->op != GGML_OP_CPY ||
+            tails_r->src[0]->type != GGML_TYPE_F32) {
+            return 0;
+        }
+        const ggml_tensor * tails_c = tails_r->src[0];
+        const ggml_tensor * starts  = sub->src[1];
+        if (score->type != GGML_TYPE_F32 || !ggml_is_contiguous(score) || score->ne[2] != 1 || score->ne[3] != 1 ||
+            add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) || !ggml_are_same_shape(add, score) ||
+            tails_r->ne[0] != 1 || tails_r->ne[1] != score->ne[1]) {
+            return 0;
+        }
+        const int64_t n_blocks = score->ne[0], n_query = score->ne[1];
+        uint32_t tails_off = 0, starts_off = 0, rowidx_off = 0xFFFFFFFFu;
+        if (!ggml_vk_qsa_limits_view(tails_c->src[0], limits, n_query, &tails_off)) {
+            return 0;
+        }
+        const ggml_tensor * vis[10];
+        int n_vis = 0;
+        uint32_t l_blocks = 0;
+        if (starts->op == GGML_OP_CPY) {
+            // one sequence row: cast(view_1d(limits, n_blocks, 0))
+            if (starts->type != GGML_TYPE_F32 || starts->ne[0] != n_blocks || starts->ne[1] != 1 ||
+                !ggml_vk_qsa_limits_view(starts->src[0], limits, n_blocks, &starts_off) || starts_off != 0) {
+                return 0;
+            }
+            vis[n_vis++] = starts;
+        } else if (starts->op == GGML_OP_GET_ROWS) {
+            // several rows: get_rows(cast(view_2d(limits, n_blocks, n_seq, blocks*4, 0)), view_1d(limits, n_query, rowidx))
+            const ggml_tensor * starts2d = starts->src[0];
+            if (starts2d == nullptr || starts2d->op != GGML_OP_CPY || starts2d->type != GGML_TYPE_F32 ||
+                starts2d->ne[0] != n_blocks || starts2d->ne[1] < 2 || starts->ne[0] != n_blocks || starts->ne[1] != n_query ||
+                !ggml_vk_qsa_limits_view(starts2d->src[0], limits, n_blocks, &starts_off) || starts_off != 0 ||
+                starts2d->src[0]->nb[1] % sizeof(int32_t) != 0 || starts2d->src[0]->nb[1] / sizeof(int32_t) < (size_t) n_blocks ||
+                !ggml_vk_qsa_limits_view(starts->src[1], limits, n_query, &rowidx_off)) {
+                return 0;
+            }
+            l_blocks = (uint32_t) (starts2d->src[0]->nb[1] / sizeof(int32_t));
+            vis[n_vis++] = starts2d;
+            vis[n_vis++] = starts;
+        } else {
+            return 0;
+        }
+        vis[n_vis++] = tails_c; vis[n_vis++] = tails_r; vis[n_vis++] = rep; vis[n_vis++] = sub;
+        vis[n_vis++] = step; vis[n_vis++] = log; vis[n_vis++] = add;
+        // every node of [node_idx, topk) is a visibility op or a view of the limits, and every visibility op is in the range
+        int n_found = 0;
+        for (int j = node_idx; j < topk_idx; ++j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            bool known = t->op == GGML_OP_VIEW && t->view_src == limits;
+            for (int k = 0; k < n_vis && !known; ++k) {
+                known = vis[k] == t;
+                n_found += known;
+            }
+            if (!known) {
+                return 0;
+            }
+            if (t->op != GGML_OP_VIEW) {
+                idxs[count] = j; ops[count] = t->op; in[count++] = t;
+            }
+        }
+        if (n_found != n_vis) {
+            return 0;
+        }
+        m.limits = limits; m.l_blocks = l_blocks; m.l_tails_off = tails_off; m.l_rowidx_off = rowidx_off;
+        m.score = score;
+    }
+
+    const ggml_tensor * topk = cgraph->nodes[topk_idx];
+    if (topk->op != GGML_OP_TOP_K || topk->type != GGML_TYPE_I32) {
+        return 0;
+    }
+    const ggml_tensor * score = topk->src[0];   // the (visibility-applied) score the chain reads
+    if (score->type != GGML_TYPE_F32 || !ggml_is_contiguous(score) || score->ne[3] != 1) {
+        return 0;
+    }
+    const int64_t n_blocks = score->ne[0], n_query = score->ne[1], n_stream = score->ne[2];
+    const int64_t budget   = topk->ne[0];
+    if (budget < 1 || budget > n_blocks || n_query < 1 || (m.limits && n_stream != 1)) {
+        return 0;
+    }
+    if (ctx && n_blocks > (int64_t) 64 * ctx->device->pipeline_qsa_block_select_reg[0]->wg_denoms[0]) {
+        return 0;   // a row no longer fits the registers: the chain stays
+    }
+    if (m.score == nullptr) {
+        m.score = score;
+    }
+    idxs[count] = topk_idx; ops[count] = topk->op; in[count++] = topk;
     const ggml_tensor * cells_view = nullptr;
     const ggml_tensor * concat     = nullptr;
-    for (int j = node_idx + 1; j < std::min(node_idx + MAX_N, cgraph->n_nodes) && count < MAX_N && !concat; ++j) {
+    for (int j = topk_idx + 1; j < std::min(topk_idx + MAX_N, cgraph->n_nodes) && count < MAX_N && !concat; ++j) {
         const ggml_tensor * t = cgraph->nodes[j];
         bool ok;
         switch (t->op) {
@@ -14643,20 +14787,15 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
         concat->ne[0] != r * budget + r - 1 || concat->ne[1] != n_query || concat->ne[2] != 1 || concat->ne[3] != n_stream) {
         return 0;
     }
-    int last = idxs[count - 1];
-    // ggml_can_fuse_subgraph_ext rejects a view whose source is outside the subgraph unless it is a weight, and the
-    // chain views the score and the block cells (score_view, cells_view). Those two are checked here instead: every
-    // reader is a chain node. The other nodes go through the helper (single use inside the chain, only the CONCAT
-    // read outside, interior views of chain nodes).
-    int     fidxs[MAX_N];
-    ggml_op fops[MAX_N];
-    int     fcount = 0;
-    for (int k = 0; k < count; ++k) {
+    const int last = idxs[count - 1];
+    // Only the CONCAT may be read outside the fusion: every other node's readers are all chain nodes (the graph's
+    // use count, which includes a cast's self-reference in src[1], equals the uses found among the chain's sources)
+    // and none is a graph output. Not ggml_can_fuse_subgraph_ext: it rejects a view of a tensor outside the subgraph
+    // unless that is a weight (the chain views the score and the block cells) and does not count the cast self-use.
+    for (int k = 0; k + 1 < count; ++k) {
         const ggml_tensor * t = in[k];
-        const bool ext_view = t->view_src != nullptr && !in_chain(t->view_src);
-        if (!ext_view) {
-            fidxs[fcount] = idxs[k]; fops[fcount++] = ops[k];
-            continue;
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return 0;
         }
         int uses = 0;
         for (int x = 0; x < count; ++x) {
@@ -14664,17 +14803,16 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
                 uses += in[x]->src[si] == t;
             }
         }
-        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || uses != ggml_node_get_use_count(cgraph, idxs[k])) {
+        if (uses != ggml_node_get_use_count(cgraph, idxs[k])) {
             return 0;
         }
     }
-    if (!ggml_can_fuse_subgraph_ext(cgraph, fidxs, fcount, fops, &last, 1)) {
+    GGML_UNUSED(ops);
+    if (ctx && (get_misalign_bytes(ctx, m.score) || get_misalign_bytes(ctx, cells) || get_misalign_bytes(ctx, tail) || get_misalign_bytes(ctx, concat) ||
+                (m.limits && get_misalign_bytes(ctx, m.limits)))) {
         return 0;
     }
-    if (ctx && (get_misalign_bytes(ctx, score) || get_misalign_bytes(ctx, cells) || get_misalign_bytes(ctx, tail) || get_misalign_bytes(ctx, concat))) {
-        return 0;
-    }
-    m.score = score; m.cells = cells; m.tail = tail; m.out = cgraph->nodes[last];
+    m.cells = cells; m.tail = tail; m.out = cgraph->nodes[last];
     m.last = last; m.r = (uint32_t) r; m.budget = (uint32_t) budget;
     return last;
 }
@@ -14703,6 +14841,7 @@ static void ggml_vk_qsa_block_select(ggml_backend_vk_context * ctx, vk_context& 
         (uint32_t) (m.cells->nb[1] / sizeof(int32_t)),
         (uint32_t) (m.tail->nb[1] / sizeof(int32_t)),
         (uint32_t) (m.tail->nb[3] / sizeof(int32_t)),
+        m.limits ? 1u : 0u, m.l_blocks, m.l_tails_off, m.l_rowidx_off,
     };
     std::array<uint32_t, 3> elements {
         bs,
@@ -14712,7 +14851,8 @@ static void ggml_vk_qsa_block_select(ggml_backend_vk_context * ctx, vk_context& 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, m.score), ggml_vk_tensor_subbuffer(ctx, m.out),
-          ggml_vk_tensor_subbuffer(ctx, m.cells), ggml_vk_tensor_subbuffer(ctx, m.tail) }, pc, elements);
+          ggml_vk_tensor_subbuffer(ctx, m.cells), ggml_vk_tensor_subbuffer(ctx, m.tail),
+          ggml_vk_tensor_subbuffer(ctx, m.limits ? m.limits : m.score) }, pc, elements);
 }
 
 void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -15770,7 +15910,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_CPY:
     case GGML_OP_CONT:
     case GGML_OP_DUP:
-        ggml_vk_cpy(ctx, compute_ctx, src0, node);
+        if (ctx->fused_qsa_block_select) {
+            ggml_vk_qsa_block_select(ctx, compute_ctx, cgraph, node_idx);   // entered at the first visibility cast
+        } else {
+            ggml_vk_cpy(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_SET_ROWS:
@@ -18571,7 +18715,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "QSA_SCORE";
                 // the epilogue reads the keys, the queries and the bias while it writes the sum: no aliasing at all
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
-            } else if (const int bs_last = cgraph->nodes[i]->op == GGML_OP_TOP_K ? ggml_vk_match_qsa_block_select(ctx, cgraph, i, qsa_bs_match) : 0) {
+            } else if (const int bs_last = (cgraph->nodes[i]->op == GGML_OP_TOP_K || cgraph->nodes[i]->op == GGML_OP_CPY) ?
+                                               ggml_vk_match_qsa_block_select(ctx, cgraph, i, qsa_bs_match) : 0) {
                 ctx->num_additional_fused_ops = bs_last - i;
                 ctx->fused_qsa_block_select = true;
                 fusion_string = "QSA_BLOCK_SELECT";
@@ -18924,7 +19069,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     std::vector<char> qsa_bs_in(graph->n_nodes, 0);
     if (ggml_vk_qsa_block_select_enabled()) {
         for (int i = 0; i < graph->n_nodes; ++i) {
-            if (graph->nodes[i]->op == GGML_OP_TOP_K) {
+            if (graph->nodes[i]->op == GGML_OP_TOP_K || graph->nodes[i]->op == GGML_OP_CPY) {
                 vk_qsa_block_select_match m;
                 const int last = ggml_vk_match_qsa_block_select(nullptr, graph, i, m);
                 if (last > i) {
@@ -19040,7 +19185,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         // QSA scorer chain (QSA_SCORE), prefill only: the fusion needs more than 64 query-head columns; decode keeps its order
         if (ggml_vk_fuse_qsa_score_enabled() && graph->nodes[first_unused]->op == GGML_OP_MUL_MAT && graph->nodes[first_unused]->ne[1] > 64 &&
-            keep_pattern(qsa_score_pattern)) {
+            (keep_pattern(qsa_score_pattern) || keep_pattern(qsa_score_pattern_nobias))) {
             continue;
         }
 
@@ -19259,6 +19404,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (ggml_vk_fuse_qsa_score_enabled()) {
                     for (int o = 0; o < (int) qsa_score_pattern.size(); ++o) {
                         if (n - o >= 0 && match_pattern(qsa_score_pattern, n - o) && graph->nodes[n - o]->type == GGML_TYPE_F32 &&
+                            graph->nodes[n - o]->ne[1] > 64 && graph->nodes[n - o + 2]->src[0] == graph->nodes[n - o + 1]) {
+                            return true;
+                        }
+                    }
+                    for (int o = 0; o < (int) qsa_score_pattern_nobias.size(); ++o) {
+                        if (n - o >= 0 && match_pattern(qsa_score_pattern_nobias, n - o) && graph->nodes[n - o]->type == GGML_TYPE_F32 &&
                             graph->nodes[n - o]->ne[1] > 64 && graph->nodes[n - o + 2]->src[0] == graph->nodes[n - o + 1]) {
                             return true;
                         }

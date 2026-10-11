@@ -539,6 +539,13 @@ static constexpr std::initializer_list<ggml_op> qsa_score_pattern { GGML_OP_MUL_
                                                                     GGML_OP_VIEW,    GGML_OP_ADD,
                                                                     GGML_OP_VIEW,    GGML_OP_ADD,
                                                                     GGML_OP_ADD };
+// the same chain without the bias ADD: the maskless path applies the visibility through the compact-limits ops
+// (cast, repeat, sub, step, log, add), which follow the head sum, so the 12-op pattern above never matches there
+static constexpr std::initializer_list<ggml_op> qsa_score_pattern_nobias { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+                                                                           GGML_OP_VIEW,    GGML_OP_CONT,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD };
 
 static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 1, 0, 0 }, // permute->src[0] == get_rows

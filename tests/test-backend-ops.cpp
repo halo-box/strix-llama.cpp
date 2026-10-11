@@ -5304,6 +5304,8 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
 struct test_qsa_block_select : public test_case {
     const int64_t n_blocks, n_query, n_stream, budget, r;
     const int64_t n_inf;
+    const int64_t n_seq;   // 0: the scores carry the visibility (-inf); >0: halo-box compact limits with n_seq rows, applied
+                           // through the cast / repeat / sub / step / log / add ops ahead of the chain (fused on Vulkan)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5311,7 +5313,7 @@ struct test_qsa_block_select : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(n_blocks, n_query, n_stream, budget, r, n_inf);
+        return VARS_TO_STR7(n_blocks, n_query, n_stream, budget, r, n_inf, n_seq);
     }
 
     bool run_whole_graph() override { return true; }
@@ -5346,9 +5348,10 @@ struct test_qsa_block_select : public test_case {
         return true;
     }
 
-    test_qsa_block_select(int64_t n_blocks = 512, int64_t n_query = 8, int64_t n_stream = 1, int64_t budget = 128, int64_t r = 4, int64_t n_inf = 0)
-        : n_blocks(n_blocks), n_query(n_query), n_stream(n_stream), budget(budget), r(r), n_inf(n_inf) {
-        GGML_ASSERT(budget <= n_blocks && n_inf <= n_blocks);
+    test_qsa_block_select(int64_t n_blocks = 512, int64_t n_query = 8, int64_t n_stream = 1, int64_t budget = 128, int64_t r = 4, int64_t n_inf = 0,
+                          int64_t n_seq = 0)
+        : n_blocks(n_blocks), n_query(n_query), n_stream(n_stream), budget(budget), r(r), n_inf(n_inf), n_seq(n_seq) {
+        GGML_ASSERT(budget <= n_blocks && n_inf <= n_blocks && (n_seq == 0 || n_stream == 1));
     }
 
     ggml_tensor * out = nullptr;
@@ -5360,6 +5363,24 @@ struct test_qsa_block_select : public test_case {
         ggml_set_name(block_cells, "block_cells");
         ggml_tensor * tail = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, r - 1, n_query, 1, n_stream);
         ggml_set_name(tail, "tail");
+
+        if (n_seq > 0) {
+            // == qwen4exp_apply_compact_visibility(ctx, score, limits, n_blocks, n_seq, n_tps = n_query, first = 0, n_query)
+            ggml_tensor * limits = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_blocks * n_seq + 2 * n_query);
+            ggml_set_name(limits, "limits");
+            ggml_tensor * starts = nullptr;
+            if (n_seq == 1) {
+                starts = ggml_cast(ctx, ggml_view_1d(ctx, limits, n_blocks, 0), GGML_TYPE_F32);
+            } else {
+                ggml_tensor * starts2d = ggml_cast(ctx, ggml_view_2d(ctx, limits, n_blocks, n_seq, n_blocks * sizeof(int32_t), 0), GGML_TYPE_F32);
+                ggml_tensor * row_idx  = ggml_view_1d(ctx, limits, n_query, (n_blocks * n_seq + n_query) * sizeof(int32_t));
+                starts = ggml_get_rows(ctx, starts2d, row_idx);
+            }
+            ggml_tensor * tails = ggml_cast(ctx, ggml_view_1d(ctx, limits, n_query, n_blocks * n_seq * sizeof(int32_t)), GGML_TYPE_F32);
+            tails = ggml_reshape_2d(ctx, tails, 1, n_query);
+            ggml_tensor * visible = ggml_step(ctx, ggml_sub(ctx, ggml_repeat(ctx, tails, score), starts));
+            score = ggml_add(ctx, score, ggml_log(ctx, visible));
+        }
 
         // == qwen4exp_select_complete_blocks(ctx, score, block_cells, tail, budget, r)
         ggml_tensor * blocks = ggml_cont(ctx, ggml_top_k(ctx, score, budget));
@@ -5396,12 +5417,29 @@ struct test_qsa_block_select : public test_case {
                     for (int64_t b = 0; b < n_blocks; ++b) {
                         p[b] = 0.001f * (float) perm[b] - 0.25f;             // distinct, some below -1 is impossible here: keep them above
                     }
-                    for (int64_t k = 0; k < n_inf; ++k) {                      // invisible blocks, spread over the row
+                    for (int64_t k = 0; n_seq == 0 && k < n_inf; ++k) {       // invisible blocks, spread over the row
                         p[(k * 7 + row) % n_blocks] = -INFINITY;
                     }
                     p[(row * 13) % n_blocks] += 1e9f;                          // the tail block's bias
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+            } else if (name == "limits") {
+                // starts: block b of row s starts at 4*b + s, n_inf blocks per row unfinished (INT32_MAX); tails: every
+                // other query sees the whole prefix, the others only its first half (positions stay below 2^24)
+                std::vector<int32_t> v((size_t) ggml_nelements(t));
+                for (int64_t sidx = 0; sidx < n_seq; ++sidx) {
+                    for (int64_t b = 0; b < n_blocks; ++b) {
+                        v[sidx * n_blocks + b] = (int32_t) (4 * b + sidx);
+                    }
+                    for (int64_t k = 0; k < n_inf; ++k) {
+                        v[sidx * n_blocks + (k * 7 + sidx) % n_blocks] = INT32_MAX;
+                    }
+                }
+                for (int64_t q = 0; q < n_query; ++q) {
+                    v[n_blocks * n_seq + q]           = (int32_t) (q % 2 == 0 ? 4 * n_blocks + 4 : 4 * (n_blocks / 2) + 1);
+                    v[n_blocks * n_seq + n_query + q] = (int32_t) (q % n_seq);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int32_t));
             } else if (name == "block_cells") {
                 std::vector<int32_t> v((size_t) ggml_nelements(t));
                 for (int64_t sidx = 0; sidx < n_stream; ++sidx) {
@@ -12615,6 +12653,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_block_select(600,  5,  1, 512, 4, 200));   // budget > visible blocks: -1 cells
     test_cases.emplace_back(new test_qsa_block_select(4096, 1,  1, 512, 4, 0));     // a decode row
     test_cases.emplace_back(new test_qsa_block_select(300,  3,  1, 300, 4, 10));    // budget == n_blocks
+    // compact limits (halo-box #117) read in the kernel: one sequence row, two rows, budget past the visible blocks
+    test_cases.emplace_back(new test_qsa_block_select(512,  8,  1, 128, 4, 0,   1));
+    test_cases.emplace_back(new test_qsa_block_select(2048, 64, 1, 512, 4, 300, 1));
+    test_cases.emplace_back(new test_qsa_block_select(1024, 16, 1, 256, 4, 50,  2));
+    test_cases.emplace_back(new test_qsa_block_select(600,  5,  1, 512, 4, 200, 2));
+    test_cases.emplace_back(new test_qsa_block_select(4096, 1,  1, 512, 4, 0,   1));  // a decode row
     // f16 x (the f16 hc norm)
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true, GGML_TYPE_F16));

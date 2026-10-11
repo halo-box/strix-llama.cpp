@@ -7,7 +7,10 @@
 // the lowest-index tie rule, and writes the selected blocks' cells in ascending block order straight into the
 // chain's output layout ([r*budget + r-1, n_query, 1, n_stream]: r cells per block, -1 for a block whose score is
 // at or below -1, i.e. the chain's step(score + 1) rule for an invisible block, then the r-1 tail cells).
-// The scores arrive with the visibility already applied (QSA_SCORE adds the block bias, -inf for an invisible block).
+// The scores arrive with the visibility already applied (QSA_SCORE adds the block bias, -inf for an invisible block),
+// or (l_mode = 1) raw, with the compact limits buffer of halo-box #117 bound: a block is visible to a query iff its
+// start is below the query's tail start, read here per element instead of through the cast / repeat / sub / step /
+// log / add chain (its f32 arithmetic is exact: positions stay below 2^24, so the integer compare is the same test).
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : enable
@@ -23,6 +26,7 @@ layout (binding = 0) readonly buffer S  {float data_s[];};   // block scores [n_
 layout (binding = 1) writeonly buffer D {int   data_d[];};   // [width, n_query, 1, n_stream]
 layout (binding = 2) readonly buffer C  {int   data_c[];};   // block cells [r*n_blocks, n_stream], stream stride c_stride_s
 layout (binding = 3) readonly buffer T  {int   data_t[];};   // tail cells [r-1, n_query, 1, n_stream], strides t_stride_q / t_stride_s
+layout (binding = 4) readonly buffer L  {int   data_l[];};   // compact limits (l_mode = 1): [rows x l_blocks starts] ++ tails ++ row ids
 
 layout (push_constant) uniform parameter {
     uint n_blocks;
@@ -34,6 +38,10 @@ layout (push_constant) uniform parameter {
     uint c_stride_s;
     uint t_stride_q;
     uint t_stride_s;
+    uint l_mode;
+    uint l_blocks;
+    uint l_tails_off;
+    uint l_rowidx_off;
 } p;
 
 #define RADIX_BITS 8
@@ -141,10 +149,26 @@ void select_row(const uint row) {
     const uint s_base = row * n;
     const uint d_base = row * p.width;
 
+    // compact visibility: the query's tail start and its row of block starts (one sequence: row 0)
+    int  l_tail = 0;
+    uint l_row  = 0;
+    if (p.l_mode != 0) {
+        l_tail = data_l[p.l_tails_off + q];
+        l_row  = p.l_rowidx_off == 0xFFFFFFFFu ? 0u : uint(data_l[p.l_rowidx_off + q]);
+    }
+
     uint keys[NPT];
     [[unroll]] for (uint j = 0; j < NPT; ++j) {
         const uint i = j * BLOCK_SIZE + tid;
-        keys[j] = i < n ? f2ui(data_s[s_base + i]) : 0u;
+        if (i < n) {
+            float v = data_s[s_base + i];
+            if (p.l_mode != 0 && !(data_l[l_row * p.l_blocks + i] < l_tail)) {
+                v = uintBitsToFloat(0xFF800000u);   // -inf: score + log(step(tail - start)) with step = 0
+            }
+            keys[j] = f2ui(v);
+        } else {
+            keys[j] = 0u;
+        }
     }
 
     // the budget-th largest key: 4 radix passes of 8 bits over the register-resident row
