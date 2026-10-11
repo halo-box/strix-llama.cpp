@@ -7415,6 +7415,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
+    if (ctx->perf_logger) {
+        // per-call path record (GGML_VK_PERF_LOGGER): the once-printed "XL tile engaged" line cannot say how many calls took which variant
+        ctx->perf_logger->count_path(std::string(quantize_y ? "int8:" : "f16:") + pipeline->name + " " + ggml_type_name(src0->type) +
+                                     " m=" + std::to_string(ne01) + " k=" + std::to_string(ne10));
+    }
 
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
     uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) : ne11;
@@ -20407,6 +20412,13 @@ void vk_perf_logger::print_timings(bool force) {
 
     if (timings.size() > 0) {
         std::cerr << "Total time: " << total_all_op_times / 1000.0 << " us." << std::endl;
+    if (!path_counts.empty()) {
+        std::cerr << "dense MUL_MAT pipeline calls:" << std::endl;
+        for (const auto & pc : path_counts) {
+            std::cerr << "  " << pc.first << ": " << pc.second << "x" << std::endl;
+        }
+        path_counts.clear();
+    }
     }
 
     timings.clear();

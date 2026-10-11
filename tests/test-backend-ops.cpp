@@ -15369,6 +15369,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], 2048, mk[1], {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, 10240, 2048, 320));
+    // Qwen3.8-27B UD-Q4_K_XL dense GEMMs at ub2048 with the f32 B the model feeds (the dense router's f16-coopmat path converts it
+    // per call; op-level numbers taken with an f16 B miss that cost)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K,   GGML_TYPE_F32, 17408, 2048, 5120,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K,   GGML_TYPE_F32, 17408, 2048, 5120,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K,   GGML_TYPE_F32, 5120,  2048, 17408, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,   GGML_TYPE_F32, 17408, 2048, 5120,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 17408, 2048, 5120,  {1, 1}, {1, 1}));
 
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {

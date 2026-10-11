@@ -1245,6 +1245,10 @@ class vk_perf_logger {
   public:
     void print_timings(bool force = false);
 
+    // dense MUL_MAT pipeline calls per print interval (which int8 / f16 / XL variant each call took; printed with the timings)
+    std::map<std::string, uint64_t> path_counts;
+    void count_path(const std::string & key) { path_counts[key] += 1; }
+
 
     std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops);
 

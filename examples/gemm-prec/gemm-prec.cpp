@@ -1,6 +1,6 @@
 // gemm-prec: time and precision of one MUL_MAT / MUL_MAT_ID shape on the first non-CPU backend vs the CPU f32 result.
 //   llama-gemm-prec <type_a> <m> <n> <k> [n_expert n_used]   (type_b f32, or f16 with GEMM_PREC_B16=1)
-// prints: shape, us/run (min of iters), max-abs-error, NMSE and the max-abs of the reference. Used for the GGML_VK_F32ACC A/B
+// prints: shape, us/run (min of iters; GEMM_PREC_SUSTAIN=<n> adds the mean of n back-to-back calls), max-abs-error, NMSE and the max-abs of the reference. Used for the GGML_VK_F32ACC A/B
 // (run twice with the env set differently) so the PR carries a precision delta vs CPU, not only speed.
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -26,7 +26,7 @@ static void set_quant(ggml_tensor * t, const std::vector<float> & f) {
     if (t->type == GGML_TYPE_F16) { std::vector<ggml_fp16_t> h(f.size()); for (size_t i = 0; i < f.size(); i++) h[i] = ggml_fp32_to_fp16(f[i]); ggml_backend_tensor_set(t, h.data(), 0, h.size() * 2); return; }
     std::vector<uint8_t> q(ggml_nbytes(t)); ggml_quantize_chunk(t->type, f.data(), q.data(), 0, f.size() / t->ne[0], t->ne[0], nullptr); ggml_backend_tensor_set(t, q.data(), 0, q.size());
 }
-struct run_t { std::vector<float> out; double us; };
+struct run_t { std::vector<float> out; double us; double us_sus = 0; int n_sus = 0; };
 static run_t run_on(ggml_backend_t be, ggml_type ta, ggml_type tb, int m, int n, int k, int ne_exp, int n_used,
                     const std::vector<float> & wa, const std::vector<float> & xb, const std::vector<int32_t> & ids, int iters) {
     ggml_init_params wp = { ggml_tensor_overhead() * 8, nullptr, true }; ggml_context * ctx = ggml_init(wp);
@@ -43,7 +43,17 @@ static run_t run_on(ggml_backend_t be, ggml_type ta, ggml_type tb, int m, int n,
     double best = 1e30;
     for (int i = 0; i < iters; i++) { auto t0 = std::chrono::steady_clock::now(); ggml_backend_graph_compute(be, gf); ggml_backend_synchronize(be);
         best = std::min(best, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()); }
-    run_t r; r.us = best; r.out.resize(ggml_nelements(out)); ggml_backend_tensor_get(out, r.out.data(), 0, r.out.size() * 4);
+    run_t r; r.us = best;
+    // GEMM_PREC_SUSTAIN=<n>: n back-to-back computes with one sync at the end, mean per call. The min above is one burst at the
+    // boost clock; a compute-dense tile (XL 256x256) is measured here at the clock the model sees under sustained load.
+    static const int sus = [] { const char * e = getenv("GEMM_PREC_SUSTAIN"); return e ? atoi(e) : 0; }();
+    if (sus > 0 && iters > 1) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < sus; i++) { ggml_backend_graph_compute(be, gf); }
+        ggml_backend_synchronize(be);
+        r.us_sus = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / sus; r.n_sus = sus;
+    }
+    r.out.resize(ggml_nelements(out)); ggml_backend_tensor_get(out, r.out.data(), 0, r.out.size() * 4);
     ggml_gallocr_free(ga); ggml_free(gctx); ggml_backend_buffer_free(buf); ggml_free(ctx); return r;
 }
 int main(int argc, char ** argv) {
@@ -67,6 +77,7 @@ int main(int argc, char ** argv) {
     run_t dev = run_on(gpu, ta, tb, m, n, k, ne_exp, n_used, wa, xb, ids, 10);
     double maxabs = 0, maxref = 0, num = 0, den = 0;
     for (size_t i = 0; i < ref.out.size(); i++) { double d = (double) dev.out[i] - ref.out[i]; maxabs = std::max(maxabs, std::fabs(d)); maxref = std::max(maxref, (double) std::fabs(ref.out[i])); num += d * d; den += (double) ref.out[i] * ref.out[i]; }
+    if (dev.n_sus) printf("gemm-prec sustained(%d back-to-back): %.1f us/run mean (min-of-iters %.1f, ratio %.3f)\n", dev.n_sus, dev.us_sus, dev.us, dev.us_sus / dev.us);
     printf("gemm-prec %s %s x %s m=%d n=%d k=%d%s: %.1f us/run  max_abs_err %.3e  (max|ref| %.3e)  NMSE %.3e  F32ACC=%s\n", ne_exp ? "MUL_MAT_ID" : "MUL_MAT", ggml_type_name(ta), ggml_type_name(tb), m, n, k,
            ne_exp ? (std::string(" E") + std::to_string(ne_exp) + " used " + std::to_string(n_used)).c_str() : "", dev.us, maxabs, maxref, num / std::max(den, 1e-30), getenv("GGML_VK_F32ACC") ? getenv("GGML_VK_F32ACC") : "default");
     ggml_backend_free(gpu); ggml_backend_free(cpu); return 0;
