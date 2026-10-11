@@ -8343,19 +8343,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_PRE:
-            // qwen4exp gated form on RDNA3.5: the unfused graph goes through the hc_mix fusion, which is faster.
-            // Qwen3.8-Flash-Next Q2_0, gfx1151, both HC ops unfused vs fused: pp2048 908.7 vs 832.5 t/s, tg128 30.2 vs 30.7.
-            // Remove once the fused kernels beat the hc_mix/hc_combine fusions at prefill.
-            if (ggml_get_op_params_i32(op, 1) != 0 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[dev_ctx->device].cc)) {
-                return false;
-            }
+            // qwen4exp gated form on RDNA3.5: the fused CUDA kernels
+            // (dsv4_hc_pre_f32<>, dsv4-hc.cu) run on this backend. Supporting
+            // the gated form keeps the whole graph on GPU; refusing it used to
+            // force a CPU split of the graph and a multi-GiB host compute
+            // buffer plus a server-side decode stall (measured 0.3-1.6 tok/s
+            // at high context on Strix Halo with parallel 4). The hc_mix /
+            // hc_combine fusions this avoids are tile-level op fusions that
+            // need the unfused graph; the pp2048 delta measured earlier
+            // (Qwen3.8-Flash-Next Q2_0 ~8%) is smaller than the CPU split cost.
+            // Setting LLAMA_FUSED_DSV4_HC_PRE=0 keeps the older behaviour.
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_POST:
-            // identity-comb (qwen4exp) form on RDNA3.5: the unfused graph goes through the hc_combine fusion, see DSV4_HC_PRE
-            if (op->src[3] == nullptr && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[dev_ctx->device].cc)) {
-                return false;
-            }
+            // identity-comb (qwen4exp) form on RDNA3.5: see GGML_OP_DSV4_HC_PRE
+            // above, same reasoning.
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
