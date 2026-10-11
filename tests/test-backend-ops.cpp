@@ -5603,8 +5603,10 @@ struct test_qsa_block_select : public test_case {
             return true;
         }
         const int64_t n = dispatch_census_count(backend, "QSA_BLOCK_SELECT");
-        if (n != 1) {
-            msg = "QSA_BLOCK_SELECT dispatches: " + std::to_string(n) + " (expected 1: the chain ran unfused)";
+        const int64_t want = env_knob_on("GGML_VK_QSA_BLOCK_SELECT") ? 1 : 0;
+        if (n != want) {
+            msg = "QSA_BLOCK_SELECT dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) +
+                  (want ? ": the chain ran unfused; GGML_VK_FUSION_DEBUG=1 prints why)" : ": the knob is off)");
             return false;
         }
         return true;
@@ -5668,6 +5670,9 @@ struct test_qsa_block_select : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         std::mt19937 rng(1234);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->view_src != nullptr) {
+                continue;   // only the inputs: a view of "limits" or "score" written with random values clobbers them
+            }
             const std::string name = ggml_get_name(t);
             if (name == "score") {
                 std::vector<float> v((size_t) ggml_nelements(t));
