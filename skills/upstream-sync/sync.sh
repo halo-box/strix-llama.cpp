@@ -114,13 +114,16 @@ models() {
     up=$(git diff --name-only "$1" "$2" -- src/models/ | sed -n 's#^src/models/\(.*\)\.cpp$#\1#p' | sort -u)
     fork=$(git diff --name-only "$1" HEAD -- src/models/ | sed -n 's#^src/models/\(.*\)\.cpp$#\1#p' | sort -u)
     both=$(comm -12 <(echo "$up") <(echo "$fork") | sed '/^$/d')
+    echo "  changed by upstream, checked with test-llama-archs: $(echo "$up" | grep -c .) archs"
+    echo "$up" | paste -sd' ' | fold -s -w 110 | sed 's/^/    /'
+    echo "  changed on both sides, checked with a real GGUF:"
     if [ -n "$both" ]; then
-        echo "$both" | sed 's/^/  /'
+        echo "$both" | sed 's/^/    /'
     else
-        echo "  none: no arch changed on both sides"
+        echo "    none"
     fi
     if git diff --name-only "$1" "$2" | grep -qE "$SHARED"; then
-        echo "  shared paths changed too (kernels, ggml core, graph, KV cache): ask the user which models to add"
+        echo "  shared paths changed too (kernels, ggml core, graph, KV cache): ask the user which real models to add"
     fi
 }
 

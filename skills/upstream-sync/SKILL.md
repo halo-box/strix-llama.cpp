@@ -156,6 +156,7 @@ Merge upstream ggml-org/llama.cpp <base-sha>..<target-sha> (<n> commits, <k> ste
 | Check | HIP (ROCm0) | Vulkan (Vulkan0) |
 |---|---|---|
 | `test-backend-ops`: no new failure | [ ] | [ ] |
+| `test-llama-archs`, every arch: no new failure | [ ] | [ ] |
 | KLD, 4 corpora at `-c 2048` and all at `-c 16384`: within the thresholds | [ ] | [ ] |
 | `llama-bench` pp and tg: within noise at every depth (tables below) | [ ] | [ ] |
 | server: tool call, same greedy decode, MTP acceptance within 5 points | [ ] | [ ] |
@@ -173,7 +174,10 @@ No machine names, home paths or model paths in the PR, the commits or the repo: 
 
 Needed before the PR leaves draft if any step of it had a sensitive conflict, and then on **both backends, HIP (ROCm) and Vulkan**. Give the user the full commands below with the placeholders filled in. Do not shorten them. Run them in clean worktrees, never in a tree with uncommitted work.
 
-Models: one GGUF per arch listed by `sync.sh report <last upstream sha of this PR>` under "models to test", that is the archs whose `src/models/<arch>.cpp` both upstream and the fork changed. An arch that only upstream changed comes in exactly as upstream wrote it. If the sync also changes shared paths (kernels, ggml core, graph, KV cache), ask the user which models to add. Check the arch of a GGUF with `python3 gguf-py/gguf/scripts/gguf_dump.py --no-tensors <model.gguf> | grep general.architecture`.
+Models, as listed by `sync.sh report <last upstream sha of this PR>` under "models to test":
+
+- **every arch**, including all the archs upstream changed: `test-llama-archs` builds a tiny random model per arch and compares each GPU backend with the CPU. No download, a few minutes;
+- **a real GGUF** for each arch whose `src/models/<arch>.cpp` both upstream and the fork changed: KLD, bench and server. If the sync also changes shared paths (kernels, ggml core, graph, KV cache), ask the user which real models to add. Check the arch of a GGUF with `python3 gguf-py/gguf/scripts/gguf_dump.py --no-tensors <model.gguf> | grep general.architecture`.
 
 The baseline is the fork before this sync: the first parent of the first merge of the branch (`$OLD` of the first step), not `origin/master`, which can move during the sync.
 
@@ -190,7 +194,7 @@ dev()   { case $1 in hip) echo ROCm0;; vk) echo Vulkan0;; esac; }
 for be in hip vk; do
   for t in base cand; do
     cmake -S ../sync-$t -B ../sync-$t/build-$be $(flags $be) -DCMAKE_BUILD_TYPE=Release && \
-      cmake --build ../sync-$t/build-$be -j --target llama-perplexity llama-bench llama-server test-backend-ops || break 2
+      cmake --build ../sync-$t/build-$be -j --target llama-perplexity llama-bench llama-server test-backend-ops test-llama-archs || break 2
   done
 done
 MODELS="<arch>=<model.gguf> <arch>=<model.gguf>"   # one GGUF per arch to test
@@ -207,6 +211,10 @@ for be in hip vk; do
   # 2. full test-backend-ops on both builds; only new failures count
   for t in base cand; do $(bin $t)/test-backend-ops -b $(dev $be) > $D/ops-$t.txt 2>&1; done
   diff <(grep FAIL $D/ops-base.txt | sort) <(grep FAIL $D/ops-cand.txt | sort) > $D/ops-new-fail.txt && echo "$be ops: no new failure"
+
+  # 2b. every model arch: tiny random models, GPU vs CPU logits; only new failures count
+  for t in base cand; do $(bin $t)/test-llama-archs -b $(dev $be) 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > $D/archs-$t.txt; done
+  diff <(grep FAIL $D/archs-base.txt | sort) <(grep FAIL $D/archs-cand.txt | sort) > $D/archs-new-fail.txt && echo "$be archs: no new failure"
 
   for mm in $MODELS; do
   M=${mm#*=}
@@ -257,6 +265,7 @@ Pass criteria, for each backend and each model:
 |---|---|
 | 1. build | both builds succeed |
 | 2. ops | no FAIL in the candidate that is not in the baseline |
+| 2b. archs | no FAIL in `test-llama-archs` of the candidate that is not in the baseline |
 | 3. logits, for each of the 5 runs | `Same top p` of the candidate >= the reference minus 0.5 points, `Mean KLD` <= 2 x the reference + 0.0001, `PPL(Q)/PPL(base)` within 1 +/- 0.01. The reference run is the baseline against itself with a smaller ubatch: other kernel paths, both correct |
 | 4. performance | pp and tg overlap the baseline within their standard deviations at every depth. Paste the raw tables |
 | 5. server | a valid `get_weather` call on both builds; the same decode text, or the first differing token explained by an upstream change in the step range; MTP acceptance rate within 5 points of the baseline (drop `--spec-type draft-mtp` if the model has no MTP head, and say so) |
