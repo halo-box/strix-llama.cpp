@@ -24,6 +24,19 @@ git merge upstream/master
 Merge commits are noisy. They are also correct, and they keep merge-base moving. Resolve
 conflicts once, in the merge, and the ancestry is recorded for free.
 
+The `upstream-sync` skill (`skills/upstream-sync/`) does this in small steps and checks each one.
+
+## After a reverted sync: the content base
+
+Reverting a sync merge removes the content but keeps the ancestry: `git merge-base` still
+says the upstream commits are merged. A later `git merge upstream/master` then skips them and
+puts newer upstream code on an older tree.
+
+`scripts/upstream-sync.base` holds the upstream commit whose content is really in the fork.
+`skills/upstream-sync/sync.sh merge` merges from that base and updates the file in the merge
+commit. Since the revert of #155 it is 86ea01d05 (2026-09-29), while `git merge-base` says
+71ad0590f (2026-10-08).
+
 ## When a PR + squash was unavoidable
 
 If divergence forced the sync through a PR (conflict resolution needs review), the content
