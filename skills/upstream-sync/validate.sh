@@ -57,17 +57,38 @@ fetch() {
     echo "$d/$f"
 }
 
+PR_BODY=$(mktemp)
+trap 'rm -f "$PR_BODY"' EXIT
+section() { awk -v h="## $1" '$0 == h {f=1; next} /^## /{f=0} f' "$PR_BODY"; }
+
+# 0. read the PR first: what the sync changed, and whether the PR says enough to validate it
 if [ -n "$PR" ]; then
-    gh pr view "$PR" --repo halo-box/strix-llama.cpp --json body,headRefName --jq .headRefName > /dev/null || die "cannot read PR $PR"
-    head=$(gh pr view "$PR" --repo halo-box/strix-llama.cpp --json headRefName --jq .headRefName)
+    gh pr view "$PR" --repo halo-box/strix-llama.cpp --json title,url,headRefName,body > "$PR_BODY.json" || die "cannot read PR $PR"
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$PR_BODY.json" | tr -d '\r' > "$PR_BODY"
+    PR_URL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["url"])' "$PR_BODY.json")
+    head=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefName"])' "$PR_BODY.json")
+    rm -f "$PR_BODY.json"
+    for h in "Overview" "Steps" "Models to validate"; do
+        [ -n "$(section "$h")" ] || die "PR $PR has no '## $h' section: generate the body with 'sync.sh summary' and fill the models table (SKILL.md, step 6)"
+    done
+    echo "== $PR_URL"
+    section Overview | grep -E '^\|' || true
+    if grep -q -F '**edit outside the conflict zones**' "$PR_BODY" || section Overview | grep -E '^\| [0-9]+ ' | grep -qvE '\| none \|$'; then
+        echo "note: this sync has edits outside the conflicts, read them in the PR before trusting the numbers"
+    fi
     [ -n "$CAND" ] || { git fetch -q origin "$head" && CAND=FETCH_HEAD; }
     # rows of the "## Models to validate" table: | arch | repo | file | short or long |
     while IFS='|' read -r _ a r f c _; do
         a=$(echo $a) r=$(echo $r) f=$(echo $f) c=$(echo $c)
-        case $a in ""|Arch|---*) continue ;; esac
+        case $a in ""|Arch|---*|"<"*) continue ;; esac
         MODELS+=("$a=$(fetch "$r" "$f"):${c:-short}")
-    done < <(gh pr view "$PR" --repo halo-box/strix-llama.cpp --json body --jq .body | tr -d '\r' | awk '/^## Models to validate/{f=1; next} /^## /{f=0} f && /^\|/')
-    [ "${#MODELS[@]}" -gt 0 ] || echo "warning: no model in the PR table, only the small model and the op tests run" >&2
+    done < <(section "Models to validate" | grep -E '^\|')
+    if [ "${#MODELS[@]}" -eq 0 ]; then
+        if section Overview | grep -q '`\*'; then
+            die "the PR has sensitive steps but no model to validate: fill the 'Models to validate' table"
+        fi
+        echo "warning: no model in the PR table, only the small model and the op tests run" >&2
+    fi
 fi
 [ -n "$CAND" ] || die "--pr <number> or --cand <rev> is required"
 [ -n "$SMALL" ] || SMALL=$(fetch ggml-org/Qwen3.5-0.8B-Base-GGUF Qwen3.5-0.8B-Base-BF16.gguf)
@@ -80,6 +101,7 @@ OUT=${OUT:-../sync-validate/$(git rev-parse --short=9 "$CAND")}
 mkdir -p "$OUT/logs"
 OUT=$(cd "$OUT" && pwd)
 SMALL=$(realpath "$SMALL")
+[ -z "$PR" ] || cp "$PR_BODY" "$OUT/pr-body.md"
 
 for p in llama-server llama-cli llama-bench llama-perplexity llama-completion; do
     if pgrep -x "$p" > /dev/null; then die "the GPU is busy: $(pgrep -a -x "$p")"; fi
@@ -96,6 +118,7 @@ echo "base $(git log -1 --format='%h %s' "$BASE")"
 echo "cand $(git log -1 --format='%h %s' "$CAND")"
 echo "out  $OUT"
 {
+    echo "pr=${PR_URL:-}"
     echo "base=$BASE"
     echo "cand=$CAND"
     echo "small=$(basename "$SMALL") $(sha256sum "$SMALL" | cut -c1-16)"
