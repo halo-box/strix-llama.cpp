@@ -909,6 +909,8 @@ template <> inline void init_pushconst_fastdiv(vk_op_sum_rows_push_constants &p)
 struct vk_quantize_q8_1_push_constants {
     uint32_t ne;
     uint32_t num_blocks;
+    uint32_t row4;      // a row-strided source: row length and row stride in vec4s (0: packed)
+    uint32_t stride4;
 };
 
 struct vk_op_flash_attn_split_k_reduce_push_constants {

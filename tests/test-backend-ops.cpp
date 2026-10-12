@@ -4098,15 +4098,59 @@ struct test_mmb_quant_hc : test_case {
 // (HC_POST_GATE_NORM / _CPY) or, with no combine in front, the norm and the cast (RMS_NORM_MUL_CPY).
 // mode: 0 combine + f32 norm, 1 combine + f16 norm, 2 f16 norm of a plain input (no combine),
 //       3 combine + f16 norm with an extra reader of the f32 MUL (the cast must not fuse; the combine + f32 norm may)
+// pad > 0 (modes 1 and 2): the f16 norm is written into a view of one [hc*embd + pad, tokens] buffer (LLAMA_HC_XN_PAD) and
+// its readers take the token stride; on Vulkan the norm must still fuse and the GEMM / mat-vec read the rows in place
+// (counted, so the test fails if the chain runs unfused or the readers copy xn back to packed rows)
 struct test_hc_post_norm : public test_case {
     const int embd, hc, tokens, mode;
     const ggml_type type_down;
+    const int pad;
     std::vector<ggml_tensor *> verify;
 
-    test_hc_post_norm(int embd, int hc, int tokens, int mode, ggml_type type_down = GGML_TYPE_Q8_0)
-        : embd(embd), hc(hc), tokens(tokens), mode(mode), type_down(type_down) {}
+    test_hc_post_norm(int embd, int hc, int tokens, int mode, ggml_type type_down = GGML_TYPE_Q8_0, int pad = 0)
+        : embd(embd), hc(hc), tokens(tokens), mode(mode), type_down(type_down), pad(pad) {
+        GGML_ASSERT(pad == 0 || mode == 1 || mode == 2);
+    }
     std::string op_desc(ggml_tensor *) override { return "HC_POST_NORM"; }
-    std::string vars() override { return VARS_TO_STR5(embd, hc, tokens, mode, type_down); }
+    std::string vars() override {
+        return pad == 0 ? VARS_TO_STR5(embd, hc, tokens, mode, type_down) : VARS_TO_STR6(embd, hc, tokens, mode, type_down, pad);
+    }
+
+    typedef uint64_t (*fusion_count_t)(const char *);
+    typedef void     (*fusion_reset_t)(void);
+    static void * backend_proc(ggml_backend_t backend, const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+    void before_compute(ggml_backend_t backend) override {
+        if (auto reset = (fusion_reset_t) backend_proc(backend, "ggml_backend_vk_fusion_count_reset")) {
+            reset();
+        }
+    }
+    static bool knob_on(const char * name) {
+        const char * e = getenv(name);
+        return e == nullptr || atoi(e) != 0;
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        auto count = (fusion_count_t) backend_proc(backend, "ggml_backend_vk_fusion_count");
+        if (pad == 0 || count == nullptr) {
+            return true;   // the unpadded cases check values only; not the Vulkan backend
+        }
+        struct { const char * name; bool want; } checks[] = {
+            { mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY", knob_on("GGML_VK_FUSE_HC_POST_NORM") },
+            // the readers take the row stride at prefill sizes (more tokens than the mat-vec columns)
+            { "MUL_MAT_ROWSTRIDE_B",     tokens > 8 && knob_on("GGML_VK_ROWSTRIDE") },
+            { "MUL_MAT_VEC_ROWSTRIDE_A", tokens > 8 && knob_on("GGML_VK_ROWSTRIDE") },
+        };
+        for (const auto & c : checks) {
+            const uint64_t n = count(c.name);
+            if ((n > 0) != c.want) {
+                msg = std::string(c.name) + " dispatches: " + std::to_string(n) + (c.want ? " (expected some)" : " (expected none)");
+                return false;
+            }
+        }
+        return true;
+    }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
@@ -4148,12 +4192,19 @@ struct test_hc_post_norm : public test_case {
             if (gf) { ggml_build_forward_expand(gf, extra); }
             verify.push_back(extra);
         }
-        if (mode != 0) {
+        if (pad > 0) {
+            // as qwen4exp emits it: the destination's VIEW node is in the graph ahead of the norm chain
+            ggml_tensor * buf = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hc_dim + pad, tokens);
+            ggml_set_name(buf, "xn_pad");
+            ggml_tensor * dst = ggml_view_3d(ctx, buf, embd, hc, tokens, embd * ggml_element_size(buf), buf->nb[1], 0);
+            if (gf) { ggml_build_forward_expand(gf, dst); }
+            xn = ggml_cpy(ctx, xn, dst);
+        } else if (mode != 0) {
             xn = ggml_cast(ctx, xn, GGML_TYPE_F16);
         }
         if (gf) { ggml_build_forward_expand(gf, xn); }
         verify.push_back(xn);
-        ggml_tensor * xn2 = ggml_reshape_2d(ctx, xn, hc_dim, tokens);
+        ggml_tensor * xn2 = pad > 0 ? ggml_view_2d(ctx, xn, hc_dim, tokens, xn->nb[2], 0) : ggml_reshape_2d(ctx, xn, hc_dim, tokens);
         ggml_tensor * w_inj  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, hc);
         ggml_tensor * w_down = ggml_new_tensor_2d(ctx, type_down, hc_dim, 64);
         ggml_tensor * inj = ggml_mul_mat(ctx, w_inj, xn2);
@@ -4162,7 +4213,9 @@ struct test_hc_post_norm : public test_case {
         verify.push_back(inj);
         verify.push_back(lo);
         ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
-        ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, xn, embd, hc, tokens), gate, 1.0f / hc);
+        ggml_tensor * xn3 = pad > 0 ? ggml_view_3d(ctx, xn2, embd, hc, tokens, embd * ggml_element_size(xn2), xn2->nb[1], 0)
+                                    : ggml_reshape_3d(ctx, xn, embd, hc, tokens);
+        ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx, xn3, gate, 1.0f / hc);
         verify.push_back(mixed);
         // every checked node keeps its value: in the model the combine also feeds the next combine, so without the
         // flag the allocator would run the norm in place over it
@@ -4174,16 +4227,53 @@ struct test_hc_post_norm : public test_case {
 };
 
 // quantized weights x an f16 B (the f16 hc norm into the hc down GEMM): int8 MMQ quantizes the f16 B directly
+// pad > 0: B is a view of a [k + pad, n] buffer (rows packed, row stride k + pad: the padded hc xn / GDN norm rows); Vulkan
+// must read it in place (int8 MMQ quantizes through the stride, an f16 A's GEMM reads B through stride_b), counted
 struct test_mul_mat_f16b : public test_case {
     const ggml_type type_a;
     const int m, n, k;
-    test_mul_mat_f16b(ggml_type type_a, int m, int n, int k) : type_a(type_a), m(m), n(n), k(k) {}
+    const int pad;
+    test_mul_mat_f16b(ggml_type type_a, int m, int n, int k, int pad = 0) : type_a(type_a), m(m), n(n), k(k), pad(pad) {}
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_F16B"; }
-    std::string vars() override { return VARS_TO_STR4(type_a, m, n, k); }
+    std::string vars() override { return pad == 0 ? VARS_TO_STR4(type_a, m, n, k) : VARS_TO_STR5(type_a, m, n, k, pad); }
     double max_nmse_err() override { return 5e-4; }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr) init_tensor_uniform(t);
+        }
+    }
+
+    typedef uint64_t (*fusion_count_t)(const char *);
+    typedef void     (*fusion_reset_t)(void);
+    static void * backend_proc(ggml_backend_t backend, const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+    void before_compute(ggml_backend_t backend) override {
+        if (auto reset = (fusion_reset_t) backend_proc(backend, "ggml_backend_vk_fusion_count_reset")) {
+            reset();
+        }
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        auto count = (fusion_count_t) backend_proc(backend, "ggml_backend_vk_fusion_count");
+        if (pad == 0 || count == nullptr || n <= 8) {
+            return true;   // unpadded; not Vulkan; a mat-vec width (B is the vector side there and is copied)
+        }
+        static const bool knob_on = [] { const char * e = getenv("GGML_VK_ROWSTRIDE"); return e == nullptr || atoi(e) != 0; }();
+        const uint64_t c = count("MUL_MAT_ROWSTRIDE_B");
+        if ((c > 0) != knob_on) {
+            msg = "MUL_MAT_ROWSTRIDE_B dispatches: " + std::to_string(c) + (knob_on ? " (B was copied to packed rows)" : " (the knob is off)");
+            return false;
+        }
+        return true;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
-        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, n);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k + pad, n);
+        if (pad > 0) {
+            b = ggml_view_2d(ctx, b, k, n, b->nb[1], 0);
+        }
         return ggml_mul_mat(ctx, a, b);
     }
 };
@@ -12541,10 +12631,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_post_norm(4096, 4, 40, 1));
     test_cases.emplace_back(new test_hc_post_norm(288, 4, 40, 1));   // 72 vec4 per row: one partial pass
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 1, GGML_TYPE_Q4_0));
+    // LLAMA_HC_XN_PAD: the padded f16 norm and its row-strided readers (128 = the shipped pad; 8 = a stride off the GEMM's
+    // K alignment; 7 tokens = decode-sized readers, which copy)
+    for (int tokens : {7, 64, 513}) {
+        test_cases.emplace_back(new test_hc_post_norm(2560, 4, tokens, 1, GGML_TYPE_Q8_0, 128));
+    }
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 2, GGML_TYPE_Q8_0, 128));
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 1, GGML_TYPE_Q4_0, 8));
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL}) {
         for (int n : {9, 64, 300}) {
             test_cases.emplace_back(new test_mul_mat_f16b(t, 320, n, 10240));
             test_cases.emplace_back(new test_mul_mat_f16b(t, 96, n, 256));
+        }
+    }
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16}) {
+        for (int pad : {8, 128}) {
+            test_cases.emplace_back(new test_mul_mat_f16b(t, 320, 64, 10240, pad));
+            test_cases.emplace_back(new test_mul_mat_f16b(t, 96, 300, 256, pad));
+            test_cases.emplace_back(new test_mul_mat_f16b(t, 96, 5, 256, pad));
         }
     }
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

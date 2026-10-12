@@ -16,6 +16,8 @@ layout (push_constant) uniform parameter
 {
     uint ne;
     uint num_blocks;
+    uint row4;      // > 0: the source rows are row4 vec4s long and stride4 vec4s apart (a row-strided f16 B,
+    uint stride4;   // LLAMA_HC_XN_PAD / LLAMA_GDN_NORM_PAD); the output stays packed. 0: a packed source
 } p;
 
 #include "types.glsl"
@@ -61,7 +63,8 @@ void quantize(const uint wgid) {
 
     const uint a_idx = ib * 8 + iqs;
 
-    vec4 vals = a_idx < p.ne / 4 ? vec4(data_a[a_idx]) : vec4(0.0f);
+    const uint src_idx = p.row4 == 0 ? a_idx : (a_idx / p.row4) * p.stride4 + a_idx % p.row4;
+    vec4 vals = a_idx < p.ne / 4 ? vec4(data_a[src_idx]) : vec4(0.0f);
     const vec4 abs_vals = abs(vals);
 
     // Find absolute max for each block

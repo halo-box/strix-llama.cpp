@@ -654,6 +654,26 @@ static ggml_tensor * qwen4exp_dec_weight(const llama_model & model, ggml_tensor 
     return tw != nullptr ? tw : w;
 }
 
+// one padded f16 destination per graph (see models.h): a new leaf only when none exists yet or the shape differs
+ggml_tensor * llama_model_qwen4exp::graph::pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name) {
+    if (*slot == nullptr || (*slot)->ne[0] != ne0 || (*slot)->ne[1] != ne1) {
+        *slot = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, ne0, ne1);
+        ggml_set_name(*slot, name);
+    }
+    return *slot;
+}
+
+// LLAMA_HC_XN_PAD=N (f16 elements, rounded down to a multiple of 8; default 128, 0 = off): the f16 hc norm output (xn) gets a
+// token stride of hc_dim + N. Flash-Next's hc_dim 10240 f16 is 80 x 256 B, so packed, every token row starts on the same DRAM
+// channel for the readers that walk xn token by token (the inject mat-vec, the hc pre mix); 10368 is 81 x 256 B. The norm writes
+// the padded rows directly (HC_POST_GATE_NORM_CPY / RMS_NORM_MUL_CPY store through the token stride) and the readers take
+// the stride (the down GEMM quantizes B through it, the swapped inject mat-vec steps A rows by it, DSV4_HC_PRE reads it), so
+// nothing copies xn back to packed rows. Port of the fork's 78a909a80 in the fixed one-buffer-per-graph form (f355c9e6d).
+static int64_t qwen4exp_hc_xn_pad() {
+    static const int64_t pad = [] { const char * e = getenv("LLAMA_HC_XN_PAD"); return e ? (int64_t) (atoi(e) & ~7) : (int64_t) 128; }();
+    return pad > 0 ? pad : 0;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,
@@ -682,10 +702,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // directly follows the MUL, so a backend that fuses the combine (or norm) with the cast writes f16 only.
     const bool norm_f16 = cparams.fused_dsv4_hc_norm_f16 && cparams.fused_dsv4_hc_pre && il >= 0 && nt >= 32 &&
                           loras->empty();
-    if (norm_f16) {
+    bool xn_padded = false;
+    if (norm_f16 && qwen4exp_hc_xn_pad() > 0) {
+        // one buffer per graph (pad_buf): every reader of this layer's xn precedes the next layer's norm through the
+        // residual stream, and the backend orders the next layer's overlapping write behind them
+        ggml_tensor * buf = pad_buf(&hc_xn_pad_buf, hc_dim + qwen4exp_hc_xn_pad(), nt, "hc_xn_pad");
+        ggml_tensor * dst = ggml_view_3d(ctx0, buf, n_embd, hc, nt, n_embd * ggml_element_size(buf), buf->nb[1], 0);
+        // the destination's VIEW node goes into the graph now, ahead of the norm chain: expanded from the CPY it would land
+        // between the MUL and the CPY, and the norm + cast fusions (consecutive nodes) would fall back to the unfused chain
+        ggml_build_forward_expand(gf, dst);
+        xn = ggml_cpy(ctx0, xn, dst);
+        xn_padded = true;
+    } else if (norm_f16) {
         xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
     }
-    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+    // padded: a view of the copy (not of the buffer), so every consumer depends on the write
+    xn = xn_padded ? ggml_view_2d(ctx0, xn, hc_dim, nt, xn->nb[2], 0) : ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, norm_f16 ? "hc_norm_f16" : "hc_norm", il);
 
     if (inject) {
@@ -711,7 +743,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     if (cparams.fused_dsv4_hc_pre && il >= 0) {
         // sigmoid gate and mean over the streams in one op
         mixed = ggml_dsv4_hc_pre_gated(ctx0,
-                ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt),
+                xn_padded ? ggml_view_3d(ctx0, xn, n_embd, hc, nt, n_embd * ggml_element_size(xn), xn->nb[1], 0)
+                          : ggml_reshape_3d(ctx0, xn, n_embd, hc, nt),
                 ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
         if (norm_f16) {

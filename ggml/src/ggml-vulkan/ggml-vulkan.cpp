@@ -7193,7 +7193,8 @@ vk_pipeline ggml_vk_get_quantize_pipeline(ggml_backend_vk_context * ctx, ggml_ty
     }
 }
 
-void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne, ggml_type src_type) {
+void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne, ggml_type src_type,
+                           uint32_t row, uint32_t row_stride) {
     VK_LOG_DEBUG("ggml_vk_quantize_q8_1(" << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ", " << ne << ")");
 
     vk_pipeline pipeline = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1, src_type);
@@ -7203,9 +7204,12 @@ void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, co
     const uint64_t max_elements = std::min<uint64_t>(uint64_t{ctx->device->properties.limits.maxComputeWorkGroupCount[0]} * pipeline->wg_denoms[0], std::numeric_limits<uint32_t>::max());
     const uint32_t elements = std::min(ne, static_cast<uint32_t>(max_elements));
 
+    GGML_ASSERT(row % 4 == 0 && row_stride % 4 == 0 && (row == 0 || row_stride >= row));
     const vk_quantize_q8_1_push_constants pc = {
         ne,
         num_blocks,
+        row / 4,
+        row_stride / 4,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { in, out }, pc, { elements, 1, 1 });
@@ -7392,6 +7396,16 @@ static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
 
 
 
+// An f16 matrix whose rows are packed but strided (qwen4exp's padded hc xn / GDN norm rows, LLAMA_HC_XN_PAD /
+// LLAMA_GDN_NORM_PAD): the dense GEMM reads it as B in place through stride_b or quantizes it to q8_1 through the row
+// stride, and the mat-vec reads it as A through stride_a, instead of copying it to packed rows, which would undo the pad.
+// GGML_VK_ROWSTRIDE=0 disables (the copy as before).
+static bool ggml_vk_f16_rowstride(const ggml_tensor * t) {
+    static const bool enabled = [] { const char * e = getenv("GGML_VK_ROWSTRIDE"); return e == nullptr || atoi(e) != 0; }();
+    return enabled && t->type == GGML_TYPE_F16 && t->nb[0] == sizeof(ggml_fp16_t) && t->ne[2] == 1 && t->ne[3] == 1 &&
+           !ggml_vk_dim01_contiguous(t) && t->nb[1] >= t->ne[0] * sizeof(ggml_fp16_t) && t->nb[1] % 16 == 0 && t->ne[0] % 4 == 0;
+}
+
 // out16: the MUL_MAT+CPY(f16) fusion. The result is stored as f16 straight into the cast's destination
 // (contiguous, same shape) by an f16-output int8 MMQ pipeline; dst itself is never written.
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, ggml_tensor * out16 = nullptr) {
@@ -7450,8 +7464,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
     // an f16 B (the f16 activations) is quantized to q8_1 straight from f16 (GGML_VK_MMQ_F16_Y=0: it takes the f16 matmul instead)
     const bool f16_y = src1->type == GGML_TYPE_F16 && ggml_vk_mmq_f16_y_enabled() && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
+    // a row-strided f16 B (the padded hc xn) is read in place through stride_b, or quantized from its rows
+    const bool y_rowstride = src0->type != GGML_TYPE_BF16 && !ctx->device->coopmat2 && ggml_vk_f16_rowstride(src1);
     bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
-                                (src1->type == GGML_TYPE_F32 || f16_y) && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
+                          (src1->type == GGML_TYPE_F32 || f16_y) && (ggml_is_contiguous(src1) || y_rowstride) && (ne11 * ne10) % 4 == 0;
     // GGML_VK_DENSE_F16COOPMAT: listed types leave the int8 path for the f16-B KHR coopmat matmul (not for the f16-out fusion,
     // which exists on the int8 path only)
     if (can_quantize_y && !d16 && ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10, (uint32_t) ne11)) {
@@ -7467,7 +7483,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
-    const bool y_needs_reformat = !quantize_y && (!ggml_vk_dim01_contiguous(src1) || y_kernel_type != src1->type);
+    const bool y_needs_reformat = !quantize_y && ((!ggml_vk_dim01_contiguous(src1) && !y_rowstride) || y_kernel_type != src1->type);
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], false, d16);
@@ -7482,8 +7498,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     GGML_ASSERT(mmp_map != nullptr);
 
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false));
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
+    const uint32_t kalign = quantize_y ? 1 : ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false);
+    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, kalign);
+    // a row-strided B read in place: the aligned shaders load B rows at multiples of stride_b
+    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8 &&
+                         (!y_rowstride || (src1->nb[1] / sizeof(ggml_fp16_t)) % kalign == 0);
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
 
@@ -7691,12 +7710,16 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             if (ctx->prealloc_y_need_sync) {
                 ggml_vk_sync_buffers(ctx, subctx);
             }
-            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne, src1->type);
+            ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_subbuffer(ctx, d_Qy, qy_buf_offset), ggml_vk_subbuffer(ctx, d_Y, 0), y_ne, src1->type,
+                                  y_rowstride ? (uint32_t) ne10 : 0u, y_rowstride ? (uint32_t) (src1->nb[1] / sizeof(ggml_fp16_t)) : 0u);
             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
             ctx->prealloc_y_last_tensor_used = src1;
             ctx->prealloc_y_last_k_padded = false;
             ctx->prealloc_y_last_row_pad = 0;
         }
+    }
+    if (y_rowstride) {
+        ggml_vk_fusion_count_add("MUL_MAT_ROWSTRIDE_B");
     }
 
     // The partial tiles of a quantized A rely on the bound range to read zeros past the last row,
@@ -7706,13 +7729,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     uint32_t stride_batch_x = qx_needs_dequant ? ne00*ne01 : ggml_vk_batch_stride(src0);
     uint32_t stride_batch_y = (qy_needs_dequant || quantize_y) ? (uint32_t) (y_row * ne11) : ggml_vk_batch_stride(src1);
-    const uint32_t stride_b = (qy_needs_dequant && !quantize_y) ? (uint32_t) y_row : (uint32_t) ne10;
+    const uint32_t stride_b = (qy_needs_dequant && !quantize_y) ? (uint32_t) y_row :
+                              (y_rowstride && !quantize_y)     ? (uint32_t) (src1->nb[1] / sizeof(ggml_fp16_t)) : (uint32_t) ne10;
 
     if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
     }
 
-    if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y) {
+    if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y && !y_rowstride) {
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
@@ -7872,7 +7896,9 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
     GGML_ASSERT(ne11 == 1 || ne12 * ne13 == 1);
     bool batch_n = ne11 > 1;
 
-    const bool x_non_contig = !ggml_vk_dim01_contiguous(src0);
+    // a row-strided f16 A (the padded hc xn as the swapped matrix of the hc inject projection): read through stride_a
+    const bool x_rowstride = ggml_vk_f16_rowstride(src0);
+    const bool x_non_contig = !ggml_vk_dim01_contiguous(src0) && !x_rowstride;
 
     // BF16 src1 has no mul_mat_vec B-type; widen to F32
     const bool widen_bf16 = src1->type == GGML_TYPE_BF16;
@@ -8053,12 +8079,15 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
     uint32_t stride_batch_y = batch_n ? ne10 : ((qy_needs_dequant || quantize_y) ? ne10*ne11 : ggml_vk_batch_stride(src1));
     uint32_t stride_batch_d = batch_n ? ne20 : (ne20*ne21);
 
-    if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
+    if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant && !x_rowstride) {
         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
     }
 
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant) {
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
+    }
+    if (x_rowstride) {
+        ggml_vk_fusion_count_add("MUL_MAT_VEC_ROWSTRIDE_A");
     }
 
     vk_subbuffer d_Out = d_D;
@@ -8106,7 +8135,7 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
 
         uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
         const vk_mat_vec_push_constants pc = {
-            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+            (uint32_t)ne00, x_rowstride ? (uint32_t)(src0->nb[1] / sizeof(ggml_fp16_t)) : (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
             stride_batch_x, stride_batch_y, stride_batch_d,
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
@@ -8863,7 +8892,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                (dst->ne[0] == 1 || (dst->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16))) &&
                src0->ne[2] == 1 && src0->ne[3] == 1 &&
                src1->ne[2] == 1 && src1->ne[3] == 1 &&
-               ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+               ggml_is_contiguous(src0) && (ggml_is_contiguous(src1) || ggml_vk_f16_rowstride(src1)) && ggml_is_contiguous(dst) &&
                get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, src1) == 0 && get_misalign_bytes(ctx, dst) == 0) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
@@ -17262,7 +17291,11 @@ static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, c
     if (mul->src[0] != rms || (has_post && rms->src[0] != hc_post)) {
         return false;
     }
-    if (out_f16 && (out->src[0] != mul || out->type != GGML_TYPE_F16 || !ggml_is_contiguous(out) || !ggml_are_same_shape(out, mul))) {
+    // the f16 output's rows within a token are packed; its token stride may be padded (LLAMA_HC_XN_PAD, a view of one
+    // padded buffer): dsv4_hc_post_norm.comp stores through sn1 / sn2, as vec4s
+    if (out_f16 && (out->src[0] != mul || out->type != GGML_TYPE_F16 || !ggml_are_same_shape(out, mul) ||
+                    out->nb[0] != sizeof(ggml_fp16_t) || out->nb[1] != out->ne[0] * sizeof(ggml_fp16_t) ||
+                    out->nb[2] < out->nb[1] * out->ne[1] || out->nb[2] % 8 != 0 || out->ne[3] != 1)) {
         return false;
     }
     const ggml_tensor * gamma = mul->src[1];
