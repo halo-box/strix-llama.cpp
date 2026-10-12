@@ -141,7 +141,7 @@ Always pass `--repo halo-box/strix-llama.cpp`. Never open anything against ggml-
 The first part of the body is generated, so it lists every change of the sync:
 
 ```sh
-OLD0=$(git merge-base HEAD origin/master)            # the fork before the first step
+OLD0=$(git merge-base HEAD origin/master)            # the fork before the first step (use the base branch of a stacked PR instead of master)
 skills/upstream-sync/sync.sh summary $OLD0 > body.md
 ```
 

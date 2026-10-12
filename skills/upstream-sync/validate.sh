@@ -11,7 +11,7 @@
 #   --model    a local model instead of the PR table; repeat the option
 #   --small    Qwen3.5-0.8B-Base in F16 or BF16, quantized here to every type of QUANTS (the idea comes from
 #              upstream ci/run.sh). Default: downloaded from ggml-org/Qwen3.5-0.8B-Base-GGUF
-#   --base     default: the merge base of the candidate with origin/master, that is the fork before the sync
+#   --base     default: the merge base of the candidate with the branch the PR targets (origin/master without --pr)
 #   --backends hip, vk, or cpu (cpu only to test this script)
 set -euo pipefail
 export LC_ALL=C
@@ -63,10 +63,11 @@ section() { awk -v h="## $1" '$0 == h {f=1; next} /^## /{f=0} f' "$PR_BODY"; }
 
 # 0. read the PR first: what the sync changed, and whether the PR says enough to validate it
 if [ -n "$PR" ]; then
-    gh pr view "$PR" --repo halo-box/strix-llama.cpp --json title,url,headRefName,body > "$PR_BODY.json" || die "cannot read PR $PR"
+    gh pr view "$PR" --repo halo-box/strix-llama.cpp --json title,url,headRefName,baseRefName,body > "$PR_BODY.json" || die "cannot read PR $PR"
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$PR_BODY.json" | tr -d '\r' > "$PR_BODY"
     PR_URL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["url"])' "$PR_BODY.json")
     head=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefName"])' "$PR_BODY.json")
+    PR_BASE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefName"])' "$PR_BODY.json")
     rm -f "$PR_BODY.json"
     for h in "Overview" "Steps" "Models to validate"; do
         [ -n "$(section "$h")" ] || die "PR $PR has no '## $h' section: generate the body with 'sync.sh summary' and fill the models table (SKILL.md, step 6)"
@@ -96,7 +97,10 @@ fi
 SMALL_TYPE=$(basename "$SMALL" | grep -oE 'BF16|F16' | head -1)
 [ -n "$SMALL_TYPE" ] || die "--small must be an F16 or BF16 gguf (the type must be in the file name)"
 CAND=$(git rev-parse --verify "$CAND^{commit}")
-BASE=$(git rev-parse --verify "${BASE:-$(git merge-base "$CAND" origin/master)}^{commit}")
+# the fork before the sync: where the candidate leaves the branch the PR targets (master, or a stacked PR branch)
+target=origin/master
+if [ -n "${PR_BASE:-}" ]; then git fetch -q origin "$PR_BASE"; target=FETCH_HEAD; fi
+BASE=$(git rev-parse --verify "${BASE:-$(git merge-base "$CAND" "$target")}^{commit}")
 OUT=${OUT:-../sync-validate/$(git rev-parse --short=9 "$CAND")}
 mkdir -p "$OUT/logs"
 OUT=$(cd "$OUT" && pwd)
