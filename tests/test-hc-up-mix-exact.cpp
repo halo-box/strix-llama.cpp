@@ -19,7 +19,7 @@
 typedef uint64_t (*fusion_count_t)(const char *);
 typedef void     (*fusion_reset_t)(void);
 
-struct shape { int64_t n_embd, nt, k, pad; bool expect_fused; };
+struct shape { int64_t n_embd, nt, k, pad; bool expect_fused; bool gate16 = true; };   // gate16 false: the f32-gate form
 
 static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh) {
     auto count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count");
@@ -34,7 +34,7 @@ static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh
     ggml_tensor * xb  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, M + sh.pad, sh.nt);   // row-padded like LLAMA_HC_XN_PAD
     ggml_tensor * x   = ggml_view_3d(ctx, xb, sh.n_embd, 4, sh.nt, sh.n_embd * sizeof(ggml_fp16_t), xb->nb[1], 0);
     ggml_tensor * g   = ggml_mul_mat(ctx, w, lo);
-    ggml_tensor * g16 = ggml_cast(ctx, g, GGML_TYPE_F16);
+    ggml_tensor * g16 = sh.gate16 ? ggml_cast(ctx, g, GGML_TYPE_F16) : g;   // (named g16 either way: the gate the HC pre reads)
     ggml_tensor * rs  = ggml_reshape_3d(ctx, g16, sh.n_embd, 4, sh.nt);
     ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx, x, rs, 0.25f);
     ggml_set_output(mixed);
@@ -61,7 +61,7 @@ static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh
         setenv("GGML_VK_HC_UP_MIX", knob, 1);
         reset();
         ggml_backend_graph_compute(be, gf);
-        n = count("HC_UP_MIX");
+        n = count(sh.gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G");
         ggml_backend_tensor_get(mixed, out.data(), 0, out.size() * sizeof(float));
     };
     uint64_t n_on = 0, n_off = 0, n_p = 0;
@@ -75,7 +75,7 @@ static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh
     if (n_off != 0 || n_on != (sh.expect_fused ? 1u : 0u)) {
         fprintf(stderr, "FAIL n_embd=%lld nt=%lld: HC_UP_MIX dispatches on=%llu off=%llu (expected %d / 0)\n",
                 (long long) sh.n_embd, (long long) sh.nt, (unsigned long long) n_on, (unsigned long long) n_off, sh.expect_fused ? 1 : 0); fails++; }
-    if (!eq && getenv("HC_UP_MIX_DIAG") != nullptr) {
+    if (!eq && sh.gate16 && getenv("HC_UP_MIX_DIAG") != nullptr) {
         // where the two runs part: the knob-off run left its f16 gate in g16; a separate f32 GEMM gives the accumulator before
         // rounding. host(g16) = the dsv4_hc_pre.comp expression on the host over that gate
         const int64_t ne = M * sh.nt;
@@ -139,7 +139,7 @@ static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh
     lv[0] += 0.5f; ggml_backend_tensor_set(lo, lv.data(), 0, lv.size() * sizeof(float));
     run("1", out_pert, n_p);
     if (memcmp(out_on.data(), out_pert.data(), out_on.size() * sizeof(float)) == 0) { fprintf(stderr, "FAIL: positive control, a perturbed input left the output unchanged\n"); fails++; }
-    printf("%s n_embd=%lld nt=%lld k=%lld pad=%lld: byte-equal=%s fused dispatches on/off=%llu/%llu control=%s\n", fails ? "FAIL" : "ok",
+    printf("%s %s n_embd=%lld nt=%lld k=%lld pad=%lld: byte-equal=%s fused dispatches on/off=%llu/%llu control=%s\n", fails ? "FAIL" : "ok", sh.gate16 ? "f16-gate" : "f32-gate",
            (long long) sh.n_embd, (long long) sh.nt, (long long) sh.k, (long long) sh.pad, eq ? "yes" : "NO",
            (unsigned long long) n_on, (unsigned long long) n_off, memcmp(out_on.data(), out_pert.data(), out_on.size() * sizeof(float)) ? "differs" : "SAME");
     ggml_backend_buffer_free(buf);
@@ -159,6 +159,11 @@ int main() {
         { 2560, 2048, 320, 128, true },    // Flash-Next: hc_dim 10240, ub 2048, low rank 320, LLAMA_HC_XN_PAD 128
         { 2560, 2051, 320, 128, true },    // the 2051 tail
         {  128,    8,  96,   0, false },   // below the MUL_MAT_CPY16 shapes: unfused both ways, still byte-equal
+        // the f32-gate form (LLAMA_HC_GATE_F16=0): the unfused gate is the f32 accumulator, no rounding in the epilogue
+        {   64,  130,  96, 128, true, false },
+        { 2560, 2048, 320, 128, true, false },
+        { 2560, 2051, 320, 128, true, false },
+        {  128,    8,  96,   0, false, false },
     };
     int fails = 0;
     for (const auto & sh : shapes) fails += run_shape(be, reg, sh);

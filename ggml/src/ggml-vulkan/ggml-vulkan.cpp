@@ -7428,6 +7428,7 @@ struct vk_hcmix_args {
     ggml_tensor *       mixed;   // DSV4_HC_PRE's output: f32 [n_embd, N]
     const ggml_tensor * x;       // DSV4_HC_PRE's x: f16 [n_embd, 4, N] (the f16 hc norm output, possibly row-padded)
     float               scale;
+    bool                round16; // the unfused gate is f16 (MUL_MAT + CPY(f16)); false: f32 gate (LLAMA_HC_GATE_F16=0)
 };
 
 static void ggml_vk_matmul_hcmix(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline& pipeline, vk_subbuffer&& a, vk_subbuffer&& b,
@@ -7445,6 +7446,7 @@ static void ggml_vk_matmul_hcmix(ggml_backend_vk_context * ctx, vk_context& subc
     pc.hc_d_s1     = d_s1;
     pc.hc_scale    = hc.scale;
     pc.hc_zero     = 0;
+    pc.hc_round    = hc.round16 ? 1u : 0u;
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { a, b, ggml_vk_tensor_subbuffer(ctx, hc.mixed, true), ggml_vk_tensor_subbuffer(ctx, hc.x, true) }, pc, { m, n, 1 });
 }
@@ -8890,9 +8892,9 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
     if (ctx->fused_hc_up_mix) {
         // HC_UP_MIX: ggml_vk_can_fuse_hc_up_mix admitted a single 2-D int8 MMQ GEMM; its output is the HC pre's mixed stream
-        GGML_ASSERT(ctx->num_additional_fused_ops == 3 && !needs_split);
-        ggml_tensor * pre = cgraph->nodes[node_idx + 3];
-        const vk_hcmix_args hc { pre, pre->src[0], ggml_get_op_params_f32(pre, 0) };
+        GGML_ASSERT((ctx->num_additional_fused_ops == 3 || ctx->num_additional_fused_ops == 2) && !needs_split);
+        ggml_tensor * pre = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+        const vk_hcmix_args hc { pre, pre->src[0], ggml_get_op_params_f32(pre, 0), ctx->num_additional_fused_ops == 3 };
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, true, nullptr, &hc);
     } else if (ctx->fused_mm_cpy16) {
         // MUL_MAT+CPY(f16): ggml_vk_can_fuse_mm_cpy16 admitted only shapes the int8 MMQ GEMM takes
@@ -18542,21 +18544,39 @@ static bool ggml_vk_hc_up_mix_enabled() {
     return e == nullptr || atoi(e) != 0;
 }
 
-static bool ggml_vk_can_fuse_hc_up_mix(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    if (!ggml_vk_hc_up_mix_enabled() || node_idx + 3 >= cgraph->n_nodes) {
-        return false;
+// Two forms. f16 gate (LLAMA_HC_GATE_F16 on): MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE, returns 3 (the extra fused nodes); the
+// epilogue rounds each gate as the d16 store does. f32 gate: MUL_MAT + RESHAPE + DSV4_HC_PRE, returns 2; the unfused gate is the
+// int8 MMQ accumulator stored as f32, so the epilogue uses it as is. 0 = no match.
+static int ggml_vk_can_fuse_hc_up_mix(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_hc_up_mix_enabled() || node_idx + 2 >= cgraph->n_nodes) {
+        return 0;
     }
     const ggml_tensor * mm  = cgraph->nodes[node_idx];
-    const ggml_tensor * cpy = cgraph->nodes[node_idx + 1];
-    const ggml_tensor * rs  = cgraph->nodes[node_idx + 2];
-    const ggml_tensor * pre = cgraph->nodes[node_idx + 3];
-    if (rs->op != GGML_OP_RESHAPE || pre->op != GGML_OP_DSV4_HC_PRE || rs->src[0] != cpy || pre->src[1] != rs ||
-        ggml_get_op_params_i32(pre, 1) == 0) {
-        return false;
+    const bool f16_gate = cgraph->nodes[node_idx + 1]->op == GGML_OP_CPY;
+    const int n_extra = f16_gate ? 3 : 2;
+    if (node_idx + n_extra >= cgraph->n_nodes) {
+        return 0;
     }
-    // MUL_MAT + CPY(f16) as the int8 MMQ GEMM takes it (the store the epilogue reproduces)
-    if (!ggml_vk_can_fuse_mm_cpy16(ctx, cgraph, node_idx)) {
-        return false;
+    const ggml_tensor * cpy = f16_gate ? cgraph->nodes[node_idx + 1] : nullptr;
+    const ggml_tensor * rs  = cgraph->nodes[node_idx + n_extra - 1];
+    const ggml_tensor * pre = cgraph->nodes[node_idx + n_extra];
+    if (rs->op != GGML_OP_RESHAPE || pre->op != GGML_OP_DSV4_HC_PRE || rs->src[0] != (f16_gate ? cpy : mm) || pre->src[1] != rs ||
+        ggml_get_op_params_i32(pre, 1) == 0) {
+        return 0;
+    }
+    if (f16_gate) {
+        // MUL_MAT + CPY(f16) as the int8 MMQ GEMM takes it (the store the epilogue reproduces)
+        if (!ggml_vk_can_fuse_mm_cpy16(ctx, cgraph, node_idx)) {
+            return 0;
+        }
+    } else {
+        // the unfused f32 GEMM must be the same int8 MMQ kernel with the same K order: no split-k (K < 2048), not routed to
+        // the f16-B coopmat path, and the shapes MUL_MAT_CPY16 admits
+        const uint32_t k = (uint32_t) mm->src[0]->ne[0];
+        if (!ggml_vk_mm_f16out_enabled() || !ggml_vk_mul_mat_f16out_ok(ctx, mm) || k >= 2048 ||
+            (ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_dense_f16coopmat(mm->src[0]->type, k, (uint32_t) mm->ne[1]))) {
+            return 0;
+        }
     }
     const ggml_tensor * x = pre->src[0];
     const int64_t n_embd = x->ne[0], nt = x->ne[2];
@@ -18564,17 +18584,20 @@ static bool ggml_vk_can_fuse_hc_up_mix(ggml_backend_vk_context * ctx, const stru
         mm->src[0]->type != GGML_TYPE_Q8_0 || mm->ne[0] != 4 * n_embd || mm->ne[1] != nt || mm->ne[2] != 1 || mm->ne[3] != 1 ||
         pre->type != GGML_TYPE_F32 || pre->ne[0] != n_embd || pre->ne[1] != nt || pre->nb[0] != sizeof(float) ||
         mm->src[0]->ne[0] % 32 != 0) {
-        return false;
+        return 0;
     }
     if (ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, (ggml_prec) mm->op_params[0], false, false, false, true) == nullptr) {
-        return false;
+        return 0;
     }
-    // the f16 gate is read only through the RESHAPE (a cast also lists itself as src[1]), the RESHAPE only by the HC pre
-    if ((cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || (rs->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-        ggml_node_get_use_count(cgraph, node_idx + 1) != 2 || ggml_node_get_use_count(cgraph, node_idx + 2) != 1) {
-        return false;
+    // the gate is read only through the RESHAPE (a cast also lists itself as src[1]), the RESHAPE only by the HC pre
+    if (f16_gate ? ((cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, node_idx + 1) != 2)
+                 : ((mm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, node_idx) != 1)) {
+        return 0;
     }
-    return true;
+    if ((rs->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, node_idx + n_extra - 1) != 1) {
+        return 0;
+    }
+    return n_extra;
 }
 
 // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores float16_t straight into the cast's destination (the f16 MoE
@@ -18962,14 +18985,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
-            } else if (ggml_vk_can_fuse_hc_up_mix(ctx, cgraph, i)) {
-                ctx->num_additional_fused_ops = 3;
+            } else if (const int hc_mix_extra = ggml_vk_can_fuse_hc_up_mix(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = hc_mix_extra;
                 ctx->fused_hc_up_mix = true;
-                fusion_string = "HC_UP_MIX";
-                op_srcs_fused_elementwise[0] = false;
-                op_srcs_fused_elementwise[1] = true;    // the cast's self-reference (see MUL_MAT_CPY16)
-                op_srcs_fused_elementwise[2] = true;    // the RESHAPE of the elided gate
-                op_srcs_fused_elementwise[3] = false;   // x is read at other indices than the mixed output
+                fusion_string = hc_mix_extra == 3 ? "HC_UP_MIX" : "HC_UP_MIX_F32G";
+                std::fill_n(op_srcs_fused_elementwise, hc_mix_extra + 1, false);   // x is read at other indices than the mixed output
+                op_srcs_fused_elementwise[hc_mix_extra - 1] = true;   // the RESHAPE of the elided gate
+                if (hc_mix_extra == 3) {
+                    op_srcs_fused_elementwise[1] = true;    // the cast's self-reference (see MUL_MAT_CPY16)
+                }
             } else if (ggml_vk_can_fuse_mm_cpy16(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_mm_cpy16 = true;
@@ -19615,6 +19639,17 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 add_pattern_alloc_deps({ GGML_OP_MUL_MAT, GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE }, first_unused + 3);
             }
             keep_pattern({ GGML_OP_MUL_MAT, GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE });
+            continue;
+        }
+        // the f32-gate form (LLAMA_HC_GATE_F16=0): MUL_MAT + RESHAPE + DSV4_HC_PRE
+        if (ggml_vk_hc_up_mix_enabled() &&
+            match_pattern({ GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE }, first_unused) &&
+            graph->nodes[first_unused + 1]->src[0] == graph->nodes[first_unused] &&
+            graph->nodes[first_unused + 2]->src[1] == graph->nodes[first_unused + 1]) {
+            if (params && params->add_alloc_dep) {
+                add_pattern_alloc_deps({ GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE }, first_unused + 2);
+            }
+            keep_pattern({ GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE });
             continue;
         }
         if (keep_topk_moe_pattern(topk_moe_early_softmax_norm)) {
