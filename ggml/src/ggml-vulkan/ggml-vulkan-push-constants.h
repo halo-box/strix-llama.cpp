@@ -21,6 +21,13 @@ struct vk_mat_mat_qsa_push_constants {
     uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;
 };
 
+// matmul_q8_0_q8_1_hcmix (HC_EPI in mul_mmq_cm1.comp): the plain push constants plus the x / mixed addressing and the mix scale
+struct vk_mat_mat_hcmix_push_constants {
+    vk_mat_mat_push_constants mm;
+    uint32_t hc_n_embd; uint32_t hc_x_offset; uint32_t hc_x_s1; uint32_t hc_x_s2; uint32_t hc_d_offset; uint32_t hc_d_s1;
+    float hc_scale;
+};
+
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
     uint32_t stride_a;

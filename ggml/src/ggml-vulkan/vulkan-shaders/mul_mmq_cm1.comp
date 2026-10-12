@@ -50,6 +50,11 @@ layout (binding = 2) writeonly buffer D2 {f16vec2 data_d2[];};
 // f32 output: four adjacent rows of a column go out as one 128-bit store
 layout (binding = 2) writeonly buffer D4 {vec4 data_d4[];};
 #endif
+#ifdef HC_EPI
+// HC_UP_MIX (wave 5): the qwen4exp hc up GEMM with the gated hc pre in its epilogue. The f16 hc norm output x [n_embd, 4, N]
+// is read here; D (binding 2) is the f32 mixed stream [n_embd, N]; the gate [4*n_embd, N] is never written.
+layout (binding = 3) readonly buffer X {float16_t data_x[];};
+#endif
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
@@ -93,6 +98,16 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+#ifdef HC_EPI
+    uint padded_n_unused;   // vk_mat_mat_push_constants.padded_N
+    uint hc_n_embd;         // n_embd; M = 4 * n_embd
+    uint hc_x_offset;       // element offset of x (f16 [n_embd, 4, N]) in binding 3
+    uint hc_x_s1;           // x element stride between streams
+    uint hc_x_s2;           // x element stride between tokens
+    uint hc_d_offset;       // element offset of the mixed output (f32 [n_embd, N]) in binding 2
+    uint hc_d_s1;           // mixed element stride between tokens
+    float hc_scale;
+#endif
 #endif
 } p;
 
@@ -189,6 +204,14 @@ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, 
 #include "mul_mm_id_funcs.glsl"
 #endif
 
+#ifdef HC_EPI
+// logical row L (i*4 + c) -> weight row c*n_embd + i; rows past M read row 0 (their results are never stored)
+uint hc_a_row_ib(const uint L) {
+    const uint phys = (L < p.M) ? ((L & 3u) * p.hc_n_embd + (L >> 2u)) : 0u;
+    return phys * (p.stride_a / BK);
+}
+#define A_ROW_IB(r) hc_a_row_ib(ir * BM + (r))
+#endif
 #include "mul_mmq_cm1_funcs.glsl"
 
 void main() {
@@ -296,7 +319,11 @@ void main() {
 #else
         batch_idx_a * (p.batch_stride_a / BK) +
 #endif
+#ifdef HC_EPI
+        start_k / BK;   // the tile's rows are added per row by A_ROW_IB (interleaved remap)
+#else
         (ir * BM * p.stride_a + start_k) / BK;
+#endif
 #ifdef MUL_MAT_ID
     uint pos_b_ib = 0;
 #else
@@ -610,6 +637,43 @@ void main() {
     }
 #else
     const uint offsets = batch_idx * p.batch_stride_d + ik * p.batch_stride_d * p.num_batches;
+
+#ifdef HC_EPI
+    // RDNA3/3.5 wave32 (the host creates this variant only there): the 32-bit pack shuffles give each lane rows 4j..4j+3 of
+    // its column = the 4 streams of element j. Bit-exact against MUL_MAT+CPY(f16) + DSV4_HC_PRE (gated, f16 x, f16 gate):
+    // the gate is rounded to f16 as the d16 store writes it, and the mix is the dsv4_hc_pre.comp expression, in its order.
+    {
+        const bool lo_half = gl_SubgroupInvocationID < 16;
+        [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+            [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                const uint tile_idx = r * cms_per_col + c;
+                const uint col_g = dc + c * TN + elem_col0;
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; e += 4) {
+                    const float a0 = float(sums[tile_idx * CM_ELEMS + e]);
+                    const float a1 = float(sums[tile_idx * CM_ELEMS + e + 1]);
+                    const float a2 = float(sums[tile_idx * CM_ELEMS + e + 2]);
+                    const float a3 = float(sums[tile_idx * CM_ELEMS + e + 3]);
+                    const float r0 = subgroupShuffleXor(lo_half ? a2 : a0, 16);
+                    const float r1 = subgroupShuffleXor(lo_half ? a3 : a1, 16);
+                    const vec4 v = lo_half ? vec4(a0, r0, a1, r1) : vec4(r0, a2, r1, a3);
+                    const uint row_g = dr + r * TM + 2u * e + (lo_half ? 0u : 4u);
+                    if (col_g < p.N && row_g + 3 < p.M) {
+                        const uint i0 = row_g >> 2u;
+                        const uint xb = p.hc_x_offset + i0 + col_g * p.hc_x_s2;
+                        float result = 0.0f;
+                        [[unroll]]
+                        for (uint ih = 0; ih < 4; ++ih) {
+                            const float wv = 1.0f / (1.0f + exp(-float(float16_t(v[ih]))));
+                            result = fma(float(data_x[xb + ih * p.hc_x_s1]), wv, result);
+                        }
+                        data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = p.hc_scale * result;
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
 
 #ifdef D16
     // RDNA3/3.5 wave32 accumulator: lane l holds column l % 16, rows (l / 16) + 2e. One shuffle with the lane

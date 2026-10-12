@@ -1,0 +1,106 @@
+// HC_UP_MIX exactness (wave 5): the Vulkan backend fuses MUL_MAT(q8_0 hc up weight, lo) + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) into
+// one int8 MMQ GEMM whose epilogue applies the gated mix. It must be BIT-EXACT with the unfused chain (the fork's HC_UP_MIX was turned
+// off because a non-exact epilogue made cached multi-turn and full re-prefill diverge). Runs each shape with GGML_VK_HC_UP_MIX=1 and =0
+// (the backend reads the knob per graph), requires byte-equal mixed outputs and the expected fused-dispatch counts, then perturbs one
+// input as a positive control (the output must change). Skips (exit 0) when there is no Vulkan device.
+
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <vector>
+
+typedef uint64_t (*fusion_count_t)(const char *);
+typedef void     (*fusion_reset_t)(void);
+
+struct shape { int64_t n_embd, nt, k, pad; bool expect_fused; };
+
+static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh) {
+    auto count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count");
+    auto reset = (fusion_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count_reset");
+    if (!count || !reset) { fprintf(stderr, "FAIL: no fusion counters\n"); return 1; }
+
+    ggml_init_params ip = { 32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    const int64_t M = 4 * sh.n_embd;
+    ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, sh.k, M);
+    ggml_tensor * lo  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sh.k, sh.nt);
+    ggml_tensor * xb  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, M + sh.pad, sh.nt);   // row-padded like LLAMA_HC_XN_PAD
+    ggml_tensor * x   = ggml_view_3d(ctx, xb, sh.n_embd, 4, sh.nt, sh.n_embd * sizeof(ggml_fp16_t), xb->nb[1], 0);
+    ggml_tensor * g   = ggml_mul_mat(ctx, w, lo);
+    ggml_tensor * g16 = ggml_cast(ctx, g, GGML_TYPE_F16);
+    ggml_tensor * rs  = ggml_reshape_3d(ctx, g16, sh.n_embd, 4, sh.nt);
+    ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx, x, rs, 0.25f);
+    ggml_set_output(mixed);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, mixed);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    if (!buf) { fprintf(stderr, "FAIL: alloc\n"); return 1; }
+
+    std::mt19937 rng(1234 + (int) sh.n_embd + (int) sh.nt);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float> wf(sh.k * M), lv(sh.k * sh.nt);
+    for (auto & v : wf) v = u(rng);
+    for (auto & v : lv) v = u(rng);
+    std::vector<uint8_t> wq(ggml_nbytes(w));
+    ggml_quantize_chunk(GGML_TYPE_Q8_0, wf.data(), wq.data(), 0, M, sh.k, nullptr);
+    std::vector<ggml_fp16_t> xv((M + sh.pad) * sh.nt);
+    for (auto & v : xv) v = ggml_fp32_to_fp16(u(rng));
+    ggml_backend_tensor_set(w, wq.data(), 0, wq.size());
+    ggml_backend_tensor_set(lo, lv.data(), 0, lv.size() * sizeof(float));
+    ggml_backend_tensor_set(xb, xv.data(), 0, xv.size() * sizeof(ggml_fp16_t));
+
+    std::vector<float> out_on(sh.n_embd * sh.nt), out_off(sh.n_embd * sh.nt), out_pert(sh.n_embd * sh.nt);
+    auto run = [&](const char * knob, std::vector<float> & out, uint64_t & n) {
+        setenv("GGML_VK_HC_UP_MIX", knob, 1);
+        reset();
+        ggml_backend_graph_compute(be, gf);
+        n = count("HC_UP_MIX");
+        ggml_backend_tensor_get(mixed, out.data(), 0, out.size() * sizeof(float));
+    };
+    uint64_t n_on = 0, n_off = 0, n_p = 0;
+    run("1", out_on, n_on);
+    run("0", out_off, n_off);
+    int fails = 0;
+    const bool eq = memcmp(out_on.data(), out_off.data(), out_on.size() * sizeof(float)) == 0;
+    size_t ndiff = 0; for (size_t i = 0; i < out_on.size(); ++i) ndiff += memcmp(&out_on[i], &out_off[i], sizeof(float)) != 0;
+    if (!eq) { fprintf(stderr, "FAIL n_embd=%lld nt=%lld k=%lld pad=%lld: fused != unfused in %zu of %zu values\n",
+                       (long long) sh.n_embd, (long long) sh.nt, (long long) sh.k, (long long) sh.pad, ndiff, out_on.size()); fails++; }
+    if (n_off != 0 || n_on != (sh.expect_fused ? 1u : 0u)) {
+        fprintf(stderr, "FAIL n_embd=%lld nt=%lld: HC_UP_MIX dispatches on=%llu off=%llu (expected %d / 0)\n",
+                (long long) sh.n_embd, (long long) sh.nt, (unsigned long long) n_on, (unsigned long long) n_off, sh.expect_fused ? 1 : 0); fails++; }
+    // positive control: one perturbed input must change the fused output (the comparison can fail)
+    lv[0] += 0.5f; ggml_backend_tensor_set(lo, lv.data(), 0, lv.size() * sizeof(float));
+    run("1", out_pert, n_p);
+    if (memcmp(out_on.data(), out_pert.data(), out_on.size() * sizeof(float)) == 0) { fprintf(stderr, "FAIL: positive control, a perturbed input left the output unchanged\n"); fails++; }
+    printf("%s n_embd=%lld nt=%lld k=%lld pad=%lld: byte-equal=%s fused dispatches on/off=%llu/%llu control=%s\n", fails ? "FAIL" : "ok",
+           (long long) sh.n_embd, (long long) sh.nt, (long long) sh.k, (long long) sh.pad, eq ? "yes" : "NO",
+           (unsigned long long) n_on, (unsigned long long) n_off, memcmp(out_on.data(), out_pert.data(), out_on.size() * sizeof(float)) ? "differs" : "SAME");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return fails;
+}
+
+int main() {
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name("Vulkan0");
+    if (!dev) { printf("test-hc-up-mix-exact: no Vulkan0 device, skipped\n"); return 0; }
+    ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const shape shapes[] = {
+        {   64,   64,  96,   0, true },
+        {   64,  130,  96, 128, true },    // ragged N, padded x rows
+        { 2560, 2048, 320, 128, true },    // Flash-Next: hc_dim 10240, ub 2048, low rank 320, LLAMA_HC_XN_PAD 128
+        { 2560, 2051, 320, 128, true },    // the 2051 tail
+        {  128,    8,  96,   0, false },   // below the MUL_MAT_CPY16 shapes: unfused both ways, still byte-equal
+    };
+    int fails = 0;
+    for (const auto & sh : shapes) fails += run_shape(be, reg, sh);
+    ggml_backend_free(be);
+    printf("test-hc-up-mix-exact: %s (%d failing checks)\n", fails ? "FAIL" : "OK", fails);
+    return fails ? 1 : 0;
+}

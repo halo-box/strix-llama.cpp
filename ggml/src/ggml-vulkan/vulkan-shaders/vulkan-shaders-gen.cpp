@@ -643,6 +643,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (!f16acc && coopmat && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
                      || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4")) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
+            if (matmul_id_type == MatMulIdType::NONE && tname == "q8_0") {
+                // HC_UP_MIX (wave 5): the qwen4exp hc up GEMM with the gated hc pre in its epilogue (f32 mixed output)
+                string_to_spv(shader_name + "_" + tname + "_q8_1_hcmix", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}, {"HC_EPI", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            }
             if (matmul_id_type == MatMulIdType::NONE || matmul_id_type == MatMulIdType::SUBGROUP) {
                 // f16 output for the MUL_MAT(_ID)(+MUL)+CPY(f16) fusions
                 string_to_spv(shader_name + "_" + tname + "_q8_1_d16", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"D_TYPE_VEC4", "f16vec4"}, {"D16", "1"}}), fp16, coopmat, coopmat2, f16acc);

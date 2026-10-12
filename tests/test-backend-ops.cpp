@@ -6706,6 +6706,62 @@ struct test_mul_mat_cpy16 : public test_case {
     }
 };
 
+// HC_UP_MIX_F16 (wave 5; Vulkan fusion name HC_UP_MIX; not the HIP test_hc_up_mix below, which covers the unfused-graph chain): the qwen4exp hc up GEMM + f16 gate cast + gated hc pre, fused on Vulkan into one int8 MMQ GEMM whose epilogue
+// applies the mix (the gate is never written). x is the f16 hc norm output, optionally row-padded (LLAMA_HC_XN_PAD). The CPU reference
+// runs the unfused chain; bit-exactness against Vulkan's own unfused chain is test-hc-up-mix-exact. GGML_VK_TEST_REQUIRE_HC_UP_MIX=1
+// fails a case unless the fusion ran exactly once (knob-aware: none with GGML_VK_HC_UP_MIX=0).
+struct test_hc_up_mix_f16 : public test_case {
+    const int64_t n_embd, nt, k, pad;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_UP_MIX_F16"; }
+    std::string vars() override { return VARS_TO_STR4(n_embd, nt, k, pad); }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+
+    test_hc_up_mix_f16(int64_t n_embd = 64, int64_t nt = 64, int64_t k = 96, int64_t pad = 0) : n_embd(n_embd), nt(nt), k(k), pad(pad) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, 4 * n_embd);
+        ggml_set_name(w, "w_up");
+        ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, nt);
+        ggml_set_name(lo, "lo");
+        ggml_tensor * xb = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 4 * n_embd + pad, nt);
+        ggml_set_name(xb, "xn");
+        ggml_tensor * x  = ggml_view_3d(ctx, xb, n_embd, 4, nt, n_embd * ggml_element_size(xb), xb->nb[1], 0);
+        ggml_tensor * g  = ggml_cast(ctx, ggml_mul_mat(ctx, w, lo), GGML_TYPE_F16);
+        ggml_set_name(g, "gate_f16");
+        ggml_tensor * out = ggml_dsv4_hc_pre_gated(ctx, x, ggml_reshape_3d(ctx, g, n_embd, 4, nt), 0.25f);
+        ggml_set_name(out, "mixed");
+        return out;
+    }
+
+    typedef uint64_t (*fusion_count_t)(const char *);
+    typedef void     (*fusion_reset_t)(void);
+    static void * backend_proc(ggml_backend_t backend, const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+    void before_compute(ggml_backend_t backend) override {
+        if (auto reset = (fusion_reset_t) backend_proc(backend, "ggml_backend_vk_fusion_count_reset")) {
+            reset();
+        }
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        static const bool require = [] { const char * e = getenv("GGML_VK_TEST_REQUIRE_HC_UP_MIX"); return e != nullptr && atoi(e) != 0; }();
+        static const bool knob_on = [] { const char * e = getenv("GGML_VK_HC_UP_MIX"); return e == nullptr || atoi(e) != 0; }();
+        auto count = (fusion_count_t) backend_proc(backend, "ggml_backend_vk_fusion_count");
+        if (!require || count == nullptr) {
+            return true;
+        }
+        const uint64_t n = count("HC_UP_MIX"), want = knob_on ? 1 : 0;
+        if (n != want) {
+            msg = "HC_UP_MIX dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        return true;
+    }
+};
+
 // GGML_OP_MUL_MAT
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
@@ -13033,6 +13089,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_cpy16(t, 201, 33, 256)); // odd M: the unpacked f16 store
     }
     test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, 10240, 2048, 320));
+    // HC_UP_MIX: exact and ragged tiles, padded x rows, the Flash-Next shape (n_embd 2560, low rank 320, ub 2048) and its 2051 tail
+    test_cases.emplace_back(new test_hc_up_mix_f16(64, 64, 96, 0));
+    test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128));
+    test_cases.emplace_back(new test_hc_up_mix_f16(256, 33, 320, 8));
+    test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2048, 320, 128));
+    test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128));
     // MUL_MAT_ID (+ MUL) + CPY(f16) on the pf-capable expert types, f32 and f16 B: exact and ragged tiles, the weighted down
     // projection, and the Flash-Next REAP-320 shapes (64 rows per expert at 2048 tokens). Int8 twins by default; the routed f16-B
     // pf twins under GGML_VK_MMID_F16COOPMAT=all with GGML_VK_TEST_REQUIRE_MMID_F16OUT=1 (wave 4)

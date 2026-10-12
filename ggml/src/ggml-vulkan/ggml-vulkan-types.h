@@ -264,10 +264,11 @@ struct vk_matmul_pipeline_key {
     bool glu = false;   // d16 MUL_MAT_ID gate projection storing silu(gate) * up (the MUL_MAT_ID+CPY(f16)+SWIGLU fusion)
     bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl, GGML_VK_MM_PREFETCH)
     bool xl = false;    // the 256x256 XL tile tier of the pf variant (aligned only, ggml_vk_mm_xl_ok); on MUL_MAT_ID keys the REG_A tile; on the F32 x F32 dense key the QSA scorer epilogue variant
+    bool hcmix = false; // the int8 MMQ hc up GEMM with the gated hc pre in its epilogue (HC_UP_MIX, mul_mmq_cm1.comp HC_EPI)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl, hcmix)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl, o.hcmix);
     }
 };
 
@@ -1399,6 +1400,7 @@ struct ggml_backend_vk_context {
     int fused_hc_post_norm {};
     // MUL_MAT+CPY(f16): the matmul stores f16 into the cast's destination
     bool fused_mm_cpy16 {};
+    bool fused_hc_up_mix {};   // MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) -> one int8 MMQ GEMM with the mix epilogue
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
