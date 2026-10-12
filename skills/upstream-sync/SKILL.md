@@ -135,20 +135,21 @@ mkdir -p $L
 for t in base cand; do ../sync-$t/build/bin/test-backend-ops -b ROCm0 > $L/ops-$t.txt 2>&1; done
 diff <(grep -E 'FAIL' $L/ops-base.txt | sort) <(grep -E 'FAIL' $L/ops-cand.txt | sort) && echo "ops: no new failure"
 
-# 3. logits vs baseline on the target model, per corpus, short and long context
-for f in ../sync-cand/tests/corpus/correctness-*.txt; do
-  n=$(basename $f .txt)
-  # llama-perplexity needs at least 2 x n_ctx tokens: repeat the corpus to about 200 KB (well over 32768 tokens)
-  : > $L/$n.txt; while [ $(stat -c %s $L/$n.txt) -lt 200000 ]; do cat $f >> $L/$n.txt; done
-  sha256sum $L/$n.txt >> $L/corpus.sha256
-  for mode in short long; do
-    if [ $mode = short ]; then A="-c 2048 -b 2048 -ub 2048"; R="-c 2048 -b 2048 -ub 512"; else A="-c 16384 -b 512 -ub 512"; R="-c 16384 -b 256 -ub 256"; fi
-    A="-m $M -ngl 99 -fa on -ctk f16 -ctv f16 $A"; R="-m $M -ngl 99 -fa on -ctk f16 -ctv f16 $R"
-    ../sync-base/build/bin/llama-perplexity $A -f $L/$n.txt --kl-divergence-base $L/$n-$mode.kld > $L/$n-$mode-base.txt 2>&1
-    ../sync-cand/build/bin/llama-perplexity $A --kl-divergence-base $L/$n-$mode.kld --kl-divergence > $L/$n-$mode-cand.txt 2>&1
-    ../sync-base/build/bin/llama-perplexity $R --kl-divergence-base $L/$n-$mode.kld --kl-divergence > $L/$n-$mode-ref.txt 2>&1
-  done
+# 3. logits vs baseline on the target model: each corpus at -c 2048, all four together at -c 16384 (several ubatches per chunk)
+#    the corpora are long enough without repetition (tests/corpus/README.md); a repeated text is mostly copied by the model
+C=../sync-cand/tests/corpus
+cat $C/correctness-prose.txt $C/correctness-code.txt $C/correctness-structured.txt $C/correctness-numeric.txt > $L/all.txt
+sha256sum $C/correctness-*.txt $L/all.txt > $L/corpus.sha256
+run() {  # <name> <file> <args> <reference args>
+  local O="-m $M -ngl 99 -fa on -ctk f16 -ctv f16"
+  ../sync-base/build/bin/llama-perplexity $O $3 -f $2 --kl-divergence-base $L/$1.kld > $L/$1-base.txt 2>&1
+  ../sync-cand/build/bin/llama-perplexity $O $3 --kl-divergence-base $L/$1.kld --kl-divergence > $L/$1-cand.txt 2>&1
+  ../sync-base/build/bin/llama-perplexity $O $4 --kl-divergence-base $L/$1.kld --kl-divergence > $L/$1-ref.txt 2>&1
+}
+for n in prose code structured numeric; do
+  run $n $C/correctness-$n.txt "-c 2048 -b 2048 -ub 2048" "-c 2048 -b 2048 -ub 512"
 done
+run long $L/all.txt "-c 16384 -b 512 -ub 512" "-c 16384 -b 256 -ub 256"
 grep -H -E 'Mean PPL\(Q\)/PPL\(base\)|Mean +KLD|Same top p' $L/*-cand.txt $L/*-ref.txt
 
 # 4. performance A/B (AGENTS.md command shape), alternating order
@@ -180,7 +181,7 @@ Pass criteria:
 |---|---|
 | 1. build | both builds succeed |
 | 2. ops | no FAIL in the candidate that is not in the baseline |
-| 3. logits, for each corpus and both modes | `Same top p` of the candidate >= the reference minus 0.5 points, `Mean KLD` <= 2 x the reference + 0.0001, `PPL(Q)/PPL(base)` within 1 +/- 0.01. The reference run is the baseline against itself with a smaller ubatch: other kernel paths, both correct |
+| 3. logits, for each of the 5 runs | `Same top p` of the candidate >= the reference minus 0.5 points, `Mean KLD` <= 2 x the reference + 0.0001, `PPL(Q)/PPL(base)` within 1 +/- 0.01. The reference run is the baseline against itself with a smaller ubatch: other kernel paths, both correct |
 | 4. performance | pp and tg overlap the baseline within their standard deviations at every depth. Paste the raw tables |
 | 5. server | a valid `get_weather` call on both builds; the same decode text, or the first differing token explained by an upstream change in the step range; MTP acceptance rate within 5 points of the baseline (drop `--spec-type draft-mtp` if the model has no MTP head, and say so) |
 
