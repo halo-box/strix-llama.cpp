@@ -2,7 +2,7 @@ name: Upstream sync report
 
 # Every 3 days, post the upstream sync plan (skills/upstream-sync/sync.sh report) to one open issue.
 # It only reports: it never merges or pushes. The sync itself follows skills/upstream-sync/SKILL.md.
-# Note: */3 restarts on the 1st of each month, so two runs can be one day apart at month end.
+# Note: */3 restarts on the 1st of each month, so two runs can be one to three days apart at month end.
 
 on:
   schedule:
