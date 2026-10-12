@@ -22,6 +22,8 @@ Bring `upstream/master` (ggml-org/llama.cpp) into `master` (halo-box/strix-llama
 ```sh
 git remote add upstream https://github.com/ggml-org/llama.cpp   # once
 git config rerere.enabled true                                  # remember resolutions across steps and retries
+# rerere replays any resolution it recorded, also a throwaway one from a test (the cache is shared by all worktrees).
+# After a test merge, run `git rerere forget <file>` for each file, or clear .git/rr-cache.
 skills/upstream-sync/sync.sh report
 ```
 
@@ -73,6 +75,8 @@ ctest --test-dir build-check -L main --output-on-failure -j 8
 ```
 
 This catches API breaks in shared code (common/, src/, server, ggml core) and tokenizer regressions. It does not compile the HIP kernels. If ROCm is installed, also run the HIP build from step 7.
+
+`test-tokenizers-ggml-vocabs` needs `git lfs`. Without it, the test reads LFS pointer files and fails with `invalid magic characters: 'vers'`. That is not a merge failure.
 
 ### 6. Push and open a draft PR on the fork
 
