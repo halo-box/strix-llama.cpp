@@ -90,9 +90,27 @@ A clean step can still break a fork kernel (for example a changed signature in `
 
 `test-tokenizers-ggml-vocabs` needs `git lfs`. Without it, the test reads LFS pointer files and fails with `invalid magic characters: 'vers'`. That is not a merge failure.
 
-Then go back to step 2 for the next step of this sync.
+Then go back to step 2 for the next step of this sync, unless a stop rule below applies.
+
+### When to stop a sync
+
+Stop **before** the next step, and open the PR with the steps already merged, when one of these is true:
+
+1. **The resolution is not clear.** For example upstream rewrote a function that the fork patches, or upstream added its own version of a fork feature (MTP, QSA, the UMA ring).
+2. **The PR is big enough to review and validate.** About 3 sensitive steps, or about 10 conflicted files in total. Adjust with the user.
+3. **A validation fails** and the cause is not found quickly.
+
+An upstream PR cannot be skipped: every later upstream commit contains it. A hard step waits for its own sync PR:
+
+- put it alone in a draft PR that describes the problem;
+- ask the authors of the fork code it touches, or the maintainers, which behaviour to keep;
+- as a last resort, take the upstream version and port the fork feature onto it, with `llama-bench` and KLD numbers (see "upstream wins" above).
+
+Meanwhile `master` stays at the last merged step: nothing breaks, the fork is only a few days behind.
 
 ### 6. Push and open a draft PR on the fork
+
+If the last merged upstream commit is not the one in the branch name (the plan shifted, or the sync stopped early), rename the branch first: `git branch -m sync/upstream-<date>-<sha of the last merged upstream commit>`.
 
 ```sh
 git push -u origin HEAD
