@@ -1,4 +1,8 @@
-# Syncing halo-box/llama.cpp with upstream
+# Syncing strix-llama.cpp with upstream
+
+Upstream is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). halo-box/llama.cpp is archived and is no
+longer synced. The fork merges upstream `master` every 3 days with the `upstream-sync` skill, and never rebases
+`master`: it is a shared branch, and a rebase would force-push over every contributor and open PR.
 
 ## Why GitHub says "N commits behind" after a sync
 
@@ -37,6 +41,9 @@ puts newer upstream code on an older tree.
 commit. Since the revert of #155 it is 86ea01d05 (2026-09-29), while `git merge-base` says
 71ad0590f (2026-10-08).
 
+Once the content base is past 71ad0590f, history and content agree again. Then delete the file:
+`sync.sh` falls back to `git merge-base`, and a plain `git merge upstream/master` is safe again.
+
 ## When a PR + squash was unavoidable
 
 If divergence forced the sync through a PR (conflict resolution needs review), the content
@@ -74,7 +81,8 @@ git merge -s ours upstream/master -m "Record upstream sync (content applied via 
 cannot change a single file, so it cannot break the build. Its only danger is burying an
 upstream change we failed to apply, which is exactly what step 1 rules out.
 
-Never run `-s ours` before the audit.
+Never run `-s ours` before the audit. If `scripts/upstream-sync.base` exists, set it to the same upstream commit in
+a follow-up commit, or the next `sync.sh merge` starts from the old base.
 
 ## Verifying a sync
 

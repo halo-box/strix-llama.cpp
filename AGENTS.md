@@ -62,7 +62,7 @@ correct, in scope, measured, and small enough to review.
    effort is the most common waste here. Check upstream too; the fix may already exist there.
 3. **Keep it reviewable.** One concern per PR. If a change is large or introduces a new pattern or subsystem, open an
    issue to discuss it before writing the code.
-4. **Stay mergeable with upstream.** This fork rebases onto upstream `master`. Prefer small, local, clearly delimited
+4. **Stay mergeable with upstream.** This fork merges upstream `master` every 3 days and never rebases `master` (see `SYNC.md`). Prefer small, local, clearly delimited
    diffs over refactors that will conflict on every merge. Do not reformat untouched code.
 5. **Disclose.** Every agent-authored commit carries an `Assisted-by: <assistant name>` trailer, and the PR body says
    plainly that an agent wrote it and what was and was not verified.
