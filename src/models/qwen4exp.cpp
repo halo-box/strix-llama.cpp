@@ -1662,7 +1662,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     return cur;
 }
 
-// LLAMA_FN_LAST_ATTN_TRIM=1 (default off): in the last layer, run the queries, the indexer queries, the selection and the
+// LLAMA_FN_LAST_ATTN_TRIM (default on, =0 off): in the last layer, run the queries, the indexer queries, the selection and the
 // attention only for the last score strip of the ubatch, [q_first, n_tokens), when every output row lies in it (a prefill
 // ubatch whose only output is its last token). K/V and the indexer keys of every row are still stored, so the cache is the
 // same; the FFN half of the last layer is already trimmed to the output rows. Port of Gufo's final-layer query-tile pruning
@@ -1670,7 +1670,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 // the GEMMs and the attention stay on their prefill paths), but a GEMM over fewer columns may take another tile size:
 // not bit-identical by construction, KL-gated.
 static bool qwen4exp_last_attn_trim() {
-    static const bool on = [] { const char * e = getenv("LLAMA_FN_LAST_ATTN_TRIM"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("LLAMA_FN_LAST_ATTN_TRIM"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 
