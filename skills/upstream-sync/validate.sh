@@ -103,9 +103,8 @@ OUT=$(cd "$OUT" && pwd)
 SMALL=$(realpath "$SMALL")
 [ -z "$PR" ] || cp "$PR_BODY" "$OUT/pr-body.md"
 
-for p in llama-server llama-cli llama-bench llama-perplexity llama-completion; do
-    if pgrep -x "$p" > /dev/null; then die "the GPU is busy: $(pgrep -a -x "$p")"; fi
-done
+# match the command line: pgrep -x only sees the first 15 characters of a name (llama-perplexity has 16)
+if busy=$(pgrep -af '(^|/)llama-(server|cli|bench|perplexity|completion)( |$)'); then die "the GPU is busy: $busy"; fi
 
 flags() { case $1 in hip) echo "-DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang" ;; vk) echo "-DGGML_VULKAN=ON" ;; cpu) echo "" ;; esac; }
 dev()   { case $1 in hip) echo ROCm0 ;; vk) echo Vulkan0 ;; cpu) echo CPU ;; esac; }
