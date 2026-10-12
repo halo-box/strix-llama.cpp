@@ -115,7 +115,7 @@ All contributors must follow this flow for backend and performance work, regardl
     - `tests/corpus/correctness-code.txt`
     - `tests/corpus/correctness-structured.txt`
     - `tests/corpus/correctness-numeric.txt`
-    - Hash each corpus and use the same bytes for upstream and candidate. If more tokens are required, repeat the corpus deterministically and save the resulting prompt before either run.
+    - Hash each corpus and use the same bytes for upstream and candidate. Each corpus has more than 4096 tokens and the four together more than 32768, so no repetition is needed up to `-c 16384` (see `tests/corpus/README.md`). A repeated text is mostly copied by the model and hides small errors.
 
 5. **Run the target model matrix**
     - Validate the current target model on every affected backend.
