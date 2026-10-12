@@ -7,6 +7,7 @@
 #include "llama-ple-async.h"
 
 #include <algorithm>
+#include <numeric>
 #include <thread>
 #include <unordered_map>
 #include <cinttypes>
@@ -962,6 +963,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
+    // f16 output norm at prefill (cparams.fused_gdn_norm_f16, probe-resolved; LLAMA_GDN_NORM_F16=0 opts out): emit RMS_NORM,
+    // MUL(gamma), SIGMOID(z), MUL, CPY(f16) back to back, which the Vulkan backend runs as one pass (RMS_NORM_MUL_SIGMUL_CPY)
+    // writing only the f16 B operand of ssm_out: no sigmoid pass, no f32 norm output and no B conversion in the GEMM (port
+    // of the fork's GDN norm f16, Strata's GDN_NOY; FN REAP-320 on the fork, 10-07: +2-3% prefill, PPL 3.7972 vs 3.7973).
+    // The GEMM's B was rounded to 8 bits from f32 before; now from f16. Prefill only (32+ tokens, as the probe), no LoRA
+    // (a LoRA delta takes no f16 B), and not for a bf16 out projection (no bf16 x f16 shader).
+    const ggml_tensor * w_out = model.layers[layer].ssm_out;
+    if (cparams.fused_gdn_norm_f16 && n_tokens >= 32 && loras->empty() && w_out != nullptr && w_out->type != GGML_TYPE_BF16) {
+        ggml_build_forward_expand(gf, gate);   // gate's own view nodes go ahead of the chain
+        ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+        ggml_tensor * out = ggml_mul(ctx0, normalized, ggml_sigmoid(ctx0, gate));
+        // LLAMA_GDN_NORM_PAD=N (f16 elements, rounded down to a multiple of 8; default 128, 0 = off): write the f16 rows with a
+        // token stride of value_dim + N, only where the packed stride camps (a multiple of 256 B sharing a factor of 8+ with
+        // the 16 channels). Flash-Next's value_dim 6144 f16 is 48 x 256 B, so packed, every token row starts on the same DRAM
+        // channel for ssm_out; 6272 is 49 x 256 B. One buffer per graph (pad_buf), shared by the GDN layers.
+        static const int64_t pad = [] { const char * e = getenv("LLAMA_GDN_NORM_PAD"); return e ? (int64_t) (atoi(e) & ~7) : (int64_t) 128; }();
+        const int64_t row = out->ne[0] * out->ne[1];
+        if (pad > 0 && (row * 2) % 256 == 0 && std::gcd<int64_t>(row * 2 / 256, 16) >= 8 && out->ne[3] == 1) {
+            ggml_tensor * buf = pad_buf(&gdn_norm_pad_buf, row + pad, out->ne[2], "gdn_norm_pad");
+            ggml_tensor * dst = ggml_view_4d(ctx0, buf, out->ne[0], out->ne[1], out->ne[2], 1,
+                    out->ne[0] * ggml_element_size(buf), buf->nb[1], buf->nb[1] * out->ne[2], 0);
+            // the destination's VIEW node goes into the graph ahead of the chain (see build_hc_mix)
+            ggml_build_forward_expand(gf, dst);
+            return ggml_cpy(ctx0, out, dst);
+        }
+        return ggml_cast(ctx0, out, GGML_TYPE_F16);
+    }
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
 
@@ -1828,11 +1856,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // a padded f16 norm output (LLAMA_GDN_NORM_PAD) is viewed, not reshaped: ssm_out reads its rows through the stride
+    ggml_tensor * final_output = ggml_is_contiguous(attn_out_norm)
+            ? ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs)
+            : ggml_view_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs,
+                    attn_out_norm->nb[2], attn_out_norm->nb[3], 0);
     cb(final_output, "final_output", il);
 
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);
+    if (final_output->type == GGML_TYPE_F16) {
+        res->add_fused_node({LLM_FUSED_OP_GDN_NORM_F16, cur, il});
+    }
 
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
 

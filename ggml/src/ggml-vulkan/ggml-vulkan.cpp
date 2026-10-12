@@ -3921,6 +3921,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_small_f32,   "rms_norm_mul_small_f32",   rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1},       1, true, false, sg);
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_mul_small_f32, "rms_norm_mul_mul_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true, false, sg);
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_scale_small_f32, "rms_norm_scale_small_f32", rms_norm_small_f32_len, rms_norm_small_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0, 0, 1}, 1, true, false, sg);
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_sigmul_small_f32_f16, "rms_norm_mul_sigmul_small_f32_f16", rms_norm_small_f32_f16_len, rms_norm_small_f32_f16_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1, 0, 1}, 1, true, false, sg);
     }
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_partials_f32, "rms_norm_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_partials_f32, "rms_norm_mul_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
@@ -13951,6 +13952,14 @@ static void ggml_vk_rms_norm_small(ggml_backend_vk_context * ctx, vk_context& su
         post_scale = ggml_get_op_params_f32(dst, 0);
         pipeline = ctx->device->pipeline_rms_norm_scale_small_f32;
         break;
+    case RMS_NORM_MUL_SIGMUL_CPY: {
+        // RMS_NORM, MUL(gamma), SIGMOID(z), MUL, CPY(f16): z is the SIGMOID's source, the destination the CPY's
+        const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+        src1 = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+        src2 = cgraph->nodes[node_idx + 2]->src[0];
+        dst  = cgraph->nodes[node_idx + 4];
+        pipeline = ctx->device->pipeline_rms_norm_mul_sigmul_small_f32_f16;
+    } break;
     default:
         GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
         break;
@@ -13989,6 +13998,7 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     const ggml_tensor * src0 = rms->src[0];
 
     if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_MUL || ctx->fused_rms_norm_mode == RMS_NORM_SCALE ||
+        ctx->fused_rms_norm_mode == RMS_NORM_MUL_SIGMUL_CPY ||
         ((ctx->fused_rms_norm_mode == RMS_NORM_COUNT || ctx->fused_rms_norm_mode == RMS_NORM_MUL) &&
          ggml_vk_rms_norm_small_ok(ctx, src0, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]))) {
         ggml_vk_rms_norm_small(ctx, subctx, cgraph, node_idx, op_params[0]);
@@ -17331,6 +17341,82 @@ static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, c
     return true;
 }
 
+// the qwen4exp GDN output norm in the order LLAMA_GDN_NORM_F16 emits it: RMS_NORM, MUL(gamma), SIGMOID(z), MUL, CPY(f16)
+static constexpr std::initializer_list<ggml_op> gdn_norm_f16_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_CPY };
+static bool ggml_vk_gdn_norm_f16_wiring(const ggml_cgraph * g, int i) {
+    if (i + 5 > g->n_nodes) {
+        return false;
+    }
+    ggml_tensor * const * n = g->nodes + i;
+    return n[0]->op == GGML_OP_RMS_NORM && n[1]->op == GGML_OP_MUL && (n[1]->src[0] == n[0] || n[1]->src[1] == n[0]) &&
+           n[2]->op == GGML_OP_UNARY && ggml_get_unary_op(n[2]) == GGML_UNARY_OP_SIGMOID &&
+           n[3]->op == GGML_OP_MUL && ((n[3]->src[0] == n[1] && n[3]->src[1] == n[2]) || (n[3]->src[0] == n[2] && n[3]->src[1] == n[1])) &&
+           n[4]->op == GGML_OP_CPY && n[4]->src[0] == n[3] && n[4]->type == GGML_TYPE_F16;
+}
+
+// RMS_NORM_MUL_SIGMUL_CPY (short rows): the GDN output norm writing only the f16 B operand of ssm_out, saving the sigmoid
+// pass, the f32 norm output and the GEMM's own B conversion (port of the fork's GDN norm f16, Strata's GDN_NOY). The SIGMOID
+// does not consume the MUL before it, so the chain is matched as a subgraph whose one output is the CPY. The destination's
+// rows are packed; its outer strides may be padded (LLAMA_GDN_NORM_PAD). GGML_VK_GDN_NORM_F16=0 disables (the chain then
+// runs as RMS_NORM_MUL, SIGMOID, MUL, CPY).
+// GGML_VK_FUSION_DEBUG=1: the first time each reason rejects a chain wired as the GDN norm f16 pattern, say so
+static bool ggml_vk_gdn_norm_f16_reject(const char * why) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    static std::set<std::string> seen;
+    if (dbg && seen.insert(why).second) {
+        fprintf(stderr, "ggml_vulkan: RMS_NORM_MUL_SIGMUL_CPY not taken: %s\n", why);
+    }
+    return false;
+}
+
+static bool ggml_vk_can_fuse_gdn_norm_f16(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    static const bool enabled = [] { const char * e = getenv("GGML_VK_GDN_NORM_F16"); return e == nullptr || atoi(e) != 0; }();
+    if (!enabled) {
+        return false;
+    }
+    if (!ggml_vk_gdn_norm_f16_wiring(cgraph, node_idx)) {
+        static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+        if (dbg && node_idx + 4 < cgraph->n_nodes && cgraph->nodes[node_idx]->op == GGML_OP_RMS_NORM &&
+            cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
+            fprintf(stderr, "ggml_vulkan: RMS_NORM at node %d not wired as the GDN norm f16 chain: %s %s %s %s %s\n", node_idx,
+                    ggml_op_desc(cgraph->nodes[node_idx]), ggml_op_desc(cgraph->nodes[node_idx + 1]), ggml_op_desc(cgraph->nodes[node_idx + 2]),
+                    ggml_op_desc(cgraph->nodes[node_idx + 3]), ggml_op_desc(cgraph->nodes[node_idx + 4]));
+        }
+        return false;
+    }
+    if (!ggml_vk_fuse_norm_extra_enabled() || ctx->device->pipeline_rms_norm_mul_sigmul_small_f32_f16 == nullptr) {
+        return ggml_vk_gdn_norm_f16_reject("no short-row norm pipeline (or GGML_VK_FUSE_NORM_EXTRA=0)");
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, gdn_norm_f16_pattern, { node_idx + 4 })) {
+        return ggml_vk_gdn_norm_f16_reject("an intermediate node has another reader (or is an output)");
+    }
+    const ggml_tensor * rms  = cgraph->nodes[node_idx];
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * sig  = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * mul2 = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * cpy  = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * x     = rms->src[0];
+    const ggml_tensor * gamma = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    const ggml_tensor * z     = sig->src[0];
+    if (x->type != GGML_TYPE_F32 || x->ne[0] > 256 || !ggml_is_contiguous_rows(x) || ctx->do_add_rms_partials) {
+        return ggml_vk_gdn_norm_f16_reject("x is not f32 short packed rows (or add-rms partials are on)");
+    }
+    if (gamma->type != GGML_TYPE_F32 || !ggml_can_repeat(gamma, mul) || mul->type != GGML_TYPE_F32 ||
+        z->type != GGML_TYPE_F32 || mul2->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(z) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(mul2) ||
+        !ggml_are_same_shape(rms, mul) || !ggml_are_same_shape(z, mul2) || !ggml_are_same_shape(mul, mul2) ||
+        get_misalign_bytes(ctx, z) != 0) {
+        return ggml_vk_gdn_norm_f16_reject("gamma / z / the MULs are not f32, packed and dst-shaped");
+    }
+    // the f16 destination: rows packed, outer strides free (a padded view); the kernel stores through dst strides
+    if (cpy->type != GGML_TYPE_F16 || !ggml_are_same_shape(cpy, mul2) || cpy->nb[0] != sizeof(ggml_fp16_t) ||
+        cpy->nb[1] != cpy->ne[0] * sizeof(ggml_fp16_t) || cpy->nb[2] < cpy->nb[1] * cpy->ne[1] ||
+        cpy->nb[3] < cpy->nb[2] * cpy->ne[2]) {
+        return ggml_vk_gdn_norm_f16_reject("the f16 destination's rows are not packed");
+    }
+    return true;
+}
+
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
@@ -18889,6 +18975,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_VIEW_SET_ROWS;
                 fusion_string = "RMS_NORM_VIEW_SET_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_vk_can_fuse_gdn_norm_f16(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 4;
+                ctx->fused_rms_norm_mode = RMS_NORM_MUL_SIGMUL_CPY;
+                fusion_string = "RMS_NORM_MUL_SIGMUL_CPY";
+                // the f16 rows are half the size of the f32 rows read: an overlap of x, gamma or z with the destination
+                // would be a race, so only the cast's src[1] (its own destination, or the padded view it writes) is
+                // elementwise. graph_optimize keeps those sources allocated through the CPY.
+                std::fill_n(op_srcs_fused_elementwise, 4, false);
+                op_srcs_fused_elementwise[4] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL_MUL;
@@ -19071,6 +19166,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                             }
                             if (!found) {
                                 need_disable = true;
+                                static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+                                if (dbg && fusion_string) {
+                                    fprintf(stderr, "ggml_vulkan: %s disabled at node %d: source %s (%s) of fused node %d overlaps the output %s\n",
+                                            fusion_string, i, src->name, ggml_op_desc(src), k, dst->name);
+                                }
                             }
                         }
                     }
@@ -19435,6 +19535,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
 
+        // RMS_NORM_MUL_SIGMUL_CPY: the SIGMOID does not read the MUL before it, so a reorder could pull it away; the fused
+        // kernel reads x, gamma and z while it writes the f16 rows, so they stay allocated through the CPY
+        if (ggml_vk_gdn_norm_f16_wiring(graph, first_unused) && match_pattern(gdn_norm_f16_pattern, first_unused)) {
+            if (params && params->add_alloc_dep) {
+                add_pattern_alloc_deps(gdn_norm_f16_pattern, first_unused + (int) gdn_norm_f16_pattern.size() - 1);
+            }
+            keep_pattern(gdn_norm_f16_pattern);
+            continue;
+        }
         if (keep_pattern(rms_norm_mul_add_mul_pattern)) {
             continue;
         }
@@ -19663,7 +19772,19 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
+            // RMS_NORM_MUL_SIGMUL_CPY: protect every node of a wired chain. The SIGMOID reads z, not the MUL, so with z's
+            // producer still in the current set this pass would take RMS_NORM and MUL alone and let empty nodes in behind them
+            // (gated_norm_order declines that case); the chain then never reaches keep_pattern intact
+            auto const &in_gdn_norm_f16 = [&](int n) -> bool {
+                for (int o = 0; o < (int) gdn_norm_f16_pattern.size(); ++o) {
+                    if (n - o >= first_unused && match_pattern(gdn_norm_f16_pattern, n - o) && ggml_vk_gdn_norm_f16_wiring(graph, n - o)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
             if (match_pattern(topk_moe_early_softmax_norm, j) ||
+                in_gdn_norm_f16(j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
                 match_pattern(topk_moe_early_softmax, j) ||

@@ -654,6 +654,7 @@ enum rms_norm_mode {
     RMS_NORM_VIEW_SET_ROWS,
     RMS_NORM_MUL_MUL,   // short rows only: normalised * gamma * gate
     RMS_NORM_SCALE,     // short rows only: scale(rms_norm(x))
+    RMS_NORM_MUL_SIGMUL_CPY, // short rows only: f16(normalised * gamma * sigmoid(z)), the qwen4exp GDN output norm
     RMS_NORM_COUNT,
 };
 
@@ -910,6 +911,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_small_f32;          // one subgroup per row, ne00 <= 256
     vk_pipeline pipeline_rms_norm_mul_small_f32;
     vk_pipeline pipeline_rms_norm_mul_mul_small_f32;  // + second multiplier (gated norm)
+    vk_pipeline pipeline_rms_norm_mul_sigmul_small_f32_f16;  // gated norm with sigmoid(z), f16 store (LLAMA_GDN_NORM_F16)
     vk_pipeline pipeline_rms_norm_scale_small_f32;    // + SCALE (the GDN q/k l2 norm)
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;

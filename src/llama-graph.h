@@ -55,6 +55,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
     LLM_FUSED_OP_MOE_F16,           // f16 MoE activations: expert down projection with an f16 B (build_moe_ffn prefill)
+    LLM_FUSED_OP_GDN_NORM_F16,      // f16 GDN output norm: the qwen4exp ssm_out projection with an f16 B (prefill)
 };
 
 enum llm_ffn_op_type : int {

@@ -171,6 +171,13 @@ static const llm_fused_op_probe llm_fused_op_moe_f16_probe = {
     /*.n_tokens_per_seq =*/ 32,
 };
 
+// the f16 GDN output norm (qwen4exp): the ssm_out projection takes an f16 B. n_tokens_per_seq matches the qwen4exp prefill threshold
+static const llm_fused_op_probe llm_fused_op_gdn_norm_f16_probe = {
+    /*.op               =*/ LLM_FUSED_OP_GDN_NORM_F16,
+    /*.name             =*/ "f16 GDN output norm",
+    /*.n_tokens_per_seq =*/ 32,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COMB,
     /*.name             =*/ "fused DeepSeek V4 HC comb",
@@ -368,6 +375,13 @@ llama_context::llama_context(
     // LLAMA_MOE_F16=0 keeps the MoE expert activations in f32 at prefill
     if (const char * env = getenv("LLAMA_MOE_F16")) {
         cparams.fused_moe_f16 = atoi(env) != 0;
+    }
+
+    cparams.fused_gdn_norm_f16 = true;
+    cparams.auto_fgdnn16       = true;
+    // LLAMA_GDN_NORM_F16=0 keeps the qwen4exp GDN output norm in f32 at prefill
+    if (const char * env = getenv("LLAMA_GDN_NORM_F16")) {
+        cparams.fused_gdn_norm_f16 = atoi(env) != 0;
     }
 
     // with causal attention, the batch size is limited by the context size
@@ -775,6 +789,27 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         }
         resolve(llm_fused_op_moe_f16_probe, cparams.fused_moe_f16);
         cparams.auto_fmoe16 = false;
+    }
+
+    if (cparams.auto_fgdnn16) {
+        // The f16 GDN output norm pays off where the norm kernel stores f16 itself, which no CPU path does: 32+ tokens per
+        // sequence and every layer on a non-CPU device. The probe then keeps it only where the layer's device takes the f16 B
+        // in the ssm_out projection (elsewhere the graph is the f32 one).
+        bool gdn_f16_devs = model.arch == LLM_ARCH_QWEN4EXP;   // the only graph that emits it: no probe reserve for others
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                gdn_f16_devs = false;
+                break;
+            }
+        }
+        cparams.fused_gdn_norm_f16 = cparams.fused_gdn_norm_f16 && gdn_f16_devs &&
+            llm_fused_op_gdn_norm_f16_probe.n_tokens_per_seq*n_seqs <= cparams.n_ubatch;
+        if (cparams.fused_gdn_norm_f16) {
+            LLAMA_LOG_INFO("%s: resolving f16 GDN output norm support:\n", func);
+        }
+        resolve(llm_fused_op_gdn_norm_f16_probe, cparams.fused_gdn_norm_f16);
+        cparams.auto_fgdnn16 = false;
     }
 }
 

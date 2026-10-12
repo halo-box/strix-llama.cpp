@@ -4559,6 +4559,112 @@ struct test_rms_norm_mul_mul : public test_case {
     }
 };
 
+// RMS_NORM + MUL(gamma) + SIGMOID(z) + MUL + CPY(f16), then the ssm_out projection: the qwen4exp GDN output norm under
+// LLAMA_GDN_NORM_F16, in the node order qwen4exp emits (Vulkan fuses the five as RMS_NORM_MUL_SIGMUL_CPY, writing only
+// the f16 rows). pad > 0: the f16 rows land in a view of one [ne0*ne1 + pad, ne2] buffer (LLAMA_GDN_NORM_PAD), its VIEW
+// node ahead of the chain, and ssm_out reads them through the stride. Allocated through the scheduler so graph_optimize
+// runs (it must keep the chain together). Fails unless the fused norm ran (and, padded at prefill widths, the row-strided B).
+struct test_gdn_norm_f16 : public test_case {
+    const std::array<int64_t, 3> ne;   // head_v_dim, heads, tokens
+    const int64_t pad;
+    const ggml_type type_out;
+    std::vector<ggml_tensor *> verify;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_NORM_F16";
+    }
+    std::string vars() override { return VARS_TO_STR3(ne, pad, type_out); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_gdn_norm_f16(std::array<int64_t, 3> ne = {128, 48, 33}, int64_t pad = 0, ggml_type type_out = GGML_TYPE_Q8_0)
+        : ne(ne), pad(pad), type_out(type_out) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE && t->view_src == nullptr) init_tensor_uniform(t);
+        }
+    }
+
+    typedef uint64_t (*fusion_count_t)(const char *);
+    typedef void     (*fusion_reset_t)(void);
+    static void * backend_proc(ggml_backend_t backend, const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+    void before_compute(ggml_backend_t backend) override {
+        if (auto reset = (fusion_reset_t) backend_proc(backend, "ggml_backend_vk_fusion_count_reset")) {
+            reset();
+        }
+    }
+    static bool knob_on(const char * name) {
+        const char * e = getenv(name);
+        return e == nullptr || atoi(e) != 0;
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        auto count = (fusion_count_t) backend_proc(backend, "ggml_backend_vk_fusion_count");
+        if (count == nullptr) {
+            return true;   // not the Vulkan backend
+        }
+        const bool fuse = knob_on("GGML_VK_GDN_NORM_F16") && knob_on("GGML_VK_FUSE_NORM_EXTRA") && knob_on("GGML_VK_NORM_SMALL");
+        struct { const char * name; uint64_t want_min, want_max; } checks[] = {
+            { "RMS_NORM_MUL_SIGMUL_CPY", fuse ? 1u : 0u, fuse ? 1u : 0u },
+            { "MUL_MAT_ROWSTRIDE_B", pad > 0 && ne[2] > 8 && knob_on("GGML_VK_ROWSTRIDE") ? 1u : 0u,
+                                     pad > 0 && ne[2] > 8 && knob_on("GGML_VK_ROWSTRIDE") ? 1u : 0u },
+        };
+        for (const auto & c : checks) {
+            const uint64_t n = count(c.name);
+            if (n < c.want_min || n > c.want_max) {
+                msg = std::string(c.name) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(c.want_min) + ")";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        const int64_t row = ne[0] * ne[1];
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+        ggml_set_name(x, "x");
+        ggml_set_input(x);
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(gamma, "gamma");
+        // z as the model has it: a reshape of a flat projection output, expanded ahead of the chain
+        ggml_tensor * z_flat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, ne[2]);
+        ggml_set_name(z_flat, "z");
+        ggml_set_input(z_flat);
+        ggml_tensor * z = ggml_reshape_3d(ctx, z_flat, ne[0], ne[1], ne[2]);
+        if (gf) { ggml_build_forward_expand(gf, z); }
+        ggml_tensor * dst = nullptr;
+        if (pad > 0) {
+            ggml_tensor * buf = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, row + pad, ne[2]);
+            ggml_set_name(buf, "gdn_norm_pad");
+            dst = ggml_view_3d(ctx, buf, ne[0], ne[1], ne[2], ne[0] * ggml_element_size(buf), buf->nb[1], 0);
+            if (gf) { ggml_build_forward_expand(gf, dst); }
+        }
+        ggml_tensor * normalized = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), gamma);
+        ggml_tensor * gated = ggml_mul(ctx, normalized, ggml_sigmoid(ctx, z));
+        ggml_tensor * y = dst ? ggml_cpy(ctx, gated, dst) : ggml_cast(ctx, gated, GGML_TYPE_F16);
+        ggml_set_name(y, "y16");
+        if (gf) { ggml_build_forward_expand(gf, y); }
+        verify.push_back(y);
+        ggml_tensor * y2 = dst ? ggml_view_2d(ctx, y, row, ne[2], y->nb[2], 0) : ggml_reshape_2d(ctx, y, row, ne[2]);
+        ggml_tensor * w_out = ggml_new_tensor_2d(ctx, type_out, row, 64);
+        ggml_set_name(w_out, "w_out");
+        ggml_tensor * out = ggml_mul_mat(ctx, w_out, y2);
+        ggml_set_name(out, "out");
+        verify.push_back(out);
+        for (ggml_tensor * t : verify) {
+            ggml_set_output(t);
+        }
+        return out;
+    }
+};
+
 // build_gdn_l2_norm: scale(rms_norm(x, eps/n), 1/sqrt(n)), fused on Vulkan as RMS_NORM_SCALE for short rows.
 // v: the input is a strided view (the GDN q/k are column slices of the conv output).
 struct test_rms_norm_scale : public test_case {
@@ -13787,6 +13893,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_mul_mul({128, 48, 33, 1}, 1e-6f, gated, true));
         test_cases.emplace_back(new test_rms_norm_mul_mul({512, 4, 3, 1}, 1e-6f, gated));   // too wide for the short-row kernel
     }
+    // LLAMA_GDN_NORM_F16 / LLAMA_GDN_NORM_PAD (Flash-Next: 128 x 48 heads; 7 tokens = a decode-sized ssm_out, which copies B)
+    for (int64_t pad : {0, 128}) {
+        for (int64_t tokens : {7, 33, 513}) {
+            test_cases.emplace_back(new test_gdn_norm_f16({128, 48, tokens}, pad));
+        }
+    }
+    test_cases.emplace_back(new test_gdn_norm_f16({128, 16, 64}, 8, GGML_TYPE_Q4_K));
+    test_cases.emplace_back(new test_gdn_norm_f16({100, 6, 40}, 0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}));
     test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}, 1e-6f, true));
     test_cases.emplace_back(new test_rms_norm_scale({100, 3, 5, 2}));
