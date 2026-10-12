@@ -1,23 +1,155 @@
-At sunrise the research vessel left the harbor and followed the eastern channel. The sea was calm, but a narrow bank of fog covered the distant markers. The crew checked the compass, compared the paper chart with the digital display, and recorded the time of each observation.
+CHAPTER IV.
 
-Mara kept the log. She wrote short sentences because every statement had to be checked later. At 06:15 the engine speed was steady. At 06:40 the wind shifted north. At 07:05 a red buoy appeared on the port side, exactly where the chart predicted.
+LITTLE TIMPEY.
 
-The purpose of the trip was simple: repeat the same survey under controlled conditions. The instruments measured temperature, pressure, salinity, and current speed. Each reading was stored twice, once in the local recorder and once in a sealed backup unit.
+I do not think I have ever seen a prettier face than that child's. She had light brown hair, and round rosy cheeks, and the bluest of blue eyes.
 
-During the second hour, the fog lifted. Low hills became visible beyond the water, and sunlight reached the deck. The crew did not change the plan. They continued along the numbered stations, stopped for three minutes at each point, and used the same procedure for every sample.
+She awoke as we were looking at her, and seeing herself amongst strangers, she cried bitterly.
 
-A good experiment depends on ordinary discipline. Names must remain consistent. Units must be written beside values. Missing observations must be marked as missing rather than replaced with convenient estimates. If a device reports an impossible value, the operator must preserve the original record before investigating the cause.
+'Poor little thing!' said Mrs. Millar. 'She wants her mother.'
 
-At noon the vessel turned west. The return route crossed the morning track at two places. Those intersections provided useful checks because the water should have similar properties when measured only a few hours apart. Small differences were expected; large differences would require another survey.
+'Mam--ma! Ma--ma!' cried the little girl, as she caught the word.
 
-The final station was close to the harbor wall. Traffic had increased, and the wake from a ferry disturbed the surface. Mara noted the disturbance, waited until the waves had passed, and repeated the measurement. Both readings stayed in the log.
+Mrs. Millar fairly broke down at this, and sobbed and cried as much as the child.
 
-Back on shore, the team copied the files to a workstation. One person verified file sizes and hashes while another compared timestamps against the paper log. They found no missing stations. The duplicate records matched byte for byte.
+'Come, my lass,' said her husband, 'cheer up! Thee'll make her worse, if thee takes on so.'
 
-The analysis began the next morning. The team first plotted the raw measurements without smoothing them. Then they applied the planned calibration and produced a second set of plots. The order mattered: raw evidence had to remain available so that every later transformation could be explained.
+But Mrs. Millar could do nothing but cry. 'Just think if it was our Polly!' was all that she could say. 'Oh, Jem, just think if it was our Polly that was calling for me!'
 
-The report separated observations from conclusions. It described the route, weather, instruments, and procedure before discussing patterns in the data. It also listed the limitations of the survey. A single calm day could describe local conditions, but it could not represent every season or every storm.
+My grandfather took the child from her, and put her on my knee. 'Now, Mary,' he said, 'get us a bit of fire and something to eat, there's a good woman! The child's cold and hungered, and we're much about the same ourselves.'
 
-When the review was complete, Mara archived the input files, scripts, plots, and written notes together. A future team should be able to repeat the work without guessing which settings had been used. Reproducibility was treated as part of the result, not as an optional task after the result.
+Mrs. Millar bustled about the house, and soon lighted a blazing fire; then she ran in next door to see if her children, whom she had left with a little servant girl, were all right, and she brought back with her some cold meat for our breakfast.
 
-The harbor lights came on as the team left the building. The vessel was already prepared for another trip. Nothing about the process was dramatic, yet the careful sequence of checks made the measurements trustworthy.
+I sat down on a stool before the fire, with the child on my knee. She seemed to be about two years old, a strong, healthy little thing. She had stopped crying now, and did not seem to be afraid of me; but whenever any of the others came near she hid her face in my shoulder.
+
+Mrs. Millar brought her a basin of bread and milk, and she let me feed her.
+
+She seemed very weary and sleepy, as if she could hardly keep her eyes open. 'Poor wee lassie!' said my grandfather; 'I expect they pulled her out of her bed to bring her on deck. Won't you put her to bed?'
+
+'Yes,' said Mrs. Millar, 'I'll put her in our Polly's bed; she'll sleep there quite nice, she will.'
+
+But the child clung to me, and cried so loudly when Mrs. Millar tried to take her, that my grandfather said,--
+
+'I wouldn't take her away, poor motherless lamb; she takes kindly to Alick; let her bide here.'
+
+So we made up a little bed for her on the sofa; and Mrs. Millar brought one of little Polly's nightgowns, and undressed and washed her, and put her to bed.
+
+The child was still very shy of all of them but me. She seemed to have taken to me from the first, and when she was put into her little bed she held out her tiny hand to me, and said, 'Handie, Timpey's handie.'
+
+'What does she say? bless her!' said Mrs. Millar, for it was almost the first time that the child had spoken.
+
+'She wants me to hold her little hand,' I said, 'Timpey's little hand. Timpey must be her name!'
+
+'I never heard of such a name,' said Mrs. Millar. 'Timpey, did you say? What do they call you, darling?' she said to the child.
+
+But the little blue eyes were closing wearily, and very soon the child was asleep. I still held that tiny hand in mine as I sat beside her; I was afraid of waking her by putting it down.
+
+'I wonder who she is,' said Mrs. Millar, in a whisper, as she folded up her little clothes. 'She _has_ beautiful things on, to be sure! She has been well taken care of, anyhow! Stop, here's something written on the little petticoat; can you make it out, Alick?'
+
+I laid down the little hand very carefully, and took the tiny petticoat to the window.
+
+'Yes,' I said, 'this will be her name. Here's _Villiers_ written on it.
+
+'Dear me!' said Mrs. Millar. 'Yes, that will be her name. Dear me, dear me; to think of her poor father and mother at the bottom of that dreadful sea! Just think if it was our Polly!' And then Mrs. Millar cried so much again that she was obliged to go home and finish her cry with her little Polly clasped tightly in her arms.
+
+My grandfather was very worn out with all he had done during the night, and went upstairs to bed. I sat watching the little sleeping child. I felt as if I could not leave her.
+
+She slept very quietly and peacefully. Poor little pet! how little she knows what has happened, I thought; and my tears came fast, and fell on the little fat hand which was lying on the pillow. But after a few minutes I leaned my head against the sofa, and fell fast asleep. I had had no sleep the night before, and was quite worn out.
+
+I was awakened, some hours after, by some one pulling my hair, and a little voice calling in my ear, 'Up! up, boy! up! up!'
+
+I looked up, and saw a little roguish face looking at me--the merriest, brightest little face you can imagine.
+
+'Up, up, boy, please!' she said again, in a coaxing voice.
+
+So I lifted up my head, and she climbed out of her little bed on the sofa on to my knee.
+
+'Put shoes on, boy,' she said, holding out her little bare toes.
+
+I put on her shoes and stockings, and then Mrs. Millar came in and dressed her.
+
+It was a lovely afternoon; the storm had ceased whilst we had been asleep, and the sun was shining brightly. I got the dinner ready, and the child watched me, and ran backwards and forwards, up and down the kitchen. She seemed quite at home now and very happy.
+
+My grandfather was still asleep, so I did not wake him. Mrs. Millar brought in some broth she had made for the child, and we dined together. I wanted to feed her, as I had done the night before, but she said,--
+
+'Timpey have 'poon, please!' and took the spoon from me, and fed herself so prettily, I could not help watching her.
+
+'God bless her, poor little thing!' said Mrs. Millar.
+
+'God bless 'ou,' said the child. The words were evidently familiar to her.
+
+'She must have heard her mother say so,' said Mrs. Millar, in a choking voice.
+
+When we had finished dinner, the child slipped down from her stool, and ran to the sofa. Here she found my grandfather's hat, which she put on her head, and my scarf, which she hung round her neck. Then she marched to the door, and said, 'Tatta, tatta; Timpey go tatta.'
+
+'Take her out a bit, Alick,' said Mrs. Millar. 'Stop a minute, though; I'll fetch her Polly's hood.' So, to her great delight, we dressed her in Polly's hood, and put a warm shawl round her, and I took her out.
+
+Oh! how she ran, and jumped, and played in the garden. I never saw such a merry little thing. Now she was picking up stones, now she was gathering daisies ('day days, she called them), now she was running down the path and calling to me to catch her. She was never still a single instant!
+
+But every now and then, as I was playing with her, I looked across the sea to Ainslie Crag. The sea had not gone down much, though the wind had ceased, and I saw the waves still dashing wildly upon the rocks.
+
+And I thought of what lay beneath them, of the shattered ship, and of the child's mother. Oh! if she only knew, I thought, as I listened to her merry laugh, which made me more ready to cry than her tears had done.
+
+CHAPTER V.
+
+THE UNCLAIMED SUNBEAM.
+
+My grandfather and Jem Millar were sitting over the fire in the little watchroom in the lighthouse tower, and I sat beside them with the child on my knee. I had found an old picture-book for her, and she was turning over the leaves, and making her funny little remarks on the pictures.
+
+'Well, Sandy,' said Millar, 'what shall we do with her?'
+
+'_Do_ with her?' said my grandfather stroking her little fair head. 'We'll keep her! Won't we, little lassie?'
+
+CHAPTER VII
+
+THE BELL ROCK AND SKERRYVORE LIGHTS
+
+At first sight it seems somewhat remarkable--some might feel disposed to challenge the assertion--that so small a country as Scotland should stand pre-eminent among the nations of the world as being that possessed of the greatest number of imposing sea-rock lights. But such is the case. Moreover, North Britain offers some of the finest and most impressive specimens of the lighthouse builder's resource and skill to be found in any part of the globe.
+
+When the responsibility for lighting the Scottish coasts was handed over to the Commissioners for Northern Lighthouses, one of their first tasks was the adequate illumination of the wave-swept Inchcape or Bell Rock, which lies some twelve miles off the Scottish mainland in the busy portal of the Firth of Tay. At that time this sinister menace to navigation was not marked in any way whatever, and apparently had remained in this unprotected condition ever since the notorious pirate, Ralph the Rover, cut away the buoy-bell which had been placed upon it by the Abbot of Aberbrothock, as narrated in Southey's famous ballad.
+
+The rock, or rather reef--inasmuch as it measures 2,000 feet from end to end, and lies athwart the fairway--is submerged completely to a depth of 16 feet at high spring-tides, while at lowest water only some 4 feet of its crest are laid bare here and there. This is not all. The ledge is the summit of a dangerous, slowly-rising submarine hillock, where, for a distance of about 100 yards on either side, the lead sounds only 3 fathoms. Wrecks were so numerous and terrible at this spot that the protection of the seafaring community became imperative, and the newly-appointed guardians of the Scottish coast lost no time in justifying the trust reposed in them, but erected a first-class light. The Eddystone had been conquered, and, although the conditions were dissimilar and the enterprise bolder, no tangible reason against its imitation was advanced.
+
+The engineer John Rennie was entrusted with the work, while Robert Stevenson was appointed as his assistant. The rock was surveyed, and a tower similar in its broad lines to that evolved by Smeaton for the Eddystone was elaborated, and the authority for its construction given in the year 1806.
+
+Work upon the rock in the earliest stages was confined to the calmest days of the summer season, when the tides were lowest, the water was smoothest, and the wind in its calmest mood. Under such conditions the men were able to stay on the site for about five hours. The engineer hoped against hope that the elements would be kind to him, and that he would be able to complete the preliminary work upon the rock in one season.
+
+The constructional plans were prepared carefully, so that advantage might be taken of every promising opportunity. One distinct drawback was the necessity to establish a depot some distance from the erecting site. Those were the days before steam navigation, and the capricious sailing craft offered the only means of maintaining communication between rock and shore, and for the conveyance of men and material to and fro. The year 1807 was devoted to the construction of vessels for the work, and to the establishment of workshops with machinery and other facilities at Arbroath, the nearest suitable point on the mainland to the rock. A temporary beacon was placed on the reef, while adjacent to the site selected for the tower a smith's forge was made fast, so as to withstand the dragging motion of the waves when the rock was submerged. The men were housed on the _Smeaton_, which during the spells of work on the rock rode at anchor a short distance away in deep water. The arrangements stipulated that three boats, which were employed to bring the men from the vessel to the rock, should always be moored at the landing-place, so that, in the event of the weather changing for the worse, the masons, forced to cease work suddenly, might regain the _Smeaton_ safely in one trip, the three boats being able to convey thirty men, which constituted the average complement on the rock.
+
+While the preparations were proceeding ashore, a little body of workers toiled, whenever possible, at clearing the face of the rock and carrying out the requisite excavation work. While this was in progress a disaster was averted very narrowly, which would have jeopardized the completion of the tower, owing to the superstitious natures of the men engaged. On September 2, 1807, the _Smeaton_, as usual, had brought out some thirty masons, had landed them safely on the rock, and was riding at anchor.
+
+Suddenly the wind freshened, and the engineer on the rock grew apprehensive of the _Smeaton_ dragging her cables. A party at once put off from the rock in one of the three boats and regained the ship, but were scarcely aboard when the cables parted, and the vessel, caught by the wind and tide, made off. Before the men regained control of her she had drifted some three miles to leeward. Meantime on the rock the situation was growing serious. Only Mr. Stevenson, who was supervising operations on the spot, and the landing-master were aware of its gravity. The masons were so busy hewing, boring and chiselling, that they had not noticed the _Smeaton's_ drift. But the engineer, observing the flowing of the tide, realized that the rock must be submerged before the ship could be brought up again. He racked his brains to find some means of getting his gang of men off safely in the nick of time, but it was a searching problem to solve with only two boats, which, at the utmost, could carry twenty-four persons. To make matters worse, one of those mists which are so peculiar to the Scottish coast began to settle down, blotting everything from sight.
+
+The water rose higher. The men toiling on the lowest levels receded higher and higher before the advancing tide, though still too deeply occupied in their labours to bestow a thought upon the _Smeaton_. At last the smith's forge was quenched, and this was the general signal to the men to prepare to leave the rock. Tools were collected, and the party strode towards the landing-stage to enter the boats. Conceive their consternation when they saw that one boat was missing! When they glanced over the water the _Smeaton_ was not riding in her usual place--in fact, was nowhere to be seen! One and all gathered around the engineer to learn the reason for this remarkable breach in the arrangements for their safety, and yet all were too dumbfounded to question or protest. As for the luckless engineer, he was at his wits' end and could not offer a word of explanation to the inquiring looks that besieged him. One and all, as the water lapped their feet, realized the hopelessness of the position. Suddenly, when they were beginning to despair, one of the men described the phantom form of a vessel making for the rock. "A boat!" he shouted in exultation. Sure enough the shadow matured into the familiar form of the Tay pilot-boat, the master of which, observing the workmen on the rock, the rising tide, and the absence of the _Smeaton_, had realized that something must have gone wrong, and approached the rock to make inquiries. He came up at the critical moment. The men were drenched, and, their feelings having been strung to a high pitch with anxiety, they nearly collapsed at the arrival of this unexpected assistance. The pilot-boat, after taking off the men, awaited the return of the _Smeaton_, which took them on board about midnight.
+
+CHAPTER X.
+
+Steamers on the Pacific.--The TELICA (1825).--P. S. N. Co., 1840.--Compound Engines adopted, 1856.--Service extended from West Coast, South America, to the River Plate (1865), and to Liverpool, 1868.--The P. S. N. Co. and Messrs. Anderson Anderson & Co., 1878.--Gulf Line of Steamers between Great Britain and West Coast, South America.
+
+The first steamer to trade along the Pacific Coast of South America was a small steamer, named the TELICA, in 1825. She was owned and commanded by a Spaniard bearing a Russian name, Mitrovitch. The venture proved a failure, chiefly owing to the scarcity of fuel, and the unfortunate man, in a fit of despair, fired his pistol into a barrel of gunpowder, and blew up his vessel in the harbour of Guayaquil, destroying himself and all on board, except one man.
+
+The next person to attempt to establish steamship communication along the Pacific Coast was an American citizen, Mr. William Wheelwright, born in Newburyport, Mass., U.S.A., in 1798, and appointed United States Consul at Guayaquil in 1824. Mr. Wheelwright, notwithstanding the tragic fate of the TELICA and her owner, was convinced of the importance of steam communication to the development of the rich resources of the western side of the South American Continent, spent six years in arranging plans for steam communication between the different Republics, and at last obtained from the Peruvian, Bolivian, and Chilian Governments the privilege of establishing and maintaining a steamship service along their respective coasts for a period of ten years. In pursuance of this object he came to England, and secured the co-operation of several wealthy merchants, and on the 17th February, 1840, a charter was obtained for the establishment of the undertaking known as the Pacific Steam Navigation Company, together with a small subsidy for the conveyance of the mails. It was not the intention of the founders of the company to trade elsewhere than along the Pacific Coast, and for this purpose a capital of a quarter of a million pounds was thought to be sufficient. The capital consisted of 5,000 shares, 50 each. Only the amount required to build two small steamers was called up. These steamers were the CHILI and PERU, each of about 700 tons gross register, with engines of about 150 horse-power nominal. They were brig-rigged paddle steamers, built of wood, by Charles Young and Co., Limehouse, London, and engined by Miller & Ravenhall.
+
+Owing in great measure to the scarcity of fuel on the coast, the company, during the first five years of its existence, sustained a loss of four-fifths of its paid-up capital, but the shareholders courageously resolved to persevere with their undertaking. The seat of management of the company was, however, transferred from London to Liverpool (1846), and the late Mr. William Just appointed Managing Director. The following year (1847), the Directors were for the first time able to declare a dividend, a modest two-and-a-half per cent.
+
+In 1850, having obtained an extension of the Government Postal contract, the Directors ordered four steamers, at a total cost of 140,000. These steamers were named the LIMA, SANTIAGO, QUITO and BOGOTA, and were each of about 1,000 tons gross and 300 horse-power nominal.
+
+In 1856 the company's service was re-organised by Mr. Just, who visited the West Coast specially for that purpose. During the same year the compound type of engines was adopted in the company's steamers, the Pacific Steam Navigation Company being thus one of the earliest ocean steamship companies to use this type of engine.
+
+A supplemental charter was obtained in 1865, extending the operations of the company, and authorising steamship communication between the West Coast of South America, and the River Plate on the East Coast.
+
+As the profits of the company had been steadily increasing for a number of years prior to 1867, it was resolved at a meeting of shareholders, held in December of that year, to establish a monthly line of steamers from Liverpool to the West Coast of South America, _via_ the Straits of Magellan, and to increase the capital of the company to 2,000,000.
+
+The first new steamer of the new service was the PACIFIC, 1,630 tons gross register, 1,174 tons net, with engines of 450 horse-power. Her principal dimensions were, length 267 feet, beam 40 feet, depth 17 feet. She was built on the Clyde in 1864, by Randolph Elder & Co., and cost 61,855. After trading for about three years on the Pacific Coast, she sailed from Valparaiso for Liverpool in May, 1868, as the pioneer steamer of the new mail service. During this year five steamers of about 3,000 tons each, specially built for the maintenance of this service, were added to the company's fleet. These were the JOHN ELDER, MAGELLAN, PATAGONIA, ARAUCANIA and CORDILLERA.
+
+So profitable was the Liverpool trade to the West Coast, the Directors determined in 1870 to make the sailings fortnightly, and in that year they added the steamers CHIMBORAZO, CUZCO, GARONNE, LUSITANIA and ACONCAGUA to the fleet.
+
+In December, 1871 they recommended a further increase of the company's capital to 3,000,000, with a view of making the service from Liverpool a weekly one. During the year they had greatly increased the number of the company's ocean steamers, having built in 1871 seven steamers, each of about 4,000 tons gross, viz., the SORATA, ILLIMANI, COTOPAXI, GALICIA, CORCOVADO, PUNO and POTOSI.
+
+In July, 1872, the capital of the company was raised to 4,000,000, and the steamers VALPARAISO and BRITANNIA were added to its fleet, and in the following year the IBERIA and LIGURIA.
+
+In addition to the above steamers, which were all built for the Liverpool to West Coast service, the Pacific Steam Navigation Company built during the years 1869 to 1873 inclusive, eighteen steamers for its Pacific Coast service.
+
+The IBERIA and LIGURIA were the last of the barque-rigged, clipper-bow type of steamer built for the Pacific Steam Navigation Company. The succeeding vessels of the fleet have as a rule four pole masts and a straight stem.
+
+Although the trade between Liverpool and the West Coast of South America had increased with marvellous rapidity, the increase in the company's tonnage had more than kept pace with it. It was found that the combined passenger and cargo trade would not support a sailing each week, and the sailings were reduced to two each month. As a consequence of the reduced number of sailings, as many as nine of the company's steamers were at one time laid up for want of employment. In 1878 the Directors were fortunately able to charter four of their vessels, the CHIMBORAZO, LUSITANIA, CUZCO and GARONNE, to Messrs. Anderson, Anderson & Co., who in that year founded the Orient Line of steamers from London to Australia. In 1882, when the latter company decided to double its sailings, the Pacific Steam Navigation Company made arrangements to employ several additional steamers in the Australian service. Although the Pacific Company was the first to establish steamship communication between Great Britain and the West Coast of South America, it has had to share the traffic in later years with the Gulf Line of steamers belonging to the Greenock Shipping Company, and with the steamers belonging to Messrs. Lamport & Holt.

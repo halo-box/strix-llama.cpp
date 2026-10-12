@@ -1,61 +1,887 @@
-#include <algorithm>
-#include <array>
-#include <cstdint>
-#include <numeric>
-#include <string>
-#include <vector>
+static void llama_sampler_temp_impl(llama_token_data_array * cur_p, float temp) {
+    if (cur_p->size == 0) {
+        return;
+    }
 
-struct sample {
-    int id;
-    float weight;
-    std::array<int, 4> shape;
+    if (temp <= 0.0f) {
+        // find the token with the highest logit and set the rest to -inf
+        size_t max_i = 0;
+        float  max_l = cur_p->data[0].logit;
+
+        for (size_t i = 1; i < cur_p->size; ++i) {
+            if (cur_p->data[i    ].logit > max_l) {
+                cur_p->data[max_i].logit = -INFINITY;
+                max_i = i;
+                max_l = cur_p->data[i].logit;
+            } else {
+                cur_p->data[i].logit = -INFINITY;
+            }
+        }
+
+        return;
+    }
+
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cur_p->data[i].logit /= temp;
+    }
+}
+
+static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_sort) {
+    GGML_ASSERT(cur_p->size > 0);
+
+    // Sort the logits in descending order if requested
+    if (do_sort && !cur_p->sorted) {
+        llama_token_data_array_partial_sort_inplace(cur_p, cur_p->size);
+    }
+
+    float max_l = cur_p->data[0].logit;
+    if (!cur_p->sorted) {
+        for (size_t i = 1; i < cur_p->size; ++i) {
+            max_l = std::max(max_l, cur_p->data[i].logit);
+        }
+    }
+
+    float cum_sum = 0.0f;
+
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        float p = expf(cur_p->data[i].logit - max_l);
+        cur_p->data[i].p = p;
+        cum_sum += p;
+    }
+
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cur_p->data[i].p /= cum_sum;
+    }
+}
+
+static void llama_sampler_top_k_impl(llama_token_data_array * cur_p, int32_t k) {
+    // if (k >= (int32_t)cur_p->size) {
+    //     return;
+    // }
+
+    if (k <= 0) {
+        return;
+    }
+
+    k = std::min(k, (int) cur_p->size);
+
+    // Sort scores in descending order
+    if (!cur_p->sorted) {
+        llama_token_data_array_partial_sort_inplace(cur_p, k);
+    }
+
+    cur_p->size = k;
+}
+
+static uint32_t get_rng_seed(uint32_t seed) {
+    if (seed == LLAMA_DEFAULT_SEED) {
+        // use system clock if std::random_device is not a true RNG
+        static bool is_rd_prng = std::random_device().entropy() == 0;
+        if (is_rd_prng) {
+            return (uint32_t) std::chrono::system_clock::now().time_since_epoch().count();
+        }
+        std::random_device rd;
+        return rd();
+    }
+    return seed;
+}
+
+// llama_sampler API
+
+struct llama_sampler * llama_sampler_init(
+        struct llama_sampler_i * iface,
+        llama_sampler_context_t ctx) {
+    return new llama_sampler {
+        /* .iface = */ iface,
+        /* .ctx   = */ ctx,
+    };
+}
+
+const char * llama_sampler_name(const struct llama_sampler * smpl) {
+    if (!smpl->iface) {
+        return "(null)";
+    }
+
+    return smpl->iface->name(smpl);
+}
+
+void llama_sampler_accept(struct llama_sampler * smpl, llama_token token) {
+    if (!smpl) {
+        return;
+    }
+
+    if (smpl->iface->accept) {
+        smpl->iface->accept(smpl, token);
+    }
+}
+
+void llama_sampler_apply(struct llama_sampler * smpl, struct llama_token_data_array * cur_p) {
+    if (!smpl) {
+        return;
+    }
+
+    GGML_ASSERT(smpl->iface->apply);
+    smpl->iface->apply(smpl, cur_p);
+}
+
+void llama_sampler_reset(struct llama_sampler * smpl) {
+    if (!smpl) {
+        return;
+    }
+
+    if (smpl->iface->reset) {
+        smpl->iface->reset(smpl);
+    }
+}
+
+struct llama_sampler * llama_sampler_clone(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return nullptr;
+    }
+
+    if (smpl->iface->clone) {
+        return smpl->iface->clone(smpl);
+    }
+
+    if (smpl->ctx == nullptr) {
+        return llama_sampler_init(
+            /* .iface = */ smpl->iface,
+            /* .ctx   = */ nullptr
+        );
+    }
+
+    GGML_ABORT("the sampler does not support cloning");
+}
+
+void llama_sampler_free(struct llama_sampler * smpl) {
+    if (smpl == nullptr) {
+        return;
+    }
+
+    if (smpl->iface->free) {
+        smpl->iface->free(smpl);
+    }
+
+    delete smpl;
+}
+
+// empty sampler
+
+struct llama_sampler_empty {
+    const char * name;
 };
 
-static float weighted_sum(const std::vector<sample> & values) {
-    float result = 0.0f;
-    for (const sample & value : values) {
-        const int volume = std::accumulate(value.shape.begin(), value.shape.end(), 1, std::multiplies<int>());
-        result += value.weight * static_cast<float>(volume);
+static struct llama_sampler * llama_sampler_init_empty(const char * name);
+
+static const char * llama_sampler_empty_name(const struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_empty *) smpl->ctx;
+    return ctx->name;
+}
+
+static void llama_sampler_empty_accept(struct llama_sampler * smpl, llama_token token) {
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(token);
+}
+
+static void llama_sampler_empty_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(cur_p);
+}
+
+static void llama_sampler_empty_reset(struct llama_sampler * smpl) {
+    GGML_UNUSED(smpl);
+}
+
+static struct llama_sampler * llama_sampler_empty_clone(const struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_empty *) smpl->ctx;
+    return llama_sampler_init_empty(ctx->name);
+}
+
+static void llama_sampler_empty_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_empty *) smpl->ctx;
+}
+
+static bool llama_sampler_empty_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(buft);
+    GGML_UNUSED(n_outputs_max_per_seq);
+
+    return true;
+}
+
+static void llama_sampler_empty_backend_accept(
+        struct llama_sampler * smpl,
+        ggml_context * ctx,
+        ggml_cgraph * gf,
+        struct ggml_tensor * selected_token) {
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(selected_token);
+}
+
+static void llama_sampler_empty_backend_apply(
+          struct llama_sampler      * smpl,
+          struct ggml_context       * ctx,
+          struct ggml_cgraph        * gf,
+          struct llama_sampler_data * data) {
+    GGML_UNUSED(smpl);
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(data);
+}
+
+static void llama_sampler_empty_backend_set_input(struct llama_sampler * smpl) {
+    GGML_UNUSED(smpl);
+}
+
+static struct llama_sampler_i llama_sampler_empty_i = {
+    /* .name              = */ llama_sampler_empty_name,
+    /* .accept            = */ llama_sampler_empty_accept,
+    /* .apply             = */ llama_sampler_empty_apply,
+    /* .reset             = */ llama_sampler_empty_reset,
+    /* .clone             = */ llama_sampler_empty_clone,
+    /* .free              = */ llama_sampler_empty_free,
+    /* .backend_init      = */ llama_sampler_empty_backend_init,
+    /* .backend_accept    = */ llama_sampler_empty_backend_accept,
+    /* .backend_apply     = */ llama_sampler_empty_backend_apply,
+    /* .backend_set_input = */ llama_sampler_empty_backend_set_input,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ nullptr,
+};
+
+struct llama_sampler * llama_sampler_init_empty(const char * name) {
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_empty_i,
+        /* .ctx   = */ new llama_sampler_empty {
+            /* .name = */ name,
+        }
+    );
+}
+
+// common backend sampler functionality
+//
+// +name : means that the sampler is support and will run on the backend
+// -name : means that a ggml operator is not supported by the backend
+//
+struct llama_sampler_backend {
+    llama_sampler_backend(const char * name) : name(name), name_ext(name), is_init(false), support(false) {}
+
+
+class GGUFReader:
+    # I - same as host, S - swapped
+    byte_order: Literal['I', 'S'] = 'I'
+    alignment: int = GGUF_DEFAULT_ALIGNMENT
+    data_offset: int
+
+    # Note: Internal helper, API may change.
+    gguf_scalar_to_np: dict[GGUFValueType, type[np.generic]] = {
+        GGUFValueType.UINT8:   np.uint8,
+        GGUFValueType.INT8:    np.int8,
+        GGUFValueType.UINT16:  np.uint16,
+        GGUFValueType.INT16:   np.int16,
+        GGUFValueType.UINT32:  np.uint32,
+        GGUFValueType.INT32:   np.int32,
+        GGUFValueType.FLOAT32: np.float32,
+        GGUFValueType.UINT64:  np.uint64,
+        GGUFValueType.INT64:   np.int64,
+        GGUFValueType.FLOAT64: np.float64,
+        GGUFValueType.BOOL:    np.bool_,
     }
-    return result;
+
+    def __init__(self, path: os.PathLike[str] | str, mode: Literal['r', 'r+', 'c'] = 'r'):
+        self.data = np.memmap(path, mode = mode)
+        offs = 0
+
+        # Check for GGUF magic
+        if self._get(offs, np.uint32, override_order = '<')[0] != GGUF_MAGIC:
+            raise ValueError('GGUF magic invalid')
+        offs += 4
+
+        # Check GGUF version
+        temp_version = self._get(offs, np.uint32)
+        if temp_version[0] & 65535 == 0:
+            # If we get 0 here that means it's (probably) a GGUF file created for
+            # the opposite byte order of the machine this script is running on.
+            self.byte_order = 'S'
+            temp_version = temp_version.view(temp_version.dtype.newbyteorder(self.byte_order))
+        version = temp_version[0]
+        if version not in READER_SUPPORTED_VERSIONS:
+            raise ValueError(f'Sorry, file appears to be version {version} which we cannot handle')
+        if sys.byteorder == "little":
+            # Host is little endian
+            host_endian = GGUFEndian.LITTLE
+            swapped_endian = GGUFEndian.BIG
+        else:
+            # Sorry PDP or other weird systems that don't use BE or LE.
+            host_endian = GGUFEndian.BIG
+            swapped_endian = GGUFEndian.LITTLE
+        self.endianess = swapped_endian if self.byte_order == "S" else host_endian
+        self.fields: OrderedDict[str, ReaderField] = OrderedDict()
+        self.tensors: list[ReaderTensor] = []
+        offs += self._push_field(ReaderField(offs, 'GGUF.version', [temp_version], [0], [GGUFValueType.UINT32]))
+
+        # Check tensor count and kv count
+        temp_counts = self._get(offs, np.uint64, 2)
+        offs += self._push_field(ReaderField(offs, 'GGUF.tensor_count', [temp_counts[:1]], [0], [GGUFValueType.UINT64]))
+        offs += self._push_field(ReaderField(offs, 'GGUF.kv_count', [temp_counts[1:]], [0], [GGUFValueType.UINT64]))
+        tensor_count, kv_count = temp_counts
+        if tensor_count > GGUF_MAX_ARRAY_ELEMENTS:
+            raise ValueError(f'Tensor count {tensor_count} exceeds maximum {GGUF_MAX_ARRAY_ELEMENTS}')
+        if kv_count > GGUF_MAX_ARRAY_ELEMENTS:
+            raise ValueError(f'KV count {kv_count} exceeds maximum {GGUF_MAX_ARRAY_ELEMENTS}')
+        offs = self._build_fields(offs, kv_count)
+
+        # Build Tensor Info Fields
+        offs, tensors_fields = self._build_tensor_info(offs, tensor_count)
+        new_align = self.fields.get('general.alignment')
+        if new_align is not None:
+            if new_align.types != [GGUFValueType.UINT32]:
+                raise ValueError('Bad type for general.alignment field')
+            self.alignment = new_align.parts[-1][0]
+            # Ensure alignment is a non-zero power of two
+            if self.alignment == 0 or (self.alignment & (self.alignment - 1)) != 0:
+                raise ValueError('Invalid alignment: must be a non-zero power of two')
+        padding = offs % self.alignment
+        if padding != 0:
+            offs += self.alignment - padding
+        self.data_offset = offs
+        self._build_tensors(offs, tensors_fields)
+
+    _DT = TypeVar('_DT', bound = npt.DTypeLike)
+
+    # Fetch a key/value metadata field by key.
+    def get_field(self, key: str) -> Union[ReaderField, None]:
+        return self.fields.get(key, None)
+
+    # Fetch a tensor from the list by index.
+    def get_tensor(self, idx: int) -> ReaderTensor:
+        return self.tensors[idx]
+
+    def _get(
+        self, offset: int, dtype: npt.DTypeLike, count: int = 1, override_order: None | Literal['I', 'S', '<'] = None,
+    ) -> npt.NDArray[Any]:
+        count = int(count)
+        itemsize = int(np.empty([], dtype = dtype).itemsize)
+        end_offs = offset + itemsize * count
+        arr = self.data[offset:end_offs].view(dtype=dtype)[:count]
+        return arr.view(arr.dtype.newbyteorder(self.byte_order if override_order is None else override_order))
+
+    def _push_field(self, field: ReaderField, skip_sum: bool = False) -> int:
+        if field.name in self.fields:
+            # TODO: add option to make this a warning and accept duplicate keys like below
+            raise KeyError(f'Duplicate {field.name} already in list at offset {field.offset}')
+
+            # logger.warning(f'Duplicate key {field.name} at offset {field.offset}')
+            # self.fields[field.name + '_{}'.format(field.offset)] = field
+        else:
+            self.fields[field.name] = field
+        return 0 if skip_sum else sum(int(part.nbytes) for part in field.parts)
+
+
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (push_constant) uniform parameter
+{
+    uint KX;
+    uint KY;
+    uint ne00;
+    uint ne01;
+    uint ne02;
+    uint ne12;
+    uint ne13;
+    uint nb11;
+    uint nb12;
+    uint nb13;
+    float scale;
+    float max_bias;
+    float m0;
+    float m1;
+    uint n_head_log2;
+    uint nrows_x;
+    uint has_sinks;
+} p;
+
+#include "types.glsl"
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
+layout (binding = 1) readonly buffer Y {B_TYPE data_b[];};
+layout (binding = 2) readonly buffer Z {float data_c[];};
+layout (binding = 3) buffer D {D_TYPE data_d[];};
+
+shared FLOAT_TYPE vals[BLOCK_SIZE];
+
+// num_iters is the number of BLOCK_SIZE loop iterations we need to iterate
+// over all the columns. The main function tries to pass a constant here,
+// as if it were a template function, to allow unrolling.
+void soft_max(uint num_iters) {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint rowx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+
+    const uint32_t i03 = rowx / (p.ne01 * p.ne02);
+    const uint32_t i02 = (rowx - i03 * p.ne01 * p.ne02) / p.ne01;
+    const uint32_t i01 = rowx % p.ne01;
+
+    uint rowy_start = 0;
+    if (p.KY > 0) {
+        rowy_start = i01 * p.nb11 + (i02 % p.ne12) * p.nb12 + (i03 % p.ne13) * p.nb13;
+    }
+
+    if (rowx >= p.nrows_x) {
+        return;
+    }
+
+    float slope = 1.0f;
+
+    // ALiBi
+    if (p.max_bias > 0.0f) {
+        const uint h = (rowx / p.ne01) % p.ne02; // head index
+
+        const float base = h < p.n_head_log2 ? p.m0 : p.m1;
+        const uint   exp = h < p.n_head_log2 ? h + 1 : 2*(h - p.n_head_log2) + 1;
+
+        slope = pow(base, exp);
+    }
+
+    // Find max
+    FLOAT_TYPE max_val = p.has_sinks == 0 ? uintBitsToFloat(0xFF800000) : data_c[i02];
+
+    // Cache values while we compute the max, so we don't need to read them
+    // again when we're ready to compute exp(x-max).
+    const uint DATA_CACHE_SIZE = 16;
+    FLOAT_TYPE data_cache[DATA_CACHE_SIZE];
+
+    [[unroll]] for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
+        const uint col = col0 + tid;
+
+        FLOAT_TYPE a = FLOAT_TYPE(0);
+        if (col < p.KX) {
+            a = data_a[rowx * p.KX + col];
+        }
+
+        FLOAT_TYPE b = FLOAT_TYPE(0);
+        if (p.KY > 0 && col < p.KX) {
+            b = data_b[rowy_start + col];
+        }
+
+        FLOAT_TYPE v = a * p.scale + slope * b;
+
+        if (col < p.KX) {
+            max_val = max(max_val, v);
+        }
+
+        if (idx < DATA_CACHE_SIZE) {
+            data_cache[idx] = v;
+        }
+    }
+
+    // reduce across the workgroup
+    vals[tid] = max_val;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            vals[tid] = max(vals[tid], vals[tid + s]);
+        }
+        barrier();
+    }
+
+    max_val = vals[0];
+    barrier();
+
+    FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
+
+    // Compute sum{exp(x - max)}
+    [[unroll]] for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
+        const uint col = col0 + tid;
+
+        if (col >= p.KX) {
+            break;
+        }
+
+        // compute exp(a*scale+b*slope), add it to sum, and cache the new value
+        // in data_cache if possible.
+        const uint i = rowx * p.KX + col;
+        FLOAT_TYPE val;
+        if (idx < DATA_CACHE_SIZE) {
+            val = exp(data_cache[idx] - max_val);
+        } else {
+            val = exp(FLOAT_TYPE(data_a[i]) * p.scale + (p.KY > 0 ? slope * FLOAT_TYPE(data_b[rowy_start + col]) : FLOAT_TYPE(0.0f)) - max_val);
+        }
+        sum += val;
+        if (idx < DATA_CACHE_SIZE) {
+            data_cache[idx] = val;
+        } else {
+            data_d[i] = D_TYPE(val);
+        }
+    }
+
+    // reduce across the workgroup
+    vals[tid] = sum;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            vals[tid] += vals[tid + s];
+        }
+        barrier();
+    }
+    sum = vals[0];
+
+    if (p.has_sinks != 0) {
+        sum += FLOAT_TYPE(exp(FLOAT_TYPE(data_c[i02]) - max_val));
+    }
+
+    FLOAT_TYPE rcpdivisor = 1.0/sum;
+
+    [[unroll]] for (uint col0 = 0, idx = 0; idx < num_iters; col0 += BLOCK_SIZE, ++idx) {
+        const uint col = col0 + tid;
+
+        if (col >= p.KX) {
+            continue;
+        }
+
+        if (idx < DATA_CACHE_SIZE) {
+            data_d[rowx*p.KX + col] = D_TYPE(data_cache[idx] * rcpdivisor);
+        } else {
+            data_d[rowx*p.KX + col] *= D_TYPE(rcpdivisor);
+        }
+    }
 }
 
-int main() {
-    std::vector<sample> values = {
-        { 7,  0.125f, { 1, 31, 32, 33 } },
-        { 11, 0.500f, { 2, 16, 64,  1 } },
-        { 19, 1.250f, { 4,  8, 17, 65 } },
-    };
-
-    std::stable_sort(values.begin(), values.end(), [](const sample & a, const sample & b) {
-        return a.id < b.id;
-    });
-
-    return weighted_sum(values) > 0.0f ? 0 : 1;
+void main() {
+    // instantiate the soft_max function for several different
+    // dimensions, to allow loop unrolling
+    uint num_blocks = (p.KX + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    if (num_blocks > 32) {
+        soft_max(num_blocks);
+    } else if (num_blocks > 16) {
+        soft_max(32);
+    } else if (num_blocks > 8) {
+        soft_max(16);
+    } else if (num_blocks > 4) {
+        soft_max(8);
+    } else if (num_blocks == 4) {
+        soft_max(4);
+    } else if (num_blocks == 3) {
+        soft_max(3);
+    } else if (num_blocks == 2) {
+        soft_max(2);
+    } else if (num_blocks == 1) {
+        soft_max(1);
+    }
 }
 
-def chunk_rows(rows, width):
-    output = []
-    for start in range(0, len(rows), width):
-        stop = min(start + width, len(rows))
-        output.append(rows[start:stop])
-    return output
+import { getAuthHeaders, getJsonHeaders } from './api-headers';
+import { base } from '$app/paths';
+import { API_ABSOLUTE_URL_PROTOCOLS, ERROR_MESSAGES, HTTP_CODE_TO_STRING } from '$lib/constants';
 
-def checksum(values):
-    state = 2166136261
-    for value in values:
-        state = (state ^ value) * 16777619
-        state &= 0xffffffff
-    return state
+/**
+ * API Fetch Utilities
+ *
+ * Provides common fetch patterns used across services:
+ * - Automatic JSON headers
+ * - Error handling with proper error messages
+ * - Base path resolution
+ */
 
-SELECT model_id, backend, AVG(tokens_per_second) AS mean_rate
-FROM benchmark_results
-WHERE prompt_tokens = 2048
-  AND depth IN (0, 12000, 32000, 64000)
-GROUP BY model_id, backend
-ORDER BY model_id, backend;
+/**
+ * Error thrown when an API request fails, carrying the HTTP status code
+ * so callers can distinguish e.g. a 503 "still loading" response from a
+ * genuine failure.
+ */
+export class ApiError extends Error {
+	status: number;
 
-curl --fail --silent --show-error \
-  --header "Content-Type: application/json" \
-  --data '{"prompt":"deterministic input","temperature":0,"seed":123}' \
-  http://127.0.0.1:8080/v1/completions
+	constructor(message: string, status: number) {
+		super(message);
+		this.name = 'ApiError';
+		this.status = status;
+	}
+}
+
+export interface ApiFetchOptions extends Omit<RequestInit, 'headers'> {
+	/**
+	 * Use auth-only headers (no Content-Type).
+	 * Default: false (uses JSON headers with Content-Type: application/json)
+	 */
+	authOnly?: boolean;
+	/**
+	 * Additional headers to merge with default headers.
+	 */
+	headers?: Record<string, string>;
+}
+
+/**
+ * Fetch JSON data from an API endpoint with standard headers and error handling.
+ *
+ * @param path - API path (will be prefixed with base path)
+ * @param options - Fetch options with additional authOnly flag
+ * @returns Parsed JSON response
+ * @throws Error with formatted message on failure
+ *
+ * @example
+ * ```typescript
+ * // GET request
+ * const models = await apiFetch<ApiModelListResponse>('/v1/models');
+ *
+ * // POST request
+ * const result = await apiFetch<ApiResponse>('/models/load', {
+ *   method: 'POST',
+ *   body: JSON.stringify({ model: 'gpt-4' })
+ * });
+ * ```
+ */
+export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): Promise<T> {
+	const { authOnly = false, headers: customHeaders, ...fetchOptions } = options;
+	const baseHeaders = authOnly ? getAuthHeaders() : getJsonHeaders();
+	const headers = { ...baseHeaders, ...customHeaders };
+	// absolute URLs with an allowed protocol pass through untouched; relative paths get the base prefix
+	const url = API_ABSOLUTE_URL_PROTOCOLS.some((p) => path.startsWith(p)) ? path : `${base}${path}`;
+
+	let response;
+
+	try {
+		response = await fetch(url, {
+			...fetchOptions,
+			headers
+		});
+	} catch (e) {
+		throw new Error(beautifyNetworkError(e));
+	}
+
+	if (!response.ok) {
+		const errorMessage = await parseErrorMessage(response);
+
+		throw new ApiError(errorMessage, response.status);
+	}
+
+	return response.json() as Promise<T>;
+}
+
+/**
+ * Fetch with URL constructed from base URL and query parameters.
+ *
+ * @param basePath - Base API path
+ * @param params - Query parameters to append
+ * @param options - Fetch options
+ * @returns Parsed JSON response
+ *
+ * @example
+ * ```typescript
+ * const props = await apiFetchWithParams<ApiProps>('./props', {
+ *   model: 'gpt-4',
+ *   autoload: 'false'
+ * });
+ * ```
+ */
+export async function apiFetchWithParams<T>(
+	basePath: string,
+	params: Record<string, string>,
+	options: ApiFetchOptions = {}
+): Promise<T> {
+	const url = new URL(basePath, window.location.href);
+
+	for (const [key, value] of Object.entries(params)) {
+		if (value !== undefined && value !== null) {
+			url.searchParams.set(key, value);
+		}
+	}
+
+	return apiFetch<T>(url.toString(), options);
+}
+
+/**
+ * POST JSON data to an API endpoint.
+ *
+ * @param path - API path
+ * @param body - Request body (will be JSON stringified)
+ * @param options - Additional fetch options
+ * @returns Parsed JSON response
+ */
+export async function apiPost<T, B = unknown>(
+	path: string,
+	body: B,
+	options: ApiFetchOptions = {}
+): Promise<T> {
+	return apiFetch<T>(path, {
+		body: JSON.stringify(body),
+		method: 'POST',
+		...options
+	});
+}
+
+if (NOT EXISTS $ENV{ROCM_PATH})
+    if (NOT EXISTS /opt/rocm)
+        set(ROCM_PATH /usr)
+    else()
+        set(ROCM_PATH /opt/rocm)
+    endif()
+else()
+    set(ROCM_PATH $ENV{ROCM_PATH})
+endif()
+
+list(APPEND CMAKE_PREFIX_PATH  ${ROCM_PATH})
+list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}/lib64/cmake")
+
+if (NOT DEFINED CMAKE_HIP_FLAGS_DEBUG)
+    set(CMAKE_HIP_FLAGS_DEBUG "-g -O2")
+endif()
+
+# CMake on Windows doesn't support the HIP language yet
+if (WIN32)
+    set(CXX_IS_HIPCC TRUE)
+else()
+    string(REGEX MATCH "hipcc(\.bat)?$" CXX_IS_HIPCC "${CMAKE_CXX_COMPILER}")
+endif()
+
+if (CXX_IS_HIPCC)
+    if (LINUX)
+        if (NOT ${CMAKE_CXX_COMPILER_ID} MATCHES "Clang")
+            message(WARNING "Only LLVM is supported for HIP, hint: CXX=/opt/rocm/llvm/bin/clang++")
+        endif()
+
+        message(WARNING "Setting hipcc as the C++ compiler is legacy behavior."
+                " Prefer setting the HIP compiler directly. See README for details.")
+    endif()
+else()
+    # Forward (AMD)GPU_TARGETS to CMAKE_HIP_ARCHITECTURES.
+    if(AMDGPU_TARGETS AND NOT GPU_TARGETS)
+        set(GPU_TARGETS ${AMDGPU_TARGETS})
+    endif()
+    if(GPU_TARGETS AND NOT CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES ${GPU_TARGETS})
+    endif()
+
+    # This fork only supports Strix Halo (gfx1151), also covering Gorgon Halo.
+    # Without this, cmake/clang defaults to the full ROCm arch list.
+    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES "gfx1151")
+    endif()
+    cmake_minimum_required(VERSION 3.21)
+    enable_language(HIP)
+endif()
+
+find_package(hip     REQUIRED)
+find_package(hipblas REQUIRED)
+find_package(rocblas REQUIRED)
+
+if (GGML_HIP_RCCL)
+    find_package(rccl REQUIRED)
+endif()
+
+if (${hip_VERSION} VERSION_LESS 6.1)
+    message(FATAL_ERROR "At least ROCM/HIP V6.1 is required")
+endif()
+
+message(STATUS "HIP and hipBLAS found")
+
+file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
+list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
+
+file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+
+ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+
+ggml_add_backend_library(ggml-hip
+                         ${GGML_HEADERS_ROCM}
+                         ${GGML_SOURCES_ROCM}
+                        )
+
+# TODO: do not use CUDA definitions for HIP
+if (NOT GGML_BACKEND_DL)
+    target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
+endif()
+
+add_compile_definitions(GGML_USE_HIP)
+
+if (GGML_CUDA_FORCE_MMQ)
+    add_compile_definitions(GGML_CUDA_FORCE_MMQ)
+endif()
+
+if (GGML_CUDA_FORCE_CUBLAS)
+    add_compile_definitions(GGML_CUDA_FORCE_CUBLAS)
+endif()
+
+
+#!/usr/bin/env bash
+
+if [ $# -lt 2 ]; then
+    echo "usage: ./scripts/compare-commits.sh <commit1> <commit2> [tool] [additional arguments]"
+    echo "  tool: 'llama-bench' (default) or 'test-backend-ops'"
+    echo "  additional arguments: passed to the selected tool"
+    exit 1
+fi
+
+set -e
+set -x
+
+# Parse arguments
+commit1=$1
+commit2=$2
+tool=${3:-llama-bench}
+additional_args="${@:4}"
+
+# Validate tool argument
+if [ "$tool" != "llama-bench" ] && [ "$tool" != "test-backend-ops" ]; then
+    echo "Error: tool must be 'llama-bench' or 'test-backend-ops'"
+    exit 1
+fi
+
+# verify at the start that the compare script has all the necessary dependencies installed
+./scripts/compare-llama-bench.py --check
+
+if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "Error: sqlite3 is not installed or not in PATH"
+    echo "Please install sqlite3 to use this script"
+    exit 1
+fi
+
+if [ "$tool" = "llama-bench" ]; then
+    db_file="llama-bench.sqlite"
+    target="llama-bench"
+    run_args="-o sql -oe md $additional_args"
+else  # test-backend-ops
+    db_file="test-backend-ops.sqlite"
+    target="test-backend-ops"
+    run_args="perf --output sql $additional_args"
+fi
+
+rm -f "$db_file" > /dev/null
+
+# to test a backend, call the script with the corresponding environment variable (e.g. GGML_CUDA=1 ./scripts/compare-commits.sh ...)
+if [ -n "$GGML_CUDA" ]; then
+    CMAKE_OPTS="${CMAKE_OPTS} -DGGML_CUDA=ON"
+fi
+
+dir="build-bench"
+
+function run {
+    rm -fr ${dir} > /dev/null
+    cmake -B ${dir} -S . ${CMAKE_OPTS} > /dev/null
+    cmake --build ${dir} -t $target -j $(nproc) > /dev/null
+    ${dir}/bin/$target $run_args | sqlite3 "$db_file"
+}
+
+git checkout $commit1 > /dev/null
+run
+
+git checkout $commit2 > /dev/null
+run
+
+./scripts/compare-llama-bench.py -b $commit1 -c $commit2 --tool $tool -i "$db_file"
