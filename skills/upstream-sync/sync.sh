@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Helper for the upstream-sync skill (skills/upstream-sync/SKILL.md, SYNC.md).
-#   sync.sh report [target]        the step plan (one step per conflicting upstream PR), then the next step in detail
+#   sync.sh report [target]        the step plan (one step per conflicting upstream PR), the models to test, the next step in detail
 #   sync.sh merge  [target]        start the merge of target on the current branch, from the content base
 #   sync.sh verify <old> [target]  after the merge commit: did every fork change survive?
 # target defaults to the next step: the first conflicting upstream commit, or at most MAX_STEP commits.
@@ -13,6 +13,8 @@ UPSTREAM=${UPSTREAM:-upstream/master}
 MAX_STEP=${MAX_STEP:-100}
 # conflicts in these paths need a run of the validation checklist on a Strix Halo machine
 SENSITIVE=${SENSITIVE:-'^(ggml/src/ggml-cuda/|ggml/src/ggml-vulkan/|ggml/src/ggml-backend|ggml/src/ggml-alloc|src/models/|src/llama-graph|src/llama-context|src/llama-kv-cache|src/llama-memory|src/llama-arch|src/llama-model|src/llama-vocab|conversion/|gguf-py/gguf/constants)'}
+# a change in these paths can affect every model
+SHARED=${SHARED:-'^(ggml/|src/llama-(graph|context|kv-cache|memory|model|arch|vocab|batch|adapter|cparams|hparams))'}
 BASE_FILE=scripts/upstream-sync.base
 
 TMP=$(mktemp -d)
@@ -105,6 +107,23 @@ plan() {
     echo "$steps steps, $sens with sensitive conflicts"
 }
 
+# Model archs to test: src/models/<arch>.cpp changed by upstream in the range and by the fork since the base.
+# An arch only upstream changed comes in as upstream wrote it.
+models() {
+    local up fork both
+    up=$(git diff --name-only "$1" "$2" -- src/models/ | sed -n 's#^src/models/\(.*\)\.cpp$#\1#p' | sort -u)
+    fork=$(git diff --name-only "$1" HEAD -- src/models/ | sed -n 's#^src/models/\(.*\)\.cpp$#\1#p' | sort -u)
+    both=$(comm -12 <(echo "$up") <(echo "$fork") | sed '/^$/d')
+    if [ -n "$both" ]; then
+        echo "$both" | sed 's/^/  /'
+    else
+        echo "  none: no arch changed on both sides"
+    fi
+    if git diff --name-only "$1" "$2" | grep -qE "$SHARED"; then
+        echo "  shared paths changed too (kernels, ggml core, graph, KV cache): ask the user which models to add"
+    fi
+}
+
 report() {
     fetch
     local ours base hist target left
@@ -130,6 +149,10 @@ report() {
     echo
     echo "== plan"
     plan "$base" "$ours"
+
+    echo
+    echo "== models to test, upstream $(git rev-parse --short "$base")..$(git rev-parse --short "${1:-$UPSTREAM}")"
+    models "$base" "$(git rev-parse "${1:-$UPSTREAM}")"
 
     target=$(resolve_target "$base" "$ours" "${1:-}")
     echo

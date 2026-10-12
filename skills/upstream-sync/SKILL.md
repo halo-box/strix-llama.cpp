@@ -151,7 +151,7 @@ Merge upstream ggml-org/llama.cpp <base-sha>..<target-sha> (<n> commits, <k> ste
 
 - [ ] after every step: `sync.sh verify` (no fork code lost, no conflict marker) and the GPU builds the step can break
 - [ ] end of sync: HIP (gfx1151) and Vulkan builds, CPU build and `ctest -L main`
-- [ ] Strix Halo checklist (step 7), needed if a step is sensitive:
+- [ ] Strix Halo checklist (step 7), needed if a step is sensitive. Models: <arch (GGUF name)>, one table per model:
 
 | Check | HIP (ROCm0) | Vulkan (Vulkan0) |
 |---|---|---|
@@ -173,6 +173,8 @@ No machine names, home paths or model paths in the PR, the commits or the repo: 
 
 Needed before the PR leaves draft if any step of it had a sensitive conflict, and then on **both backends, HIP (ROCm) and Vulkan**. Give the user the full commands below with the placeholders filled in. Do not shorten them. Run them in clean worktrees, never in a tree with uncommitted work.
 
+Models: one GGUF per arch listed by `sync.sh report <last upstream sha of this PR>` under "models to test", that is the archs whose `src/models/<arch>.cpp` both upstream and the fork changed. An arch that only upstream changed comes in exactly as upstream wrote it. If the sync also changes shared paths (kernels, ggml core, graph, KV cache), ask the user which models to add. Check the arch of a GGUF with `python3 gguf-py/gguf/scripts/gguf_dump.py --no-tensors <model.gguf> | grep general.architecture`.
+
 The baseline is the fork before this sync: the first parent of the first merge of the branch (`$OLD` of the first step), not `origin/master`, which can move during the sync.
 
 ```sh
@@ -191,7 +193,7 @@ for be in hip vk; do
       cmake --build ../sync-$t/build-$be -j --target llama-perplexity llama-bench llama-server test-backend-ops || break 2
   done
 done
-M=<model.gguf>
+MODELS="<arch>=<model.gguf> <arch>=<model.gguf>"   # one GGUF per arch to test
 L=../sync-logs/$(date +%F)
 C=../sync-cand/tests/corpus
 mkdir -p $L/hip $L/vk
@@ -205,6 +207,11 @@ for be in hip vk; do
   # 2. full test-backend-ops on both builds; only new failures count
   for t in base cand; do $(bin $t)/test-backend-ops -b $(dev $be) > $D/ops-$t.txt 2>&1; done
   diff <(grep FAIL $D/ops-base.txt | sort) <(grep FAIL $D/ops-cand.txt | sort) > $D/ops-new-fail.txt && echo "$be ops: no new failure"
+
+  for mm in $MODELS; do
+  M=${mm#*=}
+  D=$L/$be/${mm%%=*}
+  mkdir -p $D
 
   # 3. logits vs baseline: each corpus at -c 2048, all four together at -c 16384 (several ubatches per chunk)
   run() {  # <name> <file> <args> <reference args>
@@ -239,11 +246,12 @@ for be in hip vk; do
   for t in base cand; do python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["choices"][0]; print(sys.argv[1], c["finish_reason"], c["message"].get("tool_calls"))' $D/tool-$t.json; done
   for t in base cand; do python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); t=r.get("timings",{}); print(sys.argv[1], "accepted", t.get("draft_n_accepted"), "of", t.get("draft_n"))' $D/decode-$t.json; done
   cmp <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $D/decode-base.json) \
-      <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $D/decode-cand.json) && echo "$be decode: identical"
+      <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $D/decode-cand.json) && echo "$be $mm decode: identical"
+  done
 done
 ```
 
-Pass criteria, for each backend:
+Pass criteria, for each backend and each model:
 
 | Check | Pass |
 |---|---|
@@ -255,7 +263,7 @@ Pass criteria, for each backend:
 
 If a logits check fails, find the step whose merge moves the logits (rebuild at the merge commits of the branch) before going on: it is either an upstream change or a wrong resolution.
 
-Report one status per backend in the PR, as `AGENTS.md` asks: `TARGET PASS` (all checks pass), `FAIL` (any check fails), or `INCOMPLETE` (a check was not run, for example no MTP head). The PR leaves draft only when both are `TARGET PASS`. Attach or summarise the logs of `$L` without local paths.
+Report one status per backend and model in the PR, as `AGENTS.md` asks: `TARGET PASS` (all checks pass), `FAIL` (any check fails), or `INCOMPLETE` (a check was not run, for example no MTP head). The PR leaves draft only when both are `TARGET PASS`. Attach or summarise the logs of `$L` without local paths.
 
 Then the user takes the PR out of draft, and a maintainer merges it with a merge commit.
 
