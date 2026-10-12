@@ -74,19 +74,37 @@ skills/upstream-sync/sync.sh verify $OLD
 - **Fork diff size changed:** inspect with `git diff <target> HEAD -- <file>` and confirm the fork change is intact.
 - It fails if HEAD is not a merge of the target, or if conflict markers are left.
 
-### 5. Build after every step (no GPU needed)
+### 5. Build (no GPU needed)
+
+The fork supports two GPU backends, HIP (ROCm) and Vulkan, and every sync PR must build and validate both.
+
+After every step, rebuild incrementally the backend the step can break. A clean step can still break fork code (for example a changed signature in `ggml-cuda/common.cuh`), so the rule follows the paths changed by the step, not the conflicts:
+
+| The step changes | HIP build | Vulkan build |
+|---|---|---|
+| `ggml/src/ggml-cuda/` | yes | no |
+| `ggml/src/ggml-vulkan/` | no | yes |
+| ggml core (`ggml/include/`, `ggml/src/ggml*.c*`, `ggml/src/ggml-backend*`, `ggml/src/ggml-alloc*`) or `src/` | yes | yes |
+| anything else (docs, UI, server, CI) | no | no |
+
+```sh
+git diff --name-only HEAD^1 HEAD     # the paths changed by the step
+# HIP: ROCm toolchain or a ROCm container. Vulkan: Vulkan headers and glslc. ccache helps both.
+cmake -B build-hip -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" -DCMAKE_BUILD_TYPE=Release
+cmake --build build-hip -j
+cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vk -j
+```
+
+An incremental build is fast when the step changes a few kernel files, and close to a full build when it changes a header included everywhere (`ggml-cuda/common.cuh` is included by most `.cu` files).
+
+At the end of the sync, before the PR: both GPU builds again, and the CPU tests.
 
 ```sh
 cmake -B build-check -DCMAKE_BUILD_TYPE=Release
 cmake --build build-check -j
 ctest --test-dir build-check -L main --output-on-failure -j 8
-
-# the HIP kernels are the most customized fork code: compile them at every step (ROCm toolchain or a ROCm container, no GPU)
-cmake -B build-hip -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" -DCMAKE_BUILD_TYPE=Release
-cmake --build build-hip -j
 ```
-
-A clean step can still break a fork kernel (for example a changed signature in `ggml-cuda/common.cuh`), so do not skip the HIP build on steps without conflicts.
 
 `test-tokenizers-ggml-vocabs` needs `git lfs`. Without it, the test reads LFS pointer files and fails with `invalid magic characters: 'vers'`. That is not a merge failure.
 
@@ -131,16 +149,17 @@ Merge upstream ggml-org/llama.cpp <base-sha>..<target-sha> (<n> commits, <k> ste
 
 ## Validation
 
-- [ ] `sync.sh verify` after every step: no fork code lost, no conflict marker
-- [ ] CPU build and `ctest -L main` after every step
-- [ ] HIP build (gfx1151) after every step
+- [ ] after every step: `sync.sh verify` (no fork code lost, no conflict marker) and the GPU builds the step can break
+- [ ] end of sync: HIP (gfx1151) and Vulkan builds, CPU build and `ctest -L main`
 - [ ] Strix Halo checklist (step 7), needed if a step is sensitive:
-  - [ ] `test-backend-ops -b ROCm0`: no new failure
-  - [ ] KLD, 4 corpora at `-c 2048` and all at `-c 16384`: within the thresholds
-  - [ ] `llama-bench` pp and tg: within noise at every depth (tables below)
-  - [ ] server: tool call, same greedy decode, MTP acceptance within 5 points
 
-Status: TARGET PASS | FAIL | INCOMPLETE
+| Check | HIP (ROCm0) | Vulkan (Vulkan0) |
+|---|---|---|
+| `test-backend-ops`: no new failure | [ ] | [ ] |
+| KLD, 4 corpora at `-c 2048` and all at `-c 16384`: within the thresholds | [ ] | [ ] |
+| `llama-bench` pp and tg: within noise at every depth (tables below) | [ ] | [ ] |
+| server: tool call, same greedy decode, MTP acceptance within 5 points | [ ] | [ ] |
+| Status (TARGET PASS / FAIL / INCOMPLETE) | | |
 
 ## Requirements
 
@@ -152,7 +171,7 @@ No machine names, home paths or model paths in the PR, the commits or the repo: 
 
 ### 7. Validate on a Strix Halo machine
 
-Needed before the PR leaves draft if any step of it had a sensitive conflict. Give the user the full commands below with the placeholders filled in. Do not shorten them. Run them in clean worktrees, never in a tree with uncommitted work.
+Needed before the PR leaves draft if any step of it had a sensitive conflict, and then on **both backends, HIP (ROCm) and Vulkan**. Give the user the full commands below with the placeholders filled in. Do not shorten them. Run them in clean worktrees, never in a tree with uncommitted work.
 
 The baseline is the fork before this sync: the first parent of the first merge of the branch (`$OLD` of the first step), not `origin/master`, which can move during the sync.
 
@@ -160,63 +179,71 @@ The baseline is the fork before this sync: the first parent of the first merge o
 # 0. the GPU must be free
 pgrep -a -x 'llama-server|llama-cli|llama-bench|llama-perplexity' && echo "stop these first"
 
-# 1. baseline and candidate, same flags
+# 1. baseline and candidate, one build per backend, same flags
 BASE_REV=<first parent of the first sync merge>
 git worktree add --detach ../sync-base $BASE_REV
 git worktree add --detach ../sync-cand sync/upstream-<date>-<sha>
-HIP="-DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang -DCMAKE_BUILD_TYPE=Release"
-for t in ../sync-base ../sync-cand; do
-  cmake -S $t -B $t/build $HIP && cmake --build $t/build -j --target llama-perplexity llama-bench llama-server test-backend-ops || break
+flags() { case $1 in hip) echo "-DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang";; vk) echo "-DGGML_VULKAN=ON";; esac; }
+dev()   { case $1 in hip) echo ROCm0;; vk) echo Vulkan0;; esac; }
+for be in hip vk; do
+  for t in base cand; do
+    cmake -S ../sync-$t -B ../sync-$t/build-$be $(flags $be) -DCMAKE_BUILD_TYPE=Release && \
+      cmake --build ../sync-$t/build-$be -j --target llama-perplexity llama-bench llama-server test-backend-ops || break 2
+  done
 done
 M=<model.gguf>
 L=../sync-logs/$(date +%F)
-mkdir -p $L
-
-# 2. full test-backend-ops on both builds; only new failures count
-for t in base cand; do ../sync-$t/build/bin/test-backend-ops -b ROCm0 > $L/ops-$t.txt 2>&1; done
-diff <(grep -E 'FAIL' $L/ops-base.txt | sort) <(grep -E 'FAIL' $L/ops-cand.txt | sort) && echo "ops: no new failure"
-
-# 3. logits vs baseline on the target model: each corpus at -c 2048, all four together at -c 16384 (several ubatches per chunk)
-#    the corpora are long enough without repetition (tests/corpus/README.md); a repeated text is mostly copied by the model
 C=../sync-cand/tests/corpus
+mkdir -p $L/hip $L/vk
 cat $C/correctness-prose.txt $C/correctness-code.txt $C/correctness-structured.txt $C/correctness-numeric.txt > $L/all.txt
 sha256sum $C/correctness-*.txt $L/all.txt > $L/corpus.sha256
-run() {  # <name> <file> <args> <reference args>
-  local O="-m $M -ngl 99 -fa on -ctk f16 -ctv f16"
-  ../sync-base/build/bin/llama-perplexity $O $3 -f $2 --kl-divergence-base $L/$1.kld > $L/$1-base.txt 2>&1
-  ../sync-cand/build/bin/llama-perplexity $O $3 --kl-divergence-base $L/$1.kld --kl-divergence > $L/$1-cand.txt 2>&1
-  ../sync-base/build/bin/llama-perplexity $O $4 --kl-divergence-base $L/$1.kld --kl-divergence > $L/$1-ref.txt 2>&1
-}
-for n in prose code structured numeric; do
-  run $n $C/correctness-$n.txt "-c 2048 -b 2048 -ub 2048" "-c 2048 -b 2048 -ub 512"
-done
-run long $L/all.txt "-c 16384 -b 512 -ub 512" "-c 16384 -b 256 -ub 256"
-grep -H -E 'Mean PPL\(Q\)/PPL\(base\)|Mean +KLD|Same top p' $L/*-cand.txt $L/*-ref.txt
 
-# 4. performance A/B (AGENTS.md command shape), alternating order
-for t in base cand base cand; do
-  ../sync-$t/build/bin/llama-bench -m $M -p 2048 -d 0,12000,32000,64000 -b 2048 -ub 2048 -n 0 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o md | tee -a $L/bench-pp-$t.md
-done
-for t in base cand; do
-  ../sync-$t/build/bin/llama-bench -m $M -p 0 -n 128 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o md | tee -a $L/bench-tg-$t.md
-done
+for be in hip vk; do
+  bin() { echo ../sync-$1/build-$be/bin; }
+  D=$L/$be
 
-# 5. server: tool call, greedy decode and MTP drafting, on both builds
-for t in base cand; do
-  ../sync-$t/build/bin/llama-server -m $M -ngl 99 -fa on --jinja --port 8080 --spec-type draft-mtp > $L/server-$t.log 2>&1 &
-  S=$!
-  until curl -sf localhost:8080/health > /dev/null; do sleep 2; done
-  curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"What is the weather in Paris?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"temperature":0}' > $L/tool-$t.json
-  curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"Write a Python function that parses ISO 8601 dates, with tests."}],"max_tokens":256,"temperature":0}' > $L/decode-$t.json
-  kill $S; wait $S
+  # 2. full test-backend-ops on both builds; only new failures count
+  for t in base cand; do $(bin $t)/test-backend-ops -b $(dev $be) > $D/ops-$t.txt 2>&1; done
+  diff <(grep FAIL $D/ops-base.txt | sort) <(grep FAIL $D/ops-cand.txt | sort) > $D/ops-new-fail.txt && echo "$be ops: no new failure"
+
+  # 3. logits vs baseline: each corpus at -c 2048, all four together at -c 16384 (several ubatches per chunk)
+  run() {  # <name> <file> <args> <reference args>
+    local O="-m $M -ngl 99 -fa on -ctk f16 -ctv f16"
+    $(bin base)/llama-perplexity $O $3 -f $2 --kl-divergence-base $D/$1.kld > $D/$1-base.txt 2>&1
+    $(bin cand)/llama-perplexity $O $3 --kl-divergence-base $D/$1.kld --kl-divergence > $D/$1-cand.txt 2>&1
+    $(bin base)/llama-perplexity $O $4 --kl-divergence-base $D/$1.kld --kl-divergence > $D/$1-ref.txt 2>&1
+  }
+  for n in prose code structured numeric; do
+    run $n $C/correctness-$n.txt "-c 2048 -b 2048 -ub 2048" "-c 2048 -b 2048 -ub 512"
+  done
+  run long $L/all.txt "-c 16384 -b 512 -ub 512" "-c 16384 -b 256 -ub 256"
+  grep -H -E 'Mean PPL\(Q\)/PPL\(base\)|Mean +KLD|Same top p' $D/*-cand.txt $D/*-ref.txt
+
+  # 4. performance A/B (AGENTS.md command shape), alternating order
+  for t in base cand base cand; do
+    $(bin $t)/llama-bench -m $M -p 2048 -d 0,12000,32000,64000 -b 2048 -ub 2048 -n 0 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o md | tee -a $D/bench-pp-$t.md
+  done
+  for t in base cand; do
+    $(bin $t)/llama-bench -m $M -p 0 -n 128 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o md | tee -a $D/bench-tg-$t.md
+  done
+
+  # 5. server: tool call, greedy decode and MTP drafting
+  for t in base cand; do
+    $(bin $t)/llama-server -m $M -ngl 99 -fa on --jinja --port 8080 --spec-type draft-mtp > $D/server-$t.log 2>&1 &
+    S=$!
+    until curl -sf localhost:8080/health > /dev/null; do sleep 2; done
+    curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"What is the weather in Paris?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"temperature":0}' > $D/tool-$t.json
+    curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"Write a Python function that parses ISO 8601 dates, with tests."}],"max_tokens":256,"temperature":0}' > $D/decode-$t.json
+    kill $S; wait $S
+  done
+  for t in base cand; do python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["choices"][0]; print(sys.argv[1], c["finish_reason"], c["message"].get("tool_calls"))' $D/tool-$t.json; done
+  for t in base cand; do python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); t=r.get("timings",{}); print(sys.argv[1], "accepted", t.get("draft_n_accepted"), "of", t.get("draft_n"))' $D/decode-$t.json; done
+  cmp <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $D/decode-base.json) \
+      <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $D/decode-cand.json) && echo "$be decode: identical"
 done
-for t in base cand; do python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["choices"][0]; print(sys.argv[1], c["finish_reason"], c["message"].get("tool_calls"))' $L/tool-$t.json; done
-for t in base cand; do python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); t=r.get("timings",{}); print(sys.argv[1], "accepted", t.get("draft_n_accepted"), "of", t.get("draft_n"))' $L/decode-$t.json; done
-cmp <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $L/decode-base.json) \
-    <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $L/decode-cand.json) && echo "decode: identical"
 ```
 
-Pass criteria:
+Pass criteria, for each backend:
 
 | Check | Pass |
 |---|---|
@@ -228,7 +255,7 @@ Pass criteria:
 
 If a logits check fails, find the step whose merge moves the logits (rebuild at the merge commits of the branch) before going on: it is either an upstream change or a wrong resolution.
 
-Report one status in the PR, as `AGENTS.md` asks: `TARGET PASS` (all checks pass), `FAIL` (any check fails), or `INCOMPLETE` (a check was not run, for example no MTP head). Attach or summarise the logs of `$L` without local paths.
+Report one status per backend in the PR, as `AGENTS.md` asks: `TARGET PASS` (all checks pass), `FAIL` (any check fails), or `INCOMPLETE` (a check was not run, for example no MTP head). The PR leaves draft only when both are `TARGET PASS`. Attach or summarise the logs of `$L` without local paths.
 
 Then the user takes the PR out of draft, and a maintainer merges it with a merge commit.
 
