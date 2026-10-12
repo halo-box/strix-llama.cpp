@@ -147,23 +147,20 @@ skills/upstream-sync/sync.sh summary $OLD0 > body.md
 
 It contains, for each step: the upstream PR that ends it and its upstream commits, the conflicted files (`*` = sensitive) with the resolution line of the merge message, **the conflict zones** (line ranges of the merged file), the resolution diff (automatic merge with markers -> committed), and **every edit outside the conflicts**: a change in a file that did not conflict, or in a conflicted file outside its conflict zones. Nothing marks such edits during the merge, so each one needs an explanation in the PR. The body ends with the diffstat of the whole sync. GitHub limits a PR body to 65536 characters: if `body.md` is longer, keep the overview table in the body and post the `## Steps` part as PR comments, one per step.
 
-Then append the validation part, keep it short, and tick a box only for a check that really ran:
+Then append the models and the validation part, keep it short, and tick a box only for a check that really ran. One row per model to validate: the archs `sync.sh report` lists, and the models the user adds for shared paths. Use `long` when the sync touches attention, the KV cache, flash attention or QSA, `short` otherwise. `validate.sh` reads this table, so keep its four columns:
 
 ```markdown
+## Models to validate
+
+| Arch | Hugging Face repo | File | Context |
+|---|---|---|---|
+| <arch from sync.sh report> | <org>/<repo> | <file.gguf, or the -00001-of-0000N shard> | <short or long> |
+
 ## Validation
 
-- [ ] after every step: `sync.sh verify` (no fork code lost, no conflict marker) and the GPU builds the step can break
+- [ ] after every step: `sync.sh verify` and the GPU builds the step can break
 - [ ] end of sync: HIP (gfx1151) and Vulkan builds, CPU build and `ctest -L main`
-- [ ] Strix Halo checklist (step 7), needed if a step is sensitive. Models: <arch (GGUF name)>, one table per model:
-
-| Check | HIP (ROCm0) | Vulkan (Vulkan0) |
-|---|---|---|
-| `test-backend-ops`: no new failure | [ ] | [ ] |
-| `test-llama-archs`, every arch: no new failure | [ ] | [ ] |
-| KLD, 4 corpora at `-c 2048` and all at `-c 16384`: within the thresholds | [ ] | [ ] |
-| `llama-bench` pp and tg: within noise at every depth (tables below) | [ ] | [ ] |
-| server: tool call, same greedy decode, MTP acceptance within 5 points | [ ] | [ ] |
-| Status (TARGET PASS / FAIL / INCOMPLETE) | | |
+- [ ] Strix Halo: `validate.sh --pr <number>`, `summary.md` pasted below, both backends `TARGET PASS`
 
 ## Requirements
 
@@ -175,107 +172,24 @@ No machine names, home paths or model paths in the PR, the commits or the repo: 
 
 ### 7. Validate on a Strix Halo machine
 
-Needed before the PR leaves draft if any step of it had a sensitive conflict, and then on **both backends, HIP (ROCm) and Vulkan**. Give the user the full commands below with the placeholders filled in. Do not shorten them. Run them in clean worktrees, never in a tree with uncommitted work.
-
-Models, as listed by `sync.sh report <last upstream sha of this PR>` under "models to test":
-
-- **every arch**, including all the archs upstream changed: `test-llama-archs` builds a tiny random model per arch and compares each GPU backend with the CPU. No download, a few minutes;
-- **a real GGUF** for each arch whose `src/models/<arch>.cpp` both upstream and the fork changed: KLD, bench and server. If the sync also changes shared paths (kernels, ggml core, graph, KV cache), ask the user which real models to add. Check the arch of a GGUF with `python3 gguf-py/gguf/scripts/gguf_dump.py --no-tensors <model.gguf> | grep general.architecture`.
-
-The baseline is the fork before this sync: the first parent of the first merge of the branch (`$OLD` of the first step), not `origin/master`, which can move during the sync.
+Needed before the PR leaves draft if any step of it is sensitive. Someone with a Strix Halo (gfx1151) machine runs it by hand, in a clean checkout of the repo, with the GPU free:
 
 ```sh
-# 0. the GPU must be free
-pgrep -a -x 'llama-server|llama-cli|llama-bench|llama-perplexity' && echo "stop these first"
-
-# 1. baseline and candidate, one build per backend, same flags
-BASE_REV=<first parent of the first sync merge>
-git worktree add --detach ../sync-base $BASE_REV
-git worktree add --detach ../sync-cand sync/upstream-<date>-<sha>
-flags() { case $1 in hip) echo "-DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang";; vk) echo "-DGGML_VULKAN=ON";; esac; }
-dev()   { case $1 in hip) echo ROCm0;; vk) echo Vulkan0;; esac; }
-for be in hip vk; do
-  for t in base cand; do
-    cmake -S ../sync-$t -B ../sync-$t/build-$be $(flags $be) -DCMAKE_BUILD_TYPE=Release && \
-      cmake --build ../sync-$t/build-$be -j --target llama-perplexity llama-bench llama-server test-backend-ops test-llama-archs || break 2
-  done
-done
-MODELS="<arch>=<model.gguf> <arch>=<model.gguf>"   # one GGUF per arch to test
-L=../sync-logs/$(date +%F)
-C=../sync-cand/tests/corpus
-mkdir -p $L/hip $L/vk
-cat $C/correctness-prose.txt $C/correctness-code.txt $C/correctness-structured.txt $C/correctness-numeric.txt > $L/all.txt
-sha256sum $C/correctness-*.txt $L/all.txt > $L/corpus.sha256
-
-for be in hip vk; do
-  bin() { echo ../sync-$1/build-$be/bin; }
-  D=$L/$be
-
-  # 2. full test-backend-ops on both builds; only new failures count
-  for t in base cand; do $(bin $t)/test-backend-ops -b $(dev $be) > $D/ops-$t.txt 2>&1; done
-  diff <(grep FAIL $D/ops-base.txt | sort) <(grep FAIL $D/ops-cand.txt | sort) > $D/ops-new-fail.txt && echo "$be ops: no new failure"
-
-  # 2b. every model arch: tiny random models, GPU vs CPU logits; only new failures count
-  for t in base cand; do $(bin $t)/test-llama-archs -b $(dev $be) 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > $D/archs-$t.txt; done
-  diff <(grep FAIL $D/archs-base.txt | sort) <(grep FAIL $D/archs-cand.txt | sort) > $D/archs-new-fail.txt && echo "$be archs: no new failure"
-
-  for mm in $MODELS; do
-  M=${mm#*=}
-  D=$L/$be/${mm%%=*}
-  mkdir -p $D
-
-  # 3. logits vs baseline: each corpus at -c 2048, all four together at -c 16384 (several ubatches per chunk)
-  run() {  # <name> <file> <args> <reference args>
-    local O="-m $M -ngl 99 -fa on -ctk f16 -ctv f16"
-    $(bin base)/llama-perplexity $O $3 -f $2 --kl-divergence-base $D/$1.kld > $D/$1-base.txt 2>&1
-    $(bin cand)/llama-perplexity $O $3 --kl-divergence-base $D/$1.kld --kl-divergence > $D/$1-cand.txt 2>&1
-    $(bin base)/llama-perplexity $O $4 --kl-divergence-base $D/$1.kld --kl-divergence > $D/$1-ref.txt 2>&1
-  }
-  for n in prose code structured numeric; do
-    run $n $C/correctness-$n.txt "-c 2048 -b 2048 -ub 2048" "-c 2048 -b 2048 -ub 512"
-  done
-  run long $L/all.txt "-c 16384 -b 512 -ub 512" "-c 16384 -b 256 -ub 256"
-  grep -H -E 'Mean PPL\(Q\)/PPL\(base\)|Mean +KLD|Same top p' $D/*-cand.txt $D/*-ref.txt
-
-  # 4. performance A/B (AGENTS.md command shape), alternating order
-  for t in base cand base cand; do
-    $(bin $t)/llama-bench -m $M -p 2048 -d 0,12000,32000,64000 -b 2048 -ub 2048 -n 0 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o md | tee -a $D/bench-pp-$t.md
-  done
-  for t in base cand; do
-    $(bin $t)/llama-bench -m $M -p 0 -n 128 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o md | tee -a $D/bench-tg-$t.md
-  done
-
-  # 5. server: tool call, greedy decode and MTP drafting
-  for t in base cand; do
-    $(bin $t)/llama-server -m $M -ngl 99 -fa on --jinja --port 8080 --spec-type draft-mtp > $D/server-$t.log 2>&1 &
-    S=$!
-    until curl -sf localhost:8080/health > /dev/null; do sleep 2; done
-    curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"What is the weather in Paris?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"temperature":0}' > $D/tool-$t.json
-    curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"Write a Python function that parses ISO 8601 dates, with tests."}],"max_tokens":256,"temperature":0}' > $D/decode-$t.json
-    kill $S; wait $S
-  done
-  for t in base cand; do python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["choices"][0]; print(sys.argv[1], c["finish_reason"], c["message"].get("tool_calls"))' $D/tool-$t.json; done
-  for t in base cand; do python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); t=r.get("timings",{}); print(sys.argv[1], "accepted", t.get("draft_n_accepted"), "of", t.get("draft_n"))' $D/decode-$t.json; done
-  cmp <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $D/decode-base.json) \
-      <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $D/decode-cand.json) && echo "$be $mm decode: identical"
-  done
-done
+skills/upstream-sync/validate.sh --pr <number>      # HIP and Vulkan, about 40 GB of free disk
 ```
 
-Pass criteria, for each backend and each model:
+It reads the PR: its head is the candidate, the fork before the sync is the baseline, and the "Models to validate" table gives the models (downloaded to `MODELS_DIR`) and their context profile. Then, for each backend, base against candidate:
 
-| Check | Pass |
-|---|---|
-| 1. build | both builds succeed |
-| 2. ops | no FAIL in the candidate that is not in the baseline |
-| 2b. archs | no FAIL in `test-llama-archs` of the candidate that is not in the baseline |
-| 3. logits, for each of the 5 runs | `Same top p` of the candidate >= the reference minus 0.5 points, `Mean KLD` <= 2 x the reference + 0.0001, `PPL(Q)/PPL(base)` within 1 +/- 0.01. The reference run is the baseline against itself with a smaller ubatch: other kernel paths, both correct |
-| 4. performance | pp and tg overlap the baseline within their standard deviations at every depth. Paste the raw tables |
-| 5. server | a valid `get_weather` call on both builds; the same decode text, or the first differing token explained by an upstream change in the step range; MTP acceptance rate within 5 points of the baseline (drop `--spec-type draft-mtp` if the model has no MTP head, and say so) |
+1. build both (HIP gfx1151 and Vulkan);
+2. `test-backend-ops` and `test-llama-archs` (every arch as a tiny random model, GPU against CPU): no new failure;
+3. Qwen3.5-0.8B-Base (`ggml-org/Qwen3.5-0.8B-Base-GGUF`, BF16) in every quant type of `QUANTS`: KLD, pp512 / tg128, and whether the quantizer output changed. The idea comes from upstream `ci/run.sh`, which runs perplexity on every quant of a small Qwen. Plus `test-save-load-state`;
+4. each model of the PR table: KLD on the four corpora at `-c 2048` (and all four at `-c 16384` for a `long` model), `llama-bench` at pp 512, 1024, 2048 and 4096 with `-b 4096 -ub 4096` and tg128, at depths 0, 4096 and 16384 (`short`) or 0, 12000, 32000 and 64000 (`long`), then the server: tool call, greedy decode against the baseline, MTP acceptance.
 
-If a logits check fails, find the step whose merge moves the logits (rebuild at the merge commits of the branch) before going on: it is either an upstream change or a wrong resolution.
+It writes `summary.md`, with one status per backend (`TARGET PASS`, `FAIL` or `INCOMPLETE`) and the tables behind it. Paste it in the PR. The PR leaves draft only when both backends are `TARGET PASS`.
 
-Report one status per backend and model in the PR, as `AGENTS.md` asks: `TARGET PASS` (all checks pass), `FAIL` (any check fails), or `INCOMPLETE` (a check was not run, for example no MTP head). The PR leaves draft only when both are `TARGET PASS`. Attach or summarise the logs of `$L` without local paths.
+Pass criteria, built into the summary: `Same top p` >= the reference minus 0.5 points, `Mean KLD` <= 2 x the reference + 0.0001, `PPL(Q)/PPL(base)` within 1 +/- 0.01, where the reference is the baseline against itself with a smaller ubatch (other kernel paths, both correct); speed within the summed standard deviations of base and candidate; a valid tool call; MTP acceptance within 5 points. A different greedy decode is `INCOMPLETE` until the PR explains it by an upstream change.
+
+If a check fails, find the step whose merge causes it (rerun with `--cand <merge commit>`): it is either an upstream change or a wrong resolution.
 
 Then the user takes the PR out of draft, and a maintainer merges it with a merge commit.
 
