@@ -24,6 +24,10 @@ on:
       - 'scripts/snapdragon/**'
       - 'CMakePresets.json'
 
+cache-mode: none
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
@@ -36,6 +40,10 @@ jobs:
     defaults:
       run:
         shell: bash
+
+    permissions:
+      actions: write
+      contents: read
 
     steps:
       - name: Clone
@@ -66,6 +74,10 @@ jobs:
     defaults:
       run:
         shell: bash
+
+    permissions:
+      actions: write
+      contents: read
 
     steps:
       - name: Clone
@@ -98,6 +110,10 @@ jobs:
       fail-fast: false
       matrix:
         device: [SM8750, SM8850, QCS9075M]
+
+    permissions:
+      actions: read
+      contents: read
 
     steps:
       - name: Checkout
