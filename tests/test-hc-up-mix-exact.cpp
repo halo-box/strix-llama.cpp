@@ -102,32 +102,33 @@ static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh
             eq_rte += ggml_fp32_to_fp16(g32[i]) == gh[i];
             eq_rtz += ggml_fp32_to_fp16(t) == gh[i];
         }
-        auto host = [&](int64_t i0, int64_t t, bool rte32, float * gv) {
+        auto host = [&](int64_t i0, int64_t t, int mode, float * gv) {   // gate: 0 = g16, 1 = RTE(f32 GEMM), 2 = f32 GEMM unrounded
             float r = 0.0f;
             for (int ih = 0; ih < 4; ++ih) {
                 const int64_t gi = t * M + ih * sh.n_embd + i0;
-                const float g = rte32 ? ggml_fp16_to_fp32(ggml_fp32_to_fp16(g32[gi])) : ggml_fp16_to_fp32(gh[gi]);
+                const float g = mode == 2 ? g32[gi] : mode == 1 ? ggml_fp16_to_fp32(ggml_fp32_to_fp16(g32[gi])) : ggml_fp16_to_fp32(gh[gi]);
                 if (gv) gv[ih] = g;
                 const float wv = 1.0f / (1.0f + expf(-g));
                 r = fmaf(ggml_fp16_to_fp32(xv[t * (M + sh.pad) + ih * sh.n_embd + i0]), wv, r);
             }
             return 0.25f * r;
         };
-        double d_on = 0, d_off = 0; size_t on_eq_host = 0, off_eq_host = 0;
+        double d_on = 0, d_off = 0, d_unr = 0; size_t on_eq_host = 0, off_eq_host = 0, on_eq_unr = 0;
         for (int64_t t = 0; t < sh.nt; ++t) for (int64_t i0 = 0; i0 < sh.n_embd; ++i0) {
-            const float h = host(i0, t, false, nullptr); const size_t o = t * sh.n_embd + i0;
+            const float h = host(i0, t, 0, nullptr); const float hu = host(i0, t, 2, nullptr); const size_t o = t * sh.n_embd + i0;
+            d_unr = std::max(d_unr, (double) fabsf(out_on[o] - hu)); on_eq_unr += out_on[o] == hu;
             d_on = std::max(d_on, (double) fabsf(out_on[o] - h)); d_off = std::max(d_off, (double) fabsf(out_off[o] - h));
             on_eq_host += out_on[o] == h; off_eq_host += out_off[o] == h;
         }
-        printf("DIAG n_embd=%lld nt=%lld: g16 == RTE(f32 GEMM) %zu/%lld, == RTZ %zu/%lld; vs host(g16): on equal %zu max|d| %.3g, off equal %zu max|d| %.3g\n",
-               (long long) sh.n_embd, (long long) sh.nt, eq_rte, (long long) ne, eq_rtz, (long long) ne, on_eq_host, d_on, off_eq_host, d_off);
+        printf("DIAG n_embd=%lld nt=%lld: g16 == RTE(f32 GEMM) %zu/%lld, == RTZ %zu/%lld; vs host(g16): on equal %zu max|d| %.3g, off equal %zu max|d| %.3g; on vs host(unrounded gate): equal %zu max|d| %.3g\n",
+               (long long) sh.n_embd, (long long) sh.nt, eq_rte, (long long) ne, eq_rtz, (long long) ne, on_eq_host, d_on, off_eq_host, d_off, on_eq_unr, d_unr);
         int shown = 0;
         for (int64_t t = 0; t < sh.nt && shown < 3; ++t) for (int64_t i0 = 0; i0 < sh.n_embd && shown < 3; ++i0) {
             const size_t o = t * sh.n_embd + i0;
             if (memcmp(&out_on[o], &out_off[o], 4) == 0) continue;
             float gv[4], gr[4];
-            const float h = host(i0, t, false, gv); const float hr = host(i0, t, true, gr);
-            printf("DIAG  i0=%lld t=%lld on=%.9g off=%.9g host(g16)=%.9g host(RTE f32)=%.9g g16=[%g %g %g %g] rte=[%g %g %g %g]\n",
+            const float h = host(i0, t, 0, gv); const float hr = host(i0, t, 2, gr);
+            printf("DIAG  i0=%lld t=%lld on=%.9g off=%.9g host(g16)=%.9g host(unrounded)=%.9g g16=[%g %g %g %g] f32=[%.9g %.9g %.9g %.9g]\n",
                    (long long) i0, (long long) t, out_on[o], out_off[o], h, hr, gv[0], gv[1], gv[2], gv[3], gr[0], gr[1], gr[2], gr[3]);
             shown++;
         }
