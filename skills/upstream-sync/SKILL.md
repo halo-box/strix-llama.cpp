@@ -147,9 +147,17 @@ skills/upstream-sync/sync.sh summary $OLD0 > body.md
 
 It contains, for each step: the upstream PR that ends it and its upstream commits, the conflicted files (`*` = sensitive) with the resolution line of the merge message, **the conflict zones** (line ranges of the merged file), the resolution diff (automatic merge with markers -> committed), and **every edit outside the conflicts**: a change in a file that did not conflict, or in a conflicted file outside its conflict zones. Nothing marks such edits during the merge, so each one needs an explanation in the PR. The body ends with the diffstat of the whole sync. GitHub limits a PR body to 65536 characters: if `body.md` is longer, keep the overview table in the body and post the `## Steps` part as PR comments, one per step.
 
-Then append the models and the validation part, keep it short, and tick a box only for a check that really ran. One row per model to validate: the archs `sync.sh models $OLD0` lists, and the models the user adds for shared paths. `validate.sh` reads this table, so keep its three columns:
+Then append the models and the validation part, keep it short, and tick a box only for a check that really ran.
+
+`## Models concerned` lists **every** model arch the sync concerns: `sync.sh models $OLD0` prints the table with the reason for each arch (upstream changes its model file, or the fork changes or tests it and the sync changes shared paths). Fill its Validation column for every row: a real GGUF, listed in `## Models to validate`, or `test-llama-archs` only with the reason (no GGUF exists, too large for the machine, needs a target model...). No arch may be left out.
+
+`## Models to validate` holds the real GGUFs. `validate.sh` reads this table, so keep its three columns:
 
 ```markdown
+## Models concerned
+
+<output of sync.sh models $OLD0, Validation column filled>
+
 ## Models to validate
 
 | Arch | Hugging Face repo | File |

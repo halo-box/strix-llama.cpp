@@ -3,7 +3,7 @@
 #   sync.sh report [target]        the step plan (one step per conflicting upstream PR), the models to test, the next step in detail
 #   sync.sh merge  [target]        start the merge of target on the current branch, from the content base
 #   sync.sh verify <old> [target]  after the merge commit: did every fork change survive?
-#   sync.sh models <old> [target]  model archs to validate for a sync PR started at <old>, up to target (default HEAD^2)
+#   sync.sh models <old> [target]  table of every model arch a sync PR started at <old> concerns, up to target (default HEAD^2)
 #   sync.sh summary <old> [branch] markdown for the sync PR: every step, its upstream PRs, conflicts, conflict zones, resolutions and edits outside conflicts
 # target defaults to the next step: the first conflicting upstream commit, or at most MAX_STEP commits.
 set -euo pipefail
@@ -109,25 +109,25 @@ plan() {
     echo "$steps steps, $sens with sensitive conflicts"
 }
 
-# Model archs to test: src/models/<arch>.cpp changed by upstream in the range and by the fork since the base.
+# Every model arch the sync concerns, as a markdown table for the PR: archs whose src/models file upstream changes,
+# and, when shared paths change, every arch the fork changes or tests in its code (LLM_ARCH_...).
 # <fork>: the fork before the sync (default HEAD); after merges, HEAD already holds upstream changes.
-# An arch only upstream changed comes in as upstream wrote it.
 models() {  # <base> <target> [fork]
-    local up fork both
+    local fork=${3:-HEAD} up forkm gates shared=no a why
     up=$(git diff --name-only "$1" "$2" -- src/models/ | sed -n 's#^src/models/\(.*\)\.cpp$#\1#p' | sort -u)
-    fork=$(git diff --name-only "$1" "${3:-HEAD}" -- src/models/ | sed -n 's#^src/models/\(.*\)\.cpp$#\1#p' | sort -u)
-    both=$(comm -12 <(echo "$up") <(echo "$fork") | sed '/^$/d')
-    echo "  changed by upstream, checked with test-llama-archs: $(echo "$up" | grep -c .) archs"
-    echo "$up" | paste -sd' ' | fold -s -w 110 | sed 's/^/    /'
-    echo "  changed on both sides, checked with a real GGUF:"
-    if [ -n "$both" ]; then
-        echo "$both" | sed 's/^/    /'
-    else
-        echo "    none"
-    fi
-    if git diff --name-only "$1" "$2" | grep -qE "$SHARED"; then
-        echo "  shared paths changed too (kernels, ggml core, graph, KV cache): ask the user which real models to add"
-    fi
+    forkm=$(git diff --name-only "$1" "$fork" -- src/models/ | sed -n 's#^src/models/\(.*\)\.cpp$#\1#p' | sort -u)
+    gates=$(git diff "$1" "$fork" -- src ggml common tools | grep -E '^\+' | grep -oE 'LLM_ARCH_[A-Z0-9_]+' | sort -u | \
+        while read -r e; do git show "$fork:src/llama-arch.cpp" | sed -n "s/.*{ *$e *, *\"\([^\"]*\)\".*/\1/p"; done | sort -u)
+    if git diff --name-only "$1" "$2" | grep -qE "$SHARED"; then shared=yes; fi
+    echo "| Arch | Why it is concerned | Validation |"
+    echo "|---|---|---|"
+    for a in $({ echo "$up"; if [ $shared = yes ]; then echo "$forkm"; echo "$gates"; fi; } | sed '/^$/d' | sort -u); do
+        why=""
+        if echo "$up" | grep -qx "$a"; then why="upstream changes src/models/$a.cpp"; fi
+        if [ $shared = yes ] && echo "$forkm" | grep -qx "$a"; then why="${why:+$why, }the fork changes it and shared paths changed"; fi
+        if [ $shared = yes ] && echo "$gates" | grep -qx "$a" && ! echo "$forkm" | grep -qx "$a"; then why="${why:+$why, }fork code tests it and shared paths changed"; fi
+        echo "| $a | $why | <real GGUF (see Models to validate), or test-llama-archs only and why> |"
+    done
 }
 
 report() {
@@ -157,7 +157,7 @@ report() {
     plan "$base" "$ours"
 
     echo
-    echo "== models to test, upstream $(git rev-parse --short "$base")..$(git rev-parse --short "${1:-$UPSTREAM}")"
+    echo "== models concerned, upstream $(git rev-parse --short "$base")..$(git rev-parse --short "${1:-$UPSTREAM}")"
     models "$base" "$(git rev-parse "${1:-$UPSTREAM}")"
 
     target=$(resolve_target "$base" "$ours" "${1:-}")

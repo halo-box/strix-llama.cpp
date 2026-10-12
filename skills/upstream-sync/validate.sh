@@ -68,7 +68,7 @@ if [ -n "$PR" ]; then
     head=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["headRefName"])' "$PR_BODY.json")
     PR_BASE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseRefName"])' "$PR_BODY.json")
     rm -f "$PR_BODY.json"
-    for h in "Overview" "Steps" "Models to validate"; do
+    for h in "Overview" "Steps" "Models concerned" "Models to validate"; do
         [ -n "$(section "$h")" ] || die "PR $PR has no '## $h' section: generate the body with 'sync.sh summary' and fill the models table (SKILL.md, step 6)"
     done
     echo "== $PR_URL"
