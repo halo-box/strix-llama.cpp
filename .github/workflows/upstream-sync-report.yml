@@ -1,0 +1,55 @@
+name: Upstream sync report
+
+# Every 3 days, post the upstream sync plan (skills/upstream-sync/sync.sh report) to one open issue.
+# It only reports: it never merges or pushes. The sync itself follows skills/upstream-sync/SKILL.md.
+# Note: */3 restarts on the 1st of each month, so two runs can be one day apart at month end.
+
+on:
+  schedule:
+    - cron: '0 6 */3 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-sync-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: github.repository == 'halo-box/strix-llama.cpp'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Report
+        run: |
+          git remote add upstream https://github.com/ggml-org/llama.cpp
+          skills/upstream-sync/sync.sh report > report.txt 2>&1 || { echo "sync.sh report failed" >> report.txt; }
+
+      - name: Post to the issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: Upstream sync report
+        run: |
+          {
+            echo "Plan for the next upstream sync, generated $(date -u +%F) from \`master\` $(git rev-parse --short HEAD)."
+            echo "Follow \`skills/upstream-sync/SKILL.md\`. Steps marked \`*\` have sensitive conflicts and need the Strix Halo validation."
+            echo
+            echo '```'
+            head -c 60000 report.txt
+            echo '```'
+          } > body.md
+          n=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          if [ -n "$n" ]; then
+            gh issue edit "$n" --repo "$GITHUB_REPOSITORY" --body-file body.md
+            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "Plan updated $(date -u +%F)."
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file body.md
+          fi

@@ -1,43 +1,50 @@
 ---
 name: upstream-sync
-description: Merge upstream ggml-org/llama.cpp master into this fork in small steps, without losing fork code, and validate each step on a Strix Halo machine. Use when asked to sync, update from, catch up with, or pull upstream / ggml-org master into the fork.
+description: Merge upstream ggml-org/llama.cpp master into this fork every 3 days, one step per conflicting upstream PR, without losing fork code, and validate the sensitive steps on a Strix Halo machine. Use when asked to sync, update from, catch up with, or pull upstream / ggml-org master into the fork.
 ---
 
 # Upstream sync
 
-Bring `upstream/master` (ggml-org/llama.cpp) into `master` (halo-box/strix-llama.cpp) while keeping every fork change. Read `SYNC.md` and `AGENTS.md` first. halo-box/llama.cpp is not part of this sync.
+Bring `upstream/master` (ggml-org/llama.cpp) into `master` (halo-box/strix-llama.cpp) while keeping every fork change. Read `SYNC.md` and `AGENTS.md` first. halo-box/llama.cpp is archived and is not part of this sync.
 
 ## Strategy (do not deviate without asking)
 
 - **Merge, never rebase or squash.** Work on a branch `sync/upstream-<YYYY-MM-DD>`, land it through a PR on halo-box/strix-llama.cpp, and merge it with **"Create a merge commit"**. Squash drops the upstream ancestry (see `SYNC.md`).
-- **Use the content base, not `git merge-base`.** `scripts/upstream-sync.base` holds the upstream commit whose content is really in the fork. After the revert of #155, `git merge-base` claims upstream 2026-10-08 while the content is 2026-09-29, so a plain `git merge` skips 260 upstream commits. `sync.sh merge` merges from the content base and updates the file in the merge commit.
-- **Small steps.** One step ends at the first conflicting upstream commit, or after 100 commits (`MAX_STEP`). Several steps can go on the same branch. Build after each step.
+- **Every 3 days.** At about 25 upstream PRs a day, a sync brings about 75 PRs and a handful of conflicts. A scheduled workflow (`.github/workflows/upstream-sync-report.yml`) posts the plan to an issue as a reminder.
+- **One step per conflicting upstream PR.** A step merges all clean upstream PRs up to and including the next PR that conflicts with the fork, so each step has the conflicts of one upstream PR only. A clean run is cut every 100 commits (`MAX_STEP`). All steps of a sync go on the same branch, one merge commit each.
+- **Use the content base, not `git merge-base`.** `scripts/upstream-sync.base` holds the upstream commit whose content is really in the fork. After the revert of #155, `git merge-base` claims upstream 2026-10-08 while the content is 2026-09-29, so a plain `git merge` skips 260 upstream commits. `sync.sh merge` merges from the content base and updates the file in each merge commit.
 - **Never drop fork code to make a conflict go away.** If the right resolution is unclear (for example upstream rewrote the function the fork patches), stop and ask.
-- **When upstream now does what a fork change did, upstream wins:** take theirs, remove our copy, and say so in the merge message.
+- **When upstream now does what a fork change did, upstream wins**, but only with numbers: if the fork code was a gfx1151 optimization, show `llama-bench` before/after in the PR. Without numbers, keep the fork code.
 
 ## Steps
 
-### 1. Report
+### 1. Report and plan
 
 ```sh
 git remote add upstream https://github.com/ggml-org/llama.cpp   # once
 git config rerere.enabled true                                  # remember resolutions across steps and retries
-# rerere replays any resolution it recorded, also a throwaway one from a test (the cache is shared by all worktrees).
-# After a test merge, run `git rerere forget <file>` for each file, or clear .git/rr-cache.
 skills/upstream-sync/sync.sh report
 ```
 
-It prints the content base and the history base (with a warning if they differ), the next step target, and for each conflicted file the fork commits that own our side and the upstream commits on theirs. Summarise this for the user before merging.
+It prints:
+
+- the content base and the history base, with a warning if they differ;
+- **the plan**: one line per step, with the number of upstream commits, the PR that ends it, and its new conflicted files (`*` = sensitive, see `SENSITIVE` in `sync.sh`). The plan is computed against the fork as it is now, so later steps can shift a little once earlier ones are resolved;
+- the next step in detail: for each conflicted file, the fork commits that own our side and the upstream commits on theirs.
+
+Show the plan to the user. The user decides how many steps go in this sync PR. During a catch-up, end each PR after a few sensitive steps, so a regression stays easy to locate.
+
+rerere replays any resolution it recorded, also a throwaway one from a test (the cache is shared by all worktrees). After a test merge, run `git rerere forget <file>` for each file, or clear `.git/rr-cache`. When rerere resolved a file for you, review it with `git rerere diff` before you commit.
 
 ### 2. Merge one step
 
 ```sh
+git switch -c sync/upstream-$(date +%F) master      # first step only
 OLD=$(git rev-parse HEAD)
-git switch -c sync/upstream-$(date +%F) master      # or stay on the sync branch for the next step
-skills/upstream-sync/sync.sh merge                  # or: sync.sh merge <upstream-sha>
+skills/upstream-sync/sync.sh merge                  # next step of the plan, or: sync.sh merge <upstream-sha>
 ```
 
-The tree must be clean. The merge stops before the commit, with normal conflict state (`git status`, `git checkout --ours/--theirs`, `git mergetool` and rerere all work).
+The tree must be clean. The merge stops before the commit, with normal conflict state (`git status`, `git checkout --ours/--theirs`, `git mergetool` and rerere all work). It says if the step has sensitive conflicts.
 
 ### 3. Resolve conflicts
 
@@ -66,17 +73,23 @@ skills/upstream-sync/sync.sh verify $OLD
 - **Fork diff size changed:** inspect with `git diff <target> HEAD -- <file>` and confirm the fork change is intact.
 - It fails if HEAD is not a merge of the target, or if conflict markers are left.
 
-### 5. Build where you are
+### 5. Build after every step (no GPU needed)
 
 ```sh
 cmake -B build-check -DCMAKE_BUILD_TYPE=Release
 cmake --build build-check -j
 ctest --test-dir build-check -L main --output-on-failure -j 8
+
+# the HIP kernels are the most customized fork code: compile them at every step (ROCm toolchain or a ROCm container, no GPU)
+cmake -B build-hip -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" -DCMAKE_BUILD_TYPE=Release
+cmake --build build-hip -j
 ```
 
-This catches API breaks in shared code (common/, src/, server, ggml core) and tokenizer regressions. It does not compile the HIP kernels. If ROCm is installed, also run the HIP build from step 7.
+A clean step can still break a fork kernel (for example a changed signature in `ggml-cuda/common.cuh`), so do not skip the HIP build on steps without conflicts.
 
 `test-tokenizers-ggml-vocabs` needs `git lfs`. Without it, the test reads LFS pointer files and fails with `invalid magic characters: 'vers'`. That is not a merge failure.
+
+Then go back to step 2 for the next step of this sync.
 
 ### 6. Push and open a draft PR on the fork
 
@@ -86,69 +99,96 @@ gh pr create --draft --repo halo-box/strix-llama.cpp --base master \
   --title "Merge upstream llama.cpp up to <short-sha> (<date>)" --body-file <file>
 ```
 
-Always pass `--repo halo-box/strix-llama.cpp`. Never open anything against ggml-org/llama.cpp or halo-box/llama.cpp. The body contains: upstream range and commit count, conflicted files with their resolutions, the `verify` output, what was and was not tested, the checklist below, and the agent disclosure required by `AGENTS.md`.
+Always pass `--repo halo-box/strix-llama.cpp`. Never open anything against ggml-org/llama.cpp or halo-box/llama.cpp. The body contains:
 
-### 7. Hand off to the Strix Halo machine
+- the upstream range, the number of steps and commits;
+- for each step, the conflicted files with their resolutions;
+- the `verify` output and the build results;
+- the validation status (below), and what was and was not tested;
+- the agent disclosure required by `AGENTS.md`.
 
-The PR cannot leave draft until these checks pass on a gfx1151 machine. Give the user the **full commands below**, with the date, the op list and the model path filled in. Do not shorten them. Run them in clean worktrees, never in a tree with uncommitted work.
+No machine names, home paths or model paths in the PR, the commits or the repo: use placeholders like `<model.gguf>`.
+
+### 7. Validate on a Strix Halo machine
+
+Needed before the PR leaves draft if any step of it had a sensitive conflict. Give the user the full commands below with the placeholders filled in. Do not shorten them. Run them in clean worktrees, never in a tree with uncommitted work.
+
+The baseline is the fork before this sync: the first parent of the first merge of the branch (`$OLD` of the first step), not `origin/master`, which can move during the sync.
 
 ```sh
 # 0. the GPU must be free
 pgrep -a -x 'llama-server|llama-cli|llama-bench|llama-perplexity' && echo "stop these first"
 
-# 1. baseline (master) and candidate (sync branch), same flags
-git fetch origin
-git worktree add --detach ../strix-master origin/master 2>/dev/null || git -C ../strix-master checkout --detach origin/master
-git worktree add ../strix-sync sync/upstream-<date> 2>/dev/null || git -C ../strix-sync checkout sync/upstream-<date>
+# 1. baseline and candidate, same flags
+BASE_REV=<first parent of the first sync merge>
+git worktree add --detach ../sync-base $BASE_REV
+git worktree add --detach ../sync-cand sync/upstream-<date>
 HIP="-DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang -DCMAKE_BUILD_TYPE=Release"
-for t in ../strix-master ../strix-sync; do
+for t in ../sync-base ../sync-cand; do
   cmake -S $t -B $t/build $HIP && cmake --build $t/build -j --target llama-perplexity llama-bench llama-server test-backend-ops || break
 done
 M=<model.gguf>
+L=../sync-logs/$(date +%F)
+mkdir -p $L
 
-# 2. ops touched by this sync (upstream or fork side): all must be OK. If one fails, run it on master too: only new failures count.
-../strix-sync/build/bin/test-backend-ops -b ROCm0 -o <MUL_MAT,MUL_MAT_ID,TOP_K,ARGSORT,GATED_DELTA_NET,FLASH_ATTN_EXT>
+# 2. full test-backend-ops on both builds; only new failures count
+for t in base cand; do ../sync-$t/build/bin/test-backend-ops -b ROCm0 > $L/ops-$t.txt 2>&1; done
+diff <(grep -E 'FAIL' $L/ops-base.txt | sort) <(grep -E 'FAIL' $L/ops-cand.txt | sort) && echo "ops: no new failure"
 
-# 3. logits vs master on the target model, same bytes for both
-for i in $(seq 8); do cat ../strix-sync/tests/corpus/correctness-*.txt; done > /tmp/sync-corpus.txt
-sha256sum /tmp/sync-corpus.txt
-A="-m $M -c 2048 -b 4096 -ub 4096 -ngl 99 -fa on -ctk f16 -ctv f16"
-../strix-master/build/bin/llama-perplexity $A -f /tmp/sync-corpus.txt --kl-divergence-base /tmp/sync-master.kld
-../strix-sync/build/bin/llama-perplexity $A --kl-divergence-base /tmp/sync-master.kld --kl-divergence | tee /tmp/sync-kld.txt
-# noise reference: master against itself with another ubatch size (other kernel paths, both correct)
-../strix-master/build/bin/llama-perplexity ${A/-ub 4096/-ub 512} --kl-divergence-base /tmp/sync-master.kld --kl-divergence | tee /tmp/sync-kld-ref.txt
-grep -E 'Mean PPL\(Q\)/PPL\(base\)|Mean +KLD|Same top p' /tmp/sync-kld.txt /tmp/sync-kld-ref.txt
+# 3. logits vs baseline on the target model, per corpus, short and long context
+for f in ../sync-cand/tests/corpus/correctness-*.txt; do
+  n=$(basename $f .txt)
+  # llama-perplexity needs at least 2 x n_ctx tokens: repeat the corpus to about 200 KB (well over 32768 tokens)
+  : > $L/$n.txt; while [ $(stat -c %s $L/$n.txt) -lt 200000 ]; do cat $f >> $L/$n.txt; done
+  sha256sum $L/$n.txt >> $L/corpus.sha256
+  for mode in short long; do
+    if [ $mode = short ]; then A="-c 2048 -b 2048 -ub 2048"; R="-c 2048 -b 2048 -ub 512"; else A="-c 16384 -b 512 -ub 512"; R="-c 16384 -b 256 -ub 256"; fi
+    A="-m $M -ngl 99 -fa on -ctk f16 -ctv f16 $A"; R="-m $M -ngl 99 -fa on -ctk f16 -ctv f16 $R"
+    ../sync-base/build/bin/llama-perplexity $A -f $L/$n.txt --kl-divergence-base $L/$n-$mode.kld > $L/$n-$mode-base.txt 2>&1
+    ../sync-cand/build/bin/llama-perplexity $A --kl-divergence-base $L/$n-$mode.kld --kl-divergence > $L/$n-$mode-cand.txt 2>&1
+    ../sync-base/build/bin/llama-perplexity $R --kl-divergence-base $L/$n-$mode.kld --kl-divergence > $L/$n-$mode-ref.txt 2>&1
+  done
+done
+grep -H -E 'Mean PPL\(Q\)/PPL\(base\)|Mean +KLD|Same top p' $L/*-cand.txt $L/*-ref.txt
 
 # 4. performance A/B (AGENTS.md command shape), alternating order
-for b in ../strix-master ../strix-sync ../strix-master ../strix-sync; do
-  $b/build/bin/llama-bench -m $M -p 2048 -d 0,12000,32000,64000 -b 4096 -ub 4096 -n 0 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o md
+for t in base cand base cand; do
+  ../sync-$t/build/bin/llama-bench -m $M -p 2048 -d 0,12000,32000,64000 -b 2048 -ub 2048 -n 0 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o md | tee -a $L/bench-pp-$t.md
 done
-for b in ../strix-master ../strix-sync; do
-  $b/build/bin/llama-bench -m $M -p 0 -n 128 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o md
+for t in base cand; do
+  ../sync-$t/build/bin/llama-bench -m $M -p 0 -n 128 -r 4 -ngl 99 -fa on -ctk f16 -ctv f16 --load-mode none -o md | tee -a $L/bench-tg-$t.md
 done
 
-# 5. server: tool call and MTP drafting, on master then on the sync build
-for b in ../strix-master ../strix-sync; do
-  $b/build/bin/llama-server -m $M -ngl 99 -fa on --jinja --port 8080 --spec-type draft-mtp > /tmp/sync-server.log 2>&1 &
+# 5. server: tool call, greedy decode and MTP drafting, on both builds
+for t in base cand; do
+  ../sync-$t/build/bin/llama-server -m $M -ngl 99 -fa on --jinja --port 8080 --spec-type draft-mtp > $L/server-$t.log 2>&1 &
   S=$!
   until curl -sf localhost:8080/health > /dev/null; do sleep 2; done
-  curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"What is the weather in Paris?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"temperature":0}' \
-    | python3 -c 'import json,sys; c=json.load(sys.stdin)["choices"][0]; print(c["finish_reason"], c["message"].get("tool_calls"))'
-  curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"Write a Python function that parses ISO 8601 dates, with tests."}],"max_tokens":300,"temperature":0}' \
-    | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["choices"][0]["message"]["content"][:300]); print(r.get("timings"))'
+  curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"What is the weather in Paris?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"temperature":0}' > $L/tool-$t.json
+  curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"Write a Python function that parses ISO 8601 dates, with tests."}],"max_tokens":256,"temperature":0}' > $L/decode-$t.json
   kill $S; wait $S
 done
+for t in base cand; do python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["choices"][0]; print(sys.argv[1], c["finish_reason"], c["message"].get("tool_calls"))' $L/tool-$t.json; done
+for t in base cand; do python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); t=r.get("timings",{}); print(sys.argv[1], "accepted", t.get("draft_n_accepted"), "of", t.get("draft_n"))' $L/decode-$t.json; done
+cmp <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $L/decode-base.json) \
+    <(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' $L/decode-cand.json) && echo "decode: identical"
 ```
 
 Pass criteria:
 
-- Step 1: both builds succeed.
-- Step 2: every case OK, or the same failures as master.
-- Step 3: `Same top p` and `Mean KLD` of the sync build are no worse than the noise reference (within the printed uncertainty), and `PPL(Q)/PPL(base)` is about 1. If not, find the upstream commit inside the step that moves the logits before going on.
-- Step 4: pp and tg overlap master within their standard deviations at every depth. Paste the raw tables in the PR.
-- Step 5: `tool_calls` with a valid `get_weather` call on both builds; coherent text, and `draft_n_accepted` > 0 in `timings` (drop `--spec-type draft-mtp` if the model has no MTP head, and say so).
+| Check | Pass |
+|---|---|
+| 1. build | both builds succeed |
+| 2. ops | no FAIL in the candidate that is not in the baseline |
+| 3. logits, for each corpus and both modes | `Same top p` of the candidate >= the reference minus 0.5 points, `Mean KLD` <= 2 x the reference + 0.0001, `PPL(Q)/PPL(base)` within 1 +/- 0.01. The reference run is the baseline against itself with a smaller ubatch: other kernel paths, both correct |
+| 4. performance | pp and tg overlap the baseline within their standard deviations at every depth. Paste the raw tables |
+| 5. server | a valid `get_weather` call on both builds; the same decode text, or the first differing token explained by an upstream change in the step range; MTP acceptance rate within 5 points of the baseline (drop `--spec-type draft-mtp` if the model has no MTP head, and say so) |
 
-Then the user takes the PR out of draft, and a maintainer merges it with a merge commit. After the merge, the next sync starts again at step 1.
+If a logits check fails, find the step whose merge moves the logits (rebuild at the merge commits of the branch) before going on: it is either an upstream change or a wrong resolution.
+
+Report one status in the PR, as `AGENTS.md` asks: `TARGET PASS` (all checks pass), `FAIL` (any check fails), or `INCOMPLETE` (a check was not run, for example no MTP head). Attach or summarise the logs of `$L` without local paths.
+
+Then the user takes the PR out of draft, and a maintainer merges it with a merge commit.
 
 ## Abort
 

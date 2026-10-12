@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Helper for the upstream-sync skill (skills/upstream-sync/SKILL.md, SYNC.md).
-#   sync.sh report [target]        what the next merge step brings in, and which fork commits own each conflict
+#   sync.sh report [target]        the step plan (one step per conflicting upstream PR), then the next step in detail
 #   sync.sh merge  [target]        start the merge of target on the current branch, from the content base
 #   sync.sh verify <old> [target]  after the merge commit: did every fork change survive?
 # target defaults to the next step: the first conflicting upstream commit, or at most MAX_STEP commits.
@@ -11,6 +11,8 @@ cd "$(git rev-parse --show-toplevel)"
 
 UPSTREAM=${UPSTREAM:-upstream/master}
 MAX_STEP=${MAX_STEP:-100}
+# conflicts in these paths need a run of the validation checklist on a Strix Halo machine
+SENSITIVE=${SENSITIVE:-'^(ggml/src/ggml-cuda/|ggml/src/ggml-vulkan/|ggml/src/ggml-backend|ggml/src/ggml-alloc|src/models/|src/llama-graph|src/llama-context|src/llama-kv-cache|src/llama-memory|src/llama-arch|src/llama-model|src/llama-vocab|conversion/|gguf-py/gguf/constants)'}
 BASE_FILE=scripts/upstream-sync.base
 
 TMP=$(mktemp -d)
@@ -78,6 +80,31 @@ resolve_target() {  # <base> <ours> [target]
 
 oneline() { git log -1 --format='%h %cs %s' "$1"; }
 
+# One step per upstream commit that adds a conflicted file, plus a cut every MAX_STEP clean commits.
+# Computed against the fork as it is now, so later steps can shift once earlier ones are resolved.
+plan() {
+    local base=$1 ours=$2 c n=0 last=0 steps=0 sens=0 prev="" cur new mark
+    printf '%-4s %-7s %-35s %s\n' step commits "ends at" "new conflicts (* = sensitive)"
+    for c in $(git rev-list --first-parent --reverse "$base..$UPSTREAM"); do
+        n=$((n + 1))
+        if try_merge "$base" "$ours" "$c"; then cur=""; else cur=$(conflict_files | sort); fi
+        new=$(comm -13 <(echo "$prev" | sed '/^$/d') <(echo "$cur" | sed '/^$/d') | paste -sd, -)
+        if [ -n "$new" ] || [ $((n - last)) -ge "$MAX_STEP" ]; then
+            steps=$((steps + 1))
+            mark=""
+            if echo "$new" | tr ',' '\n' | grep -qE "$SENSITIVE"; then mark="*"; sens=$((sens + 1)); fi
+            printf '%-4s %-7s %-35s %s%s\n' "$steps" "$((n - last))" "$(git log -1 --format='%h %cs' "$c") $(git log -1 --format=%s "$c" | grep -oE '#[0-9]+\)$' | tr -d ')')" "$mark" "${new:-(none)}"
+            last=$n
+        fi
+        prev=$cur
+    done
+    if [ "$n" -gt "$last" ]; then
+        steps=$((steps + 1))
+        printf '%-4s %-7s %-35s %s\n' "$steps" "$((n - last))" "$(git log -1 --format='%h %cs' "$c")" "(none)"
+    fi
+    echo "$steps steps, $sens with sensitive conflicts"
+}
+
 report() {
     fetch
     local ours base hist target left
@@ -99,6 +126,10 @@ report() {
         echo "nothing to merge"
         return 0
     fi
+
+    echo
+    echo "== plan"
+    plan "$base" "$ours"
 
     target=$(resolve_target "$base" "$ours" "${1:-}")
     echo
@@ -172,6 +203,9 @@ merge() {
     if [ "$rc" -ne 0 ]; then
         echo "conflicts to resolve:"
         git diff --name-only --diff-filter=U | sed 's/^/  /'
+        if git diff --name-only --diff-filter=U | grep -qE "$SENSITIVE"; then
+            echo "sensitive: run the validation checklist on a Strix Halo machine before this sync PR leaves draft"
+        fi
     else
         echo "no conflicts"
     fi
