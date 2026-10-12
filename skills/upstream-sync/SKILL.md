@@ -9,7 +9,7 @@ Bring `upstream/master` (ggml-org/llama.cpp) into `master` (halo-box/strix-llama
 
 ## Strategy (do not deviate without asking)
 
-- **Merge, never rebase or squash.** Work on a branch `sync/upstream-<YYYY-MM-DD>`, land it through a PR on halo-box/strix-llama.cpp, and merge it with **"Create a merge commit"**. Squash drops the upstream ancestry (see `SYNC.md`).
+- **Merge, never rebase or squash.** Work on a branch `sync/upstream-<YYYY-MM-DD>-<sha>`: the day of the sync and the short sha of the last upstream commit it merges (the end of the last planned step), for example `sync/upstream-2026-10-12-8019dc563`. Then land it through a PR on halo-box/strix-llama.cpp, and merge it with **"Create a merge commit"**. Squash drops the upstream ancestry (see `SYNC.md`).
 - **Every 3 days.** At about 25 upstream PRs a day, a sync brings about 75 PRs and a handful of conflicts. A scheduled workflow (`.github/workflows/upstream-sync-report.yml`) posts the plan to an issue as a reminder.
 - **One step per conflicting upstream PR.** A step merges all clean upstream PRs up to and including the next PR that conflicts with the fork, so each step has the conflicts of one upstream PR only. A clean run is cut every 100 commits (`MAX_STEP`). All steps of a sync go on the same branch, one merge commit each.
 - **Use the content base, not `git merge-base`.** `scripts/upstream-sync.base` holds the upstream commit whose content is really in the fork. After the revert of #155, `git merge-base` claims upstream 2026-10-08 while the content is 2026-09-29, so a plain `git merge` skips 260 upstream commits. `sync.sh merge` merges from the content base and updates the file in each merge commit.
@@ -39,7 +39,8 @@ rerere replays any resolution it recorded, also a throwaway one from a test (the
 ### 2. Merge one step
 
 ```sh
-git switch -c sync/upstream-$(date +%F) master      # first step only
+T=<short sha of the last upstream commit of this sync, from the plan>
+git switch -c sync/upstream-$(date +%F)-$T master   # first step only
 OLD=$(git rev-parse HEAD)
 skills/upstream-sync/sync.sh merge                  # next step of the plan, or: sync.sh merge <upstream-sha>
 ```
@@ -122,7 +123,7 @@ pgrep -a -x 'llama-server|llama-cli|llama-bench|llama-perplexity' && echo "stop 
 # 1. baseline and candidate, same flags
 BASE_REV=<first parent of the first sync merge>
 git worktree add --detach ../sync-base $BASE_REV
-git worktree add --detach ../sync-cand sync/upstream-<date>
+git worktree add --detach ../sync-cand sync/upstream-<date>-<sha>
 HIP="-DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang -DCMAKE_BUILD_TYPE=Release"
 for t in ../sync-base ../sync-cand; do
   cmake -S $t -B $t/build $HIP && cmake --build $t/build -j --target llama-perplexity llama-bench llama-server test-backend-ops || break
@@ -193,4 +194,4 @@ Then the user takes the PR out of draft, and a maintainer merges it with a merge
 
 ## Abort
 
-`git merge --abort` (mid-merge), or `git switch master && git branch -D sync/upstream-<date>`. `master` is never touched before the PR is merged.
+`git merge --abort` (mid-merge), or `git switch master && git branch -D sync/upstream-<date>-<sha>`. `master` is never touched before the PR is merged.

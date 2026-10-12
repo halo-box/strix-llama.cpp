@@ -155,7 +155,7 @@ report() {
 merge() {
     [ -z "$(git status --porcelain --untracked-files=no)" ] || die "working tree has uncommitted changes"
     [ ! -e "$(git rev-parse --git-path MERGE_HEAD)" ] || die "a merge is already in progress"
-    [ "$(git rev-parse --abbrev-ref HEAD)" != master ] || die "run on a sync branch: git switch -c sync/upstream-$(date +%F) master"
+    [ "$(git rev-parse --abbrev-ref HEAD)" != master ] || die "run on a sync branch: git switch -c sync/upstream-$(date +%F)-<upstream sha> master"
     fetch
 
     local ours base hist target rc=0 zero n
