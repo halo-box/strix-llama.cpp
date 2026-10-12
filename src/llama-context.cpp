@@ -362,7 +362,7 @@ llama_context::llama_context(
 
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_norm_f16 = true;
-    cparams.fused_dsv4_hc_gate_f16 = true;
+    cparams.fused_dsv4_hc_gate_f16 = false;   // default off (wave 4 ABBA: +1.4% d0, -3.1% d8k); LLAMA_HC_GATE_F16=1 opts in
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
@@ -377,7 +377,7 @@ llama_context::llama_context(
     if (const char * env = getenv("LLAMA_HC_NORM_F16")) {
         cparams.fused_dsv4_hc_norm_f16 = atoi(env) != 0;
     }
-    // LLAMA_HC_GATE_F16=0 keeps the qwen4exp hc mix gate (the hc up GEMM output) in f32 at prefill
+    // LLAMA_HC_GATE_F16=1 stores the qwen4exp hc mix gate (the hc up GEMM output) as f16 at prefill (default f32)
     if (const char * env = getenv("LLAMA_HC_GATE_F16")) {
         cparams.fused_dsv4_hc_gate_f16 = atoi(env) != 0;
     }

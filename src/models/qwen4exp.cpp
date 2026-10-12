@@ -741,7 +741,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(gate, "hc_gate", il);
     // Prefill, on the f16 norm graph: store the gate as f16. The cast directly follows the up GEMM, so a backend that fuses
     // MUL_MAT + CPY(f16) writes f16 from the accumulator and the [hc_dim, T] f32 gate (84 MB on Flash-Next at a 2048-token
-    // ubatch) is neither written nor read: the gated HC pre reads the f16 gate (LLAMA_HC_GATE_F16=0 keeps it f32).
+    // ubatch) is neither written nor read: the gated HC pre reads the f16 gate (LLAMA_HC_GATE_F16=1; default off, the f32 gate fuses as HC_UP_MIX_F32G).
     const bool gate_f16 = norm_f16 && cparams.fused_dsv4_hc_gate_f16;
     if (gate_f16) {
         gate = ggml_cast(ctx0, gate, GGML_TYPE_F16);
