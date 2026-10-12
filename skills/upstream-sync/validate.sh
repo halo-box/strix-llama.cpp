@@ -111,8 +111,35 @@ flags() { case $1 in hip) echo "-DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_HIP_
 dev()   { case $1 in hip) echo ROCm0 ;; vk) echo Vulkan0 ;; cpu) echo CPU ;; esac; }
 ngl()   { if [ "$1" = cpu ]; then echo 0; else echo 99; fi; }
 bin()   { echo "$OUT/build-$1-$2/bin"; }
-# run a command, keep its output, never stop the whole validation on one failure
-run()   { local log=$1; shift; "$@" > "$log" 2>&1 || echo "EXIT=$?" >> "$log"; }
+# GPU memory in use on the amdgpu devices, VRAM + GTT in bytes (GTT matters on an APU); 0 without the counters
+gpu_used() { { cat /sys/class/drm/card*/device/mem_info_vram_used /sys/class/drm/card*/device/mem_info_gtt_used 2> /dev/null || true; } | awk '{s+=$1} END {print s+0}'; }
+# sample a process until it exits: peak RSS of it and its children, peak GPU memory above <gpu bytes before the start>
+peak() {  # <pid> <gpu before>
+    local rp=0 gp=$2 r g
+    while kill -0 "$1" 2> /dev/null; do
+        # the process can exit between two samples: ps then fails, which must not stop the script
+        r=$({ ps -o rss= --ppid "$1" -p "$1" 2> /dev/null || true; } | awk '{s+=$1} END {print s+0}')
+        g=$(gpu_used)
+        [ "$r" -gt "$rp" ] && rp=$r
+        [ "$g" -gt "$gp" ] && gp=$g
+        sleep 0.5
+    done
+    echo "PEAK_RSS_MIB=$((rp / 1024))"
+    [ "$2" -eq 0 ] || echo "PEAK_GPU_MIB=$(((gp - $2) / 1048576))"
+}
+# run a command, keep its output and its memory peaks, never stop the whole validation on one failure
+run() {
+    local log=$1 g0 pid rc=0
+    shift
+    g0=$(gpu_used)
+    "$@" > "$log" 2>&1 &
+    pid=$!
+    peak $pid "$g0" > "$log.mem"
+    wait $pid || rc=$?
+    [ $rc = 0 ] || echo "EXIT=$rc" >> "$log"
+    cat "$log.mem" >> "$log"
+    rm -f "$log.mem"
+}
 
 echo "base $(git log -1 --format='%h %s' "$BASE")"
 echo "cand $(git log -1 --format='%h %s' "$CAND")"
@@ -156,20 +183,23 @@ kld() {  # <be> <label> <model> <text> <args> <reference args>
     rm -f "$k"   # about 0.5 MB per scored token with a 248k vocab
 }
 
-bench() {  # <be> <label> <model> <args>: alternating order, two rounds per side
-    local t
+bench() {  # <be> <label> <model> <args>: alternating order, two rounds per side, one log per round
+    local t i=0
     for t in base cand base cand; do
-        "$(bin $t $1)/llama-bench" -m "$3" $4 -o jsonl >> "$OUT/$1/bench/$2-$t.jsonl" 2>> "$OUT/$1/bench/$2-$t.err" \
-            || echo "EXIT=$?" >> "$OUT/$1/bench/$2-$t.err"
+        i=$((i + 1))
+        run "$OUT/$1/bench/$2-$t-$i.log" "$(bin $t $1)/llama-bench" -m "$3" $4 -o jsonl
     done
 }
 
 server() {  # <be> <arch> <model>: tool call, greedy decode, MTP drafting
-    local be=$1 a=$2 m=$3 t s ok spec
+    local be=$1 a=$2 m=$3 t s ok spec g0 sp
     for t in base cand; do
         for spec in "--spec-type draft-mtp" ""; do
+            g0=$(gpu_used)
             "$(bin $t $be)/llama-server" -m "$m" -ngl $(ngl $be) -fa on --jinja --port 8099 $spec > "$OUT/$be/server/$a-$t.log" 2>&1 &
             s=$! ok=0
+            peak $s "$g0" > "$OUT/$be/server/$a-$t.mem" &
+            sp=$!
             for _ in $(seq 300); do
                 if curl -sf localhost:8099/health > /dev/null; then ok=1; break; fi
                 kill -0 $s 2> /dev/null || break
@@ -182,6 +212,8 @@ server() {  # <be> <arch> <model>: tool call, greedy decode, MTP drafting
             fi
             kill $s 2> /dev/null || true
             wait $s 2> /dev/null || true
+            wait $sp 2> /dev/null || true
+            cat "$OUT/$be/server/$a-$t.mem" >> "$OUT/$be/server/$a-$t.log"
             [ $ok = 1 ] && break
         done
     done
@@ -195,7 +227,8 @@ for be in ${BACKENDS//,/ }; do
     echo "$be: test-backend-ops, test-llama-archs"
     for t in base cand; do
         run "$OUT/$be/ops-$t.txt" "$(bin $t $be)/test-backend-ops" -b "$(dev $be)"
-        "$(bin $t $be)/test-llama-archs" -b "$(dev $be)" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > "$OUT/$be/archs-$t.txt" || true
+        run "$OUT/$be/archs-$t.txt" "$(bin $t $be)/test-llama-archs" -b "$(dev $be)"
+        sed -i 's/\x1b\[[0-9;]*m//g' "$OUT/$be/archs-$t.txt"
     done
 
     # 3. the small model in every quant type: logits, speed, and whether the quantizer output changed

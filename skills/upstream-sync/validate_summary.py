@@ -12,6 +12,8 @@ TOP_P_DROP = 0.5    # points below the reference
 KLD_FACTOR = 2.0    # times the reference, plus KLD_ABS
 KLD_ABS = 1e-4
 PPL_RATIO = 0.01
+MEM_REL = 0.05      # a memory rise above 5 % and MEM_ABS MiB needs an explanation in the PR
+MEM_ABS = 256
 
 out = sys.argv[1]
 
@@ -73,7 +75,10 @@ def bench_rows(be, label):
     sides = {}
     for side in ("base", "cand"):
         rows = {}
-        for line in (read(os.path.join(out, be, "bench", "%s-%s.jsonl" % (label, side))) or "").splitlines():
+        text = "".join(read(f) or "" for f in sorted(glob.glob(os.path.join(out, be, "bench", "%s-%s-*.log" % (label, side)))))
+        for line in text.splitlines():
+            if not line.startswith("{"):
+                continue
             try:
                 j = json.loads(line)
             except ValueError:
@@ -96,6 +101,48 @@ def bench_rows(be, label):
 
 def bench_status(rows):
     return worst(r[4] for r in rows) if rows else INC
+
+
+BREAKDOWN = re.compile(r"\|\s*-?\s*([^|]+?)\s*\|\s*(?:\d+\s*=\s*\d+\s*\+\s*\(\s*)?(\d+)\s*=\s*(\d+)\s*\+\s*(\d+)\s*\+\s*(\d+)")
+
+
+def mem(paths):
+    """Peak RSS and GPU memory (MiB) over the logs of one run, and the llama.cpp breakdown of the last one."""
+    rss = gpu = None
+    breakdown = {}
+    for p in paths:
+        t = read(p)
+        if t is None:
+            continue
+        for key, rx in (("rss", r"PEAK_RSS_MIB=(-?\d+)"), ("gpu", r"PEAK_GPU_MIB=(-?\d+)")):
+            for v in re.findall(rx, t):
+                v = int(v)
+                if key == "rss":
+                    rss = v if rss is None else max(rss, v)
+                else:
+                    gpu = v if gpu is None else max(gpu, v)
+        for line in t.splitlines():
+            if "memory breakdown" in line or "|" not in line:
+                continue
+            m = BREAKDOWN.search(line)
+            if m:
+                breakdown[m.group(1)] = tuple(int(x) for x in m.group(2, 3, 4, 5))   # self, model, context, compute
+    return rss, gpu, breakdown
+
+
+def mem_row(name, base_paths, cand_paths):
+    rb, gb, _ = mem(base_paths)
+    rc, gc, bd = mem(cand_paths)
+    if rc is None:
+        return name, None, INC
+    st = PASS
+    notes = []
+    for b, c in ((rb, rc), (gb, gc)):
+        if b is not None and c is not None and c > b * (1 + MEM_REL) and c - b > MEM_ABS:
+            st = INC
+    fmt = lambda b, c: "-" if c is None else ("%d -> %d MiB" % (b, c) if b is not None else "%d MiB" % c)
+    dev = "; ".join("%s %d = %d + %d + %d" % ((k,) + v) for k, v in bd.items())
+    return name, (fmt(rb, rc), fmt(gb, gc), dev or "-"), st
 
 
 def test_name(key):
@@ -217,6 +264,20 @@ def main():
             statuses.append(st)
             server_rows.append((a, st, note))
 
+        k = lambda *x: os.path.join(out, be, *x)
+        mem_rows = [mem_row("test-backend-ops", [k("ops-base.txt")], [k("ops-cand.txt")]),
+                    mem_row("test-llama-archs", [k("archs-base.txt")], [k("archs-cand.txt")]),
+                    mem_row("test-save-load-state", [k("sls-base.txt")], [k("sls-cand.txt")])]
+        for f in sorted(glob.glob(k("kld", "*-cand.txt"))):
+            label = os.path.basename(f)[:-len("-cand.txt")]
+            mem_rows.append(mem_row("perplexity " + label, [k("kld", label + "-base.txt")], [f]))
+        labels = sorted({os.path.basename(f).rsplit("-", 2)[0] for f in glob.glob(k("bench", "*-cand-*.log"))})
+        for label in labels:
+            mem_rows.append(mem_row("llama-bench " + label, glob.glob(k("bench", label + "-base-*.log")), glob.glob(k("bench", label + "-cand-*.log"))))
+        for a in models:
+            mem_rows.append(mem_row("llama-server " + a, [k("server", a + "-base.log")], [k("server", a + "-cand.log")]))
+        statuses += [r[2] for r in mem_rows]
+
         status = {PASS: "TARGET PASS", FAIL: "FAIL", INC: "INCOMPLETE"}[worst(statuses)]
         print("### %s: %s" % (be, status))
         print()
@@ -260,6 +321,15 @@ def main():
             print()
             for a, st, note in server_rows:
                 print("- %s server: %s. %s" % (a, st, note))
+        print()
+        print("Memory, base -> candidate: peak RSS of the process, peak GPU memory (amdgpu VRAM + GTT above the level before the run), "
+              "and the llama.cpp breakdown of the candidate per device in MiB (self = model + context + compute). "
+              "A rise above %d%% and %d MiB is INCOMPLETE until the PR explains it." % (MEM_REL * 100, MEM_ABS))
+        print()
+        print("| Run | Peak RSS | Peak GPU | Breakdown | Status |")
+        print("|---|---|---|---|---|")
+        for name, v, st in mem_rows:
+            print("| %s | %s | %s | %s | %s |" % ((name,) + (v or ("-", "-", "-")) + (st,)))
         if "CHANGED" in [r[1] for r in quant_rows]:
             print()
             print("Quantizer output CHANGED for some types: upstream changed the quantization. Not a failure, but say so in the PR.")
