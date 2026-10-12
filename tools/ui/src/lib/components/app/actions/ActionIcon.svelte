@@ -16,8 +16,9 @@
 		stopPropagationOnClick?: boolean;
 		target?: string;
 		tooltip?: string;
-		variant?: ButtonVariant;
+		tooltipAsTitle?: boolean;
 		tooltipSide?: TooltipSide;
+		variant?: ButtonVariant;
 	}
 
 	let {
@@ -32,12 +33,13 @@
 		stopPropagationOnClick = false,
 		target,
 		tooltip,
+		tooltipAsTitle = false,
 		tooltipSide = TooltipSide.TOP,
 		variant = 'ghost'
 	}: Props = $props();
 
 	let innerWidth = $state(0);
-	const showTooltip = $derived(!!tooltip && innerWidth > 768);
+	const showTooltip = $derived(!!tooltip && !tooltipAsTitle && innerWidth > 768);
 </script>
 
 {#snippet button(props = {})}
@@ -55,6 +57,7 @@
 		rel={href && target === '_blank' ? 'noopener noreferrer' : undefined}
 		{size}
 		{target}
+		title={tooltipAsTitle ? tooltip : undefined}
 		{variant}
 	>
 		{#if icon}
