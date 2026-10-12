@@ -3,6 +3,7 @@
 #   sync.sh report [target]        the step plan (one step per conflicting upstream PR), the models to test, the next step in detail
 #   sync.sh merge  [target]        start the merge of target on the current branch, from the content base
 #   sync.sh verify <old> [target]  after the merge commit: did every fork change survive?
+#   sync.sh models <old> [target]  model archs to validate for a sync PR started at <old>, up to target (default HEAD^2)
 #   sync.sh summary <old> [branch] markdown for the sync PR: every step, its upstream PRs, conflicts, conflict zones, resolutions and edits outside conflicts
 # target defaults to the next step: the first conflicting upstream commit, or at most MAX_STEP commits.
 set -euo pipefail
@@ -109,11 +110,12 @@ plan() {
 }
 
 # Model archs to test: src/models/<arch>.cpp changed by upstream in the range and by the fork since the base.
+# <fork>: the fork before the sync (default HEAD); after merges, HEAD already holds upstream changes.
 # An arch only upstream changed comes in as upstream wrote it.
-models() {
+models() {  # <base> <target> [fork]
     local up fork both
     up=$(git diff --name-only "$1" "$2" -- src/models/ | sed -n 's#^src/models/\(.*\)\.cpp$#\1#p' | sort -u)
-    fork=$(git diff --name-only "$1" HEAD -- src/models/ | sed -n 's#^src/models/\(.*\)\.cpp$#\1#p' | sort -u)
+    fork=$(git diff --name-only "$1" "${3:-HEAD}" -- src/models/ | sed -n 's#^src/models/\(.*\)\.cpp$#\1#p' | sort -u)
     both=$(comm -12 <(echo "$up") <(echo "$fork") | sed '/^$/d')
     echo "  changed by upstream, checked with test-llama-archs: $(echo "$up" | grep -c .) archs"
     echo "$up" | paste -sd' ' | fold -s -w 110 | sed 's/^/    /'
@@ -368,5 +370,6 @@ case "${1:-}" in
     merge)  shift; merge "$@" ;;
     verify) shift; verify "$@" ;;
     summary) shift; summary "$@" ;;
-    *) echo "usage: $0 report [target] | merge [target] | verify <old-head> [target] | summary <old-head> [branch]" >&2; exit 2 ;;
+    models) shift; models "$(content_base "$1")" "$(git rev-parse "${2:-HEAD^2}")" "$1" ;;
+    *) echo "usage: $0 report [target] | merge [target] | verify <old-head> [target] | summary <old-head> [branch] | models <old-head> [target]" >&2; exit 2 ;;
 esac
