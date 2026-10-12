@@ -7297,10 +7297,12 @@ static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n) {
     // path is a prefill tile and has an open small-n defect (bf16 m=128 n=16/9 k=5120 fail test-backend-ops under route all, 10-11)
     static const uint32_t min_n = [] { const char * e = getenv("GGML_VK_DENSE_F16COOPMAT_MINN"); return e ? (uint32_t) atoi(e) : 32u; }();
     if (k < min_k || n < min_n) return false;
-    // default OFF (10-11, wave-2 gate): with the f32 B the models feed, the routed types read flat on Flash-Next and -3.5% / -3.0%
-    // (d0 / 8k) on Qwen3.6-35B-A3B in-model, against op-level f16-B wins of 12-32%; the int8 MMQ path stays the default for every
-    // dense type. Opt in with the type list that was the default before (q4_K,q5_K,q6_K,q8_0,iq4_xs) or "all".
-    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", ""), t);
+    // Default list (wave 4, measured in-model with the K / N floors above): the K-quants and iq4_xs take the f16-B pf / XL path, q8_0
+    // stays on int8 MMQ. Routing the whole wave-2 list read +11.6% / +8.6% pp (d0 / 32k) on Qwen3.8-27B, whose dense GEMMs are
+    // q4_K / q5_K / q6_K / iq4_xs at K 5120-17408, and flat on Flash-Next (-0.1% / +1.7%) and Qwen3.6-35B-A3B (-0.2% / -0.4%), whose
+    // dense weights are all q8_0 (the int8 path is near-native for q8_0). GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8,
+    // "all" routes every type with a pf pipeline, a comma list replaces the default.
+    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,q6_K,iq4_xs"), t);
 }
 
 static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
