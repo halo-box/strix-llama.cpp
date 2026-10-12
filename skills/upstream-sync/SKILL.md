@@ -118,13 +118,35 @@ gh pr create --draft --repo halo-box/strix-llama.cpp --base master \
   --title "Merge upstream llama.cpp up to <short-sha> (<date>)" --body-file <file>
 ```
 
-Always pass `--repo halo-box/strix-llama.cpp`. Never open anything against ggml-org/llama.cpp or halo-box/llama.cpp. The body contains:
+Always pass `--repo halo-box/strix-llama.cpp`. Never open anything against ggml-org/llama.cpp or halo-box/llama.cpp. Use this body, keep it short, and tick a box only for a check that really ran:
 
-- the upstream range, the number of steps and commits;
-- for each step, the conflicted files with their resolutions;
-- the `verify` output and the build results;
-- the validation status (below), and what was and was not tested;
-- the agent disclosure required by `AGENTS.md`.
+```markdown
+## Overview
+
+Merge upstream ggml-org/llama.cpp <base-sha>..<target-sha> (<n> commits, <k> steps).
+
+| Step | Ends at | Conflicts (* = sensitive) | Resolution |
+|---|---|---|---|
+| 1 | #<upstream PR> | `<file>`* | <one line: what was kept from the fork, what from upstream> |
+
+## Validation
+
+- [ ] `sync.sh verify` after every step: no fork code lost, no conflict marker
+- [ ] CPU build and `ctest -L main` after every step
+- [ ] HIP build (gfx1151) after every step
+- [ ] Strix Halo checklist (step 7), needed if a step is sensitive:
+  - [ ] `test-backend-ops -b ROCm0`: no new failure
+  - [ ] KLD, 4 corpora at `-c 2048` and all at `-c 16384`: within the thresholds
+  - [ ] `llama-bench` pp and tg: within noise at every depth (tables below)
+  - [ ] server: tool call, same greedy decode, MTP acceptance within 5 points
+
+Status: TARGET PASS | FAIL | INCOMPLETE
+
+## Requirements
+
+- AI usage disclosure: <NO / ASSISTED / AGENT-AUTHORED, and how>
+- What was NOT verified: <every unticked box above, and why>
+```
 
 No machine names, home paths or model paths in the PR, the commits or the repo: use placeholders like `<model.gguf>`.
 
