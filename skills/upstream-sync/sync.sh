@@ -3,6 +3,7 @@
 #   sync.sh report [target]        the step plan (one step per conflicting upstream PR), the models to test, the next step in detail
 #   sync.sh merge  [target]        start the merge of target on the current branch, from the content base
 #   sync.sh verify <old> [target]  after the merge commit: did every fork change survive?
+#   sync.sh summary <old> [branch] markdown for the sync PR: every step, its upstream PRs, conflicts, conflict zones, resolutions and edits outside conflicts
 # target defaults to the next step: the first conflicting upstream commit, or at most MAX_STEP commits.
 set -euo pipefail
 export LC_ALL=C
@@ -268,9 +269,104 @@ verify() {
     echo "  (none)"
 }
 
+# Conflict zones of a file with conflict markers: "start-end" line ranges, one per zone.
+zones() { awk '/^<<<<<<< /{s=NR} /^>>>>>>> /{if (s) print s "-" NR; s=0}' "$1"; }
+
+summary() {
+    local old=${1:?usage: sync.sh summary <old-head> [branch]} br=${2:-HEAD} m n=0 p1 p2 base auto files f z first last total edits
+    local -a merges
+    mapfile -t merges < <(git rev-list --first-parent --reverse --merges "$old..$br")
+    [ "${#merges[@]}" -gt 0 ] || die "no merge commit in $old..$br"
+    first=$(content_base "$old")
+    last=$(git rev-parse "${merges[-1]}^2")
+    total=$(git rev-list --count --first-parent "$first..$last")
+
+    echo "## Overview"
+    echo
+    echo "Merge upstream ggml-org/llama.cpp $(git rev-parse --short=9 "$first")..$(git rev-parse --short=9 "$last") ($(git log -1 --format=%cs "$first") to $(git log -1 --format=%cs "$last")): $total upstream commits in ${#merges[@]} steps."
+    echo
+    echo "| Step | Ends at | Upstream commits | Conflicts (* = sensitive) | Edits outside conflicts |"
+    echo "|---|---|---|---|---|"
+    for m in "${merges[@]}"; do
+        n=$((n + 1)); p1=$(git rev-parse "$m^1"); p2=$(git rev-parse "$m^2"); base=$(content_base "$p1")
+        try_merge "$base" "$p1" "$p2" || true
+        files=$(conflict_files | while IFS= read -r f; do if echo "$f" | grep -qE "$SENSITIVE"; then echo "\`$f\`*"; else echo "\`$f\`"; fi; done | paste -sd' ' -)
+        auto=$(head -1 "$TMP/mt")
+        edits=$(git diff --name-only "$auto" "$m" -- . ":!$BASE_FILE" | { grep -vxF -f <(conflict_files; echo "$BASE_FILE") || true; } | sed 's/.*/`&`/' | paste -sd' ' -)
+        printf '| %s | %s %s | %s | %s | %s |\n' "$n" "$(git rev-parse --short=9 "$p2")" "$(git log -1 --format=%s "$p2" | grep -oE '\(#[0-9]+\)$' | tr -d '()')" \
+            "$(git rev-list --count --first-parent "$base..$p2")" "${files:-none}" "${edits:-none}"
+    done
+    echo
+    echo "Edits outside conflicts are changes the merge commit makes that neither the automatic merge nor a conflict asked for. Review each one."
+    echo
+
+    echo "## Steps"
+    n=0
+    for m in "${merges[@]}"; do
+        n=$((n + 1)); p1=$(git rev-parse "$m^1"); p2=$(git rev-parse "$m^2"); base=$(content_base "$p1")
+        echo
+        echo "### Step $n: up to $(git log -1 --format='%h %s' "$p2")"
+        echo
+        if try_merge "$base" "$p1" "$p2"; then echo "No conflict."; fi
+        auto=$(head -1 "$TMP/mt")
+        conflict_files > "$TMP/cf"
+        while IFS= read -r f; do
+            echo
+            echo "**\`$f\`**$(echo "$f" | grep -qE "$SENSITIVE" && echo ' (sensitive)')"
+            git log -1 --format=%B "$m" | sed -n "s#^- $f: ##p" | sed 's/^/Resolution: /'
+            git show "$auto:$f" > "$TMP/conflicted" 2>/dev/null || : > "$TMP/conflicted"
+            zones "$TMP/conflicted" > "$TMP/zones"
+            while IFS= read -r z; do
+                echo "- conflict zone at lines $z of the merged file (fork side $(git log -1 --format=%h "$p1"), upstream side $(git log -1 --format=%h "$p2"))"
+            done < "$TMP/zones"
+            # hunks of the resolution that touch no conflict zone: manual edits that no marker asked for
+            git diff -U0 "$auto" "$m" -- "$f" | sed -n 's/^@@ -\([0-9]*\)\(,\([0-9]*\)\)\? .*/\1 \3/p' | while read -r a b; do
+                [ -n "$b" ] || b=1
+                e=$((a + (b > 0 ? b - 1 : 0)))
+                if ! awk -F- -v a="$a" -v e="$e" '$1 <= e && $2 >= a {hit=1} END {exit !hit}' "$TMP/zones"; then
+                    echo "- **edit outside the conflict zones** at lines $a-$e of the merged file"
+                fi
+            done
+            echo
+            echo "<details><summary>Resolution diff (automatic merge with markers -> committed)</summary>"
+            echo
+            echo '```diff'
+            git diff "$auto" "$m" -- "$f"
+            echo '```'
+            echo "</details>"
+        done < "$TMP/cf"
+        edits=$(git diff --name-only "$auto" "$m" -- . ":!$BASE_FILE" | grep -vxF -f <(cat "$TMP/cf"; echo "$BASE_FILE") || true)
+        if [ -n "$edits" ]; then
+            echo
+            echo "**Edits outside conflicts:**"
+            echo
+            echo '```diff'
+            git diff "$auto" "$m" -- $edits
+            echo '```'
+        fi
+        echo
+        echo "<details><summary>Upstream commits in this step ($(git rev-list --count --first-parent "$base..$p2"))</summary>"
+        echo
+        git log --first-parent --format='- %h %s' "$base..$p2"
+        echo
+        echo "</details>"
+    done
+
+    echo
+    echo "## All changes"
+    echo
+    echo "<details><summary>Diffstat against the fork before the sync ($(git rev-parse --short "$old"))</summary>"
+    echo
+    echo '```'
+    git diff --stat=120 "$old" "$br" | tail -40
+    echo '```'
+    echo "</details>"
+}
+
 case "${1:-}" in
     report) shift; report "$@" ;;
     merge)  shift; merge "$@" ;;
     verify) shift; verify "$@" ;;
-    *) echo "usage: $0 report [target] | merge [target] | verify <old-head> [target]" >&2; exit 2 ;;
+    summary) shift; summary "$@" ;;
+    *) echo "usage: $0 report [target] | merge [target] | verify <old-head> [target] | summary <old-head> [branch]" >&2; exit 2 ;;
 esac
