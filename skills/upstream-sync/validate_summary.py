@@ -205,7 +205,6 @@ def main():
     manifest = read(os.path.join(out, "manifest.txt")) or ""
     info = dict(l.split("=", 1) for l in manifest.splitlines() if "=" in l and not l.startswith("model="))
     models = [l.split("=", 1)[1].split() for l in manifest.splitlines() if l.startswith("model=")]
-    contexts = {m[0]: (m[2] if len(m) > 2 else "short") for m in models}
     models = [m[0] for m in models]
     print("## Validation")
     print()
@@ -249,7 +248,7 @@ def main():
 
         model_rows = []
         for a in models:
-            for n in ("prose", "code", "structured", "numeric") + (("long",) if contexts[a] == "long" else ()):
+            for n in ("prose", "code", "structured", "numeric", "long"):
                 ks, c, r = kld(be, "%s-%s" % (a, n))
                 statuses.append(ks)
                 model_rows.append((a, n, c, r, ks))

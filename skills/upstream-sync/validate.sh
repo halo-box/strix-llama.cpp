@@ -4,10 +4,10 @@
 # backend, and writes summary.md with one status per backend: TARGET PASS, FAIL or INCOMPLETE.
 #
 #   validate.sh --pr <number> [--cand <rev>] [--base <rev>] [--backends hip,vk] [--out <dir>]
-#   validate.sh --cand <rev> [--model <arch>=<gguf>[:short|long]]... [--small <gguf>] ...
+#   validate.sh --cand <rev> [--model <arch>=<gguf>]... [--small <gguf>] ...
 #
 #   --pr       read the sync PR: its head is the candidate, and its "## Models to validate" table gives the models
-#              (Hugging Face repo and file, downloaded to MODELS_DIR) and their context profile, short or long
+#              (Hugging Face repo and file, downloaded to MODELS_DIR; link existing files there to skip the download)
 #   --model    a local model instead of the PR table; repeat the option
 #   --small    Qwen3.5-0.8B-Base in F16 or BF16, quantized here to every type of QUANTS (the idea comes from
 #              upstream ci/run.sh). Default: downloaded from ggml-org/Qwen3.5-0.8B-Base-GGUF
@@ -20,10 +20,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 QUANTS=${QUANTS:-"BF16 F16 Q8_0 Q6_K Q5_K_M Q5_1 Q5_0 Q4_K_M Q4_1 Q4_0 Q3_K_M Q2_K IQ4_NL IQ4_XS"}
 MODELS_DIR=${MODELS_DIR:-$HOME/.cache/strix-llama-sync/models}
-# bench: every pp size at every depth of the context profile, -b 4096 -ub 4096
+# bench: every pp size at every depth, -b 4096 -ub 4096
 PP_SIZES=${PP_SIZES:-512,1024,2048,4096}
-DEPTHS_SHORT=${DEPTHS_SHORT:-0,4096,16384}
-DEPTHS_LONG=${DEPTHS_LONG:-0,12000,32000,64000}
+DEPTHS=${DEPTHS:-0,12000,32000,64000,128000}
 CAND="" BASE="" SMALL="" BACKENDS="hip,vk" OUT="" PR=""
 MODELS=()
 while [ $# -gt 0 ]; do
@@ -44,7 +43,7 @@ die() { echo "error: $*" >&2; exit 1; }
 # download <repo> <file> (and every shard of a split gguf) to MODELS_DIR, print the local path of <file>
 fetch() {
     local d=$MODELS_DIR/${1//\//_} f=$2 files=$2 n i x
-    mkdir -p "$d"
+    mkdir -p "$d/$(dirname "$f")"
     if [[ $f =~ -00001-of-([0-9]{5})\.gguf$ ]]; then
         n=$((10#${BASH_REMATCH[1]})) files=""
         for i in $(seq -f %05g 1 $n); do files="$files ${f/-00001-of-/-$i-of-}"; done
@@ -78,11 +77,11 @@ if [ -n "$PR" ]; then
         echo "note: this sync has edits outside the conflicts, read them in the PR before trusting the numbers"
     fi
     [ -n "$CAND" ] || { git fetch -q origin "$head" && CAND=FETCH_HEAD; }
-    # rows of the "## Models to validate" table: | arch | repo | file | short or long |
-    while IFS='|' read -r _ a r f c _; do
-        a=$(echo $a) r=$(echo $r) f=$(echo $f) c=$(echo $c)
+    # rows of the "## Models to validate" table: | arch | Hugging Face repo | file |
+    while IFS='|' read -r _ a r f _; do
+        a=$(echo $a) r=$(echo $r) f=$(echo $f)
         case $a in ""|Arch|---*|"<"*) continue ;; esac
-        MODELS+=("$a=$(fetch "$r" "$f"):${c:-short}")
+        MODELS+=("$a=$(fetch "$r" "$f")")
     done < <(section "Models to validate" | grep -E '^\|')
     if [ "${#MODELS[@]}" -eq 0 ]; then
         if section Overview | grep -q '`\*'; then
@@ -152,7 +151,7 @@ echo "out  $OUT"
     echo "base=$BASE"
     echo "cand=$CAND"
     echo "small=$(basename "$SMALL") $(sha256sum "$SMALL" | cut -c1-16)"
-    for mm in "${MODELS[@]}"; do x=${mm#*=}; echo "model=${mm%%=*} $(basename "${x%:*}") ${x##*:}"; done
+    for mm in "${MODELS[@]}"; do echo "model=${mm%%=*} $(basename "${mm#*=}")"; done
     echo "backends=$BACKENDS"
 } > "$OUT/manifest.txt"
 
@@ -255,18 +254,14 @@ for be in ${BACKENDS//,/ }; do
 
     # 4. the real models of the archs this sync touches
     for mm in "${MODELS[@]}"; do
-        a=${mm%%=*} m=${mm#*=} ctx=short
-        case $m in *:short|*:long) ctx=${m##*:} m=${m%:*} ;; esac
-        depths=$DEPTHS_SHORT; [ $ctx = long ] && depths=$DEPTHS_LONG
-        echo "$be: $a ($ctx context)"
+        a=${mm%%=*} m=${mm#*=}
+        echo "$be: $a"
         for n in prose code structured numeric; do
             kld "$be" "$a-$n" "$m" "$C/correctness-$n.txt" "-c 2048 -b 2048 -ub 2048" "-c 2048 -b 2048 -ub 512"
         done
-        if [ $ctx = long ]; then
-            kld "$be" "$a-long" "$m" "$OUT/all.txt" "-c 16384 -b 512 -ub 512" "-c 16384 -b 256 -ub 256"
-        fi
-        bench "$be" "$a-pp" "$m" "-p $PP_SIZES -d $depths -b 4096 -ub 4096 -n 0 -r 4 -ngl $(ngl $be) -fa on -ctk f16 -ctv f16 --load-mode none"
-        bench "$be" "$a-tg" "$m" "-p 0 -n 128 -d $depths -b 4096 -ub 4096 -r 4 -ngl $(ngl $be) -fa on -ctk f16 -ctv f16 --load-mode none"
+        kld "$be" "$a-long" "$m" "$OUT/all.txt" "-c 16384 -b 512 -ub 512" "-c 16384 -b 256 -ub 256"
+        bench "$be" "$a-pp" "$m" "-p $PP_SIZES -d $DEPTHS -b 4096 -ub 4096 -n 0 -r 4 -ngl $(ngl $be) -fa on -ctk f16 -ctv f16 --load-mode none"
+        bench "$be" "$a-tg" "$m" "-p 0 -n 128 -d $DEPTHS -b 4096 -ub 4096 -r 4 -ngl $(ngl $be) -fa on -ctk f16 -ctv f16 --load-mode none"
         server "$be" "$a" "$m"
     done
 done
