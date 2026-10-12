@@ -26,6 +26,7 @@ struct vk_mat_mat_hcmix_push_constants {
     vk_mat_mat_push_constants mm;
     uint32_t hc_n_embd; uint32_t hc_x_offset; uint32_t hc_x_s1; uint32_t hc_x_s2; uint32_t hc_d_offset; uint32_t hc_d_s1;
     float hc_scale;
+    uint32_t hc_zero;   // 0: keeps the epilogue's f16 gate rounding opaque to the shader compiler
 };
 
 struct vk_mat_vec_push_constants {

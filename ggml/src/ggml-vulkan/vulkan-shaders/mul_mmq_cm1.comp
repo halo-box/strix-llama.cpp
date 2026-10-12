@@ -107,6 +107,7 @@ layout (push_constant) uniform parameter
     uint hc_d_offset;       // element offset of the mixed output (f32 [n_embd, N]) in binding 2
     uint hc_d_s1;           // mixed element stride between tokens
     float hc_scale;
+    uint hc_zero;           // always 0, opaque to the compiler: keeps the gate's f16 rounding (see the epilogue)
 #endif
 #endif
 } p;
@@ -663,7 +664,11 @@ void main() {
                         float result = 0.0f;
                         [[unroll]]
                         for (uint ih = 0; ih < 4; ++ih) {
-                            const float wv = 1.0f / (1.0f + exp(-float(float16_t(v[ih]))));
+                            // RADV/ACO drops a bare float(float16_t(x)) round-trip (tbo-b1d: the fused mix matched the UNROUNDED
+                            // gate). The f16 bits pass through an integer op on a push-constant zero, so the v_cvt_f16_f32 the
+                            // d16 store uses must run and the gate is the f16 value the unfused chain reads.
+                            const uint gbits = packFloat2x16(f16vec2(float16_t(v[ih]), float16_t(0.0))) ^ p.hc_zero;
+                            const float wv = 1.0f / (1.0f + exp(-float(unpackFloat2x16(gbits).x)));
                             result = fma(float(data_x[xb + ih * p.hc_x_s1]), wv, result);
                         }
                         data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = p.hc_scale * result;

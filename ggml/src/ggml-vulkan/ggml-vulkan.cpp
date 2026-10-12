@@ -7444,6 +7444,7 @@ static void ggml_vk_matmul_hcmix(ggml_backend_vk_context * ctx, vk_context& subc
     pc.hc_d_offset = (uint32_t) (get_misalign_bytes(ctx, hc.mixed) / sizeof(float));
     pc.hc_d_s1     = d_s1;
     pc.hc_scale    = hc.scale;
+    pc.hc_zero     = 0;
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { a, b, ggml_vk_tensor_subbuffer(ctx, hc.mixed, true), ggml_vk_tensor_subbuffer(ctx, hc.x, true) }, pc, { m, n, 1 });
 }
