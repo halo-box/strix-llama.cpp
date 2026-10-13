@@ -1,61 +1,540 @@
 {
-  "suite": "backend-correctness",
-  "seed": 123,
-  "temperature": 0,
-  "prompt_tokens": 2048,
-  "depths": [0, 12000, 32000, 64000],
-  "cache": {"key": "f16", "value": "f16"},
-  "backends": ["Vulkan", "ROCm"],
-  "checks": ["token_ids", "top_1", "complete_logits", "decode_state"]
+  "version": 4,
+  "configurePresets": [
+    {
+        "name":  "base",
+        "hidden": true,
+        "generator":   "Ninja",
+        "binaryDir":   "${sourceDir}/build-${presetName}",
+        "cacheVariables": {
+            "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+            "CMAKE_INSTALL_RPATH": "$ORIGIN;$ORIGIN/.."
+        }
+    },
+    {
+        "name": "sycl-base",
+        "hidden": true,
+        "generator": "Ninja",
+        "binaryDir": "${sourceDir}/build-${presetName}",
+        "cacheVariables": {
+            "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+            "CMAKE_CXX_COMPILER": "icx",
+            "CMAKE_C_COMPILER": "cl",
+            "GGML_SYCL": "ON",
+            "CMAKE_INSTALL_RPATH": "$ORIGIN;$ORIGIN/.."
+        }
+    },
+    { "name": "debug",    "hidden": true, "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
+    { "name": "release",  "hidden": true, "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } },
+    { "name": "reldbg",   "hidden": true, "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" } },
+    { "name": "static",   "hidden": true, "cacheVariables": { "GGML_STATIC":      "ON" } },
+    { "name": "sycl_f16", "hidden": true, "cacheVariables": { "GGML_SYCL_F16":    "ON" } },
+    { "name": "vulkan",   "hidden": true, "cacheVariables": { "GGML_VULKAN":      "ON" } },
+
+    {
+        "name": "x64-windows-llvm", "hidden": true,
+        "cacheVariables": {
+            "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/x64-windows-llvm.cmake"
+        }
+    },
+
+    {
+        "name": "arm64-windows-llvm", "hidden": true,
+        "architecture": { "value": "arm64",    "strategy": "external" },
+        "toolset":      { "value": "host=x64", "strategy": "external" },
+        "cacheVariables": {
+            "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/arm64-windows-llvm.cmake"
+        }
+    },
+
+    {
+        "name": "arm64-apple-clang", "hidden": true,
+        "architecture": { "value": "arm64",    "strategy": "external" },
+        "toolset":      { "value": "host=x64", "strategy": "external" },
+        "cacheVariables": {
+            "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/arm64-apple-clang.cmake"
+        }
+    },
+    {
+        "name": "x64-linux-gcc", "hidden": true,
+        "cacheVariables": {
+            "CMAKE_C_COMPILER": "gcc",
+            "CMAKE_CXX_COMPILER": "g++"
+        }
+    },
+    { "name": "x64-linux-gcc-debug", "inherits": [ "base", "x64-linux-gcc", "debug" ] },
+    { "name": "x64-linux-gcc-release", "inherits": [ "base", "x64-linux-gcc", "release" ] },
+    { "name": "x64-linux-gcc-reldbg", "inherits": [ "base", "x64-linux-gcc", "reldbg" ] },
+    { "name": "x64-linux-gcc+static-release", "inherits": [ "base", "x64-linux-gcc", "release", "static" ] },
+
+    { "name": "arm64-windows-llvm-debug", "inherits": [ "base", "arm64-windows-llvm", "debug" ] },
+    { "name": "arm64-windows-llvm-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg" ] },
+    { "name": "arm64-windows-llvm+static-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg", "static" ] },
+
+    { "name": "arm64-apple-clang-debug", "inherits": [ "base", "arm64-apple-clang", "debug" ] },
+    { "name": "arm64-apple-clang-release", "inherits": [ "base", "arm64-apple-clang", "reldbg" ] },
+    { "name": "arm64-apple-clang+static-release", "inherits": [ "base", "arm64-apple-clang",  "reldbg", "static" ] },
+
+    { "name": "x64-windows-llvm-debug", "inherits": [ "base", "x64-windows-llvm", "debug" ] },
+    { "name": "x64-windows-llvm-release", "inherits": [ "base", "x64-windows-llvm", "release" ] },
+    { "name": "x64-windows-llvm-reldbg", "inherits": [ "base", "x64-windows-llvm", "reldbg" ] },
+    { "name": "x64-windows-llvm+static-release", "inherits": [ "base", "x64-windows-llvm", "reldbg", "static" ] },
+
+    { "name": "x64-windows-msvc-debug", "inherits": [ "base", "debug" ] },
+    { "name": "x64-windows-msvc-release", "inherits": [ "base", "reldbg" ] },
+    { "name": "x64-windows-msvc+static-release", "inherits": [ "base", "reldbg", "static" ] },
+
+    { "name": "x64-windows-sycl-debug", "inherits": [ "sycl-base", "debug" ] },
+    { "name": "x64-windows-sycl-debug-f16", "inherits": [ "sycl-base", "debug", "sycl_f16" ] },
+    { "name": "x64-windows-sycl-release", "inherits": [ "sycl-base", "release" ] },
+    { "name": "x64-windows-sycl-release-f16", "inherits": [ "sycl-base", "release", "sycl_f16" ] },
+
+    { "name": "x64-windows-vulkan-debug", "inherits": [ "base", "vulkan", "debug" ] },
+    { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] }
+  ]
 }
 
-suite: backend-correctness
-oracle: immutable-upstream
-candidate: working-tree
-settings:
-  seed: 123
-  temperature: 0
-  prompt_tokens: 2048
-  batch: selected-per-target
-  ubatch: selected-per-target
-checks:
-  - prompt-token-ids
-  - prefill-final-logits
-  - deterministic-decode
-  - kv-and-recurrent-state
-  - long-context-boundaries
+{
+	"name": "llama-ui",
+	"private": true,
+	"version": "1.0.0",
+	"type": "module",
+	"scripts": {
+		"build": "npm run build-pwa-assets && vite build",
+		"build-pwa-assets": "pwa-assets-generator --root . --config pwa-assets.config.ts && pwa-assets-generator --root . --config pwa-assets-dark.config.ts && node scripts/make-icons-circular.js",
+		"dev": "bash scripts/dev.sh",
+		"preview": "vite preview",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"reset": "rm -rf .svelte-kit node_modules",
+		"format": "eslint --fix . && prettier --write .",
+		"lint": "prettier --check . && eslint .",
+		"test": "npm run test:ui -- --run && npm run test:client -- --run && npm run test:unit -- --run && npm run test:e2e",
+		"test:e2e": "playwright test",
+		"test:e2e:pwa": "playwright test tests/e2e/pwa.e2e.ts",
+		"test:client": "vitest --project=client",
+		"test:unit": "vitest --project=unit",
+		"test:unit:pwa": "vitest --project=unit --run tests/unit/pwa.spec.ts",
+		"test:pwa": "npm run test:unit:pwa && npm run test:e2e:pwa",
+		"test:ui": "vitest --project=ui",
+		"storybook": "storybook dev -p 6006",
+		"build-storybook": "storybook build",
+		"cleanup": "rm -rf .svelte-kit build node_modules test-results dist dev-dist debug-storybook.log static/pwa-*.png static/maskable-icon-*.png static/apple-touch-icon-*.png static/apple-splash-*.png static/favicon*.ico"
+	},
+	"devDependencies": {
+		"@chromatic-com/storybook": "5.2.1",
+		"@eslint/compat": "1.4.1",
+		"@eslint/js": "9.39.2",
+		"@internationalized/date": "3.12.2",
+		"@lucide/svelte": "1.25.0",
+		"@modelcontextprotocol/sdk": "1.30.0",
+		"@playwright/test": "1.56.1",
+		"@storybook/addon-a11y": "10.5.6",
+		"@storybook/addon-docs": "10.5.6",
+		"@storybook/addon-mcp": "0.7.0",
+		"@storybook/addon-svelte-csf": "5.1.2",
+		"@storybook/addon-vitest": "10.5.6",
+		"@storybook/sveltekit": "10.5.6",
+		"@sveltejs/adapter-static": "3.0.10",
+		"@sveltejs/kit": "2.70.2",
+		"@sveltejs/vite-plugin-svelte": "6.2.1",
+		"@tailwindcss/forms": "0.5.10",
+		"@tailwindcss/typography": "0.5.16",
+		"@tailwindcss/vite": "4.1.11",
+		"@types/node": "24.13.0",
+		"@vite-pwa/assets-generator": "1.0.2",
+		"@vite-pwa/sveltekit": "1.1.0",
+		"@vitest/browser": "4.1.10",
+		"@vitest/browser-playwright": "4.1.10",
+		"@vitest/coverage-v8": "4.1.10",
+		"bits-ui": "2.18.1",
+		"clsx": "2.1.1",
+		"dexie": "4.4.3",
+		"dompurify": "3.4.13",
 
-| case | backend | depth | prompt | generation | expected |
-| stock-0 | Vulkan | 0 | 2048 | 0 | reference |
-| stock-12 | Vulkan | 12000 | 2048 | 0 | reference |
-| stock-32 | ROCm | 32000 | 2048 | 0 | reference |
-| stock-64 | ROCm | 64000 | 2048 | 0 | reference |
+name: CI (cpu)
 
-model_id,backend,depth,prompt_tokens,generation_tokens,seed
-qwen38,Vulkan,0,2048,0,123
-qwen35,Vulkan,12000,2048,0,123
-gemma4,ROCm,32000,2048,0,123
-gptoss20,ROCm,64000,2048,0,123
+on:
+  workflow_dispatch: # allows manual triggering
+  push:
+    branches:
+      - master
+    paths: [
+      '.github/workflows/build-cpu.yml',
+      '.github/workflows/build-cmake-pkg.yml',
+      '**/CMakeLists.txt',
+      '**/.cmake',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+    ]
 
-[request]
-method = POST
-path = /v1/completions
-content_type = application/json
+  pull_request:
+    branches-ignore: ['**']
+    types: [opened, synchronize, reopened]
+    paths: [
+      '.github/workflows/build-cpu.yml',
+      '.github/workflows/build-cmake-pkg.yml',
+      'ggml/src/ggml-rpc/**',
+      '**/CMakeLists.txt',
+      '**/.cmake',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp'
+    ]
 
-[sampling]
-temperature = 0
-seed = 123
-top_k = 1
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
 
-[validation]
-compare_tokens = true
-compare_top_1 = true
-compare_complete_logits = true
-compare_decode = true
+env:
+  GGML_NLOOP: 3
+  GGML_N_THREADS: 1
+  GGML_SCHED_DEBUG_REALLOC: 1
+  LLAMA_ARG_LOG_COLORS: 1
+  LLAMA_ARG_LOG_PREFIX: 1
+  LLAMA_ARG_LOG_TIMESTAMPS: 1
 
-BEGIN RECORD
-id=0001 status=pending backend=Vulkan depth=0
-id=0002 status=pending backend=Vulkan depth=12000
-id=0003 status=pending backend=ROCm depth=32000
-id=0004 status=pending backend=ROCm depth=64000
-END RECORD
+jobs:
+  build-cmake-pkg:
+    uses: ./.github/workflows/build-cmake-pkg.yml
+
+  ubuntu:
+    strategy:
+      matrix:
+        include:
+          - build: 'x64'
+            os: ubuntu-22.04
+          - build: 'arm64'
+            os: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: cpu-${{ matrix.os }}
+          save: false
+
+      - name: Build Dependencies
+        id: build_depends
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-pip python3-dev python3-wheel \
+            libjpeg-dev build-essential libssl-dev \
+            git-lfs
+
+      - name: Toolchain workaround (GCC 14)
+        if: ${{ contains(matrix.os, 'ubuntu-24.04') }}
+        run: |
+          sudo apt-get install -y gcc-14 g++-14
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
+      - name: Python Dependencies
+        id: python_depends
+        run: |
+          export PIP_BREAK_SYSTEM_PACKAGES="1"
+          python3 -m pip install --upgrade pip setuptools
+          pip3 install ./gguf-py jinja2==3.1.6
+
+      - name: ccache-buckets-restore
+        uses: ./.github/actions/ccache-buckets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
+        with:
+          key: cpu-${{ matrix.os }}
+          folder: llama.cpp
+          hf_bucket: ggml-org/cache
+
+      - name: Build
+        id: cmake_build
+        run: |
+          cmake -B build \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DGGML_RPC=ON
+          time cmake --build build --config Release -j $(nproc)
+
+      - name: ccache-buckets-save
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        uses: ./.github/actions/ccache-buckets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
+        with:
+          key: cpu-${{ matrix.os }}
+          folder: llama.cpp
+          evict-old-files: 1d
+          hf_bucket: ggml-org/cache
+          save: true
+
+      - name: Test
+        id: cmake_test
+        run: |
+          cd build
+          ctest -L 'main|python' --verbose --timeout 900
+
+      - name: Test llama2c conversion
+        id: llama2c_test
+        run: |
+          cd build
+          echo "Fetch tokenizer"
+          wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/tok512.bin
+          echo "Fetch llama2c model"
+          wget https://huggingface.co/karpathy/tinyllamas/resolve/main/stories260K/stories260K.bin
+          ./bin/llama-convert-llama2c-to-ggml --copy-vocab-from-model ./tok512.bin --llama2c-model stories260K.bin --llama2c-output-model stories260K.gguf
+          ./bin/llama-completion -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
+
+  windows:
+    name: windows / ${{ matrix.build }}
+    runs-on: windows-2025
+
+    env:
+      OPENBLAS_VERSION: 0.3.23
+
+"backend_name","op_name","op_params","test_mode","supported","error_message","backend_reg_name"
+"CUDA0","ABS","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","ABS","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","SGN","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","SGN","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","NEG","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","NEG","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","STEP","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","STEP","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","TANH","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","TANH","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","ELU","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","ELU","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","RELU","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","RELU","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","SIGMOID","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","SIGMOID","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","GELU","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","GELU","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","GELU_QUICK","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","GELU_QUICK","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","SILU","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","SILU","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","HARDSWISH","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","HARDSWISH","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","HARDSIGMOID","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","HARDSIGMOID","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","EXP","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","EXP","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","EXPM1","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","EXPM1","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","SOFTPLUS","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","SOFTPLUS","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","GELU_ERF","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","GELU_ERF","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","FLOOR","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","FLOOR","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","CEIL","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","CEIL","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","ROUND","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","ROUND","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","TRUNC","type=f16,ne_a=[128,2,2,2],v=0","support","1","yes","CUDA"
+"CUDA0","TRUNC","type=f16,ne_a=[5,7,11,13],v=0","support","1","yes","CUDA"
+"CUDA0","ABS","type=f16,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+"CUDA0","ABS","type=f16,ne_a=[5,7,11,13],v=1","support","0","no","CUDA"
+"CUDA0","SGN","type=f16,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+"CUDA0","SGN","type=f16,ne_a=[5,7,11,13],v=1","support","0","no","CUDA"
+"CUDA0","NEG","type=f16,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+"CUDA0","NEG","type=f16,ne_a=[5,7,11,13],v=1","support","0","no","CUDA"
+"CUDA0","STEP","type=f16,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+"CUDA0","STEP","type=f16,ne_a=[5,7,11,13],v=1","support","0","no","CUDA"
+"CUDA0","TANH","type=f16,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+"CUDA0","TANH","type=f16,ne_a=[5,7,11,13],v=1","support","0","no","CUDA"
+"CUDA0","ELU","type=f16,ne_a=[128,2,2,2],v=1","support","0","no","CUDA"
+
+[project]
+name = "llama-cpp-scripts"
+description = "Scripts that ship with llama.cpp"
+keywords = ["ggml", "gguf", "llama.cpp"]
+version = "0.0.0"
+dynamic = ["classifiers"]
+readme = "README.md"
+authors = [{name = "GGML", email = "ggml@ggml.ai"}]
+requires-python = '>=3.10,<3.15'
+dependencies = [
+    'numpy (>=2.2.6,<3.0.0)',
+    'sentencepiece (>=0.1.98,<0.3.0)',
+    'transformers (==4.57.6)',
+    'protobuf (>=4.21.0,<5.0.0)',
+    'torch (>=2.6.0,<3.0.0)',
+    'gguf @ ./gguf-py',
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+homepage = "https://ggml.ai"
+repository = "https://github.com/ggml-org/llama.cpp"
+
+[project.scripts]
+llama-convert-hf-to-gguf = "convert_hf_to_gguf:main"
+llama-convert-lora-to-gguf = "convert_lora_to_gguf:main"
+llama-convert-llama-ggml-to-gguf = "convert_llama_ggml_to_gguf:main"
+llama-ggml-vk-generate-shaders = "ggml_vk_generate_shaders:main"
+
+[tool.poetry]
+packages = [
+    { include = "*.py", from = "." },
+    { include = "conversion", from = "." },
+]
+
+[tool.poetry.dependencies]
+torch = [
+    { version = "==2.11.0", source = "pypi", markers = "sys_platform == 'darwin'" },
+    { version = "==2.11.0+cpu", source = "pytorch", markers = "sys_platform == 'linux'" },
+    { version = "==2.11.0", source = "pypi", markers = "sys_platform == 'win32'" },
+]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "~=8.3.3"
+
+# Force wheel + cpu
+# For discussion and context see https://github.com/python-poetry/poetry#6409
+[[tool.poetry.source]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+| Operation | BLAS | CANN | CPU | CUDA | ET | HTP | MTL | OpenCL | SYCL | Vulkan | WebGPU | ZenDNN | zDNN |
+|-----------|------|------|------|------|------|------|------|------|------|------|------|------|------|
+|                              ABS | no | yes | yes | partial | partial | yes | yes | no | yes | yes | yes | no | no |
+|                              ACC | no | yes | yes | yes | no | no | yes | no | yes | yes | no | no | no |
+|                              ADD | no | yes | yes | yes | partial | partial | partial | yes | yes | yes | yes | no | no |
+|                             ADD1 | no | yes | yes | yes | no | no | no | no | no | no | no | no | no |
+|                           ADD_ID | no | no | yes | yes | no | yes | yes | yes | yes | yes | yes | no | no |
+|                           ARANGE | no | yes | yes | yes | no | no | yes | no | yes | yes | no | no | no |
+|                           ARGMAX | no | yes | yes | yes | no | yes | yes | no | yes | yes | yes | no | no |
+|                          ARGSORT | no | yes | yes | yes | no | yes | yes | partial | yes | yes | yes | no | no |
+|                             CEIL | no | no | yes | partial | partial | no | yes | no | yes | yes | yes | no | no |
+|                            CLAMP | no | yes | yes | yes | partial | yes | yes | partial | yes | yes | yes | no | no |
+|                        COL2IM_1D | no | no | no | no | no | no | no | no | yes | yes | no | no | no |
+|                           CONCAT | no | yes | yes | partial | partial | partial | yes | partial | yes | yes | partial | no | no |
+|                             CONT | no | partial | yes | yes | partial | partial | yes | partial | yes | yes | partial | no | no |
+|                          CONV_2D | no | no | yes | yes | no | no | yes | yes | yes | partial | yes | no | no |
+|                       CONV_2D_DW | no | no | yes | yes | no | no | no | no | yes | yes | yes | no | no |
+|                          CONV_3D | no | no | yes | yes | no | no | yes | no | yes | yes | no | no | no |
+|                CONV_TRANSPOSE_1D | no | yes | yes | yes | no | no | yes | no | yes | yes | no | no | no |
+|                CONV_TRANSPOSE_2D | no | no | yes | yes | no | no | yes | no | yes | yes | no | no | no |
+|                              COS | no | yes | yes | yes | no | no | yes | no | yes | yes | yes | no | no |
+|                      COUNT_EQUAL | no | yes | yes | yes | no | no | yes | no | yes | yes | no | no | no |
+|                              CPY | no | partial | partial | partial | partial | partial | partial | partial | partial | partial | partial | no | no |
+|               CROSS_ENTROPY_LOSS | no | yes | yes | yes | no | no | no | no | yes | yes | no | no | no |
+|          CROSS_ENTROPY_LOSS_BACK | no | no | yes | yes | no | no | no | no | yes | yes | no | no | no |
+|                           CUMSUM | no | no | yes | yes | yes | yes | yes | no | yes | yes | yes | no | no |
+|                             DIAG | no | no | yes | yes | partial | yes | yes | no | yes | yes | yes | no | no |
+|                    DIAG_MASK_INF | no | yes | yes | yes | no | no | no | partial | yes | yes | no | no | no |
+|                              DIV | no | yes | yes | yes | no | partial | partial | yes | yes | yes | yes | no | no |
+|                     DSV4_HC_COMB | no | no | no | no | no | no | no | no | yes | no | no | no | no |
+|                     DSV4_HC_POST | no | no | no | no | no | no | no | no | yes | no | no | no | no |
+|                      DSV4_HC_PRE | no | no | no | no | no | no | no | no | yes | no | no | no | no |
+|                              DUP | no | yes | yes | yes | no | no | partial | partial | yes | yes | no | no | no |
+|                              ELU | no | yes | yes | partial | partial | no | yes | no | yes | yes | yes | no | no |
+|                              EXP | no | yes | yes | partial | partial | partial | yes | no | yes | yes | yes | no | no |
+|                            EXPM1 | no | no | yes | partial | partial | no | yes | no | yes | yes | yes | no | no |
+|                             FILL | no | no | yes | yes | partial | yes | yes | no | yes | yes | yes | no | no |
+|                   FLASH_ATTN_EXT | no | partial | yes | partial | partial | partial | partial | partial | partial | partial | partial | no | no |
+|                            FLOOR | no | no | yes | partial | partial | no | yes | no | yes | yes | yes | no | no |
+|                  GATED_DELTA_NET | no | no | yes | no | yes | yes | partial | no | yes | yes | yes | no | no |
+|                GATED_LINEAR_ATTN | no | yes | yes | yes | no | no | no | no | yes | yes | no | no | no |
+|                            GEGLU | no | yes | yes | yes | partial | partial | partial | yes | yes | yes | yes | no | no |
+|                        GEGLU_ERF | no | yes | yes | yes | partial | no | partial | yes | yes | yes | yes | no | no |
+|                      GEGLU_QUICK | no | yes | yes | yes | partial | partial | partial | yes | yes | yes | yes | no | no |
+|                             GELU | no | yes | yes | partial | partial | partial | yes | partial | yes | yes | yes | no | no |
+
+root   ::= object
+value  ::= object | array | string | number | ("true" | "false" | "null") ws
+
+object ::=
+  "{" ws (
+            string ":" ws value
+    ("," ws string ":" ws value)*
+  )? "}" ws
+
+array  ::=
+  "[" ws (
+            value
+    ("," ws value)*
+  )? "]" ws
+
+string ::=
+  "\"" (
+    [^"\\\x7F\x00-\x1F] |
+    "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) # escapes
+  )* "\"" ws
+
+number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
+
+# Optional space: by convention, applied in this grammar after literal chars when allowed
+ws ::= | " " | "\n" [ \t]{0,20}
+
+root ::= (declaration)*
+
+declaration ::= dataType identifier "(" parameter? ")" "{" statement* "}"
+
+dataType  ::= "int" ws | "float" ws | "char" ws
+identifier ::= [a-zA-Z_] [a-zA-Z_0-9]*
+
+parameter ::= dataType identifier
+
+statement ::=
+    ( dataType identifier ws "=" ws expression ";" ) |
+    ( identifier ws "=" ws expression ";" ) |
+    ( identifier ws "(" argList? ")" ";" ) |
+    ( "return" ws expression ";" ) |
+    ( "while" "(" condition ")" "{" statement* "}" ) |
+    ( "for" "(" forInit ";" ws condition ";" ws forUpdate ")" "{" statement* "}" ) |
+    ( "if" "(" condition ")" "{" statement* "}" ("else" "{" statement* "}")? ) |
+    ( singleLineComment ) |
+    ( multiLineComment )
+
+forInit ::= dataType identifier ws "=" ws expression | identifier ws "=" ws expression
+forUpdate ::= identifier ws "=" ws expression
+
+condition ::= expression relationOperator expression
+relationOperator ::= ("<=" | "<" | "==" | "!=" | ">=" | ">")
+
+expression ::= term (("+" | "-") term)*
+term ::= factor(("*" | "/") factor)*
+
+factor ::= identifier | number | unaryTerm | funcCall | parenExpression
+unaryTerm ::= "-" factor
+funcCall ::= identifier "(" argList? ")"
+parenExpression ::= "(" ws expression ws ")"
+
+argList ::= expression ("," ws expression)*
+
+number ::= [0-9]+
+
+singleLineComment ::= "//" [^\n]* "\n"
+multiLineComment ::= "/*" ( [^*] | ("*" [^/]) )* "*/"
+
+ws ::= ([ \t\n]+)
