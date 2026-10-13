@@ -15318,8 +15318,15 @@ static int ggml_vk_try_qsa_block_select(const ggml_backend_vk_context * ctx, con
             chain_topk = cgraph->nodes[j]->op == GGML_OP_CONT && cgraph->nodes[j]->src[0] == n;
         }
     }
-    if (last > 0 || chain_topk) {
+    if (last > 0) {
         ggml_vk_path_census_add("QSA_SELECT_CHAIN");
+    } else if (chain_topk) {
+        // past the register limit (64 x BS blocks, 32768 with BS = 512: 128k cells at ratio 4) the chain stays unfused by
+        // design (B-SEL, Hi 4 10-13); count it apart so the engaged ratio QSA_BLOCK_SELECT / QSA_SELECT_CHAIN stays 1 at
+        // every context and QSA_SELECT_CHAIN_OVERSIZE says how much a tiled select would take
+        const bool oversize = ctx->device->pipeline_qsa_block_select_reg[0] != nullptr &&
+            n->src[0]->ne[0] > (int64_t) 64 * ctx->device->pipeline_qsa_block_select_reg[0]->wg_denoms[0];
+        ggml_vk_path_census_add(oversize ? "QSA_SELECT_CHAIN_OVERSIZE" : "QSA_SELECT_CHAIN");
     }
     return last;
 }
