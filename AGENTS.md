@@ -115,7 +115,7 @@ All contributors must follow this flow for backend and performance work, regardl
     - `tests/corpus/correctness-code.txt`
     - `tests/corpus/correctness-structured.txt`
     - `tests/corpus/correctness-numeric.txt`
-    - Hash each corpus and use the same bytes for upstream and candidate. If more tokens are required, repeat the corpus deterministically and save the resulting prompt before either run.
+    - Hash each corpus and use the same bytes for upstream and candidate. Each corpus has more than 4096 tokens, so no repetition is needed at `-c 2048`; the four together have more than 2 x 16384 tokens with the Qwen 3.5 and Llama 3 vocabs, enough for `-c 16384` (`llama-perplexity` needs 2 x `n_ctx` tokens; see `tests/corpus/README.md`). A repeated text is mostly copied by the model and hides small errors.
 
 5. **Run the target model matrix**
     - Validate the current target model on every affected backend.

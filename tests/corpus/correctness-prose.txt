@@ -1,23 +1,301 @@
-At sunrise the research vessel left the harbor and followed the eastern channel. The sea was calm, but a narrow bank of fog covered the distant markers. The crew checked the compass, compared the paper chart with the digital display, and recorded the time of each observation.
+CHAPTER IV.
 
-Mara kept the log. She wrote short sentences because every statement had to be checked later. At 06:15 the engine speed was steady. At 06:40 the wind shifted north. At 07:05 a red buoy appeared on the port side, exactly where the chart predicted.
+LITTLE TIMPEY.
 
-The purpose of the trip was simple: repeat the same survey under controlled conditions. The instruments measured temperature, pressure, salinity, and current speed. Each reading was stored twice, once in the local recorder and once in a sealed backup unit.
+I do not think I have ever seen a prettier face than that child's. She had light brown hair, and round rosy cheeks, and the bluest of blue eyes.
 
-During the second hour, the fog lifted. Low hills became visible beyond the water, and sunlight reached the deck. The crew did not change the plan. They continued along the numbered stations, stopped for three minutes at each point, and used the same procedure for every sample.
+She awoke as we were looking at her, and seeing herself amongst strangers, she cried bitterly.
 
-A good experiment depends on ordinary discipline. Names must remain consistent. Units must be written beside values. Missing observations must be marked as missing rather than replaced with convenient estimates. If a device reports an impossible value, the operator must preserve the original record before investigating the cause.
+'Poor little thing!' said Mrs. Millar. 'She wants her mother.'
 
-At noon the vessel turned west. The return route crossed the morning track at two places. Those intersections provided useful checks because the water should have similar properties when measured only a few hours apart. Small differences were expected; large differences would require another survey.
+'Mam--ma! Ma--ma!' cried the little girl, as she caught the word.
 
-The final station was close to the harbor wall. Traffic had increased, and the wake from a ferry disturbed the surface. Mara noted the disturbance, waited until the waves had passed, and repeated the measurement. Both readings stayed in the log.
+Mrs. Millar fairly broke down at this, and sobbed and cried as much as the child.
 
-Back on shore, the team copied the files to a workstation. One person verified file sizes and hashes while another compared timestamps against the paper log. They found no missing stations. The duplicate records matched byte for byte.
+'Come, my lass,' said her husband, 'cheer up! Thee'll make her worse, if thee takes on so.'
 
-The analysis began the next morning. The team first plotted the raw measurements without smoothing them. Then they applied the planned calibration and produced a second set of plots. The order mattered: raw evidence had to remain available so that every later transformation could be explained.
+But Mrs. Millar could do nothing but cry. 'Just think if it was our Polly!' was all that she could say. 'Oh, Jem, just think if it was our Polly that was calling for me!'
 
-The report separated observations from conclusions. It described the route, weather, instruments, and procedure before discussing patterns in the data. It also listed the limitations of the survey. A single calm day could describe local conditions, but it could not represent every season or every storm.
+My grandfather took the child from her, and put her on my knee. 'Now, Mary,' he said, 'get us a bit of fire and something to eat, there's a good woman! The child's cold and hungered, and we're much about the same ourselves.'
 
-When the review was complete, Mara archived the input files, scripts, plots, and written notes together. A future team should be able to repeat the work without guessing which settings had been used. Reproducibility was treated as part of the result, not as an optional task after the result.
+Mrs. Millar bustled about the house, and soon lighted a blazing fire; then she ran in next door to see if her children, whom she had left with a little servant girl, were all right, and she brought back with her some cold meat for our breakfast.
 
-The harbor lights came on as the team left the building. The vessel was already prepared for another trip. Nothing about the process was dramatic, yet the careful sequence of checks made the measurements trustworthy.
+I sat down on a stool before the fire, with the child on my knee. She seemed to be about two years old, a strong, healthy little thing. She had stopped crying now, and did not seem to be afraid of me; but whenever any of the others came near she hid her face in my shoulder.
+
+Mrs. Millar brought her a basin of bread and milk, and she let me feed her.
+
+She seemed very weary and sleepy, as if she could hardly keep her eyes open. 'Poor wee lassie!' said my grandfather; 'I expect they pulled her out of her bed to bring her on deck. Won't you put her to bed?'
+
+'Yes,' said Mrs. Millar, 'I'll put her in our Polly's bed; she'll sleep there quite nice, she will.'
+
+But the child clung to me, and cried so loudly when Mrs. Millar tried to take her, that my grandfather said,--
+
+'I wouldn't take her away, poor motherless lamb; she takes kindly to Alick; let her bide here.'
+
+So we made up a little bed for her on the sofa; and Mrs. Millar brought one of little Polly's nightgowns, and undressed and washed her, and put her to bed.
+
+The child was still very shy of all of them but me. She seemed to have taken to me from the first, and when she was put into her little bed she held out her tiny hand to me, and said, 'Handie, Timpey's handie.'
+
+'What does she say? bless her!' said Mrs. Millar, for it was almost the first time that the child had spoken.
+
+'She wants me to hold her little hand,' I said, 'Timpey's little hand. Timpey must be her name!'
+
+'I never heard of such a name,' said Mrs. Millar. 'Timpey, did you say? What do they call you, darling?' she said to the child.
+
+But the little blue eyes were closing wearily, and very soon the child was asleep. I still held that tiny hand in mine as I sat beside her; I was afraid of waking her by putting it down.
+
+'I wonder who she is,' said Mrs. Millar, in a whisper, as she folded up her little clothes. 'She _has_ beautiful things on, to be sure! She has been well taken care of, anyhow! Stop, here's something written on the little petticoat; can you make it out, Alick?'
+
+I laid down the little hand very carefully, and took the tiny petticoat to the window.
+
+'Yes,' I said, 'this will be her name. Here's _Villiers_ written on it.
+
+'Dear me!' said Mrs. Millar. 'Yes, that will be her name. Dear me, dear me; to think of her poor father and mother at the bottom of that dreadful sea! Just think if it was our Polly!' And then Mrs. Millar cried so much again that she was obliged to go home and finish her cry with her little Polly clasped tightly in her arms.
+
+My grandfather was very worn out with all he had done during the night, and went upstairs to bed. I sat watching the little sleeping child. I felt as if I could not leave her.
+
+She slept very quietly and peacefully. Poor little pet! how little she knows what has happened, I thought; and my tears came fast, and fell on the little fat hand which was lying on the pillow. But after a few minutes I leaned my head against the sofa, and fell fast asleep. I had had no sleep the night before, and was quite worn out.
+
+I was awakened, some hours after, by some one pulling my hair, and a little voice calling in my ear, 'Up! up, boy! up! up!'
+
+I looked up, and saw a little roguish face looking at me--the merriest, brightest little face you can imagine.
+
+'Up, up, boy, please!' she said again, in a coaxing voice.
+
+So I lifted up my head, and she climbed out of her little bed on the sofa on to my knee.
+
+'Put shoes on, boy,' she said, holding out her little bare toes.
+
+I put on her shoes and stockings, and then Mrs. Millar came in and dressed her.
+
+It was a lovely afternoon; the storm had ceased whilst we had been asleep, and the sun was shining brightly. I got the dinner ready, and the child watched me, and ran backwards and forwards, up and down the kitchen. She seemed quite at home now and very happy.
+
+My grandfather was still asleep, so I did not wake him. Mrs. Millar brought in some broth she had made for the child, and we dined together. I wanted to feed her, as I had done the night before, but she said,--
+
+'Timpey have 'poon, please!' and took the spoon from me, and fed herself so prettily, I could not help watching her.
+
+'God bless her, poor little thing!' said Mrs. Millar.
+
+'God bless 'ou,' said the child. The words were evidently familiar to her.
+
+'She must have heard her mother say so,' said Mrs. Millar, in a choking voice.
+
+When we had finished dinner, the child slipped down from her stool, and ran to the sofa. Here she found my grandfather's hat, which she put on her head, and my scarf, which she hung round her neck. Then she marched to the door, and said, 'Tatta, tatta; Timpey go tatta.'
+
+'Take her out a bit, Alick,' said Mrs. Millar. 'Stop a minute, though; I'll fetch her Polly's hood.' So, to her great delight, we dressed her in Polly's hood, and put a warm shawl round her, and I took her out.
+
+Oh! how she ran, and jumped, and played in the garden. I never saw such a merry little thing. Now she was picking up stones, now she was gathering daisies ('day days, she called them), now she was running down the path and calling to me to catch her. She was never still a single instant!
+
+But every now and then, as I was playing with her, I looked across the sea to Ainslie Crag. The sea had not gone down much, though the wind had ceased, and I saw the waves still dashing wildly upon the rocks.
+
+And I thought of what lay beneath them, of the shattered ship, and of the child's mother. Oh! if she only knew, I thought, as I listened to her merry laugh, which made me more ready to cry than her tears had done.
+
+CHAPTER V.
+
+THE UNCLAIMED SUNBEAM.
+
+My grandfather and Jem Millar were sitting over the fire in the little watchroom in the lighthouse tower, and I sat beside them with the child on my knee. I had found an old picture-book for her, and she was turning over the leaves, and making her funny little remarks on the pictures.
+
+'Well, Sandy,' said Millar, 'what shall we do with her?'
+
+'_Do_ with her?' said my grandfather stroking her little fair head. 'We'll keep her! Won't we, little lassie?'
+
+'Yes,' said the child, looking up and nodding her head, as if she understood all about it.
+
+'We ought to look up some of her relations, it seems to me,' said Jem. 'She's sure to have some, somewhere.'
+
+'And how are we to find them out?' asked my grandfather.
+
+'Oh, the captain can soon make out for us what ship is missing, and we can send a line to the owners; they'll know who the passengers was.'
+
+'Well,' said my grandfather, 'maybe you're right, Jem; we'll see what they say. But, for my part, if them that cares for the child is at the bottom of that sea, I hope no one else will come and take her away from us.'
+
+'If I hadn't so many of them at home--'began Millar.
+
+'Oh yes, my lad, I know that,' said my grandfather, interrupting him; 'but thy house is full enough already. Let the wee lassie come to Alick and me. She'll be a nice little bit of company for us; and Mary will see to her clothes and such like, I know.'
+
+'Yes, that she will,' said her husband. 'I do declare she has been crying about that child the best part of the day! She has indeed!'
+
+My grandfather followed Jem's advice, and told Captain Sayers, when he came in the steamer the next Monday, the whole story of the shipwreck, and asked him to find out for him the name and address of the owners of the vessel.
+
+Oh, how I hoped that no one would come to claim my little darling. She became dearer to me every day, and I felt as if it would break my heart to part with her. Every night, when Mrs. Millar had undressed her, she knelt beside me in her little white nightgown to 'talk to God,' as she called praying. She had evidently learnt a little prayer from her mother, for the first night she began of her own accord
+
+'Jesus, Eppy, hear me.'
+
+I could not think at first what it was that she was saying; but Mrs. Millar said she had learnt the hymn when she was a little girl, and she wrote out the first verse for me. And every night afterwards I let the child repeat it after me,--
+
+'Jesus, tender Shepherd, hear me, Bless Thy little lamb to-night, Through the darkness be Thou near me, Keep me safe till morning light.'
+
+I thought I should like her always to say the prayer her mother had taught her. I never prayed myself--my grandfather had never taught me. I wondered if my mother would have taught me if she had lived. I thought she would.
+
+I knew very little in those days of the Bible. My grandfather did not care for it, and never read it. He had a large Bible, but it was always laid on the top of the chest of drawers, as a kind of ornament; and unless I took it down to look at the curious old pictures inside, it was never opened.
+
+Sunday on the island was just the same as any other day. My grandfather worked in the garden, or read the newspaper, just the same as usual, and I rambled about the rocks, or did my lessons, or worked in the house, as I did every other day in the week. We had no church or chapel to go to, and nothing happened to mark the day.
+
+I often think now of that dreadful morning when we went across the stormy sea to that sinking ship. If our boat had capsized then, if we had been lost, what would have become of our souls? It is a very solemn thought, and I cannot be too thankful to God for sparing us both a little longer. My grandfather was a kind-hearted, good-tempered, honest old man; but I know now that that is not enough to open the door of heaven. Jesus is the only way there, and my grandfather knew little of, and cared nothing for, _Him_.
+
+Little Timpey became my constant companion, indoors and out of doors. She was rather shy of the little Millars, for they were noisy and rough in their play, but she clung to me, and never wanted to leave me. Day by day she learnt new words, and came out with such odd little remarks of her own, that she made us all laugh. Her great pleasure was to get hold of a book, and pick out the different letters of the alphabet, which, although she could hardly talk, she knew quite perfectly.
+
+Dear little pet! I can see her now, sitting at my feet on a large flat rock by the seashore, and calling me every minute to look at A, or B, or D, or S. And so by her pretty ways she crept into all our hearts, and we quite dreaded the answer coming to the letter my grandfather had written to the owners of the _Victory_, which, we found, was the name of the lost ship.
+
+It was a very wet day, the Monday that the answer came. I had been waiting some time on the pier, and was wet through before the steamer arrived. Captain Sayers handed me the letter before anything else, and I ran up with it to my grandfather at once. I could not wait until our provisions and supplies were brought on shore.
+
+Little Timpey was sitting on a stool at my grandfather's feet, winding a long piece of tape round and round her little finger. She ran to meet me as I came in, and held up her face to be kissed.
+
+What if this letter should say she was to leave us, and go back by the steamer! I drew a long breath as my grandfather opened it.
+
+It was a very civil letter from the owners of the ship, thanking us for all we had done to save the unhappy crew and passengers, but saying they knew nothing of the child or her belongings, as no one of the name of Villiers had taken a cabin, and there was no sailor on board of that name. But they said they would make further inquiries in Calcutta, from which port the vessel had sailed. Meanwhile they begged my grandfather to take charge of the child, and assured him he should be handsomely rewarded for his trouble.
+
+'That's right!' I said, when he had finished reading it. 'Then she hasn't to go yet!'
+
+'No,' said my grandfather; 'poor wee lassie! we can't spare her yet. I don't want any of their rewards, Alick, not I! That's reward enough for me,' he said, as he lifted up the child to kiss his wrinkled forehead.
+
+CHAPTER VI.
+
+THE OLD GENTLEMAN'S QUESTION.
+
+The next Monday morning Timpey and I went down together to the pier, to await the arrival of the steamer. She had brought a doll with her, which Mrs. Millar had given her, and of which she was very proud.
+
+Captain Sayers sent for me, as soon as the steamer came up to the pier, to tell me that two gentlemen had come to see my grandfather. I held the child's hand very tightly in mine, for I had felt sure they had come for her.
+
+The gentlemen came up the steps a minute or two afterwards. One of them was a middle-aged man, with a very clever face, I thought. He told me he had come to see Mr. Alexander Fergusson, and asked me if I could direct him which way to go to the house.
+
+'Yes, sir,' I said; 'Mr. Fergusson is my grandfather.' So we went up towards the lighthouse, Timpey and I walking first to lead the way, and the gentlemen following. The other gentleman was quite old, and had white hair and gold spectacles, and a pleasant, kindly face.
+
+Timpey could not walk very fast, and she kept running first to one side and then to another, to gather flowers or pick up stones, to I took her in my arms and carried her.
+
+'Is that your little sister?' asked the old gentleman.
+
+'No, sir,' I said; 'this is the little girl who was on board the _Victory_!
+
+'Dear me! dear me!' said both gentlemen at once. 'Let me look at her,' said the old man, arranging his spectacles.
+
+But Timpey was frightened, and clung to me, and began to cry. 'Never mind, never mind,' said the old gentleman kindly; 'we'll make friends with one another by-and-by.'
+
+By this time we had reached the house, and the middle-aged gentleman introduced himself as Mr. Septimus Forster, one of the owners of the lost vessel, and said that he and his father-in-law, Mr. Davis, had come to hear all particulars that my grandfather could give them with regard to the shipwreck.
+
+My grandfather begged them to sit down, and told me to prepare breakfast for them at once. They were very pleasant gentlemen, both of them, and were very kind to my grandfather. Mr. Forster wanted to make him a handsome present for what he had done; but my grandfather would not take it. They talked much of little Timpey, and I kept stopping to listen as I was setting out the cups and saucers. They had heard nothing more of her relations; and they said it was a very strange thing that no such name as Villiers was to be found on the list of passengers on board. They offered to take her away with them till some relation was found; but my grandfather begged to keep her. The gentlemen, seeing how happy and well cared for the child was, gladly consented.
+
+After breakfast Mr. Forster said he should like to see the lighthouse, so my grandfather went up to the top of the tower with him, and showed him with great pride all that was to be seen there. Old Mr. Davis was tired, and stayed behind with little Timpey and me.
+
+'This is a strong house, my lad,' he said, when the others had gone.
+
+'Yes, sir,' I said, 'it ought to be strong; the wind is fearful here sometimes.'
+
+'What sort of a foundation has it?' said the old man, tapping the floor with his stick.
+
+'Oh, it's all rock, sir,' I answered, 'solid rock; our house and the lighthouse tower are all built into the rock; they would never stand if they weren't'
+
+'And are _you_ on the Rock, my lad?' said Mr. Davis, looking at me through his spectacles.
+
+'I beg your pardon, sir,' I said, for I thought I had not heard him rightly.
+
+'Are _you_ on the Rock?' he repeated.
+
+'On the rock, sir? oh, yes,' I said, thinking he could not have understood what I said before. 'All these buildings are built into the rock, or the wind and sea would carry them away.'
+
+'But _you_,' said the old gentleman again, 'are _you_ on the Rock?'
+
+CHAPTER VII
+
+THE BELL ROCK AND SKERRYVORE LIGHTS
+
+At first sight it seems somewhat remarkable--some might feel disposed to challenge the assertion--that so small a country as Scotland should stand pre-eminent among the nations of the world as being that possessed of the greatest number of imposing sea-rock lights. But such is the case. Moreover, North Britain offers some of the finest and most impressive specimens of the lighthouse builder's resource and skill to be found in any part of the globe.
+
+When the responsibility for lighting the Scottish coasts was handed over to the Commissioners for Northern Lighthouses, one of their first tasks was the adequate illumination of the wave-swept Inchcape or Bell Rock, which lies some twelve miles off the Scottish mainland in the busy portal of the Firth of Tay. At that time this sinister menace to navigation was not marked in any way whatever, and apparently had remained in this unprotected condition ever since the notorious pirate, Ralph the Rover, cut away the buoy-bell which had been placed upon it by the Abbot of Aberbrothock, as narrated in Southey's famous ballad.
+
+The rock, or rather reef--inasmuch as it measures 2,000 feet from end to end, and lies athwart the fairway--is submerged completely to a depth of 16 feet at high spring-tides, while at lowest water only some 4 feet of its crest are laid bare here and there. This is not all. The ledge is the summit of a dangerous, slowly-rising submarine hillock, where, for a distance of about 100 yards on either side, the lead sounds only 3 fathoms. Wrecks were so numerous and terrible at this spot that the protection of the seafaring community became imperative, and the newly-appointed guardians of the Scottish coast lost no time in justifying the trust reposed in them, but erected a first-class light. The Eddystone had been conquered, and, although the conditions were dissimilar and the enterprise bolder, no tangible reason against its imitation was advanced.
+
+The engineer John Rennie was entrusted with the work, while Robert Stevenson was appointed as his assistant. The rock was surveyed, and a tower similar in its broad lines to that evolved by Smeaton for the Eddystone was elaborated, and the authority for its construction given in the year 1806.
+
+Work upon the rock in the earliest stages was confined to the calmest days of the summer season, when the tides were lowest, the water was smoothest, and the wind in its calmest mood. Under such conditions the men were able to stay on the site for about five hours. The engineer hoped against hope that the elements would be kind to him, and that he would be able to complete the preliminary work upon the rock in one season.
+
+The constructional plans were prepared carefully, so that advantage might be taken of every promising opportunity. One distinct drawback was the necessity to establish a depot some distance from the erecting site. Those were the days before steam navigation, and the capricious sailing craft offered the only means of maintaining communication between rock and shore, and for the conveyance of men and material to and fro. The year 1807 was devoted to the construction of vessels for the work, and to the establishment of workshops with machinery and other facilities at Arbroath, the nearest suitable point on the mainland to the rock. A temporary beacon was placed on the reef, while adjacent to the site selected for the tower a smith's forge was made fast, so as to withstand the dragging motion of the waves when the rock was submerged. The men were housed on the _Smeaton_, which during the spells of work on the rock rode at anchor a short distance away in deep water. The arrangements stipulated that three boats, which were employed to bring the men from the vessel to the rock, should always be moored at the landing-place, so that, in the event of the weather changing for the worse, the masons, forced to cease work suddenly, might regain the _Smeaton_ safely in one trip, the three boats being able to convey thirty men, which constituted the average complement on the rock.
+
+While the preparations were proceeding ashore, a little body of workers toiled, whenever possible, at clearing the face of the rock and carrying out the requisite excavation work. While this was in progress a disaster was averted very narrowly, which would have jeopardized the completion of the tower, owing to the superstitious natures of the men engaged. On September 2, 1807, the _Smeaton_, as usual, had brought out some thirty masons, had landed them safely on the rock, and was riding at anchor.
+
+Suddenly the wind freshened, and the engineer on the rock grew apprehensive of the _Smeaton_ dragging her cables. A party at once put off from the rock in one of the three boats and regained the ship, but were scarcely aboard when the cables parted, and the vessel, caught by the wind and tide, made off. Before the men regained control of her she had drifted some three miles to leeward. Meantime on the rock the situation was growing serious. Only Mr. Stevenson, who was supervising operations on the spot, and the landing-master were aware of its gravity. The masons were so busy hewing, boring and chiselling, that they had not noticed the _Smeaton's_ drift. But the engineer, observing the flowing of the tide, realized that the rock must be submerged before the ship could be brought up again. He racked his brains to find some means of getting his gang of men off safely in the nick of time, but it was a searching problem to solve with only two boats, which, at the utmost, could carry twenty-four persons. To make matters worse, one of those mists which are so peculiar to the Scottish coast began to settle down, blotting everything from sight.
+
+The water rose higher. The men toiling on the lowest levels receded higher and higher before the advancing tide, though still too deeply occupied in their labours to bestow a thought upon the _Smeaton_. At last the smith's forge was quenched, and this was the general signal to the men to prepare to leave the rock. Tools were collected, and the party strode towards the landing-stage to enter the boats. Conceive their consternation when they saw that one boat was missing! When they glanced over the water the _Smeaton_ was not riding in her usual place--in fact, was nowhere to be seen! One and all gathered around the engineer to learn the reason for this remarkable breach in the arrangements for their safety, and yet all were too dumbfounded to question or protest. As for the luckless engineer, he was at his wits' end and could not offer a word of explanation to the inquiring looks that besieged him. One and all, as the water lapped their feet, realized the hopelessness of the position. Suddenly, when they were beginning to despair, one of the men described the phantom form of a vessel making for the rock. "A boat!" he shouted in exultation. Sure enough the shadow matured into the familiar form of the Tay pilot-boat, the master of which, observing the workmen on the rock, the rising tide, and the absence of the _Smeaton_, had realized that something must have gone wrong, and approached the rock to make inquiries. He came up at the critical moment. The men were drenched, and, their feelings having been strung to a high pitch with anxiety, they nearly collapsed at the arrival of this unexpected assistance. The pilot-boat, after taking off the men, awaited the return of the _Smeaton_, which took them on board about midnight.
+
+This narrow escape so terrified the men that on the following day the engineer found only eight of his staff of thirty-two, who were willing to venture upon the rock again. When this gang returned in the evening, their safety appeared to restore courage to their companions, so that next day all expressed their readiness to resume their tasks.
+
+The fitful character of the work did not leave its mark so distinctly as might be supposed. Whenever there was a chance, the men worked with an amazing will and zeal; and although the first stone of the tower was not laid until July 10, 1808, three courses of masonry were completed when the undertaking was suspended at the end of November for the winter. The succeeding season's toil saw the addition of about 27 feet more of the tower, which was finally completed by the close of 1810. The building was 120 feet in height, and the light was shown for the first time on February 1, 1811.
+
+In view of the difficulties which had to be surmounted, this "ruddy gem of changeful light," as it is described by Sir Walter Scott, was not particularly costly. By the time it was brought into commission, 61,330, or $306,650, had been expended. In 1902, after nearly a century's service, the tower was provided with a new light-room, so as to bring it into conformity with modern practice.
+
+While the Bell Rock tower stands as a monument to the engineering ability of Robert Stevenson, the Skerryvore, on the western coast, is a striking tribute to the genius of his son, Alan. For forty years or more previous to 1844 one ship at least had been caught and shattered every year on this tumbled mass of gneiss. From the navigator's point of view, the danger of this spot lay chiefly in the fact that it was so widely scattered. The ridge runs like a broken backbone for a distance of some eight miles in a west-south-westerly direction, and it is flanked on each side by isolated rocks which jut from a badly-broken sea-bed. The whole mass lies some distance out to sea, being ten miles south-west of Tyree and twenty-four miles west of Iona. In rough weather the whole of the rocks are covered, and the waves, beating heavily on the mass, convert the scene into one of indescribable tumult.
+
+The Commissioners of Northern Lights acknowledged the urgent need of a light upon this ridge, but it was realized that its erection would represent the most daring feat of lighthouse engineering that had been attempted up to this time. There was only one point where a tower could be placed, and this was so exposed that the safe handling of the men and materials constituted a grave responsibility. The rock has to withstand the full impetus of the Atlantic waves, gathered in their 3,000 miles' roll, and investigations revealed the fact that they bear down upon the Skerryvore with a force equal to some 3 tons per square foot. It was apparent that any masonry tower must be of prodigious strength to resist such a battering, while at the same time a lofty stack was imperative, because the light not only would have to mount guard over the rock upon which it stood, but also over a vast stretch of dangerous water on either side.
+
+After he had completed the Bell Rock light, Robert Stevenson attacked the problem of the Skerryvore. In order to realize the magnitude of the undertaking, some of the Commissioners accompanied the engineer, but the experience of pulling out into the open Atlantic on a day when it was slightly ruffled somewhat shook their determination to investigate the reef from close quarters. Sir Walter Scott was a member of the party, and he has described the journey very graphically. Before they had gone far the Commissioners on board expressed their willingness to leave the matter entirely in the hands of their engineer. With grim Scottish humour, however, Robert Stevenson insisted that the rock should be gained, so that the Commissioners might be able to grasp the problem at first hand.
+
+But after all nothing was done. The difficulties surrounding the work were only too apparent to the officials. They agreed that the expense must be prodigious and that the risks to the workmen would be grave.
+
+In 1834 a second expedition was despatched to the reef under Alan Stevenson, who had accompanied his father on the previous occasion, and who now occupied the engineering chair. He surveyed the reef thoroughly, traversing the dangerous channels around the isolated humps, of which no less than 130 were counted, at great risk to himself and his companions. However, he achieved his object. He discovered the best site for the tower and returned home to prepare his plans.
+
+His proposals, for those days, certainly were startling. He decided to follow generally the principles of design, which had been laid down by his father in regard to the Bell Rock. But he planned something bigger and more daring. He maintained that a tower 130 feet high, with a base diameter of 42 feet, tapering in a curve to 16 feet at the top, was absolutely necessary. It was the loftiest and weightiest work of its character that had ever been contemplated up to this time, while the peculiar situation of the reef demanded pioneering work in all directions.
+
+The confidence of the Commissioners in the ability of their engineer was so complete that he received the official sanction to begin, and in 1838 the undertaking was commenced. The engineer immediately formulated his plans of campaign for a stiff struggle with Nature. One of the greatest difficulties was the necessity to transport men, supplies and material over a long distance, as the Scottish coast in this vicinity is wild and sparsely populated. He established his base on the neighbouring island of Tyree, where barracks for the workmen, and yards for the preparation of the material, were erected, while another colony was established on the Isle of Mull for the quarrying of the granite. A tiny pier or jetty had to be built at this point to facilitate the shipment of the stone, and at Tyree a small harbour had to be completed to receive the vessel which was built specially for transportation purposes between the base and the rock.
+
+Another preliminary was the provision of accommodation for the masons upon the reef. The Atlantic swell, which rendered landing on the ridge precarious and hazardous, did not permit the men to be housed upon a floating home, as had been the practice in the early days of the Bell Rock tower. In order to permit the work to go forward as uninterruptedly as the sea would permit, a peculiar barrack was erected. It was a house on stilts, the legs being sunk firmly into the rock, with the living-quarters perched some 40 feet up in the air. The skeleton type of structure was selected because it did not impede the natural movement of the waves. It was an ingenious idea, and fulfilled the purpose of its designer admirably, while the men became accustomed to their strange home after a time. For two years it withstood the seas without incident, and the engineer and men came to regard the eyrie as safe as a house on shore. But one night the little colony received a shock. The angry Atlantic got one or two of its trip-hammer blows well home, and smashed the structure to fragments. Fortunately, at the time it was untenanted.
+
+The workmen, who were on shore waiting to go out to the rock to resume their toil, were downcast at this unexpected disaster, but the engineer was not at all ruffled. He promptly sent to Glasgow for further material, and lost no time in rebuilding the quaint barrack upon new and stronger lines. This erection defied the waves successfully until its demolition after the Skerryvore was finished.
+
+Residence in this tower was eerie. The men climbed the ladder and entered a small room, which served the purposes of kitchen, dining-room, and parlour. It was barely 12 feet across--quarters somewhat cramped for thirty men. When a storm was raging, the waves, as they combed over the rock, shook the legs violently and scurried under the floor in seething foam. Now and again a roller, rising higher than its fellows, broke upon the rock and sent a mass of water against the flooring to hammer at the door. Above the living-room were the sleeping-quarters, high and dry, save when a shower of spray fell upon the roof and walls like heavy hail, and occasionally percolated the joints of the woodwork. The men, however, were not perturbed. Sleeping, even under such conditions, was far preferable to doubtful rest in a bunk upon an attendant vessel, rolling and pitching with the motion of the sea. They had had a surfeit of such experience during the first season's work, while the barrack was under erection.
+
+Yet the men could not grumble. The engineer responsible for the work shared their privations and discomforts, for Alan Stevenson clung to the rock night and day while work was in progress, and he has given a very vivid impression of life in this quaint home on legs. He relates how he "spent many a weary day and night--at those times when the sea prevented anyone going down to the rock--anxiously looking for supplies from the shore, and earnestly looking for a change of weather favourable for prosecuting the works. For miles around nothing could be seen but white foaming breakers, and nothing heard but howling winds and lashing waves. At such seasons much of our time was spent in bed, for there alone we had effectual shelter from the winds and spray, which searched every cranny in the walls of the barrack. Our slumbers, too, were at times fearfully interrupted by the sudden pouring of the sea over the roof, the rocking of the house on its pillars, and the spurting of water through the seams of the doors and windows--symptoms which, to one suddenly aroused from sound sleep, recalled the appalling fate of the former barrack, which had been engulfed in the foam not 20 yards from our dwelling, and for a moment seemed to summon us to a similar fate."
+
+CHAPTER X.
+
+Steamers on the Pacific.--The TELICA (1825).--P. S. N. Co., 1840.--Compound Engines adopted, 1856.--Service extended from West Coast, South America, to the River Plate (1865), and to Liverpool, 1868.--The P. S. N. Co. and Messrs. Anderson Anderson & Co., 1878.--Gulf Line of Steamers between Great Britain and West Coast, South America.
+
+The first steamer to trade along the Pacific Coast of South America was a small steamer, named the TELICA, in 1825. She was owned and commanded by a Spaniard bearing a Russian name, Mitrovitch. The venture proved a failure, chiefly owing to the scarcity of fuel, and the unfortunate man, in a fit of despair, fired his pistol into a barrel of gunpowder, and blew up his vessel in the harbour of Guayaquil, destroying himself and all on board, except one man.
+
+The next person to attempt to establish steamship communication along the Pacific Coast was an American citizen, Mr. William Wheelwright, born in Newburyport, Mass., U.S.A., in 1798, and appointed United States Consul at Guayaquil in 1824. Mr. Wheelwright, notwithstanding the tragic fate of the TELICA and her owner, was convinced of the importance of steam communication to the development of the rich resources of the western side of the South American Continent, spent six years in arranging plans for steam communication between the different Republics, and at last obtained from the Peruvian, Bolivian, and Chilian Governments the privilege of establishing and maintaining a steamship service along their respective coasts for a period of ten years. In pursuance of this object he came to England, and secured the co-operation of several wealthy merchants, and on the 17th February, 1840, a charter was obtained for the establishment of the undertaking known as the Pacific Steam Navigation Company, together with a small subsidy for the conveyance of the mails. It was not the intention of the founders of the company to trade elsewhere than along the Pacific Coast, and for this purpose a capital of a quarter of a million pounds was thought to be sufficient. The capital consisted of 5,000 shares, 50 each. Only the amount required to build two small steamers was called up. These steamers were the CHILI and PERU, each of about 700 tons gross register, with engines of about 150 horse-power nominal. They were brig-rigged paddle steamers, built of wood, by Charles Young and Co., Limehouse, London, and engined by Miller & Ravenhall.
+
+Owing in great measure to the scarcity of fuel on the coast, the company, during the first five years of its existence, sustained a loss of four-fifths of its paid-up capital, but the shareholders courageously resolved to persevere with their undertaking. The seat of management of the company was, however, transferred from London to Liverpool (1846), and the late Mr. William Just appointed Managing Director. The following year (1847), the Directors were for the first time able to declare a dividend, a modest two-and-a-half per cent.
+
+In 1850, having obtained an extension of the Government Postal contract, the Directors ordered four steamers, at a total cost of 140,000. These steamers were named the LIMA, SANTIAGO, QUITO and BOGOTA, and were each of about 1,000 tons gross and 300 horse-power nominal.
+
+In 1856 the company's service was re-organised by Mr. Just, who visited the West Coast specially for that purpose. During the same year the compound type of engines was adopted in the company's steamers, the Pacific Steam Navigation Company being thus one of the earliest ocean steamship companies to use this type of engine.
+
+A supplemental charter was obtained in 1865, extending the operations of the company, and authorising steamship communication between the West Coast of South America, and the River Plate on the East Coast.
+
+As the profits of the company had been steadily increasing for a number of years prior to 1867, it was resolved at a meeting of shareholders, held in December of that year, to establish a monthly line of steamers from Liverpool to the West Coast of South America, _via_ the Straits of Magellan, and to increase the capital of the company to 2,000,000.
+
+The first new steamer of the new service was the PACIFIC, 1,630 tons gross register, 1,174 tons net, with engines of 450 horse-power. Her principal dimensions were, length 267 feet, beam 40 feet, depth 17 feet. She was built on the Clyde in 1864, by Randolph Elder & Co., and cost 61,855. After trading for about three years on the Pacific Coast, she sailed from Valparaiso for Liverpool in May, 1868, as the pioneer steamer of the new mail service. During this year five steamers of about 3,000 tons each, specially built for the maintenance of this service, were added to the company's fleet. These were the JOHN ELDER, MAGELLAN, PATAGONIA, ARAUCANIA and CORDILLERA.
+
+So profitable was the Liverpool trade to the West Coast, the Directors determined in 1870 to make the sailings fortnightly, and in that year they added the steamers CHIMBORAZO, CUZCO, GARONNE, LUSITANIA and ACONCAGUA to the fleet.
+
+In December, 1871 they recommended a further increase of the company's capital to 3,000,000, with a view of making the service from Liverpool a weekly one. During the year they had greatly increased the number of the company's ocean steamers, having built in 1871 seven steamers, each of about 4,000 tons gross, viz., the SORATA, ILLIMANI, COTOPAXI, GALICIA, CORCOVADO, PUNO and POTOSI.
+
+In July, 1872, the capital of the company was raised to 4,000,000, and the steamers VALPARAISO and BRITANNIA were added to its fleet, and in the following year the IBERIA and LIGURIA.
+
+In addition to the above steamers, which were all built for the Liverpool to West Coast service, the Pacific Steam Navigation Company built during the years 1869 to 1873 inclusive, eighteen steamers for its Pacific Coast service.
+
+The IBERIA and LIGURIA were the last of the barque-rigged, clipper-bow type of steamer built for the Pacific Steam Navigation Company. The succeeding vessels of the fleet have as a rule four pole masts and a straight stem.
+
+Although the trade between Liverpool and the West Coast of South America had increased with marvellous rapidity, the increase in the company's tonnage had more than kept pace with it. It was found that the combined passenger and cargo trade would not support a sailing each week, and the sailings were reduced to two each month. As a consequence of the reduced number of sailings, as many as nine of the company's steamers were at one time laid up for want of employment. In 1878 the Directors were fortunately able to charter four of their vessels, the CHIMBORAZO, LUSITANIA, CUZCO and GARONNE, to Messrs. Anderson, Anderson & Co., who in that year founded the Orient Line of steamers from London to Australia. In 1882, when the latter company decided to double its sailings, the Pacific Steam Navigation Company made arrangements to employ several additional steamers in the Australian service. Although the Pacific Company was the first to establish steamship communication between Great Britain and the West Coast of South America, it has had to share the traffic in later years with the Gulf Line of steamers belonging to the Greenock Shipping Company, and with the steamers belonging to Messrs. Lamport & Holt.
+
+CHAPTER XI.
+
+French-Algerian Expedition, 1830.--Civil War in Portugal.--Loss of the steamer RIVAL.--Mutiny on a Transport.--Loss of the LORD BLANEY.--The MARGARET, first screw passenger steamer trading from Hull.
+
+Early in the year 1830, the French Government, fitted out an expedition against the Dey of Algiers, and an agent of the former was instructed to contract with the City of Dublin and the St. George Steam-Packet Companies for the employment of some of their first-class boats as transports in the expedition. The vessels chartered were ordered to proceed immediately to Toulon to embark French troops for service in North Africa. This was the first instance of steam vessels being extensively engaged in warlike expeditions. At this date, Portugal was engaged in a prolonged and sanguinary civil war, in the course of which vessels belonging to both of the famous Liverpool steamship companies were again employed.
+
+Don Miguel (surnamed the Usurper) had about the year 1826 assumed the government of Portugal. It is calculated that in the short space of five years he imprisoned 26,270 of his beloved subjects; 16,000 were transported to various places; 13,000 were forced to fly from his paternal government; 13,700 perished on the scaffold; and 5,000 were either in concealment or wandering about the kingdom to avoid a similar fate. Finally, Dom Pedro, Emperor of Brazil, on behalf of his daughter Donna Maria of Portugal, took active measures to recover the throne. A number of British steamers were engaged as transports or privateers in the civil war that ensued. Amongst other vessels was the "ill-fated steamer"[16] RIVAL, which sailed from Greenock on the 22nd December, 1832, bound for Oporto, with about 400 volunteers for Dom Pedro, and foundered in Galway Bay, with the loss of nearly 500 lives. Some spars, bedding, and ship's papers were washed ashore, but as not one of the passengers or crew escaped, no particulars can ever be known of the circumstances attending the fatal disaster.
+
+The LORD BLANEY was one of several of the St. George Steam-Packet Company's vessels chartered for the same service. It appears from a record of magisterial proceedings (August, 1831) before Mr. H. Leach, of Milford, that the agents employed by Dom Pedro hired 200 seamen at Liverpool, and induced them to ship on board the LORD BLANEY, under a pretext that they were merely wanted to navigate British transports across the Atlantic, to convey some regiments of Portuguese from Rio de Janeiro to Europe; but no sooner had the LORD BLANEY got fairly into the Irish Channel than the officers threw off the mask, and acknowledged their destination to be Belle Isle, for the purpose of manning Dom Pedro's fleet. Finding themselves thus entrapped, the seamen exhibited signs of mutiny, and a violent gale of wind having forced the steamer into Milford Haven for shelter, the whole body of tars went ashore with bed and baggage, declaring their intention not to fight under any flag but that of England. After completing her engagement with Dom Pedro, the LORD BLANEY was placed on the Liverpool and Newry service, and on the 18th December, 1833, she was lost with all hands (45) whilst on a voyage from Newry to Liverpool. A subscription list was opened for the benefit of the families and relatives of the crew and passengers. The City of Dublin Steam-Packet Co., although in active opposition to the St. George Steam-Packet Co., headed the list with the handsome donation of 100. Two, at least, of the City of Dublin Steam-Packet Co.'s vessels took part in the Portuguese war, the LEEDS and the BIRMINGHAM. The latter steamer, under the command of Captain Beazley, arrived at Falmouth about the 15th July, 1833. She brought despatches from Lagos which contained intelligence of the most important and decisive nature, nothing less than the complete defeat and capture of the fleet of the Usurper. The news was received with the utmost satisfaction in England as well as Portugal.
+
+The MARGARET steamship sailed from Hamburg to Hull on Friday, 19th October, 1845, with a number of passengers and a full general cargo. Shortly after leaving the Elbe she encountered a north-west gale, and after beating against it for two days, she was driven on to a dangerous bank called the Memmett, near Juist, at the entrance to the river Memm. The moment she took the shoal, the sea, which was running very high, swept several overboard. The long boat was launched and an attempt made to reach the shore, but owing to it being crowded it capsized, and every soul in it perished. From advices received, it appears that altogether sixteen of the passengers and three of the crew were lost. Those who remained on board the vessel, after severe privations, were rescued. The MARGARET was owned by Mr. Pimm, of Hull; was several years old; was about 250 tons burthen, and was rigged as a three-masted schooner. She was worked by a screw propeller, and was the first vessel of that description engaged in the passenger trade from the port of Hull.
+
+CHAPTER XII.
+
+Pioneers of Transatlantic steam navigation.--Valentia Transatlantic S. N. Co. incorporated, 1828.--Dr. Lardner's famous speech on Steam Navigation.--The ROYAL WILLIAM, first steamer from Canada to England, 1833; sold to Spanish Government and re-named YSABEL SEGUNDA.--The British Queen S. N. Co.--Launch of the BRITISH QUEEN, 1838.--SIRIUS, first passenger steamer from Europe to America, 1838.--GREAT WESTERN, 1838.--Arrival of both steamers at New York on same day.--The ROYAL WILLIAM, first Atlantic liner from Liverpool to New York, 1838.--The LIVERPOOL.--The PRESIDENT launched, 1839; lost, 1841.
+
+A Quarter of a century had elapsed since the launch of Bell's COMET on the Clyde. In the interval, all the chief ports of Great Britain and Ireland, and several of the continental ports, had been connected by steampacket services. So early as 1828 it had been proposed to establish steam communication between the West of Ireland and America, and an Act of Parliament for incorporating the Valentia Transatlantic Steam Navigation Company was obtained. The proposed capital was 24,000, in shares of 50 each. The first steamer was estimated to cost 21,000. She was to be a vessel of about 800 tons burthen, driven by engines of 200 h.p., and was expected to make six round voyages per annum. She was to accommodate 50 cabin and 50 steerage passengers, and to carry 200 tons cargo, exclusive of bunkers. It appears from the following extract from the "Liverpool Albion" of the 14th December, 1835, that although the projectors of the Valentia Company advertised in 1828 that the company was "to commence immediate operations," its first sailing had not taken place seven years later. The scheme fell through for want of support, but in 1835 it was started afresh in conjunction with the railway from London, the Post Office Packets, and the Valentia Railway. The extract is valuable also as containing Dr. Lardner's famous dictum concerning the possibility of direct steam navigation between Liverpool and New York:--
+
+"Steam Communication with America.
+
+"Dr. Lardner then proceeded to observe that one of the grandest projects which had ever occupied the human mind was at present in the process of actual accomplishment. He meant that of constructing a great highway for steam intercourse between New York and London--between the capital of the New World and that of the Old. Part of the highway was in process of formation. It consisted of several stages--that of the railroad from London to Birmingham; that from Birmingham to Liverpool, and the steam intercourse with Dublin; but there was another stage--that from Dublin to Valentia, which had as yet hardly been thought of. Ireland was a country which, with all her political disadvantages, was blest by nature with a vast number of physical advantages, and amongst the rest he might reckon a vast number of excellent harbours. No country in the world could boast of so many fine and spacious ports, bays and roadsteads. She had many harbours on her west coast which would serve admirably as stations for steam conveyance across the Atlantic; but Valentia had been selected as the extreme westerly point suitable for that purpose. It was a fine anchoring ground by an island of that name on the coast of Munster. The distance from Dublin to this point was under 200 miles, which might be traversed in about 8 hours. The nearest point on the continent of North America to this point of Ireland was St. John's in Newfoundland. The distance between the two was about 1,900 miles; thence to Halifax, in Nova Scotia, there would be another run of 550 miles, and from that to New York would not exceed the admissible range; but touching at Halifax would be desirable for the sake of passengers. The only difficulty would be as to the run from Valentia to St. John's; and the voyage from Dublin to Bordeaux and back, a distance of between 1,600 and 1,700 miles, with the same stock of coals, came very near this distance. It must be observed that westerly gales blew almost all the year round across the Atlantic. They were produced by the trade winds being the compensating cause that restored the balance which these served to destroy, according to that beautiful principle in nature which always provides a remedy for any derangement in the deranging cause itself. As a last resource, however, should the distance between Valentia and St. John's prove too great, they might make the Azores a stage between, so that there remained no doubt of the practicability of establishing a steam intercourse with the United States. As to the project, however, which was announced in the newspapers, of making the voyage directly from New York to Liverpool, it was, he had no hesitation in saying, perfectly chimerical, and they might as well talk of making a voyage from New York or Liverpool to the moon. The vessels which would ultimately be found the best adapted for the voyage between this country and the United States would be those of 800 tons, which would carry machines of 200 horse-power, and would be able to stow 400 tons of coal. To supply a 10 horse-power daily required an expenditure of a ton of coals, and, consequently, 200 horse-power would require 20 tons of coal daily; but if the vessel carried 400 tons of coal only, it would not be practicable to undertake a voyage which would require the whole of the quantity. They must make an allowance of 100 tons for contingencies. Thus, in reckoning the average length of the voyage which might be undertaken by such a vessel, we might safely calculate upon 300 tons of coal, which would be sufficient for 15 days, and it might fairly be concluded that any project which calculated upon making longer voyages than 15 days without taking in a fresh supply of coals, in the present state of the steamboat, must be considered chimerical. Now, the average rate of speed of the Mediterranean packets was 170 miles per day, and the utmost limit of a steam voyage might be taken at 2,550 miles; but even that could not be reckoned upon."

@@ -1,40 +1,734 @@
-Integer boundaries:
-0 1 2 3 4 7 8 15 16 17 31 32 33 63 64 65 127 128 129 255 256 257 511 512 513 1023 1024 1025 2047 2048 2049
+Fundamental Physical Constants, 2022 CODATA adjustment (NIST):
 
-Signed values:
--2147483648 -65536 -32768 -4096 -1024 -256 -128 -64 -32 -16 -8 -4 -2 -1 0 1 2 4 8 16 32 64 128 256 1024 4096 32767 65535 2147483647
+  Quantity                                                       Value                 Uncertainty           Unit
+-----------------------------------------------------------------------------------------------------------------------------
+alpha particle-electron mass ratio                          7294.299 541 71          0.000 000 17
+alpha particle mass                                         6.644 657 3450 e-27      0.000 000 0021 e-27      kg
+alpha particle mass energy equivalent                       5.971 920 1997 e-10      0.000 000 0019 e-10      J
+alpha particle mass energy equivalent in MeV                3727.379 4118            0.000 0012               MeV
+alpha particle mass in u                                    4.001 506 179 129        0.000 000 000 062        u
+alpha particle molar mass                                   4.001 506 1833 e-3       0.000 000 0012 e-3       kg mol^-1
+alpha particle-proton mass ratio                            3.972 599 690 252        0.000 000 000 070
+alpha particle relative atomic mass                         4.001 506 179 129        0.000 000 000 062
+alpha particle rms charge radius                            1.6785 e-15              0.0021 e-15              m
+Angstrom star                                               1.000 014 95 e-10        0.000 000 90 e-10        m
+atomic mass constant                                        1.660 539 068 92 e-27    0.000 000 000 52 e-27    kg
+atomic mass constant energy equivalent                      1.492 418 087 68 e-10    0.000 000 000 46 e-10    J
+atomic mass constant energy equivalent in MeV               931.494 103 72           0.000 000 29             MeV
+atomic mass unit-electron volt relationship                 9.314 941 0372 e8        0.000 000 0029 e8        eV
+atomic mass unit-hartree relationship                       3.423 177 6922 e7        0.000 000 0011 e7        E_h
+atomic mass unit-hertz relationship                         2.252 342 721 85 e23     0.000 000 000 70 e23     Hz
+atomic mass unit-inverse meter relationship                 7.513 006 6209 e14       0.000 000 0023 e14       m^-1
+atomic mass unit-joule relationship                         1.492 418 087 68 e-10    0.000 000 000 46 e-10    J
+atomic mass unit-kelvin relationship                        1.080 954 020 67 e13     0.000 000 000 34 e13     K
+atomic mass unit-kilogram relationship                      1.660 539 068 92 e-27    0.000 000 000 52 e-27    kg
+atomic unit of 1st hyperpolarizability                      3.206 361 2996 e-53      0.000 000 0015 e-53      C^3 m^3 J^-2
+atomic unit of 2nd hyperpolarizability                      6.235 379 9735 e-65      0.000 000 0039 e-65      C^4 m^4 J^-3
+atomic unit of action                                       1.054 571 817... e-34    (exact)                  J s
+atomic unit of charge                                       1.602 176 634 e-19       (exact)                  C
+atomic unit of charge density                               1.081 202 386 77 e12     0.000 000 000 51 e12     C m^-3
+atomic unit of current                                      6.623 618 237 5082 e-3   0.000 000 000 0072 e-3   A
+atomic unit of electric dipole mom.                         8.478 353 6198 e-30      0.000 000 0013 e-30      C m
+atomic unit of electric field                               5.142 206 751 12 e11     0.000 000 000 80 e11     V m^-1
+atomic unit of electric field gradient                      9.717 362 4424 e21       0.000 000 0030 e21       V m^-2
+atomic unit of electric polarizability                      1.648 777 272 12 e-41    0.000 000 000 51 e-41    C^2 m^2 J^-1
+atomic unit of electric potential                           27.211 386 245 981       0.000 000 000 030        V
+atomic unit of electric quadrupole mom.                     4.486 551 5185 e-40      0.000 000 0014 e-40      C m^2
+atomic unit of energy                                       4.359 744 722 2060 e-18  0.000 000 000 0048 e-18  J
+atomic unit of force                                        8.238 723 5038 e-8       0.000 000 0013 e-8       N
+atomic unit of length                                       5.291 772 105 44 e-11    0.000 000 000 82 e-11    m
+atomic unit of mag. dipole mom.                             1.854 802 013 15 e-23    0.000 000 000 58 e-23    J T^-1
+atomic unit of mag. flux density                            2.350 517 570 77 e5      0.000 000 000 73 e5      T
+atomic unit of magnetizability                              7.891 036 5794 e-29      0.000 000 0049 e-29      J T^-2
+atomic unit of mass                                         9.109 383 7139 e-31      0.000 000 0028 e-31      kg
+atomic unit of momentum                                     1.992 851 915 45 e-24    0.000 000 000 31 e-24    kg m s^-1
+atomic unit of permittivity                                 1.112 650 056 20 e-10    0.000 000 000 17 e-10    F m^-1
+atomic unit of time                                         2.418 884 326 5864 e-17  0.000 000 000 0026 e-17  s
+atomic unit of velocity                                     2.187 691 262 16 e6      0.000 000 000 34 e6      m s^-1
+Avogadro constant                                           6.022 140 76 e23         (exact)                  mol^-1
+Bohr magneton                                               9.274 010 0657 e-24      0.000 000 0029 e-24      J T^-1
+Bohr magneton in eV/T                                       5.788 381 7982 e-5       0.000 000 0018 e-5       eV T^-1
+Bohr magneton in Hz/T                                       1.399 624 491 71 e10     0.000 000 000 44 e10     Hz T^-1
+Bohr magneton in inverse meter per tesla                    46.686 447 719           0.000 000 015            m^-1 T^-1
+Bohr magneton in K/T                                        0.671 713 814 72         0.000 000 000 21         K T^-1
+Bohr radius                                                 5.291 772 105 44 e-11    0.000 000 000 82 e-11    m
+Boltzmann constant                                          1.380 649 e-23           (exact)                  J K^-1
+Boltzmann constant in eV/K                                  8.617 333 262... e-5     (exact)                  eV K^-1
+Boltzmann constant in Hz/K                                  2.083 661 912... e10     (exact)                  Hz K^-1
+Boltzmann constant in inverse meter per kelvin              69.503 480 04...         (exact)                  m^-1 K^-1
+characteristic impedance of vacuum                          376.730 313 412          0.000 000 059            ohm
+classical electron radius                                   2.817 940 3205 e-15      0.000 000 0013 e-15      m
+Compton wavelength                                          2.426 310 235 38 e-12    0.000 000 000 76 e-12    m
+conductance quantum                                         7.748 091 729... e-5     (exact)                  S
+conventional value of ampere-90                             1.000 000 088 87...      (exact)                  A
+conventional value of coulomb-90                            1.000 000 088 87...      (exact)                  C
+conventional value of farad-90                              0.999 999 982 20...      (exact)                  F
+conventional value of henry-90                              1.000 000 017 79...      (exact)                  H
+conventional value of Josephson constant                    483 597.9 e9             (exact)                  Hz V^-1
+conventional value of ohm-90                                1.000 000 017 79...      (exact)                  ohm
+conventional value of volt-90                               1.000 000 106 66...      (exact)                  V
+conventional value of von Klitzing constant                 25 812.807               (exact)                  ohm
+conventional value of watt-90                               1.000 000 195 53...      (exact)                  W
+Copper x unit                                               1.002 076 97 e-13        0.000 000 28 e-13        m
+deuteron-electron mag. mom. ratio                           -4.664 345 550 e-4       0.000 000 012 e-4
+deuteron-electron mass ratio                                3670.482 967 655         0.000 000 063
+deuteron g factor                                           0.857 438 2335           0.000 000 0022
+deuteron mag. mom.                                          4.330 735 087 e-27       0.000 000 011 e-27       J T^-1
+deuteron mag. mom. to Bohr magneton ratio                   4.669 754 568 e-4        0.000 000 012 e-4
+deuteron mag. mom. to nuclear magneton ratio                0.857 438 2335           0.000 000 0022
+deuteron mass                                               3.343 583 7768 e-27      0.000 000 0010 e-27      kg
+deuteron mass energy equivalent                             3.005 063 234 91 e-10    0.000 000 000 94 e-10    J
+deuteron mass energy equivalent in MeV                      1875.612 945 00          0.000 000 58             MeV
+deuteron mass in u                                          2.013 553 212 544        0.000 000 000 015        u
+deuteron molar mass                                         2.013 553 214 66 e-3     0.000 000 000 63 e-3     kg mol^-1
+deuteron-neutron mag. mom. ratio                            -0.448 206 52            0.000 000 11
+deuteron-proton mag. mom. ratio                             0.307 012 209 30         0.000 000 000 79
+deuteron-proton mass ratio                                  1.999 007 501 2699       0.000 000 000 0084
+deuteron relative atomic mass                               2.013 553 212 544        0.000 000 000 015
+deuteron rms charge radius                                  2.127 78 e-15            0.000 27 e-15            m
+electron charge to mass quotient                            -1.758 820 008 38 e11    0.000 000 000 55 e11     C kg^-1
+electron-deuteron mag. mom. ratio                           -2143.923 4921           0.000 0056
+electron-deuteron mass ratio                                2.724 437 107 629 e-4    0.000 000 000 047 e-4
+electron g factor                                           -2.002 319 304 360 92    0.000 000 000 000 36
+electron gyromag. ratio                                     1.760 859 627 84 e11     0.000 000 000 55 e11     s^-1 T^-1
+electron gyromag. ratio in MHz/T                            28 024.951 3861          0.000 0087               MHz T^-1
+electron-helion mass ratio                                  1.819 543 074 649 e-4    0.000 000 000 053 e-4
+electron mag. mom.                                          -9.284 764 6917 e-24     0.000 000 0029 e-24      J T^-1
+electron mag. mom. anomaly                                  1.159 652 180 46 e-3     0.000 000 000 18 e-3
+electron mag. mom. to Bohr magneton ratio                   -1.001 159 652 180 46    0.000 000 000 000 18
+electron mag. mom. to nuclear magneton ratio                -1838.281 971 877        0.000 000 032
+electron mass                                               9.109 383 7139 e-31      0.000 000 0028 e-31      kg
+electron mass energy equivalent                             8.187 105 7880 e-14      0.000 000 0026 e-14      J
+electron mass energy equivalent in MeV                      0.510 998 950 69         0.000 000 000 16         MeV
+electron mass in u                                          5.485 799 090 441 e-4    0.000 000 000 097 e-4    u
+electron molar mass                                         5.485 799 0962 e-7       0.000 000 0017 e-7       kg mol^-1
+electron-muon mag. mom. ratio                               206.766 9881             0.000 0046
+electron-muon mass ratio                                    4.836 331 70 e-3         0.000 000 11 e-3
+electron-neutron mag. mom. ratio                            960.920 48               0.000 23
+electron-neutron mass ratio                                 5.438 673 4416 e-4       0.000 000 0022 e-4
+electron-proton mag. mom. ratio                             -658.210 687 89          0.000 000 19
+electron-proton mass ratio                                  5.446 170 214 889 e-4    0.000 000 000 094 e-4
+electron relative atomic mass                               5.485 799 090 441 e-4    0.000 000 000 097 e-4
+electron-tau mass ratio                                     2.875 85 e-4             0.000 19 e-4
+electron to alpha particle mass ratio                       1.370 933 554 733 e-4    0.000 000 000 032 e-4
+electron to shielded helion mag. mom. ratio                 864.058 239 86           0.000 000 70
+electron to shielded proton mag. mom. ratio                 -658.227 5856            0.000 0027
+electron-triton mass ratio                                  1.819 200 062 327 e-4    0.000 000 000 068 e-4
+electron volt                                               1.602 176 634 e-19       (exact)                  J
+electron volt-atomic mass unit relationship                 1.073 544 100 83 e-9     0.000 000 000 33 e-9     u
+electron volt-hartree relationship                          3.674 932 217 5665 e-2   0.000 000 000 0040 e-2   E_h
+electron volt-hertz relationship                            2.417 989 242... e14     (exact)                  Hz
+electron volt-inverse meter relationship                    8.065 543 937... e5      (exact)                  m^-1
+electron volt-joule relationship                            1.602 176 634 e-19       (exact)                  J
+electron volt-kelvin relationship                           1.160 451 812... e4      (exact)                  K
+electron volt-kilogram relationship                         1.782 661 921... e-36    (exact)                  kg
+elementary charge                                           1.602 176 634 e-19       (exact)                  C
+elementary charge over h-bar                                1.519 267 447... e15     (exact)                  A J^-1
+Faraday constant                                            96 485.332 12...         (exact)                  C mol^-1
+Fermi coupling constant                                     1.166 3787 e-5           0.000 0006 e-5           GeV^-2
+fine-structure constant                                     7.297 352 5643 e-3       0.000 000 0011 e-3
+first radiation constant                                    3.741 771 852... e-16    (exact)                  W m^2
+first radiation constant for spectral radiance              1.191 042 972... e-16    (exact)                  W m^2 sr^-1
+hartree-atomic mass unit relationship                       2.921 262 317 97 e-8     0.000 000 000 91 e-8     u
+hartree-electron volt relationship                          27.211 386 245 981       0.000 000 000 030        eV
+Hartree energy                                              4.359 744 722 2060 e-18  0.000 000 000 0048 e-18  J
+Hartree energy in eV                                        27.211 386 245 981       0.000 000 000 030        eV
+hartree-hertz relationship                                  6.579 683 920 4999 e15   0.000 000 000 0072 e15   Hz
+hartree-inverse meter relationship                          2.194 746 313 6314 e7    0.000 000 000 0024 e7    m^-1
+hartree-joule relationship                                  4.359 744 722 2060 e-18  0.000 000 000 0048 e-18  J
+hartree-kelvin relationship                                 3.157 750 248 0398 e5    0.000 000 000 0034 e5    K
+hartree-kilogram relationship                               4.850 870 209 5419 e-35  0.000 000 000 0053 e-35  kg
+helion-electron mass ratio                                  5495.885 279 84          0.000 000 16
+helion g factor                                             -4.255 250 6995          0.000 000 0034
+helion mag. mom.                                            -1.074 617 551 98 e-26   0.000 000 000 93 e-26    J T^-1
+helion mag. mom. to Bohr magneton ratio                     -1.158 740 980 83 e-3    0.000 000 000 94 e-3
+helion mag. mom. to nuclear magneton ratio                  -2.127 625 3498          0.000 000 0017
+helion mass                                                 5.006 412 7862 e-27      0.000 000 0016 e-27      kg
+helion mass energy equivalent                               4.499 539 4185 e-10      0.000 000 0014 e-10      J
+helion mass energy equivalent in MeV                        2808.391 611 12          0.000 000 88             MeV
+helion mass in u                                            3.014 932 246 932        0.000 000 000 074        u
+helion molar mass                                           3.014 932 250 10 e-3     0.000 000 000 94 e-3     kg mol^-1
+helion-proton mass ratio                                    2.993 152 671 552        0.000 000 000 070
+helion relative atomic mass                                 3.014 932 246 932        0.000 000 000 074
+helion shielding shift                                      5.996 7029 e-5           0.000 0023 e-5
+hertz-atomic mass unit relationship                         4.439 821 6590 e-24      0.000 000 0014 e-24      u
+hertz-electron volt relationship                            4.135 667 696... e-15    (exact)                  eV
+hertz-hartree relationship                                  1.519 829 846 0574 e-16  0.000 000 000 0017 e-16  E_h
+hertz-inverse meter relationship                            3.335 640 951... e-9     (exact)                  m^-1
+hertz-joule relationship                                    6.626 070 15 e-34        (exact)                  J
+hertz-kelvin relationship                                   4.799 243 073... e-11    (exact)                  K
+hertz-kilogram relationship                                 7.372 497 323... e-51    (exact)                  kg
+hyperfine transition frequency of Cs-133                    9 192 631 770            (exact)                  Hz
+inverse fine-structure constant                             137.035 999 177          0.000 000 021
+inverse meter-atomic mass unit relationship                 1.331 025 048 24 e-15    0.000 000 000 41 e-15    u
+inverse meter-electron volt relationship                    1.239 841 984... e-6     (exact)                  eV
+inverse meter-hartree relationship                          4.556 335 252 9132 e-8   0.000 000 000 0050 e-8   E_h
+inverse meter-hertz relationship                            299 792 458              (exact)                  Hz
+inverse meter-joule relationship                            1.986 445 857... e-25    (exact)                  J
+inverse meter-kelvin relationship                           1.438 776 877... e-2     (exact)                  K
+inverse meter-kilogram relationship                         2.210 219 094... e-42    (exact)                  kg
+inverse of conductance quantum                              12 906.403 72...         (exact)                  ohm
+Josephson constant                                          483 597.848 4... e9      (exact)                  Hz V^-1
+joule-atomic mass unit relationship                         6.700 535 2471 e9        0.000 000 0021 e9        u
 
-Decimal values:
-0.0 0.000001 0.0009765625 0.03125 0.0625 0.1 0.125 0.25 0.3333333 0.5 0.75 0.875 0.999999 1.0
--0.0 -0.000001 -0.03125 -0.125 -0.5 -0.999999 -1.0 1.5 2.0 3.14159265 6.28318530 10.0 1000.0
+Atomic Weights and Isotopic Compositions (NIST):
 
-Shape table:
-1x1x1x1
-1x31x32x33
-2x16x64x1
-4x8x17x65
-10x512x640x2560
-24x128x2048x1
-48x128x2048x1
-512x10x2048x2560
+Atomic Number = 1
+Atomic Symbol = H
+Mass Number = 1
+Relative Atomic Mass = 1.00782503223(9)
+Isotopic Composition = 0.999885(70)
+Standard Atomic Weight = [1.00784,1.00811]
+Notes = m
 
-Matrix A:
-1 0 0 0 1 0 0 0 1
-2 3 5 7 11 13 17 19 23
--1 1 -1 1 -1 1 -1 1 -1
+Atomic Number = 1
+Atomic Symbol = D
+Mass Number = 2
+Relative Atomic Mass = 2.01410177812(12)
+Isotopic Composition = 0.000115(70)
+Standard Atomic Weight = [1.00784,1.00811]
+Notes = m
 
-Matrix B:
-0.125 0.250 0.500 1.000
-1.000 0.500 0.250 0.125
--0.125 -0.250 -0.500 -1.000
+Atomic Number = 1
+Atomic Symbol = T
+Mass Number = 3
+Relative Atomic Mass = 3.0160492779(24)
+Isotopic Composition =
+Standard Atomic Weight = [1.00784,1.00811]
+Notes = m
 
-Sequence checks:
-1 1 2 3 5 8 13 21 34 55 89 144 233 377 610 987
-2 3 5 7 11 13 17 19 23 29 31 37 41 43 47 53
-1 2 4 8 16 32 64 128 256 512 1024 2048 4096 8192
+Atomic Number = 2
+Atomic Symbol = He
+Mass Number = 3
+Relative Atomic Mass = 3.0160293201(25)
+Isotopic Composition = 0.00000134(3)
+Standard Atomic Weight = 4.002602(2)
+Notes = g,r
 
-Depth checkpoints:
-depth=0 prompt=2048 generation=0
-depth=12000 prompt=2048 generation=0
-depth=32000 prompt=2048 generation=0
-depth=64000 prompt=2048 generation=0
+Atomic Number = 2
+Atomic Symbol = He
+Mass Number = 4
+Relative Atomic Mass = 4.00260325413(6)
+Isotopic Composition = 0.99999866(3)
+Standard Atomic Weight = 4.002602(2)
+Notes = g,r
+
+Atomic Number = 3
+Atomic Symbol = Li
+Mass Number = 6
+Relative Atomic Mass = 6.0151228874(16)
+Isotopic Composition = 0.0759(4)
+Standard Atomic Weight = [6.938,6.997]
+Notes = m
+
+Atomic Number = 3
+Atomic Symbol = Li
+Mass Number = 7
+Relative Atomic Mass = 7.0160034366(45)
+Isotopic Composition = 0.9241(4)
+Standard Atomic Weight = [6.938,6.997]
+Notes = m
+
+Atomic Number = 4
+Atomic Symbol = Be
+Mass Number = 9
+Relative Atomic Mass = 9.012183065(82)
+Isotopic Composition = 1
+Standard Atomic Weight = 9.0121831(5)
+Notes =
+
+Atomic Number = 5
+Atomic Symbol = B
+Mass Number = 10
+Relative Atomic Mass = 10.01293695(41)
+Isotopic Composition = 0.199(7)
+Standard Atomic Weight = [10.806,10.821]
+Notes = m
+
+Atomic Number = 5
+Atomic Symbol = B
+Mass Number = 11
+Relative Atomic Mass = 11.00930536(45)
+Isotopic Composition = 0.801(7)
+Standard Atomic Weight = [10.806,10.821]
+Notes = m
+
+Atomic Number = 6
+Atomic Symbol = C
+Mass Number = 12
+Relative Atomic Mass = 12.0000000(00)
+Isotopic Composition = 0.9893(8)
+Standard Atomic Weight = [12.0096,12.0116]
+Notes =
+
+Atomic Number = 6
+Atomic Symbol = C
+Mass Number = 13
+Relative Atomic Mass = 13.00335483507(23)
+Isotopic Composition = 0.0107(8)
+Standard Atomic Weight = [12.0096,12.0116]
+Notes =
+
+Atomic Number = 6
+Atomic Symbol = C
+Mass Number = 14
+Relative Atomic Mass = 14.0032419884(40)
+Isotopic Composition =
+Standard Atomic Weight = [12.0096,12.0116]
+Notes =
+
+Atomic Number = 7
+Atomic Symbol = N
+Mass Number = 14
+Relative Atomic Mass = 14.00307400443(20)
+Isotopic Composition = 0.99636(20)
+Standard Atomic Weight = [14.00643,14.00728]
+Notes =
+
+Atomic Number = 7
+Atomic Symbol = N
+Mass Number = 15
+Relative Atomic Mass = 15.00010889888(64)
+Isotopic Composition = 0.00364(20)
+Standard Atomic Weight = [14.00643,14.00728]
+Notes =
+
+Atomic Number = 8
+Atomic Symbol = O
+Mass Number = 16
+Relative Atomic Mass = 15.99491461957(17)
+Isotopic Composition = 0.99757(16)
+Standard Atomic Weight = [15.99903,15.99977]
+Notes =
+
+Atomic Number = 8
+Atomic Symbol = O
+Mass Number = 17
+Relative Atomic Mass = 16.99913175650(69)
+Isotopic Composition = 0.00038(1)
+Standard Atomic Weight = [15.99903,15.99977]
+Notes =
+
+Atomic Number = 8
+Atomic Symbol = O
+Mass Number = 18
+Relative Atomic Mass = 17.99915961286(76)
+Isotopic Composition = 0.00205(14)
+Standard Atomic Weight = [15.99903,15.99977]
+Notes =
+
+Atomic Number = 9
+Atomic Symbol = F
+Mass Number = 19
+Relative Atomic Mass = 18.99840316273(92)
+Isotopic Composition = 1
+Standard Atomic Weight = 18.998403163(6)
+Notes =
+
+Atomic Number = 10
+Atomic Symbol = Ne
+Mass Number = 20
+Relative Atomic Mass = 19.9924401762(17)
+Isotopic Composition = 0.9048(3)
+Standard Atomic Weight = 20.1797(6)
+Notes = g,m
+
+Atomic Number = 10
+Atomic Symbol = Ne
+Mass Number = 21
+Relative Atomic Mass = 20.993846685(41)
+Isotopic Composition = 0.0027(1)
+Standard Atomic Weight = 20.1797(6)
+Notes = g,m
+
+Atomic Number = 10
+Atomic Symbol = Ne
+Mass Number = 22
+Relative Atomic Mass = 21.991385114(18)
+Isotopic Composition = 0.0925(3)
+Standard Atomic Weight = 20.1797(6)
+Notes = g,m
+
+Atomic Number = 11
+Atomic Symbol = Na
+Mass Number = 23
+Relative Atomic Mass = 22.9897692820(19)
+Isotopic Composition = 1
+Standard Atomic Weight = 22.98976928(2)
+Notes =
+
+Atomic Number = 12
+Atomic Symbol = Mg
+Mass Number = 24
+Relative Atomic Mass = 23.985041697(14)
+Isotopic Composition = 0.7899(4)
+Standard Atomic Weight = [24.304,24.307]
+Notes =
+
+Atomic Number = 12
+Atomic Symbol = Mg
+Mass Number = 25
+Relative Atomic Mass = 24.985836976(50)
+Isotopic Composition = 0.1000(1)
+Standard Atomic Weight = [24.304,24.307]
+Notes =
+
+Atomic Number = 12
+Atomic Symbol = Mg
+Mass Number = 26
+Relative Atomic Mass = 25.982592968(31)
+Isotopic Composition = 0.1101(3)
+Standard Atomic Weight = [24.304,24.307]
+Notes =
+
+Atomic Number = 13
+Atomic Symbol = Al
+Mass Number = 27
+Relative Atomic Mass = 26.98153853(11)
+Isotopic Composition = 1
+Standard Atomic Weight = 26.9815385(7)
+Notes =
+
+Atomic Number = 14
+Atomic Symbol = Si
+Mass Number = 28
+Relative Atomic Mass = 27.97692653465(44)
+Isotopic Composition = 0.92223(19)
+Standard Atomic Weight = [28.084,28.086]
+Notes =
+
+Atomic Number = 14
+Atomic Symbol = Si
+Mass Number = 29
+Relative Atomic Mass = 28.97649466490(52)
+Isotopic Composition = 0.04685(8)
+Standard Atomic Weight = [28.084,28.086]
+Notes =
+
+Atomic Number = 14
+Atomic Symbol = Si
+Mass Number = 30
+Relative Atomic Mass = 29.973770136(23)
+Isotopic Composition = 0.03092(11)
+Standard Atomic Weight = [28.084,28.086]
+Notes =
+
+Atomic Number = 15
+Atomic Symbol = P
+Mass Number = 31
+Relative Atomic Mass = 30.97376199842(70)
+Isotopic Composition = 1
+Standard Atomic Weight = 30.973761998(5)
+Notes =
+
+Atomic Number = 16
+Atomic Symbol = S
+Mass Number = 32
+Relative Atomic Mass = 31.9720711744(14)
+Isotopic Composition = 0.9499(26)
+Standard Atomic Weight = [32.059,32.076]
+Notes =
+
+Atomic Number = 16
+Atomic Symbol = S
+Mass Number = 33
+Relative Atomic Mass = 32.9714589098(15)
+Isotopic Composition = 0.0075(2)
+Standard Atomic Weight = [32.059,32.076]
+Notes =
+
+Atomic Number = 16
+Atomic Symbol = S
+Mass Number = 34
+Relative Atomic Mass = 33.967867004(47)
+Isotopic Composition = 0.0425(24)
+Standard Atomic Weight = [32.059,32.076]
+Notes =
+
+Atomic Number = 16
+Atomic Symbol = S
+Mass Number = 36
+Relative Atomic Mass = 35.96708071(20)
+Isotopic Composition = 0.0001(1)
+Standard Atomic Weight = [32.059,32.076]
+Notes =
+
+Atomic Number = 17
+Atomic Symbol = Cl
+Mass Number = 35
+Relative Atomic Mass = 34.968852682(37)
+Isotopic Composition = 0.7576(10)
+Standard Atomic Weight = [35.446,35.457]
+Notes = m
+
+Atomic Number = 17
+Atomic Symbol = Cl
+Mass Number = 37
+Relative Atomic Mass = 36.965902602(55)
+Isotopic Composition = 0.2424(10)
+Standard Atomic Weight = [35.446,35.457]
+Notes = m
+
+Atomic Number = 18
+Atomic Symbol = Ar
+Mass Number = 36
+Relative Atomic Mass = 35.967545105(28)
+Isotopic Composition = 0.003336(21)
+Standard Atomic Weight = 39.948(1)
+Notes = g,r
+
+Atomic Number = 18
+Atomic Symbol = Ar
+Mass Number = 38
+Relative Atomic Mass = 37.96273211(21)
+Isotopic Composition = 0.000629(7)
+Standard Atomic Weight = 39.948(1)
+Notes = g,r
+
+Atomic Number = 18
+Atomic Symbol = Ar
+Mass Number = 40
+Relative Atomic Mass = 39.9623831237(24)
+Isotopic Composition = 0.996035(25)
+Standard Atomic Weight = 39.948(1)
+Notes = g,r
+
+Atomic Number = 19
+Atomic Symbol = K
+Mass Number = 39
+Relative Atomic Mass = 38.9637064864(49)
+Isotopic Composition = 0.932581(44)
+Standard Atomic Weight = 39.0983(1)
+Notes =
+
+Atomic Number = 19
+Atomic Symbol = K
+Mass Number = 40
+Relative Atomic Mass = 39.963998166(60)
+Isotopic Composition = 0.000117(1)
+Standard Atomic Weight = 39.0983(1)
+Notes =
+
+Atomic Number = 19
+Atomic Symbol = K
+Mass Number = 41
+Relative Atomic Mass = 40.9618252579(41)
+Isotopic Composition = 0.067302(44)
+Standard Atomic Weight = 39.0983(1)
+Notes =
+
+Atomic Number = 20
+Atomic Symbol = Ca
+Mass Number = 40
+Relative Atomic Mass = 39.962590863(22)
+Isotopic Composition = 0.96941(156)
+Standard Atomic Weight = 40.078(4)
+Notes = g
+
+Atomic Number = 20
+Atomic Symbol = Ca
+Mass Number = 42
+Relative Atomic Mass = 41.95861783(16)
+Isotopic Composition = 0.00647(23)
+Standard Atomic Weight = 40.078(4)
+Notes = g
+
+Atomic Number = 20
+Atomic Symbol = Ca
+Mass Number = 43
+Relative Atomic Mass = 42.95876644(24)
+Isotopic Composition = 0.00135(10)
+Standard Atomic Weight = 40.078(4)
+Notes = g
+
+Atomic Number = 20
+Atomic Symbol = Ca
+Mass Number = 44
+Relative Atomic Mass = 43.95548156(35)
+Isotopic Composition = 0.02086(110)
+Standard Atomic Weight = 40.078(4)
+Notes = g
+
+Atomic Number = 20
+Atomic Symbol = Ca
+Mass Number = 46
+Relative Atomic Mass = 45.9536890(24)
+Isotopic Composition = 0.00004(3)
+Standard Atomic Weight = 40.078(4)
+Notes = g
+
+Atomic Number = 20
+Atomic Symbol = Ca
+Mass Number = 48
+Relative Atomic Mass = 47.95252276(13)
+Isotopic Composition = 0.00187(21)
+Standard Atomic Weight = 40.078(4)
+Notes = g
+
+Atomic Number = 21
+Atomic Symbol = Sc
+Mass Number = 45
+Relative Atomic Mass = 44.95590828(77)
+Isotopic Composition = 1
+Standard Atomic Weight = 44.955908(5)
+Notes =
+
+Atomic Number = 22
+Atomic Symbol = Ti
+Mass Number = 46
+Relative Atomic Mass = 45.95262772(35)
+Isotopic Composition = 0.0825(3)
+Standard Atomic Weight = 47.867(1)
+Notes =
+
+Atomic Number = 22
+Atomic Symbol = Ti
+Mass Number = 47
+Relative Atomic Mass = 46.95175879(38)
+Isotopic Composition = 0.0744(2)
+Standard Atomic Weight = 47.867(1)
+Notes =
+
+Atomic Number = 22
+Atomic Symbol = Ti
+Mass Number = 48
+Relative Atomic Mass = 47.94794198(38)
+Isotopic Composition = 0.7372(3)
+Standard Atomic Weight = 47.867(1)
+Notes =
+
+Atomic Number = 22
+Atomic Symbol = Ti
+Mass Number = 49
+Relative Atomic Mass = 48.94786568(39)
+Isotopic Composition = 0.0541(2)
+Standard Atomic Weight = 47.867(1)
+Notes =
+
+Atomic Number = 22
+Atomic Symbol = Ti
+Mass Number = 50
+Relative Atomic Mass = 49.94478689(39)
+Isotopic Composition = 0.0518(2)
+Standard Atomic Weight = 47.867(1)
+Notes =
+
+Atomic Number = 23
+Atomic Symbol = V
+Mass Number = 50
+Relative Atomic Mass = 49.94715601(95)
+Isotopic Composition = 0.00250(4)
+Standard Atomic Weight = 50.9415(1)
+Notes =
+
+Atomic Number = 23
+Atomic Symbol = V
+Mass Number = 51
+Relative Atomic Mass = 50.94395704(94)
+Isotopic Composition = 0.99750(4)
+Standard Atomic Weight = 50.9415(1)
+Notes =
+
+Atomic Number = 24
+Atomic Symbol = Cr
+Mass Number = 50
+Relative Atomic Mass = 49.94604183(94)
+Isotopic Composition = 0.04345(13)
+Standard Atomic Weight = 51.9961(6)
+Notes =
+
+Atomic Number = 24
+Atomic Symbol = Cr
+Mass Number = 52
+Relative Atomic Mass = 51.94050623(63)
+Isotopic Composition = 0.83789(18)
+Standard Atomic Weight = 51.9961(6)
+Notes =
+
+Atomic Number = 24
+Atomic Symbol = Cr
+Mass Number = 53
+Relative Atomic Mass = 52.94064815(62)
+Isotopic Composition = 0.09501(17)
+Standard Atomic Weight = 51.9961(6)
+Notes =
+
+Atomic Number = 24
+Atomic Symbol = Cr
+Mass Number = 54
+Relative Atomic Mass = 53.93887916(61)
+Isotopic Composition = 0.02365(7)
+Standard Atomic Weight = 51.9961(6)
+Notes =
+
+Atomic Number = 25
+Atomic Symbol = Mn
+Mass Number = 55
+Relative Atomic Mass = 54.93804391(48)
+Isotopic Composition = 1
+Standard Atomic Weight = 54.938044(3)
+Notes =
+
+Atomic Number = 26
+Atomic Symbol = Fe
+Mass Number = 54
+Relative Atomic Mass = 53.93960899(53)
+Isotopic Composition = 0.05845(35)
+Standard Atomic Weight = 55.845(2)
+Notes =
+
+Atomic Number = 26
+Atomic Symbol = Fe
+Mass Number = 56
+Relative Atomic Mass = 55.93493633(49)
+Isotopic Composition = 0.91754(36)
+Standard Atomic Weight = 55.845(2)
+Notes =
+
+Atomic Number = 26
+Atomic Symbol = Fe
+Mass Number = 57
+Relative Atomic Mass = 56.93539284(49)
+Isotopic Composition = 0.02119(10)
+Standard Atomic Weight = 55.845(2)
+Notes =
+
+Atomic Number = 26
+Atomic Symbol = Fe
+Mass Number = 58
+Relative Atomic Mass = 57.93327443(53)
+Isotopic Composition = 0.00282(4)
+Standard Atomic Weight = 55.845(2)
+Notes =
+
+Atomic Number = 27
+Atomic Symbol = Co
+Mass Number = 59
+Relative Atomic Mass = 58.93319429(56)
+Isotopic Composition = 1
+Standard Atomic Weight = 58.933194(4)
+Notes =
+
+Atomic Number = 28
+Atomic Symbol = Ni
+Mass Number = 58
+Relative Atomic Mass = 57.93534241(52)
+Isotopic Composition = 0.68077(19)
+Standard Atomic Weight = 58.6934(4)
+Notes = r
+
+Atomic Number = 28
+Atomic Symbol = Ni
+Mass Number = 60
+Relative Atomic Mass = 59.93078588(52)
+Isotopic Composition = 0.26223(15)
+Standard Atomic Weight = 58.6934(4)
+Notes = r
+
+Atomic Number = 28
+Atomic Symbol = Ni
+Mass Number = 61
+Relative Atomic Mass = 60.93105557(52)
+Isotopic Composition = 0.011399(13)
+Standard Atomic Weight = 58.6934(4)
+Notes = r
