@@ -854,6 +854,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_get_rows_flat[GGML_TYPE_COUNT];       // GGML_VK_GET_ROWS_FLAT: narrow rows, one thread per element
+    vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];   //   (f32 / f16 / bf16 / i32 sources)
     vk_pipeline pipeline_get_rows_back_f32;
     vk_pipeline pipeline_acc_f32;
     vk_pipeline pipeline_set_f32;
@@ -1319,6 +1321,7 @@ class vk_perf_logger {
 };
 
 struct ggml_backend_vk_context {
+    bool get_rows_flat {};   // the GET_ROWS being recorded uses the flat pipeline (ggml_vk_get_rows -> ggml_vk_op_f32 elements)
     std::string name;
 
     vk_device device;

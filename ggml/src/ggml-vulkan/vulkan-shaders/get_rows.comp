@@ -5,7 +5,41 @@
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
+// flat (GGML_VK_GET_ROWS_FLAT): one thread per output element over the flattened (i00, i10, i11, i12) index, a grid-stride
+// loop, for narrow rows. The row-per-workgroup layout below runs a 512-thread workgroup per gathered row with only ne00 lanes
+// active: GET_ROWS(1, 512, 2048) is 1M workgroups and ~2.9 ms of pure wave launch on gfx1151. Same element copy, bit-exact.
+layout(constant_id = 1) const bool flat_rows = false;
+
+void copy_element(const uint i00, const uint i10, const uint i11, const uint i12) {
+    const uint i01 = data_b[get_boffset() + i10*p.nb10 + i11*p.nb11 + i12*p.nb12];
+
+    const uint a_offset = get_aoffset() + i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
+    const uint d_offset = get_doffset() + i10*p.nb21 + i11*p.nb22 + i12*p.nb23;
+
+#if defined(DATA_A_BF16)
+    TEMP_TYPE v = TEMP_TYPE(bf16_to_fp32(data_a[a_offset + i00]));
+#else
+    TEMP_TYPE v = TEMP_TYPE(data_a[a_offset + i00]);
+#endif
+    data_d[d_offset + i00] = D_TYPE(v);
+}
+
 void main() {
+    if (flat_rows) {
+        const uint total  = p.ne00 * p.ne10 * p.ne11 * p.ne12;
+        const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+        for (uint idx = gl_GlobalInvocationID.x; idx < total; idx += stride) {
+            const uint i00 = idx % p.ne00;
+            uint r = idx / p.ne00;
+            const uint i10 = r % p.ne10;
+            r /= p.ne10;
+            const uint i12 = r % p.ne12;
+            const uint i11 = r / p.ne12;
+            copy_element(i00, i10, i11, i12);
+        }
+        return;
+    }
+
     const uint i00 = gl_GlobalInvocationID.x;
 
     if (i00 >= p.ne00) {

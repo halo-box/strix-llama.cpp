@@ -2503,6 +2503,35 @@ struct test_get_rows : public test_case {
             }
         }
     }
+
+    // Vulkan GGML_VK_GET_ROWS_FLAT (default 32): rows of at most 32 elements from an f32 / f16 / bf16 / i32 source take the flat
+    // pipeline, wider rows and quantized sources the row-per-workgroup one; the backend counts the flat dispatches
+    typedef uint64_t (*fusion_count_t)(const char *);
+    typedef void     (*fusion_reset_t)(void);
+    static void * backend_proc(ggml_backend_t backend, const char * name) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+    }
+    void before_compute(ggml_backend_t backend) override {
+        if (auto reset = (fusion_reset_t) backend_proc(backend, "ggml_backend_vk_fusion_count_reset")) {
+            reset();
+        }
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        auto count = (fusion_count_t) backend_proc(backend, "ggml_backend_vk_fusion_count");
+        if (count == nullptr) {
+            return true;
+        }
+        static const int64_t max_ne00 = [] { const char * e = getenv("GGML_VK_GET_ROWS_FLAT"); return e ? (int64_t) atoll(e) : (int64_t) 32; }();
+        const bool src_ok = type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_I32;
+        const bool want = src_ok && max_ne00 > 0 && n <= max_ne00;
+        const uint64_t c = count("GET_ROWS_FLAT");
+        if ((c > 0) != want) {
+            msg = "GET_ROWS_FLAT dispatches: " + std::to_string(c) + (want ? " (expected the flat pipeline)" : " (expected the row-per-workgroup one)");
+            return false;
+        }
+        return true;
+    }
 };
 
 // GGML_OP_GET_ROWS_BACK
@@ -13297,6 +13326,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    // the QSA block-selection gathers (qwen4exp_select_complete_blocks): 1-wide score / block-id rows per query and 4-wide
+    // block-cell rows (GET_ROWS(1, 512, 2048) and (4, 1048576) at a 2048-token ubatch), plus bf16 and odd widths
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8704, 512, 2048, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 1, 512, 512, 2048, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 8704, 1048576, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_BF16, 4, 300, 777, 3, 2, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 5, 300, 777, 3, 2, true, true, 2));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
