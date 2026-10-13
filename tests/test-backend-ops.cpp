@@ -4261,7 +4261,13 @@ struct test_mul_mat_f16b : public test_case {
         static const bool req_native = [] { const char * e = getenv("GGML_VK_TEST_REQUIRE_F16B_NATIVE"); return e != nullptr && atoi(e) != 0; }();
         static const bool native_on = [] { const char * e = getenv("GGML_VK_DENSE_F16B_NATIVE"); return e == nullptr || std::string(e) != "0"; }();
         if (req_native && count != nullptr) {
-            const bool want = native_on && type_a == GGML_TYPE_Q8_0 && k >= 1024 && n >= 32;
+            // the counter also counts the wave-4 dense router (GGML_VK_DENSE_F16COOPMAT, default q4_K / q5_K / q6_K / iq4_xs) when B is f16
+            static const char * dl = getenv("GGML_VK_DENSE_F16COOPMAT");
+            const bool dense_default = dl == nullptr && (type_a == GGML_TYPE_Q4_K || type_a == GGML_TYPE_Q5_K || type_a == GGML_TYPE_Q6_K || type_a == GGML_TYPE_IQ4_XS);
+            if (dl != nullptr && type_a != GGML_TYPE_Q8_0) {
+                return true;   // a custom dense list: not modelled here
+            }
+            const bool want = k >= 1024 && n >= 32 && ((native_on && type_a == GGML_TYPE_Q8_0) || dense_default);
             const uint64_t c = count("MUL_MAT_F16B_NATIVE");
             if ((c > 0) != want) {
                 msg = "MUL_MAT_F16B_NATIVE dispatches: " + std::to_string(c) + (want ? " (expected the f16-B path)" : " (expected int8 / mat-vec)");
@@ -12831,7 +12837,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 2, GGML_TYPE_Q8_0, 128));
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 1, GGML_TYPE_Q4_0, 8));
-    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL}) {
+    // bf16: a bf16 weight LLAMA_BF16_TO_F16 kept (out of f16 range) meets the f16 mixed stream
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_NL, GGML_TYPE_BF16}) {
         for (int n : {9, 64, 300}) {
             test_cases.emplace_back(new test_mul_mat_f16b(t, 320, n, 10240));
             test_cases.emplace_back(new test_mul_mat_f16b(t, 96, n, 256));
