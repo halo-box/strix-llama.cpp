@@ -317,7 +317,7 @@ gh pr merge             # your own PR
 To conserve context space, load these resources as needed:
 
 Skills: reusable task workflows live in the [skills/](skills/) directory - check there for a skill matching your task
-before starting.
+before starting. [skills/README.md](skills/README.md) lists them; harnesses find them through the `.agents/skills/` and `.claude/skills/` symlinks.
 
 This repository:
 - [Contributing guidelines](CONTRIBUTING.md)
