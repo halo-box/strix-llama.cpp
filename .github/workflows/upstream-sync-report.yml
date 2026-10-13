@@ -1,0 +1,71 @@
+name: Upstream sync report
+
+# Every 3 days, post the upstream sync plan (skills/upstream-sync/scripts/sync.sh report) to one open issue, pinned when created.
+# It only reports: it never merges or pushes. The sync itself follows skills/upstream-sync/SKILL.md.
+# Note: */3 restarts on the 1st of each month, so two runs can be one to three days apart at month end.
+
+on:
+  schedule:
+    - cron: '0 6 */3 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-sync-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: github.repository == 'halo-box/strix-llama.cpp'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Report
+        run: |
+          git remote add upstream https://github.com/ggml-org/llama.cpp
+          rc=0
+          skills/upstream-sync/scripts/sync.sh report > report.txt 2>&1 || rc=$?
+          [ $rc = 0 ] || echo "sync.sh report failed (exit $rc)" >> report.txt
+          echo "rc=$rc" >> "$GITHUB_ENV"
+
+      - name: Post to the issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: Upstream sync report
+        run: |
+          {
+            echo "Plan for the next upstream sync, generated $(date -u +%F) from \`master\` $(git rev-parse --short HEAD)."
+            echo "Follow \`skills/upstream-sync/SKILL.md\`. Steps marked \`*\` have sensitive conflicts and need the Strix Halo validation."
+            echo
+            # a fence longer than any run of backticks in the report: an upstream commit subject cannot close it
+            fence=$({ grep -o '`*' report.txt || true; } | awk '{ if (length > n) n = length } END { n = (n < 3 ? 3 : n + 1); s = ""; while (n--) s = s "`"; print s }')
+            echo "$fence"
+            head -c 60000 report.txt
+            echo
+            echo "$fence"
+          } > body.md
+          # only the issue this workflow opened: anyone can open one with the same title
+          n=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\" author:app/github-actions" --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          if [ -n "$n" ]; then
+            # a comment (a notification) only when the steps with conflicts changed: the heads, the commit counts and
+            # the last step (it ends at the upstream tip) move on every run
+            steps() { awk '/^== plan/ { f = 1; next } f && / steps, .* sensitive/ { exit } f && !/\(none\)$/'; }
+            old=$(gh issue view "$n" --repo "$GITHUB_REPOSITORY" --json body --jq .body | steps)
+            gh issue edit "$n" --repo "$GITHUB_REPOSITORY" --body-file body.md
+            [ "$old" = "$(steps < body.md)" ] || gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "Plan updated $(date -u +%F)."
+          else
+            url=$(gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file body.md)
+            # a repo pins at most 3 issues: a failed pin must not fail the report
+            gh issue pin "$url" --repo "$GITHUB_REPOSITORY" || echo "::warning::could not pin $url"
+          fi
+          # the issue says what failed; the run must fail too
+          [ "$rc" = 0 ] || { echo "::error::sync.sh report failed (exit $rc)"; exit 1; }
