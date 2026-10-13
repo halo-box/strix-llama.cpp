@@ -19,7 +19,7 @@
 typedef uint64_t (*fusion_count_t)(const char *);
 typedef void     (*fusion_reset_t)(void);
 
-struct shape { int64_t n_embd, nt, k, pad; bool expect_fused; bool gate16 = true; };   // gate16 false: the f32-gate form
+struct shape { int64_t n_embd, nt, k, pad; bool expect_fused; bool gate16 = true; bool mix16 = false; };   // gate16 false: the f32-gate form; mix16: the f16 mixed stream (wave 6)
 
 static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh) {
     auto count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_fusion_count");
@@ -36,7 +36,8 @@ static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh
     ggml_tensor * g   = ggml_mul_mat(ctx, w, lo);
     ggml_tensor * g16 = sh.gate16 ? ggml_cast(ctx, g, GGML_TYPE_F16) : g;   // (named g16 either way: the gate the HC pre reads)
     ggml_tensor * rs  = ggml_reshape_3d(ctx, g16, sh.n_embd, 4, sh.nt);
-    ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx, x, rs, 0.25f);
+    ggml_tensor * mixed = ggml_dsv4_hc_pre_gated_ext(ctx, x, rs, 0.25f, sh.mix16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+    const size_t es = ggml_element_size(mixed), nb_out = ggml_nbytes(mixed);   // f16 mixed: the float vectors below hold raw bytes
     ggml_set_output(mixed);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, mixed);
@@ -62,20 +63,20 @@ static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh
         reset();
         ggml_backend_graph_compute(be, gf);
         n = count(sh.gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G");
-        ggml_backend_tensor_get(mixed, out.data(), 0, out.size() * sizeof(float));
+        ggml_backend_tensor_get(mixed, out.data(), 0, nb_out);
     };
     uint64_t n_on = 0, n_off = 0, n_p = 0;
     run("1", out_on, n_on);
     run("0", out_off, n_off);
     int fails = 0;
-    const bool eq = memcmp(out_on.data(), out_off.data(), out_on.size() * sizeof(float)) == 0;
-    size_t ndiff = 0; for (size_t i = 0; i < out_on.size(); ++i) ndiff += memcmp(&out_on[i], &out_off[i], sizeof(float)) != 0;
+    const bool eq = memcmp(out_on.data(), out_off.data(), nb_out) == 0;
+    size_t ndiff = 0; for (size_t i = 0; i < out_on.size(); ++i) ndiff += memcmp((const char *) out_on.data() + i * es, (const char *) out_off.data() + i * es, es) != 0;
     if (!eq) { fprintf(stderr, "FAIL n_embd=%lld nt=%lld k=%lld pad=%lld: fused != unfused in %zu of %zu values\n",
                        (long long) sh.n_embd, (long long) sh.nt, (long long) sh.k, (long long) sh.pad, ndiff, out_on.size()); fails++; }
     if (n_off != 0 || n_on != (sh.expect_fused ? 1u : 0u)) {
         fprintf(stderr, "FAIL n_embd=%lld nt=%lld: HC_UP_MIX dispatches on=%llu off=%llu (expected %d / 0)\n",
                 (long long) sh.n_embd, (long long) sh.nt, (unsigned long long) n_on, (unsigned long long) n_off, sh.expect_fused ? 1 : 0); fails++; }
-    if (!eq && sh.gate16 && getenv("HC_UP_MIX_DIAG") != nullptr) {
+    if (!eq && sh.gate16 && !sh.mix16 && getenv("HC_UP_MIX_DIAG") != nullptr) {
         // where the two runs part: the knob-off run left its f16 gate in g16; a separate f32 GEMM gives the accumulator before
         // rounding. host(g16) = the dsv4_hc_pre.comp expression on the host over that gate
         const int64_t ne = M * sh.nt;
@@ -138,10 +139,10 @@ static int run_shape(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh
     // positive control: one perturbed input must change the fused output (the comparison can fail)
     lv[0] += 0.5f; ggml_backend_tensor_set(lo, lv.data(), 0, lv.size() * sizeof(float));
     run("1", out_pert, n_p);
-    if (memcmp(out_on.data(), out_pert.data(), out_on.size() * sizeof(float)) == 0) { fprintf(stderr, "FAIL: positive control, a perturbed input left the output unchanged\n"); fails++; }
-    printf("%s %s n_embd=%lld nt=%lld k=%lld pad=%lld: byte-equal=%s fused dispatches on/off=%llu/%llu control=%s\n", fails ? "FAIL" : "ok", sh.gate16 ? "f16-gate" : "f32-gate",
+    if (memcmp(out_on.data(), out_pert.data(), nb_out) == 0) { fprintf(stderr, "FAIL: positive control, a perturbed input left the output unchanged\n"); fails++; }
+    printf("%s %s%s n_embd=%lld nt=%lld k=%lld pad=%lld: byte-equal=%s fused dispatches on/off=%llu/%llu control=%s\n", fails ? "FAIL" : "ok", sh.gate16 ? "f16-gate" : "f32-gate", sh.mix16 ? " f16-mix" : "",
            (long long) sh.n_embd, (long long) sh.nt, (long long) sh.k, (long long) sh.pad, eq ? "yes" : "NO",
-           (unsigned long long) n_on, (unsigned long long) n_off, memcmp(out_on.data(), out_pert.data(), out_on.size() * sizeof(float)) ? "differs" : "SAME");
+           (unsigned long long) n_on, (unsigned long long) n_off, memcmp(out_on.data(), out_pert.data(), nb_out) ? "differs" : "SAME");
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return fails;
@@ -164,6 +165,11 @@ int main() {
         { 2560, 2048, 320, 128, true, false },
         { 2560, 2051, 320, 128, true, false },
         {  128,    8,  96,   0, false, false },
+        // the f16 mixed stream (wave 6): both gate forms; the fused store and the unfused op both round once (RTE)
+        {   64,  130,  96, 128, true, false, true },
+        { 2560, 2051, 320, 128, true, false, true },
+        {   64,  130,  96, 128, true, true,  true },
+        { 2560, 2051, 320, 128, true, true,  true },
     };
     int fails = 0;
     for (const auto & sh : shapes) fails += run_shape(be, reg, sh);

@@ -5688,6 +5688,7 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t pad;         // > 0: x is a [n_embd, n_hc, n_tokens] view of a [n_embd*n_hc + pad, n_tokens] buffer
                                // (LLAMA_HC_XN_PAD rows; 128 = the shipped pad, 2048 = a stride that camps again)
     const ggml_type type_gate; // f16: the f16 gate (LLAMA_HC_GATE_F16), gated with an f16 x only
+    const ggml_type type_out;  // f16: the f16 mixed stream (wave 6, ggml_dsv4_hc_pre_gated_ext), gated with an f16 x only
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5695,6 +5696,9 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 
     std::string vars() override {
+        if (type_out != GGML_TYPE_F32) {
+            return VARS_TO_STR8(n_embd, n_hc, n_tokens, gated, type_x, pad, type_gate, type_out);
+        }
         if (type_gate != GGML_TYPE_F32) {
             return VARS_TO_STR7(n_embd, n_hc, n_tokens, gated, type_x, pad, type_gate);
         }
@@ -5708,8 +5712,8 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 
     test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type type_x = GGML_TYPE_F32, int64_t pad = 0,
-                     ggml_type type_gate = GGML_TYPE_F32)
-        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), type_x(type_x), pad(pad), type_gate(type_gate) {}
+                     ggml_type type_gate = GGML_TYPE_F32, ggml_type type_out = GGML_TYPE_F32)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), type_x(type_x), pad(pad), type_gate(type_gate), type_out(type_out) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x;
@@ -5726,7 +5730,7 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
             ggml_tensor * gate = ggml_new_tensor_3d(ctx, type_gate, n_embd, n_hc, n_tokens);
             ggml_set_name(gate, "gate");
 
-            out = ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f/n_hc);
+            out = ggml_dsv4_hc_pre_gated_ext(ctx, x, gate, 1.0f/n_hc, type_out);
         } else {
             ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_tokens);
             ggml_set_name(weights, "weights");
@@ -6725,14 +6729,18 @@ struct test_mul_mat_cpy16 : public test_case {
 struct test_hc_up_mix_f16 : public test_case {
     const int64_t n_embd, nt, k, pad;
     const bool gate16;   // false: the f32-gate form (LLAMA_HC_GATE_F16=0, no cast; Vulkan fusion name HC_UP_MIX_F32G)
+    const bool mix16;    // true: the f16 mixed stream (wave 6, LLAMA_HC_MIX_F16; HC_UP_MIX stores f16)
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_UP_MIX_F16"; }
-    std::string vars() override { return gate16 ? VARS_TO_STR4(n_embd, nt, k, pad) : VARS_TO_STR5(n_embd, nt, k, pad, gate16); }
+    std::string vars() override {
+        if (mix16) return VARS_TO_STR6(n_embd, nt, k, pad, gate16, mix16);
+        return gate16 ? VARS_TO_STR4(n_embd, nt, k, pad) : VARS_TO_STR5(n_embd, nt, k, pad, gate16);
+    }
     double max_nmse_err() override { return 5e-4; }
     bool run_whole_graph() override { return true; }
 
-    test_hc_up_mix_f16(int64_t n_embd = 64, int64_t nt = 64, int64_t k = 96, int64_t pad = 0, bool gate16 = true)
-        : n_embd(n_embd), nt(nt), k(k), pad(pad), gate16(gate16) {}
+    test_hc_up_mix_f16(int64_t n_embd = 64, int64_t nt = 64, int64_t k = 96, int64_t pad = 0, bool gate16 = true, bool mix16 = false)
+        : n_embd(n_embd), nt(nt), k(k), pad(pad), gate16(gate16), mix16(mix16) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, 4 * n_embd);
@@ -6747,7 +6755,7 @@ struct test_hc_up_mix_f16 : public test_case {
             g = ggml_cast(ctx, g, GGML_TYPE_F16);
         }
         ggml_set_name(g, gate16 ? "gate_f16" : "gate_f32");
-        ggml_tensor * out = ggml_dsv4_hc_pre_gated(ctx, x, ggml_reshape_3d(ctx, g, n_embd, 4, nt), 0.25f);
+        ggml_tensor * out = ggml_dsv4_hc_pre_gated_ext(ctx, x, ggml_reshape_3d(ctx, g, n_embd, 4, nt), 0.25f, mix16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
         ggml_set_name(out, "mixed");
         return out;
     }
@@ -13096,6 +13104,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 64, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 64, true, GGML_TYPE_F16, 128));   // row-padded f16 xn (LLAMA_HC_XN_PAD)
+    // the f16 mixed stream (wave 6, LLAMA_HC_MIX_F16): f32 and f16 gate, padded xn, the Flash-Next ubatch
+    test_cases.emplace_back(new test_dsv4_hc_pre(31,   4, 17,   true, GGML_TYPE_F16, 0,   GGML_TYPE_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_hc_pre(31,   4, 17,   true, GGML_TYPE_F16, 0,   GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 64,   true, GGML_TYPE_F16, 128, GGML_TYPE_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 2048, true, GGML_TYPE_F16, 128, GGML_TYPE_F32, GGML_TYPE_F16));
 
     // MUL_MAT + CPY(f16): exact and ragged tiles, the column count at the mat-vec boundary, the Flash-Next hc up GEMM
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
@@ -13117,6 +13130,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128, false));
     test_cases.emplace_back(new test_hc_up_mix_f16(256, 33, 320, 8, false));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, false));
+    // the f16 mixed stream (wave 6): both gate forms
+    test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128, false, true));
+    test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, false, true));
+    test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128, true, true));
+    test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, true, true));
     // MUL_MAT_ID (+ MUL) + CPY(f16) on the pf-capable expert types, f32 and f16 B: exact and ragged tiles, the weighted down
     // projection, and the Flash-Next REAP-320 shapes (64 rows per expert at 2048 tokens). Int8 twins by default; the routed f16-B
     // pf twins under GGML_VK_MMID_F16COOPMAT=all with GGML_VK_TEST_REQUIRE_MMID_F16OUT=1 (wave 4)
