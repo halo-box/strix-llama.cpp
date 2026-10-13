@@ -20002,6 +20002,26 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             for (int k = first_unused; k <= qsa_bs_end[first_unused]; ++k) {
                 free = free && !used[k];
             }
+            if (free && params && params->add_alloc_dep) {
+                // the fused kernel reads the score, the block cells, the tail and the limits while it writes the CONCAT: keep every
+                // input from outside the run allocated through it. Without this ggml-alloc freed them at their last (in-chain) use
+                // and placed the CONCAT on top, and graph_compute's overlap check then dropped the fusion: 27 of 179 chains fused at
+                // FN pp2048 d8192 (a2dbg 10-13, "source ... overlaps the output indexer_top_k-N" on every other one)
+                const int end = qsa_bs_end[first_unused];
+                std::set<const ggml_tensor *> in_run;
+                for (int k = first_unused; k <= end; ++k) {
+                    in_run.insert(graph->nodes[k]);
+                }
+                std::set<ggml_tensor *> seen;
+                for (int k = first_unused; k <= end; ++k) {
+                    for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+                        ggml_tensor * src = graph->nodes[k]->src[s];
+                        if (src && src != graph->nodes[k] && !in_run.count(src) && seen.insert(src).second) {
+                            params->add_alloc_dep(params->user_data, src, graph->nodes[end]);
+                        }
+                    }
+                }
+            }
             if (free) {
                 for (int k = first_unused; k <= qsa_bs_end[first_unused]; ++k) {
                     new_order.push_back(graph->nodes[k]);
