@@ -19801,9 +19801,19 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         }
         // QSA scorer chain (QSA_SCORE), prefill only: the fusion needs more than 64 query-head columns; decode keeps its order
-        if (ggml_vk_fuse_qsa_score_enabled() && graph->nodes[first_unused]->op == GGML_OP_MUL_MAT && graph->nodes[first_unused]->ne[1] > 64 &&
-            (keep_pattern(qsa_score_pattern) || keep_pattern(qsa_score_pattern_nobias))) {
-            continue;
+        if (ggml_vk_fuse_qsa_score_enabled() && graph->nodes[first_unused]->op == GGML_OP_MUL_MAT && graph->nodes[first_unused]->ne[1] > 64) {
+            // the fused GEMM reads the keys, the query view and the bias while it writes the head sum: keep them allocated through
+            // it. Without the deps ggml-alloc put a strip's score on the layer's freed q (its last reader is the last strip) and the
+            // overlap check dropped QSA_SCORE ("indexer_q (view) overlaps the output indexer_score": 16 strips at FN d8192 once
+            // A2's own deps moved the layout, 10-13)
+            const bool with_bias = match_pattern(qsa_score_pattern, first_unused);
+            if ((with_bias || match_pattern(qsa_score_pattern_nobias, first_unused)) && params && params->add_alloc_dep) {
+                const auto & pat = with_bias ? qsa_score_pattern : qsa_score_pattern_nobias;
+                add_pattern_alloc_deps(pat, first_unused + (int) pat.size() - 1);
+            }
+            if (keep_pattern(qsa_score_pattern) || keep_pattern(qsa_score_pattern_nobias)) {
+                continue;
+            }
         }
 
         // RMS_NORM_MUL_SIGMUL_CPY: the SIGMOID does not read the MUL before it, so a reorder could pull it away; the fused
