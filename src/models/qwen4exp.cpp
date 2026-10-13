@@ -755,10 +755,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * mixed = nullptr;
     if (cparams.fused_dsv4_hc_pre && il >= 0) {
         // sigmoid gate and mean over the streams in one op
-        mixed = ggml_dsv4_hc_pre_gated(ctx0,
+        // wave 6 (B): every consumer of the mixed stream is a matmul B operand (attention / GDN in-projections, router, shared and
+        // routed experts), so store it as f16: the GEMMs read it without a q8_1 quantise or an f32 -> f16 staging pass (the
+        // release's hc_mix_ext). LLAMA_HC_MIX_F16=0 keeps f32; LLAMA_HC_MIX_F16_MINN (default 0) = the smallest ubatch that takes it.
+        // The f16 store needs the f16 hc norm output (norm_f16), which already requires nt >= 32 (as in wave 5), so the effective rule
+        // is the release's: f16 at nt >= 32, f32 at decode / MTP verify; MINN only raises that floor.
+        static const bool mix_f16_on = [] { const char * e = getenv("LLAMA_HC_MIX_F16"); return e == nullptr || atoi(e) != 0; }();
+        static const int64_t mix_f16_minn = [] { const char * e = getenv("LLAMA_HC_MIX_F16_MINN"); return e ? (int64_t) atoi(e) : (int64_t) 0; }();
+        const ggml_type mix_type = (mix_f16_on && norm_f16 && nt >= mix_f16_minn) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        mixed = ggml_dsv4_hc_pre_gated_ext(ctx0,
                 xn_padded ? ggml_view_3d(ctx0, xn, n_embd, hc, nt, n_embd * ggml_element_size(xn), xn->nb[1], 0)
                           : ggml_reshape_3d(ctx0, xn, n_embd, hc, nt),
-                ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc);
+                ggml_reshape_3d(ctx0, gate, n_embd, hc, nt), 1.0f / (float) hc, mix_type);
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_PRE, mixed, il});
         if (norm_f16) {
             res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, mixed, il});

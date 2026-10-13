@@ -673,7 +673,7 @@ void main() {
                             const float wv = 1.0f / (1.0f + exp(-g));
                             result = fma(float(data_x[xb + ih * p.hc_x_s1]), wv, result);
                         }
-                        data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = p.hc_scale * result;
+                        data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = D_TYPE(p.hc_scale * result);   // wave 6: D_TYPE float16_t = the f16 mixed stream
                     }
                 }
             }

@@ -2974,6 +2974,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->coopmat_int_support && rdna3 && cm1_sg == 32 && device->coopmat_int_m == 16 && device->coopmat_int_n == 16) {
             cm1_create_mmq({GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, false, false, false, false, false, false, true}, tc_mmq_cm1_int, "matmul_q8_0_q8_1_hcmix",
                            matmul_q8_0_q8_1_hcmix_cm1_len, matmul_q8_0_q8_1_hcmix_cm1_data, sizeof(vk_mat_mat_hcmix_push_constants), 4);
+            // wave 6: the f16 mixed stream (ggml_dsv4_hc_pre_gated_ext out_type F16)
+            cm1_create_mmq({GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, false, false, true, false, false, false, true}, tc_mmq_cm1_int, "matmul_q8_0_q8_1_hcmix_d16",
+                           matmul_q8_0_q8_1_hcmix_d16_cm1_len, matmul_q8_0_q8_1_hcmix_d16_cm1_data, sizeof(vk_mat_mat_hcmix_push_constants), 4);
         }
 
         GGML_ASSERT(device->subgroup_ballot);
@@ -4302,6 +4305,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_x16_f32, "dsv4_hc_pre_gated_x16_f32", dsv4_hc_pre_x_f16_len, dsv4_hc_pre_x_f16_data, "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_x16_g16_f32, "dsv4_hc_pre_gated_x16_g16_f32", dsv4_hc_pre_x_f16_g_f16_len, dsv4_hc_pre_x_f16_g_f16_data, "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants), {256, 1, 1}, { 256, 1 }, 1);
+    if (device->fp16) {
+        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_x16_f16, "dsv4_hc_pre_gated_x16_f16", dsv4_hc_pre_x_f16_d_f16_len, dsv4_hc_pre_x_f16_d_f16_data, "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants), {256, 1, 1}, { 256, 1 }, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_x16_g16_f16, "dsv4_hc_pre_gated_x16_g16_f16", dsv4_hc_pre_x_f16_g_f16_d_f16_len, dsv4_hc_pre_x_f16_g_f16_d_f16_data, "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants), {256, 1, 1}, { 256, 1 }, 1);
+    }
     if (device->subgroup_arithmetic) {
         // one 256-thread workgroup per (stream, token) row; the f16 variants store the norm as f16 (CPY f16 fused)
         for (uint32_t has_post = 0; has_post < 2; ++has_post) {
@@ -6895,7 +6902,7 @@ static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipel
         bool hcmix = false) {
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
     if (hcmix) {
-        vk_matmul_pipeline_key kh{src0_type, src1_type, false, false, false, false, false, false, true};
+        vk_matmul_pipeline_key kh{src0_type, src1_type, false, false, d16, false, false, false, true};   // d16: the f16 mixed stream
         auto ith = ctx->device->pipeline_matmul.find(kh);
         return (ith != ctx->device->pipeline_matmul.end() && !ith->second.empty()) ? &ith->second : nullptr;
     }
@@ -7444,14 +7451,15 @@ static void ggml_vk_matmul_hcmix(ggml_backend_vk_context * ctx, vk_context& subc
         const vk_hcmix_args & hc, uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t padded_n) {
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    const uint32_t d_s1 = (uint32_t) (hc.mixed->nb[1] / sizeof(float));
+    const size_t   d_el = ggml_type_size(hc.mixed->type);   // f32 or (wave 6) f16 mixed stream
+    const uint32_t d_s1 = (uint32_t) (hc.mixed->nb[1] / d_el);
     vk_mat_mat_hcmix_push_constants pc {};
     pc.mm = { m, n, k, stride_a, stride_b, d_s1, batch_stride_a, batch_stride_b, d_s1 * n, 0, 1, k, 1, 1, 1, 1, padded_n };
     pc.hc_n_embd   = (uint32_t) hc.x->ne[0];
     pc.hc_x_offset = (uint32_t) (get_misalign_bytes(ctx, hc.x) / sizeof(ggml_fp16_t));
     pc.hc_x_s1     = (uint32_t) (hc.x->nb[1] / sizeof(ggml_fp16_t));
     pc.hc_x_s2     = (uint32_t) (hc.x->nb[2] / sizeof(ggml_fp16_t));
-    pc.hc_d_offset = (uint32_t) (get_misalign_bytes(ctx, hc.mixed) / sizeof(float));
+    pc.hc_d_offset = (uint32_t) (get_misalign_bytes(ctx, hc.mixed) / d_el);
     pc.hc_d_s1     = d_s1;
     pc.hc_scale    = hc.scale;
     pc.hc_zero     = 0;
@@ -7545,7 +7553,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool y_needs_reformat = !quantize_y && ((!ggml_vk_dim01_contiguous(src1) && !y_rowstride) || y_kernel_type != src1->type);
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
-        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], false, d16, false, hcm);
+        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], false,
+                                             d16 || (hcm && od->type == GGML_TYPE_F16), false, hcm);
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
     const bool qy_needs_dequant = y_needs_reformat;
@@ -8609,9 +8618,14 @@ void ggml_vk_dsv4_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     // supports_op admits an f16 x only for the gated form, and an f16 gate only with an f16 x
     GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated && x->type == GGML_TYPE_F16));
     GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated && weights->type == GGML_TYPE_F16 && x->type == GGML_TYPE_F16));
+    // wave 6: an f16 dst (the f16 mixed stream) only with an f16 x (supports_op)
+    const bool d16 = dst->type == GGML_TYPE_F16;
+    GGML_ASSERT(!d16 || (gated && x->type == GGML_TYPE_F16));
     vk_pipeline pipeline = !gated ? ctx->device->pipeline_dsv4_hc_pre_f32 :
-                           x->type == GGML_TYPE_F16 ? (weights->type == GGML_TYPE_F16 ? ctx->device->pipeline_dsv4_hc_pre_gated_x16_g16_f32
-                                                                                       : ctx->device->pipeline_dsv4_hc_pre_gated_x16_f32)
+                           x->type == GGML_TYPE_F16 ? (weights->type == GGML_TYPE_F16 ? (d16 ? ctx->device->pipeline_dsv4_hc_pre_gated_x16_g16_f16
+                                                                                             : ctx->device->pipeline_dsv4_hc_pre_gated_x16_g16_f32)
+                                                                                       : (d16 ? ctx->device->pipeline_dsv4_hc_pre_gated_x16_f16
+                                                                                             : ctx->device->pipeline_dsv4_hc_pre_gated_x16_f32))
                                                     : ctx->device->pipeline_dsv4_hc_pre_gated_f32;
     GGML_ASSERT(pipeline != nullptr);
 
@@ -18595,11 +18609,11 @@ static int ggml_vk_can_fuse_hc_up_mix(ggml_backend_vk_context * ctx, const struc
     const int64_t n_embd = x->ne[0], nt = x->ne[2];
     if (x->ne[1] != 4 || x->ne[3] != 1 || x->type != GGML_TYPE_F16 || x->nb[0] != sizeof(ggml_fp16_t) ||
         mm->src[0]->type != GGML_TYPE_Q8_0 || mm->ne[0] != 4 * n_embd || mm->ne[1] != nt || mm->ne[2] != 1 || mm->ne[3] != 1 ||
-        pre->type != GGML_TYPE_F32 || pre->ne[0] != n_embd || pre->ne[1] != nt || pre->nb[0] != sizeof(float) ||
+        (pre->type != GGML_TYPE_F32 && pre->type != GGML_TYPE_F16) || pre->ne[0] != n_embd || pre->ne[1] != nt || pre->nb[0] != ggml_type_size(pre->type) ||
         mm->src[0]->ne[0] % 32 != 0) {
         return 0;
     }
-    if (ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, (ggml_prec) mm->op_params[0], false, false, false, true) == nullptr) {
+    if (ggml_vk_get_mul_mat_mat_pipeline_map(ctx, GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, (ggml_prec) mm->op_params[0], false, pre->type == GGML_TYPE_F16, false, true) == nullptr) {
         return 0;
     }
     // the gate is read only through the RESHAPE (a cast also lists itself as src[1]), the RESHAPE only by the HC pre
@@ -20938,7 +20952,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
             {
-                if (op->type != GGML_TYPE_F32) {
+                // wave 6: the gated HC_PRE may write an f16 mixed stream (f16 x only; checked again with the srcs below)
+                const bool f16_d_ok = op->op == GGML_OP_DSV4_HC_PRE && ggml_get_op_params_i32(op, 1) != 0 && op->src[0] &&
+                                      op->src[0]->type == GGML_TYPE_F16 && device->pipeline_dsv4_hc_pre_gated_x16_f16 != nullptr &&
+                                      device->pipeline_dsv4_hc_pre_gated_x16_g16_f16 != nullptr;
+                if (op->type != GGML_TYPE_F32 && !(f16_d_ok && op->type == GGML_TYPE_F16)) {
                     return false;
                 }
                 for (uint32_t i = 0; i < GGML_MAX_SRC; ++i) {

@@ -1008,6 +1008,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
     vk_pipeline pipeline_dsv4_hc_pre_gated_x16_f32;   // f16 x, f32 gate
     vk_pipeline pipeline_dsv4_hc_pre_gated_x16_g16_f32;   // f16 x, f16 gate (LLAMA_HC_GATE_F16: the hc up GEMM's f16 store)
+    vk_pipeline pipeline_dsv4_hc_pre_gated_x16_f16;       // f16 x, f32 gate, f16 mixed stream (wave 6)
+    vk_pipeline pipeline_dsv4_hc_pre_gated_x16_g16_f16;   // f16 x, f16 gate, f16 mixed stream
     // HC_POST(_GATE) + RMS_NORM + MUL (+ CPY f16) / RMS_NORM + MUL (+ CPY f16): [has_post][out_f16]
     vk_pipeline pipeline_dsv4_hc_post_norm[2][2];
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;

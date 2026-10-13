@@ -646,6 +646,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             if (matmul_id_type == MatMulIdType::NONE && tname == "q8_0") {
                 // HC_UP_MIX (wave 5): the qwen4exp hc up GEMM with the gated hc pre in its epilogue (f32 mixed output)
                 string_to_spv(shader_name + "_" + tname + "_q8_1_hcmix", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}, {"HC_EPI", "1"}}), fp16, coopmat, coopmat2, f16acc);
+                // wave 6: the same with an f16 mixed stream (D16 keeps the f32x4 store helpers out; the epilogue returns before any D16 store)
+                string_to_spv(shader_name + "_" + tname + "_q8_1_hcmix_d16", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"D_TYPE_VEC4", "f16vec4"}, {"D16", "1"}, {"HC_EPI", "1"}}), fp16, coopmat, coopmat2, f16acc);
             }
             if (matmul_id_type == MatMulIdType::NONE || matmul_id_type == MatMulIdType::SUBGROUP) {
                 // f16 output for the MUL_MAT(_ID)(+MUL)+CPY(f16) fusions
@@ -1243,6 +1245,8 @@ void process_shaders() {
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_pre_x_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}});
     string_to_spv("dsv4_hc_pre_x_f16_g_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}, {"G_F16", "1"}});
+    string_to_spv("dsv4_hc_pre_x_f16_d_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}, {"D_F16", "1"}});
+    string_to_spv("dsv4_hc_pre_x_f16_g_f16_d_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}, {"G_F16", "1"}, {"D_F16", "1"}});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("dsv4_hc_post_norm_f32", "dsv4_hc_post_norm.comp", {});
     string_to_spv("dsv4_hc_post_norm_f16", "dsv4_hc_post_norm.comp", {{"OUT_F16", "1"}});

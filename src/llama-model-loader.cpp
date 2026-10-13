@@ -12,8 +12,53 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <cmath>
 #include <regex>
 #include <unordered_set>
+
+// wave 6 (B): ported verbatim from the release v0.7.8.1 (src-v0781-clean 8e9dcfeb7); the qwen4exp indexer weights are bf16, and with
+// the f16 mixed stream as B a bf16 x f16 GEMM has no kernel on gfx11 RADV
+// LLAMA_BF16_TO_F16 (default on): a bf16 matmul weight bound for a GPU buffer is created and uploaded as f16, so it takes
+// the fast f16 matmul paths where a GPU has no fast bf16 one (gfx11 on RADV). bf16 has 7 mantissa bits and f16 10, so
+// every value in f16's normal range (>= 2^-14) converts exactly; values below it round to the nearest f16 subnormal
+// (error <= 2^-25, ~3e-8: real indexer weights have ~0.015% of values there, all < 1e-5). A tensor with a value f16
+// cannot hold (overflow or NaN), or a normal-range value that would change, stays bf16. Same 2 bytes: sizes unchanged.
+static bool llama_bf16_to_f16_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_BF16_TO_F16");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// returns false if the tensor must stay bf16; *n_rounded counts the sub-normal-range values that round
+static bool llama_bf16_fits_f16(const uint16_t * src, size_t n, size_t * n_rounded) {
+    const float f16_min_normal = 6.103515625e-05f; // 2^-14
+    size_t rounded = 0;
+    for (size_t i = 0; i < n; ++i) {
+        ggml_bf16_t b;
+        b.bits = src[i];
+        const float f = ggml_bf16_to_fp32(b);
+        const float h = ggml_fp16_to_fp32(ggml_fp32_to_fp16(f));
+        if (h == f) {
+            continue;
+        }
+        if (std::isnan(f) || std::isinf(h) || std::fabs(f) >= f16_min_normal) {
+            return false;   // overflow, NaN, or a normal-range value that would change
+        }
+        rounded++;
+    }
+    *n_rounded = rounded;
+    return true;
+}
+
+static void llama_bf16_to_f16_row(const uint16_t * src, ggml_fp16_t * dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        ggml_bf16_t b;
+        b.bits = src[i];
+        dst[i] = ggml_fp32_to_fp16(ggml_bf16_to_fp32(b));
+    }
+}
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1400,6 +1445,32 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
+    if (t_meta.type == GGML_TYPE_BF16 && llama_bf16_to_f16_enabled() && !(flags & TENSOR_DUPLICATED) && !is_lazy &&
+        !ggml_backend_buft_is_host(buft)) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        bool matmul_weight = false;
+        try {
+            const ggml_op op = llm_tensor_info_for(tn.tensor).op;
+            matmul_weight = (op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID) && !(tn.suffix && strcmp(tn.suffix, "bias") == 0);
+        } catch (const std::out_of_range &) {
+        }
+        const llama_tensor_weight * w = get_weight(tn.str().c_str());
+        if (matmul_weight && dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && w) {
+            std::vector<uint16_t> vals(ggml_nelements(&t_meta));
+            const auto & file = files.at(w->idx);
+            file->seek(w->offs, SEEK_SET);
+            file->read_raw(vals.data(), vals.size() * sizeof(uint16_t));
+            size_t n_rounded = 0;
+            if (llama_bf16_fits_f16(vals.data(), vals.size(), &n_rounded)) {
+                t_meta.type = GGML_TYPE_F16;   // same element size: ne/nb and the byte size are unchanged
+                f16_from_bf16.insert(tn.str());
+                f16_from_bf16_rounded += n_rounded;
+            } else {
+                LLAMA_LOG_WARN("%s: %s stays bf16 (has values f16 cannot hold exactly)\n", __func__, tn.str().c_str());
+            }
+        }
+    }
+
     ggml_context * ctx = ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
@@ -1425,6 +1496,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
+    if (!f16_from_bf16.empty()) {
+        LLAMA_LOG_INFO("%s: loading %zu bf16 matmul weights as f16 (%zu values below 2^-14 rounded, error <= 3e-8; "
+                "LLAMA_BF16_TO_F16=0 keeps bf16)\n", __func__, f16_from_bf16.size(), f16_from_bf16_rounded);
+    }
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }
@@ -1851,6 +1926,23 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (f16_from_bf16.count(ggml_get_name(cur))) {
+            // LLAMA_BF16_TO_F16: bf16 in the file, f16 in the buffer (exact, checked in create_tensor)
+            std::vector<uint16_t> src(n_size / sizeof(uint16_t));
+            if (use_mmap) {
+                memcpy(src.data(), (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs, n_size);
+            } else {
+                const auto & file = files.at(weight->idx);
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(src.data(), n_size);
+            }
+            std::vector<ggml_fp16_t> dst(src.size());
+            llama_bf16_to_f16_row(src.data(), dst.data(), src.size());
+            ggml_backend_tensor_set(cur, dst.data(), 0, n_size);
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

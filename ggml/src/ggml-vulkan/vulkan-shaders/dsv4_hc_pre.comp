@@ -1,7 +1,7 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
-#if defined(X_F16) || defined(G_F16)
+#if defined(X_F16) || defined(G_F16) || defined(D_F16)
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
@@ -48,7 +48,12 @@ layout(binding = 1, std430) readonly buffer W { float16_t data_w[]; };
 #else
 layout(binding = 1, std430) readonly buffer W { float data_w[]; };
 #endif
+#if defined(D_F16)
+// D_F16 (wave 6): the mixed stream stored as f16 (every consumer is a matmul B operand); rounded once, RTE, at the store
+layout(binding = 2, std430) writeonly buffer D { float16_t data_d[]; };
+#else
 layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
+#endif
 
 const uint hc = 4;
 
@@ -86,5 +91,9 @@ void main() {
         result = fma(float(data_x[xb + ih * nbx1]), wv, result);
     }
 
+#if defined(D_F16)
+    data_d[d_offset + i0 * nbd0 + it * nbd1] = float16_t(scale * result);
+#else
     data_d[d_offset + i0 * nbd0 + it * nbd1] = scale * result;
+#endif
 }

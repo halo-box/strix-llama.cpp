@@ -11549,7 +11549,9 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
     // the gated form also takes an f16 x and an f16 gate
     GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated_x && x->type == GGML_TYPE_F16));
     GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated_x && weights->type == GGML_TYPE_F16));
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    // wave 6: the gated form may write an f16 mixed stream (ggml_dsv4_hc_pre_gated_ext)
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || (gated_x && dst->type == GGML_TYPE_F16));
+    const bool d_f16 = dst->type == GGML_TYPE_F16;
     const bool x_f16 = x->type == GGML_TYPE_F16;
     const bool g_f16 = weights->type == GGML_TYPE_F16;
 
@@ -11602,7 +11604,12 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
             sum += xv * wv;
         }
 
-        *(float *) ((char *) dst->data + i0*nbd0 + it*nbd1) = scale * sum;
+        char * dp = (char *) dst->data + i0*nbd0 + it*nbd1;
+        if (d_f16) {
+            *(ggml_fp16_t *) dp = GGML_CPU_FP32_TO_FP16(scale * sum);
+        } else {
+            *(float *) dp = scale * sum;
+        }
     }
 }
 
