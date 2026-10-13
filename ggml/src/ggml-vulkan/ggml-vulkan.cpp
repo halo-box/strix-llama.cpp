@@ -1855,7 +1855,7 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 // register-prefetch coopmat matmul knobs (defined with the other matmul env switches further down)
 static bool ggml_vk_mm_prefetch_enabled(const vk_device& device);
 static bool ggml_vk_mm_prefetch_type(ggml_type t);
-static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n);
+static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b_f16 = false);
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
 static void ggml_vk_fusion_count_add(const char * name);
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device);
@@ -7391,7 +7391,16 @@ static bool ggml_vk_route_match(const std::vector<std::string> & list, ggml_type
 // (10-11, serialising perf logger, pp2048): the hc up GEMM q8_0 10240x2048x320 took 1.29 ms/call routed vs 0.88 on int8 MMQ
 // (95 calls per 4 ubatches, 39 ms), the one K-step the XL / prefetch tile gets at K=320 cannot amortise its B conversion and
 // prologue; the K=2560 and K=6144 shapes read flat between the paths in-model.
-static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n) {
+// GGML_VK_DENSE_F16B_NATIVE (wave 6 item 1 (A), default "q8_0"): listed types take the f16-B KHR coopmat matmul whenever B ARRIVES as f16
+// (no B conversion on that path), whatever the type list above says; decided per call at dispatch from src1->type, so a GEMM takes the
+// same path every time its B is f16. Wave-5 FN d32k timed ubatch (serial perf logger): the hc down GEMM q8_0 320x2048x10240 reads the
+// f16 hc norm output on both lines and took 1032 us/call on int8 MMQ vs 609 us/call on the release's f16-B coopmat path (95 calls).
+// "0" disables; a comma list (or "all") replaces the default. The K / N floors below still apply.
+static bool ggml_vk_dense_f16b_native(ggml_type t) {
+    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16B_NATIVE", "q8_0"), t);
+}
+
+static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b_f16) {
     static const uint32_t min_k = [] { const char * e = getenv("GGML_VK_DENSE_F16COOPMAT_MINK"); return e ? (uint32_t) atoi(e) : 1024u; }();
     // GGML_VK_DENSE_F16COOPMAT_MINN (default 32): decode / verify / MTP shapes stay on the int8 or mat-vec paths; the f16-B prefetch
     // path is a prefill tile and has an open small-n defect (bf16 m=128 n=16/9 k=5120 fail test-backend-ops under route all, 10-11)
@@ -7402,7 +7411,7 @@ static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n) {
     // q4_K / q5_K / q6_K / iq4_xs at K 5120-17408, and flat on Flash-Next (-0.1% / +1.7%) and Qwen3.6-35B-A3B (-0.2% / -0.4%), whose
     // dense weights are all q8_0 (the int8 path is near-native for q8_0). GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8,
     // "all" routes every type with a pf pipeline, a comma list replaces the default.
-    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,q6_K,iq4_xs"), t);
+    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,q6_K,iq4_xs"), t) || (b_f16 && ggml_vk_dense_f16b_native(t));
 }
 
 static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
@@ -7516,8 +7525,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                           (src1->type == GGML_TYPE_F32 || f16_y) && (ggml_is_contiguous(src1) || y_rowstride) && (ne11 * ne10) % 4 == 0;
     // GGML_VK_DENSE_F16COOPMAT: listed types leave the int8 path for the f16-B KHR coopmat matmul (not for the f16-out fusion,
     // which exists on the int8 path only)
-    if (can_quantize_y && !d16 && !hcm && ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10, (uint32_t) ne11)) {
+    if (can_quantize_y && !d16 && !hcm && ggml_vk_mm_prefetch_enabled(ctx->device) &&
+        ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10, (uint32_t) ne11, src1->type == GGML_TYPE_F16)) {
         can_quantize_y = false;
+        if (src1->type == GGML_TYPE_F16) {
+            ggml_vk_fusion_count_add("MUL_MAT_F16B_NATIVE");   // engagement read: dense GEMMs that took the f16-B path with an f16 B
+        }
     }
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
