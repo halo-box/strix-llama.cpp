@@ -670,6 +670,12 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_tq_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_cuda<GGML_TYPE_TQK7>;
+        case GGML_TYPE_TQP5:
+            return dequantize_tq_cuda<GGML_TYPE_TQP5>;
+        case GGML_TYPE_TQP6:
+            return dequantize_tq_cuda<GGML_TYPE_TQP6>;
+        case GGML_TYPE_TQP7:
+            return dequantize_tq_cuda<GGML_TYPE_TQP7>;
 #endif
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
@@ -742,6 +748,12 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_tq_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_cuda<GGML_TYPE_TQK7>;
+        case GGML_TYPE_TQP5:
+            return dequantize_tq_cuda<GGML_TYPE_TQP5>;
+        case GGML_TYPE_TQP6:
+            return dequantize_tq_cuda<GGML_TYPE_TQP6>;
+        case GGML_TYPE_TQP7:
+            return dequantize_tq_cuda<GGML_TYPE_TQP7>;
 #endif
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
@@ -811,6 +823,12 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_tq_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_cuda<GGML_TYPE_TQK7>;
+        case GGML_TYPE_TQP5:
+            return dequantize_tq_cuda<GGML_TYPE_TQP5>;
+        case GGML_TYPE_TQP6:
+            return dequantize_tq_cuda<GGML_TYPE_TQP6>;
+        case GGML_TYPE_TQP7:
+            return dequantize_tq_cuda<GGML_TYPE_TQP7>;
 #endif
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
@@ -848,6 +866,12 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK7>;
+        case GGML_TYPE_TQP5:
+            return dequantize_tq_nc_cuda<GGML_TYPE_TQP5>;
+        case GGML_TYPE_TQP6:
+            return dequantize_tq_nc_cuda<GGML_TYPE_TQP6>;
+        case GGML_TYPE_TQP7:
+            return dequantize_tq_nc_cuda<GGML_TYPE_TQP7>;
 #endif
         default:
             return nullptr;
@@ -881,6 +905,12 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK7>;
+        case GGML_TYPE_TQP5:
+            return dequantize_tq_nc_cuda<GGML_TYPE_TQP5>;
+        case GGML_TYPE_TQP6:
+            return dequantize_tq_nc_cuda<GGML_TYPE_TQP6>;
+        case GGML_TYPE_TQP7:
+            return dequantize_tq_nc_cuda<GGML_TYPE_TQP7>;
 #endif
         default:
             return nullptr;
@@ -914,6 +944,12 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK6>;
         case GGML_TYPE_TQK7:
             return dequantize_tq_nc_cuda<GGML_TYPE_TQK7>;
+        case GGML_TYPE_TQP5:
+            return dequantize_tq_nc_cuda<GGML_TYPE_TQP5>;
+        case GGML_TYPE_TQP6:
+            return dequantize_tq_nc_cuda<GGML_TYPE_TQP6>;
+        case GGML_TYPE_TQP7:
+            return dequantize_tq_nc_cuda<GGML_TYPE_TQP7>;
 #endif
         default:
             return nullptr;

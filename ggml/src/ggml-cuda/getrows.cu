@@ -568,6 +568,18 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_tq<GGML_TYPE_TQK7, dst_t>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_TQP5:
+            get_rows_cuda_tq<GGML_TYPE_TQP5, dst_t>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_TQP6:
+            get_rows_cuda_tq<GGML_TYPE_TQP6, dst_t>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_TQP7:
+            get_rows_cuda_tq<GGML_TYPE_TQP7, dst_t>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
 #endif // GGML_USE_TRELLIS
         default:
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));

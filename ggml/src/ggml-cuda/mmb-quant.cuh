@@ -378,23 +378,23 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
     }
 #ifdef GGML_USE_TRELLIS
     else if constexpr (ggml_cuda_type_is_tq(TYPE)) {
-        // Trellis types (TQ2_T/TQK6/TQK7): a 64-wide K slice is half of a 128-weight block = 16 trellis
-        // steps. mmb lane l (8 per row) decodes steps 2l, 2l+1 (8 consecutive weights, one 16-byte LDS
-        // store). Same fp32 arithmetic as tq_dequant_lane (d * fp16 codebook point), then RNE bf16.
+        // Trellis types (TQ2_T/TQK6/TQK7/TQP5-7): a 64-wide K slice is half of a 128-weight block = 4 tq
+        // lanes of 16 weights. mmb lane l (8 per row) decodes half of tq lane l/2 (8 consecutive weights,
+        // 4 codebook pairs, one 16-byte LDS store). Same fp32 arithmetic as tq_dequant_lane (d * fp16
+        // codebook point), then RNE bf16.
         typedef typename tq_block_info<TYPE>::block_t block_t;
         const block_t * b = (const block_t *) row + k0 / QK_TQK;
-        const int tl = ((k0 % QK_TQK) / 64) * 4 + (lane >> 1);   // tq lane = 4 steps = 16 weights
-        uint32_t st[TQ_STEPS_LANE];
-        tq_states4<TYPE>(b->qs, tl, st);
+        const int tl = ((k0 % QK_TQK) / 64) * 4 + (lane >> 1);   // tq lane = 16 weights
+        uint32_t idx[TQ_PAIRS_LANE];
+        tq_lane_idx<TYPE>(b->qs, tl, idx);
         const float d = __half2float(b->d);
         const uint32_t * lut = tq_lut_global();
-        const int i0 = (lane & 1) * 2;
+        const int p0 = (lane & 1) * 4;
         float v[8];
 #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            float2 p0, p1;
-            tq_step(lut, st[i0 + i], p0, p1);
-            v[4*i + 0] = d * p0.x; v[4*i + 1] = d * p0.y; v[4*i + 2] = d * p1.x; v[4*i + 3] = d * p1.y;
+        for (int p = 0; p < 4; ++p) {
+            const float2 w = tq_unpack_pair(lut[idx[p0 + p]]);
+            v[2*p + 0] = d * w.x; v[2*p + 1] = d * w.y;
         }
         uint4 o; o.x = mmb_pack2(v[0], v[1]); o.y = mmb_pack2(v[2], v[3]); o.z = mmb_pack2(v[4], v[5]); o.w = mmb_pack2(v[6], v[7]);
         *(uint4 *)(dst + 8 * lane) = o;
@@ -545,6 +545,9 @@ static void mmb_dispatch_quant(ggml_type type, Fn fn) {
         case GGML_TYPE_TQ2_T: fn(std::integral_constant<int, 32 + GGML_TYPE_TQ2_T>{}); break;
         case GGML_TYPE_TQK6: fn(std::integral_constant<int, 32 + GGML_TYPE_TQK6>{}); break;
         case GGML_TYPE_TQK7: fn(std::integral_constant<int, 32 + GGML_TYPE_TQK7>{}); break;
+        case GGML_TYPE_TQP5: fn(std::integral_constant<int, 32 + GGML_TYPE_TQP5>{}); break;
+        case GGML_TYPE_TQP6: fn(std::integral_constant<int, 32 + GGML_TYPE_TQP6>{}); break;
+        case GGML_TYPE_TQP7: fn(std::integral_constant<int, 32 + GGML_TYPE_TQP7>{}); break;
 #endif
         default: GGML_ABORT("unsupported MMB quant type");
     }
