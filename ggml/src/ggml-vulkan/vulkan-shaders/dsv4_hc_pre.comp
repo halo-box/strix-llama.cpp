@@ -49,7 +49,7 @@ layout(binding = 1, std430) readonly buffer W { float16_t data_w[]; };
 layout(binding = 1, std430) readonly buffer W { float data_w[]; };
 #endif
 #if defined(D_F16)
-// D_F16 (wave 6): the mixed stream stored as f16 (every consumer is a matmul B operand); rounded once, RTE, at the store
+// D_F16 (wave 6): the mixed stream stored as f16 (every consumer is a matmul B operand); the f32 result rounded RTE at the store
 layout(binding = 2, std430) writeonly buffer D { float16_t data_d[]; };
 #else
 layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
@@ -92,7 +92,9 @@ void main() {
     }
 
 #if defined(D_F16)
-    data_d[d_offset + i0 * nbd0 + it * nbd1] = float16_t(scale * result);
+    // equal to the f32 output stored, then CPY (and to HC_UP_MIX's f16 epilogue): the product goes through an XOR with a
+    // push-constant zero (n_embd < 2^31), so the compiler cannot fold the multiply and the conversion into one single rounding
+    data_d[d_offset + i0 * nbd0 + it * nbd1] = float16_t(uintBitsToFloat(floatBitsToUint(scale * result) ^ (n_embd >> 31)));
 #else
     data_d[d_offset + i0 * nbd0 + it * nbd1] = scale * result;
 #endif

@@ -116,7 +116,10 @@ void main() {
         if (i4 < nv4) {
             const vec4 n = v[k] * scale * data_g[gb + i4];
 #if defined(OUT_F16)
-            data_n[nb + i4] = f16vec4(n);
+            // equal to the f32 norm stored, then CPY: the product goes through an XOR with a push-constant zero (gate is 0 or
+            // 1), so the compiler cannot fold the multiply and the conversion into one single-rounding mixed-precision op
+            const f16vec4 n16 = f16vec4(uintBitsToFloat(floatBitsToUint(n) ^ uvec4(p.gate & ~1u)));
+            data_n[nb + i4] = n16;
 #else
             data_n[nb + i4] = n;
 #endif

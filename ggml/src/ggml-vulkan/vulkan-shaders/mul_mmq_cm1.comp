@@ -206,6 +206,27 @@ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, 
 #include "mul_mm_id_funcs.glsl"
 #endif
 
+#if defined(MUL_MAT_ID) && defined(D16)
+// f16 stores that must equal the unfused chain (f32 store, then CPY / the f16 SWIGLU): written plainly, the compiler may fold
+// the last f32 multiply and the f16 conversion into one single-rounding mixed-precision op (~6 in 1e5 values one ulp off),
+// and it drops a bare float(float16_t(x)) round trip. The values go through an XOR with a push-constant zero: bit 2 of
+// fusion_flags is never set (ggml_vk_matmul_id sets bits 0 and 3).
+uint mmid_zero() { return p.fusion_flags & 4u; }
+float16_t mmid_store16(const float x) { return float16_t(uintBitsToFloat(floatBitsToUint(x) ^ mmid_zero())); }
+f16vec2 mmid_store16x2(const vec2 x) { return f16vec2(uintBitsToFloat(floatBitsToUint(x) ^ uvec2(mmid_zero()))); }
+#ifdef GLU_UP
+// the unfused chain stores this projection as f16 (MUL_MAT_ID_CPY16) and the SWIGLU reads it back: round it the same way
+vec2 mmid_round16x2(const vec2 x) { return vec2(unpackFloat2x16(packFloat2x16(f16vec2(x)) ^ mmid_zero())); }
+float mmid_round16(const float x) { return mmid_round16x2(vec2(x, 0.0f)).x; }
+// the SWIGLU op's expression (swiglu.comp)
+float glu_silu_mul(const float g, const float u) { return g / (1.0f + exp(-g)) * u; }
+#endif
+#endif
+#if defined(HC_EPI) && defined(D16)
+// wave 6 f16 mixed stream: equal to the f32 mixed stream stored, then converted (as dsv4_hc_pre.comp D_F16); hc_zero is 0
+float16_t hc_store16(const float x) { return float16_t(uintBitsToFloat(floatBitsToUint(x) ^ p.hc_zero)); }
+#endif
+
 #ifdef HC_EPI
 // logical row L (i*4 + c) -> weight row c*n_embd + i; rows past M read row 0 (their results are never stored)
 uint hc_a_row_ib(const uint L) {
@@ -587,19 +608,20 @@ void main() {
                         const bool acc_gate = (p.fusion_flags & MMID_GLU_ACC_GATE) != 0;
                         if (row_g + 1 < p.M) {
                             const vec2 o = vec2(data_up2[idx / 2]);
-                            const vec2 g = acc_gate ? v : o;
-                            const vec2 u = acc_gate ? o : v;
-                            data_d2[idx / 2] = f16vec2(g.x / (1.0f + exp(-g.x)) * u.x, g.y / (1.0f + exp(-g.y)) * u.y);
+                            const vec2 v16 = mmid_round16x2(v);
+                            const vec2 g = acc_gate ? v16 : o;
+                            const vec2 u = acc_gate ? o : v16;
+                            data_d2[idx / 2] = mmid_store16x2(vec2(glu_silu_mul(g.x, u.x), glu_silu_mul(g.y, u.y)));
                         } else if (row_g < p.M) {
                             const float o = float(data_up[idx]);
-                            const float g = acc_gate ? v.x : o;
-                            data_d[idx] = float16_t(g / (1.0f + exp(-g)) * (acc_gate ? o : v.x));
+                            const float v16 = mmid_round16(v.x);
+                            data_d[idx] = mmid_store16(acc_gate ? glu_silu_mul(v16, o) : glu_silu_mul(o, v16));
                         }
 #else
                         if (row_g + 1 < p.M) {
-                            data_d2[idx / 2] = f16vec2(v * w);
+                            data_d2[idx / 2] = mmid_store16x2(v * w);
                         } else if (row_g < p.M) {
-                            data_d[idx] = float16_t(v.x * w);
+                            data_d[idx] = mmid_store16(v.x * w);
                         }
 #endif
                     }
@@ -629,11 +651,15 @@ void main() {
                 {
                     const float o = float(data_up[store_offset]);
                     const bool acc_gate = (p.fusion_flags & MMID_GLU_ACC_GATE) != 0;
-                    const float g = acc_gate ? val : o;
-                    val = g / (1.0f + exp(-g)) * (acc_gate ? o : val);
+                    const float v16 = mmid_round16(val);
+                    val = acc_gate ? glu_silu_mul(v16, o) : glu_silu_mul(o, v16);
                 }
 #endif
+#ifdef D16
+                data_d[store_offset] = mmid_store16(val);
+#else
                 data_d[store_offset] = D_TYPE(val);
+#endif
             }
         }
     }
@@ -673,7 +699,11 @@ void main() {
                             const float wv = 1.0f / (1.0f + exp(-g));
                             result = fma(float(data_x[xb + ih * p.hc_x_s1]), wv, result);
                         }
-                        data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = D_TYPE(p.hc_scale * result);   // wave 6: D_TYPE float16_t = the f16 mixed stream
+#ifdef D16
+                        data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = hc_store16(p.hc_scale * result);   // wave 6: the f16 mixed stream
+#else
+                        data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = D_TYPE(p.hc_scale * result);
+#endif
                     }
                 }
             }

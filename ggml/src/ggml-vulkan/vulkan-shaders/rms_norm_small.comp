@@ -16,6 +16,16 @@
 
 #define BLOCK_SIZE 256
 
+// f16 builds (D_F16): the store equals the unfused chain (f32 result stored, then converted to f16). Written plainly, the
+// compiler may fold the last f32 multiply and the conversion into one single-rounding mixed-precision op (~6 in 1e5 values
+// one ulp off); the value goes through an XOR with a push-constant zero first (param3 = num_partials, 0 on every f16 path).
+#ifdef D_F16
+float16_t store_d16(const float x) { return float16_t(uintBitsToFloat(floatBitsToUint(x) ^ uint(p.param3))); }
+#define STORE_D(x) store_d16(float(x))
+#else
+#define STORE_D(x) D_TYPE(x)
+#endif
+
 layout (constant_id = 1) const bool do_multiply = false;
 // RMS_NORM + MUL + MUL (the gated norm, normalised * gamma * gate): the second multiplier is
 // contiguous and the same shape as the destination, so it shares the destination index
@@ -71,26 +81,26 @@ void main() {
                 if (do_sigmoid_c) {
                     c = 1.0f / (1.0f + exp(-c));
                 }
-                data_d[d_offset + col] = D_TYPE(y * FLOAT_TYPE(c));
+                data_d[d_offset + col] = STORE_D(y * FLOAT_TYPE(c));
             }
         } else if (do_multiply) {
             if (ncols > p.ne10) {
                 for (uint col = lane; col < ncols; col += sgsize) {
-                    data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
+                    data_d[d_offset + col] = STORE_D(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
                 }
             } else {
                 for (uint col = lane; col < ncols; col += sgsize) {
-                    data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+                    data_d[d_offset + col] = STORE_D(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
                 }
             }
         } else if (do_post_scale) {
             for (uint col = lane; col < ncols; col += sgsize) {
                 const float y = float(scale * FLOAT_TYPE(data_a[a_offset + col]));
-                data_d[d_offset + col] = D_TYPE(y * p.param2);
+                data_d[d_offset + col] = STORE_D(y * p.param2);
             }
         } else {
             for (uint col = lane; col < ncols; col += sgsize) {
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+                data_d[d_offset + col] = STORE_D(scale * FLOAT_TYPE(data_a[a_offset + col]));
             }
         }
     }

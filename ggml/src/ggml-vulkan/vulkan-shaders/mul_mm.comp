@@ -186,6 +186,16 @@ layout (push_constant) uniform parameter
 #endif
 } p;
 
+#if defined(MUL_MAT_ID) && defined(MMID_SCALE)
+// The MUL_MAT_ID + MUL + CPY(f16) store must equal the unfused chain (f32 product stored, then CPY): written plainly, the
+// compiler may fold the multiply and the f16 conversion into one single-rounding mixed-precision op (~6 in 1e5 values one
+// ulp off). The product goes through an XOR with a push-constant zero (bit 2 of fusion_flags is never set: ggml_vk_matmul_id
+// sets bits 0 and 3), so its f32 rounding is kept.
+D_TYPE mmid_scaled_store(const float acc, const float sc) {
+    return D_TYPE(uintBitsToFloat(floatBitsToUint(acc * sc) ^ (p.fusion_flags & 4u)));
+}
+#endif
+
 layout (constant_id = 0) const uint BLOCK_SIZE = 64;
 layout (constant_id = 1) const uint BM = 64;
 layout (constant_id = 2) const uint BN = 64;
@@ -738,11 +748,16 @@ void main() {
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
                 if (dr + cm_row * TM + store_r < p.M) {
                     const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r;
-                    if (p.fusion_flags != 0) {
+#ifdef MMID_SCALE
+                    const float sc = (p.fusion_flags & 1u) != 0 ? data_fscale[row_idx.y * p.nei0 + row_idx.x] : 1.0;
+                    data_d[didx] = mmid_scaled_store(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]), sc);
+#else
+                    if ((p.fusion_flags & 1u) != 0) {
                         data_d[didx] = D_TYPE(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]) * data_fscale[row_idx.y * p.nei0 + row_idx.x]);
                     } else {
                         data_d[didx] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
                     }
+#endif
                 }
             }
             barrier();
