@@ -270,6 +270,7 @@ llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-sched-view-scratch.cpp)
 llama_build_and_test(test-hc-up-mix-exact.cpp)
+llama_build_and_test(test-f16-store-exact.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
