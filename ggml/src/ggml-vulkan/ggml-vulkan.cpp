@@ -15304,6 +15304,26 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
     return last;
 }
 
+// The engagement read for QSA_BLOCK_SELECT: QSA_SELECT_CHAIN counts every block-selection chain graph_compute meets, fused or
+// not (a fused chain where it is taken, from its first visibility cast or its TOP_K; an unfused one at its TOP_K, the I32 top-k
+// select_complete_blocks wraps in a CONT), so QSA_BLOCK_SELECT / QSA_SELECT_CHAIN is the engaged ratio (1 = every eligible
+// strip). QSA_SCORE is not the denominator: strips without a selection (n_kv <= budget) have a score and no chain.
+static int ggml_vk_try_qsa_block_select(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx, vk_qsa_block_select_match & m) {
+    const int last = ggml_vk_match_qsa_block_select(ctx, cgraph, node_idx, m);
+    const ggml_tensor * n = cgraph->nodes[node_idx];
+    bool chain_topk = false;
+    if (last == 0 && n->op == GGML_OP_TOP_K && n->type == GGML_TYPE_I32) {
+        // its CONT anywhere in the next 48 nodes (graph_optimize may have moved other nodes in between)
+        for (int j = node_idx + 1; j < std::min(node_idx + 48, cgraph->n_nodes) && !chain_topk; ++j) {
+            chain_topk = cgraph->nodes[j]->op == GGML_OP_CONT && cgraph->nodes[j]->src[0] == n;
+        }
+    }
+    if (last > 0 || chain_topk) {
+        ggml_vk_path_census_add("QSA_SELECT_CHAIN");
+    }
+    return last;
+}
+
 static void ggml_vk_qsa_block_select(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
     vk_qsa_block_select_match m;
     const int last = ggml_vk_match_qsa_block_select(ctx, cgraph, node_idx, m);
@@ -19496,7 +19516,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // the epilogue reads the keys, the queries and the bias while it writes the sum: no aliasing at all
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (const int bs_last = (cgraph->nodes[i]->op == GGML_OP_TOP_K || cgraph->nodes[i]->op == GGML_OP_CPY) ?
-                                               ggml_vk_match_qsa_block_select(ctx, cgraph, i, qsa_bs_match) : 0) {
+                                               ggml_vk_try_qsa_block_select(ctx, cgraph, i, qsa_bs_match) : 0) {
                 ctx->num_additional_fused_ops = bs_last - i;
                 ctx->fused_qsa_block_select = true;
                 fusion_string = "QSA_BLOCK_SELECT";
