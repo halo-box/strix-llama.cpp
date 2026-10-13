@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <cinttypes>
@@ -679,6 +680,31 @@ static int64_t qwen4exp_hc_xn_pad() {
     return pad > 0 ? pad : 0;
 }
 
+// The f16 mixed stream needs every matmul weight that reads it to take an f16 B. A bf16 weight left as bf16 (LLAMA_BF16_TO_F16=0,
+// or a value past the f16 range) has no bf16 x f16 matmul on Vulkan (test-backend-ops MUL_MAT_F16B bf16: not supported), so the
+// scheduler would run that GEMM on the CPU. Any bf16 matmul weight in the model keeps the stream f32 (checked once per model).
+static bool qwen4exp_has_bf16_matmul_weight(const llama_model & model) {
+    static std::mutex mtx;
+    static const llama_model * cached_model = nullptr;
+    static bool cached = false;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (cached_model != &model) {
+        int n = 0;
+        for (const auto & it : model.tensors_by_name) {
+            const ggml_tensor * t = it.second;
+            if (t->type == GGML_TYPE_BF16 && ggml_n_dims(t) >= 2 && it.first.find("token_embd") == std::string::npos) {
+                ++n;
+            }
+        }
+        cached_model = &model;
+        cached = n > 0;
+        if (cached) {
+            LLAMA_LOG_INFO("%s: %d bf16 matmul weights stay bf16: the hc mixed stream stays f32 (no bf16 x f16 matmul)\n", __func__, n);
+        }
+    }
+    return cached;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  x,
         ggml_tensor *  w_norm,
@@ -762,7 +788,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         // is the release's: f16 at nt >= 32, f32 at decode / MTP verify; MINN only raises that floor.
         static const bool mix_f16_on = [] { const char * e = getenv("LLAMA_HC_MIX_F16"); return e == nullptr || atoi(e) != 0; }();
         static const int64_t mix_f16_minn = [] { const char * e = getenv("LLAMA_HC_MIX_F16_MINN"); return e ? (int64_t) atoi(e) : (int64_t) 0; }();
-        const ggml_type mix_type = (mix_f16_on && norm_f16 && nt >= mix_f16_minn) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        const ggml_type mix_type = (mix_f16_on && norm_f16 && nt >= mix_f16_minn && !qwen4exp_has_bf16_matmul_weight(model)) ? GGML_TYPE_F16 : GGML_TYPE_F32;
         mixed = ggml_dsv4_hc_pre_gated_ext(ctx0,
                 xn_padded ? ggml_view_3d(ctx0, xn, n_embd, hc, nt, n_embd * ggml_element_size(xn), xn->nb[1], 0)
                           : ggml_reshape_3d(ctx0, xn, n_embd, hc, nt),
