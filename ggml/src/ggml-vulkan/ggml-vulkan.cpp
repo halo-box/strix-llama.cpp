@@ -19617,7 +19617,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         }
                         if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                             bool found = false;
-                            for (int n = 0; n < k; ++n) {
+                            // n <= k: a node's own output listed as its source is a self-reference, not a read (a cast's
+                            // src[1]). QSA_BLOCK_SELECT lost 166 of 180 chains to its cells cast once the alloc deps kept the
+                            // real inputs alive: ggml-alloc reused the dead cast buffer for the CONCAT, which no fused kernel reads
+                            for (int n = 0; n <= k; ++n) {
                                 if (cgraph->nodes[i + n] == src) {
                                     found = true;
                                     break;
