@@ -3050,8 +3050,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // register-prefetch variants (GGML_VK_MM_PREFETCH): same tiles as the quant pipelines, keyed with pf = true
         if (ggml_vk_mm_prefetch_enabled(device)) {
             // manual-fragment twins (COOPMAT_MANUAL_FRAG, "_mf"): only after the RDNA3 fragment layout probe passed on this device;
-            // GGML_VK_MMID_MANUAL_FRAG=0 keeps the coopMatLoad builds. GGML_VK_TEST_MF_SKEW=1 (test hook) builds the non-REG_A _mf
-            // pipelines with spec constant 16 = 1, which rotates the fragment's k pairs: a byte-equal test must see a difference.
+            // GGML_VK_MMID_MANUAL_FRAG=0 keeps the coopMatLoad builds. GGML_VK_TEST_MF_SKEW=1 (test hook) builds the _mf pipelines
+            // (REG_A included) with spec constant 16 = 1, which rotates the fragment's k pairs: a byte-equal test must see a difference.
             const bool mmid_mf = device->coopmat_rdna3_layout && ggml_vk_mmid_manual_frag_enabled();
             const std::string mmid_mf_sfx = mmid_mf ? "_mf" : "";
 #define MMID_MF_SPV(base, acc) (mmid_mf ? base##_mf##acc##_cm1_len : base##acc##_cm1_len), (mmid_mf ? base##_mf##acc##_cm1_data : base##acc##_cm1_data)
@@ -3110,6 +3110,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     if (spec.size() == 12) { spec.push_back(ggml_vk_coopmat_shmem_pad(device, wt[3])); spec.push_back(0); }   // 12, 13
                     if (spec.size() == 14) { spec.push_back(0); }                                                              // 14
                     spec.push_back(3u);                                                                                        // 15: REG_A
+                    if (mmid_mf && mf_skew) { spec.push_back(1u); }                                                            // 16: MF_SKEW (test hook)
                     return spec;
                 };
                 auto cm1_create_rega = [&](vk_matmul_pipeline_key key, const std::string& name, size_t len, const void* data, uint32_t pc) {

@@ -41,8 +41,8 @@ for c in d:
     n_rega += rd > 0
     if md:
         n_mf += 1
-    # the skew spec constant is applied to the non-REG_A _mf pipelines only, so only cases that ran one can show it
-    if md - rmd > 0:
+    # the skew spec constant is set on every _mf pipeline (REG_A included), so every case that ran one must show it
+    if md > 0:
         n_skewable += 1
         if hs == ho:
             print(f'FAIL positive control: {c}: skew hash equals off hash (the comparison could not see a wrong fragment)'); fail += 1
@@ -50,9 +50,9 @@ for c in d:
             n_skew += 1
     print(f'{"ok  " if eq else "FAIL"} {c}: default {hd} off {ho} skew {hs} | all {ad} pf {pd} mf {md} rega {rd} rega_mf {rmd} | off mf {mo} rega_mf {rmo}')
 
-print(f'summary: {len(d)} cases, byte-equal {n_eq}/{len(d)}, cases on _mf pipelines {n_mf}, cases on REG_A {n_rega}, skew differs {n_skew}/{n_skewable} (non-REG_A _mf cases), failures {fail}')
+print(f'summary: {len(d)} cases, byte-equal {n_eq}/{len(d)}, cases on _mf pipelines {n_mf}, cases on REG_A {n_rega}, skew differs {n_skew}/{n_skewable} (_mf cases, REG_A included), failures {fail}')
 if n_skewable == 0:
-    print('FAIL: no non-REG_A _mf case, the positive control never ran'); fail += 1
+    print('FAIL: no _mf case, the positive control never ran'); fail += 1
 if n_mf == 0:
     print('FAIL: no case ran a _mf pipeline (probe failed or routing missed): nothing was tested'); fail += 1
 sys.exit(1 if fail else 0)
