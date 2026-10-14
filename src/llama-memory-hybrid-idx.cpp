@@ -1120,7 +1120,20 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     ns_ubatch(mem->get_mem_idx() == nullptr ?
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx())) {}
+        new llama_kv_cache_context(mem->get_mem_idx())) {
+    if (kpool_track()) {
+        mem->kpool_layout_update();
+        auto st = kpool_build_sizes();
+        const auto * idx = mem->get_mem_idx();
+        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
+        GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
+        st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
+        st.n_new   = st.n_pool_real;
+        st.n_new_g = std::max(st.n_new, 1u);
+        kpool_st = std::make_unique<kpool_state>(std::move(st));
+        i_kpool  = 0;
+    }
+}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,

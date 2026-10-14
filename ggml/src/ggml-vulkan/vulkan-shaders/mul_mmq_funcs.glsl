@@ -231,7 +231,20 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
 #if defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
 // 1-byte loads for ROCmFP4 blocks (18 / 17 bytes). Low nibbles are the first
 // half of the block, high nibbles the second half.
-void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
+    if (!is_in_bounds) {
+        buf_a[buf_ib].qs[iqs    ] = 0;
+        buf_a[buf_ib].qs[iqs + 4] = 0;
+        if (iqs == 0) {
+#if defined(DATA_A_ROCMFP4)
+            buf_a[buf_ib].d = FLOAT_TYPEV2(0.0f);
+#else
+            buf_a[buf_ib].d = FLOAT_TYPE(0.0f);
+#endif
+        }
+        return;
+    }
+
     const uint32_t qs = pack32(u8vec4(data_a[ib].qs[iqs * 4    ],
                                       data_a[ib].qs[iqs * 4 + 1],
                                       data_a[ib].qs[iqs * 4 + 2],
