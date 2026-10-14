@@ -88,9 +88,6 @@ static __global__ void mm_ids_helper(
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
 
-    // token slots per warp lane group, padded to a power of 2 so a warp divides evenly
-    constexpr int neu_padded = mm_ids_pow2<n_expert_used_template>::value;
-
     extern __shared__ char data_mm_ids_helper[];
     mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
 

@@ -526,6 +526,15 @@ static __global__ void convert_f16_f32_cont(const half * x, float * y, int64_t k
 
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    if (k % 4 == 0 &&
+        (uintptr_t) vx % alignof(cvt_vec4<src_t>) == 0 &&
+        (uintptr_t) y  % alignof(cvt_vec4<dst_t>) == 0) {
+        const int64_t k4 = k/4;
+        const int64_t num_blocks = (k4 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+        convert_unary_cont_vec4<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k4);
+        return;
+    }
+
     const int nblocks = (k + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE);
     if constexpr (std::is_same<src_t, float>::value && std::is_same<dst_t, half>::value) {
         if ((uintptr_t) vx % alignof(float2) == 0 && (uintptr_t) y % alignof(half2) == 0) {
@@ -539,15 +548,6 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
             return;
         }
     }
-    if (k % 4 == 0 &&
-        (uintptr_t) vx % alignof(cvt_vec4<src_t>) == 0 &&
-        (uintptr_t) y  % alignof(cvt_vec4<dst_t>) == 0) {
-        const int64_t k4 = k/4;
-        const int64_t num_blocks = (k4 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
-        convert_unary_cont_vec4<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k4);
-        return;
-    }
-
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 

@@ -336,7 +336,7 @@ llama_kv_cache::llama_kv_cache(
                     ggml_type_name(type_k), ggml_type_name(type_v));
         }
 
-        attn_rot_k =
+        bool attn_rot_k =
             !attn_rot_disable &&
             !attn_rot_k_rocmfpx_fp3 &&
             n_embd_head_k_all > 0 &&

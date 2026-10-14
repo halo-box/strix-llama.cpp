@@ -62,6 +62,8 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
+
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -666,6 +668,22 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 
 class vk_memory_logger;
 
+// Indexer head counts we build kernels for: 4 = Qwen4-exp (qwen4_exp), 64 = DeepSeek-V4 and
+// GLM-DSA, 32 kept because test-backend-ops exercises it. N_HEAD is a specialization constant,
+// so each entry is a separately compiled kernel with the head loop fully unrolled - as a push
+// constant the loop cannot unroll and decode costs ~55% more (measured, gfx1151, kv=131584).
+static constexpr uint32_t LI_NH_VALUES[] = { 4, 32, 64 };
+#define LI_NH_COUNT (sizeof(LI_NH_VALUES) / sizeof(LI_NH_VALUES[0]))
+
+static inline int ggml_vk_li_nh_index(int64_t nh) {
+    for (size_t i = 0; i < LI_NH_COUNT; ++i) {
+        if ((int64_t) LI_NH_VALUES[i] == nh) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -722,6 +740,7 @@ struct vk_device_struct {
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
     uint32_t max_nodes_per_submit;
+    uint64_t max_bytes_per_submit;
 
     bool shader_64b_indexing;
 
@@ -835,6 +854,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_add_id_f32;
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
+    vk_pipeline pipeline_concat_transpose_i32;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     vk_pipeline pipeline_scale_f32;
     vk_pipeline pipeline_log[2];
@@ -1248,6 +1268,13 @@ class vk_perf_logger {
         timings[name].push_back(time);
     }
 
+    // Log a sub-node interval under a caller-supplied name. Used for work a node's handler
+    // dispatches before the op itself (e.g. the FA K/V contiguize/dequant pass), which would
+    // otherwise be billed to the op and invisible. No flops: these move bytes, not math.
+    void log_timing_named(const char *name, uint64_t time) {
+        timings[std::string(name)].push_back(time);
+    }
+
   private:
     std::map<std::string, std::vector<uint64_t>> timings;
     std::map<std::string, std::vector<uint64_t>> flops;
@@ -1263,6 +1290,18 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // memoized capacity decision for the FA dequant-once scratch, see ggml_vk_fa_dequant_scratch_fits
+    uint64_t fa_dequant_gate_sz;
+    bool fa_dequant_gate_fits;
+    bool fa_dequant_gate_logged;
+    // DeepSeek V4 small-batch union: the compact row count is produced on the device, so the
+    // host prices compaction from the last count it wrote. See ggml_vk_fa_union_estimate.
+    // Per batch size, because the overlap depends on it (measured 0.64 at 2 tokens, 0.40 at 4,
+    // 0.24 at 8) and because a speculative decode varies the batch with the accept count, so a
+    // single slot would be invalidated on nearly every step. This path caps the batch at 64.
+    vk_buffer fa_union_stat;
+    float     fa_union_est_ratio[64]; // union / candidates, decaying peak; 0 = unseeded
+    uint64_t  fa_union_declines;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -1342,6 +1381,9 @@ struct ggml_backend_vk_context {
     std::vector<int> query_fusion_node_count;
     std::vector<ggml_tensor *> query_nodes;
     std::vector<int> query_node_idx;
+    // non-null => this query slot closes a sub-node interval logged under this literal name,
+    // not a graph node. See ggml_vk_perf_mark_subop.
+    std::vector<const char *> query_sub_names;
     int32_t num_queries {};
     int32_t query_idx {};
 };

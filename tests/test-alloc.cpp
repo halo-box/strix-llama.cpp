@@ -677,6 +677,66 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+static void test_pinned_no_inplace() {
+    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * input  = make_input_1d(ctx, 4);
+    ggml_tensor * parent = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * child  = ggml_scale(ctx, parent, 3.0f);
+
+    ggml_set_output(child);
+    ggml_build_forward_expand(graph, child);
+
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_pin_tensor(galloc.get(), parent);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+    GGML_ASSERT(!memory_overlap(parent, child));
+}
+
+static void test_pinned_view_root_no_inplace() {
+    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * input  = make_input_1d(ctx, 4);
+    ggml_tensor * root   = ggml_scale(ctx, input, 2.0f);
+    ggml_tensor * view   = ggml_view_1d(ctx, root, 4, 0);
+    ggml_tensor * child  = ggml_scale(ctx, view, 3.0f);
+
+    ggml_set_output(child);
+    ggml_build_forward_expand(graph, child);
+
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_pin_tensor(galloc.get(), root);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+    GGML_ASSERT(!memory_overlap(root, child));
+}
+
+// Parent nbytes > max_size leaves cur_buf_size > max_size. A following view
+// then triggers a split with this_size == 0, so the view-only residual range
+// skips alloc_tensor_range unless views are finalized after all splits.
+static void test_view_init_after_max_size_split() {
+    const size_t max_size = 16;
+    dummy_backend backend = dummy_backend_init(max_size);
+    auto [ctx, graph, ctx_ptr] = make_context();
+    (void) graph;
+
+    ggml_tensor * parent = make_input_with_size(ctx, 24); // 6 x f32, > max_size
+    ggml_tensor * view0  = ggml_view_1d(ctx, parent, 2, 0);
+    ggml_tensor * view1  = ggml_view_1d(ctx, parent, 2, 2 * sizeof(float));
+    assign_names(ctx);
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx, &backend.buffer_type));
+    GGML_ASSERT(buf);
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        GGML_ASSERT(t->buffer != nullptr);
+        GGML_ASSERT(t->data != nullptr);
+    }
+    GGML_ASSERT(view0->view_src == parent);
+    GGML_ASSERT(view1->view_src == parent);
+}
+
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
 // matches the actual size of the buffer allocated for the ctx tensors
 static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
@@ -1099,66 +1159,6 @@ static void test_buft_get_alloc_size_n_does_not_allocate() {
     GGML_ASSERT(x[1]->data == nullptr);
 }
 
-static void test_pinned_no_inplace() {
-    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
-    auto [ctx, graph, ctx_ptr] = make_context();
-
-    ggml_tensor * input  = make_input_1d(ctx, 4);
-    ggml_tensor * parent = ggml_scale(ctx, input, 2.0f);
-    ggml_tensor * child  = ggml_scale(ctx, parent, 3.0f);
-
-    ggml_set_output(child);
-    ggml_build_forward_expand(graph, child);
-
-    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
-    ggml_gallocr_pin_tensor(galloc.get(), parent);
-    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
-    GGML_ASSERT(!memory_overlap(parent, child));
-}
-
-static void test_pinned_view_root_no_inplace() {
-    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
-    auto [ctx, graph, ctx_ptr] = make_context();
-
-    ggml_tensor * input  = make_input_1d(ctx, 4);
-    ggml_tensor * root   = ggml_scale(ctx, input, 2.0f);
-    ggml_tensor * view   = ggml_view_1d(ctx, root, 4, 0);
-    ggml_tensor * child  = ggml_scale(ctx, view, 3.0f);
-
-    ggml_set_output(child);
-    ggml_build_forward_expand(graph, child);
-
-    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
-    ggml_gallocr_pin_tensor(galloc.get(), root);
-    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
-    GGML_ASSERT(!memory_overlap(root, child));
-}
-
-// Parent nbytes > max_size leaves cur_buf_size > max_size. A following view
-// then triggers a split with this_size == 0, so the view-only residual range
-// skips alloc_tensor_range unless views are finalized after all splits.
-static void test_view_init_after_max_size_split() {
-    const size_t max_size = 16;
-    dummy_backend backend = dummy_backend_init(max_size);
-    auto [ctx, graph, ctx_ptr] = make_context();
-    (void) graph;
-
-    ggml_tensor * parent = make_input_with_size(ctx, 24); // 6 x f32, > max_size
-    ggml_tensor * view0  = ggml_view_1d(ctx, parent, 2, 0);
-    ggml_tensor * view1  = ggml_view_1d(ctx, parent, 2, 2 * sizeof(float));
-    assign_names(ctx);
-
-    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx, &backend.buffer_type));
-    GGML_ASSERT(buf);
-
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
-        GGML_ASSERT(t->buffer != nullptr);
-        GGML_ASSERT(t->data != nullptr);
-    }
-    GGML_ASSERT(view0->view_src == parent);
-    GGML_ASSERT(view1->view_src == parent);
-}
-
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1181,6 +1181,9 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_pinned_no_inplace", test_pinned_no_inplace);
+    run("test_pinned_view_root_no_inplace", test_pinned_view_root_no_inplace);
+    run("test_view_init_after_max_size_split", test_view_init_after_max_size_split);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
@@ -1199,8 +1202,5 @@ int main() {
     run("test_buft_get_alloc_size_n_custom_override", test_buft_get_alloc_size_n_custom_override);
     run("test_buft_get_alloc_size_n_custom_override_ctx_size", test_buft_get_alloc_size_n_custom_override_ctx_size);
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
-    run("test_pinned_no_inplace", test_pinned_no_inplace);
-    run("test_pinned_view_root_no_inplace", test_pinned_view_root_no_inplace);
-    run("test_view_init_after_max_size_split", test_view_init_after_max_size_split);
     return 0;
 }

@@ -25,7 +25,7 @@ static bool use_rdna3_5_q6_ling_j32(const mmq_args & args) {
         (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y == 32;
 }
 
-static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
+static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1 = GGML_PREC_Q8) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_q_case<GGML_TYPE_Q1_0, GGML_PREC_Q8>(ctx, args, stream);
@@ -119,47 +119,6 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         default:
             GGML_ABORT("fatal error");
     }
-}
-
-// overrides the src1 precision requested by the graph, "auto" keeps the requested one
-static ggml_prec ggml_cuda_mmq_get_prec_env() {
-    const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
-    if (env_c == nullptr) {
-        return GGML_PREC_UNDEFINED;
-    }
-    std::string env_cpp = env_c;
-    for (char & c : env_cpp) {
-        c = std::tolower(c);
-    }
-    if (env_cpp == "q4") {
-        return GGML_PREC_Q4;
-    }
-    if (env_cpp == "q8") {
-        return GGML_PREC_Q8;
-    }
-    if (env_cpp != "auto") {
-        GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_MMQ_PREC: '%s'. Available: 'q4', 'q8', 'auto'.\n", __func__, env_cpp.c_str());
-    }
-    return GGML_PREC_UNDEFINED;
-}
-
-// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
-// default to the native W4A4 instructions on Blackwell.
-static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, const int cc) {
-    static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
-
-    ggml_prec prec = prec_env;
-    if (prec == GGML_PREC_UNDEFINED) {
-        prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
-    }
-
-    // Q4 only for the FP4 types on Blackwell
-    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
-    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
-    if (prec == GGML_PREC_Q8 || !can_use_q4) {
-        return GGML_PREC_Q8;
-    }
-    return GGML_PREC_Q4;
 }
 
 // The tile width J for a src1 of ncols_opt columns: the fewest tiles, among the configs that fit in shared memory.
@@ -301,7 +260,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         GGML_ASSERT(dst_i->ne[1] == n_expert_used);
 
         const bool fallback = ggml_cuda_mmq_needs_fallback(src0_i->ne[1]);
-        // same column count to optimize for as ggml_cuda_mul_mat_q_impl
+        // same column count to optimize for as ggml_cuda_mul_mat_q
         int64_t ncols_opt = n_tokens;
         if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
             ncols_opt = (n_tokens*n_expert_used + src0_i->ne[2] - 1) / src0_i->ne[2];
@@ -348,6 +307,47 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             n_tokens, J_best[i]};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
     }
+}
+
+// overrides the src1 precision requested by the graph, "auto" keeps the requested one
+static ggml_prec ggml_cuda_mmq_get_prec_env() {
+    const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
+    if (env_c == nullptr) {
+        return GGML_PREC_UNDEFINED;
+    }
+    std::string env_cpp = env_c;
+    for (char & c : env_cpp) {
+        c = std::tolower(c);
+    }
+    if (env_cpp == "q4") {
+        return GGML_PREC_Q4;
+    }
+    if (env_cpp == "q8") {
+        return GGML_PREC_Q8;
+    }
+    if (env_cpp != "auto") {
+        GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_MMQ_PREC: '%s'. Available: 'q4', 'q8', 'auto'.\n", __func__, env_cpp.c_str());
+    }
+    return GGML_PREC_UNDEFINED;
+}
+
+// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
+// default to the native W4A4 instructions on Blackwell.
+static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, const int cc) {
+    static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
+
+    ggml_prec prec = prec_env;
+    if (prec == GGML_PREC_UNDEFINED) {
+        prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
+    }
+
+    // Q4 only for the FP4 types on Blackwell
+    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
+    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
+    if (prec == GGML_PREC_Q8 || !can_use_q4) {
+        return GGML_PREC_Q8;
+    }
+    return GGML_PREC_Q4;
 }
 
 static void ggml_cuda_mul_mat_q_impl(

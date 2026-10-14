@@ -1877,9 +1877,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    // With the n-gram table left on disk, a populated mapping would pull the table's
-    // third of the file resident for nothing; readahead alone carries the sequential load.
-    ml.init_mappings(!(params.ple_on_disk || params.lazy_mode == LLAMA_LAZY_MODE_DIRECT), use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // With the n-gram table read by explicit preads (--lazy-mode on-direct), a populated mapping would pull
+    // the table's third of the file resident for nothing; readahead alone carries the sequential load.
+    ml.init_mappings(params.lazy_mode != LLAMA_LAZY_MODE_DIRECT, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -3680,8 +3680,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_NANBEIGE:
         case LLM_ARCH_POCKETTTS:
-        // HY_V4 rotates consecutive pairs, matching the reference implementation
-        case LLM_ARCH_HY_V4:
             return LLAMA_ROPE_TYPE_NORM;
         case LLM_ARCH_BAILINGMOE3:
             // VL files carry mrope sections; text-only files keep NORM rope

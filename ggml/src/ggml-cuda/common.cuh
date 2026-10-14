@@ -1628,13 +1628,13 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
-    const ggml_tensor * shared_up = nullptr;
-    const ggml_tensor * shared_gate = nullptr;
-    ggml_tensor * shared_dst = nullptr;
     // RDNA3.5 fused-quantize matvec prologue (y_op == 3), see ggml_cuda_mm_fusion_args_device
     const ggml_tensor * y_gate = nullptr;
     const ggml_tensor * y_norm_w = nullptr;
     float y_eps = 0.0f;
+    const ggml_tensor * shared_up = nullptr;
+    const ggml_tensor * shared_gate = nullptr;
+    ggml_tensor * shared_dst = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1644,14 +1644,14 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
-    const void * shared_up = nullptr;
-    const void * shared_gate = nullptr;
-    float * shared_dst = nullptr;
-    uint32_t shared_stride_col_dst = 0;
     // RDNA3.5 fused-quantize matvec prologue (y_op == 3): y' = sigmoid(y_gate) * (rms_norm_128(y) * y_norm_w)
     const void * y_gate = nullptr;
     const void * y_norm_w = nullptr;
     float y_eps = 0.0f;
+    const void * shared_up = nullptr;
+    const void * shared_gate = nullptr;
+    float * shared_dst = nullptr;
+    uint32_t shared_stride_col_dst = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {

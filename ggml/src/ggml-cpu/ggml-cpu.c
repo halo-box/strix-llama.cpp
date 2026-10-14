@@ -4,7 +4,6 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "traits.h"
-#include "iqp.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
@@ -1583,13 +1582,6 @@ UseGgmlGemm1:;
     }
 
     ggml_barrier(params->threadpool);
-
-    // IQ panel gemm (see iqp.h) - must come after the barrier above, it consumes the q8_K rows
-    // of src1 from the work buffer
-    if (ggml_cpu_iqp_supports_mul_mat(dst) && !params->use_ref) {
-        ggml_compute_forward_mul_mat_iqp(params, dst);
-        return;
-    }
 
 #if GGML_USE_LLAMAFILE
     if (!params->use_ref && src1->type != vec_dot_type) {

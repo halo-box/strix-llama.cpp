@@ -624,6 +624,18 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+// MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep
+// plus control and user-defined tokens. Immutable once built. Contexts that request the same n_keep share one.
+struct llama_mtp_draft_vocab {
+    int32_t n_keep = 0;
+
+    ggml_tensor * head = nullptr; // [n_embd, n_rows], same type as the LM head
+    ggml_tensor * ids  = nullptr; // [n_rows] I64, token id of each row
+
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+};
+
 struct llama_prec_policy {
     // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op (unused for now)
     // TODO: migrate ad-hoc ggml_prec_set_acc() calls to this container + update apply() to use it
@@ -673,18 +685,6 @@ struct llama_hadamard {
 
     llama_hadamard_rotations rot; // folded weight -> activation transform
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
-};
-
-// MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep
-// plus control and user-defined tokens. Immutable once built. Contexts that request the same n_keep share one.
-struct llama_mtp_draft_vocab {
-    int32_t n_keep = 0;
-
-    ggml_tensor * head = nullptr; // [n_embd, n_rows], same type as the LM head
-    ggml_tensor * ids  = nullptr; // [n_rows] I64, token id of each row
-
-    ggml_context_ptr        ctx;
-    ggml_backend_buffer_ptr buf;
 };
 
 struct llama_model {

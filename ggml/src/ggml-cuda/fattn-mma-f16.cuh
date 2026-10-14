@@ -2,7 +2,6 @@
 #include "cp-async.cuh"
 #include "mma.cuh"
 #include "fattn-common.cuh"
-#include "fattn-swizzle.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -161,7 +160,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 256, 2,  64, 128, 128,  64, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  32, 128,  64,  64, 1, false);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
@@ -1247,8 +1246,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int stride_tile_K = swz ? nbatch_K2 : nbatch_K2 + 4;
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
     constexpr int stride_tile_KV_max = stride_tile_K > stride_tile_V ? stride_tile_K : stride_tile_V;
-    constexpr bool swz_K = ggml_cuda_fattn_smem_swizzle::enabled(nbatch_K2);
-    constexpr bool swz_V = V_is_K_view ? swz_K : ggml_cuda_fattn_smem_swizzle::enabled(nbatch_V2);
 
     extern __shared__ half2 tile_Q[];
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
@@ -1509,8 +1506,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     constexpr int tile_stride = nbatch_combine + 4;
     static_assert((DV/2) % nbatch_combine == 0, "bad nbatch_combine");
-
-    constexpr bool combine_needs_sync = swz_K || swz_V;
 
     if constexpr (cols_per_warp == 8) {
         const int jc_cwmo = (threadIdx.x % (2*T_C_VKQ::J)) / T_C_VKQ::J; // jc combine write meta offset
@@ -1777,7 +1772,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        if (np > 1 || nbatch_combine != DKQ/2) {
+        // Warps read columns of tile_Q that were written by other warps, so a barrier is needed before tile_Q is
+        // reused: by the next nbatch_combine batch (DV/2 > nbatch_combine) or by the Q load of the next tile.
+        if (np > 1 || DV/2 > nbatch_combine) {
             __syncthreads();
         }
     }
@@ -1864,7 +1861,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 256) {
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 256 || (DKQ > 128 && DKQ != 256)) {
         NO_DEVICE_CODE;
         return;
     }

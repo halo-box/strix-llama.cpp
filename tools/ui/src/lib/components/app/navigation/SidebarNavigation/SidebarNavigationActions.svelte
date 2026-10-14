@@ -153,23 +153,7 @@
 			{@const isActive = isItemActive(item)}
 			{@const isSearchOnMobile = item.icon === Search && deviceStore.isMobile}
 			{@const itemHref = item.externalHref ?? (isSearchOnMobile ? ROUTES.SEARCH : item.route)}
-			{@const itemOnClick = item.externalHref
-				? undefined
-				: item.action === SidebarAction.NEW_CHAT
-					? () => {
-							onNewChat?.();
-							void conversationsStore.openNewChat();
-						}
-					: item.action === SidebarAction.SETTINGS
-						? () => onSettingsClick?.()
-						: item.route
-							? () => {
-									onNewChat?.();
-									goto(item.route!);
-								}
-							: isSearchOnMobile
-								? undefined
-								: onSearchClick}
+			{@const itemOnClick = item.externalHref ? undefined : itemClickHandler(item, isSearchOnMobile)}
 			{@const itemTransition = {
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 				duration: ICON_STRIP_TRANSITION_DURATION,
@@ -215,23 +199,7 @@
 		{#each actions as item, i (item.tooltip)}
 			{@const isActive = isItemActive(item)}
 			{@const isSearchOnMobile = item.icon === Search && deviceStore.isMobile}
-			{@const itemOnClick = item.externalHref
-				? undefined
-				: item.action === SidebarAction.NEW_CHAT
-					? () => {
-							onNewChat?.();
-							void conversationsStore.openNewChat();
-						}
-					: item.action === SidebarAction.SETTINGS
-						? () => onSettingsClick?.()
-						: item.route
-							? () => {
-									onNewChat?.();
-									goto(item.route!);
-								}
-							: isSearchOnMobile
-								? undefined
-								: onSearchClick}
+			{@const itemOnClick = item.externalHref ? undefined : itemClickHandler(item, isSearchOnMobile)}
 			{@const itemTransition = {
 				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 				duration: ICON_STRIP_TRANSITION_DURATION,

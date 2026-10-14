@@ -97,13 +97,12 @@ struct buffer_view {
     }
 };
 
-void llama_clear_tensor_data(ggml_tensor * t, size_t offset, size_t size);
-
 // see docs/development/backend-scheduler.md
 static inline void llama_host_write(struct ggml_tensor * t) {
     GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
     ggml_backend_tensor_set_direct(t, 0, ggml_nbytes(t));
 }
+void llama_clear_tensor_data(ggml_tensor * t, size_t offset, size_t size);
 
 void replace_all(std::string & s, const std::string & search, const std::string & replace);
 

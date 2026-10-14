@@ -9614,7 +9614,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                                 k->type == v->type &&
                                 neq1 >= Q_TILE_SZ &&
                                 (!dst->src[5] || dst->src[3]));
-#ifdef GGML_SIMD
+#if defined(GGML_SIMD) && !defined(__x86_64__) && !defined(_M_X64)
 #if defined(__ARM_FEATURE_SVE)
         const int64_t f32_epr = svcntw();
 #else

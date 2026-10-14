@@ -372,62 +372,62 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
 #endif
 #elif defined(DATA_A_ROCMFP4) || defined(DATA_A_ROCMFP4_FAST)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
-            const uint ib = idx / 8;
-            const uint iqs = (idx & 0x07) * 2;
+    const uint ib = idx / 8;
+    const uint iqs = (idx & 0x07) * 2;
 
-            const uint vui  = uint(data_a[ib].qs[iqs]);
-            const uint vui2 = uint(data_a[ib].qs[iqs+1]);
+    const uint vui  = uint(data_a[ib].qs[iqs]);
+    const uint vui2 = uint(data_a[ib].qs[iqs+1]);
 
-            // low nibbles hold the first half of the block (scale e[0]),
-            // high nibbles the second half (scale e[1])
+    // low nibbles hold the first half of the block (scale e[0]),
+    // high nibbles the second half (scale e[1])
 #if defined(DATA_A_ROCMFP4)
-            const float d0 = ue4m3_to_fp32(data_a[ib].e[0]);
-            const float d1 = ue4m3_to_fp32(data_a[ib].e[1]);
+    const float d0 = ue4m3_to_fp32(data_a[ib].e[0]);
+    const float d1 = ue4m3_to_fp32(data_a[ib].e[1]);
 #else
-            const float d0 = ue4m3_to_fp32(data_a[ib].e);
-            const float d1 = d0;
+    const float d0 = ue4m3_to_fp32(data_a[ib].e);
+    const float d1 = d0;
 #endif
-            store_a(col, row,     FLOAT_TYPEV2(float(kvalues_rocmfp4[vui  & 0xF]) * d0,
-                                               float(kvalues_rocmfp4[vui2 & 0xF]) * d0));
-            store_a(col, row + 8, FLOAT_TYPEV2(float(kvalues_rocmfp4[vui  >>  4]) * d1,
-                                               float(kvalues_rocmfp4[vui2 >>  4]) * d1));
+    store_a(col, row,     FLOAT_TYPEV2(float(kvalues_rocmfp4[vui  & 0xF]) * d0,
+                                       float(kvalues_rocmfp4[vui2 & 0xF]) * d0));
+    store_a(col, row + 8, FLOAT_TYPEV2(float(kvalues_rocmfp4[vui  >>  4]) * d1,
+                                       float(kvalues_rocmfp4[vui2 >>  4]) * d1));
 #elif defined(DATA_A_ROCMFPX_FP3)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
-            const uint ib = idx / 8;
-            const uint iqs = (idx & 0x07) * 4;
-            const vec4 v = rocmfpx_mm_fp3_vec4(ib, iqs);
+    const uint ib = idx / 8;
+    const uint iqs = (idx & 0x07) * 4;
+    const vec4 v = rocmfpx_mm_fp3_vec4(ib, iqs);
 
-            const uint k_pair = row * LOAD_VEC_A / 2;
-            store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
-            store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+    const uint k_pair = row * LOAD_VEC_A / 2;
+    store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
+    store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
 #elif defined(DATA_A_ROCMFPX_FP6)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
-            const uint ib = idx / 8;
-            const uint iqs = (idx & 0x07) * 4;
-            const vec4 v = rocmfpx_mm_fp6_vec4(ib, iqs);
+    const uint ib = idx / 8;
+    const uint iqs = (idx & 0x07) * 4;
+    const vec4 v = rocmfpx_mm_fp6_vec4(ib, iqs);
 
-            const uint k_pair = row * LOAD_VEC_A / 2;
-            store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
-            store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+    const uint k_pair = row * LOAD_VEC_A / 2;
+    store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
+    store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
 #elif defined(DATA_A_ROCMFPX_FP8)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+    const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
-            const uint ib = idx / 8;
-            const uint iqs = (idx & 0x07) * 4;
+    const uint ib = idx / 8;
+    const uint iqs = (idx & 0x07) * 4;
 
-            const float d = ue4m3_to_fp32(data_a[ib].e);
-            const vec4 v = vec4(float(data_a[ib].qs[iqs + 0u]),
-                                float(data_a[ib].qs[iqs + 1u]),
-                                float(data_a[ib].qs[iqs + 2u]),
-                                float(data_a[ib].qs[iqs + 3u])) * d;
+    const float d = ue4m3_to_fp32(data_a[ib].e);
+    const vec4 v = vec4(float(data_a[ib].qs[iqs + 0u]),
+                        float(data_a[ib].qs[iqs + 1u]),
+                        float(data_a[ib].qs[iqs + 2u]),
+                        float(data_a[ib].qs[iqs + 3u])) * d;
 
-            const uint k_pair = row * LOAD_VEC_A / 2;
-            store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
-            store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
+    const uint k_pair = row * LOAD_VEC_A / 2;
+    store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
+    store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
 #elif defined(DATA_A_NVFP4)
     const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
     const uint eff_row = (row & 3) + (row & ~3) * 2;

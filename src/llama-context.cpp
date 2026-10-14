@@ -334,6 +334,13 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+    // LLAMA_FUSED_DSV4_HC_PRE=0 / LLAMA_FUSED_DSV4_HC_POST=0 keep the unfused hyper-connection graph
+    if (const char * env = getenv("LLAMA_FUSED_DSV4_HC_PRE")) {
+        cparams.fused_dsv4_hc_pre = atoi(env) != 0;
+    }
+    if (const char * env = getenv("LLAMA_FUSED_DSV4_HC_POST")) {
+        cparams.fused_dsv4_hc_post = atoi(env) != 0;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -570,16 +577,16 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
-        }
-
         // the draft vocabulary subset belongs to this context; contexts that ask for the same N share one copy
         if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.mtp_draft_vocab > 0) {
             mtp_draft = model.mtp_draft_vocab_get(params.mtp_draft_vocab);
             if (mtp_draft) {
                 cparams.mtp_draft_vocab = mtp_draft->n_keep;
             }
+        }
+
+        if (cparams.moe_cache_size > 0) {
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
         sched_reserve();
@@ -1563,6 +1570,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     static const bool graph_timing = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")) != 0;
     int64_t t_build = 0, t_alloc = 0, t_inputs = 0;
     bool reused = false;
+
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         reused = true;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1571,10 +1579,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        gf_res_prev_active = nullptr;
         // The previous asynchronous graph may still use allocations that reset releases.
         ggml_backend_sched_synchronize(sched.get());
-
+        gf_res_prev_active = nullptr;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1937,8 +1944,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
         // posix_fadvise only, so a wrong prediction costs readahead and nothing else
         extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
-        if (model.arch == LLM_ARCH_QWEN4EXP && batch_inp.token && batch_inp.n_tokens >= 4096) {
-            qwen4exp_ple_prefetch(model, batch_inp.token, batch_inp.n_tokens);
+        const llama_batch & batch = balloc->get_batch();
+        if (model.arch == LLM_ARCH_QWEN4EXP && batch.token && batch.n_tokens >= 4096) {
+            qwen4exp_ple_prefetch(model, batch.token, batch.n_tokens);
         }
     }
     const uint32_t n_outputs_all = balloc->get_n_outputs();

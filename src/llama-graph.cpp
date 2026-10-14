@@ -2948,7 +2948,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (top_k) {
             ggml_flash_attn_ext_add_top_k(cur, top_k, n_kv_raw);
         }
-        ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         if (v_mla) {
 #if 0
@@ -3056,7 +3056,7 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         inp->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
         ggml_set_input(inp->self_kq_mask_swa);
-        cb(inp->self_kq_mask_swa, "attn_inp_kq_mask_swa", -1);
+        cb(inp->self_kq_mask_swa, "self_kq_mask_swa", -1);
 
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
     } else {
@@ -3830,13 +3830,20 @@ ggml_tensor * llm_graph_context::build_rs(
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
-    // {state_size, rs_size} -> {state_size, n_seqs}
+    // one gather of the states i0..n_rs (ubatch states then extra states), sized by n_rs so the reserve covers every split
+    // {state_size, rs_size} -> {state_size, n_rs - i0}
+    const int64_t i0 = n_rs - state_copy->ne[0];
+
+    ggml_tensor * states_all = ggml_get_rows(ctx0, states, state_copy);
+
     ggml_tensor * output_states;
     if (main_inplace) {
         // rows are already in place; not expanded here, so the view stays next to its consumer
         output_states = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]);
     } else {
-        output_states = get_state_rows(ctx0, states, state_copy_main);
+        output_states = get_state_rows ?
+            get_state_rows(ctx0, states, state_copy_main) :
+            ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
         ggml_build_forward_expand(gf, output_states);
     }
 
@@ -3893,7 +3900,11 @@ ggml_tensor * llm_graph_context::build_rs(
 
     const bool main_inplace = allow_inplace && inp->s_copy_main_identity;
 
-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+    // a custom getter (or the in-place read) takes the states of the ubatch straight from the cache, so the gather
+    // skips the first state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
+    ggml_tensor * state_copy = get_state_rows || main_inplace ? inp->s_copy_tail : inp->s_copy;
+
+    return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows, main_inplace);
 }

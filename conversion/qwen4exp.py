@@ -25,15 +25,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP head: one full-attention QSA block after the trunk, fed by the trunk's hc-wide residual
-    supports_mtp_export = True
-
-    # MTP tensors the shared Qwen remapper does not know
-    _MTP_EXTRA = {
-        "fc_embedding":           "nextn_fc_embedding",
-        "fc_hidden":              "nextn_fc_hidden",
-        "hyper_connection_mixer": "nextn_hc_head",
-    }
+    # the MTP block is a separate draft head; vLLM drops it too
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

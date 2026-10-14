@@ -2457,6 +2457,8 @@ struct llama_model_qwen35 : public llama_model_base {
 };
 
 
+struct llama_ple_disk;
+
 // Qwen3.5 backbone evaluated without memory, with a joint decision head on top of its hidden states
 struct llama_model_clef : public llama_model_qwen35 {
     llama_model_clef(const struct llama_model_params & params) : llama_model_qwen35(params) {}
@@ -2550,13 +2552,15 @@ struct llama_model_clef : public llama_model_qwen35 {
 };
 
 
-struct llama_ple_disk;
-
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_qsa;
+    class llm_graph_input_qsa_k;
 
+    // Set with --lazy-mode on-direct: per_layer_tok_embd is counted as created but never
+    // allocated, mapped or read, and build_ple takes its rows from this reader instead of ggml_get_rows.
+    std::shared_ptr<llama_ple_disk> ple_disk;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
@@ -2585,28 +2589,38 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
                             int   il);
 
-        // dense self-attention restricted to the cells that top_k names
+        // dense self-attention over the cells the QSA mask keeps
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * top_k,
+                    ggml_tensor * sel,
+                        int64_t   n_sel,
                           float   kq_scale,
                             int   il);
 
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        llm_graph_input_qsa_k * qsa_k_inp = nullptr;
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
-        ggml_tensor * build_qsa_top_k(
+        // QSA: store this ubatch's raw indexer keys in the indexer cache (no selection)
+        void build_qsa_store_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
+                    ggml_tensor * cur,
+                            int   il);
+
+        // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
+        ggml_tensor * build_qsa_sel(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,

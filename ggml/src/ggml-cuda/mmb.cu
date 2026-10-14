@@ -1041,7 +1041,7 @@ void ggml_cuda_mmb_release_all(ggml_backend_cuda_context & ctx) {
 }
 // A producer writes the BF16 copy of t itself: the entry is found by the MMB GEMM that reads t next.
 uint16_t * ggml_cuda_mmb_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
-    if (!mmb_enabled()) return nullptr;
+    if (!mmb_enabled(ctx)) return nullptr;
     return mmb_cache_insert(ctx, t, n);
 }
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
@@ -1282,11 +1282,11 @@ bool ggml_cuda_hc_gate_mix_supported(ggml_backend_cuda_context & ctx, const ggml
     if (!mmb_gatemix_flag() || hc != 4 || !mmb_quant_type_dense(w->type) || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     if (K % ggml_blck_size(w->type) != 0) return false;
-    return !(K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t());
+    return !(K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t(ctx));
 }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
         const int hc, const float scale, const float bias) {
-    if (!ggml_cuda_hc_gate_mix_supported(w, lo, xn, dst, hc)) return false;
+    if (!ggml_cuda_hc_gate_mix_supported(ctx, w, lo, xn, dst, hc)) return false;
     const int K = (int) w->ne[0], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
     const uint16_t * xn16 = ggml_cuda_mmb_cache_lookup(ctx, xn);
     if (!xn16) return false;

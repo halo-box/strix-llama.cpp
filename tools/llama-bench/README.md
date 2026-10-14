@@ -71,8 +71,6 @@ test parameters:
                                             (default: auto)
   -lzm, --lazy-mode <on|auto|off>           (default: auto)
   --ple <file|none>                         GGUF with PLE tables to use instead of the model's (default: none)
-  -mmp, --mmap <0|1>                        (DEPRECATED IN FAVOUR OF --load-mode)
-  -dio, --direct-io <0|1>                   (DEPRECATED IN FAVOUR OF --load-mode)
   -embd, --embeddings <0|1>                 (default: 0)
   -ts, --tensor-split <ts0/ts1/..>          (default: 0)
   -ot --override-tensor <tensor name pattern>=<buffer type>;...

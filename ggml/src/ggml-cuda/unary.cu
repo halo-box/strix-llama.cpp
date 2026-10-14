@@ -318,10 +318,10 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
 
     ggml_cuda_pdl_sync();
-    const T v = (T)(op((float)x[j0]) * (float)g[j1]);
+    const T v = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[j0])) * ggml_cuda_cast<float>(g[j1]));
     dst[i] = v;
     if (dst16) {
-        dst16[i] = ggml_cuda_f32_to_bf16_rne((float) v);
+        dst16[i] = ggml_cuda_f32_to_bf16_rne(ggml_cuda_cast<float>(v));
     }
 }
 

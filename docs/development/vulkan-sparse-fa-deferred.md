@@ -67,6 +67,30 @@ Baseline, measured on a Radeon 8060S (RADV STRIX_HALO) at `dffbb7888`: FLASH_ATT
 
 ---
 
+## 2026-09-29 sync: what changed in this directory
+
+This sync did not revert `ggml/src/ggml-vulkan/` wholesale. Each side was measured on a Radeon 8060S
+(RADV Mesa 26.0.8), and the faster side was kept per area:
+
+- Matrix multiplication is upstream's (#25773 tile map, #27471, #27952 int8 coopmat1, #28415 IQ4_XS,
+  #28822 IQ3_S, #25483). Strix's legacy pipeline arrays and its env-gated mul_mat_id experiments
+  (`GGML_VK_MMID_*`, `GGML_VK_DENSE_F16B`, `GGML_VK_MMID_SCALE_EPILOGUE`) are gone. test-backend-ops perf, same
+  session: MUL_MAT geomean 1.10x, MUL_MAT_ID geomean 1.14x in upstream's favour. Strix was faster only for f16
+  expert weights at n=128-256 and for iq3_xxs MoE; these are not ported yet.
+- ROCmFPx takes upstream's per-type (LUT) matmul path and the q8_1 MMQ list.
+- Everything else keeps the strix kernels: flash attention (dynamic KV, dequant-once, contiguize, gather/union,
+  DeepSeek V4 sparse), transposed CONCAT, lightning indexer, mat-vec column chunking, submit bounding. Per-op
+  timings at pp2048 showed upstream CONCAT 12-25x slower on the delta-net models, and FA/SSM_CONV/GDN 2-3x
+  slower on Signal-3.8-27B.
+- The DeepSeek V4 hyper-connection ops are upstream's. The merged qwen4exp graph emits the gated and identity
+  forms, which the strix kernels could not run.
+- `f1e44dcc1` (NV queue-submit workaround) is back. It is inert on RADV.
+
+Upstream sparse Flash Attention (#28105) is still deferred for the reasons above. `USE_SPARSE` / bit 16 is
+not reintroduced, and `flash_attn_sparse_compact.comp` stays deleted.
+
+---
+
 ## Provenance
 
 | Ref | What |
@@ -75,6 +99,7 @@ Baseline, measured on a Radeon 8060S (RADV STRIX_HALO) at `dffbb7888`: FLASH_ATT
 | `f1e44dcc1` | upstream NV queuesubmit workaround (ggml-org#28830) — deferred |
 | `dced43c58` | the sync merge (PR #64) |
 | `82aed6017` | #63 merged into that sync |
+| `sync/halo-master-2026-09-29` | the 2026-09-29 sync (this section) |
 
 The PLE n-gram table's disk reader survived the sync as the backend of
 `--lazy-mode on-direct`; see PR #64's description for what changed and what was dropped

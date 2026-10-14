@@ -2736,7 +2736,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
-        "- on-direct: like on, but the arch reads the rows with explicit pread()s instead of demand paging the mmap (currently only PLE tables; same reader as --ngram-on-disk, page-cached)\n"
+        "- on-direct: like on, but the arch reads the rows with explicit pread()s instead of demand paging the mmap (currently only PLE tables, page-cached)\n"
         "- auto: on, but only for tensors larger than 4 GiB\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
@@ -4345,6 +4345,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.n_rs_seq_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_N_RS_SEQ"));
+    add_opt(common_arg(
+        {"--spec-draft-n-ubatch"}, "N",
+        string_format("physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: %d - same as --n-ubatch)", params.speculative.draft.n_ubatch),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
     add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",

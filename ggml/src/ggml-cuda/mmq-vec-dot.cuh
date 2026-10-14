@@ -151,6 +151,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback, GGML_PREC_Q8);
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback, GGML_PREC_Q8);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    constexpr int I             = ggml_cuda_mmq_get_I(type, J, fallback);
     constexpr int nwarps        = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
     constexpr bool split_j      = type == GGML_TYPE_Q8_0 && J == 128 && !fallback && I == 64 && nwarps == 8;
     constexpr int j_group       = split_j ? J/2 : J;

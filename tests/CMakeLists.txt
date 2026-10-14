@@ -166,6 +166,13 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+llama_build_and_test(test-qsa-prefix.cpp)
+llama_build_and_test(test-qsa-fast.cpp)
+llama_build_and_test(test-qsa-recover.cpp)
+llama_build_and_test(test-ple-disk.cpp)
+llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
+llama_build(test-save-load-state.cpp)
 # llama_context state tests: KV and recurrent state save, load, copy, rollback
 set(LLAMA_CONTEXT_TEST_SRC
     test-llama-context.cpp
@@ -177,13 +184,6 @@ set(LLAMA_CONTEXT_TEST_SRC
     llama-context/test-util.cpp
 )
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
-llama_build_and_test(test-qsa-prefix.cpp)
-llama_build_and_test(test-qsa-fast.cpp)
-llama_build_and_test(test-qsa-recover.cpp)
-llama_build_and_test(test-ple-disk.cpp)
-llama_build(test-recurrent-state-rollback.cpp)
-llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
-llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -250,12 +250,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(
         test-llama-context
         LABEL main
-        ARGS --models "${MODEL_DIR}"
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
-    # abort on graph reallocations that the initial reserve should have covered
-    set_tests_properties(test-llama-context PROPERTIES
+    set_tests_properties(test-recurrent-state-rollback PROPERTIES
         FIXTURES_REQUIRED generate-models
-        ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
     )
 
     llama_test(
@@ -294,14 +292,22 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-qwen35moe PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
-
-    # Test state save/load functionality across all architectures, using the generated dummy models
+    # non-unified multi-seq decodes reach the QSA path with one stream per ubatch (#73)
     llama_test(
-        test-save-load-state
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-qwen4exp
         LABEL main
-        ARGS --models "${MODEL_DIR}"
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
     )
-    set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-recurrent-state-rollback-qwen4exp PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    # abort on graph reallocations that the initial reserve should have covered
+    set_tests_properties(test-llama-context PROPERTIES
+        FIXTURES_REQUIRED generate-models
+        ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+    )
+
     llama_build(test-fusion.cpp)
 endif()
 
@@ -366,7 +372,6 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
-llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 # the tensor API kernels come from a separate metallib - check they produce correct results
 # ref: https://github.com/ggml-org/llama.cpp/issues/27473
 if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)
@@ -375,6 +380,7 @@ if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)
     set_tests_properties(test-backend-ops-metallib-tensor PROPERTIES ENVIRONMENT GGML_METAL_TENSOR_ENABLE=1)
 endif()
 
+llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
@@ -385,9 +391,9 @@ endif()
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
-    llama_build_and_test(test-barrier.cpp)
-    llama_build_and_test(test-quantize-fns.cpp)
-    llama_build_and_test(test-quantize-perf.cpp)
+    llama_build_and_test(test-barrier.cpp LINK ggml)
+    llama_build_and_test(test-quantize-fns.cpp LINK ggml)
+    llama_build_and_test(test-quantize-perf.cpp LINK ggml)
 
     # ROCmFPx codec self-tests, kept next to the codecs under ggml/rocmfpx.
     # test-rocmfpx exercises the ROCmFP3/6/8 codecs; test-rocmfp2-reference
@@ -406,8 +412,9 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
                          ${PROJECT_SOURCE_DIR}/ggml/rocmfpx/rocmfp2_reference.c
                          NAME test-rocmfp2-reference)
     target_include_directories(test-rocmfp2-reference PRIVATE ${PROJECT_SOURCE_DIR}/ggml/rocmfpx)
-    llama_build_and_test(test-rope.cpp)
-    llama_build_and_test(test-col2im-1d.cpp)
+    llama_build_and_test(test-rope.cpp LINK ggml)
+    llama_build_and_test(test-col2im-1d.cpp LINK ggml)
+    llama_build_and_test(test-conv-1d.cpp LINK ggml)
 endif()
 
 # libmtmd

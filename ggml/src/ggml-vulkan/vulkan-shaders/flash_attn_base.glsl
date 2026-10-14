@@ -24,8 +24,6 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;
 const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
 const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
-// Sparse: gather binding-7 indices instead of scanning [0,KV); p.split_kv = n_kv_max.
-const bool USE_SPARSE      = (Flags & 16) != 0;
 // KV comes from a buffer instead of the push constant. Used by paths that compact K/V on the
 // GPU, where the row count is only known after a dedup pass and so cannot be pushed. The
 // workgroup counts derive from neq1/neq2/neq3 and never from KV, so no indirect dispatch is
@@ -97,10 +95,6 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 layout (binding = 7) readonly buffer KVB {uint32_t data_kv_dyn[];};
 
-layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
-
-layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
-
 #define MASK_OPT_ALL_NEG_INF 1
 // a mask value at or below this (f16 -inf, or the lowest finite f16 some mask writers use for it) hides the key
 #define FA_MASK_DEAD (-65504.0)
@@ -126,8 +120,8 @@ layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
 #define BLOCK_SIZE_V fa_block_elems(FaTypeV)
 // F16 reads f16 elements directly from the binding; everything else routes
 // through dequantize4 / the MMQ helpers to unpack from the packed block layout.
-#define USE_DECODE_K (FaTypeK != GGML_TYPE_F16)
-#define USE_DECODE_V (FaTypeV != GGML_TYPE_F16)
+#define USE_DECODE_K (FaTypeK != FA_TYPE_F16)
+#define USE_DECODE_V (FaTypeV != FA_TYPE_F16)
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
