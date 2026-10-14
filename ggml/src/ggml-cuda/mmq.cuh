@@ -316,7 +316,7 @@ static __host__ int ggml_cuda_mmq_get_I(const ggml_type type, const int J, const
     return ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).I;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_I(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
+static constexpr __device__ int ggml_cuda_mmq_get_I(ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).I;
 }
 
@@ -324,7 +324,7 @@ static __host__ int ggml_cuda_mmq_get_J(const ggml_type type, const int J, const
     return ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).J;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_J(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
+static constexpr __device__ int ggml_cuda_mmq_get_J(ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).J;
 }
 
@@ -340,7 +340,7 @@ static __host__ int ggml_cuda_mmq_get_K_vram(const ggml_type type, const int J, 
     return ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1).K_vram;
 }
 
-static constexpr __device__ int ggml_cuda_mmq_get_K_vram(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
+static constexpr __device__ int ggml_cuda_mmq_get_K_vram(ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).K_vram;
 }
 
@@ -686,7 +686,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     VDR_ROCMFP4_FAST_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_q4_0_rocmfp4_fast<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             default:
                 return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);
         }
@@ -862,7 +862,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 -1,
                 ggml_cuda_mmq_load_tiles_q4_0_rocmfp4_fast<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1>);
         default:
             return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);
     }

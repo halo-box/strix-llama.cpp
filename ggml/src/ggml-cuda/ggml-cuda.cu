@@ -146,6 +146,20 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+static bool ggml_cuda_env_set(const char * name) {
+    return getenv(name) != nullptr;
+}
+
+static int ggml_cuda_env_int(const char * name, int default_value) {
+    const char * env = getenv(name);
+    return env != nullptr ? std::atoi(env) : default_value;
+}
+
+static bool ggml_cuda_env_flag(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr && std::atoi(env) != 0;
+}
+
 static int ggml_cuda_op_offload_min_batch() {
     static const int min_batch = ggml_cuda_env_int("GGML_OP_OFFLOAD_MIN_BATCH", 32);
     return min_batch;
@@ -176,19 +190,6 @@ static bool ggml_cuda_unified_memory_enabled() {
     return enabled;
 }
 
-static bool ggml_cuda_env_set(const char * name) {
-    return getenv(name) != nullptr;
-}
-
-static int ggml_cuda_env_int(const char * name, int default_value) {
-    const char * env = getenv(name);
-    return env != nullptr ? std::atoi(env) : default_value;
-}
-
-static bool ggml_cuda_env_flag(const char * name) {
-    const char * env = getenv(name);
-    return env != nullptr && std::atoi(env) != 0;
-}
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
@@ -2028,7 +2029,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ne11 > 3 && ne11 <= 8 && GGML_CUDA_CC_IS_AMD(cc) && !ggml_is_quantized(src0->type) &&
             src0->ne[1] <= 64 &&
             src0->ne[1] % (GGML_CUDA_CC_IS_CDNA(cc) ? MMF_ROWS_PER_BLOCK_CDNA : MMF_ROWS_PER_BLOCK) != 0 &&
-            ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, 3)) {
+            ggml_cuda_should_use_mmvf(src0->type, cc, ggml_cuda_info().devices[ctx.device].warp_size, src0->ne, src0->nb, 3)) {
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -5126,8 +5127,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return count - 1;
         }
     }
-
-
 
     // RDNA3.5 decode: consecutive single-column MUL_MATs that read the same activation vector (plain Q8_0/F32
     // matvecs, or a [mul_mat, mul_mat, glu] gate/up pair) are launched as one grouped kernel. The segments are

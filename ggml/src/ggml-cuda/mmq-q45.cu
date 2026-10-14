@@ -5,5 +5,5 @@
 #undef mul_mat_q
 
 void launch_mul_mat_q_q5_k_j32(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    launch_mul_mat_q_q45<GGML_TYPE_Q5_K, 32, false>(ctx, args, stream);
+    launch_mul_mat_q_q45<GGML_TYPE_Q5_K, 32, false, GGML_PREC_Q8>(ctx, args, stream);
 }
