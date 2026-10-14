@@ -6,6 +6,23 @@
 
 #include <algorithm>
 #include <cinttypes>
+// bad metadata must be catchable: GGML_ASSERT aborts the whole process
+static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
+    if (value == 0) {
+        throw std::runtime_error(format("%s must be greater than zero, got %u", ml.llm_kv(kid).c_str(), value));
+    }
+}
+
+// get_arr() copies a short array as-is, leaving a zero tail the n-gram hash silently drops
+static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32_t n_min) {
+    uint32_t n_arr = 0;
+    ml.get_arr_n(kid, n_arr, true);
+    if (n_arr < n_min) {
+        throw std::runtime_error(format("%s has %u entries, but at least %u are required",
+                                        ml.llm_kv(kid).c_str(), n_arr, n_min));
+    }
+}
+
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -155,6 +172,13 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // the PLE conv history is a row of the recurrent cache, which linear layers alone have
+    for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
+        if (hparams.is_ple(i) && !hparams.is_recr(i)) {
+            throw std::runtime_error(format("PLE layer %u is not a linear attention layer", i));
+        }
+    }
+
     switch (hparams.n_layer()) {
         case 48: type = LLM_TYPE_A3B; break;
         default: type = LLM_TYPE_UNKNOWN;
@@ -207,8 +231,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             dp.cache_bytes = params.ple_cache_mb > 0 ? (size_t) params.ple_cache_mb << 20 : 0;
             dp.direct_io   = params.ple_direct_io;
 
-            ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w.idx), ple_w.offs,
-                                                        ple_w.tensor->type, ple_w.tensor->ne[0], ple_rows, dp);
+            ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
+                                                        ple_w->tensor->type, ple_w->tensor->ne[0], ple_rows, dp);
             LLAMA_LOG_INFO("%s: PLE n-gram table stays on disk: %s\n", __func__, ple_disk->describe().c_str());
 
             per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
@@ -781,7 +805,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
     // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
