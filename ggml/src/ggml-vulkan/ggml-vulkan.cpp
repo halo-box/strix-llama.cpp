@@ -8868,6 +8868,14 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
         pc, { hc * nt, 1, 1 });
 }
 
+// GGML_VK_UNARY_MUL_KEEP (default 1): graph_optimize does not hoist a UNARY away from the MUL right behind it that consumes it,
+// when the pair can fuse. The gate SIGMOID of a gated attention (qwen4exp, qwen35) reads only the Q projection, so the first
+// pass otherwise pulls it up into the attention's set and its MUL, which waits on the attention output, runs alone
+static bool ggml_vk_unary_mul_keep_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_UNARY_MUL_KEEP"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -19588,7 +19596,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rope_view_set_rows_pattern, j) ||
                 match_pattern(hc_post_gate_pattern, j) ||
                 !gated_norm_order(j).empty() ||
-                is_mm_cpy16(j)) {
+                is_mm_cpy16(j) ||
+                (ggml_vk_unary_mul_keep_enabled() && graph->nodes[j]->op == GGML_OP_UNARY && j + 1 < graph->n_nodes &&
+                 graph->nodes[j + 1]->op == GGML_OP_MUL && !used[j + 1] && ggml_vk_can_fuse_unary_mul(graph, j, j + 1))) {
                 continue;
             }
             bool ok = true;

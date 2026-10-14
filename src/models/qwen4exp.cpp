@@ -595,6 +595,60 @@ static bool qwen4exp_has_bf16_matmul_weight(const llama_model & model) {
     return m.bf16_mm;
 }
 
+bool llama_model_qwen4exp::wq_deinterleaved() const {
+    std::lock_guard<std::mutex> lock(wq_deint_mutex);
+    if (wq_deint_state >= 0) {
+        return wq_deint_state == 1;
+    }
+    static const bool on = [] { const char * e = getenv("LLAMA_WQ_DEINTERLEAVE"); return e == nullptr || atoi(e) != 0; }();
+    if (!on) {
+        wq_deint_state = 0;
+        return false;
+    }
+    std::vector<std::pair<ggml_tensor *, int64_t>> ws;   // wq, head dim
+    for (size_t il = 0; il < layers.size(); ++il) {
+        ggml_tensor * w = layers[il].wq;
+        if (w == nullptr) {
+            continue;
+        }
+        const int64_t d = hparams.n_embd_head_k(il);
+        // [n_embd, 2 * d * n_head] in the file's per-head [q | gate] order; anything else stays as it is
+        if (w->ne[1] % (2 * d) != 0 || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w)) {
+            wq_deint_state = 0;
+            return false;
+        }
+        if (w->data == nullptr) {
+            return false;   // not loaded yet (the -fit probe): decide on a later graph
+        }
+        // in place on a device buffer only: a host buffer may be the mmap of the model file
+        if (w->buffer == nullptr || ggml_backend_buffer_is_host(w->buffer)) {
+            wq_deint_state = 0;
+            return false;
+        }
+        ws.push_back({ w, d });
+    }
+    if (ws.empty()) {
+        wq_deint_state = 0;
+        return false;
+    }
+    std::vector<uint8_t> src, dst;
+    for (const auto & [w, d] : ws) {
+        const size_t  row     = w->nb[1];
+        const int64_t n_head  = w->ne[1] / (2 * d);
+        src.resize(ggml_nbytes(w));
+        dst.resize(src.size());
+        ggml_backend_tensor_get(w, src.data(), 0, src.size());
+        for (int64_t h = 0; h < n_head; ++h) {
+            memcpy(dst.data() + (size_t) (h * d) * row,            src.data() + (size_t) (2 * h * d) * row,     (size_t) d * row);   // q rows
+            memcpy(dst.data() + (size_t) ((n_head + h) * d) * row, src.data() + (size_t) ((2 * h + 1) * d) * row, (size_t) d * row);   // gate rows
+        }
+        ggml_backend_tensor_set(w, dst.data(), 0, dst.size());
+    }
+    LLAMA_LOG_INFO("%s: wq de-interleaved to [q | gate] on %zu attention layers (LLAMA_WQ_DEINTERLEAVE)\n", __func__, ws.size());
+    wq_deint_state = 1;
+    return true;
+}
+
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
@@ -1585,13 +1639,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         }
     }
 
+    // C3: with the rows de-interleaved at load, Qcur_full is [q (n_head * d) | gate (n_head * d)] per token. A LoRA delta on wq is in
+    // the file's row order, so a de-interleaved wq cannot take one.
+    const bool wq_deint = static_cast<const llama_model_qwen4exp &>(model).wq_deinterleaved();
+    GGML_ASSERT((!wq_deint || loras->empty()) && "LLAMA_WQ_DEINTERLEAVE permuted wq: run with LLAMA_WQ_DEINTERLEAVE=0 to use a LoRA adapter");
+
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
 
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+    ggml_tensor * Qcur = wq_deint
+        ? ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head, Qcur_full->nb[1], 0)
+        : ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
     cb(Qcur, "Qcur_reshaped", il);
 
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
@@ -1607,11 +1669,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+    ggml_tensor * gate;
+    if (wq_deint) {
+        // the gate half of every token row, read in place: SIGMOID (and SIGMOID_MUL) take a row-strided view, no CONT
+        gate = ggml_view_2d(ctx0, Qcur_full, n_embd_head * n_head, n_tokens, Qcur_full->nb[1],
+            ggml_element_size(Qcur_full) * n_embd_head * n_head);
+    } else {
+        gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qcur_full) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+    }
     cb(gate, "gate_reshaped", il);
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
