@@ -432,7 +432,9 @@ model_id() {
 kld() {  # <be> <label> <model> <text> <args> <reference args>
     local be=$1 d=$OUT/$1/kld/$2 k=$OUT/$1/kld/$2.kld
     # an array: a model path with spaces stays one argument (<args> are options only, split on purpose)
-    local o=(-m "$3" -ngl "$(ngl $1)" -fa on -ctk f16 -ctv f16)
+    # --load-mode none as in bench(): with mmap a model of 80 GB is resident twice on a 128 GB UMA machine (page cache
+    # and GPU copy), and the long-context run is OOM-killed
+    local o=(-m "$3" -ngl "$(ngl $1)" -fa on -ctk f16 -ctv f16 --load-mode none)
     run "$d-base.txt" "$(bin base $be)/llama-perplexity" "${o[@]}" $5 -f "$4" --kl-divergence-base "$k"
     run "$d-cand.txt" "$(bin cand $be)/llama-perplexity" "${o[@]}" $5 --kl-divergence-base "$k" --kl-divergence
     # the reference (the baseline against itself, another ubatch) depends only on the baseline build, the model, the
