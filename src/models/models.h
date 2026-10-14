@@ -2581,6 +2581,13 @@ struct llama_model_qwen4exp : public llama_model_base {
     mutable std::vector<ggml_context *> bf16_twin_ctxs;
     mutable std::vector<ggml_backend_buffer_t> bf16_twin_bufs;
 
+    // C3 (wave 8): wq holds [q | gate] per head. LLAMA_WQ_DEINTERLEAVE (default on) permutes its rows once, in place on the
+    // weight's own (device) buffer, to [all q rows | all gate rows] on the first graph with loaded weights, so Qcur and the gate
+    // are plain views of Qcur_full and the gate needs no CONT. True when every attention wq has been permuted.
+    bool wq_deinterleaved() const;
+    mutable std::mutex wq_deint_mutex;
+    mutable int wq_deint_state = -1;   // -1 not decided yet, 0 off / not possible, 1 permuted
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
