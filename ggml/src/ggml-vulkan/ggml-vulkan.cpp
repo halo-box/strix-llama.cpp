@@ -8196,7 +8196,14 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
     uint32_t fusion_flags = 0;
 
     vk_subbuffer d_F0 = d_D;
-    if (ctx->num_additional_fused_ops > 0) {
+    float fuse_scale = 1.0f, fuse_bias = 0.0f;
+    if (ctx->num_additional_fused_ops > 0 && cgraph->nodes[node_idx + 1]->op == GGML_OP_SCALE) {
+        // MUL_MAT_VEC_SCALE: the SCALE's scale and bias, applied to the f32 result in the shader's store
+        GGML_ASSERT(ctx->num_additional_fused_ops == 1);
+        fuse_scale = ggml_get_op_params_f32(cgraph->nodes[node_idx + 1], 0);
+        fuse_bias  = ggml_get_op_params_f32(cgraph->nodes[node_idx + 1], 1);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE_PC;
+    } else if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
@@ -8224,6 +8231,7 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
             stride_batch_x, stride_batch_y, stride_batch_d,
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+            fuse_scale, fuse_bias,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                                   {
@@ -17764,6 +17772,28 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
         return true;
     }
 
+    // MUL_MAT_VEC_SCALE (GGML_VK_MMV_SCALE, default 1, read per graph): a one-column quantised mat-vec whose f32 result only feeds a
+    // SCALE; the shader applies the SCALE in its store. Only the f32 result: an f16 output would round before the scale
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_SCALE) {
+        const ggml_tensor *mul = cgraph->nodes[node_idx];
+        const ggml_tensor *sc  = cgraph->nodes[node_idx + 1];
+        const char * e = getenv("GGML_VK_MMV_SCALE");
+        if (e != nullptr && atoi(e) == 0) {
+            return false;
+        }
+        if (sc->src[0] != mul || ggml_nrows(mul) != 1 || !ggml_is_quantized(mul->src[0]->type) ||
+            mul->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(mul) || !ggml_is_contiguous(sc) || !ggml_are_same_shape(mul, sc) ||
+            (mul->src[1]->type != GGML_TYPE_F32 && mul->src[1]->type != GGML_TYPE_F16) ||
+            get_misalign_bytes(ctx, sc) != 0) {
+            return false;
+        }
+        // ggml_scale_bias with a bias: the SCALE kernel's x * s + b may contract to one fma, the epilogue rounds twice
+        if (ggml_get_op_params_f32(sc, 1) != 0.0f) {
+            return false;
+        }
+    }
+
     auto const &mmid_mul_ok = [&](const ggml_tensor *mmid, const ggml_tensor *mul) {
         const ggml_tensor *scale = mul->src[1];
 
@@ -19208,6 +19238,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SCALE })) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "MUL_MAT_VEC_SCALE";
+                // the mat-vec reads whole rows of its sources; the scale is elementwise on the mat-vec result
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
             } else if (const int hc_mix_extra = ggml_vk_can_fuse_hc_up_mix(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = hc_mix_extra;
                 ctx->fused_hc_up_mix = true;
@@ -19583,6 +19619,26 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
         if (enqueued && fusion_string) {
             ggml_vk_fusion_count_add(fusion_string);
+        }
+        // MUL_MAT_VEC_SCALE's denominator: a SCALE of a MUL_MAT's result that runs on its own (prefill, or a declined case)
+        if (enqueued && !fusion_string && cgraph->nodes[i]->op == GGML_OP_SCALE && cgraph->nodes[i]->src[0]->op == GGML_OP_MUL_MAT) {
+            ggml_vk_fusion_count_add("SCALE_AFTER_MUL_MAT_UNFUSED");
+            static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+            static int n_said = 0;
+            if (dbg && n_said < 40) {
+                n_said++;
+                const ggml_tensor * sc = cgraph->nodes[i];
+                const ggml_tensor * mm = sc->src[0];
+                int at = -1;
+                for (int k = std::max(0, i - 64); k < i; ++k) {
+                    if (cgraph->nodes[k] == mm) { at = k; }
+                }
+                fprintf(stderr, "ggml_vulkan: MUL_MAT_VEC_SCALE not taken at node %d (%s): its MUL_MAT %s is node %d (%s); between: %s; "
+                        "mm %s nrows %lld src0 %s src1 %s; scale %s param1 %g\n",
+                        i, sc->name, mm->name, at, at >= 0 ? (at == i - 1 ? "adjacent" : "not adjacent") : "not within 64",
+                        at >= 0 && at < i - 1 ? ggml_op_desc(cgraph->nodes[at + 1]) : "-", ggml_type_name(mm->type), (long long) ggml_nrows(mm),
+                        ggml_type_name(mm->src[0]->type), ggml_type_name(mm->src[1]->type), ggml_type_name(sc->type), ggml_get_op_params_f32(sc, 1));
+            }
         }
 
         if (vk_perf_logger_enabled && enqueued) {
@@ -20170,6 +20226,24 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
 
+        // MUL_MAT_VEC_SCALE: a one-column mat-vec placed in a set takes the SCALE that consumes it right behind it. The SCALE reads
+        // only the mat-vec, but another node can sit between them in the graph (Flash-Next decode, GDN layers: the hc inject's own
+        // SCALE lands between the hc down mat-vec and its 1/hc SCALE), and then the pair never fuses
+        auto const &pull_mmv_scale = [&](int mm) {
+            const ggml_tensor * n = graph->nodes[mm];
+            if (n->op != GGML_OP_MUL_MAT || ggml_nrows(n) != 1) {
+                return;
+            }
+            for (int k = mm + 1; k < std::min(mm + 16, graph->n_nodes); ++k) {
+                if (!used[k] && graph->nodes[k]->op == GGML_OP_SCALE && graph->nodes[k]->src[0] == n) {
+                    current_set.push_back(k);
+                    used[k] = true;
+                    return;
+                }
+            }
+        };
+        pull_mmv_scale(first_unused);
+
         // Loop through the next N nodes. Grab any that don't depend on other nodes that
         // haven't already been run. Nodes that have already been run have used[i] set
         // to true. Allow nodes that depend on the previous node if it's a fusion pattern
@@ -20260,6 +20334,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
+                    // MUL_MAT -> SCALE (MUL_MAT_VEC_SCALE): keep the scale behind its mat-vec
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_SCALE &&
+                      graph->nodes[j]->src[0] == graph->nodes[c] && ggml_nrows(graph->nodes[c]) == 1) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
@@ -20278,6 +20355,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
             if (ok) {
                 current_set.push_back(j);
+
+                pull_mmv_scale(j);
 
                 int rope_idx = j;
 

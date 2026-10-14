@@ -37,8 +37,24 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    float fuse_scale;   // MAT_VEC_FUSION_FLAGS_SCALE_PC
+    float fuse_bias;
 #endif
 } p;
+
+// The value a column's result is stored as. MUL_MAT + SCALE (non-ID): the SCALE kernel's arithmetic on the f32 result the unfused
+// mat-vec would have stored (x * scale + bias), each step rounded on its own (precise: no fma contraction), so it is bit-exact
+float mmv_epilogue(const FLOAT_TYPE v) {
+    float r = float(v);
+#ifndef MUL_MAT_ID
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE_PC) != 0) {
+        precise float m = r * p.fuse_scale;
+        precise float a = m + p.fuse_bias;
+        r = a;
+    }
+#endif
+    return r;
+}
 
 #ifdef MUL_MAT_ID
 uint expert_id;
@@ -121,7 +137,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(mmv_epilogue(temp[j][n]));
             }
         }
     }
@@ -176,7 +192,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(mmv_epilogue(temp[j][n]));
             }
         }
     }
@@ -221,7 +237,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
-                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(mmv_epilogue(tmpsh[j][n][0]));
             }
         }
     }
