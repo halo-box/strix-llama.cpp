@@ -1402,8 +1402,8 @@ static __global__ void build_mmq_routed_descriptors(
     }
 }
 
-template <ggml_type type, int J, bool fallback>
-__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q_routed_compact(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, const uint32_t * __restrict__ descriptors,
@@ -1412,8 +1412,8 @@ static __global__ void mul_mat_q_routed_compact(
         const uint3 channel_ratio, const int stride_channel_x,
         const uint3 sample_ratio, const int stride_sample_x) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
-    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
 
     const int wt = blockIdx.z;
     const int it = blockIdx.x;
@@ -1452,7 +1452,7 @@ static __global__ void mul_mat_q_routed_compact(
         const float * y_scale_tile = y_scale ? y_scale + col_low + jt * J : nullptr;
 
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, J, fallback, fixup>
+        mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + it * I, nullptr, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
@@ -1734,7 +1734,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
         const int descriptor_blocks = (args.ncols_dst + J - 1) / J;
         const dim3 block_nums_compact(nty, descriptor_blocks, args.nsamples_y);
-        mul_mat_q_routed_compact<type, J, fallback><<<block_nums_compact, block_dims, nbytes_shared, stream>>>
+        mul_mat_q_routed_compact<type, J, fallback, prec_src1><<<block_nums_compact, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, descriptors.get(), max_descriptors, args.dst, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, args.stride_channel_x, sample_ratio_fd, args.stride_sample_x);
