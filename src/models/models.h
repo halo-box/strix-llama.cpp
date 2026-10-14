@@ -2683,14 +2683,17 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor * gdn_norm_pad_buf = nullptr;
         ggml_tensor * pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name);
 
-        // one conv history per cache tensor: delta-net and PLE each have their own
+        // one conv history per cache tensor: delta-net and PLE each have their own. Returns [state_cols + T, channels, n_seqs]
+        // (tokens on ne[0]); channels_first (x is [channels, T, n_seqs]) returns [channels, state_cols + T, n_seqs] instead,
+        // with the same cache layout
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
-                            int   il);
+                            int   il,
+                           bool   channels_first = false);
 
         ggml_tensor * build_inp_ple(
   const llama_memory_hybrid_idx_context * mctx_hyb);
