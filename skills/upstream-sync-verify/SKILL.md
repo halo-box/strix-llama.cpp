@@ -1,6 +1,6 @@
 ---
 name: upstream-sync-verify
-description: Verify an upstream sync PR of this fork with the same checks and benchmarks as the upstream-sync skill - read the PR, check that no fork code was lost, rerun the validation on a Strix Halo machine, and post the results on the PR. Use when asked to verify, check, review or validate a "Merge upstream llama.cpp" PR.
+description: Verify an upstream sync PR of this fork with the same checks and benchmarks as the upstream-sync skill - read the PR, check that no fork code was lost, rerun the validation on a Strix Halo machine, and post the results on the PR. Use when asked to verify, check, review or validate a "Rebase onto upstream llama.cpp" (or older "Merge upstream llama.cpp") PR.
 license: MIT
 compatibility: Any agent harness that runs shell commands. Needs git 2.43 or later, bash 4.4 or later, gh (logged in), python3 and curl, from the repo root. The benchmark rerun needs a Linux Strix Halo (gfx1151) machine with systemd user services (or setsid and nohup), ROCm 10, the Vulkan headers and loader, and glslc (the script downloads the SPIR-V headers).
 ---
@@ -13,9 +13,9 @@ Check a sync PR opened with the `upstream-sync` skill, with the same checks and 
 
 ## Input
 
-The PR number. If the user did not give it, list the open sync PRs (`gh pr list --repo halo-box/strix-llama.cpp --state open --search "Merge upstream llama.cpp in:title"`) and ask.
+The PR number. If the user did not give it, list the open sync PRs (`gh pr list --repo halo-box/strix-llama.cpp --state open --search "upstream llama.cpp in:title"`) and ask.
 
-Never merge the PR and never edit its body: report to the user, and post the validation results as a comment. A maintainer merges it, with a merge commit.
+Never merge or land the PR and never edit its body: report to the user, and post the validation results as a comment. A maintainer lands a sync PR by force-push (see the upstream-sync skill, phase 5).
 
 **Explain first, once**, as in the upstream-sync rules: before the first command, say in a few short lines what this skill will do and ask "OK?": two worktrees (`../verify-tools`, `../verify-<number>`), the checks of sections 2 to 4 (read only), the validation run of section 5 (hours, the GPU, about 40 GB, the PR's code run with your environment) and the comment it posts on the PR. Ask again only if the plan changes. The scripts table of [the upstream-sync skill](../upstream-sync/SKILL.md#scripts) says what each script changes.
 

@@ -1,8 +1,36 @@
 # Syncing strix-llama.cpp with upstream
 
 Upstream is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). halo-box/llama.cpp is archived and is no
-longer synced. The fork merges upstream `master` every 3 days with the `upstream-sync` skill, and never rebases
-`master`: it is a shared branch, and a rebase would force-push over every contributor and open PR.
+longer synced. The fork **rebases** its own commits onto upstream `master` every 3 days with the `upstream-sync`
+skill: `master` is upstream's history with the fork's commits on top, in a straight line.
+
+## How a sync works
+
+1. The fork's commits (`git rev-list --no-merges master --not upstream/master`) are replayed onto the new upstream
+   tip, oldest first. Conflicts are resolved with the fork's change first, adapted to upstream's code.
+2. A rebase drops merge commits, and a resolution made in a merge exists nowhere else. The last commit of the sync
+   reconciles the tree with a 3-way merge of the old `master` and the new upstream from the upstream commit the old
+   `master` sat on, so no fork change is lost; `forklines.py` (in the skill) checks every fork line.
+3. The result is reviewed and validated as a PR from a `sync/upstream-<date>-<sha>` branch. It cannot be merged with
+   the GitHub button: a maintainer lands it with `git push --force-with-lease=master:<old master sha> origin
+   <sync branch>:master` once the PR is approved, then closes the PR.
+
+## After a sync: rebase your branch
+
+Every sync rewrites the fork's commits. A branch made from the old `master` moves onto the new one with
+
+```sh
+git fetch origin
+git rebase --onto origin/master <old master sha> <your branch>
+```
+
+`<old master sha>` is the `master` your branch started from (the sync PR gives the one it replaced). Open PRs
+need the same, then a force-push of their own branch.
+
+## History: the merge-based syncs before 2026-10-14
+
+Until 2026-10-14 the fork merged upstream instead. The sections below explain that workflow and its pitfalls; they
+still apply to the old history, not to new syncs.
 
 ## Why GitHub says "N commits behind" after a sync
 

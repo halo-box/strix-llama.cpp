@@ -1,114 +1,92 @@
-# 2. Do the steps
+# 2. Rebase
 
 Part of the `upstream-sync` skill: read [SKILL.md](../SKILL.md) first for the rules.
+
+Names used below: `OLD` the current `master`, `BASE` the upstream commit `OLD` sits on (`git merge-base OLD upstream/master`,
+or the commit the previous sync PR names), `T` the upstream commit to rebase onto.
 
 ## 2.1 Start the branch
 
 ```sh
-T=<short sha of the last upstream commit of this PR, from the plan>
-git switch -c sync/upstream-$(date +%F)-$T master
+OLD=$(git rev-parse origin/master)
+BASE=$(git merge-base $OLD upstream/master)
+T=<short sha of the target upstream commit>
+git switch -c sync/upstream-$(date +%F)-$T $T
 ```
 
-## 2.2 Merge one step
+## 2.2 Replay the fork's commits
+
+The fork's own commits, oldest first, without merges (a merge is never replayed, its resolution is restored in 2.4):
 
 ```sh
-OLD=$(git rev-parse HEAD)
-skills/upstream-sync/scripts/sync.sh merge                 # the next step of the plan
-skills/upstream-sync/scripts/sync.sh merge <upstream sha>  # or a given target
+git rev-list --reverse --no-merges --topo-order $OLD --not upstream/master > /tmp/fork-commits
 ```
 
-The tree must be clean. The merge stops before the commit, in the normal conflict state: `git status` lists the conflicted files, and `git checkout --ours/--theirs`, `git mergetool` and rerere work. It prints the conflicted files and says if one is sensitive. A step without conflict still needs the commit, `verify` and the builds.
-
-## 2.3 Resolve each conflict
-
-For each conflicted file:
-
-1. **Find what the fork changed there and why.** The report lists the fork commits that own our side; also `git log --no-merges HEAD ^upstream/master -- <file>`, and `gh pr view` on the PRs they came from.
-2. **Find what upstream changed and why**: `git log -p <base>..MERGE_HEAD -- <file>`, and the upstream PR description. `<base>` is the start of the step: the first `Upstream:` line of the prefilled message (`$(git rev-parse --git-path MERGE_MSG)`), or `git show HEAD:scripts/upstream-sync.base`. Do not read the working tree copy of that file: `merge` already set it to the target.
-3. **Kinds of conflicts:**
-   - both sides added different code at the same place (new functions, new attributes): keep both, and check the junction (a closing brace or a declaration can sit outside the conflict markers);
-   - upstream moved or refactored code the fork patched: take upstream's new structure and put the fork change back into it. Do not keep our stale copy;
-   - upstream deleted a file the fork changed (modify/delete conflict, no markers): find where upstream moved its content and carry the fork change there. That is an edit outside the conflicts: explain it in the merge message;
-   - upstream now does what the fork change did: see "upstream wins only with numbers".
-4. `git checkout --theirs <file>` only when the whole fork diff of that file is now upstream. Otherwise resolve hunk by hunk.
-5. When rerere resolved a file, check its result with `git rerere diff` before going on.
-6. Build the library to catch a broken resolution early: `cmake --build <build> --target llama` (seconds to minutes).
-
-## 2.4 Commit the step
-
-`sync.sh merge` prefills the merge message in the file `$(git rev-parse --git-path MERGE_MSG)`, with the upstream range and a line per conflicted file. Edit that file, not through an editor opened by `git commit` (a harness has no terminal):
-
-- replace each `<how it was resolved>` with one line: what was kept from the fork, what from upstream, and every edit made outside the conflict markers;
-- name the fork code that needs a review by its authors;
-- end with the trailer `AGENTS.md` asks for on agent commits: `Assisted-by: <agent name>`.
+Drop from the list what `master` itself undid: a commit and its revert both go, and a reverted upstream sync goes with
+its revert. Then replay with a todo of `pick` lines:
 
 ```sh
-git add <files>
-git commit --no-edit          # takes the edited MERGE_MSG as is
+sed 's/^/pick /' /tmp/fork-commits > /tmp/todo
+GIT_SEQUENCE_EDITOR="cp /tmp/todo" git rebase -i --empty=drop --onto $T $T
 ```
 
-`verify` fails while a `<how it was resolved>` is left in a message: fix the last one with `git commit --amend`.
+## 2.3 Resolve each conflict, fork first
 
-The commit must have two parents: the fork and the upstream target. `verify` checks it.
+In a rebase, `HEAD` (ours) is upstream plus the fork commits already replayed, and the commit being picked is theirs.
 
-## 2.5 Verify the step
+- **A file the fork does not change in the end** (`git diff --quiet $BASE $OLD -- <file>`): take `HEAD`'s version.
+  Old upstream syncs that were squashed into a fork commit carry stale upstream code; it must not come back.
+- **Fork code on upstream code that moved or changed API**: keep the fork's change and port it onto upstream's
+  current code (new parameters, renamed helpers, functions moved to another file). `git show $OLD:<file>` is the
+  fork's final intent: when a block appears there, it is the target.
+- **Both sides only add code at the same place**: keep both.
+- **Upstream now implements the same feature differently** (its own MTP, QSA, k-pool, top-k...): keep the fork's
+  version of the whole file or function, and write down the upstream PRs not taken for the PR body.
+- **A fork commit whose content is gone from `$OLD`** (replaced later in the fork's history): resolve it to `HEAD`
+  and keep only what survives.
+
+Then `git add` the files and `git rebase --continue`. An intermediate commit may not build: the reconciliation in 2.4
+makes the final tree right, and the build in 2.6 checks it. Say so in the PR body.
+
+## 2.4 Reconcile the tree
+
+The rebase dropped `master`'s merge commits, and some fork work lived only there (sync resolutions, ports made while
+merging a branch). Bring the tree to the 3-way merge of `$OLD` and `$T` from `$BASE`, file by file:
 
 ```sh
-skills/upstream-sync/scripts/sync.sh verify $OLD
+for f in $(git diff --name-only $BASE $OLD); do
+  if git diff --quiet $BASE $T -- "$f"; then git show $OLD:"$f" > "$f"; continue; fi   # upstream did not touch it
+  git show $BASE:"$f" > /tmp/b; git show $T:"$f" > /tmp/u; git show $OLD:"$f" > /tmp/m
+  git merge-file --diff3 -L fork -L base -L upstream -p /tmp/m /tmp/b /tmp/u > "$f"   # conflicts left as markers
+done
 ```
 
-It compares the fork's diff against upstream before and after the step, file by file:
+Resolve the markers fork first, as in 2.3; where the rebase already resolved the same region, reuse that resolution.
+A large file where both sides moved code merges better function by function than line by line. Files the fork
+deleted stay deleted. Commit as `sync: reconcile the rebased fork with its pre-rebase state on upstream <sha>`.
 
-- **files no longer different from upstream**: each one must be explained by upstream now doing the same thing, or by a file upstream deleted. Anything else is lost fork code: fix it before going on.
-- **files newly different from upstream**: should only be conflict fixups, such as a fork change carried to a new file.
-- **files whose fork diff size changed**: inspect with `git diff <target> HEAD -- <file>` and confirm the fork change is intact.
-
-- **fork lines no longer in their file**: lines the fork added that the file at HEAD holds fewer times than the fork did before the sync, less the copies upstream itself removed; so a fork line replaced by upstream's shows even when the size of the diff did not change. Each one is either moved by the resolution or changed by upstream: say which in the merge message, or put it back. A fork diff whose size changed is a REVIEW too (a lost fork line that upstream also added elsewhere in the file keeps every count).
-
-It ends with `verify: OK` (exit 0), `verify: REVIEW` (exit 2: fork code is gone from the listed files or lines; explain each one in the merge message, or fix it) or `verify: FAIL` (exit 1: the last merge since `$OLD` is not a merge of the target, conflict markers are left, or a merge message still holds `<how it was resolved>`). Commits after the last merge (fixups) are included in the comparison.
-
-Then build what the step can break. No GPU is needed. A clean step can still break fork code (for example a changed signature in `ggml-cuda/common.cuh`), so follow the paths the step changes (`git diff --name-only HEAD^1 HEAD`), not only the conflicts:
-
-| The step changes | HIP build | Vulkan build |
-|---|---|---|
-| `ggml/src/ggml-cuda/` | yes | no |
-| `ggml/src/ggml-vulkan/` | no | yes |
-| ggml core (`ggml/include/`, `ggml/src/ggml*.c*`, `ggml/src/ggml-backend*`, `ggml/src/ggml-alloc*`) or `src/` | yes | yes |
-| anything else (docs, UI, server, CI) | no | no |
+## 2.5 Audit the fork lines
 
 ```sh
-# HIP with ROCm 10 (ROCM_PATH, default /opt/rocm), not the first hipconfig in PATH
+python3 skills/upstream-sync/scripts/forklines.py $BASE $OLD scripts/upstream-sync.base $T
+```
+
+Every line it lists is either put back or explained in the PR body (ported to a new API, replaced by an upstream fix
+of the same bug, a fork feature that waits for a port).
+
+## 2.6 Build and test
+
+CPU, HIP (ROCm 10, gfx1151) and Vulkan must build, then `ctest -L main` on CPU:
+
+```sh
+cmake -B build-check -DCMAKE_BUILD_TYPE=Release && cmake --build build-check -j
+ctest --test-dir build-check -L main --output-on-failure -j 8
 R=${ROCM_PATH:-/opt/rocm}
 HIP_PATH=$($R/bin/hipconfig -R) cmake -B build-hip -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 \
-  -DCMAKE_HIP_COMPILER=$($R/bin/hipconfig -l)/clang -DCMAKE_BUILD_TYPE=Release
-cmake --build build-hip -j
-# Vulkan needs the Vulkan headers, glslc and the SPIR-V headers (a distribution package, the Vulkan SDK, or the copy
-# validate.sh installs in DEPS_DIR); upstream finds them but does not link their target, hence CPATH
+  -DCMAKE_HIP_COMPILER=$($R/bin/hipconfig -l)/clang -DCMAKE_BUILD_TYPE=Release && cmake --build build-hip -j
 SP=${DEPS_DIR:-$HOME/.cache/strix-llama-sync/deps}/spirv-headers-vulkan-sdk-1.4.341.0
-cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_PREFIX_PATH=$SP -DCMAKE_BUILD_TYPE=Release
-CPATH=$SP/include cmake --build build-vk -j
+cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_PREFIX_PATH=$SP -DCMAKE_BUILD_TYPE=Release && CPATH=$SP/include cmake --build build-vk -j
 ```
 
-These builds need no GPU: without a Strix Halo machine, build HIP in a ROCm container (as `.github/workflows/hip-quality-check.yml` does) and Vulkan with the Vulkan SDK. An incremental build is fast when the step changes a few kernel files, and close to a full build when it changes a header included everywhere (`ggml-cuda/common.cuh` is included by most `.cu` files). ccache helps.
-
-## 2.6 Next step, or stop
-
-Go back to 2.2 for the next step, unless one of these is true. Then stop **before** the next step, and go on to 3 with the steps already merged:
-
-1. **The resolution is not clear.** For example upstream rewrote a function that the fork patches, or added its own version of a fork feature (MTP, QSA, the UMA ring).
-2. **The PR is big enough to review and validate**: about 3 sensitive steps, or about 10 conflicted files in total. Adjust with the user.
-3. **A check fails** and the cause is not found quickly.
-
-An upstream PR cannot be skipped: every later upstream commit contains it. A hard step gets its own PR: alone, with a description of the problem and a question for the authors of the fork code it touches. As a last resort, take the upstream version and port the fork feature onto it, with `llama-bench` and KLD numbers. Meanwhile `master` stays at the last merged step: nothing breaks, the fork is only a few days behind.
-
-## 2.7 End of the sync
-
-```sh
-cmake -B build-check -DCMAKE_BUILD_TYPE=Release
-cmake --build build-check -j
-ctest --test-dir build-check -L main --output-on-failure -j 8
-```
-
-`test-tokenizers-ggml-vocabs` needs `git lfs`. Without it, the test reads LFS pointer files and fails with `invalid magic characters: 'vers'`. That is not a merge failure.
-
-If the last merged upstream commit is not the one in the branch name (the plan shifted, or the sync stopped early), rename the branch: `git branch -m sync/upstream-<date>-<sha of the last merged upstream commit>`.
+`test-tokenizers-ggml-vocabs` needs `git lfs`; without it, it fails with `invalid magic characters: 'vers'`. That is
+not a sync failure. Fix build errors in commits of their own (`sync: fix the <backend> build ...`).

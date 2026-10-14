@@ -12,10 +12,10 @@ if grep -n -i -E "/home/|/Users/|/root/|/mnt/|/media/|/data/|/srv/|~/|$(hostname
 else
   git push -u origin HEAD &&
   gh pr create --repo halo-box/strix-llama.cpp --base master \
-    --title "Merge upstream llama.cpp up to <sha> (<date>)" --body-file body.md
+    --title "Rebase onto upstream llama.cpp <sha> (<date>)" --body-file body.md
 fi
 ```
 
 If `origin` is a personal fork, add `--head <owner>:<branch>`.
 
-Open it as a draft (`--draft`) unless both backends are `TARGET PASS`, and say in the body what is missing. To refresh the results after a fix, rerun the validation on the PR itself: `validate.sh --pr <number>` replaces the marked section of the PR body (and updates it after each backend while it runs). If the body would pass the GitHub limit, it posts the results as a comment instead, and says so. To update the body by hand, use `gh api -X PATCH repos/halo-box/strix-llama.cpp/pulls/<number> -F body=@body.md`: `gh pr edit` fails on this repo with a GraphQL error about classic Projects. A maintainer merges the PR with a merge commit, after `upstream-sync-verify` if someone runs it.
+Open it as a draft (`--draft`) unless both backends are `TARGET PASS`, and say in the body what is missing. To refresh the results after a fix, rerun the validation on the PR itself: `validate.sh --pr <number>` replaces the marked section of the PR body (and updates it after each backend while it runs). If the body would pass the GitHub limit, it posts the results as a comment instead, and says so. To update the body by hand, use `gh api -X PATCH repos/halo-box/strix-llama.cpp/pulls/<number> -F body=@body.md`: `gh pr edit` fails on this repo with a GraphQL error about classic Projects. A sync PR is never merged with the GitHub button. Once it is approved (after `upstream-sync-verify` if someone runs it), a maintainer lands it with `git push --force-with-lease=master:<OLD> origin <sync branch>:master`, closes the PR, and posts the old `master` sha so contributors can rebase their branches (`SYNC.md`).

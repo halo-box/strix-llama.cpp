@@ -5,7 +5,7 @@ Part of the `upstream-sync` skill: read [SKILL.md](../SKILL.md) first for the ru
 ## 1.1 Is a sync already open?
 
 ```sh
-gh pr list --repo halo-box/strix-llama.cpp --state open --search "Merge upstream llama.cpp in:title"
+gh pr list --repo halo-box/strix-llama.cpp --state open --search "upstream llama.cpp in:title"
 ```
 
 If one is open, do not start a second one: two sync PRs at the same time conflict with each other.
