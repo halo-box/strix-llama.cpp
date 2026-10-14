@@ -2055,7 +2055,15 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                bool loaded = ret->prompt_load(*prompt_cache, task.tokens);
+
+                // a full unified KV pool has no free cells to restore into
+                // purge idle slots, least recently used first and each saved to the cache, until the restore fits
+                while (!loaded && try_clear_idle_slots()) {
+                    loaded = ret->prompt_load(*prompt_cache, task.tokens);
+                }
+
+                if (!loaded) {
                     ret->prompt_clear();
                 }
 
