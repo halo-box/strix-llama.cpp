@@ -532,6 +532,8 @@ struct ggml_gallocr {
     int cap_delayed;
     int cur_node;
     int delay;     // the reuse delay in effect: GGML_ALLOC_REUSE_DELAY, halved by the planner while a plan exceeds the cap; -1 = unread
+    long long hold; // GGML_ALLOC_REUSE_HOLD_MIB in bytes: freed blocks stay out of circulation while the held total is within it; -1 = unread
+    size_t held;    // bytes currently in the FIFO
 };
 
 struct delayed_free {
@@ -545,6 +547,21 @@ struct delayed_free {
 // nodes have been allocated. Applied in the planning pass, so the reserved size grows with N (printed by sched_reserve as usual). On
 // Flash-Next prefill the consumer-less view pins (LLAMA_KEEP_PINS) speed the dense GEMMs / GDN up ~25% per call by keeping blocks out of
 // circulation; this knob tests whether delayed reuse alone does that, at a bounded size.
+// GGML_ALLOC_REUSE_HOLD_MIB=X (the byte form): freed blocks queue in free order and the oldest return to the allocator once more than X
+// MiB is held, so the hold spans the same memory on every model whatever its node count. Combines with the node delay (a block returns
+// at whichever comes first).
+static long long ggml_gallocr_reuse_hold(void) {
+    static long long hold = -1;
+    if (hold < 0) {
+        const char * e = getenv("GGML_ALLOC_REUSE_HOLD_MIB");
+        hold = e ? atoll(e) << 20 : 0;
+        if (hold < 0) {
+            hold = 0;
+        }
+    }
+    return hold;
+}
+
 static int ggml_gallocr_reuse_delay(void) {
     static int delay = -1;
     if (delay < 0) {
@@ -561,6 +578,7 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
     GGML_ASSERT(galloc != NULL);
     galloc->delay = -1;   // GGML_ALLOC_REUSE_DELAY, read on the first plan
+    galloc->hold = -1;    // GGML_ALLOC_REUSE_HOLD_MIB, likewise
 
     galloc->bufts = calloc(n_bufs, sizeof(ggml_backend_buffer_type_t));
     GGML_ASSERT(galloc->bufts != NULL);
@@ -814,13 +832,26 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
 #endif
 
     const int delay = galloc->delay;
-    if (delay > 0) {
+    const long long hold = galloc->hold;
+    if (delay > 0 || hold > 0) {
         if (galloc->n_delayed == galloc->cap_delayed) {
             galloc->cap_delayed = galloc->cap_delayed ? 2*galloc->cap_delayed : 256;
             galloc->delayed = (struct delayed_free *) realloc(galloc->delayed, galloc->cap_delayed*sizeof(struct delayed_free));
             GGML_ASSERT(galloc->delayed != NULL);
         }
-        galloc->delayed[galloc->n_delayed++] = (struct delayed_free) { alloc, hn->addr, size, galloc->cur_node + delay };
+        galloc->delayed[galloc->n_delayed++] = (struct delayed_free) { alloc, hn->addr, size, delay > 0 ? galloc->cur_node + delay : INT_MAX };
+        galloc->held += size;
+        // the byte hold: return the oldest blocks while more than the hold is queued
+        int k = 0;
+        while (hold > 0 && galloc->held > (size_t) hold && k < galloc->n_delayed) {
+            struct delayed_free * d = &galloc->delayed[k++];
+            ggml_dyn_tallocr_free_bytes(d->alloc, d->addr, d->size);
+            galloc->held -= d->size;
+        }
+        if (k > 0) {
+            memmove(galloc->delayed, galloc->delayed + k, (size_t) (galloc->n_delayed - k) * sizeof(struct delayed_free));
+            galloc->n_delayed -= k;
+        }
     } else {
         ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
     }
@@ -834,6 +865,7 @@ static void ggml_gallocr_release_delayed(ggml_gallocr_t galloc, bool flush) {
         struct delayed_free * d = &galloc->delayed[i];
         if (flush || d->release_at <= galloc->cur_node) {
             ggml_dyn_tallocr_free_bytes(d->alloc, d->addr, d->size);
+            galloc->held -= d->size;
         } else {
             galloc->delayed[k++] = *d;
         }
@@ -892,6 +924,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
     // allocate tensors
     galloc->n_delayed = 0;
+    galloc->held = 0;
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int buffer_id = get_node_buffer_id(node_buffer_ids, i);
@@ -960,6 +993,29 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     ggml_gallocr_release_delayed(galloc, true);
 }
 
+// one planning pass over the graph from empty allocators
+static void ggml_gallocr_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
+    }
+    ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+}
+
+// the planned size over all buffers (a buffer type used twice shares one allocator: counted once)
+static size_t ggml_gallocr_plan_total(ggml_gallocr_t galloc) {
+    size_t total = 0;
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        bool seen = false;
+        for (int j = 0; j < i; j++) {
+            seen |= galloc->buf_tallocs[j] == galloc->buf_tallocs[i];
+        }
+        for (int c = 0; !seen && c < galloc->buf_tallocs[i]->n_chunks; c++) {
+            total += ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+        }
+    }
+    return total;
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
@@ -980,42 +1036,53 @@ static bool ggml_gallocr_reserve_n_impl(
     if (galloc->delay < 0) {
         galloc->delay = ggml_gallocr_reuse_delay();
     }
-    // GGML_ALLOC_REUSE_DELAY_MAX_MIB=M: a plan whose total (all buffers) exceeds M MiB under the reuse delay is redone with the delay
-    // halved, down to 0 (today's plan), so an over-sized buffer is never requested. 10-14: GGML_ALLOC_REUSE_DELAY=1024 on Flash-Next
-    // asked for more than the box can map (BO_VA -12).
-    static long long delay_cap_mib = -2;
-    if (delay_cap_mib == -2) {
+    if (galloc->hold < 0) {
+        galloc->hold = ggml_gallocr_reuse_hold();
+    }
+    // Caps on the extra size the reuse hold-back may cost. A plan over the cap is redone with the delay and the byte hold halved, down to
+    // 0 (today's plan), so an over-sized buffer is never requested (10-14: GGML_ALLOC_REUSE_DELAY=1024 on Flash-Next asked for more than
+    // the box can map, BO_VA -12). The effective values stick for this gallocr.
+    //   GGML_ALLOC_REUSE_DELAY_MAX_MIB=M: the total over all buffers of the plan stays within M MiB
+    //   GGML_ALLOC_REUSE_DELAY_MAX_FRAC=f: the total stays within (1 + f) x the plan without any hold-back (one extra planning pass)
+    static long long cap_mib = -2;
+    static double cap_frac = -2;
+    if (cap_mib == -2) {
         const char * e = getenv("GGML_ALLOC_REUSE_DELAY_MAX_MIB");
-        delay_cap_mib = e ? atoll(e) : -1;
+        cap_mib = e ? atoll(e) : -1;
+        const char * f = getenv("GGML_ALLOC_REUSE_DELAY_MAX_FRAC");
+        cap_frac = f ? atof(f) : -1;
+    }
+    size_t cap = SIZE_MAX;
+    if (cap_mib >= 0) {
+        cap = (size_t) cap_mib << 20;
+    }
+    if (cap_frac >= 0 && (galloc->delay > 0 || galloc->hold > 0)) {
+        const int d0 = galloc->delay;
+        const long long h0 = galloc->hold;
+        galloc->delay = 0;
+        galloc->hold = 0;
+        ggml_gallocr_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+        const size_t base = ggml_gallocr_plan_total(galloc);
+        galloc->delay = d0;
+        galloc->hold = h0;
+        cap = MIN(cap, (size_t) ((double) base * (1.0 + cap_frac)));
     }
     for (;;) {
-        // reset allocators
-        for (int i = 0; i < galloc->n_buffers; i++) {
-            ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
-        }
-
-        // allocate in hash table
-        ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
-
-        if (galloc->delay <= 0 || delay_cap_mib < 0) {
+        ggml_gallocr_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+        if ((galloc->delay <= 0 && galloc->hold <= 0) || cap == SIZE_MAX) {
             break;
         }
-        size_t total = 0;
-        for (int i = 0; i < galloc->n_buffers; i++) {
-            bool seen = false;
-            for (int j = 0; j < i; j++) {
-                seen |= galloc->buf_tallocs[j] == galloc->buf_tallocs[i];
-            }
-            for (int c = 0; !seen && c < galloc->buf_tallocs[i]->n_chunks; c++) {
-                total += ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
-            }
-        }
-        if (total <= (size_t) delay_cap_mib << 20) {
+        const size_t total = ggml_gallocr_plan_total(galloc);
+        if (total <= cap) {
             break;
         }
-        fprintf(stderr, "ggml_gallocr: reuse delay %d plans %.1f MiB > GGML_ALLOC_REUSE_DELAY_MAX_MIB %lld: re-planning with delay %d\n",
-                galloc->delay, total / 1048576.0, delay_cap_mib, galloc->delay / 2);
+        fprintf(stderr, "ggml_gallocr: reuse delay %d / hold %lld MiB plans %.1f MiB > cap %.1f MiB: re-planning with delay %d / hold %lld MiB\n",
+                galloc->delay, galloc->hold >> 20, total / 1048576.0, cap / 1048576.0, galloc->delay / 2, (galloc->hold / 2) >> 20);
         galloc->delay /= 2;
+        galloc->hold /= 2;
+        if (galloc->hold < (1 << 20)) {
+            galloc->hold = 0;
+        }
     }
 
     // set the node_allocs from the hash table
@@ -1102,8 +1169,9 @@ static bool ggml_gallocr_reserve_n_impl(
             dry_run = e != NULL && atoi(e) != 0;
         }
         if (dry_run && realloc && !no_alloc) {
-            fprintf(stderr, "ggml_gallocr: DRY RUN: %s buffer planned %.2f MiB in %d chunk(s), reuse delay %d\n",
-                    ggml_backend_buft_name(galloc->bufts[i]), new_size / 1048576.0, galloc->buf_tallocs[i]->n_chunks, galloc->delay);
+            fprintf(stderr, "ggml_gallocr: DRY RUN: %s buffer planned %.2f MiB in %d chunk(s), reuse delay %d, hold %lld MiB\n",
+                    ggml_backend_buft_name(galloc->bufts[i]), new_size / 1048576.0, galloc->buf_tallocs[i]->n_chunks, galloc->delay,
+                    galloc->hold >> 20);
             dry_run_hit = true;
             continue;
         }
