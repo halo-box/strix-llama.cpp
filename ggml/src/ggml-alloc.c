@@ -535,6 +535,11 @@ struct ggml_gallocr {
     long long hold; // the byte hold of the plan being made (GGML_ALLOC_REUSE_HOLD_MIB in bytes), likewise
     int delay_cfg;      // GGML_ALLOC_REUSE_DELAY; -1 = unread
     long long hold_cfg; // GGML_ALLOC_REUSE_HOLD_MIB in bytes; -1 = unread
+    // MAX_FRAC reference: the largest no-hold-back plan seen by this gallocr (the reserve's worst-case graph) and the delay / hold that
+    // graph landed on under its cap; smaller graphs (the tg graph, runtime graphs with fewer outputs) start from that landing
+    size_t base_max;
+    int delay_at_max;
+    long long hold_at_max;
     size_t held;    // bytes currently in the FIFO
 };
 
@@ -1039,16 +1044,20 @@ static bool ggml_gallocr_reserve_n_impl(
         galloc->delay_cfg = ggml_gallocr_reuse_delay();
         galloc->hold_cfg = ggml_gallocr_reuse_hold();
     }
-    // every reserve starts from the configured hold-back and caps its own graph: a reduction for one graph must not carry over to the
-    // next (10-14: llama reserves pp, tg, pp on one gallocr; with MAX_FRAC the tiny tg graph halved a sticky delay 128 -> 64 and the
-    // final pp reserve planned n64, while the dry run, which stops at the first pp reserve, had predicted n128)
+    // every reserve starts from the configured hold-back: a reduction forced on one graph must not carry over to the next (10-14: llama
+    // reserves pp, tg, pp on one gallocr; with MAX_FRAC a sticky halving from the tiny tg graph made the final pp reserve plan n64, while
+    // the dry run, which stops at the first pp reserve, had predicted n128)
     galloc->delay = galloc->delay_cfg;
     galloc->hold = galloc->hold_cfg;
     // Caps on the extra size the reuse hold-back may cost. A plan over the cap is redone with the delay and the byte hold halved, down to
     // 0 (today's plan), so an over-sized buffer is never requested (10-14: GGML_ALLOC_REUSE_DELAY=1024 on Flash-Next asked for more than
     // the box can map, BO_VA -12). The reduced values hold for this plan only.
     //   GGML_ALLOC_REUSE_DELAY_MAX_MIB=M: the total over all buffers of the plan stays within M MiB
-    //   GGML_ALLOC_REUSE_DELAY_MAX_FRAC=f: the total stays within (1 + f) x the plan without any hold-back (one extra planning pass)
+    //   GGML_ALLOC_REUSE_DELAY_MAX_FRAC=f: the total stays within (1 + f) x the largest plan without any hold-back this gallocr has seen
+    //     (one extra planning pass per reserve). The cap is relative to that worst case, not to the graph at hand: a graph with a smaller
+    //     base (the tg graph, or a runtime pp graph with fewer outputs than the reserve's all-token one) starts from the delay / hold the
+    //     worst-case graph landed on and is capped against the same bound, so it keeps the reserve's effective N instead of re-planning
+    //     smaller (10-14: the runtime pp graph's own 2x cap took FN from n128 to n32 at runtime while the buffer stayed sized for n128).
     static long long cap_mib = -2;
     static double cap_frac = -2;
     if (cap_mib == -2) {
@@ -1061,6 +1070,7 @@ static bool ggml_gallocr_reserve_n_impl(
     if (cap_mib >= 0) {
         cap = (size_t) cap_mib << 20;
     }
+    bool worst = false;
     if (cap_frac >= 0 && (galloc->delay > 0 || galloc->hold > 0)) {
         const int d0 = galloc->delay;
         const long long h0 = galloc->hold;
@@ -1070,7 +1080,14 @@ static bool ggml_gallocr_reserve_n_impl(
         const size_t base = ggml_gallocr_plan_total(galloc);
         galloc->delay = d0;
         galloc->hold = h0;
-        cap = MIN(cap, (size_t) ((double) base * (1.0 + cap_frac)));
+        if (base >= galloc->base_max) {
+            galloc->base_max = base;   // the new worst case: plan it from the configured values and record its landing below
+            worst = true;
+        } else {
+            galloc->delay = MIN(galloc->delay, galloc->delay_at_max);
+            galloc->hold = MIN(galloc->hold, galloc->hold_at_max);
+        }
+        cap = MIN(cap, (size_t) ((double) galloc->base_max * (1.0 + cap_frac)));
     }
     for (;;) {
         ggml_gallocr_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids);
@@ -1088,6 +1105,10 @@ static bool ggml_gallocr_reserve_n_impl(
         if (galloc->hold < (1 << 20)) {
             galloc->hold = 0;
         }
+    }
+    if (worst) {
+        galloc->delay_at_max = galloc->delay;
+        galloc->hold_at_max = galloc->hold;
     }
 
     // set the node_allocs from the hash table
