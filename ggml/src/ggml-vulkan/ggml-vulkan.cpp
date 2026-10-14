@@ -9449,6 +9449,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                 static bool rega_logged = false;
                 if (!rega_logged) { rega_logged = true; fprintf(stderr, "ggml_vulkan: MUL_MAT_ID REG_A tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) nei1, (unsigned) ne10); }
                 ggml_vk_fusion_count_add("MUL_MAT_ID_REGA");
+                ggml_vk_fusion_count_add((std::string("MUL_MAT_ID_REGA:") + ggml_type_name(src0->type)).c_str());
                 pipeline = itr->second[0].aligned;
             }
         }
@@ -9459,9 +9460,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     // engagement read for the manual-fragment port: every MUL_MAT_ID dispatch, the ones on the coopmat register-prefetch / REG_A
     // pipelines (the only ones with an "_mf" build), and the ones that run an "_mf" build
+    // per expert type too (":<type>"), so the REG_A engagement ratio reads MUL_MAT_ID_REGA:<t> / MUL_MAT_ID_ALL:<t>
     ggml_vk_fusion_count_add("MUL_MAT_ID_ALL");
+    ggml_vk_fusion_count_add((std::string("MUL_MAT_ID_ALL:") + ggml_type_name(src0->type)).c_str());
     if (pipeline->name.find("_pf") != std::string::npos) {
         ggml_vk_fusion_count_add("MUL_MAT_ID_PF");
+        ggml_vk_fusion_count_add((std::string("MUL_MAT_ID_PF:") + ggml_type_name(src0->type)).c_str());
         if (pipeline->name.find("_mf") != std::string::npos) {
             ggml_vk_fusion_count_add("MUL_MAT_ID_MANUAL_FRAG");
         }
