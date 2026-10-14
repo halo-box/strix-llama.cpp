@@ -20235,9 +20235,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 return;
             }
             for (int k = mm + 1; k < std::min(mm + 16, graph->n_nodes); ++k) {
-                if (!used[k] && graph->nodes[k]->op == GGML_OP_SCALE && graph->nodes[k]->src[0] == n) {
+                const ggml_tensor * t = graph->nodes[k];
+                if (!used[k] && t->op == GGML_OP_SCALE && t->src[0] == n) {
                     current_set.push_back(k);
                     used[k] = true;
+                    return;
+                }
+                // a node between them that writes the mat-vec's result in place (a view of it: in-place ops, SET / CPY into it)
+                // would change what the SCALE reads: leave the order alone
+                if (t->view_src == n || (t->op == GGML_OP_CPY && t->src[1] && (t->src[1] == n || t->src[1]->view_src == n))) {
                     return;
                 }
             }
