@@ -804,6 +804,12 @@ for be in ${BACKENDS//,/ }; do
         nt=$("$(bin base $be)/llama-tokenize" -m "$m" -f "$OUT/all.txt" --ids --show-count 2> /dev/null | sed -n 's/^Total number of tokens: //p' || true)
         lc=$(( ${nt:-32768} / 2 / 512 * 512 ))
         [ "$lc" -le 16384 ] || lc=16384
+        # llama-perplexity keeps n_ctx x n_vocab logits in RAM (16 GB at 16384 x 248k): on a 128 GB UMA machine a model
+        # that already takes more than LONG_CTX_BIG_GPU_MIB of GPU memory at 2048 is OOM-killed, so its long run is shorter
+        gpu=$(sed -n 's/^PEAK_GPU_MIB=//p' "$OUT/$be/kld/$a-numeric-base.txt" 2> /dev/null | tail -1)
+        if [ "${gpu:-0}" -gt "${LONG_CTX_BIG_GPU_MIB:-65536}" ] && [ "$lc" -gt "${LONG_CTX_BIG:-4096}" ]; then
+            lc=${LONG_CTX_BIG:-4096}
+        fi
         echo "$lc" > "$OUT/$be/kld/$a-long.ctx"
         kld "$be" "$a-long" "$m" "$OUT/all.txt" "-c $lc -b 512 -ub 512" "-c $lc -b 256 -ub 256"
         # pp and tg in one process: llama-bench fills the context once per depth and restores it for the next tests
