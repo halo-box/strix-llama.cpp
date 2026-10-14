@@ -4082,7 +4082,7 @@ static int ggml_cuda_hc_gate_mix_route(ggml_backend_cuda_context & ctx, const gg
         return 0;
     }
     const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
-    return count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix_supported(node->src[0], node->src[1], ma.xn, ma.dst, ma.hc) ? count : 0;
+    return count > 0 && ma.gate == node && ggml_cuda_hc_gate_mix_supported(ctx, node->src[0], node->src[1], ma.xn, ma.dst, ma.hc) ? count : 0;
 }
 
 static int ggml_cuda_match_hc_combine_norm(ggml_cgraph * cgraph, int i,
