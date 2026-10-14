@@ -566,7 +566,14 @@ void main() {
 #define A_SIDX(l) (XL_IDX_BASE ? a_sidx0 + a_shmem_index((l), 0) : a_sidx[(l) / loadstride_a])
 #define B_SIDX(l) (XL_IDX_BASE ? b_sidx0 + (l) * SHMEM_STRIDE : b_sidx[(l) / loadstride_b])
 #ifdef MUL_MAT_ID
-#define PF_B_GUARD if (gl_LocalInvocationID.x < required_work_items)
+// spec constant 17 (GGML_VK_MMID_B_FULL, set only with the row-id fill, GGML_VK_MMID_ROWID_FILL): load B for the whole BN tile, as the
+// release's B_IN does. The filled row ids make every slot a valid row, and the guard folds away at pipeline creation: no lane-divergent
+// branch inside the K loop, so the compiler can keep the A / B prefetch loads in flight across the WMMA section instead of draining
+// vmcnt at the branch (gfx1151 ACO, iq3_xxs REG_A tile: s_waitcnt vmcnt(0) right after the A fetch, every K step)
+// Only where the B loader's passes tile BN exactly (the release's B_IN condition, BN % loadstride_b == 0): otherwise a lane's last pass
+// would land past the B tile in shared memory. Both sides are spec constants, so this folds per pipeline; any other tile keeps the guard.
+layout(constant_id = 17) const uint MMID_B_FULL = 0;
+#define PF_B_GUARD if ((MMID_B_FULL != 0 && BN % loadstride_b == 0) || gl_LocalInvocationID.x < required_work_items)
 #else
 #define PF_B_GUARD
 #endif

@@ -1865,6 +1865,13 @@ static bool ggml_vk_mmid_rowid_fill_enabled() {
     return v;
 }
 
+// GGML_VK_MMID_B_FULL (default 1): the MUL_MAT_ID pf / REG_A pipelines load B for the whole tile (spec constant 17). Forced off when the
+// row-id fill is off: without it the slots past the tile's rows hold stale ids
+static bool ggml_vk_mmid_b_full_enabled() {
+    static const bool v = [] { const char * e = getenv("GGML_VK_MMID_B_FULL"); return (e == nullptr || atoi(e) != 0) && ggml_vk_mmid_rowid_fill_enabled(); }();
+    return v;
+}
+
 static bool ggml_vk_mmid_manual_frag_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_VK_MMID_MANUAL_FRAG"); return e == nullptr || atoi(e) != 0; }();
     return on;
@@ -3062,11 +3069,25 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const std::string mmid_mf_sfx = mmid_mf ? "_mf" : "";
 #define MMID_MF_SPV(base, acc) (mmid_mf ? base##_mf##acc##_cm1_len : base##acc##_cm1_len), (mmid_mf ? base##_mf##acc##_cm1_data : base##acc##_cm1_data)
             static const bool mf_skew = getenv("GGML_VK_TEST_MF_SKEW") != nullptr && atoi(getenv("GGML_VK_TEST_MF_SKEW")) != 0;
+            // GGML_VK_MMID_B_FULL (default 1, only with GGML_VK_MMID_ROWID_FILL on): spec constant 17, the B tile loads without the
+            // per-lane row guard (mul_mm.comp PF_B_GUARD). It needs every row-id slot valid, so it is off whenever the fill is off.
+            const bool mmid_b_full = ggml_vk_mmid_b_full_enabled();
+            // GGML_VK_MMID_B_FULL_LOG=1: per MUL_MAT_ID pf / REG_A tile, whether the shader's B_FULL condition (BN % loadstride_b == 0,
+            // loadstride_b = BLOCK_SIZE * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK as in mul_mm.comp) holds, so it drops the guard, or keeps it
+            auto b_full_log = [&](const std::vector<uint32_t>& wt, bool a) {
+                static const bool log = getenv("GGML_VK_MMID_B_FULL_LOG") != nullptr;
+                if (!log || !mmid_b_full) return;
+                const uint32_t lsb = wt[0] * (a ? 8u : 1u) * (a ? 1u : 2u) / wt[3];
+                GGML_LOG_INFO("ggml_vulkan: MMID_B_FULL tile BLOCK %u BN %u BK %u %s: loadstride_b %u -> %s\n", wt[0], wt[2], wt[3],
+                              a ? "aligned" : "unaligned", lsb, (lsb != 0 && wt[2] % lsb == 0) ? "guard dropped" : "guard kept");
+            };
             spec_fn_t mf_skew_spec = [&](const std::vector<uint32_t>& wt, bool a) {
                 std::vector<uint32_t> spec = ggml_vk_mul_mm_spec(wt, a);
                 if (spec.size() == 12) { spec.push_back(ggml_vk_coopmat_shmem_pad(device, wt[3])); spec.push_back(0); }   // 12, 13
                 while (spec.size() < 16) { spec.push_back(0); }                                                           // 14, 15 (REG_A off)
-                spec.push_back(1u);                                                                                         // 16: MF_SKEW
+                spec.push_back(mf_skew ? 1u : 0u);                                                                          // 16: MF_SKEW
+                spec.push_back(mmid_b_full ? 1u : 0u);                                                                      // 17: MMID_B_FULL
+                b_full_log(wt, a);
                 return spec;
             };
             auto cm1_create_mmid_pf = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
@@ -3074,7 +3095,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
                 // the same subgroup pin as cm1_create: GGML_VK_MMID_WAVE32 retiles tc_mmq_id for WARP = 32, so an unpinned pipeline
                 // would run that tile at the driver's default subgroup size (wave64 on RADV) and cover half of it
-                if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, (mmid_mf && mf_skew) ? mf_skew_spec : cm1_spec, false, true, 0, true,
+                if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, (mf_skew || mmid_b_full) ? mf_skew_spec : cm1_spec, false, true, 0, true,
                                                      cm1_pin || dense_pin || (mmid_wave32 && &tc_base == &tc_mmq_id));
             };
 #define X_CM1_ID_PF(TYPE, tstr) \
@@ -3116,7 +3137,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     if (spec.size() == 12) { spec.push_back(ggml_vk_coopmat_shmem_pad(device, wt[3])); spec.push_back(0); }   // 12, 13
                     if (spec.size() == 14) { spec.push_back(0); }                                                              // 14
                     spec.push_back(3u);                                                                                        // 15: REG_A
-                    if (mmid_mf && mf_skew) { spec.push_back(1u); }                                                            // 16: MF_SKEW (test hook)
+                    spec.push_back(mmid_mf && mf_skew ? 1u : 0u);                                                              // 16: MF_SKEW (test hook)
+                    spec.push_back(mmid_b_full ? 1u : 0u);                                                                     // 17: MMID_B_FULL
+                    b_full_log(wt, a);
                     return spec;
                 };
                 auto cm1_create_rega = [&](vk_matmul_pipeline_key key, const std::string& name, size_t len, const void* data, uint32_t pc) {
@@ -9485,6 +9508,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     ggml_vk_fusion_count_add((std::string("MUL_MAT_ID_ALL:") + ggml_type_name(src0->type)).c_str());
     if (pipeline->name.find("_pf") != std::string::npos) {
         ggml_vk_fusion_count_add("MUL_MAT_ID_PF");
+        if (ggml_vk_mmid_b_full_enabled()) {
+            ggml_vk_fusion_count_add("MUL_MAT_ID_B_FULL");   // the pf / REG_A pipelines were built with spec constant 17 set
+        }
         ggml_vk_fusion_count_add((std::string("MUL_MAT_ID_PF:") + ggml_type_name(src0->type)).c_str());
         if (pipeline->name.find("_mf") != std::string::npos) {
             ggml_vk_fusion_count_add("MUL_MAT_ID_MANUAL_FRAG");
