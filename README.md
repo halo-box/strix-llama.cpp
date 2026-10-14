@@ -1,6 +1,13 @@
 # strix-llama.cpp
 
 <img src="halo-box.png" alt="Halo Box" width="260">
+<b>llama.cpp, close to mainline, with more</b>
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
+[upstream llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) / [halo-box/strix-llama.cpp](https://github.com/halo-box/strix-llama.cpp)
+
+## Halo Box
 
 <b>llama.cpp for AMD Strix Halo</b>
 
@@ -117,6 +124,8 @@ The ones that matter on this hardware:
 | [Vulkan](docs/build.md#vulkan) | GPU |
 | [WebGPU](docs/build.md#webgpu) | All |
 | [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+Most of the work in this fork is measured on AMD Strix Halo (Vulkan and HIP), and CI runs the standard upstream matrix.
+
 
 ## Documentation
 
@@ -153,6 +162,9 @@ for.
 CI runs the standard llama.cpp suite plus a self-hosted `gfx1151` ROCm job on real hardware.
 
 ## Acknowledgements
+This project is a fork and owes everything to the people who built what it forks:
+
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml) - Georgi Gerganov and the llama.cpp contributors - MIT license
 This project is a fork and owes everything to the people who built what it forks:
 
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml) - Georgi Gerganov and the llama.cpp contributors - MIT license
