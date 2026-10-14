@@ -464,7 +464,7 @@ static bool test_seq_cp_scatter(struct llama_model * model, const struct common_
     params_ctx.kv_unified = true;
     auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
 
-    LOGV(LOG_LEVEL_INFO, "\n=== Test %d: seq copy (%s, scatter) ===\n", test_num, on_device ? "device" : "host");
+    LOGV(LOG_LEVEL_INFO, "\n=== Test %d: seq copy (%s, %s) ===\n", test_num, on_device ? "device" : "host", compact ? "scatter to compact" : "scatter");
 
     const uint32_t flags = on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE;
 
@@ -531,11 +531,6 @@ static bool test_seq_cp_scatter(struct llama_model * model, const struct common_
     const size_t nset = llama_state_seq_set_data_ext(ctx.get(), state_save.data(), state_save.size(), 1, flags);
     if (nset != state_save.size()) {
         LOG_ERR("%s: seq set data length %zu does not match expected length %zu\n", __func__, nset, state_save.size());
-        return false;
-    }
-
-    // Test 9: on-device restore with different source and destination chunking.
-    if (!test_seq_cp_scatter(model, params, tokens, 9, true, true)) {
         return false;
     }
     LOG_TRC("%s: seq 1 restored via %s, %zu bytes\n", __func__, on_device ? "device" : "host", nset);
@@ -780,10 +775,10 @@ struct test_suite {
 
 // column headers for the --models table, one per test, in the order they are run
 static const std::vector<const char *> test_names = {
-    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf",
+    "baseline", "seq_rm", "state_load", "cp_h", "cp_d", "cp_h_s", "cp_d_s", "rt", "rf", "cp_d_c",
 };
 
-// Run the full save/load test suite (tests 1-9) for a single model.
+// Run the full save/load test suite (tests 1-10) for a single model.
 // Returns the per-test results.
 static test_suite run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     test_suite suite;
@@ -861,6 +856,9 @@ static test_suite run_save_load_tests_for_model(const std::string & model_path, 
 
     // Test 9: state restore failure
     suite.results.push_back(test_state_restore_failure(model, params, tokens) ? test_status::PASS : test_status::FAIL);
+
+    // Test 10: on-device restore with different source and destination chunking.
+    suite.results.push_back(test_seq_cp_scatter(model, params, tokens, 10, true, true) ? test_status::PASS : test_status::FAIL);
 
     return suite;
 }

@@ -8779,6 +8779,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         q_to_vec_dot(pq, Q_q, DK);
+
         int64_t n_sel = 0;
         if (ids) {
             const int32_t * row = (const int32_t *) ((const char *) ids->data + iq1*ids->nb[1] + (iq3%ids->ne[3])*ids->nb[3]);
@@ -8792,7 +8793,6 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             n_sel = std::unique(keys, keys + n_sel) - keys;
         }
         const int64_t n_dense = std::max<int64_t>(0, std::min(ic_end, n_kv_raw) - ic_start);
-
 
         // online softmax / attention
         // loop over n_kv and n_head_kv

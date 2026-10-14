@@ -5,7 +5,27 @@
 
 #include <cstdint>
 
-static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
+void launch_mul_mat_q_q5_k_j32(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+void launch_mul_mat_q_q6_k_j32(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+
+static bool use_rdna3_5_q5_ling(const mmq_args & args) {
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    return args.type_x == GGML_TYPE_Q5_K && GGML_CUDA_CC_IS_RDNA3_5(cc) && args.ids_dst != nullptr &&
+        ((args.ncols_x == 2560 && args.nrows_x == 768) || (args.ncols_x == 768 && args.nrows_x == 2560)) &&
+        args.nchannels_x == 512 && args.nchannels_y > 0 &&
+        (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y == 32;
+}
+
+static bool use_rdna3_5_q6_ling_j32(const mmq_args & args) {
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    return args.type_x == GGML_TYPE_Q6_K && GGML_CUDA_CC_IS_RDNA3_5(cc) && args.ids_dst != nullptr &&
+        args.ncols_x == 768 && args.nrows_x == 2560 && args.nchannels_x == 512 && args.nchannels_y > 0 &&
+        (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y == 32;
+}
+
+static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1 = GGML_PREC_Q8) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_q_case<GGML_TYPE_Q1_0>(ctx, args, stream);
@@ -100,47 +120,6 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             GGML_ABORT("fatal error");
             break;
     }
-}
-
-// overrides the src1 precision requested by the graph, "auto" keeps the requested one
-static ggml_prec ggml_cuda_mmq_get_prec_env() {
-    const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
-    if (env_c == nullptr) {
-        return GGML_PREC_UNDEFINED;
-    }
-    std::string env_cpp = env_c;
-    for (char & c : env_cpp) {
-        c = std::tolower(c);
-    }
-    if (env_cpp == "q4") {
-        return GGML_PREC_Q4;
-    }
-    if (env_cpp == "q8") {
-        return GGML_PREC_Q8;
-    }
-    if (env_cpp != "auto") {
-        GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_MMQ_PREC: '%s'. Available: 'q4', 'q8', 'auto'.\n", __func__, env_cpp.c_str());
-    }
-    return GGML_PREC_UNDEFINED;
-}
-
-// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
-// default to the native W4A4 instructions on Blackwell.
-static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, const int cc) {
-    static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
-
-    ggml_prec prec = prec_env;
-    if (prec == GGML_PREC_UNDEFINED) {
-        prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
-    }
-
-    // Q4 only for the FP4 types on Blackwell
-    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
-    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
-    if (prec == GGML_PREC_Q8 || !can_use_q4) {
-        return GGML_PREC_Q8;
-    }
-    return GGML_PREC_Q4;
 }
 
 void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1) {
@@ -278,6 +257,47 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 }
 
+// overrides the src1 precision requested by the graph, "auto" keeps the requested one
+static ggml_prec ggml_cuda_mmq_get_prec_env() {
+    const char * env_c = getenv("GGML_CUDA_MMQ_PREC");
+    if (env_c == nullptr) {
+        return GGML_PREC_UNDEFINED;
+    }
+    std::string env_cpp = env_c;
+    for (char & c : env_cpp) {
+        c = std::tolower(c);
+    }
+    if (env_cpp == "q4") {
+        return GGML_PREC_Q4;
+    }
+    if (env_cpp == "q8") {
+        return GGML_PREC_Q8;
+    }
+    if (env_cpp != "auto") {
+        GGML_LOG_WARN("%s: Unknown value for GGML_CUDA_MMQ_PREC: '%s'. Available: 'q4', 'q8', 'auto'.\n", __func__, env_cpp.c_str());
+    }
+    return GGML_PREC_UNDEFINED;
+}
+
+// src1 is quantized to Q8_1 unless the FP4 types can use 4-bit activations, in which case they
+// default to the native W4A4 instructions on Blackwell.
+static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, const int cc) {
+    static const ggml_prec prec_env = ggml_cuda_mmq_get_prec_env();
+
+    ggml_prec prec = prec_env;
+    if (prec == GGML_PREC_UNDEFINED) {
+        prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
+    }
+
+    // Q4 only for the FP4 types on Blackwell
+    GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
+    const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
+    if (prec == GGML_PREC_Q8 || !can_use_q4) {
+        return GGML_PREC_Q8;
+    }
+    return GGML_PREC_Q4;
+}
+
 static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst, const ggml_tensor * swiglu) {
@@ -358,13 +378,13 @@ static void ggml_cuda_mul_mat_q_impl(
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
+
             } else if (swiglu) {
                 quantize_mmq_q8_1_swiglu_cuda(
                     (const float *) gate->data, (const float *) up->data, nullptr, src1_q8_1.get(), src0->type,
                     ne10, ne10_padded, ne11 * ne12 * ne13, /*logical_n1=*/1,
                     gate->nb[1] / sizeof(float), gate->nb[1] / sizeof(float),
                     up->nb[1] / sizeof(float), up->nb[1] / sizeof(float), stream);
-
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -483,6 +503,16 @@ static void ggml_cuda_mul_mat_q_impl(
         ne12, ncols_opt};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, nullptr);
+}
+
+void ggml_cuda_mul_mat_q_swiglu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * swiglu) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, swiglu, ids, dst, swiglu);
 }
 
 

@@ -2540,7 +2540,6 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
     ggml_set_input(cur);
-    cb(cur, "inp_out_ids", -1);
     ggml_set_name(cur, "out_ids");
 
     res->add_input(std::move(inp));
@@ -2555,7 +2554,6 @@ ggml_tensor * llm_graph_context::build_inp_mean() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, ubatch.n_seqs_unq);
     ggml_set_input(cur);
-    cb(cur, "inp_mean", -1);
     ggml_set_name(cur, "mean");
 
     res->add_input(std::move(inp));
@@ -2570,7 +2568,6 @@ ggml_tensor * llm_graph_context::build_inp_cls() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_seqs_unq);
     ggml_set_input(cur);
-    cb(cur, "inp_cls", -1);
     ggml_set_name(cur, "cls");
 
     res->add_input(std::move(inp));
@@ -2596,7 +2593,6 @@ ggml_tensor * llm_graph_context::build_inp_cross_embd() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_enc);
     ggml_set_input(cur);
-    cb(cur, "inp_cross_embd", -1);
     ggml_set_name(cur, "cross_embd");
 
     res->add_input(std::move(inp));
@@ -2611,7 +2607,6 @@ ggml_tensor * llm_graph_context::build_inp_pos_bucket_enc() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens, n_tokens);
     ggml_set_input(cur);
-    cb(cur, "inp_pos_bucket_enc", -1);
     ggml_set_name(cur, "pos_bucket_enc");
 
     res->add_input(std::move(inp));
@@ -2630,7 +2625,6 @@ ggml_tensor * llm_graph_context::build_inp_pos_bucket_dec() const {
 
     cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_tokens);
     ggml_set_input(cur);
-    cb(cur, "inp_pos_bucket_dec", -1);
     ggml_set_name(cur, "pos_bucket_dec");
 
     res->add_input(std::move(inp));
@@ -2805,7 +2799,6 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     // note: there is no KV cache, so the number of KV values is equal to the number of tokens in the batch
     inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
     ggml_set_input(inp->self_kq_mask);
-    cb(inp->self_kq_mask, "attn_inp_kq_mask", -1);
     cb(inp->self_kq_mask, "self_kq_mask", -1);
 
     inp->self_kq_mask_cnv = inp->self_kq_mask;
@@ -2813,7 +2806,7 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         inp->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
         ggml_set_input(inp->self_kq_mask_swa);
-        cb(inp->self_kq_mask_swa, "attn_inp_kq_mask_swa", -1);
+        cb(inp->self_kq_mask_swa, "self_kq_mask_swa", -1);
 
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
     } else {
@@ -3592,7 +3585,6 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
-    ggml_set_name(inp->s_copy, "inp_s_copy");
     ggml_set_name(inp->s_copy, "rs_s_copy");
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);

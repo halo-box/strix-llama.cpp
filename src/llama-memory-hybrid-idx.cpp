@@ -181,6 +181,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
 }
 
 void llama_memory_hybrid_idx::clear(bool data) {
+    qsa_prefix.reset(); qsa_recover_pending = false; std::fill(qsa_ready.begin(), qsa_ready.end(), 0);
+    if (data) { for (const auto & entry : qsa_buffers) { ggml_backend_buffer_clear(entry.second.get(), 0); } }
     llama_memory_hybrid::clear(data);
 
     if (mem_idx) {
@@ -193,6 +195,7 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
     }
+
     if (incremental_qsa && !qsa_prefix.valid) { qsa_recover_pending = true; }
     if (incremental_qsa && qsa_prefix.valid && (seq_id < 0 || seq_id == qsa_prefix.sequence)) {
         if (p1 < 0 || size_t(p1) >= qsa_prefix.cells.size()) {
@@ -200,7 +203,6 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
             for (auto & ready : qsa_ready) { ready = std::min<int64_t>(ready, qsa_prefix.cells.size()/4); }
         } else { qsa_invalidate(); }
     }
-
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, p0, p1);
     }
@@ -209,6 +211,7 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    qsa_invalidate();
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
     if (mem_idx) {
@@ -217,6 +220,7 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+    if (!qsa_prefix.valid || (qsa_prefix.sequence >= 0 && seq_id != qsa_prefix.sequence)) { qsa_invalidate(); }
     llama_memory_hybrid::seq_keep(seq_id);
 
     if (mem_idx) {
@@ -225,6 +229,7 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    qsa_invalidate();
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
     if (mem_idx) {
@@ -233,6 +238,7 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    qsa_invalidate();
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
     if (mem_idx) {
@@ -248,25 +254,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
             mb[buft_size.first] += buft_size.second;
         }
     }
-    if (ubatch.is_pos_2d()) {
-        // a 2-D (image) cell whose position exceeds its linear position breaks the scalar test; scan the cells
-        // once per distinct sequence in the ubatch, not once per token
-        const int64_t n_kv = get_idx()->get_n_kv();
-        bool seen[LLAMA_MAX_SEQ] = { false };
-        for (uint32_t i=0;i<ubatch.n_tokens;++i) {
-            const llama_seq_id s = ubatch.seq_id[i][0];
-            if (s < 0 || s >= LLAMA_MAX_SEQ || seen[s]) { continue; }
-            seen[s] = true;
-            const auto & cells = mem->get_mem_idx()->get_cells(s);
-            for (int64_t j=0;j<n_kv;++j) {
-                if (!cells.is_empty(j) && cells.seq_has(j,s) && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { return false; }
-            }
-        }
-    }
+
     for (const auto & entry : qsa_buffers) {
         mb[ggml_backend_buffer_get_type(entry.second.get())] += ggml_backend_buffer_get_size(entry.second.get());
     }
-
     return mb;
 }
 
@@ -350,8 +341,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
         uint32_t ratio,
         bool blk_bias,
         bool causal_attn) const {
-    if (!set_input_qsa_prefix(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias)) {
-        set_input_qsa_scan(cell_blk, blk_cells, blk_pos, bias, nullptr, ubatch, ratio, blk_bias);
+    // the prefix fast path encodes the causal rule
+    if (!causal_attn || !set_input_qsa_prefix(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias)) {
+        set_input_qsa_scan(cell_blk, blk_cells, blk_pos, bias, nullptr, ubatch, ratio, blk_bias, causal_attn);
     }
 }
 
@@ -361,7 +353,7 @@ void llama_memory_hybrid_idx::set_input_qsa_blocks(
     if (tail_idxs && cell_blk->ne[1] == 1 && qsa_metadata(blk_cells, blk_pos, bias, tail_idxs, *ubatch, ratio)) {
         return;
     }
-    set_input_qsa_scan(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, true);
+    set_input_qsa_scan(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, true, true);
 }
 
 // On the tracked prefix the compact metadata follows directly: the complete blocks are the first L/4 position
@@ -495,7 +487,8 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
         ggml_tensor * tail_idxs,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        bool causal_attn) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -808,6 +801,7 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
 
             // the tail is an incomplete block and is always visible, as in the reference
             const int64_t tail_start = (q + 1)/r*r;
+
             if (dst_tail && q+1>tail_start) {
                 const int64_t pb=tail_start/r;
                 if (pb>=0 && pb<n_blocks) {
@@ -832,7 +826,6 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
                 continue;
             }
 
-
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
                 // the caller adds the attention mask, which drops empty, foreign and, when causal, future cells
@@ -845,7 +838,8 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
                     }
 
                     // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = (causal_attn && bid_idx[b] >= tail_start) ? 1e9f : 0.0f;
+                    // with tails the own block is never scored (its cells come from the tail), so it is hidden
+                    cur_blk_bias[b] = (causal_attn && bid_idx[b] >= tail_start) ? (dst_tail ? -INFINITY : 1e9f) : 0.0f;
                 }
 
                 // the spare block holds the unpooled cells, which are the incomplete tail, so
@@ -978,4 +972,135 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(mem != nullptr);
 
     mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn);
+}
+
+void llama_memory_hybrid_idx_context::set_input_qsa_blocks(
+        ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio) const {
+    GGML_ASSERT(mem != nullptr);
+    mem->set_input_qsa_blocks(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio);
+}
+
+bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch, uint32_t ratio) const {
+    if (qsa_prefix_matches(ubatch)) { return true; }
+    if (!qsa_scalar_visibility(ubatch, ratio)) { return false; }
+    const llama_seq_id seq=ubatch.seq_id[0][0];
+    return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),get_idx()->get_n_kv(),seq);
+}
+
+uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
+    const uint32_t n_kv = get_idx() ? get_idx()->get_n_kv() : 0;
+    if (!mem || !mem->get_mem_idx()) { return n_kv; }
+    llama_pos pos_max = -1;
+    // a unified cache maps every seq id to stream 0; otherwise seq s is stream s and seq_to_stream holds n_stream ids.
+    // this is the stream count of the cache: get_n_stream() counts the streams of the ubatch, 1 for a single slot
+    const uint32_t n_stream = mem->get_mem_idx()->get_n_stream();
+    const llama_seq_id n_seq_scan = n_stream == 1 ? (llama_seq_id) LLAMA_MAX_SEQ : (llama_seq_id) n_stream;
+    for (llama_seq_id s = 0; s < n_seq_scan; ++s) {
+        pos_max = std::max(pos_max, mem->get_mem_idx()->get_cells(s).seq_pos_max(s));
+    }
+    if (pos_max < 0) { return n_kv; }
+    const uint32_t window = ((uint32_t) pos_max + 1 + 255) / 256 * 256;
+    return std::max(n_kv, window);
+}
+
+bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const {
+    if (qsa_prefix_matches(ubatch)) { return true; }
+    if (get_n_stream()!=1 || !get_idx() || !ubatch.token || !ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id ||
+            ubatch.n_seq_id[0]<1 || !ubatch.seq_id[0]) { return false; }
+    // one stream: every seq id of the ubatch reads the same cells
+    return qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[0][0]), get_idx()->get_n_kv(), ratio, ubatch);
+}
+
+void llama_memory_hybrid_idx::qsa_invalidate() {
+    qsa_prefix.invalidate(); qsa_recover_pending = true; std::fill(qsa_ready.begin(), qsa_ready.end(), 0);
+}
+
+bool llama_memory_hybrid_idx::qsa_recover(llama_seq_id seq) {
+    if (mem_idx->get_n_stream() != 1) { return false; }
+    const auto & raw = mem_idx->get_cells(seq);
+    if (raw.size() != qsa_prefix.positions.size()) { return false; }
+    qsa_prefix_state rebuilt(qsa_prefix.positions.size());
+    rebuilt.cells.resize(raw.get_used(), -1);
+    for (uint32_t cell=raw.used_min(); cell<raw.used_max_p1(); ++cell) {
+        if (raw.is_empty(cell)) { continue; }
+        const int32_t pos = raw.pos_get(cell);
+        const auto & ext = raw.ext_get(cell);
+        if (pos < 0 || size_t(pos) >= rebuilt.cells.size() || rebuilt.cells[pos] >= 0 ||
+            !raw.seq_has(cell, seq) || raw.seq_get_all(cell).count() != 1 ||
+            !((ext.x == 0 && ext.y == 0) || (ext.x == pos && ext.y == pos))) { return false; }
+        rebuilt.cells[pos] = cell; rebuilt.positions[cell] = pos;
+    }
+    if (std::find(rebuilt.cells.begin(), rebuilt.cells.end(), -1) != rebuilt.cells.end()) { return false; }
+    rebuilt.sequence = seq;
+    for (size_t b=0; b<rebuilt.cells.size()/4; ++b) { rebuilt.block_positions.push_back(b*4); }
+    qsa_prefix = std::move(rebuilt);
+    return true;
+}
+
+void llama_memory_hybrid_idx::qsa_apply(const llama_ubatch & u, const llama_kv_cache::slot_info & slots) {
+    if (!incremental_qsa) { return; }
+    const auto reject = [&]() { qsa_invalidate(); qsa_recover_pending = false; };
+    if (!u.token || !u.pos || !u.n_tokens || slots.n_stream() != 1 ||
+        slots.size() != u.n_tokens || !u.n_pos || !u.seq_id || !u.n_seq_id || u.n_seq_id[0] != 1 || !u.seq_id[0]) {
+        reject(); return;
+    }
+    const auto seq = u.seq_id[0][0];
+    for (uint32_t i=0; i<u.n_tokens; ++i) {
+        if (u.n_seq_id[i] != 1 || !u.seq_id[i] || u.seq_id[i][0] != seq || int64_t(u.pos[i]) != int64_t(u.pos[0])+i) {
+            reject(); return;
+        }
+        for (uint32_t axis=1; axis<u.n_pos; ++axis) {
+            if (u.pos[i+axis*u.n_tokens] != u.pos[i]) { reject(); return; }
+        }
+    }
+    if (!qsa_prefix.valid && (!qsa_recover_pending || !qsa_recover(seq))) { qsa_recover_pending = false; return; }
+    qsa_recover_pending = false;
+    if (!qsa_prefix.apply(seq, u.pos[0], slots.idxs[0])) { reject(); }
+}
+
+bool llama_memory_hybrid_idx::qsa_prefix_matches(const llama_ubatch & u) const {
+    if (!incremental_qsa || !qsa_prefix.valid || !u.token || !u.pos || !u.n_tokens || !u.n_pos || !u.seq_id || !u.n_seq_id ||
+        u.pos[0] != qsa_prefix.begin || int64_t(u.n_tokens) != qsa_prefix.end-qsa_prefix.begin) { return false; }
+    for (uint32_t i=0; i<u.n_tokens; ++i) {
+        if (u.n_seq_id[i] != 1 || !u.seq_id[i] || u.seq_id[i][0] != qsa_prefix.sequence || u.pos[i] != u.pos[0]+int32_t(i)) { return false; }
+        for (uint32_t a=1; a<u.n_pos; ++a) { if (u.pos[i+a*u.n_tokens] != u.pos[i]) { return false; } }
+    }
+    return true;
+}
+
+bool llama_memory_hybrid_idx::qsa_fast(int il, const llama_ubatch & u) const {
+    // Re-pool only the (n+3)/4+2 blocks this ubatch touches. The pooled keys match full re-pooling
+    // exactly. The earlier 128..512 output mismatch was not the cache: the 3 host inputs this path adds
+    // per layer moved the scheduler's input-count split cuts, and the CUDA backend dropped the BF16
+    // residual mark of any residual whose next combine landed across a cut (fixed there, see
+    // mmb_res16_pending). Larger ubatches are untested; QSA_FAST_MAX=127 restores the old limit.
+    static const int max_tokens = getenv("QSA_FAST_MAX") ? atoi(getenv("QSA_FAST_MAX")) : 512;
+    return qsa_prefix_matches(u) && int(u.n_tokens) <= max_tokens && u.n_tokens <= 512 && qsa_keys.at(il) &&
+        qsa_ready.at(il) >= int64_t(qsa_prefix.previous_size/4) &&
+        qsa_prefix.cells.size()/4 >= (u.n_tokens+3)/4+1;
+}
+
+ggml_tensor * llama_memory_hybrid_idx::qsa_cache(ggml_context * ctx, int il, int64_t blocks) const {
+    if (!incremental_qsa || !qsa_keys.at(il)) { return nullptr; }
+    auto * k = qsa_keys[il]; GGML_ASSERT(blocks + 1 <= k->ne[1]);
+    return ggml_view_2d(ctx, k, k->ne[0], blocks + 1, k->nb[1], 0);
+}
+
+void llama_memory_hybrid_idx::qsa_fill_updates(ggml_tensor * members, ggml_tensor * pos, ggml_tensor * rows) const {
+    const int count = rows->ne[0], complete = qsa_prefix.cells.size()/4;
+    const int first = qsa_prefix.begin/4, last = std::min(complete, (qsa_prefix.end+3)/4);
+    GGML_ASSERT(last-first < count && complete >= count - 1);
+    std::vector<int32_t> ids = { complete };
+    for (int b=first; b<last; ++b) { ids.push_back(b); }
+    for (int b=0; int(ids.size())<count; ++b) { if (b<first || b>=last) { ids.push_back(b); } }
+    auto * c = (int32_t *) members->data; auto * p = (int32_t *) pos->data; auto * w = (int64_t *) rows->data;
+    for (int i=0; i<count; ++i) {
+        w[i] = ids[i];
+        for (int j=0; j<4; ++j) { c[4*i+j] = ids[i] == complete ? 0 : qsa_prefix.cells[ids[i]*4+j]; p[j*count+i] = ids[i] == complete ? 0 : ids[i]*4; }
+    }
+}
+
+void llama_memory_hybrid_idx::qsa_commit(int il) const {
+    GGML_ASSERT(qsa_prefix.valid); qsa_ready.at(il) = qsa_prefix.cells.size()/4;
 }

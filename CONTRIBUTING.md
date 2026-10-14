@@ -1,3 +1,27 @@
+# Contributing to strix-llama.cpp
+
+This is a community fork of [`llama.cpp`](https://github.com/ggml-org/llama.cpp) for **AMD Strix Halo**
+(Ryzen AI Max / Max+ 300 series, `gfx1151`, RDNA 3.5 iGPU, unified memory). It is small, it is device-specific, and it
+runs by its own rules - the sections below replace upstream's where they differ. The coding and naming guidelines
+further down are upstream's and are kept as-is, because this fork stays mergeable with upstream.
+
+# Where does my change go?
+
+```
+ggml-org/llama.cpp            upstream
+  |
+  +-- halo-box/llama.cpp      staging fork for changes intended to go upstream
+        |
+        +-- halo-box/strix-llama.cpp   <-- this repo
+```
+
+- **Strix Halo specific, or justified by measurements on Strix Halo** -> open the PR here.
+- **A general llama.cpp improvement** -> open it against
+  [halo-box/llama.cpp](https://github.com/halo-box/llama.cpp) instead, and follow that repo's (upstream's) rules,
+  including its AI policy. Nothing is submitted upstream from this repo.
+
+If you are unsure, open an issue here and ask. Landing something in the wrong repo costs everyone more than asking.
+
 # Contributors
 
 The project differentiates between 3 levels of contributors:
@@ -20,10 +44,9 @@ who do not want to write code. A `llama-bench` run on a configuration nobody her
 
 What is allowed here that is not allowed upstream:
 
-1. Explicitly disclose the manner in which AI was employed.
-2. Check for an existing PR addressing the same change; if one exists, comment there to work with its author instead of opening a duplicate.
-3. Perform a comprehensive manual review prior to submitting the pull request. A proper code review usually takes something like one hour per 200-400 LOC and you should be spending **at least that much time on code review alone**.
-4. Be prepared to explain every line of code you submit when asked about it by a maintainer.
+- An agent may write the code, the commit messages, and the PR description.
+- An agent may open the PR itself (`gh pr create`) and reply to review comments.
+- An agent may run unattended, as long as it follows [AGENTS.md](AGENTS.md).
 
 What is still required, of humans and agents alike:
 

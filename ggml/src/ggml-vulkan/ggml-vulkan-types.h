@@ -76,6 +76,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <set>
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include <shared_mutex>
 
@@ -360,7 +361,6 @@ struct vk_queue_handle_synchronized : vk_queue_handle {
     void lock()   override { mutex.lock(); }
     void unlock() override { mutex.unlock(); }
 };
-// Driver guarantees internal synchronization via VK_KHR_internally_synchronized_queues
 
 struct vk_queue_handle_unsynchronized : vk_queue_handle {
     void submit(vk::ArrayProxy<const vk::SubmitInfo> submits, vk::Fence fence) override;
@@ -531,21 +531,6 @@ static constexpr std::initializer_list<ggml_op> topk_moe_late_softmax      { GGM
 static constexpr std::initializer_list<ggml_op> snake_pattern              { GGML_OP_MUL,      GGML_OP_SIN,
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
                                                                              GGML_OP_ADD };
-// qwen4 QSA indexer: gather per-block scores to cells + add f16 mask (cast+reshape) + top-k,
-// fused into one radix-select. The cast/reshape are elided; the raw f16 mask is read in-shader.
-static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
-                                                                   GGML_OP_CONT,     GGML_OP_CPY,
-                                                                   GGML_OP_RESHAPE,  GGML_OP_ADD,
-                                                                   GGML_OP_TOP_K };
-static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
-    { 1, 0, 0 }, // permute->src[0] == get_rows
-    { 2, 0, 1 }, // cont->src[0]    == permute
-    { 4, 0, 3 }, // reshape->src[0] == cpy (mask cast)
-    { 5, 0, 2 }, // add->src[0]     == cont
-    { 5, 1, 4 }, // add->src[1]     == reshape
-    { 6, 0, 5 }, // top_k->src[0]   == add
-};
-
 
 static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
@@ -691,6 +676,22 @@ static constexpr std::array<ggml_type, 9> lightning_indexer_k_types = {
 
 class vk_memory_logger;
 
+// Indexer head counts we build kernels for: 4 = Qwen4-exp (qwen4_exp), 64 = DeepSeek-V4 and
+// GLM-DSA, 32 kept because test-backend-ops exercises it. N_HEAD is a specialization constant,
+// so each entry is a separately compiled kernel with the head loop fully unrolled - as a push
+// constant the loop cannot unroll and decode costs ~55% more (measured, gfx1151, kv=131584).
+static constexpr uint32_t LI_NH_VALUES[] = { 4, 32, 64 };
+#define LI_NH_COUNT (sizeof(LI_NH_VALUES) / sizeof(LI_NH_VALUES[0]))
+
+static inline int ggml_vk_li_nh_index(int64_t nh) {
+    for (size_t i = 0; i < LI_NH_COUNT; ++i) {
+        if ((int64_t) LI_NH_VALUES[i] == nh) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
     std::mutex queue_submit_mutex;
@@ -822,10 +823,6 @@ struct vk_device_struct {
     matmul_tile_selector_t matmul_tile_selector;
     matmul_tile_selector_t matmul_id_tile_selector;
 
-    // EXPERIMENT (GGML_VK_MMID_F16B=1): f16-B mul_mat_id pipelines on KHR_coopmat
-    // devices (upstream only builds f32-B there). Populated only when the env flag
-    // is set; empty otherwise.
-    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_id_f16b[GGML_TYPE_COUNT];
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
 
@@ -971,7 +968,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
-    vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
@@ -1019,9 +1015,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_union_f16;
     vk_pipeline pipeline_flash_attn_gather_union_f16;
     vk_pipeline pipeline_flash_attn_gather_union_dq[GGML_TYPE_COUNT];
-    vk_pipeline pipeline_dsv4_hc_pre_f32;
-    vk_pipeline pipeline_dsv4_hc_comb_f32;
-    vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1252,13 +1245,6 @@ class vk_perf_logger {
         }
         timings[name].push_back(time);
     }
-    // Log a sub-node interval under a caller-supplied name. Used for work a node's handler
-    // dispatches before the op itself (e.g. the FA K/V contiguize/dequant pass), which would
-    // otherwise be billed to the op and invisible. No flops: these move bytes, not math.
-    void log_timing_named(const char *name, uint64_t time) {
-        timings[std::string(name)].push_back(time);
-    }
-
 
     void log_timing(const std::vector<ggml_tensor *> &nodes, const std::vector<const char *> &names, uint64_t time) {
         uint64_t total_flops = 0;
@@ -1276,6 +1262,13 @@ class vk_perf_logger {
             flops[name].push_back(total_flops);
         }
         timings[name].push_back(time);
+    }
+
+    // Log a sub-node interval under a caller-supplied name. Used for work a node's handler
+    // dispatches before the op itself (e.g. the FA K/V contiguize/dequant pass), which would
+    // otherwise be billed to the op and invisible. No flops: these move bytes, not math.
+    void log_timing_named(const char *name, uint64_t time) {
+        timings[std::string(name)].push_back(time);
     }
 
   private:
@@ -1463,34 +1456,6 @@ struct CompileTask {
     bool require_full_subgroups;
     uint32_t required_subgroup_size;
 };
-// EXPERIMENT (GGML_VK_MMID_F16B=1): convert the contiguous f32 activations (B) of
-// quantized MUL_MAT_ID to f16 and run the f16-B matmul_id kernels instead of the
-// f32-B ones. Halves B bytes and buf_b shared memory (better occupancy) at the
-// f32->f16 rounding cost upstream already accepts on the coopmat2 path.
-static bool ggml_vk_mmid_f16b_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_VK_MMID_F16B");
-        return env == nullptr || atoi(env) != 0;   // on by default; =0 disables
-    }();
-    return enabled;
-}
-
-// GGML_VK_DENSE_F16B: same idea as GGML_VK_MMID_F16B but for plain MUL_MAT. Halves the B bytes
-// moved. Numerically identical: mul_mm stages B into shared FLOAT_TYPE either way, so the f32-B
-// kernel already rounds B to f16. Helps wide dense models, costs ~1% on narrow ones.
-// 0 = off, 1 = all quantized dense matmuls, 2 = auto (only the K we have positive data for)
-static int ggml_vk_dense_f16b_mode() {
-    static const int mode = [] {
-        const char * e = getenv("GGML_VK_DENSE_F16B");
-        if (e == nullptr) return 0;
-        if (e[0] == 'a') return 2;
-        return atoi(e) != 0 ? 1 : 0;
-    }();
-    return mode;
-}
-
-static bool ggml_vk_dense_f16b_enabled() { return ggml_vk_dense_f16b_mode() != 0; }
-
 
 struct ggml_vk_debug_label {
     // at most one of these is set, depending on the scope the label was opened in

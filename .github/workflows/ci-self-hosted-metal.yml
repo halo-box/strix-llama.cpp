@@ -20,6 +20,7 @@ on:
     ]
 
   pull_request:
+    branches-ignore: ['**']
     types: [opened, synchronize, reopened]
     paths: [
       '.github/workflows/ci-self-hosted-metal.yml',

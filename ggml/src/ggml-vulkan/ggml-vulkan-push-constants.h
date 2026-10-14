@@ -12,8 +12,7 @@ struct vk_mat_mat_push_constants {
     uint32_t base_work_group_z; uint32_t num_batches;
     uint32_t k_split;
     uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
-    uint32_t n_experts;
-    uint32_t hoist_row_ids;
+    uint32_t padded_N;
 };
 
 struct vk_mat_vec_push_constants {
@@ -88,7 +87,6 @@ struct vk_flash_attn_push_constants {
 
     uint32_t ne1;
     uint32_t ne2;
-    uint32_t dst_ne2;
     uint32_t ne3;
 
     uint32_t neq2;
@@ -397,10 +395,6 @@ template <> inline void init_pushconst_fastdiv(vk_op_glu_push_constants &p) {
     init_fastdiv_values(p.ne20,                p.ne2_0mp,      p.ne2_0L);
 }
 
-template <> void init_pushconst_fastdiv(vk_op_count_experts_push_constants &p) {
-    init_fastdiv_values(p.ne00, p.ne00mp, p.ne00L);
-}
-
 template <> inline void init_pushconst_fastdiv(vk_op_count_experts_push_constants &p) {
     init_fastdiv_values(p.ne00, p.ne00mp, p.ne00L);
 }
@@ -698,20 +692,6 @@ struct vk_op_lightning_indexer_push_constants {
 
 static_assert(sizeof(vk_op_lightning_indexer_push_constants) <= 128);
 
-struct vk_op_gated_delta_net_push_constants {
-    uint32_t H;
-    uint32_t n_tokens;
-    uint32_t n_seqs;
-    uint32_t s_off;
-    uint32_t sq1, sq2, sq3;
-    uint32_t sv1, sv2, sv3;
-    uint32_t sb1, sb2, sb3;
-    uint32_t neq1, rq3;
-    float scale;
-    uint32_t K;
-};
-
-// push constants for the fork's wave64 f16 lightning-indexer kernels (scalar-64 + CM family)
 struct vk_op_lightning_indexer_cm_push_constants {
     uint32_t n_kv, n_batch, n_stream, nem3;
     uint32_t nb1, nb3;
@@ -722,34 +702,6 @@ struct vk_op_lightning_indexer_cm_push_constants {
 };
 static_assert(sizeof(vk_op_lightning_indexer_cm_push_constants) <= 128);
 
-struct vk_op_dsv4_hc_pre_push_constants {
-    uint32_t n_embd, hc, nr;
-    uint32_t sx0, sx1, sx2;
-    uint32_t sw0, sw1;
-    uint32_t sd0, sd1;
-};
-static_assert(sizeof(vk_op_dsv4_hc_pre_push_constants) <= 128);
-
-struct vk_op_dsv4_hc_comb_push_constants {
-    uint32_t n_tokens;
-    uint32_t sm0, sm1;
-    uint32_t ss0;
-    uint32_t sb0;
-    uint32_t sd0, sd1, sd2;
-    float    eps;
-    int32_t  n_iter;
-};
-static_assert(sizeof(vk_op_dsv4_hc_comb_push_constants) <= 128);
-
-struct vk_op_dsv4_hc_post_push_constants {
-    uint32_t n_embd, hc, nr;
-    uint32_t sx0, sx1;
-    uint32_t sr0, sr1, sr2;
-    uint32_t sp0, sp1;
-    uint32_t sc0, sc1, sc2;
-    uint32_t sd0, sd1, sd2;
-};
-static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 struct vk_op_flash_attn_union_push_constants {
     uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to, count_only;
 };
@@ -758,7 +710,6 @@ struct vk_op_flash_attn_union_push_constants {
 struct vk_op_flash_attn_gather_union_push_constants {
     uint32_t n_kv, n_kv_raw, kv_c_max, nbk1, nbm1, n_batch, row_words;
 };
-
 struct vk_op_flash_attn_gather_push_constants {
     uint32_t n_kv, n_kv_raw, n_top_k, kv_c;
     uint32_t nbk1, nbk3, nbt1, nbt3, nbm1, nbm3, nem3, n_batch, row_words;
@@ -777,6 +728,19 @@ struct vk_op_flash_attn_top_k_push_constants {
     uint32_t split_mode;
 };
 static_assert(sizeof(vk_op_flash_attn_top_k_push_constants) <= 128);
+
+struct vk_op_gated_delta_net_push_constants {
+    uint32_t H;
+    uint32_t n_tokens;
+    uint32_t n_seqs;
+    uint32_t s_off;
+    uint32_t sq1, sq2, sq3;
+    uint32_t sv1, sv2, sv3;
+    uint32_t sb1, sb2, sb3;
+    uint32_t neq1, rq3;
+    float scale;
+    uint32_t K;
+};
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
@@ -942,6 +906,7 @@ struct vk_op_flash_attn_split_k_reduce_push_constants {
     // destination's query count. They differ only when the caller tiles the split buffer, and
     // the destination stride between streams must always use the full count.
     uint32_t ne2;
+    uint32_t dst_ne2;
     uint32_t ne3;
     uint32_t k_num;
     uint32_t sinks;
@@ -957,16 +922,6 @@ struct vk_op_flash_attn_mask_opt_push_constants {
     uint32_t nbd1;
     uint32_t nbd2;
     uint32_t nbd3;
-};
-
-struct vk_op_flash_attn_sparse_compact_push_constants {
-    uint32_t KV;
-    uint32_t nem1;
-    uint32_t nem2;
-    uint32_t nbm1;
-    uint32_t nbm2;
-    uint32_t nbm3;
-    uint32_t n_kv_max;
 };
 
 struct vk_op_flash_attn_sparse_compact_push_constants {

@@ -248,6 +248,13 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+    // LLAMA_FUSED_DSV4_HC_PRE=0 / LLAMA_FUSED_DSV4_HC_POST=0 keep the unfused hyper-connection graph
+    if (const char * env = getenv("LLAMA_FUSED_DSV4_HC_PRE")) {
+        cparams.fused_dsv4_hc_pre = atoi(env) != 0;
+    }
+    if (const char * env = getenv("LLAMA_FUSED_DSV4_HC_POST")) {
+        cparams.fused_dsv4_hc_post = atoi(env) != 0;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -756,8 +763,7 @@ void llama_context::sched_reserve() {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-    // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
-    if (!model.hparams.no_alloc && !opt_ctx) {
+        if (!model.hparams.no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
@@ -1443,25 +1449,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+
     // LLAMA_GRAPH_TIMING=1: log where the CPU time of a decode goes (build, alloc, inputs)
     static const bool graph_timing = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")) != 0;
     int64_t t_build = 0, t_alloc = 0, t_inputs = 0;
     bool reused = false;
 
-
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+        reused = true;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // Pipeline-parallel graphs may still read input tensors when set_inputs updates them below.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
+        ggml_backend_sched_prepare_inputs(sched.get());
 
         n_reused++;
     } else {
         // The previous asynchronous graph may still use allocations that reset releases.
         ggml_backend_sched_synchronize(sched.get());
-
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -1479,8 +1482,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
-        const auto t_alloc_us = ggml_time_us();
 
+        const auto t_alloc_us = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1823,8 +1826,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
         // posix_fadvise only, so a wrong prediction costs readahead and nothing else
         extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
-        if (model.arch == LLM_ARCH_QWEN4EXP && batch_inp.token && batch_inp.n_tokens >= 4096) {
-            qwen4exp_ple_prefetch(model, batch_inp.token, batch_inp.n_tokens);
+        const llama_batch & batch = balloc->get_batch();
+        if (model.arch == LLM_ARCH_QWEN4EXP && batch.token && batch.n_tokens >= 4096) {
+            qwen4exp_ple_prefetch(model, batch.token, batch.n_tokens);
         }
     }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
@@ -3063,82 +3067,8 @@ public:
 
                 if (same_chunking) {
                     // same chunking: copy 1:1 by index
-            if (mbuf_cur.n_tensors == mbuf.n_tensors) {
-                // an equal tensor count does not imply the same chunking, e.g. save ranges [2,1] vs restore runs [1,2]
-                bool same_chunking = true;
-                for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                    if (ggml_nbytes(mbuf_cur.cpy[i]) != ggml_nbytes(mbuf.org[i])) {
-                        same_chunking = false;
-                        break;
-                    }
-                }
-
-            // different chunking: copy the write-side data (mbuf_cur.cpy) into the read-side targets (mbuf.org)
-            // with a byte cursor. Write and read enumerate the same logical data in the same order but may chunk
-            // it differently (even with an equal number of tensors), so copy across tensor boundaries rather than
-            // 1:1 by index.
-            const size_t total = mbuf_cur.total_size;
-
-            ggml_init_params params_scratch = {
-                /*.mem_size   =*/ 2*(mbuf_cur.cpy.size() + mbuf.org.size())*ggml_tensor_overhead(),
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-            ggml_context * ctx_scratch = ggml_init(params_scratch);
-
-            size_t src_pos  = 0;
-            size_t dst_pos  = 0;
-            size_t src_j    = 0;
-            size_t dst_i    = 0;
-            size_t src_base = 0;
-            size_t dst_base = 0;
-
-            while (src_pos < total) {
-                const auto & src_t = mbuf_cur.cpy[src_j];
-                const auto & dst_t = mbuf.org[dst_i];
-
-                const size_t src_size = ggml_nbytes(src_t);
-                const size_t dst_size = ggml_nbytes(dst_t);
-
-                const size_t src_off  = src_pos - src_base;
-                const size_t dst_off  = dst_pos - dst_base;
-
-                const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
-
-                const size_t   el   = ggml_element_size(src_t);
-                const int64_t n_el = (int64_t) (n_copy / el);
-
-                auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
-                ggml_backend_view_init(src_v);
-                auto * dst_v = ggml_view_1d(ctx_scratch, dst_t, n_el, dst_off);
-                ggml_backend_view_init(dst_v);
-
-                ggml_backend_tensor_copy(src_v, dst_v);
-
-                src_pos += n_copy;
-                dst_pos += n_copy;
-
-                if (src_pos - src_base == src_size) {
-                    src_base = src_pos;
-                    ++src_j;
-                }
-                if (dst_pos - dst_base == dst_size) {
-                    dst_base = dst_pos;
-                    ++dst_i;
-                }
-            }
-
-            GGML_ASSERT(src_pos == total && dst_pos == total);
-            // any tensors left unvisited hold no data
-            for (size_t i = src_j; i < mbuf_cur.cpy.size(); ++i) {
-                GGML_ASSERT(ggml_nbytes(mbuf_cur.cpy[i]) == 0);
-            }
-            for (size_t i = dst_i; i < mbuf.org.size(); ++i) {
-                GGML_ASSERT(ggml_nbytes(mbuf.org[i]) == 0);
-            }
-
-            ggml_free(ctx_scratch);
-                continue;
+                    for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+                        ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
                     }
                     continue;
                 }
@@ -3632,15 +3562,6 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
-    if (cparams.flash_attn) {
-        LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
-        cparams.flash_attn = false;
-
-        // the graph changes without flash attention, need to reserve again
-        sched_need_reserve = true;
-        sched_reserve();
-    }
-
 
     if (cparams.flash_attn) {
         LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
@@ -3987,14 +3908,6 @@ llama_context * llama_init_from_model(
 
     try {
         auto * ctx = new llama_context(*model, params);
-        const auto & cparams = ctx->get_cparams();
-
-        if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
-            LLAMA_LOG_INFO("%s: custom YaRN scaling detected, re-adjusting n_ctx_train(%u)...\n", __func__, model->hparams.n_ctx_train);
-            model->hparams.n_ctx_train = cparams.n_ctx_orig_yarn / cparams.rope_freq_scale;
-            LLAMA_LOG_INFO("%s: n_ctx_train adjusted to %u\n", __func__, model->hparams.n_ctx_train);
-        }
-
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {

@@ -300,10 +300,10 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
-
         if (ctx_spf) {
             llama_memory_seq_rm(llama_get_memory(ctx_spf), id, -1, -1);
         }
+
         prompt.clear();
     }
 
@@ -452,6 +452,7 @@ struct server_slot {
     bool can_speculate() const {
         return !!spec;
     }
+
     const server_tokens & prompt_src() const {
         return spec_prefill_active ? spec_prefill_tokens : task->tokens;
     }
@@ -459,7 +460,6 @@ struct server_slot {
     int32_t n_prompt_src() const {
         return spec_prefill_active ? (int32_t) spec_prefill_tokens.size() : task->n_tokens();
     }
-
 
     void add_token(const completion_token_output & token) {
         if (!is_processing()) {
@@ -497,8 +497,8 @@ struct server_slot {
         if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.size();
-            llama_pos pos = prompt.tokens.pos_next();
 
+            llama_pos pos = prompt.tokens.pos_next();
 
             if (!inp_embd.empty()) {
                 add_ok &= batch.add(id, inp_embd, pos, true, false);
@@ -542,6 +542,10 @@ struct server_slot {
             t_last_used = ggml_time_us();
 
             state = SLOT_STATE_IDLE;
+
+            if (ctx_spf) {
+                llama_memory_seq_rm(llama_get_memory(ctx_spf), id, -1, -1);
+            }
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -903,12 +907,12 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
+
     common_init_result_ptr llama_init_spf;
     llama_context_ptr ctx_spf_own;
     llama_model *   model_spf = nullptr;
     llama_context * ctx_spf   = nullptr;
     common_sampler_ptr smpl_spf;
-
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1231,6 +1235,7 @@ private:
 
             load_progress_callback(1.0f, &load_progress_spec);
         }
+
         if (params_base.speculative.prefill.enabled) {
             if (llama_model_is_recurrent(model_tgt)) {
                 SRV_ERR("%s", "speculative prefill is not supported for recurrent models\n");
@@ -1331,7 +1336,6 @@ private:
                 return false;
             }
         }
-
 
         if (has_mmproj) {
             if (callback_state) {
@@ -3546,7 +3550,7 @@ private:
 
                             const bool is_stateless_task = slot.task->type == SERVER_TASK_TYPE_EMBEDDING || slot.task->type == SERVER_TASK_TYPE_RERANK;
 
-                            if (slot.task->params.cache_prompt && !is_stateless_task) {
+                            if (slot.task->params.cache_prompt && !slot.spec_prefill_active && !is_stateless_task) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -3925,10 +3929,10 @@ private:
                     if (slot.prompt.n_tokens() == n_prompt_in) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
-
                         if (slot.spec_prefill_active && slot.task) {
                             slot.stats.n_prompt_processed = slot.task->n_tokens() - slot.stats.n_prompt_cached;
                         }
+
                         GGML_ASSERT(batch.size() > 0);
 
                         // extract the logits only for the last token

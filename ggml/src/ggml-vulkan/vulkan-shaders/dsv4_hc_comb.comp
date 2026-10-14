@@ -1,101 +1,90 @@
 #version 450
 
-// DeepSeek V4 fused hyper-connection "comb": build the 4x4 stream-mixing matrix per token —
-// per-source softmax over scaled+biased logits, then eps-stabilized alternating column/row
-// (sinkhorn) normalization. Port of ggml-cuda/dsv4-hc.cu (hc_comb): one THREAD per token,
-// the whole 4x4 lives in registers. At decode this is a single active thread by design —
-// the fusion's value is collapsing the ~dozen decomposed graph ops (and their intermediate
-// tensors) into one dispatch, not throughput.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+// 16 lanes per token, indexed idst + hc*isrc: idst in bits 0..1, isrc in bits 2..3,
+// so subgroupShuffleXor by 1|2 reduces a row and by 4|8 a column.
 
-layout(binding = 0) readonly  buffer MBuf { float data_mixes[]; };
-layout(binding = 1) readonly  buffer SBuf { float data_scale[]; };
-layout(binding = 2) readonly  buffer BBuf { float data_base[];  };
-layout(binding = 3) writeonly buffer DBuf { float data_d[];     };
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
-layout(push_constant) uniform Parameters {
-    uint  n_tokens;
-    uint  sm0, sm1;
-    uint  ss0;
-    uint  sb0;
-    uint  sd0, sd1, sd2;
+layout(local_size_x_id = 0, local_size_y = 4, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint n_tokens;
+
+    uint nbm0; uint nbm1;   // mixes
+    uint nbs0;              // scale
+    uint nbb0;              // base
+    uint nbd0; uint nbd1; uint nbd2;   // dst
+
+    uint m_offset;
+    uint s_offset;
+    uint b_offset;
+    uint d_offset;
+
     float eps;
-    int   n_iter;
-} p;
+    uint n_iter;
+};
 
-const uint HC = 4;
-const uint COMB_OFFSET = 2 * HC; // comb logits start after the pre/post blocks of the mix vector
+layout(binding = 0, std430) readonly buffer M { float data_m[]; };
+layout(binding = 1, std430) readonly buffer S { float data_s[]; };
+layout(binding = 2, std430) readonly buffer B { float data_b[]; };
+layout(binding = 3, std430) writeonly buffer D { float data_d[]; };
 
-void norm_cols(inout float comb[HC * HC]) {
-    for (uint idst = 0; idst < HC; ++idst) {
-        float sum = p.eps;
-        for (uint isrc = 0; isrc < HC; ++isrc) {
-            sum += comb[idst + HC * isrc];
-        }
-        const float inv_sum = 1.0 / sum;
-        for (uint isrc = 0; isrc < HC; ++isrc) {
-            comb[idst + HC * isrc] *= inv_sum;
-        }
-    }
-}
+const uint hc          = 4;
+const uint comb_offset = 2 * hc;
 
-void norm_rows(inout float comb[HC * HC]) {
-    for (uint isrc = 0; isrc < HC; ++isrc) {
-        float sum = p.eps;
-        for (uint idst = 0; idst < HC; ++idst) {
-            sum += comb[idst + HC * isrc];
-        }
-        const float inv_sum = 1.0 / sum;
-        for (uint idst = 0; idst < HC; ++idst) {
-            comb[idst + HC * isrc] *= inv_sum;
-        }
-    }
-}
+const uint TOKENS_PER_SUBGROUP = SUBGROUP_SIZE / 16;
 
 void main() {
-    const uint it = gl_GlobalInvocationID.x;
-    if (it >= p.n_tokens) {
-        return;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint blk  = lane >> 4;    // which 16-lane block, i.e. which token
+    const uint idx  = lane & 15;    // idst + hc*isrc
+
+    const uint sg = gl_WorkGroupID.x * gl_WorkGroupSize.y + gl_SubgroupID;
+    const uint it = sg * TOKENS_PER_SUBGROUP + blk;
+
+    // no early return, the shuffles need every lane; out-of-range blocks compute a discarded value
+    const bool in_range = it < n_tokens;
+
+    const float scale_comb = data_s[s_offset + 2 * nbs0];
+
+    float v = 0.0f;
+    if (in_range) {
+        v = data_m[m_offset + (comb_offset + idx) * nbm0 + it * nbm1] * scale_comb
+          + data_b[b_offset + (comb_offset + idx) * nbb0];
     }
 
-    const float scale_comb = data_scale[2 * p.ss0];
-    float comb[HC * HC];
+    // Softmax across destinations: the four lanes sharing an isrc.
+    float vmax = max(v, subgroupShuffleXor(v, 1));
+    vmax = max(vmax, subgroupShuffleXor(vmax, 2));
+    v = exp(v - vmax);
 
-    for (uint isrc = 0; isrc < HC; ++isrc) {
-        float vmax = uintBitsToFloat(0xff800000); // -inf
-        for (uint idst = 0; idst < HC; ++idst) {
-            const uint idx = idst + HC * isrc;
-            const float v = data_mixes[(COMB_OFFSET + idx) * p.sm0 + it * p.sm1] * scale_comb
-                          + data_base[(COMB_OFFSET + idx) * p.sb0];
-            comb[idx] = v;
-            vmax = max(vmax, v);
-        }
+    float sum = v + subgroupShuffleXor(v, 1);
+    sum += subgroupShuffleXor(sum, 2);
+    v = v / sum + eps;
 
-        float sum = 0.0;
-        for (uint idst = 0; idst < HC; ++idst) {
-            const uint idx = idst + HC * isrc;
-            const float v = exp(comb[idx] - vmax);
-            comb[idx] = v;
-            sum += v;
-        }
+    // Normalize columns: equal destination indices are four lanes apart.
+    sum = v + subgroupShuffleXor(v, 4);
+    sum += subgroupShuffleXor(sum, 8);
+    v /= sum + eps;
 
-        const float inv_sum = 1.0 / sum;
-        for (uint idst = 0; idst < HC; ++idst) {
-            const uint idx = idst + HC * isrc;
-            comb[idx] = comb[idx] * inv_sum + p.eps;
-        }
+    for (uint i = 1; i < n_iter; ++i) {
+        sum = v + subgroupShuffleXor(v, 1);
+        sum += subgroupShuffleXor(sum, 2);
+        v /= sum + eps;
+
+        sum = v + subgroupShuffleXor(v, 4);
+        sum += subgroupShuffleXor(sum, 8);
+        v /= sum + eps;
     }
 
-    norm_cols(comb);
-    for (int i = 1; i < p.n_iter; ++i) {
-        norm_rows(comb);
-        norm_cols(comb);
-    }
-
-    for (uint isrc = 0; isrc < HC; ++isrc) {
-        for (uint idst = 0; idst < HC; ++idst) {
-            data_d[idst * p.sd0 + isrc * p.sd1 + it * p.sd2] = comb[idst + HC * isrc];
-        }
+    if (in_range) {
+        const uint idst = idx & 3;
+        const uint isrc = idx >> 2;
+        data_d[d_offset + idst * nbd0 + isrc * nbd1 + it * nbd2] = v;
     }
 }

@@ -15,10 +15,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <functional>
-#include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
@@ -204,25 +204,6 @@ static test_status test_multi_seq_split_replay(const common_params & params, lla
             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, true);
         }
     }
-    // the in-place recurrent state is only enabled for qwen35 and qwen35moe
-    char arch[64] = {};
-    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
-    if (strcmp(arch, "qwen35") != 0 && strcmp(arch, "qwen35moe") != 0) {
-        fprintf(stderr, "%s : skipping test_seq_cp_graph_reuse for %s\n", __func__, arch);
-        return 0;
-    }
-
-    llama_model * model_scaled = load_model_scaled(params);
-    if (model_scaled == nullptr) {
-        fprintf(stderr, "%s : failed to create scaled model\n", __func__);
-        return 1;
-    }
-    const bool ok = test_seq_cp_graph_reuse(params, model_scaled);
-    llama_model_free(model_scaled);
-    if (!ok) {
-        return 1;
-    }
-
     ok = llama_decode(ctx_roll.get(), batch) == 0;
     ok = ok && llama_decode(ctx_ref.get(), batch) == 0;
     llama_batch_free(batch);
@@ -331,6 +312,272 @@ static test_status test_multi_seq_split_replay(const common_params & params, lla
 
     LOG_INF("%s: seq-1-only decode independent of seq 0 (max diff %g, nmse %g)\n", __func__, (double) diff_tail, nmse_tail);
     return test_status::PASS;
+}
+
+static void set_tensor_data_scaled(ggml_tensor * tensor, void * userdata) {
+    const size_t seed = *(const size_t *) userdata ^ std::hash<std::string>{}(tensor->name);
+    std::mt19937 gen(seed);
+    std::normal_distribution<float> dis(0.0f, 1.0f);
+
+    // norm weights and matrices at scale 1: at the 0.01 scale of the generated models the recurrent
+    // branch is too small to change the logits, so a wrong recurrent state would go unnoticed
+    const bool  is_norm = strstr(tensor->name, "norm") != nullptr;
+    const float scale   = ggml_n_dims(tensor) > 1 ? 1.0f : 1.0e-2f;
+
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+    std::vector<float> tmp(ggml_nelements(tensor));
+    for (auto & x : tmp) {
+        x = is_norm ? 1.0f : scale*dis(gen);
+    }
+    ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+}
+
+// same hparams as the model file, new random weights
+static llama_model * load_model_scaled(common_params & params) {
+    gguf_init_params gparams = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+    gguf_context * meta_file = gguf_init_from_file(params.model.path.c_str(), gparams);
+    if (meta_file == nullptr) {
+        return nullptr;
+    }
+    gguf_context * meta = gguf_init_empty();
+    gguf_set_kv(meta, meta_file);
+    gguf_free(meta_file);
+
+    size_t seed = 1234;
+    llama_model * model = llama_model_init_from_user(meta, set_tensor_data_scaled, &seed, common_model_params_to_llama(params));
+    gguf_free(meta);
+    return model;
+}
+
+static void set_graph_reuse_disable(bool disable) {
+#ifdef _WIN32
+    _putenv_s("LLAMA_GRAPH_REUSE_DISABLE", disable ? "1" : "");
+#else
+    if (disable) {
+        setenv("LLAMA_GRAPH_REUSE_DISABLE", "1", 1);
+    } else {
+        unsetenv("LLAMA_GRAPH_REUSE_DISABLE");
+    }
+#endif
+}
+
+// Two sequences share ubatches while seq_cp swaps them, forks one and rolls it back, with graph reuse on.
+// With n_rs_seq = 0 the recurrent state can be read in place when no state is copied, so a seq_cp between
+// two same-shape ubatches must stop the graph from being reused. Checked against a context without graph
+// reuse (same ubatches, so bit-exact), a context with n_rs_seq = 1, which never reads the state in place,
+// and a context that decodes one sequence per ubatch.
+static bool test_seq_cp_graph_reuse(const common_params & params, llama_model * model) {
+    const char * func    = __func__;
+    const int    n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    const auto make = [&](uint32_t n_rs_seq, bool reuse) {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = 3;
+        cparams.n_rs_seq   = n_rs_seq;
+        cparams.n_ctx      = 256;
+        cparams.n_batch    = 64;
+        cparams.n_ubatch   = 64;
+        cparams.kv_unified = true;
+        set_graph_reuse_disable(!reuse);
+        llama_context * ctx = llama_init_from_model(model, cparams);
+        set_graph_reuse_disable(false);
+        return ctx;
+    };
+
+    struct arm {
+        const char *    name;
+        llama_context * ctx;
+        bool            split;    // one llama_decode per sequence
+        float           eps;      // max |logit diff| against the first arm, relative to its max |logit|
+        float           diff_max;
+    };
+    std::vector<arm> arms = {
+        { "reuse",       make(0, true),  false, 0.0f,  0.0f },
+        { "no-reuse",    make(0, false), false, 1e-6f, 0.0f },
+        { "no-in-place", make(1, false), false, 1e-5f, 0.0f },
+        { "seq-split",   make(0, false), true,  1e-4f, 0.0f },
+    };
+
+    const auto cleanup = [&]() {
+        for (auto & a : arms) {
+            llama_free(a.ctx);
+        }
+    };
+
+    for (const auto & a : arms) {
+        if (a.ctx == nullptr) {
+            fprintf(stderr, "%s : failed to init %s context\n", __func__, a.name);
+            cleanup();
+            return false;
+        }
+    }
+
+    llama_pos pos[3] = { 0, 0, 0 };
+    uint32_t  n_step = 0;
+    bool      ok     = true;
+
+    const auto decode = [&](const std::vector<llama_seq_id> & seqs, uint32_t n_tokens) {
+        if (!ok) {
+            return;
+        }
+        n_step++;
+        const auto token = [&](llama_seq_id s, uint32_t i) {
+            return (llama_token) ((13*n_step + 7*(uint32_t) s + 3*i + 1) % (uint32_t) n_vocab);
+        };
+
+        const size_t n_rows = seqs.size()*n_tokens;
+        std::vector<std::vector<float>> logits(arms.size());
+        llama_batch batch = llama_batch_init(n_rows, 0, 1);
+        for (size_t k = 0; ok && k < arms.size(); ++k) {
+            logits[k].reserve(n_rows*n_vocab);
+            const size_t n_batches = arms[k].split ? seqs.size() : 1;
+            for (size_t b = 0; ok && b < n_batches; ++b) {
+                common_batch_clear(batch);
+                for (size_t j = 0; j < seqs.size(); ++j) {
+                    if (arms[k].split && j != b) {
+                        continue;
+                    }
+                    for (uint32_t i = 0; i < n_tokens; ++i) {
+                        common_batch_add(batch, token(seqs[j], i), pos[seqs[j]] + (llama_pos) i, { seqs[j] }, true);
+                    }
+                }
+                ok = llama_decode(arms[k].ctx, batch) == 0;
+                for (int32_t i = 0; ok && i < batch.n_tokens; ++i) {
+                    const float * l = llama_get_logits_ith(arms[k].ctx, i);
+                    logits[k].insert(logits[k].end(), l, l + n_vocab);
+                }
+            }
+            if (!ok) {
+                fprintf(stderr, "%s : %s decode failed at step %u\n", func, arms[k].name, n_step);
+            }
+        }
+        llama_batch_free(batch);
+
+        for (size_t r = 0; ok && r < n_rows; ++r) {
+            const float * ref = logits[0].data() + r*n_vocab;
+            float ref_max = 0.0f;
+            for (int t = 0; t < n_vocab; ++t) {
+                ref_max = std::max(ref_max, std::fabs(ref[t]));
+            }
+            for (size_t k = 1; k < arms.size(); ++k) {
+                const float * cur = logits[k].data() + r*n_vocab;
+                float diff = 0.0f;
+                for (int t = 0; t < n_vocab; ++t) {
+                    diff = std::max(diff, logit_diff(ref[t], cur[t]));
+                }
+                diff /= std::max(ref_max, std::numeric_limits<float>::min());
+                arms[k].diff_max = std::max(arms[k].diff_max, diff);
+                if (!(diff <= arms[k].eps)) {
+                    fprintf(stderr, "%s : step %u, seq %d row %zu: %s differs from %s by %g (rel)\n",
+                            func, n_step, seqs[r/n_tokens], r % n_tokens, arms[k].name, arms[0].name, (double) diff);
+                    ok = false;
+                }
+            }
+        }
+        for (llama_seq_id s : seqs) {
+            pos[s] += (llama_pos) n_tokens;
+        }
+    };
+
+    const auto seq_cp = [&](llama_seq_id src, llama_seq_id dst) {
+        for (auto & a : arms) {
+            llama_memory_t mem = llama_get_memory(a.ctx);
+            ok = ok && llama_memory_seq_rm(mem, dst, -1, -1);
+            llama_memory_seq_cp(mem, src, dst, -1, -1);
+        }
+        pos[dst] = pos[src];
+    };
+
+    const auto seq_rm = [&](llama_seq_id s) {
+        for (auto & a : arms) {
+            ok = ok && llama_memory_seq_rm(llama_get_memory(a.ctx), s, -1, -1);
+        }
+        pos[s] = 0;
+    };
+
+    const auto swap_01 = [&]() {
+        seq_cp(0, 2);
+        seq_cp(1, 0);
+        seq_cp(2, 1);
+        seq_rm(2);
+    };
+
+    // seq 1 is decoded first, so the first shared ubatch reorders the cells
+    decode({ 1 }, 5);
+    decode({ 0 }, 5);
+    for (uint32_t n_tokens : { 2u, 3u, 1u }) {
+        decode({ 0, 1 }, n_tokens);
+        decode({ 0, 1 }, n_tokens);
+        decode({ 0, 1 }, n_tokens);
+
+        // same ubatch shape, head and rs_z as the step before: only the state copy map changes
+        swap_01();
+        decode({ 0, 1 }, n_tokens);
+        decode({ 0, 1 }, n_tokens);
+
+        decode({ 0 }, n_tokens);
+        decode({ 1 }, n_tokens);
+        decode({ 0 }, n_tokens);
+        decode({ 1 }, n_tokens);
+
+        // fork seq 0, advance it, then roll it back to the fork
+        seq_cp(0, 2);
+        decode({ 0, 1 }, n_tokens);
+        decode({ 0, 1 }, n_tokens);
+        seq_cp(2, 0);
+        decode({ 0, 1 }, n_tokens);
+        seq_rm(2);
+        decode({ 0, 1 }, n_tokens);
+        decode({ 0, 1 }, n_tokens);
+    }
+
+    const int32_t n_reused = llama_perf_context(arms[0].ctx).n_reused;
+    if (ok && n_reused == 0) {
+        fprintf(stderr, "%s : graph reuse was not exercised\n", __func__);
+        ok = false;
+    }
+
+    if (ok) {
+        fprintf(stderr, "%s : %u steps matched, %d graphs reused (max rel diff: %s %g, %s %g, %s %g)\n", __func__, n_step, n_reused,
+                arms[1].name, (double) arms[1].diff_max, arms[2].name, (double) arms[2].diff_max, arms[3].name, (double) arms[3].diff_max);
+    }
+
+    cleanup();
+    return ok;
+}
+
+static test_status test_seq_cp_graph_reuse_for_model(const std::string & model_path, const common_params & base_params) {
+    common_params params = base_params;
+    params.model.path = model_path;
+
+    gguf_init_params gparams = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+    gguf_context * meta = gguf_init_from_file(model_path.c_str(), gparams);
+    if (meta == nullptr) {
+        LOG_ERR("%s: failed to read model metadata\n", __func__);
+        return test_status::FAIL;
+    }
+    const int64_t key = gguf_find_key(meta, "general.architecture");
+    const std::string arch = key >= 0 ? gguf_get_val_str(meta, key) : "";
+    gguf_free(meta);
+
+    // the in-place recurrent state is only enabled for qwen35 and qwen35moe
+    if (arch != "qwen35" && arch != "qwen35moe") {
+        LOG_INF("%s: skipping test_seq_cp_graph_reuse for %s\n", __func__, arch.c_str());
+        return test_status::SKIP;
+    }
+
+    llama_model_ptr model_scaled{load_model_scaled(params)};
+    if (!model_scaled) {
+        LOG_ERR("%s: failed to create scaled model\n", __func__);
+        return test_status::FAIL;
+    }
+    return test_seq_cp_graph_reuse(params, model_scaled.get()) ? test_status::PASS : test_status::FAIL;
 }
 
 // Save a rolled-back single-seq state, restore it into fresh and dirty
@@ -631,27 +878,29 @@ int main(int argc, char ** argv) {
         // silence everything but the table itself (LOG has verbosity LOG_LEVEL_OUTPUT = 0)
         common_log_set_verbosity_thold(0);
 
-        LOG("%-*s  %-8s  %s\n", (int) name_width, "Model", "rollback", "split replay");
+        LOG("%-*s  %-8s  %-12s  %s\n", (int) name_width, "Model", "rollback", "split replay", "seq cp graph reuse");
         common_log_flush(common_log_main());
 
-        size_t n_pass[2] = { 0, 0 };
-        size_t n_skip[2] = { 0, 0 };
-        size_t n_fail[2] = { 0, 0 };
+        size_t n_pass[3] = { 0, 0, 0 };
+        size_t n_skip[3] = { 0, 0, 0 };
+        size_t n_fail[3] = { 0, 0, 0 };
         for (const auto & model_path : models) {
             const auto name = std::filesystem::path(model_path).filename().string();
 
             LOG("%-*s", (int) name_width, name.c_str());
 
             const test_results res = run_tests_for_model(model_path, params);
+            const test_status graph = (res.rollback == test_status::FAIL || res.replay == test_status::FAIL)
+                    ? test_status::SKIP : test_seq_cp_graph_reuse_for_model(model_path, params);
 
             // all status strings have the same raw length, so the columns line up;
             // pad the first status to the width of the "rollback" header + separator
-            LOG("  %s      %s", test_status_str(res.rollback), test_status_str(res.replay));
+            LOG("  %s      %s          %s", test_status_str(res.rollback), test_status_str(res.replay), test_status_str(graph));
             LOG("\n");
             common_log_flush(common_log_main());
 
-            const test_status all[2] = { res.rollback, res.replay };
-            for (int t = 0; t < 2; ++t) {
+            const test_status all[3] = { res.rollback, res.replay, graph };
+            for (int t = 0; t < 3; ++t) {
                 switch (all[t]) {
                     case test_status::PASS: n_pass[t]++; break;
                     case test_status::FAIL: n_fail[t]++; break;
@@ -668,11 +917,17 @@ int main(int argc, char ** argv) {
         LOG_INF("%s: split replay: %zu passed, %zu skipped, %zu failed (of %zu)\n",
                 __func__, n_pass[1], n_skip[1], n_fail[1], models.size());
 
-        return (n_fail[0] + n_fail[1]) == 0 ? 0 : 1;
+        LOG_INF("%s: seq cp graph reuse: %zu passed, %zu skipped, %zu failed (of %zu)\n",
+                __func__, n_pass[2], n_skip[2], n_fail[2], models.size());
+
+        return (n_fail[0] + n_fail[1] + n_fail[2]) == 0 ? 0 : 1;
     }
 
     // single-model mode
     const test_results res = run_tests_for_model(params.model.path, params);
 
-    return (res.rollback == test_status::FAIL || res.replay == test_status::FAIL) ? 1 : 0;
+    if (res.rollback == test_status::FAIL || res.replay == test_status::FAIL) {
+        return 1;
+    }
+    return test_seq_cp_graph_reuse_for_model(params.model.path, params) == test_status::FAIL ? 1 : 0;
 }

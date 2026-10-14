@@ -134,10 +134,8 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                         arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_close) | arg_string, "xml-arg-string");
                     }
 
-                    if (param_schema.contains("enum") && param_schema.at("enum").is_array() &&
-                        !param_schema.at("enum").empty() &&
-                        std::all_of(param_schema.at("enum").begin(), param_schema.at("enum").end(),
-                                    [](const json & value) { return value.is_string(); })) {
+                    if (param.schema->kind() == common_chat_schema::KIND_ENUM) {
+                        const auto & enum_values = static_cast<const common_chat_schema_enum &>(*param.schema).values;
                         auto values = p.choice();
                         bool all_strings = true;
                         for (const auto & value : enum_values) {
@@ -151,6 +149,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                             arg_value = p.tool_arg_string_value(values) + arg_close;
                         }
                     }
+
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
 
                     (param.required ? required_args : optional_args).push_back(arg_rule);

@@ -1330,8 +1330,8 @@ The `response_format` parameter supports both plain JSON output (e.g. `{"type": 
 `reasoning_format`: The reasoning format to be parsed. If set to `none`, it will output the raw generated text.
 
 `reasoning_control`: Arms realtime reasoning control for this completion so it can be ended early via `/v1/chat/completions/control`. Defaults to `false`.
-`reasoning_budget_enabled`: Explicit master switch for reasoning budget, soft-warning, intro, grace, and runtime reasoning control fields. Omit it to keep the server or CLI default.
 
+`reasoning_budget_enabled`: Explicit master switch for reasoning budget, soft-warning, intro, grace, and runtime reasoning control fields. Omit it to keep the server or CLI default.
 
 `generation_prompt`: The generation prompt that was prefilled in by the template. Prepended to model output before parsing.
 
@@ -1455,10 +1455,10 @@ The response also includes a standard `usage` object:
 The server supports parsing and returning reasoning via the `reasoning_content` field, similar to Deepseek API.
 
 Reasoning input (preserve reasoning in history) is also supported by some specific templates. For more details, please refer to [PR#18994](https://github.com/ggml-org/llama.cpp/pull/18994).
+
 Reasoning budget controls can force a hard cutoff, insert soft warnings, insert an intro message, and wait for a paragraph break after budget exhaustion. Set `reasoning_budget_enabled` in a request to override the server or CLI default.
 
 Chat Completions usage reports reasoning tokens in `usage.reasoning` and `usage.completion_tokens_details.reasoning_tokens`. Responses usage reports them in `usage.reasoning` and `usage.output_tokens_details.reasoning_tokens`.
-
 
 ### POST `/v1/chat/completions/control`: Control a running chat completion in real time
 

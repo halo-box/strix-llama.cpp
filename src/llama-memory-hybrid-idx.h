@@ -1,8 +1,8 @@
 #pragma once
 
 #include "llama-memory-hybrid.h"
-
 #include "qsa-prefix-state.h"
+
 #include <memory>
 #include <vector>
 
@@ -90,7 +90,6 @@ public:
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, bool causal_attn) const;
-
     // complete-block selection metadata: tails and, when the bias is I32, compact limits
     void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                               ggml_tensor * bias, ggml_tensor * tail_idxs,
@@ -103,6 +102,7 @@ public:
     ggml_tensor * qsa_cache(ggml_context * ctx, int il, int64_t blocks) const;
     void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows) const;
     void qsa_commit(int il) const;
+
 private:
     // closed-form metadata for an incremental ubatch on the tracked prefix; false when the scan is needed
     bool set_input_qsa_prefix(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
@@ -112,7 +112,7 @@ private:
     // [n_seq x n_blocks starts] ++ [n_tps tails] ++ [n_tps row idx]
     void set_input_qsa_scan(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                             ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch,
-                            uint32_t ratio, bool blk_bias) const;
+                            uint32_t ratio, bool blk_bias, bool causal_attn) const;
     // closed-form block metadata on the tracked prefix for the compact I32 bias; false when the scan is needed
     bool qsa_metadata(ggml_tensor * cells, ggml_tensor * positions, ggml_tensor * bias,
                       ggml_tensor * tails, const llama_ubatch & ubatch, uint32_t ratio) const;
@@ -173,6 +173,7 @@ public:
 
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
+
     bool qsa_prefix_matches(const llama_ubatch & u) const { return mem && mem->qsa_prefix_matches(u); }
     bool qsa_fast(int il, const llama_ubatch & u) const { return mem && mem->qsa_fast(il, u); }
     // cells the block metadata must cover: the KV view is sized by occupied cells, but a cache whose positions
@@ -185,14 +186,12 @@ public:
     void qsa_fill_updates(ggml_tensor * members, ggml_tensor * pos, ggml_tensor * rows) const { mem->qsa_fill_updates(members, pos, rows); }
     void qsa_commit(int il) const { mem->qsa_commit(il); }
 
-
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, bool causal_attn) const;
-
     void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                               ggml_tensor * bias, ggml_tensor * tail_idxs,
                               const llama_ubatch * ubatch, uint32_t ratio) const;
@@ -201,6 +200,7 @@ public:
     bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
     // scalar visibility and the cached cells form a single-sequence prefix with unique positions
     bool qsa_position_prefix(const llama_ubatch & ubatch, uint32_t ratio) const;
+
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
 

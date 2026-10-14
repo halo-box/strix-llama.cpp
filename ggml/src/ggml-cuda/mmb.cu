@@ -1036,7 +1036,7 @@ void ggml_cuda_mmb_release_all(ggml_backend_cuda_context & ctx) {
 }
 // A producer writes the BF16 copy of t itself: the entry is found by the MMB GEMM that reads t next.
 uint16_t * ggml_cuda_mmb_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
-    if (!mmb_enabled()) return nullptr;
+    if (!mmb_enabled(ctx)) return nullptr;
     return mmb_cache_insert(ctx, t, n);
 }
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
