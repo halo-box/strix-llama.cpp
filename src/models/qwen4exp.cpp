@@ -3,7 +3,6 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
-#include "llama-ple-disk.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1587,24 +1586,11 @@ public:
 
         const int64_t n_want = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
 
-        // exactly one of the two is built: `rows` when the table is a tensor and the
-        // graph does the get_rows, `embd` when --ngram-on-disk gathered it in set_input.
-        // Dereferencing `rows` unconditionally segfaults on every on-disk decode.
-        if (rows) {
-            return rows->ne[0] == n_want;      // I32 [n_heads*n_tokens]
-        }
-        if (embd) {
-            return embd->ne[1] == n_want;      // F32 [ple_head_dim, n_heads*n_tokens]
-        }
-        return false;
+        return rows->ne[0] == n_want;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
 
-    ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]: the gathered rows, when the table is on disk
-
-    std::vector<float>   embd_buf;
-    std::vector<int32_t> rows_global;
     ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]: the gathered rows, when the table is on disk
 
     std::vector<float>   embd_buf;
@@ -1771,19 +1757,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         return;
     }
 
-    if (pmodel.ple_disk) {
-        // idx is already exactly what the reader wants: one global row per (token, head),
-        // token-major, with ple_head_offsets folded in by the loop above. The previous
-        // version read it head-major and added the offset a second time, which is only
-        // correct for a table split per head -- on a joined per_layer_token_embd it walks
-        // past the end (rows beyond ple_rows) and gather() aborts.
-        GGML_ASSERT(embd != nullptr && rows == nullptr);
-        embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
-        pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
-        ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
-        return;
-    }
-
 #if defined(__linux__) || defined(__APPLE__)
     // The table is memory-mapped and the gathered rows are effectively random, so every row is a
     // page fault the CPU get_rows would otherwise take one after another (~0.2 ms each from NVMe).
@@ -1915,10 +1888,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     }
     res->add_input(std::move(ple_inp));
 
-    if (rows != nullptr) {
-        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
-    }
+    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

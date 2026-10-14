@@ -360,6 +360,7 @@ struct vk_queue_handle_synchronized : vk_queue_handle {
     void lock()   override { mutex.lock(); }
     void unlock() override { mutex.unlock(); }
 };
+// Driver guarantees internal synchronization via VK_KHR_internally_synchronized_queues
 
 struct vk_queue_handle_unsynchronized : vk_queue_handle {
     void submit(vk::ArrayProxy<const vk::SubmitInfo> submits, vk::Fence fence) override;

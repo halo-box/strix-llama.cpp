@@ -134,6 +134,23 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                         arg_value = p.gbnf(p.atomic(p.tool_arg_json_value(json_value) + arg_close) | arg_string, "xml-arg-string");
                     }
 
+                    if (param_schema.contains("enum") && param_schema.at("enum").is_array() &&
+                        !param_schema.at("enum").empty() &&
+                        std::all_of(param_schema.at("enum").begin(), param_schema.at("enum").end(),
+                                    [](const json & value) { return value.is_string(); })) {
+                        auto values = p.choice();
+                        bool all_strings = true;
+                        for (const auto & value : enum_values) {
+                            if (!value.is_string()) {
+                                all_strings = false;
+                                break;
+                            }
+                            values |= p.literal(value.get<std::string>()) + p.peek(p.literal("\n</parameter>\n"));
+                        }
+                        if (all_strings) {
+                            arg_value = p.tool_arg_string_value(values) + arg_close;
+                        }
+                    }
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
 
                     (param.required ? required_args : optional_args).push_back(arg_rule);
