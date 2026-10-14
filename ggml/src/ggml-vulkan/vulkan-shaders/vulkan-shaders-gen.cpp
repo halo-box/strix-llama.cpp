@@ -717,6 +717,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             } else {
                 string_to_spv(shader_name + "_" + tname + "_f16_pf_d16", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}, {"MMID_SCALE", "1"}}), fp16, coopmat, coopmat2, f16acc);
                 string_to_spv(shader_name + "_" + tname + "_f32_pf_d16", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}, {"MMID_SCALE", "1"}}), fp16, coopmat, coopmat2, f16acc);
+                // manual-fragment twins ("_mf", COOPMAT_MANUAL_FRAG: mul_mm.comp BUF_MANUAL) of the four subgroup MUL_MAT_ID pf
+                // variants; the host takes them only after the RDNA3 fragment layout probe passed (GGML_VK_MMID_MANUAL_FRAG)
+                string_to_spv(shader_name + "_" + tname + "_f16_pf_mf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"COOPMAT_MANUAL_FRAG", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+                string_to_spv(shader_name + "_" + tname + "_f32_pf_mf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"COOPMAT_MANUAL_FRAG", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+                string_to_spv(shader_name + "_" + tname + "_f16_pf_d16_mf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"COOPMAT_MANUAL_FRAG", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}, {"MMID_SCALE", "1"}}), fp16, coopmat, coopmat2, f16acc);
+                string_to_spv(shader_name + "_" + tname + "_f32_pf_d16_mf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"COOPMAT_MANUAL_FRAG", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}, {"MMID_SCALE", "1"}}), fp16, coopmat, coopmat2, f16acc);
             }
         }
     }
@@ -933,6 +939,8 @@ void process_shaders() {
     string_to_spv("lightning_indexer_cm_small_f16", "lightning_indexer_cm.comp", {{"N_WAVES", "1"}, {"HEADS_PER_TILE", "1"}});
     string_to_spv("gdn_chunk_prep_f32", "gdn_chunk_prep.comp", {});
     string_to_spv("gdn_chunk_scan_f32", "gdn_chunk_scan.comp", {});
+    // RDNA3 fragment layout probe (ggml_vk_check_coopmat_rdna3_layout): gates the manual-fragment "_mf" MUL_MAT_ID pipelines
+    string_to_spv("coopmat_layout_check", "coopmat_layout_check.comp", {});
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
 #endif
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});

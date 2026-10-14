@@ -1,0 +1,60 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// One-time device check of the cooperative-matrix register layout that gdn_chunk_scan.comp (wave32) and
+// flash_attn_sel_cm.comp (wave64) assume when they build fragments by hand. It is the gfx11 WMMA layout as RADV
+// lowers KHR cooperative matrices; the spec does not guarantee it, so the host creates those kernels only when this
+// check passes:
+//   A (f16):          lane L holds row L % 16,    element i = column i (16 elements)
+//   B (f16):          lane L holds column L % 16, element i = row i    (16 elements)
+//   f32 accumulator:  lane L holds column L % 16, element i = row L / 16 + (SG / 16) i (256 / SG elements)
+// A and B are filled element by element in that layout and multiplied. The product is written twice: with
+// coopMatStore (layout-independent) and by each lane from its accumulator elements in the assumed layout. The host
+// compares both against the exact product, so a wrong A, B or accumulator layout shows up as a mismatch.
+
+layout(constant_id = 0) const uint SG = 32;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters { uint unused; } p;
+
+layout(binding = 0) writeonly buffer Out { float data_out[]; };
+
+#define MATA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MATB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define ACC  coopmat<float,     gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+// integers in [-8, 8], exact in f16, with all 16 rows and all 16 columns of each matrix distinct (the factors are
+// non-zero mod 17), so a permuted or transposed fragment moves some product entry by at least 1
+float va(uint r, uint c) { return float(int((5 * r + 3 * c + r * c) % 17) - 8); }
+float vb(uint r, uint c) { return float(int((3 * r + 7 * c + 2 * r * c) % 17) - 8); }
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+
+    MATA a;
+    MATB b;
+    // bounded by the real lengths, so a different fragment size cannot index out of range (the host rejects it)
+    for (uint i = 0; i < min(16u, uint(a.length())); i++) {
+        a[i] = float16_t(va(lane % 16, i));
+    }
+    for (uint i = 0; i < min(16u, uint(b.length())); i++) {
+        b[i] = float16_t(vb(i, lane % 16));
+    }
+    ACC c = ACC(0.0);
+    c = coopMatMulAdd(a, b, c);
+
+    coopMatStore(c, data_out, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    for (uint i = 0; i < min(256 / SG, uint(c.length())); i++) {
+        data_out[256 + (lane / 16 + (SG / 16) * i) * 16 + lane % 16] = c[i];
+    }
+    if (lane == 0) {
+        data_out[512] = float(a.length());
+        data_out[513] = float(b.length());
+        data_out[514] = float(c.length());
+    }
+}

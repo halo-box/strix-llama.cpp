@@ -1857,6 +1857,12 @@ static bool ggml_vk_mm_prefetch_enabled(const vk_device& device);
 static bool ggml_vk_mm_prefetch_type(ggml_type t);
 static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b_f16 = false);
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
+// GGML_VK_MMID_MANUAL_FRAG (default 1): MUL_MAT_ID pf / REG_A pipelines take the manual-fragment "_mf" builds when the RDNA3
+// fragment layout probe passed (ggml_vk_check_coopmat_rdna3_layout); 0 keeps the coopMatLoad builds (the gate's off arm)
+static bool ggml_vk_mmid_manual_frag_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_MMID_MANUAL_FRAG"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
 static void ggml_vk_fusion_count_add(const char * name);
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device);
 static uint32_t ggml_vk_dense_ypad();
@@ -2200,8 +2206,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (!pipeline) {
                 pipeline = std::make_shared<vk_pipeline_struct>();
             }
+            // the name follows every walk: the first walk runs before the RDNA3 layout probe, which can switch a MUL_MAT_ID
+            // pipeline to its manual-fragment "_mf" SPIR-V (picked by the walk that compiles it)
+            pipeline->name = name;
             if (!pipeline->initialized) {
-                pipeline->name = name;
                 pipeline->parameter_count = parameter_count;
                 pipeline->push_constant_size = push_constant_size;
                 pipeline->wg_denoms = wg_denoms;
@@ -2441,6 +2449,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     const int mul_mat_id_mmq_cm1_param_count = 6;
 
     using spec_fn_t = std::function<std::vector<uint32_t>(const std::vector<uint32_t>&, bool)>;
+    // a matmul pipeline keeps the name of the first walk that created it, except that the manual-fragment suffix follows the
+    // walk that compiles it (the "_mf" MUL_MAT_ID builds are picked only after the RDNA3 layout probe, which runs between walks)
+    auto const mm_name = [](const std::string & existing, const std::string & fresh) -> std::string {
+        auto strip = [](const std::string & n) { return n.find("_mf") != std::string::npos ? std::string(n).erase(n.find("_mf"), 3) : n; };
+        return existing.empty() || strip(existing) == strip(fresh) ? fresh : existing;
+    };
     auto const &create_mm_pipelines = [&](
         const vk_matmul_pipeline_key& key,
         const std::vector<vk_tile_config>& tile_configs,
@@ -2470,15 +2484,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 vec.push_back(pair);
             }
 
-            ggml_vk_create_pipeline(device, vec[i].unaligned,
-                vec[i].unaligned->name.empty() ? (shader_name + "_" + std::to_string(i)).c_str() : vec[i].unaligned->name.c_str(),
+            ggml_vk_create_pipeline(device, vec[i].unaligned, mm_name(vec[i].unaligned->name, shader_name + "_" + std::to_string(i)).c_str(),
                 spv_len, spv_data, "main", param_count, push_constant_size,
                 tc.wg_denoms, spec_fn(tc.warptile, false), 1,
                 disable_robustness, rfs, rsgs);
 
             if (vec[i].aligned) {
-                ggml_vk_create_pipeline(device, vec[i].aligned,
-                    vec[i].aligned->name.empty() ? (shader_name + "_aligned_" + std::to_string(i)).c_str() : vec[i].aligned->name.c_str(),
+                ggml_vk_create_pipeline(device, vec[i].aligned, mm_name(vec[i].aligned->name, shader_name + "_aligned_" + std::to_string(i)).c_str(),
                     spv_len, spv_data, "main", param_count, push_constant_size,
                     tc.wg_denoms, spec_fn(tc.warptile, true), tc.align,
                     disable_robustness, rfs, rsgs);
@@ -3037,23 +3049,45 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #undef X_CM1_ID
         // register-prefetch variants (GGML_VK_MM_PREFETCH): same tiles as the quant pipelines, keyed with pf = true
         if (ggml_vk_mm_prefetch_enabled(device)) {
+            // manual-fragment twins (COOPMAT_MANUAL_FRAG, "_mf"): only after the RDNA3 fragment layout probe passed on this device;
+            // GGML_VK_MMID_MANUAL_FRAG=0 keeps the coopMatLoad builds. GGML_VK_TEST_MF_SKEW=1 (test hook) builds the non-REG_A _mf
+            // pipelines with spec constant 16 = 1, which rotates the fragment's k pairs: a byte-equal test must see a difference.
+            const bool mmid_mf = device->coopmat_rdna3_layout && ggml_vk_mmid_manual_frag_enabled();
+            const std::string mmid_mf_sfx = mmid_mf ? "_mf" : "";
+#define MMID_MF_SPV(base, acc) (mmid_mf ? base##_mf##acc##_cm1_len : base##acc##_cm1_len), (mmid_mf ? base##_mf##acc##_cm1_data : base##acc##_cm1_data)
+            static const bool mf_skew = getenv("GGML_VK_TEST_MF_SKEW") != nullptr && atoi(getenv("GGML_VK_TEST_MF_SKEW")) != 0;
+            spec_fn_t mf_skew_spec = [&](const std::vector<uint32_t>& wt, bool a) {
+                std::vector<uint32_t> spec = ggml_vk_mul_mm_spec(wt, a);
+                if (spec.size() == 12) { spec.push_back(ggml_vk_coopmat_shmem_pad(device, wt[3])); spec.push_back(0); }   // 12, 13
+                while (spec.size() < 16) { spec.push_back(0); }                                                           // 14, 15 (REG_A off)
+                spec.push_back(1u);                                                                                         // 16: MF_SKEW
+                return spec;
+            };
+            auto cm1_create_mmid_pf = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
+                                          const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc) {
+                auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
+                // the same subgroup pin as cm1_create: GGML_VK_MMID_WAVE32 retiles tc_mmq_id for WARP = 32, so an unpinned pipeline
+                // would run that tile at the driver's default subgroup size (wave64 on RADV) and cover half of it
+                if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc, (mmid_mf && mf_skew) ? mf_skew_spec : cm1_spec, false, true, 0, true,
+                                                     cm1_pin || dense_pin || (mmid_wave32 && &tc_base == &tc_mmq_id));
+            };
 #define X_CM1_ID_PF(TYPE, tstr) \
             if (device->coopmat_acc_f16_support) { \
-                cm1_create({TYPE, GGML_TYPE_F32, true, true, false, false, true},  tc_mmq_id, "matmul_id_subgroup_" #tstr "_f32_pf_f16acc", matmul_id_subgroup_##tstr##_f32_pf_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f32_pf_f16acc_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
-                cm1_create({TYPE, GGML_TYPE_F16, true, true, false, false, true},  tc_mmq_id, "matmul_id_subgroup_" #tstr "_f16_pf_f16acc", matmul_id_subgroup_##tstr##_f16_pf_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f16_pf_f16acc_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
+                cm1_create_mmid_pf({TYPE, GGML_TYPE_F32, true, true, false, false, true},  tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f32_pf_f16acc") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf, _f16acc), sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
+                cm1_create_mmid_pf({TYPE, GGML_TYPE_F16, true, true, false, false, true},  tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f16_pf_f16acc") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f16_pf, _f16acc), sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
             } \
             if (device->coopmat_acc_f32_support) { \
-                cm1_create({TYPE, GGML_TYPE_F32, true, false, false, false, true}, tc_mmq_id, "matmul_id_subgroup_" #tstr "_f32_pf",        matmul_id_subgroup_##tstr##_f32_pf_cm1_len,        matmul_id_subgroup_##tstr##_f32_pf_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
-                cm1_create({TYPE, GGML_TYPE_F16, true, false, false, false, true}, tc_mmq_id, "matmul_id_subgroup_" #tstr "_f16_pf",        matmul_id_subgroup_##tstr##_f16_pf_cm1_len,        matmul_id_subgroup_##tstr##_f16_pf_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
+                cm1_create_mmid_pf({TYPE, GGML_TYPE_F32, true, false, false, false, true}, tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f32_pf") + mmid_mf_sfx,        MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf, ),        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
+                cm1_create_mmid_pf({TYPE, GGML_TYPE_F16, true, false, false, false, true}, tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f16_pf") + mmid_mf_sfx,        MMID_MF_SPV(matmul_id_subgroup_##tstr##_f16_pf, ),        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
             } \
             /* f16-output twins (wave 4): the MUL_MAT_ID(+MUL)+CPY(f16) store on the routed path, six bindings (router weights) */ \
             if (device->coopmat_acc_f16_support) { \
-                cm1_create({TYPE, GGML_TYPE_F32, true, true, true, false, true},  tc_mmq_id, "matmul_id_subgroup_" #tstr "_f32_pf_d16_f16acc", matmul_id_subgroup_##tstr##_f32_pf_d16_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f32_pf_d16_f16acc_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
-                cm1_create({TYPE, GGML_TYPE_F16, true, true, true, false, true},  tc_mmq_id, "matmul_id_subgroup_" #tstr "_f16_pf_d16_f16acc", matmul_id_subgroup_##tstr##_f16_pf_d16_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f16_pf_d16_f16acc_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
+                cm1_create_mmid_pf({TYPE, GGML_TYPE_F32, true, true, true, false, true},  tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f32_pf_d16_f16acc") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf_d16, _f16acc), sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
+                cm1_create_mmid_pf({TYPE, GGML_TYPE_F16, true, true, true, false, true},  tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f16_pf_d16_f16acc") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f16_pf_d16, _f16acc), sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
             } \
             if (device->coopmat_acc_f32_support) { \
-                cm1_create({TYPE, GGML_TYPE_F32, true, false, true, false, true}, tc_mmq_id, "matmul_id_subgroup_" #tstr "_f32_pf_d16",        matmul_id_subgroup_##tstr##_f32_pf_d16_cm1_len,        matmul_id_subgroup_##tstr##_f32_pf_d16_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
-                cm1_create({TYPE, GGML_TYPE_F16, true, false, true, false, true}, tc_mmq_id, "matmul_id_subgroup_" #tstr "_f16_pf_d16",        matmul_id_subgroup_##tstr##_f16_pf_d16_cm1_len,        matmul_id_subgroup_##tstr##_f16_pf_d16_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
+                cm1_create_mmid_pf({TYPE, GGML_TYPE_F32, true, false, true, false, true}, tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f32_pf_d16") + mmid_mf_sfx,        MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf_d16, ),        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
+                cm1_create_mmid_pf({TYPE, GGML_TYPE_F16, true, false, true, false, true}, tc_mmq_id, std::string("matmul_id_subgroup_" #tstr "_f16_pf_d16") + mmid_mf_sfx,        MMID_MF_SPV(matmul_id_subgroup_##tstr##_f16_pf_d16, ),        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
             }
             X_CM1_ID_PF(GGML_TYPE_Q8_0, q8_0)
             X_CM1_ID_PF(GGML_TYPE_Q5_0, q5_0)
@@ -3088,20 +3122,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // tile could only run in test-backend-ops
 #define X_CM1_ID_REGA(TYPE, tstr) \
                 if (device->coopmat_acc_f16_support) { \
-                    cm1_create_rega({TYPE, GGML_TYPE_F32, true, true, false, false, true, true},  "matmul_id_subgroup_" #tstr "_f32_pf_f16acc_rega", matmul_id_subgroup_##tstr##_f32_pf_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f32_pf_f16acc_cm1_data, mul_mat_id_param_count); \
-                    cm1_create_rega({TYPE, GGML_TYPE_F16, true, true, false, false, true, true},  "matmul_id_subgroup_" #tstr "_f16_pf_f16acc_rega", matmul_id_subgroup_##tstr##_f16_pf_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f16_pf_f16acc_cm1_data, mul_mat_id_param_count); \
-                    cm1_create_rega({TYPE, GGML_TYPE_F32, true, true, true,  false, true, true},  "matmul_id_subgroup_" #tstr "_f32_pf_d16_f16acc_rega", matmul_id_subgroup_##tstr##_f32_pf_d16_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f32_pf_d16_f16acc_cm1_data, mul_mat_id_mmq_cm1_param_count); \
-                    cm1_create_rega({TYPE, GGML_TYPE_F16, true, true, true,  false, true, true},  "matmul_id_subgroup_" #tstr "_f16_pf_d16_f16acc_rega", matmul_id_subgroup_##tstr##_f16_pf_d16_f16acc_cm1_len, matmul_id_subgroup_##tstr##_f16_pf_d16_f16acc_cm1_data, mul_mat_id_mmq_cm1_param_count); \
+                    cm1_create_rega({TYPE, GGML_TYPE_F32, true, true, false, false, true, true},  std::string("matmul_id_subgroup_" #tstr "_f32_pf_f16acc_rega") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf, _f16acc), mul_mat_id_param_count); \
+                    cm1_create_rega({TYPE, GGML_TYPE_F16, true, true, false, false, true, true},  std::string("matmul_id_subgroup_" #tstr "_f16_pf_f16acc_rega") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f16_pf, _f16acc), mul_mat_id_param_count); \
+                    cm1_create_rega({TYPE, GGML_TYPE_F32, true, true, true,  false, true, true},  std::string("matmul_id_subgroup_" #tstr "_f32_pf_d16_f16acc_rega") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf_d16, _f16acc), mul_mat_id_mmq_cm1_param_count); \
+                    cm1_create_rega({TYPE, GGML_TYPE_F16, true, true, true,  false, true, true},  std::string("matmul_id_subgroup_" #tstr "_f16_pf_d16_f16acc_rega") + mmid_mf_sfx, MMID_MF_SPV(matmul_id_subgroup_##tstr##_f16_pf_d16, _f16acc), mul_mat_id_mmq_cm1_param_count); \
                 } \
                 if (device->coopmat_acc_f32_support) { \
-                    cm1_create_rega({TYPE, GGML_TYPE_F32, true, false, false, false, true, true}, "matmul_id_subgroup_" #tstr "_f32_pf_rega",        matmul_id_subgroup_##tstr##_f32_pf_cm1_len,        matmul_id_subgroup_##tstr##_f32_pf_cm1_data, mul_mat_id_param_count); \
-                    cm1_create_rega({TYPE, GGML_TYPE_F16, true, false, false, false, true, true}, "matmul_id_subgroup_" #tstr "_f16_pf_rega",        matmul_id_subgroup_##tstr##_f16_pf_cm1_len,        matmul_id_subgroup_##tstr##_f16_pf_cm1_data, mul_mat_id_param_count); \
-                    cm1_create_rega({TYPE, GGML_TYPE_F32, true, false, true,  false, true, true}, "matmul_id_subgroup_" #tstr "_f32_pf_d16_rega",    matmul_id_subgroup_##tstr##_f32_pf_d16_cm1_len,    matmul_id_subgroup_##tstr##_f32_pf_d16_cm1_data,    mul_mat_id_mmq_cm1_param_count); \
-                    cm1_create_rega({TYPE, GGML_TYPE_F16, true, false, true,  false, true, true}, "matmul_id_subgroup_" #tstr "_f16_pf_d16_rega",    matmul_id_subgroup_##tstr##_f16_pf_d16_cm1_len,    matmul_id_subgroup_##tstr##_f16_pf_d16_cm1_data,    mul_mat_id_mmq_cm1_param_count); \
+                    cm1_create_rega({TYPE, GGML_TYPE_F32, true, false, false, false, true, true}, std::string("matmul_id_subgroup_" #tstr "_f32_pf_rega") + mmid_mf_sfx,        MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf, ), mul_mat_id_param_count); \
+                    cm1_create_rega({TYPE, GGML_TYPE_F16, true, false, false, false, true, true}, std::string("matmul_id_subgroup_" #tstr "_f16_pf_rega") + mmid_mf_sfx,        MMID_MF_SPV(matmul_id_subgroup_##tstr##_f16_pf, ), mul_mat_id_param_count); \
+                    cm1_create_rega({TYPE, GGML_TYPE_F32, true, false, true,  false, true, true}, std::string("matmul_id_subgroup_" #tstr "_f32_pf_d16_rega") + mmid_mf_sfx,    MMID_MF_SPV(matmul_id_subgroup_##tstr##_f32_pf_d16, ),    mul_mat_id_mmq_cm1_param_count); \
+                    cm1_create_rega({TYPE, GGML_TYPE_F16, true, false, true,  false, true, true}, std::string("matmul_id_subgroup_" #tstr "_f16_pf_d16_rega") + mmid_mf_sfx,    MMID_MF_SPV(matmul_id_subgroup_##tstr##_f16_pf_d16, ),    mul_mat_id_mmq_cm1_param_count); \
                 }
                 X_CM1_ID_REGA(GGML_TYPE_IQ3_XXS, iq3_xxs)
                 X_CM1_ID_REGA(GGML_TYPE_IQ4_NL, iq4_nl)
 #undef X_CM1_ID_REGA
+#undef MMID_MF_SPV
             }
         }
 
@@ -4492,6 +4527,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     sizeof(vk_op_lightning_indexer_cm_push_constants), {16, 1, 1}, {device->subgroup_size, LI_NH_VALUES[nhi]}, 1, true, true,
                     device->subgroup_size);
             }
+            // probe for the fragment layout the manual-fragment MUL_MAT_ID kernels assume (ggml_vk_check_coopmat_rdna3_layout)
+            if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == vk_device_architecture::AMD_RDNA3 &&
+                device->driver_id == vk::DriverId::eMesaRadv &&
+                device->subgroup_min_size <= 32 && 64 <= device->subgroup_max_size) {
+                for (uint32_t i = 0; i < 2; ++i) {
+                    const uint32_t sg = 32 << i;
+                    ggml_vk_create_pipeline(device, device->pipeline_coopmat_layout_check[i], i == 0 ? "coopmat_layout_check_32" : "coopmat_layout_check_64",
+                        coopmat_layout_check_len, coopmat_layout_check_data, "main", 1, sizeof(uint32_t), {1, 1, 1}, {sg}, 1, true, true, sg);
+                }
+            }
             // chunked gated delta net (default on, GGML_VK_GDN_CHUNK=0 off): hand-built wave32 WMMA fragments in the RDNA3 layout
             // (RDNA4 lays its fragments out differently) as RADV/ACO lowers them, so RDNA3 + RADV + wave32 only
             if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == vk_device_architecture::AMD_RDNA3 &&
@@ -4841,6 +4886,89 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             return wait_pipeline->compiled.load();
         });
     }
+}
+
+// The manual-fragment MUL_MAT_ID kernels (mul_mm.comp BUF_MANUAL) write fragment elements by hand in the gfx11 WMMA layout as
+// RADV lowers KHR cooperative matrices; the spec does not guarantee it. Run coopmat_layout_check once (wave32 and wave64) and
+// compare its hand-laid product and its coopMatStore with the exact product. Port of the nathanw release's probe (c7daa3e23);
+// GGML_VK_FORCE_NO_MANUAL_FRAG=1 makes it report failure.
+static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
+    if (!device->pipeline_coopmat_layout_check[0] || !device->pipeline_coopmat_layout_check[1]) {
+        return false;
+    }
+    // test hook: behave as a device that fails the probe (MUL_MAT_ID keeps the coopMatLoad builds)
+    if (getenv("GGML_VK_FORCE_NO_MANUAL_FRAG")) {
+        GGML_LOG_WARN("ggml_vulkan: %s: GGML_VK_FORCE_NO_MANUAL_FRAG set, treating the cooperative-matrix layout check as failed\n",
+                      device->name.c_str());
+        return false;
+    }
+    float ref[256];
+    for (uint32_t r = 0; r < 16; r++) {
+        for (uint32_t c = 0; c < 16; c++) {
+            float sum = 0.0f;
+            for (uint32_t k = 0; k < 16; k++) {
+                sum += (float) ((int) ((5 * r + 3 * k + r * k) % 17) - 8) * (float) ((int) ((3 * k + 7 * c + 2 * k * c) % 17) - 8);
+            }
+            ref[r * 16 + c] = sum;
+        }
+    }
+
+    constexpr size_t n_out = 515;
+    vk_buffer buf = ggml_vk_create_buffer_check(device, n_out * sizeof(float),
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    const vk::DescriptorPoolSize pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT);
+    const vk::DescriptorPool pool = device->device.createDescriptorPool({ {}, 1, pool_size });
+    const vk::DescriptorSet set = device->device.allocateDescriptorSets({ pool, 1, &device->dsl })[0];
+    const vk::DescriptorBufferInfo info{ buf->buffer, 0, n_out * sizeof(float) };
+    device->device.updateDescriptorSets({ vk::WriteDescriptorSet{ set, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &info } }, {});
+
+    bool ok = true;
+    for (uint32_t i = 0; i < 2 && ok; i++) {
+        vk_pipeline & pipeline = device->pipeline_coopmat_layout_check[i];
+        const uint32_t sg = 32 << i;
+        ggml_vk_load_shaders(device, pipeline);
+        memset(buf->ptr, 0, n_out * sizeof(float));
+
+        {
+            std::lock_guard<std::recursive_mutex> guard(device->mutex);
+            vk_context subctx = ggml_vk_create_temporary_context(device->compute_queue->cmd_pool);
+            ggml_vk_ctx_begin(device, subctx);
+            const vk::CommandBuffer cb = subctx->s->buffer->buf;
+            const uint32_t pc = 0;
+            cb.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), &pc);
+            cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+            cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline->layout, 0, { set }, {});
+            cb.dispatch(1, 1, 1);
+            cb.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {},
+                { vk::MemoryBarrier{ vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead } }, {}, {});
+            ggml_vk_ctx_end(subctx);
+            ggml_vk_submit(subctx, device->fence);
+            VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "coopmat layout check waitForFences", device);
+            device->device.resetFences({ device->fence });
+            ggml_vk_queue_command_pools_cleanup(device);
+        }
+
+        const float * out = (const float *) buf->ptr;
+        const bool lengths = out[512] == 16.0f && out[513] == 16.0f && out[514] == (float) (256 / sg);
+        bool store = true;
+        bool lanes = true;
+        // WMMA on gfx11 is a few ULP off the exact sum even for integer operands, while a layout error moves an
+        // entry by at least 1 (all entries are integers), so compare with a tolerance well under 1
+        for (uint32_t j = 0; j < 256; j++) {
+            store = store && fabsf(out[j] - ref[j]) < 0.0625f;
+            lanes = lanes && fabsf(out[256 + j] - ref[j]) < 0.0625f;
+        }
+        if (!(lengths && store && lanes)) {
+            GGML_LOG_WARN("ggml_vulkan: %s: the cooperative-matrix layout at wave%u is not the expected RDNA3 one "
+                          "(lengths %.0f/%.0f/%.0f, product %s, lane layout %s); MUL_MAT_ID keeps the coopMatLoad matmuls\n",
+                          device->name.c_str(), sg, out[512], out[513], out[514], store ? "ok" : "wrong", lanes ? "ok" : "wrong");
+            ok = false;
+        }
+    }
+
+    device->device.destroyDescriptorPool(pool);
+    ggml_vk_destroy_buffer(buf);
+    return ok;
 }
 
 vk_device ggml_vk_get_device(size_t idx) {
@@ -5796,6 +5924,12 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = -1;
         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
             device->mmvq_mode = 1;
+        }
+
+        // needs the queues and the fence; the MUL_MAT_ID pipelines it gates take their SPIR-V in the second load_shaders
+        device->coopmat_rdna3_layout = ggml_vk_check_coopmat_rdna3_layout(device);
+        if (device->coopmat_rdna3_layout && ggml_vk_mmid_manual_frag_enabled()) {
+            ggml_vk_load_shaders(device);
         }
 
         return device;
@@ -9322,6 +9456,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
+    }
+    // engagement read for the manual-fragment port: every MUL_MAT_ID dispatch, the ones on the coopmat register-prefetch / REG_A
+    // pipelines (the only ones with an "_mf" build), and the ones that run an "_mf" build
+    ggml_vk_fusion_count_add("MUL_MAT_ID_ALL");
+    if (pipeline->name.find("_pf") != std::string::npos) {
+        ggml_vk_fusion_count_add("MUL_MAT_ID_PF");
+        if (pipeline->name.find("_mf") != std::string::npos) {
+            ggml_vk_fusion_count_add("MUL_MAT_ID_MANUAL_FRAG");
+        }
     }
     const uint64_t x_ne = ggml_nelements(src0);
     const uint64_t y_ne = (uint64_t)y_staged_row_stride * ne11 * ne12 * ne13;

@@ -14,7 +14,7 @@ uint a_shmem_stride() {
 }
 
 void store_a(uint m, uint k_pair, FLOAT_TYPEV2 value) {
-    buf_a[a_shmem_index(m, k_pair)] = value;
+    buf_a[a_shmem_index(m, k_pair)] = TO_BUF(value);
 }
 
 #if defined(DATA_A_ROCMFPX_FP3)
@@ -751,10 +751,10 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
         const uint idx = pos_b + col * p.stride_b / LOAD_VEC_B + row;
         const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
         FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
-        buf_b[buf_idx + 0] = bb[0].xy;
-        buf_b[buf_idx + 1] = bb[0].zw;
-        buf_b[buf_idx + 2] = bb[1].xy;
-        buf_b[buf_idx + 3] = bb[1].zw;
+        buf_b[buf_idx + 0] = TO_BUF(bb[0].xy);
+        buf_b[buf_idx + 1] = TO_BUF(bb[0].zw);
+        buf_b[buf_idx + 2] = TO_BUF(bb[1].xy);
+        buf_b[buf_idx + 3] = TO_BUF(bb[1].zw);
         return;
     }
 #elif LOAD_VEC_B == 4
@@ -766,20 +766,20 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 #else
         FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
 #endif
-        buf_b[buf_idx + 0] = bb.xy;
-        buf_b[buf_idx + 1] = bb.zw;
+        buf_b[buf_idx + 0] = TO_BUF(bb.xy);
+        buf_b[buf_idx + 1] = TO_BUF(bb.zw);
         return;
     }
 #endif
     const uint idx = pos_b + col * p.stride_b + row * 2;
     const uint buf_idx = col * SHMEM_STRIDE + row;
     if (idx_n < p.N && block + row * 2 + 1 < end_k) {
-        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
-                                        TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
+        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
+                                        TO_FLOAT_TYPE(data_b_scalar[idx + 1])));
     } else if (idx_n < p.N && block + row * 2 < end_k) {
-        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
+        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f));
     } else {
-        buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
+        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(0.0f));
     }
 }
 #else
@@ -791,10 +791,10 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
         const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
         const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
         FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
-        buf_b[buf_idx + 0] = bb[0].xy;
-        buf_b[buf_idx + 1] = bb[0].zw;
-        buf_b[buf_idx + 2] = bb[1].xy;
-        buf_b[buf_idx + 3] = bb[1].zw;
+        buf_b[buf_idx + 0] = TO_BUF(bb[0].xy);
+        buf_b[buf_idx + 1] = TO_BUF(bb[0].zw);
+        buf_b[buf_idx + 2] = TO_BUF(bb[1].xy);
+        buf_b[buf_idx + 3] = TO_BUF(bb[1].zw);
         return;
     }
 #elif LOAD_VEC_B == 4
@@ -807,8 +807,8 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 #else
         FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
 #endif
-        buf_b[buf_idx + 0] = bb.xy;
-        buf_b[buf_idx + 1] = bb.zw;
+        buf_b[buf_idx + 0] = TO_BUF(bb.xy);
+        buf_b[buf_idx + 1] = TO_BUF(bb.zw);
         return;
     }
 #endif
@@ -817,14 +817,14 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
     if (row_i < _ne1 && block + row * 2 + 1 < end_k) {
         const u16vec2 row_idx = row_ids[col];
         const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
-        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
-                                        TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
+        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
+                                        TO_FLOAT_TYPE(data_b_scalar[idx + 1])));
     } else if (row_i < _ne1 && block + row * 2 < end_k) {
         const u16vec2 row_idx = row_ids[col];
         const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
-        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
+        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f));
     } else {
-        buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
+        buf_b[buf_idx] = TO_BUF(FLOAT_TYPEV2(0.0f));
     }
 }
 #endif

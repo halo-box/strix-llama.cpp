@@ -274,6 +274,7 @@ llama_build_and_test(test-f16-store-exact.cpp)
 llama_build_and_test(test-wq-deint-exact.cpp)
 llama_build_and_test(test-ple-conv-exact.cpp)
 llama_build_and_test(test-mmv-scale-exact.cpp)
+llama_build_and_test(test-mmid-manual-frag.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

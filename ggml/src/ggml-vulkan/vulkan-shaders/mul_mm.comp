@@ -229,8 +229,24 @@ const bool APPLY_SLM_A_RESHAPE = false;
 #endif
 #define SHMEM_STRIDE (BK / 2 + SHMEM_STRIDE_PAD)
 
-shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
-shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
+// COOPMAT_MANUAL_FRAG (the "_mf" builds; the host takes them only after ggml_vk_check_coopmat_rdna3_layout passed): the LDS
+// tiles are 32-bit words and the A / B fragments are assembled from eight 32-bit reads per lane in the RDNA3 wave32 layout
+// (lane L: row / column L % 16, k elements 0..15 as fragment elements 0..15) instead of coopMatLoad. An f16vec2 tile whose
+// halves are consumed separately gets split back into 16-bit LDS reads; a uint tile cannot be. Same elements, same WMMA
+// order as coopMatLoad. Port of the nathanw release's BUF_MANUAL (mul_mm.comp, 0a69431c2 / c7daa3e23).
+#if defined(COOPMAT) && defined(COOPMAT_MANUAL_FRAG) && !defined(DATA_A_BF16)
+#define BUF_MANUAL 1
+#define BUF_T uint
+#define TO_BUF(v)   pack32(float16BitsToUint16(v))
+#define FROM_BUF(u) uint16BitsToFloat16(unpack16(u))
+#else
+#define BUF_T FLOAT_TYPEV2
+#define TO_BUF(v)   (v)
+#define FROM_BUF(u) (u)
+#endif
+
+shared BUF_T buf_a[BM * SHMEM_STRIDE];
+shared BUF_T buf_b[BN * SHMEM_STRIDE];
 
 #define NUM_WARPS (BLOCK_SIZE / WARP)
 
@@ -239,10 +255,6 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #endif
 
 #if defined(MM_PREFETCH)
-// the prefetch loaders write the LDS tiles through TO_BUF (identity here; the fork's manual-fragment
-// uint tiles changed nothing on RADV, which already vectorises coopMatLoad)
-#define TO_BUF(v)   (v)
-#define FROM_BUF(u) (u)
 #if defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K)
 // Per-tile-row (d, m) f16 pairs for the current superblock: 8 sub-block pairs per row, refilled once per
 // superblock (every 8th BK=32 step) so the loaders decode the packed 6-bit scales once per row instead of
@@ -259,6 +271,24 @@ shared SCACHE_T scache_dm[BM * 8];
 
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mm_funcs.glsl"
+#ifdef COOPMAT
+#if defined(BUF_MANUAL)
+// test hook (GGML_VK_TEST_MF_SKEW, spec constant 16): rotate the fragment's k pairs so a byte-equal test must see a difference
+layout(constant_id = 16) const uint MF_SKEW = 0;
+#define MF_E(e) (((e) + MF_SKEW) & 7u)
+#define LOAD_A_FRAG(dst, row0, k2) { \
+        const uint mf_base = a_shmem_index((row0) + gl_SubgroupInvocationID % 16, (k2)); \
+        [[unroll]] for (uint mf_e = 0; mf_e < 8; mf_e++) { \
+            const FLOAT_TYPEV2 mf_v = FROM_BUF(buf_a[mf_base + MF_E(mf_e)]); dst[2 * mf_e] = mf_v.x; dst[2 * mf_e + 1] = mf_v.y; } }
+#define LOAD_B_FRAG(dst, col0, k2) { \
+        const uint mf_base = ((col0) + gl_SubgroupInvocationID % 16) * SHMEM_STRIDE + (k2); \
+        [[unroll]] for (uint mf_e = 0; mf_e < 8; mf_e++) { \
+            const FLOAT_TYPEV2 mf_v = FROM_BUF(buf_b[mf_base + MF_E(mf_e)]); dst[2 * mf_e] = mf_v.x; dst[2 * mf_e + 1] = mf_v.y; } }
+#else
+#define LOAD_A_FRAG(dst, row0, k2) coopMatLoad(dst, buf_a, a_shmem_index(row0, k2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor)
+#define LOAD_B_FRAG(dst, col0, k2) coopMatLoad(dst, buf_b, (col0) * SHMEM_STRIDE + k2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor)
+#endif
+#endif
 #if defined(MM_PREFETCH)
 #include "mul_mm_pf_funcs.glsl"
 #endif
@@ -578,7 +608,7 @@ void main() {
                         ar1[2 * e] = v1.x; ar1[2 * e + 1] = v1.y;
                     }
                     [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-                        coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + 8 * h, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                        LOAD_B_FRAG(cache_b, warp_c * WN + cm_col * TN, 8 * h);
                         sums[cm_col * cms_per_row]     = coopMatMulAdd(ar0, cache_b, sums[cm_col * cms_per_row]);
                         sums[cm_col * cms_per_row + 1] = coopMatMulAdd(ar1, cache_b, sums[cm_col * cms_per_row + 1]);
                     }
@@ -609,9 +639,9 @@ void main() {
 #endif
             [[unroll]] for (uint i = 0; i < BK; i += TK) {
                 [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
-                    coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
+                    LOAD_A_FRAG(cache_a, warp_r * WM + cm_row * TM, i / 2);
                     [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-                        coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                        LOAD_B_FRAG(cache_b, warp_c * WN + cm_col * TN, i / 2);
                         sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
                     }
                     // XL: re-read the B fragments for every row (see XL_TILE)
@@ -660,10 +690,10 @@ void main() {
         [[unroll]] for (uint i = 0; i < BK; i += TK) {
             [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
                 // Load from shared into cache
-                coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
+                LOAD_A_FRAG(cache_a, warp_r * WM + cm_row * TM, i / 2);
 
                 [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-                    coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                    LOAD_B_FRAG(cache_b, warp_c * WN + cm_col * TN, i / 2);
 
                     sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
                 }
