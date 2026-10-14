@@ -246,9 +246,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
-    # Test context state handling across all architectures, using the generated dummy models
+    # Test recurrent-state rollback across all architectures, using the generated dummy models
     llama_test(
-        test-llama-context
+        test-recurrent-state-rollback
         LABEL main
         ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
     )
@@ -301,6 +301,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-recurrent-state-rollback-qwen4exp PROPERTIES
         FIXTURES_REQUIRED generate-models
+    )
+    # Test context state handling across all architectures, using the generated dummy models
+    llama_test(
+        test-llama-context
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
     )
     # abort on graph reallocations that the initial reserve should have covered
     set_tests_properties(test-llama-context PROPERTIES

@@ -7971,7 +7971,8 @@ static void test_reasoning_budget_enabled_per_request() {
             {"reasoning_budget_enabled", true},
         };
         std::vector<raw_buffer> out_files;
-        auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+        common_chat_session out_session;
+        auto llama_params = oaicompat_chat_params_parse(nullptr, body, opt, out_files, out_session);
         if (!llama_params.contains("reasoning_budget_enabled") ||
             !llama_params["reasoning_budget_enabled"].get<bool>()) {
             throw std::runtime_error("reasoning_budget_enabled=true not forwarded to llama_params");
@@ -7984,7 +7985,8 @@ static void test_reasoning_budget_enabled_per_request() {
             {"reasoning_budget_enabled", false},
         };
         std::vector<raw_buffer> out_files;
-        auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+        common_chat_session out_session;
+        auto llama_params = oaicompat_chat_params_parse(nullptr, body, opt, out_files, out_session);
         if (!llama_params.contains("reasoning_budget_enabled") ||
             llama_params["reasoning_budget_enabled"].get<bool>()) {
             throw std::runtime_error("reasoning_budget_enabled=false not forwarded to llama_params");
@@ -7996,7 +7998,8 @@ static void test_reasoning_budget_enabled_per_request() {
             {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
         };
         std::vector<raw_buffer> out_files;
-        auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+        common_chat_session out_session;
+        auto llama_params = oaicompat_chat_params_parse(nullptr, body, opt, out_files, out_session);
         if (llama_params.contains("reasoning_budget_enabled")) {
             throw std::runtime_error("reasoning_budget_enabled must not be set in llama_params when omitted from the request body");
         }

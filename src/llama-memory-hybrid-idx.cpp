@@ -21,6 +21,7 @@ static bool hybrid_idx_no_recr(const llama_memory_recurrent * r) {
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
+#include <type_traits>
 #include <cstring>
 #include <iterator>
 #include <stdexcept>
@@ -975,6 +976,24 @@ static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::sl
     return res;
 }
 
+struct llama_memory_hybrid_idx::kpool_layout {
+    struct seq {
+        llama_pos pos_min = 0;
+        uint32_t  strm    = 0; // Stream holding this sequence's cells
+        std::vector<std::pair<llama_pos, uint32_t>> cells; // Position and stream local cell pairs, sorted by position.
+        std::vector<uint32_t> pools;
+
+        // Where the pool scan stopped, so an append resumes instead of starting over.
+        size_t j_next = 0;
+    };
+
+    std::array<seq, LLAMA_MAX_SEQ> seqs;
+
+    uint32_t n_pool_real = 0;
+};
+
+llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
+
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_update() {
     GGML_ASSERT(mem_idx != nullptr);
 
@@ -1063,16 +1082,20 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
     return *kpool_lay;
 }
 
-int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, llama_pos pos, uint32_t cell) {
-    auto it = std::lower_bound(cells.begin(), cells.end(), std::make_pair(pos, cell));
-    return it != cells.end() && it->second == cell && it->first == pos ? it - cells.begin() : -1;
-}
-
 namespace {
 
 // The last padded pool is always unused.
 uint32_t kpool_pad(uint32_t n_pool) {
     return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
+}
+
+// Rank of (pos, cell) in a sequence's cells sorted by position then cell, or -1 when absent.
+// In order mode the rank alone places a token: cells sharing a position (M-RoPE images) have distinct ranks.
+int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, llama_pos pos, uint32_t cell) {
+    auto it = std::lower_bound(cells.begin(), cells.end(), std::make_pair(pos, cell));
+    return it != cells.end() && it->second == cell && it->first == pos ? it - cells.begin() : -1;
+}
+
 }
 
 struct llama_memory_hybrid_idx_context::kpool_state {
@@ -1085,21 +1108,19 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
 };
 
-struct llama_memory_hybrid_idx::kpool_layout {
-    struct seq {
-        llama_pos pos_min = 0;
-        uint32_t  strm    = 0; // Stream holding this sequence's cells
-        std::vector<std::pair<llama_pos, uint32_t>> cells; // Position and stream local cell pairs, sorted by position.
-        std::vector<uint32_t> pools;
 
-        // Where the pool scan stopped, so an append resumes instead of starting over.
-        size_t j_next = 0;
-    };
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
+    llama_memory_hybrid_context(status) {}
 
-    std::array<seq, LLAMA_MAX_SEQ> seqs;
-
-    uint32_t n_pool_real = 0;
-};
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
+    llama_memory_hybrid_context(mem),
+    mem(mem),
+    // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
+    // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
+    ns_ubatch(mem->get_mem_idx() == nullptr ?
+        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx())) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -1127,6 +1148,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     // Sequence edits force the touched positions to re-pool.
     mem_idx_stale_batch = mem->mem_idx_stale_get();
 }
+
+llama_memory_hybrid_idx_context::~llama_memory_hybrid_idx_context() = default;
 
 bool llama_memory_hybrid_idx_context::next() {
     // Clear only after a successful ubatch.

@@ -1131,6 +1131,16 @@ struct common_memory {
 
 // wrapper around llama_batch_ext that provide getter functions for downstream code
 // entries can exceed n_batch, use get_sub_batch() to decode them in chunks
+// llama_batch helpers kept for the fork's callers of the plain llama_batch API (upstream moved to common_batch)
+void common_batch_clear(struct llama_batch & batch);
+
+void common_batch_add(
+                 struct llama_batch & batch,
+                        llama_token   id,
+                          llama_pos   pos,
+    const std::vector<llama_seq_id> & seq_ids,
+                               bool   logits);
+
 struct common_batch {
     struct token {
         llama_token  id;
