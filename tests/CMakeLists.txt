@@ -274,6 +274,7 @@ llama_build_and_test(test-sched-view-scratch.cpp LINK ggml)
 # group is a tool: three runs (default, GGML_VK_MMID_MANUAL_FRAG=0, GGML_VK_TEST_MF_SKEW=1) compared by test-vk-exact-mmid-frag.py
 llama_build(test-vk-exact.cpp LINK ggml)
 llama_build(test-wq-deint-exact.cpp LINK ggml)
+llama_build(test-ple-conv-exact.cpp LINK ggml)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

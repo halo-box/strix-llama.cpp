@@ -2225,7 +2225,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        bool                 channels_first) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
@@ -2245,7 +2246,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    ggml_tensor * conv_input = channels_first ? ggml_concat(ctx0, ggml_transpose(ctx0, state), x, 1)
+                                              : ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    const int64_t n_cols = channels_first ? conv_input->ne[1] : conv_input->ne[0];
 
     // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
     // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
@@ -2255,12 +2258,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
 
     for (int64_t slot = 0; slot < n_slots; ++slot) {
-        const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+        const int64_t s_idx = std::max<int64_t>(0, n_cols - state_cols - slot);
 
-        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-                state_cols, channels, n_seqs,
-                conv_input->nb[1], conv_input->nb[2],
-                ggml_row_size(conv_input->type, s_idx));
+        // channels first: the tail columns are rows, read back token-major through a transposed view
+        ggml_tensor * tail = channels_first
+            ? ggml_transpose(ctx0, ggml_view_3d(ctx0, conv_input,
+                    channels, state_cols, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    s_idx * conv_input->nb[1]))
+            : ggml_view_3d(ctx0, conv_input,
+                    state_cols, channels, n_seqs,
+                    conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, s_idx));
 
         ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
                 state_cols * channels, n_seqs,
@@ -2315,6 +2324,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     cb(emb, "ple_embd", -1);
 
     return emb;
+}
+
+// LLAMA_PLE_CONV_FUSED (default on): the PLE layer's dilated conv on a channels-first padded buffer (taps are row views), see build_ple
+static bool qwen4exp_ple_conv_fused() {
+    static const bool on = [] { const char * e = getenv("LLAMA_PLE_CONV_FUSED"); return e == nullptr || atoi(e) != 0; }();
+    return on;
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_ple(
@@ -2373,6 +2388,46 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     // the conv history is per sequence, so the input carries the sequence axis too
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    if (qwen4exp_ple_conv_fused() && ggml_is_contiguous(hidden) && ggml_is_contiguous(gated)) {
+        // C5: the history is prepended channels first, [hc_dim, hist + n_seq_tokens, n_seqs], so every tap is a view of whole
+        // rows: no per-tap transpose and no CONT of the conv output. Same products, same sums, same order (bit-exact). Every
+        // input of the tail (the f32 kernel, the tap views, the gated value and the residual as [hc_dim, T, S]) is built ahead
+        // of it, so the taps, the SiLU and the two residual adds are ten consecutive nodes (Vulkan: PLE_CONV_SILU_ADD)
+        ggml_tensor * w_cf = ggml_cont(ctx0, ggml_transpose(ctx0, model.layers[il].ple_conv1d));   // [hc_dim, kern]
+        if (w_cf->type != GGML_TYPE_F32) {
+            w_cf = ggml_cast(ctx0, w_cf, GGML_TYPE_F32);
+        }
+        ggml_tensor * padded_cf = build_conv_state_at(inp, inp->mctx->get_p_l(il),
+                ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
+                hist, hc_dim, il, /*channels_first =*/ true);
+
+        std::vector<ggml_tensor *> taps, wks;
+        for (int64_t k = 0; k < kern; ++k) {
+            // tap k reads (kern-1-k)*dilation positions back
+            const int64_t start = hist - (kern - 1 - k) * dil;
+            taps.push_back(ggml_view_3d(ctx0, padded_cf, hc_dim, n_seq_tokens, n_seqs,
+                    padded_cf->nb[1], padded_cf->nb[2], start * padded_cf->nb[1]));
+            wks.push_back(ggml_view_1d(ctx0, w_cf, hc_dim, k * w_cf->nb[1]));
+            ggml_build_forward_expand(gf, taps.back());
+            ggml_build_forward_expand(gf, wks.back());
+        }
+        ggml_tensor * gated_cf  = ggml_reshape_3d(ctx0, gated,  hc_dim, n_seq_tokens, n_seqs);
+        ggml_tensor * hidden_cf = ggml_reshape_3d(ctx0, hidden, hc_dim, n_seq_tokens, n_seqs);
+        ggml_build_forward_expand(gf, gated_cf);
+        ggml_build_forward_expand(gf, hidden_cf);
+
+        ggml_tensor * conv_cf = nullptr;
+        for (int64_t k = 0; k < kern; ++k) {
+            ggml_tensor * term = ggml_mul(ctx0, taps[k], wks[k]);
+            conv_cf = conv_cf ? ggml_add(ctx0, conv_cf, term) : term;
+        }
+        conv_cf = ggml_silu(ctx0, conv_cf);
+        cb(conv_cf, "ple_conv_out", il);
+
+        ggml_tensor * out = ggml_add(ctx0, hidden_cf, ggml_add(ctx0, gated_cf, conv_cf));
+        return ggml_reshape_3d(ctx0, out, n_embd, hc, n_tokens);
+    }
 
     // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
     ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),

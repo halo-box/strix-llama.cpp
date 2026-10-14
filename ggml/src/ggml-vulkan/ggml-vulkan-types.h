@@ -522,6 +522,10 @@ static constexpr std::initializer_list<ggml_op> topk_moe_late_softmax      { GGM
                                                                              GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
                                                                              GGML_OP_SOFT_MAX, GGML_OP_RESHAPE };
 
+// qwen4exp PLE layer (LLAMA_PLE_CONV_FUSED): 4 conv taps (MUL, then MUL + ADD), SiLU, + gated value, + residual
+static constexpr std::initializer_list<ggml_op> ple_conv_pattern { GGML_OP_MUL, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL, GGML_OP_ADD,
+                                                                   GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_ADD, GGML_OP_ADD };
+
 static constexpr std::initializer_list<ggml_op> snake_pattern              { GGML_OP_MUL,      GGML_OP_SIN,
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
                                                                              GGML_OP_ADD };
@@ -1003,6 +1007,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_col2im_1d_bf16;
     vk_pipeline pipeline_out_prod_f32;
     vk_pipeline pipeline_snake_f32;
+    vk_pipeline pipeline_ple_conv_silu_add_f32;
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
     vk_pipeline pipeline_pool1d_f32;
@@ -1378,6 +1383,7 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_ple_conv {};   // PLE_CONV_SILU_ADD (GGML_VK_PLE_CONV)
     // hc combine + next hc norm (dsv4_hc_post_norm.comp): HC_POST_NORM_* modes, 0 = none
     int fused_hc_post_norm {};
     // MUL_MAT+CPY(f16): the matmul stores f16 into the cast's destination
