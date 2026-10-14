@@ -2988,6 +2988,11 @@ static void mul_mat_vec_q_switch_type(
 static bool mul_mat_vec_q_fq_try(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion, const float y_scale, const float y_bias, const int y_op, const bool launch) {
+    // the shared-expert fusion (upstream mul_mat_vec_q, an extra grid row for the shared expert) is not handled here
+    if (fusion && fusion->shared_up) {
+        return false;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     const size_t ts_src0 = ggml_type_size(src0->type);
