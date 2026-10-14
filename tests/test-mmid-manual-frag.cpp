@@ -5,7 +5,8 @@
 // with GGML_VK_TEST_MF_SKEW=1, then compare the hashes (tests/test-mmid-manual-frag.py):
 //   default == off   on every case: the manual fragment reads give coopMatLoad's elements, so the WMMA sequence is the same
 //   skew != off      on every case that ran a "_mf" pipeline: the comparison can fail (positive control)
-//   mf / pf == 1     on the default run, 0 on the off run (engagement)
+//   mf / pf == 1     on the default run, 0 on the off run (engagement); rega_mf / rega == 1 likewise for the REG_A twins, and the
+//                    REG_A shapes (320 experts top-10 at n 2048 = 64 rows per expert) must run REG_A at all (rega > 0)
 // Inputs are seeded, so a process sees the same bytes every run. The routed f16-B coopmat path is forced (GGML_VK_MMID_F16COOPMAT=all)
 // so every type here reaches the pipelines that have an "_mf" build. Skips (exit 0) without a Vulkan device.
 
@@ -99,11 +100,12 @@ static void run_case(ggml_backend_t be, ggml_type ta, ggml_type tb, int64_t m, i
     std::vector<uint8_t> bytes(ggml_nbytes(out));
     ggml_backend_tensor_get(out, bytes.data(), 0, bytes.size());
     const char * en = e == EPI_F32 ? "f32" : e == EPI_CPY16 ? "cpy16" : "mul_cpy16";
-    printf("case %s_x_%s m%lld k%lld E%d u%d n%lld %s %s pad%lld hash=%016llx all=%llu pf=%llu mf=%llu\n",
+    printf("case %s_x_%s m%lld k%lld E%d u%d n%lld %s %s pad%lld hash=%016llx all=%llu pf=%llu mf=%llu rega=%llu rega_mf=%llu\n",
            ggml_type_name(ta), ggml_type_name(tb), (long long) m, (long long) k, n_exp, n_used, (long long) n, bcast ? "bcast" : "rows", en,
            (long long) pad_b, (unsigned long long) fnv1a(bytes.data(), bytes.size()),
            (unsigned long long) g_count("MUL_MAT_ID_ALL"), (unsigned long long) g_count("MUL_MAT_ID_PF"),
-           (unsigned long long) g_count("MUL_MAT_ID_MANUAL_FRAG"));
+           (unsigned long long) g_count("MUL_MAT_ID_MANUAL_FRAG"),
+           (unsigned long long) g_count("MUL_MAT_ID_REGA"), (unsigned long long) g_count("MUL_MAT_ID_REGA_MF"));
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
 }

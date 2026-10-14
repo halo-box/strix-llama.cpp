@@ -9450,6 +9450,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                 if (!rega_logged) { rega_logged = true; fprintf(stderr, "ggml_vulkan: MUL_MAT_ID REG_A tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) nei1, (unsigned) ne10); }
                 ggml_vk_fusion_count_add("MUL_MAT_ID_REGA");
                 ggml_vk_fusion_count_add((std::string("MUL_MAT_ID_REGA:") + ggml_type_name(src0->type)).c_str());
+                if (pipeline->name.find("_mf") != std::string::npos) {   // the REG_A twin built with manual B fragment loads
+                    ggml_vk_fusion_count_add("MUL_MAT_ID_REGA_MF");
+                    ggml_vk_fusion_count_add((std::string("MUL_MAT_ID_REGA_MF:") + ggml_type_name(src0->type)).c_str());
+                }
                 pipeline = itr->second[0].aligned;
             }
         }
