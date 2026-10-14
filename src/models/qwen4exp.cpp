@@ -206,8 +206,24 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                                { hparams.ple_head_dim, ple_rows }, TENSOR_SKIP);
         } else {
+        if (params.ple_on_disk) {
+            // Counted as created but never allocated, mapped or read: each ubatch preads
+            // exactly the rows it gathers (llm_graph_input_ple::set_input).
+            llama_ple_disk::params dp;
+            dp.n_threads   = params.ple_io_threads;
+            dp.cache_bytes = params.ple_cache_mb > 0 ? (size_t) params.ple_cache_mb << 20 : 0;
+            dp.direct_io   = params.ple_direct_io;
+
+            ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w.idx), ple_w.offs,
+                                                        ple_w.tensor->type, ple_w.tensor->ne[0], ple_rows, dp);
+            LLAMA_LOG_INFO("%s: PLE n-gram table stays on disk: %s\n", __func__, ple_disk->describe().c_str());
+
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_SKIP);
+        } else {
             per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                                { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        }
         }
     }
 
@@ -475,6 +491,26 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
+    }
+
+    // Hand the wide residual to an MTP head once the last layer has folded its attention and
+    // FFN into it: the head was trained on the trunk's final residual, not on the last layer's
+    // input. The final mix below is the output norm of the LM head, so capture before it. The
+    // draft reads all hc streams, which is what its hnorm is sized for. res_hc is passed as is
+    // rather than reshaped: a bare view is not a node the scheduler places, and the extraction
+    // is a flat copy, for which [n_embd, hc, T] and [hc*n_embd, T] are identical.
+    //
+    // An unmasked request wants every position, so the last layer ran uncropped above and the
+    // rows for the final mix are gathered only after this hand-over.
+    if (cparams.embeddings_nextn) {
+        res->t_h_nextn = res_hc;
+        cb(res->t_h_nextn, "h_nextn", -1);
+
+        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+        }
     }
 
     // Hand the wide residual to an MTP head once the last layer has folded its attention and
@@ -1129,6 +1165,10 @@ public:
 
     std::vector<float>   embd_buf;
     std::vector<int32_t> rows_global;
+    ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]: the gathered rows, when the table is on disk
+
+    std::vector<float>   embd_buf;
+    std::vector<int32_t> rows_global;
     const llama_model_qwen4exp & pmodel;
 
     // the predecessor tokens live in the attention KV cells (ext.tok)
@@ -1197,6 +1237,19 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+    if (pmodel.ple_disk) {
+        // idx is already exactly what the reader wants: one global row per (token, head),
+        // token-major, with ple_head_offsets folded in by the loop above. The previous
+        // version read it head-major and added the offset a second time, which is only
+        // correct for a table split per head -- on a joined per_layer_token_embd it walks
+        // past the end (rows beyond ple_rows) and gather() aborts.
+        GGML_ASSERT(embd != nullptr && rows == nullptr);
+        embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
+        pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
+        ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
+        return;
+    }
+
     if (pmodel.ple_disk) {
         // idx is already exactly what the reader wants: one global row per (token, head),
         // token-major, with ple_head_offsets folded in by the loop above. The previous
