@@ -1859,6 +1859,12 @@ static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
 // GGML_VK_MMID_MANUAL_FRAG (default 1): MUL_MAT_ID pf / REG_A pipelines take the manual-fragment "_mf" builds when the RDNA3
 // fragment layout probe passed (ggml_vk_check_coopmat_rdna3_layout); 0 keeps the coopMatLoad builds (the gate's off arm)
+// GGML_VK_MMID_ROWID_FILL (default 1): see ggml_vk_matmul_id, push-constant bit 4
+static bool ggml_vk_mmid_rowid_fill_enabled() {
+    static const bool v = [] { const char * e = getenv("GGML_VK_MMID_ROWID_FILL"); return e == nullptr || atoi(e) != 0; }();
+    return v;
+}
+
 static bool ggml_vk_mmid_manual_frag_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_VK_MMID_MANUAL_FRAG"); return e == nullptr || atoi(e) != 0; }();
     return on;
@@ -7157,8 +7163,17 @@ static void ggml_vk_matmul_id(
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     // fusion_flags bit 0: scale rows by the router weights (MUL_MAT_ID + MUL); bit 3 (int8 MMQ SwiGLU epilogue only): this GEMM
     // is the gate projection, else the up projection
+    // bit 4 (GGML_VK_MMID_ROWID_FILL, default 1): the row-id loader fills a partial tile's unused slots with token 0. The aligned
+    // B loads read row_ids for the whole BN tile, so without it a partial tile (most of them at ~64 rows per expert) gathers B
+    // rows from whatever the shared array held: scattered, possibly out-of-range reads. The rows are never stored, so the output
+    // is the same bits either way. The release's loader always fills.
+    const bool rowid_fill = ggml_vk_mmid_rowid_fill_enabled();
+    if (rowid_fill) {
+        ggml_vk_fusion_count_add("MUL_MAT_ID_ROWID_FILL");
+    }
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, n_as, row_ids_offset, fusion_flags | (glu_up && glu_acc_gate ? 8u : 0u) };
+                                              nei0, nei1, nbi1, ne11, n_as, row_ids_offset,
+                                              fusion_flags | (glu_up && glu_acc_gate ? 8u : 0u) | (rowid_fill ? 16u : 0u) };
     const uint32_t tiles_y = std::min(max_tiles, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
     const std::array<uint32_t, 3> elements = { m, tiles_y * pipeline->wg_denoms[1], uint32_t(CEIL_DIV(max_tiles, tiles_y)) };
     if (glu_up != nullptr) {

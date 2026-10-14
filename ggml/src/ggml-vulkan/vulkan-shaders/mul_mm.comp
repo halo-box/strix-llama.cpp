@@ -144,7 +144,7 @@ layout (binding = 3) readonly buffer QSA_BIAS {float data_qsa_bias[];};
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer RowMap {uint data_row_map[];};
 // Fused MUL epilogue: one scale per (expert slot, token), broadcast down the M dimension.
-// Always bound; p.fusion_flags == 0 means ignore it.
+// Always bound; bit 0 of p.fusion_flags clear means ignore it (bit 4 is the row-id fill).
 layout (binding = 5) readonly buffer FusedScale {float data_fscale[];};
 #endif
 
@@ -873,7 +873,7 @@ void main() {
                 if (row_i >= _ne1) break;
 
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
-                const bool do_scale = p.fusion_flags != 0;
+                const bool do_scale = (p.fusion_flags & 1u) != 0;
                 const float fscale = do_scale ? data_fscale[row_idx.y * p.nei0 + row_idx.x] : 1.0f;
 #endif // MUL_MAT_ID
                 [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {

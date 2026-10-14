@@ -89,7 +89,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint row_ids_offset;
-    uint fusion_flags; // != 0: scale each output row by data_fscale (MUL_MAT_ID + MUL epilogue)
+    uint fusion_flags; // bit 0: scale each output row by data_fscale (MUL_MAT_ID + MUL epilogue); bit 3 SwiGLU gate; bit 4 row-id fill
 #else
     uint base_work_group_z;
     uint num_batches;
