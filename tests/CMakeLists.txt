@@ -275,6 +275,7 @@ llama_build_and_test(test-sched-view-scratch.cpp LINK ggml)
 llama_build(test-vk-exact.cpp LINK ggml)
 llama_build(test-wq-deint-exact.cpp LINK ggml)
 llama_build(test-ple-conv-exact.cpp LINK ggml)
+llama_build(test-mmv-scale-exact.cpp LINK ggml)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
