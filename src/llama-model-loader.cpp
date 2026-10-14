@@ -1675,6 +1675,13 @@ bool llama_model_loader::load_all_data(
     // 64MB works well for NVMe drives
     const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
 
+    // pinned staging buffer for mapping->device copies; owned for the whole
+    // loading loop so an exception (check_tensors validation, tensor_set
+    // failure) cannot leak it
+    std::unique_ptr<ggml_backend_buffer, void (*)(ggml_backend_buffer_t)> mapped_stage_buf{nullptr, &ggml_backend_buffer_free};
+    void * mapped_stage_ptr  = nullptr;
+    size_t mapped_stage_size = 0;
+
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
@@ -1760,6 +1767,42 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    // CUDA/HIP: a GPU DMA read from file-backed (non-pinned) host memory, as done when
+    // copying weights straight from a file mapping (mmap) into device buffers, never
+    // completes on some setups; rocr::core::BusyWaitSignal::WaitRelaxed then spins at
+    // 100% CPU until killed (observed on Strix Halo gfx1151, GGML_HIP_NO_VMM=1).
+    // Stage every mapping->device copy through a pinned host buffer instead.
+    const bool stage_mapping = [&]() {
+        if (!use_mmap && !lazy.any()) {
+            // no copies from a mapping happen: the file-read path stages through
+            // the upload_backend pinned buffers instead
+            return false;
+        }
+        auto * buf0 = bufs.count(0) ? bufs.at(0) : nullptr;
+        if (!buf0 || ggml_backend_buffer_is_host(buf0)) {
+            return false;
+        }
+        auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf0));
+        if (!dev) {
+            return false;
+        }
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (!host_buft) {
+            return false;
+        }
+        mapped_stage_buf.reset(ggml_backend_buft_alloc_buffer(host_buft, 16 * 1024 * 1024));
+        if (!mapped_stage_buf) {
+            return false;
+        }
+        mapped_stage_ptr  = ggml_backend_buffer_get_base(mapped_stage_buf.get());
+        mapped_stage_size = ggml_backend_buffer_get_size(mapped_stage_buf.get());
+        if (mapped_stage_ptr == nullptr || mapped_stage_size == 0) {
+            mapped_stage_buf.reset(nullptr);
+            return false;
+        }
+        return true;
+    }();
+
     std::vector<ggml_tensor *> tensors;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         tensors.push_back(cur);
@@ -1822,6 +1865,15 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            } else if (stage_mapping && cur->buffer && !ggml_backend_buffer_is_host(cur->buffer)) {
+                // device destination: map -> pinned staging -> device, in chunks
+                size_t done = 0;
+                while (done < n_size) {
+                    const size_t chunk = std::min(mapped_stage_size, n_size - done);
+                    memcpy(mapped_stage_ptr, (const char *) data + done, chunk);
+                    ggml_backend_tensor_set(cur, mapped_stage_ptr, done, chunk);
+                    done += chunk;
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
@@ -1907,6 +1959,7 @@ bool llama_model_loader::load_all_data(
     }
 
     // free temporary resources used for async uploads
+    mapped_stage_buf.reset(nullptr);
     for (auto * event : events) {
         ggml_backend_event_synchronize(event);
         ggml_backend_event_free(event);

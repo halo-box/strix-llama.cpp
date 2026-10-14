@@ -829,11 +829,19 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
 // attention kernels understand that layout (F16 K/V, head 256, single stream; qsa_decode takes 1..512 queries,
 // qsa_prefill larger ubatches). The HIP backend (RDNA3.5) and Vulkan (flash_attn_sel) have them, so the selection needs
 // selected_key_attn (all QSA layers run there). Dense kernels do not read the list: ggml-cuda aborts, Vulkan declines.
+//
+// The depth must also fit the kernel that will run the op. Both selected-key kernels take GGML_QSA_MAX_KEYS
+// (common.cuh): qsa_prefill indexes whole blocks of ratio keys in a uint32 union list whose 0xFFFFFFFF slot is a
+// padding sentinel, qsa_decode gathers keys directly. The model side cannot see the backend, so it mirrors the
+// bound; the kernels' own support checks are what actually decide, and they must agree with this constant.
+static constexpr int64_t QSA_MASKLESS_MAX_KV = 1048576;  // == GGML_QSA_MAX_KEYS, kept as a literal: llama/ must not depend on ggml-cuda headers
+static_assert(QSA_MASKLESS_MAX_KV%4 == 0, "qsa_prefill requires a multiple-of-4 key count at its depth bound");
+
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
         ggml_type type_k, ggml_type type_v, bool selected_key_attn) {
     return selected_key_attn && blk_bias && cparams.causal_attn && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
-        n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
+        n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=QSA_MASKLESS_MAX_KV && ubatch.token &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
         type_k==GGML_TYPE_F16 && type_v==GGML_TYPE_F16;

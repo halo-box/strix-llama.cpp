@@ -78,6 +78,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--numa TYPE` | attempt optimizations that help on some NUMA systems<br/>- distribute: spread execution evenly over all nodes<br/>- isolate: only spawn threads on CPUs on the node that execution started on<br/>- numactl: use the CPU map provided by numactl<br/>if run without this previously, it is recommended to drop the system page cache before using this<br/>see https://github.com/ggml-org/llama.cpp/issues/1437<br/>(env: LLAMA_ARG_NUMA) |
 | `-dev, --device <dev1,dev2,..>` | comma-separated list of devices to use for offloading (none = don't offload)<br/>use --list-devices to see a list of available devices<br/>(env: LLAMA_ARG_DEVICE) |
 | `--list-devices` | print list of available devices and exit |
+
+
+| Environment variable | Effect |
+| -------------------- | ------ |
 | `-ot, --override-tensor <tensor name pattern>=<buffer type>,...` | override tensor buffer type<br/>(env: LLAMA_ARG_OVERRIDE_TENSOR) |
 | `-cmoe, --cpu-moe` | keep all Mixture of Experts (MoE) weights in the CPU<br/>(env: LLAMA_ARG_CPU_MOE) |
 | `-ncmoe, --n-cpu-moe N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU<br/>(env: LLAMA_ARG_N_CPU_MOE) |
@@ -410,6 +414,16 @@ Recommended `--cors-origins` setting, depending on where the server runs:
 | Same machine | `--cors-origins localhost` (default once `--agent` is set) |
 
 Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-credentials` / `--no-cors-credentials`. Background and rationale: [#25655](https://github.com/ggml-org/llama.cpp/pull/25655).
+
+
+### Environment-only knobs (ggml/ggml-hip internals, no CLI argument)
+
+| Environment variable | Effect |
+| -------------------- | ------ |
+| `GGML_CUDA_POOL_FREE_MIN_MB=N` | device scratch blocks at or above N MiB (e.g. QSA prefill/decode intermediates that scale with the KV length) are freed on release instead of staying cached in the legacy/non-VMM pool |
+| `QSA_DIRECT` | `-1/auto` (default) picks direct F16 reads when the batch is small against the cache, `0` always packs, `1` always reads direct; both paths are bit-identical |
+| `GGML_QSA_RANKSORT=1` | force the O(n^2) rank sort in the QSA indexer path |
+| `HC_NO_MIX_FUSE=1` | disable the hc_mix stream-mix fusion (pre-existing) |
 
 ## Build
 
