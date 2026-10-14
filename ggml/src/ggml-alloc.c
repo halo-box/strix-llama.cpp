@@ -531,8 +531,10 @@ struct ggml_gallocr {
     int n_delayed;
     int cap_delayed;
     int cur_node;
-    int delay;     // the reuse delay in effect: GGML_ALLOC_REUSE_DELAY, halved by the planner while a plan exceeds the cap; -1 = unread
-    long long hold; // GGML_ALLOC_REUSE_HOLD_MIB in bytes: freed blocks stay out of circulation while the held total is within it; -1 = unread
+    int delay;     // the reuse delay of the plan being made: starts at delay_cfg for every reserve, halved while the plan exceeds the cap
+    long long hold; // the byte hold of the plan being made (GGML_ALLOC_REUSE_HOLD_MIB in bytes), likewise
+    int delay_cfg;      // GGML_ALLOC_REUSE_DELAY; -1 = unread
+    long long hold_cfg; // GGML_ALLOC_REUSE_HOLD_MIB in bytes; -1 = unread
     size_t held;    // bytes currently in the FIFO
 };
 
@@ -577,8 +579,8 @@ static int ggml_gallocr_reuse_delay(void) {
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
     GGML_ASSERT(galloc != NULL);
-    galloc->delay = -1;   // GGML_ALLOC_REUSE_DELAY, read on the first plan
-    galloc->hold = -1;    // GGML_ALLOC_REUSE_HOLD_MIB, likewise
+    galloc->delay_cfg = -1;   // GGML_ALLOC_REUSE_DELAY, read on the first plan
+    galloc->hold_cfg = -1;    // GGML_ALLOC_REUSE_HOLD_MIB, likewise
 
     galloc->bufts = calloc(n_bufs, sizeof(ggml_backend_buffer_type_t));
     GGML_ASSERT(galloc->bufts != NULL);
@@ -1033,15 +1035,18 @@ static bool ggml_gallocr_reserve_n_impl(
         GGML_ASSERT(galloc->hash_values != NULL);
     }
 
-    if (galloc->delay < 0) {
-        galloc->delay = ggml_gallocr_reuse_delay();
+    if (galloc->delay_cfg < 0) {
+        galloc->delay_cfg = ggml_gallocr_reuse_delay();
+        galloc->hold_cfg = ggml_gallocr_reuse_hold();
     }
-    if (galloc->hold < 0) {
-        galloc->hold = ggml_gallocr_reuse_hold();
-    }
+    // every reserve starts from the configured hold-back and caps its own graph: a reduction for one graph must not carry over to the
+    // next (10-14: llama reserves pp, tg, pp on one gallocr; with MAX_FRAC the tiny tg graph halved a sticky delay 128 -> 64 and the
+    // final pp reserve planned n64, while the dry run, which stops at the first pp reserve, had predicted n128)
+    galloc->delay = galloc->delay_cfg;
+    galloc->hold = galloc->hold_cfg;
     // Caps on the extra size the reuse hold-back may cost. A plan over the cap is redone with the delay and the byte hold halved, down to
     // 0 (today's plan), so an over-sized buffer is never requested (10-14: GGML_ALLOC_REUSE_DELAY=1024 on Flash-Next asked for more than
-    // the box can map, BO_VA -12). The effective values stick for this gallocr.
+    // the box can map, BO_VA -12). The reduced values hold for this plan only.
     //   GGML_ALLOC_REUSE_DELAY_MAX_MIB=M: the total over all buffers of the plan stays within M MiB
     //   GGML_ALLOC_REUSE_DELAY_MAX_FRAC=f: the total stays within (1 + f) x the plan without any hold-back (one extra planning pass)
     static long long cap_mib = -2;
