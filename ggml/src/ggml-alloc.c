@@ -525,7 +525,36 @@ struct ggml_gallocr {
 
     struct ggml_hash_set pinned;
     bool has_pinned;
+
+    // GGML_ALLOC_REUSE_DELAY=N: a freed tensor's block becomes reusable only N graph nodes after the free (0 / unset = at once)
+    struct delayed_free * delayed; // [cap_delayed], FIFO in free order
+    int n_delayed;
+    int cap_delayed;
+    int cur_node;
 };
+
+struct delayed_free {
+    struct ggml_dyn_tallocr * alloc;
+    struct buffer_address addr;
+    size_t size;
+    int release_at; // node index from which the block may be reused
+};
+
+// GGML_ALLOC_REUSE_DELAY=N (A/B diagnostic, default 0 = off): hold every freed compute-buffer block back from reuse until N more graph
+// nodes have been allocated. Applied in the planning pass, so the reserved size grows with N (printed by sched_reserve as usual). On
+// Flash-Next prefill the consumer-less view pins (LLAMA_KEEP_PINS) speed the dense GEMMs / GDN up ~25% per call by keeping blocks out of
+// circulation; this knob tests whether delayed reuse alone does that, at a bounded size.
+static int ggml_gallocr_reuse_delay(void) {
+    static int delay = -1;
+    if (delay < 0) {
+        const char * e = getenv("GGML_ALLOC_REUSE_DELAY");
+        delay = e ? atoi(e) : 0;
+        if (delay < 0) {
+            delay = 0;
+        }
+    }
+    return delay;
+}
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
@@ -611,6 +640,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    free(galloc->delayed);
     free(galloc);
 }
 
@@ -781,8 +811,32 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     remove_allocated_tensor(alloc, hn->addr, node);
 #endif
 
-    ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
+    const int delay = ggml_gallocr_reuse_delay();
+    if (delay > 0) {
+        if (galloc->n_delayed == galloc->cap_delayed) {
+            galloc->cap_delayed = galloc->cap_delayed ? 2*galloc->cap_delayed : 256;
+            galloc->delayed = (struct delayed_free *) realloc(galloc->delayed, galloc->cap_delayed*sizeof(struct delayed_free));
+            GGML_ASSERT(galloc->delayed != NULL);
+        }
+        galloc->delayed[galloc->n_delayed++] = (struct delayed_free) { alloc, hn->addr, size, galloc->cur_node + delay };
+    } else {
+        ggml_dyn_tallocr_free_bytes(alloc, hn->addr, size);
+    }
     hn->allocated = false;
+}
+
+// return the delayed blocks whose hold-back has expired (all of them with flush) to their allocators
+static void ggml_gallocr_release_delayed(ggml_gallocr_t galloc, bool flush) {
+    int k = 0;
+    for (int i = 0; i < galloc->n_delayed; i++) {
+        struct delayed_free * d = &galloc->delayed[i];
+        if (flush || d->release_at <= galloc->cur_node) {
+            ggml_dyn_tallocr_free_bytes(d->alloc, d->addr, d->size);
+        } else {
+            galloc->delayed[k++] = *d;
+        }
+    }
+    galloc->n_delayed = k;
 }
 
 static int get_node_buffer_id(const int * node_buffer_ids, int i) {
@@ -835,9 +889,15 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 
     // allocate tensors
+    galloc->n_delayed = 0;
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         int buffer_id = get_node_buffer_id(node_buffer_ids, i);
+
+        galloc->cur_node = i;
+        if (galloc->n_delayed > 0) {
+            ggml_gallocr_release_delayed(galloc, false);
+        }
 
         // allocate parents (only leafs need to be allocated at this point)
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -894,6 +954,8 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             AT_PRINTF("\n");
         }
     }
+    // the plan is complete; return what is still held back (the allocators are reset before the next plan anyway)
+    ggml_gallocr_release_delayed(galloc, true);
 }
 
 static bool ggml_gallocr_reserve_n_impl(
