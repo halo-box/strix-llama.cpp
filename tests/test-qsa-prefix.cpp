@@ -1,5 +1,7 @@
 #include "../src/qsa-prefix-state.h"
 #include "../src/prefix.h"
+#include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-model.h"
 #include "ggml.h"
 #include <random>
 #include <iostream>
@@ -72,7 +74,64 @@ static void test_scalar_visibility() {
     }
 }
 
+// Exercise the production scan without model weights or device execution.
+static void test_scan_foreign_image() {
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN4EXP, llama_model_default_params()));
+    model->hparams = {};
+    llama_memory_hybrid_idx mem(*model, GGML_TYPE_F16, GGML_TYPE_F16, false, 64, 1, 0, LLAMA_SWA_TYPE_NONE,
+                               GGML_TYPE_F32, GGML_TYPE_F32, 4, 3, 0, false, true,
+                               nullptr, nullptr, [](int32_t) { return false; });
+    auto & cells = const_cast<llama_kv_cells &>(mem.get_mem_idx()->get_cells(0));
+    for (uint32_t j = 0; j < 10; ++j) {
+        cells.pos_set(j, j);
+        cells.seq_add(j, 0);
+        if (j < 4) { cells.seq_add(j, 2); }
+    }
+    for (uint32_t j = 16; j < 24; ++j) {
+        cells.pos_set(j, 4);
+        cells.seq_add(j, 1);
+        cells.ext_set(j, {4, llama_pos(j - 15)});
+    }
+    for (uint32_t j = 32; j < 38; ++j) {
+        cells.pos_set(j, j - 28);
+        cells.seq_add(j, 2);
+    }
+    qsa_ubatch ub({{8, {0}}, {9, {2}}}, 3);
+    GGML_ASSERT(qsa_scalar_visibility_cells(cells, 64, 4, ub.u));
+
+    for (bool compact : {false, true}) {
+        ggml_context_ptr ctx(ggml_init({8*ggml_tensor_overhead(), nullptr, true}));
+        auto * map = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 64, 1);
+        auto * members = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 64, 1);
+        auto * pos = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 64);
+        auto * bias = compact ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 3*16 + 2*2)
+                             : ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 16, 2);
+        auto * tails = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I32, 3, 2, 1);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+        GGML_ASSERT(buffer);
+        mem.set_input_qsa_blocks(map, members, pos, bias, tails, &ub.u, 4);
+        const int32_t expected_tail[] = {8, -1, -1, 36, 37, -1};
+        GGML_ASSERT(std::equal(expected_tail, expected_tail + 6, (int32_t *) tails->data));
+        for (int query = 0; query < 2; ++query) {
+            std::vector<int32_t> selected;
+            for (int b = 0; b < 16; ++b) {
+                const bool visible = compact ? ((int32_t *) bias->data)[ub.ids[query][0]*16 + b] < 8
+                                             : ((float *) bias->data)[query*16 + b] == 0.0f;
+                if (visible) {
+                    const auto * block = (int32_t *) members->data + 4*b;
+                    selected.insert(selected.end(), block, block + 4);
+                }
+            }
+            std::sort(selected.begin(), selected.end());
+            const std::vector<int32_t> expected = query == 0 ? std::vector<int32_t>{0, 1, 2, 3, 4, 5, 6, 7}
+                                                            : std::vector<int32_t>{0, 1, 2, 3, 32, 33, 34, 35};
+            GGML_ASSERT(selected == expected);
+        }
+    }
+}
+
 int main() {
+    test_scan_foreign_image();
     test_scalar_visibility();
     qsa_prefix_state s(4096);
     std::mt19937 rng(414);
