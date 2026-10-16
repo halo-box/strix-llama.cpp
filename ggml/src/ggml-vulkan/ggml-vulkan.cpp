@@ -19040,9 +19040,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
-        // The array is sized to handle the largest fusion (asserted later).
+        // The array is sized to handle the largest fusion (asserted later). Zero-initialised: a fusion branch that does not set
+        // its flags gets the conservative answer (not elementwise) instead of whatever the stack held.
         // sized to the write mask's bits (int): QSA_BLOCK_SELECT fuses up to 31 nodes (the visibility ops and the selection chain)
-        bool op_srcs_fused_elementwise[32];
+        bool op_srcs_fused_elementwise[32] = {};
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
