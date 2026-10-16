@@ -1854,6 +1854,9 @@ static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type
 
 // register-prefetch coopmat matmul knobs (defined with the other matmul env switches further down)
 static bool ggml_vk_mm_prefetch_enabled(const vk_device& device);
+static const std::vector<std::string> & ggml_vk_route_list(const char * env_name, const char * dflt);
+// MUL_MAT_ID types routed off int8 MMQ onto the f16-B coopmat pf tile when GGML_VK_MMID_F16COOPMAT is unset (see ggml_vk_mmid_f16coopmat)
+static const char * const ggml_vk_mmid_route_default = "iq3_xxs,iq4_nl";
 static bool ggml_vk_mm_prefetch_type(ggml_type t);
 static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b_f16 = false);
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
@@ -3569,6 +3572,21 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         return is_rdna3_or_4 ? 4u : rows;
     };
     uint32_t rm_iq = 2 * rm_kq;
+    // engagement: the MUL_MAT_ID types this build routes off int8 MMQ (gates assert this line), once per process
+    {
+        static bool route_logged = false;
+        if (!route_logged) {
+            route_logged = true;
+            const char * env = getenv("GGML_VK_MMID_F16COOPMAT");
+            const std::vector<std::string> & routed = ggml_vk_route_list("GGML_VK_MMID_F16COOPMAT", ggml_vk_mmid_route_default);
+            std::string types;
+            for (const auto & n : routed) {
+                types += (types.empty() ? "" : ",") + n;
+            }
+            GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID f16-B route: %s (%s)%s\n", types.empty() ? "none, int8 MMQ for every expert type" : types.c_str(),
+                    env ? "GGML_VK_MMID_F16COOPMAT" : "default", ggml_vk_mm_prefetch_enabled(device) ? "" : " [inactive: the f16-B pf path is off on this device]");
+        }
+    }
 
     const bool use_subgroups = device->subgroup_arithmetic;
     // The Imagination proprietary compiler rejects the subgroup-only dequant mul_mat_vec
@@ -7590,8 +7608,8 @@ static bool ggml_vk_mm_prefetch_type(ggml_type t) {
 // 5120x2048x17408 15.34 -> 9.85, q4_K 14.86 -> 9.52, q6_K 16.51 -> 11.25, iq4_xs 13.67 -> 9.19, q8_0 10240x2048x2560
 // 3.72 -> 2.74 and 2560x2048x6144 2.40 -> 1.86 (without XL, q8_0 and q6_K were a loss or flat, so the XL tier is what
 // qualifies them). q3_K / q5_0 / iq4_nl stay on int8 until measured. GGML_VK_DENSE_F16COOPMAT=0 keeps every type on int8, "all" routes every type that has a prefetch
-// pipeline, else a comma list of type names (q8_0,q5_k,...); default empty = int8 for every type. MUL_MAT_ID has its own, default-off list
-// (GGML_VK_MMID_F16COOPMAT) because the expert GEMMs were not measured on this path.
+// pipeline, else a comma list of type names (q8_0,q5_k,...). MUL_MAT_ID has its own list (GGML_VK_MMID_F16COOPMAT, default
+// "iq3_xxs,iq4_nl": the Flash-Next expert types, measured in-model; see ggml_vk_mmid_f16coopmat).
 static const std::vector<std::string> & ggml_vk_route_list(const char * env_name, const char * dflt) {
     static std::map<std::string, std::vector<std::string>> cache;
     auto it = cache.find(env_name);
@@ -7647,8 +7665,12 @@ static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b
     return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_DENSE_F16COOPMAT", "q4_K,q5_K,q6_K,iq4_xs"), t) || (b_f16 && ggml_vk_dense_f16b_native(t));
 }
 
+// GGML_VK_MMID_F16COOPMAT (default "iq3_xxs,iq4_nl"): the listed expert types leave int8 MMQ for the f16-B coopmat pf tile, which
+// carries the REG_A tile, the f16-output expert store (d16) and the MMID_B_FULL load. Every gate since wave 4 ran with exactly this
+// list on every arm (the batch4 mmidrouteoff arm is the A/B of record), so a build without the env lost those paths. "" or "0" keeps
+// every expert type on int8 MMQ; "all" or a comma list replaces the default. Logged once at init ("MUL_MAT_ID f16-B route: ...").
 static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
-    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_MMID_F16COOPMAT", ""), t);
+    return ggml_vk_route_match(ggml_vk_route_list("GGML_VK_MMID_F16COOPMAT", ggml_vk_mmid_route_default), t);
 }
 
 
@@ -9443,7 +9465,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     // REG_A tile (register-direct A, 128x64, wave32) for the aligned iq3_xxs / iq4_nl expert GEMMs on the f16-B coopmat
     // pf path, where the tile selector would take the medium tile (about 64 rows per expert at a 2048-token ubatch).
-    // In the model this needs the expert GEMM routed off int8 MMQ (GGML_VK_MMID_F16COOPMAT, default off); the fused f16 cast
+    // In the model this needs the expert GEMM routed off int8 MMQ (GGML_VK_MMID_F16COOPMAT, default iq3_xxs,iq4_nl); the fused f16 cast
     // (d16) takes the REG_A twin built on the pf d16 SPIR-V (wave 4). GGML_VK_FUSION_DEBUG=1 prints the first reason each
     // distinct rejection happens.
     if ((src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_NL) && ggml_vk_mmid_rega_enabled(ctx->device)) {
