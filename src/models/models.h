@@ -8,6 +8,7 @@
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <vector>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2567,6 +2568,15 @@ struct llama_model_qwen4exp : public llama_model_base {
     mutable bool           bf16_mm = false;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    bool load_tensors(llama_model_loader & ml) override;
+
+    // bf16 twins of the f32 weights decode reads as mat-vecs, made at load where the values are bf16-exact
+    // (LLAMA_BF16_TWINS=0 disables); bf16_twin() returns nullptr for a weight without one
+    void load_bf16_twins();
+    ggml_tensor * bf16_twin(const ggml_tensor * w) const;
+    std::map<const ggml_tensor *, ggml_tensor *> bf16_twins;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bf16_twin_bufs;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
