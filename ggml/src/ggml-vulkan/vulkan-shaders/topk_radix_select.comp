@@ -4,6 +4,8 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
 
 #include "types.glsl"
 
@@ -34,6 +36,76 @@ shared uint histo[RADIX_SIZE];
 shared uint sh_bucket;
 shared uint sh_above;
 shared uint sg_cnt[64];  // per-subgroup hit counts for the slot scan
+
+// histogram add with subgroup aggregation: early passes see few distinct buckets per subgroup, so per-lane LDS atomics serialise;
+// HISTO_PEEL rounds add the leading lane's bucket once for all its lanes, the rest add singly. Same totals, same output
+#ifndef HISTO_PEEL
+#define HISTO_PEEL 4
+#endif
+void histo_add(bool want, uint bucket) {
+    bool pending = want;
+    [[unroll]] for (int it = 0; it < HISTO_PEEL; ++it) {
+        const uvec4 bp = subgroupBallot(pending);
+        if (bp == uvec4(0)) {
+            return;
+        }
+        const uint leader = subgroupBallotFindLSB(bp);
+        const uint lead_bucket = subgroupShuffle(bucket, leader);
+        const bool match = pending && bucket == lead_bucket;
+        const uint cnt = subgroupBallotBitCount(subgroupBallot(match));
+        if (gl_SubgroupInvocationID == leader) {
+            atomicAdd(histo[lead_bucket], cnt);
+        }
+        pending = pending && !match;
+    }
+    if (pending) {
+        atomicAdd(histo[bucket], 1u);
+    }
+}
+
+// top-down scan by subgroup 0 for the bucket of the desired-th largest (a run of buckets per lane, exclusive add): same bucket
+// and count above as the serial one-thread walk it replaces (4 x 256 dependent LDS reads per row)
+void select_bucket(const uint desired) {
+    if (gl_SubgroupID == 0) {
+        const uint lane = gl_SubgroupInvocationID;
+        const uint per  = (RADIX_SIZE + gl_SubgroupSize - 1) / gl_SubgroupSize;
+        uint s = 0;
+        for (uint k = 0; k < per; ++k) {
+            const int bb = int(RADIX_SIZE - 1) - int(lane * per + k);
+            if (bb >= 0) {
+                s += histo[bb];
+            }
+        }
+        const uint total = subgroupAdd(s);
+        uint acc   = subgroupExclusiveAdd(s);
+        bool found = false;
+        uint b     = 0;
+        uint above = 0;
+        for (uint k = 0; k < per; ++k) {
+            const int bb = int(RADIX_SIZE - 1) - int(lane * per + k);
+            if (bb >= 0 && !found) {
+                const uint c = histo[bb];
+                if (acc + c >= desired) {
+                    found = true;
+                    b     = uint(bb);
+                    above = acc;
+                } else {
+                    acc += c;
+                }
+            }
+        }
+        const uvec4 bf = subgroupBallot(found);
+        if (bf == uvec4(0)) {
+            if (lane == 0) {
+                sh_bucket = 0;
+                sh_above  = total;
+            }
+        } else if (lane == subgroupBallotFindLSB(bf)) {
+            sh_bucket = b;
+            sh_above  = above;
+        }
+    }
+}
 
 // order-preserving float -> uint mapping
 uint f2ui(float x) {
@@ -89,26 +161,15 @@ void topk(const uint row) {
         const bool first     = (shift == 32 - RADIX_BITS);
         const uint hi_mask   = (shift + RADIX_BITS >= 32) ? 0u : (0xFFFFFFFFu << uint(shift + RADIX_BITS));
         const uint prefix_hi = prefix & hi_mask;
-        for (uint i = tid; i < ncols; i += BLOCK_SIZE) {
-            const uint key = f2ui(load(row, i, first));
-            if ((key & hi_mask) == prefix_hi) {
-                atomicAdd(histo[(key >> uint(shift)) & (RADIX_SIZE - 1)], 1u);
-            }
+        for (uint c = 0; c < ncols; c += BLOCK_SIZE) {
+            const uint i   = c + tid;
+            const uint key = i < ncols ? f2ui(load(row, i, first)) : 0u;
+            histo_add(i < ncols && (key & hi_mask) == prefix_hi, (key >> uint(shift)) & (RADIX_SIZE - 1));
         }
         barrier();
 
         // top-down scan for the bucket holding the K-th value
-        if (tid == 0) {
-            uint acc = 0;
-            uint b   = 0;
-            for (int bb = RADIX_SIZE - 1; bb >= 0; --bb) {
-                const uint c = histo[bb];
-                if (acc + c >= desired) { b = uint(bb); break; }
-                acc += c;
-            }
-            sh_bucket = b;
-            sh_above  = acc;
-        }
+        select_bucket(desired);
         barrier();
 
         prefix  |= sh_bucket << uint(shift);
@@ -158,8 +219,123 @@ void topk(const uint row) {
     }
 }
 
+#ifdef NPT
+// register-resident QSA variant (ncols <= NPT * BLOCK_SIZE): the row is gathered once into NPT keys per invocation, not re-read
+// on each later pass (TOPK_QSA was DRAM-bound, ~125 ms per ubatch at d32768); the output is bit-identical to topk()
+shared uint sh_cnt_gt[NPT * 64];
+shared uint sh_cnt_eq[NPT * 64];
+shared uint sh_chunk_gt[NPT];
+shared uint sh_chunk_eq[NPT];
+
+void topk_reg(const uint row) {
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint ncols = p.ncols;
+    const uint row_out = row * p.k;
+
+    uint keys[NPT];
+    [[unroll]] for (uint j = 0; j < NPT; ++j) {
+        const uint i = j * BLOCK_SIZE + tid;
+        keys[j] = i < ncols ? f2ui(gather(row, i)) : 0u;
+    }
+
+    uint prefix  = 0;
+    uint desired = p.k;
+
+    [[unroll]] for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        for (uint i = tid; i < RADIX_SIZE; i += BLOCK_SIZE) {
+            histo[i] = 0;
+        }
+        barrier();
+
+        const uint hi_mask   = (shift + RADIX_BITS >= 32) ? 0u : (0xFFFFFFFFu << uint(shift + RADIX_BITS));
+        const uint prefix_hi = prefix & hi_mask;
+        [[unroll]] for (uint j = 0; j < NPT; ++j) {
+            // uniform: slots past the row end hold nothing (a 34.8k row fills 34 of reg64's 64)
+            if (j * BLOCK_SIZE < ncols) {
+                const uint i = j * BLOCK_SIZE + tid;
+                histo_add(i < ncols && (keys[j] & hi_mask) == prefix_hi, (keys[j] >> uint(shift)) & (RADIX_SIZE - 1));
+            }
+        }
+        barrier();
+
+        select_bucket(desired);
+        barrier();
+
+        prefix  |= sh_bucket << uint(shift);
+        desired -= sh_above;
+        barrier();
+    }
+
+    // emission in the scratch variant's order (above the threshold, then ties, ascending index), with all per-(chunk, subgroup)
+    // hit counts published at once and scanned: 3 barriers replace 4 per chunk
+    const uint threshold = prefix;
+    const uint sg  = gl_SubgroupID;
+    const uint nsg = gl_NumSubgroups;
+    [[unroll]] for (uint j = 0; j < NPT; ++j) {
+        const uint i = j * BLOCK_SIZE + tid;
+        const uvec4 bgt = subgroupBallot(i < ncols && keys[j] >  threshold);
+        const uvec4 beq = subgroupBallot(i < ncols && keys[j] == threshold);
+        if (subgroupElect()) {
+            sh_cnt_gt[j * nsg + sg] = subgroupBallotBitCount(bgt);
+            sh_cnt_eq[j * nsg + sg] = subgroupBallotBitCount(beq);
+        }
+    }
+    barrier();
+    // per chunk: counts -> exclusive prefix over the subgroups, chunk totals aside
+    if (tid < NPT) {
+        uint tg = 0, te = 0;
+        for (uint s = 0; s < nsg; ++s) {
+            const uint cg = sh_cnt_gt[tid * nsg + s];
+            const uint ce = sh_cnt_eq[tid * nsg + s];
+            sh_cnt_gt[tid * nsg + s] = tg;
+            sh_cnt_eq[tid * nsg + s] = te;
+            tg += cg;
+            te += ce;
+        }
+        sh_chunk_gt[tid] = tg;
+        sh_chunk_eq[tid] = te;
+    }
+    barrier();
+    // chunk totals -> exclusive prefix; the ties start after every above-threshold cell
+    if (tid == 0) {
+        uint ag = 0, ae = 0;
+        for (uint j = 0; j < NPT; ++j) {
+            const uint tg = sh_chunk_gt[j];
+            const uint te = sh_chunk_eq[j];
+            sh_chunk_gt[j] = ag;
+            sh_chunk_eq[j] = ae;
+            ag += tg;
+            ae += te;
+        }
+        sh_above = ag;
+    }
+    barrier();
+    const uint n_gt = sh_above;
+    [[unroll]] for (uint j = 0; j < NPT; ++j) {
+        if (j * BLOCK_SIZE >= ncols) {
+            break;
+        }
+        const uint i  = j * BLOCK_SIZE + tid;
+        const bool gt = i < ncols && keys[j] >  threshold;
+        const bool eq = i < ncols && keys[j] == threshold;
+        const uint rgt = subgroupBallotExclusiveBitCount(subgroupBallot(gt));
+        const uint req = subgroupBallotExclusiveBitCount(subgroupBallot(eq));
+        const uint slot = gt ? sh_chunk_gt[j] + sh_cnt_gt[j * nsg + sg] + rgt
+                             : n_gt + sh_chunk_eq[j] + sh_cnt_eq[j * nsg + sg] + req;
+        if ((gt || eq) && slot < p.k) {
+            data_d[row_out + slot] = int(i);
+        }
+    }
+    barrier();
+}
+#endif
+
 void main() {
     for (uint row = gl_WorkGroupID.y; row < p.nrows; row += gl_NumWorkGroups.y) {
+#ifdef NPT
+        topk_reg(row);
+#else
         topk(row);
+#endif
     }
 }

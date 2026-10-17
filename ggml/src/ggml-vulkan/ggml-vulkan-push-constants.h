@@ -24,6 +24,12 @@ struct vk_mat_mat_hcmix_push_constants {
     uint32_t hc_round;  // 1: f16 gate (the unfused chain casts it), 0: f32 gate
 };
 
+// matmul_f32_f32_qsa (QSA_EPI in mul_mm.comp): the plain push constants plus the block-bias addressing
+struct vk_mat_mat_qsa_push_constants {
+    vk_mat_mat_push_constants mm;
+    uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;
+};
+
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
     uint32_t stride_a;
@@ -562,6 +568,25 @@ struct vk_op_topk_push_constants {
     uint32_t nrows;
     uint32_t first_pass;
     uint32_t last_pass;
+};
+
+// QSA_BLOCK_SELECT: one dispatch per strip for qwen4exp's maskless block selection
+struct vk_op_qsa_block_select_push_constants {
+    uint32_t n_blocks;
+    uint32_t budget;
+    uint32_t n_query;
+    uint32_t n_stream;
+    uint32_t r;
+    uint32_t width;       // r*budget + r-1
+    uint32_t c_stride_s;  // block cells: elements per stream
+    uint32_t t_stride_q;  // tail: elements per query
+    uint32_t t_stride_s;  // tail: elements per stream
+    // compact visibility read in the kernel: block b is visible to query q iff
+    // limits[row(q)*l_blocks + b] < limits[l_tails_off + q], row(q) = limits[l_rowidx_off + q] (0 when l_rowidx_off is ~0u)
+    uint32_t l_mode;        // 0: the scores carry the visibility; 1: apply it from the limits buffer
+    uint32_t l_blocks;      // start-row stride (0 with one sequence row)
+    uint32_t l_tails_off;   // element offset of the per-query tail starts
+    uint32_t l_rowidx_off;  // element offset of the per-query sequence rows, ~0u: one row
 };
 
 struct vk_op_topk_radix_push_constants {
