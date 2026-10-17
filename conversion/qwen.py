@@ -395,7 +395,11 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name.endswith(".A_log"):
-            data_torch = -torch.exp(data_torch)
+            if self.exl3_codebook is not None:
+                # common/exl3-dir.cpp writes the same tensor: round once from float64, as float32 exp differs between libm and MKL
+                data_torch = -torch.exp(data_torch.to(torch.float64)).to(torch.float32)
+            else:
+                data_torch = -torch.exp(data_torch)
         elif name.endswith(".dt_bias"):
             name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
         elif "conv1d" in name:
