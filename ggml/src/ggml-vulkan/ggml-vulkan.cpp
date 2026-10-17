@@ -17338,6 +17338,10 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
             get_misalign_bytes(ctx, sc) != 0) {
             return false;
         }
+        // a weight past maxStorageBufferRange takes ggml_vk_mul_mat's split-M GEMM, which has no SCALE epilogue
+        if (ggml_nbytes(mul->src[0]) > ctx->device->properties.limits.maxStorageBufferRange) {
+            return false;
+        }
         // ggml_scale_bias with a bias: the SCALE kernel's x * s + b may contract to one fma, the epilogue rounds twice
         if (ggml_get_op_params_f32(sc, 1) != 0.0f) {
             return false;
