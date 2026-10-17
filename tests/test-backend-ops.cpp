@@ -5807,6 +5807,66 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// GGML_OP_EXL3_MUL_MAT
+struct test_exl3_mul_mat : public test_case {
+    const int64_t k;
+    const int64_t n;
+    const int64_t tile_words; // 16*K
+    const int     codebook;
+    const std::array<int64_t, 2> ne_b;
+    const bool    v; // x is a strided view
+
+    std::string vars() override {
+        return VARS_TO_STR6(k, n, tile_words, codebook, ne_b, v);
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        return 2*k*n*t->ne[1]*t->ne[2];
+    }
+
+    test_exl3_mul_mat(int64_t k = 256, int64_t n = 384, int64_t tile_words = 64, int codebook = 1,
+            std::array<int64_t, 2> ne_b = {5, 1}, bool v = false)
+        : k(k), n(n), tile_words(tile_words), codebook(codebook), ne_b(ne_b), v(v) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * trellis = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, tile_words, n/16, k/16);
+        ggml_set_name(trellis, "trellis");
+
+        ggml_tensor * suh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, k);
+        ggml_set_name(suh, "suh");
+
+        ggml_tensor * svh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, n);
+        ggml_set_name(svh, "svh");
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, v ? k + 64 : k, ne_b[0], ne_b[1]);
+        ggml_set_name(x, "x");
+        if (v) {
+            x = ggml_view_3d(ctx, x, k, ne_b[0], ne_b[1], x->nb[1], x->nb[2], 0);
+            ggml_set_name(x, "x_view");
+        }
+
+        ggml_tensor * out = ggml_exl3_mul_mat(ctx, trellis, x, suh, svh, codebook);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x3E13);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I16) {
+                // raw bytes: every 16-bit trellis state decodes to a finite value
+                std::vector<int16_t> data(ggml_nelements(t));
+                for (int16_t & d : data) {
+                    d = (int16_t) (gen() >> 16);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -13685,6 +13745,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
 
+    // EXL3: K = 2, 3, 4, 6, 8 and half rate 2.5 over the three codebooks, decode and prompt rows, 3-D and strided x
+    for (auto [tile_words, codebook] : std::vector<std::pair<int64_t, int>>{{32, 1}, {48, 0}, {64, 1}, {96, 1}, {128, 2}, {40, 2}}) {
+        test_cases.emplace_back(new test_exl3_mul_mat(256, 384, tile_words, codebook, {1, 1}));
+        test_cases.emplace_back(new test_exl3_mul_mat(256, 384, tile_words, codebook, {7, 1}));
+    }
+    test_cases.emplace_back(new test_exl3_mul_mat(384, 256, 64, 1, {512, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}));
+    test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}, true));
+
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
@@ -17569,6 +17638,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int kv : { 5504, 11008, 19200, 35584 }) {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 1024, 2304, 512, false, 1, 0, tk));
         }
+    }
+
+    // EXL3 Qwen3.5-4B ffn_up (K = 4, mcg) at decode and ubatch rows
+    for (int64_t rows : { 1, 512 }) {
+        test_cases.emplace_back(new test_exl3_mul_mat(2560, 9216, 64, 1, {rows, 1}));
     }
 
     return test_cases;

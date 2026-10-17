@@ -59,8 +59,19 @@ that is done on whole 128-blocks (8 tiles plus the matching scale entries), whic
 diagonal; the tiles themselves are unchanged. Not supported yet, refused by the converter: legacy packed `.su`/`.sv`,
 2-D row-ring trellises (quantized token embeddings, n-gram tables), mixed codebooks.
 
+## Op
+
+`ggml_exl3_mul_mat(ctx, trellis, x, suh, svh, codebook)` (`GGML_OP_EXL3_MUL_MAT`) computes `y = x W` without
+materializing `W`: `y = H(H(x * suh) W_hat) * svh / 128`, H the unnormalized 128-point Hadamard. The CPU backend
+(`ggml/src/ggml-cpu/exl3-ops.cpp`, built with `GGML_EXL3=ON`) decodes `W_hat` tile by tile through a 65536-entry
+table of `ggml_exl3_codebook_value`, so every weight is exact, and accumulates in f32: per 128 block, then across
+blocks. Other backends do not support the op yet.
+
 ## Tests
 
 - `test-exl3`: the three codebook tables, and all 27 rate x codebook cases on synthetic tiles, against hashes made
   with exllamav3's `trellis.py`; type and shape checks.
 - `test-exl3 --gguf FILE`: decodes every EXL3 linear of a container and prints sha256 of `W_hat` and `W` per tensor.
+- The op: `test-exl3` also runs `ggml_exl3_mul_mat` against `ggml_mul_mat` on the f32 `W` of `ggml_exl3_dequantize`
+  for every rate x codebook case; `test-exl3 --op-gguf FILE` does it on the first linear of each (k, n, K) of a
+  container at 1 to 513 rows. Both require NMSE <= 1e-10. `test-backend-ops -o EXL3_MUL_MAT` has the op cases.

@@ -1218,9 +1218,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "EXL3_MUL_MAT",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1333,9 +1335,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "exl3(X)*y",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6796,6 +6800,42 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_exl3_mul_mat
+
+struct ggml_tensor * ggml_exl3_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * suh,
+        struct ggml_tensor  * svh,
+        int                   codebook) {
+    GGML_ASSERT(trellis->type == GGML_TYPE_I16 && ggml_is_contiguous(trellis) && trellis->ne[3] == 1);
+    GGML_ASSERT(suh->type == GGML_TYPE_F16 && svh->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(codebook >= 0 && codebook <= 2);
+
+    // tiles are 16x16 and the Hadamard blocks 128 wide
+    const int64_t k = trellis->ne[2]*16;
+    const int64_t n = trellis->ne[1]*16;
+    GGML_ASSERT(k % 128 == 0 && n % 128 == 0);
+    GGML_ASSERT(ggml_is_vector(suh) && ggml_is_contiguous(suh) && suh->ne[0] == k);
+    GGML_ASSERT(ggml_is_vector(svh) && ggml_is_contiguous(svh) && svh->ne[0] == n);
+    GGML_ASSERT(x->ne[0] == k);
+
+    const int64_t ne[4] = { n, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, codebook);
+
+    result->op     = GGML_OP_EXL3_MUL_MAT;
+    result->src[0] = trellis;
+    result->src[1] = x;
+    result->src[2] = suh;
+    result->src[3] = svh;
 
     return result;
 }

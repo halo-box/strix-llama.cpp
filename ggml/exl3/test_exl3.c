@@ -5,13 +5,21 @@
 // of diag(suh) H W_hat H diag(svh) evaluated exactly (integers) on that W_hat; the float64 dequant() of the oracle
 // differs from it only by its own rounding (160 of the 884736 values, by one f32 ulp or near zero).
 //
-// test-exl3                -> codebook tables, every rate x codebook on synthetic tiles, shape checks
+// The op tests compare ggml_exl3_mul_mat with ggml_mul_mat on the f32 W of ggml_exl3_dequantize, both on the CPU
+// backend, and require NMSE <= 1e-10. They also print the NMSE of each against a double sum on the first rows.
+//
+// test-exl3                -> codebook tables, every rate x codebook on synthetic tiles, shape checks, op on synthetic tiles
 // test-exl3 --gguf FILE    -> decode every EXL3 linear of a GGUF container, one JSON line per tensor with sha256
+// test-exl3 --op-gguf FILE -> op on the first linear of each (k, n, K) in a GGUF container, at the decode and prompt row counts
 
 #include "exl3.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 #include "hash/sha256/sha256.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,6 +194,217 @@ static int test_checks(void) {
     return n_fail;
 }
 
+#define OP_NMSE_MAX 1e-10
+
+static int op_n_threads(void) {
+    const char * env = getenv("EXL3_TEST_THREADS");
+    return env ? atoi(env) : 16;
+}
+
+// activation in [-1, 1), one channel in 128 is 32 times larger
+static float rand_act(uint32_t * s, int64_t channel) {
+    const float u = (float) (xorshift32(s) >> 8)*(1.0f/8388608.0f) - 1.0f;
+    return channel % 128 == 77 ? 32.0f*u : u;
+}
+
+static double nmse(const float * a, const float * b, int64_t n) {
+    double num = 0.0;
+    double den = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        const double d = (double) a[i] - (double) b[i];
+        num += d*d;
+        den += (double) b[i]*(double) b[i];
+    }
+    return den > 0.0 ? num/den : (num > 0.0 ? 1.0 : 0.0);
+}
+
+// one EXL3 linear in a CPU backend buffer, with its f32 W as a ggml [k, n] tensor for ggml_mul_mat
+struct op_weights {
+    struct ggml_context * ctx;
+    ggml_backend_buffer_t buf;
+    struct ggml_tensor  * trellis;
+    struct ggml_tensor  * suh;
+    struct ggml_tensor  * svh;
+    struct ggml_tensor  * w;
+    float               * w_t; // [n][k] host copy for the double sums
+    int64_t               k;
+    int64_t               n;
+    int                   cb;
+};
+
+static bool op_weights_init(struct op_weights * ow, ggml_backend_t be, const int16_t * trellis, const ggml_fp16_t * suh,
+                            const ggml_fp16_t * svh, int64_t k, int64_t n, int64_t tile_words, int cb) {
+    memset(ow, 0, sizeof(*ow));
+    ow->k  = k;
+    ow->n  = n;
+    ow->cb = cb;
+
+    float * w = (float *) malloc(k*n*sizeof(float));
+    ow->w_t   = (float *) malloc(k*n*sizeof(float));
+    if (w == NULL || ow->w_t == NULL) {
+        free(w);
+        return false;
+    }
+    ggml_exl3_dequantize(trellis, suh, svh, k, n, tile_words, (enum ggml_exl3_codebook) cb, w);
+    for (int64_t i = 0; i < k; i++) {
+        for (int64_t j = 0; j < n; j++) {
+            ow->w_t[j*k + i] = w[i*n + j];
+        }
+    }
+    free(w);
+
+    struct ggml_init_params params = { 8*ggml_tensor_overhead(), NULL, true };
+    ow->ctx     = ggml_init(params);
+    ow->trellis = ggml_new_tensor_3d(ow->ctx, GGML_TYPE_I16, tile_words, n/GGML_EXL3_TILE, k/GGML_EXL3_TILE);
+    ow->suh     = ggml_new_tensor_1d(ow->ctx, GGML_TYPE_F16, k);
+    ow->svh     = ggml_new_tensor_1d(ow->ctx, GGML_TYPE_F16, n);
+    ow->w       = ggml_new_tensor_2d(ow->ctx, GGML_TYPE_F32, k, n);
+    ow->buf     = ggml_backend_alloc_ctx_tensors(ow->ctx, be);
+    if (ow->buf == NULL) {
+        return false;
+    }
+    ggml_backend_tensor_set(ow->trellis, trellis, 0, ggml_nbytes(ow->trellis));
+    ggml_backend_tensor_set(ow->suh, suh, 0, ggml_nbytes(ow->suh));
+    ggml_backend_tensor_set(ow->svh, svh, 0, ggml_nbytes(ow->svh));
+    ggml_backend_tensor_set(ow->w, ow->w_t, 0, ggml_nbytes(ow->w));
+    return true;
+}
+
+static void op_weights_free(struct op_weights * ow) {
+    ggml_backend_buffer_free(ow->buf);
+    ggml_free(ow->ctx);
+    free(ow->w_t);
+}
+
+// nr rows of x; x_pad > 0 makes x a strided view whose padding is NaN
+// prints one JSON line, returns 1 on failure
+static int op_check_rows(ggml_backend_t be, const struct op_weights * ow, int64_t nr, int64_t x_pad, uint32_t seed,
+                         int64_t n_true, const char * label) {
+    const int64_t k  = ow->k;
+    const int64_t n  = ow->n;
+    const int64_t kx = k + x_pad;
+
+    struct ggml_init_params params = { 8*ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+    struct ggml_tensor * x_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kx, nr);
+    struct ggml_tensor * x      = x_pad > 0 ? ggml_view_2d(ctx, x_full, k, nr, x_full->nb[1], 0) : x_full;
+    struct ggml_tensor * y_op   = ggml_exl3_mul_mat(ctx, ow->trellis, x, ow->suh, ow->svh, ow->cb);
+    struct ggml_tensor * y_ref  = ggml_mul_mat(ctx, ow->w, x);
+    struct ggml_cgraph * gf     = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y_op);
+    ggml_build_forward_expand(gf, y_ref);
+
+    int fail = 1;
+    float * xd   = (float *) malloc(kx*nr*sizeof(float));
+    float * yo   = (float *) malloc(n*nr*sizeof(float));
+    float * yr   = (float *) malloc(n*nr*sizeof(float));
+    float * yt   = (float *) malloc(n*(n_true > 0 ? n_true : 1)*sizeof(float));
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    if (!ggml_backend_supports_op(be, y_op)) {
+        fprintf(stderr, "%s: EXL3_MUL_MAT is not supported by the CPU backend\n", label);
+    } else if (buf != NULL && xd != NULL && yo != NULL && yr != NULL && yt != NULL) {
+        for (int64_t r = 0; r < nr; r++) {
+            for (int64_t i = 0; i < kx; i++) {
+                xd[r*kx + i] = i < k ? rand_act(&seed, i) : NAN;
+            }
+        }
+        ggml_backend_tensor_set(x_full, xd, 0, ggml_nbytes(x_full));
+        if (ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS) {
+            ggml_backend_tensor_get(y_op, yo, 0, ggml_nbytes(y_op));
+            ggml_backend_tensor_get(y_ref, yr, 0, ggml_nbytes(y_ref));
+
+            n_true = n_true < nr ? n_true : nr;
+            for (int64_t r = 0; r < n_true; r++) {
+                for (int64_t j = 0; j < n; j++) {
+                    double s = 0.0;
+                    const float * wj = ow->w_t + j*k;
+                    const float * xr = xd + r*kx;
+                    for (int64_t i = 0; i < k; i++) {
+                        s += (double) xr[i]*(double) wj[i];
+                    }
+                    yt[r*n + j] = (float) s;
+                }
+            }
+            const double e  = nmse(yo, yr, n*nr);
+            const double eo = n_true > 0 ? nmse(yo, yt, n*n_true) : -1.0;
+            const double er = n_true > 0 ? nmse(yr, yt, n*n_true) : -1.0;
+            fail = !(e <= OP_NMSE_MAX);
+            printf("{\"case\": \"%s\", \"k\": %lld, \"n\": %lld, \"rows\": %lld, \"x_pad\": %lld, \"nmse_op_vs_mul_mat\": %.3e, "
+                   "\"nmse_op_vs_f64\": %.3e, \"nmse_mul_mat_vs_f64\": %.3e, \"f64_rows\": %lld, \"pass\": %s}\n",
+                   label, (long long) k, (long long) n, (long long) nr, (long long) x_pad, e, eo, er, (long long) n_true,
+                   fail ? "false" : "true");
+            fflush(stdout);
+        }
+    }
+
+    free(xd);
+    free(yo);
+    free(yr);
+    free(yt);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return fail;
+}
+
+// every rate x codebook at k = 256, n = 384, a few row counts and one strided x
+static int test_op(void) {
+    const int64_t tk = 16;
+    const int64_t tn = 24;
+    const int64_t k  = tk*16;
+    const int64_t n  = tn*16;
+    static const int64_t rows[] = { 1, 2, 3, 5, 8, 13 };
+
+    ggml_backend_t be = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(be, op_n_threads());
+
+    int n_fail = 0;
+    int n_run  = 0;
+    int16_t     * trellis = (int16_t *) malloc(tk*tn*128*sizeof(int16_t));
+    ggml_fp16_t * suh     = (ggml_fp16_t *) malloc(k*sizeof(ggml_fp16_t));
+    ggml_fp16_t * svh     = (ggml_fp16_t *) malloc(n*sizeof(ggml_fp16_t));
+
+    for (size_t i = 0; i < sizeof(tile_goldens)/sizeof(tile_goldens[0]); i++) {
+        const int tile_words = tile_goldens[i].tile_words;
+        const int cb         = tile_goldens[i].cb;
+
+        uint32_t s = 0x2545F491u + 0x9E3779B9u*(uint32_t) (tile_words*4 + cb);
+        for (int64_t j = 0; j < tk*tn*tile_words; j++) {
+            trellis[j] = (int16_t) (uint16_t) (xorshift32(&s) >> 16);
+        }
+        for (int64_t j = 0; j < k; j++) {
+            suh[j] = rand_f16(&s);
+        }
+        for (int64_t j = 0; j < n; j++) {
+            svh[j] = rand_f16(&s);
+        }
+
+        struct op_weights ow;
+        if (!op_weights_init(&ow, be, trellis, suh, svh, k, n, tile_words, cb)) {
+            fprintf(stderr, "op: weight setup failed\n");
+            n_fail++;
+            continue;
+        }
+        char label[64];
+        snprintf(label, sizeof(label), "synthetic K=%.1f %s", tile_words/16.0, ggml_exl3_codebook_name((enum ggml_exl3_codebook) cb));
+        for (size_t j = 0; j < sizeof(rows)/sizeof(rows[0]); j++) {
+            n_fail += op_check_rows(be, &ow, rows[j], 0, s + (uint32_t) j, rows[j], label);
+            n_run++;
+        }
+        n_fail += op_check_rows(be, &ow, 7, 160, s, 7, label);
+        n_run++;
+        op_weights_free(&ow);
+    }
+
+    free(trellis);
+    free(suh);
+    free(svh);
+    ggml_backend_free(be);
+    if (n_fail) {
+        fprintf(stderr, "op: %d of %d cases failed\n", n_fail, n_run);
+    }
+    return n_fail;
+}
+
 static void sha256_hex(const void * data, size_t n, char * out) {
     unsigned char digest[SHA256_DIGEST_SIZE];
     sha256_hash(digest, (const unsigned char *) data, n);
@@ -206,25 +425,63 @@ static void * read_tensor(FILE * f, const struct gguf_context * gctx, const stru
     return buf;
 }
 
-static int check_gguf(const char * path) {
+// reads the metadata of an EXL3 container, returns its codebook or -1
+static int open_container(const char * path, struct gguf_context ** gctx_out, struct ggml_context ** meta_out) {
     struct ggml_context * meta = NULL;
     struct gguf_init_params params = { true, &meta };
     struct gguf_context * gctx = gguf_init_from_file(path, params);
     if (gctx == NULL) {
         fprintf(stderr, "%s: cannot read GGUF\n", path);
-        return 1;
+        return -1;
     }
 
     const int64_t kid_ver = gguf_find_key(gctx, "exl3.version");
     const int64_t kid_cb  = gguf_find_key(gctx, "exl3.codebook");
+    int cb = -1;
     if (kid_ver < 0 || gguf_get_kv_type(gctx, kid_ver) != GGUF_TYPE_UINT32 || gguf_get_val_u32(gctx, kid_ver) != 1 ||
             kid_cb < 0 || gguf_get_kv_type(gctx, kid_cb) != GGUF_TYPE_STRING) {
         fprintf(stderr, "%s: missing or unsupported exl3.version / exl3.codebook\n", path);
-        return 1;
-    }
-    const int cb = ggml_exl3_codebook_from_name(gguf_get_val_str(gctx, kid_cb));
-    if (cb < 0) {
+    } else if ((cb = ggml_exl3_codebook_from_name(gguf_get_val_str(gctx, kid_cb))) < 0) {
         fprintf(stderr, "%s: unknown exl3.codebook %s\n", path, gguf_get_val_str(gctx, kid_cb));
+    }
+    if (cb < 0) {
+        gguf_free(gctx);
+        ggml_free(meta);
+        return -1;
+    }
+    *gctx_out = gctx;
+    *meta_out = meta;
+    return cb;
+}
+
+// for a "<base>.exl3_trellis" tensor: 1 and its base name and scales, -1 if the linear is malformed; 0 for other tensors
+static int find_linear(struct ggml_context * meta, const struct ggml_tensor * t, int cb, char * base,
+                       struct ggml_tensor ** su, struct ggml_tensor ** sv) {
+    const char * suffix = ".exl3_trellis";
+    const char * name   = ggml_get_name(t);
+    const size_t len    = strlen(name);
+    if (len <= strlen(suffix) || strcmp(name + len - strlen(suffix), suffix) != 0) {
+        return 0;
+    }
+    char name_su[GGML_MAX_NAME + 16];
+    char name_sv[GGML_MAX_NAME + 16];
+    snprintf(base, GGML_MAX_NAME, "%.*s", (int) (len - strlen(suffix)), name);
+    snprintf(name_su, sizeof(name_su), "%s.exl3_suh", base);
+    snprintf(name_sv, sizeof(name_sv), "%s.exl3_svh", base);
+    *su = ggml_get_tensor(meta, name_su);
+    *sv = ggml_get_tensor(meta, name_sv);
+    if (*su == NULL || *sv == NULL || !ggml_exl3_check_linear(t, *su, *sv, (enum ggml_exl3_codebook) cb)) {
+        fprintf(stderr, "%s: bad EXL3 linear\n", base);
+        return -1;
+    }
+    return 1;
+}
+
+static int check_gguf(const char * path) {
+    struct gguf_context * gctx = NULL;
+    struct ggml_context * meta = NULL;
+    const int cb = open_container(path, &gctx, &meta);
+    if (cb < 0) {
         return 1;
     }
 
@@ -235,24 +492,13 @@ static int check_gguf(const char * path) {
 
     int n_mod = 0;
     int n_err = 0;
-    const char * suffix = ".exl3_trellis";
     for (struct ggml_tensor * t = ggml_get_first_tensor(meta); t != NULL; t = ggml_get_next_tensor(meta, t)) {
-        const char * name = ggml_get_name(t);
-        const size_t len = strlen(name);
-        if (len <= strlen(suffix) || strcmp(name + len - strlen(suffix), suffix) != 0) {
-            continue;
-        }
         char base[GGML_MAX_NAME];
-        char name_su[GGML_MAX_NAME + 16];
-        char name_sv[GGML_MAX_NAME + 16];
-        snprintf(base, sizeof(base), "%.*s", (int) (len - strlen(suffix)), name);
-        snprintf(name_su, sizeof(name_su), "%s.exl3_suh", base);
-        snprintf(name_sv, sizeof(name_sv), "%s.exl3_svh", base);
-        struct ggml_tensor * su = ggml_get_tensor(meta, name_su);
-        struct ggml_tensor * sv = ggml_get_tensor(meta, name_sv);
-        if (su == NULL || sv == NULL || !ggml_exl3_check_linear(t, su, sv, (enum ggml_exl3_codebook) cb)) {
-            fprintf(stderr, "%s: bad EXL3 linear\n", base);
-            n_err++;
+        struct ggml_tensor * su = NULL;
+        struct ggml_tensor * sv = NULL;
+        const int found = find_linear(meta, t, cb, base, &su, &sv);
+        if (found <= 0) {
+            n_err += found < 0;
             continue;
         }
 
@@ -294,12 +540,90 @@ static int check_gguf(const char * path) {
     return n_err != 0 || n_mod == 0;
 }
 
+// the op on the first linear of each (k, n, K): decode (1 row), the remainders of the 4-row kernel, ubatch 512 and past it
+static int op_gguf(const char * path) {
+    static const int64_t rows[] = { 1, 2, 3, 4, 5, 7, 8, 16, 64, 511, 512, 513 };
+
+    struct gguf_context * gctx = NULL;
+    struct ggml_context * meta = NULL;
+    const int cb = open_container(path, &gctx, &meta);
+    if (cb < 0) {
+        return 1;
+    }
+    FILE * f = fopen(path, "rb");
+    if (f == NULL) {
+        return 1;
+    }
+
+    ggml_backend_t be = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(be, op_n_threads());
+
+    int64_t seen[64][3];
+    int n_seen = 0;
+    int n_run  = 0;
+    int n_fail = 0;
+    for (struct ggml_tensor * t = ggml_get_first_tensor(meta); t != NULL; t = ggml_get_next_tensor(meta, t)) {
+        char base[GGML_MAX_NAME];
+        struct ggml_tensor * su = NULL;
+        struct ggml_tensor * sv = NULL;
+        const int found = find_linear(meta, t, cb, base, &su, &sv);
+        if (found <= 0) {
+            n_fail += found < 0;
+            continue;
+        }
+        const int64_t k = t->ne[2]*GGML_EXL3_TILE;
+        const int64_t n = t->ne[1]*GGML_EXL3_TILE;
+        bool is_new = true;
+        for (int i = 0; i < n_seen; i++) {
+            is_new = is_new && !(seen[i][0] == k && seen[i][1] == n && seen[i][2] == t->ne[0]);
+        }
+        if (!is_new || n_seen == 64) {
+            continue;
+        }
+        seen[n_seen][0] = k;
+        seen[n_seen][1] = n;
+        seen[n_seen][2] = t->ne[0];
+        n_seen++;
+
+        int16_t     * trellis = (int16_t *)     read_tensor(f, gctx, t);
+        ggml_fp16_t * suh     = (ggml_fp16_t *) read_tensor(f, gctx, su);
+        ggml_fp16_t * svh     = (ggml_fp16_t *) read_tensor(f, gctx, sv);
+        struct op_weights ow;
+        if (trellis == NULL || suh == NULL || svh == NULL || !op_weights_init(&ow, be, trellis, suh, svh, k, n, t->ne[0], cb)) {
+            fprintf(stderr, "%s: read or setup failed\n", base);
+            n_fail++;
+        } else {
+            uint32_t seed = 0x6A09E667u ^ (uint32_t) n_seen;
+            for (size_t j = 0; j < sizeof(rows)/sizeof(rows[0]); j++) {
+                n_fail += op_check_rows(be, &ow, rows[j], 0, seed + (uint32_t) j, 4, base);
+                n_run++;
+            }
+            n_fail += op_check_rows(be, &ow, 5, 96, seed, 4, base);
+            n_run++;
+            op_weights_free(&ow);
+        }
+        free(trellis);
+        free(suh);
+        free(svh);
+    }
+
+    ggml_backend_free(be);
+    fclose(f);
+    gguf_free(gctx);
+    ggml_free(meta);
+    fprintf(stderr, "%s: %d shapes, %d op cases, %d failures\n", path, n_seen, n_run, n_fail);
+    return n_fail != 0 || n_run == 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc == 3 && strcmp(argv[1], "--gguf") == 0) {
         return check_gguf(argv[2]);
     }
+    if (argc == 3 && strcmp(argv[1], "--op-gguf") == 0) {
+        return op_gguf(argv[2]);
+    }
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [--gguf FILE]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--gguf FILE | --op-gguf FILE]\n", argv[0]);
         return 1;
     }
 
@@ -307,10 +631,11 @@ int main(int argc, char ** argv) {
     n_fail += test_codebooks();
     n_fail += test_tiles();
     n_fail += test_checks();
+    n_fail += test_op();
     if (n_fail) {
         fprintf(stderr, "test-exl3: %d failures\n", n_fail);
         return 1;
     }
-    printf("test-exl3: OK (3 codebooks, %d rate x codebook cases)\n", (int) (sizeof(tile_goldens)/sizeof(tile_goldens[0])));
+    printf("test-exl3: OK (3 codebooks, %d rate x codebook cases, op on all of them)\n", (int) (sizeof(tile_goldens)/sizeof(tile_goldens[0])));
     return 0;
 }

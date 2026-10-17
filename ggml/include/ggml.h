@@ -648,6 +648,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_EXL3_MUL_MAT,
+
         GGML_OP_COUNT,
     };
 
@@ -2805,6 +2807,17 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // EXL3 (exllamav3) linear, see ggml/exl3/README.md: y = x W with W = diag(suh) H W_hat H diag(svh) (k x n)
+    //   trellis I16 [16*K, n/16, k/16], x F32 [k, ...], suh F16 [k], svh F16 [n] -> F32 [n, ...]
+    //   codebook: 0 = 3inst, 1 = mcg, 2 = mul1; computed only by builds with GGML_EXL3
+    GGML_API struct ggml_tensor * ggml_exl3_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
+            int                   codebook);
 
     // custom operators
 

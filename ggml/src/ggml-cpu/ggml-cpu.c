@@ -20,6 +20,10 @@
 #include "../../rocmfp4/rocmfp4.h"
 #include "../../rocmfpx/rocmfpx.h"
 
+#ifdef GGML_USE_EXL3
+#include "exl3-ops.h"
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -2429,6 +2433,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
             break;
+        case GGML_OP_EXL3_MUL_MAT:
+            {
+#ifdef GGML_USE_EXL3
+                ggml_compute_forward_exl3_mul_mat(params, tensor);
+#else
+                GGML_ABORT("EXL3_MUL_MAT needs a build with GGML_EXL3=ON");
+#endif
+            } break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2774,6 +2786,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
+        case GGML_OP_EXL3_MUL_MAT:
             {
                 n_tasks = n_threads;
             } break;
@@ -3330,6 +3343,12 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t ne10 = node->src[1]->ne[0];
                         cur += sizeof(float)*ne10*n_tasks;
                     } break;
+#ifdef GGML_USE_EXL3
+                case GGML_OP_EXL3_MUL_MAT:
+                    {
+                        cur = ggml_cpu_exl3_work_size(node, n_tasks);
+                    } break;
+#endif
                 default:
                     break;
             }
