@@ -2586,13 +2586,18 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
+        // q_first > 0 (LLAMA_FN_LAST_ATTN_TRIM, the last layer only): queries, indexer queries, selection and attention for
+        // rows [q_first, n_tokens) only; K/V and the indexer keys of every row are still stored. When the trim is taken,
+        // *tile_out_ids gets the output rows relative to q_first (the returned tensor has n_tokens - q_first rows).
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+                        int64_t   q_first = 0,
+                    ggml_tensor ** tile_out_ids = nullptr);
 
         // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
@@ -2616,13 +2621,17 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        // q_first > 0: the selection for query rows [q_first, n_tokens) only (q_first a multiple of the score strip),
+        // with q_pos their positions; the indexer keys of every row are stored as before
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                        int64_t   q_first = 0,
+                    ggml_tensor * q_pos = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
