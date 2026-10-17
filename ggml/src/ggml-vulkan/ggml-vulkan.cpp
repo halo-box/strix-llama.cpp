@@ -8885,6 +8885,20 @@ static bool ggml_vk_unary_mul_keep_enabled() {
     return on;
 }
 
+// GGML_VK_PLE_CONV and GGML_VK_MMV_SCALE (default 1) are read once, again after the "ggml_backend_debug_env_reload" test hook
+static std::atomic<int> vk_knob_ple_conv  {-1};
+static std::atomic<int> vk_knob_mmv_scale {-1};
+
+static bool ggml_vk_knob_on(std::atomic<int> & knob, const char * name) {
+    int on = knob.load(std::memory_order_relaxed);
+    if (on < 0) {
+        const char * e = getenv(name);
+        on = e == nullptr || atoi(e) != 0;
+        knob.store(on, std::memory_order_relaxed);
+    }
+    return on != 0;
+}
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -17309,13 +17323,12 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
         return true;
     }
 
-    // MUL_MAT_VEC_SCALE (GGML_VK_MMV_SCALE, default 1, read per graph): a one-column quantised mat-vec whose f32 result only feeds a
+    // MUL_MAT_VEC_SCALE (GGML_VK_MMV_SCALE, default 1): a one-column quantised mat-vec whose f32 result only feeds a
     // SCALE; the shader applies the SCALE in its store. Only the f32 result: an f16 output would round before the scale
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_MUL_MAT && ops.begin()[1] == GGML_OP_SCALE) {
         const ggml_tensor *mul = cgraph->nodes[node_idx];
         const ggml_tensor *sc  = cgraph->nodes[node_idx + 1];
-        const char * e = getenv("GGML_VK_MMV_SCALE");
-        if (e != nullptr && atoi(e) == 0) {
+        if (!ggml_vk_knob_on(vk_knob_mmv_scale, "GGML_VK_MMV_SCALE")) {
             return false;
         }
         if (sc->src[0] != mul || ggml_nrows(mul) != 1 || !ggml_is_quantized(mul->src[0]->type) ||
@@ -17751,10 +17764,9 @@ bool ggml_vk_can_fuse_rms_norm_set_rows(ggml_backend_vk_context * ctx, const str
     return true;
 }
 
-// GGML_VK_PLE_CONV (default 1, read per graph): PLE_CONV_SILU_ADD, the qwen4exp PLE layer's conv + SiLU + residual adds
+// GGML_VK_PLE_CONV (default 1): PLE_CONV_SILU_ADD, the qwen4exp PLE layer's conv + SiLU + residual adds
 static bool ggml_vk_ple_conv_enabled() {
-    const char * e = getenv("GGML_VK_PLE_CONV");
-    return e == nullptr || atoi(e) != 0;
+    return ggml_vk_knob_on(vk_knob_ple_conv, "GGML_VK_PLE_CONV");
 }
 
 struct vk_ple_conv_match {
@@ -18448,9 +18460,12 @@ static bool ggml_vk_hc_up_mix_enabled() {
     return v != 0;
 }
 
-// test hook: the knobs a test flips between graphs (GGML_VK_HC_UP_MIX) are read again on their next use
+// test hook: the knobs a test flips between graphs (GGML_VK_HC_UP_MIX, GGML_VK_PLE_CONV, GGML_VK_MMV_SCALE) are read again on
+// their next use
 static void ggml_backend_vk_debug_env_reload() {
     vk_hc_up_mix_env.store(-1, std::memory_order_relaxed);
+    vk_knob_ple_conv.store(-1, std::memory_order_relaxed);
+    vk_knob_mmv_scale.store(-1, std::memory_order_relaxed);
 }
 
 // Two forms. f16 gate (LLAMA_HC_GATE_F16 on): MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE, returns 3 (the extra fused nodes); the

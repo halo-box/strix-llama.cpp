@@ -30,6 +30,7 @@ static void set_env(const char * name, const char * value) {
 
 typedef uint64_t (*census_count_t)(const char *);
 typedef void     (*census_reset_t)(void);
+typedef void     (*env_reload_t)(void);   // the backend reads its knobs once: re-read them after a change
 
 static const int64_t K = 4, DIL = 3, HIST = (K - 1) * DIL;
 
@@ -43,6 +44,7 @@ static std::vector<uint8_t> run(ggml_backend_t be, ggml_backend_reg_t reg, const
                                 const char * knob, uint64_t & n_fused) {
     auto count = (census_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_count");
     auto reset = (census_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_reset");
+    auto env_reload = (env_reload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_env_reload");
     const int64_t C = sh.c, T = sh.t, S = sh.s, R = HIST + T;
 
     ggml_init_params ip = { 96 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
@@ -101,6 +103,7 @@ static std::vector<uint8_t> run(ggml_backend_t be, ggml_backend_reg_t reg, const
     ggml_backend_tensor_set(g, in.g.data(), 0, in.g.size() * sizeof(float));
     ggml_backend_tensor_set(h, in.h.data(), 0, in.h.size() * sizeof(float));
     set_env("GGML_VK_PLE_CONV", knob);
+    if (env_reload) env_reload();
     if (reset) reset();
     ggml_backend_graph_compute(be, gf);
     n_fused = count ? count("PLE_CONV_SILU_ADD") : 0;

@@ -1,6 +1,6 @@
 // MUL_MAT_VEC_SCALE exactness (wave 8b): the Vulkan backend applies a SCALE that follows a one-column quantised mat-vec in the mat-vec's
 // store (qwen4exp's hc mix: silu(scale(W_down * xn, 1/hc)), 96 per decode token on Flash-Next). It must be BIT-EXACT with the separate
-// SCALE. Each case runs with GGML_VK_MMV_SCALE=1 and =0 (read per graph), requires byte-equal outputs and the expected fused-dispatch
+// SCALE. Each case runs with GGML_VK_MMV_SCALE=1 and =0 (re-read through the knob reset hook), requires byte-equal outputs and the expected fused-dispatch
 // counts (cases the fusion must decline expect 0 both ways), and checks that a scale one f32 ulp away changes the output (positive
 // control: the comparison sees a single rounding; for an f16 output, 2^-10 relative, the smallest step the f16 store cannot absorb).
 // Skips (exit 0) when there is no Vulkan device.
@@ -31,6 +31,7 @@ static void set_env(const char * name, const char * value) {
 
 typedef uint64_t (*census_count_t)(const char *);
 typedef void     (*census_reset_t)(void);
+typedef void     (*env_reload_t)(void);   // the backend reads its knobs once: re-read them after a change
 
 // chain: 0 = SCALE -> SILU (the hc mix); 1 = SCALE -> CPY f16 (the scaled result stored as f16 after the f32 SCALE); 2 = the mat-vec
 // result cast to f16 and back before the SCALE (a mat-vec feeding a CPY16: not a MUL_MAT -> SCALE pair, must not fuse)
@@ -40,6 +41,7 @@ static std::vector<uint8_t> run(ggml_backend_t be, ggml_backend_reg_t reg, const
                                 const std::vector<uint8_t> & wq, const std::vector<float> & xv) {
     auto count = (census_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_count");
     auto reset = (census_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_reset");
+    auto env_reload = (env_reload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_env_reload");
     ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * w = ggml_new_tensor_2d(ctx, sh.ta, sh.k, sh.m);
@@ -64,6 +66,7 @@ static std::vector<uint8_t> run(ggml_backend_t be, ggml_backend_reg_t reg, const
         ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
     }
     set_env("GGML_VK_MMV_SCALE", knob);
+    if (env_reload) env_reload();
     if (reset) reset();
     ggml_backend_graph_compute(be, gf);
     n_fused = count ? count("MUL_MAT_VEC_SCALE") : 0;
