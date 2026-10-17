@@ -19773,6 +19773,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             for (int k = mm + 1; k < std::min(mm + 16, graph->n_nodes); ++k) {
                 const ggml_tensor * t = graph->nodes[k];
                 if (!used[k] && t->op == GGML_OP_SCALE && t->src[0] == n) {
+                    // an in-place SCALE moved ahead would change what a reader of the mat-vec in between sees
+                    if (t->view_src != nullptr) {
+                        return;
+                    }
                     current_set.push_back(k);
                     used[k] = true;
                     return;
