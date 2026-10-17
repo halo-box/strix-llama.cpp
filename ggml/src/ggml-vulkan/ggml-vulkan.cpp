@@ -18342,6 +18342,9 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     if (l == "TOPK_QSA" && !dev->pipeline_topk_radix_qsa) {
         return "no radix top-k pipeline";
     }
+    if (l == "PLE_CONV_SILU_ADD" && !dev->pipeline_ple_conv_silu_add_f32) {
+        return "no ple_conv_silu_add pipeline";
+    }
     return nullptr;
 }
 

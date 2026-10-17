@@ -32,6 +32,7 @@ static void set_env(const char * name, const char * value) {
 typedef uint64_t (*census_count_t)(const char *);
 typedef void     (*census_reset_t)(void);
 typedef void     (*env_reload_t)(void);   // the backend reads its knobs once: re-read them after a change
+typedef const char * (*census_skip_t)(ggml_backend_t, const char *);
 
 // chain: 0 = SCALE -> SILU (the hc mix); 1 = SCALE -> CPY f16 (the scaled result stored as f16 after the f32 SCALE); 2 = the mat-vec
 // result cast to f16 and back before the SCALE (a mat-vec feeding a CPY16: not a MUL_MAT -> SCALE pair, must not fuse)
@@ -88,6 +89,14 @@ int main() {
     ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     const bool fusion = getenv("GGML_VK_DISABLE_FUSION") == nullptr;
+    // a device that cannot run the fused path at all skips (the backend says why); with fusion disabled the cases still run
+    auto census_skip = (census_skip_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_skip");
+    const char * why = census_skip ? census_skip(be, "MUL_MAT_VEC_SCALE") : nullptr;
+    if (why != nullptr && fusion) {
+        printf("MUL_MAT_VEC_SCALE not available on %s (%s), skipping\n", ggml_backend_dev_name(dev), why);
+        ggml_backend_free(be);
+        return 0;
+    }
 
     const shape shapes[] = {
         { GGML_TYPE_Q8_0, 320, 10240, 1, GGML_TYPE_F32, 0.25f, 0.0f, true,  "FN hc down, decode" },

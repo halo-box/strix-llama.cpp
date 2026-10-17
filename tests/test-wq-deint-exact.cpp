@@ -18,6 +18,7 @@
 
 typedef uint64_t (*census_count_t)(const char *);
 typedef void     (*census_reset_t)(void);
+typedef const char * (*census_skip_t)(ggml_backend_t, const char *);
 
 struct shape { int64_t n_embd, d, n_head, nt; };
 
@@ -88,6 +89,14 @@ int main(int argc, char ** argv) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     // graph_optimize (GGML_VK_UNARY_MUL_KEEP) runs under the scheduler only: here the graph keeps its build order
     const bool want_fused = getenv("GGML_VK_DISABLE_FUSION") == nullptr;
+    // a device that cannot run the fused path at all skips (the backend says why); with fusion disabled the cases still run
+    auto census_skip = (census_skip_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_skip");
+    const char * why = census_skip ? census_skip(be, "SIGMOID_MUL") : nullptr;
+    if (why != nullptr && want_fused) {
+        printf("SIGMOID_MUL not available on %s (%s), skipping\n", ggml_backend_dev_name(dev), why);
+        ggml_backend_free(be);
+        return 0;
+    }
 
     // FN attention (d 256, 12 heads, n_embd 2560); decode, a small batch, and prefill widths
     const shape shapes[] = { { 2560, 256, 12, 1 }, { 2560, 256, 12, 7 }, { 2560, 256, 12, 64 }, { 2560, 256, 12, 512 }, { 512, 128, 4, 33 } };

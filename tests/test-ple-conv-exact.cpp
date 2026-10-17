@@ -31,6 +31,7 @@ static void set_env(const char * name, const char * value) {
 typedef uint64_t (*census_count_t)(const char *);
 typedef void     (*census_reset_t)(void);
 typedef void     (*env_reload_t)(void);   // the backend reads its knobs once: re-read them after a change
+typedef const char * (*census_skip_t)(ggml_backend_t, const char *);
 
 static const int64_t K = 4, DIL = 3, HIST = (K - 1) * DIL;
 
@@ -131,6 +132,14 @@ int main() {
     ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     const bool want_fused = getenv("GGML_VK_DISABLE_FUSION") == nullptr;
+    // a device that cannot run the fused path at all skips (the backend says why); with fusion disabled the cases still run
+    auto census_skip = (census_skip_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_skip");
+    const char * why = census_skip ? census_skip(be, "PLE_CONV_SILU_ADD") : nullptr;
+    if (why != nullptr && want_fused) {
+        printf("PLE_CONV_SILU_ADD not available on %s (%s), skipping\n", ggml_backend_dev_name(dev), why);
+        ggml_backend_free(be);
+        return 0;
+    }
 
     // Flash-Next hc_dim 10240: decode, a small batch, a prefill ubatch; two sequences; an odd width
     const shape shapes[] = { { 10240, 1, 1 }, { 10240, 7, 1 }, { 10240, 2048, 1 }, { 10240, 33, 2 }, { 1000, 5, 3 } };
