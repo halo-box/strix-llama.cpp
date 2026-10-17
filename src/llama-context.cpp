@@ -1992,6 +1992,17 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// ends the model's prefetch on every exit of the decode that began it
+struct llama_prefetch_guard {
+    const llama_model & model;
+    const std::unique_ptr<llama_model_prefetch> & state;
+    ~llama_prefetch_guard() {
+        if (state) {
+            model.prefetch_end(state.get());
+        }
+    }
+};
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2057,13 +2068,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
 
-    {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
-        // posix_fadvise only, so a wrong prediction costs readahead and nothing else
-        extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
+    // the model may start work for the whole batch (qwen4exp gathers its per-layer-embedding rows one ubatch ahead);
+    // the guard ends it with this decode, whatever path leaves it
+    llama_prefetch_guard prefetch_guard { model, prefetch };
+    {
         // llama_batch_ext keeps tokens as entries; the allocator's flat view has the token IDs
         const llama_batch & flat = balloc->get_batch();
-        if (model.arch == LLM_ARCH_QWEN4EXP && flat.token && flat.n_tokens >= 4096) {
-            qwen4exp_ple_prefetch(model, flat.token, flat.n_tokens);
+        if (flat.token) {
+            model.prefetch_begin(prefetch, flat, cparams.n_ubatch);
         }
     }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
@@ -2891,6 +2903,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.prefetch    =*/ prefetch.get(),
     };
 }
 

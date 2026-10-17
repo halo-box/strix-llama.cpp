@@ -910,6 +910,11 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // work a model runs beside one llama_context::decode of the whole batch; `state` belongs to the calling context and
+    // prefetch_end runs on every exit of that decode. Nothing by default
+    virtual void prefetch_begin(std::unique_ptr<llama_model_prefetch> & /*state*/, const llama_batch & /*batch*/, uint32_t /*n_ubatch*/) const {}
+    virtual void prefetch_end(llama_model_prefetch * /*state*/) const {}
+
 protected:
     llama_model_params params;
 
