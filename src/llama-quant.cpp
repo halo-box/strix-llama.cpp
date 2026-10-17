@@ -1035,6 +1035,18 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         ++qs.i_ffn_up;
     }
 
+    // qwen4exp: the output projection of the full-attention layers carries most of the KLD of a trunk
+    // requantisation (measured one tensor class at a time on a Q5_K trunk: attn_output alone recovered
+    // 40% of the KLD excess for 1.6% more decode bytes). Never take it below Q8_0, or below its source
+    // type when the source is already lower than Q8_0.
+    if (arch == LLM_ARCH_QWEN4EXP && category == tensor_category::ATTENTION_OUTPUT) {
+        auto bits = [](ggml_type t) { return 8.0 * ggml_type_size(t) / ggml_blck_size(t); };
+        const ggml_type floor_type = bits(tensor->type) >= bits(GGML_TYPE_Q8_0) ? GGML_TYPE_Q8_0 : tensor->type;
+        if (bits(new_type) < bits(floor_type)) {
+            new_type = floor_type;
+        }
+    }
+
     return new_type;
 }
 
