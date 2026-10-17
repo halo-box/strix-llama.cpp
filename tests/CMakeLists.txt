@@ -371,6 +371,8 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
         # EXL3 decode self-test, kept next to the decoder under ggml/exl3
         llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/exl3/test_exl3.c NAME test-exl3 LINK ggml vendor::hash)
         target_include_directories(test-exl3 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/exl3 ${PROJECT_SOURCE_DIR}/vendor)
+        # EXL3 model directory importer, common/exl3-dir.cpp
+        llama_build_and_test(test-exl3-dir.cpp LINK llama-common vendor::hash)
     endif()
     llama_build_and_test(test-rope.cpp LINK ggml)
     llama_build_and_test(test-col2im-1d.cpp LINK ggml)

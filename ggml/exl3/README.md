@@ -74,8 +74,24 @@ blocks. Other backends do not support the op yet.
 before the caller sees a missing tensor, so an optional head is not replaced by the tied embedding. The buffer type
 is chosen with an `EXL3_MUL_MAT` probe. `build_lora_mm` makes `ggml_exl3_mul_mat` for such a weight (table
 `llama_model::exl3`), and a check on the reserved graph refuses any other op that reads a trellis. Supported archs:
-qwen35. EXL3 weights cannot be combined with LoRA adapters, prism.hadamard, the MTP draft vocabulary or a model
-built by `llama_model_init_from_user`.
+qwen35. EXL3 weights cannot be combined with LoRA adapters, prism.hadamard, the MTP draft vocabulary or a virtual
+model of `llama_model_init_from_user` (metadata without a complete tensor set).
+
+## Direct loading of an exllamav3 directory
+
+With `GGML_EXL3=ON`, `-m DIR` of the tools built on `common` (llama-cli, llama-server, llama-perplexity, ...) loads an
+exllamav3 model directory as shipped. `common/exl3-dir.cpp` reads `config.json`, the safetensors files and the
+tokenizer files, builds the GGUF metadata and tensor set that `convert_hf_to_gguf.py` writes for the directory, and
+gives them to `llama_model_init_from_user`. The data are copied from the safetensors files while the model loads
+(no mmap). Only qwen35 is supported. The importer:
+
+- reads the header of every `*.safetensors` file of the directory, with or without `model.safetensors.index.json`,
+  and refuses a tensor name found in two files; `quantization_config.json` (`tensor_storage`) is not read
+- does not load the vision tower (`model.visual.*`) or MTP tensors, and does not take an MTP layer count from
+  `config.json`
+- loads a stored `lm_head` also when `tie_word_embeddings` is set
+- names the pre-tokenizer by the sha256 of `json.dumps({"normalizer": ..., "pre_tokenizer": ...}, sort_keys=True)`
+  of `tokenizer.json`, and refuses an unknown one
 
 ## Tests
 
@@ -88,3 +104,8 @@ built by `llama_model_init_from_user`.
 - `test-exl3 --dequantize IN OUT`: writes a plain GGUF of a container, for model-level comparisons. Each EXL3 linear
   becomes `<base>.weight` F32 `[k, n]` from `ggml_exl3_dequantize`; the `exl3.*` keys are dropped and every other key
   and tensor is copied unchanged. Any build can load the result.
+- `test-exl3-dir`: writes a small synthetic qwen35 EXL3 directory (two shards with an index, a side file the index
+  does not list, a vision tower, an MTP layer only in `config.json`) and checks the import, the transforms, the
+  refusal of a repeated tensor name, and that the model loads and runs. `test-exl3-dir --compare DIR CONTAINER.gguf`
+  compares the import of a directory with the converter's container of it (tensors, bytes and keys);
+  `test-exl3-dir --dump DIR OUT.gguf` writes the import as a GGUF file.

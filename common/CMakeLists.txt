@@ -143,6 +143,13 @@ if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
 endif()
 
+if (GGML_EXL3)
+    # -m DIR: an exllamav3 EXL3 model directory, imported while loading
+    target_sources(${TARGET} PRIVATE exl3-dir.cpp exl3-dir.h)
+    target_link_libraries(${TARGET} PRIVATE vendor::hash)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_USE_EXL3)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
