@@ -60,6 +60,11 @@ struct llama_cparams {
     size_t moe_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    bool embeddings_layer_inp_dev;          // keep the extracted layer inputs in device memory
+
+    // >= 0: the decode reads its input features in place from ctx_other's device layer inputs,
+    //       starting at this row of ctx_other's last batch
+    int32_t layer_inp_row;
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

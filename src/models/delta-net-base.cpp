@@ -540,7 +540,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    // prefill-sized ubatches keep only the final state, see llm_arch_rs_snap_max_seq_tokens
+    const uint32_t snap_max = mctx_cur->get_rs_snap_max();
+    const bool keep = cparams.n_rs_seq > 0 && (snap_max == 0 || n_seq_tokens < (int64_t) snap_max);
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);

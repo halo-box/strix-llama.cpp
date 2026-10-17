@@ -78,6 +78,14 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // ubatches with at least this many tokens per seq write only the final state (0: always all snapshots)
+    uint32_t n_rs_snap_max = 0;
+
+    // per seq: the last ubatch wrote all rollback snapshots
+    std::vector<bool> rs_snap_ok;
+
+    void set_rs_snap_ok(const llama_ubatch & ubatch);
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -181,6 +189,8 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    uint32_t get_rs_snap_max() const;
 
     // s_copy(i) == head + i for all i < n_seqs, without side effects; always false with n_rs_seq > 0
     bool is_s_copy_main_identity(uint32_t n_seqs) const;

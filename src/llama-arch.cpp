@@ -1263,6 +1263,19 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
     }
 }
 
+// The per-token rollback snapshots force the tiled GDN kernel, while prefill ubatches never need them: on gfx1151
+// the chunked prefill path is ~100 ms faster per 2048-token ubatch (Qwen3.6 35B-A3B with a DFlash draft, 31k prompt:
+// 2004 -> 2210 tok/s). Rollback after such a ubatch is refused (see llama_memory_recurrent::seq_rm).
+uint32_t llm_arch_rs_snap_max_seq_tokens(const llm_arch & arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return 256;
+        default:
+            return 0;
+    }
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:

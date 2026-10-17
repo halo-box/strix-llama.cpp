@@ -1068,6 +1068,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
 
+    bool features_dev = false; // the draft reads the target features in place from the target's device memory
+
     std::vector<common_sampler_ptr> smpls;
 
     // backend sampler chain per seq, attached to ctx_dft
@@ -1215,6 +1217,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        // keep them on the device when the draft can reach the target context
+        features_dev = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        llama_set_embeddings_layer_inp_dev(ctx_tgt, features_dev);
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1305,6 +1311,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+                if (features_dev) {
+                    // the fused decode gathers the target features on the device, the batch only
+                    // carries the positions
+                    batch_inject.clear();
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
+                        batch_inject.add(mask_token_id, p, seq_id, false);
+                    }
+
+                    llama_set_layer_inp_row(ctx_dft, i_batch_beg[seq_id] + offset);
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                    llama_set_layer_inp_row(ctx_dft, -1);
+
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                    continue;
+                }
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions

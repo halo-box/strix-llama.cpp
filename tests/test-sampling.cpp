@@ -188,6 +188,39 @@ static void test_penalties(
     tester.check();
 }
 
+// the penalties sampler visits only the penalized tokens when the candidates are the vocabulary in token order;
+// any other order goes through the full scan and must give the same logits
+static void test_penalties_order(float repeat_penalty, float alpha_frequency, float alpha_presence) {
+    const int n_vocab = 64;
+    const std::vector<llama_token> last_tokens = {3, 7, 7, 60, 3, 3, 12};
+
+    std::vector<llama_token_data> in_order;
+    for (llama_token id = 0; id < n_vocab; ++id) {
+        in_order.push_back({id, 4.0f*sinf((float) id), 0.0f});
+    }
+    const std::vector<llama_token_data> orig = in_order;
+    std::vector<llama_token_data> reversed(in_order.rbegin(), in_order.rend());
+
+    for (auto * cur : {&in_order, &reversed}) {
+        auto * sampler = llama_sampler_init_penalties(n_vocab, (int32_t) last_tokens.size(), repeat_penalty, alpha_frequency, alpha_presence);
+        for (llama_token t : last_tokens) {
+            llama_sampler_accept(sampler, t);
+        }
+        llama_token_data_array cur_p = { cur->data(), cur->size(), -1, false };
+        llama_sampler_apply(sampler, &cur_p);
+        llama_sampler_free(sampler);
+    }
+
+    for (llama_token id = 0; id < n_vocab; ++id) {
+        const llama_token_data & a = in_order[id];
+        const llama_token_data & b = reversed[n_vocab - 1 - id];
+        GGML_ASSERT(a.id == id && b.id == id);
+        GGML_ASSERT(a.logit == b.logit);
+        const bool penalized = std::find(last_tokens.begin(), last_tokens.end(), id) != last_tokens.end();
+        GGML_ASSERT(penalized == (a.logit != orig[id].logit));
+    }
+}
+
 static void test_dry(
     const std::vector<float> & probs, const std::vector<llama_token> & last_tokens,
     const std::vector<float> & expected_probs, float dry_multiplier, float dry_base,
@@ -384,6 +417,8 @@ int main(void) {
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0},             {0.000011f, 0.249997f, 0.249997f, 0.249997f, 0.249997f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2},       {0.000023f, 0.000023f, 0.000023f, 0.499966f, 0.499966f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, {0.000000f, 0.000023f, 0.000023f, 0.499977f, 0.499977f}, 1.0f, 5.0f, 5.0f);
+    test_penalties_order(1.3f, 0.5f, 1.5f);
+    test_penalties_order(1.0f, 0.0f, 1.5f);
 
 
     test_dry({0.25f, 0.25f, 0.25f, 0.25f}, {0, 1}, {0.25f, 0.25f, 0.25f, 0.25f}, 1.0f, 1.1f, 2, 4, {});

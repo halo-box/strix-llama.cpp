@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include "llama-impl.h"
+#include "llama-context.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
@@ -545,6 +546,85 @@ static ggml_tensor * build_dflash2_conv(
     return result;
 }
 
+// row indices of the target features in the device layer inputs of the target context
+class llm_graph_input_target_rows : public llm_graph_input_i {
+public:
+    void set_input(const llama_ubatch * ubatch) override {
+        const int64_t n_extract = base.size();
+
+        std::vector<int32_t> data(n_extract * ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            for (int64_t k = 0; k < n_extract; ++k) {
+                data[i*n_extract + k] = base[k] + i;
+            }
+        }
+        ggml_backend_tensor_set(rows, data.data(), 0, ggml_nbytes(rows));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        // the start row is checked by llm_graph_params::allow_reuse
+        const ggml_tensor * t = params.cparams.ctx_other->get_layer_inp_dev().t;
+
+        return rows->ne[0] == (int64_t) base.size() * params.ubatch.n_tokens && t == src && t->data == src_data;
+    }
+
+    ggml_tensor * rows = nullptr; // I32 [n_extract*n_tokens]
+
+    // the target layer inputs the graph reads
+    const ggml_tensor * src      = nullptr;
+    const void        * src_data = nullptr;
+
+    std::vector<int32_t> base; // first row of each extract layer
+};
+
+// target features [n_embd_inp, n_tokens] for the K/V cache injection: the embd batch, or a gather of
+// the target context's device layer inputs (cparams.layer_inp_row >= 0), which saves the host copies
+static ggml_tensor * build_inp_target_features(llm_graph_context & g, const llama_model & model, int64_t n_embd_inp) {
+    ggml_context * ctx0 = g.ctx0;
+
+    const int64_t n_tokens = g.n_tokens;
+
+    if (g.cparams.layer_inp_row < 0) {
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+        ggml_set_input(inp->embd);
+
+        ggml_tensor * cur = inp->embd;
+        g.res->add_input(std::move(inp));
+
+        return cur;
+    }
+
+    GGML_ASSERT(g.cparams.ctx_other != nullptr);
+    const auto src = g.cparams.ctx_other->get_layer_inp_dev();
+    GGML_ASSERT(src.t != nullptr && "the target layer inputs are not on the device");
+
+    const auto & ids = model.target_layer_ids;
+    GGML_ASSERT(src.t->ne[0] * (int64_t) ids.size() == n_embd_inp);
+    GGML_ASSERT(g.cparams.layer_inp_row + n_tokens <= src.n_rows);
+
+    auto inp = std::make_unique<llm_graph_input_target_rows>();
+    inp->src      = src.t;
+    inp->src_data = src.t->data;
+    for (int32_t lid : ids) {
+        const int32_t slot = lid >= 0 && lid < (int32_t) src.slot->size() ? (*src.slot)[lid] : -1;
+        GGML_ASSERT(slot >= 0 && "target layer input not extracted");
+        inp->base.push_back(slot * (int32_t) src.n_rows + g.cparams.layer_inp_row);
+    }
+
+    inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) ids.size() * n_tokens);
+    ggml_set_input(inp->rows);
+
+    // [n_embd_tgt, n_extract*n_tokens] -> token-major concatenation of the extract layers
+    ggml_tensor * cur = ggml_get_rows(ctx0, src.t, inp->rows);
+    cur = ggml_reshape_2d(ctx0, cur, n_embd_inp, n_tokens);
+
+    g.res->add_input(std::move(inp));
+
+    return cur;
+}
+
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
 static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
@@ -841,16 +921,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
+    if (ubatch.embd || cparams.layer_inp_row >= 0) {
+        ggml_tensor * inp_target = build_inp_target_features(*this, model, n_embd_inp);
         cb(inp_target, "inp_target_features", -1);
-
-        res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
@@ -1121,16 +1194,9 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     // KV cache injection: fused target features from the encoder
     ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
+    if (ubatch.embd || cparams.layer_inp_row >= 0) {
+        ggml_tensor * inp_target = build_inp_target_features(*this, model, n_embd_inp);
         cb(inp_target, "inp_target_features", -1);
-
-        res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);

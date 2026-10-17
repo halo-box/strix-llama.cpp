@@ -11,7 +11,12 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
 bool ggml_cuda_moe_weighted_reduction_sgma_supported(const ggml_tensor * experts, const ggml_tensor * expert_scale,
         const ggml_tensor * weights, const ggml_tensor * gate, const ggml_tensor * shexp, const ggml_tensor * dst);
 
-// reduction + SIGMOID(gate [1, T]) -> MUL(shexp, .) -> ADD(reduction, .) in one kernel; false if the shapes/types don't fit
+// reduction + SIGMOID(gate [1, T]) -> MUL(shexp, .) -> ADD(reduction, .) in one kernel, with resid also the residual ADD
+// after it (dst = its output); false if the shapes/types don't fit
 bool ggml_cuda_op_moe_weighted_reduction_sgma(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
         const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * gate, const ggml_tensor * shexp,
-        ggml_tensor * dst);
+        ggml_tensor * dst, const ggml_tensor * resid = nullptr);
+
+// reduction + the residual ADD after it (dst = ADD output) in one kernel; false if the shapes/types don't fit
+bool ggml_cuda_op_moe_weighted_reduction_resid(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
+        const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * resid, ggml_tensor * dst);

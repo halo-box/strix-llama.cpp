@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-rdna35.cuh"
 #if defined(GGML_USE_HIP)
 #include "qsa-prefill.cuh"
 #include "qsa-decode.cuh"
@@ -758,6 +759,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_flash_attn_ext_rdna35_supported(device, dst)) {
+        return ggml_cuda_flash_attn_ext_rdna35_alloc_size(dst);
+    }
+#endif
+
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
     bool need_f16_K = false;
@@ -799,6 +806,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
     if (ggml_cuda_flash_attn_ext_qsa_prefill_supported(ctx, dst)) {
         ggml_cuda_flash_attn_ext_qsa_prefill(ctx, dst);
+        return;
+    }
+    if (ggml_cuda_flash_attn_ext_rdna35_supported(ctx, dst)) {
+        ggml_cuda_flash_attn_ext_rdna35(ctx, dst);
         return;
     }
 #endif

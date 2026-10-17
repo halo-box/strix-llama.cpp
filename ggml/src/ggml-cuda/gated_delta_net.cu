@@ -800,7 +800,7 @@ gdn_chunk_scan_kernel(const _Float16 * __restrict__ Qh, const _Float16 * __restr
         const _Float16 * __restrict__ Tb, const _Float16 * __restrict__ Pb, const float2 * __restrict__ Gb,
         const int H, const int Hk, const int n_tokens, const int nch, const float scale,
         const float * __restrict__ on_w, const float * __restrict__ on_z, float * __restrict__ on_out, uint16_t * __restrict__ on_out16,
-        const float on_eps) {
+        const float on_eps, const bool on_silu) {
 #if defined(GDNC_ENABLED)
     constexpr int NT  = CL / 16;
     constexpr int SQ  = 136;
@@ -971,7 +971,7 @@ gdn_chunk_scan_kernel(const _Float16 * __restrict__ Qh, const _Float16 * __restr
                     if (t < n_tokens) dst[((int64_t) t * H + h) * 128 + col] = O[rt][e];
                 }
         } else {
-            // fused gated RMS norm (rms_rows_f32<true>): v = rsqrt(mean(o^2) + eps) * o * w * sigmoid(z)
+            // fused gated RMS norm (rms_rows_f32<1/2>): v = rsqrt(mean(o^2) + eps) * o * w * sigmoid(z), or silu(z) * ...
 #pragma unroll
             for (int rt = 0; rt < NT; ++rt)
 #pragma unroll
@@ -993,7 +993,8 @@ gdn_chunk_scan_kernel(const _Float16 * __restrict__ Qh, const _Float16 * __restr
                     if (t < n_tokens) {
                         const int64_t oi = ((int64_t) t * H + h) * 128 + col;
                         const float sc = rsqrtf(ss / 128.0f + on_eps);
-                        const float v  = (sc * O[rt][e] * wc) * (1.0f / (1.0f + expf(-pz[rt][e])));
+                        const float t  = sc * O[rt][e] * wc;
+                        const float v  = on_silu ? ggml_cuda_op_silu_single(pz[rt][e]) * t : t * (1.0f / (1.0f + expf(-pz[rt][e])));
                         if (on_out) on_out[oi] = v;
                         if (on_out16) on_out16[oi] = ggml_cuda_f32_to_bf16_rne(v);
                     }
@@ -1079,12 +1080,13 @@ struct gdn_out_norm_ovr {
     float *       out;
     uint16_t *    out16;
     float         eps;
+    bool          silu;
 };
 static std::unordered_map<const ggml_tensor *, gdn_out_norm_ovr> g_gdn_on;
 
-void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const float * z, float * out, uint16_t * out16, float eps) {
+void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const float * z, float * out, uint16_t * out16, float eps, bool silu) {
     std::lock_guard<std::mutex> lk(g_gdn_qk_mtx);
-    g_gdn_on[gdn] = { w, z, out, out16, eps };
+    g_gdn_on[gdn] = { w, z, out, out16, eps, silu };
 }
 
 bool ggml_cuda_gdn_chunk_eligible_node(const ggml_tensor * gdn) {
@@ -1363,7 +1365,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                     sb1, sb2, scale, qk_eps, qk_mul);
                 gdn_chunk_scan_kernel<CL><<<dim3(H), 256, 0, stream>>>(Qh.get(), Kh.get(), Vh.get(), s_d, dst_d, state_d,
                     Tb.get(), Pb.get(), Gb.get(), (int) H, (int) neqk1, (int) n_tokens, nch, scale,
-                    on_ovr.w, on_ovr.z, on_ovr.out, on_ovr.out16, on_ovr.eps);
+                    on_ovr.w, on_ovr.z, on_ovr.out, on_ovr.out16, on_ovr.eps, on_ovr.silu);
                 CUDA_CHECK(cudaGetLastError());
             };
             run(std::integral_constant<int, 32>{});
@@ -1561,7 +1563,8 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
 
     // 3. recurrence (gated_delta_net_cuda), cols_per_warp state columns per warp
     {
-        const float * state_in  = args.state_cache + (int64_t) args.state_ids[0] * args.state_row_stride + (int64_t) h * S * S;
+        const int64_t state_row = args.state_row_stride ? (int64_t) args.state_ids[0] * args.state_row_stride : 0; // 0: direct
+        const float * state_in  = args.state_cache + state_row + (int64_t) h * S * S;
         float *       state_out = args.state_out + (int64_t) h * S * S;
         const int     colw      = warp * cols_per_warp;
 
@@ -1634,7 +1637,7 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
 // lanes 0..3 (which reduces to (s0 + s2) + (s1 + s3)), times the norm weight
 template <int S>
 __global__ void __launch_bounds__(S, 1)
-gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, const float eps, const float * z) {
+gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, const float eps, const float * z, const bool silu) {
     constexpr int warp_size = 32;
     static_assert(S == 4 * warp_size);
     __shared__ float red[4];
@@ -1655,8 +1658,9 @@ gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, cons
     const float scale = rsqrtf(mean + eps);
     const float normed = scale * xi * norm_w[tid];
     if (z != nullptr) {
-        // the following sigmoid(z) * normed of unary_gated_op_kernel<op_sigmoid>, same expression
-        out[(int64_t) h * S + tid] = (1.0f / (1.0f + expf(-z[(int64_t) h * S + tid]))) * normed;
+        // the following sigmoid(z) * normed / silu(z) * normed of unary_gated_op_kernel, same expression
+        const float zi = z[(int64_t) h * S + tid];
+        out[(int64_t) h * S + tid] = (silu ? ggml_cuda_op_silu_single(zi) : 1.0f / (1.0f + expf(-zi))) * normed;
     } else {
         out[(int64_t) h * S + tid] = normed;
     }
@@ -1700,11 +1704,11 @@ void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, cons
 }
 
 void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in) {
-    ggml_cuda_op_gdn_decode_fused_gated(ctx, args_in, nullptr, nullptr);
+    ggml_cuda_op_gdn_decode_fused_gated(ctx, args_in, nullptr, nullptr, false);
 }
 
 void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in,
-        const float * z, float * gated_out) {
+        const float * z, float * gated_out, bool silu) {
     GGML_ASSERT(args_in.S == 128 && args_in.d_conv == 4);
     ggml_cuda_pool_alloc<float> attn(ctx.pool(), args_in.S * args_in.H_v * args_in.n_tokens);
     ggml_cuda_gdn_decode_args args = args_in;
@@ -1718,6 +1722,6 @@ void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const 
     for (int64_t t = 0; t < args.n_tokens; ++t) {
         const int64_t offset = t * args.S * args.H_v;
         ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get() + offset, args.norm_w,
-            (z ? gated_out : args.out) + offset, args.eps_rms, z ? z + offset : nullptr);
+            (z ? gated_out : args.out) + offset, args.eps_rms, z ? z + offset : nullptr, silu);
     }
 }

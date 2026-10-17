@@ -1,4 +1,5 @@
 #include "norm-gated.cuh"
+#include "unary.cuh"
 #include "ggml-impl.h"
 
 // One wave per row, with the same reduction tree as the block-per-row norm.
@@ -7,7 +8,8 @@ static __device__ __forceinline__ float xor_tree(float v) {
     for (int off = 16; off > 0; off >>= 1) { v += __shfl_xor_sync(0xffffffff, v, off, 32); }
     return v;
 }
-template <bool GATE>
+// GATE: 0 none, 1 sigmoid(z), 2 silu(z), each the expression of the unfused gate kernel
+template <int GATE>
 static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, const float * w, const float * z, float * dst,
         const int ncols, const uint3 row_div, const uint3 channel_div, const int64_t total_rows,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, uint16_t * dst16) {
@@ -42,7 +44,9 @@ static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, cons
         if (col < ncols) {
             const float t = scale * x[col] * w[col];
             float v;
-            if (GATE) { const float s = 1.0f / (1.0f + expf(-z[col])); v = t * s; } else { v = t; }
+            if (GATE == 1) { const float s = 1.0f / (1.0f + expf(-z[col])); v = t * s; }
+            else if (GATE == 2) { v = ggml_cuda_op_silu_single(z[col]) * t; }
+            else { v = t; }
             dst[col] = v;
             if (dst16) dst16[col] = ggml_cuda_f32_to_bf16_rne(v);
         }
@@ -93,7 +97,7 @@ int ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_n
     if (k + 1 >= cgraph->n_nodes) return 0;
     const ggml_tensor * sig = cgraph->nodes[k]; ggml_tensor * out = cgraph->nodes[k+1];
     if (sig->op != GGML_OP_UNARY || out->op != GGML_OP_MUL) return 0;
-    if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) return 0;
+    if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID && ggml_get_unary_op(sig) != GGML_UNARY_OP_SILU) return 0;
     const ggml_tensor * x = rms->src[0];
     const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : (mul->src[1] == rms ? mul->src[0] : nullptr);
     if (!w) return 0;
@@ -105,6 +109,7 @@ int ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_n
     if (!ggml_are_same_shape(z, out) || !ggml_are_same_shape(mul, out) || !ggml_are_same_shape(rms, out)) return 0;
     float eps; memcpy(&eps, rms->op_params, sizeof(float)); if (eps < 0.0f) return 0;
     m.x = x; m.w = w; m.z = z; m.dst = out; m.eps = eps;
+    m.silu = ggml_get_unary_op(sig) == GGML_UNARY_OP_SILU;
     m.staged = norm_needs_staging(m);
     return (k + 1) - i;
 }
@@ -119,7 +124,7 @@ int ggml_cuda_norm_rows_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_no
     if (!w || !ggml_node_has_n_uses(cgraph, i, 1)) return 0;
     if (!rows_shape_ok(x, w, mul) || !ggml_are_same_shape(rms, mul)) return 0;
     float eps; memcpy(&eps, rms->op_params, sizeof(float)); if (eps < 0.0f) return 0;
-    m.x = x; m.w = w; m.z = nullptr; m.dst = mul; m.eps = eps; m.pre = -1;
+    m.x = x; m.w = w; m.z = nullptr; m.dst = mul; m.eps = eps; m.pre = -1; m.silu = false;
     m.staged = norm_needs_staging(m);
     return 1;
 }
@@ -131,8 +136,10 @@ void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_no
     const uint3 channel_div = init_fastdiv_values(uint32_t(x->ne[2]));
     const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
     const ggml_cuda_kernel_launch_params lp(grid, block, 0, ctx.stream());
-    if (m.z) ggml_cuda_kernel_launch(rms_rows_f32<true>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) m.z->data, (float *) m.dst->data,
+    if (m.z && m.silu) ggml_cuda_kernel_launch(rms_rows_f32<2>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) m.z->data, (float *) m.dst->data,
         (int) x->ne[0], row_div, channel_div, total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps, m.dst16);
-    else     ggml_cuda_kernel_launch(rms_rows_f32<false>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) nullptr, (float *) m.dst->data,
+    else if (m.z) ggml_cuda_kernel_launch(rms_rows_f32<1>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) m.z->data, (float *) m.dst->data,
+        (int) x->ne[0], row_div, channel_div, total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps, m.dst16);
+    else     ggml_cuda_kernel_launch(rms_rows_f32<0>, lp, (const float *) x->data, (const float *) m.w->data, (const float *) nullptr, (float *) m.dst->data,
         (int) x->ne[0], row_div, channel_div, total, (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps, m.dst16);
 }

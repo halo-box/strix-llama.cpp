@@ -1512,6 +1512,17 @@ struct ggml_backend_cuda_context {
     // HC residuals whose remaining readers live in a later split of the same graph on this device: tensor -> uses left
     std::unordered_map<const ggml_tensor *, int> mmb_res16_pending;
 
+    // RDNA3.5 FA: KV_max and the mask classes of a KQ mask are the same for every attention layer of a graph compute
+    // that reads it (the mask is written between computes only) -> computed once per compute_epoch and mask
+    uint64_t compute_epoch = 0;
+    struct fattn_mask_info {
+        uint64_t epoch = 0;
+        int64_t  key[9] = {};
+        void *   buf  = nullptr;
+        size_t   size = 0;
+    };
+    fattn_mask_info fattn_masks[4];
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

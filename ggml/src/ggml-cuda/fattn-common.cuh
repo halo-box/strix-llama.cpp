@@ -1136,6 +1136,31 @@ void launch_fattn(
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
+#if defined(GGML_USE_HIP)
+    // RDNA3.5 (WGP mode): newer ROCm runtimes report 128 KiB of LDS per multiprocessor (a WGP) where 7.15 and older
+    // reported 64 KiB, which doubles the occupancy of LDS-bound kernels and with it parallel_blocks below. The split
+    // heuristic was tuned with the 64 KiB value; e.g. Qwen3.8 27B f16-KV decode at 64k went 6.98 -> 6.76 t/s with 35
+    // instead of 18 KV splits. Cap the occupancy at the 64 KiB value so the split, and the result, do not depend on the
+    // runtime version.
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        static std::mutex lds_mutex;
+        static std::unordered_map<const void *, size_t> lds_static;
+        size_t lds;
+        {
+            std::lock_guard<std::mutex> lock(lds_mutex);
+            auto it = lds_static.find((const void *) fattn_kernel);
+            if (it == lds_static.end()) {
+                hipFuncAttributes attr;
+                CUDA_CHECK(hipFuncGetAttributes(&attr, (const void *) fattn_kernel));
+                it = lds_static.emplace((const void *) fattn_kernel, attr.sharedSizeBytes).first;
+            }
+            lds = it->second + nbytes_shared;
+        }
+        if (lds > 0) {
+            max_blocks_per_sm = std::min(max_blocks_per_sm, std::max(1, (int) (65536 / lds)));
+        }
+    }
+#endif // defined(GGML_USE_HIP)
     int parallel_blocks = max_blocks_per_sm;
 
     const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];

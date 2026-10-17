@@ -214,6 +214,9 @@ llama_context::llama_context(
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
+    cparams.embeddings_layer_inp_dev = false;
+    cparams.layer_inp_row            = -1;
+
     cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
@@ -612,6 +615,11 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // and for the readers of the device layer inputs
+    if (layer_inp_dev_read) {
+        ggml_backend_event_synchronize(layer_inp_dev_read.get());
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1398,8 +1406,27 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     cparams.embeddings_layer_inp[lid] = enable;
 
+    // the slots of the device copy change
+    layer_inp_dev_free();
+
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
     sched_need_reserve = true;
+}
+
+void llama_context::set_embeddings_layer_inp_dev(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    if (!value) {
+        layer_inp_dev_free();
+    }
+
+    cparams.embeddings_layer_inp_dev = value;
+}
+
+void llama_context::set_layer_inp_row(int32_t row) {
+    GGML_ASSERT(row < 0 || cparams.ctx_other != nullptr);
+
+    cparams.layer_inp_row = row < 0 ? -1 : row;
 }
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
@@ -2047,8 +2074,33 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // input features read in place from the device layer inputs of ctx_other (llama_set_layer_inp_row)
+    struct layer_inp_row_guard {
+        llama_context & ctx;
+        const int32_t   row;
+
+        ~layer_inp_row_guard() {
+            if (row >= 0) {
+                ctx.cparams.layer_inp_row = row;
+                ctx.cparams.ctx_other->layer_inp_dev_mark_read(ctx);
+            }
+        }
+    } layer_inp_row { *this, cparams.layer_inp_row };
+
+    if (layer_inp_row.row >= 0) {
+        // wait for the extraction, with the rows in batch order
+        cparams.ctx_other->synchronize();
+        cparams.ctx_other->output_reorder();
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        if (layer_inp_row.row >= 0) {
+            // the ubatches of a single sequence keep the batch order
+            GGML_ASSERT(ubatch.n_seqs_unq == 1);
+            cparams.layer_inp_row = layer_inp_row.row + (int32_t) n_tokens_prev;
+        }
 
         // count the outputs in this ubatch
         {
@@ -2329,7 +2381,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
-        if (enabled) {
+        if (enabled && !cparams.embeddings_layer_inp_dev) {
             embd_layer_inp_float_count += (size_t) n_embd * n_batch;
         }
     }
@@ -2401,7 +2453,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     offset += embd_nextn.size * sizeof(float);
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
-        if (cparams.embeddings_layer_inp[il]) {
+        if (cparams.embeddings_layer_inp[il] && !cparams.embeddings_layer_inp_dev) {
             embd_layer_inp[il] = buffer_view<float>{(float *) (base + offset), (size_t) n_embd * n_batch};
             offset += embd_layer_inp[il].size * sizeof(float);
         } else {
@@ -2456,6 +2508,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 }
 
 bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    if (cparams.embeddings_layer_inp_dev) {
+        extract_layer_inputs_dev(res, token_offset, n_tokens);
+        // the device rows follow the ubatch order too: output_reorder() puts them in batch order
+        return layer_inp_dev != nullptr;
+    }
+
     bool extracted = false;
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
@@ -2486,6 +2544,125 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         extracted = true;
     }
     return extracted;
+}
+
+void llama_context::layer_inp_dev_free() {
+    if (layer_inp_dev_read) {
+        ggml_backend_event_synchronize(layer_inp_dev_read.get());
+    }
+    layer_inp_dev_read.reset();
+    layer_inp_dev = nullptr;
+    layer_inp_dev_dev = nullptr;
+    buf_layer_inp_dev.reset();
+    ctx_layer_inp_dev.reset();
+    layer_inp_dev_slot.clear();
+}
+
+void llama_context::extract_layer_inputs_dev(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    const int64_t n_embd = model.hparams.n_embd;
+    const int64_t n_rows = cparams.n_batch;
+
+    if (!layer_inp_dev) {
+        layer_inp_dev_slot.assign(cparams.embeddings_layer_inp.size(), -1);
+
+        int32_t n_slot = 0;
+        for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+            if (cparams.embeddings_layer_inp[il]) {
+                if (n_slot == 0) {
+                    layer_inp_dev_dev = il < model.hparams.n_layer() ? model.dev_layer(il) : model.dev_output();
+                }
+                layer_inp_dev_slot[il] = n_slot++;
+            }
+        }
+        if (n_slot == 0) {
+            return;
+        }
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_layer_inp_dev.reset(ggml_init(params));
+
+        layer_inp_dev = ggml_new_tensor_2d(ctx_layer_inp_dev.get(), GGML_TYPE_F32, n_embd, n_rows * n_slot);
+        ggml_set_name(layer_inp_dev, "layer_inp_dev");
+
+        buf_layer_inp_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_layer_inp_dev.get(),
+                ggml_backend_dev_buffer_type(layer_inp_dev_dev)));
+        if (!buf_layer_inp_dev) {
+            GGML_ABORT("%s: failed to allocate the device layer input buffer", __func__);
+        }
+
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(layer_inp_dev_dev, &props);
+        if (props.caps.events) {
+            layer_inp_dev_read.reset(ggml_backend_event_new(layer_inp_dev_dev));
+        }
+
+        LLAMA_LOG_INFO("%s: %10s layer inputs buffer size = %8.2f MiB (%d layers)\n", __func__,
+                ggml_backend_buffer_name(buf_layer_inp_dev.get()),
+                ggml_backend_buffer_get_size(buf_layer_inp_dev.get()) / (1024.0 * 1024.0), n_slot);
+    }
+
+    GGML_ASSERT(token_offset + n_tokens <= (size_t) n_rows);
+
+    // views of the destination rows
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * cparams.embeddings_layer_inp.size(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_view { ggml_init(params) };
+
+    for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (!cparams.embeddings_layer_inp[il]) {
+            continue;
+        }
+        ggml_tensor * t = res->get_layer_inp((int) il);
+        if (!t) {
+            GGML_ABORT("layer input tensor not found");
+        }
+        GGML_ASSERT(t->type == GGML_TYPE_F32 && t->ne[0] == n_embd && ggml_nrows(t) == (int64_t) n_tokens);
+
+        const int64_t row = layer_inp_dev_slot[il] * n_rows + (int64_t) token_offset;
+
+        ggml_tensor * dst = ggml_view_2d(ctx_view.get(), layer_inp_dev, n_embd, n_tokens, layer_inp_dev->nb[1], row * layer_inp_dev->nb[1]);
+        dst = ggml_reshape_4d(ctx_view.get(), dst, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+        ggml_backend_view_init(dst);
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        GGML_ASSERT(backend != nullptr);
+
+        // do not overwrite the rows a reader graph may still use
+        if (layer_inp_dev_read) {
+            if (ggml_backend_get_device(backend) == layer_inp_dev_dev) {
+                ggml_backend_event_wait(backend, layer_inp_dev_read.get());
+            } else {
+                ggml_backend_event_synchronize(layer_inp_dev_read.get());
+            }
+        }
+
+        ggml_backend_tensor_copy_async(backend, backend, t, dst);
+    }
+}
+
+llama_context::layer_inp_dev_view llama_context::get_layer_inp_dev() const {
+    return { layer_inp_dev, (int64_t) cparams.n_batch, &layer_inp_dev_slot };
+}
+
+void llama_context::layer_inp_dev_mark_read(llama_context & reader) {
+    if (layer_inp_dev_read) {
+        for (auto & backend : reader.backends) {
+            if (ggml_backend_get_device(backend.get()) == layer_inp_dev_dev) {
+                ggml_backend_event_record(layer_inp_dev_read.get(), backend.get());
+                return;
+            }
+        }
+    }
+
+    // no event on the device of the reader
+    reader.synchronize();
 }
 
 void llama_context::output_reorder() {
@@ -2547,10 +2724,33 @@ void llama_context::output_reorder() {
 
     // [TAG_EXTRACT_TARGET_EMBEDDINGS]
     // Layer inputs and unmasked NextN embeddings contain all token rows, independent of logits selection.
+    std::vector<uint8_t> dev_r0, dev_r1;
+    bool dev_synced = false;
     for (size_t i = 0; i < embd_batch_idxs.size(); ++i) {
         while (embd_batch_idxs[i] != (int32_t) i) {
             const int32_t j = embd_batch_idxs[i];
             GGML_ASSERT(j >= 0 && (size_t) j < embd_batch_idxs.size());
+            // same swap on the device copy
+            if (layer_inp_dev) {
+                if (!dev_synced) {
+                    ggml_backend_sched_synchronize(sched.get());
+                    dev_synced = true;
+                }
+                const size_t nb1 = layer_inp_dev->nb[1];
+                dev_r0.resize(nb1);
+                dev_r1.resize(nb1);
+                for (int32_t slot : layer_inp_dev_slot) {
+                    if (slot < 0) {
+                        continue;
+                    }
+                    const size_t o0 = (slot * (size_t) cparams.n_batch + i) * nb1;
+                    const size_t o1 = (slot * (size_t) cparams.n_batch + j) * nb1;
+                    ggml_backend_tensor_get(layer_inp_dev, dev_r0.data(), o0, nb1);
+                    ggml_backend_tensor_get(layer_inp_dev, dev_r1.data(), o1, nb1);
+                    ggml_backend_tensor_set(layer_inp_dev, dev_r1.data(), o0, nb1);
+                    ggml_backend_tensor_set(layer_inp_dev, dev_r0.data(), o1, nb1);
+                }
+            }
             if (embd_nextn.has_data() && !cparams.embeddings_nextn_masked) {
                 for (size_t k = 0; k < n_embd_out; ++k) {
                     std::swap(embd_nextn.data[i*n_embd_out + k], embd_nextn.data[j*n_embd_out + k]);
@@ -2720,7 +2920,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+
+    // reserve with the batch embeddings, the in-place read of the ctx_other layer inputs takes the same memory
+    gparams.cparams.layer_inp_row = -1;
 
     res->reset();
 
@@ -4362,6 +4565,14 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {
+    ctx->set_embeddings_layer_inp_dev(value);
+}
+
+void llama_set_layer_inp_row(llama_context * ctx, int32_t row) {
+    ctx->set_layer_inp_row(row);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

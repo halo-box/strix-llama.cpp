@@ -113,6 +113,47 @@ static __global__ void moe_weighted_reduction_bf16_v4_out(const uint16_t * __res
     *(ushort4 *)(dst + token * n_embd + col4) = make_ushort4(moe_f2bf(sum.x), moe_f2bf(sum.y), moe_f2bf(sum.z), moe_f2bf(sum.w));
 }
 
+// BF16 experts + the residual ADD after the FFN in one pass: reads 4 (or more) rows per token and the residual
+// instead of writing the sum to memory and re-reading it plus the residual. Same arithmetic order as
+// moe_weighted_reduction_bf16_v4 followed by binary_contiguous<op_add>: one rounding per element in both.
+template <bool EIN16>
+static __global__ void moe_weighted_reduction_resid_v4(const void * __restrict__ experts_v,
+                                                       const float * __restrict__ expert_scale,
+                                                       const float * __restrict__ weights,
+                                                       const float * __restrict__ resid,
+                                                       float * __restrict__ dst,
+                                                       const int64_t n_embd,
+                                                       const int     n_expert_used) {
+    const int64_t token = blockIdx.x;
+    const int64_t col4  = ((int64_t) blockIdx.y * blockDim.x + threadIdx.x) * 4;
+    if (col4 >= n_embd) return;
+    auto ld = [&](const uint64_t row) -> float4 {
+        if constexpr (EIN16) {
+            const ushort4 h = *(const ushort4 *)((const uint16_t *) experts_v + row * n_embd + col4);
+            return make_float4(moe_bf2f(h.x), moe_bf2f(h.y), moe_bf2f(h.z), moe_bf2f(h.w));
+        } else {
+            return *(const float4 *)((const float *) experts_v + row * n_embd + col4);
+        }
+    };
+    const uint64_t first_row = (uint64_t) token * n_expert_used;
+    const float first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+    const float w0 = weights[first_row];
+    const float4 e0 = ld(first_row);
+    float4 sum; sum.x = (e0.x * first_scale) * w0; sum.y = (e0.y * first_scale) * w0;
+    sum.z = (e0.z * first_scale) * w0; sum.w = (e0.w * first_scale) * w0;
+    for (int expert = 1; expert < n_expert_used; ++expert) {
+        const uint64_t row = first_row + expert;
+        const float scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+        const float w = weights[row];
+        const float4 e = ld(row);
+        sum.x += (e.x * scale) * w; sum.y += (e.y * scale) * w;
+        sum.z += (e.z * scale) * w; sum.w += (e.w * scale) * w;
+    }
+    const float4 r = *(const float4 *)(resid + token * n_embd + col4);
+    sum.x += r.x; sum.y += r.y; sum.z += r.z; sum.w += r.w;
+    *(float4 *)(dst + token * n_embd + col4) = sum;
+}
+
 static __global__ void moe_weighted_reduction_f32in_bf16out_v4(const float * __restrict__ experts,
                                                               const float * __restrict__ expert_scale,
                                                               const float * __restrict__ weights,
@@ -212,6 +253,40 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// reduction + the residual ADD after it in one pass. dst is the ADD output; the reduction's own output is not written.
+// Bit-identical to ggml_cuda_op_moe_weighted_reduction followed by binary_contiguous<op_add>.
+bool ggml_cuda_op_moe_weighted_reduction_resid(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
+        const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * resid, ggml_tensor * dst) {
+    if (!experts || !weights || !resid || !dst) return false;
+    const int64_t n_embd        = experts->ne[0];
+    const int64_t n_expert_used = experts->ne[1];
+    const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
+    if (n_expert_used < 1 || n_embd % 4 != 0 || n_tokens <= 0) return false;
+    if (weights->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(weights) || !ggml_is_contiguous(dst)) return false;
+    if (resid->type != GGML_TYPE_F32 || !ggml_is_contiguous(resid) || ggml_nelements(resid) != n_embd * n_tokens) return false;
+    if (expert_scale != nullptr && (expert_scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(expert_scale))) return false;
+    if ((uintptr_t) resid->data % 16 != 0 || (uintptr_t) dst->data % 16 != 0) return false;
+
+    const bool ein16 = ggml_cuda_mmb_down16() && ggml_cuda_mmb_is_bf16_only(ctx, experts);
+    if (experts->type != GGML_TYPE_F32 && !ein16) return false;
+    if ((uintptr_t) experts->data % (ein16 ? 8 : 16) != 0) return false;
+
+    constexpr int threads = 256;
+    const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
+    const float * sc = expert_scale ? (const float *) expert_scale->data : nullptr;
+    const float * w  = (const float *) weights->data;
+    cudaStream_t stream = ctx.stream();
+    if (ein16) {
+        moe_weighted_reduction_resid_v4<true><<<blocks, threads, 0, stream>>>(experts->data, sc, w,
+            (const float *) resid->data, (float *) dst->data, n_embd, (int) n_expert_used);
+    } else {
+        moe_weighted_reduction_resid_v4<false><<<blocks, threads, 0, stream>>>((const float *) experts->data, sc, w,
+            (const float *) resid->data, (float *) dst->data, n_embd, (int) n_expert_used);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 // prefill: reduction + shared-expert merge in one pass, out = sum_k (e_k * scale_k) * w_k + shexp * sigmoid(gate[t]).
 // The sum is the moe_weighted_reduction_*_v4 expression; the merge is sigmoid_gate_mul_add_f32's (product and sum rounded
 // separately, sigmoid as op_sigmoid) -> bit-identical to the two kernels, without the F32 round trip of the reduction.
@@ -228,6 +303,7 @@ static __global__ void moe_weighted_reduction_sgma_v4(const void * __restrict__ 
                                                       const float * __restrict__ weights,
                                                       const float * __restrict__ gate,
                                                       const float * __restrict__ shexp,
+                                                      const float * __restrict__ resid,
                                                       float * __restrict__ dst,
                                                       const int64_t n_embd, const int n_expert_used) {
     const int64_t token = blockIdx.x;
@@ -255,8 +331,12 @@ static __global__ void moe_weighted_reduction_sgma_v4(const void * __restrict__ 
     }
     const float g = 1.0f / (1.0f + expf(-gate[token]));
     const float4 a = *(const float4 *)(shexp + token * n_embd + col4);
-    const float4 o = make_float4(moe_add_rn(sum.x, moe_mul_rn(a.x, g)), moe_add_rn(sum.y, moe_mul_rn(a.y, g)),
-                                 moe_add_rn(sum.z, moe_mul_rn(a.z, g)), moe_add_rn(sum.w, moe_mul_rn(a.w, g)));
+    float4 o = make_float4(moe_add_rn(sum.x, moe_mul_rn(a.x, g)), moe_add_rn(sum.y, moe_mul_rn(a.y, g)),
+                           moe_add_rn(sum.z, moe_mul_rn(a.z, g)), moe_add_rn(sum.w, moe_mul_rn(a.w, g)));
+    if (resid) { // the residual add after the FFN (the ADD kernel's sum)
+        const float4 r = *(const float4 *)(resid + token * n_embd + col4);
+        o = make_float4(moe_add_rn(o.x, r.x), moe_add_rn(o.y, r.y), moe_add_rn(o.z, r.z), moe_add_rn(o.w, r.w));
+    }
     *(float4 *)(dst + token * n_embd + col4) = o;
 }
 
@@ -274,12 +354,16 @@ bool ggml_cuda_moe_weighted_reduction_sgma_supported(const ggml_tensor * experts
 
 bool ggml_cuda_op_moe_weighted_reduction_sgma(ggml_backend_cuda_context & ctx, const ggml_tensor * experts,
         const ggml_tensor * expert_scale, const ggml_tensor * weights, const ggml_tensor * gate, const ggml_tensor * shexp,
-        ggml_tensor * dst) {
+        ggml_tensor * dst, const ggml_tensor * resid) {
     const int64_t n_embd        = experts->ne[0];
     const int64_t n_expert_used = experts->ne[1];
     const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
     if (!ggml_cuda_moe_weighted_reduction_sgma_supported(experts, expert_scale, weights, gate, shexp, dst) ||
         ((uintptr_t) shexp->data % 16) != 0 || ((uintptr_t) dst->data % 16) != 0 || ((uintptr_t) experts->data % 16) != 0) {
+        return false;
+    }
+    if (resid && (resid->type != GGML_TYPE_F32 || !ggml_is_contiguous(resid) || ggml_nelements(resid) != n_embd * n_tokens ||
+            ((uintptr_t) resid->data % 16) != 0)) {
         return false;
     }
     // a BF16-only sum stays on the unfused path, which writes it; this kernel only stores F32
@@ -300,7 +384,8 @@ bool ggml_cuda_op_moe_weighted_reduction_sgma(ggml_backend_cuda_context & ctx, c
     const float * sc = expert_scale ? (const float *) expert_scale->data : nullptr;
     cudaStream_t stream = ctx.stream();
 #define MOE_SGMA_LAUNCH(A) moe_weighted_reduction_sgma_v4<A><<<blocks, threads, 0, stream>>>(experts->data, sc, \
-        (const float *) weights->data, (const float *) gate->data, (const float *) shexp->data, (float *) dst->data, n_embd, (int) n_expert_used)
+        (const float *) weights->data, (const float *) gate->data, (const float *) shexp->data, \
+        resid ? (const float *) resid->data : nullptr, (float *) dst->data, n_embd, (int) n_expert_used)
     if (ein16) { MOE_SGMA_LAUNCH(true); } else { MOE_SGMA_LAUNCH(false); }
 #undef MOE_SGMA_LAUNCH
     CUDA_CHECK(cudaGetLastError());

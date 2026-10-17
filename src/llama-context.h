@@ -93,6 +93,18 @@ struct llama_context {
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
+    // device copy of the extracted layer inputs (cparams.embeddings_layer_inp_dev),
+    // F32 [n_embd, n_slot*n_rows] with the rows of slot s at [s*n_rows, (s+1)*n_rows)
+    struct layer_inp_dev_view {
+        ggml_tensor * t      = nullptr;
+        int64_t       n_rows = 0;
+        const std::vector<int32_t> * slot = nullptr; // [n_layer() + 1] slot of each layer, -1 if not extracted
+    };
+    layer_inp_dev_view get_layer_inp_dev() const;
+
+    // reader has queued a graph that reads the device layer inputs: the next extraction must wait for it
+    void layer_inp_dev_mark_read(llama_context & reader);
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -121,6 +133,8 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_embeddings_layer_inp_dev(bool value);
+    void set_layer_inp_row(int32_t row);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -243,6 +257,10 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
+    // device variant of extract_layer_inputs (cparams.embeddings_layer_inp_dev)
+    void extract_layer_inputs_dev(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void layer_inp_dev_free();
 
     //
     // graph
@@ -423,6 +441,14 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // device buffer for the extracted layer inputs, see get_layer_inp_dev()
+    ggml_context_ptr        ctx_layer_inp_dev;
+    ggml_backend_buffer_ptr buf_layer_inp_dev;
+    ggml_tensor *           layer_inp_dev     = nullptr;
+    ggml_backend_dev_t      layer_inp_dev_dev = nullptr;
+    std::vector<int32_t>    layer_inp_dev_slot;
+    ggml_backend_event_ptr  layer_inp_dev_read; // recorded by the readers after their graphs
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

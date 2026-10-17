@@ -70,6 +70,89 @@ static __global__ void mm_ids_helper_512_10(
     }
 }
 
+// Any expert count up to 1024: one block histograms the token slots, scans the bounds and scatters the two maps,
+// O(n_tokens*n_used) work. The per-expert helper below has every warp scan all slots: 715 us per call for Qwen3.6
+// 35B-A3B (256 experts, 8 used) at 4096 tokens, 80 calls per ubatch. Row order inside an expert is irrelevant, as above.
+constexpr int MM_IDS_HIST_MAX_EXPERTS = 1024;
+
+template <int n_expert_used_template>
+__launch_bounds__(1024, 1)
+static __global__ void mm_ids_helper_hist(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
+        int32_t * __restrict__ expert_bounds, const int n_experts, const int n_tokens, const int n_expert_used_var,
+        const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+    const int n_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+
+    __shared__ int counts[MM_IDS_HIST_MAX_EXPERTS];   // per expert: count, then exclusive bound
+    __shared__ int cursors[MM_IDS_HIST_MAX_EXPERTS];
+    __shared__ int warp_sums[32];
+
+    const int tid = threadIdx.x;
+    for (int e = tid; e < n_experts; e += blockDim.x) {
+        counts[e]  = 0;
+        cursors[e] = 0;
+    }
+    __syncthreads();
+
+    const int n_slots = n_tokens * n_used;
+    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
+        const int token = idx / n_used;
+        const int iex   = idx - token * n_used;
+        atomicAdd(&counts[ids[token * si1 + iex]], 1);
+    }
+    __syncthreads();
+
+    // exclusive scan of the counts, one expert per thread (n_experts <= 1024 = blockDim.x)
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int c = tid < n_experts ? counts[tid] : 0;
+    int incl = c;
+#pragma unroll
+    for (int off = 1; off < 32; off *= 2) {
+        const int t = __shfl_up_sync(0xFFFFFFFF, incl, off, 32);
+        incl += lane >= off ? t : 0;
+    }
+    if (lane == 31) {
+        warp_sums[warp] = incl;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int nw = blockDim.x / 32;
+        int w = lane < nw ? warp_sums[lane] : 0;
+#pragma unroll
+        for (int off = 1; off < 32; off *= 2) {
+            const int t = __shfl_up_sync(0xFFFFFFFF, w, off, 32);
+            w += lane >= off ? t : 0;
+        }
+        if (lane < nw) {
+            warp_sums[lane] = w; // inclusive over warps
+        }
+    }
+    __syncthreads();
+    const int excl = incl - c + (warp > 0 ? warp_sums[warp - 1] : 0);
+    if (tid < n_experts) {
+        counts[tid] = excl;
+        expert_bounds[tid] = excl;
+        if (tid == n_experts - 1) {
+            expert_bounds[n_experts] = excl + c;
+        }
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
+        const int token  = idx / n_used;
+        const int iex    = idx - token * n_used;
+        const int expert = ids[token * si1 + iex];
+        const int dst    = counts[expert] + atomicAdd(&cursors[expert], 1);
+        ids_dst[dst] = idx;
+        if (write_inverse) {
+            ids_src1[idx] = dst;
+        } else {
+            ids_src1[dst] = token * sis1 + iex % nchannels_y;
+        }
+    }
+}
+
 // the generic path passes 0, which needs no padding since it never groups lanes by token
 template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
 template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
@@ -205,6 +288,18 @@ void ggml_cuda_launch_mm_ids_helper(
     if (GGML_CUDA_CC_IS_RDNA3_5(cc) && n_experts == 512 && n_expert_used == 10 && getenv("GGML_CUDA_DISABLE_MMID_512") == nullptr) {
         mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
             ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
+        return;
+    }
+    const bool warp32 = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32; // the scan uses 32-lane shuffles
+    if (warp32 && n_experts <= MM_IDS_HIST_MAX_EXPERTS && getenv("GGML_CUDA_DISABLE_MMID_HIST") == nullptr) {
+        switch (n_expert_used) {
+            case  2: mm_ids_helper_hist< 2><<<1, 1024, 0, stream>>>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
+            case  4: mm_ids_helper_hist< 4><<<1, 1024, 0, stream>>>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
+            case  6: mm_ids_helper_hist< 6><<<1, 1024, 0, stream>>>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
+            case  8: mm_ids_helper_hist< 8><<<1, 1024, 0, stream>>>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
+            case 10: mm_ids_helper_hist<10><<<1, 1024, 0, stream>>>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
+            default: mm_ids_helper_hist< 0><<<1, 1024, 0, stream>>>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
+        }
         return;
     }
     switch (n_expert_used) {

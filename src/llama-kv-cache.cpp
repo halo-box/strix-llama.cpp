@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <thread>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -1725,9 +1726,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
-        for (uint32_t ii = 0; ii < n_tps; ++ii) {
-            const uint32_t i = s*n_tps + ii;
-
+        // fill row i: prev = copy the first row of the sequence (srct) and update only the cells in idxs
+        auto fill_row = [&](const uint32_t i, const bool prev, const uint32_t srct, std::vector<uint32_t> & idxs) {
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
             const auto & cells = v_cells.at(seq_to_stream[seq_id]);
@@ -1741,31 +1741,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             const uint64_t idst = n_kv*i;
 
-            // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
-            // the only cells that could change are the ones that are with similar positions as the
-            //   ones in the batch (i.e. due to causal masking, SWA, etc.)
-            // keep track of those cells and shortcut the loop to save time
-            // note: this optimization is not compatible with Alibi position encoding
-            // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
-            bool prev = false;
-
-            auto & idxs = seq_idxs[seq_id];
-
-            if (!alibi) {
-                if (seq_srct.find(seq_id) != seq_srct.end()) {
-                    const uint32_t srct = seq_srct[seq_id];
-
-                    const uint64_t idst_prev = n_kv*srct;
-
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
-
-                    prev = true;
-                } else {
-                    idxs.clear();
-                    idxs.reserve(ubatch->n_tokens + n_swa + 32);
-
-                    seq_srct[seq_id] = i;
-                }
+            if (prev) {
+                const uint64_t idst_prev = n_kv*srct;
+                std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
             }
 
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
@@ -1838,6 +1816,54 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 continue;
 skip:
                 data[idst + j] = mask_drop;
+            }
+        };
+
+        // the first row of every sequence is filled in full (and records the cells that can differ), the other rows
+        // only copy it and update those cells: they are independent and filled in parallel for large masks. At 4096
+        // tokens x 30k cells one thread took ~27 ms per ubatch while the GPU waited (Qwen3.6 35B-A3B, Strix Halo).
+        std::vector<uint32_t> rest;
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            const uint32_t i = s*n_tps + ii;
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+            auto & idxs = seq_idxs[seq_id];
+
+            if (!alibi && seq_srct.find(seq_id) != seq_srct.end()) {
+                rest.push_back(i);
+                continue;
+            }
+            if (!alibi) {
+                idxs.clear();
+                idxs.reserve(ubatch->n_tokens + n_swa + 32);
+                seq_srct[seq_id] = i;
+            }
+            fill_row(i, false, 0, idxs);
+        }
+
+        auto fill_rest = [&](const size_t r0, const size_t r1) {
+            for (size_t r = r0; r < r1; ++r) {
+                const uint32_t i = rest[r];
+                const llama_seq_id seq_id = ubatch->seq_id[i][0];
+                fill_row(i, true, seq_srct.at(seq_id), seq_idxs.at(seq_id));
+            }
+        };
+
+        const int n_thr = (int64_t) rest.size() * n_kv >= (int64_t) 4 << 20 ? 8 : 1;
+        if (n_thr == 1) {
+            fill_rest(0, rest.size());
+        } else {
+            std::vector<std::thread> workers;
+            const size_t per = (rest.size() + n_thr - 1) / n_thr;
+            for (int t = 1; t < n_thr; ++t) {
+                const size_t r0 = std::min(rest.size(), t*per), r1 = std::min(rest.size(), (t + 1)*per);
+                if (r0 < r1) {
+                    workers.emplace_back(fill_rest, r0, r1);
+                }
+            }
+            fill_rest(0, std::min(rest.size(), per));
+            for (auto & w : workers) {
+                w.join();
             }
         }
     }

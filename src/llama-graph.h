@@ -898,6 +898,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.layer_inp_row != other.cparams.layer_inp_row) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&

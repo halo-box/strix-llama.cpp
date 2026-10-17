@@ -2961,25 +2961,40 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
     }
 
     // Apply frequency and presence penalties to the cur_p
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
+    const auto apply = [ctx](llama_token_data & td, int count) {
         assert(count > 0 && count <= ctx->penalty_last_n);
 
         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
+        if (td.logit <= 0) {
+            td.logit *= ctx->penalty_repeat;
         } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
+            td.logit /= ctx->penalty_repeat;
         }
 
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        td.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+    };
+
+    // the candidates are usually the whole vocabulary in token order: then visit only the (at most penalty_last_n)
+    // penalized tokens instead of a hash lookup per candidate (~1 ms per sampled token at a 250k vocabulary)
+    bool in_order = true;
+    for (const auto & [id, count] : ctx->token_count) {
+        if (id < 0 || (size_t) id >= cur_p->size || cur_p->data[id].id != id) {
+            in_order = false;
+            break;
+        }
+    }
+    if (in_order) {
+        for (const auto & [id, count] : ctx->token_count) {
+            apply(cur_p->data[id], count);
+        }
+    } else {
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+            if (token_iter != ctx->token_count.end()) {
+                apply(cur_p->data[i], token_iter->second);
+            }
+        }
     }
 
     cur_p->sorted = false;

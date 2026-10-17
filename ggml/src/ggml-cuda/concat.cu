@@ -86,13 +86,14 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
-template <typename T>
+template <typename T, bool mul = false>
 static __global__ void concat_transposed_src1_dim0(
         const char * src0, const char * src1, char * dst,
         int64_t ne00, int64_t ne10, int64_t ne11,
         uint64_t nb00, uint64_t nb01, uint64_t nb02,
         uint64_t nb10, uint64_t nb11, uint64_t nb12,
-        uint64_t nb0, uint64_t nb1, uint64_t nb2) {
+        uint64_t nb0, uint64_t nb1, uint64_t nb2,
+        const char * src2 = nullptr, uint64_t nb20 = 0, uint64_t nb21 = 0, uint64_t nb22 = 0) {
     constexpr int tile = 32;
     __shared__ T values[tile][tile + 1];
 
@@ -108,7 +109,12 @@ static __global__ void concat_transposed_src1_dim0(
         const int64_t token = token0 + ty + j;
         const int64_t channel = channel0 + tx;
         if (token < ne10 && channel < ne11) {
-            values[ty + j][tx] = *reinterpret_cast<const T *>(src1 + i2 * nb12 + channel * nb11 + token * nb10);
+            T v = *reinterpret_cast<const T *>(src1 + i2 * nb12 + channel * nb11 + token * nb10);
+            // src1 and src2 in [channel, token] order: their product replaces the standalone MUL node
+            if constexpr (mul) {
+                v = v * *reinterpret_cast<const T *>(src2 + i2 * nb22 + channel * nb21 + token * nb20);
+            }
+            values[ty + j][tx] = v;
         }
     }
     __syncthreads();
@@ -192,6 +198,43 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
         *y = *x;
     }
+}
+
+template <typename T>
+static void concat_transposed_mul_cuda(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2,
+                                       ggml_tensor * dst, cudaStream_t stream) {
+    constexpr int tile = 32;
+    const int tile_y = concat_transposed_tile_y(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    const dim3 block_dims(tile, tile_y, 1);
+    const dim3 block_nums((src1->ne[0] + tile - 1) / tile, (src1->ne[1] + tile - 1) / tile, src1->ne[2]);
+    concat_transposed_src1_dim0<T, true><<<block_nums, block_dims, 0, stream>>>(
+        (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+        src0->ne[0], src1->ne[1], src1->ne[0],
+        src0->nb[0], src0->nb[1], src0->nb[2],
+        src1->nb[1], src1->nb[0], src1->nb[2],
+        dst->nb[0], dst->nb[1], dst->nb[2],
+        (const char *) src2->data, src2->nb[1], src2->nb[0], src2->nb[2]);
+}
+
+// LFM2 gated shortconv prefill: CONCAT(state, TRANSPOSE(MUL(b, x))) with the product read only there. Writing the
+// product inside the concat drops the standalone multiply pass over the activations. Same arithmetic as the MUL
+// kernel (one rounding per element), same layout conditions as the plain transposed concat.
+bool ggml_cuda_op_concat_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * mul) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * view = dst->src[1];
+    if (!mul || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || dst->type != GGML_TYPE_F32) return false;
+    if (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32) return false;
+    if (mul->nb[0] != sizeof(float) || mul->src[0]->nb[0] != sizeof(float) || mul->src[1]->nb[0] != sizeof(float)) return false;
+    if (!ggml_are_same_shape(mul->src[0], mul) || !ggml_are_same_shape(mul->src[1], mul)) return false;
+    // src1 of the concat must be the transpose view of the product
+    if (view->view_src != mul || view->view_offs != 0 || view->op != GGML_OP_TRANSPOSE) return false;
+    if (((const int32_t *) dst->op_params)[0] != 0 || dst->ne[3] != 1 || mul->ne[3] != 1 || src0->ne[3] != 1) return false;
+    if (src0->type != GGML_TYPE_F32 || src0->ne[1] != mul->ne[0] || src0->ne[2] != mul->ne[2]) return false;
+    if (src0->nb[0] != sizeof(float) || src0->nb[1] != src0->ne[0] * sizeof(float) || dst->nb[0] != sizeof(float) || dst->nb[1] != dst->ne[0] * sizeof(float)) return false;
+
+    concat_transposed_mul_cuda<float>(src0, mul->src[0], mul->src[1], dst, ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 template <typename T>

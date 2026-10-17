@@ -8,6 +8,7 @@ struct ggml_cuda_norm_gated_match {
     float eps;
     int pre = -1;
     bool staged = false;
+    bool silu = false;            // gate silu(z) (Qwen3.5/3.6/3.8 GDN) instead of sigmoid(z)
     uint16_t * dst16 = nullptr;   // optional BF16 copy of dst for the MMB GEMM that reads it next
 };
 int  ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);

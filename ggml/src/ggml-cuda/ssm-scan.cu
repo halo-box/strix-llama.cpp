@@ -24,6 +24,14 @@ using namespace cub;
 // Chunk size for chunked SSD. Caps matmul cost at O(chunk^2) per chunk.
 #define SSM_SSD_CHUNK_SIZE 256
 
+// Heads per block of the SSD pre_matmul kernel: a block covers all heads of one group, so the
+// per-group B, C and CB sources are loaded once and reused by every head (8 KB of shared at chunk 256).
+#define SSM_SSD_HEAD_BLOCK 8
+
+// Elements per thread in the SSD pre_matmul kernel: one element per thread (16384 tiny blocks at
+// chunk 256) measured 288 us per call on gfx1151, and these sections do not need a thread per element.
+#define SSM_SSD_PRE_ELEMS 16
+
 // We would like to keep pragma unroll for cases where L_template is not 0,
 // so we suppress the clang transformation warning.
 #ifdef __clang__
@@ -362,7 +370,6 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
-#if !defined(GGML_USE_HIP)
 // ============================================================================
 // SSD (State Space Duality) kernels for Mamba-2 prefill (n_tok > SSM_SSD_MIN_TOKENS)
 //
@@ -459,7 +466,7 @@ __global__ void ssm_ssd_prepare_dt_kernel(
 // C_scaled is always float (pairs with float s_cur in step 3c).
 // Computation is always FP32; only the final store converts to T_matmul.
 // Also materializes the causal M matrix = exp(A*(cs_out - cs_in)) * CB (fused with prep to save a launch).
-// Grid: (ceil(max(C*head_dim, d_state*C, chunk_len^2) / BLOCK), n_head, n_seqs)
+// Grid: (ceil(max(C*head_dim, d_state*C, chunk_len^2) / (SSM_SSD_PRE_ELEMS*BLOCK)), n_group * head_blocks, n_seqs)
 template <int BLOCK_SIZE, typename T_matmul>
 __global__ void ssm_ssd_pre_matmul_kernel(
         const float * __restrict__ cs,         // {n_tok, n_head} cumulative dt sums
@@ -481,65 +488,107 @@ __global__ void ssm_ssd_pre_matmul_kernel(
         const int chunk_offset,
         const int n_tok_total) {
 
-    const int h = blockIdx.y;
-    const int s = blockIdx.z;
-    const int g = h / (n_head / n_group);
+    const int hpg    = n_head / n_group;
+    const int blocks_per_group = (hpg + SSM_SSD_HEAD_BLOCK - 1) / SSM_SSD_HEAD_BLOCK;
+    const int g      = blockIdx.y / blocks_per_group;
+    const int h0     = (blockIdx.y % blocks_per_group) * SSM_SSD_HEAD_BLOCK;
+    const int hcnt   = min(SSM_SSD_HEAD_BLOCK, hpg - h0);
+    const int hbase  = g * hpg + h0;
 
-    const float A_h = A[h * A_stride];
+    const int s = blockIdx.z;
     const int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
 
     const int cs_seq_off = s * n_tok_total * n_head;
-    const float cs_base = (chunk_offset > 0) ? cs[cs_seq_off + (chunk_offset - 1) * n_head + h] : 0.0f;
-    const float cs_last = cs[cs_seq_off + (chunk_offset + chunk_len - 1) * n_head + h] - cs_base;
 
-    // Prepare X_dt = x * dt, stored d-fastest for coalesced reads and writes.
+    // Chunk-relative cumulative sums of this block's heads in shared memory: the per (t_in, t_out)
+    // loads of the M materialization were strided by n_head (a 32 B sector for 4 B used each).
+    __shared__ float cs_sh[SSM_SSD_HEAD_BLOCK * SSM_SSD_CHUNK_SIZE];
+    __shared__ float A_sh[SSM_SSD_HEAD_BLOCK];
+    __shared__ float cs_base_sh[SSM_SSD_HEAD_BLOCK];
+    __shared__ float cs_last_sh[SSM_SSD_HEAD_BLOCK];
+
+    if (threadIdx.x < hcnt) {
+        const int h = hbase + threadIdx.x;
+        A_sh[threadIdx.x]       = A[h * A_stride];
+        cs_base_sh[threadIdx.x] = (chunk_offset > 0) ? cs[cs_seq_off + (chunk_offset - 1) * n_head + h] : 0.0f;
+        cs_last_sh[threadIdx.x] = cs[cs_seq_off + (chunk_offset + chunk_len - 1) * n_head + h] - cs_base_sh[threadIdx.x];
+    }
+    __syncthreads();
+
+    // Head index fastest: a warp then reads 32 B aligned runs of cs instead of one 32 B sector per 4 B used.
+    for (int i = threadIdx.x; i < hcnt * chunk_len; i += BLOCK_SIZE) {
+        const int hl = i % hcnt;
+        const int t  = i / hcnt;
+        cs_sh[hl * chunk_len + t] = cs[cs_seq_off + (chunk_offset + t) * n_head + hbase + hl] - cs_base_sh[hl];
+    }
+    __syncthreads();
+
+    // Grid-strided, SSM_SSD_PRE_ELEMS elements per thread.
+    const int vstride = gridDim.x * BLOCK_SIZE;
+
+    // Prepare X_dt = x * dt, stored d-fastest for coalesced reads and writes. x and dt are per head.
     const int n_xdt = chunk_len * head_dim;
-    if (idx < n_xdt) {
-        const int d = idx % head_dim;
-        const int t = idx / head_dim;
+    const float  * x_s   = x     + s * x_stride_seq;
+    const float  * dt_s  = dt_sp + cs_seq_off;
+    T_matmul     * xdt_s = X_dt  + (int64_t)s * n_xdt * n_head;
+    for (int i = idx; i < n_xdt; i += vstride) {
+        const int d = i % head_dim;
+        const int t = i / head_dim;
 
-        const float x_val = x[s * x_stride_seq + (chunk_offset + t) * x_stride_tok + d + h * head_dim];
-        const float dt_val = dt_sp[cs_seq_off + (chunk_offset + t) * n_head + h];
+        const float * x_t  = x_s  + (chunk_offset + t) * x_stride_tok + d;
+        const float * dt_t = dt_s + (chunk_offset + t) * n_head;
 
-        X_dt[d + t * head_dim + h * n_xdt + s * n_xdt * n_head] = (T_matmul)(x_val * dt_val);
+        for (int hl = 0; hl < hcnt; hl++) {
+            const float x_val  = x_t[(hbase + hl) * head_dim];
+            const float dt_val = dt_t[hbase + hl];
+            xdt_s[(int64_t)(hbase + hl) * n_xdt + i] = (T_matmul)(x_val * dt_val);
+        }
     }
 
     // Prepare B_weighted and C_scaled together: both share the same index space (d_state * chunk_len)
-    // and the same cs_t load, so merging halves the cs[] global memory traffic.
+    // and the same cs_t load, so merging halves the cs[] global memory traffic. B and C are per group.
     const int n_bw = d_state * chunk_len;
-    if (idx < n_bw) {
-        const int n = idx % d_state;
-        const int t = idx / d_state;
+    const float  * B_s  = B          + s * B_stride_seq + chunk_offset * B_stride_tok + g * d_state;
+    const float  * C_s  = C_src      + s * C_stride_seq + chunk_offset * C_stride_tok + g * d_state;
+    T_matmul     * Bw_s = B_weighted + (int64_t)s * n_bw * n_head;
+    float        * Cs_s = C_scaled   + (int64_t)s * n_bw * n_head;
+    for (int i = idx; i < n_bw; i += vstride) {
+        const int n = i % d_state;
+        const int t = i / d_state;
 
-        const float cs_t = cs[cs_seq_off + (chunk_offset + t) * n_head + h] - cs_base;
+        const float B_val = B_s[t * B_stride_tok + n];
+        const float C_val = C_s[t * C_stride_tok + n];
 
-        const float B_val = B[s * B_stride_seq + (chunk_offset + t) * B_stride_tok + g * d_state + n];
-        B_weighted[n + t * d_state + h * n_bw + s * n_bw * n_head] = (T_matmul)(B_val * __expf(A_h * (cs_last - cs_t)));
-
-        const float C_val = C_src[s * C_stride_seq + (chunk_offset + t) * C_stride_tok + g * d_state + n];
-        C_scaled[n + t * d_state + h * n_bw + s * n_bw * n_head] = C_val * __expf(A_h * cs_t);
+        for (int hl = 0; hl < hcnt; hl++) {
+            const float A_h  = A_sh[hl];
+            const float cs_t = cs_sh[hl * chunk_len + t];
+            const int64_t off = (int64_t)(hbase + hl) * n_bw + i;
+            Bw_s[off] = (T_matmul)(B_val * __expf(A_h * (cs_last_sh[hl] - cs_t)));
+            Cs_s[off] = C_val * __expf(A_h * cs_t);
+        }
     }
 
-    // Materialize M = exp(A*(cs_out - cs_in)) * CB with causal mask.
+    // Materialize M = exp(A*(cs_out - cs_in)) * CB with causal mask. CB is per group too, so each
+    // element is loaded once for all heads of the block.
     const int n_M = chunk_len * chunk_len;
-    if (idx < n_M) {
-        const int t_out = idx % chunk_len;
-        const int t_in  = idx / chunk_len;
+    const float * CB_g = CB + (int64_t)s * chunk_len * chunk_len * n_group
+                            + (int64_t)g * chunk_len * chunk_len;
+    half * M_s = M_out + (int64_t)s * n_M * n_head;
+    for (int i = idx; i < n_M; i += vstride) {
+        const int t_out = i % chunk_len;
+        const int t_in  = i / chunk_len;
 
-        half val;
         if (t_in <= t_out) {
-            const float cs_out = cs[cs_seq_off + (chunk_offset + t_out) * n_head + h] - cs_base;
-            const float cs_in  = cs[cs_seq_off + (chunk_offset + t_in)  * n_head + h] - cs_base;
-            const float decay  = __expf(A_h * (cs_out - cs_in));
-            const float * CB_g = CB + (int64_t)s * chunk_len * chunk_len * n_group
-                                   + (int64_t)g * chunk_len * chunk_len;
-            const float cb_val = CB_g[t_out + t_in * chunk_len];
-            val = __float2half(decay * cb_val);
+            const float cb_val = CB_g[i];
+            for (int hl = 0; hl < hcnt; hl++) {
+                const float decay = __expf(A_sh[hl] * (cs_sh[hl * chunk_len + t_out] - cs_sh[hl * chunk_len + t_in]));
+                M_s[(int64_t)(hbase + hl) * n_M + i] = __float2half(decay * cb_val);
+            }
         } else {
-            val = __float2half(0.0f);
+            for (int hl = 0; hl < hcnt; hl++) {
+                M_s[(int64_t)(hbase + hl) * n_M + i] = __float2half(0.0f);
+            }
         }
-
-        M_out[(int64_t)s * n_M * n_head + (int64_t)h * n_M + t_in * chunk_len + t_out] = val;
     }
 }
 
@@ -610,6 +659,9 @@ static void ssm_scan_ssd_f32_cuda(
 
     cudaStream_t stream = ctx.stream();
     const int64_t d_inner = head_dim * n_head;
+
+    // The pre_matmul kernel maps heads to groups by n_head / n_group.
+    GGML_ASSERT(n_head % n_group == 0);
 
     const int64_t chunk_size = SSM_SSD_CHUNK_SIZE;
     const int64_t n_chunks = (n_tok + chunk_size - 1) / chunk_size;
@@ -701,7 +753,9 @@ static void ssm_scan_ssd_f32_cuda(
             int64_t max_work = n_xdt;
             if (n_bw  > max_work) max_work = n_bw;
             if (n_M   > max_work) max_work = n_M;
-            dim3 grid((max_work + BLOCK - 1) / BLOCK, n_head, n_seq);
+            const int64_t hpg = n_head / n_group;
+            const int64_t head_blocks = (hpg + SSM_SSD_HEAD_BLOCK - 1) / SSM_SSD_HEAD_BLOCK;
+            dim3 grid((max_work + SSM_SSD_PRE_ELEMS*BLOCK - 1) / (SSM_SSD_PRE_ELEMS*BLOCK), n_group * head_blocks, n_seq);
             ssm_ssd_pre_matmul_kernel<BLOCK, matmul_t><<<grid, BLOCK, 0, stream>>>(
                 cs, dt_sp, src3_d, src1_d, src4_d, src5_d,
                 X_dt, B_weighted, C_scaled,
@@ -783,7 +837,6 @@ static void ssm_scan_ssd_f32_cuda(
         }
     }
 }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                        const ggml_cuda_ssm_scan_fused_cache * cache) {
@@ -843,17 +896,20 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
     GGML_ASSERT(src5->nb[2] <= (size_t)INT_MAX);
     GGML_ASSERT(src5->nb[3] <= (size_t)INT_MAX);
 
-#if !defined(GGML_USE_HIP)
-    // Mamba-2 with scalar A per head: use SSD matmul path for long sequences.
-    // Requires NVIDIA Turing+ otherwise fallback to scan.
+    // Mamba-2 with scalar A per head: SSD matmul path for long sequences, scan otherwise. NVIDIA
+    // Turing+ and RDNA3.5 (gfx1151: pp4096 +18% at d0, +10% at d64k on Nemotron-3.5) use it by
+    // default; GGML_SSM_SSD: -1 platform default, 0 off, 1 on. cuBLAS and hipBLAS both need
+    // 8-element (16-byte) alignment.
     const bool is_mamba2 = (src3->nb[1] == sizeof(float));
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    static const int ssd_env = getenv("GGML_SSM_SSD") ? atoi(getenv("GGML_SSM_SSD")) : -1;
+    const bool hw_ssd = (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) || GGML_CUDA_CC_IS_RDNA3_5(cc);
+    const bool cc_ssd = ssd_env < 0 ? hw_ssd : (ssd_env > 0 && hw_ssd);
     const bool use_ssd = is_mamba2 && n_t > SSM_SSD_MIN_TOKENS
                       && K == 1
                       && n_t <= SSM_SSD_MAX_TOKENS
-                      && GGML_CUDA_CC_IS_NVIDIA(cc)
-                      && cc >= GGML_CUDA_CC_TURING
-                      && nr % 8 == 0;  // cuBLAS requires 8-element (16-byte) alignment
+                      && cc_ssd
+                      && nr % 8 == 0;
 
     if (use_ssd) {
         // ssm_ssd_init_state_kernel uses flat linear indexing within each sequence,
@@ -873,7 +929,6 @@ static void ggml_cuda_op_ssm_scan_impl(ggml_backend_cuda_context & ctx, ggml_ten
             cache ? cache->data : (float *) ((char *) dst_d + s_off), nc, nr, nh, ng, n_t, n_s);
         return;
     }
-#endif
     ssm_scan_f32_cuda(src0_d, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
                       src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
                       src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
