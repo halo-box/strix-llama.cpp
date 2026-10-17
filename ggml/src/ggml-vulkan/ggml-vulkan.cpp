@@ -7499,9 +7499,10 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
 // perf-heuristic for choosing mul_mat b type, based on shader availability
 static ggml_type ggml_vk_mul_mat_b_type(
         ggml_backend_vk_context * ctx, ggml_type src0_type, const ggml_tensor * src1,
-        ggml_type f16_type, ggml_prec prec, bool mul_mat_id, bool can_quantize_y, bool prefer_f16_b) {
+        ggml_type f16_type, ggml_prec prec, bool mul_mat_id, bool can_quantize_y, bool prefer_f16_b, bool d16 = false, bool glu = false) {
+    // d16/glu: a fused f16 store or GLU epilogue only exists for some B types, so availability must be checked with them
     auto available = [&](ggml_type b) {
-        return ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0_type, b, prec, mul_mat_id) != nullptr;
+        return ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0_type, b, prec, mul_mat_id, d16, glu) != nullptr;
     };
     if (can_quantize_y && available(GGML_TYPE_Q8_1))             return GGML_TYPE_Q8_1;
     if (prefer_f16_b   && available(f16_type))                   return f16_type;
@@ -9392,7 +9393,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                            ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
                            // only take the f16-B path if a pipeline exists for this src0 type
                            // (e.g. Q2_0 has none); otherwise fall through to the normal f32-B path.
-                           ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_F16, (ggml_prec)dst->op_params[0], true) != nullptr;
+                           ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_F16, (ggml_prec)dst->op_params[0], true, d16, glu) != nullptr;
     if (mmid_f16b) {
         static bool mmid_f16b_logged = false;
         if (!mmid_f16b_logged) {
@@ -9402,7 +9403,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
-                                        (ggml_prec)dst->op_params[0], true, can_quantize_y, prefer_f16_b || mmid_f16b);
+                                        (ggml_prec)dst->op_params[0], true, can_quantize_y, prefer_f16_b || mmid_f16b, d16, glu);
 
     const bool quantize_y   = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel = y_kernel_type == GGML_TYPE_F32;
