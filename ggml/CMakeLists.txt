@@ -188,6 +188,9 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
+# trellis weight types PTQ1_0 / TQ2_T / TQK6/7 / TQP5/6/7: backend kernels and tests.
+# OFF: the types stay known (type ids, names, sizes, CPU reference quantize/dequantize), but no backend runs them.
+option(GGML_TRELLIS                         "ggml: enable trellis weight type kernels (PTQ1_0, TQ2_T, TQK6/7, TQP5/6/7)" ON)
 
 # 3rd party libs / backends
 option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               ON)
