@@ -132,10 +132,8 @@ layout (binding = 1) readonly buffer B_SCALAR {B_TYPE_SCALAR data_b_scalar[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 #ifdef QSA_EPI
-// qwen4exp QSA indexer scorer epilogue (fused MUL_MAT -> RELU -> 4-head sum -> + block bias): the N columns
-// are (query, head) pairs, head fastest, and D is [M, N/QSA_H] with D[t*stride_d + m] =
-// ((((relu(h0)) + relu(h1)) + relu(h2)) + relu(h3)) (+ bias[t][m]), the order the unfused RELU, CONT and
-// ADD chain evaluates it in. The GEMM is the plain f32 x f32 kernel, so the sums are the same bits.
+// QSA scorer epilogue: N columns are (query, head) pairs, head fastest; D[t*stride_d + m] = ((relu(h0) + relu(h1)) + relu(h2))
+// + relu(h3) (+ bias[t][m]), the unfused chain's order on the plain f32 GEMM, so the same bits
 #define QSA_H 4
 layout (binding = 3) readonly buffer QSA_BIAS {float data_qsa_bias[];};
 #endif

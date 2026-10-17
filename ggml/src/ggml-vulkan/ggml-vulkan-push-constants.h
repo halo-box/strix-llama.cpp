@@ -570,7 +570,7 @@ struct vk_op_topk_push_constants {
     uint32_t last_pass;
 };
 
-// QSA_BLOCK_SELECT (A2): one dispatch per strip for qwen4exp's maskless block selection
+// QSA_BLOCK_SELECT: one dispatch per strip for qwen4exp's maskless block selection
 struct vk_op_qsa_block_select_push_constants {
     uint32_t n_blocks;
     uint32_t budget;
@@ -581,7 +581,7 @@ struct vk_op_qsa_block_select_push_constants {
     uint32_t c_stride_s;  // block cells: elements per stream
     uint32_t t_stride_q;  // tail: elements per query
     uint32_t t_stride_s;  // tail: elements per stream
-    // compact visibility read in the kernel (halo-box #117 limits): block b is visible to query q iff
+    // compact visibility read in the kernel: block b is visible to query q iff
     // limits[row(q)*l_blocks + b] < limits[l_tails_off + q], row(q) = limits[l_rowidx_off + q] (0 when l_rowidx_off is ~0u)
     uint32_t l_mode;        // 0: the scores carry the visibility; 1: apply it from the limits buffer
     uint32_t l_blocks;      // start-row stride (0 with one sequence row)

@@ -5587,14 +5587,12 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
-// QSA_BLOCK_SELECT (A2): the maskless block-selection chain qwen4exp_select_complete_blocks emits, node for node, so a
-// backend that fuses it (Vulkan: one dispatch per query strip) is compared against the chain on the CPU. Scores are
-// distinct per row (a random permutation scaled), n_inf blocks per row are -inf (invisible: their cells read -1 when
-// the budget still picks them) and one block carries the +1e9 tail bias, as the model's bias does.
+// QSA_BLOCK_SELECT: the chain qwen4exp_select_complete_blocks emits, node for node, against the CPU; distinct scores per row,
+// n_inf invisible (-inf) blocks per row (their cells read -1 when picked), one block with the +1e9 tail bias as in the model
 struct test_qsa_block_select : public test_case {
     const int64_t n_blocks, n_query, n_stream, budget, r;
     const int64_t n_inf;
-    const int64_t n_seq;   // 0: the scores carry the visibility (-inf); >0: halo-box compact limits with n_seq rows, applied
+    const int64_t n_seq;   // 0: the scores carry the visibility (-inf); >0: compact limits with n_seq rows, applied
                            // through the cast / repeat / sub / step / log / add ops ahead of the chain (fused on Vulkan)
 
     std::string op_desc(ggml_tensor * t) override {
@@ -5702,10 +5700,8 @@ struct test_qsa_block_select : public test_case {
                     for (int64_t b = 0; b < n_blocks; ++b) {
                         p[b] = 0.001f * (float) perm[b] - 0.25f;             // distinct, some below -1 is impossible here: keep them above
                     }
-                    // invisible blocks: spread over the row while the budget fits in the visible ones; when it does not, the
-                    // chain must select some of them and the CPU top_k picks among equal -inf keys in an unspecified order
-                    // while the kernel takes the lowest indices, so they go to the row's tail, where any pick sorts behind
-                    // every visible block and the -1 cells land in the same slots either way
+                    // invisible blocks spread over the row while the budget fits the visible ones; otherwise at the row's tail, as CPU top_k takes
+                    // equal -inf keys in any order (the kernel the lowest): there any pick sorts last and the -1 cells land in the same slots
                     const bool tail_inf = budget > n_blocks - n_inf;
                     for (int64_t k = 0; n_seq == 0 && k < n_inf; ++k) {
                         p[tail_inf ? n_blocks - 1 - k : (k * 7 + row) % n_blocks] = -INFINITY;
@@ -5714,9 +5710,8 @@ struct test_qsa_block_select : public test_case {
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
             } else if (name == "limits") {
-                // starts: block b of row s starts at 4*b + s, the last n_inf blocks of each row unfinished (INT32_MAX: at the
-                // tail for the reason above, since a query whose tail cuts the row sees fewer blocks than the budget);
-                // tails: every other query sees the whole prefix, the others only its first half (positions stay below 2^24)
+                // starts: block b of row s at 4*b + s, the last n_inf blocks unfinished (INT32_MAX, at the tail as above); tails: every other
+                // query sees the whole prefix, the rest only its first half (positions stay below 2^24)
                 std::vector<int32_t> v((size_t) ggml_nelements(t));
                 for (int64_t sidx = 0; sidx < n_seq; ++sidx) {
                     for (int64_t b = 0; b < n_blocks; ++b) {
@@ -9530,10 +9525,8 @@ struct test_top_k_stable_ties : public test_top_k {
 };
 
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
-// qwen4exp QSA indexer scorer: MUL_MAT(pooled keys, q) -> relu -> 4-head sum (-> + block bias), the chain
-// build_qsa_top_k emits; the Vulkan backend fuses it into one GEMM epilogue (QSA_SCORE, GGML_VK_QSA_SCORE=1).
-// Inputs are multiples of 1/8, so every product and every partial sum is exact in f16 inputs and f32
-// accumulation: the fused result must match the CPU bit for bit.
+// qwen4exp QSA scorer: MUL_MAT(keys, q) -> relu -> 4-head sum (-> + block bias), fused on Vulkan as QSA_SCORE. Inputs are
+// multiples of 1/8, so every product and partial sum is exact: the fused result must match the CPU bit for bit
 struct test_qsa_score : public test_case {
     const int64_t K;
     const int64_t n_blocks;
@@ -13204,7 +13197,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,    GGML_TYPE_Q8_0,   256, 128, 16, 4, 129, 0, true, true));
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,    GGML_TYPE_Q8_0,   256, 224, 16, 4, 65, 0, true, true));   // ff not a tile multiple
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,   GGML_TYPE_Q8_0,   256, 128, 16, 4, 5, 0));    // mat-vec MMID: no fusion
-    // A2: the maskless QSA block selection (Flash-Next: r = 4, budget 512; 8192 blocks = 32k context), decode and prefill rows,
+    // the maskless QSA block selection (Flash-Next: r = 4, budget 512; 8192 blocks = 32k context), decode and prefill rows,
     // invisible blocks within and beyond the budget, two streams
     test_cases.emplace_back(new test_qsa_block_select(512,  8,  1, 128, 4, 0));
     test_cases.emplace_back(new test_qsa_block_select(2048, 64, 1, 512, 4, 300));
@@ -13213,7 +13206,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_block_select(600,  5,  1, 512, 4, 200));   // budget > visible blocks: -1 cells
     test_cases.emplace_back(new test_qsa_block_select(4096, 1,  1, 512, 4, 0));     // a decode row
     test_cases.emplace_back(new test_qsa_block_select(300,  3,  1, 300, 4, 10));    // budget == n_blocks
-    // compact limits (halo-box #117) read in the kernel: one sequence row, two rows, budget past the visible blocks
+    // compact limits read in the kernel: one sequence row, two rows, budget past the visible blocks
     test_cases.emplace_back(new test_qsa_block_select(512,  8,  1, 128, 4, 0,   1));
     test_cases.emplace_back(new test_qsa_block_select(2048, 64, 1, 512, 4, 300, 1));
     test_cases.emplace_back(new test_qsa_block_select(1024, 16, 1, 256, 4, 50,  2));

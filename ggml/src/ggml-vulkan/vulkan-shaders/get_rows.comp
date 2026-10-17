@@ -5,9 +5,8 @@
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
-// flat (GGML_VK_GET_ROWS_FLAT): one thread per output element over the flattened (i00, i10, i11, i12) index, a grid-stride
-// loop, for narrow rows. The row-per-workgroup layout below runs a 512-thread workgroup per gathered row with only ne00 lanes
-// active: GET_ROWS(1, 512, 2048) is 1M workgroups and ~2.9 ms of pure wave launch on gfx1151. Same element copy, bit-exact.
+// flat (GGML_VK_GET_ROWS_FLAT): one thread per output element, grid-stride, for narrow rows, where the layout below runs 512
+// threads per row with ne00 active (GET_ROWS(1, 512, 2048): 1M workgroups, 2.9 ms on gfx1151). Same element copy, bit-exact
 layout(constant_id = 1) const bool flat_rows = false;
 
 void copy_element(const uint i00, const uint i10, const uint i11, const uint i12) {

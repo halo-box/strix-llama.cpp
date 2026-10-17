@@ -1,16 +1,7 @@
 #version 450
 
-// QSA_BLOCK_SELECT (A2 / E11, 2026-10-10): the maskless block selection of the qwen4exp indexer in one dispatch.
-// Replaces the per-strip chain qwen4exp_select_complete_blocks emits (top_k, cont, argsort, 3 get_rows, step,
-// 3 scale_bias, mul, 2 casts, concat: ~16 dispatches and three [budget, n_query] intermediates per QSA layer):
-// one workgroup per query row keeps the row's block scores in registers, radix-selects the `budget` largest with
-// the lowest-index tie rule, and writes the selected blocks' cells in ascending block order straight into the
-// chain's output layout ([r*budget + r-1, n_query, 1, n_stream]: r cells per block, -1 for a block whose score is
-// at or below -1, i.e. the chain's step(score + 1) rule for an invisible block, then the r-1 tail cells).
-// The scores arrive with the visibility already applied (QSA_SCORE adds the block bias, -inf for an invisible block),
-// or (l_mode = 1) raw, with the compact limits buffer of halo-box #117 bound: a block is visible to a query iff its
-// start is below the query's tail start, read here per element instead of through the cast / repeat / sub / step /
-// log / add chain (its f32 arithmetic is exact: positions stay below 2^24, so the integer compare is the same test).
+// QSA_BLOCK_SELECT: qwen4exp's maskless block selection, one workgroup per query row: radix top-`budget` of the row (ties: lowest
+// index), cells in ascending block order (-1 for score <= -1), then the tail; l_mode 1 tests the compact limits (start < tail)
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : enable

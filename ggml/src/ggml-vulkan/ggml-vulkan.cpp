@@ -4322,12 +4322,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t BLOCK_SIZE = 1u << std::min(10u, device->max_workgroup_size_log2);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
-        // register-resident TOPK_QSA radix select (port of the fork's 193c95d78): rows of up to 64 * BLOCK_SIZE cells
+        // register-resident TOPK_QSA radix select: rows of up to 64 * BLOCK_SIZE cells
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[0], "topk_radix_qsa_reg8", topk_radix_qsa_reg8_len, topk_radix_qsa_reg8_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[1], "topk_radix_qsa_reg16", topk_radix_qsa_reg16_len, topk_radix_qsa_reg16_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[2], "topk_radix_qsa_reg32", topk_radix_qsa_reg32_len, topk_radix_qsa_reg32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa_reg[3], "topk_radix_qsa_reg64", topk_radix_qsa_reg64_len, topk_radix_qsa_reg64_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
-        // A2: fused maskless block selection (GGML_VK_QSA_BLOCK_SELECT); 512-thread workgroups at most (GPU rule: no 1024-thread WGs)
+        // fused maskless block selection (GGML_VK_QSA_BLOCK_SELECT); 512-thread workgroups at most
         {
             const uint32_t BS = 1u << std::min(9u, device->max_workgroup_size_log2);
             ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_select_reg[0], "qsa_block_select_reg8",  qsa_block_select_reg8_len,  qsa_block_select_reg8_data,  "main", 5, sizeof(vk_op_qsa_block_select_push_constants), {BS, 1, 1}, {BS}, 1, true);
@@ -8892,8 +8892,8 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
         pc, { hc * nt, 1, 1 });
 }
 
-// qwen4exp QSA indexer scorer fusion (QSA_SCORE; port of the fork's 7bf81a7bc, idea from halo-box/strix-llama.cpp#91,
-// Gaetan Puleo): default on; GGML_VK_QSA_SCORE=0 disables, =2 keeps only the graph order (the control for the fusion itself)
+// qwen4exp QSA indexer scorer fusion (QSA_SCORE, idea from halo-box/strix-llama.cpp#91, Gaetan Puleo): default on;
+// GGML_VK_QSA_SCORE=0 disables, =2 keeps only the graph order (the control for the fusion itself)
 static int ggml_vk_qsa_score_mode() {
     static const int m = [] { const char * e = getenv("GGML_VK_QSA_SCORE"); return e ? atoi(e) : 1; }();
     return m;
@@ -8909,12 +8909,8 @@ static const std::vector<vk_matmul_pipeline_pair> * ggml_vk_qsa_score_pipelines(
 }
 
 
-// qwen4exp QSA indexer scorer (build_qsa_top_k), H = 4 indexer heads:
-//   score = MUL_MAT(pooled keys F32 [K, M, ns], q F32 [K, 4*nt, ns])     [M, 4*nt, ns]
-//   RESHAPE [M, 4, nt, ns] -> RELU -> CONT(VIEW h0) -> ADD(VIEW h1) -> ADD(VIEW h2) -> ADD(VIEW h3) (-> ADD(block bias))
-// matmul_f32_f32_qsa runs the same GEMM and applies the relu, the head sum and the bias in its epilogue, so neither the
-// [M, 4*nt] scores nor the relu copy of them is written. Returns the index of the last fused node (0: no match); *bias gets
-// the bias tensor or nullptr.
+// QSA scorer (build_qsa_top_k): MUL_MAT(keys [K, M, ns], q [K, 4*nt, ns]) -> RELU -> sum of the 4 head views (-> + block bias)
+// as one GEMM whose epilogue does relu, sum and bias. Returns the last fused node (0: no match); *bias gets the bias or nullptr
 static bool ggml_vk_qsa_block_select_fits(const ggml_backend_vk_context * ctx, int64_t n_blocks);
 
 static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** bias_out) {
@@ -13020,9 +13016,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
 }
 
-// GGML_VK_GET_ROWS_FLAT=N (default 32, 0 = off): GET_ROWS with rows of at most N elements (f32 / f16 / bf16 / i32 sources) runs
-// one thread per element instead of one 512-thread workgroup per row. The QSA block-selection gathers have 1- and 4-wide rows:
-// GET_ROWS(1, 512, 2048) launched 1M workgroups with one active lane each, 2.9 ms on gfx1151 (fn-unfused-ops, 10-13).
+// GGML_VK_GET_ROWS_FLAT=N (default 32, 0 = off): GET_ROWS with rows of at most N elements runs one thread per element, not a
+// 512-thread workgroup per row: the QSA gather GET_ROWS(1, 512, 2048) was 1M one-lane workgroups, 2.9 ms on gfx1151
 static vk_pipeline ggml_vk_get_rows_flat_pipeline(const ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     static const int64_t max_ne00 = [] { const char * e = getenv("GGML_VK_GET_ROWS_FLAT"); return e ? (int64_t) atoll(e) : (int64_t) 32; }();
     if (max_ne00 <= 0 || src0->ne[0] > max_ne00 || src1->type != GGML_TYPE_I32 ||
@@ -14986,20 +14981,14 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
     ctx->prealloc_x_need_sync = true;
 }
 
-// QSA_BLOCK_SELECT (A2 / E11, 2026-10-10): qwen4exp_select_complete_blocks emits, per query strip, top_k(score, B),
-// cont, argsort(cast f32), get_rows (the sorted block ids), get_rows(score) + scale_bias + step (valid = score > -1),
-// get_rows(block cells), cast, scale_bias, mul, scale_bias, cast, reshape, concat(tail): ~16 dispatches and three
-// [B, n_query] intermediates per QSA layer. qsa_block_select.comp does the whole thing in one dispatch per strip
-// (one workgroup per query row, register-resident scores, radix threshold, lowest-index tie rule, emission in
-// ascending block order, cells expanded in the store). The chain is matched structurally from its TOP_K: every node
-// up to the CONCAT must draw only on the chain, the score, the block-cells tensor or the tail, and only the CONCAT
-// may be read outside (ggml_can_fuse_subgraph_ext). GGML_VK_QSA_BLOCK_SELECT=0 keeps the chain.
+// QSA_BLOCK_SELECT: the ~16-op per-strip chain of qwen4exp_select_complete_blocks (top_k .. concat) as one qsa_block_select.comp
+// dispatch, matched from its TOP_K; only the CONCAT may be read outside. GGML_VK_QSA_BLOCK_SELECT=0 keeps the chain
 struct vk_qsa_block_select_match {
     const ggml_tensor * score = nullptr;   // F32 [n_blocks, n_query, n_stream], contiguous: the QSA_SCORE output (bias applied),
                                            // or the raw head sum when the visibility comes from `limits`
     const ggml_tensor * cells = nullptr;   // I32 [r*n_blocks, n_stream]
     const ggml_tensor * tail  = nullptr;   // I32 [r-1, n_query, 1, n_stream]
-    const ggml_tensor * limits = nullptr;  // I32 compact visibility limits (halo-box #117), or null
+    const ggml_tensor * limits = nullptr;  // I32 compact visibility limits, or null
     ggml_tensor *       out   = nullptr;   // I32 [r*budget + r-1, n_query, 1, n_stream]
     int      last   = 0;
     uint32_t r      = 0;
@@ -15037,12 +15026,8 @@ static bool ggml_vk_qsa_limits_view(const ggml_tensor * v, const ggml_tensor * l
     return true;
 }
 
-// returns the index of the CONCAT (0: no match). ctx may be null (graph_optimize): the device limits are then not checked.
-// Entered at the chain's TOP_K (the scores carry the visibility), or at the first cast of the compact visibility ops
-// qwen4exp_apply_compact_visibility emits ahead of it (halo-box #117 limits: cast(starts), cast(tails), reshape,
-// repeat, sub, step, log, add; several sequence rows add a get_rows): then those run inside the fusion too and the
-// kernel reads the limits itself. The fused range is [node_idx, CONCAT]; every visibility op must lie in it (the
-// limits views are empty nodes and may sit ahead of node_idx).
+// returns the CONCAT's index (0: no match); a null ctx (graph_optimize) skips the device checks. Entered at the TOP_K, or at
+// the first cast of the compact visibility ops ahead of it, which then fuse too (the kernel reads the limits itself)
 static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx, vk_qsa_block_select_match & m) {
     m = {};
     if (!ggml_vk_qsa_block_select_enabled()) {
@@ -15227,9 +15212,8 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
             if (src->type == GGML_TYPE_I32 && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && si == 0) {
                 continue;
             }
-            // the cells gather reading that RESHAPE/VIEW when the graph builder placed it AHEAD of the TOP_K (the
-            // forward expansion visits the gather's src[0] before the selection it depends on: both in the model and
-            // in test-backend-ops it is node 0, outside the fused window, an empty node either way)
+            // the cells gather reading that RESHAPE/VIEW when the forward expansion placed it ahead of the TOP_K (node 0 in the model and
+            // in test-backend-ops: outside the fused window, an empty node either way)
             if (t->op == GGML_OP_GET_ROWS && si == 0 && src->type == GGML_TYPE_I32 &&
                 (src->op == GGML_OP_RESHAPE || src->op == GGML_OP_VIEW) && src->src[0] != nullptr &&
                 src->src[0]->type == GGML_TYPE_I32 && !in_chain(src->src[0])) {
@@ -15335,10 +15319,8 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
     if (last - node_idx > 30) {
         return reject("chain longer than the fusion limit");
     }
-    // Only the CONCAT may be read outside the fusion: every other node's readers are all chain nodes (the graph's
-    // use count, which includes a cast's self-reference in src[1], equals the uses found among the chain's sources)
-    // and none is a graph output. Not ggml_can_fuse_subgraph_ext: it rejects a view of a tensor outside the subgraph
-    // unless that is a weight (the chain views the score and the block cells) and does not count the cast self-use.
+    // only the CONCAT may be read outside: each other node's use count (a cast's self-reference included) equals its uses in the
+    // chain and none is an output. Not ggml_can_fuse_subgraph_ext, which rejects the chain's views of the score and the cells
     for (int k = 0; k + 1 < count; ++k) {
         const ggml_tensor * t = in[k];
         if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -15366,10 +15348,8 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
     return last;
 }
 
-// The engagement read for QSA_BLOCK_SELECT: QSA_SELECT_CHAIN counts every block-selection chain graph_compute meets, fused or
-// not (a fused chain where it is taken, from its first visibility cast or its TOP_K; an unfused one at its TOP_K, the I32 top-k
-// select_complete_blocks wraps in a CONT), so QSA_BLOCK_SELECT / QSA_SELECT_CHAIN is the engaged ratio (1 = every eligible
-// strip). QSA_SCORE is not the denominator: strips without a selection (n_kv <= budget) have a score and no chain.
+// QSA_SELECT_CHAIN counts every block-selection chain graph_compute meets, fused or not: QSA_BLOCK_SELECT / QSA_SELECT_CHAIN is
+// the engaged ratio. QSA_SCORE is no denominator: a strip with n_kv <= budget has a score and no chain
 static int ggml_vk_try_qsa_block_select(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx, vk_qsa_block_select_match & m) {
     const int last = ggml_vk_match_qsa_block_select(ctx, cgraph, node_idx, m);
     const ggml_tensor * n = cgraph->nodes[node_idx];
@@ -15383,9 +15363,8 @@ static int ggml_vk_try_qsa_block_select(const ggml_backend_vk_context * ctx, con
     if (last > 0) {
         ggml_vk_path_census_add("QSA_SELECT_CHAIN");
     } else if (chain_topk) {
-        // past the register limit (64 x BS blocks, 32768 with BS = 512: 128k cells at ratio 4) the chain stays unfused by
-        // design (B-SEL, Hi 4 10-13); count it apart so the engaged ratio QSA_BLOCK_SELECT / QSA_SELECT_CHAIN stays 1 at
-        // every context and QSA_SELECT_CHAIN_OVERSIZE says how much a tiled select would take
+        // past the register limit (64 x BS blocks, 32768 at BS = 512) the chain stays unfused by design: counted apart so the engaged
+        // ratio stays 1 and QSA_SELECT_CHAIN_OVERSIZE says what a tiled select would take
         const bool oversize = ctx->device->pipeline_qsa_block_select_reg[0] != nullptr &&
             n->src[0]->ne[0] > (int64_t) 64 * ctx->device->pipeline_qsa_block_select_reg[0]->wg_denoms[0];
         ggml_vk_path_census_add(oversize ? "QSA_SELECT_CHAIN_OVERSIZE" : "QSA_SELECT_CHAIN");
@@ -15455,10 +15434,8 @@ void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const g
 
     vk_pipeline pipeline = ctx->device->pipeline_topk_radix_qsa;
     GGML_ASSERT(pipeline != nullptr);
-    // rows of up to 64 * BLOCK_SIZE cells stay in registers across the four radix passes and the emission (see topk_reg
-    // in the shader) and need no gather scratch; longer rows keep the scratch variant. Threshold, emission order and tie
-    // rule are unchanged (bit-identical on the fork: qsa_cmp EXACT 11/11, Flash-Next KLD identical; TOPK_QSA 56.1 ->
-    // 34.3 ms per 2048-token ubatch at d16384). GGML_VK_TOPK_QSA_REG=0 disables.
+    // rows of up to 64 * BLOCK_SIZE cells stay in registers through the radix passes and the emission, same threshold, order and
+    // tie rule (TOPK_QSA 56.1 -> 34.3 ms per 2048-token ubatch at d16384 on Flash-Next); GGML_VK_TOPK_QSA_REG=0 disables
     static const bool reg_ok = !(getenv("GGML_VK_TOPK_QSA_REG") && atoi(getenv("GGML_VK_TOPK_QSA_REG")) == 0);
     bool use_reg = false;
     if (reg_ok) {
@@ -19689,9 +19666,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         }
                         if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                             bool found = false;
-                            // n <= k: a node's own output listed as its source is a self-reference, not a read (a cast's
-                            // src[1]). QSA_BLOCK_SELECT lost 166 of 180 chains to its cells cast once the alloc deps kept the
-                            // real inputs alive: ggml-alloc reused the dead cast buffer for the CONCAT, which no fused kernel reads
+                            // n <= k: a node's own output listed as its source (a cast's src[1]) is a self-reference, not a read; counted as one it
+                            // dropped 166 of 180 QSA_BLOCK_SELECT chains once ggml-alloc gave the dead cast buffer to the CONCAT
                             for (int n = 0; n <= k; ++n) {
                                 if (cgraph->nodes[i + n] == src) {
                                     found = true;
@@ -19944,8 +19920,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         return cpy->op == GGML_OP_CPY && cpy->src[0] == last && cpy->type == GGML_TYPE_F16;
     };
 
-    // QSA_BLOCK_SELECT (A2): the select chain is matched structurally, not by a fixed op list: find every run once and
-    // keep it together (the fused dispatch needs the nodes consecutive, and the optimizer's hoisting would split them)
+    // QSA_BLOCK_SELECT: the chain is matched structurally, not by a fixed op list: keep every run together (the fused
+    // dispatch needs the nodes consecutive, and the optimizer's hoisting would split them)
     std::vector<int>  qsa_bs_end(graph->n_nodes, -1);
     std::vector<char> qsa_bs_in(graph->n_nodes, 0);
     if (ggml_vk_qsa_block_select_enabled()) {
@@ -20076,10 +20052,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 free = free && !used[k];
             }
             if (free && params && params->add_alloc_dep) {
-                // the fused kernel reads the score, the block cells, the tail and the limits while it writes the CONCAT: keep every
-                // input from outside the run allocated through it. Without this ggml-alloc freed them at their last (in-chain) use
-                // and placed the CONCAT on top, and graph_compute's overlap check then dropped the fusion: 27 of 179 chains fused at
-                // FN pp2048 d8192 (a2dbg 10-13, "source ... overlaps the output indexer_top_k-N" on every other one)
+                // the fused kernel reads the score, cells, tail and limits while it writes the CONCAT: keep them allocated through it (without
+                // it ggml-alloc put the CONCAT on a freed input and the overlap check left 27 of 179 chains fused, Flash-Next d8192)
                 const int end = qsa_bs_end[first_unused];
                 std::set<const ggml_tensor *> in_run;
                 for (int k = first_unused; k <= end; ++k) {
@@ -20109,10 +20083,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         }
         // QSA scorer chain (QSA_SCORE), prefill only: the fusion needs more than 64 query-head columns; decode keeps its order
         if (ggml_vk_fuse_qsa_score_enabled() && graph->nodes[first_unused]->op == GGML_OP_MUL_MAT && graph->nodes[first_unused]->ne[1] > 64) {
-            // the fused GEMM reads the keys, the query view and the bias while it writes the head sum: keep them allocated through
-            // it. Without the deps ggml-alloc put a strip's score on the layer's freed q (its last reader is the last strip) and the
-            // overlap check dropped QSA_SCORE ("indexer_q (view) overlaps the output indexer_score": 16 strips at FN d8192 once
-            // A2's own deps moved the layout, 10-13)
+            // the fused GEMM reads the keys, the query view and the bias while it writes the head sum: keep them allocated through it
+            // (without it a strip's score landed on the freed q and the overlap check dropped QSA_SCORE, 16 strips at d8192)
             const bool with_bias = match_pattern(qsa_score_pattern, first_unused);
             if ((with_bias || match_pattern(qsa_score_pattern_nobias, first_unused)) && params && params->add_alloc_dep) {
                 const auto & pat = with_bias ? qsa_score_pattern : qsa_score_pattern_nobias;
