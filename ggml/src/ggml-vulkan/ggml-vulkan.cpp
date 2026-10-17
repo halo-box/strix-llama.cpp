@@ -5303,6 +5303,19 @@ vk_device ggml_vk_get_device(size_t idx) {
                 }
 #endif
             }
+            // f32 accumulator for the KHR coopmat matmuls on RADV (GGML_VK_F32ACC, default on for RADV; =0 restores the f16
+            // accumulator). RADV lowers the f16 coopmat accumulator to 16-bit phis and ACO pays ~190 register copies per BK step
+            // in mul_mm (2026-09-13 ISA audit on gfx1151); the f32-accumulator WMMA runs at the same rate with none of them.
+            // Measured on the nathanw line: dense +4..18% per op, Flash-Next pp2048 +1% on top of the prefetch loaders, PPL 5.0393 vs
+            // 5.0452 (f16acc) on Qwen3.8-27B UD-Q4_K_XL. Applied after the property scan so no later property re-enables f16 acc.
+            {
+                static const int f32acc_env = [] { const char * e = getenv("GGML_VK_F32ACC"); return e ? atoi(e) : -1; }();
+                const bool f32acc = f32acc_env >= 0 ? f32acc_env != 0 : device->driver_id == vk::DriverId::eMesaRadv;
+                if (f32acc && device->coopmat_acc_f16_support) {
+                    GGML_LOG_DEBUG("ggml_vulkan: KHR coopmat matmuls use the f32 accumulator (GGML_VK_F32ACC)\n");
+                    device->coopmat_acc_f16_support = false;
+                }
+            }
 
             if (device->coopmat_m == 0 || !device->coopmat_acc_f32_support) {
                 // No suitable matmul mode found
