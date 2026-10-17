@@ -1,5 +1,6 @@
 // Vulkan fused dispatches byte-equal with the unfused chain on the same device (test-backend-ops compares against the CPU).
-// Usage: test-vk-exact [f16-store] [hc-up-mix] [mmid-frag] (default: the first two; mmid-frag is a tool for its .py).
+// Usage: test-vk-exact [f16-store] [hc-up-mix] [wq-deint] [ple-conv] [mmv-scale] [mmid-frag] (default: all but mmid-frag,
+// a tool for its .py).
 // Exit 1 on any FAIL, 0 without Vulkan0; with GGML_VK_DISABLE_FUSION no case expects a fused dispatch.
 
 #include "ggml.h"
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <map>
 #include <random>
@@ -736,6 +738,384 @@ static int run(ggml_backend_t be, bool fusion) {
 } // namespace hc_up_mix
 
 // ---------------------------------------------------------------------------------------------------------------------
+// wq-deint
+// LLAMA_WQ_DEINTERLEAVE: the attention gate from a de-interleaved wq (views, SIGMOID_MUL) must be byte-equal with the file order
+// (strided view, CONT); swapping two heads must change it. TEST_VK_EXACT_WQ_DEINT_DUMP=<path> writes the output, for
+// a byte compare with a GGML_VK_DISABLE_FUSION=1 run.
+
+namespace wq_deint {
+
+typedef uint64_t (*census_count_t)(const char *);
+typedef void     (*census_reset_t)(void);
+typedef const char * (*census_skip_t)(ggml_backend_t, const char *);
+
+struct shape { int64_t n_embd, d, n_head, nt; };
+
+// rows of w: [q(d) | gate(d)] per head -> [q heads | gate heads]; swap != 0 exchanges the q rows of heads 0 and 1 (control)
+static std::vector<uint8_t> deinterleave(const std::vector<uint8_t> & src, size_t row, int64_t d, int64_t n_head, bool swap) {
+    std::vector<uint8_t> dst(src.size());
+    for (int64_t h = 0; h < n_head; ++h) {
+        const int64_t hs = swap && h < 2 ? 1 - h : h;
+        memcpy(dst.data() + (size_t) (h * d) * row,            src.data() + (size_t) (2 * hs * d) * row,     (size_t) d * row);
+        memcpy(dst.data() + (size_t) ((n_head + h) * d) * row, src.data() + (size_t) ((2 * h + 1) * d) * row, (size_t) d * row);
+    }
+    return dst;
+}
+
+// returns the gated output; n_sigmul gets the SIGMOID_MUL dispatches of the run
+static std::vector<uint8_t> run_graph(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh, bool deint,
+                                      const std::vector<uint8_t> & wbytes, const std::vector<float> & xv, uint64_t & n_sigmul) {
+    auto count = (census_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_count");
+    auto reset = (census_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_reset");
+
+    ggml_init_params ip = { 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    const int64_t d = sh.d, H = sh.n_head, T = sh.nt;
+    ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, sh.n_embd, 2 * d * H);
+    ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sh.n_embd, T);
+    ggml_tensor * qf = ggml_mul_mat(ctx, w, x);   // Qcur_full
+    const size_t es = ggml_element_size(qf);
+    ggml_tensor * q, * gate;
+    if (deint) {
+        q    = ggml_view_3d(ctx, qf, d, H, T, es * d, qf->nb[1], 0);
+        gate = ggml_view_2d(ctx, qf, d * H, T, qf->nb[1], es * d * H);
+    } else {
+        q    = ggml_view_3d(ctx, qf, d, H, T, es * d * 2, es * d * 2 * H, 0);
+        gate = ggml_view_3d(ctx, qf, d, H, T, es * d * 2, es * d * 2 * H, es * d);
+        gate = ggml_cont_2d(ctx, gate, d * H, T);
+    }
+    // the q side stands in for norm -> rope -> attention: a chain the gate does not depend on
+    ggml_tensor * qn   = ggml_rms_norm(ctx, q, 1e-6f);
+    ggml_tensor * qs   = ggml_scale(ctx, qn, 0.5f);
+    ggml_tensor * attn = ggml_soft_max(ctx, ggml_reshape_2d(ctx, qs, d * H, T));
+    ggml_tensor * out  = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+    ggml_set_output(out);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    if (!buf) { fprintf(stderr, "FAIL: alloc\n"); exit(1); }
+    ggml_backend_tensor_set(w, wbytes.data(), 0, wbytes.size());
+    ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
+    if (reset) reset();
+    ggml_backend_graph_compute(be, gf);
+    n_sigmul = count ? count("SIGMOID_MUL") : 0;
+    std::vector<uint8_t> res(ggml_nbytes(out));
+    ggml_backend_tensor_get(out, res.data(), 0, res.size());
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return res;
+}
+
+static int run(ggml_backend_t be, bool fusion) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(be));
+    // graph_optimize (GGML_VK_UNARY_MUL_KEEP) runs under the scheduler only: here the graph keeps its build order
+    const bool want_fused = fusion;
+    // a device that cannot run the fused path at all skips (the backend says why); with fusion disabled the cases still run
+    auto census_skip = (census_skip_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_skip");
+    const char * why = census_skip ? census_skip(be, "SIGMOID_MUL") : nullptr;
+    if (why != nullptr && want_fused) {
+        printf("SIGMOID_MUL not available on %s (%s), skipping\n", ggml_backend_name(be), why);
+        return 0;
+    }
+
+    // FN attention (d 256, 12 heads, n_embd 2560); decode, a small batch, and prefill widths
+    const shape shapes[] = { { 2560, 256, 12, 1 }, { 2560, 256, 12, 7 }, { 2560, 256, 12, 64 }, { 2560, 256, 12, 512 }, { 512, 128, 4, 33 } };
+    const char * dump_path = getenv("TEST_VK_EXACT_WQ_DEINT_DUMP");
+    FILE * dump = dump_path ? fopen(dump_path, "wb") : nullptr;
+    int fails = 0;
+    for (const auto & sh : shapes) {
+        const int64_t M = 2 * sh.d * sh.n_head;
+        std::mt19937 rng(77 + (int) sh.nt + (int) sh.n_embd);
+        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+        std::vector<float> wf(sh.n_embd * M), xv(sh.n_embd * sh.nt);
+        for (auto & v : wf) v = u(rng);
+        for (auto & v : xv) v = u(rng);
+        std::vector<uint8_t> wq(ggml_row_size(GGML_TYPE_Q8_0, sh.n_embd) * M);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, wf.data(), wq.data(), 0, M, sh.n_embd, nullptr);
+        const size_t row = ggml_row_size(GGML_TYPE_Q8_0, sh.n_embd);
+
+        uint64_t n_a = 0, n_b = 0, n_c = 0;
+        const auto out_a = run_graph(be, reg, sh, false, wq, xv, n_a);
+        const auto out_b = run_graph(be, reg, sh, true,  deinterleave(wq, row, sh.d, sh.n_head, false), xv, n_b);
+        const auto out_c = run_graph(be, reg, sh, true,  deinterleave(wq, row, sh.d, sh.n_head, true),  xv, n_c);
+        size_t ndiff = 0;
+        for (size_t i = 0; i < out_a.size(); i += 4) ndiff += memcmp(out_a.data() + i, out_b.data() + i, 4) != 0;
+        const bool ctrl = memcmp(out_a.data(), out_c.data(), out_a.size()) != 0;
+        printf("n_embd=%lld d=%lld heads=%lld nt=%lld: file-order vs de-interleaved %s (%zu of %zu differ), SIGMOID_MUL file-order=%llu "
+               "de-interleaved=%llu (want %d), swapped-head control %s\n",
+               (long long) sh.n_embd, (long long) sh.d, (long long) sh.n_head, (long long) sh.nt, ndiff ? "DIFFER" : "byte-equal", ndiff,
+               out_a.size() / 4, (unsigned long long) n_a, (unsigned long long) n_b, want_fused ? 1 : 0, ctrl ? "changed (ok)" : "UNCHANGED");
+        if (ndiff) { fprintf(stderr, "FAIL nt=%lld: de-interleaved output differs\n", (long long) sh.nt); fails++; }
+        if (n_b != (want_fused ? 1u : 0u)) { fprintf(stderr, "FAIL nt=%lld: SIGMOID_MUL=%llu\n", (long long) sh.nt, (unsigned long long) n_b); fails++; }
+        if (!ctrl) { fprintf(stderr, "FAIL nt=%lld: positive control did not change the output\n", (long long) sh.nt); fails++; }
+        if (dump) fwrite(out_b.data(), 1, out_b.size(), dump);
+    }
+    if (dump) fclose(dump);
+    printf("wq-deint: %s (%d failing checks)\n", fails ? "FAIL" : "OK", fails);
+    return fails;
+}
+
+} // namespace wq_deint
+
+// ---------------------------------------------------------------------------------------------------------------------
+// ple-conv
+// LLAMA_PLE_CONV_FUSED + GGML_VK_PLE_CONV: the channels-first PLE tail fused, unfused and in the original token-major form must be
+// byte-equal; the tap sum in reverse order must differ (positive control). Skips without a Vulkan device.
+
+namespace ple_conv {
+
+typedef uint64_t (*census_count_t)(const char *);
+typedef void     (*census_reset_t)(void);
+typedef void     (*env_reload_t)(void);   // the backend reads its knobs once: re-read them after a change
+typedef const char * (*census_skip_t)(ggml_backend_t, const char *);
+
+static const int64_t K = 4, DIL = 3, HIST = (K - 1) * DIL;
+
+struct shape { int64_t c, t, s; };
+
+enum variant { ROWS, ROWS_REVERSED, ORIGINAL };
+
+struct inputs { std::vector<float> p, w, g, h; };   // p: channels first [c, HIST + t, s]; w: [K, c] as the file holds it
+
+static std::vector<uint8_t> run_case(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh, const inputs & in, variant v,
+                                const char * knob, uint64_t & n_fused) {
+    auto count = (census_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_count");
+    auto reset = (census_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_reset");
+    auto env_reload = (env_reload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_env_reload");
+    const int64_t C = sh.c, T = sh.t, S = sh.s, R = HIST + T;
+
+    ggml_init_params ip = { 96 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, C);
+    ggml_tensor * g  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, T, S);
+    ggml_tensor * h  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, T, S);
+    ggml_tensor * p  = v == ORIGINAL ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, R, C, S) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, R, S);
+    ggml_tensor * pin = ggml_scale(ctx, p, 1.0f);   // a computed padded buffer, as the model's concat is
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_tensor * out;
+    if (v == ORIGINAL) {
+        ggml_tensor * conv = nullptr;
+        for (int64_t k = 0; k < K; ++k) {
+            const int64_t start = HIST - (K - 1 - k) * DIL;
+            ggml_tensor * sh_k = ggml_cont(ctx, ggml_transpose(ctx, ggml_view_3d(ctx, pin, T, C, S, pin->nb[1], pin->nb[2], start * sizeof(float))));
+            ggml_tensor * wk = ggml_reshape_1d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, w, 1, C, w->nb[1], k * w->nb[0])), C);
+            ggml_tensor * term = ggml_mul(ctx, sh_k, wk);
+            conv = conv ? ggml_add(ctx, conv, term) : term;
+        }
+        conv = ggml_cont(ctx, ggml_silu(ctx, conv));
+        out = ggml_add(ctx, h, ggml_add(ctx, g, conv));
+    } else {
+        ggml_tensor * w_cf = ggml_cont(ctx, ggml_transpose(ctx, w));
+        std::vector<ggml_tensor *> taps, wks;
+        for (int64_t k = 0; k < K; ++k) {
+            const int64_t start = HIST - (K - 1 - k) * DIL;
+            taps.push_back(ggml_view_3d(ctx, pin, C, T, S, pin->nb[1], pin->nb[2], start * pin->nb[1]));
+            wks.push_back(ggml_view_1d(ctx, w_cf, C, k * w_cf->nb[1]));
+            ggml_build_forward_expand(gf, taps.back());
+            ggml_build_forward_expand(gf, wks.back());
+        }
+        ggml_tensor * conv = nullptr;
+        for (int64_t i = 0; i < K; ++i) {
+            const int64_t k = v == ROWS_REVERSED ? K - 1 - i : i;
+            ggml_tensor * term = ggml_mul(ctx, taps[k], wks[k]);
+            conv = conv ? ggml_add(ctx, conv, term) : term;
+        }
+        out = ggml_add(ctx, h, ggml_add(ctx, g, ggml_silu(ctx, conv)));
+    }
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    if (!buf) { fprintf(stderr, "FAIL: alloc\n"); exit(1); }
+
+    std::vector<float> pv(in.p.size());
+    if (v == ORIGINAL) {   // token-major copy of the same padded values
+        for (int64_t s = 0; s < S; ++s) for (int64_t r = 0; r < R; ++r) for (int64_t c = 0; c < C; ++c) {
+            pv[(s * C + c) * R + r] = in.p[(s * R + r) * C + c];
+        }
+    } else {
+        pv = in.p;
+    }
+    ggml_backend_tensor_set(p, pv.data(), 0, pv.size() * sizeof(float));
+    ggml_backend_tensor_set(w, in.w.data(), 0, in.w.size() * sizeof(float));
+    ggml_backend_tensor_set(g, in.g.data(), 0, in.g.size() * sizeof(float));
+    ggml_backend_tensor_set(h, in.h.data(), 0, in.h.size() * sizeof(float));
+    set_env("GGML_VK_PLE_CONV", knob);
+    if (env_reload) env_reload();
+    if (reset) reset();
+    ggml_backend_graph_compute(be, gf);
+    n_fused = count ? count("PLE_CONV_SILU_ADD") : 0;
+    std::vector<uint8_t> res(ggml_nbytes(out));
+    ggml_backend_tensor_get(out, res.data(), 0, res.size());
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return res;
+}
+
+static size_t ndiff(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
+    size_t n = 0;
+    for (size_t i = 0; i < a.size(); i += 4) n += memcmp(a.data() + i, b.data() + i, 4) != 0;
+    return n;
+}
+
+static int run(ggml_backend_t be, bool fusion) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(be));
+    const bool want_fused = fusion;
+    // a device that cannot run the fused path at all skips (the backend says why); with fusion disabled the cases still run
+    auto census_skip = (census_skip_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_skip");
+    const char * why = census_skip ? census_skip(be, "PLE_CONV_SILU_ADD") : nullptr;
+    if (why != nullptr && want_fused) {
+        printf("PLE_CONV_SILU_ADD not available on %s (%s), skipping\n", ggml_backend_name(be), why);
+        return 0;
+    }
+
+    // Flash-Next hc_dim 10240: decode, a small batch, a prefill ubatch; two sequences; an odd width
+    const shape shapes[] = { { 10240, 1, 1 }, { 10240, 7, 1 }, { 10240, 2048, 1 }, { 10240, 33, 2 }, { 1000, 5, 3 } };
+    int fails = 0;
+    for (const auto & sh : shapes) {
+        std::mt19937 rng(5 + (int) sh.t * 7 + (int) sh.s);
+        std::uniform_real_distribution<float> u(-2.0f, 2.0f);
+        inputs in;
+        in.p.resize(sh.c * (HIST + sh.t) * sh.s); in.w.resize(K * sh.c); in.g.resize(sh.c * sh.t * sh.s); in.h.resize(in.g.size());
+        for (auto * vec : { &in.p, &in.w, &in.g, &in.h }) for (auto & x : *vec) x = u(rng);
+
+        uint64_t n_on = 0, n_off = 0, n_orig = 0, n_rev = 0;
+        const auto on   = run_case(be, reg, sh, in, ROWS, "1", n_on);
+        const auto off  = run_case(be, reg, sh, in, ROWS, "0", n_off);
+        const auto orig = run_case(be, reg, sh, in, ORIGINAL, "1", n_orig);
+        const auto rev  = run_case(be, reg, sh, in, ROWS_REVERSED, "0", n_rev);
+        const size_t d_off = ndiff(on, off), d_orig = ndiff(on, orig), d_rev = ndiff(off, rev);
+        printf("c=%lld t=%lld s=%lld: fused vs unfused %zu, fused vs original %zu differ (of %zu); PLE_CONV_SILU_ADD on=%llu off=%llu "
+               "original=%llu (want %d/0/0); reversed-tap control %zu differ\n",
+               (long long) sh.c, (long long) sh.t, (long long) sh.s, d_off, d_orig, on.size() / 4, (unsigned long long) n_on,
+               (unsigned long long) n_off, (unsigned long long) n_orig, want_fused ? 1 : 0, d_rev);
+        if (d_off || d_orig) { fprintf(stderr, "FAIL t=%lld s=%lld: outputs differ\n", (long long) sh.t, (long long) sh.s); fails++; }
+        if (n_on != (want_fused ? 1u : 0u) || n_off != 0 || n_orig != 0) { fprintf(stderr, "FAIL t=%lld: fused dispatch counts\n", (long long) sh.t); fails++; }
+        if (!d_rev) { fprintf(stderr, "FAIL t=%lld: reversed-tap control unchanged\n", (long long) sh.t); fails++; }
+    }
+    printf("ple-conv: %s (%d failing checks)\n", fails ? "FAIL" : "OK", fails);
+    return fails;
+}
+
+} // namespace ple_conv
+
+// ---------------------------------------------------------------------------------------------------------------------
+// mmv-scale
+// MUL_MAT_VEC_SCALE (GGML_VK_MMV_SCALE) must be byte-equal with the separate SCALE: each case runs fused and unfused, checks the
+// fused dispatch count, and a scale one f32 ulp away (2^-10 for an f16 output) must change the output. Skips without Vulkan.
+
+namespace mmv_scale {
+
+typedef uint64_t (*census_count_t)(const char *);
+typedef void     (*census_reset_t)(void);
+typedef void     (*env_reload_t)(void);   // the backend reads its knobs once: re-read them after a change
+typedef const char * (*census_skip_t)(ggml_backend_t, const char *);
+
+// chain: 0 = SCALE -> SILU (the hc mix); 1 = SCALE -> CPY f16 (the scaled result stored as f16 after the f32 SCALE); 2 = the mat-vec
+// result cast to f16 and back before the SCALE (a mat-vec feeding a CPY16: not a MUL_MAT -> SCALE pair, must not fuse)
+struct shape { ggml_type ta; int64_t m, k, n; ggml_type tb; float scale, bias; bool expect_fused; const char * what; int chain = 0; };
+
+static std::vector<uint8_t> run_case(ggml_backend_t be, ggml_backend_reg_t reg, const shape & sh, float scale, const char * knob, uint64_t & n_fused,
+                                const std::vector<uint8_t> & wq, const std::vector<float> & xv) {
+    auto count = (census_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_count");
+    auto reset = (census_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_reset");
+    auto env_reload = (env_reload_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_env_reload");
+    ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, sh.ta, sh.k, sh.m);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, sh.tb, sh.k, sh.n);
+    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+    if (sh.chain == 2) {
+        y = ggml_cast(ctx, ggml_cast(ctx, y, GGML_TYPE_F16), GGML_TYPE_F32);
+    }
+    y = sh.bias != 0.0f ? ggml_scale_bias(ctx, y, scale, sh.bias) : ggml_scale(ctx, y, scale);
+    y = sh.chain == 1 ? ggml_cast(ctx, y, GGML_TYPE_F16) : ggml_silu(ctx, y);   // the hc mix's consumer, or an f16 store
+    ggml_set_output(y);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    if (!buf) { fprintf(stderr, "FAIL: alloc\n"); exit(1); }
+    ggml_backend_tensor_set(w, wq.data(), 0, wq.size());
+    if (sh.tb == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> h(xv.size());
+        for (size_t i = 0; i < xv.size(); ++i) h[i] = ggml_fp32_to_fp16(xv[i]);
+        ggml_backend_tensor_set(x, h.data(), 0, h.size() * sizeof(ggml_fp16_t));
+    } else {
+        ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
+    }
+    set_env("GGML_VK_MMV_SCALE", knob);
+    if (env_reload) env_reload();
+    if (reset) reset();
+    ggml_backend_graph_compute(be, gf);
+    n_fused = count ? count("MUL_MAT_VEC_SCALE") : 0;
+    std::vector<uint8_t> res(ggml_nbytes(y));
+    ggml_backend_tensor_get(y, res.data(), 0, res.size());
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return res;
+}
+
+static int run(ggml_backend_t be, bool fusion) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(be));
+    // a device that cannot run the fused path at all skips (the backend says why); with fusion disabled the cases still run
+    auto census_skip = (census_skip_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_skip");
+    const char * why = census_skip ? census_skip(be, "MUL_MAT_VEC_SCALE") : nullptr;
+    if (why != nullptr && fusion) {
+        printf("MUL_MAT_VEC_SCALE not available on %s (%s), skipping\n", ggml_backend_name(be), why);
+        return 0;
+    }
+
+    const shape shapes[] = {
+        { GGML_TYPE_Q8_0, 320, 10240, 1, GGML_TYPE_F32, 0.25f, 0.0f, true,  "FN hc down, decode" },
+        { GGML_TYPE_Q8_0, 320, 10240, 1, GGML_TYPE_F32, 0.3f,  0.0f, true,  "non power-of-two scale" },
+        { GGML_TYPE_Q8_0, 320, 10240, 1, GGML_TYPE_F16, 0.25f, 0.0f, true,  "f16 B" },
+        { GGML_TYPE_Q4_K, 640, 2560,  1, GGML_TYPE_F32, 0.25f, 0.0f, true,  "k-quant" },
+        { GGML_TYPE_Q8_0, 4099, 512,  1, GGML_TYPE_F32, 0.25f, 0.0f, true,  "odd row count" },
+        { GGML_TYPE_Q8_0, 320, 10240, 2, GGML_TYPE_F32, 0.25f, 0.0f, false, "two columns: declined" },
+        { GGML_TYPE_Q8_0, 320, 10240, 1, GGML_TYPE_F32, 0.25f, 0.5f, false, "scale_bias: declined" },
+        { GGML_TYPE_F16,  320, 10240, 1, GGML_TYPE_F32, 0.25f, 0.0f, false, "f16 weight: declined" },
+        // f16 outputs: ggml_mul_mat's dst is always f32, so an f16 result only appears after a CPY. Scaling first and casting after
+        // fuses (the cast reads the f32 scaled value either way); a mat-vec feeding a CPY16 before the SCALE is not a pair at all
+        { GGML_TYPE_Q8_0, 320, 10240, 1, GGML_TYPE_F32, 0.25f, 0.0f, true,  "SCALE -> CPY f16", 1 },
+        { GGML_TYPE_Q8_0, 320, 10240, 1, GGML_TYPE_F32, 0.25f, 0.0f, false, "mat-vec -> CPY16 -> SCALE", 2 },
+        // large K: the mat-vec never splits K across workgroups (one workgroup per row block reduces all of K: mul_mat_vec_base.glsl
+        // reduce_result, subgroupAdd then the shared-memory sum; the only other n=1 scratch path, transpose_d, is excluded once fused)
+        { GGML_TYPE_Q8_0, 320, 16384, 1, GGML_TYPE_F32, 0.25f, 0.0f, true,  "K 16384" },
+        { GGML_TYPE_Q8_0, 64,  65536, 1, GGML_TYPE_F32, 0.25f, 0.0f, true,  "K 65536" },
+    };
+    int fails = 0;
+    for (const auto & sh : shapes) {
+        std::mt19937 rng(11 + (int) sh.m + (int) sh.n * 3 + (int) sh.tb);
+        std::normal_distribution<float> dw(0.f, 0.05f), dx(0.f, 1.f);
+        std::vector<float> wf(sh.k * sh.m), xv(sh.k * sh.n);
+        for (auto & v : wf) v = dw(rng);
+        for (auto & v : xv) v = dx(rng);
+        std::vector<uint8_t> wq(ggml_row_size(sh.ta, sh.k) * sh.m);
+        ggml_quantize_chunk(sh.ta, wf.data(), wq.data(), 0, sh.m, sh.k, nullptr);
+        uint64_t n_on = 0, n_off = 0, n_ulp = 0;
+        const auto on  = run_case(be, reg, sh, sh.scale, "1", n_on, wq, xv);
+        const auto off = run_case(be, reg, sh, sh.scale, "0", n_off, wq, xv);
+        // the control's scale: one f32 ulp away, or for an f16 output the smallest step the f16 rounding cannot absorb (2^-10 relative)
+        const float s_ctl = sh.chain == 1 ? sh.scale * (1.0f + 1.0f / 1024) : std::nextafter(sh.scale, 1.0f);
+        const auto ulp = run_case(be, reg, sh, s_ctl, "1", n_ulp, wq, xv);
+        const size_t es = sh.chain == 1 ? 2 : 4;   // compare per output element
+        size_t nd = 0, nu = 0;
+        for (size_t i = 0; i < on.size(); i += es) { nd += memcmp(on.data() + i, off.data() + i, es) != 0; nu += memcmp(off.data() + i, ulp.data() + i, es) != 0; }
+        const uint64_t want = sh.expect_fused && fusion ? 1 : 0;
+        printf("%-24s %s m=%lld k=%lld n=%lld B=%s scale=%g bias=%g: fused vs unfused %s (%zu of %zu differ); MUL_MAT_VEC_SCALE on=%llu off=%llu "
+               "(want %llu/0); scale control (%s) %zu differ\n", sh.what, ggml_type_name(sh.ta), (long long) sh.m, (long long) sh.k, (long long) sh.n,
+               ggml_type_name(sh.tb), sh.scale, sh.bias, nd ? "DIFFER" : "byte-equal", nd, on.size() / es, (unsigned long long) n_on,
+               (unsigned long long) n_off, (unsigned long long) want, sh.chain == 1 ? "x(1+2^-10), f16 output" : "1 f32 ulp", nu);
+        if (nd) { fprintf(stderr, "FAIL %s: outputs differ\n", sh.what); fails++; }
+        if (n_on != want || n_off != 0) { fprintf(stderr, "FAIL %s: dispatch counts\n", sh.what); fails++; }
+        if (!nu) { fprintf(stderr, "FAIL %s: scale control unchanged\n", sh.what); fails++; }
+    }
+    printf("mmv-scale: %s (%d failing checks)\n", fails ? "FAIL" : "OK", fails);
+    return fails;
+}
+
+} // namespace mmv_scale
+
+// ---------------------------------------------------------------------------------------------------------------------
 // mmid-frag: MUL_MAT_ID output hashes and pf / _mf / REG_A path counts, compared across a default, a
 // GGML_VK_MMID_MANUAL_FRAG=0 and a GGML_VK_TEST_MF_SKEW=1 process: default == off, skew != off where _mf ran, mf == pf
 
@@ -844,6 +1224,9 @@ static const exact_group groups[] = {
     // the routed f16-B pf path (mul_mm.comp MMID_SCALE d16) for iq3_xxs (no int8 MMQ pipeline) and q6_K
     { "f16-store", true,  "iq3_xxs,q6_K", f16_store::run },
     { "hc-up-mix", true,  nullptr,        hc_up_mix::run },
+    { "wq-deint",  true,  nullptr,        wq_deint::run },
+    { "ple-conv",  true,  nullptr,        ple_conv::run },
+    { "mmv-scale", true,  nullptr,        mmv_scale::run },
     // every type here reaches the pipelines that have an "_mf" build
     { "mmid-frag", false, "all",          mmid_frag::run },
 };
@@ -856,7 +1239,7 @@ int main(int argc, char ** argv) {
             if (strcmp(argv[i], e.name) == 0) g = &e;
         }
         if (!g) {
-            fprintf(stderr, "usage: %s [f16-store] [hc-up-mix] [mmid-frag]\n", argv[0]);
+            fprintf(stderr, "usage: %s [f16-store] [hc-up-mix] [wq-deint] [ple-conv] [mmv-scale] [mmid-frag]\n", argv[0]);
             return 1;
         }
         sel.push_back(g);

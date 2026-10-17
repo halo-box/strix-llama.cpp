@@ -2582,6 +2582,13 @@ struct llama_model_qwen4exp : public llama_model_base {
     void prefetch_begin(std::unique_ptr<llama_model_prefetch> & state, const llama_batch & batch, uint32_t n_ubatch) const override;
     void prefetch_end(llama_model_prefetch * state) const override;
 
+    void load_arch_tensors_post() override;
+    const char * lora_refusal(const llama_adapter_lora & adapter) const override;
+
+    // wq holds [q | gate] per head; LLAMA_WQ_DEINTERLEAVE (default on) permutes its rows at load to [all q | all gate], so Qcur
+    // and the gate are plain views of Qcur_full. True when every attention wq was permuted
+    bool wq_deint = false;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
@@ -2675,14 +2682,16 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor * gdn_norm_pad_buf = nullptr;
         ggml_tensor * pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name);
 
-        // one conv history per cache tensor: delta-net and PLE each have their own
+        // one conv history per cache tensor (delta-net and PLE each have their own): [state_cols + T, channels, n_seqs], or with
+        // channels_first (x is [channels, T, n_seqs]) [channels, state_cols + T, n_seqs]; the cache layout is the same
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
-                            int   il);
+                            int   il,
+                           bool   channels_first = false);
 
         ggml_tensor * build_inp_ple(
   const llama_memory_hybrid_idx_context * mctx_hyb);

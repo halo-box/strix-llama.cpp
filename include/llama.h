@@ -749,6 +749,7 @@ extern "C" {
     // The following functions operate on a llama_context, hence the naming: llama_verb_...
 
     // Set LoRa adapters on the context. Will only modify if the adapters currently in context are different.
+    // Returns -1 and leaves the adapters unchanged when the model cannot take one of them.
     LLAMA_API int32_t llama_set_adapters_lora(
             struct llama_context * ctx,
             struct llama_adapter_lora ** adapters,

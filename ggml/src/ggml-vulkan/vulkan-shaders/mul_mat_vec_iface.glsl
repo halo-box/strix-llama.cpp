@@ -4,6 +4,7 @@
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_SCALE_PC 0x20   // non-ID: D = acc * p.fuse_scale + p.fuse_bias on the f32 result (MUL_MAT + SCALE, GGML_VK_MMV_SCALE)
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)
