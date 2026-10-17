@@ -779,6 +779,33 @@ llama_model_loader::llama_model_loader(
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+        // tensors with a shape are the complete tensor set of the model (e.g. common/exl3-dir.cpp), set_tensor_data fills them
+        // tensors without one only set the type of a tensor of a virtual model (tests/test-llama-archs.cpp)
+        const int64_t n_meta = gguf_get_n_tensors(metadata);
+        int64_t n_shaped = 0;
+        for (int64_t i = 0; i < n_meta; i++) {
+            const int64_t * ne = gguf_get_tensor_ne(metadata, i);
+            n_shaped += ne[0] > 0 && ne[1] > 0 && ne[2] > 0 && ne[3] > 0;
+        }
+        if (n_shaped > 0) {
+            if (n_shaped != n_meta) {
+                throw std::runtime_error(format("%s: %" PRId64 " of %" PRId64 " tensors in the metadata have no shape", __func__, n_meta - n_shaped, n_meta));
+            }
+            ggml_init_params params = { ggml_tensor_overhead()*(size_t) n_meta, NULL, true };
+            ggml_context * ctx = ggml_init(params);
+            contexts.emplace_back(ctx);
+            for (int64_t i = 0; i < n_meta; i++) {
+                ggml_tensor * cur = ggml_new_tensor(ctx, gguf_get_tensor_type(metadata, i), GGML_MAX_DIMS, gguf_get_tensor_ne(metadata, i));
+                ggml_set_name(cur, gguf_get_tensor_name(metadata, i));
+                if (weights_map.find(cur->name) != weights_map.end()) {
+                    throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
+                }
+                n_elements += ggml_nelements(cur);
+                n_bytes    += ggml_nbytes(cur);
+                weights_map.emplace(cur->name, llama_tensor_weight(nullptr, 0, metadata, cur));
+            }
+        }
     }
 
     n_kv      = gguf_get_n_kv(metadata);
@@ -1429,9 +1456,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return buft;
     };
 
-    if (files.empty()) {
+    // a virtual model: no file and no tensor set, every tensor is made with the shape the model asks for
+    if (files.empty() && weights_map.empty()) {
         if (hparams.exl3_codebook >= 0) {
-            throw std::runtime_error("EXL3 linears are only loaded from model files");
+            throw std::runtime_error("EXL3 linears are only loaded from a model file or a complete tensor set");
         }
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
