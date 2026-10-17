@@ -1323,6 +1323,8 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct vk_qsa_block_select_match;
+
 struct ggml_backend_vk_context {
     bool get_rows_flat {};   // the GET_ROWS being recorded uses the flat pipeline (ggml_vk_get_rows -> ggml_vk_op_f32 elements)
     std::string name;
@@ -1402,6 +1404,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_qsa_score {};        // QSA scorer: MUL_MAT + RELU + head sum (+ block bias) in the GEMM epilogue (GGML_VK_QSA_SCORE)
     bool fused_qsa_block_select {};   // A2: TOP_K .. CONCAT of qwen4exp_select_complete_blocks in one dispatch (GGML_VK_QSA_BLOCK_SELECT)
+    const vk_qsa_block_select_match * qsa_block_select_match {};   // graph_compute's match of that chain, read by the dispatch
     const ggml_tensor * qsa_score_bias {};
     bool fused_hc_post_gate {};
     // hc combine + next hc norm (dsv4_hc_post_norm.comp): HC_POST_NORM_* modes, 0 = none

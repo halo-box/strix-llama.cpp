@@ -15394,9 +15394,10 @@ static int ggml_vk_try_qsa_block_select(const ggml_backend_vk_context * ctx, con
 }
 
 static void ggml_vk_qsa_block_select(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
-    vk_qsa_block_select_match m;
-    const int last = ggml_vk_match_qsa_block_select(ctx, cgraph, node_idx, m);
-    GGML_ASSERT(last > node_idx && last == node_idx + ctx->num_additional_fused_ops);
+    GGML_UNUSED(cgraph);
+    GGML_ASSERT(ctx->qsa_block_select_match != nullptr);
+    const vk_qsa_block_select_match & m = *ctx->qsa_block_select_match;
+    GGML_ASSERT(m.last > node_idx && m.last == node_idx + ctx->num_additional_fused_ops);
 
     const uint32_t n_blocks = (uint32_t) m.score->ne[0];
     const uint32_t n_query  = (uint32_t) m.score->ne[1];
@@ -19347,6 +19348,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_qsa_score = false;
         ctx->fused_qsa_block_select = false;
+        ctx->qsa_block_select_match = nullptr;
         ctx->qsa_score_bias = nullptr;
         ctx->fused_hc_post_gate = false;
         ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
@@ -19588,6 +19590,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                                ggml_vk_try_qsa_block_select(ctx, cgraph, i, qsa_bs_match) : 0) {
                 ctx->num_additional_fused_ops = bs_last - i;
                 ctx->fused_qsa_block_select = true;
+                ctx->qsa_block_select_match = &qsa_bs_match;
                 fusion_string = "QSA_BLOCK_SELECT";
                 // reads the scores, the block cells and the tail, writes only the concat's destination
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
@@ -19717,6 +19720,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_qsa_score = false;
                 ctx->fused_qsa_block_select = false;
+                ctx->qsa_block_select_match = nullptr;
                 ctx->qsa_score_bias = nullptr;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
