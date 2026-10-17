@@ -15194,6 +15194,7 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
     if (topk_idx - node_idx > 10) {
         return reject("visibility window too long");
     }
+    const int topk_k = count;
     idxs[count] = topk_idx; ops[count] = topk->op; in[count++] = topk;
     const ggml_tensor * cells_view = nullptr;
     const ggml_tensor * concat     = nullptr;
@@ -15267,6 +15268,67 @@ static int ggml_vk_match_qsa_block_select(const ggml_backend_vk_context * ctx, c
         concat->type != GGML_TYPE_I32 || !ggml_is_contiguous(concat) || !in_chain(concat->src[0]) ||
         concat->ne[0] != r * budget + r - 1 || concat->ne[1] != n_query || concat->ne[2] != 1 || concat->ne[3] != n_stream) {
         return reject("cells / tail / concat shapes");
+    }
+    // the kernel hard-codes the chain's arithmetic: blocks sorted ascending, the cells gathered at the sorted blocks,
+    // valid = step(score + 1), cells (c + 1) * valid - 1, a dim-0 CONCAT; other op params keep the chain unfused
+    {
+        auto strip_reshapes = [](const ggml_tensor * t) {
+            while (t != nullptr && t->op == GGML_OP_RESHAPE) { t = t->src[0]; }
+            return t;
+        };
+        const ggml_tensor * sorted = nullptr;   // get_rows(view(cont(top_k)), argsort)
+        const ggml_tensor * picked = nullptr;   // get_rows(view(score), sorted)
+        const ggml_tensor * step   = nullptr;
+        int n_scale = 0, n_mul = 0, n_argsort = 0, n_get_rows = 0;
+        for (int k = topk_k + 1; k < count; ++k) {
+            const ggml_tensor * t = in[k];
+            bool ok = true;
+            switch (t->op) {
+                case GGML_OP_ARGSORT:
+                    ok = ggml_get_op_params_i32(t, 0) == GGML_SORT_ORDER_ASC && t->src[0]->op == GGML_OP_CPY &&
+                         strip_reshapes(t->src[0]->src[0]) != nullptr && strip_reshapes(t->src[0]->src[0])->op == GGML_OP_CONT &&
+                         strip_reshapes(t->src[0]->src[0])->src[0] == topk;
+                    n_argsort++;
+                    break;
+                case GGML_OP_GET_ROWS:
+                    if (sorted == nullptr) {
+                        ok = t->src[1]->op == GGML_OP_ARGSORT && t->src[0]->op == GGML_OP_VIEW && t->src[0]->src[0] != nullptr &&
+                             t->src[0]->src[0]->op == GGML_OP_CONT && t->src[0]->src[0]->src[0] == topk;
+                        sorted = t;
+                    } else if (t->src[0]->op == GGML_OP_VIEW && t->src[0]->src[0] == score) {
+                        ok = picked == nullptr && strip_reshapes(t->src[1]) == sorted;
+                        picked = t;
+                    } else {
+                        ok = t->src[0] == cells_view && strip_reshapes(t->src[1]) == sorted;
+                    }
+                    n_get_rows++;
+                    break;
+                case GGML_OP_SCALE:
+                    ok = ggml_get_op_params_f32(t, 0) == 1.0f &&
+                         ggml_get_op_params_f32(t, 1) == (t->src[0]->op == GGML_OP_MUL ? -1.0f : 1.0f);
+                    n_scale++;
+                    break;
+                case GGML_OP_UNARY:
+                    ok = step == nullptr && t->src[0]->op == GGML_OP_SCALE && picked != nullptr && t->src[0]->src[0] == picked;
+                    step = t;
+                    break;
+                case GGML_OP_MUL:
+                    ok = step != nullptr && t->src[1] == step && t->src[0]->op == GGML_OP_SCALE;
+                    n_mul++;
+                    break;
+                case GGML_OP_CONCAT:
+                    ok = ggml_get_op_params_i32(t, 0) == 0;
+                    break;
+                default:
+                    break;
+            }
+            if (!ok) {
+                return reject("op params differ from the chain the kernel implements");
+            }
+        }
+        if (n_argsort != 1 || n_get_rows != 3 || n_scale != 3 || n_mul != 1 || step == nullptr || picked == nullptr) {
+            return reject("op counts differ from the chain the kernel implements");
+        }
     }
     const int last = idxs[count - 1];
     // graph_compute keeps one source flag and one write-mask bit per fused node: at most 31 nodes behind the first
