@@ -42,8 +42,8 @@ layout (push_constant) uniform parameter
 #endif
 } p;
 
-// The value a column's result is stored as. MUL_MAT + SCALE (non-ID): the SCALE kernel's arithmetic on the f32 result the unfused
-// mat-vec would have stored (x * scale + bias), each step rounded on its own (precise: no fma contraction), so it is bit-exact
+// MUL_MAT + SCALE (non-ID): x * scale + bias on the f32 result, each step rounded (precise). Bit-exact only with bias == 0, as
+// scale.comp may contract x * s + b to one fma; the host declines a bias, so fuse_bias is reserved and always 0
 float mmv_epilogue(const FLOAT_TYPE v) {
     float r = float(v);
 #ifndef MUL_MAT_ID
