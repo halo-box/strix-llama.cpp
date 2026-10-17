@@ -16,6 +16,19 @@
 #include <random>
 #include <vector>
 
+// setenv / unsetenv are POSIX only; _putenv_s with an empty value removes the variable on Windows
+static void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 typedef uint64_t (*census_count_t)(const char *);
 typedef void     (*census_reset_t)(void);
 
@@ -50,7 +63,7 @@ static std::vector<uint8_t> run(ggml_backend_t be, ggml_backend_reg_t reg, const
     } else {
         ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
     }
-    setenv("GGML_VK_MMV_SCALE", knob, 1);
+    set_env("GGML_VK_MMV_SCALE", knob);
     if (reset) reset();
     ggml_backend_graph_compute(be, gf);
     n_fused = count ? count("MUL_MAT_VEC_SCALE") : 0;
