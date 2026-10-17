@@ -21,6 +21,7 @@ struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
 struct llama_hadamard;
+struct llama_exl3;
 
 class llama_moe_cache;
 
@@ -845,6 +846,8 @@ struct llm_graph_params {
 
     const llama_hadamard * hdmd = nullptr;
 
+    const llama_exl3 * exl3 = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llama_mtp_draft_vocab * mtp_draft; // MTP draft vocabulary subset of the context (nullptr = full vocabulary)
@@ -1112,6 +1115,8 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
+
+    const llama_exl3 * exl3;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

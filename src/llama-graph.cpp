@@ -1628,6 +1628,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    exl3             (params.exl3),
     samplers         (params.samplers),
     mtp_draft        (params.mtp_draft),
     prefetch         (params.prefetch),
@@ -1688,6 +1689,14 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    // an EXL3 weight has no scale tensor, and LoRA adapters cannot name it
+    if (exl3) {
+        if (const auto it = exl3->linears.find(w); it != exl3->linears.end()) {
+            GGML_ASSERT(w_s == nullptr);
+            return ggml_exl3_mul_mat(ctx0, w, cur, it->second.suh, it->second.svh, hparams.exl3_codebook);
+        }
+    }
+
     cur = build_hadamard_input(w, cur);
     if (vsub != nullptr && loras->empty()) {
         // Q8_0 2560x248320 with one output is byte-exact on gfx1151 HIP (2026-10-15).

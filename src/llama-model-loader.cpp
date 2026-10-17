@@ -1167,6 +1167,15 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             {
                 op_tensor = ggml_scale(ctx, w, 1.0f);
             } break;
+        case GGML_OP_EXL3_MUL_MAT:
+            {
+                // w is the trellis; the scales go to the same buffer type
+                const int64_t k = w->ne[2]*16;
+                ggml_tensor * suh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, k);
+                ggml_tensor * svh = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, w->ne[1]*16);
+                ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 512);
+                op_tensor = ggml_exl3_mul_mat(ctx, w, b, suh, svh, hparams.exl3_codebook);
+            } break;
         default:
             GGML_ABORT("%s: missing test for op %s for tensor %s", __func__, ggml_op_name(op), w->name);
     }
@@ -1236,6 +1245,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    bool is_exl3 = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
@@ -1322,6 +1332,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             op = GGML_OP_MUL_MAT_ID;
         } else {
             op = info.op;
+        }
+        if (is_exl3) {
+            op = GGML_OP_EXL3_MUL_MAT;
         }
 
         // sanity checks
@@ -1417,6 +1430,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     };
 
     if (files.empty()) {
+        if (hparams.exl3_codebook >= 0) {
+            throw std::runtime_error("EXL3 linears are only loaded from model files");
+        }
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
         }
@@ -1458,6 +1474,55 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
         return ret;
+    }
+
+    // EXL3 linear: "<name>.exl3_trellis/_suh/_svh" are in the file instead of "<name>.weight", the trellis stands for it
+    // this runs before the caller sees a missing weight, so an optional head is not replaced by the tied embedding
+    if (hparams.exl3_codebook >= 0 && tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {
+        const std::string name = tn.str();
+        const std::string base = name.substr(0, name.size() - strlen(".weight"));
+        const ggml_tensor * trellis = get_tensor_meta((base + ".exl3_trellis").c_str());
+        if (trellis != nullptr) {
+            const ggml_tensor * suh = get_tensor_meta((base + ".exl3_suh").c_str());
+            const ggml_tensor * svh = get_tensor_meta((base + ".exl3_svh").c_str());
+            const int64_t k  = ne.size() == 2 ? ne.begin()[0] : 0;
+            const int64_t n  = ne.size() == 2 ? ne.begin()[1] : 0;
+            const int64_t tw = trellis->ne[0];
+            // 16*K int16 per 16x16 tile: K = 1..8, or 1.5, 2.5, 3.5 with mul1
+            const bool rate_ok = (tw % 16 == 0 && tw >= 16 && tw <= 128) || (hparams.exl3_codebook == 2 && (tw == 24 || tw == 40 || tw == 56));
+            if (get_tensor_meta(name.c_str()) != nullptr || suh == nullptr || svh == nullptr || k <= 0 || n <= 0 ||
+                    k % 128 != 0 || n % 128 != 0 || trellis->type != GGML_TYPE_I16 || !rate_ok ||
+                    trellis->ne[1]*16 != n || trellis->ne[2]*16 != k || trellis->ne[3] != 1 ||
+                    suh->type != GGML_TYPE_F16 || suh->ne[0] != k || ggml_nelements(suh) != k ||
+                    svh->type != GGML_TYPE_F16 || svh->ne[0] != n || ggml_nelements(svh) != n) {
+                throw std::runtime_error(format("%s: EXL3 linear '%s' does not match the weight %s",
+                        __func__, base.c_str(), llama_format_tensor_shape(std::vector<int64_t>(ne)).c_str()));
+            }
+            if ((flags & (TENSOR_DUPLICATED | TENSOR_ALLOW_RESHAPE)) || llm_tensor_info_for(tn.tensor).op != GGML_OP_MUL_MAT) {
+                throw std::runtime_error(format("%s: EXL3 linear '%s' is not used as a plain matmul weight", __func__, base.c_str()));
+            }
+
+            ggml_tensor t_meta = *trellis;
+            is_exl3 = true;
+            ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+            is_exl3 = false;
+            if (buft == nullptr) {
+                // unused: buft_for_tensor counted the trellis
+                size_data -= ggml_nbytes(suh) + ggml_nbytes(svh);
+                n_created += 2;
+                return nullptr;
+            }
+
+            ggml_context * ctx = ctx_for_buft(buft);
+            ggml_tensor  * res = nullptr;
+            for (const ggml_tensor * meta : { trellis, suh, svh }) {
+                ggml_tensor * t = ggml_dup_tensor(ctx, meta);
+                ggml_set_name(t, ggml_get_name(meta));
+                res = res ? res : t;
+            }
+            n_created += 3;
+            return res;
+        }
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());

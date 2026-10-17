@@ -67,6 +67,16 @@ materializing `W`: `y = H(H(x * suh) W_hat) * svh / 128`, H the unnormalized 128
 table of `ggml_exl3_codebook_value`, so every weight is exact, and accumulates in f32: per 128 block, then across
 blocks. Other backends do not support the op yet.
 
+## Model loading (llama)
+
+`exl3.*` keys set `hparams.exl3_codebook`. `llama_model_loader::create_tensor` then takes `<name>.exl3_trellis`,
+`.exl3_suh` and `.exl3_svh` for a requested `<name>.weight` and returns the trellis as the weight. This happens
+before the caller sees a missing tensor, so an optional head is not replaced by the tied embedding. The buffer type
+is chosen with an `EXL3_MUL_MAT` probe. `build_lora_mm` makes `ggml_exl3_mul_mat` for such a weight (table
+`llama_model::exl3`), and a check on the reserved graph refuses any other op that reads a trellis. Supported archs:
+qwen35. EXL3 weights cannot be combined with LoRA adapters, prism.hadamard, the MTP draft vocabulary or a model
+built by `llama_model_init_from_user`.
+
 ## Tests
 
 - `test-exl3`: the three codebook tables, and all 27 rate x codebook cases on synthetic tiles, against hashes made
