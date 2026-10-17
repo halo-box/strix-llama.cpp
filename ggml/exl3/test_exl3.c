@@ -11,6 +11,8 @@
 // test-exl3                -> codebook tables, every rate x codebook on synthetic tiles, shape checks, op on synthetic tiles
 // test-exl3 --gguf FILE    -> decode every EXL3 linear of a GGUF container, one JSON line per tensor with sha256
 // test-exl3 --op-gguf FILE -> op on the first linear of each (k, n, K) in a GGUF container, at the decode and prompt row counts
+// test-exl3 --dequantize IN OUT -> plain GGUF reference of a container: each EXL3 linear becomes "<base>.weight" F32 from
+//                             ggml_exl3_dequantize, the exl3.* keys are dropped, all other keys and tensors are copied as they are
 
 #include "exl3.h"
 #include "ggml-alloc.h"
@@ -615,6 +617,159 @@ static int op_gguf(const char * path) {
     return n_fail != 0 || n_run == 0;
 }
 
+static bool write_zeros(FILE * f, size_t n) {
+    static const char zeros[64] = { 0 };
+    while (n > 0) {
+        const size_t m = n < sizeof(zeros) ? n : sizeof(zeros);
+        if (fwrite(zeros, 1, m, f) != m) {
+            return false;
+        }
+        n -= m;
+    }
+    return true;
+}
+
+static bool ends_with(const char * s, const char * suffix) {
+    const size_t ls = strlen(s);
+    const size_t lx = strlen(suffix);
+    return ls >= lx && strcmp(s + ls - lx, suffix) == 0;
+}
+
+static int dequantize_gguf(const char * path_in, const char * path_out) {
+    struct gguf_context * gctx = NULL;
+    struct ggml_context * meta = NULL;
+    const int cb = open_container(path_in, &gctx, &meta);
+    if (cb < 0) {
+        return 1;
+    }
+
+    struct gguf_context * out = gguf_init_empty();
+    gguf_set_kv(out, gctx);
+    for (int64_t i = 0; i < gguf_get_n_kv(gctx); i++) {
+        if (strncmp(gguf_get_key(gctx, i), "exl3.", 5) == 0) {
+            gguf_remove_key(out, gguf_get_key(gctx, i));
+        }
+    }
+
+    // tensor order of the container; the weight of a linear takes the place of its trellis
+    struct ggml_init_params params = { (size_t) gguf_get_n_tensors(gctx)*ggml_tensor_overhead(), NULL, true };
+    struct ggml_context * ctx_w = ggml_init(params);
+    int n_lin    = 0;
+    int n_scales = 0;
+    int n_err    = 0;
+    for (struct ggml_tensor * t = ggml_get_first_tensor(meta); t != NULL; t = ggml_get_next_tensor(meta, t)) {
+        char base[GGML_MAX_NAME];
+        char wname[GGML_MAX_NAME + 8];
+        struct ggml_tensor * su = NULL;
+        struct ggml_tensor * sv = NULL;
+        const int found = find_linear(meta, t, cb, base, &su, &sv);
+        if (found < 0) {
+            n_err++;
+        } else if (found > 0) {
+            snprintf(wname, sizeof(wname), "%s.weight", base);
+            if (gguf_find_tensor(gctx, wname) >= 0 || strlen(wname) >= GGML_MAX_NAME) {
+                fprintf(stderr, "%s: cannot add %s\n", path_in, wname);
+                n_err++;
+                continue;
+            }
+            struct ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, t->ne[2]*GGML_EXL3_TILE, t->ne[1]*GGML_EXL3_TILE);
+            ggml_set_name(w, wname);
+            gguf_add_tensor(out, w);
+            n_lin++;
+        } else if (ends_with(ggml_get_name(t), ".exl3_suh") || ends_with(ggml_get_name(t), ".exl3_svh")) {
+            n_scales++;
+        } else {
+            gguf_add_tensor(out, t);
+        }
+    }
+    if (n_err != 0 || n_lin == 0 || n_scales != 2*n_lin) {
+        fprintf(stderr, "%s: %d errors, %d linears, %d scale vectors\n", path_in, n_err, n_lin, n_scales);
+        return 1;
+    }
+
+    FILE * fi = fopen(path_in, "rb");
+    FILE * fo = fopen(path_out, "wb");
+    if (fi == NULL || fo == NULL) {
+        fprintf(stderr, "cannot open %s or %s\n", path_in, path_out);
+        return 1;
+    }
+    const size_t meta_size = gguf_get_meta_size(out);
+    void * md = malloc(meta_size);
+    gguf_get_meta_data(out, md);
+    bool ok = fwrite(md, 1, meta_size, fo) == meta_size;
+    free(md);
+
+    const size_t align = gguf_get_alignment(out);
+    size_t expected = meta_size;
+    for (int64_t i = 0; ok && i < gguf_get_n_tensors(out); i++) {
+        const char * name = gguf_get_tensor_name(out, i);
+        const size_t size = gguf_get_tensor_size(out, i);
+        char tname[GGML_MAX_NAME + 16];
+        snprintf(tname, sizeof(tname), "%.*s.exl3_trellis", (int) (strlen(name) - (ends_with(name, ".weight") ? strlen(".weight") : 0)), name);
+        struct ggml_tensor * t = ends_with(name, ".weight") ? ggml_get_tensor(meta, tname) : NULL;
+        if (t != NULL) {
+            char base[GGML_MAX_NAME];
+            struct ggml_tensor * su = NULL;
+            struct ggml_tensor * sv = NULL;
+            find_linear(meta, t, cb, base, &su, &sv);
+            const int64_t k = t->ne[2]*GGML_EXL3_TILE;
+            const int64_t n = t->ne[1]*GGML_EXL3_TILE;
+            int16_t     * trellis = (int16_t *)     read_tensor(fi, gctx, t);
+            ggml_fp16_t * suh     = (ggml_fp16_t *) read_tensor(fi, gctx, su);
+            ggml_fp16_t * svh     = (ggml_fp16_t *) read_tensor(fi, gctx, sv);
+            float       * w       = (float *)       malloc(k*n*sizeof(float));
+            float       * w_t     = (float *)       malloc(k*n*sizeof(float));
+            ok = trellis != NULL && suh != NULL && svh != NULL && w != NULL && w_t != NULL && size == (size_t) (k*n)*sizeof(float);
+            if (ok) {
+                // ggml rows are the n output columns of W
+                ggml_exl3_dequantize(trellis, suh, svh, k, n, t->ne[0], (enum ggml_exl3_codebook) cb, w);
+                for (int64_t r = 0; r < k; r++) {
+                    for (int64_t c = 0; c < n; c++) {
+                        w_t[c*k + r] = w[r*n + c];
+                    }
+                }
+                ok = fwrite(w_t, 1, size, fo) == size;
+            }
+            free(trellis);
+            free(suh);
+            free(svh);
+            free(w);
+            free(w_t);
+            fprintf(stderr, "%s: %s F32 [%lld, %lld]\n", path_out, name, (long long) k, (long long) n);
+        } else {
+            struct ggml_tensor * src = ggml_get_tensor(meta, name);
+            void * data = src != NULL && ggml_nbytes(src) == size ? read_tensor(fi, gctx, src) : NULL;
+            ok = data != NULL && fwrite(data, 1, size, fo) == size;
+            free(data);
+        }
+        ok = ok && write_zeros(fo, GGML_PAD(size, align) - size);
+        expected += GGML_PAD(size, align);
+    }
+    ok = ok && (size_t) ftell(fo) == expected;
+    ok = fclose(fo) == 0 && ok;
+    fclose(fi);
+
+    if (ok) {
+        // the written file must read back with the same tensor list
+        struct ggml_context * meta_out = NULL;
+        struct gguf_init_params rp = { true, &meta_out };
+        struct gguf_context * check = gguf_init_from_file(path_out, rp);
+        ok = check != NULL && gguf_get_n_tensors(check) == gguf_get_n_tensors(out) && gguf_get_data_offset(check) == meta_size;
+        if (check != NULL) {
+            gguf_free(check);
+            ggml_free(meta_out);
+        }
+    }
+    fprintf(stderr, "%s: %s, %d EXL3 linears dequantized, %lld tensors, %zu bytes\n", path_out, ok ? "OK" : "FAILED",
+            n_lin, (long long) gguf_get_n_tensors(out), expected);
+
+    gguf_free(out);
+    ggml_free(ctx_w);
+    gguf_free(gctx);
+    ggml_free(meta);
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     if (argc == 3 && strcmp(argv[1], "--gguf") == 0) {
         return check_gguf(argv[2]);
@@ -622,8 +777,11 @@ int main(int argc, char ** argv) {
     if (argc == 3 && strcmp(argv[1], "--op-gguf") == 0) {
         return op_gguf(argv[2]);
     }
+    if (argc == 4 && strcmp(argv[1], "--dequantize") == 0) {
+        return dequantize_gguf(argv[2], argv[3]);
+    }
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [--gguf FILE | --op-gguf FILE]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--gguf FILE | --op-gguf FILE | --dequantize IN OUT]\n", argv[0]);
         return 1;
     }
 
