@@ -65,7 +65,14 @@ diagonal; the tiles themselves are unchanged. Not supported yet, refused by the 
 materializing `W`: `y = H(H(x * suh) W_hat) * svh / 128`, H the unnormalized 128-point Hadamard. The CPU backend
 (`ggml/src/ggml-cpu/exl3-ops.cpp`, built with `GGML_EXL3=ON`) decodes `W_hat` tile by tile through a 65536-entry
 table of `ggml_exl3_codebook_value`, so every weight is exact, and accumulates in f32: per 128 block, then across
-blocks. Other backends do not support the op yet.
+blocks.
+
+The HIP backend (`ggml/src/ggml-cuda/exl3.cu`, built with `GGML_EXL3=ON`) runs the op on RDNA3 and RDNA4. It is
+adapted from the RDNA GEMV kernels of exllamav3 (MIT, see the file header). One kernel computes `H(x * suh)` in f32;
+the dot kernel decodes the trellis in registers to the exact codebook values, multiplies them with the f32
+activations (`v_fma_mix_f32`), and the last block to finish a 128-column segment applies `H` and `svh / 128` to it.
+One pass over the weights serves up to 8 rows; more rows run in groups of 8, one pass per group, which is slow for
+prompt processing. Other backends (CUDA, Vulkan, ...) do not support the op.
 
 ## Model loading (llama)
 

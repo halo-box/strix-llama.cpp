@@ -80,6 +80,9 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#ifdef GGML_USE_EXL3
+#include "ggml-cuda/exl3.cuh"
+#endif
 #include "ggml.h"
 
 #include <algorithm>
@@ -2764,6 +2767,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
+#ifdef GGML_USE_EXL3
+        case GGML_OP_EXL3_MUL_MAT:
+            ggml_cuda_op_exl3_mul_mat(ctx, dst);
+            break;
+#endif
         default:
             return false;
     }
@@ -9495,6 +9503,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+#ifdef GGML_USE_EXL3
+        case GGML_OP_EXL3_MUL_MAT:
+            return ggml_cuda_exl3_supports_op(dev_ctx->device, op);
+#endif
 
         default:
             return false;
