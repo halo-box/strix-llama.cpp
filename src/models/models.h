@@ -2569,6 +2569,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     void load_arch_tensors_post() override;
+    const char * lora_refusal(const llama_adapter_lora & adapter) const override;
 
     // wq holds [q | gate] per head; LLAMA_WQ_DEINTERLEAVE (default on) permutes its rows at load to [all q | all gate], so Qcur
     // and the gate are plain views of Qcur_full. True when every attention wq was permuted

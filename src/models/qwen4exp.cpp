@@ -637,6 +637,19 @@ void llama_model_qwen4exp::load_arch_tensors_post() {
     wq_deint = true;
 }
 
+// a LoRA delta on wq is in the file's row order, which a de-interleaved wq no longer has
+const char * llama_model_qwen4exp::lora_refusal(const llama_adapter_lora & adapter) const {
+    if (!wq_deint) {
+        return nullptr;
+    }
+    for (const auto & layer : layers) {
+        if (layer.wq != nullptr && adapter.ab_map.count(ggml_get_name(layer.wq)) > 0) {
+            return "it has a delta on attn_q, whose rows were de-interleaved at load (load the model with LLAMA_WQ_DEINTERLEAVE=0)";
+        }
+    }
+    return nullptr;
+}
+
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
@@ -1627,10 +1640,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         }
     }
 
-    // C3: with the rows de-interleaved at load, Qcur_full is [q (n_head * d) | gate (n_head * d)] per token. A LoRA delta on wq is in
-    // the file's row order, so a de-interleaved wq cannot take one.
+    // with the rows de-interleaved at load, Qcur_full is [q (n_head * d) | gate (n_head * d)] per token (lora_refusal keeps wq deltas out)
     const bool wq_deint = static_cast<const llama_model_qwen4exp &>(model).wq_deint;
-    GGML_ASSERT((!wq_deint || loras->empty()) && "LLAMA_WQ_DEINTERLEAVE permuted wq: run with LLAMA_WQ_DEINTERLEAVE=0 to use a LoRA adapter");
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]

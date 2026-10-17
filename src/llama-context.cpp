@@ -4555,6 +4555,14 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
+    for (size_t i = 0; i < n_adapters; ++i) {
+        const char * why = scales[i] != 0.0f ? ctx->get_model().lora_refusal(*adapters[i]) : nullptr;
+        if (why != nullptr) {
+            LLAMA_LOG_ERROR("%s: this model cannot take LoRA adapter %zu: %s\n", __func__, i, why);
+            return -1;
+        }
+    }
+
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;

@@ -900,6 +900,9 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // why this model cannot take the LoRA adapter, or nullptr when it can
+    virtual const char * lora_refusal(const llama_adapter_lora & /*adapter*/) const { return nullptr; }
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;
