@@ -102,6 +102,13 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// 7a (Gufo #603, hi5/ITEM7-DRAFT-POLICY.md 3a): keep the k-th draft token (k >= 1) of a chain whose kept tokens so far have the
+// top-1 probability product `acc`, when the candidate's top-1 probability is `p` and the threshold is `pcum` (0 = off).
+// The first draft is always kept; otherwise the token is kept iff acc * p >= pcum. A width-only rule: it never changes a token.
+static inline bool common_speculative_mtp_pcum_keep(float pcum, int k, float acc, float p) {
+    return pcum <= 0.0f || k <= 1 || acc * p >= pcum;
+}
+
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }
 };

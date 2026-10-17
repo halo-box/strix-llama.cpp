@@ -375,6 +375,10 @@ struct common_params_speculative_draft {
 
     // MTP only: draft over token ids < N plus control tokens (0 = full vocabulary)
     int32_t mtp_vocab = 0;
+    // MTP only (7a, Gufo #603): stop the draft chain before a token whose inclusion drops the product of the drafts' top-1
+    // probabilities below this (0 = off); the first draft token is always kept. Width-only: the emitted stream is unchanged
+    // (hi5/ITEM7-DRAFT-POLICY.md section 1) when the verify batch computes each row as the one-row decode does.
+    float mtp_pcum = 0.0f;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
