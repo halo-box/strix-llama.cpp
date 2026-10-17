@@ -19716,11 +19716,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_qsa_score = false;
-        ctx->fused_qsa_block_select = false;
+                ctx->fused_qsa_block_select = false;
                 ctx->qsa_score_bias = nullptr;
-        ctx->fused_qsa_score = false;
-        ctx->fused_qsa_block_select = false;
-        ctx->qsa_score_bias = nullptr;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
                 ctx->fused_mm_cpy16 = false;
