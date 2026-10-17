@@ -28,6 +28,8 @@ if 'NO_LOCAL_GGUF' not in os.environ:
 import gguf
 from gguf.vocab import MistralTokenizerType, MistralVocab
 
+from .exl3 import add_exl3_metadata, write_exl3_tensors
+
 try:
     from mistral_common.tokens.tokenizers.base import TokenizerVersion # type: ignore[import-not-found, ty:unresolved-import]
     from mistral_common.tokens.tokenizers.multimodal import DATASET_MEAN as _MISTRAL_COMMON_DATASET_MEAN, DATASET_STD as _MISTRAL_COMMON_DATASET_STD # type: ignore[import-not-found, ty:unresolved-import]
@@ -121,6 +123,11 @@ class ModelBase:
     mtp_only: bool = False
     no_mtp: bool = False
     mtp_shared_embd: bool = False
+
+    # EXL3 (exllamav3) checkpoints, set by write_exl3_tensors
+    exl3_codebook: str | None = None
+    exl3_permuted: list[str] = []
+    exl3_permutation: str = ""
 
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
@@ -571,6 +578,8 @@ class ModelBase:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
             elif quant_method == "modelopt":
                 dequant_fp8()
+            elif quant_method == "exl3":
+                pass  # the payloads are already written by write_exl3_tensors
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
 
@@ -618,6 +627,10 @@ class ModelBase:
             if bid is not None:
                 return False
         return name == (key_name + suffix)
+
+    def exl3_block_permutation(self, name: str, k: int, n: int) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Reorder of the 128-blocks of an EXL3 linear on the input (k) and output (n) side, or None."""
+        return None, None
 
     def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str:
         new_name = self.tensor_map.get_name(key=name, try_suffixes=try_suffixes)
@@ -1209,6 +1222,10 @@ class ModelBase:
                             self.model_tensors[input_scale_name] = inverse_scale(self.model_tensors.pop(name))
             self._generate_nvfp4_tensors()
 
+        # EXL3 payloads are copied as they are, before dequant_model sees the checkpoint
+        if quant_method == "exl3":
+            write_exl3_tensors(self)
+
         self.dequant_model()
 
         self.prepare_qkv_fusion()
@@ -1303,6 +1320,10 @@ class ModelBase:
                         # TODO: use Q4_K and Q6_K
                         data_qtype = gguf.GGMLQuantizationType.F16
 
+                # EXL3 checkpoints keep the stored type of the tensors that are not EXL3 payloads
+                if data_qtype is False and self.exl3_codebook is not None and old_dtype in (torch.float16, torch.bfloat16):
+                    data_qtype = gguf.GGMLQuantizationType.F16 if old_dtype == torch.float16 else gguf.GGMLQuantizationType.BF16
+
                 # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
                 if isinstance(data_qtype, bool):
                     if self.ftype == gguf.LlamaFileType.ALL_F32:
@@ -1387,6 +1408,9 @@ class ModelBase:
         self.gguf_writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
 
         self.add_hadamard_metadata()
+
+        if self.exl3_codebook is not None:
+            add_exl3_metadata(self, self.hparams["quantization_config"])
 
         if self._prec_a4:
             names = sorted(self._prec_a4.keys())
@@ -2973,6 +2997,7 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.float16: np.float16,
         torch.float32: np.float32,
         torch.uint8: np.uint8,
+        torch.int16: np.int16,
         torch.int64: np.int64,
     }
 

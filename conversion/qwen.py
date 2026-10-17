@@ -587,6 +587,32 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         weight, scale = self._transform_nvfp4_weight(name, weight, scale)
         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)
 
+    exl3_permutation = "linear_attn_v_heads_grouped_to_tiled"
+
+    def exl3_block_permutation(self, name: str, k: int, n: int) -> tuple[np.ndarray | None, np.ndarray | None]:
+        # the V head reorder of modify_tensors, on whole 128-blocks of the EXL3 linear
+        num_k_heads = self.hparams.get("linear_num_key_heads", 0)
+        num_v_heads = self.hparams.get("linear_num_value_heads", 0)
+        if num_k_heads <= 0 or num_v_heads <= 0 or num_k_heads == num_v_heads or "linear_attn." not in name:
+            return None, None
+
+        head_k_dim = self.hparams["linear_key_head_dim"]
+        head_v_dim = self.hparams["linear_value_head_dim"]
+        qk_dim = 2 * head_k_dim * num_k_heads
+        v_dim = num_v_heads * head_v_dim
+        if head_v_dim % 128 != 0 or qk_dim % 128 != 0:
+            raise NotImplementedError(f"{name}: V heads of {head_v_dim} do not fill whole EXL3 128-blocks")
+        v_perm = self._reorder_v_heads(torch.arange(v_dim // 128).unsqueeze(-1), 0, num_k_heads,
+                                       num_v_heads // num_k_heads, head_v_dim // 128).squeeze(-1).numpy()
+
+        if name.endswith(".in_proj_qkv") and n == qk_dim + v_dim:
+            return None, np.concatenate([np.arange(qk_dim // 128), qk_dim // 128 + v_perm])
+        if name.endswith(".in_proj_z") and n == v_dim:
+            return None, v_perm
+        if name.endswith(".out_proj") and k == v_dim:
+            return v_perm, None
+        raise NotImplementedError(f"{name}: no EXL3 V head reorder for this projection ({k} x {n})")
+
     def _hadamard_folds_tensor(self, name: str) -> bool:
         # a manifest name and `name` can differ only by leading wrapper prefixes
         return any(name.endswith(n) or n.endswith(name) for n in self.hadamard_folded_names())

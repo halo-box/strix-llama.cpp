@@ -524,6 +524,14 @@ class Keys:
     class AgentionTrellis:
         STATE_BITS = "agention.trellis.state_bits"  # uint32; TQ2_T / TQK / TQP files must say 15
 
+    class Exl3:
+        VERSION             = "exl3.version"
+        CODEBOOK            = "exl3.codebook"
+        HADAMARD_SIZE       = "exl3.hadamard_size"
+        PERMUTATION         = "exl3.permutation"
+        PERMUTED_TENSORS    = "exl3.permuted_tensors"
+        SOURCE_QUANT_CONFIG = "exl3.source.quantization_config"
+
 
 #
 # recommended mapping of model tensor names for storage in gguf
