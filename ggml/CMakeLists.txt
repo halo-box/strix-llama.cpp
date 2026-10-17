@@ -191,6 +191,7 @@ option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggm
 # trellis weight types PTQ1_0 / TQ2_T / TQK6/7 / TQP5/6/7: backend kernels and tests.
 # OFF: the types stay known (type ids, names, sizes, CPU reference quantize/dequantize), but no backend runs them.
 option(GGML_TRELLIS                         "ggml: enable trellis weight type kernels (PTQ1_0, TQ2_T, TQK6/7, TQP5/6/7)" ON)
+option(GGML_EXL3                            "ggml: build the EXL3 (exllamav3) trellis decoder" OFF)
 
 # 3rd party libs / backends
 option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               ON)

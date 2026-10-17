@@ -1,0 +1,316 @@
+// EXL3 decode self-test.
+//
+// The golden hashes come from exllamav3 tests/testlib/trellis.py (a3bfbfd0d3c0cea67815146a19fcd2bb3f84709a) on the
+// same xorshift32 inputs: decode() for the codebook tables, dequant_rotated() for W_hat. The W golden is the f32 rounding
+// of diag(suh) H W_hat H diag(svh) evaluated exactly (integers) on that W_hat; the float64 dequant() of the oracle
+// differs from it only by its own rounding (160 of the 884736 values, by one f32 ulp or near zero).
+//
+// test-exl3                -> codebook tables, every rate x codebook on synthetic tiles, shape checks
+// test-exl3 --gguf FILE    -> decode every EXL3 linear of a GGUF container, one JSON line per tensor with sha256
+
+#include "exl3.h"
+#include "gguf.h"
+#include "hash/sha256/sha256.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(_WIN32)
+#    define exl3_fseek(f, off) _fseeki64(f, (__int64) (off), SEEK_SET)
+#else
+#    include <sys/types.h>
+#    define exl3_fseek(f, off) fseeko(f, (off_t) (off), SEEK_SET)
+#endif
+
+static uint64_t fnv1a64(const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+static uint32_t xorshift32(uint32_t * s) {
+    uint32_t x = *s;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *s = x;
+    return x;
+}
+
+// normal fp16 with magnitude in [2^-5, 2^2)
+static ggml_fp16_t rand_f16(uint32_t * s) {
+    const uint32_t r = xorshift32(s);
+    const uint16_t bits = (uint16_t) (((r >> 31) << 15) | ((10 + (r >> 8) % 7) << 10) | (r & 0x3ff));
+    ggml_fp16_t h;
+    memcpy(&h, &bits, sizeof(h));
+    return h;
+}
+
+static const struct { int cb; uint64_t hash; } codebook_goldens[] = {
+    { 0, 0xfad431e7e9266898ull }, // 3inst
+    { 1, 0x7bb36b05a3b885a7ull }, // mcg
+    { 2, 0x55e1c748ed9f0cd7ull }, // mul1
+};
+
+static const struct { int tile_words; int cb; uint64_t w_hat; uint64_t w; } tile_goldens[] = {
+    {  16, 0, 0x74e599a34f95e431ull, 0x6cc7a0e65db6ddbdull },
+    {  16, 1, 0xe4fe1f740825c2bfull, 0xc8a833ae9e6d2e03ull },
+    {  16, 2, 0x87e6960dc9eeacd5ull, 0xd5ce1a6ba594d3acull },
+    {  24, 2, 0x440f66937a6e7d8cull, 0xad41919a4971d0c7ull },
+    {  32, 0, 0xd93db145e8ac28dbull, 0x8af112811c15655eull },
+    {  32, 1, 0x373667cf0a675e92ull, 0x79f9d2696e16af78ull },
+    {  32, 2, 0xed50e4d2c8f993dbull, 0xb73f4d3bebbd4606ull },
+    {  40, 2, 0x844b9f574394ed7cull, 0x0182743d4a3081adull },
+    {  48, 0, 0xf0016aa51bcbb576ull, 0x148462040b4a30d3ull },
+    {  48, 1, 0xdd4f427e2c2a6c6dull, 0x3653cd2ed1650618ull },
+    {  48, 2, 0x968f15287bed92e6ull, 0xb5926e8935fc0033ull },
+    {  56, 2, 0x4981dd0f8cde68a4ull, 0x99f9eabef86c6a0aull },
+    {  64, 0, 0x0522a294340a1828ull, 0xba4288e2fa48bccbull },
+    {  64, 1, 0x33aa888f7a3390d7ull, 0x7d4776b7b2095931ull },
+    {  64, 2, 0xb43dfb8577e89638ull, 0xb0d422c4cffefd73ull },
+    {  80, 0, 0x1ea2f7218ebac349ull, 0x9d704cfba626fe3eull },
+    {  80, 1, 0x0b279a2f23f01490ull, 0x860a49203c03ba58ull },
+    {  80, 2, 0xcbf9350492d69652ull, 0x15abe1e1fad48785ull },
+    {  96, 0, 0x75633b219d9c9dadull, 0xd9e875175a1cdc23ull },
+    {  96, 1, 0x215a9dcf441b3103ull, 0x244fb85fe437c023ull },
+    {  96, 2, 0x20e48230b3c615adull, 0xd70d6ea444373454ull },
+    { 112, 0, 0x5cc35dbd721343ebull, 0x1c153687c1ec1320ull },
+    { 112, 1, 0xdb4ab36b0cb0454cull, 0x0769f5ac9078d700ull },
+    { 112, 2, 0x1609d106d33f95f2ull, 0x73bc3ca6ff1afa49ull },
+    { 128, 0, 0xb1c9efecd1e72ad1ull, 0xe56e8502e9afb882ull },
+    { 128, 1, 0x783e7a28d589bc43ull, 0xa2226052a3c22aa1ull },
+    { 128, 2, 0xc1ceac9d5293bbffull, 0x914b948352a7c99dull },
+};
+
+static int test_codebooks(void) {
+    int n_fail = 0;
+    ggml_fp16_t * table = (ggml_fp16_t *) malloc(65536*sizeof(ggml_fp16_t));
+    for (size_t i = 0; i < sizeof(codebook_goldens)/sizeof(codebook_goldens[0]); i++) {
+        const enum ggml_exl3_codebook cb = (enum ggml_exl3_codebook) codebook_goldens[i].cb;
+        for (uint32_t s = 0; s < 65536; s++) {
+            table[s] = ggml_exl3_codebook_value((uint16_t) s, cb);
+        }
+        const uint64_t h = fnv1a64(table, 65536*sizeof(ggml_fp16_t));
+        if (h != codebook_goldens[i].hash) {
+            fprintf(stderr, "codebook %s: hash %016llx, expected %016llx\n", ggml_exl3_codebook_name(cb),
+                    (unsigned long long) h, (unsigned long long) codebook_goldens[i].hash);
+            n_fail++;
+        }
+    }
+    free(table);
+    return n_fail;
+}
+
+static int test_tiles(void) {
+    const int64_t tk = 8;
+    const int64_t tn = 16;
+    const int64_t k  = tk*16;
+    const int64_t n  = tn*16;
+
+    int n_fail = 0;
+    ggml_fp16_t * w_hat = (ggml_fp16_t *) malloc(k*n*sizeof(ggml_fp16_t));
+    float       * w     = (float *)       malloc(k*n*sizeof(float));
+    int16_t     * trellis = (int16_t *)   malloc(tk*tn*128*sizeof(int16_t));
+    ggml_fp16_t suh[128];
+    ggml_fp16_t svh[256];
+
+    for (size_t i = 0; i < sizeof(tile_goldens)/sizeof(tile_goldens[0]); i++) {
+        const int tile_words = tile_goldens[i].tile_words;
+        const enum ggml_exl3_codebook cb = (enum ggml_exl3_codebook) tile_goldens[i].cb;
+
+        uint32_t s = 0x12345678u + 0x9E3779B9u*(uint32_t) (tile_words*4 + cb);
+        if (s == 0) {
+            s = 1;
+        }
+        for (int64_t j = 0; j < tk*tn*tile_words; j++) {
+            trellis[j] = (int16_t) (uint16_t) (xorshift32(&s) >> 16);
+        }
+        for (int64_t j = 0; j < k; j++) {
+            suh[j] = rand_f16(&s);
+        }
+        for (int64_t j = 0; j < n; j++) {
+            svh[j] = rand_f16(&s);
+        }
+
+        ggml_exl3_decode_rotated(trellis, k, n, tile_words, cb, w_hat);
+        ggml_exl3_dequantize(trellis, suh, svh, k, n, tile_words, cb, w);
+
+        const uint64_t h_hat = fnv1a64(w_hat, k*n*sizeof(ggml_fp16_t));
+        const uint64_t h_w   = fnv1a64(w, k*n*sizeof(float));
+        if (h_hat != tile_goldens[i].w_hat || h_w != tile_goldens[i].w) {
+            fprintf(stderr, "K = %.1f %s: W_hat %016llx (expected %016llx), W %016llx (expected %016llx)\n",
+                    tile_words/16.0, ggml_exl3_codebook_name(cb),
+                    (unsigned long long) h_hat, (unsigned long long) tile_goldens[i].w_hat,
+                    (unsigned long long) h_w, (unsigned long long) tile_goldens[i].w);
+            n_fail++;
+        }
+    }
+
+    free(trellis);
+    free(w);
+    free(w_hat);
+    return n_fail;
+}
+
+static int test_checks(void) {
+    int n_fail = 0;
+
+    n_fail += !ggml_exl3_rate_supported(64, GGML_EXL3_CODEBOOK_MCG);
+    n_fail +=  ggml_exl3_rate_supported(40, GGML_EXL3_CODEBOOK_MCG);  // half rates need mul1
+    n_fail += !ggml_exl3_rate_supported(40, GGML_EXL3_CODEBOOK_MUL1);
+    n_fail +=  ggml_exl3_rate_supported(72, GGML_EXL3_CODEBOOK_MUL1); // K = 4.5
+    n_fail +=  ggml_exl3_rate_supported(144, GGML_EXL3_CODEBOOK_MUL1);
+
+    struct ggml_init_params params = { 16*ggml_tensor_overhead(), NULL, true };
+    struct ggml_context * ctx = ggml_init(params);
+    struct ggml_tensor * trellis = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 64, 512, 160); // k = 2560, n = 8192, K = 4
+    struct ggml_tensor * suh     = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 2560);
+    struct ggml_tensor * svh     = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 8192);
+    struct ggml_tensor * bad     = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 8192 - 128);
+    struct ggml_tensor * odd     = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 64, 512, 161);
+
+    n_fail += !ggml_exl3_check_linear(trellis, suh, svh, GGML_EXL3_CODEBOOK_MCG);
+    n_fail +=  ggml_exl3_check_linear(trellis, suh, bad, GGML_EXL3_CODEBOOK_MCG);
+    n_fail +=  ggml_exl3_check_linear(trellis, svh, suh, GGML_EXL3_CODEBOOK_MCG);
+    n_fail +=  ggml_exl3_check_linear(odd,     suh, svh, GGML_EXL3_CODEBOOK_MCG);
+    ggml_free(ctx);
+
+    if (n_fail) {
+        fprintf(stderr, "shape/rate checks: %d failures\n", n_fail);
+    }
+    return n_fail;
+}
+
+static void sha256_hex(const void * data, size_t n, char * out) {
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    sha256_hash(digest, (const unsigned char *) data, n);
+    for (int i = 0; i < SHA256_DIGEST_SIZE; i++) {
+        snprintf(out + 2*i, 3, "%02x", digest[i]);
+    }
+}
+
+static void * read_tensor(FILE * f, const struct gguf_context * gctx, const struct ggml_tensor * t) {
+    const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
+    const size_t  nb  = ggml_nbytes(t);
+    void * buf = malloc(nb);
+    if (tid < 0 || buf == NULL || exl3_fseek(f, gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid)) != 0 ||
+            fread(buf, 1, nb, f) != nb) {
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+static int check_gguf(const char * path) {
+    struct ggml_context * meta = NULL;
+    struct gguf_init_params params = { true, &meta };
+    struct gguf_context * gctx = gguf_init_from_file(path, params);
+    if (gctx == NULL) {
+        fprintf(stderr, "%s: cannot read GGUF\n", path);
+        return 1;
+    }
+
+    const int64_t kid_ver = gguf_find_key(gctx, "exl3.version");
+    const int64_t kid_cb  = gguf_find_key(gctx, "exl3.codebook");
+    if (kid_ver < 0 || gguf_get_kv_type(gctx, kid_ver) != GGUF_TYPE_UINT32 || gguf_get_val_u32(gctx, kid_ver) != 1 ||
+            kid_cb < 0 || gguf_get_kv_type(gctx, kid_cb) != GGUF_TYPE_STRING) {
+        fprintf(stderr, "%s: missing or unsupported exl3.version / exl3.codebook\n", path);
+        return 1;
+    }
+    const int cb = ggml_exl3_codebook_from_name(gguf_get_val_str(gctx, kid_cb));
+    if (cb < 0) {
+        fprintf(stderr, "%s: unknown exl3.codebook %s\n", path, gguf_get_val_str(gctx, kid_cb));
+        return 1;
+    }
+
+    FILE * f = fopen(path, "rb");
+    if (f == NULL) {
+        return 1;
+    }
+
+    int n_mod = 0;
+    int n_err = 0;
+    const char * suffix = ".exl3_trellis";
+    for (struct ggml_tensor * t = ggml_get_first_tensor(meta); t != NULL; t = ggml_get_next_tensor(meta, t)) {
+        const char * name = ggml_get_name(t);
+        const size_t len = strlen(name);
+        if (len <= strlen(suffix) || strcmp(name + len - strlen(suffix), suffix) != 0) {
+            continue;
+        }
+        char base[GGML_MAX_NAME];
+        char name_su[GGML_MAX_NAME + 16];
+        char name_sv[GGML_MAX_NAME + 16];
+        snprintf(base, sizeof(base), "%.*s", (int) (len - strlen(suffix)), name);
+        snprintf(name_su, sizeof(name_su), "%s.exl3_suh", base);
+        snprintf(name_sv, sizeof(name_sv), "%s.exl3_svh", base);
+        struct ggml_tensor * su = ggml_get_tensor(meta, name_su);
+        struct ggml_tensor * sv = ggml_get_tensor(meta, name_sv);
+        if (su == NULL || sv == NULL || !ggml_exl3_check_linear(t, su, sv, (enum ggml_exl3_codebook) cb)) {
+            fprintf(stderr, "%s: bad EXL3 linear\n", base);
+            n_err++;
+            continue;
+        }
+
+        const int64_t k = t->ne[2]*GGML_EXL3_TILE;
+        const int64_t n = t->ne[1]*GGML_EXL3_TILE;
+        int16_t     * trellis = (int16_t *)     read_tensor(f, gctx, t);
+        ggml_fp16_t * suh     = (ggml_fp16_t *) read_tensor(f, gctx, su);
+        ggml_fp16_t * svh     = (ggml_fp16_t *) read_tensor(f, gctx, sv);
+        ggml_fp16_t * w_hat   = (ggml_fp16_t *) malloc(k*n*sizeof(ggml_fp16_t));
+        float       * w       = (float *)       malloc(k*n*sizeof(float));
+        if (trellis == NULL || suh == NULL || svh == NULL || w_hat == NULL || w == NULL) {
+            fprintf(stderr, "%s: read or alloc failed\n", base);
+            n_err++;
+        } else {
+            char h_trellis[65], h_hat[65], h_w[65];
+            ggml_exl3_decode_rotated(trellis, k, n, t->ne[0], (enum ggml_exl3_codebook) cb, w_hat);
+            ggml_exl3_dequantize(trellis, suh, svh, k, n, t->ne[0], (enum ggml_exl3_codebook) cb, w);
+            sha256_hex(trellis, ggml_nbytes(t), h_trellis);
+            sha256_hex(w_hat, k*n*sizeof(ggml_fp16_t), h_hat);
+            sha256_hex(w, k*n*sizeof(float), h_w);
+            printf("{\"tensor\": \"%s\", \"k\": %lld, \"n\": %lld, \"tile_words\": %lld, \"codebook\": \"%s\", "
+                   "\"trellis_sha256\": \"%s\", \"w_hat_f16_sha256\": \"%s\", \"w_f32_sha256\": \"%s\"}\n",
+                   base, (long long) k, (long long) n, (long long) t->ne[0], ggml_exl3_codebook_name((enum ggml_exl3_codebook) cb),
+                   h_trellis, h_hat, h_w);
+            fflush(stdout);
+            n_mod++;
+        }
+        free(trellis);
+        free(suh);
+        free(svh);
+        free(w_hat);
+        free(w);
+    }
+
+    fclose(f);
+    gguf_free(gctx);
+    ggml_free(meta);
+    fprintf(stderr, "%s: %d EXL3 linears decoded, %d errors\n", path, n_mod, n_err);
+    return n_err != 0 || n_mod == 0;
+}
+
+int main(int argc, char ** argv) {
+    if (argc == 3 && strcmp(argv[1], "--gguf") == 0) {
+        return check_gguf(argv[2]);
+    }
+    if (argc != 1) {
+        fprintf(stderr, "usage: %s [--gguf FILE]\n", argv[0]);
+        return 1;
+    }
+
+    int n_fail = 0;
+    n_fail += test_codebooks();
+    n_fail += test_tiles();
+    n_fail += test_checks();
+    if (n_fail) {
+        fprintf(stderr, "test-exl3: %d failures\n", n_fail);
+        return 1;
+    }
+    printf("test-exl3: OK (3 codebooks, %d rate x codebook cases)\n", (int) (sizeof(tile_goldens)/sizeof(tile_goldens[0])));
+    return 0;
+}
