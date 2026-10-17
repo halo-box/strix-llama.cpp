@@ -1,4 +1,13 @@
 
+// f16 rope outputs (ROPE_D_F16: the KV-cache writes of RMS_NORM_MUL_ROPE(_VIEW_SET_ROWS) / ROPE_VIEW_SET_ROWS): equal to the
+// f32 rope stored, then SET_ROWS / CPY to f16. Written plainly, the compiler may fold the last multiply-add and the conversion
+// into one single-rounding mixed-precision op; the value goes through an XOR with a push-constant zero first (is_back is 0 or 1).
+#ifdef ROPE_D_F16
+#define ROPE_STORE(x) ROPE_D_TYPE(uintBitsToFloat(floatBitsToUint(x) ^ (p.is_back & ~1u)))
+#else
+#define ROPE_STORE(x) ROPE_D_TYPE(x)
+#endif
+
 float rope_yarn_ramp(const float low, const float high, const uint i0) {
     const float y = (i0 / 2 - low) / max(0.001f, high - low);
     return 1.0f - min(1.0f, max(0.0f, y));
@@ -69,8 +78,8 @@ void rope_norm(const uint i0, const uint i1, const uint i2, const uint i3, rope_
     const float x0 = float(rope_data_a[ix + 0]);
     const float x1 = float(rope_data_a[ix + 1]);
 
-    rope_data_d[idst + 0] = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
-    rope_data_d[idst + 1] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
+    rope_data_d[idst + 0] = ROPE_STORE(x0*cos_theta - x1*sin_theta);
+    rope_data_d[idst + 1] = ROPE_STORE(x0*sin_theta + x1*cos_theta);
 }
 
 void rope_neox(const uint i0, const uint i1, const uint i2, const uint i3, rope_params p) {
@@ -109,8 +118,8 @@ void rope_neox(const uint i0, const uint i1, const uint i2, const uint i3, rope_
     const float x0 = float(rope_data_a[ix + p.n_offs/2 + 0]);
     const float x1 = float(rope_data_a[ix + p.n_offs/2 + p.n_dims/2]);
 
-    rope_data_d[idst + p.n_offs/2 + 0]          = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
-    rope_data_d[idst + p.n_offs/2 + p.n_dims/2] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
+    rope_data_d[idst + p.n_offs/2 + 0]          = ROPE_STORE(x0*cos_theta - x1*sin_theta);
+    rope_data_d[idst + p.n_offs/2 + p.n_dims/2] = ROPE_STORE(x0*sin_theta + x1*cos_theta);
 }
 
 
@@ -178,8 +187,8 @@ void rope_multi(const uint i0, const uint i1, const uint i2, const uint i3, rope
     const float x0 = float(rope_data_a[ix + p.n_offs/2 + 0]);
     const float x1 = float(rope_data_a[ix + p.n_offs/2 + p.n_dims/2]);
 
-    rope_data_d[idst + p.n_offs/2 + 0]          = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
-    rope_data_d[idst + p.n_offs/2 + p.n_dims/2] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
+    rope_data_d[idst + p.n_offs/2 + 0]          = ROPE_STORE(x0*cos_theta - x1*sin_theta);
+    rope_data_d[idst + p.n_offs/2 + p.n_dims/2] = ROPE_STORE(x0*sin_theta + x1*cos_theta);
 }
 
 void rope_vision(const uint i0, const uint i1, const uint i2, const uint i3, rope_params p) {
@@ -212,7 +221,7 @@ void rope_vision(const uint i0, const uint i1, const uint i2, const uint i3, rop
     const float x0 = float(rope_data_a[ix + 0]);
     const float x1 = float(rope_data_a[ix + p.n_dims]);
 
-    rope_data_d[idst + 0]        = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
-    rope_data_d[idst + p.n_dims] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
+    rope_data_d[idst + 0]        = ROPE_STORE(x0*cos_theta - x1*sin_theta);
+    rope_data_d[idst + p.n_dims] = ROPE_STORE(x0*sin_theta + x1*cos_theta);
 }
 

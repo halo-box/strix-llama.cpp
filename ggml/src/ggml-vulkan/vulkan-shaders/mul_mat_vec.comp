@@ -68,10 +68,10 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 
         const vec4 b = load_b(j, iybs, iqs, lastiter, OOB_y, OOB_z, OOB_w);
 #endif
-        uint ibi = first_row*p.ncols;
+        uint ibi = first_row*p.stride_a;   // rows step by stride_a (== ncols unless A's rows are padded)
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             const uint ib = (ibi + col)/QUANT_K; // block index
-            ibi += p.ncols;
+            ibi += p.stride_a;
 
 #if K_PER_ITER == 8
             vec4 v = dequantize4(ib, iqs, a_offset);
@@ -124,10 +124,10 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
 
         const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4];
 
-        uint ibi = first_row*p.ncols;
+        uint ibi = first_row*p.stride_a;   // rows step by stride_a (== ncols unless A's rows are padded)
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             const uint ib = (ibi + col)/QUANT_K; // block index
-            ibi += p.ncols;
+            ibi += p.stride_a;
 
             const vec4 v = dequantize4_2aligned(ib, iqs, a_offset);
 

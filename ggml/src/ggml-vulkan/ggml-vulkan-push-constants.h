@@ -15,6 +15,15 @@ struct vk_mat_mat_push_constants {
     uint32_t padded_N;
 };
 
+// matmul_q8_0_q8_1_hcmix (HC_EPI in mul_mmq_cm1.comp): the plain push constants plus the x / mixed addressing and the mix scale
+struct vk_mat_mat_hcmix_push_constants {
+    vk_mat_mat_push_constants mm;
+    uint32_t hc_n_embd; uint32_t hc_x_offset; uint32_t hc_x_s1; uint32_t hc_x_s2; uint32_t hc_d_offset; uint32_t hc_d_s1;
+    float hc_scale;
+    uint32_t hc_zero;   // 0: keeps the epilogue's f16 gate rounding opaque to the shader compiler
+    uint32_t hc_round;  // 1: f16 gate (the unfused chain casts it), 0: f32 gate
+};
+
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
     uint32_t stride_a;
@@ -211,6 +220,25 @@ struct vk_op_dsv4_hc_post_push_constants {
     float    gate_scale_in;
     float    gate_scale_out;
 };
+
+// dsv4_hc_post_norm.comp: strides in elements; every operand has unit element stride and no misalignment
+struct vk_op_dsv4_hc_post_norm_push_constants {
+    uint32_t n_embd;
+    uint32_t hc;
+    uint32_t n_tokens;
+    uint32_t sx1;
+    uint32_t sr1; uint32_t sr2;
+    uint32_t sp0; uint32_t sp1;
+    uint32_t sg1;
+    uint32_t so1; uint32_t so2;
+    uint32_t sn1; uint32_t sn2;
+    float    eps;
+    uint32_t gate;
+    float    gate_in;
+    float    gate_out;
+    uint32_t zero;   // always 0: the f16 store's XOR operand
+};
+static_assert(sizeof(vk_op_dsv4_hc_post_norm_push_constants) <= 128);
 
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
@@ -866,6 +894,8 @@ template <> inline void init_pushconst_fastdiv(vk_op_sum_rows_push_constants &p)
 struct vk_quantize_q8_1_push_constants {
     uint32_t ne;
     uint32_t num_blocks;
+    uint32_t row4;      // a row-strided source: row length and row stride in vec4s (0: packed)
+    uint32_t stride4;
 };
 
 struct vk_op_flash_attn_split_k_reduce_push_constants {
