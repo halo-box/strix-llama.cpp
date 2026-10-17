@@ -2642,6 +2642,14 @@ struct llama_model_qwen4exp : public llama_model_base {
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
+        // the padded f16 destinations of LLAMA_HC_XN_PAD / LLAMA_GDN_NORM_PAD: ONE buffer per graph, written and read by one
+        // layer at a time. Never one per layer: a ggml_new_tensor in a graph is a leaf, and ggml-alloc allocates every leaf
+        // before the first node, so per-layer buffers would all be resident for the whole graph (on the fork line,
+        // 48 x 40.5 MiB + 36 x 25 MiB at ub 2048, 2.8 GB of a 5.3 GB Flash-Next compute buffer, 10-11)
+        ggml_tensor * hc_xn_pad_buf    = nullptr;
+        ggml_tensor * gdn_norm_pad_buf = nullptr;
+        ggml_tensor * pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name);
+
         // one conv history per cache tensor: delta-net and PLE each have their own
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,

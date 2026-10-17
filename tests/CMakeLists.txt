@@ -268,6 +268,10 @@ llama_build_and_test(test-chat-template.cpp)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
+llama_build_and_test(test-sched-view-scratch.cpp)
+llama_build_and_test(test-hc-up-mix-exact.cpp)
+llama_build_and_test(test-f16-store-exact.cpp)
+llama_build_and_test(test-mmid-manual-frag.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
