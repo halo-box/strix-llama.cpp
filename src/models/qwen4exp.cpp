@@ -595,15 +595,10 @@ static bool qwen4exp_has_bf16_matmul_weight(const llama_model & model) {
     return m.bf16_mm;
 }
 
-bool llama_model_qwen4exp::wq_deinterleaved() const {
-    std::lock_guard<std::mutex> lock(wq_deint_mutex);
-    if (wq_deint_state >= 0) {
-        return wq_deint_state == 1;
-    }
-    static const bool on = [] { const char * e = getenv("LLAMA_WQ_DEINTERLEAVE"); return e == nullptr || atoi(e) != 0; }();
-    if (!on) {
-        wq_deint_state = 0;
-        return false;
+void llama_model_qwen4exp::load_arch_tensors_post() {
+    const char * env = getenv("LLAMA_WQ_DEINTERLEAVE");
+    if (env != nullptr && atoi(env) == 0) {
+        return;
     }
     std::vector<std::pair<ggml_tensor *, int64_t>> ws;   // wq, head dim
     for (size_t il = 0; il < layers.size(); ++il) {
@@ -613,23 +608,17 @@ bool llama_model_qwen4exp::wq_deinterleaved() const {
         }
         const int64_t d = hparams.n_embd_head_k(il);
         // [n_embd, 2 * d * n_head] in the file's per-head [q | gate] order; anything else stays as it is
-        if (w->ne[1] % (2 * d) != 0 || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w)) {
-            wq_deint_state = 0;
-            return false;
-        }
-        if (w->data == nullptr) {
-            return false;   // not loaded yet (the -fit probe): decide on a later graph
+        if (w->ne[1] % (2 * d) != 0 || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w) || w->data == nullptr) {
+            return;
         }
         // in place on a device buffer only: a host buffer may be the mmap of the model file
         if (w->buffer == nullptr || ggml_backend_buffer_is_host(w->buffer)) {
-            wq_deint_state = 0;
-            return false;
+            return;
         }
         ws.push_back({ w, d });
     }
     if (ws.empty()) {
-        wq_deint_state = 0;
-        return false;
+        return;
     }
     std::vector<uint8_t> src, dst;
     for (const auto & [w, d] : ws) {
@@ -645,8 +634,7 @@ bool llama_model_qwen4exp::wq_deinterleaved() const {
         ggml_backend_tensor_set(w, dst.data(), 0, dst.size());
     }
     LLAMA_LOG_INFO("%s: wq de-interleaved to [q | gate] on %zu attention layers (LLAMA_WQ_DEINTERLEAVE)\n", __func__, ws.size());
-    wq_deint_state = 1;
-    return true;
+    wq_deint = true;
 }
 
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
@@ -1641,7 +1629,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     // C3: with the rows de-interleaved at load, Qcur_full is [q (n_head * d) | gate (n_head * d)] per token. A LoRA delta on wq is in
     // the file's row order, so a de-interleaved wq cannot take one.
-    const bool wq_deint = static_cast<const llama_model_qwen4exp &>(model).wq_deinterleaved();
+    const bool wq_deint = static_cast<const llama_model_qwen4exp &>(model).wq_deint;
     GGML_ASSERT((!wq_deint || loras->empty()) && "LLAMA_WQ_DEINTERLEAVE permuted wq: run with LLAMA_WQ_DEINTERLEAVE=0 to use a LoRA adapter");
 
     // Qwen3Next uses a single Q projection that outputs query + gate

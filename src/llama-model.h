@@ -974,6 +974,9 @@ struct llama_model_base : public llama_model {
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
 
+    // runs once the weights hold their data (never under no_alloc): an arch's in-place rearrangement of its loaded weights
+    virtual void load_arch_tensors_post() {}
+
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;
     void load_arch_tensors(llama_model_loader & ml) override = 0;
