@@ -19068,6 +19068,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[2] = false;
             } else if (cgraph->nodes[i]->op == GGML_OP_MUL && !ctx->device->disable_fusion && ggml_vk_ple_conv_enabled() &&
                        [&] { vk_ple_conv_match pm; return ggml_vk_match_ple_conv(cgraph, i, &pm); }() &&
+                       // one workgroup row per token and one layer per sequence: past the device limits it runs unfused
+                       cgraph->nodes[i]->ne[1] <= (int64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
+                       cgraph->nodes[i]->ne[2] <= (int64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[2] &&
                        ggml_can_fuse_subgraph(cgraph, i, ple_conv_pattern, { i + (int) ple_conv_pattern.size() - 1 })) {
                 ctx->num_additional_fused_ops = ple_conv_pattern.size() - 1;
                 ctx->fused_ple_conv = true;
