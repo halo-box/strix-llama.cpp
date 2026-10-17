@@ -1588,6 +1588,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // 7a (--spec-draft-mtp-pcum): per-sequence product of the kept drafts' top-1 probabilities in the current chain
+    std::vector<float> pcum_acc;
+    size_t n_pcum_stops = 0;    // chains cut by the rule
+    size_t n_pcum_saved = 0;    // draft steps not taken because of it
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1603,7 +1608,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         adaptive_n = this->params.adaptive;
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, mtp_pcum=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, this->params.mtp_pcum, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -1662,6 +1667,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
+        pcum_acc.assign(n_seq, 1.0f);
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
 
@@ -1850,6 +1856,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!dp.result_q) {
                 common_sampler_reset(smpls[seq_id].get());
             }
+            pcum_acc[seq_id] = 1.0f;
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
@@ -1924,10 +1931,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                common_sampler_accept(smpl, id, true);
-
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
+
+                // 7a (--spec-draft-mtp-pcum): stop before a token whose inclusion drops the chain's top-1 probability product below the
+                // threshold; the first draft is always kept. Width only: whatever is proposed, the target emits the same tokens.
+                if (!common_speculative_mtp_pcum_keep(params.mtp_pcum, (int) result.size() + 1, pcum_acc[seq_id], cur_p->data[0].p)) {
+                    n_pcum_stops++;
+                    n_pcum_saved += (size_t) std::max<int32_t>(0, n_draft_eff - (int32_t) result.size());
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
+                    continue;
+                }
+                pcum_acc[seq_id] *= cur_p->data[0].p;
+
+                common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
 
@@ -3236,6 +3255,13 @@ void common_speculative_print_stats(const common_speculative * spec) {
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
         }
 
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            const auto * mtp = static_cast<const common_speculative_impl_draft_mtp *>(impl.get());
+            if (mtp->params.mtp_pcum > 0.0f) {
+                SPC_INF("mtp pcum %.2f: chains cut = %zu of %zu drafts, draft steps saved = %zu\n",
+                        (double) mtp->params.mtp_pcum, mtp->n_pcum_stops, impl->n_call_draft, mtp->n_pcum_saved);
+            }
+        }
         SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
