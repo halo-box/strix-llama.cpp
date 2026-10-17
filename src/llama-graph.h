@@ -98,6 +98,11 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+
+// a context's state for llama_model::prefetch_begin / prefetch_end (one per context, made by the model)
+struct llama_model_prefetch {
+    virtual ~llama_model_prefetch() = default;
+};
 struct llama_mtp_draft_vocab;
 
 //
@@ -835,6 +840,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    llama_model_prefetch * prefetch = nullptr; // the context's llama_model::prefetch_begin state, nullptr = none
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1078,6 +1085,8 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llama_mtp_draft_vocab * mtp_draft; // nullptr = full vocabulary
+
+    llama_model_prefetch * prefetch; // nullptr = none
 
     const llm_graph_cb & cb_func;
 

@@ -2564,6 +2564,10 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // the PLE rows of the batch gathered one ubatch ahead on a worker thread (LLAMA_PLE_ASYNC=0: page-cache advice only)
+    void prefetch_begin(std::unique_ptr<llama_model_prefetch> & state, const llama_batch & batch, uint32_t n_ubatch) const override;
+    void prefetch_end(llama_model_prefetch * state) const override;
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     protected:
