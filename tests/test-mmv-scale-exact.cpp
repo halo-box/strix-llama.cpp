@@ -1,9 +1,5 @@
-// MUL_MAT_VEC_SCALE exactness (wave 8b): the Vulkan backend applies a SCALE that follows a one-column quantised mat-vec in the mat-vec's
-// store (qwen4exp's hc mix: silu(scale(W_down * xn, 1/hc)), 96 per decode token on Flash-Next). It must be BIT-EXACT with the separate
-// SCALE. Each case runs with GGML_VK_MMV_SCALE=1 and =0 (re-read through the knob reset hook), requires byte-equal outputs and the expected fused-dispatch
-// counts (cases the fusion must decline expect 0 both ways), and checks that a scale one f32 ulp away changes the output (positive
-// control: the comparison sees a single rounding; for an f16 output, 2^-10 relative, the smallest step the f16 store cannot absorb).
-// Skips (exit 0) when there is no Vulkan device.
+// MUL_MAT_VEC_SCALE (GGML_VK_MMV_SCALE) must be byte-equal with the separate SCALE: each case runs fused and unfused, checks the
+// fused dispatch count, and a scale one f32 ulp away (2^-10 for an f16 output) must change the output. Skips without Vulkan.
 
 #include "ggml.h"
 #include "ggml-alloc.h"

@@ -1,10 +1,5 @@
-// LLAMA_WQ_DEINTERLEAVE exactness (wave 8, C3): qwen4exp's wq holds [q | gate] per head. The loader can permute its rows to
-// [all q | all gate] so Qcur and the gate are plain views of the projection (no CONT) and SIGMOID + MUL fuse (SIGMOID_MUL).
-// Builds the attention-gate chain both ways on the Vulkan backend: A = file order (strided q view, CONT gate), B = permuted
-// weight (views). The gated output must be byte-equal, and B must take SIGMOID_MUL (in the model, GGML_VK_UNARY_MUL_KEEP keeps
-// graph_optimize from pulling the SIGMOID away from its MUL; this test allocates without the scheduler, so it never reorders). Positive
-// control: a permutation with two heads swapped must change the output. With a path argument, writes B's output there, so a
-// run under GGML_VK_DISABLE_FUSION=1 can be compared byte for byte (fused vs unfused). Skips (exit 0) without a Vulkan device.
+// LLAMA_WQ_DEINTERLEAVE: the attention gate from a de-interleaved wq (views, SIGMOID_MUL) must be byte-equal with the file order
+// (strided view, CONT); swapping two heads must change it. argv[1] dumps the output for a GGML_VK_DISABLE_FUSION=1 comparison.
 
 #include "ggml.h"
 #include "ggml-alloc.h"

@@ -2389,10 +2389,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     if (qwen4exp_ple_conv_fused() && ggml_is_contiguous(hidden) && ggml_is_contiguous(gated)) {
-        // C5: the history is prepended channels first, [hc_dim, hist + n_seq_tokens, n_seqs], so every tap is a view of whole
-        // rows: no per-tap transpose and no CONT of the conv output. Same products, same sums, same order (bit-exact). Every
-        // input of the tail (the f32 kernel, the tap views, the gated value and the residual as [hc_dim, T, S]) is built ahead
-        // of it, so the taps, the SiLU and the two residual adds are ten consecutive nodes (Vulkan: PLE_CONV_SILU_ADD)
+        // history prepended channels first, [hc_dim, hist + T, S]: every tap is a row view, no per-tap transpose or CONT, same
+        // order (bit-exact). The tail's inputs are built first so its ten nodes are consecutive (Vulkan: PLE_CONV_SILU_ADD)
         ggml_tensor * w_cf = ggml_cont(ctx0, ggml_transpose(ctx0, model.layers[il].ple_conv1d));   // [hc_dim, kern]
         if (w_cf->type != GGML_TYPE_F32) {
             w_cf = ggml_cast(ctx0, w_cf, GGML_TYPE_F32);

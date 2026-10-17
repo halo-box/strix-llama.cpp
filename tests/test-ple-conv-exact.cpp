@@ -1,9 +1,5 @@
-// LLAMA_PLE_CONV_FUSED exactness (wave 8, C5): qwen4exp's PLE layer runs a dilated depthwise conv (4 taps, dilation 3, a 9-token
-// history), SiLU, and out = hidden + (gated + conv). The original graph prepends the history token-major and transposes every tap
-// (CONT per tap); the C5 graph prepends it channels first and reads every tap as a row view, and the Vulkan backend fuses the ten
-// tail nodes as PLE_CONV_SILU_ADD. On the Vulkan backend, per shape: the C5 graph with GGML_VK_PLE_CONV=1 (fused, one dispatch),
-// with =0 (unfused), and the original formulation must all be byte-equal. Positive control: the C5 graph with the tap sum in the
-// reverse order must differ (so the comparison sees a reassociation). Skips (exit 0) without a Vulkan device.
+// LLAMA_PLE_CONV_FUSED + GGML_VK_PLE_CONV: the channels-first PLE tail fused, unfused and in the original token-major form must be
+// byte-equal; the tap sum in reverse order must differ (positive control). Skips without a Vulkan device.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -37,7 +33,7 @@ static const int64_t K = 4, DIL = 3, HIST = (K - 1) * DIL;
 
 struct shape { int64_t c, t, s; };
 
-enum variant { C5, C5_REVERSED, ORIGINAL };
+enum variant { ROWS, ROWS_REVERSED, ORIGINAL };
 
 struct inputs { std::vector<float> p, w, g, h; };   // p: channels first [c, HIST + t, s]; w: [K, c] as the file holds it
 
@@ -80,7 +76,7 @@ static std::vector<uint8_t> run(ggml_backend_t be, ggml_backend_reg_t reg, const
         }
         ggml_tensor * conv = nullptr;
         for (int64_t i = 0; i < K; ++i) {
-            const int64_t k = v == C5_REVERSED ? K - 1 - i : i;
+            const int64_t k = v == ROWS_REVERSED ? K - 1 - i : i;
             ggml_tensor * term = ggml_mul(ctx, taps[k], wks[k]);
             conv = conv ? ggml_add(ctx, conv, term) : term;
         }
@@ -152,10 +148,10 @@ int main() {
         for (auto * vec : { &in.p, &in.w, &in.g, &in.h }) for (auto & x : *vec) x = u(rng);
 
         uint64_t n_on = 0, n_off = 0, n_orig = 0, n_rev = 0;
-        const auto on   = run(be, reg, sh, in, C5, "1", n_on);
-        const auto off  = run(be, reg, sh, in, C5, "0", n_off);
+        const auto on   = run(be, reg, sh, in, ROWS, "1", n_on);
+        const auto off  = run(be, reg, sh, in, ROWS, "0", n_off);
         const auto orig = run(be, reg, sh, in, ORIGINAL, "1", n_orig);
-        const auto rev  = run(be, reg, sh, in, C5_REVERSED, "0", n_rev);
+        const auto rev  = run(be, reg, sh, in, ROWS_REVERSED, "0", n_rev);
         const size_t d_off = ndiff(on, off), d_orig = ndiff(on, orig), d_rev = ndiff(off, rev);
         printf("c=%lld t=%lld s=%lld: fused vs unfused %zu, fused vs original %zu differ (of %zu); PLE_CONV_SILU_ADD on=%llu off=%llu "
                "original=%llu (want %d/0/0); reversed-tap control %zu differ\n",

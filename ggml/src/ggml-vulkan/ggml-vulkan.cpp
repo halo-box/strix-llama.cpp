@@ -8877,9 +8877,8 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
         pc, { hc * nt, 1, 1 });
 }
 
-// GGML_VK_UNARY_MUL_KEEP (default 1): graph_optimize does not hoist a UNARY away from the MUL right behind it that consumes it,
-// when the pair can fuse. The gate SIGMOID of a gated attention (qwen4exp, qwen35) reads only the Q projection, so the first
-// pass otherwise pulls it up into the attention's set and its MUL, which waits on the attention output, runs alone
+// GGML_VK_UNARY_MUL_KEEP (default 1): graph_optimize keeps a fusable UNARY next to the MUL that consumes it; otherwise a gated
+// attention's SIGMOID (it reads only the Q projection) is hoisted into the attention's set and its MUL runs alone
 static bool ggml_vk_unary_mul_keep_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_VK_UNARY_MUL_KEEP"); return e == nullptr || atoi(e) != 0; }();
     return on;
@@ -19769,9 +19768,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
 
-        // MUL_MAT_VEC_SCALE: a one-column mat-vec placed in a set takes the SCALE that consumes it right behind it. The SCALE reads
-        // only the mat-vec, but another node can sit between them in the graph (Flash-Next decode, GDN layers: the hc inject's own
-        // SCALE lands between the hc down mat-vec and its 1/hc SCALE), and then the pair never fuses
+        // MUL_MAT_VEC_SCALE: a one-column mat-vec takes the SCALE that consumes it into its set; another node can sit between them
+        // (Flash-Next decode: the hc inject's SCALE between the hc down mat-vec and its 1/hc SCALE) and the pair would never fuse
         auto const &pull_mmv_scale = [&](int mm) {
             const ggml_tensor * n = graph->nodes[mm];
             if (n->op != GGML_OP_MUL_MAT || ggml_nrows(n) != 1) {

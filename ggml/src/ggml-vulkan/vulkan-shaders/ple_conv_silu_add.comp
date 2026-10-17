@@ -2,11 +2,8 @@
 
 #include "types.glsl"
 
-// PLE_CONV_SILU_ADD (qwen4exp PLE layer, LLAMA_PLE_CONV_FUSED + GGML_VK_PLE_CONV): the dilated depthwise conv over the channels-first
-// padded buffer, its SiLU and both residual adds in one pass, in the unfused graph's arithmetic:
-//   a = ((x0*w0 + x1*w1) + x2*w2) + x3*w3     every product and sum rounded on its own (precise: no fma contraction)
-//   d = h + (g + silu(a))                     silu as unary.comp computes it
-// x_k = P[c, t + tap row k] (P: [C, rows, S]), w_k = W[c + k * w_nb1], g / h / d: [C, T, S].
+// PLE_CONV_SILU_ADD: d = h + (g + silu(((x0*w0 + x1*w1) + x2*w2) + x3*w3)), x_k = P[c, t + tap k], w_k = W[c + k * w_nb1], in the
+// unfused graph's order with every step rounded on its own (precise) and silu as unary.comp computes it, so it is bit-exact
 layout (binding = 0) readonly  buffer P {float data_p[];};
 layout (binding = 1) readonly  buffer W {float data_w[];};
 layout (binding = 2) readonly  buffer G {float data_g[];};
