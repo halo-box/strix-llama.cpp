@@ -4126,7 +4126,10 @@ llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader
         if (ml.get_weight(tn(trunk_probe, "weight", 0).str().c_str()) == nullptr) {
             trunk = TENSOR_NOT_REQUIRED;
         }
-        if (ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr) {
+        // an EXL3 eh_proj is stored as its trellis (llama_model_loader::create_tensor)
+        const std::string eh_proj = tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str();
+        if (ml.get_weight(eh_proj.c_str()) == nullptr &&
+                ml.get_weight((eh_proj.substr(0, eh_proj.size() - strlen("weight")) + "exl3_trellis").c_str()) == nullptr) {
             mtp = TENSOR_NOT_REQUIRED;
         }
     }
