@@ -85,6 +85,9 @@ that is done on whole 128-blocks (8 tiles plus the matching scale entries), whic
 diagonal; the tiles themselves are unchanged. Not supported yet, refused by the converter: legacy packed `.su`/`.sv`,
 row tables other than the token embedding (n-gram / PLE tables), mixed codebooks.
 
+The qwen35 converter takes the number of MTP layers of an EXL3 checkpoint from its `mtp.layers.<i>` tensors, not
+from `mtp_num_hidden_layers` of `config.json` (a checkpoint can declare a layer it does not store).
+
 ## Op
 
 `ggml_exl3_mul_mat(ctx, trellis, x, suh, svh, codebook)` (`GGML_OP_EXL3_MUL_MAT`) computes `y = x W` without

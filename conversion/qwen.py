@@ -300,8 +300,13 @@ class _QwenMtpMixin:
         self.block_count = self.hparams["num_hidden_layers"]
         if not self.no_mtp:
             n_mtp = self.hparams.get("mtp_num_hidden_layers", 0)
+            # an EXL3 checkpoint can declare MTP layers it does not store: use the stored count, as common/exl3-dir.cpp
+            if (self.hparams.get("quantization_config") or {}).get("quant_method") == "exl3":
+                if n_mtp != self.opt_num_mtp_layers:
+                    logger.info(f"EXL3: {self.opt_num_mtp_layers} MTP layer(s) stored, config.json declares {n_mtp}")
+                n_mtp = self.opt_num_mtp_layers
             # Qwen-3-Next doesn't include `mtp_num_hidden_layers` in config.
-            if n_mtp == 0:
+            elif n_mtp == 0:
                 assert self.opt_num_mtp_layers != 0
                 n_mtp = self.opt_num_mtp_layers
             self.block_count += n_mtp
