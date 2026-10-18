@@ -2339,7 +2339,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // f16 expert activations at prefill (fused_moe_f16): casts right after the GEMMs, f16 GLU and down B, f32 combine. Plain
     // SwiGLU only, and only QWEN4EXP, the one arch with a PPL/KLD check of the f16 chain
-    const bool moe_f16_arch = arch == LLM_ARCH_QWEN4EXP;
+    // qwen35moe: KLD 0.003924 vs ubatch floor 0.004012 (Qwen3.6-35B-A3B UD-Q4_K_XL, wiki 2 x 4096), pp2048 +6.8% / +5.9% d0 / 8k (gfx1151 RADV, ABBA n=2, 2026-10-18)
+    const bool moe_f16_arch = arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35MOE;
     const bool moe_f16 = cparams.fused_moe_f16 && moe_f16_arch && il >= 0 && n_tokens >= 32 &&
         type_op == LLM_FFN_SILU && gate_exps && !gate_up_exps && !weight_before_ffn &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&

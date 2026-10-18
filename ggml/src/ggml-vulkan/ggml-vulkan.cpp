@@ -4985,7 +4985,7 @@ static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
                 cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline->layout, 0, { set }, {});
                 cb.dispatch(1, 1, 1);
                 cb.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {},
-                    { vk::MemoryBarrier{ vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead } }, {}, {});
+                    { { vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eHostRead } }, {}, {});
                 ggml_vk_ctx_end(subctx);
                 ggml_vk_submit(subctx, device->fence);
                 VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "coopmat layout check waitForFences", device);
@@ -7562,11 +7562,15 @@ static bool ggml_vk_dense_wave32_enabled(const vk_device& device) {
     return can && (env >= 0 ? env != 0 : true);
 }
 
-// GGML_VK_DENSE_YPAD=N (multiple of 8, default 128, 0 off; idea from Strata): pad the staged f16 B rows of the dense f16-B path
-// where their 256 B-granule stride camps on few DRAM channels (gcd >= 8; q8_0 2560x2048x6144 on gfx1151: 30.2 -> 40.9 TFLOPS).
+// GGML_VK_DENSE_YPAD=N (multiple of 8, default 0 off, 1..7 = 128; idea from Strata): pad the staged f16 B rows of the dense f16-B
+// path where their 256 B-granule stride camps on few DRAM channels (gcd >= 8; q8_0 2560x2048x6144 on gfx1151: 30.2 -> 40.9 TFLOPS).
 // Same bits, only the scratch layout changes. GGML_VK_DENSE_YPAD_ALL=1 pads every staged f16 B (probe).
+// Off by default: neutral on Flash-Next REAP-320 (pp 0.0 / +0.7%, d0 / 8k) and Qwen3.8-27B (-0.2 / +0.1%), gfx1151 RADV ABBA n=2, 2026-10-18
 static uint32_t ggml_vk_dense_ypad() {
-    static const uint32_t pad = [] { const char * e = getenv("GGML_VK_DENSE_YPAD"); return e ? (uint32_t) std::max(0, atoi(e)) & ~7u : 128u; }();
+    static const uint32_t pad = [] {
+        const int v = [] { const char * e = getenv("GGML_VK_DENSE_YPAD"); return e ? atoi(e) : 0; }();
+        return v <= 0 ? 0u : (v & ~7) != 0 ? (uint32_t) (v & ~7) : 128u;
+    }();
     return pad;
 }
 static bool ggml_vk_dense_ypad_camps(uint64_t k) {
@@ -9271,7 +9275,9 @@ static bool ggml_vk_mmid_medium_tile(ggml_backend_vk_context * ctx, const std::v
     uint32_t idx = ctx->device->matmul_id_tile_selector(m, n_per_expert, 0, ctx->device->shader_core_count, configs);
     if (idx >= configs.size()) idx = (uint32_t) configs.size() - 1;
     const vk_pipeline & sel = configs[idx].unaligned;
-    return sel != nullptr && sel->wg_denoms[0] == 64 && sel->wg_denoms[1] == 64;
+    // BN 64 medium tile, BM 64 or 128 (GGML_VK_MMID_M128): REG_A replaces either; ahead of M128 it read +2.7% / +2.8% pp2048 on
+    // Flash-Next REAP-320 d0 / 8k (gfx1151 RADV, ABBA n=4, 2026-10-18), M128 alone neutral
+    return sel != nullptr && sel->wg_denoms[1] == 64 && (sel->wg_denoms[0] == 64 || sel->wg_denoms[0] == 128);
 }
 
 // fused_scale / fused_dst: MUL_MAT_ID+MUL (router weights in the epilogue, result in the MUL's destination).
