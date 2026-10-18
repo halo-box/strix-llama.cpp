@@ -31,6 +31,26 @@ its independent CPU decoder `tests/testlib/trellis.py`.
 exllamav3 (H, suh, H, svh). It computes in double: the butterflies and suh are exact there, svh rounds once, so the
 result is the f32 rounding of the exact `W`.
 
+## Row rings (quantized token embeddings and n-gram / PLE tables)
+
+exllamav3 stores a quantized token embedding (`-eb`) and its hashed n-gram tables in a second format
+(`modules/quant/exl3_lib/ngram_codec.py`): rows that decode one by one. A ring of `dim` positions is `1 + dim*K/16`
+int16 words: word 0 is an fp16 scale, then stream bits `[i*K, (i+1)*K)` (LSB first in little-endian uint16 words) are
+the low K bits of the 16-bit state of position i, whose higher bits are the symbols of positions i-1, i-2, ...
+(wrapping). Always the mul1 codebook, no marker, K = 1..8.
+
+- Token embedding `<key>.trellis` int16 `[rows, groups*(1 + 16*K)]` and `<key>.signs` fp16 `[groups, 256]`: each row is
+  `groups` rings of 256, group g = `signs[g] * H256(decode * scale)`, H256 the orthonormal Walsh-Hadamard transform,
+  cropped to the hidden size. K = `(row_words/groups - 1)/16`.
+- n-gram table: rings of 160 plus the fp16 bias of the row's hash head (`head_bias [heads, 160]`, the head is the last
+  `head_offsets[h] <= row`), with I64 `head_offsets`, `head_vocab_sizes`, `layer_multipliers` for the hashing; in its
+  own file with `format = exl3_ngram_trellis`, `version = 1`, `K`, optionally split into `.shard_N.trellis`.
+
+`ggml_exl3_decode_embd_row` and `ggml_exl3_decode_ngram_row` follow `dequant_rows`: the f32 product of the codebook
+value and the scale (exact), then the Hadamard butterflies in f32 in the order of `hadamard_rotate` and the signs, or
+the bias. Their outputs equal `dequant_rows` bit for bit (the CPU path of exllamav3 rounds the embedding to fp16 after
+that; this decoder does not).
+
 ## Container (GGUF)
 
 `convert_hf_to_gguf.py` detects `quantization_config.quant_method == "exl3"` and writes, per linear with GGUF base
@@ -121,7 +141,8 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
 ## Tests
 
 - `test-exl3`: the three codebook tables, and all 27 rate x codebook cases on synthetic tiles, against hashes made
-  with exllamav3's `trellis.py`; type and shape checks.
+  with exllamav3's `trellis.py`; type and shape checks; row rings for K = 1..8 (n-gram rows with a bias, token
+  embedding rows with signs, cropped) against hashes made with exllamav3's `ngram_codec.dequant_rows`.
 - `test-exl3 --gguf FILE`: decodes every EXL3 linear of a container and prints sha256 of `W_hat` and `W` per tensor.
 - The op: `test-exl3` also runs `ggml_exl3_mul_mat` against `ggml_mul_mat` on the f32 `W` of `ggml_exl3_dequantize`
   for every rate x codebook case; `test-exl3 --op-gguf FILE` does it on the first linear of each (k, n, K) of a

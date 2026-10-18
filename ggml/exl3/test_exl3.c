@@ -11,7 +11,11 @@
 // of the backend's own ggml_mul_mat on the same f32 W, x and shape (the GPU prefill GEMMs of this tree round both
 // operands to f16; the backend is opted in to them as llama opts in its contexts).
 //
-// test-exl3                -> codebook tables, every rate x codebook on synthetic tiles, shape checks, op on synthetic tiles
+// The row-ring goldens come from exllamav3 modules/quant/exl3_lib/ngram_codec.py dequant_rows (same pin) on the same
+// xorshift32 inputs: n-gram rows of 160 with a bias, and token embedding rows of 4 rings of 256 with +/-1 signs, cropped.
+//
+// test-exl3                -> codebook tables, every rate x codebook on synthetic tiles, shape checks, op on synthetic tiles,
+//                             row rings for K = 1..8
 // test-exl3 --gguf FILE    -> decode every EXL3 linear of a GGUF container, one JSON line per tensor with sha256
 // test-exl3 --op-gguf FILE -> op on the first linear of each (k, n, K) in a GGUF container, at the decode and prompt row counts
 // test-exl3 --dequantize IN OUT -> plain GGUF reference of a container: each EXL3 linear becomes "<base>.weight" F32 from
@@ -168,6 +172,89 @@ static int test_tiles(void) {
     free(trellis);
     free(w);
     free(w_hat);
+    return n_fail;
+}
+
+// K, n-gram rows (8 x 160 with bias), token embedding rows (8 x 4 groups of 256, cropped to 1000)
+static const struct { int K; uint64_t ngram; uint64_t embd; } row_goldens[] = {
+    { 1, 0x04d0e311747c42acull, 0xc56102632334f75dull },
+    { 2, 0x0c2b81394354d778ull, 0xe604fba14b513850ull },
+    { 3, 0xda80b62104bc4600ull, 0xed6c73a527107c7cull },
+    { 4, 0xc5881597b3e8cff1ull, 0x93bcd19561debb0cull },
+    { 5, 0x56e10bb0b45f04e9ull, 0xd78ef9acd5b346daull },
+    { 6, 0x125f6e56569f7d4cull, 0xec14ef4163ff2e39ull },
+    { 7, 0x28e8389972f2d894ull, 0x209508df938773e2ull },
+    { 8, 0x82d5b1b4868cd200ull, 0x537e53ff18bdea0aull },
+};
+
+static int test_rows(void) {
+    enum { R = 8, GROUPS = 4, HIDDEN = 1000 };
+    int n_fail = 0;
+    for (size_t i = 0; i < sizeof(row_goldens)/sizeof(row_goldens[0]); i++) {
+        const int K = row_goldens[i].K;
+        uint32_t s = 0x2468ACE0u + 0x9E3779B9u*(uint32_t) K;
+
+        const int64_t words = ggml_exl3_ring_words(GGML_EXL3_ROW_DIM, K);
+        int16_t     * ng    = (int16_t *)     malloc(R*words*sizeof(int16_t));
+        ggml_fp16_t * bias  = (ggml_fp16_t *) malloc(R*GGML_EXL3_ROW_DIM*sizeof(ggml_fp16_t));
+        float       * o_ng  = (float *)       malloc(R*GGML_EXL3_ROW_DIM*sizeof(float));
+        for (int r = 0; r < R; r++) {
+            const ggml_fp16_t sc = rand_f16(&s);
+            memcpy(&ng[r*words], &sc, sizeof(sc));
+            for (int64_t j = 1; j < words; j++) {
+                ng[r*words + j] = (int16_t) (uint16_t) (xorshift32(&s) >> 16);
+            }
+        }
+        for (int j = 0; j < R*GGML_EXL3_ROW_DIM; j++) {
+            bias[j] = rand_f16(&s);
+        }
+        for (int r = 0; r < R; r++) {
+            ggml_exl3_decode_ngram_row(&ng[r*words], K, &bias[r*GGML_EXL3_ROW_DIM], &o_ng[r*GGML_EXL3_ROW_DIM]);
+        }
+
+        const int64_t gw    = ggml_exl3_ring_words(GGML_EXL3_GROUP_DIM, K);
+        ggml_fp16_t * signs = (ggml_fp16_t *) malloc(GROUPS*GGML_EXL3_GROUP_DIM*sizeof(ggml_fp16_t));
+        int16_t     * em    = (int16_t *)     malloc(R*GROUPS*gw*sizeof(int16_t));
+        float       * o_em  = (float *)       malloc(R*HIDDEN*sizeof(float));
+        for (int j = 0; j < GROUPS*GGML_EXL3_GROUP_DIM; j++) {
+            const uint16_t b = (xorshift32(&s) >> 31) ? 0xBC00 : 0x3C00;
+            memcpy(&signs[j], &b, sizeof(b));
+        }
+        for (int r = 0; r < R*GROUPS; r++) {
+            const ggml_fp16_t sc = rand_f16(&s);
+            memcpy(&em[r*gw], &sc, sizeof(sc));
+            for (int64_t j = 1; j < gw; j++) {
+                em[r*gw + j] = (int16_t) (uint16_t) (xorshift32(&s) >> 16);
+            }
+        }
+        n_fail += ggml_exl3_embd_k(GROUPS*gw, GROUPS) != K;
+        for (int r = 0; r < R; r++) {
+            ggml_exl3_decode_embd_row(&em[r*GROUPS*gw], GROUPS, K, signs, HIDDEN, &o_em[r*HIDDEN]);
+        }
+
+        const uint64_t h_ng = fnv1a64(o_ng, R*GGML_EXL3_ROW_DIM*sizeof(float));
+        const uint64_t h_em = fnv1a64(o_em, R*HIDDEN*sizeof(float));
+        if (h_ng != row_goldens[i].ngram || h_em != row_goldens[i].embd) {
+            fprintf(stderr, "rows K = %d: n-gram %016llx (want %016llx), embd %016llx (want %016llx)\n", K,
+                    (unsigned long long) h_ng, (unsigned long long) row_goldens[i].ngram,
+                    (unsigned long long) h_em, (unsigned long long) row_goldens[i].embd);
+            n_fail++;
+        }
+        free(ng);
+        free(bias);
+        free(o_ng);
+        free(signs);
+        free(em);
+        free(o_em);
+    }
+
+    // head of an n-gram row: the last offset at or below it
+    const int64_t offs[3] = { 0, 10, 25 };
+    n_fail += ggml_exl3_ngram_head(offs, 3, 0) != 0 || ggml_exl3_ngram_head(offs, 3, 9) != 0 ||
+              ggml_exl3_ngram_head(offs, 3, 10) != 1 || ggml_exl3_ngram_head(offs, 3, 24) != 1 ||
+              ggml_exl3_ngram_head(offs, 3, 25) != 2 || ggml_exl3_ngram_head(offs, 3, 1000) != 2;
+    // embedding widths: groups of 1 + 16 K words
+    n_fail += ggml_exl3_embd_k(260, 4) != 4 || ggml_exl3_embd_k(261, 4) != -1 || ggml_exl3_embd_k(4*(1 + 16*9), 4) != -1;
     return n_fail;
 }
 
@@ -892,11 +979,12 @@ int main(int argc, char ** argv) {
     n_fail += test_codebooks();
     n_fail += test_tiles();
     n_fail += test_checks();
+    n_fail += test_rows();
     n_fail += test_op();
     if (n_fail) {
         fprintf(stderr, "test-exl3: %d failures\n", n_fail);
         return 1;
     }
-    printf("test-exl3: OK (3 codebooks, %d rate x codebook cases, op on all of them)\n", (int) (sizeof(tile_goldens)/sizeof(tile_goldens[0])));
+    printf("test-exl3: OK (3 codebooks, %d rate x codebook cases, op on all of them, row rings K = 1..8)\n", (int) (sizeof(tile_goldens)/sizeof(tile_goldens[0])));
     return 0;
 }

@@ -59,6 +59,34 @@ GGML_API bool ggml_exl3_check_linear(
         const struct ggml_tensor * trellis, const struct ggml_tensor * suh, const struct ggml_tensor * svh,
         enum ggml_exl3_codebook cb);
 
+// Row rings (exllamav3 ngram_codec.py): token embedding tables and hashed n-gram (PLE) tables. A ring of dim positions
+// is 1 + dim*K/16 int16 words: word 0 holds the fp16 scale, then stream bits [i*K, (i+1)*K) (LSB first in little-endian
+// uint16 words) are the low K bits of the 16-bit state of position i, whose higher bits are the symbols of positions
+// i-1, i-2, ... (mod dim). Always the mul1 codebook, K = 1..8.
+#define GGML_EXL3_ROW_DIM   160 // n-gram row: one ring, plus the bias of its hash head
+#define GGML_EXL3_GROUP_DIM 256 // token embedding row: rings of 256, each rotated by H256 and signs
+
+// int16 words of one ring
+GGML_API int64_t ggml_exl3_ring_words(int64_t dim, int K);
+
+// K of a token embedding row of row_words int16 for `groups` rings of 256, or -1 if the width does not fit
+GGML_API int ggml_exl3_embd_k(int64_t row_words, int64_t groups);
+
+// one ring: dst[i] = mul1(state_i) * scale, an exact f32 product
+GGML_API void ggml_exl3_decode_ring(const int16_t * ring, int64_t dim, int K, float * dst);
+
+// one token embedding row: group g = signs[g] * H256(ring g) for the rings back to back, H256 the orthonormal
+// Walsh-Hadamard transform in f32, in the butterfly order of ngram_codec.hadamard_rotate; the first n_out values
+// signs: F16 [groups][256]
+GGML_API void ggml_exl3_decode_embd_row(
+        const int16_t * row, int64_t groups, int K, const ggml_fp16_t * signs, int64_t n_out, float * dst);
+
+// one n-gram row of 160: the ring plus its head's bias (F16 [160]), one f32 rounding
+GGML_API void ggml_exl3_decode_ngram_row(const int16_t * row, int K, const ggml_fp16_t * bias, float * dst);
+
+// head of n-gram row idx: the last h with head_offsets[h] <= idx, clamped to [0, n_heads)
+GGML_API int64_t ggml_exl3_ngram_head(const int64_t * head_offsets, int64_t n_heads, int64_t idx);
+
 #ifdef __cplusplus
 }
 #endif

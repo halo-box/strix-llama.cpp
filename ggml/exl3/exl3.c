@@ -198,3 +198,93 @@ bool ggml_exl3_check_linear(
     }
     return ggml_n_dims(suh) == 1 && suh->ne[0] == k && ggml_n_dims(svh) == 1 && svh->ne[0] == n;
 }
+
+int64_t ggml_exl3_ring_words(int64_t dim, int K) {
+    return 1 + dim*K/16;
+}
+
+int ggml_exl3_embd_k(int64_t row_words, int64_t groups) {
+    if (groups <= 0 || row_words % groups != 0) {
+        return -1;
+    }
+    // exllamav3 Embedding: K = (row_words / groups - 1) / 16
+    const int64_t w = row_words/groups - 1;
+    if (w <= 0 || w % 16 != 0 || w/16 > 8) {
+        return -1;
+    }
+    return (int) (w/16);
+}
+
+void ggml_exl3_decode_ring(const int16_t * ring, int64_t dim, int K, float * dst) {
+    GGML_ASSERT(K >= 1 && K <= 8 && dim > 0 && dim <= GGML_EXL3_GROUP_DIM && (dim*K) % 16 == 0);
+
+    // as unpack_rows of ngram_codec.py: the symbol of position i through a two-word window, wrapping to word 0
+    const int64_t     words  = dim*K/16;
+    const uint16_t  * stream = (const uint16_t *) (ring + 1);
+    const float       scale  = exl3_half_to_float((uint16_t) ring[0]);
+    uint32_t sym[GGML_EXL3_GROUP_DIM];
+    for (int64_t i = 0; i < dim; i++) {
+        const int64_t  bit    = i*K;
+        const uint32_t window = (uint32_t) stream[bit >> 4] | ((uint32_t) stream[((bit >> 4) + 1) % words] << 16);
+        sym[i] = (window >> (bit & 15)) & ((1u << K) - 1);
+    }
+    // the state of position i stacks the symbols of positions i, i - 1, ... from bit 0 up
+    const int nj = (15 + K)/K;
+    for (int64_t i = 0; i < dim; i++) {
+        uint32_t s = 0;
+        for (int j = 0; j < nj; j++) {
+            s |= sym[(i - j + dim) % dim] << (j*K);
+        }
+        // fp16 codebook value times fp16 scale: exact in f32
+        dst[i] = ggml_fp16_to_fp32(ggml_exl3_codebook_value((uint16_t) s, GGML_EXL3_CODEBOOK_MUL1))*scale;
+    }
+}
+
+// orthonormal Walsh-Hadamard transform of 256 values in f32, the butterfly order of ngram_codec.hadamard_rotate
+static void exl3_hadamard_rotate_256(float * x) {
+    for (int h = 1; h < GGML_EXL3_GROUP_DIM; h <<= 1) {
+        for (int i = 0; i < GGML_EXL3_GROUP_DIM; i += 2*h) {
+            for (int j = i; j < i + h; j++) {
+                const float a = x[j];
+                const float b = x[j + h];
+                x[j]     = a + b;
+                x[j + h] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < GGML_EXL3_GROUP_DIM; i++) {
+        x[i] *= 0.0625f; // 256 ** -0.5
+    }
+}
+
+void ggml_exl3_decode_embd_row(
+        const int16_t * row, int64_t groups, int K, const ggml_fp16_t * signs, int64_t n_out, float * dst) {
+    GGML_ASSERT(n_out <= groups*GGML_EXL3_GROUP_DIM);
+    const int64_t rw = ggml_exl3_ring_words(GGML_EXL3_GROUP_DIM, K);
+    float x[GGML_EXL3_GROUP_DIM];
+    for (int64_t g = 0; g*GGML_EXL3_GROUP_DIM < n_out; g++) {
+        ggml_exl3_decode_ring(row + g*rw, GGML_EXL3_GROUP_DIM, K, x);
+        exl3_hadamard_rotate_256(x);
+        const int64_t n = n_out - g*GGML_EXL3_GROUP_DIM < GGML_EXL3_GROUP_DIM ? n_out - g*GGML_EXL3_GROUP_DIM : GGML_EXL3_GROUP_DIM;
+        for (int64_t i = 0; i < n; i++) {
+            dst[g*GGML_EXL3_GROUP_DIM + i] = x[i]*ggml_fp16_to_fp32(signs[g*GGML_EXL3_GROUP_DIM + i]);
+        }
+    }
+}
+
+void ggml_exl3_decode_ngram_row(const int16_t * row, int K, const ggml_fp16_t * bias, float * dst) {
+    ggml_exl3_decode_ring(row, GGML_EXL3_ROW_DIM, K, dst);
+    for (int i = 0; i < GGML_EXL3_ROW_DIM; i++) {
+        dst[i] = dst[i] + ggml_fp16_to_fp32(bias[i]);
+    }
+}
+
+int64_t ggml_exl3_ngram_head(const int64_t * head_offsets, int64_t n_heads, int64_t idx) {
+    // searchsorted(head_offsets, idx, right = True) - 1, clamped as NGramEmbedding.fetch_rows does
+    int64_t h = 0;
+    while (h < n_heads && head_offsets[h] <= idx) {
+        h++;
+    }
+    h -= 1;
+    return h < 0 ? 0 : h >= n_heads ? n_heads - 1 : h;
+}
