@@ -5,11 +5,12 @@
 // arrival counters), then the dot kernel. A block of the dot kernel computes T = 2 adjacent 16-column tiles for up to 8
 // rows, its warps splitting K; the last block to finish a 128-column segment applies the output rotation and the
 // output scale to it.
-// More rows (prefill, RDNA3): exl3_rotate_split writes H(x * suh) as f16 hi + lo parts with a power-of-two scale per
-// row, then exl3_gemm_kernel decodes 128-column x 32-k slabs of W_hat into LDS once per block and k step and runs f16
-// WMMAs on both parts, with the output rotation in registers. This follows exllamav3's dispatch (direct quantized
-// kernels for few rows; from 144 rows exllamav3 reconstructs W in fp16 and calls hgemm), but reconstructs per tile
-// inside the GEMM instead of the whole weight, and the tile loop is the one of the MMB GEMM in mmb.cu.
+// More rows (prefill, RDNA3): exl3_rotate_split writes H(x * suh) in f16 (hi, plus the lo part when two products are
+// needed) with a power-of-two scale per row, then a GEMM decodes 128-column x 32-k slabs of W_hat into LDS once per
+// block and k step and runs f16 WMMAs, with the output rotation in registers: exl3_gemm1_kernel (one product, 256 rows
+// per block) or exl3_gemm_kernel (hi + lo, f32 grade); exl3_gemm_products picks one. This follows exllamav3's dispatch
+// (direct quantized kernels for few rows; from 144 rows exllamav3 reconstructs W in fp16 and calls hgemm), but decodes
+// per tile inside the GEMM instead of the whole weight, and the tile loop is the one of the MMB GEMM in mmb.cu.
 //
 // Adapted from turboderp-org/exllamav3 at a3bfbfd0d3c0cea67815146a19fcd2bb3f84709a (MIT licence, below):
 //   exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_tiles_rdna.cuh   per-lane load plan, tile decoders, the 16-bit
@@ -29,10 +30,10 @@
 // - x may be a strided 4-D tensor. In the dot kernel rows past 8 run in groups of 8, one pass over the weights per
 //   group.
 // - always T = 2 tiles per wave; the number of warps per block is chosen at launch.
-// - the GEMM path keeps f32-grade accuracy (exllamav3 rounds the activations to fp16 for its GEMMs): W_hat is exact in
-//   f16 and xh = hi + lo carries ~22 bits, so the op stays at NMSE ~1e-13 against ggml_mul_mat on the f32 W. The two
-//   products double the WMMA work of a single f16 product; the WMMA f32 accumulate truncates, so each k step
-//   accumulates from zero and is added in f32 (see exl3_gemm_kernel).
+// - the GEMM path rounds only the rotated activations (W_hat is exact in f16), and only where this backend context's
+//   own F32-weight GEMM rounds both operands to f16 (exl3_gemm_products); elsewhere xh = hi + lo carries ~22 bits and
+//   the op stays at NMSE ~1e-13 against ggml_mul_mat on the f32 W, at twice the WMMA work. In that path the WMMA f32
+//   accumulate truncates, so each k step accumulates from zero and is added in f32 (see exl3_gemm_kernel).
 //
 // exllamav3 licence:
 //
@@ -59,6 +60,7 @@
 // SOFTWARE.
 
 #include "exl3.cuh"
+#include "mmb.cuh"
 
 #if defined(GGML_USE_EXL3)
 
@@ -753,7 +755,7 @@ typedef uint32_t exl3_u4   __attribute__((ext_vector_type(4))); // an array of H
 // xh = H(x*suh) per 128 block, then per row a power of two s with max|xh|*s in [2^14, 2^15) (s = 1 for a row without
 // a finite nonzero value): hi = f16(xh*s), lo = f16(xh*s - hi), inv[r] = 1/s. The product with W_hat (exact in f16) of
 // hi + lo carries ~22 significant bits of xh. One block of 8 warps per row, warp w holds the segments w, w + 8, ...
-template <int S>
+template <int S, bool LO>
 static __global__ void __launch_bounds__(256) exl3_rotate_split(
         const float * __restrict__ x, const half * __restrict__ suh, half * __restrict__ xhi, half * __restrict__ xlo,
         float * __restrict__ inv, const int k, const int ne1, const int ne2, const int64_t s1, const int64_t s2,
@@ -807,7 +809,7 @@ static __global__ void __launch_bounds__(256) exl3_rotate_split(
     const float sc = __uint_as_float((uint32_t) (127 + sh) << 23);
 
     half * hr = xhi + (int64_t) r*k;
-    half * lr = xlo + (int64_t) r*k;
+    half * lr = LO ? xlo + (int64_t) r*k : nullptr;
 #pragma unroll
     for (int s = 0; s < S; ++s) {
         const int seg = warp + 8*s;
@@ -817,7 +819,9 @@ static __global__ void __launch_bounds__(256) exl3_rotate_split(
                 const float t = v[s][i]*sc;
                 const half  h = __float2half_rn(t);
                 hr[seg*EXL3_HAD + i*32 + lane] = h;
-                lr[seg*EXL3_HAD + i*32 + lane] = __float2half_rn(t - __half2float(h));
+                if constexpr (LO) {
+                    lr[seg*EXL3_HAD + i*32 + lane] = __float2half_rn(t - __half2float(h));
+                }
             }
         }
     }
@@ -1042,11 +1046,186 @@ static __global__ void __launch_bounds__(256) exl3_gemm_kernel(
 #endif // defined(RDNA3)
 }
 
+// One f16 product: y = H(xh_hi W_hat)*svh/128 with BM = 128 output columns and BN = 256 rows per block; warp w holds
+// rows w*32 .. w*32 + 31 as two 16-row tiles over all 128 columns, so each A fragment read from LDS feeds two WMMAs and
+// each decoded tile serves 256 rows. Op bench, 200 linears of Qwen3.5-4B at 512 rows, same clock: 140 ms, against 163
+// for one product in the loop of exl3_gemm_kernel (16 rows per warp) and 277 for its two products. The WMMAs accumulate
+// across k in place: the truncation (2.5e-10 at k 2560 .. 3.2e-9 at k 9216 in exl3_gemm_kernel) stays small against
+// the f16 rounding of xh.
+template <int bits, int cb>
+static __global__ void __launch_bounds__(256) exl3_gemm1_kernel(
+        const int16_t * __restrict__ trellis, const half * __restrict__ xhi, const float * __restrict__ inv,
+        const half * __restrict__ svh, float * __restrict__ dst, const int k, const int n, const int rows) {
+#if defined(RDNA3)
+    constexpr int BM         = EXL3_GEMM_BM;
+    constexpr int BN         = 2*EXL3_GEMM_BN;
+    constexpr int BK         = EXL3_GEMM_BK;
+    constexpr int LS         = EXL3_GEMM_LS;
+    constexpr int R          = exl3_lane_plan<bits>::R;
+    constexpr int tile_bytes = exl3_width<bits>::tile_bytes;
+    constexpr int KT         = BK/16;
+    constexpr int B_ITEMS    = BN*BK/8/256;
+    static_assert(BM == 8*16 && BN == 8*32, "one column tile and 32 rows per warp");
+
+    __shared__ __align__(16) uint16_t As[BM*LS];
+    __shared__ __align__(16) uint16_t Bs[BN*LS];
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const int n0   = blockIdx.x*BM;
+    const int t0   = blockIdx.y*BN;
+    const int n_steps = k / BK;
+    const uint32_t kt_stride = (uint32_t) (n/16)*tile_bytes;
+
+    const exl3_lane_plan<bits> lp = exl3_make_lane_plan<bits>(lane);
+    exl3_g_char * tq = (exl3_g_char *) exl3_uni_ptr((const char *) trellis + (size_t) (n0/16 + warp)*tile_bytes);
+
+    const int c  = lane / 4;
+    const int r0 = (lane % 4)*2;
+    uint32_t * a_st0 = (uint32_t *) (As + (warp*16 + c    )*LS + r0);
+    uint32_t * a_st1 = (uint32_t *) (As + (warp*16 + c + 8)*LS + r0);
+
+    const exl3_u4 * xsrc[B_ITEMS];
+    exl3_u4       * xdst[B_ITEMS];
+#pragma unroll
+    for (int i = 0; i < B_ITEMS; ++i) {
+        const int it  = tid + i*256;
+        const int row = min(t0 + it / (BK/8), rows - 1);
+        xsrc[i] = (const exl3_u4 *) (xhi + (int64_t) row*k + (it % (BK/8))*8);
+        xdst[i] = (exl3_u4 *) (Bs + (it / (BK/8))*LS + (it % (BK/8))*8);
+    }
+
+    uint32_t raw[KT][R];
+    exl3_u4  bst[B_ITEMS];
+#define EXL3_GEMM_LOAD(ks_)                                                       \
+    do {                                                                          \
+        _Pragma("unroll")                                                         \
+        for (int j = 0; j < KT; ++j) {                                            \
+            exl3_g_char * tp = tq + (size_t) ((ks_)*KT + j)*kt_stride;            \
+            _Pragma("unroll")                                                     \
+            for (int i = 0; i < R; ++i) {                                         \
+                raw[j][i] = exl3_ld_u32(tp, lp.off[i]);                           \
+            }                                                                     \
+        }                                                                         \
+        _Pragma("unroll")                                                         \
+        for (int i = 0; i < B_ITEMS; ++i) {                                       \
+            bst[i] = xsrc[i][(ks_)*(BK/8)];                                       \
+        }                                                                         \
+    } while (0)
+#define EXL3_GEMM_STORE()                                                         \
+    do {                                                                          \
+        _Pragma("unroll")                                                         \
+        for (int j = 0; j < KT; ++j) {                                            \
+            half2 f0[2];                                                          \
+            half2 f1[2];                                                          \
+            exl3_decode_tile<bits, cb>(raw[j], lp, f0, f1);                       \
+            a_st0[j*8]     = __builtin_bit_cast(uint32_t, f0[0]);                 \
+            a_st0[j*8 + 4] = __builtin_bit_cast(uint32_t, f0[1]);                 \
+            a_st1[j*8]     = __builtin_bit_cast(uint32_t, f1[0]);                 \
+            a_st1[j*8 + 4] = __builtin_bit_cast(uint32_t, f1[1]);                 \
+        }                                                                         \
+        _Pragma("unroll")                                                         \
+        for (int i = 0; i < B_ITEMS; ++i) {                                       \
+            *xdst[i] = bst[i];                                                    \
+        }                                                                         \
+    } while (0)
+
+    exl3_v8f acc[2][8];
+    const exl3_v8f zero = {};
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            acc[t][i] = zero;
+        }
+    }
+
+    EXL3_GEMM_LOAD(0);
+    EXL3_GEMM_STORE();
+    __syncthreads();
+    for (int ks = 0; ks < n_steps; ++ks) {
+        // as in exl3_gemm_kernel: the last step reloads itself, the loads stay ahead of the WMMAs. Two LDS stages (one
+        // barrier per step, 60 KB, 241 VGPRs) measured slower on every container shape: 139.3 vs 137.4 ms per 200
+        // linears at 512 rows and the same clock, k = 9216 912 vs 814 us (two blocks per WGP instead of three)
+        EXL3_GEMM_LOAD(min(ks + 1, n_steps - 1));
+        __builtin_amdgcn_sched_barrier(0);
+        const int r = lane % 16;
+#pragma unroll
+        for (int j = 0; j < KT; ++j) {
+            const exl3_v16h b0 = exl3_frag(Bs + (warp*32      + r)*LS + j*16);
+            const exl3_v16h b1 = exl3_frag(Bs + (warp*32 + 16 + r)*LS + j*16);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const exl3_v16h a = exl3_frag(As + (i*16 + r)*LS + j*16);
+                acc[0][i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b0, a, acc[0][i]);
+                acc[1][i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b1, a, acc[1][i]);
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        __syncthreads();
+        EXL3_GEMM_STORE();
+        __syncthreads();
+    }
+#undef EXL3_GEMM_LOAD
+#undef EXL3_GEMM_STORE
+
+    float sv[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sv[i] = __half2float(svh[n0 + i*16 + lane % 16])*(1.0f/EXL3_HAD);
+    }
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        exl3_fwht_lanes<1>(acc[t], lane);
+        exl3_fwht_lanes<2>(acc[t], lane);
+        exl3_fwht_lanes<4>(acc[t], lane);
+        exl3_fwht_lanes<8>(acc[t], lane);
+#pragma unroll
+        for (int hb = 1; hb < 8; hb <<= 1) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i & hb) {
+                    continue;
+                }
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const float a = acc[t][i][e];
+                    const float b = acc[t][i | hb][e];
+                    acc[t][i][e]      = a + b;
+                    acc[t][i | hb][e] = a - b;
+                }
+            }
+        }
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int row = t0 + warp*32 + t*16 + 2*e + lane/16;
+            if (row < rows) {
+                const float s = inv[row];
+                float * y = dst + (int64_t) row*n + n0 + lane % 16;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    y[i*16] = acc[t][i][e]*(sv[i]*s);
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(trellis, xhi, inv, svh, dst, k, n, rows);
+    NO_DEVICE_CODE;
+#endif // defined(RDNA3)
+}
+
 template <int bits, int cb>
 static void exl3_gemm_launch(const int16_t * trellis, const half * xhi, const half * xlo, const float * inv,
         const half * svh, float * dst, const int64_t k, const int64_t n, const int64_t rows, cudaStream_t stream) {
-    const dim3 grid((unsigned) (n/EXL3_GEMM_BM), (unsigned) ((rows + EXL3_GEMM_BN - 1)/EXL3_GEMM_BN));
-    exl3_gemm_kernel<bits, cb><<<grid, 256, 0, stream>>>(trellis, xhi, xlo, inv, svh, dst, (int) k, (int) n, (int) rows);
+    if (xlo == nullptr) {
+        const dim3 grid((unsigned) (n/EXL3_GEMM_BM), (unsigned) ((rows + 2*EXL3_GEMM_BN - 1)/(2*EXL3_GEMM_BN)));
+        exl3_gemm1_kernel<bits, cb><<<grid, 256, 0, stream>>>(trellis, xhi, inv, svh, dst, (int) k, (int) n, (int) rows);
+    } else {
+        const dim3 grid((unsigned) (n/EXL3_GEMM_BM), (unsigned) ((rows + EXL3_GEMM_BN - 1)/EXL3_GEMM_BN));
+        exl3_gemm_kernel<bits, cb><<<grid, 256, 0, stream>>>(trellis, xhi, xlo, inv, svh, dst, (int) k, (int) n, (int) rows);
+    }
 }
 
 template <int bits>
@@ -1068,7 +1247,8 @@ static void exl3_gemm_launch_cb(const int cb, const int16_t * trellis, const hal
     }
 }
 
-static void exl3_rotate_split_launch(const ggml_tensor * x, const half * suh, half * xhi, half * xlo, float * inv,
+template <bool LO>
+static void exl3_rotate_split_launch_lo(const ggml_tensor * x, const half * suh, half * xhi, half * xlo, float * inv,
         const int64_t k, const int64_t rows, cudaStream_t stream) {
     const int64_t segs_per_warp = (k/EXL3_HAD + 7)/8;
     const float * xd = (const float *) x->data;
@@ -1079,15 +1259,49 @@ static void exl3_rotate_split_launch(const ggml_tensor * x, const half * suh, ha
     const int64_t s3  = x->nb[3]/sizeof(float);
     const dim3 grid((unsigned) rows);
     if (segs_per_warp <= 4) {
-        exl3_rotate_split<4><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3);
+        exl3_rotate_split<4, LO><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3);
     } else if (segs_per_warp <= 8) {
-        exl3_rotate_split<8><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3);
+        exl3_rotate_split<8, LO><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3);
     } else if (segs_per_warp <= 16) {
-        exl3_rotate_split<16><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3);
+        exl3_rotate_split<16, LO><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3);
     } else {
         GGML_ASSERT(segs_per_warp <= 32);
-        exl3_rotate_split<32><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3);
+        exl3_rotate_split<32, LO><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3);
     }
+}
+
+static void exl3_rotate_split_launch(const ggml_tensor * x, const half * suh, half * xhi, half * xlo, float * inv,
+        const int64_t k, const int64_t rows, cudaStream_t stream) {
+    if (xlo != nullptr) {
+        exl3_rotate_split_launch_lo<true>(x, suh, xhi, xlo, inv, k, rows, stream);
+    } else {
+        exl3_rotate_split_launch_lo<false>(x, suh, xhi, xlo, inv, k, rows, stream);
+    }
+}
+
+// Products per k step on the GEMM path. W_hat is exact in f16, so the one rounding is that of xh = H(x*suh): one f16
+// product (exl3_gemm1_kernel, NMSE 3.5e-8 .. 4.7e-8 against a double sum on the container shapes at 512 rows) or hi + lo
+// (exl3_gemm_kernel, f32 grade, <= 1.7e-13, twice the WMMA work). The default follows the GEMM this backend context runs
+// for an F32 weight of the same shape on the same x: one product where mmb takes it (mmb_f32split_kernel, one f16 product
+// with both operands rounded: 7.4e-8 .. 8.5e-8 on those shapes at 512 and 513 rows), two where it is f32 (MMVF, MMF or
+// rocBLAS: 1e-14 .. 3e-12 at 1 .. 511 rows, and for strided x). GGML_EXL3_GEMM_PRODUCTS=1 or 2 overrides the choice.
+static int exl3_gemm_products(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * dst,
+        const int64_t k, const int64_t n) {
+    static const int forced = getenv("GGML_EXL3_GEMM_PRODUCTS") ? atoi(getenv("GGML_EXL3_GEMM_PRODUCTS")) : 0;
+    if (forced == 1 || forced == 2) {
+        return forced;
+    }
+    ggml_tensor w = {};
+    w.type  = GGML_TYPE_F32;
+    w.ne[0] = k;
+    w.ne[1] = n;
+    w.ne[2] = 1;
+    w.ne[3] = 1;
+    w.nb[0] = sizeof(float);
+    w.nb[1] = k*sizeof(float);
+    w.nb[2] = n*w.nb[1];
+    w.nb[3] = w.nb[2];
+    return ggml_cuda_mmb_supported_mm(ctx, &w, x, dst) ? 1 : 2;
 }
 
 bool ggml_cuda_exl3_supports_op(const int device, const ggml_tensor * op) {
@@ -1130,22 +1344,28 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     if (rows > EXL3_GEMV_ROWS && k <= EXL3_SPLIT_K && GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[ctx.device].cc)) {
         GGML_ASSERT((rows + EXL3_GEMM_BN - 1)/EXL3_GEMM_BN <= 65535);
+        // one f16 product or hi + lo, following the F32-weight GEMM of this context (exl3_gemm_products)
+        const bool two = exl3_gemm_products(ctx, x, dst, k, n) == 2;
         ggml_cuda_pool_alloc<half>  xhi(ctx.pool(), rows*k);
-        ggml_cuda_pool_alloc<half>  xlo(ctx.pool(), rows*k);
+        ggml_cuda_pool_alloc<half>  xlo(ctx.pool());
         ggml_cuda_pool_alloc<float> inv(ctx.pool(), rows);
-        exl3_rotate_split_launch(x, (const half *) suh->data, xhi.get(), xlo.get(), inv.get(), k, rows, stream);
+        if (two) {
+            xlo.alloc(rows*k);
+        }
+        half * xl = two ? xlo.get() : nullptr;
+        exl3_rotate_split_launch(x, (const half *) suh->data, xhi.get(), xl, inv.get(), k, rows, stream);
         switch (bits) {
-            case 1: exl3_gemm_launch_cb<1>(cb, tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
-            case 2: exl3_gemm_launch_cb<2>(cb, tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
-            case 3: exl3_gemm_launch_cb<3>(cb, tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
-            case 4: exl3_gemm_launch_cb<4>(cb, tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
-            case 5: exl3_gemm_launch_cb<5>(cb, tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
-            case 6: exl3_gemm_launch_cb<6>(cb, tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
-            case 7: exl3_gemm_launch_cb<7>(cb, tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
-            case 8: exl3_gemm_launch_cb<8>(cb, tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
-            case 17: exl3_gemm_launch<17, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
-            case 18: exl3_gemm_launch<18, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
-            case 19: exl3_gemm_launch<19, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, rows, stream); break;
+            case 1: exl3_gemm_launch_cb<1>(cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
+            case 2: exl3_gemm_launch_cb<2>(cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
+            case 3: exl3_gemm_launch_cb<3>(cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
+            case 4: exl3_gemm_launch_cb<4>(cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
+            case 5: exl3_gemm_launch_cb<5>(cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
+            case 6: exl3_gemm_launch_cb<6>(cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
+            case 7: exl3_gemm_launch_cb<7>(cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
+            case 8: exl3_gemm_launch_cb<8>(cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
+            case 17: exl3_gemm_launch<17, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
+            case 18: exl3_gemm_launch<18, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
+            case 19: exl3_gemm_launch<19, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, stream); break;
             default: GGML_ABORT("fatal error");
         }
         return;

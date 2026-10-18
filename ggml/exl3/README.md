@@ -72,10 +72,22 @@ adapted from the RDNA GEMV kernels of exllamav3 (MIT, see the file header). One 
 the dot kernel decodes the trellis in registers to the exact codebook values, multiplies them with the f32
 activations (`v_fma_mix_f32`), and the last block to finish a 128-column segment applies `H` and `svh / 128` to it.
 One pass over the weights serves up to 8 rows; up to 32 rows run in groups of 8, one pass per group. On RDNA3, more
-rows (prompt processing) take a GEMM: `H(x * suh)` is split into f16 hi + lo parts with a power-of-two scale per row,
-and a WMMA kernel decodes 128-column slabs of `W_hat` into LDS once per block and k step and multiplies both parts
-(f32 accumulation, each k step added in f32), so the op stays at f32 accuracy. RDNA4 keeps the groups of 8 for every
-row count. Other backends (CUDA, Vulkan, ...) do not support the op.
+rows (prompt processing) take a GEMM: `H(x * suh)` is written in f16 with a power-of-two scale per row, and a WMMA
+kernel decodes 128-column slabs of `W_hat` into LDS once per block and k step (`W_hat` is exact in f16) and applies
+`H` and `svh / 128` to the result in registers. The rotated activations are rounded to f16 once (one product, NMSE
+~4e-8 against a double sum) or split into hi + lo parts (two products, f32 accumulation per k step, NMSE ~1e-13).
+The default takes the precision of the GEMM the same backend context runs for an F32 weight of the same shape: one
+product where that GEMM is mmb's `mmb_f32split_kernel` (one f16 product with both operands rounded, NMSE ~8e-8:
+from 512 rows with the mmb opt-in that llama sets, for contiguous x), two products where it is f32 (MMVF, MMF,
+rocBLAS: up to 511 rows, strided x, no mmb). `GGML_EXL3_GEMM_PRODUCTS=1` or `2` forces one choice. RDNA4 keeps the
+groups of 8 for every row count. Other backends (CUDA, Vulkan, ...) do not support the op.
+
+exllamav3's wide-row path (reconstruct `W` in fp16 with the Hadamards and scales folded in, then hgemm) was measured
+here as a prototype and not kept: on the Qwen3.5-4B shapes at 512 rows the reconstruction pass alone took 356..480 us
+per 2560 x 9216 linear (~70 ms per 512-token ubatch, its memory floor ~41 ms), the fp16-weight GEMM with the same
+tile loop took 2.0..2.5 ms against 0.85 ms for the decoding GEMM (four times the weight bytes per row block), and
+rocBLAS chose a 64x32x8 tile (5.3..7.3 ms). Sum over the 200 linears: 390..400 ms (own GEMM) and 944..968 ms
+(rocBLAS) against 131..139 ms for the one-product decoding GEMM. Its accuracy equals that of the F32-weight mmb GEMM.
 
 ## Model loading (llama)
 
