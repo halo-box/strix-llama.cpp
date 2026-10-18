@@ -71,8 +71,11 @@ The HIP backend (`ggml/src/ggml-cuda/exl3.cu`, built with `GGML_EXL3=ON`) runs t
 adapted from the RDNA GEMV kernels of exllamav3 (MIT, see the file header). One kernel computes `H(x * suh)` in f32;
 the dot kernel decodes the trellis in registers to the exact codebook values, multiplies them with the f32
 activations (`v_fma_mix_f32`), and the last block to finish a 128-column segment applies `H` and `svh / 128` to it.
-One pass over the weights serves up to 8 rows; more rows run in groups of 8, one pass per group, which is slow for
-prompt processing. Other backends (CUDA, Vulkan, ...) do not support the op.
+One pass over the weights serves up to 8 rows; up to 32 rows run in groups of 8, one pass per group. On RDNA3, more
+rows (prompt processing) take a GEMM: `H(x * suh)` is split into f16 hi + lo parts with a power-of-two scale per row,
+and a WMMA kernel decodes 128-column slabs of `W_hat` into LDS once per block and k step and multiplies both parts
+(f32 accumulation, each k step added in f32), so the op stays at f32 accuracy. RDNA4 keeps the groups of 8 for every
+row count. Other backends (CUDA, Vulkan, ...) do not support the op.
 
 ## Model loading (llama)
 
@@ -107,7 +110,7 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
 - `test-exl3 --gguf FILE`: decodes every EXL3 linear of a container and prints sha256 of `W_hat` and `W` per tensor.
 - The op: `test-exl3` also runs `ggml_exl3_mul_mat` against `ggml_mul_mat` on the f32 `W` of `ggml_exl3_dequantize`
   for every rate x codebook case; `test-exl3 --op-gguf FILE` does it on the first linear of each (k, n, K) of a
-  container at 1 to 513 rows. Both require NMSE <= 1e-10. With `--backend NAME` first (e.g. `ROCm0`) the op runs on
+  container at 1 to 513 rows (both sides of the 32-row GEMM threshold). Both require NMSE <= 1e-10. With `--backend NAME` first (e.g. `ROCm0`) the op runs on
   that backend while `ggml_mul_mat` stays on the CPU. `test-backend-ops -o EXL3_MUL_MAT` has the op cases.
 - `test-exl3 --dequantize IN OUT`: writes a plain GGUF of a container, for model-level comparisons. Each EXL3 linear
   becomes `<base>.weight` F32 `[k, n]` from `ggml_exl3_dequantize`; the `exl3.*` keys are dropped and every other key
