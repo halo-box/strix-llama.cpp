@@ -111,13 +111,14 @@ static void llama_verify_hadamard_graph(
     }
 }
 
-// check that only EXL3_MUL_MAT reads an EXL3 trellis and only EXL3_GET_ROWS an EXL3 row table: any other op would
+// check that only EXL3_MUL_MAT(_ID) reads an EXL3 trellis and only EXL3_GET_ROWS an EXL3 row table: any other op would
 // take them for a weight
 static void llama_verify_exl3_graph(ggml_cgraph * gf, const llama_exl3 & exl3) {
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         const ggml_tensor * node = ggml_graph_node(gf, i);
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            if (node->src[s] && exl3.linears.count(node->src[s]) && (node->op != GGML_OP_EXL3_MUL_MAT || s != 0)) {
+            if (node->src[s] && exl3.linears.count(node->src[s]) &&
+                    ((node->op != GGML_OP_EXL3_MUL_MAT && node->op != GGML_OP_EXL3_MUL_MAT_ID) || s != 0)) {
                 throw std::runtime_error(format(
                     "EXL3 weight '%s' is consumed by %s; this graph's matmul path does not support EXL3 weights",
                     node->src[s]->name, ggml_op_name(node->op)));

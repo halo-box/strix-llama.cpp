@@ -600,7 +600,7 @@ static int64_t llama_tensor_n_params(const ggml_tensor * t) {
         return name.size() > n && name.compare(name.size() - n, n, suffix) == 0;
     };
     if (ends_with(".exl3_trellis")) {
-        return t->ne[1]*16 * t->ne[2]*16;
+        return t->ne[1]*16 * t->ne[2]*16 * t->ne[3];
     }
     if (ends_with(".exl3_suh") || ends_with(".exl3_svh")) {
         return 0;
@@ -1218,6 +1218,18 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 512);
                 op_tensor = ggml_exl3_mul_mat(ctx, w, b, suh, svh, hparams.exl3_codebook);
             } break;
+        case GGML_OP_EXL3_MUL_MAT_ID:
+            {
+                // w is the stack of expert trellises, as for GGML_OP_MUL_MAT_ID
+                const int64_t k        = w->ne[2]*16;
+                const int64_t n_expert = w->ne[3];
+                const int64_t n_used   = std::min<int64_t>(n_expert, 2);
+                ggml_tensor * suh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, n_expert);
+                ggml_tensor * svh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, w->ne[1]*16, n_expert);
+                ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, 512);
+                ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 512);
+                op_tensor = ggml_exl3_mul_mat_id(ctx, w, b, ids, suh, svh, hparams.exl3_codebook);
+            } break;
         case GGML_OP_EXL3_GET_ROWS:
             {
                 // w is the row table of the token embedding; its signs go to the same buffer type
@@ -1537,25 +1549,29 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (trellis != nullptr) {
             const ggml_tensor * suh = get_tensor_meta((base + ".exl3_suh").c_str());
             const ggml_tensor * svh = get_tensor_meta((base + ".exl3_svh").c_str());
-            const int64_t k  = ne.size() == 2 ? ne.begin()[0] : 0;
-            const int64_t n  = ne.size() == 2 ? ne.begin()[1] : 0;
+            // a linear {k, n}, or the experts of a MoE layer {k, n, E} stacked in one trellis with one suh/svh row each
+            const bool    experts = ne.size() == 3;
+            const int64_t k  = ne.size() >= 2 ? ne.begin()[0] : 0;
+            const int64_t n  = ne.size() >= 2 ? ne.begin()[1] : 0;
+            const int64_t ex = experts ? ne.begin()[2] : 1;
             const int64_t tw = trellis->ne[0];
             // 16*K int16 per 16x16 tile: K = 1..8, or 1.5, 2.5, 3.5 with mul1
             const bool rate_ok = (tw % 16 == 0 && tw >= 16 && tw <= 128) || (hparams.exl3_codebook == 2 && (tw == 24 || tw == 40 || tw == 56));
-            if (get_tensor_meta(name.c_str()) != nullptr || suh == nullptr || svh == nullptr || k <= 0 || n <= 0 ||
-                    k % 128 != 0 || n % 128 != 0 || trellis->type != GGML_TYPE_I16 || !rate_ok ||
-                    trellis->ne[1]*16 != n || trellis->ne[2]*16 != k || trellis->ne[3] != 1 ||
-                    suh->type != GGML_TYPE_F16 || suh->ne[0] != k || ggml_nelements(suh) != k ||
-                    svh->type != GGML_TYPE_F16 || svh->ne[0] != n || ggml_nelements(svh) != n) {
+            if (get_tensor_meta(name.c_str()) != nullptr || suh == nullptr || svh == nullptr || k <= 0 || n <= 0 || ex <= 0 ||
+                    ne.size() > 3 || k % 128 != 0 || n % 128 != 0 || trellis->type != GGML_TYPE_I16 || !rate_ok ||
+                    trellis->ne[1]*16 != n || trellis->ne[2]*16 != k || trellis->ne[3] != ex ||
+                    suh->type != GGML_TYPE_F16 || suh->ne[0] != k || ggml_nelements(suh) != k*ex ||
+                    svh->type != GGML_TYPE_F16 || svh->ne[0] != n || ggml_nelements(svh) != n*ex) {
                 throw std::runtime_error(format("%s: EXL3 linear '%s' does not match the weight %s",
                         __func__, base.c_str(), llama_format_tensor_shape(std::vector<int64_t>(ne)).c_str()));
             }
-            if ((flags & (TENSOR_DUPLICATED | TENSOR_ALLOW_RESHAPE)) || llm_tensor_info_for(tn.tensor).op != GGML_OP_MUL_MAT) {
+            if ((flags & (TENSOR_DUPLICATED | TENSOR_ALLOW_RESHAPE)) ||
+                    llm_tensor_info_for(tn.tensor).op != (experts ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT)) {
                 throw std::runtime_error(format("%s: EXL3 linear '%s' is not used as a plain matmul weight", __func__, base.c_str()));
             }
 
             ggml_tensor t_meta = *trellis;
-            exl3_op = GGML_OP_EXL3_MUL_MAT;
+            exl3_op = experts ? GGML_OP_EXL3_MUL_MAT_ID : GGML_OP_EXL3_MUL_MAT;
             ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
             exl3_op = GGML_OP_NONE;
             if (buft == nullptr) {

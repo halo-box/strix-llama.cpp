@@ -1792,6 +1792,17 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
+    // EXL3 experts: no scale tensor, no MoE cache, and LoRA adapters cannot name them
+    if (exl3) {
+        if (const auto it = exl3->linears.find(w); it != exl3->linears.end()) {
+            GGML_ASSERT(w_s == nullptr);
+            if (slots != nullptr) {
+                throw std::runtime_error("EXL3 experts cannot be used with the MoE expert cache");
+            }
+            return ggml_exl3_mul_mat_id(ctx0, w, cur, ids, it->second.suh, it->second.svh, hparams.exl3_codebook);
+        }
+    }
+
     cur = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?

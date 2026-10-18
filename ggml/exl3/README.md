@@ -134,7 +134,9 @@ is chosen with an `EXL3_MUL_MAT` probe. `build_lora_mm` makes `ggml_exl3_mul_mat
 a normal EXL3 block of linears (the NextN probe of the loader sees an EXL3 `eh_proj`). A token embedding row table
 stands in the same way for `token_embd.weight` (probe `EXL3_GET_ROWS`, not as a tied output head): `build_get_rows`
 decodes its rows with `ggml_exl3_get_rows` in `build_inp_embd` and in the qwen35 MTP graph, and the graph check also
-refuses any other reader of a row table. Supported archs: qwen35. EXL3 weights cannot be combined with LoRA adapters,
+refuses any other reader of a row table. A stack of experts stands for the `{k, n, E}` weight of a `MUL_MAT_ID`
+(probe `EXL3_MUL_MAT_ID`) and `build_lora_mm_id` makes `ggml_exl3_mul_mat_id` for it; the MoE expert cache is refused.
+Supported archs: qwen35, lfm2moe. EXL3 weights cannot be combined with LoRA adapters,
 prism.hadamard, the MTP draft vocabulary or a virtual model of `llama_model_init_from_user` (metadata without a
 complete tensor set).
 
