@@ -696,8 +696,15 @@ struct llama_exl3_linear {
     ggml_tensor * svh;
 };
 
+// EXL3 row-ring table (quantized token embedding): the trellis tensor stands for the table
+struct llama_exl3_rows {
+    ggml_tensor * signs;
+    int64_t       n_out; // decoded row width
+};
+
 struct llama_exl3 {
     std::unordered_map<const ggml_tensor *, llama_exl3_linear> linears; // trellis -> scales
+    std::unordered_map<const ggml_tensor *, llama_exl3_rows>   rows;    // row table -> signs
 };
 
 // MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep

@@ -467,6 +467,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_EXL3_VERSION,                        "exl3.version"                        },
     { LLM_KV_EXL3_CODEBOOK,                       "exl3.codebook"                       },
     { LLM_KV_EXL3_HADAMARD_SIZE,                  "exl3.hadamard_size"                  },
+    { LLM_KV_EXL3_ROWS_VERSION,                   "exl3.rows.version"                   },
 
     // deprecated
     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },

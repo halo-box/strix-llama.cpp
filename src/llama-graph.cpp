@@ -2695,6 +2695,15 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
 }
 
 // input embeddings with optional lora
+ggml_tensor * llm_graph_context::build_get_rows(ggml_tensor * table, ggml_tensor * ids) const {
+    if (exl3) {
+        if (const auto it = exl3->rows.find(table); it != exl3->rows.end()) {
+            return ggml_exl3_get_rows(ctx0, table, ids, it->second.signs, it->second.n_out);
+        }
+    }
+    return ggml_get_rows(ctx0, table, ids);
+}
+
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
@@ -2739,13 +2748,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
     {
-        embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        embd0 = build_get_rows(tok_embd, inp->tokens);
         ggml_build_forward_order(gf, embd0);
 
         embd1 = inp->embd;
 
         if (has_mixed) {
-            embd2 = ggml_get_rows(ctx0, tok_embd, inp->mixed_tokens);
+            embd2 = build_get_rows(tok_embd, inp->mixed_tokens);
             ggml_build_forward_order(gf, embd2);
         }
     }

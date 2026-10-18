@@ -1218,6 +1218,14 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * b   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 512);
                 op_tensor = ggml_exl3_mul_mat(ctx, w, b, suh, svh, hparams.exl3_codebook);
             } break;
+        case GGML_OP_EXL3_GET_ROWS:
+            {
+                // w is the row table of the token embedding; its signs go to the same buffer type
+                const int64_t groups = (hparams.n_embd + 255)/256;
+                ggml_tensor * signs = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, groups);
+                ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+                op_tensor = ggml_exl3_get_rows(ctx, w, ids, signs, hparams.n_embd);
+            } break;
         default:
             GGML_ABORT("%s: missing test for op %s for tensor %s", __func__, ggml_op_name(op), w->name);
     }
@@ -1287,7 +1295,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
-    bool is_exl3 = false;
+    // the op of an EXL3 tensor, for the buffer type probe (GGML_OP_NONE otherwise)
+    ggml_op exl3_op = GGML_OP_NONE;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
@@ -1375,8 +1384,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         } else {
             op = info.op;
         }
-        if (is_exl3) {
-            op = GGML_OP_EXL3_MUL_MAT;
+        if (exl3_op != GGML_OP_NONE) {
+            op = exl3_op;
         }
 
         // sanity checks
@@ -1546,9 +1555,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
 
             ggml_tensor t_meta = *trellis;
-            is_exl3 = true;
+            exl3_op = GGML_OP_EXL3_MUL_MAT;
             ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
-            is_exl3 = false;
+            exl3_op = GGML_OP_NONE;
             if (buft == nullptr) {
                 // unused: buft_for_tensor counted the trellis
                 size_data -= ggml_nbytes(suh) + ggml_nbytes(svh);
@@ -1564,6 +1573,48 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 res = res ? res : t;
             }
             n_created += 3;
+            return res;
+        }
+
+        // EXL3 row-ring table (a quantized token embedding): "<name>.exl3r_trellis/_signs" instead of "<name>.weight"
+        const ggml_tensor * table = get_tensor_meta((base + ".exl3r_trellis").c_str());
+        if (table != nullptr) {
+            const ggml_tensor * signs = get_tensor_meta((base + ".exl3r_signs").c_str());
+            const int64_t width  = ne.size() == 2 ? ne.begin()[0] : 0;
+            const int64_t n_rows = ne.size() == 2 ? ne.begin()[1] : 0;
+            // rows are padded to whole groups of 256, one ring of 1 + 16*K words each
+            const int64_t groups = (width + 255)/256;
+            const int64_t rw     = groups > 0 && table->ne[0] % groups == 0 ? table->ne[0]/groups - 1 : 0;
+            if (get_tensor_meta(name.c_str()) != nullptr || signs == nullptr || width <= 0 || n_rows <= 0 ||
+                    table->type != GGML_TYPE_I16 || table->ne[1] != n_rows || table->ne[2] != 1 || table->ne[3] != 1 ||
+                    rw < 16 || rw > 128 || rw % 16 != 0 || signs->type != GGML_TYPE_F16 || signs->ne[0] != 256 ||
+                    signs->ne[1] != groups || signs->ne[2] != 1 || signs->ne[3] != 1) {
+                throw std::runtime_error(format("%s: EXL3 row table '%s' does not match the weight %s",
+                        __func__, base.c_str(), llama_format_tensor_shape(std::vector<int64_t>(ne)).c_str()));
+            }
+            if (flags & TENSOR_DUPLICATED) {
+                throw std::runtime_error(format("%s: EXL3 row table '%s' cannot be the tied output head", __func__, base.c_str()));
+            }
+            if ((flags & TENSOR_ALLOW_RESHAPE) || llm_tensor_info_for(tn.tensor).op != GGML_OP_GET_ROWS) {
+                throw std::runtime_error(format("%s: EXL3 row table '%s' is not used as an embedding table", __func__, base.c_str()));
+            }
+
+            ggml_tensor t_meta = *table;
+            exl3_op = GGML_OP_EXL3_GET_ROWS;
+            ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+            exl3_op = GGML_OP_NONE;
+            if (buft == nullptr) {
+                size_data -= ggml_nbytes(signs);
+                n_created += 1;
+                return nullptr;
+            }
+
+            ggml_context * ctx = ctx_for_buft(buft);
+            ggml_tensor  * res = ggml_dup_tensor(ctx, table);
+            ggml_set_name(res, ggml_get_name(table));
+            ggml_tensor  * sg  = ggml_dup_tensor(ctx, signs);
+            ggml_set_name(sg, ggml_get_name(signs));
+            n_created += 2;
             return res;
         }
     }

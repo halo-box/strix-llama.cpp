@@ -2385,6 +2385,11 @@ void llama_model_base::load_hparams_exl3(llama_model_loader & ml) {
     if (hadamard_size != 128) {
         throw std::runtime_error(format("unsupported exl3.hadamard_size: %u", hadamard_size));
     }
+    // row-ring tables (token embeddings) have their own layout version
+    uint32_t rows_version = 0;
+    if (ml.get_key(LLM_KV_EXL3_ROWS_VERSION, rows_version, false) && rows_version != 1) {
+        throw std::runtime_error(format("unsupported exl3.rows.version: %u", rows_version));
+    }
     static const char * codebooks[] = { "3inst", "mcg", "mul1" };
     for (int i = 0; i < 3; i++) {
         if (codebook == codebooks[i]) {
@@ -2449,7 +2454,20 @@ void llama_model_base::load_tensors_exl3() {
         exl3.linears.emplace(t, llama_exl3_linear { su->second, sv->second });
     }
 
-    LLAMA_LOG_INFO("%s: %zu EXL3 linears, codebook %d\n", __func__, exl3.linears.size(), hparams.exl3_codebook);
+    // row tables decode to the embedding width (only the token embedding is one)
+    const std::string suffix_rows = ".exl3r_trellis";
+    for (const auto & [name, t] : tensors_by_name) {
+        if (name.size() <= suffix_rows.size() || name.compare(name.size() - suffix_rows.size(), suffix_rows.size(), suffix_rows) != 0) {
+            continue;
+        }
+        const auto sg = by_name.find(name.substr(0, name.size() - suffix_rows.size()) + ".exl3r_signs");
+        if (sg == by_name.end() || t != tok_embd) {
+            throw std::runtime_error(format("exl3: '%s' has no signs or is not the token embedding", name.c_str()));
+        }
+        exl3.rows.emplace(t, llama_exl3_rows { sg->second, (int64_t) hparams.n_embd });
+    }
+
+    LLAMA_LOG_INFO("%s: %zu EXL3 linears, codebook %d, %zu row tables\n", __func__, exl3.linears.size(), hparams.exl3_codebook, exl3.rows.size());
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {

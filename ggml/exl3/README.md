@@ -119,9 +119,12 @@ rocBLAS chose a 64x32x8 tile (5.3..7.3 ms). Sum over the 200 linears: 390..400 m
 before the caller sees a missing tensor, so an optional head is not replaced by the tied embedding. The buffer type
 is chosen with an `EXL3_MUL_MAT` probe. `build_lora_mm` makes `ggml_exl3_mul_mat` for such a weight (table
 `llama_model::exl3`), and a check on the reserved graph refuses any other op that reads a trellis. An MTP layer is
-a normal EXL3 block of linears (the NextN probe of the loader sees an EXL3 `eh_proj`). Supported archs: qwen35. EXL3
-weights cannot be combined with LoRA adapters, prism.hadamard, the MTP draft vocabulary or a virtual model of
-`llama_model_init_from_user` (metadata without a complete tensor set).
+a normal EXL3 block of linears (the NextN probe of the loader sees an EXL3 `eh_proj`). A token embedding row table
+stands in the same way for `token_embd.weight` (probe `EXL3_GET_ROWS`, not as a tied output head): `build_get_rows`
+decodes its rows with `ggml_exl3_get_rows` in `build_inp_embd` and in the qwen35 MTP graph, and the graph check also
+refuses any other reader of a row table. Supported archs: qwen35. EXL3 weights cannot be combined with LoRA adapters,
+prism.hadamard, the MTP draft vocabulary or a virtual model of `llama_model_init_from_user` (metadata without a
+complete tensor set).
 
 ## Direct loading of an exllamav3 directory
 
