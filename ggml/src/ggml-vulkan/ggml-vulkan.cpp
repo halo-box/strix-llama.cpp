@@ -6979,15 +6979,17 @@ void deferred_memset(void * dst, uint32_t val, size_t size, std::vector<vk_stagi
 // constant, not a fill formula. Only shapes the upstream rule leaves at 1 are touched; m <= 512 and k >= 4096 keep it
 // to this class, and n >= the tile's N keeps every n <= 8 verify batch and small ubatch out. Split-K changes the
 // accumulation order, so the output is not bit-equal to the unsplit GEMM (KLD-gated). The fused epilogues (f16 out,
-// HC_UP_MIX) disable split-K before this rule, so they never run per partial. GGML_VK_SKINNY_SPLITK=0 disables,
-// =N sets the split (2..16, probe). Dispatch census paths: MUL_MAT_SKINNY_ELIGIBLE (the shape qualifies), MUL_MAT_SKINNY_SPLITK
+// HC_UP_MIX) disable split-K before this rule, so they never run per partial. GGML_VK_SKINNY_SPLITK=0 (default) disables,
+// =1 enables the measured split of 8, =N sets the split (2..16, probe). Dispatch census paths: MUL_MAT_SKINNY_ELIGIBLE (the shape qualifies), MUL_MAT_SKINNY_SPLITK
 // (it split), MUL_MAT_SKINNY_DECLINED (a fused epilogue or the caller disabled split-K).
 static void ggml_vk_path_census_add(const char * name);
 
+// Off by default: FN -1.5 / -0.9%, 27B 0.0 / 0.0% when off, gfx1151 RADV ABBA n=2, 2026-10-18; opt-in until a model shows a gain
 static uint32_t ggml_vk_skinny_split_k_env() {
     static const uint32_t v = [] {
         const char * e = getenv("GGML_VK_SKINNY_SPLITK");
-        return e ? (uint32_t) std::max(0, atoi(e)) : 8u;
+        const int n = e ? atoi(e) : 0;
+        return n == 1 ? 8u : (uint32_t) std::max(0, n);
     }();
     return v;
 }
