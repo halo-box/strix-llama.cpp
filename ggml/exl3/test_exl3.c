@@ -5,9 +5,11 @@
 // of diag(suh) H W_hat H diag(svh) evaluated exactly (integers) on that W_hat; the float64 dequant() of the oracle
 // differs from it only by its own rounding (160 of the 884736 values, by one f32 ulp or near zero).
 //
-// The op tests compare ggml_exl3_mul_mat with ggml_mul_mat on the f32 W of ggml_exl3_dequantize and require
-// NMSE <= 1e-10. ggml_mul_mat runs on the CPU backend; the op runs there too, or on the backend given with --backend.
-// They also print the NMSE of each against a double sum on the first rows.
+// The op tests compare ggml_exl3_mul_mat with ggml_mul_mat on the f32 W of ggml_exl3_dequantize. ggml_mul_mat runs on
+// the CPU backend; the op runs there too, or on the backend given with --backend. A case passes when the op is within
+// NMSE 1e-10 of ggml_mul_mat (f32 grade), or when its NMSE against a double sum on the first rows is at most twice that
+// of the backend's own ggml_mul_mat on the same f32 W, x and shape (the GPU prefill GEMMs of this tree round both
+// operands to f16; the backend is opted in to them as llama opts in its contexts).
 //
 // test-exl3                -> codebook tables, every rate x codebook on synthetic tiles, shape checks, op on synthetic tiles
 // test-exl3 --gguf FILE    -> decode every EXL3 linear of a GGUF container, one JSON line per tensor with sha256
@@ -198,7 +200,8 @@ static int test_checks(void) {
     return n_fail;
 }
 
-#define OP_NMSE_MAX 1e-10
+#define OP_NMSE_MAX   1e-10
+#define OP_NMSE_CALIB 2.0 // allowed NMSE against the double sum, relative to the backend's own ggml_mul_mat
 
 static int op_n_threads(void) {
     const char * env = getenv("EXL3_TEST_THREADS");
@@ -221,6 +224,19 @@ static ggml_backend_t op_backend_init(void) {
     ggml_backend_t be = ggml_backend_init_by_name(op_backend_name, NULL);
     if (be == NULL) {
         fprintf(stderr, "no backend named %s\n", op_backend_name);
+        return NULL;
+    }
+    // the BF16/F16 WMMA GEMMs (mmb) from 512 rows, as llama sets every context it creates for a model other than qwen4exp
+    ggml_backend_dev_t dev = ggml_backend_get_device(be);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+    static const char * const names[2] = { "ggml_backend_cuda_set_mmb_enabled", "ggml_backend_cuda_set_mmb_small_batch" };
+    for (int i = 0; i < 2 && reg != NULL; i++) {
+        void * p = ggml_backend_reg_get_proc_address(reg, names[i]);
+        if (p != NULL) {
+            void (*set)(ggml_backend_t, bool);
+            memcpy(&set, &p, sizeof(set));
+            set(be, i == 0);
+        }
     }
     return be;
 }
@@ -243,15 +259,19 @@ static double nmse(const float * a, const float * b, int64_t n) {
 }
 
 // one EXL3 linear in a buffer of the op backend, with its f32 W as a ggml [k, n] tensor for ggml_mul_mat in a CPU buffer
+// and, when the op backend is not the CPU, a copy in a buffer of the op backend
 struct op_weights {
     struct ggml_context * ctx;
     ggml_backend_buffer_t buf;
     struct ggml_context * ctx_w;
     ggml_backend_buffer_t buf_w;
+    struct ggml_context * ctx_wb;
+    ggml_backend_buffer_t buf_wb;
     struct ggml_tensor  * trellis;
     struct ggml_tensor  * suh;
     struct ggml_tensor  * svh;
     struct ggml_tensor  * w;
+    struct ggml_tensor  * w_be;
     float               * w_t; // [n][k] host copy for the double sums
     int64_t               k;
     int64_t               n;
@@ -295,19 +315,31 @@ static bool op_weights_init(struct op_weights * ow, ggml_backend_t be, ggml_back
     ggml_backend_tensor_set(ow->suh, suh, 0, ggml_nbytes(ow->suh));
     ggml_backend_tensor_set(ow->svh, svh, 0, ggml_nbytes(ow->svh));
     ggml_backend_tensor_set(ow->w, ow->w_t, 0, ggml_nbytes(ow->w));
+    if (be != be_ref) {
+        ow->ctx_wb = ggml_init(params);
+        ow->w_be   = ggml_new_tensor_2d(ow->ctx_wb, GGML_TYPE_F32, k, n);
+        ow->buf_wb = ggml_backend_alloc_ctx_tensors(ow->ctx_wb, be);
+        if (ow->buf_wb == NULL) {
+            return false;
+        }
+        ggml_backend_tensor_set(ow->w_be, ow->w_t, 0, ggml_nbytes(ow->w_be));
+    }
     return true;
 }
 
 static void op_weights_free(struct op_weights * ow) {
     ggml_backend_buffer_free(ow->buf);
     ggml_backend_buffer_free(ow->buf_w);
+    ggml_backend_buffer_free(ow->buf_wb);
     ggml_free(ow->ctx);
     ggml_free(ow->ctx_w);
+    ggml_free(ow->ctx_wb);
     free(ow->w_t);
 }
 
 // nr rows of x; x_pad > 0 makes x a strided view whose padding is NaN
-// the op runs on be, ggml_mul_mat on be_ref; prints one JSON line, returns 1 on failure
+// the op runs on be, ggml_mul_mat on be_ref and, when ow->w_be is set, on be too; prints one JSON line, returns 1 on
+// failure
 static int op_check_rows(ggml_backend_t be, ggml_backend_t be_ref, const struct op_weights * ow, int64_t nr, int64_t x_pad,
                          uint32_t seed, int64_t n_true, const char * label) {
     const int64_t k  = ow->k;
@@ -320,8 +352,12 @@ static int op_check_rows(ggml_backend_t be, ggml_backend_t be_ref, const struct 
     struct ggml_tensor * x_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kx, nr);
     struct ggml_tensor * x      = x_pad > 0 ? ggml_view_2d(ctx, x_full, k, nr, x_full->nb[1], 0) : x_full;
     struct ggml_tensor * y_op   = ggml_exl3_mul_mat(ctx, ow->trellis, x, ow->suh, ow->svh, ow->cb);
+    struct ggml_tensor * y_be   = ow->w_be ? ggml_mul_mat(ctx, ow->w_be, x) : NULL;
     struct ggml_cgraph * gf     = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, y_op);
+    if (y_be) {
+        ggml_build_forward_expand(gf, y_be);
+    }
     struct ggml_tensor * x_rfull = ggml_new_tensor_2d(ctx_ref, GGML_TYPE_F32, kx, nr);
     struct ggml_tensor * x_r     = x_pad > 0 ? ggml_view_2d(ctx_ref, x_rfull, k, nr, x_rfull->nb[1], 0) : x_rfull;
     struct ggml_tensor * y_ref   = ggml_mul_mat(ctx_ref, ow->w, x_r);
@@ -332,12 +368,13 @@ static int op_check_rows(ggml_backend_t be, ggml_backend_t be_ref, const struct 
     float * xd   = (float *) malloc(kx*nr*sizeof(float));
     float * yo   = (float *) malloc(n*nr*sizeof(float));
     float * yr   = (float *) malloc(n*nr*sizeof(float));
+    float * yb   = (float *) malloc(n*nr*sizeof(float));
     float * yt   = (float *) malloc(n*(n_true > 0 ? n_true : 1)*sizeof(float));
     ggml_backend_buffer_t buf     = ggml_backend_alloc_ctx_tensors(ctx, be);
     ggml_backend_buffer_t buf_ref = ggml_backend_alloc_ctx_tensors(ctx_ref, be_ref);
     if (!ggml_backend_supports_op(be, y_op)) {
         fprintf(stderr, "%s: EXL3_MUL_MAT is not supported by the %s backend\n", label, ggml_backend_name(be));
-    } else if (buf != NULL && buf_ref != NULL && xd != NULL && yo != NULL && yr != NULL && yt != NULL) {
+    } else if (buf != NULL && buf_ref != NULL && xd != NULL && yo != NULL && yr != NULL && yb != NULL && yt != NULL) {
         for (int64_t r = 0; r < nr; r++) {
             for (int64_t i = 0; i < kx; i++) {
                 xd[r*kx + i] = i < k ? rand_act(&seed, i) : NAN;
@@ -349,6 +386,7 @@ static int op_check_rows(ggml_backend_t be, ggml_backend_t be_ref, const struct 
             ggml_backend_graph_compute(be_ref, gf_ref) == GGML_STATUS_SUCCESS) {
             ggml_backend_tensor_get(y_op, yo, 0, ggml_nbytes(y_op));
             ggml_backend_tensor_get(y_ref, yr, 0, ggml_nbytes(y_ref));
+            ggml_backend_tensor_get(y_be ? y_be : y_ref, yb, 0, ggml_nbytes(y_ref));
 
             n_true = n_true < nr ? n_true : nr;
             for (int64_t r = 0; r < n_true; r++) {
@@ -365,12 +403,17 @@ static int op_check_rows(ggml_backend_t be, ggml_backend_t be_ref, const struct 
             const double e  = nmse(yo, yr, n*nr);
             const double eo = n_true > 0 ? nmse(yo, yt, n*n_true) : -1.0;
             const double er = n_true > 0 ? nmse(yr, yt, n*n_true) : -1.0;
-            fail = !(e <= OP_NMSE_MAX);
+            const double eb = n_true > 0 ? nmse(yb, yt, n*n_true) : -1.0;
+            const bool   f32_grade  = e <= OP_NMSE_MAX;
+            const bool   calibrated = n_true > 0 && eo <= OP_NMSE_CALIB*eb;
+            fail = !(f32_grade || calibrated);
             printf("{\"case\": \"%s\", \"backend\": \"%s\", \"k\": %lld, \"n\": %lld, \"rows\": %lld, \"x_pad\": %lld, "
-                   "\"nmse_op_vs_mul_mat\": %.3e, \"nmse_op_vs_f64\": %.3e, \"nmse_mul_mat_vs_f64\": %.3e, \"f64_rows\": %lld, "
+                   "\"nmse_op_vs_mul_mat\": %.3e, \"nmse_op_vs_f64\": %.3e, \"nmse_mul_mat_vs_f64\": %.3e, "
+                   "\"nmse_be_mul_mat_vs_f64\": %.3e, \"op_over_be\": %.3f, \"f64_rows\": %lld, \"gate\": \"%s\", "
                    "\"pass\": %s}\n",
                    label, ggml_backend_name(be), (long long) k, (long long) n, (long long) nr, (long long) x_pad, e, eo, er,
-                   (long long) n_true, fail ? "false" : "true");
+                   eb, eb > 0.0 ? eo/eb : -1.0, (long long) n_true, f32_grade ? "f32" : calibrated ? "calibrated" : "none",
+                   fail ? "false" : "true");
             fflush(stdout);
         }
     }
@@ -378,6 +421,7 @@ static int op_check_rows(ggml_backend_t be, ggml_backend_t be_ref, const struct 
     free(xd);
     free(yo);
     free(yr);
+    free(yb);
     free(yt);
     ggml_backend_buffer_free(buf);
     ggml_backend_buffer_free(buf_ref);

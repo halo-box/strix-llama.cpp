@@ -110,8 +110,12 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
 - `test-exl3 --gguf FILE`: decodes every EXL3 linear of a container and prints sha256 of `W_hat` and `W` per tensor.
 - The op: `test-exl3` also runs `ggml_exl3_mul_mat` against `ggml_mul_mat` on the f32 `W` of `ggml_exl3_dequantize`
   for every rate x codebook case; `test-exl3 --op-gguf FILE` does it on the first linear of each (k, n, K) of a
-  container at 1 to 513 rows (both sides of the 32-row GEMM threshold). Both require NMSE <= 1e-10. With `--backend NAME` first (e.g. `ROCm0`) the op runs on
-  that backend while `ggml_mul_mat` stays on the CPU. `test-backend-ops -o EXL3_MUL_MAT` has the op cases.
+  container at 1 to 513 rows (both sides of the 32-row GEMM threshold and of the 512-row mmb threshold). With
+  `--backend NAME` first (e.g. `ROCm0`) the op runs on that backend while `ggml_mul_mat` stays on the CPU; the same
+  `ggml_mul_mat` on the f32 `W` also runs on that backend (opted in to mmb as llama does). A case passes when the op
+  is within NMSE 1e-10 of the CPU `ggml_mul_mat` (f32 grade), or when its NMSE against a double sum on the first rows
+  is at most twice that of the backend's own `ggml_mul_mat` (the `nmse_be_mul_mat_vs_f64` field). The fp16 values
+  of `W_hat` are checked bit for bit by the decode tests above. `test-backend-ops -o EXL3_MUL_MAT` has the op cases.
 - `test-exl3 --dequantize IN OUT`: writes a plain GGUF of a container, for model-level comparisons. Each EXL3 linear
   becomes `<base>.weight` F32 `[k, n]` from `ggml_exl3_dequantize`; the `exl3.*` keys are dropped and every other key
   and tensor is copied unchanged. Any build can load the result.
