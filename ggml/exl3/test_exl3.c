@@ -15,7 +15,7 @@
 // xorshift32 inputs: n-gram rows of 160 with a bias, and token embedding rows of 4 rings of 256 with +/-1 signs, cropped.
 //
 // test-exl3                -> codebook tables, every rate x codebook on synthetic tiles, shape checks, op on synthetic tiles,
-//                             row rings for K = 1..8
+//                             row rings for K = 1..8, EXL3_GET_ROWS against the row decoder
 // test-exl3 --gguf FILE    -> decode every EXL3 linear of a GGUF container, one JSON line per tensor with sha256
 // test-exl3 --op-gguf FILE -> op on the first linear of each (k, n, K) in a GGUF container, at the decode and prompt row counts
 // test-exl3 --dequantize IN OUT -> plain GGUF reference of a container: each EXL3 linear becomes "<base>.weight" F32 from
@@ -954,6 +954,80 @@ static int dequantize_gguf(const char * path_in, const char * path_out) {
     return ok ? 0 : 1;
 }
 
+// EXL3_GET_ROWS on the op backend against ggml_exl3_decode_embd_row, bit for bit
+static int test_get_rows_op(void) {
+    ggml_backend_t be = op_backend_init();
+    if (be == NULL) {
+        return 1;
+    }
+    int n_fail = 0;
+    const int64_t groups = 4;
+    const int64_t n_rows = 300;
+    const int64_t n_ids  = 37;
+    for (int K = 1; K <= 8; K++) {
+        for (int64_t n_out = 1000; n_out <= 1024; n_out += 24) {
+            uint32_t s = 0x13579BDFu + 0x9E3779B9u*(uint32_t) K;
+            const int64_t gw = ggml_exl3_ring_words(GGML_EXL3_GROUP_DIM, K);
+            int16_t     * table = (int16_t *)     malloc(n_rows*groups*gw*sizeof(int16_t));
+            ggml_fp16_t * signs = (ggml_fp16_t *) malloc(groups*GGML_EXL3_GROUP_DIM*sizeof(ggml_fp16_t));
+            int32_t     * ids   = (int32_t *)     malloc(n_ids*sizeof(int32_t));
+            float       * y     = (float *)       malloc(n_ids*n_out*sizeof(float));
+            float       * y_ref = (float *)       malloc(n_out*sizeof(float));
+            for (int64_t r = 0; r < n_rows*groups; r++) {
+                const ggml_fp16_t sc = rand_f16(&s);
+                memcpy(&table[r*gw], &sc, sizeof(sc));
+                for (int64_t j = 1; j < gw; j++) {
+                    table[r*gw + j] = (int16_t) (uint16_t) (xorshift32(&s) >> 16);
+                }
+            }
+            for (int64_t j = 0; j < groups*GGML_EXL3_GROUP_DIM; j++) {
+                signs[j] = rand_f16(&s);
+            }
+            for (int64_t i = 0; i < n_ids; i++) {
+                ids[i] = i == 0 ? (int32_t) (n_rows - 1) : (int32_t) (xorshift32(&s) % n_rows);
+            }
+
+            struct ggml_init_params params = { 8*ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
+            struct ggml_context * ctx = ggml_init(params);
+            struct ggml_tensor  * t_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I16, groups*gw, n_rows);
+            struct ggml_tensor  * t_signs = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, GGML_EXL3_GROUP_DIM, groups);
+            struct ggml_tensor  * t_ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_ids);
+            struct ggml_tensor  * out     = ggml_exl3_get_rows(ctx, t_table, t_ids, t_signs, n_out);
+            struct ggml_cgraph  * gf      = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, out);
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+            bool ok = buf != NULL && ggml_backend_supports_op(be, out);
+            if (ok) {
+                ggml_backend_tensor_set(t_table, table, 0, ggml_nbytes(t_table));
+                ggml_backend_tensor_set(t_signs, signs, 0, ggml_nbytes(t_signs));
+                ggml_backend_tensor_set(t_ids, ids, 0, ggml_nbytes(t_ids));
+                ok = ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS;
+            }
+            if (ok) {
+                ggml_backend_tensor_get(out, y, 0, ggml_nbytes(out));
+                for (int64_t i = 0; ok && i < n_ids; i++) {
+                    ggml_exl3_decode_embd_row(&table[ids[i]*groups*gw], groups, K, signs, n_out, y_ref);
+                    ok = memcmp(y_ref, &y[i*n_out], n_out*sizeof(float)) == 0;
+                }
+            }
+            if (!ok) {
+                fprintf(stderr, "EXL3_GET_ROWS on %s, K = %d, n_out = %lld: differs from ggml_exl3_decode_embd_row\n",
+                        ggml_backend_name(be), K, (long long) n_out);
+                n_fail++;
+            }
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            free(table);
+            free(signs);
+            free(ids);
+            free(y);
+            free(y_ref);
+        }
+    }
+    ggml_backend_free(be);
+    return n_fail;
+}
+
 int main(int argc, char ** argv) {
     if (argc >= 3 && strcmp(argv[1], "--backend") == 0) {
         op_backend_name = argv[2];
@@ -981,10 +1055,11 @@ int main(int argc, char ** argv) {
     n_fail += test_checks();
     n_fail += test_rows();
     n_fail += test_op();
+    n_fail += test_get_rows_op();
     if (n_fail) {
         fprintf(stderr, "test-exl3: %d failures\n", n_fail);
         return 1;
     }
-    printf("test-exl3: OK (3 codebooks, %d rate x codebook cases, op on all of them, row rings K = 1..8)\n", (int) (sizeof(tile_goldens)/sizeof(tile_goldens[0])));
+    printf("test-exl3: OK (3 codebooks, %d rate x codebook cases, op on all of them, row rings and EXL3_GET_ROWS for K = 1..8)\n", (int) (sizeof(tile_goldens)/sizeof(tile_goldens[0])));
     return 0;
 }

@@ -5867,6 +5867,62 @@ struct test_exl3_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_EXL3_GET_ROWS
+struct test_exl3_get_rows : public test_case {
+    const int     K;
+    const int64_t groups;
+    const int64_t n_out;
+    const int64_t n_rows;
+    const int64_t n_ids;
+
+    std::string vars() override {
+        return VARS_TO_STR5(K, groups, n_out, n_rows, n_ids);
+    }
+
+    test_exl3_get_rows(int K = 4, int64_t groups = 4, int64_t n_out = 1000, int64_t n_rows = 300, int64_t n_ids = 17)
+        : K(K), groups(groups), n_out(n_out), n_rows(n_rows), n_ids(n_ids) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_I16, groups*(1 + 16*K), n_rows);
+        ggml_set_name(table, "table");
+
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_ids);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * signs = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 256, groups);
+        ggml_set_name(signs, "signs");
+
+        ggml_tensor * out = ggml_exl3_get_rows(ctx, table, ids, signs, n_out);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x3E14);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I16) {
+                // raw bytes: every ring decodes to finite values, word 0 is its fp16 scale
+                std::vector<int16_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = (int16_t) (gen() >> 16);
+                    if (i % (1 + 16*K) == 0) {
+                        data[i] = (int16_t) ggml_fp32_to_fp16(std::uniform_real_distribution<float>(-0.1f, 0.1f)(gen));
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & d : data) {
+                    d = (int32_t) (gen() % n_rows);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -13754,6 +13810,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}));
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}, true));
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {13, 3}, true));
+    for (int K : {1, 4, 8}) {
+        test_cases.emplace_back(new test_exl3_get_rows(K, 4, 1000, 300, 17));
+    }
+    test_cases.emplace_back(new test_exl3_get_rows(3, 1, 256, 64, 512));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

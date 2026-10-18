@@ -102,6 +102,9 @@ from 512 rows with the mmb opt-in that llama sets, for contiguous x), two produc
 rocBLAS: up to 511 rows, strided x, no mmb). `GGML_EXL3_GEMM_PRODUCTS=1` or `2` forces one choice. RDNA4 keeps the
 groups of 8 for every row count. Other backends (CUDA, Vulkan, ...) do not support the op.
 
+`ggml_exl3_get_rows(ctx, table, ids, signs, n_out)` (`GGML_OP_EXL3_GET_ROWS`) decodes the rows `ids` of a token
+embedding row table to F32 `[n_out, n]`; the CPU backend runs `ggml_exl3_decode_embd_row` on each row.
+
 exllamav3's wide-row path (reconstruct `W` in fp16 with the Hadamards and scales folded in, then hgemm) was measured
 here as a prototype and not kept: on the Qwen3.5-4B shapes at 512 rows the reconstruction pass alone took 356..480 us
 per 2560 x 9216 linear (~70 ms per 512-token ubatch, its memory floor ~41 ms), the fp16-weight GEMM with the same
@@ -142,7 +145,8 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
 
 - `test-exl3`: the three codebook tables, and all 27 rate x codebook cases on synthetic tiles, against hashes made
   with exllamav3's `trellis.py`; type and shape checks; row rings for K = 1..8 (n-gram rows with a bias, token
-  embedding rows with signs, cropped) against hashes made with exllamav3's `ngram_codec.dequant_rows`.
+  embedding rows with signs, cropped) against hashes made with exllamav3's `ngram_codec.dequant_rows`, and
+  `EXL3_GET_ROWS` on the op backend against that decoder, bit for bit.
 - `test-exl3 --gguf FILE`: decodes every EXL3 linear of a container and prints sha256 of `W_hat` and `W` per tensor.
 - The op: `test-exl3` also runs `ggml_exl3_mul_mat` against `ggml_mul_mat` on the f32 `W` of `ggml_exl3_dequantize`
   for every rate x codebook case; `test-exl3 --op-gguf FILE` does it on the first linear of each (k, n, K) of a
@@ -151,7 +155,8 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
   `ggml_mul_mat` on the f32 `W` also runs on that backend (opted in to mmb as llama does). A case passes when the op
   is within NMSE 1e-10 of the CPU `ggml_mul_mat` (f32 grade), or when its NMSE against a double sum on the first rows
   is at most twice that of the backend's own `ggml_mul_mat` (the `nmse_be_mul_mat_vs_f64` field). The fp16 values
-  of `W_hat` are checked bit for bit by the decode tests above. `test-backend-ops -o EXL3_MUL_MAT` has the op cases.
+  of `W_hat` are checked bit for bit by the decode tests above. `test-backend-ops -o EXL3_MUL_MAT` and
+  `-o EXL3_GET_ROWS` have the op cases.
 - `test-exl3 --dequantize IN OUT`: writes a plain GGUF of a container, for model-level comparisons. Each EXL3 linear
   becomes `<base>.weight` F32 `[k, n]` from `ggml_exl3_dequantize`; the `exl3.*` keys are dropped and every other key
   and tensor is copied unchanged. Any build can load the result.

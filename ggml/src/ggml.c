@@ -1220,9 +1220,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "EXL3_MUL_MAT",
+    "EXL3_GET_ROWS",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1337,9 +1338,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "exl3(X)*y",
+    "exl3_get_rows(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6836,6 +6838,36 @@ struct ggml_tensor * ggml_exl3_mul_mat(
     result->src[1] = x;
     result->src[2] = suh;
     result->src[3] = svh;
+
+    return result;
+}
+
+// ggml_exl3_get_rows
+
+struct ggml_tensor * ggml_exl3_get_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * signs,
+        int64_t               n_out) {
+    GGML_ASSERT(table->type == GGML_TYPE_I16 && ggml_is_contiguous(table) && ggml_n_dims(table) <= 2);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_vector(ids));
+    GGML_ASSERT(signs->type == GGML_TYPE_F16 && ggml_is_contiguous(signs) && signs->ne[0] == 256 && ggml_n_dims(signs) <= 2);
+
+    // a row is one ring of 1 + 16*K words per group of 256, K = 1..8
+    const int64_t groups = signs->ne[1];
+    const int64_t rw     = table->ne[0] % groups == 0 ? table->ne[0]/groups - 1 : 0;
+    GGML_ASSERT(rw >= 16 && rw <= 128 && rw % 16 == 0);
+    GGML_ASSERT(n_out > 0 && n_out <= groups*256);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_out, ids->ne[0]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_out);
+
+    result->op     = GGML_OP_EXL3_GET_ROWS;
+    result->src[0] = table;
+    result->src[1] = ids;
+    result->src[2] = signs;
 
     return result;
 }

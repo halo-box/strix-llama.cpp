@@ -243,3 +243,29 @@ void ggml_compute_forward_exl3_mul_mat(const ggml_compute_params * params, ggml_
         }
     }
 }
+
+bool ggml_cpu_exl3_get_rows_supports_op(const ggml_tensor * op) {
+    const ggml_tensor * table = op->src[0];
+    const ggml_tensor * signs = op->src[2];
+    return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+           ggml_exl3_embd_k(table->ne[0], signs->ne[1]) > 0;
+}
+
+// each row is decoded by ggml_exl3_decode_embd_row, the reference decoder, so the values are its values
+void ggml_compute_forward_exl3_get_rows(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * table = dst->src[0];
+    const ggml_tensor * ids   = dst->src[1];
+    const ggml_tensor * signs = dst->src[2];
+
+    const int64_t n_out  = ggml_get_op_params_i32(dst, 0);
+    const int64_t groups = signs->ne[1];
+    const int     K      = ggml_exl3_embd_k(table->ne[0], groups);
+    GGML_ASSERT(K > 0 && dst->ne[0] == n_out && ggml_is_contiguous(dst));
+
+    for (int64_t i = params->ith; i < ids->ne[0]; i += params->nth) {
+        const int32_t id = *(const int32_t *) ((const char *) ids->data + i*ids->nb[0]);
+        GGML_ASSERT(id >= 0 && id < table->ne[1]);
+        ggml_exl3_decode_embd_row((const int16_t *) ((const char *) table->data + id*table->nb[1]), groups, K,
+                (const ggml_fp16_t *) signs->data, n_out, (float *) ((char *) dst->data + i*dst->nb[1]));
+    }
+}

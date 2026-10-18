@@ -649,6 +649,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_EXL3_MUL_MAT,
+        GGML_OP_EXL3_GET_ROWS,
 
         GGML_OP_COUNT,
     };
@@ -2818,6 +2819,16 @@ extern "C" {
             struct ggml_tensor  * suh,
             struct ggml_tensor  * svh,
             int                   codebook);
+
+    // EXL3 row-ring table (quantized token embedding, see ggml/exl3/README.md): the decoded rows `ids` of `table`
+    //   table I16 [groups*(1 + 16*K), n_rows], ids I32 [n], signs F16 [256, groups] -> F32 [n_out, n], n_out <= groups*256
+    //   computed only by builds with GGML_EXL3
+    GGML_API struct ggml_tensor * ggml_exl3_get_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * signs,
+            int64_t               n_out);
 
     // custom operators
 
