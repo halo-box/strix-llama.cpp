@@ -510,6 +510,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 #else
             return false;
 #endif
+        case GGML_OP_EXL3_MUL_MAT_ID:
+#ifdef GGML_USE_EXL3
+            return ggml_cpu_exl3_mul_mat_id_supports_op(op);
+#else
+            return false;
+#endif
         default:
             return true;
     }

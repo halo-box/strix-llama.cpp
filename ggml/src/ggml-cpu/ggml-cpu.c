@@ -2449,6 +2449,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ABORT("EXL3_GET_ROWS needs a build with GGML_EXL3=ON");
 #endif
             } break;
+        case GGML_OP_EXL3_MUL_MAT_ID:
+            {
+#ifdef GGML_USE_EXL3
+                ggml_compute_forward_exl3_mul_mat_id(params, tensor);
+#else
+                GGML_ABORT("EXL3_MUL_MAT_ID needs a build with GGML_EXL3=ON");
+#endif
+            } break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2796,6 +2804,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_EXL3_MUL_MAT:
         case GGML_OP_EXL3_GET_ROWS:
+        case GGML_OP_EXL3_MUL_MAT_ID:
             {
                 n_tasks = n_threads;
             } break;
@@ -3356,6 +3365,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_EXL3_MUL_MAT:
                     {
                         cur = ggml_cpu_exl3_work_size(node, n_tasks);
+                    } break;
+                case GGML_OP_EXL3_MUL_MAT_ID:
+                    {
+                        cur = ggml_cpu_exl3_mul_mat_id_work_size(node, n_tasks);
                     } break;
 #endif
                 default:

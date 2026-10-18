@@ -105,6 +105,12 @@ from 512 rows with the mmb opt-in that llama sets, for contiguous x), two produc
 rocBLAS: up to 511 rows, strided x, no mmb). `GGML_EXL3_GEMM_PRODUCTS=1` or `2` forces one choice. RDNA4 keeps the
 groups of 8 for every row count. Other backends (CUDA, Vulkan, ...) do not support the op.
 
+`ggml_exl3_mul_mat_id(ctx, trellis, x, ids, suh, svh, codebook)` (`GGML_OP_EXL3_MUL_MAT_ID`) is the EXL3
+counterpart of `ggml_mul_mat_id` for a stack of experts: x F32 `[k, ne11, n_tokens]` (ne11 = 1 broadcasts x over the
+slots), ids I32 `[n_used, n_tokens]`, result F32 `[n, n_used, n_tokens]`. The CPU backend groups the (slot, token) rows
+by expert and runs each expert's rows through the routines of `EXL3_MUL_MAT` in the same order, so a row equals
+`EXL3_MUL_MAT` of that expert on the same rows bit for bit.
+
 `ggml_exl3_get_rows(ctx, table, ids, signs, n_out)` (`GGML_OP_EXL3_GET_ROWS`) decodes the rows `ids` of a token
 embedding row table to F32 `[n_out, n]`; the CPU backend runs `ggml_exl3_decode_embd_row` on each row.
 
@@ -153,8 +159,10 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
 - `test-exl3`: the three codebook tables, and all 27 rate x codebook cases on synthetic tiles, against hashes made
   with exllamav3's `trellis.py`; type and shape checks; row rings for K = 1..8 (n-gram rows with a bias, token
   embedding rows with signs, cropped) against hashes made with exllamav3's `ngram_codec.dequant_rows`, and
-  `EXL3_GET_ROWS` on the op backend against that decoder, bit for bit.
-- `test-exl3 --gguf FILE`: decodes every EXL3 linear of a container and prints sha256 of `W_hat` and `W` per tensor.
+  `EXL3_GET_ROWS` on the op backend against that decoder, bit for bit; `EXL3_MUL_MAT_ID` on the op backend against
+  `EXL3_MUL_MAT` per expert (bit for bit) and against `ggml_mul_mat_id` on the f32 W of the experts (NMSE 1e-10).
+- `test-exl3 --gguf FILE`: decodes every EXL3 linear of a container and prints sha256 of `W_hat` and `W` per tensor
+  (a stack of experts: all of them, one after the other).
 - The op: `test-exl3` also runs `ggml_exl3_mul_mat` against `ggml_mul_mat` on the f32 `W` of `ggml_exl3_dequantize`
   for every rate x codebook case; `test-exl3 --op-gguf FILE` does it on the first linear of each (k, n, K) of a
   container at 1 to 513 rows (both sides of the 32-row GEMM threshold and of the 512-row mmb threshold). With
@@ -163,10 +171,10 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
   is within NMSE 1e-10 of the CPU `ggml_mul_mat` (f32 grade), or when its NMSE against a double sum on the first rows
   is at most twice that of the backend's own `ggml_mul_mat` (the `nmse_be_mul_mat_vs_f64` field). The fp16 values
   of `W_hat` are checked bit for bit by the decode tests above. `test-backend-ops -o EXL3_MUL_MAT` and
-  `-o EXL3_GET_ROWS` have the op cases.
+  `-o EXL3_GET_ROWS` and `-o EXL3_MUL_MAT_ID` have the op cases.
 - `test-exl3 --dequantize IN OUT`: writes a plain GGUF of a container, for model-level comparisons. Each EXL3 linear
-  becomes `<base>.weight` F32 `[k, n]` from `ggml_exl3_dequantize`; the `exl3.*` keys are dropped and every other key
-  and tensor is copied unchanged. Any build can load the result.
+  becomes `<base>.weight` F32 `[k, n]` (a stack of experts F32 `[k, n, E]`) from `ggml_exl3_dequantize`; the `exl3.*`
+  keys are dropped and every other key and tensor is copied unchanged. Any build can load the result.
 - `test-exl3-dir`: writes a small synthetic qwen35 EXL3 directory (two shards with an index, a side file the index
   does not list, a vision tower, an MTP layer only in `config.json`) and checks the import, the transforms, the
   refusal of a repeated tensor name, and that the model loads and runs; then a second one with a stored MTP layer and a

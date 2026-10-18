@@ -20430,3 +20430,8 @@
 "CPU","EXL3_GET_ROWS","K=4,groups=4,n_out=1000,n_rows=300,n_ids=17","support","1","yes","CPU"
 "CPU","EXL3_GET_ROWS","K=8,groups=4,n_out=1000,n_rows=300,n_ids=17","support","1","yes","CPU"
 "CPU","EXL3_GET_ROWS","K=3,groups=1,n_out=256,n_rows=64,n_ids=512","support","1","yes","CPU"
+"CPU","EXL3_MUL_MAT_ID","k=256,n=384,n_exp=8,tile_words=32,codebook=2,n_used=2,ne11=1,n_tokens=13","support","1","yes","CPU"
+"CPU","EXL3_MUL_MAT_ID","k=256,n=384,n_exp=8,tile_words=32,codebook=2,n_used=2,ne11=2,n_tokens=13","support","1","yes","CPU"
+"CPU","EXL3_MUL_MAT_ID","k=384,n=256,n_exp=8,tile_words=56,codebook=2,n_used=3,ne11=3,n_tokens=1","support","1","yes","CPU"
+"CPU","EXL3_MUL_MAT_ID","k=256,n=256,n_exp=6,tile_words=64,codebook=1,n_used=4,ne11=1,n_tokens=37","support","1","yes","CPU"
+"CPU","EXL3_MUL_MAT_ID","k=256,n=384,n_exp=16,tile_words=32,codebook=2,n_used=4,ne11=4,n_tokens=512","support","1","yes","CPU"

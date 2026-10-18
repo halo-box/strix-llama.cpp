@@ -650,6 +650,7 @@ extern "C" {
 
         GGML_OP_EXL3_MUL_MAT,
         GGML_OP_EXL3_GET_ROWS,
+        GGML_OP_EXL3_MUL_MAT_ID,
 
         GGML_OP_COUNT,
     };
@@ -2816,6 +2817,18 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * trellis,
             struct ggml_tensor  * x,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
+            int                   codebook);
+
+    // EXL3 experts (MoE), the EXL3 counterpart of ggml_mul_mat_id: expert e of trellis [16*K, n/16, k/16, E] with
+    //   suh [k, E] and svh [n, E]; x F32 [k, ne11, n_tokens], ids I32 [n_used, n_tokens], ne11 divides n_used ->
+    //   F32 [n, n_used, n_tokens]; computed only by builds with GGML_EXL3
+    GGML_API struct ggml_tensor * ggml_exl3_mul_mat_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
             struct ggml_tensor  * suh,
             struct ggml_tensor  * svh,
             int                   codebook);

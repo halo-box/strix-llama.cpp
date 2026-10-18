@@ -5867,6 +5867,80 @@ struct test_exl3_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_EXL3_MUL_MAT_ID
+struct test_exl3_mul_mat_id : public test_case {
+    const int64_t k;
+    const int64_t n;
+    const int64_t n_exp;
+    const int64_t tile_words; // 16*K
+    const int     codebook;
+    const int64_t n_used;
+    const int64_t ne11;       // 1: x broadcast over the slots, n_used: one x per slot
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR8(k, n, n_exp, tile_words, codebook, n_used, ne11, n_tokens);
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2*k*n*n_used*n_tokens;
+    }
+
+    test_exl3_mul_mat_id(int64_t k = 256, int64_t n = 384, int64_t n_exp = 8, int64_t tile_words = 32, int codebook = 2,
+            int64_t n_used = 2, int64_t ne11 = 1, int64_t n_tokens = 13)
+        : k(k), n(n), n_exp(n_exp), tile_words(tile_words), codebook(codebook), n_used(n_used), ne11(ne11), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * trellis = ggml_new_tensor_4d(ctx, GGML_TYPE_I16, tile_words, n/16, k/16, n_exp);
+        ggml_set_name(trellis, "trellis");
+
+        ggml_tensor * suh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, n_exp);
+        ggml_set_name(suh, "suh");
+
+        ggml_tensor * svh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, n_exp);
+        ggml_set_name(svh, "svh");
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, ne11, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_exl3_mul_mat_id(ctx, trellis, x, ids, suh, svh, codebook);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x3E15);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I16) {
+                // raw bytes: every 16-bit trellis state decodes to a finite value
+                std::vector<int16_t> data(ggml_nelements(t));
+                for (int16_t & d : data) {
+                    d = (int16_t) (gen() >> 16);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (t->type == GGML_TYPE_I32) {
+                // distinct experts per token
+                std::vector<int32_t> perm(n_exp);
+                std::vector<int32_t> data;
+                for (int64_t r = 0; r < n_tokens; r++) {
+                    for (int64_t e = 0; e < n_exp; e++) {
+                        perm[e] = (int32_t) e;
+                    }
+                    std::shuffle(perm.begin(), perm.end(), gen);
+                    data.insert(data.end(), perm.begin(), perm.begin() + n_used);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_EXL3_GET_ROWS
 struct test_exl3_get_rows : public test_case {
     const int     K;
@@ -13813,6 +13887,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int K : {1, 4, 8}) {
         test_cases.emplace_back(new test_exl3_get_rows(K, 4, 1000, 300, 17));
     }
+    // EXL3 experts: x broadcast (gate, up) and per slot (down), decode and prompt rows, K = 2, 3.5, 4
+    test_cases.emplace_back(new test_exl3_mul_mat_id(256, 384, 8, 32, 2, 2, 1, 13));
+    test_cases.emplace_back(new test_exl3_mul_mat_id(256, 384, 8, 32, 2, 2, 2, 13));
+    test_cases.emplace_back(new test_exl3_mul_mat_id(384, 256, 8, 56, 2, 3, 3, 1));
+    test_cases.emplace_back(new test_exl3_mul_mat_id(256, 256, 6, 64, 1, 4, 1, 37));
+    test_cases.emplace_back(new test_exl3_mul_mat_id(256, 384, 16, 32, 2, 4, 4, 512));
     test_cases.emplace_back(new test_exl3_get_rows(3, 1, 256, 64, 512));
 
     // glu ops
