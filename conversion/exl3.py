@@ -17,9 +17,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger("hf-to-gguf")
 
 EXL3_CONTAINER_VERSION = 1
+EXL3_ROWS_VERSION      = 1
 EXL3_HADAMARD_SIZE     = 128
+EXL3_GROUP_DIM         = 256
 EXL3_MARKERS           = {"mcg": 0xCBAC1FED, "mul1": 0x83DCD12D}
-EXL3_PARTS             = ("trellis", "suh", "svh", "mcg", "mul1", "su", "sv")
+EXL3_PARTS             = ("trellis", "suh", "svh", "mcg", "mul1", "su", "sv", "signs")
 
 
 def exl3_rate_supported(tile_words: int, codebook: str) -> bool:
@@ -47,7 +49,13 @@ def write_exl3_tensors(model: ModelBase) -> None:
 
     codebooks: set[str] = set()
     permuted: list[str] = []
+    rows: list[str] = []
     for base, parts in sorted(modules.items()):
+        # a 2-D trellis with signs is a quantized token embedding (exllamav3 ngram_codec.py): rows of rings of 256
+        if "signs" in parts:
+            write_exl3_rows(model, base, parts)
+            rows.append(base)
+            continue
         if "su" in parts or "sv" in parts:
             raise NotImplementedError(f"{base}: legacy packed su/sv EXL3 tensors are not supported")
         if "mcg" in parts and "mul1" in parts:
@@ -106,6 +114,37 @@ def write_exl3_tensors(model: ModelBase) -> None:
         raise NotImplementedError(f"EXL3 checkpoints that mix codebooks are not supported: {sorted(codebooks)}")
     model.exl3_codebook = codebooks.pop()
     model.exl3_permuted = permuted
+    model.exl3_rows = rows
+
+
+def write_exl3_rows(model: ModelBase, base: str, parts: dict[str, str]) -> None:
+    from .base import LazyTorchTensor
+
+    if set(parts) != {"trellis", "signs"}:
+        raise ValueError(f"{base}: row-ring table with unexpected parts {sorted(parts)}")
+    trellis = model.model_tensors[parts["trellis"]]()
+    signs   = model.model_tensors[parts["signs"]]()
+    if trellis.dim() != 2 or trellis.dtype != torch.int16 or signs.dim() != 2 or signs.dtype != torch.float16:
+        raise ValueError(f"{base}: unexpected row table {trellis.dtype} {tuple(trellis.shape)}, signs {signs.dtype} {tuple(signs.shape)}")
+    n_rows, row_words = trellis.shape
+    groups, group_dim = signs.shape
+    # exllamav3 Embedding: K = (row_words / groups - 1) / 16, rows padded to whole groups of 256
+    if group_dim != EXL3_GROUP_DIM or row_words % groups or (row_words // groups - 1) % 16 or not 1 <= (row_words // groups - 1) // 16 <= 8:
+        raise ValueError(f"{base}: row width {row_words} does not hold {groups} rings of {EXL3_GROUP_DIM}")
+    K = (row_words // groups - 1) // 16
+
+    new_base = model.map_tensor_name(base + ".weight").removesuffix(".weight")
+    if new_base != gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.TOKEN_EMBD]:
+        raise NotImplementedError(f"{base}: only the token embedding can be an EXL3 row table, not {new_base}")
+    hidden = model.find_hparam(["hidden_size", "n_embd"])
+    if groups * EXL3_GROUP_DIM < hidden or (groups - 1) * EXL3_GROUP_DIM >= hidden:
+        raise ValueError(f"{base}: {groups} groups of {EXL3_GROUP_DIM} do not cover hidden size {hidden}")
+
+    logger.info(f"{new_base + '.exl3r_trellis,':<40} K = {K} mul1 rows, {n_rows} x {groups} groups of {EXL3_GROUP_DIM}")
+    model.gguf_writer.add_tensor(new_base + ".exl3r_trellis", LazyTorchTensor.to_eager(trellis).numpy(), raw_dtype=gguf.GGMLQuantizationType.I16)
+    model.gguf_writer.add_tensor(new_base + ".exl3r_signs",   LazyTorchTensor.to_eager(signs).numpy(),   raw_dtype=gguf.GGMLQuantizationType.F16)
+    for part in ("trellis", "signs"):
+        del model.model_tensors[parts[part]]
 
 
 def add_exl3_metadata(model: ModelBase, quant_config: dict[str, Any]) -> None:
@@ -113,6 +152,8 @@ def add_exl3_metadata(model: ModelBase, quant_config: dict[str, Any]) -> None:
     w.add_uint32(gguf.Keys.Exl3.VERSION, EXL3_CONTAINER_VERSION)
     w.add_string(gguf.Keys.Exl3.CODEBOOK, model.exl3_codebook)
     w.add_uint32(gguf.Keys.Exl3.HADAMARD_SIZE, EXL3_HADAMARD_SIZE)
+    if model.exl3_rows:
+        w.add_uint32(gguf.Keys.Exl3.ROWS_VERSION, EXL3_ROWS_VERSION)
     if model.exl3_permuted:
         w.add_string(gguf.Keys.Exl3.PERMUTATION, model.exl3_permutation)
         w.add_array(gguf.Keys.Exl3.PERMUTED_TENSORS, model.exl3_permuted)

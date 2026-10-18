@@ -528,6 +528,7 @@ class Keys:
         VERSION             = "exl3.version"
         CODEBOOK            = "exl3.codebook"
         HADAMARD_SIZE       = "exl3.hadamard_size"
+        ROWS_VERSION        = "exl3.rows.version"
         PERMUTATION         = "exl3.permutation"
         PERMUTED_TENSORS    = "exl3.permuted_tensors"
         SOURCE_QUANT_CONFIG = "exl3.source.quantization_config"

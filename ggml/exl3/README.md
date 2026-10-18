@@ -63,7 +63,9 @@ name `<b>` (from the usual tensor name map):
 | `<b>.exl3_svh` | F16 | `[n]` | `.svh` bytes |
 
 There is no `<b>.weight`. A `.bias` goes through the normal path. Other tensors keep their stored type unless the
-arch converter transforms them. The markers are checked and replaced by one key:
+arch converter transforms them. A quantized token embedding becomes `token_embd.exl3r_trellis` (I16
+`[row_words, rows]`) and `token_embd.exl3r_signs` (F16 `[256, groups]`), bytes as stored. The markers are checked and
+replaced by one key:
 
 | Key | Type | Value |
 |---|---|---|
@@ -73,11 +75,12 @@ arch converter transforms them. The markers are checked and replaced by one key:
 | `exl3.permutation` | string | name of the block reorder of the arch converter, if any |
 | `exl3.permuted_tensors` | string array | base names whose 128-blocks were reordered |
 | `exl3.source.quantization_config` | string | the source `quantization_config` as JSON |
+| `exl3.rows.version` | u32 | 1, when the file has a row table |
 
 The qwen35 / qwen3next converter reorders linear-attention V heads from grouped to tiled order. For EXL3 linears
 that is done on whole 128-blocks (8 tiles plus the matching scale entries), which is exact because H is block
 diagonal; the tiles themselves are unchanged. Not supported yet, refused by the converter: legacy packed `.su`/`.sv`,
-2-D row-ring trellises (quantized token embeddings, n-gram tables), mixed codebooks.
+row tables other than the token embedding (n-gram / PLE tables), mixed codebooks.
 
 ## Op
 

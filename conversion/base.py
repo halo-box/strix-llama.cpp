@@ -128,6 +128,7 @@ class ModelBase:
     exl3_codebook: str | None = None
     exl3_permuted: list[str] = []
     exl3_permutation: str = ""
+    exl3_rows: list[str] = []
 
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
