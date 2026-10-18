@@ -95,9 +95,10 @@ rocBLAS chose a 64x32x8 tile (5.3..7.3 ms). Sum over the 200 linears: 390..400 m
 `.exl3_suh` and `.exl3_svh` for a requested `<name>.weight` and returns the trellis as the weight. This happens
 before the caller sees a missing tensor, so an optional head is not replaced by the tied embedding. The buffer type
 is chosen with an `EXL3_MUL_MAT` probe. `build_lora_mm` makes `ggml_exl3_mul_mat` for such a weight (table
-`llama_model::exl3`), and a check on the reserved graph refuses any other op that reads a trellis. Supported archs:
-qwen35. EXL3 weights cannot be combined with LoRA adapters, prism.hadamard, the MTP draft vocabulary or a virtual
-model of `llama_model_init_from_user` (metadata without a complete tensor set).
+`llama_model::exl3`), and a check on the reserved graph refuses any other op that reads a trellis. An MTP layer is
+a normal EXL3 block of linears (the NextN probe of the loader sees an EXL3 `eh_proj`). Supported archs: qwen35. EXL3
+weights cannot be combined with LoRA adapters, prism.hadamard, the MTP draft vocabulary or a virtual model of
+`llama_model_init_from_user` (metadata without a complete tensor set).
 
 ## Direct loading of an exllamav3 directory
 
@@ -109,8 +110,10 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
 
 - reads the header of every `*.safetensors` file of the directory, with or without `model.safetensors.index.json`,
   and refuses a tensor name found in two files; `quantization_config.json` (`tensor_storage`) is not read
-- does not load the vision tower (`model.visual.*`) or MTP tensors, and does not take an MTP layer count from
-  `config.json`
+- does not load the vision tower (`model.visual.*`, also an EXL3 one)
+- loads the MTP layers under the names the converter gives them (`mtp.layers.<i>.*` as layer `n_layer + i`,
+  `mtp.fc` as `nextn.eh_proj`, `mtp.pre_fc_norm_*` as `nextn.enorm` / `nextn.hnorm`, `mtp.norm` as
+  `nextn.shared_head_norm`); their number comes from the tensors, not from `mtp_num_hidden_layers` of `config.json`
 - loads a stored `lm_head` also when `tie_word_embeddings` is set
 - names the pre-tokenizer by the sha256 of `json.dumps({"normalizer": ..., "pre_tokenizer": ...}, sort_keys=True)`
   of `tokenizer.json`, and refuses an unknown one
@@ -133,6 +136,7 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
   and tensor is copied unchanged. Any build can load the result.
 - `test-exl3-dir`: writes a small synthetic qwen35 EXL3 directory (two shards with an index, a side file the index
   does not list, a vision tower, an MTP layer only in `config.json`) and checks the import, the transforms, the
-  refusal of a repeated tensor name, and that the model loads and runs. `test-exl3-dir --compare DIR CONTAINER.gguf`
+  refusal of a repeated tensor name, and that the model loads and runs; then a second one with a stored MTP layer,
+  which loads with its MTP layer and runs. `test-exl3-dir --compare DIR CONTAINER.gguf`
   compares the import of a directory with the converter's container of it (tensors, bytes and keys);
   `test-exl3-dir --dump DIR OUT.gguf` writes the import as a GGUF file.

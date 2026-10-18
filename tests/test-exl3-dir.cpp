@@ -344,8 +344,10 @@ static int64_t v_head_src(int64_t p, int64_t K, int64_t V, int64_t unit) {
 }
 
 // a qwen35 EXL3 checkpoint of 3 linear attention layers and 1 full attention layer, written in three files: two shards
-// with an index, and lm_head.safetensors that the index does not list; the config declares an MTP layer the files do not have
-static void write_synthetic(const fs::path & dir, std::map<std::string, st_file::entry> & src, int64_t & n_params) {
+// with an index, and lm_head.safetensors that the index does not list; the config declares an MTP layer the files do not
+// have. With mtp the files also hold that MTP layer
+static void write_synthetic(const fs::path & dir, std::map<std::string, st_file::entry> & src, int64_t & n_params,
+        bool mtp = false) {
     const int64_t n_embd = 256, n_ff = 256, n_vocab = 384, head_dim = 256, n_head = 2, n_head_kv = 1;
     const int64_t n_kh = 2, n_vh = 4, head_k = 128, head_v = 128;
     fs::create_directories(dir);
@@ -382,6 +384,24 @@ static void write_synthetic(const fs::path & dir, std::map<std::string, st_file:
             f.add(p + "self_attn.k_norm.weight", "BF16", { head_dim }, rnd_data("BF16", head_dim, -0.1f, 0.1f));
         }
     }
+    if (mtp) {
+        add_exl3(s2, "mtp.fc", 2*n_embd, n_embd, 4);
+        s2.add("mtp.pre_fc_norm_embedding.weight", "BF16", { n_embd }, rnd_data("BF16", n_embd, -0.1f, 0.1f));
+        s2.add("mtp.pre_fc_norm_hidden.weight",    "BF16", { n_embd }, rnd_data("BF16", n_embd, -0.1f, 0.1f));
+        s2.add("mtp.norm.weight",                  "BF16", { n_embd }, rnd_data("BF16", n_embd, -0.1f, 0.1f));
+        const std::string p = "mtp.layers.0.";
+        s2.add(p + "input_layernorm.weight",          "BF16", { n_embd }, rnd_data("BF16", n_embd, -0.1f, 0.1f));
+        s2.add(p + "post_attention_layernorm.weight", "BF16", { n_embd }, rnd_data("BF16", n_embd, -0.1f, 0.1f));
+        add_exl3(s2, p + "self_attn.q_proj", n_embd, n_head*head_dim*2, 4);
+        add_exl3(s2, p + "self_attn.k_proj", n_embd, n_head_kv*head_dim, 4);
+        add_exl3(s2, p + "self_attn.v_proj", n_embd, n_head_kv*head_dim, 4);
+        add_exl3(s2, p + "self_attn.o_proj", n_head*head_dim, n_embd, 4);
+        s2.add(p + "self_attn.q_norm.weight", "BF16", { head_dim }, rnd_data("BF16", head_dim, -0.1f, 0.1f));
+        s2.add(p + "self_attn.k_norm.weight", "BF16", { head_dim }, rnd_data("BF16", head_dim, -0.1f, 0.1f));
+        add_exl3(s2, p + "mlp.gate_proj", n_embd, n_ff, 4);
+        add_exl3(s2, p + "mlp.up_proj",   n_embd, n_ff, 4);
+        add_exl3(s2, p + "mlp.down_proj", n_ff, n_embd, 4);
+    }
     s2.add("model.visual.blocks.0.norm1.weight", "BF16", { 16 }, rnd_data("BF16", 16, -1.0f, 1.0f));
     s2.add("model.visual.patch_embed.proj.weight", "BF16", { 16, 48 }, rnd_data("BF16", 16*48, -1.0f, 1.0f));
     add_exl3(head, "lm_head", n_embd, n_vocab, 6);
@@ -403,7 +423,8 @@ static void write_synthetic(const fs::path & dir, std::map<std::string, st_file:
             auto ends_with = [&](const std::string & suffix) {
                 return t.name.size() >= suffix.size() && t.name.compare(t.name.size() - suffix.size(), suffix.size(), suffix) == 0;
             };
-            if (t.name.find("visual.") != std::string::npos || ends_with(".suh") || ends_with(".svh") || ends_with(".mcg")) {
+            if (t.name.find("visual.") != std::string::npos || ends_with(".suh") || ends_with(".svh") || ends_with(".mcg") ||
+                    t.name.rfind("mtp.", 0) == 0) {
                 continue;
             }
             int64_t n = 1;
@@ -616,6 +637,57 @@ static int synthetic() {
                 ok = std::isfinite(logits[i]);
             }
             check(ok, "a prompt runs and gives finite logits");
+            llama_free(ctx);
+            llama_model_free(model);
+        }
+    }
+
+    // a stored MTP layer, named after the trunk layers as the converter names it
+    {
+        std::map<std::string, st_file::entry> src2;
+        int64_t n_params2 = 0;
+        write_synthetic(dir / "mtp", src2, n_params2, true);
+        const common_exl3_dir_ptr d2 = common_exl3_dir_open((dir / "mtp").string());
+        const gguf_context * g2 = common_exl3_dir_gguf(d2.get());
+        auto u32_2 = [&](const char * key) { const int64_t id = gguf_find_key(g2, key); return id < 0 ? UINT32_MAX : gguf_get_val_u32(g2, id); };
+        const int64_t kr = gguf_find_key(g2, "qwen35.attention.recurrent_layers");
+        check(u32_2("qwen35.block_count") == 5 && u32_2("qwen35.nextn_predict_layers") == 1 && gguf_get_arr_n(g2, kr) == 5 &&
+              !((const int8_t *) gguf_get_arr_data(g2, kr))[4], "MTP layer counted from the tensors: block 4, full attention");
+        check(gguf_get_n_tensors(g2) == (26 + 8)*3 + 30 + 7, "8 MTP linears and 7 other MTP tensors imported");
+        check(import_data(d2.get(), "blk.4.nextn.eh_proj.exl3_trellis") == src2.at("mtp.fc.trellis").data &&
+              import_data(d2.get(), "blk.4.attn_q.exl3_trellis") == src2.at("mtp.layers.0.self_attn.q_proj.trellis").data,
+              "mtp.fc -> blk.4.nextn.eh_proj, mtp.layers.0 -> blk.4");
+        {
+            const auto & s = src2.at("mtp.pre_fc_norm_embedding.weight");
+            const auto   y = import_data(d2.get(), "blk.4.nextn.enorm.weight");
+            ok = y.size() == 4*256 && gguf_find_tensor(g2, "blk.4.nextn.hnorm.weight") >= 0 &&
+                 gguf_find_tensor(g2, "blk.4.nextn.shared_head_norm.weight") >= 0;
+            for (int64_t i = 0; ok && i < 256; i++) {
+                const float e = f32_of("BF16", s.data.data() + 2*i) + 1.0f;
+                ok = memcmp(&e, y.data() + 4*i, 4) == 0;
+            }
+            check(ok, "MTP norms: enorm, hnorm, shared_head_norm, + 1 in F32");
+        }
+
+        llama_model_params mp = llama_model_default_params();
+        mp.n_gpu_layers = 0;
+        mp.load_mtp     = true;
+        llama_model * model = common_exl3_load_model((dir / "mtp").string(), mp);
+        check(model != nullptr && llama_model_n_layer_nextn(model) == 1, "the model loads with its MTP layer");
+        if (model) {
+            llama_context_params cp = llama_context_default_params();
+            cp.n_ctx     = 64;
+            cp.n_batch   = 16;
+            cp.n_ubatch  = 16;
+            cp.n_threads = 4;
+            llama_context * ctx = llama_init_from_model(model, cp);
+            std::vector<llama_token> tokens = { 65, 66, 256, 257, 302 };
+            ok = ctx && llama_decode(ctx, llama_batch_get_one(tokens.data(), (int32_t) tokens.size())) == 0;
+            const float * logits = ok ? llama_get_logits_ith(ctx, -1) : nullptr;
+            for (int i = 0; ok && i < 384; i++) {
+                ok = std::isfinite(logits[i]);
+            }
+            check(ok, "a prompt runs with the MTP layer loaded and gives finite logits");
             llama_free(ctx);
             llama_model_free(model);
         }

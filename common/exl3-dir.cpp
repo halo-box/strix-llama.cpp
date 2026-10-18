@@ -907,6 +907,50 @@ static const struct {
     { "linear_attn.conv1d.weight",       "ssm_conv1d.weight"          },
 };
 
+// the NextN tensors of an MTP layer of qwen35
+static const struct {
+    const char * hf;
+    const char * gguf;
+} QWEN35_NEXTN[] = {
+    { "eh_proj",                 "nextn.eh_proj"          },
+    { "enorm.weight",            "nextn.enorm.weight"            },
+    { "hnorm.weight",            "nextn.hnorm.weight"            },
+    { "shared_head.norm.weight", "nextn.shared_head_norm.weight" },
+};
+
+// "mtp.layers.<i>.<rest>" -> "model.layers.<n_layer + i>.<rest>", "mtp.<fc|pre_fc_norm_*|norm>.<part>" -> the NextN
+// names of layer n_layer, as _QwenMtpMixin.filter_tensors in conversion/qwen.py; n_mtp is the number of MTP layers seen
+static std::string exl3_mtp_name(const std::string & n, int64_t n_layer, int64_t & n_mtp) {
+    static const struct {
+        const char * hf;
+        const char * name;
+    } remap[] = {
+        { "fc",                    "eh_proj"          },
+        { "pre_fc_norm_embedding", "enorm"            },
+        { "pre_fc_norm_hidden",    "hnorm"            },
+        { "norm",                  "shared_head.norm" },
+    };
+    const std::string rest = n.substr(strlen("mtp."));
+    if (str_starts_with(rest, "layers.")) {
+        const size_t dot = rest.find('.', strlen("layers."));
+        const std::string num = dot == std::string::npos ? "" : rest.substr(strlen("layers."), dot - strlen("layers."));
+        if (!num.empty() && num.find_first_not_of("0123456789") == std::string::npos) {
+            const int64_t i = std::stoll(num);
+            n_mtp = std::max(n_mtp, i + 1);
+            return "model.layers." + std::to_string(n_layer + i) + rest.substr(dot);
+        }
+    }
+    const size_t dot = rest.find('.');
+    if (dot != std::string::npos && rest.find('.', dot + 1) == std::string::npos) {
+        for (const auto & e : remap) {
+            if (rest.compare(0, dot, e.hf) == 0 && strlen(e.hf) == dot) {
+                return "model.layers." + std::to_string(n_layer) + "." + e.name + rest.substr(dot);
+            }
+        }
+    }
+    throw std::runtime_error("MTP tensor " + n + " is not known to the qwen35 importer");
+}
+
 // "model.layers.<il>.<local>" -> il, local
 static bool exl3_split_layer(const std::string & name, int64_t & il, std::string & local) {
     static const std::string prefix = "model.layers.";
@@ -927,7 +971,7 @@ static bool exl3_split_layer(const std::string & name, int64_t & il, std::string
 }
 
 // the <arch>.* and general.* keys of Qwen3_5TextModel.set_gguf_parameters
-static void exl3_qwen35_hparams(gguf_context * meta, const common_json & hp, const std::string & name, uint32_t ftype) {
+static void exl3_qwen35_hparams(gguf_context * meta, const common_json & hp, const std::string & name, uint32_t ftype, int64_t n_mtp) {
     // config fields the converter would turn into keys that this importer does not write
     static const char * refused[] = {
         "moe_intermediate_size", "shared_expert_intermediate_size", "num_local_experts", "num_experts", "n_routed_experts",
@@ -977,8 +1021,8 @@ static void exl3_qwen35_hparams(gguf_context * meta, const common_json & hp, con
     gguf_set_val_str(meta, "general.type", "model");
     gguf_set_val_str(meta, "general.name", name.c_str());
 
-    // no MTP layer: block_count counts only the layers of the checkpoint
-    gguf_set_val_u32(meta, "qwen35.block_count", exl3_u32(n_layer, "num_hidden_layers"));
+    // block_count counts the MTP layers too, as _QwenMtpMixin does
+    gguf_set_val_u32(meta, "qwen35.block_count", exl3_u32(n_layer + n_mtp, "num_hidden_layers"));
     if (const common_json * v = exl3_find(hp, { "max_position_embeddings", "n_ctx", "n_positions", "max_length", "max_sequence_length", "model_max_length" })) {
         gguf_set_val_u32(meta, "qwen35.context_length", exl3_u32(v->get<long long>(), "context length"));
     }
@@ -1033,6 +1077,8 @@ static void exl3_qwen35_hparams(gguf_context * meta, const common_json & hp, con
         if ((int64_t) recurrent.size() != n_layer) {
             throw std::runtime_error(string_format("config.json: layer_types has %zu entries, expected %" PRId64, recurrent.size(), n_layer));
         }
+        // MTP layers are full attention
+        recurrent.resize(n_layer + n_mtp, 0);
         gguf_set_arr_data(meta, "qwen35.attention.recurrent_layers", GGUF_TYPE_BOOL, recurrent.data(), recurrent.size());
     }
     gguf_set_val_u32(meta, "qwen35.full_attention_interval", exl3_u32(hp.value("full_attention_interval", (long long) 4), "full_attention_interval"));
@@ -1041,6 +1087,9 @@ static void exl3_qwen35_hparams(gguf_context * meta, const common_json & hp, con
     gguf_set_val_u32(meta, "qwen35.rope.dimension_count", exl3_u32((int64_t) ((double) rope_dim * partial), "rope dimension count"));
     if (!has_sections) {
         gguf_set_arr_data(meta, "qwen35.rope.dimension_sections", GGUF_TYPE_INT32, sections.data(), sections.size());
+    }
+    if (n_mtp > 0) {
+        gguf_set_val_u32(meta, "qwen35.nextn_predict_layers", exl3_u32(n_mtp, "MTP layers"));
     }
     gguf_set_val_u32(meta, "general.quantization_version", GGML_QNT_VERSION);
 }
@@ -1129,28 +1178,32 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
         }
     }
 
-    // the converter's names drop "language_model."
+    const int64_t n_layer = exl3_get_int(hp, "num_hidden_layers");
+
+    // the converter's names drop "language_model."; MTP layers follow the trunk layers
+    // the MTP layer count comes from the tensors, not from mtp_num_hidden_layers (the 4B EXL3 file declares 1 and has none)
+    int64_t n_mtp = 0;
     std::map<std::string, std::string> names;
     for (const auto & [orig, t] : d->st) {
-        const std::string n = str_replace_all(orig, "language_model.", "");
+        std::string n = str_replace_all(orig, "language_model.", "");
+        if (str_starts_with(n, "model.mtp.")) {
+            n = n.substr(strlen("model."));
+        }
+        if (str_starts_with(n, "mtp.")) {
+            n = exl3_mtp_name(n, n_layer, n_mtp);
+        }
         if (!names.emplace(n, orig).second) {
             throw std::runtime_error("tensors " + orig + " and " + names.at(n) + " have the same name " + n);
         }
     }
 
     int n_vision = 0;
-    int n_mtp    = 0;
     std::map<std::string, std::map<std::string, std::string>> modules;
     std::map<std::string, std::string> plain;
     for (const auto & [n, orig] : names) {
         // the vision tower is for an mmproj, not for the text model
         if (str_starts_with(n, "model.visual.") || str_starts_with(n, "visual.")) {
             n_vision++;
-            continue;
-        }
-        // MTP layers are not loaded: there is no EXL3 MTP support yet
-        if (str_starts_with(n, "mtp.") || str_starts_with(n, "model.mtp.")) {
-            n_mtp++;
             continue;
         }
         const size_t dot  = n.rfind('.');
@@ -1175,7 +1228,6 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
         throw std::runtime_error("quant_method is exl3 but the checkpoint has no .trellis tensors");
     }
 
-    const int64_t n_layer   = exl3_get_int(hp, "num_hidden_layers");
     const int64_t n_k_heads = exl3_get_int(hp, "linear_num_key_heads");
     const int64_t n_v_heads = exl3_get_int(hp, "linear_num_value_heads");
     const int64_t head_k    = exl3_get_int(hp, "linear_key_head_dim");
@@ -1197,11 +1249,9 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
     if (has_head && tie) {
         LOG_INF("%s: tie_word_embeddings is set, but lm_head is stored: the stored head is used\n", __func__);
     }
-    // the MTP layer count comes from the tensors, not from mtp_num_hidden_layers (the 4B EXL3 file declares 1 and has none)
-    if (n_mtp > 0) {
-        LOG_WRN("%s: %d MTP tensors are not loaded, EXL3 MTP layers are not supported yet\n", __func__, n_mtp);
-    } else if (hp.value("mtp_num_hidden_layers", (long long) 0) > 0) {
-        LOG_INF("%s: config.json declares %lld MTP layers, the checkpoint has none\n", __func__, hp.value("mtp_num_hidden_layers", (long long) 0));
+    if (n_mtp != hp.value("mtp_num_hidden_layers", (long long) 0)) {
+        LOG_INF("%s: config.json declares %lld MTP layers, the checkpoint has %" PRId64 "\n",
+                __func__, hp.value("mtp_num_hidden_layers", (long long) 0), n_mtp);
     }
     if (n_vision > 0) {
         LOG_INF("%s: %d vision tensors are not loaded (text model)\n", __func__, n_vision);
@@ -1213,11 +1263,14 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
         }
         int64_t il;
         std::string local;
-        if (exl3_split_layer(base, il, local) && il < n_layer) {
+        if (exl3_split_layer(base, il, local) && il < n_layer + n_mtp) {
             for (const auto & e : QWEN35_LINEARS) {
                 if (local == e.hf) {
                     return "blk." + std::to_string(il) + "." + e.gguf;
                 }
+            }
+            if (il >= n_layer && local == QWEN35_NEXTN[0].hf) {
+                return "blk." + std::to_string(il) + "." + QWEN35_NEXTN[0].gguf;
             }
         }
         return "";
@@ -1337,7 +1390,7 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
             t.name = "output_norm.weight";
         } else if (n == "lm_head.weight") {
             t.name = "output.weight";
-        } else if (exl3_split_layer(n, il, local) && il < n_layer) {
+        } else if (exl3_split_layer(n, il, local) && il < n_layer + n_mtp) {
             for (const auto & e : QWEN35_LAYER_TENSORS) {
                 if (local == e.hf) {
                     t.name = "blk." + std::to_string(il) + "." + e.gguf;
@@ -1346,6 +1399,16 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
             for (const auto & e : QWEN35_LINEARS) {
                 if (local == std::string(e.hf) + ".weight") {
                     t.name = "blk." + std::to_string(il) + "." + e.gguf + ".weight";
+                }
+            }
+            if (il >= n_layer) {
+                if (local == std::string(QWEN35_NEXTN[0].hf) + ".weight") {
+                    t.name = "blk." + std::to_string(il) + "." + QWEN35_NEXTN[0].gguf + ".weight";
+                }
+                for (const auto & e : QWEN35_NEXTN) {
+                    if (local == e.hf) {
+                        t.name = "blk." + std::to_string(il) + "." + e.gguf;
+                    }
                 }
             }
         }
@@ -1413,7 +1476,7 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
     // general.file_type: the type of the first float matrix, as the converter guesses the output type
     uint32_t ftype = 1; // MOSTLY_F16
     for (const auto & [n, orig] : names) {
-        if (str_starts_with(n, "model.visual.") || str_starts_with(n, "visual.") || str_starts_with(n, "mtp.") || str_starts_with(n, "model.mtp.")) {
+        if (str_starts_with(n, "model.visual.") || str_starts_with(n, "visual.")) {
             continue;
         }
         const st_tensor & s = d->st.at(orig);
@@ -1424,7 +1487,7 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
     }
 
     d->meta = gguf_init_empty();
-    exl3_qwen35_hparams(d->meta, hp, dir.filename().string().empty() ? dir.parent_path().filename().string() : dir.filename().string(), ftype);
+    exl3_qwen35_hparams(d->meta, hp, dir.filename().string().empty() ? dir.parent_path().filename().string() : dir.filename().string(), ftype, n_mtp);
 
     gguf_set_val_u32(d->meta, "exl3.version", 1);
     gguf_set_val_str(d->meta, "exl3.codebook", codebook.c_str());
@@ -1457,8 +1520,8 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
         gguf_add_tensor(d->meta, cur);
     }
 
-    LOG_INF("%s: %s: %zu tensors (%zu EXL3 linears, codebook %s, %zu block-permuted) from %zu safetensors file(s)\n",
-        __func__, path.c_str(), d->out.size(), modules.size(), codebook.c_str(), permuted.size(), d->shards.size());
+    LOG_INF("%s: %s: %zu tensors (%zu EXL3 linears, codebook %s, %zu block-permuted, %" PRId64 " MTP layers) from %zu safetensors file(s)\n",
+        __func__, path.c_str(), d->out.size(), modules.size(), codebook.c_str(), permuted.size(), n_mtp, d->shards.size());
     return d;
 }
 
