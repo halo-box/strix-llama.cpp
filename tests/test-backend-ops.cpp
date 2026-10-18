@@ -13753,6 +13753,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_exl3_mul_mat(384, 256, 64, 1, {512, 1}));
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}));
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}, true));
+    test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {13, 3}, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

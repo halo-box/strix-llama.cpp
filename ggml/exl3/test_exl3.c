@@ -386,13 +386,13 @@ static int op_check_rows(ggml_backend_t be, ggml_backend_t be_ref, const struct 
     return fail;
 }
 
-// every rate x codebook at k = 256, n = 384, a few row counts and one strided x
+// every rate x codebook at k = 256, n = 384, row counts on both sides of the HIP GEMM threshold (32) and two strided x
 static int test_op(void) {
     const int64_t tk = 16;
     const int64_t tn = 24;
     const int64_t k  = tk*16;
     const int64_t n  = tn*16;
-    static const int64_t rows[] = { 1, 2, 3, 5, 8, 13 };
+    static const int64_t rows[] = { 1, 2, 3, 5, 8, 13, 32, 33, 130 };
 
     ggml_backend_t be     = op_backend_init();
     ggml_backend_t be_ref = op_cpu_init();
@@ -435,7 +435,8 @@ static int test_op(void) {
             n_run++;
         }
         n_fail += op_check_rows(be, be_ref, &ow, 7, 160, s, 7, label);
-        n_run++;
+        n_fail += op_check_rows(be, be_ref, &ow, 37, 160, s, 7, label);
+        n_run += 2;
         op_weights_free(&ow);
     }
 
@@ -585,9 +586,10 @@ static int check_gguf(const char * path) {
     return n_err != 0 || n_mod == 0;
 }
 
-// the op on the first linear of each (k, n, K): decode rows 1 to 8, ubatch 512 and past it
+// the op on the first linear of each (k, n, K): decode rows 1 to 8, both sides of the HIP GEMM threshold (32), a
+// partial and a whole 128-row tile, ubatch 512 and past it
 static int op_gguf(const char * path) {
-    static const int64_t rows[] = { 1, 2, 3, 4, 5, 6, 7, 8, 16, 64, 511, 512, 513 };
+    static const int64_t rows[] = { 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 33, 64, 127, 128, 511, 512, 513 };
 
     struct gguf_context * gctx = NULL;
     struct ggml_context * meta = NULL;
@@ -650,7 +652,8 @@ static int op_gguf(const char * path) {
                 n_run++;
             }
             n_fail += op_check_rows(be, be_ref, &ow, 5, 96, seed, 4, base);
-            n_run++;
+            n_fail += op_check_rows(be, be_ref, &ow, 40, 96, seed, 4, base);
+            n_run += 2;
             op_weights_free(&ow);
         }
         free(trellis);

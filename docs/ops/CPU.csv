@@ -20425,3 +20425,4 @@
 "CPU","EXL3_MUL_MAT","k=384,n=256,tile_words=64,codebook=1,ne_b=[512,1],v=0","support","1","yes","CPU"
 "CPU","EXL3_MUL_MAT","k=256,n=384,tile_words=64,codebook=1,ne_b=[5,3],v=0","support","1","yes","CPU"
 "CPU","EXL3_MUL_MAT","k=256,n=384,tile_words=64,codebook=1,ne_b=[5,3],v=1","support","1","yes","CPU"
+"CPU","EXL3_MUL_MAT","k=256,n=384,tile_words=64,codebook=1,ne_b=[13,3],v=1","support","1","yes","CPU"
