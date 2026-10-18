@@ -62,8 +62,11 @@ name `<b>` (from the usual tensor name map):
 | `<b>.exl3_suh` | F16 | `[k]` | `.suh` bytes |
 | `<b>.exl3_svh` | F16 | `[n]` | `.svh` bytes |
 
-There is no `<b>.weight`. A `.bias` goes through the normal path. Other tensors keep their stored type unless the
-arch converter transforms them. A quantized token embedding becomes `token_embd.exl3r_trellis` (I16
+There is no `<b>.weight`. A `.bias` goes through the normal path. The experts of a MoE layer (exllamav3 writes one
+module per expert, `<prefix>.experts.<e>.<projection>`) are stacked into the arch's merged expert tensor:
+`<b>.exl3_trellis` I16 `[16*K, n/16, k/16, E]`, `.exl3_suh` F16 `[k, E]`, `.exl3_svh` F16 `[n, E]`, experts 0..E-1 in
+order, every tile unchanged; the experts of a stack must have the same K. Other tensors keep their stored type unless
+the arch converter transforms them. A quantized token embedding becomes `token_embd.exl3r_trellis` (I16
 `[row_words, rows]`) and `token_embd.exl3r_signs` (F16 `[256, groups]`), bytes as stored. The markers are checked and
 replaced by one key:
 

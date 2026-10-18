@@ -139,15 +139,15 @@ class GGUFWriter:
 
                 size = prod(shape)
 
-                # an EXL3 trellis [k/16, n/16, 16*K] int16 holds k*n weights; its scale vectors are not weights
+                # an EXL3 trellis [(E,) k/16, n/16, 16*K] int16 holds (E*) k*n weights; its scale vectors are not weights
                 if name.endswith(".exl3_trellis"):
-                    size = shape[0] * shape[1] * 256
+                    size = prod(shape[:-1]) * 256
                 elif name.endswith((".exl3_suh", ".exl3_svh")):
                     continue
 
                 if "_exps." in name:
                     if len(shape) >= 3:
-                        expert_count = shape[-2 if ".bias" in name else -3]
+                        expert_count = shape[0] if name.endswith(".exl3_trellis") else shape[-2 if ".bias" in name else -3]
                         expert_params += (size // expert_count)
                         expert_sum += expert_count
                         n_expert_tensors += 1
