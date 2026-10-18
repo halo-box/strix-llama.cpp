@@ -345,16 +345,32 @@ static int64_t v_head_src(int64_t p, int64_t K, int64_t V, int64_t unit) {
 
 // a qwen35 EXL3 checkpoint of 3 linear attention layers and 1 full attention layer, written in three files: two shards
 // with an index, and lm_head.safetensors that the index does not list; the config declares an MTP layer the files do not
-// have. With mtp the files also hold that MTP layer
+// have. With mtp the files also hold that MTP layer; with rows the token embedding is a row-ring table (K = 4, one group)
 static void write_synthetic(const fs::path & dir, std::map<std::string, st_file::entry> & src, int64_t & n_params,
-        bool mtp = false) {
+        bool mtp = false, bool rows = false) {
     const int64_t n_embd = 256, n_ff = 256, n_vocab = 384, head_dim = 256, n_head = 2, n_head_kv = 1;
     const int64_t n_kh = 2, n_vh = 4, head_k = 128, head_v = 128;
     fs::create_directories(dir);
 
     st_file s1, s2, head;
     const std::string m = "model.language_model.";
-    s1.add(m + "embed_tokens.weight", "F16", { n_vocab, n_embd }, rnd_data("F16", n_vocab*n_embd, -0.05f, 0.05f));
+    if (rows) {
+        // rings of 1 + 16*4 words: an fp16 scale, then the stream; signs +/-1
+        std::vector<uint8_t> table = rnd_data("I16", n_vocab*65, 0, 0);
+        for (int64_t r = 0; r < n_vocab; r++) {
+            const ggml_fp16_t sc = ggml_fp32_to_fp16(rnd(0.01f, 0.02f));
+            memcpy(table.data() + 2*r*65, &sc, 2);
+        }
+        std::vector<uint8_t> signs;
+        for (int i = 0; i < 256; i++) {
+            const ggml_fp16_t h = ggml_fp32_to_fp16(rnd(0, 1) < 0.5f ? -1.0f : 1.0f);
+            signs.insert(signs.end(), (const uint8_t *) &h, (const uint8_t *) &h + 2);
+        }
+        s1.add(m + "embed_tokens.trellis", "I16", { n_vocab, 65 }, table);
+        s1.add(m + "embed_tokens.signs",   "F16", { 1, 256 }, signs);
+    } else {
+        s1.add(m + "embed_tokens.weight", "F16", { n_vocab, n_embd }, rnd_data("F16", n_vocab*n_embd, -0.05f, 0.05f));
+    }
     s2.add(m + "norm.weight", "BF16", { n_embd }, rnd_data("BF16", n_embd, -0.1f, 0.1f));
     for (int il = 0; il < 4; il++) {
         st_file & f = il < 2 ? s1 : s2;
@@ -642,18 +658,18 @@ static int synthetic() {
         }
     }
 
-    // a stored MTP layer, named after the trunk layers as the converter names it
+    // a stored MTP layer, named after the trunk layers as the converter names it, and a quantized token embedding
     {
         std::map<std::string, st_file::entry> src2;
         int64_t n_params2 = 0;
-        write_synthetic(dir / "mtp", src2, n_params2, true);
+        write_synthetic(dir / "mtp", src2, n_params2, true, true);
         const common_exl3_dir_ptr d2 = common_exl3_dir_open((dir / "mtp").string());
         const gguf_context * g2 = common_exl3_dir_gguf(d2.get());
         auto u32_2 = [&](const char * key) { const int64_t id = gguf_find_key(g2, key); return id < 0 ? UINT32_MAX : gguf_get_val_u32(g2, id); };
         const int64_t kr = gguf_find_key(g2, "qwen35.attention.recurrent_layers");
         check(u32_2("qwen35.block_count") == 5 && u32_2("qwen35.nextn_predict_layers") == 1 && gguf_get_arr_n(g2, kr) == 5 &&
               !((const int8_t *) gguf_get_arr_data(g2, kr))[4], "MTP layer counted from the tensors: block 4, full attention");
-        check(gguf_get_n_tensors(g2) == (26 + 8)*3 + 30 + 7, "8 MTP linears and 7 other MTP tensors imported");
+        check(gguf_get_n_tensors(g2) == (26 + 8)*3 + 30 + 7 + 1, "8 MTP linears and 7 other MTP tensors imported, embedding as rows and signs");
         check(import_data(d2.get(), "blk.4.nextn.eh_proj.exl3_trellis") == src2.at("mtp.fc.trellis").data &&
               import_data(d2.get(), "blk.4.attn_q.exl3_trellis") == src2.at("mtp.layers.0.self_attn.q_proj.trellis").data,
               "mtp.fc -> blk.4.nextn.eh_proj, mtp.layers.0 -> blk.4");
@@ -668,6 +684,10 @@ static int synthetic() {
             }
             check(ok, "MTP norms: enorm, hnorm, shared_head_norm, + 1 in F32");
         }
+        check(import_data(d2.get(), "token_embd.exl3r_trellis") == src2.at(m + "embed_tokens.trellis").data &&
+              import_data(d2.get(), "token_embd.exl3r_signs") == src2.at(m + "embed_tokens.signs").data &&
+              gguf_find_tensor(g2, "token_embd.weight") < 0 && u32_2("exl3.rows.version") == 1,
+              "quantized token embedding carried as token_embd.exl3r_trellis/_signs, exl3.rows.version 1");
 
         llama_model_params mp = llama_model_default_params();
         mp.n_gpu_layers = 0;
@@ -687,7 +707,7 @@ static int synthetic() {
             for (int i = 0; ok && i < 384; i++) {
                 ok = std::isfinite(logits[i]);
             }
-            check(ok, "a prompt runs with the MTP layer loaded and gives finite logits");
+            check(ok, "a prompt runs through the row-ring embedding and gives finite logits");
             llama_free(ctx);
             llama_model_free(model);
         }

@@ -143,6 +143,7 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
 - loads the MTP layers under the names the converter gives them (`mtp.layers.<i>.*` as layer `n_layer + i`,
   `mtp.fc` as `nextn.eh_proj`, `mtp.pre_fc_norm_*` as `nextn.enorm` / `nextn.hnorm`, `mtp.norm` as
   `nextn.shared_head_norm`); their number comes from the tensors, not from `mtp_num_hidden_layers` of `config.json`
+- loads a quantized token embedding as `token_embd.exl3r_trellis` / `_signs`
 - loads a stored `lm_head` also when `tie_word_embeddings` is set
 - names the pre-tokenizer by the sha256 of `json.dumps({"normalizer": ..., "pre_tokenizer": ...}, sort_keys=True)`
   of `tokenizer.json`, and refuses an unknown one
@@ -168,7 +169,7 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
   and tensor is copied unchanged. Any build can load the result.
 - `test-exl3-dir`: writes a small synthetic qwen35 EXL3 directory (two shards with an index, a side file the index
   does not list, a vision tower, an MTP layer only in `config.json`) and checks the import, the transforms, the
-  refusal of a repeated tensor name, and that the model loads and runs; then a second one with a stored MTP layer,
-  which loads with its MTP layer and runs. `test-exl3-dir --compare DIR CONTAINER.gguf`
+  refusal of a repeated tensor name, and that the model loads and runs; then a second one with a stored MTP layer and a
+  row-ring token embedding, which loads with its MTP layer and runs. `test-exl3-dir --compare DIR CONTAINER.gguf`
   compares the import of a directory with the converter's container of it (tensors, bytes and keys);
   `test-exl3-dir --dump DIR OUT.gguf` writes the import as a GGUF file.

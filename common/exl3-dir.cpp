@@ -1208,7 +1208,7 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
         }
         const size_t dot  = n.rfind('.');
         const std::string part = dot == std::string::npos ? "" : n.substr(dot + 1);
-        if (part == "trellis" || part == "suh" || part == "svh" || part == "mcg" || part == "mul1" || part == "su" || part == "sv") {
+        if (part == "trellis" || part == "suh" || part == "svh" || part == "mcg" || part == "mul1" || part == "su" || part == "sv" || part == "signs") {
             modules[n.substr(0, dot)][part] = n;
         } else {
             plain[n] = orig;
@@ -1287,7 +1287,29 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
     // EXL3 linears, in the order of conversion/exl3.py
     std::string codebook;
     std::vector<std::string> permuted;
+    bool rows = false;
     for (const auto & [base, parts] : modules) {
+        // a 2-D trellis with signs: a quantized token embedding (ngram_codec.py), rows of rings of 256, always mul1
+        if (parts.count("signs")) {
+            const st_tensor & tr = d->st.at(names.at(parts.at("trellis")));
+            const st_tensor & sg = d->st.at(names.at(parts.at("signs")));
+            const int64_t hidden = exl3_get_int(hp, "hidden_size");
+            if (parts.size() != 2 || base != "model.embed_tokens") {
+                throw std::runtime_error(base + ": only the token embedding can be an EXL3 row table");
+            }
+            if (tr.dtype != "I16" || tr.shape.size() != 2 || sg.dtype != "F16" || sg.shape.size() != 2 || sg.shape[1] != 256) {
+                throw std::runtime_error(base + ": unexpected EXL3 row table dtypes or shapes");
+            }
+            const int64_t groups = sg.shape[0];
+            const int64_t rw     = tr.shape[1] % groups == 0 ? tr.shape[1]/groups - 1 : 0;
+            if (rw < 16 || rw > 128 || rw % 16 != 0 || groups*256 < hidden || (groups - 1)*256 >= hidden) {
+                throw std::runtime_error(base + ": the row width does not hold the rings of 256 for the hidden size");
+            }
+            d->out.push_back({ "token_embd.exl3r_trellis", names.at(parts.at("trellis")), GGML_TYPE_I16, tr.shape });
+            d->out.push_back({ "token_embd.exl3r_signs",   names.at(parts.at("signs")),   GGML_TYPE_F16, sg.shape });
+            rows = true;
+            continue;
+        }
         if (parts.count("su") || parts.count("sv")) {
             throw std::runtime_error(base + ": legacy packed su/sv EXL3 tensors are not supported");
         }
@@ -1492,6 +1514,9 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
     gguf_set_val_u32(d->meta, "exl3.version", 1);
     gguf_set_val_str(d->meta, "exl3.codebook", codebook.c_str());
     gguf_set_val_u32(d->meta, "exl3.hadamard_size", 128);
+    if (rows) {
+        gguf_set_val_u32(d->meta, "exl3.rows.version", 1);
+    }
     if (!permuted.empty()) {
         std::vector<const char *> ptrs;
         for (const auto & p : permuted) {
@@ -1520,8 +1545,8 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
         gguf_add_tensor(d->meta, cur);
     }
 
-    LOG_INF("%s: %s: %zu tensors (%zu EXL3 linears, codebook %s, %zu block-permuted, %" PRId64 " MTP layers) from %zu safetensors file(s)\n",
-        __func__, path.c_str(), d->out.size(), modules.size(), codebook.c_str(), permuted.size(), n_mtp, d->shards.size());
+    LOG_INF("%s: %s: %zu tensors (%zu EXL3 linears, codebook %s, %zu block-permuted, %d row tables, %" PRId64 " MTP layers) from %zu safetensors file(s)\n",
+        __func__, path.c_str(), d->out.size(), modules.size() - (rows ? 1 : 0), codebook.c_str(), permuted.size(), rows ? 1 : 0, n_mtp, d->shards.size());
     return d;
 }
 
