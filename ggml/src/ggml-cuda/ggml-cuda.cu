@@ -5632,6 +5632,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+#ifdef GGML_USE_EXL3
+    // swiglu -> EXL3_MUL_MAT_ID (MoE down projection): the op's input rotation computes the SwiGLU
+    if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_EXL3_MUL_MAT_ID &&
+        ggml_cuda_exl3_mul_mat_id_swiglu_fusable(cuda_ctx->device, node, cgraph->nodes[i + 1]) &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_EXL3_MUL_MAT_ID }, { i + 1 })) {
+        ggml_cuda_op_exl3_mul_mat_id_swiglu(*cuda_ctx, cgraph->nodes[i + 1], node);
+        return 1;
+    }
+#endif
+
     if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && node->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(node) && !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, node)) {
         uint16_t * dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, i, node);

@@ -5877,10 +5877,13 @@ struct test_exl3_mul_mat_id : public test_case {
     const int64_t n_used;
     const int64_t ne11;       // 1: x broadcast over the slots, n_used: one x per slot
     const int64_t n_tokens;
+    const bool    swiglu;     // x = swiglu(gate, up), as the MoE down projection reads it (fused on HIP's GEMM path)
 
     std::string vars() override {
-        return VARS_TO_STR8(k, n, n_exp, tile_words, codebook, n_used, ne11, n_tokens);
+        return VARS_TO_STR9(k, n, n_exp, tile_words, codebook, n_used, ne11, n_tokens, swiglu);
     }
+
+    bool run_whole_graph() override { return swiglu; }
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5888,8 +5891,9 @@ struct test_exl3_mul_mat_id : public test_case {
     }
 
     test_exl3_mul_mat_id(int64_t k = 256, int64_t n = 384, int64_t n_exp = 8, int64_t tile_words = 32, int codebook = 2,
-            int64_t n_used = 2, int64_t ne11 = 1, int64_t n_tokens = 13)
-        : k(k), n(n), n_exp(n_exp), tile_words(tile_words), codebook(codebook), n_used(n_used), ne11(ne11), n_tokens(n_tokens) {}
+            int64_t n_used = 2, int64_t ne11 = 1, int64_t n_tokens = 13, bool swiglu = false)
+        : k(k), n(n), n_exp(n_exp), tile_words(tile_words), codebook(codebook), n_used(n_used), ne11(ne11), n_tokens(n_tokens),
+          swiglu(swiglu) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * trellis = ggml_new_tensor_4d(ctx, GGML_TYPE_I16, tile_words, n/16, k/16, n_exp);
@@ -5901,7 +5905,16 @@ struct test_exl3_mul_mat_id : public test_case {
         ggml_tensor * svh = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, n_exp);
         ggml_set_name(svh, "svh");
 
-        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, ne11, n_tokens);
+        ggml_tensor * x;
+        if (swiglu) {
+            ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, ne11, n_tokens);
+            ggml_set_name(gate, "gate");
+            ggml_tensor * up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, ne11, n_tokens);
+            ggml_set_name(up, "up");
+            x = ggml_swiglu_split(ctx, gate, up);
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, ne11, n_tokens);
+        }
         ggml_set_name(x, "x");
 
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
@@ -13893,6 +13906,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_exl3_mul_mat_id(384, 256, 8, 56, 2, 3, 3, 1));
     test_cases.emplace_back(new test_exl3_mul_mat_id(256, 256, 6, 64, 1, 4, 1, 37));
     test_cases.emplace_back(new test_exl3_mul_mat_id(256, 384, 16, 32, 2, 4, 4, 512));
+    // the MoE down projection reading a SwiGLU: 64 tokens take the HIP GEMM path (fused), 2 tokens the dot path
+    test_cases.emplace_back(new test_exl3_mul_mat_id(256, 384, 8, 32, 2, 2, 2, 64, true));
+    test_cases.emplace_back(new test_exl3_mul_mat_id(256, 384, 8, 32, 2, 2, 2, 2, true));
     test_cases.emplace_back(new test_exl3_get_rows(3, 1, 256, 64, 512));
 
     // glu ops

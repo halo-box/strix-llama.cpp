@@ -10,6 +10,12 @@ bool ggml_cuda_exl3_mul_mat_id_supports_op(int device, const ggml_tensor * op);
 
 void ggml_cuda_op_exl3_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// dst = EXL3_MUL_MAT_ID(glu) where glu = swiglu(gate, up) (F32, split, contiguous, not read by any other node) and the op
+// takes its GEMM path: the input rotation computes the SwiGLU, so the glu node is not computed
+bool ggml_cuda_exl3_mul_mat_id_swiglu_fusable(int device, const ggml_tensor * glu, const ggml_tensor * dst);
+
+void ggml_cuda_op_exl3_mul_mat_id_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * glu);
+
 bool ggml_cuda_exl3_get_rows_supports_op(int device, const ggml_tensor * op);
 
 void ggml_cuda_op_exl3_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

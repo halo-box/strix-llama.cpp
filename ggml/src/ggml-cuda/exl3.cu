@@ -34,6 +34,9 @@
 //   own F32-weight GEMM rounds both operands to f16 (exl3_gemm_products); elsewhere xh = hi + lo carries ~22 bits and
 //   the op stays at NMSE ~1e-13 against ggml_mul_mat on the f32 W, at twice the WMMA work. In that path the WMMA f32
 //   accumulate truncates, so each k step accumulates from zero and is added in f32 (see exl3_gemm_kernel).
+// - exllamav3's fused expert kernel merges the gate/up output transform, the SwiGLU and the down input transform; here
+//   only the SwiGLU moves into the down projection's input rotation (graph fusion swiglu -> EXL3_MUL_MAT_ID in
+//   ggml-cuda.cu, GEMM path only), computed with ggml's gated kernel's f32 roundings, so the rows are unchanged.
 //
 // exllamav3 licence:
 //
@@ -61,6 +64,7 @@
 
 #include "exl3.cuh"
 #include "mmb.cuh"
+#include "unary.cuh"
 
 #if defined(GGML_USE_EXL3)
 
@@ -831,11 +835,15 @@ typedef uint32_t exl3_u4   __attribute__((ext_vector_type(4))); // an array of H
 // a finite nonzero value): hi = f16(xh*s), lo = f16(xh*s - hi), inv[r] = 1/s. The product with W_hat (exact in f16) of
 // hi + lo carries ~22 significant bits of xh. One block of 8 warps per row, warp w holds the segments w, w + 8, ...
 // ID: row r is the x row of its pair, with the suh of the pair's expert
-template <int S, bool LO, bool ID>
+// GLU (ID only): x is the gate and up the up tensor of a standard SwiGLU (same strides) whose output the op reads; the row is
+// silu(gate)*up computed as ggml's gated kernel computes it (unary.cu, one f32 rounding of each product) and then times suh,
+// the operations of the unfused graph without the f32 store and load in between
+template <int S, bool LO, bool ID, bool GLU = false>
 static __global__ void __launch_bounds__(256) exl3_rotate_split(
         const float * __restrict__ x, const half * __restrict__ suh, half * __restrict__ xhi, half * __restrict__ xlo,
         float * __restrict__ inv, const int k, const int ne1, const int ne2, const int64_t s1, const int64_t s2,
-        const int64_t s3, const exl3_mmid mm) {
+        const int64_t s3, const exl3_mmid mm, const float * __restrict__ up = nullptr) {
+    static_assert(!GLU || ID, "the SwiGLU input is an EXL3_MUL_MAT_ID input");
     __shared__ float s_max[8];
     const int r    = blockIdx.x;
     const int lane = threadIdx.x % 32;
@@ -843,9 +851,13 @@ static __global__ void __launch_bounds__(256) exl3_rotate_split(
     const int segs = k / EXL3_HAD;
 
     const float * xr;
+    const float * ur = nullptr;
     if constexpr (ID) {
         const int p = exl3_mmid_pair(mm, r);
         xr   = exl3_mmid_x(mm, x, p, s1, s2);
+        if constexpr (GLU) {
+            ur = exl3_mmid_x(mm, up, p, s1, s2);
+        }
         suh += (int64_t) exl3_mmid_expert(mm, p)*k;
     } else {
         const int i1 = r % ne1;
@@ -861,7 +873,12 @@ static __global__ void __launch_bounds__(256) exl3_rotate_split(
         if (seg < segs) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                v[s][i] = xr[seg*EXL3_HAD + i*32 + lane]*__half2float(suh[seg*EXL3_HAD + i*32 + lane]);
+                if constexpr (GLU) {
+                    const float g = ggml_cuda_op_silu_single(xr[seg*EXL3_HAD + i*32 + lane])*ur[seg*EXL3_HAD + i*32 + lane];
+                    v[s][i] = g*__half2float(suh[seg*EXL3_HAD + i*32 + lane]);
+                } else {
+                    v[s][i] = xr[seg*EXL3_HAD + i*32 + lane]*__half2float(suh[seg*EXL3_HAD + i*32 + lane]);
+                }
             }
             exl3_fwht128(v[s], lane);
 #pragma unroll
@@ -1418,11 +1435,12 @@ static void exl3_gemm_launch_cb(const int cb, const int16_t * trellis, const hal
     }
 }
 
-template <bool LO, bool ID>
+template <bool LO, bool ID, bool GLU = false>
 static void exl3_rotate_split_launch_lo(const ggml_tensor * x, const half * suh, half * xhi, half * xlo, float * inv,
-        const int64_t k, const int64_t rows, const exl3_mmid & mm, cudaStream_t stream) {
+        const int64_t k, const int64_t rows, const exl3_mmid & mm, cudaStream_t stream, const float * gate = nullptr,
+        const float * up = nullptr) {
     const int64_t segs_per_warp = (k/EXL3_HAD + 7)/8;
-    const float * xd = (const float *) x->data;
+    const float * xd = GLU ? gate : (const float *) x->data;
     const int     ne1 = (int) x->ne[1];
     const int     ne2 = (int) x->ne[2];
     const int64_t s1  = x->nb[1]/sizeof(float);
@@ -1430,14 +1448,14 @@ static void exl3_rotate_split_launch_lo(const ggml_tensor * x, const half * suh,
     const int64_t s3  = x->nb[3]/sizeof(float);
     const dim3 grid((unsigned) rows);
     if (segs_per_warp <= 4) {
-        exl3_rotate_split<4, LO, ID><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3, mm);
+        exl3_rotate_split<4, LO, ID, GLU><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3, mm, up);
     } else if (segs_per_warp <= 8) {
-        exl3_rotate_split<8, LO, ID><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3, mm);
+        exl3_rotate_split<8, LO, ID, GLU><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3, mm, up);
     } else if (segs_per_warp <= 16) {
-        exl3_rotate_split<16, LO, ID><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3, mm);
+        exl3_rotate_split<16, LO, ID, GLU><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3, mm, up);
     } else {
         GGML_ASSERT(segs_per_warp <= 32);
-        exl3_rotate_split<32, LO, ID><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3, mm);
+        exl3_rotate_split<32, LO, ID, GLU><<<grid, 256, 0, stream>>>(xd, suh, xhi, xlo, inv, (int) k, ne1, ne2, s1, s2, s3, mm, up);
     }
 }
 
@@ -1745,11 +1763,20 @@ bool ggml_cuda_exl3_mul_mat_id_supports_op(const int device, const ggml_tensor *
            ggml_exl3_rate_supported(trellis->ne[0], (ggml_exl3_codebook) cb);
 }
 
+// the GEMM path (exl3_rotate_split + exl3_gemm_kernel) of EXL3_MUL_MAT_ID
+static bool exl3_mmid_gemm(const int device, const ggml_tensor * dst) {
+    const ggml_tensor * trellis = dst->src[0];
+    const int64_t n_pairs = dst->src[2]->ne[0]*dst->src[2]->ne[1];
+    return n_pairs >= EXL3_MMID_GEMM_ROWS*trellis->ne[3] && trellis->ne[2]*16 <= EXL3_SPLIT_K &&
+           GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
+}
+
 // each row (pair) is computed as EXL3_MUL_MAT computes a row of its expert: the dot kernel with groups of rows of one
 // expert, or the GEMM, hi + lo (exl3_gemm_kernel, two products) or one product (its P = 1 variant, rows equal to those
 // of exl3_gemm1_kernel) per expert as the F32 control does (exl3_mmid_one_rows). No host synchronization: the routing
 // is computed on the device.
-void ggml_cuda_op_exl3_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// glu: the standard F32 SwiGLU node that dst reads as x, computed by the input rotation of the GEMM path (exl3_mmid_gemm)
+static void exl3_op_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * glu) {
     const ggml_tensor * trellis = dst->src[0];
     const ggml_tensor * x       = dst->src[1];
     const ggml_tensor * ids     = dst->src[2];
@@ -1785,8 +1812,8 @@ void ggml_cuda_op_exl3_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
     mm.ne11      = (int) x->ne[1];
     mm.tq_stride = trellis->ne[0]*trellis->ne[1]*trellis->ne[2];
 
-    const bool gemm = n_pairs >= EXL3_MMID_GEMM_ROWS*n_exp && k <= EXL3_SPLIT_K &&
-                      GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[ctx.device].cc);
+    const bool gemm = exl3_mmid_gemm(ctx.device, dst);
+    GGML_ASSERT(glu == nullptr || gemm);
     // an expert has at most one row per token
     const int M = n_tok == 1 ? 1 : n_tok == 2 ? 2 : n_tok <= 4 ? 4 : 8;
     // warps of the two-product groups, then of the one-product ones
@@ -1823,7 +1850,12 @@ void ggml_cuda_op_exl3_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
         ggml_cuda_pool_alloc<half>  xhi(ctx.pool(), n_pairs*k);
         ggml_cuda_pool_alloc<half>  xlo(ctx.pool(), n_pairs*k);
         ggml_cuda_pool_alloc<float> inv(ctx.pool(), n_pairs);
-        exl3_rotate_split_launch(x, su, xhi.get(), xlo.get(), inv.get(), k, n_pairs, &mm, stream);
+        if (glu != nullptr) {
+            exl3_rotate_split_launch_lo<true, true, true>(x, su, xhi.get(), xlo.get(), inv.get(), k, n_pairs, mm, stream,
+                (const float *) glu->src[0]->data, (const float *) glu->src[1]->data);
+        } else {
+            exl3_rotate_split_launch(x, su, xhi.get(), xlo.get(), inv.get(), k, n_pairs, &mm, stream);
+        }
         for (int t = 0; t < 2; ++t) {
             if (tab.n_grp[t] > 0) {
                 mm.grp = tab.grp[t];
@@ -1843,6 +1875,24 @@ void ggml_cuda_op_exl3_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
         (const float *) x->data, su, xh.get(), counters.get(), (int) (n_groups*n_segs), (int) k, (int) n_pairs, 1, 1,
         x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), 0, mm);
     exl3_dot_bits(bits, cb, M, xh.get(), tq, sv, y, counters.get(), k, n, n_pairs, n_groups, &mm, stream);
+}
+
+void ggml_cuda_op_exl3_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    exl3_op_mul_mat_id(ctx, dst, nullptr);
+}
+
+bool ggml_cuda_exl3_mul_mat_id_swiglu_fusable(const int device, const ggml_tensor * glu, const ggml_tensor * dst) {
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    return glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && up != nullptr && dst->src[1] == glu &&
+           glu->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(glu) && ggml_is_contiguous(gate) && ggml_is_contiguous(up) &&
+           ggml_are_same_shape(glu, gate) && ggml_are_same_shape(glu, up) && exl3_mmid_gemm(device, dst);
+}
+
+void ggml_cuda_op_exl3_mul_mat_id_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * glu) {
+    GGML_ASSERT(ggml_cuda_exl3_mul_mat_id_swiglu_fusable(ctx.device, glu, dst));
+    exl3_op_mul_mat_id(ctx, dst, glu);
 }
 
 // ---- EXL3_GET_ROWS ----

@@ -130,6 +130,14 @@ many experts get a few rows, a few get most). Each row is the row `EXL3_MUL_MAT`
 kernel, bit for bit (the GEMM's per-row arithmetic does not depend on its row tile; one-product rows are those of its
 one-product GEMM).
 
+When the op reads a standard F32 SwiGLU (`swiglu(gate, up)`, the MoE down projection) that nothing else reads and takes
+the GEMM path, the HIP backend fuses the two nodes: the input rotation reads gate and up and computes `silu(gate)*up`
+with the roundings of ggml's gated kernel before the `suh` product, so the rows are unchanged (LFM2.5-8B-A1B logits on
+the four test corpora equal those of the unfused graph bit for bit). Measured on gfx1151 (rocprofv3 kernel trace of
+llama-bench pp2048, ubatch 512, two traces per arm): SwiGLU plus MoE input rotations 8.28 / 8.22 ms per ubatch unfused,
+7.50 / 7.50 fused (the fused down rotation, 217 us per layer, streams gate and up at ~200 GB/s), out of ~126 ms of
+kernels per ubatch.
+
 `ggml_exl3_get_rows(ctx, table, ids, signs, n_out)` (`GGML_OP_EXL3_GET_ROWS`) decodes the rows `ids` of a token
 embedding row table to F32 `[n_out, n]`; the CPU backend runs `ggml_exl3_decode_embd_row` on each row. The HIP
 backend decodes one ring per warp and applies H256, the 1/16 and the signs in the butterfly order and with the
