@@ -812,7 +812,12 @@ static void exl3_launch_cb(const int cb, const int M, const float * xh, const in
 #define EXL3_GEMV_ROWS 32
 #define EXL3_SPLIT_K   32768 // longest k of the GEMM path (exl3_rotate_split holds a row in registers)
 #define EXL3_GEMM_BM   128 // output columns per block: one Hadamard segment
-#define EXL3_GEMM_BN   128 // rows per block, 16 per warp (32 per warp: 386 ms vs 254 below, spills and half the blocks)
+// rows per block, 16 per warp (32 per warp: 386 ms vs 254 below, spills and half the blocks). The hi + lo GEMM takes
+// blocks of half that (W = 4 warps) when its last block would be at most half full. 200 linears of Qwen3.5-4B (K = 4),
+// gfx1151, op bench ms with 128- vs 64-row blocks: 33 rows 62.9 vs 40.4, 64 65.3 vs 44.1, 96 68.0 vs 75.5, 128 70.4 vs
+// 77.6, 160 127.0 vs 106.1, 192 135.5 vs 112.8, 256 141.3 vs 149.3, 320 198.6 vs 176.6, 384 209.2 vs 212.3, 448 264.3 vs
+// 254.7, 511 279.3 vs 284.8 (32-row blocks: 46.5 at 33, 50.5 at 64; q4_K MMQ 21.8 at 33, 30.4 at 64, 178.5 at 511)
+#define EXL3_GEMM_BN   128
 // k per main-loop step, 2 k-tiles. Op bench sum over the 200 linears at 512 rows: 254 ms; k step 64: 267 ms (256 VGPRs,
 // spills)
 #define EXL3_GEMM_BK   32
@@ -1522,7 +1527,7 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int       bits = exl3_bits(tile_words);
 
     if (rows > EXL3_GEMV_ROWS && k <= EXL3_SPLIT_K && GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[ctx.device].cc)) {
-        GGML_ASSERT((rows + EXL3_GEMM_BN - 1)/EXL3_GEMM_BN <= 65535);
+        GGML_ASSERT((rows + EXL3_GEMM_BN/2 - 1)/(EXL3_GEMM_BN/2) <= 65535);
         // one f16 product or hi + lo, following the F32-weight GEMM of this context (exl3_gemm_products)
         const bool two = exl3_gemm_products(ctx, x, dst, k, n) == 2;
         ggml_cuda_pool_alloc<half>  xhi(ctx.pool(), rows*k);
@@ -1533,7 +1538,10 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         }
         half * xl = two ? xlo.get() : nullptr;
         exl3_rotate_split_launch(x, (const half *) suh->data, xhi.get(), xl, inv.get(), k, rows, nullptr, stream);
-        exl3_gemm_bits(bits, cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, nullptr, 0, EXL3_GEMM_BN/16, stream);
+        // hi + lo: blocks of 64 rows (W = 4) when the last block of EXL3_GEMM_BN rows would be at most half full
+        const int64_t tail = rows % EXL3_GEMM_BN;
+        const int     W    = tail > 0 && tail <= EXL3_GEMM_BN/2 ? EXL3_GEMM_BN/32 : EXL3_GEMM_BN/16;
+        exl3_gemm_bits(bits, cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, nullptr, 0, W, stream);
         return;
     }
 

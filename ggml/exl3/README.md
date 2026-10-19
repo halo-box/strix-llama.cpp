@@ -104,7 +104,8 @@ One pass over the weights serves up to 8 rows; up to 32 rows run in groups of 8,
 rows (prompt processing) take a GEMM: `H(x * suh)` is written in f16 with a power-of-two scale per row, and a WMMA
 kernel decodes 128-column slabs of `W_hat` into LDS once per block and k step (`W_hat` is exact in f16) and applies
 `H` and `svh / 128` to the result in registers. The rotated activations are rounded to f16 once (one product, NMSE
-~4e-8 against a double sum) or split into hi + lo parts (two products, f32 accumulation per k step, NMSE ~1e-13).
+~4e-8 against a double sum) or split into hi + lo parts (two products, f32 accumulation per k step, NMSE ~1e-13; blocks
+of 128 rows, or of 64 when the last block of 128 would be at most half full).
 The default takes the precision of the GEMM the same backend context runs for an F32 weight of the same shape: one
 product where that GEMM is mmb's `mmb_f32split_kernel` (one f16 product with both operands rounded, NMSE ~8e-8:
 from 512 rows with the mmb opt-in that llama sets, for contiguous x), two products where it is f32 (MMVF, MMF,
