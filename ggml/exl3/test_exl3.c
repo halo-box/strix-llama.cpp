@@ -737,7 +737,7 @@ static int check_gguf(const char * path) {
 // partial and a whole 128-row tile, ubatch 512 and past it
 static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const int16_t * trellis, const ggml_fp16_t * suh,
                                const ggml_fp16_t * svh, int64_t k, int64_t n, int64_t n_exp, int64_t tile_words, int cb,
-                               int64_t n_used, int64_t ne11, int64_t n_tok, uint32_t seed, const char * label);
+                               int64_t n_used, int64_t ne11, int64_t n_tok, bool skew, uint32_t seed, const char * label);
 
 static int op_gguf(const char * path) {
     static const int64_t rows[] = { 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 33, 64, 127, 128, 511, 512, 513 };
@@ -795,14 +795,16 @@ static int op_gguf(const char * path) {
         struct op_weights ow;
         if (n_exp > 1) {
             // a stack of experts: EXL3_MUL_MAT_ID at decode, draft-verification and prompt token counts (with 32 experts
-            // and top-4: both sides of the HIP GEMM threshold, 12 rows per expert = 96 tokens, and of its 32-row / 64-row
-            // group switch at 256 tokens), x broadcast and one per slot
+            // and top-4: both sides of the HIP GEMM threshold, 12 rows per expert = 96 tokens), x broadcast and one per
+            // slot; uniform routing, then skewed routing from 96 tokens (one expert in every token: one product from
+            // MMID_ONE_ROWS tokens, others with many and few rows)
             const int64_t n_used = n_exp < 4 ? n_exp : 4;
-            static const int64_t toks[] = { 1, 2, 4, 7, 32, 95, 96, 256, 257, 512 };
+            static const int64_t toks[] = { 1, 2, 4, 7, 32, 95, 96, 256, 257, 512, 96, 256, 512, 513 };
+            static const size_t  n_uniform = 10;
             for (size_t j = 0; trellis != NULL && suh != NULL && svh != NULL && j < sizeof(toks)/sizeof(toks[0]); j++) {
                 for (int64_t ne11 = 1; ne11 <= n_used; ne11 += n_used - 1 > 0 ? n_used - 1 : 1) {
                     n_fail += test_mul_mat_id_run(be, be_ref, trellis, suh, svh, k, n, n_exp, t->ne[0], cb, n_used, ne11,
-                                                  toks[j], 0x6A09E667u ^ (uint32_t) (n_seen*16 + j), base);
+                                                  toks[j], j >= n_uniform, 0x6A09E667u ^ (uint32_t) (n_seen*16 + j), base);
                     n_run++;
                 }
             }
@@ -960,9 +962,10 @@ static int exact_gguf(const char * path) {
             exact_rows(x, k, 0, k);
             ok = exact_run(be_cpu, trellis, ones, svh, k, n, n_exp, t->ne[0], cb, x, k, ref);
         }
-        // rows per call: all rows in one call (WMMA GEMM: one product for a dense linear, 64-row groups for a stack); 511
-        // (dense: the hi + lo GEMM) or 16 tokens (stack: 32-row groups); 32 rows (dense) or 8 tokens (stack): the dot
-        // kernel, exact. A stack token goes to all E experts, so its rows per expert are its token count
+        // rows per call: all rows in one call (WMMA GEMM: one product for a dense linear, and for a stack, whose experts
+        // then have k >= MMID_ONE_ROWS rows each); 511 (dense: the hi + lo GEMM) or 16 tokens (stack: 32-row groups);
+        // 32 rows (dense) or 8 tokens (stack): the dot kernel, exact. A stack token goes to all E experts, so its rows
+        // per expert are its token count
         const int64_t chunk[3] = { k, n_exp > 1 ? 16 : 511, n_exp > 1 ? 8 : 32 };
         int64_t diff[3] = { -1, -1, -1 };
         double  rel[3]  = { -1.0, -1.0, -1.0 };
@@ -1293,7 +1296,8 @@ static int dequantize_gguf(const char * path_in, const char * path_out) {
 
 // EXL3_MUL_MAT_ID on the op backend on a synthetic stack, see test_mul_mat_id_run
 static int test_mul_mat_id_case(ggml_backend_t be, ggml_backend_t be_ref, int64_t k, int64_t n, int64_t n_exp,
-                                int64_t tile_words, int cb, int64_t n_used, int64_t ne11, int64_t n_tok, uint32_t seed) {
+                                int64_t tile_words, int cb, int64_t n_used, int64_t ne11, int64_t n_tok, bool skew,
+                                uint32_t seed) {
     uint32_t s = seed;
     const int64_t per = k/GGML_EXL3_TILE*n/GGML_EXL3_TILE*tile_words;
     int16_t     * trellis = (int16_t *)     malloc(n_exp*per*sizeof(int16_t));
@@ -1308,7 +1312,7 @@ static int test_mul_mat_id_case(ggml_backend_t be, ggml_backend_t be_ref, int64_
     for (int64_t j = 0; j < n_exp*n; j++) {
         svh[j] = rand_f16(&s);
     }
-    const int fail = test_mul_mat_id_run(be, be_ref, trellis, suh, svh, k, n, n_exp, tile_words, cb, n_used, ne11, n_tok, s, "synthetic");
+    const int fail = test_mul_mat_id_run(be, be_ref, trellis, suh, svh, k, n, n_exp, tile_words, cb, n_used, ne11, n_tok, skew, s, "synthetic");
     free(trellis);
     free(suh);
     free(svh);
@@ -1359,15 +1363,21 @@ static bool expert_rows(ggml_backend_t be, const int16_t * trellis, const ggml_f
     return ok;
 }
 
-// the experts of a stack: x of n_tok tokens (ne11 = 1: broadcast over the slots), n_used distinct experts per token.
+// rows of one expert from which the HIP EXL3_MUL_MAT_ID runs one f16 product for them: where the backend's F32 control
+// (ggml_mul_mat_id on an F32 stack, an MMB GEMM per expert from 512 rows of a view source) does
+#define MMID_ONE_ROWS 512
+
+// the experts of a stack: x of n_tok tokens (ne11 = 1: broadcast over the slots), n_used distinct experts per token,
+// uniform, or skewed (slot 0 always the first expert, the other slots favouring low expert numbers).
 // Exactness: the rows of each expert equal EXL3_MUL_MAT on that expert's slice of the stack for the same rows, bit for
 // bit, in the path the op took: the expert's rows in one call (dot kernel on a GPU), or on a GPU backend the GEMM path
-// (chunks of up to 511 rows padded to at least 33, so that EXL3_MUL_MAT runs its hi + lo GEMM). NMSE: against
-// ggml_mul_mat_id on the f32 W of the experts on the CPU (1e-10), or against a double sum on 8 pairs at most twice that
-// of the op backend's own ggml_mul_mat_id on the same f32 W
+// (chunks of up to 511 rows padded to at least 33, so that EXL3_MUL_MAT runs its hi + lo GEMM; an expert with at least
+// MMID_ONE_ROWS rows in one call, its one-product GEMM). NMSE: against ggml_mul_mat_id on the f32 W of the experts on the
+// CPU (1e-10), or against a double sum on 8 pairs at most twice that of the op backend's own ggml_mul_mat_id on the same
+// f32 W, and so for up to 8 pairs of the experts with at least MMID_ONE_ROWS rows and up to 8 of the others
 static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const int16_t * trellis, const ggml_fp16_t * suh,
                                const ggml_fp16_t * svh, int64_t k, int64_t n, int64_t n_exp, int64_t tile_words, int cb,
-                               int64_t n_used, int64_t ne11, int64_t n_tok, uint32_t seed, const char * label) {
+                               int64_t n_used, int64_t ne11, int64_t n_tok, bool skew, uint32_t seed, const char * label) {
     uint32_t s = seed;
     const int64_t tk = k/GGML_EXL3_TILE;
     const int64_t tn = n/GGML_EXL3_TILE;
@@ -1399,7 +1409,12 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
             int32_t e;
             bool dup;
             do {
-                e = (int32_t) (xorshift32(&s) % n_pick);
+                if (skew && n_pick > (uint32_t) n_used) {
+                    const double u = (double) (xorshift32(&s) >> 8)*(1.0/16777216.0);
+                    e = i == 0 ? 0 : 1 + (int32_t) ((double) (n_pick - 1)*u*u*u);
+                } else {
+                    e = (int32_t) (xorshift32(&s) % n_pick);
+                }
                 dup = false;
                 for (int64_t j = 0; j < i; j++) {
                     dup = dup || ids[t*n_used + j] == e;
@@ -1407,6 +1422,16 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
             } while (dup);
             ids[t*n_used + i] = e;
         }
+    }
+    int64_t * cnt = (int64_t *) calloc(n_exp, sizeof(int64_t));
+    int64_t max_rows = 0;
+    int64_t rows_one = 0;
+    for (int64_t p = 0; cnt != NULL && p < n_pairs; p++) {
+        cnt[ids[p]]++;
+    }
+    for (int64_t e = 0; cnt != NULL && e < n_exp; e++) {
+        max_rows  = cnt[e] > max_rows ? cnt[e] : max_rows;
+        rows_one += cnt[e] >= MMID_ONE_ROWS ? cnt[e] : 0;
     }
 
     struct ggml_init_params params = { 16*ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
@@ -1437,7 +1462,8 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
     double err = 1.0;
     double e_op = -1.0;
     double e_be = -1.0;
-    if (buf == NULL || bufr == NULL || w_t == NULL || y_be == NULL || !ggml_backend_supports_op(be, out)) {
+    double e_cls[2][2] = { { -1.0, -1.0 }, { -1.0, -1.0 } }; // [one product, two][op, backend]
+    if (buf == NULL || bufr == NULL || w_t == NULL || y_be == NULL || cnt == NULL || !ggml_backend_supports_op(be, out)) {
         fprintf(stderr, "EXL3_MUL_MAT_ID is not supported by the %s backend\n", ggml_backend_name(be));
     } else {
         ggml_backend_tensor_set(t_tr, trellis, 0, ggml_nbytes(t_tr));
@@ -1478,6 +1504,36 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
             e_op = den > 0.0 ? num_o/den : 0.0;
             e_be = den > 0.0 ? num_b/den : 0.0;
 
+            // and on the first 8 pairs of the experts with at least MMID_ONE_ROWS rows (cls 0) and of the others (cls 1)
+            for (int cls = 0; cls < 2; cls++) {
+                double co = 0.0, cbe = 0.0, cd = 0.0;
+                int64_t taken = 0;
+                for (int64_t p = 0; p < n_pairs && taken < 8; p++) {
+                    if ((cnt[ids[p]] >= MMID_ONE_ROWS) != (cls == 0)) {
+                        continue;
+                    }
+                    taken++;
+                    const float * xr = xd + ((p / n_used)*ne11 + (p % n_used) % ne11)*k;
+                    const float * we = w_t + ids[p]*k*n;
+                    for (int64_t j = 0; j < n; j++) {
+                        double acc = 0.0;
+                        for (int64_t i = 0; i < k; i++) {
+                            acc += (double) xr[i]*(double) we[j*k + i];
+                        }
+                        const double t  = (double) (float) acc;
+                        const double dop = (double) y_id[p*n + j] - t;
+                        const double dbe = (double) y_be[p*n + j] - t;
+                        co  += dop*dop;
+                        cbe += dbe*dbe;
+                        cd  += t*t;
+                    }
+                }
+                if (taken > 0 && cd > 0.0) {
+                    e_cls[cls][0] = co/cd;
+                    e_cls[cls][1] = cbe/cd;
+                }
+            }
+
             // the rows of each expert, in pair order, against EXL3_MUL_MAT on the expert's slice
             // eq_dot: the expert's rows in one EXL3_MUL_MAT call; eq_gemm: chunks that run the GEMM on a GPU
             bool eq_dot  = true;
@@ -1501,8 +1557,9 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
                     if (!*eq) {
                         continue;
                     }
-                    *eq = pass == 0 ? expert_rows(be, trellis + e*per, suh + e*k, svh + e*n, k, n, tile_words, cb, xs, nr, nr, 0, ys)
-                                    : expert_rows(be, trellis + e*per, suh + e*k, svh + e*n, k, n, tile_words, cb, xs, nr, 511, 33, ys);
+                    *eq = pass == 0 || nr >= MMID_ONE_ROWS ?
+                          expert_rows(be, trellis + e*per, suh + e*k, svh + e*n, k, n, tile_words, cb, xs, nr, nr, 0, ys) :
+                          expert_rows(be, trellis + e*per, suh + e*k, svh + e*n, k, n, tile_words, cb, xs, nr, 511, 33, ys);
                     for (int64_t r = 0; *eq && r < nr; r++) {
                         *eq = memcmp(ys + r*n, y_id + pr[r]*n, n*sizeof(float)) == 0;
                     }
@@ -1517,15 +1574,21 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
             free(pr);
             rows_equal = eq_dot ? "one call" : eq_gemm ? "gemm chunks" : "no";
             const bool f32_grade  = err <= OP_NMSE_MAX;
-            const bool calibrated = e_be > 0.0 && e_op <= OP_NMSE_CALIB*e_be;
+            bool calibrated = e_be > 0.0 && e_op <= OP_NMSE_CALIB*e_be;
+            for (int cls = 0; cls < 2; cls++) {
+                calibrated = calibrated && (e_cls[cls][1] < 0.0 || (e_cls[cls][1] > 0.0 && e_cls[cls][0] <= OP_NMSE_CALIB*e_cls[cls][1]));
+            }
             fail = !((eq_dot || eq_gemm) && (f32_grade || calibrated));
         }
     }
     printf("{\"case\": \"mul_mat_id %s\", \"backend\": \"%s\", \"k\": %lld, \"n\": %lld, \"experts\": %lld, \"K\": %.1f, \"cb\": %d, "
-           "\"n_used\": %lld, \"ne11\": %lld, \"tokens\": %lld, \"rows_equal_mul_mat_per_expert\": \"%s\", \"nmse_vs_mul_mat_id\": %.3e, "
-           "\"nmse_op_vs_f64\": %.3e, \"nmse_be_mul_mat_id_vs_f64\": %.3e, \"op_over_be\": %.3f, \"pass\": %s}\n",
+           "\"n_used\": %lld, \"ne11\": %lld, \"tokens\": %lld, \"routing\": \"%s\", \"max_rows\": %lld, \"rows_one\": %lld, "
+           "\"rows_equal_mul_mat_per_expert\": \"%s\", \"nmse_vs_mul_mat_id\": %.3e, "
+           "\"nmse_op_vs_f64\": %.3e, \"nmse_be_mul_mat_id_vs_f64\": %.3e, \"op_over_be\": %.3f, "
+           "\"nmse_op_vs_f64_one\": %.3e, \"nmse_be_vs_f64_one\": %.3e, \"nmse_op_vs_f64_two\": %.3e, \"nmse_be_vs_f64_two\": %.3e, \"pass\": %s}\n",
            label, ggml_backend_name(be), (long long) k, (long long) n, (long long) n_exp, tile_words/16.0, cb, (long long) n_used,
-           (long long) ne11, (long long) n_tok, rows_equal, err, e_op, e_be, e_be > 0.0 ? e_op/e_be : -1.0, fail ? "false" : "true");
+           (long long) ne11, (long long) n_tok, skew ? "skewed" : "uniform", (long long) max_rows, (long long) rows_one, rows_equal,
+           err, e_op, e_be, e_be > 0.0 ? e_op/e_be : -1.0, e_cls[0][0], e_cls[0][1], e_cls[1][0], e_cls[1][1], fail ? "false" : "true");
     fflush(stdout);
     ggml_backend_buffer_free(buf);
     ggml_backend_buffer_free(bufr);
@@ -1537,6 +1600,7 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
     free(y_id);
     free(y_ref);
     free(y_be);
+    free(cnt);
     return fail;
 }
 
@@ -1548,12 +1612,15 @@ static int test_mul_mat_id_op(void) {
     }
     int n_fail = 0;
     // x broadcast over the slots (gate, up) and one x per slot (down); decode and prompt token counts; K 2, 3.5, 4, 6
-    n_fail += test_mul_mat_id_case(be, be_ref, 256, 384, 8, 32, 2, 2, 1, 13, 0x1001u);
-    n_fail += test_mul_mat_id_case(be, be_ref, 256, 384, 8, 32, 2, 2, 2, 13, 0x1002u);
-    n_fail += test_mul_mat_id_case(be, be_ref, 384, 256, 8, 56, 2, 3, 3, 1, 0x1003u);
-    n_fail += test_mul_mat_id_case(be, be_ref, 256, 256, 6, 64, 1, 4, 1, 37, 0x1004u);
-    n_fail += test_mul_mat_id_case(be, be_ref, 256, 128, 5, 96, 0, 1, 1, 9, 0x1005u);
-    n_fail += test_mul_mat_id_case(be, be_ref, 256, 256, 4, 32, 2, 2, 2, 80, 0x1006u);
+    n_fail += test_mul_mat_id_case(be, be_ref, 256, 384, 8, 32, 2, 2, 1, 13, false, 0x1001u);
+    n_fail += test_mul_mat_id_case(be, be_ref, 256, 384, 8, 32, 2, 2, 2, 13, false, 0x1002u);
+    n_fail += test_mul_mat_id_case(be, be_ref, 384, 256, 8, 56, 2, 3, 3, 1, false, 0x1003u);
+    n_fail += test_mul_mat_id_case(be, be_ref, 256, 256, 6, 64, 1, 4, 1, 37, false, 0x1004u);
+    n_fail += test_mul_mat_id_case(be, be_ref, 256, 128, 5, 96, 0, 1, 1, 9, false, 0x1005u);
+    n_fail += test_mul_mat_id_case(be, be_ref, 256, 256, 4, 32, 2, 2, 2, 80, false, 0x1006u);
+    // skewed routing: the first expert takes every token (one product on HIP from MMID_ONE_ROWS tokens)
+    n_fail += test_mul_mat_id_case(be, be_ref, 256, 256, 8, 32, 2, 3, 1, 160, true, 0x1007u);
+    n_fail += test_mul_mat_id_case(be, be_ref, 256, 384, 8, 64, 1, 3, 3, 520, true, 0x1008u);
     if (be != be_ref) {
         ggml_backend_free(be);
     }

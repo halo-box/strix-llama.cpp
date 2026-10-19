@@ -183,11 +183,14 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
 - `test-exl3`: the three codebook tables, and all 27 rate x codebook cases on synthetic tiles, against hashes made
   with exllamav3's `trellis.py`; type and shape checks; row rings for K = 1..8 (n-gram rows with a bias, token
   embedding rows with signs, cropped) against hashes made with exllamav3's `ngram_codec.dequant_rows`, and
-  `EXL3_GET_ROWS` on the op backend against that decoder, bit for bit; `EXL3_MUL_MAT_ID` on the op backend against
+  `EXL3_GET_ROWS` on the op backend against that decoder, bit for bit; `EXL3_MUL_MAT_ID` with uniform and skewed
+  routing (one expert in every token, the others favouring low expert numbers) on the op backend against
   `EXL3_MUL_MAT` per expert on the op backend, bit for bit, in the path the op took (the expert's rows in one call,
-  or on a GPU backend chunks of up to 511 rows padded to 33, which run the GEMM), and against `ggml_mul_mat_id` on
-  the f32 W of the experts: NMSE 1e-10 against the CPU, or against a double sum on 8 pairs at most twice that of the
-  op backend's own `ggml_mul_mat_id` on the same W (`nmse_be_mul_mat_id_vs_f64`).
+  or on a GPU backend chunks of up to 511 rows padded to 33, which run the hi + lo GEMM, and one call for an expert
+  with 512 rows or more, which runs the one-product GEMM), and against `ggml_mul_mat_id` on the f32 W of the
+  experts: NMSE 1e-10 against the CPU, or against a double sum on 8 pairs at most twice that of the op backend's own
+  `ggml_mul_mat_id` on the same W (`nmse_be_mul_mat_id_vs_f64`), and so on 8 pairs of the experts with 512 rows or
+  more (`nmse_*_one`) and on 8 of the others (`nmse_*_two`).
 - `test-exl3 --gguf FILE`: decodes every EXL3 linear of a container and prints sha256 of `W_hat` and `W` per tensor
   (a stack of experts: all of them, one after the other).
 - The op: `test-exl3` also runs `ggml_exl3_mul_mat` against `ggml_mul_mat` on the f32 `W` of `ggml_exl3_dequantize`
@@ -199,7 +202,8 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
   is at most twice that of the backend's own `ggml_mul_mat` (the `nmse_be_mul_mat_vs_f64` field). The fp16 values
   of `W_hat` are checked bit for bit by the decode tests above. `test-backend-ops -o EXL3_MUL_MAT` and
   `-o EXL3_GET_ROWS` and `-o EXL3_MUL_MAT_ID` have the op cases. For a stack of experts `--op-gguf` runs
-  `EXL3_MUL_MAT_ID` at 1 to 512 tokens, x broadcast and one x per slot.
+  `EXL3_MUL_MAT_ID` at 1 to 512 tokens with uniform routing and at 96 to 513 tokens with skewed routing, x broadcast
+  and one x per slot.
 - `test-exl3 [--backend NAME] --exact-gguf FILE`: the op of every linear and stack of a container on one-hot rows
   (`suh` = 1, x row r = a row of the 128-point Hadamard, so `H(x * suh)` = 128 e_r and every product is exact)
   against the CPU op. Rows run in chunks of 32 (the HIP dot kernel) must be equal bit for bit, which holds iff the
