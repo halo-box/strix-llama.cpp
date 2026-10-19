@@ -121,9 +121,11 @@ synchronization: for one token every (slot) pair is a group of one row and the k
 more tokens one block sorts the rows by expert and cuts each expert's rows into groups. Below 12 rows per expert on
 average the groups (up to 8 rows of one expert) run the dot kernel of `EXL3_MUL_MAT`; from 12 on RDNA3 they run its
 hi + lo GEMM in groups of 32 rows (up to 32 rows per expert on average) or 64 rows, two products at every token count,
-because the F32 control (`ggml_mul_mat_id` on an F32 stack) runs f32 GEMMs per expert on this backend. Each row is the
-row `EXL3_MUL_MAT` computes for that expert in the same kernel, bit for bit (the GEMM's per-row arithmetic does not
-depend on its row tile).
+because the F32 control (`ggml_mul_mat_id` on an F32 stack) runs f32 GEMMs per expert on this backend. A warp of the
+GEMM whose 16 rows are past its group's last row skips its WMMAs, so a group costs the WMMA work of its rows rounded
+up to 16 (routing in a model is far from uniform: many experts get a few rows, a few get most). Each row is the row
+`EXL3_MUL_MAT` computes for that expert in the same kernel, bit for bit (the GEMM's per-row arithmetic does not depend
+on its row tile).
 
 `ggml_exl3_get_rows(ctx, table, ids, signs, n_out)` (`GGML_OP_EXL3_GET_ROWS`) decodes the rows `ids` of a token
 embedding row table to F32 `[n_out, n]`; the CPU backend runs `ggml_exl3_decode_embd_row` on each row. The HIP

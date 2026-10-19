@@ -947,7 +947,8 @@ static __device__ __forceinline__ exl3_v16h exl3_frag(const uint16_t * p) {
 // the output Hadamard runs in registers (stages 1..8 across lanes, 16..64 across fragments, the order and roundings of
 // exl3_fwht128). Both products, W_hat with xh hi and with xh lo, are f16 WMMAs with f32 accumulation.
 // ID: block row g is group g of mm (up to BN rows of one expert), with that expert's trellis and svh; row t is stored to
-// the dst row of its pair
+// the dst row of its pair. A warp whose 16 rows are all past the group's last row only decodes its share of the weight
+// tile: it skips the WMMAs and the output
 template <int bits, int cb, bool ID, int W>
 static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
         const int16_t * __restrict__ trellis, const half * __restrict__ xhi, const half * __restrict__ xlo,
@@ -974,8 +975,11 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
     const int warp = tid / 32;
     const int n0   = blockIdx.x*BM;
     int       t0   = blockIdx.y*BN;
+    int       rt   = warp; // the warp's 16 rows: t0 + rt*16 ..
+    bool      active = true; // they hold a row of the block
     if constexpr (ID) {
-        // rows [t0, rows) of the expert's group
+        // rows [t0, rows) of the expert's group. The row tiles rotate over the warps from block to block, so that the
+        // warps of the partial groups that skip their WMMAs are not always the last ones (the same SIMDs)
         int e;
         int nr;
         exl3_mmid_group(mm, blockIdx.y, e, t0, nr);
@@ -983,6 +987,8 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
             return;
         }
         rows     = t0 + nr;
+        rt       = (warp + blockIdx.x + blockIdx.y) % W;
+        active   = rt*16 < nr;
         trellis += e*mm.tq_stride;
         svh     += (int64_t) e*n;
     }
@@ -1077,31 +1083,33 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
         // the 200 linears 265 ms, 254 with both barriers)
         EXL3_GEMM_LOAD(min(ks + 1, n_steps - 1));
         __builtin_amdgcn_sched_barrier(0);
-        // the x fragments of the step, then two column fragments at a time over the whole step: only two partial sums
-        // are live, and no WMMA waits on the one just issued
-        const int r = lane % 16;
-        exl3_v16h bh[KT];
-        exl3_v16h bl[KT];
-#pragma unroll
-        for (int j = 0; j < KT; ++j) {
-            bh[j] = exl3_frag(Bs + (     warp*16 + r)*LS + j*16);
-            bl[j] = exl3_frag(Bs + (BN + warp*16 + r)*LS + j*16);
-        }
-#pragma unroll
-        for (int i = 0; i < 8; i += 2) {
-            exl3_v8f p0 = zero;
-            exl3_v8f p1 = zero;
+        if (active) {
+            // the x fragments of the step, then two column fragments at a time over the whole step: only two partial
+            // sums are live, and no WMMA waits on the one just issued
+            const int r = lane % 16;
+            exl3_v16h bh[KT];
+            exl3_v16h bl[KT];
 #pragma unroll
             for (int j = 0; j < KT; ++j) {
-                const exl3_v16h a0 = exl3_frag(As + ( i     *16 + r)*LS + j*16);
-                const exl3_v16h a1 = exl3_frag(As + ((i + 1)*16 + r)*LS + j*16);
-                p0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], a0, p0);
-                p1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], a1, p1);
-                p0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], a0, p0);
-                p1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], a1, p1);
+                bh[j] = exl3_frag(Bs + (     rt*16 + r)*LS + j*16);
+                bl[j] = exl3_frag(Bs + (BN + rt*16 + r)*LS + j*16);
             }
-            acc[i]     += p0;
-            acc[i + 1] += p1;
+#pragma unroll
+            for (int i = 0; i < 8; i += 2) {
+                exl3_v8f p0 = zero;
+                exl3_v8f p1 = zero;
+#pragma unroll
+                for (int j = 0; j < KT; ++j) {
+                    const exl3_v16h a0 = exl3_frag(As + ( i     *16 + r)*LS + j*16);
+                    const exl3_v16h a1 = exl3_frag(As + ((i + 1)*16 + r)*LS + j*16);
+                    p0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], a0, p0);
+                    p1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], a1, p1);
+                    p0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], a0, p0);
+                    p1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], a1, p1);
+                }
+                acc[i]     += p0;
+                acc[i + 1] += p1;
+            }
         }
         // and the decode of the next step after them, when its loads have landed
         __builtin_amdgcn_sched_barrier(0);
@@ -1111,8 +1119,11 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
     }
 #undef EXL3_GEMM_LOAD
 #undef EXL3_GEMM_STORE
+    if (!active) {
+        return;
+    }
 
-    // acc[i][e]: row t0 + warp*16 + 2*e + lane/16, column n0 + i*16 + lane%16
+    // acc[i][e]: row t0 + rt*16 + 2*e + lane/16, column n0 + i*16 + lane%16
     exl3_fwht_lanes<1>(acc, lane);
     exl3_fwht_lanes<2>(acc, lane);
     exl3_fwht_lanes<4>(acc, lane);
@@ -1140,7 +1151,7 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
     }
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
-        const int t = t0 + warp*16 + 2*e + lane/16;
+        const int t = t0 + rt*16 + 2*e + lane/16;
         if (t < rows) {
             const float s = inv[t];
             float * y = dst + (int64_t) (ID ? exl3_mmid_pair(mm, t) : t)*n + n0 + lane % 16;
@@ -1565,12 +1576,23 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 // ---- EXL3_MUL_MAT_ID ----
 
 // The path by the average rows per expert, n_pairs/n_exp: the dot kernel in groups of up to 8 rows of one expert (a pass
-// over the expert's weights per group) below EXL3_MMID_GEMM_ROWS, else the hi + lo GEMM (RDNA3) in groups of 32 rows
-// (W = 2 warps) up to EXL3_MMID_W2_ROWS, 64 rows (W = 4) above. LFM2.5-8B-A1B stacks (2048 -> 1792 x broadcast / 1792 ->
-// 2048 per slot, 32 experts, top-4, K = 2 mul1), uniform routing, gfx1151, us per op (.claude/exl3-s7/results/mmid):
-//   dot vs GEMM 32-row groups: 88 tokens (11 rows per expert) 638 / 717 vs 679 / 722, 96 tokens (12) 682 / 690 vs
-//   621 / 634; 32-row vs 64-row groups: 256 tokens (32) 1040 / 1046 vs 1139 / 1110, 384 tokens (48) 1374 / 1418 vs
-//   1199 / 1169; 64-row vs 128-row groups: 512 tokens 1664 / 1639 vs 2077 / 2121, 2048 tokens 5315 / 5088 vs 5939 / 5362
+// over the expert's weights per group) below EXL3_MMID_GEMM_ROWS, else the hi + lo GEMM (RDNA3) in groups of up to 32
+// rows of one expert (W = 2 warps) up to EXL3_MMID_W2_ROWS, 64 rows (W = 4) above. A warp whose 16 rows are past its
+// group's last row skips its WMMAs (exl3_gemm_kernel), so a group costs the WMMA work of its rows rounded up to 16:
+// routing in a model is far from uniform (LFM2.5-8B-A1B at ubatch 512, llama-bench's prompt: median 16 rows per expert,
+// 18% of the experts empty, 15% with >= 128 rows holding 68% of the rows), and whole groups did 1.53x the WMMA work of
+// the rows, 16-row tiles 1.11x (.claude/exl3-s8/results/routing). LFM2.5 stacks (2048 -> 1792 x broadcast / 1792 ->
+// 2048 per slot, 32 experts, top-4, K = 2 mul1), gfx1151, us per op:
+//   dot vs GEMM 32-row groups, uniform routing (.claude/exl3-s7/results/mmid): 88 tokens (11 rows per expert) 638 / 717
+//   vs 679 / 722, 96 tokens (12) 682 / 690 vs 621 / 634
+//   32- vs 64-row groups with the skipped tiles, uniform (.claude/exl3-s8/results/mmid/tok-*): 96 tokens 503 / 496 vs
+//   532 / 532, 128: 557 / 606 vs 656 / 658, 192: 652 / 774 vs 782 / 819, 256: 840 / 991 vs 932 / 931, 384: 1294 / 1366
+//   vs 1149 / 1132
+//   512 tokens, 64-row groups with the skipped tiles vs whole groups (ABBA, .claude/exl3-s8/results/mmid/fin-*): uniform
+//   1426 / 1445 vs 1523 / 1544, llama-bench's routing 1351 / 1371 vs 1550 / 1573, prose 1370 / 1390 vs 1514 / 1576,
+//   code 1373 / 1399 vs 1579 / 1584. Rejected (llama-bench's routing): 128-row groups 1345 / 1367 vs 1315 / 1344
+//   (s8b-*), a separate launch of 32-row blocks for the last partial groups of up to 32 rows 1369 / 1382 (llama-bench
+//   pp2048 4114 / 4059 tok/s vs 4229, results/screen-w)
 #define EXL3_MMID_GEMM_ROWS   12
 #define EXL3_MMID_W2_ROWS     32
 #define EXL3_MMID_EXPERTS_MAX 1024 // exl3_mmid_route counts the rows of each expert in LDS
