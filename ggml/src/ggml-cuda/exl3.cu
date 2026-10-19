@@ -116,8 +116,8 @@ typedef __attribute__((address_space(1))) const uint32_t exl3_g_u32;
 typedef __attribute__((address_space(1))) const exl3_f2  exl3_g_f2;
 
 // EXL3_MUL_MAT_ID: the rows of the op are the (slot, token) pairs p = slot + n_used*token, in expert order. A group is
-// up to S consecutive rows of one expert; grp holds (expert, first row, rows) per group, rows = 0 past the op's last
-// group. Without grp (one token) row r is pair r and group r, its expert ids[r].
+// consecutive rows of one expert; grp (the group table of one launch) holds (expert, first row, rows) per group, rows = 0
+// past the table's last group. Without grp (one token) row r is pair r and group r, its expert ids[r].
 struct exl3_mmid {
     const char * ids;       // I32 [n_used, n_tokens]
     int64_t      ids_nb0;
@@ -948,8 +948,9 @@ static __device__ __forceinline__ exl3_v16h exl3_frag(const uint16_t * p) {
 // exl3_fwht128). Both products, W_hat with xh hi and with xh lo, are f16 WMMAs with f32 accumulation.
 // ID: block row g is group g of mm (up to BN rows of one expert), with that expert's trellis and svh; row t is stored to
 // the dst row of its pair. A warp whose 16 rows are all past the group's last row only decodes its share of the weight
-// tile: it skips the WMMAs and the output
-template <int bits, int cb, bool ID, int W>
+// tile: it skips the WMMAs and the output. P = 1 (ID only): one f16 product, W_hat with xh hi, accumulated across k in
+// place in the order of exl3_gemm1_kernel, so a row equals that kernel's row bit for bit
+template <int bits, int cb, bool ID, int W, int P = 2>
 static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
         const int16_t * __restrict__ trellis, const half * __restrict__ xhi, const half * __restrict__ xlo,
         const float * __restrict__ inv, const half * __restrict__ svh, float * __restrict__ dst, const int k,
@@ -964,11 +965,12 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
     constexpr int R          = exl3_lane_plan<bits>::R;
     constexpr int tile_bytes = exl3_width<bits>::tile_bytes;
     constexpr int KT         = BK/16;          // k-tiles per step
-    constexpr int B_ITEMS    = 2*BN*BK/8/NT;   // 16-byte chunks of xh hi and lo per thread per step
+    constexpr int B_ITEMS    = P*BN*BK/8/NT;   // 16-byte chunks of xh hi (and lo) per thread per step
     static_assert(BM == 8*16 && 8 % W == 0, "8/W column tiles and 16 rows per warp");
+    static_assert(P == 2 || (P == 1 && ID), "one product without ID is exl3_gemm1_kernel");
 
     __shared__ __align__(16) uint16_t As[BM*LS];
-    __shared__ __align__(16) uint16_t Bs[2*BN*LS];
+    __shared__ __align__(16) uint16_t Bs[P*BN*LS];
 
     const int tid  = threadIdx.x;
     const int lane = tid % 32;
@@ -1018,7 +1020,7 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
     for (int i = 0; i < B_ITEMS; ++i) {
         const int it  = tid + i*NT;
         const int row = min(t0 + (it / (BK/8)) % BN, rows - 1);
-        xsrc[i] = (const exl3_u4 *) ((i < B_ITEMS/2 ? xhi : xlo) + (int64_t) row*k + (it % (BK/8))*8);
+        xsrc[i] = (const exl3_u4 *) ((i < B_ITEMS/P ? xhi : xlo) + (int64_t) row*k + (it % (BK/8))*8);
         xdst[i] = (exl3_u4 *) (Bs + (it / (BK/8))*LS + (it % (BK/8))*8);
     }
 
@@ -1092,23 +1094,36 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
 #pragma unroll
             for (int j = 0; j < KT; ++j) {
                 bh[j] = exl3_frag(Bs + (     rt*16 + r)*LS + j*16);
-                bl[j] = exl3_frag(Bs + (BN + rt*16 + r)*LS + j*16);
+                if constexpr (P == 2) {
+                    bl[j] = exl3_frag(Bs + (BN + rt*16 + r)*LS + j*16);
+                }
             }
+            if constexpr (P == 2) {
 #pragma unroll
-            for (int i = 0; i < 8; i += 2) {
-                exl3_v8f p0 = zero;
-                exl3_v8f p1 = zero;
+                for (int i = 0; i < 8; i += 2) {
+                    exl3_v8f p0 = zero;
+                    exl3_v8f p1 = zero;
+#pragma unroll
+                    for (int j = 0; j < KT; ++j) {
+                        const exl3_v16h a0 = exl3_frag(As + ( i     *16 + r)*LS + j*16);
+                        const exl3_v16h a1 = exl3_frag(As + ((i + 1)*16 + r)*LS + j*16);
+                        p0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], a0, p0);
+                        p1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], a1, p1);
+                        p0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], a0, p0);
+                        p1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], a1, p1);
+                    }
+                    acc[i]     += p0;
+                    acc[i + 1] += p1;
+                }
+            } else {
 #pragma unroll
                 for (int j = 0; j < KT; ++j) {
-                    const exl3_v16h a0 = exl3_frag(As + ( i     *16 + r)*LS + j*16);
-                    const exl3_v16h a1 = exl3_frag(As + ((i + 1)*16 + r)*LS + j*16);
-                    p0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], a0, p0);
-                    p1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], a1, p1);
-                    p0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], a0, p0);
-                    p1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], a1, p1);
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const exl3_v16h a = exl3_frag(As + (i*16 + r)*LS + j*16);
+                        acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], a, acc[i]);
+                    }
                 }
-                acc[i]     += p0;
-                acc[i + 1] += p1;
             }
         }
         // and the decode of the next step after them, when its loads have landed
@@ -1337,11 +1352,19 @@ static __global__ void __launch_bounds__(256) exl3_gemm1_kernel(
 #endif // defined(RDNA3)
 }
 
-// hi + lo GEMM with W warps (16*W rows per block)
+// hi + lo GEMM with W warps (16*W rows per block); P = 1: the one-product variant (EXL3_MUL_MAT_ID only)
 template <int bits, int cb, bool ID>
-static void exl3_gemm2_launch(const int W, const dim3 grid, const int16_t * trellis, const half * xhi, const half * xlo,
-        const float * inv, const half * svh, float * dst, const int64_t k, const int64_t n, const int64_t rows,
-        const exl3_mmid & mm, cudaStream_t stream) {
+static void exl3_gemm2_launch(const int W, const int P, const dim3 grid, const int16_t * trellis, const half * xhi,
+        const half * xlo, const float * inv, const half * svh, float * dst, const int64_t k, const int64_t n,
+        const int64_t rows, const exl3_mmid & mm, cudaStream_t stream) {
+    if constexpr (ID) {
+        if (P == 1) {
+            GGML_ASSERT(W == 8);
+            exl3_gemm_kernel<bits, cb, true, 8, 1><<<grid, 256, 0, stream>>>(trellis, xhi, xlo, inv, svh, dst, (int) k, (int) n, (int) rows, mm);
+            return;
+        }
+    }
+    GGML_ASSERT(P == 2);
     switch (W) {
         case 2:
             // not for K = 7: four column tiles of 8 dwords per lane spill (260 bytes of scratch)
@@ -1357,38 +1380,38 @@ static void exl3_gemm2_launch(const int W, const dim3 grid, const int16_t * trel
     }
 }
 
-// mm: the groups of an EXL3_MUL_MAT_ID, n_groups of up to 16*W rows (two products only); nullptr for EXL3_MUL_MAT.
+// mm: the groups of one table of an EXL3_MUL_MAT_ID, n_groups of up to 16*W rows, P products; nullptr for EXL3_MUL_MAT.
 // W: warps of the hi + lo GEMM (16*W rows per block)
 template <int bits, int cb>
 static void exl3_gemm_launch(const int16_t * trellis, const half * xhi, const half * xlo, const float * inv,
         const half * svh, float * dst, const int64_t k, const int64_t n, const int64_t rows, const exl3_mmid * mm,
-        const int64_t n_groups, const int W, cudaStream_t stream) {
+        const int64_t n_groups, const int W, const int P, cudaStream_t stream) {
     if (mm != nullptr) {
         GGML_ASSERT(xlo != nullptr);
         const dim3 grid((unsigned) (n/EXL3_GEMM_BM), (unsigned) n_groups);
-        exl3_gemm2_launch<bits, cb, true>(W, grid, trellis, xhi, xlo, inv, svh, dst, k, n, rows, *mm, stream);
+        exl3_gemm2_launch<bits, cb, true>(W, P, grid, trellis, xhi, xlo, inv, svh, dst, k, n, rows, *mm, stream);
     } else if (xlo == nullptr) {
         const dim3 grid((unsigned) (n/EXL3_GEMM_BM), (unsigned) ((rows + 2*EXL3_GEMM_BN - 1)/(2*EXL3_GEMM_BN)));
         exl3_gemm1_kernel<bits, cb><<<grid, 256, 0, stream>>>(trellis, xhi, inv, svh, dst, (int) k, (int) n, (int) rows);
     } else {
         const dim3 grid((unsigned) (n/EXL3_GEMM_BM), (unsigned) ((rows + 16*W - 1)/(16*W)));
-        exl3_gemm2_launch<bits, cb, false>(W, grid, trellis, xhi, xlo, inv, svh, dst, k, n, rows, exl3_mmid {}, stream);
+        exl3_gemm2_launch<bits, cb, false>(W, 2, grid, trellis, xhi, xlo, inv, svh, dst, k, n, rows, exl3_mmid {}, stream);
     }
 }
 
 template <int bits>
 static void exl3_gemm_launch_cb(const int cb, const int16_t * trellis, const half * xhi, const half * xlo,
         const float * inv, const half * svh, float * dst, const int64_t k, const int64_t n, const int64_t rows,
-        const exl3_mmid * mm, const int64_t n_groups, const int W, cudaStream_t stream) {
+        const exl3_mmid * mm, const int64_t n_groups, const int W, const int P, cudaStream_t stream) {
     switch (cb) {
         case GGML_EXL3_CODEBOOK_3INST:
-            exl3_gemm_launch<bits, GGML_EXL3_CODEBOOK_3INST>(trellis, xhi, xlo, inv, svh, dst, k, n, rows, mm, n_groups, W, stream);
+            exl3_gemm_launch<bits, GGML_EXL3_CODEBOOK_3INST>(trellis, xhi, xlo, inv, svh, dst, k, n, rows, mm, n_groups, W, P, stream);
             break;
         case GGML_EXL3_CODEBOOK_MCG:
-            exl3_gemm_launch<bits, GGML_EXL3_CODEBOOK_MCG>(trellis, xhi, xlo, inv, svh, dst, k, n, rows, mm, n_groups, W, stream);
+            exl3_gemm_launch<bits, GGML_EXL3_CODEBOOK_MCG>(trellis, xhi, xlo, inv, svh, dst, k, n, rows, mm, n_groups, W, P, stream);
             break;
         case GGML_EXL3_CODEBOOK_MUL1:
-            exl3_gemm_launch<bits, GGML_EXL3_CODEBOOK_MUL1>(trellis, xhi, xlo, inv, svh, dst, k, n, rows, mm, n_groups, W, stream);
+            exl3_gemm_launch<bits, GGML_EXL3_CODEBOOK_MUL1>(trellis, xhi, xlo, inv, svh, dst, k, n, rows, mm, n_groups, W, P, stream);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -1438,19 +1461,19 @@ static int exl3_bits(const int64_t tile_words) {
 
 static void exl3_gemm_bits(const int bits, const int cb, const int16_t * tq, const half * xhi, const half * xlo,
         const float * inv, const half * sv, float * y, const int64_t k, const int64_t n, const int64_t rows,
-        const exl3_mmid * mm, const int64_t n_groups, const int W, cudaStream_t stream) {
+        const exl3_mmid * mm, const int64_t n_groups, const int W, const int P, cudaStream_t stream) {
     switch (bits) {
-        case 1: exl3_gemm_launch_cb<1>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
-        case 2: exl3_gemm_launch_cb<2>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
-        case 3: exl3_gemm_launch_cb<3>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
-        case 4: exl3_gemm_launch_cb<4>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
-        case 5: exl3_gemm_launch_cb<5>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
-        case 6: exl3_gemm_launch_cb<6>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
-        case 7: exl3_gemm_launch_cb<7>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
-        case 8: exl3_gemm_launch_cb<8>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
-        case 17: exl3_gemm_launch<17, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
-        case 18: exl3_gemm_launch<18, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
-        case 19: exl3_gemm_launch<19, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, stream); break;
+        case 1: exl3_gemm_launch_cb<1>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
+        case 2: exl3_gemm_launch_cb<2>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
+        case 3: exl3_gemm_launch_cb<3>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
+        case 4: exl3_gemm_launch_cb<4>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
+        case 5: exl3_gemm_launch_cb<5>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
+        case 6: exl3_gemm_launch_cb<6>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
+        case 7: exl3_gemm_launch_cb<7>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
+        case 8: exl3_gemm_launch_cb<8>(cb, tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
+        case 17: exl3_gemm_launch<17, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
+        case 18: exl3_gemm_launch<18, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
+        case 19: exl3_gemm_launch<19, GGML_EXL3_CODEBOOK_MUL1>(tq, xhi, xlo, inv, sv, y, k, n, rows, mm, n_groups, W, P, stream); break;
         default: GGML_ABORT("fatal error");
     }
 }
@@ -1552,7 +1575,7 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         // hi + lo: blocks of 64 rows (W = 4) when the last block of EXL3_GEMM_BN rows would be at most half full
         const int64_t tail = rows % EXL3_GEMM_BN;
         const int     W    = tail > 0 && tail <= EXL3_GEMM_BN/2 ? EXL3_GEMM_BN/32 : EXL3_GEMM_BN/16;
-        exl3_gemm_bits(bits, cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, nullptr, 0, W, stream);
+        exl3_gemm_bits(bits, cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, nullptr, 0, W, two ? 2 : 1, stream);
         return;
     }
 
@@ -1576,13 +1599,14 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 // ---- EXL3_MUL_MAT_ID ----
 
 // The path by the average rows per expert, n_pairs/n_exp: the dot kernel in groups of up to 8 rows of one expert (a pass
-// over the expert's weights per group) below EXL3_MMID_GEMM_ROWS, else the hi + lo GEMM (RDNA3) in groups of up to 32
-// rows of one expert (W = 2 warps) up to EXL3_MMID_W2_ROWS, 64 rows (W = 4) above. A warp whose 16 rows are past its
-// group's last row skips its WMMAs (exl3_gemm_kernel), so a group costs the WMMA work of its rows rounded up to 16:
-// routing in a model is far from uniform (LFM2.5-8B-A1B at ubatch 512, llama-bench's prompt: median 16 rows per expert,
-// 18% of the experts empty, 15% with >= 128 rows holding 68% of the rows), and whole groups did 1.53x the WMMA work of
-// the rows, 16-row tiles 1.11x (.claude/exl3-s8/results/routing). LFM2.5 stacks (2048 -> 1792 x broadcast / 1792 ->
-// 2048 per slot, 32 experts, top-4, K = 2 mul1), gfx1151, us per op:
+// over the expert's weights per group) below EXL3_MMID_GEMM_ROWS, else the GEMM (RDNA3) in groups of up to 32 rows of one
+// expert (W = 2 warps) up to EXL3_MMID_W2_ROWS, 64 rows (W = 4) above; the GEMM rows of an expert with at least
+// exl3_mmid_one_rows rows run one product in groups of EXL3_MMID_ONE_W warps. A warp whose 16 rows are past its group's
+// last row skips its WMMAs (exl3_gemm_kernel), so a group costs the WMMA work of its rows rounded up to 16: routing in a
+// model is far from uniform (LFM2.5-8B-A1B at ubatch 512, llama-bench's prompt: median 16 rows per expert, 18% of the
+// experts empty, 15% with >= 128 rows holding 68% of the rows), and whole groups did 1.53x the WMMA work of the rows,
+// 16-row tiles 1.11x (.claude/exl3-s8/results/routing). LFM2.5 stacks (2048 -> 1792 x broadcast / 1792 -> 2048 per slot,
+// 32 experts, top-4, K = 2 mul1), gfx1151, us per op:
 //   dot vs GEMM 32-row groups, uniform routing (.claude/exl3-s7/results/mmid): 88 tokens (11 rows per expert) 638 / 717
 //   vs 679 / 722, 96 tokens (12) 682 / 690 vs 621 / 634
 //   32- vs 64-row groups with the skipped tiles, uniform (.claude/exl3-s8/results/mmid/tok-*): 96 tokens 503 / 496 vs
@@ -1595,14 +1619,24 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 //   pp2048 4114 / 4059 tok/s vs 4229, results/screen-w)
 #define EXL3_MMID_GEMM_ROWS   12
 #define EXL3_MMID_W2_ROWS     32
+// 128-row groups for the one-product experts; 64-row groups measured the same (llama-bench pp2048 at ubatch 2048, where
+// 66% of the rows take one product: 5111 vs 5094 tok/s, .claude/exl3-s8/results/screen-onew)
+#define EXL3_MMID_ONE_W       8
 #define EXL3_MMID_EXPERTS_MAX 1024 // exl3_mmid_route counts the rows of each expert in LDS
 
-// the rows of an EXL3_MUL_MAT_ID in expert order (order[r] = pair of row r) and its groups of up to S rows of one expert
-// (exl3_mmid). One block; the atomics fill the rows of an expert in any order, which no result depends on (each row is
-// computed on its own)
+// group tables of an EXL3_MUL_MAT_ID: table 0 groups of up to s[0] rows (two products on the GEMM path), table 1 groups of
+// up to s[1] rows of the experts with at least one_rows rows (one product). The dot path uses table 0 only
+struct exl3_mmid_tables {
+    int * grp[2];
+    int   n_grp[2];
+    int   s[2];
+};
+
+// the rows of an EXL3_MUL_MAT_ID in expert order (order[r] = pair of row r) and its group tables (exl3_mmid). One block;
+// the atomics fill the rows of an expert in any order, which no result depends on (each row is computed on its own)
 static __global__ void __launch_bounds__(1024) exl3_mmid_route(
         const char * __restrict__ ids, const int64_t nb0, const int64_t nb1, const int n_used, const int n_pairs,
-        const int n_exp, const int S, int * __restrict__ order, int * __restrict__ grp, const int n_grp) {
+        const int n_exp, const int one_rows, int * __restrict__ order, const exl3_mmid_tables tab) {
     extern __shared__ int s_route[]; // [n_exp] rows per expert, then [n_exp] fill positions
     int * s_cnt = s_route;
     int * s_pos = s_route + n_exp;
@@ -1615,22 +1649,27 @@ static __global__ void __launch_bounds__(1024) exl3_mmid_route(
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        int row = 0;
-        int g   = 0;
+        int row  = 0;
+        int g[2] = { 0, 0 };
         for (int e = 0; e < n_exp; ++e) {
+            const int c = s_cnt[e];
+            const int t = c >= one_rows ? 1 : 0;
             s_pos[e] = row;
-            for (int j = 0; j < s_cnt[e]; j += S) {
-                grp[3*g]     = e;
-                grp[3*g + 1] = row + j;
-                grp[3*g + 2] = min(S, s_cnt[e] - j);
-                g++;
+            for (int j = 0; j < c; j += tab.s[t]) {
+                int * q = tab.grp[t] + 3*g[t]++;
+                q[0] = e;
+                q[1] = row + j;
+                q[2] = min(tab.s[t], c - j);
             }
-            row += s_cnt[e];
+            row += c;
         }
-        for (; g < n_grp; ++g) {
-            grp[3*g]     = 0;
-            grp[3*g + 1] = 0;
-            grp[3*g + 2] = 0;
+        for (int t = 0; t < 2; ++t) {
+            for (; g[t] < tab.n_grp[t]; ++g[t]) {
+                int * q = tab.grp[t] + 3*g[t];
+                q[0] = 0;
+                q[1] = 0;
+                q[2] = 0;
+            }
         }
     }
     __syncthreads();
@@ -1638,6 +1677,57 @@ static __global__ void __launch_bounds__(1024) exl3_mmid_route(
         const int e = *(const int *) (ids + (p % n_used)*nb0 + (p / n_used)*nb1);
         order[atomicAdd(&s_pos[e], 1)] = p;
     }
+}
+
+// Products of the GEMM rows, per expert. The F32 control, ggml_mul_mat_id on an F32 stack, runs on this backend the rows
+// of each expert as one ggml_mul_mat of a view of the stack on a contiguous copy of the rows: one f16 product
+// (mmb_f32split_kernel, both operands rounded) where ggml_cuda_mmb_supported_mm takes that shape (from 512 rows for a
+// view source), f32 (MMVF or rocBLAS) below. An expert's rows run one product iff the control runs one for them. Returns
+// the fewest rows of an expert that do (INT_MAX: none can, an expert holds at most one row per token).
+// GGML_EXL3_GEMM_PRODUCTS=1 or 2 overrides the choice as for EXL3_MUL_MAT.
+static int exl3_mmid_one_rows(ggml_backend_cuda_context & ctx, const int64_t k, const int64_t n, const int64_t n_tok) {
+    static const int forced = getenv("GGML_EXL3_GEMM_PRODUCTS") ? atoi(getenv("GGML_EXL3_GEMM_PRODUCTS")) : 0;
+    if (forced == 1 || forced == 2) {
+        return forced == 1 ? 1 : INT_MAX;
+    }
+    ggml_tensor w = {};
+    w.type  = GGML_TYPE_F32;
+    w.op    = GGML_OP_VIEW;
+    w.ne[0] = k;
+    w.ne[1] = n;
+    w.ne[2] = 1;
+    w.ne[3] = 1;
+    w.nb[0] = sizeof(float);
+    w.nb[1] = k*sizeof(float);
+    w.nb[2] = n*w.nb[1];
+    w.nb[3] = w.nb[2];
+    ggml_tensor x = w;
+    ggml_tensor d = w;
+    x.op = GGML_OP_NONE;
+    d.op = GGML_OP_NONE;
+    auto one = [&](const int64_t t) {
+        x.ne[1] = t;
+        x.nb[2] = x.nb[3] = t*x.nb[1];
+        d.ne[0] = n;
+        d.ne[1] = t;
+        d.nb[1] = n*sizeof(float);
+        d.nb[2] = d.nb[3] = t*d.nb[1];
+        return ggml_cuda_mmb_supported_mm(ctx, &w, &x, &d);
+    };
+    if (!one(n_tok)) {
+        return INT_MAX;
+    }
+    int64_t lo = 0;
+    int64_t hi = n_tok;
+    while (hi - lo > 1) {
+        const int64_t mid = (lo + hi)/2;
+        if (one(mid)) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    return (int) hi;
 }
 
 bool ggml_cuda_exl3_mul_mat_id_supports_op(const int device, const ggml_tensor * op) {
@@ -1656,8 +1746,9 @@ bool ggml_cuda_exl3_mul_mat_id_supports_op(const int device, const ggml_tensor *
 }
 
 // each row (pair) is computed as EXL3_MUL_MAT computes a row of its expert: the dot kernel with groups of rows of one
-// expert, or the hi + lo GEMM (two products at every row count: the F32 control, ggml_mul_mat_id on an F32 stack, runs
-// f32 GEMMs per expert on this backend). No host synchronization: the routing is computed on the device.
+// expert, or the GEMM, hi + lo (exl3_gemm_kernel, two products) or one product (its P = 1 variant, rows equal to those
+// of exl3_gemm1_kernel) per expert as the F32 control does (exl3_mmid_one_rows). No host synchronization: the routing
+// is computed on the device.
 void ggml_cuda_op_exl3_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * trellis = dst->src[0];
     const ggml_tensor * x       = dst->src[1];
@@ -1698,21 +1789,33 @@ void ggml_cuda_op_exl3_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
                       GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[ctx.device].cc);
     // an expert has at most one row per token
     const int M = n_tok == 1 ? 1 : n_tok == 2 ? 2 : n_tok <= 4 ? 4 : 8;
-    const int W = n_pairs <= EXL3_MMID_W2_ROWS*n_exp && bits != 7 ? 2 : 4;
-    const int S = gemm ? 16*W : M;
+    // warps of the two-product groups, then of the one-product ones
+    const int W[2] = { n_pairs <= EXL3_MMID_W2_ROWS*n_exp && bits != 7 ? 2 : 4, EXL3_MMID_ONE_W };
 
-    // one token: a group per pair; more: the routing, a group per S rows of an expert plus a partial one per expert
+    // one token: a group per pair; more: the routing and its group tables
+    exl3_mmid_tables tab = {};
     int64_t n_groups = n_pairs;
     ggml_cuda_pool_alloc<int> order(ctx.pool());
     ggml_cuda_pool_alloc<int> grp(ctx.pool());
     if (n_tok > 1) {
-        n_groups = (n_pairs + S - 1)/S + std::min(n_exp, n_pairs);
+        const int one_rows = gemm ? exl3_mmid_one_rows(ctx, k, n, n_tok) : INT_MAX;
+        int64_t n_grp[2];
+        tab.s[0] = gemm ? 16*W[0] : M;
+        tab.s[1] = 16*W[1];
+        n_grp[0] = n_pairs/tab.s[0] + std::min(n_exp, n_pairs);
+        n_grp[1] = one_rows <= n_tok ? n_pairs/tab.s[1] + n_pairs/one_rows : 0;
         order.alloc(n_pairs);
-        grp.alloc(3*n_groups);
+        grp.alloc(3*(n_grp[0] + n_grp[1]));
+        for (int t = 0; t < 2; ++t) {
+            GGML_ASSERT(n_grp[t] <= 65535);
+            tab.grp[t]   = n_grp[t] > 0 ? grp.get() + 3*(t == 0 ? 0 : n_grp[0]) : nullptr;
+            tab.n_grp[t] = (int) n_grp[t];
+        }
         exl3_mmid_route<<<1, 1024, 2*n_exp*sizeof(int), stream>>>(mm.ids, mm.ids_nb0, mm.ids_nb1, (int) n_used,
-            (int) n_pairs, (int) n_exp, S, order.get(), grp.get(), (int) n_groups);
+            (int) n_pairs, (int) n_exp, one_rows, order.get(), tab);
         mm.order = order.get();
-        mm.grp   = grp.get();
+        mm.grp   = tab.grp[0];
+        n_groups = n_grp[0];
     }
     GGML_ASSERT(n_groups <= 65535);
 
@@ -1721,7 +1824,13 @@ void ggml_cuda_op_exl3_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
         ggml_cuda_pool_alloc<half>  xlo(ctx.pool(), n_pairs*k);
         ggml_cuda_pool_alloc<float> inv(ctx.pool(), n_pairs);
         exl3_rotate_split_launch(x, su, xhi.get(), xlo.get(), inv.get(), k, n_pairs, &mm, stream);
-        exl3_gemm_bits(bits, cb, tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, n_pairs, &mm, n_groups, W, stream);
+        for (int t = 0; t < 2; ++t) {
+            if (tab.n_grp[t] > 0) {
+                mm.grp = tab.grp[t];
+                exl3_gemm_bits(bits, cb, tq, xhi.get(), xlo.get(), inv.get(), sv, y, k, n, n_pairs, &mm, tab.n_grp[t], W[t],
+                               t == 0 ? 2 : 1, stream);
+            }
+        }
         return;
     }
 

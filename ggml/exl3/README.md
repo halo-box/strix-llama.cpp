@@ -120,12 +120,15 @@ by expert and runs each expert's rows through the routines of `EXL3_MUL_MAT` in 
 synchronization: for one token every (slot) pair is a group of one row and the kernels read its expert from ids; for
 more tokens one block sorts the rows by expert and cuts each expert's rows into groups. Below 12 rows per expert on
 average the groups (up to 8 rows of one expert) run the dot kernel of `EXL3_MUL_MAT`; from 12 on RDNA3 they run its
-hi + lo GEMM in groups of 32 rows (up to 32 rows per expert on average) or 64 rows, two products at every token count,
-because the F32 control (`ggml_mul_mat_id` on an F32 stack) runs f32 GEMMs per expert on this backend. A warp of the
-GEMM whose 16 rows are past its group's last row skips its WMMAs, so a group costs the WMMA work of its rows rounded
-up to 16 (routing in a model is far from uniform: many experts get a few rows, a few get most). Each row is the row
-`EXL3_MUL_MAT` computes for that expert in the same kernel, bit for bit (the GEMM's per-row arithmetic does not depend
-on its row tile).
+GEMM in groups of 32 rows (up to 32 rows per expert on average) or 64 rows. The precision follows the F32 control
+(`ggml_mul_mat_id` on an F32 stack), which on this backend runs the rows of each expert as one `ggml_mul_mat` on a
+contiguous copy: the rows of an expert with 512 rows or more (an expert in every token of a 512-token ubatch) take one
+f16 product, like the control's mmb GEMM there, in groups of 128 rows; the others hi + lo, like its f32 GEMMs.
+`GGML_EXL3_GEMM_PRODUCTS=1` or `2` forces one choice. A warp of the GEMM whose 16 rows are past its group's last row
+skips its WMMAs, so a group costs the WMMA work of its rows rounded up to 16 (routing in a model is far from uniform:
+many experts get a few rows, a few get most). Each row is the row `EXL3_MUL_MAT` computes for that expert in the same
+kernel, bit for bit (the GEMM's per-row arithmetic does not depend on its row tile; one-product rows are those of its
+one-product GEMM).
 
 `ggml_exl3_get_rows(ctx, table, ids, signs, n_out)` (`GGML_OP_EXL3_GET_ROWS`) decodes the rows `ids` of a token
 embedding row table to F32 `[n_out, n]`; the CPU backend runs `ggml_exl3_decode_embd_row` on each row. The HIP
