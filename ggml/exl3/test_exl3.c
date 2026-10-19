@@ -19,6 +19,9 @@
 //                             EXL3_MUL_MAT per expert (bit for bit) and ggml_mul_mat_id on the f32 W of the experts
 // test-exl3 --gguf FILE    -> decode every EXL3 linear of a GGUF container, one JSON line per tensor with sha256
 // test-exl3 --op-gguf FILE -> op on the first linear of each (k, n, K) in a GGUF container, at the decode and prompt row counts
+// test-exl3 --exact-gguf FILE -> op on every linear of a container on one-hot rows, where it is exact: equal to the CPU op
+//                             bit for bit iff the backend decodes W_hat as the CPU does (see exact_gguf)
+// test-exl3 --rows-gguf FILE -> EXL3_GET_ROWS on every row of each row table of a container, against the row decoder
 // test-exl3 --dequantize IN OUT -> plain GGUF reference of a container: each EXL3 linear becomes "<base>.weight" F32 from
 //                             ggml_exl3_dequantize, the exl3.* keys are dropped, all other keys and tensors are copied as they are
 // test-exl3 --backend NAME [--op-gguf FILE] -> the op tests with the op on backend NAME (e.g. ROCm0)
@@ -833,6 +836,307 @@ static int op_gguf(const char * path) {
     return n_fail != 0 || n_run == 0;
 }
 
+// --exact-gguf: the op on the backend against the op on the CPU on inputs where every product is exact. With suh = 1 and
+// x row r = row r%128 of the unnormalized 128-point Hadamard in k block r/128 (zeros elsewhere), H(x*suh) = 128 e_r, so
+// each output is 128 W_hat[r, j] (one nonzero product, exact in f32) followed by the output rotation and svh, whose
+// order and roundings the CPU op and the HIP dot kernel share: rows run in chunks of 32 (the dot kernel on HIP; for a
+// stack, 8 tokens routed to all E experts) must equal the CPU op bit for bit, which holds iff the backend decodes
+// every value of W_hat as the CPU decoder does (bit-exact against exllamav3's trellis.py, README). The WMMA paths
+// (all k rows in one call; chunks of 511 rows, or 16 tokens for a stack) cannot be exact here: on gfx1151 the f16 WMMA
+// returns about half of the negative single products one f32 ulp toward -inf (C = +0). They must stay within 2^-18 of
+// the largest |value| of each output row; one fp16 ulp of a typical decoded value moves a row by ~3e-5 of its maximum.
+// EXL3_EXACT_STRIDE=S checks every S-th linear of the container.
+
+// one-hot rows r0 .. r0 + nr - 1 (k wide)
+static void exact_rows(float * x, int64_t k, int64_t r0, int64_t nr) {
+    memset(x, 0, k*nr*sizeof(float));
+    for (int64_t r = 0; r < nr; r++) {
+        const int64_t i = (r0 + r) % 128;
+        float * xb = x + r*k + ((r0 + r) / 128)*128;
+        for (int64_t j = 0; j < 128; j++) {
+            int pc = 0;
+            for (int64_t v = i & j; v != 0; v >>= 1) {
+                pc += (int) (v & 1);
+            }
+            xb[j] = pc % 2 ? -1.0f : 1.0f;
+        }
+    }
+}
+
+// the op on be for nr rows of x: EXL3_MUL_MAT, or EXL3_MUL_MAT_ID with every expert per token (x broadcast); out is
+// [nr][E][n]
+static bool exact_run(ggml_backend_t be, const int16_t * trellis, const ggml_fp16_t * suh, const ggml_fp16_t * svh,
+                      int64_t k, int64_t n, int64_t n_exp, int64_t tile_words, int cb, const float * x, int64_t nr,
+                      float * out) {
+    struct ggml_init_params params = { 16*ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
+    struct ggml_context * c   = ggml_init(params);
+    struct ggml_tensor  * tr  = ggml_new_tensor_4d(c, GGML_TYPE_I16, tile_words, n/GGML_EXL3_TILE, k/GGML_EXL3_TILE, n_exp);
+    struct ggml_tensor  * su  = n_exp == 1 ? ggml_new_tensor_1d(c, GGML_TYPE_F16, k) : ggml_new_tensor_2d(c, GGML_TYPE_F16, k, n_exp);
+    struct ggml_tensor  * sv  = n_exp == 1 ? ggml_new_tensor_1d(c, GGML_TYPE_F16, n) : ggml_new_tensor_2d(c, GGML_TYPE_F16, n, n_exp);
+    struct ggml_tensor  * xx  = ggml_new_tensor_3d(c, GGML_TYPE_F32, k, 1, nr);
+    struct ggml_tensor  * ids = n_exp == 1 ? NULL : ggml_new_tensor_2d(c, GGML_TYPE_I32, n_exp, nr);
+    struct ggml_tensor  * y   = n_exp == 1 ? ggml_exl3_mul_mat(c, tr, ggml_reshape_2d(c, xx, k, nr), su, sv, cb) :
+                                             ggml_exl3_mul_mat_id(c, tr, xx, ids, su, sv, cb);
+    struct ggml_cgraph  * g   = ggml_new_graph(c);
+    ggml_build_forward_expand(g, y);
+    ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors(c, be);
+    bool ok = b != NULL && ggml_backend_supports_op(be, y);
+    if (ok) {
+        ggml_backend_tensor_set(tr, trellis, 0, ggml_nbytes(tr));
+        ggml_backend_tensor_set(su, suh, 0, ggml_nbytes(su));
+        ggml_backend_tensor_set(sv, svh, 0, ggml_nbytes(sv));
+        ggml_backend_tensor_set(xx, x, 0, ggml_nbytes(xx));
+        if (ids != NULL) {
+            int32_t * id = (int32_t *) malloc(ggml_nbytes(ids));
+            ok = id != NULL;
+            for (int64_t i = 0; ok && i < n_exp*nr; i++) {
+                id[i] = (int32_t) (i % n_exp);
+            }
+            if (ok) {
+                ggml_backend_tensor_set(ids, id, 0, ggml_nbytes(ids));
+            }
+            free(id);
+        }
+        ok = ok && ggml_backend_graph_compute(be, g) == GGML_STATUS_SUCCESS;
+    }
+    if (ok) {
+        ggml_backend_tensor_get(y, out, 0, ggml_nbytes(y));
+    }
+    ggml_backend_buffer_free(b);
+    ggml_free(c);
+    return ok;
+}
+
+static int exact_gguf(const char * path) {
+    struct gguf_context * gctx = NULL;
+    struct ggml_context * meta = NULL;
+    const int cb = open_container(path, &gctx, &meta);
+    if (cb < 0) {
+        return 1;
+    }
+    FILE * f = fopen(path, "rb");
+    ggml_backend_t be     = op_backend_init();
+    ggml_backend_t be_cpu = op_cpu_init();
+    if (f == NULL || be == NULL) {
+        return 1;
+    }
+    const int stride = getenv("EXL3_EXACT_STRIDE") ? atoi(getenv("EXL3_EXACT_STRIDE")) : 1;
+
+    int     n_lin  = 0;
+    int     n_fail = 0;
+    int64_t n_vals = 0;
+    for (struct ggml_tensor * t = ggml_get_first_tensor(meta); t != NULL; t = ggml_get_next_tensor(meta, t)) {
+        char base[GGML_MAX_NAME];
+        struct ggml_tensor * su = NULL;
+        struct ggml_tensor * sv = NULL;
+        const int found = find_linear(meta, t, cb, base, &su, &sv);
+        if (found <= 0) {
+            n_fail += found < 0;
+            continue;
+        }
+        if (n_lin++ % (stride > 0 ? stride : 1) != 0) {
+            continue;
+        }
+        const int64_t k     = t->ne[2]*GGML_EXL3_TILE;
+        const int64_t n     = t->ne[1]*GGML_EXL3_TILE;
+        const int64_t n_exp = t->ne[3];
+        const int64_t width = n*n_exp; // output values per row
+        int16_t     * trellis = (int16_t *)     read_tensor(f, gctx, t);
+        ggml_fp16_t * svh     = (ggml_fp16_t *) read_tensor(f, gctx, sv);
+        ggml_fp16_t * ones    = (ggml_fp16_t *) malloc(k*n_exp*sizeof(ggml_fp16_t));
+        float       * x       = (float *)       malloc(k*k*sizeof(float));
+        float       * ref     = (float *)       malloc(width*k*sizeof(float));
+        float       * got     = (float *)       malloc(width*k*sizeof(float));
+        bool ok = trellis != NULL && svh != NULL && ones != NULL && x != NULL && ref != NULL && got != NULL;
+        for (int64_t i = 0; ok && i < k*n_exp; i++) {
+            ones[i] = ggml_fp32_to_fp16(1.0f);
+        }
+        if (ok && getenv("EXL3_EXACT_SVH1") != NULL) {
+            for (int64_t i = 0; i < n*n_exp; i++) {
+                svh[i] = ggml_fp32_to_fp16(1.0f);
+            }
+        }
+        if (ok) {
+            exact_rows(x, k, 0, k);
+            ok = exact_run(be_cpu, trellis, ones, svh, k, n, n_exp, t->ne[0], cb, x, k, ref);
+        }
+        // rows per call: all rows in one call (WMMA GEMM: one product for a dense linear, 64-row groups for a stack); 511
+        // (dense: the hi + lo GEMM) or 16 tokens (stack: 32-row groups); 32 rows (dense) or 8 tokens (stack): the dot
+        // kernel, exact. A stack token goes to all E experts, so its rows per expert are its token count
+        const int64_t chunk[3] = { k, n_exp > 1 ? 16 : 511, n_exp > 1 ? 8 : 32 };
+        int64_t diff[3] = { -1, -1, -1 };
+        double  rel[3]  = { -1.0, -1.0, -1.0 };
+        int64_t first_row = -1, first_col = -1;
+        float   first_ref = 0.0f, first_got = 0.0f;
+        for (int ps = 0; ok && ps < 3; ps++) {
+            diff[ps] = 0;
+            rel[ps]  = 0.0;
+            for (int64_t r0 = 0; ok && r0 < k; r0 += chunk[ps]) {
+                const int64_t nr = k - r0 < chunk[ps] ? k - r0 : chunk[ps];
+                ok = exact_run(be, trellis, ones, svh, k, n, n_exp, t->ne[0], cb, x + r0*k, nr, got + r0*width);
+            }
+            for (int64_t r = 0; ok && r < k; r++) {
+                for (int64_t e = 0; e < n_exp; e++) {
+                    // one output row: the n values of row r for expert e
+                    const float * rr = ref + r*width + e*n;
+                    const float * gg = got + r*width + e*n;
+                    double amax = 0.0;
+                    for (int64_t j = 0; j < n; j++) {
+                        const double av = fabs((double) rr[j]);
+                        amax = av > amax ? av : amax;
+                    }
+                    for (int64_t j = 0; j < n; j++) {
+                        if (memcmp(rr + j, gg + j, sizeof(float)) != 0) {
+                            if (ps == 2 && first_row < 0) {
+                                first_row = r;
+                                first_col = e*n + j;
+                                first_ref = rr[j];
+                                first_got = gg[j];
+                            }
+                            diff[ps]++;
+                            const double d = fabs((double) rr[j] - (double) gg[j])/(amax > 0.0 ? amax : 1.0);
+                            rel[ps] = d > rel[ps] ? d : rel[ps];
+                        }
+                    }
+                }
+            }
+            n_vals += k*width;
+        }
+        const double tol  = 1.0/262144.0;
+        const bool   pass = ok && diff[2] == 0 && rel[0] <= tol && rel[1] <= tol;
+        // the stack passes rely on the HIP routing thresholds (12 and 32 rows per expert, EXL3_MMID_*_ROWS in exl3.cu)
+        n_fail += !pass;
+        printf("{\"case\": \"exact %s\", \"backend\": \"%s\", \"k\": %lld, \"n\": %lld, \"experts\": %lld, \"K\": %.1f, "
+               "\"dot_diff\": %lld, \"gemm_all_diff\": %lld, \"gemm_all_rel\": %.3e, \"gemm_chunk_diff\": %lld, \"gemm_chunk_rel\": %.3e, "
+               "\"dot_first_row\": %lld, \"dot_first_col\": %lld, \"dot_first_ref\": %.9g, \"dot_first_got\": %.9g, \"pass\": %s}\n",
+               base, ggml_backend_name(be), (long long) k, (long long) n, (long long) n_exp, t->ne[0]/16.0,
+               (long long) diff[2], (long long) diff[0], rel[0], (long long) diff[1], rel[1], (long long) first_row,
+               (long long) first_col, (double) first_ref, (double) first_got, pass ? "true" : "false");
+        fflush(stdout);
+        free(trellis);
+        free(svh);
+        free(ones);
+        free(x);
+        free(ref);
+        free(got);
+    }
+    ggml_backend_free(be);
+    ggml_backend_free(be_cpu);
+    fclose(f);
+    gguf_free(gctx);
+    ggml_free(meta);
+    fprintf(stderr, "%s: %d linears (every %d-th checked), %lld values compared, %d failures\n", path, n_lin, stride,
+            (long long) n_vals, n_fail);
+    return n_fail != 0;
+}
+
+// --rows-gguf: EXL3_GET_ROWS on the backend for every row of each row table ("<base>.exl3r_trellis" with its signs) of a
+// container, against ggml_exl3_decode_embd_row on the CPU, bit for bit; the rows are decoded to n_embd (the
+// architecture's embedding_length), in batches of 4096 ids
+static int rows_gguf(const char * path) {
+    struct ggml_context * meta = NULL;
+    struct gguf_init_params params = { true, &meta };
+    struct gguf_context * gctx = gguf_init_from_file(path, params);
+    FILE * f = fopen(path, "rb");
+    ggml_backend_t be = op_backend_init();
+    if (gctx == NULL || f == NULL || be == NULL) {
+        return 1;
+    }
+    const int64_t karch = gguf_find_key(gctx, "general.architecture");
+    char key[256];
+    snprintf(key, sizeof(key), "%s.embedding_length", karch >= 0 ? gguf_get_val_str(gctx, karch) : "");
+    const int64_t kembd  = gguf_find_key(gctx, key);
+    const int64_t n_embd = kembd >= 0 ? (int64_t) gguf_get_val_u32(gctx, kembd) : 0;
+
+    int     n_tables = 0;
+    int     n_fail   = 0;
+    int64_t n_vals   = 0;
+    const char * suffix = ".exl3r_trellis";
+    for (struct ggml_tensor * t = ggml_get_first_tensor(meta); t != NULL; t = ggml_get_next_tensor(meta, t)) {
+        const char * name = ggml_get_name(t);
+        const size_t len  = strlen(name);
+        if (len <= strlen(suffix) || strcmp(name + len - strlen(suffix), suffix) != 0) {
+            continue;
+        }
+        char name_sg[GGML_MAX_NAME + 16];
+        snprintf(name_sg, sizeof(name_sg), "%.*s.exl3r_signs", (int) (len - strlen(suffix)), name);
+        struct ggml_tensor * sg = ggml_get_tensor(meta, name_sg);
+        const int K = sg != NULL ? ggml_exl3_embd_k(t->ne[0], sg->ne[1]) : -1;
+        n_tables++;
+        if (K <= 0 || n_embd <= 0 || n_embd > sg->ne[1]*GGML_EXL3_GROUP_DIM) {
+            fprintf(stderr, "%s: bad row table\n", name);
+            n_fail++;
+            continue;
+        }
+        int16_t     * table = (int16_t *)     read_tensor(f, gctx, t);
+        ggml_fp16_t * signs = (ggml_fp16_t *) read_tensor(f, gctx, sg);
+        const int64_t n_rows = t->ne[1];
+        const int64_t batch  = 4096;
+        float   * y     = (float *) malloc(batch*n_embd*sizeof(float));
+        float   * y_ref = (float *) malloc(n_embd*sizeof(float));
+        int32_t * ids   = (int32_t *) malloc(batch*sizeof(int32_t));
+        bool    ok      = table != NULL && signs != NULL && y != NULL && y_ref != NULL && ids != NULL;
+        int64_t n_diff  = 0;
+        int64_t first   = -1;
+
+        struct ggml_init_params p = { 8*ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
+        struct ggml_context * ctx = ggml_init(p);
+        struct ggml_tensor  * t_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I16, t->ne[0], n_rows);
+        struct ggml_tensor  * t_signs = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, GGML_EXL3_GROUP_DIM, sg->ne[1]);
+        struct ggml_tensor  * t_ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, batch);
+        struct ggml_tensor  * out     = ggml_exl3_get_rows(ctx, t_table, t_ids, t_signs, n_embd);
+        struct ggml_cgraph  * gf      = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        ok = ok && buf != NULL && ggml_backend_supports_op(be, out);
+        if (ok) {
+            ggml_backend_tensor_set(t_table, table, 0, ggml_nbytes(t_table));
+            ggml_backend_tensor_set(t_signs, signs, 0, ggml_nbytes(t_signs));
+        }
+        for (int64_t r0 = 0; ok && r0 < n_rows; r0 += batch) {
+            // the last batch repeats the last row
+            for (int64_t i = 0; i < batch; i++) {
+                ids[i] = (int32_t) (r0 + i < n_rows ? r0 + i : n_rows - 1);
+            }
+            ggml_backend_tensor_set(t_ids, ids, 0, ggml_nbytes(t_ids));
+            ok = ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS;
+            if (ok) {
+                ggml_backend_tensor_get(out, y, 0, ggml_nbytes(out));
+            }
+            for (int64_t i = 0; ok && i < batch && r0 + i < n_rows; i++) {
+                ggml_exl3_decode_embd_row(table + (r0 + i)*t->ne[0], sg->ne[1], K, signs, n_embd, y_ref);
+                for (int64_t j = 0; j < n_embd; j++) {
+                    if (memcmp(y_ref + j, y + i*n_embd + j, sizeof(float)) != 0) {
+                        first = first < 0 ? r0 + i : first;
+                        n_diff++;
+                    }
+                }
+                n_vals += n_embd;
+            }
+        }
+        const bool pass = ok && n_diff == 0;
+        n_fail += !pass;
+        printf("{\"case\": \"rows %s\", \"backend\": \"%s\", \"rows\": %lld, \"groups\": %lld, \"K\": %d, \"n_out\": %lld, "
+               "\"values_differing\": %lld, \"first_row\": %lld, \"pass\": %s}\n",
+               name, ggml_backend_name(be), (long long) n_rows, (long long) sg->ne[1], K, (long long) n_embd,
+               (long long) n_diff, (long long) first, pass ? "true" : "false");
+        fflush(stdout);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        free(table);
+        free(signs);
+        free(y);
+        free(y_ref);
+        free(ids);
+    }
+    ggml_backend_free(be);
+    fclose(f);
+    gguf_free(gctx);
+    ggml_free(meta);
+    fprintf(stderr, "%s: %d row tables, %lld values compared, %d failures\n", path, n_tables, (long long) n_vals, n_fail);
+    return n_fail != 0 || n_tables == 0;
+}
+
 static bool write_zeros(FILE * f, size_t n) {
     static const char zeros[64] = { 0 };
     while (n > 0) {
@@ -1344,11 +1648,17 @@ int main(int argc, char ** argv) {
     if (argc == 3 && strcmp(argv[1], "--op-gguf") == 0) {
         return op_gguf(argv[2]);
     }
+    if (argc == 3 && strcmp(argv[1], "--exact-gguf") == 0) {
+        return exact_gguf(argv[2]);
+    }
+    if (argc == 3 && strcmp(argv[1], "--rows-gguf") == 0) {
+        return rows_gguf(argv[2]);
+    }
     if (argc == 4 && strcmp(argv[1], "--dequantize") == 0) {
         return dequantize_gguf(argv[2], argv[3]);
     }
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [--backend NAME] [--gguf FILE | --op-gguf FILE | --dequantize IN OUT]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--backend NAME] [--gguf FILE | --op-gguf FILE | --exact-gguf FILE | --rows-gguf FILE | --dequantize IN OUT]\n", argv[0]);
         return 1;
     }
 
