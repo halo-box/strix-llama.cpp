@@ -125,7 +125,10 @@ row `EXL3_MUL_MAT` computes for that expert in the same kernel, bit for bit (the
 depend on its row tile).
 
 `ggml_exl3_get_rows(ctx, table, ids, signs, n_out)` (`GGML_OP_EXL3_GET_ROWS`) decodes the rows `ids` of a token
-embedding row table to F32 `[n_out, n]`; the CPU backend runs `ggml_exl3_decode_embd_row` on each row.
+embedding row table to F32 `[n_out, n]`; the CPU backend runs `ggml_exl3_decode_embd_row` on each row. The HIP
+backend decodes one ring per warp and applies H256, the 1/16 and the signs in the butterfly order and with the
+roundings of that decoder, so its rows equal the CPU decoder's bit for bit. Like `GET_ROWS` it is never offloaded:
+the table stays where the loader put it (a host buffer the integrated GPU reads directly, or the CPU).
 
 exllamav3's wide-row path (reconstruct `W` in fp16 with the Hadamards and scales folded in, then hgemm) was measured
 here as a prototype and not kept: on the Qwen3.5-4B shapes at 512 rows the reconstruction pass alone took 356..480 us

@@ -1706,4 +1706,126 @@ void ggml_cuda_op_exl3_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
     exl3_dot_bits(bits, cb, M, xh.get(), tq, sv, y, counters.get(), k, n, n_pairs, n_groups, &mm, stream);
 }
 
+// ---- EXL3_GET_ROWS ----
+
+// One warp per (row, ring of 256), lane l holding positions l + 32*q, q = 0..7: the symbols of the ring's K-bit stream
+// (LSB first) go to LDS, the state of position i stacks the symbols of positions i, i - 1, ... from bit 0 up, and its
+// mul1 value times the ring's fp16 scale is exact in f32; then the orthonormal H256 in the butterfly order of
+// ggml_exl3_decode_embd_row (stages 1 .. 16 across lanes, 32 .. 128 across q), the 1/16 and the signs, each one f32
+// rounding of the same operands as that decoder, so the rows are its rows bit for bit
+static __global__ void __launch_bounds__(256) exl3_get_rows_kernel(
+        const int16_t * __restrict__ table, const int64_t row_words, const char * __restrict__ ids, const int64_t ids_nb0,
+        const half * __restrict__ signs, float * __restrict__ dst, const int64_t dst_s1, const int n_ids, const int n_out,
+        const int K) {
+    __shared__ uint8_t s_sym[8][256];
+    const int  lane   = threadIdx.x % 32;
+    const int  warp   = threadIdx.x / 32;
+    const int  rings  = (n_out + 255)/256;
+    const int  w      = blockIdx.x*8 + warp;
+    const bool active = w < n_ids*rings;
+    const int  i      = active ? w / rings : 0;
+    const int  g      = active ? w % rings : 0;
+    const int  words  = 16*K;
+
+    const int16_t * ring = table + (int64_t) *(const int *) (ids + i*ids_nb0)*row_words + (int64_t) g*(1 + words);
+    uint8_t * sym = s_sym[warp];
+    if (active) {
+        const uint16_t * stream = (const uint16_t *) (ring + 1);
+        const uint32_t   mask   = (1u << K) - 1;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int      bit    = (lane*8 + j)*K;
+            const uint32_t window = (uint32_t) stream[bit >> 4] | ((uint32_t) stream[((bit >> 4) + 1) % words] << 16);
+            sym[lane*8 + j] = (uint8_t) ((window >> (bit & 15)) & mask);
+        }
+    }
+    __syncthreads();
+    if (!active) {
+        return;
+    }
+
+    const float scale = __half2float(__ushort_as_half((unsigned short) ring[0]));
+    const int   nj    = (15 + K)/K;
+    float v[8];
+#pragma unroll
+    for (int q = 0; q < 8; q += 2) {
+        uint32_t st[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int pos = lane + 32*(q + h);
+            uint32_t s = 0;
+            for (int j = 0; j < nj; ++j) {
+                s |= (uint32_t) sym[(pos - j) & 255] << (j*K);
+            }
+            st[h] = s & 0xffffu;
+        }
+        const half2 c = exl3_dq_pair<GGML_EXL3_CODEBOOK_MUL1, false, false>(st[0], st[1]);
+        v[q]     = __low2float(c)*scale;
+        v[q + 1] = __high2float(c)*scale;
+    }
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+            const float o = __shfl_xor(v[q], h, 32);
+            v[q] = (lane & h) ? o - v[q] : v[q] + o;
+        }
+    }
+#pragma unroll
+    for (int hq = 1; hq < 8; hq <<= 1) {
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+            if (q & hq) {
+                continue;
+            }
+            const float a = v[q];
+            const float b = v[q | hq];
+            v[q]      = a + b;
+            v[q | hq] = a - b;
+        }
+    }
+
+    float      * out = dst + (int64_t) i*dst_s1 + g*256;
+    const half * sg  = signs + g*256;
+    const int    n_g = min(256, n_out - g*256);
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+        const int pos = lane + 32*q;
+        if (pos < n_g) {
+            out[pos] = (v[q]*0.0625f)*__half2float(sg[pos]);
+        }
+    }
+}
+
+bool ggml_cuda_exl3_get_rows_supports_op(const int device, const ggml_tensor * op) {
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_RDNA4(cc)) {
+        return false;
+    }
+    const ggml_tensor * table = op->src[0];
+    const ggml_tensor * ids   = op->src[1];
+    const ggml_tensor * signs = op->src[2];
+    return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) && ids->type == GGML_TYPE_I32 &&
+           ggml_exl3_embd_k(table->ne[0], signs->ne[1]) > 0;
+}
+
+void ggml_cuda_op_exl3_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * table = dst->src[0];
+    const ggml_tensor * ids   = dst->src[1];
+    const ggml_tensor * signs = dst->src[2];
+
+    GGML_ASSERT(ggml_cuda_exl3_get_rows_supports_op(ctx.device, dst));
+
+    const int     n_out = ggml_get_op_params_i32(dst, 0);
+    const int     K     = ggml_exl3_embd_k(table->ne[0], signs->ne[1]);
+    const int64_t n_ids = ids->ne[0];
+    if (n_ids == 0) {
+        return;
+    }
+    const int64_t warps = n_ids*((n_out + 255)/256);
+    exl3_get_rows_kernel<<<(unsigned) ((warps + 7)/8), 256, 0, ctx.stream()>>>(
+        (const int16_t *) table->data, table->nb[1]/sizeof(int16_t), (const char *) ids->data, ids->nb[0],
+        (const half *) signs->data, (float *) dst->data, dst->nb[1]/sizeof(float), (int) n_ids, n_out, K);
+}
+
 #endif // defined(GGML_USE_EXL3)

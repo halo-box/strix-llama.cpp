@@ -2774,6 +2774,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_EXL3_MUL_MAT_ID:
             ggml_cuda_op_exl3_mul_mat_id(ctx, dst);
             break;
+        case GGML_OP_EXL3_GET_ROWS:
+            ggml_cuda_op_exl3_get_rows(ctx, dst);
+            break;
 #endif
         default:
             return false;
@@ -9511,6 +9514,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_exl3_supports_op(dev_ctx->device, op);
         case GGML_OP_EXL3_MUL_MAT_ID:
             return ggml_cuda_exl3_mul_mat_id_supports_op(dev_ctx->device, op);
+        case GGML_OP_EXL3_GET_ROWS:
+            return ggml_cuda_exl3_get_rows_supports_op(dev_ctx->device, op);
 #endif
 
         default:
@@ -9527,6 +9532,7 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
 static int64_t get_op_batch_size(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_GET_ROWS:
+        case GGML_OP_EXL3_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
             return op->ne[1];
