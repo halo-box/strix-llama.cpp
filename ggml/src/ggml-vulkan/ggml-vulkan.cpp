@@ -7096,10 +7096,46 @@ void deferred_memset(void * dst, uint32_t val, size_t size, std::vector<vk_stagi
     }
 }
 
+// Skinny dense GEMM (small M, long K, wide N), e.g. Flash-Next's hc down-projection q8_0 m=320 k=10240 at
+// n=2048: the 128x128 tile launches 3 x 16 = 48 workgroups on 40 CUs, and the upstream rule in
+// ggml_vk_guess_split_k (tiles <= 2/3 of the CUs) never fires. Split-K over 8 partials fixes the fill.
+// Port of the release's dbcac9547. Measured op-level on gfx1151 there (2026-09-29), 320x2048x10240:
+//   split   1     2     3     4     5     6     7     8     10    16
+//   q8_0 1069  1364  1239  1198  1620   909  1167   880  1414  1053  us   (q4_K 1030 -> 873, q6_K 1161 -> 972 at 8)
+// The curve is not monotonic (partials of 1024/2048/5120 K lose, 1280 / 1792 win), so the count is a measured
+// constant, not a fill formula. Only shapes the upstream rule leaves at 1 are touched; m <= 512 and k >= 4096 keep it
+// to this class, and n >= the tile's N keeps every n <= 8 verify batch and small ubatch out. Split-K changes the
+// accumulation order, so the output is not bit-equal to the unsplit GEMM (KLD-gated). The fused epilogues (f16 out,
+// HC_UP_MIX) disable split-K before this rule, so they never run per partial. GGML_VK_SKINNY_SPLITK=0 disables,
+// =N sets the split (2..16, probe). Dispatch census paths: MUL_MAT_SKINNY_ELIGIBLE (the shape qualifies), MUL_MAT_SKINNY_SPLITK
+// (it split), MUL_MAT_SKINNY_DECLINED (a fused epilogue or the caller disabled split-K).
+static void ggml_vk_path_census_add(const char * name);
+
+static uint32_t ggml_vk_skinny_split_k_env() {
+    static const uint32_t v = [] {
+        const char * e = getenv("GGML_VK_SKINNY_SPLITK");
+        return e ? (uint32_t) std::max(0, atoi(e)) : 8u;
+    }();
+    return v;
+}
+
+static bool ggml_vk_is_skinny(const ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, uint32_t bm, uint32_t bn) {
+    const uint32_t cu = ctx->device->shader_core_count;
+    return cu != 0 && m <= 512 && k >= 4096 && n >= bn && m >= bm &&
+           CEIL_DIV(m, bm) * CEIL_DIV(n, bn) < 2 * cu;
+}
+
 static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m, uint32_t n, uint32_t k, bool disable_split_k, const vk_pipeline& pipeline) {
     VK_LOG_DEBUG("ggml_vk_guess_split_k(" << m << ", " << n << ", " << k << ", " << disable_split_k << ")");
 
+    const bool skinny = ggml_vk_is_skinny(ctx, m, n, k, pipeline->wg_denoms[0], pipeline->wg_denoms[1]);
+    if (skinny) {
+        ggml_vk_path_census_add("MUL_MAT_SKINNY_ELIGIBLE");
+    }
     if (disable_split_k) {
+        if (skinny) {
+            ggml_vk_path_census_add("MUL_MAT_SKINNY_DECLINED");
+        }
         return 1;
     }
 
@@ -7117,7 +7153,14 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
             }
             // Cap the split at 8x. Unless k is huge this is a lot of overhead.
             split_k = std::min(split_k, 8u);
-
+        }
+        // skinny shapes the rule above leaves unsplit (it only splits at <= 2/3 CU tiles)
+        const uint32_t skinny_split = ggml_vk_skinny_split_k_env();
+        const bool skinny_fires = split_k == 1 && skinny && skinny_split >= 2;
+        if (skinny_fires) {
+            split_k = std::min(skinny_split, 16u);
+        }
+        if (split_k > 1) {
             // ggml_vk_matmul will align the splits to be a multiple of 256.
             // If this rounded up size would cause the last split to be empty,
             // then reduce the split count.
@@ -7132,6 +7175,9 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
                 }
                 split_k--;
             }
+        }
+        if (skinny_fires && split_k > 1) {
+            ggml_vk_path_census_add("MUL_MAT_SKINNY_SPLITK");
         }
     }
 

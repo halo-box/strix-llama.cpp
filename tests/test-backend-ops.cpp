@@ -12897,6 +12897,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_f16b(t, 96, n, 256));
         }
     }
+    // GGML_VK_SKINNY_SPLITK: Flash-Next's hc down at its real ubatch widths (48 tiles of 128x128 at n 2048 split K 8 ways; n 512
+    // takes the upstream rule), f16 B packed and row-padded (LLAMA_HC_XN_PAD), f32 B, and the f16-output form that declines
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int n : {512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_f16b(t, 320, n, 10240));
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 320, n, 10240, {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 320, 2048, 10240, 128));
+    test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, 320, 2048, 10240));
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16}) {
         for (int pad : {8, 128}) {
             test_cases.emplace_back(new test_mul_mat_f16b(t, 320, 64, 10240, pad));
