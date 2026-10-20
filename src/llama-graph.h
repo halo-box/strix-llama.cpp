@@ -51,8 +51,12 @@ enum llm_fused_op {
     LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
+    LLM_FUSED_OP_DSV4_HC_NORM_F16,  // f16 hc norm: HC pre reading an f16 x, hc inject / down matmuls with an f16 B
+    LLM_FUSED_OP_DSV4_HC_GATE_F16,  // f16 hc gate: HC pre reading an f16 gate (the hc up GEMM's f16 store)
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_MOE_F16,           // f16 MoE activations: expert down projection with an f16 B (build_moe_ffn prefill)
+    LLM_FUSED_OP_GDN_NORM_F16,      // f16 GDN output norm: the qwen4exp ssm_out projection with an f16 B (prefill)
 };
 
 enum llm_ffn_op_type : int {

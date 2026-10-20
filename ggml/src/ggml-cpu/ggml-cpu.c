@@ -1578,11 +1578,12 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer
+        // src1 is packed from F32 into vec_dot_type, widened from F16 or BF16 into an F32 work buffer, or (F16 into a
+        // quantised vec_dot_type) converted through F32: the f16 activations of a Vulkan-first graph
         const bool widen = src1->type != GGML_TYPE_F32;
 
-        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
         GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
+        GGML_ASSERT(src1->type != GGML_TYPE_BF16 || vec_dot_type == GGML_TYPE_F32);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1607,10 +1608,19 @@ UseGgmlGemm1:;
 
                     const int64_t ne10_block_size = (ne10_block_end - ne10_block_start) * bs;
 
-                    if (src1->type == GGML_TYPE_F16) {
+                    if (src1->type == GGML_TYPE_F16 && vec_dot_type == GGML_TYPE_F32) {
                         ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) wdata_row, ne10_block_size);
                     } else if (src1->type == GGML_TYPE_BF16) {
                         ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) wdata_row, ne10_block_size);
+                    } else if (src1->type == GGML_TYPE_F16) {
+                        // F16 into another vec_dot_type: through F32, in chunks of whole blocks (1024 is a
+                        // multiple of every block size)
+                        float tmp[1024];
+                        for (int64_t off = 0; off < ne10_block_size; off += 1024) {
+                            const int64_t n = MIN(1024, ne10_block_size - off);
+                            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row + off, tmp, n);
+                            from_float(tmp, (char *) wdata_row + (off/bs)*nbw0, n);
+                        }
                     } else {
                         from_float((const float *) src1_row, wdata_row, ne10_block_size);
                     }
@@ -1859,7 +1869,7 @@ static void ggml_compute_forward_mul_mat_id(
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1878,9 +1888,23 @@ static void ggml_compute_forward_mul_mat_id(
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                    const char * src1_block = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
+                    char * dst_block = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
+                    const int64_t n_block = (ne10_block_end - ne10_block_start) * bs;
+                    if (src1->type == GGML_TYPE_F32) {
+                        from_float((const float *) src1_block, dst_block, n_block);
+                    } else if (vec_dot_type == GGML_TYPE_F32) {
+                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_block, (float *) dst_block, n_block);
+                    } else {
+                        // F16 into another vec_dot_type (the f16 MoE activations): through F32, in chunks of
+                        // whole blocks (1024 is a multiple of every block size)
+                        float tmp[1024];
+                        for (int64_t off = 0; off < n_block; off += 1024) {
+                            const int64_t n = MIN(1024, n_block - off);
+                            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_block + off, tmp, n);
+                            from_float(tmp, dst_block + (off/(int64_t) bs)*nbw0, n);
+                        }
+                    }
                 }
             }
         }

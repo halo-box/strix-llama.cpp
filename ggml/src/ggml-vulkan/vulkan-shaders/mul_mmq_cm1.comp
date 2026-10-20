@@ -18,6 +18,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #endif
 
+#ifdef D16
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
+
 #include "types.glsl"
 
 #if defined(DATA_A_Q3_K) || defined(DATA_A_Q6_K) || defined(DATA_A_NVFP4)
@@ -37,10 +41,19 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 #endif
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+#ifdef D16
+// f16 output: pairs of adjacent rows go out as one 32-bit store
+layout (binding = 2) writeonly buffer D2 {f16vec2 data_d2[];};
+#endif
 
 #ifndef D16
 // f32 output: four adjacent rows of a column go out as one 128-bit store
 layout (binding = 2) writeonly buffer D4 {vec4 data_d4[];};
+#endif
+#ifdef HC_EPI
+// HC_UP_MIX: the qwen4exp hc up GEMM with the gated hc pre in its epilogue. The f16 hc norm output x [n_embd, 4, N]
+// is read here; D (binding 2) is the f32 mixed stream [n_embd, N]; the gate [4*n_embd, N] is never written.
+layout (binding = 3) readonly buffer X {float16_t data_x[];};
 #endif
 
 #ifdef MUL_MAT_ID
@@ -48,6 +61,12 @@ layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer RowMap {uint data_row_map[];};
 // MUL_MAT_ID + MUL(router weights) epilogue: one f32 weight per (expert slot, token), [1, nei0, nei1] contiguous
 layout (binding = 5) readonly buffer FusedScale {float data_fscale[];};
+#ifdef GLU_UP
+// MUL_MAT_ID+CPY(f16)+SWIGLU: the store writes silu(gate) * up, with the other projection (f16, laid out like D) read
+// here; MMID_GLU_ACC_GATE set: this GEMM is the gate projection, clear: it is the up projection
+layout (binding = 6) readonly buffer UP {float16_t data_up[];};
+layout (binding = 6) readonly buffer UP2 {f16vec2 data_up2[];};
+#endif
 #endif
 
 layout (push_constant) uniform parameter
@@ -70,7 +89,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint row_ids_offset;
-    uint fusion_flags; // != 0: scale each output row by data_fscale (MUL_MAT_ID + MUL epilogue)
+    uint fusion_flags; // bit 0: scale each output row by data_fscale (MUL_MAT_ID + MUL epilogue); bit 3 SwiGLU gate; bit 4 row-id fill
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -79,6 +98,18 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+#ifdef HC_EPI
+    uint padded_n_unused;   // vk_mat_mat_push_constants.padded_N
+    uint hc_n_embd;         // n_embd; M = 4 * n_embd
+    uint hc_x_offset;       // element offset of x (f16 [n_embd, 4, N]) in binding 3
+    uint hc_x_s1;           // x element stride between streams
+    uint hc_x_s2;           // x element stride between tokens
+    uint hc_d_offset;       // element offset of the mixed output (f32 [n_embd, N]) in binding 2
+    uint hc_d_s1;           // mixed element stride between tokens
+    float hc_scale;
+    uint hc_zero;           // always 0, opaque to the compiler: keeps the gate's f16 rounding (see the epilogue)
+    uint hc_round;          // 1: the unfused gate is f16 (LLAMA_HC_GATE_F16), round it; 0: the f32 gate = the accumulator
+#endif
 #endif
 } p;
 
@@ -171,9 +202,38 @@ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, 
 }
 
 #ifdef MUL_MAT_ID
+#define MMID_GLU_ACC_GATE  8u   // fusion_flags bit 3: the SwiGLU epilogue's GEMM is the gate projection
 #include "mul_mm_id_funcs.glsl"
 #endif
 
+#if defined(MUL_MAT_ID) && defined(D16)
+// f16 stores equal to the unfused chain (f32 store, then CPY / the f16 SWIGLU): the values go through an XOR with a push-constant
+// zero (fusion_flags bit 2, asserted clear by ggml_vk_matmul_id) so the compiler can neither fuse the multiply into the conversion
+// nor drop a float(float16_t(x)) round trip
+uint mmid_zero() { return p.fusion_flags & 4u; }
+float16_t mmid_store16(const float x) { return float16_t(uintBitsToFloat(floatBitsToUint(x) ^ mmid_zero())); }
+f16vec2 mmid_store16x2(const vec2 x) { return f16vec2(uintBitsToFloat(floatBitsToUint(x) ^ uvec2(mmid_zero()))); }
+#ifdef GLU_UP
+// the unfused chain stores this projection as f16 (MUL_MAT_ID_CPY16) and the SWIGLU reads it back: round it the same way
+vec2 mmid_round16x2(const vec2 x) { return vec2(unpackFloat2x16(packFloat2x16(f16vec2(x)) ^ mmid_zero())); }
+float mmid_round16(const float x) { return mmid_round16x2(vec2(x, 0.0f)).x; }
+// the SWIGLU op's expression (swiglu.comp)
+float glu_silu_mul(const float g, const float u) { return g / (1.0f + exp(-g)) * u; }
+#endif
+#endif
+#if defined(HC_EPI) && defined(D16)
+// f16 mixed stream: equal to the f32 mixed stream stored, then converted (as dsv4_hc_pre.comp D_F16); hc_zero is 0
+float16_t hc_store16(const float x) { return float16_t(uintBitsToFloat(floatBitsToUint(x) ^ p.hc_zero)); }
+#endif
+
+#ifdef HC_EPI
+// logical row L (i*4 + c) -> weight row c*n_embd + i; rows past M read row 0 (their results are never stored)
+uint hc_a_row_ib(const uint L) {
+    const uint phys = (L < p.M) ? ((L & 3u) * p.hc_n_embd + (L >> 2u)) : 0u;
+    return phys * (p.stride_a / BK);
+}
+#define A_ROW_IB(r) hc_a_row_ib(ir * BM + (r))
+#endif
 #include "mul_mmq_cm1_funcs.glsl"
 
 void main() {
@@ -281,7 +341,11 @@ void main() {
 #else
         batch_idx_a * (p.batch_stride_a / BK) +
 #endif
+#ifdef HC_EPI
+        start_k / BK;   // the tile's rows are added per row by A_ROW_IB (interleaved remap)
+#else
         (ir * BM * p.stride_a + start_k) / BK;
+#endif
 #ifdef MUL_MAT_ID
     uint pos_b_ib = 0;
 #else
@@ -482,7 +546,7 @@ void main() {
     const uint dc = ic * BN + b_col0;
 
 #ifdef MUL_MAT_ID
-    const bool scale_rows = p.fusion_flags != 0;
+    const bool scale_rows = (p.fusion_flags & 1u) != 0;
 #ifndef D16
     if (PACK_F32 != 0) {
         if ((p.stride_d % 4) == 0 && (p.batch_stride_d % 4) == 0) {
@@ -512,6 +576,60 @@ void main() {
         }
     }
 #endif
+#ifdef D16
+    // f16 output (MUL_MAT_ID(+MUL)+CPY(f16)): the RDNA3/3.5 wave32 accumulator pairing of the dense f16 store
+    // below, one f16vec2 per two adjacent rows of an (expert slot, token) column, both scaled by its weight
+    bool packed_id = false;
+    if (DEVICE_ARCH != VK_ARCH_AMD_RDNA4) {
+        if (WARP == 32) {
+            if (TN == 16) {
+                packed_id = (p.stride_d % 2) == 0 && (p.batch_stride_d % 2) == 0;
+            }
+        }
+    }
+    if (packed_id) {
+        const bool lo_half = gl_SubgroupInvocationID < 16;
+        [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+            [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                const uint tile_idx = r * cms_per_col + c;
+                const uint col_i = dc + c * TN + elem_col0;
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; e += 2) {
+                    const float own0 = float(sums[tile_idx * CM_ELEMS + e]);
+                    const float own1 = float(sums[tile_idx * CM_ELEMS + e + 1]);
+                    const float recv = subgroupShuffleXor(lo_half ? own1 : own0, 16);
+                    const uint row_g = dr + r * TM + 2u * e + (lo_half ? 0u : 2u);
+                    const vec2 v = lo_half ? vec2(own0, recv) : vec2(recv, own1);
+                    if (col_i < _ne1) {
+                        const u16vec2 row_idx = row_ids[col_i - ic * BN];
+                        const uint idx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g;
+#ifdef GLU_UP
+                        const bool acc_gate = (p.fusion_flags & MMID_GLU_ACC_GATE) != 0;
+                        if (row_g + 1 < p.M) {
+                            const vec2 o = vec2(data_up2[idx / 2]);
+                            const vec2 v16 = mmid_round16x2(v);
+                            const vec2 g = acc_gate ? v16 : o;
+                            const vec2 u = acc_gate ? o : v16;
+                            data_d2[idx / 2] = mmid_store16x2(vec2(glu_silu_mul(g.x, u.x), glu_silu_mul(g.y, u.y)));
+                        } else if (row_g < p.M) {
+                            const float o = float(data_up[idx]);
+                            const float v16 = mmid_round16(v.x);
+                            data_d[idx] = mmid_store16(acc_gate ? glu_silu_mul(v16, o) : glu_silu_mul(o, v16));
+                        }
+#else
+                        const float w = scale_rows ? data_fscale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)] : 1.0;
+                        if (row_g + 1 < p.M) {
+                            data_d2[idx / 2] = mmid_store16x2(v * w);
+                        } else if (row_g < p.M) {
+                            data_d[idx] = mmid_store16(v.x * w);
+                        }
+#endif
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
     [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
         [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
             const uint tile_idx = r * cms_per_col + c;
@@ -525,15 +643,113 @@ void main() {
                 const u16vec2 row_idx = row_ids[col_i - ic * BN];
                 const uint store_offset = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g;
                 float val = float(sums[tile_idx * CM_ELEMS + e]);
+#ifndef GLU_UP
                 if (scale_rows) {
                     val *= data_fscale[uint(row_idx.y) * p.nei0 + uint(row_idx.x)];
                 }
+#else
+                // no router weight with the SwiGLU store (the host asserts it): neither GLU path reads data_fscale
+                {
+                    const float o = float(data_up[store_offset]);
+                    const bool acc_gate = (p.fusion_flags & MMID_GLU_ACC_GATE) != 0;
+                    const float v16 = mmid_round16(val);
+                    val = acc_gate ? glu_silu_mul(v16, o) : glu_silu_mul(o, v16);
+                }
+#endif
+#ifdef D16
+                data_d[store_offset] = mmid_store16(val);
+#else
                 data_d[store_offset] = D_TYPE(val);
+#endif
             }
         }
     }
 #else
     const uint offsets = batch_idx * p.batch_stride_d + ik * p.batch_stride_d * p.num_batches;
+
+#ifdef HC_EPI
+    // RDNA3/3.5 wave32 (the host creates this variant only there): the 32-bit pack shuffles give each lane rows 4j..4j+3 of
+    // its column = the 4 streams of element j. Bit-exact against MUL_MAT+CPY(f16) + DSV4_HC_PRE (gated, f16 x, f16 gate):
+    // the gate is rounded to f16 as the d16 store writes it, and the mix is the dsv4_hc_pre.comp expression, in its order.
+    {
+        const bool lo_half = gl_SubgroupInvocationID < 16;
+        [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+            [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                const uint tile_idx = r * cms_per_col + c;
+                const uint col_g = dc + c * TN + elem_col0;
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; e += 4) {
+                    const float a0 = float(sums[tile_idx * CM_ELEMS + e]);
+                    const float a1 = float(sums[tile_idx * CM_ELEMS + e + 1]);
+                    const float a2 = float(sums[tile_idx * CM_ELEMS + e + 2]);
+                    const float a3 = float(sums[tile_idx * CM_ELEMS + e + 3]);
+                    const float r0 = subgroupShuffleXor(lo_half ? a2 : a0, 16);
+                    const float r1 = subgroupShuffleXor(lo_half ? a3 : a1, 16);
+                    const vec4 v = lo_half ? vec4(a0, r0, a1, r1) : vec4(r0, a2, r1, a3);
+                    const uint row_g = dr + r * TM + 2u * e + (lo_half ? 0u : 4u);
+                    if (col_g < p.N && row_g + 3 < p.M) {
+                        const uint i0 = row_g >> 2u;
+                        const uint xb = p.hc_x_offset + i0 + col_g * p.hc_x_s2;
+                        float result = 0.0f;
+                        [[unroll]]
+                        for (uint ih = 0; ih < 4; ++ih) {
+                            // RADV/ACO drops a bare float(float16_t(x)) round trip: the f16 bits pass through an integer op on a
+                            // push-constant zero, so the gate is the f16 value the unfused chain reads
+                            const uint gbits = packFloat2x16(f16vec2(float16_t(v[ih]), float16_t(0.0))) ^ p.hc_zero;
+                            const float g = p.hc_round != 0u ? float(unpackFloat2x16(gbits).x) : v[ih];
+                            const float wv = 1.0f / (1.0f + exp(-g));
+                            result = fma(float(data_x[xb + ih * p.hc_x_s1]), wv, result);
+                        }
+#ifdef D16
+                        data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = hc_store16(p.hc_scale * result);   // the f16 mixed stream
+#else
+                        data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = D_TYPE(p.hc_scale * result);
+#endif
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
+
+#ifdef D16
+    // RDNA3/3.5 wave32 accumulator: lane l holds column l % 16, rows (l / 16) + 2e. One shuffle with the lane
+    // 16 away gives each lane two adjacent rows of its column: the low half stores rows 2e, 2e+1 and the high
+    // half rows 2e+2, 2e+3, so every lane writes one f16vec2 per element pair instead of two 16-bit values.
+    bool packed = false;
+    if (DEVICE_ARCH != VK_ARCH_AMD_RDNA4) {
+        if (WARP == 32) {
+            if (TN == 16) {
+                packed = (p.stride_d % 2) == 0 && (offsets % 2) == 0;
+            }
+        }
+    }
+    if (packed) {
+        const bool lo_half = gl_SubgroupInvocationID < 16;
+        [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
+            [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
+                const uint tile_idx = r * cms_per_col + c;
+                const uint col_g = dc + c * TN + elem_col0;
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; e += 2) {
+                    const float own0 = float(sums[tile_idx * CM_ELEMS + e]);
+                    const float own1 = float(sums[tile_idx * CM_ELEMS + e + 1]);
+                    const float recv = subgroupShuffleXor(lo_half ? own1 : own0, 16);
+                    const uint row_g = dr + r * TM + 2u * e + (lo_half ? 0u : 2u);
+                    const vec2 v = lo_half ? vec2(own0, recv) : vec2(recv, own1);
+                    if (col_g < p.N) {
+                        const uint idx = offsets + col_g * p.stride_d + row_g;
+                        if (row_g + 1 < p.M) {
+                            data_d2[idx / 2] = f16vec2(v);
+                        } else if (row_g < p.M) {
+                            data_d[idx] = float16_t(v.x);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
 
 #ifndef D16
     if (PACK_F32 != 0) {

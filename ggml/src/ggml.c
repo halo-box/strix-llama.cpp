@@ -6676,9 +6676,13 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
         struct ggml_tensor  * x,
         struct ggml_tensor  * weights,
         float                 scale,
-        bool                  gated) {
-    GGML_ASSERT(x->type == GGML_TYPE_F32);
-    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+        bool                  gated,
+        enum ggml_type        out_type) {
+    // the gated form may write an f16 mixed stream (every consumer is a matmul B operand)
+    GGML_ASSERT(out_type == GGML_TYPE_F32 || (gated && out_type == GGML_TYPE_F16));
+    // the gated form also takes an f16 x and an f16 gate (backends opt in through supports_op)
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || (gated && x->type == GGML_TYPE_F16));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 || (gated && weights->type == GGML_TYPE_F16));
 
     const int64_t n_embd   = x->ne[0];
     const int64_t hc       = x->ne[1];
@@ -6697,7 +6701,7 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
     }
     GGML_ASSERT(weights->ne[3] == 1);
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, out_type, n_embd, n_tokens);
 
     ggml_set_op_params_f32(result, 0, scale);
     ggml_set_op_params_i32(result, 1, gated ? 1 : 0);
@@ -6713,7 +6717,7 @@ struct ggml_tensor * ggml_dsv4_hc_pre(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
         struct ggml_tensor  * weights) {
-    return ggml_dsv4_hc_pre_impl(ctx, x, weights, 1.0f, false);
+    return ggml_dsv4_hc_pre_impl(ctx, x, weights, 1.0f, false, GGML_TYPE_F32);
 }
 
 struct ggml_tensor * ggml_dsv4_hc_pre_gated(
@@ -6721,7 +6725,16 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * x,
         struct ggml_tensor  * gate,
         float                 scale) {
-    return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+    return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true, GGML_TYPE_F32);
+}
+
+struct ggml_tensor * ggml_dsv4_hc_pre_gated_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate,
+        float                 scale,
+        enum ggml_type        out_type) {
+    return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true, out_type);
 }
 
 // ggml_dsv4_hc_post

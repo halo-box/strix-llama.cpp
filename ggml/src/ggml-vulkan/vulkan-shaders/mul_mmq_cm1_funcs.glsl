@@ -553,11 +553,15 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
             const uint ib = pos_b_ib + buf_ib * p.stride_b / BK;
 #endif
 
+#ifndef A_ROW_IB
+#define A_ROW_IB(r) ((r) * p.stride_a / BK)
+#endif
+
 #define PREFETCH_BLOCK(blk)                                                                     \
     [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
         const uint buf_ib = loadc_a + li * loadstride_a;                                        \
         if (buf_ib < BM) {                                                                      \
-            const uint ib = pos_a_ib + buf_ib * p.stride_a / BK;                                \
+            const uint ib = pos_a_ib + A_ROW_IB(buf_ib);                                        \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
                 pre_a[li * BK_STEP + ks] = block_a_load(ib + ks, loadr_a);                      \
             }                                                                                   \

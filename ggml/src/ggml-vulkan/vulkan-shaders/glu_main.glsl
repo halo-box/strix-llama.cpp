@@ -1,3 +1,13 @@
+// f16 builds (D_F16): the store equals the f32 op stored, then converted (and the MUL_MAT_ID SwiGLU f16 epilogue). Written
+// plainly, the compiler may fold the last f32 multiply and the conversion into one single-rounding mixed-precision op; the
+// value goes through an XOR with a push-constant zero first (mode is 0, 1 or 2).
+#ifdef D_F16
+float16_t store_d16(const float x) { return float16_t(uintBitsToFloat(floatBitsToUint(x) ^ (p.mode >> 2))); }
+#define STORE_D(x) store_d16(x)
+#else
+#define STORE_D(x) D_TYPE(x)
+#endif
+
 void main() {
     const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
 
@@ -21,15 +31,15 @@ void main() {
         const uint offset = (p.ne00 / 2) * p.nb00;
         const uint idx = src_idx_a;
 
-        data_d[dst_idx] = D_TYPE(op(float(data_a[idx]), float(data_a[idx + offset])));
+        data_d[dst_idx] = STORE_D(op(float(data_a[idx]), float(data_a[idx + offset])));
     } else if (p.mode == 1) {
         // Swapped
         const uint offset = (p.ne00 / 2) * p.nb00;
         const uint idx = src_idx_a;
 
-        data_d[dst_idx] = D_TYPE(op(float(data_a[idx + offset]), float(data_a[idx])));
+        data_d[dst_idx] = STORE_D(op(float(data_a[idx + offset]), float(data_a[idx])));
     } else {
         // Split
-        data_d[dst_idx] = D_TYPE(op(float(data_a[src_idx_a]), float(data_b[src_idx_b])));
+        data_d[dst_idx] = STORE_D(op(float(data_a[src_idx_a]), float(data_b[src_idx_b])));
     }
 }
