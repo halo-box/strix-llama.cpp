@@ -131,6 +131,13 @@ layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
 layout (binding = 1) readonly buffer B_SCALAR {B_TYPE_SCALAR data_b_scalar[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
+#ifdef QSA_EPI
+// QSA scorer epilogue: N columns are (query, head) pairs, head fastest; D[t*stride_d + m] = ((relu(h0) + relu(h1)) + relu(h2))
+// + relu(h3) (+ bias[t][m]), the unfused chain's order on the plain f32 GEMM, so the same bits
+#define QSA_H 4
+layout (binding = 3) readonly buffer QSA_BIAS {float data_qsa_bias[];};
+#endif
+
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer RowMap {uint data_row_map[];};
@@ -168,6 +175,12 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint padded_N;
+#ifdef QSA_EPI
+    uint qsa_has_bias;
+    uint qsa_stride_bias;
+    uint qsa_batch_stride_bias;
+#endif
 #endif
 } p;
 
@@ -772,6 +785,35 @@ layout(constant_id = 17) const uint MMID_B_FULL = 0;
                 }
             }
             barrier();
+        }
+    }
+#elif defined(QSA_EPI)
+    // TN is a multiple of QSA_H and every column tile starts on one, so a 16x16 tile holds TM rows x TN/QSA_H
+    // whole queries; the staged tile is summed per (row, query) by the subgroup
+    [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+        [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+            if (dr + cm_row * TM < p.M && dc + cm_col * TN < p.N) {
+                coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+                [[unroll]] for (uint o = tiw; o < TM * TN / QSA_H; o += WARP) {
+                    const uint r   = o % TM;
+                    const uint g   = o / TM;
+                    const uint row = dr + cm_row * TM + r;
+                    const uint col = dc + cm_col * TN + g * QSA_H;
+                    if (row < p.M && col < p.N) {
+                        const uint t = col / QSA_H;
+                        float s = 0.0;
+                        [[unroll]] for (uint h = 0; h < QSA_H; h++) {
+                            s += max(float(coopmat_stage[warp_i * TM * TN + (g * QSA_H + h) * TM + r]), 0.0f);
+                        }
+                        if (p.qsa_has_bias != 0) {
+                            s += data_qsa_bias[batch_idx * p.qsa_batch_stride_bias + t * p.qsa_stride_bias + row];
+                        }
+                        data_d[batch_idx * p.batch_stride_d + t * p.stride_d + row] = D_TYPE(s);
+                    }
+                }
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+            }
         }
     }
 #else

@@ -760,6 +760,17 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         }
     }
 
+    // qwen4exp QSA indexer scorer with the relu / head-sum / block-bias epilogue (KHR coopmat, f32 x f32 only)
+    if (coopmat && !coopmat2 && fp16 && !f16acc && !dot2 && matmul_id_type == MatMulIdType::NONE) {
+        const std::map<std::string, std::string> f32_dict = {
+            {"FLOAT_TYPE",   FLOAT_TYPE(1, "f32")},
+            {"FLOAT_TYPEV2", FLOAT_TYPE(2, "f32")},
+            {"FLOAT_TYPEV4", FLOAT_TYPE(4, "f32")},
+            {"FLOAT_TYPEV8", FLOAT_TYPE(8, "f32")},
+        };
+        string_to_spv(shader_name + "_f32_f32_qsa", source_name, merge_maps(merge_maps(base_dict, f32_dict), {{"DATA_A_F32", "1"}, {"QSA_EPI", "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+    }
+
     // Quant shader: one SPIR-V for all quant types, selected via MmTypeA spec constant
     {
         const std::map<std::string, std::string> quant_float_type_dict = {
@@ -1256,6 +1267,13 @@ void process_shaders() {
     string_to_spv("topk_argsort_f32", "topk_argsort.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_nary_search_f32", "topk_nary_search.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_radix_select_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}});
+    for (int npt : {8, 16, 32, 64}) {
+        string_to_spv("topk_radix_qsa_reg" + std::to_string(npt), "topk_radix_select.comp", {{"A_TYPE", "float"}, {"NPT", std::to_string(npt)}});
+    }
+    // fused maskless QSA block selection
+    for (int npt : {8, 16, 32, 64}) {
+        string_to_spv("qsa_block_select_reg" + std::to_string(npt), "qsa_block_select.comp", {{"NPT", std::to_string(npt)}});
+    }
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

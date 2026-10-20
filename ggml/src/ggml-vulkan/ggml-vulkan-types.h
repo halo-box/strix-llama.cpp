@@ -265,10 +265,11 @@ struct vk_matmul_pipeline_key {
     bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl, GGML_VK_MM_PREFETCH)
     bool xl = false;    // the 256x256 XL tile tier of the pf variant (aligned only, ggml_vk_mm_xl_ok)
     bool hcmix = false; // the int8 MMQ hc up GEMM with the gated hc pre in its epilogue (HC_UP_MIX, mul_mmq_cm1.comp HC_EPI)
+    bool qsa = false;   // the QSA scorer epilogue variant of the F32 x F32 dense key (QSA_SCORE)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl, hcmix)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl, o.hcmix);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl, hcmix, qsa)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl, o.hcmix, o.qsa);
     }
 };
 
@@ -530,6 +531,22 @@ static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_R
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                    GGML_OP_TOP_K };
+
+// qwen4exp QSA indexer scorer as build_qsa_top_k emits it (QSA_SCORE): GEMM, relu, four head slices summed, block bias.
+// graph_optimize keeps this order; otherwise the mask build's FILL and views are hoisted into the head sum
+static constexpr std::initializer_list<ggml_op> qsa_score_pattern { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+                                                                    GGML_OP_VIEW,    GGML_OP_CONT,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_ADD };
+// the same chain without the bias ADD: the maskless path applies the visibility through the compact-limits ops
+// (cast, repeat, sub, step, log, add), which follow the head sum, so the 12-op pattern above never matches there
+static constexpr std::initializer_list<ggml_op> qsa_score_pattern_nobias { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+                                                                           GGML_OP_VIEW,    GGML_OP_CONT,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD };
 
 static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 1, 0, 0 }, // permute->src[0] == get_rows
@@ -837,6 +854,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_get_rows_flat[GGML_TYPE_COUNT];       // GGML_VK_GET_ROWS_FLAT: narrow rows, one thread per element
+    vk_pipeline pipeline_get_rows_flat_f32[GGML_TYPE_COUNT];   //   (f32 / f16 / bf16 / i32 sources)
     vk_pipeline pipeline_get_rows_back_f32;
     vk_pipeline pipeline_acc_f32;
     vk_pipeline pipeline_set_f32;
@@ -972,6 +991,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
+    vk_pipeline pipeline_topk_radix_qsa_reg[4]; // register-resident rows of up to {8,16,32,64} * BLOCK_SIZE cells (GGML_VK_TOPK_QSA_REG)
+    vk_pipeline pipeline_qsa_block_select_reg[4]; // fused maskless block selection, rows of up to {8,16,32,64} * BLOCK_SIZE blocks (GGML_VK_QSA_BLOCK_SELECT)
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
@@ -1301,7 +1322,10 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct vk_qsa_block_select_match;
+
 struct ggml_backend_vk_context {
+    bool get_rows_flat {};   // the GET_ROWS being recorded uses the flat pipeline (ggml_vk_get_rows -> ggml_vk_op_f32 elements)
     std::string name;
 
     vk_device device;
@@ -1377,6 +1401,10 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    bool fused_qsa_score {};        // QSA scorer: MUL_MAT + RELU + head sum (+ block bias) in the GEMM epilogue (GGML_VK_QSA_SCORE)
+    bool fused_qsa_block_select {};   // TOP_K .. CONCAT of qwen4exp_select_complete_blocks in one dispatch (GGML_VK_QSA_BLOCK_SELECT)
+    const vk_qsa_block_select_match * qsa_block_select_match {};   // graph_compute's match of that chain, read by the dispatch
+    const ggml_tensor * qsa_score_bias {};
     bool fused_hc_post_gate {};
     // hc combine + next hc norm (dsv4_hc_post_norm.comp): HC_POST_NORM_* modes, 0 = none
     int fused_hc_post_norm {};

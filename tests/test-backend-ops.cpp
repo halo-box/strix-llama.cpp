@@ -2638,6 +2638,24 @@ struct test_get_rows : public test_case {
             }
         }
     }
+
+    // Vulkan GGML_VK_GET_ROWS_FLAT (default 32): rows of at most 32 elements from an f32 / f16 / bf16 / i32 source take the flat
+    // pipeline, wider rows and quantized sources the row-per-workgroup one; GGML_VK_TEST_REQUIRE_GET_ROWS_FLAT=1 checks the count
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_GET_ROWS_FLAT")) {
+            return true;
+        }
+        const int64_t c = dispatch_census_count(backend, "path:GET_ROWS_FLAT");
+        static const int64_t max_ne00 = [] { const char * e = getenv("GGML_VK_GET_ROWS_FLAT"); return e ? (int64_t) atoll(e) : (int64_t) 32; }();
+        const bool src_ok = type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_I32;
+        const bool want = src_ok && max_ne00 > 0 && n <= max_ne00;
+        if ((c > 0) != want) {
+            msg = "GET_ROWS_FLAT dispatches: " + std::to_string(c) + (want ? " (expected the flat pipeline)" : " (expected the row-per-workgroup one)");
+            return false;
+        }
+        return true;
+    }
 };
 
 // GGML_OP_GET_ROWS_BACK
@@ -5586,6 +5604,164 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
         out = ggml_dsv4_hc_comb(ctx, mixes, scale, base, eps, n_iter);
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+// QSA_BLOCK_SELECT: the chain qwen4exp_select_complete_blocks emits, node for node, against the CPU; distinct scores per row,
+// n_inf invisible (-inf) blocks per row (their cells read -1 when picked), one block with the +1e9 tail bias as in the model
+struct test_qsa_block_select : public test_case {
+    const int64_t n_blocks, n_query, n_stream, budget, r;
+    const int64_t n_inf;
+    const int64_t n_seq;   // 0: the scores carry the visibility (-inf); >0: compact limits with n_seq rows, applied
+                           // through the cast / repeat / sub / step / log / add ops ahead of the chain (fused on Vulkan)
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_BLOCK_SELECT";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_blocks, n_query, n_stream, budget, r, n_inf, n_seq);
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    double max_nmse_err() override {
+        return 0.0;   // the selection, its order and the cells must match exactly
+    }
+
+    // the chain run unfused on Vulkan matches the CPU too: with GGML_VK_TEST_REQUIRE_QSA_BLOCK_SELECT=1 the test fails
+    // unless exactly one QSA_BLOCK_SELECT dispatch ran
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_BLOCK_SELECT", "QSA_BLOCK_SELECT")) {
+            return true;
+        }
+        const int64_t n = dispatch_census_count(backend, "QSA_BLOCK_SELECT");
+        const int64_t want = env_knob_on("GGML_VK_QSA_BLOCK_SELECT") ? 1 : 0;
+        if (n != want) {
+            msg = "QSA_BLOCK_SELECT dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) +
+                  (want ? ": the chain ran unfused; GGML_VK_FUSION_DEBUG=1 prints why)" : ": the knob is off)");
+            return false;
+        }
+        return true;
+    }
+
+    test_qsa_block_select(int64_t n_blocks = 512, int64_t n_query = 8, int64_t n_stream = 1, int64_t budget = 128, int64_t r = 4, int64_t n_inf = 0,
+                          int64_t n_seq = 0)
+        : n_blocks(n_blocks), n_query(n_query), n_stream(n_stream), budget(budget), r(r), n_inf(n_inf), n_seq(n_seq) {
+        GGML_ASSERT(budget <= n_blocks && n_inf <= n_blocks && (n_seq == 0 || n_stream == 1));
+    }
+
+    ggml_tensor * out = nullptr;
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_query, n_stream);
+        ggml_set_name(score, "score");
+        ggml_tensor * block_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r * n_blocks, n_stream);
+        ggml_set_name(block_cells, "block_cells");
+        ggml_tensor * tail = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, r - 1, n_query, 1, n_stream);
+        ggml_set_name(tail, "tail");
+
+        if (n_seq > 0) {
+            // == qwen4exp_apply_compact_visibility(ctx, score, limits, n_blocks, n_seq, n_tps = n_query, first = 0, n_query)
+            ggml_tensor * limits = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_blocks * n_seq + 2 * n_query);
+            ggml_set_name(limits, "limits");
+            ggml_tensor * starts = nullptr;
+            if (n_seq == 1) {
+                starts = ggml_cast(ctx, ggml_view_1d(ctx, limits, n_blocks, 0), GGML_TYPE_F32);
+            } else {
+                ggml_tensor * starts2d = ggml_cast(ctx, ggml_view_2d(ctx, limits, n_blocks, n_seq, n_blocks * sizeof(int32_t), 0), GGML_TYPE_F32);
+                ggml_tensor * row_idx  = ggml_view_1d(ctx, limits, n_query, (n_blocks * n_seq + n_query) * sizeof(int32_t));
+                starts = ggml_get_rows(ctx, starts2d, row_idx);
+            }
+            ggml_tensor * tails = ggml_cast(ctx, ggml_view_1d(ctx, limits, n_query, n_blocks * n_seq * sizeof(int32_t)), GGML_TYPE_F32);
+            tails = ggml_reshape_2d(ctx, tails, 1, n_query);
+            ggml_tensor * visible = ggml_step(ctx, ggml_sub(ctx, ggml_repeat(ctx, tails, score), starts));
+            score = ggml_add(ctx, score, ggml_log(ctx, visible));
+        }
+
+        // == qwen4exp_select_complete_blocks(ctx, score, block_cells, tail, budget, r)
+        ggml_tensor * blocks = ggml_cont(ctx, ggml_top_k(ctx, score, budget));
+        ggml_tensor * order  = ggml_argsort(ctx, ggml_cast(ctx, blocks, GGML_TYPE_F32), GGML_SORT_ORDER_ASC);
+        ggml_tensor * blocks_view = ggml_view_4d(ctx, blocks, 1, budget, n_query, n_stream, blocks->nb[0], blocks->nb[1], blocks->nb[2], 0);
+        blocks = ggml_reshape_3d(ctx, ggml_get_rows(ctx, blocks_view, order), budget, n_query, n_stream);
+        ggml_tensor * score_view = ggml_view_4d(ctx, score, 1, n_blocks, n_query, n_stream, score->nb[0], score->nb[1], score->nb[2], 0);
+        ggml_tensor * picked_score = ggml_get_rows(ctx, score_view, blocks);
+        ggml_tensor * valid = ggml_step(ctx, ggml_scale_bias(ctx, picked_score, 1.0f, 1.0f));
+        ggml_tensor * cells_view  = ggml_reshape_3d(ctx, block_cells, r, n_blocks, n_stream);
+        ggml_tensor * flat_blocks = ggml_reshape_2d(ctx, blocks, budget * n_query, n_stream);
+        ggml_tensor * cells = ggml_get_rows(ctx, cells_view, flat_blocks);
+        cells = ggml_reshape_4d(ctx, cells, r, budget, n_query, n_stream);
+        cells = ggml_scale_bias(ctx, ggml_cast(ctx, cells, GGML_TYPE_F32), 1.0f, 1.0f);
+        cells = ggml_mul(ctx, cells, valid);
+        cells = ggml_cast(ctx, ggml_scale_bias(ctx, cells, 1.0f, -1.0f), GGML_TYPE_I32);
+        cells = ggml_reshape_4d(ctx, cells, budget * r, n_query, 1, n_stream);
+        out = ggml_concat(ctx, cells, tail, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->view_src != nullptr) {
+                continue;   // only the inputs: a view of "limits" or "score" written with random values clobbers them
+            }
+            const std::string name = ggml_get_name(t);
+            if (name == "score") {
+                std::vector<float> v((size_t) ggml_nelements(t));
+                std::vector<int64_t> perm(n_blocks);
+                for (int64_t row = 0; row < n_query * n_stream; ++row) {
+                    for (int64_t b = 0; b < n_blocks; ++b) { perm[b] = b; }
+                    std::shuffle(perm.begin(), perm.end(), rng);
+                    float * p = v.data() + row * n_blocks;
+                    for (int64_t b = 0; b < n_blocks; ++b) {
+                        p[b] = 0.001f * (float) perm[b] - 0.25f;             // distinct, some below -1 is impossible here: keep them above
+                    }
+                    // invisible blocks spread over the row while the budget fits the visible ones; otherwise at the row's tail, as CPU top_k takes
+                    // equal -inf keys in any order (the kernel the lowest): there any pick sorts last and the -1 cells land in the same slots
+                    const bool tail_inf = budget > n_blocks - n_inf;
+                    for (int64_t k = 0; n_seq == 0 && k < n_inf; ++k) {
+                        p[tail_inf ? n_blocks - 1 - k : (k * 7 + row) % n_blocks] = -INFINITY;
+                    }
+                    p[(row * 13) % n_blocks] += 1e9f;                          // the tail block's bias
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(float));
+            } else if (name == "limits") {
+                // starts: block b of row s at 4*b + s, the last n_inf blocks unfinished (INT32_MAX, at the tail as above); tails: every other
+                // query sees the whole prefix, the rest only its first half (positions stay below 2^24)
+                std::vector<int32_t> v((size_t) ggml_nelements(t));
+                for (int64_t sidx = 0; sidx < n_seq; ++sidx) {
+                    for (int64_t b = 0; b < n_blocks; ++b) {
+                        v[sidx * n_blocks + b] = (int32_t) (4 * b + sidx);
+                    }
+                    for (int64_t k = 0; k < n_inf; ++k) {
+                        v[sidx * n_blocks + n_blocks - 1 - k] = INT32_MAX;
+                    }
+                }
+                for (int64_t q = 0; q < n_query; ++q) {
+                    v[n_blocks * n_seq + q]           = (int32_t) (q % 2 == 0 ? 4 * n_blocks + 4 : 4 * (n_blocks / 2) + 1);
+                    v[n_blocks * n_seq + n_query + q] = (int32_t) (q % n_seq);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int32_t));
+            } else if (name == "block_cells") {
+                std::vector<int32_t> v((size_t) ggml_nelements(t));
+                for (int64_t sidx = 0; sidx < n_stream; ++sidx) {
+                    for (int64_t k = 0; k < r * n_blocks; ++k) {
+                        v[sidx * r * n_blocks + k] = (int32_t) (k + 100000 * sidx);
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int32_t));
+            } else if (name == "tail") {
+                std::vector<int32_t> v((size_t) ggml_nelements(t));
+                for (size_t k = 0; k < v.size(); ++k) { v[k] = (int32_t) (5000000 + k); }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -9369,6 +9545,79 @@ struct test_top_k_stable_ties : public test_top_k {
 };
 
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
+// qwen4exp QSA scorer: MUL_MAT(keys, q) -> relu -> 4-head sum (-> + block bias), fused on Vulkan as QSA_SCORE. Inputs are
+// multiples of 1/8, so every product and partial sum is exact: the fused result must match the CPU bit for bit
+struct test_qsa_score : public test_case {
+    const int64_t K;
+    const int64_t n_blocks;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const bool    bias;
+    const bool    exact;   // false: uniform inputs, the NMSE vs the CPU then measures the f16 GEMM rounding
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_SCORE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(K, n_blocks, n_tps, n_stream, bias, exact);
+    }
+
+    test_qsa_score(int64_t K = 128, int64_t n_blocks = 512, int64_t n_tps = 64, int64_t n_stream = 1, bool bias = true, bool exact = true)
+        : K(K), n_blocks(n_blocks), n_tps(n_tps), n_stream(n_stream), bias(bias), exact(exact) {}
+
+    double max_err() override { return exact ? 0.0 : 1e-6; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = 4;
+        ggml_tensor * keys = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_blocks, n_stream);
+        ggml_set_name(keys, "keys");
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, H*n_tps, n_stream);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * score = ggml_mul_mat(ctx, keys, q);
+        score = ggml_reshape_4d(ctx, score, n_blocks, H, n_tps, n_stream);
+        score = ggml_relu(ctx, score);
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < H; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx, score, n_blocks, n_tps, n_stream, score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx, summed, slice) : ggml_cont(ctx, slice);
+        }
+        if (bias) {
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+            ggml_set_name(b, "bias");
+            summed = ggml_add(ctx, summed, b);
+        }
+        out = summed;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            std::vector<float> data(ggml_nelements(t));
+            const bool is_bias = strcmp(t->name, "bias") == 0;
+            if (!exact && !is_bias) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+                continue;
+            }
+            for (auto & v : data) {
+                // the bias is 0 or a large negative (the model's -inf, finite so the error stays defined)
+                v = is_bias ? ((rand() % 4) == 0 ? -1024.0f : 0.0f) : (float) (rand() % 17 - 8) / 8.0f;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+        }
+    }
+};
+
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
     const int64_t n_kv;
@@ -12994,6 +13243,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,    GGML_TYPE_Q8_0,   256, 128, 16, 4, 129, 0, true, true));
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,    GGML_TYPE_Q8_0,   256, 224, 16, 4, 65, 0, true, true));   // ff not a tile multiple
     test_cases.emplace_back(new test_moe_f16(GGML_TYPE_Q4_K,   GGML_TYPE_Q8_0,   256, 128, 16, 4, 5, 0));    // mat-vec MMID: no fusion
+    // the maskless QSA block selection (Flash-Next: r = 4, budget 512; 8192 blocks = 32k context), decode and prefill rows,
+    // invisible blocks within and beyond the budget, two streams
+    test_cases.emplace_back(new test_qsa_block_select(512,  8,  1, 128, 4, 0));
+    test_cases.emplace_back(new test_qsa_block_select(2048, 64, 1, 512, 4, 300));
+    test_cases.emplace_back(new test_qsa_block_select(8192, 16, 1, 512, 4, 100));
+    test_cases.emplace_back(new test_qsa_block_select(1024, 4,  2, 256, 4, 50));
+    test_cases.emplace_back(new test_qsa_block_select(600,  5,  1, 512, 4, 200));   // budget > visible blocks: -1 cells
+    test_cases.emplace_back(new test_qsa_block_select(4096, 1,  1, 512, 4, 0));     // a decode row
+    test_cases.emplace_back(new test_qsa_block_select(300,  3,  1, 300, 4, 10));    // budget == n_blocks
+    // compact limits read in the kernel: one sequence row, two rows, budget past the visible blocks
+    test_cases.emplace_back(new test_qsa_block_select(512,  8,  1, 128, 4, 0,   1));
+    test_cases.emplace_back(new test_qsa_block_select(2048, 64, 1, 512, 4, 300, 1));
+    test_cases.emplace_back(new test_qsa_block_select(1024, 16, 1, 256, 4, 50,  2));
+    test_cases.emplace_back(new test_qsa_block_select(600,  5,  1, 512, 4, 200, 2));
+    test_cases.emplace_back(new test_qsa_block_select(4096, 1,  1, 512, 4, 0,   1));  // a decode row
+    // qwen4exp QSA indexer scorer (MUL_MAT + relu + head sum + block bias), incl. ragged M/N edges and 2 streams
+    test_cases.emplace_back(new test_qsa_score(128, 512,  64, 1, true));
+    test_cases.emplace_back(new test_qsa_score(128, 4608, 512, 1, true));
+    test_cases.emplace_back(new test_qsa_score(128, 300,  50, 1, true));
+    test_cases.emplace_back(new test_qsa_score(128, 777,  33, 2, true));
+    test_cases.emplace_back(new test_qsa_score(128, 512,  64, 1, false));
+    test_cases.emplace_back(new test_qsa_score(96,  200,  20, 1, true));    // K not a multiple of the aligned load
+    test_cases.emplace_back(new test_qsa_score(128, 60,   64, 1, true));    // M <= 64: not fused
+    test_cases.emplace_back(new test_qsa_score(128, 512,  64, 1, true, false));
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
@@ -13083,6 +13356,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    // the QSA block-selection gathers (qwen4exp_select_complete_blocks): 1-wide score / block-id rows per query and 4-wide
+    // block-cell rows (GET_ROWS(1, 512, 2048) and (4, 1048576) at a 2048-token ubatch), plus bf16 and odd widths
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8704, 512, 2048, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 1, 512, 512, 2048, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 4, 8704, 65536, 16, 1, false));   // 1M 4-wide rows over 16 batches
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 8704, 65536, 16, 1, false));   // the same over i32 data (initialize_tensors sizes each tensor itself)
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_BF16, 4, 300, 777, 3, 2, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 5, 300, 777, 3, 2, true, true, 2));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)

@@ -1,0 +1,267 @@
+#version 450
+
+// QSA_BLOCK_SELECT: qwen4exp's maskless block selection, one workgroup per query row: radix top-`budget` of the row (ties: lowest
+// index), cells in ascending block order (-1 for score <= -1), then the tail; l_mode 1 tests the compact limits (start < tail)
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+layout(constant_id = 0) const int BLOCK_SIZE = 512;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer S  {float data_s[];};   // block scores [n_blocks, n_query, n_stream], contiguous
+layout (binding = 1) writeonly buffer D {int   data_d[];};   // [width, n_query, 1, n_stream]
+layout (binding = 2) readonly buffer C  {int   data_c[];};   // block cells [r*n_blocks, n_stream], stream stride c_stride_s
+layout (binding = 3) readonly buffer T  {int   data_t[];};   // tail cells [r-1, n_query, 1, n_stream], strides t_stride_q / t_stride_s
+layout (binding = 4) readonly buffer L  {int   data_l[];};   // compact limits (l_mode = 1): [rows x l_blocks starts] ++ tails ++ row ids
+
+layout (push_constant) uniform parameter {
+    uint n_blocks;
+    uint budget;
+    uint n_query;
+    uint n_stream;
+    uint r;
+    uint width;
+    uint c_stride_s;
+    uint t_stride_q;
+    uint t_stride_s;
+    uint l_mode;
+    uint l_blocks;
+    uint l_tails_off;
+    uint l_rowidx_off;
+} p;
+
+#define RADIX_BITS 8
+#define RADIX_SIZE (1 << RADIX_BITS)
+
+shared uint histo[RADIX_SIZE];
+shared uint sh_bucket;
+shared uint sh_above;
+shared uint sh_cnt_gt[NPT * 64];
+shared uint sh_cnt_eq[NPT * 64];
+shared uint sh_chunk_gt[NPT];
+shared uint sh_chunk_eq[NPT];
+
+// the histogram add and the bucket scan are those of topk_radix_select.comp (same totals, same bucket)
+#ifndef HISTO_PEEL
+#define HISTO_PEEL 4
+#endif
+void histo_add(bool want, uint bucket) {
+    bool pending = want;
+    [[unroll]] for (int it = 0; it < HISTO_PEEL; ++it) {
+        const uvec4 bp = subgroupBallot(pending);
+        if (bp == uvec4(0)) {
+            return;
+        }
+        const uint leader = subgroupBallotFindLSB(bp);
+        const uint lead_bucket = subgroupShuffle(bucket, leader);
+        const bool match = pending && bucket == lead_bucket;
+        const uint cnt = subgroupBallotBitCount(subgroupBallot(match));
+        if (gl_SubgroupInvocationID == leader) {
+            atomicAdd(histo[lead_bucket], cnt);
+        }
+        pending = pending && !match;
+    }
+    if (pending) {
+        atomicAdd(histo[bucket], 1u);
+    }
+}
+
+void select_bucket(const uint desired) {
+    if (gl_SubgroupID == 0) {
+        const uint lane = gl_SubgroupInvocationID;
+        const uint per  = (RADIX_SIZE + gl_SubgroupSize - 1) / gl_SubgroupSize;
+        uint s = 0;
+        for (uint k = 0; k < per; ++k) {
+            const int bb = int(RADIX_SIZE - 1) - int(lane * per + k);
+            if (bb >= 0) {
+                s += histo[bb];
+            }
+        }
+        const uint total = subgroupAdd(s);
+        uint acc   = subgroupExclusiveAdd(s);
+        bool found = false;
+        uint b     = 0;
+        uint above = 0;
+        for (uint k = 0; k < per; ++k) {
+            const int bb = int(RADIX_SIZE - 1) - int(lane * per + k);
+            if (bb >= 0 && !found) {
+                const uint c = histo[bb];
+                if (acc + c >= desired) {
+                    found = true;
+                    b     = uint(bb);
+                    above = acc;
+                } else {
+                    acc += c;
+                }
+            }
+        }
+        const uvec4 bf = subgroupBallot(found);
+        if (bf == uvec4(0)) {
+            if (lane == 0) {
+                sh_bucket = 0;
+                sh_above  = total;
+            }
+        } else if (lane == subgroupBallotFindLSB(bf)) {
+            sh_bucket = b;
+            sh_above  = above;
+        }
+    }
+}
+
+// order-preserving float <-> uint mapping
+uint f2ui(float x) {
+    uint y = floatBitsToUint(x);
+    if ((y & 0x80000000u) != 0u) {
+        y ^= 0xFFFFFFFFu;
+    } else {
+        y |= 0x80000000u;
+    }
+    return y;
+}
+float ui2f(uint y) {
+    if ((y & 0x80000000u) != 0u) {
+        y ^= 0x80000000u;
+    } else {
+        y ^= 0xFFFFFFFFu;
+    }
+    return uintBitsToFloat(y);
+}
+
+void select_row(const uint row) {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint q   = row % p.n_query;
+    const uint s   = row / p.n_query;
+    const uint n   = p.n_blocks;
+    const uint s_base = row * n;
+    const uint d_base = row * p.width;
+
+    // compact visibility: the query's tail start and its row of block starts (one sequence: row 0)
+    int  l_tail = 0;
+    uint l_row  = 0;
+    if (p.l_mode != 0) {
+        l_tail = data_l[p.l_tails_off + q];
+        l_row  = p.l_rowidx_off == 0xFFFFFFFFu ? 0u : uint(data_l[p.l_rowidx_off + q]);
+    }
+
+    uint keys[NPT];
+    [[unroll]] for (uint j = 0; j < NPT; ++j) {
+        const uint i = j * BLOCK_SIZE + tid;
+        if (i < n) {
+            float v = data_s[s_base + i];
+            if (p.l_mode != 0 && !(data_l[l_row * p.l_blocks + i] < l_tail)) {
+                v = uintBitsToFloat(0xFF800000u);   // -inf: score + log(step(tail - start)) with step = 0
+            }
+            keys[j] = f2ui(v);
+        } else {
+            keys[j] = 0u;
+        }
+    }
+
+    // the budget-th largest key: 4 radix passes of 8 bits over the register-resident row
+    uint prefix  = 0;
+    uint desired = p.budget;
+    [[unroll]] for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        for (uint i = tid; i < RADIX_SIZE; i += BLOCK_SIZE) {
+            histo[i] = 0;
+        }
+        barrier();
+        const uint hi_mask   = (shift + RADIX_BITS >= 32) ? 0u : (0xFFFFFFFFu << uint(shift + RADIX_BITS));
+        const uint prefix_hi = prefix & hi_mask;
+        [[unroll]] for (uint j = 0; j < NPT; ++j) {
+            if (j * BLOCK_SIZE < n) {
+                const uint i = j * BLOCK_SIZE + tid;
+                histo_add(i < n && (keys[j] & hi_mask) == prefix_hi, (keys[j] >> uint(shift)) & (RADIX_SIZE - 1));
+            }
+        }
+        barrier();
+        select_bucket(desired);
+        barrier();
+        prefix  |= sh_bucket << uint(shift);
+        desired -= sh_above;
+        barrier();
+    }
+    const uint threshold = prefix;
+
+    // per element: how many above-threshold and how many tied keys sit below its index (chunk prefix + subgroup
+    // prefix + lane rank); every above-threshold block is selected, ties are taken in ascending index order
+    const uint sg  = gl_SubgroupID;
+    const uint nsg = gl_NumSubgroups;
+    [[unroll]] for (uint j = 0; j < NPT; ++j) {
+        const uint i = j * BLOCK_SIZE + tid;
+        const uvec4 bgt = subgroupBallot(i < n && keys[j] >  threshold);
+        const uvec4 beq = subgroupBallot(i < n && keys[j] == threshold);
+        if (subgroupElect()) {
+            sh_cnt_gt[j * nsg + sg] = subgroupBallotBitCount(bgt);
+            sh_cnt_eq[j * nsg + sg] = subgroupBallotBitCount(beq);
+        }
+    }
+    barrier();
+    if (tid < NPT) {
+        uint tg = 0, te = 0;
+        for (uint x = 0; x < nsg; ++x) {
+            const uint cg = sh_cnt_gt[tid * nsg + x];
+            const uint ce = sh_cnt_eq[tid * nsg + x];
+            sh_cnt_gt[tid * nsg + x] = tg;
+            sh_cnt_eq[tid * nsg + x] = te;
+            tg += cg;
+            te += ce;
+        }
+        sh_chunk_gt[tid] = tg;
+        sh_chunk_eq[tid] = te;
+    }
+    barrier();
+    if (tid == 0) {
+        uint ag = 0, ae = 0;
+        for (uint j = 0; j < NPT; ++j) {
+            const uint tg = sh_chunk_gt[j];
+            const uint te = sh_chunk_eq[j];
+            sh_chunk_gt[j] = ag;
+            sh_chunk_eq[j] = ae;
+            ag += tg;
+            ae += te;
+        }
+        sh_above = ag;
+    }
+    barrier();
+    const uint n_gt      = sh_above;
+    const uint n_eq_take = p.budget - n_gt;   // the threshold bucket holds at least this many ties
+
+    // slot of a selected block = number of selected blocks with a lower index: the output is ascending by block id
+    const uint c_base = s * p.c_stride_s;
+    [[unroll]] for (uint j = 0; j < NPT; ++j) {
+        if (j * BLOCK_SIZE >= n) {
+            break;
+        }
+        const uint i  = j * BLOCK_SIZE + tid;
+        const bool gt = i < n && keys[j] >  threshold;
+        const bool eq = i < n && keys[j] == threshold;
+        const uint rgt = subgroupBallotExclusiveBitCount(subgroupBallot(gt));
+        const uint req = subgroupBallotExclusiveBitCount(subgroupBallot(eq));
+        const uint gt_before = sh_chunk_gt[j] + sh_cnt_gt[j * nsg + sg] + rgt;
+        const uint eq_before = sh_chunk_eq[j] + sh_cnt_eq[j * nsg + sg] + req;
+        const bool sel = gt || (eq && eq_before < n_eq_take);
+        if (sel) {
+            const uint slot  = gt_before + min(eq_before, n_eq_take);
+            // the chain marks a block whose (biased) score is at or below -1 as invisible: its cells read -1
+            const bool valid = (ui2f(keys[j]) + 1.0f) > 0.0f;
+            for (uint c = 0; c < p.r; ++c) {
+                data_d[d_base + slot * p.r + c] = valid ? data_c[c_base + i * p.r + c] : -1;
+            }
+        }
+    }
+    if (tid + 1 < p.r) {
+        data_d[d_base + p.budget * p.r + tid] = data_t[s * p.t_stride_s + q * p.t_stride_q + tid];
+    }
+    barrier();
+}
+
+void main() {
+    for (uint row = gl_WorkGroupID.y; row < p.n_query * p.n_stream; row += gl_NumWorkGroups.y) {
+        select_row(row);
+    }
+}
