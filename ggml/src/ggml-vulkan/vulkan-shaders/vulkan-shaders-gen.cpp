@@ -97,6 +97,11 @@ enum MatMulIdType {
     SUBGROUP,
 };
 
+// ternary types the int8 coopmat MMQ reads as exact int8 levels rather than through f16 (PTQ1_0 dense only); no f16-output twins
+static bool is_cm1_int8_view(const std::string& t, MatMulIdType id) {
+    return t == "tq1_0" || t == "tq2_0" || t == "q2_0" || (t == "ptq1_0" && id == MatMulIdType::NONE);
+}
+
 namespace {
 
 int execute_command(std::vector<std::string>& command, std::string& stdout_str, std::string& stderr_str) {
@@ -681,7 +686,9 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 #endif
 
         if (!f16acc && coopmat && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
-                     || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4")) {
+                     || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4"
+                     || is_cm1_int8_view(tname, matmul_id_type))) {
+            const bool i8view = is_cm1_int8_view(tname, matmul_id_type);
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
             if (matmul_id_type == MatMulIdType::NONE && tname == "q8_0") {
                 // HC_UP_MIX: the qwen4exp hc up GEMM with the gated hc pre in its epilogue (f32 mixed output)
@@ -689,11 +696,11 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
                 // the same with an f16 mixed stream (D16 keeps the f32x4 store helpers out; the epilogue returns before any D16 store)
                 string_to_spv(shader_name + "_" + tname + "_q8_1_hcmix_d16", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"D_TYPE_VEC4", "f16vec4"}, {"D16", "1"}, {"HC_EPI", "1"}}), fp16, coopmat, coopmat2, f16acc);
             }
-            if (matmul_id_type == MatMulIdType::NONE || matmul_id_type == MatMulIdType::SUBGROUP) {
+            if (!i8view && (matmul_id_type == MatMulIdType::NONE || matmul_id_type == MatMulIdType::SUBGROUP)) {
                 // f16 output for the MUL_MAT(_ID)(+MUL)+CPY(f16) fusions
                 string_to_spv(shader_name + "_" + tname + "_q8_1_d16", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"D_TYPE_VEC4", "f16vec4"}, {"D16", "1"}}), fp16, coopmat, coopmat2, f16acc);
             }
-            if (matmul_id_type == MatMulIdType::SUBGROUP) {
+            if (!i8view && matmul_id_type == MatMulIdType::SUBGROUP) {
                 // the gate projection with the SwiGLU applied in the f16 store (MUL_MAT_ID+CPY(f16)+SWIGLU)
                 string_to_spv(shader_name + "_" + tname + "_q8_1_d16_glu", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"D_TYPE_VEC4", "f16vec4"}, {"D16", "1"}, {"GLU_UP", "1"}}), fp16, coopmat, coopmat2, f16acc);
             }
