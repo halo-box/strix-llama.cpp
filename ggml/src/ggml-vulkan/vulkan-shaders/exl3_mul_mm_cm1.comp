@@ -32,6 +32,7 @@ layout(push_constant) uniform parameter {
     uint k;
     uint n;
     uint rows;
+    uint tq_stride;   // ID: uint32 words of one expert's trellis
 } p;
 
 layout(binding = 0) readonly buffer TR  { uint data_t[]; };
@@ -40,6 +41,11 @@ layout(binding = 2) readonly buffer XLO { float16_t data_lo[]; };
 layout(binding = 3) readonly buffer INV { float data_inv[]; };
 layout(binding = 4) readonly buffer SV  { float16_t data_sv[]; };
 layout(binding = 5) writeonly buffer D  { float data_d[]; };
+#ifdef ID
+// ID: group g = (expert, first row, rows) of exl3_route.comp; row r of the scratch is pair ord[r] = its dst row
+layout(binding = 6) readonly buffer GRP { uint data_grp[]; };
+layout(binding = 7) readonly buffer ORD { uint data_ord[]; };
+#endif
 
 #define EXL3_FWHT
 #include "exl3_common.glsl"
@@ -52,8 +58,23 @@ void main() {
     const uint warp = gl_SubgroupID;
     const uint tn   = p.n / 16;
     const uint seg  = gl_WorkGroupID.x;
-    const uint row0 = gl_WorkGroupID.y*BN + warp*16;  // the wave's 16 rows
-    const bool has_rows = row0 < p.rows;
+#ifdef ID
+    const uint g      = gl_WorkGroupID.y;
+    const uint e      = data_grp[3*g];
+    const uint row_e  = data_grp[3*g + 1] + data_grp[3*g + 2];  // end of the group's rows
+    if (data_grp[3*g + 2] == 0) {
+        return;
+    }
+    const uint row0   = data_grp[3*g + 1] + warp*16;           // the wave's 16 rows
+    const uint tbase  = e*p.tq_stride;
+    const uint svbase = e*p.n;
+#else
+    const uint row_e  = p.rows;
+    const uint row0   = gl_WorkGroupID.y*BN + warp*16;         // the wave's 16 rows
+    const uint tbase  = 0;
+    const uint svbase = 0;
+#endif
+    const bool has_rows = row0 < row_e;
 
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[8];
     [[unroll]] for (uint c = 0; c < 8; ++c) {
@@ -71,7 +92,7 @@ void main() {
             const uint kl = it >> 3;
             const uint ct = it & 7;
             f16vec2 f[4];
-            exl3_lane_decode(((ks*2 + kl)*tn + seg*8 + ct)*EXL3_TILE_U32, lane, f);
+            exl3_lane_decode(tbase + ((ks*2 + kl)*tn + seg*8 + ct)*EXL3_TILE_U32, lane, f);
             // column c: [k] pairs (r0, r0 + 1) and (r0 + 8, r0 + 9) of k-tile kl
             const uint ba = wb + (ct*16 + c0)*LS + kl*8 + r0/2;
             const uint bb = wb + (ct*16 + c0 + 8)*LS + kl*8 + r0/2;
@@ -113,7 +134,7 @@ void main() {
     const uint seg0 = seg*128;
     float sv[4];
     [[unroll]] for (uint i = 0; i < 4; ++i) {
-        sv[i] = float(data_sv[seg0 + i*32 + lane])*(1.0f/128.0f);
+        sv[i] = float(data_sv[svbase + seg0 + i*32 + lane])*(1.0f/128.0f);
     }
     for (uint round = 0; round < W / STAGE_W; ++round) {
         if (warp / STAGE_W == round && has_rows) {
@@ -123,7 +144,7 @@ void main() {
             }
             subgroupMemoryBarrierShared();
             subgroupBarrier();
-            const uint nr = min(16u, p.rows - row0);
+            const uint nr = min(16u, row_e - row0);
             for (uint rr = 0; rr < nr; ++rr) {
                 float v[4];
                 [[unroll]] for (uint i = 0; i < 4; ++i) {
@@ -132,7 +153,11 @@ void main() {
                 exl3_fwht128(v, lane);
                 const float inv = data_inv[row0 + rr];
                 [[unroll]] for (uint i = 0; i < 4; ++i) {
+#ifdef ID
+                    data_d[data_ord[row0 + rr]*p.n + seg0 + i*32 + lane] = (v[i]*inv)*sv[i];
+#else
                     data_d[(row0 + rr)*p.n + seg0 + i*32 + lane] = (v[i]*inv)*sv[i];
+#endif
                 }
             }
         }

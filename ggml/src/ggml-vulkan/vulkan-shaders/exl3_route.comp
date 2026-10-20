@@ -1,0 +1,85 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// EXL3_MUL_MAT_ID routing on the device (one workgroup): the (slot, token) pairs p = slot + n_used*token grouped by
+// expert. ord[r] = pair of row r (rows of an expert are consecutive, experts in order; the order within an expert is
+// that of the atomics, which no row's arithmetic depends on). grp[g] = (expert, first row, rows), groups of up to
+// gsize rows of one expert, rows = 0 past the last group up to g_max. Also zeroes the dot kernel's arrival counters.
+
+#define MAX_E 1024
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_used;
+    uint n_tokens;
+    uint ids_s1;      // ids row stride in int32
+    uint n_exp;
+    uint gsize;
+    uint g_max;
+    uint n_counters;
+} p;
+
+layout(binding = 0) readonly buffer IDS  { int  data_ids[]; };
+layout(binding = 1) writeonly buffer ORD { uint data_ord[]; };
+layout(binding = 2) writeonly buffer GRP { uint data_grp[]; };
+layout(binding = 3) writeonly buffer CN  { uint data_c[]; };
+
+shared uint cnt[MAX_E];
+shared uint off[MAX_E];
+shared uint goff[MAX_E];
+shared uint n_groups;
+
+void main() {
+    const uint tid     = gl_LocalInvocationIndex;
+    const uint n_pairs = p.n_used*p.n_tokens;
+
+    for (uint i = tid; i < p.n_counters; i += 256) {
+        data_c[i] = 0;
+    }
+    for (uint e = tid; e < p.n_exp; e += 256) {
+        cnt[e] = 0;
+    }
+    barrier();
+    for (uint i = tid; i < n_pairs; i += 256) {
+        const uint e = uint(data_ids[(i / p.n_used)*p.ids_s1 + i % p.n_used]);
+        atomicAdd(cnt[e], 1);
+    }
+    barrier();
+    if (tid == 0) {
+        uint r = 0;
+        uint g = 0;
+        for (uint e = 0; e < p.n_exp; ++e) {
+            off[e]  = r;
+            goff[e] = g;
+            r += cnt[e];
+            g += (cnt[e] + p.gsize - 1) / p.gsize;
+        }
+        n_groups = g;
+    }
+    barrier();
+    for (uint e = tid; e < p.n_exp; e += 256) {
+        const uint c = cnt[e];
+        for (uint j = 0; j*p.gsize < c; ++j) {
+            const uint g = goff[e] + j;
+            data_grp[3*g]     = e;
+            data_grp[3*g + 1] = off[e] + j*p.gsize;
+            data_grp[3*g + 2] = min(p.gsize, c - j*p.gsize);
+        }
+    }
+    for (uint g = n_groups + tid; g < p.g_max; g += 256) {
+        data_grp[3*g]     = 0;
+        data_grp[3*g + 1] = 0;
+        data_grp[3*g + 2] = 0;
+    }
+    barrier();
+    for (uint e = tid; e < p.n_exp; e += 256) {
+        cnt[e] = 0;
+    }
+    barrier();
+    for (uint i = tid; i < n_pairs; i += 256) {
+        const uint e = uint(data_ids[(i / p.n_used)*p.ids_s1 + i % p.n_used]);
+        data_ord[off[e] + atomicAdd(cnt[e], 1)] = i;
+    }
+}

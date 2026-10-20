@@ -25,6 +25,7 @@ layout(push_constant) uniform parameter {
     uint k;
     uint n;
     uint rows;
+    uint tq_stride;   // ID: uint32 words of one expert's trellis
 } p;
 
 layout(binding = 0) readonly buffer TR { uint data_t[]; };
@@ -32,9 +33,22 @@ layout(binding = 1) readonly buffer XH { vec2 data_xh[]; };
 layout(binding = 2) readonly buffer SV { float16_t data_sv[]; };
 layout(binding = 3) coherent buffer D  { float data_d[]; };
 layout(binding = 4) coherent buffer CN { uint data_c[]; };
+#ifdef ID
+// ID: group g = (expert, first row, rows) of exl3_route.comp; row r of the scratch is pair ord[r] = its dst row
+layout(binding = 5) readonly buffer GRP { uint data_grp[]; };
+layout(binding = 6) readonly buffer ORD { uint data_ord[]; };
+#endif
 
 #define EXL3_FWHT
 #include "exl3_common.glsl"
+
+uint dst_row(const uint r) {
+#ifdef ID
+    return data_ord[r];
+#else
+    return r;
+#endif
+}
 
 shared float sh_red[NWARPS*T*M*16];
 shared uint  sh_old;
@@ -46,8 +60,21 @@ void main() {
     const uint tn      = p.n / 16;
     const uint tile_n0 = gl_WorkGroupID.x*T;
     const uint group   = gl_WorkGroupID.y;
-    const uint row0    = group*M;
+#ifdef ID
+    const uint e          = data_grp[3*group];
+    const uint row0       = data_grp[3*group + 1];
+    const uint rows_valid = data_grp[3*group + 2];
+    if (rows_valid == 0) {
+        return;
+    }
+    const uint tbase  = e*p.tq_stride;
+    const uint svbase = e*p.n;
+#else
+    const uint row0       = group*M;
     const uint rows_valid = min(M, p.rows - row0);
+    const uint tbase  = 0;
+    const uint svbase = 0;
+#endif
 
     const uint k_tiles = p.k / 16;
     const uint chunk   = (k_tiles + NWARPS - 1) / NWARPS;
@@ -70,7 +97,7 @@ void main() {
     for (uint kt = kb0; kt < kb1; ++kt) {
         f16vec2 f[T][4];
         [[unroll]] for (uint t = 0; t < T; ++t) {
-            exl3_lane_decode((kt*tn + tile_n0 + t)*EXL3_TILE_U32, lane, f[t]);
+            exl3_lane_decode(tbase + (kt*tn + tile_n0 + t)*EXL3_TILE_U32, lane, f[t]);
         }
         [[unroll]] for (uint r = 0; r < M; ++r) {
             const vec2 xa = data_xh[xrow[r] + kt*8];
@@ -119,7 +146,7 @@ void main() {
             for (uint w = 0; w < NWARPS; ++w) {
                 s += sh_red[(w*T*M + i)*16 + c];
             }
-            data_d[(row0 + r)*p.n + (tile_n0 + t)*16 + c] = s;
+            data_d[dst_row(row0 + r)*p.n + (tile_n0 + t)*16 + c] = s;
         }
     }
     memoryBarrierBuffer();
@@ -136,14 +163,14 @@ void main() {
     }
     memoryBarrierBuffer();
     for (uint r = warp; r < rows_valid; r += NWARPS) {
-        const uint base = (row0 + r)*p.n + seg*128;
+        const uint base = dst_row(row0 + r)*p.n + seg*128;
         float v[4];
         [[unroll]] for (uint i = 0; i < 4; ++i) {
             v[i] = data_d[base + i*32 + lane];
         }
         exl3_fwht128(v, lane);
         [[unroll]] for (uint i = 0; i < 4; ++i) {
-            data_d[base + i*32 + lane] = v[i]*(float(data_sv[seg*128 + i*32 + lane])*(1.0f/128.0f));
+            data_d[base + i*32 + lane] = v[i]*(float(data_sv[svbase + seg*128 + i*32 + lane])*(1.0f/128.0f));
         }
     }
 }

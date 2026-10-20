@@ -8,7 +8,7 @@
 
 // EXL3 input rotation, see ggml/exl3/README.md: xh[r] = H(x[r]*suh) per 128 block, f32, bit for bit the rotation of
 // ggml-cpu/exl3-ops.cpp. One wave32 per (row, 128 block). Also zeroes the dot kernel's arrival counters.
-// ID: row r is (slot, token) pair r with the suh of its expert (EXL3_MUL_MAT_ID).
+// ID: row r is (slot, token) pair ord[r] (exl3_route.comp) with the suh of its expert (EXL3_MUL_MAT_ID).
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -32,6 +32,7 @@ layout(binding = 2) writeonly buffer XH { float    data_xh[]; };
 layout(binding = 3) writeonly buffer CN { uint     data_c[];  };
 #ifdef ID
 layout(binding = 4) readonly buffer IDS { int      data_ids[]; };
+layout(binding = 5) readonly buffer ORD { uint     data_ord[]; };
 #endif
 
 void exl3_fwht128(inout float v[4], const uint lane) {
@@ -70,9 +71,10 @@ void main() {
     uint xb;
     uint sb = seg*128;
 #ifdef ID
-    // pair r = slot + n_used*token; x row (slot % ne1, token)
-    const uint slot = r % p.n_used;
-    const uint tok  = r / p.n_used;
+    // row r is pair ord[r] = slot + n_used*token; x row (slot % ne1, token)
+    const uint pr   = data_ord[r];
+    const uint slot = pr % p.n_used;
+    const uint tok  = pr / p.n_used;
     const int  e    = data_ids[tok*p.ids_s1 + slot];
     xb  = p.x_off + (slot % p.ne1)*p.s1 + tok*p.s2 + seg*128;
     sb += uint(e)*p.k;

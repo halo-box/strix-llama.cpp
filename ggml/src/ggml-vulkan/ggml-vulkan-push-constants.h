@@ -833,9 +833,15 @@ struct vk_op_exl3_rotate_split_push_constants {
     uint32_t zero, lo, n_used, ids_s1;
 };
 
-// exl3_mul_mat_vec.comp
+// exl3_mul_mat_vec.comp, exl3_mul_mm_cm1.comp; tq_stride: uint32 words of one expert's trellis (ID)
 struct vk_op_exl3_mmv_push_constants {
-    uint32_t k, n, rows;
+    uint32_t k, n, rows, tq_stride;
+};
+
+// exl3_route.comp
+struct vk_op_exl3_route_push_constants {
+    uint32_t n_used, n_tokens, ids_s1, n_exp;
+    uint32_t gsize, g_max, n_counters;
 };
 
 // gdn_chunk_prep.comp / gdn_chunk_scan.comp: the sequential kernel's constants plus the chunk count

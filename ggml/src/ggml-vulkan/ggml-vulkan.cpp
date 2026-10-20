@@ -5061,6 +5061,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             "main", 4, sizeof(vk_op_exl3_rotate_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
         ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate_split, "exl3_rotate_split_f32", exl3_rotate_split_f32_len,
             exl3_rotate_split_f32_data, "main", 5, sizeof(vk_op_exl3_rotate_split_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_exl3_route, "exl3_route_f32", exl3_route_f32_len, exl3_route_f32_data,
+            "main", 4, sizeof(vk_op_exl3_route_push_constants), {1, 1, 1}, {}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate_id, "exl3_rotate_id_f32", exl3_rotate_id_f32_len,
+            exl3_rotate_id_f32_data, "main", 6, sizeof(vk_op_exl3_rotate_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate_split_id, "exl3_rotate_split_id_f32", exl3_rotate_split_id_f32_len,
+            exl3_rotate_split_id_f32_data, "main", 7, sizeof(vk_op_exl3_rotate_split_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
         static const uint32_t exl3_m[4] = { 1, 2, 4, 8 };
         for (uint32_t ri = 0; ri < 11; ++ri) {
             const uint32_t ka   = ri < 8 ? ri + 1 : ri - 7;
@@ -5075,6 +5081,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline2(device, device->pipeline_exl3_mmv[ri][cb][mi], name, exl3_mul_mat_vec_f32_len,
                         exl3_mul_mat_vec_f32_data, "main", 5, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
                         {256, ka, half, cb, exl3_m[mi]}, 1, true, true, 32);
+                    ggml_vk_create_pipeline2(device, device->pipeline_exl3_mmv_id[ri][cb][mi], name + "_id", exl3_mul_mat_vec_id_f32_len,
+                        exl3_mul_mat_vec_id_f32_data, "main", 7, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                        {256, ka, half, cb, exl3_m[mi]}, 1, true, true, 32);
                 }
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 if (ggml_vk_exl3_device_cm1(device)) {
@@ -5083,6 +5092,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                                  "_p" + std::to_string(pi + 1);
                         ggml_vk_create_pipeline2(device, device->pipeline_exl3_mm[ri][cb][pi], name, exl3_mul_mm_cm1_len,
                             exl3_mul_mm_cm1_data, "main", 6, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                            {EXL3_MM_ROWS*2, ka, half, cb, pi + 1}, 1, true, true, 32);
+                        ggml_vk_create_pipeline2(device, device->pipeline_exl3_mm_id[ri][cb][pi], name + "_id", exl3_mul_mm_id_cm1_len,
+                            exl3_mul_mm_id_cm1_data, "main", 8, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
                             {EXL3_MM_ROWS*2, ka, half, cb, pi + 1}, 1, true, true, 32);
                     }
                 }
@@ -14160,11 +14172,134 @@ static void ggml_vk_exl3_mul_mm(ggml_backend_vk_context * ctx, vk_context & subc
         { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), hi_buf, lo_buf, inv_buf }, rpc, { rows_pad, 1, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
 
-    const vk_op_exl3_mmv_push_constants mpc = { k, n, rows };
+    const vk_op_exl3_mmv_push_constants mpc = { k, n, rows, 0 };
     ggml_vk_dispatch_pipeline(ctx, subctx, mm,
         { ggml_vk_tensor_subbuffer(ctx, trellis), hi_buf, lo_buf, inv_buf, ggml_vk_tensor_subbuffer(ctx, svh),
           ggml_vk_tensor_subbuffer(ctx, dst) },
         mpc, { n/128, row_blks, 1 });
+    ctx->prealloc_split_k_need_sync = true;
+}
+
+// EXL3_MUL_MAT_ID: x F32 [k, ne11, n_tokens], ids I32 [n_used, n_tokens], experts stacked in dim 3 of the trellis
+#define EXL3_MAX_EXPERTS 1024 // exl3_route.comp
+
+static bool ggml_vk_exl3_mul_mat_id_supports_op(const vk_device & device, const ggml_tensor * op) {
+    const ggml_tensor * trellis = op->src[0];
+    const ggml_tensor * x       = op->src[1];
+    const ggml_tensor * ids     = op->src[2];
+    const ggml_tensor * suh     = op->src[3];
+    const ggml_tensor * svh     = op->src[4];
+    const int           cb      = ggml_get_op_params_i32(op, 0);
+    static const bool disabled = [] { const char * e = getenv("GGML_VK_DISABLE_EXL3"); return e && atoi(e) != 0; }();
+    if (disabled || !ggml_vk_exl3_device_ok(device) || op->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+        x->nb[0] != sizeof(float) || x->nb[1] % sizeof(float) != 0 || x->nb[2] % sizeof(float) != 0 ||
+        ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0 ||
+        !ggml_is_contiguous(op) || !ggml_is_contiguous(trellis) || !ggml_is_contiguous(suh) || !ggml_is_contiguous(svh) ||
+        trellis->ne[3] > EXL3_MAX_EXPERTS || !ggml_exl3_rate_supported(trellis->ne[0], (ggml_exl3_codebook) cb)) {
+        return false;
+    }
+    return ggml_nelements(op) < INT32_MAX && ggml_nbytes(x) < UINT32_MAX && ggml_nelements(trellis) < INT32_MAX &&
+           (ggml_nelements(ids) + 128)*trellis->ne[2]*16 < INT32_MAX;
+}
+
+static void ggml_vk_exl3_mul_mat_id(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * trellis = dst->src[0];
+    const ggml_tensor * x       = dst->src[1];
+    const ggml_tensor * ids     = dst->src[2];
+    const ggml_tensor * suh     = dst->src[3];
+    const ggml_tensor * svh     = dst->src[4];
+    const int           cb      = ggml_get_op_params_i32(dst, 0);
+
+    const uint32_t n        = (uint32_t) trellis->ne[1]*16;
+    const uint32_t k        = (uint32_t) trellis->ne[2]*16;
+    const uint32_t n_exp    = (uint32_t) trellis->ne[3];
+    const uint32_t n_used   = (uint32_t) ids->ne[0];
+    const uint32_t n_tokens = (uint32_t) ids->ne[1];
+    const uint32_t n_pairs  = n_used*n_tokens;
+    const uint32_t tq_words = (uint32_t) (trellis->ne[0]*trellis->ne[1]*trellis->ne[2]/2);
+    const int      ri       = ggml_vk_exl3_rate_idx(trellis->ne[0]);
+
+    // the GEMM (groups of up to 128 rows of one expert) from 8 rows per expert on average, else the dot kernel in
+    // groups of up to 8 rows (one token: every pair is a group of one row, distinct experts)
+    const bool     gemm  = n_pairs > ggml_vk_exl3_dot_max_rows()*n_exp && ctx->device->pipeline_exl3_mm_id[ri][cb][0];
+    const uint32_t mi    = n_tokens == 1 ? 0 : 3;
+    const uint32_t gsize = gemm ? EXL3_MM_ROWS : 1u << mi;
+    const uint32_t g_max = n_pairs/gsize + std::min(n_exp, n_pairs);
+
+    // scratch: ord [n_pairs], grp [g_max][3], counters (dot), then the rotated rows (GEMM: 128 pad rows past n_pairs)
+    const uint32_t n_counters = gemm ? 0 : g_max*(n/128);
+    const size_t ord_size  = GGML_PAD((size_t) n_pairs*sizeof(uint32_t), 256);
+    const size_t grp_size  = GGML_PAD((size_t) g_max*3*sizeof(uint32_t), 256);
+    const size_t cn_size   = GGML_PAD((size_t) std::max(n_counters, 1u)*sizeof(uint32_t), 256);
+    const size_t head      = ord_size + grp_size + cn_size;
+    const uint32_t products = ggml_vk_exl3_gemm_products();
+    const uint32_t rows_pad = n_pairs + EXL3_MM_ROWS;
+    const size_t inv_size  = GGML_PAD((size_t) rows_pad*sizeof(float), 256);
+    const size_t h_size    = GGML_PAD((size_t) rows_pad*k*sizeof(ggml_fp16_t), 256);
+    const size_t xh_size   = (size_t) n_pairs*k*sizeof(float);
+    const size_t total     = head + (gemm ? inv_size + h_size*products : xh_size);
+    if (ctx->prealloc_size_split_k < total) {
+        ctx->prealloc_size_split_k = total;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    vk_pipeline route = ctx->device->pipeline_exl3_route;
+    vk_pipeline rot   = gemm ? ctx->device->pipeline_exl3_rotate_split_id : ctx->device->pipeline_exl3_rotate_id;
+    vk_pipeline mm    = gemm ? ctx->device->pipeline_exl3_mm_id[ri][cb][products - 1] : ctx->device->pipeline_exl3_mmv_id[ri][cb][mi];
+    GGML_ASSERT(route && rot && mm);
+    ggml_pipeline_request_descriptor_sets(ctx, route, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, rot, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, mm, 1);
+
+    vk_buffer    sb      = ctx->prealloc_split_k;
+    vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx, ids);
+    vk_subbuffer ord_buf = { sb, 0, ord_size };
+    vk_subbuffer grp_buf = { sb, ord_size, grp_size };
+    vk_subbuffer cn_buf  = { sb, ord_size + grp_size, cn_size };
+    vk_subbuffer x_buf   = ggml_vk_tensor_subbuffer(ctx, x, true);
+    const uint32_t x_off  = (uint32_t) ((x_buf.size - ggml_nbytes(x))/sizeof(float));
+    const uint32_t ids_s1 = (uint32_t) (ids->nb[1]/sizeof(int32_t));
+
+    const vk_op_exl3_route_push_constants rpc = { n_used, n_tokens, ids_s1, n_exp, gsize, g_max, n_counters };
+    ggml_vk_dispatch_pipeline(ctx, subctx, route, { ids_buf, ord_buf, grp_buf, cn_buf }, rpc, { 1, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_op_exl3_mmv_push_constants mpc = { k, n, n_pairs, tq_words };
+    if (gemm) {
+        vk_subbuffer inv_buf = { sb, head, inv_size };
+        vk_subbuffer hi_buf  = { sb, head + inv_size, h_size };
+        vk_subbuffer lo_buf  = products == 2 ? vk_subbuffer{ sb, head + inv_size + h_size, h_size } : hi_buf;
+        const vk_op_exl3_rotate_split_push_constants spc = {
+            k, n_pairs, (uint32_t) x->ne[1], 1,
+            (uint32_t) (x->nb[1]/sizeof(float)), (uint32_t) (x->nb[2]/sizeof(float)), 0, x_off,
+            0, products == 2 ? 1u : 0u, n_used, ids_s1,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, rot,
+            { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), hi_buf, lo_buf, inv_buf, ids_buf, ord_buf }, spc, { rows_pad, 1, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, mm,
+            { ggml_vk_tensor_subbuffer(ctx, trellis), hi_buf, lo_buf, inv_buf, ggml_vk_tensor_subbuffer(ctx, svh),
+              ggml_vk_tensor_subbuffer(ctx, dst), grp_buf, ord_buf },
+            mpc, { n/128, g_max, 1 });
+    } else {
+        vk_subbuffer xh_buf = { sb, head, xh_size };
+        const vk_op_exl3_rotate_push_constants xpc = {
+            k, n_pairs, (uint32_t) x->ne[1], 1,
+            (uint32_t) (x->nb[1]/sizeof(float)), (uint32_t) (x->nb[2]/sizeof(float)), 0, x_off,
+            0, n_used, ids_s1,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, rot,
+            { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), xh_buf, cn_buf, ids_buf, ord_buf }, xpc,
+            { std::max(1u, CEIL_DIV(n_pairs*(k/128), 8u)), 1, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, mm,
+            { ggml_vk_tensor_subbuffer(ctx, trellis), xh_buf, ggml_vk_tensor_subbuffer(ctx, svh),
+              ggml_vk_tensor_subbuffer(ctx, dst), cn_buf, grp_buf, ord_buf },
+            mpc, { n/32, g_max, 1 });
+    }
     ctx->prealloc_split_k_need_sync = true;
 }
 
@@ -14224,7 +14359,7 @@ static void ggml_vk_exl3_mul_mat(ggml_backend_vk_context * ctx, vk_context & sub
         { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), xh_buf, cn_buf }, rpc, { rot_wgs, 1, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
 
-    const vk_op_exl3_mmv_push_constants mpc = { k, n, rows };
+    const vk_op_exl3_mmv_push_constants mpc = { k, n, rows, 0 };
     ggml_vk_dispatch_pipeline(ctx, subctx, mmv,
         { ggml_vk_tensor_subbuffer(ctx, trellis), xh_buf, ggml_vk_tensor_subbuffer(ctx, svh), ggml_vk_tensor_subbuffer(ctx, dst), cn_buf },
         mpc, { n/32, n_groups, 1 });
@@ -17134,6 +17269,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 #if defined(GGML_USE_EXL3)
     case GGML_OP_EXL3_MUL_MAT:
         ggml_vk_exl3_mul_mat(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_EXL3_MUL_MAT_ID:
+        ggml_vk_exl3_mul_mat_id(ctx, compute_ctx, node);
 
         break;
 #endif
@@ -22966,6 +23105,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
 #if defined(GGML_USE_EXL3)
         case GGML_OP_EXL3_MUL_MAT:
             return ggml_vk_exl3_supports_op(device, op);
+        case GGML_OP_EXL3_MUL_MAT_ID:
+            return ggml_vk_exl3_mul_mat_id_supports_op(device, op);
 #endif
         case GGML_OP_GATED_DELTA_NET:
             {
