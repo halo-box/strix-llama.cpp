@@ -1056,6 +1056,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_gdn_chunk_prep, pipeline_gdn_chunk_scan;   // chunked prefill form
     vk_pipeline pipeline_coopmat_layout_check[2];  // wave32, wave64: RDNA3/RADV fragment layout probe (ggml_vk_check_coopmat_rdna3_layout)
     bool coopmat_rdna3_layout {};                   // the probe passed: the manual-fragment "_mf" and REG_A MUL_MAT_ID pipelines may be used
+    // EXL3 (GGML_EXL3): input rotation, dot kernel [rate][codebook][rows 1, 2, 4, 8]; rate: K = 1..8, then 1.5, 2.5, 3.5
+    vk_pipeline pipeline_exl3_rotate;
+    vk_pipeline pipeline_exl3_mmv[11][3][4];
     uint32_t gdn_chunk_scan_nsplit = 1;   // scan workgroups per value head
     // One pipeline per supported indexer head count; see LI_NH_VALUES.
     vk_pipeline pipeline_lightning_indexer_f16[LI_NH_COUNT];

@@ -819,6 +819,18 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+// exl3_rotate.comp: strides and offsets in floats
+struct vk_op_exl3_rotate_push_constants {
+    uint32_t k, rows, ne1, ne2;
+    uint32_t s1, s2, s3, x_off;
+    uint32_t n_counters, n_used, ids_s1;
+};
+
+// exl3_mul_mat_vec.comp
+struct vk_op_exl3_mmv_push_constants {
+    uint32_t k, n, rows;
+};
+
 // gdn_chunk_prep.comp / gdn_chunk_scan.comp: the sequential kernel's constants plus the chunk count
 struct vk_op_gdn_chunk_push_constants {
     vk_op_gated_delta_net_push_constants gdn;

@@ -1,6 +1,9 @@
 #include "ggml-vulkan-common.h"
 
 #include <atomic>
+#if defined(GGML_USE_EXL3)
+#include "../../exl3/exl3.h"
+#endif
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
     vk::PhysicalDeviceProperties props = device.getProperties();
@@ -1892,6 +1895,13 @@ static bool ggml_vk_router_f16h_rule(uint32_t n, uint32_t k) {
 // HC_DEFER: the attention-side HC combine of a qwen4exp prefill layer does not store its output when the only other reader is the
 // FFN-side MoE epilogue combine, which recomputes it from the same inputs with the same expression (a deferred residual update):
 // one 4 x n_embd f32 store per layer and token less, one n_embd f32 read more. Bit-identical.
+#if defined(GGML_USE_EXL3)
+// the EXL3 kernels are written for wave32 (pinned) with f16 arithmetic
+static bool ggml_vk_exl3_device_ok(const vk_device & device) {
+    return device->fp16 && device->subgroup_shuffle && device->subgroup_size_control && device->subgroup_require_full_support &&
+           device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size;
+}
+#endif
 
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
@@ -5035,6 +5045,31 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline2(device, device->pipeline_topk_moe[i][use_push], "topk_moe_f32_"+std::to_string(i), topk_moe_f32_len, topk_moe_f32_data, "main", 4, sizeof(vk_op_topk_moe_push_constants), {1, 1, 1}, {device->subgroup_size, 1u<<i, use_push}, 1, true, true, device->subgroup_size);
         }
     }
+
+#if defined(GGML_USE_EXL3)
+    // EXL3 linears: wave32 kernels (see ggml_vk_exl3_device_ok)
+    if (ggml_vk_exl3_device_ok(device)) {
+        ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate, "exl3_rotate_f32", exl3_rotate_f32_len, exl3_rotate_f32_data,
+            "main", 4, sizeof(vk_op_exl3_rotate_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+        static const uint32_t exl3_m[4] = { 1, 2, 4, 8 };
+        for (uint32_t ri = 0; ri < 11; ++ri) {
+            const uint32_t ka   = ri < 8 ? ri + 1 : ri - 7;
+            const uint32_t half = ri < 8 ? 0 : 1;
+            for (uint32_t cb = 0; cb < 3; ++cb) {
+                if (half && cb != 2) {
+                    continue;
+                }
+                for (uint32_t mi = 0; mi < 4; ++mi) {
+                    const std::string name = "exl3_mmv_k" + std::to_string(ka) + (half ? "h" : "") + "_cb" + std::to_string(cb) +
+                                             "_m" + std::to_string(exl3_m[mi]);
+                    ggml_vk_create_pipeline2(device, device->pipeline_exl3_mmv[ri][cb][mi], name, exl3_mul_mat_vec_f32_len,
+                        exl3_mul_mat_vec_f32_data, "main", 5, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                        {256, ka, half, cb, exl3_m[mi]}, 1, true, true, 32);
+                }
+            }
+        }
+    }
+#endif
 
     // Drop compile_mutex so other threads can walk while we compile.
     compile_lock.unlock();
@@ -14005,6 +14040,97 @@ static bool ggml_vk_gdn_chunk_ok(const ggml_backend_vk_context * ctx, const ggml
            k->nb[1] == q->nb[1] && k->nb[2] == q->nb[2] && k->nb[3] == q->nb[3] && v->ne[1] % q->ne[1] == 0;
 }
 
+#if defined(GGML_USE_EXL3)
+// EXL3 linear, see ggml/exl3/README.md: y = H(H(x*suh) W_hat) * svh/128
+
+// pipeline index of a rate: K = 1..8 -> 0..7, K = 1.5, 2.5, 3.5 -> 8..10
+static int ggml_vk_exl3_rate_idx(int64_t tile_words) {
+    if (tile_words % 16 == 0) {
+        return (int) (tile_words / 16) - 1;
+    }
+    return 8 + (int) (tile_words / 16) - 1;
+}
+
+static bool ggml_vk_exl3_supports_op(const vk_device & device, const ggml_tensor * op) {
+    const ggml_tensor * trellis = op->src[0];
+    const ggml_tensor * x       = op->src[1];
+    const ggml_tensor * suh     = op->src[2];
+    const ggml_tensor * svh     = op->src[3];
+    const int           cb      = ggml_get_op_params_i32(op, 0);
+    if (!ggml_vk_exl3_device_ok(device) || op->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+        x->nb[0] != sizeof(float) || !ggml_is_contiguous(op) || !ggml_is_contiguous(trellis) ||
+        !ggml_is_contiguous(suh) || !ggml_is_contiguous(svh) ||
+        !ggml_exl3_rate_supported(trellis->ne[0], (ggml_exl3_codebook) cb)) {
+        return false;
+    }
+    for (int i = 1; i < 4; ++i) {
+        if (x->nb[i] % sizeof(float) != 0) {
+            return false;
+        }
+    }
+    // 32-bit indexing in the shaders
+    return ggml_nelements(op) < INT32_MAX && ggml_nelements(x) < INT32_MAX && ggml_nbytes(x) < UINT32_MAX &&
+           ggml_nelements(trellis) < INT32_MAX;
+}
+
+static void ggml_vk_exl3_mul_mat(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * trellis = dst->src[0];
+    const ggml_tensor * x       = dst->src[1];
+    const ggml_tensor * suh     = dst->src[2];
+    const ggml_tensor * svh     = dst->src[3];
+    const int           cb      = ggml_get_op_params_i32(dst, 0);
+
+    const uint32_t n    = (uint32_t) trellis->ne[1]*16;
+    const uint32_t k    = (uint32_t) trellis->ne[2]*16;
+    const uint32_t rows = (uint32_t) ggml_nrows(x);
+    const int      ri   = ggml_vk_exl3_rate_idx(trellis->ne[0]);
+
+    // dot kernel: M rows per pass (1, 2, 4 or 8), more rows in groups of 8
+    const uint32_t mi       = rows <= 1 ? 0 : rows <= 2 ? 1 : rows <= 4 ? 2 : 3;
+    const uint32_t m        = 1u << mi;
+    const uint32_t n_groups = CEIL_DIV(rows, m);
+
+    // scratch: arrival counters, then xh (f32 [rows, k])
+    const uint32_t n_counters = n_groups*(n/128);
+    const size_t   xh_off     = GGML_PAD((size_t) n_counters*sizeof(uint32_t), 256);
+    const size_t   xh_size    = (size_t) rows*k*sizeof(float);
+    if (ctx->prealloc_size_split_k < xh_off + xh_size) {
+        ctx->prealloc_size_split_k = xh_off + xh_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    vk_pipeline rot = ctx->device->pipeline_exl3_rotate;
+    vk_pipeline mmv = ctx->device->pipeline_exl3_mmv[ri][cb][mi];
+    GGML_ASSERT(rot && mmv);
+    ggml_pipeline_request_descriptor_sets(ctx, rot, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, mmv, 1);
+
+    vk_subbuffer x_buf  = ggml_vk_tensor_subbuffer(ctx, x, true);
+    vk_subbuffer cn_buf = { ctx->prealloc_split_k, 0, xh_off };
+    vk_subbuffer xh_buf = { ctx->prealloc_split_k, xh_off, xh_size };
+
+    const vk_op_exl3_rotate_push_constants rpc = {
+        k, rows, (uint32_t) x->ne[1], (uint32_t) x->ne[2],
+        (uint32_t) (x->nb[1]/sizeof(float)), (uint32_t) (x->nb[2]/sizeof(float)), (uint32_t) (x->nb[3]/sizeof(float)),
+        (uint32_t) ((x_buf.size - ggml_nbytes(x))/sizeof(float)),
+        n_counters, 1, 0,
+    };
+    const uint32_t rot_wgs = std::max(1u, CEIL_DIV(rows*(k/128), 8u));
+    ggml_vk_dispatch_pipeline(ctx, subctx, rot,
+        { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), xh_buf, cn_buf }, rpc, { rot_wgs, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_op_exl3_mmv_push_constants mpc = { k, n, rows };
+    ggml_vk_dispatch_pipeline(ctx, subctx, mmv,
+        { ggml_vk_tensor_subbuffer(ctx, trellis), xh_buf, ggml_vk_tensor_subbuffer(ctx, svh), ggml_vk_tensor_subbuffer(ctx, dst), cn_buf },
+        mpc, { n/32, n_groups, 1 });
+    ctx->prealloc_split_k_need_sync = true;
+}
+#endif
+
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     // q/k l2 norms folded into the chunk prep (ggml_vk_gdn_qk_norm_prepass): read the raw views
     const auto qk_it = ctx->gdn_qk.find(dst);
@@ -16904,6 +17030,12 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+#if defined(GGML_USE_EXL3)
+    case GGML_OP_EXL3_MUL_MAT:
+        ggml_vk_exl3_mul_mat(ctx, compute_ctx, node);
+
+        break;
+#endif
     case GGML_OP_GATED_DELTA_NET:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
 
@@ -22730,6 +22862,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return true;
             }
+#if defined(GGML_USE_EXL3)
+        case GGML_OP_EXL3_MUL_MAT:
+            return ggml_vk_exl3_supports_op(device, op);
+#endif
         case GGML_OP_GATED_DELTA_NET:
             {
                 const uint32_t S_v = op->src[2]->ne[0];

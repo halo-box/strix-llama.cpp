@@ -1,0 +1,97 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// EXL3 input rotation, see ggml/exl3/README.md: xh[r] = H(x[r]*suh) per 128 block, f32, bit for bit the rotation of
+// ggml-cpu/exl3-ops.cpp. One wave32 per (row, 128 block). Also zeroes the dot kernel's arrival counters.
+// ID: row r is (slot, token) pair r with the suh of its expert (EXL3_MUL_MAT_ID).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint k;
+    uint rows;
+    uint ne1;
+    uint ne2;
+    uint s1;          // x strides in floats
+    uint s2;
+    uint s3;
+    uint x_off;       // x offset in floats from its binding
+    uint n_counters;
+    uint n_used;      // ID: slots per token
+    uint ids_s1;      // ID: ids row stride in int32
+} p;
+
+layout(binding = 0) readonly buffer X  { float     data_x[];  };
+layout(binding = 1) readonly buffer SU { float16_t data_su[]; };
+layout(binding = 2) writeonly buffer XH { float    data_xh[]; };
+layout(binding = 3) writeonly buffer CN { uint     data_c[];  };
+#ifdef ID
+layout(binding = 4) readonly buffer IDS { int      data_ids[]; };
+#endif
+
+void exl3_fwht128(inout float v[4], const uint lane) {
+    [[unroll]] for (uint h = 1; h < 32; h <<= 1) {
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            const float o = subgroupShuffleXor(v[i], h);
+            v[i] = (lane & h) != 0 ? o - v[i] : v[i] + o;
+        }
+    }
+    const float a0 = v[0] + v[1];
+    const float a1 = v[0] - v[1];
+    const float a2 = v[2] + v[3];
+    const float a3 = v[2] - v[3];
+    v[0] = a0 + a2;
+    v[1] = a1 + a3;
+    v[2] = a0 - a2;
+    v[3] = a1 - a3;
+}
+
+void main() {
+    const uint gid = gl_GlobalInvocationID.x;
+    const uint nth = gl_NumWorkGroups.x*256;
+    for (uint i = gid; i < p.n_counters; i += nth) {
+        data_c[i] = 0;
+    }
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint w    = gid / 32;
+    const uint segs = p.k / 128;
+    if (w >= p.rows*segs) {
+        return;
+    }
+    const uint r   = w / segs;
+    const uint seg = w % segs;
+
+    uint xb;
+    uint sb = seg*128;
+#ifdef ID
+    // pair r = slot + n_used*token; x row (slot % ne1, token)
+    const uint slot = r % p.n_used;
+    const uint tok  = r / p.n_used;
+    const int  e    = data_ids[tok*p.ids_s1 + slot];
+    xb  = p.x_off + (slot % p.ne1)*p.s1 + tok*p.s2 + seg*128;
+    sb += uint(e)*p.k;
+#else
+    const uint i1 = r % p.ne1;
+    const uint i2 = (r / p.ne1) % p.ne2;
+    const uint i3 = r / (p.ne1*p.ne2);
+    xb = p.x_off + i1*p.s1 + i2*p.s2 + i3*p.s3 + seg*128;
+#endif
+
+    float v[4];
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        // the product must not contract into the first butterfly
+        precise float t = data_x[xb + i*32 + lane]*float(data_su[sb + i*32 + lane]);
+        v[i] = t;
+    }
+    exl3_fwht128(v, lane);
+    const uint ob = r*p.k + seg*128;
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        data_xh[ob + i*32 + lane] = v[i];
+    }
+}

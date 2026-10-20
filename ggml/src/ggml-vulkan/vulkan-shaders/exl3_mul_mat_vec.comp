@@ -1,0 +1,149 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// EXL3 dot kernel (few rows), see ggml/exl3/README.md and the HIP dot kernel in ggml-cuda/exl3.cu (adapted from
+// exllamav3's RDNA GEMV, MIT). y = H(xh W_hat) * svh/128 with xh = H(x*suh) from exl3_rotate.comp.
+// A workgroup computes T = 2 adjacent 16-column tiles for M rows, its waves splitting K. Each lane decodes its 8 weights
+// of a tile in registers to the exact fp16 codebook values and multiplies them with the f32 activations (f32
+// accumulation). The last workgroup to finish a 128-column segment applies H and svh/128 to it (arrival counters,
+// zeroed by the rotation). Wave32 only (pipelines pinned to subgroup size 32).
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 4) const uint M = 8;
+
+#define T 2
+const uint NWARPS = BLOCK_SIZE / 32;
+
+layout(push_constant) uniform parameter {
+    uint k;
+    uint n;
+    uint rows;
+} p;
+
+layout(binding = 0) readonly buffer TR { uint data_t[]; };
+layout(binding = 1) readonly buffer XH { vec2 data_xh[]; };
+layout(binding = 2) readonly buffer SV { float16_t data_sv[]; };
+layout(binding = 3) coherent buffer D  { float data_d[]; };
+layout(binding = 4) coherent buffer CN { uint data_c[]; };
+
+#define EXL3_FWHT
+#include "exl3_common.glsl"
+
+shared float sh_red[NWARPS*T*M*16];
+shared uint  sh_old;
+
+void main() {
+    const uint lane    = gl_SubgroupInvocationID;
+    const uint warp    = gl_SubgroupID;
+    const uint tid     = gl_LocalInvocationIndex;
+    const uint tn      = p.n / 16;
+    const uint tile_n0 = gl_WorkGroupID.x*T;
+    const uint group   = gl_WorkGroupID.y;
+    const uint row0    = group*M;
+    const uint rows_valid = min(M, p.rows - row0);
+
+    const uint k_tiles = p.k / 16;
+    const uint chunk   = (k_tiles + NWARPS - 1) / NWARPS;
+    const uint kb0     = min(warp*chunk, k_tiles);
+    const uint kb1     = min(kb0 + chunk, k_tiles);
+
+    float acc_a[T*M];
+    float acc_b[T*M];
+    [[unroll]] for (uint i = 0; i < T*M; ++i) {
+        acc_a[i] = 0.0f;
+        acc_b[i] = 0.0f;
+    }
+
+    // xh as vec2: (x[r0], x[r0 + 1]) of a k-tile at kt*8 + (lane & 3), (x[r0 + 8], x[r0 + 9]) 4 further
+    uint xrow[M];
+    [[unroll]] for (uint r = 0; r < M; ++r) {
+        xrow[r] = (row0 + min(r, rows_valid - 1))*(p.k/2) + (lane & 3);
+    }
+
+    for (uint kt = kb0; kt < kb1; ++kt) {
+        f16vec2 f[T][4];
+        [[unroll]] for (uint t = 0; t < T; ++t) {
+            exl3_lane_decode((kt*tn + tile_n0 + t)*EXL3_TILE_U32, lane, f[t]);
+        }
+        [[unroll]] for (uint r = 0; r < M; ++r) {
+            const vec2 xa = data_xh[xrow[r] + kt*8];
+            const vec2 xb = data_xh[xrow[r] + kt*8 + 4];
+            [[unroll]] for (uint t = 0; t < T; ++t) {
+                float a = acc_a[t*M + r];
+                float b = acc_b[t*M + r];
+                a = fma(xa.x, float(f[t][0].x), a);
+                a = fma(xa.y, float(f[t][0].y), a);
+                a = fma(xb.x, float(f[t][1].x), a);
+                a = fma(xb.y, float(f[t][1].y), a);
+                b = fma(xa.x, float(f[t][2].x), b);
+                b = fma(xa.y, float(f[t][2].y), b);
+                b = fma(xb.x, float(f[t][3].x), b);
+                b = fma(xb.y, float(f[t][3].y), b);
+                acc_a[t*M + r] = a;
+                acc_b[t*M + r] = b;
+            }
+        }
+    }
+
+    // quad q holds the 16 tile rows of columns q (acc_a) and q + 8 (acc_b) between its four lanes
+    [[unroll]] for (uint i = 0; i < T*M; ++i) {
+        acc_a[i] += subgroupShuffleXor(acc_a[i], 1);
+        acc_a[i] += subgroupShuffleXor(acc_a[i], 2);
+        acc_b[i] += subgroupShuffleXor(acc_b[i], 1);
+        acc_b[i] += subgroupShuffleXor(acc_b[i], 2);
+    }
+    if ((lane & 3) == 0) {
+        const uint q = lane >> 2;
+        [[unroll]] for (uint i = 0; i < T*M; ++i) {
+            sh_red[(warp*T*M + i)*16 + q]     = acc_a[i];
+            sh_red[(warp*T*M + i)*16 + q + 8] = acc_b[i];
+        }
+    }
+    barrier();
+
+    // sum the waves, store y before the output rotation
+    for (uint e = tid; e < T*M*16; e += BLOCK_SIZE) {
+        const uint i = e / 16;
+        const uint c = e % 16;
+        const uint t = i / M;
+        const uint r = i % M;
+        if (r < rows_valid) {
+            float s = 0.0f;
+            for (uint w = 0; w < NWARPS; ++w) {
+                s += sh_red[(w*T*M + i)*16 + c];
+            }
+            data_d[(row0 + r)*p.n + (tile_n0 + t)*16 + c] = s;
+        }
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    // the last workgroup of the segment's 8 tiles rotates it
+    const uint seg = tile_n0 / 8;
+    if (tid == 0) {
+        sh_old = atomicAdd(data_c[group*(p.n/128) + seg], T);
+    }
+    barrier();
+    if (sh_old + T != 8) {
+        return;
+    }
+    memoryBarrierBuffer();
+    for (uint r = warp; r < rows_valid; r += NWARPS) {
+        const uint base = (row0 + r)*p.n + seg*128;
+        float v[4];
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            v[i] = data_d[base + i*32 + lane];
+        }
+        exl3_fwht128(v, lane);
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            data_d[base + i*32 + lane] = v[i]*(float(data_sv[seg*128 + i*32 + lane])*(1.0f/128.0f));
+        }
+    }
+}
