@@ -538,6 +538,8 @@ extern "C" {
     // Create a new model from GGUF metadata as well as a function to set the tensor data
     //   - tensors are created as GGML_TYPE_F32 by default,
     //     override by adding a tensor with the same name but a different name to the context
+    //   - if the tensors in the metadata have shapes, they are the complete tensor set of the model, as in a model file:
+    //     shapes are checked, a missing optional tensor stays missing and every tensor must be used
     LLAMA_API struct llama_model * llama_model_init_from_user(
                     struct gguf_context * metadata,
           llama_model_set_tensor_data_t   set_tensor_data,    // function to initialize tensor data with

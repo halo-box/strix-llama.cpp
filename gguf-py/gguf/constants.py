@@ -521,6 +521,15 @@ class Keys:
         INVERSE_WEIGHT_NAMES = "prism.hadamard.inverse_weight_names"
         GDN_V_GROUPED        = "prism.hadamard.gdn_v_grouped"
 
+    class Exl3:
+        VERSION             = "exl3.version"
+        CODEBOOK            = "exl3.codebook"
+        HADAMARD_SIZE       = "exl3.hadamard_size"
+        ROWS_VERSION        = "exl3.rows.version"
+        PERMUTATION         = "exl3.permutation"
+        PERMUTED_TENSORS    = "exl3.permuted_tensors"
+        SOURCE_QUANT_CONFIG = "exl3.source.quantization_config"
+
     class AgentionTrellis:
         STATE_BITS = "agention.trellis.state_bits"  # uint32; TQ2_T / TQK / TQP files must say 15
 
@@ -5276,6 +5285,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.LFM2MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT, # an untied head (EXL3 checkpoints store one)
         MODEL_TENSOR.SHORTCONV_CONV,
         MODEL_TENSOR.SHORTCONV_INPROJ,
         MODEL_TENSOR.SHORTCONV_OUTPROJ,

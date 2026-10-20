@@ -1359,6 +1359,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     load_hparams_hadamard(ml);
+    load_hparams_exl3(ml);
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
@@ -1874,6 +1875,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    load_tensors_exl3();
+
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
@@ -2365,6 +2368,109 @@ void llama_model_base::load_tensors_hadamard() {
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
 }
 
+// read and check the exl3.* metadata; create_tensor then takes "<name>.exl3_trellis/_suh/_svh" for "<name>.weight"
+void llama_model_base::load_hparams_exl3(llama_model_loader & ml) {
+    uint32_t version = 0;
+    if (!ml.get_key(LLM_KV_EXL3_VERSION, version, false)) {
+        return;
+    }
+    if (version != 1) {
+        throw std::runtime_error(format("unsupported exl3.version: %u", version));
+    }
+
+    std::string codebook;
+    uint32_t    hadamard_size = 0;
+    ml.get_key(LLM_KV_EXL3_CODEBOOK, codebook);
+    ml.get_key(LLM_KV_EXL3_HADAMARD_SIZE, hadamard_size);
+    if (hadamard_size != 128) {
+        throw std::runtime_error(format("unsupported exl3.hadamard_size: %u", hadamard_size));
+    }
+    // row-ring tables (token embeddings) have their own layout version
+    uint32_t rows_version = 0;
+    if (ml.get_key(LLM_KV_EXL3_ROWS_VERSION, rows_version, false) && rows_version != 1) {
+        throw std::runtime_error(format("unsupported exl3.rows.version: %u", rows_version));
+    }
+    static const char * codebooks[] = { "3inst", "mcg", "mul1" };
+    for (int i = 0; i < 3; i++) {
+        if (codebook == codebooks[i]) {
+            hparams.exl3_codebook = i;
+        }
+    }
+    if (hparams.exl3_codebook < 0) {
+        throw std::runtime_error(format("unknown exl3.codebook: %s", codebook.c_str()));
+    }
+
+    // a smallest linear (k = n = 128, K = 4): some device must support the op
+    {
+        ggml_init_params params = { ggml_tensor_overhead()*8, NULL, true };
+        ggml_context_ptr ctx_ptr { ggml_init(params) };
+        ggml_context * ctx = ctx_ptr.get();
+        ggml_tensor * op = ggml_exl3_mul_mat(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_I16, 64, 8, 8),
+                ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 1), ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 128),
+                ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 128), hparams.exl3_codebook);
+        bool supported = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            supported = supported || ggml_backend_dev_supports_op(ggml_backend_dev_get(i), op);
+        }
+        if (!supported) {
+            throw std::runtime_error("the model has EXL3 linears, but no backend of this build runs them (build with -DGGML_EXL3=ON)");
+        }
+    }
+
+    if (!hdmd.weight_blocks.empty() || !hdmd.inverse_blocks.empty()) {
+        throw std::runtime_error("EXL3 linears and prism.hadamard folded weights cannot be combined");
+    }
+
+    // only build_lora_mm(_id) makes the EXL3 ops: refuse archs whose graphs are not verified to use them for every linear
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_LFM2MOE:
+            break;
+        default:
+            throw std::runtime_error(format("exl3: arch '%s' is not verified to route all linears through build_lora_mm", llm_arch_name(arch)));
+    }
+}
+
+void llama_model_base::load_tensors_exl3() {
+    if (hparams.exl3_codebook < 0) {
+        return;
+    }
+
+    std::unordered_map<std::string, ggml_tensor *> by_name;
+    for (const auto & [name, t] : tensors_by_name) {
+        by_name.emplace(name, t);
+    }
+
+    const std::string suffix = ".exl3_trellis";
+    for (const auto & [name, t] : tensors_by_name) {
+        if (name.size() <= suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            continue;
+        }
+        const std::string base = name.substr(0, name.size() - suffix.size());
+        const auto su = by_name.find(base + ".exl3_suh");
+        const auto sv = by_name.find(base + ".exl3_svh");
+        if (su == by_name.end() || sv == by_name.end()) {
+            throw std::runtime_error(format("exl3: '%s' has no scales", name.c_str()));
+        }
+        exl3.linears.emplace(t, llama_exl3_linear { su->second, sv->second });
+    }
+
+    // row tables decode to the embedding width (only the token embedding is one)
+    const std::string suffix_rows = ".exl3r_trellis";
+    for (const auto & [name, t] : tensors_by_name) {
+        if (name.size() <= suffix_rows.size() || name.compare(name.size() - suffix_rows.size(), suffix_rows.size(), suffix_rows) != 0) {
+            continue;
+        }
+        const auto sg = by_name.find(name.substr(0, name.size() - suffix_rows.size()) + ".exl3r_signs");
+        if (sg == by_name.end() || t != tok_embd) {
+            throw std::runtime_error(format("exl3: '%s' has no signs or is not the token embedding", name.c_str()));
+        }
+        exl3.rows.emplace(t, llama_exl3_rows { sg->second, (int64_t) hparams.n_embd });
+    }
+
+    LLAMA_LOG_INFO("%s: %zu EXL3 linears, codebook %d, %zu row tables\n", __func__, exl3.linears.size(), hparams.exl3_codebook, exl3.rows.size());
+}
+
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = nullptr;
     if (tn.bid != -1) {
@@ -2785,8 +2891,9 @@ std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(in
         return nullptr;
     }
     // only the qwen35 and qwen35moe MTP graphs use the subset, and only when the MTP block scores with the model LM head
+    // the rows of an EXL3 head are not contiguous in its trellis
     if ((arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) || hparams.n_layer_nextn == 0 ||
-            layers[hparams.n_layer()].nextn.shared_head_head != nullptr) {
+            layers[hparams.n_layer()].nextn.shared_head_head != nullptr || exl3.linears.count(out)) {
         LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d ignored: not supported for this model\n", __func__, n_keep);
         return nullptr;
     }
@@ -4038,7 +4145,10 @@ llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader
         if (ml.get_weight(tn(trunk_probe, "weight", 0).str().c_str()) == nullptr) {
             trunk = TENSOR_NOT_REQUIRED;
         }
-        if (ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr) {
+        // an EXL3 eh_proj is stored as its trellis (llama_model_loader::create_tensor)
+        const std::string eh_proj = tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str();
+        if (ml.get_weight(eh_proj.c_str()) == nullptr &&
+                ml.get_weight((eh_proj.substr(0, eh_proj.size() - strlen("weight")) + "exl3_trellis").c_str()) == nullptr) {
             mtp = TENSOR_NOT_REQUIRED;
         }
     }

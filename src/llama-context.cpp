@@ -111,6 +111,27 @@ static void llama_verify_hadamard_graph(
     }
 }
 
+// check that only EXL3_MUL_MAT(_ID) reads an EXL3 trellis and only EXL3_GET_ROWS an EXL3 row table: any other op would
+// take them for a weight
+static void llama_verify_exl3_graph(ggml_cgraph * gf, const llama_exl3 & exl3) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] && exl3.linears.count(node->src[s]) &&
+                    ((node->op != GGML_OP_EXL3_MUL_MAT && node->op != GGML_OP_EXL3_MUL_MAT_ID) || s != 0)) {
+                throw std::runtime_error(format(
+                    "EXL3 weight '%s' is consumed by %s; this graph's matmul path does not support EXL3 weights",
+                    node->src[s]->name, ggml_op_name(node->op)));
+            }
+            if (node->src[s] && exl3.rows.count(node->src[s]) && (node->op != GGML_OP_EXL3_GET_ROWS || s != 0)) {
+                throw std::runtime_error(format(
+                    "EXL3 row table '%s' is consumed by %s; this graph's embedding path does not support EXL3 row tables",
+                    node->src[s]->name, ggml_op_name(node->op)));
+            }
+        }
+    }
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -2731,6 +2752,10 @@ ggml_cgraph * llama_context::graph_reserve(
         llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
         hadamard_verified = true;
     }
+    if (!exl3_verified && gf && (!model.exl3.linears.empty() || !model.exl3.rows.empty())) {
+        llama_verify_exl3_graph(gf, model.exl3);
+        exl3_verified = true;
+    }
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
@@ -2771,6 +2796,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.exl3        =*/ model.exl3.linears.empty() && model.exl3.rows.empty() ? nullptr : &model.exl3,
         /*.samplers    =*/ sampling.samplers,
         /*.mtp_draft   =*/ mtp_draft.get(),
         /*.n_outputs   =*/ n_outputs,

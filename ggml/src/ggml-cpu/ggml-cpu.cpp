@@ -6,6 +6,10 @@
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
+#ifdef GGML_USE_EXL3
+#include "exl3-ops.h"
+#endif
+
 #include <cctype>
 #include <string>
 #include <vector>
@@ -492,6 +496,24 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_EXL3_MUL_MAT:
+#ifdef GGML_USE_EXL3
+            return ggml_cpu_exl3_supports_op(op);
+#else
+            return false;
+#endif
+        case GGML_OP_EXL3_GET_ROWS:
+#ifdef GGML_USE_EXL3
+            return ggml_cpu_exl3_get_rows_supports_op(op);
+#else
+            return false;
+#endif
+        case GGML_OP_EXL3_MUL_MAT_ID:
+#ifdef GGML_USE_EXL3
+            return ggml_cpu_exl3_mul_mat_id_supports_op(op);
+#else
+            return false;
+#endif
         default:
             return true;
     }

@@ -435,6 +435,9 @@ private:
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
 
+    // true after the EXL3 coverage check passes on a reserved graph
+    bool exl3_verified = false;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

@@ -910,6 +910,18 @@ void process_shaders() {
     string_to_spv("gdn_chunk_scan_f32", "gdn_chunk_scan.comp", {});
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
 #endif
+    // EXL3 linears (codebook, rate and rows are specialization constants)
+    string_to_spv("exl3_rotate_f32", "exl3_rotate.comp", {});
+    string_to_spv("exl3_mul_mat_vec_f32", "exl3_mul_mat_vec.comp", {});
+    string_to_spv("exl3_rotate_split_f32", "exl3_rotate_split.comp", {});
+    string_to_spv("exl3_route_f32", "exl3_route.comp", {});
+    string_to_spv("exl3_rotate_id_f32", "exl3_rotate.comp", {{"ID", "1"}});
+    string_to_spv("exl3_mul_mat_vec_id_f32", "exl3_mul_mat_vec.comp", {{"ID", "1"}});
+    string_to_spv("exl3_rotate_split_id_f32", "exl3_rotate_split.comp", {{"ID", "1"}});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("exl3_mul_mm", "exl3_mul_mm_cm1.comp", {}, true, true);
+    string_to_spv("exl3_mul_mm_id", "exl3_mul_mm_cm1.comp", {{"ID", "1"}}, true, true);
+#endif
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
     string_to_spv("flash_attn_sel_f16", "flash_attn_sel.comp", {});
     string_to_spv("flash_attn_sel_prep", "flash_attn_sel_prep.comp", {});
