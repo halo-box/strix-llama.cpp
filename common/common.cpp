@@ -2545,13 +2545,9 @@ bool common_prompt_checkpoint::load_tgt(
     if (file) {
         std::vector<uint8_t> buf(file_size_tgt);
         if (!copy_tgt(buf.data())) {
-            GGML_ABORT("failed to read a context checkpoint back from its file\n");
+            return false;
         }
-        const size_t n = llama_state_seq_set_data_ext(ctx, buf.data(), buf.size(), seq_id, flags);
-        if (n != buf.size()) {
-            GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", buf.size(), n);
-        }
-        return;
+        return llama_state_seq_set_data_ext(ctx, buf.data(), buf.size(), seq_id, flags) == buf.size();
     }
 
     if (data_tgt.empty()) {
@@ -2573,13 +2569,9 @@ bool common_prompt_checkpoint::load_dft(
     if (file && file_size_dft > 0) {
         std::vector<uint8_t> buf(file_size_dft);
         if (!copy_dft(buf.data())) {
-            GGML_ABORT("failed to read a context checkpoint back from its file\n");
+            return false;
         }
-        const size_t n = llama_state_seq_set_data_ext(ctx, buf.data(), buf.size(), seq_id, flags);
-        if (n != buf.size()) {
-            GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", buf.size(), n);
-        }
-        return;
+        return llama_state_seq_set_data_ext(ctx, buf.data(), buf.size(), seq_id, flags) == buf.size();
     }
 
     if (data_dft.empty()) {
