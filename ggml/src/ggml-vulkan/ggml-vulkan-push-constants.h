@@ -826,6 +826,13 @@ struct vk_op_exl3_rotate_push_constants {
     uint32_t n_counters, n_used, ids_s1;
 };
 
+// exl3_rotate_split.comp: strides and offsets in floats
+struct vk_op_exl3_rotate_split_push_constants {
+    uint32_t k, rows, ne1, ne2;
+    uint32_t s1, s2, s3, x_off;
+    uint32_t zero, lo, n_used, ids_s1;
+};
+
 // exl3_mul_mat_vec.comp
 struct vk_op_exl3_mmv_push_constants {
     uint32_t k, n, rows;

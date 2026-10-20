@@ -1,0 +1,141 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+
+// EXL3 GEMM (prefill), see ggml/exl3/README.md and exl3_gemm_kernel in ggml-cuda/exl3.cu.
+// y = H(xh W_hat) * svh/128 for BM = 128 output columns (one Hadamard segment) and BN = 16*W rows per workgroup
+// (W wave32). Per k step of 32 the waves decode the 2 x 8 tiles of W_hat into LDS as f16 [column][k] (exact values);
+// each wave multiplies its 16 rows of xh (f16, scaled per row by exl3_rotate_split.comp) with them, KHR coopmat
+// 16x16x16, f32 accumulation. P = 2: xh = hi + lo, two products per k-tile summed from zero, then added in f32.
+// The 16 x 128 result of a wave goes through LDS for the output Hadamard, the row's 1/s and svh/128.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 4) const uint P = 1;
+
+const uint W  = BLOCK_SIZE / 32;
+const uint BN = 16*W;
+const uint LS = 20;          // LDS column stride of W_hat in uint (f16 pairs: 32 k + 8 pad halves)
+const uint SO = 132;         // LDS row stride of the output stage in floats
+const uint STAGE_W = 2;      // waves per output stage round
+const uint WBUF = 128*LS;    // one W_hat slab
+const uint SH_SIZE = max(2*WBUF, STAGE_W*16*SO);
+
+layout(push_constant) uniform parameter {
+    uint k;
+    uint n;
+    uint rows;
+} p;
+
+layout(binding = 0) readonly buffer TR  { uint data_t[]; };
+layout(binding = 1) readonly buffer XHI { float16_t data_hi[]; };
+layout(binding = 2) readonly buffer XLO { float16_t data_lo[]; };
+layout(binding = 3) readonly buffer INV { float data_inv[]; };
+layout(binding = 4) readonly buffer SV  { float16_t data_sv[]; };
+layout(binding = 5) writeonly buffer D  { float data_d[]; };
+
+#define EXL3_FWHT
+#include "exl3_common.glsl"
+
+// two W_hat slabs (double buffered: one barrier per k step), later the output stage
+shared uint sh[SH_SIZE];
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint warp = gl_SubgroupID;
+    const uint tn   = p.n / 16;
+    const uint seg  = gl_WorkGroupID.x;
+    const uint row0 = gl_WorkGroupID.y*BN + warp*16;  // the wave's 16 rows
+    const bool has_rows = row0 < p.rows;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[8];
+    [[unroll]] for (uint c = 0; c < 8; ++c) {
+        acc[c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0f);
+    }
+
+    // decode slots of this lane: (k-tile, column tile) items w, w + W, ... of the 16 per step
+    const uint r0 = (lane & 3)*2;
+    const uint c0 = lane >> 2;
+
+    const uint k_steps = p.k / 32;
+    for (uint ks = 0; ks < k_steps; ++ks) {
+        const uint wb = (ks & 1)*WBUF;
+        for (uint it = warp; it < 16; it += W) {
+            const uint kl = it >> 3;
+            const uint ct = it & 7;
+            f16vec2 f[4];
+            exl3_lane_decode(((ks*2 + kl)*tn + seg*8 + ct)*EXL3_TILE_U32, lane, f);
+            // column c: [k] pairs (r0, r0 + 1) and (r0 + 8, r0 + 9) of k-tile kl
+            const uint ba = wb + (ct*16 + c0)*LS + kl*8 + r0/2;
+            const uint bb = wb + (ct*16 + c0 + 8)*LS + kl*8 + r0/2;
+            sh[ba]     = packFloat2x16(f[0]);
+            sh[ba + 4] = packFloat2x16(f[1]);
+            sh[bb]     = packFloat2x16(f[2]);
+            sh[bb + 4] = packFloat2x16(f[3]);
+        }
+        barrier();
+        if (has_rows) {
+            [[unroll]] for (uint kl = 0; kl < 2; ++kl) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ah;
+                coopMatLoad(ah, data_hi, row0*p.k + ks*32 + kl*16, p.k, gl_CooperativeMatrixLayoutRowMajor);
+                if (P == 1) {
+                    [[unroll]] for (uint c = 0; c < 8; ++c) {
+                        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+                        coopMatLoad(b, sh, wb + c*16*LS + kl*8, LS, gl_CooperativeMatrixLayoutColumnMajor);
+                        acc[c] = coopMatMulAdd(ah, b, acc[c]);
+                    }
+                } else {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> al;
+                    coopMatLoad(al, data_lo, row0*p.k + ks*32 + kl*16, p.k, gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for (uint c = 0; c < 8; ++c) {
+                        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+                        coopMatLoad(b, sh, wb + c*16*LS + kl*8, LS, gl_CooperativeMatrixLayoutColumnMajor);
+                        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> t =
+                            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0f);
+                        t = coopMatMulAdd(al, b, t);
+                        t = coopMatMulAdd(ah, b, t);
+                        acc[c] = acc[c] + t;
+                    }
+                }
+            }
+        }
+    }
+    barrier();
+
+    // output: STAGE_W waves at a time through LDS, one row per pass, H then 1/s and svh/128
+    const uint seg0 = seg*128;
+    float sv[4];
+    [[unroll]] for (uint i = 0; i < 4; ++i) {
+        sv[i] = float(data_sv[seg0 + i*32 + lane])*(1.0f/128.0f);
+    }
+    for (uint round = 0; round < W / STAGE_W; ++round) {
+        if (warp / STAGE_W == round && has_rows) {
+            const uint wl = warp % STAGE_W;
+            [[unroll]] for (uint c = 0; c < 8; ++c) {
+                coopMatStore(acc[c], sh, wl*16*SO + c*16, SO, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            const uint nr = min(16u, p.rows - row0);
+            for (uint rr = 0; rr < nr; ++rr) {
+                float v[4];
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    v[i] = uintBitsToFloat(sh[(wl*16 + rr)*SO + i*32 + lane]);
+                }
+                exl3_fwht128(v, lane);
+                const float inv = data_inv[row0 + rr];
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    data_d[(row0 + rr)*p.n + seg0 + i*32 + lane] = (v[i]*inv)*sv[i];
+                }
+            }
+        }
+        barrier();
+    }
+}

@@ -1,0 +1,147 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// EXL3 input rotation for the GEMM path (exl3_mul_mm_cm1.comp), as exl3_rotate_split in ggml-cuda/exl3.cu:
+// xh = H(x*suh) per 128 block, then per row a power of two s with max|xh|*s in [2^14, 2^15) (s = 1 for a row without a
+// finite nonzero value): hi = f16(xh*s), lo = f16(xh*s - hi) (with p.lo), inv[r] = 1/s. Rows in [rows, rows_pad) are
+// written as zeros. One workgroup of 8 wave32 per row; the rotation runs twice (max, then the stores).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint k;
+    uint rows;
+    uint ne1;
+    uint ne2;
+    uint s1;          // x strides in floats
+    uint s2;
+    uint s3;
+    uint x_off;       // x offset in floats from its binding
+    uint zero;        // 0, opaque to the compiler: keeps the f16 round trip of lo
+    uint lo;          // 1: write lo
+    uint n_used;      // ID: slots per token
+    uint ids_s1;      // ID: ids row stride in int32
+} p;
+
+layout(binding = 0) readonly buffer X  { float     data_x[];  };
+layout(binding = 1) readonly buffer SU { float16_t data_su[]; };
+layout(binding = 2) writeonly buffer XHI { float16_t data_hi[]; };
+layout(binding = 3) writeonly buffer XLO { float16_t data_lo[]; };
+layout(binding = 4) writeonly buffer INV { float data_inv[]; };
+#ifdef ID
+layout(binding = 5) readonly buffer IDS { int data_ids[]; };
+layout(binding = 6) readonly buffer ORD { uint data_ord[]; };
+#endif
+
+shared float sh_max[8];
+
+void exl3_fwht128(inout float v[4], const uint lane) {
+    [[unroll]] for (uint h = 1; h < 32; h <<= 1) {
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            const float o = subgroupShuffleXor(v[i], h);
+            v[i] = (lane & h) != 0 ? o - v[i] : v[i] + o;
+        }
+    }
+    const float a0 = v[0] + v[1];
+    const float a1 = v[0] - v[1];
+    const float a2 = v[2] + v[3];
+    const float a3 = v[2] - v[3];
+    v[0] = a0 + a2;
+    v[1] = a1 + a3;
+    v[2] = a0 - a2;
+    v[3] = a1 - a3;
+}
+
+void main() {
+    const uint r    = gl_WorkGroupID.x;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint warp = gl_SubgroupID;
+    const uint segs = p.k / 128;
+    const uint ob   = r*p.k;
+
+    if (r >= p.rows) {
+        for (uint i = gl_LocalInvocationIndex; i < p.k; i += 256) {
+            data_hi[ob + i] = float16_t(0.0);
+            if (p.lo != 0) {
+                data_lo[ob + i] = float16_t(0.0);
+            }
+        }
+        if (gl_LocalInvocationIndex == 0) {
+            data_inv[r] = 0.0f;
+        }
+        return;
+    }
+
+    uint xb;
+    uint sb = 0;
+#ifdef ID
+    const uint pr   = data_ord[r];
+    const uint slot = pr % p.n_used;
+    const uint tok  = pr / p.n_used;
+    xb = p.x_off + (slot % p.ne1)*p.s1 + tok*p.s2;
+    sb = uint(data_ids[tok*p.ids_s1 + slot])*p.k;
+#else
+    const uint i1 = r % p.ne1;
+    const uint i2 = (r / p.ne1) % p.ne2;
+    const uint i3 = r / (p.ne1*p.ne2);
+    xb = p.x_off + i1*p.s1 + i2*p.s2 + i3*p.s3;
+#endif
+
+    float m = 0.0f;
+    for (uint seg = warp; seg < segs; seg += 8) {
+        float v[4];
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            precise float t = data_x[xb + seg*128 + i*32 + lane]*float(data_su[sb + seg*128 + i*32 + lane]);
+            v[i] = t;
+        }
+        exl3_fwht128(v, lane);
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            m = max(m, abs(v[i]));
+        }
+    }
+    m = subgroupMax(m);
+    if (lane == 0) {
+        sh_max[warp] = m;
+    }
+    barrier();
+    m = sh_max[0];
+    [[unroll]] for (uint w = 1; w < 8; ++w) {
+        m = max(m, sh_max[w]);
+    }
+    // m = f*2^e with f in [0.5, 1): m*2^(15 - e) is in [2^14, 2^15)
+    int sh = 0;
+    if (m > 0.0f && !isinf(m) && !isnan(m)) {
+        const int e = int((floatBitsToUint(m) >> 23) & 0xffu) - 126;
+        sh = clamp(15 - e, -126, 126);
+    }
+    const float sc = uintBitsToFloat(uint(127 + sh) << 23);
+
+    for (uint seg = warp; seg < segs; seg += 8) {
+        float v[4];
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            precise float t = data_x[xb + seg*128 + i*32 + lane]*float(data_su[sb + seg*128 + i*32 + lane]);
+            v[i] = t;
+        }
+        exl3_fwht128(v, lane);
+        [[unroll]] for (uint i = 0; i < 4; i += 2) {
+            const vec2 t = vec2(v[i]*sc, v[i + 1]*sc);
+            // the f16 values of hi, through an opaque bit pattern so that t - hi sees the rounded value
+            const f16vec2 h = unpackFloat2x16(packFloat2x16(f16vec2(t)) ^ p.zero);
+            data_hi[ob + seg*128 + i*32 + lane]       = h.x;
+            data_hi[ob + seg*128 + (i + 1)*32 + lane] = h.y;
+            if (p.lo != 0) {
+                data_lo[ob + seg*128 + i*32 + lane]       = float16_t(t.x - float(h.x));
+                data_lo[ob + seg*128 + (i + 1)*32 + lane] = float16_t(t.y - float(h.y));
+            }
+        }
+    }
+    if (gl_LocalInvocationIndex == 0) {
+        data_inv[r] = uintBitsToFloat(uint(127 - sh) << 23);
+    }
+}

@@ -994,6 +994,10 @@ void process_shaders() {
     // EXL3 linears (codebook, rate and rows are specialization constants)
     string_to_spv("exl3_rotate_f32", "exl3_rotate.comp", {});
     string_to_spv("exl3_mul_mat_vec_f32", "exl3_mul_mat_vec.comp", {});
+    string_to_spv("exl3_rotate_split_f32", "exl3_rotate_split.comp", {});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("exl3_mul_mm", "exl3_mul_mm_cm1.comp", {}, true, true);
+#endif
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
     string_to_spv("flash_attn_sel_f16", "flash_attn_sel.comp", {});
     string_to_spv("flash_attn_sel_prep", "flash_attn_sel_prep.comp", {});

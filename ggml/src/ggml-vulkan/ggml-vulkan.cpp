@@ -1901,6 +1901,14 @@ static bool ggml_vk_exl3_device_ok(const vk_device & device) {
     return device->fp16 && device->subgroup_shuffle && device->subgroup_size_control && device->subgroup_require_full_support &&
            device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size;
 }
+
+// the GEMM path: KHR coopmat 16x16x16 f16 x f16 -> f32 at wave32 (coopmat2 devices take it too)
+static bool ggml_vk_exl3_device_cm1(const vk_device & device) {
+    return ggml_vk_exl3_device_ok(device) && device->coopmat_support && device->coopmat_support_16x16x16_f32acc;
+}
+
+// GEMM workgroup: 8 wave32 of 16 rows x 128 columns (4 or 16 waves: slower on gfx1151, Qwen3.5-9B ffn shapes)
+#define EXL3_MM_ROWS 128u
 #endif
 
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
@@ -5051,6 +5059,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (ggml_vk_exl3_device_ok(device)) {
         ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate, "exl3_rotate_f32", exl3_rotate_f32_len, exl3_rotate_f32_data,
             "main", 4, sizeof(vk_op_exl3_rotate_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate_split, "exl3_rotate_split_f32", exl3_rotate_split_f32_len,
+            exl3_rotate_split_f32_data, "main", 5, sizeof(vk_op_exl3_rotate_split_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
         static const uint32_t exl3_m[4] = { 1, 2, 4, 8 };
         for (uint32_t ri = 0; ri < 11; ++ri) {
             const uint32_t ka   = ri < 8 ? ri + 1 : ri - 7;
@@ -5066,6 +5076,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         exl3_mul_mat_vec_f32_data, "main", 5, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
                         {256, ka, half, cb, exl3_m[mi]}, 1, true, true, 32);
                 }
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                if (ggml_vk_exl3_device_cm1(device)) {
+                    for (uint32_t pi = 0; pi < 2; ++pi) {
+                        const std::string name = "exl3_mm_k" + std::to_string(ka) + (half ? "h" : "") + "_cb" + std::to_string(cb) +
+                                                 "_p" + std::to_string(pi + 1);
+                        ggml_vk_create_pipeline2(device, device->pipeline_exl3_mm[ri][cb][pi], name, exl3_mul_mm_cm1_len,
+                            exl3_mul_mm_cm1_data, "main", 6, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                            {EXL3_MM_ROWS*2, ka, half, cb, pi + 1}, 1, true, true, 32);
+                    }
+                }
+#endif
             }
         }
     }
@@ -14057,7 +14078,9 @@ static bool ggml_vk_exl3_supports_op(const vk_device & device, const ggml_tensor
     const ggml_tensor * suh     = op->src[2];
     const ggml_tensor * svh     = op->src[3];
     const int           cb      = ggml_get_op_params_i32(op, 0);
-    if (!ggml_vk_exl3_device_ok(device) || op->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+    // GGML_VK_DISABLE_EXL3=1: leave the EXL3 ops to the CPU (A/B against the CPU path)
+    static const bool disabled = [] { const char * e = getenv("GGML_VK_DISABLE_EXL3"); return e && atoi(e) != 0; }();
+    if (disabled || !ggml_vk_exl3_device_ok(device) || op->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
         x->nb[0] != sizeof(float) || !ggml_is_contiguous(op) || !ggml_is_contiguous(trellis) ||
         !ggml_is_contiguous(suh) || !ggml_is_contiguous(svh) ||
         !ggml_exl3_rate_supported(trellis->ne[0], (ggml_exl3_codebook) cb)) {
@@ -14073,6 +14096,78 @@ static bool ggml_vk_exl3_supports_op(const vk_device & device, const ggml_tensor
            ggml_nelements(trellis) < INT32_MAX;
 }
 
+// rows up to this take the dot kernel, more the GEMM; GGML_VK_EXL3_DOT_MAX_ROWS (test knob)
+static uint32_t ggml_vk_exl3_dot_max_rows() {
+    static const uint32_t r = [] {
+        const char * e = getenv("GGML_VK_EXL3_DOT_MAX_ROWS");
+        return e ? (uint32_t) atoi(e) : 8u;
+    }();
+    return r;
+}
+
+// products of the GEMM: 1 (xh rounded to f16 once) or 2 (hi + lo); GGML_VK_EXL3_GEMM_PRODUCTS=1|2
+static uint32_t ggml_vk_exl3_gemm_products() {
+    static const uint32_t p = [] {
+        const char * e = getenv("GGML_VK_EXL3_GEMM_PRODUCTS");
+        return e && atoi(e) == 2 ? 2u : 1u;
+    }();
+    return p;
+}
+
+static void ggml_vk_exl3_mul_mm(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst, int ri, int cb) {
+    const ggml_tensor * trellis = dst->src[0];
+    const ggml_tensor * x       = dst->src[1];
+    const ggml_tensor * suh     = dst->src[2];
+    const ggml_tensor * svh     = dst->src[3];
+
+    const uint32_t n        = (uint32_t) trellis->ne[1]*16;
+    const uint32_t k        = (uint32_t) trellis->ne[2]*16;
+    const uint32_t rows     = (uint32_t) ggml_nrows(x);
+    const uint32_t products = ggml_vk_exl3_gemm_products();
+    const uint32_t row_blks = CEIL_DIV(rows, EXL3_MM_ROWS);
+    const uint32_t rows_pad = row_blks*EXL3_MM_ROWS;
+
+    // scratch: inv [rows_pad] f32, hi [rows_pad, k] f16, lo (two products)
+    const size_t inv_size = GGML_PAD((size_t) rows_pad*sizeof(float), 256);
+    const size_t h_size   = GGML_PAD((size_t) rows_pad*k*sizeof(ggml_fp16_t), 256);
+    const size_t total    = inv_size + h_size*products;
+    if (ctx->prealloc_size_split_k < total) {
+        ctx->prealloc_size_split_k = total;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    vk_pipeline rot = ctx->device->pipeline_exl3_rotate_split;
+    vk_pipeline mm  = ctx->device->pipeline_exl3_mm[ri][cb][products - 1];
+    GGML_ASSERT(rot && mm);
+    ggml_pipeline_request_descriptor_sets(ctx, rot, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, mm, 1);
+
+    vk_subbuffer x_buf   = ggml_vk_tensor_subbuffer(ctx, x, true);
+    vk_subbuffer inv_buf = { ctx->prealloc_split_k, 0, inv_size };
+    vk_subbuffer hi_buf  = { ctx->prealloc_split_k, inv_size, h_size };
+    vk_subbuffer lo_buf  = products == 2 ? vk_subbuffer{ ctx->prealloc_split_k, inv_size + h_size, h_size } : hi_buf;
+
+    const vk_op_exl3_rotate_split_push_constants rpc = {
+        k, rows, (uint32_t) x->ne[1], (uint32_t) x->ne[2],
+        (uint32_t) (x->nb[1]/sizeof(float)), (uint32_t) (x->nb[2]/sizeof(float)), (uint32_t) (x->nb[3]/sizeof(float)),
+        (uint32_t) ((x_buf.size - ggml_nbytes(x))/sizeof(float)),
+        0, products == 2 ? 1u : 0u, 1, 0,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, rot,
+        { x_buf, ggml_vk_tensor_subbuffer(ctx, suh), hi_buf, lo_buf, inv_buf }, rpc, { rows_pad, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_op_exl3_mmv_push_constants mpc = { k, n, rows };
+    ggml_vk_dispatch_pipeline(ctx, subctx, mm,
+        { ggml_vk_tensor_subbuffer(ctx, trellis), hi_buf, lo_buf, inv_buf, ggml_vk_tensor_subbuffer(ctx, svh),
+          ggml_vk_tensor_subbuffer(ctx, dst) },
+        mpc, { n/128, row_blks, 1 });
+    ctx->prealloc_split_k_need_sync = true;
+}
+
 static void ggml_vk_exl3_mul_mat(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
     const ggml_tensor * trellis = dst->src[0];
     const ggml_tensor * x       = dst->src[1];
@@ -14084,6 +14179,12 @@ static void ggml_vk_exl3_mul_mat(ggml_backend_vk_context * ctx, vk_context & sub
     const uint32_t k    = (uint32_t) trellis->ne[2]*16;
     const uint32_t rows = (uint32_t) ggml_nrows(x);
     const int      ri   = ggml_vk_exl3_rate_idx(trellis->ne[0]);
+
+    // more than 32 rows: the coopmat GEMM, if the device has it
+    if (rows > ggml_vk_exl3_dot_max_rows() && ctx->device->pipeline_exl3_mm[ri][cb][0]) {
+        ggml_vk_exl3_mul_mm(ctx, subctx, dst, ri, cb);
+        return;
+    }
 
     // dot kernel: M rows per pass (1, 2, 4 or 8), more rows in groups of 8
     const uint32_t mi       = rows <= 1 ? 0 : rows <= 2 ? 1 : rows <= 4 ? 2 : 3;

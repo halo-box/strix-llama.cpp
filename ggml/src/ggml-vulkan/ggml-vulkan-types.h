@@ -1059,6 +1059,9 @@ struct vk_device_struct {
     // EXL3 (GGML_EXL3): input rotation, dot kernel [rate][codebook][rows 1, 2, 4, 8]; rate: K = 1..8, then 1.5, 2.5, 3.5
     vk_pipeline pipeline_exl3_rotate;
     vk_pipeline pipeline_exl3_mmv[11][3][4];
+    // EXL3 prefill GEMM (KHR coopmat 16x16x16): rotation to scaled f16, GEMM [rate][codebook][products 1, 2]
+    vk_pipeline pipeline_exl3_rotate_split;
+    vk_pipeline pipeline_exl3_mm[11][3][2];
     uint32_t gdn_chunk_scan_nsplit = 1;   // scan workgroups per value head
     // One pipeline per supported indexer head count; see LI_NH_VALUES.
     vk_pipeline pipeline_lightning_indexer_f16[LI_NH_COUNT];

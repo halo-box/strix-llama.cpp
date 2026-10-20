@@ -769,10 +769,12 @@ void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m, size_t
 int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_GET_ROWS:
+        case GGML_OP_EXL3_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_EXL3_MUL_MAT_ID:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return op->ne[2];
