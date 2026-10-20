@@ -313,6 +313,9 @@ private:
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 
+    // llama_model::prefetch_begin state of this context's decodes
+    std::unique_ptr<llama_model_prefetch> prefetch;
+
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 

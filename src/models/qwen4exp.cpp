@@ -4,11 +4,13 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-ple-disk.h"
+#include "llama-ple-async.h"
 
 #include <algorithm>
 #include <numeric>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +24,19 @@
 // defined below, used by the graph constructor
 static bool    qwen4exp_last_attn_trim();
 static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream);
+
+// the PLE row gather of a batch, defined below set_input
+static void qwen4exp_ple_gather_sync(const llama_model_qwen4exp & pmodel, const int32_t * idx, size_t n_rows, float * dst);
+
+// a context's prefetch state: its ring of PLE rows gathered ahead
+struct qwen4exp_prefetch : public llama_model_prefetch {
+    llama_ple_async ring;
+    qwen4exp_prefetch(int64_t n_heads, int64_t dim, llama_ple_async::gather_fn fn) : ring(n_heads, dim, std::move(fn)) {}
+};
+
+static llama_ple_async * qwen4exp_ring(llama_model_prefetch * state) {
+    return state ? &static_cast<qwen4exp_prefetch *>(state)->ring : nullptr;
+}
 
 // [TAG_QWEN4_REIMPLEMENT]
 // TODO: this graph implementation is pending complete reimplementation - do not use it as a reference
@@ -249,7 +264,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         if (ple_on_disk && ple_w) {
             llama_ple_disk::params dp;
-            dp.direct_io = false; // page-cached, so qwen4exp_ple_prefetch's readahead advice can land
+            dp.direct_io = false; // page-cached, so qwen4exp_ple_advise's readahead advice can land
             if (const char * e = getenv("LLAMA_PLE_DIRECT")) { dp.direct_io = atoi(e) != 0; }
 
             ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
@@ -2091,6 +2106,7 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        ring = qwen4exp_ring(params.prefetch);
 
         const int64_t n_want = (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
 
@@ -2117,25 +2133,20 @@ public:
     // the predecessor tokens live in the attention KV cells (ext.tok)
     const llama_kv_cache_context * mctx;
 
+    // the context's ring of rows gathered ahead (prefetch_begin), nullptr = gather here
+    llama_ple_async * ring = nullptr;
+
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
 };
 
-// Prefetch hook, called once per llama_decode with the whole batch: the chunk-boundary stall is the PLE row gather
-// (hundreds of thousands of scattered ~90-byte reads with the GPU idle). The same row indices are computed here for
-// a contiguous single-sequence prefill and the page cache is warmed for them while the previous chunk is still on
-// the GPU. Advice only, so a wrong prediction (multiple sequences, an image batch) costs readahead and nothing else.
-void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * tokens, int32_t n_tokens) {
+// Page-cache advice (the LLAMA_PLE_ASYNC=0 path): the same row indices are computed for a contiguous single-sequence
+// prefill and posix_fadvise warms the page cache for them while the previous chunk is still on the GPU. Advice only,
+// so a wrong prediction (multiple sequences, an image batch) costs readahead and nothing else.
+static void qwen4exp_ple_advise(const llama_model_qwen4exp & pmodel, const llama_token * tokens, int32_t n_tokens) {
     if (!tokens || n_tokens < 4096) {
         return;
     }
-    // llama_context::decode calls this for every architecture, so the downcast below is only valid
-    // once the arch is known: on any other model it reads ple_disk out of an unrelated object and
-    // dereferences whatever that happens to hold.
-    if (model_base.arch != LLM_ARCH_QWEN4EXP) {
-        return;
-    }
-    const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model_base);
     if (!pmodel.ple_disk || !pmodel.ple_disk->page_cached()) {
         return;
     }
@@ -2180,6 +2191,249 @@ void qwen4exp_ple_prefetch(const llama_model & model_base, const llama_token * t
         }
         disk->prefetch(idx.data(), idx.size());
     }).detach();
+}
+
+// Called once per llama_decode with the whole batch: the chunk-boundary stall is the PLE row gather
+// (hundreds of thousands of scattered ~90-byte reads with the GPU idle, 100-130 ms per 2048-token ubatch warm, 550+
+// cold). The row indices are hashed here from the batch's own tokens and a worker thread gathers them in token order,
+// one ubatch ahead, into the context's ring (llama-ple-async.h) while the GPU runs the current ubatch. set_input still
+// derives every token's indices from the cache and takes a token's rows from the ring only when the two agree, so the
+// bytes are those of the synchronous gather; a token whose predecessors are not in the batch (the first n_gram-1 of a
+// continued sequence) or that sits in a batch of several sequences falls back to the synchronous gather.
+// LLAMA_PLE_ASYNC=0 restores the page-cache advice thread above.
+void llama_model_qwen4exp::prefetch_begin(std::unique_ptr<llama_model_prefetch> & state, const llama_batch & batch, uint32_t n_ubatch) const {
+    const auto & pmodel = *this;
+    static const bool async_on = [] { const char * e = getenv("LLAMA_PLE_ASYNC"); return e == nullptr || atoi(e) != 0; }();
+    if (!async_on) {
+        qwen4exp_ple_advise(pmodel, batch.token, batch.n_tokens);
+        return;
+    }
+    const auto & hp = pmodel.hparams;
+    const int64_t n_gram = hp.ple_ngram_size, n_heads = hp.ple_n_heads, per_gram = hp.ple_heads_per_ngram;
+    const int64_t eos    = hp.ple_eos_token_id;
+    const int64_t n      = batch.n_tokens;
+    if (n_heads <= 0 || n_gram < 2 || !batch.token || !batch.pos || !batch.seq_id || n < 16 || n_ubatch == 0) {
+        return;   // an embd (image) batch, or decode-sized: a few rows are cheaper than a thread
+    }
+    const ggml_tensor * tab = pmodel.per_layer_tok_embd;
+    const bool host = pmodel.ple_disk || (tab && tab->data && tab->buffer && ggml_backend_buffer_is_host(tab->buffer));
+    if (!host) {
+        return;   // the table lives on a device: the graph gathers it
+    }
+
+    // predecessor of each batch token at distance 1: the token of the same sequence at pos - 1, when it is in the
+    // batch before it (chained for distance 2.. below); -1 = not in the batch
+    std::vector<int32_t> prev(n, -1);
+    std::unordered_map<llama_seq_id, std::pair<llama_pos, int32_t>> last;
+    for (int64_t i = 0; i < n; ++i) {
+        if (batch.n_seq_id[i] != 1) {
+            continue;   // a shared token has an ambiguous history: set_input asserts on it anyway
+        }
+        const llama_seq_id seq = batch.seq_id[i][0];
+        auto it = last.find(seq);
+        if (it != last.end() && it->second.first + 1 == batch.pos[i]) {
+            prev[i] = it->second.second;
+        }
+        last[seq] = { batch.pos[i], (int32_t) i };
+    }
+
+    std::vector<int32_t> idx((size_t) n * n_heads, -1);
+    std::vector<int64_t> ctx(n_gram);
+    int64_t n_unknown = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        // same rule as set_input: an EOS in the window resets everything at or before it, a position before the
+        // sequence start reads as EOS, a predecessor that is only in the cache is unknown here
+        ctx[0] = batch.token[i];
+        bool cut = false, unknown = batch.n_seq_id[i] != 1;
+        int32_t j = i;
+        for (int64_t s = 1; s < n_gram && !unknown; ++s) {
+            j = j >= 0 ? prev[j] : -1;
+            llama_token t;
+            if (cut) {
+                t = LLAMA_TOKEN_NULL;
+            } else if (j >= 0) {
+                t = batch.token[j];
+            } else if (batch.pos[i] - s < 0) {
+                t = LLAMA_TOKEN_NULL;
+            } else {
+                unknown = true;
+                break;
+            }
+            cut = cut || t < 0 || t == eos;
+            ctx[s] = cut ? eos : t;
+        }
+        if (unknown) {
+            n_unknown++;
+            continue;
+        }
+        for (int64_t g = 2; g <= n_gram; ++g) {
+            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+            for (int64_t q = 1; q < g; ++q) {
+                mixed ^= (uint64_t) ctx[q] * hp.ple_layer_multipliers[q];
+            }
+            const int64_t base = (g - 2) * per_gram;
+            for (int64_t q = 0; q < per_gram; ++q) {
+                const int64_t h_i = base + q;
+                idx[(size_t) i * n_heads + h_i] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+            }
+        }
+    }
+    if (n_unknown == n) {
+        return;
+    }
+
+    if (!state) {
+        const llama_model_qwen4exp * pm = this;   // the state belongs to a context, which never outlives its model
+        state = std::make_unique<qwen4exp_prefetch>(n_heads, hp.ple_head_dim,
+                [pm](const int32_t * rows, size_t n_rows, float * dst) { qwen4exp_ple_gather_sync(*pm, rows, n_rows, dst); });
+    }
+    llama_ple_async * async = qwen4exp_ring(state.get());
+    static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
+    if (stats) {
+        LLAMA_LOG_INFO("ple_async: batch of %" PRId64 " tokens, %" PRId64 " unknown here, window %u\n", n, n_unknown, n_ubatch);
+    }
+    async->start(std::move(idx), n, (int64_t) n_ubatch);
+}
+
+// end of the llama_decode that started the ring: nothing of a batch outlives it (a later cache edit, slot switch or
+// rollback changes the predecessors, and a ring that never hits is a silent regression, not a wrong answer)
+void llama_model_qwen4exp::prefetch_end(llama_model_prefetch * state) const {
+    llama_ple_async * async = qwen4exp_ring(state);
+    if (async && async->active()) {
+        static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
+        if (stats) {
+            LLAMA_LOG_INFO("ple_async: totals %llu ubatches, %llu tokens from the ring, %llu gathered synchronously, %.1f ms waited\n",
+                    (unsigned long long) async->st_ubatches, (unsigned long long) async->st_hits,
+                    (unsigned long long) async->st_misses, async->st_wait_ms);
+        }
+        async->stop();
+    }
+}
+
+// Host-resident table (memory-mapped or loaded into RAM): dequantize rows idx[0..n_rows) into dst, laid out
+// [dim, n_rows], exactly as the CPU get_rows would (same to_float).
+//
+// The GPU idles while this runs (65536 rows for a 4096-token ubatch), so it is split over host threads:
+// phase 1 queues every page read at once (memory-mapped table, random rows: one madvise per row instead of
+// taking the faults one after another, ~0.2 ms each from NVMe), phase 2 dequantizes. Each row goes through
+// the same to_float as before, so the result is identical. LLAMA_PLE_HOST_THREADS=1 is the serial loop.
+static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * idx, size_t n_rows, float * dst_all) {
+    GGML_ASSERT(tab && tab->data);
+    const size_t  row_size = ggml_row_size(tab->type, tab->ne[0]);
+    const int64_t dim      = tab->ne[0];
+
+    const auto * traits = ggml_get_type_traits(tab->type);
+    GGML_ASSERT(tab->type == GGML_TYPE_F32 || traits->to_float != nullptr);
+
+    static const int n_thr_cfg = [] {
+        const char * e = getenv("LLAMA_PLE_HOST_THREADS");
+        const int hw = (int) std::max(1u, std::thread::hardware_concurrency());
+        return e ? std::max(1, atoi(e)) : std::min(32, hw);
+    }();
+    const int n_thr = (int) std::max<size_t>(1, std::min<size_t>((size_t) n_thr_cfg, n_rows / 1024));
+
+    // The first ubatch of a batch pays the whole gather (~120 ms for 32768 rows = 3 MB on Flash-Next, a latency
+    // cost, not bandwidth). On a warm page cache the per-row madvise(MADV_WILLNEED) pass is pure syscall overhead, so sample the
+    // residency of a few rows with mincore() and skip the advice when the table is warm; a cold table keeps it (that is where
+    // the parallel readahead pays, 550+ ms otherwise). LLAMA_PLE_ADVISE=1 always advises (the previous behaviour), 0 never, 2 adaptive.
+    static const int advise_mode = [] { const char * e = getenv("LLAMA_PLE_ADVISE"); return e ? atoi(e) : 2; }();
+    static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
+    const int64_t t0 = ggml_time_us();
+    bool do_advise = advise_mode != 0;
+    int resident = -1;
+#if defined(__linux__)   // macOS declares mincore with a char vector: there the table is always advised
+    if (advise_mode == 2 && n_rows >= 256) {
+        const long page = sysconf(_SC_PAGESIZE);
+        if (page > 0) {
+            const int n_s = 64;
+            resident = 0;
+            for (int k = 0; k < n_s; ++k) {
+                const size_t r = idx[(size_t) k * n_rows / n_s];
+                const uintptr_t a0 = ((uintptr_t) tab->data + r * row_size) & ~((uintptr_t) page - 1);
+                unsigned char vec = 0;
+                if (mincore((void *) a0, (size_t) page, &vec) == 0 && (vec & 1)) {
+                    resident++;
+                }
+            }
+            do_advise = resident < n_s - n_s / 16;   // under ~94% resident: treat the table as cold, keep the readahead
+        }
+    }
+#endif
+    auto advise = [&](size_t k0, size_t k1) {
+#if defined(__linux__) || defined(__APPLE__)
+        const long page = sysconf(_SC_PAGESIZE);
+        if (page <= 0) {
+            return;
+        }
+        const uintptr_t base = (uintptr_t) tab->data;
+        const uintptr_t mask = ~((uintptr_t) page - 1);
+        uintptr_t prev_page = 0;
+        for (size_t k = k0; k < k1; ++k) {
+            const int32_t   r  = idx[k];
+            const uintptr_t a0 = (base + (size_t) r * row_size) & mask;
+            const uintptr_t a1 = base + (size_t) r * row_size + row_size;
+            if (a0 != prev_page) {
+                madvise((void *) a0, a1 - a0, MADV_WILLNEED);
+                prev_page = a0;
+            }
+        }
+#else
+        GGML_UNUSED(k0); GGML_UNUSED(k1);
+#endif
+    };
+    auto dequant = [&](size_t k0, size_t k1) {
+        for (size_t k = k0; k < k1; ++k) {
+            const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
+            float *      dst = dst_all + k * (size_t) dim;
+            if (tab->type == GGML_TYPE_F32) {
+                memcpy(dst, src, dim * sizeof(float));
+            } else {
+                traits->to_float(src, dst, dim);
+            }
+        }
+    };
+    int64_t t_adv = t0;
+    if (n_thr <= 1) {
+        if (do_advise) {
+            advise(0, n_rows);
+        }
+        t_adv = ggml_time_us();
+        dequant(0, n_rows);
+    } else {
+        const size_t chunk = (n_rows + n_thr - 1) / n_thr;
+        for (int phase = do_advise ? 0 : 1; phase < 2; ++phase) {
+            std::vector<std::thread> workers;
+            workers.reserve(n_thr - 1);
+            for (int t = 1; t < n_thr; ++t) {
+                const size_t k0 = std::min(n_rows, (size_t) t * chunk), k1 = std::min(n_rows, k0 + chunk);
+                workers.emplace_back([&, k0, k1, phase] { if (phase == 0) { advise(k0, k1); } else { dequant(k0, k1); } });
+            }
+            if (phase == 0) { advise(0, std::min(n_rows, chunk)); } else { dequant(0, std::min(n_rows, chunk)); }
+            for (auto & w : workers) {
+                w.join();
+            }
+            if (phase == 0) {
+                t_adv = ggml_time_us();
+            }
+        }
+    }
+    if (stats) {
+        const int64_t t1 = ggml_time_us();
+        LLAMA_LOG_INFO("ple_gather(mmap): %zu rows, resident sample %d/64, advise %s %.1f ms, dequant %.1f ms, %d threads\n",
+                n_rows, resident, do_advise ? "on" : "off", (t_adv - t0) / 1000.0, (t1 - t_adv) / 1000.0, n_thr);
+    }
+}
+
+// the synchronous row gather for whichever host path the table uses; safe to call from the prefetch worker thread
+static void qwen4exp_ple_gather_sync(const llama_model_qwen4exp & pmodel, const int32_t * idx, size_t n_rows, float * dst) {
+    if (n_rows == 0) {
+        return;
+    }
+    if (pmodel.ple_disk) {
+        pmodel.ple_disk->gather(idx, n_rows, dst);
+        return;
+    }
+    qwen4exp_ple_host_gather(pmodel.per_layer_tok_embd, idx, n_rows, dst);
 }
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -2242,94 +2496,63 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    if (embd != nullptr && !pmodel.ple_disk) {
-        // host-resident table: dequantize the rows exactly as the CPU get_rows would (same to_float)
-        const ggml_tensor * tab = pmodel.per_layer_tok_embd;
-        GGML_ASSERT(tab && tab->data && rows == nullptr);
-        const size_t  row_size = ggml_row_size(tab->type, tab->ne[0]);
-        const int64_t dim      = tab->ne[0];
-        GGML_ASSERT(dim == hp.ple_head_dim);
-
-        const auto * traits = ggml_get_type_traits(tab->type);
-
-        GGML_ASSERT(tab->type == GGML_TYPE_F32 || traits->to_float != nullptr);
+    if (embd != nullptr) {
+        // host-gathered table (memory-mapped / in RAM, or the on-disk reader): the rows arrive as an F32 input.
+        // idx is exactly what the gathers want: one global row per (token, head), token-major, with
+        // ple_head_offsets folded in by the loop above.
+        GGML_ASSERT(rows == nullptr);
+        const int64_t dim = hp.ple_head_dim;
+        if (!pmodel.ple_disk) {
+            const ggml_tensor * tab = pmodel.per_layer_tok_embd;
+            GGML_ASSERT(tab && tab->data && tab->ne[0] == dim);
+        }
         embd_buf.resize(idx.size() * (size_t) dim);
 
-        // The GPU idles while this runs (65536 rows for a 4096-token ubatch), so it is split over host threads:
-        // phase 1 queues every page read at once (memory-mapped table, random rows: one madvise per row instead of
-        // taking the faults one after another, ~0.2 ms each from NVMe), phase 2 dequantizes. Each row goes through
-        // the same to_float as before, so the result is identical. LLAMA_PLE_HOST_THREADS=1 is the serial loop.
-        static const int n_thr_cfg = [] {
-            const char * e = getenv("LLAMA_PLE_HOST_THREADS");
-            const int hw = (int) std::max(1u, std::thread::hardware_concurrency());
-            return e ? std::max(1, atoi(e)) : std::min(32, hw);
-        }();
-        const size_t n_rows = idx.size();
-        const int    n_thr  = (int) std::max<size_t>(1, std::min<size_t>((size_t) n_thr_cfg, n_rows / 1024));
-        auto advise = [&](size_t k0, size_t k1) {
-#if defined(__linux__) || defined(__APPLE__)
-            const long page = sysconf(_SC_PAGESIZE);
-            if (page <= 0) {
-                return;
-            }
-            const uintptr_t base = (uintptr_t) tab->data;
-            const uintptr_t mask = ~((uintptr_t) page - 1);
-            uintptr_t prev_page = 0;
-            for (size_t k = k0; k < k1; ++k) {
-                const int32_t   r  = idx[k];
-                const uintptr_t a0 = (base + (size_t) r * row_size) & mask;
-                const uintptr_t a1 = base + (size_t) r * row_size + row_size;
-                if (a0 != prev_page) {
-                    madvise((void *) a0, a1 - a0, MADV_WILLNEED);
-                    prev_page = a0;
+        // the rows of this ubatch were gathered ahead of time on the context's worker thread (prefetch_begin);
+        // a token's rows are taken from the ring only when its indices match the ones just computed from the cache,
+        // everything else is gathered here as before.
+        static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
+        static const bool check = getenv("LLAMA_PLE_ASYNC_CHECK") != nullptr && atoi(getenv("LLAMA_PLE_ASYNC_CHECK")) != 0;
+        llama_ple_async * async = ring;
+        if (async && async->active()) {
+            const int64_t t0 = ggml_time_us();
+            std::vector<uint8_t> miss;
+            const int64_t hits = async->consume(idx.data(), n_tokens, embd_buf.data(), miss);
+            const int64_t t1 = ggml_time_us();
+            if (hits < n_tokens) {
+                std::vector<int32_t> idx_m;
+                std::vector<int64_t> tok_m;
+                idx_m.reserve((size_t) (n_tokens - hits) * n_heads);
+                for (int64_t i = 0; i < n_tokens; ++i) {
+                    if (miss[(size_t) i]) {
+                        tok_m.push_back(i);
+                        idx_m.insert(idx_m.end(), idx.begin() + i * n_heads, idx.begin() + (i + 1) * n_heads);
+                    }
+                }
+                std::vector<float> tmp(idx_m.size() * (size_t) dim);
+                qwen4exp_ple_gather_sync(pmodel, idx_m.data(), idx_m.size(), tmp.data());
+                for (size_t k = 0; k < tok_m.size(); ++k) {
+                    memcpy(embd_buf.data() + (size_t) tok_m[k] * n_heads * dim, tmp.data() + k * (size_t) n_heads * dim,
+                           (size_t) n_heads * dim * sizeof(float));
                 }
             }
-#else
-            GGML_UNUSED(k0); GGML_UNUSED(k1);
-#endif
-        };
-        auto dequant = [&](size_t k0, size_t k1) {
-            for (size_t k = k0; k < k1; ++k) {
-                const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
-                float *      dst = embd_buf.data() + k * (size_t) dim;
-                if (tab->type == GGML_TYPE_F32) {
-                    memcpy(dst, src, dim * sizeof(float));
-                } else {
-                    traits->to_float(src, dst, dim);
-                }
+            const int64_t t2 = ggml_time_us();
+            if (stats) {
+                LLAMA_LOG_INFO("ple_async: ubatch %" PRId64 " tokens, %" PRId64 " from the ring, %" PRId64 " gathered now | wait %.1f ms, fallback %.1f ms\n",
+                        n_tokens, hits, n_tokens - hits, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0);
             }
-        };
-        if (n_thr <= 1) {
-            advise(0, n_rows);
-            dequant(0, n_rows);
+            if (check) {
+                // LLAMA_PLE_ASYNC_CHECK=1: gather the whole ubatch synchronously as well and compare the bytes
+                std::vector<float> ref(embd_buf.size());
+                qwen4exp_ple_gather_sync(pmodel, idx.data(), idx.size(), ref.data());
+                const bool same = memcmp(ref.data(), embd_buf.data(), ref.size() * sizeof(float)) == 0;
+                LLAMA_LOG_INFO("ple_async check: ubatch %" PRId64 " tokens, %" PRId64 " from the ring: bytes %s the synchronous gather\n",
+                        n_tokens, hits, same ? "IDENTICAL to" : "DIFFER from");
+                GGML_ASSERT(same && "ple_async: ring rows differ from the synchronous gather");
+            }
         } else {
-            const size_t chunk = (n_rows + n_thr - 1) / n_thr;
-            for (int phase = 0; phase < 2; ++phase) {
-                std::vector<std::thread> workers;
-                workers.reserve(n_thr - 1);
-                for (int t = 1; t < n_thr; ++t) {
-                    const size_t k0 = std::min(n_rows, (size_t) t * chunk), k1 = std::min(n_rows, k0 + chunk);
-                    workers.emplace_back([&, k0, k1, phase] { if (phase == 0) { advise(k0, k1); } else { dequant(k0, k1); } });
-                }
-                if (phase == 0) { advise(0, std::min(n_rows, chunk)); } else { dequant(0, std::min(n_rows, chunk)); }
-                for (auto & w : workers) {
-                    w.join();
-                }
-            }
+            qwen4exp_ple_gather_sync(pmodel, idx.data(), idx.size(), embd_buf.data());
         }
-        ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
-        return;
-    }
-
-    if (pmodel.ple_disk) {
-        // idx is already exactly what the reader wants: one global row per (token, head),
-        // token-major, with ple_head_offsets folded in by the loop above. The previous
-        // version read it head-major and added the offset a second time, which is only
-        // correct for a table split per head -- on a joined per_layer_token_embd it walks
-        // past the end (rows beyond ple_rows) and gather() aborts.
-        GGML_ASSERT(embd != nullptr && rows == nullptr);
-        embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
-        pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
         return;
     }
@@ -2426,6 +2649,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
+    ple_inp->ring = qwen4exp_ring(prefetch);
 
     const auto & qmodel = static_cast<const llama_model_qwen4exp &>(model);
     ggml_tensor * rows = nullptr;
