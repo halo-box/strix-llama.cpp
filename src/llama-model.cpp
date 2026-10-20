@@ -2027,6 +2027,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    load_arch_tensors_post();
+
     return true;
 }
 

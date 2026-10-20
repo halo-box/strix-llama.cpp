@@ -900,6 +900,9 @@ struct llama_model {
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
+    // why this model cannot take the LoRA adapter, or nullptr when it can
+    virtual const char * lora_refusal(const llama_adapter_lora & /*adapter*/) const { return nullptr; }
+
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;
     virtual void load_vocab  (llama_model_loader & ml) = 0;
@@ -978,6 +981,9 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+
+    // runs once the weights hold their data (never under no_alloc): an arch's in-place rearrangement of its loaded weights
+    virtual void load_arch_tensors_post() {}
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

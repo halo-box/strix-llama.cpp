@@ -9995,6 +9995,110 @@ struct test_mul_mat_add : public test_case {
     }
 };
 
+// MUL_MAT with one column followed by a SCALE, which a backend may apply in the mat-vec's store (Vulkan: MUL_MAT_VEC_SCALE)
+struct test_mul_mat_vec_scale : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int64_t m;
+    const int64_t k;
+    const float s;
+    const float b;
+
+    test_mul_mat_vec_scale(ggml_type type_a, ggml_type type_b, int64_t m, int64_t k, float s, float b = 0.0f)
+        : type_a(type_a), type_b(type_b), m(m), k(k), s(s), b(b) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, type_b, m, k, s, b);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a   = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * x   = ggml_new_tensor_2d(ctx, type_b, k, 1);
+        ggml_tensor * mm  = ggml_mul_mat(ctx, a, x);
+        ggml_tensor * out = b != 0.0f ? ggml_scale_bias(ctx, mm, s, b) : ggml_scale(ctx, mm, s);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// qwen4exp's PLE tail with the conv history channels first: four row views of one padded buffer times the kernel columns,
+// SiLU, + gated value, + residual (Vulkan: PLE_CONV_SILU_ADD). The views are expanded first so the ten nodes are consecutive
+struct test_ple_conv_rows : public test_case {
+    const int64_t c;
+    const int64_t t;
+    const int64_t s;
+
+    test_ple_conv_rows(int64_t c, int64_t t, int64_t s) : c(c), t(t), s(s) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(c, t, s);
+    }
+
+    std::string op_desc(ggml_tensor * op) override {
+        GGML_UNUSED(op);
+        return "PLE_CONV_SILU_ADD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * x = ggml_get_first_tensor(ctx); x != nullptr; x = ggml_get_next_tensor(ctx, x)) {
+            if (x->op == GGML_OP_NONE) {
+                init_tensor_uniform(x);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_tap = 4, dil = 3, hist = (n_tap - 1) * dil;
+        ggml_tensor * p = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c, hist + t, s);
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_tap, c);
+        ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c, t, s);
+        ggml_tensor * h = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c, t, s);
+        ggml_set_name(p, "p");
+        ggml_set_name(w, "w");
+        ggml_set_name(g, "g");
+        ggml_set_name(h, "h");
+
+        // a computed padded buffer and kernel, as the model's concat and transpose are
+        ggml_tensor * pin  = ggml_scale(ctx, p, 1.0f);
+        ggml_tensor * w_cf = ggml_cont(ctx, ggml_transpose(ctx, w));
+        std::vector<ggml_tensor *> taps, wks;
+        for (int64_t k = 0; k < n_tap; ++k) {
+            const int64_t start = hist - (n_tap - 1 - k) * dil;
+            taps.push_back(ggml_view_3d(ctx, pin, c, t, s, pin->nb[1], pin->nb[2], start * pin->nb[1]));
+            wks.push_back(ggml_view_1d(ctx, w_cf, c, k * w_cf->nb[1]));
+            if (gf) {
+                ggml_build_forward_expand(gf, taps.back());
+                ggml_build_forward_expand(gf, wks.back());
+            }
+        }
+        ggml_tensor * conv = nullptr;
+        for (int64_t k = 0; k < n_tap; ++k) {
+            ggml_tensor * term = ggml_mul(ctx, taps[k], wks[k]);
+            conv = conv ? ggml_add(ctx, conv, term) : term;
+        }
+        ggml_tensor * out = ggml_add(ctx, h, ggml_add(ctx, g, ggml_silu(ctx, conv)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // MoE weighted reduction followed by the sigmoid-gated shared-expert merge (qwen4exp, Qwen3-Next, Qwen3.5-MoE):
 // out = reduction + shexp * sigmoid(gate_logit). The CUDA backend fuses the reduction and the merge into one kernel.
 // between = true puts the shared-expert GEMMs between them, as the model builders do; graph_optimize then moves the
@@ -12831,6 +12935,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ple_conv(type,257,256));
         test_cases.emplace_back(new test_ple_conv(type,10240,512));
     }
+
+    // MUL_MAT (one column) -> SCALE; the Vulkan fusion declines the scale_bias case, which still checks the unfused pair
+    test_cases.emplace_back(new test_mul_mat_vec_scale(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320,  2560, 0.25f));
+    test_cases.emplace_back(new test_mul_mat_vec_scale(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320,  2560, 0.3f));
+    test_cases.emplace_back(new test_mul_mat_vec_scale(GGML_TYPE_Q4_K, GGML_TYPE_F32, 640,  2560, 0.25f));
+    test_cases.emplace_back(new test_mul_mat_vec_scale(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4099, 512,  0.25f));
+    test_cases.emplace_back(new test_mul_mat_vec_scale(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320,  2560, 0.25f, 0.5f));
+    // the PLE tail on row views of a channels-first padded buffer: decode, a batch, two and three sequences, an odd width
+    test_cases.emplace_back(new test_ple_conv_rows(10240, 1,  1));
+    test_cases.emplace_back(new test_ple_conv_rows(10240, 7,  1));
+    test_cases.emplace_back(new test_ple_conv_rows(10240, 33, 2));
+    test_cases.emplace_back(new test_ple_conv_rows(1000,  5,  3));
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (int width : {1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129}) {

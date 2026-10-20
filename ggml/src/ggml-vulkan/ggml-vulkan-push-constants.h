@@ -44,6 +44,8 @@ struct vk_mat_vec_push_constants {
     uint32_t ne12;
     uint32_t broadcast2;
     uint32_t broadcast3;
+    float fuse_scale;   // MAT_VEC_FUSION_FLAGS_SCALE_PC
+    float fuse_bias;
 };
 
 struct vk_mat_vec_p021_push_constants {
@@ -674,6 +676,16 @@ struct vk_op_conv_transpose_1d_push_constants {
     uint32_t nb1;
 
     int32_t s0;
+};
+
+struct vk_op_ple_conv_push_constants {
+    uint32_t ne0, ne1, ne2;
+    uint32_t p_off, p_nb1, p_nb2;
+    uint32_t tap1, tap2, tap3;
+    uint32_t w_off, w_nb1;
+    uint32_t g_off, g_nb1, g_nb2;
+    uint32_t h_off, h_nb1, h_nb2;
+    uint32_t d_off, d_nb1, d_nb2;
 };
 
 struct vk_op_snake_push_constants {

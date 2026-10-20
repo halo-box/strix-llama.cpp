@@ -1,0 +1,50 @@
+#version 450
+
+#include "types.glsl"
+
+// PLE_CONV_SILU_ADD: d = h + (g + silu(((x0*w0 + x1*w1) + x2*w2) + x3*w3)), x_k = P[c, t + tap k], w_k = W[c + k * w_nb1], in the
+// unfused graph's order with every step rounded on its own (precise) and silu as unary.comp computes it, so it is bit-exact
+layout (binding = 0) readonly  buffer P {float data_p[];};
+layout (binding = 1) readonly  buffer W {float data_w[];};
+layout (binding = 2) readonly  buffer G {float data_g[];};
+layout (binding = 3) readonly  buffer H {float data_h[];};
+layout (binding = 4) writeonly buffer D {float data_d[];};
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint ne0; uint ne1; uint ne2;
+    uint p_off; uint p_nb1; uint p_nb2;
+    uint tap1; uint tap2; uint tap3;      // rows past tap 0
+    uint w_off; uint w_nb1;
+    uint g_off; uint g_nb1; uint g_nb2;
+    uint h_off; uint h_nb1; uint h_nb2;
+    uint d_off; uint d_nb1; uint d_nb2;
+} p;
+
+float op_silu(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint t = gl_GlobalInvocationID.y;
+    const uint s = gl_GlobalInvocationID.z;
+    if (c >= p.ne0 || t >= p.ne1 || s >= p.ne2) {
+        return;
+    }
+    const uint pi = p.p_off + s * p.p_nb2 + t * p.p_nb1 + c;
+    const uint wi = p.w_off + c;
+
+    precise float m0 = data_p[pi] * data_w[wi];
+    precise float m1 = data_p[pi + p.tap1 * p.p_nb1] * data_w[wi + p.w_nb1];
+    precise float a  = m0 + m1;
+    precise float m2 = data_p[pi + p.tap2 * p.p_nb1] * data_w[wi + 2 * p.w_nb1];
+    a = a + m2;
+    precise float m3 = data_p[pi + p.tap3 * p.p_nb1] * data_w[wi + 3 * p.w_nb1];
+    a = a + m3;
+    precise float si = op_silu(a);
+    precise float gs = data_g[p.g_off + s * p.g_nb2 + t * p.g_nb1 + c] + si;
+    precise float o  = data_h[p.h_off + s * p.h_nb2 + t * p.h_nb1 + c] + gs;
+    data_d[p.d_off + s * p.d_nb2 + t * p.d_nb1 + c] = o;
+}
