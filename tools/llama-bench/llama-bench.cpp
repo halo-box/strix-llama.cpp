@@ -1340,6 +1340,12 @@ struct cmd_params_instance {
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
+        // one sequence, and only the last token of each batch is output, so reserve one output row like the server does
+        // (the default sizes the worst-case graph for an output per token: n_ubatch x n_vocab floats of logits)
+        if (!embeddings) {
+            cparams.n_outputs_max = 1;
+        }
+
         return cparams;
     }
 };
