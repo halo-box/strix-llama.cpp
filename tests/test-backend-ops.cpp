@@ -5700,6 +5700,126 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// the DeepSeek-V4 hc boundary node for node as build_hc_pre emits it (src/models/deepseek4.cpp): the flat rms norm, the f32
+// mix GEMM, the pre and post gates, the fused comb, the hc pre and (norm) the next RMS_NORM + MUL. The post and comb are
+// expanded after a reader of the hc pre output, as the attention block sits between them in the model. Vulkan runs the
+// chain as HC_BOUNDARY(_NORM) (GGML_VK_FUSE_HC_BOUNDARY); GGML_VK_TEST_REQUIRE_HC_BOUNDARY=1 asserts it engages.
+struct test_dsv4_hc_boundary : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    norm;
+    std::vector<ggml_tensor *> verify;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_BOUNDARY";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, norm);
+    }
+
+    test_dsv4_hc_boundary(int64_t n_embd = 512, int64_t n_tokens = 3, bool norm = true)
+        : n_embd(n_embd), n_tokens(n_tokens), norm(norm) {}
+
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        const char * name = norm ? "HC_BOUNDARY_NORM" : "HC_BOUNDARY";
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_BOUNDARY", name)) {
+            return true;
+        }
+        const bool want = env_knob_on("GGML_VK_FUSE_HC_BOUNDARY");
+        const int64_t n = dispatch_census_count(backend, name);
+        if ((n > 0) != want) {
+            msg = std::string(name) + " dispatches: " + std::to_string(n) + (want ? " (expected some)" : " (expected none)");
+            return false;
+        }
+        return true;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const std::string name = ggml_get_name(t);
+            float lo = -1.0f;
+            float hi = 1.0f;
+            if (name == "hc_fn") {
+                // mixes of order one at any width, so the gates and the Sinkhorn do not saturate
+                hi = 2.0f / sqrtf((float) (hc * n_embd));
+                lo = -hi;
+            } else if (!tensor_range(name, lo, hi)) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::mt19937 rng(tensor_seed(t));
+            std::uniform_real_distribution<float> dist(lo, hi);
+            std::vector<float> data(ggml_nelements(t));
+            for (float & v : data) {
+                v = dist(rng);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        const float eps = 1e-6f;
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "residual");
+        ggml_set_input(x);
+        ggml_tensor * hc_fn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc*n_embd, (2 + hc)*hc);
+        ggml_set_name(hc_fn, "hc_fn");
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+        ggml_tensor * flat = ggml_reshape_2d(ctx, x, hc*n_embd, n_tokens);
+        ggml_tensor * mixes = ggml_mul_mat(ctx, hc_fn, ggml_rms_norm(ctx, flat, eps));
+
+        auto gate = [&](int64_t j) {
+            ggml_tensor * s = ggml_view_1d(ctx, scale, 1, j*sizeof(float));
+            ggml_tensor * b = ggml_view_1d(ctx, base, hc, j*hc*sizeof(float));
+            ggml_tensor * g = ggml_view_2d(ctx, mixes, hc, n_tokens, mixes->nb[1], j*hc*sizeof(float));
+            return ggml_sigmoid(ctx, ggml_add(ctx, ggml_mul(ctx, g, s), b));
+        };
+        ggml_tensor * pre  = ggml_scale_bias(ctx, gate(0), 1.0f, eps);
+        ggml_tensor * post = ggml_scale(ctx, gate(1), 2.0f);
+        ggml_tensor * comb = ggml_dsv4_hc_comb(ctx, mixes, scale, base, eps, 20);
+
+        ggml_tensor * cur = ggml_dsv4_hc_pre(ctx, x, pre);
+        if (norm) {
+            ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+            ggml_set_name(gamma, "gamma");
+            cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, eps), gamma);
+        }
+        ggml_set_name(cur, "cur");
+        if (gf) {
+            ggml_build_forward_expand(gf, cur);
+        }
+        // the attention block's stand-in, ahead of the post and comb in the node order
+        ggml_tensor * attn = ggml_scale(ctx, cur, 0.5f);
+        if (gf) {
+            ggml_build_forward_expand(gf, attn);
+            ggml_build_forward_expand(gf, post);
+            ggml_build_forward_expand(gf, comb);
+        }
+        verify = { cur, post, comb };
+        for (ggml_tensor * t : verify) {
+            ggml_set_output(t);
+        }
+        out = ggml_add(ctx, ggml_sum(ctx, attn), ggml_add(ctx, ggml_sum(ctx, post), ggml_sum(ctx, comb)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -13009,6 +13129,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    // the fused hc boundary: mat-vec (n_tokens <= 16) and tiled (256- and 1024-column splits) mix forms, every n_embd / 512
+    for (bool norm : { true, false }) {
+        for (int64_t n_tokens : { 1, 2, 16, 17, 130, 1029 }) {
+            test_cases.emplace_back(new test_dsv4_hc_boundary(4096, n_tokens, norm));
+        }
+        test_cases.emplace_back(new test_dsv4_hc_boundary(512, 3, norm));
+        test_cases.emplace_back(new test_dsv4_hc_boundary(1536, 70, norm));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

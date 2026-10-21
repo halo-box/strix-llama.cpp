@@ -1272,6 +1272,8 @@ void process_shaders() {
     string_to_spv("fwht_shmem_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
+    string_to_spv("dsv4_hc_mix_f32", "dsv4_hc_mix.comp", {});
+    string_to_spv("dsv4_hc_boundary_f32", "dsv4_hc_boundary.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_pre_x_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}});
     string_to_spv("dsv4_hc_pre_x_f16_g_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}, {"G_F16", "1"}});

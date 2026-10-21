@@ -185,6 +185,36 @@ struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_iter;
 };
 
+struct vk_op_dsv4_hc_mix_push_constants {
+    uint32_t K;
+    uint32_t n_tokens;
+    uint32_t nbw1;
+    uint32_t nbx1;
+    uint32_t kc;
+};
+
+struct vk_op_dsv4_hc_boundary_push_constants {
+    uint32_t K;
+    uint32_t n_embd;
+    uint32_t n_tokens;
+    uint32_t n_split;
+    uint32_t nbx1;
+    uint32_t nbs0;
+    uint32_t nbb0;
+    uint32_t nbpo1;
+    uint32_t nbc1; uint32_t nbc2;
+    uint32_t nbo1;
+    float eps_flat;
+    float pre_mul;
+    float pre_add;
+    float post_mul;
+    float post_add;
+    float comb_eps;
+    uint32_t comb_iters;
+    float out_scale;
+    float eps_norm;
+};
+
 struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;

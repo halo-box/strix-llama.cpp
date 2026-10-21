@@ -1,0 +1,191 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// Second half of the fused DeepSeek-V4 hc boundary (dsv4_hc_mix.comp writes the partial dots). One 512-thread workgroup
+// per token replaces, for that token:
+//
+//   flat_norm = RMS_NORM(x_flat)                     sum of squares in rms_norm.comp's order: the same scale
+//   mixes     = MUL_MAT(hc_fn, flat_norm)            the split partials summed, times that scale
+//   pre       = SCALE(SIGMOID(ADD(MUL(mixes[0:4], hc_scale[0]), hc_base[0:4])), 1, eps)
+//   post      = SCALE(SIGMOID(ADD(MUL(mixes[4:8], hc_scale[1]), hc_base[4:8])), 2, 0)           (written)
+//   comb      = DSV4_HC_COMB(mixes, hc_scale, hc_base)                                          (written)
+//   out       = DSV4_HC_PRE(x, pre)                                                             (written unless NORM)
+//   NORM: out = MUL(RMS_NORM(out), gamma)                                                       (written)
+//
+// Each step after the mixes repeats the arithmetic of the kernel the unfused node runs: the affine as separate roundings
+// (precise), unary.comp's sigmoid, scale.comp's multiply-add, the shared Sinkhorn, dsv4_hc_pre.comp's fma chain and
+// rms_norm.comp's reduction. Only the mixes differ from the unfused graph (the norm scale applied after the dot product,
+// and the dot product's own order).
+
+layout(constant_id = 0) const bool NORM  = false;
+layout(constant_id = 1) const uint N_OUT = 8;   // n_embd / 512 (1..8): the columns each thread owns per stream
+
+#define BLOCK_SIZE 512
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint K;           // flat row length, hc * n_embd = hc * 512 * N_OUT
+    uint n_embd;      // 512 * N_OUT
+    uint n_tokens;
+    uint n_split;
+
+    uint nbx1;        // x token stride (elements)
+    uint nbs0;        // hc_scale element stride
+    uint nbb0;        // hc_base element stride
+    uint nbpo1;       // post token stride
+    uint nbc1; uint nbc2;   // comb strides (isrc, token); idst is unit stride
+    uint nbo1;        // out token stride
+
+    float eps_flat;   // the flat RMS_NORM's eps
+    float pre_mul;    // the pre SCALE: x * pre_mul + pre_add
+    float pre_add;
+    float post_mul;   // the post SCALE
+    float post_add;
+    float comb_eps;
+    uint  comb_iters;
+    float out_scale;  // DSV4_HC_PRE's scale
+    float eps_norm;   // NORM: the following RMS_NORM's eps
+};
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer P { float data_p[]; };
+layout(binding = 2, std430) readonly buffer S { float data_s[]; };
+layout(binding = 3, std430) readonly buffer B { float data_b[]; };
+layout(binding = 4, std430) readonly buffer G { float data_g[]; };
+layout(binding = 5, std430) writeonly buffer DP { float data_post[]; };
+layout(binding = 6, std430) writeonly buffer DC { float data_comb[]; };
+layout(binding = 7, std430) writeonly buffer DO { float data_out[]; };
+
+const uint hc   = 4;
+const uint NMIX = 24;
+const uint N_IN = hc * N_OUT;   // flat columns per thread
+
+#include "dsv4_hc_sinkhorn.glsl"
+
+shared float sumsh[BLOCK_SIZE];
+#define MIX_GROUPS 16
+shared float mixsh[MIX_GROUPS][NMIX];
+shared float mix[NMIX];
+shared float prew[hc];
+
+// rms_norm.comp's reduction: each thread's partial, then the shared-memory tree
+float block_sum(float sum, const uint tid) {
+    sumsh[tid] = sum;
+    barrier();
+    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
+        }
+        barrier();
+    }
+    sum = sumsh[0];
+    barrier();
+    return sum;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.x;
+    const uint xb  = t * nbx1;
+
+    // the split partials: 16 groups of 24 threads each sum every 16th split, then one thread per mix sums the groups in
+    // order (all loads in flight at once; a fixed order, so the result does not depend on scheduling). block_sum's barrier
+    // publishes mixsh.
+    if (tid < NMIX * MIX_GROUPS) {
+        const uint m = tid % NMIX;
+        const uint g = tid / NMIX;
+        float d = 0.0f;
+        for (uint s = g; s < n_split; s += MIX_GROUPS) {
+            d += data_p[(s * n_tokens + t) * NMIX + m];
+        }
+        mixsh[g][m] = d;
+    }
+
+    // the flat row, kept for the hc pre: column tid + 512 * j
+    float xr[N_IN];
+    float sum = 0.0f;
+    [[unroll]] for (uint col = tid, j = 0; j < N_IN; col += BLOCK_SIZE, ++j) {
+        float xi = 0.0f;
+        if (col < K) {
+            xi = data_x[xb + col];
+        }
+        xr[j] = xi;
+        sum += xi * xi;
+    }
+    sum = block_sum(sum, tid);
+    const float mean  = sum / float(K);
+    const float scale = inversesqrt(mean + eps_flat);
+
+    if (tid < NMIX) {
+        float d = 0.0f;
+        [[unroll]] for (uint g = 0; g < MIX_GROUPS; ++g) {
+            d += mixsh[g][tid];
+        }
+        mix[tid] = d * scale;
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0) {
+        // DSV4_HC_COMB on the first 16 lanes (every lane of the subgroup takes part in the shuffles)
+        const uint idx = gl_SubgroupInvocationID & 15;
+        const float scale_comb = data_s[2 * nbs0];
+        float v = mix[2 * hc + idx] * scale_comb
+                + data_b[(2 * hc + idx) * nbb0];
+        v = dsv4_hc_sinkhorn(v, comb_eps, comb_iters);
+        if (gl_SubgroupInvocationID < 16) {
+            const uint idst = idx & 3;
+            const uint isrc = idx >> 2;
+            data_comb[idst + isrc * nbc1 + t * nbc2] = v;
+        }
+    } else if (tid >= BLOCK_SIZE - 2 * hc) {
+        // pre (h < 4) and post (h >= 4), each step one rounding as the unfused MUL, ADD, SIGMOID and SCALE nodes
+        const uint h = tid - (BLOCK_SIZE - 2 * hc);
+        precise float a = mix[h] * data_s[(h / hc) * nbs0];
+        precise float b = a + data_b[h * nbb0];
+        const float sg = 1.0f / (1.0f + exp(-b));
+        if (h < hc) {
+            prew[h] = sg * pre_mul + pre_add;
+        } else {
+            data_post[(h - hc) + t * nbpo1] = sg * post_mul + post_add;
+        }
+    }
+    barrier();
+
+    // DSV4_HC_PRE: out[i] = sum_h x[i + n_embd * h] * pre[h]; column i = tid + 512 * jj sits in xr[jj + N_OUT * h]
+    float o[N_OUT];
+    [[unroll]] for (uint jj = 0; jj < N_OUT; ++jj) {
+        float result = 0.0f;
+        [[unroll]] for (uint h = 0; h < hc; ++h) {
+            result = fma(xr[jj + N_OUT * h], prew[h], result);
+        }
+        o[jj] = out_scale * result;
+    }
+
+    const uint ob = t * nbo1;
+    if (!NORM) {
+        [[unroll]] for (uint jj = 0; jj < N_OUT; ++jj) {
+            data_out[ob + tid + BLOCK_SIZE * jj] = o[jj];
+        }
+        return;
+    }
+
+    // RMS_NORM + MUL of the hc pre output, as rms_norm.comp with do_multiply
+    float sum2 = 0.0f;
+    [[unroll]] for (uint jj = 0; jj < N_OUT; ++jj) {
+        const float xi = o[jj];
+        sum2 += xi * xi;
+    }
+    sum2 = block_sum(sum2, tid);
+    const float mean2  = sum2 / float(n_embd);
+    const float scale2 = inversesqrt(mean2 + eps_norm);
+    [[unroll]] for (uint jj = 0; jj < N_OUT; ++jj) {
+        const uint col = tid + BLOCK_SIZE * jj;
+        data_out[ob + col] = scale2 * o[jj] * data_g[col];
+    }
+}

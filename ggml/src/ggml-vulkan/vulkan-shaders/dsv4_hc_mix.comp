@@ -1,0 +1,138 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// First half of the fused DeepSeek-V4 hc boundary (dsv4_hc_boundary.comp is the second): split-K dot products of the 24
+// hc mix rows with the UNNORMALIZED flat residual,
+//
+//   part[s, t, m] = sum_{k in split s} w[k, m] * x[k, t]
+//
+// The rms norm of x is a per-token scale, so the epilogue applies it to the reduced dots and the normalized flat residual
+// is never written. Partials go to a scratch buffer as [n_split, n_tokens, 24] and the epilogue sums them in split order.
+//
+// TILE == 0 (mat-vec, a few tokens): one 64-thread workgroup per (split, token), a split of 256 columns as one vec4 per
+//   thread, reduced across the workgroup.
+// TILE == 1 (prefill): one 256-thread workgroup per (split of kc columns, 64 tokens). The x tile goes through shared
+//   memory in steps of 64 columns; each thread keeps 6 rows x 1 token of accumulators.
+
+layout(constant_id = 0) const uint TILE = 0;
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint K;          // flat row length (hc * n_embd)
+    uint n_tokens;
+    uint nbw1;       // w row stride, elements (a multiple of 4)
+    uint nbx1;       // x token stride, elements (a multiple of 4)
+    uint kc;         // TILE == 1: columns per split, a multiple of 64
+};
+
+layout(binding = 0, std430) readonly buffer W { vec4 data_w4[]; };
+layout(binding = 1, std430) readonly buffer X { vec4 data_x4[]; };
+layout(binding = 2, std430) writeonly buffer P { float data_p[]; };
+
+const uint NMIX = 24;
+
+#define MV_SPLIT 256
+#define TL_TOK   64
+#define TL_STEP  64
+#define TL_ROWS  6
+
+shared float red[8][NMIX];
+shared float xs[TL_TOK][TL_STEP + 1];
+shared vec4  ws4[NMIX][TL_STEP / 4];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint s   = gl_WorkGroupID.x;
+
+    if (TILE == 0) {
+        const uint t  = gl_WorkGroupID.y;
+        const uint k4 = (s * MV_SPLIT) / 4 + tid;
+        const vec4 xv = data_x4[(t * nbx1) / 4 + k4];
+
+        float acc[NMIX];
+        [[unroll]] for (uint m = 0; m < NMIX; ++m) {
+            acc[m] = dot(data_w4[(m * nbw1) / 4 + k4], xv);
+        }
+        [[unroll]] for (uint m = 0; m < NMIX; ++m) {
+            acc[m] = subgroupAdd(acc[m]);
+        }
+        if (gl_SubgroupInvocationID == 0) {
+            [[unroll]] for (uint m = 0; m < NMIX; ++m) {
+                red[gl_SubgroupID][m] = acc[m];
+            }
+        }
+        barrier();
+        if (tid < NMIX) {
+            float sum = 0.0f;
+            for (uint g = 0; g < gl_NumSubgroups; ++g) {
+                sum += red[g][tid];
+            }
+            data_p[(s * n_tokens + t) * NMIX + tid] = sum;
+        }
+        return;
+    }
+
+    const uint t0  = gl_WorkGroupID.y * TL_TOK;
+    const uint tok = tid % TL_TOK;
+    const uint mg  = tid / TL_TOK;   // rows mg*6 .. mg*6+5
+
+    float acc[TL_ROWS];
+    [[unroll]] for (uint r = 0; r < TL_ROWS; ++r) {
+        acc[r] = 0.0f;
+    }
+
+    for (uint step = 0; step < kc / TL_STEP; ++step) {
+        const uint kb = s * kc + step * TL_STEP;
+
+        // x tile: 64 tokens x 64 columns = 1024 vec4, four per thread, 16 vec4 per token row
+        [[unroll]] for (uint r = 0; r < 4; ++r) {
+            const uint idx = tid + 256 * r;
+            const uint tt  = idx / 16;
+            const uint c4  = idx % 16;
+            vec4 v = vec4(0.0f);
+            if (t0 + tt < n_tokens) {
+                v = data_x4[((t0 + tt) * nbx1 + kb) / 4 + c4];
+            }
+            xs[tt][c4 * 4 + 0] = v.x;
+            xs[tt][c4 * 4 + 1] = v.y;
+            xs[tt][c4 * 4 + 2] = v.z;
+            xs[tt][c4 * 4 + 3] = v.w;
+        }
+        // w tile: 24 rows x 64 columns = 384 vec4
+        [[unroll]] for (uint r = 0; r < 2; ++r) {
+            const uint idx = tid + 256 * r;
+            if (idx < NMIX * (TL_STEP / 4)) {
+                const uint m  = idx / (TL_STEP / 4);
+                const uint c4 = idx % (TL_STEP / 4);
+                ws4[m][c4] = data_w4[(m * nbw1 + kb) / 4 + c4];
+            }
+        }
+        barrier();
+
+        [[unroll]] for (uint k4 = 0; k4 < TL_STEP / 4; ++k4) {
+            const float x0 = xs[tok][k4 * 4 + 0];
+            const float x1 = xs[tok][k4 * 4 + 1];
+            const float x2 = xs[tok][k4 * 4 + 2];
+            const float x3 = xs[tok][k4 * 4 + 3];
+            [[unroll]] for (uint r = 0; r < TL_ROWS; ++r) {
+                const vec4 w = ws4[mg * TL_ROWS + r][k4];
+                acc[r] = fma(w.x, x0, acc[r]);
+                acc[r] = fma(w.y, x1, acc[r]);
+                acc[r] = fma(w.z, x2, acc[r]);
+                acc[r] = fma(w.w, x3, acc[r]);
+            }
+        }
+        barrier();
+    }
+
+    if (t0 + tok < n_tokens) {
+        [[unroll]] for (uint r = 0; r < TL_ROWS; ++r) {
+            data_p[(s * n_tokens + t0 + tok) * NMIX + mg * TL_ROWS + r] = acc[r];
+        }
+    }
+}
