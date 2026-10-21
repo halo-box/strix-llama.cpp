@@ -1,0 +1,25 @@
+251991e Merge pull request #207 from pwilkin/ci/bench-history-perf-subset
+Linux X2-LA03-S03-D01 6.17.0-1032-oem #32-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 24 05:46:26 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+32
+               total        used        free      shared  buff/cache   available
+Mem:             124           5          93           1          29         119
+Swap:              0           0           0
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/loop0      1.7T  825G  817G  51% /mnt/scratch
+/dev/loop0      1.7T  825G  817G  51% /mnt/scratch
+  Name:                    AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+  Marketing Name:          AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+  Name:                    gfx1151                            
+  Marketing Name:          AMD Radeon Graphics                
+  Name:                    aie2p                              
+  Marketing Name:          NPU Strix Halo                     
+
+
+============================ ROCm System Management Interface ============================
+====================================== Product Info ======================================
+GPU[0]		: Card Series: 		AMD Radeon Graphics
+GPU[0]		: Card Model: 		0x1586
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[0]		: Card SKU: 		STRXLGEN
+cmake version 3.31.10
+7.2.53211-e1a6bc5663
