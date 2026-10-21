@@ -20,7 +20,7 @@
 
 #include "types.glsl"
 
-#if defined(DATA_A_Q3_K) || defined(DATA_A_Q6_K) || defined(DATA_A_NVFP4)
+#if defined(DATA_A_Q3_K) || defined(DATA_A_Q6_K) || defined(DATA_A_NVFP4) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S)
 #define KSCALES 2
 #else
 #define KSCALES 1
@@ -34,6 +34,14 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
 #endif
 #if defined(A_TYPE_PACKED32)
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
+#endif
+#if defined(DATA_A_TQ1_0)
+// the 54-byte block is only 2-byte aligned: qs and qh as 26 halfwords, then d
+struct block_tq1_0_packed16 {
+    uint16_t q[26];
+    float16_t d;
+};
+layout (binding = 0) readonly buffer A_TQ1_16 {block_tq1_0_packed16 data_a_tq1_16[];};
 #endif
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
@@ -124,7 +132,8 @@ shared float buf_b_s[BN * BK_STEP];
 shared int8_t cm1_kvalues[16];
 #endif
 
-#if defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS) || defined(DATA_A_NVFP4)
+#if defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS) || defined(DATA_A_NVFP4) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || \
+    defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_Q2_0) || defined(DATA_A_PTQ1_0)
 #define LOAD_VEC_A 8
 #else
 #define LOAD_VEC_A (4 * QUANT_R)
@@ -207,6 +216,9 @@ void main() {
     }
 #endif
     barrier();
+#endif
+#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S)
+    init_iq_shmem(gl_WorkGroupSize);
 #endif
 
     const uint blocks_m = (p.M + BM - 1) / BM;

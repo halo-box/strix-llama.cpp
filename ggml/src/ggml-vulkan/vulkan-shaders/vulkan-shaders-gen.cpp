@@ -91,6 +91,12 @@ const std::vector<std::string> type_names = {
     "bf16",
 };
 
+// types the int8 coopmat MMQ reads as exact int8 levels (grid values, trits) rather than through f16
+static bool is_cm1_int8_view(const std::string& t) {
+    return t == "iq2_xxs" || t == "iq2_xs" || t == "iq2_s" || t == "iq3_xxs" || t == "iq3_s" ||
+           t == "tq1_0" || t == "tq2_0" || t == "q2_0" || t == "ptq1_0";
+}
+
 enum MatMulIdType {
     NONE,
     DEFAULT,
@@ -677,7 +683,8 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 #endif
 
         if (!f16acc && coopmat && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
-                     || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4")) {
+                     || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4"
+                     || is_cm1_int8_view(tname))) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
         }
 

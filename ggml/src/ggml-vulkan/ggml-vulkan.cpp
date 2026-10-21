@@ -1723,11 +1723,36 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
     return supported;
 }
 
+// GGML_VK_MMQ_I8VIEWS: int8 MMQ for the IQ2/IQ3 grid and ternary types. Default (unset, 1 or all): the types that beat the
+// f16 tile on gfx1151, i.e. not IQ2_XS / IQ2_S (per-16 scales double the accumulator epilogue, 0.90-0.95x) and not PTQ1_0
+// for MUL_MAT_ID (0.89x at 32 rows per expert). 0: off. Otherwise a comma-separated list of type names (e.g.
+// "iq3_xxs,ptq1_0"), which enables exactly the named types for both ops.
+static bool ggml_vk_mmq_i8views_enabled(ggml_type type, bool mul_mat_id) {
+    static const std::string env = [] { const char * e = getenv("GGML_VK_MMQ_I8VIEWS"); return std::string(e ? e : ""); }();
+    if (env == "0") {
+        return false;
+    }
+    if (env.empty() || env == "1" || env == "all") {
+        return type != GGML_TYPE_IQ2_XS && type != GGML_TYPE_IQ2_S && !(mul_mat_id && type == GGML_TYPE_PTQ1_0);
+    }
+    const std::string name = ggml_type_name(type);
+    size_t pos = 0;
+    while (pos <= env.size()) {
+        const size_t end = std::min(env.find(',', pos), env.size());
+        if (env.compare(pos, end - pos, name) == 0 && end - pos == name.size()) {
+            return true;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+
 static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
 
     bool kscales2 = false;    // two scale sets per block
     bool has_dm   = false;    // d+m as vec2 + b-side sum
     bool has_kvalues = false;
+    uint32_t grid_bytes = 0;  // IQ grid table copied to shared memory
     switch (src0_type) {
         case GGML_TYPE_Q4_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q8_0:
             break;
@@ -1740,6 +1765,13 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const 
             kscales2 = true;                        break;
         case GGML_TYPE_NVFP4:
             kscales2 = true; has_kvalues = true;    break;
+        case GGML_TYPE_IQ2_XXS: grid_bytes = 256u * 8u;  break;
+        case GGML_TYPE_IQ2_XS:  grid_bytes = 512u * 8u;  kscales2 = true; break;
+        case GGML_TYPE_IQ2_S:   grid_bytes = 1024u * 8u; kscales2 = true; break;
+        case GGML_TYPE_IQ3_XXS: grid_bytes = 256u * 4u;  break;
+        case GGML_TYPE_IQ3_S:   grid_bytes = 512u * 4u;  break;
+        case GGML_TYPE_TQ1_0: case GGML_TYPE_TQ2_0: case GGML_TYPE_Q2_0: case GGML_TYPE_PTQ1_0:
+            break;
         default:
             return false;
     }
@@ -1764,6 +1796,7 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const 
     if (has_kvalues) {
         total += 16u * (uint32_t)sizeof(int8_t);         // cm1_kvalues[16]
     }
+    total += grid_bytes;
     if (src0_type == GGML_TYPE_NVFP4 && !device->ocp_fp4) {
         total += 128u * (uint32_t)sizeof(float);         // ue4m3_fp32_lut[128]
     }
@@ -2861,6 +2894,26 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int_k, "matmul_nvfp4_q8_1",  matmul_nvfp4_q8_1_cm1_len,  matmul_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3); }
         }
 
+        // Exact int8 views (GGML_VK_MMQ_I8VIEWS=0 turns them off): IQ grid values and ternary trits go to the int8 MMQ as levels
+        if (device->coopmat_int_support && (rdna3 || rdna4)) {
+#define CM1_MMQ_I8V(TYPE, tstr, TC) \
+            if (ggml_vk_mmq_i8views_enabled(TYPE, false)) { \
+                cm1_create_mmq({TYPE, GGML_TYPE_Q8_1, false, false}, TC, "matmul_" #tstr "_q8_1", matmul_##tstr##_q8_1_cm1_len, matmul_##tstr##_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3); \
+            }
+            CM1_MMQ_I8V(GGML_TYPE_IQ2_XXS, iq2_xxs, tc_mmq_cm1_int)
+            CM1_MMQ_I8V(GGML_TYPE_IQ2_XS,  iq2_xs,  tc_mmq_cm1_int)
+            CM1_MMQ_I8V(GGML_TYPE_IQ2_S,   iq2_s,   tc_mmq_cm1_int)
+            CM1_MMQ_I8V(GGML_TYPE_IQ3_XXS, iq3_xxs, tc_mmq_cm1_int)
+            CM1_MMQ_I8V(GGML_TYPE_IQ3_S,   iq3_s,   tc_mmq_cm1_int)
+            CM1_MMQ_I8V(GGML_TYPE_TQ1_0,   tq1_0,   tc_mmq_cm1_int)
+            CM1_MMQ_I8V(GGML_TYPE_TQ2_0,   tq2_0,   tc_mmq_cm1_int)
+            CM1_MMQ_I8V(GGML_TYPE_Q2_0,    q2_0,    tc_mmq_cm1_int)
+#ifdef GGML_USE_TRELLIS
+            CM1_MMQ_I8V(GGML_TYPE_PTQ1_0,  ptq1_0,  tc_mmq_cm1_int)
+#endif
+#undef CM1_MMQ_I8V
+        }
+
         GGML_ASSERT(device->subgroup_ballot);
 
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, true, false}, tc_mm, "matmul_id_subgroup_f32_f32", matmul_id_subgroup_f32_f32_cm1_len, matmul_id_subgroup_f32_f32_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
@@ -2933,6 +2986,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create_mmq({GGML_TYPE_Q5_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int,   "matmul_id_subgroup_q5_k_q8_1",   matmul_id_subgroup_q5_k_q8_1_cm1_len,   matmul_id_subgroup_q5_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
             cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_q6_k_q8_1",   matmul_id_subgroup_q6_k_q8_1_cm1_len,   matmul_id_subgroup_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_nvfp4_q8_1",  matmul_id_subgroup_nvfp4_q8_1_cm1_len,  matmul_id_subgroup_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); }
+        }
+        if (device->coopmat_int_support && (rdna3 || rdna4)) {
+#define CM1_MMQ_I8V_ID(TYPE, tstr, TC) \
+            if (ggml_vk_mmq_i8views_enabled(TYPE, true)) { \
+                cm1_create_mmq({TYPE, GGML_TYPE_Q8_1, true, false}, TC, "matmul_id_subgroup_" #tstr "_q8_1", matmul_id_subgroup_##tstr##_q8_1_cm1_len, matmul_id_subgroup_##tstr##_q8_1_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count); \
+            }
+            CM1_MMQ_I8V_ID(GGML_TYPE_IQ2_XXS, iq2_xxs, tc_mmq_cm1_int)
+            CM1_MMQ_I8V_ID(GGML_TYPE_IQ2_XS,  iq2_xs,  tc_mmq_cm1_int)
+            CM1_MMQ_I8V_ID(GGML_TYPE_IQ2_S,   iq2_s,   tc_mmq_cm1_int)
+            CM1_MMQ_I8V_ID(GGML_TYPE_IQ3_XXS, iq3_xxs, tc_mmq_cm1_int)
+            CM1_MMQ_I8V_ID(GGML_TYPE_IQ3_S,   iq3_s,   tc_mmq_cm1_int)
+            CM1_MMQ_I8V_ID(GGML_TYPE_TQ1_0,   tq1_0,   tc_mmq_cm1_int)
+            CM1_MMQ_I8V_ID(GGML_TYPE_TQ2_0,   tq2_0,   tc_mmq_cm1_int)
+            CM1_MMQ_I8V_ID(GGML_TYPE_Q2_0,    q2_0,    tc_mmq_cm1_int)
+#ifdef GGML_USE_TRELLIS
+            CM1_MMQ_I8V_ID(GGML_TYPE_PTQ1_0,  ptq1_0,  tc_mmq_cm1_int)
+#endif
+#undef CM1_MMQ_I8V_ID
         }
     } else
 #endif  // defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
