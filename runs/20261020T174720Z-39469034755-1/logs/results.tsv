@@ -1,0 +1,6 @@
+llama-bench	qwen36-35b-a3b	0	18
+perplexity	qwen36-35b-a3b	2048	0	94.8
+perplexity	qwen36-35b-a3b	4096	0	88.6
+llama-bench	qwen38-27b	0	18
+perplexity	qwen38-27b	2048	0	886.2
+perplexity	qwen38-27b	4096	0	894.4

@@ -1,0 +1,4 @@
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 63972 MiB):
+  Device 0: AMD Radeon Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 63972 MiB
+Available devices:
+  ROCm0: AMD Radeon Graphics (63972 MiB, 63968 MiB free)
