@@ -52,8 +52,12 @@ enum llm_fused_op {
     LLM_FUSED_OP_GDN_CH,
     LLM_FUSED_OP_LIGHTNING_INDEXER,
     LLM_FUSED_OP_DSV4_HC_PRE,
+    LLM_FUSED_OP_DSV4_HC_NORM_F16,  // f16 hc norm: HC pre reading an f16 x, hc inject / down matmuls with an f16 B
+    LLM_FUSED_OP_DSV4_HC_GATE_F16,  // f16 hc gate: HC pre reading an f16 gate (the hc up GEMM's f16 store)
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_MOE_F16,           // f16 MoE activations: expert down projection with an f16 B (build_moe_ffn prefill)
+    LLM_FUSED_OP_GDN_NORM_F16,      // f16 GDN output norm: the qwen4exp ssm_out projection with an f16 B (prefill)
 };
 
 enum llm_ffn_op_type : int {
@@ -99,6 +103,11 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+
+// a context's state for llama_model::prefetch_begin / prefetch_end (one per context, made by the model)
+struct llama_model_prefetch {
+    virtual ~llama_model_prefetch() = default;
+};
 struct llama_mtp_draft_vocab;
 
 //
@@ -838,6 +847,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    llama_model_prefetch * prefetch = nullptr; // the context's llama_model::prefetch_begin state, nullptr = none
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1083,6 +1094,8 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llama_mtp_draft_vocab * mtp_draft; // nullptr = full vocabulary
+
+    llama_model_prefetch * prefetch; // nullptr = none
 
     const llm_graph_cb & cb_func;
 

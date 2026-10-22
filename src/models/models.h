@@ -7,6 +7,8 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <mutex>
+#include <vector>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2567,8 +2569,24 @@ struct llama_model_qwen4exp : public llama_model_base {
     ggml_tensor * ple_exl3_bias = nullptr;
     int32_t       ple_exl3_k    = 0;
 
+    // a bf16 matmul weight left after load keeps the hc mixed stream f32; counted once, on the first graph
+    mutable std::once_flag bf16_mm_once;
+    mutable bool           bf16_mm = false;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    bool load_tensors(llama_model_loader & ml) override;
+
+    // bf16 twins of the f32 weights decode reads as mat-vecs, made at load where the values are bf16-exact
+    // (LLAMA_BF16_TWINS=0 disables); bf16_twin() returns nullptr for a weight without one
+    void load_bf16_twins();
+    ggml_tensor * bf16_twin(const ggml_tensor * w) const;
+    std::map<const ggml_tensor *, ggml_tensor *> bf16_twins;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bf16_twin_bufs;
+
+    // the PLE rows of the batch gathered one ubatch ahead on a worker thread (LLAMA_PLE_ASYNC=0: page-cache advice only)
+    void prefetch_begin(std::unique_ptr<llama_model_prefetch> & state, const llama_batch & batch, uint32_t n_ubatch) const override;
+    void prefetch_end(llama_model_prefetch * state) const override;
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
@@ -2592,13 +2610,18 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
+        // q_first > 0 (LLAMA_FN_LAST_ATTN_TRIM, the last layer only): queries, indexer queries, selection and attention for
+        // rows [q_first, n_tokens) only; K/V and the indexer keys of every row are still stored. When the trim is taken,
+        // *tile_out_ids gets the output rows relative to q_first (the returned tensor has n_tokens - q_first rows).
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+                        int64_t   q_first = 0,
+                    ggml_tensor ** tile_out_ids = nullptr);
 
         // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
@@ -2622,13 +2645,17 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        // q_first > 0: the selection for query rows [q_first, n_tokens) only (q_first a multiple of the score strip),
+        // with q_pos their positions; the indexer keys of every row are stored as before
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                        int64_t   q_first = 0,
+                    ggml_tensor * q_pos = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
@@ -2647,6 +2674,12 @@ struct llama_model_qwen4exp : public llama_model_base {
 
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
+
+        // padded f16 destinations (LLAMA_HC_XN_PAD / LLAMA_GDN_NORM_PAD), one per graph: graph leaves are allocated before the
+        // first node, so per-layer buffers would all stay resident (2.8 GB of Flash-Next's 5.3 GB compute buffer at ub 2048)
+        ggml_tensor * hc_xn_pad_buf    = nullptr;
+        ggml_tensor * gdn_norm_pad_buf = nullptr;
+        ggml_tensor * pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name);
 
         // one conv history per cache tensor: delta-net and PLE each have their own
         ggml_tensor * build_conv_state_at(

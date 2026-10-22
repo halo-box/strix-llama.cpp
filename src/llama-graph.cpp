@@ -1600,6 +1600,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     exl3             (params.exl3),
     samplers         (params.samplers),
     mtp_draft        (params.mtp_draft),
+    prefetch         (params.prefetch),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -2356,6 +2357,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    // f16 expert activations at prefill (fused_moe_f16): casts right after the GEMMs, f16 GLU and down B, f32 combine. Plain
+    // SwiGLU only, and only QWEN4EXP, the one arch with a PPL/KLD check of the f16 chain
+    // qwen35moe: KLD 0.003924 vs ubatch floor 0.004012 (Qwen3.6-35B-A3B UD-Q4_K_XL, wiki 2 x 4096), pp2048 +6.8% / +5.9% d0 / 8k (gfx1151 RADV, ABBA n=2, 2026-10-18)
+    const bool moe_f16_arch = arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35MOE;
+    const bool moe_f16 = cparams.fused_moe_f16 && moe_f16_arch && il >= 0 && n_tokens >= 32 &&
+        type_op == LLM_FFN_SILU && gate_exps && !gate_up_exps && !weight_before_ffn &&
+        !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+        hparams.swiglu_clamp_exp[il] <= 1e-6f && hparams.n_expert_used(il) > 1 && (!loras || loras->empty()) &&
+        !(exl3 && exl3->linears.count(down_exps));   // an EXL3 down projection takes only an f32 B
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff*2, n_expert_used, n_tokens]
@@ -2388,10 +2399,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
             cb(up, "ffn_moe_up_biased", il);
         }
+        if (moe_f16) {
+            up = ggml_cast(ctx0, up, GGML_TYPE_F16);
+            cb(up, "ffn_moe_up_f16", il);
+        }
 
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
+            if (moe_f16) {
+                cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+                cb(cur, "ffn_moe_gate_f16", il);
+            }
         } else {
             cur = up;
         }
@@ -2507,9 +2526,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
+    if (moe_f16) {
+        // the probe keeps the f16 graph only where the down projection with the f16 B stays on the layer's device
+        res->add_fused_node({LLM_FUSED_OP_MOE_F16, experts, il});
+    }
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
+    }
+
+    if (moe_f16) {
+        experts = ggml_cast(ctx0, experts, GGML_TYPE_F16);
+        cb(experts, "ffn_moe_weighted_f16", il);
     }
 
     ggml_build_forward_expand(gf, experts);
@@ -2533,7 +2562,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * moe_out = cur_experts[0];
 
     for (uint32_t i = 1; i < n_expert_used_il; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        // f16 expert outputs are summed in f32 from the first add on
+        moe_out = (i == 1 && moe_f16) ? ggml_add_cast(ctx0, moe_out, cur_experts[i], GGML_TYPE_F32)
+                                      : ggml_add(ctx0, moe_out, cur_experts[i]);
 
         ggml_build_forward_expand(gf, moe_out);
     }

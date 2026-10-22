@@ -21,7 +21,9 @@ PERF_BACKEND = re.compile(r'^Backend \d+/\d+: (\S+)\s*$')
 PERF_ROW = re.compile(r'^  ([A-Za-z0-9_]+)\((.*)\):\s+(\d+) runs -\s+([0-9.]+) us/run -\s+(.*?)\s*$')
 PERF_BW = re.compile(r'^(\d+) kB/run -\s+([0-9.]+) GB/s$')
 PERF_FLOP = re.compile(r'^([0-9.]+) ([kMGT])FLOP/run -\s+([0-9.]+) ([kMGT])FLOPS$')
-PERF_UNSUPPORTED = re.compile(r'^  [A-Za-z0-9_]+\(.*\): not supported')
+PERF_UNSUPPORTED = re.compile(r'^  ([A-Za-z0-9_]+\(.*\)): not supported')
+# a perf case that fails allocation or compute prints one of these instead of its `OP(params):` line
+PERF_FAILED = re.compile(r'failed to allocate|graph_compute failed')
 SCALE = {'k': 1e3, 'M': 1e6, 'G': 1e9, 'T': 1e12}
 PPL_FINAL = re.compile(r'Final estimate: PPL = ([0-9.]+) \+/- ([0-9.]+)')
 PPL_CHUNK = re.compile(r'\[(\d+)\]([0-9]+\.[0-9]+|nan|inf),')
@@ -63,10 +65,12 @@ def int_list(value: str) -> list[int]:
     return [int(v) for v in value.split(',') if v.strip().isdigit()]
 
 
-def parse_ops_perf(path: Path, backend: str) -> tuple[list[list[Any]], int]:
-    """Return the perf rows of `backend` in OPS_COLUMNS order and the count of unsupported cases."""
+def parse_ops_perf(path: Path, backend: str) -> tuple[list[list[Any]], int, set[str], int]:
+    """Return the perf rows of `backend` in OPS_COLUMNS order, the unsupported count, every case name seen and the failure count."""
     rows: list[list[Any]] = []
     unsupported = 0
+    failed = 0
+    seen: set[str] = set()
     current = None
     for raw in path.read_text(errors='replace').splitlines():
         line = ANSI.sub('', raw)
@@ -76,13 +80,19 @@ def parse_ops_perf(path: Path, backend: str) -> tuple[list[list[Any]], int]:
             continue
         if current != backend:
             continue
-        if PERF_UNSUPPORTED.match(line):
+        if PERF_FAILED.search(line):
+            failed += 1
+            continue
+        m = PERF_UNSUPPORTED.match(line)
+        if m:
             unsupported += 1
+            seen.add(m.group(1))
             continue
         m = PERF_ROW.match(line)
         if not m:
             continue
         op, params, runs, us, tail = m.groups()
+        seen.add(f'{op}({params})')
         row: list[Any] = [op, params, int(runs), float(us), None, None, None, None]
         bw = PERF_BW.match(tail)
         flop = PERF_FLOP.match(tail)
@@ -93,7 +103,7 @@ def parse_ops_perf(path: Path, backend: str) -> tuple[list[list[Any]], int]:
             row[6] = float(flop.group(1)) * SCALE[flop.group(2)]
             row[7] = float(flop.group(3)) * SCALE[flop.group(4)]
         rows.append(row)
-    return rows, unsupported
+    return rows, unsupported, seen, failed
 
 
 def parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
@@ -181,7 +191,11 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
     ops_requested = meta.get('ops_perf', 'false') == 'true'
 
     models = []
+    # the first record per model is the HIP step's; a Vulkan step download may add a second one
+    first_rows = {}
     for row in read_tsv(raw / 'models.tsv'):
+        first_rows.setdefault(row[0], row)
+    for row in first_rows.values():
         row += [''] * (8 - len(row))
         models.append({
             'key': row[0], 'repo': row[1], 'revision': row[2], 'file': row[3], 'bytes': to_int(row[4]),
@@ -189,22 +203,29 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
         })
     model_status = {m['key']: m['status'] for m in models}
 
+    vulkan_requested = meta.get('vulkan_bench', 'false') == 'true'
     bench = []
-    bench_rc: dict[str, int | None] = {}
-    for row in results:
-        if row[0] == 'llama-bench' and len(row) >= 3:
-            bench_rc[row[1]] = to_int(row[2])
-    for name in meta.get('models', '').split(','):
-        if not name:
-            continue
-        rows, bad = parse_jsonl(raw / f'llama-bench-{name}.jsonl')
-        rc = bench_rc.get(name)
-        status = exit_status(rc)
-        if model_status.get(name, 'verified') not in ('verified', ''):
-            status = f'skipped ({model_status[name]})'
-        elif status == 'ok' and not rows:
-            status = 'no rows'
-        bench.append({'model': name, 'exit_code': rc, 'status': status, 'bad_lines': bad, 'rows': rows})
+    # (backend, results.tsv kind, file prefix); the Vulkan run reuses the files the HIP run downloaded
+    lanes = [('ROCm', 'llama-bench', 'llama-bench')] + ([('Vulkan', 'llama-bench-vulkan', 'llama-bench-vulkan')] if vulkan_requested else [])
+    for backend, kind, prefix in lanes:
+        bench_rc: dict[str, str] = {row[1]: row[2] for row in results if row[0] == kind and len(row) >= 3}
+        for name in meta.get('models', '').split(','):
+            if not name:
+                continue
+            rows, bad = parse_jsonl(raw / f'{prefix}-{name}.jsonl')
+            rc = to_int(bench_rc.get(name))
+            status = exit_status(rc)
+            if model_status.get(name, 'verified') not in ('verified', ''):
+                status = f'skipped ({model_status[name]})'
+            elif (bench_rc.get(name) or '').startswith('skipped-'):
+                status = f"skipped ({bench_rc[name][len('skipped-'):]})"
+            elif bench_rc.get(name) == 'skipped':
+                status = 'skipped (no model file)'
+            elif backend == 'Vulkan' and rc is None and steps.get('device-vulkan') not in ('success', None):
+                status = 'skipped (no Vulkan device)'
+            elif status == 'ok' and not rows:
+                status = 'no rows'
+            bench.append({'model': name, 'backend': backend, 'exit_code': rc, 'status': status, 'bad_lines': bad, 'rows': rows})
 
     ppl_requested = meta.get('ppl', 'false') == 'true'
     ppl = []
@@ -234,16 +255,30 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
         for row in results:
             if row[0] == 'ops-perf' and len(row) >= 3:
                 ops_rc[row[1]] = to_int(row[2])
+        listed: list[str] = []
+        if (raw / 'perf-cases.txt').is_file():
+            listed = [line.strip() for line in (raw / 'perf-cases.txt').read_text().splitlines()
+                      if line.strip() and not line.startswith('#')]
         for backend in ('ROCm0', 'Vulkan0'):
             log = raw / f'ops-perf-{backend}.log'
-            rows, unsupported = parse_ops_perf(log, backend) if log.is_file() else ([], 0)
+            rows, unsupported, seen, n_failed = parse_ops_perf(log, backend) if log.is_file() else ([], 0, set(), 0)
             rc = ops_rc.get(backend)
             status = exit_status(rc)
-            if status == 'ok' and not rows:
+            if rc is None and rows:
+                status = 'incomplete (step stopped)'
+            elif rc is None and steps.get(f'ops-perf-{backend}') == 'skipped':
+                status = 'skipped'
+            elif status == 'ok' and not rows:
                 status = 'no rows'
+            groups = [{'group': r[2], 'exit_code': to_int(r[3]), 'n_rows': to_int(r[4])}
+                      for r in results if r[0] == 'ops-perf-group' and len(r) >= 5 and r[1] == backend]
+            # a listed case is only missing if the list group ran to its end
+            list_done = any(g['group'] == 'list' and g['exit_code'] == 0 for g in groups)
             ops.append({
                 'backend': backend, 'exit_code': rc, 'status': status, 'step': steps.get(f'ops-perf-{backend}', ''),
-                'n_rows': len(rows), 'n_unsupported': unsupported, 'columns': OPS_COLUMNS, 'rows': rows,
+                'n_rows': len(rows), 'n_unsupported': unsupported, 'n_failed': n_failed, 'groups': groups,
+                'n_listed': len(listed), 'missing_listed': [c for c in listed if c not in seen] if list_done else [],
+                'columns': OPS_COLUMNS, 'rows': rows,
             })
 
     entries = bench + ppl + ops
@@ -295,7 +330,8 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
             'hip_version': meta.get('hip_version') or None,
             'cmake_version': meta.get('cmake_version') or None,
             'rocm_device': first_match(raw / 'devices-hip.txt', r'^\s+ROCm0:\s*(.*)$'),
-            'vulkan_device': first_match(raw / 'ops-perf-Vulkan0.log', r'^ggml_vulkan: 0 = (.*)$'),
+            'vulkan_device': first_match(raw / 'devices-vulkan.txt', r'^\s+Vulkan0:\s*(.*)$')
+            or first_match(raw / 'ops-perf-Vulkan0.log', r'^ggml_vulkan: 0 = (.*)$'),
             'vulkan_driver': first_match(raw / 'vulkan-env.log', r'driverInfo\s*=\s*(.*)$'),
             'vulkan_sdk': meta.get('vulkan_sdk_version') or None,
         },
@@ -308,6 +344,7 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
             'n_gen': to_int(meta.get('n_gen')),
             'n_batch': to_int(meta.get('n_batch')),
             'ops_perf': ops_requested,
+            'vulkan_bench': vulkan_requested,
             'ppl': ppl_requested,
             'ppl_ctx': to_int(meta.get('ppl_ctx')),
             'ppl_chunks': to_int(meta.get('ppl_chunks')),
@@ -331,20 +368,24 @@ def write_summary(run: dict[str, Any]) -> None:
     path = os.environ.get('GITHUB_STEP_SUMMARY')
     if not path:
         return
-    lines = [f"### Run `{run['key']}`: {run['status']}", '', '| model | test | ubatch | depth | t/s |', '|---|---|---:|---:|---:|']
+    lines = [f"### Run `{run['key']}`: {run['status']}", '', '| model | backend | test | ubatch | depth | t/s |',
+             '|---|---|---|---:|---:|---:|']
     for entry in run['llama_bench']:
         for row in entry['rows']:
             test = f"pp{row.get('n_prompt')}" if row.get('n_prompt') else f"tg{row.get('n_gen')}"
-            lines.append(f"| {entry['model']} | {test} | {row.get('n_ubatch')} | {row.get('n_depth')} | "
+            lines.append(f"| {entry['model']} | {entry['backend']} | {test} | {row.get('n_ubatch')} | {row.get('n_depth')} | "
                          f"{row.get('avg_ts', 0):.2f} +/- {row.get('stddev_ts', 0):.2f} |")
     lines.append('')
     for entry in run['llama_bench']:
-        lines.append(f"- llama-bench {entry['model']}: {entry['status']}, {len(entry['rows'])} rows")
+        lines.append(f"- llama-bench {entry['model']} ({entry['backend']}): {entry['status']}, {len(entry['rows'])} rows")
     for entry in run['perplexity']:
         value = f"PPL {entry['ppl']:.4f} +/- {entry['ppl_err']:.5f}" if entry['ppl'] is not None else 'no PPL'
         lines.append(f"- llama-perplexity {entry['model']} b{entry['n_batch']}: {entry['status']}, {value}")
     for entry in run['ops_perf']:
-        lines.append(f"- test-backend-ops perf {entry['backend']}: {entry['status']}, {entry['n_rows']} rows")
+        missing = f", {len(entry['missing_listed'])} listed cases without a result" if entry['missing_listed'] else ''
+        if entry.get('n_failed'):
+            missing += f", {entry['n_failed']} failed to allocate or compute"
+        lines.append(f"- test-backend-ops perf {entry['backend']}: {entry['status']}, {entry['n_rows']} rows{missing}")
     with open(path, 'a') as f:
         f.write('\n'.join(lines) + '\n')
 

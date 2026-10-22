@@ -1,6 +1,10 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
+#if defined(X_F16) || defined(G_F16) || defined(D_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 // Collapse the hc residual streams of a token into one, weighted per stream:
 //
@@ -9,6 +13,9 @@
 // GATED: weights is a per-element gate [n_embd, hc, n_tokens], applied as sigmoid:
 //
 //   dst[i0, it] = scale * sum_ih x[i0, ih, it] * sigmoid(gate[i0, ih, it])
+//
+// X_F16: x is stored as f16 (the f16 hc norm output at prefill); GATED must be 1.
+// G_F16: the gate is stored as f16 (the hc up GEMM's f16 store, LLAMA_HC_GATE_F16); GATED must be 1.
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
 layout(constant_id = 1) const uint GATED = 0;
@@ -31,9 +38,22 @@ layout(push_constant) uniform parameter
     float scale;
 };
 
+#if defined(X_F16)
+layout(binding = 0, std430) readonly buffer X { float16_t data_x[]; };
+#else
 layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+#endif
+#if defined(G_F16)
+layout(binding = 1, std430) readonly buffer W { float16_t data_w[]; };
+#else
 layout(binding = 1, std430) readonly buffer W { float data_w[]; };
+#endif
+#if defined(D_F16)
+// D_F16: the mixed stream stored as f16 (every consumer is a matmul B operand); the f32 result rounded RTE at the store
+layout(binding = 2, std430) writeonly buffer D { float16_t data_d[]; };
+#else
 layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
+#endif
 
 const uint hc = 4;
 
@@ -45,7 +65,7 @@ void main() {
 
     if (GATED == 0) {
         if (tid < hc) {
-            w[tid] = data_w[w_offset + tid * nbw0 + it * nbw1];
+            w[tid] = float(data_w[w_offset + tid * nbw0 + it * nbw1]);
         }
         barrier();
     }
@@ -64,12 +84,18 @@ void main() {
     for (uint ih = 0; ih < hc; ++ih) {
         float wv;
         if (GATED == 1) {
-            wv = 1.0f / (1.0f + exp(-data_w[wb + ih * nbw1]));
+            wv = 1.0f / (1.0f + exp(-float(data_w[wb + ih * nbw1])));
         } else {
             wv = w[ih];
         }
-        result = fma(data_x[xb + ih * nbx1], wv, result);
+        result = fma(float(data_x[xb + ih * nbx1]), wv, result);
     }
 
+#if defined(D_F16)
+    // equal to the f32 output stored, then CPY (and to HC_UP_MIX's f16 epilogue): the product goes through an XOR with a
+    // push-constant zero (n_embd < 2^31), so the compiler cannot fold the multiply and the conversion into one single rounding
+    data_d[d_offset + i0 * nbd0 + it * nbd1] = float16_t(uintBitsToFloat(floatBitsToUint(scale * result) ^ (n_embd >> 31)));
+#else
     data_d[d_offset + i0 * nbd0 + it * nbd1] = scale * result;
+#endif
 }

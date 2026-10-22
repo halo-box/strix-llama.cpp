@@ -41,6 +41,16 @@ layout (binding = 3) readonly buffer I {uvec2 data_i[];};
 #extension GL_EXT_control_flow_attributes : enable
 #define BLOCK_SIZE 512
 
+// f16 builds (D_F16): the store equals the unfused chain (f32 result stored, then converted to f16). Written plainly, the
+// compiler may fold the last f32 multiply and the conversion into one single-rounding mixed-precision op (~6 in 1e5 values
+// one ulp off); the value goes through an XOR with a push-constant zero first (param3 = num_partials, 0 on every f16 path).
+#ifdef D_F16
+float16_t store_d16(const float x) { return float16_t(uintBitsToFloat(floatBitsToUint(x) ^ uint(p.param3))); }
+#define STORE_D(x) store_d16(float(x))
+#else
+#define STORE_D(x) D_TYPE(x)
+#endif
+
 layout (constant_id = 1) const bool do_multiply = false;
 #if RMS_NORM_ADD_FUSION
 layout (constant_id = 2) const bool do_post_multiply = false;
@@ -116,7 +126,7 @@ void rms_norm(uint num_iters) {
                             value *= FLOAT_TYPE(data_e[0]);
                         }
 #endif
-                        data_d[d_offset + col] = D_TYPE(value);
+                        data_d[d_offset + col] = STORE_D(value);
                     }
                 } else {
                     [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
@@ -130,7 +140,7 @@ void rms_norm(uint num_iters) {
                             value *= FLOAT_TYPE(data_e[0]);
                         }
 #endif
-                        data_d[d_offset + col] = D_TYPE(value);
+                        data_d[d_offset + col] = STORE_D(value);
                     }
                 }
             } else {
@@ -138,7 +148,7 @@ void rms_norm(uint num_iters) {
                     if (col >= ncols) {
                         continue;
                     }
-                    data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+                    data_d[d_offset + col] = STORE_D(scale * FLOAT_TYPE(data_a[a_offset + col]));
                 }
             }
 #if RMS_NORM_ROPE_FUSION

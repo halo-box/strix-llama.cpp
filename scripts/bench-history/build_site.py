@@ -175,7 +175,7 @@ def cells(run: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             samples = [float(x) for x in row.get('samples_ts') or []]
             out.append({
-                'model': entry.get('model'), 'test': name, 'kind': name[:2],
+                'model': entry.get('model'), 'backend': entry.get('backend') or row.get('backends') or '?', 'test': name, 'kind': name[:2],
                 'n_batch': row.get('n_batch'), 'n_ubatch': row.get('n_ubatch'), 'n_depth': row.get('n_depth'),
                 'mean': row.get('avg_ts'), 'sd': row.get('stddev_ts'),
                 'median': statistics.median(samples) if samples else None,
@@ -262,13 +262,13 @@ def build_index(site: Site, runs: list[dict[str, Any]], generated: str) -> str:
     parts.append('<section id="trend"><h2>Throughput over time</h2>'
                  '<p class="note">Mean tokens per second per cell, newest run first, &plusmn; one standard deviation. '
                  'tg does not depend on ubatch, so the tg cells of one depth repeat one measurement.</p>')
-    groups = sorted({(c['model'], c['kind'], c['test']) for cs in all_cells.values() for c in cs},
-                    key=lambda g: (str(g[0]), g[1] != 'pp', g[2]))
-    for model, _, test in groups:
+    groups = sorted({(c['model'], c['kind'], c['test'], c['backend']) for cs in all_cells.values() for c in cs},
+                    key=lambda g: (str(g[0]), g[1] != 'pp', g[2], str(g[3])))
+    for model, _, test, backend in groups:
         cols = sorted({(c['n_depth'], c['n_ubatch']) for cs in all_cells.values() for c in cs
-                       if c['model'] == model and c['test'] == test}, key=lambda t: (t[0] or 0, t[1] or 0))
+                       if c['model'] == model and c['test'] == test and c['backend'] == backend}, key=lambda t: (t[0] or 0, t[1] or 0))
         depths = sorted({d for d, _ in cols}, key=lambda d: d or 0)
-        parts.append(f'<h3>{esc(model)} - {esc(test)}</h3><div class="scroll"><table><thead><tr>'
+        parts.append(f'<h3>{esc(model)} - {esc(test)} - {esc(backend)}</h3><div class="scroll"><table><thead><tr>'
                      '<th rowspan="2">Date (UTC)</th><th rowspan="2">Ref</th><th rowspan="2">Commit</th>')
         for d in depths:
             span = sum(1 for dd, _ in cols if dd == d)
@@ -277,7 +277,7 @@ def build_index(site: Site, runs: list[dict[str, Any]], generated: str) -> str:
         for run in runs:
             by_col: dict[tuple[Any, Any], dict[str, Any]] = {}
             for c in all_cells[run['key']]:
-                if c['model'] == model and c['test'] == test:
+                if c['model'] == model and c['test'] == test and c['backend'] == backend:
                     by_col.setdefault((c['n_depth'], c['n_ubatch']), c)
             if not by_col:
                 continue
@@ -315,32 +315,32 @@ def build_index(site: Site, runs: list[dict[str, Any]], generated: str) -> str:
     parts.append('</section>')
 
     rows = []
-    values: dict[str, set[str]] = {'model': set(), 'ref': set(), 'ub': set(), 'depth': set()}
+    values: dict[str, set[str]] = {'model': set(), 'backend': set(), 'ref': set(), 'ub': set(), 'depth': set()}
     for run in runs:
         merged: dict[tuple[Any, ...], dict[str, Any]] = {}
         for c in all_cells[run['key']]:
-            slot = merged.setdefault((c['model'], c['n_batch'], c['n_ubatch'], c['n_depth']), {})
+            slot = merged.setdefault((c['model'], c['backend'], c['n_batch'], c['n_ubatch'], c['n_depth']), {})
             slot.setdefault(c['kind'], c)
-        for (model, _, ub, depth), slot in sorted(merged.items(), key=lambda kv: (str(kv[0][0]), kv[0][2] or 0, kv[0][3] or 0)):
-            attrs = {'model': str(model), 'ref': str(run.get('ref')), 'ub': str(ub), 'depth': str(depth)}
+        for (model, backend, _, ub, depth), slot in sorted(merged.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]), kv[0][3] or 0, kv[0][4] or 0)):
+            attrs = {'model': str(model), 'backend': str(backend), 'ref': str(run.get('ref')), 'ub': str(ub), 'depth': str(depth)}
             for k, v in attrs.items():
                 values[k].add(v)
             data = ' '.join(f'data-{k}="{esc(v)}"' for k, v in attrs.items())
             rows.append(f'<tr {data}><td>{esc(run_date(run))}</td><td><code>{esc(run.get("ref"))}</code></td>'
-                        f'<td>{site.commit_link(run)}</td><td>{esc(model)}</td><td class="num">{esc(ub)}</td>'
+                        f'<td>{site.commit_link(run)}</td><td>{esc(model)}</td><td>{esc(backend)}</td><td class="num">{esc(ub)}</td>'
                         f'<td class="num">{esc(depth)}</td>{tps(slot.get("pp"))}{tps(slot.get("tg"))}'
                         f'<td><a href="runs/{esc(run["key"])}/index.html">run</a></td></tr>')
 
     parts.append('<section id="results"><h2>All results</h2>')
     parts.append('<div class="filters" id="results-filters">')
-    labels = {'model': 'Model', 'ref': 'Ref', 'ub': 'ubatch', 'depth': 'Depth'}
+    labels = {'model': 'Model', 'backend': 'Backend', 'ref': 'Ref', 'ub': 'ubatch', 'depth': 'Depth'}
     for name, label in labels.items():
         opts = sorted(values[name], key=lambda v: (not v.isdigit(), int(v) if v.isdigit() else 0, v))
         parts.append(f'<label>{label} <select name="{name}"><option value="">all</option>'
                      + ''.join(f'<option>{esc(o)}</option>' for o in opts) + '</select></label>')
     parts.append(f'<span class="note" id="results-count">{len(rows)} rows</span></div>')
     parts.append('<div class="scroll"><table id="results-table"><thead><tr><th>Date (UTC)</th><th>Ref</th><th>Commit</th>'
-                 '<th>Model</th><th class="num">ubatch</th><th class="num">Depth</th><th class="num">pp t/s</th>'
+                 '<th>Model</th><th>Backend</th><th class="num">ubatch</th><th class="num">Depth</th><th class="num">pp t/s</th>'
                  '<th class="num">tg t/s</th><th></th></tr></thead><tbody>')
     parts.extend(rows)
     parts.append('</tbody></table></div></section>\n</main>')
@@ -427,11 +427,15 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
     parts.append('<section id="bench"><h2>llama-bench</h2>')
     if not run.get('llama_bench'):
         parts.append('<p class="note">No llama-bench results.</p>')
+    shown_models: set[str] = set()
     for entry in run.get('llama_bench', []):
         name = entry.get('model')
-        parts.append(f'<h3>{esc(name)} {badge(entry.get("status"))}</h3>')
+        rows = entry.get('rows', [])
+        backend = entry.get('backend') or (rows[0].get('backends') if rows else None) or '?'
+        parts.append(f'<h3>{esc(name)} on {esc(backend)} {badge(entry.get("status"))}</h3>')
         m = models.get(name)
-        if m:
+        if m and name not in shown_models:
+            shown_models.add(str(name))
             sha_ok = m.get('sha256_actual') == m.get('sha256')
             parts.append(kv_table([
                 ('File', f'<code>{esc(m.get("file"))}</code>'),
@@ -440,7 +444,6 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
                 ('sha256 (pinned)', f'<code>{esc(m.get("sha256"))}</code>'),
                 ('sha256 (downloaded)', f'<code>{esc(m.get("sha256_actual"))}</code> ' + (badge('ok') if sha_ok else badge(m.get('status')))),
             ]))
-        rows = entry.get('rows', [])
         if rows:
             first = rows[0]
             parts.append(kv_table([
@@ -451,7 +454,7 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
                 ('Settings', esc(f'ngl {first.get("n_gpu_layers")}, fa {first.get("flash_attn")}, '
                                  f'K {first.get("type_k")}, V {first.get("type_v")}, threads {first.get("n_threads")}')),
             ]))
-        mine = [c for c in run_cells if c['model'] == name]
+        mine = [c for c in run_cells if c['model'] == name and c['backend'] == backend]
         for test in sorted({c['test'] for c in mine}, key=lambda t: (t[:2] != 'pp', t)):
             sub = [c for c in mine if c['test'] == test]
             ubs = sorted({c['n_ubatch'] for c in sub}, key=lambda v: v or 0)
@@ -508,7 +511,9 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
         parts.append('<p class="note">Not run.</p>')
     else:
         parts.append('<table><thead><tr><th>Backend</th><th>Status</th><th class="num">Exit</th><th class="num">Rows</th>'
-                     '<th class="num">Not supported</th><th>Table</th><th>Raw log</th></tr></thead><tbody>')
+                     '<th class="num">Not supported</th><th class="num">Failed</th><th>Groups (rows)</th>'
+                     '<th class="num">Listed cases without a result</th>'
+                     '<th>Table</th><th>Raw log</th></tr></thead><tbody>')
         for o in ops:
             backend = o.get('backend')
             table = f'<a href="ops-{esc(backend)}.html">all rows</a>' if o.get('rows') else '-'
@@ -516,8 +521,15 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
                 if any(lg.get('name') == f'ops-perf-{backend}.log' for lg in run.get('logs', [])) else '-'
             parts.append(f'<tr><td>{esc(backend)}</td><td>{badge(o.get("status"))}</td><td class="num">{esc(o.get("exit_code"))}</td>'
                          f'<td class="num">{esc(o.get("n_rows"))}</td><td class="num">{esc(o.get("n_unsupported"))}</td>'
+                         f'<td class="num">{esc(o.get("n_failed", "-"))}</td><td>{esc(group_summary(o))}</td>'
+                         f'<td class="num">{len(o.get("missing_listed") or [])} of {esc(o.get("n_listed", "-"))}</td>'
                          f'<td>{table}</td><td>{raw}</td></tr>')
         parts.append('</tbody></table>')
+        for o in ops:
+            if o.get('missing_listed'):
+                parts.append(f'<details><summary>{esc(o.get("backend"))}: listed cases without a result '
+                             '(not in this build, or among the failed cases)</summary>'
+                             f'<pre>{esc(chr(10).join(o["missing_listed"]))}</pre></details>')
     parts.append('</section>')
 
     parts.append('<section id="commands"><h2>Commands</h2>')
@@ -537,6 +549,10 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
         parts.append(f'<li>{item} <span class="sd">{esc(lg.get("bytes"))} bytes</span></li>')
     parts.append('</ul></section>\n</main>')
     return page(f'Run {key}', '\n'.join(parts))
+
+
+def group_summary(ops: dict[str, Any]) -> str:
+    return ', '.join(f"{g.get('group')} {g.get('n_rows')}" for g in ops.get('groups') or []) or '-'
 
 
 def throughput(row: list[Any]) -> str:
@@ -577,7 +593,7 @@ def summary(run: dict[str, Any]) -> dict[str, Any]:
     out = {k: run.get(k) for k in keep}
     out['runner'] = (run.get('runner') or {}).get('name')
     out['run_url'] = (run.get('workflow') or {}).get('run_url')
-    out['results'] = [{k: c[k] for k in ('model', 'test', 'n_batch', 'n_ubatch', 'n_depth', 'mean', 'sd', 'median', 'n')}
+    out['results'] = [{k: c[k] for k in ('model', 'backend', 'test', 'n_batch', 'n_ubatch', 'n_depth', 'mean', 'sd', 'median', 'n')}
                       for c in cells(run)]
     out['perplexity'] = [{k: p.get(k) for k in ('model', 'n_batch', 'n_ubatch', 'n_ctx', 'n_chunks', 'ppl', 'ppl_err', 'status')}
                          for p in run.get('perplexity') or []]

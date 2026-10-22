@@ -7,11 +7,12 @@
 # it was dispatched on. workflow_dispatch only works once this file is on the default branch.
 #
 # One run does:
-#   1. builds llama-bench and test-backend-ops for HIP (gfx1151), with the bench-gfx1151.yml recipe
-#   2. runs llama-bench on the pinned models over the ubatch x depth matrix, pp and tg
+#   1. builds llama-bench and test-backend-ops for HIP (gfx1151) and Vulkan, with the bench-gfx1151.yml recipe
+#   2. runs llama-bench on the pinned models over the ubatch x depth matrix, pp and tg, on ROCm0
 #   3. runs llama-perplexity with each model on a fixed Wikitext-2 sample at batch 2048 and 4096
-#   4. runs the full test-backend-ops perf suite on ROCm0, then builds Vulkan and runs it on Vulkan0
-#   5. uploads the raw logs as an artifact, converts them to one run.json, adds that run to the
+#   4. runs a test-backend-ops perf subset on ROCm0 (scripts/bench-history/ops-perf.sh)
+#   5. runs the same llama-bench matrix and then the perf subset on Vulkan0, after all HIP work
+#   6. uploads the raw logs as an artifact, converts them to one run.json, adds that run to the
 #      bench-results branch and rebuilds the Pages site from all runs on that branch
 #
 # Recipe. Models, quants and flags come from bench-gfx1151.yml and its PR172 comparison variant,
@@ -21,8 +22,8 @@
 #     cells at one depth are repeats of one measurement.
 #   - the model download URLs pin the Hugging Face revision, and the sha256 is checked.
 #   - the Vulkan SDK version is pinned and its sha256 is checked; bench-gfx1151 takes "latest".
-#   - one failed model does not stop the next model, and each model has a 5 h timeout instead of
-#     2 h. The deepest cells of the 27B model need a 100k-token prefill at 130 tok/s or less.
+#   - one failed model does not stop the next model, and each llama-bench run has a 3 h timeout
+#     instead of 2 h (the 27B model took 1 h 53 min on ROCm0 in run 39469034755).
 #
 #   key             repo                                 revision                                  file                            bytes        sha256
 #   qwen36-35b-a3b  bartowski/Qwen_Qwen3.6-35B-A3B-GGUF  5c2410d71524f4f72b023ce8daf7a80528226d5f  Qwen_Qwen3.6-35B-A3B-Q8_0.gguf  37812647552  bc57de096ec30e45773aa86103f35a8a32cea01f2193a53a3c636d618e4434e9
@@ -33,9 +34,13 @@
 # both 4096. At c4096 the two runs score the same tokens: b2048 cuts every chunk into two batches,
 # b4096 runs it as one, so a PPL difference comes from the batch cut alone.
 #
-# The Vulkan perf suite ended in vk::DeviceLostError on this pool on 2026-10-17 (RADV, after the
-# SUM [8192,8192] case), so it runs last: a device reset cannot touch the HIP numbers. Such a run
-# is kept and shown as partial.
+# Perf subset: MUL_MAT and MUL_MAT_ID for every type at n = 1, 8 and 512, plus the cases listed in
+# scripts/bench-history/perf-cases.txt (an even sample of every other op). The full suite took more
+# than 150 min per device in run 39469034755, mostly CPU-side weight setup of trellis MUL_MAT_ID cases.
+#
+# The full Vulkan perf suite ended in vk::DeviceLostError on this pool on 2026-10-17 (RADV, after the
+# SUM [8192,8192] case), so the Vulkan perf subset runs last: a device reset cannot touch the other
+# numbers. Such a run is kept and shown as partial.
 #
 # Runner labels: `devlab-dispatch` reaches the AMD Ryzen AI Dev Lab pool, `strix-halo` selects Strix
 # Halo hosts in it. Keep both. A wrong label does not fail, the job queues silently.
@@ -73,12 +78,17 @@ on:
         required: false
         default: '5'
       ops_perf:
-        description: 'Run the full test-backend-ops perf suite on ROCm0 and Vulkan0'
+        description: 'Run the test-backend-ops perf subset on ROCm0 and Vulkan0'
         required: false
         default: true
         type: boolean
       ppl:
         description: 'Run llama-perplexity on the Wikitext-2 sample at batch 2048 and 4096'
+        required: false
+        default: true
+        type: boolean
+      vulkan_bench:
+        description: 'Run the llama-bench matrix on Vulkan0 too'
         required: false
         default: true
         type: boolean
@@ -105,7 +115,8 @@ jobs:
     name: bench / ${{ inputs.ref || github.ref_name }}
     if: ${{ !inputs.site_only }}
     runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
-    timeout-minutes: 720
+    # expected about 6.5 h; the step timeouts bound a slow step so the later steps still get their time
+    timeout-minutes: 900
     # one benchmark at a time; GitHub keeps one pending run per group and cancels an older pending one
     concurrency:
       group: ${{ github.workflow }}-devlab
@@ -202,10 +213,20 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
+      # the lane's own scripts and case list, which the measured ref may not have
+      - name: Checkout the lane scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: .bench-lane
+          sparse-checkout: scripts/bench-history
+          persist-credentials: false
+
       - name: Record run metadata
         env:
           INPUT_OPS_PERF: ${{ inputs.ops_perf }}
           INPUT_PPL: ${{ inputs.ppl }}
+          INPUT_VULKAN_BENCH: ${{ inputs.vulkan_bench }}
         run: |
           set -euo pipefail
           logs="$RUNNER_TEMP/logs"
@@ -213,6 +234,7 @@ jobs:
           : > "$logs/commands.tsv"
           : > "$logs/results.tsv"
           : > "$logs/models.tsv"
+          cp .bench-lane/scripts/bench-history/perf-cases.txt "$logs/perf-cases.txt"
           git log -1 --format='%H%n%cI%n%s' > "$logs/commit.txt"
           {
             echo "schema=1"
@@ -231,6 +253,7 @@ jobs:
             echo "n_batch=$BENCH_N_BATCH"
             echo "ops_perf=$INPUT_OPS_PERF"
             echo "ppl=$INPUT_PPL"
+            echo "vulkan_bench=$INPUT_VULKAN_BENCH"
             echo "ppl_ctx=$PPL_CTX"
             echo "ppl_chunks=$PPL_CHUNKS"
             echo "ppl_batches=$PPL_BATCHES"
@@ -309,199 +332,9 @@ jobs:
             exit 1
           fi
 
-      - name: Fetch the Wikitext-2 sample
-        id: wikitext
-        if: ${{ !cancelled() && inputs.ppl && steps.device_hip.outcome == 'success' }}
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          dir="$RUNNER_TEMP/wikitext"
-          mkdir -p "$dir"
-          curl -fsSL --retry 5 --retry-delay 5 -o "$dir/wikitext-2-raw-v1.zip" "$WIKITEXT_ZIP_URL"
-          echo "$WIKITEXT_ZIP_SHA256  $dir/wikitext-2-raw-v1.zip" | sha256sum -c -
-          # python3 is on the runner (rocm-smi is a python script); unzip is not known to be
-          python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract("wikitext-2-raw/wiki.test.raw", sys.argv[2])' \
-            "$dir/wikitext-2-raw-v1.zip" "$dir"
-          echo "$WIKITEXT_TEST_SHA256  $dir/wikitext-2-raw/wiki.test.raw" | sha256sum -c -
-          echo "WIKITEXT_FILE=$dir/wikitext-2-raw/wiki.test.raw" >> "$GITHUB_ENV"
-
-      - name: Download models, run llama-bench and llama-perplexity
-        id: bench
-        if: ${{ !cancelled() && steps.device_hip.outcome == 'success' }}
-        timeout-minutes: 600
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
-          RUN_PPL: ${{ inputs.ppl }}
-        run: |
-          # the runner starts bash with -e; drop it so one failed model does not stop the next
-          set +e
-          set -uo pipefail
-          logs="$RUNNER_TEMP/logs"
-          model_root="$RUNNER_TEMP/models"
-          mkdir -p "$model_root"
-          quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
-
-          # repo|revision|file|bytes|sha256, read from the Hugging Face API on 2026-10-20
-          model_spec() {
-            case "$1" in
-              qwen36-35b-a3b)
-                echo 'bartowski/Qwen_Qwen3.6-35B-A3B-GGUF|5c2410d71524f4f72b023ce8daf7a80528226d5f|Qwen_Qwen3.6-35B-A3B-Q8_0.gguf|37812647552|bc57de096ec30e45773aa86103f35a8a32cea01f2193a53a3c636d618e4434e9'
-                ;;
-              qwen38-27b)
-                echo 'unsloth/Qwen3.8-27B-GGUF|4ca720788d1e01f1bff70c033e0d0028fd02e502|Qwen3.8-27B-Q8_0.gguf|29047086048|a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348'
-                ;;
-              *) return 1 ;;
-            esac
-          }
-
-          # held back for KV cache and compute buffers when checking that a model fits
-          margin_bytes=$(( 16 * 1024 * 1024 * 1024 ))
-          failed=0
-          IFS=',' read -ra want <<< "$BENCH_MODELS"
-          for name in "${want[@]}"; do
-            IFS='|' read -r repo rev file bytes sha <<< "$(model_spec "$name")"
-            dest="$model_root/$name"
-            out="$dest/$file"
-            note() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$repo" "$rev" "$file" "$bytes" "$sha" "$1" "$2" >> "$logs/models.tsv"; }
-
-            avail_bytes=$(awk '/^MemAvailable:/ {print $2 * 1024; exit}' /proc/meminfo)
-            if [ "$(( bytes + margin_bytes ))" -gt "$avail_bytes" ]; then
-              echo "::error::SKIP $name: needs $(( (bytes + margin_bytes) >> 30 )) GiB, $(( avail_bytes >> 30 )) GiB available"
-              note "" skipped-memory
-              printf 'llama-bench\t%s\tskipped\t0\n' "$name" >> "$logs/results.tsv"
-              failed=1
-              continue
-            fi
-            mkdir -p "$dest"
-            free_bytes=$(df -B1 --output=avail "$dest" | tail -1)
-            if [ "$free_bytes" -lt $(( bytes + bytes / 5 )) ]; then
-              echo "::error::SKIP $name: needs $(( (bytes + bytes / 5) >> 30 )) GiB of disk, $(( free_bytes >> 30 )) GiB free"
-              note "" skipped-disk
-              printf 'llama-bench\t%s\tskipped\t0\n' "$name" >> "$logs/results.tsv"
-              failed=1
-              continue
-            fi
-
-            url="https://huggingface.co/$repo/resolve/$rev/$file"
-            echo "fetching $url"
-            auth=()
-            [ -z "${HF_TOKEN:-}" ] || auth=(-H "Authorization: Bearer $HF_TOKEN")
-            if ! curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -C - "${auth[@]}" -o "$out" "$url"; then
-              echo "::error::download failed: $url"
-              note "" download-failed
-              printf 'llama-bench\t%s\tskipped\t0\n' "$name" >> "$logs/results.tsv"
-              rm -rf "$dest"
-              failed=1
-              continue
-            fi
-            got_bytes=$(stat -c %s "$out")
-            got_sha=$(sha256sum "$out" | cut -d' ' -f1)
-            if [ "$got_bytes" != "$bytes" ] || [ "$got_sha" != "$sha" ]; then
-              echo "::error::$name: got $got_bytes bytes sha256 $got_sha, pinned $bytes bytes sha256 $sha"
-              note "$got_sha" hash-mismatch
-              printf 'llama-bench\t%s\tskipped\t0\n' "$name" >> "$logs/results.tsv"
-              rm -rf "$dest"
-              failed=1
-              continue
-            fi
-            note "$got_sha" verified
-
-            # -fa and the KV types are spelled out so the numbers do not move with the auto defaults.
-            # HIP_LAUNCH_BLOCKING is not set: it serialises every kernel launch.
-            cmd=(timeout 18000 ./build-hip/bin/llama-bench
-              -m "$out"
-              -p "$BENCH_N_PROMPT" -n "$BENCH_N_GEN"
-              -b "$BENCH_N_BATCH" -ub "$BENCH_UBATCH"
-              -d "$BENCH_DEPTHS"
-              -lzm on-direct
-              -ngl 99 -fa on -ctk f16 -ctv f16
-              -r "$BENCH_REPS" -o jsonl --progress)
-            printf 'llama-bench-%s\t%s\n' "$name" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
-            echo "=== llama-bench $name ==="
-            "${cmd[@]}" > "$logs/llama-bench-$name.jsonl" 2> "$logs/llama-bench-$name.log"
-            rc=$?
-            cat "$logs/llama-bench-$name.log"
-            rows=$(wc -l < "$logs/llama-bench-$name.jsonl")
-            printf 'llama-bench\t%s\t%s\t%s\n' "$name" "$rc" "$rows" >> "$logs/results.tsv"
-            echo "$name: exit $rc, $rows jsonl rows"
-            if [ "$rc" -ne 0 ] || [ "$rows" -eq 0 ]; then
-              echo "::error::llama-bench failed for $name (exit $rc, $rows rows)"
-              failed=1
-            fi
-
-            if [ "$RUN_PPL" = "true" ]; then
-              for b in ${PPL_BATCHES//,/ }; do
-                if [ ! -s "${WIKITEXT_FILE:-}" ]; then
-                  echo "::error::SKIP llama-perplexity $name b$b: no Wikitext-2 sample"
-                  printf 'perplexity\t%s\t%s\tno-wikitext\t\n' "$name" "$b" >> "$logs/results.tsv"
-                  failed=1
-                  continue
-                fi
-                cmd=(timeout 3600 ./build-hip/bin/llama-perplexity
-                  -m "$out" -f "$WIKITEXT_FILE"
-                  -c "$PPL_CTX" --chunks "$PPL_CHUNKS"
-                  -b "$b" -ub "$b"
-                  -lzm on-direct
-                  -ngl 99 -fa on -ctk f16 -ctv f16)
-                printf 'perplexity-%s-b%s\t%s\n' "$name" "$b" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
-                echo "=== llama-perplexity $name b$b ==="
-                t0=$(date +%s.%N)
-                "${cmd[@]}" > "$logs/perplexity-$name-b$b.log" 2>&1
-                rc=$?
-                wall=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
-                final=$(grep -oE 'Final estimate: PPL = [0-9.]+ \+/- [0-9.]+' "$logs/perplexity-$name-b$b.log" | tail -1)
-                printf 'perplexity\t%s\t%s\t%s\t%s\n' "$name" "$b" "$rc" "$wall" >> "$logs/results.tsv"
-                echo "$name b$b: exit $rc, $wall s, ${final:-no final estimate}"
-                # perplexity exits 0 without a result when the text is too short, so require the final line
-                if [ "$rc" -ne 0 ] || [ -z "$final" ]; then
-                  tail -20 "$logs/perplexity-$name-b$b.log"
-                  echo "::error::llama-perplexity failed for $name b$b (exit $rc)"
-                  failed=1
-                fi
-              done
-            fi
-            rm -rf "$dest"
-          done
-          exit "$failed"
-
-      - name: test-backend-ops perf (ROCm0)
-        id: ops_rocm
-        if: ${{ !cancelled() && inputs.ops_perf && steps.build_hip.outcome == 'success' }}
-        timeout-minutes: 150
-        env:
-          # SOLVE_TRI aborts under HIP graph capture (hipBLAS CUBLAS_STATUS_INTERNAL_ERROR in
-          # solve_tri_f32_cublas), seen on ROCm 7.2.1 on this pool, see bench-gfx1151.yml. These
-          # perf numbers are graphs-off; remove this once the capture issue is fixed.
-          GGML_CUDA_DISABLE_GRAPHS: "1"
-          OPS_BIN: ./build-hip/bin/test-backend-ops
-          OPS_DEVICE: ROCm0
-        run: |
-          set +e
-          set -uo pipefail
-          logs="$RUNNER_TEMP/logs"
-          log="$logs/ops-perf-$OPS_DEVICE.log"
-          quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
-          cmd=("$OPS_BIN" perf -b "$OPS_DEVICE")
-          printf 'ops-perf-%s\t%s\n' "$OPS_DEVICE" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
-          "${cmd[@]}" 2>&1 | tee "$log"
-          rc=${PIPESTATUS[0]}
-          rows=$(grep -c 'us/run' "$log")
-          printf 'ops-perf\t%s\t%s\t%s\n' "$OPS_DEVICE" "$rc" "$rows" >> "$logs/results.tsv"
-
-          # `-b` with a name that matches no device exits 0, so prove the device ran
-          awk -v dev="$OPS_DEVICE" '
-            $0 ~ "^Backend [0-9]+/[0-9]+: " dev "$" {
-              seen = 1
-              if ((getline nxt) > 0 && nxt !~ /^  Skipping/) ran = 1
-            }
-            END { exit !(seen && ran) }
-          ' "$log" || { echo "::error::$OPS_DEVICE never ran" >&2; exit 1; }
-          [ "$rows" -gt 0 ] || { echo "::error::no perf rows on $OPS_DEVICE" >&2; exit 1; }
-          exit "$rc"
-
       - name: Provide the Vulkan toolchain
         id: vulkan_sdk
-        if: ${{ !cancelled() && inputs.ops_perf && steps.checkout.outcome == 'success' }}
+        if: ${{ !cancelled() && (inputs.ops_perf || inputs.vulkan_bench) && steps.checkout.outcome == 'success' }}
         timeout-minutes: 20
         run: |
           # the pool has Mesa and the loader but no glslc, headers, SPIRV-Headers config or
@@ -521,10 +354,8 @@ jobs:
             exit 1
           fi
           sdk_root=$(dirname "$(dirname "$glslc_path")")
-          # GITHUB_PATH only reaches later steps; all later steps are Vulkan steps
+          # PATH and LD_LIBRARY_PATH are set by the Vulkan steps themselves, so the HIP steps keep a clean environment
           echo "VULKAN_SDK=$sdk_root" >> "$GITHUB_ENV"
-          echo "$sdk_root/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=$sdk_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           # FindVulkan wants an unversioned libvulkan.so; the runner has only the versioned loader
           vk_lib=""
           for lib in "$sdk_root/lib/libvulkan.so" "$sdk_root"/x86_64/lib/libvulkan.so /usr/lib/x86_64-linux-gnu/libvulkan.so /lib/x86_64-linux-gnu/libvulkan.so; do
@@ -563,6 +394,8 @@ jobs:
         timeout-minutes: 45
         run: |
           set -euo pipefail
+          export PATH="$VULKAN_SDK/bin:$PATH"
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           logs="$RUNNER_TEMP/logs"
           quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
 
@@ -573,7 +406,7 @@ jobs:
             "-DVulkan_LIBRARY=$VULKAN_LIBRARY"
             -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_TESTS=ON
             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF)
-          build=(cmake --build build-vulkan --config Release -j "$(nproc)" --target test-backend-ops)
+          build=(cmake --build build-vulkan --config Release -j "$(nproc)" --target llama-bench test-backend-ops)
 
           printf 'build-vulkan-configure\t%s\n' "$(quote "${configure[@]}")" >> "$logs/commands.tsv"
           printf 'build-vulkan\t%s\n' "$(quote "${build[@]}")" >> "$logs/commands.tsv"
@@ -581,35 +414,174 @@ jobs:
           "${build[@]}" > "$logs/build-vulkan-make.log" 2>&1 || { tail -100 "$logs/build-vulkan-make.log"; exit 1; }
           tail -5 "$logs/build-vulkan-make.log"
 
-      - name: test-backend-ops perf (Vulkan0)
-        id: ops_vulkan
+      - name: Detect GPU device (Vulkan)
+        id: device_vulkan
         if: ${{ !cancelled() && steps.build_vulkan.outcome == 'success' }}
-        timeout-minutes: 150
-        env:
-          OPS_BIN: ./build-vulkan/bin/test-backend-ops
-          OPS_DEVICE: Vulkan0
         run: |
+          set -uo pipefail
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          logs="$RUNNER_TEMP/logs"
+          rc=0
+          ./build-vulkan/bin/llama-bench --list-devices > "$logs/devices-vulkan.txt" 2>&1 || rc=$?
+          cat "$logs/devices-vulkan.txt"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::llama-bench --list-devices failed (exit $rc)" >&2
+            exit "$rc"
+          fi
+          if ! grep -qE '^  Vulkan0:' "$logs/devices-vulkan.txt"; then
+            echo "::error::Vulkan0 is not registered; the Vulkan backend did not build in or found no GPU" >&2
+            exit 1
+          fi
+
+      - name: Fetch the Wikitext-2 sample
+        id: wikitext
+        if: ${{ !cancelled() && inputs.ppl && steps.device_hip.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/wikitext"
+          mkdir -p "$dir"
+          curl -fsSL --retry 5 --retry-delay 5 -o "$dir/wikitext-2-raw-v1.zip" "$WIKITEXT_ZIP_URL"
+          echo "$WIKITEXT_ZIP_SHA256  $dir/wikitext-2-raw-v1.zip" | sha256sum -c -
+          # python3 is on the runner (rocm-smi is a python script); unzip is not known to be
+          python3 -I -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract("wikitext-2-raw/wiki.test.raw", sys.argv[2])' \
+            "$dir/wikitext-2-raw-v1.zip" "$dir"
+          echo "$WIKITEXT_TEST_SHA256  $dir/wikitext-2-raw/wiki.test.raw" | sha256sum -c -
+          echo "WIKITEXT_FILE=$dir/wikitext-2-raw/wiki.test.raw" >> "$GITHUB_ENV"
+
+      - name: Download models, run llama-bench and llama-perplexity (HIP)
+        id: bench
+        if: ${{ !cancelled() && steps.device_hip.outcome == 'success' }}
+        timeout-minutes: 360
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
+          RUN_PPL: ${{ inputs.ppl }}
+          KEEP_MODELS: ${{ inputs.vulkan_bench && steps.device_vulkan.outcome == 'success' }}
+        run: |
+          # the runner starts bash with -e; drop it so one failed model does not stop the next
           set +e
           set -uo pipefail
           logs="$RUNNER_TEMP/logs"
-          log="$logs/ops-perf-$OPS_DEVICE.log"
+          model=.bench-lane/scripts/bench-history/model.sh
           quote() { local s; s=$(printf '%q ' "$@"); printf '%s' "${s% }"; }
-          cmd=("$OPS_BIN" perf -b "$OPS_DEVICE")
-          printf 'ops-perf-%s\t%s\n' "$OPS_DEVICE" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
-          "${cmd[@]}" 2>&1 | tee "$log"
-          rc=${PIPESTATUS[0]}
-          rows=$(grep -c 'us/run' "$log")
-          printf 'ops-perf\t%s\t%s\t%s\n' "$OPS_DEVICE" "$rc" "$rows" >> "$logs/results.tsv"
+          failed=0
+          IFS=',' read -ra want <<< "$BENCH_MODELS"
+          for i in "${!want[@]}"; do
+            name=${want[$i]}
+            if ! path=$(bash "$model" fetch "$name"); then
+              printf 'llama-bench\t%s\tskipped\t0\n' "$name" >> "$logs/results.tsv"
+              failed=1
+              continue
+            fi
+            bash "$model" bench llama-bench ./build-hip/bin/llama-bench "$name" "$path" || failed=1
 
-          awk -v dev="$OPS_DEVICE" '
-            $0 ~ "^Backend [0-9]+/[0-9]+: " dev "$" {
-              seen = 1
-              if ((getline nxt) > 0 && nxt !~ /^  Skipping/) ran = 1
-            }
-            END { exit !(seen && ran) }
-          ' "$log" || { echo "::error::$OPS_DEVICE never ran" >&2; exit 1; }
-          [ "$rows" -gt 0 ] || { echo "::error::no perf rows on $OPS_DEVICE" >&2; exit 1; }
-          exit "$rc"
+            if [ "$RUN_PPL" = "true" ]; then
+              for b in ${PPL_BATCHES//,/ }; do
+                if [ ! -s "${WIKITEXT_FILE:-}" ]; then
+                  echo "::error::SKIP llama-perplexity $name b$b: no Wikitext-2 sample"
+                  printf 'perplexity\t%s\t%s\tno-wikitext\t\n' "$name" "$b" >> "$logs/results.tsv"
+                  failed=1
+                  continue
+                fi
+                cmd=(timeout 3600 ./build-hip/bin/llama-perplexity
+                  -m "$path" -f "$WIKITEXT_FILE"
+                  -c "$PPL_CTX" --chunks "$PPL_CHUNKS"
+                  -b "$b" -ub "$b"
+                  -lzm on-direct
+                  -ngl 99 -fa on -ctk f16 -ctv f16)
+                printf 'perplexity-%s-b%s\t%s\n' "$name" "$b" "$(quote "${cmd[@]}")" >> "$logs/commands.tsv"
+                echo "=== llama-perplexity $name b$b ==="
+                t0=$(date +%s.%N)
+                "${cmd[@]}" > "$logs/perplexity-$name-b$b.log" 2>&1
+                rc=$?
+                wall=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+                final=$(grep -oE 'Final estimate: PPL = [0-9.]+ \+/- [0-9.]+' "$logs/perplexity-$name-b$b.log" | tail -1)
+                printf 'perplexity\t%s\t%s\t%s\t%s\n' "$name" "$b" "$rc" "$wall" >> "$logs/results.tsv"
+                echo "$name b$b: exit $rc, $wall s, ${final:-no final estimate}"
+                # perplexity exits 0 without a result when the text is too short, so require the final line
+                if [ "$rc" -ne 0 ] || [ -z "$final" ]; then
+                  tail -20 "$logs/perplexity-$name-b$b.log"
+                  echo "::error::llama-perplexity failed for $name b$b (exit $rc)"
+                  failed=1
+                fi
+              done
+            fi
+            # keep the file for the Vulkan llama-bench only while the next models still fit on the disk;
+            # the Vulkan step downloads a dropped file again
+            if [ "$KEEP_MODELS" = "true" ] && bash "$model" fits "${want[@]:i+1}"; then
+              echo "keeping $name for the Vulkan llama-bench"
+            else
+              rm -rf "$RUNNER_TEMP/models/$name"
+            fi
+          done
+          exit "$failed"
+
+      - name: test-backend-ops perf (ROCm0)
+        id: ops_rocm
+        if: ${{ !cancelled() && inputs.ops_perf && steps.device_hip.outcome == 'success' }}
+        timeout-minutes: 90
+        env:
+          # SOLVE_TRI aborts under HIP graph capture (hipBLAS CUBLAS_STATUS_INTERNAL_ERROR in
+          # solve_tri_f32_cublas), seen on ROCm 7.2.1 on this pool, see bench-gfx1151.yml. These
+          # perf numbers are graphs-off; remove this once the capture issue is fixed.
+          GGML_CUDA_DISABLE_GRAPHS: "1"
+        run: |
+          bash .bench-lane/scripts/bench-history/ops-perf.sh ./build-hip/bin/test-backend-ops ROCm0 \
+            "$RUNNER_TEMP/logs/ops-perf-ROCm0.log" .bench-lane/scripts/bench-history/perf-cases.txt
+
+      - name: llama-bench (Vulkan)
+        id: bench_vulkan
+        if: ${{ !cancelled() && inputs.vulkan_bench && steps.device_vulkan.outcome == 'success' }}
+        timeout-minutes: 330
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
+        run: |
+          # after all HIP work, so a Vulkan failure or device reset cannot touch the HIP numbers
+          set +e
+          set -uo pipefail
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          logs="$RUNNER_TEMP/logs"
+          model=.bench-lane/scripts/bench-history/model.sh
+          failed=0
+          IFS=',' read -ra want <<< "$BENCH_MODELS"
+          # files the HIP step kept first, so their space is free before a dropped file is downloaded again
+          kept=()
+          dropped=()
+          for name in "${want[@]}"; do
+            # key, repo, revision, file, bytes, sha256, actual sha256, status (first record per model)
+            row=$(awk -F'\t' -v n="$name" '$1 == n { print $4 "\t" $8; exit }' "$logs/models.tsv")
+            file=${row%%$'\t'*}
+            status=${row#*$'\t'}
+            if [ "$status" != "verified" ]; then
+              echo "::error::SKIP Vulkan llama-bench $name: the HIP step could not use the model (${status:-not fetched})"
+              printf 'llama-bench-vulkan\t%s\tskipped-%s\t0\n' "$name" "${status:-not-fetched}" >> "$logs/results.tsv"
+              failed=1
+            elif [ -s "$RUNNER_TEMP/models/$name/$file" ]; then
+              kept+=("$name")
+            else
+              dropped+=("$name")
+            fi
+          done
+          for name in "${kept[@]}" "${dropped[@]}"; do
+            path=$(find "$RUNNER_TEMP/models/$name" -name '*.gguf' -print -quit 2> /dev/null)
+            if [ -z "$path" ] && ! path=$(bash "$model" fetch "$name"); then
+              printf 'llama-bench-vulkan\t%s\tskipped-download\t0\n' "$name" >> "$logs/results.tsv"
+              failed=1
+              continue
+            fi
+            bash "$model" bench llama-bench-vulkan ./build-vulkan/bin/llama-bench "$name" "$path" || failed=1
+            rm -rf "$RUNNER_TEMP/models/$name"
+          done
+          exit "$failed"
+
+      - name: test-backend-ops perf (Vulkan0)
+        id: ops_vulkan
+        if: ${{ !cancelled() && inputs.ops_perf && steps.device_vulkan.outcome == 'success' }}
+        timeout-minutes: 90
+        run: |
+          export LD_LIBRARY_PATH="$VULKAN_SDK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          bash .bench-lane/scripts/bench-history/ops-perf.sh ./build-vulkan/bin/test-backend-ops Vulkan0 \
+            "$RUNNER_TEMP/logs/ops-perf-Vulkan0.log" .bench-lane/scripts/bench-history/perf-cases.txt
 
       - name: Write run manifest
         if: ${{ always() }}
@@ -617,11 +589,13 @@ jobs:
           S_VALIDATE: ${{ steps.validate.outcome }}
           S_BUILD_HIP: ${{ steps.build_hip.outcome }}
           S_DEVICE_HIP: ${{ steps.device_hip.outcome }}
-          S_WIKITEXT: ${{ steps.wikitext.outcome }}
-          S_BENCH: ${{ steps.bench.outcome }}
-          S_OPS_ROCM: ${{ steps.ops_rocm.outcome }}
           S_VULKAN_SDK: ${{ steps.vulkan_sdk.outcome }}
           S_BUILD_VULKAN: ${{ steps.build_vulkan.outcome }}
+          S_DEVICE_VULKAN: ${{ steps.device_vulkan.outcome }}
+          S_WIKITEXT: ${{ steps.wikitext.outcome }}
+          S_BENCH: ${{ steps.bench.outcome }}
+          S_BENCH_VULKAN: ${{ steps.bench_vulkan.outcome }}
+          S_OPS_ROCM: ${{ steps.ops_rocm.outcome }}
           S_OPS_VULKAN: ${{ steps.ops_vulkan.outcome }}
         run: |
           logs="$RUNNER_TEMP/logs"
@@ -630,11 +604,13 @@ jobs:
             printf 'validate\t%s\n' "$S_VALIDATE"
             printf 'build-hip\t%s\n' "$S_BUILD_HIP"
             printf 'device-hip\t%s\n' "$S_DEVICE_HIP"
-            printf 'wikitext\t%s\n' "$S_WIKITEXT"
-            printf 'llama-bench-ppl\t%s\n' "$S_BENCH"
-            printf 'ops-perf-ROCm0\t%s\n' "$S_OPS_ROCM"
             printf 'vulkan-sdk\t%s\n' "$S_VULKAN_SDK"
             printf 'build-vulkan\t%s\n' "$S_BUILD_VULKAN"
+            printf 'device-vulkan\t%s\n' "$S_DEVICE_VULKAN"
+            printf 'wikitext\t%s\n' "$S_WIKITEXT"
+            printf 'models-hip\t%s\n' "$S_BENCH"
+            printf 'llama-bench-vulkan\t%s\n' "$S_BENCH_VULKAN"
+            printf 'ops-perf-ROCm0\t%s\n' "$S_OPS_ROCM"
             printf 'ops-perf-Vulkan0\t%s\n' "$S_OPS_VULKAN"
           } > "$logs/steps.tsv"
           echo "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$logs/meta.env"

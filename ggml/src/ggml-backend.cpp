@@ -1531,7 +1531,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             int * src_backend_id = &tensor_backend_id(src);
             if (*src_backend_id == -1) {
                 if (src->view_src != NULL) {
-                    // views are always on the same backend as the source
+                    // views are always on the same backend as the source; a source no node reads directly (a
+                    // scratch tensor written only through views) is still unassigned here and takes this node's
+                    if (*cur_backend_id != -1 && tensor_backend_id(src->view_src) == -1) {
+                        tensor_backend_id(src->view_src) = *cur_backend_id;
+                        SET_CAUSE(src->view_src, "4.cur");
+                    }
                     *src_backend_id = tensor_backend_id(src->view_src);
                     SET_CAUSE(src, "4.vsrc");
                 } else {
@@ -1543,6 +1548,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // if the node is still unassigned, assign it to the first backend that supports it
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
+        }
+        // a view node whose source is still unassigned (a scratch tensor reached only through views) puts the
+        // source on its own backend, or the allocator meets an unassigned leaf
+        if (node->view_src != NULL && *cur_backend_id != -1 && tensor_backend_id(node->view_src) == -1) {
+            tensor_backend_id(node->view_src) = *cur_backend_id;
+            SET_CAUSE(node->view_src, "4.vnode");
         }
         GGML_ASSERT(*cur_backend_id != -1);
     }

@@ -26,6 +26,9 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
 #endif
+#if defined(COOPMAT) && defined(MUL_MAT_ID)
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
 
 #ifdef MUL_MAT_ID
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
@@ -89,6 +92,12 @@ layout (binding = 0) readonly buffer A_SCALAR {uint16_t data_a_scalar[];};
 #endif
 #if defined(A_TYPE_PACKED16)
 layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16[];};
+#if defined(MM_PREFETCH)
+// dword / word views of A for the 8-wide register-prefetch loaders (block sizes 210 / 110 / 34 / 22 bytes are
+// only 2-byte aligned, so the loaders fetch whole dwords and shift; see mul_mm_pf_funcs.glsl)
+layout (binding = 0) readonly buffer A_U32 {uint data_a_u32[];};
+layout (binding = 0) readonly buffer A_U16 {uint16_t data_a_u16[];};
+#endif
 #endif
 #if defined(A_TYPE_PACKED32)
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
@@ -126,7 +135,7 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer RowMap {uint data_row_map[];};
 // Fused MUL epilogue: one scale per (expert slot, token), broadcast down the M dimension.
-// Always bound; p.fusion_flags == 0 means ignore it.
+// Always bound; bit 0 of p.fusion_flags clear means ignore it (bit 4 is the row-id fill).
 layout (binding = 5) readonly buffer FusedScale {float data_fscale[];};
 #endif
 
@@ -162,6 +171,14 @@ layout (push_constant) uniform parameter
 #endif
 } p;
 
+#if defined(MUL_MAT_ID) && defined(MMID_SCALE)
+// MUL_MAT_ID + MUL + CPY(f16) must equal the unfused chain: the product goes through an XOR with a push-constant zero (bit 2 of
+// fusion_flags, asserted clear by ggml_vk_matmul_id) so the compiler cannot fold the multiply into the f16 conversion.
+D_TYPE mmid_scaled_store(const float acc, const float sc) {
+    return D_TYPE(uintBitsToFloat(floatBitsToUint(acc * sc) ^ (p.fusion_flags & 4u)));
+}
+#endif
+
 layout (constant_id = 0) const uint BLOCK_SIZE = 64;
 layout (constant_id = 1) const uint BM = 64;
 layout (constant_id = 2) const uint BN = 64;
@@ -195,8 +212,21 @@ const bool APPLY_SLM_A_RESHAPE = false;
 #endif
 #define SHMEM_STRIDE (BK / 2 + SHMEM_STRIDE_PAD)
 
-shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
-shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
+// COOPMAT_MANUAL_FRAG ("_mf" builds, used only after ggml_vk_check_coopmat_rdna3_layout passed): uint LDS tiles, fragments built
+// from eight 32-bit reads per lane in the RDNA3 wave32 layout instead of coopMatLoad (same elements, same WMMA order).
+#if defined(COOPMAT) && defined(COOPMAT_MANUAL_FRAG) && !defined(DATA_A_BF16)
+#define BUF_MANUAL 1
+#define BUF_T uint
+#define TO_BUF(v)   pack32(float16BitsToUint16(v))
+#define FROM_BUF(u) uint16BitsToFloat16(unpack16(u))
+#else
+#define BUF_T FLOAT_TYPEV2
+#define TO_BUF(v)   (v)
+#define FROM_BUF(u) (u)
+#endif
+
+shared BUF_T buf_a[BM * SHMEM_STRIDE];
+shared BUF_T buf_b[BN * SHMEM_STRIDE];
 
 #define NUM_WARPS (BLOCK_SIZE / WARP)
 
@@ -204,11 +234,108 @@ shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
 shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #endif
 
+#if defined(MM_PREFETCH)
+#if defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K)
+// Per-tile-row (d, m) f16 pairs for the current superblock: 8 sub-block pairs per row, refilled once per
+// superblock (every 8th BK=32 step) so the loaders decode the packed 6-bit scales once per row instead of
+// once per 4-weight load. f16 pairs keep the 128x128 tile at 2 workgroups per CU (an f32 cache did not).
+#define SCACHE_DM 1
+#if defined(FLOAT16)
+#define SCACHE_T f16vec2
+#else
+#define SCACHE_T vec2
+#endif
+shared SCACHE_T scache_dm[BM * 8];
+#endif
+#endif
+
 #if defined(DATA_A_PTQ1_0)
 #include "ptq1_0.glsl"
 #endif
 #include "mul_mm_id_funcs.glsl"
 #include "mul_mm_funcs.glsl"
+#ifdef COOPMAT
+#if defined(BUF_MANUAL)
+// test hook (GGML_VK_TEST_MF_SKEW, spec constant 16): rotate the fragment's k pairs so a byte-equal test must see a difference
+layout(constant_id = 16) const uint MF_SKEW = 0;
+#define MF_E(e) (((e) + MF_SKEW) & 7u)
+#define LOAD_A_FRAG(dst, row0, k2) { \
+        const uint mf_base = a_shmem_index((row0) + gl_SubgroupInvocationID % 16, (k2)); \
+        [[unroll]] for (uint mf_e = 0; mf_e < 8; mf_e++) { \
+            const FLOAT_TYPEV2 mf_v = FROM_BUF(buf_a[mf_base + MF_E(mf_e)]); dst[2 * mf_e] = mf_v.x; dst[2 * mf_e + 1] = mf_v.y; } }
+#define LOAD_B_FRAG(dst, col0, k2) { \
+        const uint mf_base = ((col0) + gl_SubgroupInvocationID % 16) * SHMEM_STRIDE + (k2); \
+        [[unroll]] for (uint mf_e = 0; mf_e < 8; mf_e++) { \
+            const FLOAT_TYPEV2 mf_v = FROM_BUF(buf_b[mf_base + MF_E(mf_e)]); dst[2 * mf_e] = mf_v.x; dst[2 * mf_e + 1] = mf_v.y; } }
+#else
+#define LOAD_A_FRAG(dst, row0, k2) coopMatLoad(dst, buf_a, a_shmem_index(row0, k2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor)
+#define LOAD_B_FRAG(dst, col0, k2) coopMatLoad(dst, buf_b, (col0) * SHMEM_STRIDE + k2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor)
+#endif
+#endif
+#if defined(MM_PREFETCH)
+#include "mul_mm_pf_funcs.glsl"
+#endif
+
+// Register-direct A for MUL_MAT_ID (REG_A, after Halogen's expert-loading design; host gate GGML_VK_MMID_REGA): each wave32 subgroup
+// owns 32 rows; lanes 0..15 / 16..31 dequantize one 16-row fragment each, one K step ahead, into the A fragment elements (gfx11
+// layout) and swap halves with one xor-16 shuffle per f16 pair. A skips shared memory; aligned iq3_xxs / iq4_nl pipelines only.
+layout(constant_id = 15) const uint REG_A = 0;
+#if defined(MUL_MAT_ID) && defined(COOPMAT) && defined(FLOAT16) && defined(A_PREFETCH) && LOAD_VEC_A == 8 && (defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ4_NL))
+#define MMID_REGA 1
+struct rega_raw_t { uvec4 q; uint d; };
+#if defined(DATA_A_IQ3_XXS)
+#define REGA_BLK_K 256
+// q.x: grid bytes 0..3, q.y: grid bytes 4..7, q.z: sign/scale dword, q.w: d bits (the lane's row, sub-block ib32)
+rega_raw_t rega_fetch(const uint pos_a, const uint row_off) {
+    const uint sb   = (pos_a / 32 + row_off) * 98;
+    const uint ib32 = (pos_a / 4) % 8;
+    const uint q    = (sb + 2 + 8 * ib32) / 2;
+    const uint so   = (sb + 66 + 4 * ib32) / 2;
+    return rega_raw_t(uvec4(uint(data_a_u16[q])      | (uint(data_a_u16[q + 1]) << 16),
+                            uint(data_a_u16[q + 2])  | (uint(data_a_u16[q + 3]) << 16),
+                            uint(data_a_u16[so])     | (uint(data_a_u16[so + 1]) << 16),
+                            uint(data_a_u16[sb / 2])), 0u);
+}
+#else
+#define REGA_BLK_K 32
+// q: the block's 16 nibble bytes (low nibbles k 0..15, high k 16..31), d: d bits
+rega_raw_t rega_fetch(const uint pos_a, const uint row_off) {
+    const uint base = (pos_a / 4 + row_off) * 18;
+    const bool odd  = ((base + 2) & 2) != 0;
+    return rega_raw_t(uvec4(unpack8b(fetch8(base + 2), odd), unpack8b(fetch8(base + 10), odd)), uint(data_a_u16[base / 2]));
+}
+#endif
+// k 16*h .. 16*h+15 of the sub-block into an A fragment
+void rega_build(const rega_raw_t raw, const uint h, inout coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> a) {
+#if defined(DATA_A_IQ3_XXS)
+    const float db = unpackHalf2x16(raw.q.w).x * 0.5 * (0.5 + float(raw.q.z >> 28));
+    const uint g = h == 0 ? raw.q.x : raw.q.y;
+    [[unroll]] for (uint j = 0; j < 2; j++) {
+        const uint s7 = bitfieldExtract(raw.q.z, int(7 * (2 * h + j)), 7);
+        const uint s8 = s7 | ((bitCount(s7) & 1) << 7);
+        const vec4 v0 = db * vec4(unpack8(iq3xxs_grid[(g >> (16 * j)) & 0xFF]));
+        const vec4 v1 = db * vec4(unpack8(iq3xxs_grid[(g >> (16 * j + 8)) & 0xFF]));
+        const vec4 m0 = vec4(1.0) - 2.0 * vec4(uvec4(s8, s8 >> 1, s8 >> 2, s8 >> 3) & 1u);
+        const vec4 m1 = vec4(1.0) - 2.0 * vec4(uvec4(s8 >> 4, s8 >> 5, s8 >> 6, s8 >> 7) & 1u);
+        const vec4 a0 = v0 * m0;
+        const vec4 a1 = v1 * m1;
+        a[8 * j + 0] = FLOAT_TYPE(a0.x); a[8 * j + 1] = FLOAT_TYPE(a0.y);
+        a[8 * j + 2] = FLOAT_TYPE(a0.z); a[8 * j + 3] = FLOAT_TYPE(a0.w);
+        a[8 * j + 4] = FLOAT_TYPE(a1.x); a[8 * j + 5] = FLOAT_TYPE(a1.y);
+        a[8 * j + 6] = FLOAT_TYPE(a1.z); a[8 * j + 7] = FLOAT_TYPE(a1.w);
+    }
+#else
+    const float d = unpackHalf2x16(raw.d).x;
+    [[unroll]] for (uint w = 0; w < 4; w++) {
+        const uint nb = (raw.q[w] >> (4 * h)) & 0x0F0F0F0F;
+        a[4 * w + 0] = FLOAT_TYPE(d * float(kvalues_iq4nl[nb & 0xFF]));
+        a[4 * w + 1] = FLOAT_TYPE(d * float(kvalues_iq4nl[(nb >> 8) & 0xFF]));
+        a[4 * w + 2] = FLOAT_TYPE(d * float(kvalues_iq4nl[(nb >> 16) & 0xFF]));
+        a[4 * w + 3] = FLOAT_TYPE(d * float(kvalues_iq4nl[nb >> 24]));
+    }
+#endif
+}
+#endif
 
 #ifdef MULMAT_QUANT
 #include "iq_shmem_init.glsl"
@@ -345,7 +472,176 @@ void main() {
     }
 #endif
 
+#if defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K)
+#if defined(SCACHE_DM)
+// refill all 8 sub-block (d, m) pairs per row at each superblock boundary (reads at the current pos_a)
+#define SCACHE_REFILL(blk) if (((blk) & 255) == 0) { \
+            for (uint x = gl_LocalInvocationID.x; x < BM * 8; x += gl_WorkGroupSize.x) { \
+                const uint r  = x / 8; \
+                const uint is = x % 8; \
+                const uint idx = pos_a + r * (p.stride_a / LOAD_VEC_A); \
+                const uint ib = idx / 64; \
+ \
+                const vec2 loadd = vec2(data_a[ib].dm); \
+                const uvec3 scales = uvec3(data_a_packed32[ib].scales[0], \
+                                           data_a_packed32[ib].scales[1], \
+                                           data_a_packed32[ib].scales[2]); \
+                const uint scalesoffs = (is & 3) * 8; \
+                const uint scidx0 = (is < 4) ? 0 : 2; \
+                const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2; \
+                const uint mbidx0 = (is < 4) ? 1 : 2; \
+                const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4; \
+                const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2; \
+                const uint sc    = ((scales[scidx0] >> scalesoffs) & 0xF) | ((scales[0] >> scidxshift1) & 0x30); \
+                const uint mbyte = ((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30); \
+ \
+                scache_dm[x] = SCACHE_T(loadd.x * sc, -loadd.y * mbyte); \
+            } \
+            barrier(); \
+}
+#endif
+#endif
+#if !defined(SCACHE_REFILL)
+#define SCACHE_REFILL(blk)
+#endif
+
+#if defined(A_PREFETCH) && defined(B_PREFETCH)
+    // The 256x256 XL tier (16 wave32 subgroups, 192 VGPRs each, 128 for the accumulators) stays spill-free by re-reading B per
+    // accumulator row and (XL_IDX_BASE, not q4_K) keeping only row 0's tile addressing in registers; other tiles are unchanged.
+    const bool XL_TILE = BM * BN >= 256 * 256;
+#if defined(DATA_A_Q4_K)
+    const bool XL_IDX_BASE = false;
+#else
+    const bool XL_IDX_BASE = XL_TILE;
+#endif
+    // Register double-buffer for the next K tile (mul_mm_pf_funcs.glsl); aligned pipelines only. The raw
+    // registers hold the tile at pos_a / pos_b; store_*_raw dequantise it into LDS while the next tile's
+    // loads are in flight. The lane-invariant parts of the tile addressing are computed once (NIR does
+    // not hoist them out of the K loop).
+    const uint NA_RAW = (BM + loadstride_a - 1) / loadstride_a;
+    const uint NB_RAW = (BN + loadstride_b - 1) / loadstride_b;
+    A_RAW_T a_raw[NA_RAW];
+    B_TYPE b_raw[NB_RAW];
+    uint a_lane[NA_RAW];
+    uint a_sidx[NA_RAW];
+    uint b_sidx[NB_RAW];
+    const uint a_lane0 = a_lane_off(loadr_a, loadc_a);
+    const uint a_sidx0 = a_shmem_index(loadc_a, loadr_a * LOAD_VEC_A / 2);
+    const uint b_sidx0 = loadc_b * SHMEM_STRIDE + loadr_b * LOAD_VEC_B / 2;
+    if (!XL_IDX_BASE) {
+        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+            a_lane[l / loadstride_a] = a_lane_off(loadr_a, loadc_a + l);
+            a_sidx[l / loadstride_a] = a_shmem_index(loadc_a + l, loadr_a * LOAD_VEC_A / 2);
+        }
+        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+            b_sidx[l / loadstride_b] = (loadc_b + l) * SHMEM_STRIDE + loadr_b * LOAD_VEC_B / 2;
+        }
+    }
+#define A_LANE(l) (XL_IDX_BASE ? a_lane0 + a_lane_off(0, (l)) : a_lane[(l) / loadstride_a])
+#define A_SIDX(l) (XL_IDX_BASE ? a_sidx0 + a_shmem_index((l), 0) : a_sidx[(l) / loadstride_a])
+#define B_SIDX(l) (XL_IDX_BASE ? b_sidx0 + (l) * SHMEM_STRIDE : b_sidx[(l) / loadstride_b])
+#ifdef MUL_MAT_ID
+// spec constant 17 (GGML_VK_MMID_B_FULL, only with the row-id fill): load B for the whole BN tile, so the per-lane guard folds away
+// and the prefetch loads stay in flight across the WMMAs (no vmcnt(0) at a K-loop branch on gfx1151 ACO). Only where
+// BN % loadstride_b == 0, else a lane's last pass would land past the B tile; other tiles keep the guard.
+layout(constant_id = 17) const uint MMID_B_FULL = 0;
+#define PF_B_GUARD if ((MMID_B_FULL != 0 && BN % loadstride_b == 0) || gl_LocalInvocationID.x < required_work_items)
+// with the whole B tile valid (B_FULL above) every warp column may run the WMMAs (empty columns compute token-0 rows never stored)
+#define PF_WARP_GUARD if ((MMID_B_FULL != 0 && BN % loadstride_b == 0) || warp_c < required_warp_c)
+#else
+#define PF_B_GUARD
+#endif
+#define PF_FETCH() \
+    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { fetch_a(pos_a, loadr_a, loadc_a + l, A_LANE(l), a_raw[l / loadstride_a]); } \
+    PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); } }
+#define PF_STORE() \
+    [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) { store_a_raw(pos_a, loadr_a, loadc_a + l, A_SIDX(l), a_raw[l / loadstride_a]); } \
+    PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); } }
+    const bool prefetch = ALIGNED != 0;
+#if defined(MMID_REGA)
+    if (REG_A != 0 && prefetch) {
+        // lane-split register-direct A (REG_A == 3): WM == 32, the lane half selects which of the subgroup's two 16-row
+        // blocks it loads; rows past p.M clamp to the last row (never stored)
+        const uint rl = warp_r * WM + (gl_SubgroupInvocationID < 16 ? 0 : TM) + gl_SubgroupInvocationID % 16;
+        const uint row_off1 = min(ir * BM + rl, p.M - 1) * (p.stride_a / REGA_BLK_K) - ir * BM * (p.stride_a / REGA_BLK_K);
+        rega_raw_t a1 = rega_fetch(pos_a, row_off1);
+        PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); } }
+        const bool lo = gl_SubgroupInvocationID < 16;
+        for (uint block = start_k; block < end_k; block += BK) {
+            PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { store_b_raw(B_SIDX(l), b_raw[l / loadstride_b]); } }
+            const bool more = block + BK < end_k;
+            pos_a += more ? BK / LOAD_VEC_A_EFF : 0;
+            pos_b += more ? BK / LOAD_VEC_B_EFF : 0;
+            const rega_raw_t a1n = rega_fetch(pos_a, row_off1);
+            PF_B_GUARD { [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) { fetch_b(pos_b, loadr_b, loadc_b + l, b_raw[l / loadstride_b]); } }
+            barrier();
+            PF_WARP_GUARD {
+                coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> ar0, ar1;
+                [[unroll]] for (uint h = 0; h < 2; h++) {
+                    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> mine;
+                    rega_build(a1, h, mine);
+                    [[unroll]] for (uint e = 0; e < 8; e++) {
+                        const uint pm = packFloat2x16(f16vec2(mine[2 * e], mine[2 * e + 1]));
+                        const uint po = subgroupShuffleXor(pm, 16);
+                        const f16vec2 v0 = unpackFloat2x16(lo ? pm : po);
+                        const f16vec2 v1 = unpackFloat2x16(lo ? po : pm);
+                        ar0[2 * e] = v0.x; ar0[2 * e + 1] = v0.y;
+                        ar1[2 * e] = v1.x; ar1[2 * e + 1] = v1.y;
+                    }
+                    [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                        LOAD_B_FRAG(cache_b, warp_c * WN + cm_col * TN, 8 * h);
+                        sums[cm_col * cms_per_row]     = coopMatMulAdd(ar0, cache_b, sums[cm_col * cms_per_row]);
+                        sums[cm_col * cms_per_row + 1] = coopMatMulAdd(ar1, cache_b, sums[cm_col * cms_per_row + 1]);
+                    }
+                }
+            }
+            barrier();
+            a1 = a1n;
+        }
+    } else
+#endif
+    if (prefetch) {
+        a_fetch_all = true;
+        PF_FETCH()
+        a_fetch_all = false;
+        for (uint block = start_k; block < end_k; block += BK) {
+            SCACHE_REFILL(block)
+            PF_STORE()
+            // past the last tile the fetch re-reads the last tile (in bounds, never stored), which keeps
+            // the raw registers free of a loop-carried select
+            const bool more = block + BK < end_k;
+            pos_a += more ? BK / LOAD_VEC_A_EFF : 0;
+            pos_b += more ? BK / LOAD_VEC_B_EFF : 0;
+            PF_FETCH()
+            barrier();
+#ifdef COOPMAT
+#ifdef MUL_MAT_ID
+            PF_WARP_GUARD {
+#endif
+            [[unroll]] for (uint i = 0; i < BK; i += TK) {
+                [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+                    LOAD_A_FRAG(cache_a, warp_r * WM + cm_row * TM, i / 2);
+                    [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                        LOAD_B_FRAG(cache_b, warp_c * WN + cm_col * TN, i / 2);
+                        sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
+                    }
+                    // XL: re-read the B fragments for every row (see XL_TILE)
+                    if (XL_TILE) { subgroupMemoryBarrierShared(); }
+                }
+            }
+#ifdef MUL_MAT_ID
+            }
+#endif
+#else
+#error "MM_PREFETCH variants are KHR coopmat only"
+#endif
+            barrier();
+        }
+    } else
+#endif // A_PREFETCH && B_PREFETCH
+    {
     for (uint block = start_k; block < end_k; block += BK) {
+        SCACHE_REFILL(block)
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
@@ -375,10 +671,10 @@ void main() {
         [[unroll]] for (uint i = 0; i < BK; i += TK) {
             [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
                 // Load from shared into cache
-                coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
+                LOAD_A_FRAG(cache_a, warp_r * WM + cm_row * TM, i / 2);
 
                 [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-                    coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                    LOAD_B_FRAG(cache_b, warp_c * WN + cm_col * TN, i / 2);
 
                     sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
                 }
@@ -425,6 +721,7 @@ void main() {
 
         barrier();
     }
+    }
 
 #if defined(ACC_TYPE_MAX)
 #ifdef COOPMAT
@@ -462,18 +759,27 @@ void main() {
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
                 if (dr + cm_row * TM + store_r < p.M) {
                     const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r;
-                    if (p.fusion_flags != 0) {
+#ifdef MMID_SCALE
+                    const float sc = (p.fusion_flags & 1u) != 0 ? data_fscale[row_idx.y * p.nei0 + row_idx.x] : 1.0;
+                    data_d[didx] = mmid_scaled_store(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]), sc);
+#else
+                    if ((p.fusion_flags & 1u) != 0) {
                         data_d[didx] = D_TYPE(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]) * data_fscale[row_idx.y * p.nei0 + row_idx.x]);
                     } else {
                         data_d[didx] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
                     }
+#endif
                 }
             }
             barrier();
         }
     }
 #else
+#ifdef D16
+    const bool is_aligned = p.stride_d % 8 == 0;  // 16-byte rows of float16_t
+#else
     const bool is_aligned = p.stride_d % 4 == 0;  // Assumption: D_TYPE == float
+#endif
 
     [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
         [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
@@ -519,7 +825,7 @@ void main() {
                 if (row_i >= _ne1) break;
 
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
-                const bool do_scale = p.fusion_flags != 0;
+                const bool do_scale = (p.fusion_flags & 1u) != 0;
                 const float fscale = do_scale ? data_fscale[row_idx.y * p.nei0 + row_idx.x] : 1.0f;
 #endif // MUL_MAT_ID
                 [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
