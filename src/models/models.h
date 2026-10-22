@@ -2561,6 +2561,12 @@ struct llama_model_qwen4exp : public llama_model_base {
     // counted as created but never allocated, mapped or read, and build_ple takes its
     // rows from this reader instead of ggml_get_rows.
     std::shared_ptr<llama_ple_disk> ple_disk;
+
+    // An EXL3 n-gram table: per_layer_tok_embd is its I16 trellis, one ring of ple_exl3_k bits per element and row,
+    // and every row adds the F16 bias [ple_head_dim, ple_n_heads] of its hash head. Rows are decoded as they are gathered.
+    ggml_tensor * ple_exl3_bias = nullptr;
+    int32_t       ple_exl3_k    = 0;
+
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 

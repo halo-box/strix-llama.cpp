@@ -2456,9 +2456,13 @@ void llama_model_base::load_tensors_exl3() {
     }
 
     // row tables decode to the embedding width (only the token embedding is one)
+    // an n-gram row table (with a head bias, qwen4exp PLE) is decoded by the arch on the host, never by a graph op
     const std::string suffix_rows = ".exl3r_trellis";
     for (const auto & [name, t] : tensors_by_name) {
         if (name.size() <= suffix_rows.size() || name.compare(name.size() - suffix_rows.size(), suffix_rows.size(), suffix_rows) != 0) {
+            continue;
+        }
+        if (by_name.count(name.substr(0, name.size() - suffix_rows.size()) + ".exl3r_bias")) {
             continue;
         }
         const auto sg = by_name.find(name.substr(0, name.size() - suffix_rows.size()) + ".exl3r_signs");

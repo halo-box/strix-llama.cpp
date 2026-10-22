@@ -72,6 +72,12 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (GGML_EXL3)
+    # the qwen4exp PLE gather decodes EXL3 n-gram rows on the host (ggml/exl3)
+    target_compile_definitions(llama PRIVATE LLAMA_USE_EXL3)
+    target_include_directories(llama PRIVATE ../ggml/exl3)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

@@ -1554,6 +1554,39 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // EXL3 row-ring table (a quantized token embedding): "<name>.exl3r_trellis/_signs" instead of "<name>.weight"
         const ggml_tensor * table = get_tensor_meta((base + ".exl3r_trellis").c_str());
+
+        // EXL3 n-gram row table (qwen4exp PLE): one ring of `width` per row and a bias per hash head in place of the signs.
+        // The arch creates the bias ("<name>.exl3r_bias") and decodes the rows it gathers on the host, so the table stays
+        // in host memory, read on demand when the arch marks it lazy
+        if (table != nullptr && get_tensor_meta((base + ".exl3r_bias").c_str()) != nullptr) {
+            const int64_t width  = ne.size() == 2 ? ne.begin()[0] : 0;
+            const int64_t n_rows = ne.size() == 2 ? ne.begin()[1] : 0;
+            const int64_t K      = width > 0 ? (table->ne[0] - 1)*16/width : 0;
+            if (get_tensor_meta(name.c_str()) != nullptr || get_tensor_meta((base + ".exl3r_signs").c_str()) != nullptr ||
+                    K < 1 || K > 8 || (width*K) % 16 != 0 || table->ne[0] != 1 + width*K/16 || table->type != GGML_TYPE_I16 ||
+                    table->ne[1] != n_rows || table->ne[2] != 1 || table->ne[3] != 1) {
+                throw std::runtime_error(format("%s: EXL3 n-gram row table '%s' does not match the weight %s",
+                        __func__, base.c_str(), llama_format_tensor_shape(std::vector<int64_t>(ne)).c_str()));
+            }
+            if ((flags & (TENSOR_DUPLICATED | TENSOR_ALLOW_RESHAPE)) || llm_tensor_info_for(tn.tensor).op != GGML_OP_GET_ROWS) {
+                throw std::runtime_error(format("%s: EXL3 n-gram row table '%s' is not used as an embedding table", __func__, base.c_str()));
+            }
+            if (flags & TENSOR_SKIP) {
+                size_data -= ggml_nbytes(table);
+                n_created++;
+                return nullptr;
+            }
+
+            const std::string table_name = base + ".exl3r_trellis";
+            if (flags & TENSOR_READ_LAZY) {
+                is_lazy = lazy.add(table_name, table, no_alloc ? nullptr : &require_weight(table_name.c_str()));
+            }
+            ggml_tensor * res = ggml_dup_tensor(ctx_for_buft(lazy_read::buft()), table);
+            ggml_set_name(res, ggml_get_name(table));
+            n_created++;
+            return res;
+        }
+
         if (table != nullptr) {
             const ggml_tensor * signs = get_tensor_meta((base + ".exl3r_signs").c_str());
             const int64_t width  = ne.size() == 2 ? ne.begin()[0] : 0;

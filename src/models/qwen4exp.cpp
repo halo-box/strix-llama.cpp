@@ -5,6 +5,10 @@
 #include "llama-memory-recurrent.h"
 #include "llama-ple-disk.h"
 
+#ifdef LLAMA_USE_EXL3
+#include "exl3.h"
+#endif
+
 #include <algorithm>
 #include <thread>
 #include <cinttypes>
@@ -226,8 +230,18 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         // the converter pads the table; a model synthesised from metadata has no tensor to ask
+        // an EXL3 file holds the rows quantized (exllamav3 ngram_codec.py) as "<name>.exl3r_trellis", one ring of
+        // 1 + ple_head_dim*K/16 int16 per row, next to the F16 bias of every hash head
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        const auto * ple_w = ml.get_weight(ple_name.c_str());
+        const std::string ple_exl3 = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "exl3r_trellis").str();
+        const auto * ple_w = ml.get_weight(ple_exl3.c_str()) ? ml.get_weight(ple_exl3.c_str()) : ml.get_weight(ple_name.c_str());
+        if (ml.get_weight(ple_exl3.c_str())) {
+            ple_exl3_k    = (int32_t) ((ple_w->tensor->ne[0] - 1)*16/hparams.ple_head_dim);
+            ple_exl3_bias = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "exl3r_bias"), { hparams.ple_head_dim, hparams.ple_n_heads }, 0);
+            if (params.lazy_mode == LLAMA_LAZY_MODE_DIRECT) {
+                throw std::runtime_error("the EXL3 n-gram table is read through the memory map: use --lazy-mode on or auto, not on-direct");
+            }
+        }
         if (ple_w) {
             if (ple_w->tensor->ne[1] < ple_rows) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
@@ -1803,6 +1817,10 @@ public:
     std::vector<float>   embd_buf;
     std::vector<int32_t> rows_global;
 
+    // EXL3 n-gram table: the head biases and head offsets, copied for the row decoder
+    std::vector<ggml_fp16_t> ple_bias;
+    std::vector<int64_t>     ple_offsets;
+
     const llama_model_qwen4exp & pmodel;
 
     // the predecessor tokens live in the attention KV cells (ext.tok)
@@ -1938,13 +1956,21 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         const ggml_tensor * tab = pmodel.per_layer_tok_embd;
         GGML_ASSERT(tab && tab->data && rows == nullptr);
         const size_t  row_size = ggml_row_size(tab->type, tab->ne[0]);
-        const int64_t dim      = tab->ne[0];
-        GGML_ASSERT(dim == hp.ple_head_dim);
+        const int64_t dim      = hp.ple_head_dim;
+        const bool    exl3     = pmodel.ple_exl3_bias != nullptr;
+        GGML_ASSERT(exl3 ? tab->type == GGML_TYPE_I16 : tab->ne[0] == dim);
 
         const auto * traits = ggml_get_type_traits(tab->type);
 
-        GGML_ASSERT(tab->type == GGML_TYPE_F32 || traits->to_float != nullptr);
+        GGML_ASSERT(exl3 || tab->type == GGML_TYPE_F32 || traits->to_float != nullptr);
         embd_buf.resize(idx.size() * (size_t) dim);
+
+        // EXL3: a row is its ring plus the bias of its hash head, the head found from the row as exllamav3 does
+        if (exl3) {
+            ple_bias.resize(ggml_nelements(pmodel.ple_exl3_bias));
+            ggml_backend_tensor_get(pmodel.ple_exl3_bias, ple_bias.data(), 0, ggml_nbytes(pmodel.ple_exl3_bias));
+            ple_offsets.assign(hp.ple_head_offsets.begin(), hp.ple_head_offsets.begin() + hp.ple_n_heads);
+        }
 
         // The GPU idles while this runs (65536 rows for a 4096-token ubatch), so it is split over host threads:
         // phase 1 queues every page read at once (memory-mapped table, random rows: one madvise per row instead of
@@ -1983,7 +2009,14 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             for (size_t k = k0; k < k1; ++k) {
                 const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
                 float *      dst = embd_buf.data() + k * (size_t) dim;
-                if (tab->type == GGML_TYPE_F32) {
+                if (exl3) {
+#ifdef LLAMA_USE_EXL3
+                    const int64_t h = ggml_exl3_ngram_head(ple_offsets.data(), hp.ple_n_heads, idx[k]);
+                    ggml_exl3_decode_ngram_row((const int16_t *) src, pmodel.ple_exl3_k, ple_bias.data() + h*dim, dst);
+#else
+                    GGML_ABORT("EXL3 n-gram rows need a build with GGML_EXL3=ON");
+#endif
+                } else if (tab->type == GGML_TYPE_F32) {
                     memcpy(dst, src, dim * sizeof(float));
                 } else {
                     traits->to_float(src, dst, dim);
@@ -2126,7 +2159,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // get_rows node on the CPU backend would cut the graph into three splits (GPU, CPU, GPU) with
     // an extra graph launch and a device sync per ubatch. Only a table that lives on a device is
     // gathered by the graph.
-    const bool host_gather = qmodel.ple_disk ||
+    const bool host_gather = qmodel.ple_disk || qmodel.ple_exl3_bias ||
         (model.per_layer_tok_embd && model.per_layer_tok_embd->buffer && ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer));
 
     if (host_gather) {
