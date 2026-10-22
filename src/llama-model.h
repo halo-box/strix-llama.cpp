@@ -239,6 +239,10 @@ struct llama_layer_nextn {
     struct ggml_tensor * hc_head_norm          = nullptr;
     struct ggml_tensor * hc_head_down          = nullptr;
     struct ggml_tensor * hc_head_up            = nullptr;
+
+    // qwen4exp EXL3: eh_proj as its two parts, e_proj(e) + h_proj(h)
+    struct ggml_tensor * e_proj                = nullptr;
+    struct ggml_tensor * h_proj                = nullptr;
 };
 
 struct llama_layer_switch_lora {
