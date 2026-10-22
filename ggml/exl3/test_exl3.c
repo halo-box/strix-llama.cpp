@@ -1042,6 +1042,13 @@ static int rows_gguf(const char * path) {
         char name_sg[GGML_MAX_NAME + 16];
         snprintf(name_sg, sizeof(name_sg), "%.*s.exl3r_signs", (int) (len - strlen(suffix)), name);
         struct ggml_tensor * sg = ggml_get_tensor(meta, name_sg);
+        char name_bias[GGML_MAX_NAME + 16];
+        snprintf(name_bias, sizeof(name_bias), "%.*s.exl3r_bias", (int) (len - strlen(suffix)), name);
+        if (sg == NULL && ggml_get_tensor(meta, name_bias) != NULL) {
+            // an n-gram table: the arch decodes its rows on the host, EXL3_GET_ROWS never reads it
+            printf("%s: n-gram row table, skipped\n", name);
+            continue;
+        }
         const int K = sg != NULL ? ggml_exl3_embd_k(t->ne[0], sg->ne[1]) : -1;
         n_tables++;
         if (K <= 0 || n_embd <= 0 || n_embd > sg->ne[1]*GGML_EXL3_GROUP_DIM) {
