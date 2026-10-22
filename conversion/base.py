@@ -633,6 +633,10 @@ class ModelBase:
         """Reorder of the 128-blocks of an EXL3 linear on the input (k) and output (n) side, or None."""
         return None, None
 
+    def exl3_linear_names(self, name: str, n: int) -> list[tuple[str, int, int]] | None:
+        """GGUF names (without .weight) of an EXL3 linear and the output columns [n0, n1) of each, or None for its mapped name."""
+        return None
+
     def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str:
         new_name = self.tensor_map.get_name(key=name, try_suffixes=try_suffixes)
         if new_name is None:

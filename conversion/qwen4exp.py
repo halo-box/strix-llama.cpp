@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Iterable, cast
 
 import torch
@@ -68,6 +69,20 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
                     t = t.to(torch.int64)
                 return [int(x) for x in t.tolist()]
         raise ValueError(f"PLE constant {suffix!r} missing from the checkpoint")
+
+    def exl3_linear_names(self, name: str, n: int) -> list[tuple[str, int, int]] | None:
+        m = re.match(r"^model\.layers\.(\d+)\.", name)
+        bid = int(m[1]) if m else None
+        # the fused indexer projection, split at a 128-column block like the dense path
+        if name.endswith(".indexer.index_qk_proj"):
+            n_q = self.hparams["indexer_n_heads"] * self.hparams["indexer_head_dim"]
+            if n != n_q + self.hparams["indexer_head_dim"]:
+                raise ValueError(f"{name}: {n} output columns, expected {n_q} + {self.hparams['indexer_head_dim']}")
+            return [
+                (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_Q_PROJ, bid, ""), 0, n_q),
+                (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_K_PROJ, bid, ""), n_q, n),
+            ]
+        return None
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()

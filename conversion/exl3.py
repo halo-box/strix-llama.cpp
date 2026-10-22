@@ -85,10 +85,15 @@ def write_exl3_tensors(model: ModelBase) -> None:
         if k % EXL3_HADAMARD_SIZE or n % EXL3_HADAMARD_SIZE or tuple(suh.shape) != (k,) or tuple(svh.shape) != (n,):
             raise ValueError(f"{base}: inconsistent EXL3 shapes {tuple(trellis.shape)} {tuple(suh.shape)} {tuple(svh.shape)}")
 
-        new_base = model.map_tensor_name(base + ".weight").removesuffix(".weight")
+        # the arch converter may split the output columns into several GGUF linears, or name the linear itself
+        targets = model.exl3_linear_names(base, n)
+        if targets is None:
+            targets = [(model.map_tensor_name(base + ".weight").removesuffix(".weight"), 0, n)]
 
         # the arch converter may reorder whole 128-blocks; H is block diagonal, so that is a lossless tile reorder
         k_perm, n_perm = model.exl3_block_permutation(base, k, n)
+        if (k_perm is not None or n_perm is not None) and len(targets) != 1:
+            raise NotImplementedError(f"{base}: an EXL3 linear cannot be both block-permuted and split")
         if k_perm is not None:
             trellis = trellis[torch.from_numpy(exl3_block_rows(k_perm, EXL3_HADAMARD_SIZE // 16))]
             suh     = suh[torch.from_numpy(exl3_block_rows(k_perm, EXL3_HADAMARD_SIZE))]
@@ -96,13 +101,23 @@ def write_exl3_tensors(model: ModelBase) -> None:
             trellis = trellis[:, torch.from_numpy(exl3_block_rows(n_perm, EXL3_HADAMARD_SIZE // 16))]
             svh     = svh[torch.from_numpy(exl3_block_rows(n_perm, EXL3_HADAMARD_SIZE))]
         if k_perm is not None or n_perm is not None:
-            permuted.append(new_base)
+            permuted.append(targets[0][0])
 
-        logger.info(f"{new_base + '.exl3_trellis,':<40} K = {tile_words / 16:g} {codebook}, k = {k}, n = {n}"
-                    f"{' (block-permuted)' if new_base in permuted else ''}")
-        model.gguf_writer.add_tensor(new_base + ".exl3_trellis", trellis.numpy(), raw_dtype=gguf.GGMLQuantizationType.I16)
-        model.gguf_writer.add_tensor(new_base + ".exl3_suh",     suh.numpy(),     raw_dtype=gguf.GGMLQuantizationType.F16)
-        model.gguf_writer.add_tensor(new_base + ".exl3_svh",     svh.numpy(),     raw_dtype=gguf.GGMLQuantizationType.F16)
+        # a split keeps whole 128-column blocks: the output H is block diagonal, so each part is an EXL3 linear of its own
+        # with the same suh, its columns of svh and its n-tiles of the trellis
+        bounds = [0] + [n1 for _, _, n1 in targets]
+        if [n0 for _, n0, _ in targets] != bounds[:-1] or bounds[-1] != n or \
+                any(b <= a or b % EXL3_HADAMARD_SIZE for a, b in zip(bounds, bounds[1:])):
+            raise ValueError(f"{base}: the split {[t[1:] for t in targets]} does not cut {n} columns at 128-blocks")
+        for new_base, n0, n1 in targets:
+            part_trellis = trellis if len(targets) == 1 else trellis[:, n0 // 16:n1 // 16].contiguous()
+            part_svh     = svh if len(targets) == 1 else svh[n0:n1].contiguous()
+            logger.info(f"{new_base + '.exl3_trellis,':<40} K = {tile_words / 16:g} {codebook}, k = {k}, n = {n1 - n0}"
+                        f"{' (block-permuted)' if new_base in permuted else ''}"
+                        f"{f' (columns {n0}..{n1} of {n})' if len(targets) > 1 else ''}")
+            model.gguf_writer.add_tensor(new_base + ".exl3_trellis", part_trellis.numpy(), raw_dtype=gguf.GGMLQuantizationType.I16)
+            model.gguf_writer.add_tensor(new_base + ".exl3_suh",     suh.numpy(),          raw_dtype=gguf.GGMLQuantizationType.F16)
+            model.gguf_writer.add_tensor(new_base + ".exl3_svh",     part_svh.numpy(),     raw_dtype=gguf.GGMLQuantizationType.F16)
 
         for part in ("trellis", "suh", "svh", codebook):
             if part in parts:
