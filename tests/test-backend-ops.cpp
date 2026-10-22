@@ -5766,6 +5766,10 @@ struct test_dsv4_hc_boundary : public test_dsv4_hc {
                 // mixes of order one at any width, so the gates and the Sinkhorn do not saturate
                 hi = 2.0f / sqrtf((float) (hc * n_embd));
                 lo = -hi;
+            } else if (name == "gamma") {
+                // seeded like the rest, so GGML_TEST_HC_BOUNDARY_HASH compares across processes
+                lo = 0.5f;
+                hi = 1.5f;
             } else if (!tensor_range(name, lo, hi)) {
                 init_tensor_uniform(t);
                 continue;
