@@ -637,6 +637,10 @@ class ModelBase:
         """GGUF names (without .weight) of an EXL3 linear and the output columns [n0, n1) of each, or None for its mapped name."""
         return None
 
+    def exl3_row_table_name(self, name: str, row_dim: int) -> str:
+        """GGUF name (without .weight) of an EXL3 n-gram row table that decodes to rows of row_dim."""
+        raise NotImplementedError(f"{name}: this model has no EXL3 n-gram row table")
+
     def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str:
         new_name = self.tensor_map.get_name(key=name, try_suffixes=try_suffixes)
         if new_name is None:
