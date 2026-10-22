@@ -2590,7 +2590,6 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
 }
 
-// input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_get_rows(ggml_tensor * table, ggml_tensor * ids) const {
     if (exl3) {
         if (const auto it = exl3->rows.find(table); it != exl3->rows.end()) {
@@ -2600,6 +2599,7 @@ ggml_tensor * llm_graph_context::build_get_rows(ggml_tensor * table, ggml_tensor
     return ggml_get_rows(ctx0, table, ids);
 }
 
+// input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;

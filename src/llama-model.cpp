@@ -2385,7 +2385,6 @@ void llama_model_base::load_hparams_exl3(llama_model_loader & ml) {
     if (hadamard_size != 128) {
         throw std::runtime_error(format("unsupported exl3.hadamard_size: %u", hadamard_size));
     }
-    // row-ring tables (token embeddings) have their own layout version
     uint32_t rows_version = 0;
     if (ml.get_key(LLM_KV_EXL3_ROWS_VERSION, rows_version, false) && rows_version != 1) {
         throw std::runtime_error(format("unsupported exl3.rows.version: %u", rows_version));

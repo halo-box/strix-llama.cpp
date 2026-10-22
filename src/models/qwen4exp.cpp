@@ -248,8 +248,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         // --lazy-mode on-direct: the tensor is counted as created but never allocated, mapped or read; each
-        // ubatch preads exactly the rows it gathers (llm_graph_input_ple::set_input) through the page cache
-        // (an EXL3 table with O_DIRECT, below). A model with no tensor to read from stays on the lazy path.
+        // ubatch preads exactly the rows it gathers (llm_graph_input_ple::set_input) through the page cache.
+        // A model with no tensor to read from stays on the lazy path.
         const bool ple_on_disk = params.lazy_mode == LLAMA_LAZY_MODE_DIRECT;
 
         if (ple_on_disk && ple_w) {
@@ -257,17 +257,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             dp.direct_io = false; // page-cached, so qwen4exp_ple_prefetch's readahead advice can land
             if (const char * e = getenv("LLAMA_PLE_DIRECT")) { dp.direct_io = atoi(e) != 0; }
             if (ple_exl3_bias) {
-                // EXL3: the reader returns the stored rings and set_input decodes them, so the row cache holds the
-                // rings (62 B a row at K = 3) rather than decoded rows (640 B). Measured on Flash-Next 1.66bpw_h4_ng3
-                // over 45k natural tokens (309k distinct rows): the default 256 MiB holds 2^22 rings and reads 0.15%
-                // more rows than the compulsory misses; as decoded rows it would hold 2^18 and read 2.1% more. A hit
-                // decodes its ring again: 2.3 us, against 0.2-0.5 ms for a cold read from a USB SSD.
+                // The row cache keeps the stored rings (62 B a row at K = 3) rather than decoded rows (640 B): on
+                // Flash-Next 1.66bpw_h4_ng3 over 45k natural tokens (309k distinct rows) the default 256 MiB holds
+                // 2^22 rings and reads 0.15% more rows than the compulsory misses (2^18 decoded rows: 2.1% more).
+                // A hit decodes its ring again in 2.3 us, a cold read from a USB SSD takes 0.2-0.5 ms.
                 dp.ne_out = hparams.ple_head_dim;
-                // O_DIRECT, so the table stays out of the page cache too. Buffered, every distinct row read leaves
-                // its 4 KiB page there (191 MB after one 3600-token prompt), and cold rows are no faster: prefill
-                // 412 vs 411 tok/s, decode 25.18 vs 25.17. Buffered reads would let qwen4exp_ple_prefetch help
-                // batches of >= 4096 tokens: an 8192-token prompt prefills at 460 instead of 409 tok/s (resident
-                // 479), leaving 427 MB in the page cache.
+                // O_DIRECT keeps the table out of the page cache: buffered reads leave a 4 KiB page per distinct
+                // row (191 MB after one 3600-token prompt) and are no faster (prefill 412 vs 411 tok/s, decode
+                // 25.18 vs 25.17). Buffered reads help only batches of >= 4096 tokens (qwen4exp_ple_prefetch):
+                // 460 instead of 409 tok/s on an 8192-token prompt (479 resident), with 427 MB in the page cache.
                 dp.direct_io = true;
             }
 
@@ -398,8 +396,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", il), { n_embd }, flags);
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
 
-        // an EXL3 file keeps fc_embedding and fc_hidden as two linears, e_proj and h_proj (each has its own scales,
-        // an EXL3 linear is stored as its trellis); a dense file holds them merged into eh_proj
+        // an EXL3 file keeps fc_embedding and fc_hidden as two linears, e_proj and h_proj, because each has its own
+        // scales; a dense file holds them merged into eh_proj
         if (ml.get_weight(tn(LLM_TENSOR_NEXTN_E_PROJ, "weight", il).str().c_str()) ||
             ml.get_weight(tn(LLM_TENSOR_NEXTN_E_PROJ, "exl3_trellis", il).str().c_str())) {
             layer.nextn.e_proj = create_tensor(tn(LLM_TENSOR_NEXTN_E_PROJ, "weight", il), { n_embd, n_embd }, flags);
@@ -1976,7 +1974,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(exl3 || tab->type == GGML_TYPE_F32 || traits->to_float != nullptr);
         embd_buf.resize(idx.size() * (size_t) dim);
 
-        // EXL3: a row is its ring plus the bias of its hash head, the head found from the row as exllamav3 does
         if (exl3) {
             ple_bias.resize(ggml_nelements(pmodel.ple_exl3_bias));
             ggml_backend_tensor_get(pmodel.ple_exl3_bias, ple_bias.data(), 0, ggml_nbytes(pmodel.ple_exl3_bias));
@@ -2065,7 +2062,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(embd != nullptr && rows == nullptr);
         embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
         if (pmodel.ple_exl3_bias) {
-            // EXL3: the stored ring of each row decoded as in the resident branch above, with the same bias and head
 #ifdef LLAMA_USE_EXL3
             ple_bias.resize(ggml_nelements(pmodel.ple_exl3_bias));
             ggml_backend_tensor_get(pmodel.ple_exl3_bias, ple_bias.data(), 0, ggml_nbytes(pmodel.ple_exl3_bias));
