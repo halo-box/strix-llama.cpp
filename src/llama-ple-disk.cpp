@@ -30,6 +30,8 @@ struct llama_ple_disk::impl {
     ggml_type   type   = GGML_TYPE_COUNT;
     int64_t     ne0    = 0;
     int64_t     nrows  = 0;
+    int64_t     n_out  = 0;     // floats per gathered row
+    bool        coded  = false; // rows are decoded by the gather's row_decoder, not by to_float
     size_t      rs     = 0;     // bytes per row
     size_t      block  = 4096;  // O_DIRECT alignment for offset, length and buffer
     ggml_to_float_t to_float = nullptr;
@@ -46,6 +48,7 @@ struct llama_ple_disk::impl {
     std::vector<uint8_t>                       raw;      // [distinct rows, rs]
     std::vector<std::pair<int32_t, uint32_t>>  misses;   // (row, index into raw)
     float *                                    dst     = nullptr; // destination of the gather in progress
+    const row_decoder *                        decode  = nullptr; // row decoder of the gather in progress, if coded
     const uint8_t *                            src_full = nullptr; // preloaded table while a gather reads from it
     uint8_t *                                  bounce0 = nullptr; // calling-thread bounce buffer
 
@@ -86,8 +89,10 @@ struct llama_ple_disk::impl {
             throw std::runtime_error(format("llama_ple_disk: row of %lld %s elements is not a whole number of blocks",
                                             (long long) ne0, ggml_type_name(type)));
         }
-        rs = ggml_row_size(type, ne0);
-        if (type != GGML_TYPE_F32) {
+        rs    = ggml_row_size(type, ne0);
+        coded = p.ne_out > 0;
+        n_out = coded ? p.ne_out : ne0;
+        if (!coded && type != GGML_TYPE_F32) {
             to_float = ggml_get_type_traits(type)->to_float;
             if (to_float == nullptr) {
                 throw std::runtime_error(format("llama_ple_disk: no dequantizer for %s", ggml_type_name(type)));
@@ -304,14 +309,16 @@ struct llama_ple_disk::impl {
     // dequantize distinct row u into the first position that asked for it, then copy it to the others
     void dequant_row(size_t u) const {
         const uint8_t * src   = src_full ? src_full + (size_t) order[runs[u]].first * rs : raw.data() + u * rs;
-        float *         first = dst + (size_t) order[runs[u]].second * ne0;
-        if (to_float) {
+        float *         first = dst + (size_t) order[runs[u]].second * n_out;
+        if (decode) {
+            (*decode)(order[runs[u]].first, src, first);
+        } else if (to_float) {
             to_float(src, first, ne0);
         } else {
             memcpy(first, src, rs);
         }
         for (uint32_t j = runs[u] + 1; j < runs[u + 1]; ++j) {
-            memcpy(dst + (size_t) order[j].second * ne0, first, (size_t) ne0 * sizeof(float));
+            memcpy(dst + (size_t) order[j].second * n_out, first, (size_t) n_out * sizeof(float));
         }
     }
 
@@ -387,10 +394,12 @@ struct llama_ple_disk::impl {
         cv_done.wait(lk, [&] { return pending == 0; });
     }
 
-    void gather(const int32_t * idx, size_t n, float * out) {
+    void gather(const int32_t * idx, size_t n, float * out, const row_decoder & dec) {
         std::lock_guard<std::mutex> lk(mtx);
         const auto t0 = std::chrono::steady_clock::now();
         GGML_ASSERT(n < UINT32_MAX);
+        GGML_ASSERT(coded == (bool) dec && "a table opened with params.ne_out decodes its rows with the gather's decoder");
+        decode = coded ? &dec : nullptr;
 
         // sort the positions by row so equal rows are adjacent: each distinct row is read and dequantized once
         order.resize(n);
@@ -415,7 +424,7 @@ struct llama_ple_disk::impl {
             const auto t_dq0 = std::chrono::steady_clock::now();
             dst = out; src_full = full_rows;
             run_job(job_kind::dequant, n_uniq, 64, 256);
-            dst = nullptr; src_full = nullptr;
+            dst = nullptr; src_full = nullptr; decode = nullptr;
             st_calls += 1; st_rows += n; st_uniq += n_uniq; st_hits += n_uniq;
             const auto t_end = std::chrono::steady_clock::now();
             st_ms += std::chrono::duration<double, std::milli>(t_end - t0).count();
@@ -454,7 +463,7 @@ struct llama_ple_disk::impl {
         const auto t_dq0 = std::chrono::steady_clock::now();
         dst = out;
         run_job(job_kind::dequant, n_uniq, 64, 256);
-        dst = nullptr;
+        dst = nullptr; decode = nullptr;
         static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
         if (stats) {
             const auto t_end = std::chrono::steady_clock::now();
@@ -486,12 +495,12 @@ llama_ple_disk::~llama_ple_disk() {
     }
 }
 
-void llama_ple_disk::gather(const int32_t * idx, size_t n, float * dst) {
+void llama_ple_disk::gather(const int32_t * idx, size_t n, float * dst, const row_decoder & decode) {
 #if defined(_WIN32)
-    GGML_UNUSED(idx); GGML_UNUSED(n); GGML_UNUSED(dst);
+    GGML_UNUSED(idx); GGML_UNUSED(n); GGML_UNUSED(dst); GGML_UNUSED(decode);
     GGML_ABORT("llama_ple_disk: not supported on Windows");
 #else
-    pimpl->gather(idx, n, dst);
+    pimpl->gather(idx, n, dst, decode);
 #endif
 }
 
@@ -525,9 +534,10 @@ int64_t llama_ple_disk::ne0()      const { return pimpl->ne0;   }
 size_t  llama_ple_disk::row_size() const { return pimpl->rs;    }
 
 std::string llama_ple_disk::describe() const {
-    return format("%s @ %zu: %lld rows x %lld %s (%zu B/row, %.2f GiB), %s I/O, %d threads, row cache %zu MiB",
+    return format("%s @ %zu: %lld rows x %lld %s (%zu B/row, %.2f GiB)%s, %s I/O, %d threads, row cache %zu MiB",
                   pimpl->fname.c_str(), pimpl->offs, (long long) pimpl->nrows, (long long) pimpl->ne0,
                   ggml_type_name(pimpl->type), pimpl->rs, (double) pimpl->nrows * pimpl->rs / (1024.0 * 1024.0 * 1024.0),
+                  pimpl->coded ? format(" decoded to %lld f32", (long long) pimpl->n_out).c_str() : "",
                   pimpl->direct ? "direct" : "buffered", pimpl->n_threads,
                   pimpl->n_slots * pimpl->rs / (1024 * 1024));
 }

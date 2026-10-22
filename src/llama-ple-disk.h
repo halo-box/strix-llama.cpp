@@ -3,6 +3,7 @@
 #include "ggml.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -20,13 +21,18 @@ struct llama_ple_disk {
         int32_t n_threads   = 64;         // parallel readers: random reads on NVMe need queue depth
         size_t  cache_bytes = 256u << 20; // direct-mapped cache of raw rows; 0 disables
         bool    direct_io   = true;       // O_DIRECT, so the rows never enter the page cache either
+        int64_t ne_out      = 0;          // > 0: rows are not a ggml type, gather() decodes them into ne_out floats
     };
+
+    // decodes stored row `row` (row_size() bytes at src) into params.ne_out floats; called from several threads at once
+    using row_decoder = std::function<void(int32_t row, const uint8_t * src, float * dst)>;
 
     llama_ple_disk(const std::string & fname, size_t offs, ggml_type type, int64_t ne0, int64_t nrows, const params & p);
     ~llama_ple_disk();
 
-    // dequantize rows idx[0..n) into dst, laid out [ne0, n]; aborts on an out-of-range index
-    void gather(const int32_t * idx, size_t n, float * dst);
+    // dequantize rows idx[0..n) into dst, laid out [ne0, n] ([params.ne_out, n] when set); aborts on an out-of-range index
+    // a table opened with params.ne_out > 0 passes its decoder, which then replaces the type's to_float
+    void gather(const int32_t * idx, size_t n, float * dst, const row_decoder & decode = nullptr);
 
     // ask the kernel to read rows idx[0..n) into the page cache ahead of a later gather; only advice, so a
     // wrong prediction costs readahead and nothing else. A no-op with O_DIRECT, whose reads bypass the
