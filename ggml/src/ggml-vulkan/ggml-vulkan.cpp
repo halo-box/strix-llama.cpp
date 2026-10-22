@@ -9125,7 +9125,7 @@ static void ggml_vk_dsv4_hc_boundary(ggml_backend_vk_context * ctx, vk_context& 
     const uint32_t n_mix  = 24;
 
     // mat-vec form for a few tokens (one workgroup per 1024 columns and mix row, 384 at hc_dim 16384), tiled form above;
-    // the tile's split is 1024 columns at ubatch sizes (512 workgroups at 2048 tokens) and 256 below, so short prompts
+    // the tile's split is 1024 columns at ubatch sizes (1024 workgroups at 2048 tokens) and 256 below, so short prompts
     // still fill the GPU
     const bool tile = N > 16;
     const uint32_t kc = !tile ? 1024 : (N >= 1024 ? 1024 : 256);
@@ -9150,7 +9150,7 @@ static void ggml_vk_dsv4_hc_boundary(ggml_backend_vk_context * ctx, vk_context& 
         K, N, (uint32_t) (m.w->nb[1] / sizeof(float)), (uint32_t) (m.x->nb[1] / sizeof(float)), kc,
     };
     ggml_vk_dispatch_pipeline(ctx, subctx, mix, { ggml_vk_tensor_subbuffer(ctx, m.w), ggml_vk_tensor_subbuffer(ctx, m.x), part }, mpc,
-                              { n_split, tile ? CEIL_DIV(N, 64) : n_mix, 1 });
+                              { n_split, tile ? CEIL_DIV(N, 32) : n_mix, 1 });
     ggml_vk_sync_buffers(ctx, subctx);
 
     const vk_op_dsv4_hc_boundary_push_constants bpc = {
