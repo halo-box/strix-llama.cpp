@@ -69,7 +69,6 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         tensors = super().index_tensors(remote_hf_model_id=remote_hf_model_id)
 
-        # the quantized n-gram table of an EXL3 checkpoint is found by its file, not through the index
         sidecar = self.dir_model / self._EXL3_NGRAM_FILE
         if remote_hf_model_id is not None or not sidecar.is_file() or any(".ngram_embedding." in name for name in tensors):
             return tensors
