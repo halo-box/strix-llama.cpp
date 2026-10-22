@@ -82,6 +82,11 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
                 (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_Q_PROJ, bid, ""), 0, n_q),
                 (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_K_PROJ, bid, ""), n_q, n),
             ]
+        # the two MTP input projections have their own scales, so they cannot become one EXL3 eh_proj
+        if name.endswith(".nextn_fc_embedding"):
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_E_PROJ, bid, ""), 0, n)]
+        if name.endswith(".nextn_fc_hidden"):
+            return [(self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_H_PROJ, bid, ""), 0, n)]
         return None
 
     def set_gguf_parameters(self):
