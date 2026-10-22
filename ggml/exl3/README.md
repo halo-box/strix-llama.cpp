@@ -109,8 +109,8 @@ of 128 rows, or of 64 when the last block of 128 would be at most half full).
 The default takes the precision of the GEMM the same backend context runs for an F32 weight of the same shape: one
 product where that GEMM is mmb's `mmb_f32split_kernel` (one f16 product with both operands rounded, NMSE ~8e-8:
 from 512 rows with the mmb opt-in that llama sets, for contiguous x), two products where it is f32 (MMVF, MMF,
-rocBLAS: up to 511 rows, strided x, no mmb). `GGML_EXL3_GEMM_PRODUCTS=1` or `2` forces one choice. RDNA4 keeps the
-groups of 8 for every row count. Other backends (CUDA, Vulkan, ...) do not support the op.
+rocBLAS: up to 511 rows, strided x, no mmb). RDNA4 keeps the groups of 8 for every row count. Other backends (CUDA,
+Vulkan, ...) do not support the op.
 
 `ggml_exl3_mul_mat_id(ctx, trellis, x, ids, suh, svh, codebook)` (`GGML_OP_EXL3_MUL_MAT_ID`) is the EXL3
 counterpart of `ggml_mul_mat_id` for a stack of experts: x F32 `[k, ne11, n_tokens]` (ne11 = 1 broadcasts x over the
@@ -124,7 +124,7 @@ GEMM in groups of 32 rows (up to 32 rows per expert on average) or 64 rows. The 
 (`ggml_mul_mat_id` on an F32 stack), which on this backend runs the rows of each expert as one `ggml_mul_mat` on a
 contiguous copy: the rows of an expert with 512 rows or more (an expert in every token of a 512-token ubatch) take one
 f16 product, like the control's mmb GEMM there, in groups of 128 rows; the others hi + lo, like its f32 GEMMs.
-`GGML_EXL3_GEMM_PRODUCTS=1` or `2` forces one choice. A warp of the GEMM whose 16 rows are past its group's last row
+A warp of the GEMM whose 16 rows are past its group's last row
 skips its WMMAs, so a group costs the WMMA work of its rows rounded up to 16 (routing in a model is far from uniform:
 many experts get a few rows, a few get most). Each row is the row `EXL3_MUL_MAT` computes for that expert in the same
 kernel, bit for bit (the GEMM's per-row arithmetic does not depend on its row tile; one-product rows are those of its
