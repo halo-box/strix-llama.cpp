@@ -2449,7 +2449,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool moe_f16 = cparams.fused_moe_f16 && moe_f16_arch && il >= 0 && n_tokens >= 32 &&
         type_op == LLM_FFN_SILU && gate_exps && !gate_up_exps && !weight_before_ffn &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
-        hparams.swiglu_clamp_exp[il] <= 1e-6f && hparams.n_expert_used(il) > 1 && (!loras || loras->empty());
+        hparams.swiglu_clamp_exp[il] <= 1e-6f && hparams.n_expert_used(il) > 1 && (!loras || loras->empty()) &&
+        !(exl3 && exl3->linears.count(down_exps));   // an EXL3 down projection takes only an f32 B
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
@@ -2705,7 +2706,6 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
 }
 
-// input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_get_rows(ggml_tensor * table, ggml_tensor * ids) const {
     if (exl3) {
         if (const auto it = exl3->rows.find(table); it != exl3->rows.end()) {
@@ -2715,6 +2715,7 @@ ggml_tensor * llm_graph_context::build_get_rows(ggml_tensor * table, ggml_tensor
     return ggml_get_rows(ctx0, table, ids);
 }
 
+// input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
