@@ -248,8 +248,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         // --lazy-mode on-direct: the tensor is counted as created but never allocated, mapped or read; each
-        // ubatch preads exactly the rows it gathers (llm_graph_input_ple::set_input) through the page cache.
-        // A model with no tensor to read from stays on the lazy path.
+        // ubatch preads exactly the rows it gathers (llm_graph_input_ple::set_input) through the page cache
+        // (an EXL3 table with O_DIRECT, below). A model with no tensor to read from stays on the lazy path.
         const bool ple_on_disk = params.lazy_mode == LLAMA_LAZY_MODE_DIRECT;
 
         if (ple_on_disk && ple_w) {
@@ -262,6 +262,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 // more rows than the compulsory misses; as decoded rows it would hold 2^18 and read 2.1% more. A hit
                 // decodes its ring again: 2.3 us, against 0.2-0.5 ms for a cold read from a USB SSD.
                 dp.ne_out = hparams.ple_head_dim;
+                // O_DIRECT, so the table stays out of the page cache too. Buffered, every distinct row read leaves
+                // its 4 KiB page there (191 MB after one 3600-token prompt), and cold rows are no faster: prefill
+                // 412 vs 411 tok/s, decode 25.18 vs 25.17. What buffered reads buy is qwen4exp_ple_prefetch for
+                // batches of >= 4096 tokens: an 8192-token prompt prefills at 460 instead of 409 tok/s (resident
+                // 479), leaving 427 MB in the page cache. LLAMA_PLE_DIRECT=0 makes that trade.
+                dp.direct_io = true;
             }
             if (const char * e = getenv("LLAMA_PLE_DIRECT")) { dp.direct_io = atoi(e) != 0; }
 
