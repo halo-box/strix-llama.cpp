@@ -1,15 +1,14 @@
 // EXL3 decode self-test.
 //
-// The golden hashes come from exllamav3 tests/testlib/trellis.py (a3bfbfd0d3c0cea67815146a19fcd2bb3f84709a) on the
-// same xorshift32 inputs: decode() for the codebook tables, dequant_rotated() for W_hat. The W golden is the f32 rounding
-// of diag(suh) H W_hat H diag(svh) evaluated exactly (integers) on that W_hat; the float64 dequant() of the oracle
-// differs from it only by its own rounding (160 of the 884736 values, by one f32 ulp or near zero).
+// The golden hashes come from exllamav3 tests/testlib/trellis.py at a3bfbfd0d3c0cea67815146a19fcd2bb3f84709a on the
+// same xorshift32 inputs: decode() for the codebook tables, dequant_rotated() for W_hat. The W golden is
+// diag(suh) H W_hat H diag(svh) evaluated exactly in integers on that W_hat and rounded to f32; trellis.py's float64
+// dequant() differs from it only by its own rounding (in 160 of the 884736 values, by one f32 ulp or near zero).
 //
-// The op tests compare ggml_exl3_mul_mat with ggml_mul_mat on the f32 W of ggml_exl3_dequantize. ggml_mul_mat runs on
-// the CPU backend; the op runs there too, or on the backend given with --backend. A case passes when the op is within
-// NMSE 1e-10 of ggml_mul_mat (f32 grade), or when its NMSE against a double sum on the first rows is at most twice that
-// of the backend's own ggml_mul_mat on the same f32 W, x and shape (the GPU prefill GEMMs of this tree round both
-// operands to f16; the backend is opted in to them as llama opts in its contexts).
+// The op tests compare ggml_exl3_mul_mat (on the CPU, or on the --backend one) with ggml_mul_mat on the CPU, given the
+// f32 W of ggml_exl3_dequantize. A case passes within NMSE 1e-10 of ggml_mul_mat (f32 grade), or when its NMSE against
+// a double sum on the first rows is at most twice that of the backend's own ggml_mul_mat on the same W and x, since the
+// GPU prefill GEMMs round both operands to f16.
 //
 // The row-ring goldens come from exllamav3 modules/quant/exl3_lib/ngram_codec.py dequant_rows (same pin) on the same
 // xorshift32 inputs: n-gram rows of 160 with a bias, and token embedding rows of 4 rings of 256 with +/-1 signs, cropped.
@@ -346,8 +345,7 @@ static double nmse(const float * a, const float * b, int64_t n) {
     return den > 0.0 ? num/den : (num > 0.0 ? 1.0 : 0.0);
 }
 
-// one EXL3 linear in a buffer of the op backend, with its f32 W as a ggml [k, n] tensor for ggml_mul_mat in a CPU buffer
-// and, when the op backend is not the CPU, a copy in a buffer of the op backend
+// one EXL3 linear on the op backend, with its f32 W [k, n] on the CPU and, if the op backend is another one, there too
 struct op_weights {
     struct ggml_context * ctx;
     ggml_backend_buffer_t buf;
@@ -425,9 +423,8 @@ static void op_weights_free(struct op_weights * ow) {
     free(ow->w_t);
 }
 
-// nr rows of x; x_pad > 0 makes x a strided view whose padding is NaN
-// the op runs on be, ggml_mul_mat on be_ref and, when ow->w_be is set, on be too; prints one JSON line, returns 1 on
-// failure
+// the op on be and ggml_mul_mat on be_ref (and on be when ow->w_be is set) for nr rows of x, a strided view with NaN
+// padding when x_pad > 0; prints one JSON line, returns 1 on failure
 static int op_check_rows(ggml_backend_t be, ggml_backend_t be_ref, const struct op_weights * ow, int64_t nr, int64_t x_pad,
                          uint32_t seed, int64_t n_true, const char * label) {
     const int64_t k  = ow->k;
@@ -700,7 +697,6 @@ static int check_gguf(const char * path) {
             n_err++;
         } else {
             char h_trellis[65], h_hat[65], h_w[65];
-            // a stack: the experts one after the other
             for (int64_t e = 0; e < n_exp; e++) {
                 const int16_t * te = trellis + e*(ggml_nelements(t)/n_exp);
                 ggml_exl3_decode_rotated(te, k, n, t->ne[0], (enum ggml_exl3_codebook) cb, w_hat + e*k*n);
@@ -730,12 +726,12 @@ static int check_gguf(const char * path) {
     return n_err != 0 || n_mod == 0;
 }
 
-// the op on the first linear of each (k, n, K): decode rows 1 to 8, both sides of the HIP GEMM threshold (32), a
-// partial and a whole 128-row tile, ubatch 512 and past it
 static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const int16_t * trellis, const ggml_fp16_t * suh,
                                const ggml_fp16_t * svh, int64_t k, int64_t n, int64_t n_exp, int64_t tile_words, int cb,
                                int64_t n_used, int64_t ne11, int64_t n_tok, bool skew, uint32_t seed, const char * label);
 
+// the op on the first linear of each (k, n, K): decode rows 1 to 8, both sides of the HIP GEMM threshold (32), a
+// partial and a whole 128-row tile, ubatch 512 and past it
 static int op_gguf(const char * path) {
     static const int64_t rows[] = { 1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 33, 64, 127, 128, 511, 512, 513 };
 
@@ -791,10 +787,9 @@ static int op_gguf(const char * path) {
         ggml_fp16_t * svh     = (ggml_fp16_t *) read_tensor(f, gctx, sv);
         struct op_weights ow;
         if (n_exp > 1) {
-            // a stack of experts: EXL3_MUL_MAT_ID at decode, draft-verification and prompt token counts (with 32 experts
-            // and top-4: both sides of the HIP GEMM threshold, 12 rows per expert = 96 tokens), x broadcast and one per
-            // slot; uniform routing, then skewed routing from 96 tokens (one expert in every token: one product from
-            // MMID_ONE_ROWS tokens, others with many and few rows)
+            // a stack at decode, draft-verification and prompt token counts (95 and 96: both sides of the HIP GEMM
+            // threshold, 12 rows per expert at 32 experts, top-4), x broadcast and one per slot; uniform, then skewed
+            // routing from 96 tokens (the first expert in every token, one product from MMID_ONE_ROWS tokens)
             const int64_t n_used = n_exp < 4 ? n_exp : 4;
             static const int64_t toks[] = { 1, 2, 4, 7, 32, 95, 96, 256, 257, 512, 96, 256, 512, 513 };
             static const size_t  n_uniform = 10;
@@ -835,16 +830,12 @@ static int op_gguf(const char * path) {
     return n_fail != 0 || n_run == 0;
 }
 
-// --exact-gguf: the op on the backend against the op on the CPU on inputs where every product is exact. With suh = 1 and
-// x row r = row r%128 of the unnormalized 128-point Hadamard in k block r/128 (zeros elsewhere), H(x*suh) = 128 e_r, so
-// each output is 128 W_hat[r, j] (one nonzero product, exact in f32) followed by the output rotation and svh, whose
-// order and roundings the CPU op and the HIP dot kernel share: rows run in chunks of 32 (the dot kernel on HIP; for a
-// stack, 8 tokens routed to all E experts) must equal the CPU op bit for bit, which holds iff the backend decodes
-// every value of W_hat as the CPU decoder does (bit-exact against exllamav3's trellis.py, README). The WMMA paths
-// (all k rows in one call; chunks of 511 rows, or 16 tokens for a stack) cannot be exact here: on gfx1151 the f16 WMMA
-// returns about half of the negative single products one f32 ulp toward -inf (C = +0). They must stay within 2^-18 of
-// the largest |value| of each output row; one fp16 ulp of a typical decoded value moves a row by ~3e-5 of its maximum.
-// --exact-gguf FILE S checks every S-th linear of the container.
+// --exact-gguf: with suh = 1 and x row r = row r%128 of the unnormalized 128-point Hadamard in k block r/128 (zeros
+// elsewhere), H(x*suh) = 128 e_r, so each output is the exact product 128 W_hat[r, j] followed by the output rotation
+// and svh, with the same order and roundings in the CPU op and the HIP dot kernel: the dot path must equal the CPU op
+// bit for bit, which holds iff the backend decodes W_hat as the CPU does. On gfx1151 the f16 WMMA returns about half
+// of the negative single products one f32 ulp toward -inf (C = +0), so the WMMA paths must stay within 2^-18 of the
+// largest |value| of each output row; one fp16 ulp of a typical decoded value moves a row by ~3e-5 of its maximum.
 
 // one-hot rows r0 .. r0 + nr - 1 (k wide)
 static void exact_rows(float * x, int64_t k, int64_t r0, int64_t nr) {
@@ -862,8 +853,7 @@ static void exact_rows(float * x, int64_t k, int64_t r0, int64_t nr) {
     }
 }
 
-// the op on be for nr rows of x: EXL3_MUL_MAT, or EXL3_MUL_MAT_ID with every expert per token (x broadcast); out is
-// [nr][E][n]
+// the op on be for nr rows of x: EXL3_MUL_MAT, or EXL3_MUL_MAT_ID of x broadcast to every expert; out [nr][E][n]
 static bool exact_run(ggml_backend_t be, const int16_t * trellis, const ggml_fp16_t * suh, const ggml_fp16_t * svh,
                       int64_t k, int64_t n, int64_t n_exp, int64_t tile_words, int cb, const float * x, int64_t nr,
                       float * out) {
@@ -953,10 +943,10 @@ static int exact_gguf(const char * path, const int stride) {
             exact_rows(x, k, 0, k);
             ok = exact_run(be_cpu, trellis, ones, svh, k, n, n_exp, t->ne[0], cb, x, k, ref);
         }
-        // rows per call: all rows in one call (WMMA GEMM: one product for a dense linear, and for a stack, whose experts
-        // then have k >= MMID_ONE_ROWS rows each); 511 (dense: the hi + lo GEMM) or 16 tokens (stack: 32-row groups);
-        // 32 rows (dense) or 8 tokens (stack): the dot kernel, exact. A stack token goes to all E experts, so its rows
-        // per expert are its token count
+        // rows per call (for a stack, tokens, each routed to all E experts, so rows per expert): all k rows, the
+        // one-product WMMA GEMM (a stack's experts then have k >= MMID_ONE_ROWS rows); 511 rows or 16 tokens, the
+        // hi + lo GEMM (32-row groups for a stack); 32 rows or 8 tokens, the dot kernel, exact. The stack counts rely on
+        // the HIP routing thresholds of 12 and 32 rows per expert (EXL3_MMID_GEMM_ROWS, EXL3_MMID_W2_ROWS in exl3.cu).
         const int64_t chunk[3] = { k, n_exp > 1 ? 16 : 511, n_exp > 1 ? 8 : 32 };
         int64_t diff[3] = { -1, -1, -1 };
         double  rel[3]  = { -1.0, -1.0, -1.0 };
@@ -971,7 +961,6 @@ static int exact_gguf(const char * path, const int stride) {
             }
             for (int64_t r = 0; ok && r < k; r++) {
                 for (int64_t e = 0; e < n_exp; e++) {
-                    // one output row: the n values of row r for expert e
                     const float * rr = ref + r*width + e*n;
                     const float * gg = got + r*width + e*n;
                     double amax = 0.0;
@@ -998,7 +987,6 @@ static int exact_gguf(const char * path, const int stride) {
         }
         const double tol  = 1.0/262144.0;
         const bool   pass = ok && diff[2] == 0 && rel[0] <= tol && rel[1] <= tol;
-        // the stack passes rely on the HIP routing thresholds (12 and 32 rows per expert, EXL3_MMID_*_ROWS in exl3.cu)
         n_fail += !pass;
         printf("{\"case\": \"exact %s\", \"backend\": \"%s\", \"k\": %lld, \"n\": %lld, \"experts\": %lld, \"K\": %.1f, "
                "\"dot_diff\": %lld, \"gemm_all_diff\": %lld, \"gemm_all_rel\": %.3e, \"gemm_chunk_diff\": %lld, \"gemm_chunk_rel\": %.3e, "
@@ -1025,8 +1013,7 @@ static int exact_gguf(const char * path, const int stride) {
 }
 
 // --rows-gguf: EXL3_GET_ROWS on the backend for every row of each row table ("<base>.exl3r_trellis" with its signs) of a
-// container, against ggml_exl3_decode_embd_row on the CPU, bit for bit; the rows are decoded to n_embd (the
-// architecture's embedding_length), in batches of 4096 ids
+// container, against ggml_exl3_decode_embd_row on the CPU bit for bit, decoded to the architecture's embedding_length
 static int rows_gguf(const char * path) {
     struct ggml_context * meta = NULL;
     struct gguf_init_params params = { true, &meta };
@@ -1088,7 +1075,6 @@ static int rows_gguf(const char * path) {
             ggml_backend_tensor_set(t_signs, signs, 0, ggml_nbytes(t_signs));
         }
         for (int64_t r0 = 0; ok && r0 < n_rows; r0 += batch) {
-            // the last batch repeats the last row
             for (int64_t i = 0; i < batch; i++) {
                 ids[i] = (int32_t) (r0 + i < n_rows ? r0 + i : n_rows - 1);
             }
@@ -1265,7 +1251,6 @@ static int dequantize_gguf(const char * path_in, const char * path_out) {
     fclose(fi);
 
     if (ok) {
-        // the written file must read back with the same tensor list
         struct ggml_context * meta_out = NULL;
         struct gguf_init_params rp = { true, &meta_out };
         struct gguf_context * check = gguf_init_from_file(path_out, rp);
@@ -1354,18 +1339,16 @@ static bool expert_rows(ggml_backend_t be, const int16_t * trellis, const ggml_f
     return ok;
 }
 
-// rows of one expert from which the HIP EXL3_MUL_MAT_ID runs one f16 product for them: where the backend's F32 control
-// (ggml_mul_mat_id on an F32 stack, an MMB GEMM per expert from 512 rows of a view source) does
+// rows of one expert from which the HIP EXL3_MUL_MAT_ID runs one f16 product, as its F32 control (ggml_mul_mat_id on an
+// F32 stack) does with an MMB GEMM per expert from 512 rows of a view source
 #define MMID_ONE_ROWS 512
 
-// the experts of a stack: x of n_tok tokens (ne11 = 1: broadcast over the slots), n_used distinct experts per token,
-// uniform, or skewed (slot 0 always the first expert, the other slots favouring low expert numbers).
-// Exactness: the rows of each expert equal EXL3_MUL_MAT on that expert's slice of the stack for the same rows, bit for
-// bit, in the path the op took: the expert's rows in one call (dot kernel on a GPU), or on a GPU backend the GEMM path
-// (chunks of up to 511 rows padded to at least 33, so that EXL3_MUL_MAT runs its hi + lo GEMM; an expert with at least
-// MMID_ONE_ROWS rows in one call, its one-product GEMM). NMSE: against ggml_mul_mat_id on the f32 W of the experts on the
-// CPU (1e-10), or against a double sum on 8 pairs at most twice that of the op backend's own ggml_mul_mat_id on the same
-// f32 W, and so for up to 8 pairs of the experts with at least MMID_ONE_ROWS rows and up to 8 of the others
+// the experts of a stack: n_tok tokens (ne11 = 1: x broadcast over the slots), n_used distinct experts per token,
+// uniform or skewed (slot 0 always the first expert, the other slots favouring low expert numbers). The rows of each
+// expert must equal EXL3_MUL_MAT on its slice bit for bit, in one call (the dot kernel on a GPU) or as the GPU GEMM
+// path runs them (one call from MMID_ONE_ROWS rows, else chunks of up to 511 rows padded to at least 33 for the hi + lo
+// GEMM), and the NMSE must be at most 1e-10 against ggml_mul_mat_id on the CPU or, against double sums, at most twice
+// that of the backend's own ggml_mul_mat_id.
 static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const int16_t * trellis, const ggml_fp16_t * suh,
                                const ggml_fp16_t * svh, int64_t k, int64_t n, int64_t n_exp, int64_t tile_words, int cb,
                                int64_t n_used, int64_t ne11, int64_t n_tok, bool skew, uint32_t seed, const char * label) {
@@ -1525,7 +1508,6 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
                 }
             }
 
-            // the rows of each expert, in pair order, against EXL3_MUL_MAT on the expert's slice
             // eq_dot: the expert's rows in one EXL3_MUL_MAT call; eq_gemm: chunks that run the GEMM on a GPU
             bool eq_dot  = true;
             bool eq_gemm = op_backend_name != NULL;

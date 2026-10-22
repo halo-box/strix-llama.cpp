@@ -5418,7 +5418,6 @@ struct test_exl3_mul_mat_id : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else if (t->type == GGML_TYPE_I32) {
-                // distinct experts per token
                 std::vector<int32_t> perm(n_exp);
                 std::vector<int32_t> data;
                 for (int64_t r = 0; r < n_tokens; r++) {
