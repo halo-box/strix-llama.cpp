@@ -238,9 +238,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         if (ml.get_weight(ple_exl3.c_str())) {
             ple_exl3_k    = (int32_t) ((ple_w->tensor->ne[0] - 1)*16/hparams.ple_head_dim);
             ple_exl3_bias = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "exl3r_bias"), { hparams.ple_head_dim, hparams.ple_n_heads }, 0);
-            if (params.lazy_mode == LLAMA_LAZY_MODE_DIRECT) {
-                throw std::runtime_error("the EXL3 n-gram table is read through the memory map: use --lazy-mode on or auto, not on-direct");
-            }
         }
         if (ple_w) {
             if (ple_w->tensor->ne[1] < ple_rows) {
@@ -258,6 +255,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         if (ple_on_disk && ple_w) {
             llama_ple_disk::params dp;
             dp.direct_io = false; // page-cached, so qwen4exp_ple_prefetch's readahead advice can land
+            if (ple_exl3_bias) {
+                // EXL3: the reader returns the stored rings and set_input decodes them, so the row cache holds the
+                // rings (62 B a row at K = 3) rather than decoded rows (640 B). Measured on Flash-Next 1.66bpw_h4_ng3
+                // over 45k natural tokens (309k distinct rows): the default 256 MiB holds 2^22 rings and reads 0.15%
+                // more rows than the compulsory misses; as decoded rows it would hold 2^18 and read 2.1% more. A hit
+                // decodes its ring again: 2.3 us, against 0.2-0.5 ms for a cold read from a USB SSD.
+                dp.ne_out = hparams.ple_head_dim;
+            }
             if (const char * e = getenv("LLAMA_PLE_DIRECT")) { dp.direct_io = atoi(e) != 0; }
 
             ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
@@ -2053,7 +2058,23 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         // past the end (rows beyond ple_rows) and gather() aborts.
         GGML_ASSERT(embd != nullptr && rows == nullptr);
         embd_buf.resize(idx.size() * (size_t) hp.ple_head_dim);
-        pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
+        if (pmodel.ple_exl3_bias) {
+            // EXL3: the stored ring of each row decoded as in the resident branch above, with the same bias and head
+#ifdef LLAMA_USE_EXL3
+            ple_bias.resize(ggml_nelements(pmodel.ple_exl3_bias));
+            ggml_backend_tensor_get(pmodel.ple_exl3_bias, ple_bias.data(), 0, ggml_nbytes(pmodel.ple_exl3_bias));
+            ple_offsets.assign(hp.ple_head_offsets.begin(), hp.ple_head_offsets.begin() + hp.ple_n_heads);
+            const int64_t dim = hp.ple_head_dim;
+            pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data(), [&](int32_t row, const uint8_t * src, float * dst) {
+                const int64_t h = ggml_exl3_ngram_head(ple_offsets.data(), hp.ple_n_heads, row);
+                ggml_exl3_decode_ngram_row((const int16_t *) src, pmodel.ple_exl3_k, ple_bias.data() + h*dim, dst);
+            });
+#else
+            GGML_ABORT("EXL3 n-gram rows need a build with GGML_EXL3=ON");
+#endif
+        } else {
+            pmodel.ple_disk->gather(idx.data(), idx.size(), embd_buf.data());
+        }
         ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
         return;
     }
