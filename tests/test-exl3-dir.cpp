@@ -713,7 +713,6 @@ static int synthetic() {
         }
     }
 
-    // the same directory with one more file that repeats a tensor: refused, not overridden by the order of the files
     fs::copy(dir / "model", dir / "dup", fs::copy_options::recursive);
     st_file extra;
     extra.add(m + "norm.weight", "BF16", { 256 }, rnd_data("BF16", 256, -0.1f, 0.1f));
