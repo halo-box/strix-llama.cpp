@@ -2,6 +2,9 @@
 
 #include "json.h"
 #include "log.h"
+#ifdef LLAMA_USE_EXL3
+#include "exl3-dir.h"
+#endif
 
 #include "../src/llama-ext.h"
 
@@ -57,7 +60,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
+#ifdef LLAMA_USE_EXL3
+    llama_model * model = common_exl3_load_model(path_model, mparams_copy);
+#else
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+#endif
     if (model == nullptr) {
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to load model");

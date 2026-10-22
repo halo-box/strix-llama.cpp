@@ -1218,9 +1218,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "EXL3_MUL_MAT",
+    "EXL3_GET_ROWS",
+    "EXL3_MUL_MAT_ID",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1333,9 +1337,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "exl3(X)*y",
+    "exl3_get_rows(x)",
+    "exl3(X)[ids]*y",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6781,6 +6789,113 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_exl3_mul_mat
+
+struct ggml_tensor * ggml_exl3_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * suh,
+        struct ggml_tensor  * svh,
+        int                   codebook) {
+    GGML_ASSERT(trellis->type == GGML_TYPE_I16 && ggml_is_contiguous(trellis) && trellis->ne[3] == 1);
+    GGML_ASSERT(suh->type == GGML_TYPE_F16 && svh->type == GGML_TYPE_F16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(codebook >= 0 && codebook <= 2);
+
+    // tiles are 16x16 and the Hadamard blocks 128 wide
+    const int64_t k = trellis->ne[2]*16;
+    const int64_t n = trellis->ne[1]*16;
+    GGML_ASSERT(k % 128 == 0 && n % 128 == 0);
+    GGML_ASSERT(ggml_is_vector(suh) && ggml_is_contiguous(suh) && suh->ne[0] == k);
+    GGML_ASSERT(ggml_is_vector(svh) && ggml_is_contiguous(svh) && svh->ne[0] == n);
+    GGML_ASSERT(x->ne[0] == k);
+
+    const int64_t ne[4] = { n, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, codebook);
+
+    result->op     = GGML_OP_EXL3_MUL_MAT;
+    result->src[0] = trellis;
+    result->src[1] = x;
+    result->src[2] = suh;
+    result->src[3] = svh;
+
+    return result;
+}
+
+// ggml_exl3_mul_mat_id
+
+struct ggml_tensor * ggml_exl3_mul_mat_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * trellis,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * suh,
+        struct ggml_tensor  * svh,
+        int                   codebook) {
+    GGML_ASSERT(trellis->type == GGML_TYPE_I16 && ggml_is_contiguous(trellis));
+    GGML_ASSERT(suh->type == GGML_TYPE_F16 && svh->type == GGML_TYPE_F16 && ggml_is_contiguous(suh) && ggml_is_contiguous(svh));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->ne[3] == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(codebook >= 0 && codebook <= 2);
+
+    // one EXL3 linear per expert, as ggml_exl3_mul_mat
+    const int64_t k = trellis->ne[2]*16;
+    const int64_t n = trellis->ne[1]*16;
+    const int64_t E = trellis->ne[3];
+    GGML_ASSERT(k % 128 == 0 && n % 128 == 0);
+    GGML_ASSERT(suh->ne[0] == k && suh->ne[1] == E && suh->ne[2] == 1 && suh->ne[3] == 1);
+    GGML_ASSERT(svh->ne[0] == n && svh->ne[1] == E && svh->ne[2] == 1 && svh->ne[3] == 1);
+    // as ggml_mul_mat_id: an expert list per token, x broadcast over the slots
+    GGML_ASSERT(x->ne[0] == k && ids->ne[1] == x->ne[2] && ids->ne[0] % x->ne[1] == 0);
+
+    const int64_t ne[4] = { n, ids->ne[0], x->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, codebook);
+
+    result->op     = GGML_OP_EXL3_MUL_MAT_ID;
+    result->src[0] = trellis;
+    result->src[1] = x;
+    result->src[2] = ids;
+    result->src[3] = suh;
+    result->src[4] = svh;
+
+    return result;
+}
+
+// ggml_exl3_get_rows
+
+struct ggml_tensor * ggml_exl3_get_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * signs,
+        int64_t               n_out) {
+    GGML_ASSERT(table->type == GGML_TYPE_I16 && ggml_is_contiguous(table) && ggml_n_dims(table) <= 2);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_vector(ids));
+    GGML_ASSERT(signs->type == GGML_TYPE_F16 && ggml_is_contiguous(signs) && signs->ne[0] == 256 && ggml_n_dims(signs) <= 2);
+
+    // a row is one ring of 1 + 16*K words per group of 256, K = 1..8
+    const int64_t groups = signs->ne[1];
+    const int64_t rw     = table->ne[0] % groups == 0 ? table->ne[0]/groups - 1 : 0;
+    GGML_ASSERT(rw >= 16 && rw <= 128 && rw % 16 == 0);
+    GGML_ASSERT(n_out > 0 && n_out <= groups*256);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_out, ids->ne[0]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_out);
+
+    result->op     = GGML_OP_EXL3_GET_ROWS;
+    result->src[0] = table;
+    result->src[1] = ids;
+    result->src[2] = signs;
 
     return result;
 }

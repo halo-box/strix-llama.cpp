@@ -89,6 +89,14 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                     ggml-cpu/llamafile/sgemm.h)
     endif()
 
+    if (GGML_EXL3)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_EXL3)
+
+        list(APPEND GGML_CPU_SOURCES
+                    ggml-cpu/exl3-ops.cpp
+                    ggml-cpu/exl3-ops.h)
+    endif()
+
     if (GGML_CPU_HBM)
         find_library(memkind memkind REQUIRED)
 
