@@ -19,7 +19,7 @@
 //                             EXL3_MUL_MAT per expert (bit for bit) and ggml_mul_mat_id on the f32 W of the experts
 // test-exl3 --gguf FILE    -> decode every EXL3 linear of a GGUF container, one JSON line per tensor with sha256
 // test-exl3 --op-gguf FILE -> op on the first linear of each (k, n, K) in a GGUF container, at the decode and prompt row counts
-// test-exl3 --exact-gguf FILE -> op on every linear of a container on one-hot rows, where it is exact: equal to the CPU op
+// test-exl3 --exact-gguf FILE [S] -> op on every (S-th) linear of a container on one-hot rows, where it is exact: equal to the CPU op
 //                             bit for bit iff the backend decodes W_hat as the CPU does (see exact_gguf)
 // test-exl3 --rows-gguf FILE -> EXL3_GET_ROWS on every row of each row table of a container, against the row decoder
 // test-exl3 --dequantize IN OUT -> plain GGUF reference of a container: each EXL3 linear becomes "<base>.weight" F32 from
@@ -294,17 +294,14 @@ static int test_checks(void) {
 #define OP_NMSE_MAX   1e-10
 #define OP_NMSE_CALIB 2.0 // allowed NMSE against the double sum, relative to the backend's own ggml_mul_mat
 
-static int op_n_threads(void) {
-    const char * env = getenv("EXL3_TEST_THREADS");
-    return env ? atoi(env) : 16;
-}
+#define OP_N_THREADS 16
 
 // backend of the op: CPU unless --backend NAME
 static const char * op_backend_name = NULL;
 
 static ggml_backend_t op_cpu_init(void) {
     ggml_backend_t be = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(be, op_n_threads());
+    ggml_backend_cpu_set_n_threads(be, OP_N_THREADS);
     return be;
 }
 
@@ -847,7 +844,7 @@ static int op_gguf(const char * path) {
 // (all k rows in one call; chunks of 511 rows, or 16 tokens for a stack) cannot be exact here: on gfx1151 the f16 WMMA
 // returns about half of the negative single products one f32 ulp toward -inf (C = +0). They must stay within 2^-18 of
 // the largest |value| of each output row; one fp16 ulp of a typical decoded value moves a row by ~3e-5 of its maximum.
-// EXL3_EXACT_STRIDE=S checks every S-th linear of the container.
+// --exact-gguf FILE S checks every S-th linear of the container.
 
 // one-hot rows r0 .. r0 + nr - 1 (k wide)
 static void exact_rows(float * x, int64_t k, int64_t r0, int64_t nr) {
@@ -909,7 +906,7 @@ static bool exact_run(ggml_backend_t be, const int16_t * trellis, const ggml_fp1
     return ok;
 }
 
-static int exact_gguf(const char * path) {
+static int exact_gguf(const char * path, const int stride) {
     struct gguf_context * gctx = NULL;
     struct ggml_context * meta = NULL;
     const int cb = open_container(path, &gctx, &meta);
@@ -922,7 +919,6 @@ static int exact_gguf(const char * path) {
     if (f == NULL || be == NULL) {
         return 1;
     }
-    const int stride = getenv("EXL3_EXACT_STRIDE") ? atoi(getenv("EXL3_EXACT_STRIDE")) : 1;
 
     int     n_lin  = 0;
     int     n_fail = 0;
@@ -952,11 +948,6 @@ static int exact_gguf(const char * path) {
         bool ok = trellis != NULL && svh != NULL && ones != NULL && x != NULL && ref != NULL && got != NULL;
         for (int64_t i = 0; ok && i < k*n_exp; i++) {
             ones[i] = ggml_fp32_to_fp16(1.0f);
-        }
-        if (ok && getenv("EXL3_EXACT_SVH1") != NULL) {
-            for (int64_t i = 0; i < n*n_exp; i++) {
-                svh[i] = ggml_fp32_to_fp16(1.0f);
-            }
         }
         if (ok) {
             exact_rows(x, k, 0, k);
@@ -1715,8 +1706,8 @@ int main(int argc, char ** argv) {
     if (argc == 3 && strcmp(argv[1], "--op-gguf") == 0) {
         return op_gguf(argv[2]);
     }
-    if (argc == 3 && strcmp(argv[1], "--exact-gguf") == 0) {
-        return exact_gguf(argv[2]);
+    if ((argc == 3 || argc == 4) && strcmp(argv[1], "--exact-gguf") == 0) {
+        return exact_gguf(argv[2], argc == 4 ? atoi(argv[3]) : 1);
     }
     if (argc == 3 && strcmp(argv[1], "--rows-gguf") == 0) {
         return rows_gguf(argv[2]);
@@ -1725,7 +1716,7 @@ int main(int argc, char ** argv) {
         return dequantize_gguf(argv[2], argv[3]);
     }
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [--backend NAME] [--gguf FILE | --op-gguf FILE | --exact-gguf FILE | --rows-gguf FILE | --dequantize IN OUT]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--backend NAME] [--gguf FILE | --op-gguf FILE | --exact-gguf FILE [STRIDE] | --rows-gguf FILE | --dequantize IN OUT]\n", argv[0]);
         return 1;
     }
 

@@ -212,10 +212,10 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
   `-o EXL3_GET_ROWS` and `-o EXL3_MUL_MAT_ID` have the op cases. For a stack of experts `--op-gguf` runs
   `EXL3_MUL_MAT_ID` at 1 to 512 tokens with uniform routing and at 96 to 513 tokens with skewed routing, x broadcast
   and one x per slot.
-- `test-exl3 [--backend NAME] --exact-gguf FILE`: the op of every linear and stack of a container on one-hot rows
-  (`suh` = 1, x row r = a row of the 128-point Hadamard, so `H(x * suh)` = 128 e_r and every product is exact)
-  against the CPU op. Rows run in chunks of 32 (the HIP dot kernel) must be equal bit for bit, which holds iff the
-  backend decodes every value of `W_hat` as the CPU does. The WMMA paths (all rows in one call; chunks of 511) are
+- `test-exl3 [--backend NAME] --exact-gguf FILE [S]`: the op of every linear and stack of a container (every S-th) on
+  one-hot rows (`suh` = 1, x row r = a row of the 128-point Hadamard, so `H(x * suh)` = 128 e_r and every product is
+  exact) against the CPU op. Rows run in chunks of 32 (the HIP dot kernel) must be equal bit for bit, which holds iff
+  the backend decodes every value of `W_hat` as the CPU does. The WMMA paths (all rows in one call; chunks of 511) are
   checked to 2^-18 of each row's largest value: the gfx1151 f16 WMMA returns about half of the negative single
   products one f32 ulp toward -inf.
 - `test-exl3 [--backend NAME] --rows-gguf FILE`: `EXL3_GET_ROWS` on every row of each row table of a container
