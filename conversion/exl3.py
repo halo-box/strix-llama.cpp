@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 import torch
@@ -21,10 +21,13 @@ EXL3_CONTAINER_VERSION = 1
 EXL3_ROWS_VERSION      = 1
 EXL3_HADAMARD_SIZE     = 128
 EXL3_GROUP_DIM         = 256
+EXL3_ROW_DIM           = 160
 EXL3_MARKERS           = {"mcg": 0xCBAC1FED, "mul1": 0x83DCD12D}
 EXL3_PARTS             = ("trellis", "suh", "svh", "mcg", "mul1", "su", "sv", "signs")
 # a per-expert module of exllamav3's BlockSparseMLP: <prefix>.experts.<e>.<projection>
 EXL3_EXPERT_RE         = re.compile(r"^(?P<prefix>.+)\.experts\.(?P<e>\d+)\.(?P<w>[^.]+)$")
+# one shard of an n-gram row table (exllamav3 row_table.py): <prefix>.shard_<s>.trellis
+EXL3_SHARD_RE          = re.compile(r"^(?P<prefix>.+)\.shard_(?P<s>\d+)$")
 
 
 def exl3_rate_supported(tile_words: int, codebook: str) -> bool:
@@ -61,6 +64,17 @@ def write_exl3_tensors(model: ModelBase) -> None:
             stacks.setdefault(f"{m['prefix']}.experts.{m['w']}", {})[int(m["e"])] = base
     for merged, experts in sorted(stacks.items()):
         codebooks.add(write_exl3_experts(model, merged, [modules.pop(experts[e]) for e in sorted(experts)], sorted(experts)))
+
+    # n-gram (PLE) row tables: a 2-D trellis, unsharded or in shards, next to the .head_bias of its hash heads
+    tables: dict[str, dict[int, str]] = {}
+    for base, parts in list(modules.items()):
+        m = EXL3_SHARD_RE.match(base)
+        prefix, shard = (m["prefix"], int(m["s"])) if m else (base, -1)
+        if set(parts) == {"trellis"} and prefix + ".head_bias" in model.model_tensors:
+            tables.setdefault(prefix, {})[shard] = modules.pop(base)["trellis"]
+    for prefix, shards in sorted(tables.items()):
+        write_exl3_ngram_rows(model, prefix, shards)
+        rows.append(prefix)
 
     for base, parts in sorted(modules.items()):
         # a 2-D trellis with signs is a quantized token embedding (exllamav3 ngram_codec.py): rows of rings of 256
@@ -235,6 +249,47 @@ def write_exl3_rows(model: ModelBase, base: str, parts: dict[str, str]) -> None:
     model.gguf_writer.add_tensor(new_base + ".exl3r_signs",   LazyTorchTensor.to_eager(signs).numpy(),   raw_dtype=gguf.GGMLQuantizationType.F16)
     for part in ("trellis", "signs"):
         del model.model_tensors[parts[part]]
+
+
+def write_exl3_ngram_rows(model: ModelBase, prefix: str, shards: dict[int, str]) -> None:
+    """an n-gram row table (exllamav3 ngram_codec.py): rows of one ring of 160, plus the F16 bias of the row's hash head;
+    the shards are written back to back as one table, a shard at a time"""
+    from .base import LazyTorchTensor
+
+    ids = sorted(shards)
+    if ids != [-1] and ids != list(range(len(ids))):
+        raise ValueError(f"{prefix}: row table shards {ids[:4]}... are not numbered 0..{len(ids) - 1}")
+    names  = [shards[i] for i in ids]
+    metas  = [model.model_tensors[name]() for name in names]
+    shapes = [tuple(t.shape) for t in metas]
+    if any(t.dtype != torch.int16 or t.dim() != 2 for t in metas) or len({s[1] for s in shapes}) != 1:
+        raise ValueError(f"{prefix}: unexpected row table shards {sorted({(str(t.dtype), tuple(t.shape)) for t in metas})}")
+    # exllamav3 RowTable: every shard but the last has the same row count
+    if len({s[0] for s in shapes[:-1]}) > 1 or shapes[-1][0] > shapes[0][0]:
+        raise ValueError(f"{prefix}: row table shards of unequal sizes {sorted({s[0] for s in shapes})}")
+    row_words = shapes[0][1]
+    K = (row_words - 1) * 16 // EXL3_ROW_DIM
+    if not 1 <= K <= 8 or 1 + EXL3_ROW_DIM * K // 16 != row_words:
+        raise ValueError(f"{prefix}: row width {row_words} does not hold one ring of {EXL3_ROW_DIM}")
+
+    bias = model.model_tensors[prefix + ".head_bias"]()
+    if bias.dtype != torch.float16 or bias.dim() != 2 or bias.shape[1] != EXL3_ROW_DIM:
+        raise ValueError(f"{prefix}: unexpected head bias {bias.dtype} {tuple(bias.shape)}")
+
+    new_base = model.exl3_row_table_name(prefix, EXL3_ROW_DIM)
+    n_rows = sum(s[0] for s in shapes)
+
+    def load(gen: Callable[[], Any]):
+        # a fresh lazy tensor every call, or to_eager() memoizes every shard
+        return lambda: LazyTorchTensor.to_eager(gen()).numpy()
+
+    table = gguf.LazyChunkedTensor([load(model.model_tensors[name]) for name in names], shape=(n_rows, row_words), dtype=np.int16)
+    logger.info(f"{new_base + '.exl3r_trellis,':<40} K = {K} mul1 rows, {n_rows} x {EXL3_ROW_DIM} in {len(names)} shard(s), "
+                f"{bias.shape[0]} hash heads")
+    model.gguf_writer.add_tensor(new_base + ".exl3r_trellis", table, raw_dtype=gguf.GGMLQuantizationType.I16)
+    model.gguf_writer.add_tensor(new_base + ".exl3r_bias",    LazyTorchTensor.to_eager(bias).numpy(), raw_dtype=gguf.GGMLQuantizationType.F16)
+    for name in names + [prefix + ".head_bias"]:
+        del model.model_tensors[name]
 
 
 def add_exl3_metadata(model: ModelBase, quant_config: dict[str, Any]) -> None:

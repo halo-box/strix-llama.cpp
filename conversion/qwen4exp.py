@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
-from typing import Iterable, cast
+from typing import Callable, Iterable, cast
 
 import torch
 from torch import Tensor
@@ -9,7 +10,7 @@ from torch import Tensor
 import gguf
 import numpy as np
 
-from .base import ModelBase
+from .base import LazyTorchTensor, ModelBase, logger
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
 
@@ -36,6 +37,16 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         "hyper_connection_mixer": "nextn_hc_head",
     }
 
+    # the int64 PLE hash constants: name in a dense checkpoint, name in exllamav3's quantized n-gram table
+    _PLE_CONSTANTS = {
+        "layer_multipliers": ("ple_embedding.layer_multipliers",        "ple_embedding.ngram_embedding.layer_multipliers"),
+        "head_offsets":      ("ple_embedding.ngram_heads_offsets",      "ple_embedding.ngram_embedding.head_offsets"),
+        "head_vocab_sizes":  ("ple_embedding.ngram_heads_vocab_sizes",  "ple_embedding.ngram_embedding.head_vocab_sizes"),
+    }
+
+    # exllamav3 writes the quantized n-gram table to this file, which model.safetensors.index.json does not list
+    _EXL3_NGRAM_FILE = "ngram_embedding.safetensors"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # only the shard names, so the table itself is never held
@@ -55,20 +66,44 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return f"model.layers.{cls._original_block_count}.{cls._MTP_EXTRA[part]}.{rest}", gen
         return super().filter_tensors(item)
 
-    def _read_hash_constants(self, suffix: str) -> list[int]:
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        tensors = super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+        # the quantized n-gram table of an EXL3 checkpoint is found by its file, not through the index
+        sidecar = self.dir_model / self._EXL3_NGRAM_FILE
+        if remote_hf_model_id is not None or not sidecar.is_file() or any(".ngram_embedding." in name for name in tensors):
+            return tensors
+        with open(sidecar, "rb") as f:
+            header = json.loads(f.read(int.from_bytes(f.read(8), byteorder="little")))
+        meta = header.get("__metadata__", {})
+        if meta.get("format") != "exl3_ngram_trellis" or meta.get("version") != "1":
+            raise ValueError(f"{sidecar}: not an exllamav3 n-gram table of version 1 ({meta.get('format')!r}, {meta.get('version')!r})")
+        logger.info(f"gguf: indexing EXL3 n-gram table '{self._EXL3_NGRAM_FILE}' (K = {meta.get('K')}, {meta.get('rows')} rows)")
+        for name, data in gguf.utility.SafetensorsLocal(sidecar).tensors.items():
+            if self.lazy:
+                data_gen = lambda data=data: LazyTorchTensor.from_local_tensor(data)  # noqa: E731
+            else:
+                dtype = LazyTorchTensor._dtype_str_map[data.dtype]
+                data_gen = lambda data=data, dtype=dtype: torch.from_numpy(data.mmap_bytes()).view(dtype).reshape(data.shape)  # noqa: E731
+            if titem := self.filter_tensors((name, data_gen)):
+                tensors[titem[0]] = titem[1]
+        return tensors
+
+    def _read_hash_constants(self, key: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
 
         prepare_tensors() casts every non-float dtype to float32 before
         modify_tensors() sees it (base.py), which would silently round these
         45-bit multipliers. Reading the lazy tensor here bypasses that.
         """
-        for name, gen in self.model_tensors.items():
-            if name.endswith(suffix):
-                t = gen()
-                if t.dtype != torch.int64:
-                    t = t.to(torch.int64)
-                return [int(x) for x in t.tolist()]
-        raise ValueError(f"PLE constant {suffix!r} missing from the checkpoint")
+        for suffix in self._PLE_CONSTANTS[key]:
+            for name, gen in self.model_tensors.items():
+                if name.endswith(suffix):
+                    t = gen()
+                    if t.dtype != torch.int64:
+                        t = t.to(torch.int64)
+                    return [int(x) for x in t.tolist()]
+        raise ValueError(f"PLE constant {' or '.join(map(repr, self._PLE_CONSTANTS[key]))} missing from the checkpoint")
 
     def exl3_linear_names(self, name: str, n: int) -> list[tuple[str, int, int]] | None:
         m = re.match(r"^model\.layers\.(\d+)\.", name)
@@ -88,6 +123,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if name.endswith(".nextn_fc_hidden"):
             return [(self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_H_PROJ, bid, ""), 0, n)]
         return None
+
+    def exl3_row_table_name(self, name: str, row_dim: int) -> str:
+        if not name.endswith(".ple_embedding.ngram_embedding"):
+            return super().exl3_row_table_name(name, row_dim)
+        self._ple_row_dim = row_dim
+        return gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD]
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -127,12 +168,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if self._ple_row_dim is not None:
             self.gguf_writer.add_embedding_length_per_layer_input(self._ple_row_dim)
 
-        self.gguf_writer.add_ple_layer_multipliers(
-            self._read_hash_constants("ple_embedding.layer_multipliers"))
-        self.gguf_writer.add_ple_head_offsets(
-            self._read_hash_constants("ple_embedding.ngram_heads_offsets"))
-        self.gguf_writer.add_ple_head_vocab_sizes(
-            self._read_hash_constants("ple_embedding.ngram_heads_vocab_sizes"))
+        self.gguf_writer.add_ple_layer_multipliers(self._read_hash_constants("layer_multipliers"))
+        self.gguf_writer.add_ple_head_offsets(self._read_hash_constants("head_offsets"))
+        self.gguf_writer.add_ple_head_vocab_sizes(self._read_hash_constants("head_vocab_sizes"))
 
     def _image_token_id(self) -> int | None:
         img = self.hparams.get("image_token_id")
@@ -157,6 +195,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return []
         if name.endswith("ple_embedding.ngram_heads_vocab_sizes"):
             self._ple_head_vocab_sizes = [int(x) for x in data_torch.tolist()]
+            return []
+        # the same constants of a quantized n-gram table, read by set_gguf_parameters
+        if name.endswith(tuple(names[1] for names in self._PLE_CONSTANTS.values())):
             return []
 
         if ".ngram_embedding.shard_" in name:
