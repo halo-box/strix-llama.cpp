@@ -73,17 +73,28 @@ shared float mixsh[MIX_GROUPS][NMIX];
 shared float mix[NMIX];
 shared float prew[hc];
 
-// rms_norm.comp's reduction: each thread's partial, then the shared-memory tree
+// rms_norm.comp's reduction: each thread's partial, then its 512-wide tree. The levels of at least a subgroup go through
+// shared memory as there; the last levels run in subgroup 0 by shuffles, where lane tid < s reads lane tid ^ s = tid + s, the
+// partial the shared-memory tree adds at that level, so the total is bit-identical with fewer barriers.
 float block_sum(float sum, const uint tid) {
     sumsh[tid] = sum;
     barrier();
-    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s >= gl_SubgroupSize; s >>= 1) {
         if (tid < s) {
             sum += sumsh[tid + s];
             sumsh[tid] = sum;
         }
         barrier();
     }
+    if (gl_SubgroupID == 0) {
+        for (uint s = gl_SubgroupSize / 2; s > 0; s >>= 1) {
+            sum += subgroupShuffleXor(sum, s);
+        }
+        if (tid == 0) {
+            sumsh[0] = sum;
+        }
+    }
+    barrier();
     sum = sumsh[0];
     barrier();
     return sum;

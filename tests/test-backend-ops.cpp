@@ -5728,6 +5728,19 @@ struct test_dsv4_hc_boundary : public test_dsv4_hc {
 
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        // GGML_TEST_HC_BOUNDARY_HASH=1: print an FNV-1a hash of each checked output (backend1's values), so two builds or
+        // knob settings can be compared bit for bit (a reduction rewrite that keeps the arithmetic must not move a bit)
+        if (env_opt_in("GGML_TEST_HC_BOUNDARY_HASH")) {
+            for (size_t k = 0; k < verify.size(); ++k) {
+                std::vector<uint8_t> buf(ggml_nbytes(verify[k]));
+                ggml_backend_tensor_get(verify[k], buf.data(), 0, buf.size());
+                uint64_t h = 1469598103934665603ull;
+                for (uint8_t c : buf) {
+                    h = (h ^ c) * 1099511628211ull;
+                }
+                printf("HCB_HASH %s out%zu %016llx\n", vars().c_str(), k, (unsigned long long) h);
+            }
+        }
         const char * name = norm ? "HC_BOUNDARY_NORM" : "HC_BOUNDARY";
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_BOUNDARY", name)) {
             return true;
