@@ -255,6 +255,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         if (ple_on_disk && ple_w) {
             llama_ple_disk::params dp;
             dp.direct_io = false; // page-cached, so qwen4exp_ple_prefetch's readahead advice can land
+            if (const char * e = getenv("LLAMA_PLE_DIRECT")) { dp.direct_io = atoi(e) != 0; }
             if (ple_exl3_bias) {
                 // EXL3: the reader returns the stored rings and set_input decodes them, so the row cache holds the
                 // rings (62 B a row at K = 3) rather than decoded rows (640 B). Measured on Flash-Next 1.66bpw_h4_ng3
@@ -264,12 +265,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 dp.ne_out = hparams.ple_head_dim;
                 // O_DIRECT, so the table stays out of the page cache too. Buffered, every distinct row read leaves
                 // its 4 KiB page there (191 MB after one 3600-token prompt), and cold rows are no faster: prefill
-                // 412 vs 411 tok/s, decode 25.18 vs 25.17. What buffered reads buy is qwen4exp_ple_prefetch for
+                // 412 vs 411 tok/s, decode 25.18 vs 25.17. Buffered reads would let qwen4exp_ple_prefetch help
                 // batches of >= 4096 tokens: an 8192-token prompt prefills at 460 instead of 409 tok/s (resident
-                // 479), leaving 427 MB in the page cache. LLAMA_PLE_DIRECT=0 makes that trade.
+                // 479), leaving 427 MB in the page cache.
                 dp.direct_io = true;
             }
-            if (const char * e = getenv("LLAMA_PLE_DIRECT")) { dp.direct_io = atoi(e) != 0; }
 
             ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
                                                         ple_w->tensor->type, ple_w->tensor->ne[0], ple_rows, dp);
