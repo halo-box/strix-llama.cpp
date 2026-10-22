@@ -83,7 +83,14 @@ replaced by one key:
 The qwen35 / qwen3next converter reorders linear-attention V heads from grouped to tiled order. For EXL3 linears
 that is done on whole 128-blocks (8 tiles plus the matching scale entries), which is exact because H is block
 diagonal; the tiles themselves are unchanged. Not supported yet, refused by the converter: legacy packed `.su`/`.sv`,
-row tables other than the token embedding (n-gram / PLE tables), mixed codebooks.
+mixed codebooks.
+
+The qwen4exp converter splits the fused QSA indexer projection `indexer.index_qk_proj` at column 512 into
+`indexer.q_proj` and `indexer.k_proj` (a 128-column block boundary, so whole tiles and their `svh` entries move and the
+split is exact), keeps the two MTP input projections as `nextn.e_proj` and `nextn.h_proj` (each has its own scales),
+and writes the n-gram table of `ngram_embedding.safetensors`, a file the index does not list, as
+`per_layer_token_embd.exl3r_trellis` (I16 `[row_words, rows]`, the shards in order) and
+`per_layer_token_embd.exl3r_bias` (F16 `[160, heads]`); its hashing constants become the `qwen4exp.ple.*` keys.
 
 The qwen35 converter takes the number of MTP layers of an EXL3 checkpoint from its `mtp.layers.<i>` tensors, not
 from `mtp_num_hidden_layers` of `config.json` (a checkpoint can declare a layer it does not store).
@@ -163,7 +170,9 @@ stands in the same way for `token_embd.weight` (probe `EXL3_GET_ROWS`, not as a 
 decodes its rows with `ggml_exl3_get_rows` in `build_inp_embd` and in the qwen35 MTP graph, and the graph check also
 refuses any other reader of a row table. A stack of experts stands for the `{k, n, E}` weight of a `MUL_MAT_ID`
 (probe `EXL3_MUL_MAT_ID`) and `build_lora_mm_id` makes `ggml_exl3_mul_mat_id` for it; the MoE expert cache is refused.
-Supported archs: qwen35, lfm2moe. EXL3 weights cannot be combined with LoRA adapters,
+The qwen4exp n-gram (PLE) table is decoded on the host in the PLE gather, row by row with
+`ggml_exl3_decode_ngram_row`; under `--lazy-mode on-direct` its rings are read from the file with O_DIRECT.
+Supported archs: qwen35, lfm2moe, qwen4exp. EXL3 weights cannot be combined with LoRA adapters,
 prism.hadamard, the MTP draft vocabulary or a virtual model of `llama_model_init_from_user` (metadata without a
 complete tensor set).
 
