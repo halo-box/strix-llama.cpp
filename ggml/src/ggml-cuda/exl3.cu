@@ -1,16 +1,13 @@
 // EXL3 (exllamav3) linear on RDNA3 / RDNA4: GGML_OP_EXL3_MUL_MAT, see ggml/exl3/README.md.
 // y = H(H(x * suh) W_hat) * svh / 128, H the unnormalized 128-point Hadamard, W_hat decoded from the trellis.
 //
-// Up to 32 rows (decode, MTP verification): two launches per op, the input rotation (which also zeroes this call's
-// arrival counters), then the dot kernel. A block of the dot kernel computes T = 2 adjacent 16-column tiles for up to 8
-// rows, its warps splitting K; the last block to finish a 128-column segment applies the output rotation and the
-// output scale to it.
-// More rows (prefill, RDNA3): exl3_rotate_split writes H(x * suh) in f16 (hi, plus the lo part when two products are
-// needed) with a power-of-two scale per row, then a GEMM decodes 128-column x 32-k slabs of W_hat into LDS once per
-// block and k step and runs f16 WMMAs, with the output rotation in registers: exl3_gemm1_kernel (one product, 256 rows
-// per block) or exl3_gemm_kernel (hi + lo, f32 grade); exl3_gemm_products picks one. This follows exllamav3's dispatch
-// (direct quantized kernels for few rows; from 144 rows exllamav3 reconstructs W in fp16 and calls hgemm), but decodes
-// per tile inside the GEMM instead of the whole weight, and the tile loop is the one of the MMB GEMM in mmb.cu.
+// Up to 32 rows (decode): the input rotation, which also zeroes the arrival counters, then the dot kernel, in which a
+// block computes T = 2 adjacent 16-column tiles for up to 8 rows with its warps splitting K, and the last block to
+// finish a 128-column segment applies the output rotation and scale to it.
+// More rows (prefill, RDNA3): exl3_rotate_split writes H(x * suh) in f16 (hi, plus lo for two products) with a
+// power-of-two scale per row, then exl3_gemm1_kernel (one product) or exl3_gemm_kernel (hi + lo) decodes 128-column x
+// 32-k slabs of W_hat into LDS once per block and k step, runs f16 WMMAs and applies the output rotation in registers.
+// exllamav3 instead reconstructs the whole W in fp16 from 144 rows and calls hgemm.
 //
 // Adapted from turboderp-org/exllamav3 at a3bfbfd0d3c0cea67815146a19fcd2bb3f84709a (MIT licence, below):
 //   exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_tiles_rdna.cuh   per-lane load plan, tile decoders, the 16-bit
@@ -88,7 +85,6 @@ struct exl3_width {
 };
 
 // the dwords lane L reads from a tile (byte offsets) and the funnel shifts that decode its 8 weights
-//   bits 1, 2, 4: 2 dwords, one shift; bits 3: 2 dwords; bits 5, 6, 8: 4; bits 7: 8; half rates: 4
 template <int bits>
 struct exl3_lane_plan {
     static constexpr int R = exl3_width<bits>::half ? 4 : (bits <= 4 ? 2 : (bits == 7 ? 8 : 4));
@@ -119,9 +115,9 @@ typedef __attribute__((address_space(1))) const char     exl3_g_char;
 typedef __attribute__((address_space(1))) const uint32_t exl3_g_u32;
 typedef __attribute__((address_space(1))) const exl3_f2  exl3_g_f2;
 
-// EXL3_MUL_MAT_ID: the rows of the op are the (slot, token) pairs p = slot + n_used*token, in expert order. A group is
-// consecutive rows of one expert; grp (the group table of one launch) holds (expert, first row, rows) per group, rows = 0
-// past the table's last group. Without grp (one token) row r is pair r and group r, its expert ids[r].
+// EXL3_MUL_MAT_ID: the op's rows are the (slot, token) pairs p = slot + n_used*token in expert order; grp, the group
+// table of one launch, holds (expert, first row, rows) per group of consecutive rows of one expert, rows = 0 past its
+// last group. Without grp (one token) row r is pair r and group r.
 struct exl3_mmid {
     const char * ids;       // I32 [n_used, n_tokens]
     int64_t      ids_nb0;
@@ -423,8 +419,7 @@ static __device__ __forceinline__ void exl3_decode_tile(const uint32_t * raw, co
     }
 }
 
-// k-tiles whose loads are issued before the first is decoded: exllamav3's table for T = 2 (exl3_tiles_u_splitk),
-// not re-measured here
+// k-tiles loaded before the first is decoded: exllamav3's table for T = 2 (exl3_tiles_u_splitk), not re-measured here
 template <int bits, int M>
 static constexpr __device__ int exl3_u() {
     if constexpr (M >= 8) {
@@ -816,28 +811,25 @@ static void exl3_launch_cb(const int cb, const int M, const float * xh, const in
 #define EXL3_GEMV_ROWS 32
 #define EXL3_SPLIT_K   32768 // longest k of the GEMM path (exl3_rotate_split holds a row in registers)
 #define EXL3_GEMM_BM   128 // output columns per block: one Hadamard segment
-// rows per block, 16 per warp (32 per warp: 386 ms vs 254 below, spills and half the blocks). The hi + lo GEMM takes
-// blocks of half that (W = 4 warps) when its last block would be at most half full. 200 linears of Qwen3.5-4B (K = 4),
-// gfx1151, op bench ms with 128- vs 64-row blocks: 33 rows 62.9 vs 40.4, 64 65.3 vs 44.1, 96 68.0 vs 75.5, 128 70.4 vs
-// 77.6, 160 127.0 vs 106.1, 192 135.5 vs 112.8, 256 141.3 vs 149.3, 320 198.6 vs 176.6, 384 209.2 vs 212.3, 448 264.3 vs
-// 254.7, 511 279.3 vs 284.8 (32-row blocks: 46.5 at 33, 50.5 at 64; q4_K MMQ 21.8 at 33, 30.4 at 64, 178.5 at 511)
+// rows per block, 16 per warp (32 per warp: 386 vs 254 ms at 512 rows, spills and half the blocks). The hi + lo GEMM
+// takes blocks of half that (W = 4) when its last block would be at most half full: 200 linears of Qwen3.5-4B (K = 4),
+// gfx1151, op bench ms with 128- vs 64-row blocks 62.9 vs 40.4 at 33 rows, 68.0 vs 75.5 at 96, 127.0 vs 106.1 at 160,
+// 141.3 vs 149.3 at 256, 279.3 vs 284.8 at 511 (32-row blocks 46.5 at 33)
 #define EXL3_GEMM_BN   128
-// k per main-loop step, 2 k-tiles. Op bench sum over the 200 linears at 512 rows: 254 ms; k step 64: 267 ms (256 VGPRs,
-// spills)
+// k per main-loop step, 2 k-tiles: 254 ms over the 200 linears at 512 rows, k step 64 267 ms (256 VGPRs, spills)
 #define EXL3_GEMM_BK   32
 #define EXL3_GEMM_LS   (EXL3_GEMM_BK + 8) // LDS row stride in halves
 
 typedef _Float16 exl3_v16h __attribute__((ext_vector_type(16)));
 typedef float    exl3_v8f  __attribute__((ext_vector_type(8)));
-typedef uint32_t exl3_u4   __attribute__((ext_vector_type(4))); // an array of HIP's uint4 (a union) was kept in scratch
+typedef uint32_t exl3_u4   __attribute__((ext_vector_type(4))); // an array of HIP's uint4 (a union) is kept in scratch
 
 // xh = H(x*suh) per 128 block, then per row a power of two s with max|xh|*s in [2^14, 2^15) (s = 1 for a row without
 // a finite nonzero value): hi = f16(xh*s), lo = f16(xh*s - hi), inv[r] = 1/s. The product with W_hat (exact in f16) of
 // hi + lo carries ~22 significant bits of xh. One block of 8 warps per row, warp w holds the segments w, w + 8, ...
 // ID: row r is the x row of its pair, with the suh of the pair's expert
-// GLU (ID only): x is the gate and up the up tensor of a standard SwiGLU (same strides) whose output the op reads; the row is
-// silu(gate)*up computed as ggml's gated kernel computes it (unary.cu, one f32 rounding of each product) and then times suh,
-// the operations of the unfused graph without the f32 store and load in between
+// GLU (ID only): x is the gate and up the up tensor (same strides) of the SwiGLU whose output the op reads; the row is
+// silu(gate)*up rounded as in ggml's gated kernel (unary.cu), then times suh: bit for bit the unfused graph's x*suh
 template <int S, bool LO, bool ID, bool GLU = false>
 static __global__ void __launch_bounds__(256) exl3_rotate_split(
         const float * __restrict__ x, const half * __restrict__ suh, half * __restrict__ xhi, half * __restrict__ xlo,
@@ -957,16 +949,14 @@ static __device__ __forceinline__ exl3_v16h exl3_frag(const uint16_t * p) {
     return __builtin_bit_cast(exl3_v16h, (uint4[2]){a, b});
 }
 
-// y = H(xh W_hat)*svh/128 for BM = 128 output columns (one Hadamard segment) and BN = 16*W rows per block (W warps),
-// with the structure of the MMB tile GEMM in mmb.cu (register prefetch of the next k step, one LDS stage, two barriers
-// per step). Per k step warp w decodes column tiles w, w + W, ... of the step's 2 k-tiles into the LDS weight tile, as
-// f16 [column][k]; the [hi; lo] rows of xh go to LDS as they are. Each warp then holds all 128 columns of its 16 rows, so
-// the output Hadamard runs in registers (stages 1..8 across lanes, 16..64 across fragments, the order and roundings of
-// exl3_fwht128). Both products, W_hat with xh hi and with xh lo, are f16 WMMAs with f32 accumulation.
-// ID: block row g is group g of mm (up to BN rows of one expert), with that expert's trellis and svh; row t is stored to
-// the dst row of its pair. A warp whose 16 rows are all past the group's last row only decodes its share of the weight
-// tile: it skips the WMMAs and the output. P = 1 (ID only): one f16 product, W_hat with xh hi, accumulated across k in
-// place in the order of exl3_gemm1_kernel, so a row equals that kernel's row bit for bit
+// y = H(xh W_hat)*svh/128 for 128 output columns and BN = 16*W rows per block, structured as the MMB tile GEMM in
+// mmb.cu. Per k step warp w decodes the column tiles w, w + W, ... into the LDS weight tile as f16 [column][k]; each
+// warp then holds all 128 columns of its 16 rows, so the output Hadamard runs in registers (stages 1..8 across lanes,
+// 16..64 across fragments) with the order and roundings of exl3_fwht128.
+// ID: block row g is group g of mm (up to BN rows of one expert) with its expert's trellis and svh, row t goes to the
+// dst row of its pair, and a warp whose 16 rows are all past the group's last row only decodes its share of the weight
+// tile. P = 1 (ID only): one f16 product accumulated across k in place in the order of exl3_gemm1_kernel, so a row
+// equals that kernel's row bit for bit
 template <int bits, int cb, bool ID, int W, int P = 2>
 static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
         const int16_t * __restrict__ trellis, const half * __restrict__ xhi, const half * __restrict__ xlo,
@@ -1082,10 +1072,9 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
         }                                                                         \
     } while (0)
 
-    // The WMMA f32 accumulate truncates (KB 0fb3ba63: -7e-6 relative bias over k = 2560 when a whole dot product
-    // accumulates inside it). Here the WMMAs of one k step accumulate from zero into p, and p is added to acc with a
-    // round-to-nearest f32 add. Container shapes, rows 16..513, NMSE against ggml_mul_mat (CPU, f32 W) when all of k
-    // accumulated inside the WMMA: 2.5e-10 (k = 2560) .. 3.2e-9 (k = 9216), growing as k^2.
+    // Each k step's WMMAs accumulate from zero into p, and p is added to acc with a round-to-nearest f32 add: the WMMA
+    // f32 accumulate truncates, and with all of k inside it the relative bias is -7e-6 at k = 2560 and the NMSE against
+    // the CPU ggml_mul_mat on the f32 W 2.5e-10 (k = 2560) .. 3.2e-9 (k = 9216) on Qwen3.5-4B shapes, growing as k^2.
     exl3_v8f acc[8];
     const exl3_v8f zero = {};
 #pragma unroll
@@ -1098,7 +1087,7 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
     __syncthreads();
     for (int ks = 0; ks < n_steps; ++ks) {
         // the last step reloads itself: no branch around the prefetch. The scheduling barrier keeps the loads ahead
-        // of the WMMAs: left alone the compiler sank them to the end of the step and then waited for them (sum over
+        // of the WMMAs: left alone the compiler sinks them to the end of the step and then waits for them (sum over
         // the 200 linears 265 ms, 254 with both barriers)
         EXL3_GEMM_LOAD(min(ks + 1, n_steps - 1));
         __builtin_amdgcn_sched_barrier(0);
@@ -1199,12 +1188,11 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
 #endif // defined(RDNA3)
 }
 
-// One f16 product: y = H(xh_hi W_hat)*svh/128 with BM = 128 output columns and BN = 256 rows per block; warp w holds
-// rows w*32 .. w*32 + 31 as two 16-row tiles over all 128 columns, so each A fragment read from LDS feeds two WMMAs and
-// each decoded tile serves 256 rows. Op bench, 200 linears of Qwen3.5-4B at 512 rows, same clock: 140 ms, against 163
-// for one product in the loop of exl3_gemm_kernel (16 rows per warp) and 277 for its two products. The WMMAs accumulate
-// across k in place: the truncation (2.5e-10 at k 2560 .. 3.2e-9 at k 9216 in exl3_gemm_kernel) stays small against
-// the f16 rounding of xh.
+// One f16 product: y = H(xh_hi W_hat)*svh/128 for 128 output columns and 256 rows per block, warp w holding rows
+// w*32 .. w*32 + 31 as two 16-row tiles, so each A fragment read from LDS feeds two WMMAs and each decoded tile serves
+// 256 rows: 140 ms over the 200 linears of Qwen3.5-4B at 512 rows and the same clock, against 163 for one product in
+// exl3_gemm_kernel (16 rows per warp) and 277 for its two. The WMMAs accumulate across k in place: the truncation
+// (2.5e-10 at k 2560 .. 3.2e-9 at k 9216) is small against the f16 rounding of xh.
 template <int bits, int cb>
 static __global__ void __launch_bounds__(256) exl3_gemm1_kernel(
         const int16_t * __restrict__ trellis, const half * __restrict__ xhi, const float * __restrict__ inv,
@@ -1299,8 +1287,8 @@ static __global__ void __launch_bounds__(256) exl3_gemm1_kernel(
     __syncthreads();
     for (int ks = 0; ks < n_steps; ++ks) {
         // as in exl3_gemm_kernel: the last step reloads itself, the loads stay ahead of the WMMAs. Two LDS stages (one
-        // barrier per step, 60 KB, 241 VGPRs) measured slower on every container shape: 139.3 vs 137.4 ms per 200
-        // linears at 512 rows and the same clock, k = 9216 912 vs 814 us (two blocks per WGP instead of three)
+        // barrier per step, 60 KB, 241 VGPRs) are slower on every shape: 139.3 vs 137.4 ms over the 200 linears at 512
+        // rows and the same clock, 912 vs 814 us at k = 9216 (two blocks per WGP instead of three)
         EXL3_GEMM_LOAD(min(ks + 1, n_steps - 1));
         __builtin_amdgcn_sched_barrier(0);
         const int r = lane % 16;
@@ -1508,7 +1496,6 @@ static void exl3_dot_bits(const int bits, const int cb, const int M, const float
         case 6: exl3_launch_cb<6>(cb, M, xh, tq, sv, y, counters, k, n, rows, n_groups, mm, stream); break;
         case 7: exl3_launch_cb<7>(cb, M, xh, tq, sv, y, counters, k, n, rows, n_groups, mm, stream); break;
         case 8: exl3_launch_cb<8>(cb, M, xh, tq, sv, y, counters, k, n, rows, n_groups, mm, stream); break;
-        // half rates K + 0.5 exist for mul1 only
         case 17: exl3_launch<17, GGML_EXL3_CODEBOOK_MUL1>(M, xh, tq, sv, y, counters, k, n, rows, n_groups, mm, stream); break;
         case 18: exl3_launch<18, GGML_EXL3_CODEBOOK_MUL1>(M, xh, tq, sv, y, counters, k, n, rows, n_groups, mm, stream); break;
         case 19: exl3_launch<19, GGML_EXL3_CODEBOOK_MUL1>(M, xh, tq, sv, y, counters, k, n, rows, n_groups, mm, stream); break;
@@ -1517,11 +1504,11 @@ static void exl3_dot_bits(const int bits, const int cb, const int M, const float
 }
 
 // Products per k step on the GEMM path. W_hat is exact in f16, so the one rounding is that of xh = H(x*suh): one f16
-// product (exl3_gemm1_kernel, NMSE 3.5e-8 .. 4.7e-8 against a double sum on the container shapes at 512 rows) or hi + lo
-// (exl3_gemm_kernel, f32 grade, <= 1.7e-13, twice the WMMA work). The default follows the GEMM this backend context runs
-// for an F32 weight of the same shape on the same x: one product where mmb takes it (mmb_f32split_kernel, one f16 product
-// with both operands rounded: 7.4e-8 .. 8.5e-8 on those shapes at 512 and 513 rows), two where it is f32 (MMVF, MMF or
-// rocBLAS: 1e-14 .. 3e-12 at 1 .. 511 rows, and for strided x).
+// product (exl3_gemm1_kernel, NMSE 3.5e-8 .. 4.7e-8 against a double sum on the Qwen3.5-4B shapes at 512 rows) or
+// hi + lo (exl3_gemm_kernel, <= 1.7e-13, twice the WMMA work), following the GEMM this context runs for an F32 weight
+// of the same shape on the same x: one product where mmb takes it (mmb_f32split_kernel, both operands rounded:
+// 7.4e-8 .. 8.5e-8 at 512 and 513 rows), two where it is f32 (MMVF, MMF or rocBLAS: 1e-14 .. 3e-12 at 1 .. 511 rows,
+// and for strided x).
 static int exl3_gemm_products(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * dst,
         const int64_t k, const int64_t n) {
     ggml_tensor w = {};
@@ -1576,7 +1563,6 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     if (rows > EXL3_GEMV_ROWS && k <= EXL3_SPLIT_K && GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[ctx.device].cc)) {
         GGML_ASSERT((rows + EXL3_GEMM_BN/2 - 1)/(EXL3_GEMM_BN/2) <= 65535);
-        // one f16 product or hi + lo, following the F32-weight GEMM of this context (exl3_gemm_products)
         const bool two = exl3_gemm_products(ctx, x, dst, k, n) == 2;
         ggml_cuda_pool_alloc<half>  xhi(ctx.pool(), rows*k);
         ggml_cuda_pool_alloc<half>  xlo(ctx.pool());
@@ -1586,14 +1572,12 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         }
         half * xl = two ? xlo.get() : nullptr;
         exl3_rotate_split_launch(x, (const half *) suh->data, xhi.get(), xl, inv.get(), k, rows, nullptr, stream);
-        // hi + lo: blocks of 64 rows (W = 4) when the last block of EXL3_GEMM_BN rows would be at most half full
         const int64_t tail = rows % EXL3_GEMM_BN;
         const int     W    = tail > 0 && tail <= EXL3_GEMM_BN/2 ? EXL3_GEMM_BN/32 : EXL3_GEMM_BN/16;
         exl3_gemm_bits(bits, cb, tq, xhi.get(), xl, inv.get(), sv, y, k, n, rows, nullptr, 0, W, two ? 2 : 1, stream);
         return;
     }
 
-    // row tile: the smallest of 1, 2, 4, 8 that holds the rows; more rows run in groups of 8
     const int     M        = rows == 1 ? 1 : rows == 2 ? 2 : rows <= 4 ? 4 : 8;
     const int64_t n_groups = (rows + M - 1) / M;
     const int64_t n_segs   = n / EXL3_HAD;
@@ -1612,29 +1596,17 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
 // ---- EXL3_MUL_MAT_ID ----
 
-// The path by the average rows per expert, n_pairs/n_exp: the dot kernel in groups of up to 8 rows of one expert (a pass
-// over the expert's weights per group) below EXL3_MMID_GEMM_ROWS, else the GEMM (RDNA3) in groups of up to 32 rows of one
-// expert (W = 2 warps) up to EXL3_MMID_W2_ROWS, 64 rows (W = 4) above; the GEMM rows of an expert with at least
-// exl3_mmid_one_rows rows run one product in groups of EXL3_MMID_ONE_W warps. A warp whose 16 rows are past its group's
-// last row skips its WMMAs (exl3_gemm_kernel), so a group costs the WMMA work of its rows rounded up to 16: routing in a
-// model is far from uniform (LFM2.5-8B-A1B at ubatch 512, llama-bench's prompt: median 16 rows per expert, 18% of the
-// experts empty, 15% with >= 128 rows holding 68% of the rows), and whole groups did 1.53x the WMMA work of the rows,
-// 16-row tiles 1.11x (.claude/exl3-s8/results/routing). LFM2.5 stacks (2048 -> 1792 x broadcast / 1792 -> 2048 per slot,
-// 32 experts, top-4, K = 2 mul1), gfx1151, us per op:
-//   dot vs GEMM 32-row groups, uniform routing (.claude/exl3-s7/results/mmid): 88 tokens (11 rows per expert) 638 / 717
-//   vs 679 / 722, 96 tokens (12) 682 / 690 vs 621 / 634
-//   32- vs 64-row groups with the skipped tiles, uniform (.claude/exl3-s8/results/mmid/tok-*): 96 tokens 503 / 496 vs
-//   532 / 532, 128: 557 / 606 vs 656 / 658, 192: 652 / 774 vs 782 / 819, 256: 840 / 991 vs 932 / 931, 384: 1294 / 1366
-//   vs 1149 / 1132
-//   512 tokens, 64-row groups with the skipped tiles vs whole groups (ABBA, .claude/exl3-s8/results/mmid/fin-*): uniform
-//   1426 / 1445 vs 1523 / 1544, llama-bench's routing 1351 / 1371 vs 1550 / 1573, prose 1370 / 1390 vs 1514 / 1576,
-//   code 1373 / 1399 vs 1579 / 1584. Rejected (llama-bench's routing): 128-row groups 1345 / 1367 vs 1315 / 1344
-//   (s8b-*), a separate launch of 32-row blocks for the last partial groups of up to 32 rows 1369 / 1382 (llama-bench
-//   pp2048 4114 / 4059 tok/s vs 4229, results/screen-w)
+// The path follows the average rows per expert, n_pairs/n_exp; times are us per op on the two LFM2.5-8B-A1B stacks
+// (2048 -> 1792 x broadcast / 1792 -> 2048 per slot, 32 experts, top-4, K = 2 mul1) on gfx1151.
+// Below EXL3_MMID_GEMM_ROWS the dot kernel runs groups of up to 8 rows of one expert, else the GEMM (RDNA3): dot vs
+// GEMM with uniform routing 638 / 717 vs 679 / 722 at 11 rows per expert, 682 / 690 vs 621 / 634 at 12.
+// The GEMM groups hold up to 32 rows (W = 2) up to EXL3_MMID_W2_ROWS rows per expert and 64 (W = 4) above: 32- vs
+// 64-row groups with uniform routing 652 / 774 vs 782 / 819 at 24, 840 / 991 vs 932 / 931 at 32, 1294 / 1366 vs
+// 1149 / 1132 at 48; 128-row groups are slower, 1345 / 1367 vs 1315 / 1344 at 512 tokens of llama-bench's prompt.
 #define EXL3_MMID_GEMM_ROWS   12
 #define EXL3_MMID_W2_ROWS     32
-// 128-row groups for the one-product experts; 64-row groups measured the same (llama-bench pp2048 at ubatch 2048, where
-// 66% of the rows take one product: 5111 vs 5094 tok/s, .claude/exl3-s8/results/screen-onew)
+// 128-row groups for the one-product experts; 64-row groups measure the same (LFM2.5-8B-A1B, gfx1151, llama-bench
+// pp2048 at ubatch 2048, where 66% of the rows take one product: 5111 vs 5094 tok/s)
 #define EXL3_MMID_ONE_W       8
 #define EXL3_MMID_EXPERTS_MAX 1024 // exl3_mmid_route counts the rows of each expert in LDS
 
@@ -1693,11 +1665,10 @@ static __global__ void __launch_bounds__(1024) exl3_mmid_route(
     }
 }
 
-// Products of the GEMM rows, per expert. The F32 control, ggml_mul_mat_id on an F32 stack, runs on this backend the rows
-// of each expert as one ggml_mul_mat of a view of the stack on a contiguous copy of the rows: one f16 product
-// (mmb_f32split_kernel, both operands rounded) where ggml_cuda_mmb_supported_mm takes that shape (from 512 rows for a
-// view source), f32 (MMVF or rocBLAS) below. An expert's rows run one product iff the control runs one for them. Returns
-// the fewest rows of an expert that do (INT_MAX: none can, an expert holds at most one row per token).
+// The fewest rows of an expert whose GEMM rows run one product (INT_MAX: none can, an expert holds at most one row per
+// token), so they run one exactly when ggml_mul_mat_id on an F32 stack does, which this backend runs as a ggml_mul_mat
+// per expert of a view of the stack on a contiguous copy of the rows: one f16 product (mmb_f32split_kernel) where
+// ggml_cuda_mmb_supported_mm takes that shape (from 512 rows for a view source), f32 (MMVF or rocBLAS) below.
 static int exl3_mmid_one_rows(ggml_backend_cuda_context & ctx, const int64_t k, const int64_t n, const int64_t n_tok) {
     ggml_tensor w = {};
     w.type  = GGML_TYPE_F32;
@@ -1762,10 +1733,8 @@ static bool exl3_mmid_gemm(const int device, const ggml_tensor * dst) {
            GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[device].cc);
 }
 
-// each row (pair) is computed as EXL3_MUL_MAT computes a row of its expert: the dot kernel with groups of rows of one
-// expert, or the GEMM, hi + lo (exl3_gemm_kernel, two products) or one product (its P = 1 variant, rows equal to those
-// of exl3_gemm1_kernel) per expert as the F32 control does (exl3_mmid_one_rows). No host synchronization: the routing
-// is computed on the device.
+// Each row (pair) is computed as EXL3_MUL_MAT computes a row of its expert, by the dot kernel or by the GEMM with one
+// or two products per expert (exl3_mmid_one_rows); the routing runs on the device, with no host synchronization.
 // glu: the standard F32 SwiGLU node that dst reads as x, computed by the input rotation of the GEMM path (exl3_mmid_gemm)
 static void exl3_op_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * glu) {
     const ggml_tensor * trellis = dst->src[0];
