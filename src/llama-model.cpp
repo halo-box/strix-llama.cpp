@@ -2425,6 +2425,7 @@ void llama_model_base::load_hparams_exl3(llama_model_loader & ml) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_LFM2MOE:
+        case LLM_ARCH_QWEN4EXP:
             break;
         default:
             throw std::runtime_error(format("exl3: arch '%s' is not verified to route all linears through build_lora_mm", llm_arch_name(arch)));

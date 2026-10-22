@@ -500,7 +500,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         if (tok_embd_w == nullptr) {
             tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
         }
-        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        tok_embd = build_get_rows(tok_embd_w, inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
