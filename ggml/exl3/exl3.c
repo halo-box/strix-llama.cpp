@@ -207,7 +207,6 @@ int ggml_exl3_embd_k(int64_t row_words, int64_t groups) {
     if (groups <= 0 || row_words % groups != 0) {
         return -1;
     }
-    // exllamav3 Embedding: K = (row_words / groups - 1) / 16
     const int64_t w = row_words/groups - 1;
     if (w <= 0 || w % 16 != 0 || w/16 > 8) {
         return -1;

@@ -38,7 +38,7 @@ static const struct {
     const char * fingerprint;
     const char * pre;
 } EXL3_PRE_TOKENIZERS[] = {
-    { "821105e4f95dacb2d90e189de93c8273343574e7d2aae0ea82fc552ff0bc84b9", "qwen35" }, // Qwen3.5
+    { "821105e4f95dacb2d90e189de93c8273343574e7d2aae0ea82fc552ff0bc84b9", "qwen35" },
 };
 
 // one tensor of a safetensors file
@@ -1478,7 +1478,7 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
             t.arith = 1;
         }
 
-        // the type rule of ModelBase.prepare_tensors for EXL3 checkpoints: 1-D, norms, conv1d and non-.weight tensors are F32, other tensors keep the stored type
+        // the type rule of ModelBase.prepare_tensors for EXL3 checkpoints
         if (t.shape.size() <= 1 || str_ends_with(t.name, "_norm.weight") || str_ends_with(t.name, ".ssm_conv1d.weight") || !str_ends_with(t.name, ".weight")) {
             if (s.dtype != "F32" && s.dtype != "F16" && s.dtype != "BF16") {
                 throw std::runtime_error(orig + ": unexpected dtype " + s.dtype);

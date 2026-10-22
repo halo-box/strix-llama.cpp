@@ -263,7 +263,7 @@ bool ggml_cpu_exl3_mul_mat_id_supports_op(const ggml_tensor * op) {
 
 namespace {
 
-// work buffer: [expert of each row, row order: n_pairs int32 each][xh, n_pairs x k][per thread: panel, acc n_pairs x 16]
+// work buffer: [int32 order, offs, active][xh, n_pairs x k][per thread: panel, acc n_pairs x 16]
 struct mmid_layout {
     int64_t n_pairs;
     size_t  map;
