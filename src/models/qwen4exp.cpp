@@ -372,7 +372,16 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // hnorm spans the whole hyper-connection row, enorm just one stream
         layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", il), { n_embd }, flags);
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
-        layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
+
+        // an EXL3 file keeps fc_embedding and fc_hidden as two linears, e_proj and h_proj (each has its own scales,
+        // an EXL3 linear is stored as its trellis); a dense file holds them merged into eh_proj
+        if (ml.get_weight(tn(LLM_TENSOR_NEXTN_E_PROJ, "weight", il).str().c_str()) ||
+            ml.get_weight(tn(LLM_TENSOR_NEXTN_E_PROJ, "exl3_trellis", il).str().c_str())) {
+            layer.nextn.e_proj = create_tensor(tn(LLM_TENSOR_NEXTN_E_PROJ, "weight", il), { n_embd, n_embd }, flags);
+            layer.nextn.h_proj = create_tensor(tn(LLM_TENSOR_NEXTN_H_PROJ, "weight", il), { n_embd, n_embd }, flags);
+        } else {
+            layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
+        }
 
         // the draft head's own final mixer, and optional private embeddings / LM head; a shared sidecar has neither
         // of the latter and borrows the target's at graph time
@@ -424,7 +433,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const int    il    = hparams.n_layer();
     const auto & layer = model.layers[il];
 
-    GGML_ASSERT(layer.nextn.eh_proj && "MTP block is missing nextn.eh_proj");
+    GGML_ASSERT((layer.nextn.eh_proj || (layer.nextn.e_proj && layer.nextn.h_proj)) && "MTP block is missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm   && "MTP block is missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm   && "MTP block is missing nextn.hnorm");
 
@@ -483,13 +492,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     // every stream sees the same embedding term
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
-    e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
-    cb(e_norm, "mtp_enorm", il);
+    ggml_tensor * inpL   = nullptr;
+    if (layer.nextn.eh_proj) {
+        e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+        cb(e_norm, "mtp_enorm", il);
 
-    // fc_embedding(e) + fc_hidden(h) is one projection of the concatenation; the converter
-    // merges the two checkpoint tensors into this single eh_proj
-    ggml_tensor * inpL = build_lora_mm(layer.nextn.eh_proj,
-            ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+        // fc_embedding(e) + fc_hidden(h) is one projection of the concatenation; the converter
+        // merges the two checkpoint tensors into this single eh_proj
+        inpL = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+    } else {
+        cb(e_norm, "mtp_enorm", il);
+
+        // the same sum from its two parts (EXL3): e_proj once per token, added to h_proj of every stream
+        ggml_tensor * e = build_lora_mm(layer.nextn.e_proj, e_norm);
+        ggml_tensor * h = build_lora_mm(layer.nextn.h_proj, ggml_reshape_2d(ctx0, h_norm, n_embd, hc*n_tokens));
+        inpL = ggml_add(ctx0, ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), ggml_reshape_3d(ctx0, e, n_embd, 1, n_tokens));
+    }
     cb(inpL, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
