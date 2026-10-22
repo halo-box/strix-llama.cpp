@@ -12,8 +12,8 @@
 // The rms norm of x is a per-token scale, so the epilogue applies it to the reduced dots and the normalized flat residual
 // is never written. Partials go to a scratch buffer as [n_split, n_tokens, 24] and the epilogue sums them in split order.
 //
-// TILE == 0 (mat-vec, a few tokens): one 64-thread workgroup per (split, token), a split of 256 columns as one vec4 per
-//   thread, reduced across the workgroup.
+// TILE == 0 (mat-vec, a few tokens): one 64-thread workgroup per (split of 1024 columns, mix row), four coalesced vec4 of
+//   the row per thread kept in registers across the tokens; the x chunk is read per token (it stays in L2).
 // TILE == 1 (prefill): one 256-thread workgroup per (split of kc columns, 64 tokens). The x tile goes through shared
 //   memory in steps of 64 columns; each thread keeps 6 rows x 1 token of accumulators.
 
@@ -36,7 +36,7 @@ layout(binding = 2, std430) writeonly buffer P { float data_p[]; };
 
 const uint NMIX = 24;
 
-#define MV_SPLIT 256
+#define MV_SPLIT 1024
 #define TL_TOK   64
 #define TL_STEP  64
 #define TL_ROWS  6
@@ -50,29 +50,37 @@ void main() {
     const uint s   = gl_WorkGroupID.x;
 
     if (TILE == 0) {
-        const uint t  = gl_WorkGroupID.y;
+        // one workgroup per (split of 1024 columns, mix row): four coalesced vec4 per thread, kept across the tokens
+        const uint m  = gl_WorkGroupID.y;
         const uint k4 = (s * MV_SPLIT) / 4 + tid;
-        const vec4 xv = data_x4[(t * nbx1) / 4 + k4];
-
-        float acc[NMIX];
-        [[unroll]] for (uint m = 0; m < NMIX; ++m) {
-            acc[m] = dot(data_w4[(m * nbw1) / 4 + k4], xv);
+        vec4 w[4];
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            w[j] = data_w4[(m * nbw1) / 4 + k4 + 64 * j];
         }
-        [[unroll]] for (uint m = 0; m < NMIX; ++m) {
-            acc[m] = subgroupAdd(acc[m]);
-        }
-        if (gl_SubgroupInvocationID == 0) {
-            [[unroll]] for (uint m = 0; m < NMIX; ++m) {
-                red[gl_SubgroupID][m] = acc[m];
+        for (uint t = 0; t < n_tokens; ++t) {
+            float acc = 0.0f;
+            [[unroll]] for (uint j = 0; j < 4; ++j) {
+                acc += dot(w[j], data_x4[(t * nbx1) / 4 + k4 + 64 * j]);
             }
-        }
-        barrier();
-        if (tid < NMIX) {
-            float sum = 0.0f;
-            for (uint g = 0; g < gl_NumSubgroups; ++g) {
-                sum += red[g][tid];
+            acc = subgroupAdd(acc);
+            if (gl_NumSubgroups == 1) {
+                if (tid == 0) {
+                    data_p[(s * n_tokens + t) * NMIX + m] = acc;
+                }
+                continue;
             }
-            data_p[(s * n_tokens + t) * NMIX + tid] = sum;
+            if (gl_SubgroupInvocationID == 0) {
+                red[gl_SubgroupID][0] = acc;
+            }
+            barrier();
+            if (tid == 0) {
+                float sum = 0.0f;
+                for (uint g = 0; g < gl_NumSubgroups; ++g) {
+                    sum += red[g][0];
+                }
+                data_p[(s * n_tokens + t) * NMIX + m] = sum;
+            }
+            barrier();
         }
         return;
     }
