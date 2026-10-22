@@ -1521,13 +1521,9 @@ static void exl3_dot_bits(const int bits, const int cb, const int M, const float
 // (exl3_gemm_kernel, f32 grade, <= 1.7e-13, twice the WMMA work). The default follows the GEMM this backend context runs
 // for an F32 weight of the same shape on the same x: one product where mmb takes it (mmb_f32split_kernel, one f16 product
 // with both operands rounded: 7.4e-8 .. 8.5e-8 on those shapes at 512 and 513 rows), two where it is f32 (MMVF, MMF or
-// rocBLAS: 1e-14 .. 3e-12 at 1 .. 511 rows, and for strided x). GGML_EXL3_GEMM_PRODUCTS=1 or 2 overrides the choice.
+// rocBLAS: 1e-14 .. 3e-12 at 1 .. 511 rows, and for strided x).
 static int exl3_gemm_products(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * dst,
         const int64_t k, const int64_t n) {
-    static const int forced = getenv("GGML_EXL3_GEMM_PRODUCTS") ? atoi(getenv("GGML_EXL3_GEMM_PRODUCTS")) : 0;
-    if (forced == 1 || forced == 2) {
-        return forced;
-    }
     ggml_tensor w = {};
     w.type  = GGML_TYPE_F32;
     w.ne[0] = k;
@@ -1702,12 +1698,7 @@ static __global__ void __launch_bounds__(1024) exl3_mmid_route(
 // (mmb_f32split_kernel, both operands rounded) where ggml_cuda_mmb_supported_mm takes that shape (from 512 rows for a
 // view source), f32 (MMVF or rocBLAS) below. An expert's rows run one product iff the control runs one for them. Returns
 // the fewest rows of an expert that do (INT_MAX: none can, an expert holds at most one row per token).
-// GGML_EXL3_GEMM_PRODUCTS=1 or 2 overrides the choice as for EXL3_MUL_MAT.
 static int exl3_mmid_one_rows(ggml_backend_cuda_context & ctx, const int64_t k, const int64_t n, const int64_t n_tok) {
-    static const int forced = getenv("GGML_EXL3_GEMM_PRODUCTS") ? atoi(getenv("GGML_EXL3_GEMM_PRODUCTS")) : 0;
-    if (forced == 1 || forced == 2) {
-        return forced == 1 ? 1 : INT_MAX;
-    }
     ggml_tensor w = {};
     w.type  = GGML_TYPE_F32;
     w.op    = GGML_OP_VIEW;
