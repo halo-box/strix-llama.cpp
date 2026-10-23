@@ -9114,6 +9114,13 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
         pc, { hc * nt, 1, 1 });
 }
 
+static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& subctx, const char * name);
+
+static bool ggml_vk_hc_boundary_gemm_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_BOUNDARY_GEMM"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
 // The fused DeepSeek-V4 hc boundary (matched by ggml_vk_can_fuse_hc_boundary): the split-K mix dots of the unnormalized flat
 // residual into the split-K scratch, then the per-token epilogue (dsv4_hc_boundary.comp) writes post, comb and the hc pre
 // output (or its folded norm)
@@ -9128,30 +9135,49 @@ static void ggml_vk_dsv4_hc_boundary(ggml_backend_vk_context * ctx, vk_context& 
     // the tile's split is 1024 columns at ubatch sizes (1024 workgroups at 2048 tokens) and 256 below, so short prompts
     // still fill the GPU
     const bool tile = N > 16;
-    const uint32_t kc = !tile ? 1024 : (N >= 1024 ? 1024 : 256);
-    const uint32_t n_split = K / kc;
-    const size_t part_size = (size_t) n_split * N * n_mix * sizeof(float);
-    if (ctx->prealloc_size_split_k < part_size) {
-        ctx->prealloc_size_split_k = part_size;
-        ggml_vk_preallocate_buffers(ctx, subctx);
-    }
-    if (ctx->prealloc_split_k_need_sync) {
+    // prefill: by default the f32 GEMM the unfused MUL_MAT runs (ggml_vk_mul_mat_q_f16), on the unnormalized residual, into
+    // the MUL_MAT's own buffer (graph_optimize keeps it allocated through the chain); the epilogue then reads one partial per
+    // mix. 1.26 ms per 2048-token ubatch against 1.84 ms for the tiled kernel (perf logger, trunc10). GGML_VK_HC_BOUNDARY_GEMM=0,
+    // or that buffer overlapping x or an output (no allocation dependency, e.g. without graph_optimize), keeps the tiled kernel.
+    const bool gemm = tile && ggml_vk_hc_boundary_gemm_enabled() && get_misalign_bytes(ctx, m.mm) == 0 &&
+                      !ggml_vk_tensors_overlap(m.mm, m.x, false) && !ggml_vk_tensors_overlap(m.mm, m.post, false) &&
+                      !ggml_vk_tensors_overlap(m.mm, m.comb, false) && !ggml_vk_tensors_overlap(m.mm, m.out, false);
+    uint32_t n_split = 1;
+    vk_subbuffer part;
+    if (gemm) {
+        ggml_vk_mul_mat_q_f16(ctx, subctx, m.w, m.x, m.mm, false);
+        ggml_vk_perf_mark_subop(ctx, subctx, "HC_BOUNDARY_MIX_GEMM");
+        ggml_vk_sync_buffers(ctx, subctx);
+        part = ggml_vk_tensor_subbuffer(ctx, m.mm);
+    } else {
+        const uint32_t kc = !tile ? 1024 : (N >= 1024 ? 1024 : 256);
+        n_split = K / kc;
+        const size_t part_size = (size_t) n_split * N * n_mix * sizeof(float);
+        if (ctx->prealloc_size_split_k < part_size) {
+            ctx->prealloc_size_split_k = part_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        part = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+        vk_pipeline mix = ctx->device->pipeline_dsv4_hc_mix[tile ? 1 : 0];
+        GGML_ASSERT(mix != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, mix, 1);
+        const vk_op_dsv4_hc_mix_push_constants mpc = {
+            K, N, (uint32_t) (m.w->nb[1] / sizeof(float)), (uint32_t) (m.x->nb[1] / sizeof(float)), kc,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, mix, { ggml_vk_tensor_subbuffer(ctx, m.w), ggml_vk_tensor_subbuffer(ctx, m.x), part }, mpc,
+                                  { n_split, tile ? CEIL_DIV(N, 32) : n_mix, 1 });
+        // perf logger (per-op mode): the mix dispatch billed apart from the epilogue
+        ggml_vk_perf_mark_subop(ctx, subctx, tile ? "HC_BOUNDARY_MIX_TILE" : "HC_BOUNDARY_MIX_MV");
         ggml_vk_sync_buffers(ctx, subctx);
     }
-    const vk_subbuffer part = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
 
-    vk_pipeline mix = ctx->device->pipeline_dsv4_hc_mix[tile ? 1 : 0];
     vk_pipeline epi = ctx->device->pipeline_dsv4_hc_boundary[m.gamma ? 1 : 0][n_embd / 512 - 1];
-    GGML_ASSERT(mix != nullptr && epi != nullptr);
-    ggml_pipeline_request_descriptor_sets(ctx, mix, 1);
+    GGML_ASSERT(epi != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, epi, 1);
-
-    const vk_op_dsv4_hc_mix_push_constants mpc = {
-        K, N, (uint32_t) (m.w->nb[1] / sizeof(float)), (uint32_t) (m.x->nb[1] / sizeof(float)), kc,
-    };
-    ggml_vk_dispatch_pipeline(ctx, subctx, mix, { ggml_vk_tensor_subbuffer(ctx, m.w), ggml_vk_tensor_subbuffer(ctx, m.x), part }, mpc,
-                              { n_split, tile ? CEIL_DIV(N, 32) : n_mix, 1 });
-    ggml_vk_sync_buffers(ctx, subctx);
 
     const vk_op_dsv4_hc_boundary_push_constants bpc = {
         K, n_embd, N, n_split,
@@ -9173,7 +9199,9 @@ static void ggml_vk_dsv4_hc_boundary(ggml_backend_vk_context * ctx, vk_context& 
           ggml_vk_tensor_subbuffer(ctx, m.gamma ? m.gamma : m.scale), ggml_vk_tensor_subbuffer(ctx, m.post),
           ggml_vk_tensor_subbuffer(ctx, m.comb), ggml_vk_tensor_subbuffer(ctx, m.out) },
         bpc, { N, 1, 1 });
-    ctx->prealloc_split_k_need_sync = true;
+    if (!gemm) {
+        ctx->prealloc_split_k_need_sync = true;
+    }
 }
 
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -17517,7 +17545,7 @@ static bool ggml_vk_match_hc_boundary(const ggml_backend_vk_context * ctx, const
     c.count = rms2 ? 20 : 18;
     static_assert(sizeof(order) / sizeof(order[0]) == vk_hc_boundary_chain::MAX_NODES);
     std::copy(order, order + c.count, c.nodes);
-    c.m = { xf, w, sc, base, gamma, rms, gp.scl, gq.scl, comb, hcpre, rms2, out, out_at, gq.scl_at, comb_at };
+    c.m = { xf, w, sc, base, gamma, rms, gp.scl, gq.scl, comb, hcpre, rms2, out, out_at, gq.scl_at, comb_at, mm };
     return true;
 }
 
@@ -19939,6 +19967,11 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                             used_node_set.insert(graph->nodes[idx[k]]);
                             used[idx[k]] = true;
                         }
+                    }
+                    // the prefill form writes the mix GEMM's dots into the MUL_MAT's own buffer and the epilogue reads them while it
+                    // writes the outputs: keep that buffer allocated through the chain's last node
+                    if (params && params->add_alloc_dep) {
+                        params->add_alloc_dep(params->user_data, c.m.mm, graph->nodes[idx[c.count - 1]]);
                     }
                     while (first_unused < graph->n_nodes && used[first_unused]) {
                         first_unused++;

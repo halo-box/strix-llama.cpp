@@ -1404,6 +1404,7 @@ struct ggml_backend_vk_context {
         ggml_tensor * out;           // DSV4_HC_PRE, or the folded norm's MUL
         int last;                    // node index of the last fused node
         int post_idx, comb_idx;      // node indices of the two side outputs
+        ggml_tensor * mm;            // the mix MUL_MAT: its buffer takes the prefill GEMM's dots (kept allocated by graph_optimize)
     } hc_boundary {};
     // MUL_MAT+CPY(f16): the matmul stores f16 into the cast's destination
     bool fused_mm_cpy16 {};
