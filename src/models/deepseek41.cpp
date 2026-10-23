@@ -11,6 +11,29 @@
 #include <string>
 #include <vector>
 
+// shared dsv4 helpers, defined in deepseek4.cpp — declared here so this file also
+// compiles outside the unity batch that contains deepseek4.cpp.
+float dsv4_rope_attn_factor(float freq_scale, float ext_factor);
+dsv4_state_tensors dsv4_build_state_restore(
+        ggml_context * ctx,
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_dsv4_comp_state * state,
+        int32_t il);
+dsv4_state_tensors dsv4_build_state_snapshot(
+        ggml_context * ctx,
+        const llm_graph_input_dsv4::comp_input & inp,
+        const llama_dsv4_comp_state * state,
+        ggml_tensor * source_kv,
+        ggml_tensor * source_score,
+        int32_t il);
+
+// local copy instead of deepseek4.cpp's dsv4_view_2d: glm5-next.cpp defines a
+// file-static function with that exact name and can share the unity TU with us,
+// where an extern declaration followed by a static definition is an error.
+static ggml_tensor * dsv41_view_2d(ggml_context * ctx, ggml_tensor * t, int64_t ne0, int64_t ne1, int64_t i0) {
+    return ggml_view_2d(ctx, t, ne0, ne1, t->nb[1], ggml_row_size(t->type, i0));
+}
+
 // DeepSeek-V4.1.
 //
 // Shares almost everything with DeepSeek-V4: the hyper-connection stream, the MoE, the latent
@@ -672,9 +695,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
 
         const dsv4_state_tensors restored = dsv4_build_state_restore(ctx0, inp_comp, comp_state, il);
 
-        ggml_tensor * base_kv = dsv4_view_2d(
+        ggml_tensor * base_kv = dsv41_view_2d(
                 ctx0, restored.kv, restored.kv->ne[0], comp_state->get_n_rows(), 0);
-        ggml_tensor * base_score = dsv4_view_2d(
+        ggml_tensor * base_score = dsv41_view_2d(
                 ctx0, restored.score, restored.score->ne[0], comp_state->get_n_rows(), 0);
 
         ggml_tensor * source_kv    = ggml_concat(ctx0, base_kv,    state_kv,    1);
