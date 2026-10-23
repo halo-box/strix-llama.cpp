@@ -65,6 +65,12 @@ set_target_properties(llama PROPERTIES
 set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
+# deepseek4.cpp exports dsv4_view_2d with external linkage while glm5-next.cpp
+# keeps a file-static of the same name; keep them in separate TUs regardless of
+# how the model-file unity batches shift when files are added or removed.
+set_source_files_properties(models/deepseek4.cpp models/glm5-next.cpp
+    PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
 
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
