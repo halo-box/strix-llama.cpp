@@ -23,13 +23,6 @@ struct dsv4_state_tensors {
 // Shared by the DeepSeek-V4 and V4.1 graphs, which run the same compressed stream machinery.
 float dsv4_rope_attn_factor(float freq_scale, float ext_factor);
 
-ggml_tensor * dsv4_view_2d(
-        ggml_context * ctx,
-        ggml_tensor  * t,
-        int64_t        ne0,
-        int64_t        ne1,
-        int64_t        i0);
-
 dsv4_state_tensors dsv4_build_state_restore(
         ggml_context * ctx,
         const llm_graph_input_dsv4::comp_input & inp,
