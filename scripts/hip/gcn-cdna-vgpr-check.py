@@ -1,118 +1,121 @@
 #!/usr/bin/env python3
 
-import sys
-from collections import defaultdict
+import argparse
+from collections import Counter
+import json
+from pathlib import Path
 import re
+import sys
 
 
-def parse_log_file(filepath):
-    functions = defaultdict(lambda: {'vgprs': 0, 'spill': 0, 'location': ''})
-    func_stack = []
+FIELDS = ('vgprs', 'spill_stores', 'scratch_bytes')
+METADATA_FIELDS = ('vgpr_count', 'vgpr_spill_count', 'private_segment_fixed_size', 'wavefront_size')
 
-    try:
-        with open(filepath, 'r') as f:
-            for line in f:
-                # Match function name lines
-                func_match = re.search(r'remark: ([^:]+):(\d+):\d+: Function Name: (\S+)', line)
-                if func_match:
-                    location = func_match.group(1) + ':' + func_match.group(2)
-                    func_name = func_match.group(3)
-                    # Extract just the filename and line number
-                    parts = location.split('/')
-                    short_location = parts[-1] if len(parts) > 0 else location
-                    functions[func_name]['location'] = short_location
-                    # Push function onto stack with its location
-                    func_stack.append({'name': func_name, 'location': location})
-                    continue
 
-                # Match VGPR usage lines (only if we have functions in stack)
-                vgpr_match = re.search(r'remark: ([^:]+):(\d+):\d+:\s+VGPRs: (\d+)', line)
-                if vgpr_match:
-                    location = vgpr_match.group(1) + ':' + vgpr_match.group(2)
-                    # Find the most recent function with matching location
-                    for i in range(len(func_stack) - 1, -1, -1):
-                        if func_stack[i]['location'] == location:
-                            functions[func_stack[i]['name']]['vgprs'] = int(vgpr_match.group(3))
-                            break
-                    continue
+def parse_assembly(text, architecture):
+    target = re.search(r'\.amdgcn_target "[^"\n]+-([^"\n]+)"', text)
+    if target is None or target[1] != architecture:
+        raise ValueError('missing or unexpected assembly architecture')
+    if '.amdgpu_metadata' not in text:
+        return {}
+    section = text.split('.amdgpu_metadata', 1)[1]
+    if '.end_amdgpu_metadata' not in section:
+        raise ValueError('unterminated kernel metadata')
+    section = section.split('.end_amdgpu_metadata', 1)[0]
+    kernels = {}
+    for block in re.split(r'(?m)^  - (?=\.)', section)[1:]:
+        values = dict(re.findall(r'(?m)^    \.(\w+):[ \t]+(\S+)[ \t]*$', block))
+        if not all(key in values for key in ('name',) + METADATA_FIELDS):
+            raise ValueError('incomplete kernel metadata')
+        name = values['name']
+        if not re.fullmatch(r'[A-Za-z0-9_.$]+', name) or name in kernels:
+            raise ValueError(f'invalid or duplicate kernel name: {name}')
+        numbers = [int(values[key]) for key in METADATA_FIELDS]
+        if min(numbers) < 0 or numbers[3] != 32:
+            raise ValueError(f'invalid resource count or wave size: {name}')
+        kernels[name] = dict(zip(FIELDS, numbers[:3]))
+    if not kernels and not re.search(r'(?m)^amdhsa.kernels:[ \t]+\[\][ \t]*$', section):
+        raise ValueError('no kernels in metadata section')
+    return kernels
 
-                spill_match = re.search(r'remark: ([^:]+):(\d+):\d+:\s+VGPRs Spill: (\d+)', line)
-                if spill_match:
-                    location = spill_match.group(1) + ':' + spill_match.group(2)
-                    # Find the most recent function with matching location
-                    for i in range(len(func_stack) - 1, -1, -1):
-                        if func_stack[i]['location'] == location:
-                            functions[func_stack[i]['name']]['spill'] = int(spill_match.group(3))
-                            break
-                    continue
-    except FileNotFoundError:
-        print(f"Error: File {filepath} not found", file=sys.stderr)  # noqa: NP100
-        sys.exit(1)
 
-    return functions
+def read_assembly(directory, architecture):
+    kernels = {}
+    units = {}
+    for path in sorted(directory.glob('*.lto.s')):
+        try:
+            records = parse_assembly(path.read_text(), architecture)
+        except ValueError as error:
+            raise ValueError(f'{path.name}: {error}') from error
+        if records:
+            unit = path.name.split('.cu-', 1)[0]
+            if unit in units:
+                raise ValueError(f'duplicate translation unit: {unit}')
+            units[unit] = len(records)
+        for name, usage in records.items():
+            previous = kernels.get(name, usage)
+            kernels[name] = {field: max(previous[field], usage[field]) for field in FIELDS}
+    return kernels, units
+
+
+def find_regressions(kernels, units, baseline, compiler_version):
+    if baseline['schema_version'] != 1 or baseline['architecture'] != 'gfx1151':
+        raise ValueError('unsupported baseline schema or architecture')
+    if compiler_version != baseline['compiler_version']:
+        raise ValueError('compiler identity changed; review the baseline')
+    if not baseline['translation_units'] or not baseline['kernels']:
+        raise ValueError('empty baseline coverage or budgets')
+    errors = []
+    for unit, count in baseline['translation_units'].items():
+        if units.get(unit, 0) < count:
+            errors.append(f'{unit}: kernel coverage {units.get(unit, 0)} < {count}')
+    for name, budget in baseline['kernels'].items():
+        if budget['reason'] not in baseline['reasons'] or not baseline['reasons'][budget['reason']]:
+            raise ValueError(f'missing baseline reason: {name}')
+        if any(type(budget[field]) is not int or budget[field] < 0 for field in FIELDS):
+            raise ValueError(f'invalid baseline budget: {name}')
+        if budget['vgprs'] > 256 or budget['spill_stores'] == 0:
+            raise ValueError(f'invalid baseline spill exception: {name}')
+        if name not in kernels:
+            errors.append(f'{name}: missing baseline kernel')
+    for name, usage in sorted(kernels.items()):
+        # gfx1151 can address 256 VGPRs per lane; the shared SIMD pool is larger. See README.md.
+        if usage['vgprs'] > 256:
+            errors.append(f'{name}: VGPRs {usage["vgprs"]} > architectural limit 256')
+        budget = baseline['kernels'].get(name)
+        if budget is None:
+            if usage['spill_stores']:
+                errors.append(f'{name}: new spill ({usage["spill_stores"]} spill saves, {usage["scratch_bytes"]} scratch bytes/lane)')
+        else:
+            for field in FIELDS:
+                if usage[field] > budget[field]:
+                    errors.append(f'{name}: {field} {usage[field]} > baseline {budget[field]}')
+    return errors
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: ./vgpr_check.py <log_file>", file=sys.stderr)  # noqa: NP100
-        sys.exit(1)
-
-    log_file = sys.argv[1]
-    ignored = {
-        '_ZL21gated_linear_attn_f32ILi128EEviiiifPKfS1_S1_S1_S1_Pf',
-        '_ZL13rwkv_wkv7_f32ILi128EEviiiiPKfS1_S1_S1_S1_S1_S1_Pf',
-        '_ZL12rwkv_wkv_f32ILi128EEviiiiPKfS1_S1_S1_S1_S1_Pf',
-        '_ZL9mul_mat_qIL9ggml_type10ELi64ELb1EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_',
-        '_ZL9mul_mat_qIL9ggml_type42ELi128ELb1EEvPKcPKiS4_S4_PfS5_PKf15HIP_vector_typeIjLj3EEiiiiiS9_S9_iiiS9_S9_iiiS9_',
-        '_ZL18flash_attn_ext_f16ILi576ELi512ELi2ELi32ELb0ELb1ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi16ELi4ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi16ELi4ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi32ELi2ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi32ELi2ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi8ELi8ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi8ELi8ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi576ELi512ELi16ELi4ELb0ELb1ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi576ELi512ELi4ELi16ELb0ELb1ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi16ELi2ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi16ELi2ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi4ELi8ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi4ELi8ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi8ELi4ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi512ELi512ELi8ELi4ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi576ELi512ELi1ELi32ELb0ELb1ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi576ELi512ELi2ELi16ELb0ELb1ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi576ELi512ELi8ELi4ELb0ELb1ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_vecILi256ELi1EL9ggml_type2ELS0_2ELb0EEvPKcS2_S2_S2_S2_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS6_IjLj3EEiiiiiiiiiiiliiliiiiil',
-        '_ZL18flash_attn_ext_f16ILi320ELi256ELi2ELi32ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil',
-    }
-
-    functions = parse_log_file(log_file)
-    found_issues = False
-
-    # First print all ignored functions (deduplicated)
-    printed_ignored = set()
-    for func_name, data in sorted(functions.items()):
-        total_vgprs = int(data['vgprs']) + int(data['spill'])
-        if total_vgprs > 256 and func_name in ignored and func_name not in printed_ignored:
-            location = data.get('location', log_file)
-            print(f"{location}: {func_name} - Total VGPRs: {total_vgprs} ({data['vgprs']} + {data['spill']}) [IGNORED]")  # noqa: NP100
-            printed_ignored.add(func_name)
-
-    # Then print new functions with issues in red
-    for func_name, data in sorted(functions.items()):
-        total_vgprs = int(data['vgprs']) + int(data['spill'])
-        if total_vgprs > 256 and func_name not in ignored:
-            status = "[IGNORED]" if func_name in ignored else ""
-            location = data.get('location', log_file)
-            # Print in red if not ignored
-            color_code = "\033[91m" if func_name not in ignored else ""
-            reset_code = "\033[0m" if func_name not in ignored else ""
-            print(f"{color_code}{location}: {func_name} - Total VGPRs: {total_vgprs} ({data['vgprs']} + {data['spill']}) {status}{reset_code}")  # noqa: NP100
-            if func_name not in ignored:
-                found_issues = True
-
-    sys.exit(1 if found_issues else 0)
+    parser = argparse.ArgumentParser(description='Check final gfx1151 assembly against per-kernel spill budgets.')
+    parser.add_argument('assembly_directory', type=Path)
+    parser.add_argument('--baseline', type=Path, required=True)
+    parser.add_argument('--compiler-version', required=True)
+    args = parser.parse_args()
+    try:
+        baseline = json.loads(args.baseline.read_text())
+        kernels, units = read_assembly(args.assembly_directory, baseline['architecture'])
+        errors = find_regressions(kernels, units, baseline, args.compiler_version)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f'Error: {error}', file=sys.stderr)  # noqa: NP100
+        return 1
+    print(f'Parsed {len(kernels)} kernels across {len(units)} translation units from final assembly.')  # noqa: NP100
+    print(f'{sum(bool(k["spill_stores"]) for k in kernels.values())} spilling symbols; {len(baseline["kernels"])} bounded baseline entries.')  # noqa: NP100
+    print(f'Baseline reasons: {dict(Counter(k["reason"] for k in baseline["kernels"].values()))}')  # noqa: NP100
+    for error in errors:
+        print(error, file=sys.stderr)  # noqa: NP100
+    if errors:
+        return 1
+    print('PASS: no new spills or increases in per-kernel resource budgets.')  # noqa: NP100
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())

@@ -95,7 +95,7 @@ jobs:
 
     env:
       # Make sure this is in sync with build-cache.yml
-      ROCM_VERSION: "7.14.0"
+      ROCM_VERSION: "10.1.0"
 
     strategy:
       matrix:

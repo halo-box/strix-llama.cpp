@@ -4,6 +4,7 @@
 
 #include "llama-arch.h"
 #include "llama-cparams.h"
+#include "ggml-cpp.h"
 
 #include <array>
 #include <vector>
@@ -12,6 +13,28 @@
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
+
+struct llama_resident_nextn {
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buffer;
+    ggml_tensor * tensor = nullptr;
+    ggml_backend_t producer = nullptr;
+    ggml_backend_t consumer = nullptr;
+    ggml_backend_event_t ready = nullptr;
+    ggml_backend_event_t done = nullptr;
+    bool ready_recorded = false;
+    bool done_recorded = false;
+    uint64_t allocation_generation = 0;
+    uint64_t generation = 0;
+    std::vector<llama_pos> positions;
+    llama_seq_id seq_id = -1;
+    size_t n_rows = 0;
+    size_t n_exported = 0;
+
+    void export_rows(ggml_backend_t backend, ggml_tensor * src, size_t offset);
+    void set_carry(const float * carry);
+    ~llama_resident_nextn();
+};
 
 // keep this struct lightweight
 struct llama_ubatch {
@@ -80,6 +103,8 @@ struct llama_ubatch {
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+    std::shared_ptr<llama_resident_nextn> resident = nullptr;
+    size_t resident_offset = 0;
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd
@@ -122,6 +147,7 @@ struct llama_batch_ext {
     std::vector<token> tokens;
     std::vector<float> embd;
     std::vector<float> state;
+    std::shared_ptr<llama_resident_nextn> resident;
 
     llama_batch_ext(llama_context * ctx);
 
@@ -133,7 +159,8 @@ struct llama_batch_ext {
             llama_seq_id n_seq_max,
             llama_memory_i * mem,
             llama_token n_vocab,
-            size_t n_pos_per_embd);
+            size_t n_pos_per_embd,
+            size_t n_embd_state = 0);
 
     void clear();
 
@@ -223,6 +250,7 @@ private:
     std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<int8_t>         is_embd_vec;  // mixed batch only (= 1 if embd, 0 if text token)
     std::vector<float>          state_vec;    // owned state embeddings built from llama_batch_ext, llama_batch has no slot for them
+    std::shared_ptr<llama_resident_nextn> resident;
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;

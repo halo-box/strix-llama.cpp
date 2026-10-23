@@ -12,6 +12,42 @@
 #include <algorithm>
 #include <sstream>
 
+void llama_resident_nextn::export_rows(ggml_backend_t backend, ggml_tensor * src, size_t offset) {
+    GGML_ASSERT(backend == producer && src->type == GGML_TYPE_F32 && ggml_is_contiguous(src));
+    GGML_ASSERT(offset == n_exported && ggml_nbytes(src) % tensor->nb[1] == 0);
+    GGML_ASSERT(offset * tensor->nb[1] + ggml_nbytes(src) <= n_rows * tensor->nb[1]);
+    // Wait at the first write, so the next target graph can overlap the prior draft.
+    if (offset == 0 && done_recorded) {
+        ggml_backend_event_wait(producer, done);
+    }
+    // Keep the source layout [channels, HC streams, rows] for the backend copy.
+    ggml_tensor dst = *src;
+    dst.view_src = nullptr;
+    dst.buffer = tensor->buffer;
+    dst.data = (char *) tensor->data + (offset + 1) * tensor->nb[1];
+    ggml_backend_tensor_copy_async(backend, producer, src, &dst);
+    n_exported += ggml_nbytes(src) / tensor->nb[1];
+    ggml_backend_event_record(ready, producer);
+    ready_recorded = true;
+}
+
+void llama_resident_nextn::set_carry(const float * carry) {
+    ggml_backend_tensor_set_async(producer, tensor, carry, 0, tensor->nb[1]);
+    ggml_backend_event_record(ready, producer);
+    ready_recorded = true;
+}
+
+llama_resident_nextn::~llama_resident_nextn() {
+    if (done_recorded) {
+        ggml_backend_event_synchronize(done);
+    }
+    if (ready_recorded) {
+        ggml_backend_event_synchronize(ready);
+    }
+    ggml_backend_event_free(done);
+    ggml_backend_event_free(ready);
+}
+
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed) : n_pos_per_embd(n_pos_per_embd), allow_mixed(allow_mixed) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
     debug = LLAMA_BATCH_DEBUG ? atoi(LLAMA_BATCH_DEBUG) : 0;
@@ -35,6 +71,7 @@ bool llama_batch_allocr::init(
     this->n_embd       = batch_inp.n_embd > 0 ? batch_inp.n_embd : batch_inp.n_embd_inp;
     this->n_embd_state = batch_inp.n_embd_state;
     this->n_seq_max    = batch_inp.n_seq_max;
+    resident = batch_inp.resident;
 
     const int32_t n_tok = (int32_t) batch_inp.tokens.size();
 
@@ -59,6 +96,14 @@ bool llama_batch_allocr::init(
     int32_t n_both      = 0;
 
     const bool has_state = batch_inp.tokens[0].has_state;
+
+    if (resident) {
+        GGML_ASSERT(!has_state && resident->n_rows == (size_t) n_tok);
+        GGML_ASSERT(resident->tensor->ne[0] == n_embd_state);
+        for (const auto & tok : batch_inp.tokens) {
+            GGML_ASSERT(tok.id != LLAMA_TOKEN_NULL && !tok.has_embd);
+        }
+    }
 
     for (int32_t i = 0; i < n_tok; ++i) {
         const bool is_tok = batch_inp.tokens[i].id != LLAMA_TOKEN_NULL;
@@ -831,6 +876,7 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 
 void llama_batch_allocr::clear() {
     n_outputs = 0;
+    resident.reset();
 
     batch = {};
 
@@ -867,6 +913,12 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     assert(n_tokens%n_seqs == 0);
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
+
+    if (resident) {
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            GGML_ASSERT(idxs[i] == idxs[0] + (int32_t) i);
+        }
+    }
 
     const bool mixed_batch = !is_embd_vec.empty();
 
@@ -976,6 +1028,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.type         =*/ mixed ? udata->type.data() : nullptr,
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ std::move(udata),
+        /*.resident     =*/ resident,
+        /*.resident_offset =*/ resident ? (size_t) idxs[0] : 0,
     };
 
     if (debug > 0) {
@@ -1173,11 +1227,12 @@ llama_batch_ext::llama_batch_ext(
         llama_seq_id n_seq_max,
         llama_memory_i * mem,
         llama_token n_vocab,
-        size_t n_pos_per_embd) :
+        size_t n_pos_per_embd,
+        size_t n_embd_state) :
         n_tokens_max(n_tokens_max),
         n_embd_inp(n_embd_inp),
         n_embd_inp_enc(n_embd_inp_enc),
-        n_embd_state(0),
+        n_embd_state(n_embd_state),
         n_seq_max(n_seq_max),
         mem(mem),
         n_vocab(n_vocab),
@@ -1189,6 +1244,7 @@ void llama_batch_ext::clear() {
     tokens.clear();
     embd  .clear();
     state .clear();
+    resident.reset();
     n_embd = 0;
 }
 

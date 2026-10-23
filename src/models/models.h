@@ -2615,7 +2615,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il,
                         int64_t   q_first = 0,
-                    ggml_tensor ** tile_out_ids = nullptr);
+                    ggml_tensor ** tile_out_ids = nullptr,
+                           bool   cache_only = false);
 
         // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
@@ -2649,7 +2650,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il,
                         int64_t   q_first = 0,
-                    ggml_tensor * q_pos = nullptr);
+                    ggml_tensor * q_pos = nullptr,
+                           bool   cache_only = false);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

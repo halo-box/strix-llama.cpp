@@ -868,7 +868,12 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool q8_0_KV> // D == head size
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 #if defined(RDNA3_5) && defined(GGML_CUDA_FATTN_VGPR192)
+// ROCm 10.1/Clang 24, gfx1151, 2026-10-23: waves_per_eu changes kernel ISA.
+// Keep the cap until a replacement is validated on hardware.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 __attribute__((amdgpu_num_vgpr(192)))
+#pragma clang diagnostic pop
 #endif // defined(RDNA3_5) && defined(GGML_CUDA_FATTN_VGPR192)
 static __global__ void flash_attn_tile(
         const char * Q_ptr,

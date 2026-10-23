@@ -99,7 +99,7 @@ jobs:
 
   hip:
     runs-on: ubuntu-22.04
-    container: rocm/dev-ubuntu-22.04:6.1.2
+    container: rocm/dev-ubuntu-26.04:10.1.0-full
 
     steps:
       - name: Clone
@@ -109,8 +109,8 @@ jobs:
       - name: Dependencies
         id: depends
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git cmake rocblas-dev hipblas-dev libssl-dev rocwmma-dev jq python3-venv
+          apt-get update
+          apt-get install -y build-essential git cmake amdrocm-blas-dev10.1 libssl-dev amdrocm-ccl-dev10.1 jq python3-venv
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
@@ -123,7 +123,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
         with:
-          key: cuda-ubuntu-22.04-hip
+          key: cuda-ubuntu-26.04-hip
           folder: llama.cpp
           hf_bucket: ggml-org/cache
 
@@ -142,7 +142,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
         with:
-          key: cuda-ubuntu-22.04-hip
+          key: cuda-ubuntu-26.04-hip
           folder: llama.cpp
           evict-old-files: 1d
           hf_bucket: ggml-org/cache

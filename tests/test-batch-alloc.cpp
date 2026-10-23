@@ -7,8 +7,11 @@
 #include "../src/llama-hparams.h"
 #include "../src/llama-memory.h"
 #include "../src/llama-vocab.h"
+#include "../src/llama-graph.h"
+#include "../src/llama-ext.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <map>
 #include <string>
@@ -1176,6 +1179,138 @@ static void test_mtp_embd_width(testing & t) {
     });
 }
 
+static void test_resident_nextn(testing & t, const char * device) {
+    const bool gpu = device != nullptr;
+    ggml_backend_ptr producer;
+    ggml_backend_ptr consumer;
+    ggml_backend_ptr cpu;
+    if (gpu) {
+        ggml_backend_load_all();
+        producer.reset(ggml_backend_init_by_name(device, nullptr));
+        consumer.reset(ggml_backend_init_by_name(device, nullptr));
+        cpu.reset(ggml_backend_init_by_name("CPU", nullptr));
+        GGML_ASSERT(producer && consumer && cpu);
+    }
+    for (const int n : {4095, 4096, 4097}) {
+        for (const int split : {2048, 4096}) {
+            t.test(std::to_string(n) + "/" + std::to_string(split), [&](testing & t) {
+                const int width = 10240;
+                auto rows = std::make_shared<llama_resident_nextn>();
+                rows->ctx.reset(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
+                rows->tensor = ggml_new_tensor_2d(rows->ctx.get(), GGML_TYPE_F32, width, n + 1);
+                rows->n_rows = n;
+                rows->allocation_generation = 1;
+                if (gpu) {
+                    rows->producer = producer.get();
+                    rows->consumer = consumer.get();
+                    rows->buffer.reset(ggml_backend_alloc_ctx_tensors(rows->ctx.get(), producer.get()));
+                    rows->ready = ggml_backend_event_new(ggml_backend_get_device(producer.get()));
+                    rows->done = ggml_backend_event_new(ggml_backend_get_device(consumer.get()));
+                }
+                llama_batch_ext batch(n, width, width, 1, nullptr, n + 1, 1, width);
+                for (int i = 0; i < n; ++i) {
+                    const int k = batch.add_token(0);
+                    const llama_pos pos = 123 + i;
+                    GGML_ASSERT(batch.set_token_id(k, i) && batch.set_token_pos(k, &pos));
+                }
+                batch.resident = rows;
+                llama_vocab vocab;
+                llama_batch_allocr alloc(1);
+                t.assert_true(alloc.init(batch, vocab, false));
+                std::vector<uint32_t> expected;
+                if (gpu) {
+                    expected.resize((size_t) (n + 1) * width);
+                    for (int j = 0; j < width; ++j) expected[j] = 0x4a000000u + j;
+                    for (size_t j = width; j < expected.size(); ++j) expected[j] = 0x3e000000u + j;
+                    for (int off = 0; off < n; off += split) {
+                        const int count = std::min(split, n - off);
+                        ggml_context_ptr ctx(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
+                        auto * src = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 2560, 4, count);
+                        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), producer.get()));
+                        ggml_backend_tensor_set_async(producer.get(), src, expected.data() + (size_t) (off + 1) * width, 0, ggml_nbytes(src));
+                        rows->export_rows(producer.get(), src, off);
+                        ggml_backend_synchronize(producer.get());
+                    }
+                    rows->set_carry(reinterpret_cast<const float *>(expected.data()));
+                    std::vector<uint32_t> actual(expected.size());
+                    ggml_backend_event_synchronize(rows->ready);
+                    ggml_backend_tensor_get(rows->tensor, actual.data(), 0, actual.size() * sizeof(uint32_t));
+                    t.assert_true("all exported bytes and nonzero carry", actual == expected);
+                    std::vector<float> carry(width);
+                    for (const int accepted : {0, 1, 2, 3, n - 1}) {
+                        llama_nextn_resident_read(rows, rows->generation, accepted, carry.data());
+                        t.assert_true("accepted row and tail bytes", std::memcmp(carry.data(), expected.data() + (size_t) (accepted + 1) * width, width * sizeof(float)) == 0);
+                    }
+                }
+                int off = 0;
+                while (off < n) {
+                    auto ub = alloc.split_seq(split);
+                    t.assert_equal((size_t) off, ub.resident_offset);
+                    t.assert_true("no host embedding allocation", ub.embd == nullptr && ub.data->embd.empty());
+                    t.assert_true(ub.resident == rows);
+                    t.assert_equal(123 + off, ub.pos[0]);
+                    t.assert_equal(off, ub.token[0]);
+                    if (gpu) {
+                        ggml_backend_t backends[] = {consumer.get(), cpu.get()};
+                        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, nullptr, 2, 1024, false, true));
+                        ggml_context_ptr ctx(ggml_init({1024 * 1024, nullptr, true}));
+                        llm_graph_input_embd_h input(width, width);
+                        input.tokens = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, ub.n_tokens);
+                        input.h = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, ub.n_tokens);
+                        ggml_set_input(input.tokens);
+                        ggml_set_input(input.h);
+                        input.bind_resident(sched.get(), ub);
+                        auto * out = ggml_dup(ctx.get(), input.h);
+                        ggml_set_output(out);
+                        auto * graph = ggml_new_graph_custom(ctx.get(), 64, false);
+                        ggml_build_forward_expand(graph, input.tokens);
+                        ggml_build_forward_expand(graph, out);
+                        t.assert_true(ggml_backend_sched_alloc_graph(sched.get(), graph));
+                        input.set_input(&ub);
+                        t.assert_equal(GGML_STATUS_SUCCESS, ggml_backend_sched_graph_compute_async(sched.get(), graph));
+                        ggml_backend_event_record(rows->done, consumer.get());
+                        rows->done_recorded = true;
+                        ggml_backend_sched_synchronize(sched.get());
+                        std::vector<uint32_t> actual((size_t) ub.n_tokens * width);
+                        ggml_backend_tensor_get(out, actual.data(), 0, actual.size() * sizeof(uint32_t));
+                        t.assert_true("every shifted draft input byte", std::memcmp(actual.data(), expected.data() + (size_t) off * width, actual.size() * sizeof(uint32_t)) == 0);
+                        llm_graph_params params{};
+                        params.ubatch = ub;
+                        t.assert_true("resident graph reuse", input.can_reuse(params));
+                        ++rows->allocation_generation;
+                        t.assert_true("new allocation rejects reuse", !input.can_reuse(params));
+                        --rows->allocation_generation;
+                        params.ubatch.resident.reset();
+                        t.assert_true("host input rejects resident reuse", !input.can_reuse(params));
+                    }
+                    off += ub.n_tokens;
+                }
+                t.assert_equal(n, off);
+                if (gpu) {
+                    auto snapshot = llama_nextn_resident_snapshot(rows, nullptr);
+                    std::vector<uint32_t> saved((size_t) n * width);
+                    ggml_backend_event_synchronize(snapshot->ready);
+                    ggml_backend_tensor_get(snapshot->tensor, saved.data(), snapshot->tensor->nb[1], saved.size() * sizeof(uint32_t));
+                    t.assert_true("all verification snapshot bytes", std::memcmp(saved.data(), expected.data() + width, saved.size() * sizeof(uint32_t)) == 0);
+                    std::vector<uint32_t> changed(width, 0x4f000000u);
+                    ggml_backend_tensor_set_async(producer.get(), rows->tensor, changed.data(), rows->tensor->nb[1], width * sizeof(uint32_t));
+                    ggml_backend_synchronize(producer.get());
+                    std::vector<float> carry(width);
+                    llama_nextn_resident_read(snapshot, snapshot->generation, 0, carry.data());
+                    t.assert_true("snapshot survives producer overwrite", std::memcmp(carry.data(), expected.data() + width, width * sizeof(float)) == 0);
+                    const auto * storage = snapshot->tensor->data;
+                    snapshot = llama_nextn_resident_snapshot(rows, std::move(snapshot));
+                    t.assert_true("snapshot allocation reuse", snapshot->tensor->data == storage);
+                    llama_nextn_resident_read(snapshot, snapshot->generation, 0, carry.data());
+                    t.assert_true("snapshot updates at next process", std::memcmp(carry.data(), changed.data(), width * sizeof(float)) == 0);
+                }
+                batch.clear();
+                t.assert_true(!batch.resident);
+            });
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1199,6 +1334,7 @@ int main(int argc, char ** argv) {
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
     t.test("mtp_embd_width", test_mtp_embd_width);
+    t.test("resident_nextn", [&](testing & t) { test_resident_nextn(t, argc > 2 ? argv[2] : nullptr); });
 
     return t.summary();
 }

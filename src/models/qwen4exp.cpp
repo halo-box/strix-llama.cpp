@@ -465,6 +465,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
+    if (ubatch.resident) {
+        inp->bind_resident(sched, ubatch);
+    }
+
     // the draft's own embeddings if it ships them, else the target's (a shared sidecar)
     ggml_tensor * tok_embd;
     if (ubatch.token) {
@@ -481,8 +485,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * h = inp->h;
     res->add_input(std::move(inp));
 
+    // With no requested output, only the K/V and indexer cache writes survive catch-up.
+    // gfx1151 HIP, 2026-10-22: b4096/ub512 catch-up at 60127 tokens aborts in k_set_rows with this pruning; full-graph catch-up matches upstream logits and state.
+    // Cache-only is qualified at b/ub4096. Keep narrow or split catch-up on the full graph until it passes the same comparison.
+    const bool cache_only = cparams.n_ubatch >= 4096 && cparams.n_ubatch >= cparams.n_batch && n_outputs == 0 && !cparams.embeddings &&
+            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) &&
+            cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && cparams.nextn_layer_offset == 0;
+
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // an out_ids input with no consumer would be left unallocated
+    ggml_tensor * inp_out_ids = cache_only ? nullptr : build_inp_out_ids();
     // The draft block is the only layer in an MTP context. With an indexer the context holds a hybrid-idx
     // memory (create_memory) and the block runs the trunk's sparse attention; otherwise a plain attention input.
     llm_graph_input_attn_kv * inp_attn = nullptr;
@@ -526,7 +538,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     // sparse attention for the draft when its context carries an indexer cache (the sidecar ships the
     // block's indexer projections and the trunk's compress ratio is inherited at load), else dense
-    cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il);
+    cur = build_layer_attn(inp_attn, mctx_hyb, cur, inp_pos, sections, il, 0, nullptr, cache_only);
+    if (cache_only) {
+        return;
+    }
     inpL = build_hc_combine(inpL, cur, inject, il);
     cb(inpL, "mtp_hc_attn_post", il);
 
@@ -1342,7 +1357,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         int *                                   sections,
         int                                     il,
         int64_t                                 q_first,
-        ggml_tensor *                           q_pos) {
+        ggml_tensor *                           q_pos,
+        bool                                    cache_only) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim  = hparams.indexer_head_size;
@@ -1478,6 +1494,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         cb(pooled, "indexer_k_cached", il);
     }
     cb(pooled, "indexer_k", il);
+
+    if (cache_only) {
+        // set_input still fills these metadata tensors, so retain their graph allocation.
+        for (ggml_tensor * t : { inp->cell_blk, inp->blk_cells, inp->blk_pos, inp->bias, inp->tail_idxs }) {
+            if (t) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
+        ggml_build_forward_expand(gf, pooled);
+        return nullptr;
+    }
 
     // LLAMA_FN_LAST_ATTN_TRIM: queries only for rows [q_first, n_tokens) (one stream, so rows are tokens)
     GGML_ASSERT(q_first == 0 || (n_stream == 1 && q_pos != nullptr));
@@ -1755,7 +1782,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         int *                     sections,
         int                       il,
         int64_t                   q_first,
-        ggml_tensor **            tile_out_ids) {
+        ggml_tensor **            tile_out_ids,
+        bool                      cache_only) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -1803,7 +1831,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                             __func__, il, q_first, (int64_t) n_tokens, (int64_t) n_tokens);
                 }
             }
-            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, trim ? q_first : 0, q_pos);
+            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, trim ? q_first : 0, q_pos, cache_only);
         }
     }
     const int64_t n_q   = trim ? n_tokens - q_first : n_tokens;
@@ -1856,6 +1884,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
+
+    if (cache_only) {
+        // the K/V writes of build_attn, in its order, and nothing after them; the query has no consumer
+        if (inp->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+        }
+        if (inp->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+        }
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, inp->mctx->cpy_k(ctx0, Kcur, inp->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp->mctx->cpy_v(ctx0, Vcur, inp->get_v_idxs(), il));
+        return nullptr;
+    }
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 

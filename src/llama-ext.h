@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <vector>
+#include <memory>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -128,6 +129,14 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+struct llama_resident_nextn;
+LLAMA_API bool llama_nextn_resident_enable(llama_context * target, llama_context * draft);
+// Keep carry unchanged until the producer-ready event completes.
+LLAMA_API std::shared_ptr<llama_resident_nextn> llama_nextn_resident_prepare(llama_context * target, llama_batch_ext * batch, const float * carry);
+LLAMA_API void llama_nextn_resident_read(const std::shared_ptr<llama_resident_nextn> & rows, uint64_t generation, int32_t row, float * dst);
+LLAMA_API uint64_t llama_nextn_resident_generation(const std::shared_ptr<llama_resident_nextn> & rows);
+LLAMA_API std::shared_ptr<llama_resident_nextn> llama_nextn_resident_snapshot(const std::shared_ptr<llama_resident_nextn> & rows, std::shared_ptr<llama_resident_nextn> snapshot);
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);

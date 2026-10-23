@@ -189,7 +189,6 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
                 *(int4 *) &a_s[row][col / 2] = v;
             }
         } else {
-#pragma unroll
             for (int i = tid; i < BM * BK / 2; i += nthreads) {
                 const int row = i / (BK / 2), col = 2 * (i % (BK / 2));
                 half      lo = __float2half(0.0f), hi = lo;
@@ -202,7 +201,6 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
                 a_s[row][col / 2] = __halves2half2(lo, hi);
             }
         }
-#pragma unroll
         for (int k = load_row; k < BK; k += nthreads / (BN / 2)) {
             const int ki = k0 + k;
             const int ci = ki / (kw * kh), ky = ki / kw % kh, kx = ki % kw;

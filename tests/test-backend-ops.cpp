@@ -12915,7 +12915,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // one type per pipeline family the f16 store rides: int8 MMQ legacy / K / IQ blocks, the dense-router pf types (q4_K / q5_K
     // share their pf loader)
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
-        test_cases.emplace_back(new test_mul_mat_cpy16(t, 256, 128, 320));
+        test_cases.emplace_back(new test_mul_mat_cpy16(t, 256, 128, GGML_PAD(320, ggml_blck_size(t))));
         test_cases.emplace_back(new test_mul_mat_cpy16(t, 200, 130, 2560));
         test_cases.emplace_back(new test_mul_mat_cpy16(t, 72, 17, 512));
         test_cases.emplace_back(new test_mul_mat_cpy16(t, 64, 16, 256));
@@ -12940,9 +12940,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // MUL_MAT_ID (+ MUL) + CPY(f16), f32 and f16 B, exact and ragged tiles: one type per store (int8 legacy / K / q6_K, the routed
     // iq3_xxs / iq4_nl pf); the A loaders are test_mul_mat_id's and the dense pf cases'
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS}) {
+        const int64_t k = GGML_PAD(640, ggml_blck_size(t));
         for (ggml_type tb : {GGML_TYPE_F32, GGML_TYPE_F16}) {
-            test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, true,  256,  64,  640));
-            test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, false, 256,  64,  640));
+            test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, true,  256,  64,    k));
+            test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, false, 256,  64,    k));
             test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, true,  200,  70, 2560));
             test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, false, 640, 130,  512));
         }
@@ -12969,8 +12970,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q3_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4096, 512, 1024, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4200, 500, 1024, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F16, 4096, 512, 1056, {1, 1}, {1, 1}));   // K % 128 != 0, K % 32 == 0: aligned at 32
-        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, 2048, 320, {1, 1}, {1, 1}));   // the hc up-GEMM shape, below the XL gate
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F16, 4096, 512, GGML_PAD(1056, ggml_blck_size(t)), {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 1024, 2048, GGML_PAD(320, ggml_blck_size(t)), {1, 1}, {1, 1}));
     }
     // f16 MoE activations: the whole block (Flash-Next IQ3_XXS/IQ4_XS up/gate + IQ4_NL/Q8_0 down, 35B-style K-quants),
     // each fused piece alone, ragged token counts, an odd ff width (unpacked f16 stores), unweighted down
@@ -13710,14 +13711,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_bin_bcast(ggml_sub_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
     test_cases.emplace_back(new test_bin_bcast(ggml_div_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
 
-    // BF16 activations with F32 weights
+    // Mixed F32 and 16-bit operands
     for (auto op : {ggml_add, ggml_sub, ggml_mul, ggml_div}) {
         test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_BF16, {10, 5, 4, 3}, {1, 1, 1, 1}, 1, false, false, GGML_TYPE_F32));
         test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_BF16, {10, 5, 4, 3}, {2, 2, 2, 2}, 1, false, false, GGML_TYPE_F32));
         test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_BF16, {5120, 1, 1, 1}, {1, 32, 1, 1}, 1, false, false, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {17, 5, 1, 1}, {1, 2, 1, 1}, 1, false, false, GGML_TYPE_F16));
     }
 
     // fusion
+    for (auto op : {ggml_add, ggml_mul}) {
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {17, 5, 1, 1}, {1, 2, 1, 1}, 3, false, false, GGML_TYPE_F16));
+    }
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {10, 5, 4, 3}, {2, 1, 1, 1}, 2));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F16, {10, 5, 4, 3}, {2, 1, 1, 1}, 2));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_BF16, {10, 5, 4, 3}, {2, 1, 1, 1}, 2));

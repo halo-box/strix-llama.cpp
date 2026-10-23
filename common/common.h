@@ -352,6 +352,10 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // Qwen3.8-Flash-Next, gfx1151 HIP, 2026-10-22: K4096 vs K16384 gave 29.218 vs 28.563 tok/s at d0 and 33.237 vs 32.452 at d40000; head time fell 19.5%, with no omitted winners or acceptance change.
+    // Throughput was not separated beyond one SD (K4096 n=6/4, K16384 n=6/2); 4096 is a policy choice. The target verifies each draft token; 0 keeps the full head.
+    int32_t vocab_dynamic = 4096;
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match

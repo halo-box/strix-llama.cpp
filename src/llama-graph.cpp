@@ -138,10 +138,27 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_embd_h::bind_resident(ggml_backend_sched_t sched, const llama_ubatch & ubatch) {
+    resident = ubatch.resident;
+    resident_offset = ubatch.resident_offset;
+    allocation_generation = resident->allocation_generation;
+    h->buffer = resident->tensor->buffer;
+    h->data = (char *) resident->tensor->data + resident_offset * resident->tensor->nb[1];
+    ggml_backend_sched_set_tensor_backend(sched, h, resident->consumer);
+}
+
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     ASSERT_EMBD_OR_TOKEN(*ubatch);
 
     const int64_t n_tokens = ubatch->n_tokens;
+
+    if (resident) {
+        GGML_ASSERT(ubatch->resident == resident && ubatch->resident_offset == resident_offset);
+        GGML_ASSERT(ubatch->token && !ubatch->embd);
+        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        ggml_backend_event_wait(resident->consumer, resident->ready);
+        return;
+    }
 
     if (ubatch->token) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
@@ -161,6 +178,14 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
+
+    if (resident || params.ubatch.resident) {
+        return resident && resident == params.ubatch.resident &&
+                allocation_generation == resident->allocation_generation &&
+                resident_offset == params.ubatch.resident_offset &&
+                tokens && tokens->ne[0] == params.ubatch.n_tokens &&
+                h && h->ne[1] == params.ubatch.n_tokens;
+    }
 
     res &= (!params.ubatch.token)      || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
@@ -1602,6 +1627,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     prefetch         (params.prefetch),
     cb_func          (params.cb),
     res              (params.res),
+    vsub             (params.vsub),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1657,6 +1683,69 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     cur = build_hadamard_input(w, cur);
+    if (vsub != nullptr && loras->empty()) {
+        // Q8_0 2560x248320 with one output is byte-exact on gfx1151 HIP (2026-10-15).
+        // Keep LoRA and other output widths full until their picked logits pass the byte comparison.
+        const auto it = vsub->heads.find(w);
+        if (it != vsub->heads.end() && ggml_n_dims(cur) <= 2 && cur->ne[1] == 1 && (w_s == nullptr || ggml_nelements(w_s) == 1)) {
+            const llama_vocab_subset::head & head = it->second;
+
+            const int64_t n_embd    = w->ne[0];
+            const int64_t n_vocab   = w->ne[1];
+            const int64_t n_base    = vsub->n_base;
+            const int64_t n_dyn     = vsub->n_dynamic;
+            const int64_t n_outputs = cur->ne[1];
+
+            // same precision as the full head, the policy is keyed on w and not on the views of it
+            const auto set_prec = [&](ggml_tensor * t) {
+                if (prec_policy != nullptr) {
+                    const auto p = prec_policy->prec_src1.find(w);
+                    if (p != prec_policy->prec_src1.end()) {
+                        ggml_prec_set_src(t, p->second, 1);
+                    }
+                }
+            };
+
+            ggml_tensor * logits = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w, n_embd, n_base, w->nb[1], 0), cur);
+            set_prec(logits);
+            logits = ggml_concat(ctx0, logits, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab - n_base, n_outputs), -INFINITY), 0);
+
+            if (n_outputs > 0) {
+                // score the other ids in vocab order so top_k returns token ids, end-of-generation ids always win
+                ggml_tensor * scores = ggml_mul_mat(ctx0, head.scorer, ggml_mul_mat(ctx0, head.basis, cur));
+                scores = ggml_concat(ctx0, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_base, n_outputs), -INFINITY), scores, 0);
+                if (vsub->eog != nullptr) {
+                    const int64_t n_eog = vsub->eog->ne[0];
+                    scores = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, scores, 1, n_vocab, n_outputs),
+                            ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_eog, n_outputs), INFINITY),
+                            ggml_reshape_3d(ctx0, vsub->eog, n_eog, 1, 1));
+                }
+
+                // one output per op: CUDA's multi-row top_k is slow and its multi-column MUL_MAT_ID reads 2 rows per expert
+                ggml_tensor * as     = ggml_reshape_3d(ctx0, w, n_embd, 1, n_vocab);
+                ggml_tensor * ids    = nullptr;
+                ggml_tensor * picked = nullptr;
+                for (int64_t i = 0; i < n_outputs; ++i) {
+                    ggml_tensor * ids_i = ggml_top_k(ctx0, ggml_view_1d(ctx0, scores, n_vocab, i*n_vocab*ggml_element_size(scores)), n_dyn);
+                    ggml_tensor * cur_i = ggml_view_3d(ctx0, cur, n_embd, 1, 1, cur->nb[1], cur->nb[1], i*cur->nb[1]);
+                    ggml_tensor * p_i   = ggml_mul_mat_id(ctx0, as, cur_i, ggml_reshape_2d(ctx0, ids_i, n_dyn, 1));
+                    set_prec(p_i);
+                    ids    = ids    == nullptr ? ids_i : ggml_concat(ctx0, ids,    ids_i, 1);
+                    picked = picked == nullptr ? p_i   : ggml_concat(ctx0, picked, p_i,   2);
+                }
+
+                logits = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, n_vocab, n_outputs), picked, ggml_reshape_2d(ctx0, ids, n_dyn, n_outputs));
+            }
+
+            logits = ggml_reshape_2d(ctx0, logits, n_vocab, n_outputs);
+            if (w_s) {
+                logits = ggml_mul(ctx0, logits, w_s);
+            }
+
+            return logits;
+        }
+    }
+
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     if (prec_policy) {

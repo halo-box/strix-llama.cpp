@@ -1584,6 +1584,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
+    std::shared_ptr<llama_resident_nextn> verify_resident;
+    uint64_t verify_resident_generation = 0;
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1673,6 +1675,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        if (n_seq == 1 && !is_mem_shared && !chain_heads && llama_nextn_resident_enable(ctx_tgt, ctx_dft)) {
+            SPC_INF("%s", "using resident Qwen4exp nextn hand-over\n");
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1741,10 +1746,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        std::shared_ptr<llama_resident_nextn> resident_input;
+        llama_batch_ext * resident_batch = nullptr;
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             batch.clear();
+
+            for (int k = 0; k < n_tokens; ++k) {
+                const auto & t = batch_in.tokens[k];
+                if (t.id != LLAMA_TOKEN_NULL) {
+                    batch.add(t.id, t.pos[0], t.seq_id, false);
+                } else {
+                    batch.add_embd(t.embd, t.pos.data(), t.seq_id, false);
+                }
+            }
+            if (n_seq == 1 && !chain_heads) {
+                resident_batch = batch.get();
+                resident_input = llama_nextn_resident_prepare(ctx_tgt, resident_batch, pending_h[0].data());
+            }
 
             // pair each token with the tgt embedding shifted right by one position, and
             // the first token of each sequence with the pending embedding from a previous run
@@ -1752,23 +1772,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            const float * h_tgt = resident_input ? nullptr : llama_get_embeddings_nextn(ctx_tgt);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                const auto & t = batch_in.tokens[k];
-
-                const llama_seq_id seq_id = t.seq_id;
-
-                // vision tokens carry an embedding instead of an id
-                const int32_t idx = t.id != LLAMA_TOKEN_NULL
-                    ? batch.add(t.id, t.pos[0], seq_id, false)
-                    : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
+            for (int k = 0; !resident_input && k < n_tokens; ++k) {
+                const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
                 const float * h_row = k == i_batch_beg[seq_id]
                     ? pending_h[seq_id].data()
                     : h_tgt + (size_t) (k - 1) * n_embd;
 
-                batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+                batch.set_embd_state(k, { h_row, 1, (size_t) n_embd });
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1786,7 +1799,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, resident_input ? resident_batch : batch.get());
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
@@ -1802,6 +1815,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 return false;
             }
         }
+
+        if (resident_input) {
+            verify_resident = llama_nextn_resident_snapshot(resident_input, std::move(verify_resident));
+            if (verify_resident) {
+                verify_resident_generation = llama_nextn_resident_generation(verify_resident);
+                verify_h_rows[0] = n_tokens;
+                llama_nextn_resident_read(verify_resident, verify_resident_generation, n_tokens - 1, pending_h[0].data());
+                return true;
+            }
+        }
+        verify_resident.reset();
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
@@ -2018,6 +2042,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        if (verify_resident) {
+            llama_nextn_resident_read(verify_resident, verify_resident_generation, i_h, pending_h[seq_id].data());
+            return;
+        }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
@@ -2818,6 +2846,8 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    cparams.n_vocab_dynamic = params.speculative.draft.vocab_dynamic;
 
     std::string model_path;
     if (has_draft) {

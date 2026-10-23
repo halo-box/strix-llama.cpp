@@ -160,7 +160,7 @@ jobs:
 
   rocm:
     runs-on: [self-hosted, Linux, gfx1201, 1accel]
-    container: "rocm/dev-ubuntu-24.04:7.2.4-complete"
+    container: "rocm/dev-ubuntu-26.04:10.1.0-full"
 
     steps:
       - name: Clone

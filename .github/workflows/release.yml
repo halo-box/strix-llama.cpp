@@ -946,7 +946,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - ROCM_VERSION: "10.0.0"
+          - ROCM_VERSION: "10.1.0"
             # this fork only supports Strix Halo (gfx1151)
             gpu_targets: "gfx1151"
             build: x64
@@ -1492,7 +1492,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - ROCM_VERSION: "10.0.0"
+          - ROCM_VERSION: "10.1.0"
             # this fork only supports Strix Halo (gfx1151)
             gpu_targets: "gfx1151"
             build: 'x64'

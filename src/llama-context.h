@@ -91,6 +91,9 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    bool nextn_resident_enable(llama_context & draft);
+    std::shared_ptr<llama_resident_nextn> nextn_resident_prepare(llama_batch_ext & batch, const float * carry);
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
@@ -237,6 +240,9 @@ private:
 
     void output_reorder();
 
+    void nextn_resident_begin(const llama_batch_ext & batch);
+    void nextn_resident_materialize();
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -282,6 +288,8 @@ private:
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+    void vsub_init(uint32_t n_dynamic);
+    void vsub_init_head(ggml_tensor * w, const llama_vocab_subset::head & head);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -327,6 +335,9 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+    std::shared_ptr<llama_resident_nextn> nextn_resident;
+    bool nextn_resident_active = false;
+    bool nextn_resident_host_ready = true;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
@@ -426,6 +437,11 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // reduced draft LM head, nullptr = full LM head
+    std::unique_ptr<llama_vocab_subset>  vsub;
+    std::vector<ggml_context_ptr>        vsub_ctxs;
+    std::vector<ggml_backend_buffer_ptr> vsub_bufs;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

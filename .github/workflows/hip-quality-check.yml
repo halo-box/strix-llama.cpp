@@ -11,7 +11,7 @@ on:
       '**/*.cuh',
       'ggml/src/ggml-hip/CMakeLists.txt',
       'ggml/src/ggml-cuda/vendors/hip.h',
-      'scripts/hip/gcn-cdna-vgpr-check.py'
+      'scripts/hip/**'
     ]
 
   pull_request:
@@ -22,7 +22,7 @@ on:
       '**/*.cuh',
       'ggml/src/ggml-hip/CMakeLists.txt',
       'ggml/src/ggml-cuda/vendors/hip.h',
-      'scripts/hip/gcn-cdna-vgpr-check.py'
+      'scripts/hip/**'
     ]
 
 cache-mode: none
@@ -43,7 +43,7 @@ env:
 jobs:
   ubuntu-22-hip-quality-check:
     runs-on: ubuntu-22.04
-    container: rocm/dev-ubuntu-22.04:7.2.1
+    container: rocm/dev-ubuntu-26.04:10.1.0-full
     steps:
       - name: Clone
         id: checkout
@@ -52,8 +52,8 @@ jobs:
       - name: Dependencies
         id: depends
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git cmake rocblas-dev hipblas-dev libssl-dev python3 python3-venv python3-pip jq
+          apt-get update
+          apt-get install -y build-essential git cmake amdrocm-blas-dev10.1 libssl-dev python3 python3-venv python3-pip jq
 
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
@@ -66,7 +66,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
         with:
-          key: hip-quality-check-ubuntu-22.04
+          key: hip-quality-check-ubuntu-26.04
           folder: llama.cpp
           hf_bucket: ggml-org/cache
 
@@ -83,9 +83,12 @@ jobs:
           cd build
           make -j $(nproc)
 
-      - name: Check for major VGPR spills
+      - name: Check VGPR spill baselines
         id: vgpr_check
+        shell: bash
         run: |
+          set -o pipefail
+          python3 scripts/hip/test_vgpr_check.py
           cmake -B build -S . \
             -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
             -DGPU_TARGETS=gfx1151 \
@@ -95,7 +98,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cd build
           make -j $(nproc) 2>&1 | tee metrics.log | grep -v 'Rpass-analysis=kernel-resource-usage\|remark:\|^$'
-          python3 ../scripts/hip/gcn-cdna-vgpr-check.py metrics.log
+          python3 ../scripts/hip/gcn-cdna-vgpr-check.py ggml/src/ggml-hip \
+            --baseline ../scripts/hip/gfx1151-vgpr-baseline.json \
+            --compiler-version "$("$(hipconfig -l)/clang" --version | head -n 1)"
 
       - name: ccache-buckets-save
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
@@ -103,7 +108,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
         with:
-          key: hip-quality-check-ubuntu-22.04
+          key: hip-quality-check-ubuntu-26.04
           folder: llama.cpp
           evict-old-files: 1d
           hf_bucket: ggml-org/cache

@@ -2013,6 +2013,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
     const int64_t mmvf_ncols = ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH && src0->type == GGML_TYPE_BF16 ? 1 : ne11;
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_EXACT_BATCH && ne11 > MMVQ_MAX_BATCH_SIZE &&
+            ggml_cuda_should_use_mmvq(src0->type, cc, 1)) {
+        // Keep the single-column arithmetic when an exact batch exceeds the matvec limit.
+        for (int64_t col = 0; col < ne11; ++col) {
+            ggml_tensor src1_col = *src1;
+            ggml_tensor dst_col = *dst;
+            src1_col.ne[1] = 1;
+            dst_col.ne[1] = 1;
+            src1_col.data = (char *) src1->data + col*nb11;
+            dst_col.data = (char *) dst->data + col*nb1;
+            dst_col.src[1] = &src1_col;
+            ggml_cuda_mul_mat(ctx, src0, &src1_col, &dst_col);
+        }
+        return;
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, mmvf_ncols)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
