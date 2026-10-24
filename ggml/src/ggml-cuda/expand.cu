@@ -7,6 +7,8 @@
 struct expand_layout {
     size_t block_row, score_row, cell_row, tail_row, output_row, cast_block_row, cast_cell_row, expanded_row;
     int n_blocks;
+    // per stream (blockIdx.y)
+    size_t block_ss, score_ss, cell_ss, tail_ss, output_ss, cast_block_ss, cast_cell_ss, expanded_ss;
 };
 
 __global__ __launch_bounds__(256) void qsa_expand_complete_blocks_512(
@@ -14,6 +16,12 @@ __global__ __launch_bounds__(256) void qsa_expand_complete_blocks_512(
         char * output, char * cast_blocks, char * cast_cells, char * expanded, expand_layout layout) {
     const int query = blockIdx.x;
     const int lane = threadIdx.x;
+    {
+        const size_t s = blockIdx.y;
+        blocks += s*layout.block_ss; scores += s*layout.score_ss; cells += s*layout.cell_ss; tail += s*layout.tail_ss;
+        output += s*layout.output_ss; cast_blocks += s*layout.cast_block_ss; cast_cells += s*layout.cast_cell_ss;
+        expanded += s*layout.expanded_ss;
+    }
     __shared__ int ordered[512];
     const int * selected = reinterpret_cast<const int *>(blocks + query*layout.block_row);
     for (int i = lane; i < 512; i += 256) {
@@ -52,8 +60,9 @@ __global__ __launch_bounds__(256) void qsa_expand_complete_blocks_512(
 }
 
 void ggml_cuda_op_qsa_expand(ggml_backend_cuda_context & ctx, const ggml_cuda_qsa_expand_args & a) {
-    expand_layout layout{a.blocks->nb[1], a.scores->nb[1], a.cells->nb[1], a.tail->nb[1], a.output->nb[1], a.cast_blocks->nb[1], a.cast_cells->nb[2], a.expanded->nb[2], int(a.scores->ne[0])};
-    const ggml_cuda_kernel_launch_params launch(dim3(a.output->ne[1]), dim3(256), 0, ctx.stream());
+    expand_layout layout{a.blocks->nb[1], a.scores->nb[1], a.cells->nb[1], a.tail->nb[1], a.output->nb[1], a.cast_blocks->nb[1], a.cast_cells->nb[2], a.expanded->nb[2], int(a.scores->ne[0]),
+        a.blocks->nb[2], a.scores->nb[2], a.cells->nb[2], a.tail->nb[3], a.output->nb[3], a.cast_blocks->nb[2], a.cast_cells->nb[3], a.expanded->nb[3]};
+    const ggml_cuda_kernel_launch_params launch(dim3(a.output->ne[1], a.output->ne[3]), dim3(256), 0, ctx.stream());
     ggml_cuda_kernel_launch(qsa_expand_complete_blocks_512, launch,
         (const char *)a.blocks->data, (const char *)a.scores->data, (const char *)a.cells->data,
         (const char *)a.tail->data, (char *)a.output->data, (char *)a.cast_blocks->data,

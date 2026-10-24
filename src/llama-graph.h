@@ -366,11 +366,17 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // the graph marks its attention with the causal-prefix hint, so a reuse needs the same answer
+    bool can_reuse_causal_prefix(const llama_kv_cache_context * mctx, const llm_graph_params & params) const;
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // see llama_kv_cache::is_causal_prefix()
+    bool causal_prefix = false;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -1279,7 +1285,8 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
             ggml_tensor * top_k = nullptr,
-                int64_t   n_kv_raw = 0) const;
+                int64_t   n_kv_raw = 0,
+                   bool   causal_prefix = false) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

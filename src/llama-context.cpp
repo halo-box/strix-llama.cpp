@@ -856,9 +856,19 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+// LLAMA_GRAPH_PREP_OVERLAP (default 1): build and allocate the next graph while the previous one still runs (see
+// process_ubatch)
+static bool llama_graph_prep_overlap() {
+    static const bool v = !getenv("LLAMA_GRAPH_PREP_OVERLAP") || atoi(getenv("LLAMA_GRAPH_PREP_OVERLAP")) != 0;
+    return v;
+}
+
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+
+    // process_ubatch synchronizes before it writes the inputs, so the realloc does not have to
+    ggml_backend_sched_set_lazy_realloc_sync(sched.get(), llama_graph_prep_overlap());
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
@@ -1681,6 +1691,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    const bool prep_overlap = llama_graph_prep_overlap();
+
     // LLAMA_GRAPH_TIMING=1: log where the CPU time of a decode goes (build, alloc, inputs)
     static const bool graph_timing = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")) != 0;
     int64_t t_build = 0, t_alloc = 0, t_inputs = 0;
@@ -1694,8 +1706,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        // The previous asynchronous graph may still use allocations that reset releases.
-        ggml_backend_sched_synchronize(sched.get());
+        // The previous asynchronous graph may still use allocations that reset releases. Building and allocating the
+        // new graph only assigns addresses on the host, and the backends order their own device work (weight
+        // repacks, pool memory) on their streams, so LLAMA_GRAPH_PREP_OVERLAP (default 1) waits only before the
+        // inputs are written below; the GPU keeps running the previous ubatch meanwhile.
+        if (!prep_overlap) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
 
         gf_res_prev_active = nullptr;
         res->reset();
@@ -1728,6 +1745,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
+        // the inputs may share memory with tensors of the previous graph: it must be done (see the reset above)
+        if (!reused && prep_overlap) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+
         const auto t_inputs_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
@@ -20,8 +21,9 @@ static __device__ __forceinline__ float qsa3_h2f(const uint16_t h) { return (flo
 __global__ __launch_bounds__(256) void qsa3_rows_kernel(
         const int * __restrict__ ids, const size_t i1, const int ns, const int nk, int * __restrict__ srow, int * __restrict__ sflag,
         const char * mask, size_t m1, const int np2) {
-    extern __shared__ int ent[];
-    __shared__ int unsorted;
+    extern __shared__ int ent[];   // max(np2, 2 ns) entries: the row, then its compacted copy
+    __shared__ int unsorted, kdesc;
+    __shared__ int scan_s[256];
     const int q = blockIdx.x, tid = threadIdx.x;
     const int * row = reinterpret_cast<const int *>(reinterpret_cast<const char *>(ids) + (size_t) q * i1);
     if (tid == 0) { unsorted = 0; }
@@ -41,6 +43,37 @@ __global__ __launch_bounds__(256) void qsa3_rows_kernel(
         if (ent[j] > ent[j+1]) { atomicOr(&unsorted, 1); }
     }
     __syncthreads();
+    if (unsorted) {
+        // holes (-1 / hidden cells -> sentinel) around ascending keys, the usual complete-block row: compact the keys in
+        // row order with a prefix sum; if they are ascending that is exactly the sorted row (sentinels sort last)
+        int * cmp = ent + ns;
+        const int per = (ns + 255) / 256, j0 = min(ns, tid * per), j1 = min(ns, j0 + per);
+        int cnt = 0;
+        for (int j = j0; j < j1; ++j) { cnt += ent[j] != QSA3_SENT; }
+        scan_s[tid] = cnt;
+        if (tid == 0) { kdesc = 0; }
+        __syncthreads();
+        for (int off = 1; off < 256; off <<= 1) {
+            const int v = tid >= off ? scan_s[tid - off] : 0;
+            __syncthreads();
+            scan_s[tid] += v;
+            __syncthreads();
+        }
+        const int total = scan_s[255];
+        int o = scan_s[tid] - cnt;
+        for (int j = j0; j < j1; ++j) { if (ent[j] != QSA3_SENT) { cmp[o++] = ent[j]; } }
+        __syncthreads();
+        for (int j = tid; j + 1 < total; j += 256) {
+            if (cmp[j] > cmp[j+1]) { atomicOr(&kdesc, 1); }
+        }
+        __syncthreads();
+        if (!kdesc) {
+            int * dst = srow + (size_t) q * ns;
+            for (int j = tid; j < ns; j += 256) { dst[j] = j < total ? cmp[j] : QSA3_SENT; }
+            if (tid == 0) { sflag[q] = 1; }
+            return;
+        }
+    }
     if (unsorted) {
         int * dst = srow + (size_t) q * ns;
         if (np2 == 0) {
@@ -199,12 +232,18 @@ struct qsa3_layout {
     size_t knb1, vnb1, knb2, vnb2;   // raw f16 cache strides (DIRECT reads only)
     int nk, n_q, gqa, cap;
     float scale;
+    int hq, gs;                      // total q heads; gate row stride in floats (row = query * hq + head)
 };
 
-template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
+// WPE > 0 asks the compiler for that many waves per SIMD (fewer VGPRs per wave): more CTAs in flight to cover the
+// two barriers per 16 keys. 8 (192 VGPRs, no spill) is 4.5% faster than 7 on gfx1151 pp4096; GGML_QSA6_WPE=0 restores
+// the plain kernel. Same arithmetic either way.
+template<bool DIRECT, int WPE = 0, bool DIRECT_V = DIRECT> __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(WPE > 0 ? WPE : 1)))
+void qsa3_attn_kernel(
         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
         const uint16_t * __restrict__ mask, const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
-        const int * __restrict__ ucount, float * __restrict__ out, const qsa3_layout s) {
+        const int * __restrict__ ucount, float * __restrict__ out, const qsa3_layout s,
+        const float * __restrict__ gate, uint16_t * __restrict__ o16, const bool o16_f16) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     NO_DEVICE_CODE;
 #else
@@ -222,9 +261,12 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     const char * vbase = nullptr;
     if constexpr (DIRECT) {
         kbase = reinterpret_cast<const char *>(pk) + (size_t) kvh * s.knb2;
-        vbase = reinterpret_cast<const char *>(pv) + (size_t) kvh * s.vnb2;
     } else {
         pkg = pk + (size_t) kvh * nblk * 1024;
+    }
+    if constexpr (DIRECT_V) {
+        vbase = reinterpret_cast<const char *>(pv) + (size_t) kvh * s.vnb2;
+    } else {
         pvg = pv + (size_t) kvh * nblk * 1024;
     }
     const uint16_t * gblk = ublk + (size_t) g * s.cap;
@@ -337,7 +379,7 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
                 const int d = 32*w + 16*t + r;
-                if constexpr (DIRECT) {
+                if constexpr (DIRECT_V) {
                     // the packed uint2 holds the four keys of block kb at dim d; gather them from the rows
                     const char * col = vbase + (size_t)d * 2;
                     auto kv4 = [&](const int kb) -> uint2 {
@@ -467,8 +509,24 @@ template<bool DIRECT> __global__ __launch_bounds__(256) void qsa3_attn_kernel(
             const int row = 16*i + rr, qi = row / 12, h = row - 12*qi;
             const int query = QSA3_G * g + qi;
             if (query < s.n_q) {
-                float * dst = reinterpret_cast<float *>(reinterpret_cast<char *>(out) + (size_t) query * s.o2 + (size_t) (kvh * s.gqa + h) * s.o1) + 32*w + dq;
-                *reinterpret_cast<float4 *>(dst) = *reinterpret_cast<const float4 *>(ostage + rr * 32 + dq);
+                // gated output (GGML_CUDA_FA_GATE): sigmoid(gate) * O with op_sigmoid's expression, as cont_sigmoid_mul_v4
+                const int hq = kvh * s.gqa + h;
+                float4 v = *reinterpret_cast<const float4 *>(ostage + rr * 32 + dq);
+                if (gate) {
+                    const float4 gg = *reinterpret_cast<const float4 *>(gate + ((size_t) query * s.hq + hq) * s.gs + 32*w + dq);
+                    v.x = 1.0f / (1.0f + expf(-gg.x)) * v.x; v.y = 1.0f / (1.0f + expf(-gg.y)) * v.y;
+                    v.z = 1.0f / (1.0f + expf(-gg.z)) * v.z; v.w = 1.0f / (1.0f + expf(-gg.w)) * v.w;
+                }
+                if (out) {
+                    float * dst = reinterpret_cast<float *>(reinterpret_cast<char *>(out) + (size_t) query * s.o2 + (size_t) hq * s.o1) + 32*w + dq;
+                    *reinterpret_cast<float4 *>(dst) = v;
+                }
+                if (o16) {
+                    uint2 hv;
+                    hv.x = (uint32_t) ggml_cuda_f32_to_act16(v.x, o16_f16) | ((uint32_t) ggml_cuda_f32_to_act16(v.y, o16_f16) << 16);
+                    hv.y = (uint32_t) ggml_cuda_f32_to_act16(v.z, o16_f16) | ((uint32_t) ggml_cuda_f32_to_act16(v.w, o16_f16) << 16);
+                    *reinterpret_cast<uint2 *>(o16 + ((size_t) query * s.hq + hq) * 256 + 32*w + dq) = hv;
+                }
             }
         }
         __syncthreads();
@@ -488,12 +546,14 @@ bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(ggml_backend_cuda_context & 
         q->ne[0]==256 && k->ne[0]==256 && v->ne[0]==256 && q->ne[1]>=128 && q->ne[1]<=INT_MAX &&
         k->ne[1]>0 && k->ne[1]<=262140 && k->ne[1]%4==0 && v->ne[1]==k->ne[1] &&
         k->ne[2]>0 && k->ne[2]<=65535 && q->ne[2]==12*k->ne[2] && v->ne[2]==k->ne[2] &&
-        q->ne[3]==1 && k->ne[3]==1 && v->ne[3]==1 && ggml_nelements(k)/4<=INT_MAX &&
+        // split KV streams (one per sequence): ne[3] streams, run one after the other on per-stream views (maskless only)
+        k->ne[3]==q->ne[3] && v->ne[3]==q->ne[3] && (q->ne[3]==1 || (!m && ids->ne[3]==q->ne[3])) &&
+        ggml_nelements(k)/4/k->ne[3]<=INT_MAX &&
         q->nb[0]==4 && k->nb[0]==2 && v->nb[0]==2 && ids->nb[0]==4 &&
         q->nb[1]%16==0 && q->nb[2]%16==0 && uintptr_t(q->data)%16==0 &&
         k->nb[1]%16==0 && k->nb[2]%16==0 && uintptr_t(k->data)%16==0 &&
         ids->nb[1]%4==0 && uintptr_t(ids->data)%4==0 && ids->ne[0]>0 && ids->ne[0]<=2560 &&
-        ids->ne[1]>=q->ne[1] && ids->ne[2]==1 && ids->ne[3]==1 && ggml_is_contiguous(dst);
+        ids->ne[1]>=q->ne[1] && ids->ne[2]==1 && (ids->ne[3]==1 || ids->ne[3]==q->ne[3]) && ggml_is_contiguous(dst);
 }
 
 static __global__ void qsa_pack_k(const char * src, uint16_t * dst, size_t nb1, size_t nb2, int nk, uint32_t count) {
@@ -516,19 +576,27 @@ static __global__ void qsa_pack_v(const char * src, uint16_t * dst, size_t nb1, 
         *reinterpret_cast<const uint16_t *>(in+2*nb1), *reinterpret_cast<const uint16_t *>(in+3*nb1));
 }
 
-void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// out32 / dst16 (either may be null) receive the attention output, or sigmoid(gate) * output when gate is set
+static void qsa_prefill_impl1(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gate, float * out32,
+        uint16_t * dst16, const bool dst16_f16) {
     const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
     float scale; memcpy(&scale, dst->op_params, 4);
     const int n_q = (int) q->ne[1], ns = (int) ids->ne[0], nk = (int) k->ne[1];
-    // QSA_DIRECT: -1/auto picks direct f16 reads when the attention is small against the cache
-    // (the pack is O(n_kv) per ubatch), 0 always packs, 1 always reads direct. Both paths are bit-identical.
+    // QSA_DIRECT: -1/auto reads K direct (32 B row reads) and packs only V, unless the attention is small against the cache
+    // (the pack is O(n_kv) per ubatch, its gain O(n_q)): then V is read direct too. 0 packs both, 1 reads both direct,
+    // 2 forces K direct with V packed. All paths are bit-identical.
     static const int qsa_direct_cfg = getenv("QSA_DIRECT") ? atoi(getenv("QSA_DIRECT")) : -1;
-    const bool qsa_direct = qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 32 < (size_t) nk);
-    ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), qsa_direct ? 0 : ggml_nelements(k));
+    const bool qsa_direct = qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 64 < (size_t) nk);
+    const bool qsa_kdirect = qsa_direct || qsa_direct_cfg == 2 || qsa_direct_cfg < 0;
+    ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), qsa_kdirect ? 0 : ggml_nelements(k));
     ggml_cuda_pool_alloc<uint16_t> packed_v(ctx.pool(), qsa_direct ? 0 : ggml_nelements(v));
-    if (!qsa_direct) {
-        const uint32_t count_k=ggml_nelements(k)/8, count_v=ggml_nelements(v)/4;
+    if (!qsa_kdirect) {
+        const uint32_t count_k=ggml_nelements(k)/8;
         qsa_pack_k<<<(count_k+255)/256,256,0,ctx.stream()>>>((const char *)k->data,packed_k.get(),k->nb[1],k->nb[2],nk,count_k);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (!qsa_direct) {
+        const uint32_t count_v=ggml_nelements(v)/4;
         qsa_pack_v<<<(count_v+255)/256,256,0,ctx.stream()>>>((const char *)v->data,packed_v.get(),v->nb[1],v->nb[2],nk,count_v);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -544,7 +612,7 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
         static const bool ranksort = getenv("GGML_QSA_RANKSORT") && atoi(getenv("GGML_QSA_RANKSORT")) != 0;
         int np2 = 1; while (np2 < ns) np2 <<= 1;
         if (ranksort || (size_t) np2 * sizeof(int) > 60 * 1024) np2 = 0;
-        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) (np2 ? np2 : ns) * sizeof(int), ctx.stream());
+        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) std::max(np2 ? np2 : ns, 2 * ns) * sizeof(int), ctx.stream());
         ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get(), m ? (const char *)m->data : nullptr, m ? m->nb[1] : 0, np2);
         CUDA_CHECK(cudaGetLastError());
         const ggml_cuda_kernel_launch_params launch2(dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), ctx.stream());
@@ -553,18 +621,68 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
         CUDA_CHECK(cudaGetLastError());
     }
     qsa3_layout layout{q->nb[1], q->nb[2], dst->nb[1], dst->nb[2], m ? m->nb[1] : 0,
-                       k->nb[1], v->nb[1], k->nb[2], v->nb[2], nk, n_q, 12, cap, scale};
+                       k->nb[1], v->nb[1], k->nb[2], v->nb[2], nk, n_q, 12, cap, scale,
+                       (int) q->ne[2], gate ? (int) (gate->nb[1] / sizeof(float)) : 0};
+    const float * gp = gate ? (const float *) gate->data : nullptr;
     const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
-    if (qsa_direct) {
-        ggml_cuda_kernel_launch(qsa3_attn_kernel<true>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
+    static const bool qsa3_wpe8 = !getenv("GGML_QSA6_WPE") || atoi(getenv("GGML_QSA6_WPE")) != 0;
+    if (qsa_kdirect && !qsa_direct) {
+        ggml_cuda_kernel_launch(qsa3_wpe8 ? qsa3_attn_kernel<true, 8, false> : qsa3_attn_kernel<true, 0, false>, launch, (const float *) q->data, (const uint16_t *) k->data, packed_v.get(),
                                 m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
-                                (const int *) ucount.get(), (float *) dst->data, layout);
+                                (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
+    } else if (qsa_direct) {
+        ggml_cuda_kernel_launch(qsa3_wpe8 ? qsa3_attn_kernel<true, 8> : qsa3_attn_kernel<true>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
+                                m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
+                                (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
     } else {
-        ggml_cuda_kernel_launch(qsa3_attn_kernel<false>, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
+        ggml_cuda_kernel_launch(qsa3_wpe8 ? qsa3_attn_kernel<false, 8> : qsa3_attn_kernel<false>, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
                                 m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
-                                (const int *) ucount.get(), (float *) dst->data, layout);
+                                (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// split streams: one qsa_prefill_impl1 per stream on shallow tensor copies whose data point at the stream's slice
+static void qsa_prefill_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gate, float * out32,
+        uint16_t * dst16, const bool dst16_f16) {
+    const int64_t ns = dst->src[0]->ne[3];
+    if (ns == 1) {
+        qsa_prefill_impl1(ctx, dst, gate, out32, dst16, dst16_f16);
+        return;
+    }
+    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * ids = dst->src[5];
+    const int64_t n_q = q->ne[1], hq = q->ne[2];
+    for (int64_t s = 0; s < ns; ++s) {
+        ggml_tensor qs = *q, ks = *k, vs = *v, is = *ids, ds = *dst;
+        qs.data = (char *) q->data + s*q->nb[3];     qs.ne[3] = 1;
+        ks.data = (char *) k->data + s*k->nb[3];     ks.ne[3] = 1;
+        vs.data = (char *) v->data + s*v->nb[3];     vs.ne[3] = 1;
+        is.data = (char *) ids->data + s*ids->nb[3]; is.ne[3] = 1;
+        ds.data = (char *) dst->data + s*dst->nb[3]; ds.ne[3] = 1;
+        ds.src[0] = &qs; ds.src[1] = &ks; ds.src[2] = &vs; ds.src[5] = &is;
+        // rows of the gated outputs and of the gate are (query, head) pairs, n_q * hq per stream
+        const size_t rows = (size_t) s * n_q * hq;
+        ggml_tensor gs;
+        const ggml_tensor * gp = nullptr;
+        if (gate) {
+            gs = *gate;
+            gs.data = (char *) gate->data + rows * gate->nb[1];
+            gp = &gs;
+        }
+        float * o32 = out32 == (float *) dst->data ? (float *) ds.data : (out32 ? out32 + rows * 256 : nullptr);
+        qsa_prefill_impl1(ctx, &ds, gp, o32, dst16 ? dst16 + rows * 256 : nullptr, dst16_f16);
+    }
+}
+
+void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    qsa_prefill_impl(ctx, dst, nullptr, (float *) dst->data, nullptr, false);
+}
+
+void ggml_cuda_flash_attn_ext_qsa_prefill_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gate,
+        float * out32, uint16_t * dst16, bool dst16_f16) {
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && gate->nb[0] == sizeof(float) && gate->nb[2] == gate->nb[1] * gate->ne[1] &&
+                gate->nb[1] % 16 == 0 && (uintptr_t) gate->data % 16 == 0 && (out32 != nullptr || dst16 != nullptr));
+    qsa_prefill_impl(ctx, dst, gate, out32, dst16, dst16_f16);
 }
 
 #endif

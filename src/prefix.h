@@ -17,8 +17,10 @@ static bool qsa_scalar_visibility_cells(const llama_kv_cells & cells, uint32_t c
     for (uint32_t i=0;i<u.n_tokens;++i) {
         if (u.n_seq_id[i]<1 || !u.seq_id[i] || u.seq_id[i][0]<0 || u.seq_id[i][0]>=LLAMA_MAX_SEQ) { return false; }
         if (u.pos[i]<0 || u.pos[i]>=16777216) { return false; }
+        // text under M-RoPE: the three rope axes carry the position, the fourth (unused by the visibility) is 0
         for (uint32_t axis=1;axis<u.n_pos;++axis) {
-            if (u.pos[i+axis*u.n_tokens]!=u.pos[i]) { return false; }
+            const llama_pos p = u.pos[i+axis*u.n_tokens];
+            if (p!=u.pos[i] && !(axis==3 && p==0)) { return false; }
         }
         rows.set(u.seq_id[i][0]);
     }

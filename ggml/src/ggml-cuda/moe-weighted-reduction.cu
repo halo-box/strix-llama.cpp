@@ -278,6 +278,7 @@ bool ggml_cuda_op_moe_weighted_reduction_sgma(ggml_backend_cuda_context & ctx, c
     const int64_t n_embd        = experts->ne[0];
     const int64_t n_expert_used = experts->ne[1];
     const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
+    if (ggml_cuda_mmb_shape_log()) fprintf(stderr, "mmb_shape: sgma n_embd=%d n_used=%d T=%d\n", (int) n_embd, (int) n_expert_used, (int) n_tokens);
     if (!ggml_cuda_moe_weighted_reduction_sgma_supported(experts, expert_scale, weights, gate, shexp, dst) ||
         ((uintptr_t) shexp->data % 16) != 0 || ((uintptr_t) dst->data % 16) != 0 || ((uintptr_t) experts->data % 16) != 0) {
         return false;

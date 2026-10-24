@@ -2,6 +2,7 @@
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 #include "unary.cuh"
+#include "convert.cuh"
 
 #include <cstdint>
 #include <mutex>
@@ -800,7 +801,7 @@ gdn_chunk_scan_kernel(const _Float16 * __restrict__ Qh, const _Float16 * __restr
         const _Float16 * __restrict__ Tb, const _Float16 * __restrict__ Pb, const float2 * __restrict__ Gb,
         const int H, const int Hk, const int n_tokens, const int nch, const float scale,
         const float * __restrict__ on_w, const float * __restrict__ on_z, float * __restrict__ on_out, uint16_t * __restrict__ on_out16,
-        const float on_eps) {
+        const float on_eps, const bool on_out16_f16) {
 #if defined(GDNC_ENABLED)
     constexpr int NT  = CL / 16;
     constexpr int SQ  = 136;
@@ -995,7 +996,7 @@ gdn_chunk_scan_kernel(const _Float16 * __restrict__ Qh, const _Float16 * __restr
                         const float sc = rsqrtf(ss / 128.0f + on_eps);
                         const float v  = (sc * O[rt][e] * wc) * (1.0f / (1.0f + expf(-pz[rt][e])));
                         if (on_out) on_out[oi] = v;
-                        if (on_out16) on_out16[oi] = ggml_cuda_f32_to_bf16_rne(v);
+                        if (on_out16) on_out16[oi] = ggml_cuda_f32_to_act16(v, on_out16_f16);
                     }
                 }
             prefetch_z(min(ch + 1, nch - 1));
@@ -1012,6 +1013,579 @@ gdn_chunk_scan_kernel(const _Float16 * __restrict__ Qh, const _Float16 * __restr
 #endif
 }
 
+// ---------------------------------------------------------------------------------------------
+// GDN chunked prefill v2 (verified against an fp64 reference):
+// prep2 (q/k only) + scan2 VROW (v conv + SiLU inside the scan, no Vh round trip). Used when the conv, q/k L2 norm
+// and gated output norm (bf16 out only) are all fused; GGML_GDN_V2=0 restores prep + scan.
+#if defined(GDNC_ENABLED)
+#define S2_BAR() asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory")
+
+// accumulator tile (lane: column lane&15, rows 2e + (lane>>4)) -> B fragment (lane: column lane&15, rows 0..15)
+static __device__ __forceinline__ gdnc_v16h s2_acc_to_frag(const gdnc_v8f & acc, const int lane) {
+    const bool hi = lane >= 16;
+    const uint32_t s0 = hi ? 0x01000504u : 0x05040100u, s1 = hi ? 0x03020706u : 0x07060302u;
+    uint32_t w[8];
+#pragma unroll
+    for (int e = 0; e < 8; e += 2) {
+        const _Float16 h2[2] = { (_Float16) acc[e], (_Float16) acc[e + 1] };
+        uint32_t A; __builtin_memcpy(&A, h2, 4);
+        const uint32_t B = __builtin_amdgcn_permlanex16(A, A, 0x76543210, 0xFEDCBA98, true, false);
+        w[e]     = __builtin_amdgcn_perm(B, A, s0);
+        w[e + 1] = __builtin_amdgcn_perm(B, A, s1);
+    }
+    gdnc_v16h f;
+    __builtin_memcpy(&f, w, 32);
+    return f;
+}
+static __device__ __forceinline__ float s2_silu(float x) { return x * __builtin_amdgcn_rcpf(1.0f + __expf(-x)); }
+static __device__ __forceinline__ float s2_sigm(float x) { return __builtin_amdgcn_rcpf(1.0f + __expf(-x)); }
+
+// conv + SiLU of 4 channels of token t from an XT-typed x
+template <typename XT>
+static __device__ __forceinline__ float4 s2_conv4(const XT * x, const float * st, const int64_t C, const float (&wt)[4][4], const int64_t t, const int64_t c) {
+    float s[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int64_t u = t - 3 + j;
+        float xv[4];
+        if (u >= 0) {
+            if constexpr (sizeof(XT) == 4) {
+                const float4 v4 = *(const float4 *) (x + u * C + c);
+                xv[0] = v4.x; xv[1] = v4.y; xv[2] = v4.z; xv[3] = v4.w;
+            } else {
+                const uint2 v2 = *(const uint2 *) (x + u * C + c);
+                _Float16 hv[4]; __builtin_memcpy(hv, &v2, 8);
+                xv[0] = hv[0]; xv[1] = hv[1]; xv[2] = hv[2]; xv[3] = hv[3];
+            }
+        } else {
+#pragma unroll
+            for (int ch = 0; ch < 4; ++ch) xv[ch] = st[(c + ch) * 3 + (u + 3)];
+        }
+#pragma unroll
+        for (int ch = 0; ch < 4; ++ch) s[ch] = fmaf(xv[ch], wt[ch][j], s[ch]);
+    }
+    return make_float4(s2_silu(s[0]), s2_silu(s[1]), s2_silu(s[2]), s2_silu(s[3]));
+}
+#endif // GDNC_ENABLED
+
+template <int CL, typename XT = float>
+__global__ void __launch_bounds__(256)
+gdn_prep2_kernel(const gdnc_in in, const XT * __restrict__ xin, const float * __restrict__ g,
+        const float * __restrict__ beta, _Float16 * __restrict__ Tb, _Float16 * __restrict__ Pb, float2 * __restrict__ Gb,
+        _Float16 * __restrict__ Qh, _Float16 * __restrict__ Kh,
+        const int H, const int Hk, const int n_tokens, const int nch,
+        const int64_t sb1, const int64_t sb2, const float scale, const float qk_eps, const float qk_mul) {
+#if defined(GDNC_ENABLED)
+    constexpr int SK   = 136;
+    constexpr int NT   = CL / 16;
+    constexpr int NTRI = NT * (NT + 1) / 2;
+    constexpr int MR   = CL / 32;
+    constexpr int CPW  = CL / 8;
+    constexpr int NQK  = CL * 32 / 256;
+    constexpr int RMAX = 4;
+    __shared__ __align__(16) _Float16 KQs[2 * CL * SK];   // Ks, Qs (until the KK^T / QK^T jobs) | A (after)
+    _Float16 * Ks = KQs, * Qs = KQs + CL * SK;
+    float (*A)[CL][CL + 1] = (float (*)[CL][CL + 1]) KQs;
+    static_assert(RMAX * CL * (CL + 1) * 4 <= 2 * CL * SK * 2, "A alias");
+    __shared__ float KK[CL][CL + 1];
+    __shared__ float QK[CL][CL + 1];
+    __shared__ float Gs[RMAX][CL], bs[RMAX][CL];
+    const int hk = blockIdx.x, ch = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int cl = lane & 15, rh = lane >> 4;
+    const int R = H / Hk;
+    const int t0 = ch * CL, Lc = min(CL, n_tokens - t0);
+    const int i4 = (tid & 31) * 4;
+    {
+        float4 kv[NQK], qv[NQK];
+        float wq[4][4], wk[4][4];
+        gdnc_load_taps(in, in.qc + (int64_t) hk * in.sq1 + i4, wq);
+        gdnc_load_taps(in, in.kc + (int64_t) hk * in.sq1 + i4, wk);
+#pragma unroll
+        for (int j = 0; j < NQK; ++j) {
+            const int r = (tid + 256 * j) >> 5;
+            const int64_t t = t0 + min(r, Lc - 1);
+            qv[j] = s2_conv4<XT>(xin, in.st, in.C, wq, t, in.qc + (int64_t) hk * in.sq1 + i4);
+            kv[j] = s2_conv4<XT>(xin, in.st, in.C, wk, t, in.kc + (int64_t) hk * in.sq1 + i4);
+        }
+#pragma unroll
+        for (int j = 0; j < NQK; ++j) {
+            const float sk = gdn_warp_reduce_sum<32>(kv[j].x * kv[j].x + kv[j].y * kv[j].y + kv[j].z * kv[j].z + kv[j].w * kv[j].w);
+            const float sq = gdn_warp_reduce_sum<32>(qv[j].x * qv[j].x + qv[j].y * qv[j].y + qv[j].z * qv[j].z + qv[j].w * qv[j].w);
+            const float fk = qk_mul * rsqrtf(sk + qk_eps), fq = qk_mul * rsqrtf(sq + qk_eps);
+            kv[j].x *= fk; kv[j].y *= fk; kv[j].z *= fk; kv[j].w *= fk;
+            qv[j].x *= fq; qv[j].y *= fq; qv[j].z *= fq; qv[j].w *= fq;
+        }
+#pragma unroll
+        for (int j = 0; j < NQK; ++j) {
+            const int r = (tid + 256 * j) >> 5;
+            const bool ok = r < Lc;
+            const float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const uint2 kh = gdnc_pack4h(ok ? kv[j] : z4), qh = gdnc_pack4h(ok ? qv[j] : z4);
+            *(uint2 *) (Ks + r * SK + i4) = kh;
+            *(uint2 *) (Qs + r * SK + i4) = qh;
+            if (ok) {
+                const int64_t o = ((int64_t) hk * n_tokens + t0 + r) * 128 + i4;
+                *(uint2 *) (Kh + o) = kh;
+                *(uint2 *) (Qh + o) = qh;
+            }
+        }
+    }
+    for (int idx = tid; idx < R * CL; idx += 256) {
+        const int j = idx / CL, r = idx % CL, h = hk + j * Hk;
+        const int64_t o = (int64_t) (t0 + r) * sb2 + (int64_t) h * sb1;
+        Gs[j][r] = r < Lc ? g[o]    : 0.0f;
+        bs[j][r] = r < Lc ? beta[o] : 0.0f;
+    }
+    __syncthreads();
+    if (tid < R * 32) {
+        // inclusive prefix sum of g over the chunk, one wave per value head
+        const int j = tid >> 5;
+        float G = Gs[j][lane];
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const float u = __shfl_up(G, d, 32);
+            if (lane >= d) G += u;
+        }
+        Gs[j][lane] = G;
+    }
+    for (int job = wave; job < 2 * NTRI; job += 8) {
+        const bool isq = job >= NTRI;
+        int jj = isq ? job - NTRI : job, rt = 0;
+        while (jj >= rt + 1) { jj -= rt + 1; ++rt; }
+        const int st = jj;
+        const _Float16 * As = isq ? Qs : Ks;
+        gdnc_v8f acc = {};
+#pragma unroll
+        for (int kk = 0; kk < 128; kk += 16) {
+            acc = GDNC_WMMA(gdnc_frag(As, SK, rt * 16, kk, lane), gdnc_frag(Ks, SK, st * 16, kk, lane), acc);
+        }
+        float (*D)[CL + 1] = isq ? QK : KK;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) D[rt * 16 + 2 * e + rh][st * 16 + cl] = acc[e];
+    }
+    __syncthreads();
+    // A and P for all R value heads at once
+    for (int idx = tid; idx < R * CL * CL; idx += 256) {
+        const int j = idx / (CL * CL), rs = idx % (CL * CL), r = rs / CL, s = rs % CL, h = hk + j * Hk;
+        const float d = s <= r ? __expf(Gs[j][r] - Gs[j][s]) : 0.0f;
+        A[j][r][s] = s < r ? bs[j][r] * KK[r][s] * d : 0.0f;
+        Pb[((int64_t) h * nch + ch) * CL * CL + rs] = (_Float16) (s <= r ? scale * QK[r][s] * d : 0.0f);
+    }
+    if (tid < R * CL) {
+        const int j = tid / CL, r = tid % CL, h = hk + j * Hk;
+        Gb[((int64_t) h * nch + ch) * CL + r] = make_float2(__expf(Gs[j][r]), __expf(Gs[j][CL - 1] - Gs[j][r]));
+    }
+    __syncthreads();
+    // T = (I + A)^-1 column by column, barrier-free (A of all R heads is in LDS): lane = row, wave = CPW columns
+    for (int j = 0; j < R; ++j) {
+        const int h = hk + j * Hk;
+        const int j0 = wave * CPW;
+        float x[CPW];
+#pragma unroll
+        for (int c = 0; c < CPW; ++c) x[c] = (lane == j0 + c) ? 1.0f : 0.0f;
+#pragma unroll
+        for (int qq = 0; qq < CL - 1; ++qq) {
+            if (qq < j0) continue;
+            const float a = A[j][lane][qq];
+#pragma unroll
+            for (int c = 0; c < CPW; ++c) {
+                const float xq = __int_as_float(__builtin_amdgcn_readlane(__float_as_int(x[c]), qq));
+                x[c] = fmaf(-a, xq, x[c]);
+            }
+        }
+        _Float16 tmp[CPW];
+#pragma unroll
+        for (int c = 0; c < CPW; ++c) tmp[c] = (_Float16) (x[c] * bs[j][j0 + c]);
+        __builtin_memcpy(Tb + ((int64_t) h * nch + ch) * CL * CL + lane * CL + j0, tmp, sizeof(tmp));
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+template <int CL, int MODE = 0, typename XT = float, int NPF = 0, int PFD = 3, bool VROW = false, bool OUT_F16 = false, bool ZBF16 = false>
+__global__ void __launch_bounds__(256, 6)
+gdn_scan2_kernel(int * __restrict__ prog, unsigned * __restrict__ sink, const _Float16 * __restrict__ Qh, const _Float16 * __restrict__ Kh,
+        const XT * __restrict__ X, const float * __restrict__ cst, const float * __restrict__ cw, const int C, const int vc,
+        const float * __restrict__ curr_state, float * __restrict__ state,
+        const _Float16 * __restrict__ Tb, const _Float16 * __restrict__ Pb, const float2 * __restrict__ Gb,
+        const int H, const int Hk, const int n_tokens, const int nch, const float scale,
+        const float * __restrict__ on_w, const void * __restrict__ on_z_, uint16_t * __restrict__ out16, const float on_eps,
+        const int xv_hs, const int xv_c0, const int z_ts, const int z_hs) {
+#if defined(GDNC_ENABLED)
+    static_assert(CL == 32, "scan2: CL 32");
+    static_assert(!(ZBF16 && NPF > 0), "scan2: the MALL prefetcher reads z as XT");
+    const XT * __restrict__ on_z = (const XT *) on_z_;
+    constexpr int ZB = ZBF16 ? 2 : (int) sizeof(XT);   // bytes per z value (ZBF16: BF16 z written by the z GEMM, GGML_GDN_Z16)
+    constexpr int NT  = CL / 16;
+    constexpr int SQ  = 136;
+    constexpr int ST  = CL + 8;
+    constexpr int NQK = CL * 32 / 256;
+    constexpr int NTP = 2 * CL * CL / 8 / 256;
+    constexpr int NX  = CL + 2;                 // x rows per lane: t0 + rh - 3 + k, k < NX
+    __shared__ __align__(16) _Float16 Qs[CL * SQ];
+    __shared__ __align__(16) _Float16 Ks[CL * SQ];
+    __shared__ __align__(16) _Float16 KTs[128 * ST];
+    __shared__ __align__(16) _Float16 Ts[CL * ST];
+    __shared__ __align__(16) _Float16 Ps[CL * ST];
+    __shared__ __align__(16) _Float16 Os[CL * SQ];
+    __shared__ float2 Gs[CL];
+    __shared__ __align__(16) float Wn[128];
+    if constexpr (NPF > 0) {
+        if ((int) blockIdx.x >= H) {
+            // MALL prefetcher: streams x_v / z of chunk c into the caches once the scan blocks have finished
+            // chunk c - PFD (cumulative progress counter), so the scan's own (latency-bound) loads hit L2 / MALL
+            const int p = blockIdx.x - H, tid = threadIdx.x;
+            unsigned acc = 0;
+            const int total = H * nch;
+            if (tid == 0) sink[1 + p] = __hip_atomic_load(prog, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            for (int c = 0; c < nch; ++c) {
+                if (threadIdx.x == 0) {
+                    int pr;
+                    while ((pr = __hip_atomic_load(prog, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) < H * (c - PFD) && pr < total)
+                        __builtin_amdgcn_s_sleep(8);
+                }
+                __syncthreads();
+                if (__hip_atomic_load(prog, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) >= total) break;
+                for (int hh = p; hh < H; hh += NPF) {
+                    // 32 rows x 128 values of x_v and of z for head hh: 8 threads per row, 16 values each
+                    const int r = tid >> 3, q = tid & 7;
+                    const int t = min(c * CL + r, n_tokens - 1);
+                    const XT * xp = X + (int64_t) t * C + hh * xv_hs + xv_c0 + q * 16;
+                    const XT * zp = on_z + (int64_t) t * z_ts + hh * z_hs + q * 16;
+                    acc ^= *(const volatile unsigned *) xp;
+                    acc ^= *(const volatile unsigned *) zp;
+                    if constexpr (sizeof(XT) == 4) {
+                        acc ^= *(const volatile unsigned *) (xp + 8);
+                        acc ^= *(const volatile unsigned *) (zp + 8);
+                    }
+                }
+            }
+            if (acc == 0x12345678u) sink[0] = acc;
+            return;
+        }
+    }
+    const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int hk = h % Hk;
+    const int cl = lane & 15, rh = lane >> 4, col = wave * 16 + cl;
+    if (tid < 128) Wn[tid] = on_w[tid];
+    const int nr = tid >> 3, n16 = tid & 7;     // norm stage: row nr, columns 16 n16 .. +15
+
+    const float * s_in = curr_state + (int64_t) h * 128 * 128;
+    gdnc_v8f S[8];
+#pragma unroll
+    for (int it = 0; it < 8; ++it)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) S[it][e] = s_in[col * 128 + it * 16 + 2 * e + rh];
+    const __amdgpu_buffer_rsrc_t rz = __builtin_amdgcn_make_buffer_rsrc((void *) on_z, 0, 0x7fffffff, 0x31004000);
+    const __amdgpu_buffer_rsrc_t rx = __builtin_amdgcn_make_buffer_rsrc((void *) X, 0, 0x7fffffff, 0x31004000);
+    const __amdgpu_buffer_rsrc_t rout = __builtin_amdgcn_make_buffer_rsrc((void *) out16, 0, n_tokens * H * 128 * 2, 0x31004000);
+
+    const _Float16 * kh = Kh + (int64_t) hk * n_tokens * 128;
+    const _Float16 * qh = Qh + (int64_t) hk * n_tokens * 128;
+    const int vch = vc + h * 128 + col;
+    const int xoff = h * xv_hs + xv_c0 + col;
+    float wv[4];
+    { const float4 b = *(const float4 *) (cw + (int64_t) vch * 4); wv[0] = b.x; wv[1] = b.y; wv[2] = b.z; wv[3] = b.w; }
+
+    uint2 pk[NQK], pq[NQK];
+    uint4 ptp[NTP];
+    float2 pg;
+    float xr[NX];
+    float xq4[7][4];      // VROW: rows t0 + 4 wave - 3 + j, channels 4 lane .. +3
+    float wq4[4][4];
+    if constexpr (VROW) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const float4 b = *(const float4 *) (cw + (int64_t) (vc + h * 128 + lane * 4 + c) * 4);
+            wq4[c][0] = b.x; wq4[c][1] = b.y; wq4[c][2] = b.z; wq4[c][3] = b.w;
+        }
+    }
+    constexpr int ZN = ZB;                  // uint4 of z per thread (16 values)
+    uint4 pz[ZN];
+    auto prefetch = [&](const int ch) {
+        const int t0 = ch * CL;
+#pragma unroll
+        for (int j = 0; j < NQK; ++j) {
+            const int idx = tid + 256 * j, r = idx >> 5, i = (idx & 31) * 4;
+            const int64_t o = (int64_t) min(t0 + r, n_tokens - 1) * 128 + i;
+            pk[j] = *(const uint2 *) (kh + o);
+            pq[j] = *(const uint2 *) (qh + o);
+        }
+        const _Float16 * Tp = Tb + ((int64_t) h * nch + ch) * CL * CL;
+        const _Float16 * Pp = Pb + ((int64_t) h * nch + ch) * CL * CL;
+#pragma unroll
+        for (int j = 0; j < NTP; ++j) {
+            const int idx = tid + 256 * j;
+            const int w = idx % (CL * CL / 8);
+            ptp[j] = *(const uint4 *) ((idx < CL * CL / 8 ? Tp : Pp) + w * 8);
+        }
+        pg = Gb[((int64_t) h * nch + ch) * CL + (tid % CL)];
+        if constexpr (VROW) {
+            const int xo4 = h * xv_hs + xv_c0 + lane * 4;
+#pragma unroll
+            for (int j = 0; j < 7; ++j) {
+                const int t = min(max(t0 + wave * 4 - 3 + j, 0), n_tokens - 1);
+                if constexpr (sizeof(XT) == 4) {
+                    typedef unsigned v4u __attribute__((ext_vector_type(4)));
+                    const v4u v = __builtin_amdgcn_raw_buffer_load_b128(rx, (t * C + xo4) * 4, 0, 0);
+                    xq4[j][0] = __uint_as_float(v.x); xq4[j][1] = __uint_as_float(v.y); xq4[j][2] = __uint_as_float(v.z); xq4[j][3] = __uint_as_float(v.w);
+                } else {
+                    typedef unsigned v2u __attribute__((ext_vector_type(2)));
+                    const v2u v = __builtin_amdgcn_raw_buffer_load_b64(rx, (t * C + xo4) * 2, 0, 0);
+                    _Float16 hv[4]; __builtin_memcpy(hv, &v, 8);
+                    xq4[j][0] = hv[0]; xq4[j][1] = hv[1]; xq4[j][2] = hv[2]; xq4[j][3] = hv[3];
+                }
+            }
+        } else
+#pragma unroll
+        for (int k = 0; k < NX; ++k) {
+            const int t = (MODE & 256) ? (rh + k) : min(max(t0 + rh - 3 + k, 0), n_tokens - 1);
+            if constexpr (sizeof(XT) == 4) {
+                xr[k] = (MODE & 128) ? (float) k : __uint_as_float(__builtin_amdgcn_raw_buffer_load_b32(rx, (t * C + xoff) * 4, 0, 0));
+            } else {
+                xr[k] = (MODE & 128) ? (float) k : (float) __builtin_bit_cast(_Float16, __builtin_amdgcn_raw_buffer_load_b16(rx, (t * C + xoff) * 2, 0, 0));
+            }
+        }
+    };
+    auto prefetch_z = [&](const int ch) {
+        if constexpr ((MODE & 512) != 0) return;   // late gate: sigmoid(z) is applied by gdn_gate_kernel after the scan
+        const int t = (MODE & 256) ? nr : min(ch * CL + nr, n_tokens - 1);
+        const int zb = (t * z_ts + h * z_hs + n16 * 16) * ZB;
+        typedef unsigned v4u __attribute__((ext_vector_type(4)));
+#pragma unroll
+        for (int j = 0; j < ZN; ++j) {
+            if (MODE & 64) { pz[j] = make_uint4(j, 2, 3, 4); continue; }
+            const v4u v = __builtin_amdgcn_raw_buffer_load_b128(rz, zb + 16 * j, 0, 0);
+            pz[j] = make_uint4(v.x, v.y, v.z, v.w);
+        }
+    };
+    prefetch(0);
+    prefetch_z(0);
+    // conv history (rows t < 0) from the conv state
+#pragma unroll
+    for (int k = 0; k < 3; ++k) if (rh - 3 + k < 0) xr[k] = cst[(int64_t) vch * 3 + rh + k];
+    if constexpr (VROW) {
+        if (wave == 0) {
+#pragma unroll
+            for (int j = 0; j < 3; ++j)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) xq4[j][c] = cst[(int64_t) (vc + h * 128 + lane * 4 + c) * 3 + j];
+        }
+    }
+
+    for (int ch = 0; ch < nch; ++ch) {
+        const int t0 = ch * CL;
+        S2_BAR();
+#pragma unroll
+        for (int j = 0; j < NQK; ++j) {
+            const int idx = tid + 256 * j, r = idx >> 5, i = (idx & 31) * 4;
+            *(uint2 *) (Ks + r * SQ + i) = pk[j];
+            *(uint2 *) (Qs + r * SQ + i) = pq[j];
+            _Float16 kk4[4];
+            __builtin_memcpy(kk4, &pk[j], 8);
+            KTs[(i + 0) * ST + r] = kk4[0]; KTs[(i + 1) * ST + r] = kk4[1];
+            KTs[(i + 2) * ST + r] = kk4[2]; KTs[(i + 3) * ST + r] = kk4[3];
+        }
+#pragma unroll
+        for (int j = 0; j < NTP; ++j) {
+            const int idx = tid + 256 * j;
+            const int w = idx % (CL * CL / 8), r = w / (CL / 8), c8 = (w % (CL / 8)) * 8;
+            *(uint4 *) ((idx < CL * CL / 8 ? Ts : Ps) + r * ST + c8) = ptp[j];
+        }
+        if (tid < CL) Gs[tid] = pg;
+        // v = silu(conv(x)) in accumulator layout: row r = 16 rt + 2e + rh uses xr[r - rh + j], j = 0..3
+        gdnc_v8f vacc[NT];
+        if constexpr (VROW) {
+            // row layout: thread = rows 4 wave .. +3, channels 4 lane .. +3 -> fp16 rows in Os (free until the O stage)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                _Float16 hv[4];
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    float sacc = xq4[i][c] * wq4[c][0];
+                    sacc = fmaf(xq4[i + 1][c], wq4[c][1], sacc); sacc = fmaf(xq4[i + 2][c], wq4[c][2], sacc); sacc = fmaf(xq4[i + 3][c], wq4[c][3], sacc);
+                    hv[c] = (_Float16) s2_silu(sacc);
+                }
+                *(uint2 *) (Os + (wave * 4 + i) * SQ + lane * 4) = *(const uint2 *) hv;
+            }
+        } else
+#pragma unroll
+        for (int rt = 0; rt < NT; ++rt)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int k = rt * 16 + 2 * e;
+                float s = xr[k] * wv[0];
+                s = fmaf(xr[k + 1], wv[1], s); s = fmaf(xr[k + 2], wv[2], s); s = fmaf(xr[k + 3], wv[3], s);
+                vacc[rt][e] = (MODE & 32) ? xr[k] : s2_silu(s);
+            }
+        S2_BAR();
+        const int nx = min(ch + 1, nch - 1);
+        if (!(MODE & 16)) prefetch(nx);
+
+        gdnc_v8f ks[NT], qs[NT];
+#pragma unroll
+        for (int rt = 0; rt < NT; ++rt) { ks[rt] = gdnc_v8f{}; qs[rt] = gdnc_v8f{}; }
+#pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            if (MODE & 1) break;
+            const gdnc_v16h sb = s2_acc_to_frag(S[it], lane);
+#pragma unroll
+            for (int rt = 0; rt < NT; ++rt) {
+                ks[rt] = GDNC_WMMA(gdnc_frag(Ks, SQ, rt * 16, it * 16, lane), sb, ks[rt]);
+                qs[rt] = GDNC_WMMA(gdnc_frag(Qs, SQ, rt * 16, it * 16, lane), sb, qs[rt]);
+            }
+        }
+        if constexpr (VROW) {
+#pragma unroll
+            for (int rt = 0; rt < NT; ++rt)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) vacc[rt][e] = (float) Os[(rt * 16 + 2 * e + rh) * SQ + col];
+        }
+        gdnc_v16h YB[NT];
+#pragma unroll
+        for (int rt = 0; rt < NT; ++rt) {
+            gdnc_v8f y;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) y[e] = fmaf(-Gs[rt * 16 + 2 * e + rh].x, ks[rt][e], vacc[rt][e]);
+            YB[rt] = s2_acc_to_frag(y, lane);
+        }
+        gdnc_v16h UB[NT], UB2[NT];
+#pragma unroll
+        for (int rt = 0; rt < NT; ++rt) {
+            gdnc_v8f u = {};
+#pragma unroll
+            for (int st = 0; st <= rt; ++st) u = GDNC_WMMA(gdnc_frag(Ts, ST, rt * 16, st * 16, lane), YB[st], u);
+            UB[rt] = s2_acc_to_frag(u, lane);
+            gdnc_v8f u2;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) u2[e] = u[e] * Gs[rt * 16 + 2 * e + rh].y;
+            UB2[rt] = s2_acc_to_frag(u2, lane);
+        }
+        const float eGL = Gs[CL - 1].x;
+#pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            gdnc_v8f acc;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[e] = S[it][e] * eGL;
+#pragma unroll
+            for (int st = 0; st < NT && !(MODE & 2); ++st) acc = GDNC_WMMA(gdnc_frag(KTs, ST, it * 16, st * 16, lane), UB2[st], acc);
+            S[it] = acc;
+        }
+        if constexpr (VROW) S2_BAR();   // every wave has read its v from Os
+#pragma unroll
+        for (int rt = 0; rt < NT; ++rt) {
+            gdnc_v8f o;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o[e] = qs[rt][e] * (Gs[rt * 16 + 2 * e + rh].x * scale);
+#pragma unroll
+            for (int st = 0; st <= rt; ++st) o = GDNC_WMMA(gdnc_frag(Ps, ST, rt * 16, st * 16, lane), UB[st], o);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) Os[(rt * 16 + 2 * e + rh) * SQ + col] = (_Float16) o[e];
+        }
+        S2_BAR();
+        // gated RMS norm: thread = row nr, columns 16 n16 .. +15
+        if (!(MODE & 4)) {
+            float o[16];
+            {
+                const uint4 a = *(const uint4 *) (Os + nr * SQ + n16 * 16), b = *(const uint4 *) (Os + nr * SQ + n16 * 16 + 8);
+                _Float16 hv[16];
+                __builtin_memcpy(hv, &a, 16); __builtin_memcpy(hv + 8, &b, 16);
+#pragma unroll
+                for (int c = 0; c < 16; ++c) o[c] = (float) hv[c];
+            }
+            float ss = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 16; ++c) ss = fmaf(o[c], o[c], ss);
+            ss += gdn_dpp_row_xmask<1>(ss); ss += gdn_dpp_row_xmask<2>(ss); ss += gdn_dpp_row_xmask<4>(ss);
+            const float sc = rsqrtf(ss * (1.0f / 128.0f) + on_eps);
+            float zz[16];
+            if constexpr ((MODE & 512) != 0) {
+#pragma unroll
+                for (int c = 0; c < 16; ++c) zz[c] = 0.0f;
+            } else if constexpr (ZBF16) {
+                uint32_t zw[8];
+                __builtin_memcpy(zw, pz, 32);
+#pragma unroll
+                for (int c = 0; c < 8; ++c) { zz[2 * c] = __uint_as_float(zw[c] << 16); zz[2 * c + 1] = __uint_as_float(zw[c] & 0xffff0000u); }
+            } else if constexpr (sizeof(XT) == 4) {
+                __builtin_memcpy(zz, pz, 64);
+            } else {
+                _Float16 zh[16];
+                __builtin_memcpy(zh, pz, 32);
+#pragma unroll
+                for (int c = 0; c < 16; ++c) zz[c] = (float) zh[c];
+            }
+            float wn[16];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { const float4 b = *(const float4 *) (Wn + n16 * 16 + 4 * j); wn[4*j] = b.x; wn[4*j+1] = b.y; wn[4*j+2] = b.z; wn[4*j+3] = b.w; }
+            uint32_t pk2[8];
+#pragma unroll
+            for (int c = 0; c < 16; c += 2) {
+                if constexpr ((MODE & 512) != 0) {   // un-gated y = rmsnorm(o) * w as F16 (the gate kernel converts in place)
+                    const float v0 = sc * o[c] * wn[c], v1 = sc * o[c + 1] * wn[c + 1];
+                    pk2[c / 2] = (uint32_t) ggml_cuda_f32_to_act16(v0, true) | ((uint32_t) ggml_cuda_f32_to_act16(v1, true) << 16);
+                } else {
+                    const float v0 = (sc * o[c] * wn[c]) * s2_sigm(zz[c]);
+                    const float v1 = (sc * o[c + 1] * wn[c + 1]) * s2_sigm(zz[c + 1]);
+                    pk2[c / 2] = (uint32_t) ggml_cuda_f32_to_act16(v0, OUT_F16) | ((uint32_t) ggml_cuda_f32_to_act16(v1, OUT_F16) << 16);
+                }
+            }
+            // unconditional buffer store: rows t >= n_tokens fall outside num_records and are dropped by the hardware
+            // (a guard branch makes the compiler sink the z prefetch into it and drain every load with vmcnt(0))
+            {
+                const int ob = (((t0 + nr) * H + h) * 128 + n16 * 16) * 2;
+                typedef unsigned v4u __attribute__((ext_vector_type(4)));
+                __builtin_amdgcn_raw_buffer_store_b128(v4u{pk2[0], pk2[1], pk2[2], pk2[3]}, rout, ob, 0, 0);
+                __builtin_amdgcn_raw_buffer_store_b128(v4u{pk2[4], pk2[5], pk2[6], pk2[7]}, rout, ob + 16, 0, 0);
+            }
+            if (!(MODE & 16)) prefetch_z(nx);
+            if constexpr (NPF > 0) { if (tid == 0) __hip_atomic_fetch_add(prog, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); }
+        }
+    }
+
+    float * s_out = state + (int64_t) h * 128 * 128;
+#pragma unroll
+    for (int it = 0; it < 8; ++it)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) s_out[col * 128 + it * 16 + 2 * e + rh] = S[it][e];
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+// GGML_GDN_LATEJOIN: out16 (F16 y = rmsnorm(o) * w from scan2 MODE 512) *= sigmoid(z) in place, 8 values per thread
+template <bool OUT_F16, bool ZBF16>
+__global__ void __launch_bounds__(256)
+gdn_gate_kernel(uint16_t * __restrict__ out16, const void * __restrict__ z, const int64_t n8) {
+    const int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x;
+    if (i >= n8) return;
+    const uint4 y = ((const uint4 *) out16)[i];
+    float zz[8];
+    if constexpr (ZBF16) {
+        const uint4 zb = ((const uint4 *) z)[i];
+        const uint32_t zw[4] = { zb.x, zb.y, zb.z, zb.w };
+#pragma unroll
+        for (int c = 0; c < 4; ++c) { zz[2 * c] = __uint_as_float(zw[c] << 16); zz[2 * c + 1] = __uint_as_float(zw[c] & 0xffff0000u); }
+    } else {
+        const float4 z0 = ((const float4 *) z)[2 * i], z1 = ((const float4 *) z)[2 * i + 1];
+        zz[0] = z0.x; zz[1] = z0.y; zz[2] = z0.z; zz[3] = z0.w; zz[4] = z1.x; zz[5] = z1.y; zz[6] = z1.z; zz[7] = z1.w;
+    }
+    _Float16 yh[8];
+    __builtin_memcpy(yh, &y, 16);
+    uint32_t o[4];
+#pragma unroll
+    for (int c = 0; c < 8; c += 2) {
+        const float v0 = (float) yh[c] / (1.0f + __expf(-zz[c]));
+        const float v1 = (float) yh[c + 1] / (1.0f + __expf(-zz[c + 1]));
+        o[c / 2] = (uint32_t) ggml_cuda_f32_to_act16(v0, OUT_F16) | ((uint32_t) ggml_cuda_f32_to_act16(v1, OUT_F16) << 16);
+    }
+    ((uint4 *) out16)[i] = make_uint4(o[0], o[1], o[2], o[3]);
+}
+
+#ifndef GDN_V2_DEFAULT
+#define GDN_V2_DEFAULT 1   // pp2048 1683 -> 1702 t/s; logits KLD vs the v1 chunk path at the KV-bf16 noise level
+#endif
 static bool gdn_chunk_enabled() {
     static const int v = getenv("GGML_GDN_CHUNK") ? atoi(getenv("GGML_GDN_CHUNK")) : 1;
     return v != 0;
@@ -1028,7 +1602,8 @@ static bool gdn_chunk_eligible_raw(const int cc, const bool kda, const bool keep
         const void * q_d, const void * k_d) {
 #if defined(GGML_USE_HIP)
     const bool aligned = sq1 % 4 == 0 && sq2 % 4 == 0 && ((uintptr_t) q_d) % 16 == 0 && ((uintptr_t) k_d) % 16 == 0;
-    return !kda && !keep_rs && GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && n_seqs == 1 && n_tokens >= gdn_chunk_min_tokens() &&
+    // n_seqs > 1: the chunk kernels run once per sequence on its slices (each exactly a one-sequence prefill)
+    return !kda && !keep_rs && GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && n_seqs >= 1 && n_tokens >= gdn_chunk_min_tokens() &&
         aligned && Hk > 0 && H % Hk == 0 && H / Hk <= 4 && gdn_chunk_enabled();
 #else
     GGML_UNUSED(cc); GGML_UNUSED(kda); GGML_UNUSED(keep_rs); GGML_UNUSED(S_v); GGML_UNUSED(H); GGML_UNUSED(Hk);
@@ -1046,6 +1621,9 @@ bool ggml_cuda_gdn_chunk_eligible(const ggml_tensor * gdn, const ggml_tensor * q
     const int  cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool kda     = gdn->src[3]->ne[0] == v->ne[0];
     const bool keep_rs = ggml_get_op_params_i32(gdn, 0) > 1;
+    if (q->ne[3] != v->ne[3] || q->ne[2] != v->ne[2]) {
+        return false;
+    }
     return gdn_chunk_eligible_raw(cc, kda, keep_rs, v->ne[0], v->ne[1], q->ne[1], v->ne[2], v->ne[3],
         (int64_t) (q->nb[1] / sizeof(float)), (int64_t) (q->nb[2] / sizeof(float)), q->data, k->data);
 }
@@ -1079,12 +1657,40 @@ struct gdn_out_norm_ovr {
     float *       out;
     uint16_t *    out16;
     float         eps;
+    bool          out16_f16;
+    bool          z_bf16;     // z holds BF16 (its GEMM skipped the F32 store, GGML_GDN_Z16): only the v2 scan reads that
 };
 static std::unordered_map<const ggml_tensor *, gdn_out_norm_ovr> g_gdn_on;
 
-void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const float * z, float * out, uint16_t * out16, float eps) {
+void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const float * z, float * out, uint16_t * out16, float eps,
+        bool out16_f16, bool z_bf16) {
     std::lock_guard<std::mutex> lk(g_gdn_qk_mtx);
-    g_gdn_on[gdn] = { w, z, out, out16, eps };
+    g_gdn_on[gdn] = { w, z, out, out16, eps, out16_f16, z_bf16 };
+}
+
+static bool gdn_v2_enabled() {
+    static const bool v = getenv("GGML_GDN_V2") ? atoi(getenv("GGML_GDN_V2")) != 0 : GDN_V2_DEFAULT;
+    return v;
+}
+
+// GGML_GDN_Z16 (default 1): the z GEMM of a GDN layer that takes the v2 chunked path stores BF16 only (no F32 z), read by
+// the scan2 output-norm epilogue. Graph-time predicate (shapes / env only); the op aborts if the v2 scan is not taken after all.
+bool ggml_cuda_gdn_z16_ok(const ggml_tensor * gdn) {
+#if defined(GGML_USE_HIP)
+    static const bool env = getenv("GGML_GDN_Z16") ? atoi(getenv("GGML_GDN_Z16")) != 0 : true;
+    static const bool nofuse = getenv("GGML_CUDA_DISABLE_GDN_OUTNORM") != nullptr ||
+        (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_FUSION")) != 0);
+    if (!env || nofuse || !gdn || gdn->op != GGML_OP_GATED_DELTA_NET || !gdn_v2_enabled() || !gdn_chunk_enabled()) return false;
+    const ggml_tensor * v = gdn->src[2];
+    const int  cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool kda     = gdn->src[3]->ne[0] == v->ne[0];
+    const bool keep_rs = ggml_get_op_params_i32(gdn, 0) > 1;
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) && !kda && !keep_rs && v->ne[0] == 128 && v->ne[2] >= gdn_chunk_min_tokens() &&
+        v->ne[1] * 128 % 8 == 0;
+#else
+    GGML_UNUSED(gdn);
+    return false;
+#endif
 }
 
 bool ggml_cuda_gdn_chunk_eligible_node(const ggml_tensor * gdn) {
@@ -1245,7 +1851,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             g_gdn_qk.erase(it);
         }
     }
-    gdn_out_norm_ovr on_ovr = { nullptr, nullptr, nullptr, nullptr, 0.0f };
+    gdn_out_norm_ovr on_ovr = { nullptr, nullptr, nullptr, nullptr, 0.0f, false, false };
     {
         std::lock_guard<std::mutex> lk(g_gdn_qk_mtx);
         auto it = g_gdn_on.find(dst);
@@ -1343,30 +1949,96 @@ static void ggml_cuda_op_gated_delta_net_impl(
         const int cc  = ggml_cuda_info().devices[dev].cc;
         const float qk_eps = qk_ovr.q ? qk_ovr.eps : -1.0f;
         const float qk_mul = qk_ovr.q ? qk_ovr.mul : 1.0f;
-        const bool eligible = gdn_chunk_eligible_raw(cc, kda, keep_rs, S_v, H, neqk1, n_tokens, n_seqs, sq1, sq2, q_d, k_d);
+        const bool eligible = neq3 == n_seqs && gdn_chunk_eligible_raw(cc, kda, keep_rs, S_v, H, neqk1, n_tokens, n_seqs, sq1, sq2, q_d, k_d);
         if ((qk_ovr.q || on_ovr.z || cv_ovr.x) && !eligible) {
             GGML_ABORT("gated_delta_net: conv / q/k / output norms were fused for %s but the chunked path is not taken", dst->name);
         }
         if (eligible) {
-            gdnc_in in = { q_d, k_d, v_d, sq1, sq2, sv1, sv2, cv_ovr.x, cv_ovr.st, cv_ovr.cw, cv_ovr.C, cv_ovr.qc, cv_ovr.kc, cv_ovr.vc };
-            auto run = [&](auto CLc) {
+            const gdnc_in in0 = { q_d, k_d, v_d, sq1, sq2, sv1, sv2, cv_ovr.x, cv_ovr.st, cv_ovr.cw, cv_ovr.C, cv_ovr.qc, cv_ovr.kc, cv_ovr.vc };
+            const bool gdn_v2 = gdn_v2_enabled();
+            const bool use_v2 = gdn_v2 && cv_ovr.x && qk_ovr.q && on_ovr.z && on_ovr.out16 && !on_ovr.out && sv1 == 128 &&
+                ((uintptr_t) cv_ovr.x) % 16 == 0 && (cv_ovr.C % 4) == 0 && (cv_ovr.vc % 4) == 0 &&
+                (int64_t) n_tokens * cv_ovr.C * 4 < INT32_MAX && (int64_t) n_tokens * H * 128 * 2 < INT32_MAX;
+            // z stored BF16-only (GGML_GDN_Z16, a graph-time choice) is read natively only by the v2 epilogue: when the
+            // run-time checks above still refuse v2, the chunked scan below reads an F32 copy instead
+            const bool z_widen = on_ovr.z_bf16 && !use_v2;
+            auto run = [&](auto CLc, const int64_t is) {
+                // sequence `is`: its q/k/v (or conv input and history), g/beta, state in/out, output rows and z / norm output
+                const size_t ro = (size_t) is * n_tokens * H * 128;   // output rows, z and the norm output of the sequence
+                gdnc_in in = in0;
+                in.q += is * sq3; in.k += is * sq3; in.v += is * sv3;
+                const float * cx  = cv_ovr.x  ? cv_ovr.x  + (size_t) is * n_tokens * cv_ovr.C : nullptr;
+                const float * cst = cv_ovr.st ? cv_ovr.st + (size_t) is * 3 * cv_ovr.C : nullptr;
+                in.x = cx; in.st = cst;
+                const float * gs = g_d + is * sb3, * bs = b_d + is * sb3;
+                const float * s0 = s_d + (size_t) is * S_v * S_v * H;
+                float * so = state_d + (size_t) is * S_v * S_v * H;
+                float * dsts = dst_d + ro;
+                const float * zs = on_ovr.z ? (const float *) ((const char *) on_ovr.z + ro * (on_ovr.z_bf16 ? 2 : 4)) : nullptr;
+                uint16_t * o16s = on_ovr.out16 ? on_ovr.out16 + ro : nullptr;
+                float * o32s = on_ovr.out ? on_ovr.out + ro : nullptr;
                 constexpr int CL = decltype(CLc)::value;
                 const int nch = (int) ((n_tokens + CL - 1) / CL);
+                if (use_v2) {
+                    ggml_cuda_pool_alloc<_Float16> Tb(ctx.pool(), (size_t) H * nch * CL * CL);
+                    ggml_cuda_pool_alloc<_Float16> Pb(ctx.pool(), (size_t) H * nch * CL * CL);
+                    ggml_cuda_pool_alloc<float2>   Gb(ctx.pool(), (size_t) H * nch * CL);
+                    ggml_cuda_pool_alloc<_Float16> Qh(ctx.pool(), (size_t) neqk1 * n_tokens * 128);
+                    ggml_cuda_pool_alloc<_Float16> Kh(ctx.pool(), (size_t) neqk1 * n_tokens * 128);
+                    gdn_prep2_kernel<CL, float><<<dim3(neqk1, nch), 256, 0, stream>>>(in, cx, gs, bs,
+                        Tb.get(), Pb.get(), Gb.get(), Qh.get(), Kh.get(), (int) H, (int) neqk1, (int) n_tokens, nch,
+                        sb1, sb2, scale, qk_eps, qk_mul);
+                    // GGML_GDN_LATEJOIN=1: the scan runs without z, concurrently with the z GEMM (GGML_CUDA_OVL side stream);
+                    // sigmoid(z) is applied afterwards by gdn_gate_kernel
+                    static const bool late = getenv("GGML_GDN_LATEJOIN") ? atoi(getenv("GGML_GDN_LATEJOIN")) != 0 : false;
+                    if (late) {
+                        gdn_scan2_kernel<CL, 512, float, 0, 3, true, true><<<dim3(H), 256, 0, stream>>>(nullptr, nullptr, Qh.get(), Kh.get(),
+                            cx, cst, cv_ovr.cw, (int) cv_ovr.C, (int) cv_ovr.vc, s0, so,
+                            Tb.get(), Pb.get(), Gb.get(), (int) H, (int) neqk1, (int) n_tokens, nch, scale,
+                            on_ovr.w, zs, o16s, on_ovr.eps, 128, (int) cv_ovr.vc, (int) (H * 128), 128);
+                        ggml_cuda_ovl_join(ctx);
+                        const int64_t n8 = (int64_t) n_tokens * H * 128 / 8;
+                        auto gk = on_ovr.z_bf16 ? (on_ovr.out16_f16 ? gdn_gate_kernel<true, true> : gdn_gate_kernel<false, true>)
+                                                : (on_ovr.out16_f16 ? gdn_gate_kernel<true, false> : gdn_gate_kernel<false, false>);
+                        gk<<<(n8 + 255) / 256, 256, 0, stream>>>(o16s, zs, n8);
+                        CUDA_CHECK(cudaGetLastError());
+                        return;
+                    }
+                    ggml_cuda_ovl_join(ctx);   // GGML_CUDA_OVL: z (read by the output-norm epilogue) ran on the side stream
+                    // MMB_DENSE_F16: the F16 out16 copy is a template flag (no runtime select in the epilogue)
+                    (on_ovr.z_bf16 ? (on_ovr.out16_f16 ? gdn_scan2_kernel<CL, 0, float, 0, 3, true, true, true> : gdn_scan2_kernel<CL, 0, float, 0, 3, true, false, true>)
+                                   : (on_ovr.out16_f16 ? gdn_scan2_kernel<CL, 0, float, 0, 3, true, true> : gdn_scan2_kernel<CL, 0, float, 0, 3, true, false>))
+                        <<<dim3(H), 256, 0, stream>>>(nullptr, nullptr, Qh.get(), Kh.get(),
+                        cx, cst, cv_ovr.cw, (int) cv_ovr.C, (int) cv_ovr.vc, s0, so,
+                        Tb.get(), Pb.get(), Gb.get(), (int) H, (int) neqk1, (int) n_tokens, nch, scale,
+                        on_ovr.w, zs, o16s, on_ovr.eps, 128, (int) cv_ovr.vc, (int) (H * 128), 128);
+                    CUDA_CHECK(cudaGetLastError());
+                    return;
+                }
                 ggml_cuda_pool_alloc<_Float16> Tb(ctx.pool(), (size_t) H * nch * CL * CL);
                 ggml_cuda_pool_alloc<_Float16> Pb(ctx.pool(), (size_t) H * nch * CL * CL);
                 ggml_cuda_pool_alloc<float2>   Gb(ctx.pool(), (size_t) H * nch * CL);
                 ggml_cuda_pool_alloc<_Float16> Qh(ctx.pool(), (size_t) neqk1 * n_tokens * 128);
                 ggml_cuda_pool_alloc<_Float16> Kh(ctx.pool(), (size_t) neqk1 * n_tokens * 128);
                 ggml_cuda_pool_alloc<_Float16> Vh(ctx.pool(), (size_t) H * n_tokens * 128);
-                gdn_chunk_prep_kernel<CL><<<dim3(neqk1, nch), 256, 0, stream>>>(in, g_d, b_d,
+                gdn_chunk_prep_kernel<CL><<<dim3(neqk1, nch), 256, 0, stream>>>(in, gs, bs,
                     Tb.get(), Pb.get(), Gb.get(), Qh.get(), Kh.get(), Vh.get(), (int) H, (int) neqk1, (int) n_tokens, nch,
                     sb1, sb2, scale, qk_eps, qk_mul);
-                gdn_chunk_scan_kernel<CL><<<dim3(H), 256, 0, stream>>>(Qh.get(), Kh.get(), Vh.get(), s_d, dst_d, state_d,
+                ggml_cuda_ovl_join(ctx);   // z may come from the side stream
+                ggml_cuda_pool_alloc<float> z32(ctx.pool());
+                if (z_widen) {
+                    z32.alloc((size_t) n_tokens * H * 128);
+                    ggml_get_to_fp32_cuda(GGML_TYPE_BF16)(zs, z32.get(), (int64_t) n_tokens * H * 128, stream);
+                    zs = z32.get();
+                }
+                gdn_chunk_scan_kernel<CL><<<dim3(H), 256, 0, stream>>>(Qh.get(), Kh.get(), Vh.get(), s0, dsts, so,
                     Tb.get(), Pb.get(), Gb.get(), (int) H, (int) neqk1, (int) n_tokens, nch, scale,
-                    on_ovr.w, on_ovr.z, on_ovr.out, on_ovr.out16, on_ovr.eps);
+                    on_ovr.w, zs, o32s, o16s, on_ovr.eps, on_ovr.out16_f16);
                 CUDA_CHECK(cudaGetLastError());
             };
-            run(std::integral_constant<int, 32>{});
+            for (int64_t is = 0; is < n_seqs; ++is) {
+                run(std::integral_constant<int, 32>{}, is);  //CL64 fails LDS 90KB > 64KB limit
+            }
             return;
         }
     }

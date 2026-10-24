@@ -790,6 +790,370 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+#ifndef FA7_DEFAULT
+#define FA7_DEFAULT 1   // pp2048 1706 -> 1735 t/s; NMSE vs fp64 causal reference ~3e-9 (existing path ~3e-5)
+#endif
+// ---------------------------------------------------------------------------------------------
+// fa7: GQA-aware WMMA flash attention for gfx1151, causal prefill only (NH=1 NK=32 PD=1, verified against a naive GPU
+// reference and a CPU fp64 reference on all heads).
+// Shape-restricted: HQ=24, HKV=2, D=256, Q f32, K/V f16, n_kv == n_q, no ALiBi / softcap / sinks / selected keys. The
+// mask is not read: the graph must mark it as the plain causal one (ggml_flash_attn_ext_set_causal_prefix). Everything
+// else keeps the existing path. K/V are first packed (pack_kv) into WMMA-fragment order in a pool buffer:
+//   Kp[kvh][T/16][16 db][16 key][16 d], Vp[kvh][T/16][16 db][16 d][16 slot] (slots: keys 0,2,..,14 then 1,3,..,15).
+// GGML_FA7=0 disables it.
+#if defined(GGML_USE_HIP) && defined(RDNA3_5)
+#define FA7_ENABLED 1
+#endif
+namespace fa7 {
+constexpr int HQ = 24, HKV = 2, D = 256, G = HQ / HKV;
+constexpr int NH = 1, NK = 32, PD = 1;
+constexpr int NKB = NK / 16, NW = 2 * NH, NTH = NW * 32, HDB = 8;
+constexpr float LAZY = 8.0f;
+static_assert(8 % (PD + 1) == 0 && G % NH == 0, "fa7 config");
+typedef __attribute__((ext_vector_type(16))) _Float16 v16h;
+typedef __attribute__((ext_vector_type(8))) float v8f;
+typedef __attribute__((ext_vector_type(4))) unsigned int u4;
+typedef __attribute__((ext_vector_type(8))) unsigned int u8v;
+typedef __attribute__((ext_vector_type(2))) _Float16 h2;
+#if defined(FA7_ENABLED)
+static __device__ __forceinline__ unsigned xchu(unsigned x) {
+    return __builtin_amdgcn_permlanex16(x, x, 0x76543210, 0xfedcba98, false, false);
+}
+static __device__ __forceinline__ float xch(float x) { return __builtin_bit_cast(float, xchu(__builtin_bit_cast(unsigned, x))); }
+static __device__ __forceinline__ void lds_barrier() { asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory"); }
+#define FA7_SCHED_FENCE() __builtin_amdgcn_sched_barrier(0)
+#endif
+
+// Q: element (d, t, hq) at Q[t * sq1 + hq * sq2 + d] (floats); O: [T][HQ][D] f32; Kp/Vp: packed, one stream; T % 32 == 0
+// GATED: O = sigmoid(gate) * O (gate element (d, hq, t) at gate[t * sg1 + hq * sg2 + d]), O16 the 16-bit copy, O may be null
+template <bool GATED = false>
+__global__ void __launch_bounds__(NTH) fa_kernel(const float * __restrict__ Q, const _Float16 * __restrict__ Kp,
+        const _Float16 * __restrict__ Vp, float * __restrict__ O, const float scale_log2, const int T,
+        const int64_t sq1, const int64_t sq2, const float * __restrict__ gate = nullptr, const int64_t sg1 = 0, const int64_t sg2 = 0,
+        uint16_t * __restrict__ O16 = nullptr, const bool o16_f16 = false) {
+#if defined(FA7_ENABLED)
+    constexpr int NHG = G / NH;
+    __shared__ float4 xs[2][NW][NKB * 2][32];
+    const int bid = blockIdx.x;
+    const int tb = (T / 16 - 1) - bid / (HKV * NHG);   // heavy first
+    const int rem = bid % (HKV * NHG);
+    const int kvh = rem / NHG, hg = rem % NHG;
+    const int tq0 = tb * 16;
+    const int tid = threadIdx.x, w = tid >> 5, l = tid & 31, lq = l & 15, hi = l >> 4;
+    const int hd = w & 1, hq = kvh * G + hg * NH + (w >> 1);
+    const int tq = tq0 + lq;
+
+    v16h q[HDB];
+#pragma unroll
+    for (int j = 0; j < HDB; ++j) {
+        const float * qp = Q + (int64_t) tq * sq1 + (int64_t) hq * sq2 + (hd * HDB + j) * 16;
+#pragma unroll
+        for (int e = 0; e < 16; ++e) q[j][e] = (_Float16) qp[e];
+    }
+    v8f o[HDB];
+#pragma unroll
+    for (int i = 0; i < HDB; ++i) o[i] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    float m = -INFINITY, lsum = 0.f;
+
+    const int nt = (tq0 + 16 + NK - 1) / NK;
+    const _Float16 * Kh = Kp + (size_t) kvh * T * D;
+    const _Float16 * Vh = Vp + (size_t) kvh * T * D;
+    const int loff = hd * HDB * 256 + lq * 16;
+    const int voff0 = loff + hi * 8, voff1 = loff + 8 - hi * 8;
+    // buffer loads: per-lane byte offset in a VGPR (constant), tile offset in an SGPR, frag offset as immediate
+    const __amdgpu_buffer_rsrc_t rk = __builtin_amdgcn_make_buffer_rsrc((void *) Kh, 0, T * D * 2, 0x31004000);
+    const __amdgpu_buffer_rsrc_t rv = __builtin_amdgcn_make_buffer_rsrc((void *) Vh, 0, T * D * 2, 0x31004000);
+    const int lk = loff * 2, lv0 = voff0 * 2, lv1 = voff1 * 2;
+    auto ldk = [&](int t, int db, int kb) -> v16h {
+        const int so = (t * NK + kb * 16) * D * 2 + db * 512;
+        const u4 a = __builtin_bit_cast(u4, __builtin_amdgcn_raw_buffer_load_b128(rk, lk, so, 0));
+        const u4 b = __builtin_bit_cast(u4, __builtin_amdgcn_raw_buffer_load_b128(rk, lk + 16, so, 0));
+        return __builtin_bit_cast(v16h, u8v{a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]});
+    };
+    auto ldv = [&](int t, int st, int i) -> v16h {   // frag i of PV step st, tile t; halves swapped in lanes 16-31
+        const int db = (st >> 1) * 2 + i, kb = st & 1;   // step = (d-block pair, key block): independent WMMA chains
+        const int so = (t * NK + kb * 16) * D * 2 + db * 512;
+        const u4 a = __builtin_bit_cast(u4, __builtin_amdgcn_raw_buffer_load_b128(rv, lv0, so, 0));
+        const u4 b = __builtin_bit_cast(u4, __builtin_amdgcn_raw_buffer_load_b128(rv, lv1, so, 0));
+        return __builtin_bit_cast(v16h, u8v{a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]});
+    };
+
+    v16h buf[PD + 1][NKB];
+    v16h pb[NKB];
+    v8f s[NKB];
+
+    auto s_phase = [&](int t, auto && pref) {
+#pragma unroll
+        for (int kb = 0; kb < NKB; ++kb) s[kb] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+        for (int st = 0; st < 8; ++st) {
+            pref(st);
+#pragma unroll
+            for (int kb = 0; kb < NKB; ++kb)
+                s[kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(buf[st % (PD + 1)][kb], q[st], s[kb]);
+            FA7_SCHED_FENCE();
+        }
+    };
+    auto pv_phase = [&](auto && pref) {
+#pragma unroll
+        for (int st = 0; st < 8; ++st) {
+            pref(st);
+#pragma unroll
+            for (int kb = 0; kb < NKB; ++kb)
+                o[(st >> 1) * 2 + kb] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(buf[st % (PD + 1)][kb], pb[st & 1], o[(st >> 1) * 2 + kb]);
+            FA7_SCHED_FENCE();
+        }
+    };
+    auto put_s = [&](int t) {
+#pragma unroll
+        for (int kb = 0; kb < NKB; ++kb)
+#pragma unroll
+            for (int c = 0; c < 2; ++c)
+                xs[t & 1][w][kb * 2 + c][l] = float4{s[kb][4 * c], s[kb][4 * c + 1], s[kb][4 * c + 2], s[kb][4 * c + 3]};
+    };
+    auto softmax = [&](int t) {
+#pragma unroll
+        for (int kb = 0; kb < NKB; ++kb)
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                const float4 y = xs[t & 1][w ^ 1][kb * 2 + c][l];
+                s[kb][4 * c] += y.x; s[kb][4 * c + 1] += y.y; s[kb][4 * c + 2] += y.z; s[kb][4 * c + 3] += y.w;
+            }
+        const int key0 = t * NK;
+        if (key0 + NK - 1 > tq0) {   // diagonal tile (uniform)
+#pragma unroll
+            for (int kb = 0; kb < NKB; ++kb)
+#pragma unroll
+                for (int v = 0; v < 8; ++v) if (key0 + kb * 16 + 2 * v + hi > tq) s[kb][v] = -INFINITY;
+        }
+        float mx = -INFINITY;
+#pragma unroll
+        for (int kb = 0; kb < NKB; ++kb)
+#pragma unroll
+            for (int v = 0; v < 8; ++v) mx = fmaxf(mx, s[kb][v]);
+        mx = fmaxf(mx, xch(mx)) * scale_log2;
+        if (__builtin_amdgcn_ballot_w32(mx > m + LAZY)) {   // lazy rescale: p <= 2^LAZY
+            const float mn = fmaxf(m, mx);
+            const float alpha = __builtin_amdgcn_exp2f(m - mn);
+            m = mn;
+            lsum *= alpha;
+#pragma unroll
+            for (int i = 0; i < HDB; ++i) o[i] *= alpha;
+        }
+        float ps = 0.f;
+#pragma unroll
+        for (int kb = 0; kb < NKB; ++kb) {
+#pragma unroll
+            for (int v = 0; v < 8; ++v) { const float p = __builtin_amdgcn_exp2f(fmaf(s[kb][v], scale_log2, -m)); s[kb][v] = p; ps += p; }
+            unsigned u[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                u[i] = __builtin_bit_cast(unsigned, h2{(_Float16) s[kb][2 * i], (_Float16) s[kb][2 * i + 1]});
+                u[4 + i] = xchu(u[i]);
+            }
+            pb[kb] = __builtin_bit_cast(v16h, u);
+        }
+        lsum += ps;
+    };
+
+    const int tl = nt - 1;
+#pragma unroll
+    for (int p = 0; p < PD; ++p)
+#pragma unroll
+        for (int kb = 0; kb < NKB; ++kb) buf[p][kb] = ldk(0, p, kb);
+    for (int t = 0; t < nt; ++t) {
+        s_phase(t, [&](int st) {
+            const int sn = st + PD;
+#pragma unroll
+            for (int kb = 0; kb < NKB; ++kb) buf[sn % (PD + 1)][kb] = sn < 8 ? ldk(t, sn, kb) : ldv(t, sn - 8, kb);
+        });
+        put_s(t);
+        lds_barrier();
+        softmax(t);
+        const int tn = min(t + 1, tl);
+        pv_phase([&](int st) {
+            const int sn = st + PD;
+#pragma unroll
+            for (int kb = 0; kb < NKB; ++kb) buf[sn % (PD + 1)][kb] = sn < 8 ? ldv(t, sn, kb) : ldk(tn, sn - 8, kb);
+        });
+    }
+    lsum += xch(lsum);
+    const float inv = 1.f / lsum;
+    if constexpr (GATED) {
+        const size_t ob = ((size_t) tq * HQ + hq) * D + hd * HDB * 16;
+        (void) 0;
+        const float * grow = gate + (int64_t) tq * sg1 + (int64_t) hq * sg2 + hd * HDB * 16;
+#pragma unroll
+        for (int j = 0; j < HDB; ++j) {
+            // 16 contiguous gate floats of this d-block (16-byte loads); the lane takes the even (hi=0) or odd (hi=1) ones
+            float gv[16];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const float4 g4 = *(const float4 *) (grow + j * 16 + 4 * q);
+                gv[4 * q] = g4.x; gv[4 * q + 1] = g4.y; gv[4 * q + 2] = g4.z; gv[4 * q + 3] = g4.w;
+            }
+            float r[8];
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                const float g = hi ? gv[2 * v + 1] : gv[2 * v];
+                r[v] = (1.0f / (1.0f + expf(-g))) * (o[j][v] * inv);   // op_sigmoid(gate) * O, as unary_gated_op_kernel
+            }
+            // pair up with the other half-wave (lanes 16-31 hold the odd d) so each lane stores 2 adjacent values
+            float rp[8];
+#pragma unroll
+            for (int v = 0; v < 8; ++v) rp[v] = xch(r[v]);
+            // hi=0: d = 2v, 2v+1 for v < 4 ; hi=1: d = 2v, 2v+1 for v >= 4
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int v = hi ? k + 4 : k;
+                const float a = hi ? rp[v] : r[v];      // even d = 2v
+                const float b = hi ? r[v]  : rp[v];     // odd d = 2v + 1
+                const int c = j * 16 + 2 * v;
+                if (O) *(float2 *) (O + ob + c) = make_float2(a, b);
+                if (O16) *(uint32_t *) (O16 + ob + c) = (uint32_t) ggml_cuda_f32_to_act16(a, o16_f16) | ((uint32_t) ggml_cuda_f32_to_act16(b, o16_f16) << 16);
+            }
+        }
+    } else {
+    float * orow = O + ((size_t) tq * HQ + hq) * D + hd * HDB * 16;
+#pragma unroll
+    for (int j = 0; j < HDB; ++j)
+#pragma unroll
+        for (int v = 0; v < 8; ++v) orow[j * 16 + 2 * v + hi] = o[j][v] * inv;
+    }
+#else
+    GGML_UNUSED_VARS(Q, Kp, Vp, O, scale_log2, T, sq1, sq2, gate, sg1, sg2, O16, o16_f16);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// pack K/V (element (d, key, h) at K[key * sk1 + h * sk2 + d], halves) -> Kp / Vp. One block per (16-key block, kv head).
+__global__ void pack_kv(const _Float16 * __restrict__ K, const _Float16 * __restrict__ V, _Float16 * __restrict__ Kp, _Float16 * __restrict__ Vp,
+        const int T, const int64_t sk1, const int64_t sk2, const int64_t sv1, const int64_t sv2) {
+#if defined(FA7_ENABLED)
+    __shared__ _Float16 vs[16][D + 8];
+    const int blk = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    const int db = tid >> 4, r = tid & 15;
+    const size_t ob = ((size_t) h * (T / 16) + blk) * D * 16;
+    const _Float16 * kr = K + (int64_t) (blk * 16 + r) * sk1 + (int64_t) h * sk2 + db * 16;
+    *(u4 *) (Kp + ob + (db * 16 + r) * 16) = *(const u4 *) kr;
+    *(u4 *) (Kp + ob + (db * 16 + r) * 16 + 8) = *(const u4 *) (kr + 8);
+    const _Float16 * vr = V + (int64_t) (blk * 16 + r) * sv1 + (int64_t) h * sv2 + db * 16;
+    *(u4 *) &vs[r][db * 16] = *(const u4 *) vr;
+    *(u4 *) &vs[r][db * 16 + 8] = *(const u4 *) (vr + 8);
+    __syncthreads();
+    _Float16 tmp[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) tmp[j] = vs[j < 8 ? 2 * j : 2 * (j - 8) + 1][db * 16 + r];   // [even keys, odd keys]
+    *(u4 *) (Vp + ob + (db * 16 + r) * 16) = *(const u4 *) tmp;
+    *(u4 *) (Vp + ob + (db * 16 + r) * 16 + 8) = *(const u4 *) (tmp + 8);
+#else
+    GGML_UNUSED_VARS(K, V, Kp, Vp, T, sk1, sk2, sv1, sv2);
+    NO_DEVICE_CODE;
+#endif
+}
+} // namespace fa7
+
+static bool ggml_cuda_fa7_supported(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    static const bool on = getenv("GGML_FA7") ? atoi(getenv("GGML_FA7")) != 0 : FA7_DEFAULT;
+    if (!on) return false;
+    const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3];
+    if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) return false;
+    if (!K || !V || !mask || dst->src[4] || dst->src[5] || dst->src[6] || dst->src[7]) return false;
+    if (!ggml_flash_attn_ext_get_causal_prefix(dst)) return false;   // the kernel applies index-causal masking itself
+    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) return false;
+    const int64_t T = Q->ne[1];
+    if (Q->ne[0] != fa7::D || K->ne[0] != fa7::D || V->ne[0] != fa7::D || Q->ne[2] != fa7::HQ || K->ne[2] != fa7::HKV || V->ne[2] != fa7::HKV) return false;
+    // n_kv == n_q: the ubatch is the whole visible sequence (key j visible to query i iff j <= i)
+    if (K->ne[1] != T || V->ne[1] != T || T < 32 || T % 32 != 0 || (int64_t) T * fa7::D * 2 >= INT32_MAX) return false;
+    if (K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3] || mask->ne[0] != T) return false;
+    float scale, max_bias, softcap;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || softcap != 0.0f) return false;
+    // element strides: d contiguous, 16-byte aligned rows (the packer / Q loads are vectorized)
+    if (Q->nb[0] != 4 || K->nb[0] != 2 || V->nb[0] != 2 || !ggml_is_contiguous(dst)) return false;
+    if (Q->nb[1] % 16 || Q->nb[2] % 16 || K->nb[1] % 16 || K->nb[2] % 16 || V->nb[1] % 16 || V->nb[2] % 16) return false;
+    if (((uintptr_t) Q->data) % 16 || ((uintptr_t) K->data) % 16 || ((uintptr_t) V->data) % 16) return false;
+    return true;
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+// GGML_CUDA_FA_GATE (default on; 0 disables): the gated attention output in the FA epilogue. Same expression per
+// element as cont_sigmoid_mul_v4, so bit-identical (wikitext PPL unchanged at 2048 and 4096 context on gfx1151).
+static bool ggml_cuda_fa_gate_on() {
+    static const bool on = getenv("GGML_CUDA_FA_GATE") ? atoi(getenv("GGML_CUDA_FA_GATE")) != 0 : true;
+    return on;
+}
+
+bool ggml_cuda_qsa_gate_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * fa) {
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_fa_gate_on() && fa->op == GGML_OP_FLASH_ATTN_EXT &&
+        ggml_cuda_flash_attn_ext_qsa_prefill_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa);
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(fa);
+    return false;
+#endif
+}
+
+bool ggml_cuda_fa7_gate_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * fa) {
+    const bool on = ggml_cuda_fa_gate_on();
+    if (!on || fa->op != GGML_OP_FLASH_ATTN_EXT || fa->src[0]->ne[3] != 1) return false;
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_fa7_supported(ctx, fa) &&
+        !ggml_cuda_flash_attn_ext_qsa_decode_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa) &&
+        !ggml_cuda_flash_attn_ext_qsa_prefill_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa);
+#else
+    return false;
+#endif
+}
+
+void ggml_cuda_fa7_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gate, float * out32,
+        uint16_t * dst16, bool dst16_f16) {
+    ggml_cuda_set_device(ctx.device);
+    const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2];
+    cudaStream_t stream = ctx.stream();
+    const int T = (int) Q->ne[1];
+    GGML_ASSERT(Q->ne[3] == 1 && (dst16 != nullptr || out32 != nullptr) && gate->nb[0] == 4);
+    float scale;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    const float scale_log2 = scale * 1.4426950408889634f;
+    const size_t nkv = (size_t) fa7::HKV * T * fa7::D;
+    ggml_cuda_pool_alloc<_Float16> Kp(ctx.pool(), nkv), Vp(ctx.pool(), nkv);
+    const int grid = (T / 16) * fa7::HKV * (fa7::G / fa7::NH);
+    fa7::pack_kv<<<dim3(T / 16, fa7::HKV), 256, 0, stream>>>((const _Float16 *) K->data, (const _Float16 *) V->data, Kp.get(), Vp.get(), T,
+        K->nb[1] / 2, K->nb[2] / 2, V->nb[1] / 2, V->nb[2] / 2);
+    fa7::fa_kernel<true><<<grid, fa7::NTH, 0, stream>>>((const float *) Q->data, Kp.get(), Vp.get(), out32, scale_log2, T, Q->nb[1] / 4, Q->nb[2] / 4,
+        (const float *) gate->data, gate->nb[2] / 4, gate->nb[1] / 4, dst16, dst16_f16);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static void ggml_cuda_fa7(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2];
+    cudaStream_t stream = ctx.stream();
+    const int T = (int) Q->ne[1];
+    float scale;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    const float scale_log2 = scale * 1.4426950408889634f;
+    const size_t nkv = (size_t) fa7::HKV * T * fa7::D;
+    ggml_cuda_pool_alloc<_Float16> Kp(ctx.pool(), nkv), Vp(ctx.pool(), nkv);
+    const int grid = (T / 16) * fa7::HKV * (fa7::G / fa7::NH);
+    for (int64_t s = 0; s < Q->ne[3]; ++s) {
+        const _Float16 * k = (const _Float16 *) ((const char *) K->data + s * K->nb[3]);
+        const _Float16 * v = (const _Float16 *) ((const char *) V->data + s * V->nb[3]);
+        const float * q = (const float *) ((const char *) Q->data + s * Q->nb[3]);
+        float * o = (float *) dst->data + (size_t) s * T * fa7::HQ * fa7::D;
+        fa7::pack_kv<<<dim3(T / 16, fa7::HKV), 256, 0, stream>>>(k, v, Kp.get(), Vp.get(), T,
+            K->nb[1] / 2, K->nb[2] / 2, V->nb[1] / 2, V->nb[2] / 2);
+        fa7::fa_kernel<false><<<grid, fa7::NTH, 0, stream>>>(q, Kp.get(), Vp.get(), o, scale_log2, T, Q->nb[1] / 4, Q->nb[2] / 4);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 #if defined(GGML_USE_HIP)
@@ -800,6 +1164,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (ggml_cuda_flash_attn_ext_qsa_prefill_supported(ctx, dst)) {
         ggml_cuda_flash_attn_ext_qsa_prefill(ctx, dst);
         return;
+    }
+    {
+        const bool fa7_ok = ggml_cuda_fa7_supported(ctx, dst);
+        if (fa7_ok) {
+            ggml_cuda_fa7(ctx, dst);
+            return;
+        }
     }
 #endif
     // a selected-key op without a mask carries its visibility only in src[5], which the dense kernels ignore:

@@ -949,3 +949,165 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         GGML_ABORT("fatal error");
     }
 }
+
+
+// ===== GGML_CUDA_NORM_ROPE_MULTI =====
+// The per-head q/k norm of qwen4exp attention (RMS_NORM -> MUL(w), rms_rows_f32 math: one wave per row, the same
+// reduction tree) followed by its multi-section RoPE (rope_multi math), in one pass: the normalized row stays in
+// registers. NeoX pairing (p, p + n_dims/2) with n_dims % 64 == 0 keeps both elements of a pair in the same lane.
+bool ggml_cuda_norm_rope_multi_enabled() {
+    static const bool v = getenv("GGML_CUDA_NORM_ROPE_MULTI") ? atoi(getenv("GGML_CUDA_NORM_ROPE_MULTI")) != 0 : true;
+    return v;
+}
+
+static __device__ __forceinline__ float nrm_xor_tree(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) { v += __shfl_xor_sync(0xffffffff, v, off, 32); }
+    return v;
+}
+
+template <bool has_ff>
+static __global__ void __launch_bounds__(256) rms_norm_mul_rope_multi_rows(const float * __restrict__ x, const float * __restrict__ w,
+        float * __restrict__ dst, const int ncols, const int ne01, const int ne02, const int total_rows,
+        const int64_t s01, const int64_t s02, const int64_t s03, const int64_t s1, const int64_t s2, const int64_t s3, const float eps,
+        const int n_dims, const int32_t * __restrict__ pos, const float freq_scale, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float theta_scale, const float * __restrict__ freq_factors, const mrope_sections sections,
+        const bool is_imrope) {
+    // one block per token: the rotation angles (same for every head) are computed once into LDS, then each wave
+    // normalizes and rotates heads w, w + 8, ...
+    __shared__ float cs[128], sn[128];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const int i2 = blockIdx.x % ne02;
+    const int i3 = blockIdx.x / ne02;
+    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+    const int sec_w = sections.v[1] + sections.v[0];
+    for (int p = threadIdx.x; p < n_dims / 2; p += blockDim.x) {
+        const int iw = 2 * p;
+        const int sector = (iw / 2) % sect_dims;
+        float theta_base = 0.0;
+        if (is_imrope) {
+            if (sector % 3 == 1 && sector < 3 * sections.v[1]) {
+                theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+            } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {
+                theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+            } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {
+                theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+            } else {
+                theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+            }
+        } else {
+            if (sector < sections.v[0]) {
+                theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+            } else if (sector >= sections.v[0] && sector < sec_w) {
+                theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+            } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+                theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+            } else if (sector >= sec_w + sections.v[2]) {
+                theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+            }
+        }
+        const float freq_factor = has_ff ? freq_factors[iw/2] : 1.0f;
+        float cos_theta;
+        float sin_theta;
+        rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
+        cs[p] = cos_theta;
+        sn[p] = sin_theta;
+    }
+    __syncthreads();
+    const int hw = n_dims / 64;   // waves of rotated pair heads
+    for (int i1 = wid; i1 < ne01; i1 += 8) {
+        const float * xr = x   + i3 * s03 + i2 * s02 + (int64_t) i1 * s01;
+        float       * dr = dst + i3 * s3  + i2 * s2  + (int64_t) i1 * s1;
+        float xv[8];
+        float part[8];
+#pragma unroll
+        for (int wv = 0; wv < 8; ++wv) {
+            const int col = 32 * wv + lane;
+            xv[wv] = col < ncols ? xr[col] : 0.0f;
+            part[wv] = nrm_xor_tree(xv[wv] * xv[wv]);
+        }
+        float v = 0.0f;
+#pragma unroll
+        for (int wv = 0; wv < 8; ++wv) { v = lane == wv ? part[wv] : v; }
+        const float tmp = nrm_xor_tree(v);
+        const float mean = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+        float t[8];
+#pragma unroll
+        for (int wv = 0; wv < 8; ++wv) {
+            const int col = 32 * wv + lane;
+            t[wv] = col < ncols ? scale * xv[wv] * w[col] : 0.0f;
+        }
+#pragma unroll
+        for (int wv = 0; wv < 8; ++wv) {
+            const int col = 32 * wv + lane;
+            if (wv < hw) {
+                const float cos_theta = cs[col], sin_theta = sn[col];
+                float x1 = 0.0f;
+#pragma unroll
+                for (int w2 = 0; w2 < 8; ++w2) { if (w2 == wv + hw) x1 = t[w2]; }
+                const float x0 = t[wv];
+                dr[col]            = x0*cos_theta - x1*sin_theta;
+                dr[col + n_dims/2] = x0*sin_theta + x1*cos_theta;
+            } else if (wv >= 2 * hw && col < ncols) {
+                dr[col] = t[wv];
+            }
+        }
+    }
+    GGML_UNUSED(total_rows);
+}
+
+bool ggml_cuda_norm_rope_multi_ok(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * rope) {
+    if (!ggml_cuda_norm_rope_multi_enabled()) return false;
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || rope->op != GGML_OP_ROPE || rope->src[0] != mul) return false;
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : (mul->src[1] == rms_norm ? mul->src[0] : nullptr);
+    if (!w || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        rope->type != GGML_TYPE_F32 || rope->src[1]->type != GGML_TYPE_I32) return false;
+    if (x->ne[0] > 256 || x->ne[0] % 32 != 0 || x->nb[0] != 4 || !ggml_is_contiguous(w) || w->ne[0] != x->ne[0] ||
+        ggml_nelements(w) != w->ne[0] || !ggml_are_same_shape(rms_norm, mul) || !ggml_are_same_shape(mul, rope)) return false;
+    if (rope->nb[0] != 4 || ggml_nrows(x) >= INT32_MAX / 8) return false;
+    const int n_dims = ((const int32_t *) rope->op_params)[1];
+    const int mode   = ((const int32_t *) rope->op_params)[2];
+    const int n_offs = ((const int32_t *) rope->op_params)[15];
+    if (!(mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION || n_offs != 0) return false;
+    if (n_dims <= 0 || n_dims % 64 != 0 || n_dims > x->ne[0]) return false;
+    // the rope reads the normalized row in place only through registers: dst must not alias the input row of another wave
+    const uintptr_t xa = (uintptr_t) x->data, da = (uintptr_t) rope->data;
+    if (xa && da && !(da + ggml_nbytes(rope) <= xa || xa + ggml_nbytes(x) <= da)) return false;
+    return true;
+}
+
+void ggml_cuda_op_norm_rope_multi(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    const int n_dims     = ((const int32_t *) rope->op_params)[1];
+    const int mode       = ((const int32_t *) rope->op_params)[2];
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    mrope_sections sections;
+    memcpy(&freq_base,   (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
+    memcpy(&sections.v,  (const int32_t *) rope->op_params + 11, sizeof(int)*4);
+    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+    const float theta_scale = powf(freq_base, -2.0f / n_dims);
+    const float * ff = rope->src[2] ? (const float *) rope->src[2]->data : nullptr;
+    const int total = (int) ggml_nrows(x);
+    const dim3 grid((unsigned) (x->ne[2] * x->ne[3]));
+    auto go = [&](auto kern) {
+        kern<<<grid, 256, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) rope->data, (int) x->ne[0],
+            (int) x->ne[1], (int) x->ne[2], total, x->nb[1] / 4, x->nb[2] / 4, x->nb[3] / 4, rope->nb[1] / 4, rope->nb[2] / 4, rope->nb[3] / 4,
+            eps, n_dims, (const int32_t *) rope->src[1]->data, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, ff, sections, is_imrope);
+    };
+    if (ff) go(rms_norm_mul_rope_multi_rows<true>);
+    else    go(rms_norm_mul_rope_multi_rows<false>);
+    CUDA_CHECK(cudaGetLastError());
+}

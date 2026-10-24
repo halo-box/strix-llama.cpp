@@ -57,6 +57,18 @@ struct ggml_cuda_hc_combine_norm_args {
     uint16_t *          res_out_bf16 = nullptr;
     const ggml_tensor * w_inject     = nullptr;   // [hc * n_embd, hc] F32 weight
     ggml_tensor *       out_inject   = nullptr;   // [hc, T] F32, the skipped MUL_MAT node
+    // Fused MoE reduction (sgma): block_out is formed in registers from the routed experts (same expressions as
+    // moe_weighted_reduction_sgma_v4) instead of being read from memory; the reduction kernels are skipped.
+    const ggml_tensor * moe_experts  = nullptr;   // [n_embd, n_used, T] F32, or BF16 in place
+    const ggml_tensor * moe_scale    = nullptr;   // [n_used, T] F32 or null
+    const ggml_tensor * moe_weights  = nullptr;   // [n_used, T] F32
+    const ggml_tensor * moe_gate     = nullptr;   // [T] F32 (pre-sigmoid)
+    const ggml_tensor * moe_shexp    = nullptr;   // [n_embd, T] F32
+    bool                moe_experts_bf16 = false;
+    // int8 copy of out_xn for the W8A8 HC down GEMM: 32 int8 per (32-element block of the flattened [hc*n_embd])
+    // per token, then one f32 scale per (block, token). Layout [kb][t][32] and [kb][t].
+    uint8_t *           out_xn_q8    = nullptr;
+    float *             out_xn_scale = nullptr;
 };
 
 bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);

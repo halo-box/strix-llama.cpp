@@ -1072,7 +1072,8 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
         ggml_type type_k, ggml_type type_v, bool selected_key_attn) {
-    return selected_key_attn && blk_bias && cparams.causal_attn && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
+    GGML_UNUSED(n_stream);   // split streams select per stream (one sequence's cells each)
+    return selected_key_attn && blk_bias && cparams.causal_attn && ratio>1 && hparams.indexer_top_k%ratio==0 &&
         n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
@@ -1223,14 +1224,15 @@ public:
         const auto * attn = mctx->get_attn();
         const bool blocks = attn && qwen4exp_use_block_selection(blk_bias, n_stream, ratio, n_kv,
                 params.ubatch, params.cparams, params.hparams, attn->type_k(), attn->type_v(), mctx->qsa_selected_key_attn());
-        const bool scalar = blocks && params.hparams.n_swa == 0 && mctx->qsa_scalar_visibility(params.ubatch, ratio);
+        const bool scalar = blocks && params.hparams.n_swa == 0 && (n_stream == 1 || n_tps >= 128) &&
+                mctx->qsa_scalar_visibility(params.ubatch, ratio);
         res &= (tail_idxs != nullptr) == scalar;
-        res &= compact == scalar;
+        res &= compact == (scalar && n_stream == 1);
         res &= maskless == scalar;
         if (tail_idxs) { res &= tail_idxs->ne[1] == params.ubatch.n_tokens/n_stream; }
         const int64_t next_strip = qwen4exp_query_strip(params.ubatch.n_tokens/n_stream, n_stream);
         const auto next_limits = qwen4exp_score_key_limits(mctx, params.ubatch, n_blocks, next_strip, ratio,
-                params.hparams.indexer_top_k/ratio, scalar && compact);
+                params.hparams.indexer_top_k/ratio, compact);
         res &= score_strip == next_strip;
         res &= score_key_limits == next_limits;
 
@@ -1388,8 +1390,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const auto * attn_ctx = mctx_hyb->get_attn();
         const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, n_stream, r, n_kv, ubatch, cparams, hparams,
                 attn_ctx->type_k(), attn_ctx->type_v(), mctx_hyb->qsa_selected_key_attn());
-        const bool scalar = blocks && hparams.n_swa == 0 && mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
-        qsa->compact  = scalar;
+        // split streams: only the prefill kernel takes several streams (>= 128 queries each); decode keeps the mask
+        const bool scalar = blocks && hparams.n_swa == 0 && (n_stream == 1 || n_tps >= 128) &&
+                mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
+        qsa->compact  = scalar && n_stream == 1;   // split streams: F32 per-block bias per stream, same tails
         qsa->maskless = scalar;
         qsa->score_strip = qwen4exp_query_strip(n_tps, n_stream);
         qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, n_blocks, qsa->score_strip, r,

@@ -974,6 +974,7 @@ struct ggml_backend_sched_split {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool lazy_realloc_sync; // see ggml_backend_sched_set_lazy_realloc_sync
 
     int n_backends;
 
@@ -1966,9 +1967,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
 
         // the re-allocation may cause the split inputs to be moved to a different address
-        // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
-        for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+        // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy. With lazy_realloc_sync a plan
+        // that keeps every buffer only moves addresses inside them: the free callback set at creation then waits only
+        // when one is replaced.
+        if (!sched->lazy_realloc_sync) {
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
         }
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
@@ -2228,6 +2233,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+    ggml_gallocr_set_free_callback(sched->galloc, [](void * ud) {
+        ggml_backend_sched_t s = (ggml_backend_sched_t) ud;
+        for (int i = 0; i < s->n_backends; i++) {
+            ggml_backend_synchronize(s->backends[i]);
+        }
+    }, sched);
     sched->op_offload = op_offload;
 
     ggml_backend_sched_reset(sched);
@@ -2464,6 +2475,11 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_set_lazy_realloc_sync(ggml_backend_sched_t sched, bool lazy) {
+    GGML_ASSERT(sched);
+    sched->lazy_realloc_sync = lazy;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

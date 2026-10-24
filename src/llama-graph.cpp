@@ -565,8 +565,13 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= can_reuse_causal_prefix(mctx, params);
 
     return res;
+}
+
+bool llm_graph_input_attn_kv::can_reuse_causal_prefix(const llama_kv_cache_context * mctx, const llm_graph_params & params) const {
+    return mctx->is_causal_prefix(params.ubatch, params.cparams.causal_attn) == causal_prefix;
 }
 
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
@@ -1209,6 +1214,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    res &= inp_attn->can_reuse_causal_prefix(mctx->get_attn(), params);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2934,7 +2940,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                float   kq_scale,
                  int   il,
          ggml_tensor * top_k,
-             int64_t   n_kv_raw) const {
+             int64_t   n_kv_raw,
+                bool   causal_prefix) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2978,6 +2985,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (top_k) {
             ggml_flash_attn_ext_add_top_k(cur, top_k, n_kv_raw);
         }
+        ggml_flash_attn_ext_set_causal_prefix(cur, causal_prefix && !top_k && !sinks && !kq_b);
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         if (v_mla) {
@@ -3176,6 +3184,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        inp->causal_prefix = !cparams.training && mctx_cur->is_causal_prefix(ubatch, cparams.causal_attn);
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -3249,7 +3259,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, nullptr, 0, inp->causal_prefix);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

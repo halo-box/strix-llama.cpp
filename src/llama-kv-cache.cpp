@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <thread>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -1725,9 +1726,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
-        for (uint32_t ii = 0; ii < n_tps; ++ii) {
-            const uint32_t i = s*n_tps + ii;
-
+        // fill row i: prev = copy the first row of the sequence (srct) and update only the cells in idxs
+        auto fill_row = [&](const uint32_t i, const bool prev, const uint32_t srct, std::vector<uint32_t> & idxs) {
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
 
             const auto & cells = v_cells.at(seq_to_stream[seq_id]);
@@ -1747,25 +1747,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             // keep track of those cells and shortcut the loop to save time
             // note: this optimization is not compatible with Alibi position encoding
             // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
-            bool prev = false;
-
-            auto & idxs = seq_idxs[seq_id];
-
-            if (!alibi) {
-                if (seq_srct.find(seq_id) != seq_srct.end()) {
-                    const uint32_t srct = seq_srct[seq_id];
-
-                    const uint64_t idst_prev = n_kv*srct;
-
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
-
-                    prev = true;
-                } else {
-                    idxs.clear();
-                    idxs.reserve(ubatch->n_tokens + n_swa + 32);
-
-                    seq_srct[seq_id] = i;
-                }
+            if (prev) {
+                const uint64_t idst_prev = n_kv*srct;
+                std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
             }
 
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
@@ -1839,6 +1823,56 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 skip:
                 data[idst + j] = mask_drop;
             }
+        };
+
+        // the first row of every sequence is filled in full (and records the cells that can differ), the other rows
+        // only copy it and update those cells: they are independent and are filled in parallel for large masks
+        // (ported from asf0/strix-llama.cpp 087fab319). LLAMA_KQ_MASK_THREADS: worker count (default 8, 1 = serial).
+        std::vector<uint32_t> rest;
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            const uint32_t i = s*n_tps + ii;
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+            auto & idxs = seq_idxs[seq_id];
+
+            if (!alibi && seq_srct.find(seq_id) != seq_srct.end()) {
+                rest.push_back(i);
+                continue;
+            }
+            if (!alibi) {
+                idxs.clear();
+                idxs.reserve(ubatch->n_tokens + n_swa + 32);
+                seq_srct[seq_id] = i;
+            }
+            fill_row(i, false, 0, idxs);
+        }
+
+        auto fill_rest = [&](const size_t r0, const size_t r1) {
+            for (size_t r = r0; r < r1; ++r) {
+                const uint32_t i = rest[r];
+                const llama_seq_id seq_id = ubatch->seq_id[i][0];
+                fill_row(i, true, seq_srct.at(seq_id), seq_idxs.at(seq_id));
+            }
+        };
+
+        static const int n_thr_env = getenv("LLAMA_KQ_MASK_THREADS") ? std::max(1, atoi(getenv("LLAMA_KQ_MASK_THREADS"))) : 8;
+        static const int64_t min_elems = getenv("LLAMA_KQ_MASK_MIN") ? atoll(getenv("LLAMA_KQ_MASK_MIN")) : (int64_t) 1 << 20;
+        const int n_thr = (int64_t) rest.size() * n_kv >= min_elems ? n_thr_env : 1;
+        if (n_thr == 1) {
+            fill_rest(0, rest.size());
+        } else {
+            std::vector<std::thread> workers;
+            const size_t per = (rest.size() + n_thr - 1) / n_thr;
+            for (int t = 1; t < n_thr; ++t) {
+                const size_t r0 = std::min(rest.size(), t*per), r1 = std::min(rest.size(), (t + 1)*per);
+                if (r0 < r1) {
+                    workers.emplace_back(fill_rest, r0, r1);
+                }
+            }
+            fill_rest(0, std::min(rest.size(), per));
+            for (auto & w : workers) {
+                w.join();
+            }
         }
     }
 }
@@ -1901,7 +1935,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
     }
 
-    //const int64_t t_start = ggml_time_us();
+    static const bool timing = getenv("LLAMA_KQ_MASK_TIMING") != nullptr;
+    const int64_t t_start = timing ? ggml_time_us() : 0;
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -1921,9 +1956,43 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
     }
 
-    //const int64_t t_end = ggml_time_us();
+    if (timing) {
+        fprintf(stderr, "%s: kq_mask n_tokens=%u n_kv=%lld %.3f ms\n", __func__, n_tokens, (long long) n_kv, (ggml_time_us() - t_start) / 1000.0);
+    }
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+bool llama_kv_cache::is_causal_prefix(const llama_ubatch & ubatch, uint32_t n_kv, uint32_t n_stream, bool causal_attn) const {
+    // see set_input_kq_mask
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+    if (!causal_attn || swa_type != LLAMA_SWA_TYPE_NONE || hparams.use_alibi || !ubatch.pos || !ubatch.seq_id ||
+            n_stream == 0 || ubatch.n_tokens % n_stream != 0 || ubatch.n_tokens / n_stream != n_kv) {
+        return false;
+    }
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const uint32_t     i0     = s*n_kv;
+        const llama_seq_id seq_id = ubatch.seq_id[i0][0];
+        if (seq_id < 0 || seq_id >= (llama_seq_id) seq_to_stream.size()) {
+            return false;
+        }
+        const auto & cells = v_cells[seq_to_stream[seq_id]];
+        if (n_kv > cells.size()) {
+            return false;
+        }
+        for (uint32_t j = 0; j < n_kv; ++j) {
+            const uint32_t i = i0 + j;
+            if (ubatch.seq_id[i][0] != seq_id || (j > 0 && ubatch.pos[i] <= ubatch.pos[i - 1])) {
+                return false;
+            }
+            if (cells.is_empty(j) || !cells.seq_has(j, seq_id) || cells.pos_get(j) != ubatch.pos[i]) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -3068,6 +3137,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::is_causal_prefix(const llama_ubatch & ubatch, bool causal_attn) const {
+    return kv->is_causal_prefix(ubatch, n_kv, (uint32_t) sinfos[i_cur].n_stream(), causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
