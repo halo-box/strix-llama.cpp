@@ -7408,6 +7408,21 @@ struct test_moe_glu_f16 : public test_case {
     double max_nmse_err() override { return 5e-4; }
     uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2 * n_embd * n_ff * n_used * n_tokens; }
 
+    // GGML_VK_TEST_REQUIRE_PAIR_GLU=1: the fused launch must run for q4_K with M % 128 == 0 and K % 256 == 0, and must not run otherwise
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_PAIR_GLU")) {
+            return true;
+        }
+        const bool expect = type_w == GGML_TYPE_Q4_K && n_ff % 128 == 0 && n_embd % 256 == 0;
+        const int64_t n = dispatch_census_count(backend, "path:MUL_MAT_ID_PAIR_SWIGLU");
+        if (expect != (n > 0)) {
+            msg = "MUL_MAT_ID_PAIR_SWIGLU dispatches: " + std::to_string(n) + (expect ? " (expected > 0)" : " (expected 0)");
+            return false;
+        }
+        return true;
+    }
+
     test_moe_glu_f16(ggml_type type_w, ggml_type type_x, int64_t n_embd, int64_t n_ff, int n_expert, int n_used, int64_t n_tokens,
                      bool up_first = false, bool hist = false)
         : type_w(type_w), type_x(type_x), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens),
@@ -14617,6 +14632,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, 512, false, true));
     }
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F32, 512, 256, 32, 8, 65));   // not matched: q4_K only
+    // every weight type: only q4_K may take the fused launch, the rest must fall back and still match
+    for (ggml_type tw : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+                         GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+                         GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+                         GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t nt : { 65, 200 }) {
+            test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 512, 256, 32, 8, nt));
+        }
+    }
+    // ragged M (65, 129 rows) and M % 128 != 0 at 192: q4_K must fall back
+    for (int64_t m : { 65, 129, 192 }) {
+        test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, m, 32, 8, 200));
+        test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 512, m, 32, 8, 513, true));
+    }
+    // Flash-Next expert shape around the 128-token MMB gate, and a full ubatch, for the FN gate/up quant types
+    for (ggml_type tw : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
+        for (int64_t nt : { 127, 128 }) {
+            test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 2560, 640, 512, 10, nt));
+        }
+    }
+    for (ggml_type tw : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 2560, 640, 512, 10, 2048, false, true));
+    }
     test_cases.emplace_back(new test_mul_mat_pair());
     // routed MUL_MAT_ID at the production MoE shapes and quant types; run with --mmb on and off to compare BF16 WMMA vs MMQ
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
