@@ -1692,6 +1692,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         ggml_backend_sched_prepare_inputs(sched.get());
 
+        // the previous ubatch may still be running: on an integrated GPU the device reads host input buffers in place
+        // (no copy to device memory), so writing the inputs below must wait for it, as a rebuilt graph does
+        ggml_backend_sched_synchronize(sched.get());
+
         n_reused++;
     } else {
         // The previous asynchronous graph may still use allocations that reset releases.
