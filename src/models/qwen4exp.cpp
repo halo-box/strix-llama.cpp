@@ -1565,6 +1565,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_build_forward_expand(gf, blk_cells);
         ggml_build_forward_expand(gf, tail_idxs);
     }
+    // the per-block bias of split streams too: a strip reads a strided view of it, and the scheduler would copy each
+    // view of the host input with its whole span (n_stream rows of n_tps queries) and keep every copy of the graph alive
+    ggml_tensor * bias_all = inp->bias;
+    if (!inp->compact && bias_all && n_stream > 1 && strip < n_tps) {
+        bias_all = ggml_cont(ctx0, bias_all);
+        ggml_build_forward_expand(gf, bias_all);
+    }
 
     std::vector<ggml_tensor *> selected;
     for (int64_t first = q_first; first < n_tps; first += strip) {
@@ -1578,8 +1585,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             cb(score_keys, "indexer_k_bounded", il);
         }
         const bool whole = first == 0 && n_query == n_tps;   // one strip: the original tensors, no views
-        ggml_tensor * bias = inp->compact ? nullptr : whole ? inp->bias : ggml_view_3d(ctx0, inp->bias, inp->bias->ne[0], n_query, n_stream,
-                inp->bias->nb[1], inp->bias->nb[2], first*inp->bias->nb[1]);
+        ggml_tensor * bias = inp->compact ? nullptr : whole ? bias_all : ggml_view_3d(ctx0, bias_all, bias_all->ne[0], n_query, n_stream,
+                bias_all->nb[1], bias_all->nb[2], first*bias_all->nb[1]);
         ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : whole ? kq_mask : ggml_view_4d(ctx0, kq_mask,
                 n_kv, n_query, 1, n_stream, kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]);
 
