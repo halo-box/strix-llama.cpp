@@ -2,7 +2,16 @@
 
 typedef short qd_half16 __attribute__((ext_vector_type(16)));
 typedef float qd_float8 __attribute__((ext_vector_type(8)));
+typedef _Float16 qd_half2 __attribute__((ext_vector_type(2)));
 
+// two q8_0 values in the low and high 16 bits of x (byte 0 and byte 2) to packed halves times d.
+// 0x6400 | (q + 128) is 1024 + q + 128 in half, exact, so the product matches dequantize_block_q8_0_f16
+static __device__ __forceinline__ uint32_t qd_q8x2_to_h2(const uint32_t x, const qd_half2 d2) {
+    const qd_half2 v = __builtin_bit_cast(qd_half2, ((x ^ 0x00800080u) & 0x00FF00FFu) | 0x64006400u);
+    return __builtin_bit_cast(uint32_t, (v - qd_half2{(_Float16) 1152, (_Float16) 1152}) * d2);
+}
+
+template <bool q8>
 static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
         const char * q, const char * k, const char * v, const char * mask, const char * ids,
         size_t q1, size_t q2, size_t k1, size_t k2, size_t v1, size_t v2, size_t m1, size_t i1,
@@ -51,8 +60,22 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
             qd_half16 kf = {};
             const int key = keys[r];
             if (key >= 0 && key < nk) {
-                const uint16_t * src = (const uint16_t *) (k + key*k1 + kvh*k2) + 32*w+16*t;
-                kf = __builtin_bit_cast(qd_half16, (uint4[2]){*(const uint4 *)src, *(const uint4 *)(src+8)});
+                if constexpr (q8) {
+                    const auto * blk = (const block_q8_0 *) (k + key*k1 + kvh*k2) + w;
+                    const _Float16 d = __builtin_bit_cast(_Float16, blk->d);
+                    const qd_half2 d2 = qd_half2{d, d};
+                    const uint16_t * qs = (const uint16_t *) blk->qs + 8*t;
+                    uint32_t h[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const uint32_t x = qs[j];
+                        h[j] = qd_q8x2_to_h2((x & 0xFFu) | ((x & 0xFF00u) << 8), d2);
+                    }
+                    kf = __builtin_bit_cast(qd_half16, h);
+                } else {
+                    const uint16_t * src = (const uint16_t *) (k + key*k1 + kvh*k2) + 32*w+16*t;
+                    kf = __builtin_bit_cast(qd_half16, (uint4[2]){*(const uint4 *)src, *(const uint4 *)(src+8)});
+                }
             }
             scores = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf, qf[t], scores);
         }
@@ -94,13 +117,30 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
         const float alpha = alpha_s[r];
         const qd_half16 pf = __builtin_bit_cast(qd_half16, (uint4[2]){
             *(const uint4 *)&probabilities[r][0], *(const uint4 *)&probabilities[r][8]});
+        // q8_0: dims 16*t+r for t=0,1 of the same block convert together as one packed pair
+        uint32_t vpair[16] = {};
+        if constexpr (q8) {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int key = keys[j];
+                if (key >= 0 && key < nk) {
+                    const auto * blk = (const block_q8_0 *) (v + key*v1 + kvh*v2) + w;
+                    const _Float16 d = __builtin_bit_cast(_Float16, blk->d);
+                    vpair[j] = qd_q8x2_to_h2((uint32_t) (uint8_t) blk->qs[r] | ((uint32_t) (uint8_t) blk->qs[16+r] << 16), qd_half2{d, d});
+                }
+            }
+        }
 #pragma unroll
         for (int t = 0; t < 2; ++t) {
             uint16_t values[16];
 #pragma unroll
             for (int j = 0; j < 16; ++j) {
-                const int key = keys[j];
-                values[j] = key >= 0 && key < nk ? *((const uint16_t *)(v+key*v1+kvh*v2)+32*w+16*t+r) : 0;
+                if constexpr (q8) {
+                    values[j] = (uint16_t) (vpair[j] >> (16*t));
+                } else {
+                    const int key = keys[j];
+                    values[j] = key >= 0 && key < nk ? *((const uint16_t *)(v+key*v1+kvh*v2)+32*w+16*t+r) : 0;
+                }
             }
             const qd_half16 vf = __builtin_bit_cast(qd_half16,values);
 #pragma unroll
