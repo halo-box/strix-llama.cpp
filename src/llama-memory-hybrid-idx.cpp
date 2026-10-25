@@ -610,10 +610,14 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
     const bool compact = bias->type == GGML_TYPE_I32;
     float   * dst_bias      = compact ? nullptr : (float *) bias->data;
     int32_t * limits        = compact ? (int32_t *) bias->data : nullptr;
-    if (compact) {
+    // split streams: I32 [n_blocks + n_tps, n_ns], the block starts of the stream's one sequence then its tail starts
+    const bool compact_ms = compact && n_ns > 1;
+    if (compact_ms) {
+        GGML_ASSERT(tail_idxs && blk_bias && bias->ne[0] == n_blocks + n_tps && bias->ne[1] == n_ns);
+    } else if (compact) {
         GGML_ASSERT(tail_idxs && blk_bias && n_ns == 1 && (ggml_nelements(bias) - 2*n_tps) % n_blocks == 0);
     }
-    const int64_t n_seq = compact ? (ggml_nelements(bias) - 2*n_tps) / n_blocks : 1;
+    const int64_t n_seq = compact && !compact_ms ? (ggml_nelements(bias) - 2*n_tps) / n_blocks : 1;
     int32_t * dst_tail = tail_idxs ? (int32_t *) tail_idxs->data : nullptr;
     if (tail_idxs) {
         GGML_ASSERT(blk_bias && r > 1 && ggml_backend_buffer_is_host(tail_idxs->buffer));
@@ -855,7 +859,19 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
             }
         }
 
-        if (compact) {
+        if (compact_ms) {
+            // the stream's queries all belong to its sequence: block b is visible iff its rep cell carries it
+            int32_t * lim = limits + s*(n_blocks + n_tps);
+            std::fill(lim, lim + n_blocks, INT32_MAX);
+            for (int64_t ii=0;ii<n_tps;++ii) {
+                GGML_ASSERT(ubatch->seq_id[s*n_tps + ii][0] == seq_of_stream);
+            }
+            for (int64_t b=0;b<n_bid;++b) {
+                if (cells.seq_has((uint32_t) bid_cell[b], seq_of_stream)) {
+                    lim[b] = bid_idx[b];
+                }
+            }
+        } else if (compact) {
             // one start row per sequence: block b is visible to seq s iff the group's rep cell carries s,
             // so blocks shared by several sequences (seq_cp) stay visible to each of them, as in the masked path.
             // only the rows the queries read are filled
@@ -924,6 +940,11 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
                 }
             }
 
+            if (compact_ms) {
+                GGML_ASSERT(tail_start >= 0 && tail_start <= 16777216);
+                limits[s*(n_blocks + n_tps) + n_blocks + ii] = (int32_t)tail_start;
+                continue;
+            }
             if (compact) {
                 GGML_ASSERT(tail_start >= 0 && tail_start <= 16777216);
                 const int64_t base = n_blocks*n_seq;

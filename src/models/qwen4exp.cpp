@@ -1149,6 +1149,19 @@ static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_
 // layout (row_idx all 0) and produces byte-identical scores.
 static ggml_tensor * qwen4exp_apply_compact_visibility(ggml_context *ctx,ggml_tensor *score,
         ggml_tensor *limits,int64_t blocks,int64_t n_seq,int64_t n_tps,int64_t first,int64_t queries) {
+    if (score->ne[2] > 1) {
+        // split streams hold one sequence each: limits = I32 [blocks + n_tps, n_stream], per stream the start row of
+        // its sequence then the tail start per query (the same test as the F32 per-block bias, 1/n_tps of its size)
+        const int64_t n_stream = score->ne[2];
+        GGML_ASSERT(limits->type==GGML_TYPE_I32 && limits->ne[0]==blocks + n_tps && limits->ne[1]==n_stream &&
+                score->ne[0]<=blocks && score->ne[1]==queries && score->ne[3]==1);
+        auto *starts=ggml_cast(ctx,ggml_view_2d(ctx,limits,score->ne[0],n_stream,limits->nb[1],0),GGML_TYPE_F32);
+        starts=ggml_reshape_3d(ctx,starts,score->ne[0],1,n_stream);
+        auto *tails=ggml_cast(ctx,ggml_view_2d(ctx,limits,queries,n_stream,limits->nb[1],(blocks+first)*sizeof(int32_t)),GGML_TYPE_F32);
+        tails=ggml_reshape_3d(ctx,tails,1,queries,n_stream);
+        auto *visible=ggml_step(ctx,ggml_sub(ctx,ggml_repeat(ctx,tails,score),starts));
+        return ggml_add(ctx,score,ggml_log(ctx,visible));
+    }
     GGML_ASSERT(limits->type==GGML_TYPE_I32 && score->ne[0]<=blocks && score->ne[1]==queries && score->ne[2]==1);
     // one row is broadcast over the queries; several rows are cast first (n_seq x blocks) and then gathered per
     // query, so no pass over the full [blocks, queries] tensor is added
@@ -1259,8 +1272,9 @@ public:
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
         const int64_t n_tps = params.ubatch.n_tokens / n_stream;
-        res &= bias->ne[0]      == (compact ? n_blocks * params.cparams.n_seq_max + 2*n_tps : (blk_bias ? n_blocks : n_kv));
-        res &= compact || bias->ne[1] == params.ubatch.n_tokens/n_stream;
+        res &= bias->ne[0]      == (compact ? (n_stream == 1 ? n_blocks * params.cparams.n_seq_max + 2*n_tps : n_blocks + n_tps)
+                                            : (blk_bias ? n_blocks : n_kv));
+        res &= compact ? bias->ne[1] == (n_stream == 1 ? 1 : n_stream) : bias->ne[1] == params.ubatch.n_tokens/n_stream;
 
         // the selection mode and the strip bounds are baked into the graph, so a reused graph must agree on them
         const auto * attn = mctx->get_attn();
@@ -1269,13 +1283,13 @@ public:
         const bool scalar = blocks && params.hparams.n_swa == 0 && (n_stream == 1 || n_tps >= 128) &&
                 mctx->qsa_scalar_visibility(params.ubatch, ratio);
         res &= (tail_idxs != nullptr) == scalar;
-        res &= compact == (scalar && n_stream == 1);
+        res &= compact == scalar;
         res &= maskless == scalar;
         if (tail_idxs) { res &= tail_idxs->ne[1] == params.ubatch.n_tokens/n_stream; }
         const int64_t next_strip = qwen4exp_score_strip(params.ubatch.n_tokens/n_stream, n_stream, n_blocks,
                 params.hparams.indexer_n_head);
         const auto next_limits = qwen4exp_score_key_limits(mctx, params.ubatch, n_blocks, next_strip, ratio,
-                params.hparams.indexer_top_k/ratio, compact);
+                params.hparams.indexer_top_k/ratio, compact && n_stream == 1);
         res &= score_strip == next_strip;
         res &= score_key_limits == next_limits;
 
@@ -1438,13 +1452,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // split streams: only the prefill kernel takes several streams (>= 128 queries each); decode keeps the mask
         const bool scalar = blocks && hparams.n_swa == 0 && (n_stream == 1 || n_tps >= 128) &&
                 mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
-        qsa->compact  = scalar && n_stream == 1;   // split streams: F32 per-block bias per stream, same tails
+        qsa->compact  = scalar;   // I32 limits: one stream, or split streams of one sequence each
         qsa->maskless = scalar;
         qsa->score_strip = qwen4exp_score_strip(n_tps, n_stream, n_blocks, hparams.indexer_n_head);
         qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, n_blocks, qsa->score_strip, r,
-                hparams.indexer_top_k/r, qsa->compact);
-        qsa->bias = qsa->compact ? ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks*n_seq + 2*n_tps) :
-            ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+                hparams.indexer_top_k/r, qsa->compact && n_stream == 1);
+        qsa->bias = !qsa->compact ? ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream) :
+            n_stream == 1 ? ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blocks*n_seq + 2*n_tps) :
+                            ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks + n_tps, n_stream);
 
         ggml_set_input(qsa->cell_blk);
         ggml_set_input(qsa->blk_cells);
