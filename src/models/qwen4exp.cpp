@@ -280,6 +280,23 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
     }
 
+    // matmuls that read the same input: try the merged [a | b] weight the converter writes, else the separate ones
+    auto create_merged = [&](llm_tensor t_merged, llm_tensor t_a, llm_tensor t_b, int il, int64_t n_in, int64_t n_a, int64_t n_b,
+            int flags, ggml_tensor *& merged, ggml_tensor *& a, ggml_tensor *& b) {
+        if (flags & TENSOR_SKIP) {
+            const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+            create_tensor(tn(t_merged, "weight", il), { n_in, n_a + n_b }, skip | TENSOR_SKIP_IF_VIRTUAL);
+            create_tensor(tn(t_a,      "weight", il), { n_in, n_a },       skip);
+            create_tensor(tn(t_b,      "weight", il), { n_in, n_b },       skip);
+            return;
+        }
+        merged = create_tensor(tn(t_merged, "weight", il), { n_in, n_a + n_b }, flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+        if (!merged) {
+            a = create_tensor(tn(t_a, "weight", il), { n_in, n_a }, flags);
+            b = create_tensor(tn(t_b, "weight", il), { n_in, n_b }, flags);
+        }
+    };
+
     // keep walking the trunk of an MTP-only file so the per-layer bookkeeping still runs, with its tensors absent
 
     for (int il = 0; il < n_layer; ++il) {
@@ -298,13 +315,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // two HC modules per layer: before the token mixer, before the MoE
         layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | trunk_flags);
-        layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, trunk_flags);
         layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, trunk_flags);
-        layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, trunk_flags);
+        create_merged(LLM_TENSOR_HC_ATTN_DOWN_INJECT, LLM_TENSOR_HC_ATTN_DOWN, LLM_TENSOR_HC_ATTN_INJECT, il, hc_dim, hc_lr, hc,
+                trunk_flags, layer.hc_attn_down_inject, layer.hc_attn_down, layer.hc_attn_inject);
         layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | trunk_flags);
-        layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, trunk_flags);
         layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, trunk_flags);
-        layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, trunk_flags);
+        create_merged(LLM_TENSOR_HC_FFN_DOWN_INJECT, LLM_TENSOR_HC_FFN_DOWN, LLM_TENSOR_HC_FFN_INJECT, il, hc_dim, hc_lr, hc,
+                trunk_flags, layer.hc_ffn_down_inject, layer.hc_ffn_down, layer.hc_ffn_inject);
 
         if (!hparams.is_recr(il)) {
             // full attention: wq holds [q|gate] interleaved per head
@@ -320,13 +337,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il), { idx_dim }, trunk_flags);
             layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il), { idx_dim }, trunk_flags);
         } else {
-            layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", il), { n_embd, key_dim * 2 + value_dim }, trunk_flags);
-            layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", il), { n_embd, value_dim }, trunk_flags);
+            create_merged(LLM_TENSOR_ATTN_QKV_GATE, LLM_TENSOR_ATTN_QKV, LLM_TENSOR_ATTN_GATE, il, n_embd, key_dim * 2 + value_dim, value_dim,
+                    trunk_flags, layer.wqkv_z, layer.wqkv, layer.wqkv_gate);
             layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { hparams.ssm_d_conv, conv_dim }, trunk_flags);
             layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   il), { hparams.ssm_dt_rank }, trunk_flags);
             layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         il), { hparams.ssm_dt_rank }, trunk_flags);
-            layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", il), { n_embd, n_v_heads }, trunk_flags);
-            layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", il), { n_embd, n_v_heads }, trunk_flags);
+            create_merged(LLM_TENSOR_SSM_BETA_ALPHA_CAT, LLM_TENSOR_SSM_BETA, LLM_TENSOR_SSM_ALPHA, il, n_embd, n_v_heads, n_v_heads,
+                    trunk_flags, layer.ssm_beta_alpha_cat, layer.ssm_beta, layer.ssm_alpha);
             layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", il), { head_v_dim }, trunk_flags);
             layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", il), { value_dim, n_embd }, trunk_flags);
         }
@@ -361,13 +378,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const int64_t idx_dim    = hparams.indexer_head_size;
 
         layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | flags);
-        layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, flags);
         layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, flags);
-        layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, flags);
+        create_merged(LLM_TENSOR_HC_ATTN_DOWN_INJECT, LLM_TENSOR_HC_ATTN_DOWN, LLM_TENSOR_HC_ATTN_INJECT, il, hc_dim, hc_lr, hc,
+                flags, layer.hc_attn_down_inject, layer.hc_attn_down, layer.hc_attn_inject);
         layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | flags);
-        layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, flags);
         layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, flags);
-        layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, flags);
+        create_merged(LLM_TENSOR_HC_FFN_DOWN_INJECT, LLM_TENSOR_HC_FFN_DOWN, LLM_TENSOR_HC_FFN_INJECT, il, hc_dim, hc_lr, hc,
+                flags, layer.hc_ffn_down_inject, layer.hc_ffn_down, layer.hc_ffn_inject);
 
         create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
         layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
@@ -533,7 +550,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur    = build_hc_mix(inpL,
-            layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
+            layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, layer.hc_attn_down_inject, &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
 
     // sparse attention for the draft when its context carries an indexer cache (the sidecar ships the
@@ -546,7 +563,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(inpL, "mtp_hc_attn_post", il);
 
     cur = build_hc_mix(inpL,
-            layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
+            layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, layer.hc_ffn_down_inject, &inject, il);
     cb(cur, "mtp_hc_ffn_pre", il);
 
     cur = build_layer_ffn(cur, il);
@@ -572,7 +589,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cur = build_hc_mix(inpL,
                        own_mix ? layer.nextn.hc_head_norm : model.hc_head_norm,
                        own_mix ? layer.nextn.hc_head_down : model.hc_head_down,
-                       own_mix ? layer.nextn.hc_head_up   : model.hc_head_up, nullptr, nullptr, -1);
+                       own_mix ? layer.nextn.hc_head_up   : model.hc_head_up, nullptr, nullptr, nullptr, -1);
     cb(cur, "mtp_hc_head", -1);
 
     // no res->t_embd: it is n_embd wide, but the context sizes that buffer by n_embd_out.
@@ -638,7 +655,7 @@ static bool qwen4exp_has_bf16_matmul_weight(const llama_model & model) {
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 
-// bf16 twins: decode reads the f32 router / ssm_alpha / ssm_beta / hc inject weights whole once per token as mat-vecs. Where
+// bf16 twins: decode reads the f32 router / ssm_alpha / ssm_beta / hc inject weights (or their merged forms) whole once per token as mat-vecs. Where
 // every value is bf16-exact (lower 16 bits zero), a bf16 copy on the weight's buffer type halves the bytes with identical values.
 bool llama_model_qwen4exp::load_tensors(llama_model_loader & ml) {
     if (!llama_model_base::load_tensors(ml)) {
@@ -660,7 +677,8 @@ void llama_model_qwen4exp::load_bf16_twins() {
     std::vector<ggml_bf16_t> dst;
     std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> by_buft;
     for (const auto & layer : layers) {
-        for (ggml_tensor * t : { layer.ffn_gate_inp, layer.ssm_alpha, layer.ssm_beta, layer.hc_attn_inject, layer.hc_ffn_inject }) {
+        for (ggml_tensor * t : { layer.ffn_gate_inp, layer.ssm_alpha, layer.ssm_beta, layer.ssm_beta_alpha_cat, layer.hc_attn_inject,
+                                 layer.hc_ffn_inject, layer.hc_attn_down_inject, layer.hc_ffn_down_inject }) {
             if (t == nullptr || t->type != GGML_TYPE_F32) {
                 continue;
             }
@@ -733,6 +751,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  w_down,
         ggml_tensor *  w_up,
         ggml_tensor *  w_inject,
+        ggml_tensor *  w_down_inject,
         ggml_tensor ** inject,
         int            il) {
     const int64_t hc     = hparams.dsv4_hc_mult;
@@ -770,20 +789,37 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = xn_padded ? ggml_view_2d(ctx0, xn, hc_dim, nt, xn->nb[2], 0) : ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, norm_f16 ? "hc_norm_f16" : "hc_norm", il);
 
-    if (inject) {
-        *inject = build_lora_mm(qwen4exp_dec_weight(model, w_inject, nt, loras->empty()), xn);
+    ggml_tensor * lo = nullptr;
+    if (inject && w_down_inject) {
+        // merged layout: one matmul for both, the hc_down rows then the hc_inject rows. inject is a view of the
+        // unscaled rows, as the separate inject matmul writes them (build_hc_combine scales it)
+        const int64_t n_lo = w_down_inject->ne[1] - hc;
+        ggml_tensor * lo_inject = build_lora_mm(qwen4exp_dec_weight(model, w_down_inject, nt, loras->empty()), xn);
+        cb(lo_inject, "hc_down_inject", il);
+        if (norm_f16) {
+            res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, lo_inject, il});
+        }
+        *inject = ggml_view_2d(ctx0, lo_inject, hc, nt, lo_inject->nb[1], ggml_row_size(lo_inject->type, n_lo));
         cb(*inject, "hc_inject", il);
         ggml_build_forward_expand(gf, *inject);
-        if (norm_f16) {
-            res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, *inject, il});
-        }
-    }
-    ggml_tensor * lo = build_lora_mm(w_down, xn);
-    if (norm_f16) {
-        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, lo, il});
-    }
-    if (inject) {
+        lo = ggml_view_2d(ctx0, lo_inject, n_lo, nt, lo_inject->nb[1], 0);
         ggml_build_forward_expand(gf, lo);
+    } else {
+        if (inject) {
+            *inject = build_lora_mm(qwen4exp_dec_weight(model, w_inject, nt, loras->empty()), xn);
+            cb(*inject, "hc_inject", il);
+            ggml_build_forward_expand(gf, *inject);
+            if (norm_f16) {
+                res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, *inject, il});
+            }
+        }
+        lo = build_lora_mm(w_down, xn);
+        if (norm_f16) {
+            res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, lo, il});
+        }
+        if (inject) {
+            ggml_build_forward_expand(gf, lo);
+        }
     }
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
@@ -931,6 +967,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_attn_down,
                 model.layers[il].hc_attn_up,
                 model.layers[il].hc_attn_inject,
+                model.layers[il].hc_attn_down_inject,
                 &inject, il);
 
         ggml_build_forward_expand(gf, cur);
@@ -977,6 +1014,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_ffn_down,
                 model.layers[il].hc_ffn_up,
                 model.layers[il].hc_ffn_inject,
+                model.layers[il].hc_ffn_down_inject,
                 &inject, il);
 
         cur = build_layer_ffn(cur, il);
@@ -1011,7 +1049,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,
             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
-            nullptr, nullptr, -1);
+            nullptr, nullptr, nullptr, -1);
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
@@ -1028,6 +1066,23 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                         int   il) {
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    if (model.layers[il].wqkv_z) {
+        // qkv and z read the same input: one matmul, then the qkv rows and the z rows
+        ggml_tensor * qkvz = build_lora_mm(model.layers[il].wqkv_z, input);
+        cb(qkvz, "linear_attn_qkvz", il);
+
+        const int64_t n_z   = hparams.ssm_d_state * hparams.ssm_dt_rank;
+        const int64_t n_qkv = qkvz->ne[0] - n_z;
+
+        ggml_tensor * qkv_mixed = ggml_view_3d(ctx0, qkvz, n_qkv, n_seq_tokens, n_seqs, qkvz->nb[1], qkvz->nb[1] * n_seq_tokens, 0);
+        cb(qkv_mixed, "linear_attn_qkv_mixed", il);
+
+        ggml_tensor * z = ggml_view_2d(ctx0, qkvz, n_z, n_seq_tokens * n_seqs, qkvz->nb[1], ggml_row_size(qkvz->type, n_qkv));
+        cb(z, "z", il);
+
+        return { qkv_mixed, z };
+    }
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
@@ -2003,12 +2058,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(qwen4exp_dec_weight(model, model.layers[il].ssm_beta, n_tokens, loras->empty()), cur, model.layers[il].ssm_beta_s);
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    ggml_tensor * beta  = nullptr;
+    ggml_tensor * alpha = nullptr;
+    if (model.layers[il].ssm_beta_alpha_cat) {
+        // merged layout: beta and alpha read the same input, one matmul, then the beta rows and the alpha rows
+        ggml_tensor * ba = build_lora_mm(qwen4exp_dec_weight(model, model.layers[il].ssm_beta_alpha_cat, n_tokens, loras->empty()), cur);
+        cb(ba, "beta_alpha", il);
+
+        beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
+                ggml_element_size(ba), ba->nb[1], ba->nb[1] * n_seq_tokens, 0);
+        alpha = ggml_view_3d(ctx0, ba, num_v_heads, n_seq_tokens, n_seqs,
+                ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
+    } else {
+        beta = build_lora_mm(qwen4exp_dec_weight(model, model.layers[il].ssm_beta, n_tokens, loras->empty()), cur, model.layers[il].ssm_beta_s);
+        beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
     cb(beta, "beta", il);
 
-    ggml_tensor * alpha = build_lora_mm(qwen4exp_dec_weight(model, model.layers[il].ssm_alpha, n_tokens, loras->empty()), cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    if (alpha == nullptr) {
+        alpha = build_lora_mm(qwen4exp_dec_weight(model, model.layers[il].ssm_alpha, n_tokens, loras->empty()), cur, model.layers[il].ssm_alpha_s);
+        alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+    }
     cb(alpha, "alpha", il);
 
     // emit the two small projections ahead of the recurrence so that the elementwise chain
@@ -2103,7 +2173,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
-    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    // merged layout: z is a row-strided view of the qkv+z matmul
+    ggml_tensor * z_2d = ggml_is_contiguous(z) ? ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+                                               : ggml_view_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+                                                     ggml_row_size(z->type, head_v_dim), z->nb[1], z->nb[1] * n_seq_tokens, 0);
 
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
