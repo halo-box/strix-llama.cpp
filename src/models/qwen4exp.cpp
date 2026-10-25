@@ -1094,7 +1094,7 @@ static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t 
 // Complete-block selection: pick indexer_top_k/ratio whole blocks that lie before the query's own block and
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
 // selected rows then carry the visibility themselves, so attention can run without a mask. Only the selected-key
-// attention kernels understand that layout (F16 K/V, head 256, single stream; qsa_decode takes 1..512 queries,
+// attention kernels understand that layout (F16 or Q8_0 K/V, head 256, single stream; qsa_decode takes 1..512 queries,
 // qsa_prefill larger ubatches). The HIP backend (RDNA3.5) and Vulkan (flash_attn_sel) have them, so the selection needs
 // selected_key_attn (all QSA layers run there). Dense kernels do not read the list: ggml-cuda aborts, Vulkan declines.
 // The depth bound mirrors GGML_QSA_MAX_KEYS of the HIP kernels for every backend (Vulkan flash_attn_sel goes to ~8M keys but takes the masked route above 1M too).
@@ -1104,12 +1104,12 @@ static_assert(QSA_MASKLESS_MAX_KV % 4 == 0, "qsa_prefill requires a multiple-of-
 // split streams select per stream (one sequence's cells each); depth_warn is null where the decision is only re-checked
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
-        ggml_type type_k, ggml_type type_v, bool selected_key_attn, std::once_flag * depth_warn) {
+        ggml_type type_k, ggml_type type_v, bool selected_key_attn, bool selected_key_q8, std::once_flag * depth_warn) {
     const bool eligible = selected_key_attn && blk_bias && cparams.causal_attn && ratio>1 && hparams.indexer_top_k%ratio==0 &&
         n_kv>hparams.indexer_top_k+ratio-1 && ubatch.token &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
         !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
-        type_k==GGML_TYPE_F16 && type_v==GGML_TYPE_F16;
+        (type_k==GGML_TYPE_F16 || (type_k==GGML_TYPE_Q8_0 && selected_key_q8)) && type_v==type_k;
     if (eligible && n_kv > QSA_MASKLESS_MAX_KV && depth_warn) {
         // the masked route keeps full [n_kv, n_tokens] masks: the reserve can fail with no other hint
         const int64_t n_tokens = ubatch.n_tokens;
@@ -1279,7 +1279,7 @@ public:
         // the selection mode and the strip bounds are baked into the graph, so a reused graph must agree on them
         const auto * attn = mctx->get_attn();
         const bool blocks = attn && qwen4exp_use_block_selection(blk_bias, ratio, n_kv,
-                params.ubatch, params.cparams, params.hparams, attn->type_k(), attn->type_v(), mctx->qsa_selected_key_attn(), nullptr);
+                params.ubatch, params.cparams, params.hparams, attn->type_k(), attn->type_v(), mctx->qsa_selected_key_attn(), mctx->qsa_selected_key_q8(), nullptr);
         const bool scalar = blocks && params.hparams.n_swa == 0 && (n_stream == 1 || n_tps >= 128) &&
                 mctx->qsa_scalar_visibility(params.ubatch, ratio);
         res &= (tail_idxs != nullptr) == scalar;
@@ -1447,7 +1447,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         const auto * attn_ctx = mctx_hyb->get_attn();
         const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, r, n_kv, ubatch, cparams, hparams,
-                attn_ctx->type_k(), attn_ctx->type_v(), mctx_hyb->qsa_selected_key_attn(),
+                attn_ctx->type_k(), attn_ctx->type_v(), mctx_hyb->qsa_selected_key_attn(), mctx_hyb->qsa_selected_key_q8(),
                 &static_cast<const llama_model_qwen4exp &>(model).qsa_depth_warn_once);
         // split streams: only the prefill kernel takes several streams (>= 128 queries each); decode keeps the mask
         const bool scalar = blocks && hparams.n_swa == 0 && (n_stream == 1 || n_tps >= 128) &&
@@ -1601,10 +1601,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             cb(score_keys, "indexer_k_bounded", il);
         }
         const bool whole = first == 0 && n_query == n_tps;   // one strip: the original tensors, no views
-        ggml_tensor * bias = inp->compact ? nullptr : whole ? bias_all : ggml_view_3d(ctx0, bias_all, bias_all->ne[0], n_query, n_stream,
-                bias_all->nb[1], bias_all->nb[2], first*bias_all->nb[1]);
-        ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : whole ? kq_mask : ggml_view_4d(ctx0, kq_mask,
-                n_kv, n_query, 1, n_stream, kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]);
+        // the same view in every layer, see strip_views
+        const auto strip_view = [&](ggml_tensor * src, auto make) {
+            ggml_tensor *& view = strip_views[{src, first}];
+            if (view == nullptr) {
+                view = make();
+            }
+            return view;
+        };
+        ggml_tensor * bias = inp->compact ? nullptr : whole ? bias_all : strip_view(bias_all, [&] {
+            return ggml_view_3d(ctx0, bias_all, bias_all->ne[0], n_query, n_stream,
+                    bias_all->nb[1], bias_all->nb[2], first*bias_all->nb[1]); });
+        ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : whole ? kq_mask : strip_view(kq_mask, [&] {
+            return ggml_view_4d(ctx0, kq_mask, n_kv, n_query, 1, n_stream,
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]); });
 
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
         // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s

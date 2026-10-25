@@ -115,12 +115,16 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // the QSA layers must all run where a kernel reads the selection list: a backend that takes the probe op
         // (ggml-cuda: the HIP QSA kernels on RDNA3.5)
         bool all = true, any = false;
+        // only the HIP kernels read q8_0 K/V, so q8_0 needs every QSA layer on ROCm
+        bool rocm = true;
         for (int il = 0; il < (int) model.hparams.n_layer_all; ++il) {
             if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] <= 0) { continue; }
             any = true;
+            rocm = rocm && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il))), "ROCm") == 0;
             all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il);
         }
         selected_key_attn = any && all && offload;
+        selected_key_q8 = selected_key_attn && rocm;
         if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) { selected_key_attn = atoi(e) != 0; }
         LLAMA_LOG_INFO("%s: QSA attention: %s\n", __func__, selected_key_attn ?
             "selected-key kernels (maskless block selection)" : "masked top-k (no selected-key kernels on this backend)");
