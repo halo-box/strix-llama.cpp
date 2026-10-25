@@ -7389,6 +7389,76 @@ struct test_moe_prefill : public test_case {
     }
 };
 
+// The routed gate/up projections of an f16 MoE block (build_moe_ffn with fused_moe_f16): MUL_MAT_ID -> CPY(f16) for up and
+// gate, then SWIGLU(gate, up). Vulkan fuses the five nodes into one launch (MUL_MAT_ID_PAIR_SWIGLU, q4_K). up_first: the up
+// projection is expanded first (the other graph order). hist: the measured Flash-Next routing histogram of test_moe_prefill
+// (512 experts, 10 used), else uniform random distinct experts.
+struct test_moe_glu_f16 : public test_case {
+    const ggml_type type_w;
+    const ggml_type type_x;
+    const int64_t n_embd, n_ff;
+    const int n_expert, n_used;
+    const int64_t n_tokens;
+    const bool up_first;
+    const bool hist;
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_GLU_F16"; }
+    std::string vars() override { return VARS_TO_STR9(type_w, type_x, n_embd, n_ff, n_expert, n_used, n_tokens, up_first, hist); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2 * n_embd * n_ff * n_used * n_tokens; }
+
+    test_moe_glu_f16(ggml_type type_w, ggml_type type_x, int64_t n_embd, int64_t n_ff, int n_expert, int n_used, int64_t n_tokens,
+                     bool up_first = false, bool hist = false)
+        : type_w(type_w), type_x(type_x), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens),
+          up_first(up_first), hist(hist) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_tokens);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+        ggml_tensor * x  = ggml_new_tensor_3d(ctx, type_x, n_embd, 1, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * uw = ggml_new_tensor_3d(ctx, type_w, n_embd, n_ff, n_expert);
+        ggml_tensor * gw = ggml_new_tensor_3d(ctx, type_w, n_embd, n_ff, n_expert);
+        ggml_set_name(uw, "up_exps");
+        ggml_set_name(gw, "gate_exps");
+        ggml_tensor * up = ggml_cast(ctx, ggml_mul_mat_id(ctx, uw, x, ids), GGML_TYPE_F16);
+        if (up_first && gf) {
+            ggml_build_forward_expand(gf, up);
+        }
+        ggml_tensor * gate = ggml_cast(ctx, ggml_mul_mat_id(ctx, gw, x, ids), GGML_TYPE_F16);
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        if (!hist) {
+            init_mul_mat_id_tensors(ctx, n_expert);
+            return;
+        }
+        GGML_ASSERT(n_expert == 512 && n_used == 10);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) continue;
+            if (t->type != GGML_TYPE_I32) { init_tensor_uniform(t); continue; }
+            // test_moe_prefill's histogram {0:105, 1-15:134, 16-31:61, 32-63:72, 64-127:69, 128-255:39, 256-511:18, >=512:14}
+            const int bins[8][3] = {{0,0,105},{1,15,134},{16,31,61},{32,63,72},{64,127,69},{128,255,39},{256,511,18},{512,1480,14}};
+            std::vector<int> cnt;
+            for (auto & b : bins) for (int i = 0; i < b[2]; ++i) cnt.push_back(b[0] + (b[2] > 1 ? (b[1] - b[0]) * i / (b[2] - 1) : 0));
+            const int64_t total = 10 * n_tokens; int64_t sum = 0; for (int c : cnt) sum += c;
+            for (int & c : cnt) c = (int) ((int64_t) c * total / sum);
+            sum = 0; for (int c : cnt) sum += c; cnt[511] += (int) (total - sum);
+            GGML_ASSERT(cnt[511] <= n_tokens);
+            std::vector<int> perm(512); for (int i = 0; i < 512; ++i) perm[i] = (i * 197) % 512;
+            std::vector<int> slots; for (int e = 0; e < 512; ++e) for (int i = 0; i < cnt[e]; ++i) slots.push_back(perm[e]);
+            std::vector<int32_t> data(512 * n_tokens, 0);
+            for (int64_t tok = 0; tok < n_tokens; ++tok) for (int j = 0; j < 10; ++j) data[tok * 512 + j] = slots[tok + j * n_tokens];
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+        }
+    }
+};
+
 // f16 MoE activations as build_moe_ffn emits them with fused_moe_f16. part: 0 the whole block, 1 up/gate + casts,
 // 2 down (+ MUL) + cast from an f16 B, 3 the f32 combine of the f16 slices
 struct test_moe_f16 : public test_case {
@@ -14537,6 +14607,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_prefill(true, 512, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(true, 513, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(false, 512, GGML_TYPE_Q5_1));
+    // MUL_MAT_ID_PAIR_SWIGLU: both graph orders, f32 / f16 activations, token counts around the 64-row tile
+    for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (bool up_first : { false, true }) {
+            for (int64_t nt : { 9, 63, 64, 65, 200 }) {
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 512, 256, 32, 8, nt, up_first));
+            }
+        }
+        test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, 512, false, true));
+    }
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F32, 512, 256, 32, 8, 65));   // not matched: q4_K only
     test_cases.emplace_back(new test_mul_mat_pair());
     // routed MUL_MAT_ID at the production MoE shapes and quant types; run with --mmb on and off to compare BF16 WMMA vs MMQ
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
@@ -16008,6 +16088,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     if (getenv("GGML_PERF_MOE")) {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
         test_cases.emplace_back(new test_moe_prefill(false, 4096));
+        // the Flash-Next routed gate/up + SwiGLU at ub2048 / ub4096: measured routing and uniform routing
+        for (int64_t nt : { 2048, 4096 }) {
+            for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, true));
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, false));
+            }
+        }
         return test_cases;
     }
 
