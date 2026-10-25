@@ -117,14 +117,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // and with the cache's K/V types (they read this cache)
         const bool kv_f16 = type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16;
         bool all = true, all_typed = true, any = false;
+        // only the HIP kernels read q8_0 K/V, so q8_0 needs every QSA layer on ROCm
+        bool rocm = true;
         for (int il = 0; il < (int) model.hparams.n_layer_all; ++il) {
             if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] <= 0) { continue; }
             any = true;
+            rocm = rocm && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il))), "ROCm") == 0;
             all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il, GGML_TYPE_F16, GGML_TYPE_F16);
             all_typed = all_typed && (kv_f16 || qsa_selected_key_supported(model.dev_layer(il), model.hparams, il, type_k, type_v));
         }
         const bool kernels = any && all && offload;
         selected_key_attn = kernels && all_typed;
+        selected_key_q8 = selected_key_attn && rocm;
         if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) { selected_key_attn = atoi(e) != 0; }
         if (selected_key_attn) {
             LLAMA_LOG_INFO("%s: QSA attention: selected-key kernels (maskless block selection), K/V cache %s/%s\n", __func__,
