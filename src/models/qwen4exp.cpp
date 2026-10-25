@@ -1078,15 +1078,14 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
     return n_stream == 1 ? std::min<int64_t>(n_tokens, 512) : n_tokens;
 }
 
-// The indexer raw score F32 [n_blocks, n_idx_h, strip] and its ReLU grow with the context (2 x 2 GiB at 1M keys): halve the strip while the raw score exceeds 2^27 elements, down to 64 queries.
+// The indexer raw score F32 [n_blocks, n_idx_h, strip, n_stream] and its ReLU grow with the context (2 x 2 GiB at 1M keys, or with four 262144-key streams): halve the strip while the raw score exceeds 2^27 elements, down to 64 queries.
 // 2^27 is the raw score at 262144 keys for Qwen3.8 Flash Next (ratio 4, 4 indexer heads, strip 512), so shorter contexts keep 512.
 // Halves of 512 divide the q_first of the last-layer trim; a shorter ubatch has q_first = 0.
 static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t n_blocks, int64_t n_idx_h) {
     int64_t strip = qwen4exp_query_strip(n_tokens, n_stream);
-    if (n_stream != 1) {
-        return strip;
-    }
-    while (strip >= 128 && n_blocks * n_idx_h * strip > ((int64_t) 1 << 27)) {
+    // split KV streams score all streams in one GEMM per strip ([n_blocks, n_idx_h * strip, n_stream]): the bound
+    // counts them all. Their selection never trims the first queries (q_first = 0), so any strip divides it.
+    while (strip >= 128 && n_stream * n_blocks * n_idx_h * strip > ((int64_t) 1 << 27)) {
         strip = (strip + 1) / 2;
     }
     return strip;
