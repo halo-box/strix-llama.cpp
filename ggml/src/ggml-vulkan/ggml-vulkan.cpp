@@ -18894,6 +18894,13 @@ static bool ggml_vk_can_fuse_mmid_pair_glu(ggml_backend_vk_context * ctx, const 
     if (glu->type != GGML_TYPE_F16 || !ggml_is_contiguous(glu) || glu->ne[0] != M || glu->ne[1] != n_used || glu->ne[2] != T) {
         return reject("SWIGLU output is not a contiguous f16 [M, n_used, T]");
     }
+    // the launch reads the weights, the activations and the ids while it writes the SWIGLU output, and graph_compute's fused-write
+    // overlap check skips leaf sources (op NONE): a scheduler-allocated graph can place the output over a dead leaf
+    for (const ggml_tensor * src : { w_a, w_b, x, ids }) {
+        if (glu->buffer && src->buffer && ggml_vk_tensors_overlap(src, glu, false)) {
+            return reject("the SWIGLU output overlaps a weight, the activations or the ids");
+        }
+    }
     // the GEMM results and the casts are read only inside the fusion (a cast also lists itself as src[1])
     if ((mm_a->flags & GGML_TENSOR_FLAG_OUTPUT) || (mm_b->flags & GGML_TENSOR_FLAG_OUTPUT) || (cp_a->flags & GGML_TENSOR_FLAG_OUTPUT) ||
         (cp_b->flags & GGML_TENSOR_FLAG_OUTPUT) || cp_a->view_src || cp_b->view_src || cp_a->src[1] != cp_a || cp_b->src[1] != cp_b ||
