@@ -4026,6 +4026,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_Q8_0_ROCMFPX],  "get_rows_rocmfpx_fp8_f32",  get_rows_rocmfpx_fp8_f32_len,  get_rows_rocmfpx_fp8_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_MXFP4],   "get_rows_mxfp4_f32",   get_rows_mxfp4_f32_len,   get_rows_mxfp4_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_NVFP4],   "get_rows_nvfp4_f32",   get_rows_nvfp4_f32_len,   get_rows_nvfp4_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_narrow[GGML_TYPE_F32 ], "get_rows_narrow_f32_f32",  get_rows_narrow_f32_f32_len,  get_rows_narrow_f32_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_narrow[GGML_TYPE_F16 ], "get_rows_narrow_f16_f32",  get_rows_narrow_f16_f32_len,  get_rows_narrow_f16_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_narrow[GGML_TYPE_BF16], "get_rows_narrow_bf16_f32", get_rows_narrow_bf16_f32_len, get_rows_narrow_bf16_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_narrow[GGML_TYPE_I32 ], "get_rows_narrow_i32",      get_rows_narrow_i32_len,      get_rows_narrow_i32_data,      "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1);
+
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_back_f32, "get_rows_back_f32", get_rows_back_f32_len, get_rows_back_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
@@ -12787,6 +12793,13 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
         } break;
     case GGML_OP_GET_ROWS:
+        if (pipeline_override) {
+            // only the narrow path overrides: one invocation per dst element, at most 65535 groups (the shader loops past that), so
+            // the loop runs the same on every device
+            const uint64_t max_x = (uint64_t) std::min(ctx->device->properties.limits.maxComputeWorkGroupCount[0], 65535u) * pipeline->wg_denoms[0];
+            elements = { (uint32_t) std::min<uint64_t>(ggml_nelements(dst), max_x), 1, 1 };
+            break;
+        }
         elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
         elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
         elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
@@ -13068,19 +13081,50 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     }
 }
 
+// GET_ROWS_NARROW: rows of at most this many elements take get_rows_narrow.comp (many rows per workgroup). GGML_VK_GET_ROWS_NARROW=0
+// disables it, GGML_VK_GET_ROWS_NARROW_MAX=n sets the width (for timing). Width 128: test-backend-ops perf on gfx1151 (RADV, Mesa 26.2.4,
+// 2026-10-26), f32 rows from [n, 8192] x 32768 rows: narrow wins at n <= 128 (n=128 59 vs 93 us), loses at n=256 (174 vs 168 us).
+static uint32_t ggml_vk_get_rows_narrow_max() {
+    static const uint32_t max_width = [] {
+        const char * e = getenv("GGML_VK_GET_ROWS_NARROW");
+        if (e != nullptr && atoi(e) == 0) {
+            return 0u;
+        }
+        const char * m = getenv("GGML_VK_GET_ROWS_NARROW_MAX");
+        return m != nullptr ? (uint32_t) std::max(0, atoi(m)) : 128u;
+    }();
+    return max_width;
+}
+
+static vk_pipeline ggml_vk_get_rows_narrow_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * dst) {
+    const bool type_ok = (dst->type == GGML_TYPE_F32 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)) ||
+                         (dst->type == GGML_TYPE_I32 && src0->type == GGML_TYPE_I32);
+    // the shader indexes dst elements with 32-bit math
+    if (!type_ok || src0->ne[0] > (int64_t) ggml_vk_get_rows_narrow_max() || ggml_nelements(dst) > INT32_MAX) {
+        return nullptr;
+    }
+    return ctx->device->pipeline_get_rows_narrow[src0->type];
+}
+
 void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
     const uint32_t dst_type_size = ggml_type_size(dst->type);
 
+    vk_pipeline narrow = ggml_vk_get_rows_narrow_pipeline(ctx, src0, dst);
+    if (narrow) {
+        ggml_vk_path_census_add("GET_ROWS_NARROW");
+    }
+
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GET_ROWS, {
-        (uint32_t)ggml_nelements(src0),
+        // the narrow shader runs one invocation per dst element
+        (uint32_t)(narrow ? ggml_nelements(dst) : ggml_nelements(src0)),
         (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
         0.0f, 0.0f, 0,
-    });
+    }, narrow);
 }
 
 void ggml_vk_get_rows_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
