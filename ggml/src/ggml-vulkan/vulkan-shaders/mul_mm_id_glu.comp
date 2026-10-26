@@ -9,7 +9,8 @@
 #extension GL_KHR_cooperative_matrix : require
 
 // Routed MoE gate + up + SwiGLU in one launch (MUL_MAT_ID -> CPY(f16) for the up and the gate projection, then SWIGLU):
-// q4_K gate and up experts, f16 output = the SWIGLU's destination. Weight-streaming design (after halo-box PR #213's HIP
+// q4_K or q5_K (A_Q5_K) gate and up experts, f16 output = the SWIGLU's destination. OUT_F32: the f32 chain (MUL_MAT_ID x 2, then an f32
+// SWIGLU, no casts), stored as f32 with swiglu.comp's expression on the unrounded projections. Weight-streaming design (after halo-box PR #213's HIP
 // G2 kernel): at prefill every expert's rows are read once per 64-token tile, so the kernel is bound by how fast it streams
 // the weights. They go from global memory straight into registers, one 64-K stage ahead, and never touch shared memory.
 //
@@ -30,12 +31,12 @@ layout(push_constant) uniform parameter {
     uint K;              // n_embd, multiple of 256
     uint g_offset;       // gate weights, uvec4 units
     uint u_offset;       // up weights, uvec4 units
-    uint stride_e;       // uvec4 per expert (M * K / 256 * 9)
+    uint stride_e;       // uvec4 per expert (M * K / 256 * BU)
     uint b_offset;       // B, in uvec4 units
     uint b_s1;           // B stride per slot (ne11 > 1), uvec4 units
     uint b_s2;           // B stride per token, uvec4 units
     uint ne11;
-    uint d_offset;       // D, in f16vec4 units
+    uint d_offset;       // D, in f16vec4 units (vec4 with OUT_F32)
     uint n_used;
     uint row_ids_offset;
     uint zero;           // always 0: keeps the f16 roundings of the unfused chain (see glu_store)
@@ -44,7 +45,13 @@ layout(push_constant) uniform parameter {
 layout(binding = 0) readonly buffer WG { uvec4 data_g[]; };
 layout(binding = 1) readonly buffer WU { uvec4 data_u[]; };
 layout(binding = 2) readonly buffer B  { uvec4 data_b[]; };
+#if defined(OUT_F32)
+layout(binding = 3) writeonly buffer D { vec4 data_d[]; };
+#define D_VEC4 vec4
+#else
 layout(binding = 3) writeonly buffer D { f16vec4 data_d[]; };
+#define D_VEC4 f16vec4
+#endif
 layout(binding = 4) readonly buffer E  { uint data_e[]; };   // count_experts: [0] tiles, (expert, rows) per tile, row ids
 
 #define MATA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
@@ -52,6 +59,11 @@ layout(binding = 4) readonly buffer E  { uint data_e[]; };   // count_experts: [
 #define ACC  coopmat<float,     gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 
 #define BN 64            // tokens per tile (the count_experts row tile)
+#if defined(A_Q5_K)
+#define BU 11            // uvec4 per 256-K superblock: header (d, dmin, 12 scale bytes), qh (32 bytes), qs (128 bytes)
+#else
+#define BU 9             // q4_K: header, qs (128 bytes)
+#endif
 #define KC 64            // K per stage
 #define SB 36            // shared row stride in uints (32 data + 4 pad, 16-byte aligned rows)
 
@@ -77,10 +89,14 @@ uvec2 q4k_scale_min(const uvec4 hdr, const uint j) {
 }
 
 // 16 K values (bytes of q, nibble half sh) of this lane's row -> 8 packed f16 pairs: f16(fma(d, q, m)), the expression of the
-// unfused q4_K coopmat dequant (mul_mm_funcs.glsl)
-void q4k_frag(const uvec4 q, const uint sh, const float d, const float m, out uint o[8]) {
+// unfused q4_K / q5_K coopmat dequant (mul_mm_funcs.glsl). q5_K: bit hb of the qh bytes qh is the fifth bit
+void qk_frag(const uvec4 q, const uint sh, const uvec4 qh, const uint hb, const float d, const float m, out uint o[8]) {
     [[unroll]] for (uint w = 0; w < 4; w++) {
+#if defined(A_Q5_K)
+        const uint nb = ((q[w] >> sh) & 0x0F0F0F0Fu) | (((qh[w] >> hb) & 0x01010101u) << 4);
+#else
         const uint nb = (q[w] >> sh) & 0x0F0F0F0Fu;
+#endif
         const vec4 v = vec4(float(nb & 0xFFu), float((nb >> 8) & 0xFFu), float((nb >> 16) & 0xFFu), float(nb >> 24));
         o[2 * w]     = packFloat2x16(f16vec2(fma(d, v.x, m), fma(d, v.y, m)));
         o[2 * w + 1] = packFloat2x16(f16vec2(fma(d, v.z, m), fma(d, v.w, m)));
@@ -92,8 +108,12 @@ void q4k_frag(const uvec4 q, const uint sh, const float d, const float m, out ui
 float round16(const float x) { return float(unpackFloat2x16(packFloat2x16(f16vec2(x, 0.0)) ^ p.zero).x); }
 // swiglu.comp's expression, stored as f16 through the same opaque zero (a fused multiply-convert would round once)
 float glu_val(const float g, const float u) {
+#if defined(OUT_F32)
+    return g / (1.0f + exp(-g)) * u;
+#else
     const float gr = round16(g);
     return uintBitsToFloat(floatBitsToUint(gr / (1.0f + exp(-gr)) * round16(u)) ^ p.zero);
+#endif
 }
 
 void main() {
@@ -146,12 +166,19 @@ void main() {
     uvec4 br0, br1, br2 = uvec4(0), br3 = uvec4(0);
 #endif
 
-    // A: this lane's row (gate for lanes 0..15, up for 16..31), 9 uvec4 per 256-K superblock: header, then qs
+    // A: this lane's row (gate for lanes 0..15, up for 16..31), BU uvec4 per 256-K superblock
     const uint feat  = gl_WorkGroupID.x * 128 + wave * 16 + (lane % 16);
-    const uint a_row = (lo ? p.g_offset : p.u_offset) + expert * p.stride_e + feat * (p.K / 256) * 9;
-#define LOAD_A(st, h, q0, q1) { const uint sb = (st) / 4, g = (st) % 4, ai = a_row + sb * 9; \
+    const uint a_row = (lo ? p.g_offset : p.u_offset) + expert * p.stride_e + feat * (p.K / 256) * BU;
+#if defined(A_Q5_K)
+    // stage g of a superblock: qs bytes 32 g .. 32 g + 31 (uvec4 3 + 2 g, 4 + 2 g), and all 32 qh bytes (bits 2 g, 2 g + 1)
+#define LOAD_A(st, h, q0, q1, h0, h1) { const uint sb = (st) / 4, g = (st) % 4, ai = a_row + sb * BU; \
+        if (lo) { h = data_g[ai]; h0 = data_g[ai + 1]; h1 = data_g[ai + 2]; q0 = data_g[ai + 3 + 2 * g]; q1 = data_g[ai + 4 + 2 * g]; } \
+        else    { h = data_u[ai]; h0 = data_u[ai + 1]; h1 = data_u[ai + 2]; q0 = data_u[ai + 3 + 2 * g]; q1 = data_u[ai + 4 + 2 * g]; } }
+#else
+#define LOAD_A(st, h, q0, q1, h0, h1) { const uint sb = (st) / 4, g = (st) % 4, ai = a_row + sb * BU; \
         if (lo) { h = data_g[ai]; q0 = data_g[ai + 1 + 2 * g]; q1 = data_g[ai + 2 + 2 * g]; } \
         else    { h = data_u[ai]; q0 = data_u[ai + 1 + 2 * g]; q1 = data_u[ai + 2 + 2 * g]; } }
+#endif
 
     ACC acc_g[4];
     ACC acc_u[4];
@@ -161,8 +188,8 @@ void main() {
     }
 
     const uint n_stages = p.K / KC;
-    uvec4 ah, aq0, aq1;
-    LOAD_A(0, ah, aq0, aq1);
+    uvec4 ah, aq0, aq1, aqh0 = uvec4(0), aqh1 = uvec4(0);
+    LOAD_A(0, ah, aq0, aq1, aqh0, aqh1);
     LOAD_B(0, br0, br1, br2, br3);
     STORE_B(0, br0, br1, br2, br3);
     barrier();
@@ -170,9 +197,9 @@ void main() {
     for (uint st = 0; st < n_stages; st++) {
         const uint cur = st & 1;
         const bool more = st + 1 < n_stages;
-        uvec4 nh, nq0, nq1;
+        uvec4 nh, nq0, nq1, nqh0 = uvec4(0), nqh1 = uvec4(0);
         if (more) {
-            LOAD_A(st + 1, nh, nq0, nq1);
+            LOAD_A(st + 1, nh, nq0, nq1, nqh0, nqh1);
             LOAD_B(st + 1, br0, br1, br2, br3);
         }
 
@@ -187,7 +214,8 @@ void main() {
         // four 16-K steps: (bytes 0..15, low), (bytes 16..31, low), (bytes 0..15, high), (bytes 16..31, high)
         [[unroll]] for (uint ks = 0; ks < 4; ks++) {
             uint own[8];
-            q4k_frag((ks & 1) == 0 ? aq0 : aq1, ks < 2 ? 0u : 4u, ks < 2 ? d0 : d1, ks < 2 ? m0 : m1, own);
+            qk_frag((ks & 1) == 0 ? aq0 : aq1, ks < 2 ? 0u : 4u, (ks & 1) == 0 ? aqh0 : aqh1, 2 * g + (ks < 2 ? 0u : 1u),
+                    ks < 2 ? d0 : d1, ks < 2 ? m0 : m1, own);
             MATA ag, au;
             [[unroll]] for (uint j = 0; j < 8; j++) {
                 const uint oth = subgroupShuffleXor(own[j], 16);
@@ -212,7 +240,7 @@ void main() {
 
         if (more) {
             STORE_B(cur ^ 1, br0, br1, br2, br3);
-            ah = nh; aq0 = nq0; aq1 = nq1;
+            ah = nh; aq0 = nq0; aq1 = nq1; aqh0 = nqh0; aqh1 = nqh1;
         }
         barrier();
     }
@@ -235,7 +263,7 @@ void main() {
                 const vec4 v = lo ? vec4(a0, r0, a1, r1) : vec4(r0, a2, r1, a3);
                 const uint f = feat0 + 2 * e + (lo ? 0u : 4u);   // rows 2e .. 2e + 3 (low) / 2e + 4 .. 2e + 7 (high)
                 if (row < nrows) {
-                    data_d[p.d_offset + dst_row + f / 4] = f16vec4(v);
+                    data_d[p.d_offset + dst_row + f / 4] = D_VEC4(v);
                 }
             }
         }
