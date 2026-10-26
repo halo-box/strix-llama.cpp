@@ -7410,13 +7410,16 @@ struct test_moe_glu_f16 : public test_case {
     uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2 * n_embd * n_ff * n_used * n_tokens; }
 
     // GGML_VK_TEST_REQUIRE_PAIR_GLU=1: the fused launch must run for q4_K / q5_K with M % 128 == 0 and K % 256 == 0, and must not run
-    // otherwise
+    // otherwise; under GGML_VK_MMID_PAIR_GLU_EXT=0 only the q4_K f16 chain may run
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_PAIR_GLU")) {
             return true;
         }
-        const bool expect = (type_w == GGML_TYPE_Q4_K || type_w == GGML_TYPE_Q5_K) && n_ff % 128 == 0 && n_embd % 256 == 0;
+        const char * ext_env = getenv("GGML_VK_MMID_PAIR_GLU_EXT");
+        const bool ext = ext_env == nullptr || atoi(ext_env) != 0;
+        const bool expect = (type_w == GGML_TYPE_Q4_K || type_w == GGML_TYPE_Q5_K) && n_ff % 128 == 0 && n_embd % 256 == 0 &&
+                            (ext || (type_w == GGML_TYPE_Q4_K && !chain32));
         const char * path = chain32 ? "path:MUL_MAT_ID_PAIR_SWIGLU_F32" : "path:MUL_MAT_ID_PAIR_SWIGLU";
         const int64_t n = dispatch_census_count(backend, path);
         if (expect != (n > 0)) {

@@ -9984,6 +9984,16 @@ static bool ggml_vk_mmid_pair_glu_enabled() {
     return on;
 }
 
+// GGML_VK_MMID_PAIR_GLU_EXT=0: MUL_MAT_ID_PAIR_SWIGLU only for the q4_K f16 chain; the f32 chain and q5_K experts take the
+// unfused path again (GGML_VK_MMID_PAIR_GLU=0 turns all of it off)
+static bool ggml_vk_mmid_pair_glu_ext_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMID_PAIR_GLU_EXT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static constexpr uint32_t mmid_pair_glu_bn = 64;   // the shader's token tile (BN)
 
 // the weight types mul_mm_id_glu.comp dequantizes (pipeline_mmid_glu's first index), -1 for the rest
@@ -18863,7 +18873,7 @@ static bool ggml_vk_can_fuse_mmid_pair_glu(ggml_backend_vk_context * ctx, const 
     static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
     const ggml_tensor * mm_a = cgraph->nodes[i];
     const int ti = mm_a->op == GGML_OP_MUL_MAT_ID ? ggml_vk_mmid_glu_type_idx(mm_a->src[0]->type) : -1;
-    if (ti < 0 || !ctx->device->pipeline_mmid_glu[ti][f32][0]) {
+    if (ti < 0 || !ctx->device->pipeline_mmid_glu[ti][f32][0] || ((f32 || ti != 0) && !ggml_vk_mmid_pair_glu_ext_enabled())) {
         return false;
     }
     auto reject = [&](const char * why) {
