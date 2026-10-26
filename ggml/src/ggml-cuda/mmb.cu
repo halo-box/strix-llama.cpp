@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <vector>
 #include <unordered_set>
+#include <atomic>
+#include <mutex>
 
 namespace {
 
@@ -975,13 +977,21 @@ struct ggml_cuda_mmb_context {
     std::unordered_map<const void *, uint16_t *> shadow;
     std::map<std::pair<const void *, const void *>, uint16_t *> shadow_pair;
     size_t shadow_bytes = 0;
+    std::unordered_map<const uint16_t *, size_t> shadow_size;   // bytes of each shadow buffer, for shadow_bytes on a drop
+    std::atomic<bool> shadow_dropped{false};
 };
 
 namespace {
 
+// every context holding MMB state, so that a write to weight memory reaches the shadows of all of them
+static std::mutex g_mmb_ctx_mutex;
+static std::unordered_set<ggml_backend_cuda_context *> g_mmb_ctxs;
+
 static ggml_cuda_mmb_context & mmb_state(ggml_backend_cuda_context & ctx) {
     if (!ctx.mmb) {
         ctx.mmb = new ggml_cuda_mmb_context;
+        std::lock_guard<std::mutex> lock(g_mmb_ctx_mutex);
+        g_mmb_ctxs.insert(&ctx);
     }
     return *ctx.mmb;
 }
@@ -1143,10 +1153,45 @@ void ggml_cuda_mmb_release_all(ggml_backend_cuda_context & ctx) {
     for (auto & work : ctx.mmb->streams) {
         for (auto & e : work.slots) delete e.buf;
     }
+    {
+        std::lock_guard<std::mutex> lock(g_mmb_ctx_mutex);
+        g_mmb_ctxs.erase(&ctx);
+    }
     for (auto & e : ctx.mmb->shadow) CUDA_CHECK(cudaFree(e.second));
     for (auto & e : ctx.mmb->shadow_pair) CUDA_CHECK(cudaFree(e.second));
     delete ctx.mmb;
     ctx.mmb = nullptr;
+}
+
+void ggml_cuda_mmb_shadow_forget(const void * base, const size_t size) {
+    const char * lo = (const char *) base, * hi = lo + size;
+    auto in = [&](const void * p) { return (const char *) p >= lo && (const char *) p < hi; };
+    std::lock_guard<std::mutex> lock(g_mmb_ctx_mutex);
+    for (ggml_backend_cuda_context * c : g_mmb_ctxs) {
+        ggml_cuda_mmb_context * m = c->mmb;
+        if (!m) continue;
+        std::vector<uint16_t *> drop;
+        for (auto it = m->shadow.begin(); it != m->shadow.end();) {
+            if (in(it->first)) { drop.push_back(it->second); it = m->shadow.erase(it); } else ++it;
+        }
+        for (auto it = m->shadow_pair.begin(); it != m->shadow_pair.end();) {
+            if (in(it->first.first) || in(it->first.second)) { drop.push_back(it->second); it = m->shadow_pair.erase(it); } else ++it;
+        }
+        if (drop.empty()) continue;
+        // no kernel of this device may still read a shadow being freed
+        ggml_cuda_set_device(c->device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        for (uint16_t * b : drop) {
+            auto it = m->shadow_size.find(b);
+            if (it != m->shadow_size.end()) { m->shadow_bytes -= it->second; m->shadow_size.erase(it); }
+            CUDA_CHECK(cudaFree(b));
+        }
+        m->shadow_dropped = true;
+    }
+}
+
+bool ggml_cuda_mmb_shadow_dropped(ggml_backend_cuda_context & ctx) {
+    return ctx.mmb && ctx.mmb->shadow_dropped.exchange(false);
 }
 // A producer writes the BF16 copy of t itself: the entry is found by the MMB GEMM that reads t next.
 uint16_t * ggml_cuda_mmb_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
@@ -1591,6 +1636,13 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
 // Called from graph_optimize (outside stream capture): create the shadow for an eligible IQ4_NL dense weight.
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
     if (!w) return;
+    // weights only: other memory is rewritten or reused without a write through the weight hooks, and the shadow,
+    // found by address, would then hold old values (ggml_cuda_mmb_shadow_forget)
+    auto weights = [](const ggml_tensor * t) {
+        const ggml_tensor * r = t->view_src ? t->view_src : t;
+        return r->buffer && ggml_backend_buffer_get_usage(r->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    };
+    if (w->op == GGML_OP_CONCAT ? !(w->src[0] && w->src[1] && weights(w->src[0]) && weights(w->src[1])) : !weights(w)) return;
     if (mmb_is_hc_q8(w)) {
         if (mmb_state(ctx).shadow.count(w->data) > 0) return;
         const size_t n = (size_t) w->ne[0] * w->ne[1], bytes = n * 2;
@@ -1599,7 +1651,7 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
         mmb_dq_q8_0_bf16_kernel<<<(unsigned) ((n / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 32);
         CUDA_CHECK(cudaGetLastError());
-        mmb_state(ctx).shadow[w->data] = buf; mmb_state(ctx).shadow_bytes += bytes;
+        mmb_state(ctx).shadow[w->data] = buf; mmb_state(ctx).shadow_bytes += bytes; mmb_state(ctx).shadow_size[buf] = bytes;
         return;
     }
     if (mmb_is_resident_q6k(w)) {
@@ -1610,7 +1662,7 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
         mmb_dq_q6k_bf16_kernel<<<(unsigned) ((n / 256 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 256);
         CUDA_CHECK(cudaGetLastError());
-        mmb_state(ctx).shadow[w->data] = buf; mmb_state(ctx).shadow_bytes += bytes;
+        mmb_state(ctx).shadow[w->data] = buf; mmb_state(ctx).shadow_bytes += bytes; mmb_state(ctx).shadow_size[buf] = bytes;
         return;
     }
     if (mmb_shadow_mode() != 1) return;               // mode 2: Q6_K only
@@ -1632,5 +1684,5 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         mmb_state(ctx).shadow[w->data] = buf;
     }
     CUDA_CHECK(cudaGetLastError());
-    mmb_state(ctx).shadow_bytes += bytes;
+    mmb_state(ctx).shadow_bytes += bytes; mmb_state(ctx).shadow_size[buf] = bytes;
 }
