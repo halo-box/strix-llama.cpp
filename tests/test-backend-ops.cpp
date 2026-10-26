@@ -4385,15 +4385,16 @@ struct test_hc_moe_epi : public test_case {
         return hc == 4 && embd % 8 == 0 && env_knob_on("GGML_VK_HC_INJECT_FOLD") ? "HC_MOE_EPI_INJ" : "HC_MOE_EPI";
     }
 
-    // GGML_VK_TEST_REQUIRE_HC_MOE_EPI=1: one fused epilogue per graph with the knobs on (the exact twin runs unfused), none
-    // with GGML_VK_HC_MOE_EPI=0 (the negative control); with it fused, no MULTI_ADD is left
+    // GGML_VK_TEST_REQUIRE_HC_MOE_EPI=1: one fused epilogue per graph with the knobs on and at least 32 tokens (the exact twin
+    // runs unfused), none below 32 tokens or with GGML_VK_HC_MOE_EPI=0 (the negative control); with it fused, no MULTI_ADD is left
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_MOE_EPI")) {
             return true;
         }
         auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
-        const bool on = skip == nullptr || skip(backend, label()) == nullptr;
+        // below 32 tokens (decode) the backend keeps the chain unfused: the decode-shape cases assert no fused dispatch
+        const bool on = (skip == nullptr || skip(backend, label()) == nullptr) && tokens >= 32;
         int64_t n_all = 0;
         for (const char * l : { "HC_MOE_EPI", "HC_MOE_EPI_INJ", "HC_MOE_EPI_F32" }) {
             n_all += std::max<int64_t>(0, dispatch_census_count(backend, l));
@@ -12849,7 +12850,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 2, GGML_TYPE_Q8_0, 128));
     // HC_MOE_EPI: the Flash-Next shape (n_embd 2560, 4 streams, 10 routed slots + the shared expert) at prefill (f16 norm and
-    // the inject fold, padded rows as shipped) and decode (f32 norm); exact = bit-identical to the unfused chain
+    // the inject fold, padded rows as shipped; f32 norm) and decode (1 and 7 tokens: kept unfused, asserted); exact =
+    // bit-identical to the unfused chain
     for (int tokens : {1, 7, 32, 64, 513}) {
         for (bool exact : {false, true}) {
             test_cases.emplace_back(new test_hc_moe_epi(2560, 4, tokens, 10, true, tokens >= 32 ? 1 : 0, 2, 0, exact));
@@ -17351,7 +17353,7 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("HC_POST_GATE",        new test_dsv4_hc_post(4096, 21, false, true), "HC_POST_GATE/4=1");
     add("HC_MOE_EPI_INJ",      new test_hc_moe_epi(256, 4, 32, 4, true, 1, 1), "HC_MOE_EPI_INJ/13=1");
     add("HC_MOE_EPI",          new test_hc_moe_epi(260, 4, 32, 4, true, 1, 1), "HC_MOE_EPI/11=1");
-    add("HC_MOE_EPI_F32",      new test_hc_moe_epi(256, 4, 7, 4, true, 0, 2), "HC_MOE_EPI_F32/10=1;SIGMOID_MUL/2=1");
+    add("HC_MOE_EPI_F32",      new test_hc_moe_epi(256, 4, 32, 4, true, 0, 2), "HC_MOE_EPI_F32/10=1;SIGMOID_MUL/2=1");
     add("GELU_MUL",            new test_unary_mul(GGML_UNARY_OP_GELU,     GGML_TYPE_F32, { 128, 2, 2, 2 }), "GELU_MUL/2=1");
     add("SIGMOID_MUL",         new test_unary_mul(GGML_UNARY_OP_SIGMOID,  GGML_TYPE_F32, { 128, 2, 2, 2 }), "SIGMOID_MUL/2=1");
     add("SILU_MUL",            new test_unary_mul(GGML_UNARY_OP_SILU,     GGML_TYPE_F32, { 128, 2, 2, 2 }), "SILU_MUL/2=1");

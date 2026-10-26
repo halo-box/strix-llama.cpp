@@ -17435,6 +17435,9 @@ static bool ggml_vk_hc_moe_epi_enabled() {
 }
 
 static constexpr int HC_MOE_MAX_SLOTS = 32;
+// one workgroup per token: below this many tokens (decode, MTP) the unfused MULTI_ADD + ADD + norm kernels spread the layer over
+// more workgroups and are faster (Flash-Next truncated to 8 layers, decode at depth 8192: 15.9 us fused vs ~8.6 us per layer), so the chain stays unfused there
+static constexpr int64_t HC_MOE_MIN_TOKENS = 32;
 
 // the ADD chain at node_idx: n_slots slot views summed in the MULTI_ADD's source order (the first ADD's src[0], src[1], then
 // each later ADD's other operand), then optionally one f32 term (the shared expert). n_add = the chain's ADD nodes.
@@ -17543,7 +17546,7 @@ static int ggml_vk_can_fuse_hc_moe_epi(const ggml_backend_vk_context * ctx, cons
     const ggml_tensor * hc_post = cgraph->nodes[j + 3];
     const ggml_tensor * res     = hc_post->src[1];
     const int64_t n_embd = res->ne[0], hc = res->ne[1], nt = res->ne[2];
-    if (hc_post->src[0] != cgraph->nodes[j - 1] || n_embd != c.slot[0]->ne[0] || nt != c.slot[0]->ne[1] || hc < 1 || hc > 4 ||
+    if (hc_post->src[0] != cgraph->nodes[j - 1] || n_embd != c.slot[0]->ne[0] || nt != c.slot[0]->ne[1] || hc < 1 || hc > 4 || nt < HC_MOE_MIN_TOKENS ||
         nt > (int64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
         return 0;
     }
@@ -20019,7 +20022,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 std::vector<int> run;
                 const ggml_tensor * f = graph->nodes[a0];
                 // the first slot add: two views of one tensor (the routed experts' outputs)
-                if (!f->src[0] || !f->src[1] || f->src[0]->view_src == nullptr || f->src[0]->view_src != f->src[1]->view_src ||
+                if (!f->src[0] || !f->src[1] || f->src[0]->view_src == nullptr || f->src[0]->view_src != f->src[1]->view_src || f->ne[1] < HC_MOE_MIN_TOKENS ||
                     (f->src[0]->type != GGML_TYPE_F16 && f->src[0]->type != GGML_TYPE_F32)) {
                     return {};
                 }
