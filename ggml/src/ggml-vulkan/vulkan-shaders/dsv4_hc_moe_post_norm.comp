@@ -1,0 +1,273 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// qwen4exp MoE epilogue + hyper-connection combine + the next mix's grouped RMS norm, one workgroup per token over all streams:
+//
+//   x[i, t]          = ((s_0[i, t] + s_1[i, t]) + ... + s_{n-1}[i, t]) + sh[i, t]    (MULTI_ADD of the routed slots, then the
+//                                                                                    shared-expert ADD; HAS_SH == 0: no sh)
+//   res_out[i, h, t] = x[i, t] * post[h, t] + res[i, h, t]                          (DSV4_HC_POST, no comb)
+//   xn[i, h, t]      = res_out[i, h, t] * rsqrt(mean_i(res_out^2) + eps) * gamma[i, h]   (RMS_NORM + MUL (+ CPY f16))
+//   inj[r, t]        = sum_{h, i} w[h * n_embd + i, r] * xn[i, h, t]                (INJ: the next mix's inject MUL_MAT)
+//
+// The slots are the routed experts' weighted outputs, n of them per token in one tensor (slot k of token t at
+// so + k * ss1 + t * ss2 elements), f16 (SLOT_F16) or f32. Every step repeats the unfused chain's arithmetic in its order:
+// the f32 running sum from 0 over the slots in the MULTI_ADD's source order, the ADD, then dsv4_hc_post_norm.comp's
+// combine and norm. The norm's per-thread layout and reduction are those of the kernel this replaces, so the result is
+// bit-identical to the unfused chain:
+//   INJ == 0: dsv4_hc_post_norm.comp (thread j owns the vec4s j, j + 256, ... of each stream row);
+//   INJ != 0: dsv4_hc_post_norm_inj.comp (thread j owns the 8-column groups j and j + 256 of each stream).
+// The host guarantees n_embd % 4 == 0 (% 8 with INJ), n_embd <= 4096, hc <= 4 (== 4 with INJ), unit element strides,
+// 16-byte aligned rows (slot offsets and strides multiples of 4 elements) and zero misalignment on every operand.
+
+layout(constant_id = 0) const uint HAS_POST = 1;   // kept for the pipeline layout; the MoE epilogue always combines
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint BLOCK = 256;
+const uint HC_MAX = 4;
+
+#if defined(SLOT_F16)
+layout(binding = 0, std430) readonly  buffer SBuf { f16vec4 data_s[]; };
+#else
+layout(binding = 0, std430) readonly  buffer SBuf { vec4    data_s[]; };
+#endif
+layout(binding = 1, std430) readonly  buffer HBuf { vec4    data_h[]; };
+layout(binding = 2, std430) readonly  buffer RBuf { vec4    data_r[]; };
+layout(binding = 3, std430) readonly  buffer PBuf { float   data_p[]; };
+layout(binding = 4, std430) readonly  buffer GBuf { vec4    data_g[]; };
+layout(binding = 5, std430) writeonly buffer OBuf { vec4    data_o[]; };
+#if defined(OUT_F16)
+layout(binding = 6, std430) writeonly buffer NBuf { f16vec4 data_n[]; };
+#else
+layout(binding = 6, std430) writeonly buffer NBuf { vec4    data_n[]; };
+#endif
+#if defined(INJ)
+layout(binding = 7, std430) readonly  buffer WBuf { vec4    data_w[]; };
+layout(binding = 8, std430) writeonly buffer IBuf { float   data_i[]; };
+#endif
+
+layout(push_constant) uniform parameter {
+    uint  n_embd;
+    uint  hc;
+    uint  n_tokens;
+    uint  sx1;             // sh token stride (floats)
+    uint  sr1; uint sr2;   // residual stream / token strides (floats)
+    uint  sp0; uint sp1;   // post stream / token strides (floats)
+    uint  sg1;             // gamma stream stride (floats)
+    uint  so1; uint so2;   // res_out stream / token strides (floats)
+    uint  sn1; uint sn2;   // xn stream / token strides (elements)
+    float eps;
+    uint  gate;
+    float gate_in;
+    float gate_out;
+    uint  zero;            // always 0 (the f16 store's XOR operand)
+    uint  sw1;             // inject weight row stride (floats; INJ)
+    uint  si1;             // inject output token stride (floats; INJ)
+    uint  n_slots;
+    uint  so;              // slot 0 offset (elements)
+    uint  ss1;             // slot stride (elements)
+    uint  ss2;             // slot token stride (elements)
+    uint  has_sh;
+} p;
+
+// x for the 4 columns at element e of token t: the slot sum, then the shared expert
+vec4 moe_x(const uint t, const uint e) {
+    vec4 s = vec4(0.0f);
+    uint sb = p.so + t * p.ss2 + e;
+    for (uint k = 0; k < p.n_slots; ++k) {
+        s += vec4(data_s[sb / 4]);
+        sb += p.ss1;
+    }
+    if (p.has_sh != 0) {
+        s = s + data_h[(t * p.sx1 + e) / 4];
+    }
+    return s;
+}
+
+float post_weight(const uint c, const uint t) {
+    float pw = data_p[c * p.sp0 + t * p.sp1];
+    if (p.gate != 0) {
+        pw = (1.0f / (1.0f + exp(-(pw * p.gate_in)))) * p.gate_out;
+    }
+    return pw;
+}
+
+#if !defined(INJ)
+
+const uint MAX_V4 = 4;
+
+shared float sumsh[HC_MAX][32];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.x;
+    const uint nv4 = p.n_embd / 4;
+
+    vec4 xv[MAX_V4];
+    [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
+        const uint i4 = tid + k * BLOCK;
+        xv[k] = i4 < nv4 ? moe_x(t, i4 * 4) : vec4(0.0f);
+    }
+
+    vec4 v[HC_MAX][MAX_V4];
+    [[unroll]] for (uint c = 0; c < HC_MAX; ++c) {
+        if (c >= p.hc) {
+            break;
+        }
+        const float pw = post_weight(c, t);
+        const uint rb = (c * p.sr1 + t * p.sr2) / 4;
+        const uint ob = (c * p.so1 + t * p.so2) / 4;
+        float sum = 0.0f;
+        [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
+            const uint i4 = tid + k * BLOCK;
+            vec4 r = vec4(0.0f);
+            if (i4 < nv4) {
+                r = data_r[rb + i4];
+                r = xv[k] * pw + r;
+                data_o[ob + i4] = r;
+            }
+            v[c][k] = r;
+            sum += dot(r, r);
+        }
+        // dsv4_hc_post_norm.comp's row reduction: subgroup partials, then the subgroups in order
+        sum = subgroupAdd(sum);
+        if (gl_SubgroupInvocationID == 0) {
+            sumsh[c][gl_SubgroupID] = sum;
+        }
+    }
+    barrier();
+
+    [[unroll]] for (uint c = 0; c < HC_MAX; ++c) {
+        if (c >= p.hc) {
+            break;
+        }
+        float total = 0.0f;
+        for (uint s = 0; s < gl_NumSubgroups; ++s) {
+            total += sumsh[c][s];
+        }
+        const float scale = inversesqrt(total / float(p.n_embd) + p.eps);
+        const uint gb = (c * p.sg1) / 4;
+        const uint nb = (c * p.sn1 + t * p.sn2) / 4;
+        [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
+            const uint i4 = tid + k * BLOCK;
+            if (i4 < nv4) {
+                const vec4 n = v[c][k] * scale * data_g[gb + i4];
+#if defined(OUT_F16)
+                // equal to the f32 norm stored, then CPY: the XOR with a push-constant zero keeps the multiply and the
+                // conversion two separately rounded operations
+                data_n[nb + i4] = f16vec4(uintBitsToFloat(floatBitsToUint(n) ^ uvec4(p.zero)));
+#else
+                data_n[nb + i4] = n;
+#endif
+            }
+        }
+    }
+}
+
+#else // INJ
+
+const uint HC = 4;
+const uint NG = 2;   // 8-column groups per thread
+
+shared float sumsh[HC][32];
+shared float injsh[HC][32];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.x;
+    const uint ng  = p.n_embd / 8;
+
+    vec4 xv[NG][2];
+    [[unroll]] for (uint g = 0; g < NG; ++g) {
+        const uint e = (tid + g * BLOCK) * 8;
+        xv[g][0] = vec4(0.0f);
+        xv[g][1] = vec4(0.0f);
+        if (tid + g * BLOCK < ng) {
+            xv[g][0] = moe_x(t, e);
+            xv[g][1] = moe_x(t, e + 4);
+        }
+    }
+
+    vec4 a[HC][NG][2];
+    float ss[HC];
+    [[unroll]] for (uint c = 0; c < HC; ++c) {
+        const float pw = post_weight(c, t);
+        ss[c] = 0.0f;
+        [[unroll]] for (uint g = 0; g < NG; ++g) {
+            const uint e4 = (tid + g * BLOCK) * 2;
+            vec4 r0 = vec4(0.0f);
+            vec4 r1 = vec4(0.0f);
+            if (tid + g * BLOCK < ng) {
+                const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
+                r0 = data_r[rb];
+                r1 = data_r[rb + 1];
+                r0 = xv[g][0] * pw + r0;
+                r1 = xv[g][1] * pw + r1;
+                const uint ob = (c * p.so1 + t * p.so2) / 4 + e4;
+                data_o[ob]     = r0;
+                data_o[ob + 1] = r1;
+            }
+            a[c][g][0] = r0;
+            a[c][g][1] = r1;
+            ss[c] += dot(r0, r0) + dot(r1, r1);
+        }
+    }
+
+    // dsv4_hc_post_norm_inj.comp's reduction: the four stream sums, subgroup partials, then the subgroups in order
+    [[unroll]] for (uint c = 0; c < HC; ++c) {
+        const float s = subgroupAdd(ss[c]);
+        if (gl_SubgroupInvocationID == 0) {
+            sumsh[c][gl_SubgroupID] = s;
+        }
+    }
+    barrier();
+
+    vec4 inj = vec4(0.0f);
+    [[unroll]] for (uint c = 0; c < HC; ++c) {
+        float total = 0.0f;
+        for (uint s = 0; s < gl_NumSubgroups; ++s) {
+            total += sumsh[c][s];
+        }
+        const float scale = inversesqrt(total / float(p.n_embd) + p.eps);
+        [[unroll]] for (uint g = 0; g < NG; ++g) {
+            if (tid + g * BLOCK >= ng) {
+                continue;
+            }
+            const uint e4 = (tid + g * BLOCK) * 2;
+            const uint gb = (c * p.sg1) / 4 + e4;
+            const uint nb = (c * p.sn1 + t * p.sn2) / 4 + e4;
+            [[unroll]] for (uint k = 0; k < 2; ++k) {
+                const vec4 n = a[c][g][k] * scale * data_g[gb + k];
+                const f16vec4 n16 = f16vec4(uintBitsToFloat(floatBitsToUint(n) ^ uvec4(p.zero)));
+                data_n[nb + k] = n16;
+                const vec4 nf = vec4(n16);
+                const uint wb = (c * p.n_embd) / 4 + e4 + k;
+                [[unroll]] for (uint r = 0; r < HC; ++r) {
+                    inj[r] += dot(data_w[(r * p.sw1) / 4 + wb], nf);
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0; r < HC; ++r) {
+        const float s = subgroupAdd(inj[r]);
+        if (gl_SubgroupInvocationID == 0) {
+            injsh[r][gl_SubgroupID] = s;
+        }
+    }
+    barrier();
+    if (tid < HC) {
+        float total = 0.0f;
+        for (uint s = 0; s < gl_NumSubgroups; ++s) {
+            total += injsh[tid][s];
+        }
+        data_i[t * p.si1 + tid] = total;
+    }
+}
+
+#endif
