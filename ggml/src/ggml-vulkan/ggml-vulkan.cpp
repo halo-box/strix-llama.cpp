@@ -4508,6 +4508,20 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     dsv4_hc_post_norm_inj_f16_len, dsv4_hc_post_norm_inj_f16_data, "main", 8, sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants), {1, 1, 1}, { has_post }, 1);
             }
         }
+        if (device->fp16) {
+            // MoE epilogue: one workgroup per token over all streams, the routed slots (f16 / f32) summed in front of the combine
+#define CREATE_HC_MOE(s16, sname, v, vname, np) \
+            ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_moe_post_norm[s16][v], "dsv4_hc_moe_post_norm_" #sname "_" #vname, \
+                dsv4_hc_moe_post_norm_ ## sname ## _ ## vname ## _len, dsv4_hc_moe_post_norm_ ## sname ## _ ## vname ## _data, "main", np, \
+                sizeof(vk_op_dsv4_hc_moe_post_norm_push_constants), {1, 1, 1}, { 1u }, 1);
+            CREATE_HC_MOE(1, s16, 0, f32, 7)
+            CREATE_HC_MOE(1, s16, 1, f16, 7)
+            CREATE_HC_MOE(1, s16, 2, inj, 9)
+            CREATE_HC_MOE(0, s32, 0, f32, 7)
+            CREATE_HC_MOE(0, s32, 1, f16, 7)
+            CREATE_HC_MOE(0, s32, 2, inj, 9)
+#undef CREATE_HC_MOE
+        }
     }
 
     for (auto &s : device->pipeline_solve_tri_f32) {
@@ -9118,6 +9132,9 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
           ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, o), ggml_vk_tensor_subbuffer(ctx, out) },
         pc, { hc * nt, 1, 1 });
 }
+
+// HC_MOE_EPI (the MoE epilogue + HC_POST_GATE_NORM(_CPY)(_INJ)), defined with its matcher
+static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
 
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
@@ -15833,7 +15850,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     ggml_tensor * src2 = node->src[2];
     ggml_tensor * src3 = node->src[3];
 
-    if (node->op == GGML_OP_ADD) {
+    if (node->op == GGML_OP_ADD && !ctx->fused_hc_moe_epi) {
         int next_node_idx = node_idx + 1 + ctx->num_additional_fused_ops;
         if (next_node_idx < cgraph->n_nodes &&
             cgraph->nodes[next_node_idx]->op == GGML_OP_RMS_NORM &&
@@ -15915,6 +15932,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 need_sync = true;
             }
         }
+        // a tensor a fused kernel writes besides its write-mask nodes (the f16 norm under the inject fold)
+        if (ctx->fused_extra_dst && !need_sync &&
+            (overlaps_unsynced(ctx->fused_extra_dst, ctx->unsynced_nodes_read) || overlaps_unsynced(ctx->fused_extra_dst, ctx->unsynced_nodes_written))) {
+            need_sync = true;
+        }
 
         if (need_sync) {
             if (vk_enable_sync_logger) {
@@ -15948,6 +15970,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             if (extra) {
                 ctx->unsynced_nodes_read.push_back(extra);
             }
+        }
+        if (ctx->fused_extra_dst) {
+            ctx->unsynced_nodes_written.push_back(ctx->fused_extra_dst);
         }
     }
     if (vk_enable_sync_logger) {
@@ -15995,7 +16020,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_ADD:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_hc_moe_epi) {
+            ggml_vk_dsv4_hc_moe_post_norm(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_add(ctx, compute_ctx, src0, src1, node);
@@ -17392,6 +17419,247 @@ static bool ggml_vk_can_fuse_hc_post_norm_inj(const ggml_backend_vk_context * ct
     return true;
 }
 
+// HC_MOE_EPI: the qwen4exp MoE epilogue folded into the HC post norm. build_moe_ffn sums the routed experts' weighted outputs
+// (slot views of one [n_embd, n_used, T] tensor, f16 under LLM_FUSED_OP_MOE_F16) with an ADD chain (MULTI_ADD), the shared
+// expert is added with one more ADD, and that sum is the x of the FFN-side combine, which HC_POST_GATE_NORM(_CPY)(_INJ)
+// already fuses with the next mix's norm. dsv4_hc_moe_post_norm.comp reads the slots and the shared-expert term in the
+// combine, so the MULTI_ADD and ADD dispatches and their [n_embd, T] f32 write + read go away; it repeats their f32 sums
+// in order, so the result is bit-identical. graph_optimize makes the chain consecutive (the shared-expert branch moves in
+// front of the slot adds). GGML_VK_HC_MOE_EPI=0 disables both, and the graph then runs exactly as before.
+static bool ggml_vk_hc_moe_epi_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_HC_MOE_EPI");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static constexpr int HC_MOE_MAX_SLOTS = 32;
+
+// the ADD chain at node_idx: n_slots slot views summed in the MULTI_ADD's source order (the first ADD's src[0], src[1], then
+// each later ADD's other operand), then optionally one f32 term (the shared expert). n_add = the chain's ADD nodes.
+struct vk_hc_moe_chain {
+    int n_add = 0;
+    int n_slots = 0;
+    const ggml_tensor * slot[HC_MOE_MAX_SLOTS] {};
+    const ggml_tensor * sh = nullptr;
+    const ggml_tensor * root = nullptr;   // the slots' common view source
+    bool    f16 = false;                  // f16 slots (the first ADD is ggml_add_cast)
+    int64_t so = 0, ss1 = 0, ss2 = 0;     // slot 0 offset, slot stride, token stride (elements)
+};
+
+static bool ggml_vk_hc_moe_chain(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, vk_hc_moe_chain & c) {
+    c = vk_hc_moe_chain();
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    if (first->op != GGML_OP_ADD || first->type != GGML_TYPE_F32 || first->ne[2] != 1 || first->ne[3] != 1) {
+        return false;
+    }
+    const ggml_type st = first->src[0]->type;
+    if ((st != GGML_TYPE_F16 && st != GGML_TYPE_F32) || first->src[1]->type != st) {
+        return false;
+    }
+    c.f16 = st == GGML_TYPE_F16;
+    const size_t ts = ggml_type_size(st);
+    const int64_t n_embd = first->ne[0], nt = first->ne[1];
+
+    // a slot view at position k: same view source, [n_embd, T] rows of unit stride at so + k * ss1 + t * ss2
+    auto const is_slot = [&](const ggml_tensor * v, int k) -> bool {
+        if (v->type != st || v->view_src == nullptr || v->ne[0] != n_embd || v->ne[1] != nt || v->ne[2] != 1 || v->ne[3] != 1 ||
+            v->nb[0] != ts || v->nb[1] % ts != 0 || v->view_offs % ts != 0) {
+            return false;
+        }
+        const int64_t off = (int64_t) (v->view_offs / ts);
+        if (k == 0) {
+            c.root = v->view_src;
+            c.so   = off;
+            c.ss2  = (int64_t) (v->nb[1] / ts);
+            return true;
+        }
+        if (v->view_src != c.root || (int64_t) (v->nb[1] / ts) != c.ss2) {
+            return false;
+        }
+        if (k == 1) {
+            c.ss1 = off - c.so;
+            return c.ss1 > 0;
+        }
+        return off == c.so + k * c.ss1;
+    };
+    if (!ggml_are_same_shape(first, first->src[0]) || !ggml_are_same_shape(first, first->src[1]) ||
+        !is_slot(first->src[0], 0) || !is_slot(first->src[1], 1)) {
+        return false;
+    }
+    c.slot[0] = first->src[0];
+    c.slot[1] = first->src[1];
+    c.n_slots = 2;
+    c.n_add   = 1;
+    for (int i = node_idx + 1; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        const ggml_tensor * prev = cgraph->nodes[i - 1];
+        if (n->op != GGML_OP_ADD || n->type != GGML_TYPE_F32 || (n->src[0] != prev && n->src[1] != prev) ||
+            !ggml_are_same_shape(n, n->src[0]) || !ggml_are_same_shape(n, n->src[1])) {
+            break;
+        }
+        const ggml_tensor * other = n->src[0] == prev ? n->src[1] : n->src[0];
+        if (c.n_slots < HC_MOE_MAX_SLOTS && is_slot(other, c.n_slots)) {
+            c.slot[c.n_slots++] = other;
+            c.n_add++;
+            continue;
+        }
+        // the shared-expert term ends the chain
+        if (other->type == GGML_TYPE_F32 && other->nb[0] == sizeof(float) && other->nb[1] % 16 == 0 && get_misalign_bytes(ctx, other) == 0) {
+            c.sh = other;
+            c.n_add++;
+        }
+        break;
+    }
+    // vec4 slot loads: 16-byte (f32) / 8-byte (f16) aligned rows
+    if (n_embd % 4 != 0 || c.so % 4 != 0 || c.ss1 % 4 != 0 || c.ss2 % 4 != 0 || get_misalign_bytes(ctx, c.root) != 0) {
+        return false;
+    }
+    return true;
+}
+
+// at node_idx (the chain's first ADD): the number of ADD nodes in front of the HC post norm chain, or 0. mode: HC_POST_NORM_GATE_CPY
+// or HC_POST_NORM_GATE; inj: the inject MUL_MAT folded in as well (ggml_vk_can_fuse_hc_post_norm_inj).
+static int ggml_vk_can_fuse_hc_moe_epi(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int & mode, bool & inj) {
+    if (!ggml_vk_hc_moe_epi_enabled() || cgraph->nodes[node_idx]->op != GGML_OP_ADD) {
+        return 0;
+    }
+    vk_hc_moe_chain c;
+    if (!ggml_vk_hc_moe_chain(ctx, cgraph, node_idx, c)) {
+        return 0;
+    }
+    const int j = node_idx + c.n_add;
+    if (j + 6 >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_SCALE) {
+        return 0;
+    }
+    if (ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, j, HC_POST_NORM_GATE_CPY)) {
+        mode = HC_POST_NORM_GATE_CPY;
+    } else if (ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, j, HC_POST_NORM_GATE)) {
+        mode = HC_POST_NORM_GATE;
+    } else {
+        return 0;
+    }
+    const ggml_tensor * hc_post = cgraph->nodes[j + 3];
+    const ggml_tensor * res     = hc_post->src[1];
+    const int64_t n_embd = res->ne[0], hc = res->ne[1], nt = res->ne[2];
+    if (hc_post->src[0] != cgraph->nodes[j - 1] || n_embd != c.slot[0]->ne[0] || nt != c.slot[0]->ne[1] || hc < 1 || hc > 4 ||
+        nt > (int64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return 0;
+    }
+    inj = mode == HC_POST_NORM_GATE_CPY && ggml_vk_can_fuse_hc_post_norm_inj(ctx, cgraph, j, HC_POST_NORM_GATE_CPY);
+    if (ctx->device->pipeline_dsv4_hc_moe_post_norm[c.f16 ? 1 : 0][inj ? 2 : mode == HC_POST_NORM_GATE_CPY ? 1 : 0] == nullptr) {
+        return 0;
+    }
+    // the ADDs are elided: their only readers are the next ADD and the combine, and none is a graph output
+    int idxs[HC_MOE_MAX_SLOTS + 1];
+    ggml_op ops[HC_MOE_MAX_SLOTS + 1];
+    for (int k = 0; k < c.n_add; ++k) {
+        idxs[k] = node_idx + k;
+        ops[k]  = GGML_OP_ADD;
+    }
+    idxs[c.n_add] = j + 3;
+    ops[c.n_add]  = GGML_OP_DSV4_HC_POST;
+    const int outputs[] = { j + 3 };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, c.n_add + 1, ops, outputs, 1)) {
+        return 0;
+    }
+    // the kernel reads the slots, the shared expert, the residual, the post weights, gamma (and w_inject) while it writes the
+    // combine, the norm (and the inject): no input may overlap an output
+    const ggml_tensor * last = cgraph->nodes[j + (mode == HC_POST_NORM_GATE_CPY ? 6 : 5)];
+    const ggml_tensor * outs[] = { hc_post, last, inj ? cgraph->nodes[j + 8] : nullptr };
+    const ggml_tensor * ins[HC_MOE_MAX_SLOTS + 5] = {};
+    int n_in = 0;
+    for (int k = 0; k < c.n_slots; ++k) {
+        ins[n_in++] = c.slot[k];
+    }
+    ins[n_in++] = c.sh;
+    ins[n_in++] = res;
+    ins[n_in++] = cgraph->nodes[j]->src[0];
+    ins[n_in++] = cgraph->nodes[j + 5]->src[1];
+    ins[n_in++] = inj ? cgraph->nodes[j + 8]->src[0] : nullptr;
+    for (const ggml_tensor * o : outs) {
+        for (int k = 0; o != nullptr && k < n_in; ++k) {
+            if (ins[k] != nullptr && ggml_vk_tensors_overlap(ins[k], o, false)) {
+                return 0;
+            }
+        }
+    }
+    return c.n_add;
+}
+
+// node_idx: the chain's first ADD (ggml_vk_can_fuse_hc_moe_epi admitted ctx->fused_hc_moe_epi ADDs, then the HC post norm chain)
+static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    vk_hc_moe_chain c;
+    GGML_ASSERT(ggml_vk_hc_moe_chain(ctx, cgraph, node_idx, c) && c.n_add == ctx->fused_hc_moe_epi);
+    const int  mode    = ctx->fused_hc_post_norm;
+    const bool inj     = ctx->fused_hc_post_norm_inj;
+    const bool out_f16 = mode == HC_POST_NORM_GATE_CPY;
+    GGML_ASSERT(mode == HC_POST_NORM_GATE_CPY || mode == HC_POST_NORM_GATE);
+
+    const int j = node_idx + c.n_add;
+    const ggml_tensor * scale_in = cgraph->nodes[j];
+    const ggml_tensor * hc_post  = cgraph->nodes[j + 3];
+    const ggml_tensor * rms      = cgraph->nodes[j + 4];
+    const ggml_tensor * mul      = cgraph->nodes[j + 5];
+    const ggml_tensor * out      = cgraph->nodes[j + (out_f16 ? 6 : 5)];
+    GGML_ASSERT(out->type == (out_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32));
+
+    const ggml_tensor * res   = hc_post->src[1];
+    const ggml_tensor * pw    = scale_in->src[0];
+    const ggml_tensor * gamma = mul->src[1];
+    const ggml_tensor * sh    = c.sh != nullptr ? c.sh : res;   // bound but not read without a shared-expert term
+
+    const uint32_t n_embd = (uint32_t) res->ne[0];
+    const uint32_t hc     = (uint32_t) res->ne[1];
+    const uint32_t nt     = (uint32_t) res->ne[2];
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+
+    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_moe_post_norm[c.f16 ? 1 : 0][inj ? 2 : out_f16 ? 1 : 0];
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const ggml_tensor * mm = inj ? cgraph->nodes[j + 8] : nullptr;
+    const ggml_tensor * w  = inj ? mm->src[0] : nullptr;
+    const vk_op_dsv4_hc_moe_post_norm_push_constants pc = {
+        {
+            {
+                n_embd, hc, nt,
+                c.sh != nullptr ? (uint32_t)(c.sh->nb[1] / sizeof(float)) : 0u,
+                (uint32_t)(res->nb[1] / sizeof(float)), (uint32_t)(res->nb[2] / sizeof(float)),
+                (uint32_t)(pw->nb[0] / sizeof(float)), (uint32_t)(pw->nb[1] / sizeof(float)),
+                (uint32_t)(gamma->nb[1] / sizeof(float)),
+                (uint32_t)(hc_post->nb[1] / sizeof(float)), (uint32_t)(hc_post->nb[2] / sizeof(float)),
+                (uint32_t)(out->nb[1] / ggml_type_size(out->type)), (uint32_t)(out->nb[2] / ggml_type_size(out->type)),
+                eps,
+                1u,
+                ggml_get_op_params_f32(scale_in, 0),
+                ggml_get_op_params_f32(hc_post->src[2], 0),
+                0u,
+            },
+            inj ? (uint32_t)(w->nb[1] / sizeof(float)) : 0u,
+            inj ? (uint32_t)(mm->nb[1] / sizeof(float)) : 0u,
+        },
+        (uint32_t) c.n_slots, (uint32_t) c.so, (uint32_t) c.ss1, (uint32_t) c.ss2,
+        c.sh != nullptr ? 1u : 0u,
+    };
+
+    if (inj) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, c.root), ggml_vk_tensor_subbuffer(ctx, sh), ggml_vk_tensor_subbuffer(ctx, res),
+              ggml_vk_tensor_subbuffer(ctx, pw), ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, hc_post),
+              ggml_vk_tensor_subbuffer(ctx, out), ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, mm) },
+            pc, { nt, 1, 1 });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, c.root), ggml_vk_tensor_subbuffer(ctx, sh), ggml_vk_tensor_subbuffer(ctx, res),
+              ggml_vk_tensor_subbuffer(ctx, pw), ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, hc_post),
+              ggml_vk_tensor_subbuffer(ctx, out) },
+            pc, { nt, 1, 1 });
+    }
+}
+
 // the qwen4exp GDN output norm in the order LLAMA_GDN_NORM_F16 emits it: RMS_NORM, MUL(gamma), SIGMOID(z), MUL, CPY(f16)
 static constexpr std::initializer_list<ggml_op> gdn_norm_f16_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_CPY };
 static bool ggml_vk_gdn_norm_f16_wiring(const ggml_cgraph * g, int i) {
@@ -18528,6 +18796,20 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     if (l == "TOPK_QSA" && !dev->pipeline_topk_radix_qsa) {
         return "no radix top-k pipeline";
     }
+    if (l.rfind("HC_MOE_EPI", 0) == 0) {
+        if (!ggml_vk_hc_moe_epi_enabled()) {
+            return "GGML_VK_HC_MOE_EPI=0";
+        }
+        if (!ggml_vk_fuse_hc_post_norm_enabled()) {
+            return "GGML_VK_FUSE_HC_POST_NORM=0";
+        }
+        if (l == "HC_MOE_EPI_INJ" && !ggml_vk_hc_inject_fold_enabled()) {
+            return "GGML_VK_HC_INJECT_FOLD=0";
+        }
+        if (dev->pipeline_dsv4_hc_moe_post_norm[1][0] == nullptr) {
+            return "no hc moe epilogue pipeline (needs fp16 and subgroup arithmetic)";
+        }
+    }
     return nullptr;
 }
 
@@ -19012,7 +19294,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // the src is allowed to overlap the memory for the destination.
         // The array is sized to handle the largest fusion (asserted later). Zero-initialised: a fusion branch that does not set
         // its flags gets the conservative answer (not elementwise) instead of whatever the stack held.
-        bool op_srcs_fused_elementwise[13] = {};
+        bool op_srcs_fused_elementwise[32] = {};
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
@@ -19020,6 +19302,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
         ctx->fused_hc_post_norm_inj = false;
+        ctx->fused_hc_moe_epi = 0;
+        ctx->fused_extra_dst = nullptr;
         ctx->fused_mm_cpy16 = false;
         ctx->fused_hc_up_mix = false;
         ctx->fused_mmid_cpy16 = false;
@@ -19029,9 +19313,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ssm_conv_direct = -1;
         ctx->fused_extra_srcs[0] = ctx->fused_extra_srcs[1] = nullptr;
         const char *fusion_string {};
+        int hc_moe_mode = HC_POST_NORM_NONE;
+        bool hc_moe_inj = false;
+        int hc_moe_adds = 0;
         if (!ctx->device->disable_fusion) {
-            uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-            if (num_adds) {
+            uint32_t num_adds = 0;
+            if ((hc_moe_adds = ggml_vk_can_fuse_hc_moe_epi(ctx, cgraph, i, hc_moe_mode, hc_moe_inj)) > 0) {
+                // the MoE slot adds and the shared-expert add (elided), then HC_POST_GATE_NORM(_CPY)(_INJ). Outputs: the combine
+                // (the next combine's residual), the norm, and with the inject fold the inject; the norm is then not the last
+                // node, so it is the extra written tensor. No source overlaps an output (the matcher checked the kernel's
+                // inputs), and only the cast's own src[1] (its destination) is elementwise.
+                const bool cpy = hc_moe_mode == HC_POST_NORM_GATE_CPY;
+                ctx->fused_hc_moe_epi = hc_moe_adds;
+                ctx->fused_hc_post_norm = hc_moe_mode;
+                ctx->fused_hc_post_norm_inj = hc_moe_inj;
+                ctx->num_additional_fused_ops = hc_moe_adds + (hc_moe_inj ? 8 : cpy ? 6 : 5);
+                ctx->fused_ops_write_mask |= 1 << (hc_moe_adds + 3);
+                if (hc_moe_inj) {
+                    ctx->fused_extra_dst = cgraph->nodes[i + hc_moe_adds + 6];
+                }
+                fusion_string = hc_moe_inj ? "HC_MOE_EPI_INJ" : cpy ? "HC_MOE_EPI" : "HC_MOE_EPI_F32";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                op_srcs_fused_elementwise[hc_moe_adds + 6] = cpy;
+            } else if ((num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i))) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
@@ -19134,6 +19438,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_norm = cpy ? HC_POST_NORM_GATE_CPY : HC_POST_NORM_GATE;
                 ctx->fused_hc_post_norm_inj = inj;
                 ctx->num_additional_fused_ops = inj ? 8 : cpy ? 6 : 5;
+                // with the inject the norm rows are not the last node: written all the same, so later readers sync on them
+                ctx->fused_extra_dst = inj ? cgraph->nodes[i + 6] : nullptr;
                 ctx->fused_ops_write_mask |= 1 << 3;
                 fusion_string = inj ? "HC_POST_GATE_NORM_CPY_INJ" : cpy ? "HC_POST_GATE_NORM_CPY" : "HC_POST_GATE_NORM";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
@@ -19143,6 +19449,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_norm = HC_NORM_ROWS_CPY;
                 ctx->fused_hc_post_norm_inj = inj;
                 ctx->num_additional_fused_ops = inj ? 4 : 2;
+                ctx->fused_extra_dst = inj ? cgraph->nodes[i + 2] : nullptr;
                 fusion_string = inj ? "RMS_NORM_MUL_CPY_INJ" : "RMS_NORM_MUL_CPY";
                 // the f16 rows are half the f32 rows' size: an overlap with the norm input would be a race,
                 // so only the cast's src[1] (its own destination) is elementwise
@@ -19372,6 +19679,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
                 ctx->fused_hc_post_norm_inj = false;
+                ctx->fused_hc_moe_epi = 0;
+                ctx->fused_extra_dst = nullptr;
                 ctx->fused_mm_cpy16 = false;
                 ctx->fused_hc_up_mix = false;
                 ctx->fused_mmid_cpy16 = false;
@@ -19697,6 +20006,152 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
             }
             if (kept) {
+                continue;
+            }
+        }
+        // HC_MOE_EPI: the MoE slot adds, the shared-expert add, the FFN-side combine's gate chain + DSV4_HC_POST and the next
+        // mix's norm (+ CPY f16) (+ the inject view and MUL_MAT) become one consecutive run. build_moe_ffn emits the slot adds
+        // right after the expert GEMM, and the shared-expert branch (its down GEMM, gate GEMM, SIGMOID, MUL) only in front
+        // of the shared ADD, so that branch, and whatever else the run needs from in between, moves in front of the adds. The
+        // run's inputs stay allocated through its last node, which the fused kernel writes while it reads them.
+        if (ggml_vk_hc_moe_epi_enabled() && ggml_vk_fuse_hc_post_norm_enabled() && graph->nodes[first_unused]->op == GGML_OP_ADD) {
+            auto const &hc_moe_epi_order = [&](int a0, std::vector<int> & prereq) -> std::vector<int> {
+                std::vector<int> run;
+                const ggml_tensor * f = graph->nodes[a0];
+                // the first slot add: two views of one tensor (the routed experts' outputs)
+                if (!f->src[0] || !f->src[1] || f->src[0]->view_src == nullptr || f->src[0]->view_src != f->src[1]->view_src ||
+                    (f->src[0]->type != GGML_TYPE_F16 && f->src[0]->type != GGML_TYPE_F32)) {
+                    return {};
+                }
+                int k = a0;
+                run.push_back(k);
+                while (k + 1 < graph->n_nodes && !used[k + 1] && graph->nodes[k + 1]->op == GGML_OP_ADD &&
+                       (graph->nodes[k + 1]->src[0] == graph->nodes[k] || graph->nodes[k + 1]->src[1] == graph->nodes[k])) {
+                    run.push_back(++k);
+                }
+                const int lim = std::min(k + 48, graph->n_nodes);
+                // the shared-expert ADD (unless it already followed), then the combine whose x is the sum
+                int hp = -1;
+                for (int j = k + 1; j < lim && hp < 0; ++j) {
+                    const ggml_tensor * nj = graph->nodes[j];
+                    if (used[j]) {
+                        continue;
+                    }
+                    const ggml_tensor * tip = graph->nodes[run.back()];
+                    if (nj->op == GGML_OP_ADD && graph->nodes[run.back()]->op == GGML_OP_ADD && run.back() == k &&
+                        (nj->src[0] == tip || nj->src[1] == tip)) {
+                        run.push_back(j);
+                    } else if (nj->op == GGML_OP_DSV4_HC_POST && nj->src[0] == tip) {
+                        hp = j;
+                    }
+                }
+                if (hp < 3 || !match_pattern(hc_post_gate_pattern, hp - 3)) {
+                    return {};
+                }
+                for (int j = hp - 3; j <= hp; ++j) {
+                    run.push_back(j);
+                }
+                // the next mix's RMS_NORM -> MUL (-> CPY f16) (-> its 2-D view -> the inject MUL_MAT), as the HC_POST_GATE_NORM rule
+                const ggml_op want[3] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY };
+                const ggml_tensor * want_src = graph->nodes[hp];
+                int n_tail = 0;
+                for (int j = hp + 1; j < std::min(hp + 12, graph->n_nodes) && n_tail < 3; ++j) {
+                    const ggml_tensor * nj = graph->nodes[j];
+                    if (used[j] || is_empty(nj)) {
+                        continue;
+                    }
+                    if (nj->op != want[n_tail] || nj->src[0] != want_src || (n_tail == 2 && nj->type != GGML_TYPE_F16)) {
+                        break;
+                    }
+                    run.push_back(j);
+                    want_src = nj;
+                    n_tail++;
+                }
+                if (n_tail < 2) {
+                    return {};
+                }
+                if (n_tail == 3 && ggml_vk_hc_inject_fold_enabled()) {
+                    const ggml_tensor * cpy = graph->nodes[run.back()];
+                    int v = -1, m = -1;
+                    for (int j = run.back() + 1; j < std::min(run.back() + 8, graph->n_nodes) && m < 0; ++j) {
+                        const ggml_tensor * nj = graph->nodes[j];
+                        if (used[j]) {
+                            continue;
+                        }
+                        if (v < 0 && (nj->op == GGML_OP_RESHAPE || nj->op == GGML_OP_VIEW) && nj->src[0] == cpy) {
+                            v = j;
+                        } else if (v >= 0 && nj->op == GGML_OP_MUL_MAT && nj->src[1] == graph->nodes[v] && nj->src[0]->op == GGML_OP_NONE) {
+                            m = j;
+                        } else if (!is_empty(nj)) {
+                            break;
+                        }
+                    }
+                    if (m >= 0) {
+                        run.push_back(v);
+                        run.push_back(m);
+                    }
+                }
+                // what the run needs from between its nodes (sources, and nodes that read storage it overwrites), transitively
+                int hi = a0;
+                std::vector<bool> member(graph->n_nodes, false);
+                for (int r : run) {
+                    member[r] = true;
+                    hi = std::max(hi, r);
+                }
+                std::vector<bool> need(hi + 1, false);
+                for (int m = hi; m > a0; --m) {
+                    if (used[m] || (!member[m] && !need[m])) {
+                        continue;
+                    }
+                    for (int c = a0 + 1; c < m; ++c) {
+                        if (!used[c] && !member[c] && !need[c] && is_src_of(graph->nodes[m], graph->nodes[c])) {
+                            need[c] = true;
+                        }
+                    }
+                }
+                prereq.clear();
+                for (int c = a0 + 1; c < hi; ++c) {
+                    if (!need[c]) {
+                        continue;
+                    }
+                    // a node the run needs that itself depends on the run: no valid order, leave the graph as it is
+                    for (int r : run) {
+                        if (r < c && is_src_of(graph->nodes[c], graph->nodes[r])) {
+                            return {};
+                        }
+                    }
+                    prereq.push_back(c);
+                }
+                return run;
+            };
+            std::vector<int> prereq;
+            const std::vector<int> run = hc_moe_epi_order(first_unused, prereq);
+            if (!run.empty()) {
+                for (int c : prereq) {
+                    new_order.push_back(graph->nodes[c]);
+                    used_node_set.insert(graph->nodes[c]);
+                    used[c] = true;
+                }
+                if (params && params->add_alloc_dep) {
+                    ggml_tensor * last = graph->nodes[run.back()];
+                    std::set<ggml_tensor *> seen;
+                    for (int r : run) {
+                        ggml_tensor * node = graph->nodes[r];
+                        for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+                            if (node->src[s] && seen.insert(node->src[s]).second) {
+                                params->add_alloc_dep(params->user_data, node->src[s], last);
+                            }
+                        }
+                    }
+                }
+                for (int r : run) {
+                    new_order.push_back(graph->nodes[r]);
+                    used_node_set.insert(graph->nodes[r]);
+                    used[r] = true;
+                }
+                while (first_unused < graph->n_nodes && used[first_unused]) {
+                    first_unused++;
+                }
                 continue;
             }
         }

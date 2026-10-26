@@ -998,6 +998,8 @@ struct vk_device_struct {
     // HC_POST(_GATE) + RMS_NORM + MUL (+ CPY f16) / RMS_NORM + MUL (+ CPY f16): [has_post][out_f16]
     vk_pipeline pipeline_dsv4_hc_post_norm[2][2];
     vk_pipeline pipeline_dsv4_hc_post_norm_inj[2];   // [has_post], f16 norm + the inject projection
+    // MoE epilogue (slot sum + shared expert) + HC_POST_GATE + RMS_NORM + MUL (+ CPY f16) (+ inject): [slot f16][f32 norm, f16 norm, f16 norm + inject]
+    vk_pipeline pipeline_dsv4_hc_moe_post_norm[2][3];
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1391,6 +1393,7 @@ struct ggml_backend_vk_context {
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
+    int fused_hc_moe_epi {};   // HC_MOE_EPI: number of ADD nodes (routed slot adds + the shared-expert add) in front of the HC post norm chain
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {
@@ -1407,6 +1410,7 @@ struct ggml_backend_vk_context {
     int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
     // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
     const ggml_tensor * fused_extra_srcs[2] {};
+    const ggml_tensor * fused_extra_dst {};   // written by the fused kernel besides the write-mask nodes (synced like them)
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;

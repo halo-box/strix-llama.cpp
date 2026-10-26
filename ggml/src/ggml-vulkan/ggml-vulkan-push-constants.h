@@ -248,6 +248,18 @@ struct vk_op_dsv4_hc_post_norm_inj_push_constants {
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants) <= 128);
 
+// dsv4_hc_moe_post_norm.comp: the dsv4_hc_post_norm_inj fields (base.sx1 = the shared-expert token stride), then the routed slots:
+// count, slot 0 offset, slot stride and token stride (elements), and whether a shared-expert term is added
+struct vk_op_dsv4_hc_moe_post_norm_push_constants {
+    vk_op_dsv4_hc_post_norm_inj_push_constants inj;
+    uint32_t n_slots;
+    uint32_t so;
+    uint32_t ss1;
+    uint32_t ss2;
+    uint32_t has_sh;
+};
+static_assert(sizeof(vk_op_dsv4_hc_moe_post_norm_push_constants) <= 128);
+
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
     uint32_t ne01;

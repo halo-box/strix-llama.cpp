@@ -4354,6 +4354,198 @@ struct test_hc_post_norm : public test_case {
     }
 };
 
+// qwen4exp MoE epilogue into the FFN-side hc combine + the next grouped norm, in model order (HC_MOE_EPI on Vulkan): the routed
+// slots [embd, n_used, T] (f16 as LLM_FUSED_OP_MOE_F16 stores them, or f32) summed by build_moe_ffn's ADD chain, the shared
+// expert added (sh 0: none, 1: an f32 input, 2: the model's branch, down GEMM * sigmoid(gate GEMM), emitted between the slot
+// adds and its ADD), then the gated combine, RMS_NORM -> MUL (-> CPY f16, padded rows with pad > 0) and the next mix's inject
+// and down readers. exact: the chain is built twice over the same inputs, the second with its slot sum also a graph output
+// (so it runs unfused: MULTI_ADD + ADD + the norm kernel), and the outputs are the scaled differences of the two plus 1, compared
+// with a zero tolerance: any bit the fused kernel computes differently from the unfused chain fails the case.
+struct test_hc_moe_epi : public test_case {
+    const int embd, hc, tokens, n_used;
+    const bool slot_f16;
+    const int out_f16;   // 0: f32 norm (the decode form), 1: f16 norm
+    const int sh;
+    const int pad;
+    const bool exact;
+    std::vector<ggml_tensor *> verify;
+
+    test_hc_moe_epi(int embd, int hc, int tokens, int n_used, bool slot_f16 = true, int out_f16 = 1, int sh = 2, int pad = 0, bool exact = false)
+        : embd(embd), hc(hc), tokens(tokens), n_used(n_used), slot_f16(slot_f16), out_f16(out_f16), sh(sh), pad(pad), exact(exact) {
+        GGML_ASSERT(pad == 0 || out_f16);
+    }
+    std::string op_desc(ggml_tensor *) override { return "HC_MOE_EPI"; }
+    std::string vars() override { return VARS_TO_STR9(embd, hc, tokens, n_used, slot_f16, out_f16, sh, pad, exact); }
+
+    // the label the Vulkan matcher picks: the inject fold needs the f16 norm, four streams and 8-column groups
+    const char * label() const {
+        if (!out_f16) {
+            return "HC_MOE_EPI_F32";
+        }
+        return hc == 4 && embd % 8 == 0 && env_knob_on("GGML_VK_HC_INJECT_FOLD") ? "HC_MOE_EPI_INJ" : "HC_MOE_EPI";
+    }
+
+    // GGML_VK_TEST_REQUIRE_HC_MOE_EPI=1: one fused epilogue per graph with the knobs on (the exact twin runs unfused), none
+    // with GGML_VK_HC_MOE_EPI=0 (the negative control); with it fused, no MULTI_ADD is left
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_MOE_EPI")) {
+            return true;
+        }
+        auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
+        const bool on = skip == nullptr || skip(backend, label()) == nullptr;
+        int64_t n_all = 0;
+        for (const char * l : { "HC_MOE_EPI", "HC_MOE_EPI_INJ", "HC_MOE_EPI_F32" }) {
+            n_all += std::max<int64_t>(0, dispatch_census_count(backend, l));
+        }
+        const int64_t n_lab = dispatch_census_count(backend, label());
+        const int64_t n_madd = dispatch_census_count(backend, "MULTI_ADD");
+        const bool ok = on ? (n_all == 1 && n_lab == 1 && (exact || n_madd == 0)) : n_all == 0;
+        if (!ok) {
+            msg = std::string(label()) + " dispatches: " + std::to_string(n_lab) + " (all HC_MOE_EPI " + std::to_string(n_all) +
+                  ", MULTI_ADD " + std::to_string(n_madd) + "), expected " + (on ? "1" : "0");
+        }
+        return ok;
+    }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+    double max_nmse_err() override { return exact ? 0.0 : 5e-4; }
+    // exact: the number of elements that differ (the nmse of these outputs would square 1e12-scaled differences in float)
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return test_case::err(a, b, n);
+        }
+        size_t n_diff = 0;
+        for (size_t i = 0; i < n; ++i) {
+            n_diff += a[i] != b[i];
+        }
+        return (double) n_diff;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) init_tensor_uniform(t);
+        }
+    }
+
+    struct inputs {
+        ggml_tensor * residual, * inject, * slots, * sh_in, * sh_act, * w_sd, * g_x, * w_g, * gamma_flat, * w_inj, * w_down;
+    };
+
+    // one chain over the inputs; returns { combine, norm (as stored), inject, down } and the slot sum through *moe
+    std::vector<ggml_tensor *> chain(ggml_context * ctx, const inputs & in, ggml_tensor ** moe) {
+        const int64_t hc_dim = int64_t(embd) * hc;
+        ggml_tensor * v[64] = {};
+        GGML_ASSERT(n_used >= 2 && n_used <= 64);
+        // as build_moe_ffn: the slots and all the views are expanded before the adds
+        if (gf) { ggml_build_forward_expand(gf, in.slots); }
+        for (int i = 0; i < n_used; ++i) {
+            v[i] = ggml_view_2d(ctx, in.slots, embd, tokens, in.slots->nb[2], i * in.slots->nb[1]);
+            if (gf) { ggml_build_forward_expand(gf, v[i]); }
+        }
+        ggml_tensor * sum = v[0];
+        for (int i = 1; i < n_used; ++i) {
+            sum = (i == 1 && slot_f16) ? ggml_add_cast(ctx, sum, v[i], GGML_TYPE_F32) : ggml_add(ctx, sum, v[i]);
+            if (gf) { ggml_build_forward_expand(gf, sum); }
+        }
+        *moe = sum;
+        ggml_tensor * x = sum;
+        if (sh == 1) {
+            x = ggml_add(ctx, sum, in.sh_in);
+        } else if (sh == 2) {
+            ggml_tensor * down = ggml_mul_mat(ctx, in.w_sd, in.sh_act);
+            ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, in.w_g, in.g_x));
+            x = ggml_add(ctx, sum, ggml_mul(ctx, down, gate));
+        }
+        ggml_tensor * w = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, in.inject, 1.0f / hc)), 2.0f);
+        ggml_tensor * post = ggml_dsv4_hc_post(ctx, x, in.residual, w, nullptr);
+        if (gf) { ggml_build_forward_expand(gf, post); }
+        ggml_tensor * gamma = ggml_reshape_2d(ctx, in.gamma_flat, embd, hc);
+        if (gf) { ggml_build_forward_expand(gf, gamma); }
+        ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, post, 1e-6f), gamma);
+        if (pad > 0) {
+            ggml_tensor * buf = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hc_dim + pad, tokens);
+            ggml_tensor * dst = ggml_view_3d(ctx, buf, embd, hc, tokens, embd * ggml_element_size(buf), buf->nb[1], 0);
+            if (gf) { ggml_build_forward_expand(gf, dst); }
+            xn = ggml_cpy(ctx, xn, dst);
+        } else if (out_f16) {
+            xn = ggml_cast(ctx, xn, GGML_TYPE_F16);
+        }
+        if (gf) { ggml_build_forward_expand(gf, xn); }
+        ggml_tensor * xn2 = pad > 0 ? ggml_view_2d(ctx, xn, hc_dim, tokens, xn->nb[2], 0) : ggml_reshape_2d(ctx, xn, hc_dim, tokens);
+        ggml_tensor * inj = ggml_mul_mat(ctx, in.w_inj, xn2);
+        ggml_tensor * lo  = ggml_mul_mat(ctx, in.w_down, xn2);
+        if (gf) { ggml_build_forward_expand(gf, inj); ggml_build_forward_expand(gf, lo); }
+        return { post, xn, inj, lo };
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        const int64_t hc_dim = int64_t(embd) * hc;
+        // inputs are flagged so the allocator never reuses them in place (the CPU reference reads them as given)
+        inputs in {};
+        in.residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        in.inject   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        in.slots    = ggml_new_tensor_3d(ctx, slot_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, embd, n_used, tokens);
+        ggml_set_name(in.slots, "slots");
+        for (ggml_tensor * t : { in.residual, in.inject, in.slots }) {
+            ggml_set_input(t);
+        }
+        if (sh == 1) {
+            in.sh_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, tokens);
+            ggml_set_input(in.sh_in);
+        } else if (sh == 2) {
+            in.sh_act = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, tokens);
+            in.g_x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, tokens);
+            ggml_set_input(in.sh_act);
+            ggml_set_input(in.g_x);
+            in.w_sd = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 64, embd);
+            in.w_g  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 1);
+        }
+        in.gamma_flat = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
+        in.w_inj  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, hc);
+        in.w_down = ggml_new_tensor_2d(ctx, out_f16 && hc_dim % 32 == 0 ? GGML_TYPE_Q8_0 : GGML_TYPE_F32, hc_dim, 64);
+        // every input and weight also as an output, so none is ever freed: in the exact twin the allocator would otherwise
+        // place the second chain's norm over gamma after its last reader (a weight buffer in the model), and the overlap
+        // check would then run that chain on other kernels than the first
+        for (ggml_tensor * t : { in.residual, in.inject, in.slots, in.sh_in, in.sh_act, in.g_x, in.w_sd, in.w_g, in.gamma_flat, in.w_inj, in.w_down }) {
+            if (t) {
+                ggml_set_input(t);
+                ggml_set_output(t);
+            }
+        }
+
+        ggml_tensor * moe_a = nullptr;
+        std::vector<ggml_tensor *> a = chain(ctx, in, &moe_a);
+        if (!exact) {
+            for (ggml_tensor * t : a) {
+                ggml_set_output(t);
+                verify.push_back(t);
+            }
+            return a.back();
+        }
+        ggml_tensor * moe_b = nullptr;
+        std::vector<ggml_tensor *> b = chain(ctx, in, &moe_b);
+        ggml_set_output(moe_b);   // keeps the second chain unfused
+        ggml_tensor * last = nullptr;
+        for (size_t i = 0; i < a.size(); ++i) {
+            ggml_tensor * ta = a[i]->type == GGML_TYPE_F32 ? a[i] : ggml_cast(ctx, a[i], GGML_TYPE_F32);
+            ggml_tensor * tb = b[i]->type == GGML_TYPE_F32 ? b[i] : ggml_cast(ctx, b[i], GGML_TYPE_F32);
+            if (pad > 0 && i == 1) {
+                // the padded norm is a strided view: compare its rows through contiguous copies
+                ta = ggml_cont(ctx, ta);
+                tb = ggml_cont(ctx, tb);
+            }
+            // equal bits give exactly 1; a difference d gives 1 + 1e12 d, which differs from 1 for any |d| > 1e-19
+            last = ggml_scale_bias(ctx, ggml_sub(ctx, ta, tb), 1e12f, 1.0f);
+            ggml_set_output(last);
+            verify.push_back(last);
+            if (gf) { ggml_build_forward_expand(gf, last); }
+        }
+        return last;
+    }
+};
+
 // quantized weights x an f16 B (the f16 hc norm into the hc down GEMM); pad > 0: B rows with a k + pad stride (padded
 // xn / GDN norm), read in place on Vulkan
 struct test_mul_mat_f16b : public test_case {
@@ -12656,6 +12848,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_hc_post_norm(2560, 4, tokens, 1, GGML_TYPE_Q8_0, 128));
     }
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 2, GGML_TYPE_Q8_0, 128));
+    // HC_MOE_EPI: the Flash-Next shape (n_embd 2560, 4 streams, 10 routed slots + the shared expert) at prefill (f16 norm and
+    // the inject fold, padded rows as shipped) and decode (f32 norm); exact = bit-identical to the unfused chain
+    for (int tokens : {1, 7, 32, 64, 513}) {
+        for (bool exact : {false, true}) {
+            test_cases.emplace_back(new test_hc_moe_epi(2560, 4, tokens, 10, true, tokens >= 32 ? 1 : 0, 2, 0, exact));
+            if (tokens >= 32) {
+                test_cases.emplace_back(new test_hc_moe_epi(2560, 4, tokens, 10, true, 1, 2, 128, exact));
+                test_cases.emplace_back(new test_hc_moe_epi(2560, 4, tokens, 10, true, 0, 2, 0, exact));
+            } else {
+                test_cases.emplace_back(new test_hc_moe_epi(2560, 4, tokens, 10, true, 1, 2, 0, exact));
+            }
+        }
+    }
+    for (bool exact : {false, true}) {
+        test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 64, 10, false, 1, 2, 0, exact));   // f32 slots
+        test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 64, 10, false, 0, 1, 0, exact));
+        test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 64, 8, true, 1, 1, 0, exact));     // shared expert as an input
+        test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 64, 2, true, 1, 0, 0, exact));     // no shared expert, one slot add
+        test_cases.emplace_back(new test_hc_moe_epi(4096, 4, 40, 10, true, 1, 2, 0, exact));    // widest row
+        test_cases.emplace_back(new test_hc_moe_epi(288, 4, 40, 10, true, 1, 2, 0, exact));     // a partial vec4 pass
+        test_cases.emplace_back(new test_hc_moe_epi(260, 4, 33, 10, true, 1, 2, 0, exact));     // n_embd % 8 != 0: no inject fold
+        test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 64, 12, true, 1, 2, 0, exact));    // more slots than MULTI_ADD takes
+    }
+    // the Flash-Next pp2048 ubatch (op timing: eval with GGML_VK_PERF_LOGGER, perf mode skips graph_optimize)
+    test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 2048, 10, true, 1, 2, 128));
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 1, GGML_TYPE_Q4_0, 8));
     // bf16: a bf16 weight LLAMA_BF16_TO_F16 kept (out of f16 range) meets the f16 mixed stream
     // B paths: f16-B native (q8_0), int8 MMQ quantizing the f16 B (q4_0), the dense router (q4_K), non-quantized (bf16)
@@ -17132,6 +17349,9 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("RMS_NORM_VIEW_SET_ROWS", new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false), "RMS_NORM_VIEW_SET_ROWS/3=1");
     add("ROPE_VIEW_SET_ROWS",  new test_rope_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 128, 32, 8, 1 }, GGML_ROPE_TYPE_NORMAL), "ROPE_VIEW_SET_ROWS/3=1");
     add("HC_POST_GATE",        new test_dsv4_hc_post(4096, 21, false, true), "HC_POST_GATE/4=1");
+    add("HC_MOE_EPI_INJ",      new test_hc_moe_epi(256, 4, 32, 4, true, 1, 1), "HC_MOE_EPI_INJ/13=1");
+    add("HC_MOE_EPI",          new test_hc_moe_epi(260, 4, 32, 4, true, 1, 1), "HC_MOE_EPI/11=1");
+    add("HC_MOE_EPI_F32",      new test_hc_moe_epi(256, 4, 7, 4, true, 0, 2), "HC_MOE_EPI_F32/10=1;SIGMOID_MUL/2=1");
     add("GELU_MUL",            new test_unary_mul(GGML_UNARY_OP_GELU,     GGML_TYPE_F32, { 128, 2, 2, 2 }), "GELU_MUL/2=1");
     add("SIGMOID_MUL",         new test_unary_mul(GGML_UNARY_OP_SIGMOID,  GGML_TYPE_F32, { 128, 2, 2, 2 }), "SIGMOID_MUL/2=1");
     add("SILU_MUL",            new test_unary_mul(GGML_UNARY_OP_SILU,     GGML_TYPE_F32, { 128, 2, 2, 2 }), "SILU_MUL/2=1");
