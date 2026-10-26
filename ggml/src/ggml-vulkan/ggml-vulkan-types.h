@@ -427,6 +427,7 @@ static constexpr uint32_t FA_FLAG_MULTI_ROW    = 256;   // host only: build the 
 static constexpr uint32_t FA_FLAG_MR_LAZY      = 512;   // multi-row: skip identity O rescales
 static constexpr uint32_t FA_FLAG_MR_NOEB      = 1024;   // multi-row: no loop-end barrier
 static constexpr uint32_t FA_FLAG_MR_VPOST     = 2048;  // multi-row: V^T loads before the softmax barrier
+static constexpr uint32_t FA_FLAG_OUT_GATE     = 4096;  // multi-row: the store applies sigmoid(gate) (binding 8)
 
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
@@ -1389,6 +1390,7 @@ struct ggml_backend_vk_context {
     bool fused_hc_up_mix {};   // MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) -> one int8 MMQ GEMM with the mix epilogue
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
+    bool fused_fa_out_gate {};  // FLASH_ATTN_EXT+RESHAPE+VIEW+CONT+SIGMOID+MUL: the attention output gate after FA
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {

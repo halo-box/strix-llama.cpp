@@ -54,6 +54,9 @@ layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
 layout (binding = 2) readonly buffer V {float16_t data_v[];};
 layout (binding = 2) readonly buffer VV4 {f16vec4 data_vv4[];};
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
+// OUT_GATE: the attention output gate, read in place from the [q | gate] per-head interleaved Q projection
+// (element (token, head, d) at (token * ne1 + head) * 2 * HSV + d); the store writes O * sigmoid(gate)
+layout (binding = 8) readonly buffer G {float data_g[];};
 
 // one 16 x 16 f16 Q tile per subgroup at the start, then the P tile [ROWS][KT] (f16vec4 units)
 const uint32_t pstride = KT / 4 + 2;
@@ -84,6 +87,7 @@ const bool MR_LAZY = (Flags & 512) != 0;
 const bool MR_NOEB = (Flags & 1024) != 0;
 // issue the tile's V^T loads right after the S store, before the softmax barrier
 const bool MR_VPOST = (Flags & 2048) != 0;
+const bool OUT_GATE = (Flags & 4096) != 0;
 
 
 // 2-bit mask_opt state of 64-key block j for this workgroup's tokens
@@ -377,6 +381,15 @@ void main() {
             OAcc[rb][t] = OAcc[rb][t] * SC;
             const uint32_t d0 = (t * NSG + sg) * 16;
             if (tokb + 16 <= N) {
+                if (OUT_GATE) {
+                    // same accumulator layout as OAcc, so element i of both is the same (token, dim)
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> GT;
+                    coopMatLoad(GT, data_g, (tokb * p.ne1 + h) * 2 * HSV + d0, p.ne1 * 2 * HSV, gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for (uint32_t e = 0; e < GT.length(); ++e) {
+                        GT[e] = 1.0 / (1.0 + exp(-GT[e]));
+                    }
+                    OAcc[rb][t] = OAcc[rb][t] * GT;
+                }
                 // dst [HSV][ne1 heads][ne2 tokens]: row = token (stride ne1 * HSV), col = dim
                 coopMatStore(OAcc[rb][t], data_o, o_base + (tokb * p.ne1 + h) * HSV + d0, p.ne1 * HSV, gl_CooperativeMatrixLayoutRowMajor);
             } else if (tokb < N) {
@@ -387,7 +400,11 @@ void main() {
                 [[unroll]] for (uint32_t e = gl_SubgroupInvocationID; e < 256; e += 32) {
                     const uint32_t r = e / 16, c = e % 16;
                     if (tokb + r < N) {
-                        data_o[o_base + ((tokb + r) * p.ne1 + h) * HSV + d0 + c] = D_TYPE(s_sh[sg * 256 + e]);
+                        float o = s_sh[sg * 256 + e];
+                        if (OUT_GATE) {
+                            o *= 1.0 / (1.0 + exp(-data_g[((tokb + r) * p.ne1 + h) * 2 * HSV + d0 + c]));
+                        }
+                        data_o[o_base + ((tokb + r) * p.ne1 + h) * HSV + d0 + c] = D_TYPE(o);
                     }
                 }
                 subgroupBarrier();

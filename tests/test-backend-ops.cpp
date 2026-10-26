@@ -10866,6 +10866,99 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// the Qwen3-Next / Qwen3.5 / qwen4exp attention output gate in model order: the Q projection holds [q | gate] per head, and
+// FA -> reshape is multiplied by sigmoid(cont(gate view)). Through the scheduler, so graph_optimize runs and must keep the
+// chain behind the FA. GGML_VK_TEST_REQUIRE_FA_OUT_GATE=1 asserts the FA_OUT_GATE fusion; with
+// GGML_VK_TEST_REQUIRE_FA_OUT_GATE_EPI=1 also that the cases marked epi take the multi-row store epilogue
+struct test_fa_out_gate : public test_case {
+    const int64_t hs;      // head size (K = V)
+    const int64_t nh;      // query heads
+    const int64_t nh_kv;   // KV heads
+    const int64_t kv;
+    const int64_t nb;      // tokens
+    const bool gate_first; // MUL(sigmoid, attn) instead of MUL(attn, sigmoid)
+    const bool epi;        // expected to take the multi-row epilogue on RADV RDNA3
+    std::vector<ggml_tensor *> verify;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FA_OUT_GATE";
+    }
+    std::string vars() override { return VARS_TO_STR6(hs, nh, nh_kv, kv, nb, gate_first); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * nh * nb * 2 * hs * kv;
+    }
+
+    test_fa_out_gate(int64_t hs = 256, int64_t nh = 24, int64_t nh_kv = 2, int64_t kv = 256, int64_t nb = 256, bool gate_first = false, bool epi = false)
+        : hs(hs), nh(nh), nh_kv(nh_kv), kv(kv), nb(nb), gate_first(gate_first), epi(epi) {}
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_FA_OUT_GATE", "FA_OUT_GATE")) {
+            return true;
+        }
+        // every case is eligible, so GGML_VK_FA_OUT_GATE=0 under the assert is the negative control
+        const int64_t fused = dispatch_census_count(backend, "FA_OUT_GATE");
+        const int64_t e = dispatch_census_count(backend, "path:FA_OUT_GATE_EPILOGUE");
+        const int64_t f = dispatch_census_count(backend, "path:FA_OUT_GATE_SIGMUL");
+        if (fused != 1 || e + f != fused) {
+            msg = "FA_OUT_GATE dispatches: " + std::to_string(fused) + " (epilogue " + std::to_string(e) + ", sigmul " + std::to_string(f) + ")";
+            return false;
+        }
+        if (env_opt_in("GGML_VK_TEST_REQUIRE_FA_OUT_GATE_EPI") && e != (epi ? 1 : 0)) {
+            msg = "FA_OUT_GATE epilogue dispatches: " + std::to_string(e) + " (expected " + std::to_string(epi ? 1 : 0) + ")";
+            return false;
+        }
+        return true;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (t->op == GGML_OP_NONE && t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        // Q projection [q | gate] per head, then the roped q as its own tensor (the model's rope output)
+        ggml_tensor * qf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * hs, nh, nb);
+        ggml_set_name(qf, "qf");
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh, nb);
+        ggml_set_name(q, "q");
+        // the KV cache layout: [hs, heads, kv] rows read through a permute
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, nh_kv, kv);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, nh_kv, kv);
+        ggml_set_name(v, "v");
+        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, nb);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * fa = ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3), ggml_permute(ctx, k, 0, 2, 1, 3),
+                                               ggml_permute(ctx, v, 0, 2, 1, 3), m, 1.0f / sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_prec_set_acc(fa, GGML_PREC_F32);
+        ggml_tensor * attn = ggml_reshape_2d(ctx, fa, hs * nh, nb);
+        // the model emits the attention before the gate chain, whichever MUL operand it is
+        if (gf) { ggml_build_forward_expand(gf, attn); }
+
+        ggml_tensor * gate = ggml_view_3d(ctx, qf, hs, nh, nb, qf->nb[1], qf->nb[2], hs * ggml_element_size(qf));
+        gate = ggml_cont_2d(ctx, gate, hs * nh, nb);
+        ggml_tensor * sig = ggml_sigmoid(ctx, gate);
+        ggml_tensor * out = gate_first ? ggml_mul(ctx, sig, attn) : ggml_mul(ctx, attn, sig);
+        ggml_set_name(out, "out");
+        verify.push_back(out);
+        return out;
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with a top-k sparse selection hint (DeepSeek V4 CSA shape).
 // The kq_mask encodes the same selection as the top_k indices, so a backend that ignores
 // the hint (CPU) computes the identical result densely — this is exactly the contract
@@ -15477,6 +15570,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {8, 1}, 512, 75, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 512, 96, true, false, 0, 30.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
 
+    // attention output gate after FA (FA_OUT_GATE): multi-row epilogue at head size 256 / >= 64 tokens / KV % 64 == 0
+    // (partial last tile at 200 tokens), the sigmoid-mul fallback elsewhere (head size 128, decode, KV % 64 != 0)
+    test_cases.emplace_back(new test_fa_out_gate(256, 24, 2, 256, 256, false, true));
+    test_cases.emplace_back(new test_fa_out_gate(256, 24, 2, 256, 200, false, true));
+    test_cases.emplace_back(new test_fa_out_gate(256, 8, 2, 512, 64, true, true));
+    test_cases.emplace_back(new test_fa_out_gate(256, 4, 4, 128, 96, false, true));
+    test_cases.emplace_back(new test_fa_out_gate(256, 24, 2, 256, 1, false, false));
+    test_cases.emplace_back(new test_fa_out_gate(256, 24, 2, 200, 128, false, false));
+    test_cases.emplace_back(new test_fa_out_gate(128, 8, 2, 256, 96, true, false));
+
     // dense-permuted iq4_nl K/V at prefill batch sizes: iq4_nl has no native FA shader, so these
     // exercise the only supported route (the dequant-once path), incl. sinks and mixed-with-f16
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL, {0, 2, 1, 3}, false));
@@ -16006,6 +16109,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // the Flash-Next attention output gate at one pp2048 ubatch (24 heads, 2 KV heads, head size 256)
+    test_cases.emplace_back(new test_fa_out_gate(256, 24, 2, 2048, 2048, false, true));
 
     if (getenv("GGML_PERF_MOE")) {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
