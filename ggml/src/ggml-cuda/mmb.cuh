@@ -36,3 +36,8 @@ bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_ten
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 void ggml_cuda_mmb_release_all(ggml_backend_cuda_context & ctx);
+// The BF16 shadows are copies of weights, keyed by the weight's address. Weight memory that is freed or rewritten
+// drops the shadows built from it, in every context; a context that lost one rebuilds its captured graphs, which hold
+// the shadow's address (ggml_cuda_mmb_shadow_dropped, once per drop).
+void ggml_cuda_mmb_shadow_forget(const void * base, size_t size);
+bool ggml_cuda_mmb_shadow_dropped(ggml_backend_cuda_context & ctx);
