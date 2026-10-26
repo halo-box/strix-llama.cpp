@@ -4246,6 +4246,18 @@ struct test_hc_post_norm : public test_case {
 
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        // GGML_VK_TEST_REQUIRE_HC_INJECT=1: the f16 norm modes fold the inject MUL_MAT into the norm kernel (every shape here
+        // fits it), so GGML_VK_HC_INJECT_FOLD=0 under the assert is the negative control
+        // a norm the overlap check keeps unfused (the allocator placed the f16 rows over a source) runs the inject as before
+        const char * base = mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY";
+        const int64_t n_inj = (mode == 1 || mode == 2) ? dispatch_census_count(backend, (std::string(base) + "_INJ").c_str()) : 0;
+        if ((mode == 1 || mode == 2) && engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_INJECT")) {
+            const int64_t n_base = dispatch_census_count(backend, base);
+            if (n_base != 0 || n_inj > 1) {
+                msg = std::string(base) + " dispatches: " + std::to_string(n_base) + " without the inject, " + std::to_string(n_inj) + " with it";
+                return false;
+            }
+        }
         if (pad == 0 || !engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_POST_NORM", mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY")) {
             return true;   // the unpadded cases check values only; not asked, or the device cannot fuse
         }
@@ -4253,10 +4265,13 @@ struct test_hc_post_norm : public test_case {
             { mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY", env_knob_on("GGML_VK_FUSE_HC_POST_NORM") },
             // the readers take the row stride at prefill sizes (more tokens than the mat-vec columns)
             { "path:MUL_MAT_ROWSTRIDE_B",     tokens > 8 && env_knob_on("GGML_VK_ROWSTRIDE") },
-            { "path:MUL_MAT_VEC_ROWSTRIDE_A", tokens > 8 && env_knob_on("GGML_VK_ROWSTRIDE") },
+            // the inject projection is this reader unless the norm kernel computed it
+            { "path:MUL_MAT_VEC_ROWSTRIDE_A", tokens > 8 && env_knob_on("GGML_VK_ROWSTRIDE") && n_inj <= 0 },
         };
         for (const auto & c : checks) {
-            const int64_t n = dispatch_census_count(backend, c.name);
+            // the norm fusion counts with or without the inject folded in
+            const int64_t n = dispatch_census_count(backend, c.name) +
+                              (c.name == checks[0].name ? std::max<int64_t>(0, dispatch_census_count(backend, (std::string(c.name) + "_INJ").c_str())) : 0);
             if ((n > 0) != c.want) {
                 msg = std::string(c.name) + " dispatches: " + std::to_string(n) + (c.want ? " (expected some)" : " (expected none)");
                 return false;
@@ -12633,6 +12648,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_post_norm(4096, 4, 40, 1));
     test_cases.emplace_back(new test_hc_post_norm(288, 4, 40, 1));   // 72 vec4 per row: one partial pass
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 1, GGML_TYPE_Q4_0));
+    // the Flash-Next pp2048 ubatch (op timing: eval with GGML_VK_PERF_LOGGER, perf mode skips graph_optimize)
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 2048, 1));
     // LLAMA_HC_XN_PAD: the padded f16 norm and its row-strided readers (128 = the shipped pad; 8 = a stride off the GEMM's
     // K alignment; 7 tokens = decode-sized readers, which copy)
     for (int tokens : {7, 64, 513}) {

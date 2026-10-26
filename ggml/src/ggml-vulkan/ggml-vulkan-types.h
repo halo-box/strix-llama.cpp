@@ -997,6 +997,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_x16_g16_f16;   // f16 x, f16 gate, f16 mixed stream
     // HC_POST(_GATE) + RMS_NORM + MUL (+ CPY f16) / RMS_NORM + MUL (+ CPY f16): [has_post][out_f16]
     vk_pipeline pipeline_dsv4_hc_post_norm[2][2];
+    vk_pipeline pipeline_dsv4_hc_post_norm_inj[2];   // [has_post], f16 norm + the inject projection
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1389,6 +1390,7 @@ struct ggml_backend_vk_context {
     bool fused_hc_up_mix {};   // MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) -> one int8 MMQ GEMM with the mix epilogue
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
+    bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {

@@ -4503,6 +4503,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (device->fp16) {
                 ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm[has_post][1], has_post ? "dsv4_hc_post_norm_f16" : "dsv4_rms_norm_mul_rows_f16",
                     dsv4_hc_post_norm_f16_len, dsv4_hc_post_norm_f16_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { has_post }, 1);
+                // one workgroup per token over the four streams, plus the inject projection
+                ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_inj[has_post], has_post ? "dsv4_hc_post_norm_inj_f16" : "dsv4_rms_norm_mul_rows_inj_f16",
+                    dsv4_hc_post_norm_inj_f16_len, dsv4_hc_post_norm_inj_f16_data, "main", 8, sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants), {1, 1, 1}, { has_post }, 1);
             }
         }
     }
@@ -9076,7 +9079,9 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
     float eps;
     memcpy(&eps, rms->op_params, sizeof(float));
 
-    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_post_norm[has_post ? 1 : 0][out_f16 ? 1 : 0];
+    const bool inj = ctx->fused_hc_post_norm_inj;
+    vk_pipeline pipeline = inj ? ctx->device->pipeline_dsv4_hc_post_norm_inj[has_post ? 1 : 0]
+                               : ctx->device->pipeline_dsv4_hc_post_norm[has_post ? 1 : 0][out_f16 ? 1 : 0];
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -9095,6 +9100,19 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
         0u,
     };
 
+    if (inj) {
+        // the CPY's 2-D view and the inject MUL_MAT follow the norm chain (ggml_vk_can_fuse_hc_post_norm_inj)
+        GGML_ASSERT(out_f16);
+        const ggml_tensor * mm = cgraph->nodes[r + 4];
+        const ggml_tensor * w  = mm->src[0];
+        const vk_op_dsv4_hc_post_norm_inj_push_constants ipc = { pc, (uint32_t)(w->nb[1] / sizeof(float)), (uint32_t)(mm->nb[1] / sizeof(float)) };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, res), ggml_vk_tensor_subbuffer(ctx, pw),
+              ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, o), ggml_vk_tensor_subbuffer(ctx, out),
+              ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, mm) },
+            ipc, { nt, 1, 1 });
+        return;
+    }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, res), ggml_vk_tensor_subbuffer(ctx, pw),
           ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, o), ggml_vk_tensor_subbuffer(ctx, out) },
@@ -17230,6 +17248,9 @@ static bool ggml_vk_mmid_scale_epilogue_ok(const ggml_backend_vk_context * cctx,
 static constexpr std::initializer_list<ggml_op> hc_post_norm_cpy_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY };
 static constexpr std::initializer_list<ggml_op> hc_post_norm_pattern     { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL };
 static constexpr std::initializer_list<ggml_op> hc_norm_rows_cpy_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY };
+// ... and its 2-D view (RESHAPE, or the VIEW of LLAMA_HC_XN_PAD) read by the next mix's inject MUL_MAT
+static constexpr std::initializer_list<ggml_op> hc_norm_rows_cpy_inj_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+static constexpr std::initializer_list<ggml_op> hc_norm_rows_cpy_inj_view_pattern { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY, GGML_OP_VIEW, GGML_OP_MUL_MAT };
 
 // mode: HC_POST_NORM_GATE, HC_POST_NORM_GATE_CPY or HC_NORM_ROWS_CPY, matched at node_idx
 static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int mode) {
@@ -17308,6 +17329,63 @@ static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, c
             x->ne[0] != n_embd || x->ne[1] != nt || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != 4 || x->nb[1] % 16 != 0 ||
             pw->ne[0] != hc || pw->ne[1] != nt ||
             get_misalign_bytes(ctx, x) != 0 || get_misalign_bytes(ctx, pw) != 0 || get_misalign_bytes(ctx, hc_post) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// HC_POST_NORM_GATE_CPY / HC_NORM_ROWS_CPY + the next mix's inject: the CPY(f16) of the norm is followed by its 2-D view (RESHAPE,
+// or the VIEW of LLAMA_HC_XN_PAD) and MUL_MAT(w_inject f32 [hc * n_embd, hc], view). dsv4_hc_post_norm_inj.comp then runs one
+// workgroup per token, reads x once for the four streams and computes the inject from the f16 rows it stores, so the MUL_MAT's
+// pass over xn goes away. GGML_VK_HC_INJECT_FOLD=0 disables (ggml_vk_can_fuse_hc_post_norm admitted the norm chain at node_idx).
+static bool ggml_vk_hc_inject_fold_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_HC_INJECT_FOLD");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static bool ggml_vk_can_fuse_hc_post_norm_inj(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int mode) {
+    if (!ggml_vk_hc_inject_fold_enabled() || (mode != HC_POST_NORM_GATE_CPY && mode != HC_NORM_ROWS_CPY)) {
+        return false;
+    }
+    const bool has_post = mode == HC_POST_NORM_GATE_CPY;
+    if (ctx->device->pipeline_dsv4_hc_post_norm_inj[has_post ? 1 : 0] == nullptr) {
+        return false;
+    }
+    const int last = node_idx + (has_post ? 6 : 2);
+    if (last + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * cpy  = cgraph->nodes[last];
+    const ggml_tensor * view = cgraph->nodes[last + 1];
+    const ggml_tensor * mm   = cgraph->nodes[last + 2];
+    const ggml_tensor * w    = mm->src[0];
+    const ggml_tensor * res  = has_post ? cgraph->nodes[node_idx + 3]->src[1] : cgraph->nodes[node_idx]->src[0];
+    const int64_t n_embd = res->ne[0], hc = res->ne[1], nt = res->ne[2];
+    if ((view->op != GGML_OP_RESHAPE && view->op != GGML_OP_VIEW) || view->src[0] != cpy || view->view_offs != cpy->view_offs ||
+        view->ne[0] != hc * n_embd || view->ne[1] != nt || view->ne[2] != 1 || view->ne[3] != 1 ||
+        mm->op != GGML_OP_MUL_MAT || mm->src[1] != view || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    // the kernel's shape: four streams, rows of up to 4096 in 8-column groups
+    if (hc != 4 || n_embd % 8 != 0 || n_embd > 4096 || nt > (int64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return false;
+    }
+    // w [hc * n_embd, hc] f32 with 16-byte aligned rows, dst [hc, nt] f32 contiguous
+    if (w->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || w->ne[0] != hc * n_embd || w->ne[1] != hc || w->ne[2] != 1 || w->ne[3] != 1 ||
+        w->nb[0] != sizeof(float) || w->nb[1] % 16 != 0 || mm->ne[0] != hc || mm->ne[1] != nt || !ggml_is_contiguous(mm) ||
+        get_misalign_bytes(ctx, w) != 0 || get_misalign_bytes(ctx, mm) != 0) {
+        return false;
+    }
+    // the generic overlap check covers the last node (the inject) and the combine; the norm rows are written as well, so
+    // they must not overlap any source here
+    const ggml_tensor * srcs[] = { res, has_post ? cgraph->nodes[node_idx + 3]->src[0] : nullptr, has_post ? cgraph->nodes[node_idx]->src[0] : nullptr,
+                                   cgraph->nodes[last - 1]->src[1], w };
+    for (const ggml_tensor * t : srcs) {
+        if (t != nullptr && ggml_vk_tensors_overlap(t, cpy, false)) {
             return false;
         }
     }
@@ -18941,6 +19019,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
+        ctx->fused_hc_post_norm_inj = false;
         ctx->fused_mm_cpy16 = false;
         ctx->fused_hc_up_mix = false;
         ctx->fused_mmid_cpy16 = false;
@@ -19051,16 +19130,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // The kernel reads whole rows of the residual and x while it writes both, so no source may
                 // overlap either output; only the cast's own src[1] (its destination) counts as elementwise.
                 const bool cpy = ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, i, HC_POST_NORM_GATE_CPY);
+                const bool inj = cpy && ggml_vk_can_fuse_hc_post_norm_inj(ctx, cgraph, i, HC_POST_NORM_GATE_CPY);
                 ctx->fused_hc_post_norm = cpy ? HC_POST_NORM_GATE_CPY : HC_POST_NORM_GATE;
-                ctx->num_additional_fused_ops = cpy ? 6 : 5;
+                ctx->fused_hc_post_norm_inj = inj;
+                ctx->num_additional_fused_ops = inj ? 8 : cpy ? 6 : 5;
                 ctx->fused_ops_write_mask |= 1 << 3;
-                fusion_string = cpy ? "HC_POST_GATE_NORM_CPY" : "HC_POST_GATE_NORM";
+                fusion_string = inj ? "HC_POST_GATE_NORM_CPY_INJ" : cpy ? "HC_POST_GATE_NORM_CPY" : "HC_POST_GATE_NORM";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
                 op_srcs_fused_elementwise[6] = cpy;
             } else if (ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, i, HC_NORM_ROWS_CPY)) {
+                const bool inj = ggml_vk_can_fuse_hc_post_norm_inj(ctx, cgraph, i, HC_NORM_ROWS_CPY);
                 ctx->fused_hc_post_norm = HC_NORM_ROWS_CPY;
-                ctx->num_additional_fused_ops = 2;
-                fusion_string = "RMS_NORM_MUL_CPY";
+                ctx->fused_hc_post_norm_inj = inj;
+                ctx->num_additional_fused_ops = inj ? 4 : 2;
+                fusion_string = inj ? "RMS_NORM_MUL_CPY_INJ" : "RMS_NORM_MUL_CPY";
                 // the f16 rows are half the f32 rows' size: an overlap with the norm input would be a race,
                 // so only the cast's src[1] (its own destination) is elementwise
                 op_srcs_fused_elementwise[0] = false;
@@ -19288,6 +19371,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
+                ctx->fused_hc_post_norm_inj = false;
                 ctx->fused_mm_cpy16 = false;
                 ctx->fused_hc_up_mix = false;
                 ctx->fused_mmid_cpy16 = false;
@@ -19594,6 +19678,28 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             keep_pattern({ GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE });
             continue;
         }
+        // HC_NORM_ROWS_CPY + inject (RMS_NORM_MUL_CPY_INJ): the norm chain, the CPY's 2-D view and the inject MUL_MAT stay
+        // consecutive, and the norm's inputs stay allocated through the MUL_MAT, which the fused kernel writes while reading them
+        if (ggml_vk_hc_inject_fold_enabled() && ggml_vk_fuse_hc_post_norm_enabled()) {
+            bool kept = false;
+            for (const auto & pat : { hc_norm_rows_cpy_inj_pattern, hc_norm_rows_cpy_inj_view_pattern }) {
+                if (match_pattern(pat, first_unused)) {
+                    ggml_tensor * const * n = graph->nodes + first_unused;
+                    if (n[1]->src[0] == n[0] && n[2]->src[0] == n[1] && n[2]->type == GGML_TYPE_F16 && n[3]->src[0] == n[2] &&
+                        n[4]->src[1] == n[3] && n[4]->src[0]->op == GGML_OP_NONE) {
+                        if (params && params->add_alloc_dep) {
+                            add_pattern_alloc_deps(pat, first_unused + 4);
+                        }
+                        keep_pattern(pat);
+                        kept = true;
+                        break;
+                    }
+                }
+            }
+            if (kept) {
+                continue;
+            }
+        }
         if (keep_topk_moe_pattern(topk_moe_early_softmax_norm)) {
             continue;
         }
@@ -19668,6 +19774,29 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 if (tail.size() < 2) {
                     tail.clear();
+                }
+                // the inject fold: the CPY's 2-D view and the next mix's inject MUL_MAT come right after the CPY when the
+                // graph has them (the view is the norm's only node in between)
+                if (tail.size() == 3 && ggml_vk_hc_inject_fold_enabled()) {
+                    const ggml_tensor * cpy = graph->nodes[tail[2]];
+                    int v = -1, m = -1;
+                    for (int j = tail[2] + 1; j < std::min(tail[2] + 8, graph->n_nodes) && m < 0; ++j) {
+                        const ggml_tensor * nj = graph->nodes[j];
+                        if (used[j]) {
+                            continue;
+                        }
+                        if (v < 0 && (nj->op == GGML_OP_RESHAPE || nj->op == GGML_OP_VIEW) && nj->src[0] == cpy) {
+                            v = j;
+                        } else if (v >= 0 && nj->op == GGML_OP_MUL_MAT && nj->src[1] == graph->nodes[v] && nj->src[0]->op == GGML_OP_NONE) {
+                            m = j;
+                        } else if (!is_empty(nj)) {
+                            break;
+                        }
+                    }
+                    if (m >= 0) {
+                        tail.push_back(v);
+                        tail.push_back(m);
+                    }
                 }
                 // empty nodes passed over that a tail node reads (the gamma reshape) go in front of the chain;
                 // only views of weights or of already scheduled nodes, so nothing moves ahead of its source

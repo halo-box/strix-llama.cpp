@@ -240,6 +240,14 @@ struct vk_op_dsv4_hc_post_norm_push_constants {
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_norm_push_constants) <= 128);
 
+// dsv4_hc_post_norm_inj.comp: the dsv4_hc_post_norm fields, then the inject weight row stride and output token stride (floats)
+struct vk_op_dsv4_hc_post_norm_inj_push_constants {
+    vk_op_dsv4_hc_post_norm_push_constants base;
+    uint32_t sw1;
+    uint32_t si1;
+};
+static_assert(sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants) <= 128);
+
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
     uint32_t ne01;

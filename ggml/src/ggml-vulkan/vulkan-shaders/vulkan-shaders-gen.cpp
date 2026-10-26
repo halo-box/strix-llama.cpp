@@ -1280,6 +1280,7 @@ void process_shaders() {
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("dsv4_hc_post_norm_f32", "dsv4_hc_post_norm.comp", {});
     string_to_spv("dsv4_hc_post_norm_f16", "dsv4_hc_post_norm.comp", {{"OUT_F16", "1"}});
+    string_to_spv("dsv4_hc_post_norm_inj_f16", "dsv4_hc_post_norm_inj.comp", {});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
