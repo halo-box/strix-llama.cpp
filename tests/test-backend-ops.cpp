@@ -13183,6 +13183,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // i32 rows wider than one 512-lane workgroup
+    for (int n : {513, 600, 1024, 1500, 4096}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, n, 97, 9, 1, 1, false));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, n, 97, 9, 3, 2, true));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, n, 97, 9, 3, 2, false, true, 1));
+    }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
 
     // narrow rows (Vulkan GET_ROWS_NARROW): widths up to the narrow limit and past it, ragged row counts, batches and views
