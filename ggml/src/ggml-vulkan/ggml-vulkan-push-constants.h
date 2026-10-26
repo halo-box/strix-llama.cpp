@@ -737,6 +737,9 @@ struct vk_op_gated_delta_net_push_constants {
 struct vk_op_gdn_chunk_push_constants {
     vk_op_gated_delta_net_push_constants gdn;
     uint32_t nch;
+    uint32_t qk_norm;   // prep: q and k are the raw views, l2-normalised on load (x * qk_mul * rsqrt(mean(x^2) + qk_eps))
+    float    qk_eps;
+    float    qk_mul;
 };
 
 struct vk_op_ssm_scan_push_constants {

@@ -6264,6 +6264,21 @@ struct test_gdn_conv_prefill : public test_case {
         : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads) {}
     std::string op_desc(ggml_tensor *) override { return "GDN_CONV_PREFILL"; }
     std::string vars() override { return VARS_TO_STR3(n_tokens, n_k_heads, n_v_heads); }
+    // GGML_VK_TEST_REQUIRE_GDN_QKNORM=1: the chunked GDN (>= 64 tokens) normalises q / k itself and the norm nodes do not run;
+    // GGML_VK_GDN_QKNORM=0 under the assert is the negative control
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_QKNORM") || !env_knob_on("GGML_VK_GDN_CHUNK")) {
+            return true;
+        }
+        const int64_t want = n_tokens >= 64 ? 1 : 0;
+        const int64_t n = dispatch_census_count(backend, "path:GDN_QK_NORM");
+        if (n != want) {
+            msg = "GDN_QK_NORM dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        return true;
+    }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     double max_nmse_err() override { return 2e-5; }
@@ -15803,6 +15818,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Convolution/SiLU elided into the chunked GDN, allocated through the scheduler.
     test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 2));
     test_cases.emplace_back(new test_gdn_conv_prefill(512, 2, 4));
+    // the q/k l2 norms in the chunk prep: a partial last chunk, the 64-token threshold and just under it, the Flash-Next shape
+    test_cases.emplace_back(new test_gdn_conv_prefill(100, 2, 4));
+    test_cases.emplace_back(new test_gdn_conv_prefill(64, 4, 4));
+    test_cases.emplace_back(new test_gdn_conv_prefill(48, 2, 2));
+    test_cases.emplace_back(new test_gdn_conv_prefill(2048, 16, 48));
     // Multiple sequences must remain on the generic fallback.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));

@@ -13542,8 +13542,26 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
         pc, {n_tiles_kv, n_tiles_t, n_streams});
 }
 
+// the chunked prefill form (gdn_chunk_prep/scan.comp) for this GATED_DELTA_NET with these q / k tensors: S_v 128, scalar
+// gate, final state only (K == 1), q/k/v rows with unit element stride, q and k with the same strides, >= 64 tokens.
+// GGML_VK_GDN_CHUNK=0 opts out.
+static bool ggml_vk_gdn_chunk_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, const ggml_tensor * q, const ggml_tensor * k) {
+    static const bool chunk_enabled = [] { const char * e = getenv("GGML_VK_GDN_CHUNK"); return !e || atoi(e) != 0; }();
+    constexpr uint32_t chunk_min = 64;
+    const ggml_tensor * v = dst->src[2];
+    const uint32_t S_v = (uint32_t) v->ne[0];
+    const bool kda = dst->src[3]->ne[0] == (int64_t) S_v;
+    return chunk_enabled && ctx->device->pipeline_gdn_chunk_scan && S_v == 128 && !kda && ggml_get_op_params_i32(dst, 0) == 1 &&
+           v->ne[2] >= chunk_min && q->nb[0] == sizeof(float) && k->nb[0] == sizeof(float) && v->nb[0] == sizeof(float) &&
+           k->nb[1] == q->nb[1] && k->nb[2] == q->nb[2] && k->nb[3] == q->nb[3] && v->ne[1] % q->ne[1] == 0;
+}
+
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    const ggml_tensor * src_q     = dst->src[0];
+    // q/k l2 norms folded into the chunk prep (ggml_vk_gdn_qk_norm_prepass): read the raw views
+    const auto qk_it = ctx->gdn_qk.find(dst);
+    const ggml_backend_vk_context::gdn_qk_norm * qkn = qk_it != ctx->gdn_qk.end() ? &qk_it->second : nullptr;
+    const ggml_tensor * src_q     = qkn ? qkn->q_raw : dst->src[0];
+    const ggml_tensor * src_k     = qkn ? qkn->k_raw : dst->src[1];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
 
@@ -13567,7 +13585,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer src_buf[6] = {};
     for (int i = 0; i < 6; i++) {
-        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, i == 0 ? src_q : i == 1 ? src_k : dst->src[i], qkn != nullptr && i < 2);
     }
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
@@ -13594,17 +13612,10 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         K
     };
 
-    // chunked prefill form (gdn_chunk_prep/scan.comp): S_v 128, scalar gate, final state only (K == 1), q/k/v
-    // rows with unit element stride, q and k with the same strides. f16 WMMA operands, f32 accumulation: not
-    // bit-identical to the sequential scan. Default on where the pipelines exist (RDNA3 RADV wave32); GGML_VK_GDN_CHUNK=0
-    // opts out. Batches under 64 tokens keep the sequential kernel.
-    static const bool chunk_enabled = [] { const char * e = getenv("GGML_VK_GDN_CHUNK"); return !e || atoi(e) != 0; }();
-    constexpr uint32_t chunk_min = 64;
-    const bool kda = dst->src[3]->ne[0] == (int64_t) S_v;
-    if (chunk_enabled && ctx->device->pipeline_gdn_chunk_scan && S_v == 128 && !kda && K == 1 && n_tokens >= chunk_min &&
-        src_q->nb[0] == sizeof(float) && dst->src[1]->nb[0] == sizeof(float) && src_v->nb[0] == sizeof(float) &&
-        dst->src[1]->nb[1] == src_q->nb[1] && dst->src[1]->nb[2] == src_q->nb[2] && dst->src[1]->nb[3] == src_q->nb[3] &&
-        H % neq1 == 0) {
+    // chunked prefill form (ggml_vk_gdn_chunk_ok): f16 WMMA operands, f32 accumulation, not bit-identical to the sequential
+    // scan. Default on where the pipelines exist (RDNA3 RADV wave32). Batches under 64 tokens keep the sequential kernel.
+    GGML_ASSERT(qkn == nullptr || ggml_vk_gdn_chunk_ok(ctx, dst, src_q, src_k));
+    if (ggml_vk_gdn_chunk_ok(ctx, dst, src_q, src_k)) {
         constexpr uint32_t CL = 32;
         const uint32_t nch = (n_tokens + CL - 1) / CL;
         const size_t qku = 3 * CL * 128 / 2;
@@ -13618,7 +13629,10 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
             ggml_vk_sync_buffers(ctx, subctx);
         }
         vk_subbuffer scr_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
-        const vk_op_gdn_chunk_push_constants cpc = { pc, nch };
+        const vk_op_gdn_chunk_push_constants cpc = { pc, nch, qkn ? 1u : 0u, qkn ? qkn->eps : 0.0f, qkn ? qkn->mul : 1.0f };
+        if (qkn) {
+            ggml_vk_path_census_add("GDN_QK_NORM");
+        }
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_gdn_chunk_prep, 1);
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_gdn_chunk_scan, 1);
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_gdn_chunk_prep,
@@ -15801,6 +15815,10 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
+        return false;
+    }
+    // computed inside the chunked GDN (ggml_vk_gdn_qk_norm_prepass)
+    if (ctx->gdn_qk_skip.count(node)) {
         return false;
     }
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -18763,6 +18781,65 @@ static bool ggml_vk_can_fuse_mmid_mul_cpy16(ggml_backend_vk_context * ctx, const
            ggml_vk_mmid_scale_epilogue_ok(ctx, mmid, mul, true);
 }
 
+// Chunked GDN with the q/k l2 norms in the prep (GGML_VK_GDN_QKNORM=0 disables): a GATED_DELTA_NET whose q and k are each
+// SCALE(RMS_NORM(view)) with no other reader, and which takes the chunk path with the raw views, reads the views and normalises
+// them itself; its four norm nodes are skipped. The nodes are not adjacent to the GDN (the gate and beta chains sit in between),
+// so this is a per-graph table instead of a fused range. Same numbers as rms_norm.comp + scale up to the reduction order.
+static bool ggml_vk_gdn_qk_norm_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_GDN_QKNORM"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+static void ggml_vk_gdn_qk_norm_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->gdn_qk.clear();
+    ctx->gdn_qk_skip.clear();
+    if (!ggml_vk_gdn_qk_norm_enabled() || ctx->device->disable_fusion || ctx->device->pipeline_gdn_chunk_prep == nullptr) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, int> idx;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM || cgraph->nodes[i]->op == GGML_OP_SCALE) {
+            idx[cgraph->nodes[i]] = i;
+        }
+    }
+    // SCALE(RMS_NORM(raw)) over 128-rows, each node computed and read only by the GDN; eps and the factor out
+    auto const & l2_norm = [&](const ggml_tensor * sc, const ggml_tensor *& raw, float & eps, float & mul) -> bool {
+        if (sc->op != GGML_OP_SCALE || sc->src[0] == nullptr || sc->src[0]->op != GGML_OP_RMS_NORM || !idx.count(sc) || !idx.count(sc->src[0])) {
+            return false;
+        }
+        const ggml_tensor * rms = sc->src[0];
+        raw = rms->src[0];
+        if (rms->ne[0] != 128 || rms->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || raw->type != GGML_TYPE_F32 ||
+            ggml_get_op_params_f32(sc, 1) != 0.0f || ((rms->flags | sc->flags) & GGML_TENSOR_FLAG_OUTPUT) ||
+            !(rms->flags & GGML_TENSOR_FLAG_COMPUTE) || !(sc->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            ggml_node_get_use_count(cgraph, idx[rms]) != 1 || ggml_node_get_use_count(cgraph, idx[sc]) != 1) {
+            return false;
+        }
+        // the prep shader has no misalignment offset for q / k
+        if (ggml_vk_tensor_subbuffer(ctx, raw, true).size != ggml_nbytes(raw)) {
+            return false;
+        }
+        memcpy(&eps, rms->op_params, sizeof(float));
+        mul = ggml_get_op_params_f32(sc, 0);
+        return true;
+    };
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * g = cgraph->nodes[i];
+        if (g->op != GGML_OP_GATED_DELTA_NET || !(g->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            continue;
+        }
+        const ggml_tensor * q_raw = nullptr;
+        const ggml_tensor * k_raw = nullptr;
+        float q_eps, q_mul, k_eps, k_mul;
+        if (!l2_norm(g->src[0], q_raw, q_eps, q_mul) || !l2_norm(g->src[1], k_raw, k_eps, k_mul) || q_eps != k_eps || q_mul != k_mul ||
+            g->src[0] == g->src[1] || !ggml_are_same_shape(q_raw, k_raw) || !ggml_vk_gdn_chunk_ok(ctx, g, q_raw, k_raw)) {
+            continue;
+        }
+        ctx->gdn_qk[g] = { q_raw, k_raw, q_eps, q_mul };
+        ctx->gdn_qk_skip.insert({ g->src[0], g->src[0]->src[0], g->src[1], g->src[1]->src[0] });
+    }
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -18903,6 +18980,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         submit_count++;
     };
 
+    ggml_vk_gdn_qk_norm_prepass(ctx, cgraph);
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
@@ -18950,7 +19029,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ssm_conv_direct = -1;
         ctx->fused_extra_srcs[0] = ctx->fused_extra_srcs[1] = nullptr;
         const char *fusion_string {};
-        if (!ctx->device->disable_fusion) {
+        if (!ctx->device->disable_fusion && !ctx->gdn_qk_skip.count(cgraph->nodes[i])) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
@@ -19225,6 +19304,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = false;
                 }
             }
+        }
+        // a fusion may not swallow a norm the chunked GDN computes itself
+        for (int k = 1; k <= ctx->num_additional_fused_ops && !ctx->gdn_qk_skip.empty(); ++k) {
+            GGML_ASSERT(!ctx->gdn_qk_skip.count(cgraph->nodes[i + k]));
         }
         GGML_ASSERT(ctx->num_additional_fused_ops < (int)(sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0])));
         ctx->fused_ops_write_mask |= 1 << ctx->num_additional_fused_ops;
