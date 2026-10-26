@@ -429,6 +429,7 @@ static constexpr uint32_t FA_FLAG_MULTI_ROW    = 256;   // host only: build the 
 static constexpr uint32_t FA_FLAG_MR_LAZY      = 512;   // multi-row: skip identity O rescales
 static constexpr uint32_t FA_FLAG_MR_NOEB      = 1024;   // multi-row: no loop-end barrier
 static constexpr uint32_t FA_FLAG_MR_VPOST     = 2048;  // multi-row: V^T loads before the softmax barrier
+static constexpr uint32_t FA_FLAG_OUT_GATE     = 4096;  // multi-row: the store applies sigmoid(gate) (binding 8)
 
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
@@ -1507,6 +1508,7 @@ struct ggml_backend_vk_context {
     std::unordered_map<const ggml_tensor *, gdn_conv_fold> gdn_cf;
     bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
     int fused_hc_moe_epi {};   // HC_MOE_EPI: number of ADD nodes (routed slot adds + the shared-expert add) in front of the HC post norm chain
+    bool fused_fa_out_gate {};  // FLASH_ATTN_EXT+RESHAPE+VIEW+CONT+SIGMOID+MUL: the attention output gate after FA
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {
