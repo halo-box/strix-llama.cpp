@@ -483,37 +483,61 @@ bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(ggml_backend_cuda_context & 
     float bias, softcap; memcpy(&bias, (const char *) dst->op_params+4, 4); memcpy(&softcap, (const char *) dst->op_params+8, 4);
     // the mask is optional: a maskless op relies on the index rows naming only visible cells (-1 elsewhere)
     if (m && (m->type!=GGML_TYPE_F16 || m->nb[0]!=2 || m->ne[0]<k->ne[1] || m->ne[1]<q->ne[1] || m->ne[2]!=1 || m->ne[3]!=1)) return false;
-    return bias==0 && softcap==0 && q->type==GGML_TYPE_F32 && k->type==GGML_TYPE_F16 && v->type==GGML_TYPE_F16 &&
+    const auto kv_ok = [](const ggml_tensor * t) { return (t->type==GGML_TYPE_F16 || t->type==GGML_TYPE_Q8_0) && t->nb[0]==ggml_type_size(t->type); };
+    return bias==0 && softcap==0 && q->type==GGML_TYPE_F32 && kv_ok(k) && kv_ok(v) &&
         dst->type==GGML_TYPE_F32 && ids->type==GGML_TYPE_I32 &&
         q->ne[0]==256 && k->ne[0]==256 && v->ne[0]==256 && q->ne[1]>=128 && q->ne[1]<=INT_MAX &&
         k->ne[1]>0 && k->ne[1]<=262140 && k->ne[1]%4==0 && v->ne[1]==k->ne[1] &&
         k->ne[2]>0 && k->ne[2]<=65535 && q->ne[2]==12*k->ne[2] && v->ne[2]==k->ne[2] &&
         q->ne[3]==1 && k->ne[3]==1 && v->ne[3]==1 && ggml_nelements(k)/4<=INT_MAX &&
-        q->nb[0]==4 && k->nb[0]==2 && v->nb[0]==2 && ids->nb[0]==4 &&
+        q->nb[0]==4 && ids->nb[0]==4 &&
         q->nb[1]%16==0 && q->nb[2]%16==0 && uintptr_t(q->data)%16==0 &&
         k->nb[1]%16==0 && k->nb[2]%16==0 && uintptr_t(k->data)%16==0 &&
         ids->nb[1]%4==0 && uintptr_t(ids->data)%4==0 && ids->ne[0]>0 && ids->ne[0]<=2560 &&
         ids->ne[1]>=q->ne[1] && ids->ne[2]==1 && ids->ne[3]==1 && ggml_is_contiguous(dst);
 }
 
+// same half-precision product as dequantize_block_q8_0_f16, so packed data equals pack-after-dequantize
+static __device__ __forceinline__ uint16_t qsa_q8_to_h(const int8_t q, const _Float16 d) {
+    return __builtin_bit_cast(uint16_t, (_Float16) ((_Float16) q * d));
+}
+
+template <bool q8>
 static __global__ void qsa_pack_k(const char * src, uint16_t * dst, size_t nb1, size_t nb2, int nk, uint32_t count) {
     const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
     if (i>=count) return;
     const uint32_t d=(i%32)*8, key=(i/32)%nk, head=i/(uint32_t(nk)*32);
     const size_t group=size_t(head)*(nk/4)+key/4;
-    const auto * in=reinterpret_cast<const uint4 *>(src+size_t(head)*nb2+size_t(key)*nb1+d*2);
     auto * out=reinterpret_cast<uint4 *>(dst+group*1024+(d/16)*64+(key%4)*16+d%16);
-    *out=*in;
+    if constexpr (q8) {
+        const auto * blk=reinterpret_cast<const block_q8_0 *>(src+size_t(head)*nb2+size_t(key)*nb1)+d/QK8_0;
+        const _Float16 dh=__builtin_bit_cast(_Float16, blk->d);
+        uint16_t h[8];
+#pragma unroll
+        for (int j=0; j<8; ++j) { h[j]=qsa_q8_to_h(blk->qs[d%QK8_0+j], dh); }
+        *out=make_uint4(h[0]|(uint32_t(h[1])<<16), h[2]|(uint32_t(h[3])<<16), h[4]|(uint32_t(h[5])<<16), h[6]|(uint32_t(h[7])<<16));
+    } else {
+        *out=*reinterpret_cast<const uint4 *>(src+size_t(head)*nb2+size_t(key)*nb1+d*2);
+    }
 }
 
+template <bool q8>
 static __global__ void qsa_pack_v(const char * src, uint16_t * dst, size_t nb1, size_t nb2, int nk, uint32_t count) {
     const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
     if (i>=count) return;
     const uint32_t d=i%256, group=i/256, head=group/(nk/4), key=(group%(nk/4))*4;
-    const char * in=src+size_t(head)*nb2+size_t(key)*nb1+d*2;
-    *reinterpret_cast<ushort4 *>(dst+size_t(group)*1024+d*4)=make_ushort4(
-        *reinterpret_cast<const uint16_t *>(in), *reinterpret_cast<const uint16_t *>(in+nb1),
-        *reinterpret_cast<const uint16_t *>(in+2*nb1), *reinterpret_cast<const uint16_t *>(in+3*nb1));
+    const char * in=src+size_t(head)*nb2+size_t(key)*nb1;
+    uint16_t h[4];
+#pragma unroll
+    for (int j=0; j<4; ++j) {
+        if constexpr (q8) {
+            const auto * blk=reinterpret_cast<const block_q8_0 *>(in+j*nb1)+d/QK8_0;
+            h[j]=qsa_q8_to_h(blk->qs[d%QK8_0], __builtin_bit_cast(_Float16, blk->d));
+        } else {
+            h[j]=*reinterpret_cast<const uint16_t *>(in+j*nb1+d*2);
+        }
+    }
+    *reinterpret_cast<ushort4 *>(dst+size_t(group)*1024+d*4)=make_ushort4(h[0], h[1], h[2], h[3]);
 }
 
 void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -522,14 +546,18 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
     const int n_q = (int) q->ne[1], ns = (int) ids->ne[0], nk = (int) k->ne[1];
     // QSA_DIRECT: -1/auto picks direct f16 reads when the attention is small against the cache
     // (the pack is O(n_kv) per ubatch), 0 always packs, 1 always reads direct. Both paths are bit-identical.
+    // The direct kernel reads f16 only, so q8_0 K/V always pack.
     static const int qsa_direct_cfg = getenv("QSA_DIRECT") ? atoi(getenv("QSA_DIRECT")) : -1;
-    const bool qsa_direct = qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 32 < (size_t) nk);
+    const bool kv_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+    const bool qsa_direct = kv_f16 && (qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 32 < (size_t) nk));
     ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), qsa_direct ? 0 : ggml_nelements(k));
     ggml_cuda_pool_alloc<uint16_t> packed_v(ctx.pool(), qsa_direct ? 0 : ggml_nelements(v));
     if (!qsa_direct) {
         const uint32_t count_k=ggml_nelements(k)/8, count_v=ggml_nelements(v)/4;
-        qsa_pack_k<<<(count_k+255)/256,256,0,ctx.stream()>>>((const char *)k->data,packed_k.get(),k->nb[1],k->nb[2],nk,count_k);
-        qsa_pack_v<<<(count_v+255)/256,256,0,ctx.stream()>>>((const char *)v->data,packed_v.get(),v->nb[1],v->nb[2],nk,count_v);
+        auto * pack_k = k->type==GGML_TYPE_Q8_0 ? qsa_pack_k<true> : qsa_pack_k<false>;
+        auto * pack_v = v->type==GGML_TYPE_Q8_0 ? qsa_pack_v<true> : qsa_pack_v<false>;
+        pack_k<<<(count_k+255)/256,256,0,ctx.stream()>>>((const char *)k->data,packed_k.get(),k->nb[1],k->nb[2],nk,count_k);
+        pack_v<<<(count_v+255)/256,256,0,ctx.stream()>>>((const char *)v->data,packed_v.get(),v->nb[1],v->nb[2],nk,count_v);
         CUDA_CHECK(cudaGetLastError());
     }
     const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
