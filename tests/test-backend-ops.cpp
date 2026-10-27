@@ -1476,6 +1476,9 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+    // perf: time the whole graph built by build_graph (extra roots expanded through `gf`) once per compute instead of
+    // appending copies of `out`; op_size(out) must then return the bytes the whole graph moves
+    virtual bool perf_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     // engagement: when checks_engagement() is true the census of backend1 is reset right before the compare, and
     // verify_engagement FAILS the case right after it when a fused dispatch or path count is wrong
@@ -1913,6 +1916,8 @@ struct test_case {
         ggml_context_ptr ctx_weights(use_weights ? ggml_init(params) : nullptr);
         GGML_ASSERT(!use_weights || ctx_weights);
 
+        const bool whole = perf_whole_graph();
+        gf = whole ? ggml_new_graph_custom(ctx.get(), graph_nodes, false) : nullptr;
         ggml_tensor * out             = build_graph(ctx.get(), ctx_weights.get());
         current_op_name               = op_desc(out);
         if (!matches_filter(out, op_names_filter)) {
@@ -1957,7 +1962,9 @@ struct test_case {
         }
 
         // build graph
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        if (!whole) {
+            gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+        }
         ggml_build_forward_expand(gf, out);
 
         // warmup run
@@ -1970,7 +1977,9 @@ struct test_case {
         // determine number of runs
         int n_runs;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (op_flops(out) > 0) {
+        if (whole) {
+            n_runs = 1;
+        } else if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
             const uint64_t target_flops_cpu =   8ULL * GFLOP;
@@ -2003,7 +2012,7 @@ struct test_case {
             }
             return size;
         };
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf) && !whole; ++i) {
             if (ggml_is_view_op(ggml_graph_node(gf, i)->op) || ggml_graph_node(gf, i) == out) {
                 continue;
             }
@@ -8525,6 +8534,91 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
             }
         }
     }
+};
+
+// Decode mat-vec weight streaming with the weights past the 32 MB MALL (perf only, -o MMVEC_COLD; SPEC unit 6 proof).
+// n_mats > 0: `reps` MUL_MAT_ID nodes over a gate and an up expert set [k, m, n_mats] (2 x 472 MB for q4_K 640 x 2560 x 512),
+// alternating gate / up per ids set as a model layer does; each pair gets its own ids, redrawn between computes. n_mats == 0:
+// `reps` dense MUL_MAT over distinct [k, m] weights. warm = 1 keeps every node on one ids set / one weight (MALL-resident
+// control). The reported GB/s counts only the weight bytes the nodes read (whole graph timed, host wall); read the per-node
+// GPU time from GGML_VK_PERF_LOGGER.
+struct test_mmvec_cold : public test_case {
+    const ggml_type type_a;
+    const int64_t m, k;
+    const int n_mats, n_used, n_tok, reps;
+    const bool warm;
+    const bool glu; // n_mats > 0: each gate / up pair feeds a SWIGLU (the MOE_GLU_GEMV chain)
+
+    std::string vars() override { return VARS_TO_STR9(type_a, m, k, n_mats, n_used, n_tok, reps, warm, glu); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MMVEC_COLD"; }
+    bool perf_whole_graph() override { return true; }
+    bool run_whole_graph() override { return true; }
+
+    test_mmvec_cold(ggml_type type_a, int64_t m, int64_t k, int n_mats, int n_used, int n_tok, int reps, bool warm, bool glu = false)
+        : type_a(type_a), m(m), k(k), n_mats(n_mats), n_used(n_used), n_tok(n_tok), reps(reps), warm(warm), glu(glu) {}
+
+    size_t row_bytes() const { return ggml_row_size(type_a, k); }
+    size_t op_size(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return n_mats > 0 ? (size_t) reps * n_used * n_tok * m * row_bytes() : (size_t) reps * m * row_bytes();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = nullptr;
+        if (n_mats > 0) {
+            ggml_tensor * as[2] = { ggml_new_tensor_3d(ctx, type_a, k, m, n_mats), ggml_new_tensor_3d(ctx, type_a, k, m, n_mats) };
+            ggml_set_name(as[0], "gate_exps");
+            ggml_set_name(as[1], "up_exps");
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n_tok);
+            ggml_set_name(b, "b");
+            ggml_tensor * ids = nullptr;
+            for (int r = 0; r < reps; r += glu ? 2 : 1) {
+                if (r % 2 == 0 && (ids == nullptr || !warm)) {
+                    ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
+                }
+                if (glu) {
+                    // model order: up, gate, SWIGLU(gate, up)
+                    ggml_tensor * up = ggml_mul_mat_id(ctx, as[1], b, ids);
+                    out = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, as[0], b, ids), up);
+                } else {
+                    out = ggml_mul_mat_id(ctx, as[r % 2], b, ids);
+                }
+                if (gf && r + (glu ? 2 : 1) < reps) { ggml_build_forward_expand(gf, out); }
+            }
+        } else {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tok);
+            ggml_tensor * w = nullptr;
+            for (int r = 0; r < reps; ++r) {
+                if (w == nullptr || !warm) {
+                    w = ggml_new_tensor_2d(ctx, type_a, k, m);
+                }
+                out = ggml_mul_mat(ctx, w, x);
+                if (gf && r + 1 < reps) { ggml_build_forward_expand(gf, out); }
+            }
+        }
+        return out;
+    }
+
+    // distinct experts within a token, drawn at random from all n_mats
+    void init_ids(ggml_context * ctx) {
+        static std::default_random_engine rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) { continue; }
+            std::vector<int32_t> perm(n_mats);
+            for (int64_t r = 0; r < t->ne[1]; ++r) {
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                ggml_backend_tensor_set(t, perm.data(), r * t->nb[1], n_used * sizeof(int32_t));
+            }
+        }
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) { init_tensor_uniform(t); }
+        }
+        init_ids(ctx);
+    }
+    void reinit_perf_iter(ggml_context * ctx) override { if (!warm) { init_ids(ctx); } }
 };
 
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
