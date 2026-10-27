@@ -1561,7 +1561,8 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
 
     // 3. recurrence (gated_delta_net_cuda), cols_per_warp state columns per warp
     {
-        const float * state_in  = args.state_cache + (int64_t) args.state_ids[0] * args.state_row_stride + (int64_t) h * S * S;
+        const int64_t state_row = args.state_ids ? args.state_ids[0] : 0; // no ids: the state is read in place
+        const float * state_in  = args.state_cache + state_row * args.state_row_stride + (int64_t) h * S * S;
         float *       state_out = args.state_out + (int64_t) h * S * S;
         const int     colw      = warp * cols_per_warp;
 
