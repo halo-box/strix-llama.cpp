@@ -18764,8 +18764,9 @@ static bool ggml_vk_can_fuse_fn_decode_hc(ggml_backend_vk_context * ctx, const g
         pre->ne[0] != n_embd || pre->ne[1] != nt || pre->ne[2] != 1 || pre->ne[3] != 1 || pre->nb[0] != sizeof(float) || pre->nb[1] % sizeof(float) != 0) {
         return false;
     }
-    // ggml_vk_mul_mat sends it to ggml_vk_mul_mat_vec_q_f16 (not swapped)
-    if (nt > (int64_t) mul_mat_vec_max_cols || (uint64_t) m / 4 > ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+    // ggml_vk_mul_mat sends it to ggml_vk_mul_mat_vec_q_f16 (not swapped). nt == 0: a ubatch with no outputs leaves the last
+    // layer's tail empty after out_ids; the empty-node skip comes after this match, so it must not reach the mat-vec getters
+    if (nt < 1 || nt > (int64_t) mul_mat_vec_max_cols || (uint64_t) m / 4 > ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
         return false;
     }
     if (get_misalign_bytes(ctx, lo) != 0 || get_misalign_bytes(ctx, w) != 0 || get_misalign_bytes(ctx, x) != 0 || get_misalign_bytes(ctx, pre) != 0) {

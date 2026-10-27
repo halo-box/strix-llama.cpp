@@ -4362,7 +4362,7 @@ struct test_fn_decode_hc : public test_case {
         }
         auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
         const int64_t n_mmvq = dispatch_census_count(backend, "path:FN_DECODE_HC_MMVQ");
-        const bool on = (skip == nullptr || skip(backend, "FN_DECODE_HC") == nullptr) && tokens <= 8 && n_mmvq <= 0;
+        const bool on = (skip == nullptr || skip(backend, "FN_DECODE_HC") == nullptr) && tokens >= 1 && tokens <= 8 && n_mmvq <= 0;
         const int64_t n = dispatch_census_count(backend, "FN_DECODE_HC");
         const bool ok = on ? n == 1 : n == 0;
         if (!ok) {
@@ -12745,6 +12745,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fn_decode_hc(256, 64, 1, exact));
         test_cases.emplace_back(new test_fn_decode_hc(4096, 512, 3, exact));
         test_cases.emplace_back(new test_fn_decode_hc(2560, 320, 9, exact));   // past the mat-vec columns: unfused
+        test_cases.emplace_back(new test_fn_decode_hc(2560, 320, 0, exact));   // no tokens (a ubatch with no outputs): unfused
     }
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 1, GGML_TYPE_Q4_0, 8));
     // bf16: a bf16 weight LLAMA_BF16_TO_F16 kept (out of f16 range) meets the f16 mixed stream
