@@ -16,6 +16,10 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 uint a_offset, b_offset, d_offset, y_offset;
 
+#if defined(HC_MIX) && (K_PER_ITER != 8 || QUANT_R != 1)
+#error HC_MIX: only the K_PER_ITER 8, QUANT_R 1 path (q8_0) is implemented
+#endif
+
 vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, out bool OOB_y, out bool OOB_z, out bool OOB_w) {
     // Check if the latter elements are OOB, and don't fetch B or accumulate it.
     OOB_y = lastiter && (iybs + iqs + y_offset >= p.ncols);
@@ -57,6 +61,10 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const vec4 bv13 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset) / 4]);
         const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
         const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+#elif defined(HC_MIX)
+        // FN_DECODE_HC: B is the hc down output before its SCALE and SILU
+        const vec4 bv0 = hc_b_silu(vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]));
+        const vec4 bv1 = hc_b_silu(vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]));
 #else
         const vec4 bv0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
         const vec4 bv1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
@@ -70,7 +78,11 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
 #endif
         uint ibi = first_row*p.stride_a;   // rows step by stride_a (== ncols unless A's rows are padded)
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+#ifdef HC_MIX
+            const uint ib = (hc_phys_row(first_row + n)*p.stride_a + col)/QUANT_K; // block index, interleaved rows
+#else
             const uint ib = (ibi + col)/QUANT_K; // block index
+#endif
             ibi += p.stride_a;
 
 #if K_PER_ITER == 8

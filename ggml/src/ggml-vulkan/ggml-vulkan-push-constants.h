@@ -46,6 +46,19 @@ struct vk_mat_vec_push_constants {
     uint32_t broadcast3;
 };
 
+// FN_DECODE_HC (mul_mat_vec.comp HC_MIX): vk_mat_vec_push_constants followed by the hc fields
+struct vk_mat_vec_hc_mix_push_constants {
+    vk_mat_vec_push_constants mv;
+    uint32_t hc_n_embd;
+    uint32_t hc_x_offset;
+    uint32_t hc_x_s1;
+    uint32_t hc_x_s2;
+    uint32_t hc_d_s1;
+    float    hc_in_scale;
+    float    hc_in_bias;
+    float    hc_mix_scale;
+};
+
 struct vk_mat_vec_p021_push_constants {
     uint32_t ncols_x;
     uint32_t nrows_x;
