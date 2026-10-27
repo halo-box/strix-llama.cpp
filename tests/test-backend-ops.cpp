@@ -6260,22 +6260,40 @@ struct test_gdn_conv_prefill : public test_case {
     const int n_tokens;
     const int n_k_heads;
     const int n_v_heads;
-    test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads)
-        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads) {}
+    const int n_seqs;
+    const bool extra_reader; // a second reader of the SiLU output: the conv must run, so the conv fold has to decline
+    test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads, int n_seqs = 1, bool extra_reader = false)
+        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads), n_seqs(n_seqs), extra_reader(extra_reader) {}
     std::string op_desc(ggml_tensor *) override { return "GDN_CONV_PREFILL"; }
-    std::string vars() override { return VARS_TO_STR3(n_tokens, n_k_heads, n_v_heads); }
+    std::string vars() override {
+        if (n_seqs == 1 && !extra_reader) {
+            return VARS_TO_STR3(n_tokens, n_k_heads, n_v_heads);
+        }
+        return VARS_TO_STR5(n_tokens, n_k_heads, n_v_heads, n_seqs, extra_reader);
+    }
     // GGML_VK_TEST_REQUIRE_GDN_QKNORM=1: the chunked GDN (>= 64 tokens) normalises q / k itself and the norm nodes do not run;
-    // GGML_VK_GDN_QKNORM=0 under the assert is the negative control
+    // GGML_VK_GDN_QKNORM=0 under the assert is the negative control.
+    // GGML_VK_TEST_REQUIRE_GDN_CONVFOLD=1: it also computes the conv + SiLU on load and the SSM_CONV / SILU nodes do not run
+    // (not with an extra SiLU reader, under 64 tokens, or with GGML_VK_GDN_CONVFOLD=0 / GGML_VK_GDN_QKNORM=0: count 0)
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_QKNORM") || !env_knob_on("GGML_VK_GDN_CHUNK")) {
-            return true;
+        const bool chunk = env_knob_on("GGML_VK_GDN_CHUNK") && n_tokens >= 64;
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_QKNORM") && env_knob_on("GGML_VK_GDN_CHUNK")) {
+            const int64_t want = chunk ? 1 : 0;
+            const int64_t n = dispatch_census_count(backend, "path:GDN_QK_NORM");
+            if (n != want) {
+                msg = "GDN_QK_NORM dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+                return false;
+            }
         }
-        const int64_t want = n_tokens >= 64 ? 1 : 0;
-        const int64_t n = dispatch_census_count(backend, "path:GDN_QK_NORM");
-        if (n != want) {
-            msg = "GDN_QK_NORM dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
-            return false;
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_CONVFOLD")) {
+            const int64_t want = chunk && !extra_reader && env_knob_on("GGML_VK_GDN_CONVFOLD") && env_knob_on("GGML_VK_GDN_QKNORM") &&
+                                 env_knob_on("GGML_VK_SSMCONV_DIRECT") ? 1 : 0;
+            const int64_t n = dispatch_census_count(backend, "path:GDN_CONV_FOLD");
+            if (n != want) {
+                msg = "GDN_CONV_FOLD dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+                return false;
+            }
         }
         return true;
     }
@@ -6296,24 +6314,30 @@ struct test_gdn_conv_prefill : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int C = 128 * (2 * n_k_heads + n_v_heads);
-        ggml_tensor * x_src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n_tokens);
+        const int S = n_seqs;
+        ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_tokens, S);
         ggml_set_name(x_src, "x_src");
         ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, not a permanent input
-        ggml_tensor * history = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, C);
+        ggml_tensor * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, S);
         ggml_set_name(history, "history");
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
         ggml_set_name(w, "taps");
         ggml_tensor * cc = ggml_concat(ctx, history, ggml_transpose(ctx, x), 0);
-        ggml_tensor * conv = ggml_ssm_conv(ctx, ggml_reshape_3d(ctx, cc, n_tokens + 3, C, 1), w);
+        ggml_tensor * conv = ggml_ssm_conv(ctx, ggml_reshape_3d(ctx, cc, n_tokens + 3, C, S), w);
         ggml_tensor * silu = ggml_silu(ctx, conv);
         if (gf) ggml_build_forward_expand(gf, silu);
+        ggml_tensor * extra = nullptr;
+        if (extra_reader) {
+            extra = ggml_scale(ctx, silu, 2.0f);
+            if (gf) ggml_build_forward_expand(gf, extra);
+        }
 
         // An independent full-size allocation between conv and GDN exercises scheduler allocation and fusion order.
         ggml_tensor * scratch = ggml_scale(ctx, x_src, 0.25f);
         if (gf) ggml_build_forward_expand(gf, scratch);
 
         auto view = [&](int heads, int offset) {
-            return ggml_view_4d(ctx, silu, 128, heads, n_tokens, 1,
+            return ggml_view_4d(ctx, silu, 128, heads, n_tokens, S,
                                 128 * sizeof(float), (size_t) C * sizeof(float),
                                 (size_t) C * n_tokens * sizeof(float), (size_t) offset * sizeof(float));
         };
@@ -6323,13 +6347,15 @@ struct test_gdn_conv_prefill : public test_case {
         const float eps = 1e-6f;
         q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps / 128), 1.0f / sqrtf(128.0f));
         k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps / 128), 1.0f / sqrtf(128.0f));
-        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, n_tokens, 1);
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, n_tokens, S);
         ggml_set_name(g, "gate");
-        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, n_tokens, 1);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, n_tokens, S);
         ggml_set_name(beta, "beta");
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, n_v_heads, 1);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, n_v_heads, S);
         ggml_set_name(state, "state");
-        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        // the extra reader's result must be checked too: add it in (same shape only for this purpose: reduce to a scalar)
+        return extra ? ggml_add(ctx, out, ggml_scale(ctx, ggml_sum(ctx, extra), 0.0f)) : out;
     }
 };
 
@@ -15823,6 +15849,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_conv_prefill(64, 4, 4));
     test_cases.emplace_back(new test_gdn_conv_prefill(48, 2, 2));
     test_cases.emplace_back(new test_gdn_conv_prefill(2048, 16, 48));
+    // the conv fold (GDN_CONV_FOLD): a one-token last chunk, a chunk-multiple length, two sequences, the Flash-Next shape at a
+    // ragged length, and the negative control (a second SiLU reader keeps the conv, no fold)
+    test_cases.emplace_back(new test_gdn_conv_prefill(65, 2, 4));
+    test_cases.emplace_back(new test_gdn_conv_prefill(128, 2, 6));
+    test_cases.emplace_back(new test_gdn_conv_prefill(96, 2, 4, 2));
+    test_cases.emplace_back(new test_gdn_conv_prefill(64, 2, 4, 2));    // two sequences at the chunk threshold
+    test_cases.emplace_back(new test_gdn_conv_prefill(48, 2, 4, 2));    // two sequences under it: sequential kernel, no fold
+    test_cases.emplace_back(new test_gdn_conv_prefill(333, 16, 48));
+    test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 4, 1, true));
     // Multiple sequences must remain on the generic fallback.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));

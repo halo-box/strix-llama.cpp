@@ -50,6 +50,12 @@ layout(push_constant) uniform Parameters {
     uint qk_norm;     // q and k arrive un-normalised: x * qk_mul * rsqrt(mean(x^2) + qk_eps) per 128-row (the graph's
     float qk_eps;     // RMS_NORM(eps) -> SCALE(qk_mul) l2 norms, skipped by the host)
     float qk_mul;
+    // conv_fold: bindings 0 / 1 are the conv input x [C, T, S] (the qkv projection), not the SiLU output; q / k are
+    // silu(conv4(x)) of channels qc0 / kc0 + the view offset, as ssm_conv.comp MODE 1, with the conv state (binding 5,
+    // [3, C, S]) for tokens before 0 and the taps (binding 6, [4, C]). The host skips the SSM_CONV + SILU nodes.
+    uint conv_fold;
+    uint qc0, kc0, vc0;
+    uint conv_C;
 };
 
 layout(binding = 0) readonly  buffer QBuf    { float data_q[];    };
@@ -58,6 +64,27 @@ layout(binding = 2) readonly  buffer GBuf    { float data_g[];    };
 layout(binding = 3) readonly  buffer BetaBuf { float data_beta[]; };
 layout(binding = 4) writeonly buffer ScrBuf  { uint data_scr[];   };
 layout(binding = 4) writeonly buffer ScrBuf16 { float16_t data_scr16[]; };
+layout(binding = 5) readonly  buffer CStBuf  { float data_cst[];  };
+layout(binding = 6) readonly  buffer CWBuf   { float data_cw[];   };
+
+// silu(conv4) of channel c at token tt of sequence s, x element at xo: the same expressions as ssm_conv.comp MODE 1
+// (window from the conv state before token 0, one dot, SiLU), so the result is bit-identical to the SSM_CONV + SILU nodes
+float conv_silu_q(const bool is_k, const uint xo, const uint c, const uint tt, const uint s) {
+    const vec4 w = vec4(data_cw[4 * c], data_cw[4 * c + 1], data_cw[4 * c + 2], data_cw[4 * c + 3]);
+    float win[3];
+    [[unroll]] for (uint i = 0; i < 3; i++) {
+        const int t = int(tt) + int(i) - 3;
+        if (t < 0) {
+            win[i] = data_cst[s * 3 * conv_C + c * 3 + uint(t + 3)];
+        } else {
+            win[i] = is_k ? data_k[xo - (3 - i) * sq2] : data_q[xo - (3 - i) * sq2];
+        }
+    }
+    const float v = is_k ? data_k[xo] : data_q[xo];
+    float sum = dot(vec4(win[0], win[1], win[2], v), w);
+    sum = sum / (1.0f + exp(-sum));
+    return sum;
+}
 
 // half index of element (row, col) of a matrix with NCB 16-column blocks, in fragment-tile order
 #define FRAG_H(row, col, NCB) (((((row) / 16) * (NCB) + (col) / 16) * 16 + (row) % 16) * 16 + (col) % 16)
@@ -101,8 +128,17 @@ void main() {
         qvs[i] = vec2(0.0);
         if (t0 + t < n_tokens) {
             const uint off = iq3 * sq3 + (t0 + t) * sq2 + hk * sq1 + 2 * kp;
-            kvs[i] = vec2(data_k[off], data_k[off + 1]);
-            qvs[i] = vec2(data_q[off], data_q[off + 1]);
+            if (conv_fold != 0) {
+                const uint qc = qc0 + hk * sq1 + 2 * kp;
+                const uint kc = kc0 + hk * sq1 + 2 * kp;
+                kvs[i] = vec2(conv_silu_q(true,  kc0 + off,     kc,     t0 + t, iq3),
+                              conv_silu_q(true,  kc0 + off + 1, kc + 1, t0 + t, iq3));
+                qvs[i] = vec2(conv_silu_q(false, qc0 + off,     qc,     t0 + t, iq3),
+                              conv_silu_q(false, qc0 + off + 1, qc + 1, t0 + t, iq3));
+            } else {
+                kvs[i] = vec2(data_k[off], data_k[off + 1]);
+                qvs[i] = vec2(data_q[off], data_q[off + 1]);
+            }
         }
     }
     if (qk_norm != 0) {

@@ -4685,11 +4685,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->driver_id == vk::DriverId::eMesaRadv &&
                 device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
                 ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_prep, "gdn_chunk_prep_f32", gdn_chunk_prep_f32_len, gdn_chunk_prep_f32_data,
-                    "main", 5, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+                    "main", 7, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
                 // one wave (16 state columns) per workgroup, operands straight from the scratch
                 device->gdn_chunk_scan_nsplit = 8;
                 ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_f32", gdn_chunk_scan_f32_len, gdn_chunk_scan_f32_data,
-                    "main", 4, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
+                    "main", 6, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
             }
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_cm_f16,
                 "flash_attn_top_k_cm_f16", flash_attn_top_k_cm_f16_len, flash_attn_top_k_cm_f16_data, "main", 6,
@@ -13629,17 +13629,35 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
             ggml_vk_sync_buffers(ctx, subctx);
         }
         vk_subbuffer scr_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
-        const vk_op_gdn_chunk_push_constants cpc = { pc, nch, qkn ? 1u : 0u, qkn ? qkn->eps : 0.0f, qkn ? qkn->mul : 1.0f };
+        vk_op_gdn_chunk_push_constants cpc = { pc, nch, qkn ? 1u : 0u, qkn ? qkn->eps : 0.0f, qkn ? qkn->mul : 1.0f, 0, 0, 0, 0, 0 };
         if (qkn) {
             ggml_vk_path_census_add("GDN_QK_NORM");
+        }
+        // conv + SiLU on load (ggml_vk_gdn_conv_fold_prepass): q / k / v bindings are x, plus the conv state and taps;
+        // otherwise the two extra bindings get a placeholder the shader does not read
+        vk_subbuffer cst_buf = src_buf[0];
+        vk_subbuffer cw_buf  = src_buf[0];
+        const auto cf_it = ctx->gdn_cf.find(dst);
+        if (cf_it != ctx->gdn_cf.end()) {
+            const auto & cf = cf_it->second;
+            GGML_ASSERT(qkn != nullptr);
+            src_buf[0] = src_buf[1] = src_buf[2] = ggml_vk_tensor_subbuffer(ctx, cf.x);
+            cst_buf = ggml_vk_tensor_subbuffer(ctx, cf.state);
+            cw_buf  = ggml_vk_tensor_subbuffer(ctx, cf.kern);
+            cpc.conv_fold = 1;
+            cpc.qc0 = cf.qc0;
+            cpc.kc0 = cf.kc0;
+            cpc.vc0 = cf.vc0;
+            cpc.conv_C = cf.C;
+            ggml_vk_path_census_add("GDN_CONV_FOLD");
         }
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_gdn_chunk_prep, 1);
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_gdn_chunk_scan, 1);
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_gdn_chunk_prep,
-            { src_buf[0], src_buf[1], src_buf[3], src_buf[4], scr_buf }, cpc, { neq1, nch, n_seqs });
+            { src_buf[0], src_buf[1], src_buf[3], src_buf[4], scr_buf, cst_buf, cw_buf }, cpc, { neq1, nch, n_seqs });
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_gdn_chunk_scan,
-            { src_buf[2], src_buf[5], dst_buf, scr_buf }, cpc, { H * ctx->device->gdn_chunk_scan_nsplit, n_seqs, 1 });
+            { src_buf[2], src_buf[5], dst_buf, scr_buf, cst_buf, cw_buf }, cpc, { H * ctx->device->gdn_chunk_scan_nsplit, n_seqs, 1 });
         ctx->prealloc_split_k_need_sync = true;
         return;
     }
@@ -18840,6 +18858,106 @@ static void ggml_vk_gdn_qk_norm_prepass(ggml_backend_vk_context * ctx, const ggm
     }
 }
 
+// Chunked GDN with the conv + SiLU on load (GGML_VK_GDN_CONVFOLD=0 disables): a GATED_DELTA_NET that already folds its q/k
+// l2 norms (gdn_qk) and whose q, k and v are views of one SILU(SSM_CONV(concat)) that runs direct (ssm_conv_direct_check)
+// reads the conv input x instead; the SSM_CONV and the SILU are skipped, so the [C, T] SiLU output is never written. The conv
+// is computed with ssm_conv.comp MODE 1's expressions: bit-identical to the unfolded chain. graph_optimize keeps x and the conv
+// state allocated through the GDN (ggml_vk_gdn_conv_fold_structural).
+static bool ggml_vk_gdn_conv_fold_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_GDN_CONVFOLD"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// the shape part of the match (no buffers): the GDN's q / k are SCALE(RMS_NORM(view)) and q, k, v are views of the SILU of an
+// SSM_CONV over a concat the direct conv accepts. Returns the concat's node index or -1; fills the direct match.
+static int ggml_vk_gdn_conv_fold_structural(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph,
+                                            const std::unordered_map<const ggml_tensor *, int> & idx, const ggml_tensor * g,
+                                            bool runtime, ggml_backend_vk_context::ssm_conv_direct_match & m) {
+    auto raw_of = [](const ggml_tensor * t) -> const ggml_tensor * {
+        return t && t->op == GGML_OP_SCALE && t->src[0] && t->src[0]->op == GGML_OP_RMS_NORM ? t->src[0]->src[0] : nullptr;
+    };
+    const ggml_tensor * q = raw_of(g->src[0]);
+    const ggml_tensor * k = raw_of(g->src[1]);
+    const ggml_tensor * v = g->src[2];
+    if (!q || !k || !v || !q->view_src || q->view_src != k->view_src || q->view_src != v->view_src) {
+        return -1;
+    }
+    const ggml_tensor * su = q->view_src;
+    if (su->op != GGML_OP_UNARY || ggml_get_unary_op(su) != GGML_UNARY_OP_SILU || !su->src[0] || su->src[0]->op != GGML_OP_SSM_CONV) {
+        return -1;
+    }
+    const ggml_tensor * cv = su->src[0];
+    const ggml_tensor * cc = cv->src[0] && cv->src[0]->op != GGML_OP_CONCAT ? cv->src[0]->view_src : cv->src[0];
+    if (!cc || cc->op != GGML_OP_CONCAT || !idx.count(cc) || !idx.count(cv) || !idx.count(g)) {
+        return -1;
+    }
+    const int ci = idx.at(cc);
+    if (!ggml_vk_ssm_conv_direct_check(ctx, cgraph, ci, m, runtime) || m.out != su || m.conv_idx != idx.at(cv) || m.conv_idx >= idx.at(g)) {
+        return -1;
+    }
+    // every view offset is a whole number of floats inside x's [C] rows
+    for (const ggml_tensor * t : { q, k, v }) {
+        if (t->view_offs % sizeof(float) != 0 || t->view_offs / sizeof(float) >= (size_t) m.x->ne[0]) {
+            return -1;
+        }
+    }
+    return ci;
+}
+
+static void ggml_vk_gdn_conv_fold_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->gdn_cf.clear();
+    if (!ggml_vk_gdn_conv_fold_enabled() || ctx->gdn_qk.empty() || !ggml_vk_ssm_conv_direct_enabled()) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, int> idx;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        idx[cgraph->nodes[i]] = i;
+    }
+    for (const auto & it : ctx->gdn_qk) {
+        const ggml_tensor * g = it.first;
+        ggml_backend_vk_context::ssm_conv_direct_match m;
+        if (ggml_vk_gdn_conv_fold_structural(ctx, cgraph, idx, g, true, m) < 0) {
+            continue;
+        }
+        const int gi = idx.at(g);
+        const ggml_tensor * su = m.out;
+        const ggml_tensor * rq = g->src[0]->src[0];
+        const ggml_tensor * rk = g->src[1]->src[0];
+        // the SiLU output is never written: its only readers (through views) are the two folded norms and this GDN
+        bool ok = true;
+        for (int n = m.conv_idx + 2; n < cgraph->n_nodes && ok; ++n) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            if (t == g || t == rq || t == rk || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || ggml_op_is_empty(t->op)) {
+                continue;
+            }
+            if (ggml_vk_node_reads(t, su)) {
+                ok = false;
+            }
+        }
+        // x and the conv state are read at the GDN, later than the conv: nothing in between may overwrite them, and the GDN
+        // output may not alias them
+        for (int n = m.conv_idx + 1; n <= gi && ok; ++n) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            if (t->buffer == nullptr || t->op == GGML_OP_NONE || ggml_op_is_empty(t->op) || ggml_is_empty(t) ||
+                ctx->gdn_qk_skip.count(t)) {
+                continue;
+            }
+            if (ggml_vk_tensors_overlap(t, m.x, false) || ggml_vk_tensors_overlap(t, m.state, false)) {
+                ok = false;
+            }
+        }
+        if (!ok || get_misalign_bytes(ctx, m.x) != 0 || get_misalign_bytes(ctx, m.state) != 0 || get_misalign_bytes(ctx, m.kern) != 0) {
+            continue;
+        }
+        const ggml_tensor * q = it.second.q_raw;
+        const ggml_tensor * k = it.second.k_raw;
+        const ggml_tensor * v = g->src[2];
+        ctx->gdn_cf[g] = { m.x, m.state, m.kern, (uint32_t) m.x->ne[0], (uint32_t) (q->view_offs / sizeof(float)),
+                           (uint32_t) (k->view_offs / sizeof(float)), (uint32_t) (v->view_offs / sizeof(float)) };
+        ctx->gdn_qk_skip.insert({ cgraph->nodes[m.conv_idx], su });
+    }
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -18981,6 +19099,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     };
 
     ggml_vk_gdn_qk_norm_prepass(ctx, cgraph);
+    ggml_vk_gdn_conv_fold_prepass(ctx, cgraph);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
@@ -19308,6 +19427,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // a fusion may not swallow a norm the chunked GDN computes itself
         for (int k = 1; k <= ctx->num_additional_fused_ops && !ctx->gdn_qk_skip.empty(); ++k) {
             GGML_ASSERT(!ctx->gdn_qk_skip.count(cgraph->nodes[i + k]));
+        }
+        // the conv-folded chunked GDN reads x and the conv state, which are not its srcs (barrier tracking)
+        if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET && !ctx->gdn_cf.empty()) {
+            const auto cf_it = ctx->gdn_cf.find(cgraph->nodes[i]);
+            if (cf_it != ctx->gdn_cf.end()) {
+                GGML_ASSERT(ctx->num_additional_fused_ops == 0 && ctx->fused_extra_srcs[0] == nullptr);
+                ctx->fused_extra_srcs[0] = cf_it->second.x;
+                ctx->fused_extra_srcs[1] = cf_it->second.state;
+            }
         }
         GGML_ASSERT(ctx->num_additional_fused_ops < (int)(sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0])));
         ctx->fused_ops_write_mask |= 1 << ctx->num_additional_fused_ops;
@@ -20139,6 +20267,27 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     // Replace the graph with the new order.
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
+    }
+
+    // conv-folded chunked GDN (ggml_vk_gdn_conv_fold_prepass): x and the conv state are read at the GDN; keep them allocated
+    // through it (the runtime prepass re-checks the addresses). Shape-only match: a GDN that the prepass later declines only
+    // holds x a little longer.
+    if (ggml_vk_gdn_conv_fold_enabled() && ggml_vk_gdn_qk_norm_enabled() && ggml_vk_ssm_conv_direct_enabled() &&
+        !ctx->device->disable_fusion && ctx->device->pipeline_gdn_chunk_prep != nullptr && params && params->add_alloc_dep) {
+        std::unordered_map<const ggml_tensor *, int> idx;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            idx[graph->nodes[i]] = i;
+        }
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * g = graph->nodes[i];
+            ggml_backend_vk_context::ssm_conv_direct_match m;
+            if (g->op == GGML_OP_GATED_DELTA_NET && ggml_vk_gdn_conv_fold_structural(ctx, graph, idx, g, false, m) >= 0) {
+                for (const ggml_tensor * input : { m.x, m.state }) {
+                    auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
+                    params->add_alloc_dep(params->user_data, root, g);
+                }
+            }
+        }
     }
 
     // direct GDN conv: x and the state are read at the conv, after the concat that names them, and while the

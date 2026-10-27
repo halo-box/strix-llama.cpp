@@ -46,12 +46,36 @@ layout(push_constant) uniform Parameters {
     float scale;
     uint K;
     uint nch;
+    uint qk_norm;
+    float qk_eps;
+    float qk_mul;
+    uint conv_fold;   // binding 0 is the conv input x: v = silu(conv4(x)) of channel vc0 + the view offset (gdn_chunk_prep.comp)
+    uint qc0, kc0, vc0;
+    uint conv_C;
 };
 
 layout(binding = 0) readonly  buffer VBuf     { float data_v[];     };
 layout(binding = 1) readonly  buffer StateBuf { float data_state[]; };
 layout(binding = 2)           buffer DstBuf   { float data_dst[];   };
 layout(binding = 3) readonly  buffer ScrBuf   { uvec4 scr4[];       };
+layout(binding = 4) readonly  buffer CStBuf   { float data_cst[];   };
+layout(binding = 5) readonly  buffer CWBuf    { float data_cw[];    };
+
+// silu(conv4) of channel c at token tt of sequence s, x element at xo: ssm_conv.comp MODE 1's expressions (bit-identical)
+float conv_silu_v(const uint xo, const uint c, const uint tt, const uint s, const vec4 w) {
+    float win[3];
+    [[unroll]] for (uint i = 0; i < 3; i++) {
+        const int t = int(tt) + int(i) - 3;
+        if (t < 0) {
+            win[i] = data_cst[s * 3 * conv_C + c * 3 + uint(t + 3)];
+        } else {
+            win[i] = data_v[xo - (3 - i) * sv2];
+        }
+    }
+    float sum = dot(vec4(win[0], win[1], win[2], data_v[xo]), w);
+    sum = sum / (1.0f + exp(-sum));
+    return sum;
+}
 
 // one chunk in 16-byte units, fragment order (tile (rb, cb) of 32 units, lane row r at +2r):
 //   q/k block: Qh [0, 512), Kh [512, 1024), KhT [1024, 1536);  T/P block: T [0, 128), P [128, 256), gam/dec [256, 272)
@@ -119,7 +143,13 @@ void main() {
 
     const uint state_base = (seq * H + h) * S_V * S_V + (v0 + lr) * S_V;
     // token-row addressing: lane part (column, half-wave row parity) + a uniform row offset
-    const uint v_lane     = seq * sv3 + h * sv1 + v0 + lr + hi * sv2;
+    const uint v_lane     = seq * sv3 + h * sv1 + v0 + lr + hi * sv2 + (conv_fold != 0 ? vc0 : 0);
+    // conv_fold: this lane's channel and taps
+    const uint v_ch       = vc0 + h * sv1 + v0 + lr;
+    vec4 v_w = vec4(0.0);
+    if (conv_fold != 0) {
+        v_w = vec4(data_cw[4 * v_ch], data_cw[4 * v_ch + 1], data_cw[4 * v_ch + 2], data_cw[4 * v_ch + 3]);
+    }
     const uint o_lane     = (seq * n_tokens * H + h) * S_V + v0 + lr + hi * (S_V * H);
     // scratch is chunk-major (all heads of a chunk adjacent), see gdn_chunk_prep.comp
     const uint qk_base4   = (seq * nch * neq1 + iq1) * (QKU / 4);
@@ -142,7 +172,12 @@ void main() {
         [[unroll]] for (uint j = 0; j < NT; j++) {
             [[unroll]] for (uint i = 0; i < 8; i++) {
                 const uint t = t0 + 16 * j + 2 * i;      // uniform; the lane adds hi
-                vv[j][i] = data_v[v_lane + min(t, n_tokens - 1 - hi) * sv2];
+                const uint tc = min(t, n_tokens - 1 - hi);
+                if (conv_fold != 0) {
+                    vv[j][i] = conv_silu_v(v_lane + tc * sv2, v_ch, tc + hi, seq, v_w);
+                } else {
+                    vv[j][i] = data_v[v_lane + tc * sv2];
+                }
             }
         }
         const float gam_last = gd(CL - 1);
