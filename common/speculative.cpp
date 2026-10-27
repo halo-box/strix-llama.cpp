@@ -1595,6 +1595,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     size_t n_pcum_stops = 0;    // chains cut by the rule
     size_t n_pcum_saved = 0;    // draft steps not taken because of it
 
+    // --spec-draft-cost-aware: per-sequence width policy (common_speculative_mtp_cost_policy) and round timing
+    bool cost_aware = false;
+    bool ca_trace   = false;                        // LLAMA_SPEC_CA_TRACE=1: one log line per round
+    std::vector<common_speculative_mtp_cost_policy> ca_pol;
+    std::vector<int64_t> ca_t_prev;                 // draft() entry time of the previous round, 0 = none yet
+    std::vector<int32_t> ca_w_prev;                 // width the previous round verified (-1 = none)
+    std::vector<int32_t> ca_w_prev2;                // the round before that
+    std::vector<int32_t> ca_w_round;                // width chosen for the current round
+    std::vector<int32_t> ca_acc_prev;               // accepted count of the previous round (-1 = plain step)
+    std::vector<size_t>  ca_hist;                   // rounds per verified width
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1670,6 +1681,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         i_last.assign(n_seq, -1);
         pcum_acc.assign(n_seq, 1.0f);
+
+        cost_aware = this->params.cost_aware && !is_mem_shared && !chain_heads;
+        if (this->params.cost_aware && !cost_aware) {
+            SPC_WRN("%s", "--spec-draft-cost-aware applies to single-head MTP drafts only; ignored\n");
+        }
+        if (cost_aware) {
+            const char * tr = getenv("LLAMA_SPEC_CA_TRACE");
+            ca_trace = tr && atoi(tr) != 0;
+            ca_pol.assign(n_seq, common_speculative_mtp_cost_policy(this->params.n_max));
+            ca_t_prev.assign(n_seq, 0);
+            ca_w_prev.assign(n_seq, -1);
+            ca_w_prev2.assign(n_seq, -1);
+            ca_w_round.assign(n_seq, this->params.n_max);
+            ca_acc_prev.assign(n_seq, -1);
+            ca_hist.assign(common_speculative_mtp_cost_policy::W_MAX + 1, 0);
+            SPC_INF("cost-aware draft length on: width 0..%d per round\n",
+                    std::min(this->params.n_max, common_speculative_mtp_cost_policy::W_MAX));
+        }
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
 
@@ -1698,6 +1727,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
         reset_acc_ema(seq_id);
+        if (cost_aware) {
+            ca_pol[seq_id].reset(); // acceptance is per request; the round-time table is kept
+            ca_t_prev[seq_id]   = 0;
+            ca_w_prev[seq_id]   = -1;
+            ca_w_prev2[seq_id]  = -1;
+            ca_acc_prev[seq_id] = -1;
+        }
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1856,6 +1892,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<bool> drafting_round(n_seq); // drafted at least one step this round (cost-aware bookkeeping)
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -1864,8 +1901,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            if (cost_aware && ca_round_begin(seq_id, dp) == 0) {
+                continue; // plain target step: no draft step at all, the result stays empty
+            }
+
             n_drafting++;
             drafting[seq_id] = true;
+            drafting_round[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
             if (!params.probabilistic) {
                 dp.result_q = nullptr;
@@ -1931,7 +1973,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // MTP drafts sequentially, so a shorter draft saves draft passes
                 // as well as target verification work.
-                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+                const int32_t n_draft_eff = cost_aware ? ca_w_round[seq_id] : adaptive_n_draft(seq_id, params.n_max, params.n_min);
 
                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
@@ -2028,12 +2070,66 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+
+            if (cost_aware && drafting_round[seq_id]) {
+                // the width the target verifies this round (pcum / p_min cuts and the n_min clear included)
+                ca_w_prev2[seq_id] = ca_w_prev[seq_id];
+                ca_w_prev[seq_id]  = (int32_t) dp.result->size();
+                ca_hist[std::min<size_t>(dp.result->size(), ca_hist.size() - 1)]++;
+            }
         }
+    }
+
+    // --spec-draft-cost-aware: time the round that just ended, then choose this round's width (0 = plain target step)
+    int32_t ca_round_begin(llama_seq_id seq_id, const common_speculative_draft_params & dp) {
+        auto & pol = ca_pol[seq_id];
+        const int64_t t_now = ggml_time_us();
+        float dt_ms = 0.0f;
+        if (ca_t_prev[seq_id] > 0 && ca_w_prev[seq_id] >= 0) {
+            dt_ms = (float) (t_now - ca_t_prev[seq_id]) / 1000.0f;
+            pol.observe_time(ca_w_prev[seq_id], dt_ms, ca_w_prev[seq_id] != ca_w_prev2[seq_id]);
+        }
+        ca_t_prev[seq_id] = t_now;
+
+        int32_t cap = params.n_max;
+        if (dp.n_max > 0) {
+            cap = std::min(cap, dp.n_max);
+        }
+        const int32_t w = pol.choose(cap);
+        ca_w_round[seq_id] = w;
+
+        if (ca_trace) {
+            float score[common_speculative_mtp_cost_policy::W_MAX + 1];
+            const int c = std::min(cap, pol.w_max);
+            pol.best(c, score);
+            std::string sa, st;
+            for (int d = 0; d < c; ++d) {
+                sa += string_format("%s%.2f", d ? " " : "", pol.acc(d));
+            }
+            for (int k = 0; k <= c; ++k) {
+                st += string_format("%s%.1f/%d", k ? " " : "", pol.cost(k), pol.t_n[k]);
+            }
+            SPC_INF("ca seq %d prev w %d acc %d dt %.2f ms | a [%s] T [%s] -> w %d\n", seq_id, ca_w_prev[seq_id],
+                    ca_acc_prev[seq_id], dt_ms, sa.c_str(), st.c_str(), w);
+        }
+        ca_acc_prev[seq_id] = -1;
+
+        if (w == 0) {
+            ca_w_prev2[seq_id] = ca_w_prev[seq_id];
+            ca_w_prev[seq_id]  = 0;
+            ca_hist[0]++;
+        }
+        return w;
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (cost_aware && ca_w_prev[seq_id] > 0) {
+            ca_pol[seq_id].observe(ca_w_prev[seq_id], n_accepted);
+            ca_acc_prev[seq_id] = n_accepted;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
@@ -3287,6 +3383,21 @@ void common_speculative_print_stats(const common_speculative * spec) {
 
         if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
             const auto * mtp = static_cast<const common_speculative_impl_draft_mtp *>(impl.get());
+            if (mtp->cost_aware) {
+                std::string sh, st;
+                for (size_t w = 0; w < mtp->ca_hist.size(); ++w) {
+                    if (mtp->ca_hist[w]) {
+                        sh += string_format("%s%zu:%zu", sh.empty() ? "" : " ", w, mtp->ca_hist[w]);
+                    }
+                }
+                const auto & pol = mtp->ca_pol[0];
+                for (int w = 0; w <= pol.w_max; ++w) {
+                    if (pol.t_n[w]) {
+                        st += string_format("%s%d:%.1fms/%d", st.empty() ? "" : " ", w, pol.t_ms[w], pol.t_n[w]);
+                    }
+                }
+                SPC_INF("mtp cost-aware: rounds by verified width {%s}, round time seq 0 {%s}\n", sh.c_str(), st.c_str());
+            }
             if (mtp->params.mtp_pcum > 0.0f) {
                 SPC_INF("mtp pcum %.2f: chains cut = %zu of %zu drafts, draft steps saved = %zu\n",
                         (double) mtp->params.mtp_pcum, mtp->n_pcum_stops, impl->n_call_draft, mtp->n_pcum_saved);

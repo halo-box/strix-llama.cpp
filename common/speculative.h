@@ -3,6 +3,9 @@
 #include "llama.h"
 #include "common.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -108,6 +111,155 @@ void common_speculative_print_stats(const common_speculative * spec);
 static inline bool common_speculative_mtp_pcum_keep(float pcum, int k, float acc, float p) {
     return pcum <= 0.0f || k <= 1 || acc * p >= pcum;
 }
+
+// --spec-draft-cost-aware (MTP): choose each round's draft width w in 0..cap to maximise expected emitted tokens per unit of
+// round time, E(w) / T(w).
+//   E(w) = 1 + sum_{k=1..w} prod_{d<=k} a_d, where a_d is the conditional acceptance at depth d from decayed counts. Only the
+//          first rejected depth is a failure; the unverified tail and a fully accepted chain are censored.
+//   T(w) = wall time of a round of width w (draft steps, verify of w + 1 rows, draft catch-up, sampling), learned online. A
+//          width with fewer than 2 samples is priced from the nearest measured width with a per-draft slope prior.
+// The first round of a request drafts cap (the fixed-width behaviour). w = 0 is a plain target step with no draft step; after
+// choosing it the policy stays on plain steps for ar_hold rounds, then drafts one token to look again. A width change must
+// beat the current width's score by `margin`, since each change rebuilds the verify graph. Width only: greedy verify emits
+// the same tokens whatever is drafted. Acceptance resets per request (reset()); the round-time table persists.
+struct common_speculative_mtp_cost_policy {
+    static constexpr int   W_MAX   = 16;
+    static constexpr float decay   = 0.90f; // per observation of a depth (~10 observations of memory)
+    static constexpr float prior_s = 4.0f;  // prior a_d = 0.8, worth 5 observations
+    static constexpr float prior_f = 1.0f;
+    static constexpr float relax   = 0.95f; // per round, an undrafted depth drifts back to the prior
+    static constexpr float slope   = 0.30f; // prior extra round time per draft token, as a fraction of a plain step
+    static constexpr float t_alpha = 0.25f; // EMA weight of a new round-time sample
+    static constexpr float t_out   = 3.0f;  // a sample above t_out x the estimate is an outlier (idle gap, rebuild)
+    static constexpr float margin  = 1.03f;
+    static constexpr int   ar_hold = 16;
+
+    int   w_max = 3;
+    float succ[W_MAX];
+    float fail[W_MAX];
+    int   n_obs   = 0;
+    int   ar_left = 0;
+    bool  probe   = false;
+    int   w_cur   = -1;
+
+    float t_ms[W_MAX + 1];
+    int   t_n [W_MAX + 1];
+
+    explicit common_speculative_mtp_cost_policy(int w = 3) { init(w); }
+
+    void init(int w) {
+        w_max = w < 1 ? 1 : (w > W_MAX ? W_MAX : w);
+        for (int i = 0; i <= W_MAX; ++i) { t_ms[i] = 0.0f; t_n[i] = 0; }
+        reset();
+    }
+
+    void reset() {
+        for (int d = 0; d < W_MAX; ++d) { succ[d] = prior_s; fail[d] = prior_f; }
+        n_obs = 0; ar_left = 0; probe = false; w_cur = -1;
+    }
+
+    float acc(int d) const { return succ[d] / (succ[d] + fail[d]); }
+
+    float expected(int w) const {
+        float e = 1.0f, s = 1.0f;
+        for (int d = 0; d < w && d < W_MAX; ++d) { s *= acc(d); e += s; }
+        return e;
+    }
+
+    // round time of width w: ms when any width is measured, else relative to a plain step
+    float cost(int w) const {
+        if (t_n[w] >= 2) {
+            return t_ms[w];
+        }
+        int m = -1;
+        for (int k = 0; k <= w_max; ++k) {
+            if (t_n[k] >= 2 && (m < 0 || std::abs(k - w) < std::abs(m - w))) {
+                m = k;
+            }
+        }
+        return m < 0 ? 1.0f + slope * w : t_ms[m] * (1.0f + slope * w) / (1.0f + slope * m);
+    }
+
+    // score of every width 0..cap (costs forced non-decreasing in w), returns the best
+    int best(int cap, float * score) const {
+        float c_prev = 0.0f;
+        int   b      = 0;
+        for (int w = 0; w <= cap; ++w) {
+            const float c = std::max(cost(w), c_prev);
+            c_prev   = c;
+            score[w] = expected(w) / c;
+            if (score[w] > score[b]) {
+                b = w;
+            }
+        }
+        return b;
+    }
+
+    int choose(int cap) {
+        cap = std::min(cap, w_max);
+        if (cap <= 0) {
+            return 0;
+        }
+        if (ar_left > 0) {
+            if (--ar_left == 0) {
+                probe = true;
+            }
+            return 0;
+        }
+        if (n_obs == 0) {
+            return w_cur = cap;
+        }
+        float score[W_MAX + 1];
+        int b = best(cap, score);
+        if (w_cur >= 0 && w_cur <= cap && b != w_cur && score[b] < score[w_cur] * margin) {
+            b = w_cur;
+        }
+        if (probe) {
+            probe = false;
+            b = std::max(b, 1);
+        }
+        if (b == 0) {
+            ar_left = ar_hold - 1;
+            probe   = ar_left == 0;
+        }
+        return w_cur = b;
+    }
+
+    void observe(int drafted, int accepted) {
+        if (drafted <= 0) {
+            return;
+        }
+        drafted  = std::min(drafted, W_MAX);
+        accepted = std::min(accepted, drafted);
+        const int n = accepted + (accepted < drafted ? 1 : 0);
+        for (int d = 0; d < n; ++d) {
+            succ[d] = decay * succ[d] + (d < accepted ? 1.0f : 0.0f);
+            fail[d] = decay * fail[d] + (d == accepted ? 1.0f : 0.0f);
+        }
+        // depths past the drafted width get no evidence while the width stays below them: let them drift back to the
+        // prior, so one bad stretch cannot keep a depth (and the width that needs it) shut for the rest of the request
+        for (int d = drafted; d < w_max; ++d) {
+            succ[d] = relax * succ[d] + (1.0f - relax) * prior_s;
+            fail[d] = relax * fail[d] + (1.0f - relax) * prior_f;
+        }
+        n_obs++;
+    }
+
+    // a round of width w took ms; `changed` = its width differs from the round before (graph rebuild, not counted)
+    void observe_time(int w, float ms, bool changed) {
+        if (w < 0 || w > W_MAX || changed || !(ms > 0.0f)) {
+            return;
+        }
+        if (t_n[w] == 0) {
+            t_ms[w] = ms;
+        } else if (ms <= t_out * t_ms[w]) {
+            t_ms[w] = (1.0f - t_alpha) * t_ms[w] + t_alpha * ms;
+        } else {
+            return;
+        }
+        t_n[w]++;
+    }
+};
 
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }

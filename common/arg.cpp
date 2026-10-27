@@ -4421,6 +4421,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_PCUM"));
     add_opt(common_arg(
+        {"--spec-draft-cost-aware"},
+        string_format("MTP: choose each round's draft length (0 to --spec-draft-n-max) to maximise expected tokens per unit of "
+                      "time, from per-position acceptance and the measured round time per draft length; 0 is a plain target "
+                      "step (default: %s)", params.speculative.draft.cost_aware ? "true" : "false"),
+        [](common_params & params) {
+            params.speculative.draft.cost_aware = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_COST_AWARE"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",
