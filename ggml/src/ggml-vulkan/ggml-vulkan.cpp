@@ -4392,6 +4392,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce_gate, "fa_split_k_reduce_gate", fa_split_k_reduce_gate_len, fa_split_k_reduce_gate_data, "main", 4, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->vendor_id == VK_VENDOR_ID_INTEL && (device->architecture == INTEL_XE2 || (device->architecture == INTEL_XE1 && device->coopmat_support && device->uma))) {
@@ -5242,6 +5243,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (sel_sg64 && device->subgroup_shuffle && device->subgroup_arithmetic && device->fp16) {
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_prep,
                 "flash_attn_sel_prep", flash_attn_sel_prep_len, flash_attn_sel_prep_data, "main", 2,
+                sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {}, 1, true);
+            // FA_SEL_LEAN: the same pre-pass with subgroup min / scan (256 threads: whole subgroups at any size)
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_prep_sg,
+                "flash_attn_sel_prep_sg", flash_attn_sel_prep_sg_len, flash_attn_sel_prep_sg_data, "main", 2,
                 sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {}, 1, true);
             static const char * sel_names[3] = { "flash_attn_sel_f16_gqa4", "flash_attn_sel_f16_gqa8", "flash_attn_sel_f16_gqa12" };
             for (uint32_t i = 0; i < 3; ++i) {
@@ -12152,6 +12157,20 @@ static bool ggml_vk_fa_out_gate_sel_enabled() {
     return on;
 }
 
+// FA_SEL_LEAN (GGML_VK_FA_SEL_LEAN=0 off): less fixed cost around the selected-key kernels, which at decode is most of the
+// op (Flash-Next d32k: one 4 MB gather in ~24 us, plus ~13 us of pre-pass and ~8 us of reduce and gate):
+//  - the pre-pass with subgroup operations (path:FA_SEL_PREP_SG): the same cleaned rows and counts, without one shared
+//    atomic per valid entry and the 16-barrier scan;
+//  - with more than one split (decode), the attention output gate in the split-k reduce (path:FA_OUT_GATE_SEL_REDUCE): the
+//    WMMA store can only apply it with one split, so the sigmoid-mul dispatch and its barrier go
+static bool ggml_vk_fa_sel_lean_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FA_SEL_LEAN");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 // out_gate / out_gate_dst / out_gate_done: as ggml_vk_flash_attn
 static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, ggml_tensor * dst,
@@ -12206,8 +12225,7 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     // the gate in the WMMA store: one split, one stream, the gate read in place from the [q | gate] per-head interleaved
     // projection (head stride 2 * D, token stride 2 * D * heads) and the gated result written to out_gate_dst
     vk_pipeline pipeline_gate = use_cm ? ctx->device->pipeline_flash_attn_sel_cm_gate_f16[gqa_idx] : nullptr;
-    const bool gate_epi = out_gate != nullptr && ggml_vk_fa_out_gate_sel_enabled() && pipeline_gate != nullptr &&
-                          n_split == 1 && NS == 1 &&
+    const bool gate_ok =  out_gate != nullptr && ggml_vk_fa_out_gate_sel_enabled() && NS == 1 &&
                           out_gate->type == GGML_TYPE_F32 && out_gate_dst->type == GGML_TYPE_F32 &&
                           out_gate->ne[0] == (int64_t)D && out_gate->ne[1] == (int64_t)NH && out_gate->ne[2] == (int64_t)N && out_gate->ne[3] == 1 &&
                           out_gate->nb[0] == sizeof(float) && out_gate->nb[1] == 2 * D * sizeof(float) &&
@@ -12216,9 +12234,13 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
                           ggml_vk_tensor_subbuffer(ctx, out_gate, true).size == ggml_nbytes(out_gate) &&
                           // the store keeps dst's strides (dst is contiguous: the pipeline gate)
                           ggml_is_contiguous(out_gate_dst) && ggml_nelements(out_gate_dst) == ggml_nelements(dst);
+    const bool gate_epi = gate_ok && pipeline_gate != nullptr && n_split == 1;
     if (gate_epi) {
         pipeline = pipeline_gate;
     }
+    // FA_SEL_LEAN: with more than one split (decode) the gate goes in the split-k reduce
+    const bool gate_reduce = gate_ok && n_split > 1 && ggml_vk_fa_sel_lean_enabled() &&
+                             ctx->device->pipeline_flash_attn_split_k_reduce_gate != nullptr;
 
     const vk_op_flash_attn_sel_push_constants pc = {
         (uint32_t) k->ne[1], n_sel, list_stride,
@@ -12230,11 +12252,13 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
         scale, n_split, chunk, NH, N, NS,
     };
 
-    vk_pipeline prep = ctx->device->pipeline_flash_attn_sel_prep;
+    const bool prep_sg = ggml_vk_fa_sel_lean_enabled() && ctx->device->pipeline_flash_attn_sel_prep_sg != nullptr;
+    vk_pipeline prep = prep_sg ? ctx->device->pipeline_flash_attn_sel_prep_sg : ctx->device->pipeline_flash_attn_sel_prep;
     ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     if (n_split > 1) {
-        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, gate_reduce ? ctx->device->pipeline_flash_attn_split_k_reduce_gate
+                                                               : ctx->device->pipeline_flash_attn_split_k_reduce, 1);
     }
     if (ctx->prealloc_size_split_k < split_off + split_size) {
         ctx->prealloc_size_split_k = split_off + split_size;
@@ -12245,7 +12269,12 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     }
     const vk_subbuffer list_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
     ggml_vk_dispatch_pipeline(ctx, subctx, prep, { ids_buf, list_buf }, pc, { N, NS, 1 });
+    if (prep_sg) {
+        ggml_vk_path_census_add("FA_SEL_PREP_SG");
+    }
     ggml_vk_sync_buffers(ctx, subctx);
+    // the serialised perf logger bills the pre-pass, the attention kernel and the reduce (the node's remainder) apart
+    ggml_vk_perf_mark_subop(ctx, subctx, "FA_SEL_PREP (sub-op)");
 
     // the WMMA kernel takes the K/V heads on x (next to each other), the scalar one on y
     GGML_ASSERT(!use_cm || (uint64_t) N * n_split * k->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
@@ -12269,7 +12298,19 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     const vk_subbuffer split_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, split_off);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, list_buf, split_buf }, pc, grid);
     ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_perf_mark_subop(ctx, subctx, "FA_SEL_MAIN (sub-op)");
     const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = { D, NH, N, N, NS, n_split, 0 };
+    if (gate_reduce) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce_gate,
+            { split_buf, q_buf, ggml_vk_tensor_subbuffer(ctx, out_gate_dst), ggml_vk_tensor_subbuffer(ctx, out_gate, true) },
+            reduce_pc, { NH, D, N * NS });
+        ctx->prealloc_split_k_need_sync = true;
+        ggml_vk_path_census_add("FA_OUT_GATE_SEL_REDUCE");
+        if (out_gate_done) {
+            *out_gate_done = true;
+        }
+        return true;
+    }
     ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
         { split_buf, q_buf, dst_buf }, reduce_pc, { NH, D, N * NS });
     ctx->prealloc_split_k_need_sync = true;
@@ -22199,6 +22240,12 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     // dispatch paths (not fusions): GGML_VK_DISABLE_FUSION does not turn them off
     if (l == "path:QSA_RADIX_SELECT" || l == "path:QSA_PREFILL_SELECT") {
         return dev->pipeline_topk_radix_lds ? nullptr : "no LDS radix select pipeline (subgroup arithmetic, ballot, vote, full subgroups, 50 KiB shared memory)";
+    }
+    if (l == "path:FA_SEL_PREP_SG") {
+        return dev->pipeline_flash_attn_sel_prep_sg ? nullptr : "no selected-key FA pipelines";
+    }
+    if (l == "path:FA_OUT_GATE_SEL_REDUCE") {
+        return dev->pipeline_flash_attn_split_k_reduce_gate ? nullptr : "no gated split-k reduce pipeline";
     }
     if (dev->disable_fusion) {
         return "fusion disabled (GGML_VK_DISABLE_FUSION)";

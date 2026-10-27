@@ -13182,7 +13182,9 @@ struct test_fa_out_gate : public test_case {
 // selection builds them. blocks > 0: (selected - 3) / 4 blocks of 4 cells, query q sees min(blocks + q / 4, keys / 4 - 1)
 // of them (query 0 sees nothing), then its own partial block; cells scattered over the cache (logical c -> c * 7919 % keys).
 // GGML_VK_TEST_REQUIRE_FA_OUT_GATE_SEL=1 asserts the fusion and that the cases marked epi take the selected-key store
-// epilogue (path:FA_OUT_GATE_SEL), the others the sigmoid-mul (GGML_VK_FA_OUT_GATE_SEL=0 under it is the negative control)
+// epilogue (path:FA_OUT_GATE_SEL), the others (decode: few rows, split keys) the gate in the split-k reduce
+// (path:FA_OUT_GATE_SEL_REDUCE) with GGML_VK_FA_SEL_LEAN on, else the sigmoid-mul (GGML_VK_FA_OUT_GATE_SEL=0 under it
+// is the negative control)
 struct test_fa_out_gate_sel : public test_case {
     const int64_t nh;      // query heads (head size 256)
     const int64_t nh_kv;   // KV heads
@@ -13222,11 +13224,14 @@ struct test_fa_out_gate_sel : public test_case {
         }
         const int64_t fused = dispatch_census_count(backend, "FA_OUT_GATE");
         const int64_t sel = dispatch_census_count(backend, "path:FA_OUT_GATE_SEL");
+        const int64_t red = dispatch_census_count(backend, "path:FA_OUT_GATE_SEL_REDUCE");
         const int64_t e = dispatch_census_count(backend, "path:FA_OUT_GATE_EPILOGUE");
         const int64_t f = dispatch_census_count(backend, "path:FA_OUT_GATE_SIGMUL");
-        if (fused != 1 || sel != (epi ? 1 : 0) || e != sel || f != 1 - sel) {
+        const int64_t want_red = !epi && env_knob_on("GGML_VK_FA_SEL_LEAN") ? 1 : 0;
+        if (fused != 1 || sel != (epi ? 1 : 0) || red != want_red || e != sel + red || f != 1 - e) {
             msg = "FA_OUT_GATE dispatches: " + std::to_string(fused) + " (selected-key epilogue " + std::to_string(sel) +
-                  ", epilogue " + std::to_string(e) + ", sigmul " + std::to_string(f) + ", expected epilogue " + std::to_string(epi ? 1 : 0) + ")";
+                  ", reduce " + std::to_string(red) + ", epilogue " + std::to_string(e) + ", sigmul " + std::to_string(f) +
+                  ", expected epilogue " + std::to_string(epi ? 1 : 0) + ", reduce " + std::to_string(want_red) + ")";
             return false;
         }
         return true;
@@ -13546,6 +13551,21 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
         : test_qsa_prefill(queries,keys,selected,interleaved,false,1,ratio), blocks(blocks) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL_MASKLESS"; }
     std::string vars() override { return test_qsa_prefill::vars() + (blocks ? ",blocks=" + std::to_string(blocks) : ""); }
+    // GGML_VK_TEST_REQUIRE_FA_SEL_LEAN=1: with GGML_VK_FA_SEL_LEAN on, the selected-key FA cleans its rows with the
+    // subgroup pre-pass, once per op; off, never
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_FA_SEL_LEAN", "path:FA_SEL_PREP_SG") || dim != 256) {
+            return true;
+        }
+        const int64_t want = env_knob_on("GGML_VK_FA_SEL_LEAN") ? 1 : 0;
+        const int64_t got = dispatch_census_count(backend, "path:FA_SEL_PREP_SG");
+        if (got != want) {
+            msg = "path:FA_SEL_PREP_SG dispatches: " + std::to_string(got) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        return true;
+    }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
         q = ggml_permute(ctx,q,0,2,1,3);
@@ -13580,6 +13600,18 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
                     for (int c=0;c<4;++c) row[4*i+c]=cell(4*b+c);
                 }
                 for (int c=0;c<q%4;++c) row[4*budget+c]=cell(4*vis+c);
+            }
+            ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
+            return;
+        }
+        if (blocks < 0) {
+            // a messy row for the pre-pass: every third entry -1, every fifth past the cache, the rest drawn from ~97
+            // cells so most of them repeat (a repeat counts once, the first occurrence kept); the row starts invalid
+            for (int q=0;q<queries;++q) for (int j=0;j<selected;++j) {
+                int key=(j*7+q*3)%97;
+                if (j%5==0) key=keys+j;
+                if (j%3==0) key=-1;
+                picks[size_t(q)*selected+j]=key;
             }
             ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
             return;
@@ -18403,6 +18435,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fa_out_gate_sel(8, 2, 4096, 96, 2051, 400, false, true));
     test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 32768, 1, 2051, 8000, false, false));
     test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 4096, 9, 2051, 100, true, false));
+    // decode rows at 8k / 32k (FA_SEL_LEAN: the gate in the split-k reduce), 4 rows (MTP n3 verify)
+    test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 8447, 1, 2051, 2100, true, false));
+    test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 32768, 4, 2051, 8000, false, false));
 
     // dense-permuted iq4_nl K/V at prefill batch sizes: iq4_nl has no native FA shader, so these
     // exercise the only supported route (the dequant-once path), incl. sinks and mixed-with-f16
@@ -18886,6 +18921,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int q : {1,4}) test_cases.emplace_back(new test_qsa_decode_maskless(q,32768,2051,12,true,8000));
     for (int q : {1,9}) test_cases.emplace_back(new test_qsa_decode_maskless(q,65536,2051,12,true,16000));
     test_cases.emplace_back(new test_qsa_decode_maskless(3,65536,2051,8,false,16000));
+    // decode rows (FA_SEL_LEAN pre-pass; split keys): one row with an empty tail at 8k / 32k depth, rows with 1-3 tail
+    // cells, short rows that leave whole splits without keys (4, 48, 52, 68 live cells), GQA 4 / 8, K/V not interleaved,
+    // and 63 / 64 queries (the last split row count and the first unsplit one)
+    for (int keys : {8447,32768}) test_cases.emplace_back(new test_qsa_decode_maskless(1,keys,2051,12,true,keys/4-8));
+    test_cases.emplace_back(new test_qsa_decode_maskless(4,32768,2051,12,true,8000));
+    for (int blocks : {1,12,13,17}) test_cases.emplace_back(new test_qsa_decode_maskless(1,4096,2051,12,true,blocks));
+    for (int ratio : {4,8}) test_cases.emplace_back(new test_qsa_decode_maskless(2,8192,2051,ratio,true,1500));
+    test_cases.emplace_back(new test_qsa_decode_maskless(1,8192,2051,12,false,1500));
+    for (int q : {63,64}) test_cases.emplace_back(new test_qsa_decode_maskless(q,8192,2051,12,true,1500));
+    // repeated, negative and out-of-range cells (pre-pass dedup and the first valid entry as the pad)
+    for (int q : {1,4,70}) test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,2051,12,true,-1));
+    test_cases.emplace_back(new test_qsa_decode_maskless(1,4096,257,12,true,-1));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(130,4096,2051,12,true,-1));
     test_cases.emplace_back(new test_qsa_decode_maskless(9,270336,2051,12,true,66000));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2560));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2561));

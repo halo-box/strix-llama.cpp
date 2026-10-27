@@ -1061,6 +1061,7 @@ void process_shaders() {
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
     string_to_spv("flash_attn_sel_f16", "flash_attn_sel.comp", {});
     string_to_spv("flash_attn_sel_prep", "flash_attn_sel_prep.comp", {});
+    string_to_spv("flash_attn_sel_prep_sg", "flash_attn_sel_prep.comp", {{"PREP_SG", "1"}});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("flash_attn_sel_cm_f16", "flash_attn_sel_cm.comp", {});
     // attention output gate in the store (FA_OUT_GATE on the selected-key path)
@@ -1176,6 +1177,7 @@ void process_shaders() {
 
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
+    string_to_spv("fa_split_k_reduce_gate", "flash_attn_split_k_reduce.comp", {{"OUT_GATE", "1"}});
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
 
