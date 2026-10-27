@@ -14641,19 +14641,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 512, 256, 32, 8, nt, up_first));
             }
         }
-        test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, 512, false, true));
     }
-    // q5_K: both chains, both orders, f32 / f16 activations, tile edges, the Flash-Next shape (UD-Q5_K_XL) with its histogram
+    // q5_K: both chains, both orders, f32 / f16 activations, tile edges
     for (bool chain32 : { false, true }) {
         for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
             for (int64_t nt : { 9, 65, 513 }) {
                 test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, tx, 512, 256, 32, 8, nt, nt == 65, false, chain32));
             }
         }
-        test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true, chain32));
     }
     // the f32 chain (no casts, f32 SWIGLU): both graph orders, f32 / f16 activations, tile edges, then model shapes
-    // (Flash-Next with its routing histogram, LFM2.5-8B-A1B, DeepSeek-V4-Flash) and an unmatched type
+    // (LFM2.5-8B-A1B, DeepSeek-V4-Flash) and an unmatched type
     for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         for (int64_t nt : { 9, 64, 65, 200, 513 }) {
             for (bool up_first : { false, true }) {
@@ -14661,7 +14659,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 640, 512, 10, 512, false, true, true));
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, 1792, 32, 4, 300, true, false, true));
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, 2048, 256, 6, 130, false, false, true));
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q6_K, GGML_TYPE_F32, 512, 256, 32, 8, 65, false, false, true));
@@ -14679,15 +14676,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, m, 32, 8, 200));
         test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 512, m, 32, 8, 513, true));
     }
-    // Flash-Next expert shape around the 128-token MMB gate, and a full ubatch, for the FN gate/up quant types
+    // the Flash-Next expert rows (2560 x 640, 10 used) around the 128-token MMB gate for the FN gate/up quant types, on 32
+    // experts so each weight stays small
     for (ggml_type tw : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
         for (int64_t nt : { 127, 128 }) {
-            test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 2560, 640, 512, 10, nt));
+            test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 2560, 640, 32, 10, nt));
         }
     }
-    for (ggml_type tw : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
-        test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 2560, 640, 512, 10, 2048, false, true));
-    }
+    // two full Flash-Next ubatches (512 experts, its measured routing histogram), q4_K and q5_K; the other full-shape runs are in
+    // the GGML_PERF_MOE perf set
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_mul_mat_pair());
     // routed MUL_MAT_ID at the production MoE shapes and quant types; run with --mmb on and off to compare BF16 WMMA vs MMQ
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));

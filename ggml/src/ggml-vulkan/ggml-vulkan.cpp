@@ -18917,8 +18917,8 @@ static bool ggml_vk_can_fuse_mmid_pair_glu(ggml_backend_vk_context * ctx, const 
     const int64_t K = w_a->ne[0], M = w_a->ne[1], n_used = ids->ne[0], T = ids->ne[1];
     if (K % 256 != 0 || M % 128 != 0 || !ggml_vk_dim01_contiguous(w_a) || !ggml_vk_dim01_contiguous(w_b) ||
         w_a->nb[2] != w_b->nb[2] || w_a->nb[2] != (size_t) M * w_a->nb[1] ||
-        ggml_nbytes(w_a) > ctx->device->properties.limits.maxStorageBufferRange ||
-        ggml_nbytes(w_b) > ctx->device->properties.limits.maxStorageBufferRange) {
+        ggml_nbytes(w_a) + get_misalign_bytes(ctx, w_a) > ctx->device->properties.limits.maxStorageBufferRange ||
+        ggml_nbytes(w_b) + get_misalign_bytes(ctx, w_b) > ctx->device->properties.limits.maxStorageBufferRange) {
         return reject("weight shape (K % 256, M % 128, contiguous experts)");
     }
     if ((x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16) || x->ne[0] != K || x->ne[2] != T ||

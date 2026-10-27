@@ -39,7 +39,7 @@ layout(push_constant) uniform parameter {
     uint d_offset;       // D, in f16vec4 units (vec4 with OUT_F32)
     uint n_used;
     uint row_ids_offset;
-    uint zero;           // always 0: keeps the f16 roundings of the unfused chain (see glu_store)
+    uint zero;           // always 0: keeps the f16 roundings of the unfused chain (see round16 and glu_val)
 } p;
 
 layout(binding = 0) readonly buffer WG { uvec4 data_g[]; };
@@ -103,8 +103,14 @@ void qk_frag(const uvec4 q, const uint sh, const uvec4 qh, const uint hb, const 
     }
 }
 
-// the unfused chain stores each projection as f16 (CPY) and the SWIGLU reads them back; the XOR with p.zero keeps RADV from
-// folding the round trip (memory: radv-f16-roundtrip-folded-trap)
+// the unfused chain stores each projection as f16 (CPY) and the SWIGLU reads them back. RADV's NIR optimiser folds a bare
+// float(float16_t(x)) back to x, and turns a multiply followed by an f16 store into one single-rounding conversion, so the
+// fused results would miss those roundings. Measured on RADV, Mesa 26.2.4 (gfx1151) on the same pattern in other fused
+// epilogues (the hc up mix and the MUL_MAT_ID router-weight f16 store): without the opaque zero, 99.9% of values differed from
+// the unfused chain by up to 5e-5 (the folded round trip) and about 6 in 100000 by one f16 ulp (the single rounding), while the
+// SPIR-V still held both conversions. XOR-ing the bits with p.zero, a push constant the compiler cannot prove is 0, keeps both
+// conversions. p.zero and the XORs can go once a Mesa release keeps these conversions, which a fused vs unfused byte-equal
+// compare without them shows.
 float round16(const float x) { return float(unpackFloat2x16(packFloat2x16(f16vec2(x, 0.0)) ^ p.zero).x); }
 // swiglu.comp's expression, stored as f16 through the same opaque zero (a fused multiply-convert would round once)
 float glu_val(const float g, const float u) {
