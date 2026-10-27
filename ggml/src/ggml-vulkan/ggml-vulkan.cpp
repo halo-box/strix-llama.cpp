@@ -4732,9 +4732,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 &&
                 device->driver_id == vk::DriverId::eMesaRadv) {
                 static const char * sel_cm_names[3] = { "flash_attn_sel_cm_f16_gqa4", "flash_attn_sel_cm_f16_gqa8", "flash_attn_sel_cm_f16_gqa12" };
+                static const char * sel_cm_gate_names[3] = { "flash_attn_sel_cm_gate_f16_gqa4", "flash_attn_sel_cm_gate_f16_gqa8", "flash_attn_sel_cm_gate_f16_gqa12" };
                 for (uint32_t i = 0; i < 3; ++i) {
                     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_cm_f16[i],
                         sel_cm_names[i], flash_attn_sel_cm_f16_len, flash_attn_sel_cm_f16_data, "main", 5,
+                        sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {4 * (i + 1)}, 1, true, true, 64);
+                    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_cm_gate_f16[i],
+                        sel_cm_gate_names[i], flash_attn_sel_cm_gate_f16_len, flash_attn_sel_cm_gate_f16_data, "main", 6,
                         sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {4 * (i + 1)}, 1, true, true, 64);
                 }
             }
@@ -10246,8 +10250,21 @@ static vk_pipeline ggml_vk_flash_attn_sel_pipeline(const vk_device & device, con
     }
 }
 
+// FA_OUT_GATE on the selected-key path: the WMMA kernel applies the attention output gate in its store (the prefill
+// case, one split). GGML_VK_FA_OUT_GATE_SEL=0 leaves it to the sigmoid-mul after the FA, as GGML_VK_FA_OUT_GATE does
+// for every other non-multi-row FA path
+static bool ggml_vk_fa_out_gate_sel_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FA_OUT_GATE_SEL");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// out_gate / out_gate_dst / out_gate_done: as ggml_vk_flash_attn
 static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & subctx,
-        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, ggml_tensor * dst) {
+        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, ggml_tensor * dst,
+        const ggml_tensor * out_gate = nullptr, ggml_tensor * out_gate_dst = nullptr, bool * out_gate_done = nullptr) {
     vk_pipeline pipeline = ggml_vk_flash_attn_sel_pipeline(ctx->device, dst);
     if (!pipeline) {
         return false;
@@ -10295,6 +10312,23 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     // the partials go after the rows, 256-byte aligned
     const size_t split_off = ROUNDUP_POW2(list_size, 256);
 
+    // the gate in the WMMA store: one split, one stream, the gate read in place from the [q | gate] per-head interleaved
+    // projection (head stride 2 * D, token stride 2 * D * heads) and the gated result written to out_gate_dst
+    vk_pipeline pipeline_gate = use_cm ? ctx->device->pipeline_flash_attn_sel_cm_gate_f16[gqa_idx] : nullptr;
+    const bool gate_epi = out_gate != nullptr && ggml_vk_fa_out_gate_sel_enabled() && pipeline_gate != nullptr &&
+                          n_split == 1 && NS == 1 &&
+                          out_gate->type == GGML_TYPE_F32 && out_gate_dst->type == GGML_TYPE_F32 &&
+                          out_gate->ne[0] == (int64_t)D && out_gate->ne[1] == (int64_t)NH && out_gate->ne[2] == (int64_t)N && out_gate->ne[3] == 1 &&
+                          out_gate->nb[0] == sizeof(float) && out_gate->nb[1] == 2 * D * sizeof(float) &&
+                          out_gate->nb[2] == out_gate->nb[1] * (size_t)NH &&
+                          // the shader has no misalignment offset for the gate: its descriptor must start at the view
+                          ggml_vk_tensor_subbuffer(ctx, out_gate, true).size == ggml_nbytes(out_gate) &&
+                          // the store keeps dst's strides (dst is contiguous: the pipeline gate)
+                          ggml_is_contiguous(out_gate_dst) && ggml_nelements(out_gate_dst) == ggml_nelements(dst);
+    if (gate_epi) {
+        pipeline = pipeline_gate;
+    }
+
     const vk_op_flash_attn_sel_push_constants pc = {
         (uint32_t) k->ne[1], n_sel, list_stride,
         (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)), (uint32_t) (q->nb[3] / sizeof(float)),
@@ -10326,6 +10360,16 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     GGML_ASSERT(!use_cm || (uint64_t) N * n_split * k->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
     const std::array<uint32_t, 3> grid = use_cm ? std::array<uint32_t, 3>{ N * n_split * (uint32_t) k->ne[2], 1, NS }
                                                 : std::array<uint32_t, 3>{ N * n_split, (uint32_t) k->ne[2], NS };
+    if (gate_epi) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { q_buf, k_buf, v_buf, list_buf, ggml_vk_tensor_subbuffer(ctx, out_gate_dst), ggml_vk_tensor_subbuffer(ctx, out_gate, true) }, pc, grid);
+        ctx->prealloc_split_k_need_sync = true;
+        ggml_vk_path_census_add("FA_OUT_GATE_SEL");
+        if (out_gate_done) {
+            *out_gate_done = true;
+        }
+        return true;
+    }
     if (n_split == 1) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, list_buf, dst_buf }, pc, grid);
         ctx->prealloc_split_k_need_sync = true;
@@ -11089,7 +11133,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     assert(q->type == GGML_TYPE_F32);
     if (dst->src[5] != nullptr && mask == nullptr) {
         // supports_op only takes a maskless selected-key op when flash_attn_sel does
-        const bool done = ggml_vk_flash_attn_sel(ctx, subctx, q, k, v, dst);
+        const bool done = ggml_vk_flash_attn_sel(ctx, subctx, q, k, v, dst, out_gate, out_gate_dst, out_gate_done);
         GGML_ASSERT(done);
         return;
     }

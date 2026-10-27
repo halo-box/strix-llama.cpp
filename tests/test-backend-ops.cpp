@@ -10959,6 +10959,136 @@ struct test_fa_out_gate : public test_case {
     }
 };
 
+// FA_OUT_GATE on the maskless selected-key FA (qwen4exp QSA layers at depth): the same [q | gate] projection and gate chain
+// as test_fa_out_gate, with the attention reading only the listed cells (-1 elsewhere, no mask) as the complete-block
+// selection builds them. blocks > 0: (selected - 3) / 4 blocks of 4 cells, query q sees min(blocks + q / 4, keys / 4 - 1)
+// of them (query 0 sees nothing), then its own partial block; cells scattered over the cache (logical c -> c * 7919 % keys).
+// GGML_VK_TEST_REQUIRE_FA_OUT_GATE_SEL=1 asserts the fusion and that the cases marked epi take the selected-key store
+// epilogue (path:FA_OUT_GATE_SEL), the others the sigmoid-mul (GGML_VK_FA_OUT_GATE_SEL=0 under it is the negative control)
+struct test_fa_out_gate_sel : public test_case {
+    const int64_t nh;      // query heads (head size 256)
+    const int64_t nh_kv;   // KV heads
+    const int64_t keys;
+    const int64_t nb;      // tokens
+    const int64_t selected;
+    const int64_t blocks;
+    const bool gate_first; // MUL(sigmoid, attn) instead of MUL(attn, sigmoid)
+    const bool epi;        // expected to take the selected-key store epilogue on RADV RDNA3
+    ggml_tensor * ids = nullptr;
+    std::vector<ggml_tensor *> verify;
+
+    static constexpr int64_t hs = 256;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FA_OUT_GATE_SEL";
+    }
+    std::string vars() override { return VARS_TO_STR7(nh, nh_kv, keys, nb, selected, blocks, gate_first); }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * nh * nb * 2 * hs * selected;
+    }
+
+    test_fa_out_gate_sel(int64_t nh = 24, int64_t nh_kv = 2, int64_t keys = 4096, int64_t nb = 512, int64_t selected = 2051,
+                         int64_t blocks = 0, bool gate_first = false, bool epi = true)
+        : nh(nh), nh_kv(nh_kv), keys(keys), nb(nb), selected(selected), blocks(blocks), gate_first(gate_first), epi(epi) {}
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_FA_OUT_GATE_SEL", "FA_OUT_GATE")) {
+            return true;
+        }
+        const int64_t fused = dispatch_census_count(backend, "FA_OUT_GATE");
+        const int64_t sel = dispatch_census_count(backend, "path:FA_OUT_GATE_SEL");
+        const int64_t e = dispatch_census_count(backend, "path:FA_OUT_GATE_EPILOGUE");
+        const int64_t f = dispatch_census_count(backend, "path:FA_OUT_GATE_SIGMUL");
+        if (fused != 1 || sel != (epi ? 1 : 0) || e != sel || f != 1 - sel) {
+            msg = "FA_OUT_GATE dispatches: " + std::to_string(fused) + " (selected-key epilogue " + std::to_string(sel) +
+                  ", epilogue " + std::to_string(e) + ", sigmul " + std::to_string(f) + ", expected epilogue " + std::to_string(epi ? 1 : 0) + ")";
+            return false;
+        }
+        return true;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE && t->view_src == nullptr && t != ids) {
+                init_tensor_uniform(t);
+            }
+        }
+        std::vector<int32_t> picks(ggml_nelements(ids), -1);
+        if (blocks > 0) {
+            GGML_ASSERT(selected > 3 && (selected - 3) % 4 == 0 && keys % 7919 != 0);
+            const int64_t budget = (selected - 3) / 4;
+            const auto cell = [&](int64_t logical) { return int32_t((logical * 7919) % keys); };
+            for (int64_t q = 0; q < nb; ++q) {
+                int32_t * row = picks.data() + q * selected;
+                if (q == 0 && nb > 1) {
+                    continue;   // nothing visible
+                }
+                const int64_t vis = std::min(blocks + q / 4, keys / 4 - 1);
+                const int64_t n = std::min(vis, budget);
+                for (int64_t i = 0; i < n; ++i) {
+                    const int64_t b = vis <= budget ? i : (i * vis + (q * 131) % vis) / budget;   // ascending, distinct
+                    for (int c = 0; c < 4; ++c) {
+                        row[4 * i + c] = cell(4 * b + c);
+                    }
+                }
+                for (int c = 0; c < q % 4; ++c) {
+                    row[4 * budget + c] = cell(4 * vis + c);
+                }
+            }
+        } else {
+            for (int64_t q = 0; q < nb; ++q) {
+                for (int64_t j = 0; j < selected; ++j) {
+                    int32_t key = int32_t(1 + (j * 37 + q * 13) % (keys - 4));
+                    if (j == 0) key = -1;                          // an invisible block's cell
+                    if (j == 1) key = 2;
+                    if (j > selected - 3 && selected > 4) key = -1; // tail padding
+                    picks[q * selected + j] = key;
+                }
+            }
+        }
+        ggml_backend_tensor_set(ids, picks.data(), 0, ggml_nbytes(ids));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        // Q projection [q | gate] per head, then the roped q as its own tensor (the model's rope output)
+        ggml_tensor * qf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * hs, nh, nb);
+        ggml_set_name(qf, "qf");
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh, nb);
+        ggml_set_name(q, "q");
+        // the KV cache layout: [hs, heads, cells] rows read through a permute
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, nh_kv, keys);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, nh_kv, keys);
+        ggml_set_name(v, "v");
+        ids = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, selected, nb, 1, 1);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * fa = ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3), ggml_permute(ctx, k, 0, 2, 1, 3),
+                                               ggml_permute(ctx, v, 0, 2, 1, 3), nullptr, 1.0f / sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_top_k(fa, ids, 0);
+        ggml_prec_set_acc(fa, GGML_PREC_F32);
+        ggml_tensor * attn = ggml_reshape_2d(ctx, fa, hs * nh, nb);
+        // the model emits the attention before the gate chain, whichever MUL operand it is
+        if (gf) { ggml_build_forward_expand(gf, attn); }
+
+        ggml_tensor * gate = ggml_view_3d(ctx, qf, hs, nh, nb, qf->nb[1], qf->nb[2], hs * ggml_element_size(qf));
+        gate = ggml_cont_2d(ctx, gate, hs * nh, nb);
+        ggml_tensor * sig = ggml_sigmoid(ctx, gate);
+        ggml_tensor * out = gate_first ? ggml_mul(ctx, sig, attn) : ggml_mul(ctx, attn, sig);
+        ggml_set_name(out, "out");
+        verify.push_back(out);
+        return out;
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with a top-k sparse selection hint (DeepSeek V4 CSA shape).
 // The kq_mask encodes the same selection as the top_k indices, so a backend that ignores
 // the hint (CPU) computes the identical result densely — this is exactly the contract
@@ -15579,6 +15709,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fa_out_gate(256, 24, 2, 256, 1, false, false));
     test_cases.emplace_back(new test_fa_out_gate(256, 24, 2, 200, 128, false, false));
     test_cases.emplace_back(new test_fa_out_gate(128, 8, 2, 256, 96, true, false));
+    // the same gate on the maskless selected-key FA (Flash-Next QSA layers at depth: 24 heads, 2 KV heads, head size 256, a
+    // 512-block budget = 2051 listed cells): the WMMA store epilogue for one split, ragged token counts, scattered and
+    // partly invisible rows; the sigmoid-mul when the rows are split (decode)
+    test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 4096, 512, 2051, 0, false, true));
+    test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 32768, 513, 2051, 7000, false, true));
+    test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 32768, 200, 2051, 7000, true, true));
+    test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 4096, 130, 2051, 40, false, true));
+    test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 4096, 64, 257, 0, true, true));
+    test_cases.emplace_back(new test_fa_out_gate_sel(8, 2, 4096, 96, 2051, 400, false, true));
+    test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 32768, 1, 2051, 8000, false, false));
+    test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 4096, 9, 2051, 100, true, false));
 
     // dense-permuted iq4_nl K/V at prefill batch sizes: iq4_nl has no native FA shader, so these
     // exercise the only supported route (the dequant-once path), incl. sinks and mixed-with-f16
@@ -16112,6 +16253,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // the Flash-Next attention output gate at one pp2048 ubatch (24 heads, 2 KV heads, head size 256)
     test_cases.emplace_back(new test_fa_out_gate(256, 24, 2, 2048, 2048, false, true));
+    // the same on the maskless selected-key FA at depth (Flash-Next QSA: 2051 listed cells of a 32k cache)
+    test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 32768, 2048, 2051, 7000, false, true));
 
     if (getenv("GGML_PERF_MOE")) {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
