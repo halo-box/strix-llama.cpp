@@ -5210,6 +5210,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                             mul_mat_vec_id_q5_k_rp_q8_1_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
                         ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q51_q8, "mul_mat_vec_id_q5_1_rp_q8_1", mul_mat_vec_id_q5_1_rp_q8_1_len,
                             mul_mat_vec_id_q5_1_rp_q8_1_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
+                        ggml_vk_create_pipeline(device, device->pipeline_mmv_id_glu_rp_q4k_q8, "mul_mat_vec_id_glu_q4_k_rp_q8_1", mul_mat_vec_id_glu_q4_k_rp_q8_1_len,
+                            mul_mat_vec_id_glu_q4_k_rp_q8_1_data, "main", 7, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
+                        ggml_vk_create_pipeline(device, device->pipeline_mmv_id_glu_rp_q5k_q8, "mul_mat_vec_id_glu_q5_k_rp_q8_1", mul_mat_vec_id_glu_q5_k_rp_q8_1_len,
+                            mul_mat_vec_id_glu_q5_k_rp_q8_1_data, "main", 7, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
                     }
 #endif
                     ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q51, "mul_mat_vec_id_q5_1_rp_f32", mul_mat_vec_id_q5_1_rp_f32_len,
@@ -11585,10 +11589,12 @@ static void ggml_vk_mmid_pair_glu(ggml_backend_vk_context * ctx, vk_context& sub
     ctx->prealloc_split_k_need_sync = true;
 }
 
+static vk_pipeline ggml_vk_moe_glu_gemv_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * gate, const ggml_tensor * up);
+
 // MOE_GLU_GEMV: nodes [node_idx, node_idx + 1] are the gate and up MUL_MAT_ID mat-vecs (either order), node_idx + 2 their
 // SwiGLU. One dispatch per token (as the mat-vec) computes both projections of each selected expert and stores
 // silu(gate) * up into the SwiGLU's destination; the q8_1 activations are quantized once, as the first mat-vec would.
-// ggml_vk_can_fuse_moe_glu_gemv admitted only shapes on which both mat-vecs take the q8_1 MMVQ path.
+// ggml_vk_can_fuse_moe_glu_gemv admitted only shapes on which both mat-vecs take a q8_1 mat-vec path (repacked or MMVQ).
 static void ggml_vk_mul_mat_vec_id_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * glu  = cgraph->nodes[node_idx + 2];
     const ggml_tensor * gate = glu->src[0];
@@ -11608,9 +11614,14 @@ static void ggml_vk_mul_mat_vec_id_glu(ggml_backend_vk_context * ctx, vk_context
     const uint64_t ne20 = gate->ne[0];
     const uint64_t ne21 = gate->ne[1];
 
-    vk_pipeline dmmv = ctx->device->pipeline_mul_mat_vec_id_glu_q8_1_f32[src0->type];
+    vk_pipeline dmmv = ggml_vk_moe_glu_gemv_pipeline(ctx, gate, up);
+    // negative control (tests only): GGML_VK_MOE_GLU_GEMV_NEGCTL=1 swaps the gate and up experts, so every fused case must fail
+    static const bool neg = [] { const char * e = getenv("GGML_VK_MOE_GLU_GEMV_NEGCTL"); return e != nullptr && atoi(e) != 0; }();
     vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     GGML_ASSERT(dmmv != nullptr && to_q8_1 != nullptr);
+    if (ggml_vk_repack_rows(src0) != 0) {
+        ggml_vk_path_census_add("EXPERT_REPACK/VEC_GLU");
+    }
 
     const uint64_t y_ne = ggml_nelements(src1);
     const uint64_t y_sz = ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1);
@@ -11624,6 +11635,9 @@ static void ggml_vk_mul_mat_vec_id_glu(ggml_backend_vk_context * ctx, vk_context
     vk_subbuffer d_D   = ggml_vk_tensor_subbuffer(ctx, glu);
     vk_subbuffer d_X   = ggml_vk_tensor_subbuffer(ctx, src0);
     vk_subbuffer d_Xup = ggml_vk_tensor_subbuffer(ctx, up->src[0]);
+    if (neg) {
+        std::swap(d_X, d_Xup);
+    }
     vk_subbuffer d_Qy  = ggml_vk_tensor_subbuffer(ctx, src1);
     vk_subbuffer d_ids = ggml_vk_tensor_subbuffer(ctx, ids);
     vk_subbuffer d_Y   = { ctx->prealloc_y, 0, ctx->prealloc_y->size };
@@ -21974,13 +21988,14 @@ static int32_t find_first_set(uint32_t x) {
 }
 
 // MOE_GLU_GEMV: the decode (<= 8 tokens) gate and up MUL_MAT_ID mat-vecs and their SwiGLU as one dispatch
-// (ggml_vk_mul_mat_vec_id_glu). GGML_VK_MOE_GLU_GEMV=0 disables; read once, again after the "ggml_backend_debug_env_reload" test hook.
+// (ggml_vk_mul_mat_vec_id_glu). Off by default (in-model gain < 0.3 ms/token on Flash-Next):
+// GGML_VK_MOE_GLU_GEMV=1 enables; read once, again after the "ggml_backend_debug_env_reload" test hook.
 static std::atomic<int> vk_moe_glu_gemv_env {-1};
 static bool ggml_vk_moe_glu_gemv_enabled() {
     int v = vk_moe_glu_gemv_env.load(std::memory_order_relaxed);
     if (v < 0) {
         const char * e = getenv("GGML_VK_MOE_GLU_GEMV");
-        v = (e == nullptr || atoi(e) != 0) ? 1 : 0;
+        v = (e != nullptr && atoi(e) != 0) ? 1 : 0;
         vk_moe_glu_gemv_env.store(v, std::memory_order_relaxed);
     }
     return v != 0;
@@ -22045,7 +22060,7 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
         return "no small-row rms_norm_mul_mul pipeline (GGML_VK_FUSE_NORM_EXTRA)";
     }
     if (l == "MOE_GLU_GEMV" && !ggml_vk_moe_glu_gemv_enabled()) {
-        return "GGML_VK_MOE_GLU_GEMV=0";
+        return "GGML_VK_MOE_GLU_GEMV unset (off by default)";
     }
     if (l == "MOE_GLU_GEMV" && !dev->integer_dot_product) {
         return "no integer dot product (the q8_1 MMVQ mat-vec)";
@@ -22582,11 +22597,39 @@ static bool ggml_vk_can_fuse_mmid_cpy16(ggml_backend_vk_context * ctx, const str
     return ggml_vk_cpy16_of(cgraph->nodes[node_idx + 1], mmid) && ggml_vk_mmid_d16_ok(ctx, mmid, false);
 }
 
-// MUL_MAT_ID + CPY(f16) + SWIGLU(split): the gate projection of an f16 MoE block; the store applies silu(gate) * up
-// (up: the f16 up projection, computed earlier) and writes the SWIGLU's destination, so neither the gate projection
-// nor the separate GLU pass touches memory. GGML_VK_FUSE_MMID_GLU=0 disables (the MUL_MAT_ID_CPY16 fusion remains).
-// gate and up: SWIGLU(gate, up) not swapped, same activations and ids, same expert type and layout, and both on the q8_1
-// MMVQ mat-vec path of ggml_vk_mul_mat_vec_id_q_f16 (whose decision is repeated here)
+// MOE_GLU_GEMV operands: the repacked gated mat-vec (mul_mat_vec_id_rp.comp GLU) when both expert tensors sit in the expert
+// repack buffer, else the canonical one (mul_mat_vecq_glu.comp), or nullptr when neither applies
+static vk_pipeline ggml_vk_moe_glu_gemv_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * gate, const ggml_tensor * up) {
+    const ggml_tensor * w  = gate->src[0];
+    const ggml_tensor * wu = up->src[0];
+    const ggml_tensor * y  = gate->src[1];
+    if (!ctx->device->integer_dot_product || y->type != GGML_TYPE_F32 || !ggml_is_contiguous(y) || !ggml_vk_dim01_contiguous(y) ||
+        (y->ne[1] * y->ne[0]) % 4 != 0) {
+        return nullptr;
+    }
+    if (gate->src[2]->ne[1] > 8) {
+        return nullptr;   // decode and MTP-verify widths; 9+ tokens belong to MUL_MAT_ID_PAIR_SWIGLU or the unfused chain
+    }
+    const uint32_t rw = ggml_vk_repack_rows(w), ru = ggml_vk_repack_rows(wu);
+    if (rw != 0 || ru != 0) {
+        // the layout belongs to the buffer: both repacked, both on the repacked mat-vec (which quantizes B to q8_1 here)
+        if (rw != ru || !ggml_vk_repack_mmv_ok(gate) || !ggml_vk_repack_mmv_ok(up) || !ggml_vk_use_mul_mat_vec_id(gate)) {
+            return nullptr;
+        }
+        return w->type == GGML_TYPE_Q4_K ? ctx->device->pipeline_mmv_id_glu_rp_q4k_q8 :
+               w->type == GGML_TYPE_Q5_K ? ctx->device->pipeline_mmv_id_glu_rp_q5k_q8 : nullptr;
+    }
+    if (!ggml_vk_use_mul_mat_vec_id(gate) || !ggml_vk_dim01_contiguous(w) ||
+        ggml_nbytes(w) > ctx->device->properties.limits.maxStorageBufferRange ||
+        ggml_nbytes(wu) > ctx->device->properties.limits.maxStorageBufferRange ||
+        !ggml_vk_should_use_mmvq(ctx->device, w->ne[1], y->ne[2], y->ne[0], w->type)) {
+        return nullptr;
+    }
+    return ctx->device->pipeline_mul_mat_vec_id_glu_q8_1_f32[w->type];
+}
+
+// gate and up: SWIGLU(gate, up) not swapped, same activations and ids, same expert type, shape and layout, and both on the q8_1
+// mat-vec path ggml_vk_mul_mat_vec_id_q_f16 would take (its decision is repeated in ggml_vk_moe_glu_gemv_pipeline)
 static bool ggml_vk_moe_glu_gemv_pair_ok(ggml_backend_vk_context * ctx, const ggml_tensor * glu, const ggml_tensor * a, const ggml_tensor * b) {
     if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
         glu->src[1] == nullptr || a->op != GGML_OP_MUL_MAT_ID || b->op != GGML_OP_MUL_MAT_ID ||
@@ -22597,16 +22640,8 @@ static bool ggml_vk_moe_glu_gemv_pair_ok(ggml_backend_vk_context * ctx, const gg
     const ggml_tensor * up   = glu->src[1];
     const ggml_tensor * w    = gate->src[0];
     const ggml_tensor * wu   = up->src[0];
-    const ggml_tensor * y    = gate->src[1];
-    const ggml_tensor * ids  = gate->src[2];
-    if (up->src[1] != y || up->src[2] != ids || wu->type != w->type || !ggml_are_same_shape(w, wu) || !ggml_are_same_stride(w, wu) ||
-        ctx->device->pipeline_mul_mat_vec_id_glu_q8_1_f32[w->type] == nullptr || ggml_vk_repack_rows(w) != 0 || ggml_vk_repack_rows(wu) != 0 || !ggml_vk_use_mul_mat_vec_id(gate) ||
-        !ggml_vk_dim01_contiguous(w) || ggml_nbytes(w) > ctx->device->properties.limits.maxStorageBufferRange ||
-        ggml_nbytes(wu) > ctx->device->properties.limits.maxStorageBufferRange) {
-        return false;
-    }
-    if (!ctx->device->integer_dot_product || y->type != GGML_TYPE_F32 || !ggml_is_contiguous(y) || !ggml_vk_dim01_contiguous(y) ||
-        (y->ne[1] * y->ne[0]) % 4 != 0 || !ggml_vk_should_use_mmvq(ctx->device, w->ne[1], y->ne[2], y->ne[0], w->type)) {
+    if (up->src[1] != gate->src[1] || up->src[2] != gate->src[2] || wu->type != w->type || !ggml_are_same_shape(w, wu) ||
+        !ggml_are_same_stride(w, wu) || ggml_vk_moe_glu_gemv_pipeline(ctx, gate, up) == nullptr) {
         return false;
     }
     return gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32 &&
@@ -22634,6 +22669,9 @@ static bool ggml_vk_can_fuse_moe_glu_gemv(ggml_backend_vk_context * ctx, const s
     return true;
 }
 
+// MUL_MAT_ID + CPY(f16) + SWIGLU(split): the gate projection of an f16 MoE block; the store applies silu(gate) * up
+// (up: the f16 up projection, computed earlier) and writes the SWIGLU's destination, so neither the gate projection
+// nor the separate GLU pass touches memory. GGML_VK_FUSE_MMID_GLU=0 disables (the MUL_MAT_ID_CPY16 fusion remains).
 static bool ggml_vk_mmid_glu_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_VK_FUSE_MMID_GLU");

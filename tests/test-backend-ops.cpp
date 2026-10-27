@@ -575,32 +575,49 @@ static ggml_backend_buffer_type_t test_extra_buft(ggml_backend_t backend) {
     return bufts ? bufts[0] : nullptr;
 }
 
-static ggml_backend_buffer_t alloc_mmid_weights(ggml_context * ctx, ggml_backend_t backend, std::vector<ggml_tensor *> & placed) {
+// `more` (perf cases with tens of GB of weights): the weights beyond the buffer type's max size go into further buffers there;
+// without it they must fit one buffer
+static ggml_backend_buffer_t alloc_mmid_weights(ggml_context * ctx, ggml_backend_t backend, std::vector<ggml_tensor *> & placed,
+                                                std::vector<ggml_backend_buffer_ptr> * more = nullptr) {
     ggml_backend_buffer_type_t buft = env_opt_in("GGML_TEST_EXTRA_BUFT") ? test_extra_buft(backend) : nullptr;
     if (buft == nullptr) {
         return nullptr;
     }
     const size_t align = ggml_backend_buft_get_alignment(buft);
-    size_t size = align;
+    const size_t max_size = ggml_backend_buft_get_max_size(buft);
+    std::vector<std::pair<size_t, size_t>> chunks; // [first placed index, bytes]
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         ggml_tensor * w = t->op == GGML_OP_MUL_MAT_ID ? t->src[0] : nullptr;
         if (w && w->op == GGML_OP_NONE && w->view_src == nullptr && w->data == nullptr &&
             std::find(placed.begin(), placed.end(), w) == placed.end()) {
+            const size_t sz = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, w), align);
+            if (chunks.empty() || (more != nullptr && chunks.back().second + sz > max_size)) {
+                chunks.push_back({ placed.size(), align });
+            }
             placed.push_back(w);
-            size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, w), align);
+            chunks.back().second += sz;
         }
     }
     if (placed.empty()) {
         return nullptr;
     }
-    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
-    GGML_ASSERT(buf != nullptr);
-    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    ggml_tallocr ta = ggml_tallocr_new(buf);
-    for (ggml_tensor * w : placed) {
-        GGML_ASSERT(ggml_tallocr_alloc(&ta, w) == GGML_STATUS_SUCCESS);
+    ggml_backend_buffer_t first = nullptr;
+    for (size_t c = 0; c < chunks.size(); ++c) {
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, chunks[c].second);
+        GGML_ASSERT(buf != nullptr);
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_tallocr ta = ggml_tallocr_new(buf);
+        const size_t end = c + 1 < chunks.size() ? chunks[c + 1].first : placed.size();
+        for (size_t i = chunks[c].first; i < end; ++i) {
+            GGML_ASSERT(ggml_tallocr_alloc(&ta, placed[i]) == GGML_STATUS_SUCCESS);
+        }
+        if (c == 0) {
+            first = buf;
+        } else {
+            more->emplace_back(buf);
+        }
     }
-    return buf;
+    return first;
 }
 
 static bool ctx_has_unallocated(ggml_context * ctx) {
@@ -1904,8 +1921,10 @@ struct test_case {
 
         static const size_t graph_nodes = 8192;
 
+        // a whole-graph perf case builds many nodes and leaves of its own
+        const size_t n_tensors = perf_whole_graph() ? 2048 : 128;
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*n_tensors + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -1936,7 +1955,8 @@ struct test_case {
         }
 
         std::vector<ggml_tensor *> extra_placed;
-        ggml_backend_buffer_ptr buf_extra(alloc_mmid_weights(ctx.get(), backend, extra_placed));
+        std::vector<ggml_backend_buffer_ptr> buf_extra_more;
+        ggml_backend_buffer_ptr buf_extra(alloc_mmid_weights(ctx.get(), backend, extra_placed, &buf_extra_more));
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights && ctx_has_unallocated(ctx_weights.get())) {
             buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
@@ -8540,7 +8560,7 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
 // swaps them). exact = 1 builds the chain twice, the second copy kept unfused (its gate projection is a graph output), and
 // compares their difference, which must be exactly zero: the fused dispatch must equal the two mat-vecs + SWIGLU bit for bit.
 // dup = 1 repeats experts within a token's row. Engagement (GGML_VK_TEST_REQUIRE_MOE_GLU_GEMV=1): one MOE_GLU_GEMV dispatch with
-// the knob on, none with GGML_VK_MOE_GLU_GEMV=0.
+// GGML_VK_MOE_GLU_GEMV=1 (the fusion is opt-in), none without it.
 struct test_moe_glu_gemv : public test_case {
     const ggml_type type;
     const int n_mats, n_used;
@@ -8630,35 +8650,56 @@ struct test_moe_glu_gemv : public test_case {
         if (!env_opt_in("GGML_VK_TEST_REQUIRE_MOE_GLU_GEMV") || census_proc(backend, "ggml_backend_debug_dispatch_census_count") == nullptr) {
             return true;
         }
-        const int64_t n = dispatch_census_count(backend, "MOE_GLU_GEMV"), want = env_knob_on("GGML_VK_MOE_GLU_GEMV") ? 1 : 0;
+        // GGML_TEST_EXTRA_BUFT=1 puts q4_K / q5_K experts of the repack shapes (K % 256, M % 128) into the expert repack buffer: the
+        // repacked gated mat-vec takes them up to K 4096 (EXPERT_REPACK/VEC_GLU), above that the chain stays unfused
+        // (q5_1 of the down shapes, K % 64 and M % 256, is repacked too but has no gated build: it stays unfused)
+        const bool kq       = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K;
+        const bool rp_shape = env_opt_in("GGML_TEST_EXTRA_BUFT") && kq && k % 256 == 0 && m % 128 == 0;
+        const bool rp_q51   = env_opt_in("GGML_TEST_EXTRA_BUFT") && type == GGML_TYPE_Q5_1 && k % 64 == 0 && m % 256 == 0;
+        const bool fusable  = (!rp_shape || k <= 4096) && !rp_q51 && n_tok <= 8;
+        const int64_t n = dispatch_census_count(backend, "MOE_GLU_GEMV");
+        const int64_t want = env_opt_in("GGML_VK_MOE_GLU_GEMV") && fusable ? 1 : 0;
         if (n != want) {
             msg = "MOE_GLU_GEMV dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        const int64_t nrp = dispatch_census_count(backend, "path:EXPERT_REPACK/VEC_GLU");
+        if (nrp >= 0 && (nrp > 0) != (want > 0 && rp_shape)) {
+            msg = "EXPERT_REPACK/VEC_GLU = " + std::to_string(nrp) + (rp_shape ? " (repacked experts)" : " (canonical experts)");
             return false;
         }
         return true;
     }
 };
 
-// Decode mat-vec weight streaming with the weights past the 32 MB MALL (perf only, -o MMVEC_COLD; SPEC unit 6 proof).
-// n_mats > 0: `reps` MUL_MAT_ID nodes over a gate and an up expert set [k, m, n_mats] (2 x 472 MB for q4_K 640 x 2560 x 512),
-// alternating gate / up per ids set as a model layer does; each pair gets its own ids, redrawn between computes. n_mats == 0:
-// `reps` dense MUL_MAT over distinct [k, m] weights. warm = 1 keeps every node on one ids set / one weight (MALL-resident
-// control). The reported GB/s counts only the weight bytes the nodes read (whole graph timed, host wall); read the per-node
-// GPU time from GGML_VK_PERF_LOGGER.
+// Decode mat-vec weight streaming with the weights past the 32 MB MALL (perf only, -o MMVEC_COLD).
+// n_mats > 0: `reps` MUL_MAT_ID nodes over gate and up expert sets [k, m, n_mats] (2 x 472 MB for q4_K 640 x 2560 x 512),
+// alternating gate / up per ids set as a model layer does; each pair gets its own ids, redrawn between computes. n_sets > 1
+// gives pair p its own gate / up sets (p % n_sets), so n_sets = 48 streams a Flash-Next sized pool (45 GB for q4_K) as a
+// decode token does; fresh_b gives each pair its own activations, so each pair quantizes B again as a model layer does.
+// n_mats == 0: `reps` dense MUL_MAT over distinct [k, m] weights. warm = 1 keeps every node on one ids set / one weight
+// (MALL-resident control). The reported GB/s counts only the weight bytes the nodes read (whole graph timed, host wall); read
+// the per-node GPU time from GGML_VK_PERF_LOGGER.
 struct test_mmvec_cold : public test_case {
     const ggml_type type_a;
     const int64_t m, k;
     const int n_mats, n_used, n_tok, reps;
     const bool warm;
     const bool glu; // n_mats > 0: each gate / up pair feeds a SWIGLU (the MOE_GLU_GEMV chain)
+    const int n_sets;
+    const bool fresh_b;
+    const int n_dense; // glu + fresh_b: per layer, n_dense q8_0 [k, 4 k] mat-vecs over distinct weights feed the layer's activations
+                       // (the model's dense stream between expert layers: 3 x 28 MB per layer, 4 GB in all at 48 layers)
 
-    std::string vars() override { return VARS_TO_STR9(type_a, m, k, n_mats, n_used, n_tok, reps, warm, glu); }
+    std::string vars() override { return VARS_TO_STR12(type_a, m, k, n_mats, n_used, n_tok, reps, warm, glu, n_sets, fresh_b, n_dense); }
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MMVEC_COLD"; }
     bool perf_whole_graph() override { return true; }
     bool run_whole_graph() override { return true; }
 
-    test_mmvec_cold(ggml_type type_a, int64_t m, int64_t k, int n_mats, int n_used, int n_tok, int reps, bool warm, bool glu = false)
-        : type_a(type_a), m(m), k(k), n_mats(n_mats), n_used(n_used), n_tok(n_tok), reps(reps), warm(warm), glu(glu) {}
+    test_mmvec_cold(ggml_type type_a, int64_t m, int64_t k, int n_mats, int n_used, int n_tok, int reps, bool warm, bool glu = false,
+                    int n_sets = 1, bool fresh_b = false, int n_dense = 0)
+        : type_a(type_a), m(m), k(k), n_mats(n_mats), n_used(n_used), n_tok(n_tok), reps(reps), warm(warm), glu(glu),
+          n_sets(n_sets), fresh_b(fresh_b), n_dense(n_dense) {}
 
     size_t row_bytes() const { return ggml_row_size(type_a, k); }
     size_t op_size(ggml_tensor * t) override {
@@ -8669,22 +8710,47 @@ struct test_mmvec_cold : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * out = nullptr;
         if (n_mats > 0) {
-            ggml_tensor * as[2] = { ggml_new_tensor_3d(ctx, type_a, k, m, n_mats), ggml_new_tensor_3d(ctx, type_a, k, m, n_mats) };
-            ggml_set_name(as[0], "gate_exps");
-            ggml_set_name(as[1], "up_exps");
-            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n_tok);
-            ggml_set_name(b, "b");
+            const int ns = warm ? 1 : n_sets;
+            std::vector<ggml_tensor *> as(2 * ns);
+            for (int s = 0; s < ns; ++s) {
+                as[2 * s]     = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+                as[2 * s + 1] = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+                ggml_format_name(as[2 * s],     "gate_exps.%d", s);
+                ggml_format_name(as[2 * s + 1], "up_exps.%d", s);
+            }
+            ggml_tensor * b = nullptr;
             ggml_tensor * ids = nullptr;
             for (int r = 0; r < reps; r += glu ? 2 : 1) {
+                const int pair = r / 2;
                 if (r % 2 == 0 && (ids == nullptr || !warm)) {
                     ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
                 }
+                if (r % 2 == 0 && (b == nullptr || fresh_b)) {
+                    b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n_tok);
+                    ggml_set_name(b, "b");
+                    if (n_dense > 0 && glu && fresh_b) {
+                        // the dense stream of the layer: independent mat-vecs, the last one feeds the activations (a barrier,
+                        // as the model's attention / shared expert path puts one before the routed experts)
+                        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tok);
+                        ggml_tensor * d = nullptr;
+                        for (int j = 0; j < n_dense; ++j) {
+                            ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, 4 * k);
+                            ggml_set_name(wd, "dense");
+                            d = ggml_mul_mat(ctx, wd, x);
+                            if (gf && j + 1 < n_dense) { ggml_build_forward_expand(gf, d); }
+                        }
+                        ggml_tensor * dv = ggml_view_3d(ctx, d, k, 1, n_tok, k * sizeof(float), d->nb[1], 0);
+                        b = ggml_add(ctx, b, dv);
+                    }
+                }
+                ggml_tensor * g = as[2 * (pair % ns)];
+                ggml_tensor * u = as[2 * (pair % ns) + 1];
                 if (glu) {
                     // model order: up, gate, SWIGLU(gate, up)
-                    ggml_tensor * up = ggml_mul_mat_id(ctx, as[1], b, ids);
-                    out = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, as[0], b, ids), up);
+                    ggml_tensor * up = ggml_mul_mat_id(ctx, u, b, ids);
+                    out = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, g, b, ids), up);
                 } else {
-                    out = ggml_mul_mat_id(ctx, as[r % 2], b, ids);
+                    out = ggml_mul_mat_id(ctx, r % 2 ? u : g, b, ids);
                 }
                 if (gf && r + (glu ? 2 : 1) < reps) { ggml_build_forward_expand(gf, out); }
             }
@@ -8716,8 +8782,43 @@ struct test_mmvec_cold : public test_case {
         }
     }
     void initialize_tensors(ggml_context * ctx) override {
+        // a case marker for the perf logger output (stderr), so its blocks can be split by case
+        fprintf(stderr, "MMVEC_COLD case %s\n", vars().c_str());
+        // expert sets: one expert quantized from uniform values, tiled over every expert of every set (the bytes streamed are
+        // what is timed; quantizing tens of GB per case would take minutes)
+        std::vector<uint8_t> tile;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type != GGML_TYPE_I32) { init_tensor_uniform(t); }
+            if (t->type == GGML_TYPE_I32) { continue; }
+            if (t->type == GGML_TYPE_Q8_0 && n_dense > 0 && t->ne[2] == 1 && t->ne[1] == 4 * k) {
+                // dense stream weights: one quantized matrix, set into every one
+                static std::vector<uint8_t> dtile;
+                if (dtile.size() != ggml_nbytes(t)) {
+                    std::vector<float> f(t->ne[0] * t->ne[1]);
+                    std::mt19937 gen(99);
+                    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+                    for (auto & v : f) { v = dist(gen); }
+                    dtile.resize(ggml_nbytes(t));
+                    ggml_quantize_chunk(GGML_TYPE_Q8_0, f.data(), dtile.data(), 0, t->ne[1], t->ne[0], nullptr);
+                }
+                ggml_backend_tensor_set(t, dtile.data(), 0, dtile.size());
+                continue;
+            }
+            if (n_mats > 0 && t->type == type_a && t->ne[2] == n_mats && ggml_is_quantized(type_a)) {
+                if (tile.empty()) {
+                    std::vector<float> f(m * k);
+                    std::mt19937 gen(1234);
+                    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+                    for (auto & v : f) { v = dist(gen); }
+                    const size_t eb = m * row_bytes();
+                    tile.resize(eb * n_mats);
+                    ggml_quantize_chunk(type_a, f.data(), tile.data(), 0, m, k, nullptr);
+                    for (int e = 1; e < n_mats; ++e) { memcpy(tile.data() + e * eb, tile.data(), eb); }
+                }
+                GGML_ASSERT(tile.size() == ggml_nbytes(t));
+                ggml_backend_tensor_set(t, tile.data(), 0, tile.size());
+                continue;
+            }
+            init_tensor_uniform(t);
         }
         init_ids(ctx);
     }
@@ -15046,6 +15147,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_glu_gemv(t, 32, 4, 256, 8192, 1));
         test_cases.emplace_back(new test_moe_glu_gemv(t, 32, 4, 256, 8192, 1, false, true));
         test_cases.emplace_back(new test_moe_glu_gemv(t, 32, 4, 256, 512, 3));
+        // 9 tokens: past the mat-vec range, never fused (vs CPU only: the two in-graph copies take different GEMM paths)
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 64, 10, 640, 2560, 9));
+        // a second model shape (Qwen3.5-35B-A3B-like experts: FF 512, hidden 2048, 256 experts top-8)
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 256, 8, 512, 2048, 1));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 256, 8, 512, 2048, 4, false, true));
     }
     // the legacy types the fused pipeline also covers (q8_0 takes the mat-vec MMVQ path from 3 tokens on RADV)
     for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1}) {
@@ -18881,6 +18987,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_fa_out_gate(256, 24, 2, 2048, 2048, false, true));
     // the same on the maskless selected-key FA at depth (Flash-Next QSA: 2051 listed cells of a 32k cache)
     test_cases.emplace_back(new test_fa_out_gate_sel(24, 2, 32768, 2048, 2051, 7000, false, true));
+    // the selected-key FA at decode (1 row) and MTP n3 verify (4 rows), 8k / 32k cache, 2051 listed cells (FA_SEL_LEAN)
+    for (int keys : {8447, 32768}) {
+        for (int q : {1, 4}) {
+            test_cases.emplace_back(new test_qsa_decode_maskless(q, keys, 2051, 12, true, keys/4 - 8));
+        }
+    }
+    // Flash-Next decode expert mat-vec (q4_K / q5_K gate+up 640 x 2560, 512 experts, top-10) vs the dense q8_0 10240 x 2560
+    // mat-vec, weights rotated past the MALL; warm = 1 is the MALL-resident control
+    for (bool warm : {false, true}) {
+        test_cases.emplace_back(new test_mmvec_cold(GGML_TYPE_Q4_K, 640, 2560, 512, 10, 1, 48, warm));
+        test_cases.emplace_back(new test_mmvec_cold(GGML_TYPE_Q5_K, 640, 2560, 512, 10, 1, 48, warm));
+        test_cases.emplace_back(new test_mmvec_cold(GGML_TYPE_Q5_1, 2560, 640, 512, 10, 1, 48, warm));
+        test_cases.emplace_back(new test_mmvec_cold(GGML_TYPE_Q8_0, 10240, 2560, 0, 1, 1, 16, warm));
+    }
+    // the same expert pairs with their SWIGLU (MOE_GLU_GEMV with GGML_VK_MOE_GLU_GEMV=1, else unfused), T = 1 and 4
+    for (int T : {1, 4}) {
+        test_cases.emplace_back(new test_mmvec_cold(GGML_TYPE_Q4_K, 640, 2560, 512, 10, T, 48, false, true));
+        test_cases.emplace_back(new test_mmvec_cold(GGML_TYPE_Q5_K, 640, 2560, 512, 10, T, 48, false, true));
+    }
+    // GGML_PERF_MMVEC_FN=1 (needs ~46 GB of device memory): the Flash-Next gate / up decode chain at full scale,
+    // 48 layers of q4_K 640 x 2560 x 512 gate + up sets (45 GB), T = 1. Footprint: 1 / 8 / 48 sets; B quantize: shared vs
+    // fresh activations per layer; the SWIGLU chain (fused by MOE_GLU_GEMV when it applies); positive control: top-20.
+    if (getenv("GGML_PERF_MMVEC_FN")) {
+        const ggml_type t = GGML_TYPE_Q4_K;
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 10, 1, 96, false, false,  1, false));
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 10, 1, 96, false, false,  8, false));
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 10, 1, 96, false, false, 48, false));
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 10, 1, 96, false, false, 48, true));
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 20, 1, 96, false, false, 48, true));
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 10, 1, 96, false, true,   1, true));
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 10, 1, 96, false, true,  48, true));
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 20, 1, 96, false, true,  48, true));
+        // the same glu chain with the model's dense stream between expert layers (page-walk / cache context)
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 10, 1, 96, false, true,   1, true, 3));
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 10, 1, 96, false, true,  48, true, 3));
+        test_cases.emplace_back(new test_mmvec_cold(t, 640, 2560, 512, 20, 1, 96, false, true,  48, true, 3));
+    }
 
     if (getenv("GGML_PERF_MOE")) {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));

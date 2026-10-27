@@ -1141,6 +1141,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_mmid_down_q51_rpv[11];   // GGML_VK_EXPDOWN_V variants of the f16-B repacked down kernel ([0] unused)
     vk_pipeline pipeline_mmv_id_rp_q4k, pipeline_mmv_id_rp_q5k, pipeline_mmv_id_rp_q51;
     vk_pipeline pipeline_mmv_id_rp_q4k_q8, pipeline_mmv_id_rp_q5k_q8, pipeline_mmv_id_rp_q51_q8;
+    vk_pipeline pipeline_mmv_id_glu_rp_q4k_q8, pipeline_mmv_id_glu_rp_q5k_q8;   // MOE_GLU_GEMV on repacked experts
     vk_pipeline pipeline_expert_unrepack;
     vk_pipeline pipeline_expert_repack;
 

@@ -1048,6 +1048,9 @@ void process_shaders() {
     string_to_spv("mul_mat_vec_id_q4_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}, {"B_Q8_1", "1"}});
     string_to_spv("mul_mat_vec_id_q5_1_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_1", "1"}, {"B_Q8_1", "1"}});
     string_to_spv("mul_mat_vec_id_q5_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_K", "1"}, {"B_Q8_1", "1"}});
+    // MOE_GLU_GEMV on repacked experts: gate + up + SwiGLU in one mat-vec
+    string_to_spv("mul_mat_vec_id_glu_q4_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}, {"B_Q8_1", "1"}, {"GLU", "1"}});
+    string_to_spv("mul_mat_vec_id_glu_q5_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_K", "1"}, {"B_Q8_1", "1"}, {"GLU", "1"}});
 #endif
     string_to_spv("expert_unrepack", "expert_unrepack.comp", {});
     string_to_spv("expert_repack", "expert_repack.comp", {});
