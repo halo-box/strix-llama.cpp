@@ -1573,6 +1573,15 @@ struct ggml_backend_vk_context {
     // token strides (elements); filled when the producer runs, cleared per graph
     std::unordered_map<const ggml_tensor *, std::pair<uint32_t, uint32_t>> hc_res16;
     const ggml_tensor * fused_extra_dst {};   // written by the fused kernel besides the write-mask nodes (synced like them)
+    // GDN direct state write: GATED_DELTA_NET nodes matched in this graph (decided at the GDN), each with the CPY that
+    // would move its state / rollback snapshots into the recurrent cache; the GDN writes the CPY's rows, the CPY is elided
+    struct gdn_direct_match {
+        const ggml_tensor * gdn;
+        const ggml_tensor * cpy;
+        int cpy_idx;
+    };
+    std::vector<gdn_direct_match> gdn_direct_matches;
+    int fused_gdn_direct {-1};                   // current GDN writes its states into gdn_direct_matches[k].cpy
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
