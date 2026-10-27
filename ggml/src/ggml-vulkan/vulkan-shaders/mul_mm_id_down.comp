@@ -122,8 +122,15 @@ void main() {
 
     // A: this lane's row, 3 uvec4 per 64-K stage = two 24-byte q5_1 blocks (d, m | qh | 16 qs bytes)
     const uint feat0 = gl_WorkGroupID.x * 256 + wave * 32;
+#if defined(A_REPACK)
+    // expert-repacked weights (Vulkan expert repack buffer): per 32-row block the 16-byte units are stored unit-major,
+    // [stage][uvec4 k][32 rows], so each load is 512 contiguous bytes across the wave
+    const uint a_t32 = p.a_offset + expert * p.stride_e + feat0 * (p.K / KC) * 3 + lane;
+#define LOAD_A(st, a0, a1, a2) { const uint ai = a_t32 + (st) * 96; a0 = data_a[ai]; a1 = data_a[ai + 32]; a2 = data_a[ai + 64]; }
+#else
     const uint a_row = p.a_offset + expert * p.stride_e + (feat0 + lane) * (p.K / KC) * 3;
 #define LOAD_A(st, a0, a1, a2) { const uint ai = a_row + (st) * 3; a0 = data_a[ai]; a1 = data_a[ai + 1]; a2 = data_a[ai + 2]; }
+#endif
 
     ACC acc0[4];   // features feat0 .. feat0 + 15
     ACC acc1[4];   // features feat0 + 16 .. feat0 + 31

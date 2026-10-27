@@ -1,0 +1,29 @@
+#version 450
+
+// Expert repack inverse: copies a repacked expert tensor (Vulkan expert repack buffer) into canonical order. Per R-row block
+// the repacked tensor stores its 16-byte units unit-major ([U units][R rows]); canonical order is row-major ([R rows][U units]).
+// Used only by the MUL_MAT_ID paths that cannot read the repacked order.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n;              // 16-byte units in the tensor
+    uint U;              // units per row
+    uint R;              // rows per block
+    uint src_offset;     // uvec4 units
+    uint dst_offset;     // uvec4 units
+} p;
+
+layout(binding = 0) readonly buffer S { uvec4 data_s[]; };
+layout(binding = 1) writeonly buffer D { uvec4 data_d[]; };
+
+void main() {
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint c = gl_GlobalInvocationID.x; c < p.n; c += stride) {
+        const uint row = c / p.U;
+        const uint u   = c - row * p.U;
+        const uint blk = row / p.R;
+        const uint r   = row - blk * p.R;
+        data_d[p.dst_offset + c] = data_s[p.src_offset + blk * p.R * p.U + u * p.R + r];
+    }
+}

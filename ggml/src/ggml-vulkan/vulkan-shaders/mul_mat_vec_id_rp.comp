@@ -1,0 +1,299 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#if defined(B_Q8_1)
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+// MUL_MAT_ID mat-vec (one token per dispatch, as mul_mat_vec MUL_MAT_ID) for expert-repacked q4_K / q5_K / q5_1 weights (Vulkan expert
+// repack buffer). Per R-row block (q4_K / q5_K 16, q5_1 32) the repacked tensor stores its 16-byte units unit-major ([U units][R rows]),
+// so the lanes take the rows: lane L reads row L % R and a load of R lanes is R x 16 contiguous bytes. The workgroup computes 32
+// rows, its 4 waves split K, and B (f32) is staged in shared memory while the first K block of weights is in flight.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
+#define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
+#define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+
+layout(push_constant) uniform parameter {
+    uint ncols;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+    uint fusion_flags;
+    uint nei0;
+    uint ne11;
+    uint expert_i1;
+    uint nbi1;
+} p;
+
+layout(binding = 0) readonly buffer A { uvec4 data_a[]; };
+#if defined(B_Q8_1)
+// B quantized by the host (ggml_vk_quantize_q8_1), as for mul_mat_vecq: 4 blocks of 32 per x4 group
+struct block_q8_1_x4 {
+    f16vec2 ds[4];
+    int32_t qs[32];
+};
+layout(binding = 1) readonly buffer B { block_q8_1_x4 data_bq[]; };
+#else
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 1) readonly buffer BV4 { vec4 data_b4[]; };
+#endif
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+layout(binding = 3) readonly buffer Fuse0 { float data_fuse0[]; };
+layout(binding = 4) readonly buffer Fuse1 { float data_fuse1[]; };
+layout(binding = 5) readonly buffer IDS { int data_ids[]; };
+
+#define ROWS 32          // rows per workgroup
+#define KSPLIT 4         // waves per workgroup, each takes every 4th K block
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+#define A_KQ             // 256-K superblocks with 6-bit scales and mins
+#endif
+
+#if defined(A_KQ)
+#define MAX_K 4096       // the host routes larger K elsewhere
+#else
+#define MAX_K 2048
+#endif
+
+#if defined(B_Q8_1)
+shared int32_t sh_bq[MAX_K / 4];   // 4 int8 values each
+shared vec2 sh_bds[MAX_K / 32];    // per 32: d, d * sum(q)
+#else
+shared vec4 sh_b[MAX_K / 4];
+#endif
+shared float sh_part[KSPLIT][ROWS];
+
+#if defined(DATA_A_Q4_K)
+#define R 16
+#define UPB 9            // units per K block (a 256-K superblock: header + 8 qs units)
+#define QS0 1
+#elif defined(DATA_A_Q5_K)
+#define R 16
+#define UPB 11           // header, 2 qh units, 8 qs units
+#define QS0 3
+#else
+#define R 32
+#define UPB 3            // units per K block (64 K: two 24-byte blocks)
+#endif
+
+uvec4 a_cur[UPB], a_nxt[UPB];
+
+#if defined(A_KQ)
+// qs unit j, word w of the current K block: 4 low-half and 4 high-half quants as bytes (q5_K: plus bit 2 g / 2 g + 1 of the qh
+// bytes of the same positions as the fifth bit)
+void kq_words(const uint j, const uint w, out uint qlo, out uint qhi) {
+    const uint qw = a_cur[QS0 + j][w];
+    qlo = qw & 0x0F0F0F0F;
+    qhi = (qw >> 4) & 0x0F0F0F0F;
+#if defined(DATA_A_Q5_K)
+    const uint g = j / 2, qh = a_cur[1 + j % 2][w];
+    qlo |= ((qh >> (2 * g))     & 0x01010101) << 4;
+    qhi |= ((qh >> (2 * g + 1)) & 0x01010101) << 4;
+#endif
+}
+#endif
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row = tid % ROWS;
+    const uint kc  = tid / ROWS;
+    const uint expert_i0 = gl_WorkGroupID.y;
+    const uint first_row = (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z) * ROWS;
+    const uint M = p.stride_d;
+    if (first_row >= M) {
+        return;
+    }
+    const uint K = p.ncols;
+    const uint expert_id = uint(data_ids[expert_i0 + p.expert_i1 * p.nbi1]);
+    const uint b_offset = (expert_i0 % p.ne11) * p.stride_b + p.expert_i1 * p.batch_stride_b;
+    const uint d_offset = expert_i0 * p.stride_d + p.expert_i1 * p.batch_stride_d;
+
+    // this lane's row in the whole tensor and the first unit of its row block; K block kb of the row starts at unit kb * UPB
+    const uint r_abs = expert_id * M + first_row + row;
+#if defined(A_KQ)
+    const uint nkb = K / 256;
+#else
+    const uint nkb = K / 64;
+#endif
+    const uint a_base = (r_abs / R) * R * (UPB * nkb) + (r_abs % R);
+
+    // the first K block's weights are in flight while B is staged
+    uint kb = kc;
+    if (kb < nkb) {
+        [[unroll]] for (uint j = 0; j < UPB; ++j) {
+            a_cur[j] = data_a[a_base + (kb * UPB + j) * R];
+        }
+    }
+#if defined(B_Q8_1)
+    {
+        const uint b0 = b_offset / 32;
+        for (uint t = tid; t < K / 4; t += 128) {
+            const uint blk = b0 + t / 8;
+            sh_bq[t] = data_bq[blk / 4].qs[(blk % 4) * 8 + t % 8];
+        }
+        for (uint t = tid; t < K / 32; t += 128) {
+            sh_bds[t] = vec2(data_bq[(b0 + t) / 4].ds[(b0 + t) % 4]);
+        }
+    }
+#else
+    if ((b_offset & 3) == 0) {
+        for (uint k4 = tid; k4 < K / 4; k4 += 128) {
+            sh_b[k4] = data_b4[b_offset / 4 + k4];
+        }
+    } else {
+        for (uint k = tid; k < K; k += 128) {
+            sh_b[k / 4][k % 4] = data_b[b_offset + k];
+        }
+    }
+#endif
+    barrier();
+
+    float acc = 0.0;
+    for (; kb < nkb; kb += KSPLIT) {
+        if (kb + KSPLIT < nkb) {
+            [[unroll]] for (uint j = 0; j < UPB; ++j) {
+                a_nxt[j] = data_a[a_base + ((kb + KSPLIT) * UPB + j) * R];
+            }
+        }
+#if defined(A_KQ)
+        const uvec4 h = a_cur[0];
+        const vec2 dm = vec2(unpackHalf2x16(h.x));
+#if defined(B_Q8_1)
+        int32_t sumi[8];
+        [[unroll]] for (uint j = 0; j < 8; ++j) {
+            sumi[j] = 0;
+        }
+        [[unroll]] for (uint j = 0; j < 8; ++j) {
+            // qs unit j: low nibbles = values 16 (j % 2) .. + 15 of sub-block 2 (j / 2), high nibbles the same of 2 (j / 2) + 1
+            const uint g = j / 2, hh = j % 2;
+            const uint i_lo = (kb * 8 + 2 * g) * 8 + 4 * hh;
+            [[unroll]] for (uint w = 0; w < 4; ++w) {
+                uint qlo, qhi;
+                kq_words(j, w, qlo, qhi);
+                sumi[2 * g]     = dotPacked4x8AccSatEXT(int32_t(qlo), sh_bq[i_lo + w],     sumi[2 * g]);
+                sumi[2 * g + 1] = dotPacked4x8AccSatEXT(int32_t(qhi), sh_bq[i_lo + 8 + w], sumi[2 * g + 1]);
+            }
+        }
+        float sumq[8], sumb[8];
+        [[unroll]] for (uint s = 0; s < 8; ++s) {
+            const vec2 ds = sh_bds[kb * 8 + s];
+            sumq[s] = float(sumi[s]) * ds.x;
+            sumb[s] = ds.y;
+        }
+#else
+        float sumq[8], sumb[8];
+        [[unroll]] for (uint j = 0; j < 8; ++j) {
+            sumq[j] = 0.0;
+            sumb[j] = 0.0;
+        }
+        [[unroll]] for (uint j = 0; j < 8; ++j) {
+            // qs unit j: bytes 16 (j % 2) .. + 15 of group g = j / 2; low nibbles are sub-block 2g, high nibbles 2g + 1
+            const uint g = j / 2, hh = j % 2;
+            const uint k4 = kb * 64 + 16 * g + 4 * hh;
+            [[unroll]] for (uint w = 0; w < 4; ++w) {
+                uint qlo, qhi;
+                kq_words(j, w, qlo, qhi);
+                const vec4 blo = sh_b[k4 + w];
+                const vec4 bhi = sh_b[k4 + 8 + w];
+                sumq[2 * g]     += dot(vec4(uvec4(qlo, qlo >> 8, qlo >> 16, qlo >> 24) & 0xFF), blo);
+                sumq[2 * g + 1] += dot(vec4(uvec4(qhi, qhi >> 8, qhi >> 16, qhi >> 24) & 0xFF), bhi);
+                sumb[2 * g]     += (blo.x + blo.y) + (blo.z + blo.w);
+                sumb[2 * g + 1] += (bhi.x + bhi.y) + (bhi.z + bhi.w);
+            }
+        }
+#endif
+        // 6-bit scales and mins of the 8 sub-blocks (get_scale_min_k4)
+        const uint sc_w[3] = { h.y, h.z, h.w };
+        float sum_d = 0.0, sum_m = 0.0;
+        [[unroll]] for (uint s = 0; s < 8; ++s) {
+            uint sc, mn;
+            if (s < 4) {
+                sc = (sc_w[s / 4] >> (8 * (s % 4))) & 63;
+                mn = (sc_w[(s + 4) / 4] >> (8 * ((s + 4) % 4))) & 63;
+            } else {
+                const uint b4 = (sc_w[(s + 4) / 4] >> (8 * ((s + 4) % 4))) & 0xFF;
+                const uint bm = (sc_w[(s - 4) / 4] >> (8 * ((s - 4) % 4))) & 0xFF;
+                const uint bs = (sc_w[s / 4]       >> (8 * (s % 4))) & 0xFF;
+                sc = (b4 & 0xF) | ((bm >> 6) << 4);
+                mn = (b4 >> 4)  | ((bs >> 6) << 4);
+            }
+            sum_d += float(sc) * sumq[s];
+            sum_m += float(mn) * sumb[s];
+        }
+        acc += dm.x * sum_d - dm.y * sum_m;
+#else
+        // q5_1: two 24-byte blocks (d, m | qh | 16 qs bytes) in 3 units
+        const uvec4 u0 = a_cur[0], u1 = a_cur[1], u2 = a_cur[2];
+        const uint dmw[2] = { u0.x, u1.z };
+        const uint qhw[2] = { u0.y, u1.w };
+        const uint qsw[2][4] = { { u0.z, u0.w, u1.x, u1.y }, { u2.x, u2.y, u2.z, u2.w } };
+#if defined(B_Q8_1)
+        [[unroll]] for (uint bl = 0; bl < 2; ++bl) {
+            const uint ib = kb * 2 + bl;     // the q8_1 block of these 32 values
+            const uint qh = qhw[bl];
+            int32_t sumi = 0;
+            [[unroll]] for (uint w = 0; w < 4; ++w) {
+                const uint qw = qsw[bl][w];
+                const uint hl = qh >> (4 * w), hh = qh >> (4 * w + 16);
+                // bit 4 of each byte from the 4 qh bits of its values
+                const uint bl4 = ((hl & 1) << 4) | ((hl & 2) << 11) | ((hl & 4) << 18) | ((hl & 8) << 25);
+                const uint bh4 = ((hh & 1) << 4) | ((hh & 2) << 11) | ((hh & 4) << 18) | ((hh & 8) << 25);
+                sumi = dotPacked4x8AccSatEXT(int32_t((qw & 0x0F0F0F0F) | bl4),        sh_bq[ib * 8 + w],     sumi);
+                sumi = dotPacked4x8AccSatEXT(int32_t(((qw >> 4) & 0x0F0F0F0F) | bh4), sh_bq[ib * 8 + 4 + w], sumi);
+            }
+            const vec2 dm = vec2(unpackHalf2x16(dmw[bl]));
+            const vec2 ds = sh_bds[ib];
+            acc += dm.x * ds.x * float(sumi) + dm.y * ds.y;
+        }
+#else
+        [[unroll]] for (uint bl = 0; bl < 2; ++bl) {
+            const uint k4 = kb * 16 + 8 * bl;
+            const uint qh = qhw[bl];
+            float sumq = 0.0, sumb = 0.0;
+            [[unroll]] for (uint w = 0; w < 4; ++w) {
+                const uint qw = qsw[bl][w];
+                const uint hl = qh >> (4 * w), hh = qh >> (4 * w + 16);
+                const uvec4 qlo = (uvec4(qw, qw >> 8, qw >> 16, qw >> 24) & 0xF) | ((uvec4(hl, hl >> 1, hl >> 2, hl >> 3) & 1) << 4);
+                const uvec4 qhi = (uvec4(qw >> 4, qw >> 12, qw >> 20, qw >> 28) & 0xF) | ((uvec4(hh, hh >> 1, hh >> 2, hh >> 3) & 1) << 4);
+                const vec4 blo = sh_b[k4 + w], bhi = sh_b[k4 + 4 + w];
+                sumq += dot(vec4(qlo), blo) + dot(vec4(qhi), bhi);
+                sumb += (blo.x + blo.y) + (blo.z + blo.w) + (bhi.x + bhi.y) + (bhi.z + bhi.w);
+            }
+            const vec2 dm = vec2(unpackHalf2x16(dmw[bl]));
+            acc += dm.x * sumq + dm.y * sumb;
+        }
+#endif
+#endif
+        [[unroll]] for (uint j = 0; j < UPB; ++j) {
+            a_cur[j] = a_nxt[j];
+        }
+    }
+
+    sh_part[kc][row] = acc;
+    barrier();
+    if (kc == 0) {
+        float sum = 0.0;
+        [[unroll]] for (uint i = 0; i < KSPLIT; ++i) {
+            sum += sh_part[i][row];
+        }
+        const uint n = first_row + row;
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+            sum += data_fuse0[expert_id * p.stride_d + n];
+        }
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
+            sum *= data_fuse0[expert_i0];
+        }
+        if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
+            sum *= data_fuse1[expert_i0];
+        }
+        data_d[d_offset + n] = sum;
+    }
+}
