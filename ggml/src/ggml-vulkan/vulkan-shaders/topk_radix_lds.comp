@@ -1,0 +1,171 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+
+// QSA_RADIX_SELECT: top-k of a few short rows in ONE dispatch (decode / MTP verify block selection). One workgroup per
+// row: the row's keys are staged in shared memory once, a 4 x 8-bit radix select over them finds the k-th largest key,
+// and one ordered pass writes the k indices. The n-ary tournament it replaces needs a dependent pass (and a barrier) per
+// 1024-key halving of the row (5 passes at 8256 keys).
+//
+// Semantics match topk_nary_search.comp: NaN ranks as -inf, ties at the k-th value go to the lowest indices. Output order:
+// the indices above the k-th value ascending, then the tied ones ascending (callers read a set).
+//
+// The staged-key radix select follows Radiance's r4d_qsa_select_bf16.hip (Apache-2.0, a four-digit radix select with the
+// keys cached in LDS for narrow launches, ties to the lower index by prefix count); this is an independent GLSL version.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(constant_id = 1) const uint SUBGROUP_SIZE = 64;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A  {float data_a[];};
+layout (binding = 1) writeonly buffer D {int   data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint ncols;
+    uint k;
+    uint nrows;
+    uint unused0;
+    uint unused1;
+    uint unused2;
+} p;
+
+// keep in sync with QSA_RADIX_SELECT_MAX_COLS in ggml-vulkan.cpp (48 KiB of keys)
+#define MAX_COLS   12288
+#define RADIX_BITS 8
+#define RADIX_SIZE (1 << RADIX_BITS)
+#define MAX_SUBGROUPS 32
+
+shared uint keys[MAX_COLS];
+shared uint histo[RADIX_SIZE];
+shared uint sg_a[MAX_SUBGROUPS];
+shared uint sg_b[MAX_SUBGROUPS];
+shared uint sh_bucket;
+shared uint sh_above;
+
+// order-preserving float -> uint; NaN takes the -inf key, as in the n-ary path
+uint f2key(float x) {
+    if (isnan(x)) {
+        x = uintBitsToFloat(0xFF800000u);
+    }
+    uint y = floatBitsToUint(x);
+    return (y & 0x80000000u) != 0u ? ~y : (y | 0x80000000u);
+}
+
+void topk(const uint row) {
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint ncols = p.ncols;
+    const uint k     = p.k;
+
+    for (uint i = tid; i < ncols; i += BLOCK_SIZE) {
+        keys[i] = f2key(data_a[row * ncols + i]);
+    }
+
+    uint prefix  = 0;  // fixed high bits of the k-th key
+    uint desired = k;  // how many still to take from the keys that share those bits
+
+    [[unroll]] for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        if (tid < RADIX_SIZE) {
+            histo[tid] = 0;
+        }
+        barrier();
+
+        const uint hi_mask   = (shift + RADIX_BITS >= 32) ? 0u : (0xFFFFFFFFu << uint(shift + RADIX_BITS));
+        const uint prefix_hi = prefix & hi_mask;
+        // the high digits of nearby scores share a few bins: when a whole subgroup hits one bin, one atomic adds them all
+        for (uint base = 0; base < ncols; base += BLOCK_SIZE) {
+            const uint i = base + tid;
+            uint bin = 0xFFFFFFFFu;
+            if (i < ncols) {
+                const uint key = keys[i];
+                if ((key & hi_mask) == prefix_hi) {
+                    bin = (key >> uint(shift)) & (RADIX_SIZE - 1);
+                }
+            }
+            if (subgroupAllEqual(bin)) {
+                if (bin != 0xFFFFFFFFu && subgroupElect()) {
+                    atomicAdd(histo[bin], SUBGROUP_SIZE);
+                }
+            } else if (bin != 0xFFFFFFFFu) {
+                atomicAdd(histo[bin], 1u);
+            }
+        }
+        barrier();
+
+        // top-down inclusive scan of the bins: invocation t holds bin 255 - t
+        const uint c = tid < RADIX_SIZE ? histo[RADIX_SIZE - 1 - tid] : 0u;
+        uint incl = subgroupInclusiveAdd(c);
+        if (gl_SubgroupInvocationID == SUBGROUP_SIZE - 1) {
+            sg_a[gl_SubgroupID] = incl;
+        }
+        barrier();
+        if (tid < RADIX_SIZE) {
+            for (uint s = 0; s < gl_SubgroupID; ++s) {
+                incl += sg_a[s];
+            }
+            // exactly one bin crosses: the candidates hold >= desired keys in total
+            if (incl >= desired && incl - c < desired) {
+                sh_bucket = RADIX_SIZE - 1 - tid;
+                sh_above  = incl - c;
+            }
+        }
+        barrier();
+
+        prefix  |= sh_bucket << uint(shift);
+        desired -= sh_above;
+    }
+
+    // prefix is now the k-th largest key; n_above = k - desired keys are strictly larger, and the first `desired` keys
+    // equal to it (by index) fill the rest. Each invocation owns a contiguous index range, so an exclusive scan of the
+    // per-invocation counts gives every hit its slot in index order.
+    const uint threshold = prefix;
+    const uint n_above   = k - desired;
+    const uint per = (ncols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const uint beg = min(tid * per, ncols);
+    const uint end = min(beg + per, ncols);
+
+    uint na = 0;
+    uint nt = 0;
+    for (uint i = beg; i < end; ++i) {
+        const uint key = keys[i];
+        na += key > threshold ? 1u : 0u;
+        nt += key == threshold ? 1u : 0u;
+    }
+    uint pa = subgroupExclusiveAdd(na);
+    uint pt = subgroupExclusiveAdd(nt);
+    if (gl_SubgroupInvocationID == SUBGROUP_SIZE - 1) {
+        sg_a[gl_SubgroupID] = pa + na;
+        sg_b[gl_SubgroupID] = pt + nt;
+    }
+    barrier();
+    for (uint s = 0; s < gl_SubgroupID; ++s) {
+        pa += sg_a[s];
+        pt += sg_b[s];
+    }
+
+    const uint row_out = row * k;
+    for (uint i = beg; i < end; ++i) {
+        const uint key = keys[i];
+        if (key > threshold) {
+            data_d[row_out + pa] = int(i);
+            ++pa;
+        } else if (key == threshold) {
+            if (pt < desired) {
+                data_d[row_out + n_above + pt] = int(i);
+            }
+            ++pt;
+        }
+    }
+    // the next row overwrites keys and the subgroup sums
+    barrier();
+}
+
+void main() {
+    for (uint row = gl_WorkGroupID.y; row < p.nrows; row += gl_NumWorkGroups.y) {
+        topk(row);
+    }
+}

@@ -500,6 +500,8 @@ static constexpr uint32_t num_argsort_pipelines = 11;
 static constexpr uint32_t num_topk_moe_pipelines = 10;
 
 static constexpr uint32_t num_topk_pipelines = 11;
+// QSA_RADIX_SELECT row cap: the keys of one row in shared memory (topk_radix_lds.comp MAX_COLS, 48 KiB)
+static constexpr uint32_t QSA_RADIX_SELECT_MAX_COLS = 12288;
 
 static constexpr std::initializer_list<ggml_op> topk_moe_early_softmax_norm{ GGML_OP_SOFT_MAX, GGML_OP_RESHAPE,  GGML_OP_ARGSORT,
                                                                              GGML_OP_VIEW,     GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
@@ -975,6 +977,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
+    vk_pipeline pipeline_topk_radix_lds; // QSA_RADIX_SELECT: one-dispatch top-k of <= 8 short rows, keys in LDS
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_sum_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
