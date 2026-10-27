@@ -174,6 +174,21 @@ void main() {
 
     // A: this lane's row (gate for lanes 0..15, up for 16..31), BU uvec4 per 256-K superblock
     const uint feat  = gl_WorkGroupID.x * 128 + wave * 16 + (lane % 16);
+#if defined(A_REPACK)
+    // expert-repacked weights (Vulkan expert repack buffer): per 16-row block the 16-byte units are stored unit-major,
+    // [superblock][BU units][16 rows], so each half-wave load is 256 contiguous bytes
+    const uint a_t16 = (lo ? p.g_offset : p.u_offset) + expert * p.stride_e + (feat - lane % 16) * (p.K / 256) * BU + lane % 16;
+#define A_IDX(sb, j) (a_t16 + ((sb) * BU + (j)) * 16)
+#if defined(A_Q5_K)
+#define LOAD_A(st, h, q0, q1, h0, h1) { const uint sb = (st) / 4, g = (st) % 4; \
+        if (lo) { h = data_g[A_IDX(sb, 0)]; h0 = data_g[A_IDX(sb, 1)]; h1 = data_g[A_IDX(sb, 2)]; q0 = data_g[A_IDX(sb, 3 + 2 * g)]; q1 = data_g[A_IDX(sb, 4 + 2 * g)]; } \
+        else    { h = data_u[A_IDX(sb, 0)]; h0 = data_u[A_IDX(sb, 1)]; h1 = data_u[A_IDX(sb, 2)]; q0 = data_u[A_IDX(sb, 3 + 2 * g)]; q1 = data_u[A_IDX(sb, 4 + 2 * g)]; } }
+#else
+#define LOAD_A(st, h, q0, q1, h0, h1) { const uint sb = (st) / 4, g = (st) % 4; \
+        if (lo) { h = data_g[A_IDX(sb, 0)]; q0 = data_g[A_IDX(sb, 1 + 2 * g)]; q1 = data_g[A_IDX(sb, 2 + 2 * g)]; } \
+        else    { h = data_u[A_IDX(sb, 0)]; q0 = data_u[A_IDX(sb, 1 + 2 * g)]; q1 = data_u[A_IDX(sb, 2 + 2 * g)]; } }
+#endif
+#else
     const uint a_row = (lo ? p.g_offset : p.u_offset) + expert * p.stride_e + feat * (p.K / 256) * BU;
 #if defined(A_Q5_K)
     // stage g of a superblock: qs bytes 32 g .. 32 g + 31 (uvec4 3 + 2 g, 4 + 2 g), and all 32 qh bytes (bits 2 g, 2 g + 1)
@@ -184,6 +199,7 @@ void main() {
 #define LOAD_A(st, h, q0, q1, h0, h1) { const uint sb = (st) / 4, g = (st) % 4, ai = a_row + sb * BU; \
         if (lo) { h = data_g[ai]; q0 = data_g[ai + 1 + 2 * g]; q1 = data_g[ai + 2 + 2 * g]; } \
         else    { h = data_u[ai]; q0 = data_u[ai + 1 + 2 * g]; q1 = data_u[ai + 2 + 2 * g]; } }
+#endif
 #endif
 
     ACC acc_g[4];

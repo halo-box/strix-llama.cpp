@@ -1006,9 +1006,33 @@ void process_shaders() {
     string_to_spv("mul_mm_id_glu_q5_k_f32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}});
     string_to_spv("mul_mm_id_glu_q5_k_f16_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"OUT_F32", "1"}});
     string_to_spv("mul_mm_id_glu_q5_k_f32_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}, {"OUT_F32", "1"}});
+    // expert repack buffer: the same eight on the repacked weight order
+    for (const std::string tn : { "q4_k", "q5_k" }) {
+        for (const std::string o : { "", "_o32" }) {
+            for (const std::string b : { "f16", "f32" }) {
+                std::map<std::string, std::string> defs = { { "A_REPACK", "1" } };
+                if (tn == "q5_k") { defs["A_Q5_K"] = "1"; }
+                if (o == "_o32")  { defs["OUT_F32"] = "1"; }
+                if (b == "f32")   { defs["B_F32"] = "1"; }
+                string_to_spv("mul_mm_id_glu_" + tn + "_" + b + o + "_rp", "mul_mm_id_glu.comp", defs);
+            }
+        }
+    }
     // streaming q5_1 MUL_MAT_ID(+MUL)+CPY(f16) down, register-direct weights (RDNA3 fragment layout, wave32)
     string_to_spv("mul_mm_id_down_q5_1_f16", "mul_mm_id_down.comp", {});
     string_to_spv("mul_mm_id_down_q5_1_f32", "mul_mm_id_down.comp", {{"B_F32", "1"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp", "mul_mm_id_down.comp", {{"A_REPACK", "1"}});   // expert repack buffer
+    string_to_spv("mul_mm_id_down_q5_1_f32_rp", "mul_mm_id_down.comp", {{"B_F32", "1"}, {"A_REPACK", "1"}});
+    // expert repack buffer: the mat-vec MUL_MAT_ID on the repacked order, and the inverse copy for the other readers
+    string_to_spv("mul_mat_vec_id_q4_k_rp_f32", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}});
+    string_to_spv("mul_mat_vec_id_q5_1_rp_f32", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_1", "1"}});
+    string_to_spv("mul_mat_vec_id_q5_k_rp_f32", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_K", "1"}});
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    string_to_spv("mul_mat_vec_id_q4_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}, {"B_Q8_1", "1"}});
+    string_to_spv("mul_mat_vec_id_q5_1_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_1", "1"}, {"B_Q8_1", "1"}});
+    string_to_spv("mul_mat_vec_id_q5_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_K", "1"}, {"B_Q8_1", "1"}});
+#endif
+    string_to_spv("expert_unrepack", "expert_unrepack.comp", {});
     // RDNA3 fragment layout probe (ggml_vk_check_coopmat_rdna3_layout): gates the manual-fragment "_mf" MUL_MAT_ID pipelines
     string_to_spv("coopmat_layout_check", "coopmat_layout_check.comp", {});
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
