@@ -3902,6 +3902,17 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
         if (candidate->flags & GGML_TENSOR_FLAG_OUTPUT) {
             return 0;
         }
+        // a view of memory the range does not compute (an input such as the state copy ids) stays valid when the range
+        // is skipped, so its consumers may live anywhere
+        if (candidate->view_src != nullptr && ggml_cuda_is_view_or_noop(candidate)) {
+            bool produced = false;
+            for (int k = node_idx; k <= last && !produced; ++k) {
+                produced = cgraph->nodes[k] == candidate->view_src;
+            }
+            if (!produced) {
+                continue;
+            }
+        }
         int internal_uses = 0;
         for (int k = node_idx; k <= last; ++k) {
             for (int src = 0; src < GGML_MAX_SRC; ++src) {
