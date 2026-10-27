@@ -9,6 +9,12 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 layout (binding = 0) readonly buffer A {float data_a[];};
 layout (binding = 1) readonly buffer B {float data_s[];};
 layout (binding = 2) writeonly buffer D {float data_d[];};
+#if defined(OUT_GATE)
+// the attention output gate (FA_OUT_GATE on the selected-key decode path): read in place from the [q | gate] per-head
+// interleaved projection, element (query, head, d) at (query * heads + head) * 2 * D + d (one stream); data_d is the
+// sigmoid-mul's destination, with the FA output's layout
+layout (binding = 3) readonly buffer G {float data_g[];};
+#endif
 
 layout (push_constant) uniform parameter {
     uint D;
@@ -117,6 +123,9 @@ void main() {
         const float FLT_MAX = uintBitsToFloat(0x7F7FFFFF);
         O = clamp(O, -FLT_MAX, FLT_MAX);
 
+#if defined(OUT_GATE)
+        O = O * (1.0f / (1.0f + exp(-data_g[(i2 * p.ne1 + n) * 2 * D + d])));
+#endif
         data_d[(i3 * p.dst_ne2 + i2) * p.ne1 * D + D * n + d] = O;
     }
 }
