@@ -8536,6 +8536,109 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
     }
 };
 
+// MOE_GLU_GEMV: decode MoE gate + up MUL_MAT_ID mat-vecs and their SwiGLU, in the model's node order (up first; gate_first = 1
+// swaps them). exact = 1 builds the chain twice, the second copy kept unfused (its gate projection is a graph output), and
+// compares their difference, which must be exactly zero: the fused dispatch must equal the two mat-vecs + SWIGLU bit for bit.
+// dup = 1 repeats experts within a token's row. Engagement (GGML_VK_TEST_REQUIRE_MOE_GLU_GEMV=1): one MOE_GLU_GEMV dispatch with
+// the knob on, none with GGML_VK_MOE_GLU_GEMV=0.
+struct test_moe_glu_gemv : public test_case {
+    const ggml_type type;
+    const int n_mats, n_used;
+    const int64_t m, k;
+    const int n_tok;
+    const bool gate_first, exact, dup;
+
+    std::string vars() override { return VARS_TO_STR9(type, n_mats, n_used, m, k, n_tok, gate_first, exact, dup); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_GLU_GEMV"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return exact ? 0.0 : 5e-4; }
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return nmse(a, b, n);
+        }
+        double e = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            e = std::max(e, (double) std::fabs(a[i] - b[i]));
+        }
+        return e;
+    }
+
+    test_moe_glu_gemv(ggml_type type, int n_mats, int n_used, int64_t m, int64_t k, int n_tok, bool gate_first = false,
+                      bool exact = false, bool dup = false)
+        : type(type), n_mats(n_mats), n_used(n_used), m(m), k(k), n_tok(n_tok), gate_first(gate_first), exact(exact), dup(dup) {}
+
+    ggml_tensor * chain(ggml_context * ctx, ggml_tensor * gate_w, ggml_tensor * up_w, ggml_tensor * x, ggml_tensor * ids, bool unfused) {
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * up   = nullptr;
+        if (gate_first) {
+            gate = ggml_mul_mat_id(ctx, gate_w, x, ids);
+            up   = ggml_mul_mat_id(ctx, up_w, x, ids);
+        } else {
+            up   = ggml_mul_mat_id(ctx, up_w, x, ids);
+            gate = ggml_mul_mat_id(ctx, gate_w, x, ids);
+        }
+        if (unfused) {
+            ggml_set_output(gate);
+        }
+        return ggml_swiglu_split(ctx, gate, up);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
+        ggml_set_name(gate_w, "gate_exps");
+        ggml_tensor * up_w = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
+        ggml_set_name(up_w, "up_exps");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n_tok);
+        ggml_set_name(x, "x");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tok);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * out = chain(ctx, gate_w, up_w, x, ids, false);
+        ggml_set_name(out, "swiglu");
+        if (exact) {
+            if (gf) { ggml_build_forward_expand(gf, out); }
+            ggml_tensor * ref = chain(ctx, gate_w, up_w, x, ids, true);
+            ggml_set_name(ref, "swiglu_unfused");
+            out = ggml_sub(ctx, out, ref);
+            ggml_set_name(out, "diff");
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(77 + n_tok);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            std::vector<int32_t> perm(n_mats);
+            for (int64_t r = 0; r < t->ne[1]; ++r) {
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                if (dup) {
+                    for (int i = 1; i < n_used; i += 2) {
+                        perm[i] = perm[i - 1];   // each expert twice in the row
+                    }
+                }
+                ggml_backend_tensor_set(t, perm.data(), r * t->nb[1], n_used * sizeof(int32_t));
+            }
+        }
+    }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!env_opt_in("GGML_VK_TEST_REQUIRE_MOE_GLU_GEMV") || census_proc(backend, "ggml_backend_debug_dispatch_census_count") == nullptr) {
+            return true;
+        }
+        const int64_t n = dispatch_census_count(backend, "MOE_GLU_GEMV"), want = env_knob_on("GGML_VK_MOE_GLU_GEMV") ? 1 : 0;
+        if (n != want) {
+            msg = "MOE_GLU_GEMV dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        return true;
+    }
+};
+
 // Decode mat-vec weight streaming with the weights past the 32 MB MALL (perf only, -o MMVEC_COLD; SPEC unit 6 proof).
 // n_mats > 0: `reps` MUL_MAT_ID nodes over a gate and an up expert set [k, m, n_mats] (2 x 472 MB for q4_K 640 x 2560 x 512),
 // alternating gate / up per ids set as a model layer does; each pair gets its own ids, redrawn between computes. n_mats == 0:
@@ -14923,6 +15026,34 @@ struct test_topk_moe_lifetime : public test_topk_moe {
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // MOE_GLU_GEMV: Flash-Next decode expert shapes (FF 640, hidden 2560, 512 experts top-10, gate/up q4_K or q5_K), T = 1..8
+    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        for (int T = 1; T <= 8; ++T) {
+            test_cases.emplace_back(new test_moe_glu_gemv(t, (T == 1 || T == 8) ? 512 : 64, 10, 640, 2560, T));
+        }
+        for (int T : {1, 3, 8}) {
+            test_cases.emplace_back(new test_moe_glu_gemv(t, 64, 10, 640, 2560, T, false, true));
+        }
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 64, 10, 640, 2560, 1, true));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 64, 10, 640, 2560, 2, true, true));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 64, 10, 640, 2560, 2, false, false, true));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 64, 10, 640, 2560, 5, false, true, true));
+        // experts shared across tokens (16 experts, top-10), a row tail (101 rows), the 4-iteration loop (k 8192), a short k
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 16, 10, 640, 2560, 4));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 16, 10, 640, 2560, 8, false, true));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 32, 4, 101, 2560, 2));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 32, 4, 101, 2560, 3, false, true));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 32, 4, 256, 8192, 1));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 32, 4, 256, 8192, 1, false, true));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 32, 4, 256, 512, 3));
+    }
+    // the legacy types the fused pipeline also covers (q8_0 takes the mat-vec MMVQ path from 3 tokens on RADV)
+    for (ggml_type t : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1}) {
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 64, 8, 256, 2560, 1));
+        test_cases.emplace_back(new test_moe_glu_gemv(t, 64, 8, 256, 2560, 4, false, true));
+    }
+    test_cases.emplace_back(new test_moe_glu_gemv(GGML_TYPE_Q8_0, 64, 8, 256, 2560, 4));
+    test_cases.emplace_back(new test_moe_glu_gemv(GGML_TYPE_Q8_0, 64, 8, 256, 2560, 3, false, true));
     for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int tokens : {255,256,257,383,384,385}) test_cases.emplace_back(new test_ple_conv(type,256,tokens));
         test_cases.emplace_back(new test_ple_conv(type,256,256,1));
@@ -19897,6 +20028,8 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("MUL_MAT_ADD",         new test_mul_mat_add(GGML_TYPE_Q4_0, 1000, 1, 1024, MUL_MAT_ADD_RES_MM), "MUL_MAT_ADD/2=1");
     add("MUL_MAT_ID_ADD_ID",   new test_mul_mat_vec_fusion(GGML_TYPE_Q4_0, GGML_GLU_OP_SWIGLU, 1, 32, 256, true, 16, 8, false, true, true), "MUL_MAT_ID_ADD_ID/2=2");
     add("MUL_MAT_ID_MUL",      new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 1, 32, 1, true), "MUL_MAT_ID_MUL/2=1");
+    add("MOE_GLU_GEMV",        new test_moe_glu_gemv(GGML_TYPE_Q4_K, 64, 10, 640, 2560, 1), "MOE_GLU_GEMV/3=1");
+    add("MOE_GLU_GEMV",        new test_moe_glu_gemv(GGML_TYPE_Q5_K, 64, 10, 640, 2560, 4, true), "MOE_GLU_GEMV/3=1");
     add("MUL_MAT_ID_MUL",      new test_mul_mat_id_fusion(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, false, 512, 129, 256, 1, true), "MUL_MAT_ID_MUL/2=1");
     add("RMS_NORM_MUL",        new test_rms_norm_mul_add(GGML_TYPE_F32, { 64, 5, 4, 3 }, 1e-6f, false, false, false, false, false, false), "MULTI_ADD/2=1;RMS_NORM_MUL/2=1");
     add("RMS_NORM_MUL_ADD",    new test_rms_norm_mul_add(GGML_TYPE_F32, { 64, 5, 4, 3 }, 1e-6f, false), "MULTI_ADD/2=1;RMS_NORM_MUL_ADD/3=1");
