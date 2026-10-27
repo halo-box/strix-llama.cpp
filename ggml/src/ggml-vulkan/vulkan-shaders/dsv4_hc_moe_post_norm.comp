@@ -9,16 +9,18 @@
 // qwen4exp MoE epilogue + hyper-connection combine + the next mix's grouped RMS norm, one workgroup per token over all streams:
 //
 //   x[i, t]          = ((s_0[i, t] + s_1[i, t]) + ... + s_{n-1}[i, t]) + sh[i, t]    (MULTI_ADD of the routed slots, then the
-//                                                                                    shared-expert ADD; HAS_SH == 0: no sh)
+//                                                                                    shared-expert ADD; sh_mode 0: no sh)
+//   sh[i, t]         = sigmoid(gate[t]) * down[i, t]                               (sh_mode 2: the shared expert's gate, the
+//                                                                                    SIGMOID_MUL in front of the ADD)
 //   res_out[i, h, t] = x[i, t] * post[h, t] + res[i, h, t]                          (DSV4_HC_POST, no comb)
 //   xn[i, h, t]      = res_out[i, h, t] * rsqrt(mean_i(res_out^2) + eps) * gamma[i, h]   (RMS_NORM + MUL (+ CPY f16))
 //   inj[r, t]        = sum_{h, i} w[h * n_embd + i, r] * xn[i, h, t]                (INJ: the next mix's inject MUL_MAT)
 //
 // The slots are the routed experts' weighted outputs, n of them per token in one tensor (slot k of token t at
 // so + k * ss1 + t * ss2 elements), f16 (SLOT_F16) or f32. Every step repeats the unfused chain's arithmetic in its order:
-// the f32 running sum from 0 over the slots in the MULTI_ADD's source order, the ADD, then dsv4_hc_post_norm.comp's
-// combine and norm. The norm's per-thread layout and reduction are those of the kernel this replaces, so the result is
-// bit-identical to the unfused chain:
+// the f32 running sum from 0 over the slots in the MULTI_ADD's source order, the gated shared expert as SIGMOID_MUL
+// computes and stores it, the ADD, then dsv4_hc_post_norm.comp's combine and norm. The norm's per-thread layout and
+// reduction are those of the kernel this replaces, so the result is bit-identical to the unfused chain:
 //   INJ == 0: dsv4_hc_post_norm.comp (thread j owns the vec4s j, j + 256, ... of each stream row);
 //   INJ != 0: dsv4_hc_post_norm_inj.comp (thread j owns the 8-column groups j and j + 256 of each stream).
 // The host guarantees n_embd % 4 == 0 (% 8 with INJ), n_embd <= 4096, hc <= 4 (== 4 with INJ), unit element strides,
@@ -49,6 +51,9 @@ layout(binding = 6, std430) writeonly buffer NBuf { vec4    data_n[]; };
 #if defined(INJ)
 layout(binding = 7, std430) readonly  buffer WBuf { vec4    data_w[]; };
 layout(binding = 8, std430) writeonly buffer IBuf { float   data_i[]; };
+layout(binding = 9, std430) readonly  buffer TBuf { float   data_gt[]; };
+#else
+layout(binding = 7, std430) readonly  buffer TBuf { float   data_gt[]; };
 #endif
 
 layout(push_constant) uniform parameter {
@@ -72,19 +77,31 @@ layout(push_constant) uniform parameter {
     uint  so;              // slot 0 offset (elements)
     uint  ss1;             // slot stride (elements)
     uint  ss2;             // slot token stride (elements)
-    uint  has_sh;
+    uint  sh_mode;         // 0: no shared expert, 1: sh added, 2: sh = down, gated by sigmoid(gate[t]) first
+    uint  sgt;             // gate token stride (floats; sh_mode 2)
 } p;
 
-// x for the 4 columns at element e of token t: the slot sum, then the shared expert
-vec4 moe_x(const uint t, const uint e) {
+// the shared expert's gate for token t (sh_mode 2): unary.comp's op_sigmoid
+float shared_gate(const uint t) {
+    return p.sh_mode == 2 ? 1.0f / (1.0f + exp(-data_gt[t * p.sgt])) : 0.0f;
+}
+
+// x for the 4 columns at element e of token t: the slot sum, then the shared expert (sg: shared_gate(t))
+vec4 moe_x(const uint t, const uint e, const float sg) {
     vec4 s = vec4(0.0f);
     uint sb = p.so + t * p.ss2 + e;
     for (uint k = 0; k < p.n_slots; ++k) {
         s += vec4(data_s[sb / 4]);
         sb += p.ss1;
     }
-    if (p.has_sh != 0) {
-        s = s + data_h[(t * p.sx1 + e) / 4];
+    if (p.sh_mode != 0) {
+        vec4 h = data_h[(t * p.sx1 + e) / 4];
+        if (p.sh_mode == 2) {
+            // SIGMOID_MUL (op on b): sigmoid(gate) * down, rounded to f32 on its own as that kernel stores it; the XOR with a
+            // push-constant zero keeps the product from contracting into the ADD below
+            h = uintBitsToFloat(floatBitsToUint(sg * h) ^ uvec4(p.zero));
+        }
+        s = s + h;
     }
     return s;
 }
@@ -108,10 +125,11 @@ void main() {
     const uint t   = gl_WorkGroupID.x;
     const uint nv4 = p.n_embd / 4;
 
+    const float sg = shared_gate(t);
     vec4 xv[MAX_V4];
     [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
         const uint i4 = tid + k * BLOCK;
-        xv[k] = i4 < nv4 ? moe_x(t, i4 * 4) : vec4(0.0f);
+        xv[k] = i4 < nv4 ? moe_x(t, i4 * 4, sg) : vec4(0.0f);
     }
 
     vec4 v[HC_MAX][MAX_V4];
@@ -182,14 +200,15 @@ void main() {
     const uint t   = gl_WorkGroupID.x;
     const uint ng  = p.n_embd / 8;
 
+    const float sg = shared_gate(t);
     vec4 xv[NG][2];
     [[unroll]] for (uint g = 0; g < NG; ++g) {
         const uint e = (tid + g * BLOCK) * 8;
         xv[g][0] = vec4(0.0f);
         xv[g][1] = vec4(0.0f);
         if (tid + g * BLOCK < ng) {
-            xv[g][0] = moe_x(t, e);
-            xv[g][1] = moe_x(t, e + 4);
+            xv[g][0] = moe_x(t, e, sg);
+            xv[g][1] = moe_x(t, e + 4, sg);
         }
     }
 

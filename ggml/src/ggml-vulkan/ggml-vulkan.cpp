@@ -4514,12 +4514,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_moe_post_norm[s16][v], "dsv4_hc_moe_post_norm_" #sname "_" #vname, \
                 dsv4_hc_moe_post_norm_ ## sname ## _ ## vname ## _len, dsv4_hc_moe_post_norm_ ## sname ## _ ## vname ## _data, "main", np, \
                 sizeof(vk_op_dsv4_hc_moe_post_norm_push_constants), {1, 1, 1}, { 1u }, 1);
-            CREATE_HC_MOE(1, s16, 0, f32, 7)
-            CREATE_HC_MOE(1, s16, 1, f16, 7)
-            CREATE_HC_MOE(1, s16, 2, inj, 9)
-            CREATE_HC_MOE(0, s32, 0, f32, 7)
-            CREATE_HC_MOE(0, s32, 1, f16, 7)
-            CREATE_HC_MOE(0, s32, 2, inj, 9)
+            CREATE_HC_MOE(1, s16, 0, f32, 8)
+            CREATE_HC_MOE(1, s16, 1, f16, 8)
+            CREATE_HC_MOE(1, s16, 2, inj, 10)
+            CREATE_HC_MOE(0, s32, 0, f32, 8)
+            CREATE_HC_MOE(0, s32, 1, f16, 8)
+            CREATE_HC_MOE(0, s32, 2, inj, 10)
 #undef CREATE_HC_MOE
         }
     }
@@ -16168,6 +16168,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_UNARY:
+        if (ctx->fused_hc_moe_epi) {
+            // HC_MOE_EPI_SE: the run starts at the shared expert's gate
+            ggml_vk_dsv4_hc_moe_post_norm(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
             break;
@@ -17434,6 +17439,16 @@ static bool ggml_vk_hc_moe_epi_enabled() {
     return on;
 }
 
+// HC_MOE_EPI_SE: the shared expert's sigmoid gate (SIGMOID + MUL, a SIGMOID_MUL dispatch and an [n_embd, T] f32 write + read)
+// folded into the epilogue as well. GGML_VK_HC_MOE_EPI_SE=0 leaves it in front of the run (the HC_MOE_EPI form).
+static bool ggml_vk_hc_moe_epi_se_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_HC_MOE_EPI_SE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static constexpr int HC_MOE_MAX_SLOTS = 32;
 // one workgroup per token: below this many tokens (decode, MTP) the unfused MULTI_ADD + ADD + norm kernels spread the layer over
 // more workgroups and are faster (Flash-Next truncated to 8 layers, decode at depth 8192: 15.9 us fused vs ~8.6 us per layer), so the chain stays unfused there
@@ -17441,11 +17456,15 @@ static constexpr int64_t HC_MOE_MIN_TOKENS = 32;
 
 // the ADD chain at node_idx: n_slots slot views summed in the MULTI_ADD's source order (the first ADD's src[0], src[1], then
 // each later ADD's other operand), then optionally one f32 term (the shared expert). n_add = the chain's ADD nodes.
+// HC_MOE_EPI_SE: node_idx is the shared expert's gate instead, SIGMOID([1, T] gate) then MUL(down, it) (n_pre = 2), in front of
+// the slot adds, and the shared term is that MUL: sh = down, gate = the gate before the sigmoid.
 struct vk_hc_moe_chain {
+    int n_pre = 0;
     int n_add = 0;
     int n_slots = 0;
     const ggml_tensor * slot[HC_MOE_MAX_SLOTS] {};
     const ggml_tensor * sh = nullptr;
+    const ggml_tensor * gate = nullptr;
     const ggml_tensor * root = nullptr;   // the slots' common view source
     bool    f16 = false;                  // f16 slots (the first ADD is ggml_add_cast)
     int64_t so = 0, ss1 = 0, ss2 = 0;     // slot 0 offset, slot stride, token stride (elements)
@@ -17453,6 +17472,24 @@ struct vk_hc_moe_chain {
 
 static bool ggml_vk_hc_moe_chain(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, vk_hc_moe_chain & c) {
     c = vk_hc_moe_chain();
+    const ggml_tensor * se_mul = nullptr;
+    if (cgraph->nodes[node_idx]->op == GGML_OP_UNARY) {
+        const ggml_tensor * sig = cgraph->nodes[node_idx];
+        if (!ggml_vk_hc_moe_epi_se_enabled() || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || node_idx + 3 >= cgraph->n_nodes) {
+            return false;
+        }
+        const ggml_tensor * g = sig->src[0];
+        const ggml_tensor * m = cgraph->nodes[node_idx + 1];
+        if (sig->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || !ggml_are_same_shape(sig, g) || g->ne[0] != 1 || g->ne[2] != 1 ||
+            g->ne[3] != 1 || g->nb[1] % sizeof(float) != 0 || get_misalign_bytes(ctx, g) != 0 ||
+            m->op != GGML_OP_MUL || m->type != GGML_TYPE_F32 || m->src[1] != sig || m->src[0] == nullptr) {
+            return false;
+        }
+        c.gate  = g;
+        c.n_pre = 2;
+        se_mul  = m;
+        node_idx += 2;
+    }
     const ggml_tensor * first = cgraph->nodes[node_idx];
     if (first->op != GGML_OP_ADD || first->type != GGML_TYPE_F32 || first->ne[2] != 1 || first->ne[3] != 1) {
         return false;
@@ -17508,12 +17545,22 @@ static bool ggml_vk_hc_moe_chain(const ggml_backend_vk_context * ctx, const stru
             c.n_add++;
             continue;
         }
-        // the shared-expert term ends the chain
-        if (other->type == GGML_TYPE_F32 && other->nb[0] == sizeof(float) && other->nb[1] % 16 == 0 && get_misalign_bytes(ctx, other) == 0) {
-            c.sh = other;
+        // the shared-expert term ends the chain; with the gate in front, it must be the gated MUL, and the kernel reads its down
+        const ggml_tensor * shv = other;
+        if (se_mul != nullptr) {
+            shv = other == se_mul ? se_mul->src[0] : nullptr;
+            if (shv == nullptr || !ggml_are_same_shape(se_mul, shv) || shv->ne[1] != c.gate->ne[1]) {
+                return false;
+            }
+        }
+        if (shv->type == GGML_TYPE_F32 && shv->nb[0] == sizeof(float) && shv->nb[1] % 16 == 0 && get_misalign_bytes(ctx, shv) == 0) {
+            c.sh = shv;
             c.n_add++;
         }
         break;
+    }
+    if (se_mul != nullptr && c.sh == nullptr) {
+        return false;
     }
     // vec4 slot loads: 16-byte (f32) / 8-byte (f16) aligned rows
     if (n_embd % 4 != 0 || c.so % 4 != 0 || c.ss1 % 4 != 0 || c.ss2 % 4 != 0 || get_misalign_bytes(ctx, c.root) != 0) {
@@ -17522,17 +17569,20 @@ static bool ggml_vk_hc_moe_chain(const ggml_backend_vk_context * ctx, const stru
     return true;
 }
 
-// at node_idx (the chain's first ADD): the number of ADD nodes in front of the HC post norm chain, or 0. mode: HC_POST_NORM_GATE_CPY
-// or HC_POST_NORM_GATE; inj: the inject MUL_MAT folded in as well (ggml_vk_can_fuse_hc_post_norm_inj).
+// at node_idx (the chain's first ADD, or the shared expert's gate with SE): the number of nodes in front of the HC post norm
+// chain (ADDs, plus the gate's SIGMOID and MUL), or 0. mode: HC_POST_NORM_GATE_CPY or HC_POST_NORM_GATE; inj: the inject MUL_MAT
+// folded in as well (ggml_vk_can_fuse_hc_post_norm_inj).
 static int ggml_vk_can_fuse_hc_moe_epi(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, int & mode, bool & inj) {
-    if (!ggml_vk_hc_moe_epi_enabled() || cgraph->nodes[node_idx]->op != GGML_OP_ADD) {
+    const ggml_op op0 = cgraph->nodes[node_idx]->op;
+    if (!ggml_vk_hc_moe_epi_enabled() || (op0 != GGML_OP_ADD && op0 != GGML_OP_UNARY)) {
         return 0;
     }
     vk_hc_moe_chain c;
     if (!ggml_vk_hc_moe_chain(ctx, cgraph, node_idx, c)) {
         return 0;
     }
-    const int j = node_idx + c.n_add;
+    const int n_front = c.n_pre + c.n_add;
+    const int j = node_idx + n_front;
     if (j + 6 >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_SCALE) {
         return 0;
     }
@@ -17554,29 +17604,35 @@ static int ggml_vk_can_fuse_hc_moe_epi(const ggml_backend_vk_context * ctx, cons
     if (ctx->device->pipeline_dsv4_hc_moe_post_norm[c.f16 ? 1 : 0][inj ? 2 : mode == HC_POST_NORM_GATE_CPY ? 1 : 0] == nullptr) {
         return 0;
     }
-    // the ADDs are elided: their only readers are the next ADD and the combine, and none is a graph output
-    int idxs[HC_MOE_MAX_SLOTS + 1];
-    ggml_op ops[HC_MOE_MAX_SLOTS + 1];
-    for (int k = 0; k < c.n_add; ++k) {
-        idxs[k] = node_idx + k;
-        ops[k]  = GGML_OP_ADD;
+    // graph_compute's per-fusion arrays hold 32 nodes
+    if (n_front + (inj ? 9 : mode == HC_POST_NORM_GATE_CPY ? 7 : 6) > 32) {
+        return 0;
     }
-    idxs[c.n_add] = j + 3;
-    ops[c.n_add]  = GGML_OP_DSV4_HC_POST;
+    // the gate's SIGMOID and MUL and the ADDs are elided: their only readers are the next node of the chain and the combine,
+    // and none is a graph output
+    int idxs[HC_MOE_MAX_SLOTS + 3];
+    ggml_op ops[HC_MOE_MAX_SLOTS + 3];
+    for (int k = 0; k < n_front; ++k) {
+        idxs[k] = node_idx + k;
+        ops[k]  = k < c.n_pre ? (k == 0 ? GGML_OP_UNARY : GGML_OP_MUL) : GGML_OP_ADD;
+    }
+    idxs[n_front] = j + 3;
+    ops[n_front]  = GGML_OP_DSV4_HC_POST;
     const int outputs[] = { j + 3 };
-    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, c.n_add + 1, ops, outputs, 1)) {
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n_front + 1, ops, outputs, 1)) {
         return 0;
     }
     // the kernel reads the slots, the shared expert, the residual, the post weights, gamma (and w_inject) while it writes the
     // combine, the norm (and the inject): no input may overlap an output
     const ggml_tensor * last = cgraph->nodes[j + (mode == HC_POST_NORM_GATE_CPY ? 6 : 5)];
     const ggml_tensor * outs[] = { hc_post, last, inj ? cgraph->nodes[j + 8] : nullptr };
-    const ggml_tensor * ins[HC_MOE_MAX_SLOTS + 5] = {};
+    const ggml_tensor * ins[HC_MOE_MAX_SLOTS + 6] = {};
     int n_in = 0;
     for (int k = 0; k < c.n_slots; ++k) {
         ins[n_in++] = c.slot[k];
     }
     ins[n_in++] = c.sh;
+    ins[n_in++] = c.gate;
     ins[n_in++] = res;
     ins[n_in++] = cgraph->nodes[j]->src[0];
     ins[n_in++] = cgraph->nodes[j + 5]->src[1];
@@ -17588,19 +17644,20 @@ static int ggml_vk_can_fuse_hc_moe_epi(const ggml_backend_vk_context * ctx, cons
             }
         }
     }
-    return c.n_add;
+    return n_front;
 }
 
-// node_idx: the chain's first ADD (ggml_vk_can_fuse_hc_moe_epi admitted ctx->fused_hc_moe_epi ADDs, then the HC post norm chain)
+// node_idx: the chain's first ADD, or the shared expert's gate (ggml_vk_can_fuse_hc_moe_epi admitted ctx->fused_hc_moe_epi nodes,
+// then the HC post norm chain)
 static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     vk_hc_moe_chain c;
-    GGML_ASSERT(ggml_vk_hc_moe_chain(ctx, cgraph, node_idx, c) && c.n_add == ctx->fused_hc_moe_epi);
+    GGML_ASSERT(ggml_vk_hc_moe_chain(ctx, cgraph, node_idx, c) && c.n_pre + c.n_add == ctx->fused_hc_moe_epi);
     const int  mode    = ctx->fused_hc_post_norm;
     const bool inj     = ctx->fused_hc_post_norm_inj;
     const bool out_f16 = mode == HC_POST_NORM_GATE_CPY;
     GGML_ASSERT(mode == HC_POST_NORM_GATE_CPY || mode == HC_POST_NORM_GATE);
 
-    const int j = node_idx + c.n_add;
+    const int j = node_idx + c.n_pre + c.n_add;
     const ggml_tensor * scale_in = cgraph->nodes[j];
     const ggml_tensor * hc_post  = cgraph->nodes[j + 3];
     const ggml_tensor * rms      = cgraph->nodes[j + 4];
@@ -17611,7 +17668,8 @@ static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_cont
     const ggml_tensor * res   = hc_post->src[1];
     const ggml_tensor * pw    = scale_in->src[0];
     const ggml_tensor * gamma = mul->src[1];
-    const ggml_tensor * sh    = c.sh != nullptr ? c.sh : res;   // bound but not read without a shared-expert term
+    const ggml_tensor * sh    = c.sh != nullptr ? c.sh : res;       // bound but not read without a shared-expert term
+    const ggml_tensor * gt    = c.gate != nullptr ? c.gate : res;   // bound but not read without the gate
 
     const uint32_t n_embd = (uint32_t) res->ne[0];
     const uint32_t hc     = (uint32_t) res->ne[1];
@@ -17645,20 +17703,22 @@ static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_cont
             inj ? (uint32_t)(mm->nb[1] / sizeof(float)) : 0u,
         },
         (uint32_t) c.n_slots, (uint32_t) c.so, (uint32_t) c.ss1, (uint32_t) c.ss2,
-        c.sh != nullptr ? 1u : 0u,
+        c.gate != nullptr ? 2u : c.sh != nullptr ? 1u : 0u,
+        c.gate != nullptr ? (uint32_t)(c.gate->nb[1] / sizeof(float)) : 0u,
     };
 
     if (inj) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { ggml_vk_tensor_subbuffer(ctx, c.root), ggml_vk_tensor_subbuffer(ctx, sh), ggml_vk_tensor_subbuffer(ctx, res),
               ggml_vk_tensor_subbuffer(ctx, pw), ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, hc_post),
-              ggml_vk_tensor_subbuffer(ctx, out), ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, mm) },
+              ggml_vk_tensor_subbuffer(ctx, out), ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, mm),
+              ggml_vk_tensor_subbuffer(ctx, gt) },
             pc, { nt, 1, 1 });
     } else {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { ggml_vk_tensor_subbuffer(ctx, c.root), ggml_vk_tensor_subbuffer(ctx, sh), ggml_vk_tensor_subbuffer(ctx, res),
               ggml_vk_tensor_subbuffer(ctx, pw), ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, hc_post),
-              ggml_vk_tensor_subbuffer(ctx, out) },
+              ggml_vk_tensor_subbuffer(ctx, out), ggml_vk_tensor_subbuffer(ctx, gt) },
             pc, { nt, 1, 1 });
     }
 }
@@ -18806,7 +18866,10 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
         if (!ggml_vk_fuse_hc_post_norm_enabled()) {
             return "GGML_VK_FUSE_HC_POST_NORM=0";
         }
-        if (l == "HC_MOE_EPI_INJ" && !ggml_vk_hc_inject_fold_enabled()) {
+        if (l.rfind("HC_MOE_EPI_SE", 0) == 0 && !ggml_vk_hc_moe_epi_se_enabled()) {
+            return "GGML_VK_HC_MOE_EPI_SE=0";
+        }
+        if ((l == "HC_MOE_EPI_INJ" || l == "HC_MOE_EPI_SE_INJ") && !ggml_vk_hc_inject_fold_enabled()) {
             return "GGML_VK_HC_INJECT_FOLD=0";
         }
         if (dev->pipeline_dsv4_hc_moe_post_norm[1][0] == nullptr) {
@@ -19318,26 +19381,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         const char *fusion_string {};
         int hc_moe_mode = HC_POST_NORM_NONE;
         bool hc_moe_inj = false;
-        int hc_moe_adds = 0;
+        int hc_moe_front = 0;
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = 0;
-            if ((hc_moe_adds = ggml_vk_can_fuse_hc_moe_epi(ctx, cgraph, i, hc_moe_mode, hc_moe_inj)) > 0) {
-                // the MoE slot adds and the shared-expert add (elided), then HC_POST_GATE_NORM(_CPY)(_INJ). Outputs: the combine
-                // (the next combine's residual), the norm, and with the inject fold the inject; the norm is then not the last
-                // node, so it is the extra written tensor. No source overlaps an output (the matcher checked the kernel's
-                // inputs), and only the cast's own src[1] (its destination) is elementwise.
+            if ((hc_moe_front = ggml_vk_can_fuse_hc_moe_epi(ctx, cgraph, i, hc_moe_mode, hc_moe_inj)) > 0) {
+                // the MoE slot adds and the shared-expert add (elided; with SE the shared expert's gate SIGMOID + MUL in front
+                // of them too), then HC_POST_GATE_NORM(_CPY)(_INJ). Outputs: the combine (the next combine's residual), the
+                // norm, and with the inject fold the inject; the norm is then not the last node, so it is the extra written
+                // tensor. No source overlaps an output (the matcher checked the kernel's inputs), and only the cast's own
+                // src[1] (its destination) is elementwise.
                 const bool cpy = hc_moe_mode == HC_POST_NORM_GATE_CPY;
-                ctx->fused_hc_moe_epi = hc_moe_adds;
+                const bool se  = cgraph->nodes[i]->op == GGML_OP_UNARY;
+                ctx->fused_hc_moe_epi = hc_moe_front;
                 ctx->fused_hc_post_norm = hc_moe_mode;
                 ctx->fused_hc_post_norm_inj = hc_moe_inj;
-                ctx->num_additional_fused_ops = hc_moe_adds + (hc_moe_inj ? 8 : cpy ? 6 : 5);
-                ctx->fused_ops_write_mask |= 1 << (hc_moe_adds + 3);
+                ctx->num_additional_fused_ops = hc_moe_front + (hc_moe_inj ? 8 : cpy ? 6 : 5);
+                ctx->fused_ops_write_mask |= 1 << (hc_moe_front + 3);
                 if (hc_moe_inj) {
-                    ctx->fused_extra_dst = cgraph->nodes[i + hc_moe_adds + 6];
+                    ctx->fused_extra_dst = cgraph->nodes[i + hc_moe_front + 6];
                 }
-                fusion_string = hc_moe_inj ? "HC_MOE_EPI_INJ" : cpy ? "HC_MOE_EPI" : "HC_MOE_EPI_F32";
+                fusion_string = se ? (hc_moe_inj ? "HC_MOE_EPI_SE_INJ" : cpy ? "HC_MOE_EPI_SE" : "HC_MOE_EPI_SE_F32")
+                                   : (hc_moe_inj ? "HC_MOE_EPI_INJ" : cpy ? "HC_MOE_EPI" : "HC_MOE_EPI_F32");
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
-                op_srcs_fused_elementwise[hc_moe_adds + 6] = cpy;
+                op_srcs_fused_elementwise[hc_moe_front + 6] = cpy;
             } else if ((num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i))) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
@@ -20017,6 +20083,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // right after the expert GEMM, and the shared-expert branch (its down GEMM, gate GEMM, SIGMOID, MUL) only in front
         // of the shared ADD, so that branch, and whatever else the run needs from in between, moves in front of the adds. The
         // run's inputs stay allocated through its last node, which the fused kernel writes while it reads them.
+        // HC_MOE_EPI_SE: the shared expert's gate SIGMOID and MUL open the run instead (right in front of the slot adds, so if
+        // the epilogue does not match at compute time they still fuse as SIGMOID_MUL and the adds as HC_MOE_EPI).
         if (ggml_vk_hc_moe_epi_enabled() && ggml_vk_fuse_hc_post_norm_enabled() && graph->nodes[first_unused]->op == GGML_OP_ADD) {
             auto const &hc_moe_epi_order = [&](int a0, std::vector<int> & prereq) -> std::vector<int> {
                 std::vector<int> run;
@@ -20035,6 +20103,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 const int lim = std::min(k + 48, graph->n_nodes);
                 // the shared-expert ADD (unless it already followed), then the combine whose x is the sum
                 int hp = -1;
+                int se_sig = -1, se_mul = -1;
                 for (int j = k + 1; j < lim && hp < 0; ++j) {
                     const ggml_tensor * nj = graph->nodes[j];
                     if (used[j]) {
@@ -20044,6 +20113,25 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     if (nj->op == GGML_OP_ADD && graph->nodes[run.back()]->op == GGML_OP_ADD && run.back() == k &&
                         (nj->src[0] == tip || nj->src[1] == tip)) {
                         run.push_back(j);
+                        // the shared term: MUL(down, SIGMOID([1, T] gate)), each read only by the next, both in between
+                        const ggml_tensor * o = nj->src[0] == tip ? nj->src[1] : nj->src[0];
+                        if (ggml_vk_hc_moe_epi_se_enabled() && o->op == GGML_OP_MUL && o->src[1] != nullptr && o->src[1]->op == GGML_OP_UNARY &&
+                            ggml_get_unary_op(o->src[1]) == GGML_UNARY_OP_SIGMOID && o->src[1]->src[0]->ne[0] == 1) {
+                            int si = -1, mi = -1;
+                            for (int q = a0 + 1; q < j; ++q) {
+                                if (graph->nodes[q] == o) {
+                                    mi = q;
+                                } else if (graph->nodes[q] == o->src[1]) {
+                                    si = q;
+                                }
+                            }
+                            if (si > a0 && mi > si && !used[si] && !used[mi] &&
+                                ggml_node_get_use_count(graph, si) == 1 && ggml_node_get_use_count(graph, mi) == 1 &&
+                                !(graph->nodes[si]->flags & GGML_TENSOR_FLAG_OUTPUT) && !(graph->nodes[mi]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                                se_sig = si;
+                                se_mul = mi;
+                            }
+                        }
                     } else if (nj->op == GGML_OP_DSV4_HC_POST && nj->src[0] == tip) {
                         hp = j;
                     }
@@ -20093,6 +20181,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                         run.push_back(v);
                         run.push_back(m);
                     }
+                }
+                // SE: the gate's SIGMOID and MUL open the run
+                if (se_mul >= 0) {
+                    run.insert(run.begin(), { se_sig, se_mul });
                 }
                 // what the run needs from between its nodes (sources, and nodes that read storage it overwrites), transitively
                 int hi = a0;
