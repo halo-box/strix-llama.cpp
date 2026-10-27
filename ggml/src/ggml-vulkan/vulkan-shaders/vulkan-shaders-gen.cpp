@@ -897,6 +897,14 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
+        if (tname == "q8_0") {
+            // FN_DECODE_HC: the qwen4exp hc up mat-vec with SCALE + SILU on B and the gated hc pre as the store
+            const std::map<std::string, std::string> hc = {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"HC_MIX", "1"}};
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_hcmix", shader, merge_maps(base_dict, hc));
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_hcmix_subgroup", shader, merge_maps(merge_maps(base_dict, hc), {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_hcmix_subgroup_no_shmem", shader, merge_maps(merge_maps(base_dict, hc), {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
+
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (tname == "mxfp4" || tname == "nvfp4") {
             string_to_spv("mul_mat_vec_" + tname + "_f32_f32_ocp", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"USE_OCP_FP4", "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));

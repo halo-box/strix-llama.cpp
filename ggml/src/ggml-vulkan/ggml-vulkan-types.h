@@ -997,6 +997,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_x16_g16_f16;   // f16 x, f16 gate, f16 mixed stream
     // HC_POST(_GATE) + RMS_NORM + MUL (+ CPY f16) / RMS_NORM + MUL (+ CPY f16): [has_post][out_f16]
     vk_pipeline pipeline_dsv4_hc_post_norm[2][2];
+    // FN_DECODE_HC: the q8_0 hc up mat-vec with SCALE + SILU on B and DSV4_HC_PRE (gated) as the store, 4 rows per workgroup,
+    // per workgroup size and column count like pipeline_dequant_mul_mat_vec_f32_f32
+    vk_pipeline pipeline_fn_hc_up_mix_mv[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1387,6 +1390,7 @@ struct ggml_backend_vk_context {
     // MUL_MAT+CPY(f16): the matmul stores f16 into the cast's destination
     bool fused_mm_cpy16 {};
     bool fused_hc_up_mix {};   // MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) -> one int8 MMQ GEMM with the mix epilogue
+    bool fused_fn_decode_hc {};   // SCALE + SILU + MUL_MAT (mat-vec) + RESHAPE + DSV4_HC_PRE (gated) -> one mat-vec (FN_DECODE_HC)
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

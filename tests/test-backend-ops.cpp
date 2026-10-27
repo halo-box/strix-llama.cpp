@@ -4339,6 +4339,101 @@ struct test_hc_post_norm : public test_case {
     }
 };
 
+// qwen4exp decode hc mix, in model order (FN_DECODE_HC on Vulkan): the f32 hc norm xn [embd * hc, T] into the hc down mat-vec
+// (lo), SCALE(1 / hc) -> SILU -> the hc up mat-vec (q8_0 [rank, embd * hc]) -> RESHAPE -> DSV4_HC_PRE (gated) over xn as [embd, hc, T].
+// exact: the chain is built twice over the same inputs, the second with its SILU also a graph output (so it runs unfused), and the
+// outputs are the scaled differences of the two plus 1, compared with a zero tolerance (err counts differing elements).
+struct test_fn_decode_hc : public test_case {
+    const int embd, rank, tokens;
+    const bool exact;
+    std::vector<ggml_tensor *> verify;
+
+    test_fn_decode_hc(int embd, int rank, int tokens, bool exact = false) : embd(embd), rank(rank), tokens(tokens), exact(exact) {}
+    std::string op_desc(ggml_tensor *) override { return "FN_DECODE_HC"; }
+    std::string vars() override { return VARS_TO_STR4(embd, rank, tokens, exact); }
+
+    // GGML_VK_TEST_REQUIRE_FN_DECODE_HC=1: with the knob on, exactly one fused chain per graph (the exact twin runs unfused) and no
+    // DSV4_HC_PRE left in it, unless the backend recorded that the unfused up mat-vec would take the q8_1 integer-dot path
+    // (path:FN_DECODE_HC_MMVQ, e.g. 4 tokens), where it must not fuse; with GGML_VK_FN_DECODE_HC=0, none
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_FN_DECODE_HC")) {
+            return true;
+        }
+        auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
+        const int64_t n_mmvq = dispatch_census_count(backend, "path:FN_DECODE_HC_MMVQ");
+        const bool on = (skip == nullptr || skip(backend, "FN_DECODE_HC") == nullptr) && tokens <= 8 && n_mmvq <= 0;
+        const int64_t n = dispatch_census_count(backend, "FN_DECODE_HC");
+        const bool ok = on ? n == 1 : n == 0;
+        if (!ok) {
+            msg = "FN_DECODE_HC dispatches: " + std::to_string(n) + ", expected " + (on ? "1" : "0") + " (MMVQ path " + std::to_string(n_mmvq) + ")";
+        }
+        return ok;
+    }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+    // vs the CPU, which quantizes both mat-vec B operands to q8_0: the unfused Vulkan chain reaches 5.3e-4 on these shapes
+    double max_nmse_err() override { return exact ? 0.0 : 1e-3; }
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return test_case::err(a, b, n);
+        }
+        size_t n_diff = 0;
+        for (size_t i = 0; i < n; ++i) {
+            n_diff += a[i] != b[i];
+        }
+        return (double) n_diff;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) init_tensor_uniform(t);
+        }
+    }
+
+    // one chain: returns the mixed stream; *silu gets the SILU node
+    ggml_tensor * chain(ggml_context * ctx, ggml_tensor * xn, ggml_tensor * w_down, ggml_tensor * w_up, ggml_tensor ** silu) {
+        const int hc = 4;
+        ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);
+        if (gf) { ggml_build_forward_expand(gf, lo); }
+        ggml_tensor * x3 = ggml_reshape_3d(ctx, xn, embd, hc, tokens);
+        ggml_tensor * si = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / hc));
+        *silu = si;
+        ggml_tensor * gate = ggml_mul_mat(ctx, w_up, si);
+        return ggml_dsv4_hc_pre_gated_ext(ctx, x3, ggml_reshape_3d(ctx, gate, embd, hc, tokens), 1.0f / hc, GGML_TYPE_F32);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        const int64_t hc_dim = int64_t(embd) * 4;
+        ggml_tensor * xn     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, tokens);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_dim, rank);
+        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, rank, hc_dim);
+        // never freed or reused in place (the CPU reference reads them as given; the exact twin reads them again)
+        for (ggml_tensor * t : { xn, w_down, w_up }) {
+            ggml_set_input(t);
+            ggml_set_output(t);
+        }
+        ggml_tensor * si_a = nullptr;
+        ggml_tensor * a = chain(ctx, xn, w_down, w_up, &si_a);
+        if (!exact) {
+            ggml_set_output(a);
+            verify.push_back(a);
+            return a;
+        }
+        if (gf) { ggml_build_forward_expand(gf, a); }
+        ggml_tensor * si_b = nullptr;
+        ggml_tensor * b = chain(ctx, xn, w_down, w_up, &si_b);
+        ggml_set_output(si_b);   // keeps the second chain unfused
+        if (gf) { ggml_build_forward_expand(gf, b); }
+        // equal bits give exactly 1; a difference d gives 1 + 1e12 d
+        ggml_tensor * last = ggml_scale_bias(ctx, ggml_sub(ctx, a, b), 1e12f, 1.0f);
+        ggml_set_output(last);
+        verify.push_back(last);
+        return last;
+    }
+};
+
 // quantized weights x an f16 B (the f16 hc norm into the hc down GEMM); pad > 0: B rows with a k + pad stride (padded
 // xn / GDN norm), read in place on Vulkan
 struct test_mul_mat_f16b : public test_case {
@@ -12639,6 +12734,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_hc_post_norm(2560, 4, tokens, 1, GGML_TYPE_Q8_0, 128));
     }
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 2, GGML_TYPE_Q8_0, 128));
+    // FN_DECODE_HC: the Flash-Next decode hc mix (n_embd 2560, 4 streams, hc rank 320) at 1-8 tokens (MTP / speculative batches;
+    // the column chunks of the q8_0 mat-vec), a small and a wide row; exact = bit-identical to the unfused chain
+    for (int tokens = 1; tokens <= 8; ++tokens) {
+        for (bool exact : {false, true}) {
+            test_cases.emplace_back(new test_fn_decode_hc(2560, 320, tokens, exact));
+        }
+    }
+    for (bool exact : {false, true}) {
+        test_cases.emplace_back(new test_fn_decode_hc(256, 64, 1, exact));
+        test_cases.emplace_back(new test_fn_decode_hc(4096, 512, 3, exact));
+        test_cases.emplace_back(new test_fn_decode_hc(2560, 320, 9, exact));   // past the mat-vec columns: unfused
+    }
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 1, GGML_TYPE_Q4_0, 8));
     // bf16: a bf16 weight LLAMA_BF16_TO_F16 kept (out of f16 range) meets the f16 mixed stream
     // B paths: f16-B native (q8_0), int8 MMQ quantizing the f16 B (q4_0), the dense router (q4_K), non-quantized (bf16)
@@ -17117,6 +17224,7 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("RMS_NORM_VIEW_SET_ROWS", new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false), "RMS_NORM_VIEW_SET_ROWS/3=1");
     add("ROPE_VIEW_SET_ROWS",  new test_rope_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 128, 32, 8, 1 }, GGML_ROPE_TYPE_NORMAL), "ROPE_VIEW_SET_ROWS/3=1");
     add("HC_POST_GATE",        new test_dsv4_hc_post(4096, 21, false, true), "HC_POST_GATE/4=1");
+    add("FN_DECODE_HC",        new test_fn_decode_hc(256, 64, 1), "FN_DECODE_HC/5=1");
     add("GELU_MUL",            new test_unary_mul(GGML_UNARY_OP_GELU,     GGML_TYPE_F32, { 128, 2, 2, 2 }), "GELU_MUL/2=1");
     add("SIGMOID_MUL",         new test_unary_mul(GGML_UNARY_OP_SIGMOID,  GGML_TYPE_F32, { 128, 2, 2, 2 }), "SIGMOID_MUL/2=1");
     add("SILU_MUL",            new test_unary_mul(GGML_UNARY_OP_SILU,     GGML_TYPE_F32, { 128, 2, 2, 2 }), "SILU_MUL/2=1");
