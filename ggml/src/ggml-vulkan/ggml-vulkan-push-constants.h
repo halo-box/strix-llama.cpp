@@ -858,6 +858,14 @@ struct vk_op_upscale_push_constants {
     float pixel_offset;
 };
 
+// decode weight prefetch (decode_prefetch.comp): word offset into the weight descriptor, cache lines to touch, words per line
+struct vk_op_decode_prefetch_push_constants {
+    uint32_t offset;
+    uint32_t nlines;
+    uint32_t line_words;
+    uint32_t never;
+};
+
 struct vk_op_sum_rows_push_constants
 {
     uint32_t n_cols;

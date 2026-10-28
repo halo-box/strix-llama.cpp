@@ -4437,6 +4437,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_decode_prefetch, "decode_prefetch", decode_prefetch_len, decode_prefetch_data, "main", 1, sizeof(vk_op_decode_prefetch_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_sum_f32, "sum_f32", sum_f32_len, sum_f32_data, "main", 2, sizeof(vk_op_sum_push_constants), {1, 1, 1}, { 256 }, 1);
@@ -6421,6 +6422,7 @@ void ggml_vk_instance_init() {
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
+    vk_perf_logger_seq = getenv("GGML_VK_PERF_LOGGER_SEQ") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
@@ -15798,6 +15800,147 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     }
 }
 
+// Decode weight prefetch (experimental, off by default; GGML_VK_DECODE_PREFETCH=1 enables). In a decode graph, a small "touch"
+// dispatch (one load per 128-byte line, no stores) runs beside the ops of a barrier group that reads no big weights and loads the
+// next dense mat-vec's next weight bytes, so that mat-vec finds them in L2 / the memory-attached last-level cache. Reads only: no
+// barrier changes, no numeric change.
+// Measured on a 32 MB last-level cache part: each cached MB saves ~3.4 us of mat-vec time, but the decode glue groups are short
+// (2.5-7 us, about 2 us of it launch and barrier) and a touch lengthens them by about what it saves; groups led by recurrence or
+// attention stream memory themselves and slow down. Net decode gain measured ~0, so the switch stays off.
+// Knobs: _KB / _WG slice and workgroups for an ordinary small-op group (default 0 = none, 1); _LONG_OPS bitmask (2 = gated delta net,
+// 4 = decode attention; default 0) with _LONG_KB / _LONG_WG (3072, 1); _SMALLW_MB / _SMALLW_KB: groups
+// whose dense mat-vecs are all under _SMALLW_MB also get a touch (default 0 = off, 512); _MAX_MB caps touched-but-unread bytes (24).
+struct vk_decode_prefetch_cfg {
+    bool on;
+    size_t slice, slice_long, smallw, slice_smallw;
+    uint32_t wgs, wgs_long, long_ops;
+    size_t max_bytes;
+};
+
+static const vk_decode_prefetch_cfg & ggml_vk_decode_prefetch_cfg() {
+    static const vk_decode_prefetch_cfg cfg = [] {
+        auto env = [](const char * k, long d) { const char * e = getenv(k); return e != nullptr ? atol(e) : d; };
+        vk_decode_prefetch_cfg c;
+        c.on         = env("GGML_VK_DECODE_PREFETCH", 0) != 0;
+        c.slice      = (size_t) std::max(0L, env("GGML_VK_DECODE_PREFETCH_KB", 0)) * 1024;
+        c.slice_long = (size_t) std::max(0L, env("GGML_VK_DECODE_PREFETCH_LONG_KB", 3072)) * 1024;
+        c.wgs        = (uint32_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_WG", 1));
+        c.wgs_long   = (uint32_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_LONG_WG", 1));
+        c.long_ops   = (uint32_t) std::max(0L, env("GGML_VK_DECODE_PREFETCH_LONG_OPS", 0));
+        c.max_bytes  = (size_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_MAX_MB", 24)) * 1024 * 1024;
+        c.smallw       = (size_t) std::max(0L, env("GGML_VK_DECODE_PREFETCH_SMALLW_MB", 0)) * 1024 * 1024;
+        c.slice_smallw = (size_t) std::max(0L, env("GGML_VK_DECODE_PREFETCH_SMALLW_KB", 512)) * 1024;
+        return c;
+    }();
+    return cfg;
+}
+
+// 0: not a weight mat-vec, 1: dense weight mat-vec worth prefetching, 2: other weight read (expert mat-vec, small weights)
+static int ggml_vk_pf_weight_kind(const ggml_tensor * n) {
+    if (n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    const ggml_tensor * w = n->src[0];
+    if (w->buffer == nullptr || ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return 0;
+    }
+    if (n->op == GGML_OP_MUL_MAT_ID || ggml_nbytes(w) < 1024 * 1024) {
+        return 2;
+    }
+    return 1;
+}
+
+// per graph: is this a decode graph (every weight mat-vec has one token), and the next dense target after each node
+static void ggml_vk_decode_prefetch_plan(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->pf_active = false;
+    ctx->pf_group_weight = false;
+    ctx->pf_group_touched = false;
+    if (!ggml_vk_decode_prefetch_cfg().on) {
+        return;
+    }
+    bool any_dense = false;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        const int k = ggml_vk_pf_weight_kind(n);
+        if (k == 0) {
+            continue;
+        }
+        const int64_t ntok = n->op == GGML_OP_MUL_MAT ? n->src[1]->ne[1] * n->src[1]->ne[2] * n->src[1]->ne[3] : n->src[2]->ne[1];
+        if (ntok != 1) {
+            return;
+        }
+        any_dense |= k == 1;
+    }
+    if (!any_dense) {
+        return;
+    }
+    ctx->pf_next.assign(cgraph->n_nodes, -1);
+    ctx->pf_touched.assign(cgraph->n_nodes, 0);
+    ctx->pf_inflight = 0;
+    int32_t next = -1;
+    for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
+        ctx->pf_next[i] = next;
+        const int k = ggml_vk_pf_weight_kind(cgraph->nodes[i]);
+        if (k == 1) {
+            next = i;
+        } else if (k == 2 && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+            // an expert mat-vec streams more than the cache holds before the next dense target: nothing to gain across it
+            next = -1;
+        }
+    }
+    ctx->pf_active = true;
+}
+
+// after a node's dispatches: in a group with no big weight read yet, touch the next untouched bytes of the next dense mat-vecs
+// (continuing into the following ones up to an expert mat-vec), keeping touched-but-unread bytes under the cache budget
+static void ggml_vk_decode_prefetch(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const vk_decode_prefetch_cfg & cfg = ggml_vk_decode_prefetch_cfg();
+    const int last = node_idx + ctx->num_additional_fused_ops;
+    bool smallw = false;
+    for (int i = node_idx; i <= last; ++i) {
+        // a big dense mat-vec or an expert mat-vec saturates DRAM itself; small weights (hc, router twins) do not
+        const int k = ggml_vk_pf_weight_kind(cgraph->nodes[i]);
+        if (k == 1) {
+            ctx->pf_inflight -= std::min(ctx->pf_inflight, ctx->pf_touched[i]);
+            if (ggml_nbytes(cgraph->nodes[i]->src[0]) < cfg.smallw) {
+                smallw = true;
+                continue;
+            }
+        }
+        if (k == 1 || (k == 2 && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID)) {
+            ctx->pf_group_weight = true;
+        }
+    }
+    if (ctx->pf_group_weight || ctx->pf_group_touched) {
+        return;
+    }
+    const ggml_op op = cgraph->nodes[node_idx]->op;
+    const bool is_long = ((cfg.long_ops & 2) && op == GGML_OP_GATED_DELTA_NET) ||
+                         ((cfg.long_ops & 4) && op == GGML_OP_FLASH_ATTN_EXT);
+    size_t budget = is_long ? cfg.slice_long : smallw ? cfg.slice_smallw : cfg.slice;
+    const uint32_t wgs = is_long ? cfg.wgs_long : cfg.wgs;
+    for (int32_t t = ctx->pf_next[last]; t >= 0 && budget >= 128 && ctx->pf_inflight + 128 <= cfg.max_bytes; t = ctx->pf_next[t]) {
+        const ggml_tensor * w = cgraph->nodes[t]->src[0];
+        const size_t nb = ggml_nbytes(w);
+        const size_t take = std::min({ nb - std::min(nb, ctx->pf_touched[t]), budget, cfg.max_bytes - ctx->pf_inflight }) / 128 * 128;
+        if (take > 0) {
+            vk_subbuffer sb = ggml_vk_tensor_subbuffer(ctx, w, true);
+            const size_t misalign = sb.size - nb;
+            const vk_op_decode_prefetch_push_constants pc = { (uint32_t) ((misalign + ctx->pf_touched[t]) / 4), (uint32_t) (take / 128), 128 / 4, 0 };
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_decode_prefetch, 1);
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_decode_prefetch, { sb }, pc, { wgs * 256, 1, 1 });
+            ctx->pf_touched[t] += take;
+            ctx->pf_inflight += take;
+            budget -= take;
+            ctx->pf_group_touched = true;
+            ggml_vk_path_census_add("DECODE_PREFETCH");
+        }
+        if (ctx->pf_touched[t] + 128 <= nb) {
+            break;  // budget or cache room ran out inside this target
+        }
+    }
+}
+
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
@@ -15902,6 +16045,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             if (vk_enable_sync_logger) {
                 std::cerr <<  "sync" << std::endl;
             }
+            ctx->pf_group_weight = false;
+            ctx->pf_group_touched = false;
             ctx->unsynced_nodes_written.clear();
             ctx->unsynced_nodes_read.clear();
             ggml_vk_sync_buffers(ctx, compute_ctx);
@@ -16387,6 +16532,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     // the submit path below can end the command buffer, so close the region first
     dbg.close();
+
+    if (ctx->pf_active) {
+        ggml_vk_decode_prefetch(ctx, compute_ctx, cgraph, node_idx);
+    }
 
     ctx->tensor_ctxs[node_idx] = compute_ctx;
 
@@ -18783,6 +18932,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
     ctx->ssm_conv_direct_matches.clear();
+    ggml_vk_decode_prefetch_plan(ctx, cgraph);
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -19397,6 +19547,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 prev_node_idx = cur_node_idx;
                 ctx->perf_logger->log_timing(nodes, names, uint64_t((timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod));
+                if (vk_perf_logger_seq) {
+                    // one line per barrier group, in graph order: time, weight bytes read (mat-vec / mat-vec-id src0), ops
+                    double wbytes = 0;
+                    std::string ops;
+                    for (size_t k = 0; k < nodes.size(); ++k) {
+                        const ggml_tensor * n = nodes[k];
+                        if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) && n->src[0]->buffer &&
+                            ggml_backend_buffer_get_usage(n->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                            double b = (double) ggml_nbytes(n->src[0]);
+                            if (n->op == GGML_OP_MUL_MAT_ID) {
+                                b = b / n->src[0]->ne[2] * (double) (n->src[2]->ne[0] * n->src[2]->ne[1]);
+                            }
+                            wbytes += b;
+                        }
+                        ops += std::string(k ? "," : "") + (names[k] ? names[k] : ggml_op_name(n->op)) + ":" + n->name;
+                    }
+                    fprintf(stderr, "PFSEQ %d %.2f %.0f %s\n", i, (timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod / 1e3, wbytes, ops.c_str());
+                }
             }
         }
         ctx->perf_logger->print_timings();

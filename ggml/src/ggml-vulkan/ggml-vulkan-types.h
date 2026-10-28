@@ -985,6 +985,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_cumsum_multipass1_f32;
     vk_pipeline pipeline_cumsum_multipass2_f32;
     vk_pipeline pipeline_argmax_f32;
+    vk_pipeline pipeline_decode_prefetch;
     vk_pipeline pipeline_count_equal_i32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
@@ -1346,6 +1347,14 @@ struct ggml_backend_vk_context {
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
+    // decode weight prefetch (GGML_VK_DECODE_PREFETCH): per node, the next dense weight mat-vec (-1: none before an expert
+    // mat-vec) and the bytes of its weight already touched; touched bytes not yet read; per barrier group whether it already
+    // holds a big weight read or a touch
+    std::vector<int32_t> pf_next;
+    std::vector<size_t> pf_touched;
+    size_t pf_inflight {};
+    bool pf_active {};
+    bool pf_group_weight {}, pf_group_touched {};
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
