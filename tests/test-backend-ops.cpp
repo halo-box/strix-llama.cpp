@@ -7940,7 +7940,7 @@ struct test_mul_mat : public test_case {
 };
 
 // a 2-D GEMM whose B is optionally a row-padded view (the qwen4exp hc xn: f16, token stride k + pad elements), for the Vulkan
-// HC_W8A8 route (few rows, long K, opt-in): GGML_VK_TEST_REQUIRE_HC_W8A8=1 asserts it engages exactly where its gate admits the shape
+// HC_W8A8 route (few rows, long K, default on): GGML_VK_TEST_REQUIRE_HC_W8A8=1 asserts it engages exactly where its gate admits the shape
 struct test_mul_mat_hcd : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -7986,8 +7986,8 @@ struct test_mul_mat_hcd : public test_case {
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_W8A8")) {
             return true;
         }
-        const char * e = getenv("GGML_VK_HC_W8A8");   // opt-in
-        const bool on = e != nullptr && atoi(e) != 0;
+        const char * e = getenv("GGML_VK_HC_W8A8");   // default on in this tree; =0 is the exact path
+        const bool on = e == nullptr || atoi(e) != 0;
         const char * en = getenv("GGML_VK_HC_W8A8_MINN");
         const int64_t min_n = en ? atoi(en) : 512;
         const int64_t want = on && type_a == GGML_TYPE_Q8_0 && m <= 384 && k >= 4096 && k % 32 == 0 && n >= min_n &&
