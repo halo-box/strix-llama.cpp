@@ -9,7 +9,9 @@
 // QSA_RADIX_SELECT: top-k of a few short rows in ONE dispatch (decode / MTP verify block selection). One workgroup per
 // row: the row's keys are staged in shared memory once, a 4 x 8-bit radix select over them finds the k-th largest key,
 // and one ordered pass writes the k indices. The n-ary tournament it replaces needs a dependent pass (and a barrier) per
-// 1024-key halving of the row (5 passes at 8256 keys).
+// 1024-key halving of the row (5 passes at 8256 keys). QSA_PREFILL_SELECT runs the same kernel over the prefill strips
+// (hundreds of rows), where the tournament's passes each read and write every row through global memory; there the
+// key buffer is sized to the row (MAX_COLS) so that short rows leave room for more workgroups per CU.
 //
 // Semantics match topk_nary_search.comp: NaN ranks as -inf, ties at the k-th value go to the lowest indices. Output order:
 // the indices above the k-th value ascending, then the tied ones ascending (callers read a set).
@@ -19,6 +21,8 @@
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 512;
 layout(constant_id = 1) const uint SUBGROUP_SIZE = 64;
+// keys staged per row: QSA_RADIX_SELECT_MAX_COLS (48 KiB) or a smaller variant (ggml-vulkan.cpp)
+layout(constant_id = 2) const uint MAX_COLS = 12288;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -34,8 +38,6 @@ layout (push_constant) uniform parameter {
     uint unused2;
 } p;
 
-// keep in sync with QSA_RADIX_SELECT_MAX_COLS in ggml-vulkan.cpp (48 KiB of keys)
-#define MAX_COLS   12288
 #define RADIX_BITS 8
 #define RADIX_SIZE (1 << RADIX_BITS)
 #define MAX_SUBGROUPS 32
