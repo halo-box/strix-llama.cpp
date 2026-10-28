@@ -853,6 +853,25 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Recurrent state snapshot [EXPERIMENTAL]
+    // Saves the partial (recurrent) state of a sequence as it is right before a chosen token, from inside the
+    // llama_decode that processes that token, so the state before the last tokens of a batch can be checkpointed
+    // without decoding those tokens in a separate batch. Read it with llama_state_seq_get_data_ext and
+    // LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_SNAPSHOT: the data has the format of a
+    // PARTIAL_ONLY state of the sequence at that point and is restored with llama_state_seq_set_data_ext.
+
+    // Allocates the snapshot (one more copy of a sequence's recurrent state). Returns false if the context cannot
+    // take snapshots (model without a supported recurrent memory, rollback snapshots, MTP context).
+    LLAMA_API bool llama_rs_snapshot_init(struct llama_context * ctx);
+
+    // Takes a snapshot of seq_id right before the token at position pos during the next llama_decode calls.
+    // The snapshot is taken by the ubatch that holds the token at pos - 1 of seq_id, in a sequence set of its own.
+    // Arming replaces any earlier snapshot; pos < 0 disarms.
+    LLAMA_API void llama_rs_snapshot_arm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
+    // The pos of the token the current snapshot of seq_id was taken before, -1 if there is none
+    LLAMA_API llama_pos llama_rs_snapshot_pos(struct llama_context * ctx, llama_seq_id seq_id);
+
     //
     // State / sessions
     //
@@ -963,6 +982,9 @@ extern "C" {
 // Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
+
+// with PARTIAL_ONLY: get the recurrent state snapshot of the sequence (llama_rs_snapshot_arm) instead of its state
+#define LLAMA_STATE_SEQ_FLAGS_SNAPSHOT 4
 
     typedef uint32_t llama_state_seq_flags;
 

@@ -88,8 +88,23 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // recurrent state snapshot (llama_rs_snapshot_arm): copy the conv history that ends right before the snapshot
+    // token into snap; conv_input: (state_cols + n_seq_tokens, channels, n_seqs). No-op without a snapshot
+    void build_conv_snapshot(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        conv_input,
+            ggml_tensor *        snap,
+            int64_t              state_cols);
+
+    // tokens [t0, t1) of a (d0, d1, n_seq_tokens, n_seqs) delta-net input; an l2 norm (build_gdn_l2_norm) is applied
+    // again to the slice of its input, so backends that fold it into the scan still find it
+    ggml_tensor * slice_tokens(ggml_tensor * x, int64_t t0, int64_t t1);
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+    // with a recurrent state snapshot in the ubatch the scan is split at the snapshot token and the state there is
+    // copied to the snapshot; the two outputs are concatenated, or with parts != nullptr returned there (and nullptr
+    // returned), so a caller can avoid the copy
     ggml_tensor * build_recurrent_attn(
             llm_graph_input_rs * inp,
             ggml_tensor *        ssm_states_all,
@@ -99,7 +114,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            std::pair<ggml_tensor *, ggml_tensor *> * parts = nullptr);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -2664,6 +2680,15 @@ struct llama_model_qwen4exp : public llama_model_base {
 
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,
+                    ggml_tensor * weights,
+                    ggml_tensor * gate,
+                            int   layer);
+
+        // build_norm_gated of a scan split at a recurrent state snapshot: the two outputs are normed straight into
+        // the f16 destination instead of being concatenated first
+        ggml_tensor * build_norm_gated_parts(
+                    ggml_tensor * out0,
+                    ggml_tensor * out1,
                     ggml_tensor * weights,
                     ggml_tensor * gate,
                             int   layer);

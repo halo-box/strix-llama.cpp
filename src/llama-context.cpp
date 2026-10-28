@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -4266,6 +4267,9 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_SNAPSHOT) && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+        throw std::runtime_error("a recurrent state snapshot is a partial state");
+    }
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
@@ -5226,6 +5230,44 @@ size_t llama_state_seq_get_data(llama_context * ctx, uint8_t * dst, size_t size,
 
 size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id) {
     return llama_state_seq_set_data_ext(ctx, src, size, seq_id, 0);
+}
+
+//
+// recurrent state snapshot
+//
+
+static llama_memory_recurrent * llama_rs_snapshot_mem(llama_context * ctx) {
+    const auto & model = ctx->get_model();
+    if (!llm_arch_supports_rs_snapshot(model.arch) || ctx->get_cparams().n_rs_seq > 0 ||
+        ctx->get_cparams().ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model.hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        return nullptr;
+    }
+    llama_memory_i * mem = ctx->get_memory();
+    if (auto * recr = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        return recr;
+    }
+    // a non-SWA attention cache writes nothing for a partial state, so the snapshot is the whole partial state
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hyb->get_mem_recr();
+    }
+    return nullptr;
+}
+
+bool llama_rs_snapshot_init(llama_context * ctx) {
+    auto * mem = llama_rs_snapshot_mem(ctx);
+    return mem != nullptr && mem->snapshot_init();
+}
+
+void llama_rs_snapshot_arm(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    auto * mem = llama_rs_snapshot_mem(ctx);
+    if (mem != nullptr) {
+        mem->snapshot_arm(seq_id, pos);
+    }
+}
+
+llama_pos llama_rs_snapshot_pos(llama_context * ctx, llama_seq_id seq_id) {
+    auto * mem = llama_rs_snapshot_mem(ctx);
+    return mem != nullptr ? mem->snapshot_pos(seq_id) : -1;
 }
 
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
