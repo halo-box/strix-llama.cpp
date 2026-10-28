@@ -47,7 +47,13 @@ struct block_tq1_0_packed16 {
 };
 layout (binding = 0) readonly buffer A_TQ1_16 {block_tq1_0_packed16 data_a_tq1_16[];};
 #endif
+#ifdef B_F16Q
+// B is the f16 activation read in place (rows p.stride_b elements apart, a multiple of 32) and quantized to q8_1 blocks in the
+// load, with the q8_1 quantize shader's arithmetic (GGML_VK_HC_W8A8: no separate quantize pass over B)
+layout (binding = 1) readonly buffer B {f16vec4 data_bf[];};
+#else
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
+#endif
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef D16
 // f16 output: pairs of adjacent rows go out as one 32-bit store

@@ -7939,6 +7939,76 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// a 2-D GEMM whose B is optionally a row-padded view (the qwen4exp hc xn: f16, token stride k + pad elements), for the Vulkan
+// HC_W8A8 route (few rows, long K, opt-in): GGML_VK_TEST_REQUIRE_HC_W8A8=1 asserts it engages exactly where its gate admits the shape
+struct test_mul_mat_hcd : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int64_t m, n, k, pad;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, type_b, m, n, k, pad);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k;
+    }
+
+    test_mul_mat_hcd(ggml_type type_a, ggml_type type_b, int64_t m, int64_t n, int64_t k, int64_t pad = 0)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), pad(pad) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, k + pad, n);
+        ggml_set_name(b, "b");
+        if (pad != 0) {
+            b = ggml_view_2d(ctx, b, k, n, b->nb[1], 0);
+            ggml_set_name(b, "b_view");
+        }
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_W8A8")) {
+            return true;
+        }
+        const char * e = getenv("GGML_VK_HC_W8A8");   // opt-in
+        const bool on = e != nullptr && atoi(e) != 0;
+        const char * en = getenv("GGML_VK_HC_W8A8_MINN");
+        const int64_t min_n = en ? atoi(en) : 512;
+        const int64_t want = on && type_a == GGML_TYPE_Q8_0 && m <= 384 && k >= 4096 && k % 32 == 0 && n >= min_n &&
+                             (type_b == GGML_TYPE_F32 || type_b == GGML_TYPE_F16) ? 1 : 0;
+        const int64_t got = dispatch_census_count(backend, "path:MUL_MAT_HC_W8A8");
+        if (got != want) {
+            msg = "path:MUL_MAT_HC_W8A8 dispatches: " + std::to_string(got) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        // an f16 B whose row stride is a whole number of 32-element blocks is quantized in the GEMM's load (GGML_VK_HC_W8A8_F16Q)
+        const char * ef = getenv("GGML_VK_HC_W8A8_F16Q");
+        const int64_t want_f16q = want && type_b == GGML_TYPE_F16 && (k + pad) % 32 == 0 && (ef == nullptr || atoi(ef) != 0) ? 1 : 0;
+        const int64_t got_f16q = dispatch_census_count(backend, "path:MUL_MAT_HC_W8A8_F16Q");
+        if (got_f16q != want_f16q) {
+            msg = "path:MUL_MAT_HC_W8A8_F16Q dispatches: " + std::to_string(got_f16q) + " (expected " + std::to_string(want_f16q) + ")";
+            return false;
+        }
+        return true;
+    }
+};
+
 struct test_mul_mat_exact_batch : public test_case {
     const ggml_type type_a;
     const int64_t m;
@@ -14977,6 +15047,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_cpy16(t, 201, 33, 256)); // odd M: the unpacked f16 store
     }
     test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, 10240, 2048, 320));
+    // HC_W8A8: the qwen4exp hc down GEMM (q8_0 320 x 10240) over the ubatch widths, ragged tails on both sides of the n gate and
+    // of the tiles, the f16 padded xn the model feeds and a plain f32 B; m past the row gate and a short K stay off the route
+    for (int64_t n : {1, 2, 7, 33, 300, 511, 512, 513, 640, 1000, 1024, 1025, 1500, 2047, 2048, 2051}) {
+        test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, n, 10240, 128));
+    }
+    for (int64_t n : {512, 777, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, n, 10240));
+        test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, n, 10240));
+    }
+    test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 100, 600, 4096, 8));   // ragged rows, quantize pass
+    test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, 700, 10240, 32));  // in-load quantize, 32 pad
+    test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, 700, 10240, 8));   // quantize pass
+    test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 384, 1000, 6144, 0));
+    test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 448, 1024, 10240, 128));  // m past the gate
+    test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, 1024, 2560, 128));   // k under the gate
+    test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q4_0, GGML_TYPE_F16, 320, 1024, 10240, 128));  // other type
     // HC_UP_MIX: exact and ragged tiles, padded x rows, the Flash-Next shape (n_embd 2560, low rank 320, ub 2048) and its 2051 tail
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 64, 96, 0));
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128));
@@ -18366,6 +18452,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], 2048, mk[1], {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, 10240, 2048, 320));
+    // the hc down GEMM as the model feeds it (f16 xn, 128-element row pad), ubatch 512 / 1024 / 2048
+    for (int64_t n : {512, 1024, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, n, 10240, 128));
+    }
     // Qwen3.8-27B UD-Q4_K_XL dense GEMMs at ub2048 with the f32 B the model feeds (the dense router's f16-coopmat path converts it
     // per call; op-level numbers taken with an f16 B miss that cost)
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K,   GGML_TYPE_F32, 17408, 2048, 5120,  {1, 1}, {1, 1}));

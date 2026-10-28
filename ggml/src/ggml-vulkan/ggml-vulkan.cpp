@@ -3151,6 +3151,40 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // the f16 mixed stream (ggml_dsv4_hc_pre_gated_ext out_type F16)
             cm1_create_mmq({GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, false, false, true, false, false, false, true}, tc_mmq_cm1_int, "matmul_q8_0_q8_1_hcmix_d16",
                            matmul_q8_0_q8_1_hcmix_d16_cm1_len, matmul_q8_0_q8_1_hcmix_d16_cm1_data, sizeof(vk_mat_mat_hcmix_push_constants), 4);
+        }
+
+        // GGML_VK_HC_W8A8: the q8_0 int8 MMQ shader with tiles for a few-row, long-K GEMM (the qwen4exp hc down, 320 x 10240):
+        // the large tile launches only 3 x n/128 workgroups. Same shader, same per-block K order; only BM / BN / warps differ.
+        // RDNA3/3.5 wave32 with 16x16 int8 coopmats only (the warp layouts below assume 32-wide subgroups)
+        if (device->coopmat_int_support && rdna3 && cm1_sg == 32 && device->coopmat_int_m == 16 && device->coopmat_int_n == 16) {
+            const auto hcd_tile = [&](uint32_t bm, uint32_t bn, uint32_t wm, uint32_t wn) -> vk_tile_config {
+                std::vector<uint32_t> w = m_warptile_mmq_cm1_int;
+                w[0] = 32 * (bm / wm) * (bn / wn);
+                w[1] = bm; w[2] = bn; w[4] = wm; w[5] = wn;
+                return { w, { bm, bn, 1 }, 32 };
+            };
+            // index = GGML_VK_HC_W8A8_TILE
+            const std::vector<vk_tile_config> tc_hcd = {
+                hcd_tile( 32, 128, 32, 32),   // 0: 4 warps
+                hcd_tile( 64, 128, 32, 32),   // 1: 8 warps
+                hcd_tile( 64, 128, 64, 32),   // 2: 4 warps, 4x2 coopmats each
+                hcd_tile( 32, 256, 32, 32),   // 3: 8 warps
+                hcd_tile( 64,  64, 32, 32),   // 4: 4 warps (the medium tile)
+                hcd_tile(128, 128, 32, 32),   // 5: 16 warps (the large tile)
+                hcd_tile( 64, 128, 32, 64),   // 6: 4 warps, 2x4 coopmats each
+            };
+            vk_matmul_pipeline_key kh{GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, false, false};
+            kh.hcd = true;
+            spec_fn_t identity = [](const std::vector<uint32_t>& wt, bool) { return wt; };
+            create_mm_pipelines(kh, tc_hcd, "matmul_q8_0_q8_1_hcd", matmul_q8_0_q8_1_cm1_len, matmul_q8_0_q8_1_cm1_data,
+                                sizeof(vk_mat_mat_push_constants), 3, identity, false, false, 0, false, true);
+            // the same tiles reading an f16 B in place and quantizing it to q8_1 blocks in the load (no quantize pass)
+            vk_matmul_pipeline_key kf{GGML_TYPE_Q8_0, GGML_TYPE_F16, false, false};
+            kf.hcd = true;
+            create_mm_pipelines(kf, tc_hcd, "matmul_q8_0_f16q_hcd", matmul_q8_0_f16q_cm1_len, matmul_q8_0_f16q_cm1_data,
+                                sizeof(vk_mat_mat_push_constants), 3, identity, false, false, 0, false, true);
+        }
+
         // Exact int8 views (GGML_VK_MMQ_I8VIEWS=0 turns them off): IQ grid values and ternary trits go to the int8 MMQ as levels
         if (device->coopmat_int_support && (rdna3 || rdna4)) {
 #define CM1_MMQ_I8V(TYPE, tstr, TC) \
@@ -8047,6 +8081,48 @@ static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b
     return ggml_vk_route_match(list, t) || (b_f16 && ggml_vk_dense_f16b_native(t));
 }
 
+// GGML_VK_HC_W8A8=1 (opt-in, default 0): a q8_0 GEMM with few rows and a long K (the qwen4exp hc down, m = 320, k = 10240)
+// takes the int8 MMQ path (B quantized to q8_1) with a tile that launches enough workgroups, instead of the f16-B coopmat
+// path's 128 x 128 tile (3 x n/128 workgroups). Off by default: rounding the activation to q8_1 moves the logits by more than
+// the -ub 1024 vs 2048 difference (Flash-Next, ~1.4x it in mean KLD). Rows <= GGML_VK_HC_W8A8_MAXM (384), k >= 4096,
+// n >= GGML_VK_HC_W8A8_MINN (512). GGML_VK_HC_W8A8_TILE picks the tile (index into the pipeline list).
+static int ggml_vk_hc_w8a8_mode() {
+    static const int env = [] { const char * e = getenv("GGML_VK_HC_W8A8"); return e ? atoi(e) : 0; }();
+    return env;
+}
+
+static bool ggml_vk_hc_w8a8(const vk_device & device, ggml_type t, uint64_t m, uint64_t n, uint64_t k) {
+    static const uint64_t max_m = [] { const char * e = getenv("GGML_VK_HC_W8A8_MAXM"); return e ? (uint64_t) atoi(e) : 384u; }();
+    static const uint64_t min_n = [] { const char * e = getenv("GGML_VK_HC_W8A8_MINN"); return e ? (uint64_t) atoi(e) : 512u; }();
+    if (ggml_vk_hc_w8a8_mode() == 0 || t != GGML_TYPE_Q8_0 || m > max_m || k < 4096 || n < min_n || k % 32 != 0) {
+        return false;
+    }
+    vk_matmul_pipeline_key kh{GGML_TYPE_Q8_0, GGML_TYPE_Q8_1, false, false};
+    kh.hcd = true;
+    auto it = device->pipeline_matmul.find(kh);
+    return it != device->pipeline_matmul.end() && !it->second.empty();
+}
+
+// GGML_VK_HC_W8A8_F16Q (default 1): an f16 B (the hc xn) is quantized in the GEMM's B load instead of by a q8_1 pass over all of B
+// (same arithmetic as quantize_q8_1.comp, so the same q8_1 values); =0 keeps the pass
+static bool ggml_vk_hc_w8a8_f16q(const vk_device & device, const ggml_tensor * src1, bool rowstride) {
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_W8A8_F16Q"); return e == nullptr || atoi(e) != 0; }();
+    if (!on || src1->type != GGML_TYPE_F16 || src1->nb[0] != sizeof(ggml_fp16_t) || !(ggml_vk_dim01_contiguous(src1) || rowstride) ||
+        (src1->nb[1] / sizeof(ggml_fp16_t)) % 32 != 0 || src1->nb[1] % sizeof(ggml_fp16_t) != 0) {
+        return false;
+    }
+    vk_matmul_pipeline_key kf{GGML_TYPE_Q8_0, GGML_TYPE_F16, false, false};
+    kf.hcd = true;
+    auto it = device->pipeline_matmul.find(kf);
+    return it != device->pipeline_matmul.end() && !it->second.empty();
+}
+
+// default tile 1 (64 x 128, 8 warps: 5 x n/128 workgroups at m = 320), the fastest of the list at n = 512 / 1024 / 2048 on gfx1151
+static uint32_t ggml_vk_hc_w8a8_tile() {
+    static const int env = [] { const char * e = getenv("GGML_VK_HC_W8A8_TILE"); return e ? atoi(e) : 1; }();
+    return (uint32_t) std::max(env, 0);
+}
+
 // GGML_VK_MMID_F16COOPMAT (default "iq3_xxs,iq4_nl", the Flash-Next expert types): listed expert types leave int8 MMQ for the f16-B
 // pf tile, which carries REG_A, the f16-output expert store and MMID_B_FULL. Logged once at init ("MUL_MAT_ID f16-B route: ...").
 static const std::vector<std::string> & ggml_vk_mmid_route_list() {
@@ -8164,9 +8240,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool y_rowstride = src0->type != GGML_TYPE_BF16 && !ctx->device->coopmat2 && ggml_vk_f16_rowstride(src1);
     bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
                           (src1->type == GGML_TYPE_F32 || f16_y) && (ggml_is_contiguous(src1) || y_rowstride) && (ne11 * ne10) % 4 == 0;
+    // GGML_VK_HC_W8A8: the few-row, long-K q8_0 GEMM stays on int8 MMQ with its own tiles (one plain 2-D GEMM)
+    const bool hcd = can_quantize_y && !d16 && !hcm && !x_non_contig && ne02 * ne03 == 1 && ne12 * ne13 == 1 &&
+                     ggml_vk_hc_w8a8(ctx->device, src0->type, ne01, ne11, ne10);
+    // ... and an f16 B is read in place and quantized in the GEMM's load: no q8_1 staging of B at all
+    const bool hcd_f16q = hcd && ggml_vk_hc_w8a8_f16q(ctx->device, src1, y_rowstride) &&
+                          ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_F16, (ggml_prec) dst->op_params[0]) != nullptr;
+    if (hcd_f16q) {
+        can_quantize_y = false;
+    }
     // GGML_VK_DENSE_F16COOPMAT: listed types leave the int8 path for the f16-B KHR coopmat matmul (not for the f16-out fusion,
     // which exists on the int8 path only)
-    if (can_quantize_y && !d16 && !hcm && ggml_vk_mm_prefetch_enabled(ctx->device) &&
+    if (can_quantize_y && !d16 && !hcm && !hcd && ggml_vk_mm_prefetch_enabled(ctx->device) &&
         ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10, (uint32_t) ne11, src1->type == GGML_TYPE_F16)) {
         can_quantize_y = false;
         // engagement read: f16-B GEMMs routed by GGML_VK_DENSE_F16B_NATIVE only (not also by the GGML_VK_DENSE_F16COOPMAT list)
@@ -8207,9 +8292,21 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                          (!y_rowstride || (src1->nb[1] / sizeof(ggml_fp16_t)) % kalign == 0);
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+    // f16q: B is the f16 src1 read in place (y_kernel_type F16, no reformat), the pipeline quantizes it in its load
+    GGML_ASSERT(!hcd_f16q || (y_kernel_type == GGML_TYPE_F16 && !y_needs_reformat && !qx_needs_dequant));
+    if ((hcd_f16q || (hcd && quantize_y)) && !qx_needs_dequant) {
+        vk_matmul_pipeline_key kh{GGML_TYPE_Q8_0, hcd_f16q ? GGML_TYPE_F16 : GGML_TYPE_Q8_1, false, false};
+        kh.hcd = true;
+        const auto & hv = ctx->device->pipeline_matmul.at(kh);
+        pipeline = hv[std::min<size_t>(ggml_vk_hc_w8a8_tile(), hv.size() - 1)].unaligned;
+        ggml_vk_path_census_add("MUL_MAT_HC_W8A8");
+        if (hcd_f16q) {
+            ggml_vk_path_census_add("MUL_MAT_HC_W8A8_F16Q");
+        }
+    }
 
     // XL tier of the register-prefetch pipelines (aligned, dense, quantized A on the f16-B coopmat path only)
-    if (aligned && !quantize_y && !qx_needs_dequant && !d16 && ggml_vk_mm_prefetch_type(src0->type) &&
+    if (aligned && !quantize_y && !qx_needs_dequant && !d16 && !hcd_f16q && ggml_vk_mm_prefetch_type(src0->type) &&
         ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mm_xl_ok(ctx, src0->type, ne01, ne11, ne10)) {
         const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0]);
         vk_matmul_pipeline_key kx{src0->type, y_kernel_type, false, f16acc, false, false, true, true};
@@ -8454,11 +8551,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ggml_vk_matmul_hcmix(ctx, subctx, pipeline, { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range }, *hcmix,
                              ne01, ne11, ne10, ne10, stride_b, stride_batch_x, stride_batch_y, padded_n);
     } else {
+        // GGML_VK_HC_W8A8_TEST_BREAK=1 (tests only, the negative control): the hc GEMM skips its last 32-K block
+        static const bool hcd_break = [] { const char * e = getenv("GGML_VK_HC_W8A8_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+        const uint64_t k_run = (hcd && hcd_break) ? ne10 - 32 : ne10;
         ggml_vk_matmul(
             ctx, subctx, pipeline,
             { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
             ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
-            ne01, ne11, ne10,
+            ne01, ne11, k_run,
             ne10, stride_b, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
             split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
             b_col_bytes, (uint64_t)od->nb[1]
