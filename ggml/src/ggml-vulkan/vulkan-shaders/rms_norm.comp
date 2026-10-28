@@ -159,6 +159,9 @@ void rms_norm(uint num_iters) {
                     rope_neox(t, row, channel, samp, rp);
                 } else if (rp.rope_mode == GGML_ROPE_TYPE_NORMAL) {
                     rope_norm(t, row, channel, samp, rp);
+                } else {
+                    // M-RoPE / interleaved M-RoPE (rope_multi.comp); the host admits no other mode
+                    rope_multi(t, row, channel, samp, rp);
                 }
             }
 #endif
