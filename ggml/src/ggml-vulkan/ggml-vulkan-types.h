@@ -1139,6 +1139,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_mmv_id_rp_q4k, pipeline_mmv_id_rp_q5k, pipeline_mmv_id_rp_q51;
     vk_pipeline pipeline_mmv_id_rp_q4k_q8, pipeline_mmv_id_rp_q5k_q8, pipeline_mmv_id_rp_q51_q8;
     vk_pipeline pipeline_expert_unrepack;
+    vk_pipeline pipeline_expert_repack;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];

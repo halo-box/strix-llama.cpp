@@ -1033,6 +1033,7 @@ void process_shaders() {
     string_to_spv("mul_mat_vec_id_q5_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_K", "1"}, {"B_Q8_1", "1"}});
 #endif
     string_to_spv("expert_unrepack", "expert_unrepack.comp", {});
+    string_to_spv("expert_repack", "expert_repack.comp", {});
     // RDNA3 fragment layout probe (ggml_vk_check_coopmat_rdna3_layout): gates the manual-fragment "_mf" MUL_MAT_ID pipelines
     string_to_spv("coopmat_layout_check", "coopmat_layout_check.comp", {});
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});

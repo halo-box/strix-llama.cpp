@@ -1881,7 +1881,18 @@ bool llama_model_loader::load_all_data(
             return nullptr;
         }
 
-        if (buft != ggml_backend_dev_buffer_type(dev)) {
+        // the device's default buffer type, or one of its extra (non-host) buffer types: their tensors are written by the same
+        // backend's set_tensor_async (e.g. the Vulkan expert repack buffer, which reorders each chunk on the GPU)
+        bool buft_ok = buft == ggml_backend_dev_buffer_type(dev);
+        if (!buft_ok && !ggml_backend_buft_is_host(buft)) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto get_extra_bufts = reg ? (ggml_backend_dev_get_extra_bufts_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+            for (ggml_backend_buffer_type_t * extra = get_extra_bufts ? get_extra_bufts(dev) : nullptr; extra && *extra; ++extra) {
+                buft_ok = buft_ok || *extra == buft;
+            }
+        }
+        if (!buft_ok) {
             LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
                 ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
             return nullptr;
