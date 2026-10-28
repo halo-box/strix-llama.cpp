@@ -7,6 +7,7 @@
 #include "llama-ple-async.h"
 
 #include <algorithm>
+#include <cstring>
 #include <numeric>
 #include <mutex>
 #include <thread>
@@ -614,6 +615,22 @@ static int64_t qwen4exp_hc_xn_pad() {
     return pad;
 }
 
+// LLAMA_HC_MIX_PAD=N (f16 elements, multiple of 8, 0 = off): the f16 mixed stream's token stride n_embd + N. Its readers are
+// GEMMs taking it in place as B (Flash-Next: 2560 x 2 = 5120 B = 20 x 256 B, every row start on 4 of 16 DRAM channels). Unset:
+// 128 for layers on a Vulkan device, whose hc up epilogue stores the padded rows directly (Flash-Next prefill +1.8%), 0 elsewhere
+// (the copy would be a pass of its own there, unmeasured)
+static int64_t qwen4exp_hc_mix_pad(const llama_model & model, int il) {
+    static const char * env = getenv("LLAMA_HC_MIX_PAD");
+    if (env != nullptr) {
+        static const int64_t pad = qwen4exp_env_pad("LLAMA_HC_MIX_PAD");
+        return pad;
+    }
+    // a layer past the main stack (the MTP head) sits with the output
+    ggml_backend_dev_t dev = il < 0 ? nullptr : il < (int) model.hparams.n_layer() ? model.dev_layer(il) : model.dev_output();
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0 ? 128 : 0;
+}
+
 // the f16 mixed stream needs an f16 B on every reader; Vulkan has no bf16 x f16 matmul, so a bf16 matmul weight keeps it f32
 static bool qwen4exp_has_bf16_matmul_weight(const llama_model & model) {
     // the graph's model is the qwen4exp one; the count lives on it, so a freed and reallocated model is counted anew
@@ -803,6 +820,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         static const bool mix_f16_on = [] { const char * e = getenv("LLAMA_HC_MIX_F16"); return e == nullptr || atoi(e) != 0; }();
         static const int64_t mix_f16_minn = [] { const char * e = getenv("LLAMA_HC_MIX_F16_MINN"); return e ? (int64_t) atoi(e) : (int64_t) 0; }();
         const ggml_type mix_type = (mix_f16_on && norm_f16 && nt >= mix_f16_minn && !qwen4exp_has_bf16_matmul_weight(model)) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        // padded f16 rows: the destination's VIEW node goes in ahead of the hc up chain (as for xn), so the GEMM, RESHAPE, HC pre
+        // and the CPY stay consecutive; one buffer per graph, this mix's readers precede the next mix through the residual stream
+        ggml_tensor * mix_dst = nullptr;
+        const int64_t mix_pad = mix_type == GGML_TYPE_F16 ? qwen4exp_hc_mix_pad(model, il) : 0;
+        if (mix_pad > 0) {
+            ggml_tensor * buf = pad_buf(&hc_mix_pad_buf, n_embd + mix_pad, nt, "hc_mix_pad");
+            mix_dst = ggml_view_2d(ctx0, buf, n_embd, nt, buf->nb[1], 0);
+            ggml_build_forward_expand(gf, mix_dst);
+        }
         mixed = ggml_dsv4_hc_pre_gated_ext(ctx0,
                 xn_padded ? ggml_view_3d(ctx0, xn, n_embd, hc, nt, n_embd * ggml_element_size(xn), xn->nb[1], 0)
                           : ggml_reshape_3d(ctx0, xn, n_embd, hc, nt),
@@ -813,6 +839,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         }
         if (gate_f16) {
             res->add_fused_node({LLM_FUSED_OP_DSV4_HC_GATE_F16, mixed, il});
+        }
+        if (mix_dst) {
+            mixed = ggml_cpy(ctx0, mixed, mix_dst);
         }
     } else {
         ggml_tensor * gated = ggml_mul(ctx0, xn, ggml_sigmoid(ctx0, gate));

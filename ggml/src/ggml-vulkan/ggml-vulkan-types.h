@@ -1387,6 +1387,7 @@ struct ggml_backend_vk_context {
     // MUL_MAT+CPY(f16): the matmul stores f16 into the cast's destination
     bool fused_mm_cpy16 {};
     bool fused_hc_up_mix {};   // MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) -> one int8 MMQ GEMM with the mix epilogue
+    bool fused_hc_up_mix_cpy {};   // ... + CPY of the mixed stream into its row-padded destination (LLAMA_HC_MIX_PAD), stored there
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
