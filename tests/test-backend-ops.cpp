@@ -7459,10 +7459,19 @@ struct test_gdn_conv_prefill : public test_case {
     const bool extra_reader; // a second reader of the SiLU output: the conv must run, so the conv fold has to decline
     const int  x_tail;       // x holds x_tail more tokens after the n_tokens the conv reads (one sequence): the first part
                              // of a conv split at a recurrent state snapshot, whose x is a prefix view of the projection
-    test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads, int n_seqs = 1, bool extra_reader = false, int x_tail = 0)
-        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads), n_seqs(n_seqs), extra_reader(extra_reader), x_tail(x_tail) {}
-    std::string op_desc(ggml_tensor *) override { return "GDN_CONV_PREFILL"; }
+    // the qwen4exp f16 output norm chain after the GDN (GDN_OUT_NORM_PREFILL): 1 z an input, 2 z from a q8_0 projection (the
+    // GGML_VK_GDN_Z16 candidate), 3 as 1 plus a second reader of the GDN output (the fold has to decline)
+    const int out_norm;
+    std::vector<ggml_tensor *> verify;
+    test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads, int n_seqs = 1, bool extra_reader = false, int x_tail = 0,
+                          int out_norm = 0)
+        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads), n_seqs(n_seqs), extra_reader(extra_reader), x_tail(x_tail),
+          out_norm(out_norm) {}
+    std::string op_desc(ggml_tensor *) override { return out_norm ? "GDN_OUT_NORM_PREFILL" : "GDN_CONV_PREFILL"; }
     std::string vars() override {
+        if (out_norm) {
+            return VARS_TO_STR5(n_tokens, n_k_heads, n_v_heads, n_seqs, out_norm);
+        }
         if (x_tail > 0) {
             return VARS_TO_STR4(n_tokens, n_k_heads, n_v_heads, x_tail);
         }
@@ -7471,6 +7480,7 @@ struct test_gdn_conv_prefill : public test_case {
         }
         return VARS_TO_STR5(n_tokens, n_k_heads, n_v_heads, n_seqs, extra_reader);
     }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
     // GGML_VK_TEST_REQUIRE_GDN_QKNORM=1: the chunked GDN (>= 64 tokens) normalises q / k itself and the norm nodes do not run;
     // GGML_VK_GDN_QKNORM=0 under the assert is the negative control.
     // GGML_VK_TEST_REQUIRE_GDN_CONVFOLD=1: it also computes the conv + SiLU on load and the SSM_CONV / SILU nodes do not run
@@ -7504,6 +7514,24 @@ struct test_gdn_conv_prefill : public test_case {
             if (nd != want_d) {
                 msg = "GDN_CONV_DIRECT dispatches: " + std::to_string(nd) + " (expected " + std::to_string(want_d) + ")";
                 return false;
+            }
+        }
+        // GGML_VK_TEST_REQUIRE_GDN_OUTNORM=1: with GGML_VK_GDN_OUTNORM=1 the chunked GDN applies the output norm chain in its store
+        // (not with a second reader of its output or under 64 tokens; count 0 without the opt-in); with GGML_VK_GDN_Z16=1 the q8_0
+        // z projection stores f16
+        if (out_norm && engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_OUTNORM")) {
+            const char * z16e = getenv("GGML_VK_GDN_Z16");
+            const bool on = chunk && out_norm != 3 && env_opt_in("GGML_VK_GDN_OUTNORM");
+            const struct { const char * key; int64_t want; } checks[] = {
+                { "path:GDN_OUT_NORM", on ? 1 : 0 },
+                { "path:GDN_Z16", on && out_norm == 2 && z16e != nullptr && atoi(z16e) != 0 ? 1 : 0 },
+            };
+            for (const auto & c : checks) {
+                const int64_t n = dispatch_census_count(backend, c.key);
+                if (n != c.want) {
+                    msg = std::string(c.key) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(c.want) + ")";
+                    return false;
+                }
             }
         }
         return true;
@@ -7571,6 +7599,45 @@ struct test_gdn_conv_prefill : public test_case {
         ggml_set_name(beta, "beta");
         ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, n_v_heads, S);
         ggml_set_name(state, "state");
+        verify.clear();
+        if (out_norm) {
+            // z as the model has it: a reshape of a flat projection computed ahead of the GDN
+            ggml_tensor * z = nullptr;
+            if (out_norm == 2) {
+                ggml_tensor * wz = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 256, 128 * n_v_heads);
+                ggml_set_name(wz, "wz");
+                ggml_tensor * zin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, (int64_t) n_tokens * S);
+                ggml_set_name(zin, "zin");
+                z = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, wz, zin), 128, n_v_heads, n_tokens, S);
+            } else {
+                z = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, n_v_heads, n_tokens, S);
+                ggml_set_name(z, "z");
+            }
+            if (gf) ggml_build_forward_expand(gf, z);
+            ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+            const int64_t n_out = 128 * (int64_t) n_v_heads * n_tokens * S;
+            ggml_tensor * o = ggml_view_4d(ctx, gdn, 128, n_v_heads, n_tokens, S, 128 * sizeof(float),
+                                           (size_t) 128 * n_v_heads * sizeof(float), (size_t) 128 * n_v_heads * n_tokens * sizeof(float), 0);
+            // the new state, read like the recurrent cache copy reads it
+            ggml_tensor * st = ggml_scale(ctx, ggml_view_1d(ctx, gdn, 128 * 128 * (int64_t) n_v_heads * S, n_out * sizeof(float)), 1.0f);
+            if (gf) ggml_build_forward_expand(gf, st);
+            verify.push_back(st);
+            if (out_norm == 3) {
+                ggml_tensor * ex = ggml_scale(ctx, o, 2.0f);
+                if (gf) ggml_build_forward_expand(gf, ex);
+                verify.push_back(ex);
+            }
+            // an independent allocation between the GDN and the chain
+            ggml_tensor * mid = ggml_scale(ctx, x_src, 0.125f);
+            if (gf) ggml_build_forward_expand(gf, mid);
+            verify.push_back(mid);
+            ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+            ggml_set_name(gamma, "gamma");
+            ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, o, 1e-6f), gamma);
+            ggml_tensor * res = ggml_cast(ctx, ggml_mul(ctx, normed, ggml_sigmoid(ctx, z)), GGML_TYPE_F16);
+            verify.push_back(res);
+            return res;
+        }
         ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
         if (x_rest != nullptr) {
             // read the rest of x after the GDN, as the second conv part does; folded into the output with weight 0
@@ -19004,6 +19071,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_conv_prefill(2044, 16, 48, 1, false, 4));
     test_cases.emplace_back(new test_gdn_conv_prefill(329, 16, 48, 1, false, 4));
     test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 4, 1, false, 100));
+    // the gated output norm in the chunk scan store (GDN_OUT_NORM_PREFILL): ragged and one-token last chunks, a chunk multiple,
+    // two sequences, value heads under and over the conv fold's 32, the Flash-Next shape, under 64 tokens (no fold), a z
+    // projection (the GGML_VK_GDN_Z16 candidate) and the negative control (a second reader of the GDN output: no fold)
+    for (int on : { 1, 2 }) {
+        test_cases.emplace_back(new test_gdn_conv_prefill(100, 2, 4, 1, false, 0, on));
+        test_cases.emplace_back(new test_gdn_conv_prefill(65, 2, 4, 1, false, 0, on));
+        test_cases.emplace_back(new test_gdn_conv_prefill(128, 2, 6, 1, false, 0, on));
+        test_cases.emplace_back(new test_gdn_conv_prefill(96, 2, 4, 2, false, 0, on));
+        test_cases.emplace_back(new test_gdn_conv_prefill(64, 2, 4, 2, false, 0, on));
+        test_cases.emplace_back(new test_gdn_conv_prefill(256, 16, 16, 1, false, 0, on));
+        test_cases.emplace_back(new test_gdn_conv_prefill(128, 4, 16, 2, false, 0, on));
+        test_cases.emplace_back(new test_gdn_conv_prefill(333, 16, 48, 1, false, 0, on));
+        test_cases.emplace_back(new test_gdn_conv_prefill(2048, 16, 48, 1, false, 0, on));
+        test_cases.emplace_back(new test_gdn_conv_prefill(48, 2, 4, 1, false, 0, on));
+    }
+    test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 4, 1, false, 0, 3));
+    test_cases.emplace_back(new test_gdn_conv_prefill(2048, 16, 48, 1, false, 0, 3));
     // Multiple sequences must remain on the generic fallback.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));

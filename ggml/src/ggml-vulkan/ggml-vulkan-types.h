@@ -1092,6 +1092,7 @@ struct vk_device_struct {
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
     vk_pipeline pipeline_gdn_chunk_prep, pipeline_gdn_chunk_scan;   // chunked prefill form (GGML_VK_GDN_CHUNK)
+    vk_pipeline pipeline_gdn_chunk_scan_on;   // the scan with the gated output norm in its store (GGML_VK_GDN_OUTNORM), 8 waves per head
     vk_pipeline pipeline_coopmat_layout_check[2];  // wave32, wave64: RDNA3/RADV fragment layout probe (ggml_vk_check_coopmat_rdna3_layout)
     bool coopmat_rdna3_layout {};                   // the probe passed: the manual-fragment "_mf" and REG_A MUL_MAT_ID pipelines may be used
     uint32_t gdn_chunk_scan_nsplit = 1;   // scan workgroups per value head
@@ -1585,6 +1586,12 @@ struct ggml_backend_vk_context {
     struct gdn_conv_fold { const ggml_tensor * x; const ggml_tensor * state; const ggml_tensor * kern; uint32_t C, qc0, kc0, vc0; };
     std::unordered_map<const ggml_tensor *, gdn_conv_fold> gdn_cf;
     bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
+    // chunked GDN with the gated output norm in the scan store (ggml_vk_gdn_out_norm_prepass, GGML_VK_GDN_OUTNORM): gamma, z,
+    // the f16 destination (the chain's CPY), eps, and whether z is stored as f16 by its GEMM (GGML_VK_GDN_Z16); the chain's
+    // nodes go into gdn_qk_skip, the z GEMMs that store f16 into gdn_z16
+    struct gdn_out_norm { const ggml_tensor * gamma; const ggml_tensor * z; const ggml_tensor * out; float eps; bool z16; };
+    std::unordered_map<const ggml_tensor *, gdn_out_norm> gdn_on;
+    std::unordered_set<const ggml_tensor *> gdn_z16;
     int fused_hc_moe_epi {};   // HC_MOE_EPI: number of ADD nodes (routed slot adds + the shared-expert add) in front of the HC post norm chain
     bool fused_fa_out_gate {};  // FLASH_ATTN_EXT+RESHAPE+VIEW+CONT+SIGMOID+MUL: the attention output gate after FA
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

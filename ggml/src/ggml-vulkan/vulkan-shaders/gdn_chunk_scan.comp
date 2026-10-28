@@ -7,6 +7,9 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#ifdef OUT_NORM
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
 
 // Chunked gated delta net, part 2 of 2: sequential over chunks of CL tokens, after gdn_chunk_prep.comp.
 // The v columns of the state S (k x v) evolve independently: every wave32 owns 16 columns of one value head,
@@ -21,6 +24,12 @@
 // 384 waves at the Flash-Next shape). Staging K, K^T, T, P and the gate factors in LDS per workgroup measured
 // equal in-model, 6% slower op-level and 1.5x slower at 4 heads. Operands f16, accumulation f32: not
 // bit-identical to the sequential kernel. Idea from halo-box/strix-llama.cpp#91 (Gaetan Puleo).
+//
+// OUT_NORM (gdn_chunk_scan_on, one 8-wave workgroup per head): the gated output norm of the head rows is applied in the store,
+// rms_norm(o) * gamma * sigmoid(z) written as f16 (the RMS_NORM_MUL_SIGMUL_CPY chain), and the f32 o is never written. A
+// chunk's o tile goes through shared memory; each wave then normalises 4 of its 32 rows. The row sum reproduces
+// rms_norm_small.comp at subgroup size 64 (virtual lane L sums columns L and L + 64, then a 64-lane reduction) and the
+// store its expressions (same order, same XOR before the f16 conversion), to match the unfused chain.
 
 layout(constant_id = 0) const uint WGT = 128;        // NW waves of 32
 const uint NW = WGT / 32;
@@ -52,6 +61,10 @@ layout(push_constant) uniform Parameters {
     uint conv_fold;   // binding 0 is the conv input x: v = silu(conv4(x)) of channel vc0 + the view offset (gdn_chunk_prep.comp)
     uint qc0, kc0, vc0;
     uint conv_C;
+    uint out_norm;    // OUT_NORM: bit 0 on, bit 1 z is f16 (binding 7) instead of f32 (binding 6)
+    float on_eps;
+    uint on_zs2, on_zs3;
+    uint on_os2, on_os3;
 };
 
 layout(binding = 0) readonly  buffer VBuf     { float data_v[];     };
@@ -60,6 +73,17 @@ layout(binding = 2)           buffer DstBuf   { float data_dst[];   };
 layout(binding = 3) readonly  buffer ScrBuf   { uvec4 scr4[];       };
 layout(binding = 4) readonly  buffer CStBuf   { float data_cst[];   };
 layout(binding = 5) readonly  buffer CWBuf    { float data_cw[];    };
+#ifdef OUT_NORM
+layout(binding = 6) readonly  buffer ZBuf     { vec4  data_z4[];    };
+layout(binding = 7) readonly  buffer ZhBuf    { uvec2 data_zh4[];   };
+layout(binding = 8) readonly  buffer WBuf     { vec4  data_w4[];    };
+layout(binding = 9) writeonly buffer OBuf     { uvec2 data_o4[];    };
+
+#define OST (S_V + 4)
+// one chunk's o tile, 16.5 KB, so two workgroups fit in a CU's 64 KB
+shared float o_sh[CL * OST];
+#define NR 4                       // rows per wave in the norm stage: the host creates this variant with 8 waves (WGT 256)
+#endif
 
 // silu(conv4) of channel c at token tt of sequence s, x element at xo: ssm_conv.comp MODE 1's expressions (bit-identical)
 // the same for tt >= 3 (every chunk after the first): all four rows are tokens, no conv-state branch. The per-element branch
@@ -137,6 +161,22 @@ float conv_silu_v(const uint xo, const uint c, const uint tt, const uint s, cons
         b[4 * m_ + 3] = od_.y; \
     } }
 
+#ifdef OUT_NORM
+// z of row tt (clamped: rows past n_tokens are never stored), this lane's 4 columns. Loaded in the norm stage: issued at the
+// chunk start (with the V rows) the loads sit in front of the scratch loads in the in-order load counter, and the scan took
+// ~5% longer in-model.
+vec4 load_z(const uint tt) {
+    const uint t = min(tt, n_tokens - 1);
+    const uint col4 = (gl_WorkGroupID.x) * (S_V / 4) + gl_SubgroupInvocationID;
+    const uint zb = gl_WorkGroupID.y * on_zs3 + t * on_zs2;
+    if ((out_norm & 2) != 0) {
+        const uvec2 u = data_zh4[zb / 4 + col4];
+        return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y));
+    }
+    return data_z4[zb / 4 + col4];
+}
+#endif
+
 void main() {
     const uint lane  = gl_SubgroupInvocationID;
     const uint lr    = lane % 16;
@@ -162,6 +202,15 @@ void main() {
     // scratch is chunk-major (all heads of a chunk adjacent), see gdn_chunk_prep.comp
     const uint qk_base4   = (seq * nch * neq1 + iq1) * (QKU / 4);
     const uint tp_base4   = (n_seqs * nch * neq1 * QKU + (seq * nch * H + h) * TPU) / 4;
+
+#ifdef OUT_NORM
+    // norm stage: this lane's 4 columns 4 lane .. +3 of rows NR wave .. +NR-1 (z: load_z)
+    const vec4 on_w = data_w4[lane];
+    const uint on_col4 = h * (S_V / 4) + lane;
+    const uint on_oseq = seq * on_os3;
+    // XOR with a runtime zero before the f16 conversion, as rms_norm_small.comp: keeps the last multiply in f32
+    const uint on_zero = out_norm & 0x10000u;
+#endif
 
     ACC S[KT];
     [[unroll]] for (uint kt = 0; kt < KT; kt++) {
@@ -225,6 +274,10 @@ void main() {
             TO_B(RB[j], r);
         }
 
+#ifdef OUT_NORM
+        // every wave has finished the previous chunk's norm stage before o_sh is written again
+        barrier();
+#endif
         MATB DB[NT];
         [[unroll]] for (uint j = 0; j < NT; j++) {
             // Delta_j = sum_{i <= j} T_ji R_i
@@ -259,6 +312,11 @@ void main() {
                 LOAD_A(a, A_P, TFRAG(j, i));
                 o = coopMatMulAdd(a, DB[i], o);
             }
+#ifdef OUT_NORM
+            [[unroll]] for (uint i = 0; i < 8; i++) {
+                o_sh[(16 * j + AROW(i)) * OST + v0 + lr] = o[i];
+            }
+#else
             if (t0 + CL <= n_tokens) {
                 [[unroll]] for (uint i = 0; i < 8; i++) {
                     data_dst[o_lane + (t0 + 16 * j + 2 * i) * (S_V * H)] = o[i];
@@ -270,7 +328,41 @@ void main() {
                     }
                 }
             }
+#endif
         }
+#ifdef OUT_NORM
+        memoryBarrierShared();
+        barrier();
+        [[unroll]] for (uint r = 0; r < NR; r++) {
+            const uint row = gl_SubgroupID * NR + r;
+            const uint ob  = row * OST;
+            const vec4 zr = load_z(t0 + row);
+            // rms_norm_small.comp at subgroup size 64: virtual lane L = lane (columns lane, lane + 64) and L = lane + 32
+            // (columns lane + 32, lane + 96); the 64-lane sum is the two 32-lane halves added
+            float s_lo = 0.0f;
+            float s_hi = 0.0f;
+            [[unroll]] for (uint k = 0; k < 2; k++) {
+                const float xa = o_sh[ob + lane + 64 * k];
+                s_lo += xa * xa;
+                const float xb = o_sh[ob + lane + 32 + 64 * k];
+                s_hi += xb * xb;
+            }
+            const float sum   = subgroupAdd(s_lo) + subgroupAdd(s_hi);
+            const float mean  = sum / float(S_V);
+            const float scale = inversesqrt(mean + on_eps);
+            const vec4 xo = vec4(o_sh[ob + 4 * lane], o_sh[ob + 4 * lane + 1], o_sh[ob + 4 * lane + 2], o_sh[ob + 4 * lane + 3]);
+            vec4 res;
+            [[unroll]] for (uint e = 0; e < 4; e++) {
+                const float y = scale * xo[e] * on_w[e];
+                const float cz = 1.0f / (1.0f + exp(-zr[e]));
+                res[e] = uintBitsToFloat(floatBitsToUint(y * cz) ^ on_zero);
+            }
+            const uint t = t0 + row;
+            if (t < n_tokens) {
+                data_o4[(on_oseq + t * on_os2) / 4 + on_col4] = uvec2(packFloat2x16(f16vec2(res.xy)), packFloat2x16(f16vec2(res.zw)));
+            }
+        }
+#endif
     }
 
     [[unroll]] for (uint kt = 0; kt < KT; kt++) {
