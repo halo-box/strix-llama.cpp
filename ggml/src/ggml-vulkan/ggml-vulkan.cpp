@@ -1916,19 +1916,17 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
 
 // HC_CMB: the prefill HC combine kernels (the attention-side HC post norm + inject, and the MoE epilogue + combine + norm + inject)
 // load every residual row of the token, and the routed slots in batches, before their first store / sum, instead of one round
-// trip per stream and per slot. Same values and arithmetic: bit-identical. Opt-in (GGML_VK_HC_CMB=1): -4% per call on both
-// kernels in Flash-Next prefill, ~6 ms per 2048-token ubatch, under the bar set for a default change.
+// trip per stream and per slot. Same values and arithmetic: bit-identical. GGML_VK_HC_CMB=0 builds the old load order.
 static bool ggml_vk_hc_cmb_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_VK_HC_CMB"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_CMB"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 
 // HC_DEFER: the attention-side HC combine of a qwen4exp prefill layer does not store its output when the only other reader is the
 // FFN-side MoE epilogue combine, which recomputes it from the same inputs with the same expression (a deferred residual update):
-// one 4 x n_embd f32 store per layer and token less, one n_embd f32 read more. Bit-identical. Opt-in (GGML_VK_HC_DEFER=1): on
-// Flash-Next prefill (ubatch 2048) the attention-side combine is ~35% faster per call, the MoE epilogue 3-10% slower.
+// one 4 x n_embd f32 store per layer and token less, one n_embd f32 read more. Bit-identical. GGML_VK_HC_DEFER=0 disables.
 static bool ggml_vk_hc_defer_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_VK_HC_DEFER"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_DEFER"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 

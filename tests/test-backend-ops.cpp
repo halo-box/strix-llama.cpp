@@ -4586,15 +4586,15 @@ struct test_hc_layer : public test_hc_moe_epi {
     std::string op_desc(ggml_tensor *) override { return "HC_LAYER"; }
     std::string vars() override { return VARS_TO_STR4(embd, tokens, n_used, exact); }
 
-    // GGML_VK_TEST_REQUIRE_HC_DEFER=1: with GGML_VK_HC_DEFER=1 one deferred combine per graph (the exact twin's first combine is an
-    // output: never deferred), taken by the MoE epilogue at 32+ tokens; below that the MoE epilogue is unfused and the combine is
+    // GGML_VK_TEST_REQUIRE_HC_DEFER=1: one deferred combine per graph unless GGML_VK_HC_DEFER=0 (the exact twin's first combine is
+    // an output: never deferred), taken by the MoE epilogue at 32+ tokens; below that the MoE epilogue is unfused and the combine is
     // stored on first read
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_DEFER")) {
             return true;
         }
-        const bool on = env_opt_in("GGML_VK_HC_DEFER");
+        const bool on = env_knob_on("GGML_VK_HC_DEFER");
         const int64_t n_def = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_DEFER"));
         const int64_t n_moe = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_DEFER_MOE"));
         const int64_t n_mat = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_DEFER_MAT"));

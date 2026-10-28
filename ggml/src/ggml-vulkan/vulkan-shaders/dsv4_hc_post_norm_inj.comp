@@ -19,7 +19,7 @@
 // misalignment on every operand.
 
 layout(constant_id = 0) const uint HAS_POST = 1;
-// LOADS_FIRST (GGML_VK_HC_CMB=1, opt-in): every residual row and post weight of the token is loaded before the first store, so
+// LOADS_FIRST (GGML_VK_HC_CMB, default on): every residual row and post weight of the token is loaded before the first store, so
 // the four streams' loads are in flight together instead of one stream per round trip (the stores to res_out could alias the
 // residual reads as far as the compiler knows). Same values, same arithmetic and order: bit-identical.
 layout(constant_id = 1) const uint LOADS_FIRST = 0;
