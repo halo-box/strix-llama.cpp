@@ -2009,7 +2009,8 @@ static bool ggml_vk_expert_repack_enabled() {
 // negative controls (tests only), GGML_VK_EXPERT_REPACK_NEGCTL: 1 stores each row pair of a block swapped on upload and does not
 // undo it on readback (the round trip must fail); 2 swaps on upload and undoes it on readback (the round trip holds, but the host
 // order no longer matches the kernels', so every repacked compute case must fail); 3 corrupts one byte of the first chunk of
-// each write in the GGML_VK_EXPERT_REPACK_GPU_LOAD_TEST path (the GPU reorder runs; the round trip must fail)
+// each write that the GPU reorders in the synchronous path or the GGML_VK_EXPERT_REPACK_GPU_LOAD_TEST path (the round trip
+// must fail)
 static int ggml_vk_expert_repack_negctl() {
     static const int v = [] { const char * e = getenv("GGML_VK_EXPERT_REPACK_NEGCTL"); return e != nullptr ? atoi(e) : 0; }();
     return v;
@@ -18567,6 +18568,12 @@ static size_t ggml_vk_repack_gpu_load_test_chunk() {
     return v;
 }
 static void ggml_vk_repack_write_gpu_test(const vk_device & dev, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size);
+// test only: GGML_VK_EXPERT_REPACK_GPU_LOAD_TEST_SYNC=1 sends those pinned chunks through the synchronous set path instead
+static bool ggml_vk_repack_gpu_load_test_sync() {
+    static const bool v = [] { const char * e = getenv("GGML_VK_EXPERT_REPACK_GPU_LOAD_TEST_SYNC"); return e != nullptr && atoi(e) != 0; }();
+    return v;
+}
+static bool ggml_vk_repack_write_gpu_sync(const vk_device & dev, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size);
 
 void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_set_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
@@ -18583,7 +18590,11 @@ void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor
             ggml_vk_repack_write_gpu_test(buf->device, tensor, R, data, offset, size);
             return;
         }
+        if (ggml_vk_repack_write_gpu_sync(buf->device, tensor, R, data, offset, size)) {
+            return;
+        }
         ggml_vk_repack_write(buf, tensor, R, data, offset, size);
+        ggml_vk_path_census_add("EXPERT_REPACK/SET_SYNC_HOST");
         return;
     }
 
@@ -18830,15 +18841,20 @@ static bool ggml_vk_expert_repack_gpu_load_enabled() {
     return on;
 }
 
-// queue the repacked write of canonical bytes [offset, offset + size) of t from pinned host memory (the loader's staging chunks):
+// whether the GPU reorder can take a write of canonical bytes [offset, offset + size) into repacked tensor t (source alignment
+// aside): the pipeline exists, the range and rows are in 16-byte units, and no host-order negative control is set
+static bool ggml_vk_repack_gpu_ok(const vk_device & dev, const ggml_tensor * t, size_t offset, size_t size) {
+    return ggml_vk_expert_repack_negctl() != 1 && ggml_vk_expert_repack_negctl() != 2 && dev->pipeline_expert_repack &&
+           offset % 16 == 0 && size % 16 == 0 && t->nb[1] % 16 == 0;
+}
+
+// queue the repacked write of canonical bytes [offset, offset + size) of t from pinned host memory (staging chunks):
 // expert_repack.comp writes each unit to its repacked place, so a chunk may start or end inside a block. Returns false (nothing
 // queued) when the chunk is not in pinned memory or not 16-byte aligned; the caller then takes the host path.
-static bool ggml_vk_repack_write_async(ggml_backend_t backend, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size) {
+static bool ggml_vk_repack_dispatch(ggml_backend_t backend, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     const vk_device & dev = ctx->device;
-    if (!ggml_vk_expert_repack_gpu_load_enabled() || ggml_vk_expert_repack_negctl() == 1 || ggml_vk_expert_repack_negctl() == 2 ||
-        !dev->pipeline_expert_repack ||
-        offset % 16 != 0 || size % 16 != 0 || t->nb[1] % 16 != 0) {
+    if (!ggml_vk_repack_gpu_ok(dev, t, offset, size)) {
         return false;
     }
     vk_buffer src_buf = nullptr;
@@ -18876,11 +18892,19 @@ static bool ggml_vk_repack_write_async(ggml_backend_t backend, ggml_tensor * t, 
     const vk_subbuffer src = { src_buf, src_desc, src_buf_offset - src_desc + size };
     const vk_subbuffer dst = { buf_ctx->dev_buffer, dst_desc, dst_tensor_offset - dst_desc + nbytes };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src, dst }, pc, { (uint32_t) std::min<size_t>(n, 65535u * 256u), 1, 1 });
+    return true;
+}
+
+// the loader's async uploads (GGML_VK_EXPERT_REPACK_GPU_LOAD)
+static bool ggml_vk_repack_write_async(ggml_backend_t backend, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size) {
+    if (!ggml_vk_expert_repack_gpu_load_enabled() || !ggml_vk_repack_dispatch(backend, t, R, data, offset, size)) {
+        return false;
+    }
     static std::atomic<bool> logged { false };
     if (!logged.exchange(true)) {
         GGML_LOG_INFO("ggml_vulkan: expert repack: async uploads reordered on the GPU (GGML_VK_EXPERT_REPACK_GPU_LOAD=0 disables)\n");
     }
-    if (offset + size == nbytes) {
+    if (offset + size == ggml_nbytes(t)) {
         ggml_vk_path_census_add("EXPERT_REPACK/SET");
         ggml_vk_path_census_add("EXPERT_REPACK/SET_GPU");
     }
@@ -18898,10 +18922,16 @@ static void ggml_vk_repack_write_gpu_test(const vk_device & dev, ggml_tensor * t
     for (size_t done = 0; done < size; ) {
         const size_t n = std::min(chunk, size - done);
         memcpy(stage, (const uint8_t *) data + done, n);
-        if (ggml_vk_expert_repack_negctl() == 3 && done == 0) {
+        if (ggml_vk_expert_repack_negctl() == 3 && done == 0 && !ggml_vk_repack_gpu_load_test_sync()) {
             stage[0] ^= 0x5a;  // negative control: one corrupted byte per tensor write must make the case fail
         }
-        if (ggml_vk_repack_write_async(be, t, R, stage, offset + done, n)) {
+        if (ggml_vk_repack_gpu_load_test_sync()) {
+            // the synchronous path from a pinned source, as a loader that stages mapped weights through a pinned buffer calls it
+            if (!ggml_vk_repack_write_gpu_sync(dev, t, R, stage, offset + done, n)) {
+                ggml_vk_repack_write(buf, t, R, stage, offset + done, n);
+                n_host++;
+            }
+        } else if (ggml_vk_repack_write_async(be, t, R, stage, offset + done, n)) {
             n_gpu++;
         } else {
             ggml_backend_vk_synchronize(be);
@@ -18917,6 +18947,121 @@ static void ggml_vk_repack_write_gpu_test(const vk_device & dev, ggml_tensor * t
     GGML_UNUSED(n_host);
     ggml_vk_host_free(stage);
     ggml_backend_vk_free(be);
+}
+
+// GGML_VK_EXPERT_REPACK_GPU_SYNC (default on; 0 = the host permute as before): a synchronous write into a repacked tensor (a
+// mmap load, a load with tensor checks) is copied through pinned staging chunks and reordered on the GPU, the host copying the
+// next chunk meanwhile. GGML_VK_EXPERT_REPACK_GPU_SYNC_CHUNK=<bytes> sets the chunk size (default 4 MiB, a multiple of 16 bytes;
+// a small value makes chunks split row blocks, for tests).
+static bool ggml_vk_expert_repack_gpu_sync_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_EXPERT_REPACK_GPU_SYNC"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+static size_t ggml_vk_expert_repack_gpu_sync_chunk() {
+    static const size_t v = [] {
+        const char * e = getenv("GGML_VK_EXPERT_REPACK_GPU_SYNC_CHUNK");
+        const long long n = e != nullptr ? atoll(e) : 0;
+        return n > 0 ? std::max<size_t>(16, (size_t) n / 16 * 16) : (size_t) 4 << 20;
+    }();
+    return v;
+}
+
+// synchronous write of canonical bytes [offset, offset + size) into repacked tensor t through the GPU reorder. A source already in
+// pinned memory (e.g. a loader staging buffer) is reordered straight from it; any other source is copied through pinned staging
+// chunks first. Returns false (nothing written) when the GPU path cannot take the write; the caller then takes the host path.
+static bool ggml_vk_repack_write_gpu_sync(const vk_device & dev, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size) {
+    if (!ggml_vk_expert_repack_gpu_sync_enabled() || !ggml_vk_repack_gpu_ok(dev, t, offset, size)) {
+        return false;
+    }
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *) t->buffer->context;
+    std::lock_guard<std::mutex> lock(buf_ctx->repack_mutex);
+    if (buf_ctx->repack_backend == nullptr) {
+        buf_ctx->repack_backend = ggml_backend_vk_init(dev->idx);
+        if (buf_ctx->repack_backend == nullptr) {
+            return false;
+        }
+    }
+    ggml_backend_t be = buf_ctx->repack_backend;
+    static std::atomic<bool> logged { false };
+    auto engaged = [&](const char * key) {
+        if (!logged.exchange(true)) {
+            GGML_LOG_INFO("ggml_vulkan: expert repack: synchronous writes reordered on the GPU (GGML_VK_EXPERT_REPACK_GPU_SYNC=0 disables)\n");
+        }
+        ggml_vk_path_census_add("EXPERT_REPACK/SET");
+        ggml_vk_path_census_add("EXPERT_REPACK/SET_GPU");
+        ggml_vk_path_census_add("EXPERT_REPACK/SET_GPU_SYNC");
+        ggml_vk_path_census_add(key);
+    };
+
+    vk_buffer pinned = nullptr;
+    size_t    pinned_offset = 0;
+    ggml_vk_host_get(dev, data, pinned, pinned_offset);
+    if (pinned != nullptr) {
+        uint8_t * first = (uint8_t *) const_cast<void *>(data);
+        if (ggml_vk_expert_repack_negctl() == 3) {
+            first[0] ^= 0x5a;  // negative control (tests only): one corrupted byte of the caller's pinned chunk
+        }
+        if (ggml_vk_repack_dispatch(be, t, R, data, offset, size)) {
+            ggml_backend_synchronize(be);
+            engaged("EXPERT_REPACK/SET_GPU_SYNC_PINNED");
+            return true;
+        }
+        if (ggml_vk_expert_repack_negctl() == 3) {
+            first[0] ^= 0x5a;  // undone: the copy path below applies it
+        }
+    }
+
+    const size_t chunk   = std::min(ggml_vk_expert_repack_gpu_sync_chunk(), size);
+    const size_t n_slots = std::min<size_t>(4, (size + chunk - 1) / chunk);
+    uint8_t *            stage[4] = {};
+    ggml_backend_event_t ev[4]    = {};
+    bool                 used[4]  = {};
+    bool ok = true;
+    for (size_t i = 0; i < n_slots && ok; ++i) {
+        stage[i] = (uint8_t *) ggml_vk_host_malloc(chunk);
+        ev[i]    = stage[i] != nullptr ? ggml_backend_event_new(be->device) : nullptr;
+        ok       = ev[i] != nullptr;
+    }
+    size_t done = 0;
+    for (size_t k = 0; ok && done < size; ++k) {
+        const size_t s = k % n_slots;
+        if (used[s]) {
+            ggml_backend_event_synchronize(ev[s]);  // the slot's previous reorder has read it
+        }
+        const size_t n = std::min(chunk, size - done);
+        memcpy(stage[s], (const uint8_t *) data + done, n);
+        if (ggml_vk_expert_repack_negctl() == 3 && done == 0) {
+            stage[s][0] ^= 0x5a;  // negative control: one corrupted byte per tensor write must make the case fail
+        }
+        if (!ggml_vk_repack_dispatch(be, t, R, stage[s], offset + done, n)) {
+            ok = false;
+            break;
+        }
+        ggml_backend_event_record(ev[s], be);
+        used[s] = true;
+        done += n;
+    }
+    ggml_backend_synchronize(be);
+    for (size_t i = 0; i < n_slots; ++i) {
+        if (ev[i] != nullptr) {
+            ggml_backend_event_free(ev[i]);
+        }
+        if (stage[i] != nullptr) {
+            ggml_vk_host_free(stage[i]);
+        }
+    }
+    if (!ok) {
+        if (done == 0) {
+            return false;
+        }
+        // not expected (the staging chunks are pinned and aligned): the host path finishes the write, exact for any range
+        ggml_vk_repack_write(buf_ctx->dev_buffer, t, R, (const uint8_t *) data + done, offset + done, size - done);
+        ggml_vk_path_census_add("EXPERT_REPACK/SET_SYNC_HOST");
+        return true;
+    }
+    engaged("EXPERT_REPACK/SET_GPU_SYNC_COPY");
+    return true;
 }
 
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
@@ -26453,6 +26598,9 @@ std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const
 }
 
 ggml_backend_vk_buffer_context::~ggml_backend_vk_buffer_context() {
+    if (repack_backend != nullptr) {
+        ggml_backend_free(repack_backend);
+    }
     ggml_vk_destroy_buffer(dev_buffer);
 }
 

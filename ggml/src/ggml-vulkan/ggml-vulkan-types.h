@@ -1618,6 +1618,9 @@ struct ggml_backend_vk_buffer_context {
 
     ~ggml_backend_vk_buffer_context();
 
+    // expert repack buffer: the backend of the GPU reorder of synchronous writes (made on the first one, freed with the buffer)
+    ggml_backend_t repack_backend {};
+    std::mutex     repack_mutex;
 };
 
 struct vk_host_allocation {
