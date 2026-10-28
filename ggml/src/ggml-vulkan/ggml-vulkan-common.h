@@ -10,6 +10,7 @@ extern ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface;
 extern bool vk_memory_logger_enabled;
 extern bool vk_perf_logger_enabled;
 extern bool vk_perf_logger_concurrent;
+extern bool vk_perf_logger_seq;
 extern bool vk_enable_sync_logger;
 extern uint32_t vk_perf_logger_frequency;
 extern std::string vk_pipeline_stats_filter;
