@@ -457,6 +457,35 @@ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     ctx->device->device.resetFences({ ctx->fence });
 }
 
+// Decode weight prefetch from a second compute queue (GGML_VK_DECODE_PREFETCH_Q, default on where supported; =0 turns it off).
+// _WG workgroups of the side dispatch (4), _MAX_MB bytes touched per target at most (24), _POLLS bound on the side dispatch's
+// phase polls (4M, a few seconds), _CHUNK grid-stride passes between phase checks (1).
+struct vk_prefetch_q_cfg {
+    bool on;
+    uint32_t wgs;
+    size_t max_bytes;
+    uint32_t polls;
+    uint32_t chunk;
+};
+
+static const vk_prefetch_q_cfg & ggml_vk_prefetch_q_cfg() {
+    static const vk_prefetch_q_cfg cfg = [] {
+        auto env = [](const char * k, long d) { const char * e = getenv(k); return e != nullptr ? atol(e) : d; };
+        vk_prefetch_q_cfg c;
+        c.on        = env("GGML_VK_DECODE_PREFETCH_Q", 1) != 0;
+        c.wgs       = (uint32_t) std::min(64L, std::max(1L, env("GGML_VK_DECODE_PREFETCH_Q_WG", 4)));
+        c.max_bytes = (size_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_Q_MAX_MB", 24)) * 1024 * 1024;
+        c.polls     = (uint32_t) std::max(1024L, env("GGML_VK_DECODE_PREFETCH_Q_POLLS", 1L << 22));
+        c.chunk     = (uint32_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_Q_CHUNK", 1));
+        return c;
+    }();
+    return cfg;
+}
+
+static bool ggml_vk_decode_prefetch_q_env() {
+    return ggml_vk_prefetch_q_cfg().on;
+}
+
 static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
     static const char kDecodeVectorExt[] = "SPV_NV_cooperative_matrix_decode_vector";
 
@@ -4438,6 +4467,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_decode_prefetch, "decode_prefetch", decode_prefetch_len, decode_prefetch_data, "main", 1, sizeof(vk_op_decode_prefetch_push_constants), {256, 1, 1}, {}, 1);
+    if (device->prefetch_queue) {
+        ggml_vk_create_pipeline(device, device->pipeline_decode_prefetch_q, "decode_prefetch_q", decode_prefetch_q_len, decode_prefetch_q_data, "main", 2, sizeof(vk_op_decode_prefetch_push_constants), {256, 1, 1}, {}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_sum_f32, "sum_f32", sum_f32_len, sum_f32_data, "main", 2, sizeof(vk_op_sum_push_constants), {1, 1, 1}, { 256 }, 1);
@@ -5176,6 +5208,7 @@ vk_device ggml_vk_get_device(size_t idx) {
         bool dot2_f16_support = false;
         bool ocp_microscaling_extension = false;
         bool shader_float8_extension = false;
+        bool buffer_marker_extension = false;
 
         for (const auto& properties : ext_props) {
             if (strcmp("VK_KHR_maintenance4", properties.extensionName) == 0) {
@@ -5236,6 +5269,8 @@ vk_device ggml_vk_get_device(size_t idx) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
+            } else if (strcmp(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, properties.extensionName) == 0) {
+                buffer_marker_extension = true;
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -5435,8 +5470,14 @@ vk_device ggml_vk_get_device(size_t idx) {
         const uint32_t compute_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
         const uint32_t transfer_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
 
-        const float priorities[] = { 1.0f, 1.0f };
+        const float priorities[] = { 1.0f, 1.0f, 1.0f };
         device->single_queue = compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1;
+        // decode weight prefetch from a second compute queue: needs one more queue of the compute family (index 0 = compute, then
+        // the transfer queue when it shares the family), buffer markers for the phase word and buffer device addresses for the weights
+        const uint32_t prefetch_queue_index = compute_queue_family_index == transfer_queue_family_index ? 2 : 1;
+        const bool want_prefetch_queue = ggml_vk_decode_prefetch_q_env() && device->vendor_id == VK_VENDOR_ID_AMD && buffer_marker_extension &&
+                                         !device->single_queue &&
+                                         queue_family_props[compute_queue_family_index].queueCount >= prefetch_queue_index + 1;
 
         std::vector<vk::DeviceQueueCreateInfo> device_queue_create_infos;
         vk::DeviceCreateInfo device_create_info{};
@@ -5628,10 +5669,10 @@ vk_device ggml_vk_get_device(size_t idx) {
                                                 vk::DeviceQueueCreateFlags();
 
         if (compute_queue_family_index != transfer_queue_family_index) {
-            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 1, priorities});
+            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, want_prefetch_queue ? 2u : 1u, priorities});
             device_queue_create_infos.push_back({queue_flags, transfer_queue_family_index, 1, priorities + 1});
         } else if(!device->single_queue) {
-            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 2, priorities});
+            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, want_prefetch_queue ? 3u : 2u, priorities});
         } else {
             device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 1, priorities});
         }
@@ -5915,6 +5956,9 @@ vk_device ggml_vk_get_device(size_t idx) {
             device_extensions.push_back("VK_KHR_cooperative_matrix");
         }
 #endif
+        if (want_prefetch_queue) {
+            device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+        }
         device->name = GGML_VK_NAME + std::to_string(idx);
 
         device_create_info
@@ -5931,6 +5975,14 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         // Queues
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
+        if (want_prefetch_queue) {
+            device->pfn_vkCmdWriteBufferMarkerAMD = (PFN_vkCmdWriteBufferMarkerAMD) vkGetDeviceProcAddr(device->device, "vkCmdWriteBufferMarkerAMD");
+            if (device->pfn_vkCmdWriteBufferMarkerAMD != nullptr) {
+                device->buffer_marker = true;
+                device->prefetch_queue = ggml_vk_create_queue(device, compute_queue_family_index, prefetch_queue_index, { vk::PipelineStageFlagBits::eComputeShader }, false);
+                GGML_LOG_DEBUG("ggml_vulkan: decode prefetch queue: family %u index %u\n", compute_queue_family_index, prefetch_queue_index);
+            }
+        }
 
         // Shaders
         // Disable matmul tile sizes early if performance low or not supported
@@ -15941,6 +15993,258 @@ static void ggml_vk_decode_prefetch(ggml_backend_vk_context * ctx, vk_context & 
     }
 }
 
+// Decode weight prefetch from a second compute queue (GGML_VK_DECODE_PREFETCH_Q). The in-group touch above lengthens the glue
+// group it shares; this form keeps the touch out of the main queue. One persistent dispatch per decode graph runs on its own
+// VkQueue (decode_prefetch_q.comp) and follows a phase word that the main queue writes with buffer markers: "window open for
+// target t" at the first barrier after a weight group, "target t starts" right before the next weight read, "graph done" at the end.
+// While a window is open the side dispatch reads the target's weights from their start into the last-level cache. Reads only:
+// no numeric change, no barrier change on the main queue (2 markers per window).
+
+static bool ggml_vk_prefetch_q_weight_read(const ggml_tensor * n) {
+    const int k = ggml_vk_pf_weight_kind(n);
+    return k == 1 || (k == 2 && n->op == GGML_OP_MUL_MAT_ID);
+}
+
+static void ggml_vk_prefetch_q_marker(ggml_backend_vk_context * ctx, vk_context & subctx, uint32_t phase) {
+    const uint32_t v = (ctx->prefetch_q_epoch << 16) | phase;
+    ctx->device->pfn_vkCmdWriteBufferMarkerAMD(static_cast<VkCommandBuffer>(subctx->s->buffer->buf), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                               static_cast<VkBuffer>(ctx->prefetch_q_flag->buffer), 0, v);
+}
+
+static constexpr uint32_t DECODE_PREFETCH_Q_MAX_TARGETS = 32000;
+
+static bool ggml_vk_prefetch_q_init(ggml_backend_vk_context * ctx) {
+    if (ctx->prefetch_q_init_done) {
+        return ctx->prefetch_q_ok;
+    }
+    ctx->prefetch_q_init_done = true;
+    vk_device & dev = ctx->device;
+    if (!dev->prefetch_queue || !dev->buffer_marker || !dev->buffer_device_address || !dev->pipeline_decode_prefetch_q) {
+        return false;
+    }
+    vk_pipeline & pl = dev->pipeline_decode_prefetch_q;
+    if (!pl->compiled) {
+        ggml_vk_load_shaders(dev, pl);
+    }
+    try {
+        const vk::MemoryPropertyFlags host = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+        ctx->prefetch_q_flag = ggml_vk_create_buffer_check(dev, 256, host);
+        memset(ctx->prefetch_q_flag->ptr, 0, 256);
+        ctx->prefetch_q_pool = dev->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eResetCommandBuffer, dev->prefetch_queue->queue_family_index });
+        vk::DescriptorPoolSize ps(vk::DescriptorType::eStorageBuffer, 2 * MAX_PARAMETER_COUNT);
+        ctx->prefetch_q_dpool = dev->device.createDescriptorPool({ {}, 2, 1, &ps });
+        auto cbs = dev->device.allocateCommandBuffers({ ctx->prefetch_q_pool, vk::CommandBufferLevel::ePrimary, 2 });
+        for (uint32_t i = 0; i < 2; ++i) {
+            auto & sl = ctx->prefetch_q_slots[i];
+            sl.plan = ggml_vk_create_buffer_check(dev, 16 * (1 + DECODE_PREFETCH_Q_MAX_TARGETS), host);
+            sl.cb = cbs[i];
+            sl.fence = dev->device.createFence({});
+            sl.ds = dev->device.allocateDescriptorSets({ ctx->prefetch_q_dpool, 1, &dev->dsl })[0];
+            std::vector<vk::DescriptorBufferInfo> bi(MAX_PARAMETER_COUNT, vk::DescriptorBufferInfo(ctx->prefetch_q_flag->buffer, 0, VK_WHOLE_SIZE));
+            bi[1] = vk::DescriptorBufferInfo(sl.plan->buffer, 0, VK_WHOLE_SIZE);
+            std::vector<vk::WriteDescriptorSet> wr;
+            for (uint32_t b = 0; b < MAX_PARAMETER_COUNT; ++b) {
+                wr.push_back(vk::WriteDescriptorSet(sl.ds, b, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &bi[b]));
+            }
+            dev->device.updateDescriptorSets(wr, {});
+            // recorded once: the plan buffer carries everything that changes per graph
+            sl.cb.begin(vk::CommandBufferBeginInfo{});
+            sl.cb.bindPipeline(vk::PipelineBindPoint::eCompute, pl->pipeline);
+            sl.cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pl->layout, 0, { sl.ds }, {});
+            const vk_op_decode_prefetch_push_constants pc {};
+            sl.cb.pushConstants(pl->layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), &pc);
+            sl.cb.dispatch(ggml_vk_prefetch_q_cfg().wgs, 1, 1);
+            sl.cb.end();
+        }
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: decode prefetch queue disabled: %s\n", e.what());
+        return false;
+    }
+    ctx->prefetch_q_ok = true;
+    return true;
+}
+
+static void ggml_vk_prefetch_q_destroy(ggml_backend_vk_context * ctx) {
+    if (!ctx->prefetch_q_init_done) {
+        return;
+    }
+    vk_device & dev = ctx->device;
+    for (auto & sl : ctx->prefetch_q_slots) {
+        if (sl.pending) {
+            if (ctx->prefetch_q_flag && ctx->prefetch_q_flag->ptr) {
+                ((volatile uint32_t *) ctx->prefetch_q_flag->ptr)[0] = (sl.epoch << 16) | 0xffffu;
+            }
+            (void) dev->device.waitForFences({ sl.fence }, true, 2000ull * 1000 * 1000);
+            sl.pending = false;
+        }
+        if (sl.fence) {
+            dev->device.destroyFence(sl.fence);
+            sl.fence = nullptr;
+        }
+        ggml_vk_destroy_buffer(sl.plan);
+    }
+    if (ctx->prefetch_q_dpool) {
+        dev->device.destroyDescriptorPool(ctx->prefetch_q_dpool);
+        ctx->prefetch_q_dpool = nullptr;
+    }
+    if (ctx->prefetch_q_pool) {
+        dev->device.destroyCommandPool(ctx->prefetch_q_pool);
+        ctx->prefetch_q_pool = nullptr;
+    }
+    ggml_vk_destroy_buffer(ctx->prefetch_q_flag);
+    ctx->prefetch_q_init_done = false;
+    ctx->prefetch_q_ok = false;
+}
+
+// per graph: decode graphs only (every weight mat-vec has one token); the dense targets, their addresses and the side dispatch
+static void ggml_vk_prefetch_q_plan(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->prefetch_q_active = false;
+    ctx->prefetch_q_open = -1;
+    ctx->prefetch_q_after_weight = true;
+    const vk_prefetch_q_cfg & cfg = ggml_vk_prefetch_q_cfg();
+    static const bool log = getenv("GGML_VK_DECODE_PREFETCH_Q_LOG") != nullptr && atoi(getenv("GGML_VK_DECODE_PREFETCH_Q_LOG")) != 0;
+    if (log && !ctx->prefetch_q_init_done && ctx->prefetch_q_epoch == 0) {
+        GGML_LOG_INFO("ggml_vulkan: decode prefetch q: on %d, queue %d, markers %d, bda %d\n", (int) cfg.on, ctx->device->prefetch_queue != nullptr,
+                      (int) ctx->device->buffer_marker, (int) ctx->device->buffer_device_address);
+    }
+    if (!cfg.on || !ctx->device->prefetch_queue) {
+        return;
+    }
+    bool any_dense = false;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        const int k = ggml_vk_pf_weight_kind(n);
+        if (k == 0) {
+            continue;
+        }
+        const int64_t ntok = n->op == GGML_OP_MUL_MAT ? n->src[1]->ne[1] * n->src[1]->ne[2] * n->src[1]->ne[3] : n->src[2]->ne[1];
+        if (ntok != 1) {
+            return;
+        }
+        any_dense |= k == 1;
+    }
+    if (!any_dense || !ggml_vk_prefetch_q_init(ctx)) {
+        return;
+    }
+    // diagnostic: queue, markers and side resources exist, but no side dispatch and no markers
+    static const bool dry = getenv("GGML_VK_DECODE_PREFETCH_Q_DRY") != nullptr && atoi(getenv("GGML_VK_DECODE_PREFETCH_Q_DRY")) != 0;
+    if (dry) {
+        return;
+    }
+    vk_device & dev = ctx->device;
+    auto & sl = ctx->prefetch_q_slots[ctx->prefetch_q_slot_idx];
+    if (sl.pending) {
+        if (dev->device.getFenceStatus(sl.fence) != vk::Result::eSuccess) {
+            // its graph never wrote the end marker (or is still running): release the side dispatch from the host
+            ((volatile uint32_t *) ctx->prefetch_q_flag->ptr)[0] = (sl.epoch << 16) | 0xffffu;
+            if (dev->device.waitForFences({ sl.fence }, true, 2000ull * 1000 * 1000) != vk::Result::eSuccess) {
+                GGML_LOG_WARN("ggml_vulkan: decode prefetch side dispatch did not finish; prefetch queue disabled\n");
+                ctx->prefetch_q_ok = false;
+                return;
+            }
+        }
+        dev->device.resetFences({ sl.fence });
+        sl.pending = false;
+    }
+    {
+        // engagement log (GGML_VK_DECODE_PREFETCH_Q_LOG=1): side dispatch counters since the last report, every 16 graphs
+        volatile uint32_t * f = (volatile uint32_t *) ctx->prefetch_q_flag->ptr;
+        if (log && ctx->prefetch_q_epoch % 16 == 0 && ctx->prefetch_q_epoch > 0) {
+            GGML_LOG_INFO("ggml_vulkan: decode prefetch q: epoch %u: windows %u, touched %.1f MB, timed-out workgroups %u (since last report)\n",
+                          ctx->prefetch_q_epoch, f[8], f[9] * 256.0 * 128.0 * ggml_vk_prefetch_q_cfg().chunk / 1e6, f[10]);
+            f[8] = 0; f[9] = 0; f[10] = 0;
+        }
+    }
+    ctx->prefetch_q_epoch = ctx->prefetch_q_epoch % 0xfffeu + 1;
+    ctx->prefetch_q_target.assign(cgraph->n_nodes, -1);
+    ctx->prefetch_q_next.assign(cgraph->n_nodes, -1);
+    uint32_t * plan = (uint32_t *) sl.plan->ptr;
+    uint32_t nt = 0;
+    for (int i = 0; i < cgraph->n_nodes && nt < DECODE_PREFETCH_Q_MAX_TARGETS; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (ggml_vk_pf_weight_kind(n) != 1) {
+            continue;
+        }
+        const ggml_tensor * w = n->src[0];
+        if (!ggml_backend_buffer_is_vk(w->buffer)) {
+            continue;
+        }
+        const vk_buffer & b = ((ggml_backend_vk_buffer_context *) w->buffer->context)->dev_buffer;
+        const uint64_t addr = b->bda_addr + vk_tensor_offset(w) + w->view_offs;
+        const size_t lines = std::min(ggml_nbytes(w), cfg.max_bytes) / 128;
+        if (b->bda_addr == 0 || (addr & 3) != 0 || lines == 0) {
+            continue;
+        }
+        uint32_t * e = plan + 4 * (1 + nt);
+        e[0] = (uint32_t) addr;
+        e[1] = (uint32_t) (addr >> 32);
+        e[2] = (uint32_t) lines;
+        e[3] = 0;
+        ctx->prefetch_q_target[i] = (int32_t) nt++;
+    }
+    if (nt == 0) {
+        return;
+    }
+    int32_t next = -1;
+    for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (ctx->prefetch_q_target[i] >= 0) {
+            next = ctx->prefetch_q_target[i];
+        } else if (n->op == GGML_OP_MUL_MAT_ID && ggml_vk_pf_weight_kind(n) == 2) {
+            next = -1;  // the expert mat-vecs stream more than the cache holds before the next dense target
+        }
+        ctx->prefetch_q_next[i] = next;
+    }
+    plan[0] = ctx->prefetch_q_epoch;
+    plan[1] = nt;
+    plan[2] = cfg.polls;
+    plan[3] = cfg.chunk;
+    vk::SubmitInfo si(0, nullptr, nullptr, 1, &sl.cb);
+    dev->prefetch_queue->handle->submit({ si }, sl.fence);
+    sl.pending = true;
+    sl.epoch = ctx->prefetch_q_epoch;
+    ctx->prefetch_q_slot_idx ^= 1;
+    ctx->prefetch_q_active = true;
+}
+
+// at a barrier: a group without weight reads after a weight group opens the window of the next dense target
+static void ggml_vk_prefetch_q_barrier(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (!ctx->prefetch_q_after_weight || ctx->prefetch_q_open >= 0) {
+        return;
+    }
+    const int last = node_idx + ctx->num_additional_fused_ops;
+    for (int i = node_idx; i <= last; ++i) {
+        if (ggml_vk_prefetch_q_weight_read(cgraph->nodes[i])) {
+            return;
+        }
+    }
+    const int32_t t = ctx->prefetch_q_next[node_idx];
+    if (t < 0) {
+        return;
+    }
+    ggml_vk_prefetch_q_marker(ctx, subctx, 2u * (uint32_t) t + 1u);
+    ggml_vk_path_census_add("DECODE_PREFETCH_Q");
+    ctx->prefetch_q_open = t;
+    ctx->prefetch_q_after_weight = false;
+}
+
+// before a node's dispatches: a weight read closes the open window
+static void ggml_vk_prefetch_q_node(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const int last = node_idx + ctx->num_additional_fused_ops;
+    bool weight = false;
+    for (int i = node_idx; i <= last && !weight; ++i) {
+        weight = ggml_vk_prefetch_q_weight_read(cgraph->nodes[i]);
+    }
+    if (!weight) {
+        return;
+    }
+    if (ctx->prefetch_q_open >= 0) {
+        ggml_vk_prefetch_q_marker(ctx, subctx, 2u * (uint32_t) ctx->prefetch_q_open + 2u);
+        ctx->prefetch_q_open = -1;
+    }
+    ctx->prefetch_q_after_weight = true;
+}
+
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
@@ -16050,6 +16354,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             ctx->unsynced_nodes_written.clear();
             ctx->unsynced_nodes_read.clear();
             ggml_vk_sync_buffers(ctx, compute_ctx);
+            if (ctx->prefetch_q_active) {
+                ggml_vk_prefetch_q_barrier(ctx, compute_ctx, cgraph, node_idx);
+            }
 
             if (vk_perf_logger_enabled && vk_perf_logger_concurrent) {
                 ctx->query_node_idx[ctx->query_idx] = node_idx;
@@ -16076,6 +16383,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 ctx->unsynced_nodes_read.push_back(extra);
             }
         }
+    }
+    if (ctx->prefetch_q_active) {
+        ggml_vk_prefetch_q_node(ctx, compute_ctx, cgraph, node_idx);
     }
     if (vk_enable_sync_logger) {
         for (int i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
@@ -16545,6 +16855,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     last_node = true;
 #endif
 
+    if (last_node && ctx->prefetch_q_active) {
+        ggml_vk_prefetch_q_marker(ctx, compute_ctx, 0xffffu);
+        ctx->prefetch_q_active = false;
+    }
+
     if (submit || last_node) {
         ggml_vk_ctx_end(compute_ctx);
 
@@ -16683,6 +16998,8 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ctx->device->device.destroyEvent(event);
     }
     ctx->gc.events.clear();
+
+    ggml_vk_prefetch_q_destroy(ctx);
 
     ctx->device->device.destroyFence(ctx->fence);
     ctx->device->device.destroyFence(ctx->almost_ready_fence);
@@ -18933,6 +19250,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials_offset_calculation = false;
     ctx->ssm_conv_direct_matches.clear();
     ggml_vk_decode_prefetch_plan(ctx, cgraph);
+    ggml_vk_prefetch_q_plan(ctx, cgraph);
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -19500,6 +19818,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ctx->last_total_flops = total_flops;
+
+    if (ctx->prefetch_q_active) {
+        // the last node did not record the end marker (skipped node): release the side dispatch from the host
+        ((volatile uint32_t *) ctx->prefetch_q_flag->ptr)[0] = (ctx->prefetch_q_epoch << 16) | 0xffffu;
+        ctx->prefetch_q_active = false;
+    }
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
@@ -21668,11 +21992,13 @@ vk_device_struct::~vk_device_struct() {
     ggml_vk_destroy_buffer(sync_staging);
 
     if (compute_queue) compute_queue->cmd_pool.destroy(device);
+    if (prefetch_queue) prefetch_queue->cmd_pool.destroy(device);
     if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
 
     // Explicitly clear to ensure queues drop their shared_ptrs to handles
     // before the Vulkan logical device instance is destroyed
     compute_queue.reset();
+    prefetch_queue.reset();
     transfer_queue.reset();
 
     for (auto& pipeline : all_pipelines) {
