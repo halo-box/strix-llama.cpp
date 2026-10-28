@@ -2702,9 +2702,10 @@ struct llama_model_qwen4exp : public llama_model_base {
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
-        // padded f16 destinations (LLAMA_HC_XN_PAD / LLAMA_GDN_NORM_PAD), one per graph: graph leaves are allocated before the
+        // padded f16 destinations (LLAMA_HC_XN_PAD / LLAMA_HC_MIX_PAD / LLAMA_GDN_NORM_PAD), one per graph: graph leaves are allocated before the
         // first node, so per-layer buffers would all stay resident (2.8 GB of Flash-Next's 5.3 GB compute buffer at ub 2048)
         ggml_tensor * hc_xn_pad_buf    = nullptr;
+        ggml_tensor * hc_mix_pad_buf   = nullptr;
         ggml_tensor * gdn_norm_pad_buf = nullptr;
         ggml_tensor * pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name);
 
