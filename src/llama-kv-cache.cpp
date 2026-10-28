@@ -2041,6 +2041,25 @@ bool llama_kv_cache::has_cell_ext() const {
     return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
 }
 
+void llama_kv_cache::set_tokens(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    if (other || !ubatch.token || ubatch.is_mixed()) {
+        return;
+    }
+    GGML_ASSERT(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        auto & cells = v_cells[sinfo.strm[s]];
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            const uint32_t idx = sinfo.idxs[s][ii];
+            if (cells.is_empty(idx)) {
+                continue;
+            }
+            llama_kv_cell_ext ext = cells.ext_get(idx);
+            ext.tok = ubatch.token[s*sinfo.size() + ii];
+            cells.ext_set(idx, ext);
+        }
+    }
+}
+
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
@@ -3151,6 +3170,15 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+void llama_kv_cache_context::set_cur_tokens(const llama_ubatch & ubatch) const {
+    if (sinfos.empty()) {
+        return;
+    }
+    // after the last next() (a chained decode writes its token-dependent inputs once the ubatch loop is done)
+    // i_cur is past the end: the ubatch is the last one
+    kv->set_tokens(sinfos[std::min(i_cur, sinfos.size() - 1)], ubatch);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

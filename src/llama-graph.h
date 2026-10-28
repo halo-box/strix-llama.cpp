@@ -132,6 +132,10 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+
+    // true if the input depends on the ubatch token ids (decode chaining writes these last, see
+    // llama_context::decode_chain, after the previous decode returned the token)
+    virtual bool token_dependent() const { return false; }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -148,6 +152,8 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    bool token_dependent() const override { return true; }
+
     ggml_tensor * tokens       = nullptr; // I32 [n_batch]
     ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * mixed_tokens = nullptr; // I32 [n_tok_rows], mixed path: ids of the token rows
@@ -156,6 +162,9 @@ public:
     ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
 
     float scale_tok = 1.0f;
+
+    // decode chaining: the token rows go in through `embd`, gathered on the host from this table
+    const ggml_tensor * chain_tab = nullptr;
 
     const int64_t n_embd = 0;
 };
@@ -877,6 +886,9 @@ struct llm_graph_params {
     llama_model_prefetch * prefetch = nullptr; // the context's llama_model::prefetch_begin state, nullptr = none
     const llama_vocab_subset * vsub = nullptr;
 
+    // decode chaining (llama_context::decode_chain): the token embeddings are an F32 input gathered on the host
+    bool chain = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -947,6 +959,7 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             cparams.mtp_draft_vocab         == other.cparams.mtp_draft_vocab         &&
             mtp_draft == other.mtp_draft &&
+            chain == other.chain &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -983,6 +996,8 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+    // token_dep 0: the inputs that do not depend on the token ids, 1: those that do
+    void set_inputs(const llama_ubatch * ubatch, int token_dep);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
@@ -1122,6 +1137,7 @@ struct llm_graph_context {
     const llama_mtp_draft_vocab * mtp_draft; // nullptr = full vocabulary
 
     llama_model_prefetch * prefetch; // nullptr = none
+    const bool chain;                // see llm_graph_params::chain
 
     const llm_graph_cb & cb_func;
 
@@ -1285,6 +1301,13 @@ struct llm_graph_context {
 
     // tok_scale: applied to token rows only
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+
+    // decode chaining (llm_graph_params::chain): an input written after the graph is recorded goes straight into the
+    // first backend's memory, as the scheduler copies host inputs to the device when the split starts
+    void chain_input_to_device(ggml_tensor * input) const;
+
+    // rows `ids` of an embedding table; an EXL3 row-ring table is decoded by EXL3_GET_ROWS
+    ggml_tensor * build_get_rows(ggml_tensor * table, ggml_tensor * ids) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

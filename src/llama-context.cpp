@@ -694,6 +694,18 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // a chained decode still in flight: finish it and give the context its own scheduler back
+    if (chain.inflight) {
+        llama_token tok;
+        decode_chain_end(chain.seq, &tok);
+    }
+    if (chain.slot != 0) {
+        chain_swap();
+    }
+    if (chain.sched) {
+        ggml_backend_sched_synchronize(chain.sched.get());
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1891,7 +1903,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const auto t_inputs_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+        if (chain.prep) {
+            // decode chaining: the token-dependent inputs are written by decode_chain once the token is known
+            res->set_inputs(&ubatch, 0);
+        } else {
+            res->set_inputs(&ubatch);
+        }
 
         t_inputs = ggml_time_us() - t_inputs_us;
         if (graph_timing) {
@@ -2239,7 +2256,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     {
         // llama_batch_ext keeps tokens as entries; the allocator's flat view has the token IDs
         const llama_batch & flat = balloc->get_batch();
-        if (flat.token) {
+        // a chained decode does not know its token yet (and is one token: nothing to gather ahead)
+        if (flat.token && !chain.prep) {
             model.prefetch_begin(prefetch, flat, cparams.n_ubatch);
         }
     }
@@ -2363,6 +2381,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (chain.prep && res) {
+            chain.res    = const_cast<llm_graph_result *>(res);
+            chain.ubatch = ubatch;
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2532,6 +2555,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
 
+        if (chain.prep && res && res->t_sampled.size() == 1 && res->t_sampled[0] != nullptr) {
+            // this slot's sampled token for the next decode_chain, after the other output copies; the next step polls
+            // the mark behind it instead of the whole submission's fence
+            ggml_tensor * t = res->t_sampled[0];
+            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+            ggml_backend_tensor_get_async(b, t, &chain.tok[chain.slot], 0, sizeof(llama_token));
+            chain.marked[chain.slot] = b == chain.gpu[chain.slot] && chain.mark && chain.mark(b);
+        }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -2589,6 +2621,210 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    if (chain.prep) {
+        // the token-dependent inputs still read the memory context of this decode
+        chain.mctx = std::move(mctx);
+    }
+
+    return 0;
+}
+
+//
+// one-token-ahead decode chaining
+//
+
+bool llama_context::chain_init() {
+    if (chain.ready) {
+        return true;
+    }
+    // one GPU backend (the scheduler's first) and the CPU
+    if (backend_ptrs.size() != 2 || ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[0])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        LLAMA_LOG_WARN("%s: decode chaining needs exactly one GPU backend, disabled\n", __func__);
+        return false;
+    }
+    if (!model.tok_embd || !model.tok_embd->buffer || !ggml_backend_buffer_is_host(model.tok_embd->buffer) || !loras->empty() ||
+        model.hparams.n_embd_inp() != model.hparams.n_embd || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR || cparams.embeddings) {
+        LLAMA_LOG_WARN("%s: decode chaining needs a host token table, no LoRA and no embeddings output, disabled\n", __func__);
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[0]);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    chain.set_defer = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_defer_submit");
+    chain.flush     = (void (*)(ggml_backend_t))       ggml_backend_reg_get_proc_address(reg, "ggml_backend_flush_deferred");
+    chain.mark      = (bool (*)(ggml_backend_t))       ggml_backend_reg_get_proc_address(reg, "ggml_backend_mark");
+    chain.mark_wait = (void (*)(ggml_backend_t))       ggml_backend_reg_get_proc_address(reg, "ggml_backend_mark_wait");
+    if (getenv("LLAMA_DECODE_CHAIN_MARK") && atoi(getenv("LLAMA_DECODE_CHAIN_MARK")) == 0) {
+        chain.mark = nullptr; // wait for the previous decode's fence instead
+    }
+    if (!chain.set_defer || !chain.flush) {
+        LLAMA_LOG_WARN("%s: the %s backend cannot defer submissions, decode chaining disabled\n", __func__, ggml_backend_name(backend_ptrs[0]));
+        return false;
+    }
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    if (!host_buft) {
+        LLAMA_LOG_WARN("%s: no pinned host buffer type, decode chaining disabled\n", __func__);
+        return false;
+    }
+    chain.tok_buf.reset(ggml_backend_buft_alloc_buffer(host_buft, 64));
+    chain.backend.reset(ggml_backend_dev_init(dev, nullptr));
+    if (!chain.tok_buf || !chain.backend) {
+        return false;
+    }
+    chain.tok = (llama_token *) ggml_backend_buffer_get_base(chain.tok_buf.get());
+    chain.tok[0] = chain.tok[1] = LLAMA_TOKEN_NULL;
+    chain.gpu[0] = backend_ptrs[0];
+    chain.gpu[1] = chain.backend.get();
+
+    std::vector<ggml_backend_t> ptrs = backend_ptrs;
+    ptrs[0] = chain.gpu[1];
+    chain.sched.reset(ggml_backend_sched_new(ptrs.data(), backend_buft.data(), ptrs.size(),
+            gf_res_reserve->get_max_nodes(), false, cparams.op_offload));
+    ggml_backend_sched_set_lazy_realloc_sync(chain.sched.get(), true);
+    ggml_backend_sched_set_copy_callback(chain.sched.get(), sched_copy_experts, this);
+    ggml_backend_sched_set_realloc_callback(chain.sched.get(), sched_graph_realloc, this);
+
+    // reserve slot 1 for the worst-case one-token chained graph (as sched_reserve does for slot 0), so its buffers do
+    // not grow during generation
+    {
+        chain_swap();
+        chain.prep = true;
+        llama_memory_context_ptr mctx_full = memory->init_full();
+        ggml_cgraph * gf = mctx_full ? graph_reserve(1, 1, 1, mctx_full.get()) : nullptr;
+        chain.prep = false;
+        chain_swap();
+        if (!gf) {
+            LLAMA_LOG_WARN("%s: could not reserve the second slot, decode chaining disabled\n", __func__);
+            chain.sched.reset();
+            chain.backend.reset();
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: second slot compute buffer %.2f MiB\n", __func__,
+                ggml_backend_sched_get_buffer_size(chain.sched.get(), chain.gpu[1]) / (1024.0*1024.0));
+    }
+
+    chain.ready = true;
+    LLAMA_LOG_INFO("%s: decode chaining on (second %s context)\n", __func__, ggml_backend_name(chain.gpu[1]));
+    return true;
+}
+
+void llama_context::chain_swap() {
+    std::swap(sched, chain.sched);
+    std::swap(gf_res_prev, chain.gf_res_prev);
+    std::swap(gf_res_prev_active, chain.gf_res_prev_active);
+    chain.slot ^= 1;
+}
+
+// Decodes the token the previous decode of seq_id sampled on the backend (its greedy / backend sampler) and returns it
+// in *token. The decode is recorded on the other slot while the previous one still runs; its token-dependent inputs
+// are written and its batches submitted once the previous decode has finished. The previous decode is either an
+// ordinary llama_decode with one output for seq_id or the last decode_chain; decode_chain_end returns the token of
+// the last one. Returns 0, or -1 when chaining is unavailable (nothing was decoded), or a decode() error.
+int llama_context::decode_chain(llama_seq_id seq_id, llama_token * token) {
+    if (chain.mode < 0) {
+        const char * e = getenv("LLAMA_DECODE_CHAIN");
+        chain.mode = e ? atoi(e) : 1;
+    }
+    if (chain.mode == 0 || sampling.samplers.count(seq_id) == 0 || (chain.inflight && chain.seq != seq_id)) {
+        return -1;
+    }
+    if (!chain.inflight) {
+        // reserve now: a reserve rebuilds the scheduler in `sched`
+        sched_reserve();
+        if (!chain_init()) {
+            chain.mode = 0;
+            return -1;
+        }
+    }
+
+    // the token: known now on the first step, else the running decode samples it
+    llama_token tok = LLAMA_TOKEN_NULL;
+    if (!chain.inflight) {
+        synchronize();
+        tok = get_sampled_token_ith(-1);
+        if (tok == LLAMA_TOKEN_NULL) {
+            LLAMA_LOG_ERROR("%s: the previous decode has no backend-sampled token\n", __func__);
+            return -1;
+        }
+    }
+
+    const llama_pos pos = memory->seq_pos_max(seq_id) + 1;
+
+    chain_swap();
+    chain.set_defer(chain.gpu[chain.slot], true);
+    chain.prep = true;
+
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    batch.n_tokens     = 1;
+    batch.token[0]     = tok == LLAMA_TOKEN_NULL ? 0 : tok; // placeholder until the running decode samples it
+    batch.pos[0]       = pos;
+    batch.n_seq_id[0]  = 1;
+    batch.seq_id[0][0] = seq_id;
+    batch.logits[0]    = 1;
+    const int ret = decode(batch);
+    llama_batch_free(batch);
+
+    chain.prep = false;
+
+    if (ret != 0 || chain.res == nullptr || chain.ubatch.token == nullptr) {
+        // nothing of this decode reached the GPU with stale inputs: write them as they are and submit
+        chain.flush(chain.gpu[chain.slot]);
+        chain.set_defer(chain.gpu[chain.slot], false);
+        chain.res = nullptr;
+        chain.mctx.reset();
+        return ret != 0 ? ret : -3;
+    }
+
+    const int prev = chain.slot ^ 1;
+    if (chain.inflight) {
+        // the previous decode, on the other slot, samples the token of this one: poll its mark if it set one (the
+        // fence and the cleanup follow below, off the critical path), else wait for the whole submission
+        if (chain.marked[prev]) {
+            chain.mark_wait(chain.gpu[prev]);
+        } else {
+            ggml_backend_sched_synchronize(chain.sched.get());
+        }
+        tok = chain.tok[prev];
+        chain.tok[chain.slot ^ 1] = LLAMA_TOKEN_NULL;
+        GGML_ASSERT(tok >= 0 && tok < (llama_token) model.vocab.n_tokens() && "decode chaining: no sampled token");
+    }
+
+    chain.ubatch.token[0] = tok;
+    chain.res->set_inputs(&chain.ubatch, 1);
+    chain.flush(chain.gpu[chain.slot]);
+    chain.set_defer(chain.gpu[chain.slot], false);
+    chain.res = nullptr;
+    chain.mctx.reset();
+
+    if (chain.inflight && chain.marked[prev]) {
+        // the previous slot's fence and command buffer cleanup, now that the GPU runs this decode
+        ggml_backend_sched_synchronize(chain.sched.get());
+    }
+    chain.marked[prev] = false;
+
+    chain.inflight = true;
+    chain.seq      = seq_id;
+    *token = tok;
+
+    return 0;
+}
+
+// Waits for the last chained decode and returns the token it sampled (not decoded). The context then runs on its own
+// scheduler again.
+int llama_context::decode_chain_end(llama_seq_id seq_id, llama_token * token) {
+    if (!chain.inflight || chain.seq != seq_id) {
+        return -1;
+    }
+    synchronize();
+    if (chain.marked[chain.slot]) {
+        chain.mark_wait(chain.gpu[chain.slot]); // set by now: resets the event for the next use
+        chain.marked[chain.slot] = false;
+    }
+    *token = chain.tok[chain.slot];
+    chain.tok[chain.slot] = LLAMA_TOKEN_NULL;
+    chain.inflight = false;
+    if (chain.slot != 0) {
+        chain_swap();
+    }
     return 0;
 }
 
@@ -3084,6 +3320,7 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
         /*.prefetch    =*/ prefetch.get(),
         /*.vsub        =*/ vsub.get(),
+        /*.chain       =*/ chain.prep,
     };
 }
 
@@ -3497,7 +3734,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            // decode chaining: the second slot's scheduler has its own context on the device
+                            ggml_backend_t b = backend.get();
+                            if (chain.slot == 1 && b == chain.gpu[0]) {
+                                b = chain.gpu[1];
+                            }
+                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, b);
                         }
                     }
                 }
@@ -5447,4 +5689,12 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+int32_t llama_decode_chain(llama_context * ctx, llama_seq_id seq_id, llama_token * token) {
+    return ctx->decode_chain(seq_id, token);
+}
+
+int32_t llama_decode_chain_end(llama_context * ctx, llama_seq_id seq_id, llama_token * token) {
+    return ctx->decode_chain_end(seq_id, token);
 }

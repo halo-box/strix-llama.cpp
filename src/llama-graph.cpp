@@ -73,6 +73,25 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+
+        if (chain_tab) {
+            // decode chaining: the rows of the host token table, converted as the CPU GET_ROWS converts them
+            GGML_ASSERT(embd && chain_tab->ne[0] <= n_embd && chain_tab->data);
+            const auto * traits = ggml_get_type_traits(chain_tab->type);
+            std::vector<float> rows((size_t) n_embd * n_tokens, 0.0f);
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                const llama_token t = ubatch->token[i];
+                GGML_ASSERT(t >= 0 && t < chain_tab->ne[1]);
+                const char * src = (const char *) chain_tab->data + (size_t) t * chain_tab->nb[1];
+                if (chain_tab->type == GGML_TYPE_F32) {
+                    memcpy(rows.data() + (size_t) i * n_embd, src, chain_tab->ne[0] * sizeof(float));
+                } else {
+                    GGML_ASSERT(traits->to_float);
+                    traits->to_float(src, rows.data() + (size_t) i * n_embd, chain_tab->ne[0]);
+                }
+            }
+            ggml_backend_tensor_set(embd, rows.data(), 0, rows.size()*sizeof(float));
+        }
     }
 
     if (ubatch->embd && embd && !ubatch->is_mixed()) {
@@ -1494,6 +1513,14 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_result::set_inputs(const llama_ubatch * ubatch, int token_dep) {
+    for (auto & input : inputs) {
+        if ((int) input->token_dependent() == token_dep) {
+            input->set_input(ubatch);
+        }
+    }
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
@@ -1639,6 +1666,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     mtp_draft        (params.mtp_draft),
     prefetch         (params.prefetch),
+    chain            (params.chain),
     cb_func          (params.cb),
     res              (params.res),
     vsub             (params.vsub),
@@ -2696,6 +2724,24 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
 }
 
 // input embeddings with optional lora
+ggml_tensor * llm_graph_context::build_get_rows(ggml_tensor * table, ggml_tensor * ids) const {
+    if (exl3) {
+        if (const auto it = exl3->rows.find(table); it != exl3->rows.end()) {
+            return ggml_exl3_get_rows(ctx0, table, ids, it->second.signs, it->second.n_out);
+        }
+    }
+    return ggml_get_rows(ctx0, table, ids);
+}
+
+void llm_graph_context::chain_input_to_device(ggml_tensor * input) const {
+    if (sched && ggml_backend_sched_get_n_backends(sched) > 1) {
+        ggml_backend_t dev = ggml_backend_sched_get_backend(sched, 0);
+        if (ggml_backend_dev_type(ggml_backend_get_device(dev)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_backend_sched_set_tensor_backend(sched, input, dev);
+        }
+    }
+}
+
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
@@ -2800,6 +2846,17 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // vector embeddings path (ubatch.embd != nullptr)
     inps[1] = embd1;
 
+    // decode chaining: the token rows arrive through the embd input (gathered on the host after the graph is
+    // recorded), then take the token path's transforms. LoRA on the token table needs the ids in the graph.
+    const bool chain_tok = chain && ubatch.token && !ubatch.is_mixed();
+    if (chain_tok) {
+        GGML_ASSERT(loras->empty() && "decode chaining does not support LoRA adapters");
+        GGML_ASSERT(tok_embd->ne[0] == n_embd && n_embd_inp == n_embd && "decode chaining: token rows must be the input width");
+        inp->chain_tab = tok_embd;
+        chain_input_to_device(inp->embd);
+        inps[1] = build_tok(embd1, nullptr);
+    }
+
     assert(ggml_are_same_shape (inps[0], inps[1]));
     assert(ggml_are_same_stride(inps[0], inps[1]));
 
@@ -2820,7 +2877,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         assert(ggml_are_same_stride(inps[0], inps[2]));
     }
 
-    const int idx = ubatch.is_mixed() ? 2 : ubatch.token ? 0 : 1;
+    const int idx = ubatch.is_mixed() ? 2 : (ubatch.token && !chain_tok) ? 0 : 1;
 
     ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), has_mixed ? 3 : 2, idx);
 
@@ -2848,6 +2905,9 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         inp->scale_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
         cb(inp->scale_rows, "inp_scale_rows", -1);
         ggml_set_input(inp->scale_rows);
+        if (chain_tok) {
+            chain_input_to_device(inp->scale_rows);
+        }
 
         if (!ggml_is_contiguous(cur)) {
             cur = ggml_cont(ctx0, cur);
