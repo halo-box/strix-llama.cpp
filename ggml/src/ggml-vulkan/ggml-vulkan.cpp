@@ -13542,12 +13542,15 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
         pc, {n_tiles_kv, n_tiles_t, n_streams});
 }
 
+// fewest tokens per sequence for the chunked GATED_DELTA_NET form
+static constexpr int64_t ggml_vk_gdn_chunk_min = 64;
+
 // the chunked prefill form (gdn_chunk_prep/scan.comp) for this GATED_DELTA_NET with these q / k tensors: S_v 128, scalar
 // gate, final state only (K == 1), q/k/v rows with unit element stride, q and k with the same strides, >= 64 tokens.
 // GGML_VK_GDN_CHUNK=0 opts out.
 static bool ggml_vk_gdn_chunk_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, const ggml_tensor * q, const ggml_tensor * k) {
     static const bool chunk_enabled = [] { const char * e = getenv("GGML_VK_GDN_CHUNK"); return !e || atoi(e) != 0; }();
-    constexpr uint32_t chunk_min = 64;
+    constexpr int64_t chunk_min = ggml_vk_gdn_chunk_min;
     const ggml_tensor * v = dst->src[2];
     const uint32_t S_v = (uint32_t) v->ne[0];
     const bool kda = dst->src[3]->ne[0] == (int64_t) S_v;
@@ -18813,6 +18816,20 @@ static void ggml_vk_gdn_qk_norm_prepass(ggml_backend_vk_context * ctx, const ggm
     ctx->gdn_qk_skip.clear();
     if (!ggml_vk_gdn_qk_norm_enabled() || ctx->device->disable_fusion || ctx->device->pipeline_gdn_chunk_prep == nullptr) {
         return;
+    }
+    // Only a GDN with enough tokens can take the chunk path (ggml_vk_gdn_chunk_ok). A decode graph has none, so it skips the
+    // node map below, which costs ~0.14 ms per token on a large hybrid model before the first submit.
+    // GGML_VK_GDN_QKNORM_SCAN=0 always builds the map.
+    static const bool scan = [] { const char * e = getenv("GGML_VK_GDN_QKNORM_SCAN"); return e == nullptr || atoi(e) != 0; }();
+    if (scan) {
+        bool any = false;
+        for (int i = 0; i < cgraph->n_nodes && !any; ++i) {
+            const ggml_tensor * g = cgraph->nodes[i];
+            any = g->op == GGML_OP_GATED_DELTA_NET && g->src[2]->ne[2] >= ggml_vk_gdn_chunk_min;
+        }
+        if (!any) {
+            return;
+        }
     }
     std::unordered_map<const ggml_tensor *, int> idx;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
