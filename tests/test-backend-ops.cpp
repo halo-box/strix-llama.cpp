@@ -12912,6 +12912,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // the Flash-Next pp2048 ubatch (op timing: eval with GGML_VK_PERF_LOGGER, perf mode skips graph_optimize)
     test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 2048, 10, true, 1, 2, 128));
+    // HC_CMB (slots loaded in batches of 8, residual rows before the first store): a ragged ubatch tail and slot counts on and
+    // around the batch boundary, exact = bit-identical to the unfused chain
+    for (bool exact : {false, true}) {
+        test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 2051, 10, true, 1, 2, 128, exact));
+        test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 97, 10, true, 1, 3, 128, exact));
+        for (int n_used : {7, 8, 9, 16, 17}) {
+            if (exact && n_used > 9) {
+                continue;   // the exact twin of 16+ slots outgrows the test context
+            }
+            test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 64, n_used, true, 1, 2, 128, exact));
+        }
+        test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 33, 9, false, 1, 2, 0, exact));   // f32 slots
+    }
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 2051, 1, GGML_TYPE_Q8_0, 128));
+    test_cases.emplace_back(new test_hc_post_norm(2560, 4, 97, 2, GGML_TYPE_Q8_0, 128));
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 1, GGML_TYPE_Q4_0, 8));
     // bf16: a bf16 weight LLAMA_BF16_TO_F16 kept (out of f16 range) meets the f16 mixed stream
     // B paths: f16-B native (q8_0), int8 MMQ quantizing the f16 B (q4_0), the dense router (q4_K), non-quantized (bf16)

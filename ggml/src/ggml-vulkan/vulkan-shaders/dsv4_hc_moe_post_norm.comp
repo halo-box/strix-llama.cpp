@@ -27,6 +27,11 @@
 // 16-byte aligned rows (slot offsets and strides multiples of 4 elements) and zero misalignment on every operand.
 
 layout(constant_id = 0) const uint HAS_POST = 1;   // kept for the pipeline layout; the MoE epilogue always combines
+// LOADS_FIRST (GGML_VK_HC_CMB=1, opt-in): the routed slots are loaded in batches of SLOT_BATCH before they are summed (one round
+// trip per batch instead of one per slot), and every residual row of the token is loaded before the first store. Same values,
+// same arithmetic in the same order: bit-identical.
+layout(constant_id = 1) const uint LOADS_FIRST = 0;
+const uint SLOT_BATCH = 8;
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -90,9 +95,24 @@ float shared_gate(const uint t) {
 vec4 moe_x(const uint t, const uint e, const float sg) {
     vec4 s = vec4(0.0f);
     uint sb = p.so + t * p.ss2 + e;
-    for (uint k = 0; k < p.n_slots; ++k) {
-        s += vec4(data_s[sb / 4]);
-        sb += p.ss1;
+    if (LOADS_FIRST != 0) {
+        for (uint k0 = 0; k0 < p.n_slots; k0 += SLOT_BATCH) {
+            vec4 l[SLOT_BATCH];
+            [[unroll]] for (uint k = 0; k < SLOT_BATCH; ++k) {
+                l[k] = k0 + k < p.n_slots ? vec4(data_s[(sb + k * p.ss1) / 4]) : vec4(0.0f);
+            }
+            [[unroll]] for (uint k = 0; k < SLOT_BATCH; ++k) {
+                if (k0 + k < p.n_slots) {
+                    s += l[k];
+                }
+            }
+            sb += SLOT_BATCH * p.ss1;
+        }
+    } else {
+        for (uint k = 0; k < p.n_slots; ++k) {
+            s += vec4(data_s[sb / 4]);
+            sb += p.ss1;
+        }
     }
     if (p.sh_mode != 0) {
         vec4 h = data_h[(t * p.sx1 + e) / 4];
@@ -104,6 +124,43 @@ vec4 moe_x(const uint t, const uint e, const float sg) {
         s = s + h;
     }
     return s;
+}
+
+// LOADS_FIRST, INJ: x for the 8 columns at element e of token t, both halves' slot loads of a batch issued together
+void moe_x8(const uint t, const uint e, const float sg, out vec4 x0, out vec4 x1) {
+    vec4 s0 = vec4(0.0f);
+    vec4 s1 = vec4(0.0f);
+    uint sb = p.so + t * p.ss2 + e;
+    // LOADS_FIRST == 2: the tests' negative control (GGML_VK_HC_CMB_TEST_BREAK=1) drops the last routed slot
+    const uint ns = LOADS_FIRST == 2 ? p.n_slots - 1 : p.n_slots;
+    for (uint k0 = 0; k0 < ns; k0 += SLOT_BATCH) {
+        vec4 l0[SLOT_BATCH];
+        vec4 l1[SLOT_BATCH];
+        [[unroll]] for (uint k = 0; k < SLOT_BATCH; ++k) {
+            const bool ok = k0 + k < ns;
+            l0[k] = ok ? vec4(data_s[(sb + k * p.ss1) / 4])     : vec4(0.0f);
+            l1[k] = ok ? vec4(data_s[(sb + k * p.ss1) / 4 + 1]) : vec4(0.0f);
+        }
+        [[unroll]] for (uint k = 0; k < SLOT_BATCH; ++k) {
+            if (k0 + k < ns) {
+                s0 += l0[k];
+                s1 += l1[k];
+            }
+        }
+        sb += SLOT_BATCH * p.ss1;
+    }
+    if (p.sh_mode != 0) {
+        vec4 h0 = data_h[(t * p.sx1 + e) / 4];
+        vec4 h1 = data_h[(t * p.sx1 + e + 4) / 4];
+        if (p.sh_mode == 2) {
+            h0 = uintBitsToFloat(floatBitsToUint(sg * h0) ^ uvec4(p.zero));
+            h1 = uintBitsToFloat(floatBitsToUint(sg * h1) ^ uvec4(p.zero));
+        }
+        s0 = s0 + h0;
+        s1 = s1 + h1;
+    }
+    x0 = s0;
+    x1 = s1;
 }
 
 float post_weight(const uint c, const uint t) {
@@ -133,6 +190,15 @@ void main() {
     }
 
     vec4 v[HC_MAX][MAX_V4];
+    if (LOADS_FIRST != 0) {
+        [[unroll]] for (uint c = 0; c < HC_MAX; ++c) {
+            const uint rb = (c * p.sr1 + t * p.sr2) / 4;
+            [[unroll]] for (uint k = 0; k < MAX_V4; ++k) {
+                const uint i4 = tid + k * BLOCK;
+                v[c][k] = c < p.hc && i4 < nv4 ? data_r[rb + i4] : vec4(0.0f);
+            }
+        }
+    }
     [[unroll]] for (uint c = 0; c < HC_MAX; ++c) {
         if (c >= p.hc) {
             break;
@@ -145,7 +211,7 @@ void main() {
             const uint i4 = tid + k * BLOCK;
             vec4 r = vec4(0.0f);
             if (i4 < nv4) {
-                r = data_r[rb + i4];
+                r = LOADS_FIRST != 0 ? v[c][k] : data_r[rb + i4];
                 r = xv[k] * pw + r;
                 data_o[ob + i4] = r;
             }
@@ -201,18 +267,35 @@ void main() {
     const uint ng  = p.n_embd / 8;
 
     const float sg = shared_gate(t);
+    vec4 a[HC][NG][2];
+    if (LOADS_FIRST != 0) {
+        [[unroll]] for (uint c = 0; c < HC; ++c) {
+            [[unroll]] for (uint g = 0; g < NG; ++g) {
+                const uint e4 = (tid + g * BLOCK) * 2;
+                a[c][g][0] = vec4(0.0f);
+                a[c][g][1] = vec4(0.0f);
+                if (tid + g * BLOCK < ng) {
+                    const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
+                    a[c][g][0] = data_r[rb];
+                    a[c][g][1] = data_r[rb + 1];
+                }
+            }
+        }
+    }
     vec4 xv[NG][2];
     [[unroll]] for (uint g = 0; g < NG; ++g) {
         const uint e = (tid + g * BLOCK) * 8;
         xv[g][0] = vec4(0.0f);
         xv[g][1] = vec4(0.0f);
         if (tid + g * BLOCK < ng) {
-            xv[g][0] = moe_x(t, e, sg);
-            xv[g][1] = moe_x(t, e + 4, sg);
+            if (LOADS_FIRST != 0) {
+                moe_x8(t, e, sg, xv[g][0], xv[g][1]);
+            } else {
+                xv[g][0] = moe_x(t, e, sg);
+                xv[g][1] = moe_x(t, e + 4, sg);
+            }
         }
     }
-
-    vec4 a[HC][NG][2];
     float ss[HC];
     [[unroll]] for (uint c = 0; c < HC; ++c) {
         const float pw = post_weight(c, t);
@@ -223,8 +306,8 @@ void main() {
             vec4 r1 = vec4(0.0f);
             if (tid + g * BLOCK < ng) {
                 const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
-                r0 = data_r[rb];
-                r1 = data_r[rb + 1];
+                r0 = LOADS_FIRST != 0 ? a[c][g][0] : data_r[rb];
+                r1 = LOADS_FIRST != 0 ? a[c][g][1] : data_r[rb + 1];
                 r0 = xv[g][0] * pw + r0;
                 r1 = xv[g][1] * pw + r1;
                 const uint ob = (c * p.so1 + t * p.so2) / 4 + e4;

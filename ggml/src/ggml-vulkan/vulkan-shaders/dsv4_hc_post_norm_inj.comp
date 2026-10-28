@@ -19,6 +19,10 @@
 // misalignment on every operand.
 
 layout(constant_id = 0) const uint HAS_POST = 1;
+// LOADS_FIRST (GGML_VK_HC_CMB=1, opt-in): every residual row and post weight of the token is loaded before the first store, so
+// the four streams' loads are in flight together instead of one stream per round trip (the stores to res_out could alias the
+// residual reads as far as the compiler knows). Same values, same arithmetic and order: bit-identical.
+layout(constant_id = 1) const uint LOADS_FIRST = 0;
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 const uint HC = 4;
@@ -74,11 +78,27 @@ void main() {
     }
 
     vec4 a[HC][NG][2];
+    float pwl[HC];
+    if (LOADS_FIRST != 0) {
+        [[unroll]] for (uint c = 0; c < HC; ++c) {
+            pwl[c] = HAS_POST != 0 ? data_p[c * p.sp0 + t * p.sp1] : 0.0f;
+            [[unroll]] for (uint g = 0; g < NG; ++g) {
+                const uint e4 = (tid + g * BLOCK) * 2;
+                a[c][g][0] = vec4(0.0f);
+                a[c][g][1] = vec4(0.0f);
+                if (tid + g * BLOCK < ng) {
+                    const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
+                    a[c][g][0] = data_r[rb];
+                    a[c][g][1] = data_r[rb + 1];
+                }
+            }
+        }
+    }
     float ss[HC];
     [[unroll]] for (uint c = 0; c < HC; ++c) {
         float pw = 0.0f;
         if (HAS_POST != 0) {
-            pw = data_p[c * p.sp0 + t * p.sp1];
+            pw = LOADS_FIRST != 0 ? pwl[c] : data_p[c * p.sp0 + t * p.sp1];
             if (p.gate != 0) {
                 pw = (1.0f / (1.0f + exp(-(pw * p.gate_in)))) * p.gate_out;
             }
@@ -90,8 +110,9 @@ void main() {
             vec4 r1 = vec4(0.0f);
             if (tid + g * BLOCK < ng) {
                 const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
-                r0 = data_r[rb];
-                r1 = data_r[rb + 1];
+                // LOADS_FIRST == 2: the tests' negative control (GGML_VK_HC_CMB_TEST_BREAK=1) takes stream 0's residual for every stream
+                r0 = LOADS_FIRST == 2 ? a[0][g][0] : LOADS_FIRST != 0 ? a[c][g][0] : data_r[rb];
+                r1 = LOADS_FIRST != 0 ? a[c][g][1] : data_r[rb + 1];
                 if (HAS_POST != 0) {
                     r0 = xv[g][0] * pw + r0;
                     r1 = xv[g][1] * pw + r1;

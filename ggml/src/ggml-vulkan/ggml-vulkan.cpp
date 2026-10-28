@@ -1914,6 +1914,22 @@ static bool ggml_vk_dense_ypad_camps(uint64_t k);
 static bool ggml_vk_mmid_rega_enabled(const vk_device& device);
 static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type, uint32_t m, uint32_t n, uint32_t k);
 
+// HC_CMB: the prefill HC combine kernels (the attention-side HC post norm + inject, and the MoE epilogue + combine + norm + inject)
+// load every residual row of the token, and the routed slots in batches, before their first store / sum, instead of one round
+// trip per stream and per slot. Same values and arithmetic: bit-identical. Opt-in (GGML_VK_HC_CMB=1): -4% per call on both
+// kernels in Flash-Next prefill, ~6 ms per 2048-token ubatch, under the bar set for a default change.
+static bool ggml_vk_hc_cmb_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_CMB"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+// the HC_CMB spec constant: 0 old load order, 1 loads first, 2 the tests' negative control (GGML_VK_HC_CMB_TEST_BREAK=1: the MoE
+// epilogue drops its last routed slot, the attention-side combine reads stream 0's residual for every stream)
+static uint32_t ggml_vk_hc_cmb_spec() {
+    static const bool brk = [] { const char * e = getenv("GGML_VK_HC_CMB_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+    return !ggml_vk_hc_cmb_enabled() ? 0u : brk ? 2u : 1u;
+}
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -4505,7 +4521,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     dsv4_hc_post_norm_f16_len, dsv4_hc_post_norm_f16_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { has_post }, 1);
                 // one workgroup per token over the four streams, plus the inject projection
                 ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_inj[has_post], has_post ? "dsv4_hc_post_norm_inj_f16" : "dsv4_rms_norm_mul_rows_inj_f16",
-                    dsv4_hc_post_norm_inj_f16_len, dsv4_hc_post_norm_inj_f16_data, "main", 8, sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants), {1, 1, 1}, { has_post }, 1);
+                    dsv4_hc_post_norm_inj_f16_len, dsv4_hc_post_norm_inj_f16_data, "main", 8, sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants), {1, 1, 1},
+                    { has_post, ggml_vk_hc_cmb_spec() }, 1);
             }
         }
         if (device->fp16) {
@@ -4513,7 +4530,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #define CREATE_HC_MOE(s16, sname, v, vname, np) \
             ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_moe_post_norm[s16][v], "dsv4_hc_moe_post_norm_" #sname "_" #vname, \
                 dsv4_hc_moe_post_norm_ ## sname ## _ ## vname ## _len, dsv4_hc_moe_post_norm_ ## sname ## _ ## vname ## _data, "main", np, \
-                sizeof(vk_op_dsv4_hc_moe_post_norm_push_constants), {1, 1, 1}, { 1u }, 1);
+                sizeof(vk_op_dsv4_hc_moe_post_norm_push_constants), {1, 1, 1}, { 1u, ggml_vk_hc_cmb_spec() }, 1);
             CREATE_HC_MOE(1, s16, 0, f32, 8)
             CREATE_HC_MOE(1, s16, 1, f16, 8)
             CREATE_HC_MOE(1, s16, 2, inj, 10)
