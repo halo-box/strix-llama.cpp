@@ -75,6 +75,15 @@ void hc_mix_store(const FLOAT_TYPE g[4], const uint j, const uint first_row) {
 }
 #endif
 
+#ifdef GLU_B
+// MUL_MAT_VEC_GLU: the up columns, indexed like B
+layout (binding = 3) readonly buffer Fuse0V4 {vec4 data_fuse0_v4[];};
+// swiglu.comp's op on one loaded B vector: silu(gate) * up
+vec4 glu_b(const vec4 g, const vec4 u) {
+    return g / (1.0f + exp(-g)) * u;
+}
+#endif
+
 #ifdef MUL_MAT_ID
 uint expert_id;
 #endif
@@ -169,6 +178,12 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+#ifdef GLU_B
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID1) != 0) {
+                    // MUL_MAT_VEC_GLU: the shared gate, a SIGMOID_MUL (unary.comp op_sigmoid) on the [1, N] gate
+                    temp[j][n] *= FLOAT_TYPE(1.0f / (1.0f + exp(-float(data_fuse1[j]))));
+                }
+#endif
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
@@ -239,6 +254,12 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+#ifdef GLU_B
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID1) != 0) {
+                    // MUL_MAT_VEC_GLU: the shared gate, a SIGMOID_MUL (unary.comp op_sigmoid) on the [1, N] gate
+                    temp[j][n] *= FLOAT_TYPE(1.0f / (1.0f + exp(-float(data_fuse1[j]))));
+                }
+#endif
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
             }
@@ -296,6 +317,12 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
+#ifdef GLU_B
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SIGMOID1) != 0) {
+                    // MUL_MAT_VEC_GLU: the shared gate, a SIGMOID_MUL (unary.comp op_sigmoid) on the [1, N] gate
+                    tmpsh[j][n][0] *= FLOAT_TYPE(1.0f / (1.0f + exp(-float(data_fuse1[j]))));
+                }
+#endif
 #endif
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
             }

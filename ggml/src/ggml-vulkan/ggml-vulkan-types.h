@@ -1039,6 +1039,7 @@ struct vk_device_struct {
     // HC_POST(_GATE) + RMS_NORM + MUL (+ CPY f16) / RMS_NORM + MUL (+ CPY f16): [has_post][out_f16]
     vk_pipeline pipeline_dsv4_hc_post_norm[2][2];
     vk_pipeline pipeline_dsv4_hc_post_norm_inj[2];   // [has_post], f16 norm + the inject projection
+    vk_pipeline pipeline_dsv4_hc_post_norm_add;      // f32 norm, x = the sum of two inputs (HC_POST_GATE_NORM_ADD)
     // MoE epilogue (slot sum + shared expert) + HC_POST_GATE + RMS_NORM + MUL (+ CPY f16) (+ inject): [slot f16][f32 norm, f16 norm, f16 norm + inject]
     vk_pipeline pipeline_dsv4_hc_moe_post_norm[2][3];
     // HC_DEFER: the attention-side combine without its residual store [0] / storing only it [1]; the MoE epilogue that recomputes
@@ -1048,6 +1049,7 @@ struct vk_device_struct {
     // FN_DECODE_HC: the q8_0 hc up mat-vec with SCALE + SILU on B and DSV4_HC_PRE (gated) as the store, 4 rows per workgroup,
     // per workgroup size and column count like pipeline_dequant_mul_mat_vec_f32_f32
     vk_pipeline pipeline_fn_hc_up_mix_mv[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
+    vk_pipeline pipeline_mmv_glu_b[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1226,6 +1228,8 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+
+#define MAT_VEC_FUSION_FLAGS_SIGMOID1 0x10
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1495,11 +1499,16 @@ struct ggml_backend_vk_context {
     bool fused_hc_up_mix_cpy {};   // ... + CPY of the mixed stream into its row-padded destination (LLAMA_HC_MIX_PAD), stored there
     bool fused_qsa_score {};   // QSA scorer: MUL_MAT + RELU + 4-head sum (+ block bias) in the GEMM epilogue (QSA_SCORE)
     const ggml_tensor * qsa_score_bias {};   // the block bias of a QSA_SCORE chain, or nullptr
+    int  fused_mmv_glu {};        // SWIGLU (split) + MUL_MAT (q8_0 mat-vec) (+ SIGMOID + MUL of a [1, N] gate): the chain's node
+                                  // count, run as one mat-vec that forms B as it loads it (MUL_MAT_VEC_GLU(_SIG))
     bool fused_fn_decode_hc {};   // SCALE + SILU + MUL_MAT (mat-vec) + RESHAPE + DSV4_HC_PRE (gated) -> one mat-vec (FN_DECODE_HC)
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     bool fused_mmid_pair_glu {};   // MUL_MAT_ID+CPY(f16) x 2 + SWIGLU: gate, up and the SwiGLU in one weight-streaming launch
     bool fused_mmid_pair_glu_f32 {};   // ... its f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU
+    bool fused_fa_out_gate {};  // FLASH_ATTN_EXT+RESHAPE+VIEW+CONT+SIGMOID+MUL: the attention output gate after FA
+    bool fused_hc_post_norm_add {};  // ADD + HC_POST_NORM_GATE: the combine's x is the ADD's two inputs, summed in the kernel
+    bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
     // chunked GDN with the q/k l2 norms in gdn_chunk_prep (rebuilt per graph by ggml_vk_gdn_qk_norm_prepass): the raw q/k
     // views and norm constants per GATED_DELTA_NET node, and the RMS_NORM / SCALE nodes that then do not run
     struct gdn_qk_norm { const ggml_tensor * q_raw; const ggml_tensor * k_raw; float eps; float mul; };

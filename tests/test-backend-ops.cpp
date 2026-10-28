@@ -4455,6 +4455,220 @@ struct test_hc_post_norm : public test_case {
     }
 };
 
+// qwen4exp FFN-side combine with the FFN output's ADD in front (HC_POST_GATE_NORM_ADD on Vulkan): x = a + b [embd, T] (the MoE
+// sum and the gated shared expert), the gated combine into the residual [embd, hc, T], then the next mix's RMS_NORM -> MUL.
+// exact: the chain is built twice over the same inputs, the second with its ADD also a graph output (so it runs unfused), and the
+// outputs (combine and norm) are the scaled differences of the two plus 1, compared with a zero tolerance.
+struct test_hc_post_norm_add : public test_case {
+    const int embd, hc, tokens;
+    const bool exact;
+    std::vector<ggml_tensor *> verify;
+
+    test_hc_post_norm_add(int embd, int hc, int tokens, bool exact = false) : embd(embd), hc(hc), tokens(tokens), exact(exact) {}
+    std::string op_desc(ggml_tensor *) override { return "HC_POST_NORM_ADD"; }
+    std::string vars() override { return VARS_TO_STR4(embd, hc, tokens, exact); }
+
+    // GGML_VK_TEST_REQUIRE_HC_POST_NORM_ADD=1: with the knob on, exactly one fused chain per graph (the exact twin runs unfused)
+    // when there are tokens; none with no tokens or with GGML_VK_HC_POST_NORM_ADD=0
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_POST_NORM_ADD")) {
+            return true;
+        }
+        auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
+        const bool on = (skip == nullptr || skip(backend, "HC_POST_GATE_NORM_ADD") == nullptr) && tokens >= 1;
+        const int64_t n = dispatch_census_count(backend, "HC_POST_GATE_NORM_ADD");
+        const bool ok = on ? n == 1 : n == 0;
+        if (!ok) {
+            msg = "HC_POST_GATE_NORM_ADD dispatches: " + std::to_string(n) + ", expected " + (on ? "1" : "0");
+        }
+        return ok;
+    }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+    double max_nmse_err() override { return exact ? 0.0 : 1e-6; }
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return test_case::err(a, b, n);
+        }
+        size_t n_diff = 0;
+        for (size_t i = 0; i < n; ++i) {
+            n_diff += a[i] != b[i];
+        }
+        return (double) n_diff;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) init_tensor_uniform(t);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        ggml_tensor * a        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, tokens);
+        ggml_tensor * b        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, tokens);
+        ggml_tensor * inject   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        ggml_tensor * gamma_f  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, int64_t(embd) * hc);
+        // never freed or reused in place (the CPU reference reads them as given; the exact twin reads them again)
+        for (ggml_tensor * t : { residual, a, b, inject, gamma_f }) {
+            ggml_set_input(t);
+            ggml_set_output(t);
+        }
+        ggml_tensor * gamma = ggml_reshape_2d(ctx, gamma_f, embd, hc);
+        if (gf) { ggml_build_forward_expand(gf, gamma); }
+        // the model's order: the ADD, the gate chain, the combine, the norm
+        auto const chain = [&](ggml_tensor ** add_out, ggml_tensor ** comb_out) {
+            ggml_tensor * x = ggml_add(ctx, a, b);
+            *add_out = x;
+            ggml_tensor * w = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / hc)), 2.0f);
+            ggml_tensor * comb = ggml_dsv4_hc_post(ctx, x, residual, w, nullptr);
+            *comb_out = comb;
+            return ggml_mul(ctx, ggml_rms_norm(ctx, comb, 1e-6f), gamma);
+        };
+        ggml_tensor * add_a = nullptr, * comb_a = nullptr;
+        ggml_tensor * xn_a = chain(&add_a, &comb_a);
+        if (!exact) {
+            ggml_set_output(comb_a);
+            ggml_set_output(xn_a);
+            verify.push_back(comb_a);
+            verify.push_back(xn_a);
+            if (gf) { ggml_build_forward_expand(gf, comb_a); }
+            return xn_a;
+        }
+        if (gf) { ggml_build_forward_expand(gf, xn_a); }
+        ggml_tensor * add_b = nullptr, * comb_b = nullptr;
+        ggml_tensor * xn_b = chain(&add_b, &comb_b);
+        ggml_set_output(add_b);   // keeps the second chain's ADD unfused
+        if (gf) { ggml_build_forward_expand(gf, xn_b); }
+        // equal bits give exactly 1; a difference d gives 1 + 1e12 d
+        ggml_tensor * dc = ggml_scale_bias(ctx, ggml_sub(ctx, comb_a, comb_b), 1e12f, 1.0f);
+        ggml_tensor * dn = ggml_scale_bias(ctx, ggml_sub(ctx, xn_a, xn_b), 1e12f, 1.0f);
+        // one output holding both differences (a copy), so the graph reaches both
+        ggml_tensor * last = ggml_concat(ctx, ggml_reshape_2d(ctx, dc, int64_t(embd) * hc, tokens),
+                                              ggml_reshape_2d(ctx, dn, int64_t(embd) * hc, tokens), 0);
+        ggml_set_output(last);
+        verify.push_back(last);
+        return last;
+    }
+};
+
+// FFN down projection at decode (MUL_MAT_VEC_GLU on Vulkan): the gate and up columns [ff, T] -> SWIGLU (split) -> the down mat-vec
+// (q8_0 [ff, embd]); gated: then MUL(down, SIGMOID([1, T] gate)), the qwen3next / qwen4exp shared expert (MUL_MAT_VEC_GLU_SIG),
+// emitted as the model does (the down mat-vec, the gate projection, its SIGMOID, the MUL). exact: the chain is built twice over the same inputs, the second with its SWIGLU also a graph output (so it
+// runs unfused), and the outputs are the scaled differences of the two plus 1, compared with a zero tolerance.
+struct test_mmv_glu : public test_case {
+    const int ff, embd, tokens;
+    const bool gated;
+    const bool exact;
+    std::vector<ggml_tensor *> verify;
+
+    test_mmv_glu(int ff, int embd, int tokens, bool gated = false, bool exact = false) : ff(ff), embd(embd), tokens(tokens), gated(gated), exact(exact) {}
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_VEC_GLU"; }
+    std::string vars() override { return VARS_TO_STR5(ff, embd, tokens, gated, exact); }
+
+    // GGML_VK_TEST_REQUIRE_MMV_GLU=1: with the knob on, exactly one fused pair per graph (the exact twin runs unfused) at 1 to 8
+    // tokens, unless the backend recorded that the unfused mat-vec would take the q8_1 integer-dot path
+    // (path:MUL_MAT_VEC_GLU_MMVQ); none at 0 or more than 8 tokens, and none with GGML_VK_MMV_GLU=0
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_MMV_GLU")) {
+            return true;
+        }
+        auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
+        const int64_t n_mmvq = dispatch_census_count(backend, "path:MUL_MAT_VEC_GLU_MMVQ");
+        const bool on = (skip == nullptr || skip(backend, "MUL_MAT_VEC_GLU") == nullptr) && tokens >= 1 && tokens <= 8 && n_mmvq <= 0;
+        const int64_t n_pair = dispatch_census_count(backend, "MUL_MAT_VEC_GLU");
+        const int64_t n_sig  = dispatch_census_count(backend, "MUL_MAT_VEC_GLU_SIG");
+        // the gated form needs one column chunk: a single token always is one; other counts may fall back to the pair
+        const bool ok = !on ? n_pair + n_sig == 0 :
+                        !gated ? n_pair == 1 && n_sig == 0 :
+                        tokens == 1 ? n_sig == 1 && n_pair == 0 : n_pair + n_sig == 1;
+        if (!ok) {
+            msg = "MUL_MAT_VEC_GLU / _SIG dispatches: " + std::to_string(n_pair) + " / " + std::to_string(n_sig) + ", expected " +
+                  (on ? (gated ? "0 / 1" : "1 / 0") : "0 / 0") + " (MMVQ path " + std::to_string(n_mmvq) + ")";
+        }
+        return ok;
+    }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+    // vs the CPU, which quantizes the mat-vec B operand to q8_0
+    double max_nmse_err() override { return exact ? 0.0 : 1e-3; }
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return test_case::err(a, b, n);
+        }
+        size_t n_diff = 0;
+        for (size_t i = 0; i < n; ++i) {
+            n_diff += a[i] != b[i];
+        }
+        return (double) n_diff;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            // the shared gate's weight kept small, so the gate (a 256-term dot) stays inside the sigmoid's unsaturated range
+            if (strcmp(t->name, "w_sg") == 0) {
+                init_tensor_uniform(t, -0.05f, 0.05f);
+            } else {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        ggml_tensor * gate   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ff, tokens);
+        ggml_tensor * up     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ff, tokens);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, ff, embd);
+        // the gate projection's input and weight (gated only)
+        ggml_tensor * x      = gated ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, tokens) : nullptr;
+        ggml_tensor * w_sg   = gated ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 1) : nullptr;
+        if (w_sg) {
+            ggml_set_name(w_sg, "w_sg");
+        }
+        // never freed or reused in place (the CPU reference reads them as given; the exact twin reads them again)
+        for (ggml_tensor * t : { gate, up, w_down, x, w_sg }) {
+            if (t) {
+                ggml_set_input(t);
+                ggml_set_output(t);
+            }
+        }
+        // the model's order: the SWIGLU early, then the down mat-vec, the gate projection, SIGMOID, MUL
+        auto const chain = [&](ggml_tensor ** h_out) {
+            ggml_tensor * h = ggml_swiglu_split(ctx, gate, up);
+            if (gf) { ggml_build_forward_expand(gf, h); }
+            *h_out = h;
+            ggml_tensor * d = ggml_mul_mat(ctx, w_down, h);
+            if (!gated) {
+                return d;
+            }
+            return ggml_mul(ctx, d, ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_sg, x)));
+        };
+        ggml_tensor * h_a = nullptr;
+        ggml_tensor * a = chain(&h_a);
+        if (!exact) {
+            ggml_set_output(a);
+            verify.push_back(a);
+            return a;
+        }
+        if (gf) { ggml_build_forward_expand(gf, a); }
+        ggml_tensor * h_b = nullptr;
+        ggml_tensor * b = chain(&h_b);
+        ggml_set_output(h_b);   // keeps the second chain unfused
+        if (gf) { ggml_build_forward_expand(gf, b); }
+        // equal bits give exactly 1; a difference d gives 1 + 1e12 d
+        ggml_tensor * last = ggml_scale_bias(ctx, ggml_sub(ctx, a, b), 1e12f, 1.0f);
+        ggml_set_output(last);
+        verify.push_back(last);
+        return last;
+    }
+};
+
 // qwen4exp decode hc mix, in model order (FN_DECODE_HC on Vulkan): the f32 hc norm xn [embd * hc, T] into the hc down mat-vec
 // (lo), SCALE(1 / hc) -> SILU -> the hc up mat-vec (q8_0 [rank, embd * hc]) -> RESHAPE -> DSV4_HC_PRE (gated) over xn as [embd, hc, T].
 // exact: the chain is built twice over the same inputs, the second with its SILU also a graph output (so it runs unfused), and the
@@ -14460,6 +14674,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fn_decode_hc(2560, 320, 9, exact));   // past the mat-vec columns: unfused
         test_cases.emplace_back(new test_fn_decode_hc(2560, 320, 0, exact));   // no tokens (a ubatch with no outputs): unfused
     }
+    // HC_POST_GATE_NORM_ADD: the Flash-Next FFN-side combine at 1-8 tokens and a short prompt tail, a small shape, no tokens
+    for (bool exact : {false, true}) {
+        for (int tokens : {1, 2, 3, 8, 17}) {
+            test_cases.emplace_back(new test_hc_post_norm_add(2560, 4, tokens, exact));
+        }
+        test_cases.emplace_back(new test_hc_post_norm_add(256, 2, 5, exact));
+        test_cases.emplace_back(new test_hc_post_norm_add(2560, 4, 0, exact));
+    }
+    // MUL_MAT_VEC_GLU: the Flash-Next shared expert down projection (640 -> 2560) at 1-8 tokens (the column chunks of the q8_0
+    // mat-vec), a dense FFN shape, past the mat-vec columns and with no tokens (a ubatch with no outputs): both unfused
+    for (bool exact : {false, true}) {
+        for (bool gated : {false, true}) {
+            for (int tokens = 1; tokens <= 8; ++tokens) {
+                test_cases.emplace_back(new test_mmv_glu(640, 2560, tokens, gated, exact));
+            }
+            test_cases.emplace_back(new test_mmv_glu(4096, 1024, 1, gated, exact));
+            test_cases.emplace_back(new test_mmv_glu(640, 2560, 9, gated, exact));
+            test_cases.emplace_back(new test_mmv_glu(640, 2560, 0, gated, exact));
+        }
+    }
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 64, 1, GGML_TYPE_Q4_0, 8));
     // bf16: a bf16 weight LLAMA_BF16_TO_F16 kept (out of f16 range) meets the f16 mixed stream
     // B paths: f16-B native (q8_0), int8 MMQ quantizing the f16 B (q4_0), the dense router (q4_K), non-quantized (bf16)
@@ -15753,7 +15987,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (auto multi_add : {false, true}) {
         for (auto set_rows : {false, true}) {
             for (auto broadcast : {false, true}) {
-                for (auto rope : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_IMROPE}) {
+                for (auto rope : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_MROPE}) {
                     test_cases.emplace_back(new test_rms_norm_mul_rope({768, 1, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                     test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 1, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
                     test_cases.emplace_back(new test_rms_norm_mul_rope({768, 3, 5, 1}, 1e-6f, multi_add, set_rows, broadcast, rope));
@@ -15766,6 +16000,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+    // the Flash-Next attention q and k norms at decode and in a short batch: interleaved M-RoPE over [256, heads, T], the k chain
+    // into the f16 KV cache
+    for (int t : {1, 3}) {
+        test_cases.emplace_back(new test_rms_norm_mul_rope({256, 24, t, 1}, 1e-6f, false, false, false, GGML_ROPE_TYPE_IMROPE));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({256, 2, t, 1}, 1e-6f, false, true, false, GGML_ROPE_TYPE_IMROPE));
     }
     // ne[2] > 65535 exceeds the CUDA gridDim.y limit (#27901)
     test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, false, false, GGML_ROPE_TYPE_NORMAL));
@@ -19232,6 +19472,8 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("RMS_NORM_SCALE",      new test_rms_norm_scale({ 128, 16, 9, 1 }), "RMS_NORM_SCALE/2=1");
     add("RMS_NORM_MUL_ROPE",   new test_rms_norm_mul_rope({ 128, 4, 7, 2 }), "RMS_NORM_MUL_ROPE/3=1");
     add("RMS_NORM_MUL_ROPE_VIEW_SET_ROWS", new test_rms_norm_mul_rope({ 128, 4, 7, 1 }, 1e-6f, false, true), "RMS_NORM_MUL_ROPE_VIEW_SET_ROWS/5=1");
+    add("RMS_NORM_MUL_ROPE",   new test_rms_norm_mul_rope({ 256, 24, 1, 1 }, 1e-6f, false, false, false, GGML_ROPE_TYPE_IMROPE), "RMS_NORM_MUL_ROPE/3=1");
+    add("RMS_NORM_MUL_ROPE_VIEW_SET_ROWS", new test_rms_norm_mul_rope({ 256, 2, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_IMROPE), "RMS_NORM_MUL_ROPE_VIEW_SET_ROWS/5=1");
     add("RMS_NORM_VIEW_SET_ROWS", new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false), "RMS_NORM_VIEW_SET_ROWS/3=1");
     add("ROPE_VIEW_SET_ROWS",  new test_rope_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 128, 32, 8, 1 }, GGML_ROPE_TYPE_NORMAL), "ROPE_VIEW_SET_ROWS/3=1");
     add("HC_POST_GATE",        new test_dsv4_hc_post(4096, 21, false, true), "HC_POST_GATE/4=1");
@@ -19242,6 +19484,9 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("HC_MOE_EPI_SE",       new test_hc_moe_epi(260, 4, 32, 4, true, 1, 2), "HC_MOE_EPI_SE/13=1");
     add("HC_MOE_EPI_SE_F32",   new test_hc_moe_epi(256, 4, 32, 4, true, 0, 2), "HC_MOE_EPI_SE_F32/12=1");
     add("FN_DECODE_HC",        new test_fn_decode_hc(256, 64, 1), "FN_DECODE_HC/5=1");
+    add("MUL_MAT_VEC_GLU",     new test_mmv_glu(256, 128, 1), "MUL_MAT_VEC_GLU/2=1");
+    add("HC_POST_GATE_NORM_ADD", new test_hc_post_norm_add(256, 4, 1), "HC_POST_GATE_NORM_ADD/7=1");
+    add("MUL_MAT_VEC_GLU_SIG", new test_mmv_glu(256, 128, 1, true), "MUL_MAT_VEC_GLU_SIG/4=1");
     add("GELU_MUL",            new test_unary_mul(GGML_UNARY_OP_GELU,     GGML_TYPE_F32, { 128, 2, 2, 2 }), "GELU_MUL/2=1");
     add("SIGMOID_MUL",         new test_unary_mul(GGML_UNARY_OP_SIGMOID,  GGML_TYPE_F32, { 128, 2, 2, 2 }), "SIGMOID_MUL/2=1");
     add("SILU_MUL",            new test_unary_mul(GGML_UNARY_OP_SILU,     GGML_TYPE_F32, { 128, 2, 2, 2 }), "SILU_MUL/2=1");
