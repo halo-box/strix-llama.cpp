@@ -27,7 +27,7 @@
 // 16-byte aligned rows (slot offsets and strides multiples of 4 elements) and zero misalignment on every operand.
 
 layout(constant_id = 0) const uint HAS_POST = 1;   // kept for the pipeline layout; the MoE epilogue always combines
-// LOADS_FIRST (GGML_VK_HC_CMB=1, opt-in): the routed slots are loaded in batches of SLOT_BATCH before they are summed (one round
+// LOADS_FIRST (GGML_VK_HC_CMB, default on): the routed slots are loaded in batches of SLOT_BATCH before they are summed (one round
 // trip per batch instead of one per slot), and every residual row of the token is loaded before the first store. Same values,
 // same arithmetic in the same order: bit-identical.
 layout(constant_id = 1) const uint LOADS_FIRST = 0;
