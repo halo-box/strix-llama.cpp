@@ -6274,7 +6274,8 @@ struct test_gdn_conv_prefill : public test_case {
     // GGML_VK_TEST_REQUIRE_GDN_QKNORM=1: the chunked GDN (>= 64 tokens) normalises q / k itself and the norm nodes do not run;
     // GGML_VK_GDN_QKNORM=0 under the assert is the negative control.
     // GGML_VK_TEST_REQUIRE_GDN_CONVFOLD=1: it also computes the conv + SiLU on load and the SSM_CONV / SILU nodes do not run
-    // (not with an extra SiLU reader, under 64 tokens, or with GGML_VK_GDN_CONVFOLD=0 / GGML_VK_GDN_QKNORM=0: count 0)
+    // (not with an extra SiLU reader, under 64 tokens, under 32 value-head sequences unless GGML_VK_GDN_CONVFOLD=2, or with
+    // GGML_VK_GDN_CONVFOLD=0 / GGML_VK_GDN_QKNORM=0: count 0)
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         const bool chunk = env_knob_on("GGML_VK_GDN_CHUNK") && n_tokens >= 64;
@@ -6287,7 +6288,10 @@ struct test_gdn_conv_prefill : public test_case {
             }
         }
         if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_CONVFOLD")) {
-            const int64_t want = chunk && !extra_reader && env_knob_on("GGML_VK_GDN_CONVFOLD") && env_knob_on("GGML_VK_GDN_QKNORM") &&
+            // the backend folds from 32 value-head sequences up unless GGML_VK_GDN_CONVFOLD=2
+            const char * cf = getenv("GGML_VK_GDN_CONVFOLD");
+            const bool heads_ok = (int64_t) n_v_heads * n_seqs >= 32 || (cf != nullptr && atoi(cf) == 2);
+            const int64_t want = chunk && !extra_reader && heads_ok && env_knob_on("GGML_VK_GDN_CONVFOLD") && env_knob_on("GGML_VK_GDN_QKNORM") &&
                                  env_knob_on("GGML_VK_SSMCONV_DIRECT") ? 1 : 0;
             const int64_t n = dispatch_census_count(backend, "path:GDN_CONV_FOLD");
             if (n != want) {
@@ -15854,6 +15858,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_conv_prefill(65, 2, 4));
     test_cases.emplace_back(new test_gdn_conv_prefill(128, 2, 6));
     test_cases.emplace_back(new test_gdn_conv_prefill(96, 2, 4, 2));
+    test_cases.emplace_back(new test_gdn_conv_prefill(128, 4, 16, 2));   // 32 value-head sequences: folds by default
+    test_cases.emplace_back(new test_gdn_conv_prefill(256, 16, 16));     // Qwen3.5-2B heads: no fold by default
     test_cases.emplace_back(new test_gdn_conv_prefill(64, 2, 4, 2));    // two sequences at the chunk threshold
     test_cases.emplace_back(new test_gdn_conv_prefill(48, 2, 4, 2));    // two sequences under it: sequential kernel, no fold
     test_cases.emplace_back(new test_gdn_conv_prefill(333, 16, 48));

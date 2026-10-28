@@ -18863,10 +18863,19 @@ static void ggml_vk_gdn_qk_norm_prepass(ggml_backend_vk_context * ctx, const ggm
 // reads the conv input x instead; the SSM_CONV and the SILU are skipped, so the [C, T] SiLU output is never written. The conv
 // is computed with ssm_conv.comp MODE 1's expressions: bit-identical to the unfolded chain. graph_optimize keeps x and the conv
 // state allocated through the GDN (ggml_vk_gdn_conv_fold_structural).
-static bool ggml_vk_gdn_conv_fold_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_VK_GDN_CONVFOLD"); return e == nullptr || atoi(e) != 0; }();
-    return on;
+static int ggml_vk_gdn_conv_fold_mode() {
+    static const int mode = [] { const char * e = getenv("GGML_VK_GDN_CONVFOLD"); return e == nullptr ? 1 : atoi(e); }();
+    return mode;
 }
+
+static bool ggml_vk_gdn_conv_fold_enabled() {
+    return ggml_vk_gdn_conv_fold_mode() != 0;
+}
+
+// The scan recomputes each v value from four x rows on its critical path. With few value heads (one wave per 16 state columns,
+// H x 8 waves per sequence) that latency is exposed: Qwen3.5-2B (16 value heads) ran its GDN ~0.5 ms per layer slower than the
+// conv it saved, Flash-Next (48) ~0.02 ms. Fold only from 32 value-head sequences up; GGML_VK_GDN_CONVFOLD=2 folds at any count.
+static constexpr int64_t gdn_conv_fold_min_heads = 32;
 
 // the shape part of the match (no buffers): the GDN's q / k are SCALE(RMS_NORM(view)) and q, k, v are views of the SILU of an
 // SSM_CONV over a concat the direct conv accepts. Returns the concat's node index or -1; fills the direct match.
@@ -18880,6 +18889,9 @@ static int ggml_vk_gdn_conv_fold_structural(const ggml_backend_vk_context * ctx,
     const ggml_tensor * k = raw_of(g->src[1]);
     const ggml_tensor * v = g->src[2];
     if (!q || !k || !v || !q->view_src || q->view_src != k->view_src || q->view_src != v->view_src) {
+        return -1;
+    }
+    if (ggml_vk_gdn_conv_fold_mode() != 2 && v->ne[1] * v->ne[3] < gdn_conv_fold_min_heads) {
         return -1;
     }
     const ggml_tensor * su = q->view_src;
