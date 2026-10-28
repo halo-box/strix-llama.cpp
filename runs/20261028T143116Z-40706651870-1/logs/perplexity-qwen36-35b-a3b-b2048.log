@@ -1,0 +1,32 @@
+0.00.749.515 W model has unused tensor blk.40.attn_norm.weight (size = 8192 bytes) -- ignoring
+0.00.749.523 W model has unused tensor blk.40.post_attention_norm.weight (size = 8192 bytes) -- ignoring
+0.00.749.527 W model has unused tensor blk.40.attn_q.weight (size = 17825792 bytes) -- ignoring
+0.00.749.529 W model has unused tensor blk.40.attn_k.weight (size = 1114112 bytes) -- ignoring
+0.00.749.531 W model has unused tensor blk.40.attn_v.weight (size = 1114112 bytes) -- ignoring
+0.00.749.535 W model has unused tensor blk.40.attn_output.weight (size = 8912896 bytes) -- ignoring
+0.00.749.537 W model has unused tensor blk.40.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.749.538 W model has unused tensor blk.40.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.749.540 W model has unused tensor blk.40.ffn_gate_inp.weight (size = 1048576 bytes) -- ignoring
+0.00.749.542 W model has unused tensor blk.40.ffn_down_exps.weight (size = 285212672 bytes) -- ignoring
+0.00.749.545 W model has unused tensor blk.40.ffn_gate_exps.weight (size = 285212672 bytes) -- ignoring
+0.00.749.546 W model has unused tensor blk.40.ffn_up_exps.weight (size = 285212672 bytes) -- ignoring
+0.00.749.548 W model has unused tensor blk.40.ffn_gate_inp_shexp.weight (size = 4096 bytes) -- ignoring
+0.00.749.549 W model has unused tensor blk.40.ffn_gate_shexp.weight (size = 1114112 bytes) -- ignoring
+0.00.749.551 W model has unused tensor blk.40.ffn_up_shexp.weight (size = 1114112 bytes) -- ignoring
+0.00.749.552 W model has unused tensor blk.40.ffn_down_shexp.weight (size = 1114112 bytes) -- ignoring
+0.00.749.555 W model has unused tensor blk.40.nextn.eh_proj.weight (size = 8912896 bytes) -- ignoring
+0.00.749.556 W model has unused tensor blk.40.nextn.enorm.weight (size = 8192 bytes) -- ignoring
+0.00.749.558 W model has unused tensor blk.40.nextn.hnorm.weight (size = 8192 bytes) -- ignoring
+0.00.749.563 W model has unused tensor blk.40.nextn.shared_head_norm.weight (size = 8192 bytes) -- ignoring
+0.04.443.414 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but f16 MoE activations is assigned to device CPU (usually due to missing support)
+0.04.443.417 W resolve_fused_ops: f16 MoE activations not supported, set to disabled
+0.04.545.663 I cmn          init: llama threadpool init, n_threads = 16
+0.04.643.405 I 
+0.04.643.512 I system_info: n_threads = 16 (n_threads_batch = 16) / 32 | ROCm : NO_VMM = 1 | FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.04.643.529 I perplexity: tokenizing the input ..
+0.04.923.580 I perplexity: tokenization took 280.041 ms
+0.04.923.891 I perplexity: calculating perplexity over 32 chunks, n_ctx=4096, batch_size=2048, n_seq=1
+0.07.066.274 I perplexity: 2.14 seconds per pass - ETA 1.13 minutes
+[1]6.2052,[2]6.3924,[3]5.1687,[4]5.0592,[5]5.3102,[6]5.4503,[7]5.6665,[8]5.8327,[9]5.8889,[10]5.5340,[11]5.6601,[12]5.7061,[13]5.7592,[14]5.9639,[15]5.8937,[16]5.7355,[17]5.7354,[18]5.6973,[19]5.5364,[20]5.3863,[21]5.4125,[22]5.6020,[23]5.6406,[24]5.7063,[25]5.6881,[26]5.6211,[27]5.5761,[28]5.5351,[29]5.4610,[30]5.4275,[31]5.4835,[32]5.5650,
+1.04.893.003 I Final estimate: PPL = 5.5650 +/- 0.05122
+

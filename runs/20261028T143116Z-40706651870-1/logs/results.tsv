@@ -1,0 +1,20 @@
+llama-bench	qwen36-35b-a3b	0	18
+perplexity	qwen36-35b-a3b	2048	0	65.2
+perplexity	qwen36-35b-a3b	4096	0	60.3
+llama-bench	qwen38-27b	0	18
+perplexity	qwen38-27b	2048	0	385.6
+perplexity	qwen38-27b	4096	0	382.7
+llama-bench	flash-next-iq2xs	0	18
+perplexity	flash-next-iq2xs	2048	0	174.2
+perplexity	flash-next-iq2xs	4096	0	159.1
+ops-perf-group	ROCm0	mul_mat	0	102
+ops-perf-group	ROCm0	mul_mat_id	0	102
+ops-perf-group	ROCm0	list	0	174
+ops-perf	ROCm0	0	378	0
+llama-bench-vulkan	qwen36-35b-a3b	0	18
+llama-bench-vulkan	qwen38-27b	0	18
+llama-bench-vulkan	flash-next-iq2xs	0	18
+ops-perf-group	Vulkan0	mul_mat	0	120
+ops-perf-group	Vulkan0	mul_mat_id	0	120
+ops-perf-group	Vulkan0	list	0	178
+ops-perf	Vulkan0	0	418	0
