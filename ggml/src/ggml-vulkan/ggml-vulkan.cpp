@@ -8081,13 +8081,13 @@ static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b
     return ggml_vk_route_match(list, t) || (b_f16 && ggml_vk_dense_f16b_native(t));
 }
 
-// GGML_VK_HC_W8A8=1 (opt-in, default 0): a q8_0 GEMM with few rows and a long K (the qwen4exp hc down, m = 320, k = 10240)
-// takes the int8 MMQ path (B quantized to q8_1) with a tile that launches enough workgroups, instead of the f16-B coopmat
-// path's 128 x 128 tile (3 x n/128 workgroups). Off by default: rounding the activation to q8_1 moves the logits by more than
-// the -ub 1024 vs 2048 difference (Flash-Next, ~1.4x it in mean KLD). Rows <= GGML_VK_HC_W8A8_MAXM (384), k >= 4096,
+// GGML_VK_HC_W8A8 (default 1; 0 = the exact f16-B path): a q8_0 GEMM with few rows and a long K (the qwen4exp hc down, m = 320,
+// k = 10240) takes the int8 MMQ path (B quantized to q8_1) with a tile that launches enough workgroups, instead of the f16-B coopmat
+// path's 128 x 128 tile (3 x n/128 workgroups). On by default for speed: rounding the activation to q8_1 moves the logits by ~1.4x
+// the -ub 1024 vs 2048 difference in mean KLD (Flash-Next); GGML_VK_HC_W8A8=0 keeps the exact path. Rows <= GGML_VK_HC_W8A8_MAXM (384), k >= 4096,
 // n >= GGML_VK_HC_W8A8_MINN (512). GGML_VK_HC_W8A8_TILE picks the tile (index into the pipeline list).
 static int ggml_vk_hc_w8a8_mode() {
-    static const int env = [] { const char * e = getenv("GGML_VK_HC_W8A8"); return e ? atoi(e) : 0; }();
+    static const int env = [] { const char * e = getenv("GGML_VK_HC_W8A8"); return e ? atoi(e) : 1; }();
     return env;
 }
 
