@@ -16990,7 +16990,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_prefill(true, 513, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(false, 512, GGML_TYPE_Q5_1));
     test_cases.emplace_back(new test_moe_prefill(false, 2048, GGML_TYPE_Q5_1, true));
-    for (int64_t n : {100, 513, 1001}) {   // the streaming q5_1 down at odd tile counts (multi-tile workgroups, tails)
+    for (int64_t n : {1601, 2047, 3001}) {   // the streaming q5_1 down at odd tile counts (multi-tile workgroups, tails); the histogram needs n >~ 1500
         test_cases.emplace_back(new test_moe_prefill(false, n, GGML_TYPE_Q5_1, true));
     }
     // expert repack buffer (GGML_TEST_EXTRA_BUFT=1): the Flash-Next expert shapes at decode and below the f16 chain's 32 tokens
