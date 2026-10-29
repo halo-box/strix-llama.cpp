@@ -1588,14 +1588,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
+    // lazy-mode AUTO on a device without mmap support (e.g. iGPUs, see #28160): the lazy tensors (the PLE n-gram table)
+    // are CPU tensors read through a file mapping, which does not need the device to support mmap. Falling back to OFF
+    // loaded the whole table into an anonymous CPU buffer (27 GiB on Qwen3.8-Flash-Next). Keep AUTO unless the user
+    // opts out with LLAMA_LAZY_AUTO_NOMMAP=off.
     if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
-        for (const auto & dev : devices) {
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev.dev, &props);
-            if (!props.caps.mmap_support) {
-                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
-                break;
+        const char * e = getenv("LLAMA_LAZY_AUTO_NOMMAP");
+        if (e && std::string(e) == "off") {
+            for (const auto & dev : devices) {
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev.dev, &props);
+                if (!props.caps.mmap_support) {
+                    ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
+                    break;
+                }
             }
         }
     }
