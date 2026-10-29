@@ -23,6 +23,9 @@ layout(constant_id = 0) const uint HAS_POST = 1;
 // the four streams' loads are in flight together instead of one stream per round trip (the stores to res_out could alias the
 // residual reads as far as the compiler knows). Same values, same arithmetic and order: bit-identical.
 layout(constant_id = 1) const uint LOADS_FIRST = 0;
+// DEFER_MODE (GGML_VK_HC_DEFER): 1 = the combine output is not stored (the next combine, the MoE epilogue, recomputes it from the same
+// inputs with the same expression); 2 = store only the combine output (materialise a deferred one; norm and inject not written)
+layout(constant_id = 2) const uint DEFER_MODE = 0;
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 const uint HC = 4;
@@ -117,14 +120,20 @@ void main() {
                     r0 = xv[g][0] * pw + r0;
                     r1 = xv[g][1] * pw + r1;
                     const uint ob = (c * p.so1 + t * p.so2) / 4 + e4;
-                    data_o[ob]     = r0;
-                    data_o[ob + 1] = r1;
+                    if (DEFER_MODE != 1) {
+                        data_o[ob]     = r0;
+                        data_o[ob + 1] = r1;
+                    }
                 }
             }
             a[c][g][0] = r0;
             a[c][g][1] = r1;
             ss[c] += dot(r0, r0) + dot(r1, r1);
         }
+    }
+
+    if (DEFER_MODE == 2) {
+        return;   // materialise: the combine output only
     }
 
     // one reduction for the four stream sums: subgroup partials, then the subgroups in order
