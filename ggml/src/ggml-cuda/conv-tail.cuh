@@ -58,6 +58,14 @@ static inline bool ggml_cuda_conv_next_is_noop(const ggml_cgraph * cgraph, int i
 }
 
 // GGML_CONV_FUSE_DEBUG=1 prints why a concat did not match, with the node index the decision was made at
+// GGML_CONV_FUSE_DEBUG: one stderr line per conv that takes a fused path (a census of what engaged)
+static inline void ggml_cuda_conv_engaged(const char * which, const char * path, int64_t T) {
+    static const bool dbg = getenv("GGML_CONV_FUSE_DEBUG") != nullptr;
+    if (dbg) {
+        fprintf(stderr, "%s: %s T=%lld\n", which, path, (long long) T);
+    }
+}
+
 static inline bool ggml_cuda_conv_reject(const char * which, const char * why, int node) {
     static const bool dbg = getenv("GGML_CONV_FUSE_DEBUG") != nullptr;
     if (dbg) {
@@ -90,7 +98,9 @@ static inline bool ggml_cuda_conv_whole(const ggml_tensor * s, const ggml_tensor
 // concat src[1] is TRANSPOSE(view of x): x must be the whole contiguous storage of a [C, T] activation, whatever
 // shape its producer gave it (qwen4exp's grouped norm leaves it [n_embd, hc, T]); C and T come from the transpose.
 // With S > 1 sequences the transpose is [T, C, S] and x holds the S [C, T] blocks back to back.
-static inline const ggml_tensor * ggml_cuda_conv_activation_seqs(const ggml_tensor * tr, int64_t & C, int64_t & T, int64_t & S) {
+// prefix_ok: one sequence may take the first T tokens of a longer x (the delta-net conv split at a recurrent state snapshot)
+static inline const ggml_tensor * ggml_cuda_conv_activation_seqs(const ggml_tensor * tr, int64_t & C, int64_t & T, int64_t & S,
+                                                                 bool prefix_ok = false) {
     if (!tr || tr->op != GGML_OP_TRANSPOSE || tr->type != GGML_TYPE_F32 || !tr->view_src || tr->view_offs != 0 ||
         tr->ne[3] != 1) {
         return nullptr;
@@ -99,7 +109,8 @@ static inline const ggml_tensor * ggml_cuda_conv_activation_seqs(const ggml_tens
     C = tr->ne[1];
     S = tr->ne[2];
     const ggml_tensor * x = tr->view_src;
-    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x) != C * T * S ||
+    const bool size_ok = prefix_ok && S == 1 ? (x->ne[0] == C && ggml_nelements(x) >= C * T) : ggml_nelements(x) == C * T * S;
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !size_ok ||
         tr->nb[1] != sizeof(float) || tr->nb[0] != (size_t) C * sizeof(float) || (S > 1 && tr->nb[2] != (size_t) C * T * sizeof(float))) {
         return nullptr;
     }
