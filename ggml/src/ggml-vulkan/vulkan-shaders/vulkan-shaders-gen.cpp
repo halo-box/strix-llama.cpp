@@ -1032,6 +1032,8 @@ void process_shaders() {
     string_to_spv("mul_mm_id_down_q5_1_f16_rp_v6", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"KC", "128"}, {"PK16", "1"}});
     string_to_spv("mul_mm_id_down_q5_1_f16_rp_v7", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "2"}, {"PK16", "1"}});
     string_to_spv("mul_mm_id_down_q5_1_f16_rp_v8", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"KC", "128"}, {"TPW", "2"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v9", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "8"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v10", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "16"}});
     // expert repack buffer: the mat-vec MUL_MAT_ID on the repacked order, and the inverse copy for the other readers
     string_to_spv("mul_mat_vec_id_q4_k_rp_f32", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}});
     string_to_spv("mul_mat_vec_id_q5_1_rp_f32", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_1", "1"}});
