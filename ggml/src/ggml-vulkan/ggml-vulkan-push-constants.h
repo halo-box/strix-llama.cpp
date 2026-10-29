@@ -323,6 +323,13 @@ struct vk_op_dsv4_hc_moe_post_norm_defer_push_constants {
     float    gate_out_a;
 };
 static_assert(sizeof(vk_op_dsv4_hc_moe_post_norm_defer_push_constants) <= 128);
+struct vk_op_argmax_split_push_constants {
+    uint32_t ncols;     // part: row length; reduce: partials per row
+    uint32_t nrows;
+    uint32_t chunk;     // part: columns per workgroup
+    uint32_t a_offset;  // part: source misalignment (elements)
+    uint32_t d_offset;  // reduce: destination misalignment (elements)
+};
 
 // dsv4_hc_res16_widen.comp (HC_BF16RES fallback): bf16 stream / token strides (elements), f32 stream / token strides (floats)
 struct vk_op_dsv4_hc_res16_widen_push_constants {
