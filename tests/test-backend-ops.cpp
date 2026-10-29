@@ -7393,10 +7393,15 @@ struct test_gdn_conv_prefill : public test_case {
     const int n_v_heads;
     const int n_seqs;
     const bool extra_reader; // a second reader of the SiLU output: the conv must run, so the conv fold has to decline
-    test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads, int n_seqs = 1, bool extra_reader = false)
-        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads), n_seqs(n_seqs), extra_reader(extra_reader) {}
+    const int  x_tail;       // x holds x_tail more tokens after the n_tokens the conv reads (one sequence): the first part
+                             // of a conv split at a recurrent state snapshot, whose x is a prefix view of the projection
+    test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads, int n_seqs = 1, bool extra_reader = false, int x_tail = 0)
+        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads), n_seqs(n_seqs), extra_reader(extra_reader), x_tail(x_tail) {}
     std::string op_desc(ggml_tensor *) override { return "GDN_CONV_PREFILL"; }
     std::string vars() override {
+        if (x_tail > 0) {
+            return VARS_TO_STR4(n_tokens, n_k_heads, n_v_heads, x_tail);
+        }
         if (n_seqs == 1 && !extra_reader) {
             return VARS_TO_STR3(n_tokens, n_k_heads, n_v_heads);
         }
@@ -7457,9 +7462,16 @@ struct test_gdn_conv_prefill : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int C = 128 * (2 * n_k_heads + n_v_heads);
         const int S = n_seqs;
-        ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_tokens, S);
+        GGML_ASSERT(x_tail == 0 || S == 1);
+        ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_tokens + x_tail, S);
         ggml_set_name(x_src, "x_src");
         ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, not a permanent input
+        ggml_tensor * x_rest = nullptr;
+        if (x_tail > 0) {
+            // tokens [n_tokens, n_tokens + x_tail) feed a second, later reader (the model's second conv part)
+            x_rest = ggml_view_3d(ctx, x, C, x_tail, 1, x->nb[1], x->nb[1] * x_tail, x->nb[1] * n_tokens);
+            x = ggml_view_3d(ctx, x, C, n_tokens, 1, x->nb[1], x->nb[1] * n_tokens, 0);
+        }
         ggml_tensor * history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, S);
         ggml_set_name(history, "history");
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
@@ -7496,6 +7508,10 @@ struct test_gdn_conv_prefill : public test_case {
         ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, n_v_heads, S);
         ggml_set_name(state, "state");
         ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        if (x_rest != nullptr) {
+            // read the rest of x after the GDN, as the second conv part does; folded into the output with weight 0
+            out = ggml_add(ctx, out, ggml_scale(ctx, ggml_sum(ctx, ggml_cont(ctx, x_rest)), 0.0f));
+        }
         // the extra reader's result must be checked too: add it in (same shape only for this purpose: reduce to a scalar)
         return extra ? ggml_add(ctx, out, ggml_scale(ctx, ggml_sum(ctx, extra), 0.0f)) : out;
     }
@@ -18891,6 +18907,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_conv_prefill(48, 2, 4, 2));    // two sequences under it: sequential kernel, no fold
     test_cases.emplace_back(new test_gdn_conv_prefill(333, 16, 48));
     test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 4, 1, true));
+    // x is a prefix view of a longer projection (the first part of a conv split at a recurrent state snapshot): the served
+    // Flash-Next end-of-prompt shape (2048 tokens, snapshot 4 before the end), a ragged one, a long second part
+    test_cases.emplace_back(new test_gdn_conv_prefill(2044, 16, 48, 1, false, 4));
+    test_cases.emplace_back(new test_gdn_conv_prefill(329, 16, 48, 1, false, 4));
+    test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 4, 1, false, 100));
     // Multiple sequences must remain on the generic fallback.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));
