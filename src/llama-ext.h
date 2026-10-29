@@ -169,6 +169,8 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // The decode is recorded while the previous one still runs on the GPU and is submitted as soon as that one has sampled,
 // so the host work between tokens leaves the GPU idle only for the token handoff. The previous decode is an ordinary
 // llama_decode with one output for seq_id, or the last llama_decode_chain. Single sequence, one GPU backend.
+// On the first call after an ordinary decode, *token is the token that decode sampled for seq_id, or LLAMA_TOKEN_NULL to
+// take the backend-sampled token of its last output; later calls ignore it.
 // Returns 0, -1 when chaining is unavailable (nothing decoded: decode as usual), or a llama_decode error.
 LLAMA_API int32_t llama_decode_chain(struct llama_context * ctx, llama_seq_id seq_id, llama_token * token);
 

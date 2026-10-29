@@ -55,6 +55,10 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// true when every sample is the token with the largest raw logit, whatever was sampled before (greedy final sampler, no grammar,
+// no reasoning budget, no finite logit bias, every other sampler neutral or keeping the top token)
+bool common_sampler_is_greedy(const struct common_sampler * gsmpl);
+
 // extended sampling implementation:
 //
 // - set logits

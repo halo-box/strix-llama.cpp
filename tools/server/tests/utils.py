@@ -120,6 +120,7 @@ class ServerProcess:
     log_path: str | None = None
     ui_mcp_proxy: bool = False
     backend_sampling: bool = False
+    decode_chain: int | None = None
     gcp_compat: bool = False
     server_tools: str | None = None
     server_tools_runtime: str | None = None
@@ -300,6 +301,8 @@ class ServerProcess:
             server_args.extend(["--mcp-servers-json", self.mcp_servers_json])
         if self.backend_sampling:
             server_args.append("--backend_sampling")
+        if self.decode_chain is not None:
+            server_args.extend(["--decode-chain", self.decode_chain])
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
             env["AIP_HTTP_PORT"] = str(self.server_port)
