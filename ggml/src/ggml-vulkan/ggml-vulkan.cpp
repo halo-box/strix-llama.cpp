@@ -458,6 +458,7 @@ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
 }
 
 // Decode weight prefetch from a second compute queue (GGML_VK_DECODE_PREFETCH_Q, default on where supported; =0 turns it off).
+// GGML_VK_DECODE_PREFETCH_Q_QUIESCE=0 turns off the host-side end of a resident side dispatch before a mid-graph wait or an allocation.
 // _WG workgroups of the side dispatch (4), _MAX_MB bytes touched per target at most (24), _POLLS bound on the side dispatch's
 // phase polls (4M, a few seconds), _CHUNK grid-stride passes between phase checks (1).
 struct vk_prefetch_q_cfg {
@@ -16013,6 +16014,7 @@ static void ggml_vk_prefetch_q_marker(ggml_backend_vk_context * ctx, vk_context 
 
 static constexpr uint32_t DECODE_PREFETCH_Q_MAX_TARGETS = 32000;
 
+static void ggml_vk_prefetch_q_quiesce(void * c);
 static bool ggml_vk_prefetch_q_init(ggml_backend_vk_context * ctx) {
     if (ctx->prefetch_q_init_done) {
         return ctx->prefetch_q_ok;
@@ -16061,6 +16063,8 @@ static bool ggml_vk_prefetch_q_init(ggml_backend_vk_context * ctx) {
         return false;
     }
     ctx->prefetch_q_ok = true;
+    dev->prefetch_q_quiesce_ctx = ctx;
+    dev->prefetch_q_quiesce = ggml_vk_prefetch_q_quiesce;
     return true;
 }
 
@@ -16069,6 +16073,10 @@ static void ggml_vk_prefetch_q_destroy(ggml_backend_vk_context * ctx) {
         return;
     }
     vk_device & dev = ctx->device;
+    if (dev->prefetch_q_quiesce_ctx == ctx) {
+        dev->prefetch_q_quiesce = nullptr;
+        dev->prefetch_q_quiesce_ctx = nullptr;
+    }
     for (auto & sl : ctx->prefetch_q_slots) {
         if (sl.pending) {
             if (ctx->prefetch_q_flag && ctx->prefetch_q_flag->ptr) {
@@ -16097,6 +16105,17 @@ static void ggml_vk_prefetch_q_destroy(ggml_backend_vk_context * ctx) {
 }
 
 // per graph: decode graphs only (every weight mat-vec has one token); the dense targets, their addresses and the side dispatch
+// ends the current graph's prefetch from the host: the side dispatch sees the end phase and leaves, the rest of the graph records no
+// markers. Called before a host wait on the device (mid-graph synchronize) and before device memory is created or freed.
+static void ggml_vk_prefetch_q_quiesce(void * c) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) c;
+    static const bool enabled = getenv("GGML_VK_DECODE_PREFETCH_Q_QUIESCE") == nullptr || atoi(getenv("GGML_VK_DECODE_PREFETCH_Q_QUIESCE")) != 0;
+    if (enabled && ctx->prefetch_q_active) {
+        ((volatile uint32_t *) ctx->prefetch_q_flag->ptr)[0] = (ctx->prefetch_q_epoch << 16) | 0xffffu;
+        ctx->prefetch_q_active = false;
+    }
+}
+
 static void ggml_vk_prefetch_q_plan(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
     ctx->prefetch_q_active = false;
     ctx->prefetch_q_open = -1;
@@ -17486,6 +17505,8 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
 void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
+
+    ggml_vk_prefetch_q_quiesce(ctx);
 
     bool do_transfer = !ctx->compute_ctx.expired();
 

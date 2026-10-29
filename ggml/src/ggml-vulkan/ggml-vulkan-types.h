@@ -726,6 +726,10 @@ struct vk_device_struct {
     // decode weight prefetch from a second compute queue (GGML_VK_DECODE_PREFETCH_Q): a VkQueue of its own in the compute
     // family (its own kernel scheduler entity, so it runs beside compute_queue), plus VK_AMD_buffer_marker for the phase word
     std::unique_ptr<vk_queue> prefetch_queue;
+    // called before the host waits on the device or creates / frees device memory. It ends a resident side dispatch of the decode
+    // prefetch (a wait or a VA update covers every job in flight, so the side dispatch would hold it until its poll bound)
+    void (*prefetch_q_quiesce)(void *) = nullptr;
+    void * prefetch_q_quiesce_ctx = nullptr;
     bool buffer_marker = false;
     PFN_vkCmdWriteBufferMarkerAMD pfn_vkCmdWriteBufferMarkerAMD {};
     bool single_queue;
