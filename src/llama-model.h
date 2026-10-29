@@ -7,9 +7,11 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -927,6 +929,10 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 
 // model must inherit from this
 struct llama_model_base : public llama_model {
+    // background warm-up of a lazy table (see load_tensors); joined in the destructor, before the mapping is released
+    std::thread       lazy_warm_thread;
+    std::atomic<bool> lazy_warm_stop{false};
+
     friend struct llama_model;
 
     llama_model * model;
@@ -942,7 +948,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_READ_LAZY;
 
     explicit llama_model_base(const llama_model_params & params);
-    virtual ~llama_model_base() = default;
+    virtual ~llama_model_base();
 
     ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 

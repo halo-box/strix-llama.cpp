@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -40,6 +41,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <atomic>
+#include <sys/mman.h>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -2033,7 +2037,60 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    // lazy table read through the file mapping: fault it into the page cache in the background (file-backed and evictable,
+    // no anonymous memory) so the first requests do not page it in from disk. LLAMA_LAZY_PREFETCH=0 turns it off.
+    if (per_layer_tok_embd && per_layer_tok_embd->data && ml.lazy.has(per_layer_tok_embd) && !params.vocab_only) {
+        const char * e = getenv("LLAMA_LAZY_PREFETCH");
+        if (!e || atoi(e) != 0) {
+            uint8_t * base = (uint8_t *) per_layer_tok_embd->data;
+            const size_t size = ggml_nbytes(per_layer_tok_embd);
+            lazy_warm_thread = std::thread([this, base, size]() {
+                const size_t page = 4096, chunk = 256ull << 20;
+                const int64_t t0 = ggml_time_us();
+                size_t done = 0;
+                bool use_populate = true;
+                uint8_t * b0 = (uint8_t *) (((uintptr_t) base + page - 1) & ~(uintptr_t) (page - 1));
+                const size_t skip = (size_t) (b0 - base);
+                for (size_t off = skip; off < size && !lazy_warm_stop.load(); off += chunk) {
+                    const size_t n = std::min(chunk, size - off) & ~(page - 1);
+                    if (n == 0) { break; }
+#ifdef __linux__
+                    // the lazy range is mapped MADV_RANDOM (no readahead), which makes the populate a stream of 4 KiB reads:
+                    // allow readahead while this chunk is read, then restore
+                    madvise(base + off, n, MADV_SEQUENTIAL);
+                    if (use_populate) {
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+                        if (madvise(base + off, n, MADV_POPULATE_READ) != 0) {
+                            if (errno != EINVAL) { LLAMA_LOG_WARN("%s: lazy warm-up stopped: %s\n", __func__, strerror(errno)); break; }
+                            use_populate = false; // kernel < 5.14
+                        }
+                    }
+                    if (!use_populate) {
+                        madvise(base + off, n, MADV_WILLNEED);
+                        volatile uint8_t sink = 0;
+                        for (size_t k = 0; k < n && !lazy_warm_stop.load(); k += page) { sink = sink + base[off + k]; }
+                        (void) sink;
+                    }
+#endif
+                    madvise(base + off, n, MADV_RANDOM);
+                    done = off + n;
+                }
+                LLAMA_LOG_INFO("%s: lazy table warm-up %s: %.1f GiB in %.1f s\n", __func__,
+                        lazy_warm_stop.load() ? "cancelled" : "done", done / 1073741824.0, (ggml_time_us() - t0) / 1e6);
+            });
+        }
+    }
+
     return true;
+}
+
+llama_model_base::~llama_model_base() {
+    lazy_warm_stop.store(true);
+    if (lazy_warm_thread.joinable()) {
+        lazy_warm_thread.join();
+    }
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
