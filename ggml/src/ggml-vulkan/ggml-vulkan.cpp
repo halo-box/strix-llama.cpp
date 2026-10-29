@@ -1923,6 +1923,15 @@ static bool ggml_vk_hc_cmb_enabled() {
     return on;
 }
 
+// HC_DEFER: the attention-side HC combine of a qwen4exp prefill layer does not store its output when the only other reader is the
+// FFN-side MoE epilogue combine, which recomputes it from the same inputs with the same expression (a deferred residual update):
+// one 4 x n_embd f32 store per layer and token less, one n_embd f32 read more. Bit-identical. Opt-in (GGML_VK_HC_DEFER=1): on
+// Flash-Next prefill (ubatch 2048) the attention-side combine is ~35% faster per call, the MoE epilogue 3-10% slower.
+static bool ggml_vk_hc_defer_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_DEFER"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
 // the HC_CMB spec constant: 0 old load order, 1 loads first, 2 the tests' negative control (GGML_VK_HC_CMB_TEST_BREAK=1: the MoE
 // epilogue drops its last routed slot, the attention-side combine reads stream 0's residual for every stream)
 static uint32_t ggml_vk_hc_cmb_spec() {
@@ -4523,6 +4532,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_inj[has_post], has_post ? "dsv4_hc_post_norm_inj_f16" : "dsv4_rms_norm_mul_rows_inj_f16",
                     dsv4_hc_post_norm_inj_f16_len, dsv4_hc_post_norm_inj_f16_data, "main", 8, sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants), {1, 1, 1},
                     { has_post, ggml_vk_hc_cmb_spec() }, 1);
+                if (has_post) {
+                    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_inj_dm[0], "dsv4_hc_post_norm_inj_f16_nostore",
+                        dsv4_hc_post_norm_inj_f16_len, dsv4_hc_post_norm_inj_f16_data, "main", 8, sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants), {1, 1, 1},
+                        { 1u, ggml_vk_hc_cmb_spec(), 1u }, 1);
+                    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_inj_dm[1], "dsv4_hc_post_norm_inj_f16_resonly",
+                        dsv4_hc_post_norm_inj_f16_len, dsv4_hc_post_norm_inj_f16_data, "main", 8, sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants), {1, 1, 1},
+                        { 1u, ggml_vk_hc_cmb_spec(), 2u }, 1);
+                }
             }
         }
         if (device->fp16) {
@@ -4538,6 +4555,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             CREATE_HC_MOE(0, s32, 1, f16, 8)
             CREATE_HC_MOE(0, s32, 2, inj, 10)
 #undef CREATE_HC_MOE
+            ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_moe_post_norm_defer[1], "dsv4_hc_moe_post_norm_s16_inj_defer",
+                dsv4_hc_moe_post_norm_s16_inj_defer_len, dsv4_hc_moe_post_norm_s16_inj_defer_data, "main", 12,
+                sizeof(vk_op_dsv4_hc_moe_post_norm_defer_push_constants), {1, 1, 1}, { 1u, ggml_vk_hc_cmb_spec() }, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_moe_post_norm_defer[0], "dsv4_hc_moe_post_norm_s32_inj_defer",
+                dsv4_hc_moe_post_norm_s32_inj_defer_len, dsv4_hc_moe_post_norm_s32_inj_defer_data, "main", 12,
+                sizeof(vk_op_dsv4_hc_moe_post_norm_defer_push_constants), {1, 1, 1}, { 1u, ggml_vk_hc_cmb_spec() }, 1);
         }
     }
 
@@ -9085,8 +9108,9 @@ enum {
 };
 
 // node_idx: the first fused node (the chain's SCALE, or the RMS_NORM for HC_NORM_ROWS_CPY)
-static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
-    const int  mode     = ctx->fused_hc_post_norm;
+// dm (HC_DEFER): 0 the chain as fused; 1 without the combine store; 2 the combine store only (a deferred output read by another node)
+static void ggml_vk_dsv4_hc_post_norm_impl(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx,
+        int mode, bool inj_in, int dm) {
     const bool has_post = mode != HC_NORM_ROWS_CPY;
     const bool out_f16  = mode != HC_POST_NORM_GATE;
 
@@ -9110,8 +9134,10 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
     float eps;
     memcpy(&eps, rms->op_params, sizeof(float));
 
-    const bool inj = ctx->fused_hc_post_norm_inj;
-    vk_pipeline pipeline = inj ? ctx->device->pipeline_dsv4_hc_post_norm_inj[has_post ? 1 : 0]
+    const bool inj = inj_in;
+    GGML_ASSERT(dm == 0 || (inj && has_post));
+    vk_pipeline pipeline = dm != 0 ? ctx->device->pipeline_dsv4_hc_post_norm_inj_dm[dm - 1]
+                         : inj ? ctx->device->pipeline_dsv4_hc_post_norm_inj[has_post ? 1 : 0]
                                : ctx->device->pipeline_dsv4_hc_post_norm[has_post ? 1 : 0][out_f16 ? 1 : 0];
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -9148,6 +9174,109 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
         { ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, res), ggml_vk_tensor_subbuffer(ctx, pw),
           ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, o), ggml_vk_tensor_subbuffer(ctx, out) },
         pc, { hc * nt, 1, 1 });
+}
+
+// HC_DEFER at the attention-side combine (node_idx: its first SCALE; HC_POST_GATE_NORM_CPY_INJ): the combine output A has exactly one
+// reader besides the chain's own norm, a DSV4_HC_POST B taking it as its residual (the FFN-side combine), and A is not a graph output.
+// Every node from the chain's end through B's norm and inject outputs is checked not to overlap the residual, the block output or the
+// post weights, which the MoE epilogue at B reads instead of A (graph_optimize keeps them allocated until B). B's chain not being the
+// MoE epilogue when it runs is safe: the first dispatch that reads A stores it first (ggml_vk_hc_defer_guard).
+static bool ggml_vk_hc_defer_reject(const char * why) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    static std::set<std::string> said;
+    if (dbg && said.insert(why).second) {
+        GGML_LOG_INFO("ggml_vulkan: HC_DEFER not taken: %s\n", why);
+    }
+    return false;
+}
+
+static bool ggml_vk_hc_defer_try(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_hc_defer_enabled() || ctx->device->pipeline_dsv4_hc_post_norm_inj_dm[0] == nullptr ||
+        ctx->device->pipeline_dsv4_hc_post_norm_inj_dm[1] == nullptr) {
+        return false;
+    }
+    if (ctx->hc_defer.a != nullptr) {
+        return ggml_vk_hc_defer_reject("an earlier deferred combine is still pending");
+    }
+    const int last = node_idx + 8;   // SCALE, SIGMOID, SCALE, HC_POST, RMS_NORM, MUL, CPY, VIEW, MUL_MAT (inject)
+    if (last >= cgraph->n_nodes) {
+        return ggml_vk_hc_defer_reject("chain at the graph end");
+    }
+    const ggml_tensor * scale_in = cgraph->nodes[node_idx];
+    const ggml_tensor * a        = cgraph->nodes[node_idx + 3];
+    if (a->op != GGML_OP_DSV4_HC_POST || (a->flags & GGML_TENSOR_FLAG_OUTPUT) || a->src[2] == nullptr || a->type != GGML_TYPE_F32) {
+        return ggml_vk_hc_defer_reject("combine output is a graph output (or not a gated f32 combine)");
+    }
+    const ggml_tensor * res0 = a->src[1];
+    const ggml_tensor * x    = a->src[0];
+    const ggml_tensor * pw   = scale_in->src[0];
+    // two readers: the chain's RMS_NORM and B (a view of A would be a reader too)
+    if (ggml_node_get_use_count(cgraph, node_idx + 3) != 2 || cgraph->nodes[node_idx + 4]->src[0] != a) {
+        return ggml_vk_hc_defer_reject("combine output has other readers than its norm and one combine");
+    }
+    int b_idx = -1;
+    for (int n = last + 1; n < cgraph->n_nodes && b_idx < 0; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * s = t->src[j];
+            if (s == nullptr || (s != a && s->view_src != a)) {
+                continue;
+            }
+            if (t->op != GGML_OP_DSV4_HC_POST || j != 1 || s != a) {
+                return ggml_vk_hc_defer_reject("the other reader is not a combine taking it as its residual");
+            }
+            b_idx = n;
+        }
+    }
+    if (b_idx < 0) {
+        return ggml_vk_hc_defer_reject("no reading combine in this graph split");
+    }
+    const ggml_tensor * b = cgraph->nodes[b_idx];
+    if (!ggml_are_same_shape(b, a) || !ggml_are_same_shape(res0, a) || res0->type != GGML_TYPE_F32) {
+        return ggml_vk_hc_defer_reject("shapes");
+    }
+    // B's chain in the form whose MoE epilogue recomputes A (f16 norm + inject: HC_POST, RMS_NORM, MUL, CPY, VIEW, MUL_MAT); the f32
+    // norm form (the output head's) would have to store A first
+    if (b_idx + 5 >= cgraph->n_nodes || cgraph->nodes[b_idx + 3]->op != GGML_OP_CPY || cgraph->nodes[b_idx + 5]->op != GGML_OP_MUL_MAT) {
+        return ggml_vk_hc_defer_reject("the reading combine is not in the f16 norm + inject form");
+    }
+    const int end = std::min(cgraph->n_nodes - 1, b_idx + 5);
+    for (int n = last + 1; n <= end; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (t->buffer == nullptr || ggml_is_empty(t) || t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE ||
+            t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
+        for (const ggml_tensor * in : { res0, x, pw }) {
+            if (in->buffer != nullptr && ggml_vk_tensors_overlap(in, t, false)) {
+                static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+                if (dbg) {
+                    GGML_LOG_INFO("ggml_vulkan: HC_DEFER not taken at %s: input %s overlaps %s (%s, node %d, B at %d)\n", a->name, in->name,
+                                   t->name, ggml_op_desc(t), n, b_idx);
+                }
+                return false;
+            }
+        }
+    }
+    auto & d = ctx->hc_defer;
+    d.a        = a;
+    d.res0     = res0;
+    d.x        = x;
+    d.pw       = pw;
+    d.gate_in  = ggml_get_op_params_f32(scale_in, 0);
+    d.gate_out = ggml_get_op_params_f32(a->src[2], 0);
+    d.node_idx = node_idx;
+    return true;
+}
+
+static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const int mode = ctx->fused_hc_post_norm;
+    const bool dm1 = mode == HC_POST_NORM_GATE_CPY && ctx->fused_hc_post_norm_inj &&
+                     ggml_vk_hc_defer_try(ctx, cgraph, node_idx);
+    if (dm1) {
+        ggml_vk_path_census_add("HC_DEFER");
+    }
+    ggml_vk_dsv4_hc_post_norm_impl(ctx, subctx, cgraph, node_idx, mode, ctx->fused_hc_post_norm_inj, dm1 ? 1 : 0);
 }
 
 // HC_MOE_EPI (the MoE epilogue + HC_POST_GATE_NORM(_CPY)(_INJ)), defined with its matcher
@@ -17694,7 +17823,12 @@ static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_cont
     float eps;
     memcpy(&eps, rms->op_params, sizeof(float));
 
-    vk_pipeline pipeline = ctx->device->pipeline_dsv4_hc_moe_post_norm[c.f16 ? 1 : 0][inj ? 2 : out_f16 ? 1 : 0];
+    // HC_DEFER: the residual (the attention-side combine output) was not stored; recompute it from that combine's inputs
+    const bool defer = ctx->hc_defer.a != nullptr && res == ctx->hc_defer.a;
+    GGML_ASSERT(!defer || (inj && ctx->device->pipeline_dsv4_hc_moe_post_norm_defer[c.f16 ? 1 : 0] != nullptr));
+    const ggml_tensor * res_in = defer ? ctx->hc_defer.res0 : res;
+    vk_pipeline pipeline = defer ? ctx->device->pipeline_dsv4_hc_moe_post_norm_defer[c.f16 ? 1 : 0]
+                                 : ctx->device->pipeline_dsv4_hc_moe_post_norm[c.f16 ? 1 : 0][inj ? 2 : out_f16 ? 1 : 0];
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -17705,7 +17839,7 @@ static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_cont
             {
                 n_embd, hc, nt,
                 c.sh != nullptr ? (uint32_t)(c.sh->nb[1] / sizeof(float)) : 0u,
-                (uint32_t)(res->nb[1] / sizeof(float)), (uint32_t)(res->nb[2] / sizeof(float)),
+                (uint32_t)(res_in->nb[1] / sizeof(float)), (uint32_t)(res_in->nb[2] / sizeof(float)),
                 (uint32_t)(pw->nb[0] / sizeof(float)), (uint32_t)(pw->nb[1] / sizeof(float)),
                 (uint32_t)(gamma->nb[1] / sizeof(float)),
                 (uint32_t)(hc_post->nb[1] / sizeof(float)), (uint32_t)(hc_post->nb[2] / sizeof(float)),
@@ -17724,7 +17858,29 @@ static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_cont
         c.gate != nullptr ? (uint32_t)(c.gate->nb[1] / sizeof(float)) : 0u,
     };
 
-    if (inj) {
+    if (defer) {
+        const auto & d = ctx->hc_defer;
+        const vk_op_dsv4_hc_moe_post_norm_defer_push_constants dpc = {
+            pc,
+            (uint32_t)(d.x->nb[1] / sizeof(float)),
+            (uint32_t)(d.pw->nb[0] / sizeof(float)), (uint32_t)(d.pw->nb[1] / sizeof(float)),
+            1u, d.gate_in, d.gate_out,
+        };
+        // GGML_VK_HC_DEFER_TEST_BREAK=1 (tests only, the negative control): the recomputed combine drops the attention block term
+        static const bool defer_break = [] { const char * e = getenv("GGML_VK_HC_DEFER_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+        vk_op_dsv4_hc_moe_post_norm_defer_push_constants dpc2 = dpc;
+        if (defer_break) {
+            dpc2.gate_out_a = 0.0f;
+        }
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, c.root), ggml_vk_tensor_subbuffer(ctx, sh), ggml_vk_tensor_subbuffer(ctx, d.res0),
+              ggml_vk_tensor_subbuffer(ctx, pw), ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, hc_post),
+              ggml_vk_tensor_subbuffer(ctx, out), ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, mm),
+              ggml_vk_tensor_subbuffer(ctx, gt), ggml_vk_tensor_subbuffer(ctx, d.x), ggml_vk_tensor_subbuffer(ctx, d.pw) },
+            dpc2, { nt, 1, 1 });
+        ggml_vk_path_census_add("HC_DEFER_MOE");
+        ctx->hc_defer = {};
+    } else if (inj) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { ggml_vk_tensor_subbuffer(ctx, c.root), ggml_vk_tensor_subbuffer(ctx, sh), ggml_vk_tensor_subbuffer(ctx, res),
               ggml_vk_tensor_subbuffer(ctx, pw), ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, hc_post),
@@ -19206,12 +19362,50 @@ static bool ggml_vk_can_fuse_mmid_mul_cpy16(ggml_backend_vk_context * ctx, const
            ggml_vk_mmid_scale_epilogue_ok(ctx, mmid, mul, true);
 }
 
+// HC_DEFER, before the dispatch of node i (+ its fused nodes): the MoE epilogue that recomputes the deferred combine output reads its
+// inputs as extra sources (sync tracking); any other dispatch reading it first gets it stored by the attention-side kernel's
+// store-only replay (same kernel, same values)
+static void ggml_vk_hc_defer_guard(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int i) {
+    const auto & d = ctx->hc_defer;
+    if (ctx->fused_hc_moe_epi && ctx->fused_hc_post_norm_inj) {
+        const ggml_tensor * hp = cgraph->nodes[i + ctx->fused_hc_moe_epi + 3];
+        if (hp->src[1] == d.a) {
+            vk_hc_moe_chain c;
+            if (ggml_vk_hc_moe_chain(ctx, cgraph, i, c) && ctx->device->pipeline_dsv4_hc_moe_post_norm_defer[c.f16 ? 1 : 0] != nullptr) {
+                ctx->fused_extra_srcs[1] = d.res0;
+                ctx->fused_extra_srcs[2] = d.x;
+                ctx->fused_extra_srcs[3] = d.pw;
+                return;
+            }
+        }
+    }
+    bool reads = false;
+    for (int k = 0; k <= ctx->num_additional_fused_ops && !reads; ++k) {
+        const ggml_tensor * t = cgraph->nodes[i + k];
+        for (int j = 0; j < GGML_MAX_SRC && !reads; ++j) {
+            reads = t->src[j] != nullptr && (t->src[j] == d.a || t->src[j]->view_src == d.a);
+        }
+    }
+    if (!reads) {
+        return;
+    }
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    ctx->unsynced_nodes_written.clear();
+    ctx->unsynced_nodes_read.clear();
+    ggml_vk_sync_buffers(ctx, compute_ctx);
+    ggml_vk_dsv4_hc_post_norm_impl(ctx, compute_ctx, cgraph, d.node_idx, HC_POST_NORM_GATE_CPY, true, 2);
+    ctx->unsynced_nodes_written.push_back(d.a);
+    ggml_vk_path_census_add("HC_DEFER_MAT");
+    ctx->hc_defer = {};
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
+    ctx->hc_defer = {};
     ctx->device->diag_prev_end = -1;
 
     if (vk_instance.debug_utils_support) {
@@ -19394,7 +19588,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_concat_tail = -1;
         ctx->fused_ssm_conv_direct = -1;
-        ctx->fused_extra_srcs[0] = ctx->fused_extra_srcs[1] = nullptr;
+        std::fill(std::begin(ctx->fused_extra_srcs), std::end(ctx->fused_extra_srcs), nullptr);
         const char *fusion_string {};
         int hc_moe_mode = HC_POST_NORM_NONE;
         bool hc_moe_inj = false;
@@ -19784,6 +19978,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
+        if (ctx->hc_defer.a != nullptr) {
+            ggml_vk_hc_defer_guard(ctx, cgraph, i);
+        }
         const int fused_nodes = 1 + ctx->num_additional_fused_ops;
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
         if (enqueued && fusion_string) {
@@ -19897,6 +20094,43 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
     if (ctx->device->disable_graph_optimize) {
         return;
+    }
+
+    // HC_DEFER: a qwen4exp attention-side combine whose output only the next (FFN-side) combine reads keeps its inputs allocated
+    // until that combine, which reads them in its place when the attention-side kernel skips the store (ggml_vk_hc_defer_try)
+    if (ggml_vk_hc_defer_enabled() && !ctx->device->disable_fusion && params && params->add_alloc_dep) {
+        for (int n = 3; n < graph->n_nodes; ++n) {
+            ggml_tensor * a = graph->nodes[n];
+            if (a->op != GGML_OP_DSV4_HC_POST || a->src[2] == nullptr || a->src[2]->op != GGML_OP_SCALE ||
+                a->src[2]->src[0] == nullptr || a->src[2]->src[0]->op != GGML_OP_UNARY || a->src[2]->src[0]->src[0] == nullptr ||
+                a->src[2]->src[0]->src[0]->op != GGML_OP_SCALE) {
+                continue;
+            }
+            ggml_tensor * pw = a->src[2]->src[0]->src[0]->src[0];
+            for (int m = n + 1; m < graph->n_nodes; ++m) {
+                ggml_tensor * b = graph->nodes[m];
+                if (b->op == GGML_OP_DSV4_HC_POST && b->src[1] == a) {
+                    // until the end of B's chain (its inject MUL_MAT), so the dependency node does not split the fused chain
+                    ggml_tensor * until = b;
+                    for (int e = m + 1; e < std::min(graph->n_nodes, m + 9); ++e) {
+                        if (graph->nodes[e]->op == GGML_OP_MUL_MAT) {
+                            until = graph->nodes[e];
+                            break;
+                        }
+                    }
+                    params->add_alloc_dep(params->user_data, a->src[1], until);
+                    params->add_alloc_dep(params->user_data, a->src[0], until);
+                    if (pw) {
+                        params->add_alloc_dep(params->user_data, pw, until);
+                    }
+                    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+                    if (dbg) {
+                        GGML_LOG_INFO("ggml_vulkan: HC_DEFER alloc deps for %s until %s (%s)\n", a->name, until->name, ggml_op_desc(until));
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     auto const &is_empty = [](const ggml_tensor * node) -> bool {

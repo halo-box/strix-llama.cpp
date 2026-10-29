@@ -4577,6 +4577,126 @@ struct test_hc_moe_epi : public test_case {
     }
 };
 
+// one qwen4exp prefill layer's two HC combines: the attention-side combine + norm (f16, padded) + inject, then the FFN-side MoE
+// epilogue combine whose residual is the first combine's output (HC_DEFER on Vulkan: the first output is not stored and the second
+// kernel recomputes it). exact: built twice over the same inputs, the second with the first combine also a graph output (so it is
+// stored and read), compared bit for bit as in test_hc_moe_epi.
+struct test_hc_layer : public test_hc_moe_epi {
+    test_hc_layer(int embd, int tokens, int n_used, bool exact) : test_hc_moe_epi(embd, 4, tokens, n_used, true, 1, 2, 128, exact) {}
+    std::string op_desc(ggml_tensor *) override { return "HC_LAYER"; }
+    std::string vars() override { return VARS_TO_STR4(embd, tokens, n_used, exact); }
+
+    // GGML_VK_TEST_REQUIRE_HC_DEFER=1: with GGML_VK_HC_DEFER=1 one deferred combine per graph (the exact twin's first combine is an
+    // output: never deferred), taken by the MoE epilogue at 32+ tokens; below that the MoE epilogue is unfused and the combine is
+    // stored on first read
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_DEFER")) {
+            return true;
+        }
+        const bool on = env_opt_in("GGML_VK_HC_DEFER");
+        const int64_t n_def = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_DEFER"));
+        const int64_t n_moe = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_DEFER_MOE"));
+        const int64_t n_mat = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_DEFER_MAT"));
+        const bool ok = on ? (n_def == 1 && (tokens >= 32 ? (n_moe == 1 && n_mat == 0) : (n_moe + n_mat == 1))) : (n_def + n_moe + n_mat == 0);
+        if (!ok) {
+            msg = "HC_DEFER " + std::to_string(n_def) + ", HC_DEFER_MOE " + std::to_string(n_moe) + ", HC_DEFER_MAT " + std::to_string(n_mat);
+            printf("[engagement] %s ", msg.c_str());
+        }
+        return ok;
+    }
+
+    struct attn_inputs {
+        ggml_tensor * res0, * block, * inject, * gamma_flat, * w_inj, * w_down;
+    };
+
+    // the attention-side chain as qwen4exp emits it (HC_POST_GATE_NORM_CPY_INJ); returns { combine, norm, inject, down }
+    std::vector<ggml_tensor *> attn(ggml_context * ctx, const attn_inputs & in) {
+        const int64_t hc_dim = int64_t(embd) * hc;
+        ggml_tensor * w = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, in.inject, 1.0f / hc)), 2.0f);
+        ggml_tensor * post = ggml_dsv4_hc_post(ctx, in.block, in.res0, w, nullptr);
+        if (gf) { ggml_build_forward_expand(gf, post); }
+        ggml_tensor * gamma = ggml_reshape_2d(ctx, in.gamma_flat, embd, hc);
+        if (gf) { ggml_build_forward_expand(gf, gamma); }
+        ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, post, 1e-6f), gamma);
+        ggml_tensor * buf = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hc_dim + pad, tokens);
+        ggml_tensor * dst = ggml_view_3d(ctx, buf, embd, hc, tokens, embd * ggml_element_size(buf), buf->nb[1], 0);
+        if (gf) { ggml_build_forward_expand(gf, dst); }
+        xn = ggml_cpy(ctx, xn, dst);
+        if (gf) { ggml_build_forward_expand(gf, xn); }
+        ggml_tensor * xn2 = ggml_view_2d(ctx, xn, hc_dim, tokens, xn->nb[2], 0);
+        ggml_tensor * inj = ggml_mul_mat(ctx, in.w_inj, xn2);
+        ggml_tensor * lo  = ggml_mul_mat(ctx, in.w_down, xn2);
+        if (gf) { ggml_build_forward_expand(gf, inj); ggml_build_forward_expand(gf, lo); }
+        return { post, xn, inj, lo };
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        const int64_t hc_dim = int64_t(embd) * hc;
+        attn_inputs ai {};
+        ai.res0       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        ai.block      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, tokens);
+        ai.inject     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        ai.gamma_flat = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
+        ai.w_inj      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, hc);
+        ai.w_down     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_dim, 64);
+        inputs in {};
+        in.inject     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        in.slots      = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, embd, n_used, tokens);
+        ggml_set_name(in.slots, "slots");
+        in.sh_act     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, tokens);
+        in.w_sd       = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 64, embd);
+        in.g_x        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, tokens);
+        in.w_g        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 1);
+        in.gamma_flat = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
+        in.w_inj      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, hc);
+        in.w_down     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_dim, 64);
+        // every input and weight is also an output, so none is freed (see test_hc_moe_epi)
+        for (ggml_tensor * t : { ai.res0, ai.block, ai.inject, ai.gamma_flat, ai.w_inj, ai.w_down, in.inject, in.slots, in.sh_act,
+                                 in.w_sd, in.g_x, in.w_g, in.gamma_flat, in.w_inj, in.w_down }) {
+            ggml_set_input(t);
+            ggml_set_output(t);
+        }
+        auto layer = [&](bool keep_first) {
+            std::vector<ggml_tensor *> a = attn(ctx, ai);
+            if (keep_first) {
+                ggml_set_output(a[0]);   // stored and read: the reference for the deferred combine
+            }
+            inputs li = in;
+            li.residual = a[0];
+            ggml_tensor * moe = nullptr;
+            std::vector<ggml_tensor *> b = chain(ctx, li, &moe);
+            // the FFN-side combine, norm and inject (what reads the deferred combine); non-exact runs check the attention side too
+            std::vector<ggml_tensor *> outs = { b[0], b[1], b[2] };
+            if (!exact) {
+                outs.push_back(a[1]);
+                outs.push_back(b[3]);
+            }
+            return outs;
+        };
+        std::vector<ggml_tensor *> x = layer(false);
+        if (!exact) {
+            for (ggml_tensor * t : x) {
+                ggml_set_output(t);
+                verify.push_back(t);
+            }
+            return x.back();
+        }
+        std::vector<ggml_tensor *> y = layer(true);
+        ggml_tensor * last = nullptr;
+        for (size_t i = 0; i < x.size(); ++i) {
+            ggml_tensor * ta = x[i]->type == GGML_TYPE_F32 ? x[i] : ggml_cast(ctx, ggml_cont(ctx, x[i]), GGML_TYPE_F32);
+            ggml_tensor * tb = y[i]->type == GGML_TYPE_F32 ? y[i] : ggml_cast(ctx, ggml_cont(ctx, y[i]), GGML_TYPE_F32);
+            last = ggml_scale_bias(ctx, ggml_sub(ctx, ta, tb), 1e12f, 1.0f);
+            ggml_set_output(last);
+            verify.push_back(last);
+            if (gf) { ggml_build_forward_expand(gf, last); }
+        }
+        return last;
+    }
+};
+
 // quantized weights x an f16 B (the f16 hc norm into the hc down GEMM); pad > 0: B rows with a k + pad stride (padded
 // xn / GDN norm), read in place on Vulkan
 struct test_mul_mat_f16b : public test_case {
@@ -12924,6 +13044,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 64, n_used, true, 1, 2, 128, exact));
         }
         test_cases.emplace_back(new test_hc_moe_epi(2560, 4, 33, 9, false, 1, 2, 0, exact));   // f32 slots
+    }
+    // HC_DEFER: one layer's two combines, prefill sizes (deferred into the MoE epilogue, incl. a ragged tail) and below the MoE
+    // epilogue's 32 tokens (stored on first read); exact = bit-identical to the stored combine
+    for (int tokens : {16, 64, 513, 2051}) {
+        test_cases.emplace_back(new test_hc_layer(2560, tokens, 10, false));
+    }
+    for (int tokens : {16, 64, 513}) {
+        test_cases.emplace_back(new test_hc_layer(2560, tokens, 2, true));   // 2 slots: the exact twin fits the test context
     }
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 2051, 1, GGML_TYPE_Q8_0, 128));
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 97, 2, GGML_TYPE_Q8_0, 128));

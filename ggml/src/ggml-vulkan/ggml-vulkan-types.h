@@ -1000,6 +1000,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_post_norm_inj[2];   // [has_post], f16 norm + the inject projection
     // MoE epilogue (slot sum + shared expert) + HC_POST_GATE + RMS_NORM + MUL (+ CPY f16) (+ inject): [slot f16][f32 norm, f16 norm, f16 norm + inject]
     vk_pipeline pipeline_dsv4_hc_moe_post_norm[2][3];
+    // HC_DEFER: the attention-side combine without its residual store [0] / storing only it [1]; the MoE epilogue that recomputes
+    // it [slot f16]
+    vk_pipeline pipeline_dsv4_hc_post_norm_inj_dm[2];
+    vk_pipeline pipeline_dsv4_hc_moe_post_norm_defer[2];
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1409,7 +1413,17 @@ struct ggml_backend_vk_context {
     int fused_concat_tail {-1};      // current CONCAT writes only its tail (index into ssm_conv_direct_matches)
     int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
     // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
-    const ggml_tensor * fused_extra_srcs[2] {};
+    const ggml_tensor * fused_extra_srcs[4] {};
+    // HC_DEFER: an attention-side combine output that was not stored (a), with the inputs it is recomputed from (the residual,
+    // the block output, the raw post weights and the gate scales) and the chain's first node for a store-only replay
+    struct hc_defer_state {
+        const ggml_tensor * a = nullptr;
+        const ggml_tensor * res0 = nullptr;
+        const ggml_tensor * x = nullptr;
+        const ggml_tensor * pw = nullptr;
+        float gate_in = 1.0f, gate_out = 1.0f;
+        int node_idx = -1;
+    } hc_defer;
     const ggml_tensor * fused_extra_dst {};   // written by the fused kernel besides the write-mask nodes (synced like them)
 
     // for GGML_VK_PERF_LOGGER

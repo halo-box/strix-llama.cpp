@@ -262,6 +262,17 @@ struct vk_op_dsv4_hc_moe_post_norm_push_constants {
 };
 static_assert(sizeof(vk_op_dsv4_hc_moe_post_norm_push_constants) <= 128);
 
+// HC_DEFER: the MoE epilogue also recomputes the deferred attention-side combine
+struct vk_op_dsv4_hc_moe_post_norm_defer_push_constants {
+    vk_op_dsv4_hc_moe_post_norm_push_constants moe;
+    uint32_t sxa1;
+    uint32_t spa0; uint32_t spa1;
+    uint32_t gate_a;
+    float    gate_in_a;
+    float    gate_out_a;
+};
+static_assert(sizeof(vk_op_dsv4_hc_moe_post_norm_defer_push_constants) <= 128);
+
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
     uint32_t ne01;

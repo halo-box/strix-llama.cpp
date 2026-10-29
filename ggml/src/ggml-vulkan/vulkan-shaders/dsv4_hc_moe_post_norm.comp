@@ -60,6 +60,13 @@ layout(binding = 9, std430) readonly  buffer TBuf { float   data_gt[]; };
 #else
 layout(binding = 7, std430) readonly  buffer TBuf { float   data_gt[]; };
 #endif
+#if defined(DEFER)
+// HC_DEFER: the residual bound at binding 2 is the attention-side combine's residual input; that combine's output (this kernel's
+// residual) was not stored, so it is recomputed here from the attention block output and its post weights, with the expression
+// dsv4_hc_post_norm_inj.comp evaluates (bit-identical)
+layout(binding = 10, std430) readonly buffer XABuf { vec4  data_xa[]; };
+layout(binding = 11, std430) readonly buffer PABuf { float data_pa[]; };
+#endif
 
 layout(push_constant) uniform parameter {
     uint  n_embd;
@@ -84,6 +91,13 @@ layout(push_constant) uniform parameter {
     uint  ss2;             // slot token stride (elements)
     uint  sh_mode;         // 0: no shared expert, 1: sh added, 2: sh = down, gated by sigmoid(gate[t]) first
     uint  sgt;             // gate token stride (floats; sh_mode 2)
+#if defined(DEFER)
+    uint  sxa1;            // attention block output token stride (floats)
+    uint  spa0; uint spa1; // attention post weight stream / token strides (floats)
+    uint  gate_a;
+    float gate_in_a;
+    float gate_out_a;
+#endif
 } p;
 
 // the shared expert's gate for token t (sh_mode 2): unary.comp's op_sigmoid
@@ -162,6 +176,16 @@ void moe_x8(const uint t, const uint e, const float sg, out vec4 x0, out vec4 x1
     x0 = s0;
     x1 = s1;
 }
+
+#if defined(DEFER)
+// the attention-side post weight, as dsv4_hc_post_norm_inj.comp computes it
+float post_weight_a(float pw) {
+    if (p.gate_a != 0) {
+        pw = (1.0f / (1.0f + exp(-(pw * p.gate_in_a)))) * p.gate_out_a;
+    }
+    return pw;
+}
+#endif
 
 float post_weight(const uint c, const uint t) {
     float pw = data_p[c * p.sp0 + t * p.sp1];
@@ -282,6 +306,24 @@ void main() {
             }
         }
     }
+#if defined(DEFER)
+    // the recompute's inputs, loaded with the residual rows, ahead of the slot sums
+    vec4 xa[NG][2];
+    [[unroll]] for (uint g = 0; g < NG; ++g) {
+        const uint e4 = (tid + g * BLOCK) * 2;
+        xa[g][0] = vec4(0.0f);
+        xa[g][1] = vec4(0.0f);
+        if (tid + g * BLOCK < ng) {
+            const uint xb = (t * p.sxa1) / 4 + e4;
+            xa[g][0] = data_xa[xb];
+            xa[g][1] = data_xa[xb + 1];
+        }
+    }
+    float pwa_raw[HC];
+    [[unroll]] for (uint c = 0; c < HC; ++c) {
+        pwa_raw[c] = data_pa[c * p.spa0 + t * p.spa1];
+    }
+#endif
     vec4 xv[NG][2];
     [[unroll]] for (uint g = 0; g < NG; ++g) {
         const uint e = (tid + g * BLOCK) * 8;
@@ -299,6 +341,9 @@ void main() {
     float ss[HC];
     [[unroll]] for (uint c = 0; c < HC; ++c) {
         const float pw = post_weight(c, t);
+#if defined(DEFER)
+        const float pwa = post_weight_a(pwa_raw[c]);
+#endif
         ss[c] = 0.0f;
         [[unroll]] for (uint g = 0; g < NG; ++g) {
             const uint e4 = (tid + g * BLOCK) * 2;
@@ -308,6 +353,11 @@ void main() {
                 const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
                 r0 = LOADS_FIRST != 0 ? a[c][g][0] : data_r[rb];
                 r1 = LOADS_FIRST != 0 ? a[c][g][1] : data_r[rb + 1];
+#if defined(DEFER)
+                // the attention-side combine (dsv4_hc_post_norm_inj.comp: r = xv * pw + r)
+                r0 = xa[g][0] * pwa + r0;
+                r1 = xa[g][1] * pwa + r1;
+#endif
                 r0 = xv[g][0] * pw + r0;
                 r1 = xv[g][1] * pw + r1;
                 const uint ob = (c * p.so1 + t * p.so2) / 4 + e4;
