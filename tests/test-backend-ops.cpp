@@ -15651,6 +15651,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
+    // two-pass split on Vulkan (>= 16384 columns, <= 64 rows): maxima spread over the partials, the row bound, a short tail
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 2, 1, 1}, true));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {16384, 64, 1, 1}, true));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {16384, 65, 1, 1}, true));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {65537,  3, 1, 1}, true));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {16383,  2, 1, 1}, true));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
