@@ -2281,6 +2281,7 @@ static bool test_gen_greedy(llama_context * ctx, int n_gen) {
         return false;
     }
     bool chained = true;
+    token = LLAMA_TOKEN_NULL; // the first chained step takes the token the decode above sampled
     for (int i = 1; i < n_gen; i++) {
         int res = chained ? llama_decode_chain(ctx, 0, &token) : -1;
         if (res == -1) {

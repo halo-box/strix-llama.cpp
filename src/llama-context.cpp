@@ -936,6 +936,15 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
+    // decode chaining: the other slot's graphs may hold the previous samplers too (a new sampler can reuse the address
+    // of a freed one, which graph reuse would take for the same)
+    if (chain.slot == 0) {
+        for (auto & res : chain.gf_res_prev) {
+            res.reset();
+        }
+        chain.gf_res_prev_active = nullptr;
+    }
+
     sched_new(max_nodes, cparams.pipeline_parallel);
 
     llama_memory_context_ptr mctx;
@@ -2689,7 +2698,10 @@ bool llama_context::chain_init() {
         chain_swap();
         chain.prep = true;
         llama_memory_context_ptr mctx_full = memory->init_full();
-        ggml_cgraph * gf = mctx_full ? graph_reserve(1, 1, 1, mctx_full.get()) : nullptr;
+        // as the token-generation reserve in sched_reserve: with one KV stream per sequence the full memory context
+        // needs a token per stream
+        const uint32_t n_rs = cparams.kv_unified ? 1 : cparams.n_seq_max;
+        ggml_cgraph * gf = mctx_full ? graph_reserve(n_rs, n_rs, n_rs, mctx_full.get()) : nullptr;
         chain.prep = false;
         chain_swap();
         if (!gf) {
@@ -2736,11 +2748,12 @@ int llama_context::decode_chain(llama_seq_id seq_id, llama_token * token) {
         }
     }
 
-    // the token: known now on the first step, else the running decode samples it
+    // the token: known now on the first step (given by the caller, else the last output's backend-sampled token), else
+    // the running decode samples it
     llama_token tok = LLAMA_TOKEN_NULL;
     if (!chain.inflight) {
         synchronize();
-        tok = get_sampled_token_ith(-1);
+        tok = *token != LLAMA_TOKEN_NULL ? *token : get_sampled_token_ith(-1);
         if (tok == LLAMA_TOKEN_NULL) {
             LLAMA_LOG_ERROR("%s: the previous decode has no backend-sampled token\n", __func__);
             return -1;
