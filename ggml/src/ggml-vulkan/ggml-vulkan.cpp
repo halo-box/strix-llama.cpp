@@ -5179,6 +5179,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         mul_mm_id_down_q5_1_f16_rp_v ## v ## _data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
                     CREATE_MMID_DOWN_V(1) CREATE_MMID_DOWN_V(2) CREATE_MMID_DOWN_V(3) CREATE_MMID_DOWN_V(4)
                     CREATE_MMID_DOWN_V(5) CREATE_MMID_DOWN_V(6) CREATE_MMID_DOWN_V(7) CREATE_MMID_DOWN_V(8)
+                    CREATE_MMID_DOWN_V(9) CREATE_MMID_DOWN_V(10)
 #undef CREATE_MMID_DOWN_V
                     ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q4k, "mul_mat_vec_id_q4_k_rp_f32", mul_mat_vec_id_q4_k_rp_f32_len,
                         mul_mat_vec_id_q4_k_rp_f32_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
@@ -11484,14 +11485,14 @@ static void ggml_vk_mmid_pair_glu(ggml_backend_vk_context * ctx, vk_context& sub
     const bool repacked = ggml_vk_repack_rows(w) != 0;
     vk_pipeline pipeline = (repacked ? ctx->device->pipeline_mmid_down_q51_rp : ctx->device->pipeline_mmid_down_q51)[x->type == GGML_TYPE_F32 ? 1 : 0];
     // GGML_VK_EXPDOWN_V=n: variant n of the repacked f16-B kernel (1 KC128, 2 TPW2, 3 TPW4, 4 PK16, 5 EPI_OFF (measurement only,
-    // wrong results), 6 KC128+PK16, 7 TPW2+PK16, 8 KC128+TPW2); 0 / unset = the kernel above
-    static const int expdown_v = [] { const char * e = getenv("GGML_VK_EXPDOWN_V"); const int v = e ? atoi(e) : 0; return v >= 0 && v <= 8 ? v : 0; }();
+    // wrong results), 6 KC128+PK16, 7 TPW2+PK16, 8 KC128+TPW2, 9 TPW8, 10 TPW16); 0 / unset = the kernel above
+    static const int expdown_v = [] { const char * e = getenv("GGML_VK_EXPDOWN_V"); const int v = e ? atoi(e) : 0; return v >= 0 && v <= 10 ? v : 0; }();
     uint32_t tpw = 1;
     if (expdown_v != 0 && repacked && x->type == GGML_TYPE_F16 && ctx->device->pipeline_mmid_down_q51_rpv[expdown_v]) {
         const bool kc128 = expdown_v == 1 || expdown_v == 6 || expdown_v == 8;
         if (!kc128 || K % 128 == 0) {
             pipeline = ctx->device->pipeline_mmid_down_q51_rpv[expdown_v];
-            tpw = (expdown_v == 2 || expdown_v == 7 || expdown_v == 8) ? 2 : expdown_v == 3 ? 4 : 1;
+            tpw = (expdown_v == 2 || expdown_v == 7 || expdown_v == 8) ? 2 : expdown_v == 3 ? 4 : expdown_v == 9 ? 8 : expdown_v == 10 ? 16 : 1;
             ggml_vk_path_census_add("EXPDOWN_V");
         }
     }
