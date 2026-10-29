@@ -6,6 +6,8 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <array>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -104,7 +106,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     // with a recurrent state snapshot in the ubatch the scan is split at the snapshot token and the state there is
     // copied to the snapshot; the two outputs are concatenated, or with parts != nullptr returned there (and nullptr
-    // returned), so a caller can avoid the copy
+    // returned), so a caller can avoid the copy. A caller that splits its conv at the snapshot token too passes q, k, v
+    // of the first snap_t tokens only and builds the rest in part1_qkv, which is called after the first scan is in the graph
     ggml_tensor * build_recurrent_attn(
             llm_graph_input_rs * inp,
             ggml_tensor *        ssm_states_all,
@@ -115,7 +118,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il,
-            std::pair<ggml_tensor *, ggml_tensor *> * parts = nullptr);
+            std::pair<ggml_tensor *, ggml_tensor *> * parts = nullptr,
+            const std::function<std::array<ggml_tensor *, 3>()> & part1_qkv = nullptr);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -2716,6 +2720,29 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
+                            int   il);
+
+        // the delta-net conv history split at the snapshot token t (LLAMA_GDN_CONV_SPLIT): returns the concat over tokens
+        // [0, t), which has the same form as an unsplit one; the history at t is a contiguous [state_cols, C, 1] copy
+        // (also written to the snapshot), and build_conv_tail_at concatenates it with tokens [t, n) and writes the new tail
+        ggml_tensor * build_conv_state_split(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                        int64_t   t,
+                    ggml_tensor ** hist,
+                            int   il);
+
+        ggml_tensor * build_conv_tail_at(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                    ggml_tensor * hist,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                        int64_t   t,
                             int   il);
 
         ggml_tensor * build_inp_ple(
