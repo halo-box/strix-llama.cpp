@@ -2005,6 +2005,25 @@ static bool ggml_vk_hc_cmb_enabled() {
     return on;
 }
 
+// HC_BF16RES: the hc residual streams between combines (the MoE epilogue's combine output, read by the next layer's attention-side
+// combine and, with HC_DEFER, by the next MoE epilogue's recompute) are stored bf16 in their own f32 allocation, as halo-box's HIP
+// path does. Storage only: every combine, norm and inject stays f32. Not exact (KLD-gated). GGML_VK_HC_BF16RES=1 enables.
+static bool ggml_vk_hc_bf16res_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_BF16RES"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+// the bf16 rows' pad (elements, multiple of 8, default 128 = 256 B): stream stride n_embd + pad, token stride hc * that + pad, so
+// neither the 5120 B Flash-Next rows nor the 4-stream token (20480 B = 10 x 2 KiB) lands on a 2 KiB multiple. GGML_VK_HC_BF16RES_PAD
+static uint32_t ggml_vk_hc_bf16res_pad() {
+    static const uint32_t pad = [] {
+        const char * e = getenv("GGML_VK_HC_BF16RES_PAD");
+        const int v = e ? atoi(e) : 128;
+        return (uint32_t) (v >= 0 && v % 8 == 0 ? v : 128);
+    }();
+    return pad;
+}
+
 // HC_DEFER: the attention-side HC combine of a qwen4exp prefill layer does not store its output when the only other reader is the
 // FFN-side MoE epilogue combine, which recomputes it from the same inputs with the same expression (a deferred residual update):
 // one 4 x n_embd f32 store per layer and token less, one n_embd f32 read more. Bit-identical. GGML_VK_HC_DEFER=0 disables.
@@ -4755,6 +4774,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_inj_dm[1], "dsv4_hc_post_norm_inj_f16_resonly",
                         dsv4_hc_post_norm_inj_f16_len, dsv4_hc_post_norm_inj_f16_data, "main", 8, sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants), {1, 1, 1},
                         { 1u, ggml_vk_hc_cmb_spec(), 2u }, 1);
+                    // HC_BF16RES: the same three forms reading a bf16 residual
+                    static const char * const r16_names[3] = { "dsv4_hc_post_norm_inj_f16_r16", "dsv4_hc_post_norm_inj_f16_nostore_r16",
+                                                               "dsv4_hc_post_norm_inj_f16_resonly_r16" };
+                    for (uint32_t dm = 0; dm < 3; ++dm) {
+                        ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_inj_r16[dm], r16_names[dm],
+                            dsv4_hc_post_norm_inj_f16_len, dsv4_hc_post_norm_inj_f16_data, "main", 8, sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants), {1, 1, 1},
+                            { 1u, ggml_vk_hc_cmb_spec(), dm, 1u }, 1);
+                    }
                 }
             }
         }
@@ -4777,6 +4804,29 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_moe_post_norm_defer[0], "dsv4_hc_moe_post_norm_s32_inj_defer",
                 dsv4_hc_moe_post_norm_s32_inj_defer_len, dsv4_hc_moe_post_norm_s32_inj_defer_data, "main", 12,
                 sizeof(vk_op_dsv4_hc_moe_post_norm_defer_push_constants), {1, 1, 1}, { 1u, ggml_vk_hc_cmb_spec() }, 1);
+            // HC_BF16RES: the inject forms with a bf16 residual in (RES16 1), a bf16 combine out (2) or both (3)
+            static const char * const r16_moe[2][2][3] = {
+                { { "dsv4_hc_moe_post_norm_s32_inj_r16i", "dsv4_hc_moe_post_norm_s32_inj_r16o", "dsv4_hc_moe_post_norm_s32_inj_r16io" },
+                  { "dsv4_hc_moe_post_norm_s32_inj_defer_r16i", "dsv4_hc_moe_post_norm_s32_inj_defer_r16o", "dsv4_hc_moe_post_norm_s32_inj_defer_r16io" } },
+                { { "dsv4_hc_moe_post_norm_s16_inj_r16i", "dsv4_hc_moe_post_norm_s16_inj_r16o", "dsv4_hc_moe_post_norm_s16_inj_r16io" },
+                  { "dsv4_hc_moe_post_norm_s16_inj_defer_r16i", "dsv4_hc_moe_post_norm_s16_inj_defer_r16o", "dsv4_hc_moe_post_norm_s16_inj_defer_r16io" } },
+            };
+            for (uint32_t r = 1; r <= 3; ++r) {
+                ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_moe_post_norm_r16[1][r - 1], r16_moe[1][0][r - 1],
+                    dsv4_hc_moe_post_norm_s16_inj_len, dsv4_hc_moe_post_norm_s16_inj_data, "main", 10,
+                    sizeof(vk_op_dsv4_hc_moe_post_norm_push_constants), {1, 1, 1}, { 1u, ggml_vk_hc_cmb_spec(), r }, 1);
+                ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_moe_post_norm_r16[0][r - 1], r16_moe[0][0][r - 1],
+                    dsv4_hc_moe_post_norm_s32_inj_len, dsv4_hc_moe_post_norm_s32_inj_data, "main", 10,
+                    sizeof(vk_op_dsv4_hc_moe_post_norm_push_constants), {1, 1, 1}, { 1u, ggml_vk_hc_cmb_spec(), r }, 1);
+                ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_moe_post_norm_defer_r16[1][r - 1], r16_moe[1][1][r - 1],
+                    dsv4_hc_moe_post_norm_s16_inj_defer_len, dsv4_hc_moe_post_norm_s16_inj_defer_data, "main", 12,
+                    sizeof(vk_op_dsv4_hc_moe_post_norm_defer_push_constants), {1, 1, 1}, { 1u, ggml_vk_hc_cmb_spec(), r }, 1);
+                ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_moe_post_norm_defer_r16[0][r - 1], r16_moe[0][1][r - 1],
+                    dsv4_hc_moe_post_norm_s32_inj_defer_len, dsv4_hc_moe_post_norm_s32_inj_defer_data, "main", 12,
+                    sizeof(vk_op_dsv4_hc_moe_post_norm_defer_push_constants), {1, 1, 1}, { 1u, ggml_vk_hc_cmb_spec(), r }, 1);
+            }
+            ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_res16_widen, "dsv4_hc_res16_widen",
+                dsv4_hc_res16_widen_len, dsv4_hc_res16_widen_data, "main", 1, sizeof(vk_op_dsv4_hc_res16_widen_push_constants), {1, 1, 1}, {}, 1);
         }
     }
 
@@ -9673,13 +9723,22 @@ static void ggml_vk_dsv4_hc_post_norm_impl(ggml_backend_vk_context * ctx, vk_con
 
     const bool inj = inj_in;
     GGML_ASSERT(dm == 0 || (inj && has_post));
-    vk_pipeline pipeline = dm != 0 ? ctx->device->pipeline_dsv4_hc_post_norm_inj_dm[dm - 1]
+    // HC_BF16RES: the residual was stored bf16 by the MoE epilogue before (only this inject form reads one: ggml_vk_hc_res16_guard
+    // widens it for anything else)
+    const auto r16 = ctx->hc_res16.find(res);
+    const bool res16 = r16 != ctx->hc_res16.end();
+    GGML_ASSERT(!res16 || (inj && has_post));
+    vk_pipeline pipeline = res16 ? ctx->device->pipeline_dsv4_hc_post_norm_inj_r16[dm]
+                         : dm != 0 ? ctx->device->pipeline_dsv4_hc_post_norm_inj_dm[dm - 1]
                          : inj ? ctx->device->pipeline_dsv4_hc_post_norm_inj[has_post ? 1 : 0]
                                : ctx->device->pipeline_dsv4_hc_post_norm[has_post ? 1 : 0][out_f16 ? 1 : 0];
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    if (res16) {
+        ggml_vk_path_census_add("HC_BF16RES_IN");
+    }
 
-    const vk_op_dsv4_hc_post_norm_push_constants pc = {
+    vk_op_dsv4_hc_post_norm_push_constants pc = {
         n_embd, hc, nt,
         has_post ? (uint32_t)(x->nb[1] / sizeof(float)) : 0u,
         (uint32_t)(res->nb[1] / sizeof(float)), (uint32_t)(res->nb[2] / sizeof(float)),
@@ -9693,6 +9752,15 @@ static void ggml_vk_dsv4_hc_post_norm_impl(ggml_backend_vk_context * ctx, vk_con
         has_post ? ggml_get_op_params_f32(hc_post->src[2], 0) : 1.0f,
         0u,
     };
+    if (res16) {
+        pc.sr1 = r16->second.first;
+        pc.sr2 = r16->second.second;
+        // GGML_VK_HC_BF16RES_TEST_BREAK=1 (tests only, the negative control): the bf16 reader drops the token pad
+        static const bool brk = [] { const char * e = getenv("GGML_VK_HC_BF16RES_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+        if (brk) {
+            pc.sr2 -= 8;
+        }
+    }
 
     if (inj) {
         // the CPY's 2-D view and the inject MUL_MAT follow the norm chain (ggml_vk_can_fuse_hc_post_norm_inj)
@@ -19475,6 +19543,113 @@ static int ggml_vk_can_fuse_hc_moe_epi(const ggml_backend_vk_context * ctx, cons
     return n_front;
 }
 
+static bool ggml_vk_hc_res16_reject(const char * why) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    static std::set<std::string> said;
+    if (dbg && said.insert(why).second) {
+        GGML_LOG_INFO("ggml_vulkan: HC_BF16RES not taken: %s\n", why);
+    }
+    return false;
+}
+
+// HC_BF16RES at the MoE epilogue's combine (j: the combine chain's first SCALE, the inject form): its output R is stored bf16 when R
+// is a plain f32 [n_embd, 4, T] node that is not a graph output and whose only readers are the chain's own norm (in the kernel) and
+// one DSV4_HC_POST taking it as the residual whose chain this backend runs as the attention-side combine + f16 norm + inject (the
+// form that reads bf16; with HC_DEFER the MoE epilogue after it reads R too, also bf16-aware). A reader the prediction misses gets
+// R widened back to f32 first (ggml_vk_hc_res16_guard), so the result never depends on the prediction. Returns the bf16 strides.
+static bool ggml_vk_hc_res16_try(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int j, uint32_t & s1, uint32_t & s2) {
+    if (!ggml_vk_hc_bf16res_enabled()) {
+        return false;
+    }
+    const ggml_tensor * r = cgraph->nodes[j + 3];
+    if (r->op != GGML_OP_DSV4_HC_POST || r->type != GGML_TYPE_F32 || (r->flags & GGML_TENSOR_FLAG_OUTPUT) || r->view_src != nullptr ||
+        r->ne[1] != 4 || r->ne[0] % 8 != 0 || r->ne[3] != 1 || !ggml_is_contiguous(r)) {
+        return ggml_vk_hc_res16_reject("combine output is a graph output, a view, or not a packed f32 [n_embd % 8, 4, T]");
+    }
+    const uint32_t pad = ggml_vk_hc_bf16res_pad();
+    s1 = (uint32_t) r->ne[0] + pad;
+    s2 = 4 * s1 + pad;
+    if ((uint64_t) s2 * 2 > r->nb[2] || r->ne[0] * 4 > 16384) {
+        return ggml_vk_hc_res16_reject("bf16 rows do not fit the f32 token stride (pad too large)");
+    }
+    if (ggml_node_get_use_count(cgraph, j + 3) != 2 || cgraph->nodes[j + 4]->op != GGML_OP_RMS_NORM || cgraph->nodes[j + 4]->src[0] != r) {
+        return ggml_vk_hc_res16_reject("combine output has other readers than its norm and one combine");
+    }
+    int n_idx = -1;
+    for (int n = j + 5; n < cgraph->n_nodes; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * x = t->src[k];
+            if (x == nullptr || (x != r && x->view_src != r)) {
+                continue;
+            }
+            if (t->op != GGML_OP_DSV4_HC_POST || k != 1 || x != r || n_idx >= 0) {
+                return ggml_vk_hc_res16_reject("the other reader is not a combine taking it as its residual");
+            }
+            n_idx = n;
+        }
+        if (n_idx >= 0) {
+            break;
+        }
+    }
+    if (n_idx < 3) {
+        return ggml_vk_hc_res16_reject("no reading combine in this graph split");
+    }
+    const int c0 = n_idx - 3;
+    if (cgraph->nodes[c0]->op != GGML_OP_SCALE ||
+        !ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, c0, HC_POST_NORM_GATE_CPY) ||
+        !ggml_vk_can_fuse_hc_post_norm_inj(ctx, cgraph, c0, HC_POST_NORM_GATE_CPY) ||
+        (c0 >= 1 && ggml_vk_can_fuse_hc_post_norm_add(ctx, cgraph, c0 - 1))) {
+        return ggml_vk_hc_res16_reject("the reading combine is not the f16 norm + inject form");
+    }
+    if (ctx->device->pipeline_dsv4_hc_post_norm_inj_r16[0] == nullptr || ctx->device->pipeline_dsv4_hc_res16_widen == nullptr) {
+        return false;
+    }
+    return true;
+}
+
+// HC_BF16RES, before the dispatch of node i (+ its fused nodes): a bf16-stored residual read by anything other than the two kernels
+// that take one (the attention-side combine + f16 norm + inject as its residual, the MoE epilogue + inject as its residual) is widened
+// back to f32 in place first (dsv4_hc_res16_widen.comp, one workgroup) and dropped from the set
+static void ggml_vk_hc_res16_guard(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * aware = nullptr;   // the DSV4_HC_POST node whose residual this dispatch reads as bf16
+    if (ctx->fused_hc_post_norm_inj && ctx->fused_hc_post_norm == HC_POST_NORM_GATE_CPY && !ctx->fused_hc_post_norm_add) {
+        const int hp = i + (ctx->fused_hc_moe_epi ? ctx->fused_hc_moe_epi : 0) + 3;
+        if (hp < cgraph->n_nodes && cgraph->nodes[hp]->op == GGML_OP_DSV4_HC_POST) {
+            aware = cgraph->nodes[hp];
+        }
+    }
+    // GGML_VK_HC_BF16RES_TEST_WIDEN=1 (tests only): every bf16 residual is widened before its first reader (the fallback path)
+    static const bool test_widen = [] { const char * e = getenv("GGML_VK_HC_BF16RES_TEST_WIDEN"); return e != nullptr && atoi(e) != 0; }();
+    for (int k = 0; k <= ctx->num_additional_fused_ops; ++k) {
+        const ggml_tensor * t = cgraph->nodes[i + k];
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * x = t->src[j];
+            if (x == nullptr) {
+                continue;
+            }
+            const ggml_tensor * base = x->view_src != nullptr ? x->view_src : x;
+            auto it = ctx->hc_res16.find(base);
+            if (it == ctx->hc_res16.end() || (!test_widen && t == aware && j == 1 && x == base)) {
+                continue;
+            }
+            const ggml_tensor * r = it->first;
+            vk_pipeline & pipeline = ctx->device->pipeline_dsv4_hc_res16_widen;
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+            vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+            ctx->unsynced_nodes_written.clear();
+            ctx->unsynced_nodes_read.clear();
+            ggml_vk_sync_buffers(ctx, compute_ctx);
+            const vk_op_dsv4_hc_res16_widen_push_constants pc = { (uint32_t) r->ne[0], (uint32_t) r->ne[1], (uint32_t) r->ne[2], it->second.first, it->second.second,
+                                     (uint32_t) (r->nb[1] / sizeof(float)), (uint32_t) (r->nb[2] / sizeof(float)) };
+            ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, r) }, pc, { 1, 1, 1 });
+            ctx->unsynced_nodes_written.push_back(r);
+            ggml_vk_path_census_add("HC_BF16RES_WIDEN");
+            ctx->hc_res16.erase(it);
+        }
+    }
+}
+
 // node_idx: the chain's first ADD, or the shared expert's gate (ggml_vk_can_fuse_hc_moe_epi admitted ctx->fused_hc_moe_epi nodes,
 // then the HC post norm chain)
 static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -19509,14 +19684,24 @@ static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_cont
     const bool defer = ctx->hc_defer.a != nullptr && res == ctx->hc_defer.a;
     GGML_ASSERT(!defer || (inj && ctx->device->pipeline_dsv4_hc_moe_post_norm_defer[c.f16 ? 1 : 0] != nullptr));
     const ggml_tensor * res_in = defer ? ctx->hc_defer.res0 : res;
-    vk_pipeline pipeline = defer ? ctx->device->pipeline_dsv4_hc_moe_post_norm_defer[c.f16 ? 1 : 0]
+    // HC_BF16RES: the residual read bf16 (stored so by the MoE epilogue before), the combine output stored bf16 (predicted here)
+    const auto r16_in = inj ? ctx->hc_res16.find(res_in) : ctx->hc_res16.end();
+    const bool res16_in = r16_in != ctx->hc_res16.end();
+    uint32_t o16_s1 = 0, o16_s2 = 0;
+    const bool res16_out = inj && ggml_vk_hc_res16_try(ctx, cgraph, j, o16_s1, o16_s2) &&
+                           ctx->device->pipeline_dsv4_hc_moe_post_norm_r16[c.f16 ? 1 : 0][1] != nullptr;
+    const uint32_t r16 = (res16_in ? 1u : 0u) | (res16_out ? 2u : 0u);
+    GGML_ASSERT(!res16_in || inj);
+    vk_pipeline pipeline = r16 != 0 ? (defer ? ctx->device->pipeline_dsv4_hc_moe_post_norm_defer_r16[c.f16 ? 1 : 0][r16 - 1]
+                                             : ctx->device->pipeline_dsv4_hc_moe_post_norm_r16[c.f16 ? 1 : 0][r16 - 1])
+                         : defer ? ctx->device->pipeline_dsv4_hc_moe_post_norm_defer[c.f16 ? 1 : 0]
                                  : ctx->device->pipeline_dsv4_hc_moe_post_norm[c.f16 ? 1 : 0][inj ? 2 : out_f16 ? 1 : 0];
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     const ggml_tensor * mm = inj ? cgraph->nodes[j + 8] : nullptr;
     const ggml_tensor * w  = inj ? mm->src[0] : nullptr;
-    const vk_op_dsv4_hc_moe_post_norm_push_constants pc = {
+    vk_op_dsv4_hc_moe_post_norm_push_constants pc = {
         {
             {
                 n_embd, hc, nt,
@@ -19539,6 +19724,22 @@ static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_cont
         c.gate != nullptr ? 2u : c.sh != nullptr ? 1u : 0u,
         c.gate != nullptr ? (uint32_t)(c.gate->nb[1] / sizeof(float)) : 0u,
     };
+    if (res16_in) {
+        pc.inj.base.sr1 = r16_in->second.first;
+        pc.inj.base.sr2 = r16_in->second.second;
+        ggml_vk_path_census_add(defer ? "HC_BF16RES_IN_DEFER" : "HC_BF16RES_IN_MOE");
+        // GGML_VK_HC_BF16RES_TEST_BREAK=1 (tests only, the negative control): the bf16 reader drops the token pad
+        static const bool brk = [] { const char * e = getenv("GGML_VK_HC_BF16RES_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+        if (brk) {
+            pc.inj.base.sr2 -= 8;
+        }
+    }
+    if (res16_out) {
+        pc.inj.base.so1 = o16_s1;
+        pc.inj.base.so2 = o16_s2;
+        ctx->hc_res16[hc_post] = { o16_s1, o16_s2 };
+        ggml_vk_path_census_add("HC_BF16RES");
+    }
 
     if (defer) {
         const auto & d = ctx->hc_defer;
@@ -21939,6 +22140,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->device->diag_cgraph = nullptr;
     ctx->device->diag_prev_start = -1;
     ctx->hc_defer = {};
+    ctx->hc_res16.clear();
     ctx->device->diag_prev_end = -1;
 
     if (vk_instance.debug_utils_support) {
@@ -22649,6 +22851,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
+        if (!ctx->hc_res16.empty()) {
+            ggml_vk_hc_res16_guard(ctx, cgraph, i);
+        }
         if (ctx->hc_defer.a != nullptr) {
             ggml_vk_hc_defer_guard(ctx, cgraph, i);
         }

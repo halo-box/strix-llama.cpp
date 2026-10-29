@@ -32,6 +32,10 @@ layout(constant_id = 0) const uint HAS_POST = 1;   // kept for the pipeline layo
 // same arithmetic in the same order: bit-identical.
 layout(constant_id = 1) const uint LOADS_FIRST = 0;
 const uint SLOT_BATCH = 8;
+// RES16 (GGML_VK_HC_BF16RES, INJ only): bit 0 = the residual input is stored bf16, bit 1 = the combine output is stored bf16 (packed
+// rows, the strides in bf16 elements, multiples of 8). bf16 is storage only: widened on load, rounded to nearest even on the store,
+// the combine, norm and inject run in f32 on the unrounded values as with RES16 = 0
+layout(constant_id = 2) const uint RES16 = 0;
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -45,9 +49,11 @@ layout(binding = 0, std430) readonly  buffer SBuf { vec4    data_s[]; };
 #endif
 layout(binding = 1, std430) readonly  buffer HBuf { vec4    data_h[]; };
 layout(binding = 2, std430) readonly  buffer RBuf { vec4    data_r[]; };
+layout(binding = 2, std430) readonly  buffer RBuf16 { uvec4 data_r16[]; };   // RES16 bit 0: 8 bf16 per element
 layout(binding = 3, std430) readonly  buffer PBuf { float   data_p[]; };
 layout(binding = 4, std430) readonly  buffer GBuf { vec4    data_g[]; };
 layout(binding = 5, std430) writeonly buffer OBuf { vec4    data_o[]; };
+layout(binding = 5, std430) writeonly buffer OBuf16 { uvec4 data_o16[]; };  // RES16 bit 1
 #if defined(OUT_F16)
 layout(binding = 6, std430) writeonly buffer NBuf { f16vec4 data_n[]; };
 #else
@@ -282,6 +288,39 @@ void main() {
 const uint HC = 4;
 const uint NG = 2;   // 8-column groups per thread
 
+// the residual's 8 columns of group gi in stream c of token t (f32 or, RES16 bit 0, bf16 widened exactly)
+void load_res(const uint c, const uint t, const uint gi, out vec4 r0, out vec4 r1) {
+    if ((RES16 & 1) != 0) {
+        const uvec4 u = data_r16[(c * p.sr1 + t * p.sr2) / 8 + gi];
+        r0 = vec4(uintBitsToFloat(u.x << 16), uintBitsToFloat(u.x & 0xFFFF0000u), uintBitsToFloat(u.y << 16), uintBitsToFloat(u.y & 0xFFFF0000u));
+        r1 = vec4(uintBitsToFloat(u.z << 16), uintBitsToFloat(u.z & 0xFFFF0000u), uintBitsToFloat(u.w << 16), uintBitsToFloat(u.w & 0xFFFF0000u));
+    } else {
+        const uint rb = (c * p.sr1 + t * p.sr2) / 4 + gi * 2;
+        r0 = data_r[rb];
+        r1 = data_r[rb + 1];
+    }
+}
+
+// f32 -> bf16, round to nearest even (finite values; an overflow rounds to inf as the conversion would), two per word
+uint bf16_pack2(const float lo, const float hi) {
+    const uint a = floatBitsToUint(lo);
+    const uint b = floatBitsToUint(hi);
+    const uint ra = (a + 0x7FFFu + ((a >> 16) & 1u)) >> 16;
+    const uint rb = (b + 0x7FFFu + ((b >> 16) & 1u)) & 0xFFFF0000u;
+    return ra | rb;
+}
+
+// the combine output's 8 columns of group gi in stream c of token t
+void store_out(const uint c, const uint t, const uint gi, const vec4 r0, const vec4 r1) {
+    if ((RES16 & 2) != 0) {
+        data_o16[(c * p.so1 + t * p.so2) / 8 + gi] = uvec4(bf16_pack2(r0.x, r0.y), bf16_pack2(r0.z, r0.w), bf16_pack2(r1.x, r1.y), bf16_pack2(r1.z, r1.w));
+    } else {
+        const uint ob = (c * p.so1 + t * p.so2) / 4 + gi * 2;
+        data_o[ob]     = r0;
+        data_o[ob + 1] = r1;
+    }
+}
+
 shared float sumsh[HC][32];
 shared float injsh[HC][32];
 
@@ -299,9 +338,7 @@ void main() {
                 a[c][g][0] = vec4(0.0f);
                 a[c][g][1] = vec4(0.0f);
                 if (tid + g * BLOCK < ng) {
-                    const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
-                    a[c][g][0] = data_r[rb];
-                    a[c][g][1] = data_r[rb + 1];
+                    load_res(c, t, tid + g * BLOCK, a[c][g][0], a[c][g][1]);
                 }
             }
         }
@@ -350,9 +387,12 @@ void main() {
             vec4 r0 = vec4(0.0f);
             vec4 r1 = vec4(0.0f);
             if (tid + g * BLOCK < ng) {
-                const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
-                r0 = LOADS_FIRST != 0 ? a[c][g][0] : data_r[rb];
-                r1 = LOADS_FIRST != 0 ? a[c][g][1] : data_r[rb + 1];
+                if (LOADS_FIRST != 0) {
+                    r0 = a[c][g][0];
+                    r1 = a[c][g][1];
+                } else {
+                    load_res(c, t, tid + g * BLOCK, r0, r1);
+                }
 #if defined(DEFER)
                 // the attention-side combine (dsv4_hc_post_norm_inj.comp: r = xv * pw + r)
                 r0 = xa[g][0] * pwa + r0;
@@ -360,9 +400,7 @@ void main() {
 #endif
                 r0 = xv[g][0] * pw + r0;
                 r1 = xv[g][1] * pw + r1;
-                const uint ob = (c * p.so1 + t * p.so2) / 4 + e4;
-                data_o[ob]     = r0;
-                data_o[ob + 1] = r1;
+                store_out(c, t, tid + g * BLOCK, r0, r1);
             }
             a[c][g][0] = r0;
             a[c][g][1] = r1;
