@@ -5174,6 +5174,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         mul_mm_id_down_q5_1_f16_rp_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
                     ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51_rp[1], "mul_mm_id_down_q5_1_f32_rp", mul_mm_id_down_q5_1_f32_rp_len,
                         mul_mm_id_down_q5_1_f32_rp_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+#define CREATE_MMID_DOWN_V(v) \
+                    ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51_rpv[v], "mul_mm_id_down_q5_1_f16_rp_v" #v, mul_mm_id_down_q5_1_f16_rp_v ## v ## _len, \
+                        mul_mm_id_down_q5_1_f16_rp_v ## v ## _data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+                    CREATE_MMID_DOWN_V(1) CREATE_MMID_DOWN_V(2) CREATE_MMID_DOWN_V(3) CREATE_MMID_DOWN_V(4)
+                    CREATE_MMID_DOWN_V(5) CREATE_MMID_DOWN_V(6) CREATE_MMID_DOWN_V(7) CREATE_MMID_DOWN_V(8)
+#undef CREATE_MMID_DOWN_V
                     ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q4k, "mul_mat_vec_id_q4_k_rp_f32", mul_mat_vec_id_q4_k_rp_f32_len,
                         mul_mat_vec_id_q4_k_rp_f32_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
                     ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q5k, "mul_mat_vec_id_q5_k_rp_f32", mul_mat_vec_id_q5_k_rp_f32_len,
@@ -11477,6 +11483,18 @@ static void ggml_vk_mmid_pair_glu(ggml_backend_vk_context * ctx, vk_context& sub
     vk_pipeline pipeline = ctx->device->pipeline_mmid_glu[ggml_vk_mmid_glu_type_idx(w_g->type)][f32 ? 1 : 0][x->type == GGML_TYPE_F32 ? 1 : 0];
     const bool repacked = ggml_vk_repack_rows(w) != 0;
     vk_pipeline pipeline = (repacked ? ctx->device->pipeline_mmid_down_q51_rp : ctx->device->pipeline_mmid_down_q51)[x->type == GGML_TYPE_F32 ? 1 : 0];
+    // GGML_VK_EXPDOWN_V=n: variant n of the repacked f16-B kernel (1 KC128, 2 TPW2, 3 TPW4, 4 PK16, 5 EPI_OFF (measurement only,
+    // wrong results), 6 KC128+PK16, 7 TPW2+PK16, 8 KC128+TPW2); 0 / unset = the kernel above
+    static const int expdown_v = [] { const char * e = getenv("GGML_VK_EXPDOWN_V"); const int v = e ? atoi(e) : 0; return v >= 0 && v <= 8 ? v : 0; }();
+    uint32_t tpw = 1;
+    if (expdown_v != 0 && repacked && x->type == GGML_TYPE_F16 && ctx->device->pipeline_mmid_down_q51_rpv[expdown_v]) {
+        const bool kc128 = expdown_v == 1 || expdown_v == 6 || expdown_v == 8;
+        if (!kc128 || K % 128 == 0) {
+            pipeline = ctx->device->pipeline_mmid_down_q51_rpv[expdown_v];
+            tpw = (expdown_v == 2 || expdown_v == 7 || expdown_v == 8) ? 2 : expdown_v == 3 ? 4 : 1;
+            ggml_vk_path_census_add("EXPDOWN_V");
+        }
+    }
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
     if (ctx->prealloc_size_split_k < expert_data_size) {
         ctx->prealloc_size_split_k = expert_data_size;
@@ -11539,12 +11557,13 @@ static void ggml_vk_mmid_pair_glu(ggml_backend_vk_context * ctx, vk_context& sub
         n_used, (uint32_t) row_ids_offset,
         scale ? (uint32_t) (get_misalign_bytes(ctx, scale) / 4) : 0u, scale ? 1u : 0u,
     };
-    const uint32_t tiles_y = (uint32_t) std::min<uint64_t>(max_tiles, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    const uint64_t wg_tiles = CEIL_DIV(max_tiles, (uint64_t) tpw);   // tpw count_experts tiles per workgroup
+    const uint32_t tiles_y = (uint32_t) std::min<uint64_t>(wg_tiles, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
     // without router weights the scale binding is not read: bind the output there
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, w, true), ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, out, true), expert_buf,
           ggml_vk_tensor_subbuffer(ctx, scale ? scale : out, true) },
-        pc, { M, tiles_y, (uint32_t) CEIL_DIV(max_tiles, tiles_y) });
+        pc, { M, tiles_y, (uint32_t) CEIL_DIV(wg_tiles, tiles_y) });
     ctx->prealloc_split_k_need_sync = true;
 }
 
