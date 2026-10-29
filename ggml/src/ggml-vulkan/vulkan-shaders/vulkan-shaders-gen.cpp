@@ -1023,6 +1023,15 @@ void process_shaders() {
     string_to_spv("mul_mm_id_down_q5_1_f32", "mul_mm_id_down.comp", {{"B_F32", "1"}});
     string_to_spv("mul_mm_id_down_q5_1_f16_rp", "mul_mm_id_down.comp", {{"A_REPACK", "1"}});   // expert repack buffer
     string_to_spv("mul_mm_id_down_q5_1_f32_rp", "mul_mm_id_down.comp", {{"B_F32", "1"}, {"A_REPACK", "1"}});
+    // GGML_VK_EXPDOWN_V variants of the repacked f16-B down kernel (index = the env value)
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v1", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"KC", "128"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v2", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "2"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v3", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "4"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v4", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"PK16", "1"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v5", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"EPI_OFF", "1"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v6", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"KC", "128"}, {"PK16", "1"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v7", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "2"}, {"PK16", "1"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v8", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"KC", "128"}, {"TPW", "2"}});
     // expert repack buffer: the mat-vec MUL_MAT_ID on the repacked order, and the inverse copy for the other readers
     string_to_spv("mul_mat_vec_id_q4_k_rp_f32", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}});
     string_to_spv("mul_mat_vec_id_q5_1_rp_f32", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_1", "1"}});

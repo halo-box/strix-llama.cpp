@@ -51,15 +51,45 @@ layout(binding = 4) readonly buffer S  { float data_s[]; };
 #define ACC  coopmat<float,     gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 
 #define BN 64            // tokens per tile (the count_experts row tile)
-#define KC 64            // K per stage: two q5_1 blocks, 48 bytes = 3 uvec4 per row
-#define SB 36            // shared row stride in uints (32 data + 4 pad, 16-byte aligned rows)
+#ifndef KC
+#define KC 64            // K per stage: two q5_1 blocks, 48 bytes = 3 uvec4 per row (KC=128: four blocks, 6 uvec4)
+#endif
+#ifndef TPW
+#define TPW 1            // count_experts tiles per workgroup, run back to back (the next tile's first stage loads under the epilogue)
+#endif
+#define NBL (KC / 32)    // q5_1 blocks per stage
+#define AU  (NBL * 3 / 2) // A uvec4 per lane and stage
+#define KS  (KC / 16)    // 16-K WMMA steps per stage
+#define SB  (KC / 2 + 4) // shared row stride in uints (KC halves + 4 pad, 16-byte aligned rows)
 
 shared uint buf_b[2][BN * SB];
-shared uint s_rid[BN];
+shared uint s_rid[TPW][BN];
 
+#if defined(PK16)
+// one half of a q5_1 block -> 8 packed f16 pairs fma(q, d, m) in f16 (one rounding). The pairs hold K positions (4w, 4w + 2) and
+// (4w + 1, 4w + 3): the byte lanes 0/2 and 1/3 of a dword become f16 1024 + q by an OR with 0x6400, minus 1024 exactly. B is
+// stored in shared memory with the same 4-group order (STORE_B), so the products pair up as before.
+void q51_frag(const uvec4 qs, const uint qh, const uint h, const uint dm, out uint o[8]) {
+    const f16vec2 dmh = unpackFloat2x16(dm);
+    const f16vec2 d2 = f16vec2(dmh.x, dmh.x);
+    const f16vec2 m2 = f16vec2(dmh.y, dmh.y);
+    const f16vec2 off = f16vec2(float16_t(1024.0), float16_t(1024.0));
+    [[unroll]] for (uint w = 0; w < 4; w++) {
+        const uint hb = bitfieldExtract(qh, int(4 * w + 16 * h), 4);
+        // fifth bits 0..3 -> bit 4 of bytes 0..3 (shifted copies at 4 + 7 j never collide for j < 4)
+        const uint nb = ((qs[w] >> (4 * h)) & 0x0F0F0F0Fu) | ((hb * 0x02040810u) & 0x10101010u);
+        const uint x0 = (nb & 0x00FF00FFu) | 0x64006400u;
+        const uint x1 = ((nb >> 8) & 0x00FF00FFu) | 0x64006400u;
+        o[2 * w]     = packFloat2x16(fma(unpackFloat2x16(x0) - off, d2, m2));
+        o[2 * w + 1] = packFloat2x16(fma(unpackFloat2x16(x1) - off, d2, m2));
+    }
+}
+#else
 // one half (h = 0: values 0..15, the low nibbles; h = 1: values 16..31, the high nibbles) of a q5_1 block -> 8 packed f16
 // pairs f16(fma(d, q, m)); qs = the block's 16 quant bytes, qh its 32 fifth bits
-void q51_frag(const uvec4 qs, const uint qh, const uint h, const float d, const float m, out uint o[8]) {
+void q51_frag(const uvec4 qs, const uint qh, const uint h, const uint dm, out uint o[8]) {
+    const vec2 dmf = unpackHalf2x16(dm);
+    const float d = dmf.x, m = dmf.y;
     [[unroll]] for (uint w = 0; w < 4; w++) {
         const uint hb = (qh >> (4 * w + 16 * h)) & 0xFu;
         const uint nb = ((qs[w] >> (4 * h)) & 0x0F0F0F0Fu) |
@@ -69,15 +99,25 @@ void q51_frag(const uvec4 qs, const uint qh, const uint h, const float d, const 
         o[2 * w + 1] = packFloat2x16(f16vec2(fma(d, v.z, m), fma(d, v.w, m)));
     }
 }
+#endif
+
+uint pick(const uint v[TPW], const uint i) {
+    uint r = v[0];
+    [[unroll]] for (uint k = 1; k < TPW; k++) {
+        if (i == k) {
+            r = v[k];
+        }
+    }
+    return r;
+}
 
 void main() {
-    const uint tile = gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
-    if (tile >= data_e[0]) {
+    const uint n_tiles = data_e[0];
+    const uint tile0 = (gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y) * TPW;
+    if (tile0 >= n_tiles) {
         return;
     }
-    const uint expert = data_e[1 + 2 * tile];
-    const uint nrows  = data_e[2 + 2 * tile];
-    const uint nt     = (nrows + 15) / 16;              // live 16-token sub-tiles (uniform)
+    const uint ntl = min(uint(TPW), n_tiles - tile0);   // tiles of this workgroup (uniform)
 
     const uint tid  = gl_LocalInvocationID.x;
     const uint wave = gl_SubgroupID;
@@ -85,51 +125,70 @@ void main() {
     const bool lo   = lane < 16;
 
     if (tid < BN) {
-        // rows past nrows reuse row 0, so the B gather stays in bounds; their results are not stored
-        s_rid[tid] = data_e[p.row_ids_offset + tile * BN + (tid < nrows ? tid : 0)];
+        [[unroll]] for (uint tt = 0; tt < TPW; tt++) {
+            if (tt < ntl) {
+                // rows past nrows reuse row 0, so the B gather stays in bounds; their results are not stored
+                const uint nr = data_e[2 + 2 * (tile0 + tt)];
+                s_rid[tt][tid] = data_e[p.row_ids_offset + (tile0 + tt) * BN + (tid < nr ? tid : 0)];
+            }
+        }
     }
     barrier();
 
-    // B gather: thread tid fills token tid / 4, K quarter tid % 4 (16 values) of each stage
+    // B gather: thread tid fills token tid / 4, K quarter tid % 4 (KC / 4 values) of each stage
     const uint b_tok = tid / 4;
     const uint b_q   = tid % 4;
-    uint b_base;
-    {
-        const uint rid = s_rid[b_tok];
-        b_base = p.b_offset + (rid >> 16) * p.b_s2 + ((rid & 0xFFFFu) % p.ne11) * p.b_s1;
+    uint b_base[TPW];
+    [[unroll]] for (uint tt = 0; tt < TPW; tt++) {
+        const uint rid = s_rid[tt < ntl ? tt : 0][b_tok];
+        b_base[tt] = p.b_offset + (rid >> 16) * p.b_s2 + ((rid & 0xFFFFu) % p.ne11) * p.b_s1;
     }
-    const uint b_lds = b_tok * SB + b_q * 8;
+    const uint b_lds = b_tok * SB + b_q * (KC / 8);
 #if defined(B_F32)
-    // 16 floats = 4 uvec4 per thread and stage
+#define BR (KC / 16)            // uvec4 per thread and stage (4 floats each)
 #define B_PER_STAGE (KC / 4)
-#define LOAD_B(st, r0, r1, r2, r3) { const uint bi = b_base + (st) * B_PER_STAGE + b_q * 4; \
-        r0 = data_b[bi]; r1 = data_b[bi + 1]; r2 = data_b[bi + 2]; r3 = data_b[bi + 3]; }
-#define STORE_B(buf, r0, r1, r2, r3) { \
-        buf_b[buf][b_lds + 0] = packFloat2x16(f16vec2(uintBitsToFloat(r0.xy))); buf_b[buf][b_lds + 1] = packFloat2x16(f16vec2(uintBitsToFloat(r0.zw))); \
-        buf_b[buf][b_lds + 2] = packFloat2x16(f16vec2(uintBitsToFloat(r1.xy))); buf_b[buf][b_lds + 3] = packFloat2x16(f16vec2(uintBitsToFloat(r1.zw))); \
-        buf_b[buf][b_lds + 4] = packFloat2x16(f16vec2(uintBitsToFloat(r2.xy))); buf_b[buf][b_lds + 5] = packFloat2x16(f16vec2(uintBitsToFloat(r2.zw))); \
-        buf_b[buf][b_lds + 6] = packFloat2x16(f16vec2(uintBitsToFloat(r3.xy))); buf_b[buf][b_lds + 7] = packFloat2x16(f16vec2(uintBitsToFloat(r3.zw))); }
-    uvec4 br0, br1, br2, br3;
 #else
-    // 16 halves = 2 uvec4 per thread and stage
+#define BR (KC / 32)            // uvec4 per thread and stage (8 halves each)
 #define B_PER_STAGE (KC / 8)
-#define LOAD_B(st, r0, r1, r2, r3) { const uint bi = b_base + (st) * B_PER_STAGE + b_q * 2; r0 = data_b[bi]; r1 = data_b[bi + 1]; }
-#define STORE_B(buf, r0, r1, r2, r3) { \
-        buf_b[buf][b_lds + 0] = r0.x; buf_b[buf][b_lds + 1] = r0.y; buf_b[buf][b_lds + 2] = r0.z; buf_b[buf][b_lds + 3] = r0.w; \
-        buf_b[buf][b_lds + 4] = r1.x; buf_b[buf][b_lds + 5] = r1.y; buf_b[buf][b_lds + 6] = r1.z; buf_b[buf][b_lds + 7] = r1.w; }
-    uvec4 br0, br1, br2 = uvec4(0), br3 = uvec4(0);
+#endif
+    uvec4 br[BR];
+#define LOAD_B(base, st) { const uint bi = (base) + (st) * B_PER_STAGE + b_q * BR; \
+        [[unroll]] for (uint i = 0; i < BR; i++) { br[i] = data_b[bi + i]; } }
+#if defined(B_F32)
+#define STORE_B(buf) { [[unroll]] for (uint i = 0; i < BR; i++) { \
+        buf_b[buf][b_lds + 2 * i]     = packFloat2x16(f16vec2(uintBitsToFloat(br[i].xy))); \
+        buf_b[buf][b_lds + 2 * i + 1] = packFloat2x16(f16vec2(uintBitsToFloat(br[i].zw))); } }
+#elif defined(PK16)
+    // K order (4g, 4g + 2), (4g + 1, 4g + 3) per dword pair, as q51_frag's A pairs
+#define STORE_B(buf) { [[unroll]] for (uint i = 0; i < BR; i++) { \
+        buf_b[buf][b_lds + 4 * i]     = (br[i].x & 0xFFFFu) | (br[i].y << 16); \
+        buf_b[buf][b_lds + 4 * i + 1] = (br[i].x >> 16) | (br[i].y & 0xFFFF0000u); \
+        buf_b[buf][b_lds + 4 * i + 2] = (br[i].z & 0xFFFFu) | (br[i].w << 16); \
+        buf_b[buf][b_lds + 4 * i + 3] = (br[i].z >> 16) | (br[i].w & 0xFFFF0000u); } }
+#else
+#define STORE_B(buf) { [[unroll]] for (uint i = 0; i < BR; i++) { \
+        buf_b[buf][b_lds + 4 * i] = br[i].x; buf_b[buf][b_lds + 4 * i + 1] = br[i].y; \
+        buf_b[buf][b_lds + 4 * i + 2] = br[i].z; buf_b[buf][b_lds + 4 * i + 3] = br[i].w; } }
 #endif
 
-    // A: this lane's row, 3 uvec4 per 64-K stage = two 24-byte q5_1 blocks (d, m | qh | 16 qs bytes)
+    // A: this lane's row, AU uvec4 per KC stage = NBL 24-byte q5_1 blocks (d, m | qh | 16 qs bytes)
     const uint feat0 = gl_WorkGroupID.x * 256 + wave * 32;
+    const uint row_u = p.K * 3 / 64;                     // uvec4 per row
+    uint a_base[TPW];
+    [[unroll]] for (uint tt = 0; tt < TPW; tt++) {
+        const uint expert = data_e[1 + 2 * (tile0 + (tt < ntl ? tt : 0))];
 #if defined(A_REPACK)
-    // expert-repacked weights (Vulkan expert repack buffer): per 32-row block the 16-byte units are stored unit-major,
-    // [stage][uvec4 k][32 rows], so each load is 512 contiguous bytes across the wave
-    const uint a_t32 = p.a_offset + expert * p.stride_e + feat0 * (p.K / KC) * 3 + lane;
-#define LOAD_A(st, a0, a1, a2) { const uint ai = a_t32 + (st) * 96; a0 = data_a[ai]; a1 = data_a[ai + 32]; a2 = data_a[ai + 64]; }
+        // expert-repacked weights (Vulkan expert repack buffer): per 32-row block the 16-byte units are stored unit-major,
+        // [uvec4 k][32 rows], so each load is 512 contiguous bytes across the wave
+        a_base[tt] = p.a_offset + expert * p.stride_e + feat0 * row_u + lane;
 #else
-    const uint a_row = p.a_offset + expert * p.stride_e + (feat0 + lane) * (p.K / KC) * 3;
-#define LOAD_A(st, a0, a1, a2) { const uint ai = a_row + (st) * 3; a0 = data_a[ai]; a1 = data_a[ai + 1]; a2 = data_a[ai + 2]; }
+        a_base[tt] = p.a_offset + expert * p.stride_e + (feat0 + lane) * row_u;
+#endif
+    }
+#if defined(A_REPACK)
+#define LOAD_A(base, st, r) { const uint ai = (base) + (st) * (AU * 32); [[unroll]] for (uint j = 0; j < AU; j++) { r[j] = data_a[ai + 32 * j]; } }
+#else
+#define LOAD_A(base, st, r) { const uint ai = (base) + (st) * AU; [[unroll]] for (uint j = 0; j < AU; j++) { r[j] = data_a[ai + j]; } }
 #endif
 
     ACC acc0[4];   // features feat0 .. feat0 + 15
@@ -140,32 +199,36 @@ void main() {
     }
 
     const uint n_stages = p.K / KC;
-    uvec4 a0, a1, a2;
-    LOAD_A(0, a0, a1, a2);
-    LOAD_B(0, br0, br1, br2, br3);
-    STORE_B(0, br0, br1, br2, br3);
+    const uint steps = ntl * n_stages;
+    uvec4 a[AU];
+    LOAD_A(a_base[0], 0, a);
+    LOAD_B(b_base[0], 0);
+    STORE_B(0);
     barrier();
 
-    for (uint st = 0; st < n_stages; st++) {
-        const uint cur = st & 1;
-        const bool more = st + 1 < n_stages;
-        uvec4 n0, n1, n2;
+    uint tt = 0, st = 0;
+    uint nrows = data_e[2 + 2 * tile0];
+    for (uint i = 0; i < steps; i++) {
+        const uint cur = i & 1;
+        const bool more = i + 1 < steps;
+        const bool last = st + 1 == n_stages;
+        const uint nt = (nrows + 15) / 16;              // live 16-token sub-tiles (uniform)
+        uvec4 n[AU];
         if (more) {
-            LOAD_A(st + 1, n0, n1, n2);
-            LOAD_B(st + 1, br0, br1, br2, br3);
+            const uint ntt = last ? tt + 1 : tt;
+            const uint nst = last ? 0 : st + 1;
+            LOAD_A(pick(a_base, ntt), nst, n);
+            LOAD_B(pick(b_base, ntt), nst);
         }
 
-        const vec2 dm0 = unpackHalf2x16(a0.x);
-        const vec2 dm1 = unpackHalf2x16(a1.z);
-        const uvec4 qs0 = uvec4(a0.z, a0.w, a1.x, a1.y);
-
-        // four 16-K steps: (block 0, values 0..15), (block 0, 16..31), (block 1, 0..15), (block 1, 16..31)
-        [[unroll]] for (uint ks = 0; ks < 4; ks++) {
+        // KS 16-K steps: (block 0, values 0..15), (block 0, 16..31), (block 1, 0..15), ...
+        [[unroll]] for (uint ks = 0; ks < KS; ks++) {
+            const uint bl = ks / 2, h = ks % 2, pr = 3 * (bl / 2);
             uint own[8];
-            if (ks < 2) {
-                q51_frag(qs0, a0.y, ks, dm0.x, dm0.y, own);
+            if ((bl & 1) == 0) {
+                q51_frag(uvec4(a[pr].z, a[pr].w, a[pr + 1].x, a[pr + 1].y), a[pr].y, h, a[pr].x, own);
             } else {
-                q51_frag(a2, a1.w, ks - 2, dm1.x, dm1.y, own);
+                q51_frag(a[pr + 2], a[pr + 1].w, h, a[pr + 1].z, own);
             }
             MATA f0, f1;
             [[unroll]] for (uint j = 0; j < 8; j++) {
@@ -189,37 +252,55 @@ void main() {
             }
         }
 
-        if (more) {
-            STORE_B(cur ^ 1, br0, br1, br2, br3);
-            a0 = n0; a1 = n1; a2 = n2;
-        }
-        barrier();
-    }
-
-    // epilogue: times the router weight, then f16 (the unfused chain's MUL in f32, then the CPY); one xor-16 shuffle gives
-    // each lane 4 consecutive features of its token (low half: rows 2e .. 2e + 3, high half: the next four), one f16vec4 store
-    [[unroll]] for (uint t = 0; t < 4; t++) {
-        if (t < nt) {
-            const uint row = t * 16 + lane % 16;
-            const uint rid = s_rid[row];
-            const uint slot = ((rid >> 16) * p.n_used + (rid & 0xFFFFu));
-            const float w = p.scaled != 0 ? data_s[p.s_offset + slot] : 1.0f;
-            const uint dst_row = slot * (p.M / 4);
-            [[unroll]] for (uint f = 0; f < 2; f++) {
-                [[unroll]] for (uint e = 0; e < 8; e += 4) {
-                    const float c0 = (f == 0 ? acc0[t][e]     : acc1[t][e])     * w;
-                    const float c1 = (f == 0 ? acc0[t][e + 1] : acc1[t][e + 1]) * w;
-                    const float c2 = (f == 0 ? acc0[t][e + 2] : acc1[t][e + 2]) * w;
-                    const float c3 = (f == 0 ? acc0[t][e + 3] : acc1[t][e + 3]) * w;
-                    const float r0 = subgroupShuffleXor(lo ? c2 : c0, 16);
-                    const float r1 = subgroupShuffleXor(lo ? c3 : c1, 16);
-                    const vec4 v = lo ? vec4(c0, r0, c1, r1) : vec4(r0, c2, r1, c3);
-                    const uint fe = feat0 + 16 * f + 2 * e + (lo ? 0u : 4u);
-                    if (row < nrows) {
-                        data_d[p.d_offset + dst_row + fe / 4] = f16vec4(v);
+        if (last) {
+            // epilogue: times the router weight, then f16 (the unfused chain's MUL in f32, then the CPY); one xor-16 shuffle gives
+            // each lane 4 consecutive features of its token (low half: rows 2e .. 2e + 3, high half: the next four), one f16vec4 store
+            [[unroll]] for (uint t = 0; t < 4; t++) {
+                if (t < nt) {
+                    const uint row = t * 16 + lane % 16;
+                    const uint rid = s_rid[tt][row];
+                    const uint slot = ((rid >> 16) * p.n_used + (rid & 0xFFFFu));
+                    const float w = p.scaled != 0 ? data_s[p.s_offset + slot] : 1.0f;
+                    const uint dst_row = slot * (p.M / 4);
+                    [[unroll]] for (uint f = 0; f < 2; f++) {
+                        [[unroll]] for (uint e = 0; e < 8; e += 4) {
+                            const float c0 = (f == 0 ? acc0[t][e]     : acc1[t][e])     * w;
+                            const float c1 = (f == 0 ? acc0[t][e + 1] : acc1[t][e + 1]) * w;
+                            const float c2 = (f == 0 ? acc0[t][e + 2] : acc1[t][e + 2]) * w;
+                            const float c3 = (f == 0 ? acc0[t][e + 3] : acc1[t][e + 3]) * w;
+                            const float r0 = subgroupShuffleXor(lo ? c2 : c0, 16);
+                            const float r1 = subgroupShuffleXor(lo ? c3 : c1, 16);
+                            const vec4 v = lo ? vec4(c0, r0, c1, r1) : vec4(r0, c2, r1, c3);
+                            const uint fe = feat0 + 16 * f + 2 * e + (lo ? 0u : 4u);
+#if defined(EPI_OFF)
+                            // measurement only: keeps the GEMM, drops (almost) every store
+                            if (row < nrows && v.x == 1234.5f) {
+#else
+                            if (row < nrows) {
+#endif
+                                data_d[p.d_offset + dst_row + fe / 4] = f16vec4(v);
+                            }
+                        }
                     }
+                    acc0[t] = ACC(0.0);
+                    acc1[t] = ACC(0.0);
                 }
             }
+        }
+
+        if (more) {
+            STORE_B(cur ^ 1);
+            [[unroll]] for (uint j = 0; j < AU; j++) {
+                a[j] = n[j];
+            }
+        }
+        barrier();
+        if (last) {
+            tt++;
+            st = 0;
+            nrows = tt < ntl ? data_e[2 + 2 * (tile0 + tt)] : 0;
+        } else {
+            st++;
         }
     }
 }
