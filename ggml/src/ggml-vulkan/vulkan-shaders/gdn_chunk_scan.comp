@@ -62,6 +62,14 @@ layout(binding = 4) readonly  buffer CStBuf   { float data_cst[];   };
 layout(binding = 5) readonly  buffer CWBuf    { float data_cw[];    };
 
 // silu(conv4) of channel c at token tt of sequence s, x element at xo: ssm_conv.comp MODE 1's expressions (bit-identical)
+// the same for tt >= 3 (every chunk after the first): all four rows are tokens, no conv-state branch. The per-element branch
+// of the general form makes ACO wait for every outstanding load (vmcnt(0)) before each window load, serialising the V loads.
+float conv_silu_v_direct(const uint xo, const vec4 w) {
+    float sum = dot(vec4(data_v[xo - 3 * sv2], data_v[xo - 2 * sv2], data_v[xo - sv2], data_v[xo]), w);
+    sum = sum / (1.0f + exp(-sum));
+    return sum;
+}
+
 float conv_silu_v(const uint xo, const uint c, const uint tt, const uint s, const vec4 w) {
     float win[3];
     [[unroll]] for (uint i = 0; i < 3; i++) {
@@ -173,7 +181,9 @@ void main() {
             [[unroll]] for (uint i = 0; i < 8; i++) {
                 const uint t = t0 + 16 * j + 2 * i;      // uniform; the lane adds hi
                 const uint tc = min(t, n_tokens - 1 - hi);
-                if (conv_fold != 0) {
+                if (conv_fold != 0 && (conv_fold & 2u) != 0 && c > 0) {
+                    vv[j][i] = conv_silu_v_direct(v_lane + tc * sv2, v_w);
+                } else if (conv_fold != 0) {
                     vv[j][i] = conv_silu_v(v_lane + tc * sv2, v_ch, tc + hi, seq, v_w);
                 } else {
                     vv[j][i] = data_v[v_lane + tc * sv2];

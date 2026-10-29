@@ -7427,6 +7427,13 @@ struct test_gdn_conv_prefill : public test_case {
                 msg = "GDN_CONV_FOLD dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
                 return false;
             }
+            // the branch-free conv window rides on every fold unless GGML_VK_GDN_CONV_DIRECT=0
+            const int64_t want_d = env_knob_on("GGML_VK_GDN_CONV_DIRECT") ? want : 0;
+            const int64_t nd = dispatch_census_count(backend, "path:GDN_CONV_DIRECT");
+            if (nd != want_d) {
+                msg = "GDN_CONV_DIRECT dispatches: " + std::to_string(nd) + " (expected " + std::to_string(want_d) + ")";
+                return false;
+            }
         }
         return true;
     }
