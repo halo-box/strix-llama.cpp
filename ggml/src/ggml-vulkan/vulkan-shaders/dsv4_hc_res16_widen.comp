@@ -1,0 +1,60 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// HC_BF16RES fallback: widen a bf16-stored hc residual back to f32 in place, for a reader the producer did not predict.
+// The bf16 rows of token t sit at t * s2 + c * s1 (bf16 elements), the f32 rows at t * d2 + c * d1 (floats), with
+// 2 * s2 <= 4 * d2: token t's f32 rows never overlap the bf16 rows of an earlier token, so one workgroup walking the tokens
+// from the last to the first, loading a whole token before storing it, never overwrites a bf16 value it has not read yet.
+// Serial by design (rare path). n_embd % 8 == 0, hc * n_embd <= 16384.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) coherent buffer RBuf16 { uvec4 data_r16[]; };
+layout(binding = 0, std430) coherent buffer RBuf   { vec4  data_f[]; };
+
+layout(push_constant) uniform parameter {
+    uint n_embd;
+    uint hc;
+    uint n_tokens;
+    uint s1; uint s2;   // bf16 stream / token strides (elements)
+    uint d1; uint d2;   // f32 stream / token strides (floats)
+} p;
+
+const uint BLOCK = 256;
+const uint MAXG = 8;   // 8-column groups per thread: hc * n_embd / 8 / 256
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint gpr = p.n_embd / 8;   // groups per stream row
+    const uint ng  = gpr * p.hc;
+    for (uint tt = p.n_tokens; tt > 0; --tt) {
+        const uint t = tt - 1;
+        uvec4 u[MAXG];
+        [[unroll]] for (uint k = 0; k < MAXG; ++k) {
+            const uint gi = tid + k * BLOCK;
+            u[k] = uvec4(0);
+            if (gi < ng) {
+                const uint c = gi / gpr;
+                const uint g = gi - c * gpr;
+                u[k] = data_r16[(c * p.s1 + t * p.s2) / 8 + g];
+            }
+        }
+        memoryBarrierBuffer();
+        barrier();
+        [[unroll]] for (uint k = 0; k < MAXG; ++k) {
+            const uint gi = tid + k * BLOCK;
+            if (gi < ng) {
+                const uint c = gi / gpr;
+                const uint g = gi - c * gpr;
+                const uint fb = (c * p.d1 + t * p.d2) / 4 + g * 2;
+                data_f[fb]     = vec4(uintBitsToFloat(u[k].x << 16), uintBitsToFloat(u[k].x & 0xFFFF0000u),
+                                      uintBitsToFloat(u[k].y << 16), uintBitsToFloat(u[k].y & 0xFFFF0000u));
+                data_f[fb + 1] = vec4(uintBitsToFloat(u[k].z << 16), uintBitsToFloat(u[k].z & 0xFFFF0000u),
+                                      uintBitsToFloat(u[k].w << 16), uintBitsToFloat(u[k].w & 0xFFFF0000u));
+            }
+        }
+        memoryBarrierBuffer();
+        barrier();
+    }
+}

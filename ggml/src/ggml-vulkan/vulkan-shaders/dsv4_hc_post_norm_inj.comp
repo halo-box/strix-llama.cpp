@@ -26,6 +26,9 @@ layout(constant_id = 1) const uint LOADS_FIRST = 0;
 // DEFER_MODE (GGML_VK_HC_DEFER): 1 = the combine output is not stored (the next combine, the MoE epilogue, recomputes it from the same
 // inputs with the same expression); 2 = store only the combine output (materialise a deferred one; norm and inject not written)
 layout(constant_id = 2) const uint DEFER_MODE = 0;
+// RES16 (GGML_VK_HC_BF16RES): 1 = the residual is stored bf16 (packed rows, sr1 / sr2 in bf16 elements, multiples of 8), written
+// by the MoE epilogue of the layer before; widened to f32 on load, every operation after that is f32 as with RES16 = 0
+layout(constant_id = 3) const uint RES16 = 0;
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 const uint HC = 4;
@@ -34,6 +37,7 @@ const uint NG = 2;   // 8-column groups per thread
 
 layout(binding = 0, std430) readonly  buffer XBuf { vec4    data_x[]; };
 layout(binding = 1, std430) readonly  buffer RBuf { vec4    data_r[]; };
+layout(binding = 1, std430) readonly  buffer RBuf16 { uvec4 data_r16[]; };   // RES16: 8 bf16 per element
 layout(binding = 2, std430) readonly  buffer PBuf { float   data_p[]; };
 layout(binding = 3, std430) readonly  buffer GBuf { vec4    data_g[]; };
 layout(binding = 4, std430) writeonly buffer OBuf { vec4    data_o[]; };
@@ -63,6 +67,19 @@ layout(push_constant) uniform parameter {
 shared float sumsh[HC][32];
 shared float injsh[HC][32];
 
+// the residual's 8 columns of group gi in stream c of token t (f32 or, RES16, bf16 widened exactly)
+void load_res(const uint c, const uint t, const uint gi, out vec4 r0, out vec4 r1) {
+    if (RES16 != 0) {
+        const uvec4 u = data_r16[(c * p.sr1 + t * p.sr2) / 8 + gi];
+        r0 = vec4(uintBitsToFloat(u.x << 16), uintBitsToFloat(u.x & 0xFFFF0000u), uintBitsToFloat(u.y << 16), uintBitsToFloat(u.y & 0xFFFF0000u));
+        r1 = vec4(uintBitsToFloat(u.z << 16), uintBitsToFloat(u.z & 0xFFFF0000u), uintBitsToFloat(u.w << 16), uintBitsToFloat(u.w & 0xFFFF0000u));
+    } else {
+        const uint rb = (c * p.sr1 + t * p.sr2) / 4 + gi * 2;
+        r0 = data_r[rb];
+        r1 = data_r[rb + 1];
+    }
+}
+
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint t   = gl_WorkGroupID.x;
@@ -90,9 +107,7 @@ void main() {
                 a[c][g][0] = vec4(0.0f);
                 a[c][g][1] = vec4(0.0f);
                 if (tid + g * BLOCK < ng) {
-                    const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
-                    a[c][g][0] = data_r[rb];
-                    a[c][g][1] = data_r[rb + 1];
+                    load_res(c, t, tid + g * BLOCK, a[c][g][0], a[c][g][1]);
                 }
             }
         }
@@ -112,10 +127,13 @@ void main() {
             vec4 r0 = vec4(0.0f);
             vec4 r1 = vec4(0.0f);
             if (tid + g * BLOCK < ng) {
-                const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
-                // LOADS_FIRST == 2: the tests' negative control (GGML_VK_HC_CMB_TEST_BREAK=1) takes stream 0's residual for every stream
-                r0 = LOADS_FIRST == 2 ? a[0][g][0] : LOADS_FIRST != 0 ? a[c][g][0] : data_r[rb];
-                r1 = LOADS_FIRST != 0 ? a[c][g][1] : data_r[rb + 1];
+                if (LOADS_FIRST == 0) {
+                    load_res(c, t, tid + g * BLOCK, r0, r1);
+                } else {
+                    // LOADS_FIRST == 2: the tests' negative control (GGML_VK_HC_CMB_TEST_BREAK=1) takes stream 0's residual for every stream
+                    r0 = LOADS_FIRST == 2 ? a[0][g][0] : a[c][g][0];
+                    r1 = a[c][g][1];
+                }
                 if (HAS_POST != 0) {
                     r0 = xv[g][0] * pw + r0;
                     r1 = xv[g][1] * pw + r1;
