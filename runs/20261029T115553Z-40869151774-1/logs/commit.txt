@@ -1,0 +1,3 @@
+1ee46afeb50f9315f0c216e3cdacfb36b7080bb7
+2026-10-29T12:48:39+01:00
+hip : preserve Qwen4Exp MTP decode numerics
