@@ -577,7 +577,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        b,
         ggml_tensor *        s,
         int                  il,
-        std::pair<ggml_tensor *, ggml_tensor *> * parts) {
+        std::pair<ggml_tensor *, ggml_tensor *> * parts,
+        const std::function<std::array<ggml_tensor *, 3>()> & part1_qkv) {
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
@@ -585,7 +586,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t S_v          = s->ne[0];
     const int64_t H_v          = s->ne[2];
     const int64_t n_seqs       = s->ne[3];
-    const int64_t n_seq_tokens = q->ne[2];
+    // q, k, v hold only the first part when the caller split its conv at the snapshot (part1_qkv); g and b hold all tokens
+    const int64_t n_seq_tokens = part1_qkv ? g->ne[2] : q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
 
@@ -603,10 +605,22 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             const int64_t t = snap_t;
             const int64_t n = n_seq_tokens;
 
-            auto part0 = build_delta_net(slice_tokens(q, 0, t), slice_tokens(k, 0, t), slice_tokens(v, 0, t),
-                                         slice_tokens(g, 0, t), slice_tokens(b, 0, t), s, il);
-            auto part1 = build_delta_net(slice_tokens(q, t, n), slice_tokens(k, t, n), slice_tokens(v, t, n),
-                                         slice_tokens(g, t, n), slice_tokens(b, t, n), part0.second, il);
+            std::pair<ggml_tensor *, ggml_tensor *> part0, part1;
+            if (part1_qkv) {
+                // the caller's conv is split too: q, k, v are the first part's own, the second part's are built after it,
+                // so the first part's conv -> norms -> scan chain stays contiguous in the graph
+                GGML_ASSERT(q->ne[2] == t && k->ne[2] == t && v->ne[2] == t);
+                part0 = build_delta_net(q, k, v, slice_tokens(g, 0, t), slice_tokens(b, 0, t), s, il);
+                ggml_build_forward_expand(gf, part0.first);
+                const auto qkv1 = part1_qkv();
+                GGML_ASSERT(qkv1[0]->ne[2] == n - t && qkv1[1]->ne[2] == n - t && qkv1[2]->ne[2] == n - t);
+                part1 = build_delta_net(qkv1[0], qkv1[1], qkv1[2], slice_tokens(g, t, n), slice_tokens(b, t, n), part0.second, il);
+            } else {
+                part0 = build_delta_net(slice_tokens(q, 0, t), slice_tokens(k, 0, t), slice_tokens(v, 0, t),
+                                        slice_tokens(g, 0, t), slice_tokens(b, 0, t), s, il);
+                part1 = build_delta_net(slice_tokens(q, t, n), slice_tokens(k, t, n), slice_tokens(v, t, n),
+                                        slice_tokens(g, t, n), slice_tokens(b, t, n), part0.second, il);
+            }
 
             if (parts != nullptr) {
                 *parts = { part0.first, part1.first };
@@ -616,6 +630,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             new_state  = part1.second;
             snap_state = part0.second;
         } else {
+            GGML_ASSERT(!part1_qkv);
             auto attn_out = build_delta_net(q, k, v, g, b, s, il);
             output    = attn_out.first;
             new_state = attn_out.second;
@@ -645,6 +660,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
         return output;
     }
+
+    GGML_ASSERT(!part1_qkv);
 
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
