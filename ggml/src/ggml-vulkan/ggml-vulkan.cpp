@@ -460,7 +460,7 @@ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
 // Decode weight prefetch from a second compute queue (GGML_VK_DECODE_PREFETCH_Q, default on where supported; =0 turns it off).
 // GGML_VK_DECODE_PREFETCH_Q_QUIESCE=0 turns off the host-side end of a resident side dispatch before a mid-graph wait or an allocation.
 // _WG workgroups of the side dispatch (4), _MAX_MB bytes touched per target at most (24), _POLLS bound on the side dispatch's
-// phase polls (4M, a few seconds), _CHUNK grid-stride passes between phase checks (1).
+// phase polls (256k, about 40 ms), _CHUNK grid-stride passes between phase checks (1).
 struct vk_prefetch_q_cfg {
     bool on;
     uint32_t wgs;
@@ -476,7 +476,7 @@ static const vk_prefetch_q_cfg & ggml_vk_prefetch_q_cfg() {
         c.on        = env("GGML_VK_DECODE_PREFETCH_Q", 1) != 0;
         c.wgs       = (uint32_t) std::min(64L, std::max(1L, env("GGML_VK_DECODE_PREFETCH_Q_WG", 4)));
         c.max_bytes = (size_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_Q_MAX_MB", 24)) * 1024 * 1024;
-        c.polls     = (uint32_t) std::max(1024L, env("GGML_VK_DECODE_PREFETCH_Q_POLLS", 1L << 22));
+        c.polls     = (uint32_t) std::max(1024L, env("GGML_VK_DECODE_PREFETCH_Q_POLLS", 1L << 18));
         c.chunk     = (uint32_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_Q_CHUNK", 1));
         return c;
     }();
