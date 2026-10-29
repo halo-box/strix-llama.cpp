@@ -8259,6 +8259,71 @@ struct test_mul_mat_hcd : public test_case {
     }
 };
 
+// a dense GEMM at a ragged n (optionally batched, optionally a row-padded B view): the Vulkan ragged split (GGML_VK_RAGGED_XL) runs the
+// n % 256 tail columns as a second dispatch. GGML_VK_TEST_REQUIRE_RAGGED=1 asserts it never engages on an ineligible n and, with
+// GGML_VK_RAGGED_FORCE=1 (no wave model), engages on every eligible n >= 512.
+struct test_mul_mat_ragged : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int64_t m, n, k, pad, bs;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, type_b, m, n, k, pad, bs);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k * bs;
+    }
+
+    test_mul_mat_ragged(ggml_type type_a, ggml_type type_b, int64_t m, int64_t n, int64_t k, int64_t pad = 0, int64_t bs = 1)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), pad(pad), bs(bs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, k, m, bs);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k + pad, n, bs);
+        ggml_set_name(b, "b");
+        if (pad != 0) {
+            b = ggml_view_3d(ctx, b, k, n, bs, b->nb[1], b->nb[2], 0);
+            ggml_set_name(b, "b_view");
+        }
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_RAGGED")) {
+            return true;
+        }
+        const char * e  = getenv("GGML_VK_RAGGED_XL");
+        const char * et = getenv("GGML_VK_RAGGED_TAIL");
+        const char * ef = getenv("GGML_VK_RAGGED_FORCE");
+        const bool on = e == nullptr || atoi(e) != 0;
+        const int64_t tail_max = et ? atoi(et) : 128;
+        const bool force = ef != nullptr && atoi(ef) != 0;
+        const int64_t eligible = on && n > 256 && n % 256 != 0 && n % 256 <= tail_max ? 1 : 0;
+        const int64_t got = dispatch_census_count(backend, "path:MUL_MAT_RAGGED_SPLIT");
+        // a short n_main (few tiles) can take split-k, which keeps the single dispatch even when forced
+        if (got > eligible || (force && n >= 512 && got != eligible)) {
+            msg = "path:MUL_MAT_RAGGED_SPLIT dispatches: " + std::to_string(got) + " (eligible " + std::to_string(eligible) + ")";
+            return false;
+        }
+        return true;
+    }
+};
+
 struct test_mul_mat_exact_batch : public test_case {
     const ggml_type type_a;
     const int64_t m;
@@ -15652,6 +15717,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 448, 1024, 10240, 128));  // m past the gate
     test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, 1024, 2560, 128));   // k under the gate
     test_cases.emplace_back(new test_mul_mat_hcd(GGML_TYPE_Q4_0, GGML_TYPE_F16, 320, 1024, 10240, 128));  // other type
+    // ragged n past a 256 multiple (the split tail dispatch) on the Flash-Next dense shapes, the hc down (f16 padded xn), a batched
+    // GEMM and n that stay one dispatch (aligned, tail over the limit, n <= 256)
+    for (int64_t n : {1, 33, 255, 257, 904, 2047, 2048, 2049, 2050, 2177, 2305, 2433}) {
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F32, 640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, n, 10240, 128));
+    }
+    for (int64_t n : {2049, 2050}) {
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, n, 6144));
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F32, 12288, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, n, 640));
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F32, 640, n, 2560, 0, 2));    // batched
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_F16,  GGML_TYPE_F32, 512, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, n, 10240));         // hc down, f32 B
+    }
     // HC_UP_MIX: exact and ragged tiles, padded x rows, the Flash-Next shape (n_embd 2560, low rank 320, ub 2048) and its 2051 tail
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 64, 96, 0));
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128));
@@ -19128,6 +19211,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 320}, {10240, 2560}, {12288, 2560}, {2560, 6144},
                                                         {320, 10240}, {6144, 2560}, {640, 2560}, {2560, 640} }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], 2048, mk[1], {1, 1}, {1, 1}));
+    }
+    // ragged n around the ubatch tile (GGML_VK_RAGGED_XL on / off / FORCE): the dense shapes and the hc down as the model feeds them
+    for (int64_t n : {1793, 2048, 2049, 2050, 2056, 2080, 2112, 2176, 2177, 2304, 2305, 904}) {
+        for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {12288, 2560}, {2560, 6144}, {6144, 2560},
+                                                            {640, 2560}, {512, 2560}, {2560, 640} }) {
+            test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], n, mk[1]));
+        }
+        test_cases.emplace_back(new test_mul_mat_ragged(GGML_TYPE_Q8_0, GGML_TYPE_F16, 320, n, 10240, 128));
     }
     test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, 10240, 2048, 320));
     // the hc down GEMM as the model feeds it (f16 xn, 128-element row pad), ubatch 512 / 1024 / 2048
