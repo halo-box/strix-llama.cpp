@@ -2007,9 +2007,10 @@ static bool ggml_vk_hc_cmb_enabled() {
 
 // HC_BF16RES: the hc residual streams between combines (the MoE epilogue's combine output, read by the next layer's attention-side
 // combine and, with HC_DEFER, by the next MoE epilogue's recompute) are stored bf16 in their own f32 allocation, as halo-box's HIP
-// path does. Storage only: every combine, norm and inject stays f32. Not exact (KLD-gated). GGML_VK_HC_BF16RES=1 enables.
+// path does. Storage only: every combine, norm and inject stays f32. Not exact: default on for its prefill gain at a KLD cost
+// below the -ub 1024 vs 2048 difference of the f32 path; GGML_VK_HC_BF16RES=0 keeps the residual f32 (the exact path).
 static bool ggml_vk_hc_bf16res_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_VK_HC_BF16RES"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_BF16RES"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 

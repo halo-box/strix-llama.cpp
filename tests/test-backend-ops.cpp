@@ -5082,20 +5082,20 @@ struct test_hc_layer : public test_hc_moe_epi {
 };
 
 // two qwen4exp prefill layers' four HC combines: the first layer's MoE epilogue combine output is the second layer's residual, read
-// by its attention-side combine and (HC_DEFER) its MoE epilogue: on Vulkan with GGML_VK_HC_BF16RES=1 that residual is stored bf16
+// by its attention-side combine and (HC_DEFER) its MoE epilogue: on Vulkan (GGML_VK_HC_BF16RES, default on) that residual is stored bf16
 // between the layers (not exact: the CPU reference keeps f32; the bf16 rounding of the residual is well inside the tolerance)
 struct test_hc_layer2 : public test_hc_layer {
     test_hc_layer2(int embd, int tokens, int n_used) : test_hc_layer(embd, tokens, n_used, false) {}
     std::string op_desc(ggml_tensor *) override { return "HC_LAYER2"; }
 
-    // GGML_VK_TEST_REQUIRE_HC_BF16RES=1: with GGML_VK_HC_BF16RES on and 32+ tokens, one bf16 residual store per graph, read by the
+    // GGML_VK_TEST_REQUIRE_HC_BF16RES=1: with GGML_VK_HC_BF16RES on (default) and 32+ tokens, one bf16 residual store per graph, read by the
     // second attention-side combine (and, with HC_DEFER, the second MoE epilogue); GGML_VK_HC_BF16RES_TEST_WIDEN=1 widens it
     // before its first reader instead; off: none
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_BF16RES")) {
             return true;
         }
-        const bool on    = env_opt_in("GGML_VK_HC_BF16RES") && tokens >= 32;
+        const bool on    = env_knob_on("GGML_VK_HC_BF16RES") && tokens >= 32;
         const bool widen = env_opt_in("GGML_VK_HC_BF16RES_TEST_WIDEN");
         const bool defer = env_knob_on("GGML_VK_HC_DEFER");
         const int64_t n_st  = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_BF16RES"));
