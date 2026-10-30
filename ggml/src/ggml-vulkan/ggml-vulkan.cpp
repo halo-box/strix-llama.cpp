@@ -5251,6 +5251,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_prep_sg,
                 "flash_attn_sel_prep_sg", flash_attn_sel_prep_sg_len, flash_attn_sel_prep_sg_data, "main", 2,
                 sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {}, 1, true);
+#define CREATE_SEL_GATHER(T, NAME) \
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_gather[T], "flash_attn_sel_gather_" #NAME, \
+                flash_attn_sel_gather_ ## NAME ## _len, flash_attn_sel_gather_ ## NAME ## _data, "main", 4, 8 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
+            CREATE_SEL_GATHER(GGML_TYPE_F16, f16)
+            CREATE_SEL_GATHER(GGML_TYPE_Q8_0, q8_0)
+            CREATE_SEL_GATHER(GGML_TYPE_Q4_0, q4_0)
+            CREATE_SEL_GATHER(GGML_TYPE_Q4_1, q4_1)
+            CREATE_SEL_GATHER(GGML_TYPE_Q5_0, q5_0)
+            CREATE_SEL_GATHER(GGML_TYPE_Q5_1, q5_1)
+            CREATE_SEL_GATHER(GGML_TYPE_IQ4_NL, iq4_nl)
+#undef CREATE_SEL_GATHER
             static const char * sel_names[3] = { "flash_attn_sel_f16_gqa4", "flash_attn_sel_f16_gqa8", "flash_attn_sel_f16_gqa12" };
             for (uint32_t i = 0; i < 3; ++i) {
                 const uint32_t gqa = 4 * (i + 1);
@@ -12215,6 +12226,23 @@ static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& s
     subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
 }
 
+// a quantized K or V of the maskless selected-key op is dequantized to f16 first (q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl: the types
+// with a gather shader; GGML_VK_SEL_QKV=0 refuses them)
+static bool ggml_vk_flash_attn_sel_kv_ok(const vk_device & device, const ggml_tensor * t) {
+    if (t->type == GGML_TYPE_F16) {
+        return t->nb[0] == sizeof(ggml_fp16_t) && t->nb[1] % sizeof(ggml_fp16_t) == 0 &&
+            t->nb[2] % sizeof(ggml_fp16_t) == 0 && t->nb[3] % sizeof(ggml_fp16_t) == 0;
+    }
+    static const bool qkv_env = [] { const char * e = getenv("GGML_VK_SEL_QKV"); return !(e && e[0] == '0'); }();
+    if (!qkv_env || !device->pipeline_dequant[t->type] || !device->pipeline_flash_attn_sel_gather[t->type]) {
+        return false;
+    }
+    // f16 strides = block strides x block size: every stride must be whole blocks
+    const size_t ts = ggml_type_size(t->type);
+    return t->ne[0] % ggml_blck_size(t->type) == 0 && t->nb[0] == ts && t->nb[1] % ts == 0 && t->nb[2] % ts == 0 &&
+        t->nb[3] % ts == 0 && ggml_nbytes(t) / ts * ggml_blck_size(t->type) <= UINT32_MAX;
+}
+
 // maskless selected-key attention (QSA block selection): the pipeline that takes this op, or nullptr
 static vk_pipeline ggml_vk_flash_attn_sel_pipeline(const vk_device & device, const ggml_tensor * op) {
     const ggml_tensor * q   = op->src[0];
@@ -12229,24 +12257,24 @@ static vk_pipeline ggml_vk_flash_attn_sel_pipeline(const vk_device & device, con
     memcpy(&max_bias,      (const float *) op->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) op->op_params + 2, sizeof(float));
     if (max_bias != 0.0f || logit_softcap != 0.0f || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) ||
-        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || ids->type != GGML_TYPE_I32 ||
+        q->type != GGML_TYPE_F32 || !ggml_vk_flash_attn_sel_kv_ok(device, k) || !ggml_vk_flash_attn_sel_kv_ok(device, v) ||
+        ids->type != GGML_TYPE_I32 ||
         q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 ||
         k->ne[1] != v->ne[1] || k->ne[2] != v->ne[2] || k->ne[3] != q->ne[3] || v->ne[3] != q->ne[3] ||
         k->ne[2] < 1 || q->ne[2] % k->ne[2] != 0 ||
         ids->ne[0] < 1 || ids->ne[0] > 4096 || ids->ne[1] < q->ne[1] || ids->ne[2] != 1 ||
         (ids->ne[3] != 1 && ids->ne[3] != q->ne[3]) ||
-        q->nb[0] != sizeof(float) || k->nb[0] != sizeof(ggml_fp16_t) || v->nb[0] != sizeof(ggml_fp16_t) ||
-        ids->nb[0] != sizeof(int32_t)) {
+        q->nb[0] != sizeof(float) || ids->nb[0] != sizeof(int32_t)) {
         return nullptr;
     }
     for (int i = 1; i < 4; ++i) {
-        if (q->nb[i] % sizeof(float) || k->nb[i] % sizeof(ggml_fp16_t) || v->nb[i] % sizeof(ggml_fp16_t) ||
-            ids->nb[i] % sizeof(int32_t)) {
+        if (q->nb[i] % sizeof(float) || ids->nb[i] % sizeof(int32_t)) {
             return nullptr;
         }
     }
     // the shader indexes with 32-bit element offsets
-    if (ggml_nbytes(k) / sizeof(ggml_fp16_t) > UINT32_MAX || ggml_nbytes(v) / sizeof(ggml_fp16_t) > UINT32_MAX ||
+    if (ggml_nbytes(k) / ggml_type_size(k->type) * ggml_blck_size(k->type) > UINT32_MAX ||
+        ggml_nbytes(v) / ggml_type_size(v->type) * ggml_blck_size(v->type) > UINT32_MAX ||
         ggml_nbytes(q) / sizeof(float) > UINT32_MAX || ggml_nbytes(op) / sizeof(float) > UINT32_MAX) {
         return nullptr;
     }
@@ -12296,23 +12324,10 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
     const vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, q);
-    const vk_subbuffer k_buf   = ggml_vk_tensor_subbuffer(ctx, k);
-    const vk_subbuffer v_buf   = ggml_vk_tensor_subbuffer(ctx, v);
     const vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx, ids);
     const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-
-    // the WMMA kernel reads K and V rows in 16-byte pieces
-    const int gqa_idx = (int) (q->ne[2] / k->ne[2]) / 4 - 1;
-    vk_pipeline pipeline_cm = ctx->device->pipeline_flash_attn_sel_cm_f16[gqa_idx];
-    bool use_cm = pipeline_cm != nullptr && k_buf.offset % 16 == 0 && v_buf.offset % 16 == 0;
-    for (int i = 1; i < 4; ++i) {
-        use_cm = use_cm && k->nb[i] % 16 == 0 && v->nb[i] % 16 == 0;
-    }
-    // one workgroup per (query, split, K/V head) on x
-    use_cm = use_cm && (uint64_t) q->ne[1] * k->ne[2] * CEIL_DIV(ids->ne[0], 32) <= ctx->device->properties.limits.maxComputeWorkGroupCount[0];
-    if (use_cm) {
-        pipeline = pipeline_cm;
-    }
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
 
     const uint32_t n_sel = (uint32_t) ids->ne[0];
     const uint32_t N  = (uint32_t) q->ne[1];
@@ -12323,6 +12338,53 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     const uint32_t list_stride = ROUNDUP_POW2(n_sel, 64u);
     const size_t list_size = ((size_t) N * NS * list_stride + (size_t) N * NS) * sizeof(uint32_t);
 
+    // A quantized K or V goes to f16 in prealloc_x first. Prefill dequantizes the whole tensor once (a cell is read by
+    // many queries); few queries copy only the listed cells into compact rows (GGML_VK_SEL_DQ=full / gather forces one).
+    static const int dq_mode = [] {
+        const char * e = getenv("GGML_VK_SEL_DQ");
+        return !e ? 0 : strcmp(e, "full") == 0 ? 1 : strcmp(e, "gather") == 0 ? 2 : 0;
+    }();
+    const bool dequant = k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16;
+    const uint64_t compact_rows = (uint64_t) N * NS * list_stride;
+    const bool gather = dequant && compact_rows * k->ne[2] * 256 <= UINT32_MAX &&
+        (dq_mode == 2 || (dq_mode == 0 && compact_rows < (uint64_t) k->ne[1] * NS));
+    // f16 element strides of what the kernels read, and the bytes of each f16 copy (0 = read the tensor itself)
+    uint32_t sk[3], sv[3];
+    size_t k_f16_sz = 0, v_f16_sz = 0;
+    auto f16_view = [&](const ggml_tensor * t, uint32_t * st, size_t & sz) {
+        if (gather) {
+            st[0] = (uint32_t) (t->ne[2] * D); st[1] = D; st[2] = 0;
+            sz = compact_rows * t->ne[2] * D * sizeof(ggml_fp16_t);
+            return;
+        }
+        const size_t ts = ggml_type_size(t->type), bs = ggml_blck_size(t->type);
+        for (int i = 0; i < 3; ++i) {
+            st[i] = (uint32_t) (t->nb[i + 1] / ts * bs);
+        }
+        sz = t->type == GGML_TYPE_F16 ? 0 : ggml_nbytes(t) / ts * bs * sizeof(ggml_fp16_t);
+    };
+    f16_view(k, sk, k_f16_sz);
+    f16_view(v, sv, v_f16_sz);
+    const size_t x_align = std::max<size_t>(256, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    const size_t v_f16_off = ROUNDUP_POW2(k_f16_sz, x_align);
+    if (dequant) {
+        GGML_ASSERT(std::max(k_f16_sz, v_f16_sz) <= ctx->device->properties.limits.maxStorageBufferRange);
+    }
+
+    // the WMMA kernel reads K and V rows in 16-byte pieces
+    const int gqa_idx = (int) (q->ne[2] / k->ne[2]) / 4 - 1;
+    vk_pipeline pipeline_cm = ctx->device->pipeline_flash_attn_sel_cm_f16[gqa_idx];
+    bool use_cm = pipeline_cm != nullptr &&
+        (k_f16_sz ? 0 : k_buf.offset) % 16 == 0 && (v_f16_sz ? v_f16_off : v_buf.offset) % 16 == 0;
+    for (int i = 0; i < 3; ++i) {
+        use_cm = use_cm && sk[i] % 8 == 0 && sv[i] % 8 == 0;
+    }
+    // one workgroup per (query, split, K/V head) on x
+    use_cm = use_cm && (uint64_t) q->ne[1] * k->ne[2] * CEIL_DIV(ids->ne[0], 32) <= ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+    if (use_cm) {
+        pipeline = pipeline_cm;
+    }
+
     // few queries (decode) give too few workgroups to fill the GPU: split each row into whole key blocks. The
     // WMMA kernel runs one subgroup per workgroup, the scalar one GQA subgroups.
     const uint32_t n_wg = N * (uint32_t) k->ne[2] * NS;
@@ -12331,8 +12393,10 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     const uint32_t chunk = ROUNDUP_POW2(CEIL_DIV(n_sel, std::max(n_split, 1u)), 32u); // whole key blocks
     n_split = CEIL_DIV(n_sel, chunk);
     const size_t split_size = n_split > 1 ? ((size_t) D * NH * N * NS * n_split + (size_t) NH * 2 * N * NS * n_split) * sizeof(float) : 0;
-    // the partials go after the rows, 256-byte aligned
+    // the partials go after the rows, 256-byte aligned, then the identity rows of the gather
     const size_t split_off = ROUNDUP_POW2(list_size, 256);
+    const size_t list2_off = ROUNDUP_POW2(split_off + split_size, 256);
+    const size_t split_k_need = gather ? list2_off + list_size : split_off + split_size;
 
     // the gate in the WMMA store: one split, one stream, the gate read in place from the [q | gate] per-head interleaved
     // projection (head stride 2 * D, token stride 2 * D * heads) and the gated result written to out_gate_dst
@@ -12357,8 +12421,8 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     const vk_op_flash_attn_sel_push_constants pc = {
         (uint32_t) k->ne[1], n_sel, list_stride,
         (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)), (uint32_t) (q->nb[3] / sizeof(float)),
-        (uint32_t) (k->nb[1] / sizeof(ggml_fp16_t)), (uint32_t) (k->nb[2] / sizeof(ggml_fp16_t)), (uint32_t) (k->nb[3] / sizeof(ggml_fp16_t)),
-        (uint32_t) (v->nb[1] / sizeof(ggml_fp16_t)), (uint32_t) (v->nb[2] / sizeof(ggml_fp16_t)), (uint32_t) (v->nb[3] / sizeof(ggml_fp16_t)),
+        sk[0], sk[1], sk[2],
+        sv[0], sv[1], sv[2],
         (uint32_t) (ids->nb[1] / sizeof(int32_t)), ids->ne[3] == 1 ? 0u : (uint32_t) (ids->nb[3] / sizeof(int32_t)),
         (uint32_t) (dst->nb[1] / sizeof(float)), (uint32_t) (dst->nb[2] / sizeof(float)), (uint32_t) (dst->nb[3] / sizeof(float)),
         scale, n_split, chunk, NH, N, NS,
@@ -12372,14 +12436,43 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
         ggml_pipeline_request_descriptor_sets(ctx, gate_reduce ? ctx->device->pipeline_flash_attn_split_k_reduce_gate
                                                                : ctx->device->pipeline_flash_attn_split_k_reduce, 1);
     }
-    if (ctx->prealloc_size_split_k < split_off + split_size) {
-        ctx->prealloc_size_split_k = split_off + split_size;
+    if (gather) {
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_sel_gather[k->type], 1);
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_sel_gather[v->type], 1);
+    } else {
+        for (const ggml_tensor * t : { k, v }) {
+            if (t->type != GGML_TYPE_F16) {
+                ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_dequant[t->type], 1);
+            }
+        }
+    }
+    const size_t x_need = dequant ? v_f16_off + v_f16_sz : 0;
+    if (ctx->prealloc_size_split_k < split_k_need || ctx->prealloc_size_x < x_need) {
+        ctx->prealloc_size_split_k = std::max(ctx->prealloc_size_split_k, split_k_need);
+        ctx->prealloc_size_x = std::max(ctx->prealloc_size_x, x_need);
         ggml_vk_preallocate_buffers(ctx, subctx);
     }
-    if (ctx->prealloc_split_k_need_sync) {
+    if (ctx->prealloc_split_k_need_sync || (dequant && ctx->prealloc_x_need_sync)) {
         ggml_vk_sync_buffers(ctx, subctx);
     }
-    const vk_subbuffer list_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+    const vk_subbuffer k_f16 = { ctx->prealloc_x, 0, std::max<size_t>(k_f16_sz, 1) };
+    const vk_subbuffer v_f16 = { ctx->prealloc_x, v_f16_off, std::max<size_t>(v_f16_sz, 1) };
+    // full: dequantize alongside the prep pass (no dependency between them)
+    if (dequant && !gather) {
+        if (k_f16_sz) {
+            const uint32_t nel = (uint32_t) (k_f16_sz / sizeof(ggml_fp16_t));
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_dequant[k->type], { k_buf, k_f16 },
+                std::vector<uint32_t>{ 0, 0, 0, 0, nel }, { nel, 1, 1 });
+            k_buf = k_f16;
+        }
+        if (v_f16_sz) {
+            const uint32_t nel = (uint32_t) (v_f16_sz / sizeof(ggml_fp16_t));
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_dequant[v->type], { v_buf, v_f16 },
+                std::vector<uint32_t>{ 0, 0, 0, 0, nel }, { nel, 1, 1 });
+            v_buf = v_f16;
+        }
+    }
+    vk_subbuffer list_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
     ggml_vk_dispatch_pipeline(ctx, subctx, prep, { ids_buf, list_buf }, pc, { N, NS, 1 });
     if (prep_sg) {
         ggml_vk_path_census_add("FA_SEL_PREP_SG");
@@ -12387,6 +12480,29 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     ggml_vk_sync_buffers(ctx, subctx);
     // the serialised perf logger bills the pre-pass, the attention kernel and the reduce (the node's remainder) apart
     ggml_vk_perf_mark_subop(ctx, subctx, "FA_SEL_PREP (sub-op)");
+    if (gather) {
+        // K writes the identity rows, V only copies
+        const vk_subbuffer list2_buf = { ctx->prealloc_split_k, list2_off, list_size };
+        const std::array<uint32_t, 3> ggrid = { CEIL_DIV(list_stride, 4u), N * NS, 1 };
+        auto run = [&](const ggml_tensor * t, const vk_subbuffer & src, const vk_subbuffer & out, uint32_t write_list) {
+            const uint32_t u = (uint32_t) ggml_type_size(t->type);   // source strides in elements (f16) or blocks
+            const std::vector<uint32_t> gpc = { N * NS, N, list_stride, (uint32_t) t->ne[2],
+                (uint32_t) (t->nb[1] / u), (uint32_t) (t->nb[2] / u), (uint32_t) (t->nb[3] / u), write_list };
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_sel_gather[t->type],
+                { src, list_buf, out, list2_buf }, gpc, ggrid);
+        };
+        run(k, k_buf, k_f16, 1);
+        run(v, v_buf, v_f16, 0);
+        ggml_vk_sync_buffers(ctx, subctx);
+        k_buf = k_f16;
+        v_buf = v_f16;
+        list_buf = list2_buf;
+    }
+    if (dequant) {
+        ctx->prealloc_x_need_sync = true;
+        ggml_vk_path_census_add(gather ? "FA_SEL_KV_GATHER" : "FA_SEL_KV_DEQUANT");
+        ggml_vk_perf_mark_subop(ctx, subctx, gather ? "FA_SEL_KV_GATHER (sub-op)" : "FA_SEL_KV_DEQUANT (sub-op)");
+    }
 
     // the WMMA kernel takes the K/V heads on x (next to each other), the scalar one on y
     GGML_ASSERT(!use_cm || (uint64_t) N * n_split * k->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
