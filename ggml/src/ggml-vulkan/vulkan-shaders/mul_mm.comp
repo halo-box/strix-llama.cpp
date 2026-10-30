@@ -135,8 +135,13 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 // qwen4exp QSA indexer scorer epilogue (QSA_SCORE: MUL_MAT -> RELU -> 4-head sum -> + block bias). The N columns are
 // (query, head) pairs, head fastest, and D is [M, N/QSA_H] with D[t*stride_d + m] = relu(h0) + relu(h1) + relu(h2) + relu(h3)
 // (+ bias[t][m]), summed left to right as the unfused RELU, CONT and ADD chain does. The GEMM is the plain f32 x f32 one.
+// qsa_has_bias == 2 (QSA_VIS): bindings 3 and 4 hold the I32 block starts and tails of qwen4exp_apply_compact_visibility (one
+// sequence, one stream), and the sum gets + log(step(float(tail[t]) - float(start[m]))), the unfused CAST, REPEAT, SUB, STEP, LOG and
+// ADD chain computed with the same operations: + 0.0 for a visible block, + log(0.0) = -inf otherwise.
 #define QSA_H 4
 layout (binding = 3) readonly buffer QSA_BIAS {float data_qsa_bias[];};
+layout (binding = 3) readonly buffer QSA_LIMITS {int data_qsa_limits[];};   // QSA_VIS: the block starts
+layout (binding = 4) readonly buffer QSA_TAILS {int data_qsa_tails[];};      // QSA_VIS: the tails (unused otherwise)
 #endif
 
 #ifdef MUL_MAT_ID
@@ -181,6 +186,9 @@ layout (push_constant) uniform parameter
     uint qsa_has_bias;
     uint qsa_stride_bias;
     uint qsa_batch_stride_bias;
+    uint qsa_vis_start;   // QSA_VIS: element offset of start[0] in the limits
+    uint qsa_vis_tail;    // QSA_VIS: element offset of tail[0] (this strip's first query)
+    uint qsa_vis_neg;     // QSA_VIS negative control (GGML_VK_QSA_VIS_NEG): 1 inverts the visibility test
 #endif
 #endif
 } p;
@@ -807,8 +815,12 @@ layout(constant_id = 17) const uint MMID_B_FULL = 0;
                         [[unroll]] for (uint h = 0; h < QSA_H; h++) {
                             s += max(float(coopmat_stage[warp_i * TM * TN + (g * QSA_H + h) * TM + r]), 0.0f);
                         }
-                        if (p.qsa_has_bias != 0) {
+                        if (p.qsa_has_bias == 1) {
                             s += data_qsa_bias[batch_idx * p.qsa_batch_stride_bias + t * p.qsa_stride_bias + row];
+                        } else if (p.qsa_has_bias == 2) {
+                            const float vd = float(data_qsa_tails[p.qsa_vis_tail + t]) - float(data_qsa_limits[p.qsa_vis_start + row]);
+                            const bool  vv = p.qsa_vis_neg != 0 ? !(vd > 0.0f) : vd > 0.0f;
+                            s += log(vv ? 1.0f : 0.0f);
                         }
                         data_d[batch_idx * p.batch_stride_d + t * p.stride_d + row] = D_TYPE(s);
                     }

@@ -1530,6 +1530,12 @@ struct ggml_backend_vk_context {
     bool fused_hc_up_mix_cpy {};   // ... + CPY of the mixed stream into its row-padded destination (LLAMA_HC_MIX_PAD), stored there
     bool fused_qsa_score {};   // QSA scorer: MUL_MAT + RELU + 4-head sum (+ block bias) in the GEMM epilogue (QSA_SCORE)
     const ggml_tensor * qsa_score_bias {};   // the block bias of a QSA_SCORE chain, or nullptr
+    // QSA_VIS: the compact visibility folded into the QSA_SCORE epilogue (ggml_vk_match_qsa_vis): the I32 tensors holding the
+    // block starts (qsa_vis_limits) and this strip's tails, and the element offsets of start[0] and tail[0]; nullptr = off
+    const ggml_tensor * qsa_vis_limits {};
+    const ggml_tensor * qsa_vis_tails {};
+    uint32_t qsa_vis_start {};
+    uint32_t qsa_vis_tail {};
     int  fused_mmv_glu {};        // SWIGLU (split) + MUL_MAT (q8_0 mat-vec) (+ SIGMOID + MUL of a [1, N] gate): the chain's node
                                   // count, run as one mat-vec that forms B as it loads it (MUL_MAT_VEC_GLU(_SIG))
     bool fused_fn_decode_hc {};   // SCALE + SILU + MUL_MAT (mat-vec) + RESHAPE + DSV4_HC_PRE (gated) -> one mat-vec (FN_DECODE_HC)

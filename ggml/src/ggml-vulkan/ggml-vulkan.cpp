@@ -3112,7 +3112,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // the same GEMM with the qwen4exp QSA scorer epilogue (QSA_SCORE, ggml_vk_match_qsa_score): same tiles, 4th binding = bias
             vk_matmul_pipeline_key kq{GGML_TYPE_F32, GGML_TYPE_F32, false, false};
             kq.qsa = true;
-            cm1_create(kq, tc_mm, "matmul_f32_f32_qsa", matmul_f32_f32_qsa_cm1_len, matmul_f32_f32_qsa_cm1_data, sizeof(vk_mat_mat_qsa_push_constants), 4);
+            cm1_create(kq, tc_mm, "matmul_f32_f32_qsa", matmul_f32_f32_qsa_cm1_len, matmul_f32_f32_qsa_cm1_data, sizeof(vk_mat_mat_qsa_push_constants), 5);
         }
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f32_f16",     matmul_f32_f16_cm1_len,     matmul_f32_f16_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
         if (device->coopmat_acc_f16_support) {
@@ -7018,6 +7018,7 @@ void ggml_vk_instance_init() {
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_perf_logger_seq = getenv("GGML_VK_PERF_LOGGER_SEQ") != nullptr;
+    vk_perf_logger_seq_shapes = vk_perf_logger_seq && atoi(getenv("GGML_VK_PERF_LOGGER_SEQ")) >= 2;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
     const char* GGML_VK_PIPELINE_STATS = getenv("GGML_VK_PIPELINE_STATS");
@@ -10133,14 +10134,127 @@ static const std::vector<vk_matmul_pipeline_pair> * ggml_vk_qsa_score_pipelines(
     return (it == ctx->device->pipeline_matmul.end() || it->second.empty()) ? nullptr : &it->second;
 }
 
+// QSA_VIS: qwen4exp_apply_compact_visibility for one sequence and one stream (the llama-bench / -np 1 prefill form)
+//   starts = CAST(VIEW(limits, M)) [M]; tails = RESHAPE(CAST(VIEW(limits, nt))) [1, nt]
+//   score  = ADD(sum, LOG(STEP(SUB(REPEAT(tails, sum), starts))))
+// folded into the QSA_SCORE epilogue, which reads the I32 limits itself (QSA_EPI, qsa_has_bias = 2): the REPEAT, SUB, STEP,
+// LOG and ADD each made a full [M, nt] f32 pass per strip (M ~ 8k blocks at 32k). The epilogue computes the same float
+// operations, so the scores are bit-identical. Default on with QSA_SCORE; GGML_VK_QSA_VIS=0 leaves the chain unfused (graph
+// order and kernels as before). GGML_VK_QSA_VIS_NEG=1 inverts the visibility test (negative control: tests must fail).
+static bool ggml_vk_qsa_vis_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_QSA_VIS"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+static uint32_t ggml_vk_qsa_vis_neg() {
+    static const uint32_t neg = [] { const char * e = getenv("GGML_VK_QSA_VIS_NEG"); return e && atoi(e) != 0 ? 1u : 0u; }();
+    return neg;
+}
+struct vk_qsa_vis_match {
+    const ggml_tensor * starts;   // I32 tensor holding start[0..M) at element offset `start`
+    const ggml_tensor * tails;    // I32 tensor holding this strip's tail[0..nt) at element offset `tail`
+    uint32_t start;
+    uint32_t tail;
+    int n_nodes;                  // nodes from j through the final ADD
+};
+// The visibility nodes after the head sum `sum` ([M, nt, 1, 1] f32), consecutive from node j in graph order, all of them
+// members of the chain above and only the final ADD read outside it. Returns the final ADD's index or 0.
+static int ggml_vk_match_qsa_vis(const struct ggml_cgraph * g, int j, const ggml_tensor * sum, vk_qsa_vis_match * out) {
+    constexpr int max_len = 10;   // VIEW, CPY, RESHAPE, REPEAT, VIEW, CPY, SUB, STEP, LOG, ADD
+    if (!ggml_vk_qsa_vis_enabled() || sum->type != GGML_TYPE_F32 || sum->ne[2] != 1 || sum->ne[3] != 1 || !ggml_is_contiguous(sum)) {
+        return 0;
+    }
+    const int64_t M = sum->ne[0], nt = sum->ne[1];
+    int fin = -1;
+    for (int n = j; n < std::min(g->n_nodes, j + max_len); ++n) {
+        const ggml_tensor * t = g->nodes[n];
+        if (t->op == GGML_OP_ADD && t->src[0] == sum) {
+            fin = n;
+            break;
+        }
+    }
+    if (fin < 0) {
+        return 0;
+    }
+    const ggml_tensor * add = g->nodes[fin];
+    const ggml_tensor * lg  = add->src[1];
+    const ggml_tensor * st  = lg ? lg->src[0] : nullptr;
+    const ggml_tensor * sb  = st ? st->src[0] : nullptr;
+    const ggml_tensor * rp  = sb ? sb->src[0] : nullptr;
+    const ggml_tensor * cs  = sb ? sb->src[1] : nullptr;
+    const ggml_tensor * rt  = rp ? rp->src[0] : nullptr;
+    const ggml_tensor * ct  = rt ? rt->src[0] : nullptr;
+    const ggml_tensor * vt  = ct ? ct->src[0] : nullptr;
+    const ggml_tensor * vs  = cs ? cs->src[0] : nullptr;
+    auto same_shape = [&](const ggml_tensor * x) {
+        return x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[0] == M && x->ne[1] == nt && x->ne[2] == 1 && x->ne[3] == 1;
+    };
+    auto is_cast = [](const ggml_tensor * c) {
+        return c && c->op == GGML_OP_CPY && c->src[1] == c && c->type == GGML_TYPE_F32 && ggml_is_contiguous(c);
+    };
+    // the cast's I32 source of n elements: a contiguous 1-D view of an I32 root (the limits input on the device), or, when the
+    // scheduler copied that view in from the host input, the contiguous copy itself (a leaf of this split)
+    auto lim_src = [](const ggml_tensor * v, int64_t n, const ggml_tensor ** buf, uint32_t * off) {
+        if (!v || v->type != GGML_TYPE_I32 || v->ne[0] != n || v->ne[1] != 1 || v->ne[2] != 1 || v->ne[3] != 1 ||
+            v->nb[0] != sizeof(int32_t)) {
+            return false;
+        }
+        if (v->op == GGML_OP_VIEW) {
+            if (!v->view_src || v->view_src->type != GGML_TYPE_I32 || v->view_offs % sizeof(int32_t) != 0 ||
+                v->view_offs / sizeof(int32_t) + n > (size_t) ggml_nelements(v->view_src)) {
+                return false;
+            }
+            *buf = v->view_src;
+            *off = (uint32_t) (v->view_offs / sizeof(int32_t));
+            return true;
+        }
+        if (v->op == GGML_OP_NONE && v->view_src == nullptr) {
+            *buf = v;
+            *off = 0;
+            return true;
+        }
+        return false;
+    };
+    const ggml_tensor * sbuf = nullptr, * tbuf = nullptr;
+    uint32_t soff = 0, toff = 0;
+    if (!same_shape(add) || !lg || lg->op != GGML_OP_LOG || !same_shape(lg) ||
+        !st || st->op != GGML_OP_UNARY || ggml_get_unary_op(st) != GGML_UNARY_OP_STEP || !same_shape(st) ||
+        !sb || sb->op != GGML_OP_SUB || !same_shape(sb) ||
+        !rp || rp->op != GGML_OP_REPEAT || !same_shape(rp) ||
+        !rt || rt->op != GGML_OP_RESHAPE || rt->ne[0] != 1 || rt->ne[1] != nt || rt->ne[2] != 1 || rt->ne[3] != 1 ||
+        !is_cast(ct) || ct->ne[0] != nt || ggml_nelements(ct) != nt ||
+        !is_cast(cs) || cs->ne[0] != M || cs->ne[1] != 1 || cs->ne[2] != 1 || cs->ne[3] != 1 ||
+        !lim_src(vt, nt, &tbuf, &toff) || !lim_src(vs, M, &sbuf, &soff)) {
+        return 0;
+    }
+    // every node in [j, fin] is one of the chain's (none hoisted in from elsewhere), or a VIEW, which computes nothing (the
+    // views of the host limits input stay in the split graph when the scheduler copies them in)
+    const ggml_tensor * members[] = { vt, ct, rt, rp, vs, cs, sb, st, lg, add };
+    for (int n = j; n <= fin; ++n) {
+        if (std::find(std::begin(members), std::end(members), g->nodes[n]) == std::end(members) && g->nodes[n]->op != GGML_OP_VIEW) {
+            return 0;
+        }
+    }
+    if (out) {
+        out->starts  = sbuf;
+        out->tails   = tbuf;
+        out->start   = soff;
+        out->tail    = toff;
+        out->n_nodes = fin - j + 1;
+    }
+    return fin;
+}
+
 // qwen4exp QSA indexer scorer (build_qsa_top_k), 4 indexer heads:
 //   score = MUL_MAT(pooled keys F32 [K, M, ns], q F32 [K, 4*nt, ns])     [M, 4*nt, ns]
 //   RESHAPE [M, 4, nt, ns] -> RELU -> CONT(VIEW h0) -> ADD(VIEW h1) -> ADD(VIEW h2) -> ADD(VIEW h3) (-> ADD(block bias))
 // matmul_f32_f32_qsa is the GEMM the unfused MUL_MAT runs here (matmul_f32_f32, B read in place, no split-k) with the relu,
 // the head sum and the bias applied in its epilogue, so neither the [M, 4*nt] scores nor their relu copy is written.
 // Returns the index of the last fused node (0: no match); *bias_out gets the bias tensor or nullptr.
-static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** bias_out) {
+// *vis_out gets the QSA_VIS limits when the chain ends with the compact visibility (vis_out->limits nullptr otherwise).
+static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** bias_out,
+        vk_qsa_vis_match * vis_out) {
     *bias_out = nullptr;
+    *vis_out = {};
     if (ggml_vk_qsa_score_mode() != 1 || !ctx->device->coopmat_support || ctx->device->coopmat2 || ggml_vk_qsa_score_pipelines(ctx) == nullptr) {
         return 0;
     }
@@ -10170,8 +10284,8 @@ static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const st
     int last  = 0;
     // the chain is at most qsa_score_pattern long, which fits the per-fusion source flags in ggml_backend_vk_graph_compute
     constexpr int max_nodes = (int) qsa_score_pattern.size();
-    int idxs[max_nodes];
-    ggml_op ops[max_nodes];
+    int idxs[max_nodes + 10];   // + the QSA_VIS nodes
+    ggml_op ops[max_nodes + 10];
     int count = 0;
     idxs[count] = node_idx; ops[count++] = mm->op;
     // the view of head h of relu: [M, nt, ns] at offset h*nb[1]
@@ -10230,6 +10344,45 @@ static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const st
         *bias_out = nullptr;
         return 0;
     }
+    // QSA_VIS: the compact visibility right behind the head sum (one stream), then the chain ends at its ADD
+    vk_qsa_vis_match vis {};
+    const int vis_last = !*bias_out && ns == 1 && last + 1 < cgraph->n_nodes ?
+        ggml_vk_match_qsa_vis(cgraph, last + 1, cgraph->nodes[last], &vis) : 0;
+    {
+        static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+        static int n_dbg = 0;
+        if (dbg && !vis_last && !*bias_out && ggml_vk_qsa_vis_enabled() && n_dbg < 8) {
+            n_dbg++;
+            fprintf(stderr, "ggml_vulkan: QSA_VIS no match after node %d:", last);
+            for (int j = last + 1; j < std::min(last + 13, cgraph->n_nodes); ++j) {
+                fprintf(stderr, " %s", ggml_op_desc(cgraph->nodes[j]));
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    if (vis_last && !get_misalign_bytes(ctx, vis.starts) && !get_misalign_bytes(ctx, vis.tails) &&
+        !get_misalign_bytes(ctx, cgraph->nodes[vis_last])) {
+        // ggml_can_fuse_subgraph_ext cannot take this part: the casts count themselves as a use (src[1] == self) and the two
+        // views have a non-constant view_src (the limits input). Check the uses directly instead: every visibility node but the
+        // final ADD, and the head sum, is read exactly once (a cast once plus its self reference), by the chain.
+        auto read_once = [&](int j) {
+            const ggml_tensor * t = cgraph->nodes[j];
+            const int self = t->op == GGML_OP_CPY && t->src[1] == t ? 1 : 0;
+            return !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, j) == 1 + self;
+        };
+        bool ok = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, &last, 1) && read_once(last);
+        for (int j = last + 1; ok && j < vis_last; ++j) {
+            ok = read_once(j);   // a VIEW no cast reads (graph_optimize moves those ahead of the chain) is not taken
+        }
+        if (ok) {
+            *vis_out = vis;
+            return vis_last;
+        }
+        static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+        if (dbg) {
+            fprintf(stderr, "ggml_vulkan: QSA_VIS declined at node %d (uses)\n", node_idx);
+        }
+    }
     // everything from the GEMM to the last ADD is the chain, and only the last node is read outside it
     if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, &last, 1) || get_misalign_bytes(ctx, cgraph->nodes[last])) {
         *bias_out = nullptr;
@@ -10242,6 +10395,9 @@ static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const st
 // ggml_vk_mul_mat_q_f16 for an f32 x f32 product read in place), whose epilogue writes the relu'd head sum (+ block bias)
 // straight to the chain's last node
 static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mm, const ggml_tensor * bias, ggml_tensor * out) {
+    const ggml_tensor * limits = ctx->qsa_vis_limits;   // QSA_VIS (never with a bias): the starts' I32 tensor
+    const ggml_tensor * tails  = ctx->qsa_vis_tails;    //                               and the tails' one
+    GGML_ASSERT(!(limits && bias));
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
     const uint32_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1], ns = src1->ne[2];
@@ -10260,20 +10416,23 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
     pc.mm = { M, N, K, K, K, (uint32_t) (out->nb[1] / sizeof(float)),
               ggml_vk_batch_stride(src0), ggml_vk_batch_stride(src1), (uint32_t) (out->nb[2] / sizeof(float)),
               0, ns, K, ns, ns, 1, 1, N };
-    pc.has_bias          = bias != nullptr;
+    pc.has_bias          = limits ? 2 : bias != nullptr;
     pc.stride_bias       = bias ? (uint32_t) (bias->nb[1] / sizeof(float)) : 0;
     pc.batch_stride_bias = bias ? (uint32_t) (bias->nb[2] / sizeof(float)) : 0;
+    pc.vis_start         = limits ? ctx->qsa_vis_start : 0;
+    pc.vis_tail          = limits ? ctx->qsa_vis_tail : 0;
+    pc.vis_neg           = limits ? ggml_vk_qsa_vis_neg() : 0;
+    if (limits) {
+        GGML_ASSERT(ns == 1);
+        ggml_vk_path_census_add("QSA_VIS");
+    }
 
     vk_subbuffer out_buf = ggml_vk_tensor_subbuffer(ctx, out);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, src1), out_buf,
-          bias ? ggml_vk_tensor_subbuffer(ctx, bias) : out_buf }, pc, { M, N, ns });
-static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& subctx, const char * name);
-
-static bool ggml_vk_hc_boundary_gemm_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_VK_HC_BOUNDARY_GEMM"); return e == nullptr || atoi(e) != 0; }();
-    return on;
+          limits ? ggml_vk_tensor_subbuffer(ctx, limits) : bias ? ggml_vk_tensor_subbuffer(ctx, bias) : out_buf,
+          limits ? ggml_vk_tensor_subbuffer(ctx, tails) : out_buf }, pc, { M, N, ns });
 }
 
 // The fused DeepSeek-V4 hc boundary (matched by ggml_vk_can_fuse_hc_boundary): the split-K mix dots of the unnormalized flat
@@ -23268,6 +23427,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_up_mix_cpy = false;
         ctx->fused_qsa_score = false;
         ctx->qsa_score_bias = nullptr;
+        ctx->qsa_vis_limits = nullptr;
+        vk_qsa_vis_match qsa_vis {};
         ctx->fused_fn_decode_hc = false;
         ctx->fused_mmv_glu = 0;
         ctx->fused_mmid_cpy16 = false;
@@ -23333,9 +23494,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
-            } else if (const int qsa_last = cgraph->nodes[i]->op == GGML_OP_MUL_MAT ? ggml_vk_match_qsa_score(ctx, cgraph, i, &ctx->qsa_score_bias) : 0) {
+            } else if (const int qsa_last = cgraph->nodes[i]->op == GGML_OP_MUL_MAT ? ggml_vk_match_qsa_score(ctx, cgraph, i, &ctx->qsa_score_bias, &qsa_vis) : 0) {
                 ctx->num_additional_fused_ops = qsa_last - i;
                 ctx->fused_qsa_score = true;
+                ctx->qsa_vis_limits = qsa_vis.starts;
+                ctx->qsa_vis_tails  = qsa_vis.tails;
+                ctx->qsa_vis_start  = qsa_vis.start;
+                ctx->qsa_vis_tail   = qsa_vis.tail;
                 fusion_string = "QSA_SCORE";
                 static_assert(qsa_score_pattern.size() <= sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0]),
                               "the QSA_SCORE chain must fit the per-fusion source flags");
@@ -23721,7 +23886,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         }
                         if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                             // QSA_EXPAND: a cast's src[1] is the cast itself, an elided intermediate
-                            bool found = ctx->fused_qsa_expand && src == cgraph->nodes[i + k];
+                            // (QSA_SCORE with QSA_VIS: the visibility casts, read by nothing once the epilogue takes the limits)
+                            bool found = (ctx->fused_qsa_expand || ctx->fused_qsa_score) && src == cgraph->nodes[i + k];
                             for (int n = 0; n < k; ++n) {
                                 if (cgraph->nodes[i + n] == src) {
                                     found = true;
@@ -23770,6 +23936,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_up_mix_cpy = false;
                 ctx->fused_qsa_score = false;
                 ctx->qsa_score_bias = nullptr;
+                ctx->qsa_vis_limits = nullptr;
                 ctx->fused_fn_decode_hc = false;
                 ctx->fused_mmv_glu = 0;
                 ctx->fused_mmid_cpy16 = false;
@@ -23919,6 +24086,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                             wbytes += b;
                         }
                         ops += std::string(k ? "," : "") + (names[k] ? names[k] : ggml_op_name(n->op)) + ":" + n->name;
+                        if (vk_perf_logger_seq_shapes) {
+                            // GGML_VK_PERF_LOGGER_SEQ=2: the node's shape and type too (census of elementwise glue by shape)
+                            char shp[96];
+                            snprintf(shp, sizeof(shp), "[%lld,%lld,%lld,%lld]%s", (long long) n->ne[0], (long long) n->ne[1],
+                                     (long long) n->ne[2], (long long) n->ne[3], ggml_type_name(n->type));
+                            ops += shp;
+                        }
                     }
                     fprintf(stderr, "PFSEQ %d %.2f %.0f %s\n", i, (timestamps[i] - timestamps[i-1]) * ctx->device->properties.limits.timestampPeriod / 1e3, wbytes, ops.c_str());
                 }
@@ -24107,6 +24281,52 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             i += len - 1;
         }
     }
+    // QSA_VIS chains (ggml_vk_match_qsa_vis): the QSA_SCORE scorer chain and the compact visibility behind it stay consecutive
+    // and in order (the casts, the REPEAT and the SUB do not read the head sum, so the reorder below would hoist them ahead of
+    // the GEMM and the chain would never fuse), and every input the fused GEMM reads stays allocated through the final ADD it
+    // writes. Members are protected like QSA_EXPAND's. Knob off (GGML_VK_QSA_VIS=0): nothing is marked, the order is unchanged.
+    std::vector<int> qsa_vis_len;
+    if (ggml_vk_qsa_vis_enabled() && ggml_vk_qsa_score_mode() == 1 && !ctx->device->disable_fusion && ctx->device->coopmat_support &&
+        !ctx->device->coopmat2 && ggml_vk_qsa_score_pipelines(ctx) != nullptr) {
+        const int np = (int) qsa_score_pattern_nobias.size();
+        for (int i = 0; i + np < graph->n_nodes; ++i) {
+            const ggml_tensor * mm = graph->nodes[i];
+            if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || mm->ne[1] <= 64 || mm->ne[2] != 1) {
+                continue;
+            }
+            bool ok = true;
+            for (int k = 0; k < np && ok; ++k) {
+                ok = graph->nodes[i + k]->op == qsa_score_pattern_nobias.begin()[k];
+            }
+            ok = ok && graph->nodes[i + 1]->src[0] == mm && graph->nodes[i + 2]->src[0] == graph->nodes[i + 1];
+            const int fin = ok ? ggml_vk_match_qsa_vis(graph, i + np, graph->nodes[i + np - 1], nullptr) : 0;
+            if (!fin) {
+                static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+                static int n_dbg = 0;
+                if (dbg && ok && n_dbg < 4) {
+                    n_dbg++;
+                    fprintf(stderr, "ggml_vulkan: QSA_VIS pre-scan no match after node %d (n_nodes %d):", i + np - 1, graph->n_nodes);
+                    for (int j = i + np; j < std::min(i + np + 12, graph->n_nodes); ++j) {
+                        const ggml_tensor * t = graph->nodes[j];
+                        fprintf(stderr, " %s[%lld,%lld,%lld,%lld](%s%s)", ggml_op_desc(t), (long long) t->ne[0], (long long) t->ne[1],
+                                (long long) t->ne[2], (long long) t->ne[3], t->src[0] ? ggml_op_desc(t->src[0]) : "-",
+                                t->src[0] && t->src[0]->view_src ? ",view" : "");
+                    }
+                    fprintf(stderr, "\n");
+                }
+                continue;
+            }
+            if (qsa_vis_len.empty()) {
+                qsa_vis_len.assign(graph->n_nodes, 0);
+            }
+            if (qsa_expand_member.empty()) {
+                qsa_expand_member.assign(graph->n_nodes, false);
+            }
+            qsa_vis_len[i] = fin - i + 1;
+            std::fill(qsa_expand_member.begin() + i, qsa_expand_member.begin() + fin + 1, true);
+            i = fin;
+        }
+    }
     auto const &in_qsa_expand = [&](int n) -> bool {
         return !qsa_expand_member.empty() && qsa_expand_member[n];
     };
@@ -24237,6 +24457,63 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     continue;
                 }
             }
+        }
+        // QSA_VIS: the whole scorer + visibility chain at once, in its graph order
+        {
+            const int vis_len = qsa_vis_len.empty() ? 0 : qsa_vis_len[first_unused];
+            bool vis_free = vis_len > 0;
+            for (int j = first_unused; vis_free && j < first_unused + vis_len; ++j) {
+                vis_free = !used[j];
+            }
+            if (vis_free) {
+                if (params && params->add_alloc_dep) {
+                    ggml_tensor * fin = graph->nodes[first_unused + vis_len - 1];
+                    std::set<const ggml_tensor *> inside(graph->nodes + first_unused, graph->nodes + first_unused + vis_len);
+                    std::set<ggml_tensor *> seen;
+                    // the scorer's own inputs (keys, query view), as QSA_SCORE; the visibility reads only the limits, a graph input
+                    // (on the host during graph_optimize: the scheduler copies it in later, and input copies are not freed)
+                    for (int j = first_unused; j < first_unused + (int) qsa_score_pattern_nobias.size(); ++j) {
+                        for (uint32_t k = 0; k < GGML_MAX_SRC; ++k) {
+                            ggml_tensor * src = graph->nodes[j]->src[k];
+                            if (!src || inside.count(src)) {
+                                continue;
+                            }
+                            ggml_tensor * root = src->view_src ? src->view_src : src;
+                            if (seen.insert(root).second) {
+                                params->add_alloc_dep(params->user_data, root, fin);
+                            }
+                        }
+                    }
+                }
+                // a VIEW in the range that no cast reads (left behind when the scheduler copied a view of the host limits input
+                // into the split) goes first, so the fused range in graph_compute holds only the chain: such a view may look at a
+                // host tensor, which the fused dispatch's source checks must not see
+                auto stray_view = [&](int j) {
+                    if (graph->nodes[j]->op != GGML_OP_VIEW) {
+                        return false;
+                    }
+                    for (int k = first_unused; k < first_unused + vis_len; ++k) {
+                        if (graph->nodes[k]->op == GGML_OP_CPY && graph->nodes[k]->src[0] == graph->nodes[j]) {
+                            return false;
+                        }
+                    }
+                    return j > first_unused + (int) qsa_score_pattern_nobias.size() - 1;
+                };
+                for (int pass = 0; pass < 2; ++pass) {
+                    for (int j = first_unused; j < first_unused + vis_len; ++j) {
+                        if (stray_view(j) == (pass == 0)) {
+                            new_order.push_back(graph->nodes[j]);
+                            used_node_set.insert(graph->nodes[j]);
+                            used[j] = true;
+                        }
+                    }
+                }
+                while (first_unused < graph->n_nodes && used[first_unused]) {
+                    first_unused++;
+                }
+                continue;
+            }
+        }
         // (a chain whose members were already taken by another rule is left to the normal path: it then runs unfused)
         const int qsa_len = qsa_expand_len.empty() ? 0 : qsa_expand_len[first_unused];
         bool qsa_free = qsa_len > 0;
