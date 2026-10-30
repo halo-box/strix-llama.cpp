@@ -1,0 +1,188 @@
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 102400 MiB):
+  Device 0: AMD Radeon Graphics, gfx1151 (0x1151), VMM: no, Wave Size: 32, VRAM: 102400 MiB
+llama-bench: benchmark 1/18: starting
+llama-bench: benchmark 1/18: warmup prompt run
+llama-bench: benchmark 1/18: prompt run 1/5
+llama-bench: benchmark 1/18: prompt run 2/5
+llama-bench: benchmark 1/18: prompt run 3/5
+llama-bench: benchmark 1/18: prompt run 4/5
+llama-bench: benchmark 1/18: prompt run 5/5
+llama-bench: benchmark 2/18: starting
+llama-bench: benchmark 2/18: warmup generation run
+llama-bench: benchmark 2/18: generation run 1/5
+llama-bench: benchmark 2/18: generation run 2/5
+llama-bench: benchmark 2/18: generation run 3/5
+llama-bench: benchmark 2/18: generation run 4/5
+llama-bench: benchmark 2/18: generation run 5/5
+llama-bench: benchmark 3/18: starting
+llama-bench: benchmark 3/18: warmup prompt run
+llama-bench: benchmark 3/18: depth run 1/5
+llama-bench: benchmark 3/18: prompt run 1/5
+llama-bench: benchmark 3/18: depth run 2/5 (cached)
+llama-bench: benchmark 3/18: prompt run 2/5
+llama-bench: benchmark 3/18: depth run 3/5 (cached)
+llama-bench: benchmark 3/18: prompt run 3/5
+llama-bench: benchmark 3/18: depth run 4/5 (cached)
+llama-bench: benchmark 3/18: prompt run 4/5
+llama-bench: benchmark 3/18: depth run 5/5 (cached)
+llama-bench: benchmark 3/18: prompt run 5/5
+llama-bench: benchmark 4/18: starting
+llama-bench: benchmark 4/18: warmup generation run
+llama-bench: benchmark 4/18: depth run 1/5 (cached)
+llama-bench: benchmark 4/18: generation run 1/5
+llama-bench: benchmark 4/18: depth run 2/5 (cached)
+llama-bench: benchmark 4/18: generation run 2/5
+llama-bench: benchmark 4/18: depth run 3/5 (cached)
+llama-bench: benchmark 4/18: generation run 3/5
+llama-bench: benchmark 4/18: depth run 4/5 (cached)
+llama-bench: benchmark 4/18: generation run 4/5
+llama-bench: benchmark 4/18: depth run 5/5 (cached)
+llama-bench: benchmark 4/18: generation run 5/5
+llama-bench: benchmark 5/18: starting
+llama-bench: benchmark 5/18: warmup prompt run
+llama-bench: benchmark 5/18: depth run 1/5
+llama-bench: benchmark 5/18: prompt run 1/5
+llama-bench: benchmark 5/18: depth run 2/5 (cached)
+llama-bench: benchmark 5/18: prompt run 2/5
+llama-bench: benchmark 5/18: depth run 3/5 (cached)
+llama-bench: benchmark 5/18: prompt run 3/5
+llama-bench: benchmark 5/18: depth run 4/5 (cached)
+llama-bench: benchmark 5/18: prompt run 4/5
+llama-bench: benchmark 5/18: depth run 5/5 (cached)
+llama-bench: benchmark 5/18: prompt run 5/5
+llama-bench: benchmark 6/18: starting
+llama-bench: benchmark 6/18: warmup generation run
+llama-bench: benchmark 6/18: depth run 1/5 (cached)
+llama-bench: benchmark 6/18: generation run 1/5
+llama-bench: benchmark 6/18: depth run 2/5 (cached)
+llama-bench: benchmark 6/18: generation run 2/5
+llama-bench: benchmark 6/18: depth run 3/5 (cached)
+llama-bench: benchmark 6/18: generation run 3/5
+llama-bench: benchmark 6/18: depth run 4/5 (cached)
+llama-bench: benchmark 6/18: generation run 4/5
+llama-bench: benchmark 6/18: depth run 5/5 (cached)
+llama-bench: benchmark 6/18: generation run 5/5
+llama-bench: benchmark 7/18: starting
+llama-bench: benchmark 7/18: warmup prompt run
+llama-bench: benchmark 7/18: prompt run 1/5
+llama-bench: benchmark 7/18: prompt run 2/5
+llama-bench: benchmark 7/18: prompt run 3/5
+llama-bench: benchmark 7/18: prompt run 4/5
+llama-bench: benchmark 7/18: prompt run 5/5
+llama-bench: benchmark 8/18: starting
+llama-bench: benchmark 8/18: warmup generation run
+llama-bench: benchmark 8/18: generation run 1/5
+llama-bench: benchmark 8/18: generation run 2/5
+llama-bench: benchmark 8/18: generation run 3/5
+llama-bench: benchmark 8/18: generation run 4/5
+llama-bench: benchmark 8/18: generation run 5/5
+llama-bench: benchmark 9/18: starting
+llama-bench: benchmark 9/18: warmup prompt run
+llama-bench: benchmark 9/18: depth run 1/5
+llama-bench: benchmark 9/18: prompt run 1/5
+llama-bench: benchmark 9/18: depth run 2/5 (cached)
+llama-bench: benchmark 9/18: prompt run 2/5
+llama-bench: benchmark 9/18: depth run 3/5 (cached)
+llama-bench: benchmark 9/18: prompt run 3/5
+llama-bench: benchmark 9/18: depth run 4/5 (cached)
+llama-bench: benchmark 9/18: prompt run 4/5
+llama-bench: benchmark 9/18: depth run 5/5 (cached)
+llama-bench: benchmark 9/18: prompt run 5/5
+llama-bench: benchmark 10/18: starting
+llama-bench: benchmark 10/18: warmup generation run
+llama-bench: benchmark 10/18: depth run 1/5 (cached)
+llama-bench: benchmark 10/18: generation run 1/5
+llama-bench: benchmark 10/18: depth run 2/5 (cached)
+llama-bench: benchmark 10/18: generation run 2/5
+llama-bench: benchmark 10/18: depth run 3/5 (cached)
+llama-bench: benchmark 10/18: generation run 3/5
+llama-bench: benchmark 10/18: depth run 4/5 (cached)
+llama-bench: benchmark 10/18: generation run 4/5
+llama-bench: benchmark 10/18: depth run 5/5 (cached)
+llama-bench: benchmark 10/18: generation run 5/5
+llama-bench: benchmark 11/18: starting
+llama-bench: benchmark 11/18: warmup prompt run
+llama-bench: benchmark 11/18: depth run 1/5
+llama-bench: benchmark 11/18: prompt run 1/5
+llama-bench: benchmark 11/18: depth run 2/5 (cached)
+llama-bench: benchmark 11/18: prompt run 2/5
+llama-bench: benchmark 11/18: depth run 3/5 (cached)
+llama-bench: benchmark 11/18: prompt run 3/5
+llama-bench: benchmark 11/18: depth run 4/5 (cached)
+llama-bench: benchmark 11/18: prompt run 4/5
+llama-bench: benchmark 11/18: depth run 5/5 (cached)
+llama-bench: benchmark 11/18: prompt run 5/5
+llama-bench: benchmark 12/18: starting
+llama-bench: benchmark 12/18: warmup generation run
+llama-bench: benchmark 12/18: depth run 1/5 (cached)
+llama-bench: benchmark 12/18: generation run 1/5
+llama-bench: benchmark 12/18: depth run 2/5 (cached)
+llama-bench: benchmark 12/18: generation run 2/5
+llama-bench: benchmark 12/18: depth run 3/5 (cached)
+llama-bench: benchmark 12/18: generation run 3/5
+llama-bench: benchmark 12/18: depth run 4/5 (cached)
+llama-bench: benchmark 12/18: generation run 4/5
+llama-bench: benchmark 12/18: depth run 5/5 (cached)
+llama-bench: benchmark 12/18: generation run 5/5
+llama-bench: benchmark 13/18: starting
+llama-bench: benchmark 13/18: warmup prompt run
+llama-bench: benchmark 13/18: prompt run 1/5
+llama-bench: benchmark 13/18: prompt run 2/5
+llama-bench: benchmark 13/18: prompt run 3/5
+llama-bench: benchmark 13/18: prompt run 4/5
+llama-bench: benchmark 13/18: prompt run 5/5
+llama-bench: benchmark 14/18: starting
+llama-bench: benchmark 14/18: warmup generation run
+llama-bench: benchmark 14/18: generation run 1/5
+llama-bench: benchmark 14/18: generation run 2/5
+llama-bench: benchmark 14/18: generation run 3/5
+llama-bench: benchmark 14/18: generation run 4/5
+llama-bench: benchmark 14/18: generation run 5/5
+llama-bench: benchmark 15/18: starting
+llama-bench: benchmark 15/18: warmup prompt run
+llama-bench: benchmark 15/18: depth run 1/5
+llama-bench: benchmark 15/18: prompt run 1/5
+llama-bench: benchmark 15/18: depth run 2/5 (cached)
+llama-bench: benchmark 15/18: prompt run 2/5
+llama-bench: benchmark 15/18: depth run 3/5 (cached)
+llama-bench: benchmark 15/18: prompt run 3/5
+llama-bench: benchmark 15/18: depth run 4/5 (cached)
+llama-bench: benchmark 15/18: prompt run 4/5
+llama-bench: benchmark 15/18: depth run 5/5 (cached)
+llama-bench: benchmark 15/18: prompt run 5/5
+llama-bench: benchmark 16/18: starting
+llama-bench: benchmark 16/18: warmup generation run
+llama-bench: benchmark 16/18: depth run 1/5 (cached)
+llama-bench: benchmark 16/18: generation run 1/5
+llama-bench: benchmark 16/18: depth run 2/5 (cached)
+llama-bench: benchmark 16/18: generation run 2/5
+llama-bench: benchmark 16/18: depth run 3/5 (cached)
+llama-bench: benchmark 16/18: generation run 3/5
+llama-bench: benchmark 16/18: depth run 4/5 (cached)
+llama-bench: benchmark 16/18: generation run 4/5
+llama-bench: benchmark 16/18: depth run 5/5 (cached)
+llama-bench: benchmark 16/18: generation run 5/5
+llama-bench: benchmark 17/18: starting
+llama-bench: benchmark 17/18: warmup prompt run
+llama-bench: benchmark 17/18: depth run 1/5
+llama-bench: benchmark 17/18: prompt run 1/5
+llama-bench: benchmark 17/18: depth run 2/5 (cached)
+llama-bench: benchmark 17/18: prompt run 2/5
+llama-bench: benchmark 17/18: depth run 3/5 (cached)
+llama-bench: benchmark 17/18: prompt run 3/5
+llama-bench: benchmark 17/18: depth run 4/5 (cached)
+llama-bench: benchmark 17/18: prompt run 4/5
+llama-bench: benchmark 17/18: depth run 5/5 (cached)
+llama-bench: benchmark 17/18: prompt run 5/5
+llama-bench: benchmark 18/18: starting
+llama-bench: benchmark 18/18: warmup generation run
+llama-bench: benchmark 18/18: depth run 1/5 (cached)
+llama-bench: benchmark 18/18: generation run 1/5
+llama-bench: benchmark 18/18: depth run 2/5 (cached)
+llama-bench: benchmark 18/18: generation run 2/5
+llama-bench: benchmark 18/18: depth run 3/5 (cached)
+llama-bench: benchmark 18/18: generation run 3/5
+llama-bench: benchmark 18/18: depth run 4/5 (cached)
+llama-bench: benchmark 18/18: generation run 4/5
+llama-bench: benchmark 18/18: depth run 5/5 (cached)
+llama-bench: benchmark 18/18: generation run 5/5

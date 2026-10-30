@@ -1,0 +1,20 @@
+llama-bench	qwen36-35b-a3b	0	18
+perplexity	qwen36-35b-a3b	2048	0	64.9
+perplexity	qwen36-35b-a3b	4096	0	60.1
+llama-bench	qwen38-27b	0	18
+perplexity	qwen38-27b	2048	0	384.9
+perplexity	qwen38-27b	4096	0	382.0
+llama-bench	flash-next-iq2xs	0	18
+perplexity	flash-next-iq2xs	2048	0	174.6
+perplexity	flash-next-iq2xs	4096	0	159.6
+speed-bench	flash-next-iq2xs	throughput_1k	1	0
+speed-bench	flash-next-iq2xs	throughput_32k	1	0
+llama-bench-vulkan	qwen36-35b-a3b	0	18
+perplexity-vulkan	qwen36-35b-a3b	2048	0	74.7
+perplexity-vulkan	qwen36-35b-a3b	4096	0	68.2
+llama-bench-vulkan	qwen38-27b	0	18
+perplexity-vulkan	qwen38-27b	2048	0	377.7
+perplexity-vulkan	qwen38-27b	4096	0	368.7
+llama-bench-vulkan	flash-next-iq2xs	0	18
+perplexity-vulkan	flash-next-iq2xs	2048	0	189.4
+perplexity-vulkan	flash-next-iq2xs	4096	0	177.8

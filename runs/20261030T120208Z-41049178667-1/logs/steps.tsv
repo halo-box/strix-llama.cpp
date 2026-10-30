@@ -1,0 +1,10 @@
+validate	success
+build-hip	success
+device-hip	success
+vulkan-sdk	success
+build-vulkan	success
+device-vulkan	success
+wikitext	success
+speed-bench-setup	success
+models-hip	failure
+llama-bench-vulkan	success

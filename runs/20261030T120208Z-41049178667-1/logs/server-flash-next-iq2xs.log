@@ -1,0 +1,23 @@
+0.00.159.367 I srv  llama_server: initializing ...
+0.00.159.384 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.164.875 I srv  init_listene: The UI is disabled
+0.00.164.877 I srv  init_listene: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+0.00.165.057 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.167.445 I srv    load_model: loading model '/mnt/scratch/actions-runner-01/_work/_temp/models/flash-next-iq2xs/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf'
+0.00.887.558 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.01.118.364 W model has unused tensor per_layer_token_embd.weight (size = 28800138240 bytes) -- ignoring
+0.14.543.004 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but fused DeepSeek V4 HC pre is assigned to device CPU (usually due to missing support)
+0.14.543.007 W resolve_fused_ops: fused DeepSeek V4 HC pre not supported, set to disabled
+0.14.550.623 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but fused DeepSeek V4 HC post is assigned to device CPU (usually due to missing support)
+0.14.550.625 W resolve_fused_ops: fused DeepSeek V4 HC post not supported, set to disabled
+0.14.554.233 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but f16 MoE activations is assigned to device CPU (usually due to missing support)
+0.14.554.234 W resolve_fused_ops: f16 MoE activations not supported, set to disabled
+0.14.557.953 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but f16 GDN output norm is assigned to device CPU (usually due to missing support)
+0.14.557.955 W resolve_fused_ops: f16 GDN output norm not supported, set to disabled
+0.14.663.664 I cmn          init: llama threadpool init, n_threads = 16
+0.14.797.094 I common_speculative_init_result: creating MTP draft context against the target model '/mnt/scratch/actions-runner-01/_work/_temp/models/flash-next-iq2xs/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf'
+0.14.797.100 W llama_init_from_model: context type MTP requested but model doesn't contain MTP layers
+0.14.797.101 E common_speculative_init_result: failed to create MTP context
+0.14.797.107 E srv    load_model: failed to create MTP context
+0.14.797.112 I srv    operator(): operator(): cleaning up before exit...
+0.14.798.759 E srv  llama_server: exiting due to model loading error

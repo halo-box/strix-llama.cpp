@@ -1,0 +1,3 @@
+d3f9fb467f86257075c888bd32e232214299bad7
+2026-10-30T08:15:42+01:00
+cuda : restore stock K order for narrow RDNA3.5 attention
