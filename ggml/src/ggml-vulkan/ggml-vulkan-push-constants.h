@@ -18,8 +18,10 @@ struct vk_mat_mat_push_constants {
 // matmul_f32_f32_qsa (QSA_EPI in mul_mm.comp): the plain push constants plus the block-bias addressing (QSA_SCORE)
 struct vk_mat_mat_qsa_push_constants {
     vk_mat_mat_push_constants mm;
-    uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;
+    uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;   // has_bias: 0 none, 1 block bias, 2 compact visibility (QSA_VIS)
+    uint32_t vis_start; uint32_t vis_tail; uint32_t vis_neg;                 // QSA_VIS: limits element offsets, negative control
 };
+static_assert(sizeof(vk_mat_mat_qsa_push_constants) <= 128, "matmul_f32_f32_qsa push constants must fit the 128-byte minimum");
 
 // matmul_q8_0_q8_1_hcmix (HC_EPI in mul_mmq_cm1.comp): the plain push constants plus the x / mixed addressing and the mix scale
 struct vk_mat_mat_hcmix_push_constants {
