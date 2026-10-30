@@ -8629,6 +8629,12 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
 // at the cost of re-reading the weights once per chunk. Chunks never take the q8_1
 // integer-dot path (its prealloc cache is keyed by tensor, not by column; and that path
 // has the same pathology). GGML_VK_MMV_NO_SPLIT=1 restores the single dispatch.
+// On Mesa 26.2.4 those variants scale smoothly and chunking a batch of up to
+// mul_mat_vec_max_cols columns is a loss (the extra weight read per chunk buys nothing):
+// llama-bench pp3 and pp5..pp8 gain 1% to 36% with the single dispatch on seven models,
+// pp1/2/4 unchanged (issues #50, #51, #88). So such batches now run as one dispatch, which
+// may take the q8_1 integer-dot path as upstream does; GGML_VK_MMV_SPLIT=1 restores the
+// chunks. Batches of 9..16 columns (ggml_vk_mmv_can_chunk below) are chunked as before.
 // Only q8_0 and q6_K are chunked: those are the types where the slow variants were
 // measured. The K-quants were chunked to 2 columns without a measurement, and on a dense
 // Qwen3.8-27B UD-Q4_K_XL (RADV, Mesa 26.1.7) that made things worse, not better: pp3/pp5/pp8
@@ -8636,6 +8642,16 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
 // halved MTP decode (issue #25). Leave the other types on upstream's path until measured.
 static bool ggml_vk_mmv_chunk_type(ggml_type type) {
     return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q6_K;
+}
+
+// GGML_VK_MMV_SPLIT=1: chunk q8_0 / q6_K batches of up to mul_mat_vec_max_cols columns again (the
+// Mesa 26.1 behaviour); GGML_VK_MMV_NO_SPLIT=1 wins over it
+static bool ggml_vk_mmv_split_small() {
+    static const bool split = [] {
+        const char * e = getenv("GGML_VK_MMV_SPLIT");
+        return e != nullptr && e[0] == '1' && getenv("GGML_VK_MMV_NO_SPLIT") == nullptr;
+    }();
+    return split;
 }
 
 static uint32_t ggml_vk_mmv_good_cols(ggml_type type, uint32_t n) {
@@ -8684,14 +8700,13 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const ggml_tensor * src1 = dst->src[1];
     const uint32_t ne11 = (uint32_t) src1->ne[1];
 
-    static const bool no_split = getenv("GGML_VK_MMV_NO_SPLIT") != nullptr;
     const bool plain = ne11 > 1 && src1->ne[2] * src1->ne[3] == 1 &&
                        src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                        ctx->num_additional_fused_ops == 0;
     GGML_ASSERT(ne11 <= mul_mat_vec_max_cols || plain);
     // An exact batch keeps n == 1's integer-dot choice in every chunk and is always split past mul_mat_vec_max_cols.
     const bool exact_batch = ggml_vk_mul_mat_exact_batch(dst);
-    if ((!no_split || ne11 > mul_mat_vec_max_cols) && plain && std::min(ggml_vk_mmv_good_cols(src0->type, ne11), mul_mat_vec_max_cols) < ne11) {
+    if ((ggml_vk_mmv_split_small() || ne11 > mul_mat_vec_max_cols) && plain && std::min(ggml_vk_mmv_good_cols(src0->type, ne11), mul_mat_vec_max_cols) < ne11) {
         uint32_t col0 = 0;
         while (col0 < ne11) {
             const uint32_t n = std::min(ggml_vk_mmv_good_cols(src0->type, ne11 - col0), mul_mat_vec_max_cols);
