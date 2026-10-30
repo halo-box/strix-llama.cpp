@@ -18963,15 +18963,16 @@ static void ggml_vk_gdn_conv_fold_prepass(ggml_backend_vk_context * ctx, const g
                 ok = false;
             }
         }
-        // x and the conv state are read at the GDN, later than the conv: nothing in between may overwrite them, and the GDN
-        // output may not alias them
+        // x, the conv state and the taps are read at the GDN, later than the conv: nothing in between may overwrite them, and
+        // the GDN output may not alias them
         for (int n = m.conv_idx + 1; n <= gi && ok; ++n) {
             const ggml_tensor * t = cgraph->nodes[n];
             if (t->buffer == nullptr || t->op == GGML_OP_NONE || ggml_op_is_empty(t->op) || ggml_is_empty(t) ||
                 ctx->gdn_qk_skip.count(t)) {
                 continue;
             }
-            if (ggml_vk_tensors_overlap(t, m.x, false) || ggml_vk_tensors_overlap(t, m.state, false)) {
+            if (ggml_vk_tensors_overlap(t, m.x, false) || ggml_vk_tensors_overlap(t, m.state, false) ||
+                ggml_vk_tensors_overlap(t, m.kern, false)) {
                 ok = false;
             }
         }
@@ -20311,7 +20312,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             ggml_tensor * g = graph->nodes[i];
             ggml_backend_vk_context::ssm_conv_direct_match m;
             if (g->op == GGML_OP_GATED_DELTA_NET && ggml_vk_gdn_conv_fold_structural(ctx, graph, idx, g, false, m) >= 0) {
-                for (const ggml_tensor * input : { m.x, m.state }) {
+                // the taps too: a computed (non-weight) taps tensor would otherwise be freed after the skipped SSM_CONV
+                for (const ggml_tensor * input : { m.x, m.state, m.kern }) {
                     auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
                     params->add_alloc_dep(params->user_data, root, g);
                 }
