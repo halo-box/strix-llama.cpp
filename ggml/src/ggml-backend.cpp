@@ -1995,7 +1995,16 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
-static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
+// A split input that needs a blocking read from another backend: with get_tensor_async (e.g. RPC) the reads of one
+// split are issued together and waited for once, so a remote backend costs one round trip per split, not one per input.
+struct ggml_backend_sched_deferred_copy {
+    ggml_backend_t       backend;
+    struct ggml_tensor * src;
+    struct ggml_tensor * dst;
+};
+
+static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input,
+                                          std::vector<ggml_backend_sched_deferred_copy> * deferred = nullptr) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
@@ -2033,6 +2042,11 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ggml_san_cpy_async(input_backend, split_backend, input, input_cpy);
         }
     }
+    if (!cpy_async_ok && deferred != nullptr && input_backend->iface.get_tensor_async != NULL &&
+        !ggml_backend_buffer_is_host(input->buffer) && getenv("GGML_SCHED_NO_BATCH_COPY") == nullptr) {
+        deferred->push_back({ input_backend, input, input_cpy });
+        return;
+    }
     if (!cpy_async_ok) {
         ggml_backend_synchronize(input_backend);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2069,9 +2083,47 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
+        std::vector<ggml_backend_sched_deferred_copy> deferred;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (!ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
-                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
+                ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], &deferred);
+            }
+        }
+        if (!deferred.empty()) {
+            // issue every read, wait once per source backend, then write; inputs that alias the same bytes are read once
+            std::vector<std::vector<uint8_t>> data(deferred.size());
+            std::vector<int> same_as(deferred.size(), -1);
+            for (size_t i = 0; i < deferred.size(); i++) {
+                const ggml_backend_sched_deferred_copy & c = deferred[i];
+                for (size_t j = 0; j < i; j++) {
+                    if (deferred[j].src->buffer == c.src->buffer && deferred[j].src->data == c.src->data &&
+                        ggml_nbytes(deferred[j].src) == ggml_nbytes(c.src)) {
+                        same_as[i] = (int) j;
+                        break;
+                    }
+                }
+                if (same_as[i] < 0) {
+                    data[i].resize(ggml_nbytes(c.src));
+                    ggml_backend_tensor_get_async(c.backend, c.src, data[i].data(), 0, data[i].size());
+                }
+            }
+            for (size_t i = 0; i < deferred.size(); i++) {
+                bool seen = false;
+                for (size_t j = 0; j < i && !seen; j++) {
+                    seen = deferred[j].backend == deferred[i].backend;
+                }
+                if (!seen) {
+                    ggml_backend_synchronize(deferred[i].backend);
+                }
+            }
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(split_backend);
+            }
+            for (size_t i = 0; i < deferred.size(); i++) {
+                const std::vector<uint8_t> & d = data[same_as[i] < 0 ? i : (size_t) same_as[i]];
+                ggml_backend_tensor_set(deferred[i].dst, d.data(), 0, d.size());
             }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
