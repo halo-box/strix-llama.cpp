@@ -8313,7 +8313,10 @@ struct test_mul_mat_ragged : public test_case {
         const bool on = e == nullptr || atoi(e) != 0;
         const int64_t tail_max = et ? atoi(et) : 128;
         const bool force = ef != nullptr && atoi(ef) != 0;
-        const int64_t eligible = on && n > 256 && n % 256 != 0 && n % 256 <= tail_max ? 1 : 0;
+        // the split is gated to the register-prefetch path: GGML_VK_MM_PREFETCH=0 must keep every n on one dispatch
+        const char * ep = getenv("GGML_VK_MM_PREFETCH");
+        const bool pf_off = ep != nullptr && atoi(ep) == 0;
+        const int64_t eligible = on && !pf_off && n > 256 && n % 256 != 0 && n % 256 <= tail_max ? 1 : 0;
         const int64_t got = dispatch_census_count(backend, "path:MUL_MAT_RAGGED_SPLIT");
         // a short n_main (few tiles) can take split-k, which keeps the single dispatch even when forced
         if (got > eligible || (force && n >= 512 && got != eligible)) {

@@ -8245,11 +8245,12 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
 
 static uint32_t ggml_vk_hc_w8a8_tile();
 
-// GGML_VK_RAGGED_XL (default 1, =0 off): a dense GEMM whose n is just past a 256 multiple runs the n % 256 tail columns as a second
+// GGML_VK_RAGGED_XL (default 1 on AMD with the prefetch tiles, =0 off): a dense GEMM whose n is just past a 256 multiple runs the n % 256 tail columns as a second
 // dispatch when the wave model below says that is cheaper (ggml_vk_mul_mat_q_f16). GGML_VK_RAGGED_TAIL: largest tail split (default 128).
-static bool ggml_vk_ragged_split_enabled() {
+// The wave model below is fitted to the AMD register-prefetch tiles (gfx1151, RADV), so the split is gated to that path.
+static bool ggml_vk_ragged_split_enabled(const vk_device & device) {
     static const bool on = [] { const char * e = getenv("GGML_VK_RAGGED_XL"); return e ? atoi(e) != 0 : true; }();
-    return on;
+    return on && device->vendor_id == VK_VENDOR_ID_AMD && ggml_vk_mm_prefetch_enabled(device);
 }
 static uint32_t ggml_vk_ragged_tail_max() {
     static const uint32_t v = [] { const char * e = getenv("GGML_VK_RAGGED_TAIL"); return e ? (uint32_t) std::max(atoi(e), 0) : 128u; }();
@@ -8661,7 +8662,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // The two write disjoint columns of D and read the same B, so there is no barrier between them.
     vk_pipeline pipeline_tail = nullptr;
     uint32_t n_main = (uint32_t) ne11;
-    if (ggml_vk_ragged_split_enabled() && !hcm && ne11 > 256 && ne11 % 256 != 0 && ne11 % 256 <= ggml_vk_ragged_tail_max()) {
+    if (ggml_vk_ragged_split_enabled(ctx->device) && !hcm && ne11 > 256 && ne11 % 256 != 0 && ne11 % 256 <= ggml_vk_ragged_tail_max()) {
         const uint32_t nm = (uint32_t) (ne11 - ne11 % 256);
         const uint32_t nt = (uint32_t) ne11 - nm;
         const uint32_t batch = (uint32_t) (ne12 * ne13);
