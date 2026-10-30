@@ -1493,8 +1493,8 @@ struct ggml_backend_vk_context {
     std::vector<ssm_conv_direct_match> ssm_conv_direct_matches;
     int fused_concat_tail {-1};      // current CONCAT writes only its tail (index into ssm_conv_direct_matches)
     int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
-    // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
-    const ggml_tensor * fused_extra_srcs[2] {};
+    // set while the current node is a direct conv or a folded GDN: srcs read outside node->src for the sync tracking
+    const ggml_tensor * fused_extra_srcs[3] {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
