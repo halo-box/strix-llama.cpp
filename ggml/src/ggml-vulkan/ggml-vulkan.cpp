@@ -18870,6 +18870,24 @@ static void ggml_vk_gdn_qk_norm_prepass(ggml_backend_vk_context * ctx, const ggm
             g->src[0] == g->src[1] || !ggml_are_same_shape(q_raw, k_raw) || !ggml_vk_gdn_chunk_ok(ctx, g, q_raw, k_raw)) {
             continue;
         }
+        // the GDN reads q_raw / k_raw, later than the norms that are their last graph readers: nothing from the first norm through
+        // the GDN may overwrite them, and the GDN output may not alias them (graph_optimize keeps them allocated through the GDN,
+        // this is the check that it did). The norms and scales of this GDN are not computed, so they write nothing.
+        const ggml_tensor * own[4] = { g->src[0], g->src[0]->src[0], g->src[1], g->src[1]->src[0] };
+        bool ok = q_raw->buffer != nullptr && k_raw->buffer != nullptr;
+        for (int n = std::min(idx[own[1]], idx[own[3]]); n <= i && ok; ++n) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            if (t->buffer == nullptr || t->op == GGML_OP_NONE || ggml_op_is_empty(t->op) || ggml_is_empty(t) ||
+                std::find(std::begin(own), std::end(own), t) != std::end(own)) {
+                continue;
+            }
+            if (ggml_vk_tensors_overlap(t, q_raw, false) || ggml_vk_tensors_overlap(t, k_raw, false)) {
+                ok = false;
+            }
+        }
+        if (!ok) {
+            continue;
+        }
         ctx->gdn_qk[g] = { q_raw, k_raw, q_eps, q_mul };
         ctx->gdn_qk_skip.insert({ g->src[0], g->src[0]->src[0], g->src[1], g->src[1]->src[0] });
     }
@@ -19458,13 +19476,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         for (int k = 1; k <= ctx->num_additional_fused_ops && !ctx->gdn_qk_skip.empty(); ++k) {
             GGML_ASSERT(!ctx->gdn_qk_skip.count(cgraph->nodes[i + k]));
         }
-        // the conv-folded chunked GDN reads x and the conv state, which are not its srcs (barrier tracking)
-        if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET && !ctx->gdn_cf.empty()) {
+        // the conv-folded chunked GDN reads x, the conv state and the taps, the q/k-norm-folded one the raw q / k, none of which
+        // are its srcs (barrier tracking)
+        if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET && !ctx->gdn_qk.empty()) {
             const auto cf_it = ctx->gdn_cf.find(cgraph->nodes[i]);
+            const auto qk_it = ctx->gdn_qk.find(cgraph->nodes[i]);
             if (cf_it != ctx->gdn_cf.end()) {
                 GGML_ASSERT(ctx->num_additional_fused_ops == 0 && ctx->fused_extra_srcs[0] == nullptr);
                 ctx->fused_extra_srcs[0] = cf_it->second.x;
                 ctx->fused_extra_srcs[1] = cf_it->second.state;
+                ctx->fused_extra_srcs[2] = cf_it->second.kern;
+            } else if (qk_it != ctx->gdn_qk.end()) {
+                GGML_ASSERT(ctx->num_additional_fused_ops == 0 && ctx->fused_extra_srcs[0] == nullptr);
+                ctx->fused_extra_srcs[0] = qk_it->second.q_raw;
+                ctx->fused_extra_srcs[1] = qk_it->second.k_raw;
             }
         }
         GGML_ASSERT(ctx->num_additional_fused_ops < (int)(sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0])));
@@ -20297,6 +20322,28 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     // Replace the graph with the new order.
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
+    }
+
+    // q/k l2 norms folded into the chunked GDN (ggml_vk_gdn_qk_norm_prepass): the raw q / k are read at the GDN, after the skipped
+    // norms that are their last graph readers; keep them allocated through it (the prepass re-checks the addresses). Shape-only
+    // match: a GDN the prepass declines only holds them a little longer.
+    if (ggml_vk_gdn_qk_norm_enabled() && !ctx->device->disable_fusion && ctx->device->pipeline_gdn_chunk_prep != nullptr &&
+        params && params->add_alloc_dep) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * g = graph->nodes[i];
+            if (g->op != GGML_OP_GATED_DELTA_NET || g->src[2]->ne[2] < ggml_vk_gdn_chunk_min) {
+                continue;
+            }
+            for (int s = 0; s < 2; ++s) {
+                const ggml_tensor * sc = g->src[s];
+                if (sc == nullptr || sc->op != GGML_OP_SCALE || sc->src[0] == nullptr || sc->src[0]->op != GGML_OP_RMS_NORM ||
+                    sc->src[0]->src[0] == nullptr) {
+                    continue;
+                }
+                const ggml_tensor * raw = sc->src[0]->src[0];
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(raw->view_src ? raw->view_src : raw), g);
+            }
+        }
     }
 
     // conv-folded chunked GDN (ggml_vk_gdn_conv_fold_prepass): x and the conv state are read at the GDN; keep them allocated
