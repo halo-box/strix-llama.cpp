@@ -6363,6 +6363,78 @@ struct test_gdn_conv_prefill : public test_case {
     }
 };
 
+// GDN_QK_ROOT: the chunked GDN with its q/k l2 norms folded (Vulkan ggml_vk_gdn_qk_norm_prepass) reads the raw q / k after the
+// norms, their last graph readers. Here q / k are views of a computed tensor that v does not share, so nothing else keeps it
+// allocated through the GDN, and a same-size allocation after the norms can take its memory unless the backend keeps it alive.
+// GGML_VK_TEST_REQUIRE_GDN_QKNORM=1: the fold must engage (one GDN_QK_NORM dispatch from 64 tokens up).
+struct test_gdn_qk_root : public test_case {
+    const int n_tokens;
+    const int n_k_heads;
+    const int n_v_heads;
+    test_gdn_qk_root(int n_tokens, int n_k_heads, int n_v_heads)
+        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads) {}
+    std::string op_desc(ggml_tensor *) override { return "GDN_QK_ROOT"; }
+    std::string vars() override { return VARS_TO_STR3(n_tokens, n_k_heads, n_v_heads); }
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_QKNORM") && env_knob_on("GGML_VK_GDN_CHUNK")) {
+            const int64_t want = n_tokens >= 64 ? 1 : 0;
+            const int64_t n = dispatch_census_count(backend, "path:GDN_QK_NORM");
+            if (n != want) {
+                msg = "GDN_QK_NORM dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+                return false;
+            }
+        }
+        return true;
+    }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    double max_nmse_err() override { return 2e-5; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) continue;
+            if (strcmp(t->name, "gate") == 0)       init_tensor_uniform(t, -3.0f, -0.5f);
+            else if (strcmp(t->name, "beta") == 0)  init_tensor_uniform(t, 0.0f, 0.5f);
+            else if (strcmp(t->name, "state") == 0) init_tensor_uniform(t, -0.01f, 0.01f);
+            else                                    init_tensor_uniform(t, -0.25f, 0.25f);
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int CK = 128 * 2 * n_k_heads;
+        ggml_tensor * qk_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, CK, n_tokens, 1);
+        ggml_set_name(qk_src, "qk_src");
+        ggml_tensor * qk = ggml_scale(ctx, qk_src, 0.5f); // an allocatable intermediate, read only through the q / k views
+        ggml_tensor * v_src = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, n_v_heads, n_tokens, 1);
+        ggml_set_name(v_src, "v_src");
+        ggml_tensor * v = ggml_scale(ctx, v_src, 0.5f);   // a different root
+        auto view = [&](int offset) {
+            return ggml_view_4d(ctx, qk, 128, n_k_heads, n_tokens, 1, 128 * sizeof(float), (size_t) CK * sizeof(float),
+                                (size_t) CK * n_tokens * sizeof(float), (size_t) offset * sizeof(float));
+        };
+        const float eps = 1e-6f;
+        ggml_tensor * q = ggml_scale(ctx, ggml_rms_norm(ctx, view(0), eps / 128), 1.0f / sqrtf(128.0f));
+        ggml_tensor * k = ggml_scale(ctx, ggml_rms_norm(ctx, view(128 * n_k_heads), eps / 128), 1.0f / sqrtf(128.0f));
+        if (gf) {
+            ggml_build_forward_expand(gf, v);
+            ggml_build_forward_expand(gf, q);
+            ggml_build_forward_expand(gf, k);
+        }
+        // a same-size allocation after the norms (qk's last graph readers) and before the GDN
+        ggml_tensor * scratch = ggml_scale(ctx, qk_src, 0.25f);
+        if (gf) ggml_build_forward_expand(gf, scratch);
+
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, n_tokens, 1);
+        ggml_set_name(g, "gate");
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, n_v_heads, n_tokens, 1);
+        ggml_set_name(beta, "beta");
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, n_v_heads, 1);
+        ggml_set_name(state, "state");
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -15858,6 +15930,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_conv_prefill(65, 2, 4));
     test_cases.emplace_back(new test_gdn_conv_prefill(128, 2, 6));
     test_cases.emplace_back(new test_gdn_conv_prefill(96, 2, 4, 2));
+    test_cases.emplace_back(new test_gdn_qk_root(256, 2, 4));
+    test_cases.emplace_back(new test_gdn_qk_root(2048, 4, 8));
     test_cases.emplace_back(new test_gdn_conv_prefill(128, 4, 16, 2));   // 32 value-head sequences: folds by default
     test_cases.emplace_back(new test_gdn_conv_prefill(256, 16, 16));     // Qwen3.5-2B heads: no fold by default
     test_cases.emplace_back(new test_gdn_conv_prefill(64, 2, 4, 2));    // two sequences at the chunk threshold
