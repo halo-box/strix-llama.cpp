@@ -4847,7 +4847,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gdn_seq_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
         }
@@ -14629,6 +14629,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         if (ctx->prealloc_split_k_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
         }
+        GGML_ASSERT(ctx->fused_gdn_direct < 0);   // the direct state write match excludes the chunk form
         vk_subbuffer scr_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
         vk_op_gdn_chunk_push_constants cpc = { pc, nch, qkn ? 1u : 0u, qkn ? qkn->eps : 0.0f, qkn ? qkn->mul : 1.0f, 0, 0, 0, 0, 0 };
         if (qkn) {
@@ -14663,9 +14664,21 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         return;
     }
 
+    // direct state write (GGML_VK_GDN_ROLLBACK): the states go straight into the elided CPY's cache rows
+    vk_op_gdn_seq_push_constants spc = { pc, 0, 0, 0 };
+    vk_subbuffer st_buf = dst_buf;
+    if (ctx->fused_gdn_direct >= 0) {
+        const ggml_tensor * cpy = ctx->gdn_direct_matches[ctx->fused_gdn_direct].cpy;
+        GGML_ASSERT(ctx->gdn_direct_matches[ctx->fused_gdn_direct].gdn == dst);
+        st_buf = ggml_vk_tensor_subbuffer(ctx, cpy);
+        spc.st_seq    = (uint32_t) (cpy->nb[1] / sizeof(float));
+        spc.st_slot   = (uint32_t) (cpy->nb[2] / sizeof(float));
+        spc.st_direct = 1;
+    }
+
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
-        pc, { H, n_seqs, S_v });
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, st_buf},
+        spc, { H, n_seqs, S_v });
 }
 
 static void ggml_vk_lightning_indexer_cm(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, vk_pipeline pipeline) {
@@ -16928,416 +16941,7 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     }
 }
 
-// Decode weight prefetch (experimental, off by default; GGML_VK_DECODE_PREFETCH=1 enables). In a decode graph, a small "touch"
-// dispatch (one load per 128-byte line, no stores) runs beside the ops of a barrier group that reads no big weights and loads the
-// next dense mat-vec's next weight bytes, so that mat-vec finds them in L2 / the memory-attached last-level cache. Reads only: no
-// barrier changes, no numeric change.
-// Measured on a 32 MB last-level cache part: each cached MB saves ~3.4 us of mat-vec time, but the decode glue groups are short
-// (2.5-7 us, about 2 us of it launch and barrier) and a touch lengthens them by about what it saves; groups led by recurrence or
-// attention stream memory themselves and slow down. Net decode gain measured ~0, so the switch stays off.
-// Knobs: _KB / _WG slice and workgroups for an ordinary small-op group (default 0 = none, 1); _LONG_OPS bitmask (2 = gated delta net,
-// 4 = decode attention; default 0) with _LONG_KB / _LONG_WG (3072, 1); _SMALLW_MB / _SMALLW_KB: groups
-// whose dense mat-vecs are all under _SMALLW_MB also get a touch (default 0 = off, 512); _MAX_MB caps touched-but-unread bytes (24).
-struct vk_decode_prefetch_cfg {
-    bool on;
-    size_t slice, slice_long, smallw, slice_smallw;
-    uint32_t wgs, wgs_long, long_ops;
-    size_t max_bytes;
-};
-
-static const vk_decode_prefetch_cfg & ggml_vk_decode_prefetch_cfg() {
-    static const vk_decode_prefetch_cfg cfg = [] {
-        auto env = [](const char * k, long d) { const char * e = getenv(k); return e != nullptr ? atol(e) : d; };
-        vk_decode_prefetch_cfg c;
-        c.on         = env("GGML_VK_DECODE_PREFETCH", 0) != 0;
-        c.slice      = (size_t) std::max(0L, env("GGML_VK_DECODE_PREFETCH_KB", 0)) * 1024;
-        c.slice_long = (size_t) std::max(0L, env("GGML_VK_DECODE_PREFETCH_LONG_KB", 3072)) * 1024;
-        c.wgs        = (uint32_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_WG", 1));
-        c.wgs_long   = (uint32_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_LONG_WG", 1));
-        c.long_ops   = (uint32_t) std::max(0L, env("GGML_VK_DECODE_PREFETCH_LONG_OPS", 0));
-        c.max_bytes  = (size_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_MAX_MB", 24)) * 1024 * 1024;
-        c.smallw       = (size_t) std::max(0L, env("GGML_VK_DECODE_PREFETCH_SMALLW_MB", 0)) * 1024 * 1024;
-        c.slice_smallw = (size_t) std::max(0L, env("GGML_VK_DECODE_PREFETCH_SMALLW_KB", 512)) * 1024;
-        return c;
-    }();
-    return cfg;
-}
-
-// 0: not a weight mat-vec, 1: dense weight mat-vec worth prefetching, 2: other weight read (expert mat-vec, small weights)
-static int ggml_vk_pf_weight_kind(const ggml_tensor * n) {
-    if (n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID) {
-        return 0;
-    }
-    const ggml_tensor * w = n->src[0];
-    if (w->buffer == nullptr || ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-        return 0;
-    }
-    if (n->op == GGML_OP_MUL_MAT_ID || ggml_nbytes(w) < 1024 * 1024) {
-        return 2;
-    }
-    return 1;
-}
-
-// per graph: is this a decode graph (every weight mat-vec has one token), and the next dense target after each node
-static void ggml_vk_decode_prefetch_plan(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
-    ctx->pf_active = false;
-    ctx->pf_group_weight = false;
-    ctx->pf_group_touched = false;
-    if (!ggml_vk_decode_prefetch_cfg().on) {
-        return;
-    }
-    bool any_dense = false;
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * n = cgraph->nodes[i];
-        const int k = ggml_vk_pf_weight_kind(n);
-        if (k == 0) {
-            continue;
-        }
-        const int64_t ntok = n->op == GGML_OP_MUL_MAT ? n->src[1]->ne[1] * n->src[1]->ne[2] * n->src[1]->ne[3] : n->src[2]->ne[1];
-        if (ntok != 1) {
-            return;
-        }
-        any_dense |= k == 1;
-    }
-    if (!any_dense) {
-        return;
-    }
-    ctx->pf_next.assign(cgraph->n_nodes, -1);
-    ctx->pf_touched.assign(cgraph->n_nodes, 0);
-    ctx->pf_inflight = 0;
-    int32_t next = -1;
-    for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
-        ctx->pf_next[i] = next;
-        const int k = ggml_vk_pf_weight_kind(cgraph->nodes[i]);
-        if (k == 1) {
-            next = i;
-        } else if (k == 2 && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
-            // an expert mat-vec streams more than the cache holds before the next dense target: nothing to gain across it
-            next = -1;
-        }
-    }
-    ctx->pf_active = true;
-}
-
-// after a node's dispatches: in a group with no big weight read yet, touch the next untouched bytes of the next dense mat-vecs
-// (continuing into the following ones up to an expert mat-vec), keeping touched-but-unread bytes under the cache budget
-static void ggml_vk_decode_prefetch(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
-    const vk_decode_prefetch_cfg & cfg = ggml_vk_decode_prefetch_cfg();
-    const int last = node_idx + ctx->num_additional_fused_ops;
-    bool smallw = false;
-    for (int i = node_idx; i <= last; ++i) {
-        // a big dense mat-vec or an expert mat-vec saturates DRAM itself; small weights (hc, router twins) do not
-        const int k = ggml_vk_pf_weight_kind(cgraph->nodes[i]);
-        if (k == 1) {
-            ctx->pf_inflight -= std::min(ctx->pf_inflight, ctx->pf_touched[i]);
-            if (ggml_nbytes(cgraph->nodes[i]->src[0]) < cfg.smallw) {
-                smallw = true;
-                continue;
-            }
-        }
-        if (k == 1 || (k == 2 && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID)) {
-            ctx->pf_group_weight = true;
-        }
-    }
-    if (ctx->pf_group_weight || ctx->pf_group_touched) {
-        return;
-    }
-    const ggml_op op = cgraph->nodes[node_idx]->op;
-    const bool is_long = ((cfg.long_ops & 2) && op == GGML_OP_GATED_DELTA_NET) ||
-                         ((cfg.long_ops & 4) && op == GGML_OP_FLASH_ATTN_EXT);
-    size_t budget = is_long ? cfg.slice_long : smallw ? cfg.slice_smallw : cfg.slice;
-    const uint32_t wgs = is_long ? cfg.wgs_long : cfg.wgs;
-    for (int32_t t = ctx->pf_next[last]; t >= 0 && budget >= 128 && ctx->pf_inflight + 128 <= cfg.max_bytes; t = ctx->pf_next[t]) {
-        const ggml_tensor * w = cgraph->nodes[t]->src[0];
-        const size_t nb = ggml_nbytes(w);
-        const size_t take = std::min({ nb - std::min(nb, ctx->pf_touched[t]), budget, cfg.max_bytes - ctx->pf_inflight }) / 128 * 128;
-        if (take > 0) {
-            vk_subbuffer sb = ggml_vk_tensor_subbuffer(ctx, w, true);
-            const size_t misalign = sb.size - nb;
-            const vk_op_decode_prefetch_push_constants pc = { (uint32_t) ((misalign + ctx->pf_touched[t]) / 4), (uint32_t) (take / 128), 128 / 4, 0 };
-            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_decode_prefetch, 1);
-            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_decode_prefetch, { sb }, pc, { wgs * 256, 1, 1 });
-            ctx->pf_touched[t] += take;
-            ctx->pf_inflight += take;
-            budget -= take;
-            ctx->pf_group_touched = true;
-            ggml_vk_path_census_add("DECODE_PREFETCH");
-        }
-        if (ctx->pf_touched[t] + 128 <= nb) {
-            break;  // budget or cache room ran out inside this target
-        }
-    }
-}
-
-// Decode weight prefetch from a second compute queue (GGML_VK_DECODE_PREFETCH_Q). The in-group touch above lengthens the glue
-// group it shares; this form keeps the touch out of the main queue. One persistent dispatch per decode graph runs on its own
-// VkQueue (decode_prefetch_q.comp) and follows a phase word that the main queue writes with buffer markers: "window open for
-// target t" at the first barrier after a weight group, "target t starts" right before the next weight read, "graph done" at the end.
-// While a window is open the side dispatch reads the target's weights from their start into the last-level cache. Reads only:
-// no numeric change, no barrier change on the main queue (2 markers per window).
-
-static bool ggml_vk_prefetch_q_weight_read(const ggml_tensor * n) {
-    const int k = ggml_vk_pf_weight_kind(n);
-    return k == 1 || (k == 2 && n->op == GGML_OP_MUL_MAT_ID);
-}
-
-static void ggml_vk_prefetch_q_marker(ggml_backend_vk_context * ctx, vk_context & subctx, uint32_t phase) {
-    const uint32_t v = (ctx->prefetch_q_epoch << 16) | phase;
-    ctx->device->pfn_vkCmdWriteBufferMarkerAMD(static_cast<VkCommandBuffer>(subctx->s->buffer->buf), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                               static_cast<VkBuffer>(ctx->prefetch_q_flag->buffer), 0, v);
-}
-
-static constexpr uint32_t DECODE_PREFETCH_Q_MAX_TARGETS = 32000;
-
-static void ggml_vk_prefetch_q_quiesce(void * c);
-static bool ggml_vk_prefetch_q_init(ggml_backend_vk_context * ctx) {
-    if (ctx->prefetch_q_init_done) {
-        return ctx->prefetch_q_ok;
-    }
-    ctx->prefetch_q_init_done = true;
-    vk_device & dev = ctx->device;
-    if (!dev->prefetch_queue || !dev->buffer_marker || !dev->buffer_device_address || !dev->pipeline_decode_prefetch_q) {
-        return false;
-    }
-    vk_pipeline & pl = dev->pipeline_decode_prefetch_q;
-    if (!pl->compiled) {
-        ggml_vk_load_shaders(dev, pl);
-    }
-    try {
-        const vk::MemoryPropertyFlags host = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
-        ctx->prefetch_q_flag = ggml_vk_create_buffer_check(dev, 256, host);
-        memset(ctx->prefetch_q_flag->ptr, 0, 256);
-        ctx->prefetch_q_pool = dev->device.createCommandPool({ vk::CommandPoolCreateFlagBits::eResetCommandBuffer, dev->prefetch_queue->queue_family_index });
-        vk::DescriptorPoolSize ps(vk::DescriptorType::eStorageBuffer, 2 * MAX_PARAMETER_COUNT);
-        ctx->prefetch_q_dpool = dev->device.createDescriptorPool({ {}, 2, 1, &ps });
-        auto cbs = dev->device.allocateCommandBuffers({ ctx->prefetch_q_pool, vk::CommandBufferLevel::ePrimary, 2 });
-        for (uint32_t i = 0; i < 2; ++i) {
-            auto & sl = ctx->prefetch_q_slots[i];
-            sl.plan = ggml_vk_create_buffer_check(dev, 16 * (1 + DECODE_PREFETCH_Q_MAX_TARGETS), host);
-            sl.cb = cbs[i];
-            sl.fence = dev->device.createFence({});
-            sl.ds = dev->device.allocateDescriptorSets({ ctx->prefetch_q_dpool, 1, &dev->dsl })[0];
-            std::vector<vk::DescriptorBufferInfo> bi(MAX_PARAMETER_COUNT, vk::DescriptorBufferInfo(ctx->prefetch_q_flag->buffer, 0, VK_WHOLE_SIZE));
-            bi[1] = vk::DescriptorBufferInfo(sl.plan->buffer, 0, VK_WHOLE_SIZE);
-            std::vector<vk::WriteDescriptorSet> wr;
-            for (uint32_t b = 0; b < MAX_PARAMETER_COUNT; ++b) {
-                wr.push_back(vk::WriteDescriptorSet(sl.ds, b, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &bi[b]));
-            }
-            dev->device.updateDescriptorSets(wr, {});
-            // recorded once: the plan buffer carries everything that changes per graph
-            sl.cb.begin(vk::CommandBufferBeginInfo{});
-            sl.cb.bindPipeline(vk::PipelineBindPoint::eCompute, pl->pipeline);
-            sl.cb.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pl->layout, 0, { sl.ds }, {});
-            const vk_op_decode_prefetch_push_constants pc {};
-            sl.cb.pushConstants(pl->layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), &pc);
-            sl.cb.dispatch(ggml_vk_prefetch_q_cfg().wgs, 1, 1);
-            sl.cb.end();
-        }
-    } catch (const vk::SystemError & e) {
-        GGML_LOG_WARN("ggml_vulkan: decode prefetch queue disabled: %s\n", e.what());
-        return false;
-    }
-    ctx->prefetch_q_ok = true;
-    dev->prefetch_q_quiesce_ctx = ctx;
-    dev->prefetch_q_quiesce = ggml_vk_prefetch_q_quiesce;
-    return true;
-}
-
-static void ggml_vk_prefetch_q_destroy(ggml_backend_vk_context * ctx) {
-    if (!ctx->prefetch_q_init_done) {
-        return;
-    }
-    vk_device & dev = ctx->device;
-    if (dev->prefetch_q_quiesce_ctx == ctx) {
-        dev->prefetch_q_quiesce = nullptr;
-        dev->prefetch_q_quiesce_ctx = nullptr;
-    }
-    for (auto & sl : ctx->prefetch_q_slots) {
-        if (sl.pending) {
-            if (ctx->prefetch_q_flag && ctx->prefetch_q_flag->ptr) {
-                ((volatile uint32_t *) ctx->prefetch_q_flag->ptr)[0] = (sl.epoch << 16) | 0xffffu;
-            }
-            (void) dev->device.waitForFences({ sl.fence }, true, 2000ull * 1000 * 1000);
-            sl.pending = false;
-        }
-        if (sl.fence) {
-            dev->device.destroyFence(sl.fence);
-            sl.fence = nullptr;
-        }
-        ggml_vk_destroy_buffer(sl.plan);
-    }
-    if (ctx->prefetch_q_dpool) {
-        dev->device.destroyDescriptorPool(ctx->prefetch_q_dpool);
-        ctx->prefetch_q_dpool = nullptr;
-    }
-    if (ctx->prefetch_q_pool) {
-        dev->device.destroyCommandPool(ctx->prefetch_q_pool);
-        ctx->prefetch_q_pool = nullptr;
-    }
-    ggml_vk_destroy_buffer(ctx->prefetch_q_flag);
-    ctx->prefetch_q_init_done = false;
-    ctx->prefetch_q_ok = false;
-}
-
-// per graph: decode graphs only (every weight mat-vec has one token); the dense targets, their addresses and the side dispatch
-// ends the current graph's prefetch from the host: the side dispatch sees the end phase and leaves, the rest of the graph records no
-// markers. Called before a host wait on the device (mid-graph synchronize) and before device memory is created or freed.
-static void ggml_vk_prefetch_q_quiesce(void * c) {
-    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) c;
-    static const bool enabled = getenv("GGML_VK_DECODE_PREFETCH_Q_QUIESCE") == nullptr || atoi(getenv("GGML_VK_DECODE_PREFETCH_Q_QUIESCE")) != 0;
-    if (enabled && ctx->prefetch_q_active) {
-        ((volatile uint32_t *) ctx->prefetch_q_flag->ptr)[0] = (ctx->prefetch_q_epoch << 16) | 0xffffu;
-        ctx->prefetch_q_active = false;
-    }
-}
-
-static void ggml_vk_prefetch_q_plan(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
-    ctx->prefetch_q_active = false;
-    ctx->prefetch_q_open = -1;
-    ctx->prefetch_q_after_weight = true;
-    const vk_prefetch_q_cfg & cfg = ggml_vk_prefetch_q_cfg();
-    static const bool log = getenv("GGML_VK_DECODE_PREFETCH_Q_LOG") != nullptr && atoi(getenv("GGML_VK_DECODE_PREFETCH_Q_LOG")) != 0;
-    if (log && !ctx->prefetch_q_init_done && ctx->prefetch_q_epoch == 0) {
-        GGML_LOG_INFO("ggml_vulkan: decode prefetch q: on %d, queue %d, markers %d, bda %d\n", (int) cfg.on, ctx->device->prefetch_queue != nullptr,
-                      (int) ctx->device->buffer_marker, (int) ctx->device->buffer_device_address);
-    }
-    if (!cfg.on || !ctx->device->prefetch_queue) {
-        return;
-    }
-    bool any_dense = false;
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * n = cgraph->nodes[i];
-        const int k = ggml_vk_pf_weight_kind(n);
-        if (k == 0) {
-            continue;
-        }
-        const int64_t ntok = n->op == GGML_OP_MUL_MAT ? n->src[1]->ne[1] * n->src[1]->ne[2] * n->src[1]->ne[3] : n->src[2]->ne[1];
-        if (ntok != 1) {
-            return;
-        }
-        any_dense |= k == 1;
-    }
-    if (!any_dense || !ggml_vk_prefetch_q_init(ctx)) {
-        return;
-    }
-    // diagnostic: queue, markers and side resources exist, but no side dispatch and no markers
-    static const bool dry = getenv("GGML_VK_DECODE_PREFETCH_Q_DRY") != nullptr && atoi(getenv("GGML_VK_DECODE_PREFETCH_Q_DRY")) != 0;
-    if (dry) {
-        return;
-    }
-    vk_device & dev = ctx->device;
-    auto & sl = ctx->prefetch_q_slots[ctx->prefetch_q_slot_idx];
-    if (sl.pending) {
-        if (dev->device.getFenceStatus(sl.fence) != vk::Result::eSuccess) {
-            // its graph never wrote the end marker (or is still running): release the side dispatch from the host
-            ((volatile uint32_t *) ctx->prefetch_q_flag->ptr)[0] = (sl.epoch << 16) | 0xffffu;
-            if (dev->device.waitForFences({ sl.fence }, true, 2000ull * 1000 * 1000) != vk::Result::eSuccess) {
-                GGML_LOG_WARN("ggml_vulkan: decode prefetch side dispatch did not finish; prefetch queue disabled\n");
-                ctx->prefetch_q_ok = false;
-                return;
-            }
-        }
-        dev->device.resetFences({ sl.fence });
-        sl.pending = false;
-    }
-    {
-        // engagement log (GGML_VK_DECODE_PREFETCH_Q_LOG=1): side dispatch counters since the last report, every 16 graphs
-        volatile uint32_t * f = (volatile uint32_t *) ctx->prefetch_q_flag->ptr;
-        if (log && ctx->prefetch_q_epoch % 16 == 0 && ctx->prefetch_q_epoch > 0) {
-            GGML_LOG_INFO("ggml_vulkan: decode prefetch q: epoch %u: windows %u, touched %.1f MB, timed-out workgroups %u (since last report)\n",
-                          ctx->prefetch_q_epoch, f[8], f[9] * 256.0 * 128.0 * ggml_vk_prefetch_q_cfg().chunk / 1e6, f[10]);
-            f[8] = 0; f[9] = 0; f[10] = 0;
-        }
-    }
-    ctx->prefetch_q_epoch = ctx->prefetch_q_epoch % 0xfffeu + 1;
-    ctx->prefetch_q_target.assign(cgraph->n_nodes, -1);
-    ctx->prefetch_q_next.assign(cgraph->n_nodes, -1);
-    uint32_t * plan = (uint32_t *) sl.plan->ptr;
-    uint32_t nt = 0;
-    for (int i = 0; i < cgraph->n_nodes && nt < DECODE_PREFETCH_Q_MAX_TARGETS; ++i) {
-        const ggml_tensor * n = cgraph->nodes[i];
-        if (ggml_vk_pf_weight_kind(n) != 1) {
-            continue;
-        }
-        const ggml_tensor * w = n->src[0];
-        if (!ggml_backend_buffer_is_vk(w->buffer)) {
-            continue;
-        }
-        const vk_buffer & b = ((ggml_backend_vk_buffer_context *) w->buffer->context)->dev_buffer;
-        const uint64_t addr = b->bda_addr + vk_tensor_offset(w) + w->view_offs;
-        const size_t lines = std::min(ggml_nbytes(w), cfg.max_bytes) / 128;
-        if (b->bda_addr == 0 || (addr & 3) != 0 || lines == 0) {
-            continue;
-        }
-        uint32_t * e = plan + 4 * (1 + nt);
-        e[0] = (uint32_t) addr;
-        e[1] = (uint32_t) (addr >> 32);
-        e[2] = (uint32_t) lines;
-        e[3] = 0;
-        ctx->prefetch_q_target[i] = (int32_t) nt++;
-    }
-    if (nt == 0) {
-        return;
-    }
-    int32_t next = -1;
-    for (int i = cgraph->n_nodes - 1; i >= 0; --i) {
-        const ggml_tensor * n = cgraph->nodes[i];
-        if (ctx->prefetch_q_target[i] >= 0) {
-            next = ctx->prefetch_q_target[i];
-        } else if (n->op == GGML_OP_MUL_MAT_ID && ggml_vk_pf_weight_kind(n) == 2) {
-            next = -1;  // the expert mat-vecs stream more than the cache holds before the next dense target
-        }
-        ctx->prefetch_q_next[i] = next;
-    }
-    plan[0] = ctx->prefetch_q_epoch;
-    plan[1] = nt;
-    plan[2] = cfg.polls;
-    plan[3] = cfg.chunk;
-    vk::SubmitInfo si(0, nullptr, nullptr, 1, &sl.cb);
-    dev->prefetch_queue->handle->submit({ si }, sl.fence);
-    sl.pending = true;
-    sl.epoch = ctx->prefetch_q_epoch;
-    ctx->prefetch_q_slot_idx ^= 1;
-    ctx->prefetch_q_active = true;
-}
-
-// at a barrier: a group without weight reads after a weight group opens the window of the next dense target
-static void ggml_vk_prefetch_q_barrier(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
-    if (!ctx->prefetch_q_after_weight || ctx->prefetch_q_open >= 0) {
-        return;
-    }
-    const int last = node_idx + ctx->num_additional_fused_ops;
-    for (int i = node_idx; i <= last; ++i) {
-        if (ggml_vk_prefetch_q_weight_read(cgraph->nodes[i])) {
-            return;
-        }
-    }
-    const int32_t t = ctx->prefetch_q_next[node_idx];
-    if (t < 0) {
-        return;
-    }
-    ggml_vk_prefetch_q_marker(ctx, subctx, 2u * (uint32_t) t + 1u);
-    ggml_vk_path_census_add("DECODE_PREFETCH_Q");
-    ctx->prefetch_q_open = t;
-    ctx->prefetch_q_after_weight = false;
-}
-
-// before a node's dispatches: a weight read closes the open window
-static void ggml_vk_prefetch_q_node(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_cgraph * cgraph, int node_idx) {
-    const int last = node_idx + ctx->num_additional_fused_ops;
-    bool weight = false;
-    for (int i = node_idx; i <= last && !weight; ++i) {
-        weight = ggml_vk_prefetch_q_weight_read(cgraph->nodes[i]);
-    }
-    if (!weight) {
-        return;
-    }
-    if (ctx->prefetch_q_open >= 0) {
-        ggml_vk_prefetch_q_marker(ctx, subctx, 2u * (uint32_t) ctx->prefetch_q_open + 2u);
-        ctx->prefetch_q_open = -1;
-    }
-    ctx->prefetch_q_after_weight = true;
-}
+static bool ggml_vk_gdn_direct_elided(const ggml_backend_vk_context * ctx, const ggml_tensor * node, int node_idx);
 
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
@@ -17350,6 +16954,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     }
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return false;
+    }
+    if (ggml_vk_gdn_direct_elided(ctx, node, node_idx)) {
+        return false; // its GATED_DELTA_NET already wrote these rows
     }
 
     VK_LOG_DEBUG("ggml_vk_build_graph(" << node << ", " << ggml_op_name(node->op) << ")");
@@ -17489,9 +17096,6 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         if (ctx->fused_extra_dst) {
             ctx->unsynced_nodes_written.push_back(ctx->fused_extra_dst);
         }
-    }
-    if (ctx->prefetch_q_active) {
-        ggml_vk_prefetch_q_node(ctx, compute_ctx, cgraph, node_idx);
     }
     if (vk_enable_sync_logger) {
         for (int i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
@@ -20444,6 +20048,144 @@ static bool ggml_vk_ssm_conv_direct_at_conv(ggml_backend_vk_context * ctx, const
     return false;
 }
 
+// GDN direct state write. With speculative rollback slots (K = n_rs_seq + 1 > 1) the GATED_DELTA_NET writes K
+// full states into its output and a CPY then moves them into the recurrent cache rows; with K = 1 the same happens for
+// the final state. Instead the GDN writes the states straight into that CPY's destination rows and the CPY is elided:
+// one write of each state instead of write + read + write. Bit-exact (the states are the same floats, stored once). The
+// graph is unchanged, so other backends and the GGML_VK_GDN_ROLLBACK=0 arm run the same nodes. Decided at the GDN node,
+// consumed at the CPY node. Sequential kernel only (the chunked prefill form keeps the CPY).
+static bool ggml_vk_gdn_direct_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VK_GDN_ROLLBACK");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_vk_gdn_direct_reject(const char * why, int node) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    if (dbg) {
+        GGML_LOG_DEBUG("ggml_vulkan: GDN_STATE_DIRECT not used at node %d: %s\n", node, why);
+    }
+    return false;
+}
+
+static bool ggml_vk_gdn_direct_at_gdn(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i, int last_node) {
+    const ggml_tensor * gdn = cgraph->nodes[i];
+    if (!ggml_vk_gdn_direct_enabled() || gdn->op != GGML_OP_GATED_DELTA_NET) {
+        return false;
+    }
+    if (gdn->type != GGML_TYPE_F32 || !gdn->buffer || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        (gdn->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_is_empty(gdn) || ggml_vk_gdn_use_chunk(ctx, gdn)) {
+        return ggml_vk_gdn_direct_reject("output node, not computed here, unallocated or chunk form", i);
+    }
+    const ggml_tensor * src_v = gdn->src[2];
+    const int64_t S_v       = src_v->ne[0];
+    const int64_t H         = src_v->ne[1];
+    const int64_t n_tokens  = src_v->ne[2];
+    const int64_t n_seqs    = src_v->ne[3];
+    const int64_t K         = ggml_get_op_params_i32(gdn, 0);
+    const int64_t D         = S_v * S_v * H;
+    const int64_t n_written = K > 1 ? std::min<int64_t>(n_tokens, K) : 1;
+    const size_t  s_off     = (size_t) S_v * H * n_tokens * n_seqs * sizeof(float);
+    const size_t  s_end     = ggml_nbytes(gdn);
+
+    // the state region [s_off, s_end) of the GDN output must have exactly one reader: a CPY of all written states
+    int c = -1;
+    for (int n = i + 1; n < cgraph->n_nodes; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (ggml_vk_is_empty(const_cast<ggml_tensor *>(t))) {
+            continue; // views and reshapes read nothing; their readers are checked through view_src
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * r = t->src[s];
+            if (!r || (r != gdn && r->view_src != gdn)) {
+                continue;
+            }
+            const size_t r_beg = r == gdn ? 0 : r->view_offs;
+            const size_t r_end = r_beg + ggml_nbytes(r);
+            if (r_end <= s_off || r_beg >= s_end) {
+                continue; // reads the attention output only
+            }
+            if (t->op != GGML_OP_CPY || s != 0 || c >= 0) {
+                return ggml_vk_gdn_direct_reject("the states have a reader other than one CPY", n);
+            }
+            c = n;
+        }
+    }
+    if (c < 0) {
+        return ggml_vk_gdn_direct_reject("no state CPY in this graph", i);
+    }
+    if (c >= last_node) {
+        return ggml_vk_gdn_direct_reject("the CPY is the last node", c);
+    }
+    const ggml_tensor * cpy = cgraph->nodes[c];
+    const ggml_tensor * src = cpy->src[0];
+    const ggml_tensor * dst = cpy->src[1];
+    // the CPY copies every written state, in the op's layout (contiguous [D, n_seqs, n_written] from s_off) ...
+    if ((cpy->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || !cpy->buffer ||
+        cpy->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) || src->view_offs != s_off ||
+        ggml_nelements(src) != D * n_seqs * n_written) {
+        return ggml_vk_gdn_direct_reject("the CPY does not copy all states in the op layout", c);
+    }
+    // ... into [D, n_seqs, n_written] f32 rows: D contiguous floats per state, no two states overlapping
+    if (!dst || dst->type != GGML_TYPE_F32 || cpy->ne[0] != D || cpy->ne[1] != n_seqs || cpy->ne[2] != n_written ||
+        cpy->ne[3] != 1 || cpy->nb[0] != sizeof(float) || cpy->nb[1] % sizeof(float) != 0 || cpy->nb[2] % sizeof(float) != 0 ||
+        (n_seqs > 1 && cpy->nb[1] < (size_t) D * sizeof(float)) ||
+        (n_written > 1 && cpy->nb[2] < (size_t) n_seqs * cpy->nb[1]) ||
+        ggml_nbytes(cpy) > ctx->device->properties.limits.maxStorageBufferRange ||
+        cpy->nb[2] / sizeof(float) > UINT32_MAX / std::max<int64_t>(1, n_written) || get_misalign_bytes(ctx, cpy) != 0) {
+        return ggml_vk_gdn_direct_reject("cache rows layout", c);
+    }
+    // the GDN reads no part of the rows, except that a K = 1 state may be read from exactly the rows it is written to
+    // (in-place state: each lane rewrites only the elements it read)
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const ggml_tensor * r = gdn->src[s];
+        if (!r || !r->buffer || !ggml_vk_tensors_overlap(r, cpy, false)) {
+            continue;
+        }
+        const bool in_place = s == 5 && K == 1 && !ggml_vk_tensors_overlap(r, cpy, true) && ggml_is_contiguous(r) &&
+                              (n_seqs == 1 || cpy->nb[1] == (size_t) D * sizeof(float));
+        if (!in_place) {
+            return ggml_vk_gdn_direct_reject("a GDN input overlaps the cache rows", i);
+        }
+    }
+    // the rows are written at the GDN now, not at the CPY: nothing in between may read or write them
+    for (int n = i + 1; n < c; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (t->buffer == nullptr || ggml_vk_is_empty(const_cast<ggml_tensor *>(t))) {
+            continue;
+        }
+        if (ggml_vk_tensors_overlap(t, cpy, false)) {
+            return ggml_vk_gdn_direct_reject("the cache rows are written between the GDN and the CPY", n);
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * r = t->src[s];
+            if (r && r->buffer && ggml_vk_tensors_overlap(r, cpy, false)) {
+                return ggml_vk_gdn_direct_reject("the cache rows are read between the GDN and the CPY", n);
+            }
+        }
+    }
+
+    ctx->gdn_direct_matches.push_back({ gdn, cpy, c });
+    ctx->fused_gdn_direct = (int) ctx->gdn_direct_matches.size() - 1;
+    ctx->fused_extra_dst = cpy;
+    return true;
+}
+
+// the CPY whose states the GDN already wrote
+static bool ggml_vk_gdn_direct_elided(const ggml_backend_vk_context * ctx, const ggml_tensor * node, int node_idx) {
+    if (node->op != GGML_OP_CPY) {
+        return false;
+    }
+    for (const auto & m : ctx->gdn_direct_matches) {
+        if (m.cpy_idx == node_idx && m.cpy == node) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -21439,8 +21181,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
     ctx->ssm_conv_direct_matches.clear();
-    ggml_vk_decode_prefetch_plan(ctx, cgraph);
-    ggml_vk_prefetch_q_plan(ctx, cgraph);
+    ctx->gdn_direct_matches.clear();
 
     int last_node = cgraph->n_nodes - 1;
 
@@ -22002,6 +21743,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_extra_srcs[0] = qk_it->second.q_raw;
                 ctx->fused_extra_srcs[1] = qk_it->second.k_raw;
             }
+        if (!ctx->device->disable_fusion && ctx->num_additional_fused_ops == 0 && fusion_string == nullptr &&
+            ggml_vk_gdn_direct_at_gdn(ctx, cgraph, i, last_node)) {
+            fusion_string = "GDN_STATE_DIRECT";
         }
         GGML_ASSERT(ctx->num_additional_fused_ops < (int)(sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0])));
         ctx->fused_ops_write_mask |= 1 << ctx->num_additional_fused_ops;
@@ -22201,7 +21945,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 std::vector<ggml_tensor *> nodes;
                 std::vector<const char *> names;
                 for (int node_idx = prev_node_idx; node_idx < cur_node_idx; ++node_idx) {
-                    if (ggml_op_is_empty(cgraph->nodes[node_idx]->op)) {
+                    if (ggml_op_is_empty(cgraph->nodes[node_idx]->op) ||
+                        ggml_vk_gdn_direct_elided(ctx, cgraph->nodes[node_idx], node_idx)) {
                         continue;
                     }
                     nodes.push_back(cgraph->nodes[node_idx]);

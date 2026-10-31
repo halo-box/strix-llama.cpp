@@ -7157,6 +7157,102 @@ struct test_gdn_decode_rollback : public test_case {
     }
 };
 
+// GDN direct state write (Vulkan GGML_VK_GDN_ROLLBACK): GATED_DELTA_NET + the CPY of its state(s) into recurrent cache
+// rows with gaps between sequences and slots (mem_size). mode 0: separate state input; mode 1: K = 1 with the state read
+// from the very rows it is written to (in-place); mode 2: a node reads the cache rows between the GDN and the CPY (the
+// backend must keep the CPY: that reader sees the old rows).
+struct test_gdn_state_direct : public test_case {
+    const int64_t n_tokens, n_seqs, K, mem_size;
+    const int mode;
+    std::vector<ggml_tensor *> outputs;
+
+    test_gdn_state_direct(int64_t n_tokens, int64_t n_seqs, int64_t K, int64_t mem_size, int mode)
+        : n_tokens(n_tokens), n_seqs(n_seqs), K(K), mem_size(mem_size), mode(mode) {}
+
+    std::string vars() override { return VARS_TO_STR5(n_tokens, n_seqs, K, mem_size, mode); }
+    std::string op_desc(ggml_tensor *) override { return "GDN_STATE_DIRECT"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
+
+    // GGML_VK_TEST_REQUIRE_GDN_STATE_DIRECT=1: one direct GDN per graph while GGML_VK_GDN_ROLLBACK is on, none in mode 2
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_STATE_DIRECT", "GDN_STATE_DIRECT")) {
+            return true;
+        }
+        const int64_t n = dispatch_census_count(backend, "GDN_STATE_DIRECT");
+        const int64_t want = mode != 2 && env_knob_on("GGML_VK_GDN_ROLLBACK") ? 1 : 0;
+        if (n != want) {
+            msg = "GDN_STATE_DIRECT dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = 128, H = 4, D = S * S * H;
+        const int64_t n_written = K > 1 ? std::min(n_tokens, K) : 1;
+        GGML_ASSERT(mem_size >= n_seqs && (mode != 1 || (K == 1 && mem_size == n_seqs)));
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_tokens, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_tokens, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_tokens, n_seqs);
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_tokens, n_seqs);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_tokens, n_seqs);
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(b, "beta");
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, mem_size * std::max<int64_t>(K, 1));
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * state;
+        if (mode == 1) {
+            state = ggml_reshape_4d(ctx, ggml_view_2d(ctx, cache, D, n_seqs, cache->nb[1], 0), S, S, H, n_seqs);
+        } else {
+            state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H, n_seqs);
+            ggml_set_name(state, "state");
+        }
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, b, state, K);
+        ggml_build_forward_expand(gf, gdn);
+
+        // rows of slot s, sequence j at (s * mem_size + j) * D
+        ggml_tensor * dst = ggml_view_3d(ctx, cache, D, n_seqs, n_written, cache->nb[1], mem_size * cache->nb[1], 0);
+        outputs.clear();
+        if (mode == 2) {
+            ggml_tensor * reader = ggml_scale(ctx, dst, 2.0f);
+            ggml_build_forward_expand(gf, reader);
+            outputs.push_back(reader);
+        }
+        ggml_tensor * src = ggml_view_3d(ctx, gdn, D, n_seqs, n_written, D * sizeof(float), D * n_seqs * sizeof(float),
+                                         S * H * n_tokens * n_seqs * sizeof(float));
+        ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+        ggml_set_name(cpy, "gdn_state_cpy");
+        ggml_build_forward_expand(gf, cpy);
+        outputs.push_back(cpy);
+
+        ggml_tensor * attn = ggml_view_4d(ctx, gdn, S, H, n_tokens, n_seqs, S * sizeof(float), S * H * sizeof(float),
+                                          S * H * n_tokens * sizeof(float), 0);
+        ggml_tensor * out = ggml_scale(ctx, attn, 0.5f);
+        outputs.push_back(out);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -3.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t, -0.3f, 0.3f);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -17652,6 +17748,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    // GDN direct state write (Vulkan): Flash-Next MTP verify shape (4 tokens, K = 4), slot/sequence gaps, n_written < K, K = 1 in place,
+    // and a reader between the GDN and the CPY (the direct write must not engage there)
+    test_cases.emplace_back(new test_gdn_state_direct(4, 1, 4, 1, 0));
+    test_cases.emplace_back(new test_gdn_state_direct(4, 2, 4, 3, 0));
+    test_cases.emplace_back(new test_gdn_state_direct(2, 1, 4, 2, 0));
+    test_cases.emplace_back(new test_gdn_state_direct(1, 1, 4, 1, 0));
+    test_cases.emplace_back(new test_gdn_state_direct(1, 2, 1, 3, 0));
+    test_cases.emplace_back(new test_gdn_state_direct(4, 1, 1, 1, 0));
+    test_cases.emplace_back(new test_gdn_state_direct(1, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_gdn_state_direct(4, 2, 1, 2, 1));
+    test_cases.emplace_back(new test_gdn_state_direct(4, 1, 4, 1, 2));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

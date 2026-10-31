@@ -832,6 +832,17 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+// gated_delta_net.comp: the shared constants plus the direct state write (GGML_VK_GDN_ROLLBACK). st_direct != 0: the
+// states go to binding 7 at slot * st_slot + seq * st_seq (floats) instead of the op output's state region.
+struct vk_op_gdn_seq_push_constants {
+    vk_op_gated_delta_net_push_constants gdn;
+    uint32_t st_seq;
+    uint32_t st_slot;
+    uint32_t st_direct;
+};
+
+static_assert(sizeof(vk_op_gdn_seq_push_constants) <= 128);
+
 // gdn_chunk_prep.comp / gdn_chunk_scan.comp: the sequential kernel's constants plus the chunk count
 struct vk_op_gdn_chunk_push_constants {
     vk_op_gated_delta_net_push_constants gdn;
