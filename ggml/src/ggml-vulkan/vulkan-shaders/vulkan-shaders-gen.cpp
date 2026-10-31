@@ -958,6 +958,12 @@ void process_shaders() {
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup", mmvq_shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup_no_shmem", mmvq_shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         }
+        // MOE_GLU_GEMV: decode expert gate + up + SwiGLU in one mat-vec (mul_mat_vecq_glu.comp)
+        if ((is_legacy_quant(tname) && tname != "q2_0") || tname == "q4_k" || tname == "q5_k") {
+            string_to_spv("mul_mat_vec_id_glu_" + tname + "_q8_1_f32", "mul_mat_vecq_glu.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_id_glu_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq_glu.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_id_glu_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq_glu.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
 #endif
 
         // Dequant shaders
@@ -1042,6 +1048,9 @@ void process_shaders() {
     string_to_spv("mul_mat_vec_id_q4_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}, {"B_Q8_1", "1"}});
     string_to_spv("mul_mat_vec_id_q5_1_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_1", "1"}, {"B_Q8_1", "1"}});
     string_to_spv("mul_mat_vec_id_q5_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_K", "1"}, {"B_Q8_1", "1"}});
+    // MOE_GLU_GEMV on repacked experts: gate + up + SwiGLU in one mat-vec
+    string_to_spv("mul_mat_vec_id_glu_q4_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}, {"B_Q8_1", "1"}, {"GLU", "1"}});
+    string_to_spv("mul_mat_vec_id_glu_q5_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_K", "1"}, {"B_Q8_1", "1"}, {"GLU", "1"}});
 #endif
     string_to_spv("expert_unrepack", "expert_unrepack.comp", {});
     string_to_spv("expert_repack", "expert_repack.comp", {});

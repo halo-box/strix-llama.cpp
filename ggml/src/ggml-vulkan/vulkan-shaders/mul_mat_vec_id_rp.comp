@@ -13,7 +13,16 @@
 // so the lanes take the rows: lane L reads row L % R and a load of R lanes is R x 16 contiguous bytes. The workgroup computes 32
 // rows, its 4 waves split K, and B (f32) is staged in shared memory while the first K block of weights is in flight.
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+// GLU (gated GEMV, MOE_GLU_GEMV): the workgroup doubles to 256 lanes. Lanes 0..127 compute the 32 rows of the gate experts
+// (binding 0) exactly as the plain build, lanes 128..255 the same rows of the up experts (binding 6), B is staged once for both,
+// and the store is silu(gate) * up with swiglu.comp's expression into the SWIGLU's destination. Per-row sums are the plain
+// build's, so the output equals the unfused [MUL_MAT_ID, MUL_MAT_ID, SWIGLU] chain bit for bit.
+#if defined(GLU)
+#define WG 256
+#else
+#define WG 128
+#endif
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
 
 #define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
@@ -50,6 +59,12 @@ layout(binding = 2) writeonly buffer D { float data_d[]; };
 layout(binding = 3) readonly buffer Fuse0 { float data_fuse0[]; };
 layout(binding = 4) readonly buffer Fuse1 { float data_fuse1[]; };
 layout(binding = 5) readonly buffer IDS { int data_ids[]; };
+#if defined(GLU)
+layout(binding = 6) readonly buffer AU { uvec4 data_au[]; };
+#define LOAD_A(i) (half_up ? data_au[i] : data_a[i])
+#else
+#define LOAD_A(i) data_a[i]
+#endif
 
 #define ROWS 32          // rows per workgroup
 #define KSPLIT 4         // waves per workgroup, each takes every 4th K block
@@ -69,7 +84,7 @@ shared vec2 sh_bds[MAX_K / 32];    // per 32: d, d * sum(q)
 #else
 shared vec4 sh_b[MAX_K / 4];
 #endif
-shared float sh_part[KSPLIT][ROWS];
+shared float sh_part[WG / 128][KSPLIT][ROWS];
 
 #if defined(DATA_A_Q4_K)
 #define R 16
@@ -104,7 +119,10 @@ void kq_words(const uint j, const uint w, out uint qlo, out uint qhi) {
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint row = tid % ROWS;
-    const uint kc  = tid / ROWS;
+    const uint kc  = (tid % 128) / ROWS;
+#if defined(GLU)
+    const bool half_up = tid >= 128;   // whole waves: 128 is a multiple of the wave size
+#endif
     const uint expert_i0 = gl_WorkGroupID.y;
     const uint first_row = (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z) * ROWS;
     const uint M = p.stride_d;
@@ -129,27 +147,27 @@ void main() {
     uint kb = kc;
     if (kb < nkb) {
         [[unroll]] for (uint j = 0; j < UPB; ++j) {
-            a_cur[j] = data_a[a_base + (kb * UPB + j) * R];
+            a_cur[j] = LOAD_A(a_base + (kb * UPB + j) * R);
         }
     }
 #if defined(B_Q8_1)
     {
         const uint b0 = b_offset / 32;
-        for (uint t = tid; t < K / 4; t += 128) {
+        for (uint t = tid; t < K / 4; t += WG) {
             const uint blk = b0 + t / 8;
             sh_bq[t] = data_bq[blk / 4].qs[(blk % 4) * 8 + t % 8];
         }
-        for (uint t = tid; t < K / 32; t += 128) {
+        for (uint t = tid; t < K / 32; t += WG) {
             sh_bds[t] = vec2(data_bq[(b0 + t) / 4].ds[(b0 + t) % 4]);
         }
     }
 #else
     if ((b_offset & 3) == 0) {
-        for (uint k4 = tid; k4 < K / 4; k4 += 128) {
+        for (uint k4 = tid; k4 < K / 4; k4 += WG) {
             sh_b[k4] = data_b4[b_offset / 4 + k4];
         }
     } else {
-        for (uint k = tid; k < K; k += 128) {
+        for (uint k = tid; k < K; k += WG) {
             sh_b[k / 4][k % 4] = data_b[b_offset + k];
         }
     }
@@ -160,7 +178,7 @@ void main() {
     for (; kb < nkb; kb += KSPLIT) {
         if (kb + KSPLIT < nkb) {
             [[unroll]] for (uint j = 0; j < UPB; ++j) {
-                a_nxt[j] = data_a[a_base + ((kb + KSPLIT) * UPB + j) * R];
+                a_nxt[j] = LOAD_A(a_base + ((kb + KSPLIT) * UPB + j) * R);
             }
         }
 #if defined(A_KQ)
@@ -277,14 +295,22 @@ void main() {
         }
     }
 
-    sh_part[kc][row] = acc;
+    sh_part[tid / 128][kc][row] = acc;
     barrier();
-    if (kc == 0) {
+    if (tid < ROWS) {
         float sum = 0.0;
         [[unroll]] for (uint i = 0; i < KSPLIT; ++i) {
-            sum += sh_part[i][row];
+            sum += sh_part[0][i][row];
         }
         const uint n = first_row + row;
+#if defined(GLU)
+        float up = 0.0;
+        [[unroll]] for (uint i = 0; i < KSPLIT; ++i) {
+            up += sh_part[1][i][row];
+        }
+        data_d[d_offset + n] = sum / (1.0f + exp(-sum)) * up;
+        return;
+#endif
         if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
             sum += data_fuse0[expert_id * p.stride_d + n];
         }

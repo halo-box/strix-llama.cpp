@@ -869,6 +869,8 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+    // MOE_GLU_GEMV: decode gate + up + SwiGLU mat-vec (mul_mat_vecq_glu.comp), DMMV_WG_SIZE_SUBGROUP only
+    vk_pipeline pipeline_mul_mat_vec_id_glu_q8_1_f32[GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
@@ -1139,6 +1141,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_mmid_down_q51_rpv[11];   // GGML_VK_EXPDOWN_V variants of the f16-B repacked down kernel ([0] unused)
     vk_pipeline pipeline_mmv_id_rp_q4k, pipeline_mmv_id_rp_q5k, pipeline_mmv_id_rp_q51;
     vk_pipeline pipeline_mmv_id_rp_q4k_q8, pipeline_mmv_id_rp_q5k_q8, pipeline_mmv_id_rp_q51_q8;
+    vk_pipeline pipeline_mmv_id_glu_rp_q4k_q8, pipeline_mmv_id_glu_rp_q5k_q8;   // MOE_GLU_GEMV on repacked experts
     vk_pipeline pipeline_expert_unrepack;
     vk_pipeline pipeline_expert_repack;
 
@@ -1531,6 +1534,7 @@ struct ggml_backend_vk_context {
                                   // count, run as one mat-vec that forms B as it loads it (MUL_MAT_VEC_GLU(_SIG))
     bool fused_fn_decode_hc {};   // SCALE + SILU + MUL_MAT (mat-vec) + RESHAPE + DSV4_HC_PRE (gated) -> one mat-vec (FN_DECODE_HC)
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
+    bool fused_moe_glu_gemv {}; // MOE_GLU_GEMV: decode gate + up MUL_MAT_ID mat-vecs + SWIGLU in one dispatch
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     bool fused_mmid_pair_glu {};   // MUL_MAT_ID+CPY(f16) x 2 + SWIGLU: gate, up and the SwiGLU in one weight-streaming launch
     bool fused_mmid_pair_glu_f32 {};   // ... its f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU
