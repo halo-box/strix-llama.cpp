@@ -19,6 +19,9 @@ uint a_offset, b_offset, d_offset, y_offset;
 #if defined(HC_MIX) && (K_PER_ITER != 8 || QUANT_R != 1)
 #error HC_MIX: only the K_PER_ITER 8, QUANT_R 1 path (q8_0) is implemented
 #endif
+#if defined(GLU_B) && (K_PER_ITER != 8 || QUANT_R != 1)
+#error GLU_B: only the K_PER_ITER 8, QUANT_R 1 path (q8_0) is implemented
+#endif
 
 vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, out bool OOB_y, out bool OOB_z, out bool OOB_w) {
     // Check if the latter elements are OOB, and don't fetch B or accumulate it.
@@ -65,6 +68,11 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         // FN_DECODE_HC: B is the hc down output before its SCALE and SILU
         const vec4 bv0 = hc_b_silu(vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]));
         const vec4 bv1 = hc_b_silu(vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]));
+#elif defined(GLU_B)
+        // MUL_MAT_VEC_GLU: B is the SWIGLU of the gate (binding 1) and up (binding 3) columns, formed as it is loaded
+        const uint bi = (j*p.batch_stride_b + b_offset + iybs + iqs) / 4;
+        const vec4 bv0 = glu_b(vec4(data_b_v4[bi]), data_fuse0_v4[bi]);
+        const vec4 bv1 = glu_b(vec4(data_b_v4[bi + 1]), data_fuse0_v4[bi + 1]);
 #else
         const vec4 bv0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
         const vec4 bv1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);

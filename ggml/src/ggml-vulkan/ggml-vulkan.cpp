@@ -3854,6 +3854,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 static const uint64_t hc_len[3] = { mul_mat_vec_q8_0_f32_f32_hcmix_len, mul_mat_vec_q8_0_f32_f32_hcmix_subgroup_len, mul_mat_vec_q8_0_f32_f32_hcmix_subgroup_no_shmem_len };
                 ggml_vk_create_pipeline(device, device->pipeline_fn_hc_up_mix_mv[w][i], "mul_mat_vec_q8_0_f32_f32_hcmix", hc_len[reduc], hc_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_hc_mix_push_constants), {4, 1, 1}, {wg_size_subgroup, 4, i+1}, 1, true, use_subgroups, force_subgroup_size);
             }
+            {
+                // MUL_MAT_VEC_GLU: the q8_0 f32-B mat-vec above with B formed as SWIGLU(gate, up) while it is loaded; same rows per
+                // workgroup, workgroup size, reduction mode and subgroup requirements, so each row sums in the same order
+                static const void * const glu_data[3] = { mul_mat_vec_q8_0_f32_f32_glub_data, mul_mat_vec_q8_0_f32_f32_glub_subgroup_data, mul_mat_vec_q8_0_f32_f32_glub_subgroup_no_shmem_data };
+                static const uint64_t glu_len[3] = { mul_mat_vec_q8_0_f32_f32_glub_len, mul_mat_vec_q8_0_f32_f32_glub_subgroup_len, mul_mat_vec_q8_0_f32_f32_glub_subgroup_no_shmem_len };
+                ggml_vk_create_pipeline(device, device->pipeline_mmv_glu_b[w][i], "mul_mat_vec_q8_0_f32_f32_glub", glu_len[reduc], glu_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            }
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_f32_f32", arr_dmmv_q2_k_f32_f32_len[reduc16], arr_dmmv_q2_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_f32_f32", arr_dmmv_q3_k_f32_f32_len[reduc16], arr_dmmv_q3_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f32_f32", arr_dmmv_q4_k_f32_f32_len[reduc16], arr_dmmv_q4_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
@@ -4696,6 +4703,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         for (uint32_t has_post = 0; has_post < 2; ++has_post) {
             ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm[has_post][0], has_post ? "dsv4_hc_post_norm_f32" : "dsv4_rms_norm_mul_rows_f32",
                 dsv4_hc_post_norm_f32_len, dsv4_hc_post_norm_f32_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { has_post }, 1);
+            if (has_post) {
+                ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm_add, "dsv4_hc_post_norm_add_f32",
+                    dsv4_hc_post_norm_add_f32_len, dsv4_hc_post_norm_add_f32_data, "main", 7, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { has_post }, 1);
+            }
             if (device->fp16) {
                 ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_norm[has_post][1], has_post ? "dsv4_hc_post_norm_f16" : "dsv4_rms_norm_mul_rows_f16",
                     dsv4_hc_post_norm_f16_len, dsv4_hc_post_norm_f16_data, "main", 6, sizeof(vk_op_dsv4_hc_post_norm_push_constants), {1, 1, 1}, { has_post }, 1);
@@ -9029,6 +9040,77 @@ static vk_pipeline ggml_vk_fn_hc_up_mix_mv_pipeline(ggml_backend_vk_context * ct
 // RESHAPE -> DSV4_HC_PRE (gated) as the q8_0 mat-vec with HC_MIX: B is the hc down output, scaled and passed through SILU as it
 // is loaded; each workgroup computes the 4 stream rows of one column and stores the gated mix. Same column chunks as the unfused
 // mat-vec; the scaled / SILU B, the gate rows and the mix are bit-identical to the unfused chain.
+// MUL_MAT_VEC_GLU: the f32-B q8_0 mat-vec pipeline twin that forms B as SWIGLU(gate, up) while it loads it, for the stock
+// pipeline the unfused MUL_MAT would run on n columns (same rows per workgroup, workgroup size and reduction mode), or nullptr
+static vk_pipeline ggml_vk_mmv_glu_pipeline(ggml_backend_vk_context * ctx, uint32_t n, uint32_t m, uint32_t k) {
+    const vk_pipeline stock = ggml_vk_get_dequantize_mul_mat_vec(ctx, GGML_TYPE_Q8_0, GGML_TYPE_F32, n, m, k);
+    if (stock == nullptr) {
+        return nullptr;
+    }
+    for (uint32_t w = 0; w < DMMV_WG_SIZE_COUNT; ++w) {
+        if (ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q8_0][n - 1] == stock) {
+            return ctx->device->pipeline_mmv_glu_b[w][n - 1];
+        }
+    }
+    return nullptr;
+}
+
+// MUL_MAT_VEC_GLU (matched by ggml_vk_can_fuse_mmv_glu at the GLU): SWIGLU(gate, up) -> MUL_MAT (q8_0 mat-vec) as one mat-vec
+// that reads the gate and up columns and forms B with swiglu.comp's expression while it loads it. Same column chunks and
+// pipeline parameters as the unfused mat-vec, so the result is bit-identical; the SWIGLU output is never written.
+// MUL_MAT_VEC_GLU_SIG: SIGMOID([1, N] gate) -> MUL(mm, it) follow (a gated shared expert) and run as the store epilogue, with
+// SIGMOID_MUL's expression; the mat-vec result is never written either.
+static void ggml_vk_mmv_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * glu  = cgraph->nodes[node_idx];
+    const ggml_tensor * mm   = cgraph->nodes[node_idx + 1];
+    // with the gate: SIGMOID([1, N] gate) and MUL(mm, it) follow; the product is written to the MUL's destination
+    const bool sig = ctx->fused_mmv_glu == 4;
+    const ggml_tensor * sg   = sig ? cgraph->nodes[node_idx + 2]->src[0] : nullptr;
+    const ggml_tensor * out  = sig ? cgraph->nodes[node_idx + 3] : mm;
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    const ggml_tensor * w    = mm->src[0];
+    const uint32_t k = (uint32_t) w->ne[0];
+    const uint32_t m = (uint32_t) w->ne[1];
+
+    std::vector<std::pair<uint32_t, uint32_t>> chunks;
+    GGML_ASSERT(ggml_vk_mmv_float_chunks(ctx, mm, chunks));
+    std::vector<vk_pipeline> pipes;
+    for (const auto & c : chunks) {
+        vk_pipeline p = ggml_vk_mmv_glu_pipeline(ctx, c.second, m, k);
+        GGML_ASSERT(p != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, p, 1);
+        pipes.push_back(p);
+    }
+
+    const vk_subbuffer d_A = ggml_vk_tensor_subbuffer(ctx, w);
+    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+        const uint32_t col0 = chunks[ci].first;
+        const uint32_t n    = chunks[ci].second;
+        vk_subbuffer d_G = ggml_vk_tensor_subbuffer(ctx, gate);
+        vk_subbuffer d_U = ggml_vk_tensor_subbuffer(ctx, up);
+        vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, out);
+        // the gate is indexed by column from 0 (the gated form is matched with one chunk only)
+        GGML_ASSERT(!sig || (col0 == 0 && chunks.size() == 1));
+        const vk_subbuffer d_S = sig ? ggml_vk_tensor_subbuffer(ctx, sg) : d_U;
+        const uint64_t off_b = (uint64_t) col0 * gate->nb[1];
+        const uint64_t off_u = (uint64_t) col0 * up->nb[1];
+        const uint64_t off_d = (uint64_t) col0 * out->nb[1];
+        d_G.offset += off_b; d_G.size -= off_b;
+        d_U.offset += off_u; d_U.size -= off_u;
+        d_D.offset += off_d; d_D.size -= off_d;
+
+        // the stock push constants of a plain 2-D mat-vec (ggml_vk_mul_mat_vec_q_f16_cols, batch_n: B and D strides are rows)
+        const vk_mat_vec_push_constants pc = {
+            k, k, k, m,
+            n > 1 ? 0u : ggml_vk_batch_stride(w), k, m,
+            sig ? (uint32_t) MAT_VEC_FUSION_FLAGS_SIGMOID1 : 0u, 0u,
+            1u, 1u, 1u, 1u,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipes[ci], { d_A, d_G, d_D, d_U, d_S }, pc, { m, 1, 1 });
+    }
+}
+
 static void ggml_vk_fn_decode_hc_mv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * scale = cgraph->nodes[node_idx];
     const ggml_tensor * mm    = cgraph->nodes[node_idx + 2];
@@ -9474,7 +9556,11 @@ static void ggml_vk_dsv4_hc_post_norm_impl(ggml_backend_vk_context * ctx, vk_con
     GGML_ASSERT(out->type == (out_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32));
 
     const ggml_tensor * res   = has_post ? hc_post->src[1] : rms->src[0];
-    const ggml_tensor * x     = has_post ? hc_post->src[0] : res;
+    // HC_POST_GATE_NORM_ADD: the ADD in front (node_idx - 1) is elided; the kernel sums its two inputs
+    const bool add            = ctx->fused_hc_post_norm_add;
+    const ggml_tensor * add_n = add ? cgraph->nodes[node_idx - 1] : nullptr;
+    GGML_ASSERT(!add || (has_post && !out_f16 && !ctx->fused_hc_post_norm_inj && hc_post->src[0] == add_n));
+    const ggml_tensor * x     = add ? add_n->src[0] : has_post ? hc_post->src[0] : res;
     const ggml_tensor * pw    = has_post ? scale_in->src[0] : res;
     const ggml_tensor * gamma = mul->src[1];
     const ggml_tensor * o     = has_post ? hc_post : res;
@@ -9519,6 +9605,14 @@ static void ggml_vk_dsv4_hc_post_norm_impl(ggml_backend_vk_context * ctx, vk_con
               ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, o), ggml_vk_tensor_subbuffer(ctx, out),
               ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, mm) },
             ipc, { nt, 1, 1 });
+        return;
+    }
+    if (add) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, x), ggml_vk_tensor_subbuffer(ctx, res), ggml_vk_tensor_subbuffer(ctx, pw),
+              ggml_vk_tensor_subbuffer(ctx, gamma), ggml_vk_tensor_subbuffer(ctx, o), ggml_vk_tensor_subbuffer(ctx, out),
+              ggml_vk_tensor_subbuffer(ctx, add_n->src[1]) },
+            pc, { hc * nt, 1, 1 });
         return;
     }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -17245,6 +17339,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     case GGML_OP_ADD:
         if (ctx->fused_hc_moe_epi) {
             ggml_vk_dsv4_hc_moe_post_norm(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_hc_post_norm_add) {
+            ggml_vk_dsv4_hc_post_norm(ctx, compute_ctx, cgraph, node_idx + 1);
         } else if (ctx->num_additional_fused_ops) {
             ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
         } else {
@@ -17469,7 +17565,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         case GGML_GLU_OP_GEGLU_ERF:
         case GGML_GLU_OP_GEGLU_QUICK:
         case GGML_GLU_OP_SWIGLU_CLAMP:
-            ggml_vk_glu(ctx, compute_ctx, src0, src1, node);
+            if (ctx->fused_mmv_glu) {
+                ggml_vk_mmv_glu(ctx, compute_ctx, cgraph, node_idx);
+            } else {
+                ggml_vk_glu(ctx, compute_ctx, src0, src1, node);
+            }
             break;
         default:
             return false;
@@ -18936,6 +19036,61 @@ static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, c
             get_misalign_bytes(ctx, x) != 0 || get_misalign_bytes(ctx, pw) != 0 || get_misalign_bytes(ctx, hc_post) != 0) {
             return false;
         }
+    }
+    return true;
+}
+
+// HC_POST_GATE_NORM_ADD: the ADD whose only reader is the combine (x = a + b; qwen4exp's FFN output, the MoE sum plus the gated
+// shared expert), at node_idx, followed by the f32 HC_POST_GATE_NORM chain. GGML_VK_HC_POST_NORM_ADD=0 leaves the ADD unfused.
+// Read once, again after the "ggml_backend_debug_env_reload" test hook.
+static std::atomic<int> vk_hc_post_norm_add_env {-1};
+static bool ggml_vk_hc_post_norm_add_enabled() {
+    int v = vk_hc_post_norm_add_env.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char * e = getenv("GGML_VK_HC_POST_NORM_ADD");
+        v = (e == nullptr || atoi(e) != 0) ? 1 : 0;
+        vk_hc_post_norm_add_env.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+
+// the HC_POST_GATE_NORM_ADD front as graphs emit it, from node j (graph_optimize: before allocation, no buffer checks): an f32
+// ADD read only by the DSV4_HC_POST of the SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST run right behind it
+static bool ggml_vk_hc_post_norm_add_wiring(const struct ggml_cgraph * g, int j) {
+    if (j + 4 >= g->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * add = g->nodes[j];
+    return add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 && g->nodes[j + 1]->op == GGML_OP_SCALE &&
+           g->nodes[j + 2]->op == GGML_OP_UNARY && g->nodes[j + 3]->op == GGML_OP_SCALE &&
+           g->nodes[j + 4]->op == GGML_OP_DSV4_HC_POST && g->nodes[j + 4]->src[0] == add &&
+           !(add->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(g, j) == 1;
+}
+
+static bool ggml_vk_can_fuse_hc_post_norm_add(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * add = cgraph->nodes[node_idx];
+    if (!ggml_vk_hc_post_norm_add_enabled() || add->op != GGML_OP_ADD || ctx->device->pipeline_dsv4_hc_post_norm_add == nullptr ||
+        node_idx + 6 >= cgraph->n_nodes) {
+        return false;
+    }
+    // the f32 norm form only (the decode chain): a cast norm keeps its own fusions
+    if (!ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, node_idx + 1, HC_POST_NORM_GATE) ||
+        ggml_vk_can_fuse_hc_post_norm(ctx, cgraph, node_idx + 1, HC_POST_NORM_GATE_CPY)) {
+        return false;
+    }
+    const ggml_tensor * hc_post = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    // the ADD is elided: read only by the combine, not an output
+    if (hc_post->src[0] != add || (add->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, node_idx) != 1) {
+        return false;
+    }
+    // x [n_embd, nt] = a + b, all f32 with the same shape and token stride (the kernel reads both at x's offsets), vec4 rows
+    if (add->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || a == b ||
+        !ggml_are_same_shape(add, a) || !ggml_are_same_shape(add, b) || add->ne[1] < 1 ||
+        a->nb[0] != 4 || b->nb[0] != 4 || a->nb[1] != add->nb[1] || b->nb[1] != add->nb[1] || add->nb[1] % 16 != 0 ||
+        get_misalign_bytes(ctx, a) != 0 || get_misalign_bytes(ctx, b) != 0) {
+        return false;
     }
     return true;
 }
@@ -20564,6 +20719,19 @@ static bool ggml_vk_gdn_direct_elided(const ggml_backend_vk_context * ctx, const
     return false;
 }
 
+// RMS_NORM_MUL_ROPE(_VIEW_SET_ROWS) with an M-RoPE or interleaved M-RoPE rope (the qwen3.5 / qwen3next / qwen4exp q and k
+// norms): GGML_VK_FUSE_NORM_MROPE=0 leaves them unfused. Read once, again after the "ggml_backend_debug_env_reload" test hook.
+static std::atomic<int> vk_fuse_norm_mrope_env {-1};
+static bool ggml_vk_fuse_norm_mrope_enabled() {
+    int v = vk_fuse_norm_mrope_env.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char * e = getenv("GGML_VK_FUSE_NORM_MROPE");
+        v = (e == nullptr || atoi(e) != 0) ? 1 : 0;
+        vk_fuse_norm_mrope_env.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -20579,8 +20747,9 @@ bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const str
         return false;
     }
 
-    // only norm/neox are handled in the shader
-    if (mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_NORMAL) {
+    // norm, neox and (interleaved) M-RoPE are handled in the shader; GGML_VK_FUSE_NORM_MROPE=0 keeps M-RoPE unfused
+    if (mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_NORMAL &&
+        !((mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) && ggml_vk_fuse_norm_mrope_enabled())) {
         return false;
     }
 
@@ -20715,6 +20884,8 @@ static size_t ggml_backend_vk_dispatch_census_get(char * buf, size_t size) {
 }
 
 static bool ggml_vk_fn_decode_hc_enabled();
+static bool ggml_vk_mmv_glu_enabled();
+static bool ggml_vk_hc_post_norm_add_enabled();
 
 // why this device or configuration cannot emit a fusion label at all, or nullptr when it can (shape checks aside)
 static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend, const char * label) {
@@ -20774,6 +20945,12 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
         }
     if (l == "FN_DECODE_HC" && !ggml_vk_fn_decode_hc_enabled()) {
         return "GGML_VK_FN_DECODE_HC=0";
+    }
+    if ((l == "MUL_MAT_VEC_GLU" || l == "MUL_MAT_VEC_GLU_SIG") && !ggml_vk_mmv_glu_enabled()) {
+        return "GGML_VK_MMV_GLU=0";
+    }
+    if (l == "HC_POST_GATE_NORM_ADD" && !ggml_vk_hc_post_norm_add_enabled()) {
+        return "GGML_VK_HC_POST_NORM_ADD=0";
     }
     return nullptr;
 }
@@ -20918,12 +21095,31 @@ static bool ggml_vk_fn_decode_hc_enabled() {
     return v != 0;
 }
 
+// MUL_MAT_VEC_GLU: a SWIGLU (split) whose only reader is a q8_0 mat-vec, the FFN down projection at decode, as one mat-vec that
+// forms B while it loads it (ggml_vk_mmv_glu). GGML_VK_MMV_GLU=0 disables the match and its graph_optimize ordering; read once,
+// again after the "ggml_backend_debug_env_reload" test hook.
+static std::atomic<int> vk_mmv_glu_env {-1};
+static bool ggml_vk_mmv_glu_enabled() {
+    int v = vk_mmv_glu_env.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char * e = getenv("GGML_VK_MMV_GLU");
+        v = (e == nullptr || atoi(e) != 0) ? 1 : 0;
+        vk_mmv_glu_env.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+
 // test hook: the knobs a test flips between graphs (GGML_VK_HC_UP_MIX, GGML_VK_FN_DECODE_HC) are read again on their next use
 static void ggml_backend_vk_debug_env_reload() {
     vk_hc_up_mix_env.store(-1, std::memory_order_relaxed);
     vk_fn_decode_hc_env.store(-1, std::memory_order_relaxed);
+    vk_mmv_glu_env.store(-1, std::memory_order_relaxed);
+    vk_fuse_norm_mrope_env.store(-1, std::memory_order_relaxed);
+    vk_hc_post_norm_add_env.store(-1, std::memory_order_relaxed);
 }
 
+static constexpr std::initializer_list<ggml_op> mmv_glu_pattern { GGML_OP_GLU, GGML_OP_MUL_MAT };
+static constexpr std::initializer_list<ggml_op> mmv_glu_sig_pattern { GGML_OP_GLU, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL };
 static constexpr std::initializer_list<ggml_op> fn_decode_hc_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE };
 
 // the FN_DECODE_HC chain wired as build_hc_mix emits it at decode, from node i (graph_optimize: before allocation, no buffer checks)
@@ -20998,6 +21194,102 @@ static bool ggml_vk_can_fuse_fn_decode_hc(ggml_backend_vk_context * ctx, const g
     }
     GGML_UNUSED(rs);
     return true;
+}
+
+// the MUL_MAT_VEC_GLU pair as graphs emit it, from node i: SWIGLU(gate, up) (split, not swapped) and the MUL_MAT that reads it as B
+// (graph_optimize: before allocation, no buffer checks)
+static bool ggml_vk_mmv_glu_wiring(const ggml_cgraph * g, int i) {
+    if (i + 2 > g->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * glu = g->nodes[i];
+    const ggml_tensor * mm  = g->nodes[i + 1];
+    return glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && glu->src[1] != nullptr &&
+           ggml_get_op_params_i32(glu, 1) == 0 && mm->op == GGML_OP_MUL_MAT && mm->src[1] == glu && mm->src[0] != glu &&
+           mm->src[0]->type == GGML_TYPE_Q8_0 && glu->type == GGML_TYPE_F32 && glu->src[0]->type == GGML_TYPE_F32 &&
+           glu->src[1]->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32;
+}
+
+// graph_compute: the MUL_MAT_VEC_GLU pair at node i, on shapes where the unfused MUL_MAT runs the f32-B q8_0 mat-vec in every
+// column chunk (1 to mul_mat_vec_max_cols tokens; never the q8_1 integer-dot path) and the fused pipelines exist
+// the gated form, wired from the pair at i: SIGMOID of a [1, N] f32 gate and MUL(mm, SIGMOID) in either operand order, right after
+static bool ggml_vk_mmv_glu_sig_wiring(const ggml_cgraph * g, int i) {
+    if (i + 4 > g->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm  = g->nodes[i + 1];
+    const ggml_tensor * sig = g->nodes[i + 2];
+    const ggml_tensor * mul = g->nodes[i + 3];
+    return sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->src[0] != mm &&
+           sig->src[0] != g->nodes[i] && sig->type == GGML_TYPE_F32 && sig->src[0]->type == GGML_TYPE_F32 &&
+           sig->ne[0] == 1 && sig->ne[1] == mm->ne[1] && sig->ne[2] == 1 && sig->ne[3] == 1 &&
+           mul->op == GGML_OP_MUL && mul->type == GGML_TYPE_F32 && ggml_are_same_shape(mul, mm) &&
+           ((mul->src[0] == mm && mul->src[1] == sig) || (mul->src[0] == sig && mul->src[1] == mm));
+}
+
+// returns the fused chain's node count (2: the pair, 4: with the gate) or 0
+static int ggml_vk_can_fuse_mmv_glu(ggml_backend_vk_context * ctx, const ggml_cgraph * g, int i) {
+    if (!ggml_vk_mmv_glu_enabled() || !ggml_vk_mmv_glu_wiring(g, i)) {
+        return 0;
+    }
+    const ggml_tensor * glu  = g->nodes[i];
+    const ggml_tensor * mm   = g->nodes[i + 1];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    const ggml_tensor * w    = mm->src[0];
+    // the SWIGLU output is never written: it has no other reader and is not an output
+    if ((glu->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(g, i) != 1) {
+        return 0;
+    }
+    const int64_t k = w->ne[0], m = w->ne[1], nt = glu->ne[1];
+    // zero-token tails (a ubatch with no output rows) and batches past the mat-vec columns stay unfused
+    if (nt < 1 || nt > (int64_t) mul_mat_vec_max_cols) {
+        return 0;
+    }
+    if (gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        w->type != GGML_TYPE_Q8_0) {
+        return 0;
+    }
+    // gate, up and the SWIGLU: contiguous [k, nt]; the weight [k, m], contiguous; mm a plain 2-D mat-vec (no hint but the
+    // exact-batch one)
+    if (!ggml_is_contiguous(gate) || !ggml_is_contiguous(up) || !ggml_is_contiguous(glu) ||
+        !ggml_are_same_shape(gate, glu) || !ggml_are_same_shape(up, glu) ||
+        glu->ne[0] != k || glu->ne[2] != 1 || glu->ne[3] != 1 || k % 32 != 0 ||
+        !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1 ||
+        ggml_nbytes(w) > ctx->device->properties.limits.maxStorageBufferRange ||
+        mm->ne[0] != m || mm->ne[1] != nt || mm->ne[2] != 1 || mm->ne[3] != 1 || !ggml_is_contiguous(mm) ||
+        (ggml_get_op_params_i32(mm, 1) != 0 && !ggml_vk_mul_mat_exact_batch(mm)) ||
+        (uint64_t) m > ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return 0;
+    }
+    if (get_misalign_bytes(ctx, gate) != 0 || get_misalign_bytes(ctx, up) != 0 || get_misalign_bytes(ctx, w) != 0 ||
+        get_misalign_bytes(ctx, mm) != 0) {
+        return 0;
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> chunks;
+    if (!ggml_vk_mmv_float_chunks(ctx, mm, chunks)) {
+        // the unfused mat-vec quantizes B to q8_1: fusing would change its numerics
+        ggml_vk_path_census_add("MUL_MAT_VEC_GLU_MMVQ");
+        return 0;
+    }
+    for (const auto & c : chunks) {
+        if (ggml_vk_mmv_glu_pipeline(ctx, c.second, (uint32_t) m, (uint32_t) k) == nullptr) {
+            return 0;
+        }
+    }
+    // the gated form: one column chunk (the gate is read by column from 0), the mat-vec result and the SIGMOID read only by the
+    // MUL and not outputs, the gate contiguous, the product contiguous like the mat-vec it replaces
+    if (chunks.size() == 1 && ggml_vk_mmv_glu_sig_wiring(g, i)) {
+        const ggml_tensor * sig = g->nodes[i + 2];
+        const ggml_tensor * mul = g->nodes[i + 3];
+        if (!(mm->flags & GGML_TENSOR_FLAG_OUTPUT) && !(sig->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_node_get_use_count(g, i + 1) == 1 && ggml_node_get_use_count(g, i + 2) == 1 &&
+            ggml_is_contiguous(sig->src[0]) && ggml_is_contiguous(mul) &&
+            get_misalign_bytes(ctx, sig->src[0]) == 0 && get_misalign_bytes(ctx, mul) == 0) {
+            return 4;
+        }
+    }
+    return 2;
 }
 
 // Two forms. f16 gate (LLAMA_HC_GATE_F16 on): MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE, returns 3 (the extra fused nodes); the
@@ -21734,6 +22026,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_qsa_expand = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
+        ctx->fused_hc_post_norm_add = false;
         ctx->fused_hc_post_norm_inj = false;
         ctx->fused_hc_moe_epi = 0;
         ctx->fused_extra_dst = nullptr;
@@ -21744,6 +22037,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_qsa_score = false;
         ctx->qsa_score_bias = nullptr;
         ctx->fused_fn_decode_hc = false;
+        ctx->fused_mmv_glu = 0;
         ctx->fused_mmid_cpy16 = false;
         ctx->fused_mmid_glu = false;
         ctx->fused_mmid_pair_glu = false;
@@ -21779,6 +22073,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                    : (hc_moe_inj ? "HC_MOE_EPI_INJ" : cpy ? "HC_MOE_EPI" : "HC_MOE_EPI_F32");
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
                 op_srcs_fused_elementwise[hc_moe_front + 6] = cpy;
+            } else if (ggml_vk_can_fuse_hc_post_norm_add(ctx, cgraph, i)) {
+                // ADD, then the combine and the next norm: outputs as HC_POST_GATE_NORM (the combine, node 4, and the norm, the
+                // last node); the ADD is not written. The kernel reads whole rows of both summands, the residual and the post
+                // weights while it writes both outputs, so no source may overlap either
+                ctx->fused_hc_post_norm = HC_POST_NORM_GATE;
+                ctx->fused_hc_post_norm_add = true;
+                ctx->num_additional_fused_ops = 6;
+                ctx->fused_ops_write_mask |= 1 << 4;
+                fusion_string = "HC_POST_GATE_NORM_ADD";
+                std::fill_n(op_srcs_fused_elementwise, 7, false);
             } else if ((num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i))) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
             vk_hc_boundary_chain hcb;
@@ -22215,6 +22519,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_qsa_expand = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
+                ctx->fused_hc_post_norm_add = false;
                 ctx->fused_hc_post_norm_inj = false;
                 ctx->fused_hc_moe_epi = 0;
                 ctx->fused_extra_dst = nullptr;
@@ -22225,6 +22530,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_qsa_score = false;
                 ctx->qsa_score_bias = nullptr;
                 ctx->fused_fn_decode_hc = false;
+                ctx->fused_mmv_glu = 0;
                 ctx->fused_mmid_cpy16 = false;
                 ctx->fused_mmid_glu = false;
                 ctx->fused_mmid_pair_glu = false;
@@ -22289,6 +22595,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_up_mix = false;
         ctx->fused_hc_up_mix_cpy = false;
         ctx->fused_fn_decode_hc = false;
+        ctx->fused_mmv_glu = 0;
         ctx->fused_mmid_cpy16 = false;
         ctx->fused_mmid_glu = false;
         ctx->fused_mmid_pair_glu = false;
@@ -22422,6 +22729,51 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
                     if (dbg) {
                         GGML_LOG_INFO("ggml_vulkan: HC_DEFER alloc deps for %s until %s (%s)\n", a->name, until->name, ggml_op_desc(until));
+    // MUL_MAT_VEC_GLU: a SWIGLU whose only reader is a mat-vec further down (a model may emit it early, next to its gate and up
+    // projections) moves to just before that reader, where the pair fuses; nothing in between reads it, so the order is valid
+    if (ggml_vk_mmv_glu_enabled() && !ctx->device->disable_fusion) {
+        for (int g = 0; g < graph->n_nodes - 2; ++g) {
+            ggml_tensor * glu = graph->nodes[g];
+            if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr ||
+                (glu->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(graph, g) != 1 ||
+                glu->ne[1] < 1 || glu->ne[1] > (int64_t) mul_mat_vec_max_cols) {
+                continue;
+            }
+            const int lim = std::min(graph->n_nodes, g + 64);
+            for (int c = g + 1; c < lim; ++c) {
+                ggml_tensor * mm = graph->nodes[c];
+                if (mm->op == GGML_OP_MUL_MAT && mm->src[1] == glu && mm->src[0] != glu && mm->src[0]->type == GGML_TYPE_Q8_0 &&
+                    glu->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32) {
+                    if (c > g + 1) {
+                        std::rotate(graph->nodes + g, graph->nodes + g + 1, graph->nodes + c);
+                    }
+                    // a gated shared expert: [GLU, MM, X, SIGMOID(X), MUL(MM, SIGMOID)] -> X, the gate projection, moves up to where
+                    // the GLU was (next to the gate and up projections that read the same input), so the gate chain is consecutive
+                    // and X runs beside those projections instead of in front of the fused mat-vec. X may jump only over nodes it
+                    // does not read; if it reads one of them it goes right in front of the GLU instead.
+                    if (c + 3 < graph->n_nodes) {
+                        ggml_tensor * x   = graph->nodes[c + 1];
+                        ggml_tensor * sig = graph->nodes[c + 2];
+                        ggml_tensor * mul = graph->nodes[c + 3];
+                        bool indep = x->op != GGML_OP_NONE && !ggml_op_is_empty(x->op) && ggml_node_get_use_count(graph, c + 1) == 1;
+                        for (int q = 0; indep && q < GGML_MAX_SRC; ++q) {
+                            indep = x->src[q] != glu && x->src[q] != mm;
+                        }
+                        if (indep && sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->src[0] == x &&
+                            mul->op == GGML_OP_MUL && ((mul->src[0] == mm && mul->src[1] == sig) || (mul->src[0] == sig && mul->src[1] == mm))) {
+                            // the earliest slot in [g, c - 1] after every node in that range that X reads (directly or through a view)
+                            int to = g;
+                            for (int q = g; q < c - 1; ++q) {
+                                const ggml_tensor * n = graph->nodes[q];
+                                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                                    const ggml_tensor * src = x->src[k];
+                                    if (src && (src == n || src->view_src == n || (n->view_src && n->view_src == src->view_src && src->view_src))) {
+                                        to = q + 1;
+                                    }
+                                }
+                            }
+                            std::rotate(graph->nodes + to, graph->nodes + c + 1, graph->nodes + c + 2);
+                        }
                     }
                     break;
                 }
@@ -22726,6 +23078,28 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return keep_pattern(pattern);
         };
 
+        // HC_POST_GATE_NORM_ADD: the ADD stays right in front of its combine chain (scheduled next), and its two inputs stay
+        // allocated through the norm's MUL, which the fused kernel writes while it reads them
+        if (ggml_vk_hc_post_norm_add_enabled() && ggml_vk_hc_post_norm_add_wiring(graph, first_unused) && !used[first_unused + 1]) {
+            ggml_tensor * add = graph->nodes[first_unused];
+            if (params && params->add_alloc_dep && first_unused + 6 < graph->n_nodes && graph->nodes[first_unused + 6]->op == GGML_OP_MUL) {
+                params->add_alloc_dep(params->user_data, add->src[0], graph->nodes[first_unused + 6]);
+                params->add_alloc_dep(params->user_data, add->src[1], graph->nodes[first_unused + 6]);
+            }
+            keep_pattern({ GGML_OP_ADD });
+            continue;
+        }
+        // MUL_MAT_VEC_GLU: SWIGLU + MUL_MAT stay consecutive, and the gate and up columns stay allocated until the MUL_MAT,
+        // which the fused mat-vec writes while it reads them
+        if (ggml_vk_mmv_glu_enabled() && ggml_vk_mmv_glu_wiring(graph, first_unused) && match_pattern(mmv_glu_pattern, first_unused) &&
+            graph->nodes[first_unused]->ne[1] >= 1 && graph->nodes[first_unused]->ne[1] <= (int64_t) mul_mat_vec_max_cols) {
+            const bool sig = ggml_vk_mmv_glu_sig_wiring(graph, first_unused) && match_pattern(mmv_glu_sig_pattern, first_unused);
+            if (params && params->add_alloc_dep) {
+                add_pattern_alloc_deps(sig ? mmv_glu_sig_pattern : mmv_glu_pattern, first_unused + (sig ? 3 : 1));
+            }
+            keep_pattern(sig ? mmv_glu_sig_pattern : mmv_glu_pattern);
+            continue;
+        }
         // FN_DECODE_HC: SCALE + SILU + MUL_MAT + RESHAPE + DSV4_HC_PRE stay consecutive, and the chain's inputs (lo, the weight,
         // x) stay allocated until the HC pre: the fused mat-vec reads them while it writes the mixed stream
         if (ggml_vk_fn_decode_hc_enabled() && ggml_vk_fn_decode_hc_wiring(graph, first_unused) &&
@@ -23349,6 +23723,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(hc_post_gate_pattern, j) ||
                 !gated_norm_order(j).empty() ||
                 is_mm_cpy16(j) ||
+                (ggml_vk_mmv_glu_enabled() && ggml_vk_mmv_glu_wiring(graph, j) && !used[j + 1]) ||
+                (ggml_vk_hc_post_norm_add_enabled() && ggml_vk_hc_post_norm_add_wiring(graph, j) && !used[j + 1]) ||
+                (ggml_vk_mmv_glu_enabled() && j >= 2 && ggml_vk_mmv_glu_wiring(graph, j - 2) && ggml_vk_mmv_glu_sig_wiring(graph, j - 2) && !used[j - 2]) ||
+                (ggml_vk_mmv_glu_enabled() && j >= 3 && ggml_vk_mmv_glu_wiring(graph, j - 3) && ggml_vk_mmv_glu_sig_wiring(graph, j - 3) && !used[j - 3]) ||
                 fa_gate_nodes.count(graph->nodes[j])) {
                 continue;
             }

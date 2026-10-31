@@ -914,6 +914,11 @@ void process_shaders() {
             string_to_spv("mul_mat_vec_" + tname + "_f32_f32_hcmix", shader, merge_maps(base_dict, hc));
             string_to_spv("mul_mat_vec_" + tname + "_f32_f32_hcmix_subgroup", shader, merge_maps(merge_maps(base_dict, hc), {{"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_" + tname + "_f32_f32_hcmix_subgroup_no_shmem", shader, merge_maps(merge_maps(base_dict, hc), {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            // MUL_MAT_VEC_GLU: B formed as SWIGLU(gate, up) while it is loaded
+            const std::map<std::string, std::string> glu = {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"GLU_B", "1"}};
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_glub", shader, merge_maps(base_dict, glu));
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_glub_subgroup", shader, merge_maps(merge_maps(base_dict, glu), {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_glub_subgroup_no_shmem", shader, merge_maps(merge_maps(base_dict, glu), {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
@@ -1323,6 +1328,7 @@ void process_shaders() {
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("dsv4_hc_post_norm_f32", "dsv4_hc_post_norm.comp", {});
     string_to_spv("dsv4_hc_post_norm_f16", "dsv4_hc_post_norm.comp", {{"OUT_F16", "1"}});
+    string_to_spv("dsv4_hc_post_norm_add_f32", "dsv4_hc_post_norm.comp", {{"X_ADD", "1"}});
     string_to_spv("dsv4_hc_post_norm_inj_f16", "dsv4_hc_post_norm_inj.comp", {});
     string_to_spv("dsv4_hc_moe_post_norm_s16_f32", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}});
     string_to_spv("dsv4_hc_moe_post_norm_s16_f16", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}, {"OUT_F16", "1"}});
