@@ -1096,6 +1096,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_sel_cm_f16[3]; // the same on RDNA3 + RADV (WMMA, gfx11 fragment layout)
     vk_pipeline pipeline_flash_attn_sel_cm_gate_f16[3]; // the WMMA kernel with the attention output gate in its store (binding 5)
     vk_pipeline pipeline_flash_attn_sel_prep;      // cleans the selection rows for both
+    vk_pipeline pipeline_flash_attn_sel_prep_sg;   // the same with subgroup min / scan (FA_SEL_LEAN)
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
@@ -1131,6 +1132,7 @@ struct vk_device_struct {
     bool fa_sparse_compact_use_subgroups;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
+    vk_pipeline pipeline_flash_attn_split_k_reduce_gate; // the same with the attention output gate (selected-key decode)
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
     vk_pipeline pipeline_count_experts;
     vk_pipeline pipeline_mmid_glu[2][2][2];   // MUL_MAT_ID_PAIR_SWIGLU (mul_mm_id_glu.comp): [q4_K, q5_K][f32 output][f32 B]
