@@ -57,7 +57,7 @@ struct ggml_cuda_gdn_decode_args {
     float qk_scale_add[2] = { 0.0f, 0.0f };
     // recurrence
     const float *   state_cache;      // [S*S*H_v, n_slots] cache, row = state_ids[0] (transposed per head: [col][row])
-    const int32_t * state_ids;
+    const int32_t * state_ids;        // nullptr: state_cache points at the state row itself (in-place read)
     int64_t         state_row_stride;
     float *       state_out;      // [S, S, H_v] cache row
     float         scale;          // 1/sqrt(S)
