@@ -3846,6 +3846,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f32_f32", arr_dmmv_q5_0_f32_f32_len[reduc], arr_dmmv_q5_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_f32_f32", arr_dmmv_q5_1_f32_f32_len[reduc], arr_dmmv_q5_1_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_f32_f32", arr_dmmv_q8_0_f32_f32_len[reduc], arr_dmmv_q8_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            {
+                // FN_DECODE_HC: the q8_0 f32-B mat-vec above with HC_MIX, 4 rows (the 4 streams of one column) per workgroup;
+                // same workgroup size, reduction mode and subgroup requirements, so each row sums in the same order
+                static const void * const hc_data[3] = { mul_mat_vec_q8_0_f32_f32_hcmix_data, mul_mat_vec_q8_0_f32_f32_hcmix_subgroup_data, mul_mat_vec_q8_0_f32_f32_hcmix_subgroup_no_shmem_data };
+                static const uint64_t hc_len[3] = { mul_mat_vec_q8_0_f32_f32_hcmix_len, mul_mat_vec_q8_0_f32_f32_hcmix_subgroup_len, mul_mat_vec_q8_0_f32_f32_hcmix_subgroup_no_shmem_len };
+                ggml_vk_create_pipeline(device, device->pipeline_fn_hc_up_mix_mv[w][i], "mul_mat_vec_q8_0_f32_f32_hcmix", hc_len[reduc], hc_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_hc_mix_push_constants), {4, 1, 1}, {wg_size_subgroup, 4, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            }
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_f32_f32", arr_dmmv_q2_k_f32_f32_len[reduc16], arr_dmmv_q2_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_f32_f32", arr_dmmv_q3_k_f32_f32_len[reduc16], arr_dmmv_q3_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f32_f32", arr_dmmv_q4_k_f32_f32_len[reduc16], arr_dmmv_q4_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
@@ -8938,6 +8945,115 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         return;
     }
     ggml_vk_mul_mat_vec_q_f16_cols(ctx, subctx, cgraph, node_idx, 0, ne11, /*allow_quantize_y=*/ true);
+}
+
+// The column chunks ggml_vk_mul_mat_vec_q_f16 cuts an unfused, non-swapped MUL_MAT into, as (col0, ncols); false when any chunk
+// would take the q8_1 integer-dot path (mirrors its plain / good_cols / allow_quantize_y / quantize_y decisions)
+static bool ggml_vk_mmv_float_chunks(ggml_backend_vk_context * ctx, const ggml_tensor * dst, std::vector<std::pair<uint32_t, uint32_t>> & chunks) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const uint32_t ne11 = (uint32_t) src1->ne[1];
+    static const bool no_split = getenv("GGML_VK_MMV_NO_SPLIT") != nullptr;
+    const bool plain = ne11 > 1 && src1->ne[2] * src1->ne[3] == 1 &&
+                       src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+    const bool exact_batch = ggml_vk_mul_mat_exact_batch(dst);
+    chunks.clear();
+    bool allow_quantize_y = true;
+    if ((!no_split || ne11 > mul_mat_vec_max_cols) && plain && std::min(ggml_vk_mmv_good_cols(src0->type, ne11), mul_mat_vec_max_cols) < ne11) {
+        uint32_t col0 = 0;
+        while (col0 < ne11) {
+            const uint32_t n = std::min(ggml_vk_mmv_good_cols(src0->type, ne11 - col0), mul_mat_vec_max_cols);
+            chunks.emplace_back(col0, n);
+            col0 += n;
+        }
+        allow_quantize_y = exact_batch;
+    } else {
+        if (ne11 > mul_mat_vec_max_cols) {
+            return false;
+        }
+        chunks.emplace_back(0u, ne11);
+    }
+    const uint64_t ne10 = src1->ne[0];
+    for (const auto & c : chunks) {
+        const bool chunk = c.first > 0 || c.second < ne11;
+        const bool quantize_y = allow_quantize_y && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+                                ggml_vk_dim01_contiguous(src1) && (c.second * ne10) % 4 == 0 && (!chunk || ne10 % 32 == 0) &&
+                                ggml_vk_should_use_mmvq(ctx->device, (uint32_t) src0->ne[1], exact_batch ? 1 : c.second, (uint32_t) ne10, src0->type);
+        if (quantize_y && ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, c.second, (uint32_t) dst->ne[0], (uint32_t) src0->ne[0]) != nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// FN_DECODE_HC: the FN hc up mat-vec pipeline that matches the f32-B q8_0 mat-vec the unfused MUL_MAT would run on n columns
+// (same workgroup size and reduction mode), or nullptr
+static vk_pipeline ggml_vk_fn_hc_up_mix_mv_pipeline(ggml_backend_vk_context * ctx, uint32_t n, uint32_t m, uint32_t k) {
+    const vk_pipeline stock = ggml_vk_get_dequantize_mul_mat_vec(ctx, GGML_TYPE_Q8_0, GGML_TYPE_F32, n, m, k);
+    if (stock == nullptr) {
+        return nullptr;
+    }
+    for (uint32_t w = 0; w < DMMV_WG_SIZE_COUNT; ++w) {
+        if (ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q8_0][n - 1] == stock) {
+            return ctx->device->pipeline_fn_hc_up_mix_mv[w][n - 1];
+        }
+    }
+    return nullptr;
+}
+
+// FN_DECODE_HC (matched by ggml_vk_can_fuse_fn_decode_hc at the SCALE): SCALE -> SILU -> MUL_MAT(hc up, q8_0, mat-vec) ->
+// RESHAPE -> DSV4_HC_PRE (gated) as the q8_0 mat-vec with HC_MIX: B is the hc down output, scaled and passed through SILU as it
+// is loaded; each workgroup computes the 4 stream rows of one column and stores the gated mix. Same column chunks as the unfused
+// mat-vec; the scaled / SILU B, the gate rows and the mix are bit-identical to the unfused chain.
+static void ggml_vk_fn_decode_hc_mv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * scale = cgraph->nodes[node_idx];
+    const ggml_tensor * mm    = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * pre   = cgraph->nodes[node_idx + 4];
+    const ggml_tensor * lo    = scale->src[0];
+    const ggml_tensor * w     = mm->src[0];
+    const ggml_tensor * x     = pre->src[0];
+    const uint32_t k = (uint32_t) w->ne[0];
+    const uint32_t m = (uint32_t) w->ne[1];
+
+    std::vector<std::pair<uint32_t, uint32_t>> chunks;
+    GGML_ASSERT(ggml_vk_mmv_float_chunks(ctx, mm, chunks));
+    std::vector<vk_pipeline> pipes;
+    for (const auto & c : chunks) {
+        vk_pipeline p = ggml_vk_fn_hc_up_mix_mv_pipeline(ctx, c.second, m, k);
+        GGML_ASSERT(p != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, p, 1);
+        pipes.push_back(p);
+    }
+
+    const vk_subbuffer d_A = ggml_vk_tensor_subbuffer(ctx, w);
+    const vk_subbuffer d_X = ggml_vk_tensor_subbuffer(ctx, x);
+    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+        const uint32_t col0 = chunks[ci].first;
+        const uint32_t n    = chunks[ci].second;
+        vk_subbuffer d_B = ggml_vk_tensor_subbuffer(ctx, lo);
+        vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, pre);
+        const uint64_t off_b = (uint64_t) col0 * lo->nb[1];
+        const uint64_t off_d = (uint64_t) col0 * pre->nb[1];
+        d_B.offset += off_b; d_B.size -= off_b;
+        d_D.offset += off_d; d_D.size -= off_d;
+
+        vk_mat_vec_hc_mix_push_constants pc {};
+        pc.mv = {
+            k, k, k, m,
+            n > 1 ? 0u : ggml_vk_batch_stride(w), k, m,
+            0u, 0u,
+            1u, 1u, 1u, 1u,
+        };
+        pc.hc_n_embd    = m / 4;
+        pc.hc_x_offset  = (uint32_t) (col0 * (x->nb[2] / sizeof(float)));
+        pc.hc_x_s1      = (uint32_t) (x->nb[1] / sizeof(float));
+        pc.hc_x_s2      = (uint32_t) (x->nb[2] / sizeof(float));
+        pc.hc_d_s1      = (uint32_t) (pre->nb[1] / sizeof(float));
+        pc.hc_in_scale  = ggml_get_op_params_f32(scale, 0);
+        pc.hc_in_bias   = ggml_get_op_params_f32(scale, 1);
+        pc.hc_mix_scale = ggml_get_op_params_f32(pre, 0);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipes[ci], { d_A, d_B, d_D, d_X, d_X }, pc, { m, 1, 1 });
+    }
 }
 
 static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -17331,7 +17447,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_SCALE:
-        if (ctx->fused_hc_post_norm) {
+        if (ctx->fused_fn_decode_hc) {
+            ggml_vk_fn_decode_hc_mv(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_hc_post_norm) {
             ggml_vk_dsv4_hc_post_norm(ctx, compute_ctx, cgraph, node_idx);
         } else if (ctx->fused_hc_post_gate) {
             ggml_tensor * hc_post = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
@@ -20275,6 +20393,8 @@ static size_t ggml_backend_vk_dispatch_census_get(char * buf, size_t size) {
     return out.size();
 }
 
+static bool ggml_vk_fn_decode_hc_enabled();
+
 // why this device or configuration cannot emit a fusion label at all, or nullptr when it can (shape checks aside)
 static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend, const char * label) {
     const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
@@ -20329,6 +20449,8 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
         if (dev->pipeline_dsv4_hc_moe_post_norm[1][0] == nullptr) {
             return "no hc moe epilogue pipeline (needs fp16 and subgroup arithmetic)";
         }
+    if (l == "FN_DECODE_HC" && !ggml_vk_fn_decode_hc_enabled()) {
+        return "GGML_VK_FN_DECODE_HC=0";
     }
     return nullptr;
 }
@@ -20459,6 +20581,100 @@ static bool ggml_vk_hc_mix_cpy_enabled() {
 static void ggml_backend_vk_debug_env_reload() {
     vk_hc_up_mix_env.store(-1, std::memory_order_relaxed);
     vk_qsa_expand_env.store(-1, std::memory_order_relaxed);
+// FN_DECODE_HC: the qwen4exp decode hc boundary, SCALE -> SILU -> hc up MUL_MAT (q8_0 mat-vec) -> RESHAPE -> DSV4_HC_PRE (gated),
+// as one mat-vec (ggml_vk_fn_decode_hc_mv). GGML_VK_FN_DECODE_HC=0 disables the match and its graph_optimize ordering; read once,
+// again after the "ggml_backend_debug_env_reload" test hook (so a test or bench flips it between graphs in one process).
+static std::atomic<int> vk_fn_decode_hc_env {-1};
+static bool ggml_vk_fn_decode_hc_enabled() {
+    int v = vk_fn_decode_hc_env.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char * e = getenv("GGML_VK_FN_DECODE_HC");
+        v = (e == nullptr || atoi(e) != 0) ? 1 : 0;
+        vk_fn_decode_hc_env.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+
+// test hook: the knobs a test flips between graphs (GGML_VK_HC_UP_MIX, GGML_VK_FN_DECODE_HC) are read again on their next use
+static void ggml_backend_vk_debug_env_reload() {
+    vk_hc_up_mix_env.store(-1, std::memory_order_relaxed);
+    vk_fn_decode_hc_env.store(-1, std::memory_order_relaxed);
+}
+
+static constexpr std::initializer_list<ggml_op> fn_decode_hc_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE };
+
+// the FN_DECODE_HC chain wired as build_hc_mix emits it at decode, from node i (graph_optimize: before allocation, no buffer checks)
+static bool ggml_vk_fn_decode_hc_wiring(const ggml_cgraph * g, int i) {
+    if (i + 5 > g->n_nodes) {
+        return false;
+    }
+    ggml_tensor * const * n = g->nodes + i;
+    return n[0]->op == GGML_OP_SCALE && n[1]->op == GGML_OP_UNARY && ggml_get_unary_op(n[1]) == GGML_UNARY_OP_SILU && n[1]->src[0] == n[0] &&
+           n[2]->op == GGML_OP_MUL_MAT && n[2]->src[1] == n[1] && n[3]->op == GGML_OP_RESHAPE && n[3]->src[0] == n[2] &&
+           n[4]->op == GGML_OP_DSV4_HC_PRE && n[4]->src[1] == n[3] && ggml_get_op_params_i32(n[4], 1) != 0;
+}
+
+// graph_compute: the FN_DECODE_HC chain at node i, on shapes where the unfused hc up MUL_MAT runs the f32-B q8_0 mat-vec in every
+// column chunk (decode, up to mul_mat_vec_max_cols tokens; never the q8_1 integer-dot path) and the fused pipelines exist
+static bool ggml_vk_can_fuse_fn_decode_hc(ggml_backend_vk_context * ctx, const ggml_cgraph * g, int i) {
+    if (!ggml_vk_fn_decode_hc_enabled() || !ggml_vk_fn_decode_hc_wiring(g, i)) {
+        return false;
+    }
+    const ggml_tensor * sc  = g->nodes[i];
+    const ggml_tensor * si  = g->nodes[i + 1];
+    const ggml_tensor * mm  = g->nodes[i + 2];
+    const ggml_tensor * rs  = g->nodes[i + 3];
+    const ggml_tensor * pre = g->nodes[i + 4];
+    const ggml_tensor * lo  = sc->src[0];
+    const ggml_tensor * w   = mm->src[0];
+    const ggml_tensor * x   = pre->src[0];
+    // the elided nodes have no reader outside the chain
+    for (int j = 0; j < 4; ++j) {
+        if ((g->nodes[i + j]->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(g, i + j) != 1) {
+            return false;
+        }
+    }
+    const int64_t k = w->ne[0], m = w->ne[1], nt = lo->ne[1], n_embd = m / 4;
+    // f32 activations, q8_0 weight [k, 4 * n_embd]; mm is a plain 2-D mat-vec (no hint but the exact-batch one)
+    if (lo->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 || si->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        pre->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    if (!ggml_is_contiguous(lo) || !ggml_are_same_shape(lo, sc) || !ggml_are_same_shape(lo, si) || !ggml_is_contiguous(si) ||
+        lo->ne[0] != k || lo->ne[2] != 1 || lo->ne[3] != 1 || k % 32 != 0 ||
+        !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1 || m % 4 != 0 ||
+        ggml_nbytes(w) > ctx->device->properties.limits.maxStorageBufferRange ||
+        mm->ne[0] != m || mm->ne[1] != nt || mm->ne[2] != 1 || mm->ne[3] != 1 || !ggml_is_contiguous(mm) ||
+        (ggml_get_op_params_i32(mm, 1) != 0 && !ggml_vk_mul_mat_exact_batch(mm))) {
+        return false;
+    }
+    // x [n_embd, 4, nt] with unit element stride; the mixed stream [n_embd, nt], unit element stride
+    if (x->ne[0] != n_embd || x->ne[1] != 4 || x->ne[2] != nt || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+        x->nb[1] % sizeof(float) != 0 || x->nb[2] % sizeof(float) != 0 ||
+        pre->ne[0] != n_embd || pre->ne[1] != nt || pre->ne[2] != 1 || pre->ne[3] != 1 || pre->nb[0] != sizeof(float) || pre->nb[1] % sizeof(float) != 0) {
+        return false;
+    }
+    // ggml_vk_mul_mat sends it to ggml_vk_mul_mat_vec_q_f16 (not swapped). nt == 0: a ubatch with no outputs leaves the last
+    // layer's tail empty after out_ids; the empty-node skip comes after this match, so it must not reach the mat-vec getters
+    if (nt < 1 || nt > (int64_t) mul_mat_vec_max_cols || (uint64_t) m / 4 > ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        return false;
+    }
+    if (get_misalign_bytes(ctx, lo) != 0 || get_misalign_bytes(ctx, w) != 0 || get_misalign_bytes(ctx, x) != 0 || get_misalign_bytes(ctx, pre) != 0) {
+        return false;
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> chunks;
+    if (!ggml_vk_mmv_float_chunks(ctx, mm, chunks)) {
+        // the unfused up mat-vec quantizes B to q8_1 (q8_0 at 4 columns): fusing would change its numerics
+        ggml_vk_path_census_add("FN_DECODE_HC_MMVQ");
+        return false;
+    }
+    for (const auto & c : chunks) {
+        if (ggml_vk_fn_hc_up_mix_mv_pipeline(ctx, c.second, (uint32_t) m, (uint32_t) k) == nullptr) {
+            return false;
+        }
+    }
+    GGML_UNUSED(rs);
+    return true;
 }
 
 // Two forms. f16 gate (LLAMA_HC_GATE_F16 on): MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE, returns 3 (the extra fused nodes); the
@@ -21204,6 +21420,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_up_mix_cpy = false;
         ctx->fused_qsa_score = false;
         ctx->qsa_score_bias = nullptr;
+        ctx->fused_fn_decode_hc = false;
         ctx->fused_mmid_cpy16 = false;
         ctx->fused_mmid_glu = false;
         ctx->fused_mmid_pair_glu = false;
@@ -21660,6 +21877,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_up_mix_cpy = false;
                 ctx->fused_qsa_score = false;
                 ctx->qsa_score_bias = nullptr;
+                ctx->fused_fn_decode_hc = false;
                 ctx->fused_mmid_cpy16 = false;
                 ctx->fused_mmid_glu = false;
                 ctx->fused_mmid_pair_glu = false;
@@ -21722,6 +21940,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_mm_cpy16 = false;
         ctx->fused_hc_up_mix = false;
         ctx->fused_hc_up_mix_cpy = false;
+        ctx->fused_fn_decode_hc = false;
         ctx->fused_mmid_cpy16 = false;
         ctx->fused_mmid_glu = false;
         ctx->fused_mmid_pair_glu = false;
@@ -22062,6 +22281,14 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return keep_pattern(pattern);
         };
 
+        // FN_DECODE_HC: SCALE + SILU + MUL_MAT + RESHAPE + DSV4_HC_PRE stay consecutive, and the chain's inputs (lo, the weight,
+        // x) stay allocated until the HC pre: the fused mat-vec reads them while it writes the mixed stream
+        if (ggml_vk_fn_decode_hc_enabled() && ggml_vk_fn_decode_hc_wiring(graph, first_unused) &&
+            match_pattern(fn_decode_hc_pattern, first_unused) && graph->nodes[first_unused + 2]->ne[1] <= (int64_t) mul_mat_vec_max_cols) {
+            if (params && params->add_alloc_dep) {
+                add_pattern_alloc_deps(fn_decode_hc_pattern, first_unused + 4);
+            }
+            keep_pattern(fn_decode_hc_pattern);
         // HC_UP_MIX_PAD: either HC_UP_MIX form + the CPY into the padded mixed stream (LLAMA_HC_MIX_PAD) stay consecutive
         if (ggml_vk_hc_up_mix_enabled() &&
             match_pattern({ GGML_OP_MUL_MAT, GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE, GGML_OP_CPY }, first_unused) &&

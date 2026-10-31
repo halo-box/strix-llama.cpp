@@ -38,7 +38,42 @@ layout (push_constant) uniform parameter
     uint broadcast2;
     uint broadcast3;
 #endif
+#ifdef HC_MIX
+    // FN_DECODE_HC (vk_mat_vec_hc_mix_push_constants): the qwen4exp hc up mat-vec with SCALE + SILU applied to B as it is
+    // loaded and the gated hc pre (DSV4_HC_PRE) as the store
+    uint  hc_n_embd;     // n_embd; the weight has 4 * n_embd rows, read as logical row L = i*4 + c -> c*n_embd + i
+    uint  hc_x_offset;   // element offset of x (f32 hc norm [n_embd, 4, N]) in binding 3
+    uint  hc_x_s1;       // x element stride between streams
+    uint  hc_x_s2;       // x element stride between tokens
+    uint  hc_d_s1;       // mixed output element stride between tokens (binding 2 at d_offset)
+    float hc_in_scale;   // SCALE param 1 (scale.comp: x * s + b)
+    float hc_in_bias;    // SCALE param 2
+    float hc_mix_scale;  // DSV4_HC_PRE scale
+#endif
 } p;
+
+#ifdef HC_MIX
+// logical row L (i*4 + c) -> weight row c*n_embd + i
+uint hc_phys_row(const uint L) {
+    return (L & 3u) * p.hc_n_embd + (L >> 2u);
+}
+// the unfused SCALE then SILU on one loaded B vector, with the expressions of scale.comp and unary.comp (op_silu)
+vec4 hc_b_silu(vec4 v) {
+    v = v * p.hc_in_scale + p.hc_in_bias;
+    return v / (1.0f + exp(-v));
+}
+// the store of a workgroup's 4 rows (the 4 streams of column i, token j): dsv4_hc_pre.comp's GATED expression and order
+void hc_mix_store(const FLOAT_TYPE g[4], const uint j, const uint first_row) {
+    const uint i  = first_row >> 2u;
+    const uint xb = p.hc_x_offset + i + j * p.hc_x_s2;
+    float result = 0.0f;
+    [[unroll]] for (uint ih = 0; ih < 4; ++ih) {
+        const float wv = 1.0f / (1.0f + exp(-float(g[ih])));
+        result = fma(float(data_fuse0[xb + ih * p.hc_x_s1]), wv, result);
+    }
+    data_d[j * p.hc_d_s1 + i] = D_TYPE(p.hc_mix_scale * result);
+}
+#endif
 
 #ifdef MUL_MAT_ID
 uint expert_id;
@@ -98,6 +133,20 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
         }
     }
 
+#ifdef HC_MIX
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            // NUM_ROWS is 4 here (the host creates the HC_MIX pipelines with 4 rows); indexed in a loop, as the spec constant's
+            // default is 1
+            FLOAT_TYPE g[4];
+            [[unroll]] for (uint n = 0; n < 4; ++n) {
+                g[n] = temp[j][n];
+            }
+            hc_mix_store(g, j, first_row);
+        }
+    }
+    return;
+#endif
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -149,6 +198,21 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
         }
     }
     barrier();
+#ifdef HC_MIX
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            FLOAT_TYPE g[4];
+            [[unroll]] for (uint n = 0; n < 4; ++n) {
+                g[n] = FLOAT_TYPE(0);
+                [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
+                    g[n] += tmpsh[j][n][s];
+                }
+            }
+            hc_mix_store(g, j, first_row);
+        }
+    }
+    return;
+#endif
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -198,6 +262,18 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
         }
         barrier();
     }
+#ifdef HC_MIX
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            FLOAT_TYPE g[4];
+            [[unroll]] for (uint n = 0; n < 4; ++n) {
+                g[n] = tmpsh[j][n][0];
+            }
+            hc_mix_store(g, j, first_row);
+        }
+    }
+    return;
+#endif
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
