@@ -1208,7 +1208,27 @@ static vk::Event ggml_vk_create_event(ggml_backend_vk_context * ctx) {
 void ggml_vk_command_pool_cleanup(vk_device& device, vk_command_pool& p) {
     VK_LOG_DEBUG("ggml_vk_command_pool_cleanup()");
 
+    // GGML_VK_CMD_RESET_USED=0 restores the whole-pool reset.
+    static const bool reset_used = [] {
+        const char * env = getenv("GGML_VK_CMD_RESET_USED");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
     // Requires command buffers to be done
+    if (reset_used) {
+        // The pool keeps every command buffer it ever allocated, and vkResetCommandPool resets all of them. A prefill
+        // that is split into many submissions (for example the first ubatch after a decode, which inherits the decode's
+        // small flops-per-submit budget) can leave a thousand or more behind, and every later cleanup, once per decoded
+        // token, would pay for all of them. Reset only the buffers used since the last cleanup: every path that clears
+        // in_use also resets the buffer, so a buffer not in use is already in the initial state.
+        for (auto& cmd_buffer : p.cmd_buffers) {
+            if (cmd_buffer.in_use) {
+                cmd_buffer.buf.reset();
+                cmd_buffer.in_use = false;
+            }
+        }
+        return;
+    }
     device->device.resetCommandPool(p.pool);
     // Don't clear the command buffers and mark them as not in use.
     // This allows us to reuse them
