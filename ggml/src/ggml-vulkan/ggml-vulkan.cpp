@@ -2859,6 +2859,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const bool rdna4 = device->architecture == AMD_RDNA4;
 
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, false, false}, tc_mm, "matmul_f32_f32",     matmul_f32_f32_cm1_len,     matmul_f32_f32_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
+        {
+            // the same GEMM with the qwen4exp QSA scorer epilogue (QSA_SCORE, ggml_vk_match_qsa_score): same tiles, 4th binding = bias
+            vk_matmul_pipeline_key kq{GGML_TYPE_F32, GGML_TYPE_F32, false, false};
+            kq.qsa = true;
+            cm1_create(kq, tc_mm, "matmul_f32_f32_qsa", matmul_f32_f32_qsa_cm1_len, matmul_f32_f32_qsa_cm1_data, sizeof(vk_mat_mat_qsa_push_constants), 4);
+        }
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F16, false, false}, tc_mm, "matmul_f32_f16",     matmul_f32_f16_cm1_len,     matmul_f32_f16_cm1_data,     sizeof(vk_mat_mat_push_constants), 3);
         if (device->coopmat_acc_f16_support) {
             cm1_create({GGML_TYPE_F16, GGML_TYPE_F16, false, true},  tc_mm, "matmul_f16_f16acc", matmul_f16_f16acc_cm1_len, matmul_f16_f16acc_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
@@ -9112,7 +9118,167 @@ static void ggml_vk_dsv4_hc_post_norm(ggml_backend_vk_context * ctx, vk_context&
         pc, { hc * nt, 1, 1 });
 }
 
+// qwen4exp QSA indexer scorer fusion (QSA_SCORE; port of the fork's 7bf81a7bc as shipped in its v0.8, idea from
+// halo-box/strix-llama.cpp#91, Gaetan Puleo). Default on; GGML_VK_QSA_SCORE=0 disables it (graph and kernels as without it),
+// =2 keeps only the graph order below (the control for the fusion itself).
+static int ggml_vk_qsa_score_mode() {
+    static const int m = [] { const char * e = getenv("GGML_VK_QSA_SCORE"); return e ? atoi(e) : 1; }();
+    return m;
+}
+// graph_optimize keeps the chain in order (modes 1 and 2)
+static bool ggml_vk_qsa_score_order_enabled() {
+    return ggml_vk_qsa_score_mode() != 0;
+}
+static const std::vector<vk_matmul_pipeline_pair> * ggml_vk_qsa_score_pipelines(const ggml_backend_vk_context * ctx) {
+    vk_matmul_pipeline_key key{GGML_TYPE_F32, GGML_TYPE_F32, false, false};
+    key.qsa = true;
+    auto it = ctx->device->pipeline_matmul.find(key);
+    return (it == ctx->device->pipeline_matmul.end() || it->second.empty()) ? nullptr : &it->second;
+}
+
+// qwen4exp QSA indexer scorer (build_qsa_top_k), 4 indexer heads:
+//   score = MUL_MAT(pooled keys F32 [K, M, ns], q F32 [K, 4*nt, ns])     [M, 4*nt, ns]
+//   RESHAPE [M, 4, nt, ns] -> RELU -> CONT(VIEW h0) -> ADD(VIEW h1) -> ADD(VIEW h2) -> ADD(VIEW h3) (-> ADD(block bias))
+// matmul_f32_f32_qsa is the GEMM the unfused MUL_MAT runs here (matmul_f32_f32, B read in place, no split-k) with the relu,
+// the head sum and the bias applied in its epilogue, so neither the [M, 4*nt] scores nor their relu copy is written.
+// Returns the index of the last fused node (0: no match); *bias_out gets the bias tensor or nullptr.
+static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** bias_out) {
+    *bias_out = nullptr;
+    if (ggml_vk_qsa_score_mode() != 1 || !ctx->device->coopmat_support || ctx->device->coopmat2 || ggml_vk_qsa_score_pipelines(ctx) == nullptr) {
+        return 0;
+    }
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm)) {
+        return 0;
+    }
+    const ggml_tensor * k = mm->src[0];
+    const ggml_tensor * q = mm->src[1];
+    constexpr int64_t H = 4;
+    // no broadcast, no split-k (k < 2048), M and N above the mat-vec and small-tile cutoffs, one dispatch on the n axis
+    if (k->type != GGML_TYPE_F32 || q->type != GGML_TYPE_F32 || !ggml_is_contiguous(k) || !ggml_is_contiguous(q) ||
+        k->ne[2] != q->ne[2] || k->ne[3] != 1 || q->ne[3] != 1 || k->ne[0] >= 2048 ||
+        mm->ne[0] <= 64 || mm->ne[1] <= 64 || mm->ne[1] % H != 0 ||
+        mm->ne[2] > ctx->device->properties.limits.maxComputeWorkGroupCount[2] ||
+        (uint64_t) mm->ne[1] > (uint64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[1] ||
+        ggml_nbytes(k) > ctx->device->properties.limits.maxStorageBufferRange ||
+        get_misalign_bytes(ctx, k) || get_misalign_bytes(ctx, q) || ggml_vk_mul_mat_exact_batch(mm)) {
+        return 0;
+    }
+    const int64_t M = mm->ne[0], nt = mm->ne[1] / H, ns = mm->ne[2];
+
+    const ggml_tensor * reshape = nullptr;
+    const ggml_tensor * relu    = nullptr;
+    const ggml_tensor * cur     = nullptr;   // the running head sum
+    int heads = 0;                          // heads summed into cur
+    int last  = 0;
+    // the chain is at most qsa_score_pattern long, which fits the per-fusion source flags in ggml_backend_vk_graph_compute
+    constexpr int max_nodes = (int) qsa_score_pattern.size();
+    int idxs[max_nodes];
+    ggml_op ops[max_nodes];
+    int count = 0;
+    idxs[count] = node_idx; ops[count++] = mm->op;
+    // the view of head h of relu: [M, nt, ns] at offset h*nb[1]
+    auto is_head_view = [&](const ggml_tensor * v, int h) {
+        return relu && v->op == GGML_OP_VIEW && v->src[0] == relu && v->type == GGML_TYPE_F32 &&
+               v->ne[0] == M && v->ne[1] == nt && v->ne[2] == ns && v->ne[3] == 1 &&
+               v->nb[1] == relu->nb[2] && v->nb[2] == relu->nb[3] && v->view_offs == (size_t) h * relu->nb[1];
+    };
+    auto is_sum = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == M && t->ne[1] == nt && t->ne[2] == ns && t->ne[3] == 1;
+    };
+    for (int j = node_idx + 1; j < cgraph->n_nodes && count < max_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        bool take = false;
+        if (!reshape) {
+            take = n->op == GGML_OP_RESHAPE && n->src[0] == mm && n->ne[0] == M && n->ne[1] == H && n->ne[2] == nt && n->ne[3] == ns;
+            if (take) { reshape = n; }
+        } else if (!relu) {
+            take = n->op == GGML_OP_UNARY && ggml_get_unary_op(n) == GGML_UNARY_OP_RELU && n->src[0] == reshape &&
+                   n->type == GGML_TYPE_F32 && ggml_is_contiguous(n);
+            if (take) { relu = n; }
+        } else if (n->op == GGML_OP_VIEW) {
+            for (int h = 0; h < H && !take; ++h) { take = is_head_view(n, h); }
+        } else if (heads == 0) {
+            take = n->op == GGML_OP_CONT && is_sum(n) && is_head_view(n->src[0], 0);
+            if (take) { cur = n; heads = 1; }
+        } else if (heads < H) {
+            take = n->op == GGML_OP_ADD && is_sum(n) && n->src[0] == cur && is_head_view(n->src[1], heads);
+            if (take) { cur = n; heads++; last = j; }
+        } else {
+            // the block bias (masked path): one value per (block, query), added once after the head sum
+            const ggml_tensor * b = n->src[1];
+            take = n->op == GGML_OP_ADD && is_sum(n) && n->src[0] == cur && b && is_sum(b) && b != relu &&
+                   b->view_src == nullptr && !get_misalign_bytes(ctx, b);
+            if (take) { *bias_out = b; cur = n; last = j; }
+        }
+        if (!take) {
+            break;
+        }
+        idxs[count] = j; ops[count++] = n->op;
+        if (*bias_out) {
+            break;
+        }
+    }
+    if (heads != H || last != idxs[count - 1]) {
+        static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+        static int n_dbg = 0;
+        if (dbg && reshape && n_dbg < 4) {
+            n_dbg++;
+            GGML_LOG_DEBUG("ggml_vulkan: QSA_SCORE no match at node %d (heads %d, bias %d):", node_idx, heads, *bias_out != nullptr);
+            for (int j = node_idx; j < std::min(node_idx + 16, cgraph->n_nodes); ++j) {
+                GGML_LOG_DEBUG(" %s", ggml_op_desc(cgraph->nodes[j]));
+            }
+            GGML_LOG_DEBUG("\n");
+        }
+        *bias_out = nullptr;
+        return 0;
+    }
+    // everything from the GEMM to the last ADD is the chain, and only the last node is read outside it
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, &last, 1) || get_misalign_bytes(ctx, cgraph->nodes[last])) {
+        *bias_out = nullptr;
+        return 0;
+    }
+    return last;
+}
+
+// The QSA scorer fusion (ggml_vk_match_qsa_score): the unfused MUL_MAT's GEMM (same pipeline choice, strides and dispatch as
+// ggml_vk_mul_mat_q_f16 for an f32 x f32 product read in place), whose epilogue writes the relu'd head sum (+ block bias)
+// straight to the chain's last node
+static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mm, const ggml_tensor * bias, ggml_tensor * out) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const uint32_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1], ns = src1->ne[2];
+
+    const std::vector<vk_matmul_pipeline_pair> * mmp = ggml_vk_qsa_score_pipelines(ctx);
+    GGML_ASSERT(mmp != nullptr);
+    const uint32_t kpad = ggml_vk_align_size(K, ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp, M, N, false));
+    const bool aligned = K == kpad && M > 8 && N > 8;
+    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp, M, N, aligned, false);
+    GGML_ASSERT(pipeline != nullptr);
+    if (ctx->perf_logger) {
+        ctx->perf_logger->count_path(std::string("f16:") + pipeline->name + " f32 m=" + std::to_string(M) + " k=" + std::to_string(K));
+    }
+
+    vk_mat_mat_qsa_push_constants pc {};
+    pc.mm = { M, N, K, K, K, (uint32_t) (out->nb[1] / sizeof(float)),
+              ggml_vk_batch_stride(src0), ggml_vk_batch_stride(src1), (uint32_t) (out->nb[2] / sizeof(float)),
+              0, ns, K, ns, ns, 1, 1, N };
+    pc.has_bias          = bias != nullptr;
+    pc.stride_bias       = bias ? (uint32_t) (bias->nb[1] / sizeof(float)) : 0;
+    pc.batch_stride_bias = bias ? (uint32_t) (bias->nb[2] / sizeof(float)) : 0;
+
+    vk_subbuffer out_buf = ggml_vk_tensor_subbuffer(ctx, out);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, src1), out_buf,
+          bias ? ggml_vk_tensor_subbuffer(ctx, bias) : out_buf }, pc, { M, N, ns });
+}
+
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->fused_qsa_score) {
+        ggml_vk_qsa_score(ctx, subctx, cgraph->nodes[node_idx], ctx->qsa_score_bias, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+        return;
+    }
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
@@ -18745,6 +18911,9 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     if (l == "TOPK_QSA" && !dev->pipeline_topk_radix_qsa) {
         return "no radix top-k pipeline";
     }
+    if (l == "QSA_SCORE" && (!dev->coopmat_support || dev->coopmat2 || ggml_vk_qsa_score_pipelines(ctx) == nullptr)) {
+        return "no KHR coopmat f32 QSA scorer pipeline (coopmat2 devices keep the unfused chain)";
+    }
     if (l == "QSA_EXPAND" && (!dev->pipeline_qsa_expand[0] || !dev->pipeline_qsa_expand[1])) {
         return "no 512-thread workgroups";
     }
@@ -19247,6 +19416,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
         ctx->fused_mm_cpy16 = false;
         ctx->fused_hc_up_mix = false;
+        ctx->fused_qsa_score = false;
+        ctx->qsa_score_bias = nullptr;
         ctx->fused_mmid_cpy16 = false;
         ctx->fused_mmid_glu = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -19260,6 +19431,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (const int qsa_last = cgraph->nodes[i]->op == GGML_OP_MUL_MAT ? ggml_vk_match_qsa_score(ctx, cgraph, i, &ctx->qsa_score_bias) : 0) {
+                ctx->num_additional_fused_ops = qsa_last - i;
+                ctx->fused_qsa_score = true;
+                fusion_string = "QSA_SCORE";
+                static_assert(qsa_score_pattern.size() <= sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0]),
+                              "the QSA_SCORE chain must fit the per-fusion source flags");
+                // the epilogue reads the keys, the queries and the bias while it writes the sum: no aliasing at all
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -19612,6 +19791,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_norm = HC_POST_NORM_NONE;
                 ctx->fused_mm_cpy16 = false;
                 ctx->fused_hc_up_mix = false;
+                ctx->fused_qsa_score = false;
+                ctx->qsa_score_bias = nullptr;
                 ctx->fused_mmid_cpy16 = false;
                 ctx->fused_mmid_glu = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -19989,6 +20170,20 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(topk_qsa_pattern)) {
             continue;
         }
+        // QSA scorer chain (QSA_SCORE), prefill only: the fusion needs more than 64 query-head columns; decode keeps its order.
+        // The fused GEMM reads the keys, the query view and the bias while it writes the head sum, so they stay allocated through
+        // it (without that ggml-alloc can put a strip's sum on the layer's q, freed after its last strip).
+        if (ggml_vk_qsa_score_order_enabled() && graph->nodes[first_unused]->op == GGML_OP_MUL_MAT && graph->nodes[first_unused]->ne[1] > 64 &&
+            graph->nodes[first_unused]->type == GGML_TYPE_F32) {
+            const bool with_bias = match_pattern(qsa_score_pattern, first_unused);
+            if ((with_bias || match_pattern(qsa_score_pattern_nobias, first_unused)) && params && params->add_alloc_dep) {
+                const auto & pat = with_bias ? qsa_score_pattern : qsa_score_pattern_nobias;
+                add_pattern_alloc_deps(pat, first_unused + (int) pat.size() - 1);
+            }
+            if (keep_pattern(qsa_score_pattern) || keep_pattern(qsa_score_pattern_nobias)) {
+                continue;
+            }
+        }
 
         // RMS_NORM_MUL_SIGMUL_CPY: the SIGMOID does not read the MUL before it, so a reorder could pull it away; the fused
         // kernel reads x, gamma and z while it writes the f16 rows, so they stay allocated through the CPY
@@ -20209,6 +20404,19 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 for (int o = 0; o < (int) topk_qsa_pattern.size(); ++o) {
                     if (n - o >= 0 && match_pattern(topk_qsa_pattern, n - o)) {
                         return true;
+                    }
+                }
+                // every node of a QSA scorer chain (QSA_SCORE), so the grab cannot take its GEMM or its sum apart
+                if (ggml_vk_qsa_score_order_enabled()) {
+                    for (const auto * pat : { &qsa_score_pattern, &qsa_score_pattern_nobias }) {
+                        for (int o = 0; o < (int) pat->size(); ++o) {
+                            // the cheap GEMM test first: this runs for every candidate node, decode graphs included
+                            if (n - o >= 0 && graph->nodes[n - o]->op == GGML_OP_MUL_MAT && graph->nodes[n - o]->ne[1] > 64 &&
+                                graph->nodes[n - o]->type == GGML_TYPE_F32 && match_pattern(*pat, n - o) &&
+                                graph->nodes[n - o + 2]->src[0] == graph->nodes[n - o + 1]) {
+                                return true;
+                            }
+                        }
                     }
                 }
                 return false;

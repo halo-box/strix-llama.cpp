@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -9463,6 +9464,307 @@ struct test_topk_qsa : public test_case {
     }
 };
 
+// qwen4exp QSA indexer scorer: MUL_MAT(pooled keys, q) -> relu -> 4-head sum (-> + block bias), the chain build_qsa_top_k
+// emits for one query strip; the Vulkan backend fuses it into one GEMM epilogue (QSA_SCORE, GGML_VK_QSA_SCORE). n_pool > n_blocks
+// scores a leading view of the pooled keys (the score_key_limits bound); q_first > 0 or q_rows > n_tps scores a strip view of a
+// longer q, as every strip but the single whole one does. exact: inputs are multiples of 1/8, so every product and partial sum
+// is exact in f16 inputs and f32 accumulation and the result must match the CPU bit for bit.
+struct test_qsa_score : public test_case {
+    const int64_t K;
+    const int64_t n_blocks;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const bool    bias;
+    const bool    exact;   // false: uniform inputs, the NMSE vs the CPU then measures the f16 GEMM rounding
+    const int64_t n_pool;  // pooled blocks (>= n_blocks)
+    const int64_t q_first; // the strip's first query in q
+    const int64_t q_rows;  // queries in q (>= q_first + n_tps)
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_SCORE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR9(K, n_blocks, n_tps, n_stream, bias, exact, n_pool, q_first, q_rows);
+    }
+
+    test_qsa_score(int64_t K = 128, int64_t n_blocks = 512, int64_t n_tps = 64, int64_t n_stream = 1, bool bias = false, bool exact = true,
+                   int64_t n_pool = 0, int64_t q_first = 0, int64_t q_rows = 0)
+        : K(K), n_blocks(n_blocks), n_tps(n_tps), n_stream(n_stream), bias(bias), exact(exact),
+          n_pool(std::max(n_pool, n_blocks)), q_first(q_first), q_rows(std::max(q_rows, q_first + n_tps)) {}
+
+    double max_err() override { return exact ? 0.0 : 1e-6; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = 4;
+        ggml_tensor * pooled = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, n_pool, n_stream);
+        ggml_set_name(pooled, "pooled");
+        ggml_tensor * keys = n_pool > n_blocks ? ggml_view_3d(ctx, pooled, K, n_blocks, n_stream, pooled->nb[1], pooled->nb[2], 0) : pooled;
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, H, q_rows * n_stream);
+        ggml_set_name(q, "q");
+        ggml_tensor * qs = q_rows == n_tps ? ggml_reshape_3d(ctx, q, K, H*n_tps, n_stream)
+            : ggml_view_3d(ctx, q, K, H*n_tps, n_stream, q->nb[1], q->nb[2]*q_rows, q_first*q->nb[2]);
+
+        ggml_tensor * score = ggml_mul_mat(ctx, keys, qs);
+        score = ggml_reshape_4d(ctx, score, n_blocks, H, n_tps, n_stream);
+        score = ggml_relu(ctx, score);
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < H; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx, score, n_blocks, n_tps, n_stream, score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx, summed, slice) : ggml_cont(ctx, slice);
+        }
+        if (bias) {
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+            ggml_set_name(b, "bias");
+            summed = ggml_add(ctx, summed, b);
+        }
+        out = summed;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            std::vector<float> data(ggml_nelements(t));
+            const bool is_bias = strcmp(t->name, "bias") == 0;
+            if (!exact && !is_bias) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+                continue;
+            }
+            for (auto & v : data) {
+                // the bias is 0 or a large negative (the masked path's -inf, finite so the error stays defined)
+                v = is_bias ? ((rand() % 4) == 0 ? -1024.0f : 0.0f) : (float) (rand() % 17 - 8) / 8.0f;
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+        }
+    }
+
+    // the Vulkan matcher's shape gate (ggml_vk_match_qsa_score): contiguous operands, M and N above 64, K below 2048
+    bool fusable() const {
+        return n_blocks > 64 && 4 * n_tps > 64 && K < 2048 && (n_stream == 1 || (n_pool == n_blocks && q_rows == n_tps));
+    }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_SCORE", "QSA_SCORE")) {
+            return true;
+        }
+        const int64_t n = dispatch_census_count(backend, "QSA_SCORE");
+        const int64_t want = env_knob_on("GGML_VK_QSA_SCORE") && fusable() ? 1 : 0;
+        if (n != want) {
+            msg = "QSA_SCORE dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        return true;
+    }
+};
+
+// One qwen4exp maskless QSA layer's block selection over its query strips, as build_qsa_top_k builds it with compact
+// visibility (one sequence): per strip the scorer (QSA_SCORE on Vulkan) on the score_key_limits view of the pooled keys,
+// the visibility ops on the I32 limits, qwen4exp_select_complete_blocks (top-k blocks in ascending order, expanded to their
+// cells, -1 for a picked invisible block) and the tail cells; the strips joined along ne[1]. pos0 is the first query's
+// position (blocks = (pos0 + n_tps) / r); queries that see fewer than the budget get -1 sentinels. trim: only the last strip,
+// scored from a q of its own rows (LLAMA_FN_LAST_ATTN_TRIM). The scores are exact and distinct per query (a block-unique
+// integer in two f16-exact key dims plus exact noise below the gap), so the selection, ties excluded, must equal the CPU's.
+struct test_qsa_strip : public test_case {
+    const int64_t pos0;
+    const int64_t n_tps;
+    const int64_t strip;
+    const int64_t budget;   // blocks
+    const bool    trim;
+    static constexpr int64_t K = 128, H = 4, r = 4;
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_STRIP";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(pos0, n_tps, strip, budget, trim);
+    }
+
+    test_qsa_strip(int64_t pos0 = 1024, int64_t n_tps = 1024, int64_t strip = 512, int64_t budget = 512, bool trim = false)
+        : pos0(pos0), n_tps(n_tps), strip(strip), budget(budget), trim(trim) {
+        GGML_ASSERT((n_tps - q_first() + strip - 1) / strip <= 2);   // ~50 tensors per strip, 128 in the harness context
+    }
+
+    int64_t n_blocks() const { return (pos0 + n_tps) / r; }
+    int64_t q_first() const { return trim ? ((n_tps - 1) / strip) * strip : 0; }
+    // qsa_prefix_limits: the blocks a strip's last query can see, at least the budget
+    int64_t score_blocks(int64_t first) const {
+        const int64_t last = std::min(n_tps, first + strip) - 1;
+        return std::min(n_blocks(), std::max(budget, (pos0 + last + 1) / r));
+    }
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nb = n_blocks(), q0 = q_first(), n_q = n_tps - q0;
+        GGML_ASSERT(nb >= budget);
+        ggml_tensor * pooled = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, nb, 1);
+        ggml_set_name(pooled, "pooled");
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, H, n_q);
+        ggml_set_name(q, "q");
+        ggml_tensor * limits = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb + 2 * n_tps);
+        ggml_set_name(limits, "limits");
+        ggml_tensor * blk_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r * nb, 1);
+        ggml_set_name(blk_cells, "blk_cells");
+        ggml_tensor * tail_idxs = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, r - 1, n_tps, 1, 1);
+        ggml_set_name(tail_idxs, "tail_idxs");
+
+        ggml_tensor * joined = nullptr;
+        for (int64_t first = q0; first < n_tps; first += strip) {
+            const int64_t n_query = std::min(strip, n_tps - first);
+            const int64_t sb = score_blocks(first);
+            ggml_tensor * keys = sb < nb ? ggml_view_3d(ctx, pooled, K, sb, 1, pooled->nb[1], pooled->nb[2], 0) : pooled;
+            const bool whole = first == 0 && n_query == n_tps;
+            ggml_tensor * qs = whole ? ggml_reshape_3d(ctx, q, K, H*n_tps, 1)
+                : ggml_view_3d(ctx, q, K, H*n_query, 1, q->nb[1], q->nb[2]*n_q, (first - q0)*q->nb[2]);
+            ggml_tensor * score = ggml_mul_mat(ctx, keys, qs);
+            score = ggml_reshape_4d(ctx, score, sb, H, n_query, 1);
+            score = ggml_relu(ctx, score);
+            ggml_tensor * summed = nullptr;
+            for (int64_t h = 0; h < H; ++h) {
+                ggml_tensor * slice = ggml_view_3d(ctx, score, sb, n_query, 1, score->nb[2], score->nb[3], h*score->nb[1]);
+                summed = summed ? ggml_add(ctx, summed, slice) : ggml_cont(ctx, slice);
+            }
+            // qwen4exp_apply_compact_visibility, one sequence
+            ggml_tensor * starts = ggml_cast(ctx, ggml_view_1d(ctx, limits, sb, 0), GGML_TYPE_F32);
+            ggml_tensor * tails  = ggml_cast(ctx, ggml_view_1d(ctx, limits, n_query, (nb + first)*sizeof(int32_t)), GGML_TYPE_F32);
+            tails = ggml_reshape_2d(ctx, tails, 1, n_query);
+            ggml_tensor * visible = ggml_step(ctx, ggml_sub(ctx, ggml_repeat(ctx, tails, summed), starts));
+            score = ggml_add(ctx, summed, ggml_log(ctx, visible));
+            // qwen4exp_select_complete_blocks
+            ggml_tensor * tail = whole ? ggml_reshape_4d(ctx, tail_idxs, r-1, n_tps, 1, 1)
+                : ggml_view_4d(ctx, tail_idxs, r-1, n_query, 1, 1, tail_idxs->nb[1], tail_idxs->nb[2], tail_idxs->nb[2], first*tail_idxs->nb[1]);
+            ggml_tensor * block_cells = sb < nb ? ggml_view_2d(ctx, blk_cells, r*sb, 1, blk_cells->nb[1], 0) : blk_cells;
+            ggml_tensor * blocks = ggml_cont(ctx, ggml_top_k(ctx, score, budget));
+            ggml_tensor * order = ggml_argsort(ctx, ggml_cast(ctx, blocks, GGML_TYPE_F32), GGML_SORT_ORDER_ASC);
+            ggml_tensor * blocks_view = ggml_view_4d(ctx, blocks, 1, budget, n_query, 1, blocks->nb[0], blocks->nb[1], blocks->nb[2], 0);
+            blocks = ggml_reshape_3d(ctx, ggml_get_rows(ctx, blocks_view, order), budget, n_query, 1);
+            ggml_tensor * score_view = ggml_view_4d(ctx, score, 1, sb, n_query, 1, score->nb[0], score->nb[1], score->nb[2], 0);
+            ggml_tensor * picked = ggml_get_rows(ctx, score_view, blocks);
+            ggml_tensor * valid = ggml_step(ctx, ggml_scale_bias(ctx, picked, 1.0f, 1.0f));
+            ggml_tensor * cells_view = ggml_reshape_3d(ctx, block_cells, r, sb, 1);
+            ggml_tensor * cells = ggml_get_rows(ctx, cells_view, ggml_reshape_2d(ctx, blocks, budget*n_query, 1));
+            cells = ggml_reshape_4d(ctx, cells, r, budget, n_query, 1);
+            cells = ggml_scale_bias(ctx, ggml_cast(ctx, cells, GGML_TYPE_F32), 1.0f, 1.0f);
+            cells = ggml_mul(ctx, cells, valid);
+            cells = ggml_cast(ctx, ggml_scale_bias(ctx, cells, 1.0f, -1.0f), GGML_TYPE_I32);
+            cells = ggml_reshape_4d(ctx, cells, budget*r, n_query, 1, 1);
+            ggml_tensor * sel = ggml_concat(ctx, cells, tail, 0);
+            joined = joined ? ggml_concat(ctx, joined, sel, 1) : sel;
+        }
+        out = joined;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t nb = n_blocks(), n_q = n_tps - q_first();
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            const std::string name = t->name;
+            if (name == "pooled") {
+                // block b's unique integer u = perm[b] in dims 0, 1 (64 * hi + lo, f16-exact), multiples of 1/8 in [-1, 1] elsewhere
+                std::vector<int32_t> perm(nb);
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                std::vector<float> data(K * nb);
+                for (int64_t b = 0; b < nb; ++b) {
+                    data[b*K + 0] = (float) (perm[b] / 64);
+                    data[b*K + 1] = (float) (perm[b] % 64);
+                    for (int64_t d = 2; d < K; ++d) {
+                        data[b*K + d] = (float) ((int) (rng() % 17) - 8) / 8.0f;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (name == "q") {
+                // per (query, head) a weight c in {1/2, 1, 2} on u, and for head 3 minus (the other three + 1): its relu is 0 but
+                // at u = 0, and without the relu the four heads would rank the blocks in reverse. Noise of {-1, 0, 1}/32 on dims
+                // 2..17 only: |noise| <= 16/256 per head stays below half the gap between neighbouring u (>= 3/2), so the scores
+                // are distinct, and every partial sum is a multiple of 1/256 below 2^16 (|c u| <= 7 * 8191): exact in f32
+                static const float cw[3] = { 0.5f, 1.0f, 2.0f };
+                std::vector<float> data(K * H * n_q, 0.0f);
+                float c_sum = 0.0f;
+                for (int64_t i = 0; i < H * n_q; ++i) {
+                    const float c = (i % H) == 3 ? -(c_sum + 1.0f) : cw[rng() % 3];
+                    c_sum = (i % H) == 3 ? 0.0f : c_sum + c;
+                    data[i*K + 0] = 64.0f * c;
+                    data[i*K + 1] = c;
+                    for (int64_t d = 2; d < 18; ++d) {
+                        data[i*K + d] = (float) ((int) (rng() % 3) - 1) / 32.0f;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (name == "limits") {
+                // [block start] ++ [tail start per query] ++ [row 0]: block b is visible to the query at p iff b*r < (p+1)/r*r
+                std::vector<int32_t> data(nb + 2 * n_tps, 0);
+                for (int64_t b = 0; b < nb; ++b) {
+                    data[b] = (int32_t) (b * r);
+                }
+                for (int64_t t2 = 0; t2 < n_tps; ++t2) {
+                    data[nb + t2] = (int32_t) ((pos0 + t2 + 1) / r * r);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (name == "blk_cells") {
+                std::vector<int32_t> data(r * nb);
+                for (int64_t i = 0; i < r * nb; ++i) {
+                    data[i] = (int32_t) i;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (name == "tail_idxs") {
+                // the query's cells past its last complete block, -1 padded
+                std::vector<int32_t> data((r - 1) * n_tps);
+                for (int64_t t2 = 0; t2 < n_tps; ++t2) {
+                    const int64_t p = pos0 + t2, tail = (p + 1) / r * r;
+                    for (int64_t i = 0; i < r - 1; ++i) {
+                        data[t2*(r - 1) + i] = tail + i <= p ? (int32_t) (tail + i) : -1;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_SCORE", "QSA_SCORE")) {
+            return true;
+        }
+        int64_t want = 0;
+        for (int64_t first = q_first(); first < n_tps; first += strip) {
+            want += score_blocks(first) > 64 && 4 * std::min(strip, n_tps - first) > 64;
+        }
+        if (!env_knob_on("GGML_VK_QSA_SCORE")) {
+            want = 0;
+        }
+        const int64_t n = dispatch_census_count(backend, "QSA_SCORE");
+        if (n != want) {
+            msg = "QSA_SCORE dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        return true;
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -15377,6 +15679,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
 
+    // qwen4exp QSA indexer scorer (QSA_SCORE on Vulkan): K, blocks, queries, streams, bias, exact, pooled blocks, q_first, q rows
+    test_cases.emplace_back(new test_qsa_score(128, 8192, 512, 1, false));                  // FN strip: 8192 blocks x 512 queries
+    test_cases.emplace_back(new test_qsa_score(128, 8192, 512, 1, false, false));           // the same, uniform inputs (f16 rounding)
+    test_cases.emplace_back(new test_qsa_score(128, 8191, 509, 1, false));                  // ragged M and N tails
+    test_cases.emplace_back(new test_qsa_score(128, 777,  33,  1, false));
+    test_cases.emplace_back(new test_qsa_score(128, 8320, 512, 1, false, true, 8704));      // score_key_limits view of the pooled keys
+    test_cases.emplace_back(new test_qsa_score(128, 8448, 512, 1, false, true, 8704, 1024, 2048)); // a later strip of a 2048-query q
+    test_cases.emplace_back(new test_qsa_score(128, 2000, 100, 1, false, true, 2048, 412, 512));   // a ragged last strip
+    test_cases.emplace_back(new test_qsa_score(128, 512,  64,  1, true));                   // the masked path's block bias
+    test_cases.emplace_back(new test_qsa_score(128, 777,  33,  2, true));                   // 2 streams
+    test_cases.emplace_back(new test_qsa_score(128, 300,  50,  2, false, true, 400));       // 2 streams, bounded keys: unfused fallback
+    test_cases.emplace_back(new test_qsa_score(96,  200,  20,  1, true));                   // K not a multiple of the aligned load
+    test_cases.emplace_back(new test_qsa_score(128, 64,   64,  1, false));                  // M <= 64: unfused fallback
+    test_cases.emplace_back(new test_qsa_score(128, 512,  16,  1, false));                  // N <= 64: unfused fallback
+    // the whole strip chain of one layer (scorer + compact visibility + complete-block selection + tails), pos0 / queries / strip / budget
+    // (at most 2 strips per case: the harness context holds 128 tensors)
+    test_cases.emplace_back(new test_qsa_strip(1024,  1024, 512, 512));          // the first strip sees fewer blocks than the budget: -1 sentinels
+    test_cases.emplace_back(new test_qsa_strip(31744, 1024, 512, 512));          // FN at d31744: score_key_limits view on the first strip
+    test_cases.emplace_back(new test_qsa_strip(32256, 512,  512, 512));          // FN 8192 blocks x 512 queries, one whole strip
+    test_cases.emplace_back(new test_qsa_strip(4000,  700,  512, 512));          // ragged last strip (188 queries)
+    test_cases.emplace_back(new test_qsa_strip(31744, 1024, 512, 512, true));    // LLAMA_FN_LAST_ATTN_TRIM: the last strip only
+    test_cases.emplace_back(new test_qsa_strip(4000,  700,  512, 512, true));    // trimmed ragged strip
+
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
@@ -17296,6 +17621,10 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("TOPK_QSA",            new test_topk_qsa(512, 2048, 2, 1, 1500), "TOPK_QSA/7=1");
     add("QSA_EXPAND",          new test_qsa_expand(700, 9), "QSA_EXPAND/20=1");
     add("QSA_EXPAND",          new test_qsa_expand(2048, 4, 1, 2, 1), "QSA_EXPAND/21=2");
+    add("QSA_SCORE",           new test_qsa_score(128, 512, 128, 1, false), "QSA_SCORE/11=1");
+    add("QSA_SCORE",           new test_qsa_score(128, 512, 128, 1, true), "QSA_SCORE/12=1");
+    // the maskless strip as qwen4exp builds it: graph_optimize must keep the scorer chain in order with the visibility ops around it
+    add("QSA_SCORE",           new test_qsa_strip(32256, 512, 512, 512), "QSA_SCORE/11=1");
     add("TOPK_MOE_EARLY_SOFTMAX",      new test_topk_moe({ 32, 22, 1, 1 }, 8, false, false, GATING_FUNC_SOFTMAX), "TOPK_MOE_EARLY_SOFTMAX/5=1");
     add("TOPK_MOE_EARLY_SOFTMAX_NORM", new test_topk_moe({ 32, 22, 1, 1 }, 8, true,  false, GATING_FUNC_SOFTMAX), "TOPK_MOE_EARLY_SOFTMAX_NORM/10=1");
     add("TOPK_MOE_LATE_SOFTMAX",       new test_topk_moe({ 32, 22, 1, 1 }, 8, false, false, GATING_FUNC_SOFTMAX_WEIGHT), "TOPK_MOE_LATE_SOFTMAX/6=1");

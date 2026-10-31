@@ -268,10 +268,11 @@ struct vk_matmul_pipeline_key {
     bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl, GGML_VK_MM_PREFETCH)
     bool xl = false;    // the 256x256 XL tile tier of the pf variant (aligned only, ggml_vk_mm_xl_ok)
     bool hcmix = false; // the int8 MMQ hc up GEMM with the gated hc pre in its epilogue (HC_UP_MIX, mul_mmq_cm1.comp HC_EPI)
+    bool qsa = false;   // the f32 x f32 KHR coopmat GEMM with the QSA scorer epilogue (QSA_SCORE, mul_mm.comp QSA_EPI)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl, hcmix)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl, o.hcmix);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl, hcmix, qsa)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl, o.hcmix, o.qsa);
     }
 };
 
@@ -533,6 +534,22 @@ static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_R
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                    GGML_OP_TOP_K };
+
+// qwen4exp QSA indexer scorer as build_qsa_top_k emits it (QSA_SCORE, see ggml_vk_match_qsa_score): the GEMM, the relu and
+// the four head slices summed, then the block bias on the masked path. The maskless path applies the visibility through the
+// compact-limits ops (cast, repeat, sub, step, log, add) after the head sum, so only the shorter pattern matches there.
+// graph_optimize keeps either in this order; otherwise independent nodes are hoisted into the chain and it never fuses.
+static constexpr std::initializer_list<ggml_op> qsa_score_pattern { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+                                                                    GGML_OP_VIEW,    GGML_OP_CONT,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_ADD };
+static constexpr std::initializer_list<ggml_op> qsa_score_pattern_nobias { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+                                                                           GGML_OP_VIEW,    GGML_OP_CONT,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD };
 
 static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 1, 0, 0 }, // permute->src[0] == get_rows
@@ -1398,6 +1415,8 @@ struct ggml_backend_vk_context {
     // MUL_MAT+CPY(f16): the matmul stores f16 into the cast's destination
     bool fused_mm_cpy16 {};
     bool fused_hc_up_mix {};   // MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) -> one int8 MMQ GEMM with the mix epilogue
+    bool fused_qsa_score {};   // QSA scorer: MUL_MAT + RELU + 4-head sum (+ block bias) in the GEMM epilogue (QSA_SCORE)
+    const ggml_tensor * qsa_score_bias {};   // the block bias of a QSA_SCORE chain, or nullptr
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
