@@ -2495,7 +2495,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     name = "flash_attn_f32_f16_mr_cm1";
                 }
             }
-            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", 8,
+            // the multi-row kernel has a ninth binding, the output gate (FA_FLAG_OUT_GATE)
+            ggml_vk_create_pipeline(device, fa.second, name, spv_size, spv_data, "main", (fa.first.flags & FA_FLAG_MULTI_ROW) ? 9 : 8,
                                     sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                     get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                     !fa_ds, !fa_ds ? fa_sgs : 0);
@@ -4959,9 +4960,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 &&
                 device->driver_id == vk::DriverId::eMesaRadv) {
                 static const char * sel_cm_names[3] = { "flash_attn_sel_cm_f16_gqa4", "flash_attn_sel_cm_f16_gqa8", "flash_attn_sel_cm_f16_gqa12" };
+                static const char * sel_cm_gate_names[3] = { "flash_attn_sel_cm_gate_f16_gqa4", "flash_attn_sel_cm_gate_f16_gqa8", "flash_attn_sel_cm_gate_f16_gqa12" };
                 for (uint32_t i = 0; i < 3; ++i) {
                     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_cm_f16[i],
                         sel_cm_names[i], flash_attn_sel_cm_f16_len, flash_attn_sel_cm_f16_data, "main", 5,
+                        sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {4 * (i + 1)}, 1, true, true, 64);
+                    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_cm_gate_f16[i],
+                        sel_cm_gate_names[i], flash_attn_sel_cm_gate_f16_len, flash_attn_sel_cm_gate_f16_data, "main", 6,
                         sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {4 * (i + 1)}, 1, true, true, 64);
                 }
             }
@@ -11096,8 +11101,21 @@ static vk_pipeline ggml_vk_flash_attn_sel_pipeline(const vk_device & device, con
     }
 }
 
+// FA_OUT_GATE on the selected-key path: the WMMA kernel applies the attention output gate in its store (the prefill
+// case, one split). GGML_VK_FA_OUT_GATE_SEL=0 leaves it to the sigmoid-mul after the FA, as GGML_VK_FA_OUT_GATE does
+// for every other non-multi-row FA path
+static bool ggml_vk_fa_out_gate_sel_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FA_OUT_GATE_SEL");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// out_gate / out_gate_dst / out_gate_done: as ggml_vk_flash_attn
 static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & subctx,
-        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, ggml_tensor * dst) {
+        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, ggml_tensor * dst,
+        const ggml_tensor * out_gate = nullptr, ggml_tensor * out_gate_dst = nullptr, bool * out_gate_done = nullptr) {
     vk_pipeline pipeline = ggml_vk_flash_attn_sel_pipeline(ctx->device, dst);
     if (!pipeline) {
         return false;
@@ -11145,6 +11163,23 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     // the partials go after the rows, 256-byte aligned
     const size_t split_off = ROUNDUP_POW2(list_size, 256);
 
+    // the gate in the WMMA store: one split, one stream, the gate read in place from the [q | gate] per-head interleaved
+    // projection (head stride 2 * D, token stride 2 * D * heads) and the gated result written to out_gate_dst
+    vk_pipeline pipeline_gate = use_cm ? ctx->device->pipeline_flash_attn_sel_cm_gate_f16[gqa_idx] : nullptr;
+    const bool gate_epi = out_gate != nullptr && ggml_vk_fa_out_gate_sel_enabled() && pipeline_gate != nullptr &&
+                          n_split == 1 && NS == 1 &&
+                          out_gate->type == GGML_TYPE_F32 && out_gate_dst->type == GGML_TYPE_F32 &&
+                          out_gate->ne[0] == (int64_t)D && out_gate->ne[1] == (int64_t)NH && out_gate->ne[2] == (int64_t)N && out_gate->ne[3] == 1 &&
+                          out_gate->nb[0] == sizeof(float) && out_gate->nb[1] == 2 * D * sizeof(float) &&
+                          out_gate->nb[2] == out_gate->nb[1] * (size_t)NH &&
+                          // the shader has no misalignment offset for the gate: its descriptor must start at the view
+                          ggml_vk_tensor_subbuffer(ctx, out_gate, true).size == ggml_nbytes(out_gate) &&
+                          // the store keeps dst's strides (dst is contiguous: the pipeline gate)
+                          ggml_is_contiguous(out_gate_dst) && ggml_nelements(out_gate_dst) == ggml_nelements(dst);
+    if (gate_epi) {
+        pipeline = pipeline_gate;
+    }
+
     const vk_op_flash_attn_sel_push_constants pc = {
         (uint32_t) k->ne[1], n_sel, list_stride,
         (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)), (uint32_t) (q->nb[3] / sizeof(float)),
@@ -11176,6 +11211,16 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     GGML_ASSERT(!use_cm || (uint64_t) N * n_split * k->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
     const std::array<uint32_t, 3> grid = use_cm ? std::array<uint32_t, 3>{ N * n_split * (uint32_t) k->ne[2], 1, NS }
                                                 : std::array<uint32_t, 3>{ N * n_split, (uint32_t) k->ne[2], NS };
+    if (gate_epi) {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { q_buf, k_buf, v_buf, list_buf, ggml_vk_tensor_subbuffer(ctx, out_gate_dst), ggml_vk_tensor_subbuffer(ctx, out_gate, true) }, pc, grid);
+        ctx->prealloc_split_k_need_sync = true;
+        ggml_vk_path_census_add("FA_OUT_GATE_SEL");
+        if (out_gate_done) {
+            *out_gate_done = true;
+        }
+        return true;
+    }
     if (n_split == 1) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, list_buf, dst_buf }, pc, grid);
         ctx->prealloc_split_k_need_sync = true;
@@ -11885,7 +11930,8 @@ union_unavailable:;
     return true;
 }
 
-void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst,
+                        const ggml_tensor * out_gate, ggml_tensor * out_gate_dst, bool * out_gate_done) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
@@ -11938,7 +11984,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     assert(q->type == GGML_TYPE_F32);
     if (dst->src[5] != nullptr && mask == nullptr) {
         // supports_op only takes a maskless selected-key op when flash_attn_sel does
-        const bool done = ggml_vk_flash_attn_sel(ctx, subctx, q, k, v, dst);
+        const bool done = ggml_vk_flash_attn_sel(ctx, subctx, q, k, v, dst, out_gate, out_gate_dst, out_gate_done);
         GGML_ASSERT(done);
         return;
     }
@@ -12195,9 +12241,25 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 
+    // output gate in the multi-row store: the gate is read in place from the [q | gate] per-head interleaved projection
+    // (head stride 2 * HSV, token stride 2 * HSV * heads) and the gated result goes straight to out_gate_dst
+    bool gate_epi = false;
+    if (out_gate != nullptr && use_mr) {
+        gate_epi = out_gate->type == GGML_TYPE_F32 && out_gate_dst->type == GGML_TYPE_F32 &&
+                   out_gate->ne[0] == (int64_t)HSV && out_gate->ne[1] == ne1 && out_gate->ne[2] == (int64_t)N && out_gate->ne[3] == 1 && ne3 == 1 &&
+                   out_gate->nb[0] == sizeof(float) && out_gate->nb[1] == 2 * HSV * sizeof(float) &&
+                   out_gate->nb[2] == out_gate->nb[1] * (size_t)ne1 &&
+                   // the shader has no misalignment offset for the gate: its descriptor must start at the view
+                   ggml_vk_tensor_subbuffer(ctx, out_gate, true).size == ggml_nbytes(out_gate) &&
+                   ggml_is_contiguous(out_gate_dst) && ggml_nelements(out_gate_dst) == ggml_nelements(dst);
+    }
+
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff,
                                                                    fa_compact.dynamic_kv, nan_safe_v);
+    if (gate_epi) {
+        fa_pipeline_state.flags |= FA_FLAG_OUT_GATE;
+    }
     if (use_vt) {
         fa_pipeline_state.flags |= FA_FLAG_V_TRANSPOSED;
     }
@@ -12632,9 +12694,21 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             // When using gqa, we want one actual workgroup per batch, so cancel out wg_denoms
             workgroups_x *= pipeline->wg_denoms[0];
         }
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                                    {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, fa_compact.dynamic_kv ? fa_compact.kv_buf : sparse_buf},
-                                    pc, { workgroups_x, workgroups_y, workgroups_z });
+        if (use_mr) {
+            // binding 8 is the output gate; without one it is bound to dst and never read
+            const vk_subbuffer o_buf = gate_epi ? ggml_vk_tensor_subbuffer(ctx, out_gate_dst) : dst_buf;
+            const vk_subbuffer g_buf = gate_epi ? ggml_vk_tensor_subbuffer(ctx, out_gate, true) : dst_buf;
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, o_buf, mask_opt_buf, fa_compact.dynamic_kv ? fa_compact.kv_buf : sparse_buf, g_buf},
+                                        pc, { workgroups_x, workgroups_y, workgroups_z });
+            if (out_gate_done) {
+                *out_gate_done = gate_epi;
+            }
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf, fa_compact.dynamic_kv ? fa_compact.kv_buf : sparse_buf},
+                                        pc, { workgroups_x, workgroups_y, workgroups_z });
+        }
     }
 
     if (use_dequant_kv) {
@@ -14182,6 +14256,35 @@ void ggml_vk_unary_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const 
         (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], (uint32_t)src0->nb[0] / src0_type_size, (uint32_t)src0->nb[1] / src0_type_size, (uint32_t)src0->nb[2] / src0_type_size, (uint32_t)src0->nb[3] / src0_type_size,
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) mul->ne[0], (uint32_t) mul->ne[1], (uint32_t) mul->ne[2],(uint32_t) mul->ne[3], (uint32_t) mul->nb[0] /  dst_type_size, (uint32_t) mul->nb[1] /  dst_type_size, (uint32_t) mul->nb[2] /  dst_type_size, (uint32_t) mul->nb[3] /  dst_type_size,
+        0,
+        0.0f, 0.0f, 0,
+    }, pipeline);
+}
+
+// FLASH_ATTN_EXT + output gate (ggml_vk_can_fuse_fa_out_gate): out = O * sigmoid(gate). The multi-row FA does it in its
+// store; any other FA path writes O to its own destination and the sigmoid-mul reads the strided gate view (no CONT)
+static void ggml_vk_flash_attn_out_gate(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * fa = cgraph->nodes[node_idx];
+    const ggml_tensor * gate = cgraph->nodes[node_idx + 2];
+    ggml_tensor * out = cgraph->nodes[node_idx + 5];
+
+    bool done = false;
+    ggml_vk_flash_attn(ctx, subctx, fa->src[0], fa->src[1], fa->src[2], fa->src[3], fa->src[4], fa, gate, out, &done);
+    if (done) {
+        ggml_vk_path_census_add("FA_OUT_GATE_EPILOGUE");
+        return;
+    }
+    ggml_vk_path_census_add("FA_OUT_GATE_SIGMUL");
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // over the FA output's [HSV, heads, tokens] shape; out is contiguous like it
+    vk_pipeline pipeline = ctx->device->pipeline_unary_mul[ggml_vk_unary_mul_op_index(GGML_UNARY_OP_SIGMOID)][0][1][0];
+    const uint32_t ts = sizeof(float);
+    ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, gate, fa, nullptr, nullptr, out, GGML_OP_UNARY, {
+        (uint32_t)ggml_nelements(fa),
+        (uint32_t)gate->ne[0], (uint32_t)gate->ne[1], (uint32_t)gate->ne[2], (uint32_t)gate->ne[3], (uint32_t)gate->nb[0] / ts, (uint32_t)gate->nb[1] / ts, (uint32_t)gate->nb[2] / ts, (uint32_t)gate->nb[3] / ts,
+        (uint32_t)fa->ne[0], (uint32_t)fa->ne[1], (uint32_t)fa->ne[2], (uint32_t)fa->ne[3], (uint32_t)fa->nb[0] / ts, (uint32_t)fa->nb[1] / ts, (uint32_t)fa->nb[2] / ts, (uint32_t)fa->nb[3] / ts,
+        (uint32_t)fa->ne[0], (uint32_t)fa->ne[1], (uint32_t)fa->ne[2], (uint32_t)fa->ne[3], (uint32_t)fa->nb[0] / ts, (uint32_t)fa->nb[1] / ts, (uint32_t)fa->nb[2] / ts, (uint32_t)fa->nb[3] / ts,
         0,
         0.0f, 0.0f, 0,
     }, pipeline);
@@ -17760,6 +17863,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_FLASH_ATTN_EXT:
+        if (ctx->fused_fa_out_gate) {
+            ggml_vk_flash_attn_out_gate(ctx, compute_ctx, cgraph, node_idx);
+            break;
+        }
         ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
 
         break;
@@ -18577,6 +18684,56 @@ static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, i
     const int           outputs[] = { node_idx + 1 };
     return ggml_can_fuse_subgraph(cgraph, node_idx, 2, ops, outputs, 1) &&
            ggml_vk_can_fuse_unary_mul(cgraph, node_idx, node_idx + 1);
+}
+
+// Attention output gate (Qwen3-Next style): FLASH_ATTN_EXT -> RESHAPE and the gate VIEW -> CONT -> SIGMOID meet in a MUL.
+// The multi-row prefill FA applies sigmoid(gate) in its store and reads the gate in place from the Q projection; every
+// other FA path writes its output and a sigmoid-mul then reads the strided gate view directly (no CONT).
+// GGML_VK_FA_OUT_GATE=0 disables.
+static bool ggml_vk_fa_out_gate_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FA_OUT_GATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// nodes [i, i + 5] = FLASH_ATTN_EXT, RESHAPE(fa), VIEW, CONT(view), SIGMOID(cont), MUL(reshape, sigmoid), in that order
+static bool ggml_vk_fa_out_gate_wiring(const struct ggml_cgraph * cgraph, int i) {
+    if (i + 5 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * fa   = cgraph->nodes[i];
+    const ggml_tensor * rs   = cgraph->nodes[i + 1];
+    const ggml_tensor * view = cgraph->nodes[i + 2];
+    const ggml_tensor * cont = cgraph->nodes[i + 3];
+    const ggml_tensor * sig  = cgraph->nodes[i + 4];
+    const ggml_tensor * mul  = cgraph->nodes[i + 5];
+    return fa->op == GGML_OP_FLASH_ATTN_EXT && rs->op == GGML_OP_RESHAPE && rs->src[0] == fa &&
+           view->op == GGML_OP_VIEW && cont->op == GGML_OP_CONT && cont->src[0] == view &&
+           sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && sig->src[0] == cont &&
+           mul->op == GGML_OP_MUL && ((mul->src[0] == rs && mul->src[1] == sig) || (mul->src[0] == sig && mul->src[1] == rs));
+}
+
+static bool ggml_vk_can_fuse_fa_out_gate(const struct ggml_cgraph * cgraph, int i) {
+    if (!ggml_vk_fa_out_gate_enabled() || !ggml_vk_fa_out_gate_wiring(cgraph, i)) {
+        return false;
+    }
+    const ggml_tensor * fa   = cgraph->nodes[i];
+    const ggml_tensor * view = cgraph->nodes[i + 2];
+    const ggml_tensor * mul  = cgraph->nodes[i + 5];
+    // the gate view is [HSV, heads, tokens] like the FA output, with unit stride along the head dim
+    if (fa->type != GGML_TYPE_F32 || view->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        cgraph->nodes[i + 3]->type != GGML_TYPE_F32 || cgraph->nodes[i + 4]->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(view, fa) || view->nb[0] != sizeof(float) || !ggml_is_contiguous(fa) ||
+        !ggml_is_contiguous(mul) || !ggml_are_same_shape(mul, cgraph->nodes[i + 1])) {
+        return false;
+    }
+    // the VIEW reads the Q projection, which is produced outside the fused range: leave it out of the subgraph check
+    const int idxs[] = { i, i + 1, i + 3, i + 4, i + 5 };
+    const enum ggml_op ops[] = { GGML_OP_FLASH_ATTN_EXT, GGML_OP_RESHAPE, GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL };
+    const int outputs[] = { i + 5 };
+    return ggml_can_fuse_subgraph_ext(cgraph, idxs, 5, ops, outputs, 1);
 }
 
 static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -21425,6 +21582,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_mmid_glu = false;
         ctx->fused_mmid_pair_glu = false;
         ctx->fused_mmid_pair_glu_f32 = false;
+        ctx->fused_fa_out_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_concat_tail = -1;
         ctx->fused_ssm_conv_direct = -1;
@@ -21520,6 +21678,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[2] = false;
                 op_srcs_fused_elementwise[3] = true;
                 op_srcs_fused_elementwise[4] = true;
+            } else if (ggml_vk_can_fuse_fa_out_gate(cgraph, i)) {
+                // op_srcs_fused_elementwise stays false: FA reads q/k/v/mask and the gate while it writes the MUL's destination
+                ctx->num_additional_fused_ops = 5;
+                ctx->fused_fa_out_gate = true;
+                fusion_string = "FA_OUT_GATE";
             } else if (ggml_vk_can_fuse_mmid_mul_cpy16(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
                 ctx->fused_mmid_cpy16 = true;
@@ -21882,6 +22045,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_mmid_glu = false;
                 ctx->fused_mmid_pair_glu = false;
                 ctx->fused_mmid_pair_glu_f32 = false;
+                ctx->fused_fa_out_gate = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -21945,6 +22109,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_mmid_glu = false;
         ctx->fused_mmid_pair_glu = false;
         ctx->fused_mmid_pair_glu_f32 = false;
+        ctx->fused_fa_out_gate = false;
     }
 
     ctx->last_total_flops = total_flops;
@@ -22114,6 +22279,31 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     std::vector<bool> used(graph->n_nodes, false);
     std::set<ggml_tensor *> used_node_set;
 
+    // FA_OUT_GATE chains: the gate VIEW -> CONT -> SIGMOID does not depend on the FA, so the concurrent sets below would
+    // schedule it away from the FA. Their nodes are left out of those sets and emitted right behind the FA instead.
+    std::map<const ggml_tensor *, std::array<ggml_tensor *, 5>> fa_gate_chains;   // FA -> RESHAPE, VIEW, CONT, SIGMOID, MUL
+    std::set<const ggml_tensor *> fa_gate_nodes;
+    if (ggml_vk_fa_out_gate_enabled()) {
+        for (int n = 0; n < graph->n_nodes; ++n) {
+            ggml_tensor * mul = graph->nodes[n];
+            if (mul->op != GGML_OP_MUL) {
+                continue;
+            }
+            for (int s = 0; s < 2; ++s) {
+                ggml_tensor * rs  = mul->src[s];
+                ggml_tensor * sig = mul->src[1 - s];
+                if (rs->op != GGML_OP_RESHAPE || rs->src[0]->op != GGML_OP_FLASH_ATTN_EXT || sig->op != GGML_OP_UNARY ||
+                    ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->src[0]->op != GGML_OP_CONT ||
+                    sig->src[0]->src[0]->op != GGML_OP_VIEW) {
+                    continue;
+                }
+                ggml_tensor * cont = sig->src[0];
+                fa_gate_chains[rs->src[0]] = { rs, cont->src[0], cont, sig, mul };
+                fa_gate_nodes.insert({ rs->src[0], rs, cont->src[0], cont, sig, mul });
+                break;
+            }
+        }
+    }
     // QSA_EXPAND chains: their nodes stay consecutive and in order (the score and tail views would otherwise be hoisted
     // by the view pass and the independent GET_ROWS pulled away), and the chain's inputs stay allocated through its
     // CONCAT, which the fused kernel writes while it reads them. Knob off: nothing is marked, the order is unchanged.
@@ -22699,6 +22889,58 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             continue;
         }
 
+        // FA_OUT_GATE: FA, then its chain in the order the fusion matches. Every chain node must sit in the next 32 nodes and
+        // depend on nothing still unscheduled outside the chain; the FA inputs and the gate's source stay allocated through
+        // the MUL, which the fused kernel writes while it reads them
+        if (fa_gate_chains.count(graph->nodes[first_unused])) {
+            const auto & chain = fa_gate_chains[graph->nodes[first_unused]];
+            const int lim = std::min(first_unused + 32, graph->n_nodes);
+            std::array<int, 5> idx;
+            idx.fill(-1);
+            for (int j = first_unused + 1; j < lim; ++j) {
+                for (int c = 0; c < 5; ++c) {
+                    if (graph->nodes[j] == chain[c] && !used[j]) {
+                        idx[c] = j;
+                    }
+                }
+            }
+            bool ok = std::find(idx.begin(), idx.end(), -1) == idx.end();
+            for (int j = first_unused + 1; ok && j < idx[4]; ++j) {
+                if (used[j] || std::find(idx.begin(), idx.end(), j) != idx.end()) {
+                    continue;
+                }
+                for (int c = 0; c < 5 && ok; ++c) {
+                    ok = !(j < idx[c] && is_src_of(graph->nodes[idx[c]], graph->nodes[j]));
+                }
+            }
+            if (ok) {
+                ggml_tensor * fa = graph->nodes[first_unused];
+                if (params && params->add_alloc_dep) {
+                    for (uint32_t k = 0; k < GGML_MAX_SRC; ++k) {
+                        if (fa->src[k]) {
+                            params->add_alloc_dep(params->user_data, fa->src[k], chain[4]);
+                        }
+                    }
+                    params->add_alloc_dep(params->user_data, chain[1], chain[4]);
+                    if (chain[1]->view_src) {
+                        params->add_alloc_dep(params->user_data, chain[1]->view_src, chain[4]);
+                    }
+                }
+                new_order.push_back(fa);
+                used_node_set.insert(fa);
+                used[first_unused] = true;
+                for (int c = 0; c < 5; ++c) {
+                    new_order.push_back(graph->nodes[idx[c]]);
+                    used_node_set.insert(graph->nodes[idx[c]]);
+                    used[idx[c]] = true;
+                }
+                while (first_unused < graph->n_nodes && used[first_unused]) {
+                    first_unused++;
+                }
+                continue;
+            }
+        }
+
         // Gated norm (RMS_NORM_MUL_MUL): rms_norm -> mul(gamma) -> mul(gate). The gate chain (e.g. a
         // reshape + sigmoid) sits between the two MULs in the graph, so schedule it first and keep the
         // three nodes adjacent. Returns the new order (gate chain, norm, MUL, MUL), or empty.
@@ -22851,7 +23093,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rope_view_set_rows_pattern, j) ||
                 match_pattern(hc_post_gate_pattern, j) ||
                 !gated_norm_order(j).empty() ||
-                is_mm_cpy16(j)) {
+                is_mm_cpy16(j) ||
+                fa_gate_nodes.count(graph->nodes[j])) {
                 continue;
             }
             bool ok = true;
@@ -23009,7 +23252,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (used[j]) {
                     continue;
                 }
-                if (!is_empty(graph->nodes[j]) || in_qsa_expand(j)) {
+                if (!is_empty(graph->nodes[j]) || fa_gate_nodes.count(graph->nodes[j])) {
                     continue;
                 }
                 bool ok = true;

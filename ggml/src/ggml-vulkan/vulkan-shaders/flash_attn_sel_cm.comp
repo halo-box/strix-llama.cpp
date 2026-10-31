@@ -38,6 +38,12 @@ layout(binding = 1) readonly  buffer KBuf    { uvec4 data_k4[];   };
 layout(binding = 2) readonly  buffer VBuf    { uvec4 data_v4[];   };
 layout(binding = 3) readonly  buffer ListBuf { uint  data_list[]; };
 layout(binding = 4) writeonly buffer DstBuf  { float data_dst[];  };
+#if defined(OUT_GATE)
+// the attention output gate, read in place from the [q | gate] per-head interleaved Q projection (host gate: one stream,
+// element (query, head, d) at (query * n_head + head) * 2 * D + d); the store writes O * sigmoid(gate) into the MUL's
+// destination, which has the FA output's layout
+layout(binding = 5) readonly  buffer GateBuf { float data_g[];    };
+#endif
 
 layout(push_constant) uniform Parameters {
     uint n_kv;
@@ -240,10 +246,19 @@ void main() {
         if (col < GQA) {
             const uint dst_base = stream * p.nb3 + query * p.nb2 + head * p.nb1;
             const float inv_l = l == 0.0 ? 0.0 : 1.0 / l;
+#if defined(OUT_GATE)
+            const uint g_base = (query * p.n_head + head) * 2 * D;
+#endif
             [[unroll]] for (uint t = 0; t < 16; ++t) {
                 [[unroll]] for (uint i = 0; i < 4; ++i) {
                     const uint dim = (t / 8) * 128 + 8 * (grp + 4 * i) + t % 8;
+#if defined(OUT_GATE)
+                    // O first, then the sigmoid-mul's expression: the same values the unfused store + SIGMOID_MUL give
+                    const float o = O[t][i] * inv_l;
+                    data_dst[dst_base + dim] = o * (1.0f / (1.0f + exp(-data_g[g_base + dim])));
+#else
                     data_dst[dst_base + dim] = O[t][i] * inv_l;
+#endif
                 }
             }
         }
