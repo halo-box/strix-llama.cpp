@@ -22091,8 +22091,10 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
     const int64_t C = tr->ne[1];
     const int64_t S = tr->ne[2];
     const ggml_tensor * x = tr->view_src;
-    // x^T must be a plain transpose of the whole contiguous x: token stride C, channel stride 1, sequence stride C*T
-    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x) != C * T * S || tr->ne[3] != 1 ||
+    // x^T must be a plain transpose of the whole contiguous x: token stride C, channel stride 1, sequence stride C*T.
+    // One sequence may also take the first T tokens of a longer x (a conv split at a recurrent state snapshot)
+    const bool x_size_ok = S == 1 ? (x->ne[0] == C && ggml_nelements(x) >= C * T) : ggml_nelements(x) == C * T * S;
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !x_size_ok || tr->ne[3] != 1 ||
         tr->nb[0] != (size_t) C * sizeof(float) || tr->nb[1] != sizeof(float) || tr->nb[2] != (size_t) C * T * sizeof(float)) {
         return ggml_vk_ssm_conv_direct_reject("x layout", i);
     }

@@ -5275,10 +5275,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_gdn_set_conv(gdn, (const float *) gm.x->data, (const float *) gm.state->data, (const float *) gm.w->data,
                         gm.C, (int64_t) (q_raw->view_offs / 4), (int64_t) (k_raw->view_offs / 4), (int64_t) (v_raw->view_offs / 4));
                     s_precomputed[cgraph->nodes[i_rms]] = last - i_rms;
+                    ggml_cuda_gdn_conv_note("folded into the chunked GDN", gm.T);
                     return 1;
                 }
             }
             ggml_cuda_gdn_conv_direct(*cuda_ctx, gm);
+            ggml_cuda_gdn_conv_note("direct", gm.T);
             return 1;
         }
     }

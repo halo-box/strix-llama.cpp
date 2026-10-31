@@ -2862,8 +2862,20 @@ private:
     // the end-of-prompt checkpoint comes from a recurrent state snapshot (llama_rs_snapshot_arm), see load_model
     bool ckpt_snapshot = false;
 
-    void checkpoint_recycle(common_prompt_checkpoint & cur) {
-        if ((int) ckpt_spares.size() < params_base.ctx_checkpoint_spares && !cur.data_tgt.empty()) {
+    // A new prompt that shares nothing with the slot's erases its checkpoints at launch and takes a spare at its end; the
+    // release then refills that spare with a fresh allocation the next request waits for. At that launch-time erase
+    // (launch_erase) one buffer above the spare count is kept, so the erased checkpoint becomes that spare instead. The
+    // peak is unchanged: the buffer was held as a checkpoint until then, and the other erase paths keep the spare count.
+    // LLAMA_SERVER_CKPT_SPARE_EXTRA=0 keeps exactly the spare count everywhere.
+    static int checkpoint_spare_extra() {
+        static const int extra = [] { const char * e = getenv("LLAMA_SERVER_CKPT_SPARE_EXTRA"); return e == nullptr ? 1 : std::max(0, atoi(e)); }();
+        return extra;
+    }
+
+    void checkpoint_recycle(common_prompt_checkpoint & cur, bool launch_erase = false) {
+        const int extra = launch_erase ? checkpoint_spare_extra() : 0;
+        const int cap = params_base.ctx_checkpoint_spares > 0 ? params_base.ctx_checkpoint_spares + extra : 0;
+        if ((int) ckpt_spares.size() < cap && !cur.data_tgt.empty()) {
             ckpt_spares.push_back(std::move(cur.data_tgt));
         }
     }
@@ -4225,7 +4237,7 @@ private:
                                     auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        checkpoint_recycle(cur);
+                                        checkpoint_recycle(cur, /*launch_erase =*/ true);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
