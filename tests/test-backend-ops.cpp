@@ -20210,7 +20210,10 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("QSA_SCORE",           new test_qsa_score(128, 512, 128, 1, false), "QSA_SCORE/11=1");
     add("QSA_SCORE",           new test_qsa_score(128, 512, 128, 1, true), "QSA_SCORE/12=1");
     // the maskless strip as qwen4exp builds it: graph_optimize must keep the scorer chain in order with the visibility ops around it
-    add("QSA_SCORE",           new test_qsa_strip(32256, 512, 512, 512), "QSA_SCORE/11=1");
+    // QSA_VIS (GGML_VK_QSA_VIS, default on) folds the 10 compact-visibility nodes behind the head sum into the same GEMM
+    add("QSA_SCORE",           new test_qsa_strip(32256, 512, 512, 512), env_knob_on("GGML_VK_QSA_VIS") ? "QSA_EXPAND/21=1;QSA_SCORE/21=1" : "QSA_EXPAND/21=1;QSA_SCORE/11=1");
+    add("QSA_EXPAND",          new test_qsa_expand(700, 9), "QSA_EXPAND/20=1");
+    add("QSA_EXPAND",          new test_qsa_expand(2048, 4, 1, 2, 1), "QSA_EXPAND/21=2");
     add("TOPK_MOE_EARLY_SOFTMAX",      new test_topk_moe({ 32, 22, 1, 1 }, 8, false, false, GATING_FUNC_SOFTMAX), "TOPK_MOE_EARLY_SOFTMAX/5=1");
     add("TOPK_MOE_EARLY_SOFTMAX_NORM", new test_topk_moe({ 32, 22, 1, 1 }, 8, true,  false, GATING_FUNC_SOFTMAX), "TOPK_MOE_EARLY_SOFTMAX_NORM/10=1");
     add("TOPK_MOE_LATE_SOFTMAX",       new test_topk_moe({ 32, 22, 1, 1 }, 8, false, false, GATING_FUNC_SOFTMAX_WEIGHT), "TOPK_MOE_LATE_SOFTMAX/6=1");

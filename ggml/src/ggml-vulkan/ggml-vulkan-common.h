@@ -11,6 +11,7 @@ extern bool vk_memory_logger_enabled;
 extern bool vk_perf_logger_enabled;
 extern bool vk_perf_logger_concurrent;
 extern bool vk_perf_logger_seq;
+extern bool vk_perf_logger_seq_shapes;   // GGML_VK_PERF_LOGGER_SEQ=2: PFSEQ lines add each node's shape
 extern bool vk_enable_sync_logger;
 extern uint32_t vk_perf_logger_frequency;
 extern std::string vk_pipeline_stats_filter;
