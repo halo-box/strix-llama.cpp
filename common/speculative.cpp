@@ -1742,6 +1742,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        // a sequence that starts again at position 0 has no previous hidden row: pair its first token with
+        // zeros, as on the first request, not with the carry left by the previous request's last token, or
+        // two identical requests draft differently (the MTP KV at position 0 depends on the request before)
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] >= 0 && batch_in.tokens[i_batch_beg[seq_id]].pos[0] == 0) {
+                std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+            }
+        }
+
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
