@@ -1136,6 +1136,7 @@ struct vk_device_struct {
     // expert repack buffer: the same kernels on the repacked weight order, the repacked mat-vec, and the inverse copy
     vk_pipeline pipeline_mmid_glu_rp[2][2][2];   // pipeline_mmid_glu on the repacked weight order
     vk_pipeline pipeline_mmid_down_q51_rp[2];
+    vk_pipeline pipeline_mmid_down_q51_rpv[11];   // GGML_VK_EXPDOWN_V variants of the f16-B repacked down kernel ([0] unused)
     vk_pipeline pipeline_mmv_id_rp_q4k, pipeline_mmv_id_rp_q5k, pipeline_mmv_id_rp_q51;
     vk_pipeline pipeline_mmv_id_rp_q4k_q8, pipeline_mmv_id_rp_q5k_q8, pipeline_mmv_id_rp_q51_q8;
     vk_pipeline pipeline_expert_unrepack;
