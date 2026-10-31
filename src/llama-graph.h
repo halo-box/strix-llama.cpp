@@ -310,6 +310,10 @@ public:
     uint32_t head;
     int32_t rs_z;
 
+    // the recurrent state snapshot changes the graph (the scan is split at its token)
+    int32_t snap_t = -1;
+    int32_t snap_s = -1;
+
     // part of the reuse key: a seq_cp between two ubatches can change it
     bool s_copy_main_identity = false;
 };

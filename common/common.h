@@ -708,6 +708,8 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    int32_t ctx_checkpoint_spares = 2;   // keep up to N buffers of erased context checkpoints for reuse (0 = free them)
+    int32_t ctx_checkpoint_snapshot = 1; // take the end-of-prompt checkpoint from a recurrent state snapshot inside the last prompt batch (0 = decode the last 4 tokens separately)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 

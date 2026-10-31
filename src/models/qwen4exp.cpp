@@ -1090,6 +1090,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated);
 }
 
+ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated_parts(
+        ggml_tensor * out0,
+        ggml_tensor * out1,
+        ggml_tensor * weights,
+        ggml_tensor * gate,
+        int           layer) {
+    // the fused f16 path of build_norm_gated with its padded destination (the default); otherwise concatenate
+    const ggml_tensor * w_out = model.layers[layer].ssm_out;
+    static const int64_t pad = qwen4exp_env_pad("LLAMA_GDN_NORM_PAD");
+    const int64_t row = out0->ne[0] * out0->ne[1];
+    if (!(cparams.fused_gdn_norm_f16 && n_tokens >= 32 && loras->empty() && w_out != nullptr && w_out->type != GGML_TYPE_BF16 &&
+          pad > 0 && (row * 2) % 256 == 0 && std::gcd<int64_t>(row * 2 / 256, 16) >= 8 && out0->ne[3] == 1)) {
+        return build_norm_gated(ggml_concat(ctx0, out0, out1, 2), weights, gate, layer);
+    }
+
+    const int64_t t = out0->ne[2];
+    const int64_t n = t + out1->ne[2];
+
+    ggml_tensor * buf = pad_buf(&gdn_norm_pad_buf, row + pad, n, "gdn_norm_pad");
+
+    // tokens [t0, t1): norm, gate and write f16 rows into a view of base at offs (relative to base)
+    auto part = [&](ggml_tensor * x, int64_t t0, int64_t t1, ggml_tensor * base, size_t offs) {
+        ggml_tensor * g = ggml_view_4d(ctx0, gate, gate->ne[0], gate->ne[1], t1 - t0, 1, gate->nb[1], gate->nb[2], gate->nb[3], t0*gate->nb[2]);
+        ggml_build_forward_expand(gf, g);   // the gate's view nodes go ahead of the chain, as in build_norm_gated
+        ggml_tensor * normalized = build_norm(x, weights, nullptr, LLM_NORM_RMS, layer);
+        ggml_tensor * o = ggml_mul(ctx0, normalized, ggml_sigmoid(ctx0, g));
+        ggml_tensor * dst = ggml_view_4d(ctx0, base, x->ne[0], x->ne[1], t1 - t0, 1,
+                x->ne[0] * ggml_element_size(buf), buf->nb[1], buf->nb[1] * (t1 - t0), offs);
+        ggml_build_forward_expand(gf, dst);
+        return ggml_cpy(ctx0, o, dst);
+    };
+
+    // the second destination is a view of the first copy, so the copies are ordered and the result below depends on both
+    ggml_tensor * c0 = part(out0, 0, t, buf, 0);
+    ggml_tensor * c1 = part(out1, t, n, c0, t * buf->nb[1]);
+
+    // all n rows: view offsets are relative to the viewed tensor, so step back from c1 to the start of the buffer
+    return ggml_view_4d(ctx0, c1, out0->ne[0], out0->ne[1], n, 1,
+            out0->ne[0] * ggml_element_size(buf), buf->nb[1], buf->nb[1] * n, (size_t) 0 - c1->view_offs);
+}
+
 // Scoring strips: the scorer scratch is [n_blocks, strip] instead of [n_blocks, n_tokens], and each strip is
 // trimmed to the blocks it can see. 512 queries keep the scratch in the Infinity Cache on gfx1151.
 static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
@@ -2121,12 +2162,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    // a scan split at a recurrent state snapshot comes back in two parts
+    std::pair<ggml_tensor *, ggml_tensor *> parts = { nullptr, nullptr };
+    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il, &parts);
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     // gated normalization, as self.norm(core_attn_out, z) in the reference
-    ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+    ggml_tensor * attn_out_norm = output != nullptr
+            ? build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il)
+            : build_norm_gated_parts(parts.first, parts.second, model.layers[il].ssm_norm, z_2d, il);
 
     // a padded f16 norm output (LLAMA_GDN_NORM_PAD) is viewed, not reshaped: ssm_out reads its rows through the stride
     ggml_tensor * final_output = ggml_is_contiguous(attn_out_norm)
@@ -2757,6 +2802,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         // copy the strided tail directly (no intermediate cont): this is the same node sequence as
         // llm_build_delta_net_base::build_conv_state, which the backends' fused decode paths match
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+    }
+
+    if (mctx_cur->get_snap_t() >= 0) {
+        ggml_tensor * snap = conv_states_all == mctx_cur->get_p_l(il) ? mctx_cur->get_p_snap_l(il) : mctx_cur->get_r_snap_l(il);
+        build_conv_snapshot(inp, conv_input, snap, state_cols);
     }
 
     return conv_input;

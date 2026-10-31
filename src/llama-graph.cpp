@@ -439,6 +439,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= snap_t == mctx->get_snap_t();
+    res &= snap_s == mctx->get_snap_s();
 
     res &= s_copy_main_identity == mctx->is_s_copy_main_identity(params.ubatch.n_seqs);
 
@@ -1247,6 +1249,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snap_t == mctx->get_recr()->get_snap_t();
+    res &= inp_rs->snap_s == mctx->get_recr()->get_snap_s();
 
     res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
 
@@ -1296,6 +1300,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snap_t == mctx->get_recr()->get_snap_t();
+    res &= inp_rs->snap_s == mctx->get_recr()->get_snap_s();
 
     res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
 
@@ -1387,6 +1393,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snap_t == mctx->get_recr()->get_snap_t();
+    res &= inp_rs->snap_s == mctx->get_recr()->get_snap_s();
 
     res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
 
@@ -4000,6 +4008,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->snap_t = mctx_cur->get_snap_t();
+    inp->snap_s = mctx_cur->get_snap_s();
     inp->s_copy_main_identity = mctx_cur->is_s_copy_main_identity(n_seqs);
 
     return inp;

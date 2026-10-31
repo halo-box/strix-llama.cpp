@@ -114,6 +114,36 @@ public:
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
+    // partial-state snapshot: one more copy of a cell's rows, written inside a ubatch at a chosen token
+    // (see llama_rs_snapshot_arm), so the state before the last tokens of a batch can be saved without
+    // decoding those tokens separately. The snapshot tensors exist only after snapshot_init()
+    std::vector<ggml_tensor *> r_snap_l;
+    std::vector<ggml_tensor *> s_snap_l;
+    std::vector<ggml_tensor *> p_snap_l;
+
+    bool snapshot_init();
+    bool snapshot_ready() const;
+
+    // arm a snapshot of seq_id taken right before the token at pos (pos < 0 disarms)
+    void      snapshot_arm(llama_seq_id seq_id, llama_pos pos);
+    // the pos the last snapshot of seq_id was taken before, -1 = none
+    llama_pos snapshot_pos(llama_seq_id seq_id) const;
+
+    // armed request
+    llama_seq_id snap_seq = -1;
+    llama_pos    snap_pos = -1;
+
+    // taken snapshot
+    llama_seq_id snap_seq_taken = -1;
+    llama_pos    snap_pos_taken = -1;
+
+    // for the ubatch being built: the snapshot is taken after token snap_t (1-based) of sequence column snap_s, -1 = none
+    int32_t snap_t = -1;
+    int32_t snap_s = -1;
+
+    // find the armed snapshot in a ubatch and take it there
+    void snapshot_apply(const llama_ubatch & ubatch);
+
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
@@ -122,6 +152,9 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // the snapshot tensors
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> snap_bufs;
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;
@@ -133,7 +166,7 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, bool snapshot = false) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -179,6 +212,15 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+
+    // partial-state snapshot in the current ubatch: taken after token snap_t (1..n_seq_tokens) of sequence column
+    // snap_s, written to the snapshot tensors; -1 = no snapshot in this ubatch
+    int32_t get_snap_t() const;
+    int32_t get_snap_s() const;
+
+    ggml_tensor * get_r_snap_l(int32_t il) const;
+    ggml_tensor * get_s_snap_l(int32_t il) const;
+    ggml_tensor * get_p_snap_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
 

@@ -1739,6 +1739,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ctx-checkpoint-spares"}, "N",
+        string_format("keep the buffers of up to N erased context checkpoints and reuse them for new checkpoints, "
+            "which skips the zero-fill and page faults of a fresh allocation (default: %d, 0 = free them)", params.ctx_checkpoint_spares),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoint-spares must be non-negative");
+            }
+            params.ctx_checkpoint_spares = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINT_SPARES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoint-snapshot"}, "N",
+        string_format("for recurrent hybrid models, take the checkpoint 4 tokens before the end of the prompt from a state snapshot "
+            "inside the last prompt batch instead of decoding the last 4 tokens in a batch of their own; "
+            "keeps one more copy of the recurrent state on the device (default: %d, 0 = separate batch)", params.ctx_checkpoint_snapshot),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoint-snapshot must be non-negative");
+            }
+            params.ctx_checkpoint_snapshot = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINT_SNAPSHOT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
