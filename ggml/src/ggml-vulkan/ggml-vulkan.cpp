@@ -15822,7 +15822,13 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
             src_buf[0] = src_buf[1] = src_buf[2] = ggml_vk_tensor_subbuffer(ctx, cf.x);
             cst_buf = ggml_vk_tensor_subbuffer(ctx, cf.state);
             cw_buf  = ggml_vk_tensor_subbuffer(ctx, cf.kern);
-            cpc.conv_fold = 1;
+            // GGML_VK_GDN_CONV_DIRECT (default on, 0 off): chunks after the first load the conv window without the conv-state
+            // branch (bit 1 of conv_fold); bit-identical, the branch only made the compiler serialise the window loads
+            static const bool conv_direct = [] { const char * e = getenv("GGML_VK_GDN_CONV_DIRECT"); return e == nullptr || atoi(e) != 0; }();
+            cpc.conv_fold = conv_direct ? 3u : 1u;
+            if (conv_direct) {
+                ggml_vk_path_census_add("GDN_CONV_DIRECT");
+            }
             cpc.qc0 = cf.qc0;
             cpc.kc0 = cf.kc0;
             cpc.vc0 = cf.vc0;

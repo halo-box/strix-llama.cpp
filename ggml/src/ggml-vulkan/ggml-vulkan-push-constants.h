@@ -900,7 +900,7 @@ struct vk_op_gdn_chunk_push_constants {
     float    qk_mul;
     // conv_fold (GGML_VK_GDN_CONVFOLD): q / k / v are silu(conv4(x)) computed on load from the conv input x, conv state and
     // taps (prep bindings 0, 1, 5, 6; scan bindings 0, 4, 5); qc0 / kc0 / vc0 are the q / k / v view offsets in x (floats)
-    uint32_t conv_fold;
+    uint32_t conv_fold;   // bit 0 on, bit 1: chunks after the first read the window without the conv-state branch
     uint32_t qc0, kc0, vc0;
     uint32_t conv_C;
 };
