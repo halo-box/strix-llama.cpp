@@ -2299,6 +2299,9 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    // the n-gram rows hash the ubatch token ids
+    bool token_dependent() const override { return true; }
+
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
         ring = qwen4exp_ring(params.prefetch);
@@ -2660,6 +2663,11 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
     }
 
+    // decode chaining sets the token ids after apply_ubatch() stored them: store them again (a no-op otherwise)
+    if (ubatch->token) {
+        mctx->set_cur_tokens(*ubatch);
+    }
+
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
@@ -2868,10 +2876,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
         ple_inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
         ggml_set_input(ple_inp->embd);
         emb = ple_inp->embd;
+        if (chain) {
+            chain_input_to_device(ple_inp->embd);
+        }
     } else {
         ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
         ggml_set_input(ple_inp->rows);
         rows = ple_inp->rows;
+        if (chain) {
+            chain_input_to_device(ple_inp->rows);
+        }
     }
     res->add_input(std::move(ple_inp));
 

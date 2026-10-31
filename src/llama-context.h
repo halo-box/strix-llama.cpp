@@ -156,6 +156,10 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    // one-token-ahead decode chaining (LLAMA_DECODE_CHAIN=1, see llama_decode_chain in llama-ext.h)
+    int decode_chain(llama_seq_id seq_id, llama_token * token);
+    int decode_chain_end(llama_seq_id seq_id, llama_token * token);
+
     //
     // state save/load
     //
@@ -434,6 +438,44 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // one-token-ahead decode chaining: two slots (scheduler + GPU backend context + graph results) take turns. While
+    // one slot's graph runs, the next decode is recorded on the other slot without its token-dependent inputs; once
+    // the running graph has sampled the token, those inputs are written and the recorded batches are submitted.
+    struct chain_state {
+        int  mode  = -1;                 // LLAMA_DECODE_CHAIN: -1 not read yet, 0 off, 1 on
+        bool ready = false;              // slot 1 exists
+        bool prep  = false;              // decode() records without the token-dependent inputs
+        bool inflight = false;           // a chained decode was submitted, its sampled token not returned
+        int  slot  = 0;                  // the slot whose scheduler is in `sched` (0 = the context's own)
+        llama_seq_id seq = 0;
+
+        ggml_backend_ptr       backend;  // slot 1 GPU backend context (same device)
+        ggml_backend_t         gpu[2] = {};
+        ggml_backend_sched_ptr sched;    // the scheduler of the slot that is not in `sched`
+        std::array<llm_graph_result_ptr, 2> gf_res_prev;
+        llm_graph_result *     gf_res_prev_active = nullptr;
+
+        // the decode recorded by the last prep
+        llm_graph_result *       res = nullptr;
+        llama_ubatch             ubatch = {};
+        llama_memory_context_ptr mctx;
+
+        // each slot's sampled token, copied by the GPU into pinned host memory
+        ggml_backend_buffer_ptr tok_buf;
+        llama_token *           tok = nullptr;
+
+        void (*set_defer)(ggml_backend_t, bool) = nullptr;
+        void (*flush)(ggml_backend_t)           = nullptr;
+        bool (*mark)(ggml_backend_t)            = nullptr;
+        void (*mark_wait)(ggml_backend_t)       = nullptr;
+        bool marked[2] = {};                    // the slot's decode set a mark after its sampled-token copy
+    };
+
+    chain_state chain;
+
+    bool chain_init();
+    void chain_swap();
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

@@ -1025,6 +1025,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_cumsum_multipass1_f32;
     vk_pipeline pipeline_cumsum_multipass2_f32;
     vk_pipeline pipeline_argmax_f32;
+    vk_pipeline pipeline_argmax_wide_f32;   // 512 lanes per row, for a few long rows (greedy sampling over the vocab)
     vk_pipeline pipeline_decode_prefetch;
     vk_pipeline pipeline_decode_prefetch_q;
     vk_pipeline pipeline_argmax_part_f32;   // long rows in two passes: partial (max, column) per workgroup ...
@@ -1422,6 +1423,24 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    // Deferred submission (ggml_backend_vk_set_defer_submit): graph_compute records every batch but queues the
+    // submissions here; ggml_backend_vk_flush_deferred replays them in order. The caller writes inputs in between.
+    struct vk_deferred_submit {
+        std::shared_ptr<struct vk_context_struct> subctx;
+        bool has_work;      // the batch had command buffers to submit
+        int  fence_kind;    // 0 none, 1 fence, 2 almost_ready_fence
+        bool exit;          // the batch's last tensor: run the out copies after the submit
+    };
+    bool defer_submit {};
+    std::vector<vk_deferred_submit> deferred_submits;
+    // scratch buffers replaced while batches that use them wait in deferred_submits: kept until the next synchronize
+    std::vector<std::shared_ptr<struct vk_buffer_struct>> deferred_keep;
+    std::vector<ggml_backend_vk_buffer_context *> deferred_keep_bufctx;
+    // ggml_backend_vk_mark: an event the device sets after the work recorded before it, polled by the host
+    vk::Event mark_event {};
+    bool      mark_pending {};
+    // ctx->fence was submitted behind the flushed work and not waited yet (ggml_backend_vk_flush_deferred)
+    bool      fence_in_flight {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;

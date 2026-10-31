@@ -205,13 +205,14 @@ std::string common_params_sampling::print() const {
 // these parameters. A -inf bias (ignore_eos, tokens the model suppresses) only removes tokens: the winner is checked
 // against those per sample. Ties between equal top logits may resolve to
 // a different token than the chain's partial sort. LLAMA_SAMPLER_GREEDY_FAST=0 disables the fast path.
-static bool common_sampler_greedy_fast_ok(const common_params_sampling & params, bool greedy, bool has_grammar, bool has_rbudget) {
+static bool common_sampler_greedy_fast_ok(const common_params_sampling & params, bool greedy, bool has_grammar, bool has_rbudget,
+        bool check_env = true) {
     static const bool enabled = [] {
         const char * e = getenv("LLAMA_SAMPLER_GREEDY_FAST");
         return e == nullptr || atoi(e) != 0;
     }();
 
-    if (!enabled || !greedy || has_grammar || has_rbudget || params.mirostat != 0) {
+    if ((check_env && !enabled) || !greedy || has_grammar || has_rbudget || params.mirostat != 0) {
         return false;
     }
 
@@ -715,6 +716,23 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     }
 
     return gsmpl->chain;
+}
+
+bool common_sampler_is_greedy(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->chain) {
+        return false;
+    }
+    const int n = llama_sampler_chain_n(gsmpl->chain);
+    if (n <= 0) {
+        return false;
+    }
+    // a sampler set up for the backend reports "+greedy" ("-greedy" if it runs on the CPU)
+    const char * name = llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, n - 1));
+    if (name[0] == '+' || name[0] == '-') {
+        name++;
+    }
+    const bool greedy_last = strcmp(name, "greedy") == 0;
+    return common_sampler_greedy_fast_ok(gsmpl->params, greedy_last, gsmpl->grmr != nullptr, gsmpl->rbudget != nullptr, false);
 }
 
 // first index of the largest value (NaN never wins, as in the scalar loop); sets vmax

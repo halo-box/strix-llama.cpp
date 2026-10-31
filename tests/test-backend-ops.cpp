@@ -3313,12 +3313,14 @@ struct test_argmax : public test_case {
     const std::array<int64_t, 4> ne;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return ties ? VARS_TO_STR3(type, ne, ties) : VARS_TO_STR2(type, ne);
     }
 
+    const bool ties; // every value appears 4 times: the result must be the same maximum as on the CPU (the last)
+
     test_argmax(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 100, 1, 1})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 100, 1, 1}, bool ties = false)
+        : type(type), ne(ne), ties(ties) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -3339,7 +3341,7 @@ struct test_argmax : public test_case {
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<float> data(t->ne[0]);
                     for (int i = 0; i < t->ne[0]; i++) {
-                        data[i] = i;
+                        data[i] = ties ? (float) (i / 4) : (float) i;
                     }
                     std::shuffle(data.begin(), data.end(), rng);
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
@@ -19434,6 +19436,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32000, 512, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 1, 1, 1}));
 
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {512, 34, 2, 1}));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 80, 1, 1}));

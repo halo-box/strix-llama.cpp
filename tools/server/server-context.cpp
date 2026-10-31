@@ -292,6 +292,14 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // the task samples greedily on the backend and can take one-token-ahead decode chaining (--decode-chain)
+    bool chain_ok = false;
+    int32_t n_chained = 0; // tokens of the current task decoded through the chain
+    bool sampled_on_backend = false; // the last sampled token came whole from the backend sampler
+
+    // prompt position where the aligned end-of-prompt tail starts (--ctx-checkpoint-align), -1 = none
+    int32_t n_ckpt_tail_pos = -1;
+
     // end-of-prompt checkpoint taken from a recurrent state snapshot inside the batch (--ctx-checkpoint-snapshot):
     // the prompt length and the position it is taken before, -1 = none pending
     int64_t   n_ckpt_snap_tokens = -1;
@@ -1064,6 +1072,9 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    // --decode-chain: the slot whose chained decode is in flight (llama_decode_chain), -1 = none
+    int chain_slot = -1;
 
     bool add_bos_token = true;
 
@@ -2244,11 +2255,18 @@ private:
             use_backend_sampling &= !need_pre_sample_logits;
 
             // TODO: tmp until backend sampling is fully implemented
+            bool backend_sampled = false;
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                backend_sampled = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
+
+            // decode chaining reads the token straight from the backend sampler: only when that is the whole choice
+            slot.n_chained = 0;
+            slot.sampled_on_backend = false;
+            slot.chain_ok = params_base.decode_chain > 0 && backend_sampled && task.params.sampling.n_probs == 0 &&
+                            common_sampler_is_greedy(slot.smpl.get());
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
@@ -2261,6 +2279,7 @@ private:
             }
         } else {
             slot.smpl.reset();
+            slot.chain_ok = false;
         }
 
         // the per-request limit takes priority over the global one
@@ -3100,6 +3119,13 @@ private:
             return false;
         }
 
+        // a chained decode is in flight between update_slots() calls: finish it before a task can change a slot or the
+        // context (the tasks accepted while yielding only read the server state)
+        if (!is_yielding && chain_slot >= 0 && task.type != SERVER_TASK_TYPE_NEXT_RESPONSE && task.type != SERVER_TASK_TYPE_METRICS &&
+                task.type != SERVER_TASK_TYPE_SLOT_GET && task.type != SERVER_TASK_TYPE_DASHBOARD) {
+            chain_stop();
+        }
+
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -3490,6 +3516,7 @@ private:
     }
 
     void abort_all_slots(const std::string & reason) {
+        chain_abort();
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
@@ -3566,6 +3593,18 @@ private:
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
+            }
+        }
+
+        // one-token-ahead decode chaining for a lone greedy slot: the decode and its sampling happen in chain_step()
+        if (chain_slot >= 0 || params_base.decode_chain > 0) {
+            server_slot * cs = chain_candidate();
+            if (chain_slot >= 0 && (cs == nullptr || cs->id != chain_slot)) {
+                chain_stop();
+                cs = chain_candidate();
+            }
+            if (cs != nullptr && chain_step(*cs)) {
+                return;
             }
         }
 
@@ -4714,6 +4753,169 @@ private:
         return true;
     }
 
+    bool accept_special_token(const server_slot & slot, llama_token token) const {
+        return params_base.special ||
+            slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+    }
+
+    // a token the slot sampled (not speculative): accept it, stream it, stop or go on. tok_idx = its output row for
+    // n_probs. chained: the token is already being decoded (llama_decode_chain), so it joins the slot's cache here, also
+    // when it stops the slot (the memory holds it). Returns false if the slot was released.
+    bool handle_sampled_token(server_slot & slot, llama_token id, int tok_idx, bool chained) {
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+        const int64_t t_now = ggml_time_us();
+
+        slot.stats.n_gen += 1;
+
+        if (slot.stats.n_gen == 1) {
+            slot.stats.update_prompt_last();
+            slot.t_print_last = t_now;
+            slot.n_gen_last = 0;
+        }
+
+        slot.stats.update_gen_last();
+
+        completion_token_output result;
+        result.tok          = id;
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+        result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            GGML_ASSERT(!chained);
+            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+        }
+
+        if (!process_token(result, slot)) {
+            // release slot because of stop condition
+            slot.print_timings();
+            send_final_response(slot);
+            if (chained) {
+                slot.prompt.tokens.push_back(id);
+                chain_abort(); // the token the last decode sampled is not used
+                SLT_INF(slot, "decode chaining ends at the stop: %d tokens chained, n_tokens = %d\n", slot.n_chained, slot.prompt.n_tokens());
+            }
+            slot.release();
+
+            return false;
+        }
+
+        if (chained) {
+            slot.prompt.tokens.push_back(id);
+        }
+
+        slot.print_timings_tg();
+
+        return true;
+    }
+
+    //
+    // one-token-ahead decode chaining (--decode-chain, llama_decode_chain): while the decode of token t runs, the decode
+    // of t + 1 is recorded on a second scheduler and submitted as soon as t's backend sampler has picked t + 1. The
+    // server handles t + 1 (stream, stop checks) while its own decode runs. A stop therefore leaves t + 1 decoded: it
+    // stays in the slot's cache, so cache and memory still match.
+    //
+
+    // the slot that can chain this iteration: the only slot with work, generating, greedy on the backend
+    server_slot * chain_candidate() {
+        server_slot * res = nullptr;
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            if (res != nullptr) {
+                return nullptr;
+            }
+            res = &slot;
+        }
+        if (res == nullptr || res->state != SLOT_STATE_GENERATING || !res->chain_ok || !res->sampled_on_backend || spec || res->ctx_dft != nullptr ||
+                !res->inp_embd.empty() || res->need_embd() || !res->spec_draft.empty()) {
+            return nullptr;
+        }
+        // the decode this step submits must fit without a context shift (pre_decode), the next one too
+        if (res->prompt.n_tokens() + 2 >= res->n_ctx) {
+            return nullptr;
+        }
+        return res;
+    }
+
+    // returns false if the slot has to take the ordinary path this iteration (nothing was decoded)
+    bool chain_step(server_slot & slot) {
+        const bool first = chain_slot < 0;
+
+        metrics_pre_decode();
+
+        // first step: the token this slot sampled last (the last decode may have held other slots' outputs after it)
+        llama_token id = first ? slot.sampled : LLAMA_TOKEN_NULL;
+        const int ret = llama_decode_chain(ctx_tgt, slot.id, &id);
+
+        if (ret == -1) {
+            GGML_ASSERT(first && "decode chaining: in flight but unavailable");
+            SLT_DBG(slot, "%s", "decode chaining unavailable for this task\n");
+            slot.chain_ok = false;
+            return false;
+        }
+
+        if (ret != 0) {
+            SRV_ERR("decode chaining: decode failed, ret = %d\n", ret);
+            chain_slot = slot.id;
+            chain_abort();
+            send_error(slot, ret == 1 ? "Context size has been exceeded." : "Compute error.");
+            slot.release();
+            slot.prompt_clear();
+            return true;
+        }
+
+        chain_slot = slot.id;
+        slot.n_chained++;
+
+        metrics.n_decode++;
+        metrics.n_busy_slots++;
+        metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) slot.prompt.n_tokens() + 1);
+
+        if (first) {
+            // the token the ordinary path sampled and handled last: now decoded, as handle_last_sampled_token() would
+            GGML_ASSERT(id == slot.sampled && "decode chaining: the first chained token is not the slot's sampled token");
+            slot.prompt.tokens.push_back(id);
+            return true;
+        }
+
+        // sampled by the previous chained decode, decoding now
+        handle_sampled_token(slot, id, -1, true);
+
+        return true;
+    }
+
+    // ends the chain and hands its last sampled token (not decoded) to the ordinary path
+    void chain_stop() {
+        if (chain_slot < 0) {
+            return;
+        }
+        server_slot & slot = slots[chain_slot];
+        chain_slot = -1;
+
+        llama_token id = LLAMA_TOKEN_NULL;
+        GGML_ASSERT(llama_decode_chain_end(ctx_tgt, slot.id, &id) == 0);
+
+        if (slot.state != SLOT_STATE_GENERATING || !slot.task) {
+            return;
+        }
+        SLT_INF(slot, "decode chaining ends: %d tokens chained, n_tokens = %d\n", slot.n_chained, slot.prompt.n_tokens());
+        handle_sampled_token(slot, id, -1, false);
+    }
+
+    // ends the chain, dropping the last sampled token
+    void chain_abort() {
+        if (chain_slot < 0) {
+            return;
+        }
+        const int id_slot = chain_slot;
+        chain_slot = -1;
+        llama_token unused;
+        llama_decode_chain_end(ctx_tgt, id_slot, &unused);
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -4729,11 +4931,6 @@ private:
                 }
             }
         });
-
-        auto accept_special_token = [&](server_slot & slot, llama_token token) {
-            return params_base.special ||
-                slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
-        };
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
@@ -4798,40 +4995,10 @@ private:
 
             slot.i_batch = -1;
 
-            common_sampler_accept(slot.smpl.get(), id, true);
+            // a backend sampler set up only in part leaves the token to the CPU samplers: no chaining then
+            slot.sampled_on_backend = slot.chain_ok && llama_get_sampled_token_ith(slot.ctx_tgt, tok_idx) == id;
 
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
-
-            slot.stats.n_gen += 1;
-
-            if (slot.stats.n_gen == 1) {
-                slot.stats.update_prompt_last();
-                slot.t_print_last = t_now;
-                slot.n_gen_last = 0;
-            }
-
-            slot.stats.update_gen_last();
-
-            completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
-
-            if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-            }
-
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
-
-                return;
-            }
-
-            slot.print_timings_tg();
+            handle_sampled_token(slot, id, tok_idx, false);
         });
 
         // speculative decoding - main model sample and accept
