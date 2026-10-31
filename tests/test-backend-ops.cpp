@@ -7114,19 +7114,31 @@ struct test_hc_up_mix_f16 : public test_case {
     const int64_t n_embd, nt, k, pad;
     const bool gate16;   // false: the f32-gate form (LLAMA_HC_GATE_F16=0, no cast; Vulkan fusion name HC_UP_MIX_F32G)
     const bool mix16;    // true: the f16 mixed stream (LLAMA_HC_MIX_F16; HC_UP_MIX stores f16)
+    const int64_t mpad;  // > 0: the f16 mixed stream copied into rows n_embd + mpad apart (LLAMA_HC_MIX_PAD, Vulkan HC_UP_MIX*_PAD) and
+                         // read in place as the B of a q8_0 GEMM (the dense consumers), whose output is checked
 
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_UP_MIX_F16"; }
     std::string vars() override {
+        if (mpad > 0) return VARS_TO_STR7(n_embd, nt, k, pad, gate16, mix16, mpad);
         if (mix16) return VARS_TO_STR6(n_embd, nt, k, pad, gate16, mix16);
         return gate16 ? VARS_TO_STR4(n_embd, nt, k, pad) : VARS_TO_STR5(n_embd, nt, k, pad, gate16);
     }
     double max_nmse_err() override { return 5e-4; }
     bool run_whole_graph() override { return true; }
 
-    test_hc_up_mix_f16(int64_t n_embd = 64, int64_t nt = 64, int64_t k = 96, int64_t pad = 0, bool gate16 = true, bool mix16 = false)
-        : n_embd(n_embd), nt(nt), k(k), pad(pad), gate16(gate16), mix16(mix16) {}
+    test_hc_up_mix_f16(int64_t n_embd = 64, int64_t nt = 64, int64_t k = 96, int64_t pad = 0, bool gate16 = true, bool mix16 = false,
+                       int64_t mpad = 0)
+        : n_embd(n_embd), nt(nt), k(k), pad(pad), gate16(gate16), mix16(mix16), mpad(mix16 ? mpad : 0) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        // as qwen4exp emits it: the padded destination's VIEW node is in the graph ahead of the hc up chain
+        ggml_tensor * mdst = nullptr;
+        if (mpad > 0) {
+            ggml_tensor * mb = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_embd + mpad, nt);
+            ggml_set_name(mb, "mix_pad");
+            mdst = ggml_view_2d(ctx, mb, n_embd, nt, mb->nb[1], 0);
+            if (gf) { ggml_build_forward_expand(gf, mdst); }
+        }
         ggml_tensor * w  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, 4 * n_embd);
         ggml_set_name(w, "w_up");
         ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, nt);
@@ -7141,16 +7153,26 @@ struct test_hc_up_mix_f16 : public test_case {
         ggml_set_name(g, gate16 ? "gate_f16" : "gate_f32");
         ggml_tensor * out = ggml_dsv4_hc_pre_gated_ext(ctx, x, ggml_reshape_3d(ctx, g, n_embd, 4, nt), 0.25f, mix16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
         ggml_set_name(out, "mixed");
+        if (mpad > 0) {
+            out = ggml_cpy(ctx, out, mdst);
+            ggml_set_name(out, "mixed_padded");
+            ggml_tensor * w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, 96);
+            ggml_set_name(w2, "w_next");
+            out = ggml_mul_mat(ctx, w2, out);
+            ggml_set_name(out, "next");
+        }
         return out;
     }
 
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        const char * name = gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G";
+        const std::string sname = std::string(gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G") + (mpad > 0 ? "_PAD" : "");
+        const char * name = sname.c_str();
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_UP_MIX", name)) {
             return true;
         }
-        const int64_t n = dispatch_census_count(backend, name), want = env_knob_on("GGML_VK_HC_UP_MIX") ? 1 : 0;
+        const int64_t n = dispatch_census_count(backend, name),
+                      want = env_knob_on("GGML_VK_HC_UP_MIX") && (mpad == 0 || env_knob_on("GGML_VK_HC_MIX_CPY")) ? 1 : 0;
         if (n != want) {
             msg = std::string(name) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
             return false;
@@ -14098,6 +14120,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, false, true));
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128, true, true));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, true, true));
+    // the f16 mixed stream into padded rows (LLAMA_HC_MIX_PAD), read in place by the next GEMM: both gate forms, ragged n
+    test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128, false, true, 128));
+    test_cases.emplace_back(new test_hc_up_mix_f16(256, 33, 320, 8, false, true, 8));
+    test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2048, 320, 128, false, true, 128));
+    test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, false, true, 128));
+    test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128, true, true, 128));
     // MUL_MAT_ID (+ MUL) + CPY(f16), f32 and f16 B, exact and ragged tiles: one type per store (int8 legacy / K / q6_K, the routed
     // iq3_xxs / iq4_nl pf); the A loaders are test_mul_mat_id's and the dense pf cases'
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_1}) {
