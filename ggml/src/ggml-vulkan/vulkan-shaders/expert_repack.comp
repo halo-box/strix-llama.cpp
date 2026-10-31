@@ -1,0 +1,38 @@
+#version 450
+
+// Expert repack on upload: writes one chunk of canonical bytes of an expert tensor (staged in host memory) into the tensor in
+// the repacked order of the Vulkan expert repack buffer. Per R-row block, canonical order is row-major ([R rows][U units]) and
+// the repacked order unit-major ([U units][R rows]), in 16-byte units. A thread per destination unit of the blocks the chunk
+// touches: writes are contiguous, and a unit whose canonical source lies outside the chunk (the partial first / last block)
+// is left to the chunk that holds it, so the chunks of a tensor can arrive in any split.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n;              // destination units to visit: (blocks touched) * R * U
+    uint U;              // units per row
+    uint R;              // rows per block
+    uint c_lo;           // canonical unit range [c_lo, c_hi) of the chunk, from the tensor start
+    uint c_hi;
+    uint blk_lo;         // first block the chunk touches
+    uint src_offset;     // uvec4 units
+    uint dst_offset;     // uvec4 units
+} p;
+
+layout(binding = 0) readonly buffer S { uvec4 data_s[]; };
+layout(binding = 1) writeonly buffer D { uvec4 data_d[]; };
+
+void main() {
+    const uint RU     = p.R * p.U;
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint k = gl_GlobalInvocationID.x; k < p.n; k += stride) {
+        const uint b = p.blk_lo + k / RU;
+        const uint w = k % RU;           // u * R + r
+        const uint u = w / p.R;
+        const uint r = w - u * p.R;
+        const uint c = b * RU + r * p.U + u;
+        if (c >= p.c_lo && c < p.c_hi) {
+            data_d[p.dst_offset + b * RU + w] = data_s[p.src_offset + (c - p.c_lo)];
+        }
+    }
+}

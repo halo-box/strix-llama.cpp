@@ -563,6 +563,125 @@ static bool engagement_required(ggml_backend_t backend, const char * require_env
     return fusion == nullptr || skip == nullptr || skip(backend, fusion) == nullptr;
 }
 
+// GGML_TEST_EXTRA_BUFT=1: the MUL_MAT_ID weights (leaf src0) go into the backend device's first extra buffer type (e.g. the Vulkan
+// expert repack buffer), everything else into the default one; unset, the same case runs with default buffers (the A/B pair).
+// GGML_TEST_EXTRA_BUFT_ROUNDTRIP=1 also checks that set / get / copy of those weights return exactly the bytes written.
+// GGML_TEST_CENSUS_REQUIRE / GGML_TEST_CENSUS_FORBID: comma-separated dispatch census keys that must count > 0 / 0 in each case.
+static ggml_backend_buffer_type_t test_extra_buft(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto fn = reg ? (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+    ggml_backend_buffer_type_t * bufts = fn ? fn(dev) : nullptr;
+    return bufts ? bufts[0] : nullptr;
+}
+
+static ggml_backend_buffer_t alloc_mmid_weights(ggml_context * ctx, ggml_backend_t backend, std::vector<ggml_tensor *> & placed) {
+    ggml_backend_buffer_type_t buft = env_opt_in("GGML_TEST_EXTRA_BUFT") ? test_extra_buft(backend) : nullptr;
+    if (buft == nullptr) {
+        return nullptr;
+    }
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t size = align;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        ggml_tensor * w = t->op == GGML_OP_MUL_MAT_ID ? t->src[0] : nullptr;
+        if (w && w->op == GGML_OP_NONE && w->view_src == nullptr && w->data == nullptr &&
+            std::find(placed.begin(), placed.end(), w) == placed.end()) {
+            placed.push_back(w);
+            size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, w), align);
+        }
+    }
+    if (placed.empty()) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
+    GGML_ASSERT(buf != nullptr);
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_tallocr ta = ggml_tallocr_new(buf);
+    for (ggml_tensor * w : placed) {
+        GGML_ASSERT(ggml_tallocr_alloc(&ta, w) == GGML_STATUS_SUCCESS);
+    }
+    return buf;
+}
+
+static bool ctx_has_unallocated(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->data == nullptr && t->view_src == nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the bytes written come back from get_tensor (whole, partial, unaligned), and a copy to / from a default-buffer twin keeps them
+static bool extra_buft_roundtrip(ggml_backend_t backend, ggml_tensor * w, std::string & msg) {
+    const size_t n = ggml_nbytes(w);
+    std::mt19937 rng(12345);
+    std::vector<uint8_t> ref(n), got(n), part;
+    for (auto & b : ref) { b = (uint8_t) rng(); }
+    auto check = [&](const char * what) {
+        ggml_backend_tensor_get(w, got.data(), 0, n);
+        if (memcmp(got.data(), ref.data(), n) != 0) {
+            msg = std::string("roundtrip: ") + what + " mismatch in " + w->name;
+            return false;
+        }
+        return true;
+    };
+    ggml_backend_tensor_set(w, ref.data(), 0, n);
+    if (!check("whole set")) { return false; }
+    const size_t a = n / 3 + 5, len = std::min(n - a, n / 4 + 7);
+    part.resize(len);
+    for (auto & b : part) { b = (uint8_t) rng(); }
+    memcpy(ref.data() + a, part.data(), len);
+    ggml_backend_tensor_set(w, part.data(), a, len);
+    if (!check("partial set")) { return false; }
+    const size_t g = n / 2 + 3, glen = std::min<size_t>(n - g, 4099);
+    part.resize(glen);
+    ggml_backend_tensor_get(w, part.data(), g, glen);
+    if (memcmp(part.data(), ref.data() + g, glen) != 0) {
+        msg = std::string("roundtrip: partial get mismatch in ") + w->name;
+        return false;
+    }
+    ggml_init_params params = { ggml_tensor_overhead() * 2, nullptr, true };
+    ggml_context_ptr ctx2(ggml_init(params));
+    ggml_tensor * twin = ggml_dup_tensor(ctx2.get(), w);
+    ggml_backend_buffer_ptr buf2(ggml_backend_alloc_ctx_tensors(ctx2.get(), backend));
+    ggml_backend_tensor_copy(w, twin);
+    ggml_backend_tensor_get(twin, got.data(), 0, n);
+    if (memcmp(got.data(), ref.data(), n) != 0) {
+        msg = std::string("roundtrip: copy out mismatch in ") + w->name;
+        return false;
+    }
+    std::vector<uint8_t> zero(n, 0);
+    ggml_backend_tensor_set(w, zero.data(), 0, n);
+    ggml_backend_tensor_copy(twin, w);
+    return check("copy in");
+}
+
+// GGML_TEST_CENSUS_REQUIRE / _FORBID, checked after a case ran (census reset before it)
+static bool census_env_active() {
+    return getenv("GGML_TEST_CENSUS_REQUIRE") != nullptr || getenv("GGML_TEST_CENSUS_FORBID") != nullptr;
+}
+
+static bool census_env_check(ggml_backend_t backend, std::string & msg) {
+    for (const char * env : { "GGML_TEST_CENSUS_REQUIRE", "GGML_TEST_CENSUS_FORBID" }) {
+        const char * e = getenv(env);
+        if (e == nullptr) {
+            continue;
+        }
+        const bool require = strcmp(env, "GGML_TEST_CENSUS_REQUIRE") == 0;
+        std::stringstream ss(e);
+        std::string key;
+        while (std::getline(ss, key, ',')) {
+            const int64_t c = dispatch_census_count(backend, key.c_str());
+            if (c >= 0 && (require ? c == 0 : c != 0)) {
+                msg = "census " + key + " = " + std::to_string(c) + (require ? " (required > 0)" : " (forbidden)");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 enum test_mode {
     MODE_TEST,
     MODE_PERF,
@@ -1523,14 +1642,26 @@ struct test_case {
             add_sentinel(ctx_weights.get());
         }
 
+        std::vector<ggml_tensor *> extra_placed;
+        ggml_backend_buffer_ptr buf_extra(alloc_mmid_weights(ctx.get(), backend1, extra_placed));
         ggml_backend_buffer_ptr buf_weights(nullptr);
-        if (ctx_weights) {
+        if (ctx_weights && ctx_has_unallocated(ctx_weights.get())) {
             buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
             }
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+        if (buf_extra && env_opt_in("GGML_TEST_EXTRA_BUFT_ROUNDTRIP")) {
+            for (ggml_tensor * w : extra_placed) {
+                std::string msg;
+                if (!extra_buft_roundtrip(backend1, w, msg)) {
+                    test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, msg);
+                    print_test_result_locked(output_printer, result);
+                    return test_status_t::FAIL;
+                }
+            }
         }
 
         // allocate: through the scheduler when the fusion under test depends on graph_optimize (allocation
@@ -1654,7 +1785,7 @@ struct test_case {
             fused_nodes_to_verify.push_back(out);
         }
         bool cmp_ok = true;
-        if (checks_engagement()) {
+        if (checks_engagement() || census_env_active()) {
             dispatch_census_reset(backend1);
         }
         if (!second_backend_nodes().empty()) {
@@ -1685,7 +1816,7 @@ struct test_case {
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
         if (test_passed) {
             std::string engage_msg;
-            if (!verify_engagement(backend1, engage_msg)) {
+            if (!verify_engagement(backend1, engage_msg) || !census_env_check(backend1, engage_msg)) {
                 test_passed = false;
                 error_msg   = engage_msg;
             }
@@ -1799,8 +1930,10 @@ struct test_case {
             return true;
         }
 
+        std::vector<ggml_tensor *> extra_placed;
+        ggml_backend_buffer_ptr buf_extra(alloc_mmid_weights(ctx.get(), backend, extra_placed));
         ggml_backend_buffer_ptr buf_weights(nullptr);
-        if (ctx_weights) {
+        if (ctx_weights && ctx_has_unallocated(ctx_weights.get())) {
             buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors\n");
@@ -16857,6 +16990,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_prefill(true, 513, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(false, 512, GGML_TYPE_Q5_1));
     test_cases.emplace_back(new test_moe_prefill(false, 2048, GGML_TYPE_Q5_1, true));
+    // expert repack buffer (GGML_TEST_EXTRA_BUFT=1): the Flash-Next expert shapes at decode and below the f16 chain's 32 tokens
+    // (the repacked mat-vec)
+    for (int64_t n : { 1, 2, 3, 4, 5, 6, 7, 8, 16, 31 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 10, true, 640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 128, 10, true, 640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 128, 10, false, 2560, n, 640));
+    }
     // MUL_MAT_ID_PAIR_SWIGLU: both graph orders, f32 / f16 activations, token counts around the 64-row tile
     for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         for (bool up_first : { false, true }) {
@@ -18517,12 +18657,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     if (getenv("GGML_PERF_MOE")) {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
         test_cases.emplace_back(new test_moe_prefill(false, 4096));
+        // the streaming q5_1 down chain (f16 B, router weights, CPY f16) at the measured FN routing, ub2048 / ub4096
+        for (int64_t nt : { 2048, 4096 }) {
+            test_cases.emplace_back(new test_moe_prefill(false, nt, GGML_TYPE_Q5_1, true));
+        }
+        // FN routed experts at decode / MTP verify / a prompt tail: gate (q4_K) and down (q5_1) mat-vec. A graph repeats its op with
+        // the same experts, so n 1 / 4 run from the LLC; n 8 (80 experts, ~74 MB of q4_K) is the DRAM-bound per-token proxy
+        for (int64_t n : { 1, 4, 8, 16 }) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
+        }
         // the Flash-Next routed gate/up + SwiGLU at ub2048 / ub4096: measured routing and uniform routing
         for (int64_t nt : { 2048, 4096 }) {
             for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
                 test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, true));
                 test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, false));
             }
+            // q5_K (FN's q5_K gate/up layer) and the f32 chain, measured routing
+            test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F16, 2560, 640, 512, 10, nt, false, true));
+            test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 640, 512, 10, nt, false, true, true));
         }
         return test_cases;
     }

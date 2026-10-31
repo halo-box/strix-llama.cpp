@@ -1991,6 +1991,128 @@ static bool ggml_vk_mmid_manual_frag_enabled() {
 }
 static void ggml_vk_path_census_add(const char * name);
 static bool ggml_vk_dispatch_census_enabled();
+
+// Expert repack buffer (GGML_VK_EXPERT_REPACK, default on; 0 offers no extra buffer type, as before). An extra Vulkan buffer type
+// for routed expert weights: q4_K gate / up and q5_1 down tensors placed in it are stored with the 16-byte units of each R-row
+// block (R = 16 for q4_K, 32 for q5_1) in unit-major order ([U units][R rows] instead of [R rows][U units]), so a wave's A loads
+// in the streaming MUL_MAT_ID kernels are contiguous. set_tensor permutes, get_tensor / cpy_tensor invert, so every reader
+// outside the backend sees canonical bytes. The layout belongs to the buffer: experts kept elsewhere (-ncmoe) stay canonical.
+static bool ggml_vk_mmid_pair_glu_enabled();
+static bool ggml_vk_mmid_pair_glu_ext_enabled();
+static bool ggml_vk_mmid_down_stream_enabled();
+static bool ggml_vk_repack_mmv_ok(const ggml_tensor * dst);
+static bool ggml_vk_expert_repack_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_EXPERT_REPACK"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// negative controls (tests only), GGML_VK_EXPERT_REPACK_NEGCTL: 1 stores each row pair of a block swapped on upload and does not
+// undo it on readback (the round trip must fail); 2 swaps on upload and undoes it on readback (the round trip holds, but the host
+// order no longer matches the kernels', so every repacked compute case must fail); 3 corrupts one byte of the first chunk of
+// each write that the GPU reorders in the synchronous path or the GGML_VK_EXPERT_REPACK_GPU_LOAD_TEST path (the round trip
+// must fail)
+static int ggml_vk_expert_repack_negctl() {
+    static const int v = [] { const char * e = getenv("GGML_VK_EXPERT_REPACK_NEGCTL"); return e != nullptr ? atoi(e) : 0; }();
+    return v;
+}
+
+static bool ggml_vk_buft_is_repack(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && buft->iface.get_name == ggml_backend_vk_buffer_type_name &&
+           ((const ggml_backend_vk_buffer_type_context *) buft->context)->repack;
+}
+
+// rows per block of the repacked order for t on dev (16 q4_K / q5_K, 32 q5_1), or 0 for a tensor the repacked readers do not cover
+static uint32_t ggml_vk_repack_rows_shape(const vk_device & dev, const ggml_tensor * t) {
+    if (t->view_src != nullptr || t->ne[2] < 2 || t->ne[3] != 1 || !ggml_is_contiguous(t) ||
+        ggml_nbytes(t) > dev->properties.limits.maxStorageBufferRange) {
+        return 0;
+    }
+    if (((t->type == GGML_TYPE_Q4_K && dev->expert_repack_q4k) || (t->type == GGML_TYPE_Q5_K && dev->expert_repack_q5k)) &&
+        t->ne[0] % 256 == 0 && t->ne[1] % 128 == 0) {
+        return 16;
+    }
+    if (t->type == GGML_TYPE_Q5_1 && dev->expert_repack_q51 && t->ne[0] % 64 == 0 && t->ne[1] % 256 == 0) {
+        return 32;
+    }
+    return 0;
+}
+
+// rows per block when t is stored repacked (in a repack buffer, covered shape), else 0
+static uint32_t ggml_vk_repack_rows(const ggml_tensor * t) {
+    if (t == nullptr || t->buffer == nullptr || !ggml_vk_buft_is_repack(t->buffer->buft)) {
+        return 0;
+    }
+    return ggml_vk_repack_rows_shape(((const ggml_backend_vk_buffer_type_context *) t->buffer->buft->context)->device, t);
+}
+
+// a view into a repacked tensor: its bytes are not in canonical order, and no reader takes it
+static bool ggml_vk_repack_is_view(const ggml_tensor * t) {
+    return t != nullptr && t->view_src != nullptr && ggml_vk_repack_rows(t->view_src) != 0;
+}
+
+// [R rows][U units] -> [U units][R rows] (inverse: back) for nblk whole blocks, 16-byte units
+static void ggml_vk_repack_blocks(const uint8_t * src, uint8_t * dst, size_t nblk, size_t U, uint32_t R, bool inverse) {
+    const int  nc  = ggml_vk_expert_repack_negctl();
+    const bool neg = nc == 2 || (nc == 1 && !inverse);
+    for (size_t b = 0; b < nblk; ++b) {
+        const size_t base = b * R * U;
+        for (size_t r = 0; r < R; ++r) {
+            const size_t rs = neg ? (r ^ 1) : r;
+            for (size_t u = 0; u < U; ++u) {
+                const size_t c = base + r * U + u, q = base + u * R + rs;
+                memcpy(dst + 16 * (inverse ? c : q), src + 16 * (inverse ? q : c), 16);
+            }
+        }
+    }
+}
+
+// write canonical bytes [offset, offset + size) of repacked tensor t: whole row blocks are permuted in host windows; a block the
+// write covers only in part is read back and inverted first, so any range (the loader's chunked uploads) stays exact
+static void ggml_vk_repack_write(vk_buffer & buf, const ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size) {
+    const size_t blk  = (size_t) R * t->nb[1];
+    const size_t U    = t->nb[1] / 16;
+    const size_t base = vk_tensor_offset(t) + t->view_offs;
+    const size_t win  = std::max<size_t>(1, (16u << 20) / blk) * blk;
+    const size_t end  = offset + size;
+    std::vector<uint8_t> canon, perm;
+    for (size_t b = offset / blk * blk; b < end; b += win) {
+        const size_t e = std::min(b + win, (end + blk - 1) / blk * blk);
+        const size_t lo = std::max(b, offset), hi = std::min(e, end);
+        canon.resize(e - b);
+        perm.resize(e - b);
+        if (lo > b) {
+            ggml_vk_buffer_read(buf, base + b, perm.data(), blk);
+            ggml_vk_repack_blocks(perm.data(), canon.data(), 1, U, R, true);
+        }
+        if (hi < e && (e - blk > b || lo == b)) {
+            ggml_vk_buffer_read(buf, base + e - blk, perm.data() + (e - blk - b), blk);
+            ggml_vk_repack_blocks(perm.data() + (e - blk - b), canon.data() + (e - blk - b), 1, U, R, true);
+        }
+        memcpy(canon.data() + (lo - b), (const uint8_t *) data + (lo - offset), hi - lo);
+        ggml_vk_repack_blocks(canon.data(), perm.data(), (e - b) / blk, U, R, false);
+        ggml_vk_buffer_write(buf, base + b, perm.data(), e - b);
+    }
+    ggml_vk_path_census_add("EXPERT_REPACK/SET");
+}
+
+// read canonical bytes [offset, offset + size) of repacked tensor t
+static void ggml_vk_repack_read(vk_buffer & buf, const ggml_tensor * t, uint32_t R, void * data, size_t offset, size_t size) {
+    const size_t blk  = (size_t) R * t->nb[1];
+    const size_t U    = t->nb[1] / 16;
+    const size_t base = vk_tensor_offset(t) + t->view_offs;
+    const size_t win  = std::max<size_t>(1, (16u << 20) / blk) * blk;
+    const size_t end  = offset + size;
+    std::vector<uint8_t> canon, perm;
+    for (size_t b = offset / blk * blk; b < end; b += win) {
+        const size_t e = std::min(b + win, (end + blk - 1) / blk * blk);
+        const size_t lo = std::max(b, offset), hi = std::min(e, end);
+        canon.resize(e - b);
+        perm.resize(e - b);
+        ggml_vk_buffer_read(buf, base + b, perm.data(), e - b);
+        ggml_vk_repack_blocks(perm.data(), canon.data(), (e - b) / blk, U, R, true);
+        memcpy((uint8_t *) data + (lo - offset), canon.data() + (lo - b), hi - lo);
+    }
+}
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device);
 static uint32_t ggml_vk_dense_ypad();
 static bool ggml_vk_dense_ypad_camps(uint64_t k);
@@ -5034,6 +5156,45 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51[1], "mul_mm_id_down_q5_1_f32", mul_mm_id_down_q5_1_f32_len,
                     mul_mm_id_down_q5_1_f32_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
                     "main", 6, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
+                // expert repack buffer (GGML_VK_EXPERT_REPACK): the same kernels on the repacked order, the mat-vec, the inverse copy
+                if (ggml_vk_expert_repack_enabled()) {
+#define CREATE_MMID_GLU_RP(ti, tn) \
+                    ggml_vk_create_pipeline(device, device->pipeline_mmid_glu_rp[ti][0][0], "mul_mm_id_glu_" #tn "_f16_rp", mul_mm_id_glu_ ## tn ## _f16_rp_len, \
+                        mul_mm_id_glu_ ## tn ## _f16_rp_data, "main", 5, sizeof(vk_op_mmid_glu_push_constants), {128, 1, 1}, {}, 1, true, true, 32); \
+                    ggml_vk_create_pipeline(device, device->pipeline_mmid_glu_rp[ti][0][1], "mul_mm_id_glu_" #tn "_f32_rp", mul_mm_id_glu_ ## tn ## _f32_rp_len, \
+                        mul_mm_id_glu_ ## tn ## _f32_rp_data, "main", 5, sizeof(vk_op_mmid_glu_push_constants), {128, 1, 1}, {}, 1, true, true, 32); \
+                    ggml_vk_create_pipeline(device, device->pipeline_mmid_glu_rp[ti][1][0], "mul_mm_id_glu_" #tn "_f16_o32_rp", mul_mm_id_glu_ ## tn ## _f16_o32_rp_len, \
+                        mul_mm_id_glu_ ## tn ## _f16_o32_rp_data, "main", 5, sizeof(vk_op_mmid_glu_push_constants), {128, 1, 1}, {}, 1, true, true, 32); \
+                    ggml_vk_create_pipeline(device, device->pipeline_mmid_glu_rp[ti][1][1], "mul_mm_id_glu_" #tn "_f32_o32_rp", mul_mm_id_glu_ ## tn ## _f32_o32_rp_len, \
+                        mul_mm_id_glu_ ## tn ## _f32_o32_rp_data, "main", 5, sizeof(vk_op_mmid_glu_push_constants), {128, 1, 1}, {}, 1, true, true, 32);
+                    CREATE_MMID_GLU_RP(0, q4_k)
+                    CREATE_MMID_GLU_RP(1, q5_k)
+#undef CREATE_MMID_GLU_RP
+                    ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51_rp[0], "mul_mm_id_down_q5_1_f16_rp", mul_mm_id_down_q5_1_f16_rp_len,
+                        mul_mm_id_down_q5_1_f16_rp_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+                    ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51_rp[1], "mul_mm_id_down_q5_1_f32_rp", mul_mm_id_down_q5_1_f32_rp_len,
+                        mul_mm_id_down_q5_1_f32_rp_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+                    ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q4k, "mul_mat_vec_id_q4_k_rp_f32", mul_mat_vec_id_q4_k_rp_f32_len,
+                        mul_mat_vec_id_q4_k_rp_f32_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
+                    ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q5k, "mul_mat_vec_id_q5_k_rp_f32", mul_mat_vec_id_q5_k_rp_f32_len,
+                        mul_mat_vec_id_q5_k_rp_f32_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+                    if (device->integer_dot_product) {
+                        ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q4k_q8, "mul_mat_vec_id_q4_k_rp_q8_1", mul_mat_vec_id_q4_k_rp_q8_1_len,
+                            mul_mat_vec_id_q4_k_rp_q8_1_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
+                        ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q5k_q8, "mul_mat_vec_id_q5_k_rp_q8_1", mul_mat_vec_id_q5_k_rp_q8_1_len,
+                            mul_mat_vec_id_q5_k_rp_q8_1_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
+                        ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q51_q8, "mul_mat_vec_id_q5_1_rp_q8_1", mul_mat_vec_id_q5_1_rp_q8_1_len,
+                            mul_mat_vec_id_q5_1_rp_q8_1_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
+                    }
+#endif
+                    ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q51, "mul_mat_vec_id_q5_1_rp_f32", mul_mat_vec_id_q5_1_rp_f32_len,
+                        mul_mat_vec_id_q5_1_rp_f32_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
+                    ggml_vk_create_pipeline(device, device->pipeline_expert_unrepack, "expert_unrepack", expert_unrepack_len,
+                        expert_unrepack_data, "main", 2, 5 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
+                    ggml_vk_create_pipeline(device, device->pipeline_expert_repack, "expert_repack", expert_repack_len,
+                        expert_repack_data, "main", 2, 8 * sizeof(uint32_t), {256, 1, 1}, {}, 1, true);
+                }
             }
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_top_k_cm_f16,
                 "flash_attn_top_k_cm_f16", flash_attn_top_k_cm_f16_len, flash_attn_top_k_cm_f16_data, "main", 6,
@@ -6430,6 +6591,11 @@ vk_device ggml_vk_get_device(size_t idx) {
             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
         };
+        device->buffer_type_repack = {
+            /* .iface    = */ ggml_backend_vk_buffer_type_interface,
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
+            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name + "_REPACK", device, true },
+        };
 
         device->fence = device->device.createFence({});
 
@@ -6458,6 +6624,31 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->coopmat_rdna3_layout = ggml_vk_check_coopmat_rdna3_layout(device);
         if (device->coopmat_rdna3_layout && (ggml_vk_mmid_manual_frag_enabled() || ggml_vk_mmid_rega_enabled(device))) {
             ggml_vk_load_shaders(device);
+        }
+
+        // expert repack buffer: per weight type, only when the streaming kernel that reads it runs on this device
+        {
+            const bool base = ggml_vk_expert_repack_enabled() && device->coopmat_rdna3_layout && !device->disable_fusion &&
+                              device->pipeline_expert_unrepack;
+            // q5_K and the f32 chain take MUL_MAT_ID_PAIR_SWIGLU only with GGML_VK_MMID_PAIR_GLU_EXT on
+            auto glu_ok = [&](int ti) {
+                bool ok = ggml_vk_mmid_pair_glu_enabled() && (ti == 0 || ggml_vk_mmid_pair_glu_ext_enabled()) && device->pipeline_mmid_glu[ti][0][0];
+                for (int o = 0; o < 2; ++o) {
+                    for (int b = 0; b < 2; ++b) {
+                        ok = ok && device->pipeline_mmid_glu_rp[ti][o][b];
+                    }
+                }
+                return ok;
+            };
+            device->expert_repack_q4k = base && glu_ok(0) && device->pipeline_mmv_id_rp_q4k;
+            device->expert_repack_q5k = base && glu_ok(1) && device->pipeline_mmv_id_rp_q5k;
+            device->expert_repack_q51 = base && ggml_vk_mmid_down_stream_enabled() && device->pipeline_mmid_down_q51[0] &&
+                                        device->pipeline_mmid_down_q51_rp[0] && device->pipeline_mmid_down_q51_rp[1] && device->pipeline_mmv_id_rp_q51;
+            if (device->expert_repack_q4k || device->expert_repack_q5k || device->expert_repack_q51) {
+                GGML_LOG_INFO("ggml_vulkan: expert repack buffer on (%s%s%s; GGML_VK_EXPERT_REPACK=0 disables)\n",
+                              device->expert_repack_q4k ? "q4_K gate/up " : "", device->expert_repack_q5k ? "q5_K gate/up " : "",
+                              device->expert_repack_q51 ? "q5_1 down" : "");
+            }
         }
 
         return device;
@@ -10268,7 +10459,63 @@ static bool ggml_vk_mmid_medium_tile(ggml_backend_vk_context * ctx, const std::v
 // fused_scale / fused_dst: MUL_MAT_ID+MUL (router weights in the epilogue, result in the MUL's destination).
 // out16: MUL_MAT_ID(+MUL)+CPY(f16), stored as f16 into the cast's destination (ggml_vk_mmid_d16_ok); dst is never written.
 // glu_up (with out16): MUL_MAT_ID+CPY(f16)+SWIGLU, the other projection; glu_acc_gate: this GEMM is the gate projection.
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr, const ggml_tensor * out16 = nullptr, const ggml_tensor * glu_up = nullptr, bool glu_acc_gate = false) {
+// expert repack buffer: a MUL_MAT_ID path without a repacked build (GEMM fallbacks, large K mat-vec) reads a canonical copy of the
+// weight, written into a context scratch buffer by expert_unrepack.comp. Exact, but a full read + write of the tensor per call:
+// counted as EXPERT_REPACK_FALLBACK and logged once. canon receives a tensor header that points at the copy.
+static const ggml_tensor * ggml_vk_expert_unrepack(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * t, ggml_tensor * canon) {
+    const uint32_t R = ggml_vk_repack_rows(t);
+    GGML_ASSERT(R != 0 && ctx->device->pipeline_expert_unrepack);
+    const size_t nbytes = ggml_nbytes(t);
+    if (ctx->expert_unrepack_bufctx == nullptr || ctx->expert_unrepack_bufctx->dev_buffer->size < nbytes) {
+        // submit and wait for pending work before the scratch is replaced (as ggml_vk_preallocate_buffers)
+        if (subctx) {
+            ggml_vk_ctx_end(subctx);
+            ggml_vk_submit(subctx, {});
+            ctx->submit_pending = true;
+            ggml_vk_synchronize(ctx);
+            ggml_vk_ctx_begin(ctx->device, subctx);
+            ctx->compute_ctx = subctx;
+        }
+        delete ctx->expert_unrepack_bufctx;
+        std::string name = "expert_unrepack";
+        ctx->expert_unrepack_bufctx = new ggml_backend_vk_buffer_context(ctx->device, ggml_vk_create_buffer_device(ctx->device, nbytes), name);
+        ctx->expert_unrepack_buffer = {};
+        ctx->expert_unrepack_buffer.buft    = &ctx->device->buffer_type;
+        ctx->expert_unrepack_buffer.context = ctx->expert_unrepack_bufctx;
+        ctx->expert_unrepack_buffer.size    = nbytes;
+        ctx->expert_unrepack_buffer.usage   = GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_WARN("ggml_vulkan: expert repack: %s (%s) has no repacked kernel on this path, reading a canonical copy "
+                      "(slow; GGML_VK_EXPERT_REPACK=0 avoids it)\n", t->name, ggml_type_name(t->type));
+    }
+    ggml_vk_path_census_add("EXPERT_REPACK_FALLBACK");
+
+    vk_pipeline pipeline = ctx->device->pipeline_expert_unrepack;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    // the previous reader of the scratch may still run
+    ggml_vk_sync_buffers(ctx, subctx);
+    const uint32_t n = (uint32_t) (nbytes / 16);
+    const struct { uint32_t n, U, R, src_offset, dst_offset; } pc = { n, (uint32_t) (t->nb[1] / 16), R, get_misalign_bytes(ctx, t) / 16, 0 };
+    const vk_subbuffer dst = { ctx->expert_unrepack_bufctx->dev_buffer, 0, nbytes };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, t, true), dst }, pc,
+                              { std::min<uint32_t>(n, 65535u * 256u), 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    *canon = *t;
+    canon->buffer    = &ctx->expert_unrepack_buffer;
+    canon->data      = vk_ptr_base;
+    canon->view_src  = nullptr;
+    canon->view_offs = 0;
+    return canon;
+}
+
+static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0_in, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr, const ggml_tensor * out16 = nullptr, const ggml_tensor * glu_up = nullptr, bool glu_acc_gate = false) {
+    // expert repack buffer: this path reads canonical weights
+    ggml_tensor src0_canon;
+    const ggml_tensor * src0 = ggml_vk_repack_rows(src0_in) != 0 ? ggml_vk_expert_unrepack(ctx, subctx, src0_in, &src0_canon) : src0_in;
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -10762,6 +11009,12 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * ids = dst->src[2];
+    // expert repack buffer: the repacked mat-vec, or a canonical copy for what it does not take (K above its B stage)
+    const bool repacked_mmv = ggml_vk_repack_mmv_ok(dst);
+    ggml_tensor src0_canon;
+    if (!repacked_mmv && ggml_vk_repack_rows(src0) != 0) {
+        src0 = const_cast<ggml_tensor *>(ggml_vk_expert_unrepack(ctx, subctx, src0, &src0_canon));
+    }
     VK_LOG_DEBUG("ggml_vk_mul_mat_vec_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -10794,7 +11047,11 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
+    // the repacked q4_K mat-vec takes B as q8_1 (integer dot) when the device has it, as mul_mat_vecq
+    vk_pipeline rp_q8 = src0->type == GGML_TYPE_Q4_K ? ctx->device->pipeline_mmv_id_rp_q4k_q8 :
+                        src0->type == GGML_TYPE_Q5_K ? ctx->device->pipeline_mmv_id_rp_q5k_q8 : ctx->device->pipeline_mmv_id_rp_q51_q8;
+    const bool repacked_q8 = repacked_mmv && rp_q8 && ctx->device->integer_dot_product && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
+    bool quantize_y = repacked_q8 || (!repacked_mmv && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type));
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -10811,7 +11068,12 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, GGML_TYPE_Q8_1, ne20, ne00) : nullptr;
     vk_pipeline to_q8_1 = nullptr;
 
-    if (dmmv == nullptr) {
+    if (repacked_mmv) {
+        dmmv = repacked_q8                   ? rp_q8 :
+               src0->type == GGML_TYPE_Q4_K ? ctx->device->pipeline_mmv_id_rp_q4k :
+               src0->type == GGML_TYPE_Q5_K ? ctx->device->pipeline_mmv_id_rp_q5k : ctx->device->pipeline_mmv_id_rp_q51;
+        ggml_vk_path_census_add("EXPERT_REPACK/VEC");
+    } else if (dmmv == nullptr) {
         // Fall back to f16 dequant mul mat
         dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type, ne20, ne00);
         quantize_y = false;
@@ -10996,9 +11258,23 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     }
 }
 
+// expert repack buffer: the repacked mat-vec (mul_mat_vec_id_rp.comp) takes this MUL_MAT_ID: f32 B, K within its shared B stage
+static bool ggml_vk_repack_mmv_ok(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const uint32_t R = ggml_vk_repack_rows(src0);
+    return R != 0 && src1->type == GGML_TYPE_F32 && ggml_vk_dim01_contiguous(src1) && dst->type == GGML_TYPE_F32 &&
+           src0->ne[0] <= (R == 16 ? 4096 : 2048);
+}
+
 static bool ggml_vk_use_mul_mat_vec_id(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * ids = dst->src[2];
+    // repacked experts below the f16 MoE chain's 32 tokens (no streaming fusion there) stay on the repacked mat-vec: the GEMM path
+    // would need the inverse copy of the whole tensor
+    if (ids->ne[1] > 8 && ids->ne[1] < 32 && ggml_vk_repack_mmv_ok(dst)) {
+        return true;
+    }
     return ids->ne[1] <= 8 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
@@ -11026,6 +11302,100 @@ static bool ggml_vk_mmid_down_stream_enabled() {
 static bool ggml_vk_mmid_pair_glu_ext_enabled() {
     static const bool on = [] {
         const char * e = getenv("GGML_VK_MMID_PAIR_GLU_EXT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static constexpr uint32_t mmid_pair_glu_bn = 64;   // the shader's token tile (BN)
+
+// the weight types mul_mm_id_glu.comp dequantizes (pipeline_mmid_glu's first index), -1 for the rest
+static int ggml_vk_mmid_glu_type_idx(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K: return 0;
+        case GGML_TYPE_Q5_K: return 1;
+        default:             return -1;
+    }
+}
+
+// f32: the f32 chain [MUL_MAT_ID, MUL_MAT_ID, SWIGLU] instead of [MUL_MAT_ID, CPY(f16), MUL_MAT_ID, CPY(f16), SWIGLU]
+static void ggml_vk_mmid_pair_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int i, bool f32) {
+    const ggml_tensor * mm_a = cgraph->nodes[i];
+    const ggml_tensor * mm_b = cgraph->nodes[i + (f32 ? 1 : 2)];
+    const ggml_tensor * glu  = cgraph->nodes[i + (f32 ? 2 : 4)];
+    const bool a_is_gate = glu->src[0] == cgraph->nodes[i + (f32 ? 0 : 1)];
+    const ggml_tensor * w_g = (a_is_gate ? mm_a : mm_b)->src[0];
+    const ggml_tensor * w_u = (a_is_gate ? mm_b : mm_a)->src[0];
+    const ggml_tensor * x   = mm_a->src[1];
+    const ggml_tensor * ids = mm_a->src[2];
+
+    const uint32_t K = (uint32_t) w_g->ne[0], M = (uint32_t) w_g->ne[1], n_as = (uint32_t) w_g->ne[2];
+    const uint32_t n_used = (uint32_t) ids->ne[0], T = (uint32_t) ids->ne[1];
+    const uint64_t max_tiles = ggml_vk_mul_mat_id_max_tiles(n_as, (uint64_t) n_used * T, mmid_pair_glu_bn);
+    const uint64_t row_ids_offset = 1 + 2 * max_tiles;
+    const size_t expert_data_size = sizeof(uint32_t) * (row_ids_offset + max_tiles * mmid_pair_glu_bn);
+
+    // expert repack buffer: gate and up share the layout (ggml_vk_can_fuse_mmid_pair_glu)
+    const bool repacked = ggml_vk_repack_rows(w_g) != 0;
+    vk_pipeline pipeline = (repacked ? ctx->device->pipeline_mmid_glu_rp : ctx->device->pipeline_mmid_glu)
+        [ggml_vk_mmid_glu_type_idx(w_g->type)][f32 ? 1 : 0][x->type == GGML_TYPE_F32 ? 1 : 0];
+    vk_pipeline count_experts = ctx->device->pipeline_count_experts;
+    if (ctx->prealloc_size_split_k < expert_data_size) {
+        ctx->prealloc_size_split_k = expert_data_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID_PAIR_SWIGLU engaged (%s, M=%u K=%u experts=%u used=%u, %s B, %s out)\n", ggml_type_name(w_g->type),
+                      M, K, n_as, n_used, ggml_type_name(x->type), f32 ? "f32" : "f16");
+    }
+    ggml_vk_path_census_add(f32 ? "MUL_MAT_ID_PAIR_SWIGLU_F32" : "MUL_MAT_ID_PAIR_SWIGLU");
+    if (repacked) {
+        ggml_vk_path_census_add("EXPERT_REPACK/GLU");
+    }
+
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    const vk_subbuffer expert_buf = { ctx->prealloc_split_k, 0, expert_data_size };
+    {
+        vk_op_count_experts_push_constants pc = { n_used, T,
+                                                  (uint32_t) (ids->nb[0] / ggml_type_size(ids->type)),
+                                                  (uint32_t) (ids->nb[1] / ggml_type_size(ids->type)),
+                                                  (uint32_t) (get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
+                                                  n_as, 0, 0, mmid_pair_glu_bn, (uint32_t) row_ids_offset };
+        init_pushconst_fastdiv(pc);
+        ggml_vk_dispatch_pipeline(ctx, subctx, count_experts, { ggml_vk_tensor_subbuffer(ctx, ids, true), expert_buf }, pc, { 1, 1, 1 });
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const uint32_t xs = x->type == GGML_TYPE_F32 ? 4 : 8;   // B elements per uvec4
+    const vk_op_mmid_glu_push_constants pc = {
+        M, K,
+        get_misalign_bytes(ctx, w_g) / 16, get_misalign_bytes(ctx, w_u) / 16,
+        (uint32_t) (w_g->nb[2] / 16),
+        get_misalign_bytes(ctx, x) / 16, (uint32_t) (x->nb[1] / ggml_type_size(x->type) / xs), (uint32_t) (x->nb[2] / ggml_type_size(x->type) / xs),
+        (uint32_t) x->ne[1],
+        get_misalign_bytes(ctx, glu) / (f32 ? 16 : 8),
+        n_used, (uint32_t) row_ids_offset, 0u,
+    };
+    const uint32_t tiles_y = (uint32_t) std::min<uint64_t>(max_tiles, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, w_g, true), ggml_vk_tensor_subbuffer(ctx, w_u, true), ggml_vk_tensor_subbuffer(ctx, x, true),
+          ggml_vk_tensor_subbuffer(ctx, glu, true), expert_buf },
+        pc, { M, tiles_y, (uint32_t) CEIL_DIV(max_tiles, tiles_y) });
+    ctx->prealloc_split_k_need_sync = true;
+}
+
+// MUL_MAT_ID(+MUL)+CPY(f16) of q5_1 experts as one mul_mm_id_down.comp launch over the count_experts tile list (64-row tiles),
+// the weights streamed into registers. GGML_VK_MMID_DOWN_STREAM=0 disables.
+static bool ggml_vk_mmid_down_stream_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_MMID_DOWN_STREAM");
         return e == nullptr || atoi(e) != 0;
     }();
     return on;
@@ -11105,6 +11475,8 @@ static void ggml_vk_mmid_pair_glu(ggml_backend_vk_context * ctx, vk_context& sub
     const size_t expert_data_size = sizeof(uint32_t) * (row_ids_offset + max_tiles * mmid_pair_glu_bn);
 
     vk_pipeline pipeline = ctx->device->pipeline_mmid_glu[ggml_vk_mmid_glu_type_idx(w_g->type)][f32 ? 1 : 0][x->type == GGML_TYPE_F32 ? 1 : 0];
+    const bool repacked = ggml_vk_repack_rows(w) != 0;
+    vk_pipeline pipeline = (repacked ? ctx->device->pipeline_mmid_down_q51_rp : ctx->device->pipeline_mmid_down_q51)[x->type == GGML_TYPE_F32 ? 1 : 0];
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
     if (ctx->prealloc_size_split_k < expert_data_size) {
         ctx->prealloc_size_split_k = expert_data_size;
@@ -11124,6 +11496,9 @@ static void ggml_vk_mmid_pair_glu(ggml_backend_vk_context * ctx, vk_context& sub
                       ggml_type_name(x->type), scale ? ", router weights" : "");
     }
     ggml_vk_path_census_add("MUL_MAT_ID_DOWN_STREAM");
+    if (repacked) {
+        ggml_vk_path_census_add("EXPERT_REPACK/DOWN");
+    }
 
     if (ctx->prealloc_split_k_need_sync) {
         ggml_vk_sync_buffers(ctx, subctx);
@@ -18092,6 +18467,8 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    delete ctx->expert_unrepack_bufctx;
+    ctx->expert_unrepack_bufctx = nullptr;
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);
@@ -18172,9 +18549,31 @@ void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_ten
         return;
     }
 
+    GGML_ASSERT(!ggml_vk_repack_is_view(tensor) && "a view of a repacked expert tensor");
+    if (const uint32_t R = ggml_vk_repack_rows(tensor); R != 0 && (offset != 0 || size != ggml_nbytes(tensor))) {
+        // a uniform fill is order-free only over the whole tensor
+        std::vector<uint8_t> fill(size, value);
+        ggml_vk_repack_write(buf, tensor, R, fill.data(), offset, size);
+        return;
+    }
+
     uint32_t val32 = (uint32_t)value * 0x01010101;
     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
 }
+
+// test only (GGML_VK_EXPERT_REPACK_GPU_LOAD_TEST=<chunk bytes>): a synchronous write into a repacked tensor goes through pinned
+// staging chunks of that size and the GPU reorder of the async upload path, so test-backend-ops exercises it
+static size_t ggml_vk_repack_gpu_load_test_chunk() {
+    static const size_t v = [] { const char * e = getenv("GGML_VK_EXPERT_REPACK_GPU_LOAD_TEST"); return e != nullptr ? (size_t) atoll(e) : 0; }();
+    return v;
+}
+static void ggml_vk_repack_write_gpu_test(const vk_device & dev, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size);
+// test only: GGML_VK_EXPERT_REPACK_GPU_LOAD_TEST_SYNC=1 sends those pinned chunks through the synchronous set path instead
+static bool ggml_vk_repack_gpu_load_test_sync() {
+    static const bool v = [] { const char * e = getenv("GGML_VK_EXPERT_REPACK_GPU_LOAD_TEST_SYNC"); return e != nullptr && atoi(e) != 0; }();
+    return v;
+}
+static bool ggml_vk_repack_write_gpu_sync(const vk_device & dev, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size);
 
 void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_set_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
@@ -18182,6 +18581,20 @@ void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor
     vk_buffer buf = buf_ctx->dev_buffer;
 
     if (size == 0) {
+        return;
+    }
+
+    GGML_ASSERT(!ggml_vk_repack_is_view(tensor) && "a view of a repacked expert tensor");
+    if (const uint32_t R = ggml_vk_repack_rows(tensor); R != 0) {
+        if (ggml_vk_repack_gpu_load_test_chunk() != 0) {
+            ggml_vk_repack_write_gpu_test(buf->device, tensor, R, data, offset, size);
+            return;
+        }
+        if (ggml_vk_repack_write_gpu_sync(buf->device, tensor, R, data, offset, size)) {
+            return;
+        }
+        ggml_vk_repack_write(buf, tensor, R, data, offset, size);
+        ggml_vk_path_census_add("EXPERT_REPACK/SET_SYNC_HOST");
         return;
     }
 
@@ -18199,6 +18612,14 @@ void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_ten
         return;
     }
 
+    GGML_ASSERT(!ggml_vk_repack_is_view(tensor) && "a view of a repacked expert tensor");
+    if (const uint32_t R = ggml_vk_repack_rows(tensor); R != 0) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_vk_repack_write(buf, tensor, R, (const uint8_t *) data + i * stride_data, offset + i * stride_tensor, size);
+        }
+        return;
+    }
+
     ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
 }
 
@@ -18211,6 +18632,12 @@ void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_
     }
 
     vk_buffer buf = buf_ctx->dev_buffer;
+
+    GGML_ASSERT(!ggml_vk_repack_is_view(tensor) && "a view of a repacked expert tensor");
+    if (const uint32_t R = ggml_vk_repack_rows(tensor); R != 0) {
+        ggml_vk_repack_read(buf, tensor, R, data, offset, size);
+        return;
+    }
 
     ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
@@ -18227,6 +18654,14 @@ void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const gg
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
+    GGML_ASSERT(!ggml_vk_repack_is_view(tensor) && "a view of a repacked expert tensor");
+    if (const uint32_t R = ggml_vk_repack_rows(tensor); R != 0) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            ggml_vk_repack_read(buf, tensor, R, (uint8_t *) data + i * stride_data, offset + i * stride_tensor, size);
+        }
+        return;
+    }
+
     ggml_vk_buffer_read_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_tensor, stride_data, size, n_copies);
 }
 
@@ -18236,6 +18671,10 @@ bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_
     }
 
     if (ggml_backend_buffer_is_vk(src->buffer)) {
+        // a byte copy keeps the order: between a repacked and a canonical tensor take the host round trip (get / set invert)
+        if (ggml_vk_repack_is_view(src) || ggml_vk_repack_is_view(dst) || ggml_vk_repack_rows(src) != ggml_vk_repack_rows(dst)) {
+            return false;
+        }
         ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
         ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
 
@@ -18393,11 +18832,255 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     return &ctx->device->buffer_type;
 }
 
+static void ggml_backend_vk_synchronize(ggml_backend_t backend);
+
+// GGML_VK_EXPERT_REPACK_GPU_LOAD (default on; 0 = the exact host write per chunk): an async upload of canonical bytes into a
+// repacked expert tensor is reordered on the GPU while the host reads the next chunk
+static bool ggml_vk_expert_repack_gpu_load_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_EXPERT_REPACK_GPU_LOAD"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// whether the GPU reorder can take a write of canonical bytes [offset, offset + size) into repacked tensor t (source alignment
+// aside): the pipeline exists, the range and rows are in 16-byte units, and no host-order negative control is set
+static bool ggml_vk_repack_gpu_ok(const vk_device & dev, const ggml_tensor * t, size_t offset, size_t size) {
+    return ggml_vk_expert_repack_negctl() != 1 && ggml_vk_expert_repack_negctl() != 2 && dev->pipeline_expert_repack &&
+           offset % 16 == 0 && size % 16 == 0 && t->nb[1] % 16 == 0;
+}
+
+// queue the repacked write of canonical bytes [offset, offset + size) of t from pinned host memory (staging chunks):
+// expert_repack.comp writes each unit to its repacked place, so a chunk may start or end inside a block. Returns false (nothing
+// queued) when the chunk is not in pinned memory or not 16-byte aligned; the caller then takes the host path.
+static bool ggml_vk_repack_dispatch(ggml_backend_t backend, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    const vk_device & dev = ctx->device;
+    if (!ggml_vk_repack_gpu_ok(dev, t, offset, size)) {
+        return false;
+    }
+    vk_buffer src_buf = nullptr;
+    size_t src_buf_offset = 0;
+    ggml_vk_host_get(dev, data, src_buf, src_buf_offset);
+    const size_t align = dev->properties.limits.minStorageBufferOffsetAlignment;
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)t->buffer->context;
+    const size_t dst_tensor_offset = vk_tensor_offset(t) + t->view_offs;
+    const size_t src_desc = src_buf_offset & ~(align - 1);
+    const size_t dst_desc = dst_tensor_offset & ~(align - 1);
+    if (src_buf == nullptr || (src_buf_offset - src_desc) % 16 != 0 || (dst_tensor_offset - dst_desc) % 16 != 0) {
+        return false;
+    }
+
+    // a bounded number of descriptor sets between cleanups: an upload backend only records and waits on events
+    if (ctx->descriptor_set_idx >= 256) {
+        ggml_backend_vk_synchronize(backend);
+    }
+
+    const size_t   nbytes = ggml_nbytes(t);
+    const uint32_t U      = (uint32_t) (t->nb[1] / 16);
+    const size_t   RU     = (size_t) R * U;
+    const size_t   c_lo   = offset / 16, c_hi = (offset + size) / 16;
+    const size_t   blk_lo = c_lo / RU, blk_hi = (c_hi + RU - 1) / RU;
+    const size_t   n      = (blk_hi - blk_lo) * RU;
+    GGML_ASSERT(nbytes / 16 <= UINT32_MAX && n <= UINT32_MAX);
+
+    vk_pipeline pipeline = dev->pipeline_expert_repack;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    vk_context subctx = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_sync_buffers(ctx, subctx);
+    const struct { uint32_t n, U, R, c_lo, c_hi, blk_lo, src_offset, dst_offset; } pc = {
+        (uint32_t) n, U, R, (uint32_t) c_lo, (uint32_t) c_hi, (uint32_t) blk_lo,
+        (uint32_t) ((src_buf_offset - src_desc) / 16), (uint32_t) ((dst_tensor_offset - dst_desc) / 16) };
+    const vk_subbuffer src = { src_buf, src_desc, src_buf_offset - src_desc + size };
+    const vk_subbuffer dst = { buf_ctx->dev_buffer, dst_desc, dst_tensor_offset - dst_desc + nbytes };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src, dst }, pc, { (uint32_t) std::min<size_t>(n, 65535u * 256u), 1, 1 });
+    return true;
+}
+
+// the loader's async uploads (GGML_VK_EXPERT_REPACK_GPU_LOAD)
+static bool ggml_vk_repack_write_async(ggml_backend_t backend, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size) {
+    if (!ggml_vk_expert_repack_gpu_load_enabled() || !ggml_vk_repack_dispatch(backend, t, R, data, offset, size)) {
+        return false;
+    }
+    static std::atomic<bool> logged { false };
+    if (!logged.exchange(true)) {
+        GGML_LOG_INFO("ggml_vulkan: expert repack: async uploads reordered on the GPU (GGML_VK_EXPERT_REPACK_GPU_LOAD=0 disables)\n");
+    }
+    if (offset + size == ggml_nbytes(t)) {
+        ggml_vk_path_census_add("EXPERT_REPACK/SET");
+        ggml_vk_path_census_add("EXPERT_REPACK/SET_GPU");
+    }
+    return true;
+}
+
+static void ggml_vk_repack_write_gpu_test(const vk_device & dev, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size) {
+    const size_t chunk = ggml_vk_repack_gpu_load_test_chunk();
+    ggml_backend_t be = ggml_backend_vk_init(dev->idx);
+    GGML_ASSERT(be != nullptr);
+    uint8_t * stage = (uint8_t *) ggml_vk_host_malloc(chunk + 16);
+    GGML_ASSERT(stage != nullptr);
+    vk_buffer & buf = ((ggml_backend_vk_buffer_context *) t->buffer->context)->dev_buffer;
+    size_t n_gpu = 0, n_host = 0;
+    for (size_t done = 0; done < size; ) {
+        const size_t n = std::min(chunk, size - done);
+        memcpy(stage, (const uint8_t *) data + done, n);
+        if (ggml_vk_expert_repack_negctl() == 3 && done == 0 && !ggml_vk_repack_gpu_load_test_sync()) {
+            stage[0] ^= 0x5a;  // negative control: one corrupted byte per tensor write must make the case fail
+        }
+        if (ggml_vk_repack_gpu_load_test_sync()) {
+            // the synchronous path from a pinned source, as a loader that stages mapped weights through a pinned buffer calls it
+            if (!ggml_vk_repack_write_gpu_sync(dev, t, R, stage, offset + done, n)) {
+                ggml_vk_repack_write(buf, t, R, stage, offset + done, n);
+                n_host++;
+            }
+        } else if (ggml_vk_repack_write_async(be, t, R, stage, offset + done, n)) {
+            n_gpu++;
+        } else {
+            ggml_backend_vk_synchronize(be);
+            ggml_vk_repack_write(buf, t, R, stage, offset + done, n);
+            n_host++;
+        }
+        ggml_backend_vk_synchronize(be);  // the staging chunk is reused
+        done += n;
+    }
+    if (n_gpu > 0) {
+        ggml_vk_path_census_add("EXPERT_REPACK/SET_GPU_TEST");
+    }
+    GGML_UNUSED(n_host);
+    ggml_vk_host_free(stage);
+    ggml_backend_vk_free(be);
+}
+
+// GGML_VK_EXPERT_REPACK_GPU_SYNC (default on; 0 = the host permute as before): a synchronous write into a repacked tensor (a
+// mmap load, a load with tensor checks) is copied through pinned staging chunks and reordered on the GPU, the host copying the
+// next chunk meanwhile. GGML_VK_EXPERT_REPACK_GPU_SYNC_CHUNK=<bytes> sets the chunk size (default 4 MiB, a multiple of 16 bytes;
+// a small value makes chunks split row blocks, for tests).
+static bool ggml_vk_expert_repack_gpu_sync_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_EXPERT_REPACK_GPU_SYNC"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+static size_t ggml_vk_expert_repack_gpu_sync_chunk() {
+    static const size_t v = [] {
+        const char * e = getenv("GGML_VK_EXPERT_REPACK_GPU_SYNC_CHUNK");
+        const long long n = e != nullptr ? atoll(e) : 0;
+        return n > 0 ? std::max<size_t>(16, (size_t) n / 16 * 16) : (size_t) 4 << 20;
+    }();
+    return v;
+}
+
+// synchronous write of canonical bytes [offset, offset + size) into repacked tensor t through the GPU reorder. A source already in
+// pinned memory (e.g. a loader staging buffer) is reordered straight from it; any other source is copied through pinned staging
+// chunks first. Returns false (nothing written) when the GPU path cannot take the write; the caller then takes the host path.
+static bool ggml_vk_repack_write_gpu_sync(const vk_device & dev, ggml_tensor * t, uint32_t R, const void * data, size_t offset, size_t size) {
+    if (!ggml_vk_expert_repack_gpu_sync_enabled() || !ggml_vk_repack_gpu_ok(dev, t, offset, size)) {
+        return false;
+    }
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *) t->buffer->context;
+    std::lock_guard<std::mutex> lock(buf_ctx->repack_mutex);
+    if (buf_ctx->repack_backend == nullptr) {
+        buf_ctx->repack_backend = ggml_backend_vk_init(dev->idx);
+        if (buf_ctx->repack_backend == nullptr) {
+            return false;
+        }
+    }
+    ggml_backend_t be = buf_ctx->repack_backend;
+    static std::atomic<bool> logged { false };
+    auto engaged = [&](const char * key) {
+        if (!logged.exchange(true)) {
+            GGML_LOG_INFO("ggml_vulkan: expert repack: synchronous writes reordered on the GPU (GGML_VK_EXPERT_REPACK_GPU_SYNC=0 disables)\n");
+        }
+        ggml_vk_path_census_add("EXPERT_REPACK/SET");
+        ggml_vk_path_census_add("EXPERT_REPACK/SET_GPU");
+        ggml_vk_path_census_add("EXPERT_REPACK/SET_GPU_SYNC");
+        ggml_vk_path_census_add(key);
+    };
+
+    vk_buffer pinned = nullptr;
+    size_t    pinned_offset = 0;
+    ggml_vk_host_get(dev, data, pinned, pinned_offset);
+    if (pinned != nullptr) {
+        uint8_t * first = (uint8_t *) const_cast<void *>(data);
+        if (ggml_vk_expert_repack_negctl() == 3) {
+            first[0] ^= 0x5a;  // negative control (tests only): one corrupted byte of the caller's pinned chunk
+        }
+        if (ggml_vk_repack_dispatch(be, t, R, data, offset, size)) {
+            ggml_backend_synchronize(be);
+            engaged("EXPERT_REPACK/SET_GPU_SYNC_PINNED");
+            return true;
+        }
+        if (ggml_vk_expert_repack_negctl() == 3) {
+            first[0] ^= 0x5a;  // undone: the copy path below applies it
+        }
+    }
+
+    const size_t chunk   = std::min(ggml_vk_expert_repack_gpu_sync_chunk(), size);
+    const size_t n_slots = std::min<size_t>(4, (size + chunk - 1) / chunk);
+    uint8_t *            stage[4] = {};
+    ggml_backend_event_t ev[4]    = {};
+    bool                 used[4]  = {};
+    bool ok = true;
+    for (size_t i = 0; i < n_slots && ok; ++i) {
+        stage[i] = (uint8_t *) ggml_vk_host_malloc(chunk);
+        ev[i]    = stage[i] != nullptr ? ggml_backend_event_new(be->device) : nullptr;
+        ok       = ev[i] != nullptr;
+    }
+    size_t done = 0;
+    for (size_t k = 0; ok && done < size; ++k) {
+        const size_t s = k % n_slots;
+        if (used[s]) {
+            ggml_backend_event_synchronize(ev[s]);  // the slot's previous reorder has read it
+        }
+        const size_t n = std::min(chunk, size - done);
+        memcpy(stage[s], (const uint8_t *) data + done, n);
+        if (ggml_vk_expert_repack_negctl() == 3 && done == 0) {
+            stage[s][0] ^= 0x5a;  // negative control: one corrupted byte per tensor write must make the case fail
+        }
+        if (!ggml_vk_repack_dispatch(be, t, R, stage[s], offset + done, n)) {
+            ok = false;
+            break;
+        }
+        ggml_backend_event_record(ev[s], be);
+        used[s] = true;
+        done += n;
+    }
+    ggml_backend_synchronize(be);
+    for (size_t i = 0; i < n_slots; ++i) {
+        if (ev[i] != nullptr) {
+            ggml_backend_event_free(ev[i]);
+        }
+        if (stage[i] != nullptr) {
+            ggml_vk_host_free(stage[i]);
+        }
+    }
+    if (!ok) {
+        if (done == 0) {
+            return false;
+        }
+        // not expected (the staging chunks are pinned and aligned): the host path finishes the write, exact for any range
+        ggml_vk_repack_write(buf_ctx->dev_buffer, t, R, (const uint8_t *) data + done, offset + done, size - done);
+        ggml_vk_path_census_add("EXPERT_REPACK/SET_SYNC_HOST");
+        return true;
+    }
+    engaged("EXPERT_REPACK/SET_GPU_SYNC_COPY");
+    return true;
+}
+
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    if (ggml_vk_buft_is_repack(tensor->buffer->buft) && n_copies == 1 && size > 0 && !ggml_vk_repack_is_view(tensor)) {
+        if (const uint32_t R = ggml_vk_repack_rows(tensor); R != 0 && ggml_vk_repack_write_async(backend, tensor, R, data, offset, size)) {
+            return;
+        }
+    }
+    if (ggml_vk_buft_is_repack(tensor->buffer->buft) && (ggml_vk_repack_rows(tensor) != 0 || ggml_vk_repack_is_view(tensor))) {
+        // repacked expert weights (the loader's chunked uploads): ordered after the queued work, then the exact synchronous write
+        ggml_backend_vk_synchronize(backend);
+        ggml_backend_vk_buffer_set_tensor_2d(tensor->buffer, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || ggml_vk_buft_is_repack(tensor->buffer->buft) ||
+                 tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -18460,7 +19143,13 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    if (ggml_vk_buft_is_repack(tensor->buffer->buft) && (ggml_vk_repack_rows(tensor) != 0 || ggml_vk_repack_is_view(tensor))) {
+        ggml_backend_vk_synchronize(backend);
+        ggml_backend_vk_buffer_get_tensor_2d(tensor->buffer, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+        return;
+    }
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || ggml_vk_buft_is_repack(tensor->buffer->buft) ||
+                 tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -18522,6 +19211,10 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     }
 
     if (dst->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend_dst)) {
+        return false;
+    }
+    // a repacked expert weight is copied out through get_tensor (the inverse), not byte for byte
+    if (ggml_vk_repack_rows(src) != 0 || ggml_vk_repack_is_view(src)) {
         return false;
     }
 
@@ -21686,8 +22379,8 @@ static bool ggml_vk_mmid_d16_ok(ggml_backend_vk_context * ctx, const ggml_tensor
         (ctx->device->coopmat_support && ctx->device->vendor_id == VK_VENDOR_ID_INTEL)) {
         return false;
     }
-    // GEMM path only (ggml_vk_use_mul_mat_vec_id: at most 8 tokens)
-    if (mmid->src[2]->ne[1] <= 8) {
+    // GEMM path only (ggml_vk_use_mul_mat_vec_id: at most 8 tokens, repacked experts up to 31)
+    if (ggml_vk_use_mul_mat_vec_id(mmid)) {
         return false;
     }
     const ggml_prec prec = (ggml_prec) mmid->op_params[0];
@@ -21834,6 +22527,12 @@ static bool ggml_vk_can_fuse_mmid_pair_glu(ggml_backend_vk_context * ctx, const 
     const ggml_tensor * ids = mm_a->src[2];
     if (w_b->type != w_a->type || !ggml_are_same_shape(w_a, w_b) || mm_b->src[1] != x || mm_b->src[2] != ids) {
         return reject("gate and up differ in type, shape, activations or ids");
+    }
+    if (ggml_vk_repack_rows(w_a) != ggml_vk_repack_rows(w_b) || ggml_vk_repack_is_view(w_a) || ggml_vk_repack_is_view(w_b)) {
+        return reject("gate and up in different weight orders (expert repack buffer)");
+    }
+    if (ggml_vk_repack_rows(w_a) != 0 && !ctx->device->pipeline_mmid_glu_rp[ti][f32][0]) {
+        return reject("no repacked build for these weights");
     }
     const int64_t K = w_a->ne[0], M = w_a->ne[1], n_used = ids->ne[0], T = ids->ne[1];
     if (K % 256 != 0 || M % 128 != 0 || !ggml_vk_dim01_contiguous(w_a) || !ggml_vk_dim01_contiguous(w_b) ||
@@ -24538,9 +25237,35 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
+// expert repack buffer placement: the loader names the role, and only the separate gate / up (q4_K / q5_K, pair-GLU) and the down (q5_1)
+// streaming readers take the order
+static bool ggml_vk_repack_role_ok(const ggml_tensor * w) {
+    if (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_K) {
+        return strstr(w->name, "ffn_down") == nullptr && strstr(w->name, "ffn_gate_up") == nullptr;
+    }
+    return strstr(w->name, "ffn_gate") == nullptr && strstr(w->name, "ffn_up") == nullptr;
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
+
+    // the expert repack buffer: the loader's buffer-type probe (a weight without data) places only covered routed expert weights read
+    // as MUL_MAT_ID src0; at run time a repacked tensor has no other Vulkan reader (others get the canonical bytes through the
+    // scheduler's copy, get_tensor inverts), while a canonical tensor in the buffer (an op-NONE weight, which the loader places
+    // without asking) reads as usual
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * t = op->src[i];
+        if (t == nullptr || t->buffer == nullptr || !ggml_vk_buft_is_repack(t->buffer->buft)) {
+            continue;
+        }
+        const bool probe = t->data == nullptr;
+        const bool repacked = ggml_vk_repack_rows(t) != 0 || ggml_vk_repack_is_view(t);
+        if ((probe || repacked) &&
+            (op->op != GGML_OP_MUL_MAT_ID || i != 0 || ggml_vk_repack_rows(t) == 0 || !ggml_vk_repack_role_ok(t))) {
+            return false;
+        }
+    }
 
     const bool uses_bda = (op->op == GGML_OP_IM2COL || op->op == GGML_OP_IM2COL_3D) &&
                           device->shader_int64 && device->buffer_device_address;
@@ -25466,8 +26191,20 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// the expert repack buffer type when GGML_VK_EXPERT_REPACK is on and a covered weight type has its readers on this device
+static ggml_backend_buffer_type_t * ggml_backend_vk_get_extra_bufts(ggml_backend_dev_t dev) {
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+    vk_device device = ggml_vk_get_device(ctx->device);
+    device->extra_bufts[0] = (device->expert_repack_q4k || device->expert_repack_q5k || device->expert_repack_q51) ? &device->buffer_type_repack : nullptr;
+    device->extra_bufts[1] = nullptr;
+    return device->extra_bufts;
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *) ggml_backend_vk_get_extra_bufts;
+    }
     // test hooks only (the dispatch census, see ggml_vk_dispatch_census_add)
     if (strcmp(name, "ggml_backend_debug_dispatch_census_reset") == 0) {
         return (void *) ggml_backend_vk_dispatch_census_reset;
@@ -25861,6 +26598,9 @@ std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const
 }
 
 ggml_backend_vk_buffer_context::~ggml_backend_vk_buffer_context() {
+    if (repack_backend != nullptr) {
+        ggml_backend_free(repack_backend);
+    }
     ggml_vk_destroy_buffer(dev_buffer);
 }
 

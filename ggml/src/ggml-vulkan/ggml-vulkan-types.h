@@ -308,6 +308,7 @@ typedef std::weak_ptr<vk_buffer_struct> vk_buffer_ref;
 struct ggml_backend_vk_buffer_type_context {
     std::string name;
     vk_device device;
+    bool repack = false;   // the expert repack buffer type (ggml_backend_vk_get_extra_bufts)
 };
 
 struct vk_command_buffer {
@@ -1132,6 +1133,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_count_experts;
     vk_pipeline pipeline_mmid_glu[2][2][2];   // MUL_MAT_ID_PAIR_SWIGLU (mul_mm_id_glu.comp): [q4_K, q5_K][f32 output][f32 B]
     vk_pipeline pipeline_mmid_down_q51[2];   // streaming MUL_MAT_ID(+MUL)+CPY(f16) down (mul_mm_id_down.comp): [0] f16 B, [1] f32 B
+    // expert repack buffer: the same kernels on the repacked weight order, the repacked mat-vec, and the inverse copy
+    vk_pipeline pipeline_mmid_glu_rp[2][2][2];   // pipeline_mmid_glu on the repacked weight order
+    vk_pipeline pipeline_mmid_down_q51_rp[2];
+    vk_pipeline pipeline_mmv_id_rp_q4k, pipeline_mmv_id_rp_q5k, pipeline_mmv_id_rp_q51;
+    vk_pipeline pipeline_mmv_id_rp_q4k_q8, pipeline_mmv_id_rp_q5k_q8, pipeline_mmv_id_rp_q51_q8;
+    vk_pipeline pipeline_expert_unrepack;
+    vk_pipeline pipeline_expert_repack;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
@@ -1142,6 +1150,12 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
+    // expert repack buffer type (GGML_VK_EXPERT_REPACK): offered as an extra buffer type when a weight type's readers exist
+    ggml_backend_buffer_type buffer_type_repack;
+    ggml_backend_buffer_type_t extra_bufts[2] {};
+    bool expert_repack_q4k {};
+    bool expert_repack_q5k {};
+    bool expert_repack_q51 {};
 
     bool disable_fusion;
     bool disable_descriptor_reuse;
@@ -1371,6 +1385,8 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+struct ggml_backend_vk_buffer_context;
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1380,6 +1396,9 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    // expert repack buffer: canonical copy of a repacked weight for the MUL_MAT_ID paths that cannot read the repacked order
+    ggml_backend_vk_buffer_context * expert_unrepack_bufctx {};
+    ggml_backend_buffer expert_unrepack_buffer {};
     // memoized capacity decision for the FA dequant-once scratch, see ggml_vk_fa_dequant_scratch_fits
     uint64_t fa_dequant_gate_sz;
     bool fa_dequant_gate_fits;
@@ -1599,6 +1618,9 @@ struct ggml_backend_vk_buffer_context {
 
     ~ggml_backend_vk_buffer_context();
 
+    // expert repack buffer: the backend of the GPU reorder of synchronous writes (made on the first one, freed with the buffer)
+    ggml_backend_t repack_backend {};
+    std::mutex     repack_mutex;
 };
 
 struct vk_host_allocation {
