@@ -860,6 +860,42 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr) {
 
 // ===== B-side: load and store =====
 
+#ifdef B_F16Q
+// one thread holds half a 32-element block (loadr 0 / 1 = elements 0..15 / 16..31); the two halves sit in adjacent lanes
+struct block_b_prefetch {
+    f16vec4 v[4];
+};
+
+block_b_prefetch block_b_load_f16(uint ib, uint loadr) {
+    block_b_prefetch blk;
+    const uint base = ib * 8 + loadr * 4;
+    [[unroll]] for (uint i = 0; i < 4; i++) {
+        blk.v[i] = data_bf[base + i];
+    }
+    return blk;
+}
+
+// quantize_q8_1.comp's block arithmetic: d = amax / 127 (stored f16), q = round(x / d)
+void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+    vec4 v[4];
+    float amax = 0.0;
+    [[unroll]] for (uint i = 0; i < 4; i++) {
+        v[i] = vec4(blk.v[i]);
+        const vec4 a = abs(v[i]);
+        amax = max(amax, max(max(a.x, a.y), max(a.z, a.w)));
+    }
+    amax = max(amax, subgroupShuffleXor(amax, 1));
+    const float d = amax / 127.0;
+    const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
+    const uint base = buf_ib * QPITCH + ks * (BK / 4) + loadr * 4;
+    [[unroll]] for (uint i = 0; i < 4; i++) {
+        buf_b_qs[base + i] = in_bounds ? pack32(i8vec4(round(v[i] * d_inv))) : 0;
+    }
+    if (loadr == 0) {
+        buf_b_d[ks * BN + buf_ib] = in_bounds ? float(float16_t(d)) : 0.0f;
+    }
+}
+#else
 struct block_b_prefetch {
     ivec4 qs;
     float16_t d;
@@ -892,6 +928,7 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
 #endif
     }
 }
+#endif
 
 // ===== Framework macros =====
 
@@ -907,6 +944,12 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
 
 #ifndef A_ROW_IB
 #define A_ROW_IB(r) ((r) * p.stride_a / BK)
+#endif
+
+#ifdef B_F16Q
+#define B_LOAD(ib_k, loadr) block_b_load_f16(ib_k, loadr)
+#else
+#define B_LOAD(ib_k, loadr) block_b_load((ib_k) / 4, (ib_k) % 4, loadr)
 #endif
 
 #define PREFETCH_BLOCK(blk)                                                                     \
@@ -925,7 +968,7 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
             B_IB_CALC                                                                           \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
                 const uint ib_k = ((blk) + ks * BK < end_k) ? (ib + ks) : ib;                   \
-                pre_b[li * BK_STEP + ks] = block_b_load(ib_k / 4, ib_k % 4, loadr_b);          \
+                pre_b[li * BK_STEP + ks] = B_LOAD(ib_k, loadr_b);                               \
             }                                                                                   \
         }                                                                                       \
     }
