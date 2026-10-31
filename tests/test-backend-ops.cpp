@@ -14177,6 +14177,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // K5120 wraps the IQ3 multi-column MMVQ loop; the kernel handles one row per block.
+    for (ggml_type type_a : { GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS }) {
+        for (int n : { 4, 5, 6, 7, 8 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17, n, 5120, { 1, 1 }, { 1, 1 }));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17, 8, 1024, { 2, 3 }, { 2, 2 }));
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
