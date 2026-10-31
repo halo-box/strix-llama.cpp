@@ -748,6 +748,7 @@ struct vk_device_struct {
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
     uint32_t max_nodes_per_submit;
+    uint32_t first_submit_nodes; // node cap of a graph's first submit, doubled per submit up to max_nodes_per_submit; 0 = off
     uint64_t max_bytes_per_submit;
 
     bool shader_64b_indexing;

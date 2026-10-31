@@ -5502,6 +5502,15 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
         }
 
+        // The GPU idles while the first batch of a graph is recorded. Submit the first few nodes on their own and double the
+        // cap per submit, so the GPU starts early and each batch runs while the next, at most twice as large, is recorded.
+        // GGML_VK_FIRST_SUBMIT_NODES=0 makes the first batch as large as any other.
+        device->first_submit_nodes = 4;
+        const char* GGML_VK_FIRST_SUBMIT_NODES = getenv("GGML_VK_FIRST_SUBMIT_NODES");
+        if (GGML_VK_FIRST_SUBMIT_NODES != nullptr) {
+            device->first_submit_nodes = std::stoul(GGML_VK_FIRST_SUBMIT_NODES);
+        }
+
         // Also submit once a batch has accumulated enough memory traffic, so that
         // bandwidth-bound nodes with no flops estimate cannot grow a command buffer
         // past the driver timeout. 0 disables the limit.
@@ -19262,6 +19271,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // node cap of the current batch: starts at first_submit_nodes and doubles per submit (ramp batches leave the flops schedule alone)
+    uint32_t nodes_per_submit = ctx->device->max_nodes_per_submit;
+    if (ctx->device->first_submit_nodes > 0) {
+        nodes_per_submit = std::min(nodes_per_submit, ctx->device->first_submit_nodes);
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -19288,10 +19302,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         submitted_nodes = 0;
         batch_flops = 0;
         batch_bytes = 0;
-        if (submit_count < 3) {
-            flops_per_submit *= 2;
+        if (nodes_per_submit < ctx->device->max_nodes_per_submit) {
+            nodes_per_submit = std::min(nodes_per_submit * 2, ctx->device->max_nodes_per_submit);
+        } else {
+            if (submit_count < 3) {
+                flops_per_submit *= 2;
+            }
+            submit_count++;
         }
-        submit_count++;
     };
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -19710,7 +19728,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+        bool submit = (submitted_nodes >= nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (ctx->device->max_bytes_per_submit != 0 && batch_bytes >= ctx->device->max_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
