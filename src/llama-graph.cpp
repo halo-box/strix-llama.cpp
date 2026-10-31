@@ -2725,11 +2725,6 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
 
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_get_rows(ggml_tensor * table, ggml_tensor * ids) const {
-    if (exl3) {
-        if (const auto it = exl3->rows.find(table); it != exl3->rows.end()) {
-            return ggml_exl3_get_rows(ctx0, table, ids, it->second.signs, it->second.n_out);
-        }
-    }
     return ggml_get_rows(ctx0, table, ids);
 }
 

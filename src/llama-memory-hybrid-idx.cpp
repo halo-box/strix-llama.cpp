@@ -119,11 +119,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }()) {
     if (mem_idx) {
         // the QSA layers must all run where a kernel reads the selection list: a backend that takes the probe op
-        // (ggml-cuda: the HIP QSA kernels on RDNA3.5)
-        bool all = true, any = false;
+        // (ggml-cuda: the HIP QSA kernels on RDNA3.5, Vulkan: flash_attn_sel). The HIP kernels read q8_0 K/V, so q8_0 on
+        // ROCm needs every QSA layer there. Elsewhere a quantized cache needs every QSA layer's device to take the probe op
+        // with the cache's K/V types (Vulkan dequantizes q8_0 / q4_0 / q4_1 / q5_0 / q5_1 / iq4_nl to f16 first);
+        // LLAMA_QSA_MASKLESS_QKV=0 keeps a quantized cache on the masked top-k there
+        const bool kv_f16 = type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16;
+        static const bool qkv_env = [] { const char * e = getenv("LLAMA_QSA_MASKLESS_QKV"); return !(e && e[0] == '0'); }();
+        bool all = true, any = false, rocm = true, all_typed = true;
         for (int il = 0; il < (int) model.hparams.n_layer_all; ++il) {
             if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] <= 0) { continue; }
             any = true;
+            const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il)));
+            rocm = rocm && std::strcmp(reg, "ROCm") == 0;
             all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il);
             all_typed = all_typed && (kv_f16 || qsa_selected_key_supported(model.dev_layer(il), model.hparams, il, type_k, type_v));
         }

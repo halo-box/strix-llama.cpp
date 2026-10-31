@@ -1701,9 +1701,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             }
             return view;
         };
-        ggml_tensor * bias = inp->compact ? nullptr : whole ? inp->bias : strip_view(inp->bias, [&] {
-            return ggml_view_3d(ctx0, inp->bias, inp->bias->ne[0], n_query, n_stream,
-                    inp->bias->nb[1], inp->bias->nb[2], first*inp->bias->nb[1]); });
+        ggml_tensor * bias = inp->compact ? nullptr : whole ? bias_all : strip_view(bias_all, [&] {
+            return ggml_view_3d(ctx0, bias_all, bias_all->ne[0], n_query, n_stream,
+                    bias_all->nb[1], bias_all->nb[2], first*bias_all->nb[1]); });
         ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : whole ? kq_mask : strip_view(kq_mask, [&] {
             return ggml_view_4d(ctx0, kq_mask, n_kv, n_query, 1, n_stream,
                     kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]); });

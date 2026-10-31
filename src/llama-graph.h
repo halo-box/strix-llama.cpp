@@ -1306,7 +1306,7 @@ struct llm_graph_context {
     // first backend's memory, as the scheduler copies host inputs to the device when the split starts
     void chain_input_to_device(ggml_tensor * input) const;
 
-    // rows `ids` of an embedding table; an EXL3 row-ring table is decoded by EXL3_GET_ROWS
+    // rows `ids` of an embedding table
     ggml_tensor * build_get_rows(ggml_tensor * table, ggml_tensor * ids) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;

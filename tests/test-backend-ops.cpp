@@ -4861,6 +4861,73 @@ struct test_fn_decode_hc : public test_case {
         const bool ok = on ? n == 1 : n == 0;
         if (!ok) {
             msg = "FN_DECODE_HC dispatches: " + std::to_string(n) + ", expected " + (on ? "1" : "0") + " (MMVQ path " + std::to_string(n_mmvq) + ")";
+        }
+        return ok;
+    }
+    bool run_whole_graph() override { return true; }
+    bool use_scheduler_allocation() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
+    // vs the CPU, which quantizes both mat-vec B operands to q8_0: the unfused Vulkan chain reaches 5.3e-4 on these shapes
+    double max_nmse_err() override { return exact ? 0.0 : 1e-3; }
+    double err(const float * a, const float * b, size_t n) override {
+        if (!exact) {
+            return test_case::err(a, b, n);
+        }
+        size_t n_diff = 0;
+        for (size_t i = 0; i < n; ++i) {
+            n_diff += a[i] != b[i];
+        }
+        return (double) n_diff;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE) init_tensor_uniform(t);
+        }
+    }
+
+    // one chain: returns the mixed stream; *silu gets the SILU node
+    ggml_tensor * chain(ggml_context * ctx, ggml_tensor * xn, ggml_tensor * w_down, ggml_tensor * w_up, ggml_tensor ** silu) {
+        const int hc = 4;
+        ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);
+        if (gf) { ggml_build_forward_expand(gf, lo); }
+        ggml_tensor * x3 = ggml_reshape_3d(ctx, xn, embd, hc, tokens);
+        ggml_tensor * si = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / hc));
+        *silu = si;
+        ggml_tensor * gate = ggml_mul_mat(ctx, w_up, si);
+        return ggml_dsv4_hc_pre_gated_ext(ctx, x3, ggml_reshape_3d(ctx, gate, embd, hc, tokens), 1.0f / hc, GGML_TYPE_F32);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        const int64_t hc_dim = int64_t(embd) * 4;
+        ggml_tensor * xn     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, tokens);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_dim, rank);
+        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, rank, hc_dim);
+        // never freed or reused in place (the CPU reference reads them as given; the exact twin reads them again)
+        for (ggml_tensor * t : { xn, w_down, w_up }) {
+            ggml_set_input(t);
+            ggml_set_output(t);
+        }
+        ggml_tensor * si_a = nullptr;
+        ggml_tensor * a = chain(ctx, xn, w_down, w_up, &si_a);
+        if (!exact) {
+            ggml_set_output(a);
+            verify.push_back(a);
+            return a;
+        }
+        if (gf) { ggml_build_forward_expand(gf, a); }
+        ggml_tensor * si_b = nullptr;
+        ggml_tensor * b = chain(ctx, xn, w_down, w_up, &si_b);
+        ggml_set_output(si_b);   // keeps the second chain unfused
+        if (gf) { ggml_build_forward_expand(gf, b); }
+        // equal bits give exactly 1; a difference d gives 1 + 1e12 d
+        ggml_tensor * last = ggml_scale_bias(ctx, ggml_sub(ctx, a, b), 1e12f, 1.0f);
+        ggml_set_output(last);
+        verify.push_back(last);
+        return last;
+    }
+};
+
 // qwen4exp MoE epilogue into the FFN-side hc combine + the next grouped norm, in model order (HC_MOE_EPI on Vulkan): the routed
 // slots [embd, n_used, T] (f16 as LLM_FUSED_OP_MOE_F16 stores them, or f32) summed by build_moe_ffn's ADD chain, the shared
 // expert added (sh 0: none, 1: an f32 input, 2: the model's branch, down GEMM * sigmoid(gate GEMM), emitted between the slot
@@ -4932,8 +4999,6 @@ struct test_hc_moe_epi : public test_case {
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
-    // vs the CPU, which quantizes both mat-vec B operands to q8_0: the unfused Vulkan chain reaches 5.3e-4 on these shapes
-    double max_nmse_err() override { return exact ? 0.0 : 1e-3; }
     double max_nmse_err() override { return exact ? 0.0 : 5e-4; }
     // exact: the number of elements that differ (the nmse of these outputs would square 1e12-scaled differences in float)
     double err(const float * a, const float * b, size_t n) override {
@@ -4948,20 +5013,6 @@ struct test_hc_moe_epi : public test_case {
     }
     void initialize_tensors(ggml_context * ctx) override {
         for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->op == GGML_OP_NONE) init_tensor_uniform(t);
-        }
-    }
-
-    // one chain: returns the mixed stream; *silu gets the SILU node
-    ggml_tensor * chain(ggml_context * ctx, ggml_tensor * xn, ggml_tensor * w_down, ggml_tensor * w_up, ggml_tensor ** silu) {
-        const int hc = 4;
-        ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);
-        if (gf) { ggml_build_forward_expand(gf, lo); }
-        ggml_tensor * x3 = ggml_reshape_3d(ctx, xn, embd, hc, tokens);
-        ggml_tensor * si = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / hc));
-        *silu = si;
-        ggml_tensor * gate = ggml_mul_mat(ctx, w_up, si);
-        return ggml_dsv4_hc_pre_gated_ext(ctx, x3, ggml_reshape_3d(ctx, gate, embd, hc, tokens), 1.0f / hc, GGML_TYPE_F32);
             if (t->op != GGML_OP_NONE) {
                 continue;
             }
@@ -5216,31 +5267,6 @@ struct test_hc_layer : public test_hc_moe_epi {
             verify.push_back(last);
             if (gf) { ggml_build_forward_expand(gf, last); }
         }
-        const int64_t hc_dim = int64_t(embd) * 4;
-        ggml_tensor * xn     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, tokens);
-        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_dim, rank);
-        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, rank, hc_dim);
-        // never freed or reused in place (the CPU reference reads them as given; the exact twin reads them again)
-        for (ggml_tensor * t : { xn, w_down, w_up }) {
-            ggml_set_input(t);
-            ggml_set_output(t);
-        }
-        ggml_tensor * si_a = nullptr;
-        ggml_tensor * a = chain(ctx, xn, w_down, w_up, &si_a);
-        if (!exact) {
-            ggml_set_output(a);
-            verify.push_back(a);
-            return a;
-        }
-        if (gf) { ggml_build_forward_expand(gf, a); }
-        ggml_tensor * si_b = nullptr;
-        ggml_tensor * b = chain(ctx, xn, w_down, w_up, &si_b);
-        ggml_set_output(si_b);   // keeps the second chain unfused
-        if (gf) { ggml_build_forward_expand(gf, b); }
-        // equal bits give exactly 1; a difference d gives 1 + 1e12 d
-        ggml_tensor * last = ggml_scale_bias(ctx, ggml_sub(ctx, a, b), 1e12f, 1.0f);
-        ggml_set_output(last);
-        verify.push_back(last);
         return last;
     }
 };
@@ -20426,8 +20452,6 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("CONCAT_SSM_CONV_SILU", new test_ssm_conv_direct(130, 9, 1, 4), "CONCAT_SSM_CONV_SILU/2=1;CONCAT_TAIL/1=1");
     add("SNAKE",               new test_snake_fuse(GGML_TYPE_F32, { 128, 16, 1, 1 }), "SNAKE/5=1");
     add("TOPK_QSA",            new test_topk_qsa(512, 2048, 2, 1, 1500), "TOPK_QSA/7=1");
-    add("QSA_EXPAND",          new test_qsa_expand(700, 9), "QSA_EXPAND/20=1");
-    add("QSA_EXPAND",          new test_qsa_expand(2048, 4, 1, 2, 1), "QSA_EXPAND/21=2");
     add("QSA_SCORE",           new test_qsa_score(128, 512, 128, 1, false), "QSA_SCORE/11=1");
     add("QSA_SCORE",           new test_qsa_score(128, 512, 128, 1, true), "QSA_SCORE/12=1");
     // the maskless strip as qwen4exp builds it: graph_optimize must keep the scorer chain in order with the visibility ops around it

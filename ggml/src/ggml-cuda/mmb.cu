@@ -10,10 +10,9 @@
 #include <cstdlib>
 #include <vector>
 #include <unordered_set>
-#include <mutex>
-#include <set>
 #include <atomic>
 #include <mutex>
+#include <set>
 
 namespace {
 
@@ -4168,7 +4167,7 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         const int64_t nb = (int64_t) n;
         mmb_f32_to_f16_kernel<<<(unsigned) ((nb + 255) / 256), 256, 0, ctx.stream()>>>((const float *) w->data, buf, nb);
         CUDA_CHECK(cudaGetLastError());
-        mmb_state(ctx).shadow[w->data] = buf; mmb_state(ctx).shadow_bytes += n * 2;
+        mmb_state(ctx).shadow[w->data] = buf; mmb_state(ctx).shadow_bytes += n * 2; mmb_state(ctx).shadow_size[buf] = n * 2;
         return;
     }
     if (mmb_is_hc_q8(w)) {

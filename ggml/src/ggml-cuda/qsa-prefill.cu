@@ -558,7 +558,7 @@ bool ggml_cuda_flash_attn_ext_qsa_prefill_supported_dev(int device, const ggml_t
         // split KV streams (one per sequence): ne[3] streams, run one after the other on per-stream views (maskless only)
         k->ne[3]==q->ne[3] && v->ne[3]==q->ne[3] && (q->ne[3]==1 || (!m && ids->ne[3]==q->ne[3])) &&
         ggml_nelements(k)/4/k->ne[3]<=INT_MAX &&
-        q->nb[0]==4 && k->nb[0]==2 && v->nb[0]==2 && ids->nb[0]==4 && k->nb[3]%16==0 && v->nb[3]%16==0 &&
+        q->nb[0]==4 && ids->nb[0]==4 && k->nb[3]%16==0 && v->nb[3]%16==0 &&
         q->nb[1]%16==0 && q->nb[2]%16==0 && uintptr_t(q->data)%16==0 &&
         k->nb[1]%16==0 && k->nb[2]%16==0 && uintptr_t(k->data)%16==0 &&
         ids->nb[1]%4==0 && uintptr_t(ids->data)%4==0 && ids->ne[0]>0 && ids->ne[0]<=2560 &&
@@ -616,20 +616,23 @@ static void qsa_prefill_impl1(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int n_q = (int) q->ne[1], ns = (int) ids->ne[0], nk = (int) k->ne[1];
     // QSA_DIRECT: -1/auto reads K direct (32 B row reads) and packs only V, unless the attention is small against the cache
     // (the pack is O(n_kv) per ubatch, its gain O(n_q)): then V is read direct too. 0 packs both, 1 reads both direct,
-    // 2 forces K direct with V packed. All paths are bit-identical.
+    // 2 forces K direct with V packed. All paths are bit-identical. The direct reads take f16 only, so q8_0 K/V always pack.
     static const int qsa_direct_cfg = getenv("QSA_DIRECT") ? atoi(getenv("QSA_DIRECT")) : -1;
-    const bool qsa_direct = qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 64 < (size_t) nk);
-    const bool qsa_kdirect = qsa_direct || qsa_direct_cfg == 2 || qsa_direct_cfg < 0;
+    const bool kv_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+    const bool qsa_direct = kv_f16 && (qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 64 < (size_t) nk));
+    const bool qsa_kdirect = kv_f16 && (qsa_direct || qsa_direct_cfg == 2 || qsa_direct_cfg < 0);
     ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), qsa_kdirect ? 0 : ggml_nelements(k));
     ggml_cuda_pool_alloc<uint16_t> packed_v(ctx.pool(), qsa_direct ? 0 : ggml_nelements(v));
     if (!qsa_kdirect) {
         const uint32_t count_k=ggml_nelements(k)/8;
-        qsa_pack_k<<<(count_k+255)/256,256,0,ctx.stream()>>>((const char *)k->data,packed_k.get(),k->nb[1],k->nb[2],nk,count_k);
+        auto * pack_k = k->type==GGML_TYPE_Q8_0 ? qsa_pack_k<true> : qsa_pack_k<false>;
+        pack_k<<<(count_k+255)/256,256,0,ctx.stream()>>>((const char *)k->data,packed_k.get(),k->nb[1],k->nb[2],nk,count_k);
         CUDA_CHECK(cudaGetLastError());
     }
     if (!qsa_direct) {
         const uint32_t count_v=ggml_nelements(v)/4;
-        qsa_pack_v<<<(count_v+255)/256,256,0,ctx.stream()>>>((const char *)v->data,packed_v.get(),v->nb[1],v->nb[2],nk,count_v);
+        auto * pack_v = v->type==GGML_TYPE_Q8_0 ? qsa_pack_v<true> : qsa_pack_v<false>;
+        pack_v<<<(count_v+255)/256,256,0,ctx.stream()>>>((const char *)v->data,packed_v.get(),v->nb[1],v->nb[2],nk,count_v);
         CUDA_CHECK(cudaGetLastError());
     }
     const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;

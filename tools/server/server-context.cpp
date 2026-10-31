@@ -297,9 +297,6 @@ struct server_slot {
     int32_t n_chained = 0; // tokens of the current task decoded through the chain
     bool sampled_on_backend = false; // the last sampled token came whole from the backend sampler
 
-    // prompt position where the aligned end-of-prompt tail starts (--ctx-checkpoint-align), -1 = none
-    int32_t n_ckpt_tail_pos = -1;
-
     // end-of-prompt checkpoint taken from a recurrent state snapshot inside the batch (--ctx-checkpoint-snapshot):
     // the prompt length and the position it is taken before, -1 = none pending
     int64_t   n_ckpt_snap_tokens = -1;
@@ -4407,6 +4404,12 @@ private:
                         }
                     }
 
+                    // break the batch when this many prompt tokens remain (see the checkpoint offsets below)
+                    int ckpt_n_last[2] = { std::min(n_batch, 4 + n_ubatch), std::min(n_batch, 4) };
+                    if (ckpt_snap) {
+                        ckpt_n_last[0] = std::min(n_batch, n_ubatch);
+                    }
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < n_prompt_in && batch.size() < n_batch) {
                         // get next token to process
@@ -4467,8 +4470,7 @@ private:
 
                             bool should_break = false;
                             for (int i_last = 0; i_last < 2; ++i_last) {
-                                const int n_last = std::min(n_batch, (i_last == 0 && ckpt_snap) ? n_ubatch : checkpoint_offsets[i_last]);
-                                if (n_prompt_in == slot.prompt.n_tokens() + n_last) {
+                                if (n_prompt_in == slot.prompt.n_tokens() + ckpt_n_last[i_last]) {
                                     if (i_last == 1 && ckpt_snap && batch.size() < n_batch) {
                                         // keep going: the checkpoint is taken from a snapshot before the next token
                                         slot.n_ckpt_snap_tokens = slot.prompt.n_tokens();
@@ -5159,8 +5161,7 @@ private:
     }
 
     // the context the model can serve: its training context, extended by a linear RoPE scale below the trained one.
-    // YaRN needs nothing here: llama_init_from_model (src/llama-context.cpp, "custom YaRN scaling detected") already set
-    // n_ctx_train to n_ctx_orig_yarn / rope_freq_scale when the YaRN scale differs from the trained one.
+    // YaRN needs nothing here: llama_init_from_model already set n_ctx_train to n_ctx_orig_yarn / rope_freq_scale.
     int n_ctx_model() const {
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
         const float scale = params_base.rope_freq_scale;

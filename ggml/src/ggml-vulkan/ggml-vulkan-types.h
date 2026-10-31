@@ -750,7 +750,7 @@ struct vk_device_struct {
     // decode weight prefetch from a second compute queue (GGML_VK_DECODE_PREFETCH_Q): a VkQueue of its own in the compute
     // family (its own kernel scheduler entity, so it runs beside compute_queue), plus VK_AMD_buffer_marker for the phase word
     std::unique_ptr<vk_queue> prefetch_queue;
-    // called before the host waits on the device or creates / frees device memory. It ends a resident side dispatch of the decode
+    // called before the host waits on the device or creates / frees device memory: ends a resident side dispatch of the decode
     // prefetch (a wait or a VA update covers every job in flight, so the side dispatch would hold it until its poll bound)
     void (*prefetch_q_quiesce)(void *) = nullptr;
     void * prefetch_q_quiesce_ctx = nullptr;
@@ -1581,9 +1581,7 @@ struct ggml_backend_vk_context {
     // nodes go into gdn_qk_skip
     struct gdn_conv_fold { const ggml_tensor * x; const ggml_tensor * state; const ggml_tensor * kern; uint32_t C, qc0, kc0, vc0; };
     std::unordered_map<const ggml_tensor *, gdn_conv_fold> gdn_cf;
-    bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
     int fused_hc_moe_epi {};   // HC_MOE_EPI: number of ADD nodes (routed slot adds + the shared-expert add) in front of the HC post norm chain
-    bool fused_fa_out_gate {};  // FLASH_ATTN_EXT+RESHAPE+VIEW+CONT+SIGMOID+MUL: the attention output gate after FA
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {
@@ -1614,7 +1612,6 @@ struct ggml_backend_vk_context {
     // token strides (elements); filled when the producer runs, cleared per graph
     std::unordered_map<const ggml_tensor *, std::pair<uint32_t, uint32_t>> hc_res16;
     const ggml_tensor * fused_extra_dst {};   // written by the fused kernel besides the write-mask nodes (synced like them)
-    const ggml_tensor * fused_extra_srcs[2] {};
     // GDN direct state write: GATED_DELTA_NET nodes matched in this graph (decided at the GDN), each with the CPY that
     // would move its state / rollback snapshots into the recurrent cache; the GDN writes the CPY's rows, the CPY is elided
     struct gdn_direct_match {
@@ -1624,7 +1621,6 @@ struct ggml_backend_vk_context {
     };
     std::vector<gdn_direct_match> gdn_direct_matches;
     int fused_gdn_direct {-1};                   // current GDN writes its states into gdn_direct_matches[k].cpy
-    const ggml_tensor * fused_extra_dst {};      // a tensor the current node writes outside node (sync tracking)
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;

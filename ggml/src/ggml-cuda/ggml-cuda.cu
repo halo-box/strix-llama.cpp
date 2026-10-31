@@ -900,8 +900,8 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    ggml_cuda_weights_written(buffer, (char *) tensor->data + offset, size);
     ggml_cuda_mmb_r2_forget((char *) tensor->data + offset, size);   // new contents arrive in the original layout
+    ggml_cuda_weights_written(buffer, (char *) tensor->data + offset, size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -7488,6 +7488,11 @@ static uint64_t ggml_cuda_graph_sig(const ggml_cgraph * cgraph) {
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ggml_cuda_mmb_shadow_dropped(*cuda_ctx)) {
+#ifdef USE_CUDA_GRAPH
+        cuda_ctx->cuda_graphs.clear();   // captured kernels hold the address of a shadow that is gone
+#endif
+    }
     if (ggml_cuda_mmb_marks_count(*cuda_ctx) > 0 || !cuda_ctx->ovl_regions.empty()) {
         const uint64_t sig = ggml_cuda_graph_sig(cgraph);
         if (std::find(cuda_ctx->mmb_graph_sigs.begin(), cuda_ctx->mmb_graph_sigs.end(), sig) == cuda_ctx->mmb_graph_sigs.end()) {
