@@ -7389,6 +7389,103 @@ struct test_moe_prefill : public test_case {
     }
 };
 
+// The routed gate/up projections of an f16 MoE block (build_moe_ffn with fused_moe_f16): MUL_MAT_ID -> CPY(f16) for up and
+// gate, then SWIGLU(gate, up). Vulkan fuses the five nodes into one launch (MUL_MAT_ID_PAIR_SWIGLU, q4_K). up_first: the up
+// projection is expanded first (the other graph order). hist: the measured Flash-Next routing histogram of test_moe_prefill
+// (512 experts, 10 used), else uniform random distinct experts.
+struct test_moe_glu_f16 : public test_case {
+    const ggml_type type_w;
+    const ggml_type type_x;
+    const int64_t n_embd, n_ff;
+    const int n_expert, n_used;
+    const int64_t n_tokens;
+    const bool up_first;
+    const bool hist;
+    const bool chain32;   // the f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU, no casts (models without fused_moe_f16)
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MOE_GLU"; }
+    std::string vars() override { return VARS_TO_STR10(type_w, type_x, n_embd, n_ff, n_expert, n_used, n_tokens, up_first, hist, chain32); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2 * n_embd * n_ff * n_used * n_tokens; }
+
+    // GGML_VK_TEST_REQUIRE_PAIR_GLU=1: the fused launch must run for q4_K / q5_K with M % 128 == 0 and K % 256 == 0, and must not run
+    // otherwise; under GGML_VK_MMID_PAIR_GLU_EXT=0 only the q4_K f16 chain may run
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_PAIR_GLU")) {
+            return true;
+        }
+        const char * ext_env = getenv("GGML_VK_MMID_PAIR_GLU_EXT");
+        const bool ext = ext_env == nullptr || atoi(ext_env) != 0;
+        const bool expect = (type_w == GGML_TYPE_Q4_K || type_w == GGML_TYPE_Q5_K) && n_ff % 128 == 0 && n_embd % 256 == 0 &&
+                            (ext || (type_w == GGML_TYPE_Q4_K && !chain32));
+        const char * path = chain32 ? "path:MUL_MAT_ID_PAIR_SWIGLU_F32" : "path:MUL_MAT_ID_PAIR_SWIGLU";
+        const int64_t n = dispatch_census_count(backend, path);
+        if (expect != (n > 0)) {
+            msg = std::string(path) + " dispatches: " + std::to_string(n) + (expect ? " (expected > 0)" : " (expected 0)");
+            return false;
+        }
+        return true;
+    }
+
+    test_moe_glu_f16(ggml_type type_w, ggml_type type_x, int64_t n_embd, int64_t n_ff, int n_expert, int n_used, int64_t n_tokens,
+                     bool up_first = false, bool hist = false, bool chain32 = false)
+        : type_w(type_w), type_x(type_x), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens),
+          up_first(up_first), hist(hist), chain32(chain32) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_tokens);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+        ggml_tensor * x  = ggml_new_tensor_3d(ctx, type_x, n_embd, 1, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * uw = ggml_new_tensor_3d(ctx, type_w, n_embd, n_ff, n_expert);
+        ggml_tensor * gw = ggml_new_tensor_3d(ctx, type_w, n_embd, n_ff, n_expert);
+        ggml_set_name(uw, "up_exps");
+        ggml_set_name(gw, "gate_exps");
+        ggml_tensor * up = ggml_mul_mat_id(ctx, uw, x, ids);
+        if (!chain32) {
+            up = ggml_cast(ctx, up, GGML_TYPE_F16);
+        }
+        if (up_first && gf) {
+            ggml_build_forward_expand(gf, up);
+        }
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gw, x, ids);
+        if (!chain32) {
+            gate = ggml_cast(ctx, gate, GGML_TYPE_F16);
+        }
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        if (!hist) {
+            init_mul_mat_id_tensors(ctx, n_expert);
+            return;
+        }
+        GGML_ASSERT(n_expert == 512 && n_used == 10);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) continue;
+            if (t->type != GGML_TYPE_I32) { init_tensor_uniform(t); continue; }
+            // test_moe_prefill's histogram {0:105, 1-15:134, 16-31:61, 32-63:72, 64-127:69, 128-255:39, 256-511:18, >=512:14}
+            const int bins[8][3] = {{0,0,105},{1,15,134},{16,31,61},{32,63,72},{64,127,69},{128,255,39},{256,511,18},{512,1480,14}};
+            std::vector<int> cnt;
+            for (auto & b : bins) for (int i = 0; i < b[2]; ++i) cnt.push_back(b[0] + (b[2] > 1 ? (b[1] - b[0]) * i / (b[2] - 1) : 0));
+            const int64_t total = 10 * n_tokens; int64_t sum = 0; for (int c : cnt) sum += c;
+            for (int & c : cnt) c = (int) ((int64_t) c * total / sum);
+            sum = 0; for (int c : cnt) sum += c; cnt[511] += (int) (total - sum);
+            GGML_ASSERT(cnt[511] <= n_tokens);
+            std::vector<int> perm(512); for (int i = 0; i < 512; ++i) perm[i] = (i * 197) % 512;
+            std::vector<int> slots; for (int e = 0; e < 512; ++e) for (int i = 0; i < cnt[e]; ++i) slots.push_back(perm[e]);
+            std::vector<int32_t> data(512 * n_tokens, 0);
+            for (int64_t tok = 0; tok < n_tokens; ++tok) for (int j = 0; j < 10; ++j) data[tok * 512 + j] = slots[tok + j * n_tokens];
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+        }
+    }
+};
+
 // f16 MoE activations as build_moe_ffn emits them with fused_moe_f16. part: 0 the whole block, 1 up/gate + casts,
 // 2 down (+ MUL) + cast from an f16 B, 3 the f32 combine of the f16 slices
 struct test_moe_f16 : public test_case {
@@ -14537,6 +14634,59 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_prefill(true, 512, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(true, 513, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_moe_prefill(false, 512, GGML_TYPE_Q5_1));
+    // MUL_MAT_ID_PAIR_SWIGLU: both graph orders, f32 / f16 activations, token counts around the 64-row tile
+    for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (bool up_first : { false, true }) {
+            for (int64_t nt : { 9, 63, 64, 65, 200 }) {
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 512, 256, 32, 8, nt, up_first));
+            }
+        }
+    }
+    // q5_K: both chains, both orders, f32 / f16 activations, tile edges
+    for (bool chain32 : { false, true }) {
+        for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+            for (int64_t nt : { 9, 65, 513 }) {
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, tx, 512, 256, 32, 8, nt, nt == 65, false, chain32));
+            }
+        }
+    }
+    // the f32 chain (no casts, f32 SWIGLU): both graph orders, f32 / f16 activations, tile edges, then model shapes
+    // (LFM2.5-8B-A1B, DeepSeek-V4-Flash) and an unmatched type
+    for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (int64_t nt : { 9, 64, 65, 200, 513 }) {
+            for (bool up_first : { false, true }) {
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 512, 256, 32, 8, nt, up_first, false, true));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2048, 1792, 32, 4, 300, true, false, true));
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, 2048, 256, 6, 130, false, false, true));
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q6_K, GGML_TYPE_F32, 512, 256, 32, 8, 65, false, false, true));
+    // every weight type: only q4_K may take the fused launch, the rest must fall back and still match
+    for (ggml_type tw : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+                         GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+                         GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+                         GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int64_t nt : { 65, 200 }) {
+            test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 512, 256, 32, 8, nt));
+        }
+    }
+    // ragged M (65, 129 rows) and M % 128 != 0 at 192: q4_K must fall back
+    for (int64_t m : { 65, 129, 192 }) {
+        test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, m, 32, 8, 200));
+        test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 512, m, 32, 8, 513, true));
+    }
+    // the Flash-Next expert rows (2560 x 640, 10 used) around the 128-token MMB gate for the FN gate/up quant types, on 32
+    // experts so each weight stays small
+    for (ggml_type tw : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
+        for (int64_t nt : { 127, 128 }) {
+            test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 2560, 640, 32, 10, nt));
+        }
+    }
+    // two full Flash-Next ubatches (512 experts, its measured routing histogram), q4_K and q5_K; the other full-shape runs are in
+    // the GGML_PERF_MOE perf set
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
+    test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_mul_mat_pair());
     // routed MUL_MAT_ID at the production MoE shapes and quant types; run with --mmb on and off to compare BF16 WMMA vs MMQ
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
@@ -16008,6 +16158,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     if (getenv("GGML_PERF_MOE")) {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
         test_cases.emplace_back(new test_moe_prefill(false, 4096));
+        // the Flash-Next routed gate/up + SwiGLU at ub2048 / ub4096: measured routing and uniform routing
+        for (int64_t nt : { 2048, 4096 }) {
+            for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, true));
+                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, false));
+            }
+        }
         return test_cases;
     }
 
