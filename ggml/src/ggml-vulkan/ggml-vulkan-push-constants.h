@@ -253,6 +253,23 @@ struct vk_op_count_experts_push_constants {
     uint32_t row_ids_offset;
 };
 
+// mul_mm_id_glu.comp (MUL_MAT_ID_PAIR_SWIGLU); offsets and strides in the units of each binding
+struct vk_op_mmid_glu_push_constants {
+    uint32_t M;
+    uint32_t K;
+    uint32_t g_offset;
+    uint32_t u_offset;
+    uint32_t stride_e;
+    uint32_t b_offset;
+    uint32_t b_s1;
+    uint32_t b_s2;
+    uint32_t ne11;
+    uint32_t d_offset;
+    uint32_t n_used;
+    uint32_t row_ids_offset;
+    uint32_t zero;
+};
+
 // mul_mm_id_down.comp (streaming MUL_MAT_ID(+MUL)+CPY(f16) down); offsets and strides in the units of each binding
 struct vk_op_mmid_down_push_constants {
     uint32_t M;
