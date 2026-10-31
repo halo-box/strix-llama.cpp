@@ -1027,6 +1027,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_decode_prefetch;
     vk_pipeline pipeline_decode_prefetch_q;
+    vk_pipeline pipeline_argmax_part_f32;   // long rows in two passes: partial (max, column) per workgroup ...
+    vk_pipeline pipeline_argmax_reduce_f32; // ... then one workgroup per row
     vk_pipeline pipeline_count_equal_i32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     // fused DeepSeek-V4 hc boundary: split-K mix dots [tile], then the per-token epilogue [norm folded][n_embd / 512 - 1]

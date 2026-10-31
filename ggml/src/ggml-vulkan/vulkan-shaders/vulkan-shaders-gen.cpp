@@ -1359,6 +1359,8 @@ void process_shaders() {
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("decode_prefetch", "decode_prefetch.comp", {});
     string_to_spv("decode_prefetch_q", "decode_prefetch_q.comp", {});
+    string_to_spv("argmax_part_f32", "argmax_split.comp", {});
+    string_to_spv("argmax_reduce_f32", "argmax_split.comp", {{"REDUCE", "1"}});
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("sum_f32", "sum.comp", {});
     string_to_spv("cross_entropy_loss_f32", "cross_entropy_loss.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));

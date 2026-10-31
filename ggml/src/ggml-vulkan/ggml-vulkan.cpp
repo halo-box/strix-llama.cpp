@@ -4821,6 +4821,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->prefetch_queue) {
         ggml_vk_create_pipeline(device, device->pipeline_decode_prefetch_q, "decode_prefetch_q", decode_prefetch_q_len, decode_prefetch_q_data, "main", 2, sizeof(vk_op_decode_prefetch_push_constants), {256, 1, 1}, {}, 1);
     }
+    ggml_vk_create_pipeline(device, device->pipeline_argmax_part_f32, "argmax_part_f32", argmax_part_f32_len, argmax_part_f32_data, "main", 2, sizeof(vk_op_argmax_split_push_constants), {1, 1, 1}, { 256 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_argmax_reduce_f32, "argmax_reduce_f32", argmax_reduce_f32_len, argmax_reduce_f32_data, "main", 2, sizeof(vk_op_argmax_split_push_constants), {1, 1, 1}, { 64 }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_sum_f32, "sum_f32", sum_f32_len, sum_f32_data, "main", 2, sizeof(vk_op_sum_push_constants), {1, 1, 1}, { 256 }, 1);
@@ -17478,7 +17480,58 @@ void ggml_vk_cross_entropy_loss_back(ggml_backend_vk_context * ctx, vk_context& 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { grad_buf, logits_buf, labels_buf, dst_buf }, pc, ggml_vk_nrows_elements(nrows));
 }
 
+// a few long rows (a greedy argmax over the vocab) in two passes: one workgroup per row cannot keep the memory busy
+// (248320 floats: 84 us with 512 lanes). GGML_VK_ARGMAX_SPLIT=0 keeps the one-pass shader.
+static bool ggml_vk_argmax_split_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_ARGMAX_SPLIT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static constexpr uint32_t argmax_split_min_cols = 16384;
+static constexpr uint32_t argmax_split_max_rows = 64;
+static constexpr uint32_t argmax_split_chunk    = 4096; // columns per workgroup of the first pass (256 lanes x 16)
+
 void ggml_vk_argmax(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    const uint32_t ncols = (uint32_t) src0->ne[0];
+    const uint32_t nrows = (uint32_t) ggml_nrows(src0);
+
+    if (ggml_vk_argmax_split_enabled() && ncols >= argmax_split_min_cols && nrows <= argmax_split_max_rows &&
+            src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I32 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
+        const uint32_t nparts    = CEIL_DIV(ncols, argmax_split_chunk);
+        const size_t   part_size = sizeof(uint32_t) * 2 * (size_t) nparts * nrows;
+
+        if (ctx->prealloc_size_split_k < part_size) {
+            ctx->prealloc_size_split_k = part_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+
+        vk_pipeline part   = ctx->device->pipeline_argmax_part_f32;
+        vk_pipeline reduce = ctx->device->pipeline_argmax_reduce_f32;
+        ggml_pipeline_request_descriptor_sets(ctx, part, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, reduce, 1);
+
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        const vk_subbuffer part_buf = { ctx->prealloc_split_k, 0, part_size };
+
+        const vk_op_argmax_split_push_constants pc_part = {
+            ncols, nrows, argmax_split_chunk, get_misalign_bytes(ctx, src0) / (uint32_t) sizeof(float), 0,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, part, { ggml_vk_tensor_subbuffer(ctx, src0, true), part_buf }, pc_part, { nparts, nrows, 1 });
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        const vk_op_argmax_split_push_constants pc_reduce = {
+            nparts, nrows, 0, 0, get_misalign_bytes(ctx, dst) / (uint32_t) sizeof(int32_t),
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, reduce, { part_buf, ggml_vk_tensor_subbuffer(ctx, dst, true) }, pc_reduce, { nrows, 1, 1 });
+        ctx->prealloc_split_k_need_sync = true;
+        return;
+    }
+
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ARGMAX, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], 0.0f, 0.0f, 0.0f, 0.0f });
 }
 

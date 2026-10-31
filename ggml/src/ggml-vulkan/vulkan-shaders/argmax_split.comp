@@ -1,0 +1,101 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// ARGMAX over a few long rows in two passes. PART: workgroup (x = part, y = row) takes p.chunk columns of its row and writes
+// (max, column) to a partial buffer. REDUCE: one workgroup per row reduces that row's partials to the column index.
+// Ties go to the highest column (the CPU argmax keeps the last maximum): within a lane later columns win, between lanes
+// and partials the higher column wins.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;     // PART: row length; REDUCE: partials per row
+    uint nrows;
+    uint chunk;     // PART: columns per workgroup
+    uint a_offset;  // PART: source misalignment (elements)
+    uint d_offset;  // REDUCE: destination misalignment (elements)
+} p;
+
+#ifdef REDUCE
+layout (binding = 0) readonly buffer A {uvec2 data_a[];};
+layout (binding = 1) writeonly buffer D {int data_d[];};
+#else
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) writeonly buffer D {uvec2 data_d[];};
+#endif
+
+shared float smax[BLOCK_SIZE];
+shared uint sidx[BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+
+    float vmax = 0.0;
+    uint  imax = 0;
+
+#ifdef REDUCE
+    const uint row  = gl_WorkGroupID.x;
+    const uint cnt  = p.ncols;
+    const uint base = row * p.ncols;
+
+    if (tid < cnt) {
+        const uvec2 e = data_a[base + tid];
+        vmax = uintBitsToFloat(e.x);
+        imax = e.y;
+    }
+    // later partials hold later columns
+    for (uint i = tid + BLOCK_SIZE; i < cnt; i += BLOCK_SIZE) {
+        const uvec2 e = data_a[base + i];
+        const float v = uintBitsToFloat(e.x);
+        if (v >= vmax) {
+            vmax = v;
+            imax = e.y;
+        }
+    }
+#else
+    const uint part = gl_WorkGroupID.x;
+    const uint row  = gl_WorkGroupID.y;
+    const uint c0   = part * p.chunk;
+    const uint c1   = min(c0 + p.chunk, p.ncols);
+    const uint cnt  = c1 - c0;
+    const uint base = p.a_offset + row * p.ncols;
+
+    if (tid < cnt) {
+        vmax = data_a[base + c0 + tid];
+        imax = c0 + tid;
+    }
+    for (uint i = c0 + tid + BLOCK_SIZE; i < c1; i += BLOCK_SIZE) {
+        const float v = data_a[base + i];
+        if (v >= vmax) {
+            vmax = v;
+            imax = i;
+        }
+    }
+#endif
+
+    smax[tid] = vmax;
+    sidx[tid] = imax;
+
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < cnt) {
+            if (smax[tid] < smax[tid + s] || (smax[tid] == smax[tid + s] && sidx[tid + s] > sidx[tid])) {
+                smax[tid] = smax[tid + s];
+                sidx[tid] = sidx[tid + s];
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+#ifdef REDUCE
+        data_d[p.d_offset + row] = int(sidx[0]);
+#else
+        data_d[row * gl_NumWorkGroups.x + part] = uvec2(floatBitsToUint(smax[0]), sidx[0]);
+#endif
+    }
+}
