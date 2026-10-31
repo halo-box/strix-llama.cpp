@@ -4666,6 +4666,19 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->subgroup_basic && device->subgroup_shuffle && device->subgroup_require_full_support && device->subgroup_size >= 16) {
         const uint32_t tokens_per_workgroup = 4 * (device->subgroup_size / 16);
         ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {tokens_per_workgroup, 1, 1}, { device->subgroup_size }, 1, true, true, device->subgroup_size);
+
+        // the fused hc boundary: its epilogue runs the comb's Sinkhorn on the same 16-lane layout and subgroup size
+        if (device->subgroup_arithmetic) {
+            ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_mix[0], "dsv4_hc_mix_mv_f32", dsv4_hc_mix_f32_len, dsv4_hc_mix_f32_data, "main", 3, sizeof(vk_op_dsv4_hc_mix_push_constants), {1, 1, 1}, { 0u, 64u }, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_mix[1], "dsv4_hc_mix_tile_f32", dsv4_hc_mix_f32_len, dsv4_hc_mix_f32_data, "main", 3, sizeof(vk_op_dsv4_hc_mix_push_constants), {1, 1, 1}, { 1u, 256u }, 1);
+            for (uint32_t norm = 0; norm < 2; ++norm) {
+                for (uint32_t n_out = 1; n_out <= 8; ++n_out) {
+                    const std::string name = std::string(norm ? "dsv4_hc_boundary_norm_f32_" : "dsv4_hc_boundary_f32_") + std::to_string(n_out);
+                    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_boundary[norm][n_out - 1], name.c_str(), dsv4_hc_boundary_f32_len, dsv4_hc_boundary_f32_data, "main", 8,
+                        sizeof(vk_op_dsv4_hc_boundary_push_constants), {1, 1, 1}, { norm, n_out }, 1, true, true, device->subgroup_size);
+                }
+            }
+        }
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
@@ -9774,6 +9787,94 @@ static void ggml_vk_qsa_score(ggml_backend_vk_context * ctx, vk_context& subctx,
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, src1), out_buf,
           bias ? ggml_vk_tensor_subbuffer(ctx, bias) : out_buf }, pc, { M, N, ns });
+static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& subctx, const char * name);
+
+static bool ggml_vk_hc_boundary_gemm_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_BOUNDARY_GEMM"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// The fused DeepSeek-V4 hc boundary (matched by ggml_vk_can_fuse_hc_boundary): the split-K mix dots of the unnormalized flat
+// residual into the split-K scratch, then the per-token epilogue (dsv4_hc_boundary.comp) writes post, comb and the hc pre
+// output (or its folded norm)
+static void ggml_vk_dsv4_hc_boundary(ggml_backend_vk_context * ctx, vk_context& subctx) {
+    const auto & m = ctx->hc_boundary;
+    const uint32_t K      = (uint32_t) m.x->ne[0];
+    const uint32_t N      = (uint32_t) m.x->ne[1];
+    const uint32_t n_embd = K / 4;
+    const uint32_t n_mix  = 24;
+
+    // mat-vec form for a few tokens (one workgroup per 1024 columns and mix row, 384 at hc_dim 16384), tiled form above;
+    // the tile's split is 1024 columns at ubatch sizes (1024 workgroups at 2048 tokens) and 256 below, so short prompts
+    // still fill the GPU
+    const bool tile = N > 16;
+    // prefill: by default the f32 GEMM the unfused MUL_MAT runs (ggml_vk_mul_mat_q_f16), on the unnormalized residual, into
+    // the MUL_MAT's own buffer (graph_optimize keeps it allocated through the chain); the epilogue then reads one partial per
+    // mix. 1.26 ms per 2048-token ubatch against 1.84 ms for the tiled kernel (perf logger, trunc10). GGML_VK_HC_BOUNDARY_GEMM=0,
+    // or that buffer overlapping x or an output (no allocation dependency, e.g. without graph_optimize), keeps the tiled kernel.
+    const bool gemm = tile && ggml_vk_hc_boundary_gemm_enabled() && get_misalign_bytes(ctx, m.mm) == 0 &&
+                      !ggml_vk_tensors_overlap(m.mm, m.x, false) && !ggml_vk_tensors_overlap(m.mm, m.post, false) &&
+                      !ggml_vk_tensors_overlap(m.mm, m.comb, false) && !ggml_vk_tensors_overlap(m.mm, m.out, false);
+    uint32_t n_split = 1;
+    vk_subbuffer part;
+    if (gemm) {
+        ggml_vk_mul_mat_q_f16(ctx, subctx, m.w, m.x, m.mm, false);
+        ggml_vk_perf_mark_subop(ctx, subctx, "HC_BOUNDARY_MIX_GEMM");
+        ggml_vk_sync_buffers(ctx, subctx);
+        part = ggml_vk_tensor_subbuffer(ctx, m.mm);
+    } else {
+        const uint32_t kc = !tile ? 1024 : (N >= 1024 ? 1024 : 256);
+        n_split = K / kc;
+        const size_t part_size = (size_t) n_split * N * n_mix * sizeof(float);
+        if (ctx->prealloc_size_split_k < part_size) {
+            ctx->prealloc_size_split_k = part_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        part = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+
+        vk_pipeline mix = ctx->device->pipeline_dsv4_hc_mix[tile ? 1 : 0];
+        GGML_ASSERT(mix != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, mix, 1);
+        const vk_op_dsv4_hc_mix_push_constants mpc = {
+            K, N, (uint32_t) (m.w->nb[1] / sizeof(float)), (uint32_t) (m.x->nb[1] / sizeof(float)), kc,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, mix, { ggml_vk_tensor_subbuffer(ctx, m.w), ggml_vk_tensor_subbuffer(ctx, m.x), part }, mpc,
+                                  { n_split, tile ? CEIL_DIV(N, 32) : n_mix, 1 });
+        // perf logger (per-op mode): the mix dispatch billed apart from the epilogue
+        ggml_vk_perf_mark_subop(ctx, subctx, tile ? "HC_BOUNDARY_MIX_TILE" : "HC_BOUNDARY_MIX_MV");
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    vk_pipeline epi = ctx->device->pipeline_dsv4_hc_boundary[m.gamma ? 1 : 0][n_embd / 512 - 1];
+    GGML_ASSERT(epi != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, epi, 1);
+
+    const vk_op_dsv4_hc_boundary_push_constants bpc = {
+        K, n_embd, N, n_split,
+        (uint32_t) (m.x->nb[1] / sizeof(float)),
+        (uint32_t) (m.scale->nb[0] / sizeof(float)),
+        (uint32_t) (m.base->nb[0] / sizeof(float)),
+        (uint32_t) (m.post->nb[1] / sizeof(float)),
+        (uint32_t) (m.comb->nb[1] / sizeof(float)), (uint32_t) (m.comb->nb[2] / sizeof(float)),
+        (uint32_t) (m.out->nb[1] / sizeof(float)),
+        ggml_get_op_params_f32(m.rms, 0),
+        ggml_get_op_params_f32(m.pre_sc, 0), ggml_get_op_params_f32(m.pre_sc, 1),
+        ggml_get_op_params_f32(m.post, 0), ggml_get_op_params_f32(m.post, 1),
+        ggml_get_op_params_f32(m.comb, 0), (uint32_t) ggml_get_op_params_i32(m.comb, 1),
+        ggml_get_op_params_f32(m.hc_pre, 0),
+        m.rms2 ? ggml_get_op_params_f32(m.rms2, 0) : 0.0f,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, epi,
+        { ggml_vk_tensor_subbuffer(ctx, m.x), part, ggml_vk_tensor_subbuffer(ctx, m.scale), ggml_vk_tensor_subbuffer(ctx, m.base),
+          ggml_vk_tensor_subbuffer(ctx, m.gamma ? m.gamma : m.scale), ggml_vk_tensor_subbuffer(ctx, m.post),
+          ggml_vk_tensor_subbuffer(ctx, m.comb), ggml_vk_tensor_subbuffer(ctx, m.out) },
+        bpc, { N, 1, 1 });
+    if (!gemm) {
+        ctx->prealloc_split_k_need_sync = true;
+    }
 }
 
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -17281,7 +17382,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_RMS_NORM:
-        if (ctx->fused_hc_post_norm) {
+        if (ctx->fused_hc_boundary) {
+            ggml_vk_dsv4_hc_boundary(ctx, compute_ctx);
+        } else if (ctx->fused_hc_post_norm) {
             ggml_vk_dsv4_hc_post_norm(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_rms_norm(ctx, compute_ctx, cgraph, node_idx, (float *)node->op_params);
@@ -18471,6 +18574,281 @@ static bool ggml_vk_mmid_scale_epilogue_ok(const ggml_backend_vk_context * cctx,
     return true;
 }
 
+
+// DeepSeek-V4 hc boundary (dsv4_hc_mix.comp + dsv4_hc_boundary.comp), the chain build_hc_pre emits at each sub-layer:
+//   RMS_NORM(x_flat) -> MUL_MAT(hc_fn) -> VIEW(mixes[0:4]) -> MUL(VIEW(hc_scale[0])) -> ADD(VIEW(hc_base[0:4])) -> SIGMOID -> SCALE
+//                                     -> VIEW(mixes[4:8]) -> MUL(VIEW(hc_scale[1])) -> ADD(VIEW(hc_base[4:8])) -> SIGMOID -> SCALE (post, written)
+//                                     -> DSV4_HC_COMB (written)
+//   DSV4_HC_PRE(x, pre) (written), or with the next norm folded: -> RMS_NORM -> MUL(gamma) (written)
+// as two dispatches instead of 14: a split-K GEMV/GEMM of the mix rows over the UNNORMALIZED residual, then one epilogue per
+// token that takes the rms scale (rms_norm.comp's reduction), scales the reduced dots and runs the rest. The mixes are the
+// only values that differ from the unfused chain (norm scale after the dot product, different summation order).
+// llama emits the post and comb chains behind the attention block, so graph_optimize gathers the nodes into the order
+// above and graph_compute takes them as one consecutive run. GGML_VK_FUSE_HC_BOUNDARY=0 disables both.
+static bool ggml_vk_fuse_hc_boundary_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FUSE_HC_BOUNDARY");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static int32_t ggml_vk_graph_use_count(const ggml_cgraph * g, const ggml_tensor * t) {
+    const size_t h = ggml_hash_find(&g->visited_hash_set, t);
+    return ggml_bitset_get(g->visited_hash_set.used, h) ? g->use_counts[h] : 0;
+}
+
+struct vk_hc_boundary_chain {
+    static constexpr int MAX_NODES = 20;
+    const ggml_tensor * nodes[MAX_NODES];   // in the order graph_optimize emits them
+    int count = 0;
+    ggml_backend_vk_context::hc_boundary_match m {};
+};
+
+// users(t, idx, max): node indices of the readers of t the caller can see (one per source slot), up to max; returns the count.
+// Every intermediate must have all of its readers inside the chain (graph use count). allocated: check buffer alignment
+// (graph_compute); graph_optimize runs before allocation.
+template <typename Users>
+static bool ggml_vk_match_hc_boundary(const ggml_backend_vk_context * ctx, const ggml_cgraph * g, int i, const Users & users,
+                                      bool allocated, vk_hc_boundary_chain & c) {
+    c = {};
+    if (!ggml_vk_fuse_hc_boundary_enabled() || ctx->device->disable_fusion || ctx->device->pipeline_dsv4_hc_mix[0] == nullptr) {
+        return false;
+    }
+    constexpr int64_t hc = 4, n_mix = (2 + hc) * hc;
+    const ggml_tensor * rms = g->nodes[i];
+    if (rms->op != GGML_OP_RMS_NORM || rms->type != GGML_TYPE_F32 || (rms->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * xf = rms->src[0];
+    const int64_t K = xf->ne[0];
+    const int64_t N = xf->ne[1];
+    // flat rows of hc * 512 * n with n <= 8 (the epilogue's thread layout), f32, unit stride, vec4-aligned token stride
+    if (xf->type != GGML_TYPE_F32 || K % (hc * 512) != 0 || K > hc * 4096 || xf->ne[2] != 1 || xf->ne[3] != 1 ||
+        xf->nb[0] != sizeof(float) || xf->nb[1] % 16 != 0) {
+        return false;
+    }
+    const int64_t n_embd = K / hc;
+
+    int ub[4];
+    // t's one reader, when t is not an output and its only reader is visible
+    auto only_reader = [&](const ggml_tensor * t, int * at = nullptr) -> ggml_tensor * {
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_vk_graph_use_count(g, t) != 1 || users(t, ub, 4) != 1) {
+            return nullptr;
+        }
+        if (at) {
+            *at = ub[0];
+        }
+        return g->nodes[ub[0]];
+    };
+    auto f32_packed = [](const ggml_tensor * t, int64_t ne0, int64_t ne1, int64_t ne2 = 1) {
+        return t->type == GGML_TYPE_F32 && t->ne[0] == ne0 && t->ne[1] == ne1 && t->ne[2] == ne2 && t->ne[3] == 1 && ggml_is_contiguous(t);
+    };
+    auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+    auto offs = [](const ggml_tensor * t) { return t->view_src ? t->view_offs : (size_t) 0; };
+
+    ggml_tensor * mm = only_reader(rms);
+    if (!mm || mm->op != GGML_OP_MUL_MAT || mm->src[1] != rms || !f32_packed(mm, n_mix, N) || (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * w = mm->src[0];
+    if (w->type != GGML_TYPE_F32 || w->ne[0] != K || w->ne[1] != n_mix || w->ne[2] != 1 || w->ne[3] != 1 ||
+        w->nb[0] != sizeof(float) || w->nb[1] % 16 != 0) {
+        return false;
+    }
+
+    // the mixes' three readers: the pre and post views and the comb
+    int mu[4];
+    if (ggml_vk_graph_use_count(g, mm) != 3 || users(mm, mu, 4) != 3) {
+        return false;
+    }
+    ggml_tensor * vpre = nullptr;
+    ggml_tensor * vpost = nullptr;
+    ggml_tensor * comb = nullptr;
+    int comb_at = -1;
+    for (int k = 0; k < 3; ++k) {
+        ggml_tensor * u = g->nodes[mu[k]];
+        if (u->op == GGML_OP_VIEW && u->view_src == mm && u->type == GGML_TYPE_F32 && u->ne[0] == hc && u->ne[1] == N &&
+            u->ne[2] == 1 && u->ne[3] == 1 && u->nb[0] == sizeof(float) && u->nb[1] == mm->nb[1]) {
+            if (u->view_offs == 0) {
+                vpre = u;
+            } else if (u->view_offs == hc * sizeof(float)) {
+                vpost = u;
+            }
+        } else if (u->op == GGML_OP_DSV4_HC_COMB && u->src[0] == mm) {
+            comb = u;
+            comb_at = mu[k];
+        }
+    }
+    if (!vpre || !vpost || !comb || !f32_packed(comb, hc, hc, N)) {
+        return false;
+    }
+    const ggml_tensor * sc   = comb->src[1];
+    const ggml_tensor * base = comb->src[2];
+    if (sc->type != GGML_TYPE_F32 || sc->ne[0] < 3 || sc->nb[0] != sizeof(float) ||
+        base->type != GGML_TYPE_F32 || base->ne[0] != n_mix || base->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    // one gate: VIEW -> MUL(VIEW(hc_scale[j])) -> ADD(VIEW(hc_base[hc*j:])) -> SIGMOID -> SCALE
+    struct gate {
+        const ggml_tensor * v, * sv, * mul, * bv, * add, * sig;
+        ggml_tensor * scl;
+        int scl_at;
+    };
+    auto chain = [&](const ggml_tensor * v, int j, gate & gt) -> bool {
+        gt.v = v;
+        const ggml_tensor * mul = only_reader(v);
+        if (!mul || mul->op != GGML_OP_MUL || mul->src[0] != v || !f32_packed(mul, hc, N)) {
+            return false;
+        }
+        const ggml_tensor * sv = mul->src[1];
+        if (sv->op != GGML_OP_VIEW || root(sv) != root(sc) || sv->view_offs != offs(sc) + j * sizeof(float) ||
+            sv->type != GGML_TYPE_F32 || ggml_nelements(sv) != 1) {
+            return false;
+        }
+        const ggml_tensor * add = only_reader(mul);
+        if (!add || add->op != GGML_OP_ADD || add->src[0] != mul || !f32_packed(add, hc, N)) {
+            return false;
+        }
+        const ggml_tensor * bv = add->src[1];
+        if (bv->op != GGML_OP_VIEW || root(bv) != root(base) || bv->view_offs != offs(base) + j * hc * sizeof(float) ||
+            bv->type != GGML_TYPE_F32 || bv->ne[0] != hc || ggml_nelements(bv) != hc || bv->nb[0] != sizeof(float)) {
+            return false;
+        }
+        const ggml_tensor * sig = only_reader(add);
+        if (!sig || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->src[0] != add ||
+            !f32_packed(sig, hc, N)) {
+            return false;
+        }
+        int at = -1;
+        ggml_tensor * scl = only_reader(sig, &at);
+        if (!scl || scl->op != GGML_OP_SCALE || scl->src[0] != sig || !f32_packed(scl, hc, N)) {
+            return false;
+        }
+        gt = { v, sv, mul, bv, add, sig, scl, at };
+        return true;
+    };
+    gate gp {}, gq {};
+    if (!chain(vpre, 0, gp) || !chain(vpost, 1, gq)) {
+        return false;
+    }
+
+    int out_at = -1;
+    ggml_tensor * hcpre = only_reader(gp.scl, &out_at);
+    if (!hcpre || hcpre->op != GGML_OP_DSV4_HC_PRE || hcpre->src[1] != gp.scl || ggml_get_op_params_i32(hcpre, 1) != 0 ||
+        !f32_packed(hcpre, n_embd, N)) {
+        return false;
+    }
+    // x is the storage the flat norm reads: [n_embd, hc, N], packed
+    const ggml_tensor * x = hcpre->src[0];
+    if (!f32_packed(x, n_embd, hc, N) || root(x) != root(xf) || offs(x) != offs(xf) || x->nb[2] != xf->nb[1]) {
+        return false;
+    }
+
+    // the next norm (attn_norm / ffn_norm), folded when it is the hc pre output's only reader
+    const ggml_tensor * rms2 = nullptr;
+    ggml_tensor * mul2 = nullptr;
+    const ggml_tensor * gamma = nullptr;
+    if (const ggml_tensor * r2 = only_reader(hcpre)) {
+        int mul_at = -1;
+        ggml_tensor * m2 = r2->op == GGML_OP_RMS_NORM && r2->src[0] == hcpre ? only_reader(r2, &mul_at) : nullptr;
+        if (m2 && m2->op == GGML_OP_MUL && f32_packed(m2, n_embd, N)) {
+            const ggml_tensor * gm = m2->src[0] == r2 ? m2->src[1] : m2->src[1] == r2 ? m2->src[0] : nullptr;
+            if (gm && gm != r2 && gm->type == GGML_TYPE_F32 && gm->ne[0] == n_embd && ggml_nelements(gm) == n_embd && gm->nb[0] == sizeof(float)) {
+                rms2  = r2;
+                mul2  = m2;
+                gamma = gm;
+                out_at = mul_at;
+            }
+        }
+    }
+    ggml_tensor * out = mul2 ? mul2 : hcpre;
+
+    const vk_device & dev = ctx->device;
+    if (dev->pipeline_dsv4_hc_mix[1] == nullptr || dev->pipeline_dsv4_hc_boundary[gamma ? 1 : 0][n_embd / 512 - 1] == nullptr ||
+        N > (int64_t) dev->properties.limits.maxComputeWorkGroupCount[0] || N > (int64_t) dev->properties.limits.maxComputeWorkGroupCount[1]) {
+        return false;
+    }
+    if (allocated) {
+        const ggml_tensor * bound[] = { xf, w, sc, base, gamma, gq.scl, comb, out };
+        for (const ggml_tensor * t : bound) {
+            if (t && get_misalign_bytes(ctx, t) != 0) {
+                return false;
+            }
+        }
+    }
+
+    const ggml_tensor * order[] = {
+        rms, mm,
+        gp.v, gp.sv, gp.mul, gp.bv, gp.add, gp.sig, gp.scl,
+        gq.v, gq.sv, gq.mul, gq.bv, gq.add, gq.sig, gq.scl,
+        comb, hcpre, rms2, mul2,
+    };
+    c.count = rms2 ? 20 : 18;
+    static_assert(sizeof(order) / sizeof(order[0]) == vk_hc_boundary_chain::MAX_NODES);
+    std::copy(order, order + c.count, c.nodes);
+    c.m = { xf, w, sc, base, gamma, rms, gp.scl, gq.scl, comb, hcpre, rms2, out, out_at, gq.scl_at, comb_at, mm };
+    return true;
+}
+
+// graph_compute: the boundary as one consecutive run of nodes from i (graph_optimize's order). Returns the run's last
+// node index, 0 when the chain does not match there; c then holds the match.
+static int ggml_vk_can_fuse_hc_boundary(const ggml_backend_vk_context * ctx, const ggml_cgraph * g, int i, vk_hc_boundary_chain & c) {
+    if (g->nodes[i]->op != GGML_OP_RMS_NORM || !ggml_vk_fuse_hc_boundary_enabled()) {
+        return 0;
+    }
+    const int hi = std::min(g->n_nodes, i + vk_hc_boundary_chain::MAX_NODES + 8);
+    auto users = [&](const ggml_tensor * t, int * idx, int max) {
+        int n = 0;
+        for (int j = i; j < hi; ++j) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (g->nodes[j]->src[s] == t) {
+                    if (n < max) {
+                        idx[n] = j;
+                    }
+                    ++n;
+                }
+            }
+        }
+        return n;
+    };
+    if (!ggml_vk_match_hc_boundary(ctx, g, i, users, true, c)) {
+        return 0;
+    }
+    // every computing node of the chain lies in [i, last], the last one is the written output, and nothing else is in
+    // between; the chain's weight views may sit before i (zero-compute)
+    const int last = c.m.last;
+    if (last < i || last >= hi || g->nodes[last] != c.m.out) {
+        return 0;
+    }
+    int in_run = 0;
+    for (int k = 0; k < c.count; ++k) {
+        int at = -1;
+        for (int j = i; j <= last; ++j) {
+            if (g->nodes[j] == c.nodes[k]) {
+                at = j;
+                break;
+            }
+        }
+        if (at < 0) {
+            if (c.nodes[k]->op != GGML_OP_VIEW) {
+                return 0;
+            }
+            continue;
+        }
+        ++in_run;
+    }
+    if (in_run != last - i + 1) {
+        return 0;
+    }
+    for (int j = i; j <= last; ++j) {
+        if ((g->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 && g->nodes[j]->op != GGML_OP_VIEW) {
+            return 0;
+        }
+    }
+    return last;
+}
 
 static constexpr std::initializer_list<ggml_op> hc_post_norm_cpy_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_CPY };
 static constexpr std::initializer_list<ggml_op> hc_post_norm_pattern     { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL };
@@ -20368,6 +20746,8 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     if (l == "TOPK_QSA" && !dev->pipeline_topk_radix_qsa) {
         return "no radix top-k pipeline";
     }
+    if (l.rfind("HC_BOUNDARY", 0) == 0 && dev->pipeline_dsv4_hc_mix[0] == nullptr) {
+        return "no hc boundary pipelines (needs full-subgroup shuffle and arithmetic, 16+ lanes)";
     if (l == "QSA_SCORE" && (!dev->coopmat_support || dev->coopmat2 || ggml_vk_qsa_score_pipelines(ctx) == nullptr)) {
         return "no KHR coopmat f32 QSA scorer pipeline (coopmat2 devices keep the unfused chain)";
     }
@@ -21357,6 +21737,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_norm_inj = false;
         ctx->fused_hc_moe_epi = 0;
         ctx->fused_extra_dst = nullptr;
+        ctx->fused_hc_boundary = false;
         ctx->fused_mm_cpy16 = false;
         ctx->fused_hc_up_mix = false;
         ctx->fused_hc_up_mix_cpy = false;
@@ -21399,6 +21780,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
                 op_srcs_fused_elementwise[hc_moe_front + 6] = cpy;
             } else if ((num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i))) {
+            uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+            vk_hc_boundary_chain hcb;
+            const int hcb_last = ggml_vk_can_fuse_hc_boundary(ctx, cgraph, i, hcb);
+            if (hcb_last > 0) {
+                // three outputs: post (the post SCALE), comb and the last node (the hc pre or its folded norm). The epilogue
+                // reads the whole flat residual of a token while it writes them, so no source may overlap any output.
+                ctx->num_additional_fused_ops = hcb_last - i;
+                ctx->fused_hc_boundary = true;
+                ctx->hc_boundary = hcb.m;
+                ctx->fused_ops_write_mask |= (1 << (hcb.m.post_idx - i)) | (1 << (hcb.m.comb_idx - i));
+                fusion_string = hcb.m.rms2 ? "HC_BOUNDARY_NORM" : "HC_BOUNDARY";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
@@ -21753,19 +22147,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Check whether fusion would overwrite src operands while they're still in use.
         // If so, disable fusion.
         if (ctx->num_additional_fused_ops) {
-            // There are up to two output nodes - topk_moe has two.
+            // There are up to three output nodes - topk_moe has two, the hc boundary three.
             uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
-            ggml_tensor *output_nodes[2] {};
+            ggml_tensor *output_nodes[3] {};
             output_nodes[0] = cgraph->nodes[i + ctx->num_additional_fused_ops];
-            if (bits) {
-                int output_idx = find_first_set(bits);
-                GGML_ASSERT(bits == (1u << output_idx));
-                output_nodes[1] = cgraph->nodes[i + output_idx];
+            for (int j = 1; bits; ++j) {
+                GGML_ASSERT(j < 3);
+                const int output_idx = find_first_set(bits);
+                output_nodes[j] = cgraph->nodes[i + output_idx];
+                bits &= ~(1u << output_idx);
             }
 
             bool need_disable = false;
 
-            for (int j = 0; j < 2; ++j) {
+            for (int j = 0; j < 3; ++j) {
                 ggml_tensor *dst = output_nodes[j];
                 if (!dst) {
                     continue;
@@ -21823,6 +22218,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_norm_inj = false;
                 ctx->fused_hc_moe_epi = 0;
                 ctx->fused_extra_dst = nullptr;
+                ctx->fused_hc_boundary = false;
                 ctx->fused_mm_cpy16 = false;
                 ctx->fused_hc_up_mix = false;
                 ctx->fused_hc_up_mix_cpy = false;
@@ -22170,9 +22566,79 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         return cpy->op == GGML_OP_CPY && cpy->src[0] == last && cpy->type == GGML_TYPE_F16;
     };
 
+    // the fused hc boundary (ggml_vk_match_hc_boundary): every node's readers and index, built at the first candidate norm
+    std::unordered_map<const ggml_tensor *, std::vector<int>> hcb_readers;
+    std::unordered_map<const ggml_tensor *, int> hcb_index;
+    bool hcb_maps = false;
+    auto const &hcb_users = [&](const ggml_tensor * t, int * idx, int max) -> int {
+        auto it = hcb_readers.find(t);
+        if (it == hcb_readers.end()) {
+            return 0;
+        }
+        const int n = (int) it->second.size();
+        for (int k = 0; k < std::min(n, max); ++k) {
+            idx[k] = it->second[k];
+        }
+        return n;
+    };
+
     while (first_unused < graph->n_nodes) {
         std::vector<int> current_set;
 
+        // the fused hc boundary: emit the chain in the order graph_compute matches, the post and comb chains (llama emits
+        // them after the attention block) moved up behind the mix GEMM. Only when every source the chain reads outside
+        // itself is already scheduled.
+        if (graph->nodes[first_unused]->op == GGML_OP_RMS_NORM && ggml_vk_fuse_hc_boundary_enabled() && !ctx->device->disable_fusion) {
+            if (!hcb_maps) {
+                for (int n = 0; n < graph->n_nodes; ++n) {
+                    hcb_index[graph->nodes[n]] = n;
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                        if (graph->nodes[n]->src[s]) {
+                            hcb_readers[graph->nodes[n]->src[s]].push_back(n);
+                        }
+                    }
+                }
+                hcb_maps = true;
+            }
+            vk_hc_boundary_chain c;
+            if (ggml_vk_match_hc_boundary(ctx, graph, first_unused, hcb_users, false, c)) {
+                int idx[vk_hc_boundary_chain::MAX_NODES];
+                bool ready = true;
+                for (int k = 0; k < c.count && ready; ++k) {
+                    auto it = hcb_index.find(c.nodes[k]);
+                    if (it == hcb_index.end() || (used[it->second] && c.nodes[k]->op != GGML_OP_VIEW)) {
+                        ready = false;
+                        break;
+                    }
+                    idx[k] = it->second;
+                    for (int s = 0; s < GGML_MAX_SRC && ready; ++s) {
+                        const ggml_tensor * src = c.nodes[k]->src[s];
+                        auto si = src ? hcb_index.find(src) : hcb_index.end();
+                        if (si == hcb_index.end() || used[si->second]) {
+                            continue;   // a leaf, a node of another split, or scheduled
+                        }
+                        ready = std::find(c.nodes, c.nodes + k, src) != c.nodes + k;
+                    }
+                }
+                if (ready) {
+                    for (int k = 0; k < c.count; ++k) {
+                        if (!used[idx[k]]) {
+                            new_order.push_back(graph->nodes[idx[k]]);
+                            used_node_set.insert(graph->nodes[idx[k]]);
+                            used[idx[k]] = true;
+                        }
+                    }
+                    // the prefill form writes the mix GEMM's dots into the MUL_MAT's own buffer and the epilogue reads them while it
+                    // writes the outputs: keep that buffer allocated through the chain's last node
+                    if (params && params->add_alloc_dep) {
+                        params->add_alloc_dep(params->user_data, c.m.mm, graph->nodes[idx[c.count - 1]]);
+                    }
+                    while (first_unused < graph->n_nodes && used[first_unused]) {
+                        first_unused++;
+                    }
+                    continue;
+                }
+            }
         // (a chain whose members were already taken by another rule is left to the normal path: it then runs unfused)
         const int qsa_len = qsa_expand_len.empty() ? 0 : qsa_expand_len[first_unused];
         bool qsa_free = qsa_len > 0;

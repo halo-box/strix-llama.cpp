@@ -1025,6 +1025,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_decode_prefetch_q;
     vk_pipeline pipeline_count_equal_i32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
+    // fused DeepSeek-V4 hc boundary: split-K mix dots [tile], then the per-token epilogue [norm folded][n_embd / 512 - 1]
+    vk_pipeline pipeline_dsv4_hc_mix[2];
+    vk_pipeline pipeline_dsv4_hc_boundary[2][8];
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -1467,6 +1470,25 @@ struct ggml_backend_vk_context {
     bool fused_hc_post_gate {};
     // hc combine + next hc norm (dsv4_hc_post_norm.comp): HC_POST_NORM_* modes, 0 = none
     int fused_hc_post_norm {};
+    // DeepSeek-V4 hc boundary (dsv4_hc_mix.comp + dsv4_hc_boundary.comp): RMS_NORM(flat) .. DSV4_HC_PRE (+ RMS_NORM + MUL)
+    bool fused_hc_boundary {};
+    struct hc_boundary_match {
+        const ggml_tensor * x;       // the flat residual [hc * n_embd, n_tokens] (the RMS_NORM's source)
+        const ggml_tensor * w;       // hc_fn [hc * n_embd, 24]
+        const ggml_tensor * scale;   // hc_scale [3]
+        const ggml_tensor * base;    // hc_base [24]
+        const ggml_tensor * gamma;   // the folded norm's weight [n_embd], or null
+        const ggml_tensor * rms;     // the flat RMS_NORM (eps)
+        const ggml_tensor * pre_sc;  // the pre SCALE (multiply-add params)
+        ggml_tensor * post;          // the post SCALE [hc, n_tokens]
+        ggml_tensor * comb;          // DSV4_HC_COMB [hc, hc, n_tokens]
+        const ggml_tensor * hc_pre;  // DSV4_HC_PRE (scale)
+        const ggml_tensor * rms2;    // the folded RMS_NORM (eps), or null
+        ggml_tensor * out;           // DSV4_HC_PRE, or the folded norm's MUL
+        int last;                    // node index of the last fused node
+        int post_idx, comb_idx;      // node indices of the two side outputs
+        ggml_tensor * mm;            // the mix MUL_MAT: its buffer takes the prefill GEMM's dots (kept allocated by graph_optimize)
+    } hc_boundary {};
     // MUL_MAT+CPY(f16): the matmul stores f16 into the cast's destination
     bool fused_mm_cpy16 {};
     bool fused_hc_up_mix {};   // MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) -> one int8 MMQ GEMM with the mix epilogue
