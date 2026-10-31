@@ -744,6 +744,15 @@ struct vk_device_struct {
     vk_device_architecture architecture;
     std::unique_ptr<vk_queue> compute_queue;
     std::unique_ptr<vk_queue> transfer_queue;
+    // decode weight prefetch from a second compute queue (GGML_VK_DECODE_PREFETCH_Q): a VkQueue of its own in the compute
+    // family (its own kernel scheduler entity, so it runs beside compute_queue), plus VK_AMD_buffer_marker for the phase word
+    std::unique_ptr<vk_queue> prefetch_queue;
+    // called before the host waits on the device or creates / frees device memory. It ends a resident side dispatch of the decode
+    // prefetch (a wait or a VA update covers every job in flight, so the side dispatch would hold it until its poll bound)
+    void (*prefetch_q_quiesce)(void *) = nullptr;
+    void * prefetch_q_quiesce_ctx = nullptr;
+    bool buffer_marker = false;
+    PFN_vkCmdWriteBufferMarkerAMD pfn_vkCmdWriteBufferMarkerAMD {};
     bool single_queue;
     bool support_async;
     bool async_use_transfer_queue;
@@ -1010,6 +1019,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_cumsum_multipass1_f32;
     vk_pipeline pipeline_cumsum_multipass2_f32;
     vk_pipeline pipeline_argmax_f32;
+    vk_pipeline pipeline_decode_prefetch;
+    vk_pipeline pipeline_decode_prefetch_q;
     vk_pipeline pipeline_count_equal_i32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
@@ -1380,6 +1391,29 @@ struct ggml_backend_vk_context {
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
     std::vector<const ggml_tensor *> unsynced_nodes_read;
+    // decode weight prefetch (GGML_VK_DECODE_PREFETCH): per node, the next dense weight mat-vec (-1: none before an expert
+    // mat-vec) and the bytes of its weight already touched; touched bytes not yet read; per barrier group whether it already
+    // holds a big weight read or a touch
+    std::vector<int32_t> pf_next;
+    std::vector<size_t> pf_touched;
+    size_t pf_inflight {};
+    bool pf_active {};
+    bool pf_group_weight {}, pf_group_touched {};
+    // decode weight prefetch on a second queue (GGML_VK_DECODE_PREFETCH_Q): per node its dense target ordinal (-1: not one) and
+    // the next target at or after it (-1: an expert mat-vec comes first); the target whose window is open; the phase epoch;
+    // the side dispatch resources (two slots used alternately, each with its plan buffer, command buffer and fence)
+    std::vector<int32_t> prefetch_q_target, prefetch_q_next;
+    bool prefetch_q_active {};
+    bool prefetch_q_after_weight {};
+    int32_t prefetch_q_open = -1;
+    uint32_t prefetch_q_epoch {};
+    bool prefetch_q_init_done {}, prefetch_q_ok {};
+    vk_buffer prefetch_q_flag;
+    struct prefetch_q_slot_t { vk_buffer plan; vk::CommandBuffer cb; vk::Fence fence; vk::DescriptorSet ds; uint32_t epoch = 0; bool pending = false; };
+    prefetch_q_slot_t prefetch_q_slots[2];
+    uint32_t prefetch_q_slot_idx {};
+    vk::CommandPool prefetch_q_pool;
+    vk::DescriptorPool prefetch_q_dpool;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.

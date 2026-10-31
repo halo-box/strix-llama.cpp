@@ -50,6 +50,9 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
                                        void *import_ptr = nullptr) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
+    if (device->prefetch_q_quiesce != nullptr) {
+        device->prefetch_q_quiesce(device->prefetch_q_quiesce_ctx);
+    }
     if (size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
     }
@@ -260,6 +263,9 @@ void ggml_vk_destroy_buffer(vk_buffer& buf) {
 
     if (buf->device != nullptr) {
         buf->device->memory_logger->log_deallocation(buf);
+        if (buf->device->prefetch_q_quiesce != nullptr && buf.use_count() == 1) {
+            buf->device->prefetch_q_quiesce(buf->device->prefetch_q_quiesce_ctx);
+        }
     }
 
     buf.reset();
