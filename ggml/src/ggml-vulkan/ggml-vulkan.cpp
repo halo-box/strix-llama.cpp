@@ -4535,6 +4535,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->properties.limits.maxComputeWorkGroupInvocations >= 512) {
         ggml_vk_create_pipeline(device, device->pipeline_qsa_expand[0], "qsa_expand_sort", qsa_expand_len, qsa_expand_data, "main", 5, sizeof(vk_op_qsa_expand_push_constants), {1, 1, 1}, {256, 0}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_qsa_expand[1], "qsa_expand_rank", qsa_expand_len, qsa_expand_data, "main", 5, sizeof(vk_op_qsa_expand_push_constants), {1, 1, 1}, {512, 1}, 1);
+    // QSA_RADIX_SELECT: 512 invocations, the row's keys staged in 48 KiB of shared memory (topk_radix_lds.comp)
+    {
+        const uint32_t BLOCK_SIZE = 512;
+        const size_t shmem = QSA_RADIX_SELECT_MAX_COLS * sizeof(uint32_t) + 256 * sizeof(uint32_t) + 2 * 32 * sizeof(uint32_t) + 2 * sizeof(uint32_t);
+        if (device->subgroup_arithmetic && device->subgroup_ballot && device->subgroup_vote && device->subgroup_require_full_support &&
+            device->properties.limits.maxComputeWorkGroupInvocations >= BLOCK_SIZE && BLOCK_SIZE / device->subgroup_size <= 32 &&
+            shmem <= device->properties.limits.maxComputeSharedMemorySize) {
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_lds, "topk_radix_lds_f32", topk_radix_lds_f32_len, topk_radix_lds_f32_data, "main", 2, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, device->subgroup_size, QSA_RADIX_SELECT_MAX_COLS}, 1, true, true, device->subgroup_size);
+            // QSA_PREFILL_SELECT at 8k context (~2.5k values per row): a third of the shared memory, so more rows per CU
+            ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_lds_small, "topk_radix_lds_small_f32", topk_radix_lds_f32_len, topk_radix_lds_f32_data, "main", 2, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, device->subgroup_size, QSA_PREFILL_SELECT_SMALL_COLS}, 1, true, true, device->subgroup_size);
+        }
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -15358,10 +15369,84 @@ void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, const gg
     }
 }
 
+// QSA_RADIX_SELECT: top-k of at most 8 rows of at most QSA_RADIX_SELECT_MAX_COLS values in one dispatch
+// (topk_radix_lds.comp), in place of the n-ary tournament's dependent passes (one per 1024-value halving of the row). It is
+// the qwen4exp QSA block selection at decode and MTP verify: k = 512 of n_kv / 4 blocks, 3 passes at 8k context, 5 at 32k.
+// GGML_VK_QSA_RADIX_SELECT=0 disables it; =2 takes it for every top-k that fits (k <= ncols <= the cap, <= 8 rows), for tests.
+static int ggml_vk_qsa_radix_select_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_VK_QSA_RADIX_SELECT");
+        return e == nullptr ? 1 : atoi(e);
+    }();
+    return mode;
+}
+
+static bool ggml_vk_use_qsa_radix_select(const vk_device & device, uint32_t ncols, uint32_t nrows, uint32_t k) {
+    const int mode = ggml_vk_qsa_radix_select_mode();
+    if (mode == 0 || device->pipeline_topk_radix_lds == nullptr || nrows > 8 || ncols > QSA_RADIX_SELECT_MAX_COLS || k > ncols || k == 0) {
+        return false;
+    }
+    if (mode == 2) {
+        return true;
+    }
+    // the shapes where the tournament takes more than one pass (more than one 1024-wide workgroup per row)
+    return ncols > 1024 && k >= 256 && k < 1024;
+}
+
+// QSA_PREFILL_SELECT: the same one-dispatch select (topk_radix_lds.comp, one workgroup per row) for many rows, the qwen4exp
+// QSA block selection of a prefill strip: k = 512 of n_kv / 4 blocks for each of 512 queries. The tournament runs it as
+// 3 (8k context) to 5 (32k) dependent passes that each read and write every row through global memory. Rows of up to
+// QSA_PREFILL_SELECT_SMALL_COLS values use the 16 KiB key buffer, so several workgroups share a CU.
+// GGML_VK_QSA_PREFILL_SELECT=0 disables it; =2 takes it for every top-k of more than 8 rows that fits (tests).
+static int ggml_vk_qsa_prefill_select_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_VK_QSA_PREFILL_SELECT");
+        return e == nullptr ? 1 : atoi(e);
+    }();
+    return mode;
+}
+
+static vk_pipeline ggml_vk_qsa_prefill_select_pipeline(const vk_device & device, uint32_t ncols, uint32_t nrows, uint32_t k) {
+    const int mode = ggml_vk_qsa_prefill_select_mode();
+    if (mode == 0 || device->pipeline_topk_radix_lds == nullptr || nrows <= 8 || ncols > QSA_RADIX_SELECT_MAX_COLS || k > ncols || k == 0) {
+        return nullptr;
+    }
+    if (mode != 2 && !(ncols > 1024 && k >= 256 && k < 1024)) {
+        return nullptr;
+    }
+    if (mode != 3 && ncols <= QSA_PREFILL_SELECT_SMALL_COLS && device->pipeline_topk_radix_lds_small != nullptr) {
+        return device->pipeline_topk_radix_lds_small;
+    }
+    return device->pipeline_topk_radix_lds;
+}
+
 void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     uint32_t ncols = src0->ne[0];
     uint32_t nrows = ggml_nrows(src0);
     uint32_t k = dst->ne[0];
+
+    vk_pipeline lds_pipeline = nullptr;
+    const char * lds_path = nullptr;
+    if (ggml_vk_use_qsa_radix_select(ctx->device, ncols, nrows, k)) {
+        lds_pipeline = ctx->device->pipeline_topk_radix_lds;
+        lds_path = "QSA_RADIX_SELECT";
+    } else if ((lds_pipeline = ggml_vk_qsa_prefill_select_pipeline(ctx->device, ncols, nrows, k)) != nullptr) {
+        lds_path = "QSA_PREFILL_SELECT";
+    }
+    if (lds_pipeline) {
+        // reads src0 and writes dst only (no prealloc_x scratch), so no scratch sync either way
+        vk_op_topk_radix_push_constants pc { ncols, k, nrows, 0, 0, 0 };
+        std::array<uint32_t, 3> elements {
+            lds_pipeline->wg_denoms[0],
+            std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
+            1,
+        };
+        ggml_pipeline_request_descriptor_sets(ctx, lds_pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, lds_pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, dst) }, pc, elements);
+        ggml_vk_path_census_add(lds_path);
+        return;
+    }
 
     // tournament path is faster where it fits; use radix-select only past its k limit
     const uint32_t k_min_pipeline = std::max((uint32_t) log2f(float(k)) + 1, ctx->device->subgroup_size_log2);
@@ -19083,6 +19168,10 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
     const vk_device & dev = ctx->device;
     const std::string l = label;
+    // dispatch paths (not fusions): GGML_VK_DISABLE_FUSION does not turn them off
+    if (l == "path:QSA_RADIX_SELECT" || l == "path:QSA_PREFILL_SELECT") {
+        return dev->pipeline_topk_radix_lds ? nullptr : "no LDS radix select pipeline (subgroup arithmetic, ballot, vote, full subgroups, 50 KiB shared memory)";
+    }
     if (dev->disable_fusion) {
         return "fusion disabled (GGML_VK_DISABLE_FUSION)";
     }

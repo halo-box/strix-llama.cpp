@@ -9256,6 +9256,44 @@ struct test_argsort : public test_case {
 };
 
 // GGML_OP_TOP_K
+// Vulkan QSA_RADIX_SELECT engagement (GGML_VK_TEST_REQUIRE_QSA_RADIX_SELECT=1): GGML_VK_QSA_RADIX_SELECT unset or 1 takes the
+// one-dispatch LDS select for <= 8 rows of 1025..12288 values with 256 <= k < 1024; =2 for every top-k with k <= ncols <= 12288
+// and <= 8 rows; =0 for none
+static bool qsa_radix_select_engaged(ggml_backend_t backend, int64_t ncols, int64_t nrows, int64_t k, std::string & msg) {
+    if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_RADIX_SELECT", "path:QSA_RADIX_SELECT")) {
+        return true;
+    }
+    const char * e = getenv("GGML_VK_QSA_RADIX_SELECT");
+    const int mode = e == nullptr ? 1 : atoi(e);
+    const bool fits = mode != 0 && nrows <= 8 && ncols <= 12288 && k >= 1 && k <= ncols;
+    const int64_t want = fits && (mode == 2 || (ncols > 1024 && k >= 256 && k < 1024)) ? 1 : 0;
+    const int64_t got = dispatch_census_count(backend, "path:QSA_RADIX_SELECT");
+    if (got != want) {
+        msg = "path:QSA_RADIX_SELECT dispatches: " + std::to_string(got) + " (expected " + std::to_string(want) + ")";
+        return false;
+    }
+    return true;
+}
+
+// Vulkan QSA_PREFILL_SELECT engagement (GGML_VK_TEST_REQUIRE_QSA_PREFILL_SELECT=1): GGML_VK_QSA_PREFILL_SELECT unset, 1 or 3 takes
+// the same LDS select for more than 8 rows of 1025..12288 values with 256 <= k < 1024; =2 for every top-k of more than 8 rows with
+// k <= ncols <= 12288; =0 for none
+static bool qsa_prefill_select_engaged(ggml_backend_t backend, int64_t ncols, int64_t nrows, int64_t k, std::string & msg) {
+    if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_PREFILL_SELECT", "path:QSA_PREFILL_SELECT")) {
+        return true;
+    }
+    const char * e = getenv("GGML_VK_QSA_PREFILL_SELECT");
+    const int mode = e == nullptr ? 1 : atoi(e);
+    const bool fits = mode != 0 && nrows > 8 && ncols <= 12288 && k >= 1 && k <= ncols;
+    const int64_t want = fits && (mode == 2 || (ncols > 1024 && k >= 256 && k < 1024)) ? 1 : 0;
+    const int64_t got = dispatch_census_count(backend, "path:QSA_PREFILL_SELECT");
+    if (got != want) {
+        msg = "path:QSA_PREFILL_SELECT dispatches: " + std::to_string(got) + " (expected " + std::to_string(want) + ")";
+        return false;
+    }
+    return true;
+}
+
 struct test_top_k : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -9279,6 +9317,12 @@ struct test_top_k : public test_case {
     // When there are ties, only validate the final result.
     // The logic in err can't handle the sentinel tensors.
     bool run_whole_graph() override { return ties; }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        return qsa_radix_select_engaged(backend, ne[0], ne[1] * ne[2] * ne[3], k, msg) &&
+               qsa_prefill_select_engaged(backend, ne[0], ne[1] * ne[2] * ne[3], k, msg);
+    }
 
     double err(const float * a, const float * b, size_t n) override {
         // When there are no ties, we expect the exact same set of indices,
@@ -9477,6 +9521,65 @@ struct test_top_k_stable_ties : public test_top_k {
         const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
         // Other backends may legitimately choose a different subset of equal-valued columns.
         return strcmp(reg, "ROCm") == 0 ? 0.0 : double(k * ne[1]);
+    }
+};
+
+// The set the Vulkan top-k paths choose, checked exactly: the k largest values, NaN-free, with ties at the k-th value going to
+// the lowest indices (the n-ary tournament's rule, and QSA_RADIX_SELECT's). Rows hold many duplicate values and end in an
+// invisible -inf tail (QSA blocks past the query: the k-th value is -inf when fewer than k columns are visible). Run it with
+// GGML_VK_QSA_RADIX_SELECT=0 and =1 (or 2): both passing means both paths pick the same set. Not for k = 1: the tournament's
+// k = 1 max reduction does not keep the lowest index among equal maxima.
+struct test_top_k_exact_set : public test_top_k {
+    const int64_t visible;
+    const int64_t step; // row r sees min(cols, visible + r * step) values (a causal prefill strip when step > 0)
+    test_top_k_exact_set(int64_t cols, int64_t rows, int k, int64_t visible, int64_t step = 0)
+        : test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, k, true), visible(visible), step(step) {}
+    std::string vars() override {
+        return test_top_k::vars() + ",visible=" + std::to_string(visible) + (step ? ",step=" + std::to_string(step) : "") + ",exact_set=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(0xbeef);
+        std::uniform_int_distribution<int> dist(0, std::max<int>(1, (int) (visible / 8)));
+        std::vector<float> data(ggml_nelements(input));
+        for (int64_t r = 0; r < ggml_nrows(input); ++r) {
+            const int64_t vis = std::min<int64_t>(ne[0], visible + r * step);
+            for (int64_t i = 0; i < ne[0]; ++i) {
+                data[r * ne[0] + i] = i < vis ? 0.25f * (float) dist(rng) - 3.0f : -INFINITY;
+            }
+        }
+        ggml_backend_tensor_set(input, data.data(), 0, data.size() * sizeof(float));
+    }
+
+    // a is the backend under test: compare its sorted picks with the stable top-k computed here
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_UNUSED(b);
+        if (n != size_t(ggml_nrows(input) * k)) return 1.0;
+        std::vector<float> src(ggml_nelements(input));
+        ggml_backend_tensor_get(input, src.data(), 0, src.size() * sizeof(float));
+        double diff = 0.0;
+        for (int64_t r = 0; r < ggml_nrows(input); ++r) {
+            std::vector<int32_t> order(ne[0]);
+            for (int64_t i = 0; i < ne[0]; ++i) order[i] = (int32_t) i;
+            const float * v = src.data() + r * ne[0];
+            std::stable_sort(order.begin(), order.end(), [v](int32_t x, int32_t y) { return v[x] > v[y]; });
+            std::vector<int32_t> want(order.begin(), order.begin() + k);
+            std::vector<int32_t> got(k);
+            for (int i = 0; i < k; ++i) {
+                got[i] = (int32_t) a[r * k + i];
+                if (a[r * k + i] != float(got[i])) return 1.0;
+            }
+            std::sort(want.begin(), want.end());
+            std::sort(got.begin(), got.end());
+            for (int i = 0; i < k; ++i) diff += want[i] != got[i] ? 1.0 : 0.0;
+        }
+        return diff;
+    }
+
+    // the tie rule is Vulkan's (and ROCm's radix); other backends may pick another subset of equal values
+    double max_err(ggml_backend_t backend) override {
+        const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        return strcmp(reg, "Vulkan") == 0 ? 0.0 : double(k * ne[1]);
     }
 };
 
@@ -15835,6 +15938,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int cols : {1025, 2047, 2048, 2049}) test_cases.emplace_back(new test_top_k_stable_ties(cols));
 
+    // QSA_RADIX_SELECT (Vulkan): the qwen4exp decode / MTP verify block selection, k = 512 of n_kv / 4 blocks (2112 at 8k context,
+    // 8256 at 32k), 1-8 rows. Widths not a multiple of the workgroup (512), the 12288 cap and one past it, 9 rows (the tournament
+    // again); ties, an -inf tail with fewer than k visible values, k = ncols and small k (these two only under =2)
+    for (int64_t cols : {1025, 2112, 4097, 8256, 12287, 12288, 12289}) {
+        for (int64_t rows : {1, 4, 8, 9}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 512));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 512, true));
+        }
+    }
+    for (int cols : {2112, 8256, 12288}) test_cases.emplace_back(new test_top_k_stable_ties(cols));
+    test_cases.emplace_back(new test_top_k_extreme(8256, 512));
+    test_cases.emplace_back(new test_top_k_inf({8256, 4, 1, 1}, 512));
+    for (auto sh : {std::array<int64_t, 4>{2112, 1, 512, 2112}, {2112, 4, 512, 300}, {2112, 4, 512, 513}, {8256, 1, 512, 8000},
+                    {8256, 4, 512, 511}, {8256, 8, 256, 8256}, {4097, 3, 1023, 4097}, {12288, 2, 512, 12000},
+                    {2112, 1, 2112, 2112}, {2112, 2, 2112, 1500}, {700, 4, 700, 690}, {5000, 2, 7, 5000},
+                    {33, 5, 33, 20}, {9000, 1, 1100, 9000}}) {
+        test_cases.emplace_back(new test_top_k_exact_set(sh[0], sh[1], (int) sh[2], sh[3]));
+    }
+
+    // QSA_PREFILL_SELECT (Vulkan): the qwen4exp prefill block selection, k = 512 of n_kv / 4 blocks for each query of a 512-query
+    // strip (2176..2560 blocks at 8k context, 8320..8704 at 32k). Both key buffers (<= 4096 values: the small one), the 12288 cap
+    // and one past it, 9 rows (the fewest it takes), k = ncols and a single-pass width (the tournament unless =2)
+    for (int64_t cols : {512, 1024, 2176, 2560, 4096, 4097, 8320, 8704, 12288, 12289}) {
+        for (int64_t rows : {9, 512}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 512));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 512, true));
+        }
+    }
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2560, 64, 8, 1}, 512));   // rows over ne[2]
+    test_cases.emplace_back(new test_top_k_inf({8704, 64, 1, 1}, 512));
+    // causal strips: the visible blocks grow along the rows, some rows see fewer than k (their tail is -inf ties)
+    for (auto sh : {std::array<int64_t, 5>{2560, 512, 512, 300, 4}, {8704, 512, 512, 8192, 1}, {4096, 128, 512, 4096, 0},
+                    {8704, 64, 512, 200, 8}, {12288, 16, 300, 12000, 0}, {2176, 512, 512, 2048, 0}}) {
+        test_cases.emplace_back(new test_top_k_exact_set(sh[0], sh[1], (int) sh[2], sh[3], sh[4]));
+    }
+
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,  1, 1, 1 }, 1024));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 2048,  2, 1, 1 }, 1024));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 4096,  1, 1, 1 }, 2048));
@@ -17274,6 +17413,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // qwen4exp QSA block selection at 128k / 250k depth: 512 queries, 512 blocks each
     for (int64_t cols : {31250, 62500}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 512, 1, 1}, 512));
+    }
+    // qwen4exp QSA block selection of a 512-query prefill strip at 2k / 8k / 32k context (QSA_PREFILL_SELECT on Vulkan)
+    for (int64_t cols : {1024, 2176, 2560, 8320, 8704}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 512, 1, 1}, 512));
+    }
+    // qwen4exp QSA block selection at decode (1 row) and MTP n3 verify (4 rows), 8k / 32k context (QSA_RADIX_SELECT on Vulkan)
+    for (int64_t cols : {2112, 8256}) {
+        for (int64_t rows : {1, 4}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, rows, 1, 1}, 512));
+        }
     }
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
     for (auto k : {20, 40}) {
