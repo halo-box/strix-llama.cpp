@@ -47,6 +47,15 @@ layout(push_constant) uniform Parameters {
     float scale;
     uint K;
     uint nch;
+    uint qk_norm;     // q and k arrive un-normalised: x * qk_mul * rsqrt(mean(x^2) + qk_eps) per 128-row (the graph's
+    float qk_eps;     // RMS_NORM(eps) -> SCALE(qk_mul) l2 norms, skipped by the host)
+    float qk_mul;
+    // conv_fold: bindings 0 / 1 are the conv input x [C, T, S] (the qkv projection), not the SiLU output; q / k are
+    // silu(conv4(x)) of channels qc0 / kc0 + the view offset, as ssm_conv.comp MODE 1, with the conv state (binding 5,
+    // [3, C, S]) for tokens before 0 and the taps (binding 6, [4, C]). The host skips the SSM_CONV + SILU nodes.
+    uint conv_fold;
+    uint qc0, kc0, vc0;
+    uint conv_C;
 };
 
 layout(binding = 0) readonly  buffer QBuf    { float data_q[];    };
@@ -55,6 +64,27 @@ layout(binding = 2) readonly  buffer GBuf    { float data_g[];    };
 layout(binding = 3) readonly  buffer BetaBuf { float data_beta[]; };
 layout(binding = 4) writeonly buffer ScrBuf  { uint data_scr[];   };
 layout(binding = 4) writeonly buffer ScrBuf16 { float16_t data_scr16[]; };
+layout(binding = 5) readonly  buffer CStBuf  { float data_cst[];  };
+layout(binding = 6) readonly  buffer CWBuf   { float data_cw[];   };
+
+// silu(conv4) of channel c at token tt of sequence s, x element at xo: the same expressions as ssm_conv.comp MODE 1
+// (window from the conv state before token 0, one dot, SiLU), so the result is bit-identical to the SSM_CONV + SILU nodes
+float conv_silu_q(const bool is_k, const uint xo, const uint c, const uint tt, const uint s) {
+    const vec4 w = vec4(data_cw[4 * c], data_cw[4 * c + 1], data_cw[4 * c + 2], data_cw[4 * c + 3]);
+    float win[3];
+    [[unroll]] for (uint i = 0; i < 3; i++) {
+        const int t = int(tt) + int(i) - 3;
+        if (t < 0) {
+            win[i] = data_cst[s * 3 * conv_C + c * 3 + uint(t + 3)];
+        } else {
+            win[i] = is_k ? data_k[xo - (3 - i) * sq2] : data_q[xo - (3 - i) * sq2];
+        }
+    }
+    const float v = is_k ? data_k[xo] : data_q[xo];
+    float sum = dot(vec4(win[0], win[1], win[2], v), w);
+    sum = sum / (1.0f + exp(-sum));
+    return sum;
+}
 
 // half index of element (row, col) of a matrix with NCB 16-column blocks, in fragment-tile order
 #define FRAG_H(row, col, NCB) (((((row) / 16) * (NCB) + (col) / 16) * 16 + (row) % 16) * 16 + (col) % 16)
@@ -64,6 +94,7 @@ shared uint U[NVMAX * CL * AS > 2 * CL * QS ? NVMAX * CL * AS : 2 * CL * QS];
 shared float KK[CL * (CL + 1)];
 shared float QK[CL * (CL + 1)];
 shared float Gs[NVMAX][CL];
+shared vec2 NS[CL * S_V / 2 / 256][8];          // qk_norm: per-wave partial sums of k^2 and q^2 of each load step
 shared float Bs[NVMAX][CL];
 
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
@@ -84,17 +115,53 @@ void main() {
     const uint qk_scr = ((seq * nch + c) * neq1 + hk) * QKU;
     const uint tp_region = n_seqs * nch * neq1 * QKU;
 
-    // Q/K rows -> f16 pairs in LDS and in the scratch (Qh at +0, Kh at +CL*64)
-    for (uint p = tid; p < CL * S_V / 2; p += 256) {
+    // Q/K rows -> f16 pairs in LDS and in the scratch (Qh at +0, Kh at +CL*64). Load step i covers rows 4i..4i+3, one row
+    // per pair of waves (64 threads x 2 elements = 128)
+    const uint NSTEP = CL * S_V / 2 / 256;
+    vec2 kvs[NSTEP];
+    vec2 qvs[NSTEP];
+    [[unroll]] for (uint i = 0; i < NSTEP; i++) {
+        const uint p  = tid + 256 * i;
         const uint t  = p / (S_V / 2);
         const uint kp = p % (S_V / 2);
-        vec2 kv = vec2(0.0);
-        vec2 qv = vec2(0.0);
+        kvs[i] = vec2(0.0);
+        qvs[i] = vec2(0.0);
         if (t0 + t < n_tokens) {
             const uint off = iq3 * sq3 + (t0 + t) * sq2 + hk * sq1 + 2 * kp;
-            kv = vec2(data_k[off], data_k[off + 1]);
-            qv = vec2(data_q[off], data_q[off + 1]);
+            if (conv_fold != 0) {
+                const uint qc = qc0 + hk * sq1 + 2 * kp;
+                const uint kc = kc0 + hk * sq1 + 2 * kp;
+                kvs[i] = vec2(conv_silu_q(true,  kc0 + off,     kc,     t0 + t, iq3),
+                              conv_silu_q(true,  kc0 + off + 1, kc + 1, t0 + t, iq3));
+                qvs[i] = vec2(conv_silu_q(false, qc0 + off,     qc,     t0 + t, iq3),
+                              conv_silu_q(false, qc0 + off + 1, qc + 1, t0 + t, iq3));
+            } else {
+                kvs[i] = vec2(data_k[off], data_k[off + 1]);
+                qvs[i] = vec2(data_q[off], data_q[off + 1]);
+            }
         }
+    }
+    if (qk_norm != 0) {
+        [[unroll]] for (uint i = 0; i < NSTEP; i++) {
+            const vec2 ss = vec2(subgroupAdd(dot(kvs[i], kvs[i])), subgroupAdd(dot(qvs[i], qvs[i])));
+            if (lane == 0) {
+                NS[i][w] = ss;
+            }
+        }
+        barrier();
+        [[unroll]] for (uint i = 0; i < NSTEP; i++) {
+            const vec2 ss = NS[i][w & ~1u] + NS[i][w | 1u];
+            // as rms_norm.comp (inversesqrt(mean + eps)), then the SCALE as its own multiply
+            kvs[i] = (kvs[i] * inversesqrt(ss.x / float(S_V) + qk_eps)) * qk_mul;
+            qvs[i] = (qvs[i] * inversesqrt(ss.y / float(S_V) + qk_eps)) * qk_mul;
+        }
+    }
+    [[unroll]] for (uint i = 0; i < NSTEP; i++) {
+        const uint p  = tid + 256 * i;
+        const uint t  = p / (S_V / 2);
+        const uint kp = p % (S_V / 2);
+        const vec2 kv = kvs[i];
+        const vec2 qv = qvs[i];
         const uint ku = packFloat2x16(f16vec2(kv));
         const uint qu = packFloat2x16(f16vec2(qv));
         U[t * QS + kp]        = ku;

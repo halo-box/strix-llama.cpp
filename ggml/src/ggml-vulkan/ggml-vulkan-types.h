@@ -1429,6 +1429,16 @@ struct ggml_backend_vk_context {
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     bool fused_mmid_pair_glu {};   // MUL_MAT_ID+CPY(f16) x 2 + SWIGLU: gate, up and the SwiGLU in one weight-streaming launch
     bool fused_mmid_pair_glu_f32 {};   // ... its f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU
+    // chunked GDN with the q/k l2 norms in gdn_chunk_prep (rebuilt per graph by ggml_vk_gdn_qk_norm_prepass): the raw q/k
+    // views and norm constants per GATED_DELTA_NET node, and the RMS_NORM / SCALE nodes that then do not run
+    struct gdn_qk_norm { const ggml_tensor * q_raw; const ggml_tensor * k_raw; float eps; float mul; };
+    std::unordered_map<const ggml_tensor *, gdn_qk_norm> gdn_qk;
+    std::unordered_set<const ggml_tensor *> gdn_qk_skip;
+    // chunked GDN with the conv + SiLU in gdn_chunk_prep / gdn_chunk_scan (ggml_vk_gdn_conv_fold_prepass, GGML_VK_GDN_CONVFOLD):
+    // the conv input x, its state and taps and the q / k / v channel offsets per GATED_DELTA_NET node; the SSM_CONV + SILU
+    // nodes go into gdn_qk_skip
+    struct gdn_conv_fold { const ggml_tensor * x; const ggml_tensor * state; const ggml_tensor * kern; uint32_t C, qc0, kc0, vc0; };
+    std::unordered_map<const ggml_tensor *, gdn_conv_fold> gdn_cf;
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {

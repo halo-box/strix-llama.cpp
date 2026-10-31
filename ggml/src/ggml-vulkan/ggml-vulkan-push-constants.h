@@ -790,7 +790,16 @@ struct vk_op_gated_delta_net_push_constants {
 struct vk_op_gdn_chunk_push_constants {
     vk_op_gated_delta_net_push_constants gdn;
     uint32_t nch;
+    uint32_t qk_norm;   // prep: q and k are the raw views, l2-normalised on load (x * qk_mul * rsqrt(mean(x^2) + qk_eps))
+    float    qk_eps;
+    float    qk_mul;
+    // conv_fold (GGML_VK_GDN_CONVFOLD): q / k / v are silu(conv4(x)) computed on load from the conv input x, conv state and
+    // taps (prep bindings 0, 1, 5, 6; scan bindings 0, 4, 5); qc0 / kc0 / vc0 are the q / k / v view offsets in x (floats)
+    uint32_t conv_fold;
+    uint32_t qc0, kc0, vc0;
+    uint32_t conv_C;
 };
+static_assert(sizeof(vk_op_gdn_chunk_push_constants) <= 128);
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
