@@ -709,10 +709,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
 
-    // For MLA K and V have the same data.
-    // Therefore, iterate over K in reverse and later re-use the data if possible.
+    // Keep the stock K accumulation order for narrow RDNA3.5 stages.
+#if defined(RDNA3_5)
+    constexpr bool forward_k = !V_is_K_view && nbatch_K2 < DKQ/2 && ggml_cuda_fattn_mma_use_spill_fix(DKQ, ncols1, ncols2, use_logit_softcap);
+#else
+    constexpr bool forward_k = false;
+#endif
+    constexpr int last_k_stage = (DKQ/2-1) - (DKQ/2-1) % nbatch_K2;
 #pragma unroll
-    for (int k0_start = (DKQ/2-1) - (DKQ/2-1) % nbatch_K2; k0_start >= 0; k0_start -= nbatch_K2) {
+    for (int k0_start = forward_k ? 0 : last_k_stage; forward_k ? k0_start < DKQ/2 : k0_start >= 0; k0_start += forward_k ? nbatch_K2 : -nbatch_K2) {
         const int k0_stop = k0_start + nbatch_K2 < DKQ/2 ? k0_start + nbatch_K2 : DKQ/2;
 
         if constexpr (nstages <= 1) {
