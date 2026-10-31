@@ -1580,10 +1580,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_build_forward_expand(gf, blk_cells);
         ggml_build_forward_expand(gf, tail_idxs);
     }
-    // the per-block bias of split streams too: a strip reads a strided view of it, and the scheduler would copy each
-    // view of the host input with its whole span (n_stream rows of n_tps queries) and keep every copy of the graph alive
+    // the per-block bias (or the compact limits) of split streams too: a strip reads strided views of it, and the
+    // scheduler would copy each view of the host input with its whole span (all n_stream rows) and keep every copy of
+    // the graph alive. The compact limits are read twice per strip (block starts and tails), even with one strip
     ggml_tensor * bias_all = inp->bias;
-    if (!inp->compact && bias_all && n_stream > 1 && strip < n_tps) {
+    if (bias_all && n_stream > 1 && (inp->compact || strip < n_tps)) {
         bias_all = ggml_cont(ctx0, bias_all);
         ggml_build_forward_expand(gf, bias_all);
     }
@@ -1625,7 +1626,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // one value per block, so it is cheaper to bias here than after the cells are expanded
         if (inp->compact) {
-            score = qwen4exp_apply_compact_visibility(ctx0, score, inp->bias, n_blocks, n_seq, n_tps, first, n_query);
+            score = qwen4exp_apply_compact_visibility(ctx0, score, bias_all, n_blocks, n_seq, n_tps, first, n_query);
         } else if (blk_bias) {
             score = ggml_add(ctx0, score, bias);
         }
