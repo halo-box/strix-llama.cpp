@@ -1209,10 +1209,8 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         }
     }
 
-    // add the device default buffer type
-    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
-
-    // add the device extra buffer type (if any)
+    // add the device extra buffer types (if any) before the default one, as for the CPU: an extra buffer type takes only the
+    // tensors its supports_op accepts (e.g. the Vulkan expert repack buffer), the rest fall through to the default
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     if (reg) {
         auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
@@ -1226,6 +1224,9 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
             }
         }
     }
+
+    // add the device default buffer type
+    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
 
     return buft_list;
 }
