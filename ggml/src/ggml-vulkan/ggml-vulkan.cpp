@@ -8243,6 +8243,44 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
     return 2 * waves_xl <= waves_l;
 }
 
+static uint32_t ggml_vk_hc_w8a8_tile();
+
+// GGML_VK_RAGGED_XL (default 1 on AMD with the prefetch tiles, =0 off): a dense GEMM whose n is just past a 256 multiple runs the n % 256 tail columns as a second
+// dispatch when the wave model below says that is cheaper (ggml_vk_mul_mat_q_f16). GGML_VK_RAGGED_TAIL: largest tail split (default 128).
+// The wave model below is fitted to the AMD register-prefetch tiles (gfx1151, RADV), so the split is gated to that path.
+static bool ggml_vk_ragged_split_enabled(const vk_device & device) {
+    static const bool on = [] { const char * e = getenv("GGML_VK_RAGGED_XL"); return e ? atoi(e) != 0 : true; }();
+    return on && device->vendor_id == VK_VENDOR_ID_AMD && ggml_vk_mm_prefetch_enabled(device);
+}
+static uint32_t ggml_vk_ragged_tail_max() {
+    static const uint32_t v = [] { const char * e = getenv("GGML_VK_RAGGED_TAIL"); return e ? (uint32_t) std::max(atoi(e), 0) : 128u; }();
+    return v;
+}
+// Wave model of one dispatch, in units of one wave of 128x128 tiles: 2 workgroups per CU, the 256x256 XL tile 1 per CU at twice the
+// time (the premise of ggml_vk_mm_xl_ok); smaller tiles cost their area, at least a quarter wave (they stream A just the same),
+// a tail's thin tiles at least GGML_VK_RAGGED_TAIL_W.
+static bool ggml_vk_ragged_force() {   // GGML_VK_RAGGED_FORCE=1: split every eligible ragged n, skipping the wave model (probe)
+    static const bool v = [] { const char * e = getenv("GGML_VK_RAGGED_FORCE"); return e && atoi(e) != 0; }();
+    return v;
+}
+static uint32_t ggml_vk_ragged_hc_tile() {   // GGML_VK_RAGGED_HC_TILE: hc W8A8 tile index of a tail dispatch (default: the main one)
+    static const int v = [] { const char * e = getenv("GGML_VK_RAGGED_HC_TILE"); return e ? atoi(e) : -1; }();
+    return v >= 0 ? (uint32_t) v : ggml_vk_hc_w8a8_tile();
+}
+static double ggml_vk_ragged_tail_w() {   // GGML_VK_RAGGED_TAIL_W: least cost of one wave of tail tiles, in 128x128 waves (default 0.1)
+    static const double v = [] { const char * e = getenv("GGML_VK_RAGGED_TAIL_W"); return e ? atof(e) : 0.1; }();
+    return v;
+}
+static double ggml_vk_ragged_cost(const ggml_backend_vk_context * ctx, const vk_pipeline & p, uint32_t m, uint32_t n, uint32_t batch, bool tail = false) {
+    const uint32_t cu = std::max(ctx->device->shader_core_count, 1u);
+    const uint32_t bm = p->wg_denoms[0], bn = p->wg_denoms[1];
+    const bool xl = bm >= 256 && bn >= 256;
+    const uint64_t tiles = (uint64_t) CEIL_DIV(m, bm) * CEIL_DIV(n, bn) * std::max(batch, 1u);
+    const uint64_t waves = CEIL_DIV(tiles, (uint64_t) (xl ? cu : 2 * cu));
+    const double w = xl ? 2.0 : std::max(tail ? ggml_vk_ragged_tail_w() : 0.25, (double) bm * bn / (128.0 * 128.0));
+    return (double) waves * w;
+}
+
 // Whether an XL pipeline spills depends on the GPU and the compiler (gfx1150 / Mesa 26.1.6: 179 spilled VGPRs, 10-14x slower);
 // where it does, the L tile is kept. Decided from the compiled pipeline's statistics; GGML_VK_MM_XL=2 skips the check.
 static bool ggml_vk_mm_xl_spills(vk_device & device, vk_pipeline & pipeline) {
@@ -8563,58 +8601,101 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     GGML_ASSERT(mmp_map != nullptr);
 
-    const uint32_t kalign = quantize_y ? 1 : ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, ne11, false);
-    const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, kalign);
-    // a row-strided B read in place: the aligned shaders load B rows at multiples of stride_b
-    const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8 &&
-                         (!y_rowstride || (src1->nb[1] / sizeof(ggml_fp16_t)) % kalign == 0);
-
-    vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
     // f16q: B is the f16 src1 read in place (y_kernel_type F16, no reformat), the pipeline quantizes it in its load
     GGML_ASSERT(!hcd_f16q || (y_kernel_type == GGML_TYPE_F16 && !y_needs_reformat && !qx_needs_dequant));
-    if ((hcd_f16q || (hcd && quantize_y)) && !qx_needs_dequant) {
-        vk_matmul_pipeline_key kh{GGML_TYPE_Q8_0, hcd_f16q ? GGML_TYPE_F16 : GGML_TYPE_Q8_1, false, false};
-        kh.hcd = true;
-        const auto & hv = ctx->device->pipeline_matmul.at(kh);
-        pipeline = hv[std::min<size_t>(ggml_vk_hc_w8a8_tile(), hv.size() - 1)].unaligned;
+    const bool hcd_route = (hcd_f16q || (hcd && quantize_y)) && !qx_needs_dequant;
+    if (hcd_route) {
         ggml_vk_path_census_add("MUL_MAT_HC_W8A8");
         if (hcd_f16q) {
             ggml_vk_path_census_add("MUL_MAT_HC_W8A8_F16Q");
         }
     }
 
-    // XL tier of the register-prefetch pipelines (aligned, dense, quantized A on the f16-B coopmat path only)
-    if (aligned && !quantize_y && !qx_needs_dequant && !d16 && !hcd_f16q && ggml_vk_mm_prefetch_type(src0->type) &&
-        ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mm_xl_ok(ctx, src0->type, ne01, ne11, ne10)) {
-        const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0]);
-        vk_matmul_pipeline_key kx{src0->type, y_kernel_type, false, f16acc, false, false, true, true};
-        auto itx = ctx->device->pipeline_matmul.find(kx);
-        if (itx == ctx->device->pipeline_matmul.end() || itx->second.empty()) {
-            kx.f16acc = !f16acc;
-            itx = ctx->device->pipeline_matmul.find(kx);
+    // the pipeline for a dispatch of n columns (tile selector, hc tile, XL gate); a ragged n may run as two dispatches below
+    auto pick_pipeline = [&](uint32_t n, bool tail) -> vk_pipeline {
+        const uint32_t kalign = quantize_y ? 1 : ggml_vk_guess_matmul_pipeline_align_map(ctx, *mmp_map, ne01, n, false);
+        const uint32_t kpad = quantize_y ? 0 : ggml_vk_align_size(ne10, kalign);
+        // a row-strided B read in place: the aligned shaders load B rows at multiples of stride_b
+        const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && n > 8 &&
+                             (!y_rowstride || (src1->nb[1] / sizeof(ggml_fp16_t)) % kalign == 0);
+
+        vk_pipeline p = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, n, aligned, false);
+        if (hcd_route) {
+            vk_matmul_pipeline_key kh{GGML_TYPE_Q8_0, hcd_f16q ? GGML_TYPE_F16 : GGML_TYPE_Q8_1, false, false};
+            kh.hcd = true;
+            const auto & hv = ctx->device->pipeline_matmul.at(kh);
+            p = hv[std::min<size_t>(tail ? ggml_vk_ragged_hc_tile() : ggml_vk_hc_w8a8_tile(), hv.size() - 1)].unaligned;
         }
-        if (itx != ctx->device->pipeline_matmul.end() && !itx->second.empty() && itx->second[0].aligned &&
-            !ggml_vk_mm_xl_spills(ctx->device, itx->second[0].aligned)) {
-            static bool xl_logged = false;
-            if (!xl_logged) {
-                xl_logged = true;
-                GGML_LOG_INFO("ggml_vulkan: MUL_MAT XL tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) ne11, (unsigned) ne10);
+
+        // XL tier of the register-prefetch pipelines (aligned, dense, quantized A on the f16-B coopmat path only)
+        if (aligned && !quantize_y && !qx_needs_dequant && !d16 && !hcd_f16q && ggml_vk_mm_prefetch_type(src0->type) &&
+            ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mm_xl_ok(ctx, src0->type, ne01, n, ne10)) {
+            const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0]);
+            vk_matmul_pipeline_key kx{src0->type, y_kernel_type, false, f16acc, false, false, true, true};
+            auto itx = ctx->device->pipeline_matmul.find(kx);
+            if (itx == ctx->device->pipeline_matmul.end() || itx->second.empty()) {
+                kx.f16acc = !f16acc;
+                itx = ctx->device->pipeline_matmul.find(kx);
             }
-            pipeline = itx->second[0].aligned;
+            if (itx != ctx->device->pipeline_matmul.end() && !itx->second.empty() && itx->second[0].aligned &&
+                !ggml_vk_mm_xl_spills(ctx->device, itx->second[0].aligned)) {
+                static bool xl_logged = false;
+                if (!xl_logged) {
+                    xl_logged = true;
+                    GGML_LOG_INFO("ggml_vulkan: MUL_MAT XL tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) n, (unsigned) ne10);
+                }
+                p = itx->second[0].aligned;
+            }
+        }
+
+        if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+            p = ggml_vk_get_64b_indexing_pipeline(ctx, p);
+        }
+        return p;
+    };
+
+    vk_pipeline pipeline = pick_pipeline((uint32_t) ne11, false);
+
+    // Ragged n (GGML_VK_RAGGED_XL, default 1; =0 one dispatch): the tile counts are quantised in waves, so one column past a
+    // 256 multiple can cost a whole extra wave of big tiles (or the XL gate drops to the L tile). The n % 256 tail columns then
+    // run as a second dispatch on the tile the selector picks for them, the n_main columns on the pipeline picked for n_main.
+    // The two write disjoint columns of D and read the same B, so there is no barrier between them.
+    vk_pipeline pipeline_tail = nullptr;
+    uint32_t n_main = (uint32_t) ne11;
+    if (ggml_vk_ragged_split_enabled(ctx->device) && !hcm && ne11 > 256 && ne11 % 256 != 0 && ne11 % 256 <= ggml_vk_ragged_tail_max()) {
+        const uint32_t nm = (uint32_t) (ne11 - ne11 % 256);
+        const uint32_t nt = (uint32_t) ne11 - nm;
+        const uint32_t batch = (uint32_t) (ne12 * ne13);
+        vk_pipeline pm = pick_pipeline(nm, false);
+        vk_pipeline pt = pick_pipeline(nt, true);
+        const double c_full  = ggml_vk_ragged_cost(ctx, pipeline, (uint32_t) ne01, (uint32_t) ne11, batch);
+        const double c_split = ggml_vk_ragged_cost(ctx, pm, (uint32_t) ne01, nm, batch) + ggml_vk_ragged_cost(ctx, pt, (uint32_t) ne01, nt, batch, true);
+        const bool no_split_k = disable_split_k || d16 ||
+            (ggml_vk_guess_split_k(ctx, ne01, nm, ne10, false, pm) == 1 && ggml_vk_guess_split_k(ctx, ne01, nt, ne10, false, pt) == 1);
+        if ((c_split < c_full || ggml_vk_ragged_force()) && no_split_k) {
+            pipeline = pm;
+            pipeline_tail = pt;
+            n_main = nm;
+            ggml_vk_path_census_add("MUL_MAT_RAGGED_SPLIT");
         }
     }
 
-    if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
-        pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
-    }
     if (ctx->perf_logger) {
         // per-call path record (GGML_VK_PERF_LOGGER): the once-printed "XL tile engaged" line cannot say how many calls took which variant
         ctx->perf_logger->count_path(std::string(quantize_y ? "int8:" : "f16:") + pipeline->name + " " + ggml_type_name(src0->type) +
                                      " m=" + std::to_string(ne01) + " k=" + std::to_string(ne10));
+        if (pipeline_tail) {
+            ctx->perf_logger->count_path(std::string(quantize_y ? "int8:" : "f16:") + "tail:" + pipeline_tail->name + " " + ggml_type_name(src0->type) +
+                                         " m=" + std::to_string(ne01) + " k=" + std::to_string(ne10));
+        }
     }
 
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
     uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) : ne11;
+    if (pipeline_tail && qy_needs_dequant) {
+        // the tail dispatch reads whole tiles of its own BN past n_main
+        padded_n = std::max<uint32_t>(ROUNDUP_POW2(n_main, pipeline->wg_denoms[1]), n_main + ROUNDUP_POW2((uint32_t) ne11 - n_main, pipeline_tail->wg_denoms[1]));
+    }
     // GGML_VK_DENSE_YPAD: the f16-B staging copy (y_needs_reformat, f32 -> f16 into prealloc_y) is a layout we own; pad its row
     // stride where the unpadded f16 row camps on the DRAM channels. The int8 path (quantize_y) and in-place B are untouched.
     const uint32_t y_row_pad = (y_needs_reformat && qy_needs_dequant && !y_f32_kernel && ggml_vk_dense_ypad_camps(ne10)) ? ggml_vk_dense_ypad() : 0u;
@@ -8632,7 +8713,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t d_ne = ggml_nelements(dst);
 
     // the split-K reduce writes f32
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || d16 || hcm, pipeline);
+    const uint32_t split_k = pipeline_tail ? 1 : ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || d16 || hcm, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -8836,11 +8917,29 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             ctx, subctx, pipeline,
             { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
             ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
-            ne01, ne11, k_run,
+            ne01, n_main, k_run,
             ne10, stride_b, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
             split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
             b_col_bytes, (uint64_t)od->nb[1]
         );  // NOLINT
+        // GGML_VK_RAGGED_TEST_BREAK=1 (tests only, the negative control): the tail dispatch is skipped
+        static const bool ragged_break = [] { const char * e = getenv("GGML_VK_RAGGED_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+        if (pipeline_tail && !ragged_break) {
+            // columns [n_main, ne11): B and D windows shifted by n_main columns, like ggml_vk_matmul's own n-chunks
+            const uint64_t b_off = (uint64_t) n_main * b_col_bytes;
+            const uint64_t d_off = (uint64_t) n_main * (uint64_t) od->nb[1];
+            vk_subbuffer d_full = ggml_vk_subbuffer(ctx, d_D, d_buf_offset);
+            GGML_ASSERT(b_off < y_range && d_off < d_full.size);
+            ggml_vk_matmul(
+                ctx, subctx, pipeline_tail,
+                { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset + b_off, y_range - b_off },
+                { d_D, d_full.offset + d_off, d_full.size - d_off }, { ctx->prealloc_split_k, 0, d_sz },
+                ne01, (uint32_t) ne11 - n_main, k_run,
+                ne10, stride_b, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+                1, ne12*ne13, ne02, ne12, r2, r3, padded_n - n_main,
+                b_col_bytes, (uint64_t)od->nb[1]
+            );  // NOLINT
+        }
     }
 
     if (x_non_contig || qx_needs_dequant) {
