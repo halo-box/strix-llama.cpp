@@ -121,6 +121,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il);
         }
         selected_key_attn = any && all && offload;
+        selected_key_q8 = selected_key_attn && rocm;
         if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) { selected_key_attn = atoi(e) != 0; }
         LLAMA_LOG_INFO("%s: QSA attention: %s\n", __func__, selected_key_attn ?
             "selected-key kernels (maskless block selection)" : "masked top-k (no selected-key kernels on this backend)");

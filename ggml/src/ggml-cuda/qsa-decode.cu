@@ -89,15 +89,17 @@ bool ggml_cuda_flash_attn_ext_qsa_decode_supported_dev(int device, const ggml_te
     float bias, cap;
     memcpy(&bias, (const char *) dst->op_params + 4, 4);
     memcpy(&cap, (const char *) dst->op_params + 8, 4);
-    if (bias != 0.0f || cap != 0.0f || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 ||
-        v->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+    if (bias != 0.0f || cap != 0.0f || q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0) ||
+        v->type != k->type || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
         q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 || q->ne[1] < 1 || q->ne[1] > QSA_DECODE_MAX_QUERIES ||
         k->ne[1] < 1 || k->ne[1] > GGML_QSA_MAX_KEYS || v->ne[1] != k->ne[1] ||
         k->ne[2] < 1 || q->ne[2] % k->ne[2] || v->ne[2] != k->ne[2] ||
         q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
-        q->nb[0] != 4 || k->nb[0] != 2 || v->nb[0] != 2 || ids->nb[0] != 4 ||
+        q->nb[0] != 4 || k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type) || ids->nb[0] != 4 ||
         ids->ne[0] < 1 || ids->ne[0] > 2560 || ids->ne[1] < q->ne[1] || ids->ne[2] != 1 || ids->ne[3] != 1 ||
         !ggml_is_contiguous(dst)) { return false; }
+    // only the wmma kernel reads q8_0
+    if (k->type == GGML_TYPE_Q8_0 && !(q->ne[2] == 12*k->ne[2] && k->nb[1]%16 == 0 && k->nb[2]%16 == 0 && uintptr_t(k->data)%16 == 0)) { return false; }
     return !m || (m->type == GGML_TYPE_F16 && m->nb[0] == 2 && m->ne[0] >= k->ne[1] &&
                   m->ne[1] >= q->ne[1] && m->ne[2] == 1 && m->ne[3] == 1);
 }
@@ -142,7 +144,8 @@ void ggml_cuda_flash_attn_ext_qsa_decode(ggml_backend_cuda_context & ctx, ggml_t
     memcpy(&scale, dst->op_params, sizeof(scale));
     ggml_cuda_pool_alloc<float> partial(ctx.pool(), size_t(nq)*nh*splits*258);
     if (wmma) {
-    qsa_decode_wmma_partial<<<dim3(k->ne[2], nq, splits), 256, 0, ctx.stream()>>>(
+    auto * wmma_kernel = k->type == GGML_TYPE_Q8_0 ? qsa_decode_wmma_partial<true> : qsa_decode_wmma_partial<false>;
+    wmma_kernel<<<dim3(k->ne[2], nq, splits), 256, 0, ctx.stream()>>>(
         (const char *) q->data, (const char *) k->data, (const char *) v->data,
         m ? (const char *) m->data : nullptr, (const char *) unique_ids.get(),
         q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2], m ? m->nb[1] : 0, size_t(ns)*sizeof(int),
