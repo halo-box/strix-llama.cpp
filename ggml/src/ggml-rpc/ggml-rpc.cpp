@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 #include <queue>
+#include <deque>
 #include <condition_variable>
 #include <future>
 #include <memory>
@@ -523,6 +524,7 @@ private:
         void                        * output;
         size_t                        output_size;
         std::promise<void>            completion;
+        bool                          async = false;  // nobody waits on completion except a barrier
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
     using rpc_msg_queue = message_queue<rpc_msg_ptr>;
@@ -580,6 +582,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
 
 void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
     auto msg = std::make_shared<rpc_msg>();
+    msg->async = true;
     msg->cmd = cmd;
     msg->input = input;
     msg->input_size = input_size;
@@ -657,7 +660,32 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     thread = std::thread(rpc_dispatcher_trampoline, this);
 }
 
+// Async GET_TENSOR replies are pipelined: the request goes out at once and its reply is read later, in order,
+// before any command that needs a reply of its own and at every barrier. A decode step that reads several
+// boundary tensors then pays one round trip instead of one per tensor. GGML_RPC_NO_PIPELINE=1 turns it off.
+static constexpr size_t RPC_PIPELINE_MAX_BYTES = 4u << 20;
+
+static bool rpc_recv_reply(socket_ptr sock, void * output, size_t output_size) {
+    uint64_t out_size;
+    if (!sock->recv_data(&out_size, sizeof(out_size)) || out_size != output_size) {
+        return false;
+    }
+    return sock->recv_data(output, output_size);
+}
+
 void rpc_dispatcher::work() {
+    static const bool pipeline = std::getenv("GGML_RPC_NO_PIPELINE") == nullptr;
+    std::deque<rpc_msg_ptr> inflight;
+    size_t inflight_bytes = 0;
+    auto drain = [&]() {
+        while (!inflight.empty()) {
+            rpc_msg_ptr m = inflight.front();
+            inflight.pop_front();
+            RPC_STATUS_ASSERT(rpc_recv_reply(sock, m->output, m->output_size));
+            m->completion.set_value();
+        }
+        inflight_bytes = 0;
+    };
     auto last_cmd = std::chrono::steady_clock::now();
     while (running) {
         rpc_msg_ptr msg_ptr;
@@ -671,6 +699,21 @@ void rpc_dispatcher::work() {
             }
         } else if (!queue.pop(&msg_ptr)) {
             break;
+        }
+        if (pipeline && msg_ptr->async && msg_ptr->cmd == RPC_CMD_GET_TENSOR && msg_ptr->output) {
+            LOG_DBG2("[%s] %s pipelined (out: %s)\n", __func__, rpc_cmd_name(msg_ptr->cmd),
+                     rpc_log_format_size(msg_ptr->output_size).c_str());
+            RPC_STATUS_ASSERT(send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size));
+            inflight.push_back(msg_ptr);
+            inflight_bytes += msg_ptr->output_size;
+            if (inflight_bytes > RPC_PIPELINE_MAX_BYTES) {
+                drain();
+            }
+            last_cmd = std::chrono::steady_clock::now();
+            continue;
+        }
+        if (msg_ptr->cmd == RPC_CMD_NONE || msg_ptr->output) {
+            drain();
         }
         if (msg_ptr->cmd != RPC_CMD_NONE) {
             LOG_DBG2("[%s] %s (in: %s, out: %s)\n", __func__, rpc_cmd_name(msg_ptr->cmd),
