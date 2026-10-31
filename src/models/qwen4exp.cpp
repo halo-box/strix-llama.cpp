@@ -1166,12 +1166,9 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
     return n_stream == 1 ? std::min<int64_t>(n_tokens, 512) : n_tokens;
 }
 
-// The strip the indexer scores with. The raw score is F32 [n_blocks, n_idx_h, strip] and its ReLU is a second tensor
-// of that size, so a fixed strip grows the scratch with the context: 2 x 2 GiB at n_kv = 1M (4 x 65536 blocks x 4 heads x 1024
-// queries x 4 B = 4 GiB each with four 262144-token streams and -ub 4096, which scored their whole ubatch at once). Halve the strip (rounding
-// up) while the raw score exceeds 2^27 elements (its size at n_kv = 262144, 512 MiB), down to 64 queries. The
-// last-layer trim aligns q_first to qwen4exp_query_strip: a 512 strip halves to powers of two, which divide it, and a
-// shorter ubatch has q_first = 0.
+// The indexer raw score F32 [n_blocks, n_idx_h, strip, n_stream] and its ReLU grow with the context (2 x 2 GiB at 1M keys, or with four 262144-key streams): halve the strip while the raw score exceeds 2^27 elements, down to 64 queries.
+// 2^27 is the raw score at 262144 keys for Qwen3.8 Flash Next (ratio 4, 4 indexer heads, strip 512), so shorter contexts keep 512.
+// Halves of 512 divide the q_first of the last-layer trim; a shorter ubatch has q_first = 0.
 static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t n_blocks, int64_t n_idx_h) {
     int64_t strip = qwen4exp_query_strip(n_tokens, n_stream);
     // split KV streams score all streams in one GEMM per strip ([n_blocks, n_idx_h * strip, n_stream]): the bound
@@ -1673,10 +1670,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_build_forward_expand(gf, blk_cells);
         ggml_build_forward_expand(gf, tail_idxs);
     }
-    // the per-block bias of split streams too: a strip reads a strided view of it, and the scheduler would copy each
-    // view of the host input with its whole span (n_stream rows of n_tps queries) and keep every copy of the graph alive
+    // the per-block bias (or the compact limits) of split streams too: a strip reads strided views of it, and the
+    // scheduler would copy each view of the host input with its whole span (all n_stream rows) and keep every copy of
+    // the graph alive. The compact limits are read twice per strip (block starts and tails), even with one strip
     ggml_tensor * bias_all = inp->bias;
-    if (!inp->compact && bias_all && n_stream > 1 && strip < n_tps) {
+    if (bias_all && n_stream > 1 && (inp->compact || strip < n_tps)) {
         bias_all = ggml_cont(ctx0, bias_all);
         ggml_build_forward_expand(gf, bias_all);
     }
@@ -1728,7 +1726,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // one value per block, so it is cheaper to bias here than after the cells are expanded
         if (inp->compact) {
-            score = qwen4exp_apply_compact_visibility(ctx0, score, inp->bias, n_blocks, n_seq, n_tps, first, n_query);
+            score = qwen4exp_apply_compact_visibility(ctx0, score, bias_all, n_blocks, n_seq, n_tps, first, n_query);
         } else if (blk_bias) {
             score = ggml_add(ctx0, score, bias);
         }
