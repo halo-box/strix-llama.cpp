@@ -80,6 +80,9 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#ifdef GGML_USE_EXL3
+#include "ggml-cuda/exl3.cuh"
+#endif
 #include "ggml.h"
 
 #include <algorithm>
@@ -2701,6 +2704,17 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
+#ifdef GGML_USE_EXL3
+        case GGML_OP_EXL3_MUL_MAT:
+            ggml_cuda_op_exl3_mul_mat(ctx, dst);
+            break;
+        case GGML_OP_EXL3_MUL_MAT_ID:
+            ggml_cuda_op_exl3_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_EXL3_GET_ROWS:
+            ggml_cuda_op_exl3_get_rows(ctx, dst);
+            break;
+#endif
         default:
             return false;
     }
@@ -5566,6 +5580,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
     }
+
+#ifdef GGML_USE_EXL3
+    // swiglu -> EXL3_MUL_MAT_ID (MoE down projection): the op's input rotation computes the SwiGLU
+    if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_EXL3_MUL_MAT_ID &&
+        ggml_cuda_exl3_mul_mat_id_swiglu_fusable(cuda_ctx->device, node, cgraph->nodes[i + 1]) &&
+        ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_EXL3_MUL_MAT_ID }, { i + 1 })) {
+        ggml_cuda_op_exl3_mul_mat_id_swiglu(*cuda_ctx, cgraph->nodes[i + 1], node);
+        return 1;
+    }
+#endif
 
     if (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && node->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(node) && !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, node)) {
@@ -9413,6 +9437,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+#ifdef GGML_USE_EXL3
+        case GGML_OP_EXL3_MUL_MAT:
+            return ggml_cuda_exl3_supports_op(dev_ctx->device, op);
+        case GGML_OP_EXL3_MUL_MAT_ID:
+            return ggml_cuda_exl3_mul_mat_id_supports_op(dev_ctx->device, op);
+        case GGML_OP_EXL3_GET_ROWS:
+            return ggml_cuda_exl3_get_rows_supports_op(dev_ctx->device, op);
+#endif
 
         default:
             return false;
@@ -9428,10 +9460,12 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
 static int64_t get_op_batch_size(const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_GET_ROWS:
+        case GGML_OP_EXL3_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_EXL3_MUL_MAT_ID:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return op->ne[2];

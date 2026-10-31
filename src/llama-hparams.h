@@ -378,6 +378,9 @@ struct llama_hparams {
     enum llama_rope_type         rope_type               = LLAMA_ROPE_TYPE_NONE;
     enum llama_rope_scaling_type rope_scaling_type_train = LLAMA_ROPE_SCALING_TYPE_NONE;
 
+    // EXL3 linears (exl3.codebook, see ggml/exl3/README.md): 0 = 3inst, 1 = mcg, 2 = mul1, -1 = none
+    int32_t exl3_codebook = -1;
+
 
     // Resolved FFN gated activation flavor for archs that read
     // `<arch>.hidden_activation` from the GGUF (e.g. ModernBert derivatives).

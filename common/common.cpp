@@ -9,6 +9,9 @@
 
 #include "fit.h"
 #include "log.h"
+#ifdef LLAMA_USE_EXL3
+#include "exl3-dir.h"
+#endif
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1276,7 +1279,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+#ifdef LLAMA_USE_EXL3
+    llama_model * model = common_exl3_load_model(params.model.path, mparams);
+#else
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+#endif
     if (model == NULL) {
         return;
     }

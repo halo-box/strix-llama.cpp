@@ -300,8 +300,13 @@ class _QwenMtpMixin:
         self.block_count = self.hparams["num_hidden_layers"]
         if not self.no_mtp:
             n_mtp = self.hparams.get("mtp_num_hidden_layers", 0)
+            # an EXL3 checkpoint can declare MTP layers it does not store: use the stored count, as common/exl3-dir.cpp
+            if (self.hparams.get("quantization_config") or {}).get("quant_method") == "exl3":
+                if n_mtp != self.opt_num_mtp_layers:
+                    logger.info(f"EXL3: {self.opt_num_mtp_layers} MTP layer(s) stored, config.json declares {n_mtp}")
+                n_mtp = self.opt_num_mtp_layers
             # Qwen-3-Next doesn't include `mtp_num_hidden_layers` in config.
-            if n_mtp == 0:
+            elif n_mtp == 0:
                 assert self.opt_num_mtp_layers != 0
                 n_mtp = self.opt_num_mtp_layers
             self.block_count += n_mtp
@@ -395,7 +400,11 @@ class Qwen3NextModel(_QwenMtpMixin, Qwen2MoeModel):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name.endswith(".A_log"):
-            data_torch = -torch.exp(data_torch)
+            if self.exl3_codebook is not None:
+                # common/exl3-dir.cpp writes the same tensor: round once from float64, as float32 exp differs between libm and MKL
+                data_torch = -torch.exp(data_torch.to(torch.float64)).to(torch.float32)
+            else:
+                data_torch = -torch.exp(data_torch)
         elif name.endswith(".dt_bias"):
             name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
         elif "conv1d" in name:
@@ -586,6 +595,32 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
     def _repack_nvfp4(self, name: str, weight: Tensor, scale: Tensor, scale2: Tensor, input_scale: Tensor):
         weight, scale = self._transform_nvfp4_weight(name, weight, scale)
         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)
+
+    exl3_permutation = "linear_attn_v_heads_grouped_to_tiled"
+
+    def exl3_block_permutation(self, name: str, k: int, n: int) -> tuple[np.ndarray | None, np.ndarray | None]:
+        # the V head reorder of modify_tensors, on whole 128-blocks of the EXL3 linear
+        num_k_heads = self.hparams.get("linear_num_key_heads", 0)
+        num_v_heads = self.hparams.get("linear_num_value_heads", 0)
+        if num_k_heads <= 0 or num_v_heads <= 0 or num_k_heads == num_v_heads or "linear_attn." not in name:
+            return None, None
+
+        head_k_dim = self.hparams["linear_key_head_dim"]
+        head_v_dim = self.hparams["linear_value_head_dim"]
+        qk_dim = 2 * head_k_dim * num_k_heads
+        v_dim = num_v_heads * head_v_dim
+        if head_v_dim % 128 != 0 or qk_dim % 128 != 0:
+            raise NotImplementedError(f"{name}: V heads of {head_v_dim} do not fill whole EXL3 128-blocks")
+        v_perm = self._reorder_v_heads(torch.arange(v_dim // 128).unsqueeze(-1), 0, num_k_heads,
+                                       num_v_heads // num_k_heads, head_v_dim // 128).squeeze(-1).numpy()
+
+        if name.endswith(".in_proj_qkv") and n == qk_dim + v_dim:
+            return None, np.concatenate([np.arange(qk_dim // 128), qk_dim // 128 + v_perm])
+        if name.endswith(".in_proj_z") and n == v_dim:
+            return None, v_perm
+        if name.endswith(".out_proj") and k == v_dim:
+            return v_perm, None
+        raise NotImplementedError(f"{name}: no EXL3 V head reorder for this projection ({k} x {n})")
 
     def _hadamard_folds_tensor(self, name: str) -> bool:
         # a manifest name and `name` can differ only by leading wrapper prefixes
