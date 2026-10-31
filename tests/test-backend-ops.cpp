@@ -2564,6 +2564,24 @@ struct test_swiglu_clamp : public test_case {
 };
 
 // GGML_OP_GET_ROWS
+// Vulkan GET_ROWS_NARROW engagement (GGML_VK_TEST_REQUIRE_GET_ROWS_NARROW=1): rows of at most 128 elements (the backend's width,
+// GGML_VK_GET_ROWS_NARROW_MAX) of f32/f16/bf16/i32 take the narrow path; GGML_VK_GET_ROWS_NARROW=0 takes none
+static bool get_rows_narrow_engaged(ggml_backend_t backend, ggml_type type, int64_t n, std::string & msg) {
+    if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_GET_ROWS_NARROW")) {
+        return true;
+    }
+    const char * m = getenv("GGML_VK_GET_ROWS_NARROW_MAX");
+    const int64_t max_width = !env_knob_on("GGML_VK_GET_ROWS_NARROW") ? 0 : m != nullptr ? std::max(0, atoi(m)) : 128;
+    const bool type_ok = type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_I32;
+    const int64_t want = type_ok && n <= max_width ? 1 : 0;
+    const int64_t got = dispatch_census_count(backend, "path:GET_ROWS_NARROW");
+    if (got != want) {
+        msg = "path:GET_ROWS_NARROW dispatches: " + std::to_string(got) + " (expected " + std::to_string(want) + ")";
+        return false;
+    }
+    return true;
+}
+
 struct test_get_rows : public test_case {
     const ggml_type type;
     const int n; // cols
@@ -2580,7 +2598,12 @@ struct test_get_rows : public test_case {
     }
 
     double max_nmse_err() override {
-        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 ? 0.0 : test_case::max_nmse_err();
+        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_I32 ? 0.0 : test_case::max_nmse_err();
+    }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        return get_rows_narrow_engaged(backend, type, n, msg);
     }
 
     test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false, int offset_cols = 0)
@@ -2629,6 +2652,83 @@ struct test_get_rows : public test_case {
             }
             if (t->type == GGML_TYPE_I32) {
                 // rows
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % m;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_GET_ROWS with strided layouts: src0 with permuted batch dims (src_perm), and ids transposed (ids_mode 1) or one
+// row shared by every batch through zero strides (ids_mode 2)
+struct test_get_rows_layout : public test_case {
+    const ggml_type type;
+    const int n; // cols
+    const int m; // rows
+    const int r; // rows to get
+    const int be1;
+    const int be2;
+    const bool src_perm;
+    const int ids_mode;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, n, m, r, be1, be2, src_perm, ids_mode);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        return get_rows_narrow_engaged(backend, type, n, msg);
+    }
+
+    test_get_rows_layout(ggml_type type, int n, int m, int r, int be1, int be2, bool src_perm, int ids_mode)
+        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), src_perm(src_perm), ids_mode(ids_mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in;
+        if (src_perm) {
+            in = ggml_new_tensor_4d(ctx, type, n, be1, m, be2);
+            ggml_set_name(in, "in");
+            in = ggml_permute(ctx, in, 0, 2, 1, 3);
+            ggml_set_name(in, "in_perm");
+        } else {
+            in = ggml_new_tensor_4d(ctx, type, n, m, be1, be2);
+            ggml_set_name(in, "in");
+        }
+
+        ggml_tensor * rows;
+        if (ids_mode == 1) {
+            rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, be1, r, be2);
+            ggml_set_name(rows, "rows");
+            rows = ggml_permute(ctx, rows, 1, 0, 2, 3);
+            ggml_set_name(rows, "rows_t");
+        } else if (ids_mode == 2) {
+            rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
+            ggml_set_name(rows, "rows");
+            rows = ggml_view_3d(ctx, rows, r, be1, be2, 0, 0, 0);
+            ggml_set_name(rows, "rows_bcast");
+        } else {
+            rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
+            ggml_set_name(rows, "rows");
+        }
+
+        ggml_tensor * out = ggml_get_rows(ctx, in, rows);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
                 std::vector<int> data(ggml_nelements(t));
                 for (size_t i = 0; i < data.size(); i++) {
                     data[i] = rand() % m;
@@ -14593,7 +14693,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // i32 rows wider than one 512-lane workgroup
+    for (int n : {513, 600, 1024, 1500, 4096}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, n, 97, 9, 1, 1, false));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, n, 97, 9, 3, 2, true));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, n, 97, 9, 3, 2, false, true, 1));
+    }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+
+    // narrow rows (Vulkan GET_ROWS_NARROW): widths up to the narrow limit and past it, ragged row counts, batches and views
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_I32}) {
+        for (int width : {1, 2, 4, 8, 32, 64, 128, 129}) {
+            for (int rows : {1, 1001}) {
+                test_cases.emplace_back(new test_get_rows(type, width, 300, rows, 1, 1, false));
+            }
+            test_cases.emplace_back(new test_get_rows(type, width, 37, 129, 3, 2, true, true, 1));
+            test_cases.emplace_back(new test_get_rows_layout(type, width, 37, 129, 3, 2, true, 1));
+            test_cases.emplace_back(new test_get_rows_layout(type, width, 37, 129, 3, 2, false, 2));
+        }
+    }
+    // Flash-Next QSA selection gathers per 512-query strip at 8192 blocks: blocks reorder, picked score, cells (r = 4)
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 1,  512,    512, 512, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8192,    512, 512, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 8192, 262144,   1, 1, false));
+    // more dst elements than one dispatch row of workgroups (65535 x 256): the narrow shader loops
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 2, 1000, 8389000, 1, 1, false));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
@@ -17762,6 +17886,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int width : {90, 128}) {
             test_cases.emplace_back(new test_get_rows(type, width, 65537, 65536, 1, 1, false));
         }
+    }
+    // narrow rows (Vulkan GET_ROWS_NARROW): the Flash-Next QSA strip gathers, then a width sweep for the narrow limit
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 1,  512,    512, 512, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8192,    512, 512, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 4, 8192, 262144,   1, 1, false));
+    for (int width : {1, 4, 16, 64, 128, 256}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, width, 8192, 32768, 1, 1, false));
     }
 
     for (int n : {1, 4}) {
