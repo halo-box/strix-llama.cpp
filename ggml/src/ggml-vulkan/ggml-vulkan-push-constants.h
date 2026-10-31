@@ -322,6 +322,15 @@ struct vk_op_dsv4_hc_moe_post_norm_defer_push_constants {
 };
 static_assert(sizeof(vk_op_dsv4_hc_moe_post_norm_defer_push_constants) <= 128);
 
+// dsv4_hc_res16_widen.comp (HC_BF16RES fallback): bf16 stream / token strides (elements), f32 stream / token strides (floats)
+struct vk_op_dsv4_hc_res16_widen_push_constants {
+    uint32_t n_embd;
+    uint32_t hc;
+    uint32_t n_tokens;
+    uint32_t s1; uint32_t s2;
+    uint32_t d1; uint32_t d2;
+};
+
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
     uint32_t ne01;

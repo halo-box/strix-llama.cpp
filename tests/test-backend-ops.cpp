@@ -5081,6 +5081,94 @@ struct test_hc_layer : public test_hc_moe_epi {
     }
 };
 
+// two qwen4exp prefill layers' four HC combines: the first layer's MoE epilogue combine output is the second layer's residual, read
+// by its attention-side combine and (HC_DEFER) its MoE epilogue: on Vulkan (GGML_VK_HC_BF16RES, default on) that residual is stored bf16
+// between the layers (not exact: the CPU reference keeps f32; the bf16 rounding of the residual is well inside the tolerance)
+struct test_hc_layer2 : public test_hc_layer {
+    test_hc_layer2(int embd, int tokens, int n_used) : test_hc_layer(embd, tokens, n_used, false) {}
+    std::string op_desc(ggml_tensor *) override { return "HC_LAYER2"; }
+
+    // GGML_VK_TEST_REQUIRE_HC_BF16RES=1: with GGML_VK_HC_BF16RES on (default) and 32+ tokens, one bf16 residual store per graph, read by the
+    // second attention-side combine (and, with HC_DEFER, the second MoE epilogue); GGML_VK_HC_BF16RES_TEST_WIDEN=1 widens it
+    // before its first reader instead; off: none
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_BF16RES")) {
+            return true;
+        }
+        const bool on    = env_knob_on("GGML_VK_HC_BF16RES") && tokens >= 32;
+        const bool widen = env_opt_in("GGML_VK_HC_BF16RES_TEST_WIDEN");
+        const bool defer = env_knob_on("GGML_VK_HC_DEFER");
+        const int64_t n_st  = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_BF16RES"));
+        const int64_t n_in  = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_BF16RES_IN"));
+        const int64_t n_ind = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_BF16RES_IN_DEFER"));
+        const int64_t n_inm = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_BF16RES_IN_MOE"));
+        const int64_t n_wid = std::max<int64_t>(0, dispatch_census_count(backend, "path:HC_BF16RES_WIDEN"));
+        bool ok;
+        if (!on) {
+            ok = n_st + n_in + n_ind + n_inm + n_wid == 0;
+        } else if (widen) {
+            ok = n_st == 1 && n_wid == 1 && n_in + n_ind + n_inm == 0;
+        } else {
+            // with HC_DEFER the residual is read twice: by the second attention-side combine and either by the deferred MoE epilogue
+            // (_IN_DEFER) or, when that epilogue does not fuse (here the second chain's shared-expert gate stays a SIGMOID_MUL, the knob
+            // off shows the same HC_DEFER_MAT), by the combine's store-only replay (a second _IN)
+            ok = n_st == 1 && n_in + n_ind == (defer ? 2 : 1) && n_in >= 1 && n_inm == 0 && n_wid == 0;
+        }
+        if (!ok) {
+            msg = "HC_BF16RES " + std::to_string(n_st) + ", _IN " + std::to_string(n_in) + ", _IN_DEFER " + std::to_string(n_ind) +
+                  ", _IN_MOE " + std::to_string(n_inm) + ", _WIDEN " + std::to_string(n_wid);
+            printf("[engagement] %s ", msg.c_str());
+        }
+        return ok;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        verify.clear();
+        const int64_t hc_dim = int64_t(embd) * hc;
+        attn_inputs ai {};
+        ai.res0       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        ai.block      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, tokens);
+        ai.inject     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        ai.gamma_flat = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
+        ai.w_inj      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, hc);
+        ai.w_down     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_dim, 64);
+        inputs in {};
+        in.inject     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        in.slots      = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, embd, n_used, tokens);
+        ggml_set_name(in.slots, "slots");
+        in.sh_act     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, tokens);
+        in.w_sd       = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 64, embd);
+        in.g_x        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, tokens);
+        in.w_g        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 1);
+        in.gamma_flat = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim);
+        in.w_inj      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, hc);
+        in.w_down     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, hc_dim, 64);
+        for (ggml_tensor * t : { ai.res0, ai.block, ai.inject, ai.gamma_flat, ai.w_inj, ai.w_down, in.inject, in.slots, in.sh_act,
+                                 in.w_sd, in.g_x, in.w_g, in.gamma_flat, in.w_inj, in.w_down }) {
+            ggml_set_input(t);
+            ggml_set_output(t);
+        }
+        // layer 1: attention-side combine, MoE epilogue combine -> r1 (the residual between the layers)
+        std::vector<ggml_tensor *> a1 = attn(ctx, ai);
+        inputs l1 = in;
+        l1.residual = a1[0];
+        ggml_tensor * moe = nullptr;
+        std::vector<ggml_tensor *> b1 = chain(ctx, l1, &moe);
+        // layer 2 over r1
+        attn_inputs a2i = ai;
+        a2i.res0 = b1[0];
+        std::vector<ggml_tensor *> a2 = attn(ctx, a2i);
+        inputs l2 = in;
+        l2.residual = a2[0];
+        std::vector<ggml_tensor *> b2 = chain(ctx, l2, &moe);
+        for (ggml_tensor * t : { b1[1], b1[2], a2[1], a2[2], b2[0], b2[1], b2[2], b2[3] }) {
+            ggml_set_output(t);
+            verify.push_back(t);
+        }
+        return b2.back();
+    }
+};
+
 // quantized weights x an f16 B (the f16 hc norm into the hc down GEMM); pad > 0: B rows with a k + pad stride (padded
 // xn / GDN norm), read in place on Vulkan
 struct test_mul_mat_f16b : public test_case {
@@ -14728,6 +14816,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int tokens : {16, 64, 513}) {
         test_cases.emplace_back(new test_hc_layer(2560, tokens, 2, true));   // 2 slots: the exact twin fits the test context
+    }
+    // HC_BF16RES: two layers, the residual between them stored bf16 (prefill sizes incl. a ragged tail; 16 tokens: below the MoE
+    // epilogue, stays f32)
+    for (int tokens : {16, 64, 513, 2051}) {
+        test_cases.emplace_back(new test_hc_layer2(2560, tokens, 2));   // 2 slots: four chains fit the test context
     }
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 2051, 1, GGML_TYPE_Q8_0, 128));
     test_cases.emplace_back(new test_hc_post_norm(2560, 4, 97, 2, GGML_TYPE_Q8_0, 128));

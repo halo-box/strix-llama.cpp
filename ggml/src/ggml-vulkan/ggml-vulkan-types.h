@@ -1047,6 +1047,13 @@ struct vk_device_struct {
     // it [slot f16]
     vk_pipeline pipeline_dsv4_hc_post_norm_inj_dm[2];
     vk_pipeline pipeline_dsv4_hc_moe_post_norm_defer[2];
+    // HC_BF16RES: the hc residual between combines stored bf16. The attention-side combine reading a bf16 residual [dm: 0 the
+    // chain, 1 no combine store (HC_DEFER), 2 the combine store only]; the MoE epilogue (+ inject) and its HC_DEFER form
+    // [slot f16][RES16 - 1: 1 bf16 residual in, 2 bf16 combine out, 3 both]; the in-place widen fallback
+    vk_pipeline pipeline_dsv4_hc_post_norm_inj_r16[3];
+    vk_pipeline pipeline_dsv4_hc_moe_post_norm_r16[2][3];
+    vk_pipeline pipeline_dsv4_hc_moe_post_norm_defer_r16[2][3];
+    vk_pipeline pipeline_dsv4_hc_res16_widen;
     // FN_DECODE_HC: the q8_0 hc up mat-vec with SCALE + SILU on B and DSV4_HC_PRE (gated) as the store, 4 rows per workgroup,
     // per workgroup size and column count like pipeline_dequant_mul_mat_vec_f32_f32
     vk_pipeline pipeline_fn_hc_up_mix_mv[DMMV_WG_SIZE_COUNT][mul_mat_vec_max_cols];
@@ -1549,6 +1556,9 @@ struct ggml_backend_vk_context {
         float gate_in = 1.0f, gate_out = 1.0f;
         int node_idx = -1;
     } hc_defer;
+    // HC_BF16RES: hc residuals (MoE epilogue combine outputs) stored bf16 in their own f32 allocation, with their bf16 stream /
+    // token strides (elements); filled when the producer runs, cleared per graph
+    std::unordered_map<const ggml_tensor *, std::pair<uint32_t, uint32_t>> hc_res16;
     const ggml_tensor * fused_extra_dst {};   // written by the fused kernel besides the write-mask nodes (synced like them)
     const ggml_tensor * fused_extra_srcs[2] {};
     // GDN direct state write: GATED_DELTA_NET nodes matched in this graph (decided at the GDN), each with the CPY that
