@@ -1,0 +1,191 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// dsv4_hc_post_norm.comp (f16 norm) for all HC = 4 streams of one token per workgroup, plus the next mix's inject projection:
+//
+//   res_out[i, h, t] = x[i, t] * post[h, t] + res[i, h, t]                       (HAS_POST; else res_out = res)
+//   xn[i, h, t]      = f16(res_out[i, h, t] * rsqrt(mean_i(res_out^2) + eps) * gamma[i, h])
+//   inj[r, t]        = sum_{h, i} w[h * n_embd + i, r] * xn[i, h, t]               (the MUL_MAT(w_inject, xn) after the CPY)
+//
+// Thread j owns the 8-column groups j and j + 256 of every stream, so x is read once for the four streams and
+// the projection reads xn from registers instead of a second pass over the 4 x n_embd f16 rows. The inject uses the stored f16
+// xn values, as the MUL_MAT does. Only the summation order of the norm and the projection differs from the unfused kernels.
+// The host guarantees n_embd % 8 == 0, n_embd <= 4096, hc == 4, unit element strides, 16-byte aligned rows and zero
+// misalignment on every operand.
+
+layout(constant_id = 0) const uint HAS_POST = 1;
+// LOADS_FIRST (GGML_VK_HC_CMB, default on): every residual row and post weight of the token is loaded before the first store, so
+// the four streams' loads are in flight together instead of one stream per round trip (the stores to res_out could alias the
+// residual reads as far as the compiler knows). Same values, same arithmetic and order: bit-identical.
+layout(constant_id = 1) const uint LOADS_FIRST = 0;
+// DEFER_MODE (GGML_VK_HC_DEFER): 1 = the combine output is not stored (the next combine, the MoE epilogue, recomputes it from the same
+// inputs with the same expression); 2 = store only the combine output (materialise a deferred one; norm and inject not written)
+layout(constant_id = 2) const uint DEFER_MODE = 0;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint HC = 4;
+const uint BLOCK = 256;
+const uint NG = 2;   // 8-column groups per thread
+
+layout(binding = 0, std430) readonly  buffer XBuf { vec4    data_x[]; };
+layout(binding = 1, std430) readonly  buffer RBuf { vec4    data_r[]; };
+layout(binding = 2, std430) readonly  buffer PBuf { float   data_p[]; };
+layout(binding = 3, std430) readonly  buffer GBuf { vec4    data_g[]; };
+layout(binding = 4, std430) writeonly buffer OBuf { vec4    data_o[]; };
+layout(binding = 5, std430) writeonly buffer NBuf { f16vec4 data_n[]; };
+layout(binding = 6, std430) readonly  buffer WBuf { vec4    data_w[]; };
+layout(binding = 7, std430) writeonly buffer IBuf { float   data_i[]; };
+
+layout(push_constant) uniform parameter {
+    uint  n_embd;
+    uint  hc;
+    uint  n_tokens;
+    uint  sx1;             // x token stride (floats)
+    uint  sr1; uint sr2;   // residual stream / token strides (floats)
+    uint  sp0; uint sp1;   // post stream / token strides (floats)
+    uint  sg1;             // gamma stream stride (floats)
+    uint  so1; uint so2;   // res_out stream / token strides (floats)
+    uint  sn1; uint sn2;   // xn stream / token strides (elements)
+    float eps;
+    uint  gate;
+    float gate_in;
+    float gate_out;
+    uint  zero;            // always 0 (the f16 store's XOR operand)
+    uint  sw1;             // inject weight row stride (floats)
+    uint  si1;             // inject output token stride (floats)
+} p;
+
+shared float sumsh[HC][32];
+shared float injsh[HC][32];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t   = gl_WorkGroupID.x;
+    const uint ng  = p.n_embd / 8;
+
+    vec4 xv[NG][2];
+    [[unroll]] for (uint g = 0; g < NG; ++g) {
+        const uint e4 = (tid + g * BLOCK) * 2;
+        xv[g][0] = vec4(0.0f);
+        xv[g][1] = vec4(0.0f);
+        if (HAS_POST != 0 && tid + g * BLOCK < ng) {
+            const uint xb = (t * p.sx1) / 4 + e4;
+            xv[g][0] = data_x[xb];
+            xv[g][1] = data_x[xb + 1];
+        }
+    }
+
+    vec4 a[HC][NG][2];
+    float pwl[HC];
+    if (LOADS_FIRST != 0) {
+        [[unroll]] for (uint c = 0; c < HC; ++c) {
+            pwl[c] = HAS_POST != 0 ? data_p[c * p.sp0 + t * p.sp1] : 0.0f;
+            [[unroll]] for (uint g = 0; g < NG; ++g) {
+                const uint e4 = (tid + g * BLOCK) * 2;
+                a[c][g][0] = vec4(0.0f);
+                a[c][g][1] = vec4(0.0f);
+                if (tid + g * BLOCK < ng) {
+                    const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
+                    a[c][g][0] = data_r[rb];
+                    a[c][g][1] = data_r[rb + 1];
+                }
+            }
+        }
+    }
+    float ss[HC];
+    [[unroll]] for (uint c = 0; c < HC; ++c) {
+        float pw = 0.0f;
+        if (HAS_POST != 0) {
+            pw = LOADS_FIRST != 0 ? pwl[c] : data_p[c * p.sp0 + t * p.sp1];
+            if (p.gate != 0) {
+                pw = (1.0f / (1.0f + exp(-(pw * p.gate_in)))) * p.gate_out;
+            }
+        }
+        ss[c] = 0.0f;
+        [[unroll]] for (uint g = 0; g < NG; ++g) {
+            const uint e4 = (tid + g * BLOCK) * 2;
+            vec4 r0 = vec4(0.0f);
+            vec4 r1 = vec4(0.0f);
+            if (tid + g * BLOCK < ng) {
+                const uint rb = (c * p.sr1 + t * p.sr2) / 4 + e4;
+                // LOADS_FIRST == 2: the tests' negative control (GGML_VK_HC_CMB_TEST_BREAK=1) takes stream 0's residual for every stream
+                r0 = LOADS_FIRST == 2 ? a[0][g][0] : LOADS_FIRST != 0 ? a[c][g][0] : data_r[rb];
+                r1 = LOADS_FIRST != 0 ? a[c][g][1] : data_r[rb + 1];
+                if (HAS_POST != 0) {
+                    r0 = xv[g][0] * pw + r0;
+                    r1 = xv[g][1] * pw + r1;
+                    const uint ob = (c * p.so1 + t * p.so2) / 4 + e4;
+                    if (DEFER_MODE != 1) {
+                        data_o[ob]     = r0;
+                        data_o[ob + 1] = r1;
+                    }
+                }
+            }
+            a[c][g][0] = r0;
+            a[c][g][1] = r1;
+            ss[c] += dot(r0, r0) + dot(r1, r1);
+        }
+    }
+
+    if (DEFER_MODE == 2) {
+        return;   // materialise: the combine output only
+    }
+
+    // one reduction for the four stream sums: subgroup partials, then the subgroups in order
+    [[unroll]] for (uint c = 0; c < HC; ++c) {
+        const float s = subgroupAdd(ss[c]);
+        if (gl_SubgroupInvocationID == 0) {
+            sumsh[c][gl_SubgroupID] = s;
+        }
+    }
+    barrier();
+
+    vec4 inj = vec4(0.0f);
+    [[unroll]] for (uint c = 0; c < HC; ++c) {
+        float total = 0.0f;
+        for (uint s = 0; s < gl_NumSubgroups; ++s) {
+            total += sumsh[c][s];
+        }
+        const float scale = inversesqrt(total / float(p.n_embd) + p.eps);
+        [[unroll]] for (uint g = 0; g < NG; ++g) {
+            if (tid + g * BLOCK >= ng) {
+                continue;
+            }
+            const uint e4 = (tid + g * BLOCK) * 2;
+            const uint gb = (c * p.sg1) / 4 + e4;
+            const uint nb = (c * p.sn1 + t * p.sn2) / 4 + e4;
+            [[unroll]] for (uint k = 0; k < 2; ++k) {
+                const vec4 n = a[c][g][k] * scale * data_g[gb + k];
+                // equal to the f32 norm stored, then CPY: the XOR with a push-constant zero keeps the multiply and the
+                // conversion two separately rounded operations
+                const f16vec4 n16 = f16vec4(uintBitsToFloat(floatBitsToUint(n) ^ uvec4(p.zero)));
+                data_n[nb + k] = n16;
+                const vec4 nf = vec4(n16);
+                const uint wb = (c * p.n_embd) / 4 + e4 + k;
+                [[unroll]] for (uint r = 0; r < HC; ++r) {
+                    inj[r] += dot(data_w[(r * p.sw1) / 4 + wb], nf);
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0; r < HC; ++r) {
+        const float s = subgroupAdd(inj[r]);
+        if (gl_SubgroupInvocationID == 0) {
+            injsh[r][gl_SubgroupID] = s;
+        }
+    }
+    barrier();
+    if (tid < HC) {
+        float total = 0.0f;
+        for (uint s = 0; s < gl_NumSubgroups; ++s) {
+            total += injsh[tid][s];
+        }
+        data_i[t * p.si1 + tid] = total;
+    }
+}
