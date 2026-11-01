@@ -3013,6 +3013,76 @@ private:
         return n_read;
     }
 
+    // the draft context state (e.g. the MTP head cache) is appended after the checkpoints
+    // without it, a restored slot drafts from an empty draft context and accepts far fewer drafts
+    static constexpr uint32_t SLOT_DFT_MAGIC   = 0x54464453; // "SDFT"
+    static constexpr uint32_t SLOT_DFT_VERSION = 1;
+
+    size_t save_slot_draft(const std::string & filepath, const server_slot & slot) const {
+        if (slot.ctx_dft == nullptr) {
+            return 0;
+        }
+        const size_t size = llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (size == 0) {
+            return 0;
+        }
+        std::vector<uint8_t> data(size);
+        if (llama_state_seq_get_data_ext(slot.ctx_dft, data.data(), size, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != size) {
+            SRV_WRN("failed to read the draft context's state for '%s'\n", filepath.c_str());
+            return 0;
+        }
+        std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
+        if (!ofs) {
+            SRV_WRN("failed to append the draft context's state to '%s'\n", filepath.c_str());
+            return 0;
+        }
+        size_t n_written = 0;
+        const uint32_t magic   = SLOT_DFT_MAGIC;
+        const uint32_t version = SLOT_DFT_VERSION;
+        ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
+        ckpt_write(ofs, &version, sizeof(version), n_written);
+        ckpt_write_buf(ofs, data, n_written);
+        ofs.flush();
+        if (!ofs) {
+            SRV_WRN("failed to append the draft context's state to '%s' - the appendix is incomplete\n", filepath.c_str());
+            return 0;
+        }
+        SRV_INF("appended the draft context's state (%.3f MiB) to '%s'\n", (float) n_written / 1024 / 1024, filepath.c_str());
+        return n_written;
+    }
+
+    // returns the number of bytes consumed, 0 if there is no usable appendix (the draft context then starts empty)
+    size_t load_slot_draft(const std::string & filepath, size_t offset, server_slot & slot) const {
+        if (slot.ctx_dft == nullptr) {
+            return 0;
+        }
+        std::ifstream ifs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::ate);
+        const size_t file_size = ifs ? (size_t) ifs.tellg() : 0;
+        if (!ifs || file_size < offset || !ifs.seekg(offset)) {
+            return 0;
+        }
+        const size_t n_avail = file_size - offset;
+        size_t n_read = 0;
+        uint32_t magic   = 0;
+        uint32_t version = 0;
+        if (!ckpt_read(ifs, &magic, sizeof(magic), n_read) || magic != SLOT_DFT_MAGIC) {
+            return 0;
+        }
+        std::vector<uint8_t> data;
+        if (!ckpt_read(ifs, &version, sizeof(version), n_read) || version != SLOT_DFT_VERSION ||
+            !ckpt_read_buf(ifs, data, n_avail, n_read)) {
+            SRV_WRN("invalid draft state appendix in '%s' - ignored\n", filepath.c_str());
+            return 0;
+        }
+        if (llama_state_seq_set_data_ext(slot.ctx_dft, data.data(), data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) != data.size()) {
+            SRV_WRN("the draft state in '%s' does not fit this draft context - drafting starts empty\n", filepath.c_str());
+            llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, -1, -1);
+            return 0;
+        }
+        SRV_INF("restored the draft context's state (%.3f MiB) from '%s'\n", (float) data.size() / 1024 / 1024, filepath.c_str());
+        return n_read;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -3235,6 +3305,7 @@ private:
                         send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
                         break;
                     }
+                    const size_t nwrite_dft = save_slot_draft(filepath, *slot);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -3245,7 +3316,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite + nwrite_ckpt;
+                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -3295,6 +3366,10 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        if (slot->ctx_dft) {
+                            // drop what the draft context still holds for this slot, e.g. a previous conversation
+                            llama_memory_seq_rm(llama_get_memory(slot->ctx_dft), slot->id, -1, -1);
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3303,6 +3378,7 @@ private:
 
                     // nread is the end offset of the llama state payload within the file
                     const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
+                    load_slot_draft(filepath, nread + nread_ckpt, *slot);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
