@@ -1028,7 +1028,6 @@ void process_shaders() {
     string_to_spv("mul_mm_id_down_q5_1_f16_rp_v2", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "2"}});
     string_to_spv("mul_mm_id_down_q5_1_f16_rp_v3", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "4"}});
     string_to_spv("mul_mm_id_down_q5_1_f16_rp_v4", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"PK16", "1"}});
-    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v5", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"EPI_OFF", "1"}});
     string_to_spv("mul_mm_id_down_q5_1_f16_rp_v6", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"KC", "128"}, {"PK16", "1"}});
     string_to_spv("mul_mm_id_down_q5_1_f16_rp_v7", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "2"}, {"PK16", "1"}});
     string_to_spv("mul_mm_id_down_q5_1_f16_rp_v8", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"KC", "128"}, {"TPW", "2"}});

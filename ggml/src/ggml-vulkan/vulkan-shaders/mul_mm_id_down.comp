@@ -272,12 +272,7 @@ void main() {
                             const float r1 = subgroupShuffleXor(lo ? c3 : c1, 16);
                             const vec4 v = lo ? vec4(c0, r0, c1, r1) : vec4(r0, c2, r1, c3);
                             const uint fe = feat0 + 16 * f + 2 * e + (lo ? 0u : 4u);
-#if defined(EPI_OFF)
-                            // measurement only: keeps the GEMM, drops (almost) every store
-                            if (row < nrows && v.x == 1234.5f) {
-#else
                             if (row < nrows) {
-#endif
                                 data_d[p.d_offset + dst_row + fe / 4] = f16vec4(v);
                             }
                         }

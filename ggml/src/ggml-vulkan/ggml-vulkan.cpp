@@ -5261,7 +5261,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51_rpv[v], "mul_mm_id_down_q5_1_f16_rp_v" #v, mul_mm_id_down_q5_1_f16_rp_v ## v ## _len, \
                         mul_mm_id_down_q5_1_f16_rp_v ## v ## _data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
                     CREATE_MMID_DOWN_V(1) CREATE_MMID_DOWN_V(2) CREATE_MMID_DOWN_V(3) CREATE_MMID_DOWN_V(4)
-                    CREATE_MMID_DOWN_V(5) CREATE_MMID_DOWN_V(6) CREATE_MMID_DOWN_V(7) CREATE_MMID_DOWN_V(8)
+                    CREATE_MMID_DOWN_V(6) CREATE_MMID_DOWN_V(7) CREATE_MMID_DOWN_V(8)
                     CREATE_MMID_DOWN_V(9) CREATE_MMID_DOWN_V(10)
 #undef CREATE_MMID_DOWN_V
                     ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q4k, "mul_mat_vec_id_q4_k_rp_f32", mul_mat_vec_id_q4_k_rp_f32_len,
@@ -11757,9 +11757,18 @@ static void ggml_vk_mmid_down_stream(ggml_backend_vk_context * ctx, vk_context& 
 
     const bool repacked = ggml_vk_repack_rows(w) != 0;
     vk_pipeline pipeline = (repacked ? ctx->device->pipeline_mmid_down_q51_rp : ctx->device->pipeline_mmid_down_q51)[x->type == GGML_TYPE_F32 ? 1 : 0];
-    // GGML_VK_EXPDOWN_V=n: variant n of the repacked f16-B kernel (1 KC128, 2 TPW2, 3 TPW4, 4 PK16, 5 EPI_OFF (measurement only,
-    // wrong results), 6 KC128+PK16, 7 TPW2+PK16, 8 KC128+TPW2, 9 TPW8, 10 TPW16); 0 / unset = the kernel above
-    static const int expdown_v = [] { const char * e = getenv("GGML_VK_EXPDOWN_V"); const int v = e ? atoi(e) : 0; return v >= 0 && v <= 10 ? v : 0; }();
+    // GGML_VK_EXPDOWN_V=n: variant n of the repacked f16-B kernel (1 KC128, 2 TPW2, 3 TPW4, 4 PK16, 6 KC128+PK16, 7 TPW2+PK16,
+    // 8 KC128+TPW2, 9 TPW8, 10 TPW16); 0 / unset = the kernel above. 5 was a store-less measurement build and is gone: any value
+    // outside the list runs the kernel above, with a warning
+    static const int expdown_v = [] {
+        const char * e = getenv("GGML_VK_EXPDOWN_V");
+        const int v = e ? atoi(e) : 0;
+        if (v < 0 || v > 10 || v == 5) {
+            GGML_LOG_WARN("ggml_vulkan: GGML_VK_EXPDOWN_V=%s is not a valid variant, using the default down kernel\n", e);
+            return 0;
+        }
+        return v;
+    }();
     uint32_t tpw = 1;
     if (expdown_v != 0 && repacked && x->type == GGML_TYPE_F16 && ctx->device->pipeline_mmid_down_q51_rpv[expdown_v]) {
         const bool kc128 = expdown_v == 1 || expdown_v == 6 || expdown_v == 8;
