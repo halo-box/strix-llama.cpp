@@ -1762,6 +1762,16 @@ private:
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            if (!params_base.ctx_checkpoints_dir.empty()) {
+                common_prompt_checkpoint probe;
+                probe.data_tgt.resize(1);
+                if (!probe.spill(params_base.ctx_checkpoints_dir)) {
+                    SRV_ERR("cannot create files in --ctx-checkpoints-dir %s\n", params_base.ctx_checkpoints_dir.c_str());
+                    return false;
+                }
+                SRV_INF("context checkpoints are kept in unlinked files in %s, not in memory\n",
+                        params_base.ctx_checkpoints_dir.c_str());
+            }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -2877,10 +2887,23 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        spill_checkpoint(cur);
+
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+    }
+
+    // --ctx-checkpoints-dir: move the checkpoint's state out of memory
+    void spill_checkpoint(common_prompt_checkpoint & cur) const {
+        if (params_base.ctx_checkpoints_dir.empty()) {
+            return;
+        }
+        if (!cur.spill(params_base.ctx_checkpoints_dir)) {
+            SRV_WRN("could not move a context checkpoint to %s - it stays in memory\n",
+                    params_base.ctx_checkpoints_dir.c_str());
+        }
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -2936,12 +2959,24 @@ private:
         ckpt_write(ofs, &magic,   sizeof(magic),   n_written);
         ckpt_write(ofs, &version, sizeof(version), n_written);
         ckpt_write(ofs, &count,   sizeof(count),   n_written);
+        std::vector<uint8_t> buf;
         for (const auto & cur : slot.prompt.checkpoints) {
             ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
             ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
             ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
-            ckpt_write_buf(ofs, cur.data_tgt,  n_written);
-            ckpt_write_buf(ofs, cur.data_dft,  n_written);
+            // a spilled checkpoint is read back one part at a time
+            buf.resize(cur.size_tgt());
+            if (!cur.copy_tgt(buf.data())) {
+                SRV_WRN("failed to read a context checkpoint for '%s' - the appendix is incomplete\n", filepath.c_str());
+                return 0;
+            }
+            ckpt_write_buf(ofs, buf, n_written);
+            buf.resize(cur.size_dft());
+            if (!cur.copy_dft(buf.data())) {
+                SRV_WRN("failed to read a context checkpoint for '%s' - the appendix is incomplete\n", filepath.c_str());
+                return 0;
+            }
+            ckpt_write_buf(ofs, buf, n_written);
             ckpt_write_buf(ofs, cur.data_spec, n_written);
         }
         ofs.flush();
@@ -2992,6 +3027,7 @@ private:
                 SLT_WRN(slot, "invalid context checkpoint appendix in '%s' - ignored\n", filepath.c_str());
                 return 0;
             }
+            spill_checkpoint(cur);
             checkpoints.push_back(std::move(cur));
             if (checkpoints.size() > (size_t) params_base.n_ctx_checkpoints) {
                 checkpoints.pop_front();
