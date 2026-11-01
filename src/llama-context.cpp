@@ -23,6 +23,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <unordered_map>
 
 //
@@ -2638,6 +2639,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 // one-token-ahead decode chaining
 //
 
+// A chained decode is recorded, and its token-independent inputs written, before its token is known; only the inputs that
+// are chain_safe() are trusted with that (each type opts in: it reads no token ids, or writes them late into tensors the
+// device reads in place). The token ids tensor itself may feed only the token table's GET_ROWS (the branch build_inp_embd's
+// chain path does not select): any other reader, e.g. a hash routing on the ids, would see the placeholder.
+static bool llama_chain_graph_safe(const llm_graph_result * res, const ggml_tensor * tok_embd, std::string & why) {
+    for (const auto & inp : res->inputs) {
+        if (!inp->chain_safe()) {
+            const llm_graph_input_i & ref = *inp;
+            why = std::string("graph input ") + typeid(ref).name() + " is not chain-safe";
+            return false;
+        }
+    }
+    const ggml_tensor * ids = res->t_inp_tokens;
+    ggml_cgraph * gf = res->get_gf();
+    for (int i = 0; ids != nullptr && gf != nullptr && i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * n = ggml_graph_node(gf, i);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr || (src != ids && src->view_src != ids)) {
+                continue;
+            }
+            if (!(n->op == GGML_OP_GET_ROWS && s == 1 && src == ids && n->src[0] == tok_embd)) {
+                why = std::string("the token ids feed ") + ggml_op_desc(n) + " (" + n->name + ")";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool llama_context::chain_init() {
     if (chain.ready) {
         return true;
@@ -2705,11 +2736,20 @@ bool llama_context::chain_init() {
         // as the token-generation reserve in sched_reserve: with one KV stream per sequence the full memory context
         // needs a token per stream
         const uint32_t n_rs = cparams.kv_unified ? 1 : cparams.n_seq_max;
+        chain.safe = false;
         ggml_cgraph * gf = mctx_full ? graph_reserve(n_rs, n_rs, n_rs, mctx_full.get()) : nullptr;
+        const bool safe = gf != nullptr && chain.safe;   // judged by graph_reserve before scheduling
+        const std::string why = chain.why;
         chain.prep = false;
         chain_swap();
         if (!gf) {
             LLAMA_LOG_WARN("%s: could not reserve the second slot, decode chaining disabled\n", __func__);
+            chain.sched.reset();
+            chain.backend.reset();
+            return false;
+        }
+        if (!safe) {
+            LLAMA_LOG_WARN("%s: %s, decode chaining disabled\n", __func__, why.c_str());
             chain.sched.reset();
             chain.backend.reset();
             return false;
@@ -3299,6 +3339,12 @@ ggml_cgraph * llama_context::graph_reserve(
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
         llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
         hadamard_verified = true;
+    }
+
+    // decode chaining: judge the chained graph before scheduling, which points cross-backend readers at copies of their inputs
+    if (chain.prep && gf) {
+        chain.why.clear();
+        chain.safe = llama_chain_graph_safe(res, model.tok_embd, chain.why);
     }
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);

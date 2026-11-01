@@ -136,6 +136,11 @@ public:
     // true if the input depends on the ubatch token ids (decode chaining writes these last, see
     // llama_context::decode_chain, after the previous decode returned the token)
     virtual bool token_dependent() const { return false; }
+
+    // decode chaining records a decode before its token is known (llama_context::chain_init): true if this input is safe
+    // for that, i.e. it reads no token ids, or it is token_dependent() and writes them into tensors the device reads in
+    // place. An input type opts in; the default refuses chaining for the whole graph.
+    virtual bool chain_safe() const { return false; }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
@@ -153,6 +158,10 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     bool token_dependent() const override { return true; }
+
+    // the token rows arrive through `embd` on the device (build_inp_embd's chain path); the ids tensor is checked by
+    // chain_init (only the token table's GET_ROWS may read it)
+    bool chain_safe() const override { return chain_tab != nullptr; }
 
     ggml_tensor * tokens       = nullptr; // I32 [n_batch]
     ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
@@ -199,6 +208,7 @@ public:
     virtual ~llm_graph_input_pos() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -216,6 +226,7 @@ public:
     virtual ~llm_graph_input_attn_temp() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     ggml_tensor * attn_scale = nullptr; // F32 [n_batch]
 
@@ -230,6 +241,7 @@ public:
     virtual ~llm_graph_input_pos_bucket() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     ggml_tensor * pos_bucket = nullptr; // I32 [n_batch, n_batch]
 
@@ -244,6 +256,7 @@ public:
     virtual ~llm_graph_input_pos_bucket_kv() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     ggml_tensor * pos_bucket = nullptr; // I32 [n_kv, n_batch]
 
@@ -261,6 +274,7 @@ public:
     virtual ~llm_graph_input_out_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -278,6 +292,7 @@ public:
     virtual ~llm_graph_input_mean() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     ggml_tensor * mean; // F32 [n_batch, n_batch]
 
@@ -290,6 +305,7 @@ public:
     virtual ~llm_graph_input_cls() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     ggml_tensor * cls; // I32 [n_batch]
 
@@ -303,6 +319,7 @@ public:
     virtual ~llm_graph_input_rs() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -349,6 +366,7 @@ public:
     ~llm_graph_input_attn_no_cache() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
@@ -376,6 +394,7 @@ public:
     ~llm_graph_input_attn_kv() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -424,6 +443,7 @@ public:
     ~llm_graph_input_attn_k() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -458,6 +478,7 @@ public:
     ~llm_graph_input_attn_k_dsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -500,6 +521,7 @@ public:
     ~llm_graph_input_attn_k_dsa_iswa() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -545,6 +567,7 @@ public:
     ~llm_graph_input_attn_kv_iswa() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -591,6 +614,7 @@ public:
     ~llm_graph_input_attn_k_iswa() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -675,6 +699,7 @@ public:
     ~llm_graph_input_dsv4() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -723,6 +748,7 @@ public:
     virtual ~llm_graph_input_mem_hybrid() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -751,6 +777,7 @@ public:
     virtual ~llm_graph_input_mem_hybrid_k() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -779,6 +806,7 @@ public:
     virtual ~llm_graph_input_mem_hybrid_iswa() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
 
     bool can_reuse(const llm_graph_params & params) override;
 
@@ -800,6 +828,7 @@ public:
     virtual ~llm_graph_input_sampling() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool chain_safe() const override { return true; }   // reads no token ids
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;

@@ -471,6 +471,8 @@ private:
         bool (*mark)(ggml_backend_t)            = nullptr;
         void (*mark_wait)(ggml_backend_t)       = nullptr;
         bool marked[2] = {};                    // the slot's decode set a mark after its sampled-token copy
+        bool        safe = false;               // the last chained graph graph_reserve built is chain-safe (llama_chain_graph_safe)
+        std::string why;                        // why not
     };
 
     chain_state chain;
