@@ -2040,7 +2040,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
-    if (ggml_cuda_mmb_dq_packed(src0)) {   // MMB_DENSE_R2 in-place tile layout: tile GEMM or the packed-aware matvec, never MMVQ/MMQ/cuBLAS
+    if (ggml_cuda_mmb_dq_packed(src0)) {   // MMB_DENSE_R2: use only packed-aware kernels
+        // gfx1151 (2026-10-30): rows 2-4 gained 10-18%; row 8 regressed. Recheck before raising the cutoff.
+        static const int dq_mmvq_max = [] {
+            const char * env = getenv("GGML_CUDA_DQ_MMVQ_MAX");
+            return env ? std::max(0, std::min(atoi(env), MMVQ_MAX_BATCH_SIZE)) : 4;
+        }();
         if (ggml_cuda_mmb_supported_mm(ctx, src0, src1, dst)) {
             ggml_cuda_mul_mat_mmb(ctx, src0, src1, dst);
         } else if (dst->op == GGML_OP_MUL_MAT && dst->src[0] == src0 && dst->src[1] == src1 && ggml_nrows(src1) == 1 &&
@@ -2050,6 +2055,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             ggml_cuda_mmv_group_seg seg;
             seg.w = src0; seg.dst = dst;
             ggml_cuda_mmv_group(ctx, src1, &seg, 1);
+        } else if (ggml_nrows(src1) > 1 && ggml_nrows(src1) <= dq_mmvq_max && src0->type == GGML_TYPE_Q8_0 && src0->ne[1] % 128 == 0 && src0->ne[0] % 64 == 0 &&
+                ggml_is_matrix(src0) && ggml_is_matrix(src1) && ggml_is_matrix(dst) &&
+                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+                src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         } else {
             ggml_cuda_mul_mat_dq(ctx, src0, src1, dst);
         }

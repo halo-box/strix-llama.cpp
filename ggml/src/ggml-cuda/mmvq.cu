@@ -1304,7 +1304,23 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
+static __device__ __forceinline__ float vec_dot_q8_0_q8_1_pk(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int row, const int kbx, const int kqs, const int blocks_per_row) {
+    const uint8_t * ch = (const uint8_t *) vx + ((size_t) (row >> 7) * (blocks_per_row >> 1) + (kbx >> 1)) * 8704;
+    const int r = row & 127;
+    const int * q = (const int *) (ch + r*64 + (kbx & 1)*32);
+    const half d = *(const half *) (ch + 8192 + (r*2 + (kbx & 1))*2);
+    int v[VDR_Q8_0_Q8_1_MMVQ];
+    int u[VDR_Q8_0_Q8_1_MMVQ];
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+        v[i] = q[kqs + i];
+        u[i] = get_int_b4(y->qs, kqs + i);
+    }
+    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, d, __low2half(y->ds));
+}
+
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool packed = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -1472,6 +1488,9 @@ static __global__ void mul_mat_vec_q(
                     const float dot = ggml_cuda_materialize(vec_dot_q_cuda(
                         vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs));
                     tmp[j][i] = __fadd_rn(tmp[j][i], dot);
+                } else if constexpr (packed) {
+                    static_assert(type == GGML_TYPE_Q8_0 && !has_fusion, "packed MMVQ requires Q8_0 without fusion");
+                    tmp[j][i] += vec_dot_q8_0_q8_1_pk(vx, &y[j*stride_col_y + kby], row0 + i, kbx, kqs, blocks_per_row_x);
                 } else {
                     tmp[j][i] += vec_dot_q_cuda(
                         vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
@@ -2559,6 +2578,15 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+    if constexpr (type == GGML_TYPE_Q8_0 && c_ncols_dst > 1) {
+        if (fusion.x_pk) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -2812,7 +2840,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             if constexpr (type == GGML_TYPE_Q8_0) {
                 const bool no_fusion = fusion.gate == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
                     fusion.x_scale == nullptr && fusion.gate_scale == nullptr;
-                if (table_id == MMVQ_PARAMETERS_RDNA3_5 && ids == nullptr && no_fusion) {
+                if (table_id == MMVQ_PARAMETERS_RDNA3_5 && ids == nullptr && no_fusion && !fusion.x_pk) {
                     const dim3 block_nums(nrows_x, nchannels_dst, nsamples_dst);
                     const dim3 block_dims(warp_size, 1, 1);
                     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
@@ -3452,8 +3480,11 @@ void ggml_cuda_mul_mat_vec_q(
     if (mul_mat_vec_q_fq_try(ctx, src0, src1, ids, dst, fusion, 1.0f, 0.0f, 0, /*launch=*/true)) {
         return;
     }
-    // the generic kernels read Q8_0 rows: an MMB_DENSE_R2 packed weight must never get here
-    GGML_ASSERT(!ggml_cuda_mmb_dq_packed(src0) && !(fusion && fusion->gate && ggml_cuda_mmb_dq_packed(fusion->gate)));
+    const bool x_pk = ggml_cuda_mmb_dq_packed(src0);
+    GGML_ASSERT(!(fusion && fusion->gate && ggml_cuda_mmb_dq_packed(fusion->gate)));
+    GGML_ASSERT(!x_pk || (src0->type == GGML_TYPE_Q8_0 && !ids && !fusion && ggml_is_contiguous(src0) &&
+        ne01 % 128 == 0 && ne00 % 64 == 0 && ne02 == 1 && ne03 == 1 && ne2 == 1 && ne3 == 1));
+    fusion_local.x_pk = x_pk ? 1 : 0;
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
