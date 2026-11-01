@@ -16,6 +16,14 @@ typedef float v8f  __attribute__((ext_vector_type(8)));
 static __device__ __forceinline__ uint16_t qsa3_f2h(const float f) { return __builtin_bit_cast(uint16_t, (_Float16) f); }
 static __device__ __forceinline__ float qsa3_h2f(const uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
 
+typedef _Float16 qsa3_half2 __attribute__((ext_vector_type(2)));
+// two q8_0 values in byte 0 and byte 2 of x to packed halves times d (as qd_q8x2_to_h2 of the decode kernel):
+// 0x6400 | (q + 128) is 1024 + q + 128 in half, exact, so the product matches dequantize_block_q8_0_f16
+static __device__ __forceinline__ uint32_t qsa3_q8x2_to_h2(const uint32_t x, const qsa3_half2 d2) {
+    const qsa3_half2 v = __builtin_bit_cast(qsa3_half2, ((x ^ 0x00800080u) & 0x00FF00FFu) | 0x64006400u);
+    return __builtin_bit_cast(uint32_t, (v - qsa3_half2{(_Float16) 1152, (_Float16) 1152}) * d2);
+}
+
 // union builder, kernel A: per query row, check that the (validity-transformed) row is non-decreasing; if not, rank-sort it into srow[q] and set sflag[q]. Sentinel 0x7FFFFFFF for invalid (-1 / >= nk) entries.
 #define QSA3_SENT 0x7FFFFFFF
 
@@ -232,7 +240,7 @@ __global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
 
 struct qsa3_layout {
     size_t q1, q2, o1, o2, m1;
-    size_t knb1, vnb1, knb2, vnb2;   // raw f16 cache strides (DIRECT reads only)
+    size_t knb1, vnb1, knb2, vnb2;   // raw f16 / q8_0 cache strides (DIRECT reads only)
     int nk, n_q, gqa, cap;
     float scale;
     int hq, gs;                      // total q heads; gate row stride in floats (row = query * hq + head)
@@ -241,7 +249,9 @@ struct qsa3_layout {
 // WPE > 0 asks the compiler for that many waves per SIMD (fewer VGPRs per wave): more CTAs in flight to cover the
 // two barriers per 16 keys. 8 (192 VGPRs, no spill) is 4.5% faster than 7 on gfx1151 pp4096 and is what the launches
 // use. Same arithmetic either way.
-template<bool DIRECT, int WPE = 0, bool DIRECT_V = DIRECT> __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(WPE > 0 ? WPE : 1)))
+// Q8: the direct reads take q8_0 K and V rows and dequantize them in registers to the halves the pack would produce
+// (a direct K chunk, dims 32w .. 32w+31 of a key, is exactly q8_0 block w of the row)
+template<bool DIRECT, int WPE = 0, bool DIRECT_V = DIRECT, bool Q8 = false> __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(WPE > 0 ? WPE : 1)))
 void qsa3_attn_kernel(
         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
         const uint16_t * __restrict__ mask, const uint32_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
@@ -334,7 +344,40 @@ void qsa3_attn_kernel(
             return;
         }
         const int kb = blk_of(b, j);
-        if constexpr (DIRECT) {
+        if constexpr (DIRECT && Q8) {
+            // block w sits 34w bytes into a 16-byte aligned row: its quants are dword aligned for odd w (wave-uniform),
+            // 2 bytes past a dword for even w. Aligned dword loads either way, realigned with alignbyte
+            const int key = 4*kb + (r & 3);
+            const uint32_t * a = reinterpret_cast<const uint32_t *>(kbase + (size_t)key * s.knb1 + (size_t)(34*w & ~3));
+            uint32_t dw[9], qd[8];
+#pragma unroll
+            for (int i = 0; i < 9; ++i) { dw[i] = a[i]; }
+            uint16_t dh;
+            if (w & 1) {
+                dh = (uint16_t) (dw[0] >> 16);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { qd[i] = dw[i+1]; }
+            } else {
+                dh = (uint16_t) dw[0];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { qd[i] = __builtin_amdgcn_alignbyte(dw[i+1], dw[i], 2); }
+            }
+            const _Float16 d = __builtin_bit_cast(_Float16, dh);
+            const qsa3_half2 d2 = qsa3_half2{d, d};
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                uint32_t h[8];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    // bytes 0 and 2, then 1 and 3, back into order: (q0, q1), (q2, q3)
+                    const uint32_t x = qd[4*t + j];
+                    const uint32_t e = qsa3_q8x2_to_h2(x, d2), o = qsa3_q8x2_to_h2(x >> 8, d2);
+                    h[2*j]   = __builtin_amdgcn_perm(o, e, 0x05040100u);
+                    h[2*j+1] = __builtin_amdgcn_perm(o, e, 0x07060302u);
+                }
+                kf[t] = __builtin_bit_cast(v16s, h);
+            }
+        } else if constexpr (DIRECT) {
             // the packed 16-half chunk at (key, w, t) is dims (2w+t)*16 .. +15 of that key's row
             const int key = 4*kb + (r & 3);
             const char * p = kbase + (size_t)key * s.knb1 + (size_t)((2*w) * 16) * 2;
@@ -383,7 +426,25 @@ void qsa3_attn_kernel(
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
                 const int d = 32*w + 16*t + r;
-                if constexpr (DIRECT_V) {
+                if constexpr (DIRECT_V && Q8) {
+                    // dim d is qs[16t + r] of q8_0 block w; each key row has its own scale
+                    auto kv4 = [&](const int kb) -> uint2 {
+                        const char * row = vbase + (size_t)(4*kb) * s.vnb1 + (size_t) w * sizeof(block_q8_0);
+                        uint32_t qv[4];
+                        _Float16 dv[4];
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const auto * blk = reinterpret_cast<const block_q8_0 *>(row + (size_t) j * s.vnb1);
+                            dv[j] = __builtin_bit_cast(_Float16, blk->d);
+                            qv[j] = (uint8_t) blk->qs[16*t + r];
+                        }
+                        return make_uint2(qsa3_q8x2_to_h2(qv[0] | (qv[1] << 16), qsa3_half2{dv[0], dv[1]}),
+                                          qsa3_q8x2_to_h2(qv[2] | (qv[3] << 16), qsa3_half2{dv[2], dv[3]}));
+                    };
+                    vf[t] = __builtin_bit_cast(v16s, (uint2[4]){
+                        mask_values(kv4(kb0), m01 & 0xffffu), mask_values(kv4(kb1), m01 >> 16),
+                        mask_values(kv4(kb2), m23 & 0xffffu), mask_values(kv4(kb3), m23 >> 16)});
+                } else if constexpr (DIRECT_V) {
                     // the packed uint2 holds the four keys of block kb at dim d; gather them from the rows
                     const char * col = vbase + (size_t)d * 2;
                     auto kv4 = [&](const int kb) -> uint2 {
@@ -616,11 +677,13 @@ static void qsa_prefill_impl1(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int n_q = (int) q->ne[1], ns = (int) ids->ne[0], nk = (int) k->ne[1];
     // QSA_DIRECT: -1/auto reads K direct (32 B row reads) and packs only V, unless the attention is small against the cache
     // (the pack is O(n_kv) per ubatch, its gain O(n_q)): then V is read direct too. 0 packs both, 1 reads both direct,
-    // 2 forces K direct with V packed. All paths are bit-identical. The direct reads are f16 only, so q8_0 K/V always pack.
+    // 2 forces K direct with V packed. All paths are bit-identical. The direct reads take f16 or q8_0 K and V of one
+    // type (q8_0 dequantizes in registers to the packed halves); mixed K/V types always pack.
     static const int qsa_direct_cfg = getenv("QSA_DIRECT") ? atoi(getenv("QSA_DIRECT")) : -1;
-    const bool kv_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
-    const bool qsa_direct = kv_f16 && (qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 64 < (size_t) nk));
-    const bool qsa_kdirect = kv_f16 && (qsa_direct || qsa_direct_cfg == 2 || qsa_direct_cfg < 0);
+    const bool kv_q8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
+    const bool kv_direct_ok = kv_q8 || (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+    const bool qsa_direct = kv_direct_ok && (qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 64 < (size_t) nk));
+    const bool qsa_kdirect = kv_direct_ok && (qsa_direct || qsa_direct_cfg == 2 || qsa_direct_cfg < 0);
     ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), qsa_kdirect ? 0 : ggml_nelements(k));
     ggml_cuda_pool_alloc<uint16_t> packed_v(ctx.pool(), qsa_direct ? 0 : ggml_nelements(v));
     if (!qsa_kdirect) {
@@ -661,11 +724,11 @@ static void qsa_prefill_impl1(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const float * gp = gate ? (const float *) gate->data : nullptr;
     const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
     if (qsa_kdirect && !qsa_direct) {
-        ggml_cuda_kernel_launch(qsa3_attn_kernel<true, 8, false>, launch, (const float *) q->data, (const uint16_t *) k->data, packed_v.get(),
+        ggml_cuda_kernel_launch(kv_q8 ? qsa3_attn_kernel<true, 8, false, true> : qsa3_attn_kernel<true, 8, false>, launch, (const float *) q->data, (const uint16_t *) k->data, packed_v.get(),
                                 m ? (const uint16_t *) m->data : nullptr, (const uint32_t *) ublk.get(), (const uint16_t *) umask.get(),
                                 (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
     } else if (qsa_direct) {
-        ggml_cuda_kernel_launch(qsa3_attn_kernel<true, 8>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
+        ggml_cuda_kernel_launch(kv_q8 ? qsa3_attn_kernel<true, 8, true, true> : qsa3_attn_kernel<true, 8>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
                                 m ? (const uint16_t *) m->data : nullptr, (const uint32_t *) ublk.get(), (const uint16_t *) umask.get(),
                                 (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
     } else {
