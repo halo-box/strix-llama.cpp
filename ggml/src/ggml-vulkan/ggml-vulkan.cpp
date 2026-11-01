@@ -457,12 +457,13 @@ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     ctx->device->device.resetFences({ ctx->fence });
 }
 
-// Decode weight prefetch from a second compute queue (GGML_VK_DECODE_PREFETCH_Q, default on where supported; =0 turns it off).
+// Decode weight prefetch from a second compute queue (GGML_VK_DECODE_PREFETCH_Q; default on for Strix Halo (gfx1151), where it was
+// measured, off elsewhere; =1 turns it on wherever the device supports it, =0 off).
 // GGML_VK_DECODE_PREFETCH_Q_QUIESCE=0 turns off the host-side end of a resident side dispatch before a mid-graph wait or an allocation.
 // _WG workgroups of the side dispatch (4), _MAX_MB bytes touched per target at most (24), _POLLS bound on the side dispatch's
 // phase polls (256k, about 40 ms), _CHUNK grid-stride passes between phase checks (1).
 struct vk_prefetch_q_cfg {
-    bool on;
+    int on;   // GGML_VK_DECODE_PREFETCH_Q: -1 unset (the device default), 0 off, 1 on
     uint32_t wgs;
     size_t max_bytes;
     uint32_t polls;
@@ -473,7 +474,7 @@ static const vk_prefetch_q_cfg & ggml_vk_prefetch_q_cfg() {
     static const vk_prefetch_q_cfg cfg = [] {
         auto env = [](const char * k, long d) { const char * e = getenv(k); return e != nullptr ? atol(e) : d; };
         vk_prefetch_q_cfg c;
-        c.on        = env("GGML_VK_DECODE_PREFETCH_Q", 1) != 0;
+        c.on        = (int) std::min(1L, env("GGML_VK_DECODE_PREFETCH_Q", -1));
         c.wgs       = (uint32_t) std::min(64L, std::max(1L, env("GGML_VK_DECODE_PREFETCH_Q_WG", 4)));
         c.max_bytes = (size_t) std::max(1L, env("GGML_VK_DECODE_PREFETCH_Q_MAX_MB", 24)) * 1024 * 1024;
         c.polls     = (uint32_t) std::max(1024L, env("GGML_VK_DECODE_PREFETCH_Q_POLLS", 1L << 18));
@@ -483,8 +484,14 @@ static const vk_prefetch_q_cfg & ggml_vk_prefetch_q_cfg() {
     return cfg;
 }
 
-static bool ggml_vk_decode_prefetch_q_env() {
-    return ggml_vk_prefetch_q_cfg().on;
+// AMD Strix Halo (Radeon 8060S / 8050S, gfx1151): the only device the prefetch queue was measured on
+static bool ggml_vk_is_gfx1151(uint32_t vendor_id, uint32_t device_id) {
+    return vendor_id == VK_VENDOR_ID_AMD && device_id == 0x1586;
+}
+
+static bool ggml_vk_decode_prefetch_q_env(uint32_t vendor_id, uint32_t device_id) {
+    const int on = ggml_vk_prefetch_q_cfg().on;
+    return on < 0 ? ggml_vk_is_gfx1151(vendor_id, device_id) : on != 0;
 }
 
 static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
@@ -5601,7 +5608,8 @@ vk_device ggml_vk_get_device(size_t idx) {
         // decode weight prefetch from a second compute queue: needs one more queue of the compute family (index 0 = compute, then
         // the transfer queue when it shares the family), buffer markers for the phase word and buffer device addresses for the weights
         const uint32_t prefetch_queue_index = compute_queue_family_index == transfer_queue_family_index ? 2 : 1;
-        const bool want_prefetch_queue = ggml_vk_decode_prefetch_q_env() && device->vendor_id == VK_VENDOR_ID_AMD && buffer_marker_extension &&
+        const bool want_prefetch_queue = ggml_vk_decode_prefetch_q_env(device->vendor_id, device->properties.deviceID) &&
+                                         device->vendor_id == VK_VENDOR_ID_AMD && buffer_marker_extension &&
                                          !device->single_queue &&
                                          queue_family_props[compute_queue_family_index].queueCount >= prefetch_queue_index + 1;
 
@@ -16600,6 +16608,7 @@ static void ggml_vk_prefetch_q_marker(ggml_backend_vk_context * ctx, vk_context 
 static constexpr uint32_t DECODE_PREFETCH_Q_MAX_TARGETS = 32000;
 
 static void ggml_vk_prefetch_q_quiesce(void * c);
+static void ggml_vk_prefetch_q_quiesce_all(void * d);
 static bool ggml_vk_prefetch_q_init(ggml_backend_vk_context * ctx) {
     if (ctx->prefetch_q_init_done) {
         return ctx->prefetch_q_ok;
@@ -16648,8 +16657,12 @@ static bool ggml_vk_prefetch_q_init(ggml_backend_vk_context * ctx) {
         return false;
     }
     ctx->prefetch_q_ok = true;
-    dev->prefetch_q_quiesce_ctx = ctx;
-    dev->prefetch_q_quiesce = ggml_vk_prefetch_q_quiesce;
+    {
+        std::lock_guard<std::mutex> lock(dev->prefetch_q_mutex);
+        dev->prefetch_q_ctxs.push_back(ctx);
+        dev->prefetch_q_quiesce_ctx = dev.get();
+        dev->prefetch_q_quiesce = ggml_vk_prefetch_q_quiesce_all;
+    }
     return true;
 }
 
@@ -16658,9 +16671,14 @@ static void ggml_vk_prefetch_q_destroy(ggml_backend_vk_context * ctx) {
         return;
     }
     vk_device & dev = ctx->device;
-    if (dev->prefetch_q_quiesce_ctx == ctx) {
-        dev->prefetch_q_quiesce = nullptr;
-        dev->prefetch_q_quiesce_ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(dev->prefetch_q_mutex);
+        auto & v = dev->prefetch_q_ctxs;
+        v.erase(std::remove(v.begin(), v.end(), (void *) ctx), v.end());
+        if (v.empty()) {
+            dev->prefetch_q_quiesce = nullptr;
+            dev->prefetch_q_quiesce_ctx = nullptr;
+        }
     }
     for (auto & sl : ctx->prefetch_q_slots) {
         if (sl.pending) {
@@ -16701,6 +16719,16 @@ static void ggml_vk_prefetch_q_quiesce(void * c) {
     }
 }
 
+// the device hook (buffer creation / free): every context of the device with prefetch resources, a draft model's or the second
+// decode-chain context's as well as the one that allocates
+static void ggml_vk_prefetch_q_quiesce_all(void * d) {
+    vk_device_struct * dev = (vk_device_struct *) d;
+    std::lock_guard<std::mutex> lock(dev->prefetch_q_mutex);
+    for (void * c : dev->prefetch_q_ctxs) {
+        ggml_vk_prefetch_q_quiesce(c);
+    }
+}
+
 static void ggml_vk_prefetch_q_plan(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
     ctx->prefetch_q_active = false;
     ctx->prefetch_q_open = -1;
@@ -16711,7 +16739,7 @@ static void ggml_vk_prefetch_q_plan(ggml_backend_vk_context * ctx, const ggml_cg
         GGML_LOG_INFO("ggml_vulkan: decode prefetch q: on %d, queue %d, markers %d, bda %d\n", (int) cfg.on, ctx->device->prefetch_queue != nullptr,
                       (int) ctx->device->buffer_marker, (int) ctx->device->buffer_device_address);
     }
-    if (!cfg.on || !ctx->device->prefetch_queue) {
+    if (cfg.on == 0 || !ctx->device->prefetch_queue) {
         return;
     }
     bool any_dense = false;
