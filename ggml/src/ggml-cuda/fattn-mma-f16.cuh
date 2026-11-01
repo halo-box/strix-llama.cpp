@@ -398,14 +398,11 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_use_spill_fix(cons
         (DKQ == 128 && ncols2 > 1 && ncols >= 16) || (DKQ == 256 && ncols2 > 1 && ncols >= 32);
 }
 
-// gfx1151/ROCm 10.1 clang 24: these kernels spill SGPRs to VGPR lanes (1-19 each, 54 in total) unless the scheduler
-// keeps the KQ, softmax and VKQ phases of a KV iteration apart (2026-11-01). Remove when they compile without SGPR spills.
-// D64 4x8 is left out: its spill-free variants change the occupancy query and with it the stream-k split.
+// gfx1151/ROCm 10.1 clang 24: a barrier between the KQ, softmax and VKQ phases removes the SGPR spills of D64 8x4 (6) and D128 16x4 (19).
+// Kernel time with it (2026-11-01): D128 16x4 2-6% faster at KV 512-32768, D64 8x4 3-11% faster at KV >= 4096 but 3-10% slower below.
+// The other spilling configs got 1-21% slower with it and keep their spills. Remove when these kernels compile without SGPR spills.
 static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_use_phase_barrier(const int DKQ, const int ncols1, const int ncols2, const bool softcap) {
-    const bool c4x8 = ncols1 == 4 && ncols2 == 8, c8x4 = ncols1 == 8 && ncols2 == 4;
-    return (DKQ == 64 && !softcap && (c8x4 || (ncols1 == 16 && ncols2 == 2))) ||
-        (DKQ == 128 && !softcap && ((ncols1 == 16 && ncols2 == 4) || (ncols1 == 32 && ncols2 == 2))) ||
-        ((DKQ == 128 || DKQ == 256) && softcap && (c4x8 || c8x4));
+    return !softcap && ((DKQ == 64 && ncols1 == 8 && ncols2 == 4) || (DKQ == 128 && ncols1 == 16 && ncols2 == 4));
 }
 
 // gfx1151/ROCm 10.1 clang 24: Q reuse keeps D128 8x8 at 256 VGPRs; D256 8x8 needs 224 without address bounds (2026-10-24).
@@ -2038,10 +2035,9 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(AMD_MFMA_AVAILABLE)
 
 #if defined(RDNA3_5)
-    if constexpr ((DKQ == 64 && !use_logit_softcap && ncols1 == 16 && ncols2 == 2) ||
-        (DKQ == 112 && !use_logit_softcap && ((ncols1 == 16 && ncols2 == 4) || (ncols1 == 8 && ncols2 == 8))) ||
+    if constexpr ((DKQ == 112 && !use_logit_softcap && ((ncols1 == 16 && ncols2 == 4) || (ncols1 == 8 && ncols2 == 8))) ||
         (DKQ == 128 && ((use_logit_softcap && ncols1 == 16 && ncols2 == 4) || (!use_logit_softcap && ncols1 == 8 && ncols2 == 8)))) {
-        // ROCm 10.1 / gfx1151 queries these 241-246-VGPR kernels at five blocks instead of the baseline's six.
+        // ROCm 10.1 / gfx1151 queries these 242-246-VGPR kernels at five blocks instead of the baseline's six.
         // Keep the baseline register reservation until launch partitions stop using the occupancy query.
         asm volatile("" ::: "v255");
     }

@@ -162,7 +162,8 @@
   },
   "minimum_kernel_count": 7214,
   "reasons": {
-    "sgpr_lane_spill": "ROCm 10.1 / clang 24 spills these flash_attn_ext_f16 SGPRs to VGPR lanes (no scratch). The spill-free variants tried in 2026-11 change the occupancy-derived stream-k split and the output bytes (D64 4x8), or need a rolled softcap loop that puts the KQ tile in scratch (softcap D128 16x2 and 32x2). Remove when a variant is spill-free with unchanged output."
+    "sgpr_lane_spill": "ROCm 10.1 / clang 24 spills these flash_attn_ext_f16 SGPRs to VGPR lanes (no scratch). The spill-free variants tried in 2026-11 change the occupancy-derived stream-k split and the output bytes (D64 4x8), or need a rolled softcap loop that puts the KQ tile in scratch (softcap D128 16x2 and 32x2). Remove when a variant is spill-free with unchanged output.",
+    "sgpr_lane_spill_slower": "ROCm 10.1 / clang 24 spills these SGPRs to VGPR lanes (no scratch). Spill-free variants with unchanged output exist (a sched_barrier between the flash-attention KQ, softmax and VKQ phases; an 8-row unroll of the KV_max mask scan), but a 2026-11-01 kernel-time A/B against master on gfx1151 measured them slower: D64 16x2 +21% at KV 4096, D128 32x2 +4%, softcap D128 4x8 / 8x4 and D256 4x8 / 8x4 +1-6%, KV_max<64> +3-5% at 1024-4096 query rows. Remove a budget when its kernel has a spill-free variant that is not slower."
   },
   "kernels": {
     "_ZL18flash_attn_ext_f16ILi128ELi128ELi16ELi2ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
@@ -172,6 +173,13 @@
       "sgpr_spills": 5,
       "reason": "sgpr_lane_spill"
     },
+    "_ZL18flash_attn_ext_f16ILi128ELi128ELi32ELi2ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+      "vgprs": 245,
+      "spill_stores": 0,
+      "scratch_bytes": 0,
+      "sgpr_spills": 19,
+      "reason": "sgpr_lane_spill_slower"
+    },
     "_ZL18flash_attn_ext_f16ILi128ELi128ELi32ELi2ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
       "vgprs": 253,
       "spill_stores": 0,
@@ -179,12 +187,54 @@
       "sgpr_spills": 5,
       "reason": "sgpr_lane_spill"
     },
+    "_ZL18flash_attn_ext_f16ILi128ELi128ELi4ELi8ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+      "vgprs": 216,
+      "spill_stores": 0,
+      "scratch_bytes": 0,
+      "sgpr_spills": 1,
+      "reason": "sgpr_lane_spill_slower"
+    },
+    "_ZL18flash_attn_ext_f16ILi128ELi128ELi8ELi4ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+      "vgprs": 213,
+      "spill_stores": 0,
+      "scratch_bytes": 0,
+      "sgpr_spills": 1,
+      "reason": "sgpr_lane_spill_slower"
+    },
+    "_ZL18flash_attn_ext_f16ILi256ELi256ELi4ELi8ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+      "vgprs": 256,
+      "spill_stores": 0,
+      "scratch_bytes": 0,
+      "sgpr_spills": 1,
+      "reason": "sgpr_lane_spill_slower"
+    },
+    "_ZL18flash_attn_ext_f16ILi256ELi256ELi8ELi4ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+      "vgprs": 256,
+      "spill_stores": 0,
+      "scratch_bytes": 0,
+      "sgpr_spills": 1,
+      "reason": "sgpr_lane_spill_slower"
+    },
+    "_ZL18flash_attn_ext_f16ILi64ELi64ELi16ELi2ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+      "vgprs": 239,
+      "spill_stores": 0,
+      "scratch_bytes": 0,
+      "sgpr_spills": 6,
+      "reason": "sgpr_lane_spill_slower"
+    },
     "_ZL18flash_attn_ext_f16ILi64ELi64ELi4ELi8ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
       "vgprs": 247,
       "spill_stores": 0,
       "scratch_bytes": 0,
       "sgpr_spills": 6,
       "reason": "sgpr_lane_spill"
+    },
+    "_ZL25flash_attn_mask_to_KV_maxILi64EEvPK7__half2Piill": {
+      "vgprs": 12,
+      "spill_stores": 0,
+      "scratch_bytes": 0,
+      "sgpr_spills": 86,
+      "reason": "sgpr_lane_spill_slower"
     }
   }
 }
