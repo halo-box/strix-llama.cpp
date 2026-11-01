@@ -1036,7 +1036,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
-    vk_pipeline pipeline_gdn_chunk_prep, pipeline_gdn_chunk_scan;   // chunked prefill form (GGML_VK_GDN_CHUNK)
+    vk_pipeline pipeline_gdn_chunk_prep, pipeline_gdn_chunk_scan;   // chunked prefill form
     vk_pipeline pipeline_coopmat_layout_check[2];  // wave32, wave64: RDNA3/RADV fragment layout probe (ggml_vk_check_coopmat_rdna3_layout)
     bool coopmat_rdna3_layout {};                   // the probe passed: the manual-fragment "_mf" and REG_A MUL_MAT_ID pipelines may be used
     uint32_t gdn_chunk_scan_nsplit = 1;   // scan workgroups per value head

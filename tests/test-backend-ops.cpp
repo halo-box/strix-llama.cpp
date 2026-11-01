@@ -9364,7 +9364,7 @@ struct test_topk_qsa : public test_case {
 };
 
 // qwen4exp QSA indexer scorer: MUL_MAT(pooled keys, q) -> relu -> 4-head sum (-> + block bias), the chain build_qsa_top_k
-// emits for one query strip; the Vulkan backend fuses it into one GEMM epilogue (QSA_SCORE, GGML_VK_QSA_SCORE). n_pool > n_blocks
+// emits for one query strip; the Vulkan backend fuses it into one GEMM epilogue (QSA_SCORE). n_pool > n_blocks
 // scores a leading view of the pooled keys (the score_key_limits bound); q_first > 0 or q_rows > n_tps scores a strip view of a
 // longer q, as every strip but the single whole one does. exact: inputs are multiples of 1/8, so every product and partial sum
 // is exact in f16 inputs and f32 accumulation and the result must match the CPU bit for bit.
