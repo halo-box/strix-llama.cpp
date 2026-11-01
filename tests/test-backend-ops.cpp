@@ -4371,6 +4371,23 @@ struct test_mul_mat_f16b : public test_case {
                 return false;
             }
         }
+        // GGML_VK_TEST_REQUIRE_DQ8=1 asserts the dense q8_0 x f16 GEMM (GGML_VK_DENSE_DQ8) took every eligible shape
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_DQ8")) {
+            const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_DENSE_DQ8");
+            // GGML_VK_DENSE_DQ8 unset or 1 = the default shape rule (as ggml-vulkan.cpp, 3/4 of a workgroup per CU taken for 40 CUs),
+            // 2..6 = a forced tile on every eligible shape, 0 = off
+            const char * de = getenv("GGML_VK_DENSE_DQ8");
+            const int mode = de ? atoi(de) : 1;
+            const char * fe = getenv("GGML_VK_DENSE_DQ8_FEWROW");
+            const bool fewrow = (fe == nullptr || atoi(fe) != 0) && m <= 384 && k >= 4096 && n >= 1024;
+            const bool rule = fewrow || (k <= 4096 && n >= 256 && ((m + 127) / 128) * ((n + 255) / 256) >= 30);
+            const bool want = type_a == GGML_TYPE_Q8_0 && k >= 1024 && k % 64 == 0 && m >= 128 && n >= 64 && mode != 0 &&
+                              (mode >= 2 || rule);
+            if (c >= 0 && (c > 0) != want) {
+                msg = "MUL_MAT_DENSE_DQ8 dispatches: " + std::to_string(c) + (want ? " (expected the dq8 GEMM)" : " (expected another path)");
+                return false;
+            }
+        }
         if (pad == 0 || n <= 8 || !engagement_required(backend, "GGML_VK_TEST_REQUIRE_ROWSTRIDE")) {
             return true;   // unpadded; a mat-vec width (B is the vector side there and is copied); not asked
         }
@@ -4390,6 +4407,27 @@ struct test_mul_mat_f16b : public test_case {
             b = ggml_view_2d(ctx, b, k, n, b->nb[1], 0);
         }
         return ggml_mul_mat(ctx, a, b);
+    }
+};
+
+// NA q8_0 x f16 GEMMs on distinct weights and one f16 B, outputs summed: with NA * weight bytes past the 32 MB MALL each GEMM
+// meets a cold weight, as in a model, where a repeated single GEMM keeps its weight cached (perf mode only)
+struct test_mul_mat_f16b_cold : public test_case {
+    const int m, n, k, na;
+    test_mul_mat_f16b_cold(int m, int n, int k, int na) : m(m), n(n), k(k), na(na) {}
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_F16B_COLD"; }
+    std::string vars() override { return VARS_TO_STR4(m, n, k, na); }
+    bool run_whole_graph() override { return true; }
+    uint64_t op_flops(ggml_tensor *) override { return 2ull * m * n * k * na; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, n);
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < na; i++) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
+            ggml_tensor * d = ggml_mul_mat(ctx, a, b);
+            out = out ? ggml_add(ctx, out, d) : d;
+        }
+        return out;
     }
 };
 
@@ -13173,6 +13211,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_f16b(t, 96, n, 256));
         }
     }
+    // the dense q8_0 x f16 GEMM (GGML_VK_DENSE_DQ8): full and ragged tiles in m and n, one K step, B row pad
+    for (int m : {128, 200, 1000}) {
+        for (int n : {64, 77, 300, 513}) {
+            test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, m, n, 1024));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 384, 256, 64));   // k < 1024 stays on int8 (not dq8)
+    test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 2560, 300, 2560));
+    test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 1000, 300, 1024, 128));
     // shapes the XL gate's 1/16 margin (q8_0, k >= 2048) moves from the L to the XL tile (17 L waves vs 9 XL waves on 40 CUs), one
     // with ragged m and n; the same m, n at k = 1024 and the q4_K ones keep the L tile
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
@@ -16694,9 +16741,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, 10240, 2048, 320));
     // the same Flash-Next dense GEMMs with the f16 B the model feeds (the f16-B coopmat route, L / XL tiles), at ub 2048 / 4096 / 8192
     for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144}, {640, 2560},
-                                                        {512, 2560}, {2560, 640}, {320, 10240}, {10240, 320} }) {
-        for (int n : {2048, 4096, 8192}) {
+                                                        {512, 2560}, {2560, 640}, {320, 10240}, {10240, 320}, {2560, 2560}, {6144, 6144} }) {
+        for (int n : {64, 128, 512, 2048, 4096, 8192}) {
             test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, mk[0], n, mk[1]));
+        }
+    }
+    for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {12288, 2560}, {6144, 2560} }) {
+        for (int n : {2048, 8192}) {
+            test_cases.emplace_back(new test_mul_mat_f16b_cold(mk[0], n, mk[1], 4));
         }
     }
     // shapes the XL gate's margin moves from L to XL on 40 CUs (17..77 L waves; q8_0, k >= 2048); k = 1024 and q4_K keep L

@@ -1,0 +1,233 @@
+#version 450
+
+// Dense q8_0 x f16 GEMM for the KHR coopmat devices with 16x16x16 f16 WMMA (RDNA3.x wave32): D[n][m] = sum_k A[m][k] * B[n][k].
+// One workgroup = BM x BN of D, (BM / WM) x (BN / WN) wave32 subgroups of WM x WN, BK = 64 (two q8_0 blocks per row and step).
+// - A is read in place in the ggml q8_0 layout: a row is K / 32 blocks of 34 bytes, so with K % 64 == 0 every pair of blocks
+//   starts on a dword. A thread loads the 9 dwords that hold one block (d + 32 qs) and shifts by 2 bytes for an even block.
+// - A is dequantised once into LDS as f16, RN_f16(q * d), with the other q8_0 loaders' expression (see dq4).
+// - B (f16, K contiguous per column) is staged with 16-byte loads. LDS rows are 72 halves (64 + 8 pad).
+// - The next step's global loads are issued before the current step's WMMAs (register prefetch, one stage).
+// - Per 16-wide k step a wave loads its WM / 16 A fragments once and streams its WN / 16 B fragments (two fragment loads per
+//   four WMMAs at 64 x 64), the accumulators stay in registers for the whole K loop, f32.
+// Rows past M and columns past N are clamped on load and never stored. Batch 1 only (no broadcast, no split-k).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint BM = 128;
+layout(constant_id = 2) const uint BN = 256;
+layout(constant_id = 3) const uint WM = 64;
+layout(constant_id = 4) const uint WN = 64;
+layout(constant_id = 5) const uint BK = 64;   // 64 or 32
+#ifdef D_F16
+// f16 output (MUL_MAT + CPY(f16) fusion): D is f16, RNE from the f32 accumulators
+#endif
+
+layout(binding = 0) readonly buffer A { uint data_a[]; };
+layout(binding = 1) readonly buffer B { uvec4 data_b4[]; };
+#ifdef D_F16
+layout(binding = 2) writeonly buffer D { float16_t data_d[]; };
+#else
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+#endif
+
+layout(push_constant) uniform parameter {
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+    uint base_work_group_z;
+    uint num_batches;
+    uint k_split;
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+    uint padded_N;
+} p;
+
+// BK 64: a thread dequantises one whole q8_0 block per step (9 dwords). BK 32: one half block (16 qs) per step, the block parity is
+// the same for every lane of a step. LDS rows are BK + 8 halves.
+const uint LS4 = BK / 8 + 1;   // LDS row stride in uvec4
+const uint KK  = BK / 16;      // 16-wide k steps per BK
+const uint TMF = WM / 16;
+const uint TNF = WN / 16;
+const uint WAVES_M = BM / WM;
+const uint A_IT = (2 * BM) / BLOCK_SIZE;   // BK 64: blocks, BK 32: half blocks, per thread and step
+const uint B_IT = (BN * (BK / 8)) / BLOCK_SIZE;                // 16-byte B chunks per thread and step
+
+shared uvec4 As[BM * LS4];
+shared uvec4 Bs[BN * LS4];
+
+// four q8_0 bytes -> four f16 RN_f16(q * d): unsigned bytes (q + 128) * d - 128 * d in one fma (exact in f32) rounded once to f16,
+// the same expression as the other q8_0 loaders (RADV: v_cvt_f32_ubyte + v_fma_mix), so the A operand matches theirs bit for bit
+uvec2 dq4(const uint x, const float d) {
+    const uint u = x ^ 0x80808080u;
+    const vec4 v = fma(vec4(float(u & 0xffu), float((u >> 8) & 0xffu), float((u >> 16) & 0xffu), float(u >> 24)), vec4(d), vec4(-128.0f * d));
+    return uvec2(packFloat2x16(f16vec2(v.xy)), packFloat2x16(f16vec2(v.zw)));
+}
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint wave = tid / 32;
+    const uint wm   = wave % WAVES_M;
+    const uint wn   = wave / WAVES_M;
+    const uint m0   = gl_WorkGroupID.x * BM;
+    const uint n0   = gl_WorkGroupID.y * BN;
+    const uint nks  = p.K / BK;
+    const uint row_dw = (p.stride_a / 32) * 34 / 4;   // dwords per A row (stride_a % 64 == 0)
+
+    // A item i: row = idx % BM (consecutive lanes, consecutive rows), sub = idx / BM: the block of the pair (BK 64) or the
+    // half block (BK 32); both are uniform across a wave since BM % 32 == 0
+    uint a_row_dw[A_IT]; uint a_sub[A_IT]; uint a_dst[A_IT];
+    [[unroll]] for (uint i = 0; i < A_IT; i++) {
+        const uint idx = tid + i * BLOCK_SIZE;
+        const uint row = idx % BM, sub = idx / BM;
+        a_row_dw[i] = min(m0 + row, p.M - 1) * row_dw;
+        a_sub[i] = sub;
+        a_dst[i] = row * LS4 + sub * (BK == 64 ? 4 : 2);
+    }
+    uint b_src[B_IT]; uint b_dst[B_IT];
+    [[unroll]] for (uint i = 0; i < B_IT; i++) {
+        const uint idx = tid + i * BLOCK_SIZE;
+        const uint col = idx / (BK / 8), ch = idx % (BK / 8);
+        const uint gcol = min(n0 + col, p.N - 1);
+        b_src[i] = (gcol * p.stride_b) / 8 + ch;
+        b_dst[i] = col * LS4 + ch;
+    }
+
+    uint  araw[A_IT][9];
+    uvec4 braw[B_IT];
+    bool  a_odd;   // BK 32: this step's block starts 2 bytes into a dword (odd block index); BK 64: the item is the odd block
+
+#define FETCH(ks) \
+    if (BK == 64) { \
+        [[unroll]] for (uint i = 0; i < A_IT; i++) { \
+            const uint base = a_row_dw[i] + (ks) * 17 + a_sub[i] * 8; \
+            [[unroll]] for (uint w = 0; w < 9; w++) { araw[i][w] = data_a[base + w]; } \
+        } \
+    } else { \
+        /* block kb = ks at byte 34 * ks of the row: d in the dword at floor((34 ks) / 4), qs of half h from byte 34 ks + 2 + 16 h */ \
+        a_odd = ((ks) & 1) != 0; \
+        [[unroll]] for (uint i = 0; i < A_IT; i++) { \
+            const uint b0 = (ks) * 34; \
+            araw[i][0] = data_a[a_row_dw[i] + b0 / 4]; \
+            const uint q0 = (b0 + 2 + 16 * a_sub[i]) / 4; \
+            [[unroll]] for (uint w = 0; w < 5; w++) { araw[i][w + 1] = data_a[a_row_dw[i] + q0 + w]; } \
+        } \
+    } \
+    [[unroll]] for (uint i = 0; i < B_IT; i++) { braw[i] = data_b4[b_src[i] + (ks) * (BK / 8)]; }
+
+#define STORE() \
+    if (BK == 64) { \
+        [[unroll]] for (uint i = 0; i < A_IT; i++) { \
+            const bool odd = a_sub[i] != 0; \
+            const float d = float(unpackFloat2x16(odd ? (araw[i][0] >> 16) : araw[i][0]).x); \
+            uint q[8]; \
+            [[unroll]] for (uint w = 0; w < 8; w++) { q[w] = odd ? araw[i][w + 1] : ((araw[i][w] >> 16) | (araw[i][w + 1] << 16)); } \
+            [[unroll]] for (uint c = 0; c < 4; c++) { \
+                As[a_dst[i] + c] = uvec4(dq4(q[2 * c], d), dq4(q[2 * c + 1], d)); \
+            } \
+        } \
+    } else { \
+        [[unroll]] for (uint i = 0; i < A_IT; i++) { \
+            const float d = float(unpackFloat2x16(a_odd ? (araw[i][0] >> 16) : araw[i][0]).x); \
+            uint q[4]; \
+            /* odd block: qs dword-aligned (araw[1..4]); even: 2 bytes in (araw[1..5] shifted) */ \
+            [[unroll]] for (uint w = 0; w < 4; w++) { q[w] = a_odd ? araw[i][w + 1] : ((araw[i][w + 1] >> 16) | (araw[i][w + 2] << 16)); } \
+            [[unroll]] for (uint c = 0; c < 2; c++) { \
+                As[a_dst[i] + c] = uvec4(dq4(q[2 * c], d), dq4(q[2 * c + 1], d)); \
+            } \
+        } \
+    } \
+    [[unroll]] for (uint i = 0; i < B_IT; i++) { Bs[b_dst[i]] = braw[i]; }
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[TMF * TNF];
+    [[unroll]] for (uint i = 0; i < TMF * TNF; i++) {
+        acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa[TMF];
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb[TNF];
+
+    // All TMF A and TNF B fragments of a 16-k step stay resident; each is reloaded for the next 16-k step right after its last
+    // WMMA of this one (B after the last row, A after its row), so the LDS reads overlap the remaining WMMAs.
+#define LDA(i, kk) coopMatLoad(fa[i], As, (wm * WM + (i) * 16) * LS4 + (kk) * 2, LS4, gl_CooperativeMatrixLayoutRowMajor)
+#define LDB(j, kk) coopMatLoad(fb[j], Bs, (wn * WN + (j) * 16) * LS4 + (kk) * 2, LS4, gl_CooperativeMatrixLayoutColumnMajor)
+#define COMPUTE() \
+    [[unroll]] for (uint i = 0; i < TMF; i++) { LDA(i, 0); } \
+    [[unroll]] for (uint j = 0; j < TNF; j++) { LDB(j, 0); } \
+    [[unroll]] for (uint kk = 0; kk < KK; kk++) { \
+        [[unroll]] for (uint i = 0; i < TMF; i++) { \
+            [[unroll]] for (uint j = 0; j < TNF; j++) { \
+                acc[j * TMF + i] = coopMatMulAdd(fa[i], fb[j], acc[j * TMF + i]); \
+                if (i == TMF - 1 && kk + 1 < KK) { LDB(j, kk + 1); } \
+            } \
+            if (kk + 1 < KK) { LDA(i, kk + 1); } \
+        } \
+    }
+
+    FETCH(0)
+    STORE()
+    barrier();
+    for (uint ks = 0; ks + 1 < nks; ks++) {
+        FETCH(ks + 1)
+        COMPUTE()
+        barrier();
+        STORE()
+        barrier();
+    }
+    COMPUTE()
+    barrier();   // the partial-tile epilogue below reuses As
+
+    // epilogue: D[n * stride_d + m]
+    const bool full = m0 + BM <= p.M && n0 + BN <= p.N;
+    if (full) {
+        [[unroll]] for (uint j = 0; j < TNF; j++) {
+            [[unroll]] for (uint i = 0; i < TMF; i++) {
+                const uint off = (n0 + wn * WN + j * 16) * p.stride_d + m0 + wm * WM + i * 16;
+#ifdef D_F16
+                coopMatStore(coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[j * TMF + i]), data_d, off, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+#else
+                coopMatStore(acc[j * TMF + i], data_d, off, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+            }
+        }
+    } else {
+        // stage each 16 x 16 fragment through this wave's 1 KB of As (free after the loop's last barrier), store in bounds
+        const uint sbase = wave * 64;
+        const uint lane = gl_SubgroupInvocationID;
+        [[unroll]] for (uint j = 0; j < TNF; j++) {
+            [[unroll]] for (uint i = 0; i < TMF; i++) {
+                coopMatStore(acc[j * TMF + i], As, sbase, 4, gl_CooperativeMatrixLayoutColumnMajor);
+                subgroupMemoryBarrierShared();
+                [[unroll]] for (uint e = 0; e < 8; e++) {
+                    const uint idx = e * 32 + lane;
+                    const uint c = idx / 16, r = idx % 16;
+                    const uint m = m0 + wm * WM + i * 16 + r;
+                    const uint n = n0 + wn * WN + j * 16 + c;
+                    const float v = uintBitsToFloat(As[sbase + c * 4 + r / 4][r % 4]);
+                    if (m < p.M && n < p.N) {
+#ifdef D_F16
+                        data_d[n * p.stride_d + m] = float16_t(v);
+#else
+                        data_d[n * p.stride_d + m] = v;
+#endif
+                    }
+                }
+                subgroupMemoryBarrierShared();
+            }
+        }
+    }
+}

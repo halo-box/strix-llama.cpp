@@ -1379,6 +1379,12 @@ void process_shaders() {
         }
     }
 
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    // dense q8_0 x f16 GEMM (mul_mm_dq8.comp), f32 and f16 output
+    string_to_spv("matmul_dq8_q8_0_f16", "mul_mm_dq8.comp", {}, true, true, false);
+    string_to_spv("matmul_dq8_q8_0_f16_d16", "mul_mm_dq8.comp", {{"D_F16", "1"}}, true, true, false);
+#endif
+
     for (auto unroll : {false, true}) {
         for (auto a_f16 : {false, true}) {
             std::map<std::string, std::string> defines = {
