@@ -128,6 +128,11 @@ if (Vulkan_FOUND)
         add_compile_definitions(_ITERATOR_DEBUG_LEVEL=0)
     endif()
 
+    # the *_TEST_BREAK / *_NEGCTL switches that corrupt results on purpose (negative controls): test builds only
+    if (GGML_VULKAN_TEST_HOOKS)
+        add_compile_definitions(GGML_VULKAN_TEST_HOOKS)
+    endif()
+
     if (GGML_VULKAN_CHECK_RESULTS)
         add_compile_definitions(GGML_VULKAN_CHECK_RESULTS)
         # the result-checking path computes a CPU reference graph via
