@@ -11514,15 +11514,21 @@ struct test_qsa_decode : public test_qsa_prefill {
 // gathered rows are scattered as in a fragmented cache.
 struct test_qsa_prefill_maskless : public test_qsa_prefill {
     const int blocks;
-    test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true, int blocks=0)
-        : test_qsa_prefill(queries,keys,selected,interleaved,false,1,ratio), blocks(blocks) {}
+    const ggml_type type_k, type_v;
+    test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true, int blocks=0,
+            ggml_type type_k=GGML_TYPE_F16, ggml_type type_v=GGML_TYPE_F16)
+        : test_qsa_prefill(queries,keys,selected,interleaved,false,1,ratio), blocks(blocks), type_k(type_k), type_v(type_v) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL_MASKLESS"; }
-    std::string vars() override { return test_qsa_prefill::vars() + (blocks ? ",blocks=" + std::to_string(blocks) : ""); }
+    std::string vars() override {
+        std::string s = test_qsa_prefill::vars() + (blocks ? ",blocks=" + std::to_string(blocks) : "");
+        if (type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16) { s += std::string(",type_k=") + ggml_type_name(type_k) + ",type_v=" + ggml_type_name(type_v); }
+        return s;
+    }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         q = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,dim,2*ratio,queries,streams);
         q = ggml_permute(ctx,q,0,2,1,3);
-        k = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
-        v = ggml_new_tensor_4d(ctx,GGML_TYPE_F16,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        k = ggml_new_tensor_4d(ctx,type_k,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
+        v = ggml_new_tensor_4d(ctx,type_v,dim,interleaved ? 2 : keys,interleaved ? keys : 2,streams);
         if (interleaved) { k=ggml_permute(ctx,k,0,2,1,3); v=ggml_permute(ctx,v,0,2,1,3); }
         mask = nullptr;
         ids = ggml_new_tensor_4d(ctx,GGML_TYPE_I32,selected,queries,1,streams);
@@ -11599,8 +11605,9 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
     }
 };
 struct test_qsa_decode_maskless : public test_qsa_prefill_maskless {
-    test_qsa_decode_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true, int blocks=0)
-        : test_qsa_prefill_maskless(queries,keys,selected,ratio,interleaved,blocks) {}
+    test_qsa_decode_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true, int blocks=0,
+            ggml_type type_k=GGML_TYPE_F16, ggml_type type_v=GGML_TYPE_F16)
+        : test_qsa_prefill_maskless(queries,keys,selected,ratio,interleaved,blocks,type_k,type_v) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_DECODE_MASKLESS"; }
 };
 
@@ -16557,6 +16564,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int q : {1,9}) test_cases.emplace_back(new test_qsa_decode_maskless(q,65536,2051,12,true,16000));
     test_cases.emplace_back(new test_qsa_decode_maskless(3,65536,2051,8,false,16000));
     test_cases.emplace_back(new test_qsa_decode_maskless(9,270336,2051,12,true,66000));
+    // q8_0 K/V (HIP: decode dequantizes in the WMMA kernel only, GQA 12; prefill packs, or reads direct when the
+    // attention is small against the cache: 130 or 200 queries against 32k / 64k keys). Mixed K/V types: prefill only
+    {
+        const ggml_type q8 = GGML_TYPE_Q8_0;
+        for (bool interleaved : {true,false}) {
+            for (int q : {1,9,64,512}) for (int k : {257,2051}) test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,k,12,interleaved,0,q8,q8));
+            test_cases.emplace_back(new test_qsa_prefill_maskless(129,4096,257,12,interleaved,0,q8,q8));
+            test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051,12,interleaved,0,q8,q8));
+            test_cases.emplace_back(new test_qsa_prefill_maskless(640,4096,257,12,interleaved,0,q8,q8));
+        }
+        for (int q : {1,4}) test_cases.emplace_back(new test_qsa_decode_maskless(q,32768,2051,12,true,8000,q8,q8));
+        test_cases.emplace_back(new test_qsa_decode_maskless(9,4096,257,4,true,0,q8,q8));   // GQA 4: not supported for q8_0
+        test_cases.emplace_back(new test_qsa_prefill_maskless(130,32768,2051,12,true,7000,q8,q8));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(200,65536,2051,12,true,15000,q8,q8));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(70,65536,2051,12,false,16000,q8,q8));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051,12,true,0,q8,GGML_TYPE_F16));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051,12,true,0,GGML_TYPE_F16,q8));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(130,32768,2051,12,true,7000,q8,GGML_TYPE_F16));
+    }
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2560));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2561));
     test_cases.emplace_back(new test_qsa_prefill(513,512,17,true,true));
