@@ -398,6 +398,16 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_use_spill_fix(cons
         (DKQ == 128 && ncols2 > 1 && ncols >= 16) || (DKQ == 256 && ncols2 > 1 && ncols >= 32);
 }
 
+// gfx1151/ROCm 10.1 clang 24: these kernels spill SGPRs to VGPR lanes (1-19 each, 54 in total) unless the scheduler
+// keeps the KQ, softmax and VKQ phases of a KV iteration apart (2026-11-01). Remove when they compile without SGPR spills.
+// D64 4x8 is left out: its spill-free variants change the occupancy query and with it the stream-k split.
+static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_use_phase_barrier(const int DKQ, const int ncols1, const int ncols2, const bool softcap) {
+    const bool c4x8 = ncols1 == 4 && ncols2 == 8, c8x4 = ncols1 == 8 && ncols2 == 4;
+    return (DKQ == 64 && !softcap && (c8x4 || (ncols1 == 16 && ncols2 == 2))) ||
+        (DKQ == 128 && !softcap && ((ncols1 == 16 && ncols2 == 4) || (ncols1 == 32 && ncols2 == 2))) ||
+        ((DKQ == 128 || DKQ == 256) && softcap && (c4x8 || c8x4));
+}
+
 // gfx1151/ROCm 10.1 clang 24: Q reuse keeps D128 8x8 at 256 VGPRs; D256 8x8 needs 224 without address bounds (2026-10-24).
 // Remove these exceptions when the original paths are spill-free at the measured throughput.
 #if defined(__gfx1151__)
@@ -826,6 +836,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
 
+#if defined(RDNA3_5)
+    if constexpr (ggml_cuda_fattn_mma_use_phase_barrier(DKQ, ncols1, ncols2, use_logit_softcap)) {
+        __builtin_amdgcn_sched_barrier(0);
+    }
+#endif
     if (use_logit_softcap) {
         constexpr int stride = cols_per_warp == 8 ? np*T_C_KQ::I : np*T_C_KQ::J;
         static_assert(nbatch_fa % stride == 0, "bad loop size");
@@ -1104,6 +1119,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     }
 
 
+#if defined(RDNA3_5)
+    if constexpr (ggml_cuda_fattn_mma_use_phase_barrier(DKQ, ncols1, ncols2, use_logit_softcap)) {
+        __builtin_amdgcn_sched_barrier(0);
+    }
+#endif
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
 #pragma unroll
     for (int i0_start = 0; i0_start < DV; i0_start += 2*nbatch_V2) {
@@ -2018,9 +2038,10 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(AMD_MFMA_AVAILABLE)
 
 #if defined(RDNA3_5)
-    if constexpr ((DKQ == 112 && !use_logit_softcap && ((ncols1 == 16 && ncols2 == 4) || (ncols1 == 8 && ncols2 == 8))) ||
+    if constexpr ((DKQ == 64 && !use_logit_softcap && ncols1 == 16 && ncols2 == 2) ||
+        (DKQ == 112 && !use_logit_softcap && ((ncols1 == 16 && ncols2 == 4) || (ncols1 == 8 && ncols2 == 8))) ||
         (DKQ == 128 && ((use_logit_softcap && ncols1 == 16 && ncols2 == 4) || (!use_logit_softcap && ncols1 == 8 && ncols2 == 8)))) {
-        // ROCm 10.1 / gfx1151 queries these 242-246-VGPR kernels at five blocks instead of the baseline's six.
+        // ROCm 10.1 / gfx1151 queries these 241-246-VGPR kernels at five blocks instead of the baseline's six.
         // Keep the baseline register reservation until launch partitions stop using the occupancy query.
         asm volatile("" ::: "v255");
     }
