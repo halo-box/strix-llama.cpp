@@ -7651,6 +7651,10 @@ static bool ggml_vk_mm_prefetch_enabled(const vk_device& device) {
 
 // XL tier gate, fitted at op level on gfx1151 (73 dense GEMM shapes, XL 1.07-1.44x per tile): XL when its wave count is at most
 // half of l's, for q4_K/q5_K/q6_K/q8_0/iq4_xs (iq4_nl loses), k >= 1024, m >= 1024. GGML_VK_MM_XL=2 skips the gate (probe).
+// The wave counts are rounded up, so one extra XL wave can tip the comparison at many waves, where it is a few percent of the
+// work (Flash-Next q8_0 12288 x 8192 x 2560: 39 XL vs 77 L waves, L 1.20x slower). For q8_0 at k >= 2048 XL gets a 1/16 margin,
+// below its per-tile gain on the shapes it moves (1.06-1.20x); it flips only when L has at least 17 waves. Other types and
+// shorter k keep the plain comparison (q4_K: 0.97-1.18x on the same shapes, q8_0 at k = 1024: 1.00-1.10x).
 static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type, uint32_t m, uint32_t n, uint32_t k) {
     static const bool force = [] { const char * e = getenv("GGML_VK_MM_XL"); return e && atoi(e) == 2; }();
     if (force) {
@@ -7666,7 +7670,7 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
     const uint32_t cu = std::max(ctx->device->shader_core_count, 1u);
     const uint32_t waves_xl = CEIL_DIV(CEIL_DIV(m, 256u) * CEIL_DIV(n, 256u), cu);
     const uint32_t waves_l  = CEIL_DIV(CEIL_DIV(m, 128u) * CEIL_DIV(n, 128u), 2 * cu);
-    return 2 * waves_xl <= waves_l;
+    return (type == GGML_TYPE_Q8_0 && k >= 2048) ? 32 * waves_xl <= 17 * waves_l : 2 * waves_xl <= waves_l;
 }
 
 // Whether an XL pipeline spills depends on the GPU and the compiler (gfx1150 / Mesa 26.1.6: 179 spilled VGPRs, 10-14x slower);
