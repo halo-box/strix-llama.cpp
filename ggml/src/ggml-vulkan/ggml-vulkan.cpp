@@ -1917,26 +1917,34 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
 // Dense q8_0 x f16 GEMM tiles (mul_mm_dq8.comp): { BLOCK_SIZE, BM, BN, WM, WN, BK }. LDS = (BM + BN) * (BK + 8) * 2 bytes:
 // 0 = 128 x 256, 64 x 64 waves, BK 64 (55296 B, 1 WG / CU); 1 = the same at BK 32 (30720 B, 2 WG / CU); 2 = 128 x 128, 64 x 32 waves,
 // BK 32 (20480 B, 3 WG / CU); 3 = 256 x 128, 64 x 64 waves, BK 32.
-#define GGML_VK_DQ8_NCFG 4
+// 4 = 64 x 128, 4 waves of 32 x 64, BK 64 (27648 B, 2 WG / CU): few-row, long-k GEMMs (the qwen4exp hc down, 320 x 10240).
+#define GGML_VK_DQ8_NCFG 5
 static const uint32_t ggml_vk_dense_dq8_cfgs[GGML_VK_DQ8_NCFG][6] = {
-    { 256, 128, 256, 64, 64, 64 }, { 256, 128, 256, 64, 64, 32 }, { 256, 128, 128, 64, 32, 32 }, { 256, 256, 128, 64, 64, 32 } };
+    { 256, 128, 256, 64, 64, 64 }, { 256, 128, 256, 64, 64, 32 }, { 256, 128, 128, 64, 32, 32 }, { 256, 256, 128, 64, 64, 32 },
+    { 128, 64, 128, 32, 64, 64 } };
 
-// GGML_VK_DENSE_DQ8: 0 = off (default), 1 = on (tile 0 for k <= 4096, n >= 256 and at least 3/4 of a workgroup per CU: Flash-Next
-// 2560 x 6144 is slower than XL, a 256-wide tile wastes most of its WMMAs below n 256, and 512 x 512 runs 8 workgroups),
-// 2..5 = force tile 0..3 at any eligible shape (probe)
+// GGML_VK_DENSE_DQ8: 1 = on (default): tile 4 for m <= 384, k >= 4096, n >= 1024; tile 0 for k <= 4096, n >= 256 and at least 3/4
+// of a workgroup per CU (Flash-Next 2560 x 6144 is slower than XL, a 256-wide tile wastes most of its WMMAs below n 256, and
+// 512 x 512 runs 8 workgroups). 0 = off, 2..6 = force tile 0..4 at any eligible shape (probe).
 static int ggml_vk_dense_dq8_mode() {
-    static const int mode = [] { const char * e = getenv("GGML_VK_DENSE_DQ8"); return e ? atoi(e) : 0; }();
+    static const int mode = [] { const char * e = getenv("GGML_VK_DENSE_DQ8"); return e ? atoi(e) : 1; }();
     return mode;
 }
 
-static uint32_t ggml_vk_dense_dq8_pick(uint32_t m, uint32_t n) {
+// mode 1: tile 4 for a few-row long-k GEMM (m <= 384, k >= 4096: the qwen4exp hc down), else tile 0
+// (GGML_VK_DENSE_DQ8_FEWROW=0 keeps those on their old route)
+static bool ggml_vk_dense_dq8_fewrow(uint32_t m, uint32_t k) {
+    static const bool on = [] { const char * e = getenv("GGML_VK_DENSE_DQ8_FEWROW"); return e == nullptr || atoi(e) != 0; }();
+    return on && m <= 384 && k >= 4096;
+}
+
+static uint32_t ggml_vk_dense_dq8_pick(uint32_t m, uint32_t n, uint32_t k) {
     const int mode = ggml_vk_dense_dq8_mode();
     if (mode >= 2 && mode < 2 + GGML_VK_DQ8_NCFG) {
         return (uint32_t) (mode - 2);
     }
-    GGML_UNUSED(m);
     GGML_UNUSED(n);
-    return 0u;
+    return ggml_vk_dense_dq8_fewrow(m, k) ? 4u : 0u;
 }
 
 
@@ -8018,8 +8026,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         !qx_needs_dequant && !d16 && !hcm && ggml_vk_dim01_contiguous(src0) && ne02 * ne03 == 1 && ne12 * ne13 == 1 &&
         ne10 % 64 == 0 && ne01 >= 128 && ne11 >= 64 && ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
         (ggml_vk_dense_dq8_mode() != 1 ||
+         (ggml_vk_dense_dq8_fewrow((uint32_t) ne01, (uint32_t) ne10) && ne11 >= 1024) ||
          (ne10 <= 4096 && ne11 >= 256 && CEIL_DIV(ne01, 128) * CEIL_DIV(ne11, 256) >= 3 * ctx->device->shader_core_count / 4))) {
-        vk_pipeline & pd = ctx->device->pipeline_matmul_dq8[0][ggml_vk_dense_dq8_pick((uint32_t) ne01, (uint32_t) ne11)];
+        vk_pipeline & pd = ctx->device->pipeline_matmul_dq8[0][ggml_vk_dense_dq8_pick((uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10)];
         if (pd) {
             pipeline_pre_dq8 = pipeline;
             pipeline = pd;

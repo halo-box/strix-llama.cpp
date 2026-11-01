@@ -4374,7 +4374,15 @@ struct test_mul_mat_f16b : public test_case {
         // GGML_VK_TEST_REQUIRE_DQ8=1 asserts the dense q8_0 x f16 GEMM (GGML_VK_DENSE_DQ8) took every eligible shape
         if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_DQ8")) {
             const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_DENSE_DQ8");
-            const bool want = type_a == GGML_TYPE_Q8_0 && k >= 1024 && k % 64 == 0 && m >= 128 && n >= 64 && env_opt_in("GGML_VK_DENSE_DQ8");
+            // GGML_VK_DENSE_DQ8 unset or 1 = the default shape rule (as ggml-vulkan.cpp, 3/4 of a workgroup per CU taken for 40 CUs),
+            // 2..6 = a forced tile on every eligible shape, 0 = off
+            const char * de = getenv("GGML_VK_DENSE_DQ8");
+            const int mode = de ? atoi(de) : 1;
+            const char * fe = getenv("GGML_VK_DENSE_DQ8_FEWROW");
+            const bool fewrow = (fe == nullptr || atoi(fe) != 0) && m <= 384 && k >= 4096 && n >= 1024;
+            const bool rule = fewrow || (k <= 4096 && n >= 256 && ((m + 127) / 128) * ((n + 255) / 256) >= 30);
+            const bool want = type_a == GGML_TYPE_Q8_0 && k >= 1024 && k % 64 == 0 && m >= 128 && n >= 64 && mode != 0 &&
+                              (mode >= 2 || rule);
             if (c >= 0 && (c > 0) != want) {
                 msg = "MUL_MAT_DENSE_DQ8 dispatches: " + std::to_string(c) + (want ? " (expected the dq8 GEMM)" : " (expected another path)");
                 return false;

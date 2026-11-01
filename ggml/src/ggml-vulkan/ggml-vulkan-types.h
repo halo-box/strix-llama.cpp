@@ -841,7 +841,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp): [f32 / f16 output][tile config], see ggml_vk_dense_dq8_cfgs
-    vk_pipeline pipeline_matmul_dq8[2][4];
+    vk_pipeline pipeline_matmul_dq8[2][5];
     vk_pipeline pipeline_quantize_q8_1_x4;
     vk_pipeline pipeline_quantize_q8_1_x4_f16;   // f16 input (int8 MMQ with an f16 B)
 
