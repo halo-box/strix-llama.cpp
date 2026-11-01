@@ -1748,8 +1748,8 @@ static void launch_mul_mat_q_tile(ggml_backend_cuda_context & ctx, const mmq_arg
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    // The runtime guard excludes the same type/J pairs.
-    if constexpr (mmq_rdna3_5_id_use_compact(type, J)) {
+    // The runtime guard excludes the same type/J pairs. It also needs RDNA3.5, where J_best only takes tiles of its table.
+    if constexpr (mmq_rdna3_5_id_use_compact(type, J) && ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback).type != GGML_TYPE_COUNT) {
         const bool use_compact_routed = args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) &&
             GGML_CUDA_CC_IS_RDNA3_5(cc) && !config.stream_k && mmq_rdna3_5_id_use_compact(type, J);
         if (use_compact_routed) {
