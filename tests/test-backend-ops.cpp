@@ -4463,7 +4463,7 @@ struct test_indexer_head_sum : public test_case {
 };
 
 // qwen4exp QSA indexer scorer: MUL_MAT(pooled keys F32 [128, blocks], q [128, 4*queries]) -> RESHAPE -> RELU -> head sum
-// (-> compact visibility). On RDNA3.5 the whole chain is one fused GEMM unless GGML_CUDA_DISABLE_IDX_GEMM is set.
+// (-> compact visibility). On RDNA3.5 the whole chain is one fused GEMM.
 struct test_indexer_score : public test_case {
     const int blocks, queries;
     const bool vis, bounded;
@@ -13046,7 +13046,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool bounded : {false, true}) test_cases.emplace_back(new test_indexer_score(3001, queries, true, bounded));
     }
     test_cases.emplace_back(new test_indexer_score(3001, 512, true, true));
-    // with the compact visibility chain (fused on RDNA3.5 unless GGML_CUDA_DISABLE_IDX_VIS)
+    // with the compact visibility chain (fused on RDNA3.5)
     for (int blocks : {64, 1000, 10112}) test_cases.emplace_back(new test_indexer_head_sum(blocks,4,512,1,false,false,0,1));
     test_cases.emplace_back(new test_indexer_head_sum(1000,4,77,1,false,false,0,1));
     test_cases.emplace_back(new test_indexer_head_sum(1000,4,512,1,false,false,0,2));
