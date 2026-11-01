@@ -1914,6 +1914,32 @@ static bool ggml_vk_dense_ypad_camps(uint64_t k);
 static bool ggml_vk_mmid_rega_enabled(const vk_device& device);
 static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type, uint32_t m, uint32_t n, uint32_t k);
 
+// Dense q8_0 x f16 GEMM tiles (mul_mm_dq8.comp): { BLOCK_SIZE, BM, BN, WM, WN, BK }. LDS = (BM + BN) * (BK + 8) * 2 bytes:
+// 0 = 128 x 256, 64 x 64 waves, BK 64 (55296 B, 1 WG / CU); 1 = the same at BK 32 (30720 B, 2 WG / CU); 2 = 128 x 128, 64 x 32 waves,
+// BK 32 (20480 B, 3 WG / CU); 3 = 256 x 128, 64 x 64 waves, BK 32.
+#define GGML_VK_DQ8_NCFG 4
+static const uint32_t ggml_vk_dense_dq8_cfgs[GGML_VK_DQ8_NCFG][6] = {
+    { 256, 128, 256, 64, 64, 64 }, { 256, 128, 256, 64, 64, 32 }, { 256, 128, 128, 64, 32, 32 }, { 256, 256, 128, 64, 64, 32 } };
+
+// GGML_VK_DENSE_DQ8: 0 = off (default), 1 = on (tile 0 for k <= 4096, n >= 256 and at least 3/4 of a workgroup per CU: Flash-Next
+// 2560 x 6144 is slower than XL, a 256-wide tile wastes most of its WMMAs below n 256, and 512 x 512 runs 8 workgroups),
+// 2..5 = force tile 0..3 at any eligible shape (probe)
+static int ggml_vk_dense_dq8_mode() {
+    static const int mode = [] { const char * e = getenv("GGML_VK_DENSE_DQ8"); return e ? atoi(e) : 0; }();
+    return mode;
+}
+
+static uint32_t ggml_vk_dense_dq8_pick(uint32_t m, uint32_t n) {
+    const int mode = ggml_vk_dense_dq8_mode();
+    if (mode >= 2 && mode < 2 + GGML_VK_DQ8_NCFG) {
+        return (uint32_t) (mode - 2);
+    }
+    GGML_UNUSED(m);
+    GGML_UNUSED(n);
+    return 0u;
+}
+
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -2997,6 +3023,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 X_CM1_PF_XL(GGML_TYPE_IQ3_XXS, iq3_xxs)
                 X_CM1_PF_XL(GGML_TYPE_IQ4_NL, iq4_nl)
 #undef X_CM1_PF_XL
+                if (device->coopmat_acc_f32_support && device->fp16 && device->subgroup_size_control && device->subgroup_min_size <= 32 &&
+                    device->subgroup_max_size >= 32) {
+                    for (uint32_t c = 0; c < GGML_VK_DQ8_NCFG; c++) {
+                        const uint32_t * t = ggml_vk_dense_dq8_cfgs[c];
+                        const uint32_t lds = (t[1] + t[2]) * (t[5] + 8) * 2;
+                        if (lds > device->properties.limits.maxComputeSharedMemorySize) {
+                            continue;
+                        }
+                        const std::vector<uint32_t> spec = { t[0], t[1], t[2], t[3], t[4], t[5] };
+                        ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[0][c], "matmul_dq8_q8_0_f16_" + std::to_string(c),
+                                                 matmul_dq8_q8_0_f16_cm1_len, matmul_dq8_q8_0_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                                                 { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                        ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[1][c], "matmul_dq8_q8_0_f16_d16_" + std::to_string(c),
+                                                 matmul_dq8_q8_0_f16_d16_cm1_len, matmul_dq8_q8_0_f16_d16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                                                 { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                    }
+                }
             }
         }
 
@@ -7969,6 +8012,19 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         }
     }
 
+    // dense q8_0 x f16 GEMM (mul_mm_dq8.comp): 2-D, f16 B, K % 64 == 0; B's column stride is checked where it is known
+    vk_pipeline pipeline_pre_dq8 = nullptr;
+    if (ggml_vk_dense_dq8_mode() != 0 && src0->type == GGML_TYPE_Q8_0 && y_kernel_type == GGML_TYPE_F16 && !quantize_y &&
+        !qx_needs_dequant && !d16 && !hcm && ggml_vk_dim01_contiguous(src0) && ne02 * ne03 == 1 && ne12 * ne13 == 1 &&
+        ne10 % 64 == 0 && ne01 >= 128 && ne11 >= 64 && ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
+        (ggml_vk_dense_dq8_mode() != 1 ||
+         (ne10 <= 4096 && ne11 >= 256 && CEIL_DIV(ne01, 128) * CEIL_DIV(ne11, 256) >= 3 * ctx->device->shader_core_count / 4))) {
+        vk_pipeline & pd = ctx->device->pipeline_matmul_dq8[0][ggml_vk_dense_dq8_pick((uint32_t) ne01, (uint32_t) ne11)];
+        if (pd) {
+            pipeline_pre_dq8 = pipeline;
+            pipeline = pd;
+        }
+    }
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
@@ -7997,7 +8053,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t d_ne = ggml_nelements(dst);
 
     // the split-K reduce writes f32
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || d16 || hcm, pipeline);
+    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || d16 || hcm || pipeline_pre_dq8 != nullptr, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -8178,6 +8234,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
     }
 
+    if (pipeline_pre_dq8 != nullptr) {
+        // 16-byte B loads need 8-element columns and a 16-byte aligned B binding, A and D are read / written as dwords
+        if (stride_b % 8 != 0 || y_buf_offset % 16 != 0 || x_buf_offset % 4 != 0 || d_buf_offset % 4 != 0) {
+            pipeline = pipeline_pre_dq8;   // split_k stays 1 (valid for every pipeline)
+        } else {
+            ggml_vk_path_census_add("MUL_MAT_DENSE_DQ8");
+        }
+    }
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y && !y_rowstride) {
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
@@ -8194,11 +8258,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ggml_vk_matmul_hcmix(ctx, subctx, pipeline, { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range }, *hcmix,
                              ne01, ne11, ne10, ne10, stride_b, stride_batch_x, stride_batch_y, padded_n);
     } else {
+        // GGML_VK_DENSE_DQ8_TEST_BREAK=1 (negative control): the dq8 GEMM drops its last K step
+        static const bool dq8_break = [] { const char * e = getenv("GGML_VK_DENSE_DQ8_TEST_BREAK"); return e && atoi(e) != 0; }();
+        const bool is_dq8 = pipeline_pre_dq8 != nullptr && pipeline != pipeline_pre_dq8;
         ggml_vk_matmul(
             ctx, subctx, pipeline,
             { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
             ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
-            ne01, ne11, ne10,
+            ne01, ne11, (is_dq8 && dq8_break && ne10 > 64) ? ne10 - 64 : ne10,
             ne10, stride_b, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
             split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
             b_col_bytes, (uint64_t)od->nb[1]
