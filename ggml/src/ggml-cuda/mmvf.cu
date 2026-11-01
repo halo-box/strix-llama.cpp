@@ -497,7 +497,8 @@ static void mul_mat_vec_f_switch_fusion(
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
-    if constexpr (ncols_dst == 1) {
+    // fusion needs a single dst column, the multi-token launches have more (ggml_cuda_mul_mat_vec_f)
+    if constexpr (ncols_dst == 1 && !is_multi_token_id) {
         if (has_fusion) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id, tokens_in_block>, launch_params,
                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
