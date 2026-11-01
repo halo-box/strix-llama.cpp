@@ -116,11 +116,11 @@
     "mmq-instance-q4_0": 33,
     "mmq-instance-q4_0_rocmfp4_fast": 32,
     "mmq-instance-q4_1": 33,
-    "mmq-instance-q4_k": 50,
+    "mmq-instance-q4_k": 49,
     "mmq-instance-q5_0": 33,
     "mmq-instance-q5_1": 33,
-    "mmq-instance-q5_k": 50,
-    "mmq-instance-q6_k": 50,
+    "mmq-instance-q5_k": 49,
+    "mmq-instance-q6_k": 49,
     "mmq-instance-q8_0": 43,
     "mmq-q45": 4,
     "mmq-q6": 4,
@@ -160,7 +160,7 @@
     "upscale": 4,
     "wkv": 5
   },
-  "minimum_kernel_count": 6274,
+  "minimum_kernel_count": 6271,
   "reasons": {
     "sgpr_lane_spill": "ROCm 10.1 / clang 24 spills these flash_attn_ext_f16 SGPRs to VGPR lanes (no scratch). The spill-free variants tried in 2026-11 change the occupancy-derived stream-k split and the output bytes (D64 4x8), or need a rolled softcap loop that puts the KQ tile in scratch (softcap D128 16x2 and 32x2). Remove when a variant is spill-free with unchanged output.",
     "sgpr_lane_spill_slower": "ROCm 10.1 / clang 24 spills these SGPRs to VGPR lanes (no scratch). Spill-free variants with unchanged output exist (a sched_barrier between the flash-attention KQ, softmax and VKQ phases; an 8-row unroll of the KV_max mask scan), but a 2026-11-01 kernel-time A/B against master on gfx1151 measured them slower: D64 16x2 +21% at KV 4096, D128 32x2 +4%, softcap D128 4x8 / 8x4 and D256 4x8 / 8x4 +1-6%, KV_max<64> +3-5% at 1024-4096 query rows. Remove a budget when its kernel has a spill-free variant that is not slower."
