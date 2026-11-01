@@ -53,9 +53,6 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
-// set in perf mode only: GGML_TEST_QUANT_INIT_BLOCKS must not make eval tensors repeat (identical experts hide routing bugs)
-static bool g_allow_quant_init_blocks = false;
-
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
@@ -108,21 +105,10 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         }
 
         std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
-        // GGML_TEST_QUANT_INIT_BLOCKS=<n>: quantize only the first n blocks and repeat them over the
-        // tensor (perf runs of slow encoders, e.g. the trellis types on 512-expert MoE shapes). Perf mode only.
-        static const size_t fast_init_blocks = [] {
-            const char * e = g_allow_quant_init_blocks ? getenv("GGML_TEST_QUANT_INIT_BLOCKS") : nullptr;
-            return e ? (size_t) strtoull(e, nullptr, 10) : (size_t) 0;
-        }();
-        const size_t n_blocks_all = nels / ggml_blck_size(tensor->type);
-        const bool fast_init = fast_init_blocks > 0 && n_blocks_all > fast_init_blocks;
         {
             // parallel quantization by block
             size_t blck_size = ggml_blck_size(tensor->type);
             size_t n_blocks = nels / blck_size;
-            if (fast_init) {
-                n_blocks = fast_init_blocks;
-            }
 
             auto quantize_thread = [&](size_t start, size_t end) {
                 ggml_quantize_chunk(tensor->type, data.data(), dataq.data(),
@@ -147,12 +133,6 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
                 for (auto & t : tasks) {
                     t.get();
                 }
-            }
-        }
-        if (fast_init) {
-            const size_t chunk = ggml_row_size(tensor->type, fast_init_blocks * ggml_blck_size(tensor->type));
-            for (size_t off = chunk; off < dataq.size(); off += chunk) {
-                memcpy(dataq.data() + off, dataq.data(), std::min(chunk, dataq.size() - off));
             }
         }
         ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
@@ -520,8 +500,8 @@ static bool backend_has_feature(ggml_backend_t backend, const char * feature_nam
 }
 
 // Dispatch census test hooks (debug names, not a stable API): a backend that returns them from ggml_backend_reg_get_proc_address
-// counts its fused dispatches ("LABEL/n") and its recorded dispatch paths ("path:NAME") from the last reset. Engagement tests
-// use these two helpers; a backend without the hooks reports -1 and the test skips its engagement check.
+// counts its fused dispatches ("LABEL/n") and its recorded dispatch paths ("path:NAME") from the last reset. Census mode
+// uses these two helpers; a backend without the hooks reports -1.
 static void * census_proc(ggml_backend_t backend, const char * name) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -540,27 +520,6 @@ static bool dispatch_census_reset(ggml_backend_t backend) {
 static int64_t dispatch_census_count(ggml_backend_t backend, const char * name) {
     auto count = (uint64_t (*)(const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_count");
     return count ? (int64_t) count(name) : -1;
-}
-
-// a default-on backend knob (unset or non-zero) and an opt-in test switch (set and non-zero)
-static bool env_knob_on(const char * name) {
-    const char * e = getenv(name);
-    return e == nullptr || atoi(e) != 0;
-}
-
-static bool env_opt_in(const char * name) {
-    const char * e = getenv(name);
-    return e != nullptr && atoi(e) != 0;
-}
-
-// engagement asserts are opt-in (require_env) and need the census hooks; a fusion the backend says it cannot emit on
-// this device (census skip hook: GGML_VK_DISABLE_FUSION, a missing pipeline) is not asserted
-static bool engagement_required(ggml_backend_t backend, const char * require_env, const char * fusion = nullptr) {
-    if (!env_opt_in(require_env) || census_proc(backend, "ggml_backend_debug_dispatch_census_count") == nullptr) {
-        return false;
-    }
-    auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
-    return fusion == nullptr || skip == nullptr || skip(backend, fusion) == nullptr;
 }
 
 enum test_mode {
@@ -1358,10 +1317,6 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
-    // engagement: when checks_engagement() is true the census of backend1 is reset right before the compare, and
-    // verify_engagement FAILS the case right after it when a fused dispatch or path count is wrong
-    virtual bool checks_engagement() { return false; }
-    virtual bool verify_engagement(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
 
     // nodes the scheduler runs on the second backend: backend1 then computes in several splits, as llama does
     // (needs use_scheduler_allocation(); the nodes to compare must be graph outputs)
@@ -1654,9 +1609,6 @@ struct test_case {
             fused_nodes_to_verify.push_back(out);
         }
         bool cmp_ok = true;
-        if (checks_engagement()) {
-            dispatch_census_reset(backend1);
-        }
         if (!second_backend_nodes().empty()) {
             // compute backend1's splits through the scheduler, the reference as one graph on backend2
             struct ggml_backend_graph_copy copy = ggml_backend_graph_copy(backend2, gf);
@@ -1683,13 +1635,6 @@ struct test_case {
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
-        if (test_passed) {
-            std::string engage_msg;
-            if (!verify_engagement(backend1, engage_msg)) {
-                test_passed = false;
-                error_msg   = engage_msg;
-            }
-        }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -4245,26 +4190,6 @@ struct test_hc_post_norm : public test_case {
         return pad == 0 ? VARS_TO_STR5(embd, hc, tokens, mode, type_down) : VARS_TO_STR6(embd, hc, tokens, mode, type_down, pad);
     }
 
-    bool checks_engagement() override { return true; }
-    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (pad == 0 || !engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_POST_NORM", mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY")) {
-            return true;   // the unpadded cases check values only; not asked, or the device cannot fuse
-        }
-        struct { const char * name; bool want; } checks[] = {
-            { mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY", env_knob_on("GGML_VK_FUSE_HC_POST_NORM") },
-            // the readers take the row stride at prefill sizes (more tokens than the mat-vec columns)
-            { "path:MUL_MAT_ROWSTRIDE_B",     tokens > 8 && env_knob_on("GGML_VK_ROWSTRIDE") },
-            { "path:MUL_MAT_VEC_ROWSTRIDE_A", tokens > 8 && env_knob_on("GGML_VK_ROWSTRIDE") },
-        };
-        for (const auto & c : checks) {
-            const int64_t n = dispatch_census_count(backend, c.name);
-            if ((n > 0) != c.want) {
-                msg = std::string(c.name) + " dispatches: " + std::to_string(n) + (c.want ? " (expected some)" : " (expected none)");
-                return false;
-            }
-        }
-        return true;
-    }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
@@ -4354,33 +4279,6 @@ struct test_mul_mat_f16b : public test_case {
         for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (t->view_src == nullptr) init_tensor_uniform(t);
         }
-    }
-
-    bool checks_engagement() override { return true; }
-    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        // GGML_VK_TEST_REQUIRE_F16B_NATIVE=1 asserts the q8_0 x f16-B GEMM took the f16-B coopmat path (K >= 1024,
-        // N >= 32, GGML_VK_DENSE_F16B_NATIVE default list); none of the other shapes / types may take it
-        const bool req_native = engagement_required(backend, "GGML_VK_TEST_REQUIRE_F16B_NATIVE");
-        static const bool native_on = [] { const char * e = getenv("GGML_VK_DENSE_F16B_NATIVE"); return e == nullptr || std::string(e) != "0"; }();
-        const int64_t native = dispatch_census_count(backend, "path:MUL_MAT_F16B_NATIVE");
-        if (req_native && native >= 0) {
-            // the counter counts only GEMMs the native list routed (not the GGML_VK_DENSE_F16COOPMAT dense router)
-            const bool want = k >= 1024 && n >= 32 && native_on && type_a == GGML_TYPE_Q8_0;
-            if ((native > 0) != want) {
-                msg = "MUL_MAT_F16B_NATIVE dispatches: " + std::to_string(native) + (want ? " (expected the f16-B path)" : " (expected int8 / mat-vec)");
-                return false;
-            }
-        }
-        if (pad == 0 || n <= 8 || !engagement_required(backend, "GGML_VK_TEST_REQUIRE_ROWSTRIDE")) {
-            return true;   // unpadded; a mat-vec width (B is the vector side there and is copied); not asked
-        }
-        const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_ROWSTRIDE_B");
-        const bool knob_on = env_knob_on("GGML_VK_ROWSTRIDE");
-        if ((c > 0) != knob_on) {
-            msg = "MUL_MAT_ROWSTRIDE_B dispatches: " + std::to_string(c) + (knob_on ? " (B was copied to packed rows)" : " (the knob is off)");
-            return false;
-        }
-        return true;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4699,27 +4597,6 @@ struct test_gdn_norm_f16 : public test_case {
         for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (t->op == GGML_OP_NONE && t->view_src == nullptr) init_tensor_uniform(t);
         }
-    }
-
-    bool checks_engagement() override { return true; }
-    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_NORM", "RMS_NORM_MUL_SIGMUL_CPY")) {
-            return true;
-        }
-        const bool fuse = env_knob_on("GGML_VK_GDN_NORM_F16") && env_knob_on("GGML_VK_FUSE_NORM_EXTRA") && env_knob_on("GGML_VK_NORM_SMALL");
-        struct { const char * name; int64_t want_min, want_max; } checks[] = {
-            { "RMS_NORM_MUL_SIGMUL_CPY", fuse ? 1 : 0, fuse ? 1 : 0 },
-            { "path:MUL_MAT_ROWSTRIDE_B", pad > 0 && ne[2] > 8 && env_knob_on("GGML_VK_ROWSTRIDE") ? 1 : 0,
-                                          pad > 0 && ne[2] > 8 && env_knob_on("GGML_VK_ROWSTRIDE") ? 1 : 0 },
-        };
-        for (const auto & c : checks) {
-            const int64_t n = dispatch_census_count(backend, c.name);
-            if (n < c.want_min || n > c.want_max) {
-                msg = std::string(c.name) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(c.want_min) + ")";
-                return false;
-            }
-        }
-        return true;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -6668,20 +6545,6 @@ struct test_hc_up_mix_f16 : public test_case {
         ggml_set_name(out, "mixed");
         return out;
     }
-
-    bool checks_engagement() override { return true; }
-    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        const char * name = gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G";
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_UP_MIX", name)) {
-            return true;
-        }
-        const int64_t n = dispatch_census_count(backend, name), want = env_knob_on("GGML_VK_HC_UP_MIX") ? 1 : 0;
-        if (n != want) {
-            msg = std::string(name) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
-            return false;
-        }
-        return true;
-    }
 };
 
 // GGML_OP_MUL_MAT
@@ -7156,24 +7019,6 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     }
 };
 
-// the REAP-320 expert shapes with the REG_A engagement assert (GGML_VK_TEST_REQUIRE_REGA=1): same graph and compare as the base case
-struct test_mul_mat_id_rega : public test_mul_mat_id {
-    using test_mul_mat_id::test_mul_mat_id;
-
-    bool checks_engagement() override { return true; }
-    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_REGA")) {
-            return true;
-        }
-        const int64_t n = dispatch_census_count(backend, "path:MUL_MAT_ID_REGA");
-        if (n == 0) {
-            msg = "MUL_MAT_ID_REGA dispatches: 0 (GGML_VK_TEST_REQUIRE_REGA=1; GGML_VK_FUSION_DEBUG=1 prints why the tile was not taken)";
-            return false;
-        }
-        return true;
-    }
-};
-
 struct test_mul_mat_id_cold : public test_case {
     const ggml_type type_a;
     const int n_mats;
@@ -7415,26 +7260,6 @@ struct test_moe_glu_f16 : public test_case {
     double max_nmse_err() override { return 5e-4; }
     uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2 * n_embd * n_ff * n_used * n_tokens; }
 
-    // GGML_VK_TEST_REQUIRE_PAIR_GLU=1: the fused launch must run for q4_K / q5_K with M % 128 == 0 and K % 256 == 0, and must not run
-    // otherwise; under GGML_VK_MMID_PAIR_GLU_EXT=0 only the q4_K f16 chain may run
-    bool checks_engagement() override { return true; }
-    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_PAIR_GLU")) {
-            return true;
-        }
-        const char * ext_env = getenv("GGML_VK_MMID_PAIR_GLU_EXT");
-        const bool ext = ext_env == nullptr || atoi(ext_env) != 0;
-        const bool expect = (type_w == GGML_TYPE_Q4_K || type_w == GGML_TYPE_Q5_K) && n_ff % 128 == 0 && n_embd % 256 == 0 &&
-                            (ext || (type_w == GGML_TYPE_Q4_K && !chain32));
-        const char * path = chain32 ? "path:MUL_MAT_ID_PAIR_SWIGLU_F32" : "path:MUL_MAT_ID_PAIR_SWIGLU";
-        const int64_t n = dispatch_census_count(backend, path);
-        if (expect != (n > 0)) {
-            msg = std::string(path) + " dispatches: " + std::to_string(n) + (expect ? " (expected > 0)" : " (expected 0)");
-            return false;
-        }
-        return true;
-    }
-
     test_moe_glu_f16(ggml_type type_w, ggml_type type_x, int64_t n_embd, int64_t n_ff, int n_expert, int n_used, int64_t n_tokens,
                      bool up_first = false, bool hist = false, bool chain32 = false)
         : type_w(type_w), type_x(type_x), n_embd(n_embd), n_ff(n_ff), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens),
@@ -7598,7 +7423,7 @@ struct test_moe_f16 : public test_case {
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 // MUL_MAT_ID (+ MUL by the router weights) + CPY(f16): the MoE gate/up and weighted down projections storing f16 from the
-// accumulator (Vulkan MUL_MAT_ID_CPY16 / MUL_MAT_ID_MUL_CPY16); the unfused chain matches too, hence the engagement opt-in
+// accumulator (Vulkan MUL_MAT_ID_CPY16 / MUL_MAT_ID_MUL_CPY16)
 struct test_mul_mat_id_cpy16 : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -7647,29 +7472,6 @@ struct test_mul_mat_id_cpy16 : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
-    }
-
-    bool checks_engagement() override { return true; }
-    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        const char * name = with_mul ? "MUL_MAT_ID_MUL_CPY16" : "MUL_MAT_ID_CPY16";
-        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_DOWN_STREAM", name)) {
-            // GGML_VK_TEST_REQUIRE_DOWN_STREAM=1: the streaming launch must run for q5_1 with m % 256 == 0 and k % 64 == 0, and not otherwise
-            const bool expect = type_a == GGML_TYPE_Q5_1 && m % 256 == 0 && k % 64 == 0 && n > 8;
-            const int64_t nd = dispatch_census_count(backend, "path:MUL_MAT_ID_DOWN_STREAM");
-            if (expect != (nd > 0)) {
-                msg = "MUL_MAT_ID_DOWN_STREAM dispatches: " + std::to_string(nd) + (expect ? " (expected > 0)" : " (expected 0)");
-                return false;
-            }
-        }
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_MMID_F16OUT", name)) {
-            return true;   // not asked, not the Vulkan backend, or the device cannot fuse
-        }
-        const int64_t n = dispatch_census_count(backend, name);
-        if (n != 1) {
-            msg = std::string(name) + " dispatches: " + std::to_string(n) + " (expected 1; GGML_VK_TEST_REQUIRE_MMID_F16OUT=1)";
-            return false;
-        }
-        return true;
     }
 };
 
@@ -9648,20 +9450,6 @@ struct test_qsa_score : public test_case {
     bool fusable() const {
         return n_blocks > 64 && 4 * n_tps > 64 && K < 2048 && (n_stream == 1 || (n_pool == n_blocks && q_rows == n_tps));
     }
-
-    bool checks_engagement() override { return true; }
-    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_SCORE", "QSA_SCORE")) {
-            return true;
-        }
-        const int64_t n = dispatch_census_count(backend, "QSA_SCORE");
-        const int64_t want = env_knob_on("GGML_VK_QSA_SCORE") && fusable() ? 1 : 0;
-        if (n != want) {
-            msg = "QSA_SCORE dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
-            return false;
-        }
-        return true;
-    }
 };
 
 // One qwen4exp maskless QSA layer's block selection over its query strips, as build_qsa_top_k builds it with compact
@@ -9839,26 +9627,6 @@ struct test_qsa_strip : public test_case {
                 init_tensor_uniform(t);
             }
         }
-    }
-
-    bool checks_engagement() override { return true; }
-    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_SCORE", "QSA_SCORE")) {
-            return true;
-        }
-        int64_t want = 0;
-        for (int64_t first = q_first(); first < n_tps; first += strip) {
-            want += score_blocks(first) > 64 && 4 * std::min(strip, n_tps - first) > 64;
-        }
-        if (!env_knob_on("GGML_VK_QSA_SCORE")) {
-            want = 0;
-        }
-        const int64_t n = dispatch_census_count(backend, "QSA_SCORE");
-        if (n != want) {
-            msg = "QSA_SCORE dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
-            return false;
-        }
-        return true;
     }
 };
 
@@ -11642,21 +11410,6 @@ struct test_qsa_expand : public test_case {
     double max_nmse_err() override { return 0.0; }
 
     bool strip_layout() const { return strips > 1 || first_strip > 0; }
-
-    // GGML_VK_TEST_REQUIRE_QSA_EXPAND=1: one QSA_EXPAND dispatch per strip while GGML_VK_QSA_EXPAND is on, none when off
-    bool checks_engagement() override { return true; }
-    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        // no fusion label: the knob-off run asserts 0 instead of being skipped (the census skip names GGML_VK_QSA_EXPAND=0)
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_EXPAND")) {
-            return true;
-        }
-        const int64_t n = dispatch_census_count(backend, "QSA_EXPAND"), want = env_knob_on("GGML_VK_QSA_EXPAND") ? strips : 0;
-        if (n != want) {
-            msg = "QSA_EXPAND dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
-            return false;
-        }
-        return true;
-    }
 
     static ggml_tensor * select(ggml_context * ctx, ggml_tensor * score, ggml_tensor * block_cells, ggml_tensor * tail, int64_t budget) {
         const int64_t nb = score->ne[0], nq = score->ne[1];
@@ -13484,15 +13237,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_1, tb, 4, 2, true, 512, n, 640));
         }
     }
-    if (env_opt_in("GGML_VK_TEST_REQUIRE_DOWN_STREAM")) {
-        // the Flash-Next down (512 experts, 10 used, ub2048)
-        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_1, GGML_TYPE_F16, 512, 10, true, 2560, 2048, 640));
-    }
-    // the REAP-320 shapes (about 1 min of host quantization and CPU reference each): with the engagement opt-in only
-    if (env_opt_in("GGML_VK_TEST_REQUIRE_MMID_F16OUT")) {
-        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, false,  640, 2048, 2560));
-        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true,  2560, 2048,  640));
-    }
     // REG_A: the aligned medium MUL_MAT_ID tile (about 64 rows per expert) of iq3_xxs / iq4_nl takes the register-direct A
     // loader (GGML_VK_MMID_REGA); m = 320 leaves a partial 128-row tile, b = true broadcasts B
     for (int64_t m : {256, 320}) {
@@ -15158,14 +14902,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
-    // Flash-Next REAP-320 shapes (64 rows per expert): the only medium tile where REG_A engages on iq3_xxs / iq4_nl; registered
-    // with GGML_VK_TEST_REQUIRE_REGA=1 only (with GGML_VK_MMID_REGA=1 GGML_VK_MMID_F16COOPMAT=all), else plain duplicates
-    if (env_opt_in("GGML_VK_TEST_REQUIRE_REGA")) {
-        test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F16, 320, 10, true, 640, 2048, 2560));
-        test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, true, 640, 2048, 2560));
-        test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true, 2560, 2048, 640));
-        test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 320, 10, true, 2560, 2048, 640));
-    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, 4096, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 512, 10, true, 640, 4096, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 512, 10, true, 640, 4096, 2560));
@@ -17715,7 +17451,7 @@ static bool run_mmb_context_test(ggml_backend_dev_t dev, const char * op_names_f
 //   void         ggml_backend_debug_dispatch_census_reset(void)                        clear the counts and start counting
 //   size_t       ggml_backend_debug_dispatch_census_get(char * buf, size_t size)       "KEY=count;..." in key order ("LABEL/n", "path:NAME")
 //   const char * ggml_backend_debug_dispatch_census_skip(ggml_backend_t, const char * label)   why the device cannot emit it, or NULL
-//   uint64_t     ggml_backend_debug_dispatch_census_count(const char * name)                     exactly "KEY" plus every "KEY/n" (engagement checks)
+//   uint64_t     ggml_backend_debug_dispatch_census_count(const char * name)                     exactly "KEY" plus every "KEY/n"
 typedef void         (*census_reset_t)(void);
 typedef size_t       (*census_get_t)(char * buf, size_t size);
 typedef const char * (*census_skip_t)(ggml_backend_t backend, const char * label);
@@ -17844,11 +17580,11 @@ static bool test_census(ggml_backend_t backend, ggml_backend_dev_t dev, const ch
         } else {
             dispatch_census_reset(backend);
             if (c.tc->eval_census(backend, backend_cpu.get(), why)) {
-                // the by-name count (engagement checks) must agree with the map for this label
+                // the by-name count must agree with the map for this label
                 const int64_t by_name = dispatch_census_count(backend, c.label.c_str());
                 std::vector<char> buf(get(nullptr, 0) + 1);
                 get(buf.data(), buf.size());
-                // fused dispatches only ("LABEL/n"); path keys are listed, not asserted (they belong to the engagement checks)
+                // fused dispatches only ("LABEL/n"); path keys are listed, not asserted
                 auto got = census_parse(buf.data());
                 for (auto it = got.begin(); it != got.end();) {
                     if (it->first.rfind("path:", 0) == 0) {
@@ -18228,7 +17964,6 @@ int main(int argc, char ** argv) {
             mode = MODE_TEST;
         } else if (strcmp(argv[i], "perf") == 0) {
             mode = MODE_PERF;
-            g_allow_quant_init_blocks = true;
         } else if (strcmp(argv[i], "grad") == 0) {
             mode = MODE_GRAD;
         } else if (strcmp(argv[i], "support") == 0) {
