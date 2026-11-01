@@ -57,15 +57,6 @@ static inline bool ggml_cuda_conv_next_is_noop(const ggml_cgraph * cgraph, int i
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
-// GGML_CONV_FUSE_DEBUG=1 prints why a concat did not match, with the node index the decision was made at
-static inline bool ggml_cuda_conv_reject(const char * which, const char * why, int node) {
-    static const bool dbg = getenv("GGML_CONV_FUSE_DEBUG") != nullptr;
-    if (dbg) {
-        fprintf(stderr, "%s: no fusion, %s (node %d)\n", which, why, node);
-    }
-    return false;
-}
-
 // nodes after `from` (inclusive) that read t, other than t itself and `except`: a scan, so it works on graph
 // copies and views whose use-count tables are not populated
 static inline int ggml_cuda_conv_readers(const ggml_cgraph * cgraph, int from, const ggml_tensor * t, const ggml_tensor * except) {

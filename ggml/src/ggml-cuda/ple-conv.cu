@@ -106,32 +106,32 @@ static const ggml_tensor * ple_weight_root(const ggml_tensor * wk, int64_t C, in
 
 static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv_match & m) {
     if (i < 0 || i + 2 >= cgraph->n_nodes) {
-        return ggml_cuda_conv_reject("ple_conv", "check 1", i);
+        return false;
     }
     const ggml_tensor * cc = cgraph->nodes[i];
     if (cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0 ||
         (cc->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_cuda_conv_next_is_noop(cgraph, i)) {
-        return ggml_cuda_conv_reject("ple_conv", "check 2", i);
+        return false;
     }
     const ggml_tensor * st = cc->src[0];
     const ggml_tensor * tr = cc->src[1];
     if (!st || !tr || st->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || tr->op != GGML_OP_TRANSPOSE || !tr->view_src) {
-        return ggml_cuda_conv_reject("ple_conv", "check 3", i);
+        return false;
     }
     int64_t C = 0, T = 0;
     const ggml_tensor * x = ggml_cuda_conv_activation(tr, C, T);
     if (!x) {
-        return ggml_cuda_conv_reject("ple_conv", "check 4", i);
+        return false;
     }
     constexpr int K = 4, DIL = 3, H = (K - 1) * DIL;
     if (st->ne[0] != H || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) {
-        return ggml_cuda_conv_reject("ple_conv", "check 5", i);
+        return false;
     }
     if (tr->ne[0] != T || tr->ne[1] != C || tr->ne[2] != 1 || tr->view_offs != 0) {
-        return ggml_cuda_conv_reject("ple_conv", "check 6", i);
+        return false;
     }
     if (cc->ne[0] != T + H || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc) || T < 256 || C % 256 != 0) {
-        return ggml_cuda_conv_reject("ple_conv", "check 7", i);
+        return false;
     }
 
     // Every later reader of the concat must be a tail reader or one of the four taps. Between the first tap and the
@@ -147,7 +147,7 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
         const bool reads_cc = ggml_cuda_reads(t, cc);
         if (silu >= 0) {
             if (reads_cc && !ggml_cuda_conv_tail_reader(t, cc, H, tail_from)) {
-                return ggml_cuda_conv_reject("ple_conv", "check 8", n);
+                return false;
             }
             continue;
         }
@@ -155,7 +155,7 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
             const int k = ple_tap_index(t, cc, C, T, DIL, K);
             if (k >= 0) {
                 if (tap_out[k] != nullptr) {
-                    return ggml_cuda_conv_reject("ple_conv", "check 9", n);
+                    return false;
                 }
                 if (first_tap < 0) {
                     first_tap = n;
@@ -176,13 +176,13 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
                 if (t->op == GGML_OP_TRANSPOSE && t->src[0] && t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src == cc && t->src[0]->ne[0] == T) {
                     continue;
                 }
-                return ggml_cuda_conv_reject("ple_conv", "check 10", n);
+                return false;
             }
             if (first_tap >= 0) {
                 return false; // a tail CONT/CPY inside the chain window would be skipped with it
             }
             if (!ggml_cuda_conv_tail_reader(t, cc, H, tail_from)) {
-                return ggml_cuda_conv_reject("ple_conv", "check 11", n);
+                return false;
             }
             continue;
         }
@@ -200,11 +200,11 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
                 }
             }
             if (k < 0 || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] != C || t->ne[1] != T || t->ne[2] != 1) {
-                return ggml_cuda_conv_reject("ple_conv", "check 12", n);
+                return false;
             }
             const ggml_tensor * Wk = ple_weight_root(tap_out[k] == a ? b : a, C, k);
             if (!Wk || (W && W != Wk)) {
-                return ggml_cuda_conv_reject("ple_conv", "check 13", n);
+                return false;
             }
             W = Wk;
             tap_out[k] = t;
@@ -215,7 +215,7 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
         }
         if (t->op == GGML_OP_ADD) {
             if (!chain || t->src[0] != chain || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
-                return ggml_cuda_conv_reject("ple_conv", "check 14", n);
+                return false;
             }
             int k = -1;
             for (int q = 1; q < K; ++q) {
@@ -224,7 +224,7 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
                 }
             }
             if (k < 0) {
-                return ggml_cuda_conv_reject("ple_conv", "check 15", n);
+                return false;
             }
             tap_out[k] = t; // consumed
             chain = t;
@@ -232,7 +232,7 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
         }
         if (t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SILU && chain && t->src[0] == chain) {
             if (n_taps != K || !W || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] != C || t->ne[1] != T) {
-                return ggml_cuda_conv_reject("ple_conv", "check 16", n);
+                return false;
             }
             silu = n;
             continue;
@@ -241,17 +241,17 @@ static bool ple_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_ple_conv
             // weight column plumbing: must not read the concat (checked above) and must lead to a tap MUL
             continue;
         }
-        return ggml_cuda_conv_reject("ple_conv", "check 17", n);
+        return false;
     }
     if (silu < 0 || first_tap < 0 || n_taps != K || !W) {
-        return ggml_cuda_conv_reject("ple_conv", "check 18", i);
+        return false;
     }
     // chain intermediates feed only the chain: the direct kernel never produces them
     for (int n = first_tap; n < silu; ++n) {
         const ggml_tensor * t = cgraph->nodes[n];
         if (t->op == GGML_OP_CONT || t->op == GGML_OP_MUL || t->op == GGML_OP_ADD || t->op == GGML_OP_CPY) {
             if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_conv_readers(cgraph, n + 1, t, nullptr) != 1) {
-                return ggml_cuda_conv_reject("ple_conv", "chain intermediate has another reader", n);
+                return false;
             }
         }
     }

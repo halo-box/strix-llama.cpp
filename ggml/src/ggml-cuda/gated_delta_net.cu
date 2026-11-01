@@ -1623,8 +1623,7 @@ void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const 
 // epilogue. Graph-time predicate (shapes / env only); the op aborts if the v2 scan is not taken after all.
 bool ggml_cuda_gdn_z16_ok(const ggml_tensor * gdn) {
 #if defined(GGML_USE_HIP)
-    static const bool nofuse = getenv("GGML_CUDA_DISABLE_GDN_OUTNORM") != nullptr ||
-        (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_FUSION")) != 0);
+    static const bool nofuse = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_FUSION")) != 0;
     if (nofuse || !gdn || gdn->op != GGML_OP_GATED_DELTA_NET) return false;
     const ggml_tensor * v = gdn->src[2];
     const int  cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
