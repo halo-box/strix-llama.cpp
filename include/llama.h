@@ -964,6 +964,11 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// write the recurrent state as it was n tokens back (1..n_rs_seq), read from the rollback snapshot planes
+// of the last decode; single sequence only, with no rollback pending [EXPERIMENTAL]
+#define LLAMA_STATE_SEQ_FLAGS_RS_BACK(n) ((uint32_t) (((uint32_t) (n) & 0xffu) << 8))
+#define LLAMA_STATE_SEQ_FLAGS_RS_BACK_GET(flags) ((uint32_t) (((uint32_t) (flags) >> 8) & 0xffu))
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
