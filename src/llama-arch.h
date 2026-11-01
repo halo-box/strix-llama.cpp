@@ -876,3 +876,5 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch);
 // every recurrent row of these models is written by the delta-net helpers that take the state snapshot
 bool llm_arch_supports_rs_snapshot(const llm_arch & arch);
 bool llm_arch_supports_mixed_batch(const llm_arch & arch);
+// archs whose MoE FFN builds the f16 expert chain at prefill (cparams.fused_moe_f16, build_moe_ffn)
+bool llm_arch_moe_f16(const llm_arch & arch);

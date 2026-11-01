@@ -2028,17 +2028,24 @@ static bool ggml_vk_buft_is_repack(ggml_backend_buffer_type_t buft) {
            ((const ggml_backend_vk_buffer_type_context *) buft->context)->repack;
 }
 
-// rows per block of the repacked order for t on dev (16 q4_K / q5_K, 32 q5_1), or 0 for a tensor the repacked readers do not cover
+// the largest K the repacked mat-vec (mul_mat_vec_id_rp.comp) stages B for: a covered tensor must have a repacked reader at every
+// token count, else each decode MUL_MAT_ID copies the whole tensor back (ggml_vk_expert_unrepack)
+static constexpr int64_t repack_mmv_max_k_r16 = 4096;
+static constexpr int64_t repack_mmv_max_k_r32 = 2048;
+
+// rows per block of the repacked order for t on dev (16 q4_K / q5_K, 32 q5_1), or 0 for a tensor the repacked readers do not cover.
+// The buffer's placement probe (supports_op) and every reader take this one predicate.
 static uint32_t ggml_vk_repack_rows_shape(const vk_device & dev, const ggml_tensor * t) {
     if (t->view_src != nullptr || t->ne[2] < 2 || t->ne[3] != 1 || !ggml_is_contiguous(t) ||
         ggml_nbytes(t) > dev->properties.limits.maxStorageBufferRange) {
         return 0;
     }
     if (((t->type == GGML_TYPE_Q4_K && dev->expert_repack_q4k) || (t->type == GGML_TYPE_Q5_K && dev->expert_repack_q5k)) &&
-        t->ne[0] % 256 == 0 && t->ne[1] % 128 == 0) {
+        t->ne[0] % 256 == 0 && t->ne[1] % 128 == 0 && t->ne[0] <= repack_mmv_max_k_r16) {
         return 16;
     }
-    if (t->type == GGML_TYPE_Q5_1 && dev->expert_repack_q51 && t->ne[0] % 64 == 0 && t->ne[1] % 256 == 0) {
+    if (t->type == GGML_TYPE_Q5_1 && dev->expert_repack_q51 && t->ne[0] % 64 == 0 && t->ne[1] % 256 == 0 &&
+        t->ne[0] <= repack_mmv_max_k_r32) {
         return 32;
     }
     return 0;
@@ -11648,8 +11655,8 @@ static bool ggml_vk_repack_mmv_ok(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const uint32_t R = ggml_vk_repack_rows(src0);
-    return R != 0 && src1->type == GGML_TYPE_F32 && ggml_vk_dim01_contiguous(src1) && dst->type == GGML_TYPE_F32 &&
-           src0->ne[0] <= (R == 16 ? 4096 : 2048);
+    // (the K bound is part of ggml_vk_repack_rows: a repacked tensor always fits the mat-vec's B stage)
+    return R != 0 && src1->type == GGML_TYPE_F32 && ggml_vk_dim01_contiguous(src1) && dst->type == GGML_TYPE_F32;
 }
 
 static bool ggml_vk_use_mul_mat_vec_id(const ggml_tensor * dst) {
