@@ -58,31 +58,31 @@ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float
 
 static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m) {
     if (i < 0 || i + 2 >= cgraph->n_nodes) {
-        return false;
+        return ggml_cuda_conv_reject("gdn_conv", "check 1", i);
     }
     const ggml_tensor * cc = cgraph->nodes[i];
     if (cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0 ||
         (cc->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_cuda_conv_next_is_noop(cgraph, i)) {
-        return false;
+        return ggml_cuda_conv_reject("gdn_conv", "check 2", i);
     }
     const ggml_tensor * st = cc->src[0];
     const ggml_tensor * tr = cc->src[1];
     if (!st || !tr || st->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || tr->op != GGML_OP_TRANSPOSE || !tr->view_src) {
-        return false;
+        return ggml_cuda_conv_reject("gdn_conv", "check 3", i);
     }
     int64_t C = 0, T = 0, S = 0;
     const ggml_tensor * x = ggml_cuda_conv_activation_seqs(tr, C, T, S);
     if (!x) {
-        return false;
+        return ggml_cuda_conv_reject("gdn_conv", "check 4", i);
     }
     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != S || st->ne[3] != 1 || !ggml_is_contiguous(st)) {
-        return false;
+        return ggml_cuda_conv_reject("gdn_conv", "check 5", i);
     }
     if (tr->ne[0] != T || tr->ne[1] != C || tr->ne[2] != S || tr->view_offs != 0) {
-        return false;
+        return ggml_cuda_conv_reject("gdn_conv", "check 6", i);
     }
     if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != S || cc->ne[3] != 1 || !ggml_is_contiguous(cc) || T < 256 || C % 256 != 0) {
-        return false;
+        return ggml_cuda_conv_reject("gdn_conv", "check 7", i);
     }
 
     // the conv is the only reader of the whole concat; everything else must be a tail reader
@@ -95,7 +95,7 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
         }
         if (t->op == GGML_OP_SSM_CONV && ggml_cuda_conv_whole(t->src[0], cc)) {
             if (conv >= 0) {
-                return false;
+                return ggml_cuda_conv_reject("gdn_conv", "check 8", n);
             }
             conv = n;
             continue;
@@ -104,23 +104,23 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
             continue; // shape plumbing into the conv; its readers are checked as readers of the concat
         }
         if (!ggml_cuda_conv_tail_reader(t, cc, 3, tail_from)) {
-            return false;
+            return ggml_cuda_conv_reject("gdn_conv", "check 9", n);
         }
     }
     if (conv < 0 || conv + 1 >= cgraph->n_nodes) {
-        return false;
+        return ggml_cuda_conv_reject("gdn_conv", "check 10", i);
     }
     const ggml_tensor * cv = cgraph->nodes[conv];
     const ggml_tensor * w  = cv->src[1];
     if (cv->type != GGML_TYPE_F32 || cv->src[2] != nullptr || !w || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != C ||
         !ggml_is_contiguous(w) || cv->ne[0] != C || cv->ne[1] != T || cv->ne[2] != S || cv->ne[3] != 1 || !ggml_is_contiguous(cv) ||
         (cv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-        return false;
+        return ggml_cuda_conv_reject("gdn_conv", "check 11", i);
     }
     const ggml_tensor * su = cgraph->nodes[conv + 1];
     if (su->op != GGML_OP_UNARY || ggml_get_unary_op(su) != GGML_UNARY_OP_SILU || su->src[0] != cv || su->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(su) || ggml_cuda_conv_readers(cgraph, conv + 1, cv, nullptr) != 1) {
-        return false;
+        return ggml_cuda_conv_reject("gdn_conv", "check 12", i);
     }
     m.concat_idx = i; m.conv_idx = conv; m.x = x; m.state = st; m.concat = cc; m.w = w; m.out = cgraph->nodes[conv + 1];
     m.C = C; m.T = T; m.S = S; m.tail_from = std::max<int64_t>(0, tail_from);

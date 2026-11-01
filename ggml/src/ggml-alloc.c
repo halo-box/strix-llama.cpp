@@ -979,6 +979,15 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    // GGML_ALLOC_DRY_RUN=1: print the planned size of every buffer this reserve would allocate and fail the reserve instead
+    // of allocating (a sweep checks a reuse delay's size against its cap without risking the allocation)
+    static int dry_run = -1;
+    if (dry_run < 0) {
+        const char * e = getenv("GGML_ALLOC_DRY_RUN");
+        dry_run = e != NULL && atoi(e) != 0;
+    }
+    bool dry_run_hit = false;
+
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
@@ -999,6 +1008,13 @@ static bool ggml_gallocr_reserve_n_impl(
             if (new_chunk_size > cur_chunk_size) {
                 realloc = true;
             }
+        }
+        if (dry_run && realloc && !no_alloc) {
+            GGML_LOG_INFO("%s: DRY RUN: %s buffer planned %.2f MiB in %d chunk(s), reuse delay %d, hold %lld MiB\n", __func__,
+                    ggml_backend_buft_name(galloc->bufts[i]), new_size / 1048576.0, galloc->buf_tallocs[i]->n_chunks, 0,
+                    0LL);
+            dry_run_hit = true;
+            continue;
         }
         if (realloc) {
 #ifndef NDEBUG
@@ -1026,6 +1042,11 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    if (dry_run_hit) {
+        // a library must not exit the process: the caller treats a failed reserve as an error
+        GGML_LOG_WARN("%s: DRY RUN: failing the reserve before the allocation\n", __func__);
+        return false;
+    }
     return true;
 }
 
