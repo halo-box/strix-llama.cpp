@@ -1161,126 +1161,6 @@ static __global__ void mul_mat_vec_iq3_s_grid_rdna3_5(
     GGML_UNUSED(stride_col_dst);
 }
 
-// gfx1151 IQ3_S decode kernel with LDS staging, ncols == 2560 (10 blocks, 1100 B per row). The direct
-// per-lane field loads of vec_dot_iq3_s_q8_1 (about 18 vector-memory instructions per block per lane, most of
-// them for the Q8_1 activations) saturate the texture-address unit (MemUnitBusy ~91%) long before DRAM
-// bandwidth. Here each wave first copies its up (and gate) row into shared memory with 9 dword loads per
-// lane, the block copies the quantized activations once, and the dot products then read from LDS.
-// The per-lane accumulation and reduction order is the same as mul_mat_vec_iq3_s_rows_rdna3_5.
-#define MMVQ_IQ3_LDS_NCOLS      2560
-#define MMVQ_IQ3_LDS_ROW_DWORDS 275   // 10 blocks * 110 B / 4
-#define MMVQ_IQ3_LDS_ROW_SLOT   276
-#define MMVQ_IQ3_LDS_Y_DWORDS   720   // 80 Q8_1 blocks * 36 B / 4
-
-template <bool has_gate, int rows_per_block>
-__launch_bounds__(rows_per_block * ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void mul_mat_vec_iq3_s_lds_rdna3_5(
-        const void * vx_ptr, const void * vy_ptr, const int32_t * ids,
-        const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
-        const uint32_t stride_row_x, const uint32_t stride_col_dst,
-        const uint32_t stride_channel_x, const uint32_t stride_channel_y,
-        const uint32_t stride_channel_dst, const uint32_t stride_sample_x,
-        const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
-    constexpr int qk        = QK_K;
-    constexpr int qi        = ggml_cuda_type_traits<GGML_TYPE_IQ3_S>::qi;
-    constexpr int vdr       = VDR_IQ3_S_Q8_1_MMVQ;
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int blocks_per_row  = MMVQ_IQ3_LDS_NCOLS / qk;
-    constexpr int blocks_per_iter = vdr * warp_size / qi;
-    constexpr int row_loads       = (MMVQ_IQ3_LDS_ROW_DWORDS + warp_size - 1) / warp_size; // 9
-
-    __shared__ int s_y[MMVQ_IQ3_LDS_Y_DWORDS];
-    __shared__ int s_rows[rows_per_block][has_gate ? 2 : 1][MMVQ_IQ3_LDS_ROW_SLOT];
-
-    const int lane = threadIdx.x;
-    const int wave = threadIdx.y;
-    const int tid  = wave * warp_size + lane;
-    const int row  = rows_per_block * blockIdx.x + wave;
-    const bool row_ok = row < nrows_x;
-
-    const uint32_t channel_dst = blockIdx.y;
-    const uint32_t sample_dst  = blockIdx.z;
-    const uint32_t channel_x   = ids[channel_dst];
-    const uint32_t channel_y   = fastmodulo(channel_dst, nchannels_y);
-
-    const block_q8_1 * y = (const block_q8_1 *) vy_ptr + sample_dst * stride_sample_y + channel_y * stride_channel_y;
-    const int kbx_offset = sample_dst * stride_sample_x + channel_x * stride_channel_x + (row_ok ? row : 0) * stride_row_x;
-
-    // 1. weight rows -> registers (dword loads; rows are 4 B aligned: 1100 B rows, even block offsets)
-    const int * gx = (const int *) ((const block_iq3_s *) vx_ptr + kbx_offset);
-    int rx[row_loads];
-    int rg[row_loads];
-#pragma unroll
-    for (int i = 0; i < row_loads; ++i) {
-        const int idx = i * warp_size + lane;
-        rx[i] = idx < MMVQ_IQ3_LDS_ROW_DWORDS ? gx[idx] : 0;
-    }
-    if constexpr (has_gate) {
-        const int * gg = (const int *) ((const block_iq3_s *) fusion.gate + kbx_offset);
-#pragma unroll
-        for (int i = 0; i < row_loads; ++i) {
-            const int idx = i * warp_size + lane;
-            rg[i] = idx < MMVQ_IQ3_LDS_ROW_DWORDS ? gg[idx] : 0;
-        }
-    }
-
-    // 2. quantized activations -> LDS (shared by the rows of the block)
-    {
-        const int * gy = (const int *) y;
-        for (int i = tid; i < MMVQ_IQ3_LDS_Y_DWORDS; i += rows_per_block * warp_size) {
-            s_y[i] = gy[i];
-        }
-    }
-
-    // 3. rows -> LDS
-#pragma unroll
-    for (int i = 0; i < row_loads; ++i) {
-        const int idx = i * warp_size + lane;
-        if (idx < MMVQ_IQ3_LDS_ROW_DWORDS) {
-            s_rows[wave][0][idx] = rx[i];
-            if constexpr (has_gate) {
-                s_rows[wave][1][idx] = rg[i];
-            }
-        }
-    }
-    __syncthreads();
-
-    if (!row_ok) {
-        return;
-    }
-
-    // 4. dot products from LDS, same lane -> block assignment as the direct kernel
-    const block_q8_1 * y_l = (const block_q8_1 *) s_y;
-    const void *       x_l = s_rows[wave][0];
-    float sum      = 0.0f;
-    float sum_gate = 0.0f;
-#pragma unroll
-    for (int kbx = lane / (qi/vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (lane % (qi/vdr));
-        sum += vec_dot_iq3_s_q8_1(x_l, &y_l[kby], kbx, kqs);
-        if constexpr (has_gate) {
-            sum_gate += vec_dot_iq3_s_q8_1(s_rows[wave][1], &y_l[kby], kbx, kqs);
-        }
-    }
-
-    sum = warp_reduce_sum<warp_size>(sum);
-    if constexpr (has_gate) {
-        sum_gate = warp_reduce_sum<warp_size>(sum_gate);
-    }
-
-    if (lane == 0) {
-        float result = sum;
-        if constexpr (has_gate) {
-            result *= ggml_cuda_op_silu_single(sum_gate);
-        }
-        dst_ptr[sample_dst * stride_sample_dst + channel_dst * stride_channel_dst + row] = result;
-    }
-    GGML_UNUSED(stride_col_dst);
-    GGML_UNUSED(ncols_x);
-}
-
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
         return 1;
@@ -2710,7 +2590,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 const bool gate_ok = (fusion.gate == nullptr || fusion.glu_op == GGML_GLU_OP_SWIGLU) && fusion.shared_up == nullptr;
                 if (table_id == MMVQ_PARAMETERS_RDNA3_5 && ids != nullptr && ncols_x == 2560 &&
                         no_extra_fusion && gate_ok && nsamples_dst == 1) {
-                    static const int rows_env = getenv("GGML_IQ3_ROWS") ? atoi(getenv("GGML_IQ3_ROWS")) : c_rows;
                     auto launch_rows = [&](auto kernel, int rows) {
                         const dim3 block_nums((nrows_x + rows - 1) / rows, nchannels_dst, nsamples_dst);
                         const dim3 block_dims(warp_size, rows, 1);
@@ -2720,29 +2599,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                             stride_row_x, stride_col_dst, stride_channel_x, stride_channel_y,
                             stride_channel_dst, stride_sample_x, stride_sample_y, stride_sample_dst);
                     };
-                    static const int lds_env  = getenv("GGML_IQ3_LDS")  ? atoi(getenv("GGML_IQ3_LDS"))  : 0;
-                    static const int grid_env = getenv("GGML_IQ3_GRID") ? atoi(getenv("GGML_IQ3_GRID")) : 4;
-                    if (fusion.gate != nullptr && grid_env > 0) {
-                        switch (grid_env) {
-                            case 1: launch_rows(mul_mat_vec_iq3_s_grid_rdna3_5<true, 1>, 1); break;
-                            case 2: launch_rows(mul_mat_vec_iq3_s_grid_rdna3_5<true, 2>, 2); break;
-                            case 8: launch_rows(mul_mat_vec_iq3_s_grid_rdna3_5<true, 8>, 8); break;
-                            default: launch_rows(mul_mat_vec_iq3_s_grid_rdna3_5<true, 4>, 4); break;
-                        }
-                    } else if (fusion.gate != nullptr && lds_env > 0) {
-                        switch (lds_env) {
-                            case 1: launch_rows(mul_mat_vec_iq3_s_lds_rdna3_5<true, 1>, 1); break;
-                            case 2: launch_rows(mul_mat_vec_iq3_s_lds_rdna3_5<true, 2>, 2); break;
-                            case 8: launch_rows(mul_mat_vec_iq3_s_lds_rdna3_5<true, 8>, 8); break;
-                            default: launch_rows(mul_mat_vec_iq3_s_lds_rdna3_5<true, 4>, 4); break;
-                        }
-                    } else if (fusion.gate != nullptr) {
-                        switch (rows_env) {
-                            case 2: launch_rows(mul_mat_vec_iq3_s_rows_rdna3_5<true, 2>, 2); break;
-                            case 4: launch_rows(mul_mat_vec_iq3_s_rows_rdna3_5<true, 4>, 4); break;
-                            case 8: launch_rows(mul_mat_vec_iq3_s_rows_rdna3_5<true, 8>, 8); break;
-                            default: launch_rows(mul_mat_vec_iq3_s_rows_rdna3_5<true, 1>, 1); break;
-                        }
+                    if (fusion.gate != nullptr) {
+                        launch_rows(mul_mat_vec_iq3_s_grid_rdna3_5<true, 4>, 4);
                     } else {
                         launch_rows(mul_mat_vec_iq3_s_rows_rdna3_5<false, c_rows>, c_rows);
                     }

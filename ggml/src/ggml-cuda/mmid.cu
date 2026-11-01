@@ -303,7 +303,7 @@ void ggml_cuda_launch_mm_ids_helper(
         }
         return;
     }
-    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && n_experts == 512 && n_expert_used == 10 && getenv("GGML_CUDA_DISABLE_MMID_512") == nullptr) {
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && n_experts == 512 && n_expert_used == 10) {
         mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
             ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
         return;
