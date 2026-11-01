@@ -1261,6 +1261,7 @@ struct llama_model::impl {
     };
 
     layer_dev dev_input = {};
+    layer_dev dev_input_tok_embd = {}; // token_embd only, see load_tensors
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
@@ -1676,6 +1677,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->dev_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
+    }
+
+    // on an integrated GPU with all layers offloaded, token_embd (only it) goes to layer 0's device: the CPU get_rows
+    // costs a graph split and an F32 copy per ubatch (7.5 ms at 8192 tokens, gfx1151) for a weight in the same memory
+    pimpl->dev_input_tok_embd = pimpl->dev_input;
+    {
+        static const bool tok_embd_igpu = [] { const char * e = getenv("LLAMA_TOK_EMBD_IGPU"); return e == nullptr || atoi(e) != 0; }();
+        const bool all_offloaded = n_layer_all > 0 && i_gpu_start == 0 && act_gpu_layers == n_layer_all + 1;
+        if (tok_embd_igpu && all_offloaded && pimpl->dev_layer[0].dev != cpu_dev &&
+                ggml_backend_dev_type(pimpl->dev_layer[0].dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            pimpl->dev_input_tok_embd = pimpl->dev_layer[0];
+            LLAMA_LOG_INFO("%s: token_embd assigned to device %s (integrated GPU, all layers offloaded; LLAMA_TOK_EMBD_IGPU=0 keeps it on the CPU)\n",
+                    __func__, ggml_backend_dev_name(pimpl->dev_layer[0].dev));
+        }
     }
 
     // assign the output layer
@@ -2371,8 +2386,11 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
     }
+    // a tied output (TENSOR_DUPLICATED) is placed as the output
+    const buft_list_t * buft_list_input = tn.tensor == LLM_TENSOR_TOKEN_EMBD && tn.bid == -1 && !(flags & llama_model_loader::TENSOR_DUPLICATED)
+        ? pimpl->dev_input_tok_embd.buft_list : pimpl->dev_input.buft_list;
     return ml.create_tensor(
-        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        hparams, &pimpl->cpu_buft_list, buft_list_input, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
 }
 
