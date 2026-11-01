@@ -13,7 +13,7 @@
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
 
-// Multi-row coopmat1 prefill flash attention (GGML_VK_FA_MR), after the gufo engine's attention_wmma kernel.
+// Multi-row coopmat1 prefill flash attention, after the gufo engine's attention_wmma kernel.
 //
 // The cm1 kernel pins Br at 16 query rows and splits Bc over its subgroups, so every 16 rows stream
 // the whole K/V range and each subgroup needs every Q fragment (re-read from LDS per KV block).
