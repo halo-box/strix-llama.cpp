@@ -529,8 +529,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     // fc_embedding(e) + fc_hidden(h) is one projection of the concatenation; the converter
     // merges the two checkpoint tensors into this single eh_proj
-    ggml_tensor * inpL = build_lora_mm(layer.nextn.eh_proj,
-            ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+    // as one [2*n_embd, hc*n_tokens] GEMM: the 3-D [2*n_embd, hc, n_tokens] operand is a batch of n_tokens 4-column
+    // products, which Vulkan runs as mat-vec re-reading the weight per token (407 ms per 10k-token prompt at draft ub512)
+    ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0);
+    eh_in = ggml_reshape_2d(ctx0, eh_in, eh_in->ne[0], hc*n_tokens);
+    ggml_tensor * inpL = build_lora_mm(layer.nextn.eh_proj, eh_in, layer.nextn.eh_proj_s);
+    inpL = ggml_reshape_3d(ctx0, inpL, inpL->ne[0], hc, n_tokens);
     cb(inpL, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
