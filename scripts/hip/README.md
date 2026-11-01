@@ -1,6 +1,6 @@
 # HIP VGPR and SGPR spill gate
 
-The gfx1151 gate requires zero VGPR-spilling and zero SGPR-spilling kernels with the pinned ROCm 10.1 / AMD Clang 24 compiler. It reads final `*.lto.s` code-object metadata, checks every emitted kernel and takes the maximum of each resource metric across repeated names. No kernel in the tracked baseline has a VGPR spill exception; ten flash-attention kernels have bounded SGPR spill budgets (see below).
+The gfx1151 gate requires zero VGPR-spilling and zero SGPR-spilling kernels with the pinned ROCm 10.1 / AMD Clang 24 compiler. It reads final `*.lto.s` code-object metadata, checks every emitted kernel and takes the maximum of each resource metric across repeated names. No kernel in the tracked baseline has a VGPR spill exception; eleven flash-attention kernels have bounded SGPR spill budgets (see below).
 
 ## Metric definitions and architecture
 
@@ -22,7 +22,7 @@ The compiler identity must match exactly. Every input assembly file must target 
 
 Private-segment bytes are no longer governed by an allowlist. Five Q1_0 MMQ bodies retain 16 private bytes per lane with zero VGPR spill saves. This is a known observation, not an exception or a scratch-byte ceiling. A zero-spill result does not require zero private-segment bytes, and it does not establish numerical correctness, occupancy or runtime performance. Kernel changes still require the repository's hardware correctness and performance flow.
 
-The checker retains support for explicit legacy budgets so its existing regression fixtures and historical baselines can still be read; a budget without `sgpr_spills` allows no SGPR spill. The tracked gfx1151 baseline has no VGPR budget and ten SGPR budgets. Three (reason `sgpr_lane_spill`) cover flash_attn_ext_f16 D64 4x8 and softcap D128 16x2 / 32x2, whose spill-free variants changed the output bytes or used scratch. Seven (reason `sgpr_lane_spill_slower`) cover flash_attn_ext_f16 D64 16x2, D128 32x2, softcap D128 4x8 / 8x4 and softcap D256 4x8 / 8x4, and flash_attn_mask_to_KV_max<64>, whose spill-free variants measured slower.
+The checker retains support for explicit legacy budgets so its existing regression fixtures and historical baselines can still be read; a budget without `sgpr_spills` allows no SGPR spill. The tracked gfx1151 baseline has no VGPR budget and eleven SGPR budgets. Three (reason `sgpr_lane_spill`) cover flash_attn_ext_f16 D64 4x8 and softcap D128 16x2 / 32x2, whose spill-free variants changed the output bytes or used scratch. Eight (reason `sgpr_lane_spill_slower`) cover flash_attn_ext_f16 D64 8x4, D64 16x2, D128 32x2, softcap D128 4x8 / 8x4 and softcap D256 4x8 / 8x4, and flash_attn_mask_to_KV_max<64>, whose spill-free variants measured slower.
 
 ## Regenerate the coverage map
 
