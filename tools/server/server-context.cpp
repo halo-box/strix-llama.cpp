@@ -288,6 +288,9 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // create the end-of-prompt checkpoint from the rollback snapshots once the last prompt batch is decoded
+    bool ckpt_tail_pending = false;
+
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
@@ -1250,6 +1253,26 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
+    // the snapshots cost nothing only where the backend computes them beside an unchanged pass
+    // (ggml_backend_gdn_rs_exact); elsewhere K > 1 switches the prefill to a slower per-token scan
+    static bool gdn_rs_exact_on_all_gpus() {
+        bool any = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(dev);
+            if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto * fn = reg ? (bool (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_gdn_rs_exact") : nullptr;
+            if (fn == nullptr || !fn(dev)) {
+                return false;
+            }
+            any = true;
+        }
+        return any;
+    }
+
     bool load_model(common_params & params) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
@@ -1357,6 +1380,12 @@ private:
         {
             params_base.load_progress_callback = load_progress_callback;
             params_base.load_progress_callback_user_data = &load_progress_text;
+        }
+
+        // rollback snapshots let the checkpoint 4 tokens before the end of a prompt be taken inside
+        // the last prompt pass, instead of a separate 4-token pass (a full read of the weights)
+        if (params_base.n_ctx_checkpoints > 0 && params_base.ctx_checkpoint_snapshots && gdn_rs_exact_on_all_gpus()) {
+            params_base.n_rs_seq_ckpt = 4;
         }
 
         llama_init = common_init_from_params(params_base);
@@ -2817,8 +2846,33 @@ private:
         return true;
     }
 
+    // the in-pass end-of-prompt checkpoint is taken after the prompt is processed, so it must not carry draft state
+    // tied to the end of the prompt: MTP (its draft context has no recurrent layer, its cache is trimmed by position)
+    // and the n-gram drafts keep none; EAGLE3 stashes a boundary row and the standalone drafts have their own state
+    bool ckpt_tail_spec_ok() const {
+        for (const auto t : params_base.speculative.types) {
+            if (t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // the checkpoint 4 tokens before the end of the prompt, from the rollback snapshots of the last prompt pass;
+    // only valid until the next decode of the target
+    void create_tail_checkpoint(server_slot & slot) {
+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+
+        // the recurrent cell reports its own position for both bounds, so both move back with it
+        if (pos_min >= 0 && pos_max >= 4) {
+            create_checkpoint(slot, 4, std::min(pos_min, pos_max - 4), pos_max - 4, LLAMA_STATE_SEQ_FLAGS_RS_BACK(4));
+        }
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, llama_state_seq_flags flags_extra = 0) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2872,7 +2926,7 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | flags_extra);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -4200,6 +4254,12 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    // the checkpoint 4 tokens before the end comes from the snapshot planes of the last pass
+                    // (speculative decoding keeps the separate pass: its draft state is stashed with the checkpoint)
+                    const bool ckpt_tail_in_pass = do_checkpoint && params_base.ctx_checkpoint_snapshots &&
+                        (!slot.can_speculate() || ckpt_tail_spec_ok()) && n_swa == 0 && llama_n_rs_seq(ctx_tgt) >= 4;
+                    slot.ckpt_tail_pending = false;
+
                     // TODO: do the same for all models, then remove process_mtmd_chunk()
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
                         if (!add_prompt_mixed(slot)) {
@@ -4302,7 +4362,11 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            // a checkpoint closer to the start than one ubatch saves less prefill than the separate pass
+                            // its break costs on every prompt (a full read of the weights): leave it to the pass
+                            const bool worth_a_pass = !params_base.ctx_checkpoint_snapshots || pos >= n_ubatch;
+                            if (worth_a_pass &&
+                                    (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step)) {
                                 break;
                             }
                         }
@@ -4317,6 +4381,9 @@ private:
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (ckpt_tail_in_pass && offset == 4) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (n_prompt_in == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -4356,6 +4423,8 @@ private:
                         slot.i_batch     = batch.size() - 1;
 
                         slot.init_sampler();
+
+                        slot.ckpt_tail_pending = ckpt_tail_in_pass && !has_mtmd && n_prompt_in > 4;
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
@@ -4630,6 +4699,14 @@ private:
                 return;
             }
 
+            // the end-of-prompt checkpoint is created once the first token is out (it only has to precede the next
+            // decode of the target, which overwrites the snapshots), so it does not delay the first token
+            bool ckpt_tail = false;
+            if (slot.state == SLOT_STATE_DONE_PROMPT && slot.ckpt_tail_pending) {
+                slot.ckpt_tail_pending = false;
+                ckpt_tail = slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+            }
+
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
@@ -4666,6 +4743,9 @@ private:
             }
 
             if (slot.can_speculate() && !slot.spec_draft.empty()) {
+                if (ckpt_tail) {
+                    create_tail_checkpoint(slot);
+                }
                 return; // sample using speculative decoding
             }
 
@@ -4705,12 +4785,19 @@ private:
             }
 
             if (!process_token(result, slot)) {
+                if (ckpt_tail) {
+                    create_tail_checkpoint(slot);
+                }
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
                 slot.release();
 
                 return;
+            }
+
+            if (ckpt_tail) {
+                create_tail_checkpoint(slot);
             }
 
             slot.print_timings_tg();

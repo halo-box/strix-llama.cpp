@@ -9586,8 +9586,17 @@ static void ggml_backend_cuda_set_mmb_small_batch(ggml_backend_t backend, bool e
     ((ggml_backend_cuda_context *) backend->context)->mmb_small_batch = enable;
 }
 
+// bool (*)(ggml_backend_dev_t): see ggml_cuda_gdn_rs_exact
+static bool ggml_backend_cuda_gdn_rs_exact(ggml_backend_dev_t dev) {
+    const auto * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    return ggml_cuda_gdn_rs_exact(dev_ctx->device);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_gdn_rs_exact") == 0) {
+        return (void *)ggml_backend_cuda_gdn_rs_exact;
+    }
     if (strcmp(name, "ggml_backend_cuda_set_mmb_enabled") == 0) {
         return (void *)ggml_backend_cuda_set_mmb_enabled;
     }

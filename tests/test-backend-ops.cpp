@@ -6118,7 +6118,10 @@ struct test_gated_delta_net : public test_case {
     // reference) instead of the exact fp32 recurrence: HIP on RDNA3.5 (S_v = 128, >= 256 tokens per sequence, final
     // state only; several sequences run it once per sequence) and Vulkan on RDNA3 (S_v = 128, >= 64 tokens, final state only)
     double max_nmse_err() override {
-        return (head_size == 128 && n_seq_tokens >= 256 && !kda && K == 1) ? 1e-6 : 1e-7;
+        // with rollback snapshots (K > 1) one sequence takes the chunked path for all but its last K-1 tokens
+        const bool chunked = head_size == 128 && !kda &&
+            ((K == 1 && n_seq_tokens >= 256) || (K > 1 && n_seqs == 1 && n_seq_tokens - (K - 1) >= 256));
+        return chunked ? 1e-6 : 1e-7;
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
@@ -6333,6 +6336,11 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 
     std::string vars() override {
         return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
+    }
+
+    // HIP RDNA3.5: one sequence of head size 128 with >= 256 tokens before its last K-1 takes the chunked (fp16 WMMA) scan
+    double max_nmse_err() override {
+        return (head_size == 128 && n_seqs == 1 && n_seq_tokens - (K - 1) >= 256) ? 1e-6 : 1e-7;
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
@@ -16401,6 +16409,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256,  1, 3, false, false, 1, -0.5f));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256,  1, 3, false, false, 1, -0.02f));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3, false, false, 1, -0.02f));
+    // rollback snapshots on prefill-sized ubatches (HIP RDNA3.5: chunked scan + per-token tail for the last K-1 tokens)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  128, 257,  1, 1, false, false, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 300,  1, 1, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3, false, false, 4, -0.02f));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4096, 1, 3, false, false, 4, -0.02f));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4,  128, 300,  2, 1, false, false, 4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 256, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  65, 1));
@@ -16468,6 +16483,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    // prefill-sized ubatches with rollback snapshots: chunked scan + per-token tail (HIP RDNA3.5)
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 300, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 2048, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 300, 2, 4));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

@@ -708,6 +708,8 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    bool     ctx_checkpoint_snapshots = true; // take the end-of-prompt checkpoint from rollback snapshots, without a separate pass
+    uint32_t n_rs_seq_ckpt = 0;          // rollback snapshots wanted by the checkpoints (set by the server)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
