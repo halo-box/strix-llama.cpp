@@ -17498,6 +17498,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int q : {1,9}) test_cases.emplace_back(new test_qsa_decode_maskless(q,65536,2051,12,true,16000));
     test_cases.emplace_back(new test_qsa_decode_maskless(3,65536,2051,8,false,16000));
     test_cases.emplace_back(new test_qsa_decode_maskless(9,270336,2051,12,true,66000));
+    // q8_0 K/V (HIP: decode dequantizes in the WMMA kernel only, GQA 12; prefill packs, or reads direct when the
+    // attention is small against the cache: 130 or 200 queries against 32k / 64k keys). Mixed K/V types: prefill only
+    {
+        const ggml_type q8 = GGML_TYPE_Q8_0;
+        for (bool interleaved : {true,false}) {
+            for (int q : {1,9,64,512}) for (int k : {257,2051}) test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,k,12,interleaved,0,q8,q8));
+            test_cases.emplace_back(new test_qsa_prefill_maskless(129,4096,257,12,interleaved,0,q8,q8));
+            test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051,12,interleaved,0,q8,q8));
+            test_cases.emplace_back(new test_qsa_prefill_maskless(640,4096,257,12,interleaved,0,q8,q8));
+        }
+        for (int q : {1,4}) test_cases.emplace_back(new test_qsa_decode_maskless(q,32768,2051,12,true,8000,q8,q8));
+        test_cases.emplace_back(new test_qsa_decode_maskless(9,4096,257,4,true,0,q8,q8));   // GQA 4: not supported for q8_0
+        test_cases.emplace_back(new test_qsa_prefill_maskless(130,32768,2051,12,true,7000,q8,q8));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(200,65536,2051,12,true,15000,q8,q8));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(70,65536,2051,12,false,16000,q8,q8));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051,12,true,0,q8,GGML_TYPE_F16));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(513,4096,2051,12,true,0,GGML_TYPE_F16,q8));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(130,32768,2051,12,true,7000,q8,GGML_TYPE_F16));
+    }
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2560));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2561));
     test_cases.emplace_back(new test_qsa_prefill(513,512,17,true,true));
