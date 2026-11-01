@@ -15297,15 +15297,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_1, tb, 4, 2, true, 512, n, 640));
         }
     }
-    if (env_opt_in("GGML_VK_TEST_REQUIRE_DOWN_STREAM")) {
-        // the Flash-Next down (512 experts, 10 used, ub2048)
-        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_1, GGML_TYPE_F16, 512, 10, true, 2560, 2048, 640));
-    }
-    // the REAP-320 shapes (about 1 min of host quantization and CPU reference each): with the engagement opt-in only
-    if (env_opt_in("GGML_VK_TEST_REQUIRE_MMID_F16OUT")) {
-        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, false,  640, 2048, 2560));
-        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true,  2560, 2048,  640));
-    }
+    // the Flash-Next down (512 experts, 10 used, ub2048); engagement asserted with GGML_VK_TEST_REQUIRE_DOWN_STREAM=1
+    test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_Q5_1, GGML_TYPE_F16, 512, 10, true, 2560, 2048, 640));
+    // the REAP-320 shapes (about 1 min of host quantization and CPU reference each); engagement asserted with
+    // GGML_VK_TEST_REQUIRE_MMID_F16OUT=1
+    test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, false,  640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true,  2560, 2048,  640));
     // REG_A: the aligned medium MUL_MAT_ID tile (about 64 rows per expert) of iq3_xxs / iq4_nl takes the register-direct A
     // loader (GGML_VK_MMID_REGA); m = 320 leaves a partial 128-row tile, b = true broadcasts B
     for (int64_t m : {256, 320}) {
