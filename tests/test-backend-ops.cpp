@@ -7981,7 +7981,10 @@ struct test_mul_mat_ragged : public test_case {
         // the split is gated to the register-prefetch path: GGML_VK_MM_PREFETCH=0 must keep every n on one dispatch
         const char * ep = getenv("GGML_VK_MM_PREFETCH");
         const bool pf_off = ep != nullptr && atoi(ep) == 0;
-        const int64_t eligible = on && !pf_off && n > 256 && n % 256 != 0 && n % 256 <= tail_max ? 1 : 0;
+        // the hc W8A8 route (q8_0, few rows, long K: the hc down) never splits
+        const char * eh = getenv("GGML_VK_HC_W8A8");
+        const bool hc_route = !(eh != nullptr && atoi(eh) == 0) && type_a == GGML_TYPE_Q8_0 && m <= 384 && k >= 4096 && n >= 512 && k % 32 == 0;
+        const int64_t eligible = on && !pf_off && !hc_route && n > 256 && n % 256 != 0 && n % 256 <= tail_max ? 1 : 0;
         const int64_t got = dispatch_census_count(backend, "path:MUL_MAT_RAGGED_SPLIT");
         // a short n_main (few tiles) can take split-k, which keeps the single dispatch even when forced
         if (got > eligible || (force && n >= 512 && got != eligible)) {

@@ -8037,10 +8037,6 @@ static bool ggml_vk_ragged_force() {   // GGML_VK_RAGGED_FORCE=1: split every el
     static const bool v = [] { const char * e = getenv("GGML_VK_RAGGED_FORCE"); return e && atoi(e) != 0; }();
     return v;
 }
-static uint32_t ggml_vk_ragged_hc_tile() {   // GGML_VK_RAGGED_HC_TILE: hc W8A8 tile index of a tail dispatch (default: the main one)
-    static const int v = [] { const char * e = getenv("GGML_VK_RAGGED_HC_TILE"); return e ? atoi(e) : -1; }();
-    return v >= 0 ? (uint32_t) v : ggml_vk_hc_w8a8_tile();
-}
 static double ggml_vk_ragged_tail_w() {   // GGML_VK_RAGGED_TAIL_W: least cost of one wave of tail tiles, in 128x128 waves (default 0.1)
     static const double v = [] { const char * e = getenv("GGML_VK_RAGGED_TAIL_W"); return e ? atof(e) : 0.1; }();
     return v;
@@ -8407,7 +8403,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             vk_matmul_pipeline_key kh{GGML_TYPE_Q8_0, hcd_f16q ? GGML_TYPE_F16 : GGML_TYPE_Q8_1, false, false};
             kh.hcd = true;
             const auto & hv = ctx->device->pipeline_matmul.at(kh);
-            p = hv[std::min<size_t>(tail ? ggml_vk_ragged_hc_tile() : ggml_vk_hc_w8a8_tile(), hv.size() - 1)].unaligned;
+            p = hv[std::min<size_t>(ggml_vk_hc_w8a8_tile(), hv.size() - 1)].unaligned;
         }
 
         // XL tier of the register-prefetch pipelines (aligned, dense, quantized A on the f16-B coopmat path only)
@@ -8443,9 +8439,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // 256 multiple can cost a whole extra wave of big tiles (or the XL gate drops to the L tile). The n % 256 tail columns then
     // run as a second dispatch on the tile the selector picks for them, the n_main columns on the pipeline picked for n_main.
     // The two write disjoint columns of D and read the same B, so there is no barrier between them.
+    // Not on the hc W8A8 route (the few-row long-K hc down): its ragged tail takes split-k, and forced split, split-k and one
+    // dispatch measure the same there (m=320 k=10240, n 2049..2305, gfx1151).
     vk_pipeline pipeline_tail = nullptr;
     uint32_t n_main = (uint32_t) ne11;
-    if (ggml_vk_ragged_split_enabled(ctx->device) && !hcm && ne11 > 256 && ne11 % 256 != 0 && ne11 % 256 <= ggml_vk_ragged_tail_max()) {
+    if (ggml_vk_ragged_split_enabled(ctx->device) && !hcm && !hcd_route && ne11 > 256 && ne11 % 256 != 0 && ne11 % 256 <= ggml_vk_ragged_tail_max()) {
         const uint32_t nm = (uint32_t) (ne11 - ne11 % 256);
         const uint32_t nt = (uint32_t) ne11 - nm;
         const uint32_t batch = (uint32_t) (ne12 * ne13);
@@ -8453,8 +8451,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         vk_pipeline pt = pick_pipeline(nt, true);
         const double c_full  = ggml_vk_ragged_cost(ctx, pipeline, (uint32_t) ne01, (uint32_t) ne11, batch);
         const double c_split = ggml_vk_ragged_cost(ctx, pm, (uint32_t) ne01, nm, batch) + ggml_vk_ragged_cost(ctx, pt, (uint32_t) ne01, nt, batch, true);
-        const bool no_split_k = disable_split_k || d16 ||
-            (ggml_vk_guess_split_k(ctx, ne01, nm, ne10, false, pm) == 1 && ggml_vk_guess_split_k(ctx, ne01, nt, ne10, false, pt) == 1);
+        // only the main part's split-k guess decides: the tail is below the tile width, where split-k may also run (#242), and
+        // a split tail runs without split-k (the ragged split is what takes that shape)
+        const bool no_split_k = disable_split_k || d16 || ggml_vk_guess_split_k(ctx, ne01, nm, ne10, false, pm) == 1;
         if ((c_split < c_full || ggml_vk_ragged_force()) && no_split_k) {
             pipeline = pm;
             pipeline_tail = pt;
