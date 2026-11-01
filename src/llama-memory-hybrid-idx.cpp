@@ -133,9 +133,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     for (int il=0; il<layers; ++il) {
         if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] != 4) { continue; }
         auto * dev = model.dev_layer(il);
-        // validated on ROCm and Vulkan
+        // validated on ROCm, Vulkan and CPU
         const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
-        const bool validated = std::strcmp(reg, "ROCm") == 0 || std::strcmp(reg, "Vulkan") == 0;
+        const bool validated = std::strcmp(reg, "ROCm") == 0 || std::strcmp(reg, "Vulkan") == 0 || std::strcmp(reg, "CPU") == 0;
         if (!validated) { continue; }
         incremental_qsa = true;
         auto * buft = ggml_backend_dev_buffer_type(dev);
