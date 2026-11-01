@@ -398,11 +398,11 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_use_spill_fix(cons
         (DKQ == 128 && ncols2 > 1 && ncols >= 16) || (DKQ == 256 && ncols2 > 1 && ncols >= 32);
 }
 
-// gfx1151/ROCm 10.1 clang 24: a barrier between the KQ, softmax and VKQ phases removes the SGPR spills of D64 8x4 (6) and D128 16x4 (19).
-// Kernel time with it (2026-11-01): D128 16x4 2-6% faster at KV 512-32768, D64 8x4 3-11% faster at KV >= 4096 but 3-10% slower below.
-// The other spilling configs got 1-21% slower with it and keep their spills. Remove when these kernels compile without SGPR spills.
+// gfx1151/ROCm 10.1 clang 24: a barrier between the KQ, softmax and VKQ phases removes the 19 SGPR spills of D128 16x4.
+// Kernel time with it (2026-11-01): D128 16x4 2-6% faster at KV 512-32768. D64 8x4 was 3-10% slower at KV 512-2048 with it.
+// D64 8x4 and the other spilling configs keep their spills. Remove when D128 16x4 compiles without SGPR spills.
 static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_use_phase_barrier(const int DKQ, const int ncols1, const int ncols2, const bool softcap) {
-    return !softcap && ((DKQ == 64 && ncols1 == 8 && ncols2 == 4) || (DKQ == 128 && ncols1 == 16 && ncols2 == 4));
+    return !softcap && DKQ == 128 && ncols1 == 16 && ncols2 == 4;
 }
 
 // gfx1151/ROCm 10.1 clang 24: Q reuse keeps D128 8x8 at 256 VGPRs; D256 8x8 needs 224 without address bounds (2026-10-24).
