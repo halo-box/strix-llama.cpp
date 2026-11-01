@@ -13238,7 +13238,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // REG_A: the aligned medium MUL_MAT_ID tile (about 64 rows per expert) of iq3_xxs / iq4_nl takes the register-direct A
-    // loader (GGML_VK_MMID_REGA); m = 320 leaves a partial 128-row tile, b = true broadcasts B
+    // loader where the fragment layout probe passed; m = 320 leaves a partial 128-row tile, b = true broadcasts B
     for (int64_t m : {256, 320}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 2, false, m, 256, 512));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 2, true,  m, 256, 512));
