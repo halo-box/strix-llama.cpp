@@ -13248,8 +13248,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the Flash-Next REAP-320 expert shapes at small expert counts (the CPU reference stays cheap)
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 4, false, 640, 512, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 16, 4, false, 2560, 512, 640));
-    // register-prefetch coopmat matmuls and their XL 256x256 tier (GGML_VK_MM_PREFETCH / GGML_VK_MM_XL, engaged on the
-    // f16-B coopmat path, i.e. with GGML_VK_DENSE_F16COOPMAT routing the type off int8): shapes that take the XL gate
+    // register-prefetch coopmat matmuls and their XL 256x256 tier (engaged on the f16-B coopmat path, i.e. where the
+    // dense router takes the type off int8): shapes that take the XL gate
     // (m, k >= 1024, XL waves <= half of l's) and a ragged one, for every prefetch type
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q3_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4096, 512, 1024, {1, 1}, {1, 1}));
@@ -14463,7 +14463,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // q8_0 and q6_K at every mat-vec width and through the 9..16 column chunks: the single dispatch at 1..8 columns
-    // (the q8_1 integer-dot path where the backend picks it) against GGML_VK_MMV_SPLIT=1's column chunks
+    // (the q8_1 integer-dot path where the backend picks it), the column chunks at 9..16
     for (ggml_type type_a : { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
         for (int n = 1; n <= 16; ++n) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));

@@ -734,7 +734,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
     }
 
     // Register-prefetch variants of the KHR coopmat matmul (mul_mm_pf_funcs.glsl), f16 and f32 B, selected at init by
-    // GGML_VK_MM_PREFETCH; dense and subgroup MUL_MAT_ID only
+    // ggml_vk_mm_prefetch_enabled; dense and subgroup MUL_MAT_ID only
     if (coopmat && !coopmat2 && !dot2 && matmul_id_type != MatMulIdType::DEFAULT) {
         for (const auto& tname : std::vector<std::string>{"q8_0", "q5_0", "q3_k", "q6_k", "q4_k", "q5_k", "iq4_xs", "iq3_xxs", "iq4_nl"}) {
             const std::string data_a_key = "DATA_A_" + to_uppercase(tname);

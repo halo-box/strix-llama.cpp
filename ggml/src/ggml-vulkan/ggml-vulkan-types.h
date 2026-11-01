@@ -265,7 +265,7 @@ struct vk_matmul_pipeline_key {
     bool f16acc;
     bool d16 = false;   // stores float16_t (the MUL_MAT+CPY(f16) fusion)
     bool glu = false;   // d16 MUL_MAT_ID gate projection storing silu(gate) * up (the MUL_MAT_ID+CPY(f16)+SWIGLU fusion)
-    bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl, GGML_VK_MM_PREFETCH)
+    bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl)
     bool xl = false;    // the 256x256 XL tile tier of the pf variant (aligned only, ggml_vk_mm_xl_ok)
     bool hcmix = false; // the int8 MMQ hc up GEMM with the gated hc pre in its epilogue (HC_UP_MIX, mul_mmq_cm1.comp HC_EPI)
     bool qsa = false;   // the f32 x f32 KHR coopmat GEMM with the QSA scorer epilogue (QSA_SCORE, mul_mm.comp QSA_EPI)
@@ -1361,7 +1361,6 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
-    uint32_t prealloc_y_last_row_pad {};   // GGML_VK_DENSE_YPAD: row pad (elements) of the staged f16 B in prealloc_y, 0 = contiguous
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
