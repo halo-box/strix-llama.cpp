@@ -15941,8 +15941,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
-    // multi-row prefill FA shapes (Vulkan GGML_VK_FA_MR, on by default for head size 256 on RADV RDNA3; =1 also
-    // takes head size 128): 64-row workgroups of H heads x 64/H tokens, ragged last token blocks (nb 77, 130,
+    // multi-row prefill FA shapes (Vulkan, head size 256 on RADV RDNA3; the head size 128 rows run other kernels):
+    // 64-row workgroups of H heads x 64/H tokens, ragged last token blocks (nb 77, 130,
     // 200), GQA 6 / 4 / 2 / 8, no mask, sinks, ALiBi + softcap, dequantized K/V, K/V cache views
     for (auto perm : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024,  77, true,  false, 0,    0,     GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  perm));
@@ -17151,9 +17151,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // PREFILL widths with quantised K/V, which the sparse path now serves through a one-shot
     // dequant into the f16 scratch; quantised should sit within ~1% of f16 at every kv here.
     // nb=1024 is the reporting user's --ubatch-size; the kv list is their four source depths
-    // (17k/33k/67k/134k) in compressed-K rows. GGML_VK_FA_DEQUANT=0 reproduces the old dense
-    // fallback, whose gap GROWS with kv (dense is O(kv), sparse O(n_kv_raw + n_top_k)); f16
-    // under GGML_VK_FA_TOPK=0 is the falsification arm for attributing that gap to the gate.
+    // (17k/33k/67k/134k) in compressed-K rows. The old dense fallback for quantised K/V had a
+    // gap that GROWS with kv (dense is O(kv), sparse O(n_kv_raw + n_top_k)).
     for (ggml_type tk : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         for (int kv : { 5504, 11008, 19200, 35584 }) {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 1024, 2304, 512, false, 1, 0, tk));
