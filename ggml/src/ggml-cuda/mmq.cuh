@@ -228,6 +228,24 @@ struct ggml_cuda_mmq_config {
 
 #undef CASE
 
+// True if some GPU table has the tile (with stream-k if stream_k_only). The tile selection only takes tiles that the
+// table of the current GPU has, so tiles that no table has are not compiled.
+static constexpr __host__ __device__ bool ggml_cuda_mmq_config_exists(ggml_type type, int J, bool fallback, bool stream_k_only) {
+    const ggml_cuda_mmq_config configs[] = {
+        ggml_cuda_mmq_get_config_pascal_older(type, J, fallback), ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback),
+        ggml_cuda_mmq_get_config_ampere(type, J, fallback),       ggml_cuda_mmq_get_config_blackwell(type, J, fallback),
+        ggml_cuda_mmq_get_config_gcn(type, J, fallback),          ggml_cuda_mmq_get_config_cdna(type, J, fallback),
+        ggml_cuda_mmq_get_config_rdna2(type, J, fallback),        ggml_cuda_mmq_get_config_rdna3(type, J, fallback),
+        ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback),      ggml_cuda_mmq_get_config_rdna4(type, J, fallback),
+    };
+    for (const ggml_cuda_mmq_config & config : configs) {
+        if (config.type != GGML_TYPE_COUNT && (config.stream_k || !stream_k_only)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
@@ -1698,7 +1716,7 @@ static_assert(!mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q4_K, 128, 161) &&
               !mmq_rdna3_5_id_use_j48_128e(GGML_TYPE_Q8_0, 128, 161));
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
-static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+static void launch_mul_mat_q_tile(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -1711,8 +1729,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, prec_src1>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, prec_src1>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, prec_src1>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
@@ -1792,11 +1809,24 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         return;
     }
 
-    CUDA_CHECK(cudaGetLastError());
-    mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
-        (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
-         args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-         ntx_fd);
+    if constexpr (ggml_cuda_mmq_config_exists(type, J, fallback, true)) {
+        CUDA_CHECK(cudaGetLastError());
+        mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
+            (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+             args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
+             ntx_fd);
+    } else {
+        GGML_ABORT("fatal error"); // no stream-k table has this tile, so config.stream_k is false
+    }
+}
+
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
+static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+    if constexpr (ggml_cuda_mmq_config_exists(type, J, fallback, false)) {
+        launch_mul_mat_q_tile<type, J, fallback, prec_src1>(ctx, args, stream);
+    } else {
+        GGML_ABORT("fatal error"); // J_best is never a tile that no table has
+    }
 }
 
 static constexpr bool mmq_use_rdna3_5_iq_id_j48(
