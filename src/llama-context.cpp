@@ -2788,6 +2788,16 @@ int llama_context::decode_chain(llama_seq_id seq_id, llama_token * token) {
         chain.set_defer(chain.gpu[chain.slot], false);
         chain.res = nullptr;
         chain.mctx.reset();
+        // whatever this slot submitted is done, and its mark (if it set one) reset, before the slot is left
+        ggml_backend_sched_synchronize(sched.get());
+        if (chain.marked[chain.slot]) {
+            chain.mark_wait(chain.gpu[chain.slot]);
+            chain.marked[chain.slot] = false;
+        }
+        chain.tok[chain.slot] = LLAMA_TOKEN_NULL;
+        // back to the slot of the decode still in flight (or the context's own): decode_chain_end and ordinary decodes
+        // then find the state this call started from
+        chain_swap();
         return ret != 0 ? ret : -3;
     }
 
@@ -5714,4 +5724,8 @@ int32_t llama_decode_chain(llama_context * ctx, llama_seq_id seq_id, llama_token
 
 int32_t llama_decode_chain_end(llama_context * ctx, llama_seq_id seq_id, llama_token * token) {
     return ctx->decode_chain_end(seq_id, token);
+}
+
+int32_t llama_decode_chain_slot(const llama_context * ctx) {
+    return ctx->decode_chain_slot();
 }

@@ -177,3 +177,7 @@ LLAMA_API int32_t llama_decode_chain(struct llama_context * ctx, llama_seq_id se
 // Waits for the last llama_decode_chain and returns the token it sampled (not decoded). Returns 0, or -1 if none is
 // in flight.
 LLAMA_API int32_t llama_decode_chain_end(struct llama_context * ctx, llama_seq_id seq_id, llama_token * token);
+
+// The decode chaining slot whose scheduler the context runs on: 0 (its own) whenever no chained decode is in flight,
+// also after a llama_decode_chain that returned an error. For tests.
+LLAMA_API int32_t llama_decode_chain_slot(const struct llama_context * ctx);

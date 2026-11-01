@@ -159,6 +159,7 @@ struct llama_context {
     // one-token-ahead decode chaining (LLAMA_DECODE_CHAIN=1, see llama_decode_chain in llama-ext.h)
     int decode_chain(llama_seq_id seq_id, llama_token * token);
     int decode_chain_end(llama_seq_id seq_id, llama_token * token);
+    int decode_chain_slot() const { return chain.slot; }
 
     //
     // state save/load
