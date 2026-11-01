@@ -21186,7 +21186,7 @@ static bool ggml_vk_hc_moe_epi_se_enabled() {
 
 static constexpr int HC_MOE_MAX_SLOTS = 32;
 // one workgroup per token: below this many tokens (decode, MTP) the unfused MULTI_ADD + ADD + norm kernels spread the layer over
-// more workgroups and are faster (trunc8 d8192 decode: 15.9 us fused vs ~8.6 us per layer), so the chain stays unfused there
+// more workgroups and are faster (8-layer Qwen3.8-Flash-Next cut, d8192 decode: 15.9 us fused vs ~8.6 us per layer), so the chain stays unfused there
 static constexpr int64_t HC_MOE_MIN_TOKENS = 32;
 
 // the ADD chain at node_idx: n_slots slot views summed in the MULTI_ADD's source order (the first ADD's src[0], src[1], then
