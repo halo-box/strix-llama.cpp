@@ -1067,6 +1067,7 @@ struct vk_device_struct {
     // directly, and the concat node only writes the tail columns its other readers (state copies) use
     vk_pipeline pipeline_ssm_conv_direct_silu_f32;
     vk_pipeline pipeline_ssm_conv_tail_f32;
+    vk_pipeline pipeline_ple_conv_f32, pipeline_ple_conv_f16;   // by weight type
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1439,6 +1440,20 @@ struct ggml_backend_vk_context {
     std::vector<ssm_conv_direct_match> ssm_conv_direct_matches;
     int fused_concat_tail {-1};      // current CONCAT writes only its tail (index into ssm_conv_direct_matches)
     int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
+    // direct PLE conv (qwen4exp): decided at the concat, dispatched at the SiLU; the tap chain in between is elided
+    struct ple_conv_match {
+        const ggml_tensor * concat;
+        const ggml_tensor * state;   // [H, C], contiguous
+        const ggml_tensor * x;       // [C, T], contiguous
+        const ggml_tensor * w;       // [K, C], F32 or F16
+        ggml_tensor * out;           // the SILU node
+        int concat_idx, silu_idx;
+        int64_t tail_from;
+        std::vector<int> elided;     // node indices the direct kernel replaces, sorted
+    };
+    std::vector<ple_conv_match> ple_conv_matches;
+    int fused_ple_concat_tail {-1};
+    int fused_ple_conv {-1};
     // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
     const ggml_tensor * fused_extra_srcs[2] {};
 

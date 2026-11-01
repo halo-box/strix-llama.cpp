@@ -12961,6 +12961,22 @@ struct test_ple_conv : test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (auto * t=ggml_get_first_tensor(ctx);t;t=ggml_get_next_tensor(ctx,t)) if(t->op==GGML_OP_NONE) init_tensor_uniform(t);
     }
+    // GGML_VK_TEST_REQUIRE_PLE_CONV=1: Vulkan ran the direct conv and the tail-only concat, except when the concat or a tap escapes
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_PLE_CONV", "PLE_CONV_SILU")) {
+            return true;
+        }
+        const int64_t want = escape == 0 && tokens >= 8 && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) ? 1 : 0;
+        for (const char * name : { "PLE_CONV_SILU", "PLE_CONCAT_TAIL" }) {
+            const int64_t n = dispatch_census_count(backend, name);
+            if (n != want) {
+                msg = std::string(name) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+                return false;
+            }
+        }
+        return true;
+    }
     ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         const int H=9;
@@ -13154,6 +13170,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ple_conv(type,257,256));
         test_cases.emplace_back(new test_ple_conv(type,10240,512));
     }
+    test_cases.emplace_back(new test_ple_conv(GGML_TYPE_F32,256,8,8));   // tail copies reach into the state columns
+    test_cases.emplace_back(new test_ple_conv(GGML_TYPE_F32,256,5));     // decode-sized: the unfused nodes run
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (int width : {1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129}) {
@@ -17873,6 +17891,7 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("SSM_CONV_SILU",       new test_ssm_conv_bias_silu(GGML_TYPE_F32, { 4, 1024, 1, 1 }, { 4, 1024, 1, 1 }, false), "SSM_CONV_SILU/2=1");
     add("SSM_CONV_BIAS_SILU",  new test_ssm_conv_bias_silu(GGML_TYPE_F32, { 4, 1024, 1, 1 }, { 4, 1024, 1, 1 }, true), "SSM_CONV_BIAS_SILU/3=1");
     add("CONCAT_SSM_CONV_SILU", new test_ssm_conv_direct(130, 9, 1, 4), "CONCAT_SSM_CONV_SILU/2=1;CONCAT_TAIL/1=1");
+    add("PLE_CONV_SILU",       new test_ple_conv(GGML_TYPE_F32, 256, 256, 2), "PLE_CONCAT_TAIL/1=1;PLE_CONV_SILU/1=1");
     add("SNAKE",               new test_snake_fuse(GGML_TYPE_F32, { 128, 16, 1, 1 }), "SNAKE/5=1");
     add("TOPK_QSA",            new test_topk_qsa(512, 2048, 2, 1, 1500), "TOPK_QSA/7=1");
     add("QSA_EXPAND",          new test_qsa_expand(700, 9), "QSA_EXPAND/20=1");
