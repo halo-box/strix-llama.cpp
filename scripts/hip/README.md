@@ -1,10 +1,10 @@
-# HIP VGPR spill gate
+# HIP VGPR and SGPR spill gate
 
-The gfx1151 gate requires zero VGPR-spilling kernels with the pinned ROCm 10.1 / AMD Clang 24 compiler. It reads final `*.lto.s` code-object metadata, checks every emitted kernel and takes the maximum of each resource metric across repeated names. No kernel in the tracked baseline has a spill exception.
+The gfx1151 gate requires zero VGPR-spilling and zero SGPR-spilling kernels with the pinned ROCm 10.1 / AMD Clang 24 compiler. It reads final `*.lto.s` code-object metadata, checks every emitted kernel and takes the maximum of each resource metric across repeated names. No kernel in the tracked baseline has a VGPR spill exception; three flash-attention kernels have bounded SGPR spill budgets (see below).
 
 ## Metric definitions and architecture
 
-`VGPRs` / `.vgpr_count` is the allocated register count per lane. `VGPRs Spill` / `.vgpr_spill_count` counts 32-bit components of static spill-save operations, including repeated stores and reused scratch slots. `ScratchSize [bytes/lane]` / `.private_segment_fixed_size` is a separate byte count. Adding allocated VGPRs to spill saves does not give simultaneous register demand.
+`VGPRs` / `.vgpr_count` is the allocated register count per lane. `VGPRs Spill` / `.vgpr_spill_count` counts 32-bit components of static spill-save operations, including repeated stores and reused scratch slots. `SGPRs Spill` / `.sgpr_spill_count` counts SGPR spill saves; on gfx1151 they go to VGPR lanes while a lane is free, so they need not add private bytes. `ScratchSize [bytes/lane]` / `.private_segment_fixed_size` is a separate byte count. Adding allocated VGPRs to spill saves does not give simultaneous register demand.
 
 gfx1151 can address 256 VGPRs per lane, or 32 KiB per wave32. It has 1,536 physical wave32 VGPRs per SIMD, allocated in groups of 24, shared among resident waves. The physical pool is not a per-wave allowance. Any emitted kernel above 256 allocated VGPRs fails independently of the spill check.
 
@@ -16,13 +16,13 @@ Primary sources for the pinned Clang 24 revision:
 
 ## Zero-spill contract and coverage
 
-`gfx1151-vgpr-baseline.json` records the schema, architecture, exact compiler identity, image digest, source revision, the minimum total unique kernel count and minimum emitted kernel count for each translation unit. The current inventory has 7,214 unique names, 7,822 TU/name copies and 154 nonempty translation units. `minimum_kernel_count` requires at least 7,214 unique names, independently of the per-TU counts. The coverage map requires at least those 7,822 emitted copies in their recorded TUs; an empty inventory or a missing or reduced TU fails. Coverage counts must be positive integers and the baseline coverage map must be nonempty. An empty or absent `kernels` map means that any positive `.vgpr_spill_count` fails, including a single spill save.
+`gfx1151-vgpr-baseline.json` records the schema, architecture, exact compiler identity, image digest, source revision, the minimum total unique kernel count and minimum emitted kernel count for each translation unit. The current inventory has 7,214 unique names, 7,822 TU/name copies and 154 nonempty translation units. `minimum_kernel_count` requires at least 7,214 unique names, independently of the per-TU counts. The coverage map requires at least those 7,822 emitted copies in their recorded TUs; an empty inventory or a missing or reduced TU fails. Coverage counts must be positive integers and the baseline coverage map must be nonempty. An empty or absent `kernels` map means that any positive `.vgpr_spill_count` or `.sgpr_spill_count` fails, including a single spill save.
 
 The compiler identity must match exactly. Every input assembly file must target gfx1151, every kernel metadata record must include all resource fields and wave32, and duplicate TU inventories or malformed metadata fail. The gate checks the exact emitted inventory, including stubs and copies outside runtime-selected paths. It does not filter names by dispatch reachability. Missing input, a parser that matches nothing, and incomplete builds cannot pass using an empty exception map.
 
 Private-segment bytes are no longer governed by an allowlist. Five Q1_0 MMQ bodies retain 16 private bytes per lane with zero VGPR spill saves. This is a known observation, not an exception or a scratch-byte ceiling. A zero-spill result does not require zero private-segment bytes, and it does not establish numerical correctness, occupancy or runtime performance. Kernel changes still require the repository's hardware correctness and performance flow.
 
-The checker retains support for explicit legacy budgets so its existing regression fixtures and historical baselines can still be read. The tracked gfx1151 baseline contains no such budgets or compiler-migration reasons.
+The checker retains support for explicit legacy budgets so its existing regression fixtures and historical baselines can still be read; a budget without `sgpr_spills` allows no SGPR spill. The tracked gfx1151 baseline has no VGPR budget and three SGPR budgets (reason `sgpr_lane_spill`): flash_attn_ext_f16 D64 4x8 and softcap D128 16x2 / 32x2, whose spill-free variants changed the output bytes or used scratch.
 
 ## Regenerate the coverage map
 
@@ -45,6 +45,7 @@ path = Path('scripts/hip/gfx1151-vgpr-baseline.json')
 baseline = json.loads(path.read_text())
 kernels, units = checker.read_assembly(Path(sys.argv[1]), baseline['architecture'])
 assert kernels and units and not any(k['spill_stores'] for k in kernels.values())
+assert all(not k['sgpr_spills'] or name in baseline.get('kernels', {}) for name, k in kernels.items())
 assert all(k['vgprs'] <= 256 for k in kernels.values())
 baseline['translation_units'] = units
 baseline['minimum_kernel_count'] = len(kernels)

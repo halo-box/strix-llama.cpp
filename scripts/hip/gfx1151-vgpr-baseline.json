@@ -160,5 +160,31 @@
     "upscale": 4,
     "wkv": 5
   },
-  "minimum_kernel_count": 7214
+  "minimum_kernel_count": 7214,
+  "reasons": {
+    "sgpr_lane_spill": "ROCm 10.1 / clang 24 spills these flash_attn_ext_f16 SGPRs to VGPR lanes (no scratch). The spill-free variants tried in 2026-11 change the occupancy-derived stream-k split and the output bytes (D64 4x8), or need a rolled softcap loop that puts the KQ tile in scratch (softcap D128 16x2 and 32x2). Remove when a variant is spill-free with unchanged output."
+  },
+  "kernels": {
+    "_ZL18flash_attn_ext_f16ILi128ELi128ELi16ELi2ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+      "vgprs": 210,
+      "spill_stores": 0,
+      "scratch_bytes": 0,
+      "sgpr_spills": 5,
+      "reason": "sgpr_lane_spill"
+    },
+    "_ZL18flash_attn_ext_f16ILi128ELi128ELi32ELi2ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+      "vgprs": 253,
+      "spill_stores": 0,
+      "scratch_bytes": 0,
+      "sgpr_spills": 5,
+      "reason": "sgpr_lane_spill"
+    },
+    "_ZL18flash_attn_ext_f16ILi64ELi64ELi4ELi8ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+      "vgprs": 247,
+      "spill_stores": 0,
+      "scratch_bytes": 0,
+      "sgpr_spills": 6,
+      "reason": "sgpr_lane_spill"
+    }
+  }
 }
