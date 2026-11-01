@@ -487,7 +487,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->add_input(std::move(inp));
 
     // gfx1151 HIP, 2026-10-22: cache-only matched upstream logits and state at b/ub4096 with one sequence.
-    // Metadata growth is covered on CPU. Widen the configured batch/sequence limits only after the same 60127-token HIP logits/state comparison passes.
+    // Metadata growth is covered on ROCm (test-qwen4exp-mtp-cache-only). Widen the configured batch/sequence limits only after the same 60127-token HIP logits/state comparison passes.
     const bool cache_only = cparams.n_seq_max == 1 && cparams.n_ubatch >= 4096 && cparams.n_ubatch >= cparams.n_batch && n_outputs == 0 && !cparams.embeddings &&
             (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) &&
             cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && cparams.nextn_layer_offset == 0;

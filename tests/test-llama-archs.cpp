@@ -95,7 +95,7 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
-    LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on CPU (requires LLAMA_QSA_INCREMENTAL=1)\n");
+    LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on the first ROCm device (skipped without one)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -494,6 +494,19 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 }
 
 static int test_mtp_cache_only(const size_t seed, const float stdev) {
+    // the incremental QSA cache runs only on ROCm and Vulkan; cache-only was validated on ROCm
+    ggml_backend_dev_t devices[] = { nullptr, nullptr };
+    for (size_t i = 0; i < ggml_backend_dev_count() && devices[0] == nullptr; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0) {
+            devices[0] = dev;
+        }
+    }
+    if (devices[0] == nullptr) {
+        LOG("SKIP: Qwen4Exp MTP cache-only test needs a ROCm device\n");
+        return 0;
+    }
+
     gguf_context_ptr meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
     const uint32_t sections[] = { 8, 8, 0, 0 };
     gguf_set_val_u32(meta.get(), "qwen4exp.nextn_predict_layers", 1);
@@ -510,10 +523,8 @@ static int test_mtp_cache_only(const size_t seed, const float stdev) {
     gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.top_k", 8);
     gguf_set_arr_data(meta.get(), "qwen4exp.ple.layers", GGUF_TYPE_UINT32, nullptr, 0);
 
-    ggml_backend_dev_t devices[] = { nullptr };
     llama_model_params mp = llama_model_default_params();
     mp.devices = devices;
-    mp.n_gpu_layers = 0;
     mp.use_extra_bufts = false;
     mp.load_mtp = true;
     tensor_data_params data = { seed, stdev };
