@@ -239,6 +239,10 @@ struct llama_layer_nextn {
     struct ggml_tensor * hc_head_norm          = nullptr;
     struct ggml_tensor * hc_head_down          = nullptr;
     struct ggml_tensor * hc_head_up            = nullptr;
+
+    // qwen4exp EXL3: eh_proj as its two parts, e_proj(e) + h_proj(h)
+    struct ggml_tensor * e_proj                = nullptr;
+    struct ggml_tensor * h_proj                = nullptr;
 };
 
 struct llama_layer_switch_lora {
@@ -690,6 +694,23 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 
+// EXL3 linears (see ggml/exl3/README.md): the trellis tensor stands for the weight, its scales are found here
+struct llama_exl3_linear {
+    ggml_tensor * suh;
+    ggml_tensor * svh;
+};
+
+// EXL3 row-ring table (quantized token embedding): the trellis tensor stands for the table
+struct llama_exl3_rows {
+    ggml_tensor * signs;
+    int64_t       n_out; // decoded row width
+};
+
+struct llama_exl3 {
+    std::unordered_map<const ggml_tensor *, llama_exl3_linear> linears; // trellis -> scales
+    std::unordered_map<const ggml_tensor *, llama_exl3_rows>   rows;    // row table -> signs
+};
+
 // MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep
 // plus control and user-defined tokens. Immutable once built. Contexts that request the same n_keep share one.
 struct llama_mtp_draft_vocab {
@@ -715,6 +736,8 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
+
+    llama_exl3 exl3;
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;
@@ -970,6 +993,10 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: read the exl3.* metadata, and pair each EXL3 trellis with its scales after create_tensor made them
+    void load_hparams_exl3(llama_model_loader & ml);
+    void load_tensors_exl3();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
