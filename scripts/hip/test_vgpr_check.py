@@ -17,6 +17,7 @@ amdhsa.kernels:
   - .args: []
     .name: _Z6kernelv
     .private_segment_fixed_size: 3392
+    .sgpr_spill_count: 3
     .vgpr_count: 256
     .vgpr_spill_count: 1036
     .wavefront_size: 32
@@ -44,7 +45,7 @@ class TestVgprCheck(unittest.TestCase):
         return checker.find_regressions(self.kernels, self.units, self.baseline, 'fixture compiler')
 
     def test_assembly_units_and_unchanged_baseline(self):
-        self.assertEqual(self.kernels['_Z6kernelv'], {'vgprs': 256, 'spill_stores': 1036, 'scratch_bytes': 3392})
+        self.assertEqual(self.kernels['_Z6kernelv'], {'vgprs': 256, 'spill_stores': 1036, 'scratch_bytes': 3392, 'sgpr_spills': 3})
         self.assertEqual(self.check(), [])
 
     def test_each_increased_budget_fails(self):
@@ -55,7 +56,7 @@ class TestVgprCheck(unittest.TestCase):
                 self.kernels['_Z6kernelv'][field] -= 1
 
     def test_improvements_pass(self):
-        self.kernels['_Z6kernelv'] = {'vgprs': 192, 'spill_stores': 0, 'scratch_bytes': 0}
+        self.kernels['_Z6kernelv'] = {'vgprs': 192, 'spill_stores': 0, 'scratch_bytes': 0, 'sgpr_spills': 0}
         self.assertEqual(self.check(), [])
 
     def test_metrics_cannot_offset_each_other(self):
@@ -64,11 +65,11 @@ class TestVgprCheck(unittest.TestCase):
         self.assertTrue(any('spill_stores' in e for e in self.check()))
 
     def test_new_small_spill_fails(self):
-        self.kernels['_Z3newv'] = {'vgprs': 32, 'spill_stores': 1, 'scratch_bytes': 4}
+        self.kernels['_Z3newv'] = {'vgprs': 32, 'spill_stores': 1, 'scratch_bytes': 4, 'sgpr_spills': 0}
         self.assertTrue(any('new spill' in e for e in self.check()))
 
     def test_new_nonspilling_kernel_passes(self):
-        self.kernels['_Z3newv'] = {'vgprs': 256, 'spill_stores': 0, 'scratch_bytes': 0}
+        self.kernels['_Z3newv'] = {'vgprs': 256, 'spill_stores': 0, 'scratch_bytes': 0, 'sgpr_spills': 0}
         self.assertEqual(self.check(), [])
 
     def test_empty_or_reduced_coverage_fails(self):
@@ -87,7 +88,7 @@ class TestVgprCheck(unittest.TestCase):
             self.check()
 
     def test_incomplete_or_wrong_architecture_metadata_fails(self):
-        for text in [ASSEMBLY.replace('gfx1151', 'gfx908'), ASSEMBLY.replace('    .vgpr_spill_count: 1036\n', ''), ASSEMBLY.replace('.end_amdgpu_metadata', ''), ASSEMBLY.replace('.wavefront_size: 32', '.wavefront_size: 64')]:
+        for text in [ASSEMBLY.replace('gfx1151', 'gfx908'), ASSEMBLY.replace('    .vgpr_spill_count: 1036\n', ''), ASSEMBLY.replace('    .sgpr_spill_count: 3\n', ''), ASSEMBLY.replace('.end_amdgpu_metadata', ''), ASSEMBLY.replace('.wavefront_size: 32', '.wavefront_size: 64')]:
             with self.subTest(text=text):
                 with self.assertRaises(ValueError):
                     checker.parse_assembly(text, 'gfx1151')
@@ -111,6 +112,24 @@ class TestVgprCheck(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     checker.find_regressions(self.kernels, self.units, baseline, 'fixture compiler')
 
+    def test_new_sgpr_spill_fails(self):
+        self.kernels['_Z3newv'] = {'vgprs': 32, 'spill_stores': 0, 'scratch_bytes': 0, 'sgpr_spills': 1}
+        self.assertTrue(any('new SGPR spill (1 SGPR spill saves)' in e for e in self.check()))
+
+    def test_legacy_budget_allows_no_sgpr_spill(self):
+        del self.budgets['_Z6kernelv']['sgpr_spills']
+        self.assertTrue(any('sgpr_spills 3 > baseline 0' in e for e in self.check()))
+
+    def test_sgpr_only_budget(self):
+        self.kernels['_Z6kernelv'].update(spill_stores=0, scratch_bytes=0)
+        self.budgets['_Z6kernelv'].update(spill_stores=0, scratch_bytes=0)
+        self.assertEqual(self.check(), [])
+        self.kernels['_Z6kernelv']['sgpr_spills'] += 1
+        self.assertTrue(any('sgpr_spills 4 > baseline 3' in e for e in self.check()))
+        self.budgets['_Z6kernelv']['sgpr_spills'] = 0
+        with self.assertRaisesRegex(ValueError, 'invalid baseline spill exception'):
+            self.check()
+
     def test_empty_budgets_single_spill_fails(self):
         self.baseline['kernels'] = {}
         del self.baseline['reasons']
@@ -120,7 +139,7 @@ class TestVgprCheck(unittest.TestCase):
     def test_empty_or_absent_budgets_zero_spills_pass(self):
         self.baseline['kernels'] = {}
         del self.baseline['reasons']
-        self.kernels['_Z6kernelv']['spill_stores'] = 0
+        self.kernels['_Z6kernelv'].update(spill_stores=0, sgpr_spills=0)
         self.assertEqual(self.check(), [])
         del self.baseline['kernels']
         self.assertEqual(self.check(), [])
