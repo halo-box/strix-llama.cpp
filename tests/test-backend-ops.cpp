@@ -15107,8 +15107,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 2560, 640, 32, 10, nt));
         }
     }
-    // two full Flash-Next ubatches (512 experts, its measured routing histogram), q4_K and q5_K; the other full-shape runs are in
-    // the GGML_PERF_MOE perf set
+    // two full Flash-Next ubatches (512 experts, its measured routing histogram), q4_K and q5_K
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_mul_mat_pair());
@@ -16622,19 +16621,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
-
-    if (getenv("GGML_PERF_MOE")) {
-        test_cases.emplace_back(new test_moe_prefill(true, 4096));
-        test_cases.emplace_back(new test_moe_prefill(false, 4096));
-        // the Flash-Next routed gate/up + SwiGLU at ub2048 / ub4096: measured routing and uniform routing
-        for (int64_t nt : { 2048, 4096 }) {
-            for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
-                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, true));
-                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, false));
-            }
-        }
-        return test_cases;
-    }
 
     // qwen4exp complete-block selection (TOP_K + the chain QSA_EXPAND fuses) at the Flash-Next d32k shape: one 512-row
     // strip and decode rows. Perf mode repeats only the final CONCAT, so read the chain's time with GGML_VK_PERF_LOGGER
