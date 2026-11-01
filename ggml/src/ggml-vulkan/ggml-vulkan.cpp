@@ -1931,6 +1931,12 @@ static int ggml_vk_dense_dq8_mode() {
     return mode;
 }
 
+// GGML_VK_HC_DQ8: the HC_UP_MIX fusion (hc up GEMM + gated hc pre) on mul_mm_dq8.comp with an f16 B instead of int8 MMQ (default 1, =0 keeps int8 MMQ)
+static bool ggml_vk_hc_dq8_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_DQ8"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
 // mode 1: tile 4 for a few-row long-k GEMM (m <= 384, k >= 4096: the qwen4exp hc down), else tile 0
 // (GGML_VK_DENSE_DQ8_FEWROW=0 keeps those on their old route)
 static bool ggml_vk_dense_dq8_fewrow(uint32_t m, uint32_t k) {
@@ -3046,6 +3052,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[1][c], "matmul_dq8_q8_0_f16_d16_" + std::to_string(c),
                                                  matmul_dq8_q8_0_f16_d16_cm1_len, matmul_dq8_q8_0_f16_d16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
                                                  { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                        if (c == 0) {   // HC_UP_MIX epilogue variants on tile 0 (f32 / f16 mixed stream)
+                            ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_hcmix[0], "matmul_dq8_q8_0_f16_hcmix",
+                                                     matmul_dq8_q8_0_f16_hcmix_cm1_len, matmul_dq8_q8_0_f16_hcmix_cm1_data, "main", 4,
+                                                     sizeof(vk_mat_mat_hcmix_push_constants), { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                            ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_hcmix[1], "matmul_dq8_q8_0_f16_hcmix_d16",
+                                                     matmul_dq8_q8_0_f16_hcmix_d16_cm1_len, matmul_dq8_q8_0_f16_hcmix_d16_cm1_data, "main", 4,
+                                                     sizeof(vk_mat_mat_hcmix_push_constants), { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                        }
                     }
                 }
             }
@@ -7965,13 +7979,24 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             ggml_vk_path_census_add("MUL_MAT_F16B_NATIVE");
         }
     }
+    // HC_UP_MIX on the dense q8_0 x f16 GEMM (GGML_VK_HC_DQ8): B (the low-rank activations, k = 320) is converted to f16 when it is
+    // f32 (n x k, small) or read in place when it is an aligned f16, instead of quantized to q8_1
+    const uint64_t src1_off = vk_tensor_offset(src1) + src1->view_offs;
+    const bool hc_dq8 = hcm && ggml_vk_hc_dq8_enabled() && src0->type == GGML_TYPE_Q8_0 &&
+                        ne10 % 64 == 0 && ne01 >= 128 && ne12 * ne13 == 1 && ne02 * ne03 == 1 && ggml_vk_dim01_contiguous(src0) &&
+                        (src1->type == GGML_TYPE_F32 ||
+                         (src1->type == GGML_TYPE_F16 && (ggml_is_contiguous(src1) || y_rowstride) && src1->nb[1] % 16 == 0 && src1_off % 16 == 0)) &&
+                        ctx->device->pipeline_matmul_dq8_hcmix[od->type == GGML_TYPE_F16 ? 1 : 0] != nullptr;
+    if (hc_dq8) {
+        can_quantize_y = false;
+    }
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
     const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
                                         (ggml_prec)dst->op_params[0], false, can_quantize_y, prefer_f16_b);
     // an f16 output and the HC_UP_MIX epilogue exist only on the int8 MMQ path; every fallback below would write f32 into the f16 buffer
-    GGML_ASSERT(!(d16 || hcm) || y_kernel_type == GGML_TYPE_Q8_1);
+    GGML_ASSERT(!(d16 || hcm) || y_kernel_type == GGML_TYPE_Q8_1 || (hc_dq8 && y_kernel_type == GGML_TYPE_F16));
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
@@ -7979,7 +8004,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], false,
-                                             d16 || (hcm && od->type == GGML_TYPE_F16), false, hcm);
+                                             d16 || (hcm && !hc_dq8 && od->type == GGML_TYPE_F16), false, hcm && !hc_dq8);
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
     const bool qy_needs_dequant = y_needs_reformat;
@@ -8020,6 +8045,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         }
     }
 
+    if (hc_dq8) {
+        GGML_ASSERT(!qx_needs_dequant);
+        pipeline = ctx->device->pipeline_matmul_dq8_hcmix[od->type == GGML_TYPE_F16 ? 1 : 0];
+        ggml_vk_path_census_add("MUL_MAT_HC_DQ8");
+    }
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp): 2-D, f16 B, K % 64 == 0; B's column stride is checked where it is known
     vk_pipeline pipeline_pre_dq8 = nullptr;
     if (ggml_vk_dense_dq8_mode() != 0 && src0->type == GGML_TYPE_Q8_0 && y_kernel_type == GGML_TYPE_F16 && !quantize_y &&
@@ -8264,6 +8294,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (hcm) {
         // HC_UP_MIX: one 2-D GEMM (the matcher admits no batch / broadcast), split-k off, the mixed stream is the only output
         GGML_ASSERT(split_k == 1 && ne12 * ne13 == 1);
+        GGML_ASSERT(!hc_dq8 || stride_b % 8 == 0);   // 16-byte B loads
         ggml_vk_matmul_hcmix(ctx, subctx, pipeline, { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range }, *hcmix,
                              ne01, ne11, ne10, ne10, stride_b, stride_batch_x, stride_batch_y, padded_n);
     } else {

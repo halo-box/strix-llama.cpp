@@ -56,7 +56,23 @@ layout(push_constant) uniform parameter {
     uint broadcast2;
     uint broadcast3;
     uint padded_N;
+#ifdef HC_EPI
+    uint hc_n_embd;     // n_embd; M = 4 * n_embd
+    uint hc_x_offset;   // element offset of x (f16 [n_embd, 4, N]) in binding 3
+    uint hc_x_s1;       // x element stride between streams
+    uint hc_x_s2;       // x element stride between tokens
+    uint hc_d_offset;   // element offset of the mixed output in binding 2
+    uint hc_d_s1;       // mixed element stride between tokens
+    float hc_scale;
+    uint hc_zero;       // always 0, opaque to the compiler: keeps the gate's f16 rounding
+    uint hc_round;      // 1: the unfused gate is f16, round it; 0: the f32 gate = the accumulator
+#endif
 } p;
+#ifdef HC_EPI
+// HC_UP_MIX: the qwen4exp hc up GEMM with the gated hc pre in its epilogue (as mul_mmq_cm1.comp HC_EPI). A tile covers BM / 4 channels
+// x 4 streams (stream-major per wave, see a_row_dw); D (binding 2) is the mixed stream [n_embd, N]. Tile 0 only (WM = 64).
+layout(binding = 3) readonly buffer X { float16_t data_x[]; };
+#endif
 
 // BK 64: a thread dequantises one whole q8_0 block per step (9 dwords). BK 32: one half block (16 qs) per step, the block parity is
 // the same for every lane of a step. LDS rows are BK + 8 halves.
@@ -95,7 +111,14 @@ void main() {
     [[unroll]] for (uint i = 0; i < A_IT; i++) {
         const uint idx = tid + i * BLOCK_SIZE;
         const uint row = idx % BM, sub = idx / BM;
+#ifdef HC_EPI
+        // stream-major tile rows: wave row block wm covers 16 channels; its 16-row fragment f is stream f of those channels, so the
+        // 4 stream gates of one (channel, token) sit in the same lane and element of the wave's 4 accumulators (WM = 64)
+        const uint ch = m0 / 4 + (row / WM) * 16 + row % 16;
+        a_row_dw[i] = (ch < p.hc_n_embd ? (((row % WM) / 16) * p.hc_n_embd + ch) : 0u) * row_dw;
+#else
         a_row_dw[i] = min(m0 + row, p.M - 1) * row_dw;
+#endif
         a_sub[i] = sub;
         a_dst[i] = row * LS4 + sub * (BK == 64 ? 4 : 2);
     }
@@ -191,6 +214,37 @@ void main() {
     COMPUTE()
     barrier();   // the partial-tile epilogue below reuses As
 
+#ifdef HC_EPI
+    // RDNA3 / 3.5 wave32 f32 accumulator (the host creates this variant only there): lane l holds column l % 16 and rows 2 e + l / 16 of
+    // a 16 x 16 fragment. acc[j * TMF + c] is stream c, so element e of the 4 accumulators is one channel x token: mix in registers.
+    // Same expression and order as mul_mmq_cm1.comp's HC_EPI (= dsv4_hc_pre.comp).
+    {
+        const uint lane = gl_SubgroupInvocationID;
+        [[unroll]] for (uint j = 0; j < TNF; j++) {
+            const uint col_g = n0 + wn * WN + j * 16 + (lane & 15u);
+            [[unroll]] for (uint e = 0; e < 8; e++) {
+                const uint i0 = m0 / 4 + wm * 16 + 2 * e + (lane >> 4);
+                if (col_g < p.N && i0 < p.hc_n_embd) {
+                    const uint xb = p.hc_x_offset + i0 + col_g * p.hc_x_s2;
+                    float result = 0.0f;
+                    [[unroll]] for (uint ih = 0; ih < 4; ++ih) {
+                        const float a = acc[j * TMF + ih][e];
+                        const uint gbits = packFloat2x16(f16vec2(float16_t(a), float16_t(0.0))) ^ p.hc_zero;
+                        const float g = p.hc_round != 0u ? float(unpackFloat2x16(gbits).x) : a;
+                        const float wv = 1.0f / (1.0f + exp(-g));
+                        result = fma(float(data_x[xb + ih * p.hc_x_s1]), wv, result);
+                    }
+#ifdef D_F16
+                    data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = float16_t(uintBitsToFloat(floatBitsToUint(p.hc_scale * result) ^ p.hc_zero));
+#else
+                    data_d[p.hc_d_offset + i0 + col_g * p.hc_d_s1] = p.hc_scale * result;
+#endif
+                }
+            }
+        }
+        return;
+    }
+#endif
     // epilogue: D[n * stride_d + m]
     const bool full = m0 + BM <= p.M && n0 + BN <= p.N;
     if (full) {
