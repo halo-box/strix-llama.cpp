@@ -1555,17 +1555,34 @@ static int gdn_chunk_min_tokens() {
     return v;
 }
 
+// rollback snapshots (K > 1 slots, speculative decoding) on a prefill-sized ubatch of one sequence: the chunked path takes the
+// first n_tokens - (K-1) tokens (its final state to slot K-1) and then each of the last K-1 tokens alone (state to slots K-2..0),
+// so every slot holds the state after its token, as with the per-token scan. GGML_CUDA_DISABLE_GDN_RS_SPLIT=1 turns it off.
+static bool gdn_rs_split_ok(const int K, const int64_t n_tokens, const int64_t n_seqs) {
+    static const bool off = getenv("GGML_CUDA_DISABLE_GDN_RS_SPLIT") != nullptr;
+    return K <= 1 || (!off && n_seqs == 1 && n_tokens > K && n_tokens - (K - 1) >= gdn_chunk_min_tokens());
+}
+
+// the conv history of token t0 (> 2) as the chunked kernels read it: hist[c*3 + j] = x[(t0 - 3 + j)*C + c]
+static __global__ void gdn_conv_hist_kernel(const float * __restrict__ x, const int64_t t0, const int64_t C, float * __restrict__ hist) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 3 * C) {
+        const int64_t c = i / 3, j = i % 3;
+        hist[i] = x[(t0 - 3 + j) * C + c];
+    }
+}
+
 // the dispatch condition of the chunked prefill path (single source of truth for the op and the q/k-norm fusion)
-static bool gdn_chunk_eligible_raw(const int cc, const bool kda, const bool keep_rs, const int64_t S_v, const int64_t H,
+static bool gdn_chunk_eligible_raw(const int cc, const bool kda, const int K, const int64_t S_v, const int64_t H,
         const int64_t Hk, const int64_t n_tokens, const int64_t n_seqs, const int64_t sq1, const int64_t sq2,
         const void * q_d, const void * k_d) {
 #if defined(GGML_USE_HIP)
     const bool aligned = sq1 % 4 == 0 && sq2 % 4 == 0 && ((uintptr_t) q_d) % 16 == 0 && ((uintptr_t) k_d) % 16 == 0;
     // n_seqs > 1: the chunk kernels run once per sequence on its slices (each exactly a one-sequence prefill)
-    return !kda && !keep_rs && GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && n_seqs >= 1 && n_tokens >= gdn_chunk_min_tokens() &&
-        aligned && Hk > 0 && H % Hk == 0 && H / Hk <= 4 && gdn_chunk_enabled();
+    return !kda && gdn_rs_split_ok(K, n_tokens, n_seqs) && GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && n_seqs >= 1 &&
+        n_tokens >= gdn_chunk_min_tokens() && aligned && Hk > 0 && H % Hk == 0 && H / Hk <= 4 && gdn_chunk_enabled();
 #else
-    GGML_UNUSED(cc); GGML_UNUSED(kda); GGML_UNUSED(keep_rs); GGML_UNUSED(S_v); GGML_UNUSED(H); GGML_UNUSED(Hk);
+    GGML_UNUSED(cc); GGML_UNUSED(kda); GGML_UNUSED(K); GGML_UNUSED(S_v); GGML_UNUSED(H); GGML_UNUSED(Hk);
     GGML_UNUSED(n_tokens); GGML_UNUSED(n_seqs); GGML_UNUSED(sq1); GGML_UNUSED(sq2); GGML_UNUSED(q_d); GGML_UNUSED(k_d);
     return false;
 #endif
@@ -1579,11 +1596,11 @@ bool ggml_cuda_gdn_chunk_eligible(const ggml_tensor * gdn, const ggml_tensor * q
     }
     const int  cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool kda     = gdn->src[3]->ne[0] == v->ne[0];
-    const bool keep_rs = ggml_get_op_params_i32(gdn, 0) > 1;
+    const int  K       = ggml_get_op_params_i32(gdn, 0);
     if (q->ne[3] != v->ne[3] || q->ne[2] != v->ne[2]) {
         return false;
     }
-    return gdn_chunk_eligible_raw(cc, kda, keep_rs, v->ne[0], v->ne[1], q->ne[1], v->ne[2], v->ne[3],
+    return gdn_chunk_eligible_raw(cc, kda, K, v->ne[0], v->ne[1], q->ne[1], v->ne[2], v->ne[3],
         (int64_t) (q->nb[1] / sizeof(float)), (int64_t) (q->nb[2] / sizeof(float)), q->data, k->data);
 }
 
@@ -1637,12 +1654,12 @@ bool ggml_cuda_gdn_z16_ok(const ggml_tensor * gdn) {
     const ggml_tensor * v = gdn->src[2];
     const int  cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool kda     = gdn->src[3]->ne[0] == v->ne[0];
-    const bool keep_rs = ggml_get_op_params_i32(gdn, 0) > 1;
+    const int  K       = ggml_get_op_params_i32(gdn, 0);
     // the graph-time half of gdn_chunk_eligible_raw: a z marked BF16-only must reach the chunked path, which aborts
     // otherwise (only the q/k pointer alignment is left to run time)
     const ggml_tensor * q = gdn->src[0];
     const int64_t H = v->ne[1], Hk = q->ne[1];
-    return GGML_CUDA_CC_IS_RDNA3_5(cc) && !kda && !keep_rs && v->ne[0] == 128 && v->ne[2] >= gdn_chunk_min_tokens() &&
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) && !kda && gdn_rs_split_ok(K, v->ne[2], v->ne[3]) && v->ne[0] == 128 && v->ne[2] >= gdn_chunk_min_tokens() &&
         v->ne[1] * 128 % 8 == 0 && Hk > 0 && H % Hk == 0 && H / Hk <= 4 && q->ne[3] == v->ne[3];
 #else
     GGML_UNUSED(gdn);
@@ -1906,7 +1923,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
         const int cc  = ggml_cuda_info().devices[dev].cc;
         const float qk_eps = qk_ovr.q ? qk_ovr.eps : -1.0f;
         const float qk_mul = qk_ovr.q ? qk_ovr.mul : 1.0f;
-        const bool eligible = neq3 == n_seqs && gdn_chunk_eligible_raw(cc, kda, keep_rs, S_v, H, neqk1, n_tokens, n_seqs, sq1, sq2, q_d, k_d);
+        const bool eligible = neq3 == n_seqs && gdn_chunk_eligible_raw(cc, kda, K, S_v, H, neqk1, n_tokens, n_seqs, sq1, sq2, q_d, k_d);
+        // rollback snapshots on a prefill-sized ubatch (gdn_rs_split_ok): the chunked path over the first n_main tokens, then
+        // each of the last K-1 tokens alone, every run with the same fused conv / norms
+        const bool    rs_split = eligible && keep_rs;
+        const int64_t n_main   = rs_split ? n_tokens - (K - 1) : n_tokens;
         if ((qk_ovr.q || on_ovr.z || cv_ovr.x) && !eligible) {
             GGML_ABORT("gated_delta_net: conv / q/k / output norms were fused for %s but the chunked path is not taken", dst->name);
         }
@@ -1928,31 +1949,30 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 out_stage.alloc((size_t) n_seqs * n_tokens * H * 128);
                 out_base = out_stage.get();
             }
-            auto run = [&](auto CLc, const int64_t is) {
-                // sequence `is`: its q/k/v (or conv input and history), g/beta, state in/out, output rows and z / norm output
-                const size_t ro = (size_t) is * n_tokens * H * 128;   // output rows, z and the norm output of the sequence
+            // tokens [t0, t0 + nt) of sequence `is`, from state s0 to state so; hist: the conv history of token t0 when t0 > 0
+            auto run = [&](auto CLc, const int64_t is, const int64_t t0, const int64_t nt, const float * s0, float * so, const float * hist) {
+                // q/k/v (or conv input and history), g/beta, output rows and z / norm output of these tokens
+                const size_t ro = ((size_t) is * n_tokens + t0) * H * 128;
                 gdnc_in in = in0;
-                in.q += is * sq3; in.k += is * sq3; in.v += is * sv3;
-                const float * cx  = cv_ovr.x  ? cv_ovr.x  + (size_t) is * n_tokens * cv_ovr.C : nullptr;
-                const float * cst = cv_ovr.st ? cv_ovr.st + (size_t) is * 3 * cv_ovr.C : nullptr;
+                in.q += is * sq3 + t0 * sq2; in.k += is * sq3 + t0 * sq2; in.v += is * sv3 + t0 * sv2;
+                const float * cx  = cv_ovr.x  ? cv_ovr.x  + ((size_t) is * n_tokens + t0) * cv_ovr.C : nullptr;
+                const float * cst = cv_ovr.st ? (t0 > 0 ? hist : cv_ovr.st + (size_t) is * 3 * cv_ovr.C) : nullptr;
                 in.x = cx; in.st = cst;
-                const float * gs = g_d + is * sb3, * bs = b_d + is * sb3;
-                const float * s0 = s_d + (size_t) is * S_v * S_v * H;
-                float * so = state_d + (size_t) is * S_v * S_v * H;
+                const float * gs = g_d + is * sb3 + t0 * sb2, * bs = b_d + is * sb3 + t0 * sb2;
                 float * dsts = dst_d + ro;
                 const float * zs = on_ovr.z ? (const float *) ((const char *) on_ovr.z + ro * (on_ovr.z_bf16 ? 2 : 4)) : nullptr;
                 uint16_t * o16s = on_ovr.out16 ? on_ovr.out16 + ro : nullptr;
                 float * o32s = out_base ? out_base + ro : nullptr;
                 constexpr int CL = decltype(CLc)::value;
-                const int nch = (int) ((n_tokens + CL - 1) / CL);
+                const int nch = (int) ((nt + CL - 1) / CL);
                 if (use_v2) {
                     ggml_cuda_pool_alloc<_Float16> Tb(ctx.pool(), (size_t) H * nch * CL * CL);
                     ggml_cuda_pool_alloc<_Float16> Pb(ctx.pool(), (size_t) H * nch * CL * CL);
                     ggml_cuda_pool_alloc<float2>   Gb(ctx.pool(), (size_t) H * nch * CL);
-                    ggml_cuda_pool_alloc<_Float16> Qh(ctx.pool(), (size_t) neqk1 * n_tokens * 128);
-                    ggml_cuda_pool_alloc<_Float16> Kh(ctx.pool(), (size_t) neqk1 * n_tokens * 128);
+                    ggml_cuda_pool_alloc<_Float16> Qh(ctx.pool(), (size_t) neqk1 * nt * 128);
+                    ggml_cuda_pool_alloc<_Float16> Kh(ctx.pool(), (size_t) neqk1 * nt * 128);
                     gdn_prep2_kernel<CL, float><<<dim3(neqk1, nch), 256, 0, stream>>>(in, cx, gs, bs,
-                        Tb.get(), Pb.get(), Gb.get(), Qh.get(), Kh.get(), (int) H, (int) neqk1, (int) n_tokens, nch,
+                        Tb.get(), Pb.get(), Gb.get(), Qh.get(), Kh.get(), (int) H, (int) neqk1, (int) nt, nch,
                         sb1, sb2, scale, qk_eps, qk_mul);
                     ggml_cuda_ovl_join(ctx);   // z (read by the output-norm epilogue) ran on the side stream
                     // MMB_DENSE_F16: the F16 out16 copy is a template flag (no runtime select in the epilogue)
@@ -1960,7 +1980,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                                    : (on_ovr.out16_f16 ? gdn_scan2_kernel<CL, 0, float, 0, 3, true, true> : gdn_scan2_kernel<CL, 0, float, 0, 3, true, false>))
                         <<<dim3(H), 256, 0, stream>>>(nullptr, nullptr, Qh.get(), Kh.get(),
                         cx, cst, cv_ovr.cw, (int) cv_ovr.C, (int) cv_ovr.vc, s0, so,
-                        Tb.get(), Pb.get(), Gb.get(), (int) H, (int) neqk1, (int) n_tokens, nch, scale,
+                        Tb.get(), Pb.get(), Gb.get(), (int) H, (int) neqk1, (int) nt, nch, scale,
                         on_ovr.w, zs, o16s, on_ovr.eps, 128, (int) cv_ovr.vc, (int) (H * 128), 128);
                     CUDA_CHECK(cudaGetLastError());
                     return;
@@ -1968,26 +1988,46 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 ggml_cuda_pool_alloc<_Float16> Tb(ctx.pool(), (size_t) H * nch * CL * CL);
                 ggml_cuda_pool_alloc<_Float16> Pb(ctx.pool(), (size_t) H * nch * CL * CL);
                 ggml_cuda_pool_alloc<float2>   Gb(ctx.pool(), (size_t) H * nch * CL);
-                ggml_cuda_pool_alloc<_Float16> Qh(ctx.pool(), (size_t) neqk1 * n_tokens * 128);
-                ggml_cuda_pool_alloc<_Float16> Kh(ctx.pool(), (size_t) neqk1 * n_tokens * 128);
-                ggml_cuda_pool_alloc<_Float16> Vh(ctx.pool(), (size_t) H * n_tokens * 128);
+                ggml_cuda_pool_alloc<_Float16> Qh(ctx.pool(), (size_t) neqk1 * nt * 128);
+                ggml_cuda_pool_alloc<_Float16> Kh(ctx.pool(), (size_t) neqk1 * nt * 128);
+                ggml_cuda_pool_alloc<_Float16> Vh(ctx.pool(), (size_t) H * nt * 128);
                 gdn_chunk_prep_kernel<CL><<<dim3(neqk1, nch), 256, 0, stream>>>(in, gs, bs,
-                    Tb.get(), Pb.get(), Gb.get(), Qh.get(), Kh.get(), Vh.get(), (int) H, (int) neqk1, (int) n_tokens, nch,
+                    Tb.get(), Pb.get(), Gb.get(), Qh.get(), Kh.get(), Vh.get(), (int) H, (int) neqk1, (int) nt, nch,
                     sb1, sb2, scale, qk_eps, qk_mul);
                 ggml_cuda_ovl_join(ctx);   // z may come from the side stream
                 ggml_cuda_pool_alloc<float> z32(ctx.pool());
                 if (z_widen) {
-                    z32.alloc((size_t) n_tokens * H * 128);
-                    ggml_get_to_fp32_cuda(GGML_TYPE_BF16)(zs, z32.get(), (int64_t) n_tokens * H * 128, stream);
+                    z32.alloc((size_t) nt * H * 128);
+                    ggml_get_to_fp32_cuda(GGML_TYPE_BF16)(zs, z32.get(), (int64_t) nt * H * 128, stream);
                     zs = z32.get();
                 }
                 gdn_chunk_scan_kernel<CL><<<dim3(H), 256, 0, stream>>>(Qh.get(), Kh.get(), Vh.get(), s0, dsts, so,
-                    Tb.get(), Pb.get(), Gb.get(), (int) H, (int) neqk1, (int) n_tokens, nch, scale,
+                    Tb.get(), Pb.get(), Gb.get(), (int) H, (int) neqk1, (int) nt, nch, scale,
                     on_ovr.w, zs, o32s, o16s, on_ovr.eps, on_ovr.out16_f16);
                 CUDA_CHECK(cudaGetLastError());
             };
-            for (int64_t is = 0; is < n_seqs; ++is) {
-                run(std::integral_constant<int, 32>{}, is);  //CL64 fails LDS 90KB > 64KB limit
+            using CL32 = std::integral_constant<int, 32>;   //CL64 fails LDS 90KB > 64KB limit
+            const size_t sstride = (size_t) S_v * S_v * H;  // one sequence's state
+            if (!rs_split) {
+                for (int64_t is = 0; is < n_seqs; ++is) {
+                    run(CL32{}, is, 0, n_tokens, s_d + is * sstride, state_d + is * sstride, nullptr);
+                }
+            } else {
+                // one sequence: the main run leaves the state after token n_main-1 in slot K-1, then token t goes from the
+                // slot of token t-1 to slot n_tokens-1-t (slot 0: the state after the last token)
+                ggml_cuda_pool_alloc<float> hist(ctx.pool(), cv_ovr.x ? (size_t) 3 * cv_ovr.C : 0);
+                const float * s_prev = s_d;
+                for (int64_t t = n_main - 1; t < n_tokens; ++t) {
+                    const int64_t t0 = t < n_main ? 0 : t;
+                    const int64_t nt = t < n_main ? n_main : 1;
+                    float * so = state_d + (size_t) (n_tokens - 1 - t) * state_slot_stride;
+                    if (cv_ovr.x && t0 > 0) {
+                        gdn_conv_hist_kernel<<<(unsigned) ((3 * cv_ovr.C + 255) / 256), 256, 0, stream>>>(cv_ovr.x, t0, cv_ovr.C, hist.get());
+                        CUDA_CHECK(cudaGetLastError());
+                    }
+                    run(CL32{}, 0, t0, nt, s_prev, so, hist.get());
+                    s_prev = so;
+                }
             }
             if (out_base != on_ovr.out) {
                 CUDA_CHECK(cudaMemcpyAsync(on_ovr.out, out_base, (size_t) n_seqs * n_tokens * H * 128 * sizeof(float),
