@@ -74,6 +74,3 @@ bool ggml_cuda_mmb_dq_packed(const ggml_tensor * w);
 void ggml_cuda_mmb_dense_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 void ggml_cuda_mul_mat_dq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 void ggml_cuda_mmb_release_all(ggml_backend_cuda_context & ctx);
-// GGML_CUDA_OVL (bitmask, default 15 = all on; 0 = off): side streams of the intra-graph concurrency on RDNA3.5.
-//   1: GDN z region, 2: FFN shared expert region, 4: attention K/V region, 8: small-expert tier of the routed GLU
-int ggml_cuda_ovl_mask();

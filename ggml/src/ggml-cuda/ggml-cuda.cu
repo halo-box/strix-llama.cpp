@@ -6883,18 +6883,9 @@ static void ggml_cuda_ovl_fork(ggml_backend_cuda_context & ctx, const int side) 
 }
 
 // graph_optimize part: find the regions, reorder each into [S][M], keep everything they touch allocated through `end`
-int ggml_cuda_ovl_mask() {
-    static const int v = getenv("GGML_CUDA_OVL") ? atoi(getenv("GGML_CUDA_OVL")) : 15;
-    return v;
-}
-
 static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg, ggml_backend_graph_optimize_params * params) {
     if (params == nullptr || params->add_alloc_dep == nullptr ||
             !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx->device].cc)) {   // tuned and verified on gfx1151 only
-        return;
-    }
-    const int mask = ggml_cuda_ovl_mask();
-    if ((mask & 7) == 0) {
         return;
     }
     auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
@@ -6921,12 +6912,12 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
         if (sfx == nullptr) {
             continue;
         }
-        if ((mask & 1) && name_is(t, "z", sfx)) {
+        if (name_is(t, "z", sfx)) {
             const int b = find(i + 1, i + 80, [](const ggml_tensor * u) { return u->op == GGML_OP_GATED_DELTA_NET; });
             if (b > i + 1) {
                 cands.push_back({ i, b, { t }, 1, true });
             }
-        } else if ((mask & 2) && name_is(t, "ffn_gate", sfx)) {
+        } else if (name_is(t, "ffn_gate", sfx)) {
             const int iu = find(i - 2, i + 4,   [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "ffn_up", sfx); });
             const int ig = find(i + 1, i + 80,  [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "shared_expert_gate", sfx); });
             const int b  = find(i + 1, i + 120, [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL && name_is(u, "ffn_moe_weighted", sfx); });
@@ -6936,7 +6927,7 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
             if (iu >= 0 && ig >= 0 && b >= 0 && ig < b && iu < b && !scaled(cg->nodes[b]->src[0]) && !scaled(cg->nodes[b]->src[1])) {
                 cands.push_back({ std::min(i, iu), b, { t, cg->nodes[iu], cg->nodes[ig] }, 2, false });
             }
-        } else if ((mask & 4) && name_is(t, "Vcur", sfx)) {
+        } else if (name_is(t, "Vcur", sfx)) {
             const int iq = find(i - 16, i,     [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "Qcur_full", sfx); });
             const int ik = find(i + 1, i + 8,  [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "Kcur", sfx); });
             const int b  = find(i + 1, i + 48, [](const ggml_tensor * u) { return u->op == GGML_OP_FLASH_ATTN_EXT; });

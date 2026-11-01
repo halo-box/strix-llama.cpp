@@ -2759,7 +2759,7 @@ struct mmb_tier_fork {
     explicit mmb_tier_fork(ggml_backend_cuda_context & ctx, int mode = 0) {
         constexpr int SIDE = GGML_CUDA_MAX_STREAMS - 1;
         main = ctx.stream();
-        if (ctx.curr_stream_no == SIDE || !(ggml_cuda_ovl_mask() & 8)) return;   // GGML_CUDA_OVL bit 8: tier side stream
+        if (ctx.curr_stream_no == SIDE) return;
         ggml_cuda_mmb_context & st = mmb_state(ctx);
         side = ctx.stream(ctx.device, SIDE);
         if (mode == 2 && st.side_pending) {
