@@ -8,6 +8,7 @@
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <tuple>
 #include <vector>
 
 class llama_memory_hybrid_idx_context;
@@ -2635,9 +2636,10 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
         llm_graph_input_qsa_k * qsa_k_inp = nullptr;
 
-        // score-strip views of the host inputs (KQ mask, QSA bias), keyed by input and first query: the scheduler gives every
-        // view of a host input its own copy, kept for the whole graph, so the layers share one view per strip
-        std::map<std::pair<const ggml_tensor *, int64_t>, ggml_tensor *> strip_views;
+        // score-strip views of the host inputs (KQ mask, QSA bias), keyed by input, first query and strip size (it varies
+        // with the layer's compress ratio): the scheduler gives every view of a host input its own copy, kept for the whole
+        // graph, so the layers share one view per strip
+        std::map<std::tuple<const ggml_tensor *, int64_t, int64_t>, ggml_tensor *> strip_views;
 
         // QSA: store this ubatch's raw indexer keys in the indexer cache (no selection)
         void build_qsa_store_k(
