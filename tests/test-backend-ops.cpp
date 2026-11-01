@@ -6710,6 +6710,15 @@ struct test_hc_up_mix_f16 : public test_case {
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         const char * name = gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G";
+        // GGML_VK_TEST_REQUIRE_HC_DQ8=1: the fusion ran on the dense q8_0 x f16 GEMM (GGML_VK_HC_DQ8) exactly where it is eligible
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_DQ8")) {
+            const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_HC_DQ8");
+            const bool want = env_knob_on("GGML_VK_HC_DQ8") && env_knob_on("GGML_VK_HC_UP_MIX") && k % 64 == 0 && 4 * n_embd >= 128;
+            if (c >= 0 && (c > 0) != want) {
+                msg = "MUL_MAT_HC_DQ8 dispatches: " + std::to_string(c) + (want ? " (expected the dq8 GEMM)" : " (expected int8 MMQ)");
+                return false;
+            }
+        }
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_UP_MIX", name)) {
             return true;
         }
@@ -13505,6 +13514,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // HC_UP_MIX: exact and ragged tiles, padded x rows, the Flash-Next shape (n_embd 2560, low rank 320, ub 2048) and its 2051 tail
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 64, 96, 0));
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128));
+    test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 128, 128));   // k % 64 == 0, 256 rows: the GGML_VK_HC_DQ8 GEMM, ragged n
+    test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 128, 128, false, true));
     test_cases.emplace_back(new test_hc_up_mix_f16(256, 33, 320, 8));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2048, 320, 128));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2051, 320, 128));
@@ -16745,6 +16756,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int n : {64, 128, 512, 2048, 4096, 8192}) {
             test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, mk[0], n, mk[1]));
         }
+    }
+    for (int n : {2048, 8192}) {
+        test_cases.emplace_back(new test_hc_up_mix_f16(2560, n, 320, 128));
+        test_cases.emplace_back(new test_hc_up_mix_f16(2560, n, 320, 128, false));
     }
     for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {12288, 2560}, {6144, 2560} }) {
         for (int n : {2048, 8192}) {
