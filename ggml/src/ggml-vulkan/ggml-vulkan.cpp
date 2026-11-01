@@ -23103,6 +23103,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_boundary = true;
                 ctx->hc_boundary = hcb.m;
                 ctx->fused_ops_write_mask |= (1 << (hcb.m.post_idx - i)) | (1 << (hcb.m.comb_idx - i));
+                // the prefill GEMM path writes the mix dots into the MUL_MAT's own buffer (ggml_vk_dsv4_hc_boundary): synced as
+                // written like the outputs, whichever path the dispatch takes. Not in the write mask: the mix views read that
+                // buffer, so the overlap check below would disable the fusion; the GEMM path checks its own overlaps.
+                ctx->fused_extra_dst = hcb.m.mm;
                 fusion_string = hcb.m.rms2 ? "HC_BOUNDARY_NORM" : "HC_BOUNDARY";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if ((num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i))) {
