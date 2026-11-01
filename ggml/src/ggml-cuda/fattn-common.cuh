@@ -691,7 +691,13 @@ static __global__ void flash_attn_mask_to_KV_max(
     for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
         int all_inf = 1;
 
-#pragma unroll
+#if defined(RDNA3_5)
+        // gfx1151/ROCm 10.1: unrolling all 64 rows keeps 64 row offsets live and spills 86 SGPRs (2026-11-01).
+        constexpr int unroll_j = ncols1 > 32 ? 8 : ncols1;
+#else
+        constexpr int unroll_j = ncols1;
+#endif // defined(RDNA3_5)
+#pragma unroll unroll_j
         for (int j = 0; j < ncols1; ++j) {
             const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
             all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
