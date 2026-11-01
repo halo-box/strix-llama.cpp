@@ -1913,6 +1913,8 @@ static void mul_mat_vec_q_fq_launch(
     constexpr int blocks_per_iter = VDR_Q8_0_Q8_1_MMVQ * 32 / QI8_0;
     const bool long_rows = type == GGML_TYPE_Q8_0 && (ncols_x / QK8_0) >= 16 * blocks_per_iter &&
         (int64_t) nrows_x * nchannels_dst * nsamples_dst <= 1024;
+    // only Q8_0 takes the long-row branches: other types name their normal kernel there and compile no extra one
+    constexpr int pf_long = type == GGML_TYPE_Q8_0 ? MMVQ_FQ_PF_LONG : MMVQ_FQ_PF;
 
     switch (nwarps) {
         case 16:
@@ -1921,8 +1923,8 @@ static void mul_mat_vec_q_fq_launch(
             break;
         case 8:
             if (long_rows) {
-                if (has_fusion) { launch(mul_mat_vec_q_fq<type, true,  8, MMVQ_FQ_PF_LONG>); }
-                else            { launch(mul_mat_vec_q_fq<type, false, 8, MMVQ_FQ_PF_LONG>); }
+                if (has_fusion) { launch(mul_mat_vec_q_fq<type, true,  8, pf_long>); }
+                else            { launch(mul_mat_vec_q_fq<type, false, 8, pf_long>); }
             } else {
                 if (has_fusion) { launch(mul_mat_vec_q_fq<type, true,  8, MMVQ_FQ_PF>); }
                 else            { launch(mul_mat_vec_q_fq<type, false, 8, MMVQ_FQ_PF>); }
@@ -1930,8 +1932,8 @@ static void mul_mat_vec_q_fq_launch(
             break;
         case 4:
             if (long_rows) {
-                if (has_fusion) { launch(mul_mat_vec_q_fq<type, true,  4, MMVQ_FQ_PF_LONG>); }
-                else            { launch(mul_mat_vec_q_fq<type, false, 4, MMVQ_FQ_PF_LONG>); }
+                if (has_fusion) { launch(mul_mat_vec_q_fq<type, true,  4, pf_long>); }
+                else            { launch(mul_mat_vec_q_fq<type, false, 4, pf_long>); }
             } else {
                 if (has_fusion) { launch(mul_mat_vec_q_fq<type, true,  4, MMVQ_FQ_PF>); }
                 else            { launch(mul_mat_vec_q_fq<type, false, 4, MMVQ_FQ_PF>); }

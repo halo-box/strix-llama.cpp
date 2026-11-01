@@ -1601,29 +1601,6 @@ static const uint16_t * mmb_act_lookup(ggml_backend_cuda_context & ctx, const gg
 
 // Shadow BF16 copies of IQ4_NL dense weights: dequantised once (same LUT*scale -> BF16 RNE as mmb_dq_row36, so the
 // WMMA inputs are bitwise identical) so the dense GEMM runs the dequant-free WTYPE=2 path.
-__global__ void mmb_dq_q6k_bf16_kernel(const uint8_t * __restrict__ W, uint16_t * __restrict__ out, const size_t nblocks) {
-    const size_t b = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= nblocks) return;
-    const uint8_t * p  = W + b * 210;
-    const uint8_t * ql = p, * qh = p + 128;
-    const int8_t  * sc = (const int8_t *) (p + 192);
-    const float d = mmb_h2f(*(const uint16_t *) (p + 208));
-    uint16_t * o = out + b * 256;
-    for (int n = 0; n < 2; ++n) {
-        const uint8_t * QL = ql + 64 * n; const uint8_t * QH = qh + 32 * n; const int8_t * S = sc + 8 * n; uint16_t * Y = o + 128 * n;
-        for (int l = 0; l < 32; ++l) {
-            const int is = l / 16;
-            const int8_t q1 = (int8_t)((QL[l +  0] & 0xF) | (((QH[l] >> 0) & 3) << 4)) - 32;
-            const int8_t q2 = (int8_t)((QL[l + 32] & 0xF) | (((QH[l] >> 2) & 3) << 4)) - 32;
-            const int8_t q3 = (int8_t)((QL[l +  0] >>  4) | (((QH[l] >> 4) & 3) << 4)) - 32;
-            const int8_t q4 = (int8_t)((QL[l + 32] >>  4) | (((QH[l] >> 6) & 3) << 4)) - 32;
-            Y[l +  0] = mmb_f2bf(d * S[is + 0] * q1);
-            Y[l + 32] = mmb_f2bf(d * S[is + 2] * q2);
-            Y[l + 64] = mmb_f2bf(d * S[is + 4] * q3);
-            Y[l + 96] = mmb_f2bf(d * S[is + 6] * q4);
-        }
-    }
-}
 
 __global__ void mmb_dq_q8_0_bf16_kernel(const uint8_t * __restrict__ W, uint16_t * __restrict__ out, const size_t nblocks) {
     const size_t b = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1650,33 +1627,9 @@ static bool mmb_is_hc_q8(const ggml_tensor * w) {
     return w->ne[0] <= 384 && w->ne[1] >= 4096;
 }
 
-__global__ void mmb_dq_iq4nl_bf16_kernel(const uint8_t * __restrict__ W, uint16_t * __restrict__ out, const size_t nblocks) {
-    const size_t b = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= nblocks) return;
-    const uint8_t * p = W + b * 18;
-    const float d = mmb_h2f(*(const uint16_t *) p);
-    const uint32_t * q = (const uint32_t *) (p + 2);
-    uint32_t * o = (uint32_t *) (out + b * 32);
-#pragma unroll
-    for (int w = 0; w < 4; ++w) {
-        const uint32_t v = q[w];
-        const float l0 = d * mmb_kv_iq4nl[(v      ) & 0xF], h0 = d * mmb_kv_iq4nl[(v >>  4) & 0xF];
-        const float l1 = d * mmb_kv_iq4nl[(v >>  8) & 0xF], h1 = d * mmb_kv_iq4nl[(v >> 12) & 0xF];
-        const float l2 = d * mmb_kv_iq4nl[(v >> 16) & 0xF], h2 = d * mmb_kv_iq4nl[(v >> 20) & 0xF];
-        const float l3 = d * mmb_kv_iq4nl[(v >> 24) & 0xF], h3 = d * mmb_kv_iq4nl[(v >> 28) & 0xF];
-        o[2*w] = mmb_pack2(l0, l1); o[2*w + 1] = mmb_pack2(l2, l3); o[8 + 2*w] = mmb_pack2(h0, h1); o[8 + 2*w + 1] = mmb_pack2(h2, h3);
-    }
-}
 int    mmb_shadow_mode(){ return 2; }
 bool   mmb_shadow()    { return mmb_shadow_mode() != 0; }
-bool   mmb_shadow_q6k(){ return mmb_shadow_mode() >= 1; }
 size_t mmb_shadow_cap(){ return (size_t) 6144 << 20; }
-static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
-static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == GGML_TYPE_IQ4_NL && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w); }
-static bool mmb_is_row_concat(const ggml_tensor * w) {
-    return w && w->op == GGML_OP_CONCAT && w->type == GGML_TYPE_IQ4_NL && ggml_get_op_params_i32(w, 0) == 1 && mmb_is_resident_iq4(w->src[0]) && mmb_is_resident_iq4(w->src[1]) &&
-           w->src[0]->ne[0] == w->src[1]->ne[0] && w->ne[0] == w->src[0]->ne[0] && w->ne[1] == w->src[0]->ne[1] + w->src[1]->ne[1];
-}
 static const uint16_t * mmb_shadow_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
     if (w->op == GGML_OP_CONCAT) { auto it = mmb_state(ctx).shadow_pair.find({w->src[0]->data, w->src[1]->data}); return it == mmb_state(ctx).shadow_pair.end() ? nullptr : it->second; }
     auto it = mmb_state(ctx).shadow.find(w->data); return it == mmb_state(ctx).shadow.end() ? nullptr : it->second;
@@ -2092,16 +2045,14 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     const uint16_t * xhp = xf16 ? xf16 : mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
     if (mmb_tall() && src0->type == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
-        static const int wide = mmb_tall_mode() >= 2;
-        if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
-        else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
+        dim3 grid(1, (T + 63) / 64);
+        mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     // Q8_0 HC down [10240 -> 320]: at 128x128 tiles only 3x(T/128) blocks with a K=10240 loop (occupancy-bound).
     // Narrower tiles keep the per-output K accumulation order (bit-identical) but launch 3-10x more blocks:
     // the 64x64 tile <64,64,32,16> unless the int8 route below applies.
-    const uint16_t * hc_shadow = mmb_is_hc_q8(src0) ? mmb_shadow_lookup(ctx, src0) : nullptr;
     if (src0->type == GGML_TYPE_Q8_0 && M <= 384 && K >= 4096 && T >= 512) {
         const bool hbf = ggml_cuda_mmb_blk16() && ggml_cuda_mmb_is_bf16_only(ctx, dst) && (M & 7) == 0;
         uint16_t * Dh2 = hbf ? (uint16_t *) dst->data : nullptr; const bool sf = !hbf;
@@ -2136,13 +2087,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             CUDA_CHECK(cudaGetLastError());
             return;
         }
-        auto go = [&](auto tag, const uint8_t * WP) {
-            constexpr int WT = decltype(tag)::value;
-            dim3 g((M + 63) / 64, (T + 63) / 64);
-            mmb_dense_kernel<64, 64, 32, 16, WT><<<g, MMB_NT, 0, stream>>>(WP, xhp, D, Dh2, sf, M, K, T);
-        };
-        if (hc_shadow) go(std::integral_constant<int, 2>{}, (const uint8_t *) hc_shadow);
-        else           go(std::integral_constant<int, 1>{}, W);
+        dim3 g((M + 63) / 64, (T + 63) / 64);
+        mmb_dense_kernel<64, 64, 32, 16, 1><<<g, MMB_NT, 0, stream>>>(W, xhp, D, Dh2, sf, M, K, T);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -3887,10 +3833,12 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     // common small-expert case) leaves 4 waves WMMA-idle under the old shape. Bit-identical: same (m,n), same K order.
     mmb_dispatch_quant(src0->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
-        const dim3 gb((M + 127) / 128, nbig_max), gs((M + 127) / 128, nsmall_max);
-        mmb_tier_fork fork(ctx, 2);
-        mmb_routed_kernel<128, BN_SMALL, 16, 32, WT><<<gs, MMB_NT, 0, fork.small()>>>(W, eb, xhp, D, Dh, store_f32, ids_src1_p, ids_dst_p, bounds_p, desc_small.get(), M, K); // 8x2 = full 16-wave coverage (was 8x1 = 8/16 idle)
-        mmb_routed_kernel<128, BN_BIG, 32, 32, WT><<<gb, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1_p, ids_dst_p, bounds_p, desc_big.get(), M, K); // WAVES_M 4x WAVES_N 2, TM=2 TN=2 = full 128x64 coverage (was <32,16> = 32/64 tokens, half the tile lost)
+        if constexpr (WT < 32 || mmb_quant_type_routed_supported(static_cast<ggml_type>(WT - 32))) {
+            const dim3 gb((M + 127) / 128, nbig_max), gs((M + 127) / 128, nsmall_max);
+            mmb_tier_fork fork(ctx, 2);
+            mmb_routed_kernel<128, BN_SMALL, 16, 32, WT><<<gs, MMB_NT, 0, fork.small()>>>(W, eb, xhp, D, Dh, store_f32, ids_src1_p, ids_dst_p, bounds_p, desc_small.get(), M, K); // 8x2 = full 16-wave coverage (was 8x1 = 8/16 idle)
+            mmb_routed_kernel<128, BN_BIG, 32, 32, WT><<<gb, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1_p, ids_dst_p, bounds_p, desc_big.get(), M, K); // WAVES_M 4x WAVES_N 2, TM=2 TN=2 = full 128x64 coverage (was <32,16> = 32/64 tokens, half the tile lost)
+        }
     });
     mmb_join_pending(ctx);   // a path without fork: join the pending side now
     mmb_hold_release(ctx);
@@ -3909,20 +3857,24 @@ bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_ten
     return ggml_cuda_mmb_supported_mmid(ctx, gw, src1, ids, glu->src[0]) && ggml_cuda_mmb_supported_mmid(ctx, uw, src1, ids, glu->src[1]);
 }
 
+static constexpr bool mmb_gluk_type(ggml_type type) {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1;
+}
+
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu) {
     mmb_hold_release(ctx);   // stale holds (should be empty)
     cudaStream_t stream = ctx.stream();
     const int K = (int) gw->ne[0], M = (int) gw->ne[1], E = (int) gw->ne[2];
     const int ne11 = (int) src1->ne[1], T = (int) src1->ne[2], n_used = (int) ids->ne[0];
     const int n_rows_x = ne11 * T, n_rows = n_used * T;
-    constexpr int BN_sel = 128;   // the big-tier token tile; nbig_cap and launch_big are sized for 64 / 128 / 256 only
+    constexpr int BN_sel = 128;   // the big-tier token tile; nbig_cap is sized for tiles of 64 rows or more
     // gluk mode: gufo-style raw-code kPair GEMM for the routed GLU; desc built
     // at BN=128 token tiles for the big tier.
     // Gated at T>=128: it wins the prefill (pp2048 +40) but costs decode-width
     // rows (T=1..8) through tile padding (tg128 -0.7).
     constexpr int BN_gluk = 128;
     // gluk decodes Q4_K / Q5_K superblocks and Q5_1 only: the other routed types keep the legacy tiers
-    const bool glk_this = T >= 128 && M % 2 == 0 && (gw->type == GGML_TYPE_Q4_K || gw->type == GGML_TYPE_Q5_K || gw->type == GGML_TYPE_Q5_1);   // the pair epilogue stores row pairs
+    const bool glk_this = T >= 128 && M % 2 == 0 && mmb_gluk_type(gw->type);   // the pair epilogue stores row pairs
     const int BN_rt = glk_this ? BN_gluk : BN_sel;
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
     auto & ids_src1 = mmb_hold_alloc<int32_t>(ctx, n_rows);
@@ -3973,34 +3925,28 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     mmb_dispatch_quant(gw->type, [&](auto tag) {
         constexpr int WT = decltype(tag)::value;
         if constexpr (WT < 32 || mmb_quant_type_routed_supported(static_cast<ggml_type>(WT - 32))) {
-            if (glk_this) {
-                // joined here: an op between this GLU and the down (a router-weight MUL, a down off MMB) reads the output
-                mmb_tier_fork fork(ctx);
-                {
-                    const dim3 gs((M + 63) / 64, nsmall_max);
-                    mmb_routed_gluk_kernel<WT, 32><<<gs, MMB_NT, 0, fork.small()>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), eb, (size_t) M, (size_t) K);
+            if constexpr (WT >= 32 && mmb_gluk_type(static_cast<ggml_type>(WT - 32))) {
+                if (glk_this) {
+                    // joined here: an op between this GLU and the down (a router-weight MUL, a down off MMB) reads the output
+                    mmb_tier_fork fork(ctx);
+                    {
+                        const dim3 gs((M + 63) / 64, nsmall_max);
+                        mmb_routed_gluk_kernel<WT, 32><<<gs, MMB_NT, 0, fork.small()>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), eb, (size_t) M, (size_t) K);
+                    }
+                    {
+                        const dim3 gb((M + 63) / 64, nbig_cap);
+                        mmb_routed_gluk_kernel<WT, BN_gluk><<<gb, MMB_NT, 0, stream>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), eb, (size_t) M, (size_t) K);
+                    }
+                    CUDA_CHECK(cudaGetLastError());
+                    return;
                 }
-                {
-                    const dim3 gb((M + 63) / 64, nbig_cap);
-                    mmb_routed_gluk_kernel<WT, BN_gluk><<<gb, MMB_NT, 0, stream>>>(Wg, Wu, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), eb, (size_t) M, (size_t) K);
-                }
-                CUDA_CHECK(cudaGetLastError());
-                return;
             }
-            auto launch_big = [&](auto bn_tag) {
-                constexpr int BN = decltype(bn_tag)::value;
-                const dim3 gbig((M + 63) / 64, nbig_max);
-                if constexpr (WT == 32 + GGML_TYPE_Q4_K && BN == 128) {
-                    mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT, true><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-                } else if constexpr (BN == 64) {
-                    mmb_routed_glu_kernel<64, 64, 16, 32, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-                } else {
-                    mmb_routed_glu_kernel<64, BN, 32, BN / 4, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-                }
-            };
-            if (BN_sel == 256) launch_big(std::integral_constant<int,256>{});
-            else if (BN_sel == 64) launch_big(std::integral_constant<int,64>{});
-            else               launch_big(std::integral_constant<int,128>{});
+            const dim3 gbig((M + 63) / 64, nbig_max);
+            if constexpr (WT == 32 + GGML_TYPE_Q4_K) {
+                mmb_routed_glu_kernel<64, BN_sel, 32, BN_sel / 4, WT, true><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            } else {
+                mmb_routed_glu_kernel<64, BN_sel, 32, BN_sel / 4, WT><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
+            }
             if (!glk_this) mmb_routed_glu_kernel<64, 64, 16, 32, WT><<<dim3((M + 63) / 64, E + 1), MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_mid.get(), M, K);
             if (glk_this) return;
             const dim3 gsmall((M + 63) / 64, nsmall_max);
@@ -4014,7 +3960,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Called from graph_optimize (outside stream capture): create the shadow for an eligible IQ4_NL dense weight.
+// Called from graph_optimize (outside stream capture): create the 16-bit shadow for an eligible dense weight.
 void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w) {
     if (!w) return;
     if (mmb_is_f16hi_f32(w)) {
@@ -4040,37 +3986,6 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
         mmb_state(ctx).shadow[w->data] = buf; mmb_state(ctx).shadow_bytes += bytes;
         return;
     }
-    if (mmb_is_resident_q6k(w)) {
-        if (!mmb_shadow_q6k() || mmb_state(ctx).shadow.count(w->data) > 0) return;
-        const size_t n = (size_t) w->ne[0] * w->ne[1], bytes = n * 2;
-        if (mmb_state(ctx).shadow_bytes + bytes > mmb_shadow_cap()) { GGML_LOG_INFO("MMB_SHADOW cap reached; %s stays Q6_K\n", w->name); return; }
-        uint16_t * buf = nullptr;
-        if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
-        mmb_dq_q6k_bf16_kernel<<<(unsigned) ((n / 256 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 256);
-        CUDA_CHECK(cudaGetLastError());
-        mmb_state(ctx).shadow[w->data] = buf; mmb_state(ctx).shadow_bytes += bytes;
-        return;
-    }
-    if (mmb_shadow_mode() != 1) return;               // mode 2: Q6_K only
-    const bool concat = mmb_is_row_concat(w);
-    if (!concat && !mmb_is_resident_iq4(w)) return;
-    if (concat ? mmb_state(ctx).shadow_pair.count({w->src[0]->data, w->src[1]->data}) > 0 : mmb_state(ctx).shadow.count(w->data) > 0) return;
-    const size_t n = (size_t) w->ne[0] * w->ne[1];
-    const size_t bytes = n * 2;
-    if (mmb_state(ctx).shadow_bytes + bytes > mmb_shadow_cap()) { static bool warned = false; if (!warned) { GGML_LOG_INFO("MMB_SHADOW cap reached at %.1f MB; further weights stay IQ4_NL\n", mmb_state(ctx).shadow_bytes / 1048576.0); warned = true; } return; }
-    uint16_t * buf = nullptr;
-    if (cudaMalloc((void **) &buf, bytes) != cudaSuccess) { GGML_LOG_WARN("MMB_SHADOW alloc failed (%zu bytes)\n", bytes); return; }
-    if (concat) {
-        const size_t n0 = (size_t) w->src[0]->ne[0] * w->src[0]->ne[1], n1 = (size_t) w->src[1]->ne[0] * w->src[1]->ne[1];
-        mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n0 / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->src[0]->data, buf, n0 / 32);
-        mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n1 / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->src[1]->data, buf + n0, n1 / 32);
-        mmb_state(ctx).shadow_pair[{w->src[0]->data, w->src[1]->data}] = buf;
-    } else {
-        mmb_dq_iq4nl_bf16_kernel<<<(unsigned) ((n / 32 + 255) / 256), 256, 0, ctx.stream()>>>((const uint8_t *) w->data, buf, n / 32);
-        mmb_state(ctx).shadow[w->data] = buf;
-    }
-    CUDA_CHECK(cudaGetLastError());
-    mmb_state(ctx).shadow_bytes += bytes;
 }
 
 // Dense R2: in-place repack of a dense Q8_0 weight to the tile layout of mmb_tq8_dense_kernel. Each 128-row tile
