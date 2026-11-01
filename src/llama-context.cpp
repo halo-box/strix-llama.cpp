@@ -2654,7 +2654,7 @@ bool llama_context::chain_init() {
     }
     ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[0]);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    chain.set_defer = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_defer_submit");
+    chain.set_defer = (bool (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_defer_submit");
     chain.flush     = (void (*)(ggml_backend_t))       ggml_backend_reg_get_proc_address(reg, "ggml_backend_flush_deferred");
     chain.mark      = (bool (*)(ggml_backend_t))       ggml_backend_reg_get_proc_address(reg, "ggml_backend_mark");
     chain.mark_wait = (void (*)(ggml_backend_t))       ggml_backend_reg_get_proc_address(reg, "ggml_backend_mark_wait");
@@ -2663,6 +2663,14 @@ bool llama_context::chain_init() {
     }
     if (!chain.set_defer || !chain.flush) {
         LLAMA_LOG_WARN("%s: the %s backend cannot defer submissions, decode chaining disabled\n", __func__, ggml_backend_name(backend_ptrs[0]));
+        return false;
+    }
+    // the backend may still refuse to defer in this setup (e.g. serialized submissions, no async support): the recorded
+    // decode would then run on its placeholder token
+    const bool can_defer = chain.set_defer(backend_ptrs[0], true);
+    chain.set_defer(backend_ptrs[0], false);
+    if (!can_defer) {
+        LLAMA_LOG_WARN("%s: the %s backend does not defer submissions in this setup, decode chaining disabled\n", __func__, ggml_backend_name(backend_ptrs[0]));
         return false;
     }
     ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
@@ -2759,7 +2767,7 @@ int llama_context::decode_chain(llama_seq_id seq_id, llama_token * token) {
     const llama_pos pos = memory->seq_pos_max(seq_id) + 1;
 
     chain_swap();
-    chain.set_defer(chain.gpu[chain.slot], true);
+    GGML_ASSERT(chain.set_defer(chain.gpu[chain.slot], true) && "decode chaining: the backend stopped deferring submissions");
     chain.prep = true;
 
     llama_batch batch = llama_batch_init(1, 0, 1);

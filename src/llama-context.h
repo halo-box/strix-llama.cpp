@@ -465,7 +465,7 @@ private:
         ggml_backend_buffer_ptr tok_buf;
         llama_token *           tok = nullptr;
 
-        void (*set_defer)(ggml_backend_t, bool) = nullptr;
+        bool (*set_defer)(ggml_backend_t, bool) = nullptr;   // false: the backend cannot hold this context's submissions back
         void (*flush)(ggml_backend_t)           = nullptr;
         bool (*mark)(ggml_backend_t)            = nullptr;
         void (*mark_wait)(ggml_backend_t)       = nullptr;

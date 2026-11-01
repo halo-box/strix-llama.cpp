@@ -27598,13 +27598,22 @@ static ggml_backend_buffer_type_t * ggml_backend_vk_get_extra_bufts(ggml_backend
 // Deferred submission for one-token-ahead decode chaining: while on, graph_compute records the graph's command
 // buffers but does not submit them; ggml_backend_vk_flush_deferred submits everything recorded so far. The caller can
 // so build and record the next graph while the previous one still runs on another context, and write its last
-// inputs before the GPU may read them. ggml_backend_synchronize also flushes first.
-static void ggml_backend_vk_set_defer_submit(ggml_backend_t backend, bool defer) {
+// inputs before the GPU may read them. ggml_backend_synchronize also flushes first. Returns false when the request to defer
+// cannot be met: serialized submissions (GGML_VK_SERIALIZE_SUBMISSIONS) submit every batch at once, and without async
+// support (GGML_VK_DISABLE_ASYNC, DG1) graph_compute synchronizes, and so flushes, before it returns.
+static bool ggml_backend_vk_set_defer_submit(ggml_backend_t backend, bool defer) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
     if (!defer) {
         ggml_vk_flush_deferred(ctx);
+        ctx->defer_submit = false;
+        return true;
     }
-    ctx->defer_submit = defer && !ctx->device->serialize_submissions;
+    if (ctx->device->serialize_submissions || !ctx->device->support_async) {
+        ctx->defer_submit = false;
+        return false;
+    }
+    ctx->defer_submit = true;
+    return true;
 }
 
 static void ggml_backend_vk_flush_deferred(ggml_backend_t backend) {
