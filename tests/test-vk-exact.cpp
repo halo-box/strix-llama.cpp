@@ -17,37 +17,12 @@
 #include <tuple>
 #include <vector>
 
-// setenv / unsetenv are POSIX only; _putenv_s with an empty value removes the variable on Windows
-static void set_env(const char * name, const char * value, bool overwrite = true) {
-    if (!overwrite && getenv(name)) {
-        return;
-    }
-#ifdef _WIN32
-    _putenv_s(name, value ? value : "");
-#else
-    if (value) {
-        setenv(name, value, 1);
-    } else {
-        unsetenv(name);
-    }
-#endif
-}
-
 // the Vulkan dispatch census test hooks (off until the first reset)
 typedef uint64_t (*fusion_count_t)(const char *);
 typedef void     (*fusion_reset_t)(void);
 
 static fusion_count_t g_count = nullptr;
 static fusion_reset_t g_reset = nullptr;
-static void (*g_env_reload)(void) = nullptr;   // the backend caches knobs it reads per graph; null on a backend without the hook
-
-// a Vulkan knob flipped at run time: the backend re-reads it on its next use
-static void set_vk_knob(const char * name, const char * value) {
-    set_env(name, value);
-    if (g_env_reload) {
-        g_env_reload();
-    }
-}
 
 static uint64_t fnv1a(const void * p, size_t n) {
     uint64_t h = 1469598103934665603ull;
@@ -147,7 +122,6 @@ struct pair_case {
     bool strict = true;                      // byte-equal required
     rte_fn rte;                              // optional
     std::function<void()> perturb;           // positive control
-    const char * knob = nullptr;             // env knob set to "1" for the fused runs and "0" for the reference runs
 };
 
 static void run_pair(ggml_backend_t be, ggml_context * ctx, const pair_case & c) {
@@ -164,21 +138,20 @@ static void run_pair(ggml_backend_t be, ggml_context * ctx, const pair_case & c)
     GGML_ASSERT(out_f->type == GGML_TYPE_F16 && out_r->type == GGML_TYPE_F16 && ggml_nelements(out_f) == ggml_nelements(out_r));
     const size_t ne = ggml_nelements(out_f);
     std::vector<ggml_fp16_t> o_f(ne), o_f2(ne), o_r(ne), o_p(ne);
-    auto run = [&](ggml_cgraph * g, bool fused, uint64_t * n) {
-        if (c.knob) set_vk_knob(c.knob, fused ? "1" : "0");
+    auto run = [&](ggml_cgraph * g, uint64_t * n) {
         g_reset();
         ggml_backend_graph_compute(be, g);
         if (n) *n = c.fname ? g_count(c.fname) : 0;
     };
     uint64_t n_f = 0, n_r = 0;
-    run(gf, true, &n_f);
+    run(gf, &n_f);
     ggml_backend_tensor_get(out_f, o_f.data(), 0, ne * 2);
-    run(gr, false, &n_r);
+    run(gr, &n_r);
     ggml_backend_tensor_get(out_r, o_r.data(), 0, ne * 2);
-    if (gk) run(gk, false, nullptr);
+    if (gk) run(gk, nullptr);
     size_t r_match = 0, r_total = 0;
     if (c.rte) c.rte(o_f, r_match, r_total);
-    run(gf, true, nullptr);
+    run(gf, nullptr);
     ggml_backend_tensor_get(out_f, o_f2.data(), 0, ne * 2);
     size_t ndiff = 0; int maxulp = 0;
     for (size_t i = 0; i < ne; ++i) {
@@ -186,9 +159,8 @@ static void run_pair(ggml_backend_t be, ggml_context * ctx, const pair_case & c)
     }
     const bool run2 = memcmp(o_f.data(), o_f2.data(), ne * 2) == 0;
     c.perturb();
-    run(gf, true, nullptr);
+    run(gf, nullptr);
     ggml_backend_tensor_get(out_f, o_p.data(), 0, ne * 2);
-    if (c.knob) set_vk_knob(c.knob, nullptr);
     const bool ctl = memcmp(o_f.data(), o_p.data(), ne * 2) != 0;
     const bool engaged = c.fname == nullptr || (n_f == (g_fusion ? (uint64_t) c.expect : 0) && n_r == 0);
     const bool rte_ok = !c.rte || r_match == r_total;
@@ -441,7 +413,7 @@ static void case_hc_pre(ggml_backend_t be, int64_t n_embd, int64_t nt, bool g16)
 }
 
 // HC_UP_MIX with the f16 mixed stream (mul_mmq_cm1.comp HC_EPI d16): MUL_MAT(q8_0 hc up) + CPY(f16 gate) + DSV4_HC_PRE(f16 out).
-// Reference: the gate GEMM + CPY, DSV4_HC_PRE with an f32 output, then CPY(f16); GGML_VK_HC_UP_MIX=0 for the reference runs.
+// Reference: the gate GEMM + CPY, DSV4_HC_PRE with an f32 output, then CPY(f16); its gate RESHAPE is a graph output, so it cannot fuse.
 static void case_hc_up_mix(ggml_backend_t be, int64_t n_embd, int64_t nt, int64_t lr) {
     const int64_t hc = 4;
     ggml_context * ctx = new_ctx();
@@ -463,7 +435,6 @@ static void case_hc_up_mix(ggml_backend_t be, int64_t n_embd, int64_t nt, int64_
     c.fname = "HC_UP_MIX";
     c.roots_f = { of }; c.roots_r = { orr };
     c.rte = rte_of(m32);
-    c.knob = "GGML_VK_HC_UP_MIX";
     c.perturb = [lo]() { bump(lo); };
     run_pair(be, ctx, c);
     ggml_backend_buffer_free(buf);
@@ -638,28 +609,37 @@ static int run(ggml_backend_t be, bool fusion) {
 
 // ---------------------------------------------------------------------------------------------------------------------
 // hc-up-mix: HC_UP_MIX (hc up GEMM + gated hc pre in one int8 MMQ epilogue) must be bit-exact with the unfused chain, or
-// cached multi-turn and a full re-prefill diverge; GGML_VK_HC_UP_MIX=1 vs 0 per shape, engagement and a positive control
+// cached multi-turn and a full re-prefill diverge; fused vs a reference graph that cannot fuse per shape, engagement and a positive control
 
 namespace hc_up_mix {
 
 struct shape { int64_t n_embd, nt, k, pad; bool expect_fused; bool gate16 = true; bool mix16 = false; };   // gate16 false: the f32-gate form; mix16: the f16 mixed stream
 
 static int run_shape(ggml_backend_t be, const shape & sh, bool fusion) {
-    ggml_init_params ip = { 32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_init_params ip = { 32 * ggml_tensor_overhead() + 2 * ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     const int64_t hc_dim = 4 * sh.n_embd;
     ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, sh.k, hc_dim);
     ggml_tensor * lo  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, sh.k, sh.nt);
     ggml_tensor * xb  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hc_dim + sh.pad, sh.nt);   // row-padded like LLAMA_HC_XN_PAD
     ggml_tensor * x   = ggml_view_3d(ctx, xb, sh.n_embd, 4, sh.nt, sh.n_embd * sizeof(ggml_fp16_t), xb->nb[1], 0);
-    ggml_tensor * g   = ggml_mul_mat(ctx, w, lo);
-    ggml_tensor * g16 = sh.gate16 ? ggml_cast(ctx, g, GGML_TYPE_F16) : g;   // (named g16 either way: the gate the HC pre reads)
-    ggml_tensor * rs  = ggml_reshape_3d(ctx, g16, sh.n_embd, 4, sh.nt);
-    ggml_tensor * mixed = ggml_dsv4_hc_pre_gated_ext(ctx, x, rs, 0.25f, sh.mix16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+    // ref: the RESHAPE is a graph output, so HC_UP_MIX cannot take the chain
+    auto chain = [&](bool ref) {
+        ggml_tensor * g   = ggml_mul_mat(ctx, w, lo);
+        ggml_tensor * g16 = sh.gate16 ? ggml_cast(ctx, g, GGML_TYPE_F16) : g;   // (named g16 either way: the gate the HC pre reads)
+        ggml_tensor * rs  = ggml_reshape_3d(ctx, g16, sh.n_embd, 4, sh.nt);
+        if (ref) ggml_set_output(rs);
+        ggml_tensor * out = ggml_dsv4_hc_pre_gated_ext(ctx, x, rs, 0.25f, sh.mix16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+        ggml_set_output(out);
+        return out;
+    };
+    ggml_tensor * mixed   = chain(false);
+    ggml_tensor * mixed_r = chain(true);
     const size_t es = ggml_element_size(mixed), nb_out = ggml_nbytes(mixed);   // f16 mixed: the float vectors below hold raw bytes
-    ggml_set_output(mixed);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, mixed);
+    ggml_cgraph * gr = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gr, mixed_r);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
     if (!buf) { fprintf(stderr, "FAIL: alloc\n"); return 1; }
 
@@ -677,16 +657,15 @@ static int run_shape(ggml_backend_t be, const shape & sh, bool fusion) {
     ggml_backend_tensor_set(xb, xv.data(), 0, xv.size() * sizeof(ggml_fp16_t));
 
     std::vector<float> out_on(sh.n_embd * sh.nt), out_off(sh.n_embd * sh.nt), out_pert(sh.n_embd * sh.nt);
-    auto run = [&](const char * knob, std::vector<float> & out, uint64_t & n) {
-        set_vk_knob("GGML_VK_HC_UP_MIX", knob);
+    auto run = [&](ggml_cgraph * g, ggml_tensor * t, std::vector<float> & out, uint64_t & n) {
         g_reset();
-        ggml_backend_graph_compute(be, gf);
+        ggml_backend_graph_compute(be, g);
         n = g_count(sh.gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G");
-        ggml_backend_tensor_get(mixed, out.data(), 0, nb_out);
+        ggml_backend_tensor_get(t, out.data(), 0, nb_out);
     };
     uint64_t n_on = 0, n_off = 0, n_p = 0;
-    run("1", out_on, n_on);
-    run("0", out_off, n_off);
+    run(gf, mixed, out_on, n_on);
+    run(gr, mixed_r, out_off, n_off);
     int fails = 0;
     const bool eq = memcmp(out_on.data(), out_off.data(), nb_out) == 0;
     size_t ndiff = 0; for (size_t i = 0; i < out_on.size(); ++i) ndiff += memcmp((const char *) out_on.data() + i * es, (const char *) out_off.data() + i * es, es) != 0;
@@ -698,7 +677,7 @@ static int run_shape(ggml_backend_t be, const shape & sh, bool fusion) {
                 (long long) sh.n_embd, (long long) sh.nt, (unsigned long long) n_on, (unsigned long long) n_off, want_fused ? 1 : 0); fails++; }
     // positive control: one perturbed input must change the fused output (the comparison can fail)
     lv[0] += 0.5f; ggml_backend_tensor_set(lo, lv.data(), 0, lv.size() * sizeof(float));
-    run("1", out_pert, n_p);
+    run(gf, mixed, out_pert, n_p);
     if (memcmp(out_on.data(), out_pert.data(), nb_out) == 0) { fprintf(stderr, "FAIL: positive control, a perturbed input left the output unchanged\n"); fails++; }
     printf("%s %s%s n_embd=%lld nt=%lld k=%lld pad=%lld: byte-equal=%s fused dispatches on/off=%llu/%llu control=%s\n", fails ? "FAIL" : "ok", sh.gate16 ? "f16-gate" : "f32-gate", sh.mix16 ? " f16-mix" : "",
            (long long) sh.n_embd, (long long) sh.nt, (long long) sh.k, (long long) sh.pad, eq ? "yes" : "NO",
@@ -774,7 +753,6 @@ int main(int argc, char ** argv) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     g_count = (fusion_count_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_count");
     g_reset = (fusion_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_reset");
-    g_env_reload = (void (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_env_reload");
     if (!g_count || !g_reset) {
         printf("FAIL: no dispatch census counters\n");
         return 1;
