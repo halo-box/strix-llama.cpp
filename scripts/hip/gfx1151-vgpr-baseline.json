@@ -81,7 +81,7 @@
     "im2col": 4,
     "lightning-indexer": 32,
     "mean": 39,
-    "mmb": 318,
+    "mmb": 240,
     "mmf-instance-ncols_1": 144,
     "mmf-instance-ncols_10": 144,
     "mmf-instance-ncols_11": 144,
@@ -160,5 +160,5 @@
     "upscale": 4,
     "wkv": 5
   },
-  "minimum_kernel_count": 8155
+  "minimum_kernel_count": 8084
 }
