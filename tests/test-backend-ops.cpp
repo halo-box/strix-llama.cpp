@@ -13173,6 +13173,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_f16b(t, 96, n, 256));
         }
     }
+    // shapes the XL gate's 1/16 margin (q8_0, k >= 2048) moves from the L to the XL tile (17 L waves vs 9 XL waves on 40 CUs), one
+    // with ragged m and n; the same m, n at k = 1024 and the q4_K ones keep the L tile
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int k : {1024, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_f16b(t, 3072, 6912, k));
+            test_cases.emplace_back(new test_mul_mat_f16b(t, 7744, 2561, k));
+        }
+    }
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_F16}) {
         for (int pad : {8, 128}) {
             test_cases.emplace_back(new test_mul_mat_f16b(t, 320, 64, 10240, pad));
@@ -16684,6 +16692,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], 2048, mk[1], {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat_cpy16(GGML_TYPE_Q8_0, 10240, 2048, 320));
+    // the same Flash-Next dense GEMMs with the f16 B the model feeds (the f16-B coopmat route, L / XL tiles), at ub 2048 / 4096 / 8192
+    for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144}, {640, 2560},
+                                                        {512, 2560}, {2560, 640}, {320, 10240}, {10240, 320} }) {
+        for (int n : {2048, 4096, 8192}) {
+            test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, mk[0], n, mk[1]));
+        }
+    }
+    // shapes the XL gate's margin moves from L to XL on 40 CUs (17..77 L waves; q8_0, k >= 2048); k = 1024 and q4_K keep L
+    for (auto mnk : std::vector<std::array<int64_t, 3>>{ {3072, 6912, 1024}, {7744, 2561, 1024}, {3072, 6912, 2048}, {7744, 2561, 2048},
+                                                         {12288, 1792, 2560}, {6144, 3584, 2560},
+                                                         {14336, 2048, 5120}, {17408, 1280, 5120}, {4096, 5376, 4096} }) {
+        for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+            test_cases.emplace_back(new test_mul_mat_f16b(t, mnk[0], mnk[1], mnk[2]));
+        }
+    }
     // Qwen3.8-27B UD-Q4_K_XL dense GEMMs at ub2048 with the f32 B the model feeds (the dense router's f16-coopmat path converts it
     // per call; op-level numbers taken with an f16 B miss that cost)
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K,   GGML_TYPE_F32, 17408, 2048, 5120,  {1, 1}, {1, 1}));
