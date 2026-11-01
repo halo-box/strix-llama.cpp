@@ -1748,6 +1748,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--ctx-checkpoint-snapshots"},
+        {"--no-ctx-checkpoint-snapshots"},
+        "recurrent models: take the checkpoint 4 tokens before the end of the prompt from rollback snapshots kept\n"
+        "during the last prompt pass, instead of decoding those 4 tokens in a separate pass (default: enabled)",
+        [](common_params & params, bool value) {
+            params.ctx_checkpoint_snapshots = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINT_SNAPSHOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
