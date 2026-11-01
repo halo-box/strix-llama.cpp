@@ -439,18 +439,6 @@ __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, siz
     }
 }
 
-#ifdef GGML_USE_TRELLIS
-// Trellis types have no MMQ kernel: without mmb their batched MUL_MAT_ID falls back to a host-synchronised
-// per-expert dequant + BLAS loop, so mmb takes them whenever ggml_cuda_mmb_supported_mmid() allows
-// (GGML_CUDA_MMB_TQ=0 disables, for A/B). Not on fused gate_up models: the gate_up exemption there keeps every
-// type but Q8_0 / IQ4_NL off mmb, so trellis experts in a fused gate_up model (and the down projection fed by
-// it) take that slow loop at batch >= 9. Lifting the exemption for trellis types needs a KLD measurement first.
-static bool mmb_tq_enabled() {
-    static const bool v = getenv("GGML_CUDA_MMB_TQ") ? atoi(getenv("GGML_CUDA_MMB_TQ")) != 0 : true;
-    return v;
-}
-#endif
-
 // every type mmb_decode_slice() handles
 static constexpr bool mmb_quant_type_any(ggml_type type) {
 #ifdef GGML_USE_TRELLIS
@@ -495,7 +483,7 @@ static constexpr bool mmb_quant_type_dense_supported(ggml_type type) {
 
 static bool mmb_quant_type_dense(ggml_type type) {
 #ifdef GGML_USE_TRELLIS
-    if (ggml_cuda_type_is_tq(type)) return mmb_tq_enabled();
+    if (ggml_cuda_type_is_tq(type)) return true;
 #endif
     return mmb_quant_type_dense_supported(type);
 }
@@ -525,9 +513,14 @@ static constexpr bool mmb_quant_type_routed_supported(ggml_type type) {
     }
 }
 
+// Trellis types have no MMQ kernel: without mmb their batched MUL_MAT_ID falls back to a host-synchronised
+// per-expert dequant + BLAS loop, so mmb takes them whenever ggml_cuda_mmb_supported_mmid() allows.
+// Not on fused gate_up models: the gate_up exemption there keeps every type but Q8_0 / IQ4_NL off mmb, so trellis
+// experts in a fused gate_up model (and the down projection fed by it) take that slow loop at batch >= 9.
+// Lifting the exemption for trellis types needs a KLD measurement first.
 static bool mmb_quant_type_routed(ggml_type type) {
 #ifdef GGML_USE_TRELLIS
-    if (ggml_cuda_type_is_tq(type)) return mmb_tq_enabled();
+    if (ggml_cuda_type_is_tq(type)) return true;
 #endif
     return mmb_quant_type_routed_supported(type);
 }
