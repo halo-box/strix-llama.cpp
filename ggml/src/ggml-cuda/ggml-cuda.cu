@@ -2927,6 +2927,15 @@ static ggml_cuda_graph::node_properties ggml_cuda_graph_node_props(const ggml_te
     return prop;
 }
 
+static bool ggml_cuda_graph_verify_uid() {
+#ifndef NDEBUG
+    return true;
+#else
+    static const bool verify = getenv("GGML_CUDA_GRAPH_VERIFY_UID") != nullptr;
+    return verify;
+#endif
+}
+
 // see docs/development/backend-scheduler.md
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
@@ -2940,16 +2949,16 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         }
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
-#ifndef NDEBUG
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            const ggml_cuda_graph::node_properties prop = ggml_cuda_graph_node_props(cgraph->nodes[i]);
-            if (memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
-                GGML_LOG_ERROR("%s: node %d (%s) changed while cgraph->uid stayed %llu\n",
-                        __func__, i, cgraph->nodes[i]->name, (unsigned long long) cgraph->uid);
-                GGML_ABORT("CUDA graph uid reused after node properties changed - see [TAG_CUDA_GRAPH_UID]");
+        if (ggml_cuda_graph_verify_uid()) {
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                const ggml_cuda_graph::node_properties prop = ggml_cuda_graph_node_props(cgraph->nodes[i]);
+                if (memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+                    GGML_LOG_ERROR("%s: node %d (%s) changed while cgraph->uid stayed %llu\n",
+                            __func__, i, cgraph->nodes[i]->name, (unsigned long long) cgraph->uid);
+                    GGML_ABORT("CUDA graph uid reused after node properties changed - see [TAG_CUDA_GRAPH_UID]");
+                }
             }
         }
-#endif
         return false;
     }
 
@@ -4772,6 +4781,19 @@ static bool ggml_cuda_mean4_ranges_overlap(const ggml_tensor * a, const ggml_ten
 static int ggml_cuda_match_qsa_expand(const ggml_cgraph * graph, int first, ggml_cuda_qsa_expand_args & args) {
     if (first + 19 >= graph->n_nodes) return 0;
     if (graph->nodes[first]->op != GGML_OP_CONT || !graph->nodes[first]->src[0] || graph->nodes[first]->src[0]->op != GGML_OP_TOP_K) return 0;
+    static const bool debug = getenv("GGML_QSA_EXPAND_DEBUG") != nullptr;
+    static int debug_left = 3;
+    auto reject = [&](int line) {
+        if (debug && debug_left-- > 0) {
+            fprintf(stderr, "qsa_expand: reject at line %d, node %d (%s)\n", line, first, graph->nodes[first]->name);
+            for (int j = 0; j < 22 && first + j < graph->n_nodes; ++j) {
+                const ggml_tensor * t = graph->nodes[first + j];
+                fprintf(stderr, "  [%2d] %-10s %-6s [%lld,%lld,%lld,%lld] %s\n", j, ggml_op_name(t->op), ggml_type_name(t->type),
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->name);
+            }
+        }
+        return 0;
+    };
     const ggml_op expected[] = {GGML_OP_CONT, GGML_OP_VIEW, GGML_OP_CPY, GGML_OP_ARGSORT,
         GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
         GGML_OP_CPY, GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_SCALE, GGML_OP_UNARY,
@@ -4779,24 +4801,24 @@ static int ggml_cuda_match_qsa_expand(const ggml_cgraph * graph, int first, ggml
     const ggml_tensor * n[21];
     for (int j = 0; j < 19; ++j) {
         n[j] = graph->nodes[first+j];
-        if (n[j]->op != expected[j]) return 0;
+        if (n[j]->op != expected[j]) return reject(__LINE__);
     }
     // the tail may arrive through a view (a strip of the tail input) or a reshape of the whole input
     const bool tail_view = graph->nodes[first+19]->op == GGML_OP_VIEW || graph->nodes[first+19]->op == GGML_OP_RESHAPE;
     const int node_count = tail_view ? 21 : 20;
-    if (first + node_count > graph->n_nodes) return 0;
+    if (first + node_count > graph->n_nodes) return reject(__LINE__);
     n[20] = graph->nodes[first+node_count-1];
-    if (n[20]->op != GGML_OP_CONCAT) return 0;
+    if (n[20]->op != GGML_OP_CONCAT) return reject(__LINE__);
     // the tail the concat reads: the scheduler may substitute an input copy for the graph's own view node (the tail
     // indices are a host input), so take the concat's actual source rather than nodes[first+19]
     n[19] = n[20]->src[1];
-    if (!n[19]) return 0;
+    if (!n[19]) return reject(__LINE__);
     auto source = [&](int node, int src, int producer) { return n[node]->src[src] == n[producer]; };
     for (const auto & edge : {std::array<int,3>{1,0,0}, {2,0,0}, {3,0,2}, {4,0,1}, {4,1,3},
             {5,0,4}, {6,0,5}, {7,1,6}, {8,0,7}, {9,0,8}, {10,0,9}, {12,0,11}, {12,1,5},
             {13,0,12}, {14,0,13}, {15,0,10}, {15,1,14}, {16,0,15}, {17,0,16}, {18,0,17},
             {20,0,18}}) {
-        if (!source(edge[0], edge[1], edge[2])) return 0;
+        if (!source(edge[0], edge[1], edge[2])) { if (debug) fprintf(stderr, "qsa_expand: edge n[%d]->src[%d] != n[%d] (is %s)\n", edge[0], edge[1], edge[2], n[edge[0]]->src[edge[1]] ? n[edge[0]]->src[edge[1]]->name : "null"); return reject(__LINE__); }
     }
     const auto * blocks = n[0]->src[0];
     const auto * scores = n[11]->src[0];
@@ -4806,7 +4828,7 @@ static int ggml_cuda_match_qsa_expand(const ggml_cgraph * graph, int first, ggml
             blocks->type != GGML_TYPE_I32 || scores->type != GGML_TYPE_F32 || cells->type != GGML_TYPE_I32 ||
             tail->type != GGML_TYPE_I32 || n[20]->type != GGML_TYPE_I32 ||
             ggml_get_op_params_i32(n[3],0) != GGML_SORT_ORDER_ASC ||
-            ggml_get_unary_op(n[14]) != GGML_UNARY_OP_STEP || ggml_get_op_params_i32(n[20],0) != 0) return 0;
+            ggml_get_unary_op(n[14]) != GGML_UNARY_OP_STEP || ggml_get_op_params_i32(n[20],0) != 0) return reject(__LINE__);
     auto shape = [](const ggml_tensor * t, int64_t a, int64_t b, int64_t c=1, int64_t d=1) {
         return t->ne[0]==a && t->ne[1]==b && t->ne[2]==c && t->ne[3]==d;
     };
@@ -4820,25 +4842,25 @@ static int ggml_cuda_match_qsa_expand(const ggml_cgraph * graph, int first, ggml
             !shape(n[9],4,512,nq,ns) || !shape(n[10],4,512,nq,ns) || !shape(n[11],1,nb,nq,ns) ||
             !shape(n[12],1,512,nq,ns) || !shape(n[13],1,512,nq,ns) || !shape(n[14],1,512,nq,ns) ||
             !shape(n[15],4,512,nq,ns) || !shape(n[16],4,512,nq,ns) || !shape(n[17],4,512,nq,ns) ||
-            !shape(n[18],2048,nq,1,ns) || !shape(n[20],2051,nq,1,ns)) return 0;
-    for (int j : {2,9,10,11,12,13,14,15,16}) if (n[j]->type != GGML_TYPE_F32) return 0;
-    for (int j : {0,1,3,4,5,6,7,8,17,18,19,20}) if (n[j]->type != GGML_TYPE_I32) return 0;
+            !shape(n[18],2048,nq,1,ns) || !shape(n[20],2051,nq,1,ns)) return reject(__LINE__);
+    for (int j : {2,9,10,11,12,13,14,15,16}) if (n[j]->type != GGML_TYPE_F32) return reject(__LINE__);
+    for (int j : {0,1,3,4,5,6,7,8,17,18,19,20}) if (n[j]->type != GGML_TYPE_I32) return reject(__LINE__);
     for (int j : {10,13,16}) {
-        if (ggml_get_op_params_f32(n[j],0) != 1.0f || ggml_get_op_params_f32(n[j],1) != (j==16 ? -1.0f : 1.0f)) return 0;
+        if (ggml_get_op_params_f32(n[j],0) != 1.0f || ggml_get_op_params_f32(n[j],1) != (j==16 ? -1.0f : 1.0f)) return reject(__LINE__);
     }
     for (const auto * t : {blocks,scores,cells,tail,n[20]}) {
-        if (!ggml_is_contiguous(t) || t->nb[0] != 4) return 0;
+        if (!ggml_is_contiguous(t) || t->nb[0] != 4) return reject(__LINE__);
     }
     if (n[1]->view_offs != 0 || n[11]->view_offs != 0 ||
             n[1]->nb[1] != 4 || n[1]->nb[2] != size_t(512)*4 ||
-            n[11]->nb[1] != 4 || n[11]->nb[2] != size_t(nb)*4) return 0;
+            n[11]->nb[1] != 4 || n[11]->nb[2] != size_t(nb)*4) return reject(__LINE__);
     int indices[21], count=0; ggml_op ops[21];
     for (int j=0;j<node_count;++j) {
         if (j==11 || (tail_view && j==19)) continue;
         indices[count]=first+j;ops[count++]=graph->nodes[first+j]->op;
     }
     const int outputs[] = {first+2,first+9,first+17,first+18,first+node_count-1};
-    if (!ggml_can_fuse_subgraph_ext(graph, indices, count, ops, outputs, 5)) return 0;
+    if (!ggml_can_fuse_subgraph_ext(graph, indices, count, ops, outputs, 5)) return reject(__LINE__);
     args = {blocks,scores,cells,tail,graph->nodes[first+2],graph->nodes[first+9],graph->nodes[first+17],graph->nodes[first+node_count-1]};
     return node_count-1;
 }

@@ -3008,6 +3008,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool mmid_mf = device->coopmat_rdna3_layout;
             const std::string mmid_mf_sfx = mmid_mf ? "_mf" : "";
 #define MMID_MF_SPV(base, acc) (mmid_mf ? base##_mf##acc##_cm1_len : base##acc##_cm1_len), (mmid_mf ? base##_mf##acc##_cm1_data : base##acc##_cm1_data)
+            // GGML_VK_MMID_B_FULL_LOG=1: per MUL_MAT_ID pf / REG_A tile, whether the shader's B_FULL condition (BN % loadstride_b == 0,
+            // loadstride_b = BLOCK_SIZE * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK as in mul_mm.comp) holds, so it drops the guard, or keeps it
+            auto b_full_log = [&](const std::vector<uint32_t>& wt, bool a) {
+                static const bool log = getenv("GGML_VK_MMID_B_FULL_LOG") != nullptr;
+                if (!log) return;
+                const uint32_t lsb = wt[0] * (a ? 8u : 1u) * (a ? 1u : 2u) / wt[3];
+                GGML_LOG_INFO("ggml_vulkan: MMID_B_FULL tile BLOCK %u BN %u BK %u %s: loadstride_b %u -> %s\n", wt[0], wt[2], wt[3],
+                              a ? "aligned" : "unaligned", lsb, (lsb != 0 && wt[2] % lsb == 0) ? "guard dropped" : "guard kept");
+            };
             // spec constant 17 (MMID_B_FULL): the B tile loads without the per-lane row guard (mul_mm.comp PF_B_GUARD). It needs
             // every row-id slot valid: ggml_vk_matmul_id always sets the row-id fill (push-constant bit 4).
             spec_fn_t mmid_pf_spec = [&](const std::vector<uint32_t>& wt, bool a) {
@@ -3016,6 +3025,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 while (spec.size() < 16) { spec.push_back(0); }                                                           // 14, 15 (REG_A off)
                 spec.push_back(0);                                                                                          // 16: MF_SKEW
                 spec.push_back(1u);                                                                                         // 17: MMID_B_FULL
+                b_full_log(wt, a);
                 return spec;
             };
             auto cm1_create_mmid_pf = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
@@ -3067,6 +3077,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     spec.push_back(3u);                                                                                        // 15: REG_A
                     spec.push_back(0);                                                                                         // 16: MF_SKEW
                     spec.push_back(1u);                                                                                        // 17: MMID_B_FULL
+                    b_full_log(wt, a);
                     return spec;
                 };
                 auto cm1_create_rega = [&](vk_matmul_pipeline_key key, const std::string& name, size_t len, const void* data, uint32_t pc) {
@@ -7185,6 +7196,7 @@ static void ggml_vk_matmul_id(
     // is the gate projection, else the up projection
     // bit 4: the row-id loader fills a partial tile's unused slots with token 0, so the
     // aligned B loads (whole BN tile) gather valid rows instead of stale ids; those rows are never stored
+    ggml_vk_path_census_add("MUL_MAT_ID_ROWID_FILL");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
                                               nei0, nei1, nbi1, ne11, n_as, row_ids_offset,
                                               fusion_flags | (glu_up && glu_acc_gate ? 8u : 0u) | 16u };
@@ -8969,6 +8981,16 @@ static int ggml_vk_match_qsa_score(const ggml_backend_vk_context * ctx, const st
         }
     }
     if (heads != H || last != idxs[count - 1]) {
+        static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+        static int n_dbg = 0;
+        if (dbg && reshape && n_dbg < 4) {
+            n_dbg++;
+            GGML_LOG_DEBUG("ggml_vulkan: QSA_SCORE no match at node %d (heads %d, bias %d):", node_idx, heads, *bias_out != nullptr);
+            for (int j = node_idx; j < std::min(node_idx + 16, cgraph->n_nodes); ++j) {
+                GGML_LOG_DEBUG(" %s", ggml_op_desc(cgraph->nodes[j]));
+            }
+            GGML_LOG_DEBUG("\n");
+        }
         *bias_out = nullptr;
         return 0;
     }
@@ -9282,22 +9304,58 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const uint64_t row_ids_offset = 1 + 2 * max_tiles;
     const uint64_t row_map_words = row_ids_offset + max_tiles * bn;
 
+    // PROBE (GGML_VK_MMID_PROBE=1): which mmid tile actually runs, and with how many threads.
+    static const char * mmid_probe_env = getenv("GGML_VK_MMID_PROBE");
+    if (mmid_probe_env && atoi(mmid_probe_env) != 0) {
+        static std::set<std::string> seen;
+        std::string key = pipeline->name + ":" + std::to_string(n_for_tile);
+        if (seen.insert(key).second) {
+            fprintf(stderr, "ggml_vulkan: mmid pipeline=%s n_for_tile=%u m=%u wg=(%u,%u,%u)\n",
+                    pipeline->name.c_str(), n_for_tile, (uint32_t)ne01,
+                    pipeline->wg_denoms[0], pipeline->wg_denoms[1], pipeline->wg_denoms[2]);
+        }
+    }
+
     // REG_A tile (register-direct A, 128x64, wave32) for the aligned iq3_xxs / iq4_nl expert GEMMs on the routed f16-B pf path
-    // where the selector takes the medium tile; d16 takes its pf d16 twin. There is no REG_A GLU twin.
+    // where the selector takes the medium tile; d16 takes its pf d16 twin. GGML_VK_FUSION_DEBUG=1 logs each distinct rejection.
     if ((src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_NL) && ggml_vk_mmid_rega_enabled(ctx->device)) {
-        // the same n_for_tile as the base pipeline: bn, max_tiles and the row map above are sized for that tile
-        if (!quantize_y && !glu && !qx_needs_dequant && aligned && ggml_vk_mm_prefetch_enabled(ctx->device) &&
-            ggml_vk_mmid_medium_tile(ctx, *mmp_map, ne01, n_for_tile)) {
+        static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+        static std::set<std::string> rega_said;
+        auto rega_reject = [&](const char * why) {
+            if (dbg && rega_said.insert(why).second) {
+                GGML_LOG_DEBUG("ggml_vulkan: MUL_MAT_ID REG_A not taken (%s m=%u n=%u k=%u experts=%u used=%u): %s\n", ggml_type_name(src0->type),
+                        (unsigned) ne01, (unsigned) nei1, (unsigned) ne10, (unsigned) ne02, (unsigned) nei0, why);
+            }
+        };
+        if (quantize_y) {
+            rega_reject("int8 MMQ route (ggml_vk_mmid_f16coopmat does not route this type, or the f16 cast is fused: d16 lives on MMQ)");
+        } else if (glu) {
+            rega_reject("GLU store requested (no REG_A GLU twin)");
+        } else if (qx_needs_dequant) {
+            rega_reject("A needs dequant");
+        } else if (!aligned) {
+            rega_reject("not aligned (k vs the tile's align, or m / n <= 8)");
+        } else if (!ggml_vk_mm_prefetch_enabled(ctx->device)) {
+            rega_reject("prefetch pipelines off");
+        } else if (!ggml_vk_mmid_medium_tile(ctx, *mmp_map, ne01, n_for_tile)) {
+            // the same n_for_tile as the base pipeline: bn, max_tiles and the row map above are sized for that tile
+            rega_reject("tile selector did not pick the medium tile for the rows per expert");
+        } else {
             const ggml_type tb = y_kernel_type;   // the B type this GEMM runs with (master's ggml_vk_mul_mat_b_type)
             const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, tb, (ggml_prec)dst->op_params[0]);
             vk_matmul_pipeline_key kr{src0->type, tb, true, f16acc, d16, false, true, true};
             auto itr = ctx->device->pipeline_matmul.find(kr);
             if (itr == ctx->device->pipeline_matmul.end() || itr->second.empty()) { kr.f16acc = !f16acc; itr = ctx->device->pipeline_matmul.find(kr); }
-            // the row map and max_tiles above are sized for the base tile's BN, and the REG_A K loop has no tail;
-            // the d16 twin also needs the router-weight binding
-            if (itr != ctx->device->pipeline_matmul.end() && !itr->second.empty() && itr->second[0].aligned &&
-                itr->second[0].aligned->wg_denoms[1] == bn && ne10 % itr->second[0].align == 0 &&
-                (!d16 || itr->second[0].aligned->parameter_count == 6)) {
+            if (itr == ctx->device->pipeline_matmul.end() || itr->second.empty()) {
+                rega_reject(d16 ? "no REG_A d16 pipeline for this (type, B type) key" : "no REG_A pipeline for this (type, B type) key: not created (shmem / acc support) or the B type differs");
+            } else if (!itr->second[0].aligned) {
+                rega_reject("REG_A pipeline has no aligned variant");
+            } else if (itr->second[0].aligned->wg_denoms[1] != bn || ne10 % itr->second[0].align != 0) {
+                // the row map and max_tiles above are sized for the base tile's BN, and the REG_A K loop has no tail
+                rega_reject("REG_A tile BN differs from the base tile, or k is not a multiple of its align");
+            } else if (d16 && itr->second[0].aligned->parameter_count != 6) {
+                rega_reject("REG_A d16 pipeline lacks the router-weight binding");
+            } else {
                 static bool rega_logged = false;
                 if (!rega_logged) { rega_logged = true; GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID REG_A tile engaged (%s m=%u n=%u k=%u)\n", ggml_type_name(src0->type), (unsigned) ne01, (unsigned) nei1, (unsigned) ne10); }
                 if (ggml_vk_dispatch_census_enabled()) {   // the per-type names build a string: only while the census counts
@@ -9324,6 +9382,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_path_census_add((std::string("MUL_MAT_ID_ALL:") + ggml_type_name(src0->type)).c_str());
         if (pipeline->name.find("_pf") != std::string::npos) {
             ggml_vk_path_census_add("MUL_MAT_ID_PF");
+            ggml_vk_path_census_add("MUL_MAT_ID_B_FULL");   // the pf / REG_A pipelines were built with spec constant 17 set
             ggml_vk_path_census_add((std::string("MUL_MAT_ID_PF:") + ggml_type_name(src0->type)).c_str());
             if (pipeline->name.find("_mf") != std::string::npos) {
                 ggml_vk_path_census_add("MUL_MAT_ID_MANUAL_FRAG");
@@ -10434,6 +10493,56 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
         return false;
     }
 
+    // ---- diagnostic: adjacent-token top-k overlap (GGML_VK_TOPK_OVERLAP=1) ---------------
+    // Decides whether a deduplicated union is worth building for the small-batch path. A
+    // speculative draft attends at adjacent POSITIONS, so overlap between adjacent prefill
+    // tokens is the same quantity and a plain deep prefill samples it thousands of times
+    // without needing a draft model. Reports |union| / (W * n_top_k) for window sizes W.
+    // Sampled, host-side, off by default; the readback would be far too costly otherwise.
+    {
+        static const char * ov_env = getenv("GGML_VK_TOPK_OVERLAP");
+        if (ov_env && ov_env[0] == '1') {
+            static std::mutex ov_mu;
+            static uint64_t   ov_seen = 0;
+            static std::map<uint32_t, std::pair<double, uint64_t>> ov_acc; // W -> {sum ratio, n}
+            std::lock_guard<std::mutex> lock(ov_mu);
+            if ((ov_seen++ % 32) == 0) {   // sample: this is a multi-MB readback
+                const uint32_t nb  = (uint32_t) q->ne[1];
+                const uint32_t tk  = (uint32_t) top_k->ne[0];
+                const int32_t  rng = (int32_t) (k->ne[1] - n_kv_raw);
+                std::vector<int32_t> idx((size_t) nb * tk);
+                vk_subbuffer sb = ggml_vk_tensor_subbuffer(ctx, top_k);
+                ggml_vk_buffer_read(sb.buffer, sb.offset, idx.data(), idx.size() * sizeof(int32_t));
+                for (uint32_t W : {2u, 4u, 8u}) {
+                    if (nb < W) continue;
+                    double sum = 0.0; uint64_t n = 0;
+                    for (uint32_t t0 = 0; t0 + W <= nb; t0 += W) {   // disjoint windows
+                        std::unordered_set<int32_t> u;
+                        uint64_t valid = 0;
+                        for (uint32_t t = t0; t < t0 + W; ++t) {
+                            for (uint32_t j = 0; j < tk; ++j) {
+                                const int32_t v = idx[(size_t) t * tk + j];
+                                if (v >= 0 && v < rng) { u.insert(v); ++valid; }
+                            }
+                        }
+                        if (valid) { sum += (double) u.size() / (double) valid; ++n; }
+                    }
+                    if (n) { auto & a = ov_acc[W]; a.first += sum; a.second += n; }
+                }
+                fprintf(stderr, "[topk-overlap] sample %llu (n_batch=%u, kv=%lld)\n",
+                        (unsigned long long) ov_seen, nb, (long long) k->ne[1]);
+                for (const auto & e : ov_acc) {
+                    const double r = e.second.first / (double) e.second.second;
+                    const double now   = (double) n_kv_raw + (double) e.first * tk;
+                    const double dedup = (double) n_kv_raw + r * (double) e.first * tk;
+                    fprintf(stderr, "[topk-overlap]   W=%u  union/selected=%.3f  (overlap %.1f%%)  "
+                                    "kv_c %.0f -> %.0f  projected small-batch gain %.1f%%\n",
+                            e.first, r, 100.0 * (1.0 - r), now, dedup, 100.0 * (1.0 - dedup / now));
+                }
+            }
+        }
+    }
+
     vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
     if (dequant_kv) {
         if (ctx->prealloc_size_x < kv_f16_sz) {
@@ -10791,6 +10900,28 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
                               (uint64_t) k->ne[1] >= 2ull * kv_c_est &&
                               (uint64_t) k->ne[1] >= (uint64_t) kv_c;
 
+        // GGML_VK_FA_UNION_STATS=N: report every Nth call (N=1 means every call) what the gate
+        // decided and on what measurement. The alternative is inferring engagement from a
+        // timing, which is how a sparse path gets credited for a run it never took.
+        //
+        // The period is a parameter because a fixed one is a way to miss the answer: a 64-token
+        // speculative decode over 25k of context produced ONE line at a period of 256, which
+        // said only that the first call was unseeded. Running totals rather than instants, so a
+        // single late line still reports whether the path engaged.
+        static const char * stats_env = getenv("GGML_VK_FA_UNION_STATS");
+        if (stats_env && stats_env[0] != '\0' && stats_env[0] != '0') {
+            static uint64_t calls = 0, taken = 0;
+            const uint64_t  period = std::max(1ull, (unsigned long long) atoll(stats_env));
+            taken += worth_it ? 1 : 0;
+            if ((calls++ % period) == 0) {
+                fprintf(stderr, "[fa-union] n_kv=%lld n_kv_raw=%d n_batch=%u cand=%u  "
+                                "union/cand=%.3f  kv_c %u -> est %u  %s   (%llu/%llu taken)\n",
+                        (long long) k->ne[1], n_kv_raw, n_batch, n_cand, (double) ctx->fa_union_est_ratio[n_batch],
+                        kv_c, kv_c_est, worth_it ? "UNION" : "declined",
+                        (unsigned long long) taken, (unsigned long long) calls);
+            }
+        }
+
         if (!worth_it) {
             // Nothing is known about this batch shape, or the last count says compaction does
             // not pay. Either way the count is what settles it, so produce one: the scan is a
@@ -10938,6 +11069,53 @@ union_unavailable:;
         pc, { kv_c, 1, ns });
     ggml_vk_sync_buffers(ctx, subctx);
     ctx->prealloc_y_need_sync = true;
+
+    // ---- diagnostic: measure real top-k overlap between the query tokens ----------------
+    // GGML_VK_TOPK_OVERLAP=1. Off by default and never touched on the hot path. Answers the
+    // one question that decides whether a deduplicated union is worth building: this path
+    // gathers n_batch*n_top_k rows, a union would gather |union| rows, and the op's cost is
+    // linear in that count (measured: 204.4 / 205.7 / 205.5 us per row at batch 2 / 4 / 8).
+    // Needs a real model - synthetic top-k selections say nothing about real overlap, which
+    // is exactly how the mul_mat_id large-tile probe misled once before.
+    static const char * overlap_env = getenv("GGML_VK_TOPK_OVERLAP");
+    if (overlap_env && overlap_env[0] == '1' && n_batch > 1) {
+        static std::mutex        ov_mutex;
+        static uint64_t          ov_calls = 0, ov_selected = 0, ov_union = 0;
+        static std::map<uint32_t, std::pair<uint64_t, uint64_t>> ov_by_batch; // n_batch -> {selected, union}
+        const size_t n_idx = (size_t) n_batch * top_k->ne[0];
+        std::vector<int32_t> idx(n_idx);
+        vk_subbuffer top_sb = ggml_vk_tensor_subbuffer(ctx, top_k);
+        ggml_vk_buffer_read(top_sb.buffer, top_sb.offset, idx.data(), n_idx * sizeof(int32_t));
+
+        const int32_t range = (int32_t) (k->ne[1] - n_kv_raw);
+        std::unordered_set<int32_t> uni;
+        uint64_t valid = 0;
+        for (size_t i = 0; i < n_idx; ++i) {
+            const int32_t v = idx[i];
+            if (v >= 0 && v < range) { uni.insert(v); ++valid; }
+        }
+        std::lock_guard<std::mutex> lock(ov_mutex);
+        ov_calls++; ov_selected += valid; ov_union += uni.size();
+        auto & e = ov_by_batch[n_batch];
+        e.first += valid; e.second += uni.size();
+        if ((ov_calls % 256) == 0) {
+            fprintf(stderr, "[topk-overlap] calls=%llu  selected=%llu  union=%llu  "
+                            "union/selected=%.3f  => a dedup union would gather %.1f%% fewer compressed rows\n",
+                    (unsigned long long) ov_calls, (unsigned long long) ov_selected,
+                    (unsigned long long) ov_union,
+                    ov_selected ? (double) ov_union / (double) ov_selected : 0.0,
+                    ov_selected ? 100.0 * (1.0 - (double) ov_union / (double) ov_selected) : 0.0);
+            for (const auto & kv : ov_by_batch) {
+                const double ratio = kv.second.first ? (double) kv.second.second / (double) kv.second.first : 0.0;
+                // projected op speedup uses the measured linear cost model on kv_c
+                const double now  = (double) n_kv_raw + (double) kv.first * (double) top_k->ne[0];
+                const double dedup = (double) n_kv_raw + ratio * (double) kv.first * (double) top_k->ne[0];
+                fprintf(stderr, "[topk-overlap]   n_batch=%u  union/selected=%.3f  "
+                                "kv_c %.0f -> %.0f  projected op gain %.1f%%\n",
+                        kv.first, ratio, now, dedup, 100.0 * (1.0 - dedup / now));
+            }
+        }
+    }
 
     st.active = true;
     st.kv_c = kv_c;
@@ -11226,6 +11404,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         tuning_params.disable_subgroups = false;
         tuning_params.limit_occupancy_shmem = 0;
         workgroups_y = (uint32_t)neq2 / mr_h;
+        static const bool fa_mr_log = [] {
+            const char * e = getenv("GGML_VK_FA_MR_LOG");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        if (fa_mr_log) {
+            GGML_LOG_INFO("ggml_vulkan: multi-row FA N=%u KV=%u hs=%u heads=%u H=%u gqa=%u mask=%d mask_opt=%d contig=%d\n",
+                          N, KV, HSK, (uint32_t)neq2, mr_h, qk_ratio_mr, mask != nullptr, (int)use_mask_opt, (int)use_dequant_kv);
+        }
     }
 
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
@@ -17149,15 +17335,32 @@ static bool ggml_vk_gdn_norm_f16_wiring(const ggml_cgraph * g, int i) {
 
 // RMS_NORM_MUL_SIGMUL_CPY (short rows, after Strata's GDN_NOY): the GDN output norm writes only the f16 B operand of ssm_out,
 // matched as a subgraph whose one output is the CPY (rows packed, outer strides may be padded).
+// GGML_VK_FUSION_DEBUG=1: the first time each reason rejects a chain wired as the GDN norm f16 pattern, say so
+static bool ggml_vk_gdn_norm_f16_reject(const char * why) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    static std::set<std::string> seen;
+    if (dbg && seen.insert(why).second) {
+        GGML_LOG_DEBUG("ggml_vulkan: RMS_NORM_MUL_SIGMUL_CPY not taken: %s\n", why);
+    }
+    return false;
+}
+
 static bool ggml_vk_can_fuse_gdn_norm_f16(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_vk_gdn_norm_f16_wiring(cgraph, node_idx)) {
+        static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+        if (dbg && node_idx + 4 < cgraph->n_nodes && cgraph->nodes[node_idx]->op == GGML_OP_RMS_NORM &&
+            cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
+            GGML_LOG_DEBUG("ggml_vulkan: RMS_NORM at node %d not wired as the GDN norm f16 chain: %s %s %s %s %s\n", node_idx,
+                    ggml_op_desc(cgraph->nodes[node_idx]), ggml_op_desc(cgraph->nodes[node_idx + 1]), ggml_op_desc(cgraph->nodes[node_idx + 2]),
+                    ggml_op_desc(cgraph->nodes[node_idx + 3]), ggml_op_desc(cgraph->nodes[node_idx + 4]));
+        }
         return false;
     }
     if (ctx->device->pipeline_rms_norm_mul_sigmul_small_f32_f16 == nullptr) {
-        return false;
+        return ggml_vk_gdn_norm_f16_reject("no short-row norm pipeline");
     }
     if (!ggml_can_fuse_subgraph(cgraph, node_idx, gdn_norm_f16_pattern, { node_idx + 4 })) {
-        return false;
+        return ggml_vk_gdn_norm_f16_reject("an intermediate node has another reader (or is an output)");
     }
     const ggml_tensor * rms  = cgraph->nodes[node_idx];
     const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
@@ -17168,20 +17371,20 @@ static bool ggml_vk_can_fuse_gdn_norm_f16(const ggml_backend_vk_context * ctx, c
     const ggml_tensor * gamma = mul->src[0] == rms ? mul->src[1] : mul->src[0];
     const ggml_tensor * z     = sig->src[0];
     if (x->type != GGML_TYPE_F32 || x->ne[0] > 256 || !ggml_is_contiguous_rows(x) || ctx->do_add_rms_partials) {
-        return false;
+        return ggml_vk_gdn_norm_f16_reject("x is not f32 short packed rows (or add-rms partials are on)");
     }
     if (gamma->type != GGML_TYPE_F32 || !ggml_can_repeat(gamma, mul) || mul->type != GGML_TYPE_F32 ||
         z->type != GGML_TYPE_F32 || mul2->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(z) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(mul2) ||
         !ggml_are_same_shape(rms, mul) || !ggml_are_same_shape(z, mul2) || !ggml_are_same_shape(mul, mul2) ||
         get_misalign_bytes(ctx, z) != 0) {
-        return false;
+        return ggml_vk_gdn_norm_f16_reject("gamma / z / the MULs are not f32, packed and dst-shaped");
     }
     // the f16 destination: rows packed, outer strides free (a padded view); the kernel stores through dst strides
     if (cpy->type != GGML_TYPE_F16 || !ggml_are_same_shape(cpy, mul2) || cpy->nb[0] != sizeof(ggml_fp16_t) ||
         cpy->nb[1] != cpy->ne[0] * sizeof(ggml_fp16_t) || cpy->nb[2] < cpy->nb[1] * cpy->ne[1] ||
         cpy->nb[3] < cpy->nb[2] * cpy->ne[2]) {
-        return false;
+        return ggml_vk_gdn_norm_f16_reject("the f16 destination's rows are not packed");
     }
     return true;
 }
@@ -17951,6 +18154,14 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
 // decode and short verify ubatches keep the concat: nothing to save there, and the reader scan stays off that path
 static constexpr int64_t ssm_conv_direct_min_tokens = 8;
 
+static bool ggml_vk_ssm_conv_direct_reject(const char * why, int node) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    if (dbg) {
+        fprintf(stderr, "ggml_vulkan: direct ssm conv not matched at node %d: %s\n", node, why);
+    }
+    return false;
+}
+
 static bool ggml_vk_node_reads(const ggml_tensor * t, const ggml_tensor * root) {
     for (int s = 0; s < GGML_MAX_SRC; ++s) {
         if (t->src[s] && (t->src[s] == root || t->src[s]->view_src == root)) {
@@ -18009,7 +18220,7 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
     const ggml_tensor * tr = cc->src[1];
     if (!st || !tr || st->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || tr->op != GGML_OP_TRANSPOSE ||
         !tr->view_src || tr->view_offs != 0) {
-        return false;
+        return ggml_vk_ssm_conv_direct_reject("concat srcs are not (state, transpose(x))", i);
     }
     const int64_t T = tr->ne[0];
     const int64_t C = tr->ne[1];
@@ -18018,16 +18229,16 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
     // x^T must be a plain transpose of the whole contiguous x: token stride C, channel stride 1, sequence stride C*T
     if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x) != C * T * S || tr->ne[3] != 1 ||
         tr->nb[0] != (size_t) C * sizeof(float) || tr->nb[1] != sizeof(float) || tr->nb[2] != (size_t) C * T * sizeof(float)) {
-        return false;
+        return ggml_vk_ssm_conv_direct_reject("x layout", i);
     }
     if (T < ssm_conv_direct_min_tokens) {
         return false;
     }
     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != S || st->ne[3] != 1 || !ggml_is_contiguous(st)) {
-        return false;
+        return ggml_vk_ssm_conv_direct_reject("state layout", i);
     }
     if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != S || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) {
-        return false;
+        return ggml_vk_ssm_conv_direct_reject("concat layout", i);
     }
 
     // one SSM_CONV reads the whole concat; everything else must read only tail columns
@@ -18040,7 +18251,7 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
         }
         if (t->op == GGML_OP_SSM_CONV && ggml_vk_conv_whole(t->src[0], cc)) {
             if (conv >= 0) {
-                return false;
+                return ggml_vk_ssm_conv_direct_reject("two convs read the concat", n);
             }
             conv = n;
             continue;
@@ -18049,40 +18260,40 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
             continue; // shape plumbing into the conv
         }
         if (!ggml_vk_conv_tail_reader(t, cc, 3, tail_from)) {
-            return false;
+            return ggml_vk_ssm_conv_direct_reject("the concat has a reader that is neither the conv nor a tail copy", n);
         }
     }
     if (conv < 0 || conv + 1 >= cgraph->n_nodes) {
-        return false;
+        return ggml_vk_ssm_conv_direct_reject("no conv in this graph", i);
     }
     const ggml_tensor * cv = cgraph->nodes[conv];
     const ggml_tensor * w  = cv->src[1];
     if (cv->type != GGML_TYPE_F32 || !w || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != C || !ggml_is_contiguous(w) ||
         cv->ne[0] != C || cv->ne[1] != T || cv->ne[2] != S || cv->ne[3] != 1 || (cv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-        return false;
+        return ggml_vk_ssm_conv_direct_reject("conv shape", conv);
     }
     // the conv output is never written, so the SiLU right after it must be its only reader
     ggml_tensor * su = cgraph->nodes[conv + 1];
     if (su->op != GGML_OP_UNARY || ggml_get_unary_op(su) != GGML_UNARY_OP_SILU || su->src[0] != cv || su->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(su) || !ggml_are_same_shape(su, cv) || (cv->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
         (su->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-        return false;
+        return ggml_vk_ssm_conv_direct_reject("no SILU right after the conv", conv);
     }
     for (int n = conv + 2; n < cgraph->n_nodes; ++n) {
         if (ggml_vk_node_reads(cgraph->nodes[n], cv)) {
-            return false;
+            return ggml_vk_ssm_conv_direct_reject("the conv output has another reader", n);
         }
     }
 
     if (runtime) {
         for (const ggml_tensor * t : { (const ggml_tensor *) x, st, w, (const ggml_tensor *) cc, (const ggml_tensor *) su }) {
             if (!t->buffer || get_misalign_bytes(ctx, t) != 0) {
-                return false;
+                return ggml_vk_ssm_conv_direct_reject("unallocated or misaligned tensor", i);
             }
         }
         for (const ggml_tensor * t : { (const ggml_tensor *) x, st, w, (const ggml_tensor *) cc }) {
             if (ggml_vk_tensors_overlap(t, su, false)) {
-                return false;
+                return ggml_vk_ssm_conv_direct_reject("the SiLU output overlaps an input", conv + 1);
             }
         }
         // x and the state are read at the conv, later than the concat that names them: nothing in between may
@@ -18093,7 +18304,7 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
                 continue;
             }
             if (ggml_vk_tensors_overlap(t, x, false) || ggml_vk_tensors_overlap(t, st, false)) {
-                return false;
+                return ggml_vk_ssm_conv_direct_reject("x or the state is overwritten before the conv", n);
             }
         }
     }
@@ -18253,7 +18464,7 @@ static int32_t find_first_set(uint32_t x) {
 }
 
 // Dispatch census, a test hook (not a stable API): fused dispatches per "LABEL/n" and path decisions per "path:NAME". Off until a
-// test calls "ggml_backend_debug_dispatch_census_reset"; off, one relaxed load.
+// test calls "ggml_backend_debug_dispatch_census_reset" (or GGML_VK_DISPATCH_CENSUS_LOG=1, printed at exit); off, one relaxed load.
 static std::atomic<bool> vk_dispatch_census_on {false};
 static std::mutex vk_dispatch_census_mutex;
 static std::map<std::string, uint64_t> vk_dispatch_census;
@@ -18350,6 +18561,25 @@ static uint64_t ggml_backend_vk_dispatch_census_count(const char * name) {
         }
     }
     return n;
+}
+
+// runs at exit (GGML_VK_DISPATCH_CENSUS_LOG=1), when the application's log callback may already be gone: plain stderr
+static void ggml_vk_dispatch_census_print() {
+    std::lock_guard<std::mutex> lock(vk_dispatch_census_mutex);
+    fprintf(stderr, "ggml_vulkan: dispatch census:");
+    for (const auto & it : vk_dispatch_census) {
+        fprintf(stderr, " %s=%llu", it.first.c_str(), (unsigned long long) it.second);
+    }
+    fprintf(stderr, "\n");
+}
+
+// GGML_VK_DISPATCH_CENSUS_LOG=1: count from load and print the census once at exit (engagement checks in llama-bench and the like)
+static void ggml_vk_dispatch_census_log_init() {
+    const char * e = getenv("GGML_VK_DISPATCH_CENSUS_LOG");
+    if (e != nullptr && atoi(e) != 0) {
+        vk_dispatch_census_on.store(true, std::memory_order_relaxed);
+        atexit(ggml_vk_dispatch_census_print);
+    }
 }
 
 // MUL_MAT+CPY(f16): a quantized int8 MMQ GEMM whose only consumer is an f16 cast stores f16 straight into the cast's destination
@@ -18559,11 +18789,21 @@ static bool ggml_vk_can_fuse_mmid_pair_glu(ggml_backend_vk_context * ctx, const 
     if (!ctx->device->coopmat_rdna3_layout || i + (f32 ? 2 : 4) >= cgraph->n_nodes) {
         return false;
     }
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
     const ggml_tensor * mm_a = cgraph->nodes[i];
     const int ti = mm_a->op == GGML_OP_MUL_MAT_ID ? ggml_vk_mmid_glu_type_idx(mm_a->src[0]->type) : -1;
     if (ti < 0 || !ctx->device->pipeline_mmid_glu[ti][f32][0]) {
         return false;
     }
+    auto reject = [&](const char * why) {
+        if (dbg) {
+            static std::set<std::string> said;
+            if (said.insert(why).second) {
+                GGML_LOG_DEBUG("ggml_vulkan: MUL_MAT_ID_PAIR_SWIGLU not matched at node %d (%s): %s\n", i, mm_a->name, why);
+            }
+        }
+        return false;
+    };
     // the f32 chain has no casts: the SWIGLU reads the GEMM outputs (cp_* then name the GEMMs themselves)
     const ggml_tensor * cp_a = cgraph->nodes[i + 1];
     const ggml_tensor * mm_b = cgraph->nodes[i + (f32 ? 1 : 2)];
@@ -18572,50 +18812,50 @@ static bool ggml_vk_can_fuse_mmid_pair_glu(ggml_backend_vk_context * ctx, const 
     if (f32) {
         cp_a = mm_a;
         if (mm_b->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU) {
-            return false;
+            return reject("node order is not MUL_MAT_ID, MUL_MAT_ID, GLU");
         }
     } else if (cp_a->op != GGML_OP_CPY || mm_b->op != GGML_OP_MUL_MAT_ID || cp_b->op != GGML_OP_CPY || glu->op != GGML_OP_GLU) {
-        return false;
+        return reject("node order is not MUL_MAT_ID, CPY, MUL_MAT_ID, CPY, GLU");
     }
     // plain SwiGLU only: no swapped halves, no clamp (SWIGLU_OAI), separate gate and up tensors
     if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 || glu->src[1] == nullptr ||
         !((glu->src[0] == cp_a && glu->src[1] == cp_b) || (glu->src[0] == cp_b && glu->src[1] == cp_a))) {
-        return false;
+        return reject(f32 ? "not a split SWIGLU of the two GEMMs" : "not a split SWIGLU of the two casts");
     }
     if (f32 ? (mm_a->type != GGML_TYPE_F32 || mm_b->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm_a) || !ggml_is_contiguous(mm_b))
             : (!ggml_vk_cpy16_of(cp_a, mm_a) || !ggml_vk_cpy16_of(cp_b, mm_b))) {
-        return false;
+        return reject(f32 ? "GEMM outputs are not contiguous f32" : "casts are not contiguous f16 copies of the GEMMs");
     }
     const ggml_tensor * w_a = mm_a->src[0];
     const ggml_tensor * w_b = mm_b->src[0];
     const ggml_tensor * x   = mm_a->src[1];
     const ggml_tensor * ids = mm_a->src[2];
     if (w_b->type != w_a->type || !ggml_are_same_shape(w_a, w_b) || mm_b->src[1] != x || mm_b->src[2] != ids) {
-        return false;
+        return reject("gate and up differ in type, shape, activations or ids");
     }
     const int64_t K = w_a->ne[0], M = w_a->ne[1], n_used = ids->ne[0], T = ids->ne[1];
     if (K % 256 != 0 || M % 128 != 0 || !ggml_vk_dim01_contiguous(w_a) || !ggml_vk_dim01_contiguous(w_b) ||
         w_a->nb[2] != w_b->nb[2] || w_a->nb[2] != (size_t) M * w_a->nb[1] ||
         ggml_nbytes(w_a) + get_misalign_bytes(ctx, w_a) > ctx->device->properties.limits.maxStorageBufferRange ||
         ggml_nbytes(w_b) + get_misalign_bytes(ctx, w_b) > ctx->device->properties.limits.maxStorageBufferRange) {
-        return false;
+        return reject("weight shape (K % 256, M % 128, contiguous experts)");
     }
     if ((x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16) || x->ne[0] != K || x->ne[2] != T ||
         (x->ne[1] != 1 && x->ne[1] != n_used) || x->ne[3] != 1 || x->nb[0] != ggml_type_size(x->type) ||
         x->nb[1] % 16 != 0 || x->nb[2] % 16 != 0) {
-        return false;
+        return reject("activations (f32/f16 rows, 16-byte strides, broadcast over the slots)");
     }
     if (ids->type != GGML_TYPE_I32 || T <= 8 || T > 65535 || n_used > 65535) {
-        return false;
+        return reject("ids (i32, 9..65535 tokens: the mat-vec path takes <= 8)");
     }
     if (glu->type != (f32 ? GGML_TYPE_F32 : GGML_TYPE_F16) || !ggml_is_contiguous(glu) || glu->ne[0] != M || glu->ne[1] != n_used || glu->ne[2] != T) {
-        return false;
+        return reject(f32 ? "SWIGLU output is not a contiguous f32 [M, n_used, T]" : "SWIGLU output is not a contiguous f16 [M, n_used, T]");
     }
     // the launch reads the weights, the activations and the ids while it writes the SWIGLU output, and graph_compute's fused-write
     // overlap check skips leaf sources (op NONE): a scheduler-allocated graph can place the output over a dead leaf
     for (const ggml_tensor * src : { w_a, w_b, x, ids }) {
         if (glu->buffer && src->buffer && ggml_vk_tensors_overlap(src, glu, false)) {
-            return false;
+            return reject("the SWIGLU output overlaps a weight, the activations or the ids");
         }
     }
     // the GEMM results and the casts are read only inside the fusion (a cast also lists itself as src[1])
@@ -18623,18 +18863,18 @@ static bool ggml_vk_can_fuse_mmid_pair_glu(ggml_backend_vk_context * ctx, const 
         if ((mm_a->flags & GGML_TENSOR_FLAG_OUTPUT) || (mm_b->flags & GGML_TENSOR_FLAG_OUTPUT) ||
             ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
             (glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            return false;
+            return reject("a GEMM output has another reader or is an output");
         }
     } else if ((mm_a->flags & GGML_TENSOR_FLAG_OUTPUT) || (mm_b->flags & GGML_TENSOR_FLAG_OUTPUT) || (cp_a->flags & GGML_TENSOR_FLAG_OUTPUT) ||
         (cp_b->flags & GGML_TENSOR_FLAG_OUTPUT) || cp_a->view_src || cp_b->view_src || cp_a->src[1] != cp_a || cp_b->src[1] != cp_b ||
         ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 2) != 1 ||
         ggml_node_get_use_count(cgraph, i + 1) != 2 || ggml_node_get_use_count(cgraph, i + 3) != 2 ||
         (glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-        return false;
+        return reject("an intermediate has another reader or is an output");
     }
     if (get_misalign_bytes(ctx, w_a) % 16 != 0 || get_misalign_bytes(ctx, w_b) % 16 != 0 || get_misalign_bytes(ctx, x) % 16 != 0 ||
         get_misalign_bytes(ctx, glu) % (f32 ? 16 : 8) != 0) {
-        return false;
+        return reject("buffer offsets not 16-byte (weights, activations, f32 output) / 8-byte (f16 output) aligned");
     }
     return true;
 }
@@ -19199,6 +19439,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                             }
                             if (!found) {
                                 need_disable = true;
+                                static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+                                if (dbg && fusion_string) {
+                                    GGML_LOG_DEBUG("ggml_vulkan: %s disabled at node %d: source %s (%s) of fused node %d overlaps the output %s\n",
+                                            fusion_string, i, src->name, ggml_op_desc(src), k, dst->name);
+                                }
                             }
                         }
                     }
@@ -21302,6 +21547,8 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
     };
     try {
         ggml_vk_instance_init();
+        static const bool census_log = (ggml_vk_dispatch_census_log_init(), true);
+        GGML_UNUSED(census_log);
         return &reg;
     } catch (const vk::SystemError& e) {
         VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: System error: " << e.what());
