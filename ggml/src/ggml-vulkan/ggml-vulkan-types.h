@@ -269,10 +269,11 @@ struct vk_matmul_pipeline_key {
     bool xl = false;    // the 256x256 XL tile tier of the pf variant (aligned only, ggml_vk_mm_xl_ok)
     bool hcmix = false; // the int8 MMQ hc up GEMM with the gated hc pre in its epilogue (HC_UP_MIX, mul_mmq_cm1.comp HC_EPI)
     bool qsa = false;   // the f32 x f32 KHR coopmat GEMM with the QSA scorer epilogue (QSA_SCORE, mul_mm.comp QSA_EPI)
+    bool hcd = false;   // the int8 MMQ tiles for a few-row, long-K GEMM (the qwen4exp hc down, GGML_VK_HC_W8A8)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl, hcmix, qsa)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl, o.hcmix, o.qsa);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl, hcmix, qsa, hcd)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl, o.hcmix, o.qsa, o.hcd);
     }
 };
 
