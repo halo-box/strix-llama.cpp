@@ -1248,6 +1248,18 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     }
 }
 
+bool llm_arch_supports_rs_snapshot(const llm_arch & arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // these models pick weights, routing or input meaning per ubatch based on token vs embd input
 bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
     switch (arch) {
