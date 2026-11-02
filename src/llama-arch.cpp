@@ -1312,3 +1312,9 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
             return true;
     }
 }
+
+bool llm_arch_moe_f16(const llm_arch & arch) {
+    // qwen35moe: KLD 0.003924 vs ubatch floor 0.004012 (Qwen3.6-35B-A3B UD-Q4_K_XL, wiki 2 x 4096), pp2048 +6.8% / +5.9% d0 / 8k
+    // (gfx1151 RADV, ABBA n=2, 2026-10-18)
+    return arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35MOE;
+}
