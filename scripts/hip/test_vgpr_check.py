@@ -31,7 +31,7 @@ class TestVgprCheck(unittest.TestCase):
     def setUp(self):
         self.kernels = checker.parse_assembly(ASSEMBLY, 'gfx1151')
         self.units = {'sample': 1}
-        self.budgets = {'_Z6kernelv': dict(self.kernels['_Z6kernelv'], reason='compiler_change')}
+        self.budgets = {'_Z6kernelv': {**self.kernels['_Z6kernelv'], 'reason': 'compiler_change'}}
         self.baseline = {
             'schema_version': 1,
             'architecture': 'gfx1151',
