@@ -24204,7 +24204,8 @@ static int ggml_vk_gdn_out_norm_structural(const ggml_cgraph * cgraph, int gi) {
     const ggml_tensor * g = cgraph->nodes[gi];
     const ggml_tensor * v = g->src[2];
     const int64_t S_v = v->ne[0], H = v->ne[1], T = v->ne[2], S = v->ne[3];
-    if (S_v != 128 || (g->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    // under ggml_vk_gdn_chunk_min tokens the GDN runs the sequential kernel, which has no fold (decode graphs)
+    if (S_v != 128 || T < ggml_vk_gdn_chunk_min || (g->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return -1;
     }
     const int end = std::min(cgraph->n_nodes - 4, gi + 48);
@@ -24267,6 +24268,16 @@ static void ggml_vk_gdn_out_norm_prepass(ggml_backend_vk_context * ctx, const gg
     ctx->gdn_on.clear();
     ctx->gdn_z16.clear();
     if (!ggml_vk_gdn_out_norm_enabled() || ctx->device->disable_fusion || ctx->device->pipeline_gdn_chunk_scan_on == nullptr) {
+        return;
+    }
+    // only a GDN with enough tokens takes the chunk form: a decode graph has none and skips the node map below, which is built
+    // on the CPU before the first submit of every token (as in ggml_vk_gdn_qk_norm_prepass)
+    bool any = false;
+    for (int i = 0; i < cgraph->n_nodes && !any; ++i) {
+        const ggml_tensor * g = cgraph->nodes[i];
+        any = g->op == GGML_OP_GATED_DELTA_NET && g->src[2]->ne[2] >= ggml_vk_gdn_chunk_min;
+    }
+    if (!any) {
         return;
     }
     std::unordered_map<const ggml_tensor *, int> idx;
