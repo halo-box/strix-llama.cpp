@@ -125,7 +125,7 @@ layout (constant_id = 9) const uint TK = 16;
 layout (constant_id = 10) const uint WARP = 32;
 layout (constant_id = 11) const uint DEVICE_ARCH = 0; // vk_device_architecture (ggml-vulkan.cpp)
 #define VK_ARCH_AMD_RDNA4 5u
-layout (constant_id = 12) const uint PACKSTORE = 1; // 0: per-element f32 stores (GGML_VK_MMQ_PACKSTORE=0)
+layout (constant_id = 12) const uint PACKSTORE = 1; // 0: per-element f32 stores
 
 #define BK 32
 #ifdef MUL_MAT_ID

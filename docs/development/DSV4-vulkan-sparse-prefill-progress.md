@@ -92,7 +92,7 @@ GGML_VK_PERF_LOGGER=1 ./build/bin/test-backend-ops perf \
 Results:
 
 - old scalar sparse kernel: 61.42 ms, 1.68 TFLOPS of useful active-set work
-- ordinary dense FA diagnostic (`GGML_VK_FA_TOPK=0`): 255.97 ms, about 8.7 TFLOPS over the full dense work
+- ordinary dense FA (past diagnostic run): 255.97 ms, about 8.7 TFLOPS over the full dense work
 - final cooperative sparse kernel: 32.55 ms, 3.17 TFLOPS of useful active-set work
 
 The residual `FLASH_ATTN_EXT` interval after the sparse timestamp is only about 4-7 us. The cost is inside the shader, not dispatch or surrounding synchronization.
@@ -126,8 +126,6 @@ Files changed:
 - `ggml/src/ggml-vulkan/ggml-vulkan.cpp`
   - Adds the cooperative sparse pipeline when the device supports the required 16x16x16 f16/f32 cooperative matrix shape.
   - Selects it by capability and keeps the scalar shader as fallback.
-  - Adds `GGML_VK_FA_TOPK=0` to force ordinary dense FA for diagnostics.
-  - Adds `GGML_VK_FA_TOPK_CM=0` to force the old scalar sparse shader for A/B tests.
   - Adds sparse sub-operation timestamps through the existing profiler.
 
 The path is capability-based, not hardcoded to Strix Halo. The current sparse shape gate remains DeepSeek V4-specific. Devices without the required cooperative matrix support keep the correct scalar sparse or dense fallback.
@@ -160,7 +158,7 @@ The test uses the existing FA tolerance of NMSE <= `5e-4`. No NaN or Inf failure
 
 Still desirable before broader submission:
 
-- compare model logits on controlled prompts between `GGML_VK_FA_TOPK_CM=0` and the default cooperative path
+- compare model logits on controlled prompts between the old scalar sparse shader and the default cooperative path
 
 ## Canonical 32k results
 
@@ -232,22 +230,6 @@ Do not optimize TOP_K first. At 32k it is only about 74 ms total. Lightning Inde
 
 ## Useful diagnostics
 
-Force old scalar sparse path:
-
-```bash
-GGML_VK_FA_TOPK_CM=0 GGML_VK_PERF_LOGGER=1 ./build/bin/test-backend-ops perf \
-  -b Vulkan0 -o FLASH_ATTN_EXT \
-  -p 'kv=32768,nb=512,n_kv_raw=1024,n_top_k=512,sinks=0'
-```
-
-Force ordinary dense FA:
-
-```bash
-GGML_VK_FA_TOPK=0 GGML_VK_PERF_LOGGER=1 ./build/bin/test-backend-ops perf \
-  -b Vulkan0 -o FLASH_ATTN_EXT \
-  -p 'kv=32768,nb=512,n_kv_raw=1024,n_top_k=512,sinks=0'
-```
-
 Default cooperative sparse path:
 
 ```bash
@@ -256,11 +238,11 @@ GGML_VK_PERF_LOGGER=1 ./build/bin/test-backend-ops perf \
   -p 'kv=32768,nb=512,n_kv_raw=1024,n_top_k=512,sinks=0'
 ```
 
-Always run these sequentially. Do not run a compiler concurrently on this APU.
+Always run benchmarks sequentially. Do not run a compiler concurrently on this APU.
 
 ## Experimental raw-prefix split prototype
 
-An uncommitted follow-up prototype was tested after commit `24c7ead76cc1a9631fa1b42b0bfa53a15169e1ba`. Check `git status` before continuing. It was initially tested with `GGML_VK_FA_TOPK_SPLIT=1`. After the successful 32k run, the split path was changed to default-on for a llama-server coherence test. Set `GGML_VK_FA_TOPK_SPLIT=0` to restore the single cooperative sparse kernel.
+An uncommitted follow-up prototype was tested after commit `24c7ead76cc1a9631fa1b42b0bfa53a15169e1ba`. Check `git status` before continuing. It was initially tested behind an opt-in switch. After the successful 32k run, the split path was changed to default-on for a llama-server coherence test.
 
 Stage profiling on the previously used 19,200-row sparse shape (`kv=19200,nb=2048,n_kv_raw=2304,n_top_k=512,sinks=0`) showed:
 
@@ -284,7 +266,7 @@ The exact-shape microbenchmark improved from 222.19 ms to 111.33 ms. Its steady 
 Correctness validation:
 
 ```bash
-GGML_VK_FA_TOPK_SPLIT=1 ./build/bin/test-backend-ops test \
+./build/bin/test-backend-ops test \
   -b Vulkan0 -o FLASH_ATTN_EXT -p 'n_top_k='
 
 ./build/bin/test-backend-ops test -b Vulkan0 -o FLASH_ATTN_EXT
@@ -295,7 +277,7 @@ Results were 8/8 sparse top-K cases and 13,296/13,296 complete Vulkan FA cases a
 Canonical 32k prototype command:
 
 ```bash
-GGML_VK_FA_TOPK_SPLIT=1 GGML_VK_PERF_LOGGER=1 ./build/bin/llama-bench \
+GGML_VK_PERF_LOGGER=1 ./build/bin/llama-bench \
   -m ~/Projects/docker/localLLaMA/models/models--unsloth--DeepSeek-V4-Flash-0731-GGUF/snapshots/109848da2469efe1f1aab9e11acea08a065ccd4f/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf \
   -r 1 -d 32768 -p 2048 -ub 2048 -fa 1 -n 0 \
   > /tmp/dsv4-vulkan-split-32k.log 2>&1

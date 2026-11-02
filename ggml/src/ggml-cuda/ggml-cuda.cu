@@ -3778,8 +3778,7 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     };
 
     const int64_t K = ggml_get_op_params_i32(gdn, 0);
-    if (K < n_tokens || K > 8 || n_conv_cpy != K ||
-        ((n_tokens > 1 || K > 1) && getenv("GGML_CUDA_DISABLE_GDN_ROLLBACK") != nullptr)) {
+    if (K < n_tokens || K > 8 || n_conv_cpy != K) {
         return 0;
     }
 
@@ -4370,7 +4369,7 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
     a.score = src; a.dst = (ggml_tensor *) prev; a.heads = (int) H;
     a.vis_tails = nullptr; a.vis_starts = nullptr;
     for (auto & l : a.vis_leafs) { l = nullptr; }
-    if (getenv("GGML_CUDA_DISABLE_IDX_VIS") != nullptr || ns != 1) return count;
+    if (ns != 1) return count;
 
     auto vis_reject = [&]() {
         for (auto & l : a.vis_leafs) { l = nullptr; }
@@ -4485,7 +4484,7 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
 
 // MUL_MAT(keys F32, q) -> RESHAPE [M, 4, nq] -> RELU/head sum (+ visibility): the scorer writes the summed scores
 static int ggml_cuda_match_idx_gemm(ggml_backend_cuda_context & ctx, const ggml_cgraph * g, int i, ggml_cuda_idx_relu_sum_args & a) {
-    if (getenv("GGML_CUDA_DISABLE_IDX_GEMM") != nullptr || i + 3 >= g->n_nodes) return 0;
+    if (i + 3 >= g->n_nodes) return 0;
     const ggml_tensor * mm = g->nodes[i];
     if (mm->op != GGML_OP_MUL_MAT || mm->src[2] != nullptr || mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm)) return 0;
     const ggml_tensor * rs = g->nodes[i + 1];
@@ -4991,8 +4990,7 @@ static int ggml_cuda_gdn_qk_norm_match(const ggml_cgraph * cgraph, const int i, 
 // One predicate for the fusion in ggml_cuda_try_fuse and the reorder in graph_optimize, so nodes are only moved
 // when the fusion can fire (use counts are checked by each caller).
 static bool ggml_cuda_moe_sgma_enabled() {
-    static const bool on = getenv("GGML_CUDA_DISABLE_MOE_SGMA") == nullptr && getenv("GGML_CUDA_DISABLE_SGMA") == nullptr &&
-        !(getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION")));
+    static const bool on = !(getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION")));
     return on;
 }
 
@@ -5026,13 +5024,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 0;
     }
 
-    // debugging aid: only fuse nodes with GGML_CUDA_FUSE_MIN_NODE <= i < GGML_CUDA_FUSE_MAX_NODE
-    static const int fuse_min_node = getenv("GGML_CUDA_FUSE_MIN_NODE") ? std::atoi(getenv("GGML_CUDA_FUSE_MIN_NODE")) : 0;
-    static const int fuse_max_node = getenv("GGML_CUDA_FUSE_MAX_NODE") ? std::atoi(getenv("GGML_CUDA_FUSE_MAX_NODE")) : INT_MAX;
-    if (i < fuse_min_node || i >= fuse_max_node) {
-        return 0;
-    }
-
     ggml_tensor * node = cgraph->nodes[i];
 
     // chains already computed by an earlier fused kernel (the chunked GDN writes its gated output norm itself)
@@ -5059,7 +5050,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // prefill shared-expert merge: SIGMOID(gate [1, T]) -> MUL(shexp [n, T], gate) -> ADD(moe_out, .) in one kernel
     if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && i + 2 < cgraph->n_nodes &&
-            node->type == GGML_TYPE_F32 && node->ne[0] == 1 && ggml_nrows(node) >= 2 && getenv("GGML_CUDA_DISABLE_SGMA") == nullptr) {
+            node->type == GGML_TYPE_F32 && node->ne[0] == 1 && ggml_nrows(node) >= 2) {
         ggml_tensor * mul = cgraph->nodes[i + 1];
         ggml_tensor * add = cgraph->nodes[i + 2];
         const ggml_tensor * gate = node->src[0];
@@ -5086,7 +5077,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // The second node's output is written early, so it must not overlap anything the nodes in between touch.
     if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32 && node->src[0]->ne[1] <= 64 && node->src[1]->type == GGML_TYPE_F32 &&
             node->src[1]->ne[1] * node->src[1]->ne[2] >= 512 && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
-            getenv("GGML_CUDA_DISABLE_F32_DUAL") == nullptr && ggml_cuda_mmb_supported_mm(*cuda_ctx, node->src[0], node->src[1], node)) {
+            ggml_cuda_mmb_supported_mm(*cuda_ctx, node->src[0], node->src[1], node)) {
         for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8; ++j) {
             ggml_tensor * n2 = cgraph->nodes[j];
             if (!(n2->op == GGML_OP_MUL_MAT && n2->src[1] == node->src[1] && n2->src[0]->type == GGML_TYPE_F32 &&
@@ -5115,8 +5106,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // chunked GDN prefill: RMS_NORM(view of the GDN output) -> MUL(w) -> MUL(sigmoid(z)) is applied by the scan kernel
     // as its epilogue (rms_rows_f32<true> math), so the pre-norm output never round-trips through memory
-    if (node->op == GGML_OP_GATED_DELTA_NET && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
-            getenv("GGML_CUDA_DISABLE_GDN_OUTNORM") == nullptr) {
+    if (node->op == GGML_OP_GATED_DELTA_NET && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         const ggml_tensor * v = node->src[2];
         int ix = -1;
         for (int j = i + 1; j < cgraph->n_nodes && j <= i + 16; ++j) {
@@ -5207,8 +5197,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
             // chunked GDN prefill: if the SiLU output is read only through the q/k/v views of one chunk-eligible
             // GATED_DELTA_NET (q/k through the fused L2 norms), the chunk kernels compute the conv themselves
-            if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) && getenv("GGML_CUDA_DISABLE_GDN_CONV") == nullptr &&
-                    getenv("GGML_CUDA_DISABLE_GDN_QKNORM") == nullptr && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1] == gm.out) {
+            if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                    i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1] == gm.out) {
                 const ggml_tensor * out = gm.out;
                 int i_rms = -1;
                 for (int k = i + 2; k < cgraph->n_nodes && k <= i + 24; ++k) {
@@ -5326,8 +5316,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // RDNA3.5 decode: consecutive single-column MUL_MATs that read the same activation vector (plain Q8_0/F32
     // matvecs, or a [mul_mat, mul_mat, glu] gate/up pair) are launched as one grouped kernel. The segments are
     // mutually independent, so the launch position of the first one is valid for all of them.
-    if (getenv("GGML_CUDA_DISABLE_MMV_GROUP") == nullptr &&
-            node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_mmv_group_seg_ok(node->src[0], node->src[1])) {
+    if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_mmv_group_seg_ok(node->src[0], node->src[1])) {
         const ggml_tensor * y = node->src[1];
         ggml_cuda_mmv_group_seg segs[GGML_CUDA_MMV_GROUP_MAX];
         int out_nodes[GGML_CUDA_MMV_GROUP_MAX];
@@ -5389,8 +5378,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // qwen4exp chunked Gated DeltaNet prefill: q/k L2 norms folded into the chunk kernels (ggml_cuda_gdn_qk_norm_match)
-    if (node->op == GGML_OP_RMS_NORM && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
-            getenv("GGML_CUDA_DISABLE_GDN_QKNORM") == nullptr) {
+    if (node->op == GGML_OP_RMS_NORM && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         int ig; const ggml_tensor * q_raw; const ggml_tensor * k_raw; float eps, mul;
         const int last = ggml_cuda_gdn_qk_norm_match(cgraph, i, ig, q_raw, k_raw, eps, mul);
         if (last > 0) {
@@ -5454,7 +5442,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 // validated for the L2_NORM spelling. For the qwen4exp RMS_NORM+SCALE representation keep the
                 // plain fused kernel, which applies the gated norm itself: the chain fusion is the win and this
                 // avoids feeding the gate matvec tensors from a chain shape it was not exercised with.
-                if (getenv("GGML_CUDA_DISABLE_GDN_GATE") == nullptr && !args.qk_rms_scale && args.n_tokens == 1 &&
+                if (!args.qk_rms_scale && args.n_tokens == 1 &&
                         sig && mul && mm && sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID &&
                         mul->op == GGML_OP_MUL && mm->op == GGML_OP_MUL_MAT && mm->src[2] == nullptr &&
                         (mm->src[1] == mul || (ggml_cuda_is_view_or_noop(mm->src[1]) && mm->src[1]->view_src == mul &&
@@ -5474,7 +5462,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return mm_idx - i;
                 }
                 // otherwise the norm kernel of the fused step also applies the sigmoid(z) gate (one launch less)
-                if (getenv("GGML_CUDA_DISABLE_GDN_NORMGATE") == nullptr && sig && mul &&
+                if (sig && mul &&
                         sig->op == GGML_OP_UNARY && ggml_get_unary_op(sig) == GGML_UNARY_OP_SIGMOID && mul->op == GGML_OP_MUL &&
                         ((mul->src[0] == sig && mul->src[1] == norm_out) || (mul->src[1] == sig && mul->src[0] == norm_out)) &&
                         sig->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) &&
@@ -5816,8 +5804,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // qwen4exp IQ4_NL routed down projection followed by the 10-expert weighted sum. Compute all selected
     // experts for one output row in a wave and apply their routing weights immediately, avoiding the
     // [n_embd, n_used] intermediate and its separate reduction launch.
-    if (getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN") == nullptr &&
-            node->op == GGML_OP_MUL_MAT_ID && i + 20 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+    if (node->op == GGML_OP_MUL_MAT_ID && i + 20 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
             !ggml_cuda_mmb_claims(*cuda_ctx, node)) {
         constexpr int n_used = 10;
         constexpr int n_ops  = 2 + n_used + (n_used - 1);
@@ -6599,10 +6586,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         int n_ops = ggml_cuda_match_hc_mix(cgraph, i, args, ops);
         // The fused reduction replays the unfused mul/add roundings exactly (hc_mix_reduce_f32 uses
         // explicitly rounded mul/add in the same stream order), so it is bit-identical at decode too and
-        // removes ~6 tiny kernels per mix per layer (sigmoid/mul/3x add/scale). HC_NO_MIX_FUSE=1 disables.
-        if (n_ops > 0 && args.dst->ne[1] == 1 && getenv("HC_NO_MIX_FUSE")) {
-            n_ops = 0;
-        }
+        // removes ~6 tiny kernels per mix per layer (sigmoid/mul/3x add/scale).
         if (n_ops > 0) {
             int node_idxs[5 + 2 * 15 + 1];
             for (int j = 0; j < n_ops; ++j) {
@@ -6909,18 +6893,9 @@ static void ggml_cuda_ovl_fork(ggml_backend_cuda_context & ctx, const int side) 
 }
 
 // graph_optimize part: find the regions, reorder each into [S][M], keep everything they touch allocated through `end`
-int ggml_cuda_ovl_mask() {
-    static const int v = getenv("GGML_CUDA_OVL") ? atoi(getenv("GGML_CUDA_OVL")) : 15;
-    return v;
-}
-
 static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg, ggml_backend_graph_optimize_params * params) {
     if (params == nullptr || params->add_alloc_dep == nullptr ||
             !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx->device].cc)) {   // tuned and verified on gfx1151 only
-        return;
-    }
-    const int mask = ggml_cuda_ovl_mask();
-    if ((mask & 7) == 0) {
         return;
     }
     auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
@@ -6947,12 +6922,12 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
         if (sfx == nullptr) {
             continue;
         }
-        if ((mask & 1) && name_is(t, "z", sfx)) {
+        if (name_is(t, "z", sfx)) {
             const int b = find(i + 1, i + 80, [](const ggml_tensor * u) { return u->op == GGML_OP_GATED_DELTA_NET; });
             if (b > i + 1) {
                 cands.push_back({ i, b, { t }, 1, true });
             }
-        } else if ((mask & 2) && name_is(t, "ffn_gate", sfx)) {
+        } else if (name_is(t, "ffn_gate", sfx)) {
             const int iu = find(i - 2, i + 4,   [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "ffn_up", sfx); });
             const int ig = find(i + 1, i + 80,  [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "shared_expert_gate", sfx); });
             const int b  = find(i + 1, i + 120, [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL && name_is(u, "ffn_moe_weighted", sfx); });
@@ -6962,7 +6937,7 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
             if (iu >= 0 && ig >= 0 && b >= 0 && ig < b && iu < b && !scaled(cg->nodes[b]->src[0]) && !scaled(cg->nodes[b]->src[1])) {
                 cands.push_back({ std::min(i, iu), b, { t, cg->nodes[iu], cg->nodes[ig] }, 2, false });
             }
-        } else if ((mask & 4) && name_is(t, "Vcur", sfx)) {
+        } else if (name_is(t, "Vcur", sfx)) {
             const int iq = find(i - 16, i,     [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "Qcur_full", sfx); });
             const int ik = find(i + 1, i + 8,  [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "Kcur", sfx); });
             const int b  = find(i + 1, i + 48, [](const ggml_tensor * u) { return u->op == GGML_OP_FLASH_ATTN_EXT; });
@@ -7641,7 +7616,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     // Move the reduction nodes down to just before the SIGMOID so the fusion computes reduction + merge in one kernel.
     // Only done when that fusion can fire (same predicate) and no node in between reads a reduction node or writes
     // (in place / through a view) memory the reduction reads. Runs before allocation, so buffer lifetimes follow the new
-    // order. GGML_CUDA_DISABLE_MOE_SGMA=1 or GGML_CUDA_DISABLE_FUSION=1 keeps the original order.
+    // order. GGML_CUDA_DISABLE_FUSION=1 keeps the original order.
     if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) && ggml_cuda_moe_sgma_enabled()) {
         auto root = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
         // readers of t in this graph (the use-count table is not guaranteed on a split's graph view)
@@ -8291,9 +8266,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 // The chunked GDN can elide the conv/SiLU and read x, history and taps at the GDN node instead.
                 // Keeping them only through the SiLU allows the scheduler to reuse x (and corrupt q/k/v) before
                 // gdn_chunk_prep_kernel reads it. Restrict the longer lifetime to the fused prefill pattern.
-                if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
-                        getenv("GGML_CUDA_DISABLE_GDN_CONV") == nullptr &&
-                        getenv("GGML_CUDA_DISABLE_GDN_QKNORM") == nullptr) {
+                if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
                     int i_rms = -1;
                     for (int j = gm.conv_idx + 2; j < cgraph->n_nodes && j <= gm.conv_idx + 24; ++j) {
                         const ggml_tensor * t = cgraph->nodes[j];

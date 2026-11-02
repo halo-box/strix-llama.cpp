@@ -977,10 +977,10 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-template <int DV, int ncols1, int ncols2>
+template <int DV, int ncols1, int ncols2, bool stream_k>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool use_sparse,
     const int warp_size = WARP_SIZE, const bool async_kv_preload = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
@@ -1271,7 +1271,7 @@ void launch_fattn(
     );
     CUDA_CHECK(cudaGetLastError());
 
-    if (stream_k) {
+    if constexpr (stream_k) {
         if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
             // Optimized fixup: nblocks_stream_k is a multiple of ntiles_dst, launch one block per tile.
             const int nblocks_sk  = (int)blocks_num.x;
@@ -1307,7 +1307,8 @@ void launch_fattn(
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
-    } else if (parallel_blocks > 1) {
+    }
+    if (!stream_k && parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);

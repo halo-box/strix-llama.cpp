@@ -195,7 +195,7 @@ GOOD: an in-scope, measured PR
 
 Title:  vulkan : chunk batched mat-vec at slow column counts on RDNA3.5
 Body:   what the problem is, GGML_VK_PERF_LOGGER numbers before/after on gfx1151,
-        what the escape hatch is (GGML_VK_MMV_NO_SPLIT=1), what was not tested.
+        what the escape hatch is, what was not tested.
         "Written by <agent>; benchmarks run on a Ryzen AI Max+ 395."
 
 BAD: unmeasured, out of scope, or overstated

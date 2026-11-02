@@ -734,7 +734,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
     }
 
     // Register-prefetch variants of the KHR coopmat matmul (mul_mm_pf_funcs.glsl), f16 and f32 B, selected at init by
-    // GGML_VK_MM_PREFETCH; dense and subgroup MUL_MAT_ID only
+    // ggml_vk_mm_prefetch_enabled; dense and subgroup MUL_MAT_ID only
     if (coopmat && !coopmat2 && !dot2 && matmul_id_type != MatMulIdType::DEFAULT) {
         for (const auto& tname : std::vector<std::string>{"q8_0", "q5_0", "q3_k", "q6_k", "q4_k", "q5_k", "iq4_xs", "iq3_xxs", "iq4_nl"}) {
             const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
@@ -755,7 +755,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
                 string_to_spv(shader_name + "_" + tname + "_f16_pf_d16", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}, {"MMID_SCALE", "1"}}), fp16, coopmat, coopmat2, f16acc);
                 string_to_spv(shader_name + "_" + tname + "_f32_pf_d16", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}, {"MMID_SCALE", "1"}}), fp16, coopmat, coopmat2, f16acc);
                 // manual-fragment twins ("_mf", COOPMAT_MANUAL_FRAG: mul_mm.comp BUF_MANUAL) of the four subgroup MUL_MAT_ID pf
-                // variants; the host takes them only after the RDNA3 fragment layout probe passed (GGML_VK_MMID_MANUAL_FRAG)
+                // variants; the host takes them only after the RDNA3 fragment layout probe passed
                 string_to_spv(shader_name + "_" + tname + "_f16_pf_mf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"COOPMAT_MANUAL_FRAG", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
                 string_to_spv(shader_name + "_" + tname + "_f32_pf_mf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"COOPMAT_MANUAL_FRAG", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
                 string_to_spv(shader_name + "_" + tname + "_f16_pf_d16_mf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"COOPMAT_MANUAL_FRAG", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}, {"MMID_SCALE", "1"}}), fp16, coopmat, coopmat2, f16acc);
@@ -840,7 +840,7 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
-                // multi-row prefill flash attention (GGML_VK_FA_MR): f32 accumulation only
+                // multi-row prefill flash attention: f32 accumulation only
                 if (!f16acc) {
                     string_to_spv("flash_attn_f32_f16_mr", "flash_attn_cm1_mr.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);

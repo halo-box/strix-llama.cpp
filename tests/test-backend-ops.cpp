@@ -53,9 +53,6 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
-// set in perf mode only: GGML_TEST_QUANT_INIT_BLOCKS must not make eval tensors repeat (identical experts hide routing bugs)
-static bool g_allow_quant_init_blocks = false;
-
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
@@ -108,21 +105,10 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         }
 
         std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
-        // GGML_TEST_QUANT_INIT_BLOCKS=<n>: quantize only the first n blocks and repeat them over the
-        // tensor (perf runs of slow encoders, e.g. the trellis types on 512-expert MoE shapes). Perf mode only.
-        static const size_t fast_init_blocks = [] {
-            const char * e = g_allow_quant_init_blocks ? getenv("GGML_TEST_QUANT_INIT_BLOCKS") : nullptr;
-            return e ? (size_t) strtoull(e, nullptr, 10) : (size_t) 0;
-        }();
-        const size_t n_blocks_all = nels / ggml_blck_size(tensor->type);
-        const bool fast_init = fast_init_blocks > 0 && n_blocks_all > fast_init_blocks;
         {
             // parallel quantization by block
             size_t blck_size = ggml_blck_size(tensor->type);
             size_t n_blocks = nels / blck_size;
-            if (fast_init) {
-                n_blocks = fast_init_blocks;
-            }
 
             auto quantize_thread = [&](size_t start, size_t end) {
                 ggml_quantize_chunk(tensor->type, data.data(), dataq.data(),
@@ -147,12 +133,6 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
                 for (auto & t : tasks) {
                     t.get();
                 }
-            }
-        }
-        if (fast_init) {
-            const size_t chunk = ggml_row_size(tensor->type, fast_init_blocks * ggml_blck_size(tensor->type));
-            for (size_t off = chunk; off < dataq.size(); off += chunk) {
-                memcpy(dataq.data() + off, dataq.data(), std::min(chunk, dataq.size() - off));
             }
         }
         ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
@@ -542,12 +522,7 @@ static int64_t dispatch_census_count(ggml_backend_t backend, const char * name) 
     return count ? (int64_t) count(name) : -1;
 }
 
-// a default-on backend knob (unset or non-zero) and an opt-in test switch (set and non-zero)
-static bool env_knob_on(const char * name) {
-    const char * e = getenv(name);
-    return e == nullptr || atoi(e) != 0;
-}
-
+// an opt-in test switch (set and non-zero)
 static bool env_opt_in(const char * name) {
     const char * e = getenv(name);
     return e != nullptr && atoi(e) != 0;
@@ -4251,10 +4226,10 @@ struct test_hc_post_norm : public test_case {
             return true;   // the unpadded cases check values only; not asked, or the device cannot fuse
         }
         struct { const char * name; bool want; } checks[] = {
-            { mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY", env_knob_on("GGML_VK_FUSE_HC_POST_NORM") },
+            { mode == 1 ? "HC_POST_GATE_NORM_CPY" : "RMS_NORM_MUL_CPY", true },
             // the readers take the row stride at prefill sizes (more tokens than the mat-vec columns)
-            { "path:MUL_MAT_ROWSTRIDE_B",     tokens > 8 && env_knob_on("GGML_VK_ROWSTRIDE") },
-            { "path:MUL_MAT_VEC_ROWSTRIDE_A", tokens > 8 && env_knob_on("GGML_VK_ROWSTRIDE") },
+            { "path:MUL_MAT_ROWSTRIDE_B",     tokens > 8 },
+            { "path:MUL_MAT_VEC_ROWSTRIDE_A", tokens > 8 },
         };
         for (const auto & c : checks) {
             const int64_t n = dispatch_census_count(backend, c.name);
@@ -4359,12 +4334,12 @@ struct test_mul_mat_f16b : public test_case {
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         // GGML_VK_TEST_REQUIRE_F16B_NATIVE=1 asserts the q8_0 x f16-B GEMM took the f16-B coopmat path (K >= 1024,
-        // N >= 32, GGML_VK_DENSE_F16B_NATIVE default list); none of the other shapes / types may take it
+        // N >= 32, ggml_vk_dense_f16b_native); none of the other shapes / types may take it
         const bool req_native = engagement_required(backend, "GGML_VK_TEST_REQUIRE_F16B_NATIVE");
-        static const bool native_on = [] { const char * e = getenv("GGML_VK_DENSE_F16B_NATIVE"); return e == nullptr || std::string(e) != "0"; }();
+        static const bool native_on = true;
         const int64_t native = dispatch_census_count(backend, "path:MUL_MAT_F16B_NATIVE");
         if (req_native && native >= 0) {
-            // the counter counts only GEMMs the native list routed (not the GGML_VK_DENSE_F16COOPMAT dense router)
+            // the counter counts only GEMMs the native list routed (not the ggml_vk_dense_f16coopmat dense router)
             const bool want = k >= 1024 && n >= 32 && native_on && type_a == GGML_TYPE_Q8_0;
             if ((native > 0) != want) {
                 msg = "MUL_MAT_F16B_NATIVE dispatches: " + std::to_string(native) + (want ? " (expected the f16-B path)" : " (expected int8 / mat-vec)");
@@ -4375,7 +4350,7 @@ struct test_mul_mat_f16b : public test_case {
             return true;   // unpadded; a mat-vec width (B is the vector side there and is copied); not asked
         }
         const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_ROWSTRIDE_B");
-        const bool knob_on = env_knob_on("GGML_VK_ROWSTRIDE");
+        const bool knob_on = true;
         if ((c > 0) != knob_on) {
             msg = "MUL_MAT_ROWSTRIDE_B dispatches: " + std::to_string(c) + (knob_on ? " (B was copied to packed rows)" : " (the knob is off)");
             return false;
@@ -4565,7 +4540,7 @@ struct test_indexer_head_sum : public test_case {
 };
 
 // qwen4exp QSA indexer scorer: MUL_MAT(pooled keys F32 [128, blocks], q [128, 4*queries]) -> RESHAPE -> RELU -> head sum
-// (-> compact visibility). On RDNA3.5 the whole chain is one fused GEMM unless GGML_CUDA_DISABLE_IDX_GEMM is set.
+// (-> compact visibility). On RDNA3.5 the whole chain is one fused GEMM.
 struct test_indexer_score : public test_case {
     const int blocks, queries;
     const bool vis, bounded;
@@ -4706,11 +4681,11 @@ struct test_gdn_norm_f16 : public test_case {
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_NORM", "RMS_NORM_MUL_SIGMUL_CPY")) {
             return true;
         }
-        const bool fuse = env_knob_on("GGML_VK_GDN_NORM_F16") && env_knob_on("GGML_VK_FUSE_NORM_EXTRA") && env_knob_on("GGML_VK_NORM_SMALL");
+        const bool fuse = true;
         struct { const char * name; int64_t want_min, want_max; } checks[] = {
             { "RMS_NORM_MUL_SIGMUL_CPY", fuse ? 1 : 0, fuse ? 1 : 0 },
-            { "path:MUL_MAT_ROWSTRIDE_B", pad > 0 && ne[2] > 8 && env_knob_on("GGML_VK_ROWSTRIDE") ? 1 : 0,
-                                          pad > 0 && ne[2] > 8 && env_knob_on("GGML_VK_ROWSTRIDE") ? 1 : 0 },
+            { "path:MUL_MAT_ROWSTRIDE_B", pad > 0 && ne[2] > 8 ? 1 : 0,
+                                          pad > 0 && ne[2] > 8 ? 1 : 0 },
         };
         for (const auto & c : checks) {
             const int64_t n = dispatch_census_count(backend, c.name);
@@ -6675,7 +6650,7 @@ struct test_hc_up_mix_f16 : public test_case {
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_UP_MIX", name)) {
             return true;
         }
-        const int64_t n = dispatch_census_count(backend, name), want = env_knob_on("GGML_VK_HC_UP_MIX") ? 1 : 0;
+        const int64_t n = dispatch_census_count(backend, name), want = 1;
         if (n != want) {
             msg = std::string(name) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
             return false;
@@ -7416,14 +7391,13 @@ struct test_moe_glu_f16 : public test_case {
     uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return (uint64_t) 2 * 2 * n_embd * n_ff * n_used * n_tokens; }
 
     // GGML_VK_TEST_REQUIRE_PAIR_GLU=1: the fused launch must run for q4_K / q5_K with M % 128 == 0 and K % 256 == 0, and must not run
-    // otherwise; under GGML_VK_MMID_PAIR_GLU_EXT=0 only the q4_K f16 chain may run
+    // otherwise
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_PAIR_GLU")) {
             return true;
         }
-        const char * ext_env = getenv("GGML_VK_MMID_PAIR_GLU_EXT");
-        const bool ext = ext_env == nullptr || atoi(ext_env) != 0;
+        const bool ext = true;
         const bool expect = (type_w == GGML_TYPE_Q4_K || type_w == GGML_TYPE_Q5_K) && n_ff % 128 == 0 && n_embd % 256 == 0 &&
                             (ext || (type_w == GGML_TYPE_Q4_K && !chain32));
         const char * path = chain32 ? "path:MUL_MAT_ID_PAIR_SWIGLU_F32" : "path:MUL_MAT_ID_PAIR_SWIGLU";
@@ -9562,7 +9536,7 @@ struct test_topk_qsa : public test_case {
 };
 
 // qwen4exp QSA indexer scorer: MUL_MAT(pooled keys, q) -> relu -> 4-head sum (-> + block bias), the chain build_qsa_top_k
-// emits for one query strip; the Vulkan backend fuses it into one GEMM epilogue (QSA_SCORE, GGML_VK_QSA_SCORE). n_pool > n_blocks
+// emits for one query strip; the Vulkan backend fuses it into one GEMM epilogue (QSA_SCORE). n_pool > n_blocks
 // scores a leading view of the pooled keys (the score_key_limits bound); q_first > 0 or q_rows > n_tps scores a strip view of a
 // longer q, as every strip but the single whole one does. exact: inputs are multiples of 1/8, so every product and partial sum
 // is exact in f16 inputs and f32 accumulation and the result must match the CPU bit for bit.
@@ -9655,7 +9629,7 @@ struct test_qsa_score : public test_case {
             return true;
         }
         const int64_t n = dispatch_census_count(backend, "QSA_SCORE");
-        const int64_t want = env_knob_on("GGML_VK_QSA_SCORE") && fusable() ? 1 : 0;
+        const int64_t want = fusable() ? 1 : 0;
         if (n != want) {
             msg = "QSA_SCORE dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
             return false;
@@ -9849,9 +9823,6 @@ struct test_qsa_strip : public test_case {
         int64_t want = 0;
         for (int64_t first = q_first(); first < n_tps; first += strip) {
             want += score_blocks(first) > 64 && 4 * std::min(strip, n_tps - first) > 64;
-        }
-        if (!env_knob_on("GGML_VK_QSA_SCORE")) {
-            want = 0;
         }
         const int64_t n = dispatch_census_count(backend, "QSA_SCORE");
         if (n != want) {
@@ -11643,14 +11614,13 @@ struct test_qsa_expand : public test_case {
 
     bool strip_layout() const { return strips > 1 || first_strip > 0; }
 
-    // GGML_VK_TEST_REQUIRE_QSA_EXPAND=1: one QSA_EXPAND dispatch per strip while GGML_VK_QSA_EXPAND is on, none when off
+    // GGML_VK_TEST_REQUIRE_QSA_EXPAND=1: one QSA_EXPAND dispatch per strip
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        // no fusion label: the knob-off run asserts 0 instead of being skipped (the census skip names GGML_VK_QSA_EXPAND=0)
         if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_EXPAND")) {
             return true;
         }
-        const int64_t n = dispatch_census_count(backend, "QSA_EXPAND"), want = env_knob_on("GGML_VK_QSA_EXPAND") ? strips : 0;
+        const int64_t n = dispatch_census_count(backend, "QSA_EXPAND"), want = strips;
         if (n != want) {
             msg = "QSA_EXPAND dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
             return false;
@@ -13293,7 +13263,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool bounded : {false, true}) test_cases.emplace_back(new test_indexer_score(3001, queries, true, bounded));
     }
     test_cases.emplace_back(new test_indexer_score(3001, 512, true, true));
-    // with the compact visibility chain (fused on RDNA3.5 unless GGML_CUDA_DISABLE_IDX_VIS)
+    // with the compact visibility chain (fused on RDNA3.5)
     for (int blocks : {64, 1000, 10112}) test_cases.emplace_back(new test_indexer_head_sum(blocks,4,512,1,false,false,0,1));
     test_cases.emplace_back(new test_indexer_head_sum(1000,4,77,1,false,false,0,1));
     test_cases.emplace_back(new test_indexer_head_sum(1000,4,512,1,false,false,0,2));
@@ -13494,7 +13464,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_IQ4_NL,  GGML_TYPE_F16, 320, 10, true,  2560, 2048,  640));
     }
     // REG_A: the aligned medium MUL_MAT_ID tile (about 64 rows per expert) of iq3_xxs / iq4_nl takes the register-direct A
-    // loader (GGML_VK_MMID_REGA); m = 320 leaves a partial 128-row tile, b = true broadcasts B
+    // loader where the fragment layout probe passed; m = 320 leaves a partial 128-row tile, b = true broadcasts B
     for (int64_t m : {256, 320}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 2, false, m, 256, 512));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 8, 2, true,  m, 256, 512));
@@ -13504,8 +13474,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the Flash-Next REAP-320 expert shapes at small expert counts (the CPU reference stays cheap)
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 16, 4, false, 640, 512, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 16, 4, false, 2560, 512, 640));
-    // register-prefetch coopmat matmuls and their XL 256x256 tier (GGML_VK_MM_PREFETCH / GGML_VK_MM_XL, engaged on the
-    // f16-B coopmat path, i.e. with GGML_VK_DENSE_F16COOPMAT routing the type off int8): shapes that take the XL gate
+    // register-prefetch coopmat matmuls and their XL 256x256 tier (engaged on the f16-B coopmat path, i.e. where the
+    // dense router takes the type off int8): shapes that take the XL gate
     // (m, k >= 1024, XL waves <= half of l's) and a ragged one, for every prefetch type
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q3_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL}) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4096, 512, 1024, {1, 1}, {1, 1}));
@@ -14718,6 +14688,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // q8_0 and q6_K at every mat-vec width and through the 9..16 column chunks: the single dispatch at 1..8 columns
+    // (the q8_1 integer-dot path where the backend picks it), the column chunks at 9..16
+    for (ggml_type type_a : { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
+        for (int n = 1; n <= 16; ++n) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
+        }
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
@@ -15128,8 +15107,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_moe_glu_f16(tw, GGML_TYPE_F32, 2560, 640, 32, 10, nt));
         }
     }
-    // two full Flash-Next ubatches (512 experts, its measured routing histogram), q4_K and q5_K; the other full-shape runs are in
-    // the GGML_PERF_MOE perf set
+    // two full Flash-Next ubatches (512 experts, its measured routing histogram), q4_K and q5_K
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F16, 2560, 640, 512, 10, 2048, false, true));
     test_cases.emplace_back(new test_mul_mat_pair());
@@ -15150,7 +15128,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
     // Flash-Next REAP-320 shapes (64 rows per expert): the only medium tile where REG_A engages on iq3_xxs / iq4_nl; registered
-    // with GGML_VK_TEST_REQUIRE_REGA=1 only (with GGML_VK_MMID_REGA=1 GGML_VK_MMID_F16COOPMAT=all), else plain duplicates
+    // with GGML_VK_TEST_REQUIRE_REGA=1 only, else plain duplicates
     if (env_opt_in("GGML_VK_TEST_REQUIRE_REGA")) {
         test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F16, 320, 10, true, 640, 2048, 2560));
         test_cases.emplace_back(new test_mul_mat_id_rega(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 320, 10, true, 640, 2048, 2560));
@@ -16196,8 +16174,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
-    // multi-row prefill FA shapes (Vulkan GGML_VK_FA_MR, on by default for head size 256 on RADV RDNA3; =1 also
-    // takes head size 128): 64-row workgroups of H heads x 64/H tokens, ragged last token blocks (nb 77, 130,
+    // multi-row prefill FA shapes (Vulkan, head size 256 on RADV RDNA3; the head size 128 rows run other kernels):
+    // 64-row workgroups of H heads x 64/H tokens, ragged last token blocks (nb 77, 130,
     // 200), GQA 6 / 4 / 2 / 8, no mask, sinks, ALiBi + softcap, dequantized K/V, K/V cache views
     for (auto perm : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024,  77, true,  false, 0,    0,     GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  perm));
@@ -16643,19 +16621,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
-
-    if (getenv("GGML_PERF_MOE")) {
-        test_cases.emplace_back(new test_moe_prefill(true, 4096));
-        test_cases.emplace_back(new test_moe_prefill(false, 4096));
-        // the Flash-Next routed gate/up + SwiGLU at ub2048 / ub4096: measured routing and uniform routing
-        for (int64_t nt : { 2048, 4096 }) {
-            for (ggml_type tx : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
-                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, true));
-                test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, false));
-            }
-        }
-        return test_cases;
-    }
 
     // qwen4exp complete-block selection (TOP_K + the chain QSA_EXPAND fuses) at the Flash-Next d32k shape: one 512-row
     // strip and decode rows. Perf mode repeats only the final CONCAT, so read the chain's time with GGML_VK_PERF_LOGGER
@@ -17406,9 +17371,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // PREFILL widths with quantised K/V, which the sparse path now serves through a one-shot
     // dequant into the f16 scratch; quantised should sit within ~1% of f16 at every kv here.
     // nb=1024 is the reporting user's --ubatch-size; the kv list is their four source depths
-    // (17k/33k/67k/134k) in compressed-K rows. GGML_VK_FA_DEQUANT=0 reproduces the old dense
-    // fallback, whose gap GROWS with kv (dense is O(kv), sparse O(n_kv_raw + n_top_k)); f16
-    // under GGML_VK_FA_TOPK=0 is the falsification arm for attributing that gap to the gate.
+    // (17k/33k/67k/134k) in compressed-K rows. The old dense fallback for quantised K/V had a
+    // gap that GROWS with kv (dense is O(kv), sparse O(n_kv_raw + n_top_k)).
     for (ggml_type tk : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         for (int kv : { 5504, 11008, 19200, 35584 }) {
             test_cases.emplace_back(new test_flash_attn_ext_top_k(kv, 1024, 2304, 512, false, 1, 0, tk));
@@ -18219,7 +18183,6 @@ int main(int argc, char ** argv) {
             mode = MODE_TEST;
         } else if (strcmp(argv[i], "perf") == 0) {
             mode = MODE_PERF;
-            g_allow_quant_init_blocks = true;
         } else if (strcmp(argv[i], "grad") == 0) {
             mode = MODE_GRAD;
         } else if (strcmp(argv[i], "support") == 0) {

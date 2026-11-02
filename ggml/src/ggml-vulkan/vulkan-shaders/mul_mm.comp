@@ -270,7 +270,7 @@ shared SCACHE_T scache_dm[BM * 8];
 #include "mul_mm_funcs.glsl"
 #ifdef COOPMAT
 #if defined(BUF_MANUAL)
-// test hook (GGML_VK_TEST_MF_SKEW, spec constant 16): rotate the fragment's k pairs so a byte-equal test must see a difference
+// test hook (spec constant 16, the host passes 0): rotate the fragment's k pairs so a byte-equal test must see a difference
 layout(constant_id = 16) const uint MF_SKEW = 0;
 #define MF_E(e) (((e) + MF_SKEW) & 7u)
 #define LOAD_A_FRAG(dst, row0, k2) { \
@@ -290,7 +290,7 @@ layout(constant_id = 16) const uint MF_SKEW = 0;
 #include "mul_mm_pf_funcs.glsl"
 #endif
 
-// Register-direct A for MUL_MAT_ID (REG_A, after Halogen's expert-loading design; host gate GGML_VK_MMID_REGA): each wave32 subgroup
+// Register-direct A for MUL_MAT_ID (REG_A, after Halogen's expert-loading design; host gate ggml_vk_mmid_rega_enabled): each wave32 subgroup
 // owns 32 rows; lanes 0..15 / 16..31 dequantize one 16-row fragment each, one K step ahead, into the A fragment elements (gfx11
 // layout) and swap halves with one xor-16 shuffle per f16 pair. A skips shared memory; aligned iq3_xxs / iq4_nl pipelines only.
 layout(constant_id = 15) const uint REG_A = 0;
@@ -555,7 +555,7 @@ void main() {
 #define A_SIDX(l) (XL_IDX_BASE ? a_sidx0 + a_shmem_index((l), 0) : a_sidx[(l) / loadstride_a])
 #define B_SIDX(l) (XL_IDX_BASE ? b_sidx0 + (l) * SHMEM_STRIDE : b_sidx[(l) / loadstride_b])
 #ifdef MUL_MAT_ID
-// spec constant 17 (GGML_VK_MMID_B_FULL, only with the row-id fill): load B for the whole BN tile, so the per-lane guard folds away
+// spec constant 17 (MMID_B_FULL, needs the row-id fill): load B for the whole BN tile, so the per-lane guard folds away
 // and the prefetch loads stay in flight across the WMMAs (no vmcnt(0) at a K-loop branch on gfx1151 ACO). Only where
 // BN % loadstride_b == 0, else a lane's last pass would land past the B tile; other tiles keep the guard.
 layout(constant_id = 17) const uint MMID_B_FULL = 0;

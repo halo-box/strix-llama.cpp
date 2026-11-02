@@ -1674,13 +1674,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
                     const int root_backend_id = sched->hv_tensor_backend_ids[hash_id(root)];
 
-                    static const bool pin_async_reads = []() {
-                        const char * env = getenv("GGML_SCHED_PIN_ASYNC_READS");
-                        return env ? atoi(env) != 0 : true;
-                    }();
-
-                    if (pin_async_reads &&
-                        root_backend_id != -1 && root_backend_id != cur_backend_id &&
+                    if (root_backend_id != -1 && root_backend_id != cur_backend_id &&
                         sched->backends[cur_backend_id]->iface.synchronize != NULL &&
                         ggml_backend_sched_buffer_supported(sched, root, cur_backend_id)) {
                         ggml_gallocr_pin_tensor(sched->galloc, root);
@@ -2183,12 +2177,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    int n_copies_uma = is_uma ? 2 : 1;
-
-    const char * GGML_SCHED_UMA_RING = getenv("GGML_SCHED_UMA_RING");
-    if (GGML_SCHED_UMA_RING && is_uma) {
-        n_copies_uma = std::min(std::max(atoi(GGML_SCHED_UMA_RING), 1), GGML_SCHED_MAX_COPIES);
-    }
+    const int n_copies_uma = is_uma ? 2 : 1;
 
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : n_copies_uma;
 

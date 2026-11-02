@@ -1322,9 +1322,15 @@ static void launch_fattn_tile_case(
     // Native Q8 KV needs one query; the tile switch can only select these columns.
     if constexpr (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256) && (ncols1 == 1 || (ncols1 == 2 && ncols2 == 1))) {
         use_q8_0_KV = dst->src[0]->ne[1] == 1 && dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0;
-        fattn_kernel = use_q8_0_KV
-            ? flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>
-            : flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
+        if constexpr (ncols2 == 3) {
+            // the GQA-6 columns are only selected for one query with Q8_0 K and V (launch_fattn_tile_switch_ncols2)
+            GGML_ASSERT(use_q8_0_KV);
+            fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>;
+        } else {
+            fattn_kernel = use_q8_0_KV
+                ? flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>
+                : flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
+        }
     } else {
         fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
     }
@@ -1337,8 +1343,8 @@ static void launch_fattn_tile_case(
 #else
     fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
 #endif // GGML_USE_HIP
-    launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !use_q8_0_KV, !use_q8_0_KV, false, false, warp_size);
+    launch_fattn<DV, ncols1, ncols2, false>
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, !use_q8_0_KV, !use_q8_0_KV, false, warp_size);
 }
 
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>

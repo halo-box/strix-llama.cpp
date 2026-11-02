@@ -520,7 +520,6 @@ gated_delta_net_tiled_cuda(const float * q,
 //     in fp32 WMMA accumulators. The chunk's q/k/T'/P are staged once per block in LDS (K^T transposed on the way in)
 //     and the next chunk is prefetched into registers. Optionally applies the gated RMS norm of the output (fused).
 // WMMA operands are fp16 with fp32 accumulation: not bit-identical to the sequential kernels (NMSE ~2e-7).
-// GGML_GDN_CHUNK=0 disables the path (and every fusion that depends on it), GGML_GDN_CHUNK_MIN sets the token threshold.
 #if defined(GGML_USE_HIP) && defined(RDNA3_5)
 #define GDNC_ENABLED 1
 #endif
@@ -1545,15 +1544,8 @@ gdn_scan2_kernel(int * __restrict__ prog, unsigned * __restrict__ sink, const _F
 #endif
 }
 
-static bool gdn_chunk_enabled() {
-    static const int v = getenv("GGML_GDN_CHUNK") ? atoi(getenv("GGML_GDN_CHUNK")) : 1;
-    return v != 0;
-}
-
-static int gdn_chunk_min_tokens() {
-    static const int v = getenv("GGML_GDN_CHUNK_MIN") ? atoi(getenv("GGML_GDN_CHUNK_MIN")) : 256;
-    return v;
-}
+// the chunked prefill path takes ubatches of this many tokens or more
+static constexpr int64_t GDN_CHUNK_MIN_TOKENS = 256;
 
 // the dispatch condition of the chunked prefill path (single source of truth for the op and the q/k-norm fusion)
 static bool gdn_chunk_eligible_raw(const int cc, const bool kda, const bool keep_rs, const int64_t S_v, const int64_t H,
@@ -1562,8 +1554,8 @@ static bool gdn_chunk_eligible_raw(const int cc, const bool kda, const bool keep
 #if defined(GGML_USE_HIP)
     const bool aligned = sq1 % 4 == 0 && sq2 % 4 == 0 && ((uintptr_t) q_d) % 16 == 0 && ((uintptr_t) k_d) % 16 == 0;
     // n_seqs > 1: the chunk kernels run once per sequence on its slices (each exactly a one-sequence prefill)
-    return !kda && !keep_rs && GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && n_seqs >= 1 && n_tokens >= gdn_chunk_min_tokens() &&
-        aligned && Hk > 0 && H % Hk == 0 && H / Hk <= 4 && gdn_chunk_enabled();
+    return !kda && !keep_rs && GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && n_seqs >= 1 && n_tokens >= GDN_CHUNK_MIN_TOKENS &&
+        aligned && Hk > 0 && H % Hk == 0 && H / Hk <= 4;
 #else
     GGML_UNUSED(cc); GGML_UNUSED(kda); GGML_UNUSED(keep_rs); GGML_UNUSED(S_v); GGML_UNUSED(H); GGML_UNUSED(Hk);
     GGML_UNUSED(n_tokens); GGML_UNUSED(n_seqs); GGML_UNUSED(sq1); GGML_UNUSED(sq2); GGML_UNUSED(q_d); GGML_UNUSED(k_d);
@@ -1631,9 +1623,8 @@ void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const 
 // epilogue. Graph-time predicate (shapes / env only); the op aborts if the v2 scan is not taken after all.
 bool ggml_cuda_gdn_z16_ok(const ggml_tensor * gdn) {
 #if defined(GGML_USE_HIP)
-    static const bool nofuse = getenv("GGML_CUDA_DISABLE_GDN_OUTNORM") != nullptr ||
-        (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_FUSION")) != 0);
-    if (nofuse || !gdn || gdn->op != GGML_OP_GATED_DELTA_NET || !gdn_chunk_enabled()) return false;
+    static const bool nofuse = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_FUSION")) != 0;
+    if (nofuse || !gdn || gdn->op != GGML_OP_GATED_DELTA_NET) return false;
     const ggml_tensor * v = gdn->src[2];
     const int  cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool kda     = gdn->src[3]->ne[0] == v->ne[0];
@@ -1642,7 +1633,7 @@ bool ggml_cuda_gdn_z16_ok(const ggml_tensor * gdn) {
     // otherwise (only the q/k pointer alignment is left to run time)
     const ggml_tensor * q = gdn->src[0];
     const int64_t H = v->ne[1], Hk = q->ne[1];
-    return GGML_CUDA_CC_IS_RDNA3_5(cc) && !kda && !keep_rs && v->ne[0] == 128 && v->ne[2] >= gdn_chunk_min_tokens() &&
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) && !kda && !keep_rs && v->ne[0] == 128 && v->ne[2] >= GDN_CHUNK_MIN_TOKENS &&
         v->ne[1] * 128 % 8 == 0 && Hk > 0 && H % Hk == 0 && H / Hk <= 4 && q->ne[3] == v->ne[3];
 #else
     GGML_UNUSED(gdn);
@@ -1705,7 +1696,6 @@ static void launch_gated_delta_net(
         if (GGML_CUDA_CC_IS_RDNA3_5(cc) && S_v == 128 && num_warps == 32 && n_tokens >= 16) {
             // 16 warps x 4 columns per block, 16-token tiles: best of the swept configurations on gfx1151
             //     (2048 tokens, H=32: 5.03 ms -> 2.2 ms; H=64: 9.29 ms -> 4.5 ms).
-            const int cfg = getenv("GGML_GDN_TILE_CFG") ? atoi(getenv("GGML_GDN_TILE_CFG")) : (H == 48 ? 1 : 0);
             auto launch_tiled = [&](auto kernel, int warps, int cols) {
                 const dim3 tiled_grid(H, n_seqs, S_v / (warps * cols));
                 const dim3 tiled_block(warp_size, warps, 1);
@@ -1715,11 +1705,10 @@ static void launch_gated_delta_net(
                     sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
                     neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             };
-            switch (cfg) {
-                case 1: launch_tiled(gated_delta_net_tiled_cuda<128, 8,  8, 16, keep_rs_t>, 8,  8); break;
-                case 2: launch_tiled(gated_delta_net_tiled_cuda<128, 32, 2, 16, keep_rs_t>, 32, 2); break;
-                case 3: launch_tiled(gated_delta_net_tiled_cuda<128, 16, 4,  8, keep_rs_t>, 16, 4); break;
-                default: launch_tiled(gated_delta_net_tiled_cuda<128, 16, 4, 16, keep_rs_t>, 16, 4); break;
+            if (H == 48) {
+                launch_tiled(gated_delta_net_tiled_cuda<128, 8,  8, 16, keep_rs_t>, 8,  8);
+            } else {
+                launch_tiled(gated_delta_net_tiled_cuda<128, 16, 4, 16, keep_rs_t>, 16, 4);
             }
             return;
         }

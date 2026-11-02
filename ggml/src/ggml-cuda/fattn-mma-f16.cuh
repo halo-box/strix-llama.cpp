@@ -398,6 +398,13 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_use_spill_fix(cons
         (DKQ == 128 && ncols2 > 1 && ncols >= 16) || (DKQ == 256 && ncols2 > 1 && ncols >= 32);
 }
 
+// gfx1151/ROCm 10.1 clang 24: a barrier between the KQ, softmax and VKQ phases removes the 19 SGPR spills of D128 16x4.
+// Kernel time with it (2026-11-01): D128 16x4 2-6% faster at KV 512-32768. D64 8x4 was 3-10% slower at KV 512-2048 with it.
+// D64 8x4 and the other spilling configs keep their spills. Remove when D128 16x4 compiles without SGPR spills.
+static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_use_phase_barrier(const int DKQ, const int ncols1, const int ncols2, const bool softcap) {
+    return !softcap && DKQ == 128 && ncols1 == 16 && ncols2 == 4;
+}
+
 // gfx1151/ROCm 10.1 clang 24: Q reuse keeps D128 8x8 at 256 VGPRs; D256 8x8 needs 224 without address bounds (2026-10-24).
 // Remove these exceptions when the original paths are spill-free at the measured throughput.
 #if defined(__gfx1151__)
@@ -831,6 +838,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
 
+#if defined(RDNA3_5)
+    if constexpr (ggml_cuda_fattn_mma_use_phase_barrier(DKQ, ncols1, ncols2, use_logit_softcap)) {
+        __builtin_amdgcn_sched_barrier(0);
+    }
+#endif
     if (use_logit_softcap) {
         constexpr int stride = cols_per_warp == 8 ? np*T_C_KQ::I : np*T_C_KQ::J;
         static_assert(nbatch_fa % stride == 0, "bad loop size");
@@ -1109,6 +1121,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     }
 
 
+#if defined(RDNA3_5)
+    if constexpr (ggml_cuda_fattn_mma_use_phase_barrier(DKQ, ncols1, ncols2, use_logit_softcap)) {
+        __builtin_amdgcn_sched_barrier(0);
+    }
+#endif
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
 #pragma unroll
     for (int i0_start = 0; i0_start < DV; i0_start += 2*nbatch_V2) {
@@ -2271,8 +2288,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     }
 
     const bool async_kv_preload = nstages == 2 && !use_sparse;
-    launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, warp_size_host, async_kv_preload);
+    launch_fattn<DV, ncols1, ncols2, true>
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, use_sparse, warp_size_host, async_kv_preload);
 }
 
 
