@@ -522,12 +522,7 @@ static int64_t dispatch_census_count(ggml_backend_t backend, const char * name) 
     return count ? (int64_t) count(name) : -1;
 }
 
-// a default-on backend knob (unset or non-zero) and an opt-in test switch (set and non-zero)
-static bool env_knob_on(const char * name) {
-    const char * e = getenv(name);
-    return e == nullptr || atoi(e) != 0;
-}
-
+// an opt-in test switch (set and non-zero)
 static bool env_opt_in(const char * name) {
     const char * e = getenv(name);
     return e != nullptr && atoi(e) != 0;
@@ -4351,18 +4346,13 @@ struct test_mul_mat_f16b : public test_case {
                 return false;
             }
         }
-        // GGML_VK_TEST_REQUIRE_DQ8=1 asserts the dense q8_0 x f16 GEMM (GGML_VK_DENSE_DQ8) took every eligible shape
+        // GGML_VK_TEST_REQUIRE_DQ8=1 asserts the dense q8_0 x f16 GEMM (mul_mm_dq8) took every eligible shape
         if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_DQ8")) {
             const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_DENSE_DQ8");
-            // GGML_VK_DENSE_DQ8 unset or 1 = the default shape rule (as ggml-vulkan.cpp, 3/4 of a workgroup per CU taken for 40 CUs),
-            // 2..6 = a forced tile on every eligible shape, 0 = off
-            const char * de = getenv("GGML_VK_DENSE_DQ8");
-            const int mode = de ? atoi(de) : 1;
-            const char * fe = getenv("GGML_VK_DENSE_DQ8_FEWROW");
-            const bool fewrow = (fe == nullptr || atoi(fe) != 0) && m <= 384 && k >= 4096 && n >= 1024;
+            // the shape rule of ggml-vulkan.cpp, 3/4 of a workgroup per CU taken for 40 CUs
+            const bool fewrow = m <= 384 && k >= 4096 && n >= 1024;
             const bool rule = fewrow || (k <= 4096 && n >= 256 && ((m + 127) / 128) * ((n + 255) / 256) >= 30);
-            const bool want = type_a == GGML_TYPE_Q8_0 && k >= 1024 && k % 64 == 0 && m >= 128 && n >= 64 && mode != 0 &&
-                              (mode >= 2 || rule);
+            const bool want = type_a == GGML_TYPE_Q8_0 && k >= 1024 && k % 64 == 0 && m >= 128 && n >= 64 && rule;
             if (c >= 0 && (c > 0) != want) {
                 msg = "MUL_MAT_DENSE_DQ8 dispatches: " + std::to_string(c) + (want ? " (expected the dq8 GEMM)" : " (expected another path)");
                 return false;
@@ -6690,10 +6680,10 @@ struct test_hc_up_mix_f16 : public test_case {
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         const char * name = gate16 ? "HC_UP_MIX" : "HC_UP_MIX_F32G";
-        // GGML_VK_TEST_REQUIRE_HC_DQ8=1: the fusion ran on the dense q8_0 x f16 GEMM (GGML_VK_HC_DQ8) exactly where it is eligible
+        // GGML_VK_TEST_REQUIRE_HC_DQ8=1: the fusion ran on the dense q8_0 x f16 GEMM (mul_mm_dq8) exactly where it is eligible
         if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_DQ8")) {
             const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_HC_DQ8");
-            const bool want = env_knob_on("GGML_VK_HC_DQ8") && k % 64 == 0 && 4 * n_embd >= 128;
+            const bool want = k % 64 == 0 && 4 * n_embd >= 128;
             if (c >= 0 && (c > 0) != want) {
                 msg = "MUL_MAT_HC_DQ8 dispatches: " + std::to_string(c) + (want ? " (expected the dq8 GEMM)" : " (expected int8 MMQ)");
                 return false;
@@ -13195,7 +13185,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_f16b(t, 96, n, 256));
         }
     }
-    // the dense q8_0 x f16 GEMM (GGML_VK_DENSE_DQ8): full and ragged tiles in m and n, one K step, B row pad
+    // the dense q8_0 x f16 GEMM (mul_mm_dq8): full and ragged tiles in m and n, one K step, B row pad
     for (int m : {128, 200, 1000}) {
         for (int n : {64, 77, 300, 513}) {
             test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, m, n, 1024));
@@ -13489,7 +13479,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // HC_UP_MIX: exact and ragged tiles, padded x rows, the Flash-Next shape (n_embd 2560, low rank 320, ub 2048) and its 2051 tail
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 64, 96, 0));
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 96, 128));
-    test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 128, 128));   // k % 64 == 0, 256 rows: the GGML_VK_HC_DQ8 GEMM, ragged n
+    test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 128, 128));   // k % 64 == 0, 256 rows: HC_UP_MIX on the dq8 GEMM, ragged n
     test_cases.emplace_back(new test_hc_up_mix_f16(64, 130, 128, 128, false, true));
     test_cases.emplace_back(new test_hc_up_mix_f16(256, 33, 320, 8));
     test_cases.emplace_back(new test_hc_up_mix_f16(2560, 2048, 320, 128));
