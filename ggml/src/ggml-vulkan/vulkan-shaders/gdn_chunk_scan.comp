@@ -27,7 +27,9 @@
 //
 // OUT_NORM (gdn_chunk_scan_on, one 8-wave workgroup per head): the gated output norm of the head rows is applied in the store,
 // rms_norm(o) * gamma * sigmoid(z) written as f16 (the RMS_NORM_MUL_SIGMUL_CPY chain), and the f32 o is never written. A
-// chunk's o tile goes through shared memory; each wave then normalises 4 of its 32 rows. The row sum reproduces
+// chunk's o tile goes through a per-workgroup ring in global memory (16.5 KB per head, cache resident); each wave then
+// normalises 4 of its 32 rows. Not shared memory: RADV runs a shader that uses LDS in CU mode, which puts the 48 head
+// workgroups of Flash-Next on 40 CUs (8 CUs run two); without LDS it stays in WGP mode, and the scan measured 4-6% faster. The row sum reproduces
 // rms_norm_small.comp at subgroup size 64 (virtual lane L sums columns L and L + 64, then a 64-lane reduction) and the
 // store its expressions (same order, same XOR before the f16 conversion), to match the unfused chain.
 
@@ -79,9 +81,11 @@ layout(binding = 7) readonly  buffer ZhBuf    { uvec2 data_zh4[];   };
 layout(binding = 8) readonly  buffer WBuf     { vec4  data_w4[];    };
 layout(binding = 9) writeonly buffer OBuf     { uvec2 data_o4[];    };
 
+layout(binding = 10) coherent buffer OTBuf { float data_ot[]; };
+
 #define OST (S_V + 4)
-// one chunk's o tile, 16.5 KB, so two workgroups fit in a CU's 64 KB
-shared float o_sh[CL * OST];
+// this workgroup's o tile
+#define O_T(i) data_ot[(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x) * (CL * OST) + (i)]
 #define NR 4                       // rows per wave in the norm stage: the host creates this variant with 8 waves (WGT 256)
 #endif
 
@@ -275,7 +279,7 @@ void main() {
         }
 
 #ifdef OUT_NORM
-        // every wave has finished the previous chunk's norm stage before o_sh is written again
+        // every wave has finished the previous chunk's norm stage before the o tile is written again
         barrier();
 #endif
         MATB DB[NT];
@@ -314,7 +318,7 @@ void main() {
             }
 #ifdef OUT_NORM
             [[unroll]] for (uint i = 0; i < 8; i++) {
-                o_sh[(16 * j + AROW(i)) * OST + v0 + lr] = o[i];
+                O_T((16 * j + AROW(i)) * OST + v0 + lr) = o[i];
             }
 #else
             if (t0 + CL <= n_tokens) {
@@ -331,7 +335,7 @@ void main() {
 #endif
         }
 #ifdef OUT_NORM
-        memoryBarrierShared();
+        memoryBarrierBuffer();
         barrier();
         [[unroll]] for (uint r = 0; r < NR; r++) {
             const uint row = gl_SubgroupID * NR + r;
@@ -342,15 +346,15 @@ void main() {
             float s_lo = 0.0f;
             float s_hi = 0.0f;
             [[unroll]] for (uint k = 0; k < 2; k++) {
-                const float xa = o_sh[ob + lane + 64 * k];
+                const float xa = O_T(ob + lane + 64 * k);
                 s_lo += xa * xa;
-                const float xb = o_sh[ob + lane + 32 + 64 * k];
+                const float xb = O_T(ob + lane + 32 + 64 * k);
                 s_hi += xb * xb;
             }
             const float sum   = subgroupAdd(s_lo) + subgroupAdd(s_hi);
             const float mean  = sum / float(S_V);
             const float scale = inversesqrt(mean + on_eps);
-            const vec4 xo = vec4(o_sh[ob + 4 * lane], o_sh[ob + 4 * lane + 1], o_sh[ob + 4 * lane + 2], o_sh[ob + 4 * lane + 3]);
+            const vec4 xo = vec4(O_T(ob + 4 * lane), O_T(ob + 4 * lane + 1), O_T(ob + 4 * lane + 2), O_T(ob + 4 * lane + 3));
             vec4 res;
             [[unroll]] for (uint e = 0; e < 4; e++) {
                 const float y = scale * xo[e] * on_w[e];

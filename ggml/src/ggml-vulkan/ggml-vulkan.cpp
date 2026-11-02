@@ -5253,7 +5253,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     "main", 6, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
                 // with the gated output norm in the store: the norm needs a head's 128 columns, so one 8-wave workgroup per head
                 ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan_on, "gdn_chunk_scan_on_f32", gdn_chunk_scan_on_f32_len, gdn_chunk_scan_on_f32_data,
-                    "main", 10, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {256}, 1, true, true, 32);
+                    "main", 11, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {256}, 1, true, true, 32);
                 // MUL_MAT_ID_PAIR_SWIGLU (used only after the fragment layout probe passed): 128 features per workgroup in x
 #define CREATE_MMID_GLU(ti, tn) \
                 ggml_vk_create_pipeline(device, device->pipeline_mmid_glu[ti][0][0], "mul_mm_id_glu_" #tn "_f16", mul_mm_id_glu_ ## tn ## _f16_len, \
@@ -15936,7 +15936,10 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         const uint32_t nch = (n_tokens + CL - 1) / CL;
         const size_t qku = 3 * CL * 128 / 2;
         const size_t tpu = CL * CL + 2 * CL;
-        const size_t scr_size = sizeof(uint32_t) * ((size_t) n_seqs * neq1 * nch * qku + (size_t) n_seqs * H * nch * tpu);
+        const size_t scr_main = sizeof(uint32_t) * ((size_t) n_seqs * neq1 * nch * qku + (size_t) n_seqs * H * nch * tpu);
+        // the out-norm scan's per-head o tiles (gdn_chunk_scan.comp OTBuf) follow the operands
+        const bool on_fold = ctx->gdn_on.count(dst) != 0;
+        const size_t scr_size = scr_main + (on_fold ? sizeof(float) * (size_t) n_seqs * H * CL * (128 + 4) : 0);
         if (ctx->prealloc_size_split_k < scr_size) {
             ctx->prealloc_size_split_k = scr_size;
             ggml_vk_preallocate_buffers(ctx, subctx);
@@ -16003,8 +16006,9 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
             { src_buf[0], src_buf[1], src_buf[3], src_buf[4], scr_buf, cst_buf, cw_buf }, cpc, { neq1, nch, n_seqs });
         ggml_vk_sync_buffers(ctx, subctx);
         if (out_norm) {
+            vk_subbuffer ot_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, scr_main);
             ggml_vk_dispatch_pipeline(ctx, subctx, scan,
-                { src_buf[2], src_buf[5], dst_buf, scr_buf, cst_buf, cw_buf, z_buf, z_buf, w_buf, o_buf }, cpc, { H, n_seqs, 1 });
+                { src_buf[2], src_buf[5], dst_buf, scr_buf, cst_buf, cw_buf, z_buf, z_buf, w_buf, o_buf, ot_buf }, cpc, { H, n_seqs, 1 });
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, scan,
                 { src_buf[2], src_buf[5], dst_buf, scr_buf, cst_buf, cw_buf }, cpc, { H * ctx->device->gdn_chunk_scan_nsplit, n_seqs, 1 });
