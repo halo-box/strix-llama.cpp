@@ -8274,8 +8274,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     if (pipeline_pre_dq8 != nullptr) {
-        // 16-byte B loads need 8-element columns and a 16-byte aligned B binding, A and D are read / written as dwords
-        if (stride_b % 8 != 0 || y_buf_offset % 16 != 0 || x_buf_offset % 4 != 0 || d_buf_offset % 4 != 0) {
+        // B is read as 16-byte vectors relative to its binding, which starts at the tensor itself: the columns need 8-element strides,
+        // the binding offset only the device's storage-buffer alignment (an f16 activation may start 8 bytes past 16, which used to
+        // send the GEMM back to its pre-dq8 tile); A and D are read / written as dwords
+        if (stride_b % 8 != 0 || y_buf_offset % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0 ||
+            x_buf_offset % 4 != 0 || d_buf_offset % 4 != 0) {
             pipeline = pipeline_pre_dq8;   // split_k stays 1 (valid for every pipeline)
         } else {
             ggml_vk_path_census_add("MUL_MAT_DENSE_DQ8");
