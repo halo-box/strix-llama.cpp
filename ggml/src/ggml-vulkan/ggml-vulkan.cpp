@@ -18860,7 +18860,9 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
         tr->nb[0] != (size_t) C * sizeof(float) || tr->nb[1] != sizeof(float) || tr->nb[2] != (size_t) C * T * sizeof(float)) {
         return ggml_vk_ssm_conv_direct_reject("x layout", i);
     }
-    if (T < ssm_conv_direct_min_tokens) {
+    // the token count gates only the dispatch: the alloc deps from graph_optimize must not depend on it, else the
+    // graph topology changes with the ubatch size and the scheduler re-reserves for whichever ubatch comes next
+    if (runtime && T < ssm_conv_direct_min_tokens) {
         return false;
     }
     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != S || st->ne[3] != 1 || !ggml_is_contiguous(st)) {
