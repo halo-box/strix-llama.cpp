@@ -16464,6 +16464,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {16384, 65, 1, 1}, true));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {65537,  3, 1, 1}, true));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {16383,  2, 1, 1}, true));
+    // long rows take the wide (512-lane) shader on Vulkan: a greedy argmax over a 248k vocab; ties as the CPU (last maximum)
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 1, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {151936, 2, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {8192,   5, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 1, 1, 1}, true));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {8193,   3, 1, 1}, true));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1000,   7, 1, 1}, true));
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
@@ -19538,6 +19545,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 10, 1, 1}));
     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {32000, 512, 1, 1}));
+    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 1, 1, 1}));
 
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {512, 34, 2, 1}));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 80, 1, 1}));

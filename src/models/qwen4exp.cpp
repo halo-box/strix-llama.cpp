@@ -1300,6 +1300,8 @@ public:
         mctx(mctx), ratio(ratio), blk_bias(blk_bias), causal_attn(causal_attn) {}
     virtual ~llm_graph_input_qsa() = default;
 
+    bool chain_safe() const override { return true; }   // reads no token ids
+
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         if (tail_idxs) {
@@ -1386,6 +1388,8 @@ public:
     llm_graph_input_qsa_k(const llama_memory_hybrid_idx_context * mctx) : mctx(mctx) {}
     virtual ~llm_graph_input_qsa_k() = default;
 
+    bool chain_safe() const override { return true; }   // reads no token ids
+
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
     }
@@ -1410,6 +1414,7 @@ class llm_graph_input_qsa_cache : public llm_graph_input_i {
 public:
     llm_graph_input_qsa_cache(const llama_memory_hybrid_idx_context * mctx, int il, bool active, bool fast) :
         mctx(mctx), il(il), active(active), fast(fast) {}
+    bool chain_safe() const override { return true; }   // reads no token ids
     void set_input(const llama_ubatch *) override {
         if (!active) { return; }
         if (fast) { mctx->qsa_fill_updates(members, positions, rows); }
@@ -1850,6 +1855,8 @@ static bool qwen4exp_last_attn_trim() {
 struct llm_graph_input_qwen4exp_tile : public llm_graph_input_i {
     llm_graph_input_qwen4exp_tile(int64_t t0, int64_t n_tokens, int64_t n_outputs, uint32_t n_pos_per_embd)
         : t0(t0), n_tokens(n_tokens), n_outputs(n_outputs), n_pos_per_embd(n_pos_per_embd) {}
+
+    bool chain_safe() const override { return true; }   // reads only whether the ubatch has token ids, not the ids
 
     void set_input(const llama_ubatch * ub) override {
         const int64_t nt = n_tokens - t0;
@@ -2295,6 +2302,13 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    // the n-gram rows hash the ubatch token ids
+    bool token_dependent() const override { return true; }
+
+    // decode chaining: safe once build placed `embd` / `rows` on the device (chain_placed)
+    bool chain_safe() const override { return chain_placed; }
+    bool chain_placed = false;
+
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
         ring = qwen4exp_ring(params.prefetch);
@@ -2656,6 +2670,11 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
     }
 
+    // decode chaining sets the token ids after apply_ubatch() stored them: store them again (a no-op otherwise)
+    if (ubatch->token) {
+        mctx->set_cur_tokens(*ubatch);
+    }
+
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
@@ -2949,10 +2968,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
         ple_inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
         ggml_set_input(ple_inp->embd);
         emb = ple_inp->embd;
+        if (chain) {
+            chain_input_to_device(ple_inp->embd);
+            ple_inp->chain_placed = true;
+        }
     } else {
         ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
         ggml_set_input(ple_inp->rows);
         rows = ple_inp->rows;
+        if (chain) {
+            chain_input_to_device(ple_inp->rows);
+            ple_inp->chain_placed = true;
+        }
     }
     res->add_input(std::move(ple_inp));
 
