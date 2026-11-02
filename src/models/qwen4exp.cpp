@@ -27,13 +27,39 @@ static bool    qwen4exp_last_attn_trim();
 static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream);
 static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t n_blocks, int64_t n_idx_h);
 
-// the PLE row gather of a batch, defined below set_input
-static void qwen4exp_ple_gather_sync(const llama_model_qwen4exp & pmodel, const int32_t * idx, size_t n_rows, float * dst);
+// the PLE row gather of a batch, defined below set_input; rows go out in the type of qwen4exp_ple_input_type
+static void qwen4exp_ple_gather_sync(const llama_model_qwen4exp & pmodel, const int32_t * idx, size_t n_rows, void * dst);
+
+// Types whose dequantization is one exact product per element reach the device as stored (IQ4_NL row: 90 B instead
+// of 640 B F32) and a get_rows there dequantizes them, same values; else F32 rows. LLAMA_PLE_RAW=0 forces F32.
+static ggml_type qwen4exp_ple_input_type(const llama_model_qwen4exp & pmodel) {
+    std::call_once(pmodel.ple_in_once, [&] {
+        const char * e = getenv("LLAMA_PLE_RAW");
+        const ggml_type t = pmodel.ple_disk ? pmodel.ple_disk->type()
+                          : pmodel.per_layer_tok_embd ? pmodel.per_layer_tok_embd->type : GGML_TYPE_F32;
+        const int64_t dim = pmodel.hparams.ple_head_dim;
+        bool raw = (e == nullptr || atoi(e) != 0) && dim > 0 &&
+            (t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_F16);
+        ggml_backend_dev_t dev = raw && pmodel.hparams.n_layer() > 0 ? pmodel.dev_layer(0) : nullptr;
+        if (raw && dev) {
+            ggml_init_params ip = { 3 * ggml_tensor_overhead(), nullptr, true };
+            ggml_context * c = ggml_init(ip);
+            ggml_tensor * a = ggml_new_tensor_2d(c, t, dim, 4096);
+            ggml_tensor * b = ggml_new_tensor_1d(c, GGML_TYPE_I32, 4096);
+            raw = ggml_backend_dev_supports_op(dev, ggml_get_rows(c, a, b));
+            ggml_free(c);
+        }
+        pmodel.ple_in_type = raw ? t : GGML_TYPE_F32;
+        LLAMA_LOG_INFO("qwen4exp: PLE rows reach the graph as %s%s\n", ggml_type_name(pmodel.ple_in_type),
+                raw ? " (as stored, dequantized by the graph)" : "");
+    });
+    return pmodel.ple_in_type;
+}
 
 // a context's prefetch state: its ring of PLE rows gathered ahead
 struct qwen4exp_prefetch : public llama_model_prefetch {
     llama_ple_async ring;
-    qwen4exp_prefetch(int64_t n_heads, int64_t dim, llama_ple_async::gather_fn fn) : ring(n_heads, dim, std::move(fn)) {}
+    qwen4exp_prefetch(int64_t n_heads, size_t row_bytes, llama_ple_async::gather_fn fn) : ring(n_heads, row_bytes, std::move(fn)) {}
 };
 
 static llama_ple_async * qwen4exp_ring(llama_model_prefetch * state) {
@@ -2351,15 +2377,16 @@ public:
             return rows->ne[0] == n_want;      // I32 [n_heads*n_tokens]
         }
         if (embd) {
-            return embd->ne[1] == n_want;      // F32 [ple_head_dim, n_heads*n_tokens]
+            return embd->ne[1] == n_want;      // F32 or the table's type [ple_head_dim, n_heads*n_tokens]
         }
         return false;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
-    ggml_tensor * embd = nullptr;   // F32 [ple_head_dim, ple_n_heads * n_tokens]: the gathered rows, when the table is on disk
+    ggml_tensor * embd = nullptr;   // [ple_head_dim, ple_n_heads * n_tokens]: the host-gathered rows, F32 or as stored (raw)
+    ggml_tensor * raw_ids = nullptr; // I32 [ple_n_heads * n_tokens] = 0..n-1: the get_rows that dequantizes raw rows on the device
 
-    std::vector<float>   embd_buf;
+    std::vector<uint8_t> embd_buf;  // staging when embd is not in host memory
     std::vector<int32_t> rows_global;
 
     const llama_model_qwen4exp & pmodel;
@@ -2518,8 +2545,8 @@ void llama_model_qwen4exp::prefetch_begin(std::unique_ptr<llama_model_prefetch> 
 
     if (!state) {
         const llama_model_qwen4exp * pm = this;   // the state belongs to a context, which never outlives its model
-        state = std::make_unique<qwen4exp_prefetch>(n_heads, hp.ple_head_dim,
-                [pm](const int32_t * rows, size_t n_rows, float * dst) { qwen4exp_ple_gather_sync(*pm, rows, n_rows, dst); });
+        state = std::make_unique<qwen4exp_prefetch>(n_heads, ggml_row_size(qwen4exp_ple_input_type(pmodel), hp.ple_head_dim),
+                [pm](const int32_t * rows, size_t n_rows, void * dst) { qwen4exp_ple_gather_sync(*pm, rows, n_rows, dst); });
     }
     llama_ple_async * async = qwen4exp_ring(state.get());
     static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
@@ -2545,13 +2572,14 @@ void llama_model_qwen4exp::prefetch_end(llama_model_prefetch * state) const {
 }
 
 // Host-resident table (memory-mapped or loaded into RAM): dequantize rows idx[0..n_rows) into dst, laid out
-// [dim, n_rows], exactly as the CPU get_rows would (same to_float).
+// [dim, n_rows], exactly as the CPU get_rows would (same to_float); raw: copy the rows as stored instead.
 //
 // The GPU idles while this runs (65536 rows for a 4096-token ubatch), so it is split over host threads:
 // phase 1 queues every page read at once (memory-mapped table, random rows: one madvise per row instead of
 // taking the faults one after another, ~0.2 ms each from NVMe), phase 2 dequantizes. Each row goes through
 // the same to_float as before, so the result is identical. LLAMA_PLE_HOST_THREADS=1 is the serial loop.
-static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * idx, size_t n_rows, float * dst_all) {
+static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * idx, size_t n_rows, void * dst_v, bool raw) {
+    float * dst_all = (float *) dst_v;
     GGML_ASSERT(tab && tab->data);
     const size_t  row_size = ggml_row_size(tab->type, tab->ne[0]);
     const int64_t dim      = tab->ne[0];
@@ -2618,6 +2646,10 @@ static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * id
     auto dequant = [&](size_t k0, size_t k1) {
         for (size_t k = k0; k < k1; ++k) {
             const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
+            if (raw) {
+                memcpy((char *) dst_v + k * row_size, src, row_size);
+                continue;
+            }
             float *      dst = dst_all + k * (size_t) dim;
             if (tab->type == GGML_TYPE_F32) {
                 memcpy(dst, src, dim * sizeof(float));
@@ -2659,15 +2691,20 @@ static void qwen4exp_ple_host_gather(const ggml_tensor * tab, const int32_t * id
 }
 
 // the synchronous row gather for whichever host path the table uses; safe to call from the prefetch worker thread
-static void qwen4exp_ple_gather_sync(const llama_model_qwen4exp & pmodel, const int32_t * idx, size_t n_rows, float * dst) {
+static void qwen4exp_ple_gather_sync(const llama_model_qwen4exp & pmodel, const int32_t * idx, size_t n_rows, void * dst) {
     if (n_rows == 0) {
         return;
     }
+    const bool raw = qwen4exp_ple_input_type(pmodel) != GGML_TYPE_F32;
     if (pmodel.ple_disk) {
-        pmodel.ple_disk->gather(idx, n_rows, dst);
+        if (raw) {
+            pmodel.ple_disk->gather_raw(idx, n_rows, dst);
+        } else {
+            pmodel.ple_disk->gather(idx, n_rows, (float *) dst);
+        }
         return;
     }
-    qwen4exp_ple_host_gather(pmodel.per_layer_tok_embd, idx, n_rows, dst);
+    qwen4exp_ple_host_gather(pmodel.per_layer_tok_embd, idx, n_rows, dst, raw);
 }
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -2736,16 +2773,29 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     if (embd != nullptr) {
-        // host-gathered table (memory-mapped / in RAM, or the on-disk reader): the rows arrive as an F32 input.
-        // idx is exactly what the gathers want: one global row per (token, head), token-major, with
-        // ple_head_offsets folded in by the loop above.
+        // host-gathered table (memory-mapped / in RAM, or the on-disk reader): idx is one global row per (token, head),
+        // token-major, with ple_head_offsets folded in by the loop above.
         GGML_ASSERT(rows == nullptr);
         const int64_t dim = hp.ple_head_dim;
         if (!pmodel.ple_disk) {
             const ggml_tensor * tab = pmodel.per_layer_tok_embd;
             GGML_ASSERT(tab && tab->data && tab->ne[0] == dim);
         }
-        embd_buf.resize(idx.size() * (size_t) dim);
+        GGML_ASSERT(embd->type == qwen4exp_ple_input_type(pmodel));
+        const size_t row_bytes = ggml_row_size(embd->type, dim);
+        const size_t tok_bytes = (size_t) n_heads * row_bytes;
+        const size_t n_bytes   = idx.size() * row_bytes;
+        GGML_ASSERT(ggml_nbytes(embd) == n_bytes);
+
+        // gather straight into the input when it is in host memory, else stage and upload
+        const bool direct = embd->buffer && ggml_backend_buffer_is_host(embd->buffer);
+        uint8_t * dst;
+        if (direct) {
+            dst = (uint8_t *) embd->data;
+        } else {
+            embd_buf.resize(n_bytes);
+            dst = embd_buf.data();
+        }
 
         // the rows of this ubatch were gathered ahead of time on the context's worker thread (prefetch_begin);
         // a token's rows are taken from the ring only when its indices match the ones just computed from the cache,
@@ -2754,9 +2804,10 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         static const bool check = getenv("LLAMA_PLE_ASYNC_CHECK") != nullptr && atoi(getenv("LLAMA_PLE_ASYNC_CHECK")) != 0;
         llama_ple_async * async = ring;
         if (async && async->active()) {
+            GGML_ASSERT(async->token_bytes() == tok_bytes);
             const int64_t t0 = ggml_time_us();
             std::vector<uint8_t> miss;
-            const int64_t hits = async->consume(idx.data(), n_tokens, embd_buf.data(), miss);
+            const int64_t hits = async->consume(idx.data(), n_tokens, dst, miss);
             const int64_t t1 = ggml_time_us();
             if (hits < n_tokens) {
                 std::vector<int32_t> idx_m;
@@ -2768,31 +2819,48 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                         idx_m.insert(idx_m.end(), idx.begin() + i * n_heads, idx.begin() + (i + 1) * n_heads);
                     }
                 }
-                std::vector<float> tmp(idx_m.size() * (size_t) dim);
+                std::vector<uint8_t> tmp(idx_m.size() * row_bytes);
                 qwen4exp_ple_gather_sync(pmodel, idx_m.data(), idx_m.size(), tmp.data());
                 for (size_t k = 0; k < tok_m.size(); ++k) {
-                    memcpy(embd_buf.data() + (size_t) tok_m[k] * n_heads * dim, tmp.data() + k * (size_t) n_heads * dim,
-                           (size_t) n_heads * dim * sizeof(float));
+                    memcpy(dst + (size_t) tok_m[k] * tok_bytes, tmp.data() + k * tok_bytes, tok_bytes);
                 }
             }
             const int64_t t2 = ggml_time_us();
             if (stats) {
-                LLAMA_LOG_INFO("ple_async: ubatch %" PRId64 " tokens, %" PRId64 " from the ring, %" PRId64 " gathered now | wait %.1f ms, fallback %.1f ms\n",
-                        n_tokens, hits, n_tokens - hits, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0);
+                LLAMA_LOG_INFO("ple_async: ubatch %" PRId64 " tokens, %" PRId64 " from the ring, %" PRId64 " gathered now | wait %.1f ms, fallback %.1f ms | %s rows, %s\n",
+                        n_tokens, hits, n_tokens - hits, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0,
+                        ggml_type_name(embd->type), direct ? "into the input" : "staged");
             }
             if (check) {
                 // LLAMA_PLE_ASYNC_CHECK=1: gather the whole ubatch synchronously as well and compare the bytes
-                std::vector<float> ref(embd_buf.size());
+                std::vector<uint8_t> ref(n_bytes);
                 qwen4exp_ple_gather_sync(pmodel, idx.data(), idx.size(), ref.data());
-                const bool same = memcmp(ref.data(), embd_buf.data(), ref.size() * sizeof(float)) == 0;
+                const bool same = memcmp(ref.data(), dst, n_bytes) == 0;
                 LLAMA_LOG_INFO("ple_async check: ubatch %" PRId64 " tokens, %" PRId64 " from the ring: bytes %s the synchronous gather\n",
                         n_tokens, hits, same ? "IDENTICAL to" : "DIFFER from");
                 GGML_ASSERT(same && "ple_async: ring rows differ from the synchronous gather");
             }
         } else {
-            qwen4exp_ple_gather_sync(pmodel, idx.data(), idx.size(), embd_buf.data());
+            qwen4exp_ple_gather_sync(pmodel, idx.data(), idx.size(), dst);
         }
-        ggml_backend_tensor_set(embd, embd_buf.data(), 0, embd_buf.size() * sizeof(float));
+        if (!direct) {
+            ggml_backend_tensor_set(embd, embd_buf.data(), 0, n_bytes);
+        }
+
+        if (raw_ids != nullptr) {
+            // the device dequantizes row k of embd into row k of the PLE embedding
+            const int64_t n_ids = raw_ids->ne[0];
+            if (raw_ids->buffer && ggml_backend_buffer_is_host(raw_ids->buffer)) {
+                int32_t * ids = (int32_t *) raw_ids->data;
+                for (int64_t k = 0; k < n_ids; ++k) {
+                    ids[k] = (int32_t) k;
+                }
+            } else {
+                std::vector<int32_t> ids(n_ids);
+                std::iota(ids.begin(), ids.end(), 0);
+                ggml_backend_tensor_set(raw_ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+            }
+        }
         return;
     }
 
@@ -2992,14 +3060,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
         (model.per_layer_tok_embd && model.per_layer_tok_embd->buffer && ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer));
 
     if (host_gather) {
-        // the gather happens in set_input and arrives as an F32 input,
-        // token-major, which reshapes to what the per-head gathers + concat produce
-        ple_inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim, n_heads * n_tokens);
+        // the gather happens in set_input and arrives as an input, token-major, which reshapes to what the per-head
+        // gathers + concat produce; rows kept as stored are dequantized on the device
+        const ggml_type in_type = qwen4exp_ple_input_type(qmodel);
+        ple_inp->embd = ggml_new_tensor_2d(ctx0, in_type, hparams.ple_head_dim, n_heads * n_tokens);
         ggml_set_input(ple_inp->embd);
         emb = ple_inp->embd;
         if (chain) {
             chain_input_to_device(ple_inp->embd);
             ple_inp->chain_placed = true;
+        }
+        if (in_type != GGML_TYPE_F32) {
+            ple_inp->raw_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+            ggml_set_input(ple_inp->raw_ids);
+            if (chain) {
+                chain_input_to_device(ple_inp->raw_ids);
+            }
+            emb = ggml_get_rows(ctx0, ple_inp->embd, ple_inp->raw_ids);
         }
     } else {
         ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
