@@ -2013,13 +2013,26 @@ static bool ggml_vk_expert_repack_enabled() {
     return on;
 }
 
+// negative-control switches for the tests (GGML_VK_*_TEST_BREAK, GGML_VK_*_NEGCTL): they corrupt results on purpose, so
+// they are compiled in only with GGML_VULKAN_TEST_HOOKS (cmake -DGGML_VULKAN_TEST_HOOKS=ON); otherwise they read as 0 and the
+// environment variable is ignored
+static int ggml_vk_test_hook(const char * name) {
+#ifdef GGML_VULKAN_TEST_HOOKS
+    const char * e = getenv(name);
+    return e != nullptr ? atoi(e) : 0;
+#else
+    GGML_UNUSED(name);
+    return 0;
+#endif
+}
+
 // negative controls (tests only), GGML_VK_EXPERT_REPACK_NEGCTL: 1 stores each row pair of a block swapped on upload and does not
 // undo it on readback (the round trip must fail); 2 swaps on upload and undoes it on readback (the round trip holds, but the host
 // order no longer matches the kernels', so every repacked compute case must fail); 3 corrupts one byte of the first chunk of
 // each write that the GPU reorders in the synchronous path or the GGML_VK_EXPERT_REPACK_GPU_LOAD_TEST path (the round trip
 // must fail)
 static int ggml_vk_expert_repack_negctl() {
-    static const int v = [] { const char * e = getenv("GGML_VK_EXPERT_REPACK_NEGCTL"); return e != nullptr ? atoi(e) : 0; }();
+    static const int v = ggml_vk_test_hook("GGML_VK_EXPERT_REPACK_NEGCTL");
     return v;
 }
 
@@ -2212,7 +2225,7 @@ static bool ggml_vk_hc_defer_enabled() {
 // the HC_CMB spec constant: 0 old load order, 1 loads first, 2 the tests' negative control (GGML_VK_HC_CMB_TEST_BREAK=1: the MoE
 // epilogue drops its last routed slot, the attention-side combine reads stream 0's residual for every stream)
 static uint32_t ggml_vk_hc_cmb_spec() {
-    static const bool brk = [] { const char * e = getenv("GGML_VK_HC_CMB_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+    static const bool brk = ggml_vk_test_hook("GGML_VK_HC_CMB_TEST_BREAK") != 0;
     return !ggml_vk_hc_cmb_enabled() ? 0u : brk ? 2u : 1u;
 }
 
@@ -8558,7 +8571,7 @@ static void ggml_vk_matmul_hcmix(ggml_backend_vk_context * ctx, vk_context& subc
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     const size_t   d_el = ggml_type_size(hc.mixed->type);   // f32 or f16 mixed stream
     // GGML_VK_HC_MIX_PAD_TEST_BREAK=1 (tests only, the negative control): a padded destination is stored packed
-    static const bool pad_break = [] { const char * e = getenv("GGML_VK_HC_MIX_PAD_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+    static const bool pad_break = ggml_vk_test_hook("GGML_VK_HC_MIX_PAD_TEST_BREAK") != 0;
     const uint32_t d_s1 = pad_break ? (uint32_t) hc.mixed->ne[0] : (uint32_t) (hc.mixed->nb[1] / d_el);
     vk_mat_mat_hcmix_push_constants pc {};
     pc.mm = { m, n, k, stride_a, stride_b, d_s1, batch_stride_a, batch_stride_b, d_s1 * n, 0, 1, k, 1, 1, 1, 1, padded_n };
@@ -9035,10 +9048,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                              ne01, ne11, ne10, ne10, stride_b, stride_batch_x, stride_batch_y, padded_n);
     } else {
         // GGML_VK_DENSE_DQ8_TEST_BREAK=1 (negative control): the dq8 GEMM drops its last K step
-        static const bool dq8_break = [] { const char * e = getenv("GGML_VK_DENSE_DQ8_TEST_BREAK"); return e && atoi(e) != 0; }();
+        static const bool dq8_break = ggml_vk_test_hook("GGML_VK_DENSE_DQ8_TEST_BREAK") != 0;
         const bool is_dq8 = pipeline_pre_dq8 != nullptr && pipeline != pipeline_pre_dq8;
         // GGML_VK_HC_W8A8_TEST_BREAK=1 (tests only, the negative control): the hc GEMM skips its last 32-K block
-        static const bool hcd_break = [] { const char * e = getenv("GGML_VK_HC_W8A8_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+        static const bool hcd_break = ggml_vk_test_hook("GGML_VK_HC_W8A8_TEST_BREAK") != 0;
         const uint64_t k_run = (hcd && hcd_break) ? ne10 - 32 : (is_dq8 && dq8_break && ne10 > 64) ? ne10 - 64 : ne10;
         ggml_vk_matmul(
             ctx, subctx, pipeline,
@@ -9050,7 +9063,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             b_col_bytes, (uint64_t)od->nb[1]
         );  // NOLINT
         // GGML_VK_RAGGED_TEST_BREAK=1 (tests only, the negative control): the tail dispatch is skipped
-        static const bool ragged_break = [] { const char * e = getenv("GGML_VK_RAGGED_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+        static const bool ragged_break = ggml_vk_test_hook("GGML_VK_RAGGED_TEST_BREAK") != 0;
         if (pipeline_tail && !ragged_break) {
             // columns [n_main, ne11): B and D windows shifted by n_main columns, like ggml_vk_matmul's own n-chunks
             const uint64_t b_off = (uint64_t) n_main * b_col_bytes;
@@ -10210,7 +10223,7 @@ static void ggml_vk_dsv4_hc_post_norm_impl(ggml_backend_vk_context * ctx, vk_con
         pc.sr1 = r16->second.first;
         pc.sr2 = r16->second.second;
         // GGML_VK_HC_BF16RES_TEST_BREAK=1 (tests only, the negative control): the bf16 reader drops the token pad
-        static const bool brk = [] { const char * e = getenv("GGML_VK_HC_BF16RES_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+        static const bool brk = ggml_vk_test_hook("GGML_VK_HC_BF16RES_TEST_BREAK") != 0;
         if (brk) {
             pc.sr2 -= 8;
         }
@@ -11980,7 +11993,7 @@ static void ggml_vk_mul_mat_vec_id_glu(ggml_backend_vk_context * ctx, vk_context
 
     vk_pipeline dmmv = ggml_vk_moe_glu_gemv_pipeline(ctx, gate, up);
     // negative control (tests only): GGML_VK_MOE_GLU_GEMV_NEGCTL=1 swaps the gate and up experts, so every fused case must fail
-    static const bool neg = [] { const char * e = getenv("GGML_VK_MOE_GLU_GEMV_NEGCTL"); return e != nullptr && atoi(e) != 0; }();
+    static const bool neg = ggml_vk_test_hook("GGML_VK_MOE_GLU_GEMV_NEGCTL") != 0;
     vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     GGML_ASSERT(dmmv != nullptr && to_q8_1 != nullptr);
     if (ggml_vk_repack_rows(src0) != 0) {
@@ -21600,7 +21613,7 @@ static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_cont
         pc.inj.base.sr2 = r16_in->second.second;
         ggml_vk_path_census_add(defer ? "HC_BF16RES_IN_DEFER" : "HC_BF16RES_IN_MOE");
         // GGML_VK_HC_BF16RES_TEST_BREAK=1 (tests only, the negative control): the bf16 reader drops the token pad
-        static const bool brk = [] { const char * e = getenv("GGML_VK_HC_BF16RES_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+        static const bool brk = ggml_vk_test_hook("GGML_VK_HC_BF16RES_TEST_BREAK") != 0;
         if (brk) {
             pc.inj.base.sr2 -= 8;
         }
@@ -21621,7 +21634,7 @@ static void ggml_vk_dsv4_hc_moe_post_norm(ggml_backend_vk_context * ctx, vk_cont
             1u, d.gate_in, d.gate_out,
         };
         // GGML_VK_HC_DEFER_TEST_BREAK=1 (tests only, the negative control): the recomputed combine drops the attention block term
-        static const bool defer_break = [] { const char * e = getenv("GGML_VK_HC_DEFER_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+        static const bool defer_break = ggml_vk_test_hook("GGML_VK_HC_DEFER_TEST_BREAK") != 0;
         vk_op_dsv4_hc_moe_post_norm_defer_push_constants dpc2 = dpc;
         if (defer_break) {
             dpc2.gate_out_a = 0.0f;
