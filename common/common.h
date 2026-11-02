@@ -384,6 +384,8 @@ struct common_params_speculative_draft {
     // probabilities below this (0 = off); the first draft token is always kept. Width-only: the emitted stream is unchanged
     // (hi5/ITEM7-DRAFT-POLICY.md section 1) when the verify batch computes each row as the one-row decode does.
     float mtp_pcum = 0.0f;
+    // MTP only: choose each round's draft width (0..n_max) from per-depth acceptance and measured round time per width
+    bool cost_aware = false;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
