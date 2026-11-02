@@ -8557,7 +8557,9 @@ static void ggml_vk_matmul_hcmix(ggml_backend_vk_context * ctx, vk_context& subc
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t padded_n) {
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     const size_t   d_el = ggml_type_size(hc.mixed->type);   // f32 or f16 mixed stream
-    const uint32_t d_s1 = (uint32_t) (hc.mixed->nb[1] / d_el);
+    // GGML_VK_HC_MIX_PAD_TEST_BREAK=1 (tests only, the negative control): a padded destination is stored packed
+    static const bool pad_break = [] { const char * e = getenv("GGML_VK_HC_MIX_PAD_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+    const uint32_t d_s1 = pad_break ? (uint32_t) hc.mixed->ne[0] : (uint32_t) (hc.mixed->nb[1] / d_el);
     vk_mat_mat_hcmix_push_constants pc {};
     pc.mm = { m, n, k, stride_a, stride_b, d_s1, batch_stride_a, batch_stride_b, d_s1 * n, 0, 1, k, 1, 1, 1, 1, padded_n };
     pc.hc_n_embd   = (uint32_t) hc.x->ne[0];
@@ -10773,9 +10775,12 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
     if (ctx->fused_hc_up_mix) {
         // HC_UP_MIX: ggml_vk_can_fuse_hc_up_mix admitted a single 2-D int8 MMQ GEMM; its output is the HC pre's mixed stream
-        GGML_ASSERT((ctx->num_additional_fused_ops == 3 || ctx->num_additional_fused_ops == 2) && !needs_split);
-        ggml_tensor * pre = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
-        const vk_hcmix_args hc { pre, pre->src[0], ggml_get_op_params_f32(pre, 0), ctx->num_additional_fused_ops == 3 };
+        // with the padded-destination CPY last, the epilogue stores into the CPY's destination through its row stride
+        const int n_pre = ctx->num_additional_fused_ops - (ctx->fused_hc_up_mix_cpy ? 1 : 0);
+        GGML_ASSERT((n_pre == 3 || n_pre == 2) && !needs_split);
+        ggml_tensor * pre = cgraph->nodes[node_idx + n_pre];
+        ggml_tensor * out = ctx->fused_hc_up_mix_cpy ? cgraph->nodes[node_idx + n_pre + 1] : pre;
+        const vk_hcmix_args hc { out, pre->src[0], ggml_get_op_params_f32(pre, 0), n_pre == 3 };
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, true, nullptr, &hc);
     } else if (ctx->fused_mm_cpy16) {
         // MUL_MAT+CPY(f16): ggml_vk_can_fuse_mm_cpy16 admitted only shapes the int8 MMQ GEMM takes
@@ -23281,6 +23286,14 @@ static bool ggml_vk_fn_decode_hc_enabled() {
     }
     return v != 0;
 }
+// HC_UP_MIX_PAD: the HC_UP_MIX epilogue stores straight into the CPY's row-padded f16 destination (LLAMA_HC_MIX_PAD).
+// GGML_VK_HC_MIX_CPY=0 leaves the CPY as its own pass.
+static bool ggml_vk_hc_mix_cpy_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_HC_MIX_CPY"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// test hook: the knobs a test flips between graphs (GGML_VK_HC_UP_MIX) are read again on their next use
 
 // MUL_MAT_VEC_GLU: a SWIGLU (split) whose only reader is a q8_0 mat-vec, the FFN down projection at decode, as one mat-vec that
 // forms B while it loads it (ggml_vk_mmv_glu). GGML_VK_MMV_GLU=0 disables the match and its graph_optimize ordering; read once,
@@ -23484,7 +23497,12 @@ static int ggml_vk_can_fuse_mmv_glu(ggml_backend_vk_context * ctx, const ggml_cg
 // Two forms. f16 gate (LLAMA_HC_GATE_F16 on): MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE, returns 3 (the extra fused nodes); the
 // epilogue rounds each gate as the d16 store does. f32 gate: MUL_MAT + RESHAPE + DSV4_HC_PRE, returns 2; the unfused gate is the
 // int8 MMQ accumulator stored as f32, so the epilogue uses it as is. 0 = no match.
-static int ggml_vk_can_fuse_hc_up_mix(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+// A CPY right after the HC pre that copies the f16 mixed stream into a row-padded f16 destination (LLAMA_HC_MIX_PAD) is folded
+// too (*with_cpy = true, one more extra node): the epilogue stores the padded rows and the HC pre's own tensor is never written.
+static int ggml_vk_can_fuse_hc_up_mix(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, bool * with_cpy = nullptr) {
+    if (with_cpy) {
+        *with_cpy = false;
+    }
     if (!ggml_vk_hc_up_mix_enabled() || node_idx + 2 >= cgraph->n_nodes) {
         return 0;
     }
@@ -23533,6 +23551,17 @@ static int ggml_vk_can_fuse_hc_up_mix(ggml_backend_vk_context * ctx, const struc
     }
     if ((rs->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, node_idx + n_extra - 1) != 1) {
         return 0;
+    }
+    if (with_cpy && node_idx + n_extra + 1 < cgraph->n_nodes) {
+        const ggml_tensor * cp = cgraph->nodes[node_idx + n_extra + 1];
+        const ggml_tensor * d  = cp->src[1];
+        if (cp->op == GGML_OP_CPY && cp->src[0] == pre && pre->type == GGML_TYPE_F16 && d != nullptr && d->type == GGML_TYPE_F16 &&
+            ggml_are_same_shape(d, pre) && d->nb[0] == sizeof(ggml_fp16_t) && d->nb[1] >= pre->nb[1] && d->nb[1] % 16 == 0 &&
+            get_misalign_bytes(ctx, cp) % 16 == 0 && !(pre->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_node_get_use_count(cgraph, node_idx + n_extra) == 1 && ggml_vk_hc_mix_cpy_enabled()) {
+            *with_cpy = true;
+            return n_extra + 1;
+        }
     }
     return n_extra;
 }
@@ -24295,6 +24324,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         vk_qsa_vis_match qsa_vis {};
         ctx->fused_fn_decode_hc = false;
         ctx->fused_mmv_glu = 0;
+        ctx->fused_hc_up_mix_cpy = false;
         ctx->fused_mmid_cpy16 = false;
         ctx->fused_mmid_glu = false;
         ctx->fused_mmid_pair_glu = false;
@@ -24397,14 +24427,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "FN_DECODE_HC";
                 // the kernel reads all of B (lo) and x for every output: nothing may overlap the mixed stream
                 std::fill_n(op_srcs_fused_elementwise, 5, false);
-            } else if (const int hc_mix_extra = ggml_vk_can_fuse_hc_up_mix(ctx, cgraph, i)) {
-                ctx->num_additional_fused_ops = hc_mix_extra;
+            } else if (const int hc_mix_all = ggml_vk_can_fuse_hc_up_mix(ctx, cgraph, i, &ctx->fused_hc_up_mix_cpy)) {
+                const int hc_mix_extra = hc_mix_all - (ctx->fused_hc_up_mix_cpy ? 1 : 0);
+                ctx->num_additional_fused_ops = hc_mix_all;
                 ctx->fused_hc_up_mix = true;
-                fusion_string = hc_mix_extra == 3 ? "HC_UP_MIX" : "HC_UP_MIX_F32G";
-                std::fill_n(op_srcs_fused_elementwise, hc_mix_extra + 1, false);   // x is read at other indices than the mixed output
+                fusion_string = hc_mix_extra == 3 ? (ctx->fused_hc_up_mix_cpy ? "HC_UP_MIX_PAD" : "HC_UP_MIX")
+                                                  : (ctx->fused_hc_up_mix_cpy ? "HC_UP_MIX_F32G_PAD" : "HC_UP_MIX_F32G");
+                std::fill_n(op_srcs_fused_elementwise, hc_mix_all + 1, false);   // x is read at other indices than the mixed output
                 op_srcs_fused_elementwise[hc_mix_extra - 1] = true;   // the RESHAPE of the elided gate
                 if (hc_mix_extra == 3) {
                     op_srcs_fused_elementwise[1] = true;    // the cast's self-reference (see MUL_MAT_CPY16)
+                }
+                if (ctx->fused_hc_up_mix_cpy) {
+                    op_srcs_fused_elementwise[hc_mix_all] = true;   // the CPY's destination view is its own output
                 }
             } else if (ggml_vk_can_fuse_mm_cpy16(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 1;
@@ -24814,6 +24849,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->qsa_vis_limits = nullptr;
                 ctx->fused_fn_decode_hc = false;
                 ctx->fused_mmv_glu = 0;
+                ctx->fused_hc_up_mix_cpy = false;
                 ctx->fused_mmid_cpy16 = false;
                 ctx->fused_mmid_glu = false;
                 ctx->fused_mmid_pair_glu = false;
@@ -24882,6 +24918,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_up_mix = false;
         ctx->fused_fn_decode_hc = false;
         ctx->fused_mmv_glu = 0;
+        ctx->fused_hc_up_mix_cpy = false;
         ctx->fused_mmid_cpy16 = false;
         ctx->fused_mmid_glu = false;
         ctx->fused_mmid_pair_glu = false;
@@ -25514,6 +25551,29 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 add_pattern_alloc_deps(fn_decode_hc_pattern, first_unused + 4);
             }
             keep_pattern(fn_decode_hc_pattern);
+            continue;
+        }
+        // HC_UP_MIX_PAD: either HC_UP_MIX form + the CPY into the padded mixed stream (LLAMA_HC_MIX_PAD) stay consecutive
+        if (ggml_vk_hc_up_mix_enabled() &&
+            match_pattern({ GGML_OP_MUL_MAT, GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE, GGML_OP_CPY }, first_unused) &&
+            graph->nodes[first_unused + 2]->src[0] == graph->nodes[first_unused + 1] &&
+            graph->nodes[first_unused + 3]->src[1] == graph->nodes[first_unused + 2] &&
+            graph->nodes[first_unused + 4]->src[0] == graph->nodes[first_unused + 3]) {
+            if (params && params->add_alloc_dep) {
+                add_pattern_alloc_deps({ GGML_OP_MUL_MAT, GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE, GGML_OP_CPY }, first_unused + 4);
+            }
+            keep_pattern({ GGML_OP_MUL_MAT, GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE, GGML_OP_CPY });
+            continue;
+        }
+        if (ggml_vk_hc_up_mix_enabled() &&
+            match_pattern({ GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE, GGML_OP_CPY }, first_unused) &&
+            graph->nodes[first_unused + 1]->src[0] == graph->nodes[first_unused] &&
+            graph->nodes[first_unused + 2]->src[1] == graph->nodes[first_unused + 1] &&
+            graph->nodes[first_unused + 3]->src[0] == graph->nodes[first_unused + 2]) {
+            if (params && params->add_alloc_dep) {
+                add_pattern_alloc_deps({ GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE, GGML_OP_CPY }, first_unused + 3);
+            }
+            keep_pattern({ GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE, GGML_OP_CPY });
             continue;
         }
         // HC_UP_MIX: MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE stay consecutive, and the GEMM's inputs (lo) stay

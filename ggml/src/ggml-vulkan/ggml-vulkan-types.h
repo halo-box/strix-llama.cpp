@@ -1567,6 +1567,7 @@ struct ggml_backend_vk_context {
     int  fused_mmv_glu {};        // SWIGLU (split) + MUL_MAT (q8_0 mat-vec) (+ SIGMOID + MUL of a [1, N] gate): the chain's node
                                   // count, run as one mat-vec that forms B as it loads it (MUL_MAT_VEC_GLU(_SIG))
     bool fused_fn_decode_hc {};   // SCALE + SILU + MUL_MAT (mat-vec) + RESHAPE + DSV4_HC_PRE (gated) -> one mat-vec (FN_DECODE_HC)
+    bool fused_hc_up_mix_cpy {};   // ... + CPY of the mixed stream into its row-padded destination (LLAMA_HC_MIX_PAD), stored there
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_moe_glu_gemv {}; // MOE_GLU_GEMV: decode gate + up MUL_MAT_ID mat-vecs + SWIGLU in one dispatch
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
