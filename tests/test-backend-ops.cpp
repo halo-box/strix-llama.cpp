@@ -5365,9 +5365,12 @@ struct test_mul_mat_f16b : public test_case {
     const ggml_type type_a;
     const int m, n, k;
     const int pad;
-    test_mul_mat_f16b(ggml_type type_a, int m, int n, int k, int pad = 0) : type_a(type_a), m(m), n(n), k(k), pad(pad) {}
+    const int boff;   // B starts boff f16 elements into its allocation (the model's f16 activations may sit 8 bytes off 16)
+    test_mul_mat_f16b(ggml_type type_a, int m, int n, int k, int pad = 0, int boff = 0) : type_a(type_a), m(m), n(n), k(k), pad(pad), boff(boff) {}
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_F16B"; }
-    std::string vars() override { return pad == 0 ? VARS_TO_STR4(type_a, m, n, k) : VARS_TO_STR5(type_a, m, n, k, pad); }
+    std::string vars() override {
+        return (pad == 0 ? VARS_TO_STR4(type_a, m, n, k) : VARS_TO_STR5(type_a, m, n, k, pad)) + (boff ? "," + VAR_TO_STR(boff) : std::string());
+    }
     double max_nmse_err() override { return 5e-4; }
     void initialize_tensors(ggml_context * ctx) override {
         for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
@@ -5421,9 +5424,9 @@ struct test_mul_mat_f16b : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
-        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k + pad, n);
-        if (pad > 0) {
-            b = ggml_view_2d(ctx, b, k, n, b->nb[1], 0);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k + pad, n + (boff > 0 ? 1 : 0));
+        if (pad > 0 || boff > 0) {
+            b = ggml_view_2d(ctx, b, k, n, b->nb[1], (size_t) boff * sizeof(ggml_fp16_t));
         }
         return ggml_mul_mat(ctx, a, b);
     }
@@ -15540,6 +15543,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 384, 256, 64));   // k < 1024 stays on int8 (not dq8)
     test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 2560, 300, 2560));
     test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 1000, 300, 1024, 128));
+    // B 8 and 4 bytes past a 16-byte boundary (the dense q8_0 x f16 GEMM binds B at its own offset): the qkv shape, a ragged n, the
+    // few-row hc down tile, and a padded row
+    for (int boff : {4, 2}) {
+        test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 10240, 512, 2560, 0, boff));
+        test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 6144, 300, 2560, 0, boff));
+        test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 320, 2048, 10240, 0, boff));
+        test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 1000, 300, 1024, 128, boff));
+    }
     // shapes the XL gate's 1/16 margin (q8_0, k >= 2048) moves from the L to the XL tile (17 L waves vs 9 XL waves on 40 CUs), one
     // with ragged m and n; the same m, n at k = 1024 and the q4_K ones keep the L tile
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
