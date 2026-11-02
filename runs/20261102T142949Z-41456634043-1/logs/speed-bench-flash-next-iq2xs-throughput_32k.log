@@ -1,0 +1,13 @@
+Generating test split:   0%|          | 0/1536 [00:00<?, ? examples/s]Generating test split: 100%|██████████| 1536/1536 [00:00<00:00, 8132.93 examples/s]Generating test split: 100%|██████████| 1536/1536 [00:00<00:00, 8034.55 examples/s]
+speed_bench: loaded 6 samples from bench=throughput_32k category=all
+speed_bench:   0%|          | 0/6 [00:00<?, ?sample/s]speed_bench:  17%|█▋        | 1/6 [02:03<10:18, 123.69s/sample]speed_bench:  33%|███▎      | 2/6 [04:37<09:25, 141.44s/sample]speed_bench:  50%|█████     | 3/6 [04:49<04:07, 82.54s/sample] speed_bench:  67%|██████▋   | 4/6 [05:01<01:49, 54.57s/sample]speed_bench:  83%|████████▎ | 5/6 [07:08<01:20, 80.60s/sample]speed_bench: 100%|██████████| 6/6 [07:20<00:00, 57.44s/sample]speed_bench: 100%|██████████| 6/6 [07:20<00:00, 73.49s/sample]
+
+Summary (elapsed=440.94s)
+category      samples  avg_prompt_t/s  avg_pred_t/s  avg_latency  accept_rate
+------------  -------  --------------  ------------  -----------  -----------
+high_entropy  2        730.87          45.15         138.776s     0.6596     
+mixed         2        54.19           43.93         12.072s      0.5853     
+low_entropy   2        398.32          47.54         69.619s      0.8026     
+overall       6        394.46          45.54         73.489s      0.6966     
+
+speed_bench: wrote /mnt/scratch/actions-runner-01/_work/_temp/logs/speed-bench-flash-next-iq2xs-throughput_32k.json

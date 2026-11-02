@@ -1,0 +1,3 @@
+7774790458a5f467376a5a109b69cda9ed145821
+2026-11-02T10:55:06+01:00
+tests : guard QSA prefix's unexported symbols on Windows shared builds
