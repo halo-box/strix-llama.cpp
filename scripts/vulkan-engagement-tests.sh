@@ -96,9 +96,7 @@ KNOBS=(
 )
 
 # knob | reason
-XFAIL=(
-    "GGML_VK_TEST_REQUIRE_RAGGED|since split_k runs below the tile width, the ragged tail of the small-m GEMMs (m <= 640) takes split_k and the ragged split never engages (open)"
-)
+XFAIL=()
 
 xfail_reason() {
     local e
