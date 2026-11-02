@@ -1,6 +1,10 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
+#if defined(PREP_SG)
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
 
 // Maskless selected-key attention, pre-pass: one workgroup per (query, stream) row of the selection list. It drops
 // invalid entries (< 0 or >= n_kv) and repeated cells (the first occurrence is kept, as the CPU path counts a cell
@@ -13,6 +17,10 @@
 // Duplicates are found with an open-addressing hash table of list positions in shared memory: a position whose
 // cell is already in the table lowers the slot to the smaller position (atomicMin), so the first occurrence wins
 // whatever the thread order.
+//
+// PREP_SG (FA_SEL_LEAN): the same list and count with subgroup operations: the lowest valid position is a subgroup min
+// (one shared atomic per subgroup instead of one per valid entry, which serialised on one word) and the prefix sum of the
+// per-thread counts is a subgroup scan plus the subgroup totals (instead of 8 Hillis-Steele rounds and 16 barriers).
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -90,6 +98,9 @@ void main() {
     barrier();
 
     uint slots[PER_THREAD];
+#if defined(PREP_SG)
+    uint first_valid = NONE;
+#endif
     [[unroll]] for (uint i = 0; i < PER_THREAD; ++i) {
         const uint s = first + i;
         const uint key = key_sh[s];
@@ -109,10 +120,20 @@ void main() {
                 h = (h + 1) & (TABLE - 1);
             }
             slot = h;
+#if defined(PREP_SG)
+            first_valid = min(first_valid, s);
+#else
             atomicMin(first_sh, s);
+#endif
         }
         slots[i] = slot;
     }
+#if defined(PREP_SG)
+    first_valid = subgroupMin(first_valid);
+    if (subgroupElect() && first_valid != NONE) {
+        atomicMin(first_sh, first_valid);
+    }
+#endif
     barrier();
 
     uint kept = 0;
@@ -121,6 +142,22 @@ void main() {
             kept |= 1u << i;
         }
     }
+#if defined(PREP_SG)
+    // exclusive scan of the per-thread counts: within the subgroup, then the totals of the subgroups before it
+    const uint incl = subgroupInclusiveAdd(bitCount(kept));
+    if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
+        scan_sh[gl_SubgroupID] = incl;
+    }
+    barrier();
+    uint before = 0;
+    uint count = 0;
+    for (uint g = 0; g < gl_NumSubgroups; ++g) {
+        const uint t = scan_sh[g];
+        before += g < gl_SubgroupID ? t : 0;
+        count += t;
+    }
+    uint pos = before + incl - bitCount(kept);
+#else
     // inclusive scan of the per-thread counts (Hillis-Steele)
     scan_sh[tid] = bitCount(kept);
     barrier();
@@ -132,6 +169,7 @@ void main() {
     }
     const uint count = scan_sh[WG - 1];
     uint pos = scan_sh[tid] - bitCount(kept);
+#endif
 
     const uint list_base = row * p.list_stride;
     [[unroll]] for (uint i = 0; i < PER_THREAD; ++i) {
