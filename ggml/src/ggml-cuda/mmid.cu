@@ -42,7 +42,9 @@ static __global__ void mm_ids_helper_512_10(
     for (int idx = tid; idx < n_slots; idx += blockDim.x) {
         const int token = idx / 10;
         const int iex   = idx - token * 10;
-        atomicAdd(&counts[ids[token * si1 + iex]], 1);
+        const int expert = ids[token * si1 + iex];
+        if ((unsigned) expert >= 512u) continue;   // no expert's, as in mm_ids_helper and the bounded route
+        atomicAdd(&counts[expert], 1);
     }
     __syncthreads();
 
@@ -60,6 +62,7 @@ static __global__ void mm_ids_helper_512_10(
         const int token = idx / 10;
         const int iex   = idx - token * 10;
         const int expert = ids[token * si1 + iex];
+        if ((unsigned) expert >= 512u) continue;
         const int dst = expert_bounds[expert] + atomicAdd(&cursors[expert], 1);
         ids_dst[dst] = idx;
         if (write_inverse) {
