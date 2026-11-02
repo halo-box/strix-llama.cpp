@@ -5425,6 +5425,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // direct conv: 64 channels x 4 token groups of 8 tokens per workgroup; tail: 256 (channel, column) pairs
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_direct_silu_f32, "ssm_conv_direct_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {64, 32, 1}, {64, 4, 0, 1, 1, 8}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_tail_f32,        "ssm_conv_tail_f32",        ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {256, 1, 0, 0, 2, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ple_conv_f32, "ple_conv_f32", ple_conv_f32_len, ple_conv_f32_data, "main", 4, sizeof(vk_op_ple_conv_push_constants), {256, 16, 1}, {256, 16}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ple_conv_f16, "ple_conv_f16", ple_conv_f16_len, ple_conv_f16_data, "main", 4, sizeof(vk_op_ple_conv_push_constants), {256, 16, 1}, {256, 16}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -16132,6 +16134,44 @@ static void ggml_vk_concat_tail(ggml_backend_vk_context * ctx, vk_context& subct
         pc, { ncols * C, S, 1 });
 }
 
+// PLE concat: only the columns [tail_from, T + H) that the history copies read (the ssm_conv tail mode with ncs = H)
+static void ggml_vk_ple_concat_tail(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_backend_vk_context::ple_conv_match & m) {
+    const ggml_tensor * cc = m.concat;
+    const uint32_t H = (uint32_t) m.state->ne[0];
+    const uint32_t C = (uint32_t) cc->ne[1];
+    const uint32_t T = (uint32_t) cc->ne[0] - H;
+    const uint32_t ncols = (uint32_t) (cc->ne[0] - m.tail_from);
+    if (ncols == 0) {
+        return;
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_tail_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_op_ssm_conv_push_constants pc = {
+        (uint32_t) (C * sizeof(float)), (uint32_t) ((size_t) C * T * sizeof(float)),
+        0,
+        (uint32_t) cc->nb[0], (uint32_t) cc->nb[1], (uint32_t) cc->nb[2],
+        (uint32_t) m.tail_from,
+        H,
+        C, T, 1,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, m.x), ggml_vk_tensor_subbuffer(ctx, m.state),
+          ggml_vk_tensor_subbuffer(ctx, m.state), ggml_vk_tensor_subbuffer(ctx, cc) },
+        pc, { ncols * C, 1, 1 });
+}
+
+static void ggml_vk_ple_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_backend_vk_context::ple_conv_match & m) {
+    const uint32_t C = (uint32_t) m.concat->ne[1];
+    const uint32_t T = (uint32_t) (m.concat->ne[0] - m.state->ne[0]);
+    vk_pipeline pipeline = m.w->type == GGML_TYPE_F16 ? ctx->device->pipeline_ple_conv_f16 : ctx->device->pipeline_ple_conv_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_op_ple_conv_push_constants pc = { C, T };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, m.x), ggml_vk_tensor_subbuffer(ctx, m.state),
+          ggml_vk_tensor_subbuffer(ctx, m.w), ggml_vk_tensor_subbuffer(ctx, m.out) },
+        pc, { C, T, 1 });
+}
+
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (ctx->fused_ssm_conv_direct >= 0) {
         GGML_ASSERT(ctx->num_additional_fused_ops == 1);
@@ -18760,6 +18800,8 @@ static void ggml_vk_prefetch_q_node(ggml_backend_vk_context * ctx, vk_context & 
 
 static bool ggml_vk_gdn_direct_elided(const ggml_backend_vk_context * ctx, const ggml_tensor * node, int node_idx);
 
+static bool ggml_vk_ple_conv_elided(const ggml_backend_vk_context * ctx, int node_idx);
+
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
@@ -18774,6 +18816,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     }
     if (ggml_vk_gdn_direct_elided(ctx, node, node_idx)) {
         return false; // its GATED_DELTA_NET already wrote these rows
+    }
+    if (ggml_vk_ple_conv_elided(ctx, node_idx)) {
+        return false; // computed by the direct PLE conv at its SiLU
     }
 
     VK_LOG_DEBUG("ggml_vk_build_graph(" << node << ", " << ggml_op_name(node->op) << ")");
@@ -19005,6 +19050,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_CONCAT:
+        if (ctx->fused_ple_concat_tail >= 0) {
+            ggml_vk_ple_concat_tail(ctx, compute_ctx, ctx->ple_conv_matches[ctx->fused_ple_concat_tail]);
+            break;
+        }
         if (ctx->fused_concat_tail >= 0) {
             ggml_vk_concat_tail(ctx, compute_ctx, ctx->ssm_conv_direct_matches[ctx->fused_concat_tail]);
             break;
@@ -19129,6 +19178,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_UNARY:
+        if (ctx->fused_ple_conv >= 0) {
+            ggml_vk_ple_conv(ctx, compute_ctx, ctx->ple_conv_matches[ctx->fused_ple_conv]);
+            break;
+        }
         if (ctx->fused_hc_moe_epi) {
             // HC_MOE_EPI_SE: the run starts at the shared expert's gate
             ggml_vk_dsv4_hc_moe_post_norm(ctx, compute_ctx, cgraph, node_idx);
@@ -22922,6 +22975,310 @@ static bool ggml_vk_gdn_direct_elided(const ggml_backend_vk_context * ctx, const
     return false;
 }
 
+// Direct PLE conv (qwen4exp build_ple): the concat of the 9 history columns and x^T feeds four dilated taps (CONT of
+// a transposed view), each multiplied by a weight column, an ADD chain and a SiLU. As on HIP (ple-conv.cu), the concat
+// writes only the columns its history copies read and one kernel at the SiLU computes the output from the state, x and
+// the [4, C] weight; the taps, the MULs, the ADDs and the weight-column copies are not run. GGML_VK_PLE_CONV=0 runs
+// the unfused nodes.
+static bool ggml_vk_ple_conv_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_VK_PLE_CONV");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_vk_ple_conv_reject(const char * why, int node) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    if (dbg) {
+        fprintf(stderr, "ggml_vulkan: direct PLE conv not matched at node %d: %s\n", node, why);
+    }
+    return false;
+}
+
+// nodes after `from` that read t (directly or through a view of it), not counting view nodes themselves
+static int ggml_vk_ple_readers(const ggml_cgraph * cgraph, int from, const ggml_tensor * t, int * last) {
+    int n = 0;
+    for (int j = from; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * r = cgraph->nodes[j];
+        if (ggml_op_is_empty(r->op) || !ggml_vk_node_reads(r, t)) {
+            continue;
+        }
+        ++n;
+        if (last) {
+            *last = j;
+        }
+    }
+    return n;
+}
+
+static int ggml_vk_ple_node_index(const ggml_cgraph * cgraph, int from, const ggml_tensor * t) {
+    for (int j = from; j < cgraph->n_nodes; ++j) {
+        if (cgraph->nodes[j] == t) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+// tap k: CONT(TRANSPOSE(VIEW of the concat at column k * dil, [T, C])); returns k or -1
+static int ggml_vk_ple_tap_index(const ggml_tensor * t, const ggml_tensor * cc, int64_t C, int64_t T, int64_t dil, int K) {
+    if (t->op != GGML_OP_CONT || t->type != GGML_TYPE_F32 || !t->src[0] || t->src[0]->op != GGML_OP_TRANSPOSE ||
+        t->ne[0] != C || t->ne[1] != T || t->ne[2] != 1 || t->ne[3] != 1 || !ggml_is_contiguous(t)) {
+        return -1;
+    }
+    const ggml_tensor * v = t->src[0]->src[0];
+    if (!v || v->op != GGML_OP_VIEW || v->view_src != cc || v->ne[0] != T || v->ne[1] != C || v->ne[2] != 1 ||
+        v->nb[0] != sizeof(float) || v->nb[1] != cc->nb[1] || v->view_offs % (dil * sizeof(float)) != 0) {
+        return -1;
+    }
+    const int64_t k = (int64_t) (v->view_offs / (dil * sizeof(float)));
+    return k < K ? (int) k : -1;
+}
+
+// the weight operand of tap k's MUL: [CPY(F16 -> F32) <-] RESHAPE/VIEW <- CONT <- VIEW of column k of W [K, C].
+// Returns W and appends the CONT (and the cast) to `plumbing`.
+static const ggml_tensor * ggml_vk_ple_weight_root(const ggml_tensor * wk, int64_t C, int k, std::vector<const ggml_tensor *> & plumbing) {
+    if (wk->type != GGML_TYPE_F32 || ggml_nelements(wk) != C) {
+        return nullptr;
+    }
+    const bool cast = wk->op == GGML_OP_CPY;
+    const ggml_tensor * src = cast ? wk->src[0] : wk;
+    while (src && (src->op == GGML_OP_RESHAPE || src->op == GGML_OP_VIEW)) {
+        src = src->src[0];
+    }
+    if (!src || src->op != GGML_OP_CONT) {
+        return nullptr;
+    }
+    const ggml_tensor * wv = src->src[0];
+    if (!wv || wv->op != GGML_OP_VIEW || !wv->view_src) {
+        return nullptr;
+    }
+    const ggml_tensor * W = wv->view_src;
+    if ((cast ? W->type != GGML_TYPE_F16 : W->type != GGML_TYPE_F32) || W->ne[0] != 4 || W->ne[1] != C || W->ne[2] != 1 ||
+        W->ne[3] != 1 || !ggml_is_contiguous(W) || wv->ne[0] != 1 || wv->ne[1] != C || wv->nb[1] != W->nb[1] ||
+        wv->view_offs != (size_t) k * ggml_element_size(W) || src->type != W->type) {
+        return nullptr;
+    }
+    plumbing.push_back(src);
+    if (cast) {
+        // the cast's own dst operand (src[1]) is a fresh tensor in ggml_cast
+        plumbing.push_back(wk);
+    }
+    return W;
+}
+
+static bool ggml_vk_ple_conv_check(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i,
+                                   ggml_backend_vk_context::ple_conv_match & m, bool runtime) {
+    constexpr int K = 4;
+    constexpr int64_t DIL = 3, H = (K - 1) * DIL;
+    const ggml_tensor * cc = cgraph->nodes[i];
+    if (cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cc, 0) != 0 ||
+        (cc->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * st = cc->src[0];
+    const ggml_tensor * tr = cc->src[1];
+    if (!st || !tr || st->type != GGML_TYPE_F32 || tr->type != GGML_TYPE_F32 || tr->op != GGML_OP_TRANSPOSE ||
+        !tr->view_src || tr->view_offs != 0 || st->ne[0] != H) {
+        return false; // not a PLE concat (the GDN one has 3 history columns)
+    }
+    const int64_t T = tr->ne[0];
+    const int64_t C = tr->ne[1];
+    const ggml_tensor * x = tr->view_src;
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x) != C * T || tr->ne[2] != 1 || tr->ne[3] != 1 ||
+        tr->nb[0] != (size_t) C * sizeof(float) || tr->nb[1] != sizeof(float)) {
+        return ggml_vk_ple_conv_reject("x layout", i);
+    }
+    if (T < ssm_conv_direct_min_tokens) {
+        return false;
+    }
+    if (st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) {
+        return ggml_vk_ple_conv_reject("state layout", i);
+    }
+    if (cc->ne[0] != T + H || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) {
+        return ggml_vk_ple_conv_reject("concat layout", i);
+    }
+
+    // readers of the concat: the four taps, their views, and history (tail) copies
+    int64_t tail_from = T + H;
+    int tap[K] = { -1, -1, -1, -1 };
+    for (int n = i + 1; n < cgraph->n_nodes; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (!ggml_vk_node_reads(t, cc)) {
+            continue;
+        }
+        const int k = ggml_vk_ple_tap_index(t, cc, C, T, DIL, K);
+        if (k >= 0) {
+            if (tap[k] >= 0) {
+                return ggml_vk_ple_conv_reject("two taps at one offset", n);
+            }
+            tap[k] = n;
+            continue;
+        }
+        if (t->op == GGML_OP_VIEW || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_RESHAPE) {
+            continue; // tap / tail views: their non-view readers are checked here too
+        }
+        if (!ggml_vk_conv_tail_reader(t, cc, H, tail_from)) {
+            return ggml_vk_ple_conv_reject("the concat has a reader that is neither a tap nor a tail copy", n);
+        }
+    }
+    for (int k = 0; k < K; ++k) {
+        if (tap[k] < 0) {
+            return ggml_vk_ple_conv_reject("missing tap", i);
+        }
+    }
+
+    // each tap feeds one MUL by its weight column; the products chain as ((m0 + m1) + m2) + m3, then SiLU
+    std::vector<int> elided;
+    std::vector<const ggml_tensor *> plumbing;
+    const ggml_tensor * W = nullptr;
+    const ggml_tensor * mul[K] = {};
+    for (int k = 0; k < K; ++k) {
+        const ggml_tensor * tp = cgraph->nodes[tap[k]];
+        int r = -1;
+        if (ggml_vk_ple_readers(cgraph, tap[k] + 1, tp, &r) != 1) {
+            return ggml_vk_ple_conv_reject("tap has more than one reader", tap[k]);
+        }
+        const ggml_tensor * mu = cgraph->nodes[r];
+        if (mu->op != GGML_OP_MUL || mu->type != GGML_TYPE_F32 || !ggml_is_contiguous(mu) || mu->ne[0] != C || mu->ne[1] != T ||
+            mu->ne[2] != 1 || mu->ne[3] != 1 || (mu->src[0] != tp && mu->src[1] != tp)) {
+            return ggml_vk_ple_conv_reject("tap reader is not its weight MUL", r);
+        }
+        const ggml_tensor * Wk = ggml_vk_ple_weight_root(mu->src[0] == tp ? mu->src[1] : mu->src[0], C, k, plumbing);
+        if (!Wk || (W && W != Wk)) {
+            return ggml_vk_ple_conv_reject("tap weight", r);
+        }
+        W = Wk;
+        mul[k] = mu;
+        elided.push_back(tap[k]);
+        elided.push_back(r);
+    }
+    const ggml_tensor * chain = mul[0];
+    int chain_idx = ggml_vk_ple_node_index(cgraph, i + 1, chain);
+    for (int k = 1; k < K; ++k) {
+        int r = -1;
+        if (ggml_vk_ple_readers(cgraph, chain_idx + 1, chain, &r) != 1) {
+            return ggml_vk_ple_conv_reject("chain node has more than one reader", chain_idx);
+        }
+        const ggml_tensor * ad = cgraph->nodes[r];
+        if (ad->op != GGML_OP_ADD || ad->type != GGML_TYPE_F32 || !ggml_is_contiguous(ad) || !ggml_are_same_shape(ad, chain) ||
+            ad->src[0] != chain || ad->src[1] != mul[k]) {
+            return ggml_vk_ple_conv_reject("chain ADD", r);
+        }
+        elided.push_back(r);
+        chain = ad;
+        chain_idx = r;
+    }
+    int silu = -1;
+    if (ggml_vk_ple_readers(cgraph, chain_idx + 1, chain, &silu) != 1) {
+        return ggml_vk_ple_conv_reject("chain end has more than one reader", chain_idx);
+    }
+    ggml_tensor * su = cgraph->nodes[silu];
+    if (su->op != GGML_OP_UNARY || ggml_get_unary_op(su) != GGML_UNARY_OP_SILU || su->src[0] != chain || su->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(su) || !ggml_are_same_shape(su, chain) || (su->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return ggml_vk_ple_conv_reject("no SILU at the end of the chain", silu);
+    }
+    // weight-column copies are elided when only their tap MUL reads them
+    for (const ggml_tensor * t : plumbing) {
+        const int idx = ggml_vk_ple_node_index(cgraph, 0, t);
+        int r = -1;
+        if (idx >= 0 && ggml_vk_ple_readers(cgraph, idx + 1, t, &r) == 1 &&
+            std::find(elided.begin(), elided.end(), r) != elided.end()) {
+            elided.push_back(idx);
+        }
+    }
+    // cast before its CONT: the cast is elided only when its CONT is, re-run once so the order does not matter
+    for (const ggml_tensor * t : plumbing) {
+        const int idx = ggml_vk_ple_node_index(cgraph, 0, t);
+        int r = -1;
+        if (idx >= 0 && std::find(elided.begin(), elided.end(), idx) == elided.end() &&
+            ggml_vk_ple_readers(cgraph, idx + 1, t, &r) == 1 && std::find(elided.begin(), elided.end(), r) != elided.end()) {
+            elided.push_back(idx);
+        }
+    }
+    for (int e : elided) {
+        const ggml_tensor * t = cgraph->nodes[e];
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || e > silu) {
+            return ggml_vk_ple_conv_reject("elided node is an output or after the SiLU", e);
+        }
+    }
+
+    if (runtime) {
+        for (const ggml_tensor * t : { x, st, W, cc, (const ggml_tensor *) su }) {
+            if (!t->buffer || get_misalign_bytes(ctx, t) != 0) {
+                return ggml_vk_ple_conv_reject("unallocated or misaligned tensor", i);
+            }
+        }
+        for (const ggml_tensor * t : { x, st, W, cc }) {
+            if (ggml_vk_tensors_overlap(t, su, false)) {
+                return ggml_vk_ple_conv_reject("the SiLU output overlaps an input", silu);
+            }
+        }
+        // x and the state are read at the SiLU: no node run in between may overwrite them
+        for (int n = i + 1; n < silu; ++n) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            if (t->buffer == nullptr || ggml_op_is_empty(t->op) || ggml_is_empty(t) ||
+                std::find(elided.begin(), elided.end(), n) != elided.end()) {
+                continue;
+            }
+            if (ggml_vk_tensors_overlap(t, x, false) || ggml_vk_tensors_overlap(t, st, false)) {
+                return ggml_vk_ple_conv_reject("x or the state is overwritten before the SiLU", n);
+            }
+        }
+    }
+
+    std::sort(elided.begin(), elided.end());
+    m.concat     = cc;
+    m.state      = st;
+    m.x          = x;
+    m.w          = W;
+    m.out        = su;
+    m.concat_idx = i;
+    m.silu_idx   = silu;
+    m.tail_from  = std::max<int64_t>(0, tail_from);
+    m.elided     = std::move(elided);
+    return true;
+}
+
+static bool ggml_vk_ple_conv_at_concat(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (!ggml_vk_ple_conv_enabled() || cgraph->nodes[i]->op != GGML_OP_CONCAT) {
+        return false;
+    }
+    ggml_backend_vk_context::ple_conv_match m;
+    if (!ggml_vk_ple_conv_check(ctx, cgraph, i, m, true)) {
+        return false;
+    }
+    ctx->ple_conv_matches.push_back(std::move(m));
+    ctx->fused_ple_concat_tail = (int) ctx->ple_conv_matches.size() - 1;
+    return true;
+}
+
+static bool ggml_vk_ple_conv_at_silu(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i) {
+    if (cgraph->nodes[i]->op != GGML_OP_UNARY) {
+        return false;
+    }
+    for (size_t k = 0; k < ctx->ple_conv_matches.size(); ++k) {
+        const auto & m = ctx->ple_conv_matches[k];
+        if (m.silu_idx == i && m.out == cgraph->nodes[i]) {
+            ctx->fused_ple_conv = (int) k;
+            ctx->fused_extra_srcs[0] = m.x;
+            ctx->fused_extra_srcs[1] = m.state;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_vk_ple_conv_elided(const ggml_backend_vk_context * ctx, int node_idx) {
+    for (const auto & m : ctx->ple_conv_matches) {
+        if (node_idx > m.concat_idx && node_idx < m.silu_idx && std::binary_search(m.elided.begin(), m.elided.end(), node_idx)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
@@ -23108,6 +23465,9 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     }
     if (dev->disable_fusion) {
         return "fusion disabled (GGML_VK_DISABLE_FUSION)";
+    }
+    if ((l == "PLE_CONV_SILU" || l == "PLE_CONCAT_TAIL") && !ggml_vk_ple_conv_enabled()) {
+        return "direct PLE conv off (GGML_VK_PLE_CONV=0)";
     }
     if (l == "MULTI_ADD" && !dev->multi_add) {
         return "no multi_add (needs RTE f16 rounding and the push-constant size; GGML_VK_DISABLE_MULTI_ADD)";
@@ -24152,6 +24512,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
     ctx->ssm_conv_direct_matches.clear();
+    ctx->ple_conv_matches.clear();
     ggml_vk_decode_prefetch_plan(ctx, cgraph);
     ggml_vk_prefetch_q_plan(ctx, cgraph);
     ctx->gdn_direct_matches.clear();
@@ -24350,6 +24711,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         ctx->fused_concat_tail = -1;
         ctx->fused_ssm_conv_direct = -1;
+        ctx->fused_ple_concat_tail = -1;
+        ctx->fused_ple_conv = -1;
         std::fill(std::begin(ctx->fused_extra_srcs), std::end(ctx->fused_extra_srcs), nullptr);
         ctx->fused_gdn_direct = -1;
         ctx->fused_extra_dst = nullptr;
@@ -24361,7 +24724,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             uint32_t num_adds = 0;
             vk_hc_boundary_chain hcb;
             int hcb_last = 0;
-            if ((hc_moe_front = ggml_vk_can_fuse_hc_moe_epi(ctx, cgraph, i, hc_moe_mode, hc_moe_inj)) > 0) {
+            // the direct PLE conv's elided nodes start no fusion; its SiLU is decided before anything else can take it
+            const bool ple_elided = ggml_vk_ple_conv_elided(ctx, i);
+            const bool ple_silu   = !ple_elided && ggml_vk_ple_conv_at_silu(ctx, cgraph, i);
+            if (ple_elided) {
+            } else if (ple_silu) {
+                fusion_string = "PLE_CONV_SILU";
+            } else if ((hc_moe_front = ggml_vk_can_fuse_hc_moe_epi(ctx, cgraph, i, hc_moe_mode, hc_moe_inj)) > 0) {
                 // the MoE slot adds and the shared-expert add (elided; with SE the shared expert's gate SIGMOID + MUL in front
                 // of them too), then HC_POST_GATE_NORM(_CPY)(_INJ). Outputs: the combine (the next combine's residual), the
                 // norm, and with the inject fold the inject; the norm is then not the last node, so it is the extra written
@@ -24649,6 +25018,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_ple_conv_at_concat(ctx, cgraph, i)) {
+                fusion_string = "PLE_CONCAT_TAIL";
             } else if (ggml_vk_ssm_conv_direct_at_conv(ctx, cgraph, i)) {
                 // decided at the concat, which then wrote only its tail: this must not fall back
                 ctx->num_additional_fused_ops = 1;
@@ -24844,7 +25215,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
             if (need_disable) {
                 // the direct conv's concat already skipped writing the full tensor; its match checks every overlap
-                GGML_ASSERT(ctx->fused_ssm_conv_direct < 0);
+                GGML_ASSERT(ctx->fused_ssm_conv_direct < 0 && ctx->fused_ple_conv < 0);
                 ctx->num_additional_fused_ops = 0;
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
@@ -24989,7 +25360,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 std::vector<const char *> names;
                 for (int node_idx = prev_node_idx; node_idx < cur_node_idx; ++node_idx) {
                     if (ggml_op_is_empty(cgraph->nodes[node_idx]->op) ||
-                        ggml_vk_gdn_direct_elided(ctx, cgraph->nodes[node_idx], node_idx)) {
+                        ggml_vk_gdn_direct_elided(ctx, cgraph->nodes[node_idx], node_idx) ||
+                        ggml_vk_ple_conv_elided(ctx, node_idx)) {
                         continue;
                     }
                     nodes.push_back(cgraph->nodes[node_idx]);
@@ -26430,6 +26802,19 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 for (const ggml_tensor * input : { m.x, m.state, m.kern }) {
                     auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
                     params->add_alloc_dep(params->user_data, root, g);
+                }
+            }
+        }
+    }
+
+    // direct PLE conv: likewise x and the state are read at the SiLU
+    if (ggml_vk_ple_conv_enabled() && !ctx->device->disable_fusion && params && params->add_alloc_dep) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_backend_vk_context::ple_conv_match m;
+            if (graph->nodes[i]->op == GGML_OP_CONCAT && ggml_vk_ple_conv_check(ctx, graph, i, m, false)) {
+                for (const ggml_tensor * input : { m.x, m.state }) {
+                    auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
+                    params->add_alloc_dep(params->user_data, root, m.out);
                 }
             }
         }
