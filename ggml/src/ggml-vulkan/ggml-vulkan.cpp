@@ -3370,7 +3370,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         if (lds > device->properties.limits.maxComputeSharedMemorySize) {
                             continue;
                         }
-                        const std::vector<uint32_t> spec = { t[0], t[1], t[2], t[3], t[4], t[5] };
+                        // GGML_VK_DQ8_PF2 (bit c = tile c, default 0): that tile prefetches two k steps ahead (mul_mm_dq8.comp PF = 2)
+                        static const uint32_t pf2 = [] { const char * e = getenv("GGML_VK_DQ8_PF2"); return e ? (uint32_t) strtoul(e, nullptr, 0) : 0u; }();
+                        const std::vector<uint32_t> spec = { t[0], t[1], t[2], t[3], t[4], t[5], ((pf2 >> c) & 1u) ? 2u : 1u };
                         ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[0][c], "matmul_dq8_q8_0_f16_" + std::to_string(c),
                                                  matmul_dq8_q8_0_f16_cm1_len, matmul_dq8_q8_0_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
                                                  { t[1], t[2], 1 }, spec, 1, false, true, 32);

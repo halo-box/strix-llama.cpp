@@ -28,6 +28,7 @@ layout(constant_id = 2) const uint BN = 256;
 layout(constant_id = 3) const uint WM = 64;
 layout(constant_id = 4) const uint WN = 64;
 layout(constant_id = 5) const uint BK = 64;   // 64 or 32
+layout(constant_id = 6) const uint PF = 1;    // register prefetch depth: 1 = the next step, 2 = the next two steps (two register sets)
 #ifdef D_F16
 // f16 output (MUL_MAT + CPY(f16) fusion): D is f16, RNE from the f32 accumulators
 #endif
@@ -172,8 +173,14 @@ void main() {
 #else
     uint  araw[A_IT][9];
     bool  a_odd;   // BK 32: this step's block starts 2 bytes into a dword (odd block index); BK 64: the item is the odd block
+    // PF 2: the second register set
+    uint  araw2[A_IT][9];
+    uvec4 braw2[B_IT];
+    bool  a_odd2;
 
-#define FETCH(ks) \
+#define FETCH(ks) FETCH_S(ks, araw, braw, a_odd)
+#define STORE() STORE_S(araw, braw, a_odd)
+#define FETCH_S(ks, araw, braw, a_odd) \
     if (BK == 64) { \
         [[unroll]] for (uint i = 0; i < A_IT; i++) { \
             const uint base = a_row_dw[i] + (ks) * 17 + a_sub[i] * 8; \
@@ -191,7 +198,7 @@ void main() {
     } \
     [[unroll]] for (uint i = 0; i < B_IT; i++) { braw[i] = data_b4[b_src[i] + (ks) * (BK / 8)]; }
 
-#define STORE() \
+#define STORE_S(araw, braw, a_odd) \
     if (BK == 64) { \
         [[unroll]] for (uint i = 0; i < A_IT; i++) { \
             const bool odd = a_sub[i] != 0; \
@@ -243,15 +250,38 @@ void main() {
     FETCH(0)
     STORE()
     barrier();
-    for (uint ks = 0; ks + 1 < nks; ks++) {
-        FETCH(ks + 1)
+    if (PF == 2) {
+        // two steps in flight: while step ks computes, set "2" holds ks + 1 and ks + 2 is fetched into the set just stored; the body
+        // is unrolled by two so each set is named at compile time
+        if (nks > 1) { FETCH_S(1, araw2, braw2, a_odd2) }
+        uint ks = 0;
+        while (true) {
+            if (ks + 2 < nks) { FETCH_S(ks + 2, araw, braw, a_odd) }
+            COMPUTE()
+            barrier();
+            if (ks + 1 >= nks) { break; }
+            STORE_S(araw2, braw2, a_odd2)
+            barrier();
+            ks++;
+            if (ks + 2 < nks) { FETCH_S(ks + 2, araw2, braw2, a_odd2) }
+            COMPUTE()
+            barrier();
+            if (ks + 1 >= nks) { break; }
+            STORE_S(araw, braw, a_odd)
+            barrier();
+            ks++;
+        }
+    } else {
+        for (uint ks = 0; ks + 1 < nks; ks++) {
+            FETCH(ks + 1)
+            COMPUTE()
+            barrier();
+            STORE()
+            barrier();
+        }
         COMPUTE()
-        barrier();
-        STORE()
-        barrier();
+        barrier();   // the partial-tile epilogue below reuses As
     }
-    COMPUTE()
-    barrier();   // the partial-tile epilogue below reuses As
 
 #ifdef HC_EPI
     // RDNA3 / 3.5 wave32 f32 accumulator (the host creates this variant only there): lane l holds column l % 16 and rows 2 e + l / 16 of
