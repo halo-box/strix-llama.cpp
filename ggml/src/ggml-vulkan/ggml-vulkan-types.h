@@ -1067,6 +1067,8 @@ struct vk_device_struct {
     // directly, and the concat node only writes the tail columns its other readers (state copies) use
     vk_pipeline pipeline_ssm_conv_direct_silu_f32;
     vk_pipeline pipeline_ssm_conv_tail_f32;
+    vk_pipeline pipeline_ssm_conv_direct_silu_f16x;   // the direct conv / concat tail with an f16 x (DQ8_F16OUT, ssm_conv.comp MODE 4 / 3)
+    vk_pipeline pipeline_ssm_conv_tail_f16x;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1439,6 +1441,9 @@ struct ggml_backend_vk_context {
     std::vector<ssm_conv_direct_match> ssm_conv_direct_matches;
     int fused_concat_tail {-1};      // current CONCAT writes only its tail (index into ssm_conv_direct_matches)
     int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
+    // DQ8_F16OUT (ggml_vk_dq8_f16out_prepass): MUL_MAT nodes of this graph whose result is stored f16 inside their own allocation,
+    // with the f16 row pitch in elements; their only readers are the direct conv and the concat tail, which widen it on load
+    std::unordered_map<const ggml_tensor *, uint32_t> dq8_f16out;
     // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
     const ggml_tensor * fused_extra_srcs[2] {};
 
