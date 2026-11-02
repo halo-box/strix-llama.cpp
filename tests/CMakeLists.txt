@@ -166,10 +166,6 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-llama_build_and_test(test-qsa-prefix.cpp)
-llama_build_and_test(test-qsa-fast.cpp)
-llama_build_and_test(test-qsa-recover.cpp)
-llama_build_and_test(test-ple-disk.cpp)
 llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
 # llama_context state tests: KV and recurrent state save, load, copy, rollback
 set(LLAMA_CONTEXT_TEST_SRC
@@ -192,6 +188,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp LINK llama)
     llama_build_and_test(test-batch-alloc.cpp LINK llama)
+    llama_build_and_test(test-qsa-prefix.cpp)
+    llama_build_and_test(test-qsa-fast.cpp)
+    llama_build_and_test(test-qsa-recover.cpp)
+    llama_build_and_test(test-ple-disk.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
