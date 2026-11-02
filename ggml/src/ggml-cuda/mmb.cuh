@@ -77,3 +77,8 @@ void ggml_cuda_mmb_release_all(ggml_backend_cuda_context & ctx);
 // GGML_CUDA_OVL (bitmask, default 15 = all on; 0 = off): side streams of the intra-graph concurrency on RDNA3.5.
 //   1: GDN z region, 2: FFN shared expert region, 4: attention K/V region, 8: small-expert tier of the routed GLU
 int ggml_cuda_ovl_mask();
+// The BF16 shadows are copies of weights, keyed by the weight's address. Weight memory that is freed or rewritten
+// drops the shadows built from it, in every context; a context that lost one rebuilds its captured graphs, which hold
+// the shadow's address (ggml_cuda_mmb_shadow_dropped, once per drop).
+void ggml_cuda_mmb_shadow_forget(const void * base, size_t size);
+bool ggml_cuda_mmb_shadow_dropped(ggml_backend_cuda_context & ctx);
