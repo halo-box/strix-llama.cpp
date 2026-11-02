@@ -19,6 +19,8 @@
 // HAS_POST == 0: no combine, xn is the norm of res itself (RMS_NORM + MUL (+ CPY)); x, post and res_out
 // are not accessed.
 // OUT_F16: xn is stored as f16 (the graph's CPY(f16) of the MUL); otherwise f32.
+// X_ADD: x is the sum of two [n_embd, T] inputs (the ADD in front of the combine: the MoE output plus the shared expert),
+// summed as the ADD op does and never stored; both share x's token stride.
 //
 // One workgroup per (stream h, token t) row of n_embd. The row stays in registers between the combine
 // and the normalised write, so the residual is read once and the combine result written once.
@@ -38,6 +40,9 @@ layout(binding = 4, std430) writeonly buffer OBuf { vec4  data_o[]; };
 layout(binding = 5, std430) writeonly buffer NBuf { f16vec4 data_n[]; };
 #else
 layout(binding = 5, std430) writeonly buffer NBuf { vec4    data_n[]; };
+#endif
+#if defined(X_ADD)
+layout(binding = 6, std430) readonly  buffer X2Buf { vec4 data_x2[]; };
 #endif
 
 layout(push_constant) uniform parameter {
@@ -92,7 +97,13 @@ void main() {
         if (i4 < nv4) {
             r = data_r[rb + i4];
             if (HAS_POST != 0) {
+#if defined(X_ADD)
+                // the ADD's own rounding: the sum is formed on its own before it enters the combine
+                precise const vec4 xs = data_x[xb + i4] + data_x2[xb + i4];
+                r = xs * pw + r;
+#else
                 r = data_x[xb + i4] * pw + r;
+#endif
                 data_o[ob + i4] = r;
             }
         }
