@@ -2193,6 +2193,15 @@ static bool ggml_vk_dense_dq8_fewrow(uint32_t m, uint32_t k) {
     return on && m <= 384 && k >= 4096;
 }
 
+// the dq8 route's shape rule for an m x n x k GEMM (ggml_vk_mul_mat_q_f16, and ggml_vk_mul_mat_dq8_d16_ok, which must agree with it):
+// K % 64 == 0, at least 128 rows and 64 columns, and in mode 1 the few-row long-k or the wide enough k <= 4096 shapes
+static bool ggml_vk_dense_dq8_shape_ok(uint32_t m, uint32_t n, uint32_t k, uint32_t shader_cores) {
+    const int mode = ggml_vk_dense_dq8_mode();
+    return mode != 0 && k % 64 == 0 && m >= 128 && n >= 64 &&
+           (mode != 1 || (ggml_vk_dense_dq8_fewrow(m, k) && n >= 1024) ||
+            (k <= 4096 && n >= 256 && CEIL_DIV(m, 128) * CEIL_DIV(n, 256) >= 3 * shader_cores / 4));
+}
+
 static uint32_t ggml_vk_dense_dq8_pick(uint32_t m, uint32_t n, uint32_t k) {
     const int mode = ggml_vk_dense_dq8_mode();
     if (mode >= 2 && mode < 2 + GGML_VK_DQ8_NCFG) {
@@ -10905,15 +10914,17 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false, cgraph->nodes[node_idx + 1]);
     } else if (!ctx->gdn_z16.empty() && ctx->gdn_z16.count(dst)) {
         // GGML_VK_GDN_Z16: the z of a folded GDN out norm, stored as f16 into the front half of its own buffer for the scan
-        // (ggml_vk_gdn_out_norm_prepass admitted only shapes the int8 MMQ GEMM takes)
+        // (ggml_vk_gdn_out_norm_prepass admitted only shapes the int8 MMQ GEMM or, with an f16 B, the dq8 GEMM takes)
         GGML_ASSERT(ctx->num_additional_fused_ops == 0 && !needs_split);
+        // an f16 B GEMM (ggml_vk_mul_mat_dq8_d16_ok) stores through the dq8 f16-output twin, the rest on int8 MMQ
+        const bool dense_d16 = src1->type == GGML_TYPE_F16;
         ggml_tensor z16 = *dst;
         z16.type  = GGML_TYPE_F16;
         z16.nb[0] = sizeof(ggml_fp16_t);
         for (int d = 1; d < GGML_MAX_DIMS; ++d) {
             z16.nb[d] = z16.nb[d - 1] * z16.ne[d - 1];
         }
-        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false, &z16);
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false, &z16, nullptr, dense_d16);
         ggml_vk_path_census_add("GDN_Z16");
     } else if (needs_split) {
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
@@ -23890,6 +23901,29 @@ static bool ggml_vk_mul_mat_f16out_ok(ggml_backend_vk_context * ctx, const ggml_
     return mm->ne[1] > (int64_t) mul_mat_vec_chunk_max_cols && mm->ne[0] > (int64_t) mul_mat_vec_max_cols;
 }
 
+// true when this MUL_MAT takes the dense q8_0 x f16 GEMM (mul_mm_dq8.comp) and can store f16 there (dense_d16 in
+// ggml_vk_mul_mat_q_f16): q8_0 A, f16 B (contiguous, or row-strided and read in place: ggml_vk_f16_rowstride), one 2-D GEMM, the dq8
+// shape rule, and the binding alignment of the dq8 route's runtime guard on the offsets it binds (UMA host buffers included)
+static bool ggml_vk_mul_mat_dq8_d16_ok(ggml_backend_vk_context * ctx, const ggml_tensor * mm) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F16 ||
+        !ggml_is_contiguous(src0) || !(ggml_is_contiguous(src1) || ggml_vk_f16_rowstride(src1)) || !ggml_is_contiguous(mm) ||
+        src0->ne[2] * src0->ne[3] != 1 || src1->ne[2] * src1->ne[3] != 1 ||
+        ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+        ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    const uint32_t m = (uint32_t) src0->ne[1], n = (uint32_t) src1->ne[1], k = (uint32_t) src0->ne[0];
+    if (!ggml_vk_dense_dq8_shape_ok(m, n, k, ctx->device->shader_core_count) ||
+        ctx->device->pipeline_matmul_dq8[1][ggml_vk_dense_dq8_pick(m, n, k)] == nullptr) {
+        return false;
+    }
+    return src0->buffer && src1->buffer && mm->buffer && (src1->nb[1] / sizeof(ggml_fp16_t)) % 8 == 0 &&
+           ggml_vk_tensor_buffer_offset(ctx, src1) % 16 == 0 && ggml_vk_tensor_buffer_offset(ctx, src0) % 4 == 0 &&
+           ggml_vk_tensor_buffer_offset(ctx, mm) % 4 == 0;
+}
+
 static bool ggml_vk_can_fuse_mm_cpy16(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_vk_mm_f16out_enabled() || !ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_CPY })) {
         return false;
@@ -24762,8 +24796,8 @@ static void ggml_vk_hc_defer_guard(ggml_backend_vk_context * ctx, const struct g
 // the CPY's destination; the chain is skipped and the f32 GDN output is never written. The epilogue reproduces rms_norm_small's
 // lane and expression order. The destination is written at the GDN, earlier than the CPY: graph_optimize keeps everything the
 // GDN reads and the GDN tensor itself allocated through the CPY, and the runtime prepass re-checks every overlap.
-// GGML_VK_GDN_Z16=1 (with the fold): the z GEMM stores f16 into the front half of its own buffer and the scan reads that; only
-// a GEMM on the int8 MMQ route can (Flash-Next's z GEMM gets an f16 B and takes the f16-B route, so it does not engage there).
+// GGML_VK_GDN_Z16=1 (with the fold): the z GEMM stores f16 into the front half of its own buffer and the scan reads that; a GEMM
+// on the int8 MMQ route or on the dense q8_0 x f16 GEMM (GGML_VK_DENSE_DQ8; Flash-Next's z: f16 B) can.
 // Not bit-identical to the separate chain (where the last bits differ is not established). The separate norm pass is
 // bandwidth-bound and grows with the token count (Flash-Next on Strix Halo: 0.60 ms per GDN layer at 2048 tokens, 2.45 ms
 // at 8192); the fused scan hides most of it.
@@ -24836,7 +24870,8 @@ static const ggml_tensor * ggml_vk_gdn_z16_gemm(ggml_backend_vk_context * ctx, c
     const ggml_tensor * zr  = z->view_src ? z->view_src : z;
     if (zr->op != GGML_OP_MUL_MAT || z->view_offs != 0 || ggml_nelements(z) != ggml_nelements(zr) || !ggml_is_contiguous(z) ||
         !ggml_is_contiguous(zr) || (zr->flags & GGML_TENSOR_FLAG_OUTPUT) || !idx.count(zr) || idx.at(zr) >= gi ||
-        !ggml_vk_mul_mat_f16out_ok(ctx, zr)) {
+        !(ggml_vk_mul_mat_f16out_ok(ctx, zr) || ggml_vk_mul_mat_dq8_d16_ok(ctx, zr))) {
+        ggml_vk_gdn_on_reject("z16: the z GEMM cannot store f16 (not a whole contiguous MUL_MAT on the int8 or dq8 route)", gi);
         return nullptr;
     }
     for (int n = idx.at(zr) + 1; n < cgraph->n_nodes; ++n) {
@@ -24845,6 +24880,7 @@ static const ggml_tensor * ggml_vk_gdn_z16_gemm(ggml_backend_vk_context * ctx, c
             continue;
         }
         if (ggml_vk_node_reads(t, zr)) {
+            ggml_vk_gdn_on_reject("z16: another node reads the z GEMM output", gi);
             return nullptr;
         }
     }

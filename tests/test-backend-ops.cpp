@@ -7548,7 +7548,8 @@ struct test_gdn_conv_prefill : public test_case {
     const int  x_tail;       // x holds x_tail more tokens after the n_tokens the conv reads (one sequence): the first part
                              // of a conv split at a recurrent state snapshot, whose x is a prefix view of the projection
     // the qwen4exp f16 output norm chain after the GDN (GDN_OUT_NORM_PREFILL): 1 z an input, 2 z from a q8_0 projection (the
-    // GGML_VK_GDN_Z16 candidate), 3 as 1 plus a second reader of the GDN output (the fold has to decline)
+    // GGML_VK_GDN_Z16 candidate), 3 as 1 plus a second reader of the GDN output (the fold has to decline), 4 as 2 with a row-padded f16 B
+    // (the Flash-Next z: the dense q8_0 x f16 GEMM, GGML_VK_DENSE_DQ8)
     const int out_norm;
     std::vector<ggml_tensor *> verify;
     test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads, int n_seqs = 1, bool extra_reader = false, int x_tail = 0,
@@ -7610,11 +7611,21 @@ struct test_gdn_conv_prefill : public test_case {
         if (out_norm && engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_OUTNORM")) {
             const char * z16e = getenv("GGML_VK_GDN_Z16");
             const bool on = chunk && out_norm != 3 && env_knob_on("GGML_VK_GDN_OUTNORM");
+            const bool z16 = z16e != nullptr && atoi(z16e) != 0;
+            // out_norm 4 takes the dq8 route only with GGML_VK_DENSE_DQ8 >= 2 (any shape); mode 1's shape gate is not checked here
+            const char * dq8e = getenv("GGML_VK_DENSE_DQ8");
+            const int dq8 = dq8e != nullptr ? atoi(dq8e) : 0;
+            const bool z16_known = out_norm != 4 || !z16 || dq8 == 0 || dq8 >= 2;
             const struct { const char * key; int64_t want; } checks[] = {
                 { "path:GDN_OUT_NORM", on ? 1 : 0 },
-                { "path:GDN_Z16", on && out_norm == 2 && z16e != nullptr && atoi(z16e) != 0 ? 1 : 0 },
+                { "path:GDN_Z16", on && z16 && (out_norm == 2 || (out_norm == 4 && dq8 >= 2)) ? 1 : 0 },
+                // the f16 B z GEMM stores f16 on the dq8 route, not int8 MMQ
+                { "path:DQ8_F16OUT_STORE", on && z16 && out_norm == 4 && dq8 >= 2 ? 1 : 0 },
             };
             for (const auto & c : checks) {
+                if (!z16_known && strcmp(c.key, "path:GDN_OUT_NORM") != 0) {
+                    continue;
+                }
                 const int64_t n = dispatch_census_count(backend, c.key);
                 if (n != c.want) {
                     msg = std::string(c.key) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(c.want) + ")";
@@ -7691,11 +7702,19 @@ struct test_gdn_conv_prefill : public test_case {
         if (out_norm) {
             // z as the model has it: a reshape of a flat projection computed ahead of the GDN
             ggml_tensor * z = nullptr;
-            if (out_norm == 2) {
+            if (out_norm == 2 || out_norm == 4) {
                 ggml_tensor * wz = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 256, 128 * n_v_heads);
                 ggml_set_name(wz, "wz");
-                ggml_tensor * zin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, (int64_t) n_tokens * S);
-                ggml_set_name(zin, "zin");
+                ggml_tensor * zin = nullptr;
+                if (out_norm == 4) {
+                    // f16 rows padded to 264 halves, read in place through the row stride (the model's padded norm output)
+                    ggml_tensor * zpad = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 264, (int64_t) n_tokens * S);
+                    ggml_set_name(zpad, "zin");
+                    zin = ggml_view_2d(ctx, zpad, 256, (int64_t) n_tokens * S, zpad->nb[1], 0);
+                } else {
+                    zin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, (int64_t) n_tokens * S);
+                    ggml_set_name(zin, "zin");
+                }
                 z = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, wz, zin), 128, n_v_heads, n_tokens, S);
             } else {
                 z = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, n_v_heads, n_tokens, S);
@@ -19209,7 +19228,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the gated output norm in the chunk scan store (GDN_OUT_NORM_PREFILL): ragged and one-token last chunks, a chunk multiple,
     // two sequences, value heads under and over the conv fold's 32, the Flash-Next shape, under 64 tokens (no fold), a z
     // projection (the GGML_VK_GDN_Z16 candidate) and the negative control (a second reader of the GDN output: no fold)
-    for (int on : { 1, 2 }) {
+    for (int on : { 1, 2, 4 }) {
         test_cases.emplace_back(new test_gdn_conv_prefill(100, 2, 4, 1, false, 0, on));
         test_cases.emplace_back(new test_gdn_conv_prefill(65, 2, 4, 1, false, 0, on));
         test_cases.emplace_back(new test_gdn_conv_prefill(128, 2, 6, 1, false, 0, on));
