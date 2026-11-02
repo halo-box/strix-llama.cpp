@@ -45,7 +45,9 @@ struct llama_ple_disk::impl {
     std::vector<uint32_t>                      runs;     // order[runs[u]..runs[u+1]) are the positions of distinct row u
     std::vector<uint8_t>                       raw;      // [distinct rows, rs]
     std::vector<std::pair<int32_t, uint32_t>>  misses;   // (row, index into raw)
-    float *                                    dst     = nullptr; // destination of the gather in progress
+    uint8_t *                                  dst     = nullptr; // destination of the gather in progress
+    size_t                                     dst_stride = 0;    // bytes per row in dst: ne0 floats, or rs when raw_out
+    bool                                       raw_out = false;   // copy the stored rows as they are (gather_raw)
     const uint8_t *                            src_full = nullptr; // preloaded table while a gather reads from it
     uint8_t *                                  bounce0 = nullptr; // calling-thread bounce buffer
 
@@ -304,14 +306,14 @@ struct llama_ple_disk::impl {
     // dequantize distinct row u into the first position that asked for it, then copy it to the others
     void dequant_row(size_t u) const {
         const uint8_t * src   = src_full ? src_full + (size_t) order[runs[u]].first * rs : raw.data() + u * rs;
-        float *         first = dst + (size_t) order[runs[u]].second * ne0;
-        if (to_float) {
-            to_float(src, first, ne0);
+        uint8_t *       first = dst + (size_t) order[runs[u]].second * dst_stride;
+        if (to_float && !raw_out) {
+            to_float(src, (float *) first, ne0);
         } else {
             memcpy(first, src, rs);
         }
         for (uint32_t j = runs[u] + 1; j < runs[u + 1]; ++j) {
-            memcpy(dst + (size_t) order[j].second * ne0, first, (size_t) ne0 * sizeof(float));
+            memcpy(dst + (size_t) order[j].second * dst_stride, first, dst_stride);
         }
     }
 
@@ -387,8 +389,10 @@ struct llama_ple_disk::impl {
         cv_done.wait(lk, [&] { return pending == 0; });
     }
 
-    void gather(const int32_t * idx, size_t n, float * out) {
+    void gather(const int32_t * idx, size_t n, uint8_t * out, bool as_stored) {
         std::lock_guard<std::mutex> lk(mtx);
+        raw_out    = as_stored;
+        dst_stride = as_stored ? rs : (size_t) ne0 * sizeof(float);
         const auto t0 = std::chrono::steady_clock::now();
         GGML_ASSERT(n < UINT32_MAX);
 
@@ -491,7 +495,16 @@ void llama_ple_disk::gather(const int32_t * idx, size_t n, float * dst) {
     GGML_UNUSED(idx); GGML_UNUSED(n); GGML_UNUSED(dst);
     GGML_ABORT("llama_ple_disk: not supported on Windows");
 #else
-    pimpl->gather(idx, n, dst);
+    pimpl->gather(idx, n, (uint8_t *) dst, false);
+#endif
+}
+
+void llama_ple_disk::gather_raw(const int32_t * idx, size_t n, void * dst) {
+#if defined(_WIN32)
+    GGML_UNUSED(idx); GGML_UNUSED(n); GGML_UNUSED(dst);
+    GGML_ABORT("llama_ple_disk: not supported on Windows");
+#else
+    pimpl->gather(idx, n, (uint8_t *) dst, true);
 #endif
 }
 
@@ -523,6 +536,7 @@ bool llama_ple_disk::page_cached() const { return !pimpl->direct; }
 int64_t llama_ple_disk::n_rows()   const { return pimpl->nrows; }
 int64_t llama_ple_disk::ne0()      const { return pimpl->ne0;   }
 size_t  llama_ple_disk::row_size() const { return pimpl->rs;    }
+ggml_type llama_ple_disk::type()   const { return pimpl->type;  }
 
 std::string llama_ple_disk::describe() const {
     return format("%s @ %zu: %lld rows x %lld %s (%zu B/row, %.2f GiB), %s I/O, %d threads, row cache %zu MiB",

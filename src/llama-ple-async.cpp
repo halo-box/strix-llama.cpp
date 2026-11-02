@@ -6,8 +6,8 @@
 #include <chrono>
 #include <cstring>
 
-llama_ple_async::llama_ple_async(int64_t n_heads, int64_t dim, gather_fn fn)
-    : n_heads(n_heads), dim(dim), gather(std::move(fn)) {}
+llama_ple_async::llama_ple_async(int64_t n_heads, size_t row_bytes, gather_fn fn)
+    : n_heads(n_heads), row_bytes(row_bytes), gather(std::move(fn)) {}
 
 llama_ple_async::~llama_ple_async() {
     stop();
@@ -27,7 +27,7 @@ void llama_ple_async::start(std::vector<int32_t> idx_all, int64_t n_tok, int64_t
     n_tokens = n_tok;
     window   = win;
     cap      = 2 * window;
-    ring.resize((size_t) cap * n_heads * dim);
+    ring.resize((size_t) cap * token_bytes());
 
     produced = 0;
     consumed = 0;
@@ -50,7 +50,7 @@ void llama_ple_async::worker_main() {
         }
         // windows start at multiples of `window` and cap is a multiple of it, so a window is contiguous in the ring
         const int64_t slot = t0 % cap;
-        gather(idx_fill.data() + t0 * n_heads, (size_t) (n * n_heads), ring.data() + (size_t) slot * n_heads * dim);
+        gather(idx_fill.data() + t0 * n_heads, (size_t) (n * n_heads), ring.data() + (size_t) slot * token_bytes());
         {
             std::lock_guard<std::mutex> lk(mtx);
             produced = t0 + n;
@@ -64,7 +64,8 @@ void llama_ple_async::worker_main() {
     cv.notify_all();
 }
 
-int64_t llama_ple_async::consume(const int32_t * idx, int64_t n, float * dst, std::vector<uint8_t> & miss) {
+int64_t llama_ple_async::consume(const int32_t * idx, int64_t n, void * dst_v, std::vector<uint8_t> & miss) {
+    uint8_t * dst = (uint8_t *) dst_v;
     miss.assign((size_t) n, 1);
     if (!running) {
         return 0;
@@ -81,7 +82,7 @@ int64_t llama_ple_async::consume(const int32_t * idx, int64_t n, float * dst, st
     }
     st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
-    const size_t  tok_bytes = (size_t) n_heads * dim * sizeof(float);
+    const size_t  tok_bytes = token_bytes();
 
     int64_t hits = 0;
     for (int64_t i = 0; i < n; ++i) {
@@ -93,7 +94,7 @@ int64_t llama_ple_async::consume(const int32_t * idx, int64_t n, float * dst, st
         if (truth[0] < 0 || memcmp(truth, idx + i * n_heads, (size_t) n_heads * sizeof(int32_t)) != 0) {
             continue;
         }
-        memcpy(dst + (size_t) i * n_heads * dim, ring.data() + (size_t) (t % cap) * n_heads * dim, tok_bytes);
+        memcpy(dst + (size_t) i * tok_bytes, ring.data() + (size_t) (t % cap) * tok_bytes, tok_bytes);
         miss[(size_t) i] = 0;
         hits++;
     }

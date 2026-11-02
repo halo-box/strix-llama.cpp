@@ -17,19 +17,21 @@
 // the bytes handed to the graph are exactly what the synchronous gather would have produced. Anything else
 // (unknown predecessors, a different ubatch order) is gathered synchronously as a miss.
 struct llama_ple_async {
-    // gathers n_rows rows idx[0..n_rows) into dst laid out [dim, n_rows]; must be safe to call from the worker
-    using gather_fn = std::function<void(const int32_t * idx, size_t n_rows, float * dst)>;
+    // gathers n_rows rows idx[0..n_rows) into dst, row_bytes each; must be safe to call from the worker
+    using gather_fn = std::function<void(const int32_t * idx, size_t n_rows, void * dst)>;
 
-    llama_ple_async(int64_t n_heads, int64_t dim, gather_fn fn);
+    llama_ple_async(int64_t n_heads, size_t row_bytes, gather_fn fn);
     ~llama_ple_async();
 
     // begin a batch: idx_all is [n_heads, n_tokens] in batch order, -1 for a token whose rows are not known
     void start(std::vector<int32_t> idx_all, int64_t n_tokens, int64_t window);
 
-    // take the next n tokens at the cursor: the rows of token i go to dst + i*n_heads*dim when the ring holds
+    // take the next n tokens at the cursor: the rows of token i go to dst + i*n_heads*row_bytes when the ring holds
     // exactly idx[i*n_heads .. (i+1)*n_heads); miss[i] = 1 otherwise. Blocks until the worker has produced
     // them. Returns the number of hits.
-    int64_t consume(const int32_t * idx, int64_t n, float * dst, std::vector<uint8_t> & miss);
+    int64_t consume(const int32_t * idx, int64_t n, void * dst, std::vector<uint8_t> & miss);
+
+    size_t token_bytes() const { return (size_t) n_heads * row_bytes; }
 
     // end the batch: stops the worker and drops the ring contents
     void stop();
@@ -44,12 +46,12 @@ private:
     void worker_main();
 
     const int64_t n_heads;
-    const int64_t dim;
+    const size_t  row_bytes;
     gather_fn     gather;
 
     std::vector<int32_t> idx_truth;   // as given, -1 = unknown
     std::vector<int32_t> idx_fill;    // unknown rows replaced by row 0 so the gather never sees -1
-    std::vector<float>   ring;        // cap tokens x n_heads x dim
+    std::vector<uint8_t> ring;        // cap tokens x n_heads x row_bytes
     int64_t n_tokens = 0;
     int64_t window   = 0;
     int64_t cap      = 0;             // ring capacity in tokens, a multiple of window

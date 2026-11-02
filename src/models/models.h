@@ -2563,6 +2563,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     // counted as created but never allocated, mapped or read, and build_ple takes its
     // rows from this reader instead of ggml_get_rows.
     std::shared_ptr<llama_ple_disk> ple_disk;
+    // the type host-gathered PLE rows reach the graph in (qwen4exp_ple_input_type), decided once per model
+    mutable std::once_flag ple_in_once;
+    mutable ggml_type      ple_in_type = GGML_TYPE_F32;
     // a bf16 matmul weight left after load keeps the hc mixed stream f32; counted once, on the first graph
     mutable std::once_flag bf16_mm_once;
     mutable bool           bf16_mm = false;
