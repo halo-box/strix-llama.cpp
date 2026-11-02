@@ -38,6 +38,9 @@ private:
         bool stop     = false;
         bool busy     = false; // set by yield_to_queue(), cleared by the worker once it is done processing tasks
         bool yielding = false; // work() is still running on the start_loop() thread
+        // wake the worker only while tasks are queued during a yield, and let it go back to sleep once the queue is
+        // empty, so the end of a yield does not wait for a worker wake-up (LLAMA_SERVER_YIELD_LAZY=0: old behaviour)
+        bool lazy     = true;
     };
     worker_t worker;
 
@@ -146,6 +149,8 @@ private:
 
     // for worker_t
     void worker_loop();
+    void worker_loop_lazy();
+    void worker_wake_if_yielding(); // caller must hold mutex_tasks
     void worker_stop();
 };
 
