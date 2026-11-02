@@ -5297,6 +5297,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // with the gated output norm in the store: the norm needs a head's 128 columns, so one 8-wave workgroup per head
                 ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan_on, "gdn_chunk_scan_on_f32", gdn_chunk_scan_on_f32_len, gdn_chunk_scan_on_f32_data,
                     "main", 11, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {256}, 1, true, true, 32);
+                // store / K^T variants (GGML_VK_GDN_PREP_V4, GGML_VK_GDN_KT_GATHER)
+                ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_prep_v4, "gdn_chunk_prep_v4_f32", gdn_chunk_prep_v4_f32_len, gdn_chunk_prep_v4_f32_data,
+                    "main", 7, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+                ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_prep_v4_nokt, "gdn_chunk_prep_v4_nokt_f32", gdn_chunk_prep_v4_nokt_f32_len,
+                    gdn_chunk_prep_v4_nokt_f32_data, "main", 7, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+                ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan_ktg, "gdn_chunk_scan_ktg_f32", gdn_chunk_scan_ktg_f32_len, gdn_chunk_scan_ktg_f32_data,
+                    "main", 6, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
+                ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan_on_ktg, "gdn_chunk_scan_on_ktg_f32", gdn_chunk_scan_on_ktg_f32_len,
+                    gdn_chunk_scan_on_ktg_f32_data, "main", 11, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {256}, 1, true, true, 32);
                 // MUL_MAT_ID_PAIR_SWIGLU (used only after the fragment layout probe passed): 128 features per workgroup in x
 #define CREATE_MMID_GLU(ti, tn) \
                 ggml_vk_create_pipeline(device, device->pipeline_mmid_glu[ti][0][0], "mul_mm_id_glu_" #tn "_f16", mul_mm_id_glu_ ## tn ## _f16_len, \
@@ -16091,10 +16100,21 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
             o_buf = ggml_vk_tensor_subbuffer(ctx, on.out);
             ggml_vk_path_census_add("GDN_OUT_NORM");
         }
-        vk_pipeline scan = out_norm ? ctx->device->pipeline_gdn_chunk_scan_on : ctx->device->pipeline_gdn_chunk_scan;
-        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_gdn_chunk_prep, 1);
+        // GGML_VK_GDN_PREP_V4=1: the prep stores Qh / Kh / KhT / P as 16-byte units (same bytes). GGML_VK_GDN_KT_GATHER=1 (with
+        // PREP_V4): no KhT copy, the scan gathers K^T from the Kh fragments
+        static const bool prep_v4 = [] { const char * e = getenv("GGML_VK_GDN_PREP_V4"); return e != nullptr && atoi(e) != 0; }();
+        static const bool kt_gather = [] { const char * e = getenv("GGML_VK_GDN_KT_GATHER"); return e != nullptr && atoi(e) != 0; }();
+        const bool ktg = prep_v4 && kt_gather;
+        vk_pipeline prep = ktg ? ctx->device->pipeline_gdn_chunk_prep_v4_nokt : prep_v4 ? ctx->device->pipeline_gdn_chunk_prep_v4
+                                                                                        : ctx->device->pipeline_gdn_chunk_prep;
+        vk_pipeline scan = out_norm ? (ktg ? ctx->device->pipeline_gdn_chunk_scan_on_ktg : ctx->device->pipeline_gdn_chunk_scan_on)
+                                    : (ktg ? ctx->device->pipeline_gdn_chunk_scan_ktg : ctx->device->pipeline_gdn_chunk_scan);
+        if (prep_v4) {
+            ggml_vk_path_census_add(ktg ? "GDN_PREP_V4_KTG" : "GDN_PREP_V4");
+        }
+        ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
         ggml_pipeline_request_descriptor_sets(ctx, scan, 1);
-        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_gdn_chunk_prep,
+        ggml_vk_dispatch_pipeline(ctx, subctx, prep,
             { src_buf[0], src_buf[1], src_buf[3], src_buf[4], scr_buf, cst_buf, cw_buf }, cpc, { neq1, nch, n_seqs });
         ggml_vk_sync_buffers(ctx, subctx);
         if (out_norm) {

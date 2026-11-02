@@ -73,6 +73,9 @@ layout(binding = 0) readonly  buffer VBuf     { float data_v[];     };
 layout(binding = 1) readonly  buffer StateBuf { float data_state[]; };
 layout(binding = 2)           buffer DstBuf   { float data_dst[];   };
 layout(binding = 3) readonly  buffer ScrBuf   { uvec4 scr4[];       };
+#ifdef KT_GATHER
+layout(binding = 3) readonly  buffer ScrBuf16 { float16_t scr16[];  };
+#endif
 layout(binding = 4) readonly  buffer CStBuf   { float data_cst[];   };
 layout(binding = 5) readonly  buffer CWBuf    { float data_cw[];    };
 #ifdef OUT_NORM
@@ -149,6 +152,15 @@ float conv_silu_v(const uint xo, const uint c, const uint tt, const uint s, cons
     v_ = unpackFloat2x16(x1_.z); a[12] = v_.x; a[13] = v_.y; \
     v_ = unpackFloat2x16(x1_.w); a[14] = v_.x; a[15] = v_.y; }
 #define LOAD_A(a, SRC, frag) { const uvec4 y0_ = SRC((frag) + la); const uvec4 y1_ = SRC((frag) + la + 1); SET_A(a, y0_, y1_) }
+#ifdef KT_GATHER
+// KT_GATHER (the prep stores no KhT, gdn_chunk_prep.comp PREP_NOKT): the K^T fragment (k block kt, t block j) is column lr of
+// the Kh tile (t block j, k block kt), 16 halves 32 bytes apart
+#define LOAD_KT(a, kt, j) { \
+    const uint b_ = (qk4 + G_K + QFRAG(j, kt)) * 8 + lr; \
+    [[unroll]] for (uint e_ = 0; e_ < 16; e_++) { a[e_] = scr16[b_ + 16 * e_]; } }
+#else
+#define LOAD_KT(a, kt, j) LOAD_A(a, A_KT, KTFRAG(kt, j))
+#endif
 
 // f32 accumulator -> f16 B operand of the same 16x16 tile: rows 4m+hi, 4m+2+hi are packed into one dword,
 // swapped with the other half-wave, and interleaved into rows 4m..4m+3. (A hi/lo f16 split of S, R and
@@ -302,7 +314,7 @@ void main() {
             TO_B(dsb, ds);
             [[unroll]] for (uint kt = 0; kt < KT; kt++) {
                 MATA a;
-                LOAD_A(a, A_KT, KTFRAG(kt, j));
+                LOAD_KT(a, kt, j);
                 S[kt] = coopMatMulAdd(a, dsb, S[kt]);
             }
 

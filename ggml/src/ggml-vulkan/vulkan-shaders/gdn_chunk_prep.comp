@@ -23,6 +23,8 @@
 // 16 contiguous halves, so a scan lane reads its fragment as two adjacent 16-byte units.
 // Tokens past n_tokens are padded with q = k = 0, g = 0, beta = 0: their T rows/columns and updates vanish.
 // Wave32 required (hand-built RDNA3 WMMA fragments, see gdn_chunk_scan.comp).
+// PREP_V4: Qh, Kh, KhT and P are stored as 16-byte units (byte-identical scratch). PREP_NOKT (with PREP_V4): no KhT, the
+// scan (KT_GATHER) reads K^T from the Kh fragments.
 // Idea from halo-box/strix-llama.cpp#91 (Gaetan Puleo).
 
 #define S_V 128
@@ -64,6 +66,7 @@ layout(binding = 2) readonly  buffer GBuf    { float data_g[];    };
 layout(binding = 3) readonly  buffer BetaBuf { float data_beta[]; };
 layout(binding = 4) writeonly buffer ScrBuf  { uint data_scr[];   };
 layout(binding = 4) writeonly buffer ScrBuf16 { float16_t data_scr16[]; };
+layout(binding = 4) writeonly buffer ScrBuf4  { uvec4 data_scr4[];   };
 layout(binding = 5) readonly  buffer CStBuf  { float data_cst[];  };
 layout(binding = 6) readonly  buffer CWBuf   { float data_cw[];   };
 
@@ -183,11 +186,43 @@ void main() {
         const uint qu = packFloat2x16(f16vec2(qv));
         U[t * QS + kp]        = ku;
         U[(CL + t) * QS + kp] = qu;
+#ifndef PREP_V4
         data_scr[qk_scr + FRAG_H(t, 2 * kp, S_V / 16) / 2]               = qu;
         data_scr[qk_scr + CL * S_V / 2 + FRAG_H(t, 2 * kp, S_V / 16) / 2] = ku;
+#endif
     }
     barrier();
 
+#ifdef PREP_V4
+    // PREP_V4: the scratch written from LDS as 16-byte units in fragment order (unit u of a region: tile u / 32, tile row
+    // (u % 32) / 2, columns 8 (u % 2) .. +7), so a wave stores 512 contiguous bytes instead of 4-byte pieces of 32-byte runs
+    // Qh, Kh: 2 x CL * S_V / 8 units, tile (row block, k block) with S_V / 16 k blocks
+    [[unroll]] for (uint i = 0; i < 2 * CL * S_V / 8 / 256; i++) {
+        const uint p    = tid + 256 * i;
+        const uint isk  = p / (CL * S_V / 8);           // 0 Qh (LDS rows CL..), 1 Kh (LDS rows 0..)
+        const uint u    = p % (CL * S_V / 8);
+        const uint tile = u / 32;
+        const uint row  = (tile / (S_V / 16)) * 16 + (u % 32) / 2;
+        const uint col  = (tile % (S_V / 16)) * 16 + (u % 2) * 8;
+        const uint lb   = ((isk != 0 ? 0 : CL) + row) * QS + col / 2;
+        data_scr4[qk_scr / 4 + p] = uvec4(U[lb], U[lb + 1], U[lb + 2], U[lb + 3]);
+    }
+#ifndef PREP_NOKT
+    // KhT [128][CL] at +CL*128 uints: tile (k block, t block) with CL / 16 t blocks; 8 t values of one k per unit
+    [[unroll]] for (uint i = 0; i < CL * S_V / 8 / 256; i++) {
+        const uint u    = tid + 256 * i;
+        const uint tile = u / 32;
+        const uint k    = (tile / (CL / 16)) * 16 + (u % 32) / 2;
+        const uint t0u  = (tile % (CL / 16)) * 16 + (u % 2) * 8;
+        uint h[8];
+        [[unroll]] for (uint e = 0; e < 8; e++) {
+            const uint a = U[(t0u + e) * QS + k / 2];
+            h[e] = (k & 1) != 0 ? (a >> 16) : (a & 0xFFFFu);
+        }
+        data_scr4[(qk_scr + CL * S_V) / 4 + u] = uvec4(h[0] | (h[1] << 16), h[2] | (h[3] << 16), h[4] | (h[5] << 16), h[6] | (h[7] << 16));
+    }
+#endif
+#else
     // KhT [128][CL] at +CL*128 (in uints): thread (k, t pair)
     for (uint p = tid; p < S_V * CL / 2; p += 256) {
         const uint k  = p / (CL / 2);
@@ -198,6 +233,7 @@ void main() {
         const uint hi = (k & 1) != 0 ? (b >> 16) : (b & 0xFFFFu);
         data_scr[qk_scr + CL * S_V + FRAG_H(k, 2 * tp, CL / 16) / 2] = lo | (hi << 16);
     }
+#endif
 
     // KK^T and QK^T (CL x CL, f32 accumulation): wave w -> product w / 4 (0 KK, 1 QK), tile (w / 2 % 2, w % 2)
     {
@@ -249,7 +285,33 @@ void main() {
             }
         }
         barrier();
-        // A (f32, LDS) and P (f16, scratch); thread (j, r, s)
+        // A (f32, LDS) and P (f16, scratch)
+#ifdef PREP_V4
+        // thread (j, r, 8 s): P as one 16-byte unit (8 columns of a fragment row)
+        [[unroll]] for (uint ii = 0; ii < NVMAX * CL * CL / 8 / 256; ii++) {
+            const uint i  = tid + 256 * ii;
+            const uint j  = i / (CL * CL / 8);
+            const uint r  = (i / (CL / 8)) % CL;
+            const uint s0 = (i % (CL / 8)) * 8;
+            if (j0 + j < nv) {
+                const uint h = hk + (j0 + j) * neq1;
+                uint pk[4];
+                [[unroll]] for (uint e = 0; e < 8; e += 2) {
+                    float pv[2];
+                    [[unroll]] for (uint d = 0; d < 2; d++) {
+                        const uint s = s0 + e + d;
+                        const float ex = s <= r ? exp(Gs[j][r] - Gs[j][s]) : 0.0;
+                        U[(j * CL + r) * AS + s] = floatBitsToUint(s < r ? Bs[j][r] * KK[r * (CL + 1) + s] * ex : 0.0);
+                        pv[d] = scale * QK[r * (CL + 1) + s] * ex;
+                    }
+                    pk[e / 2] = packFloat2x16(f16vec2(float16_t(pv[0]), float16_t(pv[1])));
+                }
+                const uint tp = tp_region + ((seq * nch + c) * H + h) * TPU;
+                data_scr4[(tp + CL * CL / 2) / 4 + FRAG_H(r, s0, CL / 16) / 8] = uvec4(pk[0], pk[1], pk[2], pk[3]);
+            }
+        }
+#else
+        // thread (j, r, s)
         for (uint i = tid; i < NVMAX * CL * CL; i += 256) {
             const uint j = i / (CL * CL);
             const uint r = (i / CL) % CL;
@@ -262,6 +324,7 @@ void main() {
                 data_scr16[2 * (tp + CL * CL / 2) + FRAG_H(r, s, CL / 16)] = float16_t(scale * QK[r * (CL + 1) + s] * e);
             }
         }
+#endif
         barrier();
         // T = (I + A)^-1 diag(beta) by forward substitution: thread (j, col) keeps its column in registers
         if (tid < NVMAX * CL) {
