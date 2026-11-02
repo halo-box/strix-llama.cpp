@@ -24174,7 +24174,7 @@ static void ggml_vk_hc_defer_guard(ggml_backend_vk_context * ctx, const struct g
     ctx->hc_defer = {};
 }
 
-// Chunked GDN with the gated output norm in the scan store (opt-in, GGML_VK_GDN_OUTNORM=1): when the GDN's output is read
+// Chunked GDN with the gated output norm in the scan store (default on, GGML_VK_GDN_OUTNORM=0 off): when the GDN's output is read
 // only by the qwen4exp f16 output norm chain RMS_NORM, MUL(gamma), SIGMOID(z), MUL, CPY(f16) (ggml_vk_gdn_norm_f16_wiring), the
 // scan (gdn_chunk_scan_on: one 8-wave workgroup per head) applies the norm to each chunk's rows and stores the f16 result into
 // the CPY's destination; the chain is skipped and the f32 GDN output is never written. The epilogue reproduces rms_norm_small's
@@ -24182,10 +24182,11 @@ static void ggml_vk_hc_defer_guard(ggml_backend_vk_context * ctx, const struct g
 // GDN reads and the GDN tensor itself allocated through the CPY, and the runtime prepass re-checks every overlap.
 // GGML_VK_GDN_Z16=1 (with the fold): the z GEMM stores f16 into the front half of its own buffer and the scan reads that; only
 // a GEMM on the int8 MMQ route can (Flash-Next's z GEMM gets an f16 B and takes the f16-B route, so it does not engage there).
-// Opt-in: on Qwen3.8-Flash-Next prefill the norm dispatch goes (~0.6 ms per GDN layer) but the 8-wave scan with the norm stage
-// takes ~0.42 ms longer, so pp2048 gains only ~0.3-0.5%.
+// Not bit-identical to the separate chain (where the last bits differ is not established). The separate norm pass is
+// bandwidth-bound and grows with the token count (Flash-Next on Strix Halo: 0.60 ms per GDN layer at 2048 tokens, 2.45 ms
+// at 8192); the fused scan hides most of it.
 static bool ggml_vk_gdn_out_norm_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_VK_GDN_OUTNORM"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("GGML_VK_GDN_OUTNORM"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 

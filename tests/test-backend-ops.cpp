@@ -7516,12 +7516,12 @@ struct test_gdn_conv_prefill : public test_case {
                 return false;
             }
         }
-        // GGML_VK_TEST_REQUIRE_GDN_OUTNORM=1: with GGML_VK_GDN_OUTNORM=1 the chunked GDN applies the output norm chain in its store
-        // (not with a second reader of its output or under 64 tokens; count 0 without the opt-in); with GGML_VK_GDN_Z16=1 the q8_0
+        // GGML_VK_TEST_REQUIRE_GDN_OUTNORM=1: unless GGML_VK_GDN_OUTNORM=0 the chunked GDN applies the output norm chain in its store
+        // (not with a second reader of its output or under 64 tokens; count 0 with GGML_VK_GDN_OUTNORM=0); with GGML_VK_GDN_Z16=1 the q8_0
         // z projection stores f16
         if (out_norm && engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_OUTNORM")) {
             const char * z16e = getenv("GGML_VK_GDN_Z16");
-            const bool on = chunk && out_norm != 3 && env_opt_in("GGML_VK_GDN_OUTNORM");
+            const bool on = chunk && out_norm != 3 && env_knob_on("GGML_VK_GDN_OUTNORM");
             const struct { const char * key; int64_t want; } checks[] = {
                 { "path:GDN_OUT_NORM", on ? 1 : 0 },
                 { "path:GDN_Z16", on && out_norm == 2 && z16e != nullptr && atoi(z16e) != 0 ? 1 : 0 },
