@@ -1,0 +1,164 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// First half of the fused DeepSeek-V4 hc boundary (dsv4_hc_boundary.comp is the second): split-K dot products of the 24
+// hc mix rows with the UNNORMALIZED flat residual,
+//
+//   part[s, t, m] = sum_{k in split s} w[k, m] * x[k, t]
+//
+// The rms norm of x is a per-token scale, so the epilogue applies it to the reduced dots and the normalized flat residual
+// is never written. Partials go to a scratch buffer as [n_split, n_tokens, 24] and the epilogue sums them in split order.
+//
+// TILE == 0 (mat-vec, a few tokens): one 64-thread workgroup per (split of 1024 columns, mix row), four coalesced vec4 of
+//   the row per thread kept in registers across the tokens; the x chunk is read per token (it stays in L2).
+// TILE == 1 (prefill): one 256-thread workgroup per (split of kc columns, 32 tokens). The x and w tiles go through shared
+//   memory in steps of 128 columns (32 lanes read 512 contiguous bytes of a token row), the next step's loads issued before
+//   the current step's math; each thread keeps 3 rows x 1 token of accumulators.
+
+layout(constant_id = 0) const uint TILE = 0;
+
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint K;          // flat row length (hc * n_embd)
+    uint n_tokens;
+    uint nbw1;       // w row stride, elements (a multiple of 4)
+    uint nbx1;       // x token stride, elements (a multiple of 4)
+    uint kc;         // TILE == 1: columns per split, a multiple of 64
+};
+
+layout(binding = 0, std430) readonly buffer W { vec4 data_w4[]; };
+layout(binding = 1, std430) readonly buffer X { vec4 data_x4[]; };
+layout(binding = 2, std430) writeonly buffer P { float data_p[]; };
+
+const uint NMIX = 24;
+
+#define MV_SPLIT 1024
+#define TL_TOK   32
+#define TL_STEP  128
+#define TL_ROWS  3
+
+shared float red[8][NMIX];
+shared float xs[TL_TOK][TL_STEP + 1];
+shared vec4  ws4[NMIX][TL_STEP / 4];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint s   = gl_WorkGroupID.x;
+
+    if (TILE == 0) {
+        // one workgroup per (split of 1024 columns, mix row): four coalesced vec4 per thread, kept across the tokens
+        const uint m  = gl_WorkGroupID.y;
+        const uint k4 = (s * MV_SPLIT) / 4 + tid;
+        vec4 w[4];
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            w[j] = data_w4[(m * nbw1) / 4 + k4 + 64 * j];
+        }
+        for (uint t = 0; t < n_tokens; ++t) {
+            float acc = 0.0f;
+            [[unroll]] for (uint j = 0; j < 4; ++j) {
+                acc += dot(w[j], data_x4[(t * nbx1) / 4 + k4 + 64 * j]);
+            }
+            acc = subgroupAdd(acc);
+            if (gl_NumSubgroups == 1) {
+                if (tid == 0) {
+                    data_p[(s * n_tokens + t) * NMIX + m] = acc;
+                }
+                continue;
+            }
+            if (gl_SubgroupInvocationID == 0) {
+                red[gl_SubgroupID][0] = acc;
+            }
+            barrier();
+            if (tid == 0) {
+                float sum = 0.0f;
+                for (uint g = 0; g < gl_NumSubgroups; ++g) {
+                    sum += red[g][0];
+                }
+                data_p[(s * n_tokens + t) * NMIX + m] = sum;
+            }
+            barrier();
+        }
+        return;
+    }
+
+    const uint t0  = gl_WorkGroupID.y * TL_TOK;
+    const uint tok = tid % TL_TOK;
+    const uint rg  = tid / TL_TOK;   // rows rg*3 .. rg*3+2
+    const uint n_steps = kc / TL_STEP;
+
+    float acc[TL_ROWS];
+    [[unroll]] for (uint r = 0; r < TL_ROWS; ++r) {
+        acc[r] = 0.0f;
+    }
+
+    // one step's tiles in registers: x 32 tokens x 128 columns (32 lanes read 512 contiguous bytes of a token row), w 24 x 128;
+    // the next step's loads are issued before the current step's math, so they overlap it
+    vec4 xr[4];
+    vec4 wr[3];
+    uint kb = s * kc;
+    [[unroll]] for (uint r = 0; r < 4; ++r) {
+        const uint idx = tid + 256 * r;
+        const uint tt  = idx / (TL_STEP / 4);
+        xr[r] = t0 + tt < n_tokens ? data_x4[((t0 + tt) * nbx1 + kb) / 4 + idx % (TL_STEP / 4)] : vec4(0.0f);
+    }
+    [[unroll]] for (uint r = 0; r < 3; ++r) {
+        const uint idx = tid + 256 * r;
+        wr[r] = data_w4[((idx / (TL_STEP / 4)) * nbw1 + kb) / 4 + idx % (TL_STEP / 4)];
+    }
+
+    for (uint step = 0; step < n_steps; ++step) {
+        [[unroll]] for (uint r = 0; r < 4; ++r) {
+            const uint idx = tid + 256 * r;
+            const uint tt  = idx / (TL_STEP / 4);
+            const uint c   = (idx % (TL_STEP / 4)) * 4;
+            xs[tt][c + 0] = xr[r].x;
+            xs[tt][c + 1] = xr[r].y;
+            xs[tt][c + 2] = xr[r].z;
+            xs[tt][c + 3] = xr[r].w;
+        }
+        [[unroll]] for (uint r = 0; r < 3; ++r) {
+            const uint idx = tid + 256 * r;
+            ws4[idx / (TL_STEP / 4)][idx % (TL_STEP / 4)] = wr[r];
+        }
+        barrier();
+
+        if (step + 1 < n_steps) {
+            kb += TL_STEP;
+            [[unroll]] for (uint r = 0; r < 4; ++r) {
+                const uint idx = tid + 256 * r;
+                const uint tt  = idx / (TL_STEP / 4);
+                xr[r] = t0 + tt < n_tokens ? data_x4[((t0 + tt) * nbx1 + kb) / 4 + idx % (TL_STEP / 4)] : vec4(0.0f);
+            }
+            [[unroll]] for (uint r = 0; r < 3; ++r) {
+                const uint idx = tid + 256 * r;
+                wr[r] = data_w4[((idx / (TL_STEP / 4)) * nbw1 + kb) / 4 + idx % (TL_STEP / 4)];
+            }
+        }
+
+        [[unroll]] for (uint k4 = 0; k4 < TL_STEP / 4; ++k4) {
+            const float x0 = xs[tok][k4 * 4 + 0];
+            const float x1 = xs[tok][k4 * 4 + 1];
+            const float x2 = xs[tok][k4 * 4 + 2];
+            const float x3 = xs[tok][k4 * 4 + 3];
+            [[unroll]] for (uint r = 0; r < TL_ROWS; ++r) {
+                const vec4 w = ws4[rg * TL_ROWS + r][k4];
+                acc[r] = fma(w.x, x0, acc[r]);
+                acc[r] = fma(w.y, x1, acc[r]);
+                acc[r] = fma(w.z, x2, acc[r]);
+                acc[r] = fma(w.w, x3, acc[r]);
+            }
+        }
+        barrier();
+    }
+
+    if (t0 + tok < n_tokens) {
+        [[unroll]] for (uint r = 0; r < TL_ROWS; ++r) {
+            data_p[(s * n_tokens + t0 + tok) * NMIX + rg * TL_ROWS + r] = acc[r];
+        }
+    }
+}
