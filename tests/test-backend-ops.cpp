@@ -5439,6 +5439,41 @@ struct test_mul_mat_f16b : public test_case {
 
 // NA q8_0 x f16 GEMMs on distinct weights and one f16 B, outputs summed: with NA * weight bytes past the 32 MB MALL each GEMM
 // meets a cold weight, as in a model, where a repeated single GEMM keeps its weight cached (perf mode only)
+// a q8_0 GEMM with an f32 B (the Flash-Next attention o and shared-expert down): GGML_VK_DENSE_DQ8_F32B converts B to f16 for the
+// dq8 GEMM instead of quantizing it to q8_1. GGML_VK_TEST_REQUIRE_DQ8_F32B=1 asserts the route against the shape rule.
+struct test_mul_mat_dq8_f32b : public test_case {
+    const int m, n, k;
+    test_mul_mat_dq8_f32b(int m, int n, int k) : m(m), n(n), k(k) {}
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_DQ8_F32B"; }
+    std::string vars() override { return VARS_TO_STR3(m, n, k); }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor *) override { return 2ull * m * n * k; }
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_DQ8_F32B")) {
+            return true;
+        }
+        const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_DQ8_F32B");
+        const char * e = getenv("GGML_VK_DENSE_DQ8_F32B");
+        const char * de = getenv("GGML_VK_DENSE_DQ8");
+        const char * le = getenv("GGML_VK_DENSE_DQ8_LONGK");
+        // the shape rule of ggml-vulkan.cpp for 40 CUs (3/4 of a workgroup per CU = 30)
+        const bool want = (e == nullptr || atoi(e) != 0) && (de == nullptr || atoi(de) == 1) && k % 64 == 0 && k >= 512 &&
+                          m >= 128 && n >= 256 && (k <= 4096 || le == nullptr || atoi(le) != 0) &&
+                          ((m + 127) / 128) * ((n + 255) / 256) >= 30;
+        if (c >= 0 && (c > 0) != want) {
+            msg = "MUL_MAT_DQ8_F32B dispatches: " + std::to_string(c) + (want ? " (expected the f16-B dq8 route)" : " (expected int8 MMQ)");
+            return false;
+        }
+        return true;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        return ggml_mul_mat(ctx, a, b);
+    }
+};
+
 struct test_mul_mat_f16b_cold : public test_case {
     const int m, n, k, na;
     test_mul_mat_f16b_cold(int m, int n, int k, int na) : m(m), n(n), k(k), na(na) {}
@@ -15637,6 +15672,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 2560, 300, 6144, 128));
     test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 1000, 1025, 6144, 128));
     test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 2560, 300, 6144));   // packed 12288 B rows camp: stays off dq8
+    // f32 B on the dq8 GEMM (GGML_VK_DENSE_DQ8_F32B): shared-expert down (k 640) full / ragged n, attention o (k 6144, the staging
+    // copy padded against camping), ragged m, and shapes that stay on int8 (n < 256, k < 512, too few workgroups)
+    for (auto mnk : std::vector<std::array<int, 3>>{ {2560, 2048, 640}, {2560, 300, 640}, {2560, 512, 6144}, {1000, 1025, 6144},
+                                                     {2560, 128, 640}, {2560, 512, 320}, {256, 512, 640} }) {
+        test_cases.emplace_back(new test_mul_mat_dq8_f32b(mnk[0], mnk[1], mnk[2]));
+    }
     // B 8 and 4 bytes past a 16-byte boundary (the dense q8_0 x f16 GEMM binds B at its own offset): the qkv shape, a ragged n, the
     // few-row hc down tile, and a padded row
     for (int boff : {4, 2}) {
@@ -19485,6 +19526,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the f32-B dense GEMMs (attention o 2560 x 6144, shared-expert down 2560 x 640: int8 MMQ by default)
     for (auto mk : std::vector<std::array<int64_t, 2>>{ {2560, 6144}, {2560, 640} }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], 8192, mk[1], {1, 1}, {1, 1}));
+    }
+    for (auto mk : std::vector<std::array<int, 2>>{ {2560, 6144}, {2560, 640} }) {
+        for (int n : {512, 1024, 2048, 8192}) {
+            test_cases.emplace_back(new test_mul_mat_dq8_f32b(mk[0], n, mk[1]));
+        }
     }
     for (int n : {2048, 8192}) {
         test_cases.emplace_back(new test_hc_up_mix_f16(2560, n, 320, 128));

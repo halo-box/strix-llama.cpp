@@ -2190,6 +2190,15 @@ static bool ggml_vk_pitch_camps(uint64_t bytes) {
     return bytes % 256 == 0 && std::gcd(bytes / 256, (uint64_t) 16) >= 8;
 }
 
+// GGML_VK_DENSE_DQ8_F32B (default 1, 0 off): a q8_0 GEMM with an f32 B (the Flash-Next attention o 2560 x 6144 and shared-expert
+// down 2560 x 640) leaves int8 MMQ for the dq8 GEMM: B is converted to f16 (row-padded where its pitch would camp) instead of
+// quantized to q8_1. Only where mode 1 would give the dq8 GEMM the shape (k % 64 == 0, k >= 512, n >= 256, enough workgroups).
+// gfx1151, n 8192: shexp down 1170 -> 878 us, attention o 10385 -> 8016 us (op level, conversion included).
+static bool ggml_vk_dense_dq8_f32b() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_DENSE_DQ8_F32B"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
 static uint32_t ggml_vk_dense_dq8_pick(uint32_t m, uint32_t n, uint32_t k) {
     const int mode = ggml_vk_dense_dq8_mode();
     if (mode >= 2 && mode < 2 + GGML_VK_DQ8_NCFG) {
@@ -8681,7 +8690,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
     // GGML_VK_DENSE_F16COOPMAT: listed types leave the int8 path for the f16-B KHR coopmat matmul (not for the f16-out fusion,
     // which exists on the int8 path only)
-    if (can_quantize_y && !d16 && !hcm && !hcd && ggml_vk_mm_prefetch_enabled(ctx->device) &&
+    // GGML_VK_DENSE_DQ8_F32B: an f32-B q8_0 GEMM the dq8 GEMM would take (mode 1 shape rule, the f16 staging copy is padded
+    // against camping below) converts B to f16 instead of quantizing it
+    const bool dq8_f32b = can_quantize_y && !d16 && !hcm && !hcd && ggml_vk_dense_dq8_f32b() && ggml_vk_dense_dq8_mode() == 1 &&
+                          src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && ggml_vk_mm_prefetch_enabled(ctx->device) &&
+                          !x_non_contig && ne02 * ne03 == 1 && ne12 * ne13 == 1 && ne10 % 64 == 0 && ne10 >= 512 && ne01 >= 128 &&
+                          ne11 >= 256 && (ne10 <= 4096 || ggml_vk_dense_dq8_longk()) &&
+                          CEIL_DIV(ne01, 128) * CEIL_DIV(ne11, 256) >= 3 * ctx->device->shader_core_count / 4 &&
+                          ctx->device->pipeline_matmul_dq8[0][0] != nullptr;
+    if (dq8_f32b) {
+        can_quantize_y = false;
+        ggml_vk_path_census_add("MUL_MAT_DQ8_F32B");
+    } else if (can_quantize_y && !d16 && !hcm && !hcd && ggml_vk_mm_prefetch_enabled(ctx->device) &&
         ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10, (uint32_t) ne11, src1->type == GGML_TYPE_F16)) {
         can_quantize_y = false;
         // engagement read: f16-B GEMMs routed by GGML_VK_DENSE_F16B_NATIVE only (not also by the GGML_VK_DENSE_F16COOPMAT list)
@@ -8816,8 +8836,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp): 2-D, f16 B, K % 64 == 0; B's column stride is checked where it is known
     vk_pipeline pipeline_pre_dq8 = nullptr;
     // the row pitch the GEMM reads B at: src1's own, or the f16 staging copy's (row-padded where GGML_VK_DENSE_YPAD pads it)
+    const uint32_t stage_pad = !ggml_vk_dense_ypad_camps(ne10) ? 0u : dq8_f32b ? std::max(ggml_vk_dense_ypad(), 128u) : ggml_vk_dense_ypad();
     const uint64_t b_pitch = y_needs_reformat
-        ? (ne10 + (ggml_vk_dense_ypad_camps(ne10) ? ggml_vk_dense_ypad() : 0u)) * sizeof(ggml_fp16_t)
+        ? (ne10 + stage_pad) * sizeof(ggml_fp16_t)
         : (uint64_t) src1->nb[1];
     if (ggml_vk_dense_dq8_mode() != 0 && src0->type == GGML_TYPE_Q8_0 && y_kernel_type == GGML_TYPE_F16 && !quantize_y &&
         !qx_needs_dequant && !d16 && !hcm && ggml_vk_dim01_contiguous(src0) && ne02 * ne03 == 1 && ne12 * ne13 == 1 &&
@@ -8849,7 +8870,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
     // GGML_VK_DENSE_YPAD: the f16-B staging copy (y_needs_reformat, f32 -> f16 into prealloc_y) is a layout we own; pad its row
     // stride where the unpadded f16 row camps on the DRAM channels. The int8 path (quantize_y) and in-place B are untouched.
-    const uint32_t y_row_pad = (y_needs_reformat && qy_needs_dequant && !y_f32_kernel && ggml_vk_dense_ypad_camps(ne10)) ? ggml_vk_dense_ypad() : 0u;
+    const uint32_t y_row_pad = (y_needs_reformat && qy_needs_dequant && !y_f32_kernel) ? stage_pad : 0u;
     const uint64_t y_row = ne10 + y_row_pad;
     if (y_row_pad != 0) {
         static bool y_row_pad_logged = false;
