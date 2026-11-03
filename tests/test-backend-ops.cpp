@@ -16788,6 +16788,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, mk[0], n, mk[1]));
         }
     }
+    // the merged qwen4exp attn_qkv_gate GEMM (10240 + 6144 rows; 16384 f32 = a 64 KiB output row pitch) and the same with
+    // 64 more rows, and the merged hc down+inject (320 + 4)
+    for (auto mk : std::vector<std::array<int64_t, 2>>{ {16384, 2560}, {16448, 2560}, {324, 10240} }) {
+        for (int n : {2048, 8192}) {
+            test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, mk[0], n, mk[1]));
+        }
+    }
     for (int n : {2048, 8192}) {
         test_cases.emplace_back(new test_hc_up_mix_f16(2560, n, 320, 128));
         test_cases.emplace_back(new test_hc_up_mix_f16(2560, n, 320, 128, false));
