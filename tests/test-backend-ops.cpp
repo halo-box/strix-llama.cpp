@@ -7426,9 +7426,12 @@ struct test_gated_delta_net : public test_case {
 // straight from x and the state and writes only the concat columns the copies read. Allocated through the
 // scheduler so graph_optimize's allocation dependencies apply; x is an intermediate the allocator could reuse.
 // Verified nodes: the SiLU output and every state copy (the state the next ubatch starts from).
+// dense_k > 0: x is the qwen4exp GDN qkv GEMM (q8_0 [dense_k, channels] x f16 [dense_k, n_t], one sequence), which Vulkan may store
+// as f16 for the direct conv and the concat tail (GGML_VK_DQ8_F16OUT); GGML_VK_TEST_REQUIRE_DQ8_F16OUT asserts that it does.
 struct test_ssm_conv_direct : public test_case {
     const int64_t channels, n_t, n_s, n_slots;
     const bool extra_reader; // a whole-concat reader besides the conv: must fall back to the full concat
+    const int64_t dense_k;
 
     std::vector<ggml_tensor *> verify;
 
@@ -7442,11 +7445,40 @@ struct test_ssm_conv_direct : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
 
     std::string vars() override {
-        return VARS_TO_STR5(channels, n_t, n_s, n_slots, extra_reader);
+        return VARS_TO_STR5(channels, n_t, n_s, n_slots, extra_reader) + (dense_k > 0 ? "," + VAR_TO_STR(dense_k) : std::string());
     }
 
-    test_ssm_conv_direct(int64_t channels = 64, int64_t n_t = 7, int64_t n_s = 1, int64_t n_slots = 1, bool extra_reader = false)
-        : channels(channels), n_t(n_t), n_s(n_s), n_slots(n_slots), extra_reader(extra_reader) {}
+    // f16 storage of x (dense_k > 0): the GEMM result is rounded once to f16
+    double max_nmse_err() override { return dense_k > 0 ? 5e-4 : 1e-7; }
+
+    bool checks_engagement() override { return dense_k > 0; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (dense_k == 0 || !engagement_required(backend, "GGML_VK_TEST_REQUIRE_DQ8_F16OUT", "CONCAT_SSM_CONV_SILU")) {
+            return true;
+        }
+        const int64_t want = env_opt_in("GGML_VK_DQ8_F16OUT") && env_knob_on("GGML_VK_DENSE_DQ8") && !extra_reader ? 1 : 0;
+        for (const char * name : { "path:DQ8_F16OUT_STORE", "path:DQ8_F16OUT_IN_CONV", "path:DQ8_F16OUT_IN_TAIL" }) {
+            const int64_t n = dispatch_census_count(backend, name);
+            if (n != want) {
+                msg = std::string(name) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    test_ssm_conv_direct(int64_t channels = 64, int64_t n_t = 7, int64_t n_s = 1, int64_t n_slots = 1, bool extra_reader = false,
+                         int64_t dense_k = 0)
+        : channels(channels), n_t(n_t), n_s(n_s), n_slots(n_slots), extra_reader(extra_reader), dense_k(dense_k) {}
+
+    // dense: only the leaves (an op output may share a consumed leaf's memory under the scheduler's allocation)
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (dense_k == 0 || (t->op == GGML_OP_NONE && t->buffer != nullptr)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         verify.clear();
@@ -7455,7 +7487,19 @@ struct test_ssm_conv_direct : public test_case {
         ggml_set_name(state, "state");
         ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_t, n_s);
         ggml_set_name(x_src, "x_src");
-        ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, like the qkv projection
+        ggml_tensor * x = nullptr;
+        if (dense_k > 0) {
+            GGML_ASSERT(n_s == 1);
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, dense_k, C);
+            ggml_set_name(w, "w_qkv");
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, dense_k, n_t);
+            ggml_set_name(b, "b_norm");
+            ggml_set_input(w);
+            ggml_set_input(b);
+            x = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w, b), C, n_t, n_s);
+        } else {
+            x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, like the qkv projection
+        }
         ggml_tensor * kern = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
         ggml_set_name(kern, "kernel");
         ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * C, n_s * n_slots);
@@ -7482,7 +7526,7 @@ struct test_ssm_conv_direct : public test_case {
         }
         // an independent full-size allocation between the concat and the conv
         ggml_tensor * scratch = ggml_scale(ctx, x_src, 0.25f);
-        if (gf) {
+        if (gf && dense_k == 0) {
             ggml_build_forward_expand(gf, scratch);
         }
 
@@ -19130,6 +19174,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_direct(130, 8, 2, 8));         // tail reaches into the state columns
     test_cases.emplace_back(new test_ssm_conv_direct(10240, 257, 1, 1));     // Flash-Next channels
     test_cases.emplace_back(new test_ssm_conv_direct(256, 64, 1, 1, true));  // another whole-concat reader: no fusion
+    // x = the q8_0 x f16 qkv GEMM (Flash-Next channels and k; ragged token tiles; two rollback slots; an extra reader keeps f32)
+    for (int64_t nt : {256, 300, 2048}) {
+        test_cases.emplace_back(new test_ssm_conv_direct(10240, nt, 1, 2, false, 2560));
+    }
+    test_cases.emplace_back(new test_ssm_conv_direct(10240, 300, 1, 2, false, 1024));
+    test_cases.emplace_back(new test_ssm_conv_direct(10240, 300, 1, 1, true, 2560));
     // Convolution/SiLU elided into the chunked GDN, allocated through the scheduler.
     test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 2));
     test_cases.emplace_back(new test_gdn_conv_prefill(512, 2, 4));

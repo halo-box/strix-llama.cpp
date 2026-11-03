@@ -1124,6 +1124,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_direct_silu_f32;
     vk_pipeline pipeline_ssm_conv_tail_f32;
     vk_pipeline pipeline_ple_conv_f32, pipeline_ple_conv_f16;   // by weight type
+    vk_pipeline pipeline_ssm_conv_direct_silu_f16x;   // the direct conv / concat tail with an f16 x (DQ8_F16OUT, ssm_conv.comp MODE 4 / 3)
+    vk_pipeline pipeline_ssm_conv_tail_f16x;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1649,6 +1651,9 @@ struct ggml_backend_vk_context {
     std::vector<ple_conv_match> ple_conv_matches;
     int fused_ple_concat_tail {-1};
     int fused_ple_conv {-1};
+    // DQ8_F16OUT (ggml_vk_dq8_f16out_prepass): MUL_MAT nodes of this graph whose result is stored f16 inside their own allocation,
+    // with the f16 row pitch in elements; their only readers are the direct conv and the concat tail, which widen it on load
+    std::unordered_map<const ggml_tensor *, uint32_t> dq8_f16out;
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;

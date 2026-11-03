@@ -2163,6 +2163,23 @@ static int ggml_vk_dense_dq8_mode() {
     return mode;
 }
 
+// GGML_VK_DQ8_F16OUT: the qwen4exp GDN qkv GEMM on the dense q8_0 x f16 GEMM stores its result as f16 inside its own f32
+// allocation, rows GGML_VK_DQ8_F16OUT_PAD elements (default 128) past the row length, when its only readers are the direct conv
+// and the concat tail (ssm_conv.comp MODE 4 / 3), which widen it exactly (ggml_vk_dq8_f16out_prepass). 0 keeps the f32 store.
+static bool ggml_vk_dq8_f16out_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_DQ8_F16OUT"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+static uint32_t ggml_vk_dq8_f16out_pad() {
+    static const uint32_t pad = [] { const char * e = getenv("GGML_VK_DQ8_F16OUT_PAD"); return e ? (uint32_t) atoi(e) : 128u; }();
+    return pad;
+}
+// negative control (GGML_VK_DQ8_F16OUT_TEST_BREAK=1): the readers take the f16 rows 8 elements short of their pitch
+static uint32_t ggml_vk_dq8_f16out_test_break() {
+    static const uint32_t b = [] { const char * e = getenv("GGML_VK_DQ8_F16OUT_TEST_BREAK"); return (e && atoi(e) != 0) ? 8u : 0u; }();
+    return b;
+}
+
 // GGML_VK_HC_DQ8: the HC_UP_MIX fusion (hc up GEMM + gated hc pre) on mul_mm_dq8.comp with an f16 B instead of int8 MMQ (default 1, =0 keeps int8 MMQ)
 static bool ggml_vk_hc_dq8_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_VK_HC_DQ8"); return e == nullptr || atoi(e) != 0; }();
@@ -5456,6 +5473,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_tail_f32,        "ssm_conv_tail_f32",        ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {256, 1, 0, 0, 2, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ple_conv_f32, "ple_conv_f32", ple_conv_f32_len, ple_conv_f32_data, "main", 4, sizeof(vk_op_ple_conv_push_constants), {256, 16, 1}, {256, 16}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ple_conv_f16, "ple_conv_f16", ple_conv_f16_len, ple_conv_f16_data, "main", 4, sizeof(vk_op_ple_conv_push_constants), {256, 16, 1}, {256, 16}, 1);
+    if (device->fp16) {
+        // f16 x (the DQ8_F16OUT qkv store): the same two kernels widening x on load
+        ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_direct_silu_f16x, "ssm_conv_direct_silu_f16x", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {64, 32, 1}, {64, 4, 0, 1, 4, 8}, 1);
+        ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_tail_f16x,        "ssm_conv_tail_f16x",        ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {256, 1, 0, 0, 3, 1}, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -8619,8 +8641,10 @@ static void ggml_vk_matmul_hcmix(ggml_backend_vk_context * ctx, vk_context& subc
         { a, b, ggml_vk_tensor_subbuffer(ctx, hc.mixed, true), ggml_vk_tensor_subbuffer(ctx, hc.x, true) }, pc, { m, n, 1 });
 }
 
+// dense_d16 (DQ8_F16OUT, ggml_vk_dq8_f16out_prepass): out16 is dst's own allocation viewed as f16 rows pitch apart, stored by the
+// dense q8_0 x f16 GEMM's f16-output twin (mul_mm_dq8.comp D_F16); the prepass admitted only shapes that take that GEMM.
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k, ggml_tensor * out16 = nullptr,
-        const vk_hcmix_args * hcmix = nullptr) {
+        const vk_hcmix_args * hcmix = nullptr, bool dense_d16 = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << ggml_type_name(dst->type) << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
@@ -8639,7 +8663,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t ne13 = src1->ne[3];
 
     const bool d16 = out16 != nullptr;
-    GGML_ASSERT(!d16 || (out16->type == GGML_TYPE_F16 && ggml_is_contiguous(out16) && ggml_are_same_shape(out16, dst)));
+    GGML_ASSERT(!dense_d16 || (d16 && src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F16));
+    GGML_ASSERT(!d16 || (out16->type == GGML_TYPE_F16 && ggml_are_same_shape(out16, dst) &&
+                         (ggml_is_contiguous(out16) || (dense_d16 && out16->nb[0] == sizeof(ggml_fp16_t) && out16->nb[1] % 16 == 0))));
     const bool hcm = hcmix != nullptr;   // HC_UP_MIX: the output is the mixed stream, like d16 an int8-MMQ-only store
     GGML_ASSERT(!(d16 && hcm));
     const ggml_tensor * od = hcm ? hcmix->mixed : d16 ? out16 : dst;
@@ -8709,7 +8735,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                         (src1->type == GGML_TYPE_F32 ||
                          (src1->type == GGML_TYPE_F16 && (ggml_is_contiguous(src1) || y_rowstride) && src1->nb[1] % 16 == 0 && src1_off % 16 == 0)) &&
                         ctx->device->pipeline_matmul_dq8_hcmix[od->type == GGML_TYPE_F16 ? 1 : 0] != nullptr;
-    if (hc_dq8) {
+    if (hc_dq8 || dense_d16) {
         can_quantize_y = false;
     }
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
@@ -8718,7 +8744,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
                                         (ggml_prec)dst->op_params[0], false, can_quantize_y, prefer_f16_b);
     // an f16 output and the HC_UP_MIX epilogue exist only on the int8 MMQ path; every fallback below would write f32 into the f16 buffer
-    GGML_ASSERT(!(d16 || hcm) || y_kernel_type == GGML_TYPE_Q8_1 || (hc_dq8 && y_kernel_type == GGML_TYPE_F16));
+    GGML_ASSERT(!(d16 || hcm) || y_kernel_type == GGML_TYPE_Q8_1 || ((hc_dq8 || dense_d16) && y_kernel_type == GGML_TYPE_F16));
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
@@ -8726,7 +8752,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
         ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], false,
-                                             d16 || (hcm && !hc_dq8 && od->type == GGML_TYPE_F16), false, hcm && !hc_dq8);
+                                             (d16 && !dense_d16) || (hcm && !hc_dq8 && od->type == GGML_TYPE_F16), false, hcm && !hc_dq8);
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
     const bool qy_needs_dequant = y_needs_reformat;
@@ -8828,12 +8854,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp): 2-D, f16 B, K % 64 == 0; B's column stride is checked where it is known
     vk_pipeline pipeline_pre_dq8 = nullptr;
     if (ggml_vk_dense_dq8_mode() != 0 && src0->type == GGML_TYPE_Q8_0 && y_kernel_type == GGML_TYPE_F16 && !quantize_y &&
-        !qx_needs_dequant && !d16 && !hcm && ggml_vk_dim01_contiguous(src0) && ne02 * ne03 == 1 && ne12 * ne13 == 1 &&
+        !qx_needs_dequant && (!d16 || dense_d16) && !hcm && ggml_vk_dim01_contiguous(src0) && ne02 * ne03 == 1 && ne12 * ne13 == 1 &&
         ne10 % 64 == 0 && ne01 >= 128 && ne11 >= 64 && ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
         (ggml_vk_dense_dq8_mode() != 1 ||
          (ggml_vk_dense_dq8_fewrow((uint32_t) ne01, (uint32_t) ne10) && ne11 >= 1024) ||
          (ne10 <= 4096 && ne11 >= 256 && CEIL_DIV(ne01, 128) * CEIL_DIV(ne11, 256) >= 3 * ctx->device->shader_core_count / 4))) {
-        vk_pipeline & pd = ctx->device->pipeline_matmul_dq8[0][ggml_vk_dense_dq8_pick((uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10)];
+        vk_pipeline & pd = ctx->device->pipeline_matmul_dq8[dense_d16 ? 1 : 0][ggml_vk_dense_dq8_pick((uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10)];
         if (pd) {
             pipeline_pre_dq8 = pipeline;
             pipeline = pd;
@@ -8852,6 +8878,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             router_f16h = true;
         }
     }
+    // the f16 store exists only on the dq8 GEMM; every other route would write f32 rows into the f16 layout
+    GGML_ASSERT(!dense_d16 || pipeline_pre_dq8 != nullptr);
     if (ctx->perf_logger) {
         // per-call path record (GGML_VK_PERF_LOGGER): the once-printed "XL tile engaged" line cannot say how many calls took which variant
         ctx->perf_logger->count_path(std::string(quantize_y ? "int8:" : "f16:") + pipeline->name + " " + ggml_type_name(src0->type) +
@@ -8892,7 +8920,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
     // HC_UP_MIX writes the mixed stream (n_embd x N), a quarter of the gate GEMM's dst: size the store by its own tensor
-    const uint64_t d_sz = hcm ? ggml_nbytes(od) : ggml_type_size(od->type) * d_ne;
+    const uint64_t d_sz = (hcm || dense_d16) ? ggml_nbytes(od) : ggml_type_size(od->type) * d_ne;
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -9073,10 +9101,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         // (an f32 A with 16-byte loads: a 16-byte aligned A binding)
         if (stride_b % 8 != 0 || y_buf_offset % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0 ||
             x_buf_offset % (router_f16h ? 16 : 4) != 0 || d_buf_offset % 4 != 0) {
+            GGML_ASSERT(!dense_d16);   // ggml_vk_dq8_f16out_ok checked the same alignment
             pipeline = pipeline_pre_dq8;   // split_k stays 1 (valid for every pipeline)
             router_f16h = false;
         } else {
             ggml_vk_path_census_add(router_f16h ? "MUL_MAT_ROUTER_F16H" : "MUL_MAT_DENSE_DQ8");
+            if (dense_d16) {
+                ggml_vk_path_census_add("DQ8_F16OUT_STORE");
+            }
         }
     }
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y && !y_rowstride) {
@@ -10846,6 +10878,18 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         ggml_tensor * out = ctx->fused_hc_up_mix_cpy ? cgraph->nodes[node_idx + n_pre + 1] : pre;
         const vk_hcmix_args hc { out, pre->src[0], ggml_get_op_params_f32(pre, 0), n_pre == 3 };
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, true, nullptr, &hc);
+    } else if (!ctx->dq8_f16out.empty() && ctx->dq8_f16out.count(dst)) {
+        // DQ8_F16OUT (ggml_vk_dq8_f16out_prepass): f16 D into dst's own allocation, rows pitch elements apart; its readers widen it.
+        // The node runs alone (a fusion consuming it would read the f16 bytes as f32).
+        GGML_ASSERT(ctx->num_additional_fused_ops == 0 && !needs_split);
+        ggml_tensor d16 = *dst;
+        d16.type  = GGML_TYPE_F16;
+        d16.nb[0] = sizeof(ggml_fp16_t);
+        d16.nb[1] = (size_t) ctx->dq8_f16out.at(dst) * sizeof(ggml_fp16_t);
+        d16.nb[2] = d16.nb[1] * dst->ne[1];
+        d16.nb[3] = d16.nb[2] * dst->ne[2];
+        GGML_ASSERT(ggml_nbytes(&d16) <= ggml_nbytes(dst));
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, true, &d16, nullptr, true);
     } else if (ctx->fused_mm_cpy16) {
         // MUL_MAT+CPY(f16): ggml_vk_can_fuse_mm_cpy16 admitted only shapes the int8 MMQ GEMM takes
         GGML_ASSERT(ctx->num_additional_fused_ops == 1 && !needs_split);
@@ -16178,11 +16222,18 @@ static void ggml_vk_ssm_conv_direct(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t T = (uint32_t) m.out->ne[1];
     const uint32_t S = (uint32_t) m.out->ne[2];
 
-    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_direct_silu_f32;
+    // DQ8_F16OUT: x was stored f16 with its own row pitch (ggml_vk_dq8_f16out_prepass)
+    const auto f16_it = ctx->dq8_f16out.find(m.x);
+    const bool x16 = f16_it != ctx->dq8_f16out.end();
+    const uint32_t x_row = x16 ? (uint32_t) ((f16_it->second - ggml_vk_dq8_f16out_test_break()) * sizeof(ggml_fp16_t)) : (uint32_t) (C * sizeof(float));
+    vk_pipeline pipeline = x16 ? ctx->device->pipeline_ssm_conv_direct_silu_f16x : ctx->device->pipeline_ssm_conv_direct_silu_f32;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    if (x16) {
+        ggml_vk_path_census_add("DQ8_F16OUT_IN_CONV");
+    }
 
     const vk_op_ssm_conv_push_constants pc = {
-        (uint32_t) (C * sizeof(float)), (uint32_t) ((size_t) C * T * sizeof(float)),
+        x_row, (uint32_t) ((size_t) x_row * T),
         (uint32_t) m.kern->nb[1],
         (uint32_t) m.out->nb[0], (uint32_t) m.out->nb[1], (uint32_t) m.out->nb[2],
         (uint32_t) m.kern->ne[0],
@@ -16206,11 +16257,17 @@ static void ggml_vk_concat_tail(ggml_backend_vk_context * ctx, vk_context& subct
         return;
     }
 
-    vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_tail_f32;
+    const auto f16_it = ctx->dq8_f16out.find(m.x);
+    const bool x16 = f16_it != ctx->dq8_f16out.end();
+    const uint32_t x_row = x16 ? (uint32_t) ((f16_it->second - ggml_vk_dq8_f16out_test_break()) * sizeof(ggml_fp16_t)) : (uint32_t) (C * sizeof(float));
+    vk_pipeline pipeline = x16 ? ctx->device->pipeline_ssm_conv_tail_f16x : ctx->device->pipeline_ssm_conv_tail_f32;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    if (x16) {
+        ggml_vk_path_census_add("DQ8_F16OUT_IN_TAIL");
+    }
 
     const vk_op_ssm_conv_push_constants pc = {
-        (uint32_t) (C * sizeof(float)), (uint32_t) ((size_t) C * T * sizeof(float)),
+        x_row, (uint32_t) ((size_t) x_row * T),
         0,
         (uint32_t) cc->nb[0], (uint32_t) cc->nb[1], (uint32_t) cc->nb[2],
         (uint32_t) m.tail_from,
@@ -16357,6 +16414,9 @@ void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subctx, con
 }
 
 void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // a DQ8_F16OUT x is read only through CONCAT_TAIL and the direct conv (ggml_vk_dq8_f16out_prepass); the full concat reads f32
+    GGML_ASSERT(ctx->dq8_f16out.empty() || (!ctx->dq8_f16out.count(src1->view_src ? src1->view_src : src1) &&
+                                           !ctx->dq8_f16out.count(src0->view_src ? src0->view_src : src0)));
     int * op_params = (int *)dst->op_params;
 
     const uint32_t unit_size = ggml_vk_concat_unit_size(dst->type);
@@ -22702,6 +22762,9 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
 }
 
 // Direct GDN conv: CONCAT(state [3, C, S], transpose(x [C, T, S]), dim 0) -> SSM_CONV(width 4) -> SILU.
+static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i,
+                                          ggml_backend_vk_context::ssm_conv_direct_match & m, bool runtime);
+
 // The concat transposes x into an [T+3, C, S] tensor (84 MB at T = 2048 for Flash-Next) that the conv reads once.
 // Instead the conv reads x in its channel-contiguous layout and the state directly, and the concat node writes
 // only the tail columns that its other readers (the recurrent conv-state copies, which read the last 3 columns
@@ -23367,6 +23430,99 @@ static bool ggml_vk_ple_conv_elided(const ggml_backend_vk_context * ctx, int nod
         }
     }
     return false;
+}
+
+// DQ8_F16OUT: the GEMM takes the dense q8_0 x f16 GEMM (ggml_vk_mul_mat_q_f16's dq8 rule, its f16-output twin and its alignment
+// checks) with a 2-D, f16 B read in place
+static bool ggml_vk_dq8_f16out_ok(ggml_backend_vk_context * ctx, const ggml_tensor * mm) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F16 ||
+        ggml_vk_dense_dq8_mode() == 0 || !ggml_vk_mm_prefetch_enabled(ctx->device) || ctx->device->coopmat2 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(mm) || mm->view_src != nullptr ||
+        !(ggml_is_contiguous(src1) || ggml_vk_f16_rowstride(src1)) ||
+        src0->ne[2] * src0->ne[3] != 1 || src1->ne[2] * src1->ne[3] != 1 ||
+        ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange ||
+        ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+        !ggml_vk_dense_f16coopmat(src0->type, (uint32_t) src1->ne[0], (uint32_t) src1->ne[1], true)) {
+        return false;
+    }
+    const uint64_t m = src0->ne[1], n = src1->ne[1], k = src0->ne[0];
+    if (k % 64 != 0 || m < 128 || n < 64) {
+        return false;
+    }
+    if (ggml_vk_dense_dq8_mode() == 1 &&
+        !((ggml_vk_dense_dq8_fewrow((uint32_t) m, (uint32_t) k) && n >= 1024) ||
+          (k <= 4096 && n >= 256 && CEIL_DIV(m, 128) * CEIL_DIV(n, 256) >= 3 * ctx->device->shader_core_count / 4))) {
+        return false;
+    }
+    if (!ctx->device->pipeline_matmul_dq8[1][ggml_vk_dense_dq8_pick((uint32_t) m, (uint32_t) n, (uint32_t) k)]) {
+        return false;
+    }
+    // 16-byte B loads (column stride; the binding starts at B), dword A and D
+    const uint64_t b_col = ggml_is_contiguous(src1) ? (uint64_t) k : src1->nb[1] / sizeof(ggml_fp16_t);
+    // (the offsets ggml_vk_mul_mat_q_f16 binds: A and B relative to their mapped host buffer on UMA)
+    if (b_col % 8 != 0 || ggml_vk_tensor_buffer_offset(ctx, src1) % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0 ||
+        ggml_vk_tensor_buffer_offset(ctx, src0) % 4 != 0 || (vk_tensor_offset(mm) + mm->view_offs) % 4 != 0) {
+        return false;
+    }
+    return true;
+}
+
+// DQ8_F16OUT for the qwen4exp GDN qkv GEMM: x of a direct conv match (the same structural + runtime check the concat makes) that is
+// a plain MUL_MAT of this graph on the dq8 GEMM, not a graph output, whose only reader besides views is that match's CONCAT. Its
+// readers are then the concat tail and the direct conv, both of which widen the f16 store exactly; anything else keeps f32.
+static void ggml_vk_dq8_f16out_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->dq8_f16out.clear();
+    if (!ggml_vk_dq8_f16out_enabled() || ctx->device->disable_fusion || !ggml_vk_ssm_conv_direct_enabled() ||
+        ctx->device->pipeline_ssm_conv_direct_silu_f16x == nullptr || ctx->device->pipeline_ssm_conv_tail_f16x == nullptr) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i]->op != GGML_OP_CONCAT) {
+            continue;
+        }
+        ggml_backend_vk_context::ssm_conv_direct_match m;
+        if (!ggml_vk_ssm_conv_direct_check(ctx, cgraph, i, m, true)) {
+            continue;
+        }
+        const ggml_tensor * x = m.x;
+        static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+        if (ctx->dq8_f16out.count(x) || (x->flags & GGML_TENSOR_FLAG_OUTPUT) || x->ne[2] * x->ne[3] != 1 ||
+            !ggml_vk_dq8_f16out_ok(ctx, x)) {
+            if (dbg) {
+                const ggml_tensor * b1 = x->src[1];
+                fprintf(stderr, "ggml_vulkan: DQ8_F16OUT not taken at concat %d: x %s op %s flags %d; B %s %s contig %d nb1 %zu off %zu; A off %zu D off %zu\n",
+                        i, x->name, ggml_op_desc(x), (int) x->flags, b1 ? b1->name : "-", b1 ? ggml_type_name(b1->type) : "-",
+                        b1 ? (int) ggml_is_contiguous(b1) : -1, b1 ? b1->nb[1] : 0, b1 ? ggml_vk_tensor_buffer_offset(ctx, b1) : 0,
+                        x->src[0] ? ggml_vk_tensor_buffer_offset(ctx, x->src[0]) : 0, (size_t) vk_tensor_offset(x));
+            }
+            continue;
+        }
+        const uint32_t pitch = (uint32_t) x->ne[0] + ggml_vk_dq8_f16out_pad();
+        if (pitch % 8 != 0 || (uint64_t) pitch * sizeof(ggml_fp16_t) * x->ne[1] > ggml_nbytes(x)) {
+            continue;
+        }
+        int xi = -1;
+        bool ok = true;
+        for (int n = 0; n < cgraph->n_nodes && ok; ++n) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            if (t == x) {
+                xi = n;
+                continue;
+            }
+            if (!ggml_vk_node_reads(t, x) || ggml_op_is_empty(t->op)) {
+                continue;   // views alias x; their readers name x through view_src and are checked here as well
+            }
+            ok = t == m.concat;
+            if (!ok && dbg) {
+                fprintf(stderr, "ggml_vulkan: DQ8_F16OUT not taken for %s: node %d %s (%s) reads it\n", x->name, n, t->name, ggml_op_desc(t));
+            }
+        }
+        if (ok && xi >= 0 && xi < i) {
+            ctx->dq8_f16out[x] = pitch;
+        }
+    }
 }
 
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
@@ -24812,6 +24968,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ggml_vk_decode_prefetch_plan(ctx, cgraph);
     ggml_vk_prefetch_q_plan(ctx, cgraph);
     ctx->gdn_direct_matches.clear();
+    ggml_vk_dq8_f16out_prepass(ctx, cgraph);
 
     int last_node = cgraph->n_nodes - 1;
 
