@@ -250,6 +250,8 @@ void main() {
     FETCH(0)
     STORE()
     barrier();
+#ifndef A_F32
+    // (PF 2 has no second register set in the f32-A variant: that one always runs PF 1)
     if (PF == 2) {
         // two steps in flight: while step ks computes, set "2" holds ks + 1 and ks + 2 is fetched into the set just stored; the body
         // is unrolled by two so each set is named at compile time
@@ -271,7 +273,9 @@ void main() {
             barrier();
             ks++;
         }
-    } else {
+    } else
+#endif
+    {
         for (uint ks = 0; ks + 1 < nks; ks++) {
             FETCH(ks + 1)
             COMPUTE()
