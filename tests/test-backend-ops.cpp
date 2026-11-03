@@ -4724,14 +4724,17 @@ struct test_gdn_norm_f16 : public test_case {
         GGML_UNUSED(t);
         return "GDN_NORM_F16";
     }
-    std::string vars() override { return VARS_TO_STR3(ne, pad, type_out); }
+    const int64_t zpad;   // z as the merged qkv+z GEMM has it: a view whose token stride is wider than the z row
+    std::string vars() override {
+        return VARS_TO_STR3(ne, pad, type_out) + (zpad > 0 ? "," + VAR_TO_STR(zpad) : "");
+    }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
     double max_nmse_err() override { return 5e-4; }
 
-    test_gdn_norm_f16(std::array<int64_t, 3> ne = {128, 48, 33}, int64_t pad = 0, ggml_type type_out = GGML_TYPE_Q8_0)
-        : ne(ne), pad(pad), type_out(type_out) {}
+    test_gdn_norm_f16(std::array<int64_t, 3> ne = {128, 48, 33}, int64_t pad = 0, ggml_type type_out = GGML_TYPE_Q8_0, int64_t zpad = 0)
+        : ne(ne), pad(pad), type_out(type_out), zpad(zpad) {}
 
     void initialize_tensors(ggml_context * ctx) override {
         for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
@@ -4768,11 +4771,14 @@ struct test_gdn_norm_f16 : public test_case {
         ggml_set_input(x);
         ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
         ggml_set_name(gamma, "gamma");
-        // z as the model has it: a reshape of a flat projection output, expanded ahead of the chain
-        ggml_tensor * z_flat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, ne[2]);
+        // z as the model has it: a reshape of a flat projection output (or, zpad > 0, a view of the back of a wider one),
+        // expanded ahead of the chain
+        ggml_tensor * z_flat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row + zpad, ne[2]);
         ggml_set_name(z_flat, "z");
         ggml_set_input(z_flat);
-        ggml_tensor * z = ggml_reshape_3d(ctx, z_flat, ne[0], ne[1], ne[2]);
+        ggml_tensor * z = zpad > 0 ? ggml_view_3d(ctx, z_flat, ne[0], ne[1], ne[2], ne[0] * sizeof(float), z_flat->nb[1],
+                                                  zpad * sizeof(float))
+                                   : ggml_reshape_3d(ctx, z_flat, ne[0], ne[1], ne[2]);
         if (gf) { ggml_build_forward_expand(gf, z); }
         ggml_tensor * dst = nullptr;
         if (pad > 0) {
@@ -6299,10 +6305,26 @@ struct test_gdn_conv_prefill : public test_case {
     const int n_tokens;
     const int n_k_heads;
     const int n_v_heads;
-    test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads)
-        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads) {}
+    const int xpad;   // x as the merged qkv+z GEMM has it: the front C channels of a wider row
+    test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads, int xpad = 0)
+        : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads), xpad(xpad) {}
     std::string op_desc(ggml_tensor *) override { return "GDN_CONV_PREFILL"; }
-    std::string vars() override { return VARS_TO_STR3(n_tokens, n_k_heads, n_v_heads); }
+    std::string vars() override {
+        return VARS_TO_STR3(n_tokens, n_k_heads, n_v_heads) + (xpad > 0 ? "," + VAR_TO_STR(xpad) : "");
+    }
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_CONV", "CONCAT_SSM_CONV_SILU")) {
+            return true;
+        }
+        const int64_t want = env_knob_on("GGML_VK_SSMCONV_DIRECT") ? 1 : 0;
+        const int64_t n = dispatch_census_count(backend, "CONCAT_SSM_CONV_SILU");
+        if (n != want) {
+            msg = "CONCAT_SSM_CONV_SILU dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+            return false;
+        }
+        return true;
+    }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     double max_nmse_err() override { return 2e-5; }
@@ -6320,9 +6342,12 @@ struct test_gdn_conv_prefill : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int C = 128 * (2 * n_k_heads + n_v_heads);
-        ggml_tensor * x_src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n_tokens);
+        ggml_tensor * x_src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C + xpad, n_tokens);
         ggml_set_name(x_src, "x_src");
         ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, not a permanent input
+        if (xpad > 0) {
+            x = ggml_view_2d(ctx, x, C, n_tokens, x->nb[1], 0);
+        }
         ggml_tensor * history = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, C);
         ggml_set_name(history, "history");
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
@@ -14417,6 +14442,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_gdn_norm_f16({128, 16, 64}, 8, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_gdn_norm_f16({100, 6, 40}, 0, GGML_TYPE_F16));
+    // merged attn_qkv_gate: z is the back 6144 of a 16384-wide row
+    test_cases.emplace_back(new test_gdn_norm_f16({128, 48, 64}, 0, GGML_TYPE_Q8_0, 10240));
+    test_cases.emplace_back(new test_gdn_norm_f16({128, 48, 5},  0, GGML_TYPE_Q8_0, 10240));
     test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}));
     test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}, 1e-6f, true));
     test_cases.emplace_back(new test_rms_norm_scale({100, 3, 5, 2}));
@@ -16496,6 +16524,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Convolution/SiLU elided into the chunked GDN, allocated through the scheduler.
     test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 2));
     test_cases.emplace_back(new test_gdn_conv_prefill(512, 2, 4));
+    // merged attn_qkv_gate: x is the front 10240 of a 16384-wide row
+    test_cases.emplace_back(new test_gdn_conv_prefill(256, 16, 48, 6144));
+    test_cases.emplace_back(new test_gdn_conv_prefill(64, 2, 4, 1024));
     // Multiple sequences must remain on the generic fallback.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));

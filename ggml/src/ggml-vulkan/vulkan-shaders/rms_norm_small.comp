@@ -59,6 +59,8 @@ void main() {
         // the second multiplier is packed and dst-shaped, so it keeps the packed index; the destination goes through its
         // strides (packed unless LLAMA_GDN_NORM_PAD pads the f16 rows)
         const uint d_row    = ((samp*p.ne02 + channel)*p.ne01 + row)*ncols;
+        // the sigmoid gate z: rows packed within a token, token stride p.ne (elements; ne01 * ncols when packed)
+        const uint c_row    = do_sigmoid_c ? (samp*p.ne02 + channel)*p.ne + row*ncols : d_row;
         const uint d_offset = samp*p.nb23 + channel*p.nb22 + row*p.nb21 + get_doffset();
 
         FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
@@ -75,7 +77,7 @@ void main() {
             for (uint col = lane; col < ncols; col += sgsize) {
                 const FLOAT_TYPE g = FLOAT_TYPE(data_b[b_offset + (ncols > p.ne10 ? fastmod(col, p.ne10) : col)]);
                 const FLOAT_TYPE y = scale * FLOAT_TYPE(data_a[a_offset + col]) * g;
-                float c = data_c[d_row + col];
+                float c = data_c[c_row + col];
                 if (do_sigmoid_c) {
                     c = 1.0f / (1.0f + exp(-c));
                 }
