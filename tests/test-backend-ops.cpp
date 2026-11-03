@@ -19523,7 +19523,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // decode (split keys), and increasing rows broken by a repeat or a swap (duplicate table) or with cells past the cache
     for (int ratio : {4,12}) test_cases.emplace_back(new test_qsa_prefill_maskless(130,4096,2051,ratio,true,40,true));
     test_cases.emplace_back(new test_qsa_prefill_maskless(130,32768,2051,12,true,7000,true));
-    test_cases.emplace_back(new test_qsa_prefill_maskless(129,4096,257,12,true,30,true));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(129,4096,259,12,true,30,true));
     for (int q : {1,4}) test_cases.emplace_back(new test_qsa_decode_maskless(q,8192,2051,12,true,1500,true));
     for (int mode : {-2,-3,-4}) {
         test_cases.emplace_back(new test_qsa_prefill_maskless(130,4096,2051,12,true,mode));
