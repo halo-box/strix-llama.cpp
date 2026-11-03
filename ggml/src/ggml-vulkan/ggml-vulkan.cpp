@@ -1953,6 +1953,29 @@ static uint32_t ggml_vk_dense_dq8_pick(uint32_t m, uint32_t n, uint32_t k) {
     return ggml_vk_dense_dq8_fewrow(m, k) ? 4u : 0u;
 }
 
+// GGML_VK_ROUTER_F16H: an f32 weight x f16 B GEMM (the qwen4exp MoE router, [2560 -> 512]) on the mul_mm_dq8.comp tiles with an f32 A
+// (A_F32), instead of the f32-A KHR coopmat matmul. Both round A and B to f16 and add the 16-k WMMA steps in k order with f32
+// accumulators, so the operands are the ones the f32-A matmul uses. 1 = on (default), 0 = off, 2..6 = force tile 0..4 (probe).
+static int ggml_vk_router_f16h_mode() {
+    static const int mode = [] { const char * e = getenv("GGML_VK_ROUTER_F16H"); return e ? atoi(e) : 1; }();
+    return mode;
+}
+
+// mode 1: k <= 4096, n >= 256. Tile 4 (64 x 128) except 1024 < n < 6144, where tile 1 (128 x 256, BK 32) is faster: gfx1151,
+// m=512 k=2560 us per GEMM (f32-A matmul / tile 1 / tile 4): n=512 87 / 172 / 57, 1024 156 / 172 / 106, 2048 270 / 188 / 206,
+// 4096 547 / 378 / 404, 8192 1153 / 807 / 737.
+static bool ggml_vk_router_f16h_rule(uint32_t n, uint32_t k) {
+    return ggml_vk_router_f16h_mode() >= 2 || (k <= 4096 && n >= 256);
+}
+
+static uint32_t ggml_vk_router_f16h_pick(uint32_t n) {
+    const int mode = ggml_vk_router_f16h_mode();
+    if (mode >= 2 && mode < 2 + GGML_VK_DQ8_NCFG) {
+        return (uint32_t) (mode - 2);
+    }
+    return (n > 1024 && n < 6144) ? 1u : 4u;
+}
+
 
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
@@ -3051,6 +3074,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                                  { t[1], t[2], 1 }, spec, 1, false, true, 32);
                         ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[1][c], "matmul_dq8_q8_0_f16_d16_" + std::to_string(c),
                                                  matmul_dq8_q8_0_f16_d16_cm1_len, matmul_dq8_q8_0_f16_d16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                                                 { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                        ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_f32[c], "matmul_dq8_f32_f16_" + std::to_string(c),
+                                                 matmul_dq8_f32_f16_cm1_len, matmul_dq8_f32_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
                                                  { t[1], t[2], 1 }, spec, 1, false, true, 32);
                         if (c == 0) {   // HC_UP_MIX epilogue variants on tile 0 (f32 / f16 mixed stream)
                             ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_hcmix[0], "matmul_dq8_q8_0_f16_hcmix",
@@ -8064,6 +8090,19 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             pipeline = pd;
         }
     }
+    // f32 weight x f16 B on the same tiles (GGML_VK_ROUTER_F16H, the MoE router): A read in place as f32
+    bool router_f16h = false;
+    if (pipeline_pre_dq8 == nullptr && ggml_vk_router_f16h_mode() != 0 && src0->type == GGML_TYPE_F32 && y_kernel_type == GGML_TYPE_F16 &&
+        !quantize_y && !qx_needs_dequant && !d16 && !hcm && ggml_vk_dim01_contiguous(src0) && ne02 * ne03 == 1 && ne12 * ne13 == 1 &&
+        ne10 % 64 == 0 && ne01 >= 128 && ne11 >= 64 && ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
+        ggml_vk_router_f16h_rule((uint32_t) ne11, (uint32_t) ne10)) {
+        vk_pipeline & pd = ctx->device->pipeline_matmul_dq8_f32[ggml_vk_router_f16h_pick((uint32_t) ne11)];
+        if (pd) {
+            pipeline_pre_dq8 = pipeline;
+            pipeline = pd;
+            router_f16h = true;
+        }
+    }
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
@@ -8276,12 +8315,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (pipeline_pre_dq8 != nullptr) {
         // B is read as 16-byte vectors relative to its binding, which starts at the tensor itself: the columns need 8-element strides,
         // the binding offset only the device's storage-buffer alignment (an f16 activation may start 8 bytes past 16, which used to
-        // send the GEMM back to its pre-dq8 tile); A and D are read / written as dwords
+        // send the GEMM back to its pre-dq8 tile); A and D are read / written as dwords (an f32 A with 16-byte loads: a 16-byte
+        // aligned A binding)
         if (stride_b % 8 != 0 || y_buf_offset % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0 ||
-            x_buf_offset % 4 != 0 || d_buf_offset % 4 != 0) {
+            x_buf_offset % (router_f16h ? 16 : 4) != 0 || d_buf_offset % 4 != 0) {
             pipeline = pipeline_pre_dq8;   // split_k stays 1 (valid for every pipeline)
+            router_f16h = false;
         } else {
-            ggml_vk_path_census_add("MUL_MAT_DENSE_DQ8");
+            ggml_vk_path_census_add(router_f16h ? "MUL_MAT_ROUTER_F16H" : "MUL_MAT_DENSE_DQ8");
         }
     }
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y && !y_rowstride) {
@@ -8303,12 +8344,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     } else {
         // GGML_VK_DENSE_DQ8_TEST_BREAK=1 (negative control): the dq8 GEMM drops its last K step
         static const bool dq8_break = [] { const char * e = getenv("GGML_VK_DENSE_DQ8_TEST_BREAK"); return e && atoi(e) != 0; }();
-        const bool is_dq8 = pipeline_pre_dq8 != nullptr && pipeline != pipeline_pre_dq8;
+        // GGML_VK_ROUTER_F16H_TEST_BREAK=1 (negative control): the same for the f32-A variant
+        static const bool f16h_break = [] { const char * e = getenv("GGML_VK_ROUTER_F16H_TEST_BREAK"); return e && atoi(e) != 0; }();
+        const bool is_dq8 = pipeline_pre_dq8 != nullptr && pipeline != pipeline_pre_dq8 && (router_f16h ? f16h_break : dq8_break);
         ggml_vk_matmul(
             ctx, subctx, pipeline,
             { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
             ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
-            ne01, ne11, (is_dq8 && dq8_break && ne10 > 64) ? ne10 - 64 : ne10,
+            ne01, ne11, (is_dq8 && ne10 > 64) ? ne10 - 64 : ne10,
             ne10, stride_b, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
             split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
             b_col_bytes, (uint64_t)od->nb[1]
