@@ -8,7 +8,7 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_cooperative_matrix : require
 
-// Routed MoE down projection, MUL_MAT_ID (+ MUL by the router weights) + CPY(f16), q5_1 experts, f16 output = the CPY's
+// Routed MoE down projection, MUL_MAT_ID (+ MUL by the router weights) + CPY(f16), q5_1 or q8_0 (A_Q8_0) experts, f16 output = the CPY's
 // destination. Weight-streaming design (after halo-box PR #213's HIP R2 down kernel): at prefill every expert's rows are read
 // once per 64-token tile, so the kernel is bound by how fast it streams the weights. They go from global memory straight
 // into registers, one 64-K stage ahead, and never touch shared memory.
@@ -40,7 +40,11 @@ layout(push_constant) uniform parameter {
     uint scaled;         // 0: no MUL in the chain (the scale binding is not read)
 } p;
 
+#if defined(A_Q8_0)
+layout(binding = 0) readonly buffer A  { uint data_a[]; };   // canonical q8_0 rows, read as dwords (34-byte blocks)
+#else
 layout(binding = 0) readonly buffer A  { uvec4 data_a[]; };
+#endif
 layout(binding = 1) readonly buffer B  { uvec4 data_b[]; };
 layout(binding = 2) writeonly buffer D { f16vec4 data_d[]; };
 layout(binding = 3) readonly buffer E  { uint data_e[]; };   // count_experts: [0] tiles, (expert, rows) per tile, row ids
@@ -58,7 +62,13 @@ layout(binding = 4) readonly buffer S  { float data_s[]; };
 #define TPW 1            // count_experts tiles per workgroup, run back to back (the next tile's first stage loads under the epilogue)
 #endif
 #define NBL (KC / 32)    // q5_1 blocks per stage
+#if defined(A_Q8_0)
+#define AU  (NBL * 17 / 2) // A dwords per lane and stage: two 34-byte q8_0 blocks
+#define A_T uint
+#else
 #define AU  (NBL * 3 / 2) // A uvec4 per lane and stage
+#define A_T uvec4
+#endif
 #define KS  (KC / 16)    // 16-K WMMA steps per stage
 #define SB  (KC / 2 + 4) // shared row stride in uints (KC halves + 4 pad, 16-byte aligned rows)
 
@@ -97,6 +107,24 @@ void q51_frag(const uvec4 qs, const uint qh, const uint h, const uint dm, out ui
         const vec4 v = vec4(float(nb & 0xFFu), float((nb >> 8) & 0xFFu), float((nb >> 16) & 0xFFu), float(nb >> 24));
         o[2 * w]     = packFloat2x16(f16vec2(fma(d, v.x, m), fma(d, v.y, m)));
         o[2 * w + 1] = packFloat2x16(f16vec2(fma(d, v.z, m), fma(d, v.w, m)));
+    }
+}
+#endif
+
+#if defined(A_Q8_0)
+// one half (h = 0: values 0..15, h = 1: 16..31) of q8_0 block bl (0, 1) of a stage -> 8 packed f16 pairs f16(d * q) (d * q is exact
+// in f32, so one rounding, as the dequantize-to-f16 paths). A block pair is 68 bytes = 17 dwords from a 4-byte aligned start:
+// block 0 = d in the low half of dword 0, quants at bytes 2..33; block 1 = d in the high half of dword 8, quants in dwords 9..16
+void q80_frag(const uint a[AU], const uint bl, const uint h, out uint o[8]) {
+    const float d = bl == 0 ? unpackHalf2x16(a[0]).x : unpackHalf2x16(a[8]).y;
+    [[unroll]] for (uint w = 0; w < 4; w++) {
+        const uint i = 4 * h + w;
+        const uint q = bl == 0 ? ((a[i] >> 16) | (a[i + 1] << 16)) : a[9 + i];
+        const int qi = int(q);
+        const vec4 v = vec4(float(bitfieldExtract(qi, 0, 8)), float(bitfieldExtract(qi, 8, 8)),
+                            float(bitfieldExtract(qi, 16, 8)), float(bitfieldExtract(qi, 24, 8)));
+        o[2 * w]     = packFloat2x16(f16vec2(d * v.x, d * v.y));
+        o[2 * w + 1] = packFloat2x16(f16vec2(d * v.z, d * v.w));
     }
 }
 #endif
@@ -173,11 +201,17 @@ void main() {
 
     // A: this lane's row, AU uvec4 per KC stage = NBL 24-byte q5_1 blocks (d, m | qh | 16 qs bytes)
     const uint feat0 = gl_WorkGroupID.x * 256 + wave * 32;
+#if defined(A_Q8_0)
+    const uint row_u = p.K * 17 / 64;                    // dwords per row (K / 32 blocks of 34 bytes)
+#else
     const uint row_u = p.K * 3 / 64;                     // uvec4 per row
+#endif
     uint a_base[TPW];
     [[unroll]] for (uint tt = 0; tt < TPW; tt++) {
         const uint expert = data_e[1 + 2 * (tile0 + (tt < ntl ? tt : 0))];
-#if defined(A_REPACK)
+#if defined(A_Q8_0)
+        a_base[tt] = 4 * (p.a_offset + expert * p.stride_e) + (feat0 + lane) * row_u;
+#elif defined(A_REPACK)
         // expert-repacked weights (Vulkan expert repack buffer): per 32-row block the 16-byte units are stored unit-major,
         // [uvec4 k][32 rows], so each load is 512 contiguous bytes across the wave
         a_base[tt] = p.a_offset + expert * p.stride_e + feat0 * row_u + lane;
@@ -200,7 +234,7 @@ void main() {
 
     const uint n_stages = p.K / KC;
     const uint steps = ntl * n_stages;
-    uvec4 a[AU];
+    A_T a[AU];
     LOAD_A(a_base[0], 0, a);
     LOAD_B(b_base[0], 0);
     STORE_B(0);
@@ -213,7 +247,7 @@ void main() {
         const bool more = i + 1 < steps;
         const bool last = st + 1 == n_stages;
         const uint nt = (nrows + 15) / 16;              // live 16-token sub-tiles (uniform)
-        uvec4 n[AU];
+        A_T n[AU];
         if (more) {
             const uint ntt = last ? tt + 1 : tt;
             const uint nst = last ? 0 : st + 1;
@@ -225,11 +259,15 @@ void main() {
         [[unroll]] for (uint ks = 0; ks < KS; ks++) {
             const uint bl = ks / 2, h = ks % 2, pr = 3 * (bl / 2);
             uint own[8];
+#if defined(A_Q8_0)
+            q80_frag(a, bl, h, own);
+#else
             if ((bl & 1) == 0) {
                 q51_frag(uvec4(a[pr].z, a[pr].w, a[pr + 1].x, a[pr + 1].y), a[pr].y, h, a[pr].x, own);
             } else {
                 q51_frag(a[pr + 2], a[pr + 1].w, h, a[pr + 1].z, own);
             }
+#endif
             MATA f0, f1;
             [[unroll]] for (uint j = 0; j < 8; j++) {
                 const uint oth = subgroupShuffleXor(own[j], 16);

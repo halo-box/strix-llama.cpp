@@ -5273,6 +5273,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     mul_mm_id_down_q5_1_f16_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
                 ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51[1], "mul_mm_id_down_q5_1_f32", mul_mm_id_down_q5_1_f32_len,
                     mul_mm_id_down_q5_1_f32_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+                ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q80[0], "mul_mm_id_down_q8_0_f16", mul_mm_id_down_q8_0_f16_len,
+                    mul_mm_id_down_q8_0_f16_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+                ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q80[1], "mul_mm_id_down_q8_0_f16_t8", mul_mm_id_down_q8_0_f16_t8_len,
+                    mul_mm_id_down_q8_0_f16_t8_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
                 // expert repack buffer (GGML_VK_EXPERT_REPACK): the same kernels on the repacked order, the mat-vec, the inverse copy
                 if (ggml_vk_expert_repack_enabled()) {
 #define CREATE_MMID_GLU_RP(ti, tn) \
@@ -11781,14 +11785,33 @@ static bool ggml_vk_mmid_pair_glu_ext_enabled() {
     return on;
 }
 
+// GGML_VK_MMID_DOWN_Q8: q8_0 experts of the f16 down chain on the streaming down kernel. 0: they keep the int8 MMQ path (B quantized
+// to q8_1); 1 (default): one count_experts tile per workgroup; 2: eight tiles per workgroup
+static int ggml_vk_mmid_down_q8_mode() {
+    static const int v = [] {
+        const char * e = getenv("GGML_VK_MMID_DOWN_Q8");
+        const int m = e ? atoi(e) : 1;
+        return m < 0 || m > 2 ? 1 : m;
+    }();
+    return v;
+}
+
 static constexpr uint32_t mmid_down_stream_bn = 64;   // the shader's token tile (BN)
 
 static bool ggml_vk_mmid_down_stream_ok(ggml_backend_vk_context * ctx, const ggml_tensor * mmid, const ggml_tensor * scale, const ggml_tensor * out) {
     const ggml_tensor * w   = mmid->src[0];
     const ggml_tensor * x   = mmid->src[1];
     const ggml_tensor * ids = mmid->src[2];
-    if (!ggml_vk_mmid_down_stream_enabled() || !ctx->device->coopmat_rdna3_layout || !ctx->device->pipeline_mmid_down_q51[0] ||
-        w->type != GGML_TYPE_Q5_1) {
+    if (!ggml_vk_mmid_down_stream_enabled() || !ctx->device->coopmat_rdna3_layout) {
+        return false;
+    }
+    if (w->type == GGML_TYPE_Q8_0) {
+        // canonical layout only (q8_0 is never repacked), f16 B (the fused_moe_f16 chain)
+        if (ggml_vk_mmid_down_q8_mode() == 0 || !ctx->device->pipeline_mmid_down_q80[ggml_vk_mmid_down_q8_mode() - 1] || x->type != GGML_TYPE_F16 ||
+            ggml_vk_repack_rows(w) != 0 || w->nb[2] % 16 != 0) {
+            return false;
+        }
+    } else if (w->type != GGML_TYPE_Q5_1 || !ctx->device->pipeline_mmid_down_q51[0]) {
         return false;
     }
     const int64_t K = w->ne[0], M = w->ne[1], n_used = ids->ne[0], T = ids->ne[1];
@@ -11826,7 +11849,9 @@ static void ggml_vk_mmid_down_stream(ggml_backend_vk_context * ctx, vk_context& 
     const size_t expert_data_size = sizeof(uint32_t) * (row_ids_offset + max_tiles * mmid_down_stream_bn);
 
     const bool repacked = ggml_vk_repack_rows(w) != 0;
-    vk_pipeline pipeline = (repacked ? ctx->device->pipeline_mmid_down_q51_rp : ctx->device->pipeline_mmid_down_q51)[x->type == GGML_TYPE_F32 ? 1 : 0];
+    const bool q8 = w->type == GGML_TYPE_Q8_0;
+    vk_pipeline pipeline = q8 ? ctx->device->pipeline_mmid_down_q80[ggml_vk_mmid_down_q8_mode() - 1]
+                              : (repacked ? ctx->device->pipeline_mmid_down_q51_rp : ctx->device->pipeline_mmid_down_q51)[x->type == GGML_TYPE_F32 ? 1 : 0];
     // GGML_VK_EXPDOWN_V=n: variant n of the repacked f16-B kernel (1 KC128, 2 TPW2, 3 TPW4, 4 PK16, 6 KC128+PK16, 7 TPW2+PK16,
     // 8 KC128+TPW2, 9 TPW8, 10 TPW16); 0 / unset = the kernel above. 5 was a store-less measurement build and is gone: any value
     // outside the list runs the kernel above, with a warning
@@ -11839,8 +11864,8 @@ static void ggml_vk_mmid_down_stream(ggml_backend_vk_context * ctx, vk_context& 
         }
         return v;
     }();
-    uint32_t tpw = 1;
-    if (expdown_v != 0 && repacked && x->type == GGML_TYPE_F16 && ctx->device->pipeline_mmid_down_q51_rpv[expdown_v]) {
+    uint32_t tpw = q8 && ggml_vk_mmid_down_q8_mode() == 2 ? 8 : 1;
+    if (expdown_v != 0 && !q8 && repacked && x->type == GGML_TYPE_F16 && ctx->device->pipeline_mmid_down_q51_rpv[expdown_v]) {
         const bool kc128 = expdown_v == 1 || expdown_v == 6 || expdown_v == 8;
         if (!kc128 || K % 128 == 0) {
             pipeline = ctx->device->pipeline_mmid_down_q51_rpv[expdown_v];
@@ -11856,13 +11881,16 @@ static void ggml_vk_mmid_down_stream(ggml_backend_vk_context * ctx, vk_context& 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
 
-    static bool logged = false;
-    if (!logged) {
-        logged = true;
-        GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID down streaming engaged (q5_1, M=%u K=%u experts=%u used=%u, %s B%s)\n", M, K, n_as, n_used,
-                      ggml_type_name(x->type), scale ? ", router weights" : "");
+    static bool logged[2] = { false, false };
+    if (!logged[q8]) {
+        logged[q8] = true;
+        GGML_LOG_INFO("ggml_vulkan: MUL_MAT_ID down streaming engaged (%s, M=%u K=%u experts=%u used=%u, %s B%s)\n", ggml_type_name(w->type),
+                      M, K, n_as, n_used, ggml_type_name(x->type), scale ? ", router weights" : "");
     }
     ggml_vk_path_census_add("MUL_MAT_ID_DOWN_STREAM");
+    if (q8) {
+        ggml_vk_path_census_add("MUL_MAT_ID_DOWN_STREAM/Q8_0");
+    }
     if (repacked) {
         ggml_vk_path_census_add("EXPERT_REPACK/DOWN");
     }
