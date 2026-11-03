@@ -662,9 +662,93 @@ bool llama_model_qwen4exp::load_tensors(llama_model_loader & ml) {
         return false;
     }
     if (!ml.no_alloc) {
+        load_hc_split();
         load_bf16_twins();
     }
     return true;
+}
+
+// hc split: the merged [hc_down | hc_inject] weight of the upstream converter is split back into the hc_down rows (a view, no copy)
+// and an f32 hc_inject (its hc rows dequantized: the values the merged matmul uses). The mix then builds the same graph as a
+// separate-tensor file, so every backend fusion keyed on that graph applies (the inject computed in the norm kernel, the decode
+// hc mat-vec chain); the merged matmul only shared the pass over xn, which those fusions remove anyway. LLAMA_HC_SPLIT=0 keeps
+// the one merged matmul.
+void llama_model_qwen4exp::load_hc_split() {
+    const char * e = getenv("LLAMA_HC_SPLIT");
+    if (e != nullptr && atoi(e) == 0) {
+        return;
+    }
+    const int64_t hc = hparams.dsv4_hc_mult;
+    struct item { ggml_tensor ** merged; ggml_tensor ** down; ggml_tensor ** inject; };
+    std::map<ggml_backend_buffer_type_t, std::vector<item>> by_buft;
+    for (auto & layer : layers) {
+        for (const item & it : { item { &layer.hc_attn_down_inject, &layer.hc_attn_down, &layer.hc_attn_inject },
+                                 item { &layer.hc_ffn_down_inject,  &layer.hc_ffn_down,  &layer.hc_ffn_inject } }) {
+            const ggml_tensor * t = *it.merged;
+            if (t == nullptr || t->buffer == nullptr || t->data == nullptr || !ggml_is_contiguous(t) || t->ne[1] <= hc ||
+                t->ne[2] != 1 || t->ne[3] != 1 || ggml_get_type_traits(t->type)->to_float == nullptr) {
+                continue;
+            }
+            by_buft[ggml_backend_buffer_get_type(t->buffer)].push_back(it);
+        }
+    }
+    size_t n_split = 0;
+    std::vector<uint8_t> raw;
+    std::vector<float>   f32;
+    for (auto & kv : by_buft) {
+        // the injects are allocated on the merged weight's buffer type; the down views live in a context of their own (never
+        // allocated: they point into the merged weight)
+        ggml_init_params ip = { ggml_tensor_overhead() * (kv.second.size() + 1), nullptr, true };
+        ggml_context_ptr ctx   { ggml_init(ip) };
+        ggml_context_ptr ctx_v { ggml_init(ip) };
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> injects;   // (merged, f32 inject)
+        std::vector<ggml_tensor *> downs;
+        for (const item & it : kv.second) {
+            ggml_tensor * m = *it.merged;
+            const int64_t n_lo = m->ne[1] - hc;
+            std::string name = ggml_get_name(m);
+            const size_t pos = name.find("_down_inject");
+            const std::string stem = pos == std::string::npos ? name : name.substr(0, pos);
+            ggml_tensor * down = ggml_view_2d(ctx_v.get(), m, m->ne[0], n_lo, m->nb[1], 0);
+            ggml_format_name(down, "%s_down.weight", stem.c_str());
+            ggml_tensor * inj = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, m->ne[0], hc);
+            ggml_format_name(inj, "%s_inject.weight", stem.c_str());
+            downs.push_back(down);
+            injects.emplace_back(m, inj);
+        }
+        ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), kv.first) };
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: hc split: allocation on %s failed, keeping the merged matmul\n", __func__, ggml_backend_buft_name(kv.first));
+            continue;
+        }
+        for (ggml_tensor * d : downs) {
+            d->buffer = nullptr;   // ggml_view_2d already set data; view_init sets both
+            if (ggml_backend_view_init(d) != GGML_STATUS_SUCCESS) {
+                GGML_ABORT("hc split: view of %s failed", ggml_get_name(d->view_src));
+            }
+        }
+        for (size_t i = 0; i < kv.second.size(); ++i) {
+            ggml_tensor * m   = injects[i].first;
+            ggml_tensor * inj = injects[i].second;
+            const int64_t n_lo = m->ne[1] - hc;
+            raw.resize(hc * m->nb[1]);
+            f32.resize(ggml_nelements(inj));
+            ggml_backend_tensor_get(m, raw.data(), n_lo * m->nb[1], raw.size());
+            ggml_get_type_traits(m->type)->to_float(raw.data(), f32.data(), (int64_t) f32.size());
+            ggml_backend_tensor_set(inj, f32.data(), 0, f32.size() * sizeof(float));
+            const item & it = kv.second[i];
+            *it.down   = downs[i];
+            *it.inject = inj;
+            *it.merged = nullptr;
+            n_split++;
+        }
+        hc_split_bufs.emplace_back(std::move(ctx), std::move(buf));
+        hc_split_bufs.emplace_back(std::move(ctx_v), nullptr);
+    }
+    if (n_split > 0) {
+        LLAMA_LOG_INFO("%s: hc split: %zu merged hc down+inject weights split into down views + f32 inject (LLAMA_HC_SPLIT=0 keeps them merged)\n",
+                __func__, n_split);
+    }
 }
 
 void llama_model_qwen4exp::load_bf16_twins() {

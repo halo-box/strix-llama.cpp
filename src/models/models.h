@@ -2576,6 +2576,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     // bf16 twins of the f32 weights decode reads as mat-vecs, made at load where the values are bf16-exact
     // (LLAMA_BF16_TWINS=0 disables); bf16_twin() returns nullptr for a weight without one
     void load_bf16_twins();
+    // merged hc_*_down_inject weights split into a down view and an f32 inject at load (LLAMA_HC_SPLIT=0 keeps them merged)
+    void load_hc_split();
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> hc_split_bufs;
     ggml_tensor * bf16_twin(const ggml_tensor * w) const;
     std::map<const ggml_tensor *, ggml_tensor *> bf16_twins;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bf16_twin_bufs;
