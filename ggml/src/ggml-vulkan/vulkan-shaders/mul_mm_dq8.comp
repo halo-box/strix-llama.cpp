@@ -10,6 +10,8 @@
 // - Per 16-wide k step a wave loads its WM / 16 A fragments once and streams its WN / 16 B fragments (two fragment loads per
 //   four WMMAs at 64 x 64), the accumulators stay in registers for the whole K loop, f32.
 // Rows past M and columns past N are clamped on load and never stored. Batch 1 only (no broadcast, no split-k).
+// A_F32: A is an f32 matrix (K contiguous per row, the qwen4exp MoE router), read in place with 16-byte loads and rounded to f16 on the
+// LDS store, the rounding the f32-A KHR coopmat matmul applies when it fills its LDS (same operands, same per-output k order).
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
@@ -30,7 +32,11 @@ layout(constant_id = 5) const uint BK = 64;   // 64 or 32
 // f16 output (MUL_MAT + CPY(f16) fusion): D is f16, RNE from the f32 accumulators
 #endif
 
+#ifdef A_F32
+layout(binding = 0) readonly buffer A { uvec4 data_a4[]; };
+#else
 layout(binding = 0) readonly buffer A { uint data_a[]; };
+#endif
 layout(binding = 1) readonly buffer B { uvec4 data_b4[]; };
 #ifdef D_F16
 layout(binding = 2) writeonly buffer D { float16_t data_d[]; };
@@ -81,7 +87,11 @@ const uint KK  = BK / 16;      // 16-wide k steps per BK
 const uint TMF = WM / 16;
 const uint TNF = WN / 16;
 const uint WAVES_M = BM / WM;
+#ifdef A_F32
+const uint A_IT = (BM * (BK / 8)) / BLOCK_SIZE;               // 8-element A chunks (two 16-byte loads) per thread and step
+#else
 const uint A_IT = (2 * BM) / BLOCK_SIZE;   // BK 64: blocks, BK 32: half blocks, per thread and step
+#endif
 const uint B_IT = (BN * (BK / 8)) / BLOCK_SIZE;                // 16-byte B chunks per thread and step
 
 shared uvec4 As[BM * LS4];
@@ -103,6 +113,16 @@ void main() {
     const uint m0   = gl_WorkGroupID.x * BM;
     const uint n0   = gl_WorkGroupID.y * BN;
     const uint nks  = p.K / BK;
+#ifdef A_F32
+    // A item i: chunk ch (8 elements) of row idx / (BK / 8), as the B items: consecutive lanes read consecutive 32 bytes of a row
+    uint a_src[A_IT]; uint a_dst[A_IT];
+    [[unroll]] for (uint i = 0; i < A_IT; i++) {
+        const uint idx = tid + i * BLOCK_SIZE;
+        const uint row = idx / (BK / 8), ch = idx % (BK / 8);
+        a_src[i] = (min(m0 + row, p.M - 1) * p.stride_a) / 4 + ch * 2;
+        a_dst[i] = row * LS4 + ch;
+    }
+#else
     const uint row_dw = (p.stride_a / 32) * 34 / 4;   // dwords per A row (stride_a % 64 == 0)
 
     // A item i: row = idx % BM (consecutive lanes, consecutive rows), sub = idx / BM: the block of the pair (BK 64) or the
@@ -122,6 +142,7 @@ void main() {
         a_sub[i] = sub;
         a_dst[i] = row * LS4 + sub * (BK == 64 ? 4 : 2);
     }
+#endif
     uint b_src[B_IT]; uint b_dst[B_IT];
     [[unroll]] for (uint i = 0; i < B_IT; i++) {
         const uint idx = tid + i * BLOCK_SIZE;
@@ -131,8 +152,25 @@ void main() {
         b_dst[i] = col * LS4 + ch;
     }
 
-    uint  araw[A_IT][9];
     uvec4 braw[B_IT];
+#ifdef A_F32
+    uvec4 araw[A_IT][2];
+
+#define FETCH(ks) \
+    [[unroll]] for (uint i = 0; i < A_IT; i++) { \
+        araw[i][0] = data_a4[a_src[i] + (ks) * (BK / 4)]; \
+        araw[i][1] = data_a4[a_src[i] + (ks) * (BK / 4) + 1]; \
+    } \
+    [[unroll]] for (uint i = 0; i < B_IT; i++) { braw[i] = data_b4[b_src[i] + (ks) * (BK / 8)]; }
+
+#define STORE() \
+    [[unroll]] for (uint i = 0; i < A_IT; i++) { \
+        const vec4 lo = uintBitsToFloat(araw[i][0]), hi = uintBitsToFloat(araw[i][1]); \
+        As[a_dst[i]] = uvec4(packFloat2x16(f16vec2(lo.xy)), packFloat2x16(f16vec2(lo.zw)), packFloat2x16(f16vec2(hi.xy)), packFloat2x16(f16vec2(hi.zw))); \
+    } \
+    [[unroll]] for (uint i = 0; i < B_IT; i++) { Bs[b_dst[i]] = braw[i]; }
+#else
+    uint  araw[A_IT][9];
     bool  a_odd;   // BK 32: this step's block starts 2 bytes into a dword (odd block index); BK 64: the item is the odd block
 
 #define FETCH(ks) \
@@ -176,6 +214,7 @@ void main() {
         } \
     } \
     [[unroll]] for (uint i = 0; i < B_IT; i++) { Bs[b_dst[i]] = braw[i]; }
+#endif
 
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[TMF * TNF];
     [[unroll]] for (uint i = 0; i < TMF * TNF; i++) {

@@ -1383,6 +1383,8 @@ void process_shaders() {
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp), f32 and f16 output
     string_to_spv("matmul_dq8_q8_0_f16", "mul_mm_dq8.comp", {}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_d16", "mul_mm_dq8.comp", {{"D_F16", "1"}}, true, true, false);
+    // the same GEMM with an f32 A rounded to f16 on the LDS store (the qwen4exp MoE router)
+    string_to_spv("matmul_dq8_f32_f16", "mul_mm_dq8.comp", {{"A_F32", "1"}}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_hcmix", "mul_mm_dq8.comp", {{"HC_EPI", "1"}}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_hcmix_d16", "mul_mm_dq8.comp", {{"HC_EPI", "1"}, {"D_F16", "1"}}, true, true, false);
 #endif
