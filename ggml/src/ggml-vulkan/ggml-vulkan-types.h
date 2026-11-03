@@ -1597,7 +1597,9 @@ struct ggml_backend_vk_context {
     // chunked GDN with the conv + SiLU in gdn_chunk_prep / gdn_chunk_scan (ggml_vk_gdn_conv_fold_prepass, GGML_VK_GDN_CONVFOLD):
     // the conv input x, its state and taps and the q / k / v channel offsets per GATED_DELTA_NET node; the SSM_CONV + SILU
     // nodes go into gdn_qk_skip
-    struct gdn_conv_fold { const ggml_tensor * x; const ggml_tensor * state; const ggml_tensor * kern; uint32_t C, qc0, kc0, vc0; };
+    // C: conv channels (the state / taps layout); xs2 / xs3: x token / sequence strides in floats (C and C * T, or a wider row
+    // when x is the front of the merged qkv+z GEMM)
+    struct gdn_conv_fold { const ggml_tensor * x; const ggml_tensor * state; const ggml_tensor * kern; uint32_t C, qc0, kc0, vc0, xs2, xs3; };
     std::unordered_map<const ggml_tensor *, gdn_conv_fold> gdn_cf;
     bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
     // chunked GDN with the gated output norm in the scan store (ggml_vk_gdn_out_norm_prepass, GGML_VK_GDN_OUTNORM): gamma, z,

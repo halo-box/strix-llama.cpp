@@ -16316,6 +16316,9 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
             cpc.kc0 = cf.kc0;
             cpc.vc0 = cf.vc0;
             cpc.conv_C = cf.C;
+            // q / k / v are read from x: its token and sequence strides (the SiLU output's when x rows hold only the C channels)
+            cpc.gdn.sq2 = cpc.gdn.sv2 = cf.xs2;
+            cpc.gdn.sq3 = cpc.gdn.sv3 = cf.xs3;
             ggml_vk_path_census_add("GDN_CONV_FOLD");
         }
         // gated output norm in the scan store (ggml_vk_gdn_out_norm_prepass): z (f32, or f16 from its GEMM), gamma and the chain's
@@ -24953,9 +24956,9 @@ static int ggml_vk_gdn_conv_fold_structural(const ggml_backend_vk_context * ctx,
     if (!ggml_vk_ssm_conv_direct_check(ctx, cgraph, ci, m, runtime) || m.out != su || m.conv_idx != idx.at(cv) || m.conv_idx >= idx.at(g)) {
         return -1;
     }
-    // every view offset is a whole number of floats inside x's [C] rows
+    // every view offset is a whole number of floats inside the C conv channels of x
     for (const ggml_tensor * t : { q, k, v }) {
-        if (t->view_offs % sizeof(float) != 0 || t->view_offs / sizeof(float) >= (size_t) m.x->ne[0]) {
+        if (t->view_offs % sizeof(float) != 0 || t->view_offs / sizeof(float) >= (size_t) m.kern->ne[1]) {
             return -1;
         }
     }
@@ -25011,8 +25014,9 @@ static void ggml_vk_gdn_conv_fold_prepass(ggml_backend_vk_context * ctx, const g
         const ggml_tensor * q = it.second.q_raw;
         const ggml_tensor * k = it.second.k_raw;
         const ggml_tensor * v = g->src[2];
-        ctx->gdn_cf[g] = { m.x, m.state, m.kern, (uint32_t) m.x->ne[0], (uint32_t) (q->view_offs / sizeof(float)),
-                           (uint32_t) (k->view_offs / sizeof(float)), (uint32_t) (v->view_offs / sizeof(float)) };
+        ctx->gdn_cf[g] = { m.x, m.state, m.kern, (uint32_t) m.kern->ne[1], (uint32_t) (q->view_offs / sizeof(float)),
+                           (uint32_t) (k->view_offs / sizeof(float)), (uint32_t) (v->view_offs / sizeof(float)),
+                           (uint32_t) (m.x_nb1 / sizeof(float)), (uint32_t) (m.x_nb2 / sizeof(float)) };
         ctx->gdn_qk_skip.insert({ cgraph->nodes[m.conv_idx], su });
     }
 }
