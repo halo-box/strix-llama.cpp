@@ -1155,6 +1155,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_count_experts;
     vk_pipeline pipeline_mmid_glu[2][2][2];   // MUL_MAT_ID_PAIR_SWIGLU (mul_mm_id_glu.comp): [q4_K, q5_K][f32 output][f32 B]
     vk_pipeline pipeline_mmid_down_q51[2];   // streaming MUL_MAT_ID(+MUL)+CPY(f16) down (mul_mm_id_down.comp): [0] f16 B, [1] f32 B
+    vk_pipeline pipeline_mmid_down_q80[2];   // the same kernel on canonical q8_0 experts, f16 B: [0] one tile per workgroup, [1] 8 (GGML_VK_MMID_DOWN_Q8)
     // expert repack buffer: the same kernels on the repacked weight order, the repacked mat-vec, and the inverse copy
     vk_pipeline pipeline_mmid_glu_rp[2][2][2];   // pipeline_mmid_glu on the repacked weight order
     vk_pipeline pipeline_mmid_down_q51_rp[2];

@@ -17787,6 +17787,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n : {1601, 2047, 3001}) {   // the streaming q5_1 down at odd tile counts (multi-tile workgroups, tails); the histogram needs n >~ 1500
         test_cases.emplace_back(new test_moe_prefill(false, n, GGML_TYPE_Q5_1, true));
     }
+    for (int64_t n : {1601, 2048}) {   // the q8_0 down layers of the f16 chain
+        test_cases.emplace_back(new test_moe_prefill(false, n, GGML_TYPE_Q8_0, true));
+    }
     // expert repack buffer (GGML_TEST_EXTRA_BUFT=1): the Flash-Next expert shapes at decode and below the f16 chain's 32 tokens
     // (the repacked mat-vec)
     for (int64_t n : { 1, 2, 3, 4, 5, 6, 7, 8, 16, 31 }) {
@@ -19536,9 +19539,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
         test_cases.emplace_back(new test_moe_prefill(false, 4096));
         // the streaming q5_1 down chain (f16 B, router weights, CPY f16) at the measured FN routing, ub2048 / ub4096
-        for (int64_t nt : { 2048, 4096 }) {
+        for (int64_t nt : { 2048, 4096, 8192 }) {
             test_cases.emplace_back(new test_moe_prefill(false, nt, GGML_TYPE_Q5_1, true));
         }
+        // the q8_0 down layers of the same chain (Flash-Next keeps a few, other quant mixes all of them)
+        for (int64_t nt : { 2048, 8192 }) {
+            test_cases.emplace_back(new test_moe_prefill(false, nt, GGML_TYPE_Q8_0, true));
+        }
+        // gate/up + SwiGLU at ub8192, measured routing
+        test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 2560, 640, 512, 10, 8192, false, true));
         // FN routed experts at decode / MTP verify / a prompt tail: gate (q4_K) and down (q5_1) mat-vec. A graph repeats its op with
         // the same experts, so n 1 / 4 run from the LLC; n 8 (80 experts, ~74 MB of q4_K) is the DRAM-bound per-token proxy
         for (int64_t n : { 1, 4, 8, 16 }) {

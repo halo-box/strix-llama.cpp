@@ -1032,6 +1032,8 @@ void process_shaders() {
     // streaming q5_1 MUL_MAT_ID(+MUL)+CPY(f16) down, register-direct weights (RDNA3 fragment layout, wave32)
     string_to_spv("mul_mm_id_down_q5_1_f16", "mul_mm_id_down.comp", {});
     string_to_spv("mul_mm_id_down_q5_1_f32", "mul_mm_id_down.comp", {{"B_F32", "1"}});
+    string_to_spv("mul_mm_id_down_q8_0_f16", "mul_mm_id_down.comp", {{"A_Q8_0", "1"}});   // canonical q8_0 experts, f16 B
+    string_to_spv("mul_mm_id_down_q8_0_f16_t8", "mul_mm_id_down.comp", {{"A_Q8_0", "1"}, {"TPW", "8"}});
     string_to_spv("mul_mm_id_down_q5_1_f16_rp", "mul_mm_id_down.comp", {{"A_REPACK", "1"}});   // expert repack buffer
     string_to_spv("mul_mm_id_down_q5_1_f32_rp", "mul_mm_id_down.comp", {{"B_F32", "1"}, {"A_REPACK", "1"}});
     // GGML_VK_EXPDOWN_V variants of the repacked f16-B down kernel (index = the env value)
