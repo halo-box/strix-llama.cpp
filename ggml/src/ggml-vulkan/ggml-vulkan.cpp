@@ -2156,7 +2156,7 @@ static const uint32_t ggml_vk_dense_dq8_cfgs[GGML_VK_DQ8_NCFG][6] = {
     { 128, 64, 128, 32, 64, 64 } };
 
 // GGML_VK_DENSE_DQ8: 1 = on (default): tile 4 for m <= 384, k >= 4096, n >= 1024; tile 0 for k <= 4096, n >= 256 and at least 3/4
-// of a workgroup per CU (Flash-Next 2560 x 6144 is slower than XL, a 256-wide tile wastes most of its WMMAs below n 256, and
+// of a workgroup per CU (k > 4096 only with a B pitch that does not camp, GGML_VK_DENSE_DQ8_LONGK; a 256-wide tile wastes most of its WMMAs below n 256, and
 // 512 x 512 runs 8 workgroups). 0 = off, 2..6 = force tile 0..4 at any eligible shape (probe).
 static int ggml_vk_dense_dq8_mode() {
     static const int mode = [] { const char * e = getenv("GGML_VK_DENSE_DQ8"); return e ? atoi(e) : 1; }();
@@ -2174,6 +2174,20 @@ static bool ggml_vk_hc_dq8_enabled() {
 static bool ggml_vk_dense_dq8_fewrow(uint32_t m, uint32_t k) {
     static const bool on = [] { const char * e = getenv("GGML_VK_DENSE_DQ8_FEWROW"); return e == nullptr || atoi(e) != 0; }();
     return on && m <= 384 && k >= 4096;
+}
+
+// GGML_VK_DENSE_DQ8_LONGK (default 1, 0 off): mode 1 also takes k > 4096 on tile 0 (the Flash-Next ssm_out, 2560 x 6144) when the
+// f16 B rows do not start on one DRAM channel. The k <= 4096 limit was measured with packed 12288 B rows (48 x 256 B, which camp);
+// the model's ssm_out B carries a 128-element row pad (LLAMA_GDN_NORM_PAD), and there tile 0 beats the XL tile (gfx1151, n 8192:
+// 6971 -> 6662 us). A camping B keeps the XL tile, as before.
+static bool ggml_vk_dense_dq8_longk() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_DENSE_DQ8_LONGK"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// a B row pitch in bytes whose 256 B granules share a factor of 8 or more with the 16 DRAM channels (as ggml_vk_dense_ypad_camps)
+static bool ggml_vk_pitch_camps(uint64_t bytes) {
+    return bytes % 256 == 0 && std::gcd(bytes / 256, (uint64_t) 16) >= 8;
 }
 
 static uint32_t ggml_vk_dense_dq8_pick(uint32_t m, uint32_t n, uint32_t k) {
@@ -8801,12 +8815,16 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp): 2-D, f16 B, K % 64 == 0; B's column stride is checked where it is known
     vk_pipeline pipeline_pre_dq8 = nullptr;
+    // the row pitch the GEMM reads B at: src1's own, or the f16 staging copy's (row-padded where GGML_VK_DENSE_YPAD pads it)
+    const uint64_t b_pitch = y_needs_reformat
+        ? (ne10 + (ggml_vk_dense_ypad_camps(ne10) ? ggml_vk_dense_ypad() : 0u)) * sizeof(ggml_fp16_t)
+        : (uint64_t) src1->nb[1];
     if (ggml_vk_dense_dq8_mode() != 0 && src0->type == GGML_TYPE_Q8_0 && y_kernel_type == GGML_TYPE_F16 && !quantize_y &&
         !qx_needs_dequant && !d16 && !hcm && ggml_vk_dim01_contiguous(src0) && ne02 * ne03 == 1 && ne12 * ne13 == 1 &&
         ne10 % 64 == 0 && ne01 >= 128 && ne11 >= 64 && ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
         (ggml_vk_dense_dq8_mode() != 1 ||
          (ggml_vk_dense_dq8_fewrow((uint32_t) ne01, (uint32_t) ne10) && ne11 >= 1024) ||
-         (ne10 <= 4096 && ne11 >= 256 && CEIL_DIV(ne01, 128) * CEIL_DIV(ne11, 256) >= 3 * ctx->device->shader_core_count / 4))) {
+         ((ne10 <= 4096 || (ggml_vk_dense_dq8_longk() && !ggml_vk_pitch_camps(b_pitch))) && ne11 >= 256 && CEIL_DIV(ne01, 128) * CEIL_DIV(ne11, 256) >= 3 * ctx->device->shader_core_count / 4))) {
         vk_pipeline & pd = ctx->device->pipeline_matmul_dq8[0][ggml_vk_dense_dq8_pick((uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10)];
         if (pd) {
             pipeline_pre_dq8 = pipeline;

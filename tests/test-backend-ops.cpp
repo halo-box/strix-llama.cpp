@@ -5402,7 +5402,12 @@ struct test_mul_mat_f16b : public test_case {
             const int mode = de ? atoi(de) : 1;
             const char * fe = getenv("GGML_VK_DENSE_DQ8_FEWROW");
             const bool fewrow = (fe == nullptr || atoi(fe) != 0) && m <= 384 && k >= 4096 && n >= 1024;
-            const bool rule = fewrow || (k <= 4096 && n >= 256 && ((m + 127) / 128) * ((n + 255) / 256) >= 30);
+            const char * le = getenv("GGML_VK_DENSE_DQ8_LONGK");
+            // long k only where B's row pitch does not camp on the DRAM channels (as ggml-vulkan.cpp ggml_vk_pitch_camps)
+            const uint64_t pitch = (uint64_t) (k + pad) * 2;
+            const bool camps = pitch % 256 == 0 && std::gcd(pitch / 256, (uint64_t) 16) >= 8;
+            const bool longk = (le == nullptr || atoi(le) != 0) && !camps;
+            const bool rule = fewrow || ((k <= 4096 || longk) && n >= 256 && ((m + 127) / 128) * ((n + 255) / 256) >= 30);
             const bool want = type_a == GGML_TYPE_Q8_0 && k >= 1024 && k % 64 == 0 && m >= 128 && n >= 64 && mode != 0 &&
                               (mode >= 2 || rule);
             if (c >= 0 && (c > 0) != want) {
@@ -15628,6 +15633,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 384, 256, 64));   // k < 1024 stays on int8 (not dq8)
     test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 2560, 300, 2560));
     test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 1000, 300, 1024, 128));
+    // long k (the Flash-Next ssm_out, row-padded B as the model feeds it): ragged n, one full and one ragged m tile
+    test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 2560, 300, 6144, 128));
+    test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 1000, 1025, 6144, 128));
+    test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 2560, 300, 6144));   // packed 12288 B rows camp: stays off dq8
     // B 8 and 4 bytes past a 16-byte boundary (the dense q8_0 x f16 GEMM binds B at its own offset): the qkv shape, a ragged n, the
     // few-row hc down tile, and a padded row
     for (int boff : {4, 2}) {
@@ -19465,6 +19474,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int n : {64, 128, 512, 2048, 4096, 8192}) {
             test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, mk[0], n, mk[1]));
         }
+    }
+    // the same with the 128-element B row pad the model's f16 activations carry (LLAMA_GDN_NORM_PAD / LLAMA_HC_MIX_PAD): packed
+    // 12288 B rows (k 6144) camp on few DRAM channels, the padded ones do not
+    for (auto mk : std::vector<std::array<int64_t, 2>>{ {2560, 6144}, {10240, 2560}, {6144, 2560}, {12288, 2560} }) {
+        for (int n : {2048, 8192}) {
+            test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, mk[0], n, mk[1], 128));
+        }
+    }
+    // the f32-B dense GEMMs (attention o 2560 x 6144, shared-expert down 2560 x 640: int8 MMQ by default)
+    for (auto mk : std::vector<std::array<int64_t, 2>>{ {2560, 6144}, {2560, 640} }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], 8192, mk[1], {1, 1}, {1, 1}));
     }
     for (int n : {2048, 8192}) {
         test_cases.emplace_back(new test_hc_up_mix_f16(2560, n, 320, 128));
