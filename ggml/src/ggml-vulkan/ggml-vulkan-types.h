@@ -1114,6 +1114,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_sel_cm_gate_f16[3]; // the WMMA kernel with the attention output gate in its store (binding 5)
     vk_pipeline pipeline_flash_attn_sel_prep;      // cleans the selection rows for both
     vk_pipeline pipeline_flash_attn_sel_prep_sg;   // the same with subgroup min / scan (FA_SEL_LEAN)
+    vk_pipeline pipeline_flash_attn_sel_prep2;     // the same rows, coalesced, no hash table for increasing rows (FA_SEL_PREP2)
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];

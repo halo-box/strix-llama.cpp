@@ -5467,6 +5467,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_prep_sg,
                 "flash_attn_sel_prep_sg", flash_attn_sel_prep_sg_len, flash_attn_sel_prep_sg_data, "main", 2,
                 sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {}, 1, true);
+            // FA_SEL_PREP2: the same rows with coalesced loads and stores, and no hash table for increasing rows
+            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_prep2,
+                "flash_attn_sel_prep2", flash_attn_sel_prep2_len, flash_attn_sel_prep2_data, "main", 2,
+                sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {}, 1, true);
             static const char * sel_names[3] = { "flash_attn_sel_f16_gqa4", "flash_attn_sel_f16_gqa8", "flash_attn_sel_f16_gqa12" };
             for (uint32_t i = 0; i < 3; ++i) {
                 const uint32_t gqa = 4 * (i + 1);
@@ -12670,6 +12674,18 @@ static bool ggml_vk_fa_sel_lean_enabled() {
     return on;
 }
 
+// FA_SEL_PREP2 (GGML_VK_FA_SEL_PREP2=0 off): the selected-key pre-pass (path:FA_SEL_PREP2) reads and writes each row with
+// consecutive threads on consecutive entries, spreads the row over all 256 threads, and skips the duplicate hash table
+// for rows whose valid cells increase (they cannot repeat), which complete-block rows of a cache in position order are.
+// The cleaned rows and counts are the same, so the attention result is bit-identical.
+static bool ggml_vk_fa_sel_prep2_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_VK_FA_SEL_PREP2");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 // out_gate / out_gate_dst / out_gate_done: as ggml_vk_flash_attn
 static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, ggml_tensor * dst,
@@ -12751,8 +12767,10 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
         scale, n_split, chunk, NH, N, NS,
     };
 
-    const bool prep_sg = ggml_vk_fa_sel_lean_enabled() && ctx->device->pipeline_flash_attn_sel_prep_sg != nullptr;
-    vk_pipeline prep = prep_sg ? ctx->device->pipeline_flash_attn_sel_prep_sg : ctx->device->pipeline_flash_attn_sel_prep;
+    const bool prep2 = ggml_vk_fa_sel_prep2_enabled() && ctx->device->pipeline_flash_attn_sel_prep2 != nullptr;
+    const bool prep_sg = !prep2 && ggml_vk_fa_sel_lean_enabled() && ctx->device->pipeline_flash_attn_sel_prep_sg != nullptr;
+    vk_pipeline prep = prep2   ? ctx->device->pipeline_flash_attn_sel_prep2
+                     : prep_sg ? ctx->device->pipeline_flash_attn_sel_prep_sg : ctx->device->pipeline_flash_attn_sel_prep;
     ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     if (n_split > 1) {
@@ -12768,7 +12786,9 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     }
     const vk_subbuffer list_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
     ggml_vk_dispatch_pipeline(ctx, subctx, prep, { ids_buf, list_buf }, pc, { N, NS, 1 });
-    if (prep_sg) {
+    if (prep2) {
+        ggml_vk_path_census_add("FA_SEL_PREP2");
+    } else if (prep_sg) {
         ggml_vk_path_census_add("FA_SEL_PREP_SG");
     }
     ggml_vk_sync_buffers(ctx, subctx);
@@ -23903,6 +23923,9 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     }
     if (l == "path:FA_SEL_PREP_SG") {
         return dev->pipeline_flash_attn_sel_prep_sg ? nullptr : "no selected-key FA pipelines";
+    }
+    if (l == "path:FA_SEL_PREP2") {
+        return dev->pipeline_flash_attn_sel_prep2 ? nullptr : "no selected-key FA pipelines";
     }
     if (l == "path:FA_OUT_GATE_SEL_REDUCE") {
         return dev->pipeline_flash_attn_split_k_reduce_gate ? nullptr : "no gated split-k reduce pipeline";

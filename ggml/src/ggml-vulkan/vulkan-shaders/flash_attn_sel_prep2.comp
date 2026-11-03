@@ -1,0 +1,202 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Maskless selected-key attention, pre-pass (FA_SEL_PREP2): the same cleaned rows and counts as flash_attn_sel_prep.comp
+// (invalid entries dropped, a repeated cell kept once at its first occurrence, the original order, the row padded with
+// its first surviving cell, one count per row after the rows), with less work per row:
+//  - the row is read and the cleaned row written with consecutive threads on consecutive entries (the old pre-pass gave
+//    each thread 16 consecutive entries, so one load or store touched 64 cache lines);
+//  - each thread owns ceil(n_sel / 256) consecutive entries instead of 16, so all 256 threads take part at n_sel 2051;
+//  - when the valid entries of a row are strictly increasing they cannot repeat, so the row skips the duplicate hash
+//    table (its clear, one shared compare-and-swap per entry and a barrier). The complete-block rows of a cache that
+//    holds one sequence in position order are increasing: the blocks are listed in ascending order and the tail cells
+//    follow them. Any other row takes the hash table as before.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer IdsBuf  { int  data_ids[];  };
+layout(binding = 1) writeonly buffer ListBuf { uint data_list[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_kv;
+    uint n_sel;
+    uint list_stride;
+    uint nbq1;
+    uint nbq2;
+    uint nbq3;
+    uint nbk1;
+    uint nbk2;
+    uint nbk3;
+    uint nbv1;
+    uint nbv2;
+    uint nbv3;
+    uint nbi1;
+    uint nbi3;
+    uint nb1;
+    uint nb2;
+    uint nb3;
+    float scale;
+    uint n_split;
+    uint chunk;
+    uint n_head;
+    uint n_tok;
+    uint n_stream;
+} p;
+
+const uint WG = 256;
+const uint MAX_SEL = 4096;          // host gate: n_sel <= 4096
+const uint MAX_PER = MAX_SEL / WG;
+const uint TABLE = 4096;            // >= n_sel, so every distinct cell finds a slot
+const uint NONE = 0xffffffffu;
+
+shared uint key_sh[MAX_SEL];        // the row's cells (NONE for an invalid entry), then the cleaned row
+shared uint table_sh[TABLE];        // list positions, NONE = empty slot (rows that are not increasing only)
+shared uint cnt_sh[WG];             // per subgroup: the valid entry count, then the kept entry count
+shared uint top_sh[WG];             // per subgroup: the largest valid cell + 1 (0 = none)
+shared uint unsorted_sh;
+
+uint slot_hash(uint key) {
+    return (key * 2654435761u) >> 20; // 12 bits: TABLE == 4096
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint query = gl_WorkGroupID.x;
+    const uint stream = gl_WorkGroupID.y;
+    const uint row = stream * p.n_tok + query;
+    const uint ids_base = stream * p.nbi3 + query * p.nbi1;
+    const uint per = (p.n_sel + WG - 1) / WG;
+
+    for (uint s = tid; s < p.n_sel; s += WG) {
+        const int id = data_ids[ids_base + s];
+        key_sh[s] = id >= 0 && uint(id) < p.n_kv ? uint(id) : NONE;
+    }
+    if (tid == 0) {
+        unsorted_sh = 0;
+    }
+    barrier();
+
+    // thread tid owns the positions [tid * per, tid * per + per): the scan below keeps the original order. An odd
+    // per (9 at n_sel 2051) reads key_sh without bank conflicts.
+    const uint first = tid * per;
+    uint keys[MAX_PER];
+    uint valid = 0;
+    uint lo = NONE;       // the first valid cell
+    uint top = 0;         // the last valid cell + 1, 0 = none
+    bool inc = true;      // the valid cells increase strictly
+    [[unroll]] for (uint i = 0; i < MAX_PER; ++i) {
+        const uint s = first + i;
+        const uint key = i < per && s < p.n_sel ? key_sh[s] : NONE;
+        keys[i] = key;
+        if (key != NONE) {
+            valid |= 1u << i;
+            inc = inc && key + 1 > top;
+            lo = lo == NONE ? key : lo;
+            top = key + 1;
+        }
+    }
+
+    // the largest valid cell + 1 before this thread, and the valid counts: subgroup scans plus the subgroup totals
+    const uint top_ex = subgroupExclusiveMax(top);
+    const uint n_valid = bitCount(valid);
+    const uint valid_incl = subgroupInclusiveAdd(n_valid);
+    if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
+        top_sh[gl_SubgroupID] = max(top_ex, top);
+        cnt_sh[gl_SubgroupID] = valid_incl;
+    }
+    barrier();
+    uint top_before = top_ex;
+    uint valid_before = 0;
+    uint valid_count = 0;
+    for (uint g = 0; g < gl_NumSubgroups; ++g) {
+        const uint t = top_sh[g];
+        const uint c = cnt_sh[g];
+        top_before = g < gl_SubgroupID ? max(top_before, t) : top_before;
+        valid_before += g < gl_SubgroupID ? c : 0;
+        valid_count += c;
+    }
+    if (!inc || (lo != NONE && lo + 1 <= top_before)) {
+        atomicOr(unsorted_sh, 1u);
+    }
+    barrier();
+
+    uint kept = valid;
+    uint pos = valid_before + valid_incl - n_valid;
+    uint count = valid_count;
+    if (unsorted_sh != 0) {
+        // a row that is not increasing: drop repeats with an open-addressing hash table of list positions. A position
+        // whose cell is already in the table lowers the slot to the smaller position (atomicMin), so the first
+        // occurrence wins whatever the thread order (as flash_attn_sel_prep.comp)
+        for (uint i = tid; i < TABLE; i += WG) {
+            table_sh[i] = NONE;
+        }
+        barrier();
+        uint slots[MAX_PER];
+        [[unroll]] for (uint i = 0; i < MAX_PER; ++i) {
+            const uint key = keys[i];
+            uint slot = NONE;
+            if (key != NONE) {
+                const uint s = first + i;
+                uint h = slot_hash(key);
+                // terminates: at most n_sel <= TABLE distinct cells
+                for (;;) {
+                    const uint c = atomicCompSwap(table_sh[h], NONE, s);
+                    if (c == NONE) {
+                        break;
+                    }
+                    if (key_sh[c] == key) {
+                        atomicMin(table_sh[h], s);
+                        break;
+                    }
+                    h = (h + 1) & (TABLE - 1);
+                }
+                slot = h;
+            }
+            slots[i] = slot;
+        }
+        barrier();
+        kept = 0;
+        [[unroll]] for (uint i = 0; i < MAX_PER; ++i) {
+            if (slots[i] != NONE && table_sh[slots[i]] == first + i) {
+                kept |= 1u << i;
+            }
+        }
+        const uint incl = subgroupInclusiveAdd(bitCount(kept));
+        // cnt_sh was last read before the barrier above
+        if (gl_SubgroupInvocationID == gl_SubgroupSize - 1) {
+            cnt_sh[gl_SubgroupID] = incl;
+        }
+        barrier();
+        uint before = 0;
+        count = 0;
+        for (uint g = 0; g < gl_NumSubgroups; ++g) {
+            const uint t = cnt_sh[g];
+            before += g < gl_SubgroupID ? t : 0;
+            count += t;
+        }
+        pos = before + incl - bitCount(kept);
+    }
+
+    // the cleaned row in key_sh: every thread holds its cells in registers, and every read of key_sh (including the
+    // hash table's) is before the last barrier
+    [[unroll]] for (uint i = 0; i < MAX_PER; ++i) {
+        if ((kept & (1u << i)) != 0) {
+            key_sh[pos] = keys[i];
+            pos++;
+        }
+    }
+    barrier();
+
+    // pad with the row's first valid entry, which is always a first occurrence and so the cleaned row's first cell
+    const uint list_base = row * p.list_stride;
+    const uint pad = count > 0 ? key_sh[0] : 0;
+    for (uint s = tid; s < p.list_stride; s += WG) {
+        data_list[list_base + s] = s < count ? key_sh[s] : pad;
+    }
+    if (tid == 0) {
+        data_list[p.n_tok * p.n_stream * p.list_stride + row] = count;
+    }
+}

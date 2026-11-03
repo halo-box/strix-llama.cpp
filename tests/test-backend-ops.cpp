@@ -13967,25 +13967,42 @@ struct test_qsa_decode : public test_qsa_prefill {
 // cells, -1 padded). Query q sees min(blocks + q / 4, keys / 4 - 1) complete blocks, so with a small blocks value the
 // early rows are mostly -1 (a few live cells, partial key blocks; query 0 of a multi-query case sees nothing), and
 // with a deep cache the picks spread over the whole cache. Logical cell c lives in physical cell c * 7919 % keys, so the
-// gathered rows are scattered as in a fragmented cache.
+// gathered rows are scattered as in a fragmented cache; linear keeps cell c at c (one sequence in position order), so
+// the valid cells of a row increase, which the FA_SEL_PREP2 pre-pass cleans without its duplicate table.
+// blocks -2 / -3 / -4 (linear rows, every 7th entry -1): -2 the last entry repeats a cell of the row's start (another
+// thread's range in the pre-pass), -3 two neighbours swapped (decreasing once, no repeat), -4 increasing with cells past
+// the cache mixed in. -2 and -3 must take the duplicate table, -4 must not, and all three must give the same rows.
 struct test_qsa_prefill_maskless : public test_qsa_prefill {
     const int blocks;
-    test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true, int blocks=0)
-        : test_qsa_prefill(queries,keys,selected,interleaved,false,1,ratio), blocks(blocks) {}
+    const bool linear;
+    test_qsa_prefill_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true, int blocks=0, bool linear=false)
+        : test_qsa_prefill(queries,keys,selected,interleaved,false,1,ratio), blocks(blocks), linear(linear) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_PREFILL_MASKLESS"; }
-    std::string vars() override { return test_qsa_prefill::vars() + (blocks ? ",blocks=" + std::to_string(blocks) : ""); }
-    // GGML_VK_TEST_REQUIRE_FA_SEL_LEAN=1: with GGML_VK_FA_SEL_LEAN on, the selected-key FA cleans its rows with the
-    // subgroup pre-pass, once per op; off, never
+    std::string vars() override { return test_qsa_prefill::vars() + (blocks ? ",blocks=" + std::to_string(blocks) : "") + (linear ? ",linear=1" : ""); }
+    // GGML_VK_TEST_REQUIRE_FA_SEL_LEAN=1: with GGML_VK_FA_SEL_LEAN on and GGML_VK_FA_SEL_PREP2 off, the selected-key FA
+    // cleans its rows with the subgroup pre-pass, once per op; otherwise never.
+    // GGML_VK_TEST_REQUIRE_FA_SEL_PREP2=1: with GGML_VK_FA_SEL_PREP2 on, once per op with the FA_SEL_PREP2 pre-pass; off, never
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_FA_SEL_LEAN", "path:FA_SEL_PREP_SG") || dim != 256) {
+        if (dim != 256) {
             return true;
         }
-        const int64_t want = env_knob_on("GGML_VK_FA_SEL_LEAN") ? 1 : 0;
-        const int64_t got = dispatch_census_count(backend, "path:FA_SEL_PREP_SG");
-        if (got != want) {
-            msg = "path:FA_SEL_PREP_SG dispatches: " + std::to_string(got) + " (expected " + std::to_string(want) + ")";
-            return false;
+        const bool prep2 = env_knob_on("GGML_VK_FA_SEL_PREP2");
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_FA_SEL_LEAN", "path:FA_SEL_PREP_SG")) {
+            const int64_t want = env_knob_on("GGML_VK_FA_SEL_LEAN") && !prep2 ? 1 : 0;
+            const int64_t got = dispatch_census_count(backend, "path:FA_SEL_PREP_SG");
+            if (got != want) {
+                msg = "path:FA_SEL_PREP_SG dispatches: " + std::to_string(got) + " (expected " + std::to_string(want) + ")";
+                return false;
+            }
+        }
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_FA_SEL_PREP2", "path:FA_SEL_PREP2")) {
+            const int64_t want = prep2 ? 1 : 0;
+            const int64_t got = dispatch_census_count(backend, "path:FA_SEL_PREP2");
+            if (got != want) {
+                msg = "path:FA_SEL_PREP2 dispatches: " + std::to_string(got) + " (expected " + std::to_string(want) + ")";
+                return false;
+            }
         }
         return true;
     }
@@ -14008,9 +14025,9 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
         }
         std::vector<int32_t> picks(ggml_nelements(ids));
         if (blocks > 0) {
-            GGML_ASSERT(selected > 3 && (selected-3)%4 == 0 && keys%7919 != 0);
+            GGML_ASSERT(selected > 3 && (selected-3)%4 == 0 && (linear || keys%7919 != 0));
             const int budget=(selected-3)/4;
-            const auto cell=[&](int logical) { return int((int64_t(logical)*7919)%keys); };
+            const auto cell=[&](int logical) { return linear ? logical : int((int64_t(logical)*7919)%keys); };
             for (int q=0;q<queries;++q) {
                 int32_t * row=picks.data()+size_t(q)*selected;
                 std::fill(row,row+selected,-1);
@@ -14023,6 +14040,21 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
                     for (int c=0;c<4;++c) row[4*i+c]=cell(4*b+c);
                 }
                 for (int c=0;c<q%4;++c) row[4*budget+c]=cell(4*vis+c);
+            }
+            ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
+            return;
+        }
+        if (blocks <= -2) {
+            GGML_ASSERT(keys > selected + 1 && selected > 16);
+            for (int q=0;q<queries;++q) {
+                int32_t * row=picks.data()+size_t(q)*selected;
+                for (int j=0;j<selected;++j) {
+                    row[j]=int((int64_t(j)*(keys-1))/selected+q%2);   // strictly increasing, below keys
+                    if (j%7==3) row[j]=-1;
+                }
+                if (blocks == -2) row[selected-1]=row[q%3];          // a repeat of an early (valid or -1) entry
+                if (blocks == -3) std::swap(row[9+q%5],row[10+q%5]);
+                if (blocks == -4) for (int j=5+q%4;j<selected;j+=11) row[j]=keys+j;
             }
             ggml_backend_tensor_set(ids,picks.data(),0,ggml_nbytes(ids));
             return;
@@ -14082,8 +14114,8 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
     }
 };
 struct test_qsa_decode_maskless : public test_qsa_prefill_maskless {
-    test_qsa_decode_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true, int blocks=0)
-        : test_qsa_prefill_maskless(queries,keys,selected,ratio,interleaved,blocks) {}
+    test_qsa_decode_maskless(int queries, int keys, int selected, int ratio=12, bool interleaved=true, int blocks=0, bool linear=false)
+        : test_qsa_prefill_maskless(queries,keys,selected,ratio,interleaved,blocks,linear) {}
     std::string op_desc(ggml_tensor *) override { return "QSA_DECODE_MASKLESS"; }
 };
 
@@ -19487,6 +19519,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int q : {1,4,70}) test_cases.emplace_back(new test_qsa_decode_maskless(q,4096,2051,12,true,-1));
     test_cases.emplace_back(new test_qsa_decode_maskless(1,4096,257,12,true,-1));
     test_cases.emplace_back(new test_qsa_prefill_maskless(130,4096,2051,12,true,-1));
+    // FA_SEL_PREP2: rows in position order (increasing cells: no duplicate table), at d0-like and deep caches, GQA 4,
+    // decode (split keys), and increasing rows broken by a repeat or a swap (duplicate table) or with cells past the cache
+    for (int ratio : {4,12}) test_cases.emplace_back(new test_qsa_prefill_maskless(130,4096,2051,ratio,true,40,true));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(130,32768,2051,12,true,7000,true));
+    test_cases.emplace_back(new test_qsa_prefill_maskless(129,4096,257,12,true,30,true));
+    for (int q : {1,4}) test_cases.emplace_back(new test_qsa_decode_maskless(q,8192,2051,12,true,1500,true));
+    for (int mode : {-2,-3,-4}) {
+        test_cases.emplace_back(new test_qsa_prefill_maskless(130,4096,2051,12,true,mode));
+        test_cases.emplace_back(new test_qsa_prefill_maskless(129,4096,257,12,true,mode));
+        test_cases.emplace_back(new test_qsa_decode_maskless(1,4096,2051,12,true,mode));
+    }
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2560));
     test_cases.emplace_back(new test_qsa_prefill(513,4096,2561));
     test_cases.emplace_back(new test_qsa_prefill(513,512,17,true,true));
