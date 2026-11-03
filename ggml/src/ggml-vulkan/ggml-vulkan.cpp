@@ -5251,6 +5251,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 device->gdn_chunk_scan_nsplit = 8;
                 ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan, "gdn_chunk_scan_f32", gdn_chunk_scan_f32_len, gdn_chunk_scan_f32_data,
                     "main", 6, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {32}, 1, true, true, 32);
+                // with the gated output norm in the store: the norm needs a head's 128 columns, so one 8-wave workgroup per head
+                ggml_vk_create_pipeline(device, device->pipeline_gdn_chunk_scan_on, "gdn_chunk_scan_on_f32", gdn_chunk_scan_on_f32_len, gdn_chunk_scan_on_f32_data,
+                    "main", 11, sizeof(vk_op_gdn_chunk_push_constants), {1, 1, 1}, {256}, 1, true, true, 32);
                 // MUL_MAT_ID_PAIR_SWIGLU (used only after the fragment layout probe passed): 128 features per workgroup in x
 #define CREATE_MMID_GLU(ti, tn) \
                 ggml_vk_create_pipeline(device, device->pipeline_mmid_glu[ti][0][0], "mul_mm_id_glu_" #tn "_f16", mul_mm_id_glu_ ## tn ## _f16_len, \
@@ -10804,6 +10807,18 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         // MUL_MAT+CPY(f16): ggml_vk_can_fuse_mm_cpy16 admitted only shapes the int8 MMQ GEMM takes
         GGML_ASSERT(ctx->num_additional_fused_ops == 1 && !needs_split);
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false, cgraph->nodes[node_idx + 1]);
+    } else if (!ctx->gdn_z16.empty() && ctx->gdn_z16.count(dst)) {
+        // GGML_VK_GDN_Z16: the z of a folded GDN out norm, stored as f16 into the front half of its own buffer for the scan
+        // (ggml_vk_gdn_out_norm_prepass admitted only shapes the int8 MMQ GEMM takes)
+        GGML_ASSERT(ctx->num_additional_fused_ops == 0 && !needs_split);
+        ggml_tensor z16 = *dst;
+        z16.type  = GGML_TYPE_F16;
+        z16.nb[0] = sizeof(ggml_fp16_t);
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            z16.nb[d] = z16.nb[d - 1] * z16.ne[d - 1];
+        }
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false, &z16);
+        ggml_vk_path_census_add("GDN_Z16");
     } else if (needs_split) {
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
         const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
@@ -15926,7 +15941,10 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         const uint32_t nch = (n_tokens + CL - 1) / CL;
         const size_t qku = 3 * CL * 128 / 2;
         const size_t tpu = CL * CL + 2 * CL;
-        const size_t scr_size = sizeof(uint32_t) * ((size_t) n_seqs * neq1 * nch * qku + (size_t) n_seqs * H * nch * tpu);
+        const size_t scr_main = sizeof(uint32_t) * ((size_t) n_seqs * neq1 * nch * qku + (size_t) n_seqs * H * nch * tpu);
+        // the out-norm scan's per-head o tiles (gdn_chunk_scan.comp OTBuf) follow the operands
+        const bool on_fold = ctx->gdn_on.count(dst) != 0;
+        const size_t scr_size = scr_main + (on_fold ? sizeof(float) * (size_t) n_seqs * H * CL * (128 + 4) : 0);
         if (ctx->prealloc_size_split_k < scr_size) {
             ctx->prealloc_size_split_k = scr_size;
             ggml_vk_preallocate_buffers(ctx, subctx);
@@ -15936,7 +15954,8 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         }
         GGML_ASSERT(ctx->fused_gdn_direct < 0);   // the direct state write match excludes the chunk form
         vk_subbuffer scr_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
-        vk_op_gdn_chunk_push_constants cpc = { pc, nch, qkn ? 1u : 0u, qkn ? qkn->eps : 0.0f, qkn ? qkn->mul : 1.0f, 0, 0, 0, 0, 0 };
+        vk_op_gdn_chunk_push_constants cpc = { pc, nch, qkn ? 1u : 0u, qkn ? qkn->eps : 0.0f, qkn ? qkn->mul : 1.0f, 0, 0, 0, 0, 0,
+                                               0, 0.0f, 0, 0, 0, 0 };
         if (qkn) {
             ggml_vk_path_census_add("GDN_QK_NORM");
         }
@@ -15964,13 +15983,41 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
             cpc.conv_C = cf.C;
             ggml_vk_path_census_add("GDN_CONV_FOLD");
         }
+        // gated output norm in the scan store (ggml_vk_gdn_out_norm_prepass): z (f32, or f16 from its GEMM), gamma and the chain's
+        // f16 destination; one 8-wave workgroup per head
+        const auto on_it = ctx->gdn_on.find(dst);
+        const bool out_norm = on_it != ctx->gdn_on.end();
+        vk_subbuffer z_buf = src_buf[0], w_buf = src_buf[0], o_buf = src_buf[0];
+        if (out_norm) {
+            const auto & on = on_it->second;
+            cpc.out_norm = 1u | (on.z16 ? 2u : 0u);
+            // GGML_VK_GDN_OUTNORM_TEST_BREAK=1 (test-backend-ops negative control): a wrong eps, the tests must fail
+            static const bool brk = [] { const char * e = getenv("GGML_VK_GDN_OUTNORM_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
+            cpc.on_eps   = brk ? 1.0f : on.eps;
+            // element strides: z16 holds the f16 copy of a contiguous z, so its element strides equal the f32 ones
+            cpc.on_zs2 = (uint32_t) (on.z->nb[2] / sizeof(float));
+            cpc.on_zs3 = (uint32_t) (on.z->nb[3] / sizeof(float));
+            cpc.on_os2 = (uint32_t) (on.out->nb[2] / sizeof(ggml_fp16_t));
+            cpc.on_os3 = (uint32_t) (on.out->nb[3] / sizeof(ggml_fp16_t));
+            z_buf = ggml_vk_tensor_subbuffer(ctx, on.z);
+            w_buf = ggml_vk_tensor_subbuffer(ctx, on.gamma);
+            o_buf = ggml_vk_tensor_subbuffer(ctx, on.out);
+            ggml_vk_path_census_add("GDN_OUT_NORM");
+        }
+        vk_pipeline scan = out_norm ? ctx->device->pipeline_gdn_chunk_scan_on : ctx->device->pipeline_gdn_chunk_scan;
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_gdn_chunk_prep, 1);
-        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_gdn_chunk_scan, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, scan, 1);
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_gdn_chunk_prep,
             { src_buf[0], src_buf[1], src_buf[3], src_buf[4], scr_buf, cst_buf, cw_buf }, cpc, { neq1, nch, n_seqs });
         ggml_vk_sync_buffers(ctx, subctx);
-        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_gdn_chunk_scan,
-            { src_buf[2], src_buf[5], dst_buf, scr_buf, cst_buf, cw_buf }, cpc, { H * ctx->device->gdn_chunk_scan_nsplit, n_seqs, 1 });
+        if (out_norm) {
+            vk_subbuffer ot_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, scr_main);
+            ggml_vk_dispatch_pipeline(ctx, subctx, scan,
+                { src_buf[2], src_buf[5], dst_buf, scr_buf, cst_buf, cw_buf, z_buf, z_buf, w_buf, o_buf, ot_buf }, cpc, { H, n_seqs, 1 });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, scan,
+                { src_buf[2], src_buf[5], dst_buf, scr_buf, cst_buf, cw_buf }, cpc, { H * ctx->device->gdn_chunk_scan_nsplit, n_seqs, 1 });
+        }
         ctx->prealloc_split_k_need_sync = true;
         return;
     }
@@ -24490,6 +24537,212 @@ static void ggml_vk_hc_defer_guard(ggml_backend_vk_context * ctx, const struct g
     ctx->hc_defer = {};
 }
 
+// Chunked GDN with the gated output norm in the scan store (default on, GGML_VK_GDN_OUTNORM=0 off): when the GDN's output is read
+// only by the qwen4exp f16 output norm chain RMS_NORM, MUL(gamma), SIGMOID(z), MUL, CPY(f16) (ggml_vk_gdn_norm_f16_wiring), the
+// scan (gdn_chunk_scan_on: one 8-wave workgroup per head) applies the norm to each chunk's rows and stores the f16 result into
+// the CPY's destination; the chain is skipped and the f32 GDN output is never written. The epilogue reproduces rms_norm_small's
+// lane and expression order. The destination is written at the GDN, earlier than the CPY: graph_optimize keeps everything the
+// GDN reads and the GDN tensor itself allocated through the CPY, and the runtime prepass re-checks every overlap.
+// GGML_VK_GDN_Z16=1 (with the fold): the z GEMM stores f16 into the front half of its own buffer and the scan reads that; only
+// a GEMM on the int8 MMQ route can (Flash-Next's z GEMM gets an f16 B and takes the f16-B route, so it does not engage there).
+// Not bit-identical to the separate chain (where the last bits differ is not established). The separate norm pass is
+// bandwidth-bound and grows with the token count (Flash-Next on Strix Halo: 0.60 ms per GDN layer at 2048 tokens, 2.45 ms
+// at 8192); the fused scan hides most of it.
+static bool ggml_vk_gdn_out_norm_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_GDN_OUTNORM"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+static bool ggml_vk_gdn_z16_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_GDN_Z16"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+static bool ggml_vk_gdn_on_reject(const char * why, int node) {
+    static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
+    if (dbg) {
+        fprintf(stderr, "ggml_vulkan: GDN out norm not folded at node %d: %s\n", node, why);
+    }
+    return false;
+}
+
+// the shape part of the match (no buffers): the RMS_NORM of the chain that reads this GDN's whole output as [S_v, H, T, S]
+// (a packed view at offset 0), within a few nodes after it. Returns the RMS_NORM's node index or -1.
+static int ggml_vk_gdn_out_norm_structural(const ggml_cgraph * cgraph, int gi) {
+    const ggml_tensor * g = cgraph->nodes[gi];
+    const ggml_tensor * v = g->src[2];
+    const int64_t S_v = v->ne[0], H = v->ne[1], T = v->ne[2], S = v->ne[3];
+    // under ggml_vk_gdn_chunk_min tokens the GDN runs the sequential kernel, which has no fold (decode graphs)
+    if (S_v != 128 || T < ggml_vk_gdn_chunk_min || (g->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    const int end = std::min(cgraph->n_nodes - 4, gi + 48);
+    for (int ri = gi + 1; ri < end; ++ri) {
+        const ggml_tensor * rms = cgraph->nodes[ri];
+        if (rms->op != GGML_OP_RMS_NORM || rms->src[0] == nullptr || rms->src[0]->view_src != g) {
+            continue;
+        }
+        const ggml_tensor * x = rms->src[0];
+        if (x->view_offs != 0 || x->type != GGML_TYPE_F32 || x->ne[0] != S_v || x->ne[1] != H || x->ne[2] != T || x->ne[3] != S ||
+            x->nb[1] != (size_t) S_v * 4 || x->nb[2] != (size_t) S_v * H * 4 || x->nb[3] != (size_t) S_v * H * T * 4 ||
+            !ggml_vk_gdn_norm_f16_wiring(cgraph, ri)) {
+            return -1;
+        }
+        const ggml_tensor * mul   = cgraph->nodes[ri + 1];
+        const ggml_tensor * gamma = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+        const ggml_tensor * z     = cgraph->nodes[ri + 2]->src[0];
+        const ggml_tensor * cpy   = cgraph->nodes[ri + 4];
+        if (gamma->type != GGML_TYPE_F32 || gamma->ne[0] != S_v || ggml_nelements(gamma) != S_v || !ggml_is_contiguous(gamma) ||
+            z->type != GGML_TYPE_F32 || !ggml_are_same_shape(z, x) || z->nb[0] != 4 || z->nb[1] != (size_t) S_v * 4 ||
+            z->nb[2] % 16 != 0 || z->nb[3] % 16 != 0 ||
+            cpy->type != GGML_TYPE_F16 || !ggml_are_same_shape(cpy, x) || cpy->nb[0] != 2 || cpy->nb[1] != (size_t) S_v * 2 ||
+            cpy->nb[2] % 8 != 0 || cpy->nb[3] % 8 != 0) {
+            return -1;
+        }
+        for (int k = 0; k < 4; ++k) {
+            if (cgraph->nodes[ri + k]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                return -1;
+            }
+        }
+        return ri;
+    }
+    return -1;
+}
+
+// the z GEMM that may store f16 for this chain: a MUL_MAT before the GDN whose whole output z views and that nothing else reads
+static const ggml_tensor * ggml_vk_gdn_z16_gemm(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph,
+                                                const std::unordered_map<const ggml_tensor *, int> & idx, int gi, int ri) {
+    const ggml_tensor * sig = cgraph->nodes[ri + 2];
+    const ggml_tensor * z   = sig->src[0];
+    const ggml_tensor * zr  = z->view_src ? z->view_src : z;
+    if (zr->op != GGML_OP_MUL_MAT || z->view_offs != 0 || ggml_nelements(z) != ggml_nelements(zr) || !ggml_is_contiguous(z) ||
+        !ggml_is_contiguous(zr) || (zr->flags & GGML_TENSOR_FLAG_OUTPUT) || !idx.count(zr) || idx.at(zr) >= gi ||
+        !ggml_vk_mul_mat_f16out_ok(ctx, zr)) {
+        return nullptr;
+    }
+    for (int n = idx.at(zr) + 1; n < cgraph->n_nodes; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (t == sig || ggml_op_is_empty(t->op)) {
+            continue;
+        }
+        if (ggml_vk_node_reads(t, zr)) {
+            return nullptr;
+        }
+    }
+    return zr;
+}
+
+static void ggml_vk_gdn_out_norm_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->gdn_on.clear();
+    ctx->gdn_z16.clear();
+    if (!ggml_vk_gdn_out_norm_enabled() || ctx->device->disable_fusion || ctx->device->pipeline_gdn_chunk_scan_on == nullptr) {
+        return;
+    }
+    // only a GDN with enough tokens takes the chunk form: a decode graph has none and skips the node map below, which is built
+    // on the CPU before the first submit of every token (as in ggml_vk_gdn_qk_norm_prepass)
+    bool any = false;
+    for (int i = 0; i < cgraph->n_nodes && !any; ++i) {
+        const ggml_tensor * g = cgraph->nodes[i];
+        any = g->op == GGML_OP_GATED_DELTA_NET && g->src[2]->ne[2] >= ggml_vk_gdn_chunk_min;
+    }
+    if (!any) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, int> idx;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        idx[cgraph->nodes[i]] = i;
+    }
+    for (int gi = 0; gi < cgraph->n_nodes; ++gi) {
+        const ggml_tensor * g = cgraph->nodes[gi];
+        if (g->op != GGML_OP_GATED_DELTA_NET || !(g->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_vk_gdn_use_chunk(ctx, g)) {
+            continue;
+        }
+        const int ri = ggml_vk_gdn_out_norm_structural(cgraph, gi);
+        if (ri < 0) {
+            continue;
+        }
+        if (!ggml_can_fuse_subgraph(cgraph, ri, gdn_norm_f16_pattern, { ri + 4 })) {
+            ggml_vk_gdn_on_reject("an intermediate of the norm chain has another reader", gi);
+            continue;
+        }
+        const ggml_tensor * rms   = cgraph->nodes[ri];
+        const ggml_tensor * mul   = cgraph->nodes[ri + 1];
+        const ggml_tensor * gamma = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+        const ggml_tensor * z     = cgraph->nodes[ri + 2]->src[0];
+        const ggml_tensor * out   = cgraph->nodes[ri + 4];
+        if (!out->buffer || !z->buffer || !gamma->buffer || !g->buffer ||
+            get_misalign_bytes(ctx, z) != 0 || get_misalign_bytes(ctx, gamma) != 0 || get_misalign_bytes(ctx, out) != 0) {
+            ggml_vk_gdn_on_reject("z, gamma or the destination is misaligned", gi);
+            continue;
+        }
+        // the GDN's output part is read by the RMS_NORM only (its state part goes to the cache copies)
+        const size_t out_bytes = ggml_nbytes(rms->src[0]);
+        bool ok = true;
+        for (int n = gi + 1; n < cgraph->n_nodes && ok; ++n) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            if (t == rms || ggml_op_is_empty(t->op)) {
+                continue;
+            }
+            for (int sidx = 0; sidx < GGML_MAX_SRC && ok; ++sidx) {
+                const ggml_tensor * sv = t->src[sidx];
+                if (sv && (sv == g || (sv->view_src == g && sv->view_offs < out_bytes))) {
+                    ok = ggml_vk_gdn_on_reject("another node reads the GDN output", gi);
+                }
+            }
+        }
+        // the destination is written while the GDN reads its inputs, z and gamma, and before the nodes between the GDN and the
+        // chain run: none of them may touch it, and none may write z
+        std::vector<const ggml_tensor *> reads = { g, z, gamma };
+        for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
+            if (g->src[sidx]) {
+                reads.push_back(g->src[sidx]);
+            }
+        }
+        const auto qk_it = ctx->gdn_qk.find(g);
+        if (qk_it != ctx->gdn_qk.end()) {
+            reads.push_back(qk_it->second.q_raw);
+            reads.push_back(qk_it->second.k_raw);
+        }
+        const auto cf_it = ctx->gdn_cf.find(g);
+        if (cf_it != ctx->gdn_cf.end()) {
+            reads.push_back(cf_it->second.x);
+            reads.push_back(cf_it->second.state);
+            reads.push_back(cf_it->second.kern);
+        }
+        for (const ggml_tensor * t : reads) {
+            if (ok && t->buffer && ggml_vk_tensors_overlap(t, out, false)) {
+                ok = ggml_vk_gdn_on_reject("the destination overlaps a GDN input, z, gamma or the GDN tensor", gi);
+            }
+        }
+        for (int n = gi + 1; n < ri && ok; ++n) {
+            const ggml_tensor * t = cgraph->nodes[n];
+            if (ggml_op_is_empty(t->op) || t->buffer == nullptr || ggml_is_empty(t)) {
+                continue;
+            }
+            if (ggml_vk_tensors_overlap(t, out, false) || ggml_vk_tensors_overlap(t, z, false)) {
+                ok = ggml_vk_gdn_on_reject("a node between the GDN and the chain writes the destination or z", gi);
+            }
+            for (int sidx = 0; sidx < GGML_MAX_SRC && ok; ++sidx) {
+                const ggml_tensor * sv = t->src[sidx];
+                if (sv && sv->buffer && ggml_vk_tensors_overlap(sv, out, false)) {
+                    ok = ggml_vk_gdn_on_reject("a node between the GDN and the chain reads the destination's memory", gi);
+                }
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+        const ggml_tensor * zg = ggml_vk_gdn_z16_enabled() ? ggml_vk_gdn_z16_gemm(ctx, cgraph, idx, gi, ri) : nullptr;
+        ctx->gdn_on[g] = { gamma, z, out, ggml_get_op_params_f32(rms, 0), zg != nullptr };
+        for (int k = 0; k < 5; ++k) {
+            ctx->gdn_qk_skip.insert(cgraph->nodes[ri + k]);
+        }
+        if (zg) {
+            ctx->gdn_z16.insert(zg);
+        }
+    }
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -24647,6 +24900,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ggml_vk_gdn_qk_norm_prepass(ctx, cgraph);
     ggml_vk_gdn_conv_fold_prepass(ctx, cgraph);
+    ggml_vk_gdn_out_norm_prepass(ctx, cgraph);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
@@ -24720,7 +24974,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         int hc_moe_mode = HC_POST_NORM_NONE;
         bool hc_moe_inj = false;
         int hc_moe_front = 0;
-        if (!ctx->device->disable_fusion && !ctx->gdn_qk_skip.count(cgraph->nodes[i])) {
+        // a z GEMM that stores f16 for a folded GDN out norm (gdn_z16) runs alone
+        if (!ctx->device->disable_fusion && !ctx->gdn_qk_skip.count(cgraph->nodes[i]) &&
+            (ctx->gdn_z16.empty() || !ctx->gdn_z16.count(cgraph->nodes[i]))) {
             uint32_t num_adds = 0;
             vk_hc_boundary_chain hcb;
             int hcb_last = 0;
@@ -25148,6 +25404,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         if (!ctx->device->disable_fusion && ctx->num_additional_fused_ops == 0 && fusion_string == nullptr &&
             ggml_vk_gdn_direct_at_gdn(ctx, cgraph, i, last_node)) {
             fusion_string = "GDN_STATE_DIRECT";
+        }
+        // the out-norm folded chunked GDN reads z and gamma and writes the chain's f16 destination (barrier tracking)
+        if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET && !ctx->gdn_on.empty()) {
+            const auto on_it = ctx->gdn_on.find(cgraph->nodes[i]);
+            if (on_it != ctx->gdn_on.end()) {
+                GGML_ASSERT(ctx->num_additional_fused_ops == 0 && ctx->fused_extra_dst == nullptr);
+                ctx->fused_extra_srcs[2] = on_it->second.z;
+                ctx->fused_extra_srcs[3] = on_it->second.gamma;
+                ctx->fused_extra_dst = on_it->second.out;
+            }
         }
         GGML_ASSERT(ctx->num_additional_fused_ops < (int)(sizeof(op_srcs_fused_elementwise) / sizeof(op_srcs_fused_elementwise[0])));
         ctx->fused_ops_write_mask |= 1 << ctx->num_additional_fused_ops;
@@ -26816,6 +27082,47 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     auto * root = const_cast<ggml_tensor *>(input->view_src ? input->view_src : input);
                     params->add_alloc_dep(params->user_data, root, m.out);
                 }
+            }
+        }
+    }
+
+    // out-norm folded chunked GDN (ggml_vk_gdn_out_norm_prepass): the chain's f16 destination is written at the GDN, so everything
+    // the GDN reads (through the folded q/k norms and conv too), z, gamma and the GDN tensor stay allocated through the chain's CPY
+    // and the allocator cannot hand their memory to the destination. Shape-only match; the runtime prepass re-checks the addresses.
+    if (ggml_vk_gdn_out_norm_enabled() && !ctx->device->disable_fusion && ctx->device->pipeline_gdn_chunk_scan_on != nullptr &&
+        params && params->add_alloc_dep) {
+        std::unordered_map<const ggml_tensor *, int> idx;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            idx[graph->nodes[i]] = i;
+        }
+        for (int gi = 0; gi < graph->n_nodes; ++gi) {
+            ggml_tensor * g = graph->nodes[gi];
+            int ri;
+            if (g->op != GGML_OP_GATED_DELTA_NET || (ri = ggml_vk_gdn_out_norm_structural(graph, gi)) < 0) {
+                continue;
+            }
+            ggml_tensor * cpy = graph->nodes[ri + 4];
+            const ggml_tensor * mul = graph->nodes[ri + 1];
+            std::vector<const ggml_tensor *> keep = { g, graph->nodes[ri + 2]->src[0], mul->src[0] == graph->nodes[ri] ? mul->src[1] : mul->src[0] };
+            for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
+                const ggml_tensor * t = g->src[sidx];
+                if (t == nullptr) {
+                    continue;
+                }
+                keep.push_back(t);
+                // the folded q/k l2 norm reads SCALE(RMS_NORM(raw))'s raw view
+                if (t->op == GGML_OP_SCALE && t->src[0] && t->src[0]->op == GGML_OP_RMS_NORM && t->src[0]->src[0]) {
+                    keep.push_back(t->src[0]->src[0]);
+                }
+            }
+            ggml_backend_vk_context::ssm_conv_direct_match m;
+            if (ggml_vk_gdn_conv_fold_enabled() && ggml_vk_gdn_conv_fold_structural(ctx, graph, idx, g, false, m) >= 0) {
+                keep.push_back(m.x);
+                keep.push_back(m.state);
+            }
+            for (const ggml_tensor * t : keep) {
+                auto * root = const_cast<ggml_tensor *>(t->view_src ? t->view_src : t);
+                params->add_alloc_dep(params->user_data, root, cpy);
             }
         }
     }

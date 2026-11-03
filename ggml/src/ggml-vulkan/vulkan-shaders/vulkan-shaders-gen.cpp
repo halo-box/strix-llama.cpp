@@ -1003,6 +1003,7 @@ void process_shaders() {
     string_to_spv("lightning_indexer_cm_small_f16", "lightning_indexer_cm.comp", {{"N_WAVES", "1"}, {"HEADS_PER_TILE", "1"}});
     string_to_spv("gdn_chunk_prep_f32", "gdn_chunk_prep.comp", {});
     string_to_spv("gdn_chunk_scan_f32", "gdn_chunk_scan.comp", {});
+    string_to_spv("gdn_chunk_scan_on_f32", "gdn_chunk_scan.comp", {{"OUT_NORM", "1"}});
     // MUL_MAT_ID_PAIR_SWIGLU: q4_K gate + up + SwiGLU, register-direct weights (RDNA3 fragment layout, wave32)
     string_to_spv("mul_mm_id_glu_q4_k_f16", "mul_mm_id_glu.comp", {});
     string_to_spv("mul_mm_id_glu_q4_k_f32", "mul_mm_id_glu.comp", {{"B_F32", "1"}});

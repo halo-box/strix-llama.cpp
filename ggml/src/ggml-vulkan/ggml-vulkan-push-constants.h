@@ -903,6 +903,13 @@ struct vk_op_gdn_chunk_push_constants {
     uint32_t conv_fold;   // bit 0 on, bit 1: chunks after the first read the window without the conv-state branch
     uint32_t qc0, kc0, vc0;
     uint32_t conv_C;
+    // out_norm (GGML_VK_GDN_OUTNORM, the gdn_chunk_scan_on pipeline): the scan stores rms_norm(o) * gamma * sigmoid(z) as f16
+    // (bit 0) with z read as f16 (bit 1, GGML_VK_GDN_Z16); on_zs2 / on_zs3 and on_os2 / on_os3 are the token / sequence strides
+    // of z and of the f16 destination in elements (head rows packed: 128 apart)
+    uint32_t out_norm;
+    float    on_eps;
+    uint32_t on_zs2, on_zs3;
+    uint32_t on_os2, on_os3;
 };
 static_assert(sizeof(vk_op_gdn_chunk_push_constants) <= 128);
 
