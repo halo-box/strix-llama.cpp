@@ -82,9 +82,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
+        # newer transformers (seen with 5.22.1) renames the QSA layers from "full_attention" to "indexed_attention"
+        # (Qwen4ExpConfig); accept both, or every ratio is 0 and QSA stays off at runtime
+        qsa_types = ("full_attention", "indexed_attention")
         # the MTP block is a full-attention QSA layer too
         self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+            [ratio if layer_types[i] in qsa_types else 0 for i in range(n_layer)]
             + [ratio] * (self.block_count - n_layer)
         )
 
