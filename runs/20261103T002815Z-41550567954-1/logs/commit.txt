@@ -1,0 +1,3 @@
+ee30b949e8bf9827b06cc4de925c040b91045c56
+2026-11-02T07:30:48+09:30
+vulkan : HC_UP_MIX on the dense q8_0 x f16 GEMM with an f16 B, on by default (#246)
