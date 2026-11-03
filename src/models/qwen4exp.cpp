@@ -663,6 +663,7 @@ bool llama_model_qwen4exp::load_tensors(llama_model_loader & ml) {
     }
     if (!ml.no_alloc) {
         load_hc_split();
+        load_qkvz_split();
         load_bf16_twins();
     }
     return true;
@@ -748,6 +749,50 @@ void llama_model_qwen4exp::load_hc_split() {
     if (n_split > 0) {
         LLAMA_LOG_INFO("%s: hc split: %zu merged hc down+inject weights split into down views + f32 inject (LLAMA_HC_SPLIT=0 keeps them merged)\n",
                 __func__, n_split);
+    }
+}
+
+// qkvz split: the merged [attn_qkv | attn_gate] weight split into two row views (no copy). One bigger GEMM writes f32 rows of
+// 16384 (a 64 KiB pitch for Flash-Next) that the conv and the gated norm then read strided; on Strix Halo the two GEMMs are faster
+// (trunc8 prefill: one GEMM 5.78 ms vs 3.52 + 1.80 ms per layer). LLAMA_QKVZ_SPLIT=0 keeps the merged GEMM.
+void llama_model_qwen4exp::load_qkvz_split() {
+    const char * e = getenv("LLAMA_QKVZ_SPLIT");
+    if (e != nullptr && atoi(e) == 0) {
+        return;
+    }
+    const int64_t n_z = (int64_t) hparams.ssm_d_state * hparams.ssm_dt_rank;
+    size_t n_split = 0;
+    ggml_init_params ip = { ggml_tensor_overhead() * (2 * layers.size() + 1), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    for (auto & layer : layers) {
+        ggml_tensor * m = layer.wqkv_z;
+        if (m == nullptr || m->buffer == nullptr || m->data == nullptr || !ggml_is_contiguous(m) || m->ne[1] <= n_z ||
+            m->ne[2] != 1 || m->ne[3] != 1) {
+            continue;
+        }
+        const int64_t n_qkv = m->ne[1] - n_z;
+        std::string name = ggml_get_name(m);
+        const size_t pos = name.find("_qkv_gate");
+        const std::string stem = pos == std::string::npos ? name : name.substr(0, pos);
+        ggml_tensor * qkv  = ggml_view_2d(ctx.get(), m, m->ne[0], n_qkv, m->nb[1], 0);
+        ggml_tensor * gate = ggml_view_2d(ctx.get(), m, m->ne[0], n_z,   m->nb[1], n_qkv * m->nb[1]);
+        ggml_format_name(qkv,  "%s_qkv.weight",  stem.c_str());
+        ggml_format_name(gate, "%s_gate.weight", stem.c_str());
+        for (ggml_tensor * v : { qkv, gate }) {
+            v->buffer = nullptr;   // ggml_view_2d already set data; view_init sets both
+            if (ggml_backend_view_init(v) != GGML_STATUS_SUCCESS) {
+                GGML_ABORT("qkvz split: view of %s failed", ggml_get_name(m));
+            }
+        }
+        layer.wqkv      = qkv;
+        layer.wqkv_gate = gate;
+        layer.wqkv_z    = nullptr;
+        n_split++;
+    }
+    if (n_split > 0) {
+        LLAMA_LOG_INFO("%s: qkvz split: %zu merged attn_qkv_gate weights split into qkv + gate views (LLAMA_QKVZ_SPLIT=0 keeps them merged)\n",
+                __func__, n_split);
+        hc_split_bufs.emplace_back(std::move(ctx), nullptr);
     }
 }
 

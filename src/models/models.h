@@ -2578,6 +2578,8 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_bf16_twins();
     // merged hc_*_down_inject weights split into a down view and an f32 inject at load (LLAMA_HC_SPLIT=0 keeps them merged)
     void load_hc_split();
+    // merged attn_qkv_gate weights split into qkv and gate row views at load (LLAMA_QKVZ_SPLIT=0 keeps them merged)
+    void load_qkvz_split();
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> hc_split_bufs;
     ggml_tensor * bf16_twin(const ggml_tensor * w) const;
     std::map<const ggml_tensor *, ggml_tensor *> bf16_twins;
