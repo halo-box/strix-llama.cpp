@@ -883,11 +883,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         if (norm_f16) {
             res->add_fused_node({LLM_FUSED_OP_DSV4_HC_NORM_F16, lo_inject, il});
         }
-        *inject = ggml_view_2d(ctx0, lo_inject, hc, nt, lo_inject->nb[1], ggml_row_size(lo_inject->type, n_lo));
+        // inject: the unscaled hc rows, made contiguous ([hc, nt], small) so build_hc_combine's scale reads packed rows
+        *inject = ggml_cont(ctx0, ggml_view_2d(ctx0, lo_inject, hc, nt, lo_inject->nb[1], ggml_row_size(lo_inject->type, n_lo)));
         cb(*inject, "hc_inject", il);
         ggml_build_forward_expand(gf, *inject);
-        lo = ggml_view_2d(ctx0, lo_inject, n_lo, nt, lo_inject->nb[1], 0);
-        ggml_build_forward_expand(gf, lo);
+        // lo: the 1/hc scale over the whole contiguous output (as upstream; backends' SCALE wants packed rows), then the
+        // hc_down rows as a view for the silu
+        lo_inject = ggml_scale(ctx0, lo_inject, 1.0f / (float) hc);
+        lo = ggml_silu(ctx0, ggml_view_2d(ctx0, lo_inject, n_lo, nt, lo_inject->nb[1], 0));
     } else {
         if (inject) {
             *inject = build_lora_mm(qwen4exp_dec_weight(model, w_inject, nt, loras->empty()), xn);
@@ -904,8 +907,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         if (inject) {
             ggml_build_forward_expand(gf, lo);
         }
+        lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     }
-    lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = build_lora_mm(w_up, lo);
     cb(gate, "hc_gate", il);
     // LLAMA_HC_GATE_F16=1 (default off; the f32 gate fuses as HC_UP_MIX_F32G): the gate cast right after the up GEMM, so
