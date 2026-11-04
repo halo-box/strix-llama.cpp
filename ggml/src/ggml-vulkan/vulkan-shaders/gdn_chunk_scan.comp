@@ -63,7 +63,8 @@ layout(push_constant) uniform Parameters {
     uint conv_fold;   // binding 0 is the conv input x: v = silu(conv4(x)) of channel vc0 + the view offset (gdn_chunk_prep.comp)
     uint qc0, kc0, vc0;
     uint conv_C;
-    uint out_norm;    // OUT_NORM: bit 0 on, bit 1 z is f16 (binding 7) instead of f32 (binding 6)
+    uint out_norm;    // OUT_NORM: bit 0 on, bit 1 z is f16 (binding 7) instead of f32 (binding 6), bit 2 z is head-major (on_zs2 = 128,
+                      // heads 128 * n_tokens * n_seqs apart: the dq8 GEMM's D_HM store)
     float on_eps;
     uint on_zs2, on_zs3;
     uint on_os2, on_os3;
@@ -183,8 +184,9 @@ float conv_silu_v(const uint xo, const uint c, const uint tt, const uint s, cons
 // ~5% longer in-model.
 vec4 load_z(const uint tt) {
     const uint t = min(tt, n_tokens - 1);
-    const uint col4 = (gl_WorkGroupID.x) * (S_V / 4) + gl_SubgroupInvocationID;
-    const uint zb = gl_WorkGroupID.y * on_zs3 + t * on_zs2;
+    const bool hm = (out_norm & 4) != 0;
+    const uint col4 = (hm ? 0 : gl_WorkGroupID.x * (S_V / 4)) + gl_SubgroupInvocationID;
+    const uint zb = gl_WorkGroupID.y * on_zs3 + t * on_zs2 + (hm ? gl_WorkGroupID.x * (S_V * n_tokens * n_seqs) : 0);
     if ((out_norm & 2) != 0) {
         const uvec2 u = data_zh4[zb / 4 + col4];
         return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y));

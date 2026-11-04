@@ -12,6 +12,9 @@
 // Rows past M and columns past N are clamped on load and never stored. Batch 1 only (no broadcast, no split-k).
 // A_F32: A is an f32 matrix (K contiguous per row, the qwen4exp MoE router), read in place with 16-byte loads and rounded to f16 on the
 // LDS store, the rounding the f32-A KHR coopmat matmul applies when it fills its LDS (same operands, same per-output k order).
+// D_HM: D is stored head-major for 128-row heads, element (m, n) at (m / 128) * stride_d + n * 128 + m % 128 (stride_d = the
+// head stride), so a reader that walks the tokens of one head reads contiguous rows (the qwen4exp GDN z, GGML_VK_GDN_ZHM). A
+// 16-row fragment starts on a multiple of 16 and never crosses a head. Same values as the plain store.
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
@@ -318,16 +321,23 @@ void main() {
         return;
     }
 #endif
-    // epilogue: D[n * stride_d + m]
+    // epilogue: D[n * stride_d + m] (D_HM: head-major, see the top)
+#ifdef D_HM
+#define D_OFF(m_, n_) (((m_) / 128) * p.stride_d + (n_) * 128 + (m_) % 128)
+#define D_LD 128
+#else
+#define D_OFF(m_, n_) ((n_) * p.stride_d + (m_))
+#define D_LD p.stride_d
+#endif
     const bool full = m0 + BM <= p.M && n0 + BN <= p.N;
     if (full) {
         [[unroll]] for (uint j = 0; j < TNF; j++) {
             [[unroll]] for (uint i = 0; i < TMF; i++) {
-                const uint off = (n0 + wn * WN + j * 16) * p.stride_d + m0 + wm * WM + i * 16;
+                const uint off = D_OFF(m0 + wm * WM + i * 16, n0 + wn * WN + j * 16);
 #ifdef D_F16
-                coopMatStore(coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[j * TMF + i]), data_d, off, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatStore(coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[j * TMF + i]), data_d, off, D_LD, gl_CooperativeMatrixLayoutColumnMajor);
 #else
-                coopMatStore(acc[j * TMF + i], data_d, off, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatStore(acc[j * TMF + i], data_d, off, D_LD, gl_CooperativeMatrixLayoutColumnMajor);
 #endif
             }
         }
@@ -347,9 +357,9 @@ void main() {
                     const float v = uintBitsToFloat(As[sbase + c * 4 + r / 4][r % 4]);
                     if (m < p.M && n < p.N) {
 #ifdef D_F16
-                        data_d[n * p.stride_d + m] = float16_t(v);
+                        data_d[D_OFF(m, n)] = float16_t(v);
 #else
-                        data_d[n * p.stride_d + m] = v;
+                        data_d[D_OFF(m, n)] = v;
 #endif
                     }
                 }

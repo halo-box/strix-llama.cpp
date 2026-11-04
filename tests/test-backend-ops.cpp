@@ -7678,6 +7678,27 @@ struct test_gdn_conv_prefill : public test_case {
                 }
             }
         }
+        // GGML_VK_TEST_REQUIRE_GDN_ZHM=1: with GGML_VK_GDN_ZHM=1 (and not GGML_VK_GDN_Z16) the f16 B z projection of out_norm 4 is stored
+        // head-major by the dq8 GEMM for the folded norm (the route is known only with GGML_VK_DENSE_DQ8 >= 2); count 0 otherwise
+        if (out_norm && engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_ZHM")) {
+            const char * z16e = getenv("GGML_VK_GDN_Z16");
+            const char * zhme = getenv("GGML_VK_GDN_ZHM");
+            const char * dq8e = getenv("GGML_VK_DENSE_DQ8");
+            const bool on  = chunk && out_norm != 3 && env_knob_on("GGML_VK_GDN_OUTNORM");
+            const bool z16 = z16e != nullptr && atoi(z16e) != 0;
+            const bool zhm = zhme != nullptr && atoi(zhme) != 0;
+            const int  dq8 = dq8e != nullptr ? atoi(dq8e) : 1;
+            if (!(on && zhm && !z16 && out_norm == 4 && dq8 == 1)) {
+                const int64_t want = on && zhm && !z16 && out_norm == 4 && dq8 >= 2 ? 1 : 0;
+                for (const char * key : { "path:GDN_ZHM", "path:DQ8_HM_STORE" }) {
+                    const int64_t n = dispatch_census_count(backend, key);
+                    if (n != want) {
+                        msg = std::string(key) + " dispatches: " + std::to_string(n) + " (expected " + std::to_string(want) + ")";
+                        return false;
+                    }
+                }
+            }
+        }
         return true;
     }
     bool run_whole_graph() override { return true; }

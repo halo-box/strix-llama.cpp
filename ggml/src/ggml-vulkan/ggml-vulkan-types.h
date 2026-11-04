@@ -863,6 +863,7 @@ struct vk_device_struct {
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp): [f32 / f16 output][tile config], see ggml_vk_dense_dq8_cfgs
     vk_pipeline pipeline_matmul_dq8[2][6];
     vk_pipeline pipeline_matmul_dq8_f32[6];   // the same tiles with an f32 A rounded to f16 (GGML_VK_ROUTER_F16H)
+    vk_pipeline pipeline_matmul_dq8_hm[6];    // the same tiles with a head-major f32 D (128-row heads, GGML_VK_GDN_ZHM)
     vk_pipeline pipeline_matmul_dq8_hcmix[2];   // HC_UP_MIX epilogue, [f32 / f16 mixed stream]
     vk_pipeline pipeline_quantize_q8_1_x4;
     vk_pipeline pipeline_quantize_q8_1_x4_f16;   // f16 input (int8 MMQ with an f16 B)
@@ -1601,9 +1602,12 @@ struct ggml_backend_vk_context {
     // chunked GDN with the gated output norm in the scan store (ggml_vk_gdn_out_norm_prepass, GGML_VK_GDN_OUTNORM): gamma, z,
     // the f16 destination (the chain's CPY), eps, and whether z is stored as f16 by its GEMM (GGML_VK_GDN_Z16); the chain's
     // nodes go into gdn_qk_skip, the z GEMMs that store f16 into gdn_z16
-    struct gdn_out_norm { const ggml_tensor * gamma; const ggml_tensor * z; const ggml_tensor * out; float eps; bool z16; };
+    // (or head-major by its GEMM, GGML_VK_GDN_ZHM: those GEMMs go into gdn_zhm)
+    struct gdn_out_norm { const ggml_tensor * gamma; const ggml_tensor * z; const ggml_tensor * out; float eps; bool z16; bool zhm; };
     std::unordered_map<const ggml_tensor *, gdn_out_norm> gdn_on;
     std::unordered_set<const ggml_tensor *> gdn_z16;
+    std::unordered_set<const ggml_tensor *> gdn_zhm;
+    bool dq8_hm {};   // set around the ggml_vk_mul_mat_q_f16 call of a gdn_zhm GEMM: it must take the head-major dq8 GEMM
     int fused_hc_moe_epi {};   // HC_MOE_EPI: number of ADD nodes (routed slot adds + the shared-expert add) in front of the HC post norm chain
     bool fused_fa_out_gate {};  // FLASH_ATTN_EXT+RESHAPE+VIEW+CONT+SIGMOID+MUL: the attention output gate after FA
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};

@@ -3421,6 +3421,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[1][c], "matmul_dq8_q8_0_f16_d16_" + std::to_string(c),
                                                  matmul_dq8_q8_0_f16_d16_cm1_len, matmul_dq8_q8_0_f16_d16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
                                                  { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                        ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_hm[c], "matmul_dq8_q8_0_f16_hm_" + std::to_string(c),
+                                                 matmul_dq8_q8_0_f16_hm_cm1_len, matmul_dq8_q8_0_f16_hm_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                                                 { t[1], t[2], 1 }, spec, 1, false, true, 32);
                         ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_f32[c], "matmul_dq8_f32_f16_" + std::to_string(c),
                                                  matmul_dq8_f32_f16_cm1_len, matmul_dq8_f32_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
                                                  { t[1], t[2], 1 }, spec, 1, false, true, 32);
@@ -8831,7 +8834,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                         (src1->type == GGML_TYPE_F32 ||
                          (src1->type == GGML_TYPE_F16 && (ggml_is_contiguous(src1) || y_rowstride) && src1->nb[1] % 16 == 0 && src1_off % 16 == 0)) &&
                         ctx->device->pipeline_matmul_dq8_hcmix[od->type == GGML_TYPE_F16 ? 1 : 0] != nullptr;
-    if (hc_dq8 || dense_d16) {
+    // a head-major D (dq8_hm) exists on the dq8 GEMM only: keep the f16 B, as for dense_d16
+    if (hc_dq8 || dense_d16 || ctx->dq8_hm) {
         can_quantize_y = false;
     }
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
@@ -8923,7 +8927,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // dispatch measure the same there (m=320 k=10240, n 2049..2305, gfx1151).
     vk_pipeline pipeline_tail = nullptr;
     uint32_t n_main = (uint32_t) ne11;
-    if (ggml_vk_ragged_split_enabled(ctx->device) && !hcm && !hcd_route && ne11 > 256 && ne11 % 256 != 0 && ne11 % 256 <= ggml_vk_ragged_tail_max()) {
+    if (ggml_vk_ragged_split_enabled(ctx->device) && !hcm && !hcd_route && !ctx->dq8_hm && ne11 > 256 && ne11 % 256 != 0 && ne11 % 256 <= ggml_vk_ragged_tail_max()) {
         const uint32_t nm = (uint32_t) (ne11 - ne11 % 256);
         const uint32_t nt = (uint32_t) ne11 - nm;
         const uint32_t batch = (uint32_t) (ne12 * ne13);
@@ -8963,7 +8967,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         (ggml_vk_dense_dq8_mode() != 1 ||
          (ggml_vk_dense_dq8_fewrow((uint32_t) ne01, (uint32_t) ne10) && ne11 >= 1024) ||
          ((ne10 <= 4096 || (ggml_vk_dense_dq8_longk() && !ggml_vk_pitch_camps(b_pitch))) && ne11 >= 256 && CEIL_DIV(ne01, 128) * CEIL_DIV(ne11, 256) >= 3 * ctx->device->shader_core_count / 4))) {
-        vk_pipeline & pd = ctx->device->pipeline_matmul_dq8[dense_d16 ? 1 : 0][ggml_vk_dense_dq8_pick((uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10)];
+        // a head-major D (ctx->dq8_hm, GGML_VK_GDN_ZHM) exists on the f32-output dq8 GEMM only
+        const uint32_t dq8_cfg = ggml_vk_dense_dq8_pick((uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10);
+        vk_pipeline & pd = ctx->dq8_hm ? ctx->device->pipeline_matmul_dq8_hm[dq8_cfg] : ctx->device->pipeline_matmul_dq8[dense_d16 ? 1 : 0][dq8_cfg];
         if (pd) {
             pipeline_pre_dq8 = pipeline;
             pipeline = pd;
@@ -8984,6 +8990,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
     // the f16 store exists only on the dq8 GEMM; every other route would write f32 rows into the f16 layout
     GGML_ASSERT(!dense_d16 || pipeline_pre_dq8 != nullptr);
+    if (ctx->dq8_hm && (pipeline_pre_dq8 == nullptr || router_f16h || dense_d16 || pipeline_tail != nullptr || ne01 % 128 != 0)) {
+        GGML_LOG_ERROR("ggml_vulkan: head-major dq8 request off the dq8 route: m=%u n=%u k=%u y=%s quantize_y=%d qx_dequant=%d pre_dq8=%d tail=%d f16h=%d\n",
+                       (uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10, ggml_type_name(y_kernel_type), (int) quantize_y, (int) qx_needs_dequant,
+                       (int) (pipeline_pre_dq8 != nullptr), (int) (pipeline_tail != nullptr), (int) router_f16h);
+        GGML_ABORT("GGML_VK_GDN_ZHM: the z GEMM did not take the head-major dq8 GEMM");
+    }
     if (ctx->perf_logger) {
         // per-call path record (GGML_VK_PERF_LOGGER): the once-printed "XL tile engaged" line cannot say how many calls took which variant
         ctx->perf_logger->count_path(std::string(quantize_y ? "int8:" : "f16:") + pipeline->name + " " + ggml_type_name(src0->type) +
@@ -9205,7 +9217,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         // (an f32 A with 16-byte loads: a 16-byte aligned A binding)
         if (stride_b % 8 != 0 || y_buf_offset % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0 ||
             x_buf_offset % (router_f16h ? 16 : 4) != 0 || d_buf_offset % 4 != 0) {
-            GGML_ASSERT(!dense_d16);   // ggml_vk_dq8_f16out_ok checked the same alignment
+            GGML_ASSERT(!dense_d16 && !ctx->dq8_hm);   // ggml_vk_dq8_f16out_ok / ggml_vk_mul_mat_dq8_d16_ok checked the same alignment
             pipeline = pipeline_pre_dq8;   // split_k stays 1 (valid for every pipeline)
             router_f16h = false;
         } else {
@@ -9215,6 +9227,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             }
             if (dense_d16) {
                 ggml_vk_path_census_add("DQ8_F16OUT_STORE");
+            }
+            if (ctx->dq8_hm) {
+                ggml_vk_path_census_add("DQ8_HM_STORE");
             }
         }
     }
@@ -9243,14 +9258,17 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         // GGML_VK_HC_W8A8_TEST_BREAK=1 (tests only, the negative control): the hc GEMM skips its last 32-K block
         static const bool hcd_break = ggml_vk_test_hook("GGML_VK_HC_W8A8_TEST_BREAK") != 0;
         const uint64_t k_run = (hcd && hcd_break) ? ne10 - 32 : (is_dq8 && ne10 > 64) ? ne10 - 64 : ne10;
+        // head-major D (dq8_hm): stride_d is the head stride (128 rows x ne11 columns), a column is 128 elements
+        const uint32_t hm_stride_d = ctx->dq8_hm ? (uint32_t) (128 * ne11) : stride_d;
+        const uint64_t d_col_bytes = ctx->dq8_hm ? 128 * sizeof(float) : (uint64_t) od->nb[1];
         ggml_vk_matmul(
             ctx, subctx, pipeline,
             { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
             ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
             ne01, n_main, k_run,
-            ne10, stride_b, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+            ne10, stride_b, hm_stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
             split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
-            b_col_bytes, (uint64_t)od->nb[1]
+            b_col_bytes, d_col_bytes
         );  // NOLINT
         // GGML_VK_RAGGED_TEST_BREAK=1 (tests only, the negative control): the tail dispatch is skipped
         static const bool ragged_break = ggml_vk_test_hook("GGML_VK_RAGGED_TEST_BREAK") != 0;
@@ -11015,6 +11033,14 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
         }
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false, &z16, nullptr, dense_d16);
         ggml_vk_path_census_add("GDN_Z16");
+    } else if (!ctx->gdn_zhm.empty() && ctx->gdn_zhm.count(dst)) {
+        // GGML_VK_GDN_ZHM: the z of a folded GDN out norm, stored head-major (f32) for the scan's norm stage
+        // (ggml_vk_gdn_out_norm_prepass admitted only GEMMs the dq8 route takes, ggml_vk_mul_mat_dq8_hm_ok)
+        GGML_ASSERT(ctx->num_additional_fused_ops == 0 && !needs_split);
+        ctx->dq8_hm = true;
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
+        ctx->dq8_hm = false;
+        ggml_vk_path_census_add("GDN_ZHM");
     } else if (needs_split) {
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
         const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
@@ -16230,13 +16256,21 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         vk_subbuffer z_buf = src_buf[0], w_buf = src_buf[0], o_buf = src_buf[0];
         if (out_norm) {
             const auto & on = on_it->second;
-            cpc.out_norm = 1u | (on.z16 ? 2u : 0u);
+            // GGML_VK_GDN_ZHM_TEST_BREAK=1 (hooks build, negative control): the scan reads the head-major z as token-major
+            static const bool zhm_break = ggml_vk_test_hook("GGML_VK_GDN_ZHM_TEST_BREAK") != 0;
+            cpc.out_norm = 1u | (on.z16 ? 2u : 0u) | (on.zhm && !zhm_break ? 4u : 0u);
             // GGML_VK_GDN_OUTNORM_TEST_BREAK=1 (test-backend-ops negative control): a wrong eps, the tests must fail
             static const bool brk = [] { const char * e = getenv("GGML_VK_GDN_OUTNORM_TEST_BREAK"); return e != nullptr && atoi(e) != 0; }();
             cpc.on_eps   = brk ? 1.0f : on.eps;
             // element strides: z16 holds the f16 copy of a contiguous z, so its element strides equal the f32 ones
             cpc.on_zs2 = (uint32_t) (on.z->nb[2] / sizeof(float));
             cpc.on_zs3 = (uint32_t) (on.z->nb[3] / sizeof(float));
+            if (on.zhm && !zhm_break) {
+                // head-major z (GGML_VK_GDN_ZHM): token rows 128 elements apart inside a head, the sequences' tokens in a row,
+                // heads 128 * T * S apart (the shader derives the head stride)
+                cpc.on_zs2 = 128;
+                cpc.on_zs3 = (uint32_t) (128 * on.z->ne[2]);
+            }
             cpc.on_os2 = (uint32_t) (on.out->nb[2] / sizeof(ggml_fp16_t));
             cpc.on_os3 = (uint32_t) (on.out->nb[3] / sizeof(ggml_fp16_t));
             z_buf = ggml_vk_tensor_subbuffer(ctx, on.z);
@@ -24057,6 +24091,17 @@ static bool ggml_vk_mul_mat_dq8_d16_ok(ggml_backend_vk_context * ctx, const ggml
            ggml_vk_tensor_buffer_offset(ctx, mm) % 4 == 0;
 }
 
+// GGML_VK_GDN_ZHM: the GEMM takes the dq8 route with an f32 D (the same route and checks as the f16-output twin) and its rows are whole
+// 128-row heads; ggml_vk_mul_mat_q_f16 aborts if a head-major request lands anywhere else
+static bool ggml_vk_mul_mat_dq8_hm_ok(ggml_backend_vk_context * ctx, const ggml_tensor * mm) {
+    if (!ggml_vk_mul_mat_dq8_d16_ok(ctx, mm) || mm->src[0]->ne[1] % 128 != 0 || mm->ne[2] * mm->ne[3] != 1 ||
+        (uint64_t) mm->src[0]->ne[1] * (uint64_t) mm->ne[1] > UINT32_MAX) {
+        return false;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    return ctx->device->pipeline_matmul_dq8_hm[ggml_vk_dense_dq8_pick((uint32_t) src0->ne[1], (uint32_t) mm->src[1]->ne[1], (uint32_t) src0->ne[0])] != nullptr;
+}
+
 static bool ggml_vk_can_fuse_mm_cpy16(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_vk_mm_f16out_enabled() || !ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_CPY })) {
         return false;
@@ -24944,6 +24989,14 @@ static bool ggml_vk_gdn_z16_enabled() {
     return on;
 }
 
+// GGML_VK_GDN_ZHM=1 (with the fold, opt-in): the z GEMM on the dense q8_0 x f16 GEMM (f16 B) stores z head-major, the 128 values of one
+// head of every token in a row, so the scan's norm stage reads the chunk rows of its head contiguously instead of 128 x 48 x 4 bytes
+// apart. Same f32 values (bit-identical). Not with GGML_VK_GDN_Z16 on the same GEMM (Z16 wins).
+static bool ggml_vk_gdn_zhm_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_VK_GDN_ZHM"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
 static bool ggml_vk_gdn_on_reject(const char * why, int node) {
     static const bool dbg = getenv("GGML_VK_FUSION_DEBUG") != nullptr;
     if (dbg) {
@@ -25020,9 +25073,36 @@ static const ggml_tensor * ggml_vk_gdn_z16_gemm(ggml_backend_vk_context * ctx, c
     return zr;
 }
 
+// GGML_VK_GDN_ZHM: the same z GEMM match as ggml_vk_gdn_z16_gemm, on the dq8 route with an f32 D (ggml_vk_mul_mat_dq8_hm_ok). The scan
+// derives the head stride from its token and sequence counts, so z must be exactly [128 x heads, T x S].
+static const ggml_tensor * ggml_vk_gdn_zhm_gemm(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph,
+                                                const std::unordered_map<const ggml_tensor *, int> & idx, int gi, int ri) {
+    const ggml_tensor * sig = cgraph->nodes[ri + 2];
+    const ggml_tensor * z   = sig->src[0];
+    const ggml_tensor * zr  = z->view_src ? z->view_src : z;
+    if (zr->op != GGML_OP_MUL_MAT || z->view_offs != 0 || ggml_nelements(z) != ggml_nelements(zr) || !ggml_is_contiguous(z) ||
+        !ggml_is_contiguous(zr) || (zr->flags & GGML_TENSOR_FLAG_OUTPUT) || !idx.count(zr) || idx.at(zr) >= gi ||
+        zr->ne[0] != z->ne[0] * z->ne[1] || zr->ne[1] != z->ne[2] * z->ne[3] || !ggml_vk_mul_mat_dq8_hm_ok(ctx, zr)) {
+        ggml_vk_gdn_on_reject("zhm: the z GEMM cannot store head-major (not a whole contiguous [heads x 128, tokens] MUL_MAT on the dq8 route)", gi);
+        return nullptr;
+    }
+    for (int n = idx.at(zr) + 1; n < cgraph->n_nodes; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        if (t == sig || ggml_op_is_empty(t->op)) {
+            continue;
+        }
+        if (ggml_vk_node_reads(t, zr)) {
+            ggml_vk_gdn_on_reject("zhm: another node reads the z GEMM output", gi);
+            return nullptr;
+        }
+    }
+    return zr;
+}
+
 static void ggml_vk_gdn_out_norm_prepass(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
     ctx->gdn_on.clear();
     ctx->gdn_z16.clear();
+    ctx->gdn_zhm.clear();
     if (!ggml_vk_gdn_out_norm_enabled() || ctx->device->disable_fusion || ctx->device->pipeline_gdn_chunk_scan_on == nullptr) {
         return;
     }
@@ -25121,7 +25201,11 @@ static void ggml_vk_gdn_out_norm_prepass(ggml_backend_vk_context * ctx, const gg
             continue;
         }
         const ggml_tensor * zg = ggml_vk_gdn_z16_enabled() ? ggml_vk_gdn_z16_gemm(ctx, cgraph, idx, gi, ri) : nullptr;
-        ctx->gdn_on[g] = { gamma, z, out, ggml_get_op_params_f32(rms, 0), zg != nullptr };
+        const ggml_tensor * zh = zg == nullptr && ggml_vk_gdn_zhm_enabled() ? ggml_vk_gdn_zhm_gemm(ctx, cgraph, idx, gi, ri) : nullptr;
+        ctx->gdn_on[g] = { gamma, z, out, ggml_get_op_params_f32(rms, 0), zg != nullptr, zh != nullptr };
+        if (zh) {
+            ctx->gdn_zhm.insert(zh);
+        }
         for (int k = 0; k < 5; ++k) {
             ctx->gdn_qk_skip.insert(cgraph->nodes[ri + k]);
         }
@@ -25363,9 +25447,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         int hc_moe_mode = HC_POST_NORM_NONE;
         bool hc_moe_inj = false;
         int hc_moe_front = 0;
-        // a z GEMM that stores f16 for a folded GDN out norm (gdn_z16) runs alone
+        // a z GEMM that stores f16 (gdn_z16) or head-major (gdn_zhm) for a folded GDN out norm runs alone
         if (!ctx->device->disable_fusion && !ctx->gdn_qk_skip.count(cgraph->nodes[i]) &&
-            (ctx->gdn_z16.empty() || !ctx->gdn_z16.count(cgraph->nodes[i]))) {
+            (ctx->gdn_z16.empty() || !ctx->gdn_z16.count(cgraph->nodes[i])) &&
+            (ctx->gdn_zhm.empty() || !ctx->gdn_zhm.count(cgraph->nodes[i]))) {
             uint32_t num_adds = 0;
             vk_hc_boundary_chain hcb;
             int hcb_last = 0;
