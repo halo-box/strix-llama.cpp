@@ -5382,6 +5382,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     mul_mm_id_down_q8_0_f16_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
                 ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q80[1], "mul_mm_id_down_q8_0_f16_t8", mul_mm_id_down_q8_0_f16_t8_len,
                     mul_mm_id_down_q8_0_f16_t8_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+                ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q80_half[0], "mul_mm_id_down_q8_0_f16_h", mul_mm_id_down_q8_0_f16_h_len,
+                    mul_mm_id_down_q8_0_f16_h_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+                ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q80_half[1], "mul_mm_id_down_q8_0_f16_h_t8", mul_mm_id_down_q8_0_f16_h_t8_len,
+                    mul_mm_id_down_q8_0_f16_h_t8_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
                 // expert repack buffer (GGML_VK_EXPERT_REPACK): the same kernels on the repacked order, the mat-vec, the inverse copy
                 if (ggml_vk_expert_repack_enabled()) {
 #define CREATE_MMID_GLU_RP(ti, tn) \
@@ -5407,6 +5411,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     CREATE_MMID_DOWN_V(6) CREATE_MMID_DOWN_V(7) CREATE_MMID_DOWN_V(8)
                     CREATE_MMID_DOWN_V(9) CREATE_MMID_DOWN_V(10)
 #undef CREATE_MMID_DOWN_V
+                    ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51_rp_half[0], "mul_mm_id_down_q5_1_f16_rp_h", mul_mm_id_down_q5_1_f16_rp_h_len,
+                        mul_mm_id_down_q5_1_f16_rp_h_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
+                    ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51_rp_half[1], "mul_mm_id_down_q5_1_f16_rp_h_t8", mul_mm_id_down_q5_1_f16_rp_h_t8_len,
+                        mul_mm_id_down_q5_1_f16_rp_h_t8_data, "main", 5, sizeof(vk_op_mmid_down_push_constants), {256, 1, 1}, {}, 1, true, true, 32);
                     ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q4k, "mul_mat_vec_id_q4_k_rp_f32", mul_mat_vec_id_q4_k_rp_f32_len,
                         mul_mat_vec_id_q4_k_rp_f32_data, "main", 6, sizeof(vk_mat_vec_id_push_constants), {32, 1, 1}, {}, 1, true);
                     ggml_vk_create_pipeline(device, device->pipeline_mmv_id_rp_q5k, "mul_mat_vec_id_q5_k_rp_f32", mul_mat_vec_id_q5_k_rp_f32_len,
@@ -5810,7 +5818,7 @@ static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
         }
     }
 
-    constexpr size_t n_out = 515;
+    constexpr size_t n_out = 1027;
     // an optional feature: a Vulkan error here (allocation, submit, fence) reports the check as failed instead of aborting init
     vk_buffer buf;
     vk::DescriptorPool pool;
@@ -5858,6 +5866,17 @@ static bool ggml_vk_check_coopmat_rdna3_layout(vk_device & device) {
             for (uint32_t j = 0; j < 256; j++) {
                 store = store && fabsf(out[j] - ref[j]) < 0.0625f;
                 lanes = lanes && fabsf(out[256 + j] - ref[j]) < 0.0625f;
+            }
+            if (sg == 32) {
+                // A read from one lane per row (mul_mm_id_down HALF_A): parity layout, and the low half for the record
+                bool parity = true, low = true;
+                for (uint32_t j = 0; j < 256; j++) {
+                    parity = parity && fabsf(out[515 + j] - ref[j]) < 0.0625f;
+                    low    = low    && fabsf(out[771 + j] - ref[j]) < 0.0625f;
+                }
+                device->coopmat_rdna3_half_a = parity;
+                GGML_LOG_INFO("ggml_vulkan: %s: WMMA A row m read from one lane: parity layout (m, m + 16 by row parity) %s, "
+                              "low half-wave %s\n", device->name.c_str(), parity ? "yes" : "no", low ? "yes" : "no");
             }
             if (!(lengths && store && lanes)) {
                 GGML_LOG_WARN("ggml_vulkan: %s: the cooperative-matrix layout at wave%u is not the expected RDNA3 one "
@@ -12045,6 +12064,25 @@ static void ggml_vk_mmid_down_stream(ggml_backend_vk_context * ctx, vk_context& 
             pipeline = ctx->device->pipeline_mmid_down_q51_rpv[expdown_v];
             tpw = (expdown_v == 2 || expdown_v == 7 || expdown_v == 8) ? 2 : expdown_v == 3 ? 4 : expdown_v == 9 ? 8 : expdown_v == 10 ? 16 : 1;
             ggml_vk_path_census_add("EXPDOWN_V");
+        }
+    }
+    // GGML_VK_EXPDOWN_NOSEL=1: the same kernel with half-wave A fragments (mul_mm_id_down.comp HALF_A): each lane decodes the row the
+    // WMMA reads from it, so the fragments need no selects. Same operands, same results. f16 B, one or eight tiles per workgroup
+    // (q5_1 repacked: the default kernel or EXPDOWN_V=9; q8_0: either MMID_DOWN_Q8 mode); needs the layout probe's parity result
+    static const bool nosel = [] {
+        const char * e = getenv("GGML_VK_EXPDOWN_NOSEL");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (nosel && x->type == GGML_TYPE_F16 && ctx->device->coopmat_rdna3_half_a && (tpw == 1 || tpw == 8)) {
+        vk_pipeline h = nullptr;
+        if (q8) {
+            h = ctx->device->pipeline_mmid_down_q80_half[tpw == 8 ? 1 : 0];
+        } else if (repacked && (pipeline == ctx->device->pipeline_mmid_down_q51_rp[0] || pipeline == ctx->device->pipeline_mmid_down_q51_rpv[9])) {
+            h = ctx->device->pipeline_mmid_down_q51_rp_half[tpw == 8 ? 1 : 0];
+        }
+        if (h) {
+            pipeline = h;
+            ggml_vk_path_census_add("EXPDOWN_NOSEL");
         }
     }
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;

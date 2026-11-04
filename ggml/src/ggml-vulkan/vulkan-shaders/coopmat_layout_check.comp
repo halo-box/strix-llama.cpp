@@ -48,6 +48,23 @@ void main() {
     c = coopMatMulAdd(a, b, c);
 
     coopMatStore(c, data_out, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+
+    // which lane the multiply reads row m of A from (wave32): A filled in one lane per row, the other lane of the pair (L, L ^ 16)
+    // holds garbage. Parity layout at 515: row m from lane m for even m, m + 16 for odd m; low half at 771: row m from lane m.
+    // A product equal to the reference means the garbage lanes were not read.
+    {
+        const bool hi = (lane & 16u) != 0u;
+        MATA ap, al;
+        for (uint i = 0; i < min(16u, uint(ap.length())); i++) {
+            const float16_t g = float16_t(77.0 + float(lane % 32));
+            ap[i] = (((lane & 1u) != 0u) == hi) ? float16_t(va(lane % 16, i)) : g;
+            al[i] = !hi ? float16_t(va(lane % 16, i)) : g;
+        }
+        ACC cp = coopMatMulAdd(ap, b, ACC(0.0));
+        ACC cl = coopMatMulAdd(al, b, ACC(0.0));
+        coopMatStore(cp, data_out, 515, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(cl, data_out, 771, 16, gl_CooperativeMatrixLayoutRowMajor);
+    }
     for (uint i = 0; i < min(256 / SG, uint(c.length())); i++) {
         data_out[256 + (lane / 16 + (SG / 16) * i) * 16 + lane % 16] = c[i];
     }

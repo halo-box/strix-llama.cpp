@@ -1099,6 +1099,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_gdn_chunk_scan_ktg;       // GGML_VK_GDN_KT_GATHER: K^T gathered from the K fragments
     vk_pipeline pipeline_gdn_chunk_scan_on_ktg;
     vk_pipeline pipeline_coopmat_layout_check[2];  // wave32, wave64: RDNA3/RADV fragment layout probe (ggml_vk_check_coopmat_rdna3_layout)
+    bool coopmat_rdna3_half_a = false;   // the probe saw WMMA read A row m from lane m (even m) / m + 16 (odd m) only
     bool coopmat_rdna3_layout {};                   // the probe passed: the manual-fragment "_mf" and REG_A MUL_MAT_ID pipelines may be used
     uint32_t gdn_chunk_scan_nsplit = 1;   // scan workgroups per value head
     // One pipeline per supported indexer head count; see LI_NH_VALUES.
@@ -1159,7 +1160,9 @@ struct vk_device_struct {
     // expert repack buffer: the same kernels on the repacked weight order, the repacked mat-vec, and the inverse copy
     vk_pipeline pipeline_mmid_glu_rp[2][2][2];   // pipeline_mmid_glu on the repacked weight order
     vk_pipeline pipeline_mmid_down_q51_rp[2];
+    vk_pipeline pipeline_mmid_down_q80_half[2];   // q8_0 with half-wave A fragments (GGML_VK_EXPDOWN_NOSEL): [0] one tile per workgroup, [1] eight
     vk_pipeline pipeline_mmid_down_q51_rpv[11];   // GGML_VK_EXPDOWN_V variants of the f16-B repacked down kernel ([0] and [5] unused)
+    vk_pipeline pipeline_mmid_down_q51_rp_half[2];   // half-wave A fragments (GGML_VK_EXPDOWN_NOSEL): [0] one tile per workgroup, [1] eight
     vk_pipeline pipeline_mmv_id_rp_q4k, pipeline_mmv_id_rp_q5k, pipeline_mmv_id_rp_q51;
     vk_pipeline pipeline_mmv_id_rp_q4k_q8, pipeline_mmv_id_rp_q5k_q8, pipeline_mmv_id_rp_q51_q8;
     vk_pipeline pipeline_mmv_id_glu_rp_q4k_q8, pipeline_mmv_id_glu_rp_q5k_q8;   // MOE_GLU_GEMV on repacked experts

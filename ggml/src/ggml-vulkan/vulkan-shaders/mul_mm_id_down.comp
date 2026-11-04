@@ -151,6 +151,15 @@ void main() {
     const uint wave = gl_SubgroupID;
     const uint lane = gl_SubgroupInvocationID;
     const bool lo   = lane < 16;
+    // A row of this lane within the wave's 32 features. HALF_A (GGML_VK_EXPDOWN_NOSEL; needs the layout probe's parity result: the
+    // WMMA reads A row m from lane m for even m and m + 16 for odd m): lanes m and m + 16 hold rows m and 16 + m, split by row
+    // parity, so the f0 fragment is this lane's own decode and f1 the other half-wave's, with no selects. Every weight is still
+    // decoded once per wave; the accumulator layout and the epilogue are unchanged
+#if defined(HALF_A)
+    const uint arow = (lane % 16) + ((((lane & 1u) ^ (lane >> 4)) != 0u) ? 16u : 0u);
+#else
+    const uint arow = lane;
+#endif
 
     if (tid < BN) {
         [[unroll]] for (uint tt = 0; tt < TPW; tt++) {
@@ -210,13 +219,13 @@ void main() {
     [[unroll]] for (uint tt = 0; tt < TPW; tt++) {
         const uint expert = data_e[1 + 2 * (tile0 + (tt < ntl ? tt : 0))];
 #if defined(A_Q8_0)
-        a_base[tt] = 4 * (p.a_offset + expert * p.stride_e) + (feat0 + lane) * row_u;
+        a_base[tt] = 4 * (p.a_offset + expert * p.stride_e) + (feat0 + arow) * row_u;
 #elif defined(A_REPACK)
         // expert-repacked weights (Vulkan expert repack buffer): per 32-row block the 16-byte units are stored unit-major,
         // [uvec4 k][32 rows], so each load is 512 contiguous bytes across the wave
-        a_base[tt] = p.a_offset + expert * p.stride_e + feat0 * row_u + lane;
+        a_base[tt] = p.a_offset + expert * p.stride_e + feat0 * row_u + arow;
 #else
-        a_base[tt] = p.a_offset + expert * p.stride_e + (feat0 + lane) * row_u;
+        a_base[tt] = p.a_offset + expert * p.stride_e + (feat0 + arow) * row_u;
 #endif
     }
 #if defined(A_REPACK)
@@ -271,8 +280,13 @@ void main() {
             MATA f0, f1;
             [[unroll]] for (uint j = 0; j < 8; j++) {
                 const uint oth = subgroupShuffleXor(own[j], 16);
+#if defined(HALF_A)
+                const f16vec2 v0 = unpackFloat2x16(own[j]);
+                const f16vec2 v1 = unpackFloat2x16(oth);
+#else
                 const f16vec2 v0 = unpackFloat2x16(lo ? own[j] : oth);
                 const f16vec2 v1 = unpackFloat2x16(lo ? oth : own[j]);
+#endif
                 f0[2 * j] = v0.x; f0[2 * j + 1] = v0.y;
                 f1[2 * j] = v1.x; f1[2 * j + 1] = v1.y;
             }
