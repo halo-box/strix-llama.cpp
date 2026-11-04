@@ -4674,7 +4674,7 @@ static int ggml_cuda_match_hc_combine_norm(ggml_cgraph * cgraph, int i,
                     const ggml_tensor * xi = mm ? mm->src[1] : nullptr;
                     if (mm && mm->op == GGML_OP_MUL_MAT && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                         (xi == mulg || (xi->view_src == mulg && xi->view_offs == 0)) && ggml_is_contiguous(xi) &&
-                        wi->op == GGML_OP_NONE && wi->type == GGML_TYPE_F32 && ggml_is_contiguous(wi) &&
+                        wi->op == GGML_OP_NONE && (wi->type == GGML_TYPE_F32 || wi->type == GGML_TYPE_F16) && ggml_is_contiguous(wi) &&
                         wi->ne[0] == n_embd * hc && wi->ne[1] == hc && wi->ne[2] == 1 && wi->ne[3] == 1 &&
                         mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) &&
                         mm->ne[0] == hc && mm->ne[1] == n_tok && mm->ne[2] == 1 && mm->ne[3] == 1) {
@@ -6677,7 +6677,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (skip > 0 && !args.single_block) {
             // HC16: a BF16 copy of xn for its consumers, and BF16 residual / block_out streams where every reader agreed.
             // MMB_F16_BLAS: the F16 GEMM readers get the RNE F16 staging copy in place of the unread BF16 and int8 copies.
-            const bool blas16 = !args.out_inject && (ggml_cuda_mmb_f16_marks(*cuda_ctx, args.out_xn) & MMB_F16_BLAS) &&
+            const bool blas16 = (!args.out_inject || args.w_inject->type == GGML_TYPE_F16) &&
+                                (ggml_cuda_mmb_f16_marks(*cuda_ctx, args.out_xn) & MMB_F16_BLAS) &&
                                 !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, args.out_xn);
             args.out_xn_bf16  = blas16 ? ggml_cuda_mmb_blas_f16_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn))
                                        : ggml_cuda_mmb_cache_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn));
@@ -7823,10 +7824,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 // F16 BLAS staging: every GEMM that reads xn has F16 weights (the F16 cuBLAS path converts xn per GEMM) and
                 // the stream mix gets its gate from an F16 GEMM too. No MMB GEMM reads xn, so nothing reads its BF16 or
                 // int8 copy, and the combine + norm writes the RNE F16 copy that those GEMMs read in place of their conversions.
-                bool blas = !ca.out_inject; int nblas = 0;
+                // an F16-weight inject is fused into the combine + norm (it reads the F32 xn), so it is no BLAS reader
+                bool blas = !ca.out_inject || ca.w_inject->type == GGML_TYPE_F16; int nblas = 0;
                 for (auto rr = readers_after(xn, i + 1); rr.first != rr.second && blas; ++rr.first) {
                     const int n = *rr.first;
                     const ggml_tensor * t = cgraph->nodes[n];
+                    if (t == ca.out_inject) continue;
                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
                     if (t->op == GGML_OP_MUL_MAT && t->src[0]->type == GGML_TYPE_F16 && t->src[0] != xn && t->src[0]->view_src != xn &&
                         (t->src[1] == xn || t->src[1]->view_src == xn)) { ++nblas; continue; }
