@@ -1315,10 +1315,13 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
 }
 
 bool llama_context::nextn_resident_enable(llama_context & draft) {
+    // LLAMA_MTP_RESIDENT: 0 = off, unset = ROCm only, 1 = also Vulkan (opt-in until its logits, state and rollback
+    // match the host hand-over byte for byte in served A/B)
     const char * resident = getenv("LLAMA_MTP_RESIDENT");
     if (resident && strcmp(resident, "0") == 0) {
         return false;
     }
+    const bool allow_vulkan = resident && atoi(resident) == 1;
     if (model.arch != LLM_ARCH_QWEN4EXP || draft.model.arch != LLM_ARCH_QWEN4EXP ||
             cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || draft.cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
             draft.model.hparams.n_layer_nextn != 1 || model.devices.size() != 1 || draft.model.devices.size() != 1 ||
@@ -1331,7 +1334,8 @@ bool llama_context::nextn_resident_enable(llama_context & draft) {
     ggml_backend_t consumer = nullptr;
     // Only ROCm passed model-level verification; widen after logits, state and rollback match byte for byte on another backend.
     for (auto & backend : backends) {
-        if (strncmp(ggml_backend_name(backend.get()), "ROCm", 4) == 0) {
+        const char * name = ggml_backend_name(backend.get());
+        if (strncmp(name, "ROCm", 4) == 0 || (allow_vulkan && strncmp(name, "Vulkan", 6) == 0)) {
             producer = backend.get();
         }
     }
