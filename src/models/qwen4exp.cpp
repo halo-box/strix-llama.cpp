@@ -24,6 +24,7 @@
 
 // defined below, used by the graph constructor
 static bool    qwen4exp_last_attn_trim();
+static bool    qwen4exp_mtp_cache_only_any();
 static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream);
 static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t n_blocks, int64_t n_idx_h);
 
@@ -515,7 +516,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     // gfx1151 HIP, 2026-10-22: cache-only matched upstream logits and state at b/ub4096 with one sequence.
     // Metadata growth is covered on CPU. Widen the configured batch/sequence limits only after the same 60127-token HIP logits/state comparison passes.
-    const bool cache_only = cparams.n_seq_max == 1 && cparams.n_ubatch >= 4096 && cparams.n_ubatch >= cparams.n_batch && n_outputs == 0 && !cparams.embeddings &&
+    // LLAMA_MTP_CACHE_ONLY=1 drops the width rule (any ubatch, split or not): the prune keeps the same K/V writes
+    const bool cache_only = cparams.n_seq_max == 1 && (qwen4exp_mtp_cache_only_any() || (cparams.n_ubatch >= 4096 && cparams.n_ubatch >= cparams.n_batch)) &&
+            n_outputs == 0 && !cparams.embeddings &&
             (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) &&
             cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && cparams.nextn_layer_offset == 0;
 
@@ -1904,6 +1907,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     }
 
     return cur;
+}
+
+// LLAMA_MTP_CACHE_ONLY=1: the MTP draft's prompt catch-up (no outputs) stops after its attention at every ubatch width,
+// not only at ubatch >= 4096 (the HIP k_set_rows failure behind that rule was seen at b4096 / ub512 on ROCm only)
+static bool qwen4exp_mtp_cache_only_any() {
+    static const bool on = [] { const char * e = getenv("LLAMA_MTP_CACHE_ONLY"); return e != nullptr && atoi(e) != 0; }();
+    return on;
 }
 
 // LLAMA_FN_LAST_ATTN_TRIM (default on, =0 off): in the last layer, run the queries, the indexer queries, the selection and the
