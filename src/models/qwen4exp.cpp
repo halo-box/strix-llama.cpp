@@ -3031,7 +3031,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_split(
             ggml_row_size(conv_input->type, t)));
     cb(h, "conv_hist_snap", il);
 
-    ggml_tensor * snap = conv_states_all == mctx_cur->get_p_l(il) ? mctx_cur->get_p_snap_l(il) : mctx_cur->get_r_snap_l(il);
+    // the snapshot tensors exist only when this ubatch takes a snapshot (not for the LLAMA_GDN_KEEP_SPLIT split)
+    ggml_tensor * snap = mctx_cur->get_snap_t() < 0 ? nullptr
+            : conv_states_all == mctx_cur->get_p_l(il) ? mctx_cur->get_p_snap_l(il) : mctx_cur->get_r_snap_l(il);
     if (mctx_cur->get_snap_t() >= 0 && snap != nullptr) {
         GGML_ASSERT(mctx_cur->get_snap_t() == t && mctx_cur->get_snap_s() == 0);
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, h, snap));
