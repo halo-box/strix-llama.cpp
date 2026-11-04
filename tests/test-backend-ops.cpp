@@ -5387,7 +5387,12 @@ struct test_mul_mat_f16b : public test_case {
         const int64_t native = dispatch_census_count(backend, "path:MUL_MAT_F16B_NATIVE");
         if (req_native && native >= 0) {
             // the counter counts only GEMMs the native list routed (not the GGML_VK_DENSE_F16COOPMAT dense router)
-            const bool want = k >= 1024 && n >= 32 && native_on && type_a == GGML_TYPE_Q8_0;
+            // a few-row long-k q8_0 GEMM goes to int8 MMQ first (GGML_VK_HC_W8A8, default on: m <= 384, k >= 4096, n >= 512)
+            static const bool hc_on = [] { const char * e = getenv("GGML_VK_HC_W8A8"); return e == nullptr || atoi(e) != 0; }();
+            static const int hc_maxm = [] { const char * e = getenv("GGML_VK_HC_W8A8_MAXM"); return e ? atoi(e) : 384; }();
+            static const int hc_minn = [] { const char * e = getenv("GGML_VK_HC_W8A8_MINN"); return e ? atoi(e) : 512; }();
+            const bool hc = hc_on && m <= hc_maxm && k >= 4096 && n >= hc_minn && k % 32 == 0;
+            const bool want = k >= 1024 && n >= 32 && native_on && type_a == GGML_TYPE_Q8_0 && !hc;
             if ((native > 0) != want) {
                 msg = "MUL_MAT_F16B_NATIVE dispatches: " + std::to_string(native) + (want ? " (expected the f16-B path)" : " (expected int8 / mat-vec)");
                 return false;
@@ -9738,8 +9743,11 @@ struct test_mul_mat_id_cpy16 : public test_case {
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         const char * name = with_mul ? "MUL_MAT_ID_MUL_CPY16" : "MUL_MAT_ID_CPY16";
         if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_DOWN_STREAM", name)) {
-            // GGML_VK_TEST_REQUIRE_DOWN_STREAM=1: the streaming launch must run for q5_1 with m % 256 == 0 and k % 64 == 0, and not otherwise
-            const bool expect = type_a == GGML_TYPE_Q5_1 && m % 256 == 0 && k % 64 == 0 && n > 8;
+            // GGML_VK_TEST_REQUIRE_DOWN_STREAM=1: the streaming launch must run for q5_1 with m % 256 == 0 and k % 64 == 0, and for
+            // q8_0 with an f16 B on the same shapes while GGML_VK_MMID_DOWN_Q8 (default 1) is on, and not otherwise
+            static const bool q8_on = [] { const char * e = getenv("GGML_VK_MMID_DOWN_Q8"); const int v = e ? atoi(e) : 1; return v != 0; }();
+            const bool q8 = type_a == GGML_TYPE_Q8_0 && type_b == GGML_TYPE_F16 && q8_on && (m * k / 32 * 34) % 16 == 0;
+            const bool expect = (type_a == GGML_TYPE_Q5_1 || q8) && m % 256 == 0 && k % 64 == 0 && n > 8;
             const int64_t nd = dispatch_census_count(backend, "path:MUL_MAT_ID_DOWN_STREAM");
             if (expect != (nd > 0)) {
                 msg = "MUL_MAT_ID_DOWN_STREAM dispatches: " + std::to_string(nd) + (expect ? " (expected > 0)" : " (expected 0)");
