@@ -711,6 +711,13 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
 #endif
 }
 
+// 16x16x16 WMMA on BF16 operands, or on F16 operands for the mmb_routed_f16_type() weights
+template <bool F16>
+__device__ __forceinline__ v8f mmb_wmma_glu(const v16s b, const v16s a, const v8f c) {
+    if constexpr (F16) return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(tq8_v16h, b), __builtin_bit_cast(tq8_v16h, a), c);
+    else               return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b, a, c);
+}
+
 template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, bool Q4K_HALF, typename XRowFn, typename DRowFn>
 __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t wrow_bytes, const int a_rows,
         const uint16_t * __restrict__ Xh, const int K, XRowFn xrow, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, DRowFn drow, const int m0,
@@ -718,6 +725,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     constexpr int WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
     constexpr int A_ITEMS = (BM + MMB_NT - 1) / MMB_NT;
     constexpr int B_ITEMS = (BN * 8) / MMB_NT;
+    constexpr bool F16 = WTYPE >= 32 && mmb_routed_f16_type((ggml_type) (WTYPE - 32));   // F16 weights and Xh
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int wm = wave % WAVES_M, wn = wave / WAVES_M;
     uint4 g0[A_ITEMS], g1[A_ITEMS], u0[A_ITEMS], u1[A_ITEMS]; uint32_t g2[A_ITEMS], u2[A_ITEMS];
@@ -799,8 +807,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
             }
         } else if constexpr (WTYPE != 0 && WTYPE != 32 + GGML_TYPE_Q4_K) {
             constexpr int LOAD_TYPE = WTYPE == 1 ? 32 + GGML_TYPE_Q8_0 : WTYPE;
-            mmb_load_quant_tile<LOAD_TYPE, BM, MMB_LDS_STRIDE>(Wg, wrow_bytes, a_rows, weight_ks, Ag);
-            mmb_load_quant_tile<LOAD_TYPE, BM, MMB_LDS_STRIDE>(Wu, wrow_bytes, a_rows, weight_ks, Au);
+            mmb_load_quant_tile<LOAD_TYPE, BM, MMB_LDS_STRIDE, F16>(Wg, wrow_bytes, a_rows, weight_ks, Ag);
+            mmb_load_quant_tile<LOAD_TYPE, BM, MMB_LDS_STRIDE, F16>(Wu, wrow_bytes, a_rows, weight_ks, Au);
         }
 
 #pragma unroll
@@ -862,13 +870,13 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                         const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
 #pragma unroll
                         for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
-                            accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a, accg[i][j]); }
+                            accg[i][j] = mmb_wmma_glu<F16>(b[j], a, accg[i][j]); }
                         }
                     {
                         const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)});
 #pragma unroll
                         for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
-                            accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a, accu[i][j]); }
+                            accu[i][j] = mmb_wmma_glu<F16>(b[j], a, accu[i][j]); }
                         }
                 }
             } else {
@@ -885,8 +893,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
                     for (int j = 0; j < TN; ++j) {
                         if constexpr (TAIL) { if (!jact[j]) continue; }
-                        accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], ag[i], accg[i][j]);
-                        accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], au[i], accu[i][j]);
+                        accg[i][j] = mmb_wmma_glu<F16>(b[j], ag[i], accg[i][j]);
+                        accu[i][j] = mmb_wmma_glu<F16>(b[j], au[i], accu[i][j]);
                     }
             }
         }
@@ -3895,7 +3903,10 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     // gluk decodes Q4_K / Q5_K superblocks and Q5_1 only: the other routed types keep the legacy tiers
     const bool glk_this = T >= 128 && M % 2 == 0 && mmb_gluk_type(gw->type);   // the pair epilogue stores row pairs
     const int BN_rt = glk_this ? BN_gluk : BN_sel;
-    const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
+    const bool f16_ops = mmb_routed_f16_type(gw->type);   // F16 operands: the F32 input must exist (not a BF16-only tensor)
+    GGML_ASSERT(!f16_ops || !ggml_cuda_mmb_is_bf16_only(ctx, src1));
+    const uint16_t * xhp = f16_ops ? mmb_f16_activation(ctx, src1, (size_t) n_rows_x * K, stream)
+                                   : mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
     auto & ids_src1 = mmb_hold_alloc<int32_t>(ctx, n_rows);
     auto & ids_dst = mmb_hold_alloc<int32_t>(ctx, n_rows);
     auto & bounds = mmb_hold_alloc<int32_t>(ctx, E + 1);

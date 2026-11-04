@@ -20,6 +20,22 @@ struct mmb_quant_slice {
     __device__ element operator[](int64_t n) const { return {dst, offset + (int) n - begin}; }
 };
 
+// mmb_quant_slice with F16 elements: the RNE half of the fp32 value, as dequantize_block_* with dst_t = half stores it
+struct mmb_quant_slice_f16 {
+    uint16_t * dst;
+    int begin;
+    int offset = 0;
+    struct element {
+        uint16_t * dst;
+        int index;
+        __device__ void operator=(float value) const {
+            if (index >= 0 && index < 64) dst[index] = __half_as_ushort(ggml_cuda_cast<half>(value));
+        }
+    };
+    __device__ mmb_quant_slice_f16 operator+(int64_t n) const { return {dst, begin, offset + (int) n}; }
+    __device__ element operator[](int64_t n) const { return {dst, offset + (int) n - begin}; }
+};
+
 // 8 bf16 weights from fp32 values, one 16-byte LDS store (RNE as mmb_f2bf)
 __device__ __forceinline__ void mmb_store8(uint16_t * dst, const float * v) {
     uint4 o; o.x = mmb_pack2(v[0], v[1]); o.y = mmb_pack2(v[2], v[3]); o.z = mmb_pack2(v[4], v[5]); o.w = mmb_pack2(v[6], v[7]);
@@ -141,8 +157,10 @@ template <> struct mmb_lb<32 + GGML_TYPE_IQ3_XXS> {
     }
 };
 
-template <ggml_type TYPE>
+// F16: store F16 instead of BF16 weights (IQ1_M only)
+template <ggml_type TYPE, bool F16 = false>
 __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0, uint16_t * dst, const int lane) {
+    static_assert(!F16 || TYPE == GGML_TYPE_IQ1_M, "F16 slice decode is IQ1_M only");
     constexpr int QK = ggml_cuda_type_traits<TYPE>::qk;
     if constexpr (TYPE == GGML_TYPE_Q1_0) {
         constexpr int QR = ggml_cuda_type_traits<TYPE>::qr;
@@ -288,7 +306,8 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
         for (int tid = lane; tid < 32; tid += 8) dequantize_iq1_s<float>(row, k0 / QK, out, tid);
     }
     else if constexpr (TYPE == GGML_TYPE_IQ1_M) {
-        const mmb_quant_slice out{dst, k0 % QK};
+        using slice_t = std::conditional_t<F16, mmb_quant_slice_f16, mmb_quant_slice>;
+        const slice_t out{dst, k0 % QK};
 #pragma unroll
         for (int tid = lane; tid < 32; tid += 8) dequantize_iq1_m<float>(row, k0 / QK, out, tid);
     }
@@ -426,12 +445,12 @@ __host__ __device__ constexpr size_t mmb_row_bytes(int k) {
     }
 }
 
-template <int WTYPE, int BM, int STRIDE>
+template <int WTYPE, int BM, int STRIDE, bool F16 = false>
 __device__ __forceinline__ void mmb_load_quant_tile(const uint8_t * weights, size_t row_bytes, int rows, int ks, uint16_t * tile) {
     for (int row = threadIdx.x / 8; row < BM; row += blockDim.x / 8) {
         uint16_t * dst = tile + row * STRIDE;
         const int lane = threadIdx.x % 8;
-        if (row < rows) mmb_decode_slice<(ggml_type)(WTYPE - 32)>(weights + row * row_bytes, ks * 64, dst, lane);
+        if (row < rows) mmb_decode_slice<(ggml_type)(WTYPE - 32), F16>(weights + row * row_bytes, ks * 64, dst, lane);
         else {
 #pragma unroll
             for (int k = lane; k < 64; k += 8) dst[k] = 0;
@@ -508,9 +527,15 @@ static constexpr bool mmb_quant_type_routed_supported(ggml_type type) {
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ1_M:   // no MMQ: the alternative is the host-synchronised per-expert dequant + F16 BLAS loop
             return mmb_quant_type_any(type);
         default: return false;
     }
+}
+
+// routed types that run with F16 instead of BF16 operands: the precision of the F16 BLAS path they replace
+static constexpr bool mmb_routed_f16_type(ggml_type type) {
+    return type == GGML_TYPE_IQ1_M;
 }
 
 // Trellis types have no MMQ kernel: without mmb their batched MUL_MAT_ID falls back to a host-synchronised
