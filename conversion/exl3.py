@@ -179,20 +179,29 @@ def write_exl3_experts(model: ModelBase, merged: str, experts: list[dict[str, st
         raise NotImplementedError(f"{merged}: experts with different codebooks {sorted(codebooks)}")
     codebook = codebooks.pop()
 
-    data: dict[str, list[Any]] = {"trellis": [], "suh": [], "svh": []}
+    # suh / svh are small and stacked here; the trellis (most of the model) is written one expert at a time
+    data: dict[str, list[Any]] = {"suh": [], "svh": []}
     for parts in experts:
         for part in data:
             data[part].append(LazyTorchTensor.to_eager(model.model_tensors[parts[part]]()))
-    shapes = {tuple(t.shape) for t in data["trellis"]}
+    metas = [model.model_tensors[parts["trellis"]]() for parts in experts]
+    shapes = {tuple(t.shape) for t in metas}
     if len(shapes) != 1 or len({tuple(t.shape) for t in data["suh"]}) != 1 or len({tuple(t.shape) for t in data["svh"]}) != 1:
         raise NotImplementedError(f"{merged}: experts of different shapes or rates {sorted(shapes)}, they cannot be stacked")
-    trellis = torch.stack(data["trellis"])
+    shape = shapes.pop()
     suh     = torch.stack(data["suh"])
     svh     = torch.stack(data["svh"])
-    _, tk, tn, tile_words = trellis.shape
+    if len(shape) != 3 or any(t.dtype != torch.int16 for t in metas) or suh.dtype != torch.float16 or svh.dtype != torch.float16:
+        raise ValueError(f"{merged}: unexpected expert dtypes or shapes {metas[0].dtype} {shape}")
+    tk, tn, tile_words = shape
     k, n = tk * 16, tn * 16
-    if trellis.dim() != 4 or trellis.dtype != torch.int16 or suh.dtype != torch.float16 or svh.dtype != torch.float16:
-        raise ValueError(f"{merged}: unexpected expert dtypes or shapes {trellis.dtype} {tuple(trellis.shape)}")
+
+    def load(gen: Callable[[], Any]):
+        # a fresh lazy tensor every call, or to_eager() memoizes every expert
+        return lambda: LazyTorchTensor.to_eager(gen()).numpy()
+
+    trellis = gguf.LazyChunkedTensor([load(model.model_tensors[parts["trellis"]]) for parts in experts],
+                                     shape=(len(ids), tk, tn, tile_words), dtype=np.int16)
     if not exl3_rate_supported(tile_words, codebook) or k % EXL3_HADAMARD_SIZE or n % EXL3_HADAMARD_SIZE or \
             tuple(suh.shape) != (len(ids), k) or tuple(svh.shape) != (len(ids), n):
         raise ValueError(f"{merged}: unsupported EXL3 rate or inconsistent shapes {tuple(trellis.shape)}")
