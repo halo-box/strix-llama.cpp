@@ -2150,10 +2150,10 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
 // 0 = 128 x 256, 64 x 64 waves, BK 64 (55296 B, 1 WG / CU); 1 = the same at BK 32 (30720 B, 2 WG / CU); 2 = 128 x 128, 64 x 32 waves,
 // BK 32 (20480 B, 3 WG / CU); 3 = 256 x 128, 64 x 64 waves, BK 32.
 // 4 = 64 x 128, 4 waves of 32 x 64, BK 64 (27648 B, 2 WG / CU): few-row, long-k GEMMs (the qwen4exp hc down, 320 x 10240).
-#define GGML_VK_DQ8_NCFG 5
+#define GGML_VK_DQ8_NCFG 6
 static const uint32_t ggml_vk_dense_dq8_cfgs[GGML_VK_DQ8_NCFG][6] = {
     { 256, 128, 256, 64, 64, 64 }, { 256, 128, 256, 64, 64, 32 }, { 256, 128, 128, 64, 32, 32 }, { 256, 256, 128, 64, 64, 32 },
-    { 128, 64, 128, 32, 64, 64 } };
+    { 128, 64, 128, 32, 64, 64 }, { 256, 256, 128, 64, 64, 64 } };
 
 // GGML_VK_DENSE_DQ8: 1 = on (default): tile 4 for m <= 384, k >= 4096, n >= 1024; tile 0 for k <= 4096, n >= 256 and at least 3/4
 // of a workgroup per CU (k > 4096 only with a B pitch that does not camp, GGML_VK_DENSE_DQ8_LONGK; a 256-wide tile wastes most of its WMMAs below n 256, and
@@ -2192,6 +2192,18 @@ static uint32_t ggml_vk_dq8_f16out_test_break() {
 static bool ggml_vk_hc_dq8_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_VK_HC_DQ8"); return e == nullptr || atoi(e) != 0; }();
     return on;
+}
+
+// GGML_VK_HC_DQ8_TILE=c: the GGML_VK_HC_DQ8 mix GEMM runs dq8 tile c, one of the tiles with WM = 64 (the stream-major row map needs
+// it): 0 (128 x 256, the default), 1, 3 or 5. Tile 5 (256 x 128, BK 64) covers 64 channels, so the epilogue reads x and stores each
+// token's mixed segment as whole 128-byte lines (Flash-Next n 8192: 2.18 -> 2.04 ms per call). Same per-output k order: bit-identical.
+static uint32_t ggml_vk_hc_dq8_tile() {
+    static const uint32_t c = [] {
+        const char * e = getenv("GGML_VK_HC_DQ8_TILE");
+        const int v = e ? atoi(e) : 0;
+        return (v == 1 || v == 3 || v == 5) ? (uint32_t) v : 0u;
+    }();
+    return c;
 }
 
 // mode 1: tile 4 for a few-row long-k GEMM (m <= 384, k >= 4096: the qwen4exp hc down), else tile 0
@@ -3412,7 +3424,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_f32[c], "matmul_dq8_f32_f16_" + std::to_string(c),
                                                  matmul_dq8_f32_f16_cm1_len, matmul_dq8_f32_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
                                                  { t[1], t[2], 1 }, spec, 1, false, true, 32);
-                        if (c == 0) {   // HC_UP_MIX epilogue variants on tile 0 (f32 / f16 mixed stream)
+                        if (c == ggml_vk_hc_dq8_tile()) {   // HC_UP_MIX epilogue variants (f32 / f16 mixed stream) on one tile
                             ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_hcmix[0], "matmul_dq8_q8_0_f16_hcmix",
                                                      matmul_dq8_q8_0_f16_hcmix_cm1_len, matmul_dq8_q8_0_f16_hcmix_cm1_data, "main", 4,
                                                      sizeof(vk_mat_mat_hcmix_push_constants), { t[1], t[2], 1 }, spec, 1, false, true, 32);
@@ -8915,6 +8927,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         GGML_ASSERT(!qx_needs_dequant);
         pipeline = ctx->device->pipeline_matmul_dq8_hcmix[od->type == GGML_TYPE_F16 ? 1 : 0];
         ggml_vk_path_census_add("MUL_MAT_HC_DQ8");
+        if (ggml_vk_hc_dq8_tile() == 5) {
+            ggml_vk_path_census_add("MUL_MAT_HC_DQ8_T5");
+        }
     }
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp): 2-D, f16 B, K % 64 == 0; B's column stride is checked where it is known
     vk_pipeline pipeline_pre_dq8 = nullptr;
