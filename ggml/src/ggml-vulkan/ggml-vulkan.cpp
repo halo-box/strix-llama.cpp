@@ -12105,12 +12105,12 @@ static void ggml_vk_mmid_down_stream(ggml_backend_vk_context * ctx, vk_context& 
             ggml_vk_path_census_add("EXPDOWN_V");
         }
     }
-    // GGML_VK_EXPDOWN_NOSEL=1: the same kernel with half-wave A fragments (mul_mm_id_down.comp HALF_A): each lane decodes the row the
+    // GGML_VK_EXPDOWN_NOSEL (default 1, 0 off): the same kernel with half-wave A fragments (mul_mm_id_down.comp HALF_A): each lane decodes the row the
     // WMMA reads from it, so the fragments need no selects. Same operands, same results. f16 B, one or eight tiles per workgroup
     // (q5_1 repacked: the default kernel or EXPDOWN_V=9; q8_0: either MMID_DOWN_Q8 mode); needs the layout probe's parity result
     static const bool nosel = [] {
         const char * e = getenv("GGML_VK_EXPDOWN_NOSEL");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     if (nosel && x->type == GGML_TYPE_F16 && ctx->device->coopmat_rdna3_half_a && (tpw == 1 || tpw == 8)) {
         vk_pipeline h = nullptr;
