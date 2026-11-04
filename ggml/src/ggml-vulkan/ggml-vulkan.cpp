@@ -2198,12 +2198,13 @@ static bool ggml_vk_hc_dq8_enabled() {
 }
 
 // GGML_VK_HC_DQ8_TILE=c: the GGML_VK_HC_DQ8 mix GEMM runs dq8 tile c, one of the tiles with WM = 64 (the stream-major row map needs
-// it): 0 (128 x 256, the default), 1, 3 or 5. Tile 5 (256 x 128, BK 64) covers 64 channels, so the epilogue reads x and stores each
+// it): 5 (the default), 0 (128 x 256), 1 or 3. Tile 5 (256 x 128, BK 64) covers 64 channels, so the epilogue reads x and stores each
 // token's mixed segment as whole 128-byte lines (Flash-Next n 8192: 2.18 -> 2.04 ms per call). Same per-output k order: bit-identical.
+// GGML_VK_HC_DQ8_TILE=0 keeps the old tile.
 static uint32_t ggml_vk_hc_dq8_tile() {
     static const uint32_t c = [] {
         const char * e = getenv("GGML_VK_HC_DQ8_TILE");
-        const int v = e ? atoi(e) : 0;
+        const int v = e ? atoi(e) : 5;
         return (v == 1 || v == 3 || v == 5) ? (uint32_t) v : 0u;
     }();
     return c;

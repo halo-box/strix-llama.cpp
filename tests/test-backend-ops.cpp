@@ -8372,11 +8372,11 @@ struct test_hc_up_mix_f16 : public test_case {
                 return false;
             }
         }
-        // GGML_VK_TEST_REQUIRE_HC_DQ8_T5=1: the dq8 GEMM ran on tile 5 (GGML_VK_HC_DQ8_TILE=5) exactly where the dq8 GEMM runs
+        // GGML_VK_TEST_REQUIRE_HC_DQ8_T5=1: the dq8 GEMM ran on tile 5 (GGML_VK_HC_DQ8_TILE unset or 5) exactly where the dq8 GEMM runs
         if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_HC_DQ8_T5")) {
             const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_HC_DQ8_T5");
             const char * t = getenv("GGML_VK_HC_DQ8_TILE");
-            const bool want = t != nullptr && atoi(t) == 5 && env_knob_on("GGML_VK_HC_DQ8") && env_knob_on("GGML_VK_HC_UP_MIX") &&
+            const bool want = (t == nullptr || atoi(t) == 5) && env_knob_on("GGML_VK_HC_DQ8") && env_knob_on("GGML_VK_HC_UP_MIX") &&
                               k % 64 == 0 && 4 * n_embd >= 128;
             if (c >= 0 && (c > 0) != want) {
                 msg = "MUL_MAT_HC_DQ8_T5 dispatches: " + std::to_string(c) + (want ? " (expected tile 5)" : " (expected tile 0)");
