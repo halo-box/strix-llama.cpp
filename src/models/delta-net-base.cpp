@@ -666,6 +666,37 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    // LLAMA_GDN_KEEP_SPLIT=1 (callers that take two output parts, one sequence): with rollback slots a wide ubatch (a prompt
+    // ubatch) runs the K-snapshot scan only over its last K tokens; the tokens before them take the plain K = 1 scan (the
+    // chunked prefill form on backends that have one, which the K-snapshot op does not). The slots get the same K states.
+    static const bool keep_split = [] { const char * e = getenv("LLAMA_GDN_KEEP_SPLIT"); return e != nullptr && atoi(e) != 0; }();
+    if (keep_split && parts != nullptr && n_seqs == 1 && n_seq_tokens > K) {
+        const int64_t t = n_seq_tokens - K;
+        const int64_t n = n_seq_tokens;
+
+        auto part0 = build_delta_net(slice_tokens(q, 0, t), slice_tokens(k, 0, t), slice_tokens(v, 0, t),
+                                     slice_tokens(g, 0, t), slice_tokens(b, 0, t), s, il);
+        ggml_build_forward_expand(gf, part0.first);
+
+        ggml_tensor * gdn1 = ggml_gated_delta_net(ctx0, slice_tokens(q, t, n), slice_tokens(k, t, n), slice_tokens(v, t, n),
+                                                  slice_tokens(g, t, n), slice_tokens(b, t, n), part0.second, K);
+        res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn1, il});
+
+        const int64_t score1 = S_v * H_v * K;
+        ggml_tensor * out1 = ggml_view_4d(ctx0, gdn1, S_v, H_v, K, 1,
+            ggml_row_size(gdn1->type, S_v), ggml_row_size(gdn1->type, S_v * H_v), ggml_row_size(gdn1->type, score1), 0);
+
+        const size_t row_size1 = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        ggml_tensor * src1 = ggml_view_3d(ctx0, gdn1, D, 1, K,
+            ggml_row_size(gdn1->type, D), ggml_row_size(gdn1->type, D), ggml_row_size(gdn1->type, score1));
+        ggml_tensor * dst1 = ggml_view_3d(ctx0, ssm_states_all, D, 1, K,
+            ssm_states_all->nb[1], (size_t) mem_size * row_size1, (size_t) kv_head * row_size1);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src1, dst1));
+
+        *parts = { part0.first, out1 };
+        return nullptr;
+    }
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
