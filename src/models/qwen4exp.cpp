@@ -669,6 +669,15 @@ bool llama_model_qwen4exp::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
+// a weight whose rows can be viewed and read as stored: allocated, contiguous, and on a device buffer or the plain CPU buffer
+// (an extra CPU buffer type such as the repack one stores the rows in another layout)
+static bool qwen4exp_row_view_ok(const ggml_tensor * t) {
+    if (t->buffer == nullptr || t->data == nullptr || !ggml_is_contiguous(t)) {
+        return false;
+    }
+    return !ggml_backend_buffer_is_host(t->buffer) || ggml_backend_buffer_get_type(t->buffer) == ggml_backend_cpu_buffer_type();
+}
+
 // hc split: the merged [hc_down | hc_inject] weight of the upstream converter is split back into the hc_down rows (a view, no copy)
 // and an f32 hc_inject (its hc rows dequantized: the values the merged matmul uses). The mix then builds the same graph as a
 // separate-tensor file, so every backend fusion keyed on that graph applies (the inject computed in the norm kernel, the decode
@@ -686,7 +695,7 @@ void llama_model_qwen4exp::load_hc_split() {
         for (const item & it : { item { &layer.hc_attn_down_inject, &layer.hc_attn_down, &layer.hc_attn_inject },
                                  item { &layer.hc_ffn_down_inject,  &layer.hc_ffn_down,  &layer.hc_ffn_inject } }) {
             const ggml_tensor * t = *it.merged;
-            if (t == nullptr || t->buffer == nullptr || t->data == nullptr || !ggml_is_contiguous(t) || t->ne[1] <= hc ||
+            if (t == nullptr || !qwen4exp_row_view_ok(t) || t->ne[1] <= hc ||
                 t->ne[2] != 1 || t->ne[3] != 1 || ggml_get_type_traits(t->type)->to_float == nullptr) {
                 continue;
             }
@@ -753,8 +762,8 @@ void llama_model_qwen4exp::load_hc_split() {
 }
 
 // qkvz split: the merged [attn_qkv | attn_gate] weight split into two row views (no copy). One bigger GEMM writes f32 rows of
-// 16384 (a 64 KiB pitch for Flash-Next) that the conv and the gated norm then read strided; on Strix Halo the two GEMMs are faster
-// (trunc8 prefill: one GEMM 5.78 ms vs 3.52 + 1.80 ms per layer). LLAMA_QKVZ_SPLIT=0 keeps the merged GEMM.
+// 16384 (a 64 KiB pitch for Flash-Next) that the conv and the gated norm then read strided; on gfx1151 the two GEMMs are faster
+// (Flash-Next ub 2048: one GEMM 5.78 ms vs 3.52 + 1.80 ms per layer). LLAMA_QKVZ_SPLIT=0 keeps the merged GEMM.
 void llama_model_qwen4exp::load_qkvz_split() {
     const char * e = getenv("LLAMA_QKVZ_SPLIT");
     if (e != nullptr && atoi(e) == 0) {
@@ -766,7 +775,7 @@ void llama_model_qwen4exp::load_qkvz_split() {
     ggml_context_ptr ctx { ggml_init(ip) };
     for (auto & layer : layers) {
         ggml_tensor * m = layer.wqkv_z;
-        if (m == nullptr || m->buffer == nullptr || m->data == nullptr || !ggml_is_contiguous(m) || m->ne[1] <= n_z ||
+        if (m == nullptr || !qwen4exp_row_view_ok(m) || m->ne[1] <= n_z ||
             m->ne[2] != 1 || m->ne[3] != 1) {
             continue;
         }
