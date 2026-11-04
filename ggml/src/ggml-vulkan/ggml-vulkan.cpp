@@ -25021,11 +25021,11 @@ static bool ggml_vk_gdn_z16_enabled() {
     return on;
 }
 
-// GGML_VK_GDN_ZHM=1 (with the fold, opt-in): the z GEMM on the dense q8_0 x f16 GEMM (f16 B) stores z head-major, the 128 values of one
+// GGML_VK_GDN_ZHM (with the fold, default 1, 0 off): the z GEMM on the dense q8_0 x f16 GEMM (f16 B) stores z head-major, the 128 values of one
 // head of every token in a row, so the scan's norm stage reads the chunk rows of its head contiguously instead of 128 x 48 x 4 bytes
 // apart. Same f32 values (bit-identical). Not with GGML_VK_GDN_Z16 on the same GEMM (Z16 wins).
 static bool ggml_vk_gdn_zhm_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_VK_GDN_ZHM"); return e != nullptr && atoi(e) != 0; }();
+    static const bool on = [] { const char * e = getenv("GGML_VK_GDN_ZHM"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 
