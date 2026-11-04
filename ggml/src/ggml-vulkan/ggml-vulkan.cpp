@@ -2163,6 +2163,14 @@ static int ggml_vk_dense_dq8_mode() {
     return mode;
 }
 
+// GGML_VK_DQ8_PF2 (bit c = tile c, default 0x10 = tile 4): that tile prefetches two k steps ahead (mul_mm_dq8.comp PF = 2).
+// Tile 4 is the few-row long-k tile (the Flash-Next hc down, m 320 x k 10240): -7.6 ms per 8192-token ubatch on gfx1151, bit-exact.
+// Tiles 0-3 spill with PF = 2. 0 = one step on every tile. The f32-A variant (router f16h) always runs one step.
+static uint32_t ggml_vk_dq8_pf2_mask() {
+    static const uint32_t mask = [] { const char * e = getenv("GGML_VK_DQ8_PF2"); return e ? (uint32_t) strtoul(e, nullptr, 0) : 0x10u; }();
+    return mask;
+}
+
 // GGML_VK_DQ8_F16OUT: the qwen4exp GDN qkv GEMM on the dense q8_0 x f16 GEMM stores its result as f16 inside its own f32
 // allocation, rows GGML_VK_DQ8_F16OUT_PAD elements (default 128) past the row length, when its only readers are the direct conv
 // and the concat tail (ssm_conv.comp MODE 4 / 3), which widen it exactly (ggml_vk_dq8_f16out_prepass). 0 keeps the f32 store.
@@ -3393,9 +3401,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         if (lds > device->properties.limits.maxComputeSharedMemorySize) {
                             continue;
                         }
-                        // GGML_VK_DQ8_PF2 (bit c = tile c, default 0): that tile prefetches two k steps ahead (mul_mm_dq8.comp PF = 2)
-                        static const uint32_t pf2 = [] { const char * e = getenv("GGML_VK_DQ8_PF2"); return e ? (uint32_t) strtoul(e, nullptr, 0) : 0u; }();
-                        const std::vector<uint32_t> spec = { t[0], t[1], t[2], t[3], t[4], t[5], ((pf2 >> c) & 1u) ? 2u : 1u };
+                        // GGML_VK_DQ8_PF2 (ggml_vk_dq8_pf2_mask): bit c set = tile c prefetches two k steps ahead
+                        const std::vector<uint32_t> spec = { t[0], t[1], t[2], t[3], t[4], t[5], ((ggml_vk_dq8_pf2_mask() >> c) & 1u) ? 2u : 1u };
                         ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[0][c], "matmul_dq8_q8_0_f16_" + std::to_string(c),
                                                  matmul_dq8_q8_0_f16_cm1_len, matmul_dq8_q8_0_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
                                                  { t[1], t[2], 1 }, spec, 1, false, true, 32);
@@ -9169,6 +9176,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             router_f16h = false;
         } else {
             ggml_vk_path_census_add(router_f16h ? "MUL_MAT_ROUTER_F16H" : "MUL_MAT_DENSE_DQ8");
+            if (!router_f16h && ((ggml_vk_dq8_pf2_mask() >> ggml_vk_dense_dq8_pick((uint32_t) ne01, (uint32_t) ne11, (uint32_t) ne10)) & 1u)) {
+                ggml_vk_path_census_add("MUL_MAT_DQ8_PF2");   // engagement read: the picked tile runs the two-step prefetch
+            }
             if (dense_d16) {
                 ggml_vk_path_census_add("DQ8_F16OUT_STORE");
             }
