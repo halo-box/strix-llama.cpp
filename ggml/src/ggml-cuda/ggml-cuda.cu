@@ -1521,6 +1521,16 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+// F16 GEMM output handed to a consumer that reads F16 (the HC stream mix): set around one ggml_cuda_mul_mat call.
+// The F16 cuBLAS path of `dst` writes its F16 result to `buf` and skips the F32 conversion (done = true); every other
+// path ignores it and writes the F32 dst.
+struct ggml_cuda_cublas_f16_out {
+    const ggml_tensor * dst  = nullptr;
+    half *              buf  = nullptr;
+    bool                done = false;
+};
+static thread_local ggml_cuda_cublas_f16_out g_cublas_f16_out;
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1585,8 +1595,14 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
+    // the BLAS staging copy of src1 that its producer (HC combine + norm) wrote with the RNE cast of the conversion below
+    const uint16_t * src1_staged = compute_type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && ggml_is_contiguously_allocated(src1) ?
+        ggml_cuda_mmb_blas_f16_lookup(ctx, src1) : nullptr;
+
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
+    } else if (src1_staged) {
+        src1_ptr = (const cuda_t *) src1_staged;
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
 
@@ -1612,6 +1628,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     ggml_cuda_pool_alloc<cuda_t> dst_temp(ctx.pool());
     char * dst_ptr;
+    half * f16_out = nullptr;   // g_cublas_f16_out.buf when this call serves it
     size_t nbd2 = dst->nb[2];
     size_t nbd3 = dst->nb[3];
 
@@ -1640,7 +1657,12 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         if constexpr (compute_type == GGML_TYPE_F32) {
             dst_ptr = (char *) dst_ddf;  // Direct F32 output
         } else {
-            dst_ptr = (char *) dst_temp.alloc(ne_dst);
+            if constexpr (compute_type == GGML_TYPE_F16) {
+                if (g_cublas_f16_out.dst == dst && ne12 == 1 && ne13 == 1 && ggml_is_contiguous(dst)) {
+                    f16_out = g_cublas_f16_out.buf;
+                }
+            }
+            dst_ptr = f16_out ? (char *) f16_out : (char *) dst_temp.alloc(ne_dst);
             nbd2 /= sizeof(float) / sizeof(cuda_t);
             nbd3 /= sizeof(float) / sizeof(cuda_t);
         }
@@ -1729,7 +1751,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 
     // Convert output back to F32 if needed
-    if (cu_data_type != CUDA_R_32F) {
+    if (f16_out) {
+        g_cublas_f16_out.done = true;
+    } else if (cu_data_type != CUDA_R_32F) {
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
         to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
     }
@@ -6577,6 +6601,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int count = ggml_cuda_hc_gate_mix_route(*cuda_ctx, cgraph, i, ma);
         if (count > 0 && ggml_cuda_hc_gate_mix(*cuda_ctx, node->src[0], node->src[1], ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) return count;
     }
+    // HC gate GEMM with F16 weights (prefill, 512+ tokens) read only by the stream mix: the GEMM runs as before and the mix
+    // reads its F16 output, so the F32 gate and its conversion pass are skipped. Another GEMM path writes the F32 gate.
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F16 && ggml_nrows(node) >= 512 &&
+            ggml_is_contiguous(node) && ggml_node_has_n_uses(cgraph, i, 1) &&
+            GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        ggml_cuda_hc_mix_args ma;
+        const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
+        if (count > 0 && ma.gate == node) {
+            ggml_cuda_pool_alloc<half> gate16(cuda_ctx->pool(), ggml_nelements(node));
+            g_cublas_f16_out = { node, gate16.get(), false };
+            ggml_cuda_mul_mat(*cuda_ctx, node->src[0], node->src[1], node);
+            ma.gate_f16 = g_cublas_f16_out.done ? gate16.get() : nullptr;
+            g_cublas_f16_out = {};
+            ggml_cuda_op_hc_mix_reduce(*cuda_ctx, ma);
+            return count;
+        }
+    }
 
     //     sigmoid(gate) -> mul(xn, .) -> reshape -> view(stream 0) -> cont -> (view(stream c) -> add) x (hc-1) -> scale
     // one kernel reads xn/gate once and writes the [n_embd, T] mean of the gated streams
@@ -6605,8 +6646,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int skip = ggml_cuda_match_hc_combine_norm(cgraph, i, args,
                 ggml_cuda_info().devices[cuda_ctx->device].warp_size, true);
         if (skip > 0 && !args.single_block) {
-            // HC16: a BF16 copy of xn for its consumers, and BF16 residual / block_out streams where every reader agreed
-            args.out_xn_bf16  = ggml_cuda_mmb_cache_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn));
+            // HC16: a BF16 copy of xn for its consumers, and BF16 residual / block_out streams where every reader agreed.
+            // MMB_F16_BLAS: the F16 GEMM readers get the RNE F16 staging copy in place of the unread BF16 and int8 copies.
+            const bool blas16 = !args.out_inject && (ggml_cuda_mmb_f16_marks(*cuda_ctx, args.out_xn) & MMB_F16_BLAS) &&
+                                !ggml_cuda_mmb_is_bf16_only(*cuda_ctx, args.out_xn);
+            args.out_xn_bf16  = blas16 ? ggml_cuda_mmb_blas_f16_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn))
+                                       : ggml_cuda_mmb_cache_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn));
+            args.xn16_f16     = blas16 && args.out_xn_bf16;
+            args.xn_q8        = !blas16;
             args.store_xn_f32 = !(args.out_xn_bf16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, args.out_xn));
             if (!args.store_xn_f32 && !args.out_inject) {
                 ggml_cuda_hc_combine_norm_args sa;
@@ -7744,6 +7791,26 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     ok = false;
                 }
                 if (ok && nread > 0 && ggml_cuda_marks_readers_local(cgraph, xn)) ggml_cuda_mmb_mark_bf16_only(*cuda_ctx, xn);
+                // F16 BLAS staging: every GEMM that reads xn has F16 weights (the F16 cuBLAS path converts xn per GEMM) and
+                // the stream mix gets its gate from an F16 GEMM too. No MMB GEMM reads xn, so nothing reads its BF16 or
+                // int8 copy, and the combine + norm writes the RNE F16 copy that those GEMMs read in place of their conversions.
+                bool blas = !ca.out_inject; int nblas = 0;
+                for (auto rr = readers_after(xn, i + 1); rr.first != rr.second && blas; ++rr.first) {
+                    const int n = *rr.first;
+                    const ggml_tensor * t = cgraph->nodes[n];
+                    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
+                    if (t->op == GGML_OP_MUL_MAT && t->src[0]->type == GGML_TYPE_F16 && t->src[0] != xn && t->src[0]->view_src != xn &&
+                        (t->src[1] == xn || t->src[1]->view_src == xn)) { ++nblas; continue; }
+                    if (t->op == GGML_OP_MUL && n >= 1) {
+                        ggml_cuda_hc_mix_args ma;
+                        if (ggml_cuda_hc_mix_closed(cgraph, n - 1, ma) > 0 && (ma.xn == xn || ma.xn->view_src == xn) &&
+                            ma.gate->op == GGML_OP_MUL_MAT && ma.gate->src[0]->type == GGML_TYPE_F16) continue;
+                    }
+                    blas = false;
+                }
+                if (blas && nblas > 0 && (xn->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && ggml_cuda_marks_readers_local(cgraph, xn)) {
+                    ggml_cuda_mmb_mark_f16(*cuda_ctx, xn, MMB_F16_BLAS);
+                }
             }
             if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
                 // the combine reads a BF16 block_out only at view offset 0 (graph_compute), and only inside its own nodes

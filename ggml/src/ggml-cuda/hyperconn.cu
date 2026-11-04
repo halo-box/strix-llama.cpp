@@ -1,6 +1,7 @@
 #include <vector>
 #include <algorithm>
 #include "hyperconn.cuh"
+#include "convert.cuh"
 #include "mmb.cuh"
 #include "ggml-backend-impl.h"
 
@@ -54,6 +55,40 @@ static __global__ void hc_mix_reduce_f32(
     }
 
     // identical expression to scale_f32 in scale.cu
+    dst[index] = scale * acc + bias;
+}
+
+// exact F16 -> F32 widening as its own instruction: the empty asm stops it folding into the sigmoid's FMAs (v_fma_mix),
+// so the arithmetic after the load is that of hc_mix_reduce_f32
+static __device__ __forceinline__ float hc_h2f(const half h) {
+    float f = __half2float(h);
+#if defined(__HIP_PLATFORM_AMD__)
+    asm("" : "+v"(f));
+#endif
+    return f;
+}
+
+// hc_mix_reduce_f32 with the gate read from the F16 BLAS output. F16 -> F32 is exact, so each gate value is the one
+// the F32 conversion of that output writes, and the result is bit-identical to hc_mix_reduce_f32 after that conversion.
+static __global__ void hc_mix_reduce_f32_g16(
+        const float * __restrict__ xn, const half * __restrict__ gate, float * __restrict__ dst,
+        const int64_t n_embd, const int64_t n_tokens, const int hc, const float scale, const float bias) {
+    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= n_embd * n_tokens) {
+        return;
+    }
+
+    const int64_t t = index / n_embd;
+    const int64_t e = index - t * n_embd;
+    const int64_t hc_dim = n_embd * hc;
+    const int64_t base = t * hc_dim + e;
+
+    float acc = hc_mul_rn(xn[base], hc_sigmoid(hc_h2f(gate[base])));
+    for (int c = 1; c < hc; ++c) {
+        const int64_t i = base + int64_t(c) * n_embd;
+        acc = hc_add_rn(acc, hc_mul_rn(xn[i], hc_sigmoid(hc_h2f(gate[i]))));
+    }
+
     dst[index] = scale * acc + bias;
 }
 
@@ -162,12 +197,26 @@ void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda
         return off >= 0 && off % (n_embd * (ptrdiff_t) sizeof(float)) == 0 &&
             off + (ptrdiff_t) ggml_nbytes(dst) <= (ptrdiff_t) ggml_nbytes(in);
     };
-    const bool stage = !stream_aligned_alias(xn) || !stream_aligned_alias(gate);
+    // an F16 gate is in pool memory, not in the graph buffer: only xn can alias the output
+    const bool stage = !stream_aligned_alias(xn) || (!args.gate_f16 && !stream_aligned_alias(gate));
 
     ggml_cuda_pool_alloc<float> staged(ctx.pool());
     float * out = stage ? staged.alloc(n_embd * n_tokens) : (float *) dst->data;
 
     const int64_t n_items = n_embd * n_tokens;
+    if (args.gate_f16) {
+        // the F16 gate route takes prefill batches only, where the F32 path is the serial kernel below
+        GGML_ASSERT(args.hc != 4 || n_tokens > 32);
+        const int threads = 256;
+        const int blocks = (int) ((n_items + threads - 1) / threads);
+        const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+        ggml_cuda_kernel_launch(hc_mix_reduce_f32_g16, launch_params,
+            (const float *) xn->data, args.gate_f16, out, n_embd, n_tokens, args.hc, args.scale, args.bias);
+        if (stage) {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, out, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
+        return;
+    }
     const uint16_t * xn16 = ggml_cuda_mmb_cache_lookup(ctx, xn);
     const uint16_t * g16  = ggml_cuda_mmb_cache_lookup(ctx, gate);
     if (xn16 && g16) {
@@ -353,9 +402,15 @@ __device__ __forceinline__ float hc_hi(const uint32_t u) { return __uint_as_floa
 __device__ __forceinline__ uint32_t hc_pack2(const float a, const float b) {
     return (uint32_t) hc_f2bf32(a) | ((uint32_t) hc_f2bf32(b) << 16);
 }
+// RNE F16 bits of f: the cast that convert_unary_cont_vec4<float, half> applies to an F32 B before the F16 BLAS GEMM
+__device__ __forceinline__ uint16_t hc_f2h(const float f) { return __half_as_ushort(ggml_cuda_cast<half>(f)); }
+__device__ __forceinline__ uint32_t hc_pack2_f16(const float a, const float b) {
+    return (uint32_t) hc_f2h(a) | ((uint32_t) hc_f2h(b) << 16);
+}
 
 // One (token, stream) row of the combine + norm; with INJECT it also accumulates the row's share of the next mix's inject projection.
-template <bool INJECT>
+// XH_F16: the 16-bit copy of xn is RNE F16 (hc_f2h), not BF16.
+template <bool INJECT, bool XH_F16 = false>
 static __device__ __forceinline__ void hc_combine_norm_row_b256(
         const int c, const int t, const int hc, float * s_sum,
         const float * inject, const float * residual,
@@ -417,7 +472,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
             const float2 gv = *(const float2 *)(g + col);
             const float v0 = scale * xs[2 * k] * gv.x, v1 = scale * xs[2 * k + 1] * gv.y;
             if (store_xn_f32) *(float2 *)(xn + col) = make_float2(v0, v1);
-            if (xh) *(uint32_t *)(xh + col) = hc_pack2(v0, v1);
+            if (xh) *(uint32_t *)(xh + col) = XH_F16 ? hc_pack2_f16(v0, v1) : hc_pack2(v0, v1);
             if (out_xn_q8) {
                 // per-32-element-block absmax over the 16-lane group (j = col/2), then the int8 codes and scale
                 float amax = fmaxf(fabsf(v0), fabsf(v1));
@@ -442,7 +497,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
         } else if (col < n_embd) {
             const float v0 = scale * xs[2 * k] * g[col];
             if (store_xn_f32) xn[col] = v0;
-            if (xh) xh[col] = hc_f2bf32(v0);
+            if (xh) xh[col] = XH_F16 ? hc_f2h(v0) : hc_f2bf32(v0);
             if constexpr (INJECT) {
 #pragma unroll
                 for (int r = 0; r < HC_INJ_HC; ++r) {
@@ -463,6 +518,20 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
     __shared__ float s_sum[32];
     hc_combine_norm_row_b256<false>(blockIdx.x, blockIdx.y, gridDim.x, s_sum, inject, residual, block_out, gamma,
         out_res, out_xn, out_xn_bf16, store_xn_f32, res_in_bf16, res_out_bf16, blk_in_bf16,
+        n_embd, s1, b1, s2, b2, eps, nullptr, nullptr, out_xn_q8, out_xn_scale, q8_blocks, n_tokens);
+}
+
+// hc_combine_norm_f32_b256 with the 16-bit copy of xn in RNE F16: the staging of an F16 BLAS GEMM that reads xn
+static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b256_xf16(
+        const float * inject, const float * residual,
+        const float * block_out, const float * gamma,
+        float * out_res, float * out_xn, uint16_t * out_xn_f16, const bool store_xn_f32,
+        const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
+        const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps,
+        uint8_t * out_xn_q8, float * out_xn_scale, const int q8_blocks, const int n_tokens) {
+    __shared__ float s_sum[32];
+    hc_combine_norm_row_b256<false, true>(blockIdx.x, blockIdx.y, gridDim.x, s_sum, inject, residual, block_out, gamma,
+        out_res, out_xn, out_xn_f16, store_xn_f32, res_in_bf16, res_out_bf16, blk_in_bf16,
         n_embd, s1, b1, s2, b2, eps, nullptr, nullptr, out_xn_q8, out_xn_scale, q8_blocks, n_tokens);
 }
 
@@ -728,11 +797,13 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     GGML_ASSERT(ggml_are_same_shape(a.out_res, a.out_xn) && ggml_are_same_shape(a.out_res, a.residual));
     GGML_ASSERT(ggml_nelements(a.block_out) == n_embd * n_tokens && ggml_nelements(a.gamma) == n_embd * hc &&
                 ggml_nelements(a.inject) == hc * n_tokens);
+    // the F16 copy of xn has only the b256 row kernel
+    GGML_ASSERT(!a.xn16_f16 || (!a.single_block && !a.out_inject && a.out_xn_bf16 && a.store_xn_f32));
 
     // int8 copy of xn for the W8A8 HC down: allocated once and written by the row kernels below; the HC down
     // GEMM reads it through ggml_cuda_mmb_xnq8_get when its src1 root matches.
     ggml_cuda_hc_combine_norm_args aa = a;
-    if (!a.single_block && (n_embd % 32) == 0 && n_embd <= HC_CN_MAX_EMB && n_tokens >= 512) {
+    if (a.xn_q8 && !a.single_block && (n_embd % 32) == 0 && n_embd <= HC_CN_MAX_EMB && n_tokens >= 512) {
         // the v2 rows kernel writes token groups of 1 << HC_V2_QGS: the last group is padded, not truncated
         const int q8_blocks = (int) (n_embd / 32);
         const int64_t n_tok_pad = GGML_PAD(n_tokens, 1 << HC_V2_QGS);
@@ -781,7 +852,7 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
 
     // 256 threads x 2 packed elements per iteration (the shipped layout); the BF16 options ride on this kernel
     const ggml_cuda_kernel_launch_params lp2(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK2, 0, ctx.stream());
-    ggml_cuda_kernel_launch(hc_combine_norm_f32_b256, lp2,
+    ggml_cuda_kernel_launch(a.xn16_f16 ? hc_combine_norm_f32_b256_xf16 : hc_combine_norm_f32_b256, lp2,
         (const float *) a.inject->data, (const float *) a.residual->data,
         (const float *) a.block_out->data, (const float *) a.gamma->data,
         (float *) a.out_res->data, (float *) a.out_xn->data, a.out_xn_bf16, a.store_xn_f32,

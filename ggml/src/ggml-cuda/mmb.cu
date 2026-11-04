@@ -1486,7 +1486,8 @@ __global__ void mmb_build_desc3(const int32_t * __restrict__ bounds, uint32_t * 
 
 } // namespace
 
-struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; bool f16; ggml_cuda_pool_alloc<uint16_t> * buf; };
+// blas: plain RNE F16 staging of the F16 cuBLAS path (ggml_cuda_mmb_blas_f16_*), found by no other lookup
+struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; bool f16; ggml_cuda_pool_alloc<uint16_t> * buf; bool blas = false; };
 // Routing maps of the last fused GLU, reused by the routed down that reads that GLU's output (same ids tensor).
 struct mmb_ids_record {
     const void * ids = nullptr;
@@ -1567,7 +1568,7 @@ static const uint16_t * mmb_copy_find(ggml_backend_cuda_context & ctx, const ggm
         auto & work = mmb_state(ctx).streams[si];
         for (int k = 0; k < (int) std::size(work.slots); ++k) {
             auto & e = work.slots[k];
-            if (!e.buf || e.f16 != f16 || e.root != root) continue;
+            if (!e.buf || e.blas || e.f16 != f16 || e.root != root) continue;
             if (const uint16_t * p = at(e.data, e.n, e.buf->get())) { ggml_cuda_ovl_note_slot_read(ctx, si, k); return p; }
         }
     }
@@ -1673,7 +1674,7 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
     mmb_cache_entry & e = mmb_workspace(ctx).slots[slot];
     if (e.buf && mmb_workspace(ctx).slot_cap[slot] < n) { delete e.buf; e.buf = nullptr; }
     if (!e.buf) { e.buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n); mmb_workspace(ctx).slot_cap[slot] = n; }
-    e.root = mmb_root(t); e.data = t->data; e.n = n; e.f16 = f16;
+    e.root = mmb_root(t); e.data = t->data; e.n = n; e.f16 = f16; e.blas = false;
     return e.buf->get();
 }
 void ggml_cuda_mmb_marks_clear(ggml_backend_cuda_context & ctx) { if (ctx.mmb) { ctx.mmb->bf16_only.clear(); ctx.mmb->f16_marks.clear(); } }
@@ -1768,6 +1769,24 @@ const uint8_t * ggml_cuda_mmb_xnq8_get(ggml_backend_cuda_context & ctx, const gg
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
     if (!mmb_enabled(ctx) || ggml_nrows(t) < mmb_min_t(ctx)) return nullptr;
     return ggml_cuda_mmb_slot_reserve(ctx, 0, t, n);
+}
+uint16_t * ggml_cuda_mmb_blas_f16_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
+    if (!mmb_enabled(ctx) || ggml_nrows(t) < mmb_min_t(ctx)) return nullptr;
+    uint16_t * p = ggml_cuda_mmb_slot_reserve(ctx, 0, t, n, true);
+    mmb_workspace(ctx).slots[0].blas = true;
+    return p;
+}
+const uint16_t * ggml_cuda_mmb_blas_f16_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    if (!ctx.mmb) return nullptr;
+    const ggml_tensor * root = mmb_root(t);
+    for (int si = 0; si < GGML_CUDA_MAX_STREAMS; ++si) {
+        const mmb_cache_entry & e = ctx.mmb->streams[si].slots[0];
+        if (e.buf && e.blas && e.root == root && e.data == t->data && e.n == (size_t) ggml_nelements(t)) {
+            ggml_cuda_ovl_note_slot_read(ctx, si, 0);
+            return e.buf->get();
+        }
+    }
+    return nullptr;
 }
 
 #ifdef GGML_USE_TRELLIS
