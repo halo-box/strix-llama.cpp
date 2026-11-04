@@ -736,7 +736,14 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
     // Register-prefetch variants of the KHR coopmat matmul (mul_mm_pf_funcs.glsl), f16 and f32 B, selected at init by
     // GGML_VK_MM_PREFETCH; dense and subgroup MUL_MAT_ID only
     if (coopmat && !coopmat2 && !dot2 && matmul_id_type != MatMulIdType::DEFAULT) {
-        for (const auto& tname : std::vector<std::string>{"q8_0", "q5_0", "q3_k", "q6_k", "q4_k", "q5_k", "iq4_xs", "iq3_xxs", "iq4_nl"}) {
+        std::vector<std::string> pf_types = {"q8_0", "q5_0", "q3_k", "q6_k", "q4_k", "q5_k", "iq4_xs", "iq3_xxs", "iq4_nl"};
+#ifdef GGML_USE_TRELLIS
+        // TQ2_T: MUL_MAT_ID only (the host keeps dense TQ2_T on the generic tiles)
+        if (matmul_id_type != MatMulIdType::NONE) {
+            pf_types.push_back("tq2_t");
+        }
+#endif
+        for (const auto& tname : pf_types) {
             const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
             const std::string lva = (tname == "q4_k" || tname == "q5_k") ? "4" : "8";
             const std::map<std::string, std::string> float_type_dict = {
