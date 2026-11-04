@@ -2200,8 +2200,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // output read by two scans is not folded. The second part (the last few tokens) convolves the history at t (a
     // contiguous copy, also the snapshot) with x[t, n). Same per-element arithmetic. LLAMA_GDN_CONV_SPLIT=0 keeps one conv.
     static const bool conv_split_env = [] { const char * e = getenv("LLAMA_GDN_CONV_SPLIT"); return e == nullptr || atoi(e) != 0; }();
-    const int64_t snap_t     = mctx_cur->get_snap_t();
-    const bool    conv_split = conv_split_env && cparams.n_rs_seq == 0 && n_seqs == 1 && snap_t > 0 && snap_t < n_seq_tokens;
+    // LLAMA_GDN_KEEP_SPLIT=1 with rollback slots: build_recurrent_attn splits a wide ubatch's scan K = n_rs_seq + 1 tokens
+    // before its end; split the conv there too so the first part keeps the conv fold, and the tail writes the K conv slots
+    static const bool keep_split_env = [] { const char * e = getenv("LLAMA_GDN_KEEP_SPLIT"); return e != nullptr && atoi(e) != 0; }();
+    const int64_t K_slots    = (int64_t) cparams.n_rs_seq + 1;
+    const bool    keep_split = conv_split_env && keep_split_env && cparams.n_rs_seq > 0 && n_seqs == 1 &&
+                               n_seq_tokens > K_slots && mctx_cur->get_snap_t() < 0;
+    const int64_t snap_t     = keep_split ? n_seq_tokens - K_slots : mctx_cur->get_snap_t();
+    const bool    conv_split = keep_split || (conv_split_env && cparams.n_rs_seq == 0 && n_seqs == 1 && snap_t > 0 && snap_t < n_seq_tokens);
     const int64_t n_part0    = conv_split ? snap_t : n_seq_tokens;
 
     ggml_tensor * conv_hist  = nullptr;
@@ -3001,7 +3007,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_split(
     const int64_t n_seqs    = ubatch.n_seqs;
     const int64_t row_total = conv_states_all->ne[0];
 
-    GGML_ASSERT(n_seqs == 1 && cparams.n_rs_seq == 0);
+    // n_rs_seq > 0 only for the LLAMA_GDN_KEEP_SPLIT split, which never coincides with a snapshot
+    GGML_ASSERT(n_seqs == 1 && (cparams.n_rs_seq == 0 || mctx_cur->get_snap_t() < 0));
     GGML_ASSERT(state_cols * channels == row_total);
     GGML_ASSERT(t > 0 && t < x->ne[1]);
 
@@ -3055,19 +3062,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_tail_at(
     ggml_tensor * conv_input = ggml_concat(ctx0, hist, ggml_transpose(ctx0, x1), 0);
     cb(conv_input, "conv_input_part1", il);
 
-    // the new conv state: the last state_cols columns (one rollback slot: n_rs_seq == 0)
+    // the new conv state: the last state_cols columns, once per rollback slot as in build_conv_state_at (slot s ends s tokens
+    // earlier; the tail holds state_cols + n - t >= state_cols + n_rs_seq columns, so every slot is inside it)
     const int64_t row_total = conv_states_all->ne[0];
     const size_t  row_size  = ggml_row_size(conv_states_all->type, row_total);
+    const uint32_t mem_size = mctx_cur->get_size();
 
-    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-            state_cols, channels, 1,
-            conv_input->nb[1], conv_input->nb[2],
-            ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
-    ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-            state_cols * channels, 1,
-            conv_states_all->nb[1],
-            kv_head * row_size);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+    for (int64_t slot = 0; slot <= (int64_t) cparams.n_rs_seq; ++slot) {
+        GGML_ASSERT(conv_input->ne[0] - state_cols - slot >= 0);
+        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, 1,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols - slot));
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, 1,
+                conv_states_all->nb[1],
+                (slot * mem_size + kv_head) * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+    }
 
     return conv_input;
 }

@@ -661,8 +661,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         return output;
     }
 
-    GGML_ASSERT(!part1_qkv);
-
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
@@ -674,11 +672,22 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         const int64_t t = n_seq_tokens - K;
         const int64_t n = n_seq_tokens;
 
-        auto part0 = build_delta_net(slice_tokens(q, 0, t), slice_tokens(k, 0, t), slice_tokens(v, 0, t),
-                                     slice_tokens(g, 0, t), slice_tokens(b, 0, t), s, il);
+        // with part1_qkv the caller split its conv at t too: q, k, v are the first part's, the last K tokens' are built after it
+        GGML_ASSERT(!part1_qkv || (q->ne[2] == t && k->ne[2] == t && v->ne[2] == t));
+        auto part0 = part1_qkv
+                ? build_delta_net(q, k, v, slice_tokens(g, 0, t), slice_tokens(b, 0, t), s, il)
+                : build_delta_net(slice_tokens(q, 0, t), slice_tokens(k, 0, t), slice_tokens(v, 0, t),
+                                  slice_tokens(g, 0, t), slice_tokens(b, 0, t), s, il);
         ggml_build_forward_expand(gf, part0.first);
 
-        ggml_tensor * gdn1 = ggml_gated_delta_net(ctx0, slice_tokens(q, t, n), slice_tokens(k, t, n), slice_tokens(v, t, n),
+        std::array<ggml_tensor *, 3> qkv1;
+        if (part1_qkv) {
+            qkv1 = part1_qkv();
+            GGML_ASSERT(qkv1[0]->ne[2] == K && qkv1[1]->ne[2] == K && qkv1[2]->ne[2] == K);
+        } else {
+            qkv1 = { slice_tokens(q, t, n), slice_tokens(k, t, n), slice_tokens(v, t, n) };
+        }
+        ggml_tensor * gdn1 = ggml_gated_delta_net(ctx0, qkv1[0], qkv1[1], qkv1[2],
                                                   slice_tokens(g, t, n), slice_tokens(b, t, n), part0.second, K);
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn1, il});
 
@@ -696,6 +705,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         *parts = { part0.first, out1 };
         return nullptr;
     }
+
+    GGML_ASSERT(!part1_qkv);
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
