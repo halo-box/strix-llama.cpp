@@ -12001,13 +12001,14 @@ static void ggml_vk_mmid_down_stream(ggml_backend_vk_context * ctx, vk_context& 
     vk_pipeline pipeline = q8 ? ctx->device->pipeline_mmid_down_q80[ggml_vk_mmid_down_q8_mode() - 1]
                               : (repacked ? ctx->device->pipeline_mmid_down_q51_rp : ctx->device->pipeline_mmid_down_q51)[x->type == GGML_TYPE_F32 ? 1 : 0];
     // GGML_VK_EXPDOWN_V=n: variant n of the repacked f16-B kernel (1 KC128, 2 TPW2, 3 TPW4, 4 PK16, 6 KC128+PK16, 7 TPW2+PK16,
-    // 8 KC128+TPW2, 9 TPW8, 10 TPW16); 0 / unset = the kernel above. 5 was a store-less measurement build and is gone: any value
-    // outside the list runs the kernel above, with a warning
+    // 8 KC128+TPW2, 9 TPW8, 10 TPW16); unset = 9 (TPW8, the fastest on gfx1151: -20 ms per 8192-token ubatch on Flash-Next);
+    // 0 = the kernel above. 5 was a store-less measurement build and is gone: any value outside the list runs the kernel above,
+    // with a warning
     static const int expdown_v = [] {
         const char * e = getenv("GGML_VK_EXPDOWN_V");
-        const int v = e ? atoi(e) : 0;
+        const int v = e ? atoi(e) : 9;
         if (v < 0 || v > 10 || v == 5) {
-            GGML_LOG_WARN("ggml_vulkan: GGML_VK_EXPDOWN_V=%s is not a valid variant, using the default down kernel\n", e);
+            GGML_LOG_WARN("ggml_vulkan: GGML_VK_EXPDOWN_V=%s is not a valid variant, using the base down kernel\n", e);
             return 0;
         }
         return v;
