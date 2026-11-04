@@ -2288,17 +2288,46 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
+    // stable counting sort by expert, O(tokens*n_expert_used) instead of O(experts*tokens*n_expert_used): each expert's
+    // rows stay in token order and a token counts only its first slot for an expert, so the arrays are unchanged
+    const auto expert_at = [&](int64_t i12, int64_t iex) {
+        return *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+    };
+    const auto sorted_slot = [&](int64_t i12, int64_t iex) {
+        const int32_t expert_to_use = expert_at(i12, iex);
+        assert(expert_to_use >= 0 && expert_to_use < ne02);
+        if (expert_to_use < 0 || expert_to_use >= ne02) {
+            return -1;
+        }
+        for (int64_t j = 0; j < iex; ++j) {
+            if (expert_at(i12, j) == expert_to_use) {
+                return -1;
+            }
+        }
+        return expert_to_use;
+    };
+    for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t expert_to_use = sorted_slot(i12, iex);
+            if (expert_to_use >= 0) {
+                tokens_per_expert[expert_to_use]++;
+            }
+        }
+    }
+    std::vector<int64_t> expert_offset(ne02);
+    int64_t n_sorted = 0;
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-        for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
-            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
-                if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
-                    ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
-                    tokens_per_expert[i02]++;
-                    break;
-                }
+        expert_offset[i02] = n_sorted;
+        n_sorted += tokens_per_expert[i02];
+    }
+    ids_to_sorted_host.resize(n_sorted);
+    for (int64_t i12 = 0; i12 < ne12; ++i12) {
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t expert_to_use = sorted_slot(i12, iex);
+            if (expert_to_use >= 0) {
+                const int64_t pos = expert_offset[expert_to_use]++;
+                ids_from_sorted_host[i12*n_expert_used + iex] = pos;
+                ids_to_sorted_host[pos] = i12*ne11 + iex % ne11;
             }
         }
     }
