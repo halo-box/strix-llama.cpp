@@ -44,19 +44,24 @@ static bool qsa_text_pos(const llama_ubatch & u, uint32_t i) {
 // llama_memory_hybrid_idx
 //
 
-// can dev run maskless selected-key attention with the shapes of QSA layer il? (a probe op, as for weight buffer types)
-static bool qsa_selected_key_supported(ggml_backend_dev_t dev, const llama_hparams & hp, int il) {
-    ggml_init_params params = { 8*ggml_tensor_overhead(), nullptr, true };
-    ggml_context_ptr ctx { ggml_init(params) };
-    const int64_t d     = hp.n_embd_head_k();
-    const int64_t n_sel = hp.indexer_top_k + hp.dsv4_compress_ratios[il] - 1;
-    ggml_tensor * q   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, 1, hp.n_head(il), 1);
-    ggml_tensor * k   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, d, 4*n_sel, hp.n_head_kv(il), 1);
-    ggml_tensor * v   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, d, 4*n_sel, hp.n_head_kv(il), 1);
-    ggml_tensor * ids = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_I32, n_sel, 1, 1, 1);
-    ggml_tensor * fa  = ggml_flash_attn_ext(ctx.get(), q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
-    ggml_flash_attn_ext_add_top_k(fa, ids, 0);
-    return ggml_backend_dev_supports_op(dev, fa);
+// can dev run maskless selected-key attention with the shapes and cache types of QSA layer il? (a probe op, as for
+// weight buffer types). Probed for one query and for a ubatch past the decode kernels (ggml-cuda: qsa_decode takes up to
+// 512 queries, qsa_prefill the rest), since a kernel can take one and not the other (q8_0 decode is WMMA-only)
+static bool qsa_selected_key_supported(ggml_backend_dev_t dev, const llama_hparams & hp, int il, ggml_type type_k, ggml_type type_v) {
+    for (const int64_t n_q : { 1, 513 }) {
+        ggml_init_params params = { 8*ggml_tensor_overhead(), nullptr, true };
+        ggml_context_ptr ctx { ggml_init(params) };
+        const int64_t d     = hp.n_embd_head_k();
+        const int64_t n_sel = hp.indexer_top_k + hp.dsv4_compress_ratios[il] - 1;
+        ggml_tensor * q   = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, n_q, hp.n_head(il), 1);
+        ggml_tensor * k   = ggml_new_tensor_4d(ctx.get(), type_k, d, 4*n_sel, hp.n_head_kv(il), 1);
+        ggml_tensor * v   = ggml_new_tensor_4d(ctx.get(), type_v, d, 4*n_sel, hp.n_head_kv(il), 1);
+        ggml_tensor * ids = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_I32, n_sel, n_q, 1, 1);
+        ggml_tensor * fa  = ggml_flash_attn_ext(ctx.get(), q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_top_k(fa, ids, 0);
+        if (!ggml_backend_dev_supports_op(dev, fa)) { return false; }
+    }
+    return true;
 }
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
@@ -112,18 +117,19 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
     if (mem_idx) {
-        // the QSA layers must all run where a kernel reads the selection list: a backend that takes the probe op
-        // (ggml-cuda: the HIP QSA kernels on RDNA3.5)
+        // the QSA layers must all run where a kernel reads the selection list with this cache: a backend that takes the
+        // probe op (ggml-cuda: the HIP QSA kernels on RDNA3.5, f16 or q8_0; Vulkan flash_attn_sel, f16)
         bool all = true, any = false;
         for (int il = 0; il < (int) model.hparams.n_layer_all; ++il) {
             if (!model.hparams.has_kv(il) || !filter_idx(il) || model.hparams.dsv4_compress_ratios[il] <= 0) { continue; }
             any = true;
-            all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il);
+            all = all && qsa_selected_key_supported(model.dev_layer(il), model.hparams, il, type_k, type_v);
         }
         selected_key_attn = any && all && offload;
         if (const char * e = getenv("LLAMA_QSA_SELECTED_KEY")) { selected_key_attn = atoi(e) != 0; }
-        LLAMA_LOG_INFO("%s: QSA attention: %s\n", __func__, selected_key_attn ?
-            "selected-key kernels (maskless block selection)" : "masked top-k (no selected-key kernels on this backend)");
+        LLAMA_LOG_INFO("%s: QSA attention: %s (K %s, V %s)\n", __func__, selected_key_attn ?
+            "selected-key kernels (maskless block selection)" : "masked top-k (no selected-key kernels for this backend and cache type)",
+            ggml_type_name(type_k), ggml_type_name(type_v));
     }
     if (!mem_idx || !offload || n_swa != 0) { return; }
     qsa_prefix = qsa_prefix_state(kv_size);
