@@ -2150,7 +2150,10 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
 // 0 = 128 x 256, 64 x 64 waves, BK 64 (55296 B, 1 WG / CU); 1 = the same at BK 32 (30720 B, 2 WG / CU); 2 = 128 x 128, 64 x 32 waves,
 // BK 32 (20480 B, 3 WG / CU); 3 = 256 x 128, 64 x 64 waves, BK 32.
 // 4 = 64 x 128, 4 waves of 32 x 64, BK 64 (27648 B, 2 WG / CU): few-row, long-k GEMMs (the qwen4exp hc down, 320 x 10240).
+// 5 = 256 x 128, 64 x 64 waves, BK 64: the hc up mix GEMM only (GGML_VK_HC_DQ8_TILE=5); its pipelines exist only with that knob.
 #define GGML_VK_DQ8_NCFG 6
+// tiles the dense / router dq8 GEMMs can run (and the probe modes 2..6 can force): 0..4
+#define GGML_VK_DQ8_NDENSE 5
 static const uint32_t ggml_vk_dense_dq8_cfgs[GGML_VK_DQ8_NCFG][6] = {
     { 256, 128, 256, 64, 64, 64 }, { 256, 128, 256, 64, 64, 32 }, { 256, 128, 128, 64, 32, 32 }, { 256, 256, 128, 64, 64, 32 },
     { 128, 64, 128, 32, 64, 64 }, { 256, 256, 128, 64, 64, 64 } };
@@ -2247,7 +2250,7 @@ static bool ggml_vk_dense_dq8_f32b() {
 
 static uint32_t ggml_vk_dense_dq8_pick(uint32_t m, uint32_t n, uint32_t k) {
     const int mode = ggml_vk_dense_dq8_mode();
-    if (mode >= 2 && mode < 2 + GGML_VK_DQ8_NCFG) {
+    if (mode >= 2 && mode < 2 + GGML_VK_DQ8_NDENSE) {
         return (uint32_t) (mode - 2);
     }
     GGML_UNUSED(n);
@@ -2271,7 +2274,7 @@ static bool ggml_vk_router_f16h_rule(uint32_t n, uint32_t k) {
 
 static uint32_t ggml_vk_router_f16h_pick(uint32_t n) {
     const int mode = ggml_vk_router_f16h_mode();
-    if (mode >= 2 && mode < 2 + GGML_VK_DQ8_NCFG) {
+    if (mode >= 2 && mode < 2 + GGML_VK_DQ8_NDENSE) {
         return (uint32_t) (mode - 2);
     }
     return (n > 1024 && n < 6144) ? 1u : 4u;
@@ -3408,6 +3411,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (device->coopmat_acc_f32_support && device->fp16 && device->subgroup_size_control && device->subgroup_min_size <= 32 &&
                     device->subgroup_max_size >= 32) {
                     for (uint32_t c = 0; c < GGML_VK_DQ8_NCFG; c++) {
+                        if (c >= GGML_VK_DQ8_NDENSE && c != ggml_vk_hc_dq8_tile()) {
+                            continue;   // hc-only tile, not selected
+                        }
                         const uint32_t * t = ggml_vk_dense_dq8_cfgs[c];
                         const uint32_t lds = (t[1] + t[2]) * (t[5] + 8) * 2;
                         if (lds > device->properties.limits.maxComputeSharedMemorySize) {
@@ -3415,18 +3421,20 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         }
                         // GGML_VK_DQ8_PF2 (ggml_vk_dq8_pf2_mask): bit c set = tile c prefetches two k steps ahead
                         const std::vector<uint32_t> spec = { t[0], t[1], t[2], t[3], t[4], t[5], ((ggml_vk_dq8_pf2_mask() >> c) & 1u) ? 2u : 1u };
-                        ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[0][c], "matmul_dq8_q8_0_f16_" + std::to_string(c),
-                                                 matmul_dq8_q8_0_f16_cm1_len, matmul_dq8_q8_0_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
-                                                 { t[1], t[2], 1 }, spec, 1, false, true, 32);
-                        ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[1][c], "matmul_dq8_q8_0_f16_d16_" + std::to_string(c),
-                                                 matmul_dq8_q8_0_f16_d16_cm1_len, matmul_dq8_q8_0_f16_d16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
-                                                 { t[1], t[2], 1 }, spec, 1, false, true, 32);
-                        ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_hm[c], "matmul_dq8_q8_0_f16_hm_" + std::to_string(c),
-                                                 matmul_dq8_q8_0_f16_hm_cm1_len, matmul_dq8_q8_0_f16_hm_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
-                                                 { t[1], t[2], 1 }, spec, 1, false, true, 32);
-                        ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_f32[c], "matmul_dq8_f32_f16_" + std::to_string(c),
-                                                 matmul_dq8_f32_f16_cm1_len, matmul_dq8_f32_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
-                                                 { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                        if (c < GGML_VK_DQ8_NDENSE) {   // dense / f16-out / head-major / f32-A variants: tiles 0..4 only
+                            ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[0][c], "matmul_dq8_q8_0_f16_" + std::to_string(c),
+                                                     matmul_dq8_q8_0_f16_cm1_len, matmul_dq8_q8_0_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                                                     { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                            ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[1][c], "matmul_dq8_q8_0_f16_d16_" + std::to_string(c),
+                                                     matmul_dq8_q8_0_f16_d16_cm1_len, matmul_dq8_q8_0_f16_d16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                                                     { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                            ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_hm[c], "matmul_dq8_q8_0_f16_hm_" + std::to_string(c),
+                                                     matmul_dq8_q8_0_f16_hm_cm1_len, matmul_dq8_q8_0_f16_hm_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                                                     { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                            ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_f32[c], "matmul_dq8_f32_f16_" + std::to_string(c),
+                                                     matmul_dq8_f32_f16_cm1_len, matmul_dq8_f32_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                                                     { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                        }
                         if (c == ggml_vk_hc_dq8_tile()) {   // HC_UP_MIX epilogue variants (f32 / f16 mixed stream) on one tile
                             ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_hcmix[0], "matmul_dq8_q8_0_f16_hcmix",
                                                      matmul_dq8_q8_0_f16_hcmix_cm1_len, matmul_dq8_q8_0_f16_hcmix_cm1_data, "main", 4,
