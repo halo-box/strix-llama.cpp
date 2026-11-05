@@ -171,10 +171,11 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
 
-    // Q2_0 (routed down): a lane prefetches its 2 qs bytes and d in the WMMA loop, store_lds decodes its 8 weights
+    // Q2_0 (routed down): a lane prefetches its 2 qs bytes and d in the WMMA loop, unpacked, so their wait lands after
+    // the WMMAs; store_lds decodes its 8 weights
     constexpr bool Q20 = WTYPE == 32 + GGML_TYPE_Q2_0;
     constexpr int Q2R = Q20 ? (BM * 8) / MMB_NT : 1;
-    uint32_t q20[Q2R];
+    uint32_t q20q[Q2R], q20d[Q2R];
     // Q5_1 at BM=128 (routed down): two threads per row, one 24-byte block (32 weights) each. One thread per row left
     // half the CTA idle while the other half decoded 64 weights (~600 VALU per stage against 16 WMMA per wave).
     constexpr bool Q51S = false && WTYPE == 32 + GGML_TYPE_Q5_1 && BM * 2 == MMB_NT && MMB_BK == 64;   // off: measured neutral-to-negative (1678 -> 1668 t/s pp2048)
@@ -202,7 +203,8 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
             for (int r = 0; r < Q2R; ++r) {
                 const int row = (tid >> 3) + r * (MMB_NT / 8);
                 const block_q2_0 * x = (const block_q2_0 *)(Wbase + (size_t)row * wrow_bytes) + ks;
-                q20[r] = row < a_rows ? *(const uint16_t *)(x->qs + 2 * (tid & 7)) | ((uint32_t)*(const uint16_t *)&x->d << 16) : 0u;
+                if (row < a_rows) { q20q[r] = *(const uint16_t *)(x->qs + 2 * (tid & 7)); q20d[r] = *(const uint16_t *)&x->d; }
+                else { q20q[r] = 0u; q20d[r] = 0u; }
             }
         }
         if constexpr (!Q51S) {
@@ -247,10 +249,10 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
 #pragma unroll
             for (int r = 0; r < Q2R; ++r) {
                 const int row = (tid >> 3) + r * (MMB_NT / 8);
-                const float d = mmb_h2f((uint16_t)(q20[r] >> 16));
+                const float d = mmb_h2f((uint16_t) q20d[r]);
                 float v[8];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) v[j] = ((int) ((q20[r] >> (2 * j)) & 3) - 1) * d;
+                for (int j = 0; j < 8; ++j) v[j] = ((int) ((q20q[r] >> (2 * j)) & 3) - 1) * d;
                 mmb_store8(As + row * MMB_LDS_STRIDE + 8 * (tid & 7), v);
             }
         } else if constexpr (WTYPE >= 32 && WTYPE != 32 + GGML_TYPE_Q5_1) mmb_load_quant_tile<WTYPE, BM, MMB_LDS_STRIDE>(Wbase, wrow_bytes, a_rows, weight_ks, As);
@@ -742,12 +744,12 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     int brow[B_ITEMS];
 #pragma unroll
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
-    // grid-based types (mmb_lb): prefetch each lane's block fields into registers during the WMMA loop, grid in
-    // LDS, decode in store_lds. Same fp32 math as dequantize_* -> bit-identical.
+    // grid-based types (mmb_lb): prefetch each lane's raw block fields into registers during the WMMA loop, grid in
+    // LDS, pack + decode in store_lds. Same fp32 math as dequantize_* -> bit-identical.
     using LBT = mmb_lb<WTYPE>;
     constexpr bool LB = LBT::ok;
     constexpr int LBR = LB ? (BM * 8) / MMB_NT : 1;
-    uint32_t lbg[LBR][2], lbu[LBR][2];
+    uint32_t lbg[LBR][LBT::NR], lbu[LBR][LBT::NR];
     __shared__ typename LBT::grid_t lbgrid[LBT::N];
     if constexpr (LB) { for (int i = tid; i < LBT::N; i += MMB_NT) lbgrid[i] = LBT::entry(i); }
     // gfx1151/ROCm 10.1 clang 24: direct activation staging clears 20 wide-GLU spill names without changing the 64x256 tile.
@@ -766,9 +768,12 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
             for (int r = 0; r < LBR; ++r) {
                 const int row = (tid >> 3) + r * (MMB_NT / 8);
                 if (row < a_rows) {
-                    LBT::fetch(Wg + (size_t)row * wrow_bytes, ks, sub, il, lbg[r][0], lbg[r][1]);
-                    LBT::fetch(Wu + (size_t)row * wrow_bytes, ks, sub, il, lbu[r][0], lbu[r][1]);
-                } else { lbg[r][0] = lbg[r][1] = lbu[r][0] = lbu[r][1] = 0u; } // d = 0 -> zero rows (never stored)
+                    LBT::fetch(Wg + (size_t)row * wrow_bytes, ks, sub, il, lbg[r]);
+                    LBT::fetch(Wu + (size_t)row * wrow_bytes, ks, sub, il, lbu[r]);
+                } else {   // d = 0 -> zero rows (never stored)
+#pragma unroll
+                    for (int f = 0; f < LBT::NR; ++f) { lbg[r][f] = 0u; lbu[r][f] = 0u; }
+                }
             }
         }
 #pragma unroll
@@ -810,8 +815,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
             for (int r = 0; r < LBR; ++r) {
                 const int row = (tid >> 3) + r * (MMB_NT / 8);
-                *(uint4 *)(Ag + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = LBT::decode(lbgrid, lbg[r][0], lbg[r][1], il);
-                *(uint4 *)(Au + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = LBT::decode(lbgrid, lbu[r][0], lbu[r][1], il);
+                *(uint4 *)(Ag + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = LBT::decode(lbgrid, lbg[r], sub, il);
+                *(uint4 *)(Au + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = LBT::decode(lbgrid, lbu[r], sub, il);
             }
         } else if constexpr (WTYPE != 0 && WTYPE != 32 + GGML_TYPE_Q4_K) {
             constexpr int LOAD_TYPE = WTYPE == 1 ? 32 + GGML_TYPE_Q8_0 : WTYPE;
