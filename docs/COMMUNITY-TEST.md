@@ -7,7 +7,8 @@ opt-in, and every one has a switch to turn it off, so you can compare.
 
 ## What is in it
 
-Vulkan, Flash-Next prefill and decode (set the variable to 0 to turn a change off):
+Vulkan, Flash-Next prefill and decode (set the variable to 0 to turn a change off; `GGML_VK_EXPDOWN_V` is a kernel
+variant number, default 9, and `GGML_VK_RAGGED_TAIL` a tile size, default 128):
 
 | change | switch |
 |---|---|
@@ -48,6 +49,7 @@ Model loading and MTP:
 - A recent shaderc `glslc` (the one that ships with the Vulkan SDK or a shaderc build). Older distro `glslc` builds
   (2023.x) lack `GL_EXT_integer_dot_product`, so the int8 kernels are not built and you get slower, different numbers.
   The configure log must say `GL_EXT_integer_dot_product supported by glslc`.
+- This guide is for the Vulkan backend. The branch also builds with ROCm / HIP, but HIP is not tested here.
 - SPIRV-Headers (the `spirv-headers` package, or a checkout). If the build stops with `'spv' has not been declared`,
   point the compiler at the headers as shown below.
 
@@ -93,8 +95,9 @@ cmake --build build --config Release -j
 ## llama-server with MTP
 
 The MTP head is public: `unsloth/Qwen3.8-Flash-Next-GGUF`, file `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (2.8 GB,
-head-less: it borrows the embeddings and LM head of the main model). `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` in the repo
-root (4.1 GB, own LM head) works too. The numbers below use the shared Q8_0 file.
+head-less: it borrows the embeddings and LM head of the main model). The numbers below use that file. The repo-root
+`mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (4.1 GB, own LM head) also exists, but `--spec-draft-mtp-vocab` does not apply to it
+(it is ignored with a warning) and we have not measured it on this branch.
 
 ```sh
 LLAMA_GDN_KEEP_SPLIT=1 LLAMA_MTP_CACHE_ONLY=1 ./build/bin/llama-server \
@@ -122,10 +125,13 @@ kernels for these files). KLD and top-1 are against the BF16 model on WikiText-2
 
 - 128 GB: UD-Q4_K_XL is the best quality and the fastest prefill (its expert and dense types have the most tuned
   kernels here). The smaller quants decode 15-21 % faster but prefill about 30 % slower.
-- 64 GB: not measured on this branch. Every full Flash-Next quant above needs more GPU memory than a 64 GB box can give
-  next to the OS (the smallest peaks at 57.8 GB on a 128 GB box). The smaller public quants (UD-IQ2 / UD-IQ1, 66-80 GB
-  files) are untested here. If you try one, use `-ub 2048`, `-lm none -lzm on-direct`, a small `-c`, and please report
-  the result, including a failure to load.
+- 64 GB: the model we run on 64 GB is Gyro-M (`agentionai/Qwen3.8-Flash-Next-Gyro-GGUF`, file
+  `Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf`, a pruned TQ2_0 build; its routed experts use the TQ2_T kernel of #252). It
+  loads and runs on this branch on a 64 GB box with `-lm none -lzm on-direct -ub 2048` (about 37 GB of GPU memory at
+  pp2048); we did not re-measure its speed for this guide. The unsloth quants above peak at 57.8 GB of GPU memory or
+  more, which is likely too tight for 64 GB; the smaller unsloth quants (UD-IQ2 / UD-IQ1, 66-80 GB files) are untested
+  here. If you try one, use `-ub 2048`, `-lm none -lzm on-direct`, a small `-c`, and please report the result,
+  including a failure to load.
 - The UD-Q4_K_XL files from before and after the unsloth v3.1 re-upload have the same tensor types and bytes: same KLD, speed within run spread.
 
 ## Reference numbers (128 GB box, BIOS power mode balanced)
