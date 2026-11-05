@@ -30,6 +30,10 @@ void ggml_cuda_gdn_set_conv(const ggml_tensor * gdn, const float * x, const floa
 // ggml_cuda_gdn_chunk_eligible with the q/k views registered by set_qk_norm (if any)
 bool ggml_cuda_gdn_chunk_eligible_node(const ggml_tensor * gdn);
 
+// the device runs prefill-sized GATED_DELTA_NET with K > 1 rollback snapshots on the chunked path with the same outputs and
+// final state as K = 1 (the snapshots are computed beside it); elsewhere K > 1 takes the per-token scan
+bool ggml_cuda_gdn_rs_exact(int device);
+
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);

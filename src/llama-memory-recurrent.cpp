@@ -796,7 +796,13 @@ size_t llama_memory_recurrent::size_p_bytes() const {
 }
 
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    GGML_UNUSED(flags);
+    // RS_BACK(k): write the state k tokens back, from snapshot plane k
+    const uint32_t rs_back = n_rs_seq != 0 ? LLAMA_STATE_SEQ_FLAGS_RS_BACK_GET(flags) : 0;
+    if (LLAMA_STATE_SEQ_FLAGS_RS_BACK_GET(flags) > 0) {
+        GGML_ASSERT(rs_back > 0 && "RS_BACK needs rollback snapshots (n_rs_seq > 0)");
+        GGML_ASSERT(seq_id >= 0 && rs_back <= n_rs_seq);
+        GGML_ASSERT(rs_idx[seq_id] == 0 && "cannot read a snapshot plane while a rollback is pending");
+    }
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
@@ -815,7 +821,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
             if (n_rs_seq != 0) {
                 if (seq_id != -1) {
                     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rs_idx.size());
-                    rs_idx_cur = rs_idx[seq_id];
+                    rs_idx_cur = rs_back > 0 ? rs_back : rs_idx[seq_id];
                 } else {
                     bool has_rs_idx = false;
                     for (const llama_seq_id cell_seq_id : cell.seq_id) {
@@ -872,7 +878,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     io.write(&cell_count, sizeof(cell_count));
 
-    state_write_meta(io, cell_ranges, seq_id);
+    state_write_meta(io, cell_ranges, seq_id, (llama_pos) rs_back);
     state_write_data(io, cell_ranges_data);
 }
 
@@ -907,11 +913,11 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     }
 }
 
-void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
+void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id, llama_pos pos_back) const {
     for (const auto & range : cell_ranges) {
         for (uint32_t i = range.first; i < range.second; ++i) {
             const auto & cell = cells[i];
-            const llama_pos pos      = cell.pos;
+            const llama_pos pos      = cell.pos - pos_back;
             const uint32_t  n_seq_id = seq_id == -1 ? cell.seq_id.size() : 0;
 
             io.write(&pos,      sizeof(pos));
