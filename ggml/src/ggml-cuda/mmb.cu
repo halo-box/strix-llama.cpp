@@ -157,8 +157,14 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     constexpr int WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
     constexpr int A_ITEMS = (BM + MMB_NT - 1) / MMB_NT;
     constexpr int B_ITEMS = (BN * 8) / MMB_NT;
-    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    // 2x2 fragment tiles guard the tail per wave (wave index from readfirstlane, a scalar branch): a guard per 16-token
+    // fragment made the compiler rebuild every WMMA B operand with 16-bit half moves (~8-16 VALU per WMMA). Dead
+    // fragments of a live wave multiply zero-filled B rows and are never stored. Narrower tiles keep the per-fragment
+    // guard: there it costs no copies and skips the half-empty fragments of tiny experts.
+    constexpr bool WAVE_GUARD = TM > 1 && TN > 1;
+    const int tid = threadIdx.x, lane = tid & 31, wave = __builtin_amdgcn_readfirstlane(tid >> 5);
     const int wm = wave % WAVES_M, wn = wave / WAVES_M;
+    const bool wact = !TAIL || wn * WTN < n_cols;
     uint4 a0[A_ITEMS], a1[A_ITEMS], a3[A_ITEMS], a4[A_ITEMS], a5[A_ITEMS], a6[A_ITEMS], a7[A_ITEMS], a8[A_ITEMS]; uint32_t a2[A_ITEMS];
     uint4 bst[B_ITEMS];
     int brow[B_ITEMS];
@@ -317,12 +323,12 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                 for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
                     const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); a[i] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
 #pragma unroll
-                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
                     const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); b[j] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
 #pragma unroll
                 for (int i = 0; i < TM; ++i)
 #pragma unroll
-                    for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
+                    for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; }
                         if constexpr (F16) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b[j], a[i], acc[i][j]);
                         else               acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
             }
@@ -726,8 +732,10 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     constexpr int A_ITEMS = (BM + MMB_NT - 1) / MMB_NT;
     constexpr int B_ITEMS = (BN * 8) / MMB_NT;
     constexpr bool F16 = WTYPE >= 32 && mmb_routed_f16_type((ggml_type) (WTYPE - 32));   // F16 weights and Xh
-    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    constexpr bool WAVE_GUARD = TM > 1 && TN > 1;   // see mmb_tile_gemm
+    const int tid = threadIdx.x, lane = tid & 31, wave = __builtin_amdgcn_readfirstlane(tid >> 5);
     const int wm = wave % WAVES_M, wn = wave / WAVES_M;
+    const bool wact = !TAIL || wn * WTN < n_cols;
     uint4 g0[A_ITEMS], g1[A_ITEMS], u0[A_ITEMS], u1[A_ITEMS]; uint32_t g2[A_ITEMS], u2[A_ITEMS];
     uint4 gm[A_ITEMS], um[A_ITEMS];
     uint4 bst[B_ITEMS];
@@ -861,7 +869,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
             if constexpr (STREAM) {
                 v16s b[TN]; const int r = lane & 15;
 #pragma unroll
-                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
                     b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
 #pragma unroll
                 for (int i = 0; i < TM; ++i) {
@@ -869,13 +877,13 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                     {
                         const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
 #pragma unroll
-                        for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
+                        for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; }
                             accg[i][j] = mmb_wmma_glu<F16>(b[j], a, accg[i][j]); }
                         }
                     {
                         const v16s a = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)});
 #pragma unroll
-                        for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
+                        for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; }
                             accu[i][j] = mmb_wmma_glu<F16>(b[j], a, accu[i][j]); }
                         }
                 }
@@ -886,13 +894,13 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
                     ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
                     au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
 #pragma unroll
-                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
                     b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
 #pragma unroll
                 for (int i = 0; i < TM; ++i)
 #pragma unroll
                     for (int j = 0; j < TN; ++j) {
-                        if constexpr (TAIL) { if (!jact[j]) continue; }
+                        if constexpr (TAIL) { if (WAVE_GUARD ? !wact : !jact[j]) continue; }
                         accg[i][j] = mmb_wmma_glu<F16>(b[j], ag[i], accg[i][j]);
                         accu[i][j] = mmb_wmma_glu<F16>(b[j], au[i], accu[i][j]);
                     }
