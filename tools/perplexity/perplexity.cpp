@@ -31,6 +31,30 @@ struct results_perplexity {
     std::vector<float>       probs;
 };
 
+// QSA validation knobs (scripts/qsa-validation/README.md). Measurement only: without the variables the scored window
+// is the upstream one and the only addition is the QKLD_CHUNK line of --kl-divergence.
+//   QKL_TAIL=N   score the last N positions of each chunk (2 <= N <= n_ctx - 1) instead of its second half. A
+//                --kl-divergence-base file does not record N, so the base and every arm scored against it must use
+//                the same N.
+//   QKL_SPLIT=P  chunk position at which the QKLD_CHUNK line splits its lo / hi means (default 2048).
+static int qkl_first_scored(int n_ctx) {
+    const char * env = getenv("QKL_TAIL");
+    if (env == nullptr) {
+        return n_ctx/2;
+    }
+    const int tail = atoi(env);
+    if (tail < 2 || tail > n_ctx - 1) {
+        LOG_ERR("%s: QKL_TAIL=%s is outside [2, %d]\n", __func__, env, n_ctx - 1);
+        return -1;
+    }
+    return n_ctx - tail;
+}
+
+static int qkl_split() {
+    const char * env = getenv("QKL_SPLIT");
+    return env ? atoi(env) : 2048;
+}
+
 struct results_log_softmax {
     double log_softmax;
     float  logit;
@@ -455,6 +479,10 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
 
+    if (qkl_first_scored(n_ctx) < 0) {
+        return {};
+    }
+
     std::ofstream logits_stream;
     if (!params.logits_file.empty()) {
         logits_stream.open(params.logits_file.c_str(), std::ios::binary);
@@ -537,7 +565,8 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // Example, we have a context window of 512, we will compute perplexity for each of the
     // last 256 tokens.  Then, we split the input up into context window size chunks to
     // process the entire prompt.
-    const int first = n_ctx/2;
+    // (QKL_TAIL moves the start of the scored window, see qkl_first_scored)
+    const int first = qkl_first_scored(n_ctx);
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
@@ -1735,9 +1764,16 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     common_batch batch(ctx);
 
-    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
-    std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
-    std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
+    // first scored position of each chunk (QKL_TAIL moves it, see qkl_first_scored)
+    const int first = qkl_first_scored((int) n_ctx);
+    if (first < 0) {
+        return;
+    }
+    const int split = qkl_split();
+
+    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - first) * nv);
+    std::vector<float>    kld_values(size_t(n_ctx - 1 - first)*n_chunk);
+    std::vector<float> p_diff_values(size_t(n_ctx - 1 - first)*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
         logits.reserve(size_t(n_ctx) * n_vocab);
@@ -1768,8 +1804,6 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     kl_divergence_result kld;
     auto    kld_ptr =    kld_values.data();
     auto p_diff_ptr = p_diff_values.data();
-
-    const int first = n_ctx/2;
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
@@ -1849,6 +1883,19 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
                     workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
             p_diff_ptr += n_ctx - 1 - first;
+            {
+                // per-chunk mean KLD in full precision, straight from this chunk's kld_values (the table below is
+                // cumulative over chunks and printed with 5 decimals), plus its means over positions < QKL_SPLIT (lo)
+                // and >= QKL_SPLIT (hi); the chunk index is 0-based
+                const int n_scored = (int) n_ctx - 1 - first;
+                double lo = 0, hi = 0;
+                int nlo = 0, nhi = 0;
+                for (int t = 0; t < n_scored; ++t) {
+                    if (first + t < split) { lo += kld_ptr[t]; nlo++; } else { hi += kld_ptr[t]; nhi++; }
+                }
+                LOG("QKLD_CHUNK %d all=%.9e lo=%.9e nlo=%d hi=%.9e nhi=%d\n", i + seq, (lo + hi)/std::max(1, nlo + nhi),
+                    nlo ? lo/nlo : 0.0, nlo, nhi ? hi/nhi : 0.0, nhi);
+            }
             kld_ptr    += n_ctx - 1 - first;
 
             LOG("%4d", i + seq + 1);
