@@ -226,6 +226,10 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // rewrite the token ids the cells of an applied ubatch keep (ext.tok), for a ubatch whose ids were set after it
+    // was applied (decode chaining)
+    void set_tokens(const slot_info & sinfo, const llama_ubatch & ubatch);
+
     //
     // input API
     //
@@ -461,6 +465,9 @@ public:
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
+    // see llama_kv_cache::set_tokens(), for the current ubatch
+    void set_cur_tokens(const llama_ubatch & ubatch) const;
 
 private:
     llama_memory_status status;

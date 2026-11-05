@@ -1,0 +1,34 @@
+#version 450
+
+// Decode weight prefetch: one 32-bit load per cache line over a byte range of a weight buffer, so the lines are in L2 / the
+// memory-attached last-level cache when the mat-vec that reads them runs. Launched beside latency-bound small ops; stores
+// nothing (the store below is behind a push constant that is always 0, which keeps the loads alive).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) buffer W {uint data_w[];};
+
+layout (push_constant) uniform parameter {
+    uint offset;      // in 32-bit words
+    uint nlines;
+    uint line_words;
+    uint never;
+} p;
+
+void main() {
+    const uint nthr = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint i = gl_GlobalInvocationID.x;
+    uint acc = 0;
+    for (; i + 3 * nthr < p.nlines; i += 4 * nthr) {
+        acc += data_w[p.offset + i * p.line_words];
+        acc += data_w[p.offset + (i + nthr) * p.line_words];
+        acc += data_w[p.offset + (i + 2 * nthr) * p.line_words];
+        acc += data_w[p.offset + (i + 3 * nthr) * p.line_words];
+    }
+    for (; i < p.nlines; i += nthr) {
+        acc += data_w[p.offset + i * p.line_words];
+    }
+    if (p.never != 0 && acc == 0x9e3779b9u) {
+        data_w[p.offset] = acc;
+    }
+}

@@ -1,6 +1,7 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
 
 #include "types.glsl"
 
@@ -13,6 +14,7 @@ layout(constant_id = 3) const bool APPLY_SILU = false;
 //    is the ncs-column state [ncs, nr, n_s]; the concat is never read. Kernel width must be 4 (ncs = 3).
 // 2: concat tail: write concat columns [nc, ncs + n_t) of every channel row from the state and x (src0 = x,
 //    binding 2 = state, dst = concat with row stride dst_nb1 and sequence stride dst_nb2; nc = first column).
+// 3: MODE 2 and 4: MODE 1 with x stored f16 (the dense GEMM's f16 store, nb01 / nb02 in bytes of f16 rows), widened exactly on load.
 layout(constant_id = 4) const uint MODE = 0;
 // MODE 1: tokens per thread. The 4-tap window slides in registers, so a token costs one x load and one store.
 layout(constant_id = 5) const uint TOKENS_PER_THREAD = 1;
@@ -20,6 +22,7 @@ layout(constant_id = 5) const uint TOKENS_PER_THREAD = 1;
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer Src0 { float src0[]; };
+layout(binding = 0) readonly buffer Src0h { float16_t src0h[]; };
 layout(binding = 1) readonly buffer Src1 { float src1[]; };
 layout(binding = 2) readonly buffer Bias { float bias[]; };
 layout(binding = 3) buffer Dst { float dst[]; };
@@ -31,8 +34,12 @@ layout(push_constant) uniform PushConstants {
     uint nc; uint ncs; uint nr; uint n_t; uint n_s;
 };
 
+const bool X16 = MODE == 3 || MODE == 4;
+const uint XB = X16 ? 2 : 4;   // bytes per x element
+float x_at(const uint i) { return X16 ? float(src0h[i]) : src0[i]; }
+
 void main() {
-    if (MODE == 1) {
+    if (MODE == 1 || MODE == 4) {
         // one thread per (channel, TOKENS_PER_THREAD tokens); lanes run along channels, so every x load and
         // dst store is a contiguous row segment
         const uint c  = gl_GlobalInvocationID.x;
@@ -41,8 +48,8 @@ void main() {
         if (c >= nr || t0 >= n_t || s >= n_s) {
             return;
         }
-        const uint xs      = nb01 / 4;
-        const uint x_base  = s * (nb02 / 4) + c;
+        const uint xs      = nb01 / XB;
+        const uint x_base  = s * (nb02 / XB) + c;
         const uint st_base = s * ncs * nr + c * ncs;
         const uint k_base  = c * (nb11 / 4);
         const vec4 w = vec4(src1[k_base], src1[k_base + 1], src1[k_base + 2], src1[k_base + 3]);
@@ -54,7 +61,7 @@ void main() {
             if (t < 0) {
                 win[i] = bias[st_base + uint(t + int(ncs))];
             } else {
-                win[i] = src0[x_base + uint(t) * xs];
+                win[i] = x_at(x_base + uint(t) * xs);
             }
         }
         const uint d_base = s * (dst_nb2 / 4) + c;
@@ -63,7 +70,7 @@ void main() {
             if (t >= n_t) {
                 break;
             }
-            const float v = src0[x_base + t * xs];
+            const float v = x_at(x_base + t * xs);
             // the same dot() as the nc == 4 path over the concat, so the result is bit-identical
             float sum = dot(vec4(win[0], win[1], win[2], v), w);
             sum = sum / (1.0f + exp(-sum));
@@ -73,7 +80,7 @@ void main() {
             win[2] = v;
         }
         return;
-    } else if (MODE == 2) {
+    } else if (MODE == 2 || MODE == 3) {
         const uint ncols = ncs + n_t - nc;
         const uint idx = gl_GlobalInvocationID.x;
         const uint s   = gl_WorkGroupID.y;
@@ -83,7 +90,7 @@ void main() {
         // lanes along channels: x reads coalesce, the (few) columns per channel are the outer index
         const uint c = idx % nr;
         const uint j = nc + idx / nr;
-        const float v = j < ncs ? bias[s * ncs * nr + c * ncs + j] : src0[s * (nb02 / 4) + (j - ncs) * (nb01 / 4) + c];
+        const float v = j < ncs ? bias[s * ncs * nr + c * ncs + j] : x_at(s * (nb02 / XB) + (j - ncs) * (nb01 / XB) + c);
         dst[s * (dst_nb2 / 4) + c * (dst_nb1 / 4) + j] = v;
         return;
     }

@@ -26,6 +26,7 @@
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API: llama_decode_chain
 #include "log.h"
 
 #ifdef _WIN32
@@ -2240,8 +2241,91 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     return true;
 }
 
+// LLAMA_BENCH_TG_GREEDY=1: generation feeds each decode the token a greedy backend sampler picked on the previous one
+// (instead of random tokens), through llama_decode_chain unless LLAMA_DECODE_CHAIN=0. LLAMA_BENCH_TOKDUMP=<file>
+// appends the generated ids (one line per test).
+static bool tg_greedy() {
+    static const bool v = getenv("LLAMA_BENCH_TG_GREEDY") && atoi(getenv("LLAMA_BENCH_TG_GREEDY")) != 0;
+    return v;
+}
+
+// the greedy sampler goes on the context once, at creation (a sampler change re-reserves the graph)
+static void tg_greedy_attach(llama_context * ctx) {
+    if (!tg_greedy()) {
+        return;
+    }
+    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+    if (!llama_set_sampler(ctx, 0, smpl)) {
+        fprintf(stderr, "%s: the greedy sampler cannot run on the backend\n", __func__);
+        exit(1);
+    }
+}
+
+static bool test_gen_greedy(llama_context * ctx, int n_gen) {
+    // the warm-up (one token) also sets up the chain
+    n_gen = std::max(n_gen, 3);
+
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : 1;
+    std::vector<llama_token> ids;
+
+    common_batch batch(ctx);
+    llama_pos pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+
+    // the first decode is an ordinary one, the rest chain on it
+    batch.add(token, pos++, 0, true);
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        return false;
+    }
+    bool chained = true;
+    token = LLAMA_TOKEN_NULL; // the first chained step takes the token the decode above sampled
+    for (int i = 1; i < n_gen; i++) {
+        int res = chained ? llama_decode_chain(ctx, 0, &token) : -1;
+        if (res == -1) {
+            chained = false;
+            llama_synchronize(ctx);
+            token = llama_get_sampled_token_ith(ctx, -1);
+            batch.clear();
+            batch.add(token, pos, 0, true);
+            res = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        }
+        pos++;
+        if (res != 0) {
+            fprintf(stderr, "%s: failed to decode generation token, res = %d\n", __func__, res);
+            return false;
+        }
+        ids.push_back(token);
+    }
+    if (chained) {
+        llama_decode_chain_end(ctx, 0, &token);
+    } else {
+        llama_synchronize(ctx);
+        token = llama_get_sampled_token_ith(ctx, -1);
+    }
+    ids.push_back(token);
+
+    if (const char * f = getenv("LLAMA_BENCH_TOKDUMP")) {
+        if (FILE * fp = fopen(f, "a")) {
+            fprintf(fp, "chained=%d n=%zu:", (int) chained, ids.size());
+            for (llama_token t : ids) {
+                fprintf(fp, " %d", t);
+            }
+            fprintf(fp, "\n");
+            fclose(fp);
+        }
+    }
+    return true;
+}
+
 static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     llama_set_n_threads(ctx, n_threads, n_threads);
+
+    if (tg_greedy()) {
+        return test_gen_greedy(ctx, n_gen);
+    }
 
     const llama_model * model   = llama_get_model(ctx);
     const llama_vocab * vocab   = llama_model_get_vocab(model);
@@ -2426,6 +2510,8 @@ int llama_bench(int argc, char ** argv) {
             llama_model_free(lmodel);
             return 1;
         }
+
+        tg_greedy_attach(ctx);
 
         test t(inst, lmodel, ctx);
 

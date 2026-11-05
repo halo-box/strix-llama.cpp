@@ -1739,6 +1739,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--ctx-checkpoint-spares"}, "N",
+        string_format("keep the buffers of up to N erased context checkpoints and reuse them for new checkpoints, "
+            "which skips the zero-fill and page faults of a fresh allocation (default: %d, 0 = free them)", params.ctx_checkpoint_spares),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoint-spares must be non-negative");
+            }
+            params.ctx_checkpoint_spares = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINT_SPARES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--decode-chain"}, "N",
+        string_format("when one slot generates with greedy backend sampling (backend_sampling, no grammar, n_probs or speculative "
+            "decoding), record each decode while the previous one runs and submit it as soon as that one has sampled; "
+            "a stop leaves the last sampled token decoded in the slot's cache (default: %d, 0 = off)", params.decode_chain),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("decode-chain must be non-negative");
+            }
+            params.decode_chain = value;
+        }
+    ).set_env("LLAMA_ARG_DECODE_CHAIN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--ctx-checkpoint-snapshot"}, "N",
+        string_format("for recurrent hybrid models, take the checkpoint 4 tokens before the end of the prompt from a state snapshot "
+            "inside the last prompt batch instead of decoding the last 4 tokens in a batch of their own; "
+            "keeps one more copy of the recurrent state on the device (default: %d, 0 = separate batch)", params.ctx_checkpoint_snapshot),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoint-snapshot must be non-negative");
+            }
+            params.ctx_checkpoint_snapshot = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINT_SNAPSHOT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
@@ -4420,6 +4455,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mtp_pcum = std::max(0.0f, std::min(1.0f, std::stof(value)));
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_PCUM"));
+    add_opt(common_arg(
+        {"--spec-draft-cost-aware"},
+        string_format("MTP: choose each round's draft length (0 to --spec-draft-n-max) to maximise expected tokens per unit of "
+                      "time, from per-position acceptance and the measured round time per draft length; 0 is a plain target "
+                      "step (default: %s)", params.speculative.draft.cost_aware ? "true" : "false"),
+        [](common_params & params) {
+            params.speculative.draft.cost_aware = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_COST_AWARE"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},

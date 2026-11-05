@@ -28,6 +28,9 @@ struct llama_ple_disk {
     // dequantize rows idx[0..n) into dst, laid out [ne0, n]; aborts on an out-of-range index
     void gather(const int32_t * idx, size_t n, float * dst);
 
+    // copy rows idx[0..n) into dst as stored, row_size() bytes each
+    void gather_raw(const int32_t * idx, size_t n, void * dst);
+
     // ask the kernel to read rows idx[0..n) into the page cache ahead of a later gather; only advice, so a
     // wrong prediction costs readahead and nothing else. A no-op with O_DIRECT, whose reads bypass the
     // page cache. Safe to call from another thread while a gather runs.
@@ -38,6 +41,7 @@ struct llama_ple_disk {
     int64_t     n_rows()   const;
     int64_t     ne0()      const;
     size_t      row_size() const;
+    ggml_type   type()     const;
     std::string describe() const;
 
     struct impl;

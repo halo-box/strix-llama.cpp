@@ -24,7 +24,7 @@
 
 #include "types.glsl"
 
-#if defined(DATA_A_Q3_K) || defined(DATA_A_Q6_K) || defined(DATA_A_NVFP4)
+#if defined(DATA_A_Q3_K) || defined(DATA_A_Q6_K) || defined(DATA_A_NVFP4) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S)
 #define KSCALES 2
 #else
 #define KSCALES 1
@@ -39,7 +39,21 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
 #if defined(A_TYPE_PACKED32)
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
 #endif
+#ifdef B_F16Q
+// B is the f16 activation read in place (rows p.stride_b elements apart, a multiple of 32) and quantized to q8_1 blocks in the
+// load, with the q8_1 quantize shader's arithmetic (GGML_VK_HC_W8A8: no separate quantize pass over B)
+layout (binding = 1) readonly buffer B {f16vec4 data_bf[];};
+#else
+#if defined(DATA_A_TQ1_0)
+// the 54-byte block is only 2-byte aligned: qs and qh as 26 halfwords, then d
+struct block_tq1_0_packed16 {
+    uint16_t q[26];
+    float16_t d;
+};
+layout (binding = 0) readonly buffer A_TQ1_16 {block_tq1_0_packed16 data_a_tq1_16[];};
+#endif
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
+#endif
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef D16
 // f16 output: pairs of adjacent rows go out as one 32-bit store
@@ -155,7 +169,8 @@ shared float buf_b_s[BN * BK_STEP];
 shared int8_t cm1_kvalues[16];
 #endif
 
-#if defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS) || defined(DATA_A_NVFP4)
+#if defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS) || defined(DATA_A_NVFP4) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || \
+    defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_Q2_0) || defined(DATA_A_PTQ1_0)
 #define LOAD_VEC_A 8
 #else
 #define LOAD_VEC_A (4 * QUANT_R)
@@ -267,6 +282,9 @@ void main() {
     }
 #endif
     barrier();
+#endif
+#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S)
+    init_iq_shmem(gl_WorkGroupSize);
 #endif
 
     const uint blocks_m = (p.M + BM - 1) / BM;

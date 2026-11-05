@@ -18,8 +18,10 @@ struct vk_mat_mat_push_constants {
 // matmul_f32_f32_qsa (QSA_EPI in mul_mm.comp): the plain push constants plus the block-bias addressing (QSA_SCORE)
 struct vk_mat_mat_qsa_push_constants {
     vk_mat_mat_push_constants mm;
-    uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;
+    uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;   // has_bias: 0 none, 1 block bias, 2 compact visibility (QSA_VIS)
+    uint32_t vis_start; uint32_t vis_tail; uint32_t vis_neg;                 // QSA_VIS: limits element offsets, negative control
 };
+static_assert(sizeof(vk_mat_mat_qsa_push_constants) <= 128, "matmul_f32_f32_qsa push constants must fit the 128-byte minimum");
 
 // matmul_q8_0_q8_1_hcmix (HC_EPI in mul_mmq_cm1.comp): the plain push constants plus the x / mixed addressing and the mix scale
 struct vk_mat_mat_hcmix_push_constants {
@@ -44,6 +46,19 @@ struct vk_mat_vec_push_constants {
     uint32_t ne12;
     uint32_t broadcast2;
     uint32_t broadcast3;
+};
+
+// FN_DECODE_HC (mul_mat_vec.comp HC_MIX): vk_mat_vec_push_constants followed by the hc fields
+struct vk_mat_vec_hc_mix_push_constants {
+    vk_mat_vec_push_constants mv;
+    uint32_t hc_n_embd;
+    uint32_t hc_x_offset;
+    uint32_t hc_x_s1;
+    uint32_t hc_x_s2;
+    uint32_t hc_d_s1;
+    float    hc_in_scale;
+    float    hc_in_bias;
+    float    hc_mix_scale;
 };
 
 struct vk_mat_vec_p021_push_constants {
@@ -191,6 +206,36 @@ struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_iter;
 };
 
+struct vk_op_dsv4_hc_mix_push_constants {
+    uint32_t K;
+    uint32_t n_tokens;
+    uint32_t nbw1;
+    uint32_t nbx1;
+    uint32_t kc;
+};
+
+struct vk_op_dsv4_hc_boundary_push_constants {
+    uint32_t K;
+    uint32_t n_embd;
+    uint32_t n_tokens;
+    uint32_t n_split;
+    uint32_t nbx1;
+    uint32_t nbs0;
+    uint32_t nbb0;
+    uint32_t nbpo1;
+    uint32_t nbc1; uint32_t nbc2;
+    uint32_t nbo1;
+    float eps_flat;
+    float pre_mul;
+    float pre_add;
+    float post_mul;
+    float post_add;
+    float comb_eps;
+    uint32_t comb_iters;
+    float out_scale;
+    float eps_norm;
+};
+
 struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;
@@ -245,6 +290,55 @@ struct vk_op_dsv4_hc_post_norm_push_constants {
     uint32_t zero;   // always 0: the f16 store's XOR operand
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_norm_push_constants) <= 128);
+
+// dsv4_hc_post_norm_inj.comp: the dsv4_hc_post_norm fields, then the inject weight row stride and output token stride (floats)
+struct vk_op_dsv4_hc_post_norm_inj_push_constants {
+    vk_op_dsv4_hc_post_norm_push_constants base;
+    uint32_t sw1;
+    uint32_t si1;
+};
+static_assert(sizeof(vk_op_dsv4_hc_post_norm_inj_push_constants) <= 128);
+
+// dsv4_hc_moe_post_norm.comp: the dsv4_hc_post_norm_inj fields (base.sx1 = the shared-expert token stride), then the routed slots:
+// count, slot 0 offset, slot stride and token stride (elements), the shared-expert term (0: none, 1: added, 2: its sigmoid gate
+// applied first) and the gate's token stride (floats)
+struct vk_op_dsv4_hc_moe_post_norm_push_constants {
+    vk_op_dsv4_hc_post_norm_inj_push_constants inj;
+    uint32_t n_slots;
+    uint32_t so;
+    uint32_t ss1;
+    uint32_t ss2;
+    uint32_t sh_mode;
+    uint32_t sgt;
+};
+static_assert(sizeof(vk_op_dsv4_hc_moe_post_norm_push_constants) <= 128);
+
+// HC_DEFER: the MoE epilogue also recomputes the deferred attention-side combine
+struct vk_op_dsv4_hc_moe_post_norm_defer_push_constants {
+    vk_op_dsv4_hc_moe_post_norm_push_constants moe;
+    uint32_t sxa1;
+    uint32_t spa0; uint32_t spa1;
+    uint32_t gate_a;
+    float    gate_in_a;
+    float    gate_out_a;
+};
+static_assert(sizeof(vk_op_dsv4_hc_moe_post_norm_defer_push_constants) <= 128);
+struct vk_op_argmax_split_push_constants {
+    uint32_t ncols;     // part: row length; reduce: partials per row
+    uint32_t nrows;
+    uint32_t chunk;     // part: columns per workgroup
+    uint32_t a_offset;  // part: source misalignment (elements)
+    uint32_t d_offset;  // reduce: destination misalignment (elements)
+};
+
+// dsv4_hc_res16_widen.comp (HC_BF16RES fallback): bf16 stream / token strides (elements), f32 stream / token strides (floats)
+struct vk_op_dsv4_hc_res16_widen_push_constants {
+    uint32_t n_embd;
+    uint32_t hc;
+    uint32_t n_tokens;
+    uint32_t s1; uint32_t s2;
+    uint32_t d1; uint32_t d2;
+};
 
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
@@ -786,11 +880,38 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+// gated_delta_net.comp: the shared constants plus the direct state write (GGML_VK_GDN_ROLLBACK). st_direct != 0: the
+// states go to binding 7 at slot * st_slot + seq * st_seq (floats) instead of the op output's state region.
+struct vk_op_gdn_seq_push_constants {
+    vk_op_gated_delta_net_push_constants gdn;
+    uint32_t st_seq;
+    uint32_t st_slot;
+    uint32_t st_direct;
+};
+
+static_assert(sizeof(vk_op_gdn_seq_push_constants) <= 128);
+
 // gdn_chunk_prep.comp / gdn_chunk_scan.comp: the sequential kernel's constants plus the chunk count
 struct vk_op_gdn_chunk_push_constants {
     vk_op_gated_delta_net_push_constants gdn;
     uint32_t nch;
+    uint32_t qk_norm;   // prep: q and k are the raw views, l2-normalised on load (x * qk_mul * rsqrt(mean(x^2) + qk_eps))
+    float    qk_eps;
+    float    qk_mul;
+    // conv_fold (GGML_VK_GDN_CONVFOLD): q / k / v are silu(conv4(x)) computed on load from the conv input x, conv state and
+    // taps (prep bindings 0, 1, 5, 6; scan bindings 0, 4, 5); qc0 / kc0 / vc0 are the q / k / v view offsets in x (floats)
+    uint32_t conv_fold;   // bit 0 on, bit 1: chunks after the first read the window without the conv-state branch
+    uint32_t qc0, kc0, vc0;
+    uint32_t conv_C;
+    // out_norm (GGML_VK_GDN_OUTNORM, the gdn_chunk_scan_on pipeline): the scan stores rms_norm(o) * gamma * sigmoid(z) as f16
+    // (bit 0) with z read as f16 (bit 1, GGML_VK_GDN_Z16); on_zs2 / on_zs3 and on_os2 / on_os3 are the token / sequence strides
+    // of z and of the f16 destination in elements (head rows packed: 128 apart)
+    uint32_t out_norm;
+    float    on_eps;
+    uint32_t on_zs2, on_zs3;
+    uint32_t on_os2, on_os3;
 };
+static_assert(sizeof(vk_op_gdn_chunk_push_constants) <= 128);
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
@@ -806,6 +927,10 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+struct vk_op_ple_conv_push_constants {
+    uint32_t C, T;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -909,6 +1034,14 @@ struct vk_op_upscale_push_constants {
     uint32_t ne10; uint32_t ne11; uint32_t ne12; uint32_t ne13;
     float sf0; float sf1; float sf2; float sf3;
     float pixel_offset;
+};
+
+// decode weight prefetch (decode_prefetch.comp): word offset into the weight descriptor, cache lines to touch, words per line
+struct vk_op_decode_prefetch_push_constants {
+    uint32_t offset;
+    uint32_t nlines;
+    uint32_t line_words;
+    uint32_t never;
 };
 
 struct vk_op_sum_rows_push_constants

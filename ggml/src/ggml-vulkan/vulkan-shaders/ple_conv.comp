@@ -1,0 +1,76 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "types.glsl"
+
+// qwen4exp PLE convolution in one pass: out[c, t] = silu(sum_k w[k, c] * p[c, t + k * DIL]) where p is the concat of the
+// H = 3 * DIL history columns (state) and x^T. The unfused graph is four transposed tap copies, four MULs, an ADD chain
+// and a SiLU; the products and sums are rounded in the same order here (precise: no contraction to fma), so the
+// result is bit-identical to it.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint TOKENS_PER_THREAD = 16;
+
+const uint K   = 4;
+const uint DIL = 3;
+const uint H   = (K - 1) * DIL;
+const uint WIN = H + 1;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X { float x[]; };         // [C, T], channel-contiguous
+layout(binding = 1) readonly buffer S { float state[]; };     // [H, C]
+layout(binding = 2) readonly buffer W { W_TYPE w[]; };        // [K, C]
+layout(binding = 3) writeonly buffer D { float dst[]; };      // [C, T]
+
+layout(push_constant) uniform PushConstants {
+    uint C;
+    uint T;
+};
+
+// column j of the concat for channel c
+float ld(const uint c, const uint j) {
+    if (j < H) {
+        return state[c * H + j];
+    }
+    return (j - H) < T ? x[(j - H) * C + c] : 0.0f;
+}
+
+void main() {
+    const uint c  = gl_GlobalInvocationID.x;
+    const uint t0 = gl_WorkGroupID.y * TOKENS_PER_THREAD;
+    if (c >= C || t0 >= T) {
+        return;
+    }
+
+    float wr[K];
+    [[unroll]] for (uint k = 0; k < K; ++k) {
+        wr[k] = float(w[c * K + k]);
+    }
+
+    float win[WIN];
+    [[unroll]] for (uint k = 0; k < WIN; ++k) {
+        win[k] = ld(c, t0 + k);
+    }
+
+    [[unroll]] for (uint i = 0; i < TOKENS_PER_THREAD; ++i) {
+        const uint t = t0 + i;
+        if (t >= T) {
+            break;
+        }
+        precise float s = win[0] * wr[0];
+        [[unroll]] for (uint k = 1; k < K; ++k) {
+            s = s + win[k * DIL] * wr[k];
+        }
+        // the unary SiLU's expression
+        const float v = s;
+        dst[t * C + c] = v / (1.0f + exp(-v));
+
+        [[unroll]] for (uint k = 0; k + 1 < WIN; ++k) {
+            win[k] = win[k + 1];
+        }
+        win[WIN - 1] = ld(c, t + WIN);
+    }
+}

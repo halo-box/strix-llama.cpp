@@ -44,6 +44,7 @@ int server_queue::post(server_task && task, bool front) {
     if (reset_timer) {
         time_last_task = ggml_time_ms();
     }
+    worker_wake_if_yielding();
     condition_tasks.notify_one();
     return task_id;
 }
@@ -70,6 +71,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     if (reset_timer) {
         time_last_task = ggml_time_ms();
     }
+    worker_wake_if_yielding();
     condition_tasks.notify_one();
     return 0;
 }
@@ -207,6 +209,51 @@ void server_queue::worker_loop() {
     }
 }
 
+void server_queue::worker_wake_if_yielding() {
+    if (worker.lazy && worker.yielding && !worker.busy && !queue_tasks.empty()) {
+        worker.busy = true;
+        worker.cv.notify_one();
+    }
+}
+
+void server_queue::worker_loop_lazy() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    while (true) {
+        // busy is set by worker_wake_if_yielding() once a task is queued during a yield
+        worker.cv.wait(lock, [&]{
+            return worker.stop || worker.busy;
+        });
+        if (worker.stop) {
+            worker.busy = false;
+            break;
+        }
+
+        // process tasks until the queue is empty or the yield ended; busy is cleared under the same lock as that check,
+        // so a task posted afterwards wakes the worker again
+        while (true) {
+            lock.unlock();
+            bool terminated = false;
+            try {
+                // note: do not hold any lock here, the callback may post new tasks
+                terminated = process_new_tasks(true);
+            } catch (...) {
+                lock.lock();
+                worker.exception = std::current_exception();
+                break;
+            }
+            lock.lock();
+            if (terminated || worker.stop || !worker.yielding || queue_tasks.empty()) {
+                break;
+            }
+        }
+
+        worker.busy = false;
+        condition_tasks.notify_all(); // yield_to_queue() may wait for this
+    }
+    lock.unlock();
+    condition_tasks.notify_all();
+}
+
 void server_queue::worker_stop() {
     if (!worker.thread.joinable()) {
         return;
@@ -227,11 +274,16 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
-        GGML_ASSERT(!worker.busy && "yield_to_queue() cannot be nested");
-        worker.busy     = true;
+        GGML_ASSERT(!worker.busy && !worker.yielding && "yield_to_queue() cannot be nested");
         worker.yielding = true;
+        if (worker.lazy) {
+            // nothing queued: the worker sleeps until post() brings a task
+            worker_wake_if_yielding();
+        } else {
+            worker.busy = true;
+            worker.cv.notify_one();
+        }
     }
-    worker.cv.notify_one();
 
     // run the work on the current thread, so that all ggml compute stays on the same thread
     std::exception_ptr exception;
@@ -285,7 +337,15 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     worker.stop     = false;
     worker.busy     = false;
     worker.yielding = false;
-    worker.thread = std::thread([this]() { worker_loop(); });
+    {
+        const char * e = getenv("LLAMA_SERVER_YIELD_LAZY");
+        worker.lazy = e == nullptr || atoi(e) != 0;
+    }
+    if (worker.lazy) {
+        worker.thread = std::thread([this]() { worker_loop_lazy(); });
+    } else {
+        worker.thread = std::thread([this]() { worker_loop(); });
+    }
 
     constexpr auto max_wait_time = std::chrono::seconds(1);
     auto should_sleep = [&]() -> bool {

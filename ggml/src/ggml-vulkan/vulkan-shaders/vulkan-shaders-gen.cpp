@@ -91,6 +91,12 @@ const std::vector<std::string> type_names = {
     "bf16",
 };
 
+// types the int8 coopmat MMQ reads as exact int8 levels (grid values, trits) rather than through f16
+static bool is_cm1_int8_view(const std::string& t) {
+    return t == "iq2_xxs" || t == "iq2_xs" || t == "iq2_s" || t == "iq3_xxs" || t == "iq3_s" ||
+           t == "tq1_0" || t == "tq2_0" || t == "q2_0" || t == "ptq1_0";
+}
+
 enum MatMulIdType {
     NONE,
     DEFAULT,
@@ -681,13 +687,16 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 #endif
 
         if (!f16acc && coopmat && (tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1" || tname == "q8_0" || tname == "iq4_nl" || tname == "iq4_xs" || tname == "mxfp4"
-                     || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4")) {
+                     || tname == "q3_k" || tname == "q4_k" || tname == "q5_k" || tname == "q6_k" || tname == "nvfp4"
+                     || is_cm1_int8_view(tname))) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}}), fp16, coopmat, coopmat2, f16acc);
             if (matmul_id_type == MatMulIdType::NONE && tname == "q8_0") {
                 // HC_UP_MIX: the qwen4exp hc up GEMM with the gated hc pre in its epilogue (f32 mixed output)
                 string_to_spv(shader_name + "_" + tname + "_q8_1_hcmix", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}, {"HC_EPI", "1"}}), fp16, coopmat, coopmat2, f16acc);
                 // the same with an f16 mixed stream (D16 keeps the f32x4 store helpers out; the epilogue returns before any D16 store)
                 string_to_spv(shader_name + "_" + tname + "_q8_1_hcmix_d16", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"D_TYPE_VEC4", "f16vec4"}, {"D16", "1"}, {"HC_EPI", "1"}}), fp16, coopmat, coopmat2, f16acc);
+                // HC_W8A8: an f16 B quantized to q8_1 blocks in the load
+                string_to_spv(shader_name + "_" + tname + "_f16q", "mul_mmq_cm1.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}, {"D_TYPE_VEC4", "vec4"}, {"B_F16Q", "1"}}), fp16, coopmat, coopmat2, f16acc);
             }
             if (matmul_id_type == MatMulIdType::NONE || matmul_id_type == MatMulIdType::SUBGROUP) {
                 // f16 output for the MUL_MAT(_ID)(+MUL)+CPY(f16) fusions
@@ -901,6 +910,19 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
+        if (tname == "q8_0") {
+            // FN_DECODE_HC: the qwen4exp hc up mat-vec with SCALE + SILU on B and the gated hc pre as the store
+            const std::map<std::string, std::string> hc = {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"HC_MIX", "1"}};
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_hcmix", shader, merge_maps(base_dict, hc));
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_hcmix_subgroup", shader, merge_maps(merge_maps(base_dict, hc), {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_hcmix_subgroup_no_shmem", shader, merge_maps(merge_maps(base_dict, hc), {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            // MUL_MAT_VEC_GLU: B formed as SWIGLU(gate, up) while it is loaded
+            const std::map<std::string, std::string> glu = {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"GLU_B", "1"}};
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_glub", shader, merge_maps(base_dict, glu));
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_glub_subgroup", shader, merge_maps(merge_maps(base_dict, glu), {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f32_glub_subgroup_no_shmem", shader, merge_maps(merge_maps(base_dict, glu), {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
+
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (tname == "mxfp4" || tname == "nvfp4") {
             string_to_spv("mul_mat_vec_" + tname + "_f32_f32_ocp", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"USE_OCP_FP4", "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
@@ -936,6 +958,12 @@ void process_shaders() {
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup", mmvq_shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup_no_shmem", mmvq_shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         }
+        // MOE_GLU_GEMV: decode expert gate + up + SwiGLU in one mat-vec (mul_mat_vecq_glu.comp)
+        if ((is_legacy_quant(tname) && tname != "q2_0") || tname == "q4_k" || tname == "q5_k") {
+            string_to_spv("mul_mat_vec_id_glu_" + tname + "_q8_1_f32", "mul_mat_vecq_glu.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_id_glu_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq_glu.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_id_glu_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq_glu.comp", merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
 #endif
 
         // Dequant shaders
@@ -961,9 +989,13 @@ void process_shaders() {
             string_to_spv("get_rows_" + tname, shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
         }
         string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
+        if (tname == "f32" || tname == "f16" || tname == "bf16") {
+            string_to_spv("get_rows_narrow_" + tname + "_f32", "get_rows_narrow.comp", merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
+        }
     }
 
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
+    string_to_spv("get_rows_narrow_i32", "get_rows_narrow.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
 
     string_to_spv("lightning_indexer_f16", "lightning_indexer_scalar64.comp", {});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -971,6 +1003,11 @@ void process_shaders() {
     string_to_spv("lightning_indexer_cm_small_f16", "lightning_indexer_cm.comp", {{"N_WAVES", "1"}, {"HEADS_PER_TILE", "1"}});
     string_to_spv("gdn_chunk_prep_f32", "gdn_chunk_prep.comp", {});
     string_to_spv("gdn_chunk_scan_f32", "gdn_chunk_scan.comp", {});
+    string_to_spv("gdn_chunk_scan_on_f32", "gdn_chunk_scan.comp", {{"OUT_NORM", "1"}});
+    string_to_spv("gdn_chunk_prep_v4_f32", "gdn_chunk_prep.comp", {{"PREP_V4", "1"}});
+    string_to_spv("gdn_chunk_prep_v4_nokt_f32", "gdn_chunk_prep.comp", {{"PREP_V4", "1"}, {"PREP_NOKT", "1"}});
+    string_to_spv("gdn_chunk_scan_ktg_f32", "gdn_chunk_scan.comp", {{"KT_GATHER", "1"}});
+    string_to_spv("gdn_chunk_scan_on_ktg_f32", "gdn_chunk_scan.comp", {{"OUT_NORM", "1"}, {"KT_GATHER", "1"}});
     // MUL_MAT_ID_PAIR_SWIGLU: q4_K gate + up + SwiGLU, register-direct weights (RDNA3 fragment layout, wave32)
     string_to_spv("mul_mm_id_glu_q4_k_f16", "mul_mm_id_glu.comp", {});
     string_to_spv("mul_mm_id_glu_q4_k_f32", "mul_mm_id_glu.comp", {{"B_F32", "1"}});
@@ -980,9 +1017,54 @@ void process_shaders() {
     string_to_spv("mul_mm_id_glu_q5_k_f32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}});
     string_to_spv("mul_mm_id_glu_q5_k_f16_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"OUT_F32", "1"}});
     string_to_spv("mul_mm_id_glu_q5_k_f32_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}, {"OUT_F32", "1"}});
+    // expert repack buffer: the same eight on the repacked weight order
+    for (const std::string tn : { "q4_k", "q5_k" }) {
+        for (const std::string o : { "", "_o32" }) {
+            for (const std::string b : { "f16", "f32" }) {
+                std::map<std::string, std::string> defs = { { "A_REPACK", "1" } };
+                if (tn == "q5_k") { defs["A_Q5_K"] = "1"; }
+                if (o == "_o32")  { defs["OUT_F32"] = "1"; }
+                if (b == "f32")   { defs["B_F32"] = "1"; }
+                string_to_spv("mul_mm_id_glu_" + tn + "_" + b + o + "_rp", "mul_mm_id_glu.comp", defs);
+            }
+        }
+    }
     // streaming q5_1 MUL_MAT_ID(+MUL)+CPY(f16) down, register-direct weights (RDNA3 fragment layout, wave32)
     string_to_spv("mul_mm_id_down_q5_1_f16", "mul_mm_id_down.comp", {});
     string_to_spv("mul_mm_id_down_q5_1_f32", "mul_mm_id_down.comp", {{"B_F32", "1"}});
+    string_to_spv("mul_mm_id_down_q8_0_f16", "mul_mm_id_down.comp", {{"A_Q8_0", "1"}});   // canonical q8_0 experts, f16 B
+    string_to_spv("mul_mm_id_down_q8_0_f16_t8", "mul_mm_id_down.comp", {{"A_Q8_0", "1"}, {"TPW", "8"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp", "mul_mm_id_down.comp", {{"A_REPACK", "1"}});   // expert repack buffer
+    string_to_spv("mul_mm_id_down_q5_1_f32_rp", "mul_mm_id_down.comp", {{"B_F32", "1"}, {"A_REPACK", "1"}});
+    // GGML_VK_EXPDOWN_V variants of the repacked f16-B down kernel (index = the env value)
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v1", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"KC", "128"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v2", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "2"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v3", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "4"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v4", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"PK16", "1"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v6", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"KC", "128"}, {"PK16", "1"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v7", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "2"}, {"PK16", "1"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v8", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"KC", "128"}, {"TPW", "2"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v9", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "8"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_v10", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"TPW", "16"}});
+    // GGML_VK_EXPDOWN_NOSEL: half-wave A fragments (no selects), repacked q5_1 (one / eight tiles per workgroup) and q8_0
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_h", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"HALF_A", "1"}});
+    string_to_spv("mul_mm_id_down_q5_1_f16_rp_h_t8", "mul_mm_id_down.comp", {{"A_REPACK", "1"}, {"HALF_A", "1"}, {"TPW", "8"}});
+    string_to_spv("mul_mm_id_down_q8_0_f16_h", "mul_mm_id_down.comp", {{"A_Q8_0", "1"}, {"HALF_A", "1"}});
+    string_to_spv("mul_mm_id_down_q8_0_f16_h_t8", "mul_mm_id_down.comp", {{"A_Q8_0", "1"}, {"HALF_A", "1"}, {"TPW", "8"}});
+    // expert repack buffer: the mat-vec MUL_MAT_ID on the repacked order, and the inverse copy for the other readers
+    string_to_spv("mul_mat_vec_id_q4_k_rp_f32", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}});
+    string_to_spv("mul_mat_vec_id_q5_1_rp_f32", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_1", "1"}});
+    string_to_spv("mul_mat_vec_id_q5_k_rp_f32", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_K", "1"}});
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    string_to_spv("mul_mat_vec_id_q4_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}, {"B_Q8_1", "1"}});
+    string_to_spv("mul_mat_vec_id_q5_1_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_1", "1"}, {"B_Q8_1", "1"}});
+    string_to_spv("mul_mat_vec_id_q5_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_K", "1"}, {"B_Q8_1", "1"}});
+    // MOE_GLU_GEMV on repacked experts: gate + up + SwiGLU in one mat-vec
+    string_to_spv("mul_mat_vec_id_glu_q4_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q4_K", "1"}, {"B_Q8_1", "1"}, {"GLU", "1"}});
+    string_to_spv("mul_mat_vec_id_glu_q5_k_rp_q8_1", "mul_mat_vec_id_rp.comp", {{"DATA_A_Q5_K", "1"}, {"B_Q8_1", "1"}, {"GLU", "1"}});
+#endif
+    string_to_spv("expert_unrepack", "expert_unrepack.comp", {});
+    string_to_spv("expert_repack", "expert_repack.comp", {});
     // RDNA3 fragment layout probe (ggml_vk_check_coopmat_rdna3_layout): gates the manual-fragment "_mf" MUL_MAT_ID pipelines
     string_to_spv("coopmat_layout_check", "coopmat_layout_check.comp", {});
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
@@ -990,8 +1072,12 @@ void process_shaders() {
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
     string_to_spv("flash_attn_sel_f16", "flash_attn_sel.comp", {});
     string_to_spv("flash_attn_sel_prep", "flash_attn_sel_prep.comp", {});
+    string_to_spv("flash_attn_sel_prep_sg", "flash_attn_sel_prep.comp", {{"PREP_SG", "1"}});
+    string_to_spv("flash_attn_sel_prep2", "flash_attn_sel_prep2.comp", {});
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("flash_attn_sel_cm_f16", "flash_attn_sel_cm.comp", {});
+    // attention output gate in the store (FA_OUT_GATE on the selected-key path)
+    string_to_spv("flash_attn_sel_cm_gate_f16", "flash_attn_sel_cm.comp", {{"OUT_GATE", "1"}});
 #endif
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("flash_attn_top_k_cm_f16", "flash_attn_top_k_cm.comp", {});
@@ -1103,6 +1189,7 @@ void process_shaders() {
 
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
+    string_to_spv("fa_split_k_reduce_gate", "flash_attn_split_k_reduce.comp", {{"OUT_GATE", "1"}});
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
 
@@ -1279,8 +1366,13 @@ void process_shaders() {
     string_to_spv("topk_nary_search_f32", "topk_nary_search.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_radix_select_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}});
     string_to_spv("qsa_expand", "qsa_expand.comp", {});
+    string_to_spv("topk_radix_lds_f32", "topk_radix_lds.comp", {});
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
+    string_to_spv("decode_prefetch", "decode_prefetch.comp", {});
+    string_to_spv("decode_prefetch_q", "decode_prefetch_q.comp", {});
+    string_to_spv("argmax_part_f32", "argmax_split.comp", {});
+    string_to_spv("argmax_reduce_f32", "argmax_split.comp", {{"REDUCE", "1"}});
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("sum_f32", "sum.comp", {});
     string_to_spv("cross_entropy_loss_f32", "cross_entropy_loss.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1289,6 +1381,8 @@ void process_shaders() {
     string_to_spv("fwht_shmem_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
+    string_to_spv("dsv4_hc_mix_f32", "dsv4_hc_mix.comp", {});
+    string_to_spv("dsv4_hc_boundary_f32", "dsv4_hc_boundary.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_pre_x_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}});
     string_to_spv("dsv4_hc_pre_x_f16_g_f16", "dsv4_hc_pre.comp", {{"X_F16", "1"}, {"G_F16", "1"}});
@@ -1297,6 +1391,17 @@ void process_shaders() {
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("dsv4_hc_post_norm_f32", "dsv4_hc_post_norm.comp", {});
     string_to_spv("dsv4_hc_post_norm_f16", "dsv4_hc_post_norm.comp", {{"OUT_F16", "1"}});
+    string_to_spv("dsv4_hc_post_norm_add_f32", "dsv4_hc_post_norm.comp", {{"X_ADD", "1"}});
+    string_to_spv("dsv4_hc_post_norm_inj_f16", "dsv4_hc_post_norm_inj.comp", {});
+    string_to_spv("dsv4_hc_moe_post_norm_s16_f32", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s16_f16", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}, {"OUT_F16", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s16_inj", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}, {"OUT_F16", "1"}, {"INJ", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s32_f32", "dsv4_hc_moe_post_norm.comp", {});
+    string_to_spv("dsv4_hc_moe_post_norm_s32_f16", "dsv4_hc_moe_post_norm.comp", {{"OUT_F16", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s32_inj", "dsv4_hc_moe_post_norm.comp", {{"OUT_F16", "1"}, {"INJ", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s16_inj_defer", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}, {"OUT_F16", "1"}, {"INJ", "1"}, {"DEFER", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s32_inj_defer", "dsv4_hc_moe_post_norm.comp", {{"OUT_F16", "1"}, {"INJ", "1"}, {"DEFER", "1"}});
+    string_to_spv("dsv4_hc_res16_widen", "dsv4_hc_res16_widen.comp", {});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1383,6 +1488,10 @@ void process_shaders() {
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp), f32 and f16 output
     string_to_spv("matmul_dq8_q8_0_f16", "mul_mm_dq8.comp", {}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_d16", "mul_mm_dq8.comp", {{"D_F16", "1"}}, true, true, false);
+    // head-major f32 D for 128-row heads (the qwen4exp GDN z read by the scan's output norm, GGML_VK_GDN_ZHM)
+    string_to_spv("matmul_dq8_q8_0_f16_hm", "mul_mm_dq8.comp", {{"D_HM", "1"}}, true, true, false);
+    // the same GEMM with an f32 A rounded to f16 on the LDS store (the qwen4exp MoE router, GGML_VK_ROUTER_F16H)
+    string_to_spv("matmul_dq8_f32_f16", "mul_mm_dq8.comp", {{"A_F32", "1"}}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_hcmix", "mul_mm_dq8.comp", {{"HC_EPI", "1"}}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_hcmix_d16", "mul_mm_dq8.comp", {{"HC_EPI", "1"}, {"D_F16", "1"}}, true, true, false);
 #endif
@@ -1430,6 +1539,8 @@ void process_shaders() {
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
+    string_to_spv("ple_conv_f32", "ple_conv.comp", {{"W_TYPE", "float"}});
+    string_to_spv("ple_conv_f16", "ple_conv.comp", {{"W_TYPE", "float16_t"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 

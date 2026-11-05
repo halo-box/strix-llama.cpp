@@ -1182,7 +1182,7 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
 }
 
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
-static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
+static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split, bool use_extra_bufts) {
     buft_list_t buft_list;
 
     // add the device split buffer type if requested and available
@@ -1209,12 +1209,10 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         }
     }
 
-    // add the device default buffer type
-    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
-
-    // add the device extra buffer type (if any)
+    // add the device extra buffer types (if any) before the default one, as for the CPU: an extra buffer type takes only the
+    // tensors its supports_op accepts (e.g. the Vulkan expert repack buffer), the rest fall through to the default
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    if (reg) {
+    if (reg && use_extra_bufts) {
         auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
 
@@ -1226,6 +1224,9 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
             }
         }
     }
+
+    // add the device default buffer type
+    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
 
     return buft_list;
 }
@@ -1261,6 +1262,7 @@ struct llama_model::impl {
     };
 
     layer_dev dev_input = {};
+    layer_dev dev_input_tok_embd = {}; // token_embd only, see load_tensors
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
@@ -1610,7 +1612,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
-        buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
+        // the only GPU extra buffer type, the Vulkan expert repack buffer, holds expert weights whose prefill readers are the
+        // f16 MoE chain's fused GEMMs (every other prefill MUL_MAT_ID would copy the whole expert tensor back per call), so it
+        // is offered only to the archs that build that chain
+        buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split, params.use_extra_bufts && llm_arch_moe_f16(arch));
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
@@ -1676,6 +1681,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->dev_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
+    }
+
+    // on an integrated GPU with all layers offloaded, token_embd (only it) goes to layer 0's device: the CPU get_rows
+    // costs a graph split and an F32 copy per ubatch (7.5 ms at 8192 tokens, gfx1151) for a weight in the same memory
+    pimpl->dev_input_tok_embd = pimpl->dev_input;
+    {
+        static const bool tok_embd_igpu = [] { const char * e = getenv("LLAMA_TOK_EMBD_IGPU"); return e == nullptr || atoi(e) != 0; }();
+        const bool all_offloaded = n_layer_all > 0 && i_gpu_start == 0 && act_gpu_layers == n_layer_all + 1;
+        if (tok_embd_igpu && all_offloaded && pimpl->dev_layer[0].dev != cpu_dev &&
+                ggml_backend_dev_type(pimpl->dev_layer[0].dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            pimpl->dev_input_tok_embd = pimpl->dev_layer[0];
+            LLAMA_LOG_INFO("%s: token_embd assigned to device %s (integrated GPU, all layers offloaded; LLAMA_TOK_EMBD_IGPU=0 keeps it on the CPU)\n",
+                    __func__, ggml_backend_dev_name(pimpl->dev_layer[0].dev));
+        }
     }
 
     // assign the output layer
@@ -2371,8 +2390,11 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
     }
+    // a tied output (TENSOR_DUPLICATED) is placed as the output
+    const buft_list_t * buft_list_input = tn.tensor == LLM_TENSOR_TOKEN_EMBD && tn.bid == -1 && !(flags & llama_model_loader::TENSOR_DUPLICATED)
+        ? pimpl->dev_input_tok_embd.buft_list : pimpl->dev_input.buft_list;
     return ml.create_tensor(
-        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        hparams, &pimpl->cpu_buft_list, buft_list_input, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
 }
 

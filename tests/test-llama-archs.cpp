@@ -96,6 +96,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on CPU (requires LLAMA_QSA_INCREMENTAL=1)\n");
+    LOG("  --decode-chain           Test one-token-ahead decode chaining on the first GPU device (or -b)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -1218,6 +1219,253 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     return all_ok ? 0 : 1;
 }
 
+// --decode-chain: one-token-ahead decode chaining (llama_decode_chain) on a GPU device. Per arch, a greedy backend-sampled
+// generation must give the same ids chained and unchained, or chaining must refuse (the first llama_decode_chain returns -1).
+// A chained decode is recorded before its token is known, so an input that reads the token ids without being rewritten
+// later shows up here as different ids. For the plain llama arch also two error paths: a chained decode that fails (no
+// KV slot) must leave the context on its own scheduler (first step) or on the decode still in flight (later step).
+struct chain_run {
+    std::vector<llama_token> ids;
+    bool chained = false;
+};
+
+static llama_context_ptr chain_make_ctx(llama_model * model, uint32_t n_ctx) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = n_ctx;
+    cp.n_threads = 4;
+    cp.n_threads_batch = 4;
+    cp.n_ubatch = 64;
+    llama_context_ptr ctx(llama_init_from_model(model, cp));
+    if (!ctx) {
+        throw std::runtime_error("failed to create llama context");
+    }
+    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+    if (!llama_set_sampler(ctx.get(), 0, smpl)) {
+        throw std::runtime_error("the greedy sampler cannot run on the backend");
+    }
+    return ctx;
+}
+
+static void chain_prompt(llama_context * ctx, const std::vector<llama_token> & prompt) {
+    common_batch batch(ctx);
+    for (size_t i = 0; i < prompt.size(); i++) {
+        batch.add(prompt[i], (llama_pos) i, 0, i + 1 == prompt.size());
+    }
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        throw std::runtime_error("failed to decode the prompt");
+    }
+}
+
+// n_gen ids after the prompt: chained through llama_decode_chain when `chain`, else one ordinary decode per token
+static chain_run chain_generate(llama_context * ctx, const std::vector<llama_token> & prompt, int n_gen, bool chain) {
+    chain_run r;
+    chain_prompt(ctx, prompt);
+    llama_pos pos = (llama_pos) prompt.size();
+    common_batch batch(ctx);
+    llama_token tok = LLAMA_TOKEN_NULL;
+    r.chained = chain;
+    for (int i = 1; i < n_gen; i++) {
+        int ret = r.chained ? llama_decode_chain(ctx, 0, &tok) : -1;
+        if (ret == -1) {
+            if (r.chained && i > 1) {
+                throw std::runtime_error("decode chaining stopped in flight");
+            }
+            r.chained = false;
+            llama_synchronize(ctx);
+            tok = llama_get_sampled_token_ith(ctx, -1);
+            batch.clear();
+            batch.add(tok, pos, 0, true);
+            ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        }
+        if (ret != 0) {
+            throw std::runtime_error("failed to decode a generated token");
+        }
+        pos++;
+        r.ids.push_back(tok);
+    }
+    if (r.chained) {
+        if (llama_decode_chain_end(ctx, 0, &tok) != 0) {
+            throw std::runtime_error("llama_decode_chain_end failed");
+        }
+    } else {
+        llama_synchronize(ctx);
+        tok = llama_get_sampled_token_ith(ctx, -1);
+    }
+    r.ids.push_back(tok);
+    return r;
+}
+
+// error paths on a context of n_ctx cells: returns an empty string or what failed
+static std::string chain_error_paths(llama_model * model, uint32_t n_ctx, size_t seed) {
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    // reference: the ids sampled after positions n_ctx - 3, n_ctx - 2, n_ctx - 1
+    const std::vector<llama_token> prompt = get_tokens(n_ctx - 2, n_vocab, seed + 7);
+    std::vector<llama_token> ref;
+    {
+        llama_context_ptr ctx = chain_make_ctx(model, n_ctx);
+        ref = chain_generate(ctx.get(), prompt, 3, false).ids;
+    }
+    {
+        // a later step fails: the third chained decode finds no KV cell; the second, still in flight, samples ref[2]
+        llama_context_ptr ctx = chain_make_ctx(model, n_ctx);
+        chain_prompt(ctx.get(), prompt);
+        llama_token tok = LLAMA_TOKEN_NULL;
+        if (llama_decode_chain(ctx.get(), 0, &tok) != 0 || tok != ref[0]) {
+            return "chained step 1";
+        }
+        if (llama_decode_chain(ctx.get(), 0, &tok) != 0 || tok != ref[1]) {
+            return "chained step 2";
+        }
+        if (llama_decode_chain(ctx.get(), 0, &tok) == 0) {
+            return "chained step 3 did not fail on a full cache";
+        }
+        if (llama_decode_chain_end(ctx.get(), 0, &tok) != 0 || tok != ref[2]) {
+            return "after a failed later step: decode_chain_end returned token " + std::to_string(tok) + ", want " + std::to_string(ref[2]);
+        }
+        if (llama_decode_chain_slot(ctx.get()) != 0) {
+            return "after a failed later step: the context runs on chain slot " + std::to_string(llama_decode_chain_slot(ctx.get()));
+        }
+    }
+    {
+        // the first step fails: the prompt fills every cell
+        std::vector<llama_token> full = prompt;
+        full.push_back(ref[0]);
+        full.push_back(ref[1]);
+        llama_context_ptr ctx = chain_make_ctx(model, n_ctx);
+        chain_prompt(ctx.get(), full);
+        llama_token tok = LLAMA_TOKEN_NULL;
+        if (llama_decode_chain(ctx.get(), 0, &tok) == 0) {
+            return "chained step 1 did not fail on a full cache";
+        }
+        if (llama_decode_chain_slot(ctx.get()) != 0) {
+            return "after a failed first step: the context runs on chain slot " + std::to_string(llama_decode_chain_slot(ctx.get()));
+        }
+        // ordinary decodes go on from there: drop the last cell and decode ref[1] again, which samples ref[2]
+        llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, n_ctx - 1, -1);
+        common_batch batch(ctx.get());
+        batch.add(ref[1], n_ctx - 1, 0, true);
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            return "ordinary decode after a failed first step";
+        }
+        llama_synchronize(ctx.get());
+        if (llama_get_sampled_token_ith(ctx.get(), -1) != ref[2]) {
+            return "ordinary decode after a failed first step sampled a different token";
+        }
+    }
+    return "";
+}
+
+static int test_decode_chain(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
+    struct user_data_t {
+        ggml_log_callback callback;
+        void * user_data;
+        int verbosity;
+    } ud;
+    llama_log_get(&ud.callback, &ud.user_data);
+    ud.verbosity = verbosity;
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * u = (const user_data_t *) user_data;
+        // the refusal reasons are WARN lines: keep them visible
+        if (common_log_get_verbosity(level) <= u->verbosity || (level == GGML_LOG_LEVEL_WARN && strstr(text, "decode chaining") != nullptr)) {
+            u->callback(level, text, u->user_data);
+        }
+    }, &ud);
+
+    ggml_backend_dev_t dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                (target_backend == nullptr || strcmp(target_backend, ggml_backend_dev_name(d)) == 0)) {
+            dev = d;
+            break;
+        }
+    }
+    if (dev == nullptr) {
+        LOG("decode chain: no GPU device, SKIP\n");
+        return 0;
+    }
+
+    const int n_gen = 12;
+    size_t n_ok = 0, n_failed = 0, n_chained = 0;
+    for (const llm_arch & arch : llm_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch)) {
+            continue;
+        }
+        // gemma4 and granite-switch are skipped by the logits test for fixture reasons, not because they cannot load:
+        // they are the archs whose extra token inputs chaining must refuse, so they are tried here
+        const bool tried = arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GRANITE_SWITCH;
+        if (!tried && !arch_supported(arch)) {
+            continue;
+        }
+        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT || arch == LLM_ARCH_T5 ||
+                arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1) {
+            continue;
+        }
+        for (bool moe : {false, true}) {
+            if ((moe && !moe_implemented(arch)) || (!moe && moe_mandatory(arch))) {
+                continue;
+            }
+            std::string status;
+            bool ok = true;
+            try {
+                gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+                if (arch == LLM_ARCH_BAILINGMOE3) {
+                    GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
+                }
+                auto mc = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, { dev });
+                llama_model * model = mc.first.get();
+                mc.second.reset();
+                const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+                const std::vector<llama_token> prompt = get_tokens(16, n_vocab, seed);
+                chain_run plain, chained;
+                {
+                    llama_context_ptr ctx = chain_make_ctx(model, 0);
+                    plain = chain_generate(ctx.get(), prompt, n_gen, false);
+                }
+                {
+                    llama_context_ptr ctx = chain_make_ctx(model, 0);
+                    chained = chain_generate(ctx.get(), prompt, n_gen, true);
+                }
+                if (!chained.chained) {
+                    status = "OK (chaining refused)";
+                } else if (chained.ids != plain.ids) {
+                    ok = false;
+                    size_t at = 0;
+                    while (at < plain.ids.size() && plain.ids[at] == chained.ids[at]) {
+                        at++;
+                    }
+                    status = "FAIL (chained ids differ from token " + std::to_string(at) + ")";
+                } else {
+                    n_chained++;
+                    status = "OK (chained, same ids)";
+                    if (arch == LLM_ARCH_LLAMA && !moe) {
+                        const std::string err = chain_error_paths(model, 256, seed);
+                        if (!err.empty()) {
+                            ok = false;
+                            status = "FAIL (error path: " + err + ")";
+                        } else {
+                            status += ", error paths OK";
+                        }
+                    }
+                }
+            } catch (const std::exception & e) {
+                if (tried) {
+                    status = std::string("SKIP (") + e.what() + ")";
+                } else {
+                    ok = false;
+                    status = std::string("FAIL (") + e.what() + ")";
+                }
+            }
+            LOG("decode chain: %-16s %-5s %s\n", llm_arch_name(arch), moe ? "MoE" : "Dense", status.c_str());
+            (ok ? n_ok : n_failed)++;
+        }
+    }
+    llama_log_set(ud.callback, ud.user_data);
+    LOG("decode chain: %zu/%zu OK, %zu chained, %zu failed\n", n_ok, n_ok + n_failed, n_chained, n_failed);
+    return n_failed == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -1232,6 +1480,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool mtp_cache_only = false;
+    bool decode_chain = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1260,6 +1509,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--mtp-cache-only") == 0) {
             mtp_cache_only = true;
+        } else if (strcmp(argv[i], "--decode-chain") == 0) {
+            decode_chain = true;
         } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--seed") == 0) {
             if (i + 1 < argc) {
                 seed = std::stoull(argv[++i]);
@@ -1316,6 +1567,9 @@ int main(int argc, char ** argv) {
     try {
         if (mtp_cache_only) {
             return test_mtp_cache_only(seed, stdev);
+        }
+        if (decode_chain) {
+            return test_decode_chain(arch_filter, seed, stdev, verbosity, target_backend);
         }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);

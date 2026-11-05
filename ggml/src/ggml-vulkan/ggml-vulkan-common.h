@@ -10,6 +10,8 @@ extern ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface;
 extern bool vk_memory_logger_enabled;
 extern bool vk_perf_logger_enabled;
 extern bool vk_perf_logger_concurrent;
+extern bool vk_perf_logger_seq;
+extern bool vk_perf_logger_seq_shapes;   // GGML_VK_PERF_LOGGER_SEQ=2: PFSEQ lines add each node's shape
 extern bool vk_enable_sync_logger;
 extern uint32_t vk_perf_logger_frequency;
 extern std::string vk_pipeline_stats_filter;
@@ -110,7 +112,10 @@ bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx)
 void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx);
 
 // flash-attn
-void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst);
+// out_gate / out_gate_dst: apply sigmoid(out_gate) in the store and write out_gate_dst instead of dst, where the kernel
+// supports it (*out_gate_done is then set); otherwise dst is written as usual and the caller applies the gate
+void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst,
+                        const ggml_tensor * out_gate = nullptr, ggml_tensor * out_gate_dst = nullptr, bool * out_gate_done = nullptr);
 
 // operators
 void ggml_vk_cpy_to_contiguous(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline pipeline, const ggml_tensor * tensor, const vk_subbuffer & in, const vk_subbuffer & out);

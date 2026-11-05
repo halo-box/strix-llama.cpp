@@ -6,6 +6,8 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <array>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -88,8 +90,24 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // recurrent state snapshot (llama_rs_snapshot_arm): copy the conv history that ends right before the snapshot
+    // token into snap; conv_input: (state_cols + n_seq_tokens, channels, n_seqs). No-op without a snapshot
+    void build_conv_snapshot(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        conv_input,
+            ggml_tensor *        snap,
+            int64_t              state_cols);
+
+    // tokens [t0, t1) of a (d0, d1, n_seq_tokens, n_seqs) delta-net input; an l2 norm (build_gdn_l2_norm) is applied
+    // again to the slice of its input, so backends that fold it into the scan still find it
+    ggml_tensor * slice_tokens(ggml_tensor * x, int64_t t0, int64_t t1);
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+    // with a recurrent state snapshot in the ubatch the scan is split at the snapshot token and the state there is
+    // copied to the snapshot; the two outputs are concatenated, or with parts != nullptr returned there (and nullptr
+    // returned), so a caller can avoid the copy. A caller that splits its conv at the snapshot token too passes q, k, v
+    // of the first snap_t tokens only and builds the rest in part1_qkv, which is called after the first scan is in the graph
     ggml_tensor * build_recurrent_attn(
             llm_graph_input_rs * inp,
             ggml_tensor *        ssm_states_all,
@@ -99,7 +117,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
-            int                  il);
+            int                  il,
+            std::pair<ggml_tensor *, ggml_tensor *> * parts = nullptr,
+            const std::function<std::array<ggml_tensor *, 3>()> & part1_qkv = nullptr);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -2563,6 +2583,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     // counted as created but never allocated, mapped or read, and build_ple takes its
     // rows from this reader instead of ggml_get_rows.
     std::shared_ptr<llama_ple_disk> ple_disk;
+    // the type host-gathered PLE rows reach the graph in (qwen4exp_ple_input_type), decided once per model
+    mutable std::once_flag ple_in_once;
+    mutable ggml_type      ple_in_type = GGML_TYPE_F32;
     // a bf16 matmul weight left after load keeps the hc mixed stream f32; counted once, on the first graph
     mutable std::once_flag bf16_mm_once;
     mutable bool           bf16_mm = false;
@@ -2670,12 +2693,22 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * gate,
                             int   layer);
 
+        // build_norm_gated of a scan split at a recurrent state snapshot: the two outputs are normed straight into
+        // the f16 destination instead of being concatenated first
+        ggml_tensor * build_norm_gated_parts(
+                    ggml_tensor * out0,
+                    ggml_tensor * out1,
+                    ggml_tensor * weights,
+                    ggml_tensor * gate,
+                            int   layer);
+
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
-        // padded f16 destinations (LLAMA_HC_XN_PAD / LLAMA_GDN_NORM_PAD), one per graph: graph leaves are allocated before the
+        // padded f16 destinations (LLAMA_HC_XN_PAD / LLAMA_HC_MIX_PAD / LLAMA_GDN_NORM_PAD), one per graph: graph leaves are allocated before the
         // first node, so per-layer buffers would all stay resident (2.8 GB of Flash-Next's 5.3 GB compute buffer at ub 2048)
         ggml_tensor * hc_xn_pad_buf    = nullptr;
+        ggml_tensor * hc_mix_pad_buf   = nullptr;
         ggml_tensor * gdn_norm_pad_buf = nullptr;
         ggml_tensor * pad_buf(ggml_tensor ** slot, int64_t ne0, int64_t ne1, const char * name);
 
@@ -2686,6 +2719,29 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
+                            int   il);
+
+        // the delta-net conv history split at the snapshot token t (LLAMA_GDN_CONV_SPLIT): returns the concat over tokens
+        // [0, t), which has the same form as an unsplit one; the history at t is a contiguous [state_cols, C, 1] copy
+        // (also written to the snapshot), and build_conv_tail_at concatenates it with tokens [t, n) and writes the new tail
+        ggml_tensor * build_conv_state_split(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                        int64_t   t,
+                    ggml_tensor ** hist,
+                            int   il);
+
+        ggml_tensor * build_conv_tail_at(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                    ggml_tensor * hist,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                        int64_t   t,
                             int   il);
 
         ggml_tensor * build_inp_ple(

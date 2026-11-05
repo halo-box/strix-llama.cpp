@@ -71,7 +71,7 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
         return ggml_cuda_conv_reject("gdn_conv", "check 3", i);
     }
     int64_t C = 0, T = 0, S = 0;
-    const ggml_tensor * x = ggml_cuda_conv_activation_seqs(tr, C, T, S);
+    const ggml_tensor * x = ggml_cuda_conv_activation_seqs(tr, C, T, S, /*prefix_ok=*/true);
     if (!x) {
         return ggml_cuda_conv_reject("gdn_conv", "check 4", i);
     }
@@ -167,4 +167,8 @@ void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_
     gdn_conv_direct_kernel<TT><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
         (const float *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_gdn_conv_note(const char * path, int64_t T) {
+    ggml_cuda_conv_engaged("gdn_conv", path, T);
 }

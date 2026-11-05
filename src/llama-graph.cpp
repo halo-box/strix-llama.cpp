@@ -73,6 +73,25 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+
+        if (chain_tab) {
+            // decode chaining: the rows of the host token table, converted as the CPU GET_ROWS converts them
+            GGML_ASSERT(embd && chain_tab->ne[0] <= n_embd && chain_tab->data);
+            const auto * traits = ggml_get_type_traits(chain_tab->type);
+            std::vector<float> rows((size_t) n_embd * n_tokens, 0.0f);
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                const llama_token t = ubatch->token[i];
+                GGML_ASSERT(t >= 0 && t < chain_tab->ne[1]);
+                const char * src = (const char *) chain_tab->data + (size_t) t * chain_tab->nb[1];
+                if (chain_tab->type == GGML_TYPE_F32) {
+                    memcpy(rows.data() + (size_t) i * n_embd, src, chain_tab->ne[0] * sizeof(float));
+                } else {
+                    GGML_ASSERT(traits->to_float);
+                    traits->to_float(src, rows.data() + (size_t) i * n_embd, chain_tab->ne[0]);
+                }
+            }
+            ggml_backend_tensor_set(embd, rows.data(), 0, rows.size()*sizeof(float));
+        }
     }
 
     if (ubatch->embd && embd && !ubatch->is_mixed()) {
@@ -439,6 +458,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= snap_t == mctx->get_snap_t();
+    res &= snap_s == mctx->get_snap_s();
 
     res &= s_copy_main_identity == mctx->is_s_copy_main_identity(params.ubatch.n_seqs);
 
@@ -1247,6 +1268,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snap_t == mctx->get_recr()->get_snap_t();
+    res &= inp_rs->snap_s == mctx->get_recr()->get_snap_s();
 
     res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
 
@@ -1296,6 +1319,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snap_t == mctx->get_recr()->get_snap_t();
+    res &= inp_rs->snap_s == mctx->get_recr()->get_snap_s();
 
     res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
 
@@ -1387,6 +1412,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snap_t == mctx->get_recr()->get_snap_t();
+    res &= inp_rs->snap_s == mctx->get_recr()->get_snap_s();
 
     res &= inp_rs->s_copy_main_identity == mctx->get_recr()->is_s_copy_main_identity(params.ubatch.n_seqs);
 
@@ -1483,6 +1510,14 @@ void llm_graph_result::reset() {
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     for (auto & input : inputs) {
         input->set_input(ubatch);
+    }
+}
+
+void llm_graph_result::set_inputs(const llama_ubatch * ubatch, int token_dep) {
+    for (auto & input : inputs) {
+        if ((int) input->token_dependent() == token_dep) {
+            input->set_input(ubatch);
+        }
     }
 }
 
@@ -1631,6 +1666,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     mtp_draft        (params.mtp_draft),
     prefetch         (params.prefetch),
+    chain            (params.chain),
     cb_func          (params.cb),
     res              (params.res),
     vsub             (params.vsub),
@@ -2410,7 +2446,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
-    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    // a row-padded input (qwen4exp LLAMA_HC_MIX_PAD) is viewed through its row stride, not reshaped
+    cur = ggml_is_contiguous(cur) ? ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens)
+                                  : ggml_view_3d(ctx0, cur, n_embd, 1, n_tokens, cur->nb[1], cur->nb[1], 0);
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2424,8 +2462,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // f16 expert activations at prefill (fused_moe_f16): casts right after the GEMMs, f16 GLU and down B, f32 combine. Plain
     // SwiGLU only, and only QWEN4EXP, the one arch with a PPL/KLD check of the f16 chain
-    // qwen35moe: KLD 0.003924 vs ubatch floor 0.004012 (Qwen3.6-35B-A3B UD-Q4_K_XL, wiki 2 x 4096), pp2048 +6.8% / +5.9% d0 / 8k (gfx1151 RADV, ABBA n=2, 2026-10-18)
-    const bool moe_f16_arch = arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35MOE;
+    const bool moe_f16_arch = llm_arch_moe_f16(arch);
     const bool moe_f16 = cparams.fused_moe_f16 && moe_f16_arch && il >= 0 && n_tokens >= 32 &&
         type_op == LLM_FFN_SILU && gate_exps && !gate_up_exps && !weight_before_ffn &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
@@ -2686,6 +2723,16 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
 }
 
 // input embeddings with optional lora
+
+void llm_graph_context::chain_input_to_device(ggml_tensor * input) const {
+    if (sched && ggml_backend_sched_get_n_backends(sched) > 1) {
+        ggml_backend_t dev = ggml_backend_sched_get_backend(sched, 0);
+        if (ggml_backend_dev_type(ggml_backend_get_device(dev)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_backend_sched_set_tensor_backend(sched, input, dev);
+        }
+    }
+}
+
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
@@ -2790,6 +2837,17 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // vector embeddings path (ubatch.embd != nullptr)
     inps[1] = embd1;
 
+    // decode chaining: the token rows arrive through the embd input (gathered on the host after the graph is
+    // recorded), then take the token path's transforms. LoRA on the token table needs the ids in the graph.
+    const bool chain_tok = chain && ubatch.token && !ubatch.is_mixed();
+    if (chain_tok) {
+        GGML_ASSERT(loras->empty() && "decode chaining does not support LoRA adapters");
+        GGML_ASSERT(tok_embd->ne[0] == n_embd && n_embd_inp == n_embd && "decode chaining: token rows must be the input width");
+        inp->chain_tab = tok_embd;
+        chain_input_to_device(inp->embd);
+        inps[1] = build_tok(embd1, nullptr);
+    }
+
     assert(ggml_are_same_shape (inps[0], inps[1]));
     assert(ggml_are_same_stride(inps[0], inps[1]));
 
@@ -2810,7 +2868,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         assert(ggml_are_same_stride(inps[0], inps[2]));
     }
 
-    const int idx = ubatch.is_mixed() ? 2 : ubatch.token ? 0 : 1;
+    const int idx = ubatch.is_mixed() ? 2 : (ubatch.token && !chain_tok) ? 0 : 1;
 
     ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), has_mixed ? 3 : 2, idx);
 
@@ -2838,6 +2896,9 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         inp->scale_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
         cb(inp->scale_rows, "inp_scale_rows", -1);
         ggml_set_input(inp->scale_rows);
+        if (chain_tok) {
+            chain_input_to_device(inp->scale_rows);
+        }
 
         if (!ggml_is_contiguous(cur)) {
             cur = ggml_cont(ctx0, cur);
@@ -4000,6 +4061,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->snap_t = mctx_cur->get_snap_t();
+    inp->snap_s = mctx_cur->get_snap_s();
     inp->s_copy_main_identity = mctx_cur->is_s_copy_main_identity(n_seqs);
 
     return inp;

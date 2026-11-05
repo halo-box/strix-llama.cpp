@@ -1,0 +1,254 @@
+#version 450
+
+// MOE_GLU_GEMV: the decode MUL_MAT_ID mat-vec of an expert's gate and up projections plus their SwiGLU in one dispatch.
+// Binding 0 holds the gate experts, binding 6 the up experts (same type and layout); the q8_1 activations (binding 1) are
+// read once for both. Each workgroup computes NUM_ROWS rows of both projections for one (token, slot): per k step the
+// weight words of all 2 x NUM_ROWS rows are loaded before the first dot product. Every row's dot products, their order
+// and the reduction are those of mul_mat_vecq.comp, so gate and up are bit-identical to the two MUL_MAT_ID dispatches,
+// and silu(g) * u is the expression of swiglu.comp.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+#define MMQ
+#define B_TYPE block_q8_1_x4
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+#if defined(DATA_A_QUANT_K)
+#define K_PER_ITER 16
+#elif defined(DATA_A_QUANT_LEGACY)
+#define K_PER_ITER 8
+#else
+#error unimplemented
+#endif
+
+layout (binding = 6) readonly buffer AU {A_TYPE data_a_up[];};
+#if defined(A_TYPE_PACKED16)
+layout (binding = 6) readonly buffer AU_PACKED16 {A_TYPE_PACKED16 data_a_up_packed16[];};
+#endif
+#if defined(A_TYPE_PACKED32)
+layout (binding = 6) readonly buffer AU_PACKED32 {A_TYPE_PACKED32 data_a_up_packed32[];};
+#endif
+
+uint a_offset, b_offset, d_offset;
+
+int32_t cache_b_qs[K_PER_ITER / 4];
+vec2 cache_b_ds;
+
+// gate: the functions as mul_mat_vecq.comp has them
+#include "mul_mat_vecq_funcs.glsl"
+
+// up: the same functions over binding 6
+#define data_a data_a_up
+#define data_a_packed16 data_a_up_packed16
+#define data_a_packed32 data_a_up_packed32
+#define get_dm get_dm_up
+#define get_dm2 get_dm2_up
+#define get_dm_scale get_dm_scale_up
+#define repack repack_up
+#define repack4 repack4_up
+#define mul_q8_1 mul_q8_1_up
+#define mmvq_dot_product mmvq_dot_product_up
+#include "mul_mat_vecq_funcs.glsl"
+#undef data_a
+#undef data_a_packed16
+#undef data_a_packed32
+#undef get_dm
+#undef get_dm2
+#undef get_dm_scale
+#undef repack
+#undef repack4
+#undef mul_q8_1
+#undef mmvq_dot_product
+
+void load_b(const uint col, const uint b_qs_idx) {
+    const uint b_block_idx = col / QUANT_K_Q8_1 + b_offset;
+    const uint b_block_idx_outer = b_block_idx / 4;
+    const uint b_block_idx_inner = b_block_idx % 4;
+    cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
+
+#if QUANT_R == 2
+    cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
+    cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
+#else
+#if K_PER_ITER == 8
+    cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 2];
+    cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 2 + 1];
+#elif K_PER_ITER == 16
+    cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4    ];
+    cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + 1];
+    cache_b_qs[2] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + 2];
+    cache_b_qs[3] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx * 4 + 3];
+#else
+#error unimplemented
+#endif
+#endif
+}
+
+void iter(inout FLOAT_TYPE tg[NUM_ROWS], inout FLOAT_TYPE tu[NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
+    load_b(col, b_qs_idx);
+
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+    // every weight word of the 2 x num_rows rows first, then the products in mul_mat_vecq.comp's per-row form
+    i32vec4 qg[NUM_ROWS], qu[NUM_ROWS];
+    vec2 sg[NUM_ROWS], su[NUM_ROWS];
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+        ibi += p.ncols;
+        qg[n] = repack4(a_block_idx, b_qs_idx * 4);
+        sg[n] = get_dm_scale(a_block_idx, b_qs_idx * 4);
+        qu[n] = repack4_up(a_block_idx, b_qs_idx * 4);
+        su[n] = get_dm_scale_up(a_block_idx, b_qs_idx * 4);
+    }
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        int32_t q_sum = 0;
+        q_sum += dotPacked4x8EXT(qg[n].x, cache_b_qs[0]);
+        q_sum += dotPacked4x8EXT(qg[n].y, cache_b_qs[1]);
+        q_sum += dotPacked4x8EXT(qg[n].z, cache_b_qs[2]);
+        q_sum += dotPacked4x8EXT(qg[n].w, cache_b_qs[3]);
+        tg[n] += FLOAT_TYPE(float(cache_b_ds.x) * float(sg[n].x) * float(q_sum) - float(sg[n].y) * float(cache_b_ds.y / 2));
+        q_sum = 0;
+        q_sum += dotPacked4x8EXT(qu[n].x, cache_b_qs[0]);
+        q_sum += dotPacked4x8EXT(qu[n].y, cache_b_qs[1]);
+        q_sum += dotPacked4x8EXT(qu[n].z, cache_b_qs[2]);
+        q_sum += dotPacked4x8EXT(qu[n].w, cache_b_qs[3]);
+        tu[n] += FLOAT_TYPE(float(cache_b_ds.x) * float(su[n].x) * float(q_sum) - float(su[n].y) * float(cache_b_ds.y / 2));
+    }
+#else
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+        ibi += p.ncols;
+        tg[n] += mmvq_dot_product(a_block_idx, b_qs_idx);
+        tu[n] += mmvq_dot_product_up(a_block_idx, b_qs_idx);
+    }
+#endif
+}
+
+float glu_op(float a, float b) {
+    return a / (1.0f + exp(-a)) * b;
+}
+
+#if !defined(USE_SUBGROUP_ADD_NO_SHMEM)
+shared FLOAT_TYPE tmpsh_g[NUM_ROWS][BLOCK_SIZE];
+shared FLOAT_TYPE tmpsh_u[NUM_ROWS][BLOCK_SIZE];
+#endif
+
+// the reductions of mul_mat_vec_base.glsl (NUM_COLS 1), one per projection, then the SwiGLU store
+void reduce_glu(FLOAT_TYPE tg[NUM_ROWS], FLOAT_TYPE tu[NUM_ROWS], const uint first_row, const uint num_rows, const uint tid) {
+#if defined(USE_SUBGROUP_ADD_NO_SHMEM)
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        tg[n] = subgroupAdd(tg[n]);
+        tu[n] = subgroupAdd(tu[n]);
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            data_d[d_offset + first_row + n] = D_TYPE(glu_op(float(tg[n]), float(tu[n])));
+        }
+    }
+#elif defined(USE_SUBGROUP_ADD)
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        tg[n] = subgroupAdd(tg[n]);
+        tu[n] = subgroupAdd(tu[n]);
+    }
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            tmpsh_g[n][gl_SubgroupID] = tg[n];
+            tmpsh_u[n][gl_SubgroupID] = tu[n];
+        }
+    }
+    barrier();
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            tg[n] = FLOAT_TYPE(0);
+            tu[n] = FLOAT_TYPE(0);
+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
+                tg[n] += tmpsh_g[n][s];
+                tu[n] += tmpsh_u[n][s];
+            }
+            data_d[d_offset + first_row + n] = D_TYPE(glu_op(float(tg[n]), float(tu[n])));
+        }
+    }
+#else
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        tmpsh_g[n][tid] = tg[n];
+        tmpsh_u[n][tid] = tu[n];
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                tmpsh_g[n][tid] += tmpsh_g[n][tid + s];
+                tmpsh_u[n][tid] += tmpsh_u[n][tid + s];
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            data_d[d_offset + first_row + n] = D_TYPE(glu_op(float(tmpsh_g[n][0]), float(tmpsh_u[n][0])));
+        }
+    }
+#endif
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+
+    get_offsets(a_offset, b_offset, d_offset);
+    a_offset *= QUANT_K / QUANT_K_Q8_1;
+    b_offset /= QUANT_K_Q8_1;
+
+    FLOAT_TYPE tg[NUM_ROWS], tu[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        tg[n] = FLOAT_TYPE(0.0f);
+        tu[n] = FLOAT_TYPE(0.0f);
+    }
+
+    const uint col_stride = K_PER_ITER * BLOCK_SIZE;
+    uint num_iters = p.ncols / col_stride;
+    if (num_iters * col_stride + K_PER_ITER * tid < p.ncols) {
+        num_iters++;
+    }
+
+    const uint b_qs_idx = tid % (32 / K_PER_ITER);
+    uint col = tid * K_PER_ITER;
+    while (num_iters >= 4) {
+        [[unroll]] for (uint k = 0; k < 4; ++k) {
+            iter(tg, tu, first_row, num_rows, col, b_qs_idx);
+            col += col_stride;
+        }
+        num_iters -= 4;
+    }
+
+    if (num_iters >= 2) {
+        iter(tg, tu, first_row, num_rows, col, b_qs_idx);
+        col += col_stride;
+        iter(tg, tu, first_row, num_rows, col, b_qs_idx);
+        col += col_stride;
+        num_iters -= 2;
+    }
+
+    if (num_iters > 0) {
+        iter(tg, tu, first_row, num_rows, col, b_qs_idx);
+    }
+
+    reduce_glu(tg, tu, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

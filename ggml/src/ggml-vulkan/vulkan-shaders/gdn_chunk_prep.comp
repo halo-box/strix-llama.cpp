@@ -23,6 +23,8 @@
 // 16 contiguous halves, so a scan lane reads its fragment as two adjacent 16-byte units.
 // Tokens past n_tokens are padded with q = k = 0, g = 0, beta = 0: their T rows/columns and updates vanish.
 // Wave32 required (hand-built RDNA3 WMMA fragments, see gdn_chunk_scan.comp).
+// PREP_V4: Qh, Kh, KhT and P are stored as 16-byte units (byte-identical scratch). PREP_NOKT (with PREP_V4): no KhT, the
+// scan (KT_GATHER) reads K^T from the Kh fragments.
 // Idea from halo-box/strix-llama.cpp#91 (Gaetan Puleo).
 
 #define S_V 128
@@ -47,6 +49,15 @@ layout(push_constant) uniform Parameters {
     float scale;
     uint K;
     uint nch;
+    uint qk_norm;     // q and k arrive un-normalised: x * qk_mul * rsqrt(mean(x^2) + qk_eps) per 128-row (the graph's
+    float qk_eps;     // RMS_NORM(eps) -> SCALE(qk_mul) l2 norms, skipped by the host)
+    float qk_mul;
+    // conv_fold: bindings 0 / 1 are the conv input x [C, T, S] (the qkv projection), not the SiLU output; q / k are
+    // silu(conv4(x)) of channels qc0 / kc0 + the view offset, as ssm_conv.comp MODE 1, with the conv state (binding 5,
+    // [3, C, S]) for tokens before 0 and the taps (binding 6, [4, C]). The host skips the SSM_CONV + SILU nodes.
+    uint conv_fold;
+    uint qc0, kc0, vc0;
+    uint conv_C;
 };
 
 layout(binding = 0) readonly  buffer QBuf    { float data_q[];    };
@@ -55,6 +66,38 @@ layout(binding = 2) readonly  buffer GBuf    { float data_g[];    };
 layout(binding = 3) readonly  buffer BetaBuf { float data_beta[]; };
 layout(binding = 4) writeonly buffer ScrBuf  { uint data_scr[];   };
 layout(binding = 4) writeonly buffer ScrBuf16 { float16_t data_scr16[]; };
+layout(binding = 4) writeonly buffer ScrBuf4  { uvec4 data_scr4[];   };
+layout(binding = 5) readonly  buffer CStBuf  { float data_cst[];  };
+layout(binding = 6) readonly  buffer CWBuf   { float data_cw[];   };
+
+// silu(conv4) of channel c at token tt of sequence s, x element at xo: the same expressions as ssm_conv.comp MODE 1
+// (window from the conv state before token 0, one dot, SiLU), so the result is bit-identical to the SSM_CONV + SILU nodes
+// the same for tt >= 3 (every chunk after the first): no conv-state branch (see gdn_chunk_scan.comp conv_silu_v_direct)
+float conv_silu_q_direct(const bool is_k, const uint xo, const uint c) {
+    const vec4 w = vec4(data_cw[4 * c], data_cw[4 * c + 1], data_cw[4 * c + 2], data_cw[4 * c + 3]);
+    const vec4 x = is_k ? vec4(data_k[xo - 3 * sq2], data_k[xo - 2 * sq2], data_k[xo - sq2], data_k[xo])
+                        : vec4(data_q[xo - 3 * sq2], data_q[xo - 2 * sq2], data_q[xo - sq2], data_q[xo]);
+    float sum = dot(x, w);
+    sum = sum / (1.0f + exp(-sum));
+    return sum;
+}
+
+float conv_silu_q(const bool is_k, const uint xo, const uint c, const uint tt, const uint s) {
+    const vec4 w = vec4(data_cw[4 * c], data_cw[4 * c + 1], data_cw[4 * c + 2], data_cw[4 * c + 3]);
+    float win[3];
+    [[unroll]] for (uint i = 0; i < 3; i++) {
+        const int t = int(tt) + int(i) - 3;
+        if (t < 0) {
+            win[i] = data_cst[s * 3 * conv_C + c * 3 + uint(t + 3)];
+        } else {
+            win[i] = is_k ? data_k[xo - (3 - i) * sq2] : data_q[xo - (3 - i) * sq2];
+        }
+    }
+    const float v = is_k ? data_k[xo] : data_q[xo];
+    float sum = dot(vec4(win[0], win[1], win[2], v), w);
+    sum = sum / (1.0f + exp(-sum));
+    return sum;
+}
 
 // half index of element (row, col) of a matrix with NCB 16-column blocks, in fragment-tile order
 #define FRAG_H(row, col, NCB) (((((row) / 16) * (NCB) + (col) / 16) * 16 + (row) % 16) * 16 + (col) % 16)
@@ -64,6 +107,7 @@ shared uint U[NVMAX * CL * AS > 2 * CL * QS ? NVMAX * CL * AS : 2 * CL * QS];
 shared float KK[CL * (CL + 1)];
 shared float QK[CL * (CL + 1)];
 shared float Gs[NVMAX][CL];
+shared vec2 NS[CL * S_V / 2 / 256][8];          // qk_norm: per-wave partial sums of k^2 and q^2 of each load step
 shared float Bs[NVMAX][CL];
 
 #define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
@@ -84,26 +128,101 @@ void main() {
     const uint qk_scr = ((seq * nch + c) * neq1 + hk) * QKU;
     const uint tp_region = n_seqs * nch * neq1 * QKU;
 
-    // Q/K rows -> f16 pairs in LDS and in the scratch (Qh at +0, Kh at +CL*64)
-    for (uint p = tid; p < CL * S_V / 2; p += 256) {
+    // Q/K rows -> f16 pairs in LDS and in the scratch (Qh at +0, Kh at +CL*64). Load step i covers rows 4i..4i+3, one row
+    // per pair of waves (64 threads x 2 elements = 128)
+    const uint NSTEP = CL * S_V / 2 / 256;
+    vec2 kvs[NSTEP];
+    vec2 qvs[NSTEP];
+    [[unroll]] for (uint i = 0; i < NSTEP; i++) {
+        const uint p  = tid + 256 * i;
         const uint t  = p / (S_V / 2);
         const uint kp = p % (S_V / 2);
-        vec2 kv = vec2(0.0);
-        vec2 qv = vec2(0.0);
+        kvs[i] = vec2(0.0);
+        qvs[i] = vec2(0.0);
         if (t0 + t < n_tokens) {
             const uint off = iq3 * sq3 + (t0 + t) * sq2 + hk * sq1 + 2 * kp;
-            kv = vec2(data_k[off], data_k[off + 1]);
-            qv = vec2(data_q[off], data_q[off + 1]);
+            if (conv_fold != 0 && (conv_fold & 2u) != 0 && c > 0) {
+                const uint qc = qc0 + hk * sq1 + 2 * kp;
+                const uint kc = kc0 + hk * sq1 + 2 * kp;
+                kvs[i] = vec2(conv_silu_q_direct(true,  kc0 + off,     kc),
+                              conv_silu_q_direct(true,  kc0 + off + 1, kc + 1));
+                qvs[i] = vec2(conv_silu_q_direct(false, qc0 + off,     qc),
+                              conv_silu_q_direct(false, qc0 + off + 1, qc + 1));
+            } else if (conv_fold != 0) {
+                const uint qc = qc0 + hk * sq1 + 2 * kp;
+                const uint kc = kc0 + hk * sq1 + 2 * kp;
+                kvs[i] = vec2(conv_silu_q(true,  kc0 + off,     kc,     t0 + t, iq3),
+                              conv_silu_q(true,  kc0 + off + 1, kc + 1, t0 + t, iq3));
+                qvs[i] = vec2(conv_silu_q(false, qc0 + off,     qc,     t0 + t, iq3),
+                              conv_silu_q(false, qc0 + off + 1, qc + 1, t0 + t, iq3));
+            } else {
+                kvs[i] = vec2(data_k[off], data_k[off + 1]);
+                qvs[i] = vec2(data_q[off], data_q[off + 1]);
+            }
         }
+    }
+    if (qk_norm != 0) {
+        [[unroll]] for (uint i = 0; i < NSTEP; i++) {
+            const vec2 ss = vec2(subgroupAdd(dot(kvs[i], kvs[i])), subgroupAdd(dot(qvs[i], qvs[i])));
+            if (lane == 0) {
+                NS[i][w] = ss;
+            }
+        }
+        barrier();
+        [[unroll]] for (uint i = 0; i < NSTEP; i++) {
+            const vec2 ss = NS[i][w & ~1u] + NS[i][w | 1u];
+            // as rms_norm.comp (inversesqrt(mean + eps)), then the SCALE as its own multiply
+            kvs[i] = (kvs[i] * inversesqrt(ss.x / float(S_V) + qk_eps)) * qk_mul;
+            qvs[i] = (qvs[i] * inversesqrt(ss.y / float(S_V) + qk_eps)) * qk_mul;
+        }
+    }
+    [[unroll]] for (uint i = 0; i < NSTEP; i++) {
+        const uint p  = tid + 256 * i;
+        const uint t  = p / (S_V / 2);
+        const uint kp = p % (S_V / 2);
+        const vec2 kv = kvs[i];
+        const vec2 qv = qvs[i];
         const uint ku = packFloat2x16(f16vec2(kv));
         const uint qu = packFloat2x16(f16vec2(qv));
         U[t * QS + kp]        = ku;
         U[(CL + t) * QS + kp] = qu;
+#ifndef PREP_V4
         data_scr[qk_scr + FRAG_H(t, 2 * kp, S_V / 16) / 2]               = qu;
         data_scr[qk_scr + CL * S_V / 2 + FRAG_H(t, 2 * kp, S_V / 16) / 2] = ku;
+#endif
     }
     barrier();
 
+#ifdef PREP_V4
+    // PREP_V4: the scratch written from LDS as 16-byte units in fragment order (unit u of a region: tile u / 32, tile row
+    // (u % 32) / 2, columns 8 (u % 2) .. +7), so a wave stores 512 contiguous bytes instead of 4-byte pieces of 32-byte runs
+    // Qh, Kh: 2 x CL * S_V / 8 units, tile (row block, k block) with S_V / 16 k blocks
+    [[unroll]] for (uint i = 0; i < 2 * CL * S_V / 8 / 256; i++) {
+        const uint p    = tid + 256 * i;
+        const uint isk  = p / (CL * S_V / 8);           // 0 Qh (LDS rows CL..), 1 Kh (LDS rows 0..)
+        const uint u    = p % (CL * S_V / 8);
+        const uint tile = u / 32;
+        const uint row  = (tile / (S_V / 16)) * 16 + (u % 32) / 2;
+        const uint col  = (tile % (S_V / 16)) * 16 + (u % 2) * 8;
+        const uint lb   = ((isk != 0 ? 0 : CL) + row) * QS + col / 2;
+        data_scr4[qk_scr / 4 + p] = uvec4(U[lb], U[lb + 1], U[lb + 2], U[lb + 3]);
+    }
+#ifndef PREP_NOKT
+    // KhT [128][CL] at +CL*128 uints: tile (k block, t block) with CL / 16 t blocks; 8 t values of one k per unit
+    [[unroll]] for (uint i = 0; i < CL * S_V / 8 / 256; i++) {
+        const uint u    = tid + 256 * i;
+        const uint tile = u / 32;
+        const uint k    = (tile / (CL / 16)) * 16 + (u % 32) / 2;
+        const uint t0u  = (tile % (CL / 16)) * 16 + (u % 2) * 8;
+        uint h[8];
+        [[unroll]] for (uint e = 0; e < 8; e++) {
+            const uint a = U[(t0u + e) * QS + k / 2];
+            h[e] = (k & 1) != 0 ? (a >> 16) : (a & 0xFFFFu);
+        }
+        data_scr4[(qk_scr + CL * S_V) / 4 + u] = uvec4(h[0] | (h[1] << 16), h[2] | (h[3] << 16), h[4] | (h[5] << 16), h[6] | (h[7] << 16));
+    }
+#endif
+#else
     // KhT [128][CL] at +CL*128 (in uints): thread (k, t pair)
     for (uint p = tid; p < S_V * CL / 2; p += 256) {
         const uint k  = p / (CL / 2);
@@ -114,6 +233,7 @@ void main() {
         const uint hi = (k & 1) != 0 ? (b >> 16) : (b & 0xFFFFu);
         data_scr[qk_scr + CL * S_V + FRAG_H(k, 2 * tp, CL / 16) / 2] = lo | (hi << 16);
     }
+#endif
 
     // KK^T and QK^T (CL x CL, f32 accumulation): wave w -> product w / 4 (0 KK, 1 QK), tile (w / 2 % 2, w % 2)
     {
@@ -165,7 +285,33 @@ void main() {
             }
         }
         barrier();
-        // A (f32, LDS) and P (f16, scratch); thread (j, r, s)
+        // A (f32, LDS) and P (f16, scratch)
+#ifdef PREP_V4
+        // thread (j, r, 8 s): P as one 16-byte unit (8 columns of a fragment row)
+        [[unroll]] for (uint ii = 0; ii < NVMAX * CL * CL / 8 / 256; ii++) {
+            const uint i  = tid + 256 * ii;
+            const uint j  = i / (CL * CL / 8);
+            const uint r  = (i / (CL / 8)) % CL;
+            const uint s0 = (i % (CL / 8)) * 8;
+            if (j0 + j < nv) {
+                const uint h = hk + (j0 + j) * neq1;
+                uint pk[4];
+                [[unroll]] for (uint e = 0; e < 8; e += 2) {
+                    float pv[2];
+                    [[unroll]] for (uint d = 0; d < 2; d++) {
+                        const uint s = s0 + e + d;
+                        const float ex = s <= r ? exp(Gs[j][r] - Gs[j][s]) : 0.0;
+                        U[(j * CL + r) * AS + s] = floatBitsToUint(s < r ? Bs[j][r] * KK[r * (CL + 1) + s] * ex : 0.0);
+                        pv[d] = scale * QK[r * (CL + 1) + s] * ex;
+                    }
+                    pk[e / 2] = packFloat2x16(f16vec2(float16_t(pv[0]), float16_t(pv[1])));
+                }
+                const uint tp = tp_region + ((seq * nch + c) * H + h) * TPU;
+                data_scr4[(tp + CL * CL / 2) / 4 + FRAG_H(r, s0, CL / 16) / 8] = uvec4(pk[0], pk[1], pk[2], pk[3]);
+            }
+        }
+#else
+        // thread (j, r, s)
         for (uint i = tid; i < NVMAX * CL * CL; i += 256) {
             const uint j = i / (CL * CL);
             const uint r = (i / CL) % CL;
@@ -178,6 +324,7 @@ void main() {
                 data_scr16[2 * (tp + CL * CL / 2) + FRAG_H(r, s, CL / 16)] = float16_t(scale * QK[r * (CL + 1) + s] * e);
             }
         }
+#endif
         barrier();
         // T = (I + A)^-1 diag(beta) by forward substitution: thread (j, col) keeps its column in registers
         if (tid < NVMAX * CL) {

@@ -1,0 +1,91 @@
+#version 450
+
+// Decode weight prefetch from a second compute queue: one persistent dispatch per decode graph, launched on its own queue.
+// The main queue writes a phase word with buffer markers: (epoch << 16) | (2 t + 1) when the glue before dense mat-vec target t
+// starts, (epoch << 16) | (2 t + 2) when target t's group starts, (epoch << 16) | 0xffff at the end of the graph. While a
+// target's window is open, every workgroup of this dispatch loads one 32-bit word per 128-byte line of the target's weights from
+// their start (in order, as the mat-vec reads them), so those lines are in the last-level cache when the mat-vec runs. It stops
+// as soon as the phase moves on. Reads only; the store below is never taken. Every wait is bounded by a poll count.
+
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WRef { uint w[]; };
+
+layout (binding = 0) coherent volatile buffer Flag { uint flag[]; };
+// plan[0] = (epoch, n targets, max polls, lines per check); plan[1 + t] = (address lo, address hi, lines to touch, 0)
+layout (binding = 1) readonly buffer Plan { uvec4 plan[]; };
+
+shared uint s_v;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint nthr = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    const uint gid = gl_WorkGroupID.x * gl_WorkGroupSize.x + tid;
+    const uvec4 hdr = plan[0];
+    const uint epoch = hdr.x & 0xffffu;
+    const uint ntargets = hdr.y;
+    const uint max_polls = hdr.z;
+    const uint chunk = max(hdr.w, 1u);
+    uint polls = 0;
+    uint last = 0xffffffffu;
+    uint acc = 0;
+    uint nwin = 0, npass = 0;
+    bool timed_out = false;
+    while (true) {
+        if (tid == 0) {
+            s_v = atomicOr(flag[0], 0u);
+        }
+        barrier();
+        const uint v = s_v;
+        barrier();
+        const uint ph = v & 0xffffu;
+        if ((v >> 16) == epoch && ph == 0xffffu) {
+            break;
+        }
+        const uint t = (ph - 1u) >> 1;
+        if ((v >> 16) != epoch || (ph & 1u) == 0u || t >= ntargets || t == last) {
+            if (++polls > max_polls) {
+                timed_out = true;
+                break;
+            }
+            continue;
+        }
+        last = t;
+        ++nwin;
+        const uvec4 e = plan[1 + t];
+        WRef r = WRef(e.xy);
+        // touch until the phase changes: chunk grid-stride passes between checks
+        for (uint i0 = 0; i0 < e.z; i0 += chunk * nthr) {
+            for (uint j = 0; j < chunk; ++j) {
+                const uint i = i0 + j * nthr + gid;
+                if (i < e.z) {
+                    acc += r.w[i * 32u];
+                }
+            }
+            ++npass;
+            if (tid == 0) {
+                s_v = atomicOr(flag[0], 0u);
+            }
+            barrier();
+            const bool moved = s_v != v;
+            barrier();
+            if (moved) {
+                break;
+            }
+        }
+    }
+    // engagement counters for the host (flag[8] windows, flag[9] 256-line passes, flag[10] timed-out workgroups)
+    if (tid == 0) {
+        atomicAdd(flag[8], nwin);
+        atomicAdd(flag[9], npass);
+        if (timed_out) {
+            atomicAdd(flag[10], 1u);
+        }
+    }
+    if (acc == 0x9e3779b9u && hdr.w == 0xffffffffu) {
+        flag[16 + (gid & 31u)] = acc;
+    }
+}

@@ -5,6 +5,8 @@ bool vk_memory_logger_enabled = false;
 bool vk_perf_logger_enabled = false;
 
 bool vk_perf_logger_concurrent = false;
+bool vk_perf_logger_seq = false;
+bool vk_perf_logger_seq_shapes = false;
 
 bool vk_enable_sync_logger = false;
 

@@ -163,6 +163,9 @@ struct server_batch {
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
+    // the slot that takes the recurrent state snapshot in this batch (one per batch), -1 = none
+    int32_t id_slot_snapshot = -1;
+
     void init(llama_context * ctx, int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
@@ -200,6 +203,7 @@ struct server_batch {
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
+        id_slot_snapshot  = -1;
     }
 
     int32_t size() const {
@@ -287,6 +291,18 @@ struct server_slot {
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
+
+    // the task samples greedily on the backend and can take one-token-ahead decode chaining (--decode-chain)
+    bool chain_ok = false;
+    int32_t n_chained = 0; // tokens of the current task decoded through the chain
+    bool sampled_on_backend = false; // the last sampled token came whole from the backend sampler
+
+    // prompt position where the aligned end-of-prompt tail starts (--ctx-checkpoint-align), -1 = none
+    int32_t n_ckpt_tail_pos = -1;
+    // end-of-prompt checkpoint taken from a recurrent state snapshot inside the batch (--ctx-checkpoint-snapshot):
+    // the prompt length and the position it is taken before, -1 = none pending
+    int64_t   n_ckpt_snap_tokens = -1;
+    llama_pos ckpt_snap_pos      = -1;
 
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
@@ -1056,6 +1072,9 @@ private:
 
     common_speculative_ptr spec;
 
+    // --decode-chain: the slot whose chained decode is in flight (llama_decode_chain), -1 = none
+    int chain_slot = -1;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -1672,6 +1691,13 @@ private:
             return false;
         }
 
+        // the end-of-prompt checkpoint from a recurrent state snapshot taken inside the last prompt batch, instead of
+        // a separate decode of the last 4 tokens. Not with a draft or prefill context: their state at that point
+        // would need a snapshot too
+        ckpt_snapshot = params_base.ctx_checkpoint_snapshot > 0 && params_base.n_ctx_checkpoints > 0 &&
+                !spec && ctx_dft == nullptr && ctx_spf == nullptr &&
+                llama_rs_snapshot_init(ctx_tgt);
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -1689,6 +1715,7 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                checkpoint_spares_fill();
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1760,8 +1787,8 @@ private:
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
-                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d, snapshot = %d\n",
+                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step, ckpt_snapshot ? 1 : 0);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -2227,11 +2254,18 @@ private:
             use_backend_sampling &= !need_pre_sample_logits;
 
             // TODO: tmp until backend sampling is fully implemented
+            bool backend_sampled = false;
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                backend_sampled = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
+
+            // decode chaining reads the token straight from the backend sampler: only when that is the whole choice
+            slot.n_chained = 0;
+            slot.sampled_on_backend = false;
+            slot.chain_ok = params_base.decode_chain > 0 && backend_sampled && task.params.sampling.n_probs == 0 &&
+                            common_sampler_is_greedy(slot.smpl.get());
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
@@ -2244,6 +2278,7 @@ private:
             }
         } else {
             slot.smpl.reset();
+            slot.chain_ok = false;
         }
 
         // the per-request limit takes priority over the global one
@@ -2817,8 +2852,44 @@ private:
         return true;
     }
 
-    // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // buffers of erased checkpoints, reused by new ones: a checkpoint is a large host copy of the state that
+    // cannot be rolled back (112 MiB for a 48-layer GDN hybrid), and a fresh one pays a zero-fill and a page
+    // fault per page before the copy, on the critical path between two prompt chunks
+    std::vector<std::vector<uint8_t>> ckpt_spares;
+    size_t ckpt_size_last = 0;
+
+    // the end-of-prompt checkpoint comes from a recurrent state snapshot (llama_rs_snapshot_arm), see load_model
+    bool ckpt_snapshot = false;
+
+    // A new prompt that shares nothing with the slot's erases its checkpoints at launch and takes a spare at its end; the
+    // release then refills that spare with a fresh allocation the next request waits for. At that launch-time erase
+    // (launch_erase) one buffer above the spare count is kept, so the erased checkpoint becomes that spare instead. The
+    // peak is unchanged: the buffer was held as a checkpoint until then, and the other erase paths keep the spare count.
+    // LLAMA_SERVER_CKPT_SPARE_EXTRA=0 keeps exactly the spare count everywhere.
+    static int checkpoint_spare_extra() {
+        static const int extra = [] { const char * e = getenv("LLAMA_SERVER_CKPT_SPARE_EXTRA"); return e == nullptr ? 1 : std::max(0, atoi(e)); }();
+        return extra;
+    }
+
+    void checkpoint_recycle(common_prompt_checkpoint & cur, bool launch_erase = false) {
+        const int extra = launch_erase ? checkpoint_spare_extra() : 0;
+        const int cap = params_base.ctx_checkpoint_spares > 0 ? params_base.ctx_checkpoint_spares + extra : 0;
+        if ((int) ckpt_spares.size() < cap && !cur.data_tgt.empty()) {
+            ckpt_spares.push_back(std::move(cur.data_tgt));
+        }
+    }
+
+    // top the spares up when a slot is released, off the critical path: requests that extend a cached prefix,
+    // or whose old checkpoints move to the prompt cache, erase nothing that could be recycled
+    void checkpoint_spares_fill() {
+        while (ckpt_size_last > 0 && (int) ckpt_spares.size() < params_base.ctx_checkpoint_spares) {
+            ckpt_spares.emplace_back(ckpt_size_last);
+        }
+    }
+
+    // n_tokens_ckpt: the prompt length the checkpoint is taken at
+    // snapshot: take it from the recurrent state snapshot instead of the current state
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_ckpt, llama_pos pos_min, llama_pos pos_max, bool snapshot = false) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2832,6 +2903,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                checkpoint_recycle(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2847,15 +2919,17 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            checkpoint_recycle(slot.prompt.checkpoints.front());
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            const int64_t n_tokens_new = n_tokens_ckpt;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    checkpoint_recycle(*it);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2867,13 +2941,21 @@ private:
 
         cur.id_task = id_task;
 
+        // update_tgt resizes the buffer to the state size, a no-op for a spare of the same size
+        // (a spare of another size would be reallocated and copied first, so it is not used)
+        if (!ckpt_spares.empty() && ckpt_spares.back().size() == ckpt_size_last) {
+            cur.data_tgt = std::move(ckpt_spares.back());
+            ckpt_spares.pop_back();
+        }
+
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        cur.update_pos(n_tokens_ckpt, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (snapshot ? LLAMA_STATE_SEQ_FLAGS_SNAPSHOT : 0));
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        ckpt_size_last = cur.data_tgt.size();
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2881,6 +2963,32 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+    }
+
+    // after a decode: turn the recurrent state snapshot the slot armed into its end-of-prompt checkpoint
+    // last: the last decode of the batch, after which a snapshot not taken is dropped
+    void create_snapshot_checkpoint(server_slot & slot, bool last) {
+        if (slot.n_ckpt_snap_tokens < 0) {
+            return;
+        }
+
+        const llama_pos pos = slot.ckpt_snap_pos;
+
+        if (llama_rs_snapshot_pos(ctx_tgt, slot.id) == pos && slot.task) {
+            // the state a decode stopping before pos would have left: the recurrent part ends at pos - 1
+            const llama_pos pos_min = std::min(llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id), pos - 1);
+
+            create_checkpoint(slot, slot.n_ckpt_snap_tokens, pos_min, pos - 1, /*snapshot =*/ true);
+        } else if (!last) {
+            return; // taken by a later decode of this batch
+        } else {
+            SLT_WRN(slot, "the end-of-prompt snapshot at pos = %d was not taken - no checkpoint there\n", pos);
+        }
+
+        llama_rs_snapshot_arm(ctx_tgt, -1, -1);
+
+        slot.n_ckpt_snap_tokens = -1;
+        slot.ckpt_snap_pos      = -1;
     }
 
     // checkpoints are appended to the slot save file, after the llama state payload
@@ -3020,6 +3128,13 @@ private:
                            task.type != SERVER_TASK_TYPE_DASHBOARD) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
+        }
+
+        // a chained decode is in flight between update_slots() calls: finish it before a task can change a slot or the
+        // context (the tasks accepted while yielding only read the server state)
+        if (!is_yielding && chain_slot >= 0 && task.type != SERVER_TASK_TYPE_NEXT_RESPONSE && task.type != SERVER_TASK_TYPE_METRICS &&
+                task.type != SERVER_TASK_TYPE_SLOT_GET && task.type != SERVER_TASK_TYPE_DASHBOARD) {
+            chain_stop();
         }
 
         switch (task.type) {
@@ -3412,6 +3527,7 @@ private:
     }
 
     void abort_all_slots(const std::string & reason) {
+        chain_abort();
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
@@ -3491,6 +3607,18 @@ private:
             }
         }
 
+        // one-token-ahead decode chaining for a lone greedy slot: the decode and its sampling happen in chain_step()
+        if (chain_slot >= 0 || params_base.decode_chain > 0) {
+            server_slot * cs = chain_candidate();
+            if (chain_slot >= 0 && (cs == nullptr || cs->id != chain_slot)) {
+                chain_stop();
+                cs = chain_candidate();
+            }
+            if (cs != nullptr && chain_step(*cs)) {
+                return;
+            }
+        }
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -3538,6 +3666,11 @@ private:
 #endif
 
                 if (ok) {
+                    // the end-of-prompt checkpoint from the snapshot this decode took
+                    if (batch.id_slot_snapshot >= 0) {
+                        create_snapshot_checkpoint(slots[batch.id_slot_snapshot], off + n_tokens >= batch.size());
+                    }
+
                     // move the head of the batch forward with the number of tokens we just processed
                     off_next = off + n_tokens;
 
@@ -3821,6 +3954,8 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+                        slot.n_ckpt_snap_tokens = -1;
+                        slot.ckpt_snap_pos      = -1;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, n_prompt_in);
@@ -4098,9 +4233,10 @@ private:
                             {
                                 // erase any checkpoints with pos_max > pos_next
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-                                    const auto & cur = *it;
+                                    auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        checkpoint_recycle(cur, /*launch_erase =*/ true);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -4257,6 +4393,19 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // with --ctx-checkpoint-snapshot the checkpoint 4 tokens before the end is taken from a snapshot
+                    // inside the batch, so the last 4 tokens need no batch of their own; the earlier break moves to
+                    // n_ubatch before the end, so the last batch is one whole ubatch
+                    bool ckpt_snap = do_checkpoint && ckpt_snapshot && batch.id_slot_snapshot < 0;
+                    if (ckpt_snap) {
+                        // GPU matmul kernels tile the batch in 128 rows: when the last ubatch would end 1 to 4 tokens
+                        // past a multiple of 128, those tokens cost a whole tile, more than a batch of their own
+                        const int n_last = std::min(n_prompt_in - slot.prompt.n_tokens(), n_ubatch);
+                        if (n_last % 128 >= 1 && n_last % 128 <= 4) {
+                            ckpt_snap = false;
+                        }
+                    }
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < n_prompt_in && batch.size() < n_batch) {
                         // get next token to process
@@ -4316,9 +4465,15 @@ private:
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
+                            for (int i_last = 0; i_last < 2; ++i_last) {
+                                const int n_last = std::min(n_batch, (i_last == 0 && ckpt_snap) ? n_ubatch : checkpoint_offsets[i_last]);
                                 if (n_prompt_in == slot.prompt.n_tokens() + n_last) {
+                                    if (i_last == 1 && ckpt_snap && batch.size() < n_batch) {
+                                        // keep going: the checkpoint is taken from a snapshot before the next token
+                                        slot.n_ckpt_snap_tokens = slot.prompt.n_tokens();
+                                        slot.ckpt_snap_pos      = slot.prompt.tokens.pos_next();
+                                        continue;
+                                    }
                                     should_break = true;
                                     break;
                                 }
@@ -4386,7 +4541,20 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+                    }
+
+                    // the end-of-prompt checkpoint inside this batch: arm the snapshot, taken by the decode below
+                    if (slot.n_ckpt_snap_tokens >= 0) {
+                        if (slot.n_ckpt_snap_tokens < slot.prompt.n_tokens() && !has_mtmd) {
+                            batch.id_slot_snapshot = slot.id;
+                            llama_rs_snapshot_arm(ctx_tgt, slot.id, slot.ckpt_snap_pos);
+                            SLT_DBG(slot, "armed the end-of-prompt snapshot at n_tokens = %" PRId64 ", pos = %d\n",
+                                    slot.n_ckpt_snap_tokens, slot.ckpt_snap_pos);
+                        } else {
+                            slot.n_ckpt_snap_tokens = -1;
+                            slot.ckpt_snap_pos      = -1;
+                        }
                     }
                 }
 
@@ -4596,6 +4764,169 @@ private:
         return true;
     }
 
+    bool accept_special_token(const server_slot & slot, llama_token token) const {
+        return params_base.special ||
+            slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+    }
+
+    // a token the slot sampled (not speculative): accept it, stream it, stop or go on. tok_idx = its output row for
+    // n_probs. chained: the token is already being decoded (llama_decode_chain), so it joins the slot's cache here, also
+    // when it stops the slot (the memory holds it). Returns false if the slot was released.
+    bool handle_sampled_token(server_slot & slot, llama_token id, int tok_idx, bool chained) {
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+        const int64_t t_now = ggml_time_us();
+
+        slot.stats.n_gen += 1;
+
+        if (slot.stats.n_gen == 1) {
+            slot.stats.update_prompt_last();
+            slot.t_print_last = t_now;
+            slot.n_gen_last = 0;
+        }
+
+        slot.stats.update_gen_last();
+
+        completion_token_output result;
+        result.tok          = id;
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+        result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            GGML_ASSERT(!chained);
+            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+        }
+
+        if (!process_token(result, slot)) {
+            // release slot because of stop condition
+            slot.print_timings();
+            send_final_response(slot);
+            if (chained) {
+                slot.prompt.tokens.push_back(id);
+                chain_abort(); // the token the last decode sampled is not used
+                SLT_INF(slot, "decode chaining ends at the stop: %d tokens chained, n_tokens = %d\n", slot.n_chained, slot.prompt.n_tokens());
+            }
+            slot.release();
+
+            return false;
+        }
+
+        if (chained) {
+            slot.prompt.tokens.push_back(id);
+        }
+
+        slot.print_timings_tg();
+
+        return true;
+    }
+
+    //
+    // one-token-ahead decode chaining (--decode-chain, llama_decode_chain): while the decode of token t runs, the decode
+    // of t + 1 is recorded on a second scheduler and submitted as soon as t's backend sampler has picked t + 1. The
+    // server handles t + 1 (stream, stop checks) while its own decode runs. A stop therefore leaves t + 1 decoded: it
+    // stays in the slot's cache, so cache and memory still match.
+    //
+
+    // the slot that can chain this iteration: the only slot with work, generating, greedy on the backend
+    server_slot * chain_candidate() {
+        server_slot * res = nullptr;
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            if (res != nullptr) {
+                return nullptr;
+            }
+            res = &slot;
+        }
+        if (res == nullptr || res->state != SLOT_STATE_GENERATING || !res->chain_ok || !res->sampled_on_backend || spec || res->ctx_dft != nullptr ||
+                !res->inp_embd.empty() || res->need_embd() || !res->spec_draft.empty()) {
+            return nullptr;
+        }
+        // the decode this step submits must fit without a context shift (pre_decode), the next one too
+        if (res->prompt.n_tokens() + 2 >= res->n_ctx) {
+            return nullptr;
+        }
+        return res;
+    }
+
+    // returns false if the slot has to take the ordinary path this iteration (nothing was decoded)
+    bool chain_step(server_slot & slot) {
+        const bool first = chain_slot < 0;
+
+        metrics_pre_decode();
+
+        // first step: the token this slot sampled last (the last decode may have held other slots' outputs after it)
+        llama_token id = first ? slot.sampled : LLAMA_TOKEN_NULL;
+        const int ret = llama_decode_chain(ctx_tgt, slot.id, &id);
+
+        if (ret == -1) {
+            GGML_ASSERT(first && "decode chaining: in flight but unavailable");
+            SLT_DBG(slot, "%s", "decode chaining unavailable for this task\n");
+            slot.chain_ok = false;
+            return false;
+        }
+
+        if (ret != 0) {
+            SRV_ERR("decode chaining: decode failed, ret = %d\n", ret);
+            chain_slot = slot.id;
+            chain_abort();
+            send_error(slot, ret == 1 ? "Context size has been exceeded." : "Compute error.");
+            slot.release();
+            slot.prompt_clear();
+            return true;
+        }
+
+        chain_slot = slot.id;
+        slot.n_chained++;
+
+        metrics.n_decode++;
+        metrics.n_busy_slots++;
+        metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) slot.prompt.n_tokens() + 1);
+
+        if (first) {
+            // the token the ordinary path sampled and handled last: now decoded, as handle_last_sampled_token() would
+            GGML_ASSERT(id == slot.sampled && "decode chaining: the first chained token is not the slot's sampled token");
+            slot.prompt.tokens.push_back(id);
+            return true;
+        }
+
+        // sampled by the previous chained decode, decoding now
+        handle_sampled_token(slot, id, -1, true);
+
+        return true;
+    }
+
+    // ends the chain and hands its last sampled token (not decoded) to the ordinary path
+    void chain_stop() {
+        if (chain_slot < 0) {
+            return;
+        }
+        server_slot & slot = slots[chain_slot];
+        chain_slot = -1;
+
+        llama_token id = LLAMA_TOKEN_NULL;
+        GGML_ASSERT(llama_decode_chain_end(ctx_tgt, slot.id, &id) == 0);
+
+        if (slot.state != SLOT_STATE_GENERATING || !slot.task) {
+            return;
+        }
+        SLT_INF(slot, "decode chaining ends: %d tokens chained, n_tokens = %d\n", slot.n_chained, slot.prompt.n_tokens());
+        handle_sampled_token(slot, id, -1, false);
+    }
+
+    // ends the chain, dropping the last sampled token
+    void chain_abort() {
+        if (chain_slot < 0) {
+            return;
+        }
+        const int id_slot = chain_slot;
+        chain_slot = -1;
+        llama_token unused;
+        llama_decode_chain_end(ctx_tgt, id_slot, &unused);
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -4611,11 +4942,6 @@ private:
                 }
             }
         });
-
-        auto accept_special_token = [&](server_slot & slot, llama_token token) {
-            return params_base.special ||
-                slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
-        };
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
@@ -4680,40 +5006,10 @@ private:
 
             slot.i_batch = -1;
 
-            common_sampler_accept(slot.smpl.get(), id, true);
+            // a backend sampler set up only in part leaves the token to the CPU samplers: no chaining then
+            slot.sampled_on_backend = slot.chain_ok && llama_get_sampled_token_ith(slot.ctx_tgt, tok_idx) == id;
 
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
-
-            slot.stats.n_gen += 1;
-
-            if (slot.stats.n_gen == 1) {
-                slot.stats.update_prompt_last();
-                slot.t_print_last = t_now;
-                slot.n_gen_last = 0;
-            }
-
-            slot.stats.update_gen_last();
-
-            completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
-
-            if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-            }
-
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
-
-                return;
-            }
-
-            slot.print_timings_tg();
+            handle_sampled_token(slot, id, tok_idx, false);
         });
 
         // speculative decoding - main model sample and accept

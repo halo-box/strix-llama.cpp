@@ -4,7 +4,8 @@
 #
 #   1. checks out that ref
 #   2. builds llama-bench and test-backend-ops for gfx1151 (HIP by default)
-#   3. runs test-backend-ops in `test` mode, then in `perf` mode, on the GPU device
+#   3. runs test-backend-ops in `test` mode (on Vulkan also with every engagement check on,
+#      scripts/vulkan-engagement-tests.sh), then in `perf` mode, on the GPU device
 #   4. downloads the fitting quant of each requested model from Hugging Face and
 #      runs llama-bench over the requested prompt / generation / depth / batch matrix
 #   5. uploads every log plus the raw jsonl as one artifact
@@ -259,6 +260,18 @@ jobs:
           fi
 
           exit "$rc"
+
+      - name: test-backend-ops engagement (Vulkan)
+        # the fusion engagement asserts (GGML_VK_TEST_REQUIRE_*) and the census mode are opt-in in a plain
+        # test-backend-ops run, so a fusion that stops engaging still passes there; this step turns them all on
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && !inputs.skip_ops && inputs.backend == 'vulkan' }}
+        run: |
+          set +e
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/logs/engagement"
+          ./scripts/vulkan-engagement-tests.sh -b "$OPS_DEVICE" -l "$RUNNER_TEMP/logs/engagement" ./build/bin/test-backend-ops \
+            2>&1 | tee "$RUNNER_TEMP/logs/ops-engagement.log"
+          exit "${PIPESTATUS[0]}"
 
       - name: test-backend-ops perf
         if: ${{ !cancelled() && steps.build.outcome == 'success' && !inputs.skip_ops }}
