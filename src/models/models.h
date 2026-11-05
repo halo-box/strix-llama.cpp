@@ -6,6 +6,8 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <array>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -95,7 +97,9 @@ struct llm_build_delta_net_base : public llm_graph_context {
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     // with rollback slots, a caller that passes parts gets a wide ubatch of one sequence back in two parts there (and
-    // nullptr returned): the plain scan over all but the last K = n_rs_seq + 1 tokens and the K-snapshot scan over those
+    // nullptr returned): the plain scan over all but the last K = n_rs_seq + 1 tokens and the K-snapshot scan over those.
+    // A caller that splits its conv at the same token passes q, k, v of the first part only and builds the last K tokens'
+    // in part1_qkv, which is called after the first scan is in the graph
     ggml_tensor * build_recurrent_attn(
             llm_graph_input_rs * inp,
             ggml_tensor *        ssm_states_all,
@@ -106,7 +110,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il,
-            std::pair<ggml_tensor *, ggml_tensor *> * parts = nullptr);
+            std::pair<ggml_tensor *, ggml_tensor *> * parts = nullptr,
+            const std::function<std::array<ggml_tensor *, 3>()> & part1_qkv = nullptr);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -2702,6 +2707,29 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
+                            int   il);
+
+        // the delta-net conv history split at token t (the rollback-slot scan split): returns the concat over tokens
+        // [0, t), which has the same form as an unsplit one, and the history at t as a contiguous [state_cols, C, 1]
+        // copy in hist; build_conv_tail_at concatenates it with tokens [t, n) and writes the conv rollback slots
+        ggml_tensor * build_conv_state_split(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                        int64_t   t,
+                    ggml_tensor ** hist,
+                            int   il);
+
+        ggml_tensor * build_conv_tail_at(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                    ggml_tensor * hist,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                        int64_t   t,
                             int   il);
 
         ggml_tensor * build_inp_ple(

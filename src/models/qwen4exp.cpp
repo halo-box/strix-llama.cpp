@@ -2085,8 +2085,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-    ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+    // With rollback slots build_recurrent_attn splits a wide ubatch's scan K = n_rs_seq + 1 tokens before its end. Split the
+    // conv there too: the first part is then concat(state, x[0, t)) -> conv -> SiLU -> one scan, the same graph as an
+    // unsplit ubatch, which the backends fold into the chunked scan; one SiLU output read by two scans is not folded. The
+    // second part (the last K tokens) convolves the history at t (a contiguous copy) with x[t, n) and writes the K conv
+    // rollback slots. Same per-element arithmetic.
+    const int64_t K_slots    = (int64_t) cparams.n_rs_seq + 1;
+    const bool    conv_split = cparams.n_rs_seq > 0 && n_seqs == 1 && n_seq_tokens > K_slots;
+    const int64_t split_t    = conv_split ? n_seq_tokens - K_slots : n_seq_tokens;
+
+    ggml_tensor * conv_hist  = nullptr;
+    ggml_tensor * conv_input = conv_split
+            ? build_conv_state_split(inp, conv_states_all, qkv_mixed, conv_kernel_size - 1, conv_channels, split_t, &conv_hist, il)
+            : build_conv_state_at(inp, conv_states_all, qkv_mixed, conv_kernel_size - 1, conv_channels, il);
 
     // read the recurrent state in place when no row is copied (e3f31cf6d gave qwen35 this; qwen4exp never enabled it): the
     // per-layer GET_ROWS of the 3 MB state per token goes away, the write-back of the new state stays
@@ -2096,59 +2107,74 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
-
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
-
-    ggml_tensor * conv_qkv_mix = conv_output_silu;
-
-    int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
-
-    // Extract the convolved Q, K, V from conv_output
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            0);
-
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
-
-    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_v_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
-
-    cb(q_conv, "q_conv", il);
-    cb(k_conv, "k_conv", il);
-    cb(v_conv, "v_conv", il);
-
-
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // conv -> SiLU -> the q, k, v views of T tokens -> the q / k l2 norms
+    auto conv_qkv = [&](ggml_tensor * cin, int64_t T) -> std::array<ggml_tensor *, 3> {
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, cin, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
 
-    // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
-        GGML_ASSERT(num_v_heads % num_k_heads == 0);
-        q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-        k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
+
+        ggml_tensor * conv_qkv_mix = conv_output_silu;
+
+        int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
+
+        // Extract the convolved Q, K, V from conv_output
+        ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, T, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * T,
+                0);
+
+        ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, T, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * T,
+                head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+
+        ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, T, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_v_dim),
+                nb1_qkv,
+                nb1_qkv * T,
+                ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
+
+        cb(q_conv, "q_conv", il);
+        cb(k_conv, "k_conv", il);
+        cb(v_conv, "v_conv", il);
+
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+
+        // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
+        if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+            GGML_ASSERT(num_v_heads % num_k_heads == 0);
+            q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, T, n_seqs);
+            k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, T, n_seqs);
+        }
+
+        cb(q_conv, "q_conv_predelta", il);
+        cb(k_conv, "k_conv_predelta", il);
+        cb(v_conv, "v_conv_predelta", il);
+
+        return { q_conv, k_conv, v_conv };
+    };
+
+    const auto qkv0 = conv_qkv(conv_input, split_t);
+
+    // the second part of a split conv, built after the first scan
+    std::function<std::array<ggml_tensor *, 3>()> part1_qkv;
+    if (conv_split) {
+        part1_qkv = [&]() {
+            ggml_tensor * cin1 = build_conv_tail_at(inp, conv_states_all, qkv_mixed, conv_hist, conv_kernel_size - 1, conv_channels, split_t, il);
+            return conv_qkv(cin1, n_seq_tokens - split_t);
+        };
     }
-
-    cb(q_conv, "q_conv_predelta", il);
-    cb(k_conv, "k_conv_predelta", il);
-    cb(v_conv, "v_conv_predelta", il);
 
     // with rollback slots a wide ubatch's scan comes back in two parts
     std::pair<ggml_tensor *, ggml_tensor *> parts = { nullptr, nullptr };
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il, &parts);
+    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, qkv0[0], qkv0[1], qkv0[2], gate, beta, state, il, &parts, part1_qkv);
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
@@ -2785,6 +2811,87 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
         // copy the strided tail directly (no intermediate cont): this is the same node sequence as
         // llm_build_delta_net_base::build_conv_state, which the backends' fused decode paths match
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+    }
+
+    return conv_input;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_split(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        conv_states_all,
+        ggml_tensor *        x,
+        int64_t              state_cols,
+        int64_t              channels,
+        int64_t              t,
+        ggml_tensor **       hist,
+        int                  il) {
+    const int64_t n_seqs    = ubatch.n_seqs;
+    const int64_t row_total = conv_states_all->ne[0];
+
+    GGML_ASSERT(n_seqs == 1);
+    GGML_ASSERT(state_cols * channels == row_total);
+    GGML_ASSERT(t > 0 && t < x->ne[1]);
+
+    auto it = rs_rows.find(conv_states_all);
+    if (it == rs_rows.end()) {
+        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_states_all, row_total, n_seqs)).first;
+    }
+    ggml_tensor * state = ggml_reshape_3d(ctx0, it->second, state_cols, channels, n_seqs);
+    cb(state, "conv_state_at", il);
+
+    // tokens [0, t): a prefix of x, viewed as a [C, t, 1] tensor of its own
+    ggml_tensor * x0 = ggml_view_3d(ctx0, x, x->ne[0], t, 1, x->nb[1], x->nb[1] * t, 0);
+    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x0), 0);
+    cb(conv_input, "conv_input_part0", il);
+
+    // the history at t: the last state_cols columns of the first part's concat, as a contiguous tensor
+    ggml_tensor * h = ggml_cont(ctx0, ggml_view_3d(ctx0, conv_input,
+            state_cols, channels, 1,
+            conv_input->nb[1], conv_input->nb[2],
+            ggml_row_size(conv_input->type, t)));
+    cb(h, "conv_hist_split", il);
+    ggml_build_forward_expand(gf, h);
+
+    *hist = h;
+    return conv_input;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_conv_tail_at(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        conv_states_all,
+        ggml_tensor *        x,
+        ggml_tensor *        hist,
+        int64_t              state_cols,
+        int64_t              channels,
+        int64_t              t,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    const auto kv_head = mctx_cur->get_head();
+    const int64_t n    = x->ne[1];
+
+    // tokens [t, n) after the history at t
+    ggml_tensor * x1 = ggml_view_3d(ctx0, x, x->ne[0], n - t, 1, x->nb[1], x->nb[1] * (n - t), x->nb[1] * t);
+    ggml_tensor * conv_input = ggml_concat(ctx0, hist, ggml_transpose(ctx0, x1), 0);
+    cb(conv_input, "conv_input_part1", il);
+
+    // the new conv state: the last state_cols columns, once per rollback slot as in build_conv_state_at (slot s ends s tokens
+    // earlier; the tail holds state_cols + n - t >= state_cols + n_rs_seq columns, so every slot is inside it)
+    const int64_t row_total = conv_states_all->ne[0];
+    const size_t  row_size  = ggml_row_size(conv_states_all->type, row_total);
+    const uint32_t mem_size = mctx_cur->get_size();
+
+    for (int64_t slot = 0; slot <= (int64_t) cparams.n_rs_seq; ++slot) {
+        GGML_ASSERT(conv_input->ne[0] - state_cols - slot >= 0);
+        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, 1,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols - slot));
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, 1,
+                conv_states_all->nb[1],
+                (slot * mem_size + kv_head) * row_size);
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 

@@ -555,7 +555,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        b,
         ggml_tensor *        s,
         int                  il,
-        std::pair<ggml_tensor *, ggml_tensor *> * parts) {
+        std::pair<ggml_tensor *, ggml_tensor *> * parts,
+        const std::function<std::array<ggml_tensor *, 3>()> & part1_qkv) {
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
@@ -563,11 +564,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t S_v          = s->ne[0];
     const int64_t H_v          = s->ne[2];
     const int64_t n_seqs       = s->ne[3];
-    const int64_t n_seq_tokens = q->ne[2];
+    // q, k, v hold only the first part when the caller split its conv (part1_qkv); g and b hold all tokens
+    const int64_t n_seq_tokens = part1_qkv ? g->ne[2] : q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
 
     if (!keep) {
+        GGML_ASSERT(!part1_qkv);
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
@@ -592,11 +595,22 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         const int64_t t = n_seq_tokens - K;
         const int64_t n = n_seq_tokens;
 
-        auto part0 = build_delta_net(slice_tokens(q, 0, t), slice_tokens(k, 0, t), slice_tokens(v, 0, t),
-                                     slice_tokens(g, 0, t), slice_tokens(b, 0, t), s, il);
+        // with part1_qkv the caller split its conv at t too: q, k, v are the first part's, the last K tokens' are built after it
+        GGML_ASSERT(!part1_qkv || (q->ne[2] == t && k->ne[2] == t && v->ne[2] == t));
+        auto part0 = part1_qkv
+                ? build_delta_net(q, k, v, slice_tokens(g, 0, t), slice_tokens(b, 0, t), s, il)
+                : build_delta_net(slice_tokens(q, 0, t), slice_tokens(k, 0, t), slice_tokens(v, 0, t),
+                                  slice_tokens(g, 0, t), slice_tokens(b, 0, t), s, il);
         ggml_build_forward_expand(gf, part0.first);
 
-        ggml_tensor * gdn1 = ggml_gated_delta_net(ctx0, slice_tokens(q, t, n), slice_tokens(k, t, n), slice_tokens(v, t, n),
+        std::array<ggml_tensor *, 3> qkv1;
+        if (part1_qkv) {
+            qkv1 = part1_qkv();
+            GGML_ASSERT(qkv1[0]->ne[2] == K && qkv1[1]->ne[2] == K && qkv1[2]->ne[2] == K);
+        } else {
+            qkv1 = { slice_tokens(q, t, n), slice_tokens(k, t, n), slice_tokens(v, t, n) };
+        }
+        ggml_tensor * gdn1 = ggml_gated_delta_net(ctx0, qkv1[0], qkv1[1], qkv1[2],
                                                   slice_tokens(g, t, n), slice_tokens(b, t, n), part0.second, K);
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn1, il});
 
@@ -614,6 +628,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         *parts = { part0.first, out1 };
         return nullptr;
     }
+
+    GGML_ASSERT(!part1_qkv);
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
