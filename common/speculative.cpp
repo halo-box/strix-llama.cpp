@@ -2324,7 +2324,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             if (is_mem_shared && !batch_in.tokens[i_batch_end[seq_id]].output) {
                 verify_h_rows[seq_id] = 0;
                 continue;
@@ -2334,8 +2333,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     batch_in.tokens.begin() + i_batch_beg[seq_id],
                     batch_in.tokens.begin() + i_batch_end[seq_id] + 1,
                     [](const common_batch::token & token) { return token.output; });
-            const int32_t h_rows = is_mem_shared && !all_rows_output ? 1 : n_rows;
-            const int32_t h_offset = is_mem_shared && !all_rows_output ? i_batch_end[seq_id] : i_batch_beg[seq_id];
+            // accept() reads the row of the last accepted draft token, and only the rows of a verify batch carry
+            // outputs: keep the rows from the first output row on. A prompt batch outputs its last row at most, so
+            // it keeps only that row, the carry.
+            int32_t i_out = i_batch_end[seq_id];
+            for (int32_t k = i_batch_beg[seq_id]; k <= i_batch_end[seq_id]; ++k) {
+                if (batch_in.tokens[k].seq_id == seq_id && batch_in.tokens[k].output) {
+                    i_out = k;
+                    break;
+                }
+            }
+            const int32_t h_offset = !is_mem_shared ? i_out : all_rows_output ? i_batch_beg[seq_id] : i_batch_end[seq_id];
+            const int32_t h_rows   = i_batch_end[seq_id] - h_offset + 1;
 
             verify_h_rows[seq_id] = h_rows;
 
