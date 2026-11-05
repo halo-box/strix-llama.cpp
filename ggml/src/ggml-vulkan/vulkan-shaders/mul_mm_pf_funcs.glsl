@@ -261,6 +261,30 @@ void store_a_raw(const uint pos_a, const uint row, const uint col, const uint si
     buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(v1.xy));
     buf_a[sidx + 3] = TO_BUF(FLOAT_TYPEV2(v1.zw));
 }
+#elif LOAD_VEC_A == 8 && defined(DATA_A_TQ2_T)
+// 34 B blocks (d, then 32 path bytes; 2-byte aligned, 17 words). One call = 8 weights = trellis steps t0, t0 + 1 (t0 even), whose
+// states read path bytes t0 - 1 (circular), t0 and t0 + 1: word qs[t0 / 2] holds t0 and t0 + 1, the high byte of the word before it
+// (circular inside the block, so word 15 for t0 = 0) holds t0 - 1. Two 16-bit loads and d instead of three byte loads and d.
+#define A_PREFETCH 1
+#define A_RAW_T uvec2   // x: b(t0-1) << 16 | b(t0) << 8 | b(t0+1), y: d bits
+uint a_lane_off(const uint row, const uint col) { return col * (p.stride_a / LOAD_VEC_A) + row; }
+void fetch_a(const uint pos_a, const uint row, const uint col, const uint lane_off, out A_RAW_T raw) {
+    const uint idx = pos_a + lane_off;
+    const uint wb  = (idx / 16) * 17;   // block base in 16-bit words
+    const uint w   = idx & 15u;         // word of path bytes t0, t0 + 1
+    const uint cur = uint(data_a_u16[wb + 1 + w]);
+    const uint prv = uint(data_a_u16[wb + 1 + ((w + 15u) & 15u)]);
+    raw = uvec2(((prv >> 8) << 16) | ((cur & 0xFFu) << 8) | (cur >> 8), uint(data_a_u16[wb]));
+}
+void store_a_raw(const uint pos_a, const uint row, const uint col, const uint sidx, const A_RAW_T raw) {
+    const float d = float(uint16BitsToFloat16(uint16_t(raw.y)));
+    const vec4 lo = tq2_t_step(raw.x >> 8) * d;
+    const vec4 hi = tq2_t_step(raw.x & 0xFFFFu) * d;
+    buf_a[sidx]     = TO_BUF(FLOAT_TYPEV2(lo.xy));
+    buf_a[sidx + 1] = TO_BUF(FLOAT_TYPEV2(lo.zw));
+    buf_a[sidx + 2] = TO_BUF(FLOAT_TYPEV2(hi.xy));
+    buf_a[sidx + 3] = TO_BUF(FLOAT_TYPEV2(hi.zw));
+}
 #endif
 
 void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
@@ -471,6 +495,25 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair, FLOAT_TYPEV2(v.xy));
+#elif defined(DATA_A_TQ2_T)
+            // LOAD_VEC_A == 8: two trellis steps, which read three consecutive path bytes (as mul_mm_funcs.glsl)
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+            const uint ib = idx / 16;
+            const uint t0 = (idx & 0xfu) * 2u;
+
+            const float d = float(data_a[ib].d);
+            const uint b0 = uint(data_a[ib].qs[(t0 + 31u) & 31u]);
+            const uint b1 = uint(data_a[ib].qs[t0]);
+            const uint b2 = uint(data_a[ib].qs[t0 + 1u]);
+            const vec4 lo = tq2_t_step((b0 << 8u) | b1) * d;
+            const vec4 hi = tq2_t_step((b1 << 8u) | b2) * d;
+
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            store_a(col, k_pair,     FLOAT_TYPEV2(lo.xy));
+            store_a(col, k_pair + 1, FLOAT_TYPEV2(lo.zw));
+            store_a(col, k_pair + 2, FLOAT_TYPEV2(hi.xy));
+            store_a(col, k_pair + 3, FLOAT_TYPEV2(hi.zw));
 #elif defined(DATA_A_Q3_K)
 #if LOAD_VEC_A == 8
             A_RAW_T raw;

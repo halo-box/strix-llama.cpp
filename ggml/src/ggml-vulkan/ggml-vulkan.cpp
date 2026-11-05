@@ -1975,6 +1975,7 @@ static const std::vector<std::string> & ggml_vk_mmid_route_list();
 // MUL_MAT_ID types routed off int8 MMQ onto the f16-B coopmat pf tile when GGML_VK_MMID_F16COOPMAT is unset (see ggml_vk_mmid_f16coopmat)
 static const char * const ggml_vk_mmid_route_default = "iq3_xxs,iq4_nl";
 static bool ggml_vk_mm_prefetch_type(ggml_type t);
+static bool ggml_vk_mmid_tq2t_pf_enabled();
 static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b_f16 = false);
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
 // GGML_VK_MMID_MANUAL_FRAG (default 1): MUL_MAT_ID pf / REG_A pipelines take the manual-fragment "_mf" builds when the RDNA3
@@ -1990,6 +1991,14 @@ static bool ggml_vk_mmid_rowid_fill_enabled() {
 static bool ggml_vk_mmid_b_full_enabled() {
     static const bool v = [] { const char * e = getenv("GGML_VK_MMID_B_FULL"); return (e == nullptr || atoi(e) != 0) && ggml_vk_mmid_rowid_fill_enabled(); }();
     return v;
+}
+
+// GGML_VK_MMID_TQ2T_B_FULL (default 0): the TQ2_T pf pipelines are built without MMID_B_FULL; the full-tile B load and the
+// unguarded warp columns cost TQ2_T more than they save (Gyro-M pp2048 on gfx1151: gate/up 8.98 -> 7.67, down 5.28 -> 4.78 ms
+// per layer without them)
+static bool ggml_vk_mmid_tq2t_b_full_enabled() {
+    static const bool v = [] { const char * e = getenv("GGML_VK_MMID_TQ2T_B_FULL"); return e != nullptr && atoi(e) != 0; }();
+    return v && ggml_vk_mmid_b_full_enabled();
 }
 
 static bool ggml_vk_mmid_manual_frag_enabled() {
@@ -3616,6 +3625,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // GGML_VK_MMID_B_FULL (default 1, only with GGML_VK_MMID_ROWID_FILL on): spec constant 17, the B tile loads without the
             // per-lane row guard (mul_mm.comp PF_B_GUARD). It needs every row-id slot valid, so it is off whenever the fill is off.
             const bool mmid_b_full = ggml_vk_mmid_b_full_enabled();
+            // per-type override while one type's pipelines are created (GGML_VK_MMID_TQ2T_B_FULL)
+            bool pf_b_full_off = false;
             // GGML_VK_MMID_B_FULL_LOG=1: per MUL_MAT_ID pf / REG_A tile, whether the shader's B_FULL condition (BN % loadstride_b == 0,
             // loadstride_b = BLOCK_SIZE * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK as in mul_mm.comp) holds, so it drops the guard, or keeps it
             auto b_full_log = [&](const std::vector<uint32_t>& wt, bool a) {
@@ -3630,8 +3641,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (spec.size() == 12) { spec.push_back(ggml_vk_coopmat_shmem_pad(device, wt[3])); spec.push_back(0); }   // 12, 13
                 while (spec.size() < 16) { spec.push_back(0); }                                                           // 14, 15 (REG_A off)
                 spec.push_back(mf_skew ? 1u : 0u);                                                                          // 16: MF_SKEW
-                spec.push_back(mmid_b_full ? 1u : 0u);                                                                      // 17: MMID_B_FULL
-                b_full_log(wt, a);
+                spec.push_back(mmid_b_full && !pf_b_full_off ? 1u : 0u);                                                    // 17: MMID_B_FULL
+                if (!pf_b_full_off) { b_full_log(wt, a); }
                 return spec;
             };
             auto cm1_create_mmid_pf = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
@@ -3669,6 +3680,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             X_CM1_ID_PF(GGML_TYPE_IQ4_XS, iq4_xs)
             X_CM1_ID_PF(GGML_TYPE_IQ3_XXS, iq3_xxs)
             X_CM1_ID_PF(GGML_TYPE_IQ4_NL, iq4_nl)
+#ifdef GGML_USE_TRELLIS
+            if (ggml_vk_mmid_tq2t_pf_enabled()) {
+                pf_b_full_off = !ggml_vk_mmid_tq2t_b_full_enabled();
+                X_CM1_ID_PF(GGML_TYPE_TQ2_T, tq2_t)
+                pf_b_full_off = false;
+            }
+#endif
 #undef X_CM1_ID_PF
             // REG_A tile for the aligned iq3_xxs / iq4_nl MUL_MAT_ID pf pipelines (keyed xl = true on the id keys): 128 threads
             // = 4 wave32 subgroups, BM 128 x BN 64, each subgroup owns WM 32 rows and all 64 columns; spec constant 15 = 3
@@ -8587,11 +8605,27 @@ static bool ggml_vk_mmid_rega_enabled(const vk_device& device) {
     return env >= 0 ? env != 0 : device->coopmat_rdna3_layout;
 }
 
+// GGML_VK_MMID_TQ2T_PF (default 1, 0 = the generic KHR coopmat tile): TQ2_T MUL_MAT_ID takes the register-prefetch tile
+// (mul_mm_pf_funcs.glsl) and its f16-output twin, so MUL_MAT_ID(+MUL)+CPY(f16) fuses as on the routed f16-B types. MUL_MAT_ID only:
+// no dense TQ2_T pf pipeline is built, so dense TQ2_T falls through to the generic tiles.
+static bool ggml_vk_mmid_tq2t_pf_enabled() {
+#ifdef GGML_USE_TRELLIS
+    static const bool on = [] { const char * e = getenv("GGML_VK_MMID_TQ2T_PF"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+#else
+    return false;
+#endif
+}
+
 static bool ggml_vk_mm_prefetch_type(ggml_type t) {
     switch (t) {
         case GGML_TYPE_Q8_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q3_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
         case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ4_NL:
             return true;
+#ifdef GGML_USE_TRELLIS
+        case GGML_TYPE_TQ2_T:
+            return ggml_vk_mmid_tq2t_pf_enabled();
+#endif
         default:
             return false;
     }
@@ -8696,6 +8730,12 @@ static const std::vector<std::string> & ggml_vk_mmid_route_list() {
 }
 
 static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
+#ifdef GGML_USE_TRELLIS
+    // TQ2_T has no int8 MMQ: its pf tile is always the f16-B route (GGML_VK_MMID_TQ2T_PF)
+    if (t == GGML_TYPE_TQ2_T) {
+        return ggml_vk_mmid_tq2t_pf_enabled();
+    }
+#endif
     return ggml_vk_route_match(ggml_vk_mmid_route_list(), t);
 }
 
@@ -11456,7 +11496,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_path_census_add((std::string("MUL_MAT_ID_ALL:") + ggml_type_name(src0->type)).c_str());
         if (pipeline->name.find("_pf") != std::string::npos) {
             ggml_vk_path_census_add("MUL_MAT_ID_PF");
-            if (ggml_vk_mmid_b_full_enabled()) {
+            if (src0->type == GGML_TYPE_TQ2_T ? ggml_vk_mmid_tq2t_b_full_enabled() : ggml_vk_mmid_b_full_enabled()) {
                 ggml_vk_path_census_add("MUL_MAT_ID_B_FULL");   // the pf / REG_A pipelines were built with spec constant 17 set
             }
             ggml_vk_path_census_add((std::string("MUL_MAT_ID_PF:") + ggml_type_name(src0->type)).c_str());
