@@ -1594,7 +1594,7 @@ private:
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
-        const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
+        const int n_ctx_max = n_ctx_model();
 
         {
             // note: the capping itself is done in n_ctx_slot(), here we only report it
@@ -1617,9 +1617,9 @@ private:
             const int n_ctx_capped = params_base.kv_unified_per_slot > 0 ?
                 std::min(n_ctx_seq, params_base.kv_unified_per_slot) : n_ctx_seq;
 
-            if (n_ctx_capped > n_ctx_train) {
-                SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n",
-                        n_ctx_capped, n_ctx_train);
+            if (n_ctx_capped > n_ctx_max) {
+                SRV_WRN("the slot context (%d) exceeds the context the model can serve (%d: the training context, or what a linear --rope-scale / --rope-freq-scale extends it to) - capping\n",
+                        n_ctx_capped, n_ctx_max);
             }
         }
 
@@ -4861,7 +4861,37 @@ private:
         });
     }
 
-    // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
+    // the context the model can serve: its training context, extended by a linear RoPE scale below the trained one.
+    // YaRN needs nothing here: llama_init_from_model (src/llama-context.cpp, "custom YaRN scaling detected") already set
+    // n_ctx_train to n_ctx_orig_yarn / rope_freq_scale when the YaRN scale differs from the trained one.
+    int n_ctx_model() const {
+        const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
+        const float scale = params_base.rope_freq_scale;
+        const float scale_train = llama_model_rope_freq_scale_train(model_tgt);
+        if (scale > 0.0f && scale < scale_train && rope_scaling_type() == LLAMA_ROPE_SCALING_TYPE_LINEAR) {
+            return (int) std::min<double>((double) n_ctx_train * scale_train / scale, (double) INT32_MAX);
+        }
+        return n_ctx_train;
+    }
+
+    // --rope-scaling, or the GGUF's trained type when it is not given (resolved as llama_context does)
+    llama_rope_scaling_type rope_scaling_type() const {
+        if (params_base.rope_scaling_type != LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
+            return params_base.rope_scaling_type;
+        }
+        char arch[64] = {};
+        char type[32] = {};
+        std::string t = "linear";   // the loader's default when the GGUF has no type
+        if (llama_model_meta_val_str(model_tgt, "general.architecture", arch, sizeof(arch)) >= 0 &&
+            llama_model_meta_val_str(model_tgt, (std::string(arch) + ".rope.scaling.type").c_str(), type, sizeof(type)) >= 0) {
+            t = type;
+        }
+        return t == "none" ? LLAMA_ROPE_SCALING_TYPE_NONE : t == "yarn" ? LLAMA_ROPE_SCALING_TYPE_YARN :
+               t == "linear" ? LLAMA_ROPE_SCALING_TYPE_LINEAR : t == "longrope" ? LLAMA_ROPE_SCALING_TYPE_LONGROPE :
+               LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
+    }
+
+    // context size of a single slot, capped by --kv-unified-per-slot and by the context the model can serve
     int n_ctx_slot() const {
         int res = llama_n_ctx_seq(ctx_tgt);
 
@@ -4869,7 +4899,7 @@ private:
             res = std::min(res, params_base.kv_unified_per_slot);
         }
 
-        return std::min(res, llama_model_n_ctx_train(model_tgt));
+        return std::min(res, n_ctx_model());
     }
 
     server_response_reader get_response_reader() {

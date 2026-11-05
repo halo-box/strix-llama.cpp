@@ -873,6 +873,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
+    // the next graph is built and allocated while the previous one still runs: process_ubatch synchronizes before it
+    // writes the inputs, so the realloc does not have to
+    ggml_backend_sched_set_lazy_realloc_sync(sched.get(), true);
+
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
@@ -1822,8 +1826,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        // The previous asynchronous graph may still use allocations that reset releases.
-        ggml_backend_sched_synchronize(sched.get());
+        // The previous asynchronous graph may still use allocations that reset releases. Building and allocating the
+        // new graph only assigns addresses on the host, and the backends order their own device work (weight
+        // repacks, pool memory) on their streams, so this waits only before the inputs are written
+        // below; the GPU keeps running the previous ubatch meanwhile.
 
         gf_res_prev_active = nullptr;
         res->reset();
@@ -1856,6 +1862,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
+        // the inputs may share memory with tensors of the previous graph: it must be done (see the reset above). A reused
+        // graph too: on an integrated GPU the device reads host input buffers in place (no copy), so the previous ubatch
+        // may still be reading the mask and positions this would overwrite
+        ggml_backend_sched_synchronize(sched.get());
+
         const auto t_inputs_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated

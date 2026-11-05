@@ -509,6 +509,8 @@ struct node_alloc {
 };
 
 struct ggml_gallocr {
+    void (*free_cb)(void * user_data); // before an existing buffer is freed by a reserve
+    void * free_cb_ud;
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
@@ -1201,6 +1203,9 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
+            if (galloc->buffers[i] != NULL && galloc->free_cb != NULL) {
+                galloc->free_cb(galloc->free_cb_ud);
+            }
             ggml_vbuffer_free(galloc->buffers[i]);
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
@@ -1220,6 +1225,11 @@ static bool ggml_gallocr_reserve_n_impl(
         return false;
     }
     return true;
+}
+
+void ggml_gallocr_set_free_callback(ggml_gallocr_t galloc, void (*cb)(void * user_data), void * user_data) {
+    galloc->free_cb    = cb;
+    galloc->free_cb_ud = user_data;
 }
 
 void ggml_gallocr_reserve_n_size(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pick the test-backend-ops perf cases that bench-gfx1151-history runs besides MUL_MAT and MUL_MAT_ID.
+"""Pick the test-backend-ops perf cases that bench-gfx1151-ops-perf runs besides MUL_MAT and MUL_MAT_ID.
 
 Reads the full perf case list, one `OP(params)` string per line, and keeps an evenly spaced sample of
 each op's cases (first, last and evenly in between): at least 3 per op, or 1 in 20 for large ops.
@@ -28,7 +28,7 @@ def main() -> int:
             seen.add(line)
             by_op.setdefault(m.group(1), []).append(line)
     out = sys.stdout
-    out.write('# test-backend-ops perf cases run by .github/workflows/bench-gfx1151-history.yml besides the\n'
+    out.write('# test-backend-ops perf cases run by .github/workflows/bench-gfx1151-ops-perf.yml besides the\n'
               '# all-types MUL_MAT and MUL_MAT_ID cases; written by scripts/bench-history/select_perf_cases.py\n')
     for op, cases in by_op.items():
         k = min(len(cases), max(3, math.ceil(len(cases) / 20)))

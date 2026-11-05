@@ -17,7 +17,12 @@ bool ggml_cuda_gdn_chunk_eligible(const ggml_tensor * gdn, const ggml_tensor * q
 void ggml_cuda_gdn_set_qk_norm(const ggml_tensor * gdn, const ggml_tensor * q_raw, const ggml_tensor * k_raw, float eps, float mul);
 // chunked prefill: the gated RMS norm of the output (RMS_NORM -> MUL(w) -> MUL(sigmoid(z))) written by the scan kernel
 // straight into out (+ optional BF16 copy out16); z / out laid out like the GDN output rows [S_v, H, T]
-void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const float * z, float * out, uint16_t * out16, float eps);
+// out16_f16: out16 holds F16 (saturating) instead of BF16, for an MMB_DENSE_F16 reader
+// z_bf16: z holds BF16 (the z GEMM stored only the BF16 copy, see ggml_cuda_gdn_z16_ok)
+void ggml_cuda_gdn_set_out_norm(const ggml_tensor * gdn, const float * w, const float * z, float * out, uint16_t * out16, float eps,
+        bool out16_f16 = false, bool z_bf16 = false);
+// graph-time predicate: the z GEMM feeding the gated output norm of this GDN node may store BF16 only
+bool ggml_cuda_gdn_z16_ok(const ggml_tensor * gdn);
 // chunked prefill: the causal conv + SiLU producing q/k/v is computed by the chunk kernels from the raw conv input
 // x [T, C] (row stride C floats), history st [C, 3] and taps cw [C, 4]; qc/kc/vc = channel of element 0 of each view
 void ggml_cuda_gdn_set_conv(const ggml_tensor * gdn, const float * x, const float * st, const float * cw,

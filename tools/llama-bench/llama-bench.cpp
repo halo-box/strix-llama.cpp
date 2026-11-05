@@ -2216,6 +2216,9 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
 
     std::vector<llama_token> tokens(n_batch);
 
+    // same prompt on every call: a rep must benchmark the same workload (warm-up included)
+    std::srand(1);
+
     int n_processed = 0;
 
     while (n_processed < n_prompt) {

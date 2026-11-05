@@ -268,10 +268,11 @@ struct vk_matmul_pipeline_key {
     bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl, GGML_VK_MM_PREFETCH)
     bool xl = false;    // the 256x256 XL tile tier of the pf variant (aligned only, ggml_vk_mm_xl_ok)
     bool hcmix = false; // the int8 MMQ hc up GEMM with the gated hc pre in its epilogue (HC_UP_MIX, mul_mmq_cm1.comp HC_EPI)
+    bool qsa = false;   // the f32 x f32 KHR coopmat GEMM with the QSA scorer epilogue (QSA_SCORE, mul_mm.comp QSA_EPI)
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl, hcmix)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl, o.hcmix);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, d16, glu, pf, xl, hcmix, qsa)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.d16, o.glu, o.pf, o.xl, o.hcmix, o.qsa);
     }
 };
 
@@ -533,6 +534,22 @@ static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_R
                                                                    GGML_OP_CONT,     GGML_OP_CPY,
                                                                    GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                    GGML_OP_TOP_K };
+
+// qwen4exp QSA indexer scorer as build_qsa_top_k emits it (QSA_SCORE, see ggml_vk_match_qsa_score): the GEMM, the relu and
+// the four head slices summed, then the block bias on the masked path. The maskless path applies the visibility through the
+// compact-limits ops (cast, repeat, sub, step, log, add) after the head sum, so only the shorter pattern matches there.
+// graph_optimize keeps either in this order; otherwise independent nodes are hoisted into the chain and it never fuses.
+static constexpr std::initializer_list<ggml_op> qsa_score_pattern { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+                                                                    GGML_OP_VIEW,    GGML_OP_CONT,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                    GGML_OP_ADD };
+static constexpr std::initializer_list<ggml_op> qsa_score_pattern_nobias { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+                                                                           GGML_OP_VIEW,    GGML_OP_CONT,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD,
+                                                                           GGML_OP_VIEW,    GGML_OP_ADD };
 
 static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
     { 1, 0, 0 }, // permute->src[0] == get_rows
@@ -823,6 +840,9 @@ struct vk_device_struct {
     matmul_tile_selector_t matmul_id_tile_selector;
 
     vk_pipeline pipeline_matmul_split_k_reduce;
+    // dense q8_0 x f16 GEMM (mul_mm_dq8.comp): [f32 / f16 output][tile config], see ggml_vk_dense_dq8_cfgs
+    vk_pipeline pipeline_matmul_dq8[2][5];
+    vk_pipeline pipeline_matmul_dq8_hcmix[2];   // HC_UP_MIX epilogue, [f32 / f16 mixed stream]
     vk_pipeline pipeline_quantize_q8_1_x4;
     vk_pipeline pipeline_quantize_q8_1_x4_f16;   // f16 input (int8 MMQ with an f16 B)
 
@@ -975,6 +995,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
+    vk_pipeline pipeline_qsa_expand[2];  // qwen4exp complete-block selection after TOP_K: [0] bitonic (strips), [1] rank (<= 8 rows)
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_sum_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
@@ -1068,6 +1089,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
     vk_pipeline pipeline_count_experts;
+    vk_pipeline pipeline_mmid_glu[2][2][2];   // MUL_MAT_ID_PAIR_SWIGLU (mul_mm_id_glu.comp): [q4_K, q5_K][f32 output][f32 B]
+    vk_pipeline pipeline_mmid_down_q51[2];   // streaming MUL_MAT_ID(+MUL)+CPY(f16) down (mul_mm_id_down.comp): [0] f16 B, [1] f32 B
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
@@ -1381,14 +1404,27 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    // qwen4exp complete-block selection after TOP_K (QSA_EXPAND): the inputs and output of the matched chain
+    bool fused_qsa_expand {};
+    struct qsa_expand_args {
+        const ggml_tensor * blocks;   // TOP_K ids
+        const ggml_tensor * scores;
+        const ggml_tensor * cells;    // [r, n_blocks] view of the block cells
+        const ggml_tensor * tail;
+        ggml_tensor * out;            // the CONCAT
+    } qsa_expand {};
     bool fused_hc_post_gate {};
     // hc combine + next hc norm (dsv4_hc_post_norm.comp): HC_POST_NORM_* modes, 0 = none
     int fused_hc_post_norm {};
     // MUL_MAT+CPY(f16): the matmul stores f16 into the cast's destination
     bool fused_mm_cpy16 {};
     bool fused_hc_up_mix {};   // MUL_MAT + CPY(f16) + RESHAPE + DSV4_HC_PRE (gated) -> one int8 MMQ GEMM with the mix epilogue
+    bool fused_qsa_score {};   // QSA scorer: MUL_MAT + RELU + 4-head sum (+ block bias) in the GEMM epilogue (QSA_SCORE)
+    const ggml_tensor * qsa_score_bias {};   // the block bias of a QSA_SCORE chain, or nullptr
     bool fused_mmid_cpy16 {};   // MUL_MAT_ID(+MUL)+CPY(f16): the expert GEMM stores f16 into the cast destination
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
+    bool fused_mmid_pair_glu {};   // MUL_MAT_ID+CPY(f16) x 2 + SWIGLU: gate, up and the SwiGLU in one weight-streaming launch
+    bool fused_mmid_pair_glu_f32 {};   // ... its f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {

@@ -88,18 +88,26 @@ static inline bool ggml_cuda_conv_whole(const ggml_tensor * s, const ggml_tensor
 }
 
 // concat src[1] is TRANSPOSE(view of x): x must be the whole contiguous storage of a [C, T] activation, whatever
-// shape its producer gave it (qwen4exp's grouped norm leaves it [n_embd, hc, T]); C and T come from the transpose
-static inline const ggml_tensor * ggml_cuda_conv_activation(const ggml_tensor * tr, int64_t & C, int64_t & T) {
+// shape its producer gave it (qwen4exp's grouped norm leaves it [n_embd, hc, T]); C and T come from the transpose.
+// With S > 1 sequences the transpose is [T, C, S] and x holds the S [C, T] blocks back to back.
+static inline const ggml_tensor * ggml_cuda_conv_activation_seqs(const ggml_tensor * tr, int64_t & C, int64_t & T, int64_t & S) {
     if (!tr || tr->op != GGML_OP_TRANSPOSE || tr->type != GGML_TYPE_F32 || !tr->view_src || tr->view_offs != 0 ||
-        tr->ne[2] != 1 || tr->ne[3] != 1) {
+        tr->ne[3] != 1) {
         return nullptr;
     }
     T = tr->ne[0];
     C = tr->ne[1];
+    S = tr->ne[2];
     const ggml_tensor * x = tr->view_src;
-    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x) != C * T ||
-        tr->nb[1] != sizeof(float) || tr->nb[0] != (size_t) C * sizeof(float)) {
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || ggml_nelements(x) != C * T * S ||
+        tr->nb[1] != sizeof(float) || tr->nb[0] != (size_t) C * sizeof(float) || (S > 1 && tr->nb[2] != (size_t) C * T * sizeof(float))) {
         return nullptr;
     }
     return x;
+}
+
+static inline const ggml_tensor * ggml_cuda_conv_activation(const ggml_tensor * tr, int64_t & C, int64_t & T) {
+    int64_t S = 0;
+    const ggml_tensor * x = ggml_cuda_conv_activation_seqs(tr, C, T, S);
+    return S == 1 ? x : nullptr;
 }

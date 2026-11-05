@@ -1,9 +1,10 @@
 # Nightly ROCm release builds of this fork, same layout as lemonade-sdk/llamacpp-rocm
 # (https://github.com/lemonade-sdk/llamacpp-rocm, MIT) so the zips drop into the same tooling.
 # Differences: builds this repository instead of cloning upstream llama.cpp, releases on every merge to
-# master instead of nightly, builds Linux only by default (Windows still selectable by dispatch), uses the
-# job token when no GH_TOKEN secret exists, and runs the self-hosted Strix Halo tests only when the runners
-# are registered.
+# master instead of nightly, pins ROCm 10.1 (the version halo-box HIP work is built and tested on), adds
+# Linux and Windows Vulkan zips, uses the job token when no GH_TOKEN secret exists, and runs the self-hosted
+# Strix Halo tests only when the runners are registered. Windows builds are best effort: a failed Windows
+# job leaves its zip out of the release instead of blocking the Linux zips.
 name: Build Llama.cpp + ROCm
 on:
   workflow_dispatch:
@@ -11,21 +12,21 @@ on:
       operating_systems:
         description: 'Operating systems to build for (comma-separated: windows,ubuntu)'
         required: false
-        default: 'ubuntu'
+        default: 'windows,ubuntu'
       gfx_target:
         description: 'AMD GPU targets (comma-separated; this fork supports Strix Halo / gfx1151 only)'
         required: false
         default: 'gfx1151'
       rocm_version:
-        description: 'ROCm version to use (e.g., 7.13.0a20260318) or "latest" to auto-detect'
+        description: 'ROCm version to use (e.g., 10.1.0a20260910) or "latest" to auto-detect the newest nightly'
         required: false
-        default: 'latest'
+        default: '10.1.0a20260910'
       llamacpp_version:
         description: 'Branch or tag of this repository to build, or "latest" for master'
         required: false
         default: 'latest'
       vulkan:
-        description: 'Also build the Linux Vulkan zip'
+        description: 'Also build the Linux and Windows Vulkan zips'
         required: false
         default: true
         type: boolean
@@ -53,10 +54,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  OPERATING_SYSTEMS: ${{ github.event.inputs.operating_systems || 'ubuntu' }}
+  OPERATING_SYSTEMS: ${{ github.event.inputs.operating_systems || 'windows,ubuntu' }}
   # this fork only supports Strix Halo (gfx1151)
   GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151' }}
-  ROCM_VERSION: ${{ github.event.inputs.rocm_version || 'latest' }}
+  # ROCm 10.1 has no stable release yet, so pin the last 10.1 nightly (2026-09-10) for both OSes
+  ROCM_VERSION: ${{ github.event.inputs.rocm_version || '10.1.0a20260910' }}
+  VULKAN_SDK_VERSION: 1.4.357.0
   LLAMACPP_VERSION: ${{ github.event.inputs.llamacpp_version || 'latest' }}
   # on a push, build exactly the merged commit
   BUILD_SHA: ${{ github.event_name == 'push' && github.sha || '' }}
@@ -909,6 +912,69 @@ jobs:
       id: set-outputs
       run: echo "llamacpp_commit_hash=${LLAMACPP_COMMIT_HASH}" >> $GITHUB_OUTPUT
 
+  build-windows-vulkan:
+    # Windows Vulkan build of the same commit. Same portable layout as the Linux zip (runtime-loaded
+    # CPU variants and backends); uses the Vulkan loader and AMD driver installed on the user's system.
+    # The clang toolchain matches upstream's Windows CPU release build. Not pinned to windows-2022 like the
+    # HIP job: that image has Clang 19, and the fetched LLVM OpenMP needs Clang 20.
+    runs-on: windows-2025-vs2026
+    needs: prepare-matrix
+    if: |
+      github.event.inputs.vulkan != 'false' &&
+      needs.prepare-matrix.outputs.should_build_windows == 'true'
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ env.BUILD_SHA != '' && env.BUILD_SHA || (env.LLAMACPP_VERSION == 'latest' && 'master' || env.LLAMACPP_VERSION) }}
+        path: llama.cpp
+
+    - name: Install Vulkan SDK
+      run: |
+        curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_SDK_VERSION}.exe"
+        & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+        Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_SDK_VERSION}"
+        Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_SDK_VERSION}\bin"
+
+    - name: Install Ninja
+      run: choco install ninja
+
+    - name: Build Llama.cpp + Vulkan
+      shell: cmd
+      run: |
+        call "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vs_path.txt
+        set /p VS_PATH=<vs_path.txt
+        call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+        cd llama.cpp
+        git log --oneline -1
+        cmake -S . -B build -G Ninja ^
+          -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+          -DCMAKE_BUILD_TYPE=Release ^
+          -DBUILD_SHARED_LIBS=ON ^
+          -DLLAMA_BUILD_TESTS=OFF ^
+          -DGGML_VULKAN=ON ^
+          -DGGML_RPC=ON ^
+          -DGGML_NATIVE=OFF ^
+          -DGGML_BACKEND_DL=ON ^
+          -DGGML_CPU_ALL_VARIANTS=ON ^
+          -DGGML_OPENMP=ON ^
+          -DGGML_OPENMP_FETCH=ON ^
+          -DLLAMA_BUILD_BORINGSSL=ON
+        if errorlevel 1 exit /b 1
+        cmake --build build -j %NUMBER_OF_PROCESSORS%
+        if errorlevel 1 exit /b 1
+        copy LICENSE build\bin\
+        dir build\bin
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: llama-windows-vulkan-x64
+        path: llama.cpp/build/bin/
+        retention-days: 30
+
   test-stx-halo:
     runs-on: ${{ matrix.runner }}
     needs: [prepare-matrix, build-windows, build-ubuntu]
@@ -941,14 +1007,14 @@ jobs:
         artifact_name: llama-${{ matrix.artifact_prefix }}-rocm-${{ matrix.gfx_target }}-x64
 
   create-release:
-    needs: [prepare-matrix, build-windows, build-ubuntu, build-ubuntu-vulkan, test-stx-halo]
+    needs: [prepare-matrix, build-windows, build-ubuntu, build-ubuntu-vulkan, build-windows-vulkan, test-stx-halo]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
       pull-requests: write
+    # Windows jobs are best effort and do not gate the release; a missing Windows zip is left out
     if: |
       always() &&
-      (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
       (needs.build-ubuntu.result == 'success' || needs.build-ubuntu.result == 'skipped') &&
       (needs.build-ubuntu-vulkan.result == 'success' || needs.build-ubuntu-vulkan.result == 'skipped') &&
       (needs.build-windows.result == 'success' || needs.build-ubuntu.result == 'success') &&
@@ -1050,10 +1116,12 @@ jobs:
           done
         done
 
-        if [ -d "./all-artifacts/llama-ubuntu-vulkan-x64" ]; then
-          echo "Creating archive: llama-${TAG}-ubuntu-vulkan-x64.zip"
-          (cd ./all-artifacts/llama-ubuntu-vulkan-x64 && zip -r "../../llama-${TAG}-ubuntu-vulkan-x64.zip" *)
-        fi
+        for os in ubuntu windows; do
+          if [ -d "./all-artifacts/llama-${os}-vulkan-x64" ]; then
+            echo "Creating archive: llama-${TAG}-${os}-vulkan-x64.zip"
+            (cd "./all-artifacts/llama-${os}-vulkan-x64" && zip -r "../../llama-${TAG}-${os}-vulkan-x64.zip" *)
+          fi
+        done
 
         echo "Created archives:"
         ls -la *.zip
@@ -1080,8 +1148,9 @@ jobs:
         # Verify archives exist
         ls -la *.zip
 
-        # Prepare upload files list
+        # Prepare upload files list; list only the OSes whose zips were actually built
         upload_files=""
+        rocm_os=""
         IFS=',' read -ra TARGET_ARRAY <<< "$targets"
         IFS=',' read -ra OS_ARRAY <<< "$operating_systems"
 
@@ -1093,14 +1162,26 @@ jobs:
             final_archive_name="llama-${TAG}-${os}-rocm-${target}-x64"
             if [ -f "${final_archive_name}.zip" ]; then
               upload_files="${upload_files} ${final_archive_name}.zip"
+              case " $rocm_os " in *" $os "*) ;; *) rocm_os="${rocm_os:+$rocm_os, }$os" ;; esac
             fi
           done
         done
 
+        vulkan_os=""
+        for os in ubuntu windows; do
+          if [ -f "llama-${TAG}-${os}-vulkan-x64.zip" ]; then
+            upload_files="${upload_files} llama-${TAG}-${os}-vulkan-x64.zip"
+            vulkan_os="${vulkan_os:+$vulkan_os, }$os"
+          fi
+        done
         vulkan_line=""
-        if [ -f "llama-${TAG}-ubuntu-vulkan-x64.zip" ]; then
-          upload_files="${upload_files} llama-${TAG}-ubuntu-vulkan-x64.zip"
-          vulkan_line="**Vulkan**: ubuntu x64"
+        if [ -n "$vulkan_os" ]; then
+          vulkan_line="**Vulkan**: $vulkan_os x64"
+        fi
+
+        windows_note=""
+        if [[ "$upload_files" == *"-windows-"* && "${{ needs.test-stx-halo.result }}" != "success" ]]; then
+          windows_note="The Windows zips are built in CI and have not been tested on Strix Halo hardware."
         fi
 
         echo "Files to upload: $upload_files"
@@ -1109,12 +1190,12 @@ jobs:
         gh release create "$TAG" \
           --title "$TAG" \
           --notes "**Build Number**: $TAG
-        **Operating System(s)**: $operating_systems
+        **Operating System(s)**: $rocm_os
         **GPU Target(s)**: $targets
         **ROCm Version**: $ROCM_VERSION
         $vulkan_line
         **Llama.cpp Commit Hash**: $LLAMACPP_COMMIT_HASH
         **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
-        This release includes compiled llama.cpp binaries with ROCm support for AMD Strix Halo (gfx1151), with all essential ROCm runtime libraries included." \
+        This release includes compiled llama.cpp binaries with ROCm support for AMD Strix Halo (gfx1151), with all essential ROCm runtime libraries included. $windows_note" \
           $upload_files

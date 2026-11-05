@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmb.cuh"
 #include "ggml-backend-impl.h"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -1671,10 +1672,31 @@ struct mmvq_fq_q8_0_chunk {
     half d[pf];
 };
 
+// pk_row >= 0: x is the base of a weight in the MMB_DENSE_R2 in-place tile layout (per 128-row tile and 64-K step one
+// 8704 B chunk: qs[128][64] then d[128][2]) and pk_row is the weight row; the loaded values are the same as in Q8_0.
 template <int pf>
 static __device__ __forceinline__ void mmvq_fq_q8_0_load(
-        mmvq_fq_q8_0_chunk<pf> & c, const block_q8_0 * GGML_CUDA_RESTRICT x, const int kbx0, const int kqs, const int blocks_per_row_x) {
+        mmvq_fq_q8_0_chunk<pf> & c, const block_q8_0 * GGML_CUDA_RESTRICT x, const int kbx0, const int kqs, const int blocks_per_row_x,
+        const int pk_row = -1) {
     constexpr int blocks_per_iter = VDR_Q8_0_Q8_1_MMVQ * ggml_cuda_get_physical_warp_size() / QI8_0;
+    if (pk_row >= 0) {
+        const uint8_t * tile = (const uint8_t *) x + (size_t) (pk_row >> 7) * (blocks_per_row_x >> 1) * 8704;
+        const int r = pk_row & 127;
+#pragma unroll
+        for (int i = 0; i < pf; ++i) {
+            const int kbx = kbx0 + i*blocks_per_iter;
+            if (kbx < blocks_per_row_x) {
+                const uint8_t * ch = tile + (size_t) (kbx >> 1) * 8704;
+                const int * q = (const int *) (ch + r*64 + (kbx & 1)*32);
+#pragma unroll
+                for (int j = 0; j < VDR_Q8_0_Q8_1_MMVQ; ++j) {
+                    c.qs[i][j] = q[kqs + j];
+                }
+                c.d[i] = *(const half *) (ch + 8192 + (r*2 + (kbx & 1))*2);
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int i = 0; i < pf; ++i) {
         const int kbx = kbx0 + i*blocks_per_iter;
@@ -1773,13 +1795,15 @@ static __global__ void mul_mat_vec_q_fq(
     const int kqs  = vdr * (lane % (qi/vdr));
     const int kbx0 = lane / (qi/vdr);
 
-    [[maybe_unused]] const block_q8_0 * x  = (const block_q8_0 *) vx + kbx_offset;
+    // MMB_DENSE_R2 packed weight (Q8_0, one channel/sample, no ids): tile addressing from the tensor base
+    const int x_pk_row = q8_0_path && fusion.x_pk ? (int) row_safe : -1;
+    [[maybe_unused]] const block_q8_0 * x  = (const block_q8_0 *) vx + (x_pk_row >= 0 ? 0 : kbx_offset);
     [[maybe_unused]] const block_q8_0 * xg = nullptr;
 
     [[maybe_unused]] mmvq_fq_q8_0_chunk<pf> cx;
     [[maybe_unused]] mmvq_fq_q8_0_chunk<pf> cg;
     if constexpr (q8_0_path) {
-        mmvq_fq_q8_0_load(cx, x, kbx0, kqs, blocks_per_row_x);
+        mmvq_fq_q8_0_load(cx, x, kbx0, kqs, blocks_per_row_x, x_pk_row);
         if constexpr (has_fusion) {
             if (use_gate) {
                 xg = (const block_q8_0 *) vgate + kbx_offset;
@@ -1901,7 +1925,7 @@ static __global__ void mul_mat_vec_q_fq(
         [[maybe_unused]] mmvq_fq_q8_0_chunk<pf> ng;
         const int c1 = c0 + chunk_blocks;
         if (c1 < blocks_per_row_x) {
-            mmvq_fq_q8_0_load(nx, x, c1, kqs, blocks_per_row_x);
+            mmvq_fq_q8_0_load(nx, x, c1, kqs, blocks_per_row_x, x_pk_row);
             if constexpr (has_fusion) {
                 if (use_gate) {
                     mmvq_fq_q8_0_load(ng, xg, c1, kqs, blocks_per_row_x);
@@ -2081,6 +2105,7 @@ struct mmvq_group_seg_dev {
     int          blocks_begin;
     int          glu_op;
     float        glu_limit;
+    int          pk;              // MMB_DENSE_R2: vx is in the in-place tile layout
 };
 
 struct mmvq_group_args_dev {
@@ -2126,12 +2151,13 @@ static __global__ void mul_mat_vec_fq_group(
     const int kqs  = vdr * (lane % (qi/vdr));
     const int kbx0 = lane / (qi/vdr);
 
-    const block_q8_0 * x  = (const block_q8_0 *) seg.vx + (size_t) row_safe*seg.stride_row;
+    const int pk_row = seg.pk ? row_safe : -1;
+    const block_q8_0 * x  = (const block_q8_0 *) seg.vx + (seg.pk ? 0 : (size_t) row_safe*seg.stride_row);
     const block_q8_0 * xg = use_gate ? (const block_q8_0 *) seg.gate + (size_t) row_safe*seg.gate_stride_row : nullptr;
 
     mmvq_fq_q8_0_chunk<pf> cx;
     mmvq_fq_q8_0_chunk<pf> cg;
-    mmvq_fq_q8_0_load(cx, x, kbx0, kqs, blocks_per_row_x);
+    mmvq_fq_q8_0_load(cx, x, kbx0, kqs, blocks_per_row_x, pk_row);
     if (use_gate) {
         mmvq_fq_q8_0_load(cg, xg, kbx0, kqs, blocks_per_row_x);
     }
@@ -2193,7 +2219,7 @@ static __global__ void mul_mat_vec_fq_group(
         mmvq_fq_q8_0_chunk<pf> ng;
         const int c1 = c0 + chunk_blocks;
         if (c1 < blocks_per_row_x) {
-            mmvq_fq_q8_0_load(nx, x, c1, kqs, blocks_per_row_x);
+            mmvq_fq_q8_0_load(nx, x, c1, kqs, blocks_per_row_x, pk_row);
             if (use_gate) {
                 mmvq_fq_q8_0_load(ng, xg, c1, kqs, blocks_per_row_x);
             }
@@ -2274,6 +2300,7 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
     for (int i = 0; i < nseg; ++i) {
         GGML_ASSERT(ggml_cuda_mmv_group_seg_ok(segs[i].w, y));
         GGML_ASSERT(segs[i].dst->type == GGML_TYPE_F32 && ggml_is_contiguous(segs[i].dst) && ggml_nelements(segs[i].dst) == segs[i].w->ne[1]);
+        GGML_ASSERT(!segs[i].gate || (!ggml_cuda_mmb_dq_packed(segs[i].gate) && !ggml_cuda_mmb_dq_packed(segs[i].w)));
         if (segs[i].gate) {
             GGML_ASSERT(segs[i].w->type == GGML_TYPE_Q8_0 && segs[i].gate->type == GGML_TYPE_Q8_0 &&
                 ggml_are_same_shape(segs[i].w, segs[i].gate) && segs[i].gate->nb[0] == sizeof(block_q8_0) &&
@@ -2304,6 +2331,8 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
         d.blocks_begin = nblocks;
         d.glu_op       = (int) segs[i].glu_op;
         d.glu_limit    = segs[i].glu_limit;
+        d.pk           = ggml_cuda_mmb_dq_packed(w) ? 1 : 0;
+        GGML_ASSERT(!d.pk || (w->ne[1] % 128 == 0 && (w->ne[0] / QK8_0) % 2 == 0 && w->nb[1] == (w->ne[0] / QK8_0) * sizeof(block_q8_0)));
         nblocks += (d.nrows + nwarps - 1) / nwarps;
     }
 
@@ -3065,6 +3094,11 @@ static bool mul_mat_vec_q_fq_try(
             ne10 % QK8_1 == 0 && (ne10 / QK8_1) * sizeof(block_q8_1) <= 16384)) {
         return false;
     }
+    // MMB_DENSE_R2 packed weight: single matrix only, and never as the fused GLU gate (Q8_0 row addressing)
+    const bool x_pk = ggml_cuda_mmb_dq_packed(src0);
+    if ((x_pk && (ids || ne02 != 1 || ne03 != 1 || ne2 != 1 || ne3 != 1)) || (fusion && fusion->gate && ggml_cuda_mmb_dq_packed(fusion->gate))) {
+        return false;
+    }
     if (!launch) {
         return true;
     }
@@ -3093,6 +3127,7 @@ static bool mul_mat_vec_q_fq_try(
         fusion_local.y_norm_w  = fusion->y_norm_w ? fusion->y_norm_w->data : nullptr;
         fusion_local.y_eps     = fusion->y_eps;
     }
+    fusion_local.x_pk = x_pk ? 1 : 0;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -3417,6 +3452,8 @@ void ggml_cuda_mul_mat_vec_q(
     if (mul_mat_vec_q_fq_try(ctx, src0, src1, ids, dst, fusion, 1.0f, 0.0f, 0, /*launch=*/true)) {
         return;
     }
+    // the generic kernels read Q8_0 rows: an MMB_DENSE_R2 packed weight must never get here
+    GGML_ASSERT(!ggml_cuda_mmb_dq_packed(src0) && !(fusion && fusion->gate && ggml_cuda_mmb_dq_packed(fusion->gate)));
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);

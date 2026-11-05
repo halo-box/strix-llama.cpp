@@ -1,5 +1,5 @@
 #!/bin/bash
-# The test-backend-ops perf subset of bench-gfx1151-history.yml on one device, appended to one log:
+# The test-backend-ops perf subset of bench-gfx1151-ops-perf.yml on one device, appended to one log:
 # MUL_MAT and MUL_MAT_ID for every type (selected with -p, so a new type is picked up without an
 # edit), then the fixed case list for the other ops. The full suite takes more than 150 min per
 # device on gfx1151, mostly in the CPU-side weight setup of the trellis MUL_MAT_ID cases.

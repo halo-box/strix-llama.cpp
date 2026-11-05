@@ -1,0 +1,218 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// Routed MoE down projection, MUL_MAT_ID (+ MUL by the router weights) + CPY(f16), q5_1 experts, f16 output = the CPY's
+// destination. Weight-streaming design (after halo-box PR #213's HIP R2 down kernel): at prefill every expert's rows are read
+// once per 64-token tile, so the kernel is bound by how fast it streams the weights. They go from global memory straight
+// into registers, one 64-K stage ahead, and never touch shared memory.
+//
+// Workgroup = one tile of the count_experts list (expert, up to 64 routed rows) x 256 output features, 8 wave32 subgroups.
+// Wave w owns features 32 w .. 32 w + 31, one row per lane; lanes 0..15 hold the first 16, lanes 16..31 the second 16, and one
+// xor-16 shuffle per f16 pair gives every lane both fragments in the gfx11 layout. B (the routed rows' activations) is gathered
+// by row id into double-buffered shared memory, 64 K per stage. Token sub-tiles past the tile's row count skip their WMMA.
+//
+// Fragment layout (RDNA3 + RADV, wave32; the host requires ggml_vk_check_coopmat_rdna3_layout):
+//   A: lane L holds row L % 16, element i = k i;  B: lane L holds column L % 16, element i = k i;
+//   f32 accumulator: lane L holds column L % 16, element e = row L / 16 + 2 e.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint M;              // output features per expert (n_embd), multiple of 256
+    uint K;              // n_ff, multiple of 64
+    uint a_offset;       // weights, uvec4 units
+    uint stride_e;       // uvec4 per expert (M * K / 32 * 24 / 16)
+    uint b_offset;       // B, in uvec4 units
+    uint b_s1;           // B stride per slot (ne11 > 1), uvec4 units
+    uint b_s2;           // B stride per token, uvec4 units
+    uint ne11;
+    uint d_offset;       // D, in f16vec4 units
+    uint n_used;
+    uint row_ids_offset;
+    uint s_offset;       // router weights [1, n_used, n_tokens], floats
+    uint scaled;         // 0: no MUL in the chain (the scale binding is not read)
+} p;
+
+layout(binding = 0) readonly buffer A  { uvec4 data_a[]; };
+layout(binding = 1) readonly buffer B  { uvec4 data_b[]; };
+layout(binding = 2) writeonly buffer D { f16vec4 data_d[]; };
+layout(binding = 3) readonly buffer E  { uint data_e[]; };   // count_experts: [0] tiles, (expert, rows) per tile, row ids
+layout(binding = 4) readonly buffer S  { float data_s[]; };
+
+#define MATA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MATB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define ACC  coopmat<float,     gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+#define BN 64            // tokens per tile (the count_experts row tile)
+#define KC 64            // K per stage: two q5_1 blocks, 48 bytes = 3 uvec4 per row
+#define SB 36            // shared row stride in uints (32 data + 4 pad, 16-byte aligned rows)
+
+shared uint buf_b[2][BN * SB];
+shared uint s_rid[BN];
+
+// one half (h = 0: values 0..15, the low nibbles; h = 1: values 16..31, the high nibbles) of a q5_1 block -> 8 packed f16
+// pairs f16(fma(d, q, m)); qs = the block's 16 quant bytes, qh its 32 fifth bits
+void q51_frag(const uvec4 qs, const uint qh, const uint h, const float d, const float m, out uint o[8]) {
+    [[unroll]] for (uint w = 0; w < 4; w++) {
+        const uint hb = (qh >> (4 * w + 16 * h)) & 0xFu;
+        const uint nb = ((qs[w] >> (4 * h)) & 0x0F0F0F0Fu) |
+                        ((hb & 1u) << 4) | ((hb & 2u) << 11) | ((hb & 4u) << 18) | ((hb & 8u) << 25);
+        const vec4 v = vec4(float(nb & 0xFFu), float((nb >> 8) & 0xFFu), float((nb >> 16) & 0xFFu), float(nb >> 24));
+        o[2 * w]     = packFloat2x16(f16vec2(fma(d, v.x, m), fma(d, v.y, m)));
+        o[2 * w + 1] = packFloat2x16(f16vec2(fma(d, v.z, m), fma(d, v.w, m)));
+    }
+}
+
+void main() {
+    const uint tile = gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
+    if (tile >= data_e[0]) {
+        return;
+    }
+    const uint expert = data_e[1 + 2 * tile];
+    const uint nrows  = data_e[2 + 2 * tile];
+    const uint nt     = (nrows + 15) / 16;              // live 16-token sub-tiles (uniform)
+
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint wave = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const bool lo   = lane < 16;
+
+    if (tid < BN) {
+        // rows past nrows reuse row 0, so the B gather stays in bounds; their results are not stored
+        s_rid[tid] = data_e[p.row_ids_offset + tile * BN + (tid < nrows ? tid : 0)];
+    }
+    barrier();
+
+    // B gather: thread tid fills token tid / 4, K quarter tid % 4 (16 values) of each stage
+    const uint b_tok = tid / 4;
+    const uint b_q   = tid % 4;
+    uint b_base;
+    {
+        const uint rid = s_rid[b_tok];
+        b_base = p.b_offset + (rid >> 16) * p.b_s2 + ((rid & 0xFFFFu) % p.ne11) * p.b_s1;
+    }
+    const uint b_lds = b_tok * SB + b_q * 8;
+#if defined(B_F32)
+    // 16 floats = 4 uvec4 per thread and stage
+#define B_PER_STAGE (KC / 4)
+#define LOAD_B(st, r0, r1, r2, r3) { const uint bi = b_base + (st) * B_PER_STAGE + b_q * 4; \
+        r0 = data_b[bi]; r1 = data_b[bi + 1]; r2 = data_b[bi + 2]; r3 = data_b[bi + 3]; }
+#define STORE_B(buf, r0, r1, r2, r3) { \
+        buf_b[buf][b_lds + 0] = packFloat2x16(f16vec2(uintBitsToFloat(r0.xy))); buf_b[buf][b_lds + 1] = packFloat2x16(f16vec2(uintBitsToFloat(r0.zw))); \
+        buf_b[buf][b_lds + 2] = packFloat2x16(f16vec2(uintBitsToFloat(r1.xy))); buf_b[buf][b_lds + 3] = packFloat2x16(f16vec2(uintBitsToFloat(r1.zw))); \
+        buf_b[buf][b_lds + 4] = packFloat2x16(f16vec2(uintBitsToFloat(r2.xy))); buf_b[buf][b_lds + 5] = packFloat2x16(f16vec2(uintBitsToFloat(r2.zw))); \
+        buf_b[buf][b_lds + 6] = packFloat2x16(f16vec2(uintBitsToFloat(r3.xy))); buf_b[buf][b_lds + 7] = packFloat2x16(f16vec2(uintBitsToFloat(r3.zw))); }
+    uvec4 br0, br1, br2, br3;
+#else
+    // 16 halves = 2 uvec4 per thread and stage
+#define B_PER_STAGE (KC / 8)
+#define LOAD_B(st, r0, r1, r2, r3) { const uint bi = b_base + (st) * B_PER_STAGE + b_q * 2; r0 = data_b[bi]; r1 = data_b[bi + 1]; }
+#define STORE_B(buf, r0, r1, r2, r3) { \
+        buf_b[buf][b_lds + 0] = r0.x; buf_b[buf][b_lds + 1] = r0.y; buf_b[buf][b_lds + 2] = r0.z; buf_b[buf][b_lds + 3] = r0.w; \
+        buf_b[buf][b_lds + 4] = r1.x; buf_b[buf][b_lds + 5] = r1.y; buf_b[buf][b_lds + 6] = r1.z; buf_b[buf][b_lds + 7] = r1.w; }
+    uvec4 br0, br1, br2 = uvec4(0), br3 = uvec4(0);
+#endif
+
+    // A: this lane's row, 3 uvec4 per 64-K stage = two 24-byte q5_1 blocks (d, m | qh | 16 qs bytes)
+    const uint feat0 = gl_WorkGroupID.x * 256 + wave * 32;
+    const uint a_row = p.a_offset + expert * p.stride_e + (feat0 + lane) * (p.K / KC) * 3;
+#define LOAD_A(st, a0, a1, a2) { const uint ai = a_row + (st) * 3; a0 = data_a[ai]; a1 = data_a[ai + 1]; a2 = data_a[ai + 2]; }
+
+    ACC acc0[4];   // features feat0 .. feat0 + 15
+    ACC acc1[4];   // features feat0 + 16 .. feat0 + 31
+    [[unroll]] for (uint t = 0; t < 4; t++) {
+        acc0[t] = ACC(0.0);
+        acc1[t] = ACC(0.0);
+    }
+
+    const uint n_stages = p.K / KC;
+    uvec4 a0, a1, a2;
+    LOAD_A(0, a0, a1, a2);
+    LOAD_B(0, br0, br1, br2, br3);
+    STORE_B(0, br0, br1, br2, br3);
+    barrier();
+
+    for (uint st = 0; st < n_stages; st++) {
+        const uint cur = st & 1;
+        const bool more = st + 1 < n_stages;
+        uvec4 n0, n1, n2;
+        if (more) {
+            LOAD_A(st + 1, n0, n1, n2);
+            LOAD_B(st + 1, br0, br1, br2, br3);
+        }
+
+        const vec2 dm0 = unpackHalf2x16(a0.x);
+        const vec2 dm1 = unpackHalf2x16(a1.z);
+        const uvec4 qs0 = uvec4(a0.z, a0.w, a1.x, a1.y);
+
+        // four 16-K steps: (block 0, values 0..15), (block 0, 16..31), (block 1, 0..15), (block 1, 16..31)
+        [[unroll]] for (uint ks = 0; ks < 4; ks++) {
+            uint own[8];
+            if (ks < 2) {
+                q51_frag(qs0, a0.y, ks, dm0.x, dm0.y, own);
+            } else {
+                q51_frag(a2, a1.w, ks - 2, dm1.x, dm1.y, own);
+            }
+            MATA f0, f1;
+            [[unroll]] for (uint j = 0; j < 8; j++) {
+                const uint oth = subgroupShuffleXor(own[j], 16);
+                const f16vec2 v0 = unpackFloat2x16(lo ? own[j] : oth);
+                const f16vec2 v1 = unpackFloat2x16(lo ? oth : own[j]);
+                f0[2 * j] = v0.x; f0[2 * j + 1] = v0.y;
+                f1[2 * j] = v1.x; f1[2 * j + 1] = v1.y;
+            }
+            [[unroll]] for (uint t = 0; t < 4; t++) {
+                if (t < nt) {
+                    MATB bf;
+                    const uint bb = (t * 16 + lane % 16) * SB + ks * 8;
+                    [[unroll]] for (uint j = 0; j < 8; j++) {
+                        const f16vec2 v = unpackFloat2x16(buf_b[cur][bb + j]);
+                        bf[2 * j] = v.x; bf[2 * j + 1] = v.y;
+                    }
+                    acc0[t] = coopMatMulAdd(f0, bf, acc0[t]);
+                    acc1[t] = coopMatMulAdd(f1, bf, acc1[t]);
+                }
+            }
+        }
+
+        if (more) {
+            STORE_B(cur ^ 1, br0, br1, br2, br3);
+            a0 = n0; a1 = n1; a2 = n2;
+        }
+        barrier();
+    }
+
+    // epilogue: times the router weight, then f16 (the unfused chain's MUL in f32, then the CPY); one xor-16 shuffle gives
+    // each lane 4 consecutive features of its token (low half: rows 2e .. 2e + 3, high half: the next four), one f16vec4 store
+    [[unroll]] for (uint t = 0; t < 4; t++) {
+        if (t < nt) {
+            const uint row = t * 16 + lane % 16;
+            const uint rid = s_rid[row];
+            const uint slot = ((rid >> 16) * p.n_used + (rid & 0xFFFFu));
+            const float w = p.scaled != 0 ? data_s[p.s_offset + slot] : 1.0f;
+            const uint dst_row = slot * (p.M / 4);
+            [[unroll]] for (uint f = 0; f < 2; f++) {
+                [[unroll]] for (uint e = 0; e < 8; e += 4) {
+                    const float c0 = (f == 0 ? acc0[t][e]     : acc1[t][e])     * w;
+                    const float c1 = (f == 0 ? acc0[t][e + 1] : acc1[t][e + 1]) * w;
+                    const float c2 = (f == 0 ? acc0[t][e + 2] : acc1[t][e + 2]) * w;
+                    const float c3 = (f == 0 ? acc0[t][e + 3] : acc1[t][e + 3]) * w;
+                    const float r0 = subgroupShuffleXor(lo ? c2 : c0, 16);
+                    const float r1 = subgroupShuffleXor(lo ? c3 : c1, 16);
+                    const vec4 v = lo ? vec4(c0, r0, c1, r1) : vec4(r0, c2, r1, c3);
+                    const uint fe = feat0 + 16 * f + 2 * e + (lo ? 0u : 4u);
+                    if (row < nrows) {
+                        data_d[p.d_offset + dst_row + fe / 4] = f16vec4(v);
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1851,6 +1851,12 @@ bool llama_model_loader::load_all_data(
     // Buffer size: balance between memory usage and I/O efficiency
     const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
 
+    // staging buffer for mapping -> device copies (see stage_mapping), owned for the whole loading loop so that an exception
+    // (tensor validation, tensor_set failure) cannot leak it
+    std::unique_ptr<ggml_backend_buffer, void (*)(ggml_backend_buffer_t)> mapped_stage_buf{nullptr, &ggml_backend_buffer_free};
+    void * mapped_stage_ptr  = nullptr;
+    size_t mapped_stage_size = 0;
+
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
@@ -1935,6 +1941,40 @@ bool llama_model_loader::load_all_data(
             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs[0])),
             ggml_backend_name(upload_backend));
     }
+
+    // On an integrated GPU (Strix Halo gfx1151, GGML_HIP_NO_VMM) a device copy straight from the file mapping is
+    // very slow: with -lm mmap, llama-server had not finished loading a 78 GiB model after 400 s (#166 reports it
+    // never completing). Stage those copies through a host buffer of the device's host buffer type (pinned unless
+    // that allocation fails): 48 s. Only for integrated GPUs, which AUTO already loads without mmap: other devices
+    // keep the direct copy, and a meta (tensor-parallel) buffer only accepts whole split rows per tensor_set.
+    const bool stage_mapping = [&]() {
+        if (!use_mmap) {
+            return false;   // lazy tensors live in CPU buffers: no mapping -> device copy without mmap
+        }
+        auto * buf0 = bufs.empty() ? nullptr : bufs[0];
+        if (!buf0 || ggml_backend_buffer_is_host(buf0)) {
+            return false;
+        }
+        auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf0));
+        if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            return false;
+        }
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (!host_buft) {
+            return false;
+        }
+        mapped_stage_buf.reset(ggml_backend_buft_alloc_buffer(host_buft, 16 * 1024 * 1024));
+        if (!mapped_stage_buf) {
+            return false;
+        }
+        mapped_stage_ptr  = ggml_backend_buffer_get_base(mapped_stage_buf.get());
+        mapped_stage_size = ggml_backend_buffer_get_size(mapped_stage_buf.get());
+        if (mapped_stage_ptr == nullptr || mapped_stage_size == 0) {
+            mapped_stage_buf.reset(nullptr);
+            return false;
+        }
+        return true;
+    }();
 
     std::vector<ggml_tensor *> tensors;
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -2052,6 +2092,14 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            } else if (stage_mapping && cur->buffer && !ggml_backend_buffer_is_host(cur->buffer)) {
+                // device destination: mapping -> staging buffer -> device, in chunks
+                for (size_t done = 0; done < n_size; ) {
+                    const size_t chunk = std::min(mapped_stage_size, n_size - done);
+                    memcpy(mapped_stage_ptr, data + done, chunk);
+                    ggml_backend_tensor_set(cur, mapped_stage_ptr, done, chunk);
+                    done += chunk;
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
@@ -2137,6 +2185,7 @@ bool llama_model_loader::load_all_data(
     }
 
     // free temporary resources used for async uploads
+    mapped_stage_buf.reset(nullptr);
     for (auto * event : events) {
         ggml_backend_event_synchronize(event);
         ggml_backend_event_free(event);

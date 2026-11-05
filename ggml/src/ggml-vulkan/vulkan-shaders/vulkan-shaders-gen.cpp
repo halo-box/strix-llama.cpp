@@ -659,6 +659,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             if (!coopmat2) {
                 string_to_spv(shader_name + "_" + tname + "_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
             }
+            // the same f32 x f32 GEMM with the qwen4exp QSA scorer epilogue (QSA_SCORE; KHR coopmat only)
+            if (tname == "f32" && coopmat && !coopmat2 && fp16 && !f16acc && !dot2 && matmul_id_type == MatMulIdType::NONE) {
+                string_to_spv(shader_name + "_f32_f32_qsa", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"QSA_EPI", "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+            }
             continue;
         }
 
@@ -967,6 +971,18 @@ void process_shaders() {
     string_to_spv("lightning_indexer_cm_small_f16", "lightning_indexer_cm.comp", {{"N_WAVES", "1"}, {"HEADS_PER_TILE", "1"}});
     string_to_spv("gdn_chunk_prep_f32", "gdn_chunk_prep.comp", {});
     string_to_spv("gdn_chunk_scan_f32", "gdn_chunk_scan.comp", {});
+    // MUL_MAT_ID_PAIR_SWIGLU: q4_K gate + up + SwiGLU, register-direct weights (RDNA3 fragment layout, wave32)
+    string_to_spv("mul_mm_id_glu_q4_k_f16", "mul_mm_id_glu.comp", {});
+    string_to_spv("mul_mm_id_glu_q4_k_f32", "mul_mm_id_glu.comp", {{"B_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_q4_k_f16_o32", "mul_mm_id_glu.comp", {{"OUT_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_q4_k_f32_o32", "mul_mm_id_glu.comp", {{"B_F32", "1"}, {"OUT_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_q5_k_f16", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}});
+    string_to_spv("mul_mm_id_glu_q5_k_f32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_q5_k_f16_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"OUT_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_q5_k_f32_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}, {"OUT_F32", "1"}});
+    // streaming q5_1 MUL_MAT_ID(+MUL)+CPY(f16) down, register-direct weights (RDNA3 fragment layout, wave32)
+    string_to_spv("mul_mm_id_down_q5_1_f16", "mul_mm_id_down.comp", {});
+    string_to_spv("mul_mm_id_down_q5_1_f32", "mul_mm_id_down.comp", {{"B_F32", "1"}});
     // RDNA3 fragment layout probe (ggml_vk_check_coopmat_rdna3_layout): gates the manual-fragment "_mf" MUL_MAT_ID pipelines
     string_to_spv("coopmat_layout_check", "coopmat_layout_check.comp", {});
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
@@ -1262,6 +1278,7 @@ void process_shaders() {
     string_to_spv("topk_argsort_f32", "topk_argsort.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_nary_search_f32", "topk_nary_search.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_radix_select_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}});
+    string_to_spv("qsa_expand", "qsa_expand.comp", {});
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1361,6 +1378,14 @@ void process_shaders() {
             }
         }
     }
+
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    // dense q8_0 x f16 GEMM (mul_mm_dq8.comp), f32 and f16 output
+    string_to_spv("matmul_dq8_q8_0_f16", "mul_mm_dq8.comp", {}, true, true, false);
+    string_to_spv("matmul_dq8_q8_0_f16_d16", "mul_mm_dq8.comp", {{"D_F16", "1"}}, true, true, false);
+    string_to_spv("matmul_dq8_q8_0_f16_hcmix", "mul_mm_dq8.comp", {{"HC_EPI", "1"}}, true, true, false);
+    string_to_spv("matmul_dq8_q8_0_f16_hcmix_d16", "mul_mm_dq8.comp", {{"HC_EPI", "1"}, {"D_F16", "1"}}, true, true, false);
+#endif
 
     for (auto unroll : {false, true}) {
         for (auto a_f16 : {false, true}) {

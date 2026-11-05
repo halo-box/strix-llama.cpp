@@ -57,6 +57,10 @@ struct ggml_cuda_hc_combine_norm_args {
     uint16_t *          res_out_bf16 = nullptr;
     const ggml_tensor * w_inject     = nullptr;   // [hc * n_embd, hc] F32 weight
     ggml_tensor *       out_inject   = nullptr;   // [hc, T] F32, the skipped MUL_MAT node
+    // int8 copy of out_xn for the W8A8 HC down GEMM: 32 int8 per (32-element block of the flattened [hc*n_embd])
+    // per token, then one f32 scale per (block, token). Layout [kb][t][32] and [kb][t].
+    uint8_t *           out_xn_q8    = nullptr;
+    float *             out_xn_scale = nullptr;
 };
 
 bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);

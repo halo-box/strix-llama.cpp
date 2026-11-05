@@ -208,6 +208,21 @@ def ppl_delta(base: dict[str, Any] | None, other: dict[str, Any] | None) -> str:
     return f'<td class="num">{delta:+.4f} <span class="sd">({100 * delta / base["ppl"]:+.3f}%)</span></td>'
 
 
+def speed_cell(row: dict[str, Any] | None) -> str:
+    """One SPEED-Bench category: mean decode tokens per second, with the draft acceptance below it."""
+    if not row:
+        return '<td class="num">-</td>'
+    value = row.get('avg_pred_t_s')
+    if value is None:
+        return f'<td class="num"><span class="sd">{esc(row.get("requests"))} samples</span></td>'
+    title = f"{row.get('requests')} samples, {row.get('turns')} turns, {row.get('failed')} failed"
+    accept = row.get('accept_rate')
+    if accept is None:
+        return f'<td class="num" title="{esc(title)}">{fmt(value)}</td>'
+    return (f'<td class="num" title="{esc(title)}">{fmt(value)} '
+            f'<span class="sd">{100 * float(accept):.1f}%</span></td>')
+
+
 def load_runs(results: Path) -> list[dict[str, Any]]:
     runs = []
     for path in sorted((results / 'runs').glob('*/run.json')):
@@ -236,7 +251,7 @@ def build_index(site: Site, runs: list[dict[str, Any]], generated: str) -> str:
                  f'<p class="lede">{len(runs)} recorded runs of <code>bench-gfx1151-history.yml</code> on the AMD DevLab '
                  f'Dispatch Strix Halo pool. Built {esc(generated)} UTC from the {branch} branch. '
                  'Machine-readable: <a href="data/runs.json">data/runs.json</a>.</p>\n'
-                 '<nav><a href="#runs">Runs</a><a href="#trend">Over time</a><a href="#ppl">Perplexity</a><a href="#results">All results</a></nav>\n'
+                 '<nav><a href="#runs">Runs</a><a href="#trend">Over time</a><a href="#ppl">Perplexity</a><a href="#speed">SPEED-Bench</a><a href="#results">All results</a></nav>\n'
                  '</header>\n<main>')
 
     parts.append('<section id="runs"><h2>Runs</h2>')
@@ -292,26 +307,67 @@ def build_index(site: Site, runs: list[dict[str, Any]], generated: str) -> str:
     parts.append('<section id="ppl"><h2>Perplexity over time</h2>'
                  '<p class="note">llama-perplexity on the pinned Wikitext-2 sample, newest run first, &plusmn; the error the tool reports. '
                  'Both batch sizes score the same tokens, so the delta is the effect of how each chunk is cut into batches.</p>')
-    ppl_models = sorted({str(p.get('model')) for run in runs for p in run.get('perplexity') or []})
-    for model in ppl_models:
-        batches = sorted({p.get('n_batch') or 0 for run in runs for p in run.get('perplexity') or [] if p.get('model') == model})
-        parts.append(f'<h3>{esc(model)}</h3><div class="scroll"><table><thead><tr><th>Date (UTC)</th><th>Ref</th><th>Commit</th>'
+    ppl_models = sorted({(str(p.get('model')), p.get('backend', 'ROCm')) for run in runs for p in run.get('perplexity') or []})
+    for model, backend in ppl_models:
+        batches = sorted({p.get('n_batch') or 0 for run in runs for p in run.get('perplexity') or []
+                          if p.get('model') == model and p.get('backend', 'ROCm') == backend})
+        parts.append(f'<h3>{esc(model)} - {esc(backend)}</h3><div class="scroll"><table><thead><tr><th>Date (UTC)</th><th>Ref</th><th>Commit</th><th>Backend</th>'
                      + ''.join(f'<th class="num">b{esc(b)}</th>' for b in batches)
                      + ''.join(f'<th class="num">b{esc(b)} - b{esc(batches[0])}</th>' for b in batches[1:])
                      + '<th>Sample</th></tr></thead><tbody>')
         for run in runs:
-            mine = {p.get('n_batch'): p for p in run.get('perplexity') or [] if p.get('model') == model}
+            mine = {(p.get('backend', 'ROCm'), p.get('n_batch')): p for p in run.get('perplexity') or []
+                    if p.get('model') == model and p.get('backend', 'ROCm') == backend}
             if not mine:
                 continue
             matrix = run.get('matrix') or {}
             parts.append(f'<tr><td><a href="runs/{esc(run["key"])}/index.html">{esc(run_date(run))}</a></td>'
                          f'<td><code>{esc(run.get("ref"))}</code></td><td>{site.commit_link(run)}</td>'
-                         + ''.join(ppl_cell(mine.get(b)) for b in batches)
-                         + ''.join(ppl_delta(mine.get(batches[0]), mine.get(b)) for b in batches[1:])
+                         + f'<td>{esc(backend)}</td>'
+                         + ''.join(ppl_cell(mine.get((backend, b))) for b in batches)
+                         + ''.join(ppl_delta(mine.get((backend, batches[0])), mine.get((backend, b))) for b in batches[1:])
                          + f'<td>c{esc(matrix.get("ppl_ctx"))} x {esc(matrix.get("ppl_chunks"))} chunks</td></tr>')
         parts.append('</tbody></table></div>')
     if not ppl_models:
         parts.append('<p class="note">No perplexity results yet.</p>')
+    parts.append('</section>')
+
+    parts.append('<section id="speed"><h2>SPEED-Bench over time</h2>'
+                 '<p class="note">tools/server/bench/speed-bench against llama-server with speculative decoding, newest run '
+                 'first. The number is the mean decode tokens per second of that category, the small one the share of '
+                 'drafted tokens the target accepted. Prefill throughput is on each run page.</p>')
+    speed_groups = sorted({(str(s.get('model')), str(s.get('bench') or '?'))
+                           for run in runs for s in run.get('speed_bench') or []})
+    for model, bench in speed_groups:
+        entries = [(run, s) for run in runs for s in run.get('speed_bench') or []
+                   if str(s.get('model')) == model and str(s.get('bench') or '?') == bench]
+        cats: list[str] = []
+        for _, s in entries:
+            for row in s.get('summary') or []:
+                name = row.get('category')
+                if name and name not in cats:
+                    cats.append(name)
+        cats.sort(key=lambda c: (c == 'overall', c))
+        used = next((s.get('draft') for _, s in entries if (s.get('draft') or {}).get('file')), None)
+        if used:
+            head_note = (f'Draft head <code>{esc(used.get("file"))}</code> @ <code>{esc(used.get("revision"))}</code>'
+                         f' of {esc(used.get("repo"))}')
+        else:
+            head_note = 'No MTP draft head recorded'
+        parts.append(f'<h3>{esc(model)} - {esc(bench)}</h3><p class="note">{head_note}</p>'
+                     f'<div class="scroll"><table><thead><tr><th>Date (UTC)</th>'
+                     '<th>Ref</th><th>Commit</th><th>Speculative</th>'
+                     + ''.join(f'<th class="num">{esc(c)}</th>' for c in cats)
+                     + '</tr></thead><tbody>')
+        for run, s in entries:
+            by_cat = {row.get('category'): row for row in s.get('summary') or []}
+            parts.append(f'<tr><td><a href="runs/{esc(run["key"])}/index.html">{esc(run_date(run))}</a></td>'
+                         f'<td><code>{esc(run.get("ref"))}</code></td><td>{site.commit_link(run)}</td>'
+                         f'<td>{esc(s.get("spec_type") or "-")}</td>'
+                         + ''.join(speed_cell(by_cat.get(c)) for c in cats) + '</tr>')
+        parts.append('</tbody></table></div>')
+    if not speed_groups:
+        parts.append('<p class="note">No SPEED-Bench results yet.</p>')
     parts.append('</section>')
 
     rows = []
@@ -367,7 +423,7 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
              f'<h1>Run {esc(key)}</h1>',
              f'<p class="lede">{badge(run.get("status"))} <code>{esc(run.get("ref"))}</code> at {site.commit_link(run)} '
              f'on <span class="mono">{esc(runner.get("name"))}</span></p>',
-             '<nav><a href="#run">Run</a><a href="#bench">llama-bench</a><a href="#ppl">llama-perplexity</a><a href="#ops">test-backend-ops</a>'
+             '<nav><a href="#run">Run</a><a href="#bench">llama-bench</a><a href="#ppl">llama-perplexity</a><a href="#speed">SPEED-Bench</a><a href="#ops">test-backend-ops</a>'
              '<a href="#commands">Commands</a><a href="#raw">Raw output</a></nav>\n</header>\n<main>']
 
     commit = site.commit_link(run, short=False)
@@ -413,6 +469,9 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
                                  f'{matrix.get("ppl_chunks")} chunks, -b/-ub {",".join(map(str, matrix.get("ppl_batches", [])))}')
          if matrix.get('ppl') else 'no'),
         ('test-backend-ops perf', 'yes' if matrix.get('ops_perf') else 'no'),
+        ('SPEED-Bench', esc(f'{matrix.get("spec_type")}, {matrix.get("speed_bench_osl")} output tokens, '
+                            f'{matrix.get("speed_bench_limit")} samples per category, -ub {matrix.get("speed_bench_ubatch")}, '
+                            f'-c {matrix.get("speed_bench_ctx")}') if matrix.get('speed_bench') else 'no'),
     ]))
     steps = run.get('steps') or {}
     if steps:
@@ -485,21 +544,24 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
     else:
         base = {}
         for e in entries:
-            base.setdefault(e.get('model'), e)
-        parts.append('<table><thead><tr><th>Model</th><th class="num">batch / ubatch</th><th class="num">ctx x chunks</th>'
+            base.setdefault((e.get('model'), e.get('backend', 'ROCm')), e)
+        parts.append('<table><thead><tr><th>Model</th><th>Backend</th><th class="num">batch / ubatch</th><th class="num">ctx x chunks</th>'
                      '<th class="num">PPL</th><th class="num">vs first batch</th><th class="num">s/pass</th><th class="num">wall s</th>'
                      '<th>Status</th><th>Raw log</th></tr></thead><tbody>')
         for e in entries:
-            name = f'perplexity-{e.get("model")}-b{e.get("n_batch")}.log'
+            backend = e.get('backend', 'ROCm')
+            prefix = 'perplexity-vulkan' if backend == 'Vulkan' else 'perplexity'
+            name = f'{prefix}-{e.get("model")}-b{e.get("n_batch")}.log'
             raw = link(site.log_url(key, name), name) if any(lg.get('name') == name for lg in run.get('logs', [])) else '-'
-            delta = ppl_delta(base[e.get('model')], e) if base[e.get('model')] is not e else '<td class="num">-</td>'
-            parts.append(f'<tr><td>{esc(e.get("model"))}</td><td class="num">{esc(e.get("n_batch"))} / {esc(e.get("n_ubatch"))}</td>'
+            first = base[(e.get('model'), backend)]
+            delta = ppl_delta(first, e) if first is not e else '<td class="num">-</td>'
+            parts.append(f'<tr><td>{esc(e.get("model"))}</td><td>{esc(backend)}</td><td class="num">{esc(e.get("n_batch"))} / {esc(e.get("n_ubatch"))}</td>'
                          f'<td class="num">{esc(e.get("n_ctx")) + " x " + esc(e.get("n_chunks")) if e.get("n_ctx") else "-"}</td>{ppl_cell(e)}{delta}'
                          f'<td class="num">{fmt(e.get("seconds_per_pass"))}</td><td class="num">{fmt(e.get("wall_seconds"), 1)}</td>'
                          f'<td>{badge(e.get("status"))}</td><td>{raw}</td></tr>')
         parts.append('</tbody></table>')
         parts.append('<details><summary>Cumulative PPL per chunk</summary><table><tbody>'
-                     + ''.join(f'<tr><th>{esc(e.get("model"))} b{esc(e.get("n_batch"))}</th>'
+                     + ''.join(f'<tr><th>{esc(e.get("model"))} ({esc(e.get("backend", "ROCm"))}) b{esc(e.get("n_batch"))}</th>'
                                f'<td class="mono wrap">{esc(", ".join(f"{v:.4f}" for v in e.get("chunk_ppl") or []))}</td></tr>'
                                for e in entries)
                      + '</tbody></table></details>')
@@ -508,7 +570,9 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
     parts.append('<section id="ops"><h2>test-backend-ops perf</h2>')
     ops = run.get('ops_perf') or []
     if not ops:
-        parts.append('<p class="note">Not run.</p>')
+        parts.append('<p class="note">Not run in this lane. The perf subset is '
+                     '<code>bench-gfx1151-ops-perf.yml</code>, which keeps its own artifact; runs recorded before '
+                     'the split carry their rows here.</p>')
     else:
         parts.append('<table><thead><tr><th>Backend</th><th>Status</th><th class="num">Exit</th><th class="num">Rows</th>'
                      '<th class="num">Not supported</th><th class="num">Failed</th><th>Groups (rows)</th>'
@@ -530,6 +594,63 @@ def build_run(site: Site, run: dict[str, Any]) -> str:
                 parts.append(f'<details><summary>{esc(o.get("backend"))}: listed cases without a result '
                              '(not in this build, or among the failed cases)</summary>'
                              f'<pre>{esc(chr(10).join(o["missing_listed"]))}</pre></details>')
+    parts.append('</section>')
+
+    parts.append('<section id="speed"><h2>SPEED-Bench</h2>')
+    speed_entries = run.get('speed_bench') or []
+    if not speed_entries:
+        parts.append('<p class="note">Not run.</p>')
+    else:
+        for e in speed_entries:
+            cfg = e.get('config') or {}
+            name = e.get('model')
+            parts.append(f'<h3>{esc(name)} - {esc(e.get("bench"))} {badge(e.get("status"))}</h3>')
+            samples = e.get('selected_samples')
+            count = (f'{esc(e.get("completed_samples"))} of {esc(samples)} completed, '
+                     f'{esc(e.get("failed_samples"))} failed') if samples is not None else '-'
+            bench_row = (f'{esc(cfg.get("bench"))} / {esc(cfg.get("category"))}' if cfg else '-')
+            out_row = (f'{esc(cfg.get("osl"))} tokens (max_tokens), temperature 0' if cfg else '-')
+            draft = e.get('draft') or {}
+            if draft.get('file'):
+                sha_ok = draft.get('sha256_actual') == draft.get('sha256')
+                hf_url = f'https://huggingface.co/{draft.get("repo")}/tree/{draft.get("revision")}'
+                head_row = (f'<code>{esc(draft.get("file"))}</code> from {link(hf_url, str(draft.get("repo")))}'
+                            f' @ <code>{esc(draft.get("revision"))}</code>, {esc(draft.get("bytes"))} bytes, '
+                            f'sha256 <code>{esc(draft.get("sha256"))}</code> '
+                            + (badge('ok') if sha_ok else badge(draft.get('status'))))
+            else:
+                head_row = '-'
+            parts.append(kv_table([
+                ('Client', 'tools/server/bench/speed-bench/speed_bench.py'),
+                ('Bench / category', bench_row),
+                ('Samples', count),
+                ('Server', f'--spec-type {esc(e.get("spec_type"))}, -b {esc(e.get("n_batch"))}, '
+                           f'-ub {esc(e.get("n_ubatch"))}, -c {esc(e.get("n_ctx"))}, one slot'),
+                ('Draft head', head_row),
+                ('Output length', out_row),
+            ]))
+            summary_rows = e.get('summary') or []
+            if summary_rows:
+                parts.append('<table><thead><tr><th>Category</th><th class="num">Samples</th><th class="num">Turns</th>'
+                             '<th class="num">Prompt t/s</th><th class="num">Decode t/s</th><th class="num">Latency s</th>'
+                             '<th class="num">Drafted</th><th class="num">Accepted</th><th class="num">Accept rate</th>'
+                             '<th class="num">Failed</th></tr></thead><tbody>')
+                for row in summary_rows:
+                    accept = row.get('accept_rate')
+                    rate = f'{100 * float(accept):.1f}%' if accept is not None else '-'
+                    parts.append(f'<tr><td>{esc(row.get("category"))}</td><td class="num">{esc(row.get("requests"))}</td>'
+                                 f'<td class="num">{esc(row.get("turns"))}</td>'
+                                 f'<td class="num">{fmt(row.get("avg_prompt_t_s"))}</td>'
+                                 f'<td class="num">{fmt(row.get("avg_pred_t_s"))}</td>'
+                                 f'<td class="num">{fmt(row.get("avg_latency"))}</td>'
+                                 f'<td class="num">{esc(row.get("draft_n"))}</td>'
+                                 f'<td class="num">{esc(row.get("accepted"))}</td><td class="num">{esc(rate)}</td>'
+                                 f'<td class="num">{esc(row.get("failed"))}</td></tr>')
+                parts.append('</tbody></table>')
+            names = [f'speed-bench-{name}-{e.get("bench")}.log', f'speed-bench-{name}-{e.get("bench")}.json',
+                     f'server-{name}.log']
+            links = [link(site.log_url(key, n), n) for n in names if any(lg.get('name') == n for lg in run.get('logs', []))]
+            parts.append(f'<p class="note">Raw: {" ".join(links) if links else "-"}</p>')
     parts.append('</section>')
 
     parts.append('<section id="commands"><h2>Commands</h2>')
@@ -595,9 +716,16 @@ def summary(run: dict[str, Any]) -> dict[str, Any]:
     out['run_url'] = (run.get('workflow') or {}).get('run_url')
     out['results'] = [{k: c[k] for k in ('model', 'backend', 'test', 'n_batch', 'n_ubatch', 'n_depth', 'mean', 'sd', 'median', 'n')}
                       for c in cells(run)]
-    out['perplexity'] = [{k: p.get(k) for k in ('model', 'n_batch', 'n_ubatch', 'n_ctx', 'n_chunks', 'ppl', 'ppl_err', 'status')}
+    out['perplexity'] = [{k: p.get(k, 'ROCm' if k == 'backend' else None) for k in ('model', 'backend', 'n_batch', 'n_ubatch', 'n_ctx', 'n_chunks', 'ppl', 'ppl_err', 'status')}
                          for p in run.get('perplexity') or []]
     out['ops_perf'] = [{k: o.get(k) for k in ('backend', 'status', 'exit_code', 'n_rows')} for o in run.get('ops_perf', [])]
+    out['speed_bench'] = []
+    for s in run.get('speed_bench') or []:
+        entry = {k: s.get(k) for k in ('model', 'bench', 'spec_type', 'status', 'n_ctx', 'n_ubatch', 'limit')}
+        entry['draft'] = (s.get('draft') or {}).get('file')
+        entry['summary'] = [{k: r.get(k) for k in ('category', 'requests', 'avg_prompt_t_s', 'avg_pred_t_s', 'accept_rate')}
+                            for r in s.get('summary') or []]
+        out['speed_bench'].append(entry)
     return out
 
 

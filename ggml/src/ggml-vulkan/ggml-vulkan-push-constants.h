@@ -15,6 +15,12 @@ struct vk_mat_mat_push_constants {
     uint32_t padded_N;
 };
 
+// matmul_f32_f32_qsa (QSA_EPI in mul_mm.comp): the plain push constants plus the block-bias addressing (QSA_SCORE)
+struct vk_mat_mat_qsa_push_constants {
+    vk_mat_mat_push_constants mm;
+    uint32_t has_bias; uint32_t stride_bias; uint32_t batch_stride_bias;
+};
+
 // matmul_q8_0_q8_1_hcmix (HC_EPI in mul_mmq_cm1.comp): the plain push constants plus the x / mixed addressing and the mix scale
 struct vk_mat_mat_hcmix_push_constants {
     vk_mat_mat_push_constants mm;
@@ -251,6 +257,40 @@ struct vk_op_count_experts_push_constants {
     uint32_t ne00L;
     uint32_t row_tile_size;
     uint32_t row_ids_offset;
+};
+
+// mul_mm_id_glu.comp (MUL_MAT_ID_PAIR_SWIGLU); offsets and strides in the units of each binding
+struct vk_op_mmid_glu_push_constants {
+    uint32_t M;
+    uint32_t K;
+    uint32_t g_offset;
+    uint32_t u_offset;
+    uint32_t stride_e;
+    uint32_t b_offset;
+    uint32_t b_s1;
+    uint32_t b_s2;
+    uint32_t ne11;
+    uint32_t d_offset;
+    uint32_t n_used;
+    uint32_t row_ids_offset;
+    uint32_t zero;
+};
+
+// mul_mm_id_down.comp (streaming MUL_MAT_ID(+MUL)+CPY(f16) down); offsets and strides in the units of each binding
+struct vk_op_mmid_down_push_constants {
+    uint32_t M;
+    uint32_t K;
+    uint32_t a_offset;
+    uint32_t stride_e;
+    uint32_t b_offset;
+    uint32_t b_s1;
+    uint32_t b_s2;
+    uint32_t ne11;
+    uint32_t d_offset;
+    uint32_t n_used;
+    uint32_t row_ids_offset;
+    uint32_t s_offset;
+    uint32_t scaled;
 };
 
 struct vk_op_glu_push_constants {
@@ -571,6 +611,19 @@ struct vk_op_topk_radix_push_constants {
     uint32_t n_tps;    // QSA only
     uint32_t n_blocks; // QSA only
     uint32_t n_stream; // QSA only
+};
+
+// QSA_EXPAND (qsa_expand.comp): element offsets and row strides of each binding
+struct vk_op_qsa_expand_push_constants {
+    uint32_t n_query;
+    uint32_t n_blocks;
+    uint32_t budget;
+    uint32_t r;
+    uint32_t b_off, b_stride;
+    uint32_t s_off, s_stride;
+    uint32_t c_off, c_stride;
+    uint32_t t_off, t_stride;
+    uint32_t d_off, d_stride;
 };
 
 struct vk_op_im2col_push_constants {

@@ -79,7 +79,10 @@ static __global__ __launch_bounds__(256) void qsa_decode_merge(
 }
 
 bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
-    if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) { return false; }
+    return ggml_cuda_flash_attn_ext_qsa_decode_supported_dev(ctx.device, dst);
+}
+bool ggml_cuda_flash_attn_ext_qsa_decode_supported_dev(int device, const ggml_tensor * dst) {
+    if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) { return false; }
     const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];
     // the mask is optional: the launcher and both kernels take a null mask (visibility from the index rows alone)
     if (!q || !k || !v || !ids || dst->src[4] || dst->src[6] || dst->src[7] || ggml_get_op_params_i32(dst, 4) != 0) { return false; }
@@ -89,7 +92,7 @@ bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & c
     if (bias != 0.0f || cap != 0.0f || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 ||
         v->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
         q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 || q->ne[1] < 1 || q->ne[1] > QSA_DECODE_MAX_QUERIES ||
-        k->ne[1] < 1 || k->ne[1] > 262144 || v->ne[1] != k->ne[1] ||
+        k->ne[1] < 1 || k->ne[1] > GGML_QSA_MAX_KEYS || v->ne[1] != k->ne[1] ||
         k->ne[2] < 1 || q->ne[2] % k->ne[2] || v->ne[2] != k->ne[2] ||
         q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
         q->nb[0] != 4 || k->nb[0] != 2 || v->nb[0] != 2 || ids->nb[0] != 4 ||

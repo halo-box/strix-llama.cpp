@@ -2566,6 +2566,8 @@ struct llama_model_qwen4exp : public llama_model_base {
     // a bf16 matmul weight left after load keeps the hc mixed stream f32; counted once, on the first graph
     mutable std::once_flag bf16_mm_once;
     mutable bool           bf16_mm = false;
+    // once per model: the fit probe loads its own model, with its logs demoted to debug
+    mutable std::once_flag qsa_depth_warn_once;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 

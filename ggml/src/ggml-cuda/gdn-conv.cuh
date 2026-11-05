@@ -11,6 +11,7 @@ struct ggml_cuda_gdn_conv_match {
     const ggml_tensor * w = nullptr;      // [4, C] F32
     ggml_tensor * out = nullptr;          // SiLU output [C, T]
     int64_t C = 0, T = 0, tail_from = 0;
+    int64_t S = 1;                        // sequences: x, state, concat and out hold S blocks of the shapes above
 };
 bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m);
 bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cuda_gdn_conv_match & m);

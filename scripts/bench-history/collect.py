@@ -159,6 +159,29 @@ def first_match(path: Path, pattern: str) -> str | None:
     return None
 
 
+def parse_speed_bench(path: Path) -> dict[str, Any]:
+    """The config, the sample counts and the per-category summary of one speed_bench.py --output file."""
+    out: dict[str, Any] = {'config': {}, 'selected_samples': None, 'completed_samples': None,
+                           'failed_samples': None, 'summary': []}
+    if not path.is_file():
+        return out
+    try:
+        payload = json.loads(path.read_text(errors='replace'))
+    except json.JSONDecodeError:
+        return out
+    if not isinstance(payload, dict):
+        return out
+    config = payload.get('config')
+    if isinstance(config, dict):
+        out['config'] = {k: config.get(k) for k in ('bench', 'category', 'osl', 'concurrency', 'extra_inputs')}
+    for name in ('selected_samples', 'completed_samples', 'failed_samples'):
+        out[name] = to_int(payload.get(name))
+    summary = payload.get('summary')
+    if isinstance(summary, list):
+        out['summary'] = [row for row in summary if isinstance(row, dict)]
+    return out
+
+
 def exit_status(rc: int | None) -> str:
     if rc is None:
         return 'not-run'
@@ -230,24 +253,28 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
     ppl_requested = meta.get('ppl', 'false') == 'true'
     ppl = []
     if ppl_requested:
-        ppl_rows = {(row[1], row[2]): row for row in results if row[0] == 'perplexity' and len(row) >= 4}
-        for name in meta.get('models', '').split(','):
-            if not name:
-                continue
-            for batch in int_list(meta.get('ppl_batches', '')):
-                row = ppl_rows.get((name, str(batch)))
-                parsed = parse_perplexity(raw / f'perplexity-{name}-b{batch}.log')
-                rc = to_int(row[3]) if row else None
-                if row and row[3] == 'no-wikitext':
-                    status = 'skipped (no wikitext)'
-                elif row is None and model_status.get(name, 'verified') not in ('verified', ''):
-                    status = f'skipped ({model_status[name]})'
-                else:
-                    status = exit_status(rc)
-                    if status == 'ok' and parsed['ppl'] is None:
-                        status = 'no result'
-                ppl.append({'model': name, 'n_batch': batch, 'n_ubatch': batch, 'exit_code': rc, 'status': status,
-                            'wall_seconds': float(row[4]) if row and len(row) > 4 and row[4] else None, **parsed})
+        lanes = [('ROCm', 'perplexity', 'perplexity')] + ([('Vulkan', 'perplexity-vulkan', 'perplexity-vulkan')] if meta.get('vulkan_ppl') == 'true' else [])
+        for backend, kind, prefix in lanes:
+            ppl_rows = {(row[1], row[2]): row for row in results if row[0] == kind and len(row) >= 4}
+            for name in meta.get('models', '').split(','):
+                if not name:
+                    continue
+                for batch in int_list(meta.get('ppl_batches', '')):
+                    row = ppl_rows.get((name, str(batch)))
+                    parsed = parse_perplexity(raw / f'{prefix}-{name}-b{batch}.log')
+                    rc = to_int(row[3]) if row else None
+                    if row and row[3] == 'no-wikitext':
+                        status = 'skipped (no wikitext)'
+                    elif row is None and model_status.get(name, 'verified') not in ('verified', ''):
+                        status = f'skipped ({model_status[name]})'
+                    elif backend == 'Vulkan' and row is None and steps.get('device-vulkan') not in ('success', None):
+                        status = 'skipped (no Vulkan device)'
+                    else:
+                        status = exit_status(rc)
+                        if status == 'ok' and parsed['ppl'] is None:
+                            status = 'no result'
+                    ppl.append({'model': name, 'backend': backend, 'n_batch': batch, 'n_ubatch': batch, 'exit_code': rc, 'status': status,
+                                'wall_seconds': float(row[4]) if row and len(row) > 4 and row[4] else None, **parsed})
 
     ops = []
     if ops_requested:
@@ -281,10 +308,50 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
                 'columns': OPS_COLUMNS, 'rows': rows,
             })
 
-    entries = bench + ppl + ops
+    speed = []
+    if meta.get('speed_bench', 'false') == 'true':
+        # the pinned MTP draft head each model was measured with, from drafts.tsv
+        drafts: dict[str, dict[str, Any]] = {}
+        for row in read_tsv(raw / 'drafts.tsv'):
+            if row[0] == 'draft' and len(row) >= 9 and row[1] not in drafts:
+                drafts[row[1]] = {'repo': row[2], 'revision': row[3], 'file': row[4], 'bytes': to_int(row[5]),
+                                  'sha256': row[6], 'sha256_actual': row[7] or None, 'status': row[8]}
+        # one results.tsv row per bench: speed-bench <model> <bench> <rc|no-draft> <wall>
+        speed_rc = {(row[1], row[2]): row[3] for row in results
+                    if row[0] == 'speed-bench' and len(row) >= 4}
+        for name in meta.get('models', '').split(','):
+            if not name:
+                continue
+            benches = [b for b in (meta.get(f'speed_bench_benches_{name}') or '').split(',') if b]
+            for bench_name in benches:
+                parsed = parse_speed_bench(raw / f'speed-bench-{name}-{bench_name}.json')
+                row_rc = speed_rc.get((name, bench_name))
+                rc = to_int(row_rc)
+                status = exit_status(rc)
+                if row_rc == 'no-draft':
+                    status = 'skipped (no MTP draft)'
+                elif model_status.get(name, 'verified') not in ('verified', ''):
+                    status = f'skipped ({model_status[name]})'
+                elif status == 'ok' and not parsed['summary']:
+                    status = 'no result'
+                elif status == 'ok' and parsed['failed_samples']:
+                    status = f"partial ({parsed['failed_samples']} samples failed)"
+                speed.append({
+                    'model': name, 'bench': bench_name, 'exit_code': rc, 'status': status,
+                    'spec_type': meta.get('spec_type') or None,
+                    'n_ctx': to_int(meta.get('speed_bench_ctx')),
+                    'n_batch': to_int(meta.get('speed_bench_batch')),
+                    'n_ubatch': to_int(meta.get('speed_bench_ubatch')),
+                    'limit': to_int(meta.get('speed_bench_limit')),
+                    'draft': drafts.get(name),
+                    **parsed,
+                })
+
+    entries = bench + ppl + ops + speed
     if bench and all(e['status'] == 'ok' for e in entries):
         status = 'ok'
-    elif any(b['rows'] for b in bench) or any(o['rows'] for o in ops) or any(p['ppl'] is not None for p in ppl):
+    elif any(b['rows'] for b in bench) or any(o['rows'] for o in ops) or any(p['ppl'] is not None for p in ppl) \
+            or any(s['summary'] for s in speed):
         status = 'partial'
     else:
         status = 'failed'
@@ -346,10 +413,17 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
             'ops_perf': ops_requested,
             'vulkan_bench': vulkan_requested,
             'ppl': ppl_requested,
+            'vulkan_ppl': meta.get('vulkan_ppl') == 'true',
             'ppl_ctx': to_int(meta.get('ppl_ctx')),
             'ppl_chunks': to_int(meta.get('ppl_chunks')),
             'ppl_batches': int_list(meta.get('ppl_batches', '')),
             'wikitext_sha256': meta.get('wikitext_sha256') or None,
+            'speed_bench': meta.get('speed_bench', 'false') == 'true',
+            'speed_bench_limit': to_int(meta.get('speed_bench_limit')),
+            'speed_bench_osl': to_int(meta.get('speed_bench_osl')),
+            'speed_bench_ctx': to_int(meta.get('speed_bench_ctx')),
+            'speed_bench_ubatch': to_int(meta.get('speed_bench_ubatch')),
+            'spec_type': meta.get('spec_type') or None,
         },
         'steps': steps,
         'commands': [{'label': r[0], 'command': r[1]} for r in read_tsv(raw / 'commands.tsv') if len(r) >= 2],
@@ -357,6 +431,7 @@ def collect(raw: Path, out: Path, artifact_url: str) -> str | None:
         'llama_bench': bench,
         'perplexity': ppl,
         'ops_perf': ops,
+        'speed_bench': speed,
         'logs': logs,
     }
     (run_dir / 'run.json').write_text(json.dumps(run, indent=1) + '\n')
@@ -380,12 +455,24 @@ def write_summary(run: dict[str, Any]) -> None:
         lines.append(f"- llama-bench {entry['model']} ({entry['backend']}): {entry['status']}, {len(entry['rows'])} rows")
     for entry in run['perplexity']:
         value = f"PPL {entry['ppl']:.4f} +/- {entry['ppl_err']:.5f}" if entry['ppl'] is not None else 'no PPL'
-        lines.append(f"- llama-perplexity {entry['model']} b{entry['n_batch']}: {entry['status']}, {value}")
+        lines.append(f"- llama-perplexity {entry['model']} ({entry.get('backend', 'ROCm')}) b{entry['n_batch']}: {entry['status']}, {value}")
     for entry in run['ops_perf']:
         missing = f", {len(entry['missing_listed'])} listed cases without a result" if entry['missing_listed'] else ''
         if entry.get('n_failed'):
             missing += f", {entry['n_failed']} failed to allocate or compute"
         lines.append(f"- test-backend-ops perf {entry['backend']}: {entry['status']}, {entry['n_rows']} rows{missing}")
+    for entry in run.get('speed_bench') or []:
+        overall = next((row for row in entry['summary'] if row.get('category') == 'overall'), None)
+        label = f"{entry['model']} {entry.get('bench')}"
+        draft = entry.get('draft') or {}
+        head = f" with {draft['file']}" if draft.get('file') else ''
+        if overall and overall.get('avg_pred_t_s') is not None:
+            accept = overall.get('accept_rate')
+            share = f", {100 * accept:.1f}% draft acceptance" if accept is not None else ', nothing drafted'
+            lines.append(f"- SPEED-Bench {label} (--spec-type {entry.get('spec_type')}{head}): {entry['status']}, "
+                         f"{overall['avg_pred_t_s']:.2f} t/s decode over {overall.get('requests')} samples{share}")
+        else:
+            lines.append(f"- SPEED-Bench {label}: {entry['status']}, no result")
     with open(path, 'a') as f:
         f.write('\n'.join(lines) + '\n')
 

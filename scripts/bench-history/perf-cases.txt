@@ -1,4 +1,4 @@
-# test-backend-ops perf cases run by .github/workflows/bench-gfx1151-history.yml besides the
+# test-backend-ops perf cases run by .github/workflows/bench-gfx1151-ops-perf.yml besides the
 # all-types MUL_MAT and MUL_MAT_ID cases; written by scripts/bench-history/select_perf_cases.py
 GET_ROWS(type=f32,n=90,m=65537,r=65536,be1=1,be2=1,v=0,vs0=0,offset_cols=0)
 GET_ROWS(type=f16,n=90,m=65537,r=65536,be1=1,be2=1,v=0,vs0=0,offset_cols=0)

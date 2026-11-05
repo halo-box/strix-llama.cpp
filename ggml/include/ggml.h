@@ -2560,6 +2560,15 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // hint: the mask is the plain causal one over the key index (n_kv == n_q per stream, key j visible to query i
+    // iff j <= i), so a backend may skip reading it. The mask must still be supplied and correct.
+    GGML_API void ggml_flash_attn_ext_set_causal_prefix(
+            struct ggml_tensor * a,
+            bool                 causal_prefix);
+
+    GGML_API bool ggml_flash_attn_ext_get_causal_prefix(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
