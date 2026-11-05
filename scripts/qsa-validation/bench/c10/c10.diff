@@ -1,0 +1,129 @@
+--- llama-bench.orig.cpp	2026-11-04 11:29:39.836761721 +0100
++++ llama-bench.cpp	2026-11-04 11:30:10.981350991 +0100
+@@ -2207,6 +2207,75 @@
+     std::vector<uint8_t> buf; // the llama_context state buffer
+ };
+ 
++
++// ---- C10 real-text token source ----
++static std::vector<llama_token> g_c10_toks;
++static bool g_c10_ready = false;
++static int64_t g_c10_off = 0;
++static void c10_init(const llama_vocab * vocab) {
++    if (g_c10_ready) return;
++    g_c10_ready = true;
++    const char * env = getenv("C10_TEXT");
++    if (!env || !*env) return;
++    const char * seg_env = getenv("C10_SEG");
++    const size_t seg = seg_env ? (size_t) atoll(seg_env) : 16384;
++    const char * maxb_env = getenv("C10_MAXBYTES");
++    const size_t maxb = maxb_env ? (size_t) atoll(maxb_env) : 2000000;
++    std::vector<std::vector<llama_token>> per;
++    std::string list(env);
++    size_t p0 = 0;
++    while (p0 <= list.size()) {
++        size_t p1 = list.find(',', p0); if (p1 == std::string::npos) p1 = list.size();
++        std::string path = list.substr(p0, p1 - p0); p0 = p1 + 1;
++        if (path.empty()) continue;
++        FILE * f = fopen(path.c_str(), "rb");
++        if (!f) { fprintf(stderr, "C10: cannot open %s\n", path.c_str()); exit(1); }
++        std::string txt; char buf[65536]; size_t n;
++        while ((n = fread(buf, 1, sizeof(buf), f)) > 0 && txt.size() < maxb) txt.append(buf, n);
++        fclose(f);
++        if (txt.size() > maxb) txt.resize(maxb);
++        // cut at the last newline so no UTF-8 sequence is split
++        size_t nl = txt.rfind('\n'); if (nl != std::string::npos) txt.resize(nl + 1);
++        int32_t nt = -llama_tokenize(vocab, txt.c_str(), (int32_t) txt.size(), nullptr, 0, false, false);
++        std::vector<llama_token> t(nt);
++        int32_t got = llama_tokenize(vocab, txt.c_str(), (int32_t) txt.size(), t.data(), nt, false, false);
++        if (got != nt) { fprintf(stderr, "C10: tokenize failed for %s (%d vs %d)\n", path.c_str(), got, nt); exit(1); }
++        fprintf(stderr, "C10: %s: %zu bytes -> %d tokens\n", path.c_str(), txt.size(), nt);
++        per.push_back(std::move(t));
++    }
++    if (llama_vocab_get_add_bos(vocab)) g_c10_toks.push_back(llama_vocab_bos(vocab));
++    if (per.size() == 1) {
++        g_c10_toks.insert(g_c10_toks.end(), per[0].begin(), per[0].end());
++    } else {
++        std::vector<size_t> pos(per.size(), 0);
++        bool any = true;
++        while (any) {
++            any = false;
++            for (size_t k = 0; k < per.size(); k++) {
++                if (pos[k] >= per[k].size()) continue;
++                size_t e = std::min(per[k].size(), pos[k] + seg);
++                g_c10_toks.insert(g_c10_toks.end(), per[k].begin() + pos[k], per[k].begin() + e);
++                pos[k] = e; any = true;
++            }
++        }
++    }
++    uint64_t h = 1469598103934665603ull;
++    for (llama_token x : g_c10_toks) { h ^= (uint32_t) x; h *= 1099511628211ull; }
++    fprintf(stderr, "C10: corpus %zu tokens (seg %zu, add_bos %d), fnv1a %016llx\n", g_c10_toks.size(), seg,
++            (int) llama_vocab_get_add_bos(vocab), (unsigned long long) h);
++}
++static void c10_log_window(const llama_vocab * vocab, const char * what, int64_t off, int n) {
++    if (g_c10_toks.empty()) return;
++    std::string out;
++    for (int i = 0; i < 12 && i < n; i++) {
++        char pc[256]; int l = llama_token_to_piece(vocab, g_c10_toks[(off + i) % g_c10_toks.size()], pc, sizeof(pc), 0, true);
++        if (l > 0) out.append(pc, l);
++    }
++    for (auto & c : out) if (c == '\n') c = ' ';
++    fprintf(stderr, "C10: %s off=%lld n=%d starts: [%s]\n", what, (long long) off, n, out.c_str());
++}
++// ---- end C10 ----
++
+ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
+     llama_set_n_threads(ctx, n_threads, n_threads);
+ 
+@@ -2219,14 +2288,26 @@
+     // same prompt on every call: a rep must benchmark the same workload (warm-up included)
+     std::srand(1);
+ 
++    c10_init(vocab);
++    const bool c10_text = !g_c10_toks.empty();
++    static int c10_nlog = 0;
++    if (c10_text && c10_nlog < 6) { c10_log_window(vocab, "prompt", g_c10_off, n_prompt); c10_nlog++; }
++
+     int n_processed = 0;
+ 
+     while (n_processed < n_prompt) {
+         int n_tokens = std::min(n_prompt - n_processed, n_batch);
++        if (c10_text) {
++            const size_t N = g_c10_toks.size();
++            for (int i = 0; i < n_tokens; i++) {
++                tokens[i] = g_c10_toks[(size_t) (g_c10_off + n_processed + i) % N];
++            }
++        } else {
+         tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+         for (int i = 1; i < n_tokens; i++) {
+             tokens[i] = std::rand() % n_vocab;
+         }
++        }
+         common_batch batch = common_batch_get_one(ctx, tokens.data(), n_tokens);
+         int res = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+         if (res != 0) {
+@@ -2464,6 +2545,7 @@
+                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
+                 }
+                 //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
++                g_c10_off = 0;
+                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                 if (!res) {
+                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
+@@ -2506,6 +2588,7 @@
+                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
+                                 i + 1, params.reps);
+                     }
++                    g_c10_off = 0;
+                     bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                     if (!res) {
+                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
+@@ -2533,6 +2616,7 @@
+                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
+                             i + 1, params.reps);
+                 }
++                g_c10_off = t.n_depth;
+                 bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                 if (!res) {
+                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);

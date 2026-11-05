@@ -1,0 +1,49 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f6960cbdf..87a19a5e7 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -42,6 +42,8 @@ struct qpin_state {
+     std::vector<int32_t> pos;
+     std::map<std::pair<int,int>, qpin_acc> qsa; // (layer, depth bucket of 4096; -1 = all)
+     std::map<int, qpin_acc> moe;
++    std::map<std::pair<int,int>, qpin_acc> qsa_chunk; // (chunk, src: 1 cb, 2 tk first fire, 3 tk second fire)
++    std::map<int, int> tk_fire; // per layer, reset per ubatch
+     std::map<std::string, int> fds;
+     std::vector<int32_t> buf, rec, stamp;
+     std::vector<uint8_t> bytes;
+@@ -78,6 +80,7 @@ void qpin_rows(ggml_tensor * t, int kind, int il) {
+     S.buf.resize(W*nq);
+     ggml_backend_tensor_get(t, S.buf.data(), 0, W*nq*sizeof(int32_t));
+     kind == 1 ? S.n_cb++ : S.n_tk++;
++    const int src = kind == 1 ? 1 : (++S.tk_fire[il] == 1 ? 2 : 3);
+     char fname[64];
+     snprintf(fname, sizeof(fname), "rows_c%d_l%d.bin", S.chunk, il);
+     S.rec.resize(W + 1);
+@@ -123,6 +126,7 @@ void qpin_rows(ggml_tensor * t, int kind, int il) {
+             qpin_add(S.qsa[{il, (int) (p/4096)}], ov, jc, ex);
+             qpin_add(S.qsa[{-1, (int) (p/4096)}], ov, jc, ex);
+             qpin_add(S.qsa[{-1, -1}], ov, jc, ex);
++            qpin_add(S.qsa_chunk[{S.chunk, src}], ov, jc, ex);
+         }
+         if (S.pin_qsa) {
+             for (int64_t j = 0; j < W; ++j) {
+@@ -215,6 +219,7 @@ void qpin_init() {
+ void qpin_begin_ubatch(const llama_ubatch & ub) {
+     if (!g_qpin.mode) { return; }
+     g_qpin.pos.clear();
++    g_qpin.tk_fire.clear();
+     if (ub.n_tokens < 16 || ub.pos == nullptr) { return; }
+     if (ub.pos[0] == 0) { g_qpin.chunk++; }
+     g_qpin.pos.assign(ub.pos, ub.pos + ub.n_tokens);
+@@ -235,6 +240,11 @@ void qpin_report() {
+         out("QPIN_QSA layer=%d bucket=%d n=%lld overlap=%.6f jaccard=%.6f exact=%.6f\n", k.first, k.second,
+             (long long) a.n, a.overlap / std::max<int64_t>(a.n, 1), a.jacc / std::max<int64_t>(a.n, 1), (double) a.exact / std::max<int64_t>(a.n, 1));
+     }
++    for (const auto & [k, a] : S.qsa_chunk) {
++        out("QPIN_QSA_CHUNK chunk=%d src=%s n=%lld overlap=%.9f jaccard=%.9f exact=%.9f\n", k.first,
++            k.second == 1 ? "cb" : (k.second == 2 ? "tk1" : "tk2"), (long long) a.n, a.overlap / std::max<int64_t>(a.n, 1),
++            a.jacc / std::max<int64_t>(a.n, 1), (double) a.exact / std::max<int64_t>(a.n, 1));
++    }
+     for (const auto & [k, a] : S.moe) {
+         out("QPIN_MOE layer=%d n=%lld overlap=%.6f exact=%.6f\n", k, (long long) a.n,
+             a.overlap / std::max<int64_t>(a.n, 1), (double) a.exact / std::max<int64_t>(a.n, 1));

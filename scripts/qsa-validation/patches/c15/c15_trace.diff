@@ -1,0 +1,216 @@
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index a40ba8456..0e2c8723a 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -9,6 +9,10 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
++
++// C15 instrumentation (GGML_C15=1): planned buffer sizes, the tensor that sets each chunk top, realloc reasons
++static int ggml_c15_on(void) { static int v = -1; if (v < 0) { const char * e = getenv("GGML_C15"); v = e ? atoi(e) : 0; } return v; }
+ 
+ #define MAX(a, b) ((a) > (b) ? (a) : (b))
+ #define MAX_FREE_BLOCKS 256
+@@ -116,6 +120,11 @@ struct tallocr_chunk {
+     struct free_block free_blocks[MAX_FREE_BLOCKS];
+     int n_free_blocks;
+     size_t max_size;
++    char top_name[GGML_MAX_NAME];
++    int top_op;
++    int64_t top_ne[4];
++    int top_type;
++    size_t top_off, top_size;
+ };
+ 
+ struct ggml_dyn_tallocr {
+@@ -305,6 +314,14 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
+     }
+ #endif
+ 
++    if (tensor && addr.offset + size > chunk->max_size) {
++        snprintf(chunk->top_name, sizeof(chunk->top_name), "%s", tensor->name);
++        chunk->top_op = tensor->op;
++        chunk->top_type = tensor->type;
++        for (int k = 0; k < 4; k++) { chunk->top_ne[k] = tensor->ne[k]; }
++        chunk->top_off = addr.offset;
++        chunk->top_size = size;
++    }
+     chunk->max_size = MAX(chunk->max_size, addr.offset + size);
+ 
+     return addr;
+@@ -1102,6 +1119,57 @@ static bool ggml_gallocr_reserve_n_impl(
+         galloc->hold_at_max = galloc->hold;
+     }
+ 
++    if (ggml_c15_on()) {
++        static int c15_seq = 0;
++        const int seq = c15_seq++;
++        bool grow = false;
++        for (int i = 0; i < galloc->n_buffers; i++) {
++            bool seen = false;
++            for (int j = 0; j < i; j++) { seen |= galloc->buf_tallocs[j] == galloc->buf_tallocs[i]; }
++            if (seen) { continue; }
++            size_t planned = 0;
++            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) { planned += ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c); }
++            const size_t cur = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
++            grow |= planned > cur;
++            GGML_LOG_WARN("C15A plan #%d galloc=%p nodes=%d leafs=%d no_alloc=%d buf=%s planned=%zu (%.4f MiB) cur=%zu (%.4f MiB)%s\n",
++                    seq, (void *) galloc, graph->n_nodes, graph->n_leafs, (int) no_alloc, ggml_backend_buft_name(galloc->bufts[i]),
++                    planned, planned/1048576.0, cur, cur/1048576.0, planned > cur ? " GROW" : "");
++            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
++                const struct tallocr_chunk * ch = galloc->buf_tallocs[i]->chunks[c];
++                GGML_LOG_WARN("C15A   top #%d %s chunk %d: '%s' op=%s type=%s ne=[%lld,%lld,%lld,%lld] off=%zu size=%zu end=%zu\n",
++                        seq, ggml_backend_buft_name(galloc->bufts[i]), c, ch->top_name, ggml_op_name((enum ggml_op) ch->top_op),
++                        ggml_type_name((enum ggml_type) ch->top_type),
++                        (long long) ch->top_ne[0], (long long) ch->top_ne[1], (long long) ch->top_ne[2], (long long) ch->top_ne[3],
++                        ch->top_off, ch->top_size, ch->top_off + ch->top_size);
++            }
++        }
++        const char * dir = getenv("GGML_C15_DUMP");
++        const char * all = getenv("GGML_C15_DUMP_ALL");
++        if (dir && (grow || (all && atoi(all)))) {
++            char path[512];
++            snprintf(path, sizeof(path), "%s/plan_%d_%04d.tsv", dir, (int) getpid(), seq);
++            FILE * f = fopen(path, "w");
++            if (f) {
++                fprintf(f, "#galloc=%p nodes=%d leafs=%d\n", (void *) galloc, graph->n_nodes, graph->n_leafs);
++                for (int pass = 0; pass < 2; pass++) {
++                    const int n = pass == 0 ? graph->n_nodes : graph->n_leafs;
++                    for (int i = 0; i < n; i++) {
++                        struct ggml_tensor * t = pass == 0 ? graph->nodes[i] : graph->leafs[i];
++                        if (t->view_src || t->data) { continue; }
++                        struct hash_node * hn = ggml_gallocr_hash_get(galloc, t);
++                        if (hn->buffer_id < 0) { continue; }
++                        fprintf(f, "%c\t%d\t%s\t%s\t%s\t%d\t%zu\t%zu\t%lld,%lld,%lld,%lld\n", pass == 0 ? 'N' : 'L', i, t->name,
++                                ggml_op_name(t->op), ggml_type_name(t->type), hn->buffer_id, hn->addr.offset,
++                                ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], t),
++                                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
++                    }
++                }
++                fclose(f);
++                GGML_LOG_WARN("C15A dump #%d -> %s\n", seq, path);
++            }
++        }
++    }
++
+     // set the node_allocs from the hash table
+     if (galloc->n_nodes < graph->n_nodes) {
+         free(galloc->node_allocs);
+@@ -1292,6 +1360,7 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
+ 
+ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+     if (galloc->n_nodes != graph->n_nodes) {
++        if (ggml_c15_on()) { GGML_LOG_WARN("C15R galloc=%p n_nodes %d -> %d\n", (void *) galloc, galloc->n_nodes, graph->n_nodes); }
+ #ifndef NDEBUG
+         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
+ #endif
+@@ -1299,6 +1368,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
+     }
+ 
+     if (galloc->n_leafs != graph->n_leafs) {
++        if (ggml_c15_on()) { GGML_LOG_WARN("C15R galloc=%p n_leafs %d -> %d\n", (void *) galloc, galloc->n_leafs, graph->n_leafs); }
+ #ifndef NDEBUG
+         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
+ #endif
+@@ -1310,6 +1380,8 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
+         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+ 
+         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
++            if (ggml_c15_on()) { GGML_LOG_WARN("C15R galloc=%p node %d '%s' op=%s size %zu > size_max %zu\n", (void *) galloc, i, node->name, ggml_op_name(node->op),
++                    node_alloc->dst.buffer_id >= 0 ? ggml_backend_buft_get_alloc_size(galloc->bufts[node_alloc->dst.buffer_id], node) : 0, node_alloc->dst.size_max); }
+ #ifndef NDEBUG
+             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
+ #endif
+@@ -1322,6 +1394,8 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
+                 continue;
+             }
+             if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
++                if (ggml_c15_on()) { GGML_LOG_WARN("C15R galloc=%p node %d '%s' src %d '%s' size %zu > size_max %zu\n", (void *) galloc, i, node->name, j, src->name,
++                        node_alloc->src[j].buffer_id >= 0 ? ggml_backend_buft_get_alloc_size(galloc->bufts[node_alloc->src[j].buffer_id], src) : 0, node_alloc->src[j].size_max); }
+ #ifndef NDEBUG
+                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
+ #endif
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7fc62456a..9edb77551 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1880,6 +1880,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+     }
+ 
++    static const bool c15 = getenv("GGML_C15") && atoi(getenv("GGML_C15")) != 0;
++    if (c15) {
++        std::string sz;
++        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++            const size_t a = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
++            sz += format(" %s=%zu(exp %zu)%s", ggml_backend_buft_name(backend_buft[i]), a, backend_buf_exp_size[i], a > backend_buf_exp_size[i] ? "!OVER" : "");
++        }
++        llama_seq_id s0 = ubatch.n_seq_id && ubatch.n_seq_id[0] > 0 ? ubatch.seq_id[0][0] : -1;
++        LLAMA_LOG_WARN("C15L ubatch ctx=%p ctx_type=%d gtype=%d n_tokens=%u n_seqs=%u n_seq_tokens=%u n_seqs_unq=%u n_outputs=%d token=%d embd=%d pos=[%d..%d] seq0=%d reused=%d nodes=%d%s\n",
++                (void *) this, (int) cparams.ctx_type, (int) gtype, ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seq_tokens, ubatch.n_seqs_unq,
++                (int) n_outputs, ubatch.token != nullptr, ubatch.embd != nullptr,
++                ubatch.pos ? ubatch.pos[0] : -1, ubatch.pos ? ubatch.pos[ubatch.n_tokens-1] : -1, s0, (int) reused,
++                ggml_graph_n_nodes(res->get_gf()), sz.c_str());
++    }
++
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+@@ -2976,6 +2991,11 @@ ggml_cgraph * llama_context::graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
+     GGML_ASSERT(n_outputs >= 1);
++    static const bool c15 = getenv("GGML_C15") && atoi(getenv("GGML_C15")) != 0;
++    if (c15) {
++        LLAMA_LOG_WARN("C15L graph_reserve ctx=%p ctx_type=%d n_tokens=%u n_seqs=%u n_outputs=%u split_only=%d sizes=%d\n",
++                (void *) this, (int) cparams.ctx_type, n_tokens, n_seqs, n_outputs, (int) split_only, sizes != nullptr);
++    }
+ 
+     if (n_tokens % n_seqs != 0) {
+         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d13804ce9..57a970941 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1475,6 +1475,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+             ggml_set_input(qsa->tail_idxs);
+         }
+ 
++        static const bool c15 = getenv("GGML_C15") && atoi(getenv("GGML_C15")) != 0;
++        if (c15) {
++            LLAMA_LOG_WARN("C15Q inputs il=%d r=%lld n_kv=%lld n_blocks=%lld n_stream=%lld n_tps=%lld blk_bias=%d blocks=%d scalar=%d strip=%lld key_limits=%zu bias=%s[%lld,%lld,%lld] tail=%d pos0=%d posN=%d\n",
++                    il, (long long) r, (long long) n_kv, (long long) n_blocks, (long long) n_stream, (long long) n_tps, (int) blk_bias, (int) blocks, (int) scalar,
++                    (long long) qsa->score_strip, qsa->score_key_limits.size(), ggml_type_name(qsa->bias->type),
++                    (long long) qsa->bias->ne[0], (long long) qsa->bias->ne[1], (long long) qsa->bias->ne[2], (int) (qsa->tail_idxs != nullptr),
++                    ubatch.pos ? ubatch.pos[0] : -1, ubatch.pos ? ubatch.pos[ubatch.n_tokens-1] : -1);
++        }
+         inp = qsa.get();
+         res->add_input(std::move(qsa));
+         qsa_inps.emplace((uint32_t) r, inp);
+@@ -1495,6 +1503,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     ggml_tensor * cached = storage && mctx_hyb->qsa_prefix_matches(ubatch) ? storage : nullptr;
+     const bool fast_cache = cached && mctx_hyb->qsa_fast(il, ubatch);
+     const int64_t prep_blocks = fast_cache ? (n_tokens+3)/4+2 : n_blocks;
++    {
++        static const bool c15 = getenv("GGML_C15") && atoi(getenv("GGML_C15")) != 0;
++        if (c15) {
++            LLAMA_LOG_WARN("C15Q cache il=%d storage=%d cached=%d fast=%d prep_blocks=%lld\n", il, storage != nullptr, cached != nullptr, (int) fast_cache, (long long) prep_blocks);
++        }
++    }
+     ggml_tensor * member_rows = inp->blk_cells;
+     ggml_tensor * block_positions = inp->blk_pos;
+     ggml_tensor * cache_rows = nullptr;
+@@ -1874,6 +1888,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+             const char * env = getenv("LLAMA_QSA_DENSE_SHORTCUT");
+             return env == nullptr || atoi(env) != 0;
+         }();
++        static const bool c15 = getenv("GGML_C15") && atoi(getenv("GGML_C15")) != 0;
++        if (c15) {
++            LLAMA_LOG_WARN("C15Q layer il=%d r=%lld n_kv=%lld width=%lld route=%s q_first=%lld n_tokens=%lld n_outputs=%lld\n", il, (long long) r, (long long) n_kv, (long long) width,
++                    shortcut && n_kv <= width ? "dense-shortcut" : "selection", (long long) q_first, (long long) n_tokens, (long long) n_outputs);
++        }
+         if (shortcut && n_kv <= width) {
+             build_qsa_store_k(mctx_hyb, cur, il);
+         } else {

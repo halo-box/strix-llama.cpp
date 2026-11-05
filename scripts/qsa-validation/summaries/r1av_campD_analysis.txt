@@ -1,0 +1,53 @@
+R D_ref_rec rc=0 322s env=[] | 1.36.556.125 I Final estimate: PPL = 3.0364 +/- 0.04746 |  |  | QPIN_SUMMARY mode=1 chunk
+R D_self rc=0 417s env=[] |  | Mean    KLD:  -0.000000 ±   0.000000 
+R D_q8_0_q8_0_u512_av0 rc=0 427s env=[LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000198 ±   0.000005 
+R D_q8_0_q8_0_u512_av2 rc=0 422s env=[LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.000162 ±   0.000004 
+R D_q4_0_q4_0_u512_av0 rc=0 444s env=[LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.007529 ±   0.000208 
+R D_q4_0_q4_0_u512_av2 rc=0 518s env=[LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.007406 ±   0.000213 
+R D_bf16_bf16_u512_av0 rc=0 456s env=[LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000172 ±   0.000005 
+R D_bf16_bf16_u512_av2 rc=0 535s env=[LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.000143 ±   0.000008 
+R D_q8_0_f16_u512_av0 rc=0 413s env=[LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000181 ±   0.000006 
+R D_q8_0_f16_u512_av2 rc=0 430s env=[LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.000146 ±   0.000004 
+R D_f16_q8_0_u512_av0 rc=0 467s env=[LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000189 ±   0.000005 
+R D_f16_q8_0_u512_av2 rc=0 410s env=[LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.000147 ±   0.000004 
+R D_f16_f16_u512_av0 rc=0 381s env=[LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000162 ±   0.000006 
+R D_f16_f16_u512_av2 rc=0 374s env=[LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.000134 ±   0.000007 
+R D_q8_0_q8_0_u16_av0 rc=0 658s env=[LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.006900 ±   0.000174 
+R D_q8_0_q8_0_u16_av2 rc=0 577s env=[LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.006745 ±   0.000177 
+R D_f16_f16_u16_av0 rc=0 669s env=[LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.006745 ±   0.000188 
+R D_f16_f16_u16_av2 rc=0 633s env=[LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.006563 ±   0.000155 
+R D_q8_0_q8_0_u512_av0_r2 rc=0 223s env=[LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000198 ±   0.000005 
+R D_q8_0_q8_0_u512_av2_r2 rc=0 230s env=[LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.000162 ±   0.000004 
+R D_q8_0_q8_0_u1024_av0 rc=0 208s env=[LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000198 ±   0.000005 
+D_q8_0_q8_0_u512_av2 - D_q8_0_q8_0_u512_av0 (n=16)
+  lo : A=1.9817e-04 B=1.6244e-04 diff=-3.5722e-05 SEp=5.217e-06 diff/SEp=-6.85 [PASS at 3SEp] max|d|=6.355e-05 per-chunk d: -4.98e-05 -4.69e-05 -3.61e-05 -3.41e-05 -6.35e-05 -8.23e-06 +2.28e-05 -2.52e-05 -4.15e-05 -3.60e-05 -4.02e-05 -1.88e-05 -5.63e-05 -3.95e-05 -4.86e-05 -4.96e-05
+D_q4_0_q4_0_u512_av2 - D_q4_0_q4_0_u512_av0 (n=16)
+  lo : A=7.5295e-03 B=7.4056e-03 diff=-1.2387e-04 SEp=1.079e-04 diff/SEp=-1.15 [PASS at 3SEp] max|d|=8.654e-04 per-chunk d: -6.19e-04 -8.65e-04 +5.53e-04 -7.15e-04 -1.02e-04 +8.32e-05 -1.76e-04 +2.90e-04 -4.63e-04 +4.79e-04 -3.17e-04 +1.53e-04 +2.44e-04 -1.09e-05 -5.72e-04 +5.59e-05
+D_bf16_bf16_u512_av2 - D_bf16_bf16_u512_av0 (n=16)
+  lo : A=1.7173e-04 B=1.4280e-04 diff=-2.8935e-05 SEp=7.739e-06 diff/SEp=-3.74 [PASS at 3SEp] max|d|=7.316e-05 per-chunk d: -2.60e-05 -6.32e-05 -4.30e-05 -4.52e-05 -2.60e-05 -4.36e-05 +7.32e-05 -2.47e-05 -3.14e-05 -1.04e-05 -1.79e-05 -3.52e-05 -5.84e-05 -5.49e-05 -2.65e-05 -2.96e-05
+D_q8_0_f16_u512_av2 - D_q8_0_f16_u512_av0 (n=16)
+  lo : A=1.8131e-04 B=1.4563e-04 diff=-3.5679e-05 SEp=3.657e-06 diff/SEp=-9.76 [PASS at 3SEp] max|d|=6.016e-05 per-chunk d: -4.27e-05 -4.03e-05 -3.75e-05 -4.80e-05 -2.41e-05 -3.11e-05 -4.51e-05 -1.98e-05 -2.18e-05 -3.99e-05 -4.03e-05 -1.94e-06 -4.09e-05 -6.02e-05 -2.33e-05 -5.40e-05
+D_f16_q8_0_u512_av2 - D_f16_q8_0_u512_av0 (n=16)
+  lo : A=1.8851e-04 B=1.4667e-04 diff=-4.1844e-05 SEp=4.149e-06 diff/SEp=-10.08 [PASS at 3SEp] max|d|=7.157e-05 per-chunk d: -4.75e-05 -4.53e-05 -2.35e-05 -4.15e-05 -4.69e-05 -3.86e-05 -5.39e-05 -7.16e-05 -4.72e-05 -3.69e-05 -3.57e-05 -1.60e-05 -5.76e-05 -3.37e-05 -6.47e-05 -8.85e-06
+D_f16_f16_u512_av2 - D_f16_f16_u512_av0 (n=16)
+  lo : A=1.6158e-04 B=1.3440e-04 diff=-2.7181e-05 SEp=5.717e-06 diff/SEp=-4.75 [PASS at 3SEp] max|d|=5.834e-05 per-chunk d: -9.07e-07 -5.83e-05 -3.76e-05 -2.63e-05 -3.26e-05 -5.71e-05 +3.94e-05 -4.15e-05 -2.93e-05 -3.16e-05 -2.04e-05 -1.23e-05 -3.02e-05 -3.44e-05 -3.89e-05 -2.32e-05
+D_q8_0_q8_0_u16_av2 - D_q8_0_q8_0_u16_av0 (n=16)
+  lo : A=6.8998e-03 B=6.7445e-03 diff=-1.5532e-04 SEp=9.209e-05 diff/SEp=-1.69 [PASS at 3SEp] max|d|=9.702e-04 per-chunk d: -4.18e-04 -7.12e-04 -2.20e-04 -9.70e-04 -1.89e-04 +5.31e-04 +3.41e-05 -2.27e-04 -1.44e-04 -8.98e-05 -2.38e-04 -2.88e-04 +4.39e-04 +7.84e-05 -1.08e-04 +3.66e-05
+D_f16_f16_u16_av2 - D_f16_f16_u16_av0 (n=16)
+  lo : A=6.7452e-03 B=6.5629e-03 diff=-1.8234e-04 SEp=9.754e-05 diff/SEp=-1.87 [PASS at 3SEp] max|d|=9.150e-04 per-chunk d: -1.28e-04 +3.51e-04 -7.82e-04 +3.13e-04 -1.97e-04 +1.06e-04 -4.67e-04 +1.94e-04 -6.69e-04 +2.49e-04 -2.55e-04 -1.04e-04 +6.09e-05 -9.15e-04 -3.98e-04 -2.75e-04
+D_q8_0_q8_0_u512_av0_r2 - D_q8_0_q8_0_u512_av0 (n=16)
+  lo : A=1.9817e-04 B=1.9817e-04 diff=+0.0000e+00 SEp=0.000e+00 diff/SEp=+nan [PASS at 3SEp] max|d|=0.000e+00 per-chunk d: +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00
+D_q8_0_q8_0_u512_av2_r2 - D_q8_0_q8_0_u512_av2 (n=16)
+  lo : A=1.6244e-04 B=1.6244e-04 diff=+0.0000e+00 SEp=0.000e+00 diff/SEp=+nan [PASS at 3SEp] max|d|=0.000e+00 per-chunk d: +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00
+D_q8_0_q8_0_u1024_av0 - D_q8_0_q8_0_u512_av0 (n=16)
+  lo : A=1.9817e-04 B=1.9817e-04 diff=+0.0000e+00 SEp=0.000e+00 diff/SEp=+nan [PASS at 3SEp] max|d|=0.000e+00 per-chunk d: +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00
+D_q8_0_q8_0_u16_av0 - D_q8_0_q8_0_u512_av0 (n=16)
+  lo : A=1.9817e-04 B=6.8998e-03 diff=+6.7017e-03 SEp=4.062e-04 diff/SEp=+16.50 [FAIL at 3SEp] max|d|=9.603e-03 per-chunk d: +7.28e-03 +8.19e-03 +9.60e-03 +8.03e-03 +5.17e-03 +4.87e-03 +7.09e-03 +8.02e-03 +8.30e-03 +4.44e-03 +5.23e-03 +4.28e-03 +6.54e-03 +8.24e-03 +5.82e-03 +6.13e-03
+1.19.812.433 I kl_divergence: 21.59 seconds per pass - ETA 5.75 minutes
+1.18.383.849 I kl_divergence: 22.03 seconds per pass - ETA 5.87 minutes
+1.18.164.605 I kl_divergence: 21.53 seconds per pass - ETA 5.73 minutes
+1.13.585.816 I kl_divergence: 21.66 seconds per pass - ETA 5.77 minutes
+C1TRACE dense_tile_vec_mma nq 2 nkv 256 ids -1 mask 1 K q8_0 V q8_0
+C1TRACE dense_tile_vec_mma nq 16 nkv 256 ids -1 mask 1 K q8_0 V q8_0
+C1TRACE dense_tile_vec_mma nq 2 nkv 256 ids -1 mask 1 K f16 V f16
+C1TRACE dense_tile_vec_mma nq 16 nkv 256 ids -1 mask 1 K f16 V f16

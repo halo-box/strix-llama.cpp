@@ -1,0 +1,12 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index d3835de3e..073c9f4d9 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1635,6 +1635,7 @@ struct test_case {
+             }
+ 
+             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
++            fprintf(stderr, "BANDS_NMSE_VS_CPU %s %s nmse_gpu_vs_cpu=%.9e n=%zu\n", ggml_op_desc(t1), ud->tc->vars().c_str(), nmse(f2.data(), f1.data(), f1.size()), f1.size());
+             if (err > ud->tc->max_err(ud->backend1)) {
+                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
+                 //for (int i = 0; i < (int) f1.size(); i++) {

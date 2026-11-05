@@ -1,0 +1,119 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 87a19a5e7..52c72110b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -71,6 +71,43 @@ bool qpin_read(const std::string & name, int64_t rec_words, int64_t p, int32_t *
+ 
+ void qpin_add(qpin_acc & a, double ov, double jc, bool ex) { a.overlap += ov; a.jacc += jc; a.n++; a.exact += ex; }
+ 
++// ---- R1Q8 (measurement only): planted defects. LAB_DEF=d1|d2|d3  LAB_DEF_PRE=1 (apply to the computed rows BEFORE the pin copy)
++// d1: layer LAB_D1_L (23): drop the last valid tail cell (row slots W-3..W-1) of every query row (-> -1)
++// d2: layer LAB_D2_L (3):  drop one selected block (4 cells) per query row: the median valid block of the row (-> -1)
++// d3: layer LAB_D3_L (23): attn_output x (1 + LAB_D3_EPS) (default 1e-3) == V x (1+eps): softmax weights sum to 1, wo is linear
++struct lab_def_state { int def = 0; bool pre = false; int l1 = 23, l2 = 3, l3 = 23; double eps = 1e-3;
++    int64_t n_d1 = 0, n_d1_self = 0, n_d2 = 0, n_d3 = 0, n_rows_l = 0; bool init = false; };
++lab_def_state g_lab;
++void lab_init() {
++    if (g_lab.init) { return; }
++    g_lab.init = true;
++    if (const char * d = getenv("LAB_DEF")) { g_lab.def = !strcmp(d, "d1") ? 1 : !strcmp(d, "d2") ? 2 : !strcmp(d, "d3") ? 3 : 0; }
++    g_lab.pre = getenv("LAB_DEF_PRE") && atoi(getenv("LAB_DEF_PRE"));
++    if (getenv("LAB_D1_L")) { g_lab.l1 = atoi(getenv("LAB_D1_L")); }
++    if (getenv("LAB_D2_L")) { g_lab.l2 = atoi(getenv("LAB_D2_L")); }
++    if (getenv("LAB_D3_L")) { g_lab.l3 = atoi(getenv("LAB_D3_L")); }
++    if (getenv("LAB_D3_EPS")) { g_lab.eps = atof(getenv("LAB_D3_EPS")); }
++    fprintf(stderr, "R1Q8: def=%d pre=%d l1=%d l2=%d l3=%d eps=%.3e\n", g_lab.def, (int) g_lab.pre, g_lab.l1, g_lab.l2, g_lab.l3, g_lab.eps);
++}
++// apply d1/d2 to one row in place; p = query position
++void lab_def_row(int32_t * row, int64_t W, int il, int64_t p) {
++    if (g_lab.def == 1 && il == g_lab.l1) {
++        for (int64_t j = W - 1; j >= W - 3; --j) {
++            if (row[j] >= 0) { g_lab.n_d1++; g_lab.n_d1_self += row[j] == p; row[j] = -1; break; }
++        }
++    } else if (g_lab.def == 2 && il == g_lab.l2) {
++        const int64_t nb = (W - 3) / 4;
++        int64_t nv = 0;
++        for (int64_t b = 0; b < nb; ++b) { nv += row[4*b] >= 0; }
++        if (nv == 0) { return; }
++        int64_t want = nv / 2, k = 0;
++        for (int64_t b = 0; b < nb; ++b) {
++            if (row[4*b] < 0) { continue; }
++            if (k++ == want) { for (int c = 0; c < 4; ++c) { row[4*b + c] = -1; } g_lab.n_d2++; break; }
++        }
++    }
++}
++
+ void qpin_rows(ggml_tensor * t, int kind, int il) {
+     auto & S = g_qpin;
+     GGML_ASSERT(t->type == GGML_TYPE_I32 && t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t));
+@@ -128,6 +165,8 @@ void qpin_rows(ggml_tensor * t, int kind, int il) {
+             qpin_add(S.qsa[{-1, -1}], ov, jc, ex);
+             qpin_add(S.qsa_chunk[{S.chunk, src}], ov, jc, ex);
+         }
++        if (kind == 1 && (il == g_lab.l1 || il == g_lab.l2)) { g_lab.n_rows_l++; }
++        if (kind == 1 && g_lab.pre) { lab_def_row(cur, W, il, p); modified = true; }
+         if (S.pin_qsa) {
+             for (int64_t j = 0; j < W; ++j) {
+                 cur[j] = (kind == 2 && ref[j] < 0) ? first_valid : ref[j];
+@@ -135,6 +174,7 @@ void qpin_rows(ggml_tensor * t, int kind, int il) {
+             modified = true;
+             S.n_rows_pin++;
+         }
++        if (kind == 1 && !g_lab.pre && g_lab.def) { lab_def_row(cur, W, il, p); modified = true; }
+     }
+     if (modified) {
+         ggml_backend_tensor_set(t, S.buf.data(), 0, W*nq*sizeof(int32_t));
+@@ -195,7 +235,19 @@ bool qpin_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
+     if      (strncmp(name, "qsa_rows_cb-",  12) == 0) { kind = 1; }
+     else if (strncmp(name, "qsa_rows_tk-",  12) == 0) { kind = 2; }
+     else if (strncmp(name, "ffn_moe_topk-", 13) == 0) { kind = 3; }
++    else if (g_lab.def == 3 && strncmp(name, "attn_output-", 12) == 0 && atoi(name + 12) == g_lab.l3) { kind = 4; } // observed only under LAB_DEF=d3: observing splits the graph
+     if (ask) { return kind != 0; }
++    if (kind == 4) {
++        if (g_lab.def == 3 && g_qpin.mode == 2 && g_qpin.chunk >= 0 && !g_qpin.pos.empty()) {
++            GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t));
++            std::vector<float> v(ggml_nelements(t));
++            ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
++            for (float & x : v) { x = (float) (x * (1.0 + g_lab.eps)); }
++            ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
++            g_lab.n_d3++;
++        }
++        return true;
++    }
+     if (kind == 0 || g_qpin.chunk < 0 || g_qpin.pos.empty()) { return true; }
+     const int il = atoi(strrchr(name, '-') + 1);
+     if (kind == 3) { qpin_moe(t, il); } else { qpin_rows(t, kind, il); }
+@@ -214,6 +266,7 @@ void qpin_init() {
+     g_qpin.pin_moe = pin && strstr(pin, "moe");
+     if (const char * s = getenv("QPIN_STATS")) { g_qpin.stats_path = s; }
+     LLAMA_LOG_WARN("QPIN: mode=%s dir=%s pin_qsa=%d pin_moe=%d\n", m, d, g_qpin.pin_qsa, g_qpin.pin_moe);
++    lab_init();
+ }
+ 
+ void qpin_begin_ubatch(const llama_ubatch & ub) {
+@@ -249,6 +302,9 @@ void qpin_report() {
+         out("QPIN_MOE layer=%d n=%lld overlap=%.6f exact=%.6f\n", k, (long long) a.n,
+             a.overlap / std::max<int64_t>(a.n, 1), (double) a.exact / std::max<int64_t>(a.n, 1));
+     }
++    out("R1Q8_SUMMARY def=%d pre=%d rows_at_l=%lld d1_dropped=%lld d1_dropped_self=%lld d2_dropped_blocks=%lld d3_scaled_tensors=%lld\n",
++        g_lab.def, (int) g_lab.pre, (long long) g_lab.n_rows_l, (long long) g_lab.n_d1, (long long) g_lab.n_d1_self,
++        (long long) g_lab.n_d2, (long long) g_lab.n_d3);
+     if (f) { fclose(f); }
+     for (auto & [n, fd] : S.fds) { if (fd >= 0) { close(fd); } }
+     S.fds.clear();
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index 5dd2826c8..96c753755 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -1880,8 +1880,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+ 
+             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+ 
++            const double r1q8_s0 = kld.sum_kld; const size_t r1q8_c0 = kld.count, r1q8_t0 = kld.n_same_top;
+             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
+                     workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
++            LOG("QKLD_CHUNK %d n=%zu kld=%.9e same_top=%.9e\n", i + seq + 1, kld.count - r1q8_c0,
++                (kld.sum_kld - r1q8_s0) / (double) (kld.count - r1q8_c0), (double) (kld.n_same_top - r1q8_t0) / (double) (kld.count - r1q8_c0));
+             p_diff_ptr += n_ctx - 1 - first;
+             {
+                 // per-chunk mean KLD in full precision, straight from this chunk's kld_values (the table below is

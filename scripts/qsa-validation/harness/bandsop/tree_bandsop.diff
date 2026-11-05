@@ -1,0 +1,57 @@
+diff --git a/ggml/src/ggml-cuda/qsa-decode.cu b/ggml/src/ggml-cuda/qsa-decode.cu
+index eee9a7471..62265c441 100644
+--- a/ggml/src/ggml-cuda/qsa-decode.cu
++++ b/ggml/src/ggml-cuda/qsa-decode.cu
+@@ -1,3 +1,4 @@
++#include <vector>
+ #include "qsa-decode.cuh"
+ #if defined(GGML_USE_HIP)
+ #include "qsa-decode-wmma.cuh"
+@@ -140,6 +141,7 @@ void ggml_cuda_flash_attn_ext_qsa_decode(ggml_backend_cuda_context & ctx, ggml_t
+         chunk = ((ns + target - 1)/target + 15)/16*16;
+     }
+     const int splits = (ns + chunk - 1)/chunk;
++    if (getenv("BANDS_ROUTE")) fprintf(stderr, "QSA_ROUTE decode G1 wmma %d nq %d ns %d nk %d splits %d chunk %d kt %s vt %s\n", (int) wmma, nq, ns, (int) k->ne[1], splits, chunk, ggml_type_name(k->type), ggml_type_name(v->type));
+     float scale;
+     memcpy(&scale, dst->op_params, sizeof(scale));
+     ggml_cuda_pool_alloc<float> partial(ctx.pool(), size_t(nq)*nh*splits*258);
+@@ -157,6 +159,7 @@ void ggml_cuda_flash_attn_ext_qsa_decode(ggml_backend_cuda_context & ctx, ggml_t
+         q->nb[1], q->nb[2], k->nb[1], k->nb[2], v->nb[1], v->nb[2], m ? m->nb[1] : 0, size_t(ns)*sizeof(int),
+         k->ne[1], ns, nh, nh/k->ne[2], splits, chunk, scale, partial.get());
+     }
++    if (const char * pd = getenv("BANDS_PARTIAL")) { static int seq = 0; std::vector<float> hp(size_t(nq)*nh*splits*258); CUDA_CHECK(cudaMemcpyAsync(hp.data(), partial.get(), hp.size()*4, cudaMemcpyDeviceToHost, ctx.stream())); CUDA_CHECK(cudaStreamSynchronize(ctx.stream())); char fn[512]; snprintf(fn, sizeof fn, "%s/part_%03d.f32", pd, seq++); FILE * f = fopen(fn, "wb"); fwrite(hp.data(), 4, hp.size(), f); fclose(f); fprintf(stderr, "BANDS_PARTIAL %s nq %d splits %d\n", fn, nq, splits); }
+     qsa_decode_merge<<<nq*nh, 256, 0, ctx.stream()>>>(partial.get(), (float *) dst->data, splits);
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/ggml/src/ggml-cuda/qsa-prefill.cu b/ggml/src/ggml-cuda/qsa-prefill.cu
+index 9cac57b3e..e608de2eb 100644
+--- a/ggml/src/ggml-cuda/qsa-prefill.cu
++++ b/ggml/src/ggml-cuda/qsa-prefill.cu
+@@ -684,6 +684,7 @@ static void qsa_prefill_impl1(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     const bool kv_direct_ok = kv_q8 || (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+     const bool qsa_direct = kv_direct_ok && (qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 64 < (size_t) nk));
+     const bool qsa_kdirect = kv_direct_ok && (qsa_direct || qsa_direct_cfg == 2 || qsa_direct_cfg < 0);
++    if (getenv("BANDS_ROUTE")) fprintf(stderr, "QSA_ROUTE prefill G4 direct %d kdirect %d nq %d ns %d nk %d kt %s vt %s\n", (int) qsa_direct, (int) qsa_kdirect, n_q, ns, nk, ggml_type_name(k->type), ggml_type_name(v->type));
+     ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), qsa_kdirect ? 0 : ggml_nelements(k));
+     ggml_cuda_pool_alloc<uint16_t> packed_v(ctx.pool(), qsa_direct ? 0 : ggml_nelements(v));
+     if (!qsa_kdirect) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index d3835de3e..31d585c11 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1635,6 +1635,7 @@ struct test_case {
+             }
+ 
+             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
++            fprintf(stderr, "BANDS_NMSE_VS_CPU %s %s nmse_gpu_vs_cpu=%.9e n=%zu\n", ggml_op_desc(t1), ud->tc->vars().c_str(), nmse(f2.data(), f1.data(), f1.size()), f1.size());
+             if (err > ud->tc->max_err(ud->backend1)) {
+                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
+                 //for (int i = 0; i < (int) f1.size(); i++) {
+@@ -11601,6 +11602,7 @@ struct test_qsa_prefill_maskless : public test_qsa_prefill {
+         const double gpu_error=nmse(reference.data(),actual,n);
+         const double cpu_error=nmse(reference.data(),cpu,n);
+         fprintf(stderr,"QSA_MASKLESS_FP64 q=%d keys=%d selected=%d gpu=%.9g cpu=%.9g\n",queries,keys,selected,gpu_error,cpu_error);
++        if (const char * dd = getenv("BANDS_DUMP")) if (ratio == 12 && streams == 1) { static int seq = 0; char fn[512]; snprintf(fn, sizeof fn, "%s/%s_%03d.bdmp", dd, op_desc(nullptr).c_str(), seq++); FILE * f = fopen(fn, "wb"); GGML_ASSERT(f); const int32_t h[8] = {queries, keys, selected, ratio, (int32_t) interleaved, blocks, (int32_t) type_k, (int32_t) type_v}; fwrite(h, 4, 8, f); auto rows = [&](ggml_tensor * t, int64_t n1, int64_t n2) { ggml_tensor * b = t->view_src ? t->view_src : t; std::vector<uint8_t> B(ggml_nbytes(b)); ggml_backend_tensor_get(b, B.data(), 0, B.size()); const size_t rb = ggml_row_size(t->type, t->ne[0]); for (int64_t i1 = 0; i1 < n1; ++i1) for (int64_t i2 = 0; i2 < n2; ++i2) fwrite(B.data() + t->view_offs + i1 * t->nb[1] + i2 * t->nb[2], 1, rb, f); }; rows(q, queries, 2*ratio); rows(k, keys, 2); rows(v, keys, 2); fwrite(picks.data(), 4, picks.size(), f); fwrite(actual, 4, n, f); fwrite(cpu, 4, n, f); fclose(f); fprintf(stderr, "BANDS_DUMP %s %s\n", fn, vars().c_str()); }
+         return std::max(gpu_error,cpu_error);
+     }
+ };

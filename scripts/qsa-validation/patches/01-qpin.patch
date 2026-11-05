@@ -1,0 +1,303 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7fc62456a..f6960cbdf 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -24,6 +24,228 @@
+ #include <string>
+ #include <unordered_map>
+ 
++// ---- QPIN (measurement only): record / replay of the QSA selection rows and the MoE expert ids ----
++// QPIN=record|replay  QPIN_DIR=<dir>  QPIN_PIN=qsa,moe (replay: what to inject; empty = observe only)
++// QPIN_STATS=<file> (replay: computed-vs-reference agreement). Keyed by (chunk, layer, position); a chunk starts at
++// every ubatch whose first position is 0 (llama-perplexity clears the cache per chunk, so cell == position).
++#include <fcntl.h>
++#include <unistd.h>
++#include <map>
++#include <vector>
++namespace {
++struct qpin_acc { double overlap = 0, jacc = 0; int64_t n = 0, exact = 0; };
++struct qpin_state {
++    int mode = 0; // 1 record, 2 replay
++    bool pin_qsa = false, pin_moe = false;
++    std::string dir, stats_path;
++    int chunk = -1;
++    std::vector<int32_t> pos;
++    std::map<std::pair<int,int>, qpin_acc> qsa; // (layer, depth bucket of 4096; -1 = all)
++    std::map<int, qpin_acc> moe;
++    std::map<std::string, int> fds;
++    std::vector<int32_t> buf, rec, stamp;
++    std::vector<uint8_t> bytes;
++    int32_t tag = 0;
++    int64_t n_rows_rec = 0, n_rows_pin = 0, n_rows_absent = 0, n_moe_rec = 0, n_moe_pin = 0, n_moe_absent = 0, n_cb = 0, n_tk = 0;
++};
++qpin_state g_qpin;
++
++int qpin_fd(const std::string & name, bool write) {
++    auto it = g_qpin.fds.find(name);
++    if (it != g_qpin.fds.end()) { return it->second; }
++    const std::string path = g_qpin.dir + "/" + name;
++    const int fd = write ? open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644) : open(path.c_str(), O_RDONLY);
++    if (fd < 0 && write) { GGML_ABORT("qpin: cannot open %s", path.c_str()); }
++    g_qpin.fds[name] = fd;
++    return fd;
++}
++
++bool qpin_read(const std::string & name, int64_t rec_words, int64_t p, int32_t * out) {
++    const int fd = qpin_fd(name, false);
++    if (fd < 0) { return false; }
++    const ssize_t n = pread(fd, out, rec_words*4, (off_t) p*rec_words*4);
++    return n == rec_words*4 && out[0] != 0;
++}
++
++void qpin_add(qpin_acc & a, double ov, double jc, bool ex) { a.overlap += ov; a.jacc += jc; a.n++; a.exact += ex; }
++
++void qpin_rows(ggml_tensor * t, int kind, int il) {
++    auto & S = g_qpin;
++    GGML_ASSERT(t->type == GGML_TYPE_I32 && t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t));
++    const int64_t W = t->ne[0], nq = t->ne[1], ntok = (int64_t) S.pos.size();
++    GGML_ASSERT(nq <= ntok);
++    const int64_t q0 = ntok - nq;
++    S.buf.resize(W*nq);
++    ggml_backend_tensor_get(t, S.buf.data(), 0, W*nq*sizeof(int32_t));
++    kind == 1 ? S.n_cb++ : S.n_tk++;
++    char fname[64];
++    snprintf(fname, sizeof(fname), "rows_c%d_l%d.bin", S.chunk, il);
++    S.rec.resize(W + 1);
++    if (S.mode == 1) {
++        GGML_ASSERT(kind == 1 && "qpin: the reference must take the complete-block (maskless) route");
++        const int fd = qpin_fd(fname, true);
++        for (int64_t i = 0; i < nq; ++i) {
++            S.rec[0] = (int32_t) W;
++            memcpy(S.rec.data() + 1, S.buf.data() + i*W, W*sizeof(int32_t));
++            const int64_t p = S.pos[q0 + i];
++            GGML_ASSERT(pwrite(fd, S.rec.data(), (W+1)*4, (off_t) p*(W+1)*4) == (W+1)*4);
++            S.n_rows_rec++;
++        }
++        return;
++    }
++    bool modified = false;
++    for (int64_t i = 0; i < nq; ++i) {
++        const int64_t p = S.pos[q0 + i];
++        if (!qpin_read(fname, W + 1, p, S.rec.data())) { S.n_rows_absent++; continue; }
++        GGML_ASSERT(S.rec[0] == W);
++        const int32_t * ref = S.rec.data() + 1;
++        int32_t * cur = S.buf.data() + i*W;
++        if (++S.tag == INT32_MAX) { S.tag = 1; std::fill(S.stamp.begin(), S.stamp.end(), 0); }
++        int64_t R = 0, C = 0, I = 0;
++        int32_t first_valid = -1;
++        for (int64_t j = 0; j < W; ++j) {
++            const int32_t v = ref[j];
++            if (v < 0) { continue; }
++            if ((size_t) v >= S.stamp.size()) { S.stamp.resize(v + 65536, 0); }
++            if (S.stamp[v] != S.tag) { S.stamp[v] = S.tag; R++; }
++            if (first_valid < 0) { first_valid = v; }
++        }
++        for (int64_t j = 0; j < W; ++j) {
++            const int32_t v = cur[j];
++            if (v < 0 || (kind == 2 && v > p)) { continue; }
++            C++;
++            if ((size_t) v < S.stamp.size() && S.stamp[v] == S.tag) { I++; S.stamp[v] = 0; }
++        }
++        if (p >= 2052 && R > 0) {
++            const double ov = (double) I / R, jc = (double) I / (R + C - I);
++            const bool ex = I == R && C == R;
++            qpin_add(S.qsa[{il, -1}], ov, jc, ex);
++            qpin_add(S.qsa[{il, (int) (p/4096)}], ov, jc, ex);
++            qpin_add(S.qsa[{-1, (int) (p/4096)}], ov, jc, ex);
++            qpin_add(S.qsa[{-1, -1}], ov, jc, ex);
++        }
++        if (S.pin_qsa) {
++            for (int64_t j = 0; j < W; ++j) {
++                cur[j] = (kind == 2 && ref[j] < 0) ? first_valid : ref[j];
++            }
++            modified = true;
++            S.n_rows_pin++;
++        }
++    }
++    if (modified) {
++        ggml_backend_tensor_set(t, S.buf.data(), 0, W*nq*sizeof(int32_t));
++    }
++}
++
++void qpin_moe(ggml_tensor * t, int il) {
++    auto & S = g_qpin;
++    GGML_ASSERT(t->type == GGML_TYPE_I32 && t->ne[2] == 1 && t->ne[3] == 1 && t->nb[0] == sizeof(int32_t));
++    const int64_t K = t->ne[0], nr = t->ne[1], ntok = (int64_t) S.pos.size();
++    GGML_ASSERT(nr <= ntok);
++    const int64_t q0 = ntok - nr;
++    const size_t span = ggml_nbytes(t), nb1 = t->nb[1];
++    S.bytes.resize(span);
++    ggml_backend_tensor_get(t, S.bytes.data(), 0, span);
++    char fname[64];
++    snprintf(fname, sizeof(fname), "moe_c%d_l%d.bin", S.chunk, il);
++    S.rec.resize(K + 1);
++    if (S.mode == 1) {
++        const int fd = qpin_fd(fname, true);
++        for (int64_t i = 0; i < nr; ++i) {
++            S.rec[0] = (int32_t) K;
++            memcpy(S.rec.data() + 1, S.bytes.data() + i*nb1, K*sizeof(int32_t));
++            const int64_t p = S.pos[q0 + i];
++            GGML_ASSERT(pwrite(fd, S.rec.data(), (K+1)*4, (off_t) p*(K+1)*4) == (K+1)*4);
++            S.n_moe_rec++;
++        }
++        return;
++    }
++    bool modified = false;
++    for (int64_t i = 0; i < nr; ++i) {
++        const int64_t p = S.pos[q0 + i];
++        if (!qpin_read(fname, K + 1, p, S.rec.data())) { S.n_moe_absent++; continue; }
++        GGML_ASSERT(S.rec[0] == K);
++        int32_t * cur = (int32_t *) (S.bytes.data() + i*nb1);
++        const int32_t * ref = S.rec.data() + 1;
++        int64_t I = 0;
++        bool same_order = true;
++        for (int64_t a = 0; a < K; ++a) {
++            same_order &= cur[a] == ref[a];
++            for (int64_t b = 0; b < K; ++b) { if (cur[a] == ref[b]) { I++; break; } }
++        }
++        qpin_add(S.moe[il], (double) I / K, (double) I / (2*K - I), I == K);
++        qpin_add(S.moe[-1], (double) I / K, (double) I / (2*K - I), I == K);
++        if (S.pin_moe) {
++            if (!same_order) { memcpy(cur, ref, K*sizeof(int32_t)); modified = true; }
++            S.n_moe_pin++;
++        }
++    }
++    if (modified) {
++        ggml_backend_tensor_set(t, S.bytes.data(), 0, span);
++    }
++}
++
++bool qpin_cb(ggml_tensor * t, bool ask, void * /*ud*/) {
++    const char * name = t->name;
++    int kind = 0;
++    if      (strncmp(name, "qsa_rows_cb-",  12) == 0) { kind = 1; }
++    else if (strncmp(name, "qsa_rows_tk-",  12) == 0) { kind = 2; }
++    else if (strncmp(name, "ffn_moe_topk-", 13) == 0) { kind = 3; }
++    if (ask) { return kind != 0; }
++    if (kind == 0 || g_qpin.chunk < 0 || g_qpin.pos.empty()) { return true; }
++    const int il = atoi(strrchr(name, '-') + 1);
++    if (kind == 3) { qpin_moe(t, il); } else { qpin_rows(t, kind, il); }
++    return true;
++}
++
++void qpin_init() {
++    const char * m = getenv("QPIN");
++    if (!m || g_qpin.mode) { return; }
++    g_qpin.mode = strcmp(m, "record") == 0 ? 1 : 2;
++    const char * d = getenv("QPIN_DIR");
++    GGML_ASSERT(d && "QPIN_DIR");
++    g_qpin.dir = d;
++    const char * pin = getenv("QPIN_PIN");
++    g_qpin.pin_qsa = pin && strstr(pin, "qsa");
++    g_qpin.pin_moe = pin && strstr(pin, "moe");
++    if (const char * s = getenv("QPIN_STATS")) { g_qpin.stats_path = s; }
++    LLAMA_LOG_WARN("QPIN: mode=%s dir=%s pin_qsa=%d pin_moe=%d\n", m, d, g_qpin.pin_qsa, g_qpin.pin_moe);
++}
++
++void qpin_begin_ubatch(const llama_ubatch & ub) {
++    if (!g_qpin.mode) { return; }
++    g_qpin.pos.clear();
++    if (ub.n_tokens < 16 || ub.pos == nullptr) { return; }
++    if (ub.pos[0] == 0) { g_qpin.chunk++; }
++    g_qpin.pos.assign(ub.pos, ub.pos + ub.n_tokens);
++}
++
++void qpin_report() {
++    auto & S = g_qpin;
++    if (!S.mode) { return; }
++    FILE * f = S.stats_path.empty() ? nullptr : fopen(S.stats_path.c_str(), "w");
++    auto out = [&](const char * fmt, auto... args) {
++        fprintf(stderr, fmt, args...);
++        if (f) { fprintf(f, fmt, args...); }
++    };
++    out("QPIN_SUMMARY mode=%d chunks=%d rows_rec=%lld rows_pin=%lld rows_absent=%lld moe_rec=%lld moe_pin=%lld moe_absent=%lld cb_tensors=%lld tk_tensors=%lld\n",
++        S.mode, S.chunk + 1, (long long) S.n_rows_rec, (long long) S.n_rows_pin, (long long) S.n_rows_absent,
++        (long long) S.n_moe_rec, (long long) S.n_moe_pin, (long long) S.n_moe_absent, (long long) S.n_cb, (long long) S.n_tk);
++    for (const auto & [k, a] : S.qsa) {
++        out("QPIN_QSA layer=%d bucket=%d n=%lld overlap=%.6f jaccard=%.6f exact=%.6f\n", k.first, k.second,
++            (long long) a.n, a.overlap / std::max<int64_t>(a.n, 1), a.jacc / std::max<int64_t>(a.n, 1), (double) a.exact / std::max<int64_t>(a.n, 1));
++    }
++    for (const auto & [k, a] : S.moe) {
++        out("QPIN_MOE layer=%d n=%lld overlap=%.6f exact=%.6f\n", k, (long long) a.n,
++            a.overlap / std::max<int64_t>(a.n, 1), (double) a.exact / std::max<int64_t>(a.n, 1));
++    }
++    if (f) { fclose(f); }
++    for (auto & [n, fd] : S.fds) { if (fd >= 0) { close(fd); } }
++    S.fds.clear();
++    S.mode = 0;
++}
++} // namespace
++
+ //
+ // llama_context
+ //
+@@ -258,6 +480,12 @@ llama_context::llama_context(
+ 
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
++    qpin_init();
++    if (g_qpin.mode) {
++        GGML_ASSERT(cparams.cb_eval == nullptr);
++        cparams.cb_eval = qpin_cb;
++        cparams.cb_eval_user_data = nullptr;
++    }
+ 
+     cparams.ctx_other = nullptr;
+ 
+@@ -679,6 +907,7 @@ llama_context::llama_context(
+ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
++    qpin_report();
+ 
+     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
+     if (!model.hparams.no_alloc && !opt_ctx) {
+@@ -1880,6 +2109,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+     }
+ 
++    qpin_begin_ubatch(ubatch);
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index df7c327d3..658ab6520 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -1,4 +1,15 @@
+ #include "llama-memory-hybrid-idx.h"
++#include <cstdlib>
++#include <cstring>
++// QPIN_IDX_TYPE=f16|q8_0|q4_0 (measurement only): indexer key cache type instead of -ctk
++static ggml_type qpin_idx_type(ggml_type t) {
++    const char * e = getenv("QPIN_IDX_TYPE");
++    if (!e) { return t; }
++    if (!strcmp(e, "f16")) { return GGML_TYPE_F16; }
++    if (!strcmp(e, "q8_0")) { return GGML_TYPE_Q8_0; }
++    if (!strcmp(e, "q4_0")) { return GGML_TYPE_Q4_0; }
++    GGML_ABORT("QPIN_IDX_TYPE");
++}
+ #include "prefix.h"
+ 
+ #include <algorithm>
+@@ -112,7 +123,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+ 
+         return new llama_kv_cache(
+-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
++            model, hparams_idx, qpin_idx_type(type_k), qpin_idx_type(type_v), v_trans, offload, unified,
+             kv_size, n_seq_max, n_pad, n_swa, swa_type,
+             nullptr, filter_idx, nullptr, nullptr, "idx_");
+     }()) {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d13804ce9..d276b4672 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1679,6 +1679,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         qwen4exp_append_strip(ctx0, gf, selected, top_k);
+     }
+     ggml_tensor * top_k = qwen4exp_finish_strips(ctx0, gf, selected);
++    cb(top_k, inp->tail_idxs ? "qsa_rows_cb" : "qsa_rows_tk", il);   // QPIN hook name
+ 
+     return top_k;
+ }

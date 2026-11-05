@@ -1,0 +1,83 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7fc62456a..b4c14d6fa 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -881,6 +881,8 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
+     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+ }
+ 
++bool llama_lab_force_nc = false; // LAB R2-RES
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -1001,6 +1003,42 @@ void llama_context::sched_reserve() {
+         }
+     }
+ 
++    // LAB R2-RES: the forced non-compact S = 2 reserve variant (LAB_FORCE_NC=1: n_tps = min(ub, 1024) per stream,
++    // n_kv = full (init_full), n_seqs = n_seq_max; LAB_FORCE_NC=2: the same with n_tokens = min(ub, 1024) in total; =3: that total on one sequence)
++    if (const char * e = getenv("LAB_FORCE_NC"); e && atoi(e) > 0 && model.arch == LLM_ARCH_QWEN4EXP && !cparams.training) {
++        const int      mode     = atoi(e);
++        const uint32_t n_str_v  = cparams.kv_unified ? 1 : cparams.n_seq_max;
++        const uint32_t s_x512   = getenv("LAB_NC_TPS") ? (uint32_t) atoi(getenv("LAB_NC_TPS")) : 1024; // S x 512, S = 2 by default
++        const uint32_t n_tps_v  = std::min<uint32_t>(cparams.n_ubatch, s_x512);
++        const uint32_t n_tok_v  = mode >= 2 ? n_tps_v : n_tps_v*n_str_v;
++        const uint32_t n_seqs_v = mode == 3 ? 1 : n_seqs; // mode 3: the same total tokens on one sequence (one stream)
++        const uint32_t n_out_v  = std::max<uint32_t>(n_seqs, std::min<uint32_t>(n_tok_v, n_outputs_pp));
++        std::vector<size_t> before(backend_ptrs.size(), 0), vsz(backend_ptrs.size(), 0);
++        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++            before[i] = model.hparams.no_alloc ? backend_buf_exp_size[i] : ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
++        }
++        LLAMA_LOG_INFO("LAB_NC variant: ctx_type=%d mode=%d n_tokens=%u n_seqs=%u n_outputs=%u n_stream=%u kv_unified=%d n_ctx=%u n_ubatch=%u no_alloc=%d\n",
++            (int) cparams.ctx_type, mode, n_tok_v, n_seqs_v, n_out_v, n_str_v, (int) cparams.kv_unified, cparams.n_ctx, cparams.n_ubatch, (int) model.hparams.no_alloc);
++        llama_lab_force_nc = true;
++        ggml_cgraph * gf = nullptr;
++        if (model.hparams.no_alloc) {
++            // probe path: measure the variant on its own without touching backend_buf_exp_size (the PR records only pass pp #1)
++            gf = graph_reserve(n_tok_v, n_seqs_v, n_out_v, mctx.get(), true, vsz.data());
++        } else {
++            gf = graph_reserve(n_tok_v, n_seqs_v, n_out_v, mctx.get(), false);
++        }
++        llama_lab_force_nc = false;
++        if (!gf) {
++            throw std::runtime_error("LAB_NC: failed to allocate the forced non-compact variant");
++        }
++        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++            const size_t after = model.hparams.no_alloc ? vsz[i] : ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
++            LLAMA_LOG_INFO("LAB_NC variant: ctx_type=%d %s before=%zu %s=%zu (%.2f MiB vs %.2f MiB)\n", (int) cparams.ctx_type,
++                ggml_backend_buft_name(backend_buft[i]), before[i], model.hparams.no_alloc ? "variant_alone" : "after", after,
++                before[i]/1048576.0, after/1048576.0);
++        }
++    }
++
+     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+         ggml_backend_t             backend = backend_ptrs[i];
+         ggml_backend_buffer_type_t buft    = backend_buft[i];
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d13804ce9..a8650619e 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -17,6 +17,7 @@
+ #include <cstdlib>
+ 
+ #if defined(__linux__) || defined(__APPLE__)
++extern bool llama_lab_force_nc; // LAB R2-RES
+ #include <sys/mman.h>
+ #include <unistd.h>
+ #endif
+@@ -1450,8 +1451,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+                 mctx_hyb->qsa_selected_key_attn(),
+                 &static_cast<const llama_model_qwen4exp &>(model).qsa_depth_warn_once);
+         // split streams: only the prefill kernel takes several streams (>= 128 queries each); decode keeps the mask
+-        const bool scalar = blocks && hparams.n_swa == 0 && (n_stream == 1 || n_tps >= 128) &&
++        const bool scalar = !llama_lab_force_nc && blocks && hparams.n_swa == 0 && (n_stream == 1 || n_tps >= 128) &&
+                 mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
++        if (getenv("LAB_NC_LOG")) {
++            LLAMA_LOG_INFO("LAB_NC qsa_input il=%d r=%d n_kv=%lld n_blocks=%lld n_tps=%lld n_stream=%lld n_tokens=%lld blocks=%d blk_bias=%d forced=%d scalar=%d\n",
++                il, (int) r, (long long) n_kv, (long long) n_blocks, (long long) n_tps, (long long) n_stream, (long long) n_tokens,
++                (int) blocks, (int) blk_bias, (int) llama_lab_force_nc, (int) scalar);
++        }
+         qsa->compact  = scalar;   // I32 limits: one stream, or split streams of one sequence each
+         qsa->maskless = scalar;
+         qsa->score_strip = qwen4exp_score_strip(n_tps, n_stream, n_blocks, hparams.indexer_n_head);

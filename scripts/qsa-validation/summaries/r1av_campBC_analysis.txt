@@ -1,0 +1,54 @@
+C_q8_0_np1av3 - C_q8_0_av3 (n=32)
+  lo : A=1.1464e-02 B=1.1464e-02 diff=+0.0000e+00 SEp=0.000e+00 diff/SEp=+nan [PASS at 3SEp] max|d|=0.000e+00 per-chunk d: +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00
+C_q8_0_av3 - C_q8_0_base (n=0)
+/home/gaetan/dev/wt_lab/r1av/tree/ggml/src/ggml.c:5758: GGML_ASSERT(top_k->ne[1] == a->src[0]->ne[1]) failed
+kl_divergence: computing over 32 chunks, n_ctx=1024, batch_size=2048, n_seq=2
+kl_divergence: 1.94 seconds per pass - ETA 0.50 minutes
+kl_divergence: computing over 32 chunks, n_ctx=1024, batch_size=1024, n_seq=1
+kl_divergence: 1.19 seconds per pass - ETA 0.63 minutes
+C1TRACE qsa_decode nq 2 nkv 256 ids 256 mask 0 K q8_0 V q8_0;C1TRACE qsa_prefill nq 1024 nkv 1024 ids 1024 mask 0 K q8_0 V q8_0;
+C_q4_0_np1av3 - C_q4_0_av3 (n=32)
+  lo : A=2.3148e-02 B=2.3148e-02 diff=+0.0000e+00 SEp=0.000e+00 diff/SEp=+nan [PASS at 3SEp] max|d|=0.000e+00 per-chunk d: +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00
+C_q4_0_av3 - C_q4_0_base (n=0)
+/home/gaetan/dev/wt_lab/r1av/tree/ggml/src/ggml.c:5758: GGML_ASSERT(top_k->ne[1] == a->src[0]->ne[1]) failed
+kl_divergence: computing over 32 chunks, n_ctx=1024, batch_size=2048, n_seq=2
+kl_divergence: 5.62 seconds per pass - ETA 1.48 minutes
+kl_divergence: computing over 32 chunks, n_ctx=1024, batch_size=1024, n_seq=1
+kl_divergence: 2.16 seconds per pass - ETA 1.15 minutes
+
+R B_q8_0_base rc=0 261s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=0] | 2.25.841.529 I Final estimate: PPL = 3.1604 +/- 0.02515 |  |  |  
+R B_q8_0_av0r rc=0 403s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:  -0.000000 ±   0.000000 
+R B_q8_0_av2 rc=0 438s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.008274 ±   0.000117 
+R B_q8_0_ub1024 rc=0 409s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.005144 ±   0.000100 
+R B_q4_0_base rc=0 443s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=0] | 2.51.161.945 I Final estimate: PPL = 3.1705 +/- 0.02526 |  |  |  
+R B_q4_0_av0r rc=0 460s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000000 ±   0.000000 
+R B_q4_0_av2 rc=0 517s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.018111 ±   0.000227 
+R B_q4_0_ub1024 rc=0 446s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000001 ±   0.000000 
+R B_bf16_base rc=0 495s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=0] | 2.23.456.939 I Final estimate: PPL = 3.1622 +/- 0.02519 |  |  |  
+R B_bf16_av0r rc=0 431s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000000 ±   0.000000 
+R B_bf16_av2 rc=0 478s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=2] |  | Mean    KLD:   0.008309 ±   0.000148 
+R B_bf16_ub1024 rc=0 405s env=[QKL_TAIL=8191 LLAMA_QSA_ALLVIS=0] |  | Mean    KLD:   0.000001 ±   0.000000 
+B_q8_0_av2 - B_q8_0_av0r (n=8)
+  lo : A=-5.6619e-08 B=1.0766e-02 diff=+1.0766e-02 SEp=1.612e-03 diff/SEp=+6.68 [FAIL at 3SEp] max|d|=1.994e-02 per-chunk d: +1.99e-02 +7.58e-03 +1.52e-02 +1.00e-02 +8.21e-03 +9.96e-03 +8.90e-03 +6.28e-03
+  hi : A=-1.3725e-07 B=7.4439e-03 diff=+7.4440e-03 SEp=1.173e-03 diff/SEp=+6.35 [FAIL at 3SEp] max|d|=1.343e-02 per-chunk d: +1.34e-02 +8.83e-03 +7.17e-03 +1.02e-02 +4.32e-03 +5.67e-03 +6.81e-03 +3.15e-03
+  all: A=-1.1710e-07 B=8.2743e-03 diff=+8.2744e-03 SEp=1.205e-03 diff/SEp=+6.87 [FAIL at 3SEp] max|d|=1.506e-02 per-chunk d: +1.51e-02 +8.52e-03 +9.18e-03 +1.01e-02 +5.29e-03 +6.74e-03 +7.33e-03 +3.94e-03
+B_q8_0_ub1024 - B_q8_0_av0r (n=8)
+  lo : A=-5.6619e-08 B=3.4683e-06 diff=+3.5249e-06 SEp=8.085e-07 diff/SEp=+4.36 [FAIL at 3SEp] max|d|=8.661e-06 per-chunk d: +8.66e-06 +1.91e-06 +2.55e-06 +2.73e-06 +4.35e-06 +1.26e-06 +3.66e-06 +3.08e-06
+  hi : A=-1.3725e-07 B=6.8574e-03 diff=+6.8576e-03 SEp=1.146e-03 diff/SEp=+5.98 [FAIL at 3SEp] max|d|=1.313e-02 per-chunk d: +1.31e-02 +7.81e-03 +6.34e-03 +9.19e-03 +4.04e-03 +4.93e-03 +6.53e-03 +2.88e-03
+  all: A=-1.1710e-07 B=5.1444e-03 diff=+5.1445e-03 SEp=8.597e-04 diff/SEp=+5.98 [FAIL at 3SEp] max|d|=9.849e-03 per-chunk d: +9.85e-03 +5.86e-03 +4.76e-03 +6.90e-03 +3.03e-03 +3.70e-03 +4.90e-03 +2.16e-03
+B_q4_0_av2 - B_q4_0_av0r (n=8)
+  lo : A=5.2306e-08 B=2.1245e-02 diff=+2.1245e-02 SEp=3.095e-03 diff/SEp=+6.86 [FAIL at 3SEp] max|d|=4.036e-02 per-chunk d: +4.04e-02 +1.54e-02 +2.63e-02 +1.88e-02 +2.03e-02 +2.01e-02 +1.65e-02 +1.23e-02
+  hi : A=9.7810e-08 B=1.7067e-02 diff=+1.7067e-02 SEp=2.222e-03 diff/SEp=+7.68 [FAIL at 3SEp] max|d|=2.716e-02 per-chunk d: +2.72e-02 +2.06e-02 +1.49e-02 +2.35e-02 +1.07e-02 +1.50e-02 +1.61e-02 +8.68e-03
+  all: A=8.6437e-08 B=1.8111e-02 diff=+1.8111e-02 SEp=2.223e-03 diff/SEp=+8.15 [FAIL at 3SEp] max|d|=3.046e-02 per-chunk d: +3.05e-02 +1.93e-02 +1.77e-02 +2.23e-02 +1.31e-02 +1.63e-02 +1.62e-02 +9.58e-03
+B_q4_0_ub1024 - B_q4_0_av0r (n=8)
+  lo : A=5.2306e-08 B=2.9569e-06 diff=+2.9046e-06 SEp=5.003e-07 diff/SEp=+5.81 [FAIL at 3SEp] max|d|=5.948e-06 per-chunk d: +1.51e-06 +2.14e-06 +2.63e-06 +1.56e-06 +3.37e-06 +2.83e-06 +5.95e-06 +3.25e-06
+  hi : A=9.7810e-08 B=9.7810e-08 diff=+0.0000e+00 SEp=0.000e+00 diff/SEp=+nan [PASS at 3SEp] max|d|=0.000e+00 per-chunk d: +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00
+  all: A=8.6437e-08 B=8.1240e-07 diff=+7.2596e-07 SEp=1.250e-07 diff/SEp=+5.81 [FAIL at 3SEp] max|d|=1.487e-06 per-chunk d: +3.76e-07 +5.35e-07 +6.58e-07 +3.91e-07 +8.41e-07 +7.08e-07 +1.49e-06 +8.13e-07
+B_bf16_av2 - B_bf16_av0r (n=8)
+  lo : A=-4.5900e-09 B=1.0737e-02 diff=+1.0737e-02 SEp=1.927e-03 diff/SEp=+5.57 [FAIL at 3SEp] max|d|=2.240e-02 per-chunk d: +2.24e-02 +8.62e-03 +1.48e-02 +1.02e-02 +7.05e-03 +8.35e-03 +9.21e-03 +5.32e-03
+  hi : A=7.6487e-09 B=7.5002e-03 diff=+7.5002e-03 SEp=1.236e-03 diff/SEp=+6.07 [FAIL at 3SEp] max|d|=1.428e-02 per-chunk d: +1.43e-02 +8.43e-03 +6.90e-03 +9.75e-03 +4.11e-03 +6.02e-03 +7.43e-03 +3.07e-03
+  all: A=4.5898e-09 B=8.3093e-03 diff=+8.3093e-03 SEp=1.361e-03 diff/SEp=+6.11 [FAIL at 3SEp] max|d|=1.631e-02 per-chunk d: +1.63e-02 +8.47e-03 +8.87e-03 +9.86e-03 +4.85e-03 +6.60e-03 +7.87e-03 +3.63e-03
+B_bf16_ub1024 - B_bf16_av0r (n=8)
+  lo : A=-4.5900e-09 B=2.1978e-06 diff=+2.2024e-06 SEp=3.116e-07 diff/SEp=+7.07 [FAIL at 3SEp] max|d|=3.276e-06 per-chunk d: +6.61e-07 +2.24e-06 +2.57e-06 +1.86e-06 +3.28e-06 +1.44e-06 +2.34e-06 +3.23e-06
+  hi : A=7.6487e-09 B=7.6487e-09 diff=+0.0000e+00 SEp=0.000e+00 diff/SEp=+nan [PASS at 3SEp] max|d|=0.000e+00 per-chunk d: +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00 +0.00e+00
+  all: A=4.5898e-09 B=5.5506e-07 diff=+5.5047e-07 SEp=7.788e-08 diff/SEp=+7.07 [FAIL at 3SEp] max|d|=8.188e-07 per-chunk d: +1.65e-07 +5.61e-07 +6.43e-07 +4.64e-07 +8.19e-07 +3.60e-07 +5.85e-07 +8.07e-07
