@@ -719,11 +719,19 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
 #endif
 }
 
-// 16x16x16 WMMA on BF16 operands, or on F16 operands for the mmb_routed_f16_type() weights
+// 16x16x16 WMMA on BF16 operands, or on F16 operands for the mmb_routed_f16_type() weights. The F16 one is inline asm
+// on 32-bit operand registers: through the f16 builtin the compiler kept each guarded activation fragment as 16
+// scalar halves and rebuilt it with ~24 v_mov_b16 per WMMA pair (and ~24 more VGPRs).
+typedef uint32_t mmb_v8u __attribute__((ext_vector_type(8)));
 template <bool F16>
 __device__ __forceinline__ v8f mmb_wmma_glu(const v16s b, const v16s a, const v8f c) {
-    if constexpr (F16) return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(tq8_v16h, b), __builtin_bit_cast(tq8_v16h, a), c);
-    else               return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b, a, c);
+    if constexpr (F16) {
+        v8f d = c;
+        asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+v"(d) : "v"(__builtin_bit_cast(mmb_v8u, b)), "v"(__builtin_bit_cast(mmb_v8u, a)));
+        return d;
+    } else {
+        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b, a, c);
+    }
 }
 
 template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, bool Q4K_HALF, typename XRowFn, typename DRowFn>
@@ -748,6 +756,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     // LDS, pack + decode in store_lds. Same fp32 math as dequantize_* -> bit-identical.
     using LBT = mmb_lb<WTYPE>;
     constexpr bool LB = LBT::ok;
+    static_assert(WTYPE != 32 + GGML_TYPE_IQ1_M || F16, "the IQ1_M grid decoder returns F16 weights");
     constexpr int LBR = LB ? (BM * 8) / MMB_NT : 1;
     uint32_t lbg[LBR][LBT::NR], lbu[LBR][LBT::NR];
     __shared__ typename LBT::grid_t lbgrid[LBT::N];
@@ -815,8 +824,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
 #pragma unroll
             for (int r = 0; r < LBR; ++r) {
                 const int row = (tid >> 3) + r * (MMB_NT / 8);
-                *(uint4 *)(Ag + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = LBT::decode(lbgrid, lbg[r], sub, il);
-                *(uint4 *)(Au + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = LBT::decode(lbgrid, lbu[r], sub, il);
+                *(uint4 *)(Ag + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = mmb_lb_decode<WTYPE>(lbgrid, lbg[r], sub, il, weight_ks);
+                *(uint4 *)(Au + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = mmb_lb_decode<WTYPE>(lbgrid, lbu[r], sub, il, weight_ks);
             }
         } else if constexpr (WTYPE != 0 && WTYPE != 32 + GGML_TYPE_Q4_K) {
             constexpr int LOAD_TYPE = WTYPE == 1 ? 32 + GGML_TYPE_Q8_0 : WTYPE;

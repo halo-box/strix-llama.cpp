@@ -166,6 +166,56 @@ template <> struct mmb_lb<32 + GGML_TYPE_IQ3_XXS> {
         return mmb_grid8_bf16(g[(w1 >> 16) & 0xff], g[w1 >> 24], mmb_h2f((uint16_t) w1) * (0.5f + (w0 >> 28)) * 0.5f, mmb_ksigns((w0 >> 7 * il) & 127));
     }
 };
+// IQ1_M (routed GLU with F16 operands only, see mmb_routed_f16_type): decode() returns 8 F16 weights. Every grid value
+// is 0, 1 or 2, so the LDS table holds 2-bit codes (4 KB instead of 8 KB). A group's 8 weights take one of three
+// values, d * (q + delta) for q = 0..2: each is the dequantize_iq1_m fp32 expression with its RNE F16 cast, and
+// v_perm picks one per weight -> bit-identical to the generic F16 decoder.
+template <> struct mmb_lb<32 + GGML_TYPE_IQ1_M> {
+    static constexpr bool ok = true; using grid_t = uint16_t; static constexpr int N = 2048, NR = 4;
+    static __device__ __forceinline__ grid_t entry(const int i) {
+        const uint32_t g = iq1s_grid_gpu[i]; uint32_t c = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) c |= (((g >> (8 * j)) & 3) << (2 * j)) | (((g >> (8 * j + 4)) & 3) << (2 * j + 8));
+        return (grid_t) c;
+    }
+    static __device__ __forceinline__ void fetch(const uint8_t * row, const int ks, const int sub, const int il, uint32_t (&f)[NR]) {
+        const block_iq1_m * x = (const block_iq1_m *) row + (ks * 64) / QK_K;
+        const int ib = ((ks * 64) % QK_K) / 32 + sub;
+        f[0] = x->qs[4 * ib + il]; f[1] = x->qh[2 * ib + il / 2];
+        const uint2 sc = *(const uint2 *) x->scales;   // the 4 scale words (the block is 56 B, scales at +48)
+        f[2] = sc.x; f[3] = sc.y;
+    }
+    // ks: the K step the fields were fetched for (the 16-bit scale word of this 32-block is sc[ks % 4])
+    static __device__ __forceinline__ uint4 decode(const grid_t * g, const uint32_t (&f)[NR], const int sub, const int il, const int ks) {
+        const uint32_t sc0 = f[2] & 0xffff, sc1 = f[2] >> 16, sc2 = f[3] & 0xffff, sc3 = f[3] >> 16;
+        const uint32_t sw = (((ks & 2) ? f[3] : f[2]) >> (16 * (ks & 1))) & 0xffff;
+        const float d = mmb_h2f((uint16_t) ((sc0 >> 12) | ((sc1 >> 8) & 0x00f0) | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000)))
+            * (2 * (int) ((sw >> (3 * (2 * sub + il / 2))) & 0x7) + 1);
+        const uint32_t qh = f[1] >> (4 * (il % 2));
+        const float delta = (qh & 0x08) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
+        auto h = [&](const int q) { return (uint32_t) __half_as_ushort(ggml_cuda_cast<half>(d * ((float) q + delta))); };
+        const uint32_t lo = h(0) | (h(1) << 16), hi = h(2);   // value q at bytes 2q, 2q+1 of {hi, lo}
+        const uint32_t c = g[f[0] | ((qh & 7) << 8)];
+        auto sel = [](const uint32_t c8) {   // 4 two-bit codes -> v_perm selectors for 2 x 2 F16 values
+            const uint32_t t = (c8 | (c8 << 12)) & 0x000f000fu;
+            const uint32_t b = ((t | (t << 6)) & 0x03030303u) << 1;   // byte j = 2 q_j
+            return make_uint2(__builtin_amdgcn_perm(b | 0x01010101u, b, 0x05010400u), __builtin_amdgcn_perm(b | 0x01010101u, b, 0x07030602u));
+        };
+        const uint2 s0 = sel(c & 0xff), s1 = sel(c >> 8);
+        return make_uint4(__builtin_amdgcn_perm(hi, lo, s0.x), __builtin_amdgcn_perm(hi, lo, s0.y),
+                          __builtin_amdgcn_perm(hi, lo, s1.x), __builtin_amdgcn_perm(hi, lo, s1.y));
+    }
+};
+// decode() of a mmb_lb type, with the K step for the types whose fields depend on it (IQ1_M)
+template <int WTYPE>
+__device__ __forceinline__ uint4 mmb_lb_decode(const typename mmb_lb<WTYPE>::grid_t * g, const uint32_t (&f)[mmb_lb<WTYPE>::NR], const int sub, const int il, const int ks) {
+    if constexpr (WTYPE == 32 + GGML_TYPE_IQ1_M) {
+        return mmb_lb<WTYPE>::decode(g, f, sub, il, ks);
+    } else {
+        GGML_UNUSED(ks);
+        return mmb_lb<WTYPE>::decode(g, f, sub, il);
+    }
+}
 
 // F16: store F16 instead of BF16 weights (IQ1_M only)
 template <ggml_type TYPE, bool F16 = false>
