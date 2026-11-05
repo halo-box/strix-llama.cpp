@@ -19690,7 +19690,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     if (getenv("GGML_PERF_MOE")) {
         test_cases.emplace_back(new test_moe_prefill(true, 4096));
         test_cases.emplace_back(new test_moe_prefill(false, 4096));
-        // the streaming q5_1 down chain (f16 B, router weights, CPY f16) at the measured FN routing, ub2048 / ub4096
+        // the streaming q5_1 down chain (f16 B, router weights, CPY f16) at the measured Flash-Next routing, ub2048 / ub4096
         for (int64_t nt : { 2048, 4096, 8192 }) {
             test_cases.emplace_back(new test_moe_prefill(false, nt, GGML_TYPE_Q5_1, true));
         }
@@ -19700,7 +19700,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         // gate/up + SwiGLU at ub8192, measured routing
         test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F16, 2560, 640, 512, 10, 8192, false, true));
-        // FN routed experts at decode / MTP verify / a prompt tail: gate (q4_K) and down (q5_1) mat-vec. A graph repeats its op with
+        // Flash-Next routed experts at decode / MTP verify / a prompt tail: gate (q4_K) and down (q5_1) mat-vec. A graph repeats its op with
         // the same experts, so n 1 / 4 run from the LLC; n 8 (80 experts, ~74 MB of q4_K) is the DRAM-bound per-token proxy
         for (int64_t n : { 1, 4, 8, 16 }) {
             test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, true, 640, n, 2560));
@@ -19712,7 +19712,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, true));
                 test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, tx, 2560, 640, 512, 10, nt, false, false));
             }
-            // q5_K (FN's q5_K gate/up layer) and the f32 chain, measured routing
+            // q5_K (the Flash-Next q5_K gate/up layer) and the f32 chain, measured routing
             test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q5_K, GGML_TYPE_F16, 2560, 640, 512, 10, nt, false, true));
             test_cases.emplace_back(new test_moe_glu_f16(GGML_TYPE_Q4_K, GGML_TYPE_F32, 2560, 640, 512, 10, nt, false, true, true));
         }

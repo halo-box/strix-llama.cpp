@@ -2159,7 +2159,7 @@ static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type
 // 0 = 128 x 256, 64 x 64 waves, BK 64 (55296 B, 1 WG / CU); 1 = the same at BK 32 (30720 B, 2 WG / CU); 2 = 128 x 128, 64 x 32 waves,
 // BK 32 (20480 B, 3 WG / CU); 3 = 256 x 128, 64 x 64 waves, BK 32.
 // 4 = 64 x 128, 4 waves of 32 x 64, BK 64 (27648 B, 2 WG / CU): few-row, long-k GEMMs (the qwen4exp hc down, 320 x 10240).
-// 5 = 256 x 128, 64 x 64 waves, BK 64: the hc up mix GEMM only (GGML_VK_HC_DQ8_TILE=5); its pipelines exist only with that knob.
+// 5 = 256 x 128, 64 x 64 waves, BK 64: the hc up mix GEMM only (GGML_VK_HC_DQ8_TILE=5); its pipelines exist only while GGML_VK_HC_DQ8_TILE selects it (default 5).
 #define GGML_VK_DQ8_NCFG 6
 // tiles the dense / router dq8 GEMMs can run (and the probe modes 2..6 can force): 0..4
 #define GGML_VK_DQ8_NDENSE 5
@@ -9898,7 +9898,7 @@ static bool ggml_vk_mmv_float_chunks(ggml_backend_vk_context * ctx, const ggml_t
     return true;
 }
 
-// FN_DECODE_HC: the FN hc up mat-vec pipeline that matches the f32-B q8_0 mat-vec the unfused MUL_MAT would run on n columns
+// FN_DECODE_HC: the Flash-Next hc up mat-vec pipeline that matches the f32-B q8_0 mat-vec the unfused MUL_MAT would run on n columns
 // (same workgroup size and reduction mode), or nullptr
 static vk_pipeline ggml_vk_fn_hc_up_mix_mv_pipeline(ggml_backend_vk_context * ctx, uint32_t n, uint32_t m, uint32_t k) {
     const vk_pipeline stock = ggml_vk_get_dequantize_mul_mat_vec(ctx, GGML_TYPE_Q8_0, GGML_TYPE_F32, n, m, k);

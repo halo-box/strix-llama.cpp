@@ -1878,7 +1878,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // a prompt batch (wider than a verify batch) is never accepted against: keep its last row only, which is
-            // the carry (LLAMA_MTP_VERIFY_H_ALL=1 keeps every row, the old 80 MB per 2048 rows host copy on FN)
+            // the carry (LLAMA_MTP_VERIFY_H_ALL=1 keeps every row, the old 80 MB per 2048 rows host copy on Flash-Next)
             static const bool keep_all = [] { const char * e = getenv("LLAMA_MTP_VERIFY_H_ALL"); return e && atoi(e) != 0; }();
             const int32_t n_all  = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             const int32_t i_beg  = keep_all || n_all <= this->n_max + 1 ? 0 : n_all - 1;

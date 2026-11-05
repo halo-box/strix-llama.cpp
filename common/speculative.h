@@ -125,7 +125,7 @@ static inline bool common_speculative_mtp_pcum_keep(float pcum, int k, float acc
 // Caveat: the width path reads wall-clock round times, so two identical requests can take different widths. Where the
 // target's logits depend on the verify batch shape (Vulkan verify rows vs one-row decode can flip a near-tie argmax), the
 // greedy output then varies run to run, while fixed-width MTP repeats itself. Measured on Strix Halo 128 GB, Mesa 26.2.4,
-// FN UD-Q4_K_XL: base n3 and fixed n1 already diverge from plain decode at token 24 of 512.
+// Flash-Next UD-Q4_K_XL: base n3 and fixed n1 already diverge from plain decode at token 24 of 512.
 struct common_speculative_mtp_cost_policy {
     static constexpr int   W_MAX   = 16;
     static constexpr float decay   = 0.90f; // per observation of a depth (~10 observations of memory)
