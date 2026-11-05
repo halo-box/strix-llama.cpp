@@ -5832,14 +5832,17 @@ struct test_gdn_norm_f16 : public test_case {
         GGML_UNUSED(t);
         return "GDN_NORM_F16";
     }
-    std::string vars() override { return VARS_TO_STR3(ne, pad, type_out); }
+    const int64_t zpad;   // z as the merged qkv+z GEMM has it: a view whose token stride is wider than the z row
+    std::string vars() override {
+        return VARS_TO_STR3(ne, pad, type_out) + (zpad > 0 ? "," + VAR_TO_STR(zpad) : "");
+    }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
     double max_nmse_err() override { return 5e-4; }
 
-    test_gdn_norm_f16(std::array<int64_t, 3> ne = {128, 48, 33}, int64_t pad = 0, ggml_type type_out = GGML_TYPE_Q8_0)
-        : ne(ne), pad(pad), type_out(type_out) {}
+    test_gdn_norm_f16(std::array<int64_t, 3> ne = {128, 48, 33}, int64_t pad = 0, ggml_type type_out = GGML_TYPE_Q8_0, int64_t zpad = 0)
+        : ne(ne), pad(pad), type_out(type_out), zpad(zpad) {}
 
     void initialize_tensors(ggml_context * ctx) override {
         for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
@@ -5876,11 +5879,14 @@ struct test_gdn_norm_f16 : public test_case {
         ggml_set_input(x);
         ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
         ggml_set_name(gamma, "gamma");
-        // z as the model has it: a reshape of a flat projection output, expanded ahead of the chain
-        ggml_tensor * z_flat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row, ne[2]);
+        // z as the model has it: a reshape of a flat projection output (or, zpad > 0, a view of the back of a wider one),
+        // expanded ahead of the chain
+        ggml_tensor * z_flat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row + zpad, ne[2]);
         ggml_set_name(z_flat, "z");
         ggml_set_input(z_flat);
-        ggml_tensor * z = ggml_reshape_3d(ctx, z_flat, ne[0], ne[1], ne[2]);
+        ggml_tensor * z = zpad > 0 ? ggml_view_3d(ctx, z_flat, ne[0], ne[1], ne[2], ne[0] * sizeof(float), z_flat->nb[1],
+                                                  zpad * sizeof(float))
+                                   : ggml_reshape_3d(ctx, z_flat, ne[0], ne[1], ne[2]);
         if (gf) { ggml_build_forward_expand(gf, z); }
         ggml_tensor * dst = nullptr;
         if (pad > 0) {
@@ -7596,13 +7602,17 @@ struct test_gdn_conv_prefill : public test_case {
     // GGML_VK_GDN_Z16 candidate), 3 as 1 plus a second reader of the GDN output (the fold has to decline), 4 as 2 with a row-padded f16 B
     // (the Flash-Next z: the dense q8_0 x f16 GEMM, GGML_VK_DENSE_DQ8)
     const int out_norm;
+    const int xpad;   // x as the merged qkv+z GEMM has it: the front C channels of a wider row
     std::vector<ggml_tensor *> verify;
     test_gdn_conv_prefill(int n_tokens, int n_k_heads, int n_v_heads, int n_seqs = 1, bool extra_reader = false, int x_tail = 0,
-                          int out_norm = 0)
+                          int out_norm = 0, int xpad = 0)
         : n_tokens(n_tokens), n_k_heads(n_k_heads), n_v_heads(n_v_heads), n_seqs(n_seqs), extra_reader(extra_reader), x_tail(x_tail),
-          out_norm(out_norm) {}
+          out_norm(out_norm), xpad(xpad) {}
     std::string op_desc(ggml_tensor *) override { return out_norm ? "GDN_OUT_NORM_PREFILL" : "GDN_CONV_PREFILL"; }
     std::string vars() override {
+        if (xpad > 0) {
+            return VARS_TO_STR5(n_tokens, n_k_heads, n_v_heads, n_seqs, x_tail) + "," + VAR_TO_STR(xpad);
+        }
         if (out_norm) {
             return VARS_TO_STR5(n_tokens, n_k_heads, n_v_heads, n_seqs, out_norm);
         }
@@ -7720,9 +7730,12 @@ struct test_gdn_conv_prefill : public test_case {
         const int C = 128 * (2 * n_k_heads + n_v_heads);
         const int S = n_seqs;
         GGML_ASSERT(x_tail == 0 || S == 1);
-        ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_tokens + x_tail, S);
+        ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C + xpad, n_tokens + x_tail, S);
         ggml_set_name(x_src, "x_src");
         ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, not a permanent input
+        if (xpad > 0) {
+            x = ggml_view_3d(ctx, x, C, n_tokens + x_tail, S, x->nb[1], x->nb[2], 0);
+        }
         ggml_tensor * x_rest = nullptr;
         if (x_tail > 0) {
             // tokens [n_tokens, n_tokens + x_tail) feed a second, later reader (the model's second conv part)
@@ -17147,6 +17160,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_gdn_norm_f16({128, 16, 64}, 8, GGML_TYPE_Q4_K));
     test_cases.emplace_back(new test_gdn_norm_f16({100, 6, 40}, 0, GGML_TYPE_F16));
+    // merged attn_qkv_gate: z is the back 6144 of a 16384-wide row
+    test_cases.emplace_back(new test_gdn_norm_f16({128, 48, 64}, 0, GGML_TYPE_Q8_0, 10240));
+    test_cases.emplace_back(new test_gdn_norm_f16({128, 48, 5},  0, GGML_TYPE_Q8_0, 10240));
     test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}));
     test_cases.emplace_back(new test_rms_norm_scale({128, 16, 9, 1}, 1e-6f, true));
     test_cases.emplace_back(new test_rms_norm_scale({100, 3, 5, 2}));
@@ -19367,6 +19383,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 4, 1, false, 0, 3));
     test_cases.emplace_back(new test_gdn_conv_prefill(2048, 16, 48, 1, false, 0, 3));
+    // merged attn_qkv_gate: x is the front 10240 of a 16384-wide row
+    test_cases.emplace_back(new test_gdn_conv_prefill(256, 16, 48, 1, false, 0, 0, 6144));
+    test_cases.emplace_back(new test_gdn_conv_prefill(64, 2, 4, 1, false, 0, 0, 1024));
     // Multiple sequences must remain on the generic fallback.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 15, 1, 1, false, true));
@@ -19747,6 +19766,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto mk : std::vector<std::array<int, 2>>{ {2560, 6144}, {2560, 640} }) {
         for (int n : {512, 1024, 2048, 8192}) {
             test_cases.emplace_back(new test_mul_mat_dq8_f32b(mk[0], n, mk[1]));
+        }
+    }
+    // the merged qwen4exp attn_qkv_gate GEMM (10240 + 6144 rows; 16384 f32 = a 64 KiB output row pitch) and the same with
+    // 64 more rows, and the merged hc down+inject (320 + 4)
+    for (auto mk : std::vector<std::array<int64_t, 2>>{ {16384, 2560}, {16448, 2560}, {324, 10240} }) {
+        for (int n : {2048, 8192}) {
+            test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, mk[0], n, mk[1]));
         }
     }
     for (int n : {2048, 8192}) {

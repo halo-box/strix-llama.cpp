@@ -16500,7 +16500,7 @@ static void ggml_vk_ssm_conv_direct(ggml_backend_vk_context * ctx, vk_context& s
     }
 
     const vk_op_ssm_conv_push_constants pc = {
-        x_row, (uint32_t) ((size_t) x_row * T),
+        x16 ? x_row : (uint32_t) m.x_nb1, x16 ? (uint32_t) ((size_t) x_row * T) : (uint32_t) m.x_nb2,
         (uint32_t) m.kern->nb[1],
         (uint32_t) m.out->nb[0], (uint32_t) m.out->nb[1], (uint32_t) m.out->nb[2],
         (uint32_t) m.kern->ne[0],
@@ -16534,7 +16534,7 @@ static void ggml_vk_concat_tail(ggml_backend_vk_context * ctx, vk_context& subct
     }
 
     const vk_op_ssm_conv_push_constants pc = {
-        x_row, (uint32_t) ((size_t) x_row * T),
+        x16 ? x_row : (uint32_t) m.x_nb1, x16 ? (uint32_t) ((size_t) x_row * T) : (uint32_t) m.x_nb2,
         0,
         (uint32_t) cc->nb[0], (uint32_t) cc->nb[1], (uint32_t) cc->nb[2],
         (uint32_t) m.tail_from,
@@ -17085,6 +17085,10 @@ static void ggml_vk_rms_norm_small(ggml_backend_vk_context * ctx, vk_context& su
 
     vk_op_binary_push_constants pc = ggml_vk_rms_norm_push_constants(src0, src1, dst, eps, 0);
     pc.param2 = post_scale;
+    if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_SIGMUL_CPY) {
+        // z's token stride in elements (ne00 * ne01 when packed); rms_norm_small.comp does not read ne otherwise
+        pc.ne = (uint32_t) (src2->nb[2] / sizeof(float));
+    }
     init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, dst);
     GGML_ASSERT(dst->type != GGML_TYPE_F16 || pc.param3 == 0.0f);   // the f16 store XORs with param3 as its zero (rms_norm_small.comp)
 
@@ -22161,6 +22165,13 @@ static bool ggml_vk_gdn_norm_f16_reject(const char * why) {
     return false;
 }
 
+// z [ncols, heads, tokens, seqs]: rows packed within a token, the token stride free (the merged qkv+z GEMM's z is a view whose
+// token stride is the whole GEMM row); the kernel reads z through that stride (push constant ne)
+static bool ggml_vk_gdn_norm_f16_z_ok(const ggml_tensor * z) {
+    return z->nb[0] == sizeof(float) && z->nb[1] == z->ne[0] * sizeof(float) && z->nb[2] >= z->nb[1] * z->ne[1] &&
+           z->nb[2] % sizeof(float) == 0 && (z->ne[3] == 1 || z->nb[3] == z->nb[2] * z->ne[2]);
+}
+
 static bool ggml_vk_can_fuse_gdn_norm_f16(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     static const bool enabled = [] { const char * e = getenv("GGML_VK_GDN_NORM_F16"); return e == nullptr || atoi(e) != 0; }();
     if (!enabled) {
@@ -22195,7 +22206,7 @@ static bool ggml_vk_can_fuse_gdn_norm_f16(const ggml_backend_vk_context * ctx, c
     }
     if (gamma->type != GGML_TYPE_F32 || !ggml_can_repeat(gamma, mul) || mul->type != GGML_TYPE_F32 ||
         z->type != GGML_TYPE_F32 || mul2->type != GGML_TYPE_F32 ||
-        !ggml_is_contiguous(z) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(mul2) ||
+        !ggml_vk_gdn_norm_f16_z_ok(z) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(mul2) ||
         !ggml_are_same_shape(rms, mul) || !ggml_are_same_shape(z, mul2) || !ggml_are_same_shape(mul, mul2) ||
         get_misalign_bytes(ctx, z) != 0) {
         return ggml_vk_gdn_norm_f16_reject("gamma / z / the MULs are not f32, packed and dst-shaped");
@@ -23120,11 +23131,12 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
     const int64_t C = tr->ne[1];
     const int64_t S = tr->ne[2];
     const ggml_tensor * x = tr->view_src;
-    // x^T must be a plain transpose of the whole contiguous x: token stride C, channel stride 1, sequence stride C*T.
-    // One sequence may also take the first T tokens of a longer x (a conv split at a recurrent state snapshot)
-    const bool x_size_ok = S == 1 ? (x->ne[0] == C && ggml_nelements(x) >= C * T) : ggml_nelements(x) == C * T * S;
-    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !x_size_ok || tr->ne[3] != 1 ||
-        tr->nb[0] != (size_t) C * sizeof(float) || tr->nb[1] != sizeof(float) || tr->nb[2] != (size_t) C * T * sizeof(float)) {
+    // x^T must be a plain transpose of the front C channels of a contiguous x with one row per (token, sequence): channel
+    // stride 1, token stride = x's row (C, or wider when x is a merged qkv+z GEMM whose qkv rows come first), sequence
+    // stride = T rows. One sequence may also take the first T tokens of a longer x (a conv split at a recurrent state snapshot)
+    const bool x_rows_ok = S == 1 ? ggml_nrows(x) >= T : ggml_nrows(x) == T * S;
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] < C || !x_rows_ok || tr->ne[3] != 1 ||
+        tr->nb[0] != x->nb[1] || tr->nb[1] != sizeof(float) || tr->nb[2] != x->nb[1] * T) {
         return ggml_vk_ssm_conv_direct_reject("x layout", i);
     }
     if (T < ssm_conv_direct_min_tokens) {
@@ -23208,6 +23220,8 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
     m.concat    = cc;
     m.state     = st;
     m.x         = x;
+    m.x_nb1     = tr->nb[0];
+    m.x_nb2     = tr->nb[2];
     m.kern      = w;
     m.out       = su;
     m.conv_idx  = conv;

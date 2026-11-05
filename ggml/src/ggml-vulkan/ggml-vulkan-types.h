@@ -1616,7 +1616,9 @@ struct ggml_backend_vk_context {
     struct ssm_conv_direct_match {
         const ggml_tensor * concat;
         const ggml_tensor * state;   // [ncs, C, S], contiguous
-        const ggml_tensor * x;       // x^T's storage: [C, T, S], contiguous
+        const ggml_tensor * x;       // x^T's storage: contiguous rows of >= C channels, one per (token, sequence)
+        size_t x_nb1;                // x token stride in bytes (C * 4, or a wider row when x is the front of a merged GEMM)
+        size_t x_nb2;                // x sequence stride in bytes (x_nb1 * T)
         const ggml_tensor * kern;    // [ncs + 1, C]
         ggml_tensor * out;           // the SILU node
         int conv_idx;
