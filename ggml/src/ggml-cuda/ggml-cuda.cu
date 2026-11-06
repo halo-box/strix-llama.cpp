@@ -80,7 +80,18 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/sparse-attn.cuh"
+#include "ggml-cuda/sparse-attn-census.h"
 #include "ggml.h"
+#include <vector>
+
+#if defined(GGML_USE_HIP)
+// dispatch census and HIP graphs (definitions with the census procs below): the ids dispatched while a graph is being
+// captured are recorded into it, and a replay of the graph counts them again
+static void ggml_cuda_sa_census_capture_begin(std::vector<uint8_t> * ids);
+static void ggml_cuda_sa_census_capture_end(void);
+static void ggml_cuda_sa_census_replay(const std::vector<uint8_t> & ids);
+#endif // defined(GGML_USE_HIP)
 
 #include <algorithm>
 #include <array>
@@ -1022,6 +1033,8 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
 
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
+        : tensor->op == GGML_OP_SPARSE_ATTN_PLAN
+        ? ggml_cuda_sparse_attn_plan_get_alloc_size(tensor)   // max dst over the G range + sort/dedup scratch
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
@@ -2700,6 +2713,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_SPARSE_ATTN_PLAN:
+            ggml_cuda_sparse_attn_plan(ctx, dst);
             break;
         default:
             return false;
@@ -6555,6 +6571,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int skip = ggml_cuda_match_qsa_expand(cgraph, i, args);
         if (skip && ggml_cuda_qsa_expand_alias_ok(args)) {
             ggml_cuda_op_qsa_expand(*cuda_ctx, args);
+            ggml_cuda_sa_census_add(GGML_CUDA_SA_CENSUS_QSA_EXPAND);
             return skip;
         }
     }
@@ -7135,6 +7152,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+    if (use_cuda_graph && cuda_graph_update_required) {
+        ggml_cuda_sa_census_capture_begin(&cuda_ctx->cuda_graph(graph_key)->census_ids);
+    }
+#endif
 
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
@@ -7376,6 +7398,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+#if defined(GGML_USE_HIP)
+            ggml_cuda_sa_census_capture_end();
+#endif
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -7396,6 +7421,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+#if defined(GGML_USE_HIP)
+        if (!cuda_graph_update_required) {   // a replay: the capture above did not dispatch (and count) the kernels
+            ggml_cuda_sa_census_replay(graph->census_ids);
+        }
+#endif
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -9413,6 +9443,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_SPARSE_ATTN_PLAN:
+            return ggml_cuda_sparse_attn_plan_supported(dev_ctx->device, op);   // HIP only; false on CUDA builds
 
         default:
             return false;
@@ -9586,8 +9618,145 @@ static void ggml_backend_cuda_set_mmb_small_batch(ggml_backend_t backend, bool e
     ((ggml_backend_cuda_context *) backend->context)->mmb_small_batch = enable;
 }
 
+// Dispatch census of the HIP sparse-attention kernels (sparse-attn-census.h): one relaxed counter per compiled key, off
+// (one relaxed load per dispatch) until ggml_backend_debug_dispatch_census_reset or GGML_CUDA_DISPATCH_CENSUS_LOG=1.
+#if defined(GGML_USE_HIP)
+static std::atomic<bool>     ggml_cuda_sa_census_on {false};
+static std::atomic<uint64_t> ggml_cuda_sa_census_counts[GGML_CUDA_SA_CENSUS_N];
+static_assert(GGML_CUDA_SA_CENSUS_N <= 256, "census ids are recorded into HIP graphs as uint8_t");
+
+// the census ids of the graph this thread is capturing (recorded whether the census is on or off, so a graph captured
+// before a reset is still counted when it is replayed after it)
+static thread_local std::vector<uint8_t> * ggml_cuda_sa_census_capture = nullptr;
+
+void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id) {
+    if (ggml_cuda_sa_census_capture != nullptr) {
+        ggml_cuda_sa_census_capture->push_back((uint8_t) id);
+    }
+    if (ggml_cuda_sa_census_on.load(std::memory_order_relaxed)) {
+        ggml_cuda_sa_census_counts[id].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+static void ggml_cuda_sa_census_capture_begin(std::vector<uint8_t> * ids) {
+    ids->clear();
+    ggml_cuda_sa_census_capture = ids;
+}
+
+static void ggml_cuda_sa_census_capture_end(void) {
+    ggml_cuda_sa_census_capture = nullptr;
+}
+
+static void ggml_cuda_sa_census_replay(const std::vector<uint8_t> & ids) {
+    if (ggml_cuda_sa_census_on.load(std::memory_order_relaxed)) {
+        for (const uint8_t id : ids) {
+            ggml_cuda_sa_census_counts[id].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+static void ggml_backend_cuda_dispatch_census_reset(void) {
+    for (auto & c : ggml_cuda_sa_census_counts) {
+        c.store(0, std::memory_order_relaxed);
+    }
+    ggml_cuda_sa_census_on.store(true, std::memory_order_relaxed);
+}
+
+// key is exactly name, or name is a "/"-separated prefix of key ("sa_plan" covers "sa_plan/G1" and "sa_plan/G4")
+static bool ggml_cuda_sa_census_key_under(const char * key, const char * name) {
+    const size_t n = strlen(name);
+    return strncmp(key, name, n) == 0 && (key[n] == '\0' || key[n] == '/');
+}
+
+static uint64_t ggml_backend_cuda_dispatch_census_count(const char * name) {
+    uint64_t n = 0;
+    for (int i = 0; i < GGML_CUDA_SA_CENSUS_N; ++i) {
+        if (ggml_cuda_sa_census_key_under(ggml_cuda_sa_census_keys[i], name)) {
+            n += ggml_cuda_sa_census_counts[i].load(std::memory_order_relaxed);
+        }
+    }
+    return n;
+}
+
+static std::string ggml_cuda_sa_census_string(void) {
+    std::map<std::string, uint64_t> sorted;
+    for (int i = 0; i < GGML_CUDA_SA_CENSUS_N; ++i) {
+        const uint64_t c = ggml_cuda_sa_census_counts[i].load(std::memory_order_relaxed);
+        if (c > 0) {
+            sorted[ggml_cuda_sa_census_keys[i]] = c;
+        }
+    }
+    std::string out;
+    for (const auto & it : sorted) {
+        out += it.first + "=" + std::to_string(it.second) + ";";
+    }
+    return out;
+}
+
+// "KEY=count;..." for the non-zero keys in key order into buf (truncated to size, NUL-terminated); returns the full length
+static size_t ggml_backend_cuda_dispatch_census_get(char * buf, size_t size) {
+    const std::string out = ggml_cuda_sa_census_string();
+    if (buf != nullptr && size > 0) {
+        const size_t n = std::min(out.size(), size - 1);
+        memcpy(buf, out.data(), n);
+        buf[n] = '\0';
+    }
+    return out.size();
+}
+
+static const char * const * ggml_backend_cuda_dispatch_census_list(void) {
+    return ggml_cuda_sa_census_keys;
+}
+
+// NULL when label is a compiled key or a prefix of one; otherwise this backend never counts it
+static const char * ggml_backend_cuda_dispatch_census_skip(ggml_backend_t backend, const char * label) {
+    GGML_UNUSED(backend);
+    for (int i = 0; i < GGML_CUDA_SA_CENSUS_N; ++i) {
+        if (ggml_cuda_sa_census_key_under(ggml_cuda_sa_census_keys[i], label)) {
+            return nullptr;
+        }
+    }
+    return "not a HIP dispatch census key (ggml_backend_debug_dispatch_census_list)";
+}
+
+// GGML_CUDA_DISPATCH_CENSUS_LOG=1: count from backend registration and print the census to stderr at exit (plain stderr:
+// the application's log callback may already be gone)
+static void ggml_cuda_sa_census_print(void) {
+    fprintf(stderr, "ggml_cuda: dispatch census: %s\n", ggml_cuda_sa_census_string().c_str());
+}
+
+static void ggml_cuda_sa_census_log_init(void) {
+    const char * e = getenv("GGML_CUDA_DISPATCH_CENSUS_LOG");
+    if (e != nullptr && atoi(e) != 0) {
+        ggml_cuda_sa_census_on.store(true, std::memory_order_relaxed);
+        atexit(ggml_cuda_sa_census_print);
+    }
+}
+#else
+void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id) {
+    GGML_UNUSED(id);
+}
+#endif // defined(GGML_USE_HIP)
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if defined(GGML_USE_HIP)
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_reset") == 0) {
+        return (void *) ggml_backend_cuda_dispatch_census_reset;
+    }
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_count") == 0) {
+        return (void *) ggml_backend_cuda_dispatch_census_count;
+    }
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_get") == 0) {
+        return (void *) ggml_backend_cuda_dispatch_census_get;
+    }
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_list") == 0) {
+        return (void *) ggml_backend_cuda_dispatch_census_list;
+    }
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_skip") == 0) {
+        return (void *) ggml_backend_cuda_dispatch_census_skip;
+    }
+#endif // defined(GGML_USE_HIP)
     if (strcmp(name, "ggml_backend_cuda_set_mmb_enabled") == 0) {
         return (void *)ggml_backend_cuda_set_mmb_enabled;
     }
@@ -9670,6 +9839,9 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 /* .iface       = */ ggml_backend_cuda_reg_interface,
                 /* .context     = */ ctx
             };
+#if defined(GGML_USE_HIP)
+            ggml_cuda_sa_census_log_init();
+#endif // defined(GGML_USE_HIP)
         }
 
         initialized = true;
