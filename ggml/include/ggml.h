@@ -648,6 +648,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // appended before GGML_OP_COUNT so that no existing op value moves (RPC: minor version bump, ggml-rpc.h)
+        GGML_OP_SPARSE_ATTN_PLAN,
+        GGML_OP_SPARSE_ATTN,
+
         GGML_OP_COUNT,
     };
 
@@ -2582,6 +2586,98 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * top_k,
                      int64_t     n_kv_raw);
+
+    //
+    // sparse attention over per-query selection rows (two ops)
+    //
+    // ggml_sparse_attn_plan canonicalises per-query selection rows into a grouped attention plan. Integer only: every
+    // backend that implements it produces identical dst bytes (every byte of ggml_nbytes(dst)).
+    //   S(i,s) = { c : exists j, sel[j,i,0,s] == c, 0 <= c < n_kv }
+    // (set semantics: the order of a row, duplicates, -1 and out-of-range entries are irrelevant; out-of-range values
+    // other than -1 are counted in hdr.n_bad).
+    //
+    // sel  : I32 [n_sel, n_q, 1, n_stream]; nb[0] == 4; nb[1..3] % 4 == 0; n_sel >= 1
+    // n_kv : keys visible to the op (cells 0..n_kv-1 of the K/V views); 1 <= n_kv <= 2^24
+    // group: G in {1, 4}: consecutive queries of one stream that share one union of quads
+    // dst  : I8 [ggml_sparse_attn_plan_nbytes(n_sel, n_q, n_stream, n_kv, group)], little-endian, offsets 256-byte aligned:
+    //   hdr    struct ggml_sparse_attn_plan_hdr (64 bytes, then zero bytes up to off_counts = 256)
+    //   counts u32 [n_stream][n_groups]       entries used, padded to a multiple of 4
+    //   quads  u32 [n_stream][n_groups][cap]  physical quad id = cell >> 2, strictly ascending within a group
+    //   masks  u16 [n_stream][n_groups][cap]  bit 4*j + c: query j of the group attends cell 4*quad + c (G = 1: bits 0..3)
+    //   n_groups = ceil(n_q / G); cap = round4(min(G * n_sel, ceil(n_kv / 4)))
+    //   every entry past the group's real entries (the padding up to counts[s][g] and everything up to cap) holds
+    //   quad = the last real quad of the group (0 for an empty group) and mask = 0; the gaps between sections are 0
+    // The sort/dedup scratch is not part of dst: ggml_sparse_attn_plan_scratch_nbytes(n_sel, n_q, n_stream)
+    // = n_stream * n_q * round4(n_sel) * 4 bytes (GPU backends: in their get_alloc_size over-allocation of dst;
+    // CPU: in the graph work buffer).
+#define GGML_SPARSE_ATTN_PLAN_MAGIC   0x50415351u // the bytes "QSAP"
+#define GGML_SPARSE_ATTN_PLAN_VERSION 1u
+
+    struct ggml_sparse_attn_plan_hdr {
+        uint32_t magic;      // GGML_SPARSE_ATTN_PLAN_MAGIC
+        uint32_t version;    // GGML_SPARSE_ATTN_PLAN_VERSION
+        uint32_t group;
+        uint32_t n_q;
+        uint32_t n_stream;
+        uint32_t n_groups;
+        uint32_t cap;
+        uint32_t n_bad;      // out-of-range values other than -1, every occurrence counted
+        uint64_t off_counts;
+        uint64_t off_quads;
+        uint64_t off_masks;
+        uint64_t reserved;   // 0
+    };
+
+    struct ggml_sparse_attn_plan_layout {
+        int32_t group;
+        int64_t n_groups;
+        int64_t cap;
+        size_t  off_counts;
+        size_t  off_quads;
+        size_t  off_masks;
+        size_t  nbytes;      // == ggml_sparse_attn_plan_nbytes()
+    };
+
+    GGML_API struct ggml_sparse_attn_plan_layout ggml_sparse_attn_plan_get_layout(
+            int64_t n_sel, int64_t n_q, int64_t n_stream, int64_t n_kv, int32_t group);
+    GGML_API size_t ggml_sparse_attn_plan_nbytes(int64_t n_sel, int64_t n_q, int64_t n_stream, int64_t n_kv, int32_t group);
+    GGML_API size_t ggml_sparse_attn_plan_scratch_nbytes(int64_t n_sel, int64_t n_q, int64_t n_stream);
+
+    GGML_API struct ggml_tensor * ggml_sparse_attn_plan(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sel,
+            int64_t               n_kv,
+            int32_t               group);
+
+    // ggml_sparse_attn: attention of every query over its plan cells.
+    //   out[:,h,i,s] = H_o( sum_{c in S(i,s)} softmax_c( f16(scale * H_q q[:,i,h,s]) . f16(k[:,c,h/r,s]) ) * f16(v[:,c,h/r,s]) )
+    //   r = n_head / n_head_kv; H_q / H_o: orthonormal Sylvester-Hadamard over consecutive blocks of rot_q / rot_o dims
+    //   (0 = identity), the transform llama_mul_mat_hadamard applies; an empty S gives 0.
+    //
+    // q   : F32 [D, n_q, n_head, n_stream]        nb[0] == 4, any other strides (the FLASH_ATTN_EXT q layout)
+    // k   : T_k [D, n_kv_k, n_head_kv, n_stream]   cache view (stored rotated if quantized); n_kv_k >= 4*ceil(n_kv/4)
+    // v   : T_v [D, n_kv_v, n_head_kv, n_stream]   not transposed;                           n_kv_v >= 4*ceil(n_kv/4)
+    // plan: ggml_sparse_attn_plan(sel, n_kv, G) with sel->ne[1] == n_q and sel->ne[3] == n_stream
+    // rot_q, rot_o: 0, 64, 128 or 256, dividing D
+    // dst : F32 [D, n_head, n_q, n_stream] (the FLASH_ATTN_EXT output layout)
+    //
+    // Numeric contract (the CPU op implements it exactly; it is the reference of every backend):
+    //   1. K and V elements are converted to f16 as the type's to_float value rounded to f16 (RNE, +-inf on overflow).
+    //   2. q is transformed by H_q in f32 when rot_q > 0, multiplied by scale in f32 and rounded to f16.
+    //   3. Scores are f32. Online softmax over the cells in ascending order: P is rounded to f16 against the running max
+    //      for PV, the normaliser l sums the unrounded f32 p, PV accumulates in f32; acc / l and H_o run in f32.
+    //   4. A cell whose mask bit is 0 and every padding entry contribute nothing, whatever their stored bytes
+    //      (NaN / inf included). The summation order is a pure function of the shape and of the op's inputs, so the
+    //      output is deterministic run to run.
+    GGML_API struct ggml_tensor * ggml_sparse_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * plan,
+            float                 scale,
+            int32_t               rot_q,
+            int32_t               rot_o);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

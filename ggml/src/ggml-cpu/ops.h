@@ -118,6 +118,12 @@ void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * para
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+
+// sparse-attn.cpp (built with -ffp-contract=off)
+void ggml_compute_forward_sparse_attn_plan(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_sparse_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+size_t ggml_cpu_sparse_attn_plan_work_size(const struct ggml_tensor * node, int n_tasks);
+size_t ggml_cpu_sparse_attn_work_size(const struct ggml_tensor * node, int n_tasks);
 #ifdef __cplusplus
 }
 #endif

@@ -494,6 +494,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_SPARSE_ATTN: {
+            // K/V rows are converted with the type's to_float
+            for (int i = 1; i <= 2; ++i) {
+                const ggml_type t = op->src[i]->type;
+                if (t != GGML_TYPE_F32 && ggml_get_type_traits(t)->to_float == nullptr) {
+                    return false;
+                }
+            }
+            return true;
+        }
         default:
             return true;
     }
