@@ -2567,8 +2567,6 @@ struct llama_model_qwen4exp : public llama_model_base {
     // a bf16 matmul weight left after load keeps the hc mixed stream f32; counted once, on the first graph
     mutable std::once_flag bf16_mm_once;
     mutable bool           bf16_mm = false;
-    // once per model: the fit probe loads its own model, with its logs demoted to debug
-    mutable std::once_flag qsa_depth_warn_once;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
@@ -2621,15 +2619,36 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor ** tile_out_ids = nullptr,
                            bool   cache_only = false);
 
-        // dense self-attention restricted to the cells that top_k names
+        // self-attention restricted to the cells that top_k names; with plan, on GGML_OP_SPARSE_ATTN pinned to backend
+        // (*attn_node gets the node), without it on the masked route
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
                     ggml_tensor * top_k,
+                    ggml_tensor * plan,
+                 ggml_backend_t   backend,
                           float   kq_scale,
-                            int   il);
+                            int   il,
+                    ggml_tensor ** attn_node);
+
+        // the placement and the policies of a QSA layer's attention (PLAN-v3 §5, §10), for the device of its K buffer
+        struct qsa_policy {
+            ggml_backend_dev_t dev = nullptr;   // whose policies apply
+            ggml_backend_t backend = nullptr;   // where plan and attend run
+            bool host_kv   = false;             // the K buffer is a host buffer
+            bool layer_gpu = false;             // host K buffer, weights on a GPU: -nkvo
+            llm_graph_qsa_place place = LLM_QSA_PLACE_K_DEVICE;
+            ggml_backend_sparse_attn_group_t        group        = nullptr;
+            ggml_backend_sparse_attn_prefer_dense_t prefer_dense = nullptr;
+        };
+        qsa_policy build_qsa_policy(ggml_tensor * k, ggml_type type_v, int il) const;
+        // the all-visible rows of the shortcut, once per graph, one view per layer
+        ggml_tensor * build_qsa_rows_av(ggml_tensor * kq_mask, int il);
+        ggml_tensor * build_qsa_plan(ggml_tensor * rows, const qsa_policy & policy, int64_t n_kv, ggml_type type_k, ggml_type type_v,
+                bool shortcut, int32_t & group, int il);
+        ggml_tensor * qsa_rows_av_shared = nullptr;
 
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set

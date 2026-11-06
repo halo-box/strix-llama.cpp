@@ -117,6 +117,7 @@ int llama_server(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+    common_qsa_census_begin();
 
     const int result = llama_server(params, argc, argv, child);
     common_log_flush(common_log_main());
@@ -471,6 +472,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
             ctx_http.stop();
             ctx_server.terminate();
             mcp_mgr.shutdown();
+            common_qsa_census_print();
             llama_backend_free();
         };
 

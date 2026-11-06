@@ -272,6 +272,18 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    // QSA placement guard (PLAN-v3 §10) over llama's graph gf with the placement of the current split: every SPARSE_ATTN_PLAN,
+    // SPARSE_ATTN and QSA-layer shortcut attention node on the backend of its layer's K buffer, supported there, each plan
+    // with one consumer, and enough nodes inspected to mean something. Returns the error text, empty when it passes.
+    std::string qsa_guard(ggml_cgraph * gf, const llm_graph_result * res, const char * where);
+    // the init guard on split_only reserve graphs of one shape; throws on a violation
+    void qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const char * where);
+    // the number of QSA layers a graph of this context holds, 0 when QSA does not apply
+    int qsa_n_layers() const;
+    // LLAMA_QSA_TRACE=1: producer x route x context per executed ubatch (§14.3), printed at exit
+    void qsa_trace_ubatch(const llm_graph_result * res);
+    void qsa_trace_print() const;
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -467,4 +479,14 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // QSA guard counters (qsa_guard) and the LLAMA_QSA_TRACE accumulators
+    int     qsa_guard_passes       = 0;
+    int     qsa_guard_inspected_min = -1;
+    int64_t qsa_guard_inspected    = 0;
+    int64_t qsa_guard_cpu_launch   = 0;   // QSA-layer attention placed on the CPU while the layer's K buffer is on a GPU
+    std::map<std::string, int64_t> qsa_trace_counts;
+    int64_t qsa_cpu_sparse_attn    = 0;   // executed SPARSE_ATTN / SPARSE_ATTN_PLAN / shortcut attention nodes on the CPU
+    int64_t qsa_cpu_sparse_plan    = 0;
+    int64_t qsa_cpu_shortcut_attn  = 0;
 };

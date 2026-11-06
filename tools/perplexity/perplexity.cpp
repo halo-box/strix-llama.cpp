@@ -2092,6 +2092,7 @@ int llama_perplexity(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+    common_qsa_census_begin();
 
     // load the model and apply lora adapter, if any
     auto llama_init = common_init_from_params(params);
@@ -2138,6 +2139,7 @@ int llama_perplexity(int argc, char ** argv) {
     LOG("\n");
     llama_perf_context_print(ctx);
     common_memory_breakdown_print(ctx);
+    common_qsa_census_print();
 
     llama_backend_free();
 

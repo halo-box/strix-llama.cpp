@@ -1392,3 +1392,12 @@ struct common_prompt_checkpoint {
     void clear_tgt();
     void clear_dft();
 };
+
+//
+// QSA reach census (LLAMA_QSA_TRACE=1, scripts/qsa-validation/census_check.py)
+//
+
+// start the backend dispatch census of every registered backend that has one (a no-op without LLAMA_QSA_TRACE=1)
+void common_qsa_census_begin();
+// print "QSA_CENSUS <key> <count>" for every non-zero key
+void common_qsa_census_print();

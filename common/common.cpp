@@ -2458,3 +2458,45 @@ void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
 }
+
+//
+// QSA reach census
+//
+
+static bool common_qsa_census_on() {
+    const char * e = getenv("LLAMA_QSA_TRACE");
+    return e != nullptr && atoi(e) != 0;
+}
+
+void common_qsa_census_begin() {
+    if (!common_qsa_census_on()) {
+        return;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        auto reset = (void (*)(void)) ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_backend_debug_dispatch_census_reset");
+        if (reset) {
+            reset();
+        }
+    }
+}
+
+void common_qsa_census_print() {
+    if (!common_qsa_census_on()) {
+        return;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto list  = (const char * const * (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_list");
+        auto count = (uint64_t (*)(const char *))     ggml_backend_reg_get_proc_address(reg, "ggml_backend_debug_dispatch_census_count");
+        if (!list || !count) {
+            continue;
+        }
+        for (const char * const * k = list(); *k != nullptr; ++k) {
+            const uint64_t c = count(*k);
+            if (c > 0) {
+                fprintf(stderr, "QSA_CENSUS %s %llu\n", *k, (unsigned long long) c);
+            }
+        }
+    }
+    fflush(stderr);
+}
