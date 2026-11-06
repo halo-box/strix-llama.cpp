@@ -65,6 +65,8 @@ struct sa_g4_args {
     const uint8_t *  qflags;    // packed V: [n_stream][n_head_kv][pv_nquads]: 1 = sa_pack_v replaced a non-finite half
                                 // of that quad by 0 (nullptr for direct V)
     const uint32_t * qany;      // packed V: nonzero when any quad is flagged (cleared before the pack)
+    int              kt_g;      // KT / VT == SA_T_GEN (the generic tier): the ggml types of K and V (sa_any_elem)
+    int              vt_g;
 };
 
 typedef void (*sa_g4_kernel_t)(const sa_g4_args);
@@ -76,8 +78,16 @@ extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_bf16[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q8_0[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q4_0[];
 
+// waves per EU the register allocator targets: 8 (192 VGPRs) for every instance but the generic tier's direct-V GQA 12
+// one, which spills at that budget (W5 resource checks: 1 spilled VGPR, 8 B scratch, with the conversions already moved
+// past the barriers) and gets 7 (it then allocates 209 VGPRs, no scratch), one wave of occupancy less on that instance only
+template <int KT, int VL, int GQA>
+static constexpr int sa_g4_waves_per_eu() {
+    return KT == SA_T_GEN && VL == SA_V_SPLITGATHER && GQA == 12 ? 7 : 8;
+}
+
 template <int KT, int VT, int VL, int EPI, int GQA>
-__global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8))) sa_attend_g4(const sa_g4_args a) {
+__global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_waves_per_eu<KT, VL, GQA>()))) sa_attend_g4(const sa_g4_args a) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     GGML_UNUSED(a);
     NO_DEVICE_CODE;
@@ -181,12 +191,23 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8))) s
         if (!kon) {
             return;
         }
-        sa_piece_load<KT>(kbase + (size_t) (4*b[r >> 2] + (r & 3)) * a.k_nb1, w, hi, kr);
+        if constexpr (KT == SA_T_GEN) {
+            // the generic tier defers the load and the runtime-switch conversion to k_fin (after the barriers, when the
+            // score fragments are dead): converting here, with the scores and the direct-V raw elements live, spilled
+            // the GQA 12 instances (W5 resource checks). kr[0] carries the cell
+            kr[0] = 4*b[r >> 2] + (r & 3);
+        } else {
+            sa_piece_load<KT>(kbase + (size_t) (4*b[r >> 2] + (r & 3)) * a.k_nb1, w, hi, kr);
+        }
     };
     auto k_fin = [&](const uint32_t * kr, const bool kon, sa_v16s * kf) {
         uint32_t o[8];
         if (kon) {
-            sa_piece_cvt<KT>(kr, w, o);
+            if constexpr (KT == SA_T_GEN) {
+                sa_any_piece(a.kt_g, kbase + (size_t) kr[0] * a.k_nb1, w, hi, o);
+            } else {
+                sa_piece_cvt<KT>(kr, w, o);
+            }
         } else {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
@@ -211,6 +232,11 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8))) s
 
     // ---- V: split-gather (direct): raw elements before barrier 2, conversion + exchange after ----
     auto v_raw = [&](const uint32_t * b, uint32_t * vr) {
+        if constexpr (VT == SA_T_GEN) {   // the generic tier gathers and converts after the barriers (v_fin)
+            GGML_UNUSED(b);
+            GGML_UNUSED(vr);
+            return;
+        }
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
 #pragma unroll
@@ -219,11 +245,21 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8))) s
             }
         }
     };
-    auto v_fin = [&](const uint32_t * vr, const uint32_t m01, const uint32_t m23, sa_v16s * vf) {
+    auto v_fin = [&](const uint32_t * vr, const uint32_t * b, const uint32_t m01, const uint32_t m23, sa_v16s * vf) {
         uint32_t o[8];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const uint2 v = make_uint2(sa_gather_pair<VT>(vr[4*j + 0], vr[4*j + 1]), sa_gather_pair<VT>(vr[4*j + 2], vr[4*j + 3]));
+            uint2 v;
+            if constexpr (VT == SA_T_GEN) {
+                // the generic tier gathers and converts here, after the barriers and one entry at a time: converting the
+                // 16 elements before the barriers (as the S_fast raw gather does) spilled the GQA 12 instance (W5 resource
+                // checks)
+                GGML_UNUSED(vr);
+                v = sa_any_quad4(a.vt_g, vbase, a.v_nb1, b[j], 32*w + 16*hi + r);
+            } else {
+                GGML_UNUSED(b);
+                v = make_uint2(sa_gather_pair<VT>(vr[4*j + 0], vr[4*j + 1]), sa_gather_pair<VT>(vr[4*j + 2], vr[4*j + 3]));
+            }
             const uint2 mv = sa_mask_cells(v, entry_mask(m01, m23, j));
             o[2*j] = mv.x;
             o[2*j + 1] = mv.y;
@@ -401,7 +437,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8))) s
             }
         }
         if constexpr (!PACKED) {
-            v_fin(vr, m01, m23, vf);
+            v_fin(vr, b, m01, m23, vf);
         }
         // direct V: a non-finite V half in this wave's fragment (x * 0 + acc is NaN exactly then, one packed FMA per
         // dword). Packed V needs no check here: sa_pack_v already replaced every non-finite half by 0 and flagged its
@@ -512,10 +548,14 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8))) s
 }
 
 
-// one K / V element (dim d of a row) as its contract f16 value, widened to f32 (sparse-attn-q8.cuh conversions)
+// one K / V element (dim d of a row) as its contract f16 value, widened to f32 (sparse-attn-q8.cuh conversions; the
+// generic tier: sa_any_elem of the ggml type gt)
 template <int T>
-static __device__ __forceinline__ float sa_elem_f16(const char * row, const int d) {
-    if constexpr (T == SA_T_Q8_0) {
+static __device__ __forceinline__ float sa_elem_f16(const char * row, const int d, const int gt) {
+    (void) gt;
+    if constexpr (T == SA_T_GEN) {
+        return sa_h2f_bits(sa_any_elem(gt, row, d));
+    } else if constexpr (T == SA_T_Q8_0) {
         const char * blk = row + 34 * (d / 32);
         const _Float16 dh = __builtin_bit_cast(_Float16, *reinterpret_cast<const uint16_t *>(blk));
         return (float) ((_Float16) *reinterpret_cast<const int8_t *>(blk + 2 + d % 32) * dh);
@@ -584,7 +624,7 @@ __global__ void __launch_bounds__(256) sa_attend_fixup(const sa_g4_args a, const
                     continue;
                 }
                 const size_t cell = 4 * (size_t) gblk[e] + c;
-                float prod = qd * sa_elem_f16<KT>(kbase + cell * a.k_nb1, d);
+                float prod = qd * sa_elem_f16<KT>(kbase + cell * a.k_nb1, d, a.kt_g);
 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) {
                     prod += __shfl_xor(prod, o);
@@ -608,7 +648,7 @@ __global__ void __launch_bounds__(256) sa_attend_fixup(const sa_g4_args a, const
                 const float p  = expf(sc - mx);
                 const float ph = (float) __builtin_bit_cast(_Float16, sa_f2h(p));
                 l   += p;
-                acc += ph * sa_elem_f16<VT>(vbase + cell * a.v_nb1, d);
+                acc += ph * sa_elem_f16<VT>(vbase + cell * a.v_nb1, d, a.vt_g);
             }
         }
         float v = l > 0.f ? acc / l : 0.f;
@@ -635,5 +675,10 @@ extern const sa_fixup_kernel_t ggml_cuda_sa_fixup_kernels_f16[];
 extern const sa_fixup_kernel_t ggml_cuda_sa_fixup_kernels_bf16[];
 extern const sa_fixup_kernel_t ggml_cuda_sa_fixup_kernels_q8_0[];
 extern const sa_fixup_kernel_t ggml_cuda_sa_fixup_kernels_q4_0[];
+
+// the generic tier's G4 instances (sparse-attn-generic.cu, GGML_CUDA_SA_GEN_G4_INSTANCES of sparse-attn-census.h):
+// sa_attend_g4<SA_T_GEN, SA_T_GEN, VL, SA_EPI_PLAIN, GQA> at index vl * 3 + gqa_index, and its fixup
+extern const sa_g4_kernel_t ggml_cuda_sa_gen_g4_kernels[];
+extern const sa_fixup_kernel_t ggml_cuda_sa_gen_fixup_kernel;
 
 #endif // defined(GGML_USE_HIP)

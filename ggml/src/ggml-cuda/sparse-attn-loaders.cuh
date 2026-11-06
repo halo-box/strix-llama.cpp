@@ -21,6 +21,11 @@
 //                    fastest direct V at 262k / 1M for q8_0 / q4_0 (X+X 20.34 / 24.60 ms vs packed 23.18 / 37.32), 0
 //                    scratch with split K; for f16 / bf16 it is the direct V of the CAPPED trait (below)
 //
+// Generic tier (SA_T_GEN, PLAN-v3 §6.1 S_generic, sparse-attn-generic.cu): K and V of any type of S through the runtime
+// switch sa_any_piece / sa_any_quad4 / sa_any_elem below, which convert at load (the "raw" registers already hold f16
+// halves, so sa_piece_cvt and sa_gather_pair take the f16 branch for SA_T_GEN); the loader shapes (split K, split-gather
+// or packed V in the G4 attend; split K and LDS-staged V in the G1 attend) are the S_fast ones.
+//
 // V pack-limit trait (D8, OWNER decision 2026-11-05, AT-O deferred): SA_VPACK_CAPPED = packed iff n_kv < 64 * n_q, else
 // direct (PR #219's n_q * 64 < n_kv switch, C18 decision 3); SA_VPACK_ALWAYS = packed at every n_kv (the owner's
 // alternative for f16 / bf16: +512 / +1024 MiB at c524288 / c1M, R1-C). Changing a type's row of sa_vpack_trait is the
@@ -29,6 +34,8 @@
 #include <cstdint>
 #include <cstddef>
 
+#include "ggml.h"
+
 // the type ids of the WMMA tiers (S_fast, PLAN-v3 §6.1); also the order of the census keys
 enum sa_type_id {
     SA_T_F16  = 0,
@@ -36,6 +43,10 @@ enum sa_type_id {
     SA_T_Q8_0 = 2,
     SA_T_Q4_0 = 3,
     SA_T_COUNT,
+    // the generic tier (PLAN-v3 §6.1 S_generic, §6.2 sparse-attn-generic.cu): one instance for every K / V type of S, the
+    // ggml type a runtime kernel argument (sa_g4_args / sa_g1_args kt_g, vt_g) and every element converted by the runtime
+    // switch of sa_any_elem / sa_any_piece below
+    SA_T_GEN  = 8,
 };
 
 enum sa_k_loader { SA_K_DIRECT = 0, SA_K_SPLIT = 1 };
@@ -47,6 +58,7 @@ enum sa_vpack    { SA_VPACK_CAPPED = 0, SA_VPACK_ALWAYS = 1 };
 #define SA_TID_bf16    SA_T_BF16
 #define SA_TID_q8_0    SA_T_Q8_0
 #define SA_TID_q4_0    SA_T_Q4_0
+#define SA_TID_generic SA_T_GEN
 #define SA_VL_packed   SA_V_PACKED
 #define SA_VL_direct   SA_V_SPLITGATHER
 #define SA_EPI_plain   SA_EPI_PLAIN
@@ -76,6 +88,146 @@ static constexpr int sa_block_bytes(const int t) {
 #if defined(GGML_USE_HIP)
 
 #include "sparse-attn-q8.cuh"
+
+// ---- the generic tier's loader: one K / V element of any type of S (PLAN-v3 §6.1) as its contract f16 bits ----
+// The value is the CPU op's (ggml-cpu/sparse-attn.cpp sa_load_row): the type's to_float, then one RNE rounding to f16
+// (+-inf past the f16 range). Each case computes to_float exactly as ggml-quants.c does in f32 and rounds once:
+//   f16 the stored half; bf16 widened (exact) then RNE; f32 RNE;
+//   q8_0 q * d, q4_0 (q - 8) * d, q5_0 (q - 16) * d, iq4_nl kvalues_iq4nl[q] * d: the f32 product is exact (at most
+//        8 + 11 significant bits), so its RNE to f16 is the one rounding of the CPU's (and equals sa_q8x2_to_h2 /
+//        sa_q4x2_to_h2, which round the same exact product in half arithmetic);
+//   q4_1 q * d + m, q5_1 q * d + m: q * d is exact in f32, so fmaf and the CPU's mul-then-add give the same f32 value
+//        (one rounding of q * d + m), then RNE to f16.
+// Block layouts (ggml-common.h): q8_0 {d, qs[32]} 34 B; q4_0 / iq4_nl {d, qs[16]} 18 B; q4_1 {d, m, qs[16]} 20 B;
+// q5_0 {d, qh[4], qs[16]} 22 B; q5_1 {d, m, qh[4], qs[16]} 24 B. Element j of a 32-block: nibble qs[j & 15] low (j < 16)
+// or high (j >= 16), fifth bit (q5) bit j of qh (ggml-quants.c dequantize_row_q5_0: xh_1 = (qh >> (j + 12)) & 0x10 is
+// bit j + 16). Only 2-byte loads are used for the halves (blocks of 18 / 22 bytes are 2-byte aligned).
+
+static __device__ __forceinline__ float sa_h2f_bits(const uint16_t h) {
+    return (float) __builtin_bit_cast(_Float16, h);
+}
+
+static __device__ __forceinline__ uint16_t sa_ld_u16(const char * p) {
+    return *reinterpret_cast<const uint16_t *>(p);
+}
+
+// nibble of element j (0..31) of a 32-block whose qs start at qs
+static __device__ __forceinline__ int sa_nib(const char * qs, const int j) {
+    const uint8_t b = *reinterpret_cast<const uint8_t *>(qs + (j & 15));
+    return j < 16 ? (b & 15) : (b >> 4);
+}
+
+// fifth bit of element j of a q5 block whose qh start at qh
+static __device__ __forceinline__ int sa_q5_hbit(const char * qh, const int j) {
+    return (*reinterpret_cast<const uint8_t *>(qh + (j >> 3)) >> (j & 7)) & 1;
+}
+
+// kvalues_iq4nl[n] (ggml-common.h): -127 -104 -83 -65 -49 -35 -22 -10 1 13 25 38 53 69 89 113, packed into two words
+static __device__ __forceinline__ int sa_iq4nl_value(const int n) {
+    const uint64_t lo = 0xF6EADDCFBFAD9881ULL;   // n = 0..7  : -127, -104, -83, -65, -49, -35, -22, -10 (bytes, little-endian)
+    const uint64_t hi = 0x7159453526190D01ULL;   // n = 8..15 : 1, 13, 25, 38, 53, 69, 89, 113
+    return (int) (int8_t) (uint8_t) (((n < 8 ? lo : hi) >> (8 * (n & 7))) & 0xffu);
+}
+
+template <int GT>
+static __device__ __forceinline__ uint16_t sa_elem_t(const char * row, const int d) {
+    if constexpr (GT == GGML_TYPE_F16) {
+        return sa_ld_u16(row + 2 * d);
+    } else if constexpr (GT == GGML_TYPE_BF16) {
+        return sa_bf1_to_h(sa_ld_u16(row + 2 * d));
+    } else if constexpr (GT == GGML_TYPE_F32) {
+        return sa_f2h(*reinterpret_cast<const float *>(row + 4 * d));
+    } else if constexpr (GT == GGML_TYPE_Q8_0) {
+        const char * b = row + 34 * (d >> 5);
+        return sa_f2h((float) *reinterpret_cast<const int8_t *>(b + 2 + (d & 31)) * sa_h2f_bits(sa_ld_u16(b)));
+    } else if constexpr (GT == GGML_TYPE_Q4_0) {
+        const char * b = row + 18 * (d >> 5);
+        return sa_f2h((float) (sa_nib(b + 2, d & 31) - 8) * sa_h2f_bits(sa_ld_u16(b)));
+    } else if constexpr (GT == GGML_TYPE_Q4_1) {
+        const char * b = row + 20 * (d >> 5);
+        return sa_f2h(fmaf((float) sa_nib(b + 4, d & 31), sa_h2f_bits(sa_ld_u16(b)), sa_h2f_bits(sa_ld_u16(b + 2))));
+    } else if constexpr (GT == GGML_TYPE_Q5_0) {
+        const char * b = row + 22 * (d >> 5);
+        const int j = d & 31;
+        return sa_f2h((float) ((sa_nib(b + 6, j) | (sa_q5_hbit(b + 2, j) << 4)) - 16) * sa_h2f_bits(sa_ld_u16(b)));
+    } else if constexpr (GT == GGML_TYPE_Q5_1) {
+        const char * b = row + 24 * (d >> 5);
+        const int j = d & 31;
+        return sa_f2h(fmaf((float) (sa_nib(b + 8, j) | (sa_q5_hbit(b + 4, j) << 4)), sa_h2f_bits(sa_ld_u16(b)), sa_h2f_bits(sa_ld_u16(b + 2))));
+    } else {
+        static_assert(GT == GGML_TYPE_IQ4_NL, "sa_elem_t: type outside S");
+        const char * b = row + 18 * (d >> 5);
+        return sa_f2h((float) sa_iq4nl_value(sa_nib(b + 2, d & 31)) * sa_h2f_bits(sa_ld_u16(b)));
+    }
+}
+
+// the types of S (PLAN-v3 §6.1), the cases of every runtime switch below
+#define SA_ANY_TYPES(X)       \
+    X(GGML_TYPE_F16)          \
+    X(GGML_TYPE_BF16)         \
+    X(GGML_TYPE_F32)          \
+    X(GGML_TYPE_Q8_0)         \
+    X(GGML_TYPE_Q4_0)         \
+    X(GGML_TYPE_Q4_1)         \
+    X(GGML_TYPE_Q5_0)         \
+    X(GGML_TYPE_Q5_1)         \
+    X(GGML_TYPE_IQ4_NL)
+
+// one element (dim d) of a row of ggml type gt, f16 bits; gt is uniform over the launch (a kernel argument), so the switch
+// is a scalar branch. A type outside S cannot reach a kernel (supports_op), it gives a NaN
+static __device__ __forceinline__ uint16_t sa_any_elem(const int gt, const char * row, const int d) {
+    switch (gt) {
+#define SA_ANY_ELEM_CASE(T) case T: return sa_elem_t<T>(row, d);
+        SA_ANY_TYPES(SA_ANY_ELEM_CASE)
+#undef SA_ANY_ELEM_CASE
+        default: return 0x7e00u;
+    }
+}
+
+// piece p (dims 8p..8p+7 and 16+8p..16+8p+7) of block w (dims 32w..32w+31) of a row of type gt, as the f16 dwords of
+// sa_piece_cvt's output: out[0..3] = dims 32w+8p.., out[4..7] = dims 32w+16+8p.. (low half = the lower dim)
+template <int GT>
+static __device__ __forceinline__ void sa_piece_t(const char * row, const int w, const int p, uint32_t * out) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int d0 = 32 * w + 8 * p + 2 * i;
+        out[i]     = (uint32_t) sa_elem_t<GT>(row, d0)      | ((uint32_t) sa_elem_t<GT>(row, d0 + 1)  << 16);
+        out[4 + i] = (uint32_t) sa_elem_t<GT>(row, d0 + 16) | ((uint32_t) sa_elem_t<GT>(row, d0 + 17) << 16);
+    }
+}
+
+static __device__ __forceinline__ void sa_any_piece(const int gt, const char * row, const int w, const int p, uint32_t * out) {
+    switch (gt) {
+#define SA_ANY_PIECE_CASE(T) case T: sa_piece_t<T>(row, w, p, out); return;
+        SA_ANY_TYPES(SA_ANY_PIECE_CASE)
+#undef SA_ANY_PIECE_CASE
+        default:
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                out[i] = 0x7e007e00u;
+            }
+            return;
+    }
+}
+
+// the direct-V gather of the generic tier: element d of the 4 cells 4 * quad + c (c < 4) of one plan entry as two dwords of
+// f16 halves (cell c in half c), the layout sa_mask_cells takes
+template <int GT>
+static __device__ __forceinline__ uint2 sa_quad4_t(const char * base, const size_t nb1, const uint32_t quad, const int d) {
+    const char * row = base + (size_t) (4 * quad) * nb1;
+    const uint32_t h0 = sa_elem_t<GT>(row, d), h1 = sa_elem_t<GT>(row + nb1, d);
+    const uint32_t h2 = sa_elem_t<GT>(row + 2 * nb1, d), h3 = sa_elem_t<GT>(row + 3 * nb1, d);
+    return make_uint2(h0 | (h1 << 16), h2 | (h3 << 16));
+}
+
+static __device__ __forceinline__ uint2 sa_any_quad4(const int gt, const char * base, const size_t nb1, const uint32_t quad, const int d) {
+    switch (gt) {
+#define SA_ANY_QUAD4_CASE(T) case T: return sa_quad4_t<T>(base, nb1, quad, d);
+        SA_ANY_TYPES(SA_ANY_QUAD4_CASE)
+#undef SA_ANY_QUAD4_CASE
+        default: return make_uint2(0x7e007e00u, 0x7e007e00u);
+    }
+}
 
 // value of lane i ^ 16
 static __device__ __forceinline__ uint32_t sa_xchg16(const uint32_t x) {

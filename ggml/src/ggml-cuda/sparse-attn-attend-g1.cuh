@@ -13,6 +13,8 @@
 //   - the cells come from the ggml.h G = 1 plan (one group per query: ascending quads, mask bits 0..3) instead of the PR's
 //     atomicCAS-deduplicated index rows, so the visit order is the plan's ascending cell order and the output is a
 //     function of the op's inputs (the PR's dedup kept a racing occurrence: R2-BOP, up to 18 distinct unique-id sets);
+//   - the generic tier (KT = VT = SA_T_GEN, sparse-attn-generic.cu): K split and V staged as above, every element
+//     converted at load by the runtime switch of sa_any_piece (sparse-attn-loaders.cuh) over the ggml types kt_g / vt_g;
 //   - rows = the GQA query heads of one kv head (GQA in {4, 8, 12}, padded to the 16 WMMA rows with zero q), streams and
 //     kv heads on grid.x (x = (stream, query, kv head), kv head fastest; y = split);
 //   - the op contract (ggml.h): q * scale in f32, then f16 (the PR rounded q and scale to f16 first);
@@ -106,9 +108,14 @@ struct sa_g1_args {
     float            scale;
     float *          out;       // splits == 1: dst F32 [256, n_head, n_q, n_stream]
     float *          partial;   // splits > 1: [n_stream][n_q][n_head][splits][258]
+    int              kt_g;      // KT / VT == SA_T_GEN (the generic tier): the ggml types of K and V (sa_any_elem)
+    int              vt_g;
 };
 
 typedef void (*sa_g1_kernel_t)(const sa_g1_args);
+
+// the generic tier's G1 instances (sparse-attn-generic.cu): sa_attend_g1<SA_T_GEN, SA_T_GEN, GQA> at index gqa_index
+extern const sa_g1_kernel_t ggml_cuda_sa_gen_g1_kernels[];
 
 template <int KT, int VT, int GQA>
 __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
@@ -205,9 +212,13 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
             const int key = cell_of(r);
             uint32_t o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             if (key >= 0) {
-                uint32_t raw[sa_piece<KT>::N];
-                sa_piece_load<KT>(kb_ + (size_t) key * a.k_nb1, w, hi, raw);
-                sa_piece_cvt<KT>(raw, w, o);
+                if constexpr (KT == SA_T_GEN) {   // the generic tier: converted at load (runtime type)
+                    sa_any_piece(a.kt_g, kb_ + (size_t) key * a.k_nb1, w, hi, o);
+                } else {
+                    uint32_t raw[sa_piece<KT>::N];
+                    sa_piece_load<KT>(kb_ + (size_t) key * a.k_nb1, w, hi, raw);
+                    sa_piece_cvt<KT>(raw, w, o);
+                }
             }
             uint32_t x[8];
 #pragma unroll
@@ -277,9 +288,13 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
             const int key = cell_of(kk);
             uint32_t o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             if (key >= 0) {
-                uint32_t raw[sa_piece<VT>::N];
-                sa_piece_load<VT>(vb_ + (size_t) key * a.v_nb1, w, p, raw);
-                sa_piece_cvt<VT>(raw, w, o);
+                if constexpr (VT == SA_T_GEN) {
+                    sa_any_piece(a.vt_g, vb_ + (size_t) key * a.v_nb1, w, p, o);
+                } else {
+                    uint32_t raw[sa_piece<VT>::N];
+                    sa_piece_load<VT>(vb_ + (size_t) key * a.v_nb1, w, p, raw);
+                    sa_piece_cvt<VT>(raw, w, o);
+                }
             }
             const int kh = (kk >> 3) ^ p, koff = (kk & 7) * 2;
             char * b0 = tile + 256 * p + (kh << 4) + koff;
