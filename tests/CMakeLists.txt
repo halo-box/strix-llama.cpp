@@ -169,6 +169,8 @@ endif ()
 llama_build_and_test(test-qsa-prefix.cpp)
 llama_build_and_test(test-qsa-fast.cpp)
 llama_build_and_test(test-qsa-recover.cpp)
+# the all-visible rows of the QSA shortcut (PLAN-v3 §14.1), on every backend of the build
+llama_build_and_test(test-qsa-allvis-rows.cpp)
 llama_build_and_test(test-ple-disk.cpp)
 llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
 # llama_context state tests: KV and recurrent state save, load, copy, rollback
@@ -418,6 +420,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-sparse-attn-plan-oracle.cpp LINK ggml)
     # Vulkan checks of the two ops: limits, capability gates, rotation against fwht.comp, the workspace sync rule (skips without Vulkan)
     llama_build_and_test(test-sparse-attn-vk.cpp LINK ggml)
+    # the QSA placement guard (PLAN-v3 §10): needs a qwen4exp model on the command line (fake GPU device, forced reject, non-vacuity)
+    llama_build(test-qsa-guard.cpp LINK llama ggml)
+    # census rows from the shipped policy, for scripts/qsa-validation/census_check.py (PLAN-v3 §14.3)
+    llama_build(test-qsa-select-dump.cpp LINK ggml)
     llama_build_and_test(test-backend-sched-ring.cpp)
 endif()
 
