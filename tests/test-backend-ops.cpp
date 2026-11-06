@@ -13572,6 +13572,14 @@ struct test_sparse_attn_plan : public test_case {
 // scripts/qsa-validation/summaries/w3_prband.md): the mix / empty / poison rows of n_sel <= 257 reach p100 3.899e-9
 // (66 x 257 poison q8_0), the n_sel 2051 rows 1.206e-9 (129 x 2051 blocks q8_0). The PR rows alone set the old 1.21e-9,
 // which the PR kernel itself exceeds on the other row patterns (R2-BOP measured G4 on PR rows only).
+// G1 (census key sa_attend/G1/<KT>/<VT>/splits<class>/...: the class's first split count): the R2-BOP UNI rows of
+// PLAN-v3 §14.2 (a) (2 x p100 of the PR-verbatim qsa_decode_wmma_partial + qsa_decode_merge, f16 and q8_0, 3 seeds),
+// which hold over the W4 case list's own inputs as well (88 G1 dumps through R2-BOP's bands_dec TBO mode: every class's
+// 2 x p100 below its UNI row); the classes 6-16 and > 33, which R2-BOP did not reach, measured in W4 with the same
+// harness: 6-16 = 2 x 7.90e-8 (UNI 32 x 2051 x 8192, 9 splits; 8 UNI shapes x 2 types x 3 seeds, max over the TBO dumps
+// 5.54e-8), > 33 = 2 x 8.44e-8 (TBO 1 x 4096 x 16384 f16, 64 splits; UNI max 7.77e-8 over 4 shapes x 2 types x 3 seeds).
+// Planted defects (R2-BOP d1 / d2 / d3) exceed 12.3 x p100 in both (W4 summary scripts/qsa-validation/summaries/
+// w4_bands.md).
 static double sa_band_row(int G, int splits, int64_t n_sel) {
     const bool big = n_sel > 257;
     if (G == 4) {
@@ -13583,10 +13591,14 @@ static double sa_band_row(int G, int splits, int64_t n_sel) {
     if (splits <= 5) {
         return big ? 1.56e-7 : 1.34e-7;
     }
-    if (splits >= 17 && splits <= 33 && big) {
-        return 1.71e-7;
+    // n_sel <= 257 cannot give more than 5 splits (sa_g1_splits: ceil(257 / 64) = 5 at n_q <= 8, fewer above)
+    if (splits <= 16) {
+        return big ? 1.58e-7 : -1.0;
     }
-    return -1.0;   // splits 6-16 and > 33: no row yet (measured on the PR-verbatim decode before it is gated, W4)
+    if (splits <= 33) {
+        return big ? 1.71e-7 : -1.0;
+    }
+    return big ? 1.69e-7 : -1.0;
 }
 
 // the class of the attend dispatches the census counted since the reset: keys "sa_attend/G4/..." and
@@ -13690,7 +13702,7 @@ struct test_sparse_attn : public test_case {
                                        (size_t) (D / ggml_blck_size(type_v)) * ggml_type_size(type_v) * kv_rows * n_head_kv * n_stream);
     }
 
-    std::vector<std::string> census_families() override { return { "sa_attend/", "sa_fixup/", "sa_pack/" }; }
+    std::vector<std::string> census_families() override { return { "sa_attend/", "sa_fixup/", "sa_pack/", "sa_merge" }; }
 
     // GGML_SA_TEST_REPORT=1: one SA_REPORT line per compared output (backend, case, census class, band, NMSE, and the f64
     // errors of PLAN-v3 §3: max|out - ref| / max|ref| against O_C18 and O_PLAN on up to 16 queries per stream, reported only)
@@ -13725,8 +13737,10 @@ struct test_sparse_attn : public test_case {
     void dump_tbo(const float * a, const float * b, size_t n) {
         const char * dir = getenv("GGML_SA_TEST_DUMP");
         const bool fmt = (type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_Q8_0) && (type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_Q8_0);
+        // GGML_SA_TEST_DUMP_MAX_KV (default 65536): larger caches are not dumped (a 2^21-cell f16 dump is 4 GiB)
+        const int64_t max_kv = getenv("GGML_SA_TEST_DUMP_MAX_KV") ? atoll(getenv("GGML_SA_TEST_DUMP_MAX_KV")) : 65536;
         if (dir == nullptr || gqa != 12 || n_head_kv != 2 || n_stream != 1 || D != 256 || n_kv % 4 != 0 || !fmt ||
-            n != (size_t) (n_q * 24 * 256)) {
+            n != (size_t) (n_q * 24 * 256) || n_kv > max_kv) {
             return;
         }
         static int seq = 0;
@@ -14403,6 +14417,49 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
             }
         }
     }
+
+    // ---- the G1 attend (PLAN-v3 §13 W4) ----
+    // the W4 n_q set x 1 / 2 streams x every S_fast type: n_kv 8192, n_sel 2051, so the shape-only split count
+    // (sa_g1_splits: PR #219's decode rule) walks 33 (n_q 1-8), 26 (9), 5 (64, 65), 4 (66), 3 (127), 2 (263); K/V layouts
+    // alternating
+    {
+        int alt = 0;
+        for (int64_t nq : {1, 2, 4, 8, 9, 64, 65, 66, 127, 263}) {
+            for (int ns : {1, 2}) {
+                for (ggml_type t : S_fast) {
+                    test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, 1, SA_ROWS_MIX, 12, ns, 0, 0, alt++ % 2));
+                }
+            }
+        }
+    }
+    // every compiled G1 census key (sparse-attn-census.h: S_fast^2 x GQA {4, 8, 12} x the 5 split classes): n_q 1,
+    // n_kv 16384, n_sel 17 / 257 / 513 / 2051 / 4096 -> 1 / 5 / 9 / 33 / 64 splits
+    {
+        int alt = 0;
+        for (ggml_type tk : S_fast) {
+            for (ggml_type tv : S_fast) {
+                for (int gqa : {4, 8, 12}) {
+                    for (int64_t ns : {17, 257, 513, 2051, 4096}) {
+                        test_cases.emplace_back(new test_sparse_attn(tk, tv, 1, 16384, ns, 1, SA_ROWS_MIX, gqa, 1, 0, 0, alt++ % 2));
+                    }
+                }
+            }
+        }
+    }
+    // complete quads (the CB rows of a fresh cache, C5: qpb 1.001) at the decode and ub64 shapes
+    for (ggml_type t : S_fast) {
+        for (int64_t nq : {1, 64}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 65536, 2051, 1, SA_ROWS_BLOCKS));
+    }
+    // the ported #219 shapes PR219 ran through qsa_decode (R2-BOP route census: every same-type case with n_q <= 512)
+    // whose G4 variant is listed above: their G1 variants, so U34 gates the G1 kernel on every one of them
+    for (ggml_type t : {F16, Q8}) {
+        test_cases.emplace_back(new test_sparse_attn(t, t, 512, 4096, 257,  1, SA_ROWS_PR));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 512, 4096, 2051, 1, SA_ROWS_PR));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 129, 4096, 257,  1, SA_ROWS_PR));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 130, 32768, 2051, 1, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 7000));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 200, 65536, 2051, 1, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 15000));
+    }
+    test_cases.emplace_back(new test_sparse_attn(F16, F16, 130, 270336, 2051, 1, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 66000));
 
     // ---- gate fusion (test_sparse_attn_gated, PLAN-v3 §14.1): every EPI = gated G4 instance (S_fast pair x V regime x
     //      GQA), the MMB reader paths (BF16 copy with and without the F32 store, F16 copy for a dense-R2 Q8_0 weight),
@@ -19481,9 +19538,12 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                 for (const std::string & f : census_families_run) {
                     fam += (fam.empty() ? "" : ",") + f;
                 }
+                // a -p filter selects a subset of the cases, which cannot reach every key: reported, not gated
+                const bool gated = params_filter == nullptr;
                 printf("  CENSUS COVERAGE: %s: %zu/%zu compiled keys of {%s} launched (%zu excluded by a forcing switch): %s\n",
-                       ggml_backend_name(backend), n_keys - n_missing, n_keys, fam.c_str(), n_skipped, n_missing == 0 ? "OK" : "FAIL");
-                census_ok = n_missing == 0;
+                       ggml_backend_name(backend), n_keys - n_missing, n_keys, fam.c_str(), n_skipped,
+                       n_missing == 0 ? "OK" : gated ? "FAIL" : "not gated (-p filter)");
+                census_ok = n_missing == 0 || !gated;
             }
         }
 
