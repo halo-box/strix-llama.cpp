@@ -239,6 +239,16 @@ extern "C" {
     // dense-shortcut range
     typedef bool    (*ggml_backend_sparse_attn_prefer_dense_t)(ggml_backend_dev_t dev, enum ggml_type type_k,
                                                                enum ggml_type type_v, int64_t n_q, int64_t n_kv);
+    // "ggml_backend_sparse_attn_unsupported_reason": why supports_op is false for this SPARSE_ATTN / SPARSE_ATTN_PLAN node on
+    // dev, for the init error (NULL when it is supported). Without the proc: the backend has no sparse-attention kernel.
+    // A reason that names a K / V type problem starts with "type pair".
+    typedef const char * (*ggml_backend_sparse_attn_unsupported_reason_t)(ggml_backend_dev_t dev, const struct ggml_tensor * op);
+    // "ggml_backend_sparse_attn_select_dump" (test only, PLAN-v3 §14.3): the census keys one executed SPARSE_ATTN_PLAN + SPARSE_ATTN
+    // pair of this shape launches, space separated, each as key[*launches], from the shipped selection logic. gated = the
+    // gate fusion takes this attend when its instance exists. Returns the full length; buf gets it NUL-terminated.
+    typedef size_t  (*ggml_backend_sparse_attn_select_dump_t)(ggml_backend_dev_t dev, int64_t n_q_per_stream, int64_t n_kv, int64_t n_stream,
+                                                              int64_t n_sel, enum ggml_type type_k, enum ggml_type type_v, int64_t n_head,
+                                                              int64_t n_head_kv, int32_t group, bool gated, char * buf, size_t size);
 
     //
     // Backend registry

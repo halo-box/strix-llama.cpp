@@ -29,6 +29,14 @@ void   ggml_cuda_sparse_attn_gated(ggml_backend_cuda_context & ctx, ggml_tensor 
 // why this process never dispatches census key `key` (or a key under the prefix `key`) on HIP device `device` (-1: any
 // device): a forcing switch excludes it, or the device's arch runs another tier; nullptr when it can be dispatched
 const char * ggml_cuda_sparse_attn_census_skip(int device, const char * key);
+
+// why ggml_cuda_sparse_attn_supported / _plan_supported is false for op, NULL when it is true (the init error, PLAN-v3 §10).
+// GGML_CUDA_SA_REJECT=1 (test hook, read at every call) makes both ops unsupported, for the guard test on a real HIP build
+const char * ggml_cuda_sparse_attn_unsupported_reason(int device, const ggml_tensor * op);
+bool ggml_cuda_sparse_attn_force_reject(void);
+// the census keys of one executed plan + attend of this shape, from sa_select (ggml_backend_sparse_attn_select_dump_t)
+size_t ggml_cuda_sparse_attn_select_dump(int device, int64_t n_q, int64_t n_kv, int64_t n_stream, int64_t n_sel, ggml_type type_k, ggml_type type_v,
+                                         int64_t n_head, int64_t n_head_kv, int32_t group, bool gated, char * buf, size_t size);
 // the workspace this node uses: [dst->data + *offset, + *bytes) (the fusion overlap check)
 void   ggml_cuda_sparse_attn_ws_range(int device, const ggml_tensor * op, size_t * offset, size_t * bytes);
 
