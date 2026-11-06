@@ -1381,6 +1381,10 @@ struct test_case {
     virtual bool expected_unsupported(const char * backend_name) { GGML_UNUSED(backend_name); return false; }
     // the weight-context tensors end at the end of their buffer (no post-graph sentinel after them)
     virtual bool weights_end_at_buffer_end() { return false; }
+    // suite-level dispatch census (PLAN-v3 §14.1): the key families ("sa_attend/", ...) of the backend census that this
+    // case dispatches. After every such case the driver adds the case's census counts to a suite total, and at the end
+    // of the run every compiled key of those families (ggml_backend_debug_dispatch_census_list) must have been launched
+    virtual std::vector<std::string> census_families() { return {}; }
 
     // nodes the scheduler runs on the second backend: backend1 then computes in several splits, as llama does
     // (needs use_scheduler_allocation(); the nodes to compare must be graph outputs)
@@ -13508,6 +13512,7 @@ struct test_sparse_attn_plan : public test_case {
     bool expected_unsupported(const char * backend_name) override {
         return sa_expected_unsupported(backend_name, group, 0, 0);
     }
+    std::vector<std::string> census_families() override { return { "sa_plan/" }; }
     // engagement (GPU backends): the compare ran exactly one "sa_plan/G<group>" dispatch and none of the other group
     // (census keys of PLAN-v3 §6.2); required under --fail-unsupported or GGML_SA_TEST_REQUIRE_CENSUS=1
     bool checks_engagement() override { return true; }
@@ -13561,10 +13566,16 @@ struct test_sparse_attn_plan : public test_case {
 
 // NMSE bands of PLAN-v3 §14.2 (a), k = 2 (2 x p100 on PR-verbatim kernels), by the class the dispatch census reports:
 // (G, split count, n_sel bucket). Returns a negative value for a class without a row.
+// G4: 2 x p100 of the PR-verbatim qsa3_attn_kernel (V0 and VD, bitwise equal) against O_CON over the R2-BOP inputs
+// (PR cell formula rows: 2.04e-9 / 1.21e-9) and over the W3 case list's own inputs (2 x 40 dumps of the f16 / q8_0
+// GQA-12 cases from two test-backend-ops runs, GGML_SA_TEST_DUMP, run through R2-BOP's bands_attn TBO mode; W3 summary
+// scripts/qsa-validation/summaries/w3_prband.md): the mix / empty / poison rows of n_sel <= 257 reach p100 3.899e-9
+// (66 x 257 poison q8_0), the n_sel 2051 rows 1.206e-9 (129 x 2051 blocks q8_0). The PR rows alone set the old 1.21e-9,
+// which the PR kernel itself exceeds on the other row patterns (R2-BOP measured G4 on PR rows only).
 static double sa_band_row(int G, int splits, int64_t n_sel) {
     const bool big = n_sel > 257;
     if (G == 4) {
-        return big ? 2.04e-9 : 1.21e-9;
+        return big ? 2.41e-9 : 7.80e-9;
     }
     if (splits <= 1) {
         return n_sel <= 17 ? 5.02e-8 : big ? 1.23e-7 : 1.07e-7;
@@ -13581,7 +13592,19 @@ static double sa_band_row(int G, int splits, int64_t n_sel) {
 // the class of the attend dispatches the census counted since the reset: keys "sa_attend/G4/..." and
 // "sa_attend/G1/.../splits<n>" (PLAN-v3 §6.2), listed by the census proc ggml_backend_debug_dispatch_census_list
 // (a NULL-terminated array of every compiled key). Returns a negative band when the class cannot be determined.
+// §14.2 (c) type spread: a K/V pair without its own row takes the row of its class times the measured spread (R1-A (1):
+// x1.12 at prefill (G4) and at decode n_q 512, x1.9 at decode n_q 1; the rows were measured on f16 and q8_0 pairs, which
+// differ by <= x1.06, R2-BOP)
+static double sa_type_spread(ggml_type tk, ggml_type tv, int G, int64_t n_q) {
+    const bool measured = tk == tv && (tk == GGML_TYPE_F16 || tk == GGML_TYPE_Q8_0);
+    if (measured) {
+        return 1.0;
+    }
+    return G == 4 || n_q > 1 ? 1.12 : 1.9;
+}
+
 static double sa_band_for_backend(ggml_backend_t backend, int64_t n_sel, std::string & cls) {
+    cls.clear();
     typedef const char * const * (*census_list_t)(void);
     auto list = (census_list_t) census_proc(backend, "ggml_backend_debug_dispatch_census_list");
     if (!list || census_proc(backend, "ggml_backend_debug_dispatch_census_count") == nullptr) {
@@ -13667,12 +13690,95 @@ struct test_sparse_attn : public test_case {
                                        (size_t) (D / ggml_blck_size(type_v)) * ggml_type_size(type_v) * kv_rows * n_head_kv * n_stream);
     }
 
+    std::vector<std::string> census_families() override { return { "sa_attend/", "sa_fixup/", "sa_pack/" }; }
+
+    // GGML_SA_TEST_REPORT=1: one SA_REPORT line per compared output (backend, case, census class, band, NMSE, and the f64
+    // errors of PLAN-v3 §3: max|out - ref| / max|ref| against O_C18 and O_PLAN on up to 16 queries per stream, reported only)
+    double last_nmse = -1.0, last_f64_c18 = -1.0, last_f64_plan = -1.0;
+    static bool report_on() {
+        static const bool on = getenv("GGML_SA_TEST_REPORT") != nullptr && atoi(getenv("GGML_SA_TEST_REPORT")) != 0;
+        return on;
+    }
+    void report_f64(const float * got) {
+        last_f64_c18 = last_f64_plan = -1.0;
+        if (!report_on()) {
+            return;
+        }
+        std::vector<int64_t> qs;
+        const int64_t nq_s = std::min<int64_t>(16, n_q);
+        for (int64_t j = 0; j < nq_s; ++j) {
+            qs.push_back(nq_s > 1 ? j * (n_q - 1) / (nq_s - 1) : 0);
+        }
+        const sa_ref::view qv = sa_host_view(q), kv = sa_host_view(k), vv = sa_host_view(v);
+        const std::vector<int32_t> rows = sa_read_rows(sel);
+        last_f64_c18  = sa_ref::f64_maxrel(qv, kv, vv, rows, n_sel, n_kv, scale, rot_q, rot_o, qs, got, sa_ref::O_C18);
+        last_f64_plan = sa_ref::f64_maxrel(qv, kv, vv, rows, n_sel, n_kv, scale, rot_q, rot_o, qs, got, sa_ref::O_PLAN);
+    }
+    virtual const char * report_tag() { return "SPARSE_ATTN"; }
+
+    // GGML_SA_TEST_DUMP=<dir>: the case's inputs and both outputs in the R2-BOP "TBO" dump format (bands_ref.h
+    // next_tbo: header {n_q, n_kv, n_sel, 12, 0, 0, type_k, type_v}, Q [n_q][24][256] f32, K / V [n_kv][2][row bytes],
+    // rows [n_q][n_sel] i32, out backend1, out CPU), so the PR-verbatim G4 kernel can be run on exactly these inputs
+    // (bands_attn TBO:<file>). Written for the shapes that format holds: GQA 12, 2 kv heads, 1 stream, f16 / q8_0 K and
+    // V, n_kv % 4 == 0. The rows are written canonical (valid cells ascending and unique, then -1): the plan of a row is
+    // a function of its cell set, and the PR union builder needs no duplicate handling on them.
+    void dump_tbo(const float * a, const float * b, size_t n) {
+        const char * dir = getenv("GGML_SA_TEST_DUMP");
+        const bool fmt = (type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_Q8_0) && (type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_Q8_0);
+        if (dir == nullptr || gqa != 12 || n_head_kv != 2 || n_stream != 1 || D != 256 || n_kv % 4 != 0 || !fmt ||
+            n != (size_t) (n_q * 24 * 256)) {
+            return;
+        }
+        static int seq = 0;
+        char fn[1024];
+        snprintf(fn, sizeof(fn), "%s/sa_%04d.bdmp", dir, seq++);
+        FILE * f = fopen(fn, "wb");
+        GGML_ASSERT(f);
+        const int32_t h[8] = { (int32_t) n_q, (int32_t) n_kv, (int32_t) n_sel, 12, 0, 0, (int32_t) type_k, (int32_t) type_v };
+        fwrite(h, 4, 8, f);
+        const sa_ref::view qv = sa_host_view(q), kv = sa_host_view(k), vv = sa_host_view(v);
+        for (int64_t i = 0; i < n_q; ++i) {
+            for (int64_t hh = 0; hh < 24; ++hh) {
+                fwrite(qv.row(i, hh, 0), 4, 256, f);
+            }
+        }
+        for (const sa_ref::view * t : { &kv, &vv }) {
+            const size_t rb = ggml_row_size(t->type, 256);
+            for (int64_t c = 0; c < n_kv; ++c) {
+                for (int64_t g = 0; g < 2; ++g) {
+                    fwrite(t->row(c, g, 0), 1, rb, f);
+                }
+            }
+        }
+        const std::vector<int32_t> rows = sa_read_rows(sel);
+        std::vector<int32_t> canon((size_t) (n_q * n_sel), -1), cells;
+        for (int64_t i = 0; i < n_q; ++i) {
+            sa_ref::row_cells(rows.data() + (size_t) (i * n_sel), n_sel, n_kv, cells);
+            std::copy(cells.begin(), cells.end(), canon.begin() + (size_t) (i * n_sel));
+        }
+        fwrite(canon.data(), 4, canon.size(), f);
+        fwrite(a, 4, n, f);
+        fwrite(b, 4, n, f);
+        fclose(f);
+        fprintf(stderr, "SA_DUMP %s %s\n", fn, vars().c_str());
+    }
+
     double max_nmse_err() override { return 0.0; }
     double max_err(ggml_backend_t backend) override {
         if (sa_is_cpu(backend)) {
-            return 0.0;   // the CPU op against itself: exact
+            band = 0.0;   // the CPU op against itself: exact
+        } else {
+            band = sa_band_for_backend(backend, n_sel, band_class);
+            if (band > 0) {
+                const int G = band_class.find("sa_attend/G4/") != std::string::npos ? 4 : 1;
+                band *= sa_type_spread(type_k, type_v, G, n_q);
+            }
         }
-        band = sa_band_for_backend(backend, n_sel, band_class);
+        if (report_on()) {
+            printf("SA_REPORT backend=%s case=%s(%s) class=%s band=%.3e nmse=%.3e ratio=%.3f f64_c18=%.3e f64_plan=%.3e\n",
+                   ggml_backend_name(backend), report_tag(), vars().c_str(), band_class.c_str(), band, last_nmse,
+                   band > 0 ? last_nmse / band : -1.0, last_f64_c18, last_f64_plan);
+        }
         return band;
     }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
@@ -13691,11 +13797,14 @@ struct test_sparse_attn : public test_case {
     }
 
     double err(const float * a, const float * b, size_t n) override {
+        dump_tbo(a, b, n);
+        report_f64(a);
         if (special != SA_OVERFLOW) {
-            const double e = nmse(a, b, n);
+            double e = nmse(a, b, n);
             if (std::isnan(e)) {   // an all-zero reference (empty rows): only an identical result passes
-                return memcmp(a, b, n * sizeof(float)) == 0 ? 0.0 : 1.0;
+                e = memcmp(a, b, n * sizeof(float)) == 0 ? 0.0 : 1.0;
             }
+            last_nmse = e;
             return e;
         }
         // overflow: the set of inf positions must be the expected one (from the single selected V row), and the NMSE
@@ -13733,7 +13842,8 @@ struct test_sparse_attn : public test_case {
         if (n_inf == 0) {
             return 1.0;   // the case must produce infinities
         }
-        return saa > 0 ? sab / saa : sab;
+        last_nmse = saa > 0 ? sab / saa : sab;
+        return last_nmse;
     }
 
     ggml_tensor * new_kv(ggml_context * ctx, ggml_type type, ggml_tensor ** storage) {
@@ -13964,6 +14074,180 @@ struct test_sparse_attn : public test_case {
     }
 };
 
+// launches counted since the census reset of the attend keys (sa_attend/...) whose epilogue segment is epi ("plain" or
+// "gated"); -1 without the census procs
+static int64_t sa_census_epi(ggml_backend_t backend, const char * epi) {
+    typedef const char * const * (*census_list_t)(void);
+    auto list = (census_list_t) census_proc(backend, "ggml_backend_debug_dispatch_census_list");
+    if (!list) {
+        return -1;
+    }
+    const std::string seg = std::string("/") + epi + "/";
+    int64_t n = 0;
+    for (const char * const * k = list(); k && *k; ++k) {
+        const std::string key = *k;
+        if (key.rfind("sa_attend/", 0) == 0 && key.find(seg) != std::string::npos) {
+            n += std::max<int64_t>(0, dispatch_census_count(backend, *k));
+        }
+    }
+    return n;
+}
+
+enum sa_gate_variant {
+    SA_GATE_F32,        // SPARSE_ATTN -> view -> MUL(., SIGMOID(CONT(gate))): the gated F32 output, compared
+    SA_GATE_BF16,       // + a MUL_MAT (BF16 weight) reading the gated output, which is also a graph output: the epilogue
+                        //   writes F32 and the BF16 copy the MMB GEMM reads; both outputs compared
+    SA_GATE_BF16_ONLY,  // the gated output read only by the BF16 MMB GEMM (graph_optimize marks it BF16-only): the epilogue
+                        //   writes only the BF16 copy; the GEMM output compared
+    SA_GATE_F16_ONLY,   // the same with a dense Q8_0 weight (MMB_DENSE_R2 in place, an F16 reader): only the F16 copy
+    SA_GATE_REJECT,     // the gated output allocated over Q (gallocr hands it the memory of Q, dead after the attend):
+                        //   the overlap check must refuse the fusion; the unfused graph must still be right
+};
+
+static const char * sa_gate_name(int v) {
+    switch (v) {
+        case SA_GATE_F32:       return "f32";
+        case SA_GATE_BF16:      return "bf16";
+        case SA_GATE_BF16_ONLY: return "bf16only";
+        case SA_GATE_F16_ONLY:  return "f16only";
+        case SA_GATE_REJECT:    return "reject";
+    }
+    return "?";
+}
+
+// test_sparse_attn_gated (PLAN-v3 §14.1, O28): the whole qwen4exp attention-gate graph after the attend, so the HIP gate
+// fusion (ggml-cuda.cu: SPARSE_ATTN -> [views] -> CONT(gate) -> SIGMOID -> MUL, the EPI = gated instance) is reached
+// through the backend's own matcher. q and the gate are interleaved per (token, head) in one tensor, as qwen4exp's
+// Qcur_full ([q | gate] per head), so the gate is a strided view. Engagement: the census must count exactly one gated
+// attend launch and no plain one (SA_GATE_REJECT: no gated launch and one plain one). Rotation (rot 64 / 256) lands
+// with the in-op rotation (W10).
+struct test_sparse_attn_gated : public test_sparse_attn {
+    const int variant;
+    ggml_tensor * mul = nullptr, * mm = nullptr;
+    int64_t mm_elems = 0;
+
+    test_sparse_attn_gated(ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv, int64_t n_sel, int gqa,
+                           int n_stream, int variant, int kv_layout = 1)
+        : test_sparse_attn(type_k, type_v, n_q, n_kv, n_sel, 4, SA_ROWS_MIX, gqa, n_stream, 0, 0, kv_layout), variant(variant) {}
+
+    std::string vars() override {
+        return test_sparse_attn::vars() + ",gated=" + sa_gate_name(variant);
+    }
+    const char * report_tag() override { return "SPARSE_ATTN_GATED"; }
+    bool use_scheduler_allocation() override {
+        return variant == SA_GATE_BF16_ONLY || variant == SA_GATE_F16_ONLY || variant == SA_GATE_REJECT;
+    }
+    bool use_weight_context() override { return false; }
+    bool weights_end_at_buffer_end() override { return false; }
+    // the scheduler-allocated variants compute the determinism re-run through ggml_backend_sched_graph_compute (its own
+    // split copy of the graph, after graph_optimize), not the graph the compare ran: the two runs are not the same
+    // computation, so only the directly computed variants run the memcmp determinism check
+    int n_determinism_runs() override { return use_scheduler_allocation() ? 1 : 2; }
+    // the CPU check of the attend output against O_CON reads q / k / v and the attend output after the run; under the
+    // scheduler's allocation those buffers are reused by later nodes, so it runs on the directly allocated variants only
+    bool verify_reference(ggml_backend_t backend, std::string & msg) override {
+        return use_scheduler_allocation() || test_sparse_attn::verify_reference(backend, msg);
+    }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        switch (variant) {
+            case SA_GATE_BF16:      return { mul, mm };
+            case SA_GATE_BF16_ONLY:
+            case SA_GATE_F16_ONLY:  return { mm };
+            default:                return { mul };
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_UNUSED(ctx_weights);
+        kv_rows = 4 * ((n_kv + 3) / 4);
+        const int64_t n_head = n_head_kv * gqa, T = n_q * n_stream;
+        ggml_tensor * gate = nullptr;
+        if (variant == SA_GATE_REJECT) {
+            // q is computed (dead after the attend) and has the size of the gated output; the gate is its own input
+            ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_head, n_q, n_stream);
+            ggml_set_name(q_in, "q_in");
+            ggml_tensor * q_st = ggml_scale(ctx, q_in, 1.0f);
+            ggml_set_name(q_st, "q_storage");
+            q = ggml_permute(ctx, q_st, 0, 2, 1, 3);
+            gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_head, T);
+            ggml_set_name(gate, "gate");
+        } else {
+            ggml_tensor * qfull = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * D, n_head, T);
+            ggml_set_name(qfull, "qfull");
+            const size_t es = sizeof(float);
+            ggml_tensor * qv = ggml_view_4d(ctx, qfull, D, n_head, n_q, n_stream, 2 * D * es, 2 * D * es * n_head,
+                                            2 * D * es * n_head * n_q, 0);
+            q = ggml_permute(ctx, qv, 0, 2, 1, 3);
+            gate = ggml_view_3d(ctx, qfull, D, n_head, T, 2 * D * es, 2 * D * es * n_head, D * es);
+        }
+        k = new_kv(ctx, type_k, &k_st);
+        v = new_kv(ctx, type_v, &v_st);
+        ggml_set_name(k_st, "k_storage");
+        ggml_set_name(v_st, "v_storage");
+        sel  = sa_new_sel(this, ctx, n_sel, n_q, n_stream, 0);
+        plan = ggml_sparse_attn_plan(ctx, sel, n_kv, group);
+        ggml_set_name(plan, "plan");
+        out  = ggml_sparse_attn(ctx, q, k, v, plan, scale, rot_q, rot_o);
+        ggml_set_name(out, "out");
+        ggml_tensor * cur = ggml_reshape_3d(ctx, out, D, n_head, T);
+        ggml_tensor * gs  = ggml_sigmoid(ctx, ggml_cont(ctx, gate));
+        mul = variant == SA_GATE_REJECT ? ggml_mul(ctx, gs, cur) : ggml_mul(ctx, cur, gs);
+        ggml_set_name(mul, "attn_gated");
+        if (variant == SA_GATE_F32 || variant == SA_GATE_REJECT) {
+            return mul;
+        }
+        if (variant == SA_GATE_BF16) {
+            ggml_set_output(mul);
+        }
+        // the wo projection: BF16 weight (BF16 reader), or a dense Q8_0 weight large enough for MMB_DENSE_R2 (F16 reader)
+        const bool dense = variant == SA_GATE_F16_ONLY;
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, dense ? GGML_TYPE_Q8_0 : GGML_TYPE_BF16, D * n_head, dense ? 2560 : 128);
+        ggml_set_name(w, "wo");
+        mm = ggml_mul_mat(ctx, w, ggml_reshape_2d(ctx, mul, D * n_head, T));
+        ggml_set_name(mm, "attn_output");
+        ggml_set_output(mm);
+        mm_elems = ggml_nelements(mm);
+        return mm;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (mm == nullptr || (int64_t) n != mm_elems) {
+            // the gated output: NMSE against the CPU graph (sigmoid(gate) * attend), the band of the attend's class. No
+            // f64 report: the f64 oracles are of the attend output (and in SA_GATE_REJECT q's memory is reused)
+            const double e = nmse(a, b, n);
+            last_nmse = e;
+            last_f64_c18 = last_f64_plan = -1.0;
+            return e;
+        }
+        if (mm != nullptr && (int64_t) n == mm_elems) {
+            // the GEMM output reads the 16-bit copy: its error is the activation rounding, not the attend band
+            const double e = nmse(a, b, n);
+            if (report_on()) {
+                printf("SA_REPORT case=SPARSE_ATTN_GATED(%s) wo_gemm nmse=%.3e tol=5e-4\n", vars().c_str(), e);
+            }
+            return e <= 5e-4 ? 0.0 : 1.0;
+        }
+        GGML_ABORT("unreachable");
+    }
+
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!test_sparse_attn::verify_engagement(backend, msg)) {
+            return false;
+        }
+        if (sa_is_cpu(backend)) {
+            return true;
+        }
+        const int64_t gated = sa_census_epi(backend, "gated"), plain = sa_census_epi(backend, "plain");
+        const int64_t want_gated = variant == SA_GATE_REJECT ? 0 : 1;
+        if (gated != want_gated || plain != 1 - want_gated) {
+            msg = "gate fusion census gated=" + std::to_string(gated) + " plain=" + std::to_string(plain) +
+                  " (want " + std::to_string(want_gated) + " and " + std::to_string(1 - want_gated) + ")";
+            return false;
+        }
+        return true;
+    }
+};
+
 static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> & test_cases) {
     const ggml_type F16 = GGML_TYPE_F16, BF16 = GGML_TYPE_BF16, Q8 = GGML_TYPE_Q8_0, Q4 = GGML_TYPE_Q4_0;
     const ggml_type S_fast[]    = { F16, BF16, Q8, Q4 };
@@ -14102,6 +14386,44 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
     test_cases.emplace_back(new test_sparse_attn(F16, Q8, 513, 4096, 2051, 4, SA_ROWS_PR));
     test_cases.emplace_back(new test_sparse_attn(Q8, F16, 130, 32768, 2051, 4, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 7000));
     test_cases.emplace_back(new test_sparse_attn(F16, F16, 130, 270336, 2051, 4, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 66000));
+
+    // ---- the G4 attend (PLAN-v3 §13 W3): every S_fast pair x both V-loader regimes x 1 / 2 streams x GQA {4, 8, 12};
+    //      n_q 129: n_kv 4096 < 64 * 129 (packed V), n_kv 16384 >= 64 * 129 (direct V); K/V layouts alternating ----
+    {
+        int alt = 0;
+        for (ggml_type tk : S_fast) {
+            for (ggml_type tv : S_fast) {
+                for (int gqa : {4, 8, 12}) {
+                    for (int ns : {1, 2}) {
+                        for (int64_t nk : {4096, 16384}) {
+                            test_cases.emplace_back(new test_sparse_attn(tk, tv, 129, nk, 257, 4, SA_ROWS_MIX, gqa, ns, 0, 0, alt++ % 2));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- gate fusion (test_sparse_attn_gated, PLAN-v3 §14.1): every EPI = gated G4 instance (S_fast pair x V regime x
+    //      GQA), the MMB reader paths (BF16 copy with and without the F32 store, F16 copy for a dense-R2 Q8_0 weight),
+    //      2 streams, and the overlap rejection ----
+    for (ggml_type tk : S_fast) {
+        for (ggml_type tv : S_fast) {
+            for (int gqa : {4, 8, 12}) {
+                for (int64_t nk : {4096, 16384}) {
+                    test_cases.emplace_back(new test_sparse_attn_gated(tk, tv, 129, nk, 257, gqa, 1, SA_GATE_F32));
+                }
+            }
+        }
+    }
+    for (ggml_type t : {F16, Q8}) {
+        for (int var : {SA_GATE_BF16, SA_GATE_BF16_ONLY, SA_GATE_F16_ONLY}) {
+            test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 4096, 257, 12, 1, var));
+        }
+        test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 16384, 257, 12, 1, SA_GATE_F16_ONLY, 0));
+        test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 4096, 2051, 12, 2, SA_GATE_F32));
+    }
+    for (ggml_type t : {F16, Q4}) test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 4096, 257, 12, 1, SA_GATE_REJECT));
 }
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
@@ -19042,6 +19364,11 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             my_end = std::min(my_begin + chunk, test_cases.size());
         };
 
+        // suite-level census accumulator (test_case::census_families): key -> launches summed over the cases
+        std::map<std::string, uint64_t> census_suite;
+        std::set<std::string> census_families_run;
+        std::mutex census_suite_mutex;
+
         const auto & run_tests = [&](ggml_backend_t b, ggml_backend_t b_cpu) {
             size_t my_begin, my_end;
             next_chunk(my_begin, my_end);
@@ -19049,6 +19376,18 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                 for (size_t i = my_begin; i < my_end; ++i) {
                     auto & test = test_cases[i];
                     test_status_t status = test->eval(b, b_cpu, op_names_filter, output_printer);
+                    if ((status == test_status_t::OK || status == test_status_t::FAIL) && !test->census_families().empty()) {
+                        typedef const char * const * (*census_list_t)(void);
+                        auto list = (census_list_t) census_proc(b, "ggml_backend_debug_dispatch_census_list");
+                        std::lock_guard<std::mutex> guard(census_suite_mutex);
+                        for (const std::string & f : test->census_families()) {
+                            census_families_run.insert(f);
+                        }
+                        for (const char * const * k = list ? list() : nullptr; k && *k; ++k) {
+                            const int64_t c = dispatch_census_count(b, *k);
+                            census_suite[*k] += c > 0 ? (uint64_t) c : 0;
+                        }
+                    }
                     if (status == test_status_t::NOT_SUPPORTED && g_fail_unsupported && !test->expected_unsupported(ggml_backend_name(b))) {
                         status = test_status_t::FAIL;   // reported "not supported" above; not on this backend's expected list
                     }
@@ -19107,13 +19446,54 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             }
         }
 
+        // every compiled census key of the families the run dispatched was launched at least once (backends with the
+        // census list proc; the CPU backend has none). A key only a forced tier reaches is covered by its own forced run.
+        bool census_ok = true;
+        {
+            typedef const char * const * (*census_list_t)(void);
+            auto list = (census_list_t) census_proc(backend, "ggml_backend_debug_dispatch_census_list");
+            auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
+            if (list && !census_families_run.empty()) {
+                size_t n_keys = 0, n_missing = 0, n_skipped = 0;
+                for (const char * const * k = list(); k && *k; ++k) {
+                    const std::string key = *k;
+                    bool in_family = false;
+                    for (const std::string & f : census_families_run) {
+                        in_family = in_family || key.rfind(f, 0) == 0;
+                    }
+                    if (!in_family) {
+                        continue;
+                    }
+                    if (const char * why = skip ? skip(backend, key.c_str()) : nullptr) {
+                        ++n_skipped;   // a forced run: the key belongs to another run (the first reason is printed)
+                        if (n_skipped == 1) {
+                            printf("  CENSUS COVERAGE: %s: keys excluded in this process, e.g. %s: %s\n", ggml_backend_name(backend), key.c_str(), why);
+                        }
+                        continue;
+                    }
+                    ++n_keys;
+                    if (census_suite[key] == 0) {
+                        ++n_missing;
+                        printf("  CENSUS COVERAGE: %s: compiled key %s was never launched\n", ggml_backend_name(backend), key.c_str());
+                    }
+                }
+                std::string fam;
+                for (const std::string & f : census_families_run) {
+                    fam += (fam.empty() ? "" : ",") + f;
+                }
+                printf("  CENSUS COVERAGE: %s: %zu/%zu compiled keys of {%s} launched (%zu excluded by a forcing switch): %s\n",
+                       ggml_backend_name(backend), n_keys - n_missing, n_keys, fam.c_str(), n_skipped, n_missing == 0 ? "OK" : "FAIL");
+                census_ok = n_missing == 0;
+            }
+        }
+
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
 
         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
 
         const bool context_ok = run_mmb_context_test(dev, op_names_filter, output_printer);
-        return n_ok == tests_run && slice_ok && context_ok;
+        return n_ok == tests_run && slice_ok && context_ok && census_ok;
     }
 
     if (mode == MODE_GRAD) {
