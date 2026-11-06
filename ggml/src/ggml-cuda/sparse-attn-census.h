@@ -29,6 +29,19 @@
 //                                               the class's lower bound), extended by the GQA level as the G4 keys are
 //   sa_merge                                    one launch of sa_merge_splits (sparse-attn-merge.cu), which follows every
 //                                               sa_attend_g1 launch with more than one split
+//   sa_generic/G4/<VL>/gqa<n>                   one launch of the generic tier's G4 attend (sa_attend_g4<SA_T_GEN, SA_T_GEN,
+//                                               VL, plain, n>, sparse-attn-generic.cu): any K / V pair of S through the
+//                                               runtime-switch loader; V loader packed | direct (PLAN-v3 §6.2 key
+//                                               sa_generic/G<g>, extended by the V loader and the GQA level as the G4 keys)
+//   sa_generic/G1/splits<c>/gqa<n>              one launch of the generic tier's G1 attend (sa_attend_g1<SA_T_GEN, SA_T_GEN,
+//                                               n>), split class c as the sa_attend/G1 keys (followed by sa_merge when the
+//                                               split count is > 1)
+//   sa_generic/fixup                            one launch of sa_attend_fixup<SA_T_GEN, SA_T_GEN, plain> (after every
+//                                               sa_generic/G4 launch)
+//   sa_generic/pack                             one launch of sa_pack_v<SA_T_GEN> (the generic tier's packed V)
+//   sa_portable/G<g>                            one launch of the portable tier (sa_attend_portable, sparse-attn-portable.cu:
+//                                               scalar FMA, every type of S, any HIP arch) on a plan with group g. The tier
+//                                               every HIP arch other than RDNA3.5 runs, and GGML_CUDA_SA_FORCE=portable
 //   qsa_expand                                  one fused qwen4exp complete-block selection (expand.cu, matched in ggml-cuda.cu)
 //
 // The procs are returned by ggml_backend_reg_get_proc_address of the HIP backend (ggml-cuda.cu):
@@ -134,6 +147,34 @@
 
 #define GGML_CUDA_SA_CENSUS_G1_KEY(kt, vt, gqa, cls) "sa_attend/G1/" #kt "/" #vt "/splits" cls "/gqa" #gqa
 
+// generic tier G4 instances (sa_attend_g4<SA_T_GEN, SA_T_GEN, VL, SA_EPI_PLAIN, GQA>), V loader outermost: dispatched by
+// sparse-attn-generic.cu at index vl * 3 + gqa_index (vl: SA_V_PACKED 0, SA_V_SPLITGATHER 1)
+#define GGML_CUDA_SA_GEN_G4_INSTANCES(X) \
+    X(packed, 4)                         \
+    X(packed, 8)                         \
+    X(packed, 12)                        \
+    X(direct, 4)                         \
+    X(direct, 8)                         \
+    X(direct, 12)
+
+#define GGML_CUDA_SA_GEN_G4_N 6
+
+#define GGML_CUDA_SA_CENSUS_GEN_G4_KEY(vl, gqa) "sa_generic/G4/" #vl "/gqa" #gqa
+
+// generic tier G1 instances (sa_attend_g1<SA_T_GEN, SA_T_GEN, GQA>), index gqa_index; census key id
+// GGML_CUDA_SA_CENSUS_GEN_G1_FIRST + gqa_index * 5 + split class
+#define GGML_CUDA_SA_GEN_G1_INSTANCES(X) \
+    X(4)                                 \
+    X(8)                                 \
+    X(12)
+
+#define GGML_CUDA_SA_GEN_G1_N 3
+
+#define GGML_CUDA_SA_CENSUS_GEN_G1_KEY(gqa, cls) "sa_generic/G1/splits" cls "/gqa" #gqa
+
+// portable tier: one kernel, the plan's group a runtime argument; one key per group of GGML_CUDA_SA_PLAN_GROUPS
+#define GGML_CUDA_SA_CENSUS_PORTABLE_KEY(g) "sa_portable/G" #g
+
 enum ggml_cuda_sa_census_id {
 #define GGML_CUDA_SA_CENSUS_PLAN_ID(g) GGML_CUDA_SA_CENSUS_PLAN_G##g,
     GGML_CUDA_SA_PLAN_GROUPS(GGML_CUDA_SA_CENSUS_PLAN_ID)
@@ -154,8 +195,32 @@ enum ggml_cuda_sa_census_id {
 #undef GGML_CUDA_SA_CENSUS_G1_INST_
 #undef GGML_CUDA_SA_CENSUS_G1_ID
     GGML_CUDA_SA_CENSUS_MERGE,
+#define GGML_CUDA_SA_CENSUS_GEN_G4_ID(vl, gqa) GGML_CUDA_SA_CENSUS_GEN_G4_##vl##_##gqa,
+    GGML_CUDA_SA_GEN_G4_INSTANCES(GGML_CUDA_SA_CENSUS_GEN_G4_ID)
+#undef GGML_CUDA_SA_CENSUS_GEN_G4_ID
+#define GGML_CUDA_SA_CENSUS_GEN_G1_ID(gqa, c, cls) GGML_CUDA_SA_CENSUS_GEN_G1_##gqa##_c##c,
+#define GGML_CUDA_SA_CENSUS_GEN_G1_INST_(gqa) GGML_CUDA_SA_G1_CENSUS_(GGML_CUDA_SA_CENSUS_GEN_G1_ID_, generic, generic, gqa)
+#define GGML_CUDA_SA_CENSUS_GEN_G1_ID_(kt, vt, gqa, c, cls) GGML_CUDA_SA_CENSUS_GEN_G1_ID(gqa, c, cls)
+    GGML_CUDA_SA_GEN_G1_INSTANCES(GGML_CUDA_SA_CENSUS_GEN_G1_INST_)
+#undef GGML_CUDA_SA_CENSUS_GEN_G1_ID_
+#undef GGML_CUDA_SA_CENSUS_GEN_G1_INST_
+#undef GGML_CUDA_SA_CENSUS_GEN_G1_ID
+    GGML_CUDA_SA_CENSUS_GEN_FIXUP,
+    GGML_CUDA_SA_CENSUS_GEN_PACK,
+#define GGML_CUDA_SA_CENSUS_PORTABLE_ID(g) GGML_CUDA_SA_CENSUS_PORTABLE_G##g,
+    GGML_CUDA_SA_PLAN_GROUPS(GGML_CUDA_SA_CENSUS_PORTABLE_ID)
+#undef GGML_CUDA_SA_CENSUS_PORTABLE_ID
     GGML_CUDA_SA_CENSUS_N,
 };
+
+// first generic G4 id: instance i of GGML_CUDA_SA_GEN_G4_INSTANCES has id GGML_CUDA_SA_CENSUS_GEN_G4_FIRST + i
+#define GGML_CUDA_SA_CENSUS_GEN_G4_FIRST GGML_CUDA_SA_CENSUS_GEN_G4_packed_4
+// first generic G1 id: instance i (gqa_index), split class c has id GGML_CUDA_SA_CENSUS_GEN_G1_FIRST + 5 * i + c
+#define GGML_CUDA_SA_CENSUS_GEN_G1_FIRST GGML_CUDA_SA_CENSUS_GEN_G1_4_c0
+static_assert(GGML_CUDA_SA_CENSUS_GEN_G1_FIRST - GGML_CUDA_SA_CENSUS_GEN_G4_FIRST == GGML_CUDA_SA_GEN_G4_N,
+              "GGML_CUDA_SA_GEN_G4_INSTANCES must list GGML_CUDA_SA_GEN_G4_N instances");
+static_assert(GGML_CUDA_SA_CENSUS_GEN_FIXUP - GGML_CUDA_SA_CENSUS_GEN_G1_FIRST == 5 * GGML_CUDA_SA_GEN_G1_N,
+              "GGML_CUDA_SA_GEN_G1_INSTANCES must list GGML_CUDA_SA_GEN_G1_N instances of 5 split classes each");
 
 // first G4 attend id; instance i of GGML_CUDA_SA_G4_INSTANCES has id GGML_CUDA_SA_CENSUS_G4_FIRST + i
 #define GGML_CUDA_SA_CENSUS_G4_FIRST GGML_CUDA_SA_CENSUS_G4_f16_f16_packed_plain_4
@@ -192,6 +257,19 @@ static const char * const ggml_cuda_sa_census_keys[GGML_CUDA_SA_CENSUS_N + 1] = 
 #undef GGML_CUDA_SA_CENSUS_G1_INST_
 #undef GGML_CUDA_SA_CENSUS_G1_STR
     "sa_merge",
+#define GGML_CUDA_SA_CENSUS_GEN_G4_STR(vl, gqa) GGML_CUDA_SA_CENSUS_GEN_G4_KEY(vl, gqa),
+    GGML_CUDA_SA_GEN_G4_INSTANCES(GGML_CUDA_SA_CENSUS_GEN_G4_STR)
+#undef GGML_CUDA_SA_CENSUS_GEN_G4_STR
+#define GGML_CUDA_SA_CENSUS_GEN_G1_STR_(kt, vt, gqa, c, cls) GGML_CUDA_SA_CENSUS_GEN_G1_KEY(gqa, cls),
+#define GGML_CUDA_SA_CENSUS_GEN_G1_INST_(gqa) GGML_CUDA_SA_G1_CENSUS_(GGML_CUDA_SA_CENSUS_GEN_G1_STR_, generic, generic, gqa)
+    GGML_CUDA_SA_GEN_G1_INSTANCES(GGML_CUDA_SA_CENSUS_GEN_G1_INST_)
+#undef GGML_CUDA_SA_CENSUS_GEN_G1_INST_
+#undef GGML_CUDA_SA_CENSUS_GEN_G1_STR_
+    "sa_generic/fixup",
+    "sa_generic/pack",
+#define GGML_CUDA_SA_CENSUS_PORTABLE_STR(g) GGML_CUDA_SA_CENSUS_PORTABLE_KEY(g),
+    GGML_CUDA_SA_PLAN_GROUPS(GGML_CUDA_SA_CENSUS_PORTABLE_STR)
+#undef GGML_CUDA_SA_CENSUS_PORTABLE_STR
     nullptr,
 };
 

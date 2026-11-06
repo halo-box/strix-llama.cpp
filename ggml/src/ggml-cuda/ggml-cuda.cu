@@ -9792,8 +9792,9 @@ static const char * const * ggml_backend_cuda_dispatch_census_list(void) {
 // NULL when label is a compiled key or a prefix of one that this process can dispatch; otherwise why this backend never
 // counts it (not a key, or excluded by a forcing switch such as GGML_CUDA_SA_FORCE)
 static const char * ggml_backend_cuda_dispatch_census_skip(ggml_backend_t backend, const char * label) {
-    GGML_UNUSED(backend);
-    if (const char * why = ggml_cuda_sparse_attn_census_skip(label)) {
+    // the device decides the tier (the portable tier on HIP archs other than RDNA3.5); -1 when the backend is not given
+    const int device = backend != nullptr && backend->context != nullptr ? ((ggml_backend_cuda_context *) backend->context)->device : -1;
+    if (const char * why = ggml_cuda_sparse_attn_census_skip(device, label)) {
         return why;
     }
     for (int i = 0; i < GGML_CUDA_SA_CENSUS_N; ++i) {

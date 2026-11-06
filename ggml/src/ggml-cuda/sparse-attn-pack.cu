@@ -1,4 +1,5 @@
-// sa_pack_v<T>: V of an S_fast type to the packed f16 layout the G4 attend reads with SA_V_PACKED (PLAN-v3 §6.2, D8).
+// sa_pack_v<T>: V of an S_fast type (or, T = SA_T_GEN, of any type of S through the runtime switch sa_any_elem: the
+// generic tier's pack, PLAN-v3 §6.2 "4 + 1 generic") to the packed f16 layout the G4 attend reads with SA_V_PACKED (PLAN-v3 §6.2, D8).
 //
 // Layout: f16 [n_stream][n_head_kv][n_quads][256 dims][4 cells], the PR #219 tree's qsa_pack_v indexing
 // (qsa-prefill.cu: element (quad, dim) at quad * 1024 + dim * 4) with the stream and the kv head as outer dimensions, so
@@ -24,8 +25,9 @@ template <int T>
 static __global__ void __launch_bounds__(SA_PACK_THREADS) sa_pack_v(
         const char * __restrict__ v, uint16_t * __restrict__ dst, const size_t nb1, const size_t nb2, const size_t nb3,
         const int n_head_kv, const uint32_t n_quads, const uint64_t count, uint8_t * __restrict__ qflags,
-        uint32_t * __restrict__ any) {
+        uint32_t * __restrict__ any, const int gt) {
     static_assert(SA_PACK_THREADS == 256, "one block per quad: the 256 dims of a row");
+    (void) gt;
     const uint64_t i = (uint64_t) blockIdx.x * SA_PACK_THREADS + threadIdx.x;
     if (blockIdx.x * (uint64_t) SA_PACK_THREADS >= count) {
         return;
@@ -42,7 +44,12 @@ static __global__ void __launch_bounds__(SA_PACK_THREADS) sa_pack_v(
     int bad = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const uint32_t g = sa_gather_load<T>(in + (size_t) j * nb1, w, dd);
+        uint32_t g;
+        if constexpr (T == SA_T_GEN) {   // the generic tier's pack: any type of S, f16 bits (sparse-attn-loaders.cuh)
+            g = sa_any_elem(gt, in + (size_t) j * nb1, (int) d);
+        } else {
+            g = sa_gather_load<T>(in + (size_t) j * nb1, w, dd);
+        }
         h[j] = sa_gather_pair<T>(g, g) & 0xffffu;
         if ((h[j] & 0x7c00u) == 0x7c00u) {
             h[j] = 0;
@@ -60,7 +67,7 @@ static __global__ void __launch_bounds__(SA_PACK_THREADS) sa_pack_v(
 }
 
 void ggml_cuda_sparse_attn_pack_v(cudaStream_t stream, const ggml_tensor * v, const int64_t n_quads, uint16_t * dst,
-                                  uint8_t * qflags, uint32_t * any) {
+                                  uint8_t * qflags, uint32_t * any, const bool generic) {
     GGML_ASSERT(v->ne[0] == 256 && n_quads >= 1 && n_quads <= ((int64_t) 1 << 22));
     GGML_ASSERT(4 * n_quads <= v->ne[1]);
     const uint64_t count  = (uint64_t) n_quads * 256 * (uint64_t) v->ne[2] * (uint64_t) v->ne[3];
@@ -69,11 +76,17 @@ void ggml_cuda_sparse_attn_pack_v(cudaStream_t stream, const ggml_tensor * v, co
     const char * src = (const char *) v->data;
     CUDA_CHECK(cudaMemsetAsync(any, 0, sizeof(uint32_t), stream));
     const int nhkv = (int) v->ne[2];
+    if (generic) {
+        sa_pack_v<SA_T_GEN><<<(unsigned) blocks, SA_PACK_THREADS, 0, stream>>>(src, dst, v->nb[1], v->nb[2], v->nb[3], nhkv,
+                                                                         (uint32_t) n_quads, count, qflags, any, (int) v->type);
+        ggml_cuda_sa_census_add(GGML_CUDA_SA_CENSUS_GEN_PACK);
+        return;
+    }
     switch (v->type) {
 #define SA_PACK_CASE(gt, tid, key)                                                                                         \
         case gt:                                                                                                           \
             sa_pack_v<tid><<<(unsigned) blocks, SA_PACK_THREADS, 0, stream>>>(src, dst, v->nb[1], v->nb[2], v->nb[3], nhkv, \
-                                                                              (uint32_t) n_quads, count, qflags, any);     \
+                                                                              (uint32_t) n_quads, count, qflags, any, 0);  \
             ggml_cuda_sa_census_add(key);                                                                                  \
             break;
         SA_PACK_CASE(GGML_TYPE_F16,  SA_T_F16,  GGML_CUDA_SA_CENSUS_PACK_f16)
