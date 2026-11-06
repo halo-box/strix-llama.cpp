@@ -1,0 +1,235 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+#include "types.glsl"
+#include "ggml_type_ids.glsl"
+
+// GGML_OP_SPARSE_ATTN, scalar 64-lane tier (PLAN-v3 §6.3), derived from flash_attn_sel.comp: 64-lane devices that are not
+// RADV RDNA3 and pass the sel gate (subgroup size 64, shuffle, arithmetic, fp16, 64 GQA invocations, 46,720 B shared at
+// GQA 12). One workgroup per (query, K/V head, stream, split), one subgroup per query head of that K/V head, so each K/V
+// row is read once per query. Cells go in blocks of BK = 8 plan entries: two lanes compute one key's dot product (half
+// the dims each), so the softmax needs two subgroup reductions per block instead of one per key. With n_split > 1, split
+// z takes the blocks z, z + n_split, ... of its row and writes a partial result (sparse_attn_reduce.comp).
+// A masked or padding cell is never loaded: its K and V stay 0 and its weight is 0.
+
+layout(constant_id = 0) const uint WORKGROUP_SIZE = 768;
+layout(constant_id = 1) const uint SUBGROUP_SIZE = 64;
+layout(constant_id = 2) const uint GQA = 12;
+layout(constant_id = 3) const uint FaTypeK = 1;
+layout(constant_id = 4) const uint FaTypeV = 1;
+layout(constant_id = 5) const uint ROT_Q = 0;       // 0, 64, 128, 256
+layout(constant_id = 6) const uint ROT_DUMP = 0;    // test hook: write H_q q to dst and stop
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer QBuf    { float   data_q[];    };
+layout(binding = 1) readonly  buffer KBuf    { f16vec4 data_k4v[];  };
+layout(binding = 2) readonly  buffer VBuf    { f16vec4 data_v4v[];  };
+layout(binding = 3) readonly  buffer PlanBuf { uint    data_plan[]; };
+layout(binding = 4) writeonly buffer DstBuf  { float   data_dst[];  };
+
+#include "sparse_attn_load.glsl"
+
+layout(push_constant) uniform Parameters {
+    uint nbq1, nbq2, nbq3, q_off;
+    uint nbk1, nbk2, nbk3, k_off;
+    uint nbv1, nbv2, nbv3, v_off;
+    uint off_counts, off_quads, off_masks, cap;
+    uint nb1, nb2, nb3;
+    float scale;
+    float rot_scale;
+    uint n_split, n_head, n_q, n_stream, q_base;
+} p;
+
+// The pipeline is created with subgroup size 64 and head size 256 only (ggml_vk_sa_select).
+const uint HEAD_SIZE = 256;
+const uint LANES = 64;
+const uint PER_LANE = HEAD_SIZE / LANES;
+const uint BK = 32;
+const uint BE = BK / 4;   // plan entries per block
+const uint HALF = HEAD_SIZE / 2;
+const uint NONE = 0xffffffffu;
+const float FLT_MAX = 3.402823466e38;
+
+shared uint block_key[BK];
+shared float q_sh[GQA * HEAD_SIZE];
+shared float16_t kt_sh[HEAD_SIZE * BK]; // K block, transposed: [dim][key], so the per-lane key reads hit different banks
+shared float16_t v_sh[BK * HEAD_SIZE];  // V block: [key][dim]
+shared float p_sh[GQA * BK];
+
+void main() {
+    if (FaTypeK == GGML_TYPE_IQ4_NL || FaTypeV == GGML_TYPE_IQ4_NL) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
+
+    const float NEG_INF = uintBitsToFloat(0xff800000);
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint split = gl_WorkGroupID.x % p.n_split;
+    const uint query = gl_WorkGroupID.x / p.n_split + p.q_base;
+    const uint kv_head = gl_WorkGroupID.y;
+    const uint stream = gl_WorkGroupID.z;
+    const uint head = kv_head * GQA + sg;
+
+    // No early return: every invocation must reach every barrier below.
+
+    const uint q_base = p.q_off + stream * p.nbq3 + head * p.nbq2 + query * p.nbq1;
+    {
+        float reg[PER_LANE];
+        const float pre = ROT_Q != 0 ? p.rot_scale : 1.0;
+        [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+            reg[i] = data_q[q_base + lane + i * LANES] * pre;
+        }
+        if (ROT_Q != 0) {
+            [[unroll]] for (uint b = 1; b < LANES && b < ROT_Q; b <<= 1) {
+                [[unroll]] for (uint j = 0; j < PER_LANE; ++j) {
+                    const float val = reg[j];
+                    const float other = subgroupShuffleXor(val, b);
+                    reg[j] = (lane & b) == 0 ? val + other : other - val;
+                }
+            }
+            [[unroll]] for (uint b = LANES; b < ROT_Q; b <<= 1) {
+                const uint st = b / LANES;
+                [[unroll]] for (uint j = 0; j < PER_LANE; j += 2 * st) {
+                    [[unroll]] for (uint k = 0; k < st; ++k) {
+                        const float x = reg[j + k];
+                        const float y = reg[j + k + st];
+                        reg[j + k] = x + y;
+                        reg[j + k + st] = x - y;
+                    }
+                }
+            }
+        }
+        [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+            if (ROT_DUMP != 0) {
+                data_dst[stream * p.nb3 + query * p.nb2 + head * p.nb1 + lane + i * LANES] = reg[i];
+            }
+            // q * scale in f32, rounded to f16
+            q_sh[sg * HEAD_SIZE + lane + i * LANES] = float(float16_t(reg[i] * p.scale));
+        }
+    }
+    barrier();
+    if (ROT_DUMP != 0) {
+        return;
+    }
+
+    float acc[PER_LANE];
+    [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+        acc[i] = 0.0;
+    }
+    float row_max = NEG_INF;
+    float row_sum = 0.0;
+
+    const uint row = stream * p.n_q + query;
+    const uint count = data_plan[p.off_counts + row];
+    const uint quads = p.off_quads + row * p.cap;
+    const uint masks = p.off_masks + row * (p.cap / 2);
+
+    const uint k_base = p.k_off + stream * p.nbk3 + kv_head * p.nbk2;
+    const uint v_base = p.v_off + stream * p.nbv3 + kv_head * p.nbv2;
+    const uint kcol = lane % BK;   // the key this lane scores
+    const uint khalf = lane / BK;  // and which half of its dims
+
+    for (uint bl = split; bl * BE < count; bl += p.n_split) {
+        const uint e0 = bl * BE;
+        if (tid < BK) {
+            const uint e = e0 + tid / 4;
+            uint key = NONE;
+            if (e < count) {
+                const uint mw = data_plan[masks + e / 2] >> ((e & 1) * 16);
+                if (((mw >> (tid & 3)) & 1u) != 0) {
+                    key = 4 * data_plan[quads + e] + (tid & 3);
+                }
+            }
+            block_key[tid] = key;
+        }
+        barrier();
+
+        // 4 dims per load
+        for (uint idx = tid; idx < BK * HEAD_SIZE / 4; idx += WORKGROUP_SIZE) {
+            const uint col = idx / (HEAD_SIZE / 4);
+            const uint d4 = (idx % (HEAD_SIZE / 4)) * 4;
+            const uint key = block_key[col];
+            f16vec4 kx = f16vec4(0.0);
+            f16vec4 vx = f16vec4(0.0);
+            if (key != NONE) {
+                const uint kr = k_base + key * p.nbk1;
+                const uint vr = v_base + key * p.nbv1;
+                if (FaTypeK == GGML_TYPE_F16) {
+                    kx = data_k4v[kr * 2 + d4 / 4];
+                } else {
+                    kx = f16vec4(sa_dq4_k(kr, d4));
+                }
+                if (FaTypeV == GGML_TYPE_F16) {
+                    vx = data_v4v[vr * 2 + d4 / 4];
+                } else {
+                    vx = f16vec4(sa_dq4_v(vr, d4));
+                }
+            }
+            [[unroll]] for (uint j = 0; j < 4; ++j) {
+                kt_sh[(d4 + j) * BK + col] = kx[j];
+                v_sh[col * HEAD_SIZE + d4 + j] = vx[j];
+            }
+        }
+        barrier();
+
+        float s = 0.0;
+        const uint qoff = sg * HEAD_SIZE + khalf * HALF;
+        const uint koff = khalf * HALF * BK + kcol;
+        for (uint d = 0; d < HALF; ++d) {
+            s += q_sh[qoff + d] * float(kt_sh[koff + d * BK]);
+        }
+        s += subgroupShuffleXor(s, BK);
+        const bool valid = block_key[kcol] != NONE;
+        s = valid ? s : NEG_INF;
+
+        const float new_max = max(row_max, subgroupMax(s));
+        const float old_scale = new_max == row_max ? 1.0 : exp(row_max - new_max);
+        const float weight = valid ? exp(s - new_max) : 0.0;
+        row_sum = row_sum * old_scale + subgroupAdd(khalf == 0 ? weight : 0.0);
+        row_max = new_max;
+        if (khalf == 0) {
+            p_sh[sg * BK + kcol] = float(float16_t(weight));
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+            acc[i] *= old_scale;
+        }
+        for (uint j = 0; j < BK; ++j) {
+            const float w = p_sh[sg * BK + j];
+            [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+                acc[i] += w * float(v_sh[j * HEAD_SIZE + lane + i * LANES]);
+            }
+        }
+        barrier();
+    }
+
+    if (p.n_split == 1) {
+        const uint dst_base = stream * p.nb3 + query * p.nb2 + head * p.nb1;
+        const float inv_sum = row_sum > 0.0 ? 1.0 / row_sum : 0.0;
+        [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+            data_dst[dst_base + lane + i * LANES] = acc[i] * inv_sum;
+        }
+    } else {
+        // partial: unnormalized O, then L and M per head (an empty split writes M = -FLT_MAX, not -inf, so the
+        // reduce never computes exp(-inf - -inf))
+        const uint slot = split + p.n_split * (query + p.n_q * stream);
+        const uint o_base = HEAD_SIZE * p.n_head * slot + HEAD_SIZE * head;
+        [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
+            data_dst[o_base + lane + i * LANES] = acc[i];
+        }
+        if (lane == 0) {
+            const uint lm = HEAD_SIZE * p.n_head * p.n_q * p.n_stream * p.n_split + p.n_head * 2 * slot + head;
+            data_dst[lm] = row_sum;
+            data_dst[lm + p.n_head] = max(row_max, -FLT_MAX);
+        }
+    }
+}

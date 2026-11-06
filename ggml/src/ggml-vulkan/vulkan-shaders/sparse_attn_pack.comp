@@ -1,0 +1,43 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "types.glsl"
+#include "ggml_type_ids.glsl"
+
+// GGML_OP_SPARSE_ATTN, the diagnostic dequant-once pack arm (PLAN-v3 §6.3, AT-B3): one K or V view -> f16 rows in the
+// attend's workspace, [256 dims][n_cells][n_head_kv][n_stream]. The attend then runs its f16 instance on the pack. One
+// invocation per cell, 64 cells per workgroup, no barrier. Selected only by GGML_VK_SA_FORCE=vpack unless AT-B3 ships it.
+
+layout(constant_id = 0) const uint FaTypeK = 1;
+const uint FaTypeV = 1;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) writeonly buffer OutBuf { uint data_out[]; };
+
+#include "sparse_attn_load.glsl"
+
+layout(push_constant) uniform Parameters {
+    uint nb1, nb2, nb3, off;   // source strides and offset, in the unit of the type
+    uint n_cells, n_head_kv;
+} p;
+
+void main() {
+    if (FaTypeK == GGML_TYPE_IQ4_NL) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
+    const uint cell = gl_WorkGroupID.x * 64u + gl_LocalInvocationIndex;
+    if (cell >= p.n_cells) {
+        return;
+    }
+    const uint head = gl_WorkGroupID.y % p.n_head_kv;
+    const uint stream = gl_WorkGroupID.y / p.n_head_kv;
+    const uint row = p.off + cell * p.nb1 + head * p.nb2 + stream * p.nb3;
+    const uint o = ((stream * p.n_head_kv + head) * p.n_cells + cell) * 128u;
+    for (uint d = 0u; d < 256u; d += 4u) {
+        const vec4 x = sa_dq4_k(row, d);
+        data_out[o + d / 2u] = sa_pack2(x.xy);
+        data_out[o + d / 2u + 1u] = sa_pack2(x.zw);
+    }
+}
