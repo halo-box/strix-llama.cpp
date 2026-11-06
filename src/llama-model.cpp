@@ -3015,11 +3015,23 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     filter_recr = [&](uint32_t)    { return false; };
                 }
 
+                // PLAN-v3 D21: qwen4exp's QSA layers always run the sparse op past the shortcut, which reads V not transposed,
+                // so its cache keeps that layout whatever -fa says
+                const bool qsa_arch = arch == LLM_ARCH_QWEN4EXP;
+                if (qsa_arch && split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                    throw std::runtime_error("QSA sparse attention is not supported with --split-mode tensor: the meta backend has no SPARSE_ATTN handler; use --split-mode layer or none");
+                }
+                // PLAN-v3 §4.4: the largest n_kv an op test has run (the first f16 K view >= 2 GiB, 2^21 + 4 cells); 1M+ runtime is U12
+                constexpr uint32_t qsa_max_n_ctx_seq = (1u << 21) + 4;
+                if (qsa_arch && cparams.n_ctx_seq > qsa_max_n_ctx_seq) {
+                    throw std::runtime_error(format("QSA sparse attention: n_ctx_seq = %u is above the tested maximum of %u cells", cparams.n_ctx_seq, qsa_max_n_ctx_seq));
+                }
+
                 res = new llama_memory_hybrid_idx(
                     /* model             */ *this,
                     /* attn_type_k       */ params.type_k,
                     /* attn_type_v       */ params.type_v,
-                    /* attn_v_trans      */ !cparams.flash_attn,
+                    /* attn_v_trans      */ qsa_arch ? false : !cparams.flash_attn,
                     /* attn_kv_size      */ cparams.n_ctx_seq,
                     /* attn_n_pad        */ 1,
                     /* attn_n_swa        */ hparams.n_swa,

@@ -957,6 +957,30 @@ struct llm_graph_fused_node {
     int il;
 };
 
+// One QSA layer's attention in a built graph (PLAN-v3 §10, §14.3): what the placement guard checks and what LLAMA_QSA_TRACE
+// counts per executed ubatch. A cache-only MTP graph registers nothing (it has no attention node).
+enum llm_graph_qsa_place {
+    LLM_QSA_PLACE_K_DEVICE,        // on the backend of the device that holds the layer's K buffer (CPU for a host K buffer)
+    LLM_QSA_PLACE_HOST_KV_COPY,    // the named host-KV route: K buffer on the host, nodes on the layer's GPU, K/V copied (§10)
+    LLM_QSA_PLACE_SCHEDULER,       // the shortcut attention over a host K buffer that the scheduler places (AT-W7PERF (d))
+};
+
+struct llm_graph_qsa_node {
+    int           il       = -1;
+    const char *  producer = "";       // av | cb | te | dense | masked (§14.3); masked goes away in W8
+    ggml_tensor * plan     = nullptr;  // GGML_OP_SPARSE_ATTN_PLAN, nullptr on the dense and masked routes
+    ggml_tensor * attn     = nullptr;  // GGML_OP_SPARSE_ATTN, or the dense / masked attention node
+    ggml_tensor * k        = nullptr;  // the K cache view this attention reads
+    int64_t       n_q      = 0;        // queries per stream
+    int64_t       n_kv     = 0;
+    int64_t       n_stream = 0;
+    ggml_type     type_k   = GGML_TYPE_COUNT;
+    ggml_type     type_v   = GGML_TYPE_COUNT;
+    int32_t       group    = 0;        // G of the plan, 0 without a plan
+    bool          shortcut = false;    // n_kv <= top_k + r - 1
+    llm_graph_qsa_place place = LLM_QSA_PLACE_K_DEVICE;
+};
+
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
@@ -998,6 +1022,9 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
+    void add_qsa_node(const llm_graph_qsa_node & node) { qsa_nodes.push_back(node); }
+    const std::vector<llm_graph_qsa_node> & get_qsa_nodes() const { return qsa_nodes; }
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
@@ -1017,6 +1044,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<llm_graph_qsa_node>   qsa_nodes;   // the attention node of every QSA layer of this graph
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
 

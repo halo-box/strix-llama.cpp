@@ -679,6 +679,7 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    qsa_trace_print();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -869,6 +870,293 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+//
+// QSA placement guard and trace (PLAN-v3 §10, §14.3)
+//
+
+int llama_context::qsa_n_layers() const {
+    if (model.arch != LLM_ARCH_QWEN4EXP) {
+        return 0;
+    }
+    const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
+    if (mem == nullptr || mem->get_mem_idx() == nullptr) {
+        return 0;
+    }
+    const auto & hp = model.hparams;
+    const bool mtp = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+    int n = 0;
+    for (uint32_t il = mtp ? hp.n_layer() : 0; il < (mtp ? hp.n_layer_all : hp.n_layer()); ++il) {
+        n += hp.dsv4_compress_ratios[il] > 0 && model.layers[il].index_q_proj != nullptr;
+    }
+    return n;
+}
+
+static bool qsa_trace_on() {
+    static const bool on = [] { const char * e = getenv("LLAMA_QSA_TRACE"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+// the K / V types this device takes for this node's shape, for the "supported here" remedy of the init error
+static std::string qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor * attn) {
+    static const ggml_type types[] = { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F32,
+                                       GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
+    if (attn->op != GGML_OP_SPARSE_ATTN) {
+        return "";
+    }
+    ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    std::string out;
+    for (const ggml_type t : types) {
+        ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), t, attn->src[1]->ne[0], attn->src[1]->ne[1], attn->src[1]->ne[2], attn->src[1]->ne[3]);
+        ggml_tensor * op = ggml_sparse_attn(ctx.get(), attn->src[0], k, k, attn->src[3], 1.0f, 0, 0);
+        if (ggml_backend_dev_supports_op(dev, op)) {
+            out += (out.empty() ? "" : ", ") + std::string(ggml_type_name(t));
+        }
+    }
+    return out;
+}
+
+// PLAN-v3 §10: the message names the op's device and the remedies of the cause
+static std::string qsa_unsupported_error(const llm_graph_qsa_node & n, ggml_backend_dev_t dev, const ggml_tensor * op) {
+    std::string reason;
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        reason = "type pair not supported";
+    } else if (op->op == GGML_OP_SPARSE_ATTN || op->op == GGML_OP_SPARSE_ATTN_PLAN) {
+        auto proc = (ggml_backend_sparse_attn_unsupported_reason_t) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(dev), "ggml_backend_sparse_attn_unsupported_reason");
+        const char * why = proc ? proc(dev, op) : nullptr;
+        reason = why ? why : "no sparse-attention kernel in this backend";
+    } else {
+        reason = "no dense attention kernel for this pair on this device";
+    }
+    std::string msg = format("QSA layer %d (%s): sparse attention K=%s V=%s is not supported on device %s (backend %s): %s; ",
+            n.il, n.producer, ggml_type_name(n.type_k), ggml_type_name(n.type_v), ggml_backend_dev_name(dev),
+            ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), reason.c_str());
+    if (reason.rfind("type pair", 0) == 0) {
+        msg += "use another -ctk/-ctv (supported here: " + qsa_supported_types(dev, n.attn) + ")";
+    } else {
+        msg += "run QSA on the CPU with -ngl 0 or --no-kv-offload, or use a HIP (RDNA3.5) or Vulkan build";
+    }
+    return msg;
+}
+
+std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * res, const char * where) {
+    const auto & nodes = res->get_qsa_nodes();
+    auto * sc = sched.get();
+
+    // the checks per layer
+    int n_required = 0;
+    bool cache_only = false;
+    std::unordered_map<const ggml_tensor *, const llm_graph_qsa_node *> plans, attends;
+    for (const auto & n : nodes) {
+        if (n.attn == nullptr) {
+            cache_only = true;     // an MTP cache-only graph: no attention at all
+            continue;
+        }
+        if (strcmp(n.producer, "masked") == 0) {
+            continue;              // non-compact ubatches keep the old route until W8
+        }
+        n_required += n.plan ? 2 : 1;
+
+        const ggml_tensor * root = n.k->view_src ? n.k->view_src : n.k;
+        ggml_backend_buffer_type_t buft = root->buffer ? ggml_backend_buffer_get_type(root->buffer) : nullptr;
+        const bool host_kv = buft && ggml_backend_buft_is_host(buft);
+        ggml_backend_dev_t dev_k = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+
+        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sc, n.attn);
+        ggml_backend_dev_t dev = be ? ggml_backend_get_device(be) : nullptr;
+        if (dev == nullptr) {
+            return format("QSA layer %d (%s): attention node has no backend at '%s'", n.il, n.producer, where);
+        }
+
+        if (!host_kv && dev != dev_k && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            qsa_guard_cpu_launch++;
+        }
+
+        // the backend this route must run on
+        ggml_backend_dev_t dev_want = nullptr;
+        switch (n.place) {
+            case LLM_QSA_PLACE_K_DEVICE:
+                dev_want = host_kv ? ggml_backend_get_device(backend_cpu) : dev_k;
+                break;
+            case LLM_QSA_PLACE_HOST_KV_COPY:
+                if (cparams.offload_kqv || !host_kv) {
+                    return format("QSA layer %d: the host-KV copy route needs --no-kv-offload", n.il);
+                }
+                dev_want = model.dev_layer(n.il);
+                break;
+            case LLM_QSA_PLACE_SCHEDULER:
+                if (n.plan != nullptr || !n.shortcut || !host_kv || cparams.offload_kqv) {
+                    return format("QSA layer %d: only the shortcut attention over a host K buffer may be left to the scheduler", n.il);
+                }
+                break;
+        }
+
+        // a pinned node is not checked by the scheduler: an op its device does not take must never reach a compute
+        ggml_backend_dev_t dev_op = dev_want ? dev_want : dev;
+        for (const ggml_tensor * op : { (const ggml_tensor *) n.plan, (const ggml_tensor *) n.attn }) {
+            if (op && !ggml_backend_dev_supports_op(dev_op, op)) {
+                return qsa_unsupported_error(n, dev_op, op);
+            }
+        }
+        if (dev_want && dev != dev_want) {
+            return qsa_unsupported_error(n, dev_want, n.attn);
+        }
+        if (n.plan) {
+            ggml_backend_t be_plan = ggml_backend_sched_get_tensor_backend(sc, n.plan);
+            if (be_plan != be) {
+                return format("QSA layer %d (%s): plan on %s, attend on %s (F-W4-1: the attend reads the plan's node)", n.il, n.producer,
+                        be_plan ? ggml_backend_name(be_plan) : "none", ggml_backend_name(be));
+            }
+            plans[n.plan] = &n;
+            attends[n.attn] = &n;
+        }
+    }
+
+    // llama's gf: every sparse node is registered and has a backend; each plan has exactly one consumer, its attend, with the
+    // same n_q and n_stream (not sched->graph, which also holds alloc-dep and input-copy nodes)
+    int n_inspected = 0;
+    std::unordered_map<const ggml_tensor *, int> plan_users;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        if (t->op == GGML_OP_SPARSE_ATTN_PLAN || t->op == GGML_OP_SPARSE_ATTN) {
+            if (ggml_backend_sched_get_tensor_backend(sc, const_cast<ggml_tensor *>(t)) != nullptr) {
+                n_inspected++;
+            }
+            if ((t->op == GGML_OP_SPARSE_ATTN_PLAN ? plans.count(t) : attends.count(t)) == 0) {
+                return format("QSA guard: %s node '%s' is not registered by its layer", ggml_op_name(t->op), t->name);
+            }
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s] && t->src[s]->op == GGML_OP_SPARSE_ATTN_PLAN) {
+                plan_users[t->src[s]]++;
+                const ggml_tensor * pl = t->src[s];
+                if (t->op != GGML_OP_SPARSE_ATTN || t->src[3] != pl || t->src[0]->ne[1] != pl->src[0]->ne[1] || t->src[0]->ne[3] != pl->src[0]->ne[3]) {
+                    return format("QSA guard: plan '%s' is read by %s '%s': its one consumer must be a SPARSE_ATTN with its n_q and n_stream",
+                            pl->name, ggml_op_name(t->op), t->name);
+                }
+            }
+        }
+    }
+    for (const auto & it : plans) {
+        const auto u = plan_users.find(it.first);
+        if (u == plan_users.end() || u->second != 1) {
+            return format("QSA layer %d: plan has %d consumers, expected 1", it.second->il, u == plan_users.end() ? 0 : u->second);
+        }
+    }
+    // the dense shortcut's attention nodes were each read with a non-NULL backend above
+    for (const auto & n : nodes) {
+        if (n.attn && !n.plan && strcmp(n.producer, "masked") != 0) {
+            n_inspected++;
+        }
+    }
+
+    // non-vacuity: a pass that looked at nothing proves nothing
+    const int n_layers = qsa_n_layers();
+    if (!cache_only && ((int) nodes.size() != n_layers || n_inspected < n_required)) {
+        return format("QSA guard inspected nothing at '%s': %d nodes with a backend, %d required, %d of %d layers registered",
+                where, n_inspected, n_required, (int) nodes.size(), n_layers);
+    }
+
+    qsa_guard_passes++;
+    qsa_guard_inspected += n_inspected;
+    qsa_guard_inspected_min = qsa_guard_inspected_min < 0 ? n_inspected : std::min(qsa_guard_inspected_min, n_inspected);
+    return "";
+}
+
+void llama_context::qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const char * where) {
+    auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx, true);
+    if (gf == nullptr) {
+        throw std::runtime_error(format("failed to build the QSA guard's reserve graph '%s'", where));
+    }
+    const auto * res = get_gf_res_reserve();
+    const std::string err = qsa_guard(gf, res, where);
+    if (!err.empty()) {
+        throw std::runtime_error(err);
+    }
+    int n_plan = 0, n_attend = 0, n_cpu = 0, n_copy = 0, n_sched = 0;
+    for (const auto & n : res->get_qsa_nodes()) {
+        n_plan   += n.plan != nullptr;
+        n_attend += n.attn != nullptr;
+        n_copy   += n.place == LLM_QSA_PLACE_HOST_KV_COPY;
+        n_sched  += n.place == LLM_QSA_PLACE_SCHEDULER;
+        if (n.attn) {
+            ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), n.attn);
+            n_cpu += be == backend_cpu;
+        }
+    }
+    // one line per context and shape: the route, the types, where the policies come from, the pins (#219's log line, adapted)
+    const auto & nodes = res->get_qsa_nodes();
+    if (!nodes.empty()) {
+        const auto & n0 = nodes.front();
+        const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
+        const char * ctx_name = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
+        ggml_backend_t be0 = ggml_backend_sched_get_tensor_backend(sched.get(), n0.attn);
+        ggml_backend_dev_t dev0 = be0 ? ggml_backend_get_device(be0) : nullptr;
+        const bool has_policy = dev0 && ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev0), "ggml_backend_sparse_attn_group") != nullptr;
+        LLAMA_LOG_INFO("%s: QSA ctx=%s graph=%s route=%s K=%s V=%s idx=%s policy=%s backend=%s plan=%d attend=%d cpu=%d%s%s n_kv=%" PRId64 " G=%d guard=%d/%d\n",
+                __func__, ctx_name, where, n_copy > 0 ? "host-kv-copy" : n_plan > 0 ? "sparse" : "dense-shortcut",
+                ggml_type_name(n0.type_k), ggml_type_name(n0.type_v), mem && mem->get_mem_idx() ? ggml_type_name(mem->get_mem_idx()->type_k()) : "none",
+                has_policy ? "backend" : "default", be0 ? ggml_backend_name(be0) : "none", n_plan, n_attend, n_cpu,
+                n_sched > 0 ? " shortcut=scheduler" : "", n_cpu > 0 ? " pinned-cpu" : "", n0.n_kv, n0.group, qsa_guard_inspected_min, 2 * qsa_n_layers());
+    }
+}
+
+void llama_context::qsa_trace_ubatch(const llm_graph_result * res) {
+    if (!qsa_trace_on()) {
+        return;
+    }
+    const char * ctx_name = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
+    for (const auto & n : res->get_qsa_nodes()) {
+        if (n.attn == nullptr) {
+            continue;
+        }
+        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), n.attn);
+        const bool sparse = n.plan != nullptr;
+        const bool on_cpu = be == backend_cpu;
+        char line[256];
+        snprintf(line, sizeof(line), "il=%d producer=%s n_q=%" PRId64 " n_kv=%" PRId64 " n_stream=%" PRId64 " k=%s v=%s",
+                n.il, n.producer, n.n_q, n.n_kv, n.n_stream, ggml_type_name(n.type_k), ggml_type_name(n.type_v));
+        std::string key = line;
+        key += format(" route=%s ctx=%s backend=%s G=%d", n.place == LLM_QSA_PLACE_HOST_KV_COPY ? "host-kv-copy" : sparse ? "sparse" : strcmp(n.producer, "masked") == 0 ? "masked" : "dense",
+                ctx_name, be ? ggml_backend_name(be) : "none", n.group);
+        if (sparse) {
+            key += format(" n_sel=%" PRId64 " gqa=%" PRId64, n.plan->src[0]->ne[0], n.attn->src[0]->ne[2] / n.attn->src[1]->ne[2]);
+        }
+        qsa_trace_counts[key]++;
+        if (on_cpu) {
+            if (sparse) {
+                qsa_cpu_sparse_attn++;
+                qsa_cpu_sparse_plan++;
+            } else if (strcmp(n.producer, "dense") == 0) {
+                qsa_cpu_shortcut_attn++;
+            }
+        }
+    }
+}
+
+void llama_context::qsa_trace_print() const {
+    if (!qsa_trace_on() || qsa_n_layers() == 0) {
+        return;
+    }
+    // plain stderr: the application's log callback may already be gone
+    for (const auto & it : qsa_trace_counts) {
+        // the count stays right after the fields the census checker parses
+        const size_t p = it.first.find(" route=");
+        fprintf(stderr, "LLAMA_QSA_TRACE %s count=%" PRId64 "%s\n", it.first.substr(0, p).c_str(), it.second, it.first.substr(p).c_str());
+    }
+    if (qsa_cpu_sparse_attn > 0) {
+        fprintf(stderr, "QSA_CENSUS cpu:sparse_attn %" PRId64 "\n", qsa_cpu_sparse_attn);
+        fprintf(stderr, "QSA_CENSUS cpu:sparse_attn_plan %" PRId64 "\n", qsa_cpu_sparse_plan);
+    }
+    if (qsa_cpu_shortcut_attn > 0) {
+        fprintf(stderr, "QSA_CENSUS cpu:shortcut_attn %" PRId64 "\n", qsa_cpu_shortcut_attn);
+    }
+    fprintf(stderr, "LLAMA_QSA_GUARD ctx=%s passes=%d inspected=%" PRId64 " inspected_min=%d layers=%d cpu_launch=%" PRId64 "\n",
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main", qsa_guard_passes, qsa_guard_inspected, qsa_guard_inspected_min, qsa_n_layers(), qsa_guard_cpu_launch);
+    fflush(stderr);
+}
+
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
@@ -938,10 +1226,21 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
+    // the fit probe (no_alloc): ggml_gallocr_reserve_n_size overwrites its sizes per graph while the real reserve grows, so the
+    // estimate is the per-backend max over every reserve graph (PLAN-v3 §7.1.7)
+    const bool no_alloc = model.hparams.no_alloc;
+    std::vector<size_t> probe_sizes(backend_ptrs.size(), 0);
+    std::fill(backend_buf_exp_size.begin(), backend_buf_exp_size.end(), 0);
+    const auto probe_max = [&]() {
+        for (size_t i = 0; no_alloc && i < backend_ptrs.size(); ++i) {
+            backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], probe_sizes[i]);
+        }
+    };
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+                no_alloc, no_alloc ? probe_sizes.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -960,6 +1259,7 @@ void llama_context::sched_reserve() {
         n_input_tensors_pp = this->n_input_tensors;
 
         graph_has_logits = get_gf_res_reserve()->get_logits() != nullptr;
+        probe_max();
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
@@ -968,7 +1268,7 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), no_alloc, no_alloc ? probe_sizes.data() : nullptr);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -977,6 +1277,7 @@ void llama_context::sched_reserve() {
         n_nodes_tg         = ggml_graph_n_nodes(gf);
         n_inputs_tg        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_tg = this->n_input_tensors;
+        probe_max();
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -990,21 +1291,32 @@ void llama_context::sched_reserve() {
                 // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), no_alloc, no_alloc ? probe_sizes.data() : nullptr);
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), no_alloc, no_alloc ? probe_sizes.data() : nullptr);
         };
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+        probe_max();
+    }
+
+    // the placement guard runs on split_only graphs: ggml_backend_sched_reserve ends with a reset, after which no node has a
+    // backend (PLAN-v3 §10). One pass per reserve graph; a violation is an init error.
+    if (qsa_n_layers() > 0) {
+        qsa_guard_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), "pp");
+        if (!cparams.training) {
+            qsa_guard_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), "tg");
+        }
+        ggml_backend_sched_reset(sched.get());
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-        if (!model.hparams.no_alloc) {
+        if (!no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
@@ -1857,6 +2169,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         t_alloc = ggml_time_us() - t_alloc_us;
 
+        // every newly built graph: a QSA node on the wrong backend is an error, never a compute (PLAN-v3 §10)
+        if (!res->get_qsa_nodes().empty()) {
+            const std::string err = qsa_guard(gf, res, "decode");
+            if (!err.empty()) {
+                LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+
         gf_res_prev_active = res;
     }
 
@@ -1886,6 +2208,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+
+    qsa_trace_ubatch(res);
 
     if (ubatch.resident) {
         ggml_backend_event_record(ubatch.resident->done, ubatch.resident->consumer);

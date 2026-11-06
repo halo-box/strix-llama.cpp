@@ -2332,6 +2332,7 @@ int llama_bench(int argc, char ** argv) {
     }
     llama_backend_init();
     llama_numa_init(params.numa);
+    common_qsa_census_begin();
 
     if (!set_process_priority(params.prio)) {
         fprintf(stderr, "%s: error: failed to set process priority\n", __func__);
@@ -2586,6 +2587,7 @@ int llama_bench(int argc, char ** argv) {
         p_err->print_footer();
     }
 
+    common_qsa_census_print();
     llama_backend_free();
 
     return 0;
