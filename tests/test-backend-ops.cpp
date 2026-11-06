@@ -4453,25 +4453,35 @@ struct test_hc_chain : public test_case {
     bool use_scheduler_allocation() override { return true; }
     double max_nmse_err() override { return 5e-4; }
 
+    // inputs only: the scheduler reuses a leaf's memory once its last reader ran, so writing a later node would clobber it
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
             // mix weights in [-1/sqrt(K), 1/sqrt(K)]: the gates stay out of sigmoid saturation
             const float s = mix && strncmp(ggml_get_name(t), "hc_w_", 5) == 0 ? 1.0f / sqrtf((float) t->ne[0]) : 1.0f;
             init_tensor_uniform(t, -s, s);
         }
     }
 
+    // every leaf is flagged as an input so the allocator places all of them before it frees anything
+    static ggml_tensor * input(ggml_tensor * t) {
+        ggml_set_input(t);
+        return t;
+    }
+
     ggml_tensor * build_mix_graph(ggml_context * ctx) {
         const int embd = 2560, hc = 4, lr = 320;
-        auto * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
-        auto * block    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
-        auto * inject   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
+        auto * residual = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens));
+        auto * block    = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens));
+        auto * inject   = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens));
         ggml_tensor * out = nullptr;
         for (int layer = 0; layer < 2; ++layer) {
-            auto * gamma  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc);
-            auto * w_inj  = ggml_new_tensor_2d(ctx, type_w, embd * hc, hc);
-            auto * w_down = ggml_new_tensor_2d(ctx, type_w, embd * hc, lr);
-            auto * w_up   = ggml_new_tensor_2d(ctx, type_w, lr, embd * hc);
+            auto * gamma  = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc));
+            auto * w_inj  = input(ggml_new_tensor_2d(ctx, type_w, embd * hc, hc));
+            auto * w_down = input(ggml_new_tensor_2d(ctx, type_w, embd * hc, lr));
+            auto * w_up   = input(ggml_new_tensor_2d(ctx, type_w, lr, embd * hc));
             ggml_set_name(w_inj, "hc_w_inject");
             ggml_set_name(w_down, "hc_w_down");
             ggml_set_name(w_up, "hc_w_up");
@@ -4505,18 +4515,18 @@ struct test_hc_chain : public test_case {
             return build_mix_graph(ctx);
         }
         const int embd = 2560, hc = 4;
-        auto * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+        auto * residual = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens));
         ggml_tensor * out = nullptr;
         for (int layer = 0; layer < 2; ++layer) {
-            auto * block  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
-            auto * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
-            auto * gamma  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc);   // RMS_NORM and MUL adjacent
+            auto * block  = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens));
+            auto * inject = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens));
+            auto * gamma  = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc));   // RMS_NORM and MUL adjacent
             auto * weight = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 0.25f)), 2.0f);
             weight = ggml_reshape_3d(ctx, weight, 1, hc, tokens);
             if (gf) { ggml_build_forward_expand(gf, residual); ggml_build_forward_expand(gf, block); ggml_build_forward_expand(gf, weight); }
             auto * combined = ggml_add(ctx, residual, ggml_mul(ctx, ggml_repeat(ctx, block, residual), weight));
             auto * norm = ggml_reshape_2d(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, combined, 1e-6f), gamma), embd * hc, tokens);
-            auto * projection = ggml_new_tensor_2d(ctx, type_w, embd * hc, 4);
+            auto * projection = input(ggml_new_tensor_2d(ctx, type_w, embd * hc, 4));
             auto * proj = ggml_mul_mat(ctx, projection, norm);
             if (gf) ggml_build_forward_expand(gf, proj);
             out = out ? ggml_add(ctx, out, proj) : proj;
