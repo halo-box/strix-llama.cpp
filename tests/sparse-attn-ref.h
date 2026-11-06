@@ -234,4 +234,91 @@ static std::vector<float> attend(const view & q, const view & k, const view & v,
     return out;
 }
 
+// f64 oracles of PLAN-v3 §3 (R1-M-Lab A, bands_ref.h), reported only (never gated):
+//   O_C18  q = f16(f16(q) * f16(scale)), K/V = to_float rounded to f16, bf16 saturated to +-65504 first (c18_attn.cu:290)
+//   O_PLAN q * scale in f32, K/V = to_float (no f16 rounding)
+// both with an exact f64 softmax over the row's valid cells. Computed for the queries listed in `queries` (all heads and
+// streams); returns max |gpu - ref| / max |ref| over them, against `got` ([D, n_head, n_q, n_stream] contiguous).
+// Infinite or NaN reference values are skipped (the overflow case).
+enum f64_oracle { O_C18 = 0, O_PLAN = 1 };
+
+static double f64_maxrel(const view & q, const view & k, const view & v, const std::vector<int32_t> & rows, int64_t n_sel,
+                         int64_t n_kv, float scale, int32_t rot_q, int32_t rot_o, const std::vector<int64_t> & queries,
+                         const float * got, f64_oracle mode) {
+    const int64_t D = q.ne[0], n_q = q.ne[1], n_head = q.ne[2], n_stream = q.ne[3];
+    const int64_t r = n_head / k.ne[2];
+    auto row_f = [&](const view & t, int64_t c, int64_t g, int64_t s, std::vector<float> & out) {
+        out.resize(D);
+        const uint8_t * p = t.row(c, g, s);
+        if (t.type == GGML_TYPE_F32) {
+            memcpy(out.data(), p, D * sizeof(float));
+        } else {
+            ggml_get_type_traits(t.type)->to_float(p, out.data(), D);
+        }
+        if (mode == O_C18) {
+            for (int64_t d = 0; d < D; ++d) {
+                float x = out[d];
+                if (t.type == GGML_TYPE_BF16) {
+                    x = std::min(65504.0f, std::max(-65504.0f, x));
+                }
+                out[d] = rh(x);
+            }
+        }
+    };
+    double emax = 0.0, amax = 0.0;
+    std::vector<int32_t> cells;
+    std::vector<float> tmp(D), kr, vr;
+    std::vector<double> qd(D), sc, acc(D);
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t i : queries) {
+            if (i < 0 || i >= n_q) {
+                continue;
+            }
+            row_cells(rows.data() + (size_t) ((s * n_q + i) * n_sel), n_sel, n_kv, cells);
+            for (int64_t h = 0; h < n_head; ++h) {
+                const int64_t kvh = h / r;
+                memcpy(tmp.data(), q.row(i, h, s), D * sizeof(float));
+                fwht(tmp.data(), D, rot_q);
+                for (int64_t d = 0; d < D; ++d) {
+                    qd[d] = mode == O_C18 ? (double) rh(rh(tmp[d]) * rh(scale)) : (double) (tmp[d] * scale);
+                }
+                sc.assign(cells.size(), 0.0);
+                double mx = -INFINITY;
+                for (size_t ci = 0; ci < cells.size(); ++ci) {
+                    row_f(k, cells[ci], kvh, s, kr);
+                    double x = 0.0;
+                    for (int64_t d = 0; d < D; ++d) {
+                        x += qd[d] * (double) kr[d];
+                    }
+                    sc[ci] = x;
+                    mx = std::max(mx, x);
+                }
+                double den = 0.0;
+                std::fill(acc.begin(), acc.end(), 0.0);
+                for (size_t ci = 0; ci < cells.size(); ++ci) {
+                    const double p = std::exp(sc[ci] - mx);
+                    den += p;
+                    row_f(v, cells[ci], kvh, s, vr);
+                    for (int64_t d = 0; d < D; ++d) {
+                        acc[d] += p * (double) vr[d];
+                    }
+                }
+                for (int64_t d = 0; d < D; ++d) {
+                    tmp[d] = den > 0.0 ? (float) (acc[d] / den) : 0.0f;
+                }
+                fwht(tmp.data(), D, rot_o);
+                const float * g = got + (size_t) (((s * n_q + i) * n_head + h) * D);
+                for (int64_t d = 0; d < D; ++d) {
+                    if (!std::isfinite(tmp[d]) || !std::isfinite(g[d])) {
+                        continue;
+                    }
+                    amax = std::max(amax, (double) std::fabs(tmp[d]));
+                    emax = std::max(emax, (double) std::fabs((double) g[d] - (double) tmp[d]));
+                }
+            }
+        }
+    }
+    return amax > 0.0 ? emax / amax : emax;
+}
+
 } // namespace sa_ref
