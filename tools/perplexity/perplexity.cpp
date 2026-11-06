@@ -55,6 +55,27 @@ static int qkl_split() {
     return env ? atoi(env) : 2048;
 }
 
+// QKL_HASH=1: after each chunk, print a 64-bit hash of the bits of the scored logits (the rows the KLD uses), both
+// when the base is recorded and under --kl-divergence. Equal hashes for a chunk mean bit-identical logits, which the
+// uint16 base cannot show (its quantization leaves a self-replay KLD of a few 1e-7 per chunk).
+static void qkl_hash_print(const char * what, int chunk, const float * logits, size_t n) {
+    static const bool on = [] { const char * e = getenv("QKL_HASH"); return e != nullptr && atoi(e) != 0; }();
+    if (!on) {
+        return;
+    }
+    // FNV-1a over the 32-bit words in 4 interleaved lanes, then the lanes combined in order
+    uint64_t h[4] = { 1469598103934665603ULL, 1469598103934665603ULL ^ 1, 1469598103934665603ULL ^ 2, 1469598103934665603ULL ^ 3 };
+    const uint32_t * w = reinterpret_cast<const uint32_t *>(logits);
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        for (int l = 0; l < 4; ++l) { h[l] = (h[l] ^ w[i + l]) * 1099511628211ULL; }
+    }
+    for (; i < n; ++i) { h[0] = (h[0] ^ w[i]) * 1099511628211ULL; }
+    uint64_t r = 1469598103934665603ULL;
+    for (int l = 0; l < 4; ++l) { r = (r ^ h[l]) * 1099511628211ULL; }
+    LOG("QKL_HASH %s %d %016llx n=%zu\n", what, chunk, (unsigned long long) r, n);
+}
+
 struct results_log_softmax {
     double log_softmax;
     float  logit;
@@ -649,6 +670,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
                         prob_history.data()  + start + seq*n_ctx + first);
             }
             count += n_ctx - first - 1;
+            qkl_hash_print("base", i + seq, all_logits, size_t(n_ctx - 1 - first) * n_vocab);
 
             // perplexity is e^(average negative log-likelihood)
             if (params.ppl_output_type == 0) {
@@ -1896,6 +1918,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
                 LOG("QKLD_CHUNK %d all=%.9e lo=%.9e nlo=%d hi=%.9e nhi=%d\n", i + seq, (lo + hi)/std::max(1, nlo + nhi),
                     nlo ? lo/nlo : 0.0, nlo, nhi ? hi/nhi : 0.0, nhi);
             }
+            qkl_hash_print("kld", i + seq, all_logits, size_t(n_ctx - 1 - first) * n_vocab);
             kld_ptr    += n_ctx - 1 - first;
 
             LOG("%4d", i + seq + 1);
