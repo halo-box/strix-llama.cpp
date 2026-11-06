@@ -88,9 +88,9 @@
 #if defined(GGML_USE_HIP)
 // dispatch census and HIP graphs (definitions with the census procs below): the ids dispatched while a graph is being
 // captured are recorded into it, and a replay of the graph counts them again
-static void ggml_cuda_sa_census_capture_begin(std::vector<uint8_t> * ids);
+static void ggml_cuda_sa_census_capture_begin(std::vector<uint16_t> * ids);
 static void ggml_cuda_sa_census_capture_end(void);
-static void ggml_cuda_sa_census_replay(const std::vector<uint8_t> & ids);
+static void ggml_cuda_sa_census_replay(const std::vector<uint16_t> & ids);
 #endif // defined(GGML_USE_HIP)
 
 #include <algorithm>
@@ -9704,22 +9704,22 @@ static void ggml_backend_cuda_set_mmb_small_batch(ggml_backend_t backend, bool e
 #if defined(GGML_USE_HIP)
 static std::atomic<bool>     ggml_cuda_sa_census_on {false};
 static std::atomic<uint64_t> ggml_cuda_sa_census_counts[GGML_CUDA_SA_CENSUS_N];
-static_assert(GGML_CUDA_SA_CENSUS_N <= 256, "census ids are recorded into HIP graphs as uint8_t");
+static_assert(GGML_CUDA_SA_CENSUS_N <= 65536, "census ids are recorded into HIP graphs as uint16_t");
 
 // the census ids of the graph this thread is capturing (recorded whether the census is on or off, so a graph captured
 // before a reset is still counted when it is replayed after it)
-static thread_local std::vector<uint8_t> * ggml_cuda_sa_census_capture = nullptr;
+static thread_local std::vector<uint16_t> * ggml_cuda_sa_census_capture = nullptr;
 
 void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id) {
     if (ggml_cuda_sa_census_capture != nullptr) {
-        ggml_cuda_sa_census_capture->push_back((uint8_t) id);
+        ggml_cuda_sa_census_capture->push_back((uint16_t) id);
     }
     if (ggml_cuda_sa_census_on.load(std::memory_order_relaxed)) {
         ggml_cuda_sa_census_counts[id].fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-static void ggml_cuda_sa_census_capture_begin(std::vector<uint8_t> * ids) {
+static void ggml_cuda_sa_census_capture_begin(std::vector<uint16_t> * ids) {
     ids->clear();
     ggml_cuda_sa_census_capture = ids;
 }
@@ -9728,9 +9728,9 @@ static void ggml_cuda_sa_census_capture_end(void) {
     ggml_cuda_sa_census_capture = nullptr;
 }
 
-static void ggml_cuda_sa_census_replay(const std::vector<uint8_t> & ids) {
+static void ggml_cuda_sa_census_replay(const std::vector<uint16_t> & ids) {
     if (ggml_cuda_sa_census_on.load(std::memory_order_relaxed)) {
-        for (const uint8_t id : ids) {
+        for (const uint16_t id : ids) {
             ggml_cuda_sa_census_counts[id].fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -9823,9 +9823,31 @@ void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id) {
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_USE_HIP)
+// sparse-attention policies of the HIP backend (PLAN-v3 §5; ggml-backend.h ggml_backend_sparse_attn_group_t,
+// ggml_backend_sparse_attn_prefer_dense_t), for the device dev of a QSA layer's K buffer (sparse-attn-attend-g1.cu)
+static int32_t ggml_backend_cuda_sparse_attn_group(ggml_backend_dev_t dev, int64_t n_q_per_stream, int64_t n_kv,
+                                                   enum ggml_type type_k, enum ggml_type type_v, bool shortcut) {
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    return ggml_cuda_sparse_attn_group(device, n_q_per_stream, n_kv, type_k, type_v, shortcut);
+}
+
+static bool ggml_backend_cuda_sparse_attn_prefer_dense(ggml_backend_dev_t dev, enum ggml_type type_k, enum ggml_type type_v,
+                                                       int64_t n_q, int64_t n_kv) {
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    return ggml_cuda_sparse_attn_prefer_dense(device, type_k, type_v, n_q, n_kv);
+}
+#endif // defined(GGML_USE_HIP)
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
 #if defined(GGML_USE_HIP)
+    if (strcmp(name, "ggml_backend_sparse_attn_group") == 0) {
+        return (void *) (ggml_backend_sparse_attn_group_t) ggml_backend_cuda_sparse_attn_group;
+    }
+    if (strcmp(name, "ggml_backend_sparse_attn_prefer_dense") == 0) {
+        return (void *) (ggml_backend_sparse_attn_prefer_dense_t) ggml_backend_cuda_sparse_attn_prefer_dense;
+    }
     if (strcmp(name, "ggml_backend_debug_dispatch_census_reset") == 0) {
         return (void *) ggml_backend_cuda_dispatch_census_reset;
     }

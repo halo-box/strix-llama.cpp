@@ -1408,7 +1408,7 @@ struct ggml_cuda_graph {
     std::vector<node_properties> node_props;
     // dispatch census ids (sparse-attn-census.h) of the kernels captured into this graph: a replay counts them again,
     // so the census counts launches whether HIP graphs are on or off
-    std::vector<uint8_t> census_ids;
+    std::vector<uint16_t> census_ids;
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
