@@ -416,6 +416,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp LINK ggml)
     # the sparse attention plan against the C3 oracle (sparse-attn-ref.h), plus the over-allocation check of the two ops
     llama_build_and_test(test-sparse-attn-plan-oracle.cpp LINK ggml)
+    # Vulkan checks of the two ops: limits, capability gates, rotation against fwht.comp, the workspace sync rule (skips without Vulkan)
+    llama_build_and_test(test-sparse-attn-vk.cpp LINK ggml)
     llama_build_and_test(test-backend-sched-ring.cpp)
 endif()
 

@@ -1378,7 +1378,7 @@ struct test_case {
     // a host reference check of backend1's result, run after the compare (FAILS the case when it returns false)
     virtual bool verify_reference(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
     // --fail-unsupported: true when this backend is expected not to support the case (the per-backend list)
-    virtual bool expected_unsupported(const char * backend_name) { GGML_UNUSED(backend_name); return false; }
+    virtual bool expected_unsupported(ggml_backend_t backend) { GGML_UNUSED(backend); return false; }
     // the weight-context tensors end at the end of their buffer (no post-graph sentinel after them)
     virtual bool weights_end_at_buffer_end() { return false; }
     // suite-level dispatch census (PLAN-v3 §14.1): the key families ("sa_attend/", ...) of the backend census that this
@@ -13477,14 +13477,15 @@ static void sa_init_sel(ggml_tensor * sel, const std::vector<int32_t> & rows) {
     sa_write_rows(sel, rows);
 }
 
-// --fail-unsupported expected-unsupported list (PLAN-v3 §6.3, §14.1): Vulkan has no G = 4 plan or attend, and no
-// K/V binding larger than its 1 GiB buffer maximum
-static bool sa_expected_unsupported(const char * backend_name, int group, size_t k_bytes, size_t v_bytes) {
-    const bool vk = strncmp(backend_name, "Vulkan", 6) == 0;
+// --fail-unsupported expected-unsupported list (PLAN-v3 §6.3, §14.1): Vulkan has no G = 4 plan or attend, and no K/V
+// binding larger than the device allows: its 1 GiB buffer maximum, or a smaller maxStorageBufferRange (lavapipe: 128 MiB)
+static bool sa_expected_unsupported(ggml_backend_t backend, int group, size_t k_bytes, size_t v_bytes) {
+    const bool vk = strncmp(ggml_backend_name(backend), "Vulkan", 6) == 0;
     if (vk && group == 4) {
         return true;
     }
-    if (vk && std::max(k_bytes, v_bytes) > ((size_t) 1 << 30)) {
+    auto limit = (size_t (*)(ggml_backend_t)) census_proc(backend, "ggml_backend_debug_vk_sa_binding_limit");
+    if (vk && std::max(k_bytes, v_bytes) > (limit ? limit(backend) : ((size_t) 1 << 30))) {
         return true;
     }
     return false;
@@ -13509,8 +13510,8 @@ struct test_sparse_attn_plan : public test_case {
         return memcmp(a, b, n * sizeof(float)) == 0 ? 0.0 : 1.0;
     }
     int n_determinism_runs() override { return 2; }
-    bool expected_unsupported(const char * backend_name) override {
-        return sa_expected_unsupported(backend_name, group, 0, 0);
+    bool expected_unsupported(ggml_backend_t backend) override {
+        return sa_expected_unsupported(backend, group, 0, 0);
     }
     std::vector<std::string> census_families() override { return { "sa_plan/" }; }
     // engagement (GPU backends): the compare ran exactly one "sa_plan/G<group>" dispatch and none of the other group
@@ -13636,12 +13637,18 @@ static double sa_band_for_backend(ggml_backend_t backend, int64_t n_sel, std::st
     int n_classes = 0;
     for (const char * const * k = list(); k && *k; ++k) {
         const std::string key = *k;
-        const bool attend = key.rfind("sa_attend/", 0) == 0 || key.rfind("sa_generic/G", 0) == 0 || key.rfind("sa_portable/", 0) == 0;
+        const bool attend = key.rfind("sa_attend/", 0) == 0 || key.rfind("sa_generic/G", 0) == 0 || key.rfind("sa_portable/", 0) == 0 ||
+                            key.rfind("sa_merge/vk/", 0) == 0;
         if (!attend || dispatch_census_count(backend, key.c_str()) <= 0) {
             continue;
         }
         int G = 0, splits = 1;
-        if (key.rfind("sa_attend/G4/", 0) == 0 || key.rfind("sa_generic/G4/", 0) == 0 || key == "sa_portable/G4") {
+        if (key.rfind("sa_attend/vk/", 0) == 0) {
+            G = 1;   // Vulkan: the G1 row of the split class, sa_merge/vk/splits<n> (absent: one pass per query), PLAN-v3 §14.2 (c)
+        } else if (key.rfind("sa_merge/vk/splits", 0) == 0) {
+            G = 1;
+            splits = atoi(key.c_str() + strlen("sa_merge/vk/splits"));
+        } else if (key.rfind("sa_attend/G4/", 0) == 0 || key.rfind("sa_generic/G4/", 0) == 0 || key == "sa_portable/G4") {
             G = 4;
         } else if (key.rfind("sa_attend/G1/", 0) == 0 || key.rfind("sa_generic/G1/", 0) == 0) {
             G = 1;
@@ -13709,8 +13716,8 @@ struct test_sparse_attn : public test_case {
     int n_determinism_runs() override { return 2; }
     bool use_weight_context() override { return at_end != 0; }
     bool weights_end_at_buffer_end() override { return at_end != 0; }
-    bool expected_unsupported(const char * backend_name) override {
-        return sa_expected_unsupported(backend_name, group, (size_t) (D / ggml_blck_size(type_k)) * ggml_type_size(type_k) * kv_rows * n_head_kv * n_stream,
+    bool expected_unsupported(ggml_backend_t backend) override {
+        return sa_expected_unsupported(backend, group, (size_t) (D / ggml_blck_size(type_k)) * ggml_type_size(type_k) * kv_rows * n_head_kv * n_stream,
                                        (size_t) (D / ggml_blck_size(type_v)) * ggml_type_size(type_v) * kv_rows * n_head_kv * n_stream);
     }
 
@@ -14458,6 +14465,8 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
         for (ggml_type tk : S_all) {
             for (ggml_type tv : S_all) {
                 test_cases.emplace_back(new test_sparse_attn(tk, tv, 9, 4096, 257, 1, SA_ROWS_MIX, 12, 1, 0, 0, alt++ % 2));
+                // n_kv < 64 * n_q on G1, one pass per query at the Vulkan split rule (n_wg 130 >= 128): the V staged / pack arms
+                test_cases.emplace_back(new test_sparse_attn(tk, tv, 65, 4096, 257, 1, SA_ROWS_MIX, 12, 1, 0, 0, alt % 2));
             }
         }
     }
@@ -19656,7 +19665,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                             census_suite[*k] += c > 0 ? (uint64_t) c : 0;
                         }
                     }
-                    if (status == test_status_t::NOT_SUPPORTED && g_fail_unsupported && !test->expected_unsupported(ggml_backend_name(b))) {
+                    if (status == test_status_t::NOT_SUPPORTED && g_fail_unsupported && !test->expected_unsupported(b)) {
                         status = test_status_t::FAIL;   // reported "not supported" above; not on this backend's expected list
                     }
                     if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
