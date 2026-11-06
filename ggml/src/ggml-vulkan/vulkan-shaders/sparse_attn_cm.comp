@@ -16,8 +16,9 @@
 // subgroup per (query, K/V head, stream, split), register-built WMMA fragments, the same accumulator layout and the same
 // online softmax. What differs:
 //   - the cells come from the G = 1 plan: one step = 4 plan entries = 16 cells of 4 quads, in the plan's ascending quad
-//     order. A cell's mask bit selects it: a masked or padding cell gets score -inf and zero K and V fragments, by select,
-//     so a NaN or inf stored there cannot reach the output (0 * NaN = NaN in WMMA, PLAN-v3 §2.2);
+//     order. A cell's mask bit selects it: a masked or padding cell gets score -inf (by select: a NaN in its K row reaches
+//     only its own row of S) and a zero V column, so a NaN or inf stored there cannot reach the output (0 * NaN = NaN in
+//     WMMA, PLAN-v3 §2.2);
 //   - K and V of any type of S through sparse_attn_load.glsl: the S_fast types with packed f16 arithmetic (sa_q8x2, sa_q4x2, sa_bf2), the others
 //     through flash_attn_dequant.glsl. V is either direct (fragments built from the loads) or staged (the step's 16 V rows converted into shared
 //     memory, then read): SA_VL, AT-B3;
@@ -285,7 +286,6 @@ void main() {
 
         // this lane's K row
         const uint cur = 4 * qd[col >> 2] + (col & 3);
-        const bool k_live = ((vm >> col) & 1u) != 0;
 
         ACC S = ACC(0.0);
         const uint kr = k_base + cur * p.nbk1;
@@ -293,8 +293,6 @@ void main() {
         [[unroll]] for (uint c = 0; c < D / 16; ++c) {
             uvec4 ka, kb2;
             sa_k16(kr, c, ka, kb2, kst);
-            ka = k_live ? ka : uvec4(0);
-            kb2 = k_live ? kb2 : uvec4(0);
             const uvec4 qa = q_sh[col * QS + 2 * c];
             const uvec4 qb = q_sh[col * QS + 2 * c + 1];
             MAT_A KA;
@@ -385,7 +383,9 @@ void main() {
                 } else {
                     const uint vr = 4 * qd[ke >> 2] + (ke & 3);
                     v = sa_v8(v_base + vr * p.nbv1, hh * 16 + col);
-                    v = ((vm >> ke) & 1u) != 0 ? v : uvec4(0);
+                    if (((vm >> ke) & 1u) == 0) {   // uniform: all lanes take the same branch
+                        v = uvec4(0);
+                    }
                 }
                 f16vec2 t;
                 t = unpackFloat2x16(v.x); VA[0][ke] = t.x; VA[1][ke] = t.y;
