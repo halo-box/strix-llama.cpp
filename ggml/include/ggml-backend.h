@@ -228,6 +228,18 @@ extern "C" {
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
 
+    // Sparse-attention policies (GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN), resolved per backend with
+    // ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "<name>") for the device that holds the K cache.
+    // Without them a caller uses G = 1 and prefer_dense = (type_k == type_v == GGML_TYPE_F16).
+    // "ggml_backend_sparse_attn_group": the work split G (1 or 4) of the plan, for n_q_per_stream queries per stream over
+    // n_kv keys; shortcut = the all-visible rows of the dense-shortcut range (its own decision)
+    typedef int32_t (*ggml_backend_sparse_attn_group_t)(ggml_backend_dev_t dev, int64_t n_q_per_stream, int64_t n_kv,
+                                                        enum ggml_type type_k, enum ggml_type type_v, bool shortcut);
+    // "ggml_backend_sparse_attn_prefer_dense": true when the dense causal attention is preferred over the sparse op in the
+    // dense-shortcut range
+    typedef bool    (*ggml_backend_sparse_attn_prefer_dense_t)(ggml_backend_dev_t dev, enum ggml_type type_k,
+                                                               enum ggml_type type_v, int64_t n_q, int64_t n_kv);
+
     //
     // Backend registry
     //

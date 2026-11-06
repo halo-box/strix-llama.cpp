@@ -1,9 +1,10 @@
 // GGML_OP_SPARSE_ATTN on HIP: kernel selection, workspace size, supports_op and dispatch (PLAN-v3 §2.2, §5, §6.2, §7).
 //
 // Tiers in this file: the G4 WMMA attend for S_fast^2 (sa_attend_g4, sparse-attn-attend-g4.cuh; instances in
-// sparse-attn-attend-g4-<kt>.cu), selected at runtime only on RDNA3.5 (GGML_CUDA_CC_IS_RDNA3_5, the arch PR #219 gates
-// every QSA kernel to, qsa-decode.cu:85), with rot_q = rot_o = 0. The G1 tier (W4), the generic and portable tiers (W5)
-// and the in-op rotation (W10) are not built yet: supports_op is false for those shapes.
+// sparse-attn-attend-g4-<kt>.cu) and the G1 WMMA attend for S_fast^2 (sa_attend_g1, sparse-attn-attend-g1.cuh; instances
+// and launcher in sparse-attn-attend-g1.cu, split merge in sparse-attn-merge.cu), selected at runtime only on RDNA3.5
+// (GGML_CUDA_CC_IS_RDNA3_5, the arch PR #219 gates every QSA kernel to, qsa-decode.cu:85), with rot_q = rot_o = 0. The
+// generic and portable tiers (W5) and the in-op rotation (W10) are not built yet: supports_op is false for those shapes.
 //
 // One shape-only function, sa_select, decides the kernel instance and the V loader; supports_op, get_alloc_size, the
 // dispatch and the census all use it (PLAN-v3 §5 "kernel instance, V pack vs direct, split count").
@@ -16,10 +17,12 @@
 //     direct V: [wave flags: 1 B per (stream, group, kv head, wave) = n_stream x ceil(n_q / 4) x n_head_kv x 8 B]
 //   every flag byte is written at each launch (the any-flag is cleared by a 4-byte memset before the pack), and
 //   sa_attend_fixup reads them.
-//   get_alloc_size takes the max over every G of the policy range ({1, 4}: G1 has no workspace until W4 adds its split
-//   partials) and every n_q' <= n_q at this n_kv, and over every runtime n_kv' <= n_kv: under CAPPED a runtime n_kv'
-//   packs only when n_kv' < 64 * n_q, so the pack bound is min(4 * ceil(n_kv / 4), 64 * n_q) cells, and the flags grow
-//   with n_q (PLAN-v3 §5 "workspace size", §7).
+//   Workspace, G1: the split-K partials [n_stream][n_q][n_head][splits][258] f32 when the shape-only split count
+//   (sa_g1_splits) is > 1, none with one split (the attend writes dst itself).
+//   get_alloc_size takes the max over every G of the policy range ({1, 4}) and every n_q' <= n_q at this n_kv, and over
+//   every runtime n_kv' <= n_kv: under CAPPED a runtime n_kv' packs only when n_kv' < 64 * n_q, so the pack bound is
+//   min(4 * ceil(n_kv / 4), 64 * n_q) cells, the flags grow with n_q, and the G1 partials are maximised over n_q' by
+//   sa_g1_partial_bytes_max (they are not monotone in n_q, R1-C) (PLAN-v3 §5 "workspace size", §7).
 // Test switch GGML_CUDA_SA_FORCE (comma-separated): vpacked | vdirect force the V loader (PLAN-v3 §6.2); it changes the
 // kernel choice inside the backend only, never placement, and get_alloc_size follows it; the census skip proc names the
 // keys a forced process cannot dispatch (ggml_cuda_sparse_attn_census_skip).
@@ -119,6 +122,8 @@ struct sa_selection {
     size_t  qflags_offset; // packed: quad flags, from dst->data
     size_t  any_offset;    // packed: any-flag, from dst->data
     size_t  flags_offset;  // direct: wave flags, from dst->data
+    int64_t splits;        // G1: shape-only split count (sa_g1_splits); 1 for G4
+    size_t  partial_offset;// G1 with splits > 1: split-K partials, from dst->data
     size_t  ws_bytes;      // workspace this op uses from ws_offset
     size_t  ws_max;        // workspace get_alloc_size reserves (max over the policy range, see the header)
     const char * why;     // when !ok
@@ -156,12 +161,14 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
     r.gqa_index = r.n_head_kv > 0 && r.n_head % r.n_head_kv == 0 ? sa_gqa_index(r.n_head / r.n_head_kv) : -1;
     r.ws_offset = GGML_PAD(ggml_nbytes(op), SA_WS_ALIGN);
 
-    // workspace bound over the policy range (G in {1, 4}; G1 has none until W4) at this n_kv: the larger of the packed
-    // layout at the largest pack any runtime op can need and the direct layout at this n_q
+    // workspace bound over the policy range (G in {1, 4}) at this n_kv: the G4 packed layout at the largest pack any
+    // runtime op can need, the G4 direct layout at this n_q, and the largest G1 partials of any n_q' <= n_q
+    r.splits = 1;
     if (r.vt >= 0) {
         const int64_t quads_max = sa_g4_pack_cells_max(r.vt, r.n_q, r.n_kv) / 4;
         const size_t  packed = quads_max > 0 ? sa_g4_packed_ws_bytes(quads_max, r.n_head_kv, r.n_stream) : 0;
         r.ws_max = std::max(packed, sa_g4_flags_bytes(r.n_q, r.n_head_kv, r.n_stream));
+        r.ws_max = std::max(r.ws_max, ggml_cuda_sa_g1_partial_bytes_max(r.n_q, r.n_sel, r.n_kv, r.n_head, r.n_stream));
     }
 
     if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) {
@@ -184,8 +191,17 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
         r.why = "rot_q / rot_o != 0 (in-op rotation: W10)";
         return r;
     }
+    if (r.G == 1) {
+        r.vl     = -1;
+        r.splits = ggml_cuda_sa_g1_splits(r.n_q, r.n_sel, r.n_kv);
+        r.ws_bytes = ggml_cuda_sa_g1_partial_bytes(r.n_q, r.n_head, r.n_stream, r.splits);
+        r.partial_offset = r.ws_offset;
+        GGML_ASSERT(r.ws_bytes <= r.ws_max);
+        r.ok = true;
+        return r;
+    }
     if (r.G != 4) {
-        r.why = "G = 1 plan (G1 tier: W4)";
+        r.why = "plan G other than 1 or 4";
         return r;
     }
     r.vl = sa_g4_vl(r.vt, r.n_q, r.n_kv);
@@ -223,9 +239,13 @@ bool ggml_cuda_sparse_attn_supported(int device, const ggml_tensor * op) {
     if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
         return false;
     }
-    // grid (n_groups, n_head_kv, n_stream) and int indexing of queries / groups / plan entries
+    // grid (G4: (n_groups, n_head_kv, n_stream); G1: (n_stream * n_q * n_head_kv, splits)) and int indexing of queries /
+    // groups / plan entries
     const int64_t n_groups = (sel.n_q + 3) / 4;
     if (sel.n_head_kv > 65535 || sel.n_stream > 65535 || n_groups > INT_MAX || sel.n_q > INT_MAX / 4 || sel.n_head > INT_MAX) {
+        return false;
+    }
+    if (sel.G == 1 && sel.n_stream * sel.n_q * sel.n_head_kv > INT_MAX) {
         return false;
     }
     const ggml_sparse_attn_plan_layout L = ggml_sparse_attn_plan_get_layout(sel.n_sel, sel.n_q, sel.n_stream, sel.n_kv, sel.G);
@@ -306,6 +326,37 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     GGML_ASSERT(ggml_backend_buffer_get_alloc_size(dst->buffer, dst) >= sel.ws_offset + sel.ws_bytes &&
                 "SPARSE_ATTN dst is not over-allocated by the HIP buffer type (get_alloc_size)");
     cudaStream_t stream = ctx.stream();
+
+    if (sel.G == 1) {
+        GGML_ASSERT(epi == SA_EPI_PLAIN && "the gate fusion has G4 instances only (ggml_cuda_sparse_attn_gate_ok)");
+        const uint8_t * pd = (const uint8_t *) plan->data;
+        ggml_cuda_sa_g1_launch_params p = {};
+        p.q = (const char *) q->data; p.k = (const char *) k->data; p.v = (const char *) v->data;
+        for (int i = 0; i < 4; ++i) {
+            p.q_nb[i] = q->nb[i]; p.k_nb[i] = k->nb[i]; p.v_nb[i] = v->nb[i];
+        }
+        p.counts    = (const uint32_t *) (pd + L.off_counts);
+        p.quads     = (const uint32_t *) (pd + L.off_quads);
+        p.masks     = (const uint16_t *) (pd + L.off_masks);
+        p.n_groups  = (int) L.n_groups;
+        p.cap       = (int) L.cap;
+        p.n_q       = (int) sel.n_q;
+        p.n_head    = (int) sel.n_head;
+        p.n_head_kv = (int) sel.n_head_kv;
+        p.n_stream  = (int) sel.n_stream;
+        p.splits    = (int) sel.splits;
+        p.kt        = sel.kt;
+        p.vt        = sel.vt;
+        p.gqa_index = sel.gqa_index;
+        p.scale     = ggml_get_op_params_f32(dst, 0);
+        p.out       = out32;
+        p.partial   = sel.splits > 1 ? (float *) ((char *) dst->data + sel.partial_offset) : nullptr;
+        ggml_cuda_sa_g1_launch(stream, p);
+        if (sel.splits > 1) {
+            ggml_cuda_sa_merge_splits(stream, p.partial, out32, sel.n_stream * sel.n_q * sel.n_head, (int) sel.splits);
+        }
+        return;
+    }
 
     sa_g4_args a = {};
     a.q = (const char *) q->data; a.q_nb1 = q->nb[1]; a.q_nb2 = q->nb[2]; a.q_nb3 = q->nb[3];
