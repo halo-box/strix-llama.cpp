@@ -13508,6 +13508,24 @@ struct test_sparse_attn_plan : public test_case {
     bool expected_unsupported(const char * backend_name) override {
         return sa_expected_unsupported(backend_name, group, 0, 0);
     }
+    // engagement (GPU backends): the compare ran exactly one "sa_plan/G<group>" dispatch and none of the other group
+    // (census keys of PLAN-v3 §6.2); required under --fail-unsupported or GGML_SA_TEST_REQUIRE_CENSUS=1
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if ((dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) || !engagement_required(backend, "GGML_SA_TEST_REQUIRE_CENSUS")) {
+            return true;
+        }
+        const std::string key   = "sa_plan/G" + std::to_string(group);
+        const std::string other = "sa_plan/G" + std::to_string(group == 1 ? 4 : 1);
+        const int64_t n  = dispatch_census_count(backend, key.c_str());
+        const int64_t no = dispatch_census_count(backend, other.c_str());
+        if (n != 1 || no != 0) {
+            msg = "census " + key + "=" + std::to_string(n) + " " + other + "=" + std::to_string(no) + " (want 1 and 0)";
+            return false;
+        }
+        return true;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         sel = sa_new_sel(this, ctx, n_sel, n_q, n_stream, layout);
@@ -13982,6 +14000,12 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
     test_cases.emplace_back(new test_sparse_attn_plan(1, 1, 4, 1, 1, SA_ROWS_PERM));
     test_cases.emplace_back(new test_sparse_attn_plan(3, 1, 4, 4, 2, SA_ROWS_PERM, 1));
     test_cases.emplace_back(new test_sparse_attn_plan(4096, 2051, 8192, 4, 1, SA_ROWS_BLOCKS));
+    // rows longer than a block's LDS (HIP: 2 x n_sel x 4 B > 60 KiB): the global-memory rows and merge kernels
+    for (int64_t nk : {4096, 65536}) {
+        for (int pat : {SA_ROWS_ASC, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_MIX}) {
+            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn_plan(5, 9000, nk, G, 2, pat));
+        }
+    }
 
     // ---- SPARSE_ATTN (PLAN-v3 §14.1) ----
     // every S x S pair (n_q 9, n_kv 4096 >= 64 * n_q: the direct-V regime); alternating K/V view layouts
