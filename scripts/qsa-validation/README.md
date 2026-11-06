@@ -71,6 +71,33 @@ above. Without their environment variables the patches do not change the graph.
 - `w3_attn.cu`, `w3_build.sh`, `w3_campaign.sh`, `w3_summ.py` the kernel-time harness on the C18 rows and the
   V-loader crossover -> `summaries/w3_kernel_time.md`; `w3_attrib.sh` the attribution lab (non-finite check, fixup).
 
+## `harness/w4/`: the W4 done-when (HIP SPARSE_ATTN G1 attend and the G policy, §13 W4)
+
+- `build_hip.sh` HIP build with the rule flags. `tu_all.sh` the `-Werror` TU builds of the W4 TUs
+  (`sparse-attn-attend-g1.cu`, `sparse-attn-merge.cu`, `sparse-attn-attend-g4.cu`, `ggml-cuda.cu`), parsed for
+  spills. `final_w4.sh` runs every build, TU check and test-backend-ops run (one op per run) at the committed tree.
+- `w4_dec.cu` + `build.sh` is the W4 kernel harness. It includes, in one process:
+  - the head of R2-BOP's `bands_dec.cu`, verbatim: the PR decode kernel and C18's `c18_dec_kernel`;
+  - the worktree's G1 / G4 / pack / merge kernels;
+  - `bands_ref.h` fixtures and oracles;
+  - `sa_ref::plan` plans.
+  - Modes: `band` (NMSE vs O_CON, planted defects, run-to-run determinism) and `time` (the C18 protocol).
+- `uni.sh`, `tbo.sh`, `uni_an.py`, `tbo_an.py` run the PR-verbatim decode (R2-BOP `bands_dec`):
+  - on UNI fixtures for the G1 split classes 6-16 and > 33;
+  - on the W4 test-backend-ops G1 dumps.
+  - They give the band rows -> `summaries/w4_bands.md`.
+- `syn1.sh`, `syn1_an.py`: the decode n_q 1 SYN 262k fixture enlarged to 12 layers x 3 seeds
+  (`BANDS_SYN_LAYERS=12`), with the re-set §14.2 (b) row -> `summaries/w4_bands.md`.
+- `c18gate.sh`, `c18gate_an.py`: the G1 kernel gates against C18's decode harness kernel, same run ->
+  `summaries/w4_c18gate.md`.
+- `ata.sh`, `ata_plan.sh` (+ `trunc_rows.py` and W2's `w2_plan`), `ata_an.py`: AT-A G1 vs G4. They give the fitted rule
+  in `sparse-attn-attend-g1.cu`, the D8 re-derivation and the trimmed-layer row -> `summaries/w4_ata.md`.
+- `w4_reserve.cpp`, `atc5.sh`: AT-C5 at op level. The reserve goes through `ggml_backend_sched`, then every runtime
+  n_q' <= ub and n_kv' is run with the policy G and with forced g4 / g1, under `GGML_SCHED_DEBUG_REALLOC=1` ->
+  `summaries/w4_atc5.md`.
+- `w4_procs.cpp` checks the HIP policy procs as llama resolves them: the group rule grid, the prefer_dense table and
+  `GGML_CUDA_SA_FORCE`.
+
 ## Other tools
 
 | path | what | origin |
@@ -83,4 +110,4 @@ above. Without their environment variables the patches do not change the graph.
 | `harness/bands` | R1-A numeric-band harnesses (O_CON reference `bands_ref.h`, `bands_attn.cu`, `bands_dec.cu`, CPU) | `EV/bands/src` |
 | `harness/bandsop` | R2-BOP harnesses with the UNI / TBO fixtures (`UNI:` generator = init_tensor_uniform's distribution, `TBO:` dumps written by `tree_bandsop.diff` from test-backend-ops) | `EV/bandsop/src`, `EV/bandsop/remote/tree_bandsop.diff` |
 | `campaigns/` | `r1/text_campaign.sh`, `r1/img_campaign.sh` (+ `run.sh`), `r1c/runB3.sh` (+ `srv3.sh`), `r1s/r1s.sh`, `r2res/srv.sh`, `r2res/parse.py`, the r1ub / r1e / r1q8 runners and analyzers | `EV/r1`, `EV/r1c`, `EV/r1s`, `EV/r2res`, `EV/r1ub`, `EV/r1e`, `EV/r1q8` |
-| `summaries/` | `kdecide.md`, `compact*.md`, `analysis_op.md`, `res2_summary.md`, `probe_gap.txt`, the R1 analysis outputs; W12: `w12_bands.md` (analyzer output), `w12_chunks.tsv` (every arm's per-chunk KLD, logits hashes and agreement), `w12_campaign*.out` (run lines), `w12_hookobs_campaign.out` (the aborted first pass with the round-1 r1q8 hook); W1: `w1_ocon.md`, `w1_plan_c3.md`; W2: `w2_plan_c3.md`; W3: `w3_prband.md`, `w3_kernel_time.md`, `w3_resources_tests.md` | as named; W12 logs in `strix-002:~/dev/wt_lab/w12/logs`, W1 results in `strix-002:~/dev/wt_lab/w1/res`, W2 results in `strix-002:~/dev/wt_lab/w2/res`, W3 results in `strix-002:~/dev/wt_lab/w3/{c18,prband,attrib}` |
+| `summaries/` | `kdecide.md`, `compact*.md`, `analysis_op.md`, `res2_summary.md`, `probe_gap.txt`, the R1 analysis outputs; W12: `w12_bands.md` (analyzer output), `w12_chunks.tsv` (every arm's per-chunk KLD, logits hashes and agreement), `w12_campaign*.out` (run lines), `w12_hookobs_campaign.out` (the aborted first pass with the round-1 r1q8 hook); W1: `w1_ocon.md`, `w1_plan_c3.md`; W2: `w2_plan_c3.md`; W3: `w3_prband.md`, `w3_kernel_time.md`, `w3_resources_tests.md`; W4: `w4_bands.md`, `w4_c18gate.md`, `w4_ata.md`, `w4_atc5.md`, `w4_resources_tests.md` | as named; W12 logs in `strix-002:~/dev/wt_lab/w12/logs`, W1 results in `strix-002:~/dev/wt_lab/w1/res`, W2 results in `strix-002:~/dev/wt_lab/w2/res`, W3 results in `strix-002:~/dev/wt_lab/w3/{c18,prband,attrib}`, W4 results in `strix-002:~/dev/wt_lab/w4/{prband,bands,reserve}` |
