@@ -1401,6 +1401,9 @@ struct ggml_cuda_graph {
         void *   node_src_data_ptrs[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+        // the source types: kernels are chosen by them, and two types of one element size (F16 / BF16) give equal
+        // pointers, ne and nb, so a graph whose sources changed type only must not be replayed
+        int32_t  node_src_type[GGML_MAX_SRC];
     };
     std::vector<node_properties> node_props;
     // dispatch census ids (sparse-attn-census.h) of the kernels captured into this graph: a replay counts them again,

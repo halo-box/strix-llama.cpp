@@ -1035,6 +1035,8 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : tensor->op == GGML_OP_SPARSE_ATTN_PLAN
         ? ggml_cuda_sparse_attn_plan_get_alloc_size(tensor)   // max dst over the G range + sort/dedup scratch
+        : tensor->op == GGML_OP_SPARSE_ATTN
+        ? ggml_cuda_sparse_attn_get_alloc_size(buft_ctx->device, tensor)   // + max workspace (V pack) over G and n_q' <= n_q
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
@@ -2717,6 +2719,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SPARSE_ATTN_PLAN:
             ggml_cuda_sparse_attn_plan(ctx, dst);
             break;
+        case GGML_OP_SPARSE_ATTN:
+            ggml_cuda_sparse_attn(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -2937,6 +2942,9 @@ static ggml_cuda_graph::node_properties ggml_cuda_graph_node_props(const ggml_te
             prop.node_src_data_ptrs[j] = node->src[j]->data;
             memcpy(prop.node_src_ne[j], node->src[j]->ne, sizeof(prop.node_src_ne[j]));
             memcpy(prop.node_src_nb[j], node->src[j]->nb, sizeof(prop.node_src_nb[j]));
+            prop.node_src_type[j] = (int32_t) node->src[j]->type;
+        } else {
+            prop.node_src_type[j] = -1;
         }
     }
 
@@ -6753,6 +6761,77 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // sparse-attention gate fusion (PLAN-v3 §6.2, O28): SPARSE_ATTN -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .)
+    // runs the EPI = gated G4 instance: sigmoid(gate) * O in the attend epilogue, the SPARSE_ATTN output itself is never
+    // stored. The gate rows R = (s * n_q + i) * n_head + h are read at gate->data + R * gate->nb[1], so the gate is
+    // [D, n_head, n_q, n_stream] or [D, n_head, n_q * n_stream] with contiguous heads (the qwen4exp view of Qcur_full).
+#if defined(GGML_USE_HIP)
+    if (node->op == GGML_OP_SPARSE_ATTN && (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && ggml_is_contiguous(node) &&
+            ggml_cuda_sparse_attn_gate_ok(cuda_ctx->device, node)) {
+        int j = i + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) ++j;
+        if (j + 2 < cgraph->n_nodes) {
+            ggml_tensor * cont = cgraph->nodes[j], * unary = cgraph->nodes[j + 1], * mul = cgraph->nodes[j + 2];
+            const ggml_tensor * gate = cont->src[0];
+            const ggml_tensor * other = mul->op == GGML_OP_MUL ? (mul->src[0] == unary ? mul->src[1] : mul->src[0]) : nullptr;
+            const int64_t n_rows = node->ne[1] * node->ne[2] * node->ne[3];   // n_head * n_q * n_stream
+            bool ok = cont->op == GGML_OP_CONT && unary->op == GGML_OP_UNARY && ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID &&
+                unary->src[0] == cont && mul->op == GGML_OP_MUL && (mul->src[0] == unary || mul->src[1] == unary) && other &&
+                (other == node || other->view_src == node) && ggml_is_contiguous(other) && ggml_nelements(other) == ggml_nelements(node) &&
+                gate != nullptr && gate->type == GGML_TYPE_F32 && gate->nb[0] == sizeof(float) && gate->ne[0] == node->ne[0] &&
+                gate->ne[1] == node->ne[1] && gate->ne[2] * gate->ne[3] == node->ne[2] * node->ne[3] &&
+                (gate->ne[3] == 1 || (gate->ne[2] == node->ne[2] && gate->nb[3] == gate->nb[2] * gate->ne[2])) &&
+                gate->nb[2] == gate->nb[1] * gate->ne[1] &&
+                // the gated epilogue reads the gate in float4: 16-byte rows and base
+                ((uintptr_t) gate->data % 16) == 0 && gate->nb[1] % 16 == 0 &&
+                ggml_are_same_shape(unary, cont) && ggml_nelements(unary) == ggml_nelements(node) &&
+                ggml_are_same_shape(mul->src[0], mul->src[1]) && ggml_is_contiguous(mul) &&
+                mul->type == GGML_TYPE_F32 && ggml_nelements(mul) == ggml_nelements(node) && ggml_nrows(node) == n_rows &&
+                ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { j + 2 });
+            for (int k = 0; k < cgraph->n_nodes && ok; ++k) {   // the attend output is read only through views by the MUL
+                const ggml_tensor * t = cgraph->nodes[k];
+                if (k == i || t == mul || ggml_cuda_is_view_or_noop(t)) continue;
+                for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                    if (t->src[s] == node || t->src[s]->view_src == node) ok = false;
+                }
+            }
+            bool f16 = false;
+            uint16_t * dst16 = nullptr;
+            bool store_f32 = true;
+            if (ok) {
+                dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, j + 2, mul, &f16);
+                store_f32 = !(dst16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, mul));
+            }
+            if (ok) {   // what the kernel writes must not overlap anything it reads (q, k, v, plan, gate, and the V pack
+                        // workspace in the node's own over-allocation). The allocator may hand the gated output the
+                        // memory of Q (dead after the attend): harmless when only the 16-bit copy is written
+                auto overlap = [](const void * a, size_t na, const void * b, size_t nb) {
+                    const uintptr_t x = (uintptr_t) a, y = (uintptr_t) b; return na > 0 && nb > 0 && x < y + nb && y < x + na; };
+                size_t ws_off = 0, ws_bytes = 0;
+                ggml_cuda_sparse_attn_ws_range(cuda_ctx->device, node, &ws_off, &ws_bytes);
+                struct range { const void * p; size_t n; };
+                std::vector<range> reads;
+                const ggml_tensor * gs = gate->view_src ? gate->view_src : gate;
+                for (const ggml_tensor * r : std::initializer_list<const ggml_tensor *>{ node->src[0], node->src[1], node->src[2], node->src[3], gs }) {
+                    if (!r) continue;
+                    const ggml_tensor * rr = r->view_src ? r->view_src : r;
+                    reads.push_back({ rr->data, ggml_nbytes(rr) });
+                }
+                reads.push_back({ (const char *) node->data + ws_off, ws_bytes });
+                for (const range & rd : reads) {
+                    if (store_f32 && overlap(mul->data, ggml_nbytes(mul), rd.p, rd.n)) ok = false;
+                    if (dst16 && overlap(dst16, (size_t) ggml_nelements(mul) * sizeof(uint16_t), rd.p, rd.n)) ok = false;
+                }
+            }
+            if (ok) {
+                ggml_cuda_sparse_attn_gated(*cuda_ctx, node, gate, store_f32 ? (float *) mul->data : nullptr, dst16, f16);
+                return j + 2 - i;
+            }
+            ggml_cuda_mmb_cache_unproduce(*cuda_ctx, dst16);   // not fused: the gated output is computed (and copied) later
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
     // FA gate fusion: FLASH_ATTN_EXT (fa7 or qsa prefill) -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .): the
     // gate in the attention epilogue; the FA output itself is never stored
     const bool fa_gate_qsa = node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_qsa_gate_ok(*cuda_ctx, node);
@@ -9445,6 +9524,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_SPARSE_ATTN_PLAN:
             return ggml_cuda_sparse_attn_plan_supported(dev_ctx->device, op);   // HIP only; false on CUDA builds
+        case GGML_OP_SPARSE_ATTN:
+            return ggml_cuda_sparse_attn_supported(dev_ctx->device, op);        // HIP only; false on CUDA builds
 
         default:
             return false;
@@ -9708,9 +9789,13 @@ static const char * const * ggml_backend_cuda_dispatch_census_list(void) {
     return ggml_cuda_sa_census_keys;
 }
 
-// NULL when label is a compiled key or a prefix of one; otherwise this backend never counts it
+// NULL when label is a compiled key or a prefix of one that this process can dispatch; otherwise why this backend never
+// counts it (not a key, or excluded by a forcing switch such as GGML_CUDA_SA_FORCE)
 static const char * ggml_backend_cuda_dispatch_census_skip(ggml_backend_t backend, const char * label) {
     GGML_UNUSED(backend);
+    if (const char * why = ggml_cuda_sparse_attn_census_skip(label)) {
+        return why;
+    }
     for (int i = 0; i < GGML_CUDA_SA_CENSUS_N; ++i) {
         if (ggml_cuda_sa_census_key_under(ggml_cuda_sa_census_keys[i], label)) {
             return nullptr;
