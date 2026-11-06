@@ -216,6 +216,67 @@ __device__ __forceinline__ uint4 mmb_lb_decode(const typename mmb_lb<WTYPE>::gri
         return mmb_lb<WTYPE>::decode(g, f, sub, il);
     }
 }
+// M-split decoders for the 3-value IQ2 grids: one lane decodes 16 consecutive weights of a row (groups il = 2 pc, 2 pc + 1
+// of one 32-block, which share their scale). Every IQ2_XXS / IQ2_XS / IQ2_S grid byte is 8, 25 or 43, so the three
+// values RNE_bf16(d * 8), RNE_bf16(d * 25), RNE_bf16(d * 43) are formed once per 16 weights and v_perm picks one per
+// weight from the grid's 2-bit codes; signs are the bf16 sign-bit XOR (RNE is sign-symmetric). Same fp32 d and products
+// as mmb_lb<>::decode / mmb_grid8_bf16 -> bit-identical.
+__device__ __forceinline__ uint32_t mmb_rne_hi(const float x) { const uint32_t u = __float_as_uint(x); return u + 0x7fffu + ((u >> 16) & 1u); }
+__device__ __forceinline__ void mmb_iq2_tab(const float d, uint32_t & lo, uint32_t & hi) {
+    lo = __builtin_amdgcn_perm(mmb_rne_hi(d * 25.0f), mmb_rne_hi(d * 8.0f), 0x07060302u);   // value 0 | value 1 << 16
+    hi = mmb_rne_hi(d * 43.0f) >> 16;                                                         // value 2
+}
+// 8 weights: c = 8 two-bit codes (weight j at bits 2 j), sg = 8 sign bits
+__device__ __forceinline__ uint4 mmb_iq2_dec8(const uint32_t c, const uint32_t lo, const uint32_t hi, const uint32_t sg) {
+    uint32_t o[4];
+#pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        const uint32_t c8 = (c >> (8 * b)) & 0xffu;
+        const uint32_t t = (c8 | (c8 << 12)) & 0x000f000fu;
+        const uint32_t s = ((t | (t << 6)) & 0x03030303u) << 1;   // byte j = 2 q_j
+        o[2 * b]     = __builtin_amdgcn_perm(hi, lo, __builtin_amdgcn_perm(s | 0x01010101u, s, 0x05010400u));
+        o[2 * b + 1] = __builtin_amdgcn_perm(hi, lo, __builtin_amdgcn_perm(s | 0x01010101u, s, 0x07030602u));
+    }
+    return make_uint4(o[0] ^ ((sg &  1u) << 15 | (sg &   2u) << 30), o[1] ^ ((sg &  4u) << 13 | (sg &   8u) << 28),
+                      o[2] ^ ((sg & 16u) << 11 | (sg &  32u) << 26), o[3] ^ ((sg & 64u) <<  9 | (sg & 128u) << 24));
+}
+template <int WTYPE> struct mmb_ms3 { static constexpr bool ok = false; };
+template <> struct mmb_ms3<32 + GGML_TYPE_IQ2_S> {
+    static constexpr bool ok = true; using grid_t = uint16_t; static constexpr int N = 1024, NR = 5;
+    static __device__ __forceinline__ grid_t entry(const int i) { return mmb_lb<32 + GGML_TYPE_IQ2_S>::entry(i); }
+    static __device__ __forceinline__ void fetch(const uint8_t * row, const int ks, const int q, const int pc, uint32_t (&f)[NR]) {
+        const block_iq2_s * x = (const block_iq2_s *) row + (ks * 64) / QK_K;
+        const int ib = ((ks * 64) % QK_K) / 32 + q;
+        f[0] = *(const uint16_t *) (x->qs + 4 * ib + 2 * pc); f[1] = x->qh[ib]; f[2] = *(const uint16_t *) (x->qs + QK_K / 8 + 4 * ib + 2 * pc);
+        f[3] = x->scales[ib]; f[4] = *(const uint16_t *) &x->d;
+    }
+    static __device__ __forceinline__ void decode(const grid_t * g, const uint32_t (&f)[NR], const int pc, uint4 & w0, uint4 & w1) {
+        const float d = mmb_h2f((uint16_t) f[4]) * (0.5f + ((f[3] >> 4 * pc) & 0xf)) * 0.25f;
+        uint32_t lo, hi; mmb_iq2_tab(d, lo, hi);
+        const uint32_t i0 = (f[0] & 0xff) | ((f[1] << (8 - 4 * pc)) & 0x300), i1 = (f[0] >> 8) | ((f[1] << (6 - 4 * pc)) & 0x300);
+        w0 = mmb_iq2_dec8(g[i0], lo, hi, f[2] & 0xff); w1 = mmb_iq2_dec8(g[i1], lo, hi, f[2] >> 8);
+    }
+};
+template <> struct mmb_ms3<32 + GGML_TYPE_IQ2_XXS> {
+    static constexpr bool ok = true; using grid_t = uint16_t; static constexpr int N = 256, NR = 3;
+    static __device__ __forceinline__ grid_t entry(const int i) {
+        const uint64_t g = iq2xxs_grid[i]; uint32_t c = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { const uint32_t b = (g >> (8 * j)) & 0xff; c |= ((uint32_t) (b > 8) + (uint32_t) (b > 25)) << (2 * j); }
+        return (grid_t) c;
+    }
+    static __device__ __forceinline__ void fetch(const uint8_t * row, const int ks, const int q, const int pc, uint32_t (&f)[NR]) {
+        const block_iq2_xxs * x = (const block_iq2_xxs *) row + (ks * 64) / QK_K;
+        const uint16_t * q2 = x->qs + 4 * (((ks * 64) % QK_K) / 32 + q);
+        f[0] = q2[2] | ((uint32_t) q2[3] << 16); f[1] = *(const uint16_t *) &x->d; f[2] = q2[pc];
+    }
+    static __device__ __forceinline__ void decode(const grid_t * g, const uint32_t (&f)[NR], const int pc, uint4 & w0, uint4 & w1) {
+        const float d = mmb_h2f((uint16_t) f[1]) * (0.5f + (f[0] >> 28)) * 0.25f;
+        uint32_t lo, hi; mmb_iq2_tab(d, lo, hi);
+        w0 = mmb_iq2_dec8(g[f[2] & 0xff], lo, hi, mmb_ksigns((f[0] >> (14 * pc)) & 127));
+        w1 = mmb_iq2_dec8(g[f[2] >> 8], lo, hi, mmb_ksigns((f[0] >> (14 * pc + 7)) & 127));
+    }
+};
 
 // F16: store F16 instead of BF16 weights (IQ1_M only)
 template <ggml_type TYPE, bool F16 = false>

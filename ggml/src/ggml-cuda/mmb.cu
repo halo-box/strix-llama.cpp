@@ -992,8 +992,8 @@ __device__ __forceinline__ mmb_v8u mmb_ms_xhalf(const mmb_v8u x) {
 
 // Big GLU tier (64 rows x 128 tokens) with the weights decoded in registers. Wave w owns the gate (w < 4) or up (w >= 4)
 // rows 16 (w & 3) .. +15 and all 128 tokens: its accumulators are 8 token fragments of one matrix, so every decoded weight
-// still serves 128 tokens. The weights are the first WMMA operand, straight from mmb_lb decode (one decode per weight,
-// mmb_ms_piece), the tokens the second (bf16 in LDS, double-buffered, one barrier per K step). Same bf16 weights and
+// still serves 128 tokens. The weights are the first WMMA operand, straight from the mmb_ms3 decode (one decode per
+// weight, mmb_ms_piece), the tokens the second (bf16 in LDS, double-buffered, one barrier per K step). Same bf16 weights and
 // ascending K order per output as mmb_tile_gemm_glu, transposed -> bit-identical; accumulator lane (n, h) holds weight
 // rows 2 v + h, token n. The up waves pass their accumulators to the gate waves through LDS for silu(gate) * up.
 template <int WTYPE>
@@ -1005,8 +1005,8 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     NO_DEVICE_CODE;
 #else
-    using LBT = mmb_lb<WTYPE>;
-    static_assert(LBT::ok && mmb_glu_ms_type(WTYPE), "BF16 grid types only");
+    using LBT = mmb_ms3<WTYPE>;
+    static_assert(LBT::ok && mmb_glu_ms_type(WTYPE), "3-value IQ2 grid types only");
     constexpr int BM = 64, BN = 128, TN = BN / 16, BSZ = BN * MMB_LDS_STRIDE, B_ITEMS = BN * 8 / MMB_NT;
     static_assert(2 * BSZ * 2 >= 4 * TN * 8 * 32 * 4, "the epilogue's fp32 exchange reuses Bs");
     __shared__ __align__(16) uint16_t Bs[2 * BSZ];
@@ -1024,12 +1024,10 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
     const uint8_t * wrow = (wave < 4 ? Wg : Wu) + (size_t) e * expert_bytes + (size_t) min(m0 + rg * 16 + r, M - 1) * wrow_bytes;
     for (int i = tid; i < LBT::N; i += MMB_NT) lbgrid[i] = LBT::entry(i);
 
-    uint32_t f[2][2][LBT::NR];   // [32-K half][group of the lane's piece] raw fields of one K step
+    uint32_t f[2][LBT::NR];   // [32-K half] raw fields of the lane's 16 weights of one K step
     auto fetch = [&](const int ks) {
 #pragma unroll
-        for (int q = 0; q < 2; ++q)
-#pragma unroll
-            for (int t = 0; t < 2; ++t) LBT::fetch(wrow, ks, q, 2 * pc + t, f[q][t]);
+        for (int q = 0; q < 2; ++q) LBT::fetch(wrow, ks, q, pc, f[q]);
     };
     const uint16_t * bsrc[B_ITEMS];
     bool bzero[B_ITEMS];
@@ -1069,7 +1067,7 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
             mmb_v8u w[2];
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
-                const uint4 lo = mmb_lb_decode<WTYPE>(lbgrid, f[q][0], q, 2 * pc, ks), hi = mmb_lb_decode<WTYPE>(lbgrid, f[q][1], q, 2 * pc + 1, ks);
+                uint4 lo, hi; LBT::decode(lbgrid, f[q], pc, lo, hi);
                 w[q] = mmb_v8u{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
             }
             if (ks + 1 < nks) { fetch(ks + 1); load_b(ks + 1); }
