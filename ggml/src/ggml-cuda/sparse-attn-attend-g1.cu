@@ -51,19 +51,35 @@ static int sa_force_group(void) {
     return g;
 }
 
-// AT-A crossover (PLAN-v3 §16.5): G1 where the G1 attend beats min(G4 packed + pack, G4 direct) by more than 3 x the
-// p90 run-to-run noise, else G4. Until the fit below replaces it: the default n_q < 128 ? 1 : 4 (C1 d3, C13 d1-d2).
+// AT-A crossover (PLAN-v3 §16.5), fitted on the W4 kernels (scripts/qsa-validation/summaries/w4_ata.md): G1 where
+// t_G1 = plan(G1) + G1 attend (+ merge) beats t_G4 = plan(G4) + min(G4 packed + pack, G4 direct) by more than 3 x the
+// p90 run-to-run noise (p90 0.33 % over 1188 samples: margin 1 %) at every tested n_q up to the threshold, on every
+// fixture of the n_kv class (C18 wiki / rand rows at n_kv 8192 and 135168 with SYN data, SYN:1.8 plans at 32768 and
+// 65536; n_q 2 .. 512; C18 protocol, two processes). Keyed by the V type (D3: (n_q, n_kv, T_v)); n_kv is mapped to the
+// nearest measured class on a log scale (boundaries at the geometric midpoints 16384, 46341, 94118); n_kv > 135168 uses
+// the 135168 class and n_q between two tested values takes the lower one's verdict (both UNPROVEN extrapolations).
+// Types outside S_fast (the generic tier, W5) keep the default n_q < 128 (C1 d3, C13 d1-d2).
 bool ggml_cuda_sa_g1_beats_g4(int64_t n_q_per_stream, int64_t n_kv, ggml_type type_k, ggml_type type_v) {
-    GGML_UNUSED(n_kv);
     GGML_UNUSED(type_k);
-    GGML_UNUSED(type_v);
-    return n_q_per_stream < 128;
+    // largest n_q with G1: [V f16, bf16, q8_0, q4_0][n_kv class 8192, 32768, 65536, 135168]
+    static const int64_t nq_max[4][4] = {
+        { 32, 16, 16,  64 },
+        { 32, 32, 16,  64 },
+        { 32, 32, 32,  96 },
+        { 32, 64, 64, 128 },
+    };
+    const int tv = sa_policy_type(type_v);
+    if (tv < 0) {
+        return n_q_per_stream < 128;
+    }
+    const int c = n_kv < 16384 ? 0 : n_kv < 46341 ? 1 : n_kv < 94118 ? 2 : 3;
+    return n_q_per_stream <= nq_max[tv][c];
 }
 
 // The work split G of a QSA layer's plan (D3). Inputs: queries per stream, n_kv, the K / V types, and whether the layer
 // is in the dense shortcut (all-visible rows, n_kv <= top_k + r - 1), which has its own decision (P2-9).
 //
-// Past the shortcut: the two-way rule fitted by AT-A (PLAN-v3 §16.5) on the W4 kernels, see ggml_cuda_sa_g1_beats_g4.
+// Past the shortcut: the two-way rule fitted by AT-A (PLAN-v3 §16.5) on the W4 kernels (ggml_cuda_sa_g1_beats_g4).
 // In the shortcut: the default n_q < 128 ? 1 : 4 (C1 d3, C13) until AT-W7PERF (W7) measures the all-visible rows.
 int ggml_cuda_sparse_attn_group(int device, int64_t n_q_per_stream, int64_t n_kv, ggml_type type_k, ggml_type type_v, bool shortcut) {
     GGML_UNUSED(device);
