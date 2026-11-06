@@ -1,6 +1,6 @@
 #!/bin/bash
 # AT-W12-BANDS + W12 done-when campaign on W0-lab (PLAN-v3 §13 W12, §16.5 AT-W12-BANDS).
-#   campaign.sh PHASE...   phases: A (ref8t0: self, control, H1, direct form incl. H3) C (ref16t0: H2 + agreement control)
+#   campaign.sh PHASE...   phases: S (QKL_HASH bit-identity of every self-replay) A (ref8t0: self, control, H1, direct form incl. H3) C (ref16t0: H2 + agreement control)
 #                                  D (ref32x8: H4) V (W0-Vulkan: V1, V2) B (ref8L: Q11a lo/hi split, U40) E (ref2k: Q11b shift)
 # Each reference (base.kld + pins) is deleted after its phase; logs and .stats stay in $LOGS.
 set -u
@@ -85,6 +85,18 @@ phase_E() {
   done
   for t in f16 q8_0; do W12_B=2048 $RUN e_${t}_${t}_u16 $F replay $t $t 16 2048 16 hip; done
   rm -rf $F
+}
+phase_S() {
+  # bit-identity of every self-replay (QKL_HASH=1): each reference is recorded again and replayed by itself; the
+  # per-chunk logits hashes of the record and of the replay must match, and the replay's QKLD_CHUNK values must equal
+  # those of the phase that used the reference (so the re-recorded reference is the same one)
+  local H=QKL_HASH=1
+  $RUN s_ref8t0_rec $R/s8 record f16 f16 4096 8192 8 hip $T0 $H;                  $RUN s_ref8t0_self $R/s8 replay f16 f16 4096 8192 8 hip $H; rm -rf $R/s8
+  $RUN s_ref16t0_rec $R/s16 record f16 f16 4096 8192 16 hip $T0 $H;               $RUN s_ref16t0_self $R/s16 replay f16 f16 4096 8192 16 hip $H; rm -rf $R/s16
+  $RUN s_ref32x8_rec $R/s32 record f16 f16 4096 32768 8 hip $T0 QKL_TAIL=4096 $H; $RUN s_ref32x8_self $R/s32 replay f16 f16 4096 32768 8 hip QKL_TAIL=4096 $H; rm -rf $R/s32
+  $RUN s_vref8t0_rec $R/sv record f16 f16 4096 8192 8 vk $T0 $H;                  $RUN s_vref8t0_self $R/sv replay f16 f16 4096 8192 8 vk $H; rm -rf $R/sv
+  $RUN s_ref8L_rec $R/sL record f16 f16 4096 8192 8 hip $T0 QKL_TAIL=8191 $H;     $RUN s_ref8L_self $R/sL replay f16 f16 4096 8192 8 hip QKL_TAIL=8191 QKL_SPLIT=2048 $H; rm -rf $R/sL
+  W12_B=2048 $RUN s_ref2k_rec $R/s2 record f16 f16 2048 2048 16 hip $T0 $H;       W12_B=2048 $RUN s_ref2k_self $R/s2 replay f16 f16 2048 2048 16 hip $H; rm -rf $R/s2
 }
 for ph in "$@"; do echo "PHASE $ph start $(date +%T)"; phase_$ph; echo "PHASE $ph done $(date +%T)"; done
 echo CAMPAIGN_DONE $(date +%T)

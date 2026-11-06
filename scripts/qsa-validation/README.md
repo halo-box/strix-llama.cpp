@@ -11,6 +11,9 @@ ones they ran with on strix-002 and are kept as run. `EV/` below is the checksum
   chunk's `kld_values` (the cumulative table is printed with 5 decimals). Chunk index 0-based.
 - `QKL_TAIL=N`: score the last N positions of each chunk (2 <= N <= n_ctx - 1). Use the same N for the base and its arms.
 - `QKL_SPLIT=P`: lo / hi split point of the QKLD_CHUNK line (default 2048).
+- `QKL_HASH=1`: `QKL_HASH {base|kld} <chunk> <hash> n=<floats>` per chunk, a 64-bit FNV-1a hash of the bits of the
+  scored logits, printed when the base is recorded and under `--kl-divergence`: a self-replay is bit-identical iff the
+  hashes match chunk by chunk (the uint16 base leaves a self-replay KLD of a few 1e-7 per chunk, so the KLD cannot show it).
 
 ## `patches/`: the PR219 measurement arm (W0-lab)
 
@@ -31,7 +34,7 @@ above. Without their environment variables the patches do not change the graph.
 ## `w12/`: the W12 done-when and AT-W12-BANDS campaign (§16.5)
 
 - `run.sh` one perplexity arm (modes record / replay / observe / pinbase / pinkld; HIP, Vulkan, round-1 Vulkan).
-- `campaign.sh A C D V B E` the phases: A = ref8t0 (self-replay, control, H1, direct form incl. H3), C = ref16t0 (H2,
+- `campaign.sh S A C D V B E` the phases: S = QKL_HASH bit-identity of every self-replay, A = ref8t0 (self-replay, control, H1, direct form incl. H3), C = ref16t0 (H2,
   agreement control), D = ref32x8 (H4), V = W0-Vulkan (V1, V2), B = ref8L (Q11a lo/hi split, U40), E = ref2k (Q11b shift).
   Each reference is deleted after its phase.
 - `analyze_w12.py LOGDIR EVDIR` pre-registered formulas -> `summaries/w12_bands.md`.
