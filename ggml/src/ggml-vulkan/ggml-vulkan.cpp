@@ -11400,6 +11400,21 @@ static bool ggml_backend_vk_sparse_attn_prefer_dense(ggml_backend_dev_t, enum gg
     return type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16;   // the default until AT-B4
 }
 
+static const char * ggml_backend_vk_sparse_attn_unsupported_reason(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+    const vk_device device = ggml_vk_get_device(ctx->device);
+    if (ggml_vk_sa_tier(device) == VK_SA_TIER_NONE) {
+        return "Vulkan device lacks the pipelines of every sparse-attention tier";
+    }
+    if (op->op == GGML_OP_SPARSE_ATTN) {
+        if (ggml_backend_dev_supports_op(dev, op)) {
+            return nullptr;
+        }
+        return ggml_vk_sa_select(device, op).pipeline == nullptr ? "type pair not supported" : "a binding of this shape exceeds the device limits";
+    }
+    return ggml_backend_dev_supports_op(dev, op) ? nullptr : "plan shape not supported on this Vulkan device";
+}
+
 // the dst descriptor of a sparse node, and its workspace right after it (P2-19)
 static vk_subbuffer ggml_vk_sa_ws_subbuffer(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, const vk_subbuffer & dst_buf, const size_t offset, const size_t bytes) {
     const size_t off = ggml_vk_sa_round_up(ctx->device, ggml_nbytes(dst)) + offset;
@@ -22972,6 +22987,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_sparse_attn_prefer_dense") == 0) {
         return (void *) (ggml_backend_sparse_attn_prefer_dense_t) ggml_backend_vk_sparse_attn_prefer_dense;
+    }
+    if (strcmp(name, "ggml_backend_sparse_attn_unsupported_reason") == 0) {
+        return (void *) (ggml_backend_sparse_attn_unsupported_reason_t) ggml_backend_vk_sparse_attn_unsupported_reason;
     }
     return nullptr;
 }

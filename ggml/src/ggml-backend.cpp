@@ -2293,8 +2293,8 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(sizes);
 
-    ggml_backend_sched_reset(sched);
-
+    // no reset here: it would wipe the placement the caller set while building measure_graph (ggml_backend_sched_set_tensor_backend).
+    // The caller resets before it builds the graph (llama_context::graph_reserve, the only caller)
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);

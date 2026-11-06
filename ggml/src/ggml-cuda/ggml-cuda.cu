@@ -7051,7 +7051,7 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
         } else if ((mask & 4) && name_is(t, "Vcur", sfx)) {
             const int iq = find(i - 16, i,     [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "Qcur_full", sfx); });
             const int ik = find(i + 1, i + 8,  [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "Kcur", sfx); });
-            const int b  = find(i + 1, i + 48, [](const ggml_tensor * u) { return u->op == GGML_OP_FLASH_ATTN_EXT; });
+            const int b  = find(i + 1, i + 48, [](const ggml_tensor * u) { return u->op == GGML_OP_FLASH_ATTN_EXT || u->op == GGML_OP_SPARSE_ATTN; });
             if (iq >= 0 && ik >= 0 && b >= 0) {
                 cands.push_back({ iq + 1, b, { t, cg->nodes[ik] }, 4, false });
             }
@@ -7127,6 +7127,15 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
         reg.s_first = sv.front(); reg.m_first = mv.front(); reg.end = end; reg.kind = c.kind; reg.deferred = c.deferred;
         ctx->ovl_regions[reg.s_first] = reg;
         prev_b = c.b;
+    }
+    // LAB_OVL_PRINT=1 (measurement only, AT-D1; W13 deletes it): the regions of this graph by kind
+    static const bool ovl_print = getenv("LAB_OVL_PRINT") != nullptr;
+    if (ovl_print) {
+        int n_kind[5] = { 0, 0, 0, 0, 0 };
+        for (const auto & it : ctx->ovl_regions) {
+            n_kind[it.second.kind]++;
+        }
+        fprintf(stderr, "LAB_OVL nodes=%d kind1=%d kind2=%d kind4=%d\n", cg->n_nodes, n_kind[1], n_kind[2], n_kind[4]);
     }
 }
 
@@ -9825,6 +9834,17 @@ void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id) {
 #endif // defined(GGML_USE_HIP)
 
 #if defined(GGML_USE_HIP)
+static const char * ggml_backend_cuda_sparse_attn_unsupported_reason(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    return ggml_cuda_sparse_attn_unsupported_reason(device, op);
+}
+
+static size_t ggml_backend_cuda_sparse_attn_select_dump(ggml_backend_dev_t dev, int64_t n_q, int64_t n_kv, int64_t n_stream, int64_t n_sel,
+        enum ggml_type type_k, enum ggml_type type_v, int64_t n_head, int64_t n_head_kv, int32_t group, bool gated, char * buf, size_t size) {
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    return ggml_cuda_sparse_attn_select_dump(device, n_q, n_kv, n_stream, n_sel, type_k, type_v, n_head, n_head_kv, group, gated, buf, size);
+}
+
 // sparse-attention policies of the HIP backend (PLAN-v3 §5; ggml-backend.h ggml_backend_sparse_attn_group_t,
 // ggml_backend_sparse_attn_prefer_dense_t), for the device dev of a QSA layer's K buffer (sparse-attn-attend-g1.cu)
 static int32_t ggml_backend_cuda_sparse_attn_group(ggml_backend_dev_t dev, int64_t n_q_per_stream, int64_t n_kv,
@@ -9848,6 +9868,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sparse_attn_prefer_dense") == 0) {
         return (void *) (ggml_backend_sparse_attn_prefer_dense_t) ggml_backend_cuda_sparse_attn_prefer_dense;
+    }
+    if (strcmp(name, "ggml_backend_sparse_attn_unsupported_reason") == 0) {
+        return (void *) (ggml_backend_sparse_attn_unsupported_reason_t) ggml_backend_cuda_sparse_attn_unsupported_reason;
+    }
+    if (strcmp(name, "ggml_backend_sparse_attn_select_dump") == 0) {
+        return (void *) (ggml_backend_sparse_attn_select_dump_t) ggml_backend_cuda_sparse_attn_select_dump;
     }
     if (strcmp(name, "ggml_backend_debug_dispatch_census_reset") == 0) {
         return (void *) ggml_backend_cuda_dispatch_census_reset;
