@@ -1,0 +1,6 @@
+PHASE A start 20:25:34
+R ref8t0_rec rc=0 132s bk=hip b=4096 ub=4096 c=8192 x8 f16/f16 mode=record env=[LLAMA_FN_LAST_ATTN_TRIM=0] |  | QPIN_SUMMARY mode=1 chunks=8 rows_rec=786432 rows_pin=0 rows_absent=0 moe_rec=3112960 moe_pin=0 moe_absent=0 cb_tensors=192 tk_tensors=0
+R a_f16_f16_u4096 rc=0 130s bk=hip b=4096 ub=4096 c=8192 x8 f16/f16 mode=replay env=[] | Mean    KLD:  -0.000000 ±   0.000000 | QPIN_SUMMARY mode=2 chunks=8 rows_rec=0 rows_pin=757760 rows_absent=0 moe_rec=0 moe_pin=3112960 moe_absent=0 cb_tensors=192 tk_tensors=0
+R a_q8_0_q8_0_u4096 rc=0 132s bk=hip b=4096 ub=4096 c=8192 x8 q8_0/q8_0 mode=replay env=[] | Mean    KLD:   0.000138 ±   0.000002 | QPIN_SUMMARY mode=2 chunks=8 rows_rec=0 rows_pin=757760 rows_absent=0 moe_rec=0 moe_pin=3112960 moe_absent=0 cb_tensors=192 tk_tensors=0
+R a_f16_f16_u2048 rc=0 127s bk=hip b=4096 ub=2048 c=8192 x8 f16/f16 mode=replay env=[] | Mean    KLD:   0.000112 ±   0.000002 | QPIN_SUMMARY mode=2 chunks=8 rows_rec=0 rows_pin=577536 rows_absent=0 moe_rec=0 moe_pin=3112960 moe_absent=0 cb_tensors=288 tk_tensors=0
+R a_bf16_bf16_u4096 rc=0 131s bk=hip b=4096 ub=4096 c=8192 x8 bf16/bf16 mode=replay env=[] | Mean    KLD:   0.000174 ±   0.000003 | QPIN_SUMMARY mode=2 chunks=8 rows_rec=0 rows_pin=1572864 rows_absent=0 moe_rec=0 moe_pin=3112960 moe_absent=0 cb_tensors=0 tk_tensors=384
