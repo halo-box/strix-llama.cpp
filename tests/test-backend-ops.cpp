@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "sparse-attn-ref.h"
 
 #include <algorithm>
 #include <atomic>
@@ -553,10 +554,18 @@ static bool env_opt_in(const char * name) {
     return e != nullptr && atoi(e) != 0;
 }
 
+// --fail-unsupported: for the selected ops, a "not supported" result that is not on the backend's expected-unsupported
+// list (test_case::expected_unsupported), a missing census proc and a missing engagement opt-in are FAILs
+static bool g_fail_unsupported = false;
+
 // engagement asserts are opt-in (require_env) and need the census hooks; a fusion the backend says it cannot emit on
-// this device (census skip hook: GGML_VK_DISABLE_FUSION, a missing pipeline) is not asserted
+// this device (census skip hook: GGML_VK_DISABLE_FUSION, a missing pipeline) is not asserted. Under --fail-unsupported
+// the opt-in is implied and a backend without the census hooks is asserted anyway (its counts read -1, so the check fails).
 static bool engagement_required(ggml_backend_t backend, const char * require_env, const char * fusion = nullptr) {
-    if (!env_opt_in(require_env) || census_proc(backend, "ggml_backend_debug_dispatch_census_count") == nullptr) {
+    if (g_fail_unsupported && census_proc(backend, "ggml_backend_debug_dispatch_census_count") == nullptr) {
+        return true;
+    }
+    if (!(env_opt_in(require_env) || g_fail_unsupported) || census_proc(backend, "ggml_backend_debug_dispatch_census_count") == nullptr) {
         return false;
     }
     auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
@@ -1363,6 +1372,16 @@ struct test_case {
     virtual bool checks_engagement() { return false; }
     virtual bool verify_engagement(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
 
+    // determinism: eval mode computes backend1 this many times in total and memcmps the compared outputs of every run
+    // with the first; a difference FAILS the case
+    virtual int n_determinism_runs() { return 1; }
+    // a host reference check of backend1's result, run after the compare (FAILS the case when it returns false)
+    virtual bool verify_reference(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
+    // --fail-unsupported: true when this backend is expected not to support the case (the per-backend list)
+    virtual bool expected_unsupported(const char * backend_name) { GGML_UNUSED(backend_name); return false; }
+    // the weight-context tensors end at the end of their buffer (no post-graph sentinel after them)
+    virtual bool weights_end_at_buffer_end() { return false; }
+
     // nodes the scheduler runs on the second backend: backend1 then computes in several splits, as llama does
     // (needs use_scheduler_allocation(); the nodes to compare must be graph outputs)
     virtual std::vector<ggml_tensor *> second_backend_nodes() { return {}; }
@@ -1519,7 +1538,7 @@ struct test_case {
 
         // post-graph sentinel
         add_sentinel(ctx.get());
-        if (ctx_weights) {
+        if (ctx_weights && !weights_end_at_buffer_end()) {
             add_sentinel(ctx_weights.get());
         }
 
@@ -1688,6 +1707,47 @@ struct test_case {
             if (!verify_engagement(backend1, engage_msg)) {
                 test_passed = false;
                 error_msg   = engage_msg;
+            }
+        }
+        if (test_passed && n_determinism_runs() > 1 && second_backend_nodes().empty()) {
+            // the outputs of the first run, then recompute backend1's graph and memcmp
+            std::vector<ggml_tensor *> det_nodes = fused_nodes_to_verify;
+            if (det_nodes.empty()) {
+                det_nodes.push_back(out);
+            }
+            std::vector<std::vector<uint8_t>> first(det_nodes.size());
+            for (size_t i = 0; i < det_nodes.size(); ++i) {
+                first[i].resize(ggml_nbytes(det_nodes[i]));
+                ggml_backend_tensor_get(det_nodes[i], first[i].data(), 0, first[i].size());
+            }
+            for (int run = 1; test_passed && run < n_determinism_runs(); ++run) {
+                const ggml_status st = sched ? ggml_backend_sched_graph_compute(sched.get(), gf) : ggml_backend_graph_compute(backend1, gf);
+                if (st != GGML_STATUS_SUCCESS) {
+                    test_passed = false;
+                    error_msg   = "determinism run failed to compute";
+                    break;
+                }
+                for (size_t i = 0; i < det_nodes.size(); ++i) {
+                    std::vector<uint8_t> again(first[i].size());
+                    ggml_backend_tensor_get(det_nodes[i], again.data(), 0, again.size());
+                    if (memcmp(again.data(), first[i].data(), again.size()) != 0) {
+                        size_t k = 0;
+                        while (again[k] == first[i][k]) {
+                            ++k;
+                        }
+                        test_passed = false;
+                        error_msg   = "nondeterministic: run " + std::to_string(run + 1) + " differs from run 1 in " +
+                                      ggml_op_desc(det_nodes[i]) + " at byte " + std::to_string(k);
+                        break;
+                    }
+                }
+            }
+        }
+        if (test_passed) {
+            std::string ref_msg;
+            if (!verify_reference(backend1, ref_msg)) {
+                test_passed = false;
+                error_msg   = ref_msg;
             }
         }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
@@ -13151,6 +13211,875 @@ struct test_topk_moe_lifetime : public test_topk_moe {
     }
 };
 
+// ---------------------------------------------------------------------------------------------------------------------
+// GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN
+//
+// test_sparse_attn_plan: the whole plan dst is compared byte for byte (err() = memcmp, max error 0) with the CPU, and
+//   verify_reference() compares it with the C3 oracle (sparse-attn-ref.h) on every backend: the plan is integer and
+//   its bytes are part of the op contract.
+// test_sparse_attn: the attend output (fusion_test_nodes = {attend}: the plan node is not NMSE-compared). On the CPU
+//   backend the error bound is 0 and verify_reference() compares it bit for bit with the O_CON host reference
+//   (sparse-attn-ref.h); on other backends the band is the NMSE row of the class the dispatch census reports
+//   (sa_band_for_backend, PLAN-v3 §14.2).
+// Both run twice on backend1 (n_determinism_runs) and must be memcmp-equal.
+// ---------------------------------------------------------------------------------------------------------------------
+
+enum sa_rows_pattern {
+    SA_ROWS_ASC,     // distinct valid cells, ascending, -1 after them
+    SA_ROWS_PERM,    // the same cells in a random order
+    SA_ROWS_DUP,     // permuted, about 1/4 of the entries replaced by repeats of other entries of the row
+    SA_ROWS_NEG,     // permuted, about 1/4 of the entries replaced by -1
+    SA_ROWS_OOB,     // permuted, about 1/8 of the entries replaced by out-of-range values (n_kv, n_kv + 7, -2, INT32_MIN, INT32_MAX)
+    SA_ROWS_ALLNEG,  // every entry -1
+    SA_ROWS_MIX,     // queries of a group draw most cells from a shared pool; permuted, duplicates, -1 and out-of-range values
+    SA_ROWS_BLOCKS,  // complete quads (4 consecutive cells, quad-aligned) at random quads, ascending; -1 after them
+    SA_ROWS_PR,      // the maskless cell formula of test_qsa_prefill_maskless (blocks = 0)
+    SA_ROWS_PRBLK,   // the complete-block rows of test_qsa_prefill_maskless (blocks > 0: scattered by 7919)
+    SA_ROWS_ALLVIS,  // every cell 0..n_kv-1 in a random order (n_kv <= n_sel), -1 after them (the dense-shortcut rows)
+    SA_ROWS_EMPTY,   // SA_ROWS_MIX, every third query row all -1
+    SA_ROWS_POISON,  // cells 4*quad + c with c in {0, 1, 2} minus (query % 3) of shared quads; cell 4*quad + 3 is never selected
+    SA_ROWS_SINGLE,  // one valid cell per row
+};
+
+static const char * sa_rows_name(int p) {
+    switch (p) {
+        case SA_ROWS_ASC:    return "asc";
+        case SA_ROWS_PERM:   return "perm";
+        case SA_ROWS_DUP:    return "dup";
+        case SA_ROWS_NEG:    return "neg";
+        case SA_ROWS_OOB:    return "oob";
+        case SA_ROWS_ALLNEG: return "allneg";
+        case SA_ROWS_MIX:    return "mix";
+        case SA_ROWS_BLOCKS: return "blocks";
+        case SA_ROWS_PR:     return "pr";
+        case SA_ROWS_PRBLK:  return "prblk";
+        case SA_ROWS_ALLVIS: return "allvis";
+        case SA_ROWS_EMPTY:  return "empty";
+        case SA_ROWS_POISON: return "poison";
+        case SA_ROWS_SINGLE: return "single";
+    }
+    return "?";
+}
+
+// rows[((s * n_q) + i) * n_sel + j]; deterministic in (pattern, shape, seed)
+static std::vector<int32_t> sa_make_rows(int pattern, int64_t n_sel, int64_t n_q, int64_t n_stream, int64_t n_kv, int prblk, uint32_t seed) {
+    std::vector<int32_t> rows((size_t) (n_sel * n_q * n_stream), -1);
+    std::mt19937 rng(seed * 2654435761u + (uint32_t) (n_sel * 31 + n_q * 7 + n_kv * 3 + n_stream + pattern * 101));
+    auto uni = [&](int64_t n) { return (int64_t) (rng() % (uint64_t) n); };
+    // nv distinct cells of [0, n_kv), random
+    auto distinct = [&](int64_t nv, std::vector<int32_t> & out) {
+        out.clear();
+        if (nv * 2 >= n_kv) {
+            std::vector<int32_t> all((size_t) n_kv);
+            std::iota(all.begin(), all.end(), 0);
+            std::shuffle(all.begin(), all.end(), rng);
+            out.assign(all.begin(), all.begin() + nv);
+        } else {
+            std::set<int32_t> seen;
+            while ((int64_t) out.size() < nv) {
+                const int32_t c = (int32_t) uni(n_kv);
+                if (seen.insert(c).second) {
+                    out.push_back(c);
+                }
+            }
+        }
+    };
+    const int32_t oob[5] = { (int32_t) n_kv, (int32_t) (n_kv + 7), -2, INT32_MIN, INT32_MAX };
+    std::vector<int32_t> cells, pool;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t i = 0; i < n_q; ++i) {
+            int32_t * row = rows.data() + (size_t) ((s * n_q + i) * n_sel);
+            switch (pattern) {
+                case SA_ROWS_ALLNEG:
+                    break;
+                case SA_ROWS_ASC:
+                case SA_ROWS_PERM:
+                case SA_ROWS_DUP:
+                case SA_ROWS_NEG:
+                case SA_ROWS_OOB: {
+                    distinct(std::min(n_sel, n_kv), cells);
+                    if (pattern == SA_ROWS_ASC) {
+                        std::sort(cells.begin(), cells.end());
+                    }
+                    std::copy(cells.begin(), cells.end(), row);
+                    if (pattern != SA_ROWS_ASC) {
+                        std::shuffle(row, row + n_sel, rng);
+                    }
+                    for (int64_t j = 0; j < n_sel; ++j) {
+                        if (pattern == SA_ROWS_DUP && uni(4) == 0) {
+                            row[j] = row[uni(n_sel)];
+                        } else if (pattern == SA_ROWS_NEG && uni(4) == 0) {
+                            row[j] = -1;
+                        } else if (pattern == SA_ROWS_OOB && uni(8) == 0) {
+                            row[j] = oob[uni(5)];
+                        }
+                    }
+                } break;
+                case SA_ROWS_MIX:
+                case SA_ROWS_EMPTY: {
+                    if (pattern == SA_ROWS_EMPTY && i % 3 == 2) {
+                        break;
+                    }
+                    if (i % 4 == 0) {   // a pool shared by the 4 queries of a G4 group
+                        distinct(std::min(n_kv, n_sel + n_sel / 2 + 1), pool);
+                    }
+                    for (int64_t j = 0; j < n_sel; ++j) {
+                        const int64_t u = uni(16);
+                        if (u < 11) {
+                            row[j] = pool[uni((int64_t) pool.size())];      // shared pool, with repeats
+                        } else if (u < 13) {
+                            row[j] = (int32_t) uni(n_kv);                    // anywhere
+                        } else if (u < 15) {
+                            row[j] = -1;
+                        } else {
+                            row[j] = oob[uni(5)];
+                        }
+                    }
+                } break;
+                case SA_ROWS_BLOCKS: {
+                    const int64_t n_quads = (n_kv + 3) / 4;
+                    std::set<int32_t> qs;
+                    const int64_t want = std::min(n_sel / 4, n_kv / 4);
+                    while ((int64_t) qs.size() < want) {
+                        qs.insert((int32_t) uni(n_kv / 4));
+                    }
+                    int64_t o = 0;
+                    for (int32_t qd : qs) {
+                        for (int c = 0; c < 4; ++c) {
+                            row[o++] = 4 * qd + c;
+                        }
+                    }
+                    // a partial last quad when there is room (the CB tail)
+                    for (int c = 0; o < n_sel && c < (int) (i % 4) && 4 * (n_quads - 1) + c < n_kv; ++c) {
+                        row[o++] = (int32_t) (4 * (n_quads - 1) + c);
+                    }
+                } break;
+                case SA_ROWS_PR: {
+                    for (int64_t j = 0; j < n_sel; ++j) {
+                        int32_t key = (int32_t) (1 + (j * 37 + i * 13 + s * 7) % (n_kv - 4));
+                        if (j == 0) key = n_sel == 1 ? 2 : -1;
+                        if (j == 1) key = 2;
+                        if (j > n_sel - 3 && n_sel > 4) key = -1;
+                        row[j] = key;
+                    }
+                } break;
+                case SA_ROWS_PRBLK: {
+                    GGML_ASSERT(n_sel > 3 && (n_sel - 3) % 4 == 0 && n_kv % 7919 != 0);
+                    const int64_t budget = (n_sel - 3) / 4;
+                    auto cell = [&](int64_t logical) { return (int32_t) ((logical * 7919) % n_kv); };
+                    if (i == 0 && n_q > 1) {
+                        break;
+                    }
+                    const int64_t vis = std::min<int64_t>(prblk + i / 4, n_kv / 4 - 1);
+                    const int64_t n = std::min(vis, budget);
+                    for (int64_t b0 = 0; b0 < n; ++b0) {
+                        const int64_t b = vis <= budget ? b0 : (b0 * vis + (i * 131) % vis) / budget;
+                        for (int c = 0; c < 4; ++c) row[4 * b0 + c] = cell(4 * b + c);
+                    }
+                    for (int64_t c = 0; c < i % 4; ++c) row[4 * budget + c] = cell(4 * vis + c);
+                } break;
+                case SA_ROWS_ALLVIS: {
+                    GGML_ASSERT(n_kv <= n_sel);
+                    for (int64_t c = 0; c < n_kv; ++c) row[c] = (int32_t) c;
+                    std::shuffle(row, row + n_sel, rng);
+                } break;
+                case SA_ROWS_POISON: {
+                    // the 4 queries of a group share their quads, so a G4 union has as many quads as one row
+                    if (i % 4 == 0) {
+                        const int64_t nq = std::min((n_sel / 2) | 1, n_kv / 4);   // odd: counts % 4 != 0
+                        std::set<int32_t> qs;
+                        while ((int64_t) qs.size() < nq) qs.insert((int32_t) uni(n_kv / 4));
+                        pool.assign(qs.begin(), qs.end());
+                    }
+                    int64_t o = 0;
+                    for (int32_t qd : pool) {
+                        for (int c = 0; c < 3 && o < n_sel; ++c) {
+                            if (c != (int) (i % 3)) row[o++] = 4 * qd + c;
+                        }
+                    }
+                    std::shuffle(row, row + n_sel, rng);
+                } break;
+                case SA_ROWS_SINGLE: {
+                    row[uni(n_sel)] = (int32_t) uni(n_kv);
+                } break;
+            }
+        }
+    }
+    return rows;
+}
+
+// host copy of a tensor's bytes (any strides: ggml_nbytes from t->data, indexed with t->nb)
+static sa_ref::view sa_host_view(const ggml_tensor * t) {
+    sa_ref::view v;
+    v.type = t->type;
+    for (int i = 0; i < 4; ++i) {
+        v.ne[i] = t->ne[i];
+        v.nb[i] = t->nb[i];
+    }
+    v.bytes.resize(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, v.bytes.data(), 0, v.bytes.size());
+    return v;
+}
+
+// rows of a (possibly strided) sel view, in the rows[((s * n_q) + i) * n_sel + j] order of sa_make_rows
+static std::vector<int32_t> sa_read_rows(const ggml_tensor * sel) {
+    const sa_ref::view v = sa_host_view(sel);
+    const int64_t n_sel = sel->ne[0], n_q = sel->ne[1], n_stream = sel->ne[3];
+    std::vector<int32_t> rows((size_t) (n_sel * n_q * n_stream));
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t i = 0; i < n_q; ++i) {
+            memcpy(rows.data() + (size_t) ((s * n_q + i) * n_sel), v.row(i, 0, s), n_sel * sizeof(int32_t));
+        }
+    }
+    return rows;
+}
+
+// write rows into a (possibly strided) sel view through its storage tensor
+static void sa_write_rows(ggml_tensor * sel, const std::vector<int32_t> & rows) {
+    ggml_tensor * storage = sel->view_src ? sel->view_src : sel;
+    const size_t base = sel->view_src ? sel->view_offs : 0;
+    const int64_t n_sel = sel->ne[0], n_q = sel->ne[1], n_stream = sel->ne[3];
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t i = 0; i < n_q; ++i) {
+            ggml_backend_tensor_set(storage, rows.data() + (size_t) ((s * n_q + i) * n_sel), base + i * sel->nb[1] + s * sel->nb[3], n_sel * sizeof(int32_t));
+        }
+    }
+}
+
+// sel layouts: 0 plain [n_sel, n_q, 1, n_stream]; 1 interleaved (storage [n_sel, n_stream, n_q], streams interleaved per
+// query); 2 strided (rows of a wider tensor, at an offset of 2 entries)
+static ggml_tensor * sa_new_sel(test_case * tc, ggml_context * ctx, int64_t n_sel, int64_t n_q, int64_t n_stream, int layout) {
+    if (layout == 1) {
+        ggml_tensor * st = tc->ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_sel, n_stream, n_q, 1);
+        ggml_set_name(st, "sel_storage");
+        return ggml_permute(ctx, st, 0, 3, 1, 2);
+    }
+    if (layout == 2) {
+        ggml_tensor * st = tc->ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_sel + 5, n_q, 1, n_stream);
+        ggml_set_name(st, "sel_storage");
+        return ggml_view_4d(ctx, st, n_sel, n_q, 1, n_stream, st->nb[1], st->nb[2], st->nb[3], 2 * sizeof(int32_t));
+    }
+    ggml_tensor * sel = tc->ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_sel, n_q, 1, n_stream);
+    ggml_set_name(sel, "sel");
+    return sel;
+}
+
+static void sa_init_sel(ggml_tensor * sel, const std::vector<int32_t> & rows) {
+    if (sel->view_src) {
+        // entries outside the view: out-of-range values, so a read outside it would change hdr.n_bad
+        std::vector<int32_t> junk(ggml_nelements(sel->view_src), INT32_MIN + 1);
+        ggml_backend_tensor_set(sel->view_src, junk.data(), 0, ggml_nbytes(sel->view_src));
+    }
+    sa_write_rows(sel, rows);
+}
+
+// --fail-unsupported expected-unsupported list (PLAN-v3 §6.3, §14.1): Vulkan has no G = 4 plan or attend, and no
+// K/V binding larger than its 1 GiB buffer maximum
+static bool sa_expected_unsupported(const char * backend_name, int group, size_t k_bytes, size_t v_bytes) {
+    const bool vk = strncmp(backend_name, "Vulkan", 6) == 0;
+    if (vk && group == 4) {
+        return true;
+    }
+    if (vk && std::max(k_bytes, v_bytes) > ((size_t) 1 << 30)) {
+        return true;
+    }
+    return false;
+}
+
+struct test_sparse_attn_plan : public test_case {
+    const int64_t n_q, n_sel, n_kv;
+    const int group, n_stream, pattern, layout;
+    ggml_tensor * sel = nullptr;
+    ggml_tensor * plan_out = nullptr;
+
+    test_sparse_attn_plan(int64_t n_q, int64_t n_sel, int64_t n_kv, int group, int n_stream = 1, int pattern = SA_ROWS_MIX, int layout = 0)
+        : n_q(n_q), n_sel(n_sel), n_kv(n_kv), group(group), n_stream(n_stream), pattern(pattern), layout(layout) {}
+
+    std::string op_desc(ggml_tensor *) override { return "SPARSE_ATTN_PLAN"; }
+    std::string vars() override {
+        const std::string rows = sa_rows_name(pattern);
+        return VARS_TO_STR7(n_q, n_sel, n_kv, group, n_stream, rows, layout);
+    }
+    double max_nmse_err() override { return 0.0; }
+    double err(const float * a, const float * b, size_t n) override {
+        return memcmp(a, b, n * sizeof(float)) == 0 ? 0.0 : 1.0;
+    }
+    int n_determinism_runs() override { return 2; }
+    bool expected_unsupported(const char * backend_name) override {
+        return sa_expected_unsupported(backend_name, group, 0, 0);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        sel = sa_new_sel(this, ctx, n_sel, n_q, n_stream, layout);
+        plan_out = ggml_sparse_attn_plan(ctx, sel, n_kv, group);
+        ggml_set_name(plan_out, "plan");
+        return plan_out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_NONE && t->type == GGML_TYPE_F32) init_tensor_uniform(t);   // sentinels
+        }
+        sa_init_sel(sel, sa_make_rows(pattern, n_sel, n_q, n_stream, n_kv, 0, 1));
+    }
+    bool verify_reference(ggml_backend_t backend, std::string & msg) override {
+        GGML_UNUSED(backend);
+        ggml_tensor * out = plan_out;
+        const std::vector<uint8_t> ref = sa_ref::plan(sa_read_rows(sel), n_sel, n_q, n_stream, n_kv, group);
+        std::vector<uint8_t> got(ggml_nbytes(out));
+        ggml_backend_tensor_get(out, got.data(), 0, got.size());
+        if (got.size() != ref.size()) {
+            msg = "plan size " + std::to_string(got.size()) + " != C3 oracle " + std::to_string(ref.size());
+            return false;
+        }
+        if (memcmp(got.data(), ref.data(), ref.size()) != 0) {
+            size_t k = 0;
+            while (got[k] == ref[k]) ++k;
+            msg = "plan differs from the C3 oracle at byte " + std::to_string(k);
+            return false;
+        }
+        return true;
+    }
+};
+
+// NMSE bands of PLAN-v3 §14.2 (a), k = 2 (2 x p100 on PR-verbatim kernels), by the class the dispatch census reports:
+// (G, split count, n_sel bucket). Returns a negative value for a class without a row.
+static double sa_band_row(int G, int splits, int64_t n_sel) {
+    const bool big = n_sel > 257;
+    if (G == 4) {
+        return big ? 2.04e-9 : 1.21e-9;
+    }
+    if (splits <= 1) {
+        return n_sel <= 17 ? 5.02e-8 : big ? 1.23e-7 : 1.07e-7;
+    }
+    if (splits <= 5) {
+        return big ? 1.56e-7 : 1.34e-7;
+    }
+    if (splits >= 17 && splits <= 33 && big) {
+        return 1.71e-7;
+    }
+    return -1.0;   // splits 6-16 and > 33: no row yet (measured on the PR-verbatim decode before it is gated, W4)
+}
+
+// the class of the attend dispatches the census counted since the reset: keys "sa_attend/G4/..." and
+// "sa_attend/G1/.../splits<n>" (PLAN-v3 §6.2), listed by the census proc ggml_backend_debug_dispatch_census_list
+// (a NULL-terminated array of every compiled key). Returns a negative band when the class cannot be determined.
+static double sa_band_for_backend(ggml_backend_t backend, int64_t n_sel, std::string & cls) {
+    typedef const char * const * (*census_list_t)(void);
+    auto list = (census_list_t) census_proc(backend, "ggml_backend_debug_dispatch_census_list");
+    if (!list || census_proc(backend, "ggml_backend_debug_dispatch_census_count") == nullptr) {
+        cls = "no dispatch census";
+        return -1.0;
+    }
+    double band = -1.0;
+    int n_classes = 0;
+    for (const char * const * k = list(); k && *k; ++k) {
+        const std::string key = *k;
+        if (key.rfind("sa_attend/", 0) != 0 || dispatch_census_count(backend, key.c_str()) <= 0) {
+            continue;
+        }
+        int G = 0, splits = 1;
+        if (key.rfind("sa_attend/G4/", 0) == 0) {
+            G = 4;
+        } else if (key.rfind("sa_attend/G1/", 0) == 0) {
+            G = 1;
+            const size_t p = key.find("/splits");
+            if (p != std::string::npos) splits = atoi(key.c_str() + p + 7);
+        } else {
+            cls = "census key without a band class: " + key;
+            return -1.0;
+        }
+        const double b = sa_band_row(G, splits, n_sel);
+        if (b < 0) {
+            cls = "no band row for " + key;
+            return -1.0;
+        }
+        band = std::max(band, b);
+        cls += (n_classes++ ? "," : "") + key;
+    }
+    if (n_classes == 0) {
+        cls = "no sa_attend dispatch in the census";
+    }
+    return band;
+}
+
+static bool sa_is_cpu(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+enum sa_special { SA_PLAIN = 0, SA_POISON = 1, SA_OVERFLOW = 2 };
+
+struct test_sparse_attn : public test_case {
+    const ggml_type type_k, type_v;
+    const int64_t D, n_q, n_kv, n_sel;
+    const int gqa, n_head_kv, n_stream, group, rot_q, rot_o, pattern, kv_layout, at_end, special, prblk;
+    const float scale;
+    ggml_tensor * q = nullptr, * k = nullptr, * v = nullptr, * sel = nullptr, * plan = nullptr, * out = nullptr;
+    ggml_tensor * k_st = nullptr, * v_st = nullptr;
+    int64_t kv_rows = 0;
+    double band = 0.0;
+    std::string band_class;
+
+    test_sparse_attn(ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv, int64_t n_sel, int group,
+                     int pattern = SA_ROWS_MIX, int gqa = 12, int n_stream = 1, int rot_q = 0, int rot_o = 0,
+                     int kv_layout = 1, int at_end = 0, int special = SA_PLAIN, int prblk = 0, float scale = 0.0625f,
+                     int64_t D = 256, int n_head_kv = 2)
+        : type_k(type_k), type_v(type_v), D(D), n_q(n_q), n_kv(n_kv), n_sel(n_sel), gqa(gqa), n_head_kv(n_head_kv),
+          n_stream(n_stream), group(group), rot_q(rot_q), rot_o(rot_o), pattern(pattern), kv_layout(kv_layout),
+          at_end(at_end), special(special), prblk(prblk), scale(scale) {}
+
+    std::string op_desc(ggml_tensor *) override { return "SPARSE_ATTN"; }
+    std::string vars() override {
+        const std::string rows = sa_rows_name(pattern);
+        std::string s = VARS_TO_STR11(type_k, type_v, n_q, n_kv, n_sel, group, gqa, n_stream, rot_q, rot_o, rows);
+        s += "," + VARS_TO_STR3(kv_layout, at_end, scale);
+        if (special == SA_POISON) s += ",poison";
+        if (special == SA_OVERFLOW) s += ",overflow";
+        if (prblk) s += ",prblk=" + std::to_string(prblk);
+        return s;
+    }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+    bool checks_engagement() override { return true; }
+    int n_determinism_runs() override { return 2; }
+    bool use_weight_context() override { return at_end != 0; }
+    bool weights_end_at_buffer_end() override { return at_end != 0; }
+    bool expected_unsupported(const char * backend_name) override {
+        return sa_expected_unsupported(backend_name, group, (size_t) (D / ggml_blck_size(type_k)) * ggml_type_size(type_k) * kv_rows * n_head_kv * n_stream,
+                                       (size_t) (D / ggml_blck_size(type_v)) * ggml_type_size(type_v) * kv_rows * n_head_kv * n_stream);
+    }
+
+    double max_nmse_err() override { return 0.0; }
+    double max_err(ggml_backend_t backend) override {
+        if (sa_is_cpu(backend)) {
+            return 0.0;   // the CPU op against itself: exact
+        }
+        band = sa_band_for_backend(backend, n_sel, band_class);
+        return band;
+    }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!sa_is_cpu(backend) && band < 0) {
+            msg = "SPARSE_ATTN band class unknown (" + band_class + ")";
+            return false;
+        }
+        return true;
+    }
+
+    // contract value of V's element d of cell c (kv head g, stream s): to_float rounded to f16
+    std::vector<float> v_contract_row(const sa_ref::view & vv, int64_t c, int64_t g, int64_t s) const {
+        std::vector<float> r(D);
+        sa_ref::load_row(vv, c, g, s, r.data());
+        return r;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (special != SA_OVERFLOW) {
+            const double e = nmse(a, b, n);
+            if (std::isnan(e)) {   // an all-zero reference (empty rows): only an identical result passes
+                return memcmp(a, b, n * sizeof(float)) == 0 ? 0.0 : 1.0;
+            }
+            return e;
+        }
+        // overflow: the set of inf positions must be the expected one (from the single selected V row), and the NMSE
+        // runs over the finite elements only (nmse() would see inf - inf = NaN, and NaN > max_err is false)
+        const sa_ref::view vv = sa_host_view(v);
+        const std::vector<int32_t> rows = sa_read_rows(sel);
+        double sab = 0.0, saa = 0.0;
+        size_t n_inf = 0;
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (int64_t i = 0; i < n_q; ++i) {
+                std::vector<int32_t> cells;
+                sa_ref::row_cells(rows.data() + (size_t) ((s * n_q + i) * n_sel), n_sel, n_kv, cells);
+                for (int64_t h = 0; h < n_head_kv * gqa; ++h) {
+                    std::vector<float> vr(D, 0.0f);
+                    if (cells.size() == 1) vr = v_contract_row(vv, cells[0], h / gqa, s);
+                    for (int64_t d = 0; d < D; ++d) {
+                        const size_t idx = (size_t) (((s * n_q + i) * n_head_kv * gqa + h) * D + d);
+                        GGML_ASSERT(idx < n);
+                        if (std::isinf(vr[d])) {
+                            ++n_inf;
+                            if (!(std::isinf(a[idx]) && std::isinf(b[idx]) && std::signbit(a[idx]) == std::signbit(vr[d]) && std::signbit(b[idx]) == std::signbit(vr[d]))) {
+                                return 1.0;
+                            }
+                        } else {
+                            if (!std::isfinite(a[idx]) || !std::isfinite(b[idx])) {
+                                return 1.0;
+                            }
+                            sab += (double) (a[idx] - b[idx]) * (a[idx] - b[idx]);
+                            saa += (double) a[idx] * a[idx];
+                        }
+                    }
+                }
+            }
+        }
+        if (n_inf == 0) {
+            return 1.0;   // the case must produce infinities
+        }
+        return saa > 0 ? sab / saa : sab;
+    }
+
+    ggml_tensor * new_kv(ggml_context * ctx, ggml_type type, ggml_tensor ** storage) {
+        ggml_tensor * t;
+        if (kv_layout == 1) {
+            // the cache layout: [D, n_head_kv, kv_rows, n_stream], viewed as [D, kv_rows, n_head_kv, n_stream]
+            *storage = at_end ? ::ggml_new_tensor_4d(ctx, type, D, n_head_kv, kv_rows, n_stream)
+                              : ggml_new_tensor_4d(ctx, type, D, n_head_kv, kv_rows, n_stream);
+            t = ggml_permute(ctx, *storage, 0, 2, 1, 3);
+        } else {
+            *storage = at_end ? ::ggml_new_tensor_4d(ctx, type, D, kv_rows, n_head_kv, n_stream)
+                              : ggml_new_tensor_4d(ctx, type, D, kv_rows, n_head_kv, n_stream);
+            t = *storage;
+        }
+        return t;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        kv_rows = 4 * ((n_kv + 3) / 4);
+        ggml_context * ckv = at_end ? ctx_weights : ctx;
+        // q: [D, n_head, n_q, n_stream] viewed as [D, n_q, n_head, n_stream] (the FLASH_ATTN_EXT q layout)
+        ggml_tensor * q_st = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_head_kv * gqa, n_q, n_stream);
+        ggml_set_name(q_st, "q_storage");
+        q = ggml_permute(ctx, q_st, 0, 2, 1, 3);
+        if (at_end == 2) {   // K is the last tensor of its buffer
+            v = new_kv(ckv, type_v, &v_st);
+            k = new_kv(ckv, type_k, &k_st);
+        } else {             // V last (at_end == 1), or ordinary placement
+            k = new_kv(ckv, type_k, &k_st);
+            v = new_kv(ckv, type_v, &v_st);
+        }
+        ggml_set_name(k_st, "k_storage");
+        ggml_set_name(v_st, "v_storage");
+        sel  = sa_new_sel(this, ctx, n_sel, n_q, n_stream, 0);
+        plan = ggml_sparse_attn_plan(ctx, sel, n_kv, group);
+        ggml_set_name(plan, "plan");
+        out  = ggml_sparse_attn(ctx, q, k, v, plan, scale, rot_q, rot_o);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    // fill one K/V storage: uniform values over the whole tensor, or (large views) zeros plus uniform rows for the
+    // selected cells only
+    void init_kv(ggml_tensor * st, const std::vector<int32_t> & rows, uint32_t seed) {
+        if (ggml_nbytes(st) <= ((size_t) 256 << 20)) {
+            init_tensor_uniform(st);
+            return;
+        }
+        ggml_backend_tensor_memset(st, 0, 0, ggml_nbytes(st));
+        std::mt19937 rng(seed);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> f(D);
+        std::vector<uint8_t> qb(ggml_row_size(st->type, D));
+        std::set<std::pair<int64_t, int32_t>> done;
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (size_t j = 0; j < (size_t) (n_q * n_sel); ++j) {
+                const int32_t c = rows[(size_t) (s * n_q * n_sel) + j];
+                if (c < 0 || c >= n_kv || !done.insert({s, c}).second) continue;
+                for (int64_t g = 0; g < n_head_kv; ++g) {
+                    for (auto & x : f) x = dist(rng);
+                    ggml_quantize_chunk(st->type, f.data(), qb.data(), 0, 1, D, nullptr);
+                    const size_t off = kv_layout == 1 ? g * st->nb[1] + c * st->nb[2] + s * st->nb[3]
+                                                      : c * st->nb[1] + g * st->nb[2] + s * st->nb[3];
+                    ggml_backend_tensor_set(st, qb.data(), off, qb.size());
+                }
+            }
+        }
+    }
+
+    size_t kv_offset(const ggml_tensor * st, int64_t c, int64_t g, int64_t s) const {
+        return kv_layout == 1 ? g * st->nb[1] + c * st->nb[2] + s * st->nb[3] : c * st->nb[1] + g * st->nb[2] + s * st->nb[3];
+    }
+
+    // poison one cell row of K or V: NaN (K) / +inf (V) values, or a NaN / inf scale d in every block
+    void poison_row(ggml_tensor * st, int64_t c, int64_t g, int64_t s, bool is_k) {
+        const size_t rb = ggml_row_size(st->type, D);
+        std::vector<uint8_t> row(rb);
+        const size_t off = kv_offset(st, c, g, s);
+        ggml_backend_tensor_get(st, row.data(), off, rb);
+        const uint16_t h16 = is_k ? 0x7E00 : 0x7C00;   // f16 NaN / +inf
+        const uint16_t b16 = is_k ? 0x7FC0 : 0x7F80;   // bf16 NaN / +inf
+        switch (st->type) {
+            case GGML_TYPE_F16:  for (int64_t d = 0; d < D; ++d) memcpy(row.data() + 2 * d, &h16, 2); break;
+            case GGML_TYPE_BF16: for (int64_t d = 0; d < D; ++d) memcpy(row.data() + 2 * d, &b16, 2); break;
+            case GGML_TYPE_F32: {
+                const float f = is_k ? NAN : INFINITY;
+                for (int64_t d = 0; d < D; ++d) memcpy(row.data() + 4 * d, &f, 4);
+            } break;
+            default: {   // block types with an f16 scale d first (q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl)
+                const size_t bs = ggml_type_size(st->type);
+                for (size_t b = 0; b < rb / bs; ++b) memcpy(row.data() + b * bs, &h16, 2);
+            } break;
+        }
+        ggml_backend_tensor_set(st, row.data(), off, rb);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const std::vector<int32_t> rows = sa_make_rows(pattern, n_sel, n_q, n_stream, n_kv, prblk, 1);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t == sel || t == k_st || t == v_st) continue;
+            init_tensor_uniform(t);   // q and the sentinels
+        }
+        // the K/V storages live in ctx, or in ctx_weights for the at_end cases (initialize_tensors runs once per context)
+        if (ctx_has(ctx, k_st)) {
+            init_kv(k_st, rows, 11);
+            init_kv(v_st, rows, 17);
+            if (special == SA_POISON) {
+                init_poison();
+            }
+            if (special == SA_OVERFLOW) {
+                init_overflow(rows);
+            }
+        }
+        if (ctx_has(ctx, sel)) {
+            sa_init_sel(sel, rows);
+        }
+    }
+
+    static bool ctx_has(ggml_context * ctx, const ggml_tensor * x) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == x) return true;
+        }
+        return false;
+    }
+
+    // every cell 4*quad + 3 of K and V poisoned; the rows never select it (SA_ROWS_POISON). Reach is asserted here on the
+    // plan (the C3 oracle, whose bytes equal the CPU op's, test_sparse_attn_plan): at least one group has a padded
+    // count (count % 4 != 0) and its padding quad holds a poisoned cell that no query of the group selects.
+    void init_poison() {
+        GGML_ASSERT(pattern == SA_ROWS_POISON);
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (int64_t c = 3; c < kv_rows; c += 4) {
+                for (int64_t g = 0; g < n_head_kv; ++g) {
+                    poison_row(k_st, c, g, s, true);
+                    poison_row(v_st, c, g, s, false);
+                }
+            }
+        }
+        const std::vector<int32_t> rows = sa_make_rows(pattern, n_sel, n_q, n_stream, n_kv, prblk, 1);
+        const std::vector<uint8_t> p = sa_ref::plan(rows, n_sel, n_q, n_stream, n_kv, group);
+        const ggml_sparse_attn_plan_layout L = ggml_sparse_attn_plan_get_layout(n_sel, n_q, n_stream, n_kv, group);
+        const uint32_t * counts = (const uint32_t *) (p.data() + L.off_counts);
+        const uint32_t * quads  = (const uint32_t *) (p.data() + L.off_quads);
+        const uint16_t * masks  = (const uint16_t *) (p.data() + L.off_masks);
+        bool reached = false;
+        for (int64_t e = 0; e < n_stream * L.n_groups && !reached; ++e) {
+            int64_t n_real = 0;
+            while (n_real < L.cap && masks[e * L.cap + n_real] != 0) ++n_real;
+            if (n_real == 0 || counts[e] == n_real) continue;   // no padding entry in this group
+            const uint32_t pad_quad = quads[e * L.cap + counts[e] - 1];
+            uint16_t sel_bits = 0;
+            for (int64_t k2 = 0; k2 < n_real; ++k2) {
+                if (quads[e * L.cap + k2] == pad_quad) sel_bits |= masks[e * L.cap + k2];
+            }
+            // cell 3 of the padding quad: poisoned, and no query of the group selects it
+            reached = (4 * (int64_t) pad_quad + 3 < kv_rows) && (sel_bits & 0x8888) == 0;
+        }
+        GGML_ASSERT(reached && "poison case does not reach a padded quad with a poisoned unselected cell");
+    }
+
+    // V rows of the selected cells with values past the f16 range: bf16 V (> 65504), q8_0 V (d * q > 65504),
+    // f16 V (stored +-inf); rot 0 and one selected cell per row
+    void init_overflow(const std::vector<int32_t> & rows) {
+        GGML_ASSERT(pattern == SA_ROWS_SINGLE && rot_o == 0);
+        const size_t rb = ggml_row_size(type_v, D);
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (size_t j = 0; j < (size_t) (n_q * n_sel); ++j) {
+                const int32_t c = rows[(size_t) (s * n_q * n_sel) + j];
+                if (c < 0 || c >= n_kv) continue;
+                for (int64_t g = 0; g < n_head_kv; ++g) {
+                    std::vector<uint8_t> row(rb);
+                    const size_t off = kv_offset(v_st, c, g, s);
+                    ggml_backend_tensor_get(v_st, row.data(), off, rb);
+                    for (int64_t d = 0; d < D; d += 5) {   // every 5th element overflows, alternating sign
+                        const float big = (d / 5) % 2 ? -1.0e5f : 7.0e4f;
+                        if (type_v == GGML_TYPE_BF16) {
+                            const ggml_bf16_t b = ggml_fp32_to_bf16(big);
+                            memcpy(row.data() + 2 * d, &b, 2);
+                        } else if (type_v == GGML_TYPE_F16) {
+                            const uint16_t h = big > 0 ? 0x7C00 : 0xFC00;
+                            memcpy(row.data() + 2 * d, &h, 2);
+                        } else if (type_v == GGML_TYPE_Q8_0) {
+                            // block of d: scale 1000, element q = +-127 -> +-127000
+                            const size_t bs = ggml_type_size(GGML_TYPE_Q8_0);
+                            uint8_t * blk = row.data() + (d / 32) * bs;
+                            const ggml_fp16_t scale16 = ggml_fp32_to_fp16(1000.0f);
+                            memcpy(blk, &scale16, 2);
+                            blk[2 + d % 32] = (uint8_t) (int8_t) (big > 0 ? 127 : -127);
+                        } else {
+                            GGML_ABORT("overflow case: V type %s", ggml_type_name(type_v));
+                        }
+                    }
+                    ggml_backend_tensor_set(v_st, row.data(), off, rb);
+                }
+            }
+        }
+    }
+
+    // CPU: bit equality with the O_CON host reference (sparse-attn-ref.h)
+    bool verify_reference(ggml_backend_t backend, std::string & msg) override {
+        if (!sa_is_cpu(backend)) {
+            return true;
+        }
+        const sa_ref::view qv = sa_host_view(q), kv = sa_host_view(k), vv = sa_host_view(v);
+        const std::vector<float> ref = sa_ref::attend(qv, kv, vv, sa_read_rows(sel), n_sel, n_kv, scale, rot_q, rot_o,
+                                                      std::max(1, std::min(16, (int) std::thread::hardware_concurrency())));
+        std::vector<float> got(ggml_nelements(out));
+        ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
+        GGML_ASSERT(got.size() == ref.size());
+        if (memcmp(got.data(), ref.data(), got.size() * sizeof(float)) != 0) {
+            size_t n_diff = 0, first = SIZE_MAX;
+            for (size_t i = 0; i < got.size(); ++i) {
+                if (memcmp(&got[i], &ref[i], sizeof(float)) != 0) {
+                    ++n_diff;
+                    first = std::min(first, i);
+                }
+            }
+            char b[256];
+            snprintf(b, sizeof(b), "CPU op != O_CON reference in %zu of %zu values (first at %zu: %.9g vs %.9g)",
+                     n_diff, got.size(), first, got[first], ref[first]);
+            msg = b;
+            return false;
+        }
+        return true;
+    }
+};
+
+static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    const ggml_type F16 = GGML_TYPE_F16, BF16 = GGML_TYPE_BF16, Q8 = GGML_TYPE_Q8_0, Q4 = GGML_TYPE_Q4_0;
+    const ggml_type S_fast[]    = { F16, BF16, Q8, Q4 };
+    const ggml_type S_all[]     = { F16, BF16, Q8, Q4, GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
+
+    // ---- SPARSE_ATTN_PLAN (PLAN-v3 §14.1) ----
+    // n_q x n_sel x G
+    for (int64_t nq : {1, 2, 8, 127, 128, 129, 512, 513, 4096}) {
+        for (int64_t ns : {257, 2051}) {
+            if (nq == 4096 && ns == 257) continue;
+            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn_plan(nq, ns, 65536, G));
+        }
+    }
+    // n_sel 1 and 4096, shallow and deep caches
+    for (int64_t ns : {1, 4096}) {
+        for (int64_t nq : {1, 129, 513}) {
+            for (int64_t nk : {4096, 1048576}) {
+                for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn_plan(nq, ns, nk, G));
+            }
+        }
+    }
+    // every row pattern at every n_kv of §14.1 (n_kv 4: a single quad)
+    for (int64_t nk : {4, 2051, 4096, 65536, 270336, 1048576}) {
+        for (int pat : {SA_ROWS_ASC, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_NEG, SA_ROWS_OOB, SA_ROWS_ALLNEG, SA_ROWS_MIX, SA_ROWS_BLOCKS}) {
+            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn_plan(129, 257, nk, G, 1, pat));
+        }
+    }
+    // 2 streams; plain, interleaved and strided rows
+    for (int layout : {0, 1, 2}) {
+        for (int64_t nq : {8, 129}) {
+            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn_plan(nq, 257, 4096, G, 2, SA_ROWS_MIX, layout));
+        }
+    }
+    test_cases.emplace_back(new test_sparse_attn_plan(1, 1, 4, 1, 1, SA_ROWS_PERM));
+    test_cases.emplace_back(new test_sparse_attn_plan(3, 1, 4, 4, 2, SA_ROWS_PERM, 1));
+    test_cases.emplace_back(new test_sparse_attn_plan(4096, 2051, 8192, 4, 1, SA_ROWS_BLOCKS));
+
+    // ---- SPARSE_ATTN (PLAN-v3 §14.1) ----
+    // every S x S pair (n_q 9, n_kv 4096 >= 64 * n_q: the direct-V regime); alternating K/V view layouts
+    {
+        int alt = 0;
+        for (ggml_type tk : S_all) {
+            for (ggml_type tv : S_all) {
+                test_cases.emplace_back(new test_sparse_attn(tk, tv, 9, 4096, 257, 1, SA_ROWS_MIX, 12, 1, 0, 0, alt++ % 2));
+            }
+        }
+    }
+    // both V-loader regimes for every S_fast pair: n_kv < 64 * n_q (n_q 129, n_kv 4096, G4) and n_kv >= 64 * n_q
+    // (n_q 9, n_kv 32768, G1), n_sel 2051
+    for (ggml_type tk : S_fast) {
+        for (ggml_type tv : S_fast) {
+            test_cases.emplace_back(new test_sparse_attn(tk, tv, 129, 4096, 2051, 4, SA_ROWS_BLOCKS));
+            test_cases.emplace_back(new test_sparse_attn(tk, tv, 9, 32768, 2051, 1, SA_ROWS_MIX));
+        }
+    }
+    // n_q >= 513 with 64 * n_q < n_kv (direct V on G4)
+    for (ggml_type t : {F16, Q8}) test_cases.emplace_back(new test_sparse_attn(t, t, 513, 65536, 2051, 4, SA_ROWS_BLOCKS));
+    // the n_q set of §14.1 (G = the HIP default n_q < 128 ? 1 : 4, and the other G for a few)
+    for (int64_t nq : {1, 2, 4, 8, 9, 64, 65, 66, 127, 128, 129, 263, 512, 513}) {
+        for (ggml_type t : {F16, Q8}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, nq < 128 ? 1 : 4, SA_ROWS_MIX));
+    }
+    for (int64_t nq : {1, 9, 127, 513}) test_cases.emplace_back(new test_sparse_attn(Q4, Q4, nq, 8192, 2051, nq < 128 ? 4 : 1, SA_ROWS_MIX));
+    test_cases.emplace_back(new test_sparse_attn(F16, F16, 4096, 8192, 2051, 4, SA_ROWS_BLOCKS));
+    // n_kv: all-visible (the shortcut, n_kv <= 2051), 2051 with views of 2052 rows ending at their buffer's end, deep
+    for (int64_t nk : {1, 17, 512, 2048, 2051}) {
+        for (ggml_type t : {F16, Q8, BF16, Q4}) test_cases.emplace_back(new test_sparse_attn(t, t, 16, nk, 2051, 1, SA_ROWS_ALLVIS));
+    }
+    for (ggml_type t : {F16, Q8}) {
+        for (int at_end : {1, 2}) {
+            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 9, 2051, 2051, G, SA_ROWS_ALLVIS, 12, 1, 0, 0, 1, at_end));
+        }
+        for (int64_t nk : {4096, 32768, 65536, 270336}) test_cases.emplace_back(new test_sparse_attn(t, t, 9, nk, 2051, 1, SA_ROWS_MIX));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 1, 1048576, 2051, 1, SA_ROWS_MIX));
+        // the first f16 K view >= 2 GiB: offsets past INT32_MAX bytes
+        test_cases.emplace_back(new test_sparse_attn(t, t, 1, ((int64_t) 1 << 21) + 4, 2051, 1, SA_ROWS_MIX));
+    }
+    test_cases.emplace_back(new test_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, 1, 1048576, 2051, 1, SA_ROWS_MIX));
+    // GQA 4, 8, 12
+    for (int gqa : {4, 8, 12}) {
+        for (ggml_type t : {F16, Q8, Q4}) {
+            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 2051, G, SA_ROWS_MIX, gqa));
+        }
+    }
+    // rotations
+    for (auto r : std::vector<std::pair<int, int>>{{64, 64}, {256, 256}, {64, 0}, {0, 256}, {128, 64}}) {
+        for (ggml_type t : {F16, Q8, Q4, BF16}) test_cases.emplace_back(new test_sparse_attn(t, t, 65, 4096, 2051, 1, SA_ROWS_MIX, 12, 1, r.first, r.second));
+    }
+    // 2 streams, both K/V layouts
+    for (int layout : {0, 1}) {
+        for (ggml_type t : {F16, Q8}) {
+            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 65, 4096, 2051, G, SA_ROWS_MIX, 12, 2, 0, 0, layout));
+        }
+    }
+    // empty rows, all -1 rows, permuted / duplicate rows
+    for (ggml_type t : {F16, Q8, Q4, BF16}) {
+        test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, 1, SA_ROWS_EMPTY));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, 4, SA_ROWS_EMPTY));
+    }
+    for (int pat : {SA_ROWS_ALLNEG, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_OOB}) {
+        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(Q8, F16, 33, 4096, 257, G, pat));
+    }
+    // poison (every S_fast type): NaN / inf values and scales in cells no query selects, inside attended quads and
+    // in the padding quads
+    for (ggml_type t : S_fast) {
+        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, G, SA_ROWS_POISON, 12, 1, 0, 0, 1, 0, SA_POISON));
+    }
+    // V-side overflow: bf16 V > 65504, q8_0 V with d * q > 65504, f16 V with stored inf; one selected cell
+    for (ggml_type tv : {BF16, Q8, F16}) {
+        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(F16, tv, 9, 4096, 257, G, SA_ROWS_SINGLE, 12, 1, 0, 0, 1, 0, SA_OVERFLOW));
+    }
+    // a scale that is not a power of two (the contract multiplies in f32 before the f16 rounding)
+    for (ggml_type t : {F16, Q8}) test_cases.emplace_back(new test_sparse_attn(t, t, 65, 4096, 2051, 1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, SA_PLAIN, 0, 0.0883883476f));
+
+    // ---- the QSA_*_MASKLESS shapes, with their cell formulas (test_qsa_prefill_maskless), including the q8_0 and mixed
+    //      K/V case list #219 added (b60447506): decode q {1, 9, 64, 512} x sel {257, 2051}; prefill 129 / 513 / 640;
+    //      130 x 32k, 200 x 64k, 70 x 64k; mixed q8_0 / f16 at 513 and 130; GQA 4 ----
+    for (ggml_type t : {F16, Q8}) {
+        for (int64_t nq : {1, 9, 64, 512}) {
+            for (int64_t ns : {257, 2051}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 4096, ns, nq < 128 ? 1 : 4, SA_ROWS_PR));
+        }
+        test_cases.emplace_back(new test_sparse_attn(t, t, 129, 4096, 257,  4, SA_ROWS_PR));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 513, 4096, 2051, 4, SA_ROWS_PR));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 640, 4096, 257,  4, SA_ROWS_PR));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 130, 32768, 2051, 4, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 7000));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 200, 65536, 2051, 4, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 15000));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 70,  65536, 2051, 1, SA_ROWS_PRBLK, 12, 1, 0, 0, 0, 0, SA_PLAIN, 16000));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 9,   4096, 257,  1, SA_ROWS_PR, 4));
+    }
+    test_cases.emplace_back(new test_sparse_attn(Q8, F16, 513, 4096, 2051, 4, SA_ROWS_PR));
+    test_cases.emplace_back(new test_sparse_attn(F16, Q8, 513, 4096, 2051, 4, SA_ROWS_PR));
+    test_cases.emplace_back(new test_sparse_attn(Q8, F16, 130, 32768, 2051, 4, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 7000));
+    test_cases.emplace_back(new test_sparse_attn(F16, F16, 130, 270336, 2051, 4, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 66000));
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     for (auto type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -16735,6 +17664,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, GGML_TYPE_F16));
     }
 
+    make_test_cases_sparse_attn(test_cases);
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -18094,6 +19025,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                 for (size_t i = my_begin; i < my_end; ++i) {
                     auto & test = test_cases[i];
                     test_status_t status = test->eval(b, b_cpu, op_names_filter, output_printer);
+                    if (status == test_status_t::NOT_SUPPORTED && g_fail_unsupported && !test->expected_unsupported(ggml_backend_name(b))) {
+                        status = test_status_t::FAIL;   // reported "not supported" above; not on this backend's expected list
+                    }
                     if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
                         continue;
                     }
@@ -18319,7 +19253,10 @@ static void usage(char ** argv) {
     printf("  --show-coverage             show test coverage\n");
     printf("  --test-file <path>          read test operators from a test file generated by test-export-graph-ops\n");
     printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n");
-    printf("  --mmb <on|off>              CUDA/HIP matmuls from 32 rows use the BF16 WMMA path as in a qwen4exp context (on, default) or the normal dispatch (off)\n\n");
+    printf("  --mmb <on|off>              CUDA/HIP matmuls from 32 rows use the BF16 WMMA path as in a qwen4exp context (on, default) or the normal dispatch (off)\n");
+    printf("  --fail-unsupported          test mode: a selected case the backend does not support FAILS unless it is on the\n");
+    printf("                              backend's expected-unsupported list; engagement checks become mandatory (a missing\n");
+    printf("                              census proc or opt-in fails instead of skipping)\n\n");
     printf("Examples:\n");
     printf("  %s -j 8\n", argv[0]);
     printf("  %s -o ADD,MUL_MAT\n", argv[0]);
@@ -18406,6 +19343,8 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--fail-unsupported") == 0) {
+            g_fail_unsupported = true;
         } else if (strcmp(argv[i], "--mmb") == 0) {
             if (i + 1 < argc && (strcmp(argv[i + 1], "on") == 0 || strcmp(argv[i + 1], "off") == 0)) {
                 mmb = strcmp(argv[++i], "on") == 0;

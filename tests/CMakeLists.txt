@@ -328,6 +328,9 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
+# the sparse attention host reference (sparse-attn-ref.h) checks the CPU op bit for bit: no FMA contraction
+set_source_files_properties(test-backend-ops.cpp test-sparse-attn-plan-oracle.cpp PROPERTIES COMPILE_OPTIONS
+    "$<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>,$<CXX_COMPILER_ID:IntelLLVM>>:-ffp-contract=off>")
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
@@ -411,6 +414,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp LINK ggml)
+    # the sparse attention plan against the C3 oracle (sparse-attn-ref.h), plus the over-allocation check of the two ops
+    llama_build_and_test(test-sparse-attn-plan-oracle.cpp LINK ggml)
     llama_build_and_test(test-backend-sched-ring.cpp)
 endif()
 
