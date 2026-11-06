@@ -1,0 +1,436 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+#include "types.glsl"
+#include "ggml_type_ids.glsl"
+
+// GGML_OP_SPARSE_ATTN, RDNA3 + RADV coopmat kernel (PLAN-v3 §6.3), derived from flash_attn_sel_cm.comp: one 64-lane
+// subgroup per (query, K/V head, stream, split), register-built WMMA fragments, the same accumulator layout and the same
+// online softmax. What differs:
+//   - the cells come from the G = 1 plan: one step = 4 plan entries = 16 cells of 4 quads, in the plan's ascending quad
+//     order. A cell's mask bit selects it: a masked or padding cell gets score -inf and zero K and V fragments, by select,
+//     so a NaN or inf stored there cannot reach the output (0 * NaN = NaN in WMMA, PLAN-v3 §2.2);
+//   - K and V of any type of S through sparse_attn_load.glsl: the S_fast types with packed f16 arithmetic (sa_q8x2, sa_q4x2, sa_bf2), the others
+//     through flash_attn_dequant.glsl. V is either direct (fragments built from the loads) or staged (the step's 16 V rows converted into shared
+//     memory, then read): SA_VL, AT-B3;
+//   - split z takes the steps z, z + n_split, ... of its row, so empty splits cannot appear while a row has enough steps
+//     and the split count is a function of the shape alone;
+//   - q is rounded to f16 after the f32 product (scale * H_q q), PLAN-v3 §2.2 item 2. H_q runs in registers, the butterfly
+//     order of fwht.comp (same subgroup size, 64); ROT_Q is a spec constant, so rot 0 costs nothing. H_o is a separate
+//     dispatch of fwht.comp (ggml_vk_sparse_attn).
+//
+// The fragment layout (A: lane L holds row L % 16, element i = column i; B: lane L holds column L % 16, element i = row i;
+// f32 accumulator: lane L holds column L % 16, rows L / 16 + 4 i) is the gfx11 layout of RADV's KHR cooperative matrix
+// lowering, which the spec does not guarantee: the host creates this pipeline for RADV on RDNA3 only.
+
+layout(constant_id = 0) const uint GQA = 12;
+layout(constant_id = 1) const uint FaTypeK = 1;
+layout(constant_id = 2) const uint FaTypeV = 1;
+layout(constant_id = 3) const uint SA_VL = 0;       // 0 direct, 1 staged
+layout(constant_id = 4) const uint ROT_Q = 0;       // 0, 64, 128, 256
+layout(constant_id = 5) const uint ROT_DUMP = 0;    // test hook: write H_q q to dst and stop
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer QBuf    { float data_q[];    };
+layout(binding = 1) readonly  buffer KBuf    { uvec4 data_k4[];   };
+layout(binding = 2) readonly  buffer VBuf    { uvec4 data_v4[];   };
+layout(binding = 1) readonly  buffer KWBuf   { uint  data_kw[];   };
+layout(binding = 2) readonly  buffer VWBuf   { uint  data_vw[];   };
+layout(binding = 3) readonly  buffer PlanBuf { uint  data_plan[]; };
+layout(binding = 3) readonly  buffer PlanB4  { uvec4 data_plan4[]; };
+layout(binding = 4) writeonly buffer DstBuf  { float data_dst[];  };
+
+#include "sparse_attn_load.glsl"
+
+layout(push_constant) uniform Parameters {
+    uint nbq1, nbq2, nbq3, q_off;
+    uint nbk1, nbk2, nbk3, k_off;
+    uint nbv1, nbv2, nbv3, v_off;
+    uint off_counts, off_quads, off_masks, cap;
+    uint nb1, nb2, nb3;
+    float scale;
+    float rot_scale;
+    uint n_split, n_head, n_q, n_stream, q_base;
+} p;
+
+const uint D = 256;          // host gate: head size 256
+const uint QS = D / 8 + 1;   // Q row stride in uvec4, padded against bank conflicts
+const uint STEP = 16;
+const float FLT_MAX = 3.402823466e38;
+
+shared uvec4 q_sh[16 * QS];  // Q * scale in f16, [head][dim], heads >= GQA zero
+shared float rq_sh[ROT_Q != 0 ? GQA * D : 1];        // H_q q in f32, [head][dim]
+shared uvec4 v_sh[SA_VL != 0 ? STEP * D / 8 : 1];    // the step's V rows in f16, [key][dim / 8]
+
+#define ACC   coopmat<float,     gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MAT_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MAT_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+// 16 contiguous f16 (two uvec4) into elements 0..15
+#define FILL16(M, a, b) { \
+    f16vec2 t_; \
+    t_ = unpackFloat2x16(a.x); M[ 0] = t_.x; M[ 1] = t_.y; \
+    t_ = unpackFloat2x16(a.y); M[ 2] = t_.x; M[ 3] = t_.y; \
+    t_ = unpackFloat2x16(a.z); M[ 4] = t_.x; M[ 5] = t_.y; \
+    t_ = unpackFloat2x16(a.w); M[ 6] = t_.x; M[ 7] = t_.y; \
+    t_ = unpackFloat2x16(b.x); M[ 8] = t_.x; M[ 9] = t_.y; \
+    t_ = unpackFloat2x16(b.y); M[10] = t_.x; M[11] = t_.y; \
+    t_ = unpackFloat2x16(b.z); M[12] = t_.x; M[13] = t_.y; \
+    t_ = unpackFloat2x16(b.w); M[14] = t_.x; M[15] = t_.y; }
+
+// 8 contiguous dims (dim 8 c8 ...) of a V row as packed f16. o is even; the window [floor((o - 2) / 4), + 3 dwords) holds the 8 bytes at o and ends
+// inside them, so the last piece of a row does not read past it.
+uvec4 sa_v8(const uint vrow, const uint c8) {
+    if (FaTypeV == GGML_TYPE_F16) {
+        return data_v4[vrow + c8];
+    }
+    if (FaTypeV == GGML_TYPE_BF16) {
+        const uvec4 w = data_v4[vrow / 8u + c8];
+        return uvec4(sa_bf2(w.x), sa_bf2(w.y), sa_bf2(w.z), sa_bf2(w.w));
+    }
+    if (FaTypeV == GGML_TYPE_Q8_0 || FaTypeV == GGML_TYPE_Q4_0) {
+        const bool q8 = FaTypeV == GGML_TYPE_Q8_0;
+        const uint bs = q8 ? 34u : 18u;
+        const uint blk = (vrow + (c8 >> 2)) * bs;
+        const uint dw = data_vw[blk >> 2] >> ((blk & 2u) * 8u);
+        const f16vec2 d2 = sa_d2(dw);
+        const uint j = (c8 & 3u) * 8u;
+        const uint o = blk + 2u + (q8 ? j : (j & 15u));
+        const uint x = (o - 2u) >> 2;
+        const uint w0 = data_vw[x], w1 = data_vw[x + 1u], w2 = data_vw[x + 2u];
+        const bool odd = (o & 2u) != 0u;
+        const uint a = odd ? (w0 >> 16) | (w1 << 16) : w1;
+        const uint b = odd ? (w1 >> 16) | (w2 << 16) : w2;
+        if (q8) {
+            return uvec4(sa_q8x4(a, d2), sa_q8x4(b, d2));
+        }
+        const uint shift = j >= 16u ? 4u : 0u;
+        return uvec4(sa_q4x4(a, shift, d2), sa_q4x4(b, shift, d2));
+    }
+    const vec4 x0 = sa_dq4_v(vrow, 8u * c8);
+    const vec4 x1 = sa_dq4_v(vrow, 8u * c8 + 4u);
+    return uvec4(sa_pack2(x0.xy), sa_pack2(x0.zw), sa_pack2(x1.xy), sa_pack2(x1.zw));
+}
+
+// the state of the K loader across the chunks of one row: the two 16-byte lines of the last load and the block's scales
+struct sa_k_state { uint w[8]; f16vec2 d2; };
+
+// 16 contiguous dims (dim 16 c ...) of a K row as packed f16. kr: the row, in the unit of the type; c runs 0 .. 15 in order.
+void sa_k16(const uint kr, const uint c, out uvec4 ka, out uvec4 kb, inout sa_k_state st) {
+    if (FaTypeK == GGML_TYPE_F16) {
+        ka = data_k4[kr + 2u * c];
+        kb = data_k4[kr + 2u * c + 1u];
+    } else if (FaTypeK == GGML_TYPE_BF16) {
+        const uvec4 a = data_k4[kr / 8u + 2u * c];
+        const uvec4 b = data_k4[kr / 8u + 2u * c + 1u];
+        ka = uvec4(sa_bf2(a.x), sa_bf2(a.y), sa_bf2(a.z), sa_bf2(a.w));
+        kb = uvec4(sa_bf2(b.x), sa_bf2(b.y), sa_bf2(b.z), sa_bf2(b.w));
+    } else if (FaTypeK == GGML_TYPE_Q8_0 || FaTypeK == GGML_TYPE_Q4_0) {
+        const bool q8 = FaTypeK == GGML_TYPE_Q8_0;
+        const uint bs = q8 ? 34u : 18u;
+        const uint base = kr * (bs / 2u) / 8u;           // the row in 16-byte lines (kr * bs / 16, a row is a multiple of 16 bytes)
+        const uint r = (c >> 1) * bs;                    // the block, from the row
+        const bool even = (c & 1u) == 0u;
+        const uint q0 = r + 2u + (q8 && !even ? 16u : 0u);   // its 16 q bytes
+        const uint line = even ? r / 16u : q0 / 16u;
+        if (q8 || even) {
+            const uvec4 l0 = data_k4[base + line];
+            st.w[0] = l0.x; st.w[1] = l0.y; st.w[2] = l0.z; st.w[3] = l0.w;
+            // the q bytes of an odd q8_0 chunk can end on this line: the next one may be past the row
+            if (q0 + 16u > (line + 1u) * 16u || r + 2u > (line + 1u) * 16u) {
+                const uvec4 l1 = data_k4[base + line + 1u];
+                st.w[4] = l1.x; st.w[5] = l1.y; st.w[6] = l1.z; st.w[7] = l1.w;
+            }
+        }
+        if (even) {
+            const uint pd = r - line * 16u;
+            st.d2 = sa_d2(st.w[pd >> 2] >> ((pd & 2u) * 8u));
+        }
+        const uint line_q = q8 ? line : r / 16u;
+        const uint pq = q0 - line_q * 16u;
+        const uint i = pq >> 2;
+        const bool odd = (pq & 2u) != 0u;
+        const uint shift = (c & 1u) * 4u;
+        uvec2 x[4];
+        [[unroll]] for (uint k = 0; k < 4; ++k) {
+            const uint word = odd ? (st.w[i + k] >> 16) | (st.w[i + k + 1u] << 16) : st.w[i + k];
+            x[k] = q8 ? sa_q8x4(word, st.d2) : sa_q4x4(word, shift, st.d2);
+        }
+        ka = uvec4(x[0], x[1]);
+        kb = uvec4(x[2], x[3]);
+    } else {
+        const vec4 x0 = sa_dq4_k(kr, 16u * c);
+        const vec4 x1 = sa_dq4_k(kr, 16u * c + 4u);
+        const vec4 x2 = sa_dq4_k(kr, 16u * c + 8u);
+        const vec4 x3 = sa_dq4_k(kr, 16u * c + 12u);
+        ka = uvec4(sa_pack2(x0.xy), sa_pack2(x0.zw), sa_pack2(x1.xy), sa_pack2(x1.zw));
+        kb = uvec4(sa_pack2(x2.xy), sa_pack2(x2.zw), sa_pack2(x3.xy), sa_pack2(x3.zw));
+    }
+}
+
+void main() {
+    if (FaTypeK == GGML_TYPE_IQ4_NL || FaTypeV == GGML_TYPE_IQ4_NL) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
+
+    const float NEG_INF = uintBitsToFloat(0xff800000);
+    const uint lane = gl_SubgroupInvocationID;
+    const uint col = lane & 15;   // fragment lane: K row (key), Q^T / P^T / accumulator column (head), V^T row (dim)
+    const uint grp = lane >> 4;   // accumulator rows grp + 4 i
+    const uint n_kv_head = p.n_head / GQA;
+    const uint kv_head = gl_WorkGroupID.x % n_kv_head;
+    const uint split = (gl_WorkGroupID.x / n_kv_head) % p.n_split;
+    const uint query = gl_WorkGroupID.x / (n_kv_head * p.n_split) + p.q_base;
+    const uint stream = gl_WorkGroupID.z;
+
+    // H_q in registers, as fwht.comp: scale first, then the butterflies from len 1 up
+    if (ROT_Q != 0) {
+        [[unroll]] for (uint h = 0; h < GQA; ++h) {
+            const uint qb = p.q_off + stream * p.nbq3 + (kv_head * GQA + h) * p.nbq2 + query * p.nbq1;
+            float reg[D / 64];
+            [[unroll]] for (uint i = 0; i < D / 64; ++i) {
+                reg[i] = data_q[qb + lane + 64 * i] * p.rot_scale;
+            }
+            [[unroll]] for (uint b = 1; b < 64 && b < ROT_Q; b <<= 1) {
+                [[unroll]] for (uint j = 0; j < D / 64; ++j) {
+                    const float val = reg[j];
+                    const float other = subgroupShuffleXor(val, b);
+                    reg[j] = (lane & b) == 0 ? val + other : other - val;
+                }
+            }
+            [[unroll]] for (uint b = 64; b < ROT_Q; b <<= 1) {
+                const uint st = b / 64;
+                [[unroll]] for (uint j = 0; j < D / 64; j += 2 * st) {
+                    [[unroll]] for (uint k = 0; k < st; ++k) {
+                        const float x = reg[j + k];
+                        const float y = reg[j + k + st];
+                        reg[j + k] = x + y;
+                        reg[j + k + st] = x - y;
+                    }
+                }
+            }
+            [[unroll]] for (uint i = 0; i < D / 64; ++i) {
+                rq_sh[h * D + lane + 64 * i] = reg[i];
+            }
+        }
+        barrier();
+        if (ROT_DUMP != 0) {
+            [[unroll]] for (uint h = 0; h < GQA; ++h) {
+                const uint dst_base = stream * p.nb3 + query * p.nb2 + (kv_head * GQA + h) * p.nb1;
+                [[unroll]] for (uint i = 0; i < D / 64; ++i) {
+                    data_dst[dst_base + lane + 64 * i] = rq_sh[h * D + lane + 64 * i];
+                }
+            }
+            return;
+        }
+    }
+
+    // Q * scale -> f16 in shared memory
+    [[unroll]] for (uint i = 0; i < 16 * (D / 8) / 64; ++i) {
+        const uint idx = lane + 64 * i;
+        const uint h = idx / (D / 8);
+        const uint c8 = idx % (D / 8);
+        uvec4 w = uvec4(0);
+        if (h < GQA) {
+            float x[8];
+            if (ROT_Q != 0) {
+                [[unroll]] for (uint j = 0; j < 8; ++j) {
+                    x[j] = rq_sh[h * D + c8 * 8 + j] * p.scale;
+                }
+            } else {
+                const uint qb = p.q_off + stream * p.nbq3 + (kv_head * GQA + h) * p.nbq2 + query * p.nbq1 + c8 * 8;
+                [[unroll]] for (uint j = 0; j < 8; ++j) {
+                    x[j] = data_q[qb + j] * p.scale;
+                }
+            }
+            w.x = packFloat2x16(f16vec2(x[0], x[1]));
+            w.y = packFloat2x16(f16vec2(x[2], x[3]));
+            w.z = packFloat2x16(f16vec2(x[4], x[5]));
+            w.w = packFloat2x16(f16vec2(x[6], x[7]));
+        }
+        q_sh[h * QS + c8] = w;
+    }
+    barrier();
+
+    const uint row = stream * p.n_q + query;
+    const uint count = data_plan[p.off_counts + row];
+    const uint quads = p.off_quads + row * p.cap;
+    const uint masks = p.off_masks + row * (p.cap / 2);
+
+    const uint k_base = p.k_off + stream * p.nbk3 + kv_head * p.nbk2;
+    const uint v_base = p.v_off + stream * p.nbv3 + kv_head * p.nbv2;
+
+    ACC O[16];
+    [[unroll]] for (uint t = 0; t < 16; ++t) {
+        O[t] = ACC(0.0);
+    }
+    float m = NEG_INF;   // running max and sum of head col (identical in the 4 lanes of a column)
+    float l = 0.0;
+
+    for (uint st = split; st * 4 < count; st += p.n_split) {
+        const uint e = st * 4;
+        const uvec4 qd = data_plan4[(quads + e) / 4];     // quads is a multiple of 4 dwords: 256-aligned section, cap % 4 == 0
+        const uint m01 = data_plan[masks + e / 2];
+        const uint m23 = data_plan[masks + e / 2 + 1];
+        // bit k = cell k of the step
+        const uint vm = (m01 & 15u) | ((m01 >> 12) & 0xf0u) | ((m23 & 15u) << 8) | (((m23 >> 16) & 15u) << 12);
+
+        // this lane's K row
+        const uint cur = 4 * qd[col >> 2] + (col & 3);
+        const bool k_live = ((vm >> col) & 1u) != 0;
+
+        ACC S = ACC(0.0);
+        const uint kr = k_base + cur * p.nbk1;
+        sa_k_state kst;
+        [[unroll]] for (uint c = 0; c < D / 16; ++c) {
+            uvec4 ka, kb2;
+            sa_k16(kr, c, ka, kb2, kst);
+            ka = k_live ? ka : uvec4(0);
+            kb2 = k_live ? kb2 : uvec4(0);
+            const uvec4 qa = q_sh[col * QS + 2 * c];
+            const uvec4 qb = q_sh[col * QS + 2 * c + 1];
+            MAT_A KA;
+            MAT_B QB;
+            FILL16(KA, ka, kb2);
+            FILL16(QB, qa, qb);
+            S = coopMatMulAdd(KA, QB, S);
+        }
+
+        // online softmax for head col over keys grp + 4 i of the step
+        float s[4];
+        float mx = NEG_INF;
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            s[i] = ((vm >> (grp + 4 * i)) & 1u) != 0 ? S[i] : NEG_INF;
+            mx = max(mx, s[i]);
+        }
+        mx = max(mx, subgroupShuffleXor(mx, 16));
+        mx = max(mx, subgroupShuffleXor(mx, 32));
+        const float m_new = max(m, mx);   // finite: a step holds at least one live cell
+        const float corr = exp(m - m_new);
+        float pv[4];
+        float ps = 0.0;
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            pv[i] = exp(s[i] - m_new);
+            ps += pv[i];
+        }
+        ps += subgroupShuffleXor(ps, 16);
+        ps += subgroupShuffleXor(ps, 32);
+        l = l * corr + ps;
+        m = m_new;
+
+        // P^T as a B fragment: element e = key e of the step. Key e = g + 4 i sits in pv[i] of the lanes of group g,
+        // and a register of the fragment packs keys (2k, 2k+1) = groups (2(k & 1), 2(k & 1) + 1), i = k / 2.
+        // Pair the groups with a xor-16 exchange, then trade halves with a xor-32 exchange.
+        const uint own01 = packFloat2x16(f16vec2(pv[0], pv[1]));
+        const uint own23 = packFloat2x16(f16vec2(pv[2], pv[3]));
+        const uint par01 = subgroupShuffleXor(own01, 16);
+        const uint par23 = subgroupShuffleXor(own23, 16);
+        const bool even = (grp & 1) == 0;
+        const f16vec2 o01 = unpackFloat2x16(own01), o23 = unpackFloat2x16(own23);
+        const f16vec2 q01 = unpackFloat2x16(par01), q23 = unpackFloat2x16(par23);
+        // w[i] = keys (2(grp/2) + 4 i, +1): register k = grp / 2 + 2 i of the fragment
+        uint w[4];
+        w[0] = even ? packFloat2x16(f16vec2(o01.x, q01.x)) : packFloat2x16(f16vec2(q01.x, o01.x));
+        w[1] = even ? packFloat2x16(f16vec2(o01.y, q01.y)) : packFloat2x16(f16vec2(q01.y, o01.y));
+        w[2] = even ? packFloat2x16(f16vec2(o23.x, q23.x)) : packFloat2x16(f16vec2(q23.x, o23.x));
+        w[3] = even ? packFloat2x16(f16vec2(o23.y, q23.y)) : packFloat2x16(f16vec2(q23.y, o23.y));
+        uint x[4];
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            x[i] = subgroupShuffleXor(w[i], 32);
+        }
+        const uint base = grp >> 1;
+        MAT_B PB;
+        [[unroll]] for (uint k = 0; k < 8; ++k) {
+            const f16vec2 t = unpackFloat2x16((k & 1) == base ? w[k >> 1] : x[k >> 1]);
+            PB[2 * k] = t.x;
+            PB[2 * k + 1] = t.y;
+        }
+
+        // once the running maxima settle, most steps leave every head's max unchanged: skip the rescale (uniform)
+        if (subgroupBallot(corr != 1.0) != uvec4(0)) {
+            [[unroll]] for (uint t = 0; t < 16; ++t) {
+                [[unroll]] for (uint i = 0; i < O[t].length(); ++i) {
+                    O[t][i] *= corr;
+                }
+            }
+        }
+
+        // staged V: 512 pieces of 8 dims, 8 per lane
+        if (SA_VL != 0) {
+            [[unroll]] for (uint i = 0; i < STEP * (D / 8) / 64; ++i) {
+                const uint idx = lane + 64 * i;
+                const uint ke = idx / (D / 8);
+                const uint c8 = idx % (D / 8);
+                const uint vr = 4 * qd[ke >> 2] + (ke & 3);
+                v_sh[idx] = ((vm >> ke) & 1u) != 0 ? sa_v8(v_base + vr * p.nbv1, c8) : uvec4(0);
+            }
+            barrier();
+        }
+
+        // V^T fragments, 8 tiles per half of the head
+        [[unroll]] for (uint hh = 0; hh < 2; ++hh) {
+            MAT_A VA[8];
+            [[unroll]] for (uint ke = 0; ke < STEP; ++ke) {
+                uvec4 v;
+                if (SA_VL != 0) {
+                    v = v_sh[ke * (D / 8) + hh * 16 + col];
+                } else {
+                    const uint vr = 4 * qd[ke >> 2] + (ke & 3);
+                    v = sa_v8(v_base + vr * p.nbv1, hh * 16 + col);
+                    v = ((vm >> ke) & 1u) != 0 ? v : uvec4(0);
+                }
+                f16vec2 t;
+                t = unpackFloat2x16(v.x); VA[0][ke] = t.x; VA[1][ke] = t.y;
+                t = unpackFloat2x16(v.y); VA[2][ke] = t.x; VA[3][ke] = t.y;
+                t = unpackFloat2x16(v.z); VA[4][ke] = t.x; VA[5][ke] = t.y;
+                t = unpackFloat2x16(v.w); VA[6][ke] = t.x; VA[7][ke] = t.y;
+            }
+            [[unroll]] for (uint j = 0; j < 8; ++j) {
+                O[hh * 8 + j] = coopMatMulAdd(VA[j], PB, O[hh * 8 + j]);
+            }
+        }
+        if (SA_VL != 0) {
+            barrier();
+        }
+    }
+
+    const uint head = kv_head * GQA + col;
+    if (p.n_split == 1) {
+        if (col < GQA) {
+            const uint dst_base = stream * p.nb3 + query * p.nb2 + head * p.nb1;
+            const float inv_l = l > 0.0 ? 1.0 / l : 0.0;
+            [[unroll]] for (uint t = 0; t < 16; ++t) {
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    const uint dim = (t / 8) * 128 + 8 * (grp + 4 * i) + t % 8;
+                    data_dst[dst_base + dim] = O[t][i] * inv_l;
+                }
+            }
+        }
+    } else {
+        // partial: unnormalized O, then L and M per head (an empty split writes M = -FLT_MAX, not -inf, so the
+        // reduce never computes exp(-inf - -inf))
+        if (col < GQA) {
+            const uint slot = split + p.n_split * (query + p.n_q * stream);
+            const uint o_base = D * p.n_head * slot + D * head;
+            [[unroll]] for (uint t = 0; t < 16; ++t) {
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    const uint dim = (t / 8) * 128 + 8 * (grp + 4 * i) + t % 8;
+                    data_dst[o_base + dim] = O[t][i];
+                }
+            }
+            if (grp == 0) {
+                const uint lm = D * p.n_head * p.n_q * p.n_stream * p.n_split + p.n_head * 2 * slot + head;
+                data_dst[lm] = l;
+                data_dst[lm + p.n_head] = max(m, -FLT_MAX);
+            }
+        }
+    }
+}

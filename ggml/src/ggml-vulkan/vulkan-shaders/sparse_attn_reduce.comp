@@ -1,0 +1,80 @@
+#version 450
+
+// GGML_OP_SPARSE_ATTN, split-K merge (PLAN-v3 §6.3), from flash_attn_split_k_reduce.comp without sinks and without the
+// clamp: a V that overflows f16 gives +-inf in the output (PLAN-v3 §2.2 item 1, the overflow case of §14.1). Reductions in
+// shared memory, the splits in fixed ascending order: the result is a function of the partials alone. H_o, when asked, is a
+// separate dispatch of fwht.comp after this one.
+
+const uint BLOCK_SIZE = 32;
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer A { float data_a[]; };
+layout(binding = 1) writeonly buffer D_ { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint D;
+    uint n_head;
+    uint n_q;
+    uint n_stream;
+    uint n_split;
+} p;
+
+shared float tmpsh[BLOCK_SIZE];
+
+void main() {
+    // one workgroup per (head, 32 dims, query, stream)
+    const uint n = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint i2 = gl_WorkGroupID.z % p.n_q;
+    const uint i3 = gl_WorkGroupID.z / p.n_q;
+
+    const uint D = p.D;
+    const uint k_num = p.n_split;
+    const uint lm_base = D * p.n_head * p.n_q * p.n_stream * k_num + p.n_head * 2u * k_num * (i2 + p.n_q * i3);
+    const uint l_offset = lm_base + n;
+    const uint m_offset = lm_base + p.n_head + n;
+    const uint lm_stride = p.n_head * 2u;
+
+    float m_max = uintBitsToFloat(0xff800000u);
+    for (uint k = 0u; k + tid < k_num; k += BLOCK_SIZE) {
+        m_max = max(m_max, data_a[m_offset + (k + tid) * lm_stride]);
+    }
+    tmpsh[tid] = m_max;
+    barrier();
+    for (uint s = BLOCK_SIZE / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            m_max = max(m_max, tmpsh[tid + s]);
+            tmpsh[tid] = m_max;
+        }
+        barrier();
+    }
+    m_max = tmpsh[0];
+    barrier();
+
+    float L = 0.0;
+    for (uint k = 0u; k + tid < k_num; k += BLOCK_SIZE) {
+        L += exp(data_a[m_offset + (k + tid) * lm_stride] - m_max) * data_a[l_offset + (k + tid) * lm_stride];
+    }
+    tmpsh[tid] = L;
+    barrier();
+    for (uint s = BLOCK_SIZE / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            L += tmpsh[tid + s];
+            tmpsh[tid] = L;
+        }
+        barrier();
+    }
+    L = tmpsh[0];
+    const float inv_l = L > 0.0 ? 1.0 / L : 0.0;
+
+    const uint d = tid + gl_WorkGroupID.y * BLOCK_SIZE;
+    if (d < D) {
+        float O = 0.0;
+        for (uint k = 0u; k < k_num; ++k) {
+            const float m = data_a[m_offset + k * lm_stride];
+            const float o = data_a[D * p.n_head * (k + k_num * (i2 + p.n_q * i3)) + D * n + d];
+            O += m > -3.402823466e38 ? exp(m - m_max) * o : 0.0;
+        }
+        data_d[(i3 * p.n_q + i2) * p.n_head * D + D * n + d] = O * inv_l;
+    }
+}

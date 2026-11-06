@@ -19,8 +19,14 @@ layout(push_constant) uniform parameter
     float scale;
 };
 
+#ifdef FWHT_INPLACE
+// one binding: H_o of GGML_OP_SPARSE_ATTN (no aliased descriptors); every row is read whole before it is written
+layout(binding = 0, std430) buffer A { float data_a[]; };
+#define data_d data_a
+#else
 layout(binding = 0, std430) readonly buffer A { float data_a[]; };
 layout(binding = 1, std430) writeonly buffer D { float data_d[]; };
+#endif
 
 const uint EL_W = N / BLOCK_SIZE;
 

@@ -1,0 +1,264 @@
+#version 450
+
+// GGML_OP_SPARSE_ATTN_PLAN, G = 1 (PLAN-v3 §2.1, §6.3): one workgroup per query row. The whole dst is bit-exact to the
+// CPU op (ggml-cpu/sparse-attn.cpp) and to the C3 oracle.
+//
+// Portable by construction: 32-bit loads and stores only, no subgroup operation, no 8- or 16-bit storage, a few shared
+// words. Its host gate is its own (WG invocations and (WG + WG / 16 + 2) * 4 bytes of shared memory), not the 64-lane gate of the
+// attend kernels.
+//
+// p.mode == 0 (one workgroup, first dispatch): the header and the zero bytes of dst (header padding, section gaps).
+// p.mode == 1 (one workgroup per (query, stream)), with a host barrier before it, because hdr.n_bad is a shared counter:
+//   1. each thread cleans a contiguous chunk of the row into the scratch row (invalid entries -> NONE; values other than
+//      -1 count in hdr.n_bad) and tests "strictly ascending, invalid entries last";
+//   2. when a thread found a violation, a bitonic sort of the scratch row (flip form; comparators past n_sel are dropped,
+//      which is the power-of-two network on the row padded with +inf). The sort runs in the storage buffer: n_sel is
+//      not limited by shared memory (the plan contract has no n_sel limit);
+//   3. a quad starts at a valid position whose quad differs from the previous position's; a two-level sum of the per-thread
+//      counts gives each thread its first entry; each start ORs the mask of its run (repeats of a cell fall in the run,
+//      so duplicates cost time, never bytes);
+//   4. the padding entries of the row: quad = last valid quad (or 0), mask 0 (zeroed in step 1).
+// The masks are u16 and written as whole dwords through atomicOr: two threads can own the two halves of one dword.
+
+layout(constant_id = 0) const uint WG = 256;   // a power of two
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer SelBuf { int sel[]; };
+layout(binding = 1) coherent buffer DstBuf { uint dst[]; };
+layout(binding = 2) coherent buffer ScrBuf { uint scr[]; };
+
+layout(push_constant) uniform Parameters {
+    uint mode;
+    uint n_kv;
+    uint n_sel;
+    uint stride;       // scratch entries per row
+    uint nbs1;         // sel strides and offset, in entries
+    uint nbs3;
+    uint sel_off;
+    uint n_q;
+    uint n_stream;
+    uint cap;
+    uint off_counts;   // dst sections, in dwords
+    uint off_quads;
+    uint off_masks;
+    uint q_base;       // first query of this dispatch
+} p;
+
+const uint NONE = 0xffffffffu;
+
+shared uint unsorted_sh;
+shared uint lastq_sh;       // last valid quad + 1, 0 = no valid cell
+shared uint scan_sh[WG];
+const uint R = 16u;         // the host gate: 16 <= WG <= 256, a power of two
+shared uint group_sh[WG / R];
+
+void write_header() {
+    // ggml_sparse_attn_plan_hdr: magic, version, group, n_q, n_stream, n_groups, cap, n_bad, then 4 u64
+    dst[0] = 0x50415351u;
+    dst[1] = 1u;
+    dst[2] = 1u;
+    dst[3] = p.n_q;
+    dst[4] = p.n_stream;
+    dst[5] = p.n_q;
+    dst[6] = p.cap;
+    dst[7] = 0u;
+    dst[8]  = p.off_counts * 4u; dst[9]  = 0u;
+    dst[10] = p.off_quads  * 4u; dst[11] = 0u;
+    dst[12] = p.off_masks  * 4u; dst[13] = 0u;
+    dst[14] = 0u;                dst[15] = 0u;
+    for (uint i = 16u; i < p.off_counts; ++i) {
+        dst[i] = 0u;
+    }
+    const uint n_ent = p.n_stream * p.n_q;
+    for (uint i = p.off_counts + n_ent; i < p.off_quads; ++i) {
+        dst[i] = 0u;
+    }
+    for (uint i = p.off_quads + n_ent * p.cap; i < p.off_masks; ++i) {
+        dst[i] = 0u;
+    }
+}
+
+void sort_barrier() {
+    memoryBarrierBuffer();
+    barrier();
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    if (p.mode == 0u) {
+        if (tid == 0u) {
+            write_header();
+        }
+        return;
+    }
+
+    const uint q = gl_WorkGroupID.x + p.q_base;
+    const uint s = gl_WorkGroupID.y;
+    const uint row = s * p.n_q + q;
+    const uint n = p.n_sel;
+    const uint sel_base = p.sel_off + s * p.nbs3 + q * p.nbs1;
+    const uint scr_base = row * p.stride;
+    const uint chunk = (n + WG - 1u) / WG;
+    const uint lo = min(tid * chunk, n);
+    const uint hi = min(lo + chunk, n);
+    const uint masks_base = p.off_masks + row * (p.cap / 2u);
+    const uint quads_base = p.off_quads + row * p.cap;
+
+    if (tid == 0u) {
+        unsorted_sh = 0u;
+        lastq_sh = 0u;
+    }
+    barrier();
+
+    // 1. clean
+    uint n_bad = 0u;
+    uint violation = 0u;
+    uint prev = NONE;
+    if (lo > 0u && lo < n) {
+        const int c = sel[sel_base + lo - 1u];
+        prev = (c >= 0 && uint(c) < p.n_kv) ? uint(c) : NONE;
+    }
+    for (uint i = lo; i < hi; ++i) {
+        const int c = sel[sel_base + i];
+        const bool valid = c >= 0 && uint(c) < p.n_kv;
+        const uint x = valid ? uint(c) : NONE;
+        if (!valid && c != -1) {
+            n_bad++;
+        }
+        if (i > 0u && valid && (prev == NONE || prev >= x)) {
+            violation = 1u;
+        }
+        prev = x;
+        scr[scr_base + i] = x;
+    }
+    for (uint w = tid; w < p.cap / 2u; w += WG) {
+        dst[masks_base + w] = 0u;
+    }
+    if (n_bad != 0u) {
+        atomicAdd(dst[7], n_bad);
+    }
+    if (violation != 0u) {
+        atomicOr(unsorted_sh, 1u);
+    }
+    sort_barrier();
+
+    // 2. sort
+    if (unsorted_sh != 0u) {
+        for (uint len = 1u; len < n; len <<= 1) {
+            // flip stage: runs of len are merged into runs of 2 len
+            const uint n_blocks = (n + 2u * len - 1u) / (2u * len);
+            const uint n_pairs = n_blocks * len;
+            for (uint m = tid; m < n_pairs; m += WG) {
+                const uint k = (m / len) * 2u * len;
+                const uint i = m % len;
+                const uint a = k + i;
+                const uint b = k + 2u * len - 1u - i;
+                if (b < n) {
+                    const uint x = scr[scr_base + a];
+                    const uint y = scr[scr_base + b];
+                    if (x > y) {
+                        scr[scr_base + a] = y;
+                        scr[scr_base + b] = x;
+                    }
+                }
+            }
+            sort_barrier();
+            for (uint h = len >> 1; h > 0u; h >>= 1) {
+                const uint n_blocks_h = (n + 2u * h - 1u) / (2u * h);
+                const uint n_pairs_h = n_blocks_h * h;
+                for (uint m = tid; m < n_pairs_h; m += WG) {
+                    const uint k = (m / h) * 2u * h;
+                    const uint a = k + m % h;
+                    const uint b = a + h;
+                    if (b < n) {
+                        const uint x = scr[scr_base + a];
+                        const uint y = scr[scr_base + b];
+                        if (x > y) {
+                            scr[scr_base + a] = y;
+                            scr[scr_base + b] = x;
+                        }
+                    }
+                }
+                sort_barrier();
+            }
+        }
+    }
+
+    // 3. entries: starts in this thread's chunk, then an inclusive scan (Hillis-Steele)
+    uint own = 0u;
+    prev = lo > 0u && lo < n ? scr[scr_base + lo - 1u] : NONE;
+    for (uint i = lo; i < hi; ++i) {
+        const uint x = scr[scr_base + i];
+        if (x != NONE && (prev == NONE || (prev >> 2) != (x >> 2))) {
+            own++;
+        }
+        prev = x;
+    }
+    // 2 barriers: this thread's group of R threads, then the groups before it (WG <= R * R)
+    scan_sh[tid] = own;
+    barrier();
+    uint before = 0u;
+    for (uint t = tid & ~(R - 1u); t < tid; ++t) {
+        before += scan_sh[t];
+    }
+    if ((tid & (R - 1u)) == R - 1u) {
+        group_sh[tid / R] = before + own;
+    }
+    barrier();
+    for (uint g = 0u; g < tid / R; ++g) {
+        before += group_sh[g];
+    }
+    uint count = 0u;
+    for (uint g = 0u; g < WG / R; ++g) {
+        count += group_sh[g];
+    }
+    uint pos = before;
+
+    prev = lo > 0u && lo < n ? scr[scr_base + lo - 1u] : NONE;
+    uint word = NONE;
+    uint word_bits = 0u;
+    uint last_quad = NONE;
+    for (uint i = lo; i < hi; ++i) {
+        const uint x = scr[scr_base + i];
+        if (x != NONE && (prev == NONE || (prev >> 2) != (x >> 2))) {
+            const uint quad = x >> 2;
+            uint mask = 0u;
+            for (uint j = i; j < n; ++j) {
+                const uint y = scr[scr_base + j];
+                if (y == NONE || (y >> 2) != quad) {
+                    break;
+                }
+                mask |= 1u << (y & 3u);
+            }
+            dst[quads_base + pos] = quad;
+            const uint w = pos / 2u;
+            if (w != word) {
+                if (word != NONE) {
+                    atomicOr(dst[masks_base + word], word_bits);
+                }
+                word = w;
+                word_bits = 0u;
+            }
+            word_bits |= mask << ((pos & 1u) * 16u);
+            pos++;
+            last_quad = quad;
+        }
+        prev = x;
+    }
+    if (word != NONE) {
+        atomicOr(dst[masks_base + word], word_bits);
+    }
+    if (last_quad != NONE) {
+        atomicMax(lastq_sh, last_quad + 1u);
+    }
+    barrier();
+
+    // 4. padding entries and the padded count
+    const uint pad = lastq_sh > 0u ? lastq_sh - 1u : 0u;
+    for (uint e = count + tid; e < p.cap; e += WG) {
+        dst[quads_base + e] = pad;
+    }
+    if (tid == 0u) {
+        dst[p.off_counts + row] = (count + 3u) & ~3u;
+    }
+}

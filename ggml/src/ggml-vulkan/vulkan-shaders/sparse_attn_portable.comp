@@ -1,0 +1,285 @@
+#version 450
+
+// GGML_OP_SPARSE_ATTN, portable tier (PLAN-v3 §6.3, P2-16): every Vulkan device that can create neither the coopmat nor the
+// 64-lane pipelines. No extension, no capability beyond Shader: no subgroup operation (the subgroup size is neither
+// assumed nor read), no 8- or 16-bit type, K and V read as 32-bit words. Device requirements: what the Vulkan 1.2 target of
+// the build asks, GQA invocations per workgroup and 2 KiB of shared memory.
+//
+// One workgroup per (query, K/V head, stream), one invocation per query head of that K/V head. Cell by cell, in the plan's
+// ascending order: the invocations convert the K and V rows into shared memory (dims in stripes), barrier, each computes
+// its head's score and online softmax over private q and acc, barrier. The tier never splits: its output is the plan's one
+// pass per query, the class "G1, 1 split" of the §14.2 (c) transfer rule.
+//
+// Arithmetic: the CPU op's (ggml-cpu/sparse-attn.cpp, O_CON), operation by operation, with NoContraction (`precise`):
+//   q: H_q in f32 (scale first, then the butterflies from len 1 up, fwht.comp's order), f32 product with scale, one RNE
+//      rounding to f16; K / V: to_float in f32 as ggml-quants.c, one RNE rounding to f16; each score an f32 sum over the 256
+//      dims in sequential order; if s > m { alpha = (m == -inf) ? 0 : exp(m - s); acc *= alpha; l *= alpha; m = s };
+//      p = exp(s - m); l += p; acc += f16(p) * v; out = l > 0 ? acc / l : 0.
+//   The f32 <-> f16 conversions are integer code: packHalf2x16 has no rounding-mode guarantee (and RTZ lowerings exist), and
+//   the f16 storage conversions are what this tier does not require.
+//   The only arithmetic difference from the CPU op is the device exp against the host's.
+// Masked-off and padding cells are never loaded (the loop walks the query's mask bits), so their bytes cannot reach the
+// output (contract item 4).
+//
+// Shared memory: K and V rows, 2 KiB + a few bytes; q and acc are private (no more than GQA * 2 KiB in total when a driver
+// lowers them to scratch, none of it shared).
+
+layout(constant_id = 0) const uint GQA = 12;        // also the workgroup size
+layout(constant_id = 1) const uint FaTypeK = 1;
+layout(constant_id = 2) const uint FaTypeV = 1;
+layout(constant_id = 3) const uint ROT_Q = 0;       // 0, 64, 128, 256
+layout(constant_id = 4) const uint ROT_DUMP = 0;    // test hook: write H_q q to dst and stop
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer QBuf    { float data_q[];    };
+layout(binding = 1) readonly  buffer KBuf    { uint  data_k[];    };
+layout(binding = 2) readonly  buffer VBuf    { uint  data_v[];    };
+layout(binding = 3) readonly  buffer PlanBuf { uint  data_plan[]; };
+layout(binding = 4) writeonly buffer DstBuf  { float data_dst[];  };
+
+layout(push_constant) uniform Parameters {
+    uint nbq1, nbq2, nbq3, q_off;
+    uint nbk1, nbk2, nbk3, k_off;   // bytes
+    uint nbv1, nbv2, nbv3, v_off;   // bytes
+    uint off_counts, off_quads, off_masks, cap;
+    uint nb1, nb2, nb3;
+    float scale;
+    float rot_scale;
+    uint n_split, n_head, n_q, n_stream, q_base;
+} p;
+
+const uint D = 256;
+
+// ggml_type ids (ggml.h), as in ggml_type_ids.glsl (which needs no extension, but this tier stays free of every include)
+const uint T_F32 = 0u, T_F16 = 1u, T_Q4_0 = 2u, T_Q4_1 = 3u, T_Q5_0 = 6u, T_Q5_1 = 7u, T_Q8_0 = 8u, T_IQ4_NL = 20u, T_BF16 = 30u;
+
+shared float k_sh[D];
+shared float v_sh[D];
+
+// f16 bits -> f32, every value exact (denormals included)
+float sa_h2f(const uint h) {
+    const uint s = (h & 0x8000u) << 16;
+    const uint e = (h >> 10) & 31u;
+    const uint m = h & 1023u;
+    if (e == 31u) {
+        return uintBitsToFloat(s | 0x7f800000u | (m << 13));
+    }
+    if (e == 0u) {
+        // m * 2^-24: exact in f32, as a normal number
+        if (m == 0u) {
+            return uintBitsToFloat(s);
+        }
+        const int top = findMSB(m);   // m < 2^10
+        return uintBitsToFloat(s | (uint(103 + top) << 23) | ((m << (23 - top)) & 0x7fffffu));
+    }
+    return uintBitsToFloat(s | ((e + 112u) << 23) | (m << 13));
+}
+
+// f32 -> f16 bits, round to nearest even, +-inf past the f16 range, as F16C
+uint sa_f2h(const float f) {
+    const uint b = floatBitsToUint(f);
+    const uint s = (b >> 16) & 0x8000u;
+    const uint a = b & 0x7fffffffu;
+    if (a > 0x7f800000u) {
+        return s | 0x7e00u | ((a >> 13) & 0x1ffu);
+    }
+    if (a >= 0x47800000u) {   // >= 65536, inf included
+        return s | 0x7c00u;
+    }
+    if (a >= 0x38800000u) {   // normal f16: >= 2^-14
+        const uint h = ((a - 0x38000000u) >> 13);
+        const uint rem = a & 0x1fffu;
+        return s | (h + ((rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) ? 1u : 0u));
+    }
+    if (a < 0x33000000u) {    // < 2^-25: rounds to 0 (2^-25 itself is the tie, handled below)
+        return s;
+    }
+    const uint sig = (a & 0x7fffffu) | 0x800000u;
+    const uint sh = 126u - (a >> 23);   // 14 .. 24
+    const uint h = sig >> sh;
+    const uint rem = sig & ((1u << sh) - 1u);
+    const uint half_ = 1u << (sh - 1u);
+    return s | (h + ((rem > half_ || (rem == half_ && (h & 1u) != 0u)) ? 1u : 0u));
+}
+
+float sa_round(const float x) {
+    return sa_h2f(sa_f2h(x));
+}
+
+// little-endian byte / half at a byte offset of a binding
+#define SA_BYTE(buf, o) ((buf[(o) >> 2] >> (((o) & 3u) * 8u)) & 0xffu)
+#define SA_HALF(buf, o) (SA_BYTE(buf, o) | (SA_BYTE(buf, (o) + 1u) << 8))
+
+const float IQ4NL[16] = float[16](-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+
+// to_float of dim d of a row (ggml-quants.c), in f32, rounded to f16. Block layouts (ggml-common.h): q8_0 {d, qs[32]} 34 B;
+// q4_0 / iq4_nl {d, qs[16]} 18 B; q4_1 {d, m, qs[16]} 20 B; q5_0 {d, qh[4], qs[16]} 22 B; q5_1 {d, m, qh[4], qs[16]} 24 B.
+#define SA_LOAD_FN(NAME, buf)                                                                  \
+float NAME(const uint type, const uint row, const uint d) {                                    \
+    const uint j = d & 31u;                                                                    \
+    precise float x = 0.0;                                                                     \
+    switch (type) {                                                                            \
+        case T_F16:                                                                            \
+            return sa_h2f(SA_HALF(buf, row + 2u * d));                                         \
+        case T_F32:                                                                            \
+            return sa_round(uintBitsToFloat(buf[(row + 4u * d) >> 2]));                        \
+        case T_BF16:                                                                           \
+            return sa_round(uintBitsToFloat(SA_HALF(buf, row + 2u * d) << 16));                \
+        case T_Q8_0: {                                                                         \
+            const uint blk = row + (d >> 5) * 34u;                                             \
+            const int q = int(SA_BYTE(buf, blk + 2u + j) << 24) >> 24;                         \
+            x = sa_h2f(SA_HALF(buf, blk)) * float(q);                                          \
+            return sa_round(x);                                                                \
+        }                                                                                      \
+        case T_Q4_0: {                                                                         \
+            const uint blk = row + (d >> 5) * 18u;                                             \
+            const uint nb = SA_BYTE(buf, blk + 2u + (j & 15u)) >> (j >= 16u ? 4u : 0u);        \
+            x = sa_h2f(SA_HALF(buf, blk)) * (float(nb & 15u) - 8.0);                           \
+            return sa_round(x);                                                                \
+        }                                                                                      \
+        case T_IQ4_NL: {                                                                       \
+            const uint blk = row + (d >> 5) * 18u;                                             \
+            const uint nb = SA_BYTE(buf, blk + 2u + (j & 15u)) >> (j >= 16u ? 4u : 0u);        \
+            x = sa_h2f(SA_HALF(buf, blk)) * IQ4NL[nb & 15u];                                   \
+            return sa_round(x);                                                                \
+        }                                                                                      \
+        case T_Q4_1: {                                                                         \
+            const uint blk = row + (d >> 5) * 20u;                                             \
+            const uint nb = SA_BYTE(buf, blk + 4u + (j & 15u)) >> (j >= 16u ? 4u : 0u);        \
+            x = float(nb & 15u) * sa_h2f(SA_HALF(buf, blk));                                   \
+            x = x + sa_h2f(SA_HALF(buf, blk + 2u));                                            \
+            return sa_round(x);                                                                \
+        }                                                                                      \
+        case T_Q5_0: {                                                                         \
+            const uint blk = row + (d >> 5) * 22u;                                             \
+            const uint nb = SA_BYTE(buf, blk + 6u + (j & 15u)) >> (j >= 16u ? 4u : 0u);        \
+            const uint hb = (SA_BYTE(buf, blk + 2u + (j >> 3)) >> (j & 7u)) & 1u;              \
+            x = sa_h2f(SA_HALF(buf, blk)) * (float((nb & 15u) | (hb << 4)) - 16.0);            \
+            return sa_round(x);                                                                \
+        }                                                                                      \
+        case T_Q5_1: {                                                                         \
+            const uint blk = row + (d >> 5) * 24u;                                             \
+            const uint nb = SA_BYTE(buf, blk + 8u + (j & 15u)) >> (j >= 16u ? 4u : 0u);        \
+            const uint hb = (SA_BYTE(buf, blk + 4u + (j >> 3)) >> (j & 7u)) & 1u;              \
+            x = float((nb & 15u) | (hb << 4)) * sa_h2f(SA_HALF(buf, blk));                     \
+            x = x + sa_h2f(SA_HALF(buf, blk + 2u));                                            \
+            return sa_round(x);                                                                \
+        }                                                                                      \
+        default:                                                                               \
+            return 0.0;                                                                        \
+    }                                                                                          \
+}
+
+SA_LOAD_FN(sa_load_k, data_k)
+SA_LOAD_FN(sa_load_v, data_v)
+
+void main() {
+    const float NEG_INF = uintBitsToFloat(0xff800000u);
+    const uint t = gl_LocalInvocationIndex;   // query head within the K/V head
+    const uint query = gl_WorkGroupID.x + p.q_base;
+    const uint kv_head = gl_WorkGroupID.y;
+    const uint stream = gl_WorkGroupID.z;
+    const uint head = kv_head * GQA + t;
+
+    float q[D];
+    float acc[D];
+    {
+        const uint qb = p.q_off + stream * p.nbq3 + head * p.nbq2 + query * p.nbq1;
+        for (uint d = 0u; d < D; ++d) {
+            q[d] = data_q[qb + d];
+        }
+    }
+    if (ROT_Q != 0u) {
+        for (uint d = 0u; d < D; ++d) {
+            precise float x = q[d] * p.rot_scale;
+            q[d] = x;
+        }
+        for (uint blk = 0u; blk < D; blk += ROT_Q) {
+            for (uint len = 1u; len < ROT_Q; len <<= 1) {
+                for (uint i = 0u; i < ROT_Q; i += 2u * len) {
+                    for (uint j = 0u; j < len; ++j) {
+                        const float u = q[blk + i + j];
+                        const float v = q[blk + i + len + j];
+                        precise float a = u + v;
+                        precise float b = u - v;
+                        q[blk + i + j] = a;
+                        q[blk + i + len + j] = b;
+                    }
+                }
+            }
+        }
+    }
+    if (ROT_DUMP != 0u) {
+        const uint dst_base = stream * p.nb3 + query * p.nb2 + head * p.nb1;
+        for (uint d = 0u; d < D; ++d) {
+            data_dst[dst_base + d] = q[d];
+        }
+        return;
+    }
+    for (uint d = 0u; d < D; ++d) {
+        precise float x = q[d] * p.scale;
+        q[d] = sa_round(x);
+        acc[d] = 0.0;
+    }
+    float m = NEG_INF;
+    float l = 0.0;
+
+    const uint row = stream * p.n_q + query;
+    const uint count = data_plan[p.off_counts + row];
+    const uint quads = p.off_quads + row * p.cap;
+    const uint masks = p.off_masks + row * (p.cap / 2u);
+    const uint k_base = p.k_off + stream * p.nbk3 + kv_head * p.nbk2;
+    const uint v_base = p.v_off + stream * p.nbv3 + kv_head * p.nbv2;
+
+    for (uint e = 0u; e < count; ++e) {
+        const uint mask = (data_plan[masks + e / 2u] >> ((e & 1u) * 16u)) & 15u;
+        if (mask == 0u) {
+            continue;
+        }
+        const uint quad = data_plan[quads + e];
+        for (uint c = 0u; c < 4u; ++c) {
+            if (((mask >> c) & 1u) == 0u) {
+                continue;
+            }
+            const uint cell = 4u * quad + c;
+            const uint kr = k_base + cell * p.nbk1;
+            const uint vr = v_base + cell * p.nbv1;
+            for (uint d = t; d < D; d += GQA) {
+                k_sh[d] = sa_load_k(FaTypeK, kr, d);
+                v_sh[d] = sa_load_v(FaTypeV, vr, d);
+            }
+            barrier();
+
+            precise float s = 0.0;
+            for (uint d = 0u; d < D; ++d) {
+                precise float pr = q[d] * k_sh[d];
+                s = s + pr;
+            }
+            if (s > m) {
+                const float alpha = m == NEG_INF ? 0.0 : exp(m - s);
+                for (uint d = 0u; d < D; ++d) {
+                    precise float x = acc[d] * alpha;
+                    acc[d] = x;
+                }
+                precise float lx = l * alpha;
+                l = lx;
+                m = s;
+            }
+            const float pc = exp(s - m);
+            const float ph = sa_round(pc);
+            precise float ln = l + pc;
+            l = ln;
+            for (uint d = 0u; d < D; ++d) {
+                precise float pr = ph * v_sh[d];
+                precise float x = acc[d] + pr;
+                acc[d] = x;
+            }
+            barrier();
+        }
+    }
+
+    const uint dst_base = stream * p.nb3 + query * p.nb2 + head * p.nb1;
+    for (uint d = 0u; d < D; ++d) {
+        data_dst[dst_base + d] = l > 0.0 ? acc[d] / l : 0.0;
+    }
+}
