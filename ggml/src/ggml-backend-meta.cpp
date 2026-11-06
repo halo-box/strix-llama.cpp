@@ -153,6 +153,9 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    if (op->op == GGML_OP_SPARSE_ATTN_PLAN || op->op == GGML_OP_SPARSE_ATTN) {
+        return false; // no tensor-split handler (see the split-state switch)
+    }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
@@ -1067,6 +1070,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_GLU: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
+            case GGML_OP_SPARSE_ATTN_PLAN:
+            case GGML_OP_SPARSE_ATTN: {
+                // no tensor-split handler: supports_op is false for both ops, and QSA under a tensor split is an init error
+                GGML_ABORT("%s is not supported by the meta (tensor-split) backend", ggml_op_name(tensor->op));
+            } //break;
             default: {
                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
                 split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};

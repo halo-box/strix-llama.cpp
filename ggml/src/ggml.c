@@ -1218,9 +1218,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "SPARSE_ATTN_PLAN",
+    "SPARSE_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1333,9 +1336,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "sparse_attn_plan(sel)",
+    "sparse_attn(q,k,v,plan)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6629,6 +6635,122 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_sparse_attn_plan / ggml_sparse_attn
+
+static_assert(sizeof(struct ggml_sparse_attn_plan_hdr) == 64, "ggml_sparse_attn_plan_hdr must be 64 bytes");
+
+#define GGML_SPARSE_ATTN_PLAN_ALIGN 256
+
+struct ggml_sparse_attn_plan_layout ggml_sparse_attn_plan_get_layout(
+        int64_t n_sel, int64_t n_q, int64_t n_stream, int64_t n_kv, int32_t group) {
+    GGML_ASSERT(n_sel >= 1 && n_q >= 1 && n_stream >= 1);
+    GGML_ASSERT(n_kv >= 1 && n_kv <= ((int64_t) 1 << 24));
+    GGML_ASSERT(group == 1 || group == 4);
+
+    struct ggml_sparse_attn_plan_layout l;
+    l.group    = group;
+    l.n_groups = (n_q + group - 1) / group;
+    const int64_t n_quads = (n_kv + 3) / 4;
+    const int64_t worst   = (int64_t) group * n_sel;
+    l.cap      = GGML_PAD(worst < n_quads ? worst : n_quads, 4);
+    const size_t n_ent    = (size_t) n_stream * (size_t) l.n_groups;
+    l.off_counts = GGML_SPARSE_ATTN_PLAN_ALIGN;
+    l.off_quads  = l.off_counts + GGML_PAD(n_ent * sizeof(uint32_t), GGML_SPARSE_ATTN_PLAN_ALIGN);
+    l.off_masks  = l.off_quads  + GGML_PAD(n_ent * (size_t) l.cap * sizeof(uint32_t), GGML_SPARSE_ATTN_PLAN_ALIGN);
+    l.nbytes     = l.off_masks  + n_ent * (size_t) l.cap * sizeof(uint16_t);
+    return l;
+}
+
+size_t ggml_sparse_attn_plan_nbytes(int64_t n_sel, int64_t n_q, int64_t n_stream, int64_t n_kv, int32_t group) {
+    return ggml_sparse_attn_plan_get_layout(n_sel, n_q, n_stream, n_kv, group).nbytes;
+}
+
+size_t ggml_sparse_attn_plan_scratch_nbytes(int64_t n_sel, int64_t n_q, int64_t n_stream) {
+    GGML_ASSERT(n_sel >= 1 && n_q >= 1 && n_stream >= 1);
+    return (size_t) n_stream * (size_t) n_q * (size_t) GGML_PAD(n_sel, 4) * sizeof(int32_t);
+}
+
+struct ggml_tensor * ggml_sparse_attn_plan(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sel,
+        int64_t               n_kv,
+        int32_t               group) {
+    GGML_ASSERT(sel->type == GGML_TYPE_I32);
+    GGML_ASSERT(sel->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(sel->nb[1] % sizeof(int32_t) == 0 && sel->nb[2] % sizeof(int32_t) == 0 && sel->nb[3] % sizeof(int32_t) == 0);
+    GGML_ASSERT(sel->ne[0] >= 1);
+    GGML_ASSERT(sel->ne[2] == 1);
+    GGML_ASSERT(sel->ne[1] <= UINT32_MAX && sel->ne[3] <= UINT32_MAX);
+    GGML_ASSERT(n_kv >= 1 && n_kv <= ((int64_t) 1 << 24));
+    GGML_ASSERT(group == 1 || group == 4);
+
+    const size_t nbytes = ggml_sparse_attn_plan_nbytes(sel->ne[0], sel->ne[1], sel->ne[3], n_kv, group);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) nbytes);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_kv);
+    ggml_set_op_params_i32(result, 1, group);
+
+    result->op     = GGML_OP_SPARSE_ATTN_PLAN;
+    result->src[0] = sel;
+
+    return result;
+}
+
+static bool ggml_sparse_attn_rot_ok(int32_t rot, int64_t D) {
+    return rot == 0 || ((rot == 64 || rot == 128 || rot == 256) && D % rot == 0);
+}
+
+struct ggml_tensor * ggml_sparse_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * plan,
+        float                 scale,
+        int32_t               rot_q,
+        int32_t               rot_o) {
+    GGML_ASSERT(plan->op == GGML_OP_SPARSE_ATTN_PLAN && plan->type == GGML_TYPE_I8);
+    const struct ggml_tensor * sel = plan->src[0];
+    GGML_ASSERT(sel != NULL);
+
+    const int64_t D         = q->ne[0];
+    const int64_t n_q       = q->ne[1];
+    const int64_t n_head    = q->ne[2];
+    const int64_t n_stream  = q->ne[3];
+    const int64_t n_head_kv = k->ne[2];
+    const int64_t n_kv      = ggml_get_op_params_i32(plan, 0);
+    const int64_t n_kv4     = 4 * ((n_kv + 3) / 4);
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->nb[0] == sizeof(float));
+    GGML_ASSERT(k->ne[0] == D && v->ne[0] == D);
+    GGML_ASSERT(v->ne[2] == n_head_kv);
+    GGML_ASSERT(n_head_kv >= 1 && n_head % n_head_kv == 0);
+    GGML_ASSERT(k->ne[3] == n_stream && v->ne[3] == n_stream);
+    // rows of K and V are read with the type's to_float: one contiguous row of D elements per (cell, head, stream)
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type) && D % ggml_blck_size(k->type) == 0);
+    GGML_ASSERT(v->nb[0] == ggml_type_size(v->type) && D % ggml_blck_size(v->type) == 0);
+    GGML_ASSERT(sel->ne[1] == n_q && sel->ne[3] == n_stream);
+    // a quad load reads 4 cells: the views must hold every cell of the last quad
+    GGML_ASSERT(k->ne[1] >= n_kv4 && v->ne[1] >= n_kv4);
+    GGML_ASSERT(ggml_sparse_attn_rot_ok(rot_q, D) && ggml_sparse_attn_rot_ok(rot_o, D));
+
+    const int64_t ne[4] = { D, n_head, n_q, n_stream };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, rot_q);
+    ggml_set_op_params_i32(result, 2, rot_o);
+
+    result->op     = GGML_OP_SPARSE_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = plan;
 
     return result;
 }

@@ -7,11 +7,13 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    8
-#define RPC_PROTO_MINOR_VERSION    0
+#define RPC_PROTO_MINOR_VERSION    1
 #define RPC_PROTO_PATCH_VERSION    0
 
+// The hello only compares major/minor and deserialize does not validate op values, so a change of the op enum needs
+// at least a minor bump: 8.1 appends GGML_OP_SPARSE_ATTN_PLAN and GGML_OP_SPARSE_ATTN before GGML_OP_COUNT.
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_MINOR_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
