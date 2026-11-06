@@ -174,8 +174,14 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     // Q2_0 (routed down): a lane prefetches its 2 qs bytes and d in the WMMA loop, unpacked, so their wait lands after
     // the WMMAs; store_lds decodes its 8 weights
     constexpr bool Q20 = WTYPE == 32 + GGML_TYPE_Q2_0;
-    constexpr int Q2R = Q20 ? (BM * 8) / MMB_NT : 1;
+    // routed Q2_0: two threads per row, 32 weights each, so a thread forms one row's four bf16 values (q - 1) d per
+    // stage (as the same fp32 products with the same RNE) and v_perm picks two weights per dword; eight threads per
+    // row with four rows each spent ~50 VALU per 8 weights on the per-weight convert, multiply and RNE
+    constexpr bool Q20T = Q20 && TAIL && BM * 2 == MMB_NT;
+    constexpr int Q2R = Q20 ? (Q20T ? 4 : (BM * 8) / MMB_NT) : 1;
     uint32_t q20q[Q2R], q20d[Q2R];
+    [[maybe_unused]] float q20m1 = -1.0f;   // opaque, so (0 - 1) * d stays a multiply (an fneg would flip the sign of a NaN d)
+    if constexpr (Q20T) asm("" : "+v"(q20m1));
     // Q5_1 at BM=128 (routed down): two threads per row, one 24-byte block (32 weights) each. One thread per row left
     // half the CTA idle while the other half decoded 64 weights (~600 VALU per stage against 16 WMMA per wave).
     constexpr bool Q51S = false && WTYPE == 32 + GGML_TYPE_Q5_1 && BM * 2 == MMB_NT && MMB_BK == 64;   // off: measured neutral-to-negative (1678 -> 1668 t/s pp2048)
@@ -198,7 +204,13 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                 a0[0] = make_uint4(w0.x, w0.y, w1.x, w1.y); a1[0] = make_uint4(w2.x, w2.y, 0u, 0u);
             } else { a0[0] = a1[0] = make_uint4(0,0,0,0); }   // d = m = 0: zero rows (never stored)
         }
-        if constexpr (Q20) {
+        if constexpr (Q20T) {
+            const int row = tid >> 1;
+            const block_q2_0 * x = (const block_q2_0 *)(Wbase + (size_t)row * wrow_bytes) + ks;
+#pragma unroll
+            for (int r = 0; r < Q2R; ++r) q20q[r] = row < a_rows ? *(const uint16_t *)(x->qs + 8 * (tid & 1) + 2 * r) : 0u;
+            q20d[0] = row < a_rows ? *(const uint16_t *)&x->d : 0u;
+        } else if constexpr (Q20) {
 #pragma unroll
             for (int r = 0; r < Q2R; ++r) {
                 const int row = (tid >> 3) + r * (MMB_NT / 8);
@@ -245,7 +257,21 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
         }
     };
     auto store_lds = [&]() {
-        if constexpr (Q20) {
+        if constexpr (Q20T) {
+            const float d = mmb_h2f((uint16_t) q20d[0]);
+            // value of code q at bytes 2q, 2q + 1 of {hi, lo}
+            const uint32_t lo = mmb_pack2(q20m1 * d, (float) (1 - 1) * d), hi = mmb_pack2((float) (2 - 1) * d, (float) (3 - 1) * d);
+            uint4 * dst = (uint4 *)(As + (tid >> 1) * MMB_LDS_STRIDE + 32 * (tid & 1));
+#pragma unroll
+            for (int r = 0; r < Q2R; ++r) {
+                // codes of weights 2w, 2w + 1 at bits 4w and 16 + 4w; selector bytes {2a, 2a + 1, 2b, 2b + 1}
+                const uint32_t q = q20q[r], p = (q & 0x3333u) | ((q & 0xccccu) << 14);
+                uint32_t o[4];
+#pragma unroll
+                for (int w = 0; w < 4; ++w) o[w] = __builtin_amdgcn_perm(hi, lo, ((p >> (4 * w)) & 0x30003u) * 0x202u + 0x01000100u);
+                dst[r] = make_uint4(o[0], o[1], o[2], o[3]);
+            }
+        } else if constexpr (Q20) {
 #pragma unroll
             for (int r = 0; r < Q2R; ++r) {
                 const int row = (tid >> 3) + r * (MMB_NT / 8);
