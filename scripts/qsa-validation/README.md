@@ -49,6 +49,16 @@ above. Without their environment variables the patches do not change the graph.
   NMSE of CPU FA + src[5]; `w1_ocon overflow` the V overflow rule. `vhash.cpp` the V-cache hash of a fixture.
   `campaign_w1.sh` the runs; `analyze_w1.py RESDIR` the verdicts -> `summaries/w1_ocon.md`.
 
+## `harness/w2/`: the W2 done-when (HIP SPARSE_ATTN_PLAN, §13 W2)
+
+- `cap.sh` recaptures C3s rows at d32k and d131k with C3s `c3_capture` and its pos0 list (PR219 build, read-only)
+  into `~/dev/wt_lab/w2/cap` (deleted after the run, 2.4 GB). `rowstat.cpp` counts the rows the rows kernel can
+  read in place.
+- `w2_plan.cpp` the C3 plan-stage harness on the op: R plan nodes per graph on ROCm0, wall time per op, whole-dst
+  memcmp against the CPU backend and the C3 oracle (`tests/sparse-attn-ref.h`). `campaign_w2.sh` the runs;
+  `analyze_w2.py RESDIR` the table and the gate -> `summaries/w2_plan_c3.md`. `mutants_w2.sh` the mutation check of
+  the op tests on ROCm0.
+
 ## Other tools
 
 | path | what | origin |
@@ -61,4 +71,4 @@ above. Without their environment variables the patches do not change the graph.
 | `harness/bands` | R1-A numeric-band harnesses (O_CON reference `bands_ref.h`, `bands_attn.cu`, `bands_dec.cu`, CPU) | `EV/bands/src` |
 | `harness/bandsop` | R2-BOP harnesses with the UNI / TBO fixtures (`UNI:` generator = init_tensor_uniform's distribution, `TBO:` dumps written by `tree_bandsop.diff` from test-backend-ops) | `EV/bandsop/src`, `EV/bandsop/remote/tree_bandsop.diff` |
 | `campaigns/` | `r1/text_campaign.sh`, `r1/img_campaign.sh` (+ `run.sh`), `r1c/runB3.sh` (+ `srv3.sh`), `r1s/r1s.sh`, `r2res/srv.sh`, `r2res/parse.py`, the r1ub / r1e / r1q8 runners and analyzers | `EV/r1`, `EV/r1c`, `EV/r1s`, `EV/r2res`, `EV/r1ub`, `EV/r1e`, `EV/r1q8` |
-| `summaries/` | `kdecide.md`, `compact*.md`, `analysis_op.md`, `res2_summary.md`, `probe_gap.txt`, the R1 analysis outputs; W12: `w12_bands.md` (analyzer output), `w12_chunks.tsv` (every arm's per-chunk KLD, logits hashes and agreement), `w12_campaign*.out` (run lines), `w12_hookobs_campaign.out` (the aborted first pass with the round-1 r1q8 hook); W1: `w1_ocon.md`, `w1_plan_c3.md` | as named; W12 logs in `strix-002:~/dev/wt_lab/w12/logs`, W1 results in `strix-002:~/dev/wt_lab/w1/res` |
+| `summaries/` | `kdecide.md`, `compact*.md`, `analysis_op.md`, `res2_summary.md`, `probe_gap.txt`, the R1 analysis outputs; W12: `w12_bands.md` (analyzer output), `w12_chunks.tsv` (every arm's per-chunk KLD, logits hashes and agreement), `w12_campaign*.out` (run lines), `w12_hookobs_campaign.out` (the aborted first pass with the round-1 r1q8 hook); W1: `w1_ocon.md`, `w1_plan_c3.md`; W2: `w2_plan_c3.md` | as named; W12 logs in `strix-002:~/dev/wt_lab/w12/logs`, W1 results in `strix-002:~/dev/wt_lab/w1/res`, W2 results in `strix-002:~/dev/wt_lab/w2/res` |
