@@ -7,13 +7,14 @@ backend dispatch census to equal the sum, key by key.
 
 Log contract (the lines the branch prints; W7 adds the llama side, W2-W6 the backend side):
   llama side, LLAMA_QSA_TRACE=1, printed at exit, one line per distinct (layer, shape), counted per executed ubatch:
-    LLAMA_QSA_TRACE il=<layer> producer=<av|cb|te|dense> n_q=<queries per stream> n_kv=<cells> n_stream=<s>
-                    k=<type> v=<type> count=<executed ubatches>
+    LLAMA_QSA_TRACE il=<layer> producer=<av|cb|te|dense|masked> n_q=<queries per stream> n_kv=<cells> n_stream=<s>
+                    k=<type> v=<type> count=<executed ubatches> route=<sparse|dense|masked|host-kv-copy> ctx=<main|mtp>
+                    backend=<name> G=<g> [n_sel=<n> gqa=<g>]
   backend side, read at exit through ggml_backend_debug_dispatch_census_count (§6.2 key strings):
     QSA_CENSUS <key> <count>
   selection dump (test-only proc ggml_backend_sparse_attn_select_dump, or any tool that implements it): it reads
-  shape lines `<n_q> <n_kv> <n_stream> <k> <v> <shortcut 0|1>` on stdin and prints, per shape, one line
-    SA_SELECT <n_q> <n_kv> <n_stream> <k> <v> <shortcut> -> <key>[*<launches>] [<key>[*<launches>] ...]
+  shape lines `<n_q> <n_kv> <n_stream> <k> <v> <shortcut 0|1> [<n_sel> <gqa>]` on stdin and prints, per shape, one line
+    SA_SELECT <the shape line> -> <key>[*<launches>] [<key>[*<launches>] ...]
   (launches default to 1 per executed op; a dense shortcut shape prints no key).
 
 Modes:
@@ -26,9 +27,11 @@ Exit status 0 = every check passed, 1 = a mismatch, 2 = bad input.
 import argparse, re, subprocess, sys
 from collections import Counter, defaultdict
 
-TRACE_RE = re.compile(r'LLAMA_QSA_TRACE il=(-?\d+) producer=(\w+) n_q=(\d+) n_kv=(\d+) n_stream=(\d+) k=(\w+) v=(\w+) count=(\d+)')
+TRACE_RE = re.compile(r'LLAMA_QSA_TRACE il=(-?\d+) producer=(\w+) n_q=(\d+) n_kv=(\d+) n_stream=(\d+) k=(\w+) v=(\w+) count=(\d+)(.*)$')
 CENSUS_RE = re.compile(r'^QSA_CENSUS (\S+) (\d+)\s*$')
-SELECT_RE = re.compile(r'^SA_SELECT (\d+) (\d+) (\d+) (\w+) (\w+) ([01]) ->(.*)$')
+SELECT_RE = re.compile(r'^SA_SELECT (\d+) (\d+) (\d+) (\w+) (\w+) ([01])((?: \d+)*) ->(.*)$')
+# keys the shape cannot predict: the fused selection counts strips and layers, the cpu: rows are llama's own
+EXPECT_SKIP = re.compile(r'^(qsa_expand$|cpu:)')
 
 # §14.3 table, default policy. Each recipe: regexes over census keys / trace producers that must be nonzero (any
 # match with count > 0) and regexes that must be zero (every match has count 0). 'producer:' rows test the trace.
@@ -51,33 +54,40 @@ def parse_log(path):
     for line in open(path, errors='replace'):
         m = TRACE_RE.search(line)
         if m:
-            il, prod, nq, nkv, ns, k, v, cnt = m.groups()
-            trace.append(dict(il=int(il), producer=prod, n_q=int(nq), n_kv=int(nkv), n_stream=int(ns), k=k, v=v, count=int(cnt)))
+            il, prod, nq, nkv, ns, k, v, cnt, rest = m.groups()
+            extra = dict(re.findall(r'(\w+)=(\S+)', rest))
+            trace.append(dict(il=int(il), producer=prod, n_q=int(nq), n_kv=int(nkv), n_stream=int(ns), k=k, v=v, count=int(cnt), **extra))
             continue
         m = CENSUS_RE.match(line.strip())
         if m: census[m.group(1)] += int(m.group(2))
     return trace, census
 
 def shape_key(t):
-    return (t['n_q'], t['n_kv'], t['n_stream'], t['k'], t['v'], 1 if t['producer'] == 'av' else 0)
+    key = (t['n_q'], t['n_kv'], t['n_stream'], t['k'], t['v'], 1 if t['producer'] == 'av' else 0)
+    if 'n_sel' in t: key += (int(t['n_sel']), int(t['gqa']))
+    return key
+
+# a shape reaches the backend census only when it runs a sparse op on the backend the census counts
+def on_census(t):
+    return t['producer'] not in ('dense', 'masked', 'cache') and t.get('backend', 'gpu') not in ('CPU',)
 
 def parse_select(text):
     sel = {}
     for line in text.splitlines():
         m = SELECT_RE.match(line.strip())
         if not m: continue
-        nq, nkv, ns, k, v, sc, rest = m.groups()
+        nq, nkv, ns, k, v, sc, more, rest = m.groups()
         keys = Counter()
         for tok in rest.split():
             key, _, mult = tok.partition('*')
             keys[key] += int(mult) if mult else 1
-        sel[(int(nq), int(nkv), int(ns), k, v, int(sc))] = keys
+        sel[(int(nq), int(nkv), int(ns), k, v, int(sc)) + tuple(int(x) for x in more.split())] = keys
     return sel
 
 def expected_census(trace, sel):
     exp, missing = Counter(), []
     for t in trace:
-        if t['producer'] == 'dense': continue   # dense shortcut: FLASH_ATTN_EXT, no sparse key
+        if not on_census(t): continue   # dense shortcut, masked route, host-KV CPU route: no sparse key on the backend
         s = shape_key(t)
         if s not in sel: missing.append(s); continue
         for key, mult in sel[s].items(): exp[key] += mult * t['count']
@@ -92,6 +102,7 @@ def cmd_expect(log, select_text):
     for s in sorted(set(missing)):
         print(f'MISSING_SELECT {s}'); rc = 1
     for key in sorted(set(exp) | set(census)):
+        if EXPECT_SKIP.search(key): continue
         e, c = exp.get(key, 0), census.get(key, 0)
         ok = e == c
         print(f"{'OK  ' if ok else 'DIFF'} {key} expected={e} census={c}")
@@ -168,7 +179,7 @@ def main():
         if a.select_file: text = open(a.select_file).read()
         else:
             trace, _ = parse_log(a.log[0])
-            shapes = sorted({shape_key(t) for t in trace if t['producer'] != 'dense'})
+            shapes = sorted({shape_key(t) for t in trace if on_census(t)})
             inp = ''.join(' '.join(map(str, s)) + '\n' for s in shapes)
             text = subprocess.run(a.select_cmd, shell=True, input=inp, capture_output=True, text=True, check=True).stdout
         return cmd_expect(a.log[0], text)
