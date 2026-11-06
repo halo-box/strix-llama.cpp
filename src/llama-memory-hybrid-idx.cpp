@@ -850,7 +850,13 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
                 if ((cells.seq_get_all((uint32_t) j) & tail_seqs).none()) { continue; }
                 const int64_t idx=ranked ? rank[j] : cells.pos_get(j);
                 const int64_t slot=g*r+idx%r;
-                GGML_ASSERT(group_members[slot]<0 || group_members[slot]==j);
+                // Unranked (several sequences in the stream), an image's cells repeat one position, so two cells of
+                // this ubatch's sequence can land in one slot. Only the query's tail block is read below: mark the
+                // slot ambiguous (-2) instead of aborting here.
+                if (group_members[slot]==-2 || (group_members[slot]>=0 && group_members[slot]!=j)) {
+                    group_members[slot]=-2;
+                    continue;
+                }
                 group_members[slot]=(int32_t)j;
             }
         }
@@ -928,6 +934,16 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
                         if (!cells.seq_has((uint32_t)grp_first[g],seq_id)) { continue; }
                         for (int64_t slot=0;slot<q+1-tail_start;++slot) {
                             const int32_t cell=group_members[g*r+slot];
+                            if (cell==-2) {
+                                // an image ends inside the query's tail block, unranked: its cells cannot be told
+                                // apart by slot, so this one is left out of the tail (rare; never seen in tests)
+                                static bool warned = false;
+                                if (!warned) {
+                                    warned = true;
+                                    LLAMA_LOG_WARN("%s: QSA tail slot shared by image cells of one sequence; one cell left out\n", __func__);
+                                }
+                                continue;
+                            }
                             if (cell<0 || !cells.seq_has((uint32_t)cell,seq_id)) { continue; }
                             GGML_ASSERT(tail[slot]<0 || tail[slot]==cell);
                             tail[slot]=cell;
