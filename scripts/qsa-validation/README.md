@@ -119,6 +119,16 @@ above. Without their environment variables the patches do not change the graph.
   each of the 4 targets), and the attribution of the build's warnings.
 - Results: `summaries/w5_tests.md` (bands, GQA replication, tiers, resources, compile gate).
 
+## `harness/w6/`: the W6 done-when (Vulkan plan and attend, portability, §13 W6, AT-B2, AT-B3, AT-B7)
+
+- `all_final.sh` the whole W6 final on the tree at HEAD, every step under flock: the timing campaign, `final_w6.sh`, the mutants. `final_w6.sh`: `runs1.sh` (the two ops on RADV default, forced scalar, portable_sg32, portable, vdirect, vstaged, vpack, and on lavapipe), `runs2.sh` (vulkaninfo, the system lavapipe's crash, validation layer runs, `test-sparse-attn-vk` on both devices, `GGML_VK_SA_MAX_Q`, `GGML_VK_SA_CAP_MASK`), the HIP, CPU and CPU-only regressions.
+- `w6_attn_report.py LOG...` passes, "not supported" by reason, max band ratio per tier and V variant, K/V pairs and rot cases seen. `summ.py` writes the summaries.
+- `w6_time.cpp`, `time_campaign.sh`, `w6_time_an.py`: AT-B2 and AT-B3 at op level -> `summaries/w6_time.md`.
+- `mutants_w6.py`, `mutants_val.py`: planted defects and the positive controls of the validation-layer runs.
+- `lvp_try.c`, `lvp_bisect.py`: one SPIR-V on one ICD (compile + dispatch): how the system lavapipe's crash was isolated.
+- Tools outside the tree, user directories, nothing installed in the system: `~/dev/wt_lab/w6/tools` (vulkan-validation-layers 1.4.341, vulkaninfo: `dnf download`, `rpm2cpio`), `~/dev/wt_lab/w6/lvp43` (lavapipe from Fedora 43: mesa-vulkan-drivers 25.3.6, llvm-libs 21.1.8, libdisplay-info), `lvpenv.sh` its environment.
+- Results: `summaries/w6_tests.md`, `summaries/w6_time.md`.
+
 ## Other tools
 
 | path | what | origin |
