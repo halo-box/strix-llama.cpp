@@ -13604,6 +13604,15 @@ static double sa_band_row(int G, int splits, int64_t n_sel) {
 // the class of the attend dispatches the census counted since the reset: keys "sa_attend/G4/..." and
 // "sa_attend/G1/.../splits<n>" (PLAN-v3 §6.2), listed by the census proc ggml_backend_debug_dispatch_census_list
 // (a NULL-terminated array of every compiled key). Returns a negative band when the class cannot be determined.
+// The generic and portable tiers (W5) have no PR counterpart; their band follows the §14.2 (c) transfer rule "anchored on
+// O_CON vs f64 plus the nearest PR-verbatim class row x the type spread", never a row measured on the tier itself:
+//   sa_generic/G4/...              the G4 row (the same WMMA body and loader shapes as the PR's qsa3_attn_kernel; only the
+//                                  element conversion is a runtime switch)
+//   sa_generic/G1/.../splits<n>    the G1 row of that split class (the PR's qsa_decode_wmma_partial body)
+//   sa_portable/G<g>               the row of the PR kernel that computes the same plan G in one pass per query: G4 for a
+//                                  G = 4 plan, "G1, 1 split" for a G = 1 plan (the portable tier never splits)
+// The O_CON anchor: the CPU op is the reference of every case (bitwise equal to bands_ref.h O_CON, W1) and its contract
+// error against f64 is the W1 bound; the GPU-vs-f64 errors are reported (GGML_SA_TEST_REPORT), not gated.
 // §14.2 (c) type spread: a K/V pair without its own row takes the row of its class times the measured spread (R1-A (1):
 // x1.12 at prefill (G4) and at decode n_q 512, x1.9 at decode n_q 1; the rows were measured on f16 and q8_0 pairs, which
 // differ by <= x1.06, R2-BOP)
@@ -13627,16 +13636,19 @@ static double sa_band_for_backend(ggml_backend_t backend, int64_t n_sel, std::st
     int n_classes = 0;
     for (const char * const * k = list(); k && *k; ++k) {
         const std::string key = *k;
-        if (key.rfind("sa_attend/", 0) != 0 || dispatch_census_count(backend, key.c_str()) <= 0) {
+        const bool attend = key.rfind("sa_attend/", 0) == 0 || key.rfind("sa_generic/G", 0) == 0 || key.rfind("sa_portable/", 0) == 0;
+        if (!attend || dispatch_census_count(backend, key.c_str()) <= 0) {
             continue;
         }
         int G = 0, splits = 1;
-        if (key.rfind("sa_attend/G4/", 0) == 0) {
+        if (key.rfind("sa_attend/G4/", 0) == 0 || key.rfind("sa_generic/G4/", 0) == 0 || key == "sa_portable/G4") {
             G = 4;
-        } else if (key.rfind("sa_attend/G1/", 0) == 0) {
+        } else if (key.rfind("sa_attend/G1/", 0) == 0 || key.rfind("sa_generic/G1/", 0) == 0) {
             G = 1;
             const size_t p = key.find("/splits");
             if (p != std::string::npos) splits = atoi(key.c_str() + p + 7);
+        } else if (key == "sa_portable/G1") {
+            G = 1;   // one pass per query: the "G1, 1 split" row
         } else {
             cls = "census key without a band class: " + key;
             return -1.0;
@@ -13702,7 +13714,9 @@ struct test_sparse_attn : public test_case {
                                        (size_t) (D / ggml_blck_size(type_v)) * ggml_type_size(type_v) * kv_rows * n_head_kv * n_stream);
     }
 
-    std::vector<std::string> census_families() override { return { "sa_attend/", "sa_fixup/", "sa_pack/", "sa_merge" }; }
+    std::vector<std::string> census_families() override {
+        return { "sa_attend/", "sa_fixup/", "sa_pack/", "sa_merge", "sa_generic/", "sa_portable/" };
+    }
 
     // GGML_SA_TEST_REPORT=1: one SA_REPORT line per compared output (backend, case, census class, band, NMSE, and the f64
     // errors of PLAN-v3 §3: max|out - ref| / max|ref| against O_C18 and O_PLAN on up to 16 queries per stream, reported only)
@@ -13784,7 +13798,8 @@ struct test_sparse_attn : public test_case {
         } else {
             band = sa_band_for_backend(backend, n_sel, band_class);
             if (band > 0) {
-                const int G = band_class.find("sa_attend/G4/") != std::string::npos ? 4 : 1;
+                const int G = band_class.find("sa_attend/G4/") != std::string::npos || band_class.find("sa_generic/G4/") != std::string::npos ||
+                              band_class.find("sa_portable/G4") != std::string::npos ? 4 : 1;
                 band *= sa_type_spread(type_k, type_v, G, n_q);
             }
         }
@@ -14022,7 +14037,7 @@ struct test_sparse_attn : public test_case {
     }
 
     // V rows of the selected cells with values past the f16 range: bf16 V (> 65504), q8_0 V (d * q > 65504),
-    // f16 V (stored +-inf); rot 0 and one selected cell per row
+    // f16 V (stored +-inf), f32 V (> 65504; the generic tier); rot 0 and one selected cell per row
     void init_overflow(const std::vector<int32_t> & rows) {
         GGML_ASSERT(pattern == SA_ROWS_SINGLE && rot_o == 0);
         const size_t rb = ggml_row_size(type_v, D);
@@ -14042,6 +14057,9 @@ struct test_sparse_attn : public test_case {
                         } else if (type_v == GGML_TYPE_F16) {
                             const uint16_t h = big > 0 ? 0x7C00 : 0xFC00;
                             memcpy(row.data() + 2 * d, &h, 2);
+                        } else if (type_v == GGML_TYPE_F32) {
+                            // f32 V past the f16 range: to_float is exact, the f16 rounding overflows to +-inf
+                            memcpy(row.data() + 4 * d, &big, 4);
                         } else if (type_v == GGML_TYPE_Q8_0) {
                             // block of d: scale 1000, element q = +-127 -> +-127000
                             const size_t bs = ggml_type_size(GGML_TYPE_Q8_0);
@@ -14252,10 +14270,138 @@ struct test_sparse_attn_gated : public test_sparse_attn {
             return true;
         }
         const int64_t gated = sa_census_epi(backend, "gated"), plain = sa_census_epi(backend, "plain");
+        // a process whose tier has no gated instance (GGML_CUDA_SA_FORCE=generic / portable, or a HIP arch that runs the
+        // portable tier: the census skip proc excludes the fast G4 keys) computes the MUL unfused: one generic / portable
+        // attend, no fast one
+        auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
+        if (skip != nullptr && skip(backend, "sa_attend/G4") != nullptr) {
+            const int64_t other = dispatch_census_count(backend, "sa_generic/G4") + dispatch_census_count(backend, "sa_generic/G1") +
+                                  dispatch_census_count(backend, "sa_portable");
+            if (gated != 0 || plain != 0 || other != 1) {
+                msg = "unfused tier census gated=" + std::to_string(gated) + " plain=" + std::to_string(plain) +
+                      " generic+portable attends=" + std::to_string(other) + " (want 0, 0 and 1)";
+                return false;
+            }
+            return true;
+        }
         const int64_t want_gated = variant == SA_GATE_REJECT ? 0 : 1;
         if (gated != want_gated || plain != 1 - want_gated) {
             msg = "gate fusion census gated=" + std::to_string(gated) + " plain=" + std::to_string(plain) +
                   " (want " + std::to_string(want_gated) + " and " + std::to_string(1 - want_gated) + ")";
+            return false;
+        }
+        return true;
+    }
+};
+
+// test_sparse_attn_gqa_rep (PLAN-v3 §13 W5, §14.2 (c) "GQA 4/8"): the GQA 4 / 8 instance against the GQA 12 instance on
+// the same per-head data. Two attends share K, V and the plan: one with GQA r (4 or 8; the case's own heads) and one with
+// GQA 12 whose query heads replicate them (head j of kv head g of the GQA 12 query = head j % r of kv head g of the
+// GQA r query). Both outputs are compared with the CPU op (the band of the census class, as test_sparse_attn); then, on
+// the backend under test, every replicated head of the GQA 12 output must agree with its GQA r head to the GQA 12 row of
+// the class (the PLAN-v3 §14.2 row, without the type spread), and on the CPU bitwise (the per-head arithmetic of the CPU
+// op does not depend on GQA). SA_GQAREP lines report the NMSE and whether the two are bitwise equal.
+struct test_sparse_attn_gqa_rep : public test_sparse_attn {
+    ggml_tensor * q12 = nullptr, * q12_st = nullptr, * qr_st = nullptr, * out12 = nullptr;
+
+    test_sparse_attn_gqa_rep(ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv, int64_t n_sel, int group, int gqa, int n_stream = 1)
+        : test_sparse_attn(type_k, type_v, n_q, n_kv, n_sel, group, SA_ROWS_MIX, gqa, n_stream) {}
+
+    std::string vars() override { return test_sparse_attn::vars() + ",rep12"; }
+    const char * report_tag() override { return "SPARSE_ATTN_GQAREP"; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out, out12 }; }
+    int n_determinism_runs() override { return 2; }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_UNUSED(ctx_weights);
+        kv_rows = 4 * ((n_kv + 3) / 4);
+        qr_st = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_head_kv * gqa, n_q, n_stream);
+        ggml_set_name(qr_st, "q_storage");
+        q = ggml_permute(ctx, qr_st, 0, 2, 1, 3);
+        q12_st = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_head_kv * 12, n_q, n_stream);
+        ggml_set_name(q12_st, "q12_storage");
+        q12 = ggml_permute(ctx, q12_st, 0, 2, 1, 3);
+        k = new_kv(ctx, type_k, &k_st);
+        v = new_kv(ctx, type_v, &v_st);
+        ggml_set_name(k_st, "k_storage");
+        ggml_set_name(v_st, "v_storage");
+        sel  = sa_new_sel(this, ctx, n_sel, n_q, n_stream, 0);
+        plan = ggml_sparse_attn_plan(ctx, sel, n_kv, group);
+        ggml_set_name(plan, "plan");
+        out = ggml_sparse_attn(ctx, q, k, v, plan, scale, 0, 0);
+        ggml_set_name(out, "out");
+        out12 = ggml_sparse_attn(ctx, q12, k, v, plan, scale, 0, 0);
+        ggml_set_name(out12, "out12");
+        if (gf) {
+            ggml_build_forward_expand(gf, out);
+        }
+        return out12;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const std::vector<int32_t> rows = sa_make_rows(pattern, n_sel, n_q, n_stream, n_kv, prblk, 1);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t == sel || t == q12_st) continue;
+            init_tensor_uniform(t);   // the GQA r query, K, V and the sentinels
+        }
+        sa_init_sel(sel, rows);
+        // the GQA 12 query: head g * 12 + j = head g * gqa + j % gqa of the GQA r query, for every (query, stream)
+        std::vector<float> qr(ggml_nelements(qr_st)), q12v(ggml_nelements(q12_st));
+        ggml_backend_tensor_get(qr_st, qr.data(), 0, ggml_nbytes(qr_st));
+        for (int64_t t = 0; t < n_q * n_stream; ++t) {
+            for (int64_t g = 0; g < n_head_kv; ++g) {
+                for (int64_t j = 0; j < 12; ++j) {
+                    const float * src = qr.data() + ((size_t) t * n_head_kv * gqa + (size_t) (g * gqa + j % gqa)) * D;
+                    float * dst = q12v.data() + ((size_t) t * n_head_kv * 12 + (size_t) (g * 12 + j)) * D;
+                    std::copy(src, src + D, dst);
+                }
+            }
+        }
+        ggml_backend_tensor_set(q12_st, q12v.data(), 0, ggml_nbytes(q12_st));
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double e = nmse(a, b, n);
+        if (std::isnan(e)) {
+            e = memcmp(a, b, n * sizeof(float)) == 0 ? 0.0 : 1.0;
+        }
+        last_nmse = e;
+        last_f64_c18 = last_f64_plan = -1.0;
+        return e;
+    }
+
+    bool verify_reference(ggml_backend_t backend, std::string & msg) override {
+        std::vector<float> o(ggml_nelements(out)), o12(ggml_nelements(out12));
+        ggml_backend_tensor_get(out, o.data(), 0, ggml_nbytes(out));
+        ggml_backend_tensor_get(out12, o12.data(), 0, ggml_nbytes(out12));
+        // dst [D, n_head, n_q, n_stream]: row (t, head) at (t * n_head + head) * D
+        double sab = 0.0, saa = 0.0;
+        size_t n_diff = 0;
+        for (int64_t t = 0; t < n_q * n_stream; ++t) {
+            for (int64_t g = 0; g < n_head_kv; ++g) {
+                for (int64_t j = 0; j < 12; ++j) {
+                    const float * x = o12.data() + ((size_t) t * n_head_kv * 12 + (size_t) (g * 12 + j)) * D;
+                    const float * y = o.data() + ((size_t) t * n_head_kv * gqa + (size_t) (g * gqa + j % gqa)) * D;
+                    for (int64_t d = 0; d < D; ++d) {
+                        n_diff += memcmp(&x[d], &y[d], sizeof(float)) != 0;
+                        sab += (double) (x[d] - y[d]) * (x[d] - y[d]);
+                        saa += (double) x[d] * x[d];
+                    }
+                }
+            }
+        }
+        const double e = saa > 0 ? sab / saa : sab;
+        std::string cls;
+        const double row = sa_is_cpu(backend) ? 0.0 : sa_band_for_backend(backend, n_sel, cls);
+        printf("SA_GQAREP backend=%s case=%s class=%s row=%.3e nmse=%.3e bitwise=%s (%zu of %zu values differ) ",
+               ggml_backend_name(backend), vars().c_str(), cls.c_str(), row, e, n_diff == 0 ? "yes" : "no", n_diff, o12.size());
+        if (sa_is_cpu(backend) ? n_diff != 0 : !(row > 0 && e <= row)) {
+            char b[256];
+            snprintf(b, sizeof(b), "GQA %d vs replicated GQA 12: nmse %.3e, %zu values differ (row %.3e)", gqa, e, n_diff, row);
+            msg = b;
             return false;
         }
         return true;
@@ -14481,6 +14627,71 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
         test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 4096, 2051, 12, 2, SA_GATE_F32));
     }
     for (ggml_type t : {F16, Q4}) test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 4096, 257, 12, 1, SA_GATE_REJECT));
+
+    // ---- the generic tier (PLAN-v3 §13 W5): every pair of S with a member outside S_fast. The S x S list above runs them
+    //      on G1 (n_q 9, n_sel 257); here: G4 in both V regimes, every generic census key, the n_q set, poison, overflow ----
+    const ggml_type S_gen[] = { GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
+    auto is_gen = [&](ggml_type t) { return std::find(std::begin(S_gen), std::end(S_gen), t) != std::end(S_gen); };
+    // G4, n_q 129: n_kv 4096 < 64 * 129 (packed V, the generic pack), n_kv 16384 >= 64 * 129 (direct V); layouts alternating
+    {
+        int alt = 0;
+        for (ggml_type tk : S_all) {
+            for (ggml_type tv : S_all) {
+                if (!is_gen(tk) && !is_gen(tv)) continue;
+                for (int64_t nk : {4096, 16384}) {
+                    test_cases.emplace_back(new test_sparse_attn(tk, tv, 129, nk, 257, 4, SA_ROWS_MIX, 12, 1, 0, 0, alt++ % 2));
+                }
+            }
+        }
+    }
+    // every generic G4 key (V regime x GQA {4, 8, 12}) with 1 / 2 streams, and every generic G1 key (GQA x the 5 split
+    // classes: n_q 1, n_kv 16384, n_sel 17 / 257 / 513 / 2051 / 4096), on mixed generic / fast pairs
+    for (auto pr : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL}, {GGML_TYPE_F32, GGML_TYPE_Q5_0}, {GGML_TYPE_Q5_1, F16}}) {
+        for (int gqa : {4, 8, 12}) {
+            for (int ns : {1, 2}) {
+                for (int64_t nk : {4096, 16384}) {
+                    test_cases.emplace_back(new test_sparse_attn(pr.first, pr.second, 129, nk, 257, 4, SA_ROWS_MIX, gqa, ns));
+                }
+            }
+        }
+    }
+    for (auto pr : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q5_0, GGML_TYPE_Q4_1}, {Q8, GGML_TYPE_F32}}) {
+        for (int gqa : {4, 8, 12}) {
+            for (int64_t ns : {17, 257, 513, 2051, 4096}) {
+                test_cases.emplace_back(new test_sparse_attn(pr.first, pr.second, 1, 16384, ns, 1, SA_ROWS_MIX, gqa));
+            }
+        }
+    }
+    // the n_q set on G1 / G4 at n_sel 2051 for every generic type (K = V), 2 streams on two of them, complete quads
+    for (ggml_type t : S_gen) {
+        for (int64_t nq : {1, 9, 66, 263}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, 1, SA_ROWS_MIX));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 513, 8192, 2051, 4, SA_ROWS_MIX));
+        test_cases.emplace_back(new test_sparse_attn(t, t, 513, 65536, 2051, 4, SA_ROWS_BLOCKS));
+    }
+    for (ggml_type t : {GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL}) {
+        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 65, 4096, 2051, G, SA_ROWS_MIX, 12, 2, 0, 0, 0));
+    }
+    // poison (every generic type: NaN / inf values and scales in unselected cells and padding quads); f32 V overflow
+    for (ggml_type t : S_gen) {
+        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, G, SA_ROWS_POISON, 12, 1, 0, 0, 1, 0, SA_POISON));
+    }
+    for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(GGML_TYPE_Q5_1, GGML_TYPE_F32, 9, 4096, 257, G, SA_ROWS_SINGLE, 12, 1, 0, 0, 1, 0, SA_OVERFLOW));
+
+    // ---- GQA 4 / 8 against GQA 12 on replicated heads (PLAN-v3 §13 W5, §14.2 (c)): the fast G4 and G1 instances of every
+    //      S_fast type, one mixed pair, and the generic tier (q4_1, q5_0 / f16) ----
+    for (ggml_type t : S_fast) {
+        for (int G : {1, 4}) {
+            for (int gqa : {4, 8}) test_cases.emplace_back(new test_sparse_attn_gqa_rep(t, t, 66, 4096, 2051, G, gqa));
+        }
+    }
+    for (int gqa : {4, 8}) {
+        test_cases.emplace_back(new test_sparse_attn_gqa_rep(Q8, F16, 129, 16384, 257, 4, gqa, 2));    // direct V, 2 streams
+        test_cases.emplace_back(new test_sparse_attn_gqa_rep(Q4, BF16, 1, 16384, 2051, 1, gqa));        // G1 split-K
+        for (int G : {1, 4}) {
+            test_cases.emplace_back(new test_sparse_attn_gqa_rep(GGML_TYPE_Q4_1, GGML_TYPE_Q4_1, 66, 4096, 2051, G, gqa));
+            test_cases.emplace_back(new test_sparse_attn_gqa_rep(GGML_TYPE_Q5_0, F16, 129, 16384, 257, G, gqa));
+        }
+    }
 }
 
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
