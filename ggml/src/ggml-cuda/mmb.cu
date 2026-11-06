@@ -754,10 +754,15 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
     // grid-based types (mmb_lb): prefetch each lane's raw block fields into registers during the WMMA loop, grid in
     // LDS, pack + decode in store_lds. Same fp32 math as dequantize_* -> bit-identical.
-    using LBT = mmb_lb<WTYPE>;
+    // The 3-value IQ2 grid types take the mmb_ms3 decoder instead: 4 lanes per row, a lane's 16 weights (groups 2 il,
+    // 2 il + 1 of 32-block sub) share one scale and one 3-value table. Same bf16 weights in the same LDS slots.
+    constexpr bool M3 = mmb_ms3<WTYPE>::ok;
+    using LBT = std::conditional_t<M3, mmb_ms3<WTYPE>, mmb_lb<WTYPE>>;
     constexpr bool LB = LBT::ok;
     static_assert(WTYPE != 32 + GGML_TYPE_IQ1_M || F16, "the IQ1_M grid decoder returns F16 weights");
-    constexpr int LBR = LB ? (BM * 8) / MMB_NT : 1;
+    constexpr int LSH = M3 ? 2 : 3;   // log2 of the lanes per weight row
+    static_assert(!LB || (BM << LSH) % MMB_NT == 0, "the grid decode covers whole rows");
+    constexpr int LBR = LB ? (BM << LSH) / MMB_NT : 1;
     uint32_t lbg[LBR][LBT::NR], lbu[LBR][LBT::NR];
     __shared__ typename LBT::grid_t lbgrid[LBT::N];
     if constexpr (LB) { for (int i = tid; i < LBT::N; i += MMB_NT) lbgrid[i] = LBT::entry(i); }
@@ -772,10 +777,10 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
     auto load_regs = [&](const int ks) {
         weight_ks = ks;
         if constexpr (LB) {
-            const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1;
+            const int lr = tid & ((1 << LSH) - 1), sub = M3 ? lr >> 1 : lr & 1, il = M3 ? lr & 1 : lr >> 1;
 #pragma unroll
             for (int r = 0; r < LBR; ++r) {
-                const int row = (tid >> 3) + r * (MMB_NT / 8);
+                const int row = (tid >> LSH) + r * (MMB_NT >> LSH);
                 if (row < a_rows) {
                     LBT::fetch(Wg + (size_t)row * wrow_bytes, ks, sub, il, lbg[r]);
                     LBT::fetch(Wu + (size_t)row * wrow_bytes, ks, sub, il, lbu[r]);
@@ -820,12 +825,19 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
         if constexpr (LB) {
             // branchless (padding rows decode to zero); same fp32 arithmetic and the same RNE + sign-XOR packing
             // as dequantize_*, so the BF16 weights are bit-identical to the generic decoder path
-            const int l8 = tid & 7, sub = l8 & 1, il = l8 >> 1;
+            const int lr = tid & ((1 << LSH) - 1), sub = M3 ? lr >> 1 : lr & 1, il = M3 ? lr & 1 : lr >> 1;
 #pragma unroll
             for (int r = 0; r < LBR; ++r) {
-                const int row = (tid >> 3) + r * (MMB_NT / 8);
-                *(uint4 *)(Ag + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = mmb_lb_decode<WTYPE>(lbgrid, lbg[r], sub, il, weight_ks);
-                *(uint4 *)(Au + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = mmb_lb_decode<WTYPE>(lbgrid, lbu[r], sub, il, weight_ks);
+                const int row = (tid >> LSH) + r * (MMB_NT >> LSH);
+                if constexpr (M3) {
+                    uint16_t * pg = Ag + row * MMB_LDS_STRIDE + 32 * sub + 16 * il, * pu = Au + row * MMB_LDS_STRIDE + 32 * sub + 16 * il;
+                    uint4 w0, w1;
+                    LBT::decode(lbgrid, lbg[r], il, w0, w1); *(uint4 *) pg = w0; *(uint4 *) (pg + 8) = w1;
+                    LBT::decode(lbgrid, lbu[r], il, w0, w1); *(uint4 *) pu = w0; *(uint4 *) (pu + 8) = w1;
+                } else {
+                    *(uint4 *)(Ag + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = mmb_lb_decode<WTYPE>(lbgrid, lbg[r], sub, il, weight_ks);
+                    *(uint4 *)(Au + row * MMB_LDS_STRIDE + 32 * sub + 8 * il) = mmb_lb_decode<WTYPE>(lbgrid, lbu[r], sub, il, weight_ks);
+                }
             }
         } else if constexpr (WTYPE != 0 && WTYPE != 32 + GGML_TYPE_Q4_K) {
             constexpr int LOAD_TYPE = WTYPE == 1 ? 32 + GGML_TYPE_Q8_0 : WTYPE;
