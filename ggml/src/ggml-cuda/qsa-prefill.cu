@@ -8,6 +8,7 @@
 #include <algorithm>
 
 typedef short v16s __attribute__((ext_vector_type(16)));
+typedef _Float16 v16h __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 
 #define QSA3_L2E 1.4426950408889634f
@@ -375,7 +376,7 @@ void qsa3_attn_kernel(
 #pragma unroll
             for (int e = 0; e < 8; ++e) { sc[i][e] = 0.f; }
 #pragma unroll
-            for (int t = 0; t < 2; ++t) { sc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf[t], qf[i][t], sc[i]); }
+            for (int t = 0; t < 2; ++t) { sc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, kf[t]), __builtin_bit_cast(v16h, qf[i][t]), sc[i]); }
         }
         v16s vf[2];
         {
@@ -491,7 +492,7 @@ void qsa3_attn_kernel(
         for (int i = 0; i < 3; ++i) {
             const v16s pf = __builtin_bit_cast(v16s, (uint4[2]){ptile[i][r*2+0], ptile[i][r*2+1]});
 #pragma unroll
-            for (int t = 0; t < 2; ++t) { O[i][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf[t], pf, O[i][t]); }
+            for (int t = 0; t < 2; ++t) { O[i][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, vf[t]), __builtin_bit_cast(v16h, pf), O[i][t]); }
         }
         kf[0] = kfn[0]; kf[1] = kfn[1];
         b[0] = nb[0]; b[1] = nb[1]; b[2] = nb[2]; b[3] = nb[3]; m01 = nm01; m23 = nm23;

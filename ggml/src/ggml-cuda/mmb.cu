@@ -16,6 +16,7 @@
 namespace {
 
 typedef short v16s __attribute__((ext_vector_type(16)));
+typedef _Float16 v16h __attribute__((ext_vector_type(16)));
 typedef float v8f  __attribute__((ext_vector_type(8)));
 constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 
@@ -297,7 +298,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                     const v16s b = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)});
 #pragma unroll
                     for (int i = 0; i < TM; ++i) {
-                        if constexpr (F16) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b, a[i], acc[i][j]);
+                        if constexpr (F16) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, b), __builtin_bit_cast(v16h, a[i]), acc[i][j]);
                         else               acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b, a[i], acc[i][j]);
                         // gfx1151/ROCm 10.1 clang 24: S119 needs seven saves/32 bytes at loop head (2026-10-24); remove these bounds when full prefetch is spill-free.
 #if defined(__gfx1151__)
@@ -323,7 +324,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
                 for (int i = 0; i < TM; ++i)
 #pragma unroll
                     for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; }
-                        if constexpr (F16) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(b[j], a[i], acc[i][j]);
+                        if constexpr (F16) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, b[j]), __builtin_bit_cast(v16h, a[i]), acc[i][j]);
                         else               acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
             }
         }
@@ -1013,9 +1014,9 @@ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, 
             for (int i = 0; i < TM; ++i)
 #pragma unroll
                 for (int j = 0; j < TN; ++j) {
-                    acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], ah[i], acc[i][j]);
-                    if constexpr (XSPLIT) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], ah[i], acc[i][j]);
-                    if constexpr (!TWO) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], al[i], acc[i][j]);
+                    acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, bh[j]), __builtin_bit_cast(v16h, ah[i]), acc[i][j]);
+                    if constexpr (XSPLIT) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, bl[j]), __builtin_bit_cast(v16h, ah[i]), acc[i][j]);
+                    if constexpr (!TWO) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, bh[j]), __builtin_bit_cast(v16h, al[i]), acc[i][j]);
                 }
         }
         __syncthreads();
@@ -1155,7 +1156,7 @@ mmb_idx_score_kernel(const float * __restrict__ W, const uint16_t * __restrict__
 #pragma unroll
             for (int i = 0; i < TM; ++i)
 #pragma unroll
-                for (int j = 0; j < TN; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], ah[i], acc[i][j]);
+                for (int j = 0; j < TN; ++j) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, bh[j]), __builtin_bit_cast(v16h, ah[i]), acc[i][j]);
         }
         // epilogue of mmb_f32split_kernel<..., EPI=1>
 #pragma unroll
@@ -2325,7 +2326,7 @@ __device__ __forceinline__ void mmb_gluk_c2h(uint32_t codes, __half2 idx_lo, __h
 }
 __device__ __forceinline__ v8f mmb_gluk_wmma(v16s a, v16s b, v8f c) {
 #if defined(RDNA3)
-    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(v16h, a), __builtin_bit_cast(v16h, b), c);
 #else
     GGML_UNUSED_VARS(a, b);
     NO_DEVICE_CODE;

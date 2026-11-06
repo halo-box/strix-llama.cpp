@@ -1409,18 +1409,18 @@ namespace ggml_cuda_mma {
             tile<16, 16, float, dl_d> & D, const tile<16, 8, nv_bfloat162, dl_ab> & A, const tile<16, 8, nv_bfloat162, dl_ab> & B) {
 #if defined(AMD_WMMA_AVAILABLE)
 #if defined(RDNA4)
-        using bf16x8_t = __attribute__((ext_vector_type(8))) __bf16;
+        using ushortx8_a = short __attribute__((ext_vector_type(8)));
         using floatx8_t = __attribute__((ext_vector_type(8))) float;
         floatx8_t& acc_frag = reinterpret_cast<floatx8_t&>(D.x[0]);
-        const bf16x8_t& a_frag = reinterpret_cast<const bf16x8_t&>(A.x[0]);
-        const bf16x8_t& b_frag = reinterpret_cast<const bf16x8_t&>(B.x[0]);
+        const ushortx8_a& a_frag = reinterpret_cast<const ushortx8_a&>(A.x[0]);
+        const ushortx8_a& b_frag = reinterpret_cast<const ushortx8_a&>(B.x[0]);
         acc_frag = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a_frag, b_frag, acc_frag);
 #elif defined(RDNA3)
-        using bf16x16_t = __attribute__((ext_vector_type(16))) __bf16;
+        using ushortx16_a = short __attribute__((ext_vector_type(16)));
         using floatx8_t = __attribute__((ext_vector_type(8))) float;
         floatx8_t& acc_frag = reinterpret_cast<floatx8_t&>(D.x[0]);
-        const bf16x16_t& a_frag = reinterpret_cast<const bf16x16_t&>(A.x[0]);
-        const bf16x16_t& b_frag = reinterpret_cast<const bf16x16_t&>(B.x[0]);
+        const ushortx16_a& a_frag = reinterpret_cast<const ushortx16_a&>(A.x[0]);
+        const ushortx16_a& b_frag = reinterpret_cast<const ushortx16_a&>(B.x[0]);
         acc_frag = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a_frag, b_frag, acc_frag);
 #else
         GGML_UNUSED_VARS(D, A, B);
