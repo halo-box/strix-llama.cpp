@@ -225,7 +225,8 @@ int main(int argc, char ** argv) {
             rc = fail("context creation");
         } else {
             setenv("GGML_CUDA_SA_REJECT", "1", 1);
-            std::vector<llama_token> tok(64, 1);
+            // 256 queries: the sparse op's n_q band under the shipped prefer_dense policy of q8_0 (AT-W7PERF)
+            std::vector<llama_token> tok(256, 1);
             llama_batch b = llama_batch_get_one(tok.data(), (int32_t) tok.size());
             const int ret = llama_decode(ctx, b);
             printf("llama_decode returned %d\n", ret);
