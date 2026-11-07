@@ -1,0 +1,13 @@
+Generating test split:   0%|          | 0/1536 [00:00<?, ? examples/s]Generating test split: 100%|██████████| 1536/1536 [00:00<00:00, 59034.65 examples/s]
+speed_bench: loaded 6 samples from bench=throughput_1k category=all
+speed_bench:   0%|          | 0/6 [00:00<?, ?sample/s]speed_bench:  17%|█▋        | 1/6 [01:34<07:54, 94.93s/sample]speed_bench:  33%|███▎      | 2/6 [03:14<06:30, 97.53s/sample]speed_bench:  50%|█████     | 3/6 [03:24<02:53, 57.84s/sample]speed_bench:  67%|██████▋   | 4/6 [03:35<01:18, 39.05s/sample]speed_bench:  83%|████████▎ | 5/6 [05:06<00:57, 57.78s/sample]speed_bench: 100%|██████████| 6/6 [05:16<00:00, 41.62s/sample]speed_bench: 100%|██████████| 6/6 [05:16<00:00, 52.73s/sample]
+
+Summary (elapsed=316.38s)
+category      samples  avg_prompt_t/s  avg_pred_t/s  avg_latency  accept_rate
+------------  -------  --------------  ------------  -----------  -----------
+high_entropy  2        739.69          42.87         97.144s      0.6077     
+mixed         2        58.98           41.76         10.428s      0.5591     
+low_entropy   2        444.95          44.40         50.616s      0.6635     
+overall       6        414.54          43.01         52.729s      0.6223     
+
+speed_bench: wrote /mnt/scratch/actions-runner-01/_work/_temp/logs/speed-bench-flash-next-iq2xs-throughput_1k.json

@@ -1,0 +1,19 @@
+0.00.830.276 W model has unused tensor per_layer_token_embd.weight (size = 28800138240 bytes) -- ignoring
+0.13.389.055 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but fused DeepSeek V4 HC pre is assigned to device CPU (usually due to missing support)
+0.13.389.058 W resolve_fused_ops: fused DeepSeek V4 HC pre not supported, set to disabled
+0.13.396.002 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but fused DeepSeek V4 HC post is assigned to device CPU (usually due to missing support)
+0.13.396.004 W resolve_fused_ops: fused DeepSeek V4 HC post not supported, set to disabled
+0.13.399.601 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but f16 MoE activations is assigned to device CPU (usually due to missing support)
+0.13.399.603 W resolve_fused_ops: f16 MoE activations not supported, set to disabled
+0.13.403.364 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but f16 GDN output norm is assigned to device CPU (usually due to missing support)
+0.13.403.366 W resolve_fused_ops: f16 GDN output norm not supported, set to disabled
+0.13.629.110 I cmn          init: llama threadpool init, n_threads = 16
+0.13.758.144 I 
+0.13.758.265 I system_info: n_threads = 16 (n_threads_batch = 16) / 32 | ROCm : NO_VMM = 1 | FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.13.758.281 I perplexity: tokenizing the input ..
+0.14.057.513 I perplexity: tokenization took 299.222 ms
+0.14.057.850 I perplexity: calculating perplexity over 32 chunks, n_ctx=4096, batch_size=4096, n_seq=1
+0.17.774.923 I perplexity: 3.72 seconds per pass - ETA 1.97 minutes
+[1]1.5347,[2]2.4276,[3]2.2811,[4]2.4553,[5]2.8516,[6]3.1857,[7]3.4257,[8]3.6554,[9]3.7691,[10]3.6538,[11]3.4998,[12]3.3504,[13]3.2669,[14]3.5143,[15]3.5543,[16]3.5494,[17]3.6209,[18]3.6731,[19]3.6414,[20]3.6149,[21]3.6817,[22]3.8687,[23]3.8094,[24]3.9043,[25]3.9306,[26]3.9378,[27]3.9510,[28]3.9598,[29]3.9441,[30]3.9578,[31]4.0246,[32]4.1070,
+2.13.688.920 I Final estimate: PPL = 4.1070 +/- 0.03469
+
