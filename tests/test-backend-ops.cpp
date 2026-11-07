@@ -4437,31 +4437,96 @@ struct test_hc_f32_consumer : public test_case {
 // combine (BF16-only residual stream), the second is dead after its norm, so without the out_res -> out_xn allocation
 // dependency the allocator hands its buffer to the normalized output, the alias check refuses the fused kernel, and the
 // fallback would read the BF16-only stream as F32 (the last-layer perplexity failure).
+// mix: each layer runs the full qwen4exp HC mix on its norm (inject and down GEMMs, scale + silu, up GEMM, stream mix) and
+// the next combine takes that inject and mix, as build_hc_mix / build_hc_combine emit them. F16 weights (Flash-Next stores
+// the HC weights BF16, the loader makes them F16) take the F16 cuBLAS GEMMs: xn gets the F16 staging copy, the mix reads
+// the F16 gate.
 struct test_hc_chain : public test_case {
     const int tokens;
     const ggml_type type_w;
+    const bool mix;
 
-    test_hc_chain(int tokens, ggml_type type_w) : tokens(tokens), type_w(type_w) {}
+    test_hc_chain(int tokens, ggml_type type_w, bool mix = false) : tokens(tokens), type_w(type_w), mix(mix) {}
     std::string op_desc(ggml_tensor *) override { return "HC_CHAIN"; }
-    std::string vars() override { return VARS_TO_STR2(tokens, type_w); }
+    std::string vars() override { return mix ? VARS_TO_STR3(tokens, type_w, mix) : VARS_TO_STR2(tokens, type_w); }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     double max_nmse_err() override { return 5e-4; }
 
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int embd = 2560, hc = 4;
-        auto * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
+    // inputs only: the scheduler reuses a leaf's memory once its last reader ran, so writing a later node would clobber it
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            // mix weights in [-1/sqrt(K), 1/sqrt(K)]: the gates stay out of sigmoid saturation
+            const float s = mix && strncmp(ggml_get_name(t), "hc_w_", 5) == 0 ? 1.0f / sqrtf((float) t->ne[0]) : 1.0f;
+            init_tensor_uniform(t, -s, s);
+        }
+    }
+
+    // every leaf is flagged as an input so the allocator places all of them before it frees anything
+    static ggml_tensor * input(ggml_tensor * t) {
+        ggml_set_input(t);
+        return t;
+    }
+
+    ggml_tensor * build_mix_graph(ggml_context * ctx) {
+        const int embd = 2560, hc = 4, lr = 320;
+        auto * residual = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens));
+        auto * block    = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens));
+        auto * inject   = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens));
         ggml_tensor * out = nullptr;
         for (int layer = 0; layer < 2; ++layer) {
-            auto * block  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
-            auto * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
-            auto * gamma  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc);   // RMS_NORM and MUL adjacent
+            auto * gamma  = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc));
+            auto * w_inj  = input(ggml_new_tensor_2d(ctx, type_w, embd * hc, hc));
+            auto * w_down = input(ggml_new_tensor_2d(ctx, type_w, embd * hc, lr));
+            auto * w_up   = input(ggml_new_tensor_2d(ctx, type_w, lr, embd * hc));
+            ggml_set_name(w_inj, "hc_w_inject");
+            ggml_set_name(w_down, "hc_w_down");
+            ggml_set_name(w_up, "hc_w_up");
+            auto * weight = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / hc)), 2.0f);
+            weight = ggml_reshape_3d(ctx, weight, 1, hc, tokens);
+            if (gf) { ggml_build_forward_expand(gf, residual); ggml_build_forward_expand(gf, block); ggml_build_forward_expand(gf, weight); }
+            auto * combined = ggml_add(ctx, residual, ggml_mul(ctx, ggml_repeat(ctx, block, residual), weight));
+            auto * xn = ggml_reshape_2d(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, combined, 1e-6f), gamma), embd * hc, tokens);
+            inject = ggml_mul_mat(ctx, w_inj, xn);
+            if (gf) ggml_build_forward_expand(gf, inject);
+            auto * lo = ggml_mul_mat(ctx, w_down, xn);
+            if (gf) ggml_build_forward_expand(gf, lo);
+            lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / hc));
+            auto * gated = ggml_mul(ctx, xn, ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo)));
+            gated = ggml_reshape_3d(ctx, gated, embd, hc, tokens);
+            auto * mixed = ggml_cont(ctx, ggml_view_2d(ctx, gated, embd, tokens, gated->nb[2], 0));
+            for (int c = 1; c < hc; ++c) {
+                mixed = ggml_add(ctx, mixed, ggml_view_2d(ctx, gated, embd, tokens, gated->nb[2], c * gated->nb[1]));
+            }
+            mixed = ggml_scale(ctx, mixed, 1.0f / hc);
+            if (gf) ggml_build_forward_expand(gf, mixed);
+            out = out ? ggml_add(ctx, out, mixed) : mixed;
+            residual = combined;
+            block = ggml_reshape_3d(ctx, mixed, embd, 1, tokens);
+        }
+        return out;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (mix) {
+            return build_mix_graph(ctx);
+        }
+        const int embd = 2560, hc = 4;
+        auto * residual = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens));
+        ggml_tensor * out = nullptr;
+        for (int layer = 0; layer < 2; ++layer) {
+            auto * block  = input(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens));
+            auto * inject = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens));
+            auto * gamma  = input(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc));   // RMS_NORM and MUL adjacent
             auto * weight = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 0.25f)), 2.0f);
             weight = ggml_reshape_3d(ctx, weight, 1, hc, tokens);
             if (gf) { ggml_build_forward_expand(gf, residual); ggml_build_forward_expand(gf, block); ggml_build_forward_expand(gf, weight); }
             auto * combined = ggml_add(ctx, residual, ggml_mul(ctx, ggml_repeat(ctx, block, residual), weight));
             auto * norm = ggml_reshape_2d(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, combined, 1e-6f), gamma), embd * hc, tokens);
-            auto * projection = ggml_new_tensor_2d(ctx, type_w, embd * hc, 4);
+            auto * projection = input(ggml_new_tensor_2d(ctx, type_w, embd * hc, 4));
             auto * proj = ggml_mul_mat(ctx, projection, norm);
             if (gf) ggml_build_forward_expand(gf, proj);
             out = out ? ggml_add(ctx, out, proj) : proj;
@@ -13160,6 +13225,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_hc_chain(tokens, type));
         }
     }
+    // full HC mix chains: F16 at the 512-token threshold and the Flash-Next prefill ubatch, 511 below it, BF16 (MMB readers)
+    for (int tokens : {511, 512, 4096}) {
+        test_cases.emplace_back(new test_hc_chain(tokens, GGML_TYPE_F16, true));
+    }
+    test_cases.emplace_back(new test_hc_chain(512, GGML_TYPE_BF16, true));
 
     for (int mode : {0, 1, 2, 3}) {
         for (int tokens : {1, 7, 64, 513}) {
@@ -14616,6 +14686,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 256, 1000, 3, 1));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 512, 640, 4, 1));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_F32,  320, 2560, 4, 1));
+    // F16 up GEMM at prefill: the mix reads its F16 output; with an external reader of a mix node the route declines
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_F16,  320, 2560, 4, 512));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_F16,  320, 2560, 4, 4096));
+    test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_F16,  320, 2560, 4, 512, true));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 14, 3));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 16, 3));
     test_cases.emplace_back(new test_hc_up_mix(GGML_TYPE_Q8_0, 64, 64, 16, 3, true));
