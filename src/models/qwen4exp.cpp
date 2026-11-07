@@ -21,9 +21,12 @@
 #include <unistd.h>
 #endif
 
-// AT-W7PERF (PLAN-v3 §10, §16.5): the pre-registered decisions of the -nkvo gate
+// AT-W7PERF (PLAN-v3 §10, §16.5): the pre-registered decisions of the -nkvo gate. Fallback (a), plan and attend on the CPU,
+// missed the gate for f16, q8_0, q4_0 and bf16 (54 of 56 cells FAIL, 0.48-0.95 of W0-lab, phase ND). Fallback (b), this host-KV copy route,
+// is the next route of the pre-registered order for those four types: it met the gate for f16, q8_0 and q4_0 (phase NDB,
+// every cell PASS or a d0 cell whose CI contains 0.98); bf16 under (b) was not measured (UNPROVEN). The other types keep
+// fallback (a): no -nkvo cell was measured for them. The shortcut pin applies to the CPU route only; AT-W7PERF (d) did not run.
 static constexpr bool QWEN4EXP_SHORTCUT_PIN_DEFAULT = true;
-static constexpr bool QWEN4EXP_HOST_KV_COPY_DEFAULT = false;
 
 // defined below, used by the graph constructor
 static bool    qwen4exp_last_attn_trim();
@@ -1133,9 +1136,10 @@ static bool qwen4exp_host_kv_copy(ggml_type type_k, ggml_type type_v) {
     if (force >= 0) {
         return force != 0;
     }
-    GGML_UNUSED(type_k);
-    GGML_UNUSED(type_v);
-    return QWEN4EXP_HOST_KV_COPY_DEFAULT;
+    auto on_grid = [](ggml_type t) {
+        return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_BF16;
+    };
+    return on_grid(type_k) && on_grid(type_v);
 }
 
 // Visible-prefix scoring bound. For one sequence with unique non-negative positions the indexer enumerates
