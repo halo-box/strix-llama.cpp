@@ -22,7 +22,10 @@ phase_A() {
   for p in $ALL; do k=${p%:*}; v=${p#*:}; both a_$(tagof $p)_u4096 $R/ref8t0 replay $k $v 4096 8192 8; done     # Q1-A
   $RUN w0_a_f16_f16_u2048 $R/ref8t0 replay w0 f16 f16 2048 8192 8                                               # Q2 floor
   for p in $THREE; do k=${p%:*}; v=${p#*:}; both a_$(tagof $p)_u512 $R/ref8t0 replay $k $v 512 8192 8; done     # Q1-B
-  for p in $THREE; do k=${p%:*}; v=${p#*:}; both a_$(tagof $p)_u64 $R/ref8t0 replay $k $v 64 8192 8; done       # Q1-C
+  for p in $THREE; do k=${p%:*}; v=${p#*:}; both a_$(tagof $p)_u64 $R/ref8t0 replay $k $v 64 8192 8               # Q1-C
+    # AT-A routes n_q 64 at n_kv <= 8192 to G4: the forced arm keeps G1 gated e2e (PLAN-v3 §14.3 "Forced arms after AT-A")
+    $RUN new_a_$(tagof $p)_u64g1 $R/ref8t0 replay new $k $v 64 8192 8 GGML_CUDA_SA_FORCE=g1
+  done
   for t in f16 q8_0; do                                                                                         # Q8: on - off, same type
     for d in d1 d2 d3; do both a8_${t}_$d $R/ref8t0 replay $t $t 4096 8192 8 LAB_DEF=$d; done
     both a8_${t}_off $R/ref8t0 replay $t $t 4096 8192 8 LAB_DEF=d3 LAB_D3_EPS=0

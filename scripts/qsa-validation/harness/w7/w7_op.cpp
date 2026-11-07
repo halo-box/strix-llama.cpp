@@ -1,7 +1,9 @@
 // AT-W7PERF op level (PLAN-v3 §16.5): SPARSE_ATTN over all-visible rows (plan + attend) with forced G1 and forced G4, against
 // the causal FLASH_ATTN_EXT of the same K / V pair, on n_q x n_kv, GQA 12, D 256, one stream, SYN data. The op is timed by the
-// wall time of ggml_backend_graph_compute (it synchronizes) with HIP graphs off, after 3 warm-ups: per (arm, shape, type pair)
-// the median of REPS computes on each of 12 data seeds ("layers"), and the mean of those medians.
+// wall time of ggml_backend_graph_compute (it synchronizes) with HIP graphs off, after 3 warm-ups, on a graph of R independent ops over
+// the same inputs (R grows as n_q falls, so a compute is well above the launch and wake-up noise of one call; a qwen4exp graph runs
+// 12 such ops per ubatch too): wall / R is the cost of one op with its launches and the gaps between them. Per (arm, shape, type
+// pair) the median of REPS computes on each of 12 data seeds ("layers"), and the mean of those medians.
 // usage: w7_op <proc tag> <backend> <reps> <pairs: k:v,k:v> <n_q list> <n_kv list>   (GGML_CUDA_SA_FORCE is set by this process per arm)
 // CPU arm: backend CPU with arms G1 only (reports the CPU attend per layer).
 #include "ggml.h"
@@ -51,26 +53,33 @@ static void fill_tensor(ggml_tensor * t, int64_t n_kv, int64_t n_head_kv, std::m
 
 static double run_arm(ggml_backend_t be, const std::string & arm, ggml_type tk, ggml_type tv, int64_t n_q, int64_t n_kv, int reps, unsigned seed) {
     const int64_t D = 256, n_head_kv = 2, n_head = 24;
-    ggml_init_params ip = { 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    const int R = n_q <= 8 ? 96 : n_q <= 32 ? 48 : n_q <= 127 ? 24 : 8;
+    ggml_init_params ip = { (64 + 4 * R) * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_q, n_head);
     ggml_tensor * k = ggml_new_tensor_3d(ctx, tk, D, n_kv, n_head_kv);
     ggml_tensor * v = ggml_new_tensor_3d(ctx, tv, D, n_kv, n_head_kv);
-    ggml_tensor * rows = nullptr, * mask = nullptr, * out = nullptr;
+    ggml_tensor * rows = nullptr, * mask = nullptr;
     ggml_cgraph * gf = ggml_new_graph(ctx);
     const float scale = 1.0f / 16.0f;
     if (arm == "dense") {
         mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_q);
-        out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
-        ggml_prec_set_acc(out, GGML_PREC_F32);
     } else {
         rows = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_kv, n_q, 1, 1);
-        ggml_tensor * plan = ggml_sparse_attn_plan(ctx, rows, n_kv, arm == "G4" ? 4 : 1);
-        ggml_build_forward_expand(gf, plan);
-        out = ggml_sparse_attn(ctx, q, k, v, plan, scale, 0, 0);
     }
-    ggml_set_output(out);
-    ggml_build_forward_expand(gf, out);
+    for (int r = 0; r < R; ++r) {
+        ggml_tensor * out = nullptr;
+        if (arm == "dense") {
+            out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+            ggml_prec_set_acc(out, GGML_PREC_F32);
+        } else {
+            ggml_tensor * plan = ggml_sparse_attn_plan(ctx, rows, n_kv, arm == "G4" ? 4 : 1);
+            ggml_build_forward_expand(gf, plan);
+            out = ggml_sparse_attn(ctx, q, k, v, plan, scale, 0, 0);
+        }
+        ggml_set_output(out);
+        ggml_build_forward_expand(gf, out);
+    }
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         if (!ggml_backend_supports_op(be, ggml_graph_node(gf, i))) {
             ggml_free(ctx);
@@ -111,7 +120,7 @@ static double run_arm(ggml_backend_t be, const std::string & arm, ggml_type tk, 
     for (int i = 0; i < reps; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
         if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) { fprintf(stderr, "compute failed\n"); exit(1); }
-        ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / R);
     }
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);

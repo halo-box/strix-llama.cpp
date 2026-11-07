@@ -11,6 +11,6 @@ for p in 1 2 3; do
   echo "AT_OP p$p rc=$? lines=$(wc -l < $OUT/p$p.out)"
 done
 # CPU SPARSE_ATTN per layer, f16 vs q8_0 (report)
-flock ~/gpu.lock env GGML_CUDA_DISABLE_GRAPHS=1 $OUT/w7_op cpu CPU 3 f16:f16,q8_0:q8_0 2,16,64,127,512 512,2048 > $OUT/cpu.out 2> $OUT/cpu.err
+flock ~/gpu.lock env GGML_CUDA_DISABLE_GRAPHS=1 $OUT/w7_op cpu CPU 1 f16:f16,q8_0:q8_0 2,64,127 512,2048 > $OUT/cpu.out 2> $OUT/cpu.err
 echo "AT_OP cpu rc=$? lines=$(wc -l < $OUT/cpu.out)"
 echo AT_OP_DONE

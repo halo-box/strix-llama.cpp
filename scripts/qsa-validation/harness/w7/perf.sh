@@ -4,7 +4,7 @@
 #   perf.sh PHASE...: P1 P23 P4 P5 P6N ND (nkvo gate) QUICKNK
 . "$(dirname "$0")/env.sh"
 OUT=$W7/perf; mkdir -p $OUT
-TXT=$WIKI,~/dev/wt_lab/c10/corp/code.txt
+TXT=$WIKI,$HOME/dev/wt_lab/c10/corp/code.txt
 bin_of() { case $1 in new) echo $W7/bench/bin_w7/llama-bench;; w0) echo $W7/bench/bin_w0/llama-bench;; base) echo ~/dev/wt_lab/c10/bin_base/llama-bench;; esac; }
 SAMP=$T/scripts/qsa-validation/kfd/c7samp.py
 one() { # tag arm k v "bench args" [env...]
@@ -73,13 +73,23 @@ phase_P6N() { # eviction-sample rate new vs base, >= 30 reps (reported): ub512 p
     R=30 one p6_q8_0_d32k_$a $a q8_0 q8_0 "-b 4096 -ub 4096 -p 2048 -n 0 -d 32768"
   done
 }
-phase_ND() { # AT-W7PERF (c): -nkvo, W7 vs W0-lab, interleaved
+phase_ND() { # AT-W7PERF (c): -nkvo, W7 (CPU route, fallback (a)) vs W0-lab, interleaved
+  for t in ${NKTYPES:-f16 q8_0 q4_0 bf16}; do
+    warm w0 $t $t
+    for i in ${PROCS:-0 1 2}; do
+      if [ $((i % 2)) = 0 ]; then a=w0; else a=new; fi
+      one nk_${t}_pp_${i}_$a $a $t $t "-nkvo 1 -b 4096 -ub 512,4096 -p 512,2048 -n 0 -d 0,4096,32768" LLAMA_QSA_HOST_KV_COPY=0
+      one nk_${t}_tg_${i}_$a $a $t $t "-nkvo 1 -b 4096 -ub 512 -p 0 -n 32 -d 4096,32768" LLAMA_QSA_HOST_KV_COPY=0
+    done
+  done
+}
+phase_NDB() { # AT-W7PERF (e): fallback (b), the named host-KV copy route, on the same grid
   for t in ${NKTYPES:-f16 q8_0 q4_0 bf16}; do
     warm w0 $t $t
     for i in ${PROCS:-0 1 2 3 4 5 6}; do
       if [ $((i % 2)) = 0 ]; then a=w0; else a=new; fi
-      one nk_${t}_pp_${i}_$a $a $t $t "-nkvo 1 -b 4096 -ub 512,4096 -p 512,2048 -n 0 -d 0,4096,32768"
-      one nk_${t}_tg_${i}_$a $a $t $t "-nkvo 1 -b 4096 -ub 512 -p 0 -n 32 -d 4096,32768"
+      one nkb_${t}_pp_${i}_$a $a $t $t "-nkvo 1 -b 4096 -ub 512,4096 -p 512,2048 -n 0 -d 0,4096,32768" LLAMA_QSA_HOST_KV_COPY=1
+      one nkb_${t}_tg_${i}_$a $a $t $t "-nkvo 1 -b 4096 -ub 512 -p 0 -n 32 -d 4096,32768" LLAMA_QSA_HOST_KV_COPY=1
     done
   done
 }

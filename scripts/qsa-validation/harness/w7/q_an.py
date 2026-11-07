@@ -78,6 +78,7 @@ for p in ['f16_f16', 'q8_0_q8_0', 'q4_0_q4_0']:
     row(f'Q1-B {p} ub512', paired(kld(f'new_a_{p}_u512'), kld(f'w0_a_{p}_u512')), B_512)
 for p in ['f16_f16', 'q8_0_q8_0', 'q4_0_q4_0']:
     row(f'Q1-C {p} ub64', paired(kld(f'new_a_{p}_u64'), kld(f'w0_a_{p}_u64')), B_64)
+    row(f'Q1-C {p} ub64 forced G1', paired(kld(f'new_a_{p}_u64g1'), kld(f'w0_a_{p}_u64')), B_64)
 print('\n## Q1 direct form (KLD(new(T) || PR219(T) pinned), LAB_DEF=d3 eps 0 on both)\n')
 print('| type | mean KLD | SE | band | verdict |\n|---|---|---|---|---|')
 for p, b in DIRECT.items():

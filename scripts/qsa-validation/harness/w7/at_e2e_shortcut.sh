@@ -4,11 +4,10 @@
 . "$(dirname "$0")/env.sh"
 OUT=$W7/at_e2e; mkdir -p $OUT
 BB=$W7/bench/bin_w7/llama-bench
-TXT=$WIKI,~/dev/wt_lab/c10/corp/code.txt
+TXT=$WIKI,$HOME/dev/wt_lab/c10/corp/code.txt
 PROCS=${PROCS:-0 1 2 3 4 5 6}
 one() { # tag dense k v
-  local tag=$1 dense=$2 k=$3 v=$4 de=""
-  [ $dense = 1 ] && de="LLAMA_QSA_PREFER_DENSE=1"
+  local tag=$1 dense=$2 k=$3 v=$4 de="LLAMA_QSA_PREFER_DENSE=$2"
   flock ~/gpu.lock env C10_TEXT=$TXT $de $BB -m $M -ngl 99 -fa 1 -lzm on-direct -ctk $k -ctv $v -b 4096 -ub 64,512,1024,2048 -p 512,2048 -n 0 -d 0 -r 5 --progress -o json > $OUT/${tag}_pp.json 2> $OUT/${tag}_pp.err; local a=$?
   flock ~/gpu.lock env C10_TEXT=$TXT $de $BB -m $M -ngl 99 -fa 1 -lzm on-direct -ctk $k -ctv $v -b 4096 -ub 512 -p 0 -n 128 -d 0,1024,1900 -r 5 --progress -o json > $OUT/${tag}_tg.json 2> $OUT/${tag}_tg.err; local b=$?
   echo "$(date +%T) $tag pp_rc=$a tg_rc=$b"

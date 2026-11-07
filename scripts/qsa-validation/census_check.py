@@ -32,6 +32,7 @@ CENSUS_RE = re.compile(r'^QSA_CENSUS (\S+) (\d+)\s*$')
 SELECT_RE = re.compile(r'^SA_SELECT (\d+) (\d+) (\d+) (\w+) (\w+) ([01])((?: \d+)*) ->(.*)$')
 # keys the shape cannot predict: the fused selection counts strips and layers, the cpu: rows are llama's own
 EXPECT_SKIP = re.compile(r'^(qsa_expand$|cpu:)')
+GATED_FLOOR = 0.9
 
 # §14.3 table, default policy. Each recipe: regexes over census keys / trace producers that must be nonzero (any
 # match with count > 0) and regexes that must be zero (every match has count 0). 'producer:' rows test the trace.
@@ -101,11 +102,26 @@ def cmd_expect(log, select_text):
     rc = 0
     for s in sorted(set(missing)):
         print(f'MISSING_SELECT {s}'); rc = 1
-    for key in sorted(set(exp) | set(census)):
-        if EXPECT_SKIP.search(key): continue
-        e, c = exp.get(key, 0), census.get(key, 0)
+    # The EPI of a G4 attend is not a function of its shape: the gate fusion's overlap check depends on where gallocr puts the MUL
+    # output (ggml-cuda.cu, PLAN-v3 §2.2 item 4). So the attend and fixup keys are compared with gated and plain merged, and the gated
+    # share of the fusible attends has its own floor, printed per run.
+    def merged(c):
+        out = Counter()
+        for k, v in c.items():
+            if not EXPECT_SKIP.search(k): out[k.replace('/gated', '/plain')] += v
+        return out
+    em, cm = merged(exp), merged(census)
+    for key in sorted(set(em) | set(cm)):
+        e, c = em.get(key, 0), cm.get(key, 0)
         ok = e == c
         print(f"{'OK  ' if ok else 'DIFF'} {key} expected={e} census={c}")
+        rc |= 0 if ok else 1
+    eg = sum(v for k, v in exp.items() if '/gated' in k and k.startswith('sa_attend/'))
+    cg = sum(v for k, v in census.items() if '/gated' in k and k.startswith('sa_attend/'))
+    if eg:
+        share = cg / eg
+        ok = share >= GATED_FLOOR
+        print(f"{'OK  ' if ok else 'DIFF'} gated share of the fusible G4 attends: {cg}/{eg} = {share:.3f} (floor {GATED_FLOOR})")
         rc |= 0 if ok else 1
     print('EXPECT ' + ('PASS' if rc == 0 else 'FAIL'))
     return rc

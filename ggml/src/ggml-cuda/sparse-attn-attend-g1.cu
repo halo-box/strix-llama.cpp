@@ -80,22 +80,24 @@ bool ggml_cuda_sa_g1_beats_g4(int64_t n_q_per_stream, int64_t n_kv, ggml_type ty
 // is in the dense shortcut (all-visible rows, n_kv <= top_k + r - 1), which has its own decision (P2-9).
 //
 // Past the shortcut: the two-way rule fitted by AT-A (PLAN-v3 §16.5) on the W4 kernels (ggml_cuda_sa_g1_beats_g4).
-// In the shortcut: the default n_q < 128 ? 1 : 4 (C1 d3, C13) until AT-W7PERF (W7) measures the all-visible rows.
+// In the shortcut: AT-W7PERF (W7), per D4 n_q band on the all-visible rows (scripts/qsa-validation/summaries/w7_at_op.md): G1 up to n_q 32
+// (G1 / G4 time 0.13-0.72 at n_q <= 16; at n_q 32 they are within 1.0-1.12), G4 above it (G1 / G4 1.36-2.4 from n_q 64), with a noise
+// margin of 3 x p90 = 1 %. Every S_fast pair has the same crossover, so the rule does not depend on the types.
 int ggml_cuda_sparse_attn_group(int device, int64_t n_q_per_stream, int64_t n_kv, ggml_type type_k, ggml_type type_v, bool shortcut) {
     GGML_UNUSED(device);
     if (const int f = sa_force_group()) {
         return f;
     }
     if (shortcut) {
-        return n_q_per_stream < 128 ? 1 : 4;
+        return n_q_per_stream <= 32 ? 1 : 4;
     }
     return ggml_cuda_sa_g1_beats_g4(n_q_per_stream, n_kv, type_k, type_v) ? 1 : 4;
 }
 
-// Dense shortcut preference (D4): f16 / f16 keeps the dense causal FLASH_ATTN_EXT, every other pair runs the sparse op
-// with all-visible rows, until AT-W7PERF (W7) flips a (pair, n_q band) whose sparse cell is below 0.98 x dense. The n_q
-// bands of D4: {1, 2-8, 9-32, 33-127, 128-511, 512-1023, >= 1024}; the table has one entry per band so a flip is a
-// one-line change.
+// Dense shortcut preference (D4). f16 / f16 keeps the dense causal FLASH_ATTN_EXT; a (pair, n_q band) of another pair is dense where
+// the pre-registered AT-W7PERF rule flipped it: an op cell of the band with sparse (plan + attend, its own G) below 0.98 x dense, or an e2e
+// cell of the band whose CI upper bound is below 0.98 (scripts/qsa-validation/summaries/w7_at_op.md, w7_at_e2e.md; every e2e cell passed).
+// The n_q bands of D4: {1, 2-8, 9-32, 33-127, 128-511, 512-1023, >= 1024}.
 bool ggml_cuda_sparse_attn_prefer_dense(int device, ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv) {
     GGML_UNUSED(device);
     GGML_UNUSED(n_kv);
@@ -104,12 +106,12 @@ bool ggml_cuda_sparse_attn_prefer_dense(int device, ggml_type type_k, ggml_type 
     if (tk < 0 || tv < 0) {
         return false;   // S_generic pairs: sparse (no measured dense cell)
     }
-    // [K f16, bf16, q8_0, q4_0][V f16, bf16, q8_0, q4_0][band]: 1 = dense. Default (D4): f16 / f16 only.
+    // [K f16, bf16, q8_0, q4_0][V f16, bf16, q8_0, q4_0][band]: 1 = dense
     static const bool dense[4][4][7] = {
-        { { 1, 1, 1, 1, 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 } },
-        { { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 } },
-        { { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 } },
-        { { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 } },
+        { { 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 0, 0, 0 }, { 1, 1, 1, 1, 0, 0, 0 }, { 1, 1, 1, 1, 0, 0, 0 } },   // K f16
+        { { 1, 1, 1, 1, 0, 0, 0 }, { 1, 1, 1, 0, 0, 0, 0 }, { 0, 1, 1, 0, 0, 0, 0 }, { 0, 1, 1, 1, 0, 0, 0 } },   // K bf16
+        { { 1, 1, 1, 1, 0, 0, 0 }, { 0, 1, 1, 1, 0, 0, 0 }, { 1, 1, 1, 1, 0, 0, 0 }, { 1, 1, 1, 1, 0, 0, 0 } },   // K q8_0
+        { { 1, 1, 1, 1, 0, 0, 0 }, { 0, 1, 1, 1, 0, 0, 0 }, { 0, 1, 1, 1, 0, 0, 0 }, { 1, 1, 1, 1, 0, 0, 0 } },   // K q4_0
     };
     return dense[tk][tv][band];
 }
