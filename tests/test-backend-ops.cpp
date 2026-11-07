@@ -53,13 +53,35 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
+// large quantized tensors (e.g. 512-expert MoE weights) spend seconds in the CPU encoder, far more than the op itself.
+// They are filled from a pool of independently quantized random blocks instead: each block of the tensor takes a pool block
+// picked by a hash of a per-tensor random seed and the block index, so experts, rows and neighbouring blocks all differ.
+// Shapes are unchanged.
+static constexpr size_t QUANT_POOL_BLOCKS     = 16384;
+static constexpr size_t QUANT_POOL_MIN_BLOCKS = 8*QUANT_POOL_BLOCKS;
+
+static uint64_t quant_pool_hash(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     if (ggml_is_empty(tensor)) {
         return;
     }
 
     size_t nels = ggml_nelements(tensor);
-    std::vector<float> data(nels);
+
+    const bool   is_quant     = ggml_is_quantized(tensor->type);
+    const size_t n_blocks_all = is_quant ? nels / ggml_blck_size(tensor->type) : 0;
+    const bool   pool_init    = is_quant && n_blocks_all >= QUANT_POOL_MIN_BLOCKS &&
+                                ggml_row_size(tensor->type, nels) == n_blocks_all * ggml_type_size(tensor->type);
+    // with the pool only its blocks need random floats
+    const size_t n_gen = pool_init ? QUANT_POOL_BLOCKS * ggml_blck_size(tensor->type) : nels;
+
+    std::vector<float> data(n_gen);
     {
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
@@ -73,13 +95,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         };
 
         if (n_threads == 1) {
-            init_thread(0, nels);
+            init_thread(0, n_gen);
         } else {
             std::vector<std::future<void>> tasks;
             tasks.reserve(n_threads);
             for (size_t i = 0; i < n_threads; i++) {
-                size_t start =     i*nels/n_threads;
-                size_t end   = (i+1)*nels/n_threads;
+                size_t start =     i*n_gen/n_threads;
+                size_t end   = (i+1)*n_gen/n_threads;
                 tasks.push_back(std::async(std::launch::async, init_thread, start, end));
             }
             for (auto & t : tasks) {
@@ -109,6 +131,9 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             // parallel quantization by block
             size_t blck_size = ggml_blck_size(tensor->type);
             size_t n_blocks = nels / blck_size;
+            if (pool_init) {
+                n_blocks = QUANT_POOL_BLOCKS;   // the pool lands at the start of dataq
+            }
 
             auto quantize_thread = [&](size_t start, size_t end) {
                 ggml_quantize_chunk(tensor->type, data.data(), dataq.data(),
@@ -133,6 +158,14 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
                 for (auto & t : tasks) {
                     t.get();
                 }
+            }
+        }
+        if (pool_init) {
+            const size_t bs = ggml_type_size(tensor->type);
+            const std::vector<uint8_t> pool(dataq.begin(), dataq.begin() + QUANT_POOL_BLOCKS * bs);
+            const uint64_t seed = ((uint64_t) std::random_device{}() << 32) | std::random_device{}();
+            for (size_t b = 0; b < n_blocks_all; b++) {
+                memcpy(dataq.data() + b * bs, pool.data() + (quant_pool_hash(seed ^ b) % QUANT_POOL_BLOCKS) * bs, bs);
             }
         }
         ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
