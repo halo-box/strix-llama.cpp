@@ -95,7 +95,7 @@ static void usage(char ** argv) {
     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
-    LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on CPU and on the first ROCm device\n");
+    LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on CPU and on the first ROCm and Vulkan devices\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -597,13 +597,14 @@ static void test_mtp_cache_only_dev(ggml_backend_dev_t dev, const size_t seed, c
 }
 
 static int test_mtp_cache_only(const size_t seed, const float stdev) {
-    // CPU, then the first ROCm device: cache-only was validated on HIP
     test_mtp_cache_only_dev(nullptr, seed, stdev);
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "ROCm") == 0) {
-            test_mtp_cache_only_dev(dev, seed, stdev);
-            break;
+    for (const char * backend : { "ROCm", "Vulkan" }) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), backend) == 0) {
+                test_mtp_cache_only_dev(dev, seed, stdev);
+                break;
+            }
         }
     }
     return 0;

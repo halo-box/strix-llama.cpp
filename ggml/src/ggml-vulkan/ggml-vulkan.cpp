@@ -3047,6 +3047,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // elsewhere the coopMatLoad builds stay.
             const bool mmid_mf = device->coopmat_rdna3_layout;
             const std::string mmid_mf_sfx = mmid_mf ? "_mf" : "";
+            static const bool mf_skew = [] { const char * e = getenv("GGML_VK_TEST_MF_SKEW"); return e && atoi(e) != 0; }();
 #define MMID_MF_SPV(base, acc) (mmid_mf ? base##_mf##acc##_cm1_len : base##acc##_cm1_len), (mmid_mf ? base##_mf##acc##_cm1_data : base##acc##_cm1_data)
             // GGML_VK_MMID_B_FULL_LOG=1: per MUL_MAT_ID pf / REG_A tile, whether the shader's B_FULL condition (BN % loadstride_b == 0,
             // loadstride_b = BLOCK_SIZE * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK as in mul_mm.comp) holds, so it drops the guard, or keeps it
@@ -3063,7 +3064,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 std::vector<uint32_t> spec = ggml_vk_mul_mm_spec(wt, a);
                 if (spec.size() == 12) { spec.push_back(ggml_vk_coopmat_shmem_pad(device, wt[3])); spec.push_back(0); }   // 12, 13
                 while (spec.size() < 16) { spec.push_back(0); }                                                           // 14, 15 (REG_A off)
-                spec.push_back(0);                                                                                          // 16: MF_SKEW
+                spec.push_back(mf_skew ? 1u : 0u);                                                                          // 16: MF_SKEW
                 spec.push_back(1u);                                                                                         // 17: MMID_B_FULL
                 b_full_log(wt, a);
                 return spec;
@@ -3115,7 +3116,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     if (spec.size() == 12) { spec.push_back(ggml_vk_coopmat_shmem_pad(device, wt[3])); spec.push_back(0); }   // 12, 13
                     if (spec.size() == 14) { spec.push_back(0); }                                                              // 14
                     spec.push_back(3u);                                                                                        // 15: REG_A
-                    spec.push_back(0);                                                                                         // 16: MF_SKEW
+                    spec.push_back(mf_skew ? 1u : 0u);                                                                         // 16: MF_SKEW
                     spec.push_back(1u);                                                                                        // 17: MMID_B_FULL
                     b_full_log(wt, a);
                     return spec;
@@ -8037,11 +8038,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ggml_vk_matmul_hcmix(ctx, subctx, pipeline, { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range }, *hcmix,
                              ne01, ne11, ne10, ne10, stride_b, stride_batch_x, stride_batch_y, padded_n);
     } else {
+        // Negative control: drop the last K step only on the dense dq8 path.
+        static const bool dq8_break = [] { const char * e = getenv("GGML_VK_DENSE_DQ8_TEST_BREAK"); return e && atoi(e) != 0; }();
+        const bool is_dq8 = pipeline_pre_dq8 != nullptr && pipeline != pipeline_pre_dq8;
         ggml_vk_matmul(
             ctx, subctx, pipeline,
             { d_X, x_buf_offset, x_range }, { d_Y, y_buf_offset, y_range },
             ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
-            ne01, ne11, ne10,
+            ne01, ne11, (is_dq8 && dq8_break && ne10 > 64) ? ne10 - 64 : ne10,
             ne10, stride_b, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
             split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
             b_col_bytes, (uint64_t)od->nb[1]
@@ -11433,8 +11437,9 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     // Selected-key attention (src[5]) may name any cell, so masked keys must not leak NaN/inf from V; dense
-    // attention relies on the KV cache zeroing freed cells.
-    const bool nan_safe_v = mask != nullptr && dst->src[5] != nullptr;
+    // attention relies on the KV cache zeroing freed cells. GGML_VK_FA_NAN_SAFE=1 also protects unified multi-sequence caches.
+    static const bool fa_nan_safe_all = [] { const char * e = getenv("GGML_VK_FA_NAN_SAFE"); return e && atoi(e) != 0; }();
+    const bool nan_safe_v = mask != nullptr && (dst->src[5] != nullptr || fa_nan_safe_all);
 
     const bool radv_rdna3 = ctx->device->driver_id == vk::DriverId::eMesaRadv &&
                             ctx->device->architecture == vk_device_architecture::AMD_RDNA3;
@@ -11466,7 +11471,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const bool fa_mr_on = HSK == 256 && radv_rdna3;
     const uint32_t qk_ratio_mr = nek2 > 0 ? (uint32_t)(neq2 / nek2) : 0;
     const uint32_t mr_h = (qk_ratio_mr % 2) == 0 ? 2u : 1u;
-    const bool use_mr = fa_mr_on && vt_ok && f32acc &&
+    const bool use_mr = fa_mr_on && vt_ok && f32acc && !nan_safe_v &&
                         k_type_eff == GGML_TYPE_F16 && HSK == HSV && qk_ratio_mr > 0 &&
                         neq2 == (int64_t)qk_ratio_mr * nek2 && nek2 == nev2 &&
                         (mask == nullptr || (mask->type == GGML_TYPE_F16 && nem2 <= 1 && nem3 <= 1 &&

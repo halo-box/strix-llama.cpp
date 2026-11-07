@@ -270,7 +270,7 @@ shared SCACHE_T scache_dm[BM * 8];
 #include "mul_mm_funcs.glsl"
 #ifdef COOPMAT
 #if defined(BUF_MANUAL)
-// test hook (spec constant 16, the host passes 0): rotate the fragment's k pairs so a byte-equal test must see a difference
+// test hook (spec constant 16, GGML_VK_TEST_MF_SKEW): rotate the fragment's k pairs so a byte-equal test must see a difference
 layout(constant_id = 16) const uint MF_SKEW = 0;
 #define MF_E(e) (((e) + MF_SKEW) & 7u)
 #define LOAD_A_FRAG(dst, row0, k2) { \
