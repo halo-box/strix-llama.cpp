@@ -44,11 +44,7 @@ static int ggml_cuda_mmq_rdna3_5_fixed_J(
     // MoE: narrow J by rows per expert, run through the routed-compact kernel
     if (GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback && ids != nullptr && mmq_rdna3_5_id_n_experts_ok(nchannels_y)) {
         const int64_t rows_per_expert = (ncols_dst + nchannels_y - 1) / nchannels_y;
-        int J = mmq_rdna3_5_id_use_j48_128e(type, nchannels_y, rows_per_expert) ? 48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);
-        if (type == GGML_TYPE_Q6_K && getenv("GGML_Q6_COMPACT_J")) {
-            J = atoi(getenv("GGML_Q6_COMPACT_J"));
-        }
-        return J;
+        return mmq_rdna3_5_id_use_j48_128e(type, nchannels_y, rows_per_expert) ? 48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);
     }
     return 0;
 }

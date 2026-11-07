@@ -8,8 +8,8 @@ import re
 import sys
 
 
-FIELDS = ('vgprs', 'spill_stores', 'scratch_bytes')
-METADATA_FIELDS = ('vgpr_count', 'vgpr_spill_count', 'private_segment_fixed_size', 'wavefront_size')
+FIELDS = ('vgprs', 'spill_stores', 'scratch_bytes', 'sgpr_spills')
+METADATA_FIELDS = ('vgpr_count', 'vgpr_spill_count', 'private_segment_fixed_size', 'sgpr_spill_count', 'wavefront_size')
 
 
 def parse_assembly(text, architecture):
@@ -31,9 +31,9 @@ def parse_assembly(text, architecture):
         if not re.fullmatch(r'[A-Za-z0-9_.$]+', name) or name in kernels:
             raise ValueError(f'invalid or duplicate kernel name: {name}')
         numbers = [int(values[key]) for key in METADATA_FIELDS]
-        if min(numbers) < 0 or numbers[3] != 32:
+        if min(numbers) < 0 or numbers[4] != 32:
             raise ValueError(f'invalid resource count or wave size: {name}')
-        kernels[name] = dict(zip(FIELDS, numbers[:3]))
+        kernels[name] = dict(zip(FIELDS, numbers[:4]))
     if not kernels and not re.search(r'(?m)^amdhsa.kernels:[ \t]+\[\][ \t]*$', section):
         raise ValueError('no kernels in metadata section')
     return kernels
@@ -68,7 +68,8 @@ def find_regressions(kernels, units, baseline, compiler_version):
     minimum_kernels = baseline.get('minimum_kernel_count', max(baseline['translation_units'].values()))
     if type(minimum_kernels) is not int or minimum_kernels <= 0:
         raise ValueError('invalid minimum kernel count')
-    budgets = baseline.get('kernels', {})
+    # an SGPR budget is optional: a legacy budget without one allows no SGPR spill
+    budgets = {name: dict(budget, sgpr_spills=budget.get('sgpr_spills', 0)) for name, budget in baseline.get('kernels', {}).items()}
     errors = []
     if not kernels:
         errors.append('empty kernel inventory')
@@ -82,7 +83,7 @@ def find_regressions(kernels, units, baseline, compiler_version):
             raise ValueError(f'missing baseline reason: {name}')
         if any(type(budget[field]) is not int or budget[field] < 0 for field in FIELDS):
             raise ValueError(f'invalid baseline budget: {name}')
-        if budget['vgprs'] > 256 or budget['spill_stores'] == 0:
+        if budget['vgprs'] > 256 or budget['spill_stores'] + budget['sgpr_spills'] == 0:
             raise ValueError(f'invalid baseline spill exception: {name}')
         if name not in kernels:
             errors.append(f'{name}: missing baseline kernel')
@@ -94,6 +95,8 @@ def find_regressions(kernels, units, baseline, compiler_version):
         if budget is None:
             if usage['spill_stores']:
                 errors.append(f'{name}: new spill ({usage["spill_stores"]} spill saves, {usage["scratch_bytes"]} scratch bytes/lane)')
+            if usage['sgpr_spills']:
+                errors.append(f'{name}: new SGPR spill ({usage["sgpr_spills"]} SGPR spill saves)')
         else:
             for field in FIELDS:
                 if usage[field] > budget[field]:
@@ -102,7 +105,7 @@ def find_regressions(kernels, units, baseline, compiler_version):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Require zero gfx1151 VGPR spills, or enforce explicit legacy budgets.')
+    parser = argparse.ArgumentParser(description='Require zero gfx1151 VGPR and SGPR spills, or enforce explicit legacy budgets.')
     parser.add_argument('assembly_directory', type=Path)
     parser.add_argument('--baseline', type=Path, required=True)
     parser.add_argument('--compiler-version', required=True)
@@ -116,14 +119,14 @@ def main():
         return 1
     print(f'Parsed {len(kernels)} kernels across {len(units)} translation units from final assembly.')  # noqa: NP100
     budgets = baseline.get('kernels', {})
-    print(f'{sum(bool(k["spill_stores"]) for k in kernels.values())} spilling symbols; {len(budgets)} bounded baseline entries.')  # noqa: NP100
+    print(f'{sum(bool(k["spill_stores"]) for k in kernels.values())} VGPR-spilling and {sum(bool(k["sgpr_spills"]) for k in kernels.values())} SGPR-spilling symbols; {len(budgets)} bounded baseline entries.')  # noqa: NP100
     if budgets:
         print(f'Baseline reasons: {dict(Counter(k["reason"] for k in budgets.values()))}')  # noqa: NP100
     for error in errors:
         print(error, file=sys.stderr)  # noqa: NP100
     if errors:
         return 1
-    print('PASS: no new spills or increases in per-kernel resource budgets.' if budgets else 'PASS: zero VGPR spills with complete baseline coverage.')  # noqa: NP100
+    print('PASS: no new spills or increases in per-kernel resource budgets.' if budgets else 'PASS: zero VGPR and SGPR spills with complete baseline coverage.')  # noqa: NP100
     return 0
 
 

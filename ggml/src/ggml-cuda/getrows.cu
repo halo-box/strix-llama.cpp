@@ -378,21 +378,22 @@ static void get_rows_cuda_float(
                     s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
             };
             constexpr auto one = std::integral_constant<int, 1>{};
-            if constexpr (std::is_same<src0_t, half>::value) {
-                if (ne00 > 32) {
+            if (ne00 > 32) {
+                if constexpr (std::is_same<src0_t, half>::value) {
                     if (ne00 <= 64) launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 2>{});
                     else            launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 4>{});
-                    return;
+                } else {
+                    if (ne00 <= 64) launch(std::integral_constant<int,  64>{}, one);
+                    else            launch(std::integral_constant<int, 128>{}, one);
                 }
+                return;
             }
             if      (ne00 <=  1) launch(std::integral_constant<int,   1>{}, one);
             else if (ne00 <=  2) launch(std::integral_constant<int,   2>{}, one);
             else if (ne00 <=  4) launch(std::integral_constant<int,   4>{}, one);
             else if (ne00 <=  8) launch(std::integral_constant<int,   8>{}, one);
             else if (ne00 <= 16) launch(std::integral_constant<int,  16>{}, one);
-            else if (ne00 <= 32) launch(std::integral_constant<int,  32>{}, one);
-            else if (ne00 <= 64) launch(std::integral_constant<int,  64>{}, one);
-            else                launch(std::integral_constant<int, 128>{}, one);
+            else                launch(std::integral_constant<int,  32>{}, one);
             return;
         }
     }

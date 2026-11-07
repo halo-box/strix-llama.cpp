@@ -19,60 +19,10 @@ struct mm_ids_helper_store {
 };
 static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
 
-// Qwen4exp 512-expert / 10-active fast path. The generic helper launches one warp per expert and every
-// warp scans all token slots (O(n_experts*n_tokens*n_used)). Here one block histograms the slots, computes
-// the 512 bounds, and scatters the two maps in O(n_tokens*n_used). Row ordering inside an expert is irrelevant:
-// ids_dst maps every compact MMQ row back to its exact destination and there is no cross-row reduction.
-__launch_bounds__(1024, 1)
-static __global__ void mm_ids_helper_512_10(
-        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
-        int32_t * __restrict__ expert_bounds, const int n_tokens, const int nchannels_y,
-        const int si1, const int sis1, const bool write_inverse) {
-    __shared__ int counts[512];
-    __shared__ int cursors[512];
-
-    const int tid = threadIdx.x;
-    if (tid < 512) {
-        counts[tid] = 0;
-        cursors[tid] = 0;
-    }
-    __syncthreads();
-
-    const int n_slots = n_tokens * 10;
-    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
-        const int token = idx / 10;
-        const int iex   = idx - token * 10;
-        atomicAdd(&counts[ids[token * si1 + iex]], 1);
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        int total = 0;
-        expert_bounds[0] = 0;
-        for (int e = 0; e < 512; ++e) {
-            total += counts[e];
-            expert_bounds[e + 1] = total;
-        }
-    }
-    __syncthreads();
-
-    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
-        const int token = idx / 10;
-        const int iex   = idx - token * 10;
-        const int expert = ids[token * si1 + iex];
-        const int dst = expert_bounds[expert] + atomicAdd(&cursors[expert], 1);
-        ids_dst[dst] = idx;
-        if (write_inverse) {
-            ids_src1[idx] = dst;
-        } else {
-            ids_src1[dst] = token * sis1 + iex % nchannels_y;
-        }
-    }
-}
-
 // Any expert count up to 1024: one block histograms the token slots, scans the bounds and scatters the two maps,
 // O(n_tokens*n_used) work. The per-expert helper below has every warp scan all slots: 715 us per call for Qwen3.6
-// 35B-A3B (256 experts, 8 used) at 4096 tokens, 80 calls per ubatch. Row order inside an expert is irrelevant, as above.
+// 35B-A3B (256 experts, 8 used) at 4096 tokens, 80 calls per ubatch.
+// Row order inside an expert is irrelevant: ids_dst maps every compact MMQ row back to its exact destination and there is no cross-row reduction.
 constexpr int MM_IDS_HIST_MAX_EXPERTS = 1024;
 
 template <int n_expert_used_template>
@@ -288,8 +238,8 @@ void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    // the histogram helper (AMD wave32); the serial-scan 512/10 helper and the per-expert generic helper remain for other
-    // shapes. Its atomic scatter orders the rows of an expert differently from run to run: NVIDIA stream-k MMQ would then
+    // the histogram helper (AMD wave32); the per-expert generic helper remains for other shapes.
+    // Its atomic scatter orders the rows of an expert differently from run to run: NVIDIA stream-k MMQ would then
     // split K differently per run, so the token-ordered helpers stay there (bitwise reproducible outputs)
     const bool warp32 = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32; // the scan uses 32-lane shuffles
     if (GGML_CUDA_CC_IS_AMD(cc) && warp32 && n_experts <= MM_IDS_HIST_MAX_EXPERTS) {
@@ -301,11 +251,6 @@ void ggml_cuda_launch_mm_ids_helper(
             case 10: mm_ids_helper_hist<10><<<1, 1024, 0, stream>>>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
             default: mm_ids_helper_hist< 0><<<1, 1024, 0, stream>>>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse); break;
         }
-        return;
-    }
-    if (GGML_CUDA_CC_IS_RDNA3_5(cc) && n_experts == 512 && n_expert_used == 10 && getenv("GGML_CUDA_DISABLE_MMID_512") == nullptr) {
-        mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
-            ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
         return;
     }
     switch (n_expert_used) {

@@ -547,11 +547,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 #if defined(GGML_USE_HIP)
     // RDNA3.5, wide batched rows (e.g. the qwen4exp QSA block selection): one workgroup per row selects the same set
-    // as the stable-tie radix path in fewer passes. GGML_CUDA_TOPK_WG=0 keeps the radix kernels.
+    // as the stable-tie radix path in fewer passes.
     {
-        static const bool wg = getenv("GGML_CUDA_TOPK_WG") == nullptr || atoi(getenv("GGML_CUDA_TOPK_WG")) != 0;
         const bool wide = ncols >= 8192 || (ncols >= 4096 && nrows >= 128) || (ncols >= 2048 && nrows >= 512);
-        if (wg && wide && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc) &&
+        if (wide && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc) &&
                 nrows > 1 && k <= ncols && ncols <= INT_MAX && nrows <= INT_MAX) {
             top_k_wg_kernel<<<(unsigned) nrows, TOPK_WG_THREADS, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
             CUDA_CHECK(cudaGetLastError());

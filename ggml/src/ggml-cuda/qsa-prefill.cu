@@ -564,16 +564,6 @@ bool ggml_cuda_flash_attn_ext_qsa_prefill_supported_dev(int device, const ggml_t
         ids->ne[1]>=q->ne[1] && ids->ne[2]==1 && (ids->ne[3]==1 || ids->ne[3]==q->ne[3]) && ggml_is_contiguous(dst);
 }
 
-static __global__ void qsa_pack_k(const char * src, uint16_t * dst, size_t nb1, size_t nb2, int nk, uint32_t count) {
-    const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
-    if (i>=count) return;
-    const uint32_t d=(i%32)*8, key=(i/32)%nk, head=i/(uint32_t(nk)*32);
-    const size_t group=size_t(head)*(nk/4)+key/4;
-    const auto * in=reinterpret_cast<const uint4 *>(src+size_t(head)*nb2+size_t(key)*nb1+d*2);
-    auto * out=reinterpret_cast<uint4 *>(dst+group*1024+(d/16)*64+(key%4)*16+d%16);
-    *out=*in;
-}
-
 static __global__ void qsa_pack_v(const char * src, uint16_t * dst, size_t nb1, size_t nb2, int nk, uint32_t count) {
     const uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
     if (i>=count) return;
@@ -590,19 +580,10 @@ static void qsa_prefill_impl1(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
     float scale; memcpy(&scale, dst->op_params, 4);
     const int n_q = (int) q->ne[1], ns = (int) ids->ne[0], nk = (int) k->ne[1];
-    // QSA_DIRECT: -1/auto reads K direct (32 B row reads) and packs only V, unless the attention is small against the cache
-    // (the pack is O(n_kv) per ubatch, its gain O(n_q)): then V is read direct too. 0 packs both, 1 reads both direct,
-    // 2 forces K direct with V packed. All paths are bit-identical.
-    static const int qsa_direct_cfg = getenv("QSA_DIRECT") ? atoi(getenv("QSA_DIRECT")) : -1;
-    const bool qsa_direct = qsa_direct_cfg == 1 || (qsa_direct_cfg < 0 && (size_t) n_q * 64 < (size_t) nk);
-    const bool qsa_kdirect = qsa_direct || qsa_direct_cfg == 2 || qsa_direct_cfg < 0;
-    ggml_cuda_pool_alloc<uint16_t> packed_k(ctx.pool(), qsa_kdirect ? 0 : ggml_nelements(k));
+    // K is read direct (32 B row reads) and only V is packed, unless the attention is small against the cache
+    // (the pack is O(n_kv) per ubatch, its gain O(n_q)): then V is read direct too. Both paths are bit-identical.
+    const bool qsa_direct = (size_t) n_q * 64 < (size_t) nk;
     ggml_cuda_pool_alloc<uint16_t> packed_v(ctx.pool(), qsa_direct ? 0 : ggml_nelements(v));
-    if (!qsa_kdirect) {
-        const uint32_t count_k=ggml_nelements(k)/8;
-        qsa_pack_k<<<(count_k+255)/256,256,0,ctx.stream()>>>((const char *)k->data,packed_k.get(),k->nb[1],k->nb[2],nk,count_k);
-        CUDA_CHECK(cudaGetLastError());
-    }
     if (!qsa_direct) {
         const uint32_t count_v=ggml_nelements(v)/4;
         qsa_pack_v<<<(count_v+255)/256,256,0,ctx.stream()>>>((const char *)v->data,packed_v.get(),v->nb[1],v->nb[2],nk,count_v);
@@ -616,10 +597,9 @@ static void qsa_prefill_impl1(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_pool_alloc<int>      srow(ctx.pool(), (size_t) n_q * ns);
     ggml_cuda_pool_alloc<int>      sflag(ctx.pool(), (size_t) n_q);
     {
-        // bitonic row sort over the next power of two (GGML_QSA_RANKSORT=1: the O(n^2) rank sort)
-        static const bool ranksort = getenv("GGML_QSA_RANKSORT") && atoi(getenv("GGML_QSA_RANKSORT")) != 0;
+        // bitonic row sort over the next power of two; the O(n^2) rank sort when that does not fit in 60 KiB
         int np2 = 1; while (np2 < ns) np2 <<= 1;
-        if (ranksort || (size_t) np2 * sizeof(int) > 60 * 1024) np2 = 0;
+        if ((size_t) np2 * sizeof(int) > 60 * 1024) np2 = 0;
         const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) std::max(np2 ? np2 : ns, 2 * ns) * sizeof(int), ctx.stream());
         ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get(), m ? (const char *)m->data : nullptr, m ? m->nb[1] : 0, np2);
         CUDA_CHECK(cudaGetLastError());
@@ -633,16 +613,12 @@ static void qsa_prefill_impl1(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                        (int) q->ne[2], gate ? (int) (gate->nb[1] / sizeof(float)) : 0};
     const float * gp = gate ? (const float *) gate->data : nullptr;
     const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
-    if (qsa_kdirect && !qsa_direct) {
+    if (!qsa_direct) {
         ggml_cuda_kernel_launch(qsa3_attn_kernel<true, 8, false>, launch, (const float *) q->data, (const uint16_t *) k->data, packed_v.get(),
                                 m ? (const uint16_t *) m->data : nullptr, (const uint32_t *) ublk.get(), (const uint16_t *) umask.get(),
                                 (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
-    } else if (qsa_direct) {
-        ggml_cuda_kernel_launch(qsa3_attn_kernel<true, 8>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
-                                m ? (const uint16_t *) m->data : nullptr, (const uint32_t *) ublk.get(), (const uint16_t *) umask.get(),
-                                (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
     } else {
-        ggml_cuda_kernel_launch(qsa3_attn_kernel<false, 8>, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
+        ggml_cuda_kernel_launch(qsa3_attn_kernel<true, 8>, launch, (const float *) q->data, (const uint16_t *) k->data, (const uint16_t *) v->data,
                                 m ? (const uint16_t *) m->data : nullptr, (const uint32_t *) ublk.get(), (const uint16_t *) umask.get(),
                                 (const int *) ucount.get(), out32, layout, gp, dst16, dst16_f16);
     }

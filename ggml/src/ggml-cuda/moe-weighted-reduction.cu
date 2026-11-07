@@ -289,13 +289,9 @@ bool ggml_cuda_op_moe_weighted_reduction_sgma(ggml_backend_cuda_context & ctx, c
     // same condition as the unfused reduction's BF16-input path
     const bool ein16 = ggml_cuda_mmb_down16() && ggml_cuda_mmb_is_bf16_only(ctx, experts);
     // one block per token when its n_embd/4 lanes fit a block (640 for n_embd 2560: no idle lanes, where 256 left 128 of
-    // 768 idle), else 256. MOE_SGMA_THREADS overrides, rounded to whole warps within [32, 1024].
-    static const int env_threads = getenv("MOE_SGMA_THREADS") ? atoi(getenv("MOE_SGMA_THREADS")) : 0;
+    // 768 idle), else 256.
     const int64_t lanes = n_embd / 4;
-    int threads = (lanes <= 1024 && lanes % 32 == 0) ? (int) lanes : 256;
-    if (env_threads > 0) {
-        threads = std::min(1024, std::max(32, (env_threads + 31) / 32 * 32));
-    }
+    const int threads = (lanes <= 1024 && lanes % 32 == 0) ? (int) lanes : 256;
     const dim3 blocks(n_tokens, (n_embd / 4 + threads - 1) / threads, 1);
     const float * sc = expert_scale ? (const float *) expert_scale->data : nullptr;
     cudaStream_t stream = ctx.stream();

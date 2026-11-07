@@ -234,65 +234,13 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_cuda_hc
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// combine + grouped rms norm, one token: block per stream, 1024 threads (the rms_norm_f32<1024> layout)
+// combine + grouped rms norm, 1024 threads (the rms_norm_f32<1024> layout)
 //   w        = s2 * sigmoid(s1 * inject[c] + b1) + b2
 //   res[e,c] = residual[e,c] + block_out[e] * w
 //   xn[e,c]  = rms_norm(res[:,c]) * gamma[e,c]
 
 #define HC_CN_BLOCK   1024
 #define HC_CN_MAX_EMB 3072
-
-static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
-        const float * __restrict__ inject, const float * __restrict__ residual,
-        const float * __restrict__ block_out, const float * __restrict__ gamma,
-        float * __restrict__ out_res, float * __restrict__ out_xn,
-        const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps) {
-    __shared__ float s_sum[32];
-
-    const int c   = blockIdx.x;   // stream
-    const int t   = blockIdx.y;   // token
-    const int hc  = gridDim.x;
-    const int tid = threadIdx.x;
-
-    // identical expressions to scale_f32 / op_sigmoid / scale_f32
-    const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
-    const float x2 = hc_sigmoid(x1);
-    const float w  = s2 * x2 + b2;
-
-    const int64_t row = (int64_t) t * hc + c;
-    const float * res = residual + row * n_embd;
-    float *       dst = out_res  + row * n_embd;
-    block_out += (int64_t) t * n_embd;
-    float xs[3];
-    float tmp = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 3; ++k) {
-        const int col = tid + k * HC_CN_BLOCK;
-        xs[k] = 0.0f;
-        if (col < n_embd) {
-            const float m  = hc_mul_rn(block_out[col], w);
-            const float xi = hc_add_rn(res[col], m);
-            dst[col] = xi;
-            xs[k]    = xi;
-            tmp += xi * xi;
-        }
-    }
-
-    tmp = block_reduce<block_reduce_method::SUM, HC_CN_BLOCK>(tmp, s_sum);
-
-    const float mean  = tmp / n_embd;
-    const float scale = rsqrtf(mean + eps);
-
-    const float * g  = gamma  + (int64_t) c * n_embd;
-    float *       xn = out_xn + row * n_embd;
-#pragma unroll
-    for (int k = 0; k < 3; ++k) {
-        const int col = tid + k * HC_CN_BLOCK;
-        if (col < n_embd) {
-            xn[col] = scale * xs[k] * g[col];
-        }
-    }
-}
 
 // Read all residual, block and injection values before writing aliased outputs.
 // Gamma must remain disjoint from both outputs.

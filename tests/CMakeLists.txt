@@ -166,7 +166,6 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-llama_build_and_test(test-qsa-prefix.cpp)
 llama_build_and_test(test-qsa-fast.cpp)
 llama_build_and_test(test-qsa-recover.cpp)
 llama_build_and_test(test-ple-disk.cpp)
@@ -192,6 +191,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp LINK llama)
     llama_build_and_test(test-batch-alloc.cpp LINK llama)
+    llama_build_and_test(test-qsa-prefix.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -231,7 +231,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     #       this branch and run them on all platforms
     llama_build(test-llama-archs.cpp)
     llama_test(test-llama-archs NAME test-qwen4exp-mtp-cache-only ARGS --mtp-cache-only -s 1234)
-    set_tests_properties(test-qwen4exp-mtp-cache-only PROPERTIES ENVIRONMENT "LLAMA_QSA_INCREMENTAL=1")
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -272,8 +271,7 @@ llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-sched-view-scratch.cpp LINK ggml)
 # Vulkan fused-path exactness: the engagement asserts need the int8 MMQ / f16-output pipelines, which lavapipe and many
-# non-AMD devices lack, so it is not registered as a test (run it manually on a device that has the paths); its mmid-frag
-# group is a tool: three runs (default, GGML_VK_MMID_MANUAL_FRAG=0, GGML_VK_TEST_MF_SKEW=1) compared by test-vk-exact-mmid-frag.py
+# non-AMD devices lack, so it is not registered as a test (run it manually on a device that has the paths)
 llama_build(test-vk-exact.cpp LINK ggml)
 llama_build_and_test(test-spec-mtp-pcum.cpp)
 llama_build_and_test(test-draft-vocab.cpp)
