@@ -1120,6 +1120,18 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
 }
 
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
+// the context-level init errors of qwen4exp's QSA (PLAN-v3 §10)
+static void qwen4exp_qsa_check_context(llama_split_mode split_mode, uint32_t n_ctx_seq) {
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::runtime_error("QSA sparse attention is not supported with --split-mode tensor: the meta backend has no SPARSE_ATTN handler; use --split-mode layer or none");
+    }
+    // §4.4: the largest n_kv an op test has run (the first f16 K view >= 2 GiB, 2^21 + 4 cells); 1M+ runtime is U12
+    constexpr uint32_t max_n_ctx_seq = (1u << 21) + 4;
+    if (n_ctx_seq > max_n_ctx_seq) {
+        throw std::runtime_error(format("QSA sparse attention: n_ctx_seq = %u is above the tested maximum of %u cells", n_ctx_seq, max_n_ctx_seq));
+    }
+}
+
 static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
 
@@ -3015,23 +3027,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     filter_recr = [&](uint32_t)    { return false; };
                 }
 
-                // PLAN-v3 D21: qwen4exp's QSA layers always run the sparse op past the shortcut, which reads V not transposed,
-                // so its cache keeps that layout whatever -fa says
-                const bool qsa_arch = arch == LLM_ARCH_QWEN4EXP;
-                if (qsa_arch && split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-                    throw std::runtime_error("QSA sparse attention is not supported with --split-mode tensor: the meta backend has no SPARSE_ATTN handler; use --split-mode layer or none");
-                }
-                // PLAN-v3 §4.4: the largest n_kv an op test has run (the first f16 K view >= 2 GiB, 2^21 + 4 cells); 1M+ runtime is U12
-                constexpr uint32_t qsa_max_n_ctx_seq = (1u << 21) + 4;
-                if (qsa_arch && cparams.n_ctx_seq > qsa_max_n_ctx_seq) {
-                    throw std::runtime_error(format("QSA sparse attention: n_ctx_seq = %u is above the tested maximum of %u cells", cparams.n_ctx_seq, qsa_max_n_ctx_seq));
-                }
-
                 res = new llama_memory_hybrid_idx(
                     /* model             */ *this,
                     /* attn_type_k       */ params.type_k,
                     /* attn_type_v       */ params.type_v,
-                    /* attn_v_trans      */ qsa_arch ? false : !cparams.flash_attn,
+                    /* attn_v_trans      */ !cparams.flash_attn,
                     /* attn_kv_size      */ cparams.n_ctx_seq,
                     /* attn_n_pad        */ 1,
                     /* attn_n_swa        */ hparams.n_swa,
@@ -3231,11 +3231,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_memory_hybrid_idx::layer_filter_cb f_idx =
                         [&](uint32_t il) { return il >= hparams.n_layer(); };
                     LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
+                    qwen4exp_qsa_check_context(split_mode(), cparams.n_ctx_seq);
                     return new llama_memory_hybrid_idx(
                         /* model             */ *this,
                         /* attn_type_k       */ params.type_k,
                         /* attn_type_v       */ params.type_v,
-                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_v_trans      */ false,   // PLAN-v3 D21: the sparse op reads V not transposed, whatever -fa says
                         /* attn_kv_size      */ cparams.n_ctx_seq,
                         /* attn_n_pad        */ 1,
                         /* attn_n_swa        */ hparams.n_swa,
@@ -3330,12 +3331,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx) {
+                        // PLAN-v3 D21: qwen4exp's QSA layers run the sparse op past the shortcut, which reads V not transposed,
+                        // so its cache keeps that layout whatever -fa says
+                        const bool qsa_arch = arch == LLM_ARCH_QWEN4EXP;
+                        if (qsa_arch) {
+                            qwen4exp_qsa_check_context(split_mode(), cparams.n_ctx_seq);
+                        }
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_v_trans      */ qsa_arch ? false : !cparams.flash_attn,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
