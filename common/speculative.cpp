@@ -1832,12 +1832,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            // a prompt batch (wider than a verify batch) is never accepted against: keep its last row only, which is
+            // the carry (copying every row was 80 MB per 2048 rows on Qwen3.8-Flash-Next)
+            const int32_t n_all  = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const int32_t i_beg  = n_all <= this->n_max + 1 ? 0 : n_all - 1;
+            const int32_t n_rows = n_all - i_beg;
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i_beg + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
