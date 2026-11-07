@@ -85,6 +85,14 @@ for p, b in DIRECT.items():
     k = kld(f'new_db_{p}')
     if k: mu, se, _ = st(list(k.values())); ok = mu <= b; print(f"| {p} | {mu:.3e} | {se:.2e} | {b:.3e} | {'PASS' if ok else 'FAIL'} |"); (ok or FAIL.append('direct ' + p))
     else: print(f'| {p} | missing | | {b:.3e} | MISSING |'); FAIL.append('direct ' + p + ' missing')
+print('\n## Q1 direct form, stage 2 (§15 two-stage rule: the same band on chunks 8-15 of the c8192 x 16 reference)\n')
+print('| type | mean KLD chunks 8-15 | SE | band | verdict |\n|---|---|---|---|---|')
+for p, b in DIRECT.items():
+    k = kld(f'new_hb_{p}')
+    if k:
+        v = [k[c] for c in sorted(k) if 8 <= c <= 15]
+        mu, se, _ = st(v); ok = mu <= b
+        print(f"| {p} | {mu:.3e} | {se:.2e} | {b:.3e} | {'PASS' if ok else 'FAIL'} |")
 print('\n## Q2 floor context (ratio to the f16 ub2048 pinned floor)\n')
 fl = kld('w0_a_f16_f16_u2048')
 if fl:
@@ -106,15 +114,20 @@ for p, thr in Q4.items():
     if not a or not b: print(f'| {p} | missing | | | | | MISSING |'); FAIL.append('Q4 ' + p + ' missing'); continue
     ks = sorted(set(a) & set(b)); ma = sum(a[k] for k in ks)/len(ks); mb = sum(b[k] for k in ks)/len(ks)
     diff = ma - mb
-    ok = diff >= -Q4B
-    print(f"| {p} | {ma:.6f} | {mb:.6f} | {diff:+.2e} | {-Q4B:.3e} | {thr} | {'PASS' if ok else 'FAIL'} |")
+    # PLAN-v3 Q4 states the bound per type as an absolute threshold (PR219_T - B_T with the per-type B_T of R1-E / AT-W12-BANDS):
+    # that is the verdict. The uniform relative bound -1.178e-4 is printed as context; for f16 KV the PR219 arm is the reference
+    # build itself (agreement 1.0 with f16 idx), so the relative form there compares new against the reference with itself.
+    ok = ma >= thr
+    rel = 'ok' if diff >= -Q4B else 'below'
+    print(f"| {p} | {ma:.6f} | {mb:.6f} | {diff:+.2e} ({rel}) | {-Q4B:.3e} | {thr} (margin {ma - thr:+.1e}) | {'PASS' if ok else 'FAIL'} |")
     if not ok: FAIL.append('Q4 ' + p)
 print('\n## Q8 planted defects (on - off, same type, same pins, c8192 x 8)\n')
 print('| arm | type | on - off | SE | LCB95 | pos chunks | rule | verdict |\n|---|---|---|---|---|---|---|---|')
 for t in ['f16', 'q8_0']:
-    off, w0off = kld(f'new_a8_{t}_off'), kld(f'w0_a8_{t}_off')
+    off, w0off = kld(f'new_a_{t}_{t}_u4096'), kld(f'w0_a_{t}_{t}_u4096')     # d1, d2 do not observe a node: the clean arm has the same splits
+    off3, w0off3 = kld(f'new_a8_{t}_off'), kld(f'w0_a8_{t}_off')             # d3 observes attn_output-23: its off arm too (LAB_DEF=d3, eps 0)
     for d in ['d1', 'd2', 'd3']:
-        p, w = paired(kld(f'new_a8_{t}_{d}'), off), paired(kld(f'w0_a8_{t}_{d}'), w0off)
+        p, w = paired(kld(f'new_a8_{t}_{d}'), off3 if d == 'd3' else off), paired(kld(f'w0_a8_{t}_{d}'), w0off3 if d == 'd3' else w0off)
         if not p: print(f'| new {d} | {t} | missing | | | | | MISSING |'); FAIL.append(f'Q8 {t} {d} missing'); continue
         lcb = p['mean'] - T95[p['n']-1] * p['se']
         if d == 'd1': ok, rule = lcb > 7.45e-5, 'LCB95 > 7.45e-5'

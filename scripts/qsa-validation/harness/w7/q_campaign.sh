@@ -55,6 +55,30 @@ phase_D() {
     rm -f $QKBASE; unset QKBASE
   done
 }
+phase_H() {  # §15 two-stage rule: a Q1 direct-form type that failed stage 1, re-scored on chunks 8-15 of the c8192 x 16 reference (HTYPES)
+  local F=$R/ref16h
+  $RUN ref16h_rec $F record w0 f16 f16 4096 8192 16 $T0
+  for p in ${HTYPES:?}; do k=${p%:*}; v=${p#*:}; t=$(tagof $p)
+    export QKBASE=$R/kbaseh_$t.kld
+    $RUN w0_hb_${t}_base $F pinbase w0 $k $v 4096 8192 16 LAB_DEF=d3 LAB_D3_EPS=0
+    $RUN new_hb_${t} $F pinkld new $k $v 4096 8192 16 LAB_DEF=d3 LAB_D3_EPS=0
+    # explanatory, not a gate: the PR219 arm itself with eps = 1e-7 at layer 23 (the band's saturation arm) and at layer 3, the first QSA layer
+    $RUN w0_hs23_${t} $F pinkld w0 $k $v 4096 8192 16 LAB_DEF=d3 LAB_D3_EPS=1e-7
+    $RUN w0_hs3_${t} $F pinkld w0 $k $v 4096 8192 16 LAB_DEF=d3 LAB_D3_EPS=1e-7 LAB_D3_L=3
+    rm -f $QKBASE; unset QKBASE
+  done
+  rm -rf $F
+}
+phase_K() {  # explanatory, not a gate: PR219's own route changes in the direct form, on ref8t0 (the first 8 chunks of phase D's arms)
+  need_ref8
+  for spec in q8_0:q8_0:0 q4_0:q4_0:1 bf16:bf16:1 f16:f16:0; do k=${spec%%:*}; r=${spec#*:}; v=${r%:*}; o=${r#*:}; t=${k}_$v
+    export QKBASE=$R/kbasek_$t.kld
+    $RUN w0_kb_${t}_base $R/ref8t0 pinbase w0 $k $v 4096 8192 8 LAB_DEF=d3 LAB_D3_EPS=0
+    $RUN w0_kk_${t}_route $R/ref8t0 pinkld w0 $k $v 4096 8192 8 LAB_DEF=d3 LAB_D3_EPS=0 LLAMA_QSA_SELECTED_KEY=$o
+    $RUN w0_kk_${t}_eps3 $R/ref8t0 pinkld w0 $k $v 4096 8192 8 LAB_DEF=d3 LAB_D3_EPS=1e-7 LAB_D3_L=3
+    rm -f $QKBASE; unset QKBASE
+  done
+}
 phase_B() {
   local F=$R/ref8L
   $RUN ref8L_rec $F record w0 f16 f16 4096 8192 8 $T0 QKL_TAIL=8191

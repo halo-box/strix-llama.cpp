@@ -76,7 +76,7 @@ phase_P6N() { # eviction-sample rate new vs base, >= 30 reps (reported): ub512 p
 phase_ND() { # AT-W7PERF (c): -nkvo, W7 (CPU route, fallback (a)) vs W0-lab, interleaved
   for t in ${NKTYPES:-f16 q8_0 q4_0 bf16}; do
     warm w0 $t $t
-    for i in ${PROCS:-0 1 2}; do
+    for i in ${PROCS:-0 1}; do    # one process per arm: the first look at fallback (a); a cell that is not a clear FAIL gets the §16 reruns
       if [ $((i % 2)) = 0 ]; then a=w0; else a=new; fi
       one nk_${t}_pp_${i}_$a $a $t $t "-nkvo 1 -b 4096 -ub 512,4096 -p 512,2048 -n 0 -d 0,4096,32768" LLAMA_QSA_HOST_KV_COPY=0
       one nk_${t}_tg_${i}_$a $a $t $t "-nkvo 1 -b 4096 -ub 512 -p 0 -n 32 -d 4096,32768" LLAMA_QSA_HOST_KV_COPY=0
@@ -86,7 +86,7 @@ phase_ND() { # AT-W7PERF (c): -nkvo, W7 (CPU route, fallback (a)) vs W0-lab, int
 phase_NDB() { # AT-W7PERF (e): fallback (b), the named host-KV copy route, on the same grid
   for t in ${NKTYPES:-f16 q8_0 q4_0 bf16}; do
     warm w0 $t $t
-    for i in ${PROCS:-0 1 2 3 4 5 6}; do
+    for i in ${PROCS:-1 2 3 4 5 6 7}; do    # with the W0 process of phase ND: R N R N R N R N
       if [ $((i % 2)) = 0 ]; then a=w0; else a=new; fi
       one nkb_${t}_pp_${i}_$a $a $t $t "-nkvo 1 -b 4096 -ub 512,4096 -p 512,2048 -n 0 -d 0,4096,32768" LLAMA_QSA_HOST_KV_COPY=1
       one nkb_${t}_tg_${i}_$a $a $t $t "-nkvo 1 -b 4096 -ub 512 -p 0 -n 32 -d 4096,32768" LLAMA_QSA_HOST_KV_COPY=1
@@ -97,10 +97,26 @@ phase_NPIN() { # AT-W7PERF (d): shortcut pin on vs off, pp512 and tg32 at d0/d10
   for t in f16; do
     for i in 0 1 2 3 4 5 6; do
       if [ $((i % 2)) = 0 ]; then e=LLAMA_QSA_SHORTCUT_PIN=0; a=off; else e=LLAMA_QSA_SHORTCUT_PIN=1; a=on; fi
-      one npin_${t}_pp_${i}_$a new $t $t "-nkvo 1 -b 4096 -ub 512 -p 512 -n 0 -d 0,1024" $e
-      one npin_${t}_tg_${i}_$a new $t $t "-nkvo 1 -b 4096 -ub 512 -p 0 -n 32 -d 0,1024" $e
+      one npin_${t}_pp_${i}_$a new $t $t "-nkvo 1 -b 4096 -ub 512 -p 512 -n 0 -d 0,1024" $e LLAMA_QSA_HOST_KV_COPY=0
+      one npin_${t}_tg_${i}_$a new $t $t "-nkvo 1 -b 4096 -ub 512 -p 0 -n 32 -d 0,1024" $e LLAMA_QSA_HOST_KV_COPY=0
     done
   done
+}
+phase_D2B() { # AT-D2 perf: -ngl 0, pp512 @ d4096 and tg32 @ d4096, W7 vs W0-lab, 3 interleaved processes per arm
+  for t in f16 q8_0; do
+    for i in 0 1 2 3 4 5; do
+      if [ $((i % 2)) = 0 ]; then a=w0; else a=new; fi
+      NGL=0 one d2b_${t}_${i}_$a $a $t $t "-b 4096 -ub 512 -p 512 -n 32 -d 4096"
+    done
+  done
+}
+phase_D1V() { # AT-D1 value: OVL=15 vs OVL=11, pp4096 at d32768 / d131072, ub4096, f16 / q8_0, W0 and W7, ratio of ratios (the plan's §16 design, 3 processes per arm)
+  for d in 32768 131072; do for t in f16 q8_0; do
+    warm new $t $t
+    for i in ${PROCS:-0 1 2}; do for a in w0 new; do for ov in 15 11; do
+      one d1v_d${d}_${t}_${i}_${a}_ovl$ov $a $t $t "-b 4096 -ub 4096 -p 4096 -n 0 -d $d" GGML_CUDA_OVL=$ov
+    done; done; done
+  done; done
 }
 for ph in "$@"; do echo "PHASE $ph start $(date +%T)"; phase_$ph; echo "PHASE $ph done $(date +%T)"; done
 echo PERF_DONE $(date +%T)
