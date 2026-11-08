@@ -1,0 +1,57 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d833ff046..873c1d6f5 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -18,6 +18,7 @@
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
++#include <map>
+ #include <cstdlib>
+ #include <limits>
+ #include <stdexcept>
+@@ -2166,6 +2167,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+         t_alloc = ggml_time_us() - t_alloc_us;
+ 
++        // C19 lab (measurement only, scripts/qsa-validation/patches/05-c19-log.patch): LAB_C19_LOG=1 logs the compute buffer
++        // of every backend whenever the graph allocation changed it
++        if (getenv("LAB_C19_LOG")) {
++            static std::map<const void *, std::vector<size_t>> lab_prev;
++            auto & prev = lab_prev[this];
++            prev.resize(backend_ptrs.size(), 0);
++            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++                const size_t sz = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
++                if (sz != prev[i]) {
++                    LLAMA_LOG_INFO("C19 buf ctx=%p %s %.2f MiB (was %.2f) n_nodes=%d\n", (const void *) this,
++                            ggml_backend_name(backend_ptrs[i]), sz/1048576.0, prev[i]/1048576.0, ggml_graph_n_nodes(gf));
++                    prev[i] = sz;
++                }
++            }
++        }
++
+         // every newly built graph: a QSA node on the wrong backend is an error, never a compute (PLAN-v3 §10)
+         if (!res->get_qsa_nodes().empty()) {
+             const std::string err = qsa_guard(gf, res, "decode");
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d0b5d2a8a..28b978830 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1620,10 +1620,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         const bool whole = first == 0 && n_query == n_tps;   // one strip: the original tensors, no views
+         // the same view in every layer, see strip_views
+         const auto strip_view = [&](ggml_tensor * src, auto make) {
++            // C19 lab (measurement only, scripts/qsa-validation/patches/05-c19-log.patch): LAB_C19_LOG=1 logs every call
++            static const bool lab_log = getenv("LAB_C19_LOG") != nullptr;
+             ggml_tensor *& view = strip_views[{src, first, n_query}];
++            const bool is_new = view == nullptr;
+             if (view == nullptr) {
+                 view = make();
+             }
++            if (lab_log) {
++                LLAMA_LOG_INFO("C19 sv il=%d src=%s first=%lld nq=%lld nkv=%lld new=%d noshare=0 bytes=%zu\n", il, src->name,
++                        (long long) first, (long long) n_query, (long long) n_kv, (int) is_new, ggml_nbytes(view));
++            }
+             return view;
+         };
+         ggml_tensor * bias = inp->compact ? nullptr : whole ? bias_all : strip_view(bias_all, [&] {
