@@ -27,6 +27,12 @@ for name in ['01-qpin', '02-r1e-qsa-chunk', '03-r1q8-defect-hook']:
     r = subprocess.run(['patch', '-p1', '-F3', '--no-backup-if-mismatch'], input=keep, text=True, capture_output=True)
     print(name, r.returncode, r.stdout[-400:], r.stderr[-200:])
     if r.returncode: sys.exit(1)
+# W13+: the measurement-only env hooks (LLAMA_QSA_PREFER_DENSE, _SHORTCUT_PIN, _HOST_KV_COPY, _FORCE_NONCOMPACT,
+# LAB_OVL_PRINT) left the branch; patch 06 puts them back on the lab tree
+if 'getenv("LLAMA_QSA_PREFER_DENSE")' not in open('src/models/qwen4exp.cpp').read():
+    r = subprocess.run(['git', 'apply', f'{P}/06-w13-measurement-hooks.patch'], text=True, capture_output=True)
+    print('06-w13-measurement-hooks', r.returncode, r.stderr[-200:])
+    if r.returncode: sys.exit(1)
 # patch's fuzz puts qpin_report() on the wrong synchronize(): it belongs in the destructor
 p = 'src/llama-context.cpp'; s = open(p).read()
 s = s.replace('    synchronize();\n    qpin_report();\n\n    const int64_t t_start_us', '    synchronize();\n\n    const int64_t t_start_us')

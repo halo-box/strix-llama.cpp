@@ -1,0 +1,127 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index bcc5245f1..bfc0dfdd0 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -7119,6 +7119,15 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
+         ctx->ovl_regions[reg.s_first] = reg;
+         prev_b = c.b;
+     }
++    // LAB_OVL_PRINT=1 (measurement only, AT-D1; W13 deletes it): the regions of this graph by kind
++    static const bool ovl_print = getenv("LAB_OVL_PRINT") != nullptr;
++    if (ovl_print) {
++        int n_kind[5] = { 0, 0, 0, 0, 0 };
++        for (const auto & it : ctx->ovl_regions) {
++            n_kind[it.second.kind]++;
++        }
++        fprintf(stderr, "LAB_OVL nodes=%d kind1=%d kind2=%d kind4=%d\n", cg->n_nodes, n_kind[1], n_kind[2], n_kind[4]);
++    }
+ }
+ 
+ // GGML_CUDA_OP_PROF=1 (with GGML_CUDA_DISABLE_GRAPHS=1): GPU time of every op (fused groups as one) by an event pair on the
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index fe84a8221..8a63cd1bc 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -40,6 +40,14 @@ static bool qsa_text_pos(const llama_ubatch & u, uint32_t i) {
+     return true;
+ }
+ 
++// LLAMA_QSA_FORCE_NONCOMPACT=1, validation only (a measurement hook, deleted with the others in W13): every ubatch is
++// non-compact, at init (NC0) and at graph time alike, so shapes no supported flow reaches can run under STRICT (a one-stream
++// non-compact ubatch of a split cache, AT-C12 / U38) and the single-sequence decode error can be shown
++static bool qsa_force_noncompact() {
++    static const bool v = [] { const char * e = getenv("LLAMA_QSA_FORCE_NONCOMPACT"); return e != nullptr && atoi(e) != 0; }();
++    return v;
++}
++
+ //
+ // llama_memory_hybrid_idx
+ //
+@@ -298,6 +306,9 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full_n_kv(uint32_t n_kv)
+ }
+ 
+ int llama_memory_hybrid_idx::qsa_compact_reason(const llama_kv_cache * kv, uint32_t n_stream, uint32_t n_kv, uint32_t ratio, const llama_ubatch & ubatch) {
++    if (qsa_force_noncompact()) {
++        return QSA_NC_FORCED;
++    }
+     if (!kv || !ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id || n_stream == 0 || ubatch.n_tokens % n_stream != 0) {
+         return QSA_NC_INPUT;
+     }
+@@ -1849,6 +1860,7 @@ uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
+ }
+ 
+ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const {
++    if (qsa_force_noncompact()) { return false; }
+     if (qsa_prefix_matches(ubatch)) { return true; }
+     return qsa_compact_reason(ubatch, ratio) == QSA_COMPACT_OK;
+ }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d6a0039a1..25fb73de6 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1114,16 +1114,31 @@ static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n
+         hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256;
+ }
+ 
++// LLAMA_QSA_PREFER_DENSE (measurement only, AT-W7PERF; W13 deletes it): 1 = every pair dense in the shortcut, 0 = every
++// pair sparse, unset = the backend's policy
++static int qwen4exp_force_prefer_dense() {
++    static const int v = [] { const char * e = getenv("LLAMA_QSA_PREFER_DENSE"); return e == nullptr ? -1 : (atoi(e) != 0 ? 1 : 0); }();
++    return v;
++}
++
+ // The shortcut attention of a QSA layer whose K buffer is on the host while its weights are on a GPU (-nkvo). AT-W7PERF (d)
+-// decides whether it is pinned to the CPU (PLAN-v3 §10); the measurement override is lab patch 06 (scripts/qsa-validation).
++// decides whether it is pinned to the CPU (PLAN-v3 §10). LLAMA_QSA_SHORTCUT_PIN=0|1 overrides it for that measurement.
+ static bool qwen4exp_pin_shortcut() {
+-    return QWEN4EXP_SHORTCUT_PIN_DEFAULT;
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_QSA_SHORTCUT_PIN");
++        return e != nullptr ? atoi(e) != 0 : QWEN4EXP_SHORTCUT_PIN_DEFAULT;
++    }();
++    return v;
+ }
+ 
+ // The host-KV fallback of PLAN-v3 §10, enabled per type by the AT-D4 / AT-W7PERF (c) result: plan and attend on the GPU of
+-// the layer's weights, K / V copied by the scheduler (the PR219 route). The measurement override is lab patch 06
+-// (scripts/qsa-validation). Only reachable when offload_kqv is off, and logged as route=host-kv-copy.
++// the layer's weights, K / V copied by the scheduler (the PR219 route). LLAMA_QSA_HOST_KV_COPY=0|1 overrides it for that
++// measurement. Only reachable when offload_kqv is off, and logged as route=host-kv-copy.
+ static bool qwen4exp_host_kv_copy(ggml_type type_k, ggml_type type_v) {
++    static const int force = [] { const char * e = getenv("LLAMA_QSA_HOST_KV_COPY"); return e == nullptr ? -1 : (atoi(e) != 0 ? 1 : 0); }();
++    if (force >= 0) {
++        return force != 0;
++    }
+     auto on_grid = [](ggml_type t) {
+         return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_BF16;
+     };
+@@ -1951,7 +1966,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+             build_qsa_store_k(mctx_hyb, cur, il);
+             if (!cache_only) {
+                 // D4: a backend policy per (pair, n_q band). Without the proc: dense for f16 / f16 only
+-                const bool dense = policy.prefer_dense ?
++                const int force = qwen4exp_force_prefer_dense();
++                const bool dense = force >= 0 ? force != 0 : policy.prefer_dense ?
+                     policy.prefer_dense(policy.dev, qsa_node.type_k, qsa_node.type_v, n_tokens/qsa_node.n_stream, n_kv) :
+                     (qsa_node.type_k == GGML_TYPE_F16 && qsa_node.type_v == GGML_TYPE_F16);
+                 if (dense) {
+diff --git a/src/prefix.h b/src/prefix.h
+index 084c4f280..f36ce4f38 100644
+--- a/src/prefix.h
++++ b/src/prefix.h
+@@ -35,6 +35,7 @@ enum qsa_compact_reason {
+     QSA_NC_DUP_KEY          = 3, // two cells of one sequence with the same (pos, y, x) key: the mask order is not total
+     QSA_NC_2D_MULTI_SEQ     = 4, // a sequence of the stream holds 2-D cells while another sequence has cells in the stream
+     QSA_NC_SHARED_BLOCK     = 5, // a position block holds one sequence under two sequence sets (seq_cp inside the block)
++    QSA_NC_FORCED           = 6, // LLAMA_QSA_FORCE_NONCOMPACT=1 (validation only: AT-C12's one-stream split shape, the decode error)
+ };
+ 
+ static const char * qsa_compact_reason_name(int r) {
+@@ -45,6 +46,7 @@ static const char * qsa_compact_reason_name(int r) {
+         case QSA_NC_DUP_KEY:      return "duplicate-(pos,y,x)-key";
+         case QSA_NC_2D_MULTI_SEQ: return "2-D-cells-with-another-sequence-in-the-stream";
+         case QSA_NC_SHARED_BLOCK: return "block-shared-by-two-sequence-sets";
++        case QSA_NC_FORCED:       return "forced-by-LLAMA_QSA_FORCE_NONCOMPACT";
+     }
+     return "unknown";
+ }

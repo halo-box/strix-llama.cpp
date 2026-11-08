@@ -21,3 +21,4 @@ for p in ${PAIRS:-q8_0:q8_0 q4_0:q4_0 bf16:bf16 q8_0:f16 f16:q8_0}; do
   done
 done
 echo AT_E2E_DONE
+\n# W13+: the LLAMA_QSA_* / LAB_OVL_PRINT hooks this script sets live in patches/06-w13-measurement-hooks.patch; on a W13+ head\n# point the new-arm binaries at a tree built by harness/w13/hooks_tree.sh\n

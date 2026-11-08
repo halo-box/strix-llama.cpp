@@ -120,3 +120,4 @@ phase_D1V() { # AT-D1 value: OVL=15 vs OVL=11, pp4096 at d32768 / d131072, ub409
 }
 for ph in "$@"; do echo "PHASE $ph start $(date +%T)"; phase_$ph; echo "PHASE $ph done $(date +%T)"; done
 echo PERF_DONE $(date +%T)
+\n# W13+: the LLAMA_QSA_* / LAB_OVL_PRINT hooks this script sets live in patches/06-w13-measurement-hooks.patch; on a W13+ head\n# point the new-arm binaries at a tree built by harness/w13/hooks_tree.sh\n

@@ -15,7 +15,7 @@ phase_D1() {
   for t in f16 q8_0; do for arm in new w0; do
     [ $arm = new ] && B=$N || B=$Z
     flock ~/gpu.lock env LAB_OVL_PRINT=1 $B/llama-bench -m $M -ngl 99 -fa 1 -lzm on-direct -ctk $t -ctv $t -b 4096 -ub 4096 -p 4096 -n 0 -d 4096,32768 -r 1 -o json > $OUT/d1_${t}_$arm.json 2> $OUT/d1_${t}_$arm.err
-    echo "d1 $t $arm rc=$? kind4 per graph: $(grep LAB_OVL $OUT/d1_${t}_$arm.err | sed 's/.*kind4=//' | sort | uniq -c | tr '\n' ';')"
+    echo "d1 $t $arm rc=$? kind4 per graph: $(grep LAB_OVL $OUT/d1_${t}_$arm.err | sed 's/.*kind4=//' | sort | uniq -c | tr '\n# W13+: the LLAMA_QSA_* / LAB_OVL_PRINT hooks this script sets live in patches/06-w13-measurement-hooks.patch; on a W13+ head\n# point the new-arm binaries at a tree built by harness/w13/hooks_tree.sh\n' ';')"
   done; done
   # U16: 20 chunks, HIP graphs on, OVL=15 vs OVL=11, logits hashes
   for t in f16 q8_0; do for ov in 15 11; do

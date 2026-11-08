@@ -30,7 +30,7 @@ phase_VC() {
     for u in 4096 512; do
       log=$OUT/logs/c_${t}_u$u.log
       flock ~/gpu.lock env LLAMA_QSA_TRACE=1 timeout 1800 $NVK/llama-perplexity -m $M -f $WIKI -c 8192 -b 4096 -ub $u --chunks 1 $COMMON -ctk $k -ctv $v > $log 2>&1
-      echo "VC $t u$u rc=$? $(grep -h 'Final estimate' $log | tail -1 | sed 's/.*Final/Final/') masked=$(grep -c 'producer=masked' $log) cpu=$(grep -c 'QSA_CENSUS cpu:' $log) guard=[$(grep LLAMA_QSA_GUARD $log | tail -1 | cut -d' ' -f3-)] sa=[$(grep QSA_CENSUS $log | grep -E 'sa_' | cut -d' ' -f2- | tr '\n' ';' | cut -c1-150)]"
+      echo "VC $t u$u rc=$? $(grep -h 'Final estimate' $log | tail -1 | sed 's/.*Final/Final/') masked=$(grep -c 'producer=masked' $log) cpu=$(grep -c 'QSA_CENSUS cpu:' $log) guard=[$(grep LLAMA_QSA_GUARD $log | tail -1 | cut -d' ' -f3-)] sa=[$(grep QSA_CENSUS $log | grep -E 'sa_' | cut -d' ' -f2- | tr '\n# W13+: the LLAMA_QSA_* / LAB_OVL_PRINT hooks this script sets live in patches/06-w13-measurement-hooks.patch; on a W13+ head\n# point the new-arm binaries at a tree built by harness/w13/hooks_tree.sh\n' ';' | cut -c1-150)]"
     done
   done
 }
