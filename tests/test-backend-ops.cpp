@@ -14158,16 +14158,17 @@ static const char * sa_gate_name(int v) {
 // fusion (ggml-cuda.cu: SPARSE_ATTN -> [views] -> CONT(gate) -> SIGMOID -> MUL, the EPI = gated instance) is reached
 // through the backend's own matcher. q and the gate are interleaved per (token, head) in one tensor, as qwen4exp's
 // Qcur_full ([q | gate] per head), so the gate is a strided view. Engagement: the census must count exactly one gated
-// attend launch and no plain one (SA_GATE_REJECT: no gated launch and one plain one). Rotation (rot 64 / 256) lands
-// with the in-op rotation (W10).
+// attend launch and no plain one (SA_GATE_REJECT: no gated launch and one plain one). With rot_q / rot_o != 0 (W10) the
+// rotations run inside the op, so the same matcher fuses the gate into the rotated epilogue (the qwen4exp graph of a
+// quantized cache).
 struct test_sparse_attn_gated : public test_sparse_attn {
     const int variant;
     ggml_tensor * mul = nullptr, * mm = nullptr;
     int64_t mm_elems = 0;
 
     test_sparse_attn_gated(ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv, int64_t n_sel, int gqa,
-                           int n_stream, int variant, int kv_layout = 1)
-        : test_sparse_attn(type_k, type_v, n_q, n_kv, n_sel, 4, SA_ROWS_MIX, gqa, n_stream, 0, 0, kv_layout), variant(variant) {}
+                           int n_stream, int variant, int kv_layout = 1, int rot_q = 0, int rot_o = 0)
+        : test_sparse_attn(type_k, type_v, n_q, n_kv, n_sel, 4, SA_ROWS_MIX, gqa, n_stream, rot_q, rot_o, kv_layout), variant(variant) {}
 
     std::string vars() override {
         return test_sparse_attn::vars() + ",gated=" + sa_gate_name(variant);
@@ -14510,6 +14511,37 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
     for (auto r : std::vector<std::pair<int, int>>{{64, 64}, {256, 256}, {64, 0}, {0, 256}, {128, 64}}) {
         for (ggml_type t : {F16, Q8, Q4, BF16}) test_cases.emplace_back(new test_sparse_attn(t, t, 65, 4096, 2051, 1, SA_ROWS_MIX, 12, 1, r.first, r.second));
     }
+    // the in-op rotations on every HIP kernel family (W10): G4 with packed V (n_kv 4096 < 64 * 129) and direct V
+    // (16384), G1 with one split (n_sel 17) and with the split merge (the block above, n_sel 2051 -> 5 splits), in the
+    // qwen4exp pair (256, 64) and the other two orders; GQA 4 / 8, two streams, mixed pairs, the S_generic tier
+    for (auto r : std::vector<std::pair<int, int>>{{256, 64}, {64, 256}, {128, 128}}) {
+        for (ggml_type t : S_fast) {
+            for (int64_t nk : {4096, 16384}) test_cases.emplace_back(new test_sparse_attn(t, t, 129, nk, 257, 4, SA_ROWS_MIX, 12, 1, r.first, r.second));
+            test_cases.emplace_back(new test_sparse_attn(t, t, 1, 16384, 17, 1, SA_ROWS_MIX, 12, 1, r.first, r.second));
+        }
+    }
+    for (int gqa : {4, 8}) {
+        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(Q8, Q8, 66, 4096, 2051, G, SA_ROWS_MIX, gqa, 1, 256, 64));
+    }
+    for (int G : {1, 4}) {
+        test_cases.emplace_back(new test_sparse_attn(Q4, Q8, 65, 4096, 2051, G, SA_ROWS_MIX, 12, 2, 256, 64, 0));
+        test_cases.emplace_back(new test_sparse_attn(Q8, F16, 65, 4096, 2051, G, SA_ROWS_MIX, 12, 1, 256, 0));
+        test_cases.emplace_back(new test_sparse_attn(F16, Q4, 65, 4096, 2051, G, SA_ROWS_MIX, 12, 1, 0, 64));
+        for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL}) {
+            test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 2051, G, SA_ROWS_MIX, 12, 1, 256, 64));
+        }
+    }
+    // rotated empty rows (H_o of 0 is 0), poison with rotations, and the overflow cases with H_q (rot_o = 0: an inf output
+    // element through H_o would turn its whole block into NaN): the G4 fixup recomputes those blocks with the rotation
+    for (ggml_type t : S_fast) {
+        for (int G : {1, 4}) {
+            test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, G, SA_ROWS_EMPTY, 12, 1, 256, 64));
+            test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, G, SA_ROWS_POISON, 12, 1, 256, 64, 1, 0, SA_POISON));
+        }
+    }
+    for (ggml_type tv : {BF16, Q8, F16}) {
+        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(F16, tv, 9, 4096, 257, G, SA_ROWS_SINGLE, 12, 1, 256, 0, 1, 0, SA_OVERFLOW));
+    }
     // 2 streams, both K/V layouts
     for (int layout : {0, 1}) {
         for (ggml_type t : {F16, Q8}) {
@@ -14636,6 +14668,20 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
         test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 4096, 2051, 12, 2, SA_GATE_F32));
     }
     for (ggml_type t : {F16, Q4}) test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 4096, 257, 12, 1, SA_GATE_REJECT));
+    // the gate fused into the rotated epilogue (W10): every S_fast type x both V regimes x the qwen4exp pair (256, 64) and
+    // (64, 256), the 16-bit reader paths and 2 streams with rotations, and the rejection with rotations
+    for (ggml_type t : S_fast) {
+        for (auto r : std::vector<std::pair<int, int>>{{256, 64}, {64, 256}}) {
+            for (int64_t nk : {4096, 16384}) {
+                test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, nk, 257, 12, 1, SA_GATE_F32, 1, r.first, r.second));
+            }
+        }
+    }
+    for (int var : {SA_GATE_BF16, SA_GATE_BF16_ONLY, SA_GATE_F16_ONLY}) {
+        test_cases.emplace_back(new test_sparse_attn_gated(Q8, Q8, 129, 4096, 257, 12, 1, var, 1, 256, 64));
+    }
+    test_cases.emplace_back(new test_sparse_attn_gated(Q4, Q8, 129, 4096, 2051, 8, 2, SA_GATE_F32, 1, 256, 64));
+    test_cases.emplace_back(new test_sparse_attn_gated(Q8, Q8, 129, 4096, 257, 12, 1, SA_GATE_REJECT, 1, 256, 64));
 
     // ---- the generic tier (PLAN-v3 §13 W5): every pair of S with a member outside S_fast. The S x S list above runs them
     //      on G1 (n_q 9, n_sel 257); here: G4 in both V regimes, every generic census key, the n_q set, poison, overflow ----
