@@ -1,10 +1,13 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "fwht.cuh"
+#include "sparse-attn-fwht.cuh"
 
 // wide FWHT blocks use one row per thread block with this many threads
 #define GGML_CUDA_FWHT_BLOCK_NT 256
 
+// One row per warp: the transform is fwht_block (sparse-attn-fwht.cuh), which the in-op rotations of GGML_OP_SPARSE_ATTN
+// share, so the two are bitwise equal on the same f32 input (tests/test-sparse-attn-rot.cpp).
 template <int N, typename T>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
 __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale) {
@@ -26,35 +29,10 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
     ggml_cuda_pdl_sync();
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
-        reg[i] = ggml_cuda_cast<float>(src[i * warp_size + lane]) * scale;
+        reg[i] = ggml_cuda_cast<float>(src[i * warp_size + lane]);
     }
 
-#pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < el_w; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
-
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
-    }
-
-#pragma unroll
-    for (int h = warp_size; h < N; h *= 2) {
-        const int step = h / warp_size;
-#pragma unroll
-        for (int j = 0; j < el_w; j += 2 * step) {
-#pragma unroll
-            for (int k = 0; k < step; k++) {
-                const float x = reg[j + k];
-                const float y = reg[j + k + step];
-
-                reg[j + k]        = x + y;
-                reg[j + k + step] = x - y;
-            }
-        }
-    }
+    fwht_block<N, warp_size>(reg, lane, scale);
 
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
