@@ -510,5 +510,5 @@ private:
     int64_t strict_violations        = 0;
     int64_t strict_reallocs          = 0;
     std::vector<size_t> strict_seen;    // the largest size seen per backend past its reserve
-    int64_t qsa_decode_errors        = 0;  // graph-build check (PLAN-v3 §4.3)
+    int64_t qsa_ubatch_errors        = 0;  // graph-build check (PLAN-v3 §4.3)
 };

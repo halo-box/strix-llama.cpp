@@ -1234,7 +1234,7 @@ static ggml_tensor * qwen4exp_select_complete_blocks(ggml_context *ctx0, ggml_te
 // strips are joined pairwise along ne[1] (balanced concat tree)
 static void qwen4exp_append_strip(ggml_context * ctx, ggml_cgraph * graph,
         std::vector<ggml_tensor *> & chunks, ggml_tensor * value) {
-    // the joined selection stays lazy: its consumer (the attention mask or the maskless kernel) pulls it in, as the
+    // the joined selection stays lazy: its consumer (the sparse-attention plan) pulls it in, as the
     // community builder did, so the node order around the attention block is unchanged
     GGML_UNUSED(graph);
     chunks.push_back(value);
@@ -1306,7 +1306,6 @@ public:
         const bool scalar = blocks && params.hparams.n_swa == 0 && mctx->qsa_scalar_visibility(params.ubatch, ratio);
         res &= (tail_idxs != nullptr) == scalar;
         res &= compact == scalar;
-        res &= maskless == scalar;
         if (tail_idxs) { res &= tail_idxs->ne[1] == params.ubatch.n_tokens/n_stream; }
         const int64_t next_strip = qwen4exp_score_strip(params.ubatch.n_tokens/n_stream, n_stream, n_blocks,
                 params.hparams.indexer_n_head);
@@ -1328,8 +1327,7 @@ public:
 
     // complete-block selection (see qwen4exp_use_block_selection): the query's own partial block, -1 padded
     ggml_tensor * tail_idxs = nullptr;   // I32 [ratio-1, n_tokens/n_stream, n_stream]
-    bool compact  = false;               // I32 limits instead of the F32 per-block bias
-    bool maskless = false;               // attention drops the mask: the selected rows carry the visibility
+    bool compact  = false;               // I32 limits instead of the F32 per-block bias; the CB rows carry the visibility
     int64_t score_strip = 0;
     std::vector<int64_t> score_key_limits;   // per strip, empty = no bound
 
@@ -1442,7 +1440,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens/n_stream;
 
-    // maskless multi-seq: one block-start row per sequence, row index = seq id, bounded by n_seq_max so every
+    // compact multi-seq: one block-start row per sequence, row index = seq id, bounded by n_seq_max so every
     // runtime seq id lands in range. n_seq=1 (np1) reduces the compact layout to the original single-seq one.
     const int64_t n_seq = cparams.n_seq_max;
 
@@ -1481,7 +1479,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             const uint32_t U = mctx_hyb->qsa_noncompact_cap(cparams.n_ubatch);
             if ((uint32_t) n_tokens > U || !mctx_hyb->qsa_multi_seq()) {
                 const int why = mctx_hyb->qsa_compact_reason(ubatch, (uint32_t) r);
-                res->set_qsa_decode_error(format("QSA layer %d: a non-compact ubatch (%s) of %d tokens (n_tps %" PRId64 ", n_stream %" PRId64
+                res->set_qsa_ubatch_error(format("QSA layer %d: a non-compact ubatch (%s) of %d tokens (n_tps %" PRId64 ", n_stream %" PRId64
                         ", n_seqs %u) at n_kv %" PRId64 " %s; the reserve covers non-compact ubatches of at most U = %u tokens in "
                         "contexts serving several sequences (n_seq_max = %u, %s)", il, qsa_compact_reason_name(why), (int) n_tokens,
                         n_tps, n_stream, ubatch.n_seqs_unq, n_kv, ubatch.token ? "text" : "embd", U, cparams.n_seq_max,
@@ -1489,7 +1487,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             }
         }
         qsa->compact  = scalar;   // I32 limits: one stream, or split streams of one sequence each
-        qsa->maskless = scalar;
         qsa->score_strip = qwen4exp_score_strip(n_tps, n_stream, n_blocks, hparams.indexer_n_head);
         qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, n_blocks, qsa->score_strip, r,
                 hparams.indexer_top_k/r, qsa->compact && n_stream == 1);
@@ -1956,11 +1953,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         const int64_t r     = hparams.dsv4_compress_ratios[il];
         const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width = (int64_t) hparams.indexer_top_k + r - 1;
-        // LLAMA_QSA_DENSE_SHORTCUT=0 forces the selection path (validation)
-        static const bool shortcut = [] {
-            const char * env = getenv("LLAMA_QSA_DENSE_SHORTCUT");
-            return env == nullptr || atoi(env) != 0;
-        }();
         qsa_node.il       = il;
         qsa_node.k        = inp->mctx->get_k(ctx0, il);
         qsa_node.n_kv     = n_kv;
@@ -1970,7 +1962,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         qsa_node.shortcut = n_kv <= width;
         policy = build_qsa_policy(qsa_node.k, qsa_node.type_v, il);
         qsa_node.place = policy.place;
-        if (shortcut && n_kv <= width) {
+        if (n_kv <= width) {
             build_qsa_store_k(mctx_hyb, cur, il);
             if (!cache_only) {
                 // D4: a backend policy per (pair, n_q band). Without the proc: dense for f16 / f16 only
@@ -1990,7 +1982,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
             // the trim needs the compact selection (the TE rows read the full-batch KQ mask, PLAN-v3 §4.4) and one
             // stream; the input set of this ratio was made by an earlier layer
             const auto it_inp = qsa_inps.find((uint32_t) r);
-            if (q_first > 0 && tile_out_ids && mctx_hyb->get_n_stream() == 1 && it_inp != qsa_inps.end() && it_inp->second->maskless &&
+            if (q_first > 0 && tile_out_ids && mctx_hyb->get_n_stream() == 1 && it_inp != qsa_inps.end() && it_inp->second->compact &&
                     q_first % qwen4exp_query_strip(n_tokens, 1) == 0) {
                 auto tile = std::make_unique<llm_graph_input_qwen4exp_tile>(q_first, n_tokens, n_outputs, hparams.n_pos_per_embd());
                 tile->pos     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (n_tokens - q_first) * hparams.n_pos_per_embd());
@@ -2014,7 +2006,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                 const auto it_rows = qsa_inps.find((uint32_t) r);
                 GGML_ASSERT(it_rows != qsa_inps.end());
                 plan = build_qsa_plan(top_k, policy, n_kv, qsa_node.type_k, qsa_node.type_v, false, qsa_node.group, il);
-                qsa_node.producer = it_rows->second->maskless ? "cb" : "te";
+                qsa_node.producer = it_rows->second->compact ? "cb" : "te";
             }
         }
     }
