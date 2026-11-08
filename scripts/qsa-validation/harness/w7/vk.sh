@@ -1,5 +1,5 @@
 #!/bin/bash
-# AT-B (PLAN-v3 §16.5, W6/W7), on the switched graph. vk.sh PHASE...: VB (builds) VC (census) VQ (Q1-vk / AT-B6) VO (AT-B4 op level) VE (AT-B4 e2e) V1 (AT-B1) V5 (AT-B5)
+# AT-B (PLAN-v3 §16.5, W6/W7), on the switched graph. vk.sh PHASE...: VB (builds) VC (census) VQ (Q1-vk / AT-B6) VO (AT-B4 op level) VE (AT-B4 e2e) V1 (AT-B1, 8 processes per pair and arm) V1M (AT-B1 at its minimum size) V5 (AT-B5)
 . "$(dirname "$0")/env.sh"
 OUT=$W7/vk; mkdir -p $OUT/logs
 TXT=$WIKI,$HOME/dev/wt_lab/c10/corp/code.txt
@@ -21,7 +21,7 @@ bb() { # tag tree
 }
 phase_VB() {
   flock ~/gpu.lock cmake --build $T/build-vk -j 16 > $OUT/build_new.log 2>&1; echo "vk new build rc=$? warnings=$(grep -c 'warning:' $OUT/build_new.log)"
-  (cd $LAB && cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF > $OUT/lab_cfg.log 2>&1 && flock ~/gpu.lock cmake --build build-vk -j 16 --target llama-perplexity > $OUT/build_lab.log 2>&1; echo "vk lab build rc=$?")
+  (cd $LAB && cmake -B build-vk -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DCMAKE_CXX_FLAGS=-I$HOME/.local/spirv-headers/include -DSPIRV-Headers_DIR=$HOME/.local/spirv-headers/share/cmake/SPIRV-Headers > $OUT/lab_cfg.log 2>&1 && flock ~/gpu.lock cmake --build build-vk -j 16 --target llama-perplexity > $OUT/build_lab.log 2>&1; echo "vk lab build rc=$?")
   bb vk_new $T > $OUT/bb_new.log 2>&1; echo "bench vk new rc=$?"
   bb vk_w0 $HOME/dev/wt_lab/w0lab12 > $OUT/bb_w0.log 2>&1; echo "bench vk w0 rc=$?"
 }
@@ -90,6 +90,20 @@ phase_V1() {
       echo "$(date +%T) V1 ${t}_${i}_$a rc=$?"
     done
   done
+}
+phase_V1M() { # AT-B1 at the size its criterion sets: >= 4 W0 and >= 4 new f16 processes (f16 new / W0 >= 0.99), >= 4 new processes of every
+  # other S_fast pair (new_T / new f16 >= 0.95; W0 is not part of that ratio), one round-robin per process index so every arm is interleaved
+  local D=$OUT/at_b1; mkdir -p $D
+  for i in 0 1 2 3; do
+    for arm in w0:f16:f16 new:f16:f16 new:q8_0:q8_0 new:q4_0:q4_0 new:bf16:bf16 new:q8_0:f16 new:f16:q8_0; do
+      a=${arm%%:*}; p=${arm#*:}; k=$(pair_k $p); v=$(pair_v $p); t=$(pair_tag $p)
+      [ $a = w0 ] && B=$W7/bench/bin_vk_w0 || B=$W7/bench/bin_vk_new
+      [ -s $D/b1_${t}_${i}_$a.json ] && continue
+      flock ~/gpu.lock env C10_TEXT=$TXT $B/llama-bench -m $M -ngl 99 -fa 1 -lzm on-direct -ctk $k -ctv $v -b 4096 -ub 4096,512 -p 512,2048 -n 0 -d 4096,32768,131072 -r 5 -o json > $D/b1_${t}_${i}_$a.json 2> $D/b1_${t}_${i}_$a.err
+      echo "$(date +%T) V1M ${t}_${i}_$a rc=$?"
+    done
+  done
+  python3 $T/scripts/qsa-validation/harness/w7/perf_an.py $D B1 > $D/summary.md
 }
 phase_V5() {
   BIN=$T/build-vk/bin

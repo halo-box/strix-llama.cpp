@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """W7 perf verdicts (PLAN-v3 §16): the §16 statistic (per process the mean of reps 1..n; ratio CI from the hierarchical bootstrap, 4000 draws, seed 1), keyed by (depth, ub, pp, tg) so
 cross-type ratios work. A sample below 0.9 x its cell median is an eviction sample (dropped, counted) when its process's C7 sampler saw KFD evictions after the first 60 s; otherwise it is a P6 (a) failure.
-usage: perf_an.py DIR PHASE [PHASE...]   phases: P1 P2 P3 P4 P5 P6 ND NDB NPIN"""
+usage: perf_an.py DIR PHASE [PHASE...]   phases: P1 P2 P3 P4 P5 P6 ND NDB NPIN D2B D1V B1"""
 import glob, json, os, random, re, sys, collections
 DRAWS, SEED = 4000, 1
 d = sys.argv[1]
@@ -110,6 +110,12 @@ for ph in sys.argv[2:]:
         for t in ('f16', 'q8_0'):
             # pass: the CI contains 1 (RERUN in this table) or lies above it (PASS)
             rr(f'AT-D1 value {t}: (W7 OVL15/OVL11) / (W0 OVL15/OVL11)', load(f'd1v_*_{t}_*_w0_ovl15'), load(f'd1v_*_{t}_*_new_ovl15'), load(f'd1v_*_{t}_*_w0_ovl11'), load(f'd1v_*_{t}_*_new_ovl11'), 1.0)
+    elif ph == 'B1':
+        # AT-B1 (P8): f16 new / W0 >= 0.99; every other S_fast pair new_T / new f16 >= 0.95 in every cell
+        Nf = load('b1_f16_f16_*_new')
+        ratio('AT-B1 Vulkan f16, new vs W0', load('b1_f16_f16_*_w0'), Nf, .99)
+        for t in 'q8_0_q8_0 q4_0_q4_0 bf16_bf16 q8_0_f16 f16_q8_0'.split():
+            ratio(f'AT-B1 Vulkan new {t} / new f16', Nf, load(f'b1_{t}_*_new'), .95)
     elif ph == 'NPIN':
         ratio('AT-W7PERF (d) shortcut pin on / off', load('npin_*_off'), load('npin_*_on'), .98)
 print(f'\n## totals {dict(RES)}; eviction samples dropped {sum(EV.values())} in {len(EV)} processes; processes with evictions {sum(1 for v in EVMS.values() if v > 0)}/{len(EVMS)}, mean evicted_ms {sum(EVMS.values())/max(1,len(EVMS)):.0f}; P6 (a) samples below 0.9 x cell median: {len(P6A)} {P6A[:6]}')
