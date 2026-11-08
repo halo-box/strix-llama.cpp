@@ -987,6 +987,11 @@ struct llama_model_base : public llama_model {
 
 const char * llm_type_name(llm_type type);
 
+// PLAN-v3 §9 (D14): the indexer key cache type of a sparse-attention memory (llama_memory_hybrid_idx).
+// qwen4exp: type_k_idx when given, otherwise (GGML_TYPE_COUNT, auto) q8_0 for a sub-8-bit type_k
+// (q4_0, q4_1, q5_0, q5_1, iq4_nl) and type_k for every other type. Every other architecture: type_k.
+ggml_type llama_model_type_k_idx(llm_arch arch, ggml_type type_k, ggml_type type_k_idx);
+
 // convenience macro for loading local variables for load_tensors() in llama_model_base
 // note: cast to int64_t since we will use these for the tensor dimensions
 #define LLAMA_LOAD_LOCALS \

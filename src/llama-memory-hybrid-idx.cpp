@@ -71,6 +71,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                  uint32_t   n_rs_seq,
                      bool   offload,
                      bool   unified,
+                            /* indexer key cache type */
+                ggml_type   type_k_idx,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
@@ -82,6 +84,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
+    type_k_idx(type_k_idx),
+    arch(model.arch),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
@@ -97,10 +101,11 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
         hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells, type = %s\n", __func__, kv_size, ggml_type_name(type_k_idx));
 
+        // only K is cached (MLA layout above), so type_v reaches no tensor
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, type_k_idx, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
@@ -476,6 +481,8 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     // two find_slot calls agree only while both caches see the same occupancy, which a restore cannot promise
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
+    bool reading_idx = false;
+
     try {
         // the indexer cache has the SWA type of the attention cache, so both read the same partial state
         get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
@@ -484,20 +491,46 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if (mem_idx) {
+            reading_idx = true;
             mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+            reading_idx = false;
             // a restore that rewrites cells does it behind the pool layout's back
             if (!sinfos_attn.empty()) {
                 mem_idx_stale_set(seq_id, 0);
             }
         }
 
-    } catch (...) {
+    } catch (const std::exception & err) {
         // a half-restored context is the one state the indexer cannot fix by itself: attention holds new cells, the indexer old ones
         // drop what was being restored from all of them, which is a state they do agree on.
         state_drop(seq_id);
 
+        if (!reading_idx) {
+            throw;
+        }
+        // PLAN-v3 §9 (P2-26): the stream is unchanged, the indexer section is an ordinary llama_kv_cache state whose per-layer
+        // type check rejects a file saved with another indexer type (a qwen4exp session saved with a sub-8-bit -ctk before
+        // --cache-type-k-idx auto mapped its indexer to q8_0); say so instead of the bare "failed to restore kv cache"
+        throw std::runtime_error(state_read_idx_error(err.what()));
+    } catch (...) {
+        state_drop(seq_id);
+
         throw;
     }
+}
+
+std::string llama_memory_hybrid_idx::state_read_idx_error(const char * what) const {
+    const auto ids = mem_idx->get_layer_ids();
+    const int il0 = ids.empty() ? -1 : (int) ids.front();
+    const int32_t t_saved = mem_idx->state_read_k_type_mismatch();
+    if (t_saved >= 0 && t_saved < GGML_TYPE_COUNT && ggml_get_type_traits((ggml_type) t_saved)->blck_size != 0) {
+        return format("failed to restore the sparse-attention indexer cache (first QSA layer %d): the session was saved with indexer type %s, "
+                "this context uses %s; re-save the session%s",
+                il0, ggml_type_name((ggml_type) t_saved), ggml_type_name(type_k_idx),
+                arch == LLM_ARCH_QWEN4EXP ? format(", or load it with --cache-type-k-idx %s", ggml_type_name((ggml_type) t_saved)).c_str() : "");
+    }
+    return format("failed to restore the sparse-attention indexer cache (first QSA layer %d, indexer type %s): %s; re-save the session",
+            il0, ggml_type_name(type_k_idx), what);
 }
 
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {

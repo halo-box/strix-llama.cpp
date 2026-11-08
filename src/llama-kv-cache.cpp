@@ -2377,6 +2377,8 @@ const slot_info_vec_t *   sinfos_in) {
         sinfos_out->assign(n_stream, slot_info{});
     }
 
+    k_type_mismatch_ref = -1;
+
     if (sinfos_in && sinfos_in->size() != n_stream) {
         throw std::runtime_error("failed to restore kv cache: mirrored slot layout has the wrong stream count");
     }
@@ -2811,6 +2813,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         const int32_t k_type_i = (int32_t) k->type;
         if (k_type_i != k_type_i_ref) {
             LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
+            k_type_mismatch_ref = k_type_i_ref;
             return false;
         }
 

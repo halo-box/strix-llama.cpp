@@ -168,6 +168,9 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    // the saved key type of the last state read that failed the per-layer key type check, -1 when it did not
+    int32_t state_read_k_type_mismatch() const { return k_type_mismatch_ref; }
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     // The stream holding seq_id's cells.
@@ -296,6 +299,9 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    // see state_read_k_type_mismatch()
+    int32_t k_type_mismatch_ref = -1;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;

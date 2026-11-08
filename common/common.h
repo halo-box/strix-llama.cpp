@@ -663,6 +663,7 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k_idx = GGML_TYPE_COUNT; // qwen4exp indexer key cache data type, GGML_TYPE_COUNT = auto
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 

@@ -31,7 +31,7 @@ struct qsa_fixture {
         model->hparams.rope_type = LLAMA_ROPE_TYPE_IMROPE;   // n_pos_per_embd = 4, as every qwen4exp model
         mem.reset(new llama_memory_hybrid_idx(*model, GGML_TYPE_F16, GGML_TYPE_F16, false, kv_size, 1, 0, LLAMA_SWA_TYPE_NONE,
                 GGML_TYPE_F32, GGML_TYPE_F32, std::max<uint32_t>(n_seq_max, 1), n_seq_max, n_rs_seq, false, unified,
-                nullptr, nullptr, [](int32_t) { return false; }));
+                GGML_TYPE_F16, nullptr, nullptr, [](int32_t) { return false; }));
         // the model has no layer: the QSA layers' ratio and top-k of Qwen3.8 Flash Next (ratio 4, top-k 2048)
         mem->qsa_resplit_configure({ 4 }, 2048, strips);
     }
