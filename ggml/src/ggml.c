@@ -5759,6 +5759,9 @@ void ggml_flash_attn_ext_add_top_k(
         struct ggml_tensor * top_k,
                  int64_t     n_kv_raw) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    // the kq_mask carries the selection (see ggml.h): backends may ignore top_k, so an op without a mask would attend to
+    // every key. QSA's maskless selection is GGML_OP_SPARSE_ATTN_PLAN + GGML_OP_SPARSE_ATTN
+    GGML_ASSERT(a->src[3] != NULL);
     GGML_ASSERT(a->src[5] == NULL);
     GGML_ASSERT(top_k->type == GGML_TYPE_I32);
     GGML_ASSERT(top_k->ne[1] == a->src[0]->ne[1]);
