@@ -4,10 +4,6 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
-#if defined(GGML_USE_HIP)
-#include "qsa-prefill.cuh"
-#include "qsa-decode.cuh"
-#endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -1083,24 +1079,10 @@ static bool ggml_cuda_fa7_supported(const ggml_backend_cuda_context & ctx, const
 // The gated attention output in the FA epilogue. Same expression per element as cont_sigmoid_mul_v4, so
 // bit-identical (wikitext PPL unchanged at 2048 and 4096 context on gfx1151).
 
-bool ggml_cuda_qsa_gate_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * fa) {
-#if defined(GGML_USE_HIP)
-    // the fused op must reach the prefill kernel (decode is tried first) and the gate spans one stream
-    return fa->op == GGML_OP_FLASH_ATTN_EXT && fa->src[0]->ne[3] == 1 &&
-        !ggml_cuda_flash_attn_ext_qsa_decode_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa) &&
-        ggml_cuda_flash_attn_ext_qsa_prefill_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa);
-#else
-    GGML_UNUSED(ctx); GGML_UNUSED(fa);
-    return false;
-#endif
-}
-
 bool ggml_cuda_fa7_gate_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * fa) {
     if (fa->op != GGML_OP_FLASH_ATTN_EXT || fa->src[0]->ne[3] != 1) return false;
 #if defined(GGML_USE_HIP)
-    return ggml_cuda_fa7_supported(ctx, fa) &&
-        !ggml_cuda_flash_attn_ext_qsa_decode_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa) &&
-        !ggml_cuda_flash_attn_ext_qsa_prefill_supported(const_cast<ggml_backend_cuda_context &>(ctx), fa);
+    return ggml_cuda_fa7_supported(ctx, fa);
 #else
     return false;
 #endif
@@ -1151,14 +1133,6 @@ static void ggml_cuda_fa7(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 #if defined(GGML_USE_HIP)
-    if (ggml_cuda_flash_attn_ext_qsa_decode_supported(ctx, dst)) {
-        ggml_cuda_flash_attn_ext_qsa_decode(ctx, dst);
-        return;
-    }
-    if (ggml_cuda_flash_attn_ext_qsa_prefill_supported(ctx, dst)) {
-        ggml_cuda_flash_attn_ext_qsa_prefill(ctx, dst);
-        return;
-    }
     {
         const bool fa7_ok = ggml_cuda_fa7_supported(ctx, dst);
         if (fa7_ok) {
@@ -1167,19 +1141,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
     }
 #endif
-    // a selected-key op without a mask carries its visibility only in src[5], which the dense kernels ignore:
-    // reaching them would attend to the whole padded cache
-    if (dst->src[5] && !dst->src[3]) {
-        const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * ids = dst->src[5];
-        GGML_ABORT("flash_attn_ext: maskless selected-key attention was not taken by a QSA kernel (%s): q [%lld,%lld,%lld,%lld] %s nb %zu/%zu, "
-                   "k [%lld,%lld,%lld,%lld] %s nb %zu/%zu/%zu, v %s nb %zu/%zu, ids [%lld,%lld,%lld,%lld] nb %zu, src6 %d src7 %d p4 %d dst contiguous %d",
-                   dst->name, (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3], ggml_type_name(q->type), q->nb[1], q->nb[2],
-                   (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3], ggml_type_name(k->type), k->nb[0], k->nb[1], k->nb[2],
-                   ggml_type_name(v->type), v->nb[1], v->nb[2], (long long) ids->ne[0], (long long) ids->ne[1], (long long) ids->ne[2], (long long) ids->ne[3], ids->nb[1],
-                   dst->src[6] != nullptr, dst->src[7] != nullptr, ggml_get_op_params_i32(dst, 4), ggml_is_contiguous(dst));
-    }
-
-
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -1196,15 +1157,5 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    // a maskless selected-key op (visibility only in src[5]) runs on the QSA kernels alone: an op neither takes must
-    // go to another backend instead of the abort in ggml_cuda_flash_attn_ext
-    if (dst->src[5] && !dst->src[3]) {
-#if defined(GGML_USE_HIP)
-        return ggml_cuda_flash_attn_ext_qsa_decode_supported_dev(device, dst) ||
-               ggml_cuda_flash_attn_ext_qsa_prefill_supported_dev(device, dst);
-#else
-        return false;
-#endif
-    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

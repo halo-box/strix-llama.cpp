@@ -2,7 +2,7 @@
 
 // sa_attend_g1<KT, VT, GQA>: GGML_OP_SPARSE_ATTN with a G = 1 plan on RDNA3 WMMA (PLAN-v3 §6.2, D9, D10).
 //
-// The body is PR #219's qsa_decode_wmma_partial (qsa-decode-wmma.cuh of 94e086847), as C18's decode harness took it over
+// The body is PR #219's decode WMMA partial kernel (qsa-decode-wmma.cuh of 94e086847), as C18's decode harness took it over
 // line by line (c18_dec.cu c18_dec_kernel: Q prologue, WMMA order, online softmax in wave 0, 2 barriers per 16-cell chunk
 // plus the PR's trailing one, the partial epilogue), with:
 //   - the loaders of C18 decision 2 (MEASUREMENTS.md C18 "Decode kernel"): V LDS-staged and transposed through a

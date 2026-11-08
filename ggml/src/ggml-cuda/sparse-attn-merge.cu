@@ -4,7 +4,7 @@
 // (sa_attend_g1 with splits > 1: [splits][258] = 256 unnormalised accumulators, the split's running max m_z and its
 // normaliser l_z) are combined in split order, so the result is a pure function of the partials:
 //   M = max_z m_z;  f_z = exp(m_z - M) for the splits with l_z > 0;  out = sum_z f_z acc_z / sum_z f_z l_z  (0 if empty).
-// This is PR #219's qsa_decode_merge arithmetic (qsa-decode.cu:65-79: f32, expf, the same order), with the splits whose
+// This is PR #219's decode merge arithmetic (the merge kernel of qsa-decode.cu:65-79 at 94e086847: f32, expf, the same order), with the splits whose
 // normaliser is 0 skipped by a select instead of multiplied by a 0 factor (their accumulators are 0 anyway: an empty
 // split writes zeros). The rot_o epilogue of PLAN-v3 §6.2 (W10): with rot_o != 0 the merged row is staged in shared
 // memory and H_o is applied over its consecutive blocks of rot_o dims (sa_fwht_smem of sparse-attn-fwht.cuh: the

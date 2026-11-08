@@ -6832,10 +6832,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif // defined(GGML_USE_HIP)
 
-    // FA gate fusion: FLASH_ATTN_EXT (fa7 or qsa prefill) -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .): the
-    // gate in the attention epilogue; the FA output itself is never stored
-    const bool fa_gate_qsa = node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_qsa_gate_ok(*cuda_ctx, node);
-    if (node->op == GGML_OP_FLASH_ATTN_EXT && (fa_gate_qsa || ggml_cuda_fa7_gate_ok(*cuda_ctx, node)) && ggml_is_contiguous(node) &&
+    // FA gate fusion: FLASH_ATTN_EXT (fa7) -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .): the gate in the
+    // attention epilogue; the FA output itself is never stored. QSA layers take the SPARSE_ATTN gate fusion above
+    if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_fa7_gate_ok(*cuda_ctx, node) && ggml_is_contiguous(node) &&
             (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
         int j = i + 1;
         while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) ++j;
@@ -6847,9 +6846,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 unary->src[0] == cont && mul->op == GGML_OP_MUL && (mul->src[0] == unary || mul->src[1] == unary) && other &&
                 (other == node || other->view_src == node) && ggml_is_contiguous(other) && ggml_nelements(other) == ggml_nelements(node) &&
                 gate->type == GGML_TYPE_F32 && gate->nb[0] == sizeof(float) && gate->ne[0] == node->ne[0] && gate->ne[1] == node->ne[1] &&
-                // the gated epilogues read the gate in float4: 16-byte rows and base, and QSA takes contiguous heads
+                // the gated epilogue reads the gate in float4: 16-byte rows and base
                 ((uintptr_t) gate->data % 16) == 0 && gate->nb[1] % 16 == 0 && gate->nb[2] % 16 == 0 &&
-                (!fa_gate_qsa || gate->nb[2] == gate->nb[1] * gate->ne[1]) &&
                 gate->ne[2] == node->ne[2] && gate->ne[3] == 1 && ggml_are_same_shape(unary, cont) && ggml_is_contiguous(mul) &&
                 mul->type == GGML_TYPE_F32 && ggml_nelements(mul) == ggml_nelements(node) &&
                 ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { j + 2 });
@@ -6872,7 +6870,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 auto overlap = [](const void * a, size_t na, const void * b, size_t nb) {
                     const uintptr_t x = (uintptr_t) a, y = (uintptr_t) b; return x < y + nb && y < x + na; };
                 const ggml_tensor * gs = gate->view_src ? gate->view_src : gate;
-                for (const ggml_tensor * r : std::initializer_list<const ggml_tensor *>{ node->src[0], node->src[1], node->src[2], node->src[3], node->src[5], gs }) {
+                for (const ggml_tensor * r : std::initializer_list<const ggml_tensor *>{ node->src[0], node->src[1], node->src[2], node->src[3], gs }) {
                     if (!r) continue;
                     const ggml_tensor * rr = r->view_src ? r->view_src : r;
                     if (store_f32 && overlap(mul->data, ggml_nbytes(mul), rr->data, ggml_nbytes(rr))) ok = false;
@@ -6880,14 +6878,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
             }
             if (ok) {
-#if defined(GGML_USE_HIP)
-                if (fa_gate_qsa) {
-                    ggml_cuda_flash_attn_ext_qsa_prefill_gated(*cuda_ctx, node, gate, store_f32 ? (float *) mul->data : nullptr, dst16, f16);
-                } else
-#endif
-                {
-                    ggml_cuda_fa7_gated(*cuda_ctx, node, gate, store_f32 ? (float *) mul->data : nullptr, dst16, f16);
-                }
+                ggml_cuda_fa7_gated(*cuda_ctx, node, gate, store_f32 ? (float *) mul->data : nullptr, dst16, f16);
                 return j + 2 - i;
             }
             ggml_cuda_mmb_cache_unproduce(*cuda_ctx, dst16);   // not fused: the gated output is computed (and copied) later

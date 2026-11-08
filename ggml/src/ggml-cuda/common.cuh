@@ -104,10 +104,6 @@
 #define GGML_CUDA_CC_IS_CDNA3(cc)   (GGML_CUDA_CC_IS_CDNA(cc) && cc >= GGML_CUDA_CC_CDNA3 && cc < GGML_CUDA_CC_CDNA4)
 #define GGML_CUDA_CC_IS_CDNA4(cc)   (GGML_CUDA_CC_IS_CDNA(cc) && cc >= GGML_CUDA_CC_CDNA4 && cc < GGML_CUDA_CC_RDNA1)
 
-// max keys of the QSA selected-key kernels: the 1M context of Qwen3.8 Flash Next with YaRN x4, not an id-space limit
-// QSA_MASKLESS_MAX_KV in qwen4exp.cpp must match, so a deeper n_kv takes the masked route instead of a refused op
-#define GGML_QSA_MAX_KEYS 1048576
-
 // Moore Threads
 #define MUSART_HMASK 40300 // MUSA rc4.3, min. ver. for half2 -> uint mask comparisons
 
