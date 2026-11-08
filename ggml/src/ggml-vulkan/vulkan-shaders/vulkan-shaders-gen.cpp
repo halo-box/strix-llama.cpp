@@ -992,11 +992,6 @@ void process_shaders() {
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
 #endif
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
-    string_to_spv("flash_attn_sel_f16", "flash_attn_sel.comp", {});
-    string_to_spv("flash_attn_sel_prep", "flash_attn_sel_prep.comp", {});
-    for (const std::string t : {"f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"}) {
-        string_to_spv("flash_attn_sel_gather_" + t, "flash_attn_sel_gather.comp", {{"DATA_A_" + to_uppercase(t), "1"}});
-    }
     // GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN (PLAN-v3 §6.3). K/V of any type through spec constants; the plan, the portable tier
     // and the reduce use no extension.
     {
@@ -1010,9 +1005,6 @@ void process_shaders() {
         string_to_spv("sparse_attn_cm_f16", "sparse_attn_cm.comp", sa_dict);
 #endif
     }
-#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    string_to_spv("flash_attn_sel_cm_f16", "flash_attn_sel_cm.comp", {});
-#endif
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("flash_attn_top_k_cm_f16", "flash_attn_top_k_cm.comp", {});
 #endif

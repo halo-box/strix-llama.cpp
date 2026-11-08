@@ -12,7 +12,7 @@
 #include "types.glsl"
 #include "ggml_type_ids.glsl"
 
-// GGML_OP_SPARSE_ATTN, RDNA3 + RADV coopmat kernel (PLAN-v3 §6.3), derived from flash_attn_sel_cm.comp: one 64-lane
+// GGML_OP_SPARSE_ATTN, RDNA3 + RADV coopmat kernel (PLAN-v3 §6.3), derived from the coopmat selected-key FA shader of master ea5285ddf (deleted in W13): one 64-lane
 // subgroup per (query, K/V head, stream, split), register-built WMMA fragments, the same accumulator layout and the same
 // online softmax. What differs:
 //   - the cells come from the G = 1 plan: one step = 4 plan entries = 16 cells of 4 quads, in the plan's ascending quad

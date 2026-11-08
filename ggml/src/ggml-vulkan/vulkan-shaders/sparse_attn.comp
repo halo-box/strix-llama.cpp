@@ -10,7 +10,7 @@
 #include "types.glsl"
 #include "ggml_type_ids.glsl"
 
-// GGML_OP_SPARSE_ATTN, scalar 64-lane tier (PLAN-v3 §6.3), derived from flash_attn_sel.comp: 64-lane devices that are not
+// GGML_OP_SPARSE_ATTN, scalar 64-lane tier (PLAN-v3 §6.3), derived from the scalar selected-key FA shader of master ea5285ddf (deleted in W13): 64-lane devices that are not
 // RADV RDNA3 and pass the sel gate (subgroup size 64, shuffle, arithmetic, fp16, 64 GQA invocations, 46,720 B shared at
 // GQA 12). One workgroup per (query, K/V head, stream, split), one subgroup per query head of that K/V head, so each K/V
 // row is read once per query. Cells go in blocks of BK = 8 plan entries: two lanes compute one key's dot product (half
