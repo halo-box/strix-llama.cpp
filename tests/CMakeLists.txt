@@ -171,6 +171,8 @@ llama_build_and_test(test-qsa-fast.cpp)
 llama_build_and_test(test-qsa-recover.cpp)
 # the all-visible rows of the QSA shortcut (PLAN-v3 §14.1), on every backend of the build
 llama_build_and_test(test-qsa-allvis-rows.cpp)
+# the TE rows of a non-compact QSA ubatch against PR219's masked route on the R1-CB oracle layouts (PLAN-v3 W8), on every backend of the build
+llama_build_and_test(test-qsa-te-rows.cpp)
 llama_build_and_test(test-ple-disk.cpp)
 llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
 # llama_context state tests: KV and recurrent state save, load, copy, rollback

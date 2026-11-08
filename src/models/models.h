@@ -2619,14 +2619,13 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor ** tile_out_ids = nullptr,
                            bool   cache_only = false);
 
-        // self-attention restricted to the cells that top_k names; with plan, on GGML_OP_SPARSE_ATTN pinned to backend
-        // (*attn_node gets the node), without it on the masked route
+        // self-attention restricted to the cells that top_k names, on GGML_OP_SPARSE_ATTN pinned to backend (*attn_node
+        // gets the node); plan is the SPARSE_ATTN_PLAN of top_k
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * top_k,
                     ggml_tensor * plan,
                  ggml_backend_t   backend,
                           float   kq_scale,

@@ -1,4 +1,5 @@
 #include "models.h"
+#include "qwen4exp-te.h"
 #include "../prefix.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -1102,7 +1103,8 @@ static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t 
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
 // selected rows then carry the visibility themselves, so attention runs without a mask, on GGML_OP_SPARSE_ATTN, for any
 // K / V type, on any backend and whatever -fa or -nkvo say (PLAN-v3 D5, D21; the placement is pinned, build_layer_attn).
-// The token rule moves with the single-sequence image predicate (W9); until then image ubatches take the masked route.
+// The token rule moves with the single-sequence image predicate (W9); until then image ubatches take the TE rows of a
+// non-compact ubatch (PLAN-v3 §4.1 row 4, qwen4exp-te.h).
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
     return blk_bias && cparams.causal_attn && ratio>1 && hparams.indexer_top_k%ratio==0 &&
@@ -1481,10 +1483,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
-        // complete-block selection lists cells with -1 sentinels (invisible blocks, empty tail slots) that only the
-        // maskless kernel understands; when the visibility is not scalar (2-D image positions in the cache, a block
-        // split over sequence sets) the attention takes the masked path, whose set_rows would write row -1, so the
-        // block-expanded top-k with the per-block bias is used there instead
+        // complete-block selection lists cells with -1 sentinels (invisible blocks, empty tail slots); when the
+        // visibility is not scalar (2-D image positions in the cache, a block split over sequence sets) the
+        // block-expanded top-k with the per-block bias and the KQ mask is used instead (the TE rows, qwen4exp-te.h)
         if (scalar) {
             GGML_ASSERT(hparams.indexer_top_k % r == 0);
             qsa->tail_idxs = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r-1, n_tps, n_stream);
@@ -1670,33 +1671,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             continue;
         }
 
-        // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
-        ggml_tensor * expanded = ggml_get_rows(ctx0,
-                ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
-        expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
-
+        // non-compact (PLAN-v3 §4.1 row 4): PR219's TE set, top_k(expanded, width), with the cells the visibility hides
+        // set to -1 (qwen4exp-te.h). cell_blk indexes every block, so the scorer is never bounded here
+        // (qwen4exp_score_key_limits returns no bound for a non-compact ubatch)
+        GGML_ASSERT(score_blocks == n_blocks);
+        ggml_tensor * add = bias;
         if (blk_bias) {
             // flash attention keeps the mask in f16; the scores are f32
             ggml_tensor * mask = query_mask->type == GGML_TYPE_F32 ? query_mask : ggml_cast(ctx0, query_mask, GGML_TYPE_F32);
-            expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, n_query, n_stream));
-        } else {
-            expanded = ggml_add(ctx0, expanded, bias);
+            add = ggml_reshape_3d(ctx0, mask, n_kv, n_query, n_stream);
         }
+        ggml_tensor * expanded = qwen4exp_te_expand(ctx0, score, inp->cell_blk, add);
         cb(expanded, "indexer_score_tokens", il);
 
         // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
         const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
-        ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
-
-        // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
-        top_k = ggml_reshape_4d(ctx0, top_k, width, n_query, 1, n_stream);
-        cb(top_k, "indexer_top_k", il);
-        qwen4exp_append_strip(ctx0, gf, selected, top_k);
+        // [width, n_query, 1, n_stream], the layout of the sparse plan's rows
+        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx0, expanded, width);
+        cb(sel.top_k, "indexer_top_k", il);
+        qwen4exp_append_strip(ctx0, gf, selected, sel.rows);
     }
     ggml_tensor * top_k = qwen4exp_finish_strips(ctx0, gf, selected);
-    // the rows that feed the plan (compact route), or the masked route's top-k: the names of PLAN-v3 §4.5
-    cb(top_k, inp->tail_idxs ? "qsa_rows_cb" : "qsa_rows_tk", il);
+    // the rows that feed the plan: the names of PLAN-v3 §4.5
+    cb(top_k, inp->tail_idxs ? "qsa_rows_cb" : "qsa_rows_te", il);
 
     return top_k;
 }
@@ -1778,24 +1776,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_plan(ggml_tensor * rows, co
     return plan;
 }
 
-// Dense GQA self-attention restricted to the cells that top_k names.
-// With plan (compact and shortcut rows): GGML_OP_SPARSE_ATTN, whose rows carry the visibility, so it needs no mask. The
-// rotation stays in the graph here (rot_q = rot_o = 0, PLAN-v3 §8: W10 moves it into the op).
-// Without a plan (non-compact ubatches until W8): the masked route below copies the MLA sparse path in
-// llm_graph_context::build_attn.
+// Dense GQA self-attention restricted to the cells of the plan's rows (compact CB, non-compact TE or shortcut all-visible
+// rows), on GGML_OP_SPARSE_ATTN: the rows carry the visibility, so it needs no mask. The rotation stays in the graph here
+// (rot_q = rot_o = 0, PLAN-v3 §8: W10 moves it into the op). The masked route PR219 kept for non-compact ubatches (a KQ
+// mask unmasked at the top-k cells, FLASH_ATTN_EXT + src[5]) is deleted for every backend (PLAN-v3 W8, D22).
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             q_cur,
         ggml_tensor *             k_cur,
         ggml_tensor *             v_cur,
-        ggml_tensor *             top_k,
         ggml_tensor *             plan,
         ggml_backend_t            backend,
         float                     kq_scale,
         int                       il,
         ggml_tensor **            attn_node) {
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
-    // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
+    // has already scored with its own query in build_qsa_top_k, so the rows are unaffected.
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
@@ -1823,74 +1819,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    GGML_ASSERT(plan != nullptr && plan->op == GGML_OP_SPARSE_ATTN_PLAN);
 
-    if (plan) {
-        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-        const int64_t n_stream = k->ne[3];
-        GGML_ASSERT(v->nb[1] <= v->nb[2] && "qwen4exp's hybrid-idx cache keeps V not transposed (PLAN-v3 D21)");
-        // the layouts of build_attn_mha: [D, n_q, n_head, n_stream], [D, n_kv, n_head_kv, n_stream]
-        ggml_tensor * q = ggml_view_4d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]/n_stream, n_stream,
-                q_cur->nb[1], q_cur->nb[2], q_cur->nb[2]*(q_cur->ne[2]/n_stream), 0);
-        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
-        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
-        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-        ggml_tensor * attn = ggml_sparse_attn(ctx0, q, k, v, plan, kq_scale, 0, 0);
-        cb(attn, "qsa_attn", il);
-        ggml_backend_sched_set_tensor_backend(sched, attn, backend);
-        *attn_node = attn;
-        ggml_tensor * cur = ggml_reshape_2d(ctx0, attn, attn->ne[0]*attn->ne[1], attn->ne[2]*attn->ne[3]);
-        ggml_build_forward_expand(gf, cur);
-        cb(cur, "kqv_out", il);
-        // the rotation is its own inverse, so undo it on the value side of the output
-        if (inp->self_v_rot) {
-            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
-        }
-        return cur;
-    }
-
-    // prepare new kq mask - starts filled with -INFINITY
-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
-
-    // reshape KQ mask into tensor with rows of size 1:
-    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
-    kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
-
-    // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
-    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
-
-    // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-
-    // modify KQ mask by unmasking elements that are in top_k indices
-    // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
-
-    // reshape to restore the original shape of KQ mask:
-    // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
-    kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
-
-    // combine with the original kq mask
-    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
-
-    ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-
-    // TODO: enable sparse attention when we are ready
-    // ref: https://github.com/ggml-org/llama.cpp/pull/27970
-    //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il, top_k, 0);
+    const int64_t n_stream = k->ne[3];
+    GGML_ASSERT(v->nb[1] <= v->nb[2] && "qwen4exp's hybrid-idx cache keeps V not transposed (PLAN-v3 D21)");
+    // the layouts of build_attn_mha: [D, n_q, n_head, n_stream], [D, n_kv, n_head_kv, n_stream]
+    ggml_tensor * q = ggml_view_4d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]/n_stream, n_stream,
+            q_cur->nb[1], q_cur->nb[2], q_cur->nb[2]*(q_cur->ne[2]/n_stream), 0);
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    ggml_tensor * attn = ggml_sparse_attn(ctx0, q, k, v, plan, kq_scale, 0, 0);
+    cb(attn, "qsa_attn", il);
+    ggml_backend_sched_set_tensor_backend(sched, attn, backend);
+    *attn_node = attn;
+    ggml_tensor * cur = ggml_reshape_2d(ctx0, attn, attn->ne[0]*attn->ne[1], attn->ne[2]*attn->ne[3]);
+    ggml_build_forward_expand(gf, cur);
     cb(cur, "kqv_out", il);
-
     // the rotation is its own inverse, so undo it on the value side of the output
     if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
     }
-
     return cur;
 }
 
@@ -2015,8 +1966,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                 }
             }
         } else {
-            // the trim needs the maskless selection (the masked path reads the full-batch KQ mask) and one stream; the
-            // input set of this ratio was made by an earlier layer
+            // the trim needs the compact selection (the TE rows read the full-batch KQ mask, PLAN-v3 §4.4) and one
+            // stream; the input set of this ratio was made by an earlier layer
             const auto it_inp = qsa_inps.find((uint32_t) r);
             if (q_first > 0 && tile_out_ids && mctx_hyb->get_n_stream() == 1 && it_inp != qsa_inps.end() && it_inp->second->maskless &&
                     q_first % qwen4exp_query_strip(n_tokens, 1) == 0) {
@@ -2037,12 +1988,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                 }
             }
             top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, trim ? q_first : 0, q_pos, cache_only);
-            const auto it_rows = qsa_inps.find((uint32_t) r);
-            if (top_k && it_rows != qsa_inps.end() && it_rows->second->maskless) {
+            if (top_k) {
+                // compact CB rows or the non-compact TE rows: both carry the visibility (-1 for a hidden cell)
+                const auto it_rows = qsa_inps.find((uint32_t) r);
+                GGML_ASSERT(it_rows != qsa_inps.end());
                 plan = build_qsa_plan(top_k, policy, n_kv, qsa_node.type_k, qsa_node.type_v, false, qsa_node.group, il);
-                qsa_node.producer = "cb";
-            } else if (top_k) {
-                qsa_node.producer = "masked";   // non-compact ubatches keep the old route until W8
+                qsa_node.producer = it_rows->second->maskless ? "cb" : "te";
             }
         }
     }
@@ -2120,7 +2071,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     if (top_k) {
         ggml_tensor * attn_node = nullptr;
-        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, plan, policy.backend, kq_scale, il, &attn_node);
+        cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, plan, policy.backend, kq_scale, il, &attn_node);
         qsa_node.attn = attn_node ? attn_node : cur;
     } else {
         const size_t n_fused = res->get_fused_nodes().size();
