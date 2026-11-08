@@ -221,6 +221,12 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * m
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
+llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem, uint32_t n_kv) :
+    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), n_kv)),
+    ctx_recr(mem->get_mem_recr()->init_full()),
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+}
+
 llama_memory_hybrid_context::llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
               llama_context * lctx,

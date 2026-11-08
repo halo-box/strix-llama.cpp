@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <string>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -822,6 +823,12 @@ struct llama_vocab_subset {
     ggml_tensor * eog = nullptr; // I32 end-of-generation ids >= n_base, always picked
 };
 
+// reserve-only QSA graph variants (PLAN-v3 §7.1): never set on a runtime graph
+enum llm_graph_qsa_reserve : uint32_t {
+    LLM_GRAPH_QSA_RESERVE_NONCOMPACT = 1u << 0, // §7.1.4: the compact decision is false at the reserve n_kv
+    LLM_GRAPH_QSA_RESERVE_FAST       = 1u << 1, // §7.1.2: the incremental fast-cache route at n_tokens <= 512
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -872,6 +879,9 @@ struct llm_graph_params {
 
     llama_model_prefetch * prefetch = nullptr; // the context's llama_model::prefetch_begin state, nullptr = none
     const llama_vocab_subset * vsub = nullptr;
+
+    // reserve-only QSA graph variants (PLAN-v3 §7.1), LLM_GRAPH_QSA_RESERVE_*; 0 for every runtime graph
+    uint32_t qsa_reserve = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1025,6 +1035,10 @@ public:
     void add_qsa_node(const llm_graph_qsa_node & node) { qsa_nodes.push_back(node); }
     const std::vector<llm_graph_qsa_node> & get_qsa_nodes() const { return qsa_nodes; }
 
+    // the QSA graph-build check (PLAN-v3 §4.3): non-empty when this graph must not be allocated; llama_decode returns an error
+    void set_qsa_decode_error(std::string msg) { if (qsa_decode_error.empty()) { qsa_decode_error = std::move(msg); } }
+    const std::string & get_qsa_decode_error() const { return qsa_decode_error; }
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
@@ -1045,6 +1059,7 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::vector<llm_graph_qsa_node>   qsa_nodes;   // the attention node of every QSA layer of this graph
+    std::string                       qsa_decode_error;
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
 
@@ -1152,6 +1167,8 @@ struct llm_graph_context {
     llm_graph_result * res;
 
     const llama_vocab_subset * vsub;
+
+    const uint32_t qsa_reserve; // llm_graph_params::qsa_reserve
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
