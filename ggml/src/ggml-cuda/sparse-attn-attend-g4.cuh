@@ -21,7 +21,15 @@
 //     block. sa_attend_fixup then recomputes every block that touches a flagged quad or was flagged, with the CPU op's
 //     per-cell arithmetic (p * v added only to the rows whose query attends the cell). The flags and the fixup keep the
 //     WMMA loop free of any exact-path code, which did not fit the 192 VGPRs of the GQA 12 instances (W3 resource
-//     checks).
+//     checks);
+//   - the in-op rotations (PLAN-v3 §8, D13): rot_q != 0 replaces the Q prologue by one that reads whole query rows, one
+//     row per wave at a time, applies H_q with fwht_row (sparse-attn-fwht.cuh: the arithmetic of fwht.cu) in f32, then
+//     the f32 product with scale and the f16 rounding; rot_o != 0 replaces the epilogue store by one that takes whole
+//     output rows (acc / l, f32) from the staging tile, applies H_o with fwht_row and stores them (gated: then the
+//     sigmoid gate, as without rotation). The rotation code exists only in the ROT = true instances (rot_q and rot_o
+//     are then uniform kernel arguments, each may be 0): the ROT = false instances, which every op with rot_q = rot_o = 0
+//     runs, compile to the W9 kernels (a runtime branch in every instance cost 3.6-6 % of the rot 0 attend time on the
+//     C18 wiki rows, ~/dev/wt_lab/w10/time).
 //
 // Work: block (group g, kv head, stream), 8 waves; wave w owns dims 32w .. 32w+31. Scores: each wave computes the
 // partial scores of all rows over its 32 dims, waves w < NT (NT = GQA / 4 row tiles) reduce tile w and run the online
@@ -32,6 +40,7 @@
 
 #include "common.cuh"
 #include "sparse-attn-loaders.cuh"
+#include "sparse-attn-fwht.cuh"
 
 #define SA_L2E 1.4426950408889634f
 
@@ -67,27 +76,37 @@ struct sa_g4_args {
     const uint32_t * qany;      // packed V: nonzero when any quad is flagged (cleared before the pack)
     int              kt_g;      // KT / VT == SA_T_GEN (the generic tier): the ggml types of K and V (sa_any_elem)
     int              vt_g;
+    int              rot_q;     // H_q block size (0, 64, 128 or 256): op_params[1]
+    int              rot_o;     // H_o block size (0, 64, 128 or 256): op_params[2]
+    float            rot_q_scale;   // 1.0f / sqrtf(rot_q), as fwht.cu computes it (unused when rot_q == 0)
+    float            rot_o_scale;   // 1.0f / sqrtf(rot_o)
+    int              rot_dump;  // test hook (GGML_CUDA_SA_ROT_DUMP=1, rot_q != 0): write H_q q (f32, before scale) to out
+                                // rows R and stop (tests/test-sparse-attn-rot.cpp)
+    int              fixup_all; // test hook (GGML_CUDA_SA_FORCE=fixup): sa_attend_fixup recomputes every block
 };
 
 typedef void (*sa_g4_kernel_t)(const sa_g4_args);
 
-// the instance tables of sparse-attn-attend-g4-<kt>.cu, in GGML_CUDA_SA_G4_KT_ order (sparse-attn-census.h):
-// index ((vt * 2 + vl) * 2 + epi) * 3 + gqa_index, gqa_index 0 / 1 / 2 for GQA 4 / 8 / 12
+// the instance tables of sparse-attn-attend-g4-<kt>.cu, in GGML_CUDA_SA_G4_KT_ order (sparse-attn-census.h), two
+// instances per census index i = ((vt * 2 + vl) * 2 + epi) * 3 + gqa_index (gqa_index 0 / 1 / 2 for GQA 4 / 8 / 12): entry
+// 2 * i is ROT = false, 2 * i + 1 ROT = true
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_f16[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_bf16[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q8_0[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q4_0[];
 
-// waves per EU the register allocator targets: 8 (192 VGPRs) for every instance but the generic tier's direct-V GQA 12
-// one, which spills at that budget (W5 resource checks: 1 spilled VGPR, 8 B scratch, with the conversions already moved
-// past the barriers) and gets 7 (it then allocates 209 VGPRs, no scratch), one wave of occupancy less on that instance only
-template <int KT, int VL, int GQA>
+// waves per EU the register allocator targets: 8 (192 VGPRs) for every instance but the generic tier's GQA 12 ones, which
+// spill at that budget and get 7 (up to 209 VGPRs, no scratch), one wave of occupancy less on those two instances only:
+// the direct-V one since W5 (W5 resource checks: 1 spilled VGPR, 8 B scratch, with the conversions already moved past the
+// barriers), and the packed-V one with the rotation prologue / epilogue (ROT = true: 1 spilled VGPR, 8 B scratch at 192
+// VGPRs, ~/dev/wt_rewrite_logs/W10/tu_final.out)
+template <int KT, int VL, int GQA, bool ROT>
 static constexpr int sa_g4_waves_per_eu() {
-    return KT == SA_T_GEN && VL == SA_V_SPLITGATHER && GQA == 12 ? 7 : 8;
+    return KT == SA_T_GEN && GQA == 12 && (VL == SA_V_SPLITGATHER || ROT) ? 7 : 8;
 }
 
-template <int KT, int VT, int VL, int EPI, int GQA>
-__global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_waves_per_eu<KT, VL, GQA>()))) sa_attend_g4(const sa_g4_args a) {
+template <int KT, int VT, int VL, int EPI, int GQA, bool ROT>
+__global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_waves_per_eu<KT, VL, GQA, ROT>()))) sa_attend_g4(const sa_g4_args a) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     GGML_UNUSED(a);
     NO_DEVICE_CODE;
@@ -116,7 +135,55 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
 
     // Q prologue: f16(q * scale) (f32 product, one rounding), staged per wave, read back as the WMMA B fragments
     sa_v16s qf[NT][2];
-    {
+    if (ROT && a.rot_q != 0) {
+        // H_q: wave w takes rows w, w + 8, ... whole (lane l holds dims 32 j + l, the fwht_row layout), transforms them in
+        // f32, and writes f16(x * scale) of dim 32 j + l into the stage of wave j (the layout the read-back expects)
+        uint16_t * stage0 = reinterpret_cast<uint16_t *>(&part[0][0][0]);
+        for (int row = w; row < 16 * NT; row += 8) {
+            const int qi = row / GQA, h = row - GQA*qi;
+            const int query = 4*g + qi;
+            float x[8];
+            if (query < a.n_q) {   // uniform over the wave
+                const float * src = reinterpret_cast<const float *>(a.q + (size_t) s * a.q_nb3 + (size_t) query * a.q_nb1 +
+                                                                    (size_t) (kvh * GQA + h) * a.q_nb2);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    x[j] = src[32*j + lane];
+                }
+                fwht_row<256, 32>(x, lane, a.rot_q, a.rot_q_scale);
+                if (a.rot_dump) {
+                    float * dst = a.out + (((size_t) s * a.n_q + query) * a.n_head + (size_t) (kvh * GQA + h)) * 256;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        dst[32*j + lane] = x[j];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    x[j] = 0.f;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                stage0[j * (16 * NT * 32) + row * 32 + lane] = sa_f2h(x[j] * a.scale);
+            }
+        }
+        if (a.rot_dump) {
+            return;   // uniform over the block: the test hook stops after the transform
+        }
+        __syncthreads();
+        uint16_t * stage = stage0 + w * (16 * NT * 32);
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                const uint16_t * src = stage + (16*i + r) * 32 + 16*t;
+                qf[i][t] = __builtin_bit_cast(sa_v16s, (uint4[2]){*reinterpret_cast<const uint4 *>(src), *reinterpret_cast<const uint4 *>(src + 8)});
+            }
+        }
+        __syncthreads();
+    } else {
         uint16_t * stage = reinterpret_cast<uint16_t *>(&part[0][0][0]) + w * (16 * NT * 32);
 #pragma unroll
         for (int c = 0; c < 4 * NT; ++c) {
@@ -512,6 +579,45 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
             }
         }
         __syncthreads();
+        if (ROT && a.rot_o != 0) {
+            // H_o: tile i is in part, element (row rr, dim 32 j + l) of the tile at ostage of wave j + rr * 32 + l. Wave w
+            // takes rows w and w + 8 whole (the fwht_row layout), transforms them in f32 and stores them (gated: then
+            // the gate, element by element, with the expression of the unrotated epilogue)
+            const float * tile = reinterpret_cast<const float *>(&part[0][0][0]);
+            for (int rr = w; rr < 16; rr += 8) {
+                const int row = 16*i + rr, qi = row / GQA, h = row - GQA*qi;
+                const int query = 4*g + qi;
+                if (query >= a.n_q) {   // uniform over the wave
+                    continue;
+                }
+                float x[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    x[j] = tile[j * (16 * 32) + rr * 32 + lane];
+                }
+                fwht_row<256, 32>(x, lane, a.rot_o, a.rot_o_scale);
+                const size_t R = ((size_t) s * a.n_q + query) * a.n_head + (size_t) (kvh * GQA + h);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int d = 32*j + lane;
+                    float v = x[j];
+                    if constexpr (EPI == SA_EPI_GATED) {
+                        const float gg = *reinterpret_cast<const float *>(a.gate + R * a.gate_nb1 + (size_t) d * 4);
+                        v = 1.0f / (1.0f + expf(-gg)) * v;
+                        if (a.o16) {
+                            a.o16[R * 256 + d] = ggml_cuda_f32_to_act16(v, a.o16_f16 != 0);
+                        }
+                        if (a.out) {
+                            a.out[R * 256 + d] = v;
+                        }
+                    } else {
+                        a.out[R * 256 + d] = v;
+                    }
+                }
+            }
+            __syncthreads();
+            continue;
+        }
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
             const int rr = 4*c + (lane >> 3), dq = 4 * (lane & 7);
@@ -577,17 +683,22 @@ static __device__ __forceinline__ float sa_elem_f16(const char * row, const int 
 // that row's query attends, in the plan's ascending order, one at a time: f32 score (block sum over the 256 dims in a
 // fixed order), online softmax with expf, P rounded to f16 for PV, l summing the f32 p, f32 PV, acc / l. Same grid as
 // sa_attend_g4; a block with nothing flagged returns after one load (direct V: its 8 wave flags; packed V: the pack's
-// any-flag, and only when that is set the quad flags of its entries). Thread d owns dim d.
+// any-flag, and only when that is set the quad flags of its entries). Thread d owns dim d. The rotations: H_q of the
+// row's q and H_o of its output through shared memory (sa_fwht_smem, the arithmetic of fwht.cu), as sa_attend_g4.
+// a.fixup_all (test hook) recomputes every block.
 template <int KT, int VT, int EPI>
 __global__ void __launch_bounds__(256) sa_attend_fixup(const sa_g4_args a, const int gqa) {
     const int d = threadIdx.x, lane = d & 31, w = d >> 5;
     const int g = blockIdx.x, kvh = blockIdx.y, s = blockIdx.z;
     const size_t ent = (size_t) s * a.n_groups + g;
     __shared__ float red[8];
+    __shared__ float rowbuf[256];
     const uint32_t * gblk  = a.quads + ent * a.cap;
     const uint16_t * gmsk  = a.masks + ent * a.cap;
     const uint32_t   n_ent = a.counts[ent];
-    if (a.qflags != nullptr) {
+    if (a.fixup_all) {
+        // test hook: no early exit
+    } else if (a.qflags != nullptr) {
         // packed V: recompute only when a quad of this group was flagged by the pack
         if (*a.qany == 0) {
             return;
@@ -611,7 +722,13 @@ __global__ void __launch_bounds__(256) sa_attend_fixup(const sa_g4_args a, const
             break;   // rows are ordered by query
         }
         const int hq = kvh * gqa + h;
-        const float qv = *reinterpret_cast<const float *>(a.q + (size_t) s * a.q_nb3 + (size_t) query * a.q_nb1 + (size_t) hq * a.q_nb2 + (size_t) d * 4);
+        float qv = *reinterpret_cast<const float *>(a.q + (size_t) s * a.q_nb3 + (size_t) query * a.q_nb1 + (size_t) hq * a.q_nb2 + (size_t) d * 4);
+        if (a.rot_q != 0) {   // uniform over the block
+            __syncthreads();   // rowbuf of the previous row is read
+            rowbuf[d] = qv;
+            sa_fwht_smem<256>(rowbuf, 1, 256, a.rot_q, a.rot_q_scale, d, 256);
+            qv = rowbuf[d];
+        }
         const float qd = (float) __builtin_bit_cast(_Float16, sa_f2h(qv * a.scale));
         float mx = -INFINITY, l = 0.f, acc = 0.f;
         for (uint32_t e = 0; e < n_ent; ++e) {
@@ -652,6 +769,12 @@ __global__ void __launch_bounds__(256) sa_attend_fixup(const sa_g4_args a, const
             }
         }
         float v = l > 0.f ? acc / l : 0.f;
+        if (a.rot_o != 0) {   // uniform over the block
+            __syncthreads();   // every thread has read its rotated q from rowbuf
+            rowbuf[d] = v;
+            sa_fwht_smem<256>(rowbuf, 1, 256, a.rot_o, a.rot_o_scale, d, 256);
+            v = rowbuf[d];
+        }
         const size_t R = ((size_t) s * a.n_q + query) * a.n_head + (size_t) hq;
         if constexpr (EPI == SA_EPI_GATED) {
             const float gg = *reinterpret_cast<const float *>(a.gate + R * a.gate_nb1 + (size_t) d * 4);
@@ -677,7 +800,7 @@ extern const sa_fixup_kernel_t ggml_cuda_sa_fixup_kernels_q8_0[];
 extern const sa_fixup_kernel_t ggml_cuda_sa_fixup_kernels_q4_0[];
 
 // the generic tier's G4 instances (sparse-attn-generic.cu, GGML_CUDA_SA_GEN_G4_INSTANCES of sparse-attn-census.h):
-// sa_attend_g4<SA_T_GEN, SA_T_GEN, VL, SA_EPI_PLAIN, GQA> at index vl * 3 + gqa_index, and its fixup
+// sa_attend_g4<SA_T_GEN, SA_T_GEN, VL, SA_EPI_PLAIN, GQA, ROT> at index 2 * (vl * 3 + gqa_index) + ROT, and its fixup
 extern const sa_g4_kernel_t ggml_cuda_sa_gen_g4_kernels[];
 extern const sa_fixup_kernel_t ggml_cuda_sa_gen_fixup_kernel;
 

@@ -66,6 +66,9 @@ struct ggml_cuda_sa_g1_launch_params {
     int              kt, vt, gqa_index;   // sa_type_id of K and V, GQA 4 / 8 / 12 -> 0 / 1 / 2
     int              kt_g, vt_g;          // the ggml types of K and V (the generic tier)
     float            scale;
+    int              rot_q, rot_o;        // op_params[1], op_params[2] (rot_o: applied by the attend with one split, by
+                                          // ggml_cuda_sa_merge_splits otherwise)
+    int              rot_dump;            // test hook GGML_CUDA_SA_ROT_DUMP (rot_q != 0): H_q q into out, nothing else
     float *          out;                 // splits == 1
     float *          partial;             // splits > 1
 };
@@ -89,11 +92,19 @@ struct ggml_cuda_sa_portable_launch_params {
     int              n_groups, cap, G, n_q, n_head, n_head_kv, n_stream, gqa;
     int              kt_g, vt_g;          // the ggml types of K and V
     float            scale;
+    int              rot_q, rot_o;        // op_params[1], op_params[2]
+    int              rot_dump;            // test hook GGML_CUDA_SA_ROT_DUMP (rot_q != 0): H_q q into out, nothing else
     float *          out;                 // dst
 };
 void ggml_cuda_sa_portable_launch(cudaStream_t stream, const ggml_cuda_sa_portable_launch_params & p);
-// sa_merge_splits (sparse-attn-merge.cu): n_rows output rows of 256 floats from [n_rows][splits][258] partials
-void ggml_cuda_sa_merge_splits(cudaStream_t stream, const float * partial, float * out, int64_t n_rows, int splits);
+// sa_merge_splits (sparse-attn-merge.cu): n_rows output rows of 256 floats from [n_rows][splits][258] partials, then H_o
+// over blocks of rot_o dims (0: none)
+void ggml_cuda_sa_merge_splits(cudaStream_t stream, const float * partial, float * out, int64_t n_rows, int splits, int rot_o);
+
+// 1 / sqrtf(rot), the scale fwht.cu applies before its butterflies (1 for rot 0)
+static inline float ggml_cuda_sa_rot_scale(const int rot) {
+    return rot != 0 ? 1 / sqrtf(rot) : 1.0f;
+}
 
 // HIP policies (sparse-attn-attend-g1.cu), exposed as the procs ggml_backend_sparse_attn_group and
 // ggml_backend_sparse_attn_prefer_dense (ggml-backend.h, PLAN-v3 §5 "G and shortcut policy")
