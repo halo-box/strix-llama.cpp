@@ -69,7 +69,7 @@ static void fake_dev_props(ggml_backend_dev_t dev, ggml_backend_dev_props * prop
     props->description = fake_dev_desc(dev);
     props->type = fake_dev_type(dev);
     fake_dev_memory(dev, &props->memory_free, &props->memory_total);
-    props->caps = { false, false, false, false };
+    props->caps = { false, false, false, false, false };   // async, host_buffer, buffer_from_host_ptr, events, mmap_support
 }
 static ggml_backend_t fake_dev_init(ggml_backend_dev_t dev, const char *) {
     ggml_backend_t b = ggml_backend_cpu_init();
