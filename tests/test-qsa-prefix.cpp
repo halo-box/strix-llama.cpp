@@ -112,7 +112,7 @@ static void test_scan_foreign_image() {
     model->hparams = {};
     llama_memory_hybrid_idx mem(*model, GGML_TYPE_F16, GGML_TYPE_F16, false, 64, 1, 0, LLAMA_SWA_TYPE_NONE,
                                GGML_TYPE_F32, GGML_TYPE_F32, 4, 3, 0, false, true,
-                               nullptr, nullptr, [](int32_t) { return false; });
+                               GGML_TYPE_F16, nullptr, nullptr, [](int32_t) { return false; });
     auto & cells = const_cast<llama_kv_cells &>(mem.get_mem_idx()->get_cells(0));
     for (uint32_t j = 0; j < 10; ++j) {
         cells.pos_set(j, j);

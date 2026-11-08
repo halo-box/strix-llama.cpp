@@ -37,6 +37,8 @@ public:
                  uint32_t   n_rs_seq,
                      bool   offload,
                      bool   unified,
+                            /* indexer key cache type, already resolved (llama_model_type_k_idx) */
+                ggml_type   type_k_idx,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
@@ -79,6 +81,9 @@ public:
     //
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+
+    // the indexer key cache type this memory was built with (PLAN-v3 §9)
+    ggml_type get_type_k_idx() const { return type_k_idx; }
 
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
@@ -180,9 +185,17 @@ private:
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
 
+    // the message of a failed indexer-section restore (state_read)
+    std::string state_read_idx_error(const char * what) const;
+
     // the indexer cache holds one key head per layer, so it needs its own hparams:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
+
+    const ggml_type type_k_idx;
+
+    // the model's architecture, for the restore error's hint (only qwen4exp takes --cache-type-k-idx)
+    const llm_arch arch;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
 

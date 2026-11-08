@@ -559,6 +559,7 @@ llama_context::llama_context(
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
+            /*.type_k_idx=*/ params.type_k_idx,
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
@@ -5116,6 +5117,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.type_k_idx                  =*/ GGML_TYPE_COUNT,
         /*.moe_cache_size              =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
@@ -5169,6 +5171,12 @@ llama_context * llama_init_from_model(
         if (model->get_split_state_ud.n_devices == 1) {
             LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
         }
+    }
+
+    if ((int) params.type_k_idx < 0 || (int) params.type_k_idx > (int) GGML_TYPE_COUNT ||
+        (params.type_k_idx != GGML_TYPE_COUNT && ggml_get_type_traits(params.type_k_idx)->blck_size == 0)) {
+        LLAMA_LOG_ERROR("%s: invalid indexer K cache type %d\n", __func__, (int) params.type_k_idx);
+        return nullptr;
     }
 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {

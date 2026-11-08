@@ -1121,6 +1121,46 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
 
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
 // the context-level init errors of qwen4exp's QSA (PLAN-v3 §10)
+ggml_type llama_model_type_k_idx(llm_arch arch, ggml_type type_k, ggml_type type_k_idx) {
+    if (arch != LLM_ARCH_QWEN4EXP) {
+        // GLM5_NEXT and every other indexer keep the -ctk type (PLAN-v3 §9, O26)
+        return type_k;
+    }
+    if (type_k_idx != GGML_TYPE_COUNT) {
+        return type_k_idx; // --cache-type-k-idx override
+    }
+    switch (type_k) {
+        // a sub-8-bit indexer loses selection agreement (R1-E: q4_0 indexer 0.98814 of f16's, q8_0 indexer 0.999802),
+        // so the indexer of these types is q8_0 (the other sub-8-bit types follow q4_0, PLAN-v3 U8)
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
+            return GGML_TYPE_Q8_0;
+        default:
+            return type_k;
+    }
+}
+
+// the resolved indexer type of this model's hybrid-idx memory, checked against the indexer row and logged once per memory
+static ggml_type qsa_resolve_type_k_idx(const llama_model & model, const llama_memory_params & params) {
+    const ggml_type t = llama_model_type_k_idx(model.arch, params.type_k, params.type_k_idx);
+    if (model.arch != LLM_ARCH_QWEN4EXP && params.type_k_idx != GGML_TYPE_COUNT && params.type_k_idx != params.type_k) {
+        LLAMA_LOG_WARN("%s: --cache-type-k-idx %s is ignored for %s: its indexer cache keeps the K cache type %s\n",
+                __func__, ggml_type_name(params.type_k_idx), llm_arch_name(model.arch), ggml_type_name(params.type_k));
+    }
+    const uint32_t row = model.hparams.indexer_head_size;
+    if (row > 0 && row % ggml_blck_size(t) != 0) {
+        throw std::runtime_error(format("indexer K cache type %s with block size %lld does not divide the indexer head size %u",
+                    ggml_type_name(t), (long long) ggml_blck_size(t), row));
+    }
+    LLAMA_LOG_INFO("%s: indexer K cache type = %s (%s, -ctk %s)\n", __func__, ggml_type_name(t),
+            params.type_k_idx != GGML_TYPE_COUNT && model.arch == LLM_ARCH_QWEN4EXP ? "override" : "auto",
+            ggml_type_name(params.type_k));
+    return t;
+}
+
 static void qwen4exp_qsa_check_context(llama_split_mode split_mode, uint32_t n_ctx_seq) {
     if (split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw std::runtime_error("QSA sparse attention is not supported with --split-mode tensor: the meta backend has no SPARSE_ATTN handler; use --split-mode layer or none");
@@ -3043,6 +3083,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* n_rs_seq          */ cparams.n_rs_seq,
                     /* offload           */ cparams.offload_kqv,
                     /* unified           */ cparams.kv_unified,
+                    /* type_k_idx        */ qsa_resolve_type_k_idx(*this, params),
                     /* filter_attn       */ std::move(filter_attn),
                     /* filter_recr       */ std::move(filter_recr),
                     /* filter_idx        */ std::move(filter_idx));
@@ -3248,6 +3289,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         /* n_rs_seq          */ cparams.n_rs_seq,
                         /* offload           */ cparams.offload_kqv,
                         /* unified           */ cparams.kv_unified,
+                        /* type_k_idx        */ qsa_resolve_type_k_idx(*this, params),
                         /* filter_attn       */ std::move(f_attn),
                         /* filter_recr       */ std::move(f_recr),
                         /* filter_idx        */ std::move(f_idx));
@@ -3354,6 +3396,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
+                            /* type_k_idx        */ qsa_resolve_type_k_idx(*this, params),
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
