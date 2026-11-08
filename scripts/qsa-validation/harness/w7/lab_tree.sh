@@ -19,7 +19,11 @@ P = sys.argv[1]
 for name in ['01-qpin', '02-r1e-qsa-chunk', '03-r1q8-defect-hook']:
     s = open(f'{P}/{name}.patch').read()
     parts = re.split(r'(?m)^(?=diff --git )', s)
-    keep = ''.join(x for x in parts if x and 'b/src/models/qwen4exp.cpp' not in x.split('\n')[0])
+    # W11+: the branch has its own indexer type override (--cache-type-k-idx, LLAMA_ARG_CACHE_TYPE_K_IDX; auto maps a sub-8-bit -ctk
+    # to q8_0), so 01-qpin's QPIN_IDX_TYPE hunk of llama-memory-hybrid-idx.cpp is dropped there (it no longer applies)
+    w11 = 'type_k_idx' in open('src/llama-memory-hybrid-idx.h').read()
+    drop = ['b/src/models/qwen4exp.cpp'] + (['b/src/llama-memory-hybrid-idx.cpp'] if w11 and name == '01-qpin' else [])
+    keep = ''.join(x for x in parts if x and not any(d in x.split('\n')[0] for d in drop))
     r = subprocess.run(['patch', '-p1', '-F3', '--no-backup-if-mismatch'], input=keep, text=True, capture_output=True)
     print(name, r.returncode, r.stdout[-400:], r.stderr[-200:])
     if r.returncode: sys.exit(1)

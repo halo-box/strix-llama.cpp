@@ -100,7 +100,9 @@ phase_C() {
   local F=$R/ref16t0
   $RUN ref16t0_rec $F record w0 f16 f16 4096 8192 16 $T0
   for p in f16:f16 q8_0:q8_0; do k=${p%:*}; v=${p#*:}; both c_$(tagof $p) $F replay $k $v 4096 8192 16; done
-  both c_f16k_q8idx $F replay f16 f16 4096 8192 16 QPIN_IDX_TYPE=q8_0
+  # the W0 arm takes the indexer type from QPIN_IDX_TYPE (lab patch 01); a W11+ new arm from LLAMA_ARG_CACHE_TYPE_K_IDX (its lab tree
+  # drops the QPIN_IDX_TYPE hunk), and its q4_0 arm runs the shipped auto mapping (q4_0 -> q8_0 indexer) with no override
+  both c_f16k_q8idx $F replay f16 f16 4096 8192 16 QPIN_IDX_TYPE=q8_0 LLAMA_ARG_CACHE_TYPE_K_IDX=q8_0
   $RUN w0_c_q4_0_q4_0 $F replay w0 q4_0 q4_0 4096 8192 16 QPIN_IDX_TYPE=q8_0 LLAMA_QSA_SELECTED_KEY=1
   $RUN new_c_q4_0_q4_0 $F replay new q4_0 q4_0 4096 8192 16 QPIN_IDX_TYPE=q8_0
   for p in bf16:bf16 q8_0:f16 f16:q8_0; do k=${p%:*}; v=${p#*:}; t=$(tagof $p)
