@@ -953,9 +953,6 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
             cache_only = true;     // an MTP cache-only graph: no attention at all
             continue;
         }
-        if (strcmp(n.producer, "masked") == 0) {
-            continue;              // non-compact ubatches keep the old route until W8
-        }
         n_required += n.plan ? 2 : 1;
 
         const ggml_tensor * root = n.k->view_src ? n.k->view_src : n.k;
@@ -1046,7 +1043,7 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
     }
     // the dense shortcut's attention nodes were each read with a non-NULL backend above
     for (const auto & n : nodes) {
-        if (n.attn && !n.plan && strcmp(n.producer, "masked") != 0) {
+        if (n.attn && !n.plan) {
             n_inspected++;
         }
     }
@@ -1118,7 +1115,7 @@ void llama_context::qsa_trace_ubatch(const llm_graph_result * res) {
         snprintf(line, sizeof(line), "il=%d producer=%s n_q=%" PRId64 " n_kv=%" PRId64 " n_stream=%" PRId64 " k=%s v=%s",
                 n.il, n.producer, n.n_q, n.n_kv, n.n_stream, ggml_type_name(n.type_k), ggml_type_name(n.type_v));
         std::string key = line;
-        key += format(" route=%s ctx=%s backend=%s G=%d", n.place == LLM_QSA_PLACE_HOST_KV_COPY ? "host-kv-copy" : sparse ? "sparse" : strcmp(n.producer, "masked") == 0 ? "masked" : "dense",
+        key += format(" route=%s ctx=%s backend=%s G=%d", n.place == LLM_QSA_PLACE_HOST_KV_COPY ? "host-kv-copy" : sparse ? "sparse" : "dense",
                 ctx_name, be ? ggml_backend_name(be) : "none", n.group);
         if (sparse) {
             key += format(" n_sel=%" PRId64 " gqa=%" PRId64, n.plan->src[0]->ne[0], n.attn->src[0]->ne[2] / n.attn->src[1]->ne[2]);

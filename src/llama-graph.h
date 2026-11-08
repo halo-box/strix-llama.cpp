@@ -967,9 +967,9 @@ enum llm_graph_qsa_place {
 
 struct llm_graph_qsa_node {
     int           il       = -1;
-    const char *  producer = "";       // av | cb | te | dense | masked (§14.3); masked goes away in W8
-    ggml_tensor * plan     = nullptr;  // GGML_OP_SPARSE_ATTN_PLAN, nullptr on the dense and masked routes
-    ggml_tensor * attn     = nullptr;  // GGML_OP_SPARSE_ATTN, or the dense / masked attention node
+    const char *  producer = "";       // av | cb | te | dense | cache (§14.3); the masked route was deleted in W8
+    ggml_tensor * plan     = nullptr;  // GGML_OP_SPARSE_ATTN_PLAN, nullptr on the dense route
+    ggml_tensor * attn     = nullptr;  // GGML_OP_SPARSE_ATTN, or the dense attention node
     ggml_tensor * k        = nullptr;  // the K cache view this attention reads
     int64_t       n_q      = 0;        // queries per stream
     int64_t       n_kv     = 0;
