@@ -100,6 +100,9 @@ public:
     // init full
     explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
 
+    // init full with the attention view limited to n_kv cells (a reserve graph at a smaller n_kv, PLAN-v3 §7.1.3)
+    llama_memory_hybrid_context(llama_memory_hybrid * mem, uint32_t n_kv);
+
     // init update
     explicit llama_memory_hybrid_context(
         llama_memory_hybrid * mem,

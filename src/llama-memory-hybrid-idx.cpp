@@ -40,6 +40,14 @@ static bool qsa_text_pos(const llama_ubatch & u, uint32_t i) {
     return true;
 }
 
+// LLAMA_QSA_FORCE_NONCOMPACT=1, validation only (a measurement hook, deleted with the others in W13): every ubatch is
+// non-compact, at init (NC0) and at graph time alike, so shapes no supported flow reaches can run under STRICT (a one-stream
+// non-compact ubatch of a split cache, AT-C12 / U38) and the single-sequence decode error can be shown
+static bool qsa_force_noncompact() {
+    static const bool v = [] { const char * e = getenv("LLAMA_QSA_FORCE_NONCOMPACT"); return e != nullptr && atoi(e) != 0; }();
+    return v;
+}
+
 //
 // llama_memory_hybrid_idx
 //
@@ -96,6 +104,23 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
+    n_seq_max_qsa = n_seq_max;
+    if (mem_idx) {
+        // NC0 (PLAN-v3 §4.3) runs the compact predicate once per distinct compress ratio of the QSA layers
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            const uint32_t r = model.hparams.dsv4_compress_ratios[il];
+            if (r > 0 && filter_idx(il) && std::find(qsa_nc_ratios.begin(), qsa_nc_ratios.end(), r) == qsa_nc_ratios.end()) {
+                qsa_nc_ratios.push_back(r);
+            }
+        }
+        qsa_nc_top_k = model.hparams.indexer_top_k;
+        // the re-split keeps the trailing n_rs_seq + 1 tokens of a sequence in one ubatch of at most S x 512 tokens:
+        // split_equal asserts n_ubatch > n_keep_tail (llama-batch.cpp), so this is an init error instead of that abort
+        if (n_seq_max > 1 && !qsa_nc_ratios.empty() && n_rs_seq > 0 && n_rs_seq + 1 >= qsa_nc_strips * 512) {
+            throw std::runtime_error(format("QSA: n_rs_seq + 1 = %u must be below the non-compact re-split cap of %u tokens",
+                        n_rs_seq + 1, qsa_nc_strips * 512));
+        }
+    }
     if (!mem_idx || !offload || n_swa != 0) { return; }
     qsa_prefix = qsa_prefix_state(kv_size);
     const int layers = model.hparams.n_layer_all;
@@ -130,9 +155,42 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }
 }
 
+// NC0(u) (PLAN-v3 §4.3): the selection path (n_kv > top_k + r - 1) and the compact predicate rejects u on the cells prepare
+// simulated. It drops the graph-time terms that can only turn a non-compact ubatch into a compact one (the incremental
+// qsa_prefix_matches shortcut), so NC0 contains every graph-time non-compact ubatch. It reads the attention cells, the graph
+// reads the indexer cells: they are the same slots with the same edits (test-qsa-resplit asserts it after every apply)
+bool llama_memory_hybrid_idx::qsa_nc0(const llama_ubatch & ubatch, const llama_kv_cache::slot_info & sinfo) const {
+    const uint32_t n_kv = get_mem_attn()->get_n_kv(sinfo);
+    for (const uint32_t r : qsa_nc_ratios) {
+        if (n_kv > qsa_nc_top_k + r - 1 && qsa_compact_reason(get_mem_attn(), sinfo.n_stream(), n_kv, r, ubatch) != QSA_COMPACT_OK) {
+            return true;
+        }
+    }
+    return false;
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
-    do {
+    //
+    // The non-compact re-split (PLAN-v3 §4.3, P2-2): a ubatch that NC0 marks non-compact and that holds more than U tokens in
+    // total is formed again with at most U tokens. split_equal is a deterministic function of the used flags (split_reset),
+    // so the ubatches before the failing one replay identically, the failing one then holds <= U tokens and the next failure
+    // index is larger: the loop runs at most #ubatches times. Only contexts that serve several sequences re-split: in a
+    // single-sequence context a non-compact ubatch is a decode error (the graph-build check, qwen4exp build_qsa_top_k)
+    // NC0 is recorded for every ubatch of a context that serves several sequences; it re-splits only when U < n_ubatch
+    const uint32_t U = qsa_noncompact_cap(n_ubatch);
+    const bool resplit = mem_idx && n_seq_max_qsa > 1 && !qsa_nc_ratios.empty();
+
+    std::vector<uint32_t> cap;   // per ubatch index: the n_ubatch it is formed with (0 = n_ubatch)
+    uint32_t i_fail_last = 0;
+    // the ubatches before the last failure replay identically (same tokens, same cells): their NC0 is kept, not recomputed,
+    // so the predicate runs once per ubatch plus once per replay; the token counts are checked to be the same
+    std::vector<uint8_t>  nc0_kept;
+    std::vector<uint32_t> n_tokens_kept;
+    qsa_last_n_replay = 0;
+    qsa_last_nc0_v.clear();
+
+    while (true) {
         balloc.split_reset();
 
         // follow the recurrent pattern for creating the ubatch splits
@@ -141,9 +199,12 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
         while (true) {
             llama_ubatch ubatch;
 
+            const size_t k = ubatches.size();
+            const uint32_t n_ub = k < cap.size() && cap[k] > 0 ? cap[k] : n_ubatch;
+
             if (embd_all) {
                 // if all tokens are output, split by sequence
-                ubatch = balloc.split_seq(n_ubatch);
+                ubatch = balloc.split_seq(n_ub);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                 const bool unified = (get_mem_attn()->get_n_stream() == 1);
@@ -153,7 +214,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = get_mem_recr()->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ub, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -168,17 +229,53 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             break;
         }
 
-        // prepare the recurrent batches first
+        // prepare the attention cache, with the NC0 hook when this context re-splits
+        uint32_t i_fail = UINT32_MAX;
+        std::vector<uint8_t> nc0(ubatches.size(), 0);
+        llama_kv_cache::slot_info_vec_t heads_attn;
+        if (resplit) {
+            heads_attn = get_mem_attn()->prepare(ubatches, [&](uint32_t i, const llama_ubatch & ub, const llama_kv_cache::slot_info & sinfo) {
+                if (i < nc0_kept.size()) {
+                    GGML_ASSERT(n_tokens_kept[i] == ub.n_tokens && "qsa: a replayed ubatch changed");
+                    nc0[i] = nc0_kept[i];
+                    return true;
+                }
+                nc0[i] = qsa_nc0(ub, sinfo) ? 1 : 0;
+                return !(nc0[i] && ub.n_tokens > U);
+            }, &i_fail);
+        } else {
+            heads_attn = get_mem_attn()->prepare(ubatches);
+        }
+        if (heads_attn.empty() && i_fail != UINT32_MAX) {
+            // the first non-compact ubatch above U: form it again with U tokens and replay
+            GGML_ASSERT((qsa_last_n_replay == 0 || i_fail > i_fail_last) && "qsa: the re-split must move forward");
+            GGML_ASSERT(qsa_last_n_replay < ubatches.size() && "qsa: more re-splits than ubatches");
+            i_fail_last = i_fail;
+            nc0_kept.assign(nc0.begin(), nc0.begin() + i_fail);
+            n_tokens_kept.clear();
+            for (uint32_t k = 0; k < i_fail; ++k) {
+                n_tokens_kept.push_back(ubatches[k].n_tokens);
+            }
+            if (cap.size() <= i_fail) {
+                cap.resize(i_fail + 1, 0);
+            }
+            cap[i_fail] = U;
+            qsa_last_n_replay++;
+            n_qsa_resplit++;
+            LLAMA_LOG_DEBUG("%s: QSA re-split %u: ubatch %u of %zu is non-compact with %u tokens > U = %u\n",
+                    __func__, qsa_last_n_replay, i_fail, ubatches.size(), ubatches[i_fail].n_tokens, U);
+            continue;
+        }
+        if (heads_attn.empty()) {
+            LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
+            return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+        qsa_last_nc0_v = std::move(nc0);
+
+        // the recurrent batches, once, on the final ubatches (PLAN-v3 §4.3: after the accepted attention prepare)
         if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
-            return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
-        }
-
-        // prepare the attention cache
-        auto heads_attn = get_mem_attn()->prepare(ubatches);
-        if (heads_attn.empty()) {
-            LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
@@ -190,13 +287,40 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
 
         return std::make_unique<llama_memory_hybrid_idx_context>(
                 this, std::move(heads_attn), std::move(heads_idx), std::move(ubatches));
-    } while(false);
+    }
 
     return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
     return std::make_unique<llama_memory_hybrid_idx_context>(this);
+}
+
+llama_memory_context_ptr llama_memory_hybrid_idx::init_full_n_kv(uint32_t n_kv) {
+    return std::make_unique<llama_memory_hybrid_idx_context>(this, n_kv);
+}
+
+int llama_memory_hybrid_idx::qsa_compact_reason(const llama_kv_cache * kv, uint32_t n_stream, uint32_t n_kv, uint32_t ratio, const llama_ubatch & ubatch) {
+    if (qsa_force_noncompact()) {
+        return QSA_NC_FORCED;
+    }
+    if (!kv || !ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id || n_stream == 0 || ubatch.n_tokens % n_stream != 0) {
+        return QSA_NC_INPUT;
+    }
+    // stream s of the ubatch holds tokens [s*n_tps, (s+1)*n_tps) and reads the cells of their sequence (split streams);
+    // one stream reads one cell array for every sequence id (unified)
+    const uint32_t n_tps = ubatch.n_tokens / n_stream;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const uint32_t i0 = s*n_tps;
+        if (ubatch.n_seq_id[i0] < 1 || !ubatch.seq_id[i0] || ubatch.seq_id[i0][0] < 0 || ubatch.seq_id[i0][0] >= LLAMA_MAX_SEQ) {
+            return QSA_NC_INPUT;
+        }
+        const int r = qsa_compact_visibility_stream(kv->get_cells(ubatch.seq_id[i0][0]), n_kv, ratio, ubatch, i0, n_tps);
+        if (r != QSA_COMPACT_OK) {
+            return r;
+        }
+    }
+    return QSA_COMPACT_OK;
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
@@ -620,6 +744,9 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
 
     if (dst_blk_pos) { std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0); }
 
+    // the rank decision per stream, read by the scan/predicate agreement assert of test-qsa-visibility
+    qsa_scan_ranked.assign(n_ns, 0);
+
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
@@ -634,15 +761,8 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
         bid_cell .clear();
         bid_slot0.clear();
 
-        int n_seq_present = 0;
-
-        for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
-            if (cells.seq_pos_min(sq) >= 0) {
-                n_seq_present++;
-            }
-        }
-
-        const bool one_seq = n_seq_present <= 1;
+        // the same function the compact predicate calls (prefix.h, PLAN-v3 §4.2 step 3)
+        const bool one_seq = qsa_stream_one_seq(cells);
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
@@ -717,7 +837,7 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
         group_cells();
 
         // mrope repeats one position across an image, so rank cells instead of using the position
-        if (dup && ubatch->is_pos_2d() && one_seq) {
+        if (qsa_scan_ranks(cells, dup, ubatch->is_pos_2d())) {
             order.clear();
             order.reserve(n_kv);
 
@@ -753,6 +873,10 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
         }
 
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
+
+        if ((size_t) s < qsa_scan_ranked.size()) {
+            qsa_scan_ranked[s] = ranked ? 1 : 0;
+        }
 
         int32_t n_bid = 0;
 
@@ -1137,6 +1261,27 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx())) {
+    if (kpool_track()) {
+        mem->kpool_layout_update();
+        auto st = kpool_build_sizes();
+        const auto * idx = mem->get_mem_idx();
+        const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
+        GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
+        st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
+        st.n_new   = st.n_pool_real;
+        st.n_new_g = std::max(st.n_new, 1u);
+        kpool_st = std::make_unique<kpool_state>(std::move(st));
+        i_kpool  = 0;
+    }
+}
+
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv) :
+    llama_memory_hybrid_context(mem, n_kv),
+    mem(mem),
+    ns_ubatch(mem->get_mem_idx() == nullptr ?
+        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx(), n_kv)) {
     if (kpool_track()) {
         mem->kpool_layout_update();
         auto st = kpool_build_sizes();
@@ -1682,25 +1827,15 @@ uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
 }
 
 bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const {
+    if (qsa_force_noncompact()) { return false; }
     if (qsa_prefix_matches(ubatch)) { return true; }
-    if (!get_idx() || !ubatch.token || !ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id ||
-            ubatch.n_seq_id[0]<1 || !ubatch.seq_id[0]) { return false; }
-    if (get_n_stream()!=1) {
-        // split streams: stream s of the ubatch holds tokens [s*n_tps, (s+1)*n_tps) and reads the cells of their sequence
-        const uint32_t ns = get_n_stream();
-        if (ubatch.n_tokens % ns != 0) { return false; }
-        const uint32_t n_tps = ubatch.n_tokens / ns;
-        for (uint32_t s = 0; s < ns; ++s) {
-            const uint32_t i0 = s*n_tps;
-            if (ubatch.n_seq_id[i0]<1 || !ubatch.seq_id[i0]) { return false; }
-            if (!qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[i0][0]), get_idx()->get_n_kv(), ratio, ubatch)) {
-                return false;
-            }
-        }
-        return true;
-    }
-    // one stream: every seq id of the ubatch reads the same cells
-    return qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[0][0]), get_idx()->get_n_kv(), ratio, ubatch);
+    return qsa_compact_reason(ubatch, ratio) == QSA_COMPACT_OK;
+}
+
+int llama_memory_hybrid_idx_context::qsa_compact_reason(const llama_ubatch & ubatch, uint32_t ratio) const {
+    // embedding (image) ubatches are accepted like token ubatches (PLAN-v3 §4.2 step 1); each stream with its own ids (step 2)
+    if (!get_idx() || !mem || !mem->get_mem_idx()) { return QSA_NC_INPUT; }
+    return llama_memory_hybrid_idx::qsa_compact_reason(mem->get_mem_idx(), get_n_stream(), get_idx()->get_n_kv(), ratio, ubatch);
 }
 
 void llama_memory_hybrid_idx::qsa_invalidate() {

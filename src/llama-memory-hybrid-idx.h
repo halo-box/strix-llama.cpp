@@ -3,6 +3,7 @@
 #include "llama-memory-hybrid.h"
 #include "qsa-prefix-state.h"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <memory>
@@ -128,6 +129,31 @@ public:
     void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows) const;
     void qsa_commit(int il) const;
 
+    // the full-cache context with the attention and indexer views limited to n_kv cells: reserve pass B (PLAN-v3 §7.1.3),
+    // the dense shortcut's graph at the largest padded n_kv it serves
+    llama_memory_context_ptr init_full_n_kv(uint32_t n_kv);
+
+    // PLAN-v3 §4.2 / §4.3: the compact predicate of a ubatch over the cells of kv (the attention cache at init, the
+    // indexer cache at graph time), each of the ubatch's n_stream streams with the sequence ids of its own tokens;
+    // QSA_COMPACT_OK or the reason of qsa_compact_reason (prefix.h)
+    static int qsa_compact_reason(const llama_kv_cache * kv, uint32_t n_stream, uint32_t n_kv, uint32_t ratio, const llama_ubatch & ubatch);
+
+    // the non-compact re-split (PLAN-v3 §4.3, P2-2): U = min(n_ubatch, strips x 512) tokens in total per non-compact ubatch
+    static constexpr uint32_t QSA_NONCOMPACT_STRIPS = 1;
+    uint32_t qsa_noncompact_cap(uint32_t n_ubatch) const { return std::min<uint32_t>(n_ubatch, qsa_nc_strips * 512); }
+    // replays of init_batch since the memory was made, and in its last call (test-qsa-resplit assert (vi))
+    uint64_t qsa_n_resplit() const { return n_qsa_resplit; }
+    uint32_t qsa_last_replays() const { return qsa_last_n_replay; }
+    // NC0 per ubatch of the last init_batch (true: init-time non-compact), and the sizes the replay used
+    const std::vector<uint8_t> & qsa_last_nc0() const { return qsa_last_nc0_v; }
+    // test hook: the ratios of the QSA layers, the indexer top-k and S (default: from the model and QSA_NONCOMPACT_STRIPS)
+    void qsa_resplit_configure(std::vector<uint32_t> ratios, uint32_t top_k, uint32_t strips) {
+        qsa_nc_ratios = std::move(ratios); qsa_nc_top_k = top_k; qsa_nc_strips = strips;
+    }
+    // the rank decision of the last scan, per stream of its ubatch (test-qsa-visibility's agreement assert)
+    const std::vector<uint8_t> & qsa_last_scan_ranked() const { return qsa_scan_ranked; }
+    uint32_t get_n_seq_max() const { return n_seq_max_qsa; }
+
 private:
     // closed-form metadata for an incremental ubatch on the tracked prefix; false when the scan is needed
     bool set_input_qsa_prefix(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
@@ -170,6 +196,18 @@ private:
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
+
+    // NC0 inputs (PLAN-v3 §4.3): the compress ratios of the QSA layers and the indexer top-k, and S
+    std::vector<uint32_t> qsa_nc_ratios;
+    uint32_t qsa_nc_top_k  = 0;
+    uint32_t qsa_nc_strips = QSA_NONCOMPACT_STRIPS;
+    uint32_t n_seq_max_qsa = 1;
+    uint64_t n_qsa_resplit = 0;
+    uint32_t qsa_last_n_replay = 0;
+    std::vector<uint8_t> qsa_last_nc0_v;
+    mutable std::vector<uint8_t> qsa_scan_ranked;
+    // NC0(u) on the cells prepare simulated: the selection path (n_kv > top_k + r - 1) and the compact predicate rejects u
+    bool qsa_nc0(const llama_ubatch & ubatch, const llama_kv_cache::slot_info & sinfo) const;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -203,6 +241,9 @@ public:
             llama_memory_hybrid_idx * mem,
                       llama_context * lctx,
                                bool   optimize);
+
+    // a full-cache context whose attention and indexer views hold n_kv cells (reserve pass B)
+    llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv);
 
     // used to create a batch processing context from a batch
     llama_memory_hybrid_idx_context(
@@ -259,6 +300,11 @@ public:
     // one stream, scalar positions in range, no 2d rope extents, no block split over sequence sets
     // (qsa_scalar_visibility_cells): the compact visibility rule applies
     bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
+    // why the compact predicate rejects ubatch on the indexer cells (QSA_COMPACT_OK when it accepts), for the decode error
+    int qsa_compact_reason(const llama_ubatch & ubatch, uint32_t ratio) const;
+    // the re-split cap U of this memory (PLAN-v3 §4.3) and whether it serves several sequences
+    uint32_t qsa_noncompact_cap(uint32_t n_ubatch) const { return mem ? mem->qsa_noncompact_cap(n_ubatch) : n_ubatch; }
+    bool qsa_multi_seq() const { return mem && mem->get_n_seq_max() > 1; }
     // scalar visibility and the cached cells form a single-sequence prefix with unique positions
     bool qsa_position_prefix(const llama_ubatch & ubatch, uint32_t ratio) const;
 

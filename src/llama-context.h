@@ -263,9 +263,18 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // a reserve graph other than the plain pp / tg shapes (PLAN-v3 §7.1): QSA graph flags (LLM_GRAPH_QSA_RESERVE_*),
+    // sequential positions instead of all-zero ones, and the last token of the ubatch as its one output
+    struct reserve_variant {
+        uint32_t qsa         = 0;
+        bool     seq_pos     = false;
+        bool     last_output = false;
+    };
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        const reserve_variant * variant = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -277,7 +286,11 @@ private:
     // with one consumer, and enough nodes inspected to mean something. Returns the error text, empty when it passes.
     std::string qsa_guard(ggml_cgraph * gf, const llm_graph_result * res, const char * where);
     // the init guard on split_only reserve graphs of one shape; throws on a violation
-    void qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const char * where);
+    void qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const char * where,
+            const reserve_variant * variant = nullptr);
+    // LLAMA_STRICT_RESERVE=1 (PLAN-v3 §7.1.6): after a ubatch's graph is allocated, every backend's compute buffer is at most
+    // its reserve; the first growth past it is logged with the ubatch and the largest nodes of that backend
+    void strict_reserve_check(const llama_ubatch & ubatch, ggml_cgraph * gf, const llm_graph_result * res);
     // the number of QSA layers a graph of this context holds, 0 when QSA does not apply
     int qsa_n_layers() const;
     // LLAMA_QSA_TRACE=1: producer x route x context per executed ubatch (§14.3), printed at exit
@@ -489,4 +502,13 @@ private:
     int64_t qsa_cpu_sparse_attn    = 0;   // executed SPARSE_ATTN / SPARSE_ATTN_PLAN / shortcut attention nodes on the CPU
     int64_t qsa_cpu_sparse_plan    = 0;
     int64_t qsa_cpu_shortcut_attn  = 0;
+    int     qsa_guard_last_inspected = 0; // the last guard pass: nodes read with a backend, nodes required
+    int     qsa_guard_last_required  = 0;
+
+    // LLAMA_STRICT_RESERVE (PLAN-v3 §7.1.6)
+    bool    strict_reserve           = [] { const char * e = getenv("LLAMA_STRICT_RESERVE"); return e != nullptr && atoi(e) != 0; }();
+    int64_t strict_violations        = 0;
+    int64_t strict_reallocs          = 0;
+    std::vector<size_t> strict_seen;    // the largest size seen per backend past its reserve
+    int64_t qsa_decode_errors        = 0;  // graph-build check (PLAN-v3 §4.3)
 };

@@ -813,7 +813,15 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    return prepare(ubatches, nullptr, nullptr);
+}
+
+llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches, const prepare_hook_t & hook, uint32_t * i_fail) {
     llama_kv_cache::slot_info_vec_t res;
+
+    if (i_fail) {
+        *i_fail = UINT32_MAX;
+    }
 
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
@@ -854,6 +862,15 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // now emplace the ubatch
         apply_ubatch(sinfo_new, ubatch);
+
+        // the cells now hold the state this ubatch's graph will see (PLAN-v3 §4.3, NC0 hook)
+        if (hook && !hook((uint32_t) (res.size() - 1), ubatch, sinfo_new)) {
+            if (i_fail) {
+                *i_fail = (uint32_t) (res.size() - 1);
+            }
+            success = false;
+            break;
+        }
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -3021,6 +3038,13 @@ llama_kv_cache_context::llama_kv_cache_context(
         sinfos[0].strm.push_back(s);
         sinfos[0].idxs[s].resize(1, 0);
     }
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        uint32_t n_kv) : llama_kv_cache_context(kv) {
+    GGML_ASSERT(n_kv > 0);
+    this->n_kv = std::min(n_kv, kv->get_size());
 }
 
 llama_kv_cache_context::llama_kv_cache_context(

@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -216,6 +217,12 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
+    // prepare with a check per ubatch (PLAN-v3 §4.3, the NC0 hook): hook(i, ubatch, sinfo) runs right after ubatch i is
+    // placed, on the cells exactly as apply_ubatch leaves them at graph time; false stops the preparation, sets *i_fail = i,
+    // restores the cells and returns an empty vector
+    using prepare_hook_t = std::function<bool(uint32_t, const llama_ubatch &, const slot_info &)>;
+    slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches, const prepare_hook_t & hook, uint32_t * i_fail);
+
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
@@ -389,6 +396,11 @@ public:
     // used to create a full-cache context
     llama_kv_cache_context(
             llama_kv_cache * kv);
+
+    // used to create a full-cache context whose view holds n_kv cells (a reserve graph at a smaller n_kv)
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t n_kv);
 
     // used to create an update context
     llama_kv_cache_context(

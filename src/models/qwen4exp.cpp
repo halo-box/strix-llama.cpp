@@ -1103,12 +1103,13 @@ static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t 
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
 // selected rows then carry the visibility themselves, so attention runs without a mask, on GGML_OP_SPARSE_ATTN, for any
 // K / V type, on any backend and whatever -fa or -nkvo say (PLAN-v3 D5, D21; the placement is pinned, build_layer_attn).
-// The token rule moves with the single-sequence image predicate (W9); until then image ubatches take the TE rows of a
-// non-compact ubatch (PLAN-v3 §4.1 row 4, qwen4exp-te.h).
+// Embedding (image) ubatches take it too: the single-sequence image predicate (PLAN-v3 §4.2) decides their visibility like a
+// token ubatch's; a non-compact ubatch takes the TE rows (PLAN-v3 §4.1 row 4, qwen4exp-te.h).
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
+    GGML_UNUSED(ubatch);
     return blk_bias && cparams.causal_attn && ratio>1 && hparams.indexer_top_k%ratio==0 &&
-        n_kv>hparams.indexer_top_k+ratio-1 && ubatch.token &&
+        n_kv>hparams.indexer_top_k+ratio-1 &&
         hparams.f_max_alibi_bias==0.0f && !hparams.attn_soft_cap &&
         hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256;
 }
@@ -1469,7 +1470,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const auto * attn_ctx = mctx_hyb->get_attn();
         const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, r, n_kv, ubatch, cparams, hparams);
         // the sparse op takes n_stream on ne[3] at any n_tps (PLAN-v3 §4.4)
-        const bool scalar = blocks && hparams.n_swa == 0 && mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
+        // the reserve's non-compact variant (PLAN-v3 §7.1.4) forces the decision: the empty-cache reserve ubatch is compact
+        const bool force_nc = (qsa_reserve & LLM_GRAPH_QSA_RESERVE_NONCOMPACT) != 0;
+        const bool scalar = !force_nc && blocks && hparams.n_swa == 0 && mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
+        // the always-on graph-build check (PLAN-v3 §4.3, no env gate): a non-compact ubatch on the selection path with more
+        // than U tokens, or any non-compact ubatch in a single-sequence context (it reserves no variant, §7.1.5), is a
+        // decode error; process_ubatch returns it before the graph is allocated. The reserve graphs never trigger it
+        // (they are compact, and the variant has T <= U); a reused graph keeps the same compact flag (can_reuse)
+        if (!scalar && !force_nc && n_kv > (int64_t) hparams.indexer_top_k + r - 1) {
+            const uint32_t U = mctx_hyb->qsa_noncompact_cap(cparams.n_ubatch);
+            if ((uint32_t) n_tokens > U || !mctx_hyb->qsa_multi_seq()) {
+                const int why = mctx_hyb->qsa_compact_reason(ubatch, (uint32_t) r);
+                res->set_qsa_decode_error(format("QSA layer %d: a non-compact ubatch (%s) of %d tokens (n_tps %" PRId64 ", n_stream %" PRId64
+                        ", n_seqs %u) at n_kv %" PRId64 " %s; the reserve covers non-compact ubatches of at most U = %u tokens in "
+                        "contexts serving several sequences (n_seq_max = %u, %s)", il, qsa_compact_reason_name(why), (int) n_tokens,
+                        n_tps, n_stream, ubatch.n_seqs_unq, n_kv, ubatch.token ? "text" : "embd", U, cparams.n_seq_max,
+                        !mctx_hyb->qsa_multi_seq() ? "single-sequence context: no non-compact reserve" : "the re-split did not apply"));
+            }
+        }
         qsa->compact  = scalar;   // I32 limits: one stream, or split streams of one sequence each
         qsa->maskless = scalar;
         qsa->score_strip = qwen4exp_score_strip(n_tps, n_stream, n_blocks, hparams.indexer_n_head);
@@ -1509,8 +1527,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
     ggml_tensor * storage = r == 4 && blk_bias && cparams.causal_attn && n_stream == 1 ? mctx_hyb->qsa_cache(ctx0, il) : nullptr;
-    ggml_tensor * cached = storage && mctx_hyb->qsa_prefix_matches(ubatch) ? storage : nullptr;
-    const bool fast_cache = cached && mctx_hyb->qsa_fast(il, ubatch);
+    // reserve pass A (PLAN-v3 §7.1.2) builds the fast-cache route the empty-cache reserve never reaches (C15: +33280 B ROCm0)
+    const bool reserve_fast = (qsa_reserve & LLM_GRAPH_QSA_RESERVE_FAST) != 0 && n_tokens <= 512;
+    ggml_tensor * cached = storage && (reserve_fast || mctx_hyb->qsa_prefix_matches(ubatch)) ? storage : nullptr;
+    const bool fast_cache = cached && (reserve_fast || mctx_hyb->qsa_fast(il, ubatch));
     const int64_t prep_blocks = fast_cache ? (n_tokens+3)/4+2 : n_blocks;
     ggml_tensor * member_rows = inp->blk_cells;
     ggml_tensor * block_positions = inp->blk_pos;

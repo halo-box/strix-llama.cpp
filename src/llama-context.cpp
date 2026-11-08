@@ -680,6 +680,18 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
     qsa_trace_print();
+    {
+        // plain stderr, as qsa_trace_print: the application's log callback may already be gone
+        const char * ctx_name = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
+        const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
+        if (mem != nullptr && mem->get_mem_idx() != nullptr && model.arch == LLM_ARCH_QWEN4EXP) {
+            fprintf(stderr, "LLAMA_QSA_RESPLIT ctx=%s n_qsa_resplit=%" PRIu64 " decode_errors=%" PRId64 "\n", ctx_name, mem->qsa_n_resplit(), qsa_decode_errors);
+        }
+        if (strict_reserve) {
+            fprintf(stderr, "LLAMA_STRICT_RESERVE ctx=%s violations=%" PRId64 " reallocs=%" PRId64 "\n", ctx_name, strict_violations, strict_reallocs);
+        }
+        fflush(stderr);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1055,14 +1067,17 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
                 where, n_inspected, n_required, (int) nodes.size(), n_layers);
     }
 
+    qsa_guard_last_inspected = n_inspected;
+    qsa_guard_last_required  = n_required;
     qsa_guard_passes++;
     qsa_guard_inspected += n_inspected;
     qsa_guard_inspected_min = qsa_guard_inspected_min < 0 ? n_inspected : std::min(qsa_guard_inspected_min, n_inspected);
     return "";
 }
 
-void llama_context::qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const char * where) {
-    auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx, true);
+void llama_context::qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const char * where,
+        const reserve_variant * variant) {
+    auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx, true, nullptr, variant);
     if (gf == nullptr) {
         throw std::runtime_error(format("failed to build the QSA guard's reserve graph '%s'", where));
     }
@@ -1095,7 +1110,8 @@ void llama_context::qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32
                 __func__, ctx_name, where, n_copy > 0 ? "host-kv-copy" : n_plan > 0 ? "sparse" : "dense-shortcut",
                 ggml_type_name(n0.type_k), ggml_type_name(n0.type_v), mem && mem->get_mem_idx() ? ggml_type_name(mem->get_mem_idx()->type_k()) : "none",
                 has_policy ? "backend" : "default", be0 ? ggml_backend_name(be0) : "none", n_plan, n_attend, n_cpu,
-                n_sched > 0 ? " shortcut=scheduler" : "", n_cpu > 0 ? " pinned-cpu" : "", n0.n_kv, n0.group, qsa_guard_inspected_min, 2 * qsa_n_layers());
+                n_sched > 0 ? " shortcut=scheduler" : "", n_cpu > 0 ? " pinned-cpu" : "", n0.n_kv, n0.group, qsa_guard_last_inspected,
+                std::max(qsa_guard_last_required, 1));
     }
 }
 
@@ -1276,6 +1292,88 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
         probe_max();
     }
+    if (!no_alloc) {
+        std::string sizes_pp_tg;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            sizes_pp_tg += format(" %s=%.2f", ggml_backend_name(backend_ptrs[i]), ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i])/1024.0/1024.0);
+        }
+        LLAMA_LOG_INFO("%s: reserve after the pp and tg graphs, MiB:%s\n", __func__, sizes_pp_tg.c_str());
+    }
+
+    // the QSA reserve graphs of PLAN-v3 §7.1, in the allocating context before the sizes are recorded below, and in the
+    // fit probe's per-backend max (no_alloc):
+    //  - pass A (§7.1.2): sequential positions, one output in the last row: the trim tile (n_tokens > 512) and the
+    //    incremental fast-cache route (n_tokens <= 512), which the all-zero-position reserve never builds (C15);
+    //  - pass B (§7.1.3): the dense shortcut at its largest padded n_kv (its [n_kv, n_tokens] mask, C15);
+    //  - the non-compact variant (§7.1.4) when the context serves several sequences: T = min(ub, S x 512) tokens in total,
+    //    the decision forced to non-compact at the full n_kv; the re-split bounds every runtime non-compact ubatch by T
+    struct qsa_reserve_pass {
+        const char * name;
+        uint32_t n_tokens;
+        uint32_t n_seqs;
+        uint32_t n_outputs;
+        const llama_memory_context_i * mctx;
+        reserve_variant var;
+    };
+    std::vector<qsa_reserve_pass> qsa_passes;
+    llama_memory_context_ptr mctx_shortcut;
+    if (qsa_n_layers() > 0 && !cparams.training) {
+        auto * mem_qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
+        GGML_ASSERT(mem_qsa != nullptr);
+        const auto & hp = model.hparams;
+        // one KV stream (unified, or a single sequence): the fast cache and the trim need n_stream == 1
+        if (cparams.kv_unified || n_seqs == 1) {
+            if (n_tokens > 512) {
+                qsa_passes.push_back({ "passA-trim", n_tokens, 1, 1, mctx.get(), { 0, true, true } });
+            }
+            // the fast route with every row an output (llama-perplexity at ub <= 512): C15's +33280 B sit under the logits
+            const uint32_t n_fast = std::min<uint32_t>(n_tokens, 512);
+            qsa_passes.push_back({ "passA-fast", n_fast, 1, std::min(n_fast, n_outputs_pp), mctx.get(), { LLM_GRAPH_QSA_RESERVE_FAST, true, false } });
+        }
+        // the shortcut serves n_kv <= top_k + r - 1; n_kv is padded to multiples of 256 (llama_kv_cache::get_n_kv)
+        uint32_t width = 0;
+        for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
+            if (hp.dsv4_compress_ratios[il] > 0) {
+                width = std::max<uint32_t>(width, hp.indexer_top_k + hp.dsv4_compress_ratios[il] - 1);
+            }
+        }
+        const uint32_t n_kv_b = width / 256 * 256;
+        const uint32_t n_kv_full = mem_qsa->get_mem_attn()->get_size();
+        if (n_kv_b >= 256 && n_kv_b < n_kv_full) {
+            // a stream's cells hold at least its own tokens of the ubatch, so a shortcut ubatch has at most n_kv_b tokens per
+            // stream: a 4096-token ubatch at n_kv 2048 cannot occur
+            const uint32_t n_streams = cparams.kv_unified ? 1 : n_seqs;
+            const uint32_t n_tok_b   = std::min(n_tokens, n_kv_b * n_streams);
+            mctx_shortcut = mem_qsa->init_full_n_kv(n_kv_b);
+            qsa_passes.push_back({ "passB", n_tok_b, n_seqs, std::min(n_tok_b, n_outputs_pp), mctx_shortcut.get(), {} });
+        }
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            // the MTP draft context processes prompt ubatches with no output row (W9 strict run: n_outputs = 0 on a 4096-token
+            // ubatch grew the MTP ROCm0 buffer past the pp reserve, whose graph always has >= 1 output)
+            qsa_passes.push_back({ "pp-0out", n_tokens, n_seqs, 0, mctx.get(), {} });
+        }
+        if (n_seqs > 1) {
+            const uint32_t T = std::min(n_tokens, mem_qsa->qsa_noncompact_cap(cparams.n_ubatch));
+            qsa_passes.push_back({ "noncompact", T, n_seqs, std::max(n_seqs, std::min(T, n_outputs_pp)), mctx.get(),
+                    { LLM_GRAPH_QSA_RESERVE_NONCOMPACT, false, false } });
+        }
+    }
+    for (auto & p : qsa_passes) {
+        auto * gf = graph_reserve(p.n_tokens, p.n_seqs, p.n_outputs, p.mctx, no_alloc, no_alloc ? probe_sizes.data() : nullptr, &p.var);
+        if (!gf) {
+            throw std::runtime_error(format("failed to allocate the QSA reserve graph '%s'", p.name));
+        }
+        probe_max();
+        // the per-backend reserve after this pass (grow-only), for the reserve accounting of AT-C12 / M5
+        std::string sizes_after;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t sz = no_alloc ? probe_sizes[i] : ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            sizes_after += format(" %s=%.2f", ggml_backend_name(backend_ptrs[i]), sz/1024.0/1024.0);
+        }
+        LLAMA_LOG_INFO("%s: QSA reserve %s: n_tokens = %u, n_seqs = %u, n_outputs = %u, n_kv = %u; %s MiB:%s\n", __func__, p.name,
+                p.n_tokens, p.n_seqs, p.n_outputs, static_cast<const llama_memory_hybrid_idx_context *>(p.mctx)->get_idx()->get_n_kv(),
+                no_alloc ? "this graph" : "reserve after it", sizes_after.c_str());
+    }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
@@ -1306,6 +1404,9 @@ void llama_context::sched_reserve() {
         qsa_guard_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), "pp");
         if (!cparams.training) {
             qsa_guard_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), "tg");
+        }
+        for (auto & p : qsa_passes) {
+            qsa_guard_reserve(p.n_tokens, p.n_seqs, p.n_outputs, p.mctx, p.name, &p.var);
         }
         ggml_backend_sched_reset(sched.get());
     }
@@ -2158,6 +2259,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // the QSA graph-build check (PLAN-v3 §4.3): an unreserved non-compact graph is never allocated
+        if (!res->get_qsa_decode_error().empty()) {
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, res->get_qsa_decode_error().c_str());
+            qsa_decode_errors++;
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
         const auto t_alloc_us = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -2174,6 +2283,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
+        }
+
+        if (strict_reserve) {
+            strict_reserve_check(ubatch, gf, res);
         }
 
         gf_res_prev_active = res;
@@ -3294,9 +3407,11 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+        const reserve_variant * variant) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+    // a reserve variant may have no output (the MTP prompt ubatch, PLAN-v3 §7.1); the plain reserves keep >= 1
+    GGML_ASSERT(n_outputs >= 1 || variant != nullptr);
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
@@ -3324,9 +3439,30 @@ ggml_cgraph * llama_context::graph_reserve(
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
+    if (variant && variant->seq_pos) {
+        // sequential positions per sequence, text under M-RoPE as [p, p, p, 0], ending at the last cell of a stream: the
+        // reserve then takes the routes that a degenerate all-zero ubatch never takes (the trim, the fast cache) with the
+        // widest scorer qwen4exp_score_key_limits allows (a ubatch at the end of the context)
+        const uint32_t n_ctx_stream = cparams.kv_unified ? cparams.n_ctx : std::max<uint32_t>(1, cparams.n_ctx / std::max<uint32_t>(1, cparams.n_seq_max));
+        const llama_pos pos0 = (llama_pos) (n_ctx_stream > ubatch.n_seq_tokens ? n_ctx_stream - ubatch.n_seq_tokens : 0);
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            for (uint32_t t = 0; t < ubatch.n_seq_tokens; ++t) {
+                const uint32_t i = s*ubatch.n_seq_tokens + t;
+                for (uint32_t a = 0; a < ubatch.n_pos; ++a) {
+                    ubatch.pos[i + a*ubatch.n_tokens] = (a == 3 && ubatch.n_pos == 4) ? 0 : pos0 + (llama_pos) t;
+                }
+            }
+        }
+    }
+    if (variant && variant->last_output) {
+        std::fill(ubatch.output, ubatch.output + ubatch.n_tokens, 0);
+        ubatch.output[ubatch.n_tokens - 1] = 1;
+    }
+
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    gparams.qsa_reserve = variant ? variant->qsa : 0;
 
     res->reset();
 
@@ -3644,13 +3780,56 @@ void llama_context::vsub_init_head(ggml_tensor * w, const llama_vocab_subset::he
     ggml_backend_tensor_set(head.scorer, data.data(), 0, data.size());
 }
 
+void llama_context::strict_reserve_check(const llama_ubatch & ubatch, ggml_cgraph * gf, const llm_graph_result * res) {
+    if (strict_seen.size() != backend_ptrs.size()) {
+        strict_seen.assign(backend_ptrs.size(), 0);
+    }
+    const char * ctx_name = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        ggml_backend_t backend = backend_ptrs[i];
+        const size_t size = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+        const size_t exp  = backend_buf_exp_size[i];
+        // gallocr never shrinks: log each new high-water mark past the reserve once
+        if (size <= exp || size <= strict_seen[i]) {
+            continue;
+        }
+        strict_seen[i] = size;
+        strict_violations++;
+        // the largest nodes of this backend in the graph that grew it
+        std::vector<std::pair<size_t, const ggml_tensor *>> big;
+        for (int j = 0; j < ggml_graph_n_nodes(gf); ++j) {
+            ggml_tensor * t = ggml_graph_node(gf, j);
+            if (ggml_backend_sched_get_tensor_backend(sched.get(), t) == backend) {
+                big.emplace_back(ggml_nbytes(t), t);
+            }
+        }
+        std::sort(big.begin(), big.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        std::string nodes;
+        for (size_t j = 0; j < std::min<size_t>(3, big.size()); ++j) {
+            nodes += format(" %s(%s %.2f MiB)", big[j].second->name, ggml_op_desc(big[j].second), big[j].first/1024.0/1024.0);
+        }
+        std::string qsa;
+        if (!res->get_qsa_nodes().empty()) {
+            const auto & n = res->get_qsa_nodes().front();
+            qsa = format(" qsa producer=%s n_q=%" PRId64 " n_kv=%" PRId64 " n_stream=%" PRId64, n.producer, n.n_q, n.n_kv, n.n_stream);
+        }
+        LLAMA_LOG_ERROR("LLAMA_STRICT_RESERVE violation ctx=%s backend=%s buffer=%.4f MiB > reserve=%.4f MiB (+%zu B): ubatch n_tokens=%u n_seqs=%u n_outputs=%d %s%s; graph nodes=%d splits=%d; largest nodes:%s\n",
+                ctx_name, ggml_backend_name(backend), size/1024.0/1024.0, exp/1024.0/1024.0, size - exp, ubatch.n_tokens, ubatch.n_seqs_unq,
+                (int) n_outputs, ubatch.token ? "text" : "embd", qsa.c_str(), ggml_graph_n_nodes(gf), ggml_backend_sched_get_n_splits(sched.get()), nodes.c_str());
+    }
+}
+
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    if (lctx->strict_reserve) {
+        // LLAMA_STRICT_RESERVE: every re-plan is counted; the growth itself is checked after the allocation (strict_reserve_check)
+        lctx->strict_reallocs++;
+    }
+
     // reallocating after the backend assignments changed is expected, trace only the unexpected ones
     if (backend_ids_changed) {
         return;
     }
-
-    auto * lctx = static_cast<llama_context *>(user_data);
 
     if (graph_size_changed) {
         lctx->n_reallocs_diff++;
