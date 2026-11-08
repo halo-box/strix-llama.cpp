@@ -1036,8 +1036,8 @@ public:
     const std::vector<llm_graph_qsa_node> & get_qsa_nodes() const { return qsa_nodes; }
 
     // the QSA graph-build check (PLAN-v3 §4.3): non-empty when this graph must not be allocated; llama_decode returns an error
-    void set_qsa_decode_error(std::string msg) { if (qsa_decode_error.empty()) { qsa_decode_error = std::move(msg); } }
-    const std::string & get_qsa_decode_error() const { return qsa_decode_error; }
+    void set_qsa_ubatch_error(std::string msg) { if (qsa_ubatch_error.empty()) { qsa_ubatch_error = std::move(msg); } }
+    const std::string & get_qsa_ubatch_error() const { return qsa_ubatch_error; }
 
     void set_params(const llm_graph_params & params);
 
@@ -1059,7 +1059,7 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::vector<llm_graph_qsa_node>   qsa_nodes;   // the attention node of every QSA layer of this graph
-    std::string                       qsa_decode_error;
+    std::string                       qsa_ubatch_error;
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
 

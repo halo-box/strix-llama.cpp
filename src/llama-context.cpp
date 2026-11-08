@@ -686,7 +686,7 @@ llama_context::~llama_context() {
         const char * ctx_name = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
         const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
         if (mem != nullptr && mem->get_mem_idx() != nullptr && model.arch == LLM_ARCH_QWEN4EXP) {
-            fprintf(stderr, "LLAMA_QSA_RESPLIT ctx=%s n_qsa_resplit=%" PRIu64 " decode_errors=%" PRId64 "\n", ctx_name, mem->qsa_n_resplit(), qsa_decode_errors);
+            fprintf(stderr, "LLAMA_QSA_RESPLIT ctx=%s n_qsa_resplit=%" PRIu64 " decode_errors=%" PRId64 "\n", ctx_name, mem->qsa_n_resplit(), qsa_ubatch_errors);
         }
         if (strict_reserve) {
             fprintf(stderr, "LLAMA_STRICT_RESERVE ctx=%s violations=%" PRId64 " reallocs=%" PRId64 "\n", ctx_name, strict_violations, strict_reallocs);
@@ -2261,9 +2261,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         // the QSA graph-build check (PLAN-v3 §4.3): an unreserved non-compact graph is never allocated
-        if (!res->get_qsa_decode_error().empty()) {
-            LLAMA_LOG_ERROR("%s: %s\n", __func__, res->get_qsa_decode_error().c_str());
-            qsa_decode_errors++;
+        if (!res->get_qsa_ubatch_error().empty()) {
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, res->get_qsa_ubatch_error().c_str());
+            qsa_ubatch_errors++;
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
