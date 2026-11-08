@@ -13,6 +13,8 @@
 //   dims in sequential order; per cell, in the plan's ascending cell order: if s > m { alpha = (m == -inf) ? 0 :
 //   expf(m - s); acc *= alpha; l *= alpha; m = s }; p = expf(s - m); l += p; acc += f16(p) * v; out = l > 0 ? acc / l : 0.
 //   The only arithmetic difference from the CPU op is the device expf (ocml) against the host's.
+//   Rotations (PLAN-v3 §8, D13): H_q of q (f32, before the product with scale) and H_o of acc / l through shared memory,
+//   sa_fwht_smem (sparse-attn-fwht.cuh: the arithmetic of fwht.cu and of the CPU op's sa_fwht).
 // Masked-off and padding cells are never loaded (the cells are collected from this query's mask bits), so their bytes
 // cannot reach the output (contract item 4).
 //
@@ -30,6 +32,7 @@
 #if defined(GGML_USE_HIP)
 
 #include "sparse-attn-loaders.cuh"
+#include "sparse-attn-fwht.cuh"
 
 #define SA_P_D     256   // head size (supports_op)
 #define SA_P_TILE  16    // cells per staged tile
@@ -48,6 +51,9 @@ struct sa_portable_args {
     const uint16_t * masks;
     int              n_groups, cap, G, n_q, n_head, n_head_kv, gqa, kt_g, vt_g;
     float            scale;
+    int              rot_q, rot_o;              // H_q / H_o block sizes (0, 64, 128, 256)
+    float            rot_q_scale, rot_o_scale;  // 1.0f / sqrtf(rot), as fwht.cu
+    int              rot_dump;                  // test hook: H_q q into out, nothing else
     float *          out;       // dst F32 [256, n_head, n_q, n_stream]
 };
 
@@ -68,10 +74,27 @@ static __global__ void __launch_bounds__(256) sa_attend_portable(const sa_portab
     __shared__ int   cnt[SA_P_BATCH + 1];
     __shared__ int   cells[4 * SA_P_BATCH];
 
-    for (int h = 0; h < r; ++h) {
-        const float x = *reinterpret_cast<const float *>(a.q + (size_t) s * a.q_nb3 + (size_t) i * a.q_nb1 +
-                                                         (size_t) (kvh * r + h) * a.q_nb2 + (size_t) d * sizeof(float));
-        qs[h][d] = sa_h2f_bits(sa_f2h(x * a.scale));
+    if (a.rot_q != 0) {   // uniform over the grid
+        for (int h = 0; h < r; ++h) {
+            qs[h][d] = *reinterpret_cast<const float *>(a.q + (size_t) s * a.q_nb3 + (size_t) i * a.q_nb1 +
+                                                        (size_t) (kvh * r + h) * a.q_nb2 + (size_t) d * sizeof(float));
+        }
+        sa_fwht_smem<SA_P_D>(&qs[0][0], r, SA_P_D + 1, a.rot_q, a.rot_q_scale, d, SA_P_D);
+        if (a.rot_dump) {
+            for (int h = 0; h < r; ++h) {
+                a.out[(((size_t) s * a.n_q + i) * a.n_head + (size_t) (kvh * r + h)) * SA_P_D + d] = qs[h][d];
+            }
+            return;
+        }
+        for (int h = 0; h < r; ++h) {
+            qs[h][d] = sa_h2f_bits(sa_f2h(qs[h][d] * a.scale));
+        }
+    } else {
+        for (int h = 0; h < r; ++h) {
+            const float x = *reinterpret_cast<const float *>(a.q + (size_t) s * a.q_nb3 + (size_t) i * a.q_nb1 +
+                                                             (size_t) (kvh * r + h) * a.q_nb2 + (size_t) d * sizeof(float));
+            qs[h][d] = sa_h2f_bits(sa_f2h(x * a.scale));
+        }
     }
     if (d < SA_P_RMAX) {
         m_s[d] = -INFINITY;
@@ -174,6 +197,20 @@ static __global__ void __launch_bounds__(256) sa_attend_portable(const sa_portab
         __syncthreads();       // cnt and cells are rewritten by the next batch
     }
 
+    if (a.rot_o != 0) {   // uniform over the grid; qs is free (the last tile ended on a barrier)
+#pragma unroll
+        for (int h = 0; h < SA_P_RMAX; ++h) {
+            if (h < r) {
+                const float l = l_s[h];
+                qs[h][d] = l > 0.0f ? acc[h] / l : 0.0f;
+            }
+        }
+        sa_fwht_smem<SA_P_D>(&qs[0][0], r, SA_P_D + 1, a.rot_o, a.rot_o_scale, d, SA_P_D);
+        for (int h = 0; h < r; ++h) {
+            a.out[(((size_t) s * a.n_q + i) * a.n_head + (size_t) (kvh * r + h)) * SA_P_D + d] = qs[h][d];
+        }
+        return;
+    }
 #pragma unroll
     for (int h = 0; h < SA_P_RMAX; ++h) {
         if (h < r) {
@@ -204,6 +241,11 @@ void ggml_cuda_sa_portable_launch(cudaStream_t stream, const ggml_cuda_sa_portab
     a.kt_g      = p.kt_g;
     a.vt_g      = p.vt_g;
     a.scale     = p.scale;
+    a.rot_q       = p.rot_q;
+    a.rot_o       = p.rot_o;
+    a.rot_q_scale = ggml_cuda_sa_rot_scale(p.rot_q);
+    a.rot_o_scale = ggml_cuda_sa_rot_scale(p.rot_o);
+    a.rot_dump    = p.rot_dump;
     a.out       = p.out;
     const unsigned blocks = (unsigned) ((int64_t) p.n_q * p.n_stream * p.n_head_kv);
     sa_attend_portable<<<blocks, 256, 0, stream>>>(a);

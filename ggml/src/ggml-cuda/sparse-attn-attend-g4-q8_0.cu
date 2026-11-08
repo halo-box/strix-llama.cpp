@@ -1,4 +1,4 @@
-// The 48 sa_attend_g4 instances and the 8 sa_attend_fixup instances with K type q8_0 (GGML_CUDA_SA_G4_KT_ and
+// The 96 sa_attend_g4 instances (48 census indices x ROT false / true) and the 8 sa_attend_fixup instances with K type q8_0 (GGML_CUDA_SA_G4_KT_ and
 // GGML_CUDA_SA_FIXUP_KT_ of sparse-attn-census.h), one TU per K type so the G4 instances build in parallel. Dispatched by
 // sparse-attn-attend-g4.cu through ggml_cuda_sa_g4_kernels_q8_0 and ggml_cuda_sa_fixup_kernels_q8_0.
 
@@ -7,9 +7,10 @@
 
 #if defined(GGML_USE_HIP)
 
-#define SA_G4_FN(kt, vt, vl, epi, gqa) sa_attend_g4<SA_TID_##kt, SA_TID_##vt, SA_VL_##vl, SA_EPI_##epi, gqa>,
-extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q8_0[GGML_CUDA_SA_G4_PER_KT];
-const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q8_0[GGML_CUDA_SA_G4_PER_KT] = { GGML_CUDA_SA_G4_KT_(SA_G4_FN, q8_0) };
+#define SA_G4_FN(kt, vt, vl, epi, gqa) sa_attend_g4<SA_TID_##kt, SA_TID_##vt, SA_VL_##vl, SA_EPI_##epi, gqa, false>, \
+                                       sa_attend_g4<SA_TID_##kt, SA_TID_##vt, SA_VL_##vl, SA_EPI_##epi, gqa, true>,
+extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q8_0[2 * GGML_CUDA_SA_G4_PER_KT];
+const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q8_0[2 * GGML_CUDA_SA_G4_PER_KT] = { GGML_CUDA_SA_G4_KT_(SA_G4_FN, q8_0) };
 #undef SA_G4_FN
 
 #define SA_FIXUP_FN(kt, vt, epi) sa_attend_fixup<SA_TID_##kt, SA_TID_##vt, SA_EPI_##epi>,

@@ -26,7 +26,13 @@
 //     [z * len, min((z + 1) * len, C)), len = ceil(C / S), of its C = counts / 4 chunks: a pure function of the plan (at
 //     most as many chunks per split as the PR's 64-key splits hold on complete-quad rows). With one split the block
 //     normalises and writes dst itself; otherwise it writes the PR partial row (256 values, max, normaliser) and
-//     sa_merge_splits (sparse-attn-merge.cu) combines the splits in a fixed order.
+//     sa_merge_splits (sparse-attn-merge.cu) combines the splits in a fixed order;
+//   - the in-op rotations (PLAN-v3 §8, D13): rot_q != 0 replaces the Q prologue by one that takes whole query rows (wave w
+//     the heads w and w + 8) through fwht_row (sparse-attn-fwht.cuh, the arithmetic of fwht.cu) in f32 before the f32
+//     product with scale and the f16 rounding; rot_o != 0 makes the one-split epilogue stage acc / l per head in shared
+//     memory (8 heads at a time) and store H_o of each row (fwht_row); with more splits the partials stay unrotated and
+//     sa_merge_splits applies H_o after the merge. The rotation code exists only in the ROT = true instances: the ROT =
+//     false ones, which every op without rotation runs, compile to the W9 kernels.
 //
 // Every count / quad / mask entry the kernel reads is inside the plan dst; every K / V cell it reads is a cell
 // 4 * quad + c with quad < ceil(n_kv / 4), inside the views (ggml_sparse_attn asserts the view rows). Offsets are size_t.
@@ -83,6 +89,7 @@ static inline size_t sa_g1_partial_bytes_max(const int64_t n_q, const int64_t n_
 #if defined(GGML_USE_HIP)
 
 #include "sparse-attn-loaders.cuh"
+#include "sparse-attn-fwht.cuh"
 
 #ifndef SA_L2E
 #define SA_L2E 1.4426950408889634f
@@ -110,14 +117,20 @@ struct sa_g1_args {
     float *          partial;   // splits > 1: [n_stream][n_q][n_head][splits][258]
     int              kt_g;      // KT / VT == SA_T_GEN (the generic tier): the ggml types of K and V (sa_any_elem)
     int              vt_g;
+    int              rot_q;     // H_q block size (0, 64, 128 or 256)
+    int              rot_o;     // H_o block size; applied here with one split, by sa_merge_splits otherwise
+    float            rot_q_scale;   // 1.0f / sqrtf(rot_q), as fwht.cu computes it
+    float            rot_o_scale;   // 1.0f / sqrtf(rot_o)
+    int              rot_dump;  // test hook (GGML_CUDA_SA_ROT_DUMP=1, rot_q != 0): write H_q q (f32) to out and stop
 };
 
 typedef void (*sa_g1_kernel_t)(const sa_g1_args);
 
-// the generic tier's G1 instances (sparse-attn-generic.cu): sa_attend_g1<SA_T_GEN, SA_T_GEN, GQA> at index gqa_index
+// the generic tier's G1 instances (sparse-attn-generic.cu): sa_attend_g1<SA_T_GEN, SA_T_GEN, GQA, ROT> at index
+// 2 * gqa_index + ROT
 extern const sa_g1_kernel_t ggml_cuda_sa_gen_g1_kernels[];
 
-template <int KT, int VT, int GQA>
+template <int KT, int VT, int GQA, bool ROT>
 __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
     GGML_UNUSED(a);
@@ -134,6 +147,7 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
     __shared__ union {
         uint16_t query_stage[8][16][32];
         float4   scores[8][64];
+        float    ostage[8][256];   // rot_o epilogue: acc / l of 8 heads, whole rows
     } shared;
     __shared__ __align__(16) uint16_t probabilities[16][16];
     __shared__ float alpha_s[16];
@@ -153,11 +167,46 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
 
     // Q prologue: f16(q * scale) (f32 product, one rounding; the PR computed f16(q) * f16(scale)), rows >= GQA zero
     sa_v16s qf[2];
-    for (int j = lane; j < 16*32; j += 32) {
-        const int head = j / 32, d = j % 32;
-        const float value = head < GQA ? *(const float *) (a.q + (size_t) s * a.q_nb3 + (size_t) query * a.q_nb1 +
-                                                           (size_t) (kvh * GQA + head) * a.q_nb2 + (size_t) (w * 32 + d) * 4) : 0.0f;
-        shared.query_stage[w][head][d] = sa_f2h(value * a.scale);
+    if (ROT && a.rot_q != 0) {
+        // H_q: wave w takes heads w and w + 8 whole (lane l holds dims 32 j + l), transforms them in f32 and writes
+        // f16(x * scale) of dim 32 j + l into the stage of wave j
+        for (int head = w; head < 16; head += 8) {
+            float x[8];
+            if (head < GQA) {   // uniform over the wave
+                const float * src = (const float *) (a.q + (size_t) s * a.q_nb3 + (size_t) query * a.q_nb1 + (size_t) (kvh * GQA + head) * a.q_nb2);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    x[j] = src[32*j + lane];
+                }
+                fwht_row<256, 32>(x, lane, a.rot_q, a.rot_q_scale);
+                if (a.rot_dump) {
+                    float * dst = a.out + (((size_t) s * a.n_q + query) * a.n_head + (size_t) (kvh * GQA + head)) * 256;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        dst[32*j + lane] = x[j];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    x[j] = 0.0f;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                shared.query_stage[j][head][lane] = sa_f2h(x[j] * a.scale);
+            }
+        }
+        if (a.rot_dump) {
+            return;   // uniform over the block: the test hook stops after the transform
+        }
+    } else {
+        for (int j = lane; j < 16*32; j += 32) {
+            const int head = j / 32, d = j % 32;
+            const float value = head < GQA ? *(const float *) (a.q + (size_t) s * a.q_nb3 + (size_t) query * a.q_nb1 +
+                                                               (size_t) (kvh * GQA + head) * a.q_nb2 + (size_t) (w * 32 + d) * 4) : 0.0f;
+            shared.query_stage[w][head][d] = sa_f2h(value * a.scale);
+        }
     }
     __syncthreads();
 #pragma unroll
@@ -334,7 +383,38 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
             l_s[r] = normalizer;
         }
         __syncthreads();
-        if (r < GQA) {
+        if (ROT && a.rot_o != 0) {
+            // H_o: 8 heads at a time, acc / l staged whole (head - h0, dim) in shared memory; wave w then transforms head
+            // h0 + w (the fwht_row layout) and stores it. The chunk loop ended on a barrier, so the union is free
+            for (int h0 = 0; h0 < GQA; h0 += 8) {
+                if (r >= h0 && r < h0 + 8 && r < GQA) {
+                    const float l = l_s[r];
+#pragma unroll
+                    for (int t = 0; t < 2; ++t) {
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) {
+                            shared.ostage[r - h0][32*w + 16*t + 2*e + hi] = l > 0.0f ? output[t][e] / l : 0.0f;
+                        }
+                    }
+                }
+                __syncthreads();
+                const int head = h0 + w;
+                if (head < GQA) {   // uniform over the wave
+                    float x[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        x[j] = shared.ostage[w][32*j + lane];
+                    }
+                    fwht_row<256, 32>(x, lane, a.rot_o, a.rot_o_scale);
+                    float * dst = a.out + (((size_t) s * a.n_q + query) * a.n_head + (size_t) (kvh * GQA + head)) * 256;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        dst[32*j + lane] = x[j];
+                    }
+                }
+                __syncthreads();
+            }
+        } else if (r < GQA) {
             const float l = l_s[r];
             float * dst = a.out + (((size_t) s * a.n_q + query) * a.n_head + (size_t) (kvh * GQA + r)) * 256;
 #pragma unroll

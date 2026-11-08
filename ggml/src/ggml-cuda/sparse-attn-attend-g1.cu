@@ -118,9 +118,10 @@ bool ggml_cuda_sparse_attn_prefer_dense(int device, ggml_type type_k, ggml_type 
 
 #if defined(GGML_USE_HIP)
 
-// the 48 G1 instances, in GGML_CUDA_SA_G1_INSTANCES order: index (kt * 4 + vt) * 3 + gqa_index
-#define SA_G1_FN(kt, vt, gqa) sa_attend_g1<SA_TID_##kt, SA_TID_##vt, gqa>,
-static const sa_g1_kernel_t sa_g1_kernels[GGML_CUDA_SA_G1_N] = { GGML_CUDA_SA_G1_INSTANCES(SA_G1_FN) };
+// the 96 G1 instances, in GGML_CUDA_SA_G1_INSTANCES order, two per census index i = (kt * 4 + vt) * 3 + gqa_index:
+// entry 2 * i is ROT = false (no rotation code), 2 * i + 1 ROT = true
+#define SA_G1_FN(kt, vt, gqa) sa_attend_g1<SA_TID_##kt, SA_TID_##vt, gqa, false>, sa_attend_g1<SA_TID_##kt, SA_TID_##vt, gqa, true>,
+static const sa_g1_kernel_t sa_g1_kernels[2 * GGML_CUDA_SA_G1_N] = { GGML_CUDA_SA_G1_INSTANCES(SA_G1_FN) };
 #undef SA_G1_FN
 
 int64_t ggml_cuda_sa_g1_splits(int64_t n_q, int64_t n_sel, int64_t n_kv) {
@@ -155,10 +156,16 @@ void ggml_cuda_sa_g1_launch(cudaStream_t stream, const ggml_cuda_sa_g1_launch_pa
     a.scale     = p.scale;
     a.out       = p.out;
     a.partial   = p.partial;
+    a.rot_q       = p.rot_q;
+    a.rot_o       = p.splits == 1 ? p.rot_o : 0;   // with more splits sa_merge_splits applies H_o
+    a.rot_q_scale = ggml_cuda_sa_rot_scale(p.rot_q);
+    a.rot_o_scale = ggml_cuda_sa_rot_scale(p.rot_o);
+    a.rot_dump    = p.rot_dump;
     const int idx = (p.kt * SA_T_COUNT + p.vt) * 3 + p.gqa_index;
     // grid: x = (stream, query, kv head) with the kv head fastest (the PR's blockIdx.x), y = split
     const dim3 grid((unsigned) ((int64_t) p.n_q * p.n_stream * p.n_head_kv), (unsigned) p.splits, 1);
-    sa_g1_kernels[idx]<<<grid, 256, 0, stream>>>(a);
+    const int rot = a.rot_q != 0 || a.rot_o != 0 ? 1 : 0;
+    sa_g1_kernels[2 * idx + rot]<<<grid, 256, 0, stream>>>(a);
     const int cls = sa_g1_split_class(p.splits);
     ggml_cuda_sa_census_add((ggml_cuda_sa_census_id) (GGML_CUDA_SA_CENSUS_G1_FIRST + idx * SA_G1_SPLIT_CLASSES + cls));
 }

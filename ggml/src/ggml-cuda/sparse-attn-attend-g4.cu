@@ -8,8 +8,10 @@
 //             of S with a member outside S_fast (f32, q4_1, q5_0, q5_1, iq4_nl);
 //   portable  the scalar attend of sparse-attn-portable.cu (any type of S, any plan G, no WMMA / cross-lane operation).
 // The WMMA tiers are selected at runtime only on RDNA3.5 (GGML_CUDA_CC_IS_RDNA3_5, the arch PR #219 gates every QSA
-// kernel to, qsa-decode.cu:85); every other HIP arch runs the portable tier (its speed there is UNPROVEN, U15). All tiers
-// take rot_q = rot_o = 0 until the in-op rotation (W10): supports_op is false for rot != 0.
+// kernel to, qsa-decode.cu:85); every other HIP arch runs the portable tier (its speed there is UNPROVEN, U15). Every tier
+// applies the in-op rotations (PLAN-v3 §8, D13, W10): H_q in its Q prologue and H_o in its epilogue (the G1 split merge
+// for G1 with more than one split), with the transform of sparse-attn-fwht.cuh that fwht.cu runs, so the gate fusion
+// matches for quantized caches too (the output un-rotation no longer sits between the attend and the gate).
 //
 // One shape-only function, sa_select, decides the tier, the kernel instance and the V loader; supports_op, get_alloc_size,
 // the dispatch and the census all use it (PLAN-v3 §5 "kernel instance, V pack vs direct, split count").
@@ -34,7 +36,10 @@
 // the generic tier for every pair of S; portable forces the portable tier; g1 | g4 force the group policy
 // (sparse-attn-attend-g1.cu). It changes the kernel choice inside the backend only, never placement, and get_alloc_size
 // follows it; the census skip proc names the keys a forced process (or another arch) cannot dispatch
-// (ggml_cuda_sparse_attn_census_skip).
+// (ggml_cuda_sparse_attn_census_skip). fixup makes sa_attend_fixup recompute every G4 block (its exact path, rotations
+// included, then runs on every case).
+// Test hook GGML_CUDA_SA_ROT_DUMP=1 (read at every dispatch, tests/test-sparse-attn-rot.cpp): an op with rot_q != 0 writes
+// H_q q (f32, before the product with scale) into dst instead of the attention, and launches nothing after the attend.
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-census.h"
@@ -81,15 +86,16 @@ enum sa_force_tier { SA_FORCE_TIER_NONE = 0, SA_FORCE_TIER_GENERIC, SA_FORCE_TIE
 enum sa_tier       { SA_TIER_FAST = 0, SA_TIER_GENERIC, SA_TIER_PORTABLE };
 
 struct sa_force_t {
-    int vl;
-    int tier;
+    int  vl;
+    int  tier;
+    bool fixup_all;
 };
 
 // GGML_CUDA_SA_FORCE, parsed once: the V loader and the tier (g1 / g4 are the group policy's, read at every call by
 // sparse-attn-attend-g1.cu)
 static const sa_force_t & sa_force(void) {
     static const sa_force_t f = [] {
-        sa_force_t r = { SA_FORCE_VL_NONE, SA_FORCE_TIER_NONE };
+        sa_force_t r = { SA_FORCE_VL_NONE, SA_FORCE_TIER_NONE, false };
         const char * e = getenv("GGML_CUDA_SA_FORCE");
         if (e == nullptr) {
             return r;
@@ -107,17 +113,20 @@ static const sa_force_t & sa_force(void) {
                 r.tier = SA_FORCE_TIER_GENERIC;
             } else if (tok == "portable") {
                 r.tier = SA_FORCE_TIER_PORTABLE;
+            } else if (tok == "fixup") {
+                r.fixup_all = true;
             } else if (tok == "g1" || tok == "g4") {
                 // the group policy's (sparse-attn-attend-g1.cu)
             } else if (!tok.empty()) {
-                GGML_LOG_WARN("%s: GGML_CUDA_SA_FORCE: '%s' is not a forcing switch of this build (vpacked, vdirect, generic, portable, g1, g4)\n", __func__, tok.c_str());
+                GGML_LOG_WARN("%s: GGML_CUDA_SA_FORCE: '%s' is not a forcing switch of this build (vpacked, vdirect, generic, portable, fixup, g1, g4)\n", __func__, tok.c_str());
             }
             p = q + 1;
         }
-        if (r.tier != SA_FORCE_TIER_NONE || r.vl != SA_FORCE_VL_NONE) {
-            GGML_LOG_INFO("%s: GGML_CUDA_SA_FORCE=%s: tier %s, V loader %s\n", __func__, e,
+        if (r.tier != SA_FORCE_TIER_NONE || r.vl != SA_FORCE_VL_NONE || r.fixup_all) {
+            GGML_LOG_INFO("%s: GGML_CUDA_SA_FORCE=%s: tier %s, V loader %s, G4 fixup %s\n", __func__, e,
                           r.tier == SA_FORCE_TIER_GENERIC ? "generic" : r.tier == SA_FORCE_TIER_PORTABLE ? "portable" : "policy",
-                          r.vl == SA_FORCE_VL_PACKED ? "packed" : r.vl == SA_FORCE_VL_DIRECT ? "direct" : "policy");
+                          r.vl == SA_FORCE_VL_PACKED ? "packed" : r.vl == SA_FORCE_VL_DIRECT ? "direct" : "policy",
+                          r.fixup_all ? "every block" : "flagged blocks");
         }
         return r;
     }();
@@ -126,6 +135,12 @@ static const sa_force_t & sa_force(void) {
 
 static int sa_force_vl(void) {
     return sa_force().vl;
+}
+
+// GGML_CUDA_SA_ROT_DUMP=1 (test hook, read at every dispatch so one process can run both arms)
+static bool sa_rot_dump(void) {
+    const char * e = getenv("GGML_CUDA_SA_ROT_DUMP");
+    return e != nullptr && atoi(e) != 0;
 }
 
 // the tier of HIP device `device` before the type pair is known: portable on every arch other than RDNA3.5 and under
@@ -246,9 +261,14 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
         r.why = "head size other than 256";
         return r;
     }
-    if (ggml_get_op_params_i32(op, 1) != 0 || ggml_get_op_params_i32(op, 2) != 0) {
-        r.why = "rot_q / rot_o != 0 (in-op rotation: W10)";
-        return r;
+    {
+        // the in-op rotations: blocks of 64, 128 or 256 of the 256 dims (fwht_row, sparse-attn-fwht.cuh)
+        const int32_t rq = ggml_get_op_params_i32(op, 1), ro = ggml_get_op_params_i32(op, 2);
+        auto rot_ok = [](const int32_t x) { return x == 0 || x == 64 || x == 128 || x == 256; };
+        if (!rot_ok(rq) || !rot_ok(ro)) {
+            r.why = "rot_q / rot_o not in {0, 64, 128, 256}";
+            return r;
+        }
     }
     if (r.G != 1 && r.G != 4) {
         r.why = "plan G other than 1 or 4";
@@ -500,6 +520,10 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
                 "SPARSE_ATTN dst is not over-allocated by the HIP buffer type (get_alloc_size)");
     cudaStream_t stream = ctx.stream();
     const bool generic = sel.tier == SA_TIER_GENERIC;
+    const int  rot_q   = ggml_get_op_params_i32(dst, 1);
+    const int  rot_o   = ggml_get_op_params_i32(dst, 2);
+    const bool rot_dump = rot_q != 0 && sa_rot_dump();
+    GGML_ASSERT((!rot_dump || epi == SA_EPI_PLAIN) && "GGML_CUDA_SA_ROT_DUMP: plain attends only");
 
     if (sel.tier == SA_TIER_PORTABLE) {
         GGML_ASSERT(epi == SA_EPI_PLAIN && "the gate fusion has fast G4 instances only (ggml_cuda_sparse_attn_gate_ok)");
@@ -523,6 +547,9 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
         p.kt_g      = (int) k->type;
         p.vt_g      = (int) v->type;
         p.scale     = ggml_get_op_params_f32(dst, 0);
+        p.rot_q     = rot_q;
+        p.rot_o     = rot_o;
+        p.rot_dump  = rot_dump ? 1 : 0;
         p.out       = out32;
         ggml_cuda_sa_portable_launch(stream, p);
         return;
@@ -552,6 +579,9 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
         p.kt_g      = (int) k->type;
         p.vt_g      = (int) v->type;
         p.scale     = ggml_get_op_params_f32(dst, 0);
+        p.rot_q     = rot_q;
+        p.rot_o     = rot_o;
+        p.rot_dump  = rot_dump ? 1 : 0;
         p.out       = out32;
         p.partial   = sel.splits > 1 ? (float *) ((char *) dst->data + sel.partial_offset) : nullptr;
         if (generic) {
@@ -559,8 +589,8 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
         } else {
             ggml_cuda_sa_g1_launch(stream, p);
         }
-        if (sel.splits > 1) {
-            ggml_cuda_sa_merge_splits(stream, p.partial, out32, sel.n_stream * sel.n_q * sel.n_head, (int) sel.splits);
+        if (sel.splits > 1 && !rot_dump) {
+            ggml_cuda_sa_merge_splits(stream, p.partial, out32, sel.n_stream * sel.n_q * sel.n_head, (int) sel.splits, rot_o);
         }
         return;
     }
@@ -594,6 +624,12 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     a.out       = out32;
     a.kt_g      = (int) k->type;
     a.vt_g      = (int) v->type;
+    a.rot_q       = rot_q;
+    a.rot_o       = rot_o;
+    a.rot_q_scale = ggml_cuda_sa_rot_scale(rot_q);
+    a.rot_o_scale = ggml_cuda_sa_rot_scale(rot_o);
+    a.rot_dump    = rot_dump ? 1 : 0;
+    a.fixup_all   = sa_force().fixup_all ? 1 : 0;
     if (epi == SA_EPI_GATED) {
         a.gate     = (const char *) gate->data;
         a.gate_nb1 = gate->nb[1];
@@ -606,8 +642,11 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
         GGML_ASSERT(epi == SA_EPI_PLAIN && "the gate fusion has fast G4 instances only (ggml_cuda_sparse_attn_gate_ok)");
         const int gidx = sel.vl * 3 + sel.gqa_index;
         GGML_ASSERT(gidx >= 0 && gidx < GGML_CUDA_SA_GEN_G4_N);
-        ggml_cuda_sa_gen_g4_kernels[gidx]<<<grid, 256, 0, stream>>>(a);
+        ggml_cuda_sa_gen_g4_kernels[2 * gidx + (rot_q != 0 || rot_o != 0 ? 1 : 0)]<<<grid, 256, 0, stream>>>(a);
         ggml_cuda_sa_census_add((ggml_cuda_sa_census_id) (GGML_CUDA_SA_CENSUS_GEN_G4_FIRST + gidx));
+        if (rot_dump) {
+            return;
+        }
         ggml_cuda_sa_gen_fixup_kernel<<<grid, 256, 0, stream>>>(a, (int) (sel.n_head / sel.n_head_kv));
         ggml_cuda_sa_census_add(GGML_CUDA_SA_CENSUS_GEN_FIXUP);
         return;
@@ -615,9 +654,13 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
 
     const int idx = ((sel.vt * SA_V_COUNT + sel.vl) * SA_EPI_COUNT + epi) * 3 + sel.gqa_index;
     GGML_ASSERT(idx >= 0 && idx < GGML_CUDA_SA_G4_PER_KT);
-    const sa_g4_kernel_t kernel = sa_g4_table(sel.kt)[idx];
+    // two instances per census index: ROT = false (no rotation code: the rot 0 kernel) and ROT = true
+    const sa_g4_kernel_t kernel = sa_g4_table(sel.kt)[2 * idx + (rot_q != 0 || rot_o != 0 ? 1 : 0)];
     kernel<<<grid, 256, 0, stream>>>(a);
     ggml_cuda_sa_census_add((ggml_cuda_sa_census_id) (GGML_CUDA_SA_CENSUS_G4_FIRST + sel.kt * GGML_CUDA_SA_G4_PER_KT + idx));
+    if (rot_dump) {
+        return;
+    }
 
     // exact recomputation of the blocks that took a non-finite V half out of the shared PV WMMA (returns at once for
     // the others; sparse-attn-attend-g4.cuh)
