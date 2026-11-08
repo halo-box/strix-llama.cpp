@@ -11396,8 +11396,37 @@ static int32_t ggml_backend_vk_sparse_attn_group(ggml_backend_dev_t, int64_t, in
     return 1;   // PLAN-v3 §5: Vulkan G = 1
 }
 
-static bool ggml_backend_vk_sparse_attn_prefer_dense(ggml_backend_dev_t, enum ggml_type type_k, enum ggml_type type_v, int64_t, int64_t) {
-    return type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16;   // the default until AT-B4
+// Dense shortcut preference on Vulkan (D4, AT-B4 op level, PLAN-v3 §16.5): SPARSE_ATTN over all-visible rows (plan + attend, G 1) against
+// the causal FLASH_ATTN_EXT of the same pair, n_q {1, 2, 4, 8, 16, 32, 64, 127, 128, 256, 512, 1024, 2048} x n_kv {512, 1024, 2048}, all 16
+// pairs of {f16, bf16, q8_0, q4_0}, three processes, noise p90 1.25 % (scripts/qsa-validation/summaries/w7_vk_at_b4_op.md). A (pair, n_q band)
+// is dense where an op cell of the band has sparse below 0.98 x dense (the pre-registered rule); f16 / f16 keeps the dense FLASH_ATTN_EXT.
+// The bf16-mixed pairs stay sparse: Vulkan FLASH_ATTN_EXT does not take them (every dense arm "unsupported", L40). The e2e cells of AT-B4
+// were not run (UNPROVEN), so a band can only be flipped further by them. Other types: sparse (no measured dense cell).
+static bool ggml_backend_vk_sparse_attn_prefer_dense(ggml_backend_dev_t, enum ggml_type type_k, enum ggml_type type_v, int64_t n_q, int64_t n_kv) {
+    GGML_UNUSED(n_kv);
+    auto ti = [](ggml_type t) {
+        switch (t) {
+            case GGML_TYPE_F16:  return 0;
+            case GGML_TYPE_BF16: return 1;
+            case GGML_TYPE_Q8_0: return 2;
+            case GGML_TYPE_Q4_0: return 3;
+            default:             return -1;
+        }
+    };
+    const int tk = ti(type_k), tv = ti(type_v);
+    if (tk < 0 || tv < 0) {
+        return false;
+    }
+    // the n_q bands of D4: {1, 2-8, 9-32, 33-127, 128-511, 512-1023, >= 1024}
+    const int band = n_q <= 1 ? 0 : n_q <= 8 ? 1 : n_q <= 32 ? 2 : n_q <= 127 ? 3 : n_q <= 511 ? 4 : n_q <= 1023 ? 5 : 6;
+    // [K f16, bf16, q8_0, q4_0][V f16, bf16, q8_0, q4_0][band]: 1 = dense
+    static const bool dense[4][4][7] = {
+        { { 1, 1, 1, 1, 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0 }, { 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1, 1 } },   // K f16
+        { { 0, 0, 0, 0, 0, 0, 0 }, { 1, 1, 1, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 } },   // K bf16
+        { { 1, 1, 1, 0, 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0 }, { 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1, 1 } },   // K q8_0
+        { { 1, 1, 1, 0, 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0 }, { 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1, 1 } },   // K q4_0
+    };
+    return dense[tk][tv][band];
 }
 
 static const char * ggml_backend_vk_sparse_attn_unsupported_reason(ggml_backend_dev_t dev, const ggml_tensor * op) {
