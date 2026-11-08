@@ -1797,9 +1797,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_plan(ggml_tensor * rows, co
 }
 
 // Dense GQA self-attention restricted to the cells of the plan's rows (compact CB, non-compact TE or shortcut all-visible
-// rows), on GGML_OP_SPARSE_ATTN: the rows carry the visibility, so it needs no mask. The rotation stays in the graph here
-// (rot_q = rot_o = 0, PLAN-v3 §8: W10 moves it into the op). The masked route PR219 kept for non-compact ubatches (a KQ
-// mask unmasked at the top-k cells, FLASH_ATTN_EXT + src[5]) is deleted for every backend (PLAN-v3 W8, D22).
+// rows), on GGML_OP_SPARSE_ATTN: the rows carry the visibility, so it needs no mask. The storage rotation of a quantized
+// cache is unchanged (k_cur / v_cur go through the hinted Hadamard mul_mat before cpy_k / cpy_v), but q's rotation and the
+// output un-rotation run inside the op (PLAN-v3 §8, D13, W10): rot_q = n_rot_k and rot_o = n_rot_v (0 for a side that is
+// not rotated), so no node sits between the attend and the sigmoid gate and the HIP gate fusion matches for quantized
+// caches too. The masked route PR219 kept for non-compact ubatches (a KQ mask unmasked at the top-k cells,
+// FLASH_ATTN_EXT + src[5]) is deleted for every backend (PLAN-v3 W8, D22).
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             q_cur,
@@ -1810,10 +1813,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         float                     kq_scale,
         int                       il,
         ggml_tensor **            attn_node) {
-    // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
+    // rotate k/v before they reach a quantized cache, as the dense path does; q is rotated by the op (rot_q). The indexer
     // has already scored with its own query in build_qsa_top_k, so the rows are unaffected.
+    const int32_t rot_q = inp->self_k_rot ? (int32_t) inp->self_k_rot->ne[0] : 0;
+    const int32_t rot_o = inp->self_v_rot ? (int32_t) inp->self_v_rot->ne[0] : 0;
     if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
     }
 
@@ -1851,17 +1855,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-    ggml_tensor * attn = ggml_sparse_attn(ctx0, q, k, v, plan, kq_scale, 0, 0);
+    // H_q q and H_o of the output in the op: the rotation is its own inverse, so H_o undoes the value-side rotation
+    ggml_tensor * attn = ggml_sparse_attn(ctx0, q, k, v, plan, kq_scale, rot_q, rot_o);
     cb(attn, "qsa_attn", il);
     ggml_backend_sched_set_tensor_backend(sched, attn, backend);
     *attn_node = attn;
     ggml_tensor * cur = ggml_reshape_2d(ctx0, attn, attn->ne[0]*attn->ne[1], attn->ne[2]*attn->ne[3]);
     ggml_build_forward_expand(gf, cur);
     cb(cur, "kqv_out", il);
-    // the rotation is its own inverse, so undo it on the value side of the output
-    if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
-    }
     return cur;
 }
 

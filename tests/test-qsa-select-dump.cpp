@@ -1,8 +1,10 @@
 // Census rows generated from the shipped policy (PLAN-v3 §14.3): reads shape lines
 //   <n_q> <n_kv> <n_stream> <k> <v> <shortcut 0|1> [<n_sel> <gqa>]
 // on stdin and prints SA_SELECT lines for scripts/qsa-validation/census_check.py, from the backend's own group() policy and
-// its sa_select logic (the test-only proc ggml_backend_sparse_attn_select_dump). The gate fusion applies to an attend whose
-// output is not un-rotated (a V cache that is not quantized, until W10).
+// its sa_select logic (the test-only proc ggml_backend_sparse_attn_select_dump). The gate fusion applies to every fusible
+// attend, whatever the cache types: since W10 the output un-rotation of a quantized V cache runs inside the op (rot_o), so
+// no node sits between the attend and the gate (the backend's select dump names the gated key only where an EPI = gated
+// instance exists: the fast G4 tier).
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -56,7 +58,7 @@ int main() {
         const int32_t G = group(dev, n_q, n_kv, k, v, shortcut != 0);
         const int64_t n_head_kv = 2;
         char buf[1024];
-        dump(dev, n_q, n_kv, n_stream, n_sel, k, v, gqa * n_head_kv, n_head_kv, G, !ggml_is_quantized(v), buf, sizeof(buf));
+        dump(dev, n_q, n_kv, n_stream, n_sel, k, v, gqa * n_head_kv, n_head_kv, G, true, buf, sizeof(buf));
         printf("SA_SELECT %s -> %s\n", line.c_str(), buf);
     }
     return 0;
