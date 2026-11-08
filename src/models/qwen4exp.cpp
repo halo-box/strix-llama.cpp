@@ -1114,31 +1114,16 @@ static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n
         hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256;
 }
 
-// LLAMA_QSA_PREFER_DENSE (measurement only, AT-W7PERF; W13 deletes it): 1 = every pair dense in the shortcut, 0 = every
-// pair sparse, unset = the backend's policy
-static int qwen4exp_force_prefer_dense() {
-    static const int v = [] { const char * e = getenv("LLAMA_QSA_PREFER_DENSE"); return e == nullptr ? -1 : (atoi(e) != 0 ? 1 : 0); }();
-    return v;
-}
-
 // The shortcut attention of a QSA layer whose K buffer is on the host while its weights are on a GPU (-nkvo). AT-W7PERF (d)
-// decides whether it is pinned to the CPU (PLAN-v3 §10). LLAMA_QSA_SHORTCUT_PIN=0|1 overrides it for that measurement.
+// decides whether it is pinned to the CPU (PLAN-v3 §10); the measurement override is lab patch 06 (scripts/qsa-validation).
 static bool qwen4exp_pin_shortcut() {
-    static const bool v = [] {
-        const char * e = getenv("LLAMA_QSA_SHORTCUT_PIN");
-        return e != nullptr ? atoi(e) != 0 : QWEN4EXP_SHORTCUT_PIN_DEFAULT;
-    }();
-    return v;
+    return QWEN4EXP_SHORTCUT_PIN_DEFAULT;
 }
 
 // The host-KV fallback of PLAN-v3 §10, enabled per type by the AT-D4 / AT-W7PERF (c) result: plan and attend on the GPU of
-// the layer's weights, K / V copied by the scheduler (the PR219 route). LLAMA_QSA_HOST_KV_COPY=0|1 overrides it for that
-// measurement. Only reachable when offload_kqv is off, and logged as route=host-kv-copy.
+// the layer's weights, K / V copied by the scheduler (the PR219 route). The measurement override is lab patch 06
+// (scripts/qsa-validation). Only reachable when offload_kqv is off, and logged as route=host-kv-copy.
 static bool qwen4exp_host_kv_copy(ggml_type type_k, ggml_type type_v) {
-    static const int force = [] { const char * e = getenv("LLAMA_QSA_HOST_KV_COPY"); return e == nullptr ? -1 : (atoi(e) != 0 ? 1 : 0); }();
-    if (force >= 0) {
-        return force != 0;
-    }
     auto on_grid = [](ggml_type t) {
         return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_BF16;
     };
@@ -1966,8 +1951,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
             build_qsa_store_k(mctx_hyb, cur, il);
             if (!cache_only) {
                 // D4: a backend policy per (pair, n_q band). Without the proc: dense for f16 / f16 only
-                const int force = qwen4exp_force_prefer_dense();
-                const bool dense = force >= 0 ? force != 0 : policy.prefer_dense ?
+                const bool dense = policy.prefer_dense ?
                     policy.prefer_dense(policy.dev, qsa_node.type_k, qsa_node.type_v, n_tokens/qsa_node.n_stream, n_kv) :
                     (qsa_node.type_k == GGML_TYPE_F16 && qsa_node.type_v == GGML_TYPE_F16);
                 if (dense) {

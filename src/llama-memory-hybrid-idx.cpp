@@ -40,14 +40,6 @@ static bool qsa_text_pos(const llama_ubatch & u, uint32_t i) {
     return true;
 }
 
-// LLAMA_QSA_FORCE_NONCOMPACT=1, validation only (a measurement hook, deleted with the others in W13): every ubatch is
-// non-compact, at init (NC0) and at graph time alike, so shapes no supported flow reaches can run under STRICT (a one-stream
-// non-compact ubatch of a split cache, AT-C12 / U38) and the single-sequence decode error can be shown
-static bool qsa_force_noncompact() {
-    static const bool v = [] { const char * e = getenv("LLAMA_QSA_FORCE_NONCOMPACT"); return e != nullptr && atoi(e) != 0; }();
-    return v;
-}
-
 //
 // llama_memory_hybrid_idx
 //
@@ -306,9 +298,6 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full_n_kv(uint32_t n_kv) 
 }
 
 int llama_memory_hybrid_idx::qsa_compact_reason(const llama_kv_cache * kv, uint32_t n_stream, uint32_t n_kv, uint32_t ratio, const llama_ubatch & ubatch) {
-    if (qsa_force_noncompact()) {
-        return QSA_NC_FORCED;
-    }
     if (!kv || !ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id || n_stream == 0 || ubatch.n_tokens % n_stream != 0) {
         return QSA_NC_INPUT;
     }
@@ -1860,7 +1849,6 @@ uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
 }
 
 bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const {
-    if (qsa_force_noncompact()) { return false; }
     if (qsa_prefix_matches(ubatch)) { return true; }
     return qsa_compact_reason(ubatch, ratio) == QSA_COMPACT_OK;
 }

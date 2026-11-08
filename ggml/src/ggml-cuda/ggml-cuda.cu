@@ -7119,15 +7119,6 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
         ctx->ovl_regions[reg.s_first] = reg;
         prev_b = c.b;
     }
-    // LAB_OVL_PRINT=1 (measurement only, AT-D1; W13 deletes it): the regions of this graph by kind
-    static const bool ovl_print = getenv("LAB_OVL_PRINT") != nullptr;
-    if (ovl_print) {
-        int n_kind[5] = { 0, 0, 0, 0, 0 };
-        for (const auto & it : ctx->ovl_regions) {
-            n_kind[it.second.kind]++;
-        }
-        fprintf(stderr, "LAB_OVL nodes=%d kind1=%d kind2=%d kind4=%d\n", cg->n_nodes, n_kind[1], n_kind[2], n_kind[4]);
-    }
 }
 
 // GGML_CUDA_OP_PROF=1 (with GGML_CUDA_DISABLE_GRAPHS=1): GPU time of every op (fused groups as one) by an event pair on the

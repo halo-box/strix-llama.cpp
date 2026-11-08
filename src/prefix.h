@@ -35,7 +35,6 @@ enum qsa_compact_reason {
     QSA_NC_DUP_KEY          = 3, // two cells of one sequence with the same (pos, y, x) key: the mask order is not total
     QSA_NC_2D_MULTI_SEQ     = 4, // a sequence of the stream holds 2-D cells while another sequence has cells in the stream
     QSA_NC_SHARED_BLOCK     = 5, // a position block holds one sequence under two sequence sets (seq_cp inside the block)
-    QSA_NC_FORCED           = 6, // LLAMA_QSA_FORCE_NONCOMPACT=1 (validation only: AT-C12's one-stream split shape, the decode error)
 };
 
 static const char * qsa_compact_reason_name(int r) {
@@ -46,7 +45,6 @@ static const char * qsa_compact_reason_name(int r) {
         case QSA_NC_DUP_KEY:      return "duplicate-(pos,y,x)-key";
         case QSA_NC_2D_MULTI_SEQ: return "2-D-cells-with-another-sequence-in-the-stream";
         case QSA_NC_SHARED_BLOCK: return "block-shared-by-two-sequence-sets";
-        case QSA_NC_FORCED:       return "forced-by-LLAMA_QSA_FORCE_NONCOMPACT";
     }
     return "unknown";
 }
