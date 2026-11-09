@@ -186,6 +186,10 @@ public:
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
 
+    // after a mirrored state_read_sinfo(): take the 2D position of the restored cells from src (same layout)
+    // the qwen4exp indexer has no rope of its own, so its saved state has no x/y, yet the QSA visibility rule reads them
+    void ext_2d_copy(const llama_kv_cache & src, const slot_info_vec_t & sinfos);
+
     //
     // graph_build API
     //

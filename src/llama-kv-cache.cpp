@@ -2546,6 +2546,34 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
+void llama_kv_cache::ext_2d_copy(const llama_kv_cache & src, const slot_info_vec_t & sinfos) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other || src.hparams.n_pos_per_embd() <= 1) {
+        return;
+    }
+
+    GGML_ASSERT(src.n_stream == n_stream);
+
+    for (const auto & sinfo : sinfos) {
+        if (sinfo.empty()) {
+            continue;
+        }
+
+        const uint32_t strm = sinfo.strm[0];
+
+        auto       & cells     = v_cells[strm];
+        const auto & src_cells = src.v_cells[strm];
+
+        for (const uint32_t idx : sinfo.idxs[0]) {
+            // only x and y: tok is this cache's own (PLE)
+            llama_kv_cell_ext ext = cells.ext_get(idx);
+            ext.x = src_cells.ext_get(idx).x;
+            ext.y = src_cells.ext_get(idx).y;
+            cells.ext_set(idx, ext);
+        }
+    }
+}
+
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];

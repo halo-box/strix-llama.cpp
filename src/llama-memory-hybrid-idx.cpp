@@ -386,6 +386,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if (mem_idx) {
             mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+            mem_idx->ext_2d_copy(*get_mem_attn(), sinfos_attn);
             // a restore that rewrites cells does it behind the pool layout's back
             if (!sinfos_attn.empty()) {
                 mem_idx_stale_set(seq_id, 0);
