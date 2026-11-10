@@ -6,6 +6,7 @@
 #include <bitset>
 #include <cassert>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <vector>
@@ -51,6 +52,7 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_pos_ndup[s] = 0;
         }
     }
 
@@ -326,6 +328,16 @@ public:
         return seq_pos[seq_id];
     }
 
+    // how many cells of sequence seq_id repeat a position another cell of seq_id holds: sum over its positions of
+    // (cells at that position - 1). 0 means every position of the sequence is unique (kept up to date by seq_pos_inc /
+    // seq_pos_dec, so reading it is O(1); the QSA compact predicate reads it on every graph build, prefix.h)
+    uint32_t seq_pos_n_dup(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_pos_ndup[seq_id];
+    }
+
     // the token of the cell of sequence seq_id at the largest position <= p
     // when several cells share that position, the one with the highest index wins
     // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p
@@ -531,16 +543,36 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
+    // seq_pos_ndup[s]: the entries of seq_pos[s] whose position another entry of seq_pos[s] also holds, minus one per such
+    // position (seq_pos_n_dup). The entries of one position are adjacent in the set, so a neighbour test keeps it exact
+    uint32_t seq_pos_ndup[LLAMA_MAX_SEQ] = {};
+
     // helper functions for updating `seq_pos`, once cell at a time:
 
+    // another entry of the set at the position of it
+    static bool seq_pos_has_twin(const std::set<std::pair<llama_pos, uint32_t>> & sp,
+            std::set<std::pair<llama_pos, uint32_t>>::const_iterator it) {
+        return (it != sp.begin() && std::prev(it)->first == it->first) ||
+               (std::next(it) != sp.end() && std::next(it)->first == it->first);
+    }
+
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
-        const auto n = seq_pos[s].erase({ pos[i], i });
-        assert(n == 1);
-        GGML_UNUSED(n);
+        const auto it = seq_pos[s].find({ pos[i], i });
+        assert(it != seq_pos[s].end());
+        if (it == seq_pos[s].end()) {
+            return;
+        }
+        if (seq_pos_has_twin(seq_pos[s], it)) {
+            seq_pos_ndup[s]--;
+        }
+        seq_pos[s].erase(it);
     }
 
     void seq_pos_inc(llama_seq_id s, uint32_t i) {
-        seq_pos[s].insert({ pos[i], i });
+        const auto res = seq_pos[s].insert({ pos[i], i });
+        if (res.second && seq_pos_has_twin(seq_pos[s], res.first)) {
+            seq_pos_ndup[s]++;
+        }
     }
 
     // remove cell i
