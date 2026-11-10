@@ -12,6 +12,11 @@
 //   (iv)  the last n_keep_tail tokens of every sequence share one ubatch
 //   (v)   attention cells == indexer cells after every apply
 //   (vi)  replays <= #ubatches
+// The grid runs with the test hook qsa_nc0_eval_all, so that NC0 is evaluated on every ubatch and (i) covers all of them.
+// The decode phase runs without it, as llama does: on the same layouts, a ubatch of at most U tokens (the 1-token-per-slot
+// decode step of a multi-sequence server) gets no NC0 evaluation (the predicate is an O(n_kv) host scan per ratio whose
+// result cannot matter there, because only a non-compact ubatch above U is re-split), while a prompt ubatch above U still
+// gets it; the ubatches and replays equal those of the same batch with every ubatch evaluated.
 // Pass: 0 violations over the fixed seeds, and the re-split engaged (replays > 0) on the multi-sequence layouts.
 #include "qsa-mem-fixture.h"
 
@@ -21,7 +26,7 @@
 #include <set>
 #include <tuple>
 
-static int64_t g_viol[7] = { 0 };
+static int64_t g_viol[8] = { 0 };
 static int64_t g_ubatches = 0, g_nc = 0, g_nc0 = 0, g_replays = 0, g_batches = 0;
 
 #define VIOL(k, ...) do { if (g_viol[k]++ < 10) { fprintf(stderr, "violation (%d): ", k); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
@@ -74,7 +79,7 @@ static void run_batch(qsa_fixture & f, const std::vector<qsa_fixture::tok> & tok
         return;
     }
     for (uint32_t k = 0; k < n_ub; ++k) {
-        const bool n0 = multi && nc0[k];
+        const bool n0 = multi && nc0[k] == 1;
         g_nc += graph_nc[k];
         g_nc0 += n0;
         if (graph_nc[k] && !n0) {
@@ -148,6 +153,74 @@ static size_t free_cells(const qsa_fixture & f, llama_seq_id s) {
     return c.size() - c.get_used();
 }
 
+// the decode phase: NC0 runs only on the ubatches where the re-split can act (n_tokens > U)
+struct decode_run { std::vector<uint32_t> n_tok; uint32_t replays = 0, evals = 0; std::vector<uint8_t> nc0; bool ok = false; };
+
+static decode_run decode_feed(qsa_fixture & f, const std::vector<qsa_fixture::tok> & toks, uint32_t n_ubatch, bool eval_all) {
+    decode_run r;
+    f.mem->qsa_nc0_eval_all(eval_all);
+    r.ok = f.feed(toks, n_ubatch, [&](const llama_memory_hybrid_idx_context *, const llama_ubatch & u, uint32_t) { r.n_tok.push_back(u.n_tokens); });
+    r.replays = f.mem->qsa_last_replays();
+    r.evals = f.mem->qsa_last_nc0_evals();
+    r.nc0 = f.mem->qsa_last_nc0();
+    return r;
+}
+
+static void decode_phase() {
+    struct layout { const char * name; uint32_t kv, n_seq_max; bool unified; };
+    for (const layout & L : { layout{ "b:unified-np4", 327680, 4, true }, layout{ "d:split-np2", 131072, 2, false } }) {
+        // two fixtures fed the same history: one with the hook (every ubatch evaluated), one as llama runs
+        qsa_fixture fa(L.kv, L.n_seq_max, L.unified), fb(L.kv, L.n_seq_max, L.unified);
+        for (qsa_fixture * f : { &fa, &fb }) {
+            f->mem->qsa_nc0_eval_all(true);
+            for (llama_seq_id s = 0; s < (llama_seq_id) L.n_seq_max; ++s) {
+                f->feed(f->text(s, 6000 + 100 * (uint32_t) s), 4096);   // past top_k + r - 1 = 2051 cells per sequence
+            }
+        }
+        uint32_t evals_small = 0, evals_large = 0, ub_small = 0, ub_large = 0;
+        for (int step = 0; step < 6; ++step) {
+            // a decode step (1 token per slot), and every third step a 2-slot prompt above U = 512 tokens
+            std::vector<qsa_fixture::tok> ta, tb;
+            const bool prompt = step % 3 == 2;
+            for (llama_seq_id s = 0; s < (llama_seq_id) (prompt ? 2 : L.n_seq_max); ++s) {
+                const auto x = fa.text(s, prompt ? 700 : 1), y = fb.text(s, prompt ? 700 : 1);
+                ta.insert(ta.end(), x.begin(), x.end());
+                tb.insert(tb.end(), y.begin(), y.end());
+            }
+            const uint32_t n_ubatch = 4096, U = fb.mem->qsa_noncompact_cap(n_ubatch);
+            const decode_run a = decode_feed(fa, ta, n_ubatch, true);
+            const decode_run b = decode_feed(fb, tb, n_ubatch, false);
+            if (!a.ok || !b.ok) {
+                VIOL(0, "decode phase %s step %d: a batch was refused", L.name, step);
+                continue;
+            }
+            if (a.n_tok != b.n_tok || a.replays != b.replays) {
+                VIOL(7, "decode phase %s step %d: the ubatches differ with NC0 skipped (%zu vs %zu ubatches, %u vs %u replays)",
+                        L.name, step, a.n_tok.size(), b.n_tok.size(), a.replays, b.replays);
+            }
+            uint32_t small = 0, large = 0;
+            for (size_t k = 0; k < b.n_tok.size(); ++k) {
+                (b.n_tok[k] > U ? large : small)++;
+                if (b.n_tok[k] <= U && k < b.nc0.size() && b.nc0[k] != llama_memory_hybrid_idx::QSA_NC0_SKIPPED) {
+                    VIOL(7, "decode phase %s step %d: ubatch %zu of %u tokens <= U = %u was given an NC0 evaluation", L.name, step, k, b.n_tok[k], U);
+                }
+            }
+            // every evaluation of the hook-free run is on a ubatch above U (replays re-form one ubatch, so at most one more)
+            if (b.evals > large + b.replays) {
+                VIOL(7, "decode phase %s step %d: %u NC0 evaluations for %u ubatches above U (%u small)", L.name, step, b.evals, large, small);
+            }
+            (large > 0 ? evals_large : evals_small) += b.evals;
+            ub_small += small;
+            ub_large += large;
+        }
+        fprintf(stderr, "decode phase %s: ubatches <= U %u (NC0 evaluations on decode steps %u), ubatches > U %u (evaluations on prompt steps %u)\n",
+                L.name, ub_small, evals_small, ub_large, evals_large);
+        if (ub_large == 0 || evals_large == 0) {
+            VIOL(7, "decode phase %s: no prompt ubatch above U was evaluated: the phase proves nothing", L.name);
+        }
+    }
+}
+
 int main() {
     const char * layouts[] = { "a:single-2d", "b:seqcp", "c:layout3", "d:split-np2", "a1:np1" };
     int64_t replays_multi = 0;
@@ -161,6 +234,7 @@ int main() {
                     const uint32_t n_seq_max = np1 ? 1 : split ? 2 : 4;
                     const uint32_t kv = split ? 131072 : 327680;
                     qsa_fixture f(kv, n_seq_max, !split, n_keep_tail > 0 ? n_keep_tail - 1 : 0, S);
+                    f.mem->qsa_nc0_eval_all(true);   // (i) on every ubatch
                     std::mt19937 rng(1000003u * n_ubatch + 97u * S + n_keep_tail + (uint32_t) L[0]);
                     std::vector<llama_seq_id> active;
                     const uint32_t ub0 = 4096;
@@ -209,12 +283,13 @@ int main() {
         fprintf(stderr, "layout %s done: batches %" PRId64 ", ubatches %" PRId64 ", graph-NC %" PRId64 ", NC0 %" PRId64 ", replays %" PRId64 "\n",
                 layout, g_batches, g_ubatches, g_nc, g_nc0, g_replays);
     }
+    decode_phase();
     int64_t total = 0;
-    for (int k = 0; k < 7; ++k) { total += g_viol[k]; }
+    for (int k = 0; k < 8; ++k) { total += g_viol[k]; }
     printf("test-qsa-resplit: %" PRId64 " batches, %" PRId64 " ubatches, %" PRId64 " graph-time non-compact, %" PRId64 " NC0, %" PRId64 " replays (multi-sequence %" PRId64 ")\n",
             g_batches, g_ubatches, g_nc, g_nc0, g_replays, replays_multi);
-    printf("violations: refused %" PRId64 ", (i) %" PRId64 ", (ii) %" PRId64 ", (iii) %" PRId64 ", (iv) %" PRId64 ", (v) %" PRId64 ", (vi) %" PRId64 "\n",
-            g_viol[0], g_viol[1], g_viol[2], g_viol[3], g_viol[4], g_viol[5], g_viol[6]);
+    printf("violations: refused %" PRId64 ", (i) %" PRId64 ", (ii) %" PRId64 ", (iii) %" PRId64 ", (iv) %" PRId64 ", (v) %" PRId64 ", (vi) %" PRId64 ", decode %" PRId64 "\n",
+            g_viol[0], g_viol[1], g_viol[2], g_viol[3], g_viol[4], g_viol[5], g_viol[6], g_viol[7]);
     const bool engaged = replays_multi > 0 && g_nc > 0;
     if (!engaged) {
         printf("the re-split never engaged: the test proves nothing\n");

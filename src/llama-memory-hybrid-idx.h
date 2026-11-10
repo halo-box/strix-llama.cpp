@@ -150,8 +150,12 @@ public:
     // replays of init_batch since the memory was made, and in its last call (test-qsa-resplit assert (vi))
     uint64_t qsa_n_resplit() const { return n_qsa_resplit; }
     uint32_t qsa_last_replays() const { return qsa_last_n_replay; }
-    // NC0 per ubatch of the last init_batch (true: init-time non-compact), and the sizes the replay used
+    // NC0 per ubatch of the last init_batch (1: init-time non-compact, 0: compact, QSA_NC0_SKIPPED: not evaluated)
     const std::vector<uint8_t> & qsa_last_nc0() const { return qsa_last_nc0_v; }
+    static constexpr uint8_t QSA_NC0_SKIPPED = 2;
+    // qsa_nc0 evaluations in the last init_batch, and the test hook that evaluates NC0 on every ubatch (test-qsa-resplit)
+    uint32_t qsa_last_nc0_evals() const { return qsa_last_n_nc0_eval; }
+    void qsa_nc0_eval_all(bool on) { qsa_nc0_all = on; }
     // test hook: the ratios of the QSA layers, the indexer top-k and S (default: from the model and QSA_NONCOMPACT_STRIPS)
     void qsa_resplit_configure(std::vector<uint32_t> ratios, uint32_t top_k, uint32_t strips) {
         qsa_nc_ratios = std::move(ratios); qsa_nc_top_k = top_k; qsa_nc_strips = strips;
@@ -219,6 +223,8 @@ private:
     uint64_t n_qsa_resplit = 0;
     uint32_t qsa_last_n_replay = 0;
     std::vector<uint8_t> qsa_last_nc0_v;
+    uint32_t qsa_last_n_nc0_eval = 0;
+    bool qsa_nc0_all = false;
     mutable std::vector<uint8_t> qsa_scan_ranked;
     // NC0(u) on the cells prepare simulated: the selection path (n_kv > top_k + r - 1) and the compact predicate rejects u
     bool qsa_nc0(const llama_ubatch & ubatch, const llama_kv_cache::slot_info & sinfo) const;

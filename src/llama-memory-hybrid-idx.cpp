@@ -174,7 +174,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
     // so the ubatches before the failing one replay identically, the failing one then holds <= U tokens and the next failure
     // index is larger: the loop runs at most #ubatches times. Only contexts that serve several sequences re-split: in a
     // single-sequence context a non-compact ubatch is a decode error (the graph-build check, qwen4exp build_qsa_top_k)
-    // NC0 is recorded for every ubatch of a context that serves several sequences; it re-splits only when U < n_ubatch
+    // NC0 is evaluated for the ubatches above U of a context that serves several sequences (the others are recorded as
+    // QSA_NC0_SKIPPED); it re-splits only when U < n_ubatch
     const uint32_t U = qsa_noncompact_cap(n_ubatch);
     const bool resplit = mem_idx && n_seq_max_qsa > 1 && !qsa_nc_ratios.empty();
 
@@ -186,6 +187,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
     std::vector<uint32_t> n_tokens_kept;
     qsa_last_n_replay = 0;
     qsa_last_nc0_v.clear();
+    qsa_last_n_nc0_eval = 0;
 
     while (true) {
         balloc.split_reset();
@@ -237,6 +239,13 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
                     nc0[i] = nc0_kept[i];
                     return true;
                 }
+                if (ub.n_tokens <= U && !qsa_nc0_all) {
+                    // nothing to re-split: NC0 cannot change the answer, so its O(n_kv) scans per ratio are not run (the
+                    // decode ubatch of a multi-sequence server); the graph-time predicate still routes the ubatch
+                    nc0[i] = QSA_NC0_SKIPPED;
+                    return true;
+                }
+                qsa_last_n_nc0_eval++;
                 nc0[i] = qsa_nc0(ub, sinfo) ? 1 : 0;
                 return !(nc0[i] && ub.n_tokens > U);
             }, &i_fail);
