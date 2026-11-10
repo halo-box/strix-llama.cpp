@@ -55,16 +55,25 @@ static bool qsa_key_2d(const llama_kv_cells & cells, uint32_t j) {
 }
 
 // duplicate (pos, y, x) keys among the cells of seq: the positions come sorted from seq_pos_get, so only the cells of a
-// position that occurs more than once are compared on (y, x)
-static bool qsa_seq_has_dup_key(const llama_kv_cells & cells, llama_seq_id seq, bool pos_2d) {
+// position that occurs more than once are compared on (y, x). A sequence with unique positions (every text sequence,
+// seq_cp copies included) is answered from the cells' duplicate count without a walk: the predicate runs on every graph
+// build and can_reuse of a multi-sequence context, and the walk visited every cell of every sequence of the ubatch there.
+// walked (test hook, test-qsa-dup-key): the set entries visited
+static bool qsa_seq_has_dup_key(const llama_kv_cells & cells, llama_seq_id seq, bool pos_2d, size_t * walked = nullptr) {
+    if (cells.seq_pos_n_dup(seq) == 0) {
+        return false;   // no position repeats: no key can
+    }
+    if (!pos_2d) {
+        return true;    // the key is the position alone
+    }
     const auto & sp = cells.seq_pos_get(seq);
     std::vector<std::pair<llama_pos, llama_pos>> yx;
     for (auto it = sp.begin(); it != sp.end();) {
         auto end = it;
         size_t n = 0;
         while (end != sp.end() && end->first == it->first) { ++end; ++n; }
+        if (walked) { *walked += n; }
         if (n > 1) {
-            if (!pos_2d) { return true; }
             yx.clear();
             for (auto c = it; c != end; ++c) {
                 const auto & e = cells.ext_get(c->second);

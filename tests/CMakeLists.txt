@@ -199,6 +199,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # PLAN-v3 W9: the compact visibility predicate against the KQ mask, and the non-compact re-split, on the production
     # hybrid-idx memory (CPU, no model file)
     llama_build_and_test(test-qsa-visibility.cpp LINK llama)
+    # the duplicate-key term of the compact predicate reads a kept count, not a walk of every cell of the sequence
+    llama_build_and_test(test-qsa-dup-key.cpp LINK llama)
     llama_build_and_test(test-qsa-resplit.cpp LINK llama)
     llama_build_and_test(test-qsa-reserve-view.cpp LINK llama)
     # the QSA reserve pass list (llama_qsa_reserve_passes) builds the one-stream shortcut graph of a split multi-sequence context
