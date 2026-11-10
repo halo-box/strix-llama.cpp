@@ -348,7 +348,7 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 # the sparse attention host reference (sparse-attn-ref.h) checks the CPU op bit for bit: no FMA contraction
-set_source_files_properties(test-backend-ops.cpp test-sparse-attn-plan-oracle.cpp PROPERTIES COMPILE_OPTIONS
+set_source_files_properties(test-backend-ops.cpp test-sparse-attn-plan-oracle.cpp test-sparse-attn-neginf-v.cpp PROPERTIES COMPILE_OPTIONS
     "$<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>,$<CXX_COMPILER_ID:IntelLLVM>>:-ffp-contract=off>")
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
@@ -435,6 +435,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp LINK ggml)
     # the sparse attention plan against the C3 oracle (sparse-attn-ref.h), plus the over-allocation check of the two ops
     llama_build_and_test(test-sparse-attn-plan-oracle.cpp LINK ggml)
+    # ggml.h item 3: a -inf cell's non-finite V element gives NaN in that dimension (0 * v), the CPU op and O_CON agree
+    llama_build_and_test(test-sparse-attn-neginf-v.cpp LINK ggml)
     # Vulkan checks of the two ops: limits, capability gates, rotation against fwht.comp, the workspace sync rule (skips without Vulkan)
     llama_build_and_test(test-sparse-attn-vk.cpp LINK ggml)
     # every dense pick of the QSA shortcut policy (HIP, Vulkan) is a FLASH_ATTN_EXT the device takes; skipped without the policy
