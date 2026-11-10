@@ -445,6 +445,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     if (GGML_RPC AND NOT WIN32)
         # the sparse-attention ops through an in-process rpc-server: alloc size per plan, supports_op of the server device
         llama_build_and_test(test-rpc-sparse-attn.cpp LINK ggml)
+        # the RPC hello rejects a server older than the op enum this client sends
+        llama_build_and_test(test-rpc-hello.cpp LINK ggml)
     endif()
     # the HIP gated SPARSE_ATTN fusion places an output that overlaps a read in graph memory, never in the pool (D12); host only
     llama_build_and_test(test-sparse-attn-gate-scratch.cpp LINK ggml)
