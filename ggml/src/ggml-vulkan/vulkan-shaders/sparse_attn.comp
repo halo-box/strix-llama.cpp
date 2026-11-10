@@ -216,9 +216,12 @@ void main() {
 
     if (p.n_split == 1) {
         const uint dst_base = stream * p.nb3 + query * p.nb2 + head * p.nb1;
-        const float inv_sum = row_sum > 0.0 ? 1.0 / row_sum : 0.0;
+        // a row whose normaliser is not > 0 (empty, or NaN from a NaN score) is 0 (ggml.h item 5): a select of the result,
+        // not acc * 0, which is NaN for the NaN accumulator such a row has; the test is on the bits (sa_l_pos)
+        const bool pos = sa_l_pos(row_sum);
+        const float inv_sum = pos ? 1.0 / row_sum : 0.0;
         [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
-            data_dst[dst_base + lane + i * LANES] = acc[i] * inv_sum;
+            data_dst[dst_base + lane + i * LANES] = pos ? acc[i] * inv_sum : 0.0;
         }
     } else {
         // partial: unnormalized O, then L and M per head (an empty split writes M = -FLT_MAX, not -inf, so the
