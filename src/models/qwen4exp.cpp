@@ -1,5 +1,6 @@
 #include "models.h"
 #include "qwen4exp-te.h"
+#include "qwen4exp-qsa-check.h"
 #include "../prefix.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -1459,10 +1460,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // the always-on graph-build check (PLAN-v3 §4.3, no env gate): a non-compact ubatch on the selection path with more
         // than U tokens, or any non-compact ubatch in a single-sequence context (it reserves no variant, §7.1.5), is a
         // decode error; process_ubatch returns it before the graph is allocated. The reserve graphs never trigger it
-        // (they are compact, and the variant has T <= U); a reused graph keeps the same compact flag (can_reuse)
-        if (!scalar && !force_nc && n_kv > (int64_t) hparams.indexer_top_k + r - 1) {
+        // (they are compact, and the variant has T <= U); a reused graph keeps the same compact flag (can_reuse). Only
+        // where block selection is eligible (qwen4exp_qsa_noncompact_error): elsewhere every ubatch takes the TE rows
+        {
             const uint32_t U = mctx_hyb->qsa_noncompact_cap(cparams.n_ubatch);
-            if ((uint32_t) n_tokens > U || !mctx_hyb->qsa_multi_seq()) {
+            if (qwen4exp_qsa_noncompact_error(blocks, hparams.n_swa != 0, force_nc, scalar, n_kv, (int64_t) hparams.indexer_top_k + r - 1,
+                        (uint32_t) n_tokens, U, mctx_hyb->qsa_multi_seq())) {
                 const int why = mctx_hyb->qsa_compact_reason(ubatch, (uint32_t) r);
                 res->set_qsa_ubatch_error(format("QSA layer %d: a non-compact ubatch (%s) of %d tokens (n_tps %" PRId64 ", n_stream %" PRId64
                         ", n_seqs %u) at n_kv %" PRId64 " %s; the reserve covers non-compact ubatches of at most U = %u tokens in "

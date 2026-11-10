@@ -2131,8 +2131,12 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
-    // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph
-    //sched_need_reserve = true;
+    // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph;
+    // except with QSA layers: complete-block selection needs causal attention (qwen4exp_use_block_selection), so a flip
+    // moves every QSA ubatch between the compact rows and the TE rows, whose shapes the reserve must hold
+    if (qsa_n_layers() > 0) {
+        sched_need_reserve = true;
+    }
 }
 
 bool llama_context::get_causal_attn() const {
