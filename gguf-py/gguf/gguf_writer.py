@@ -32,6 +32,7 @@ from .constants import (
 )
 
 from .quants import quant_shape_from_byte_shape
+from .lazy import LazyChunkedTensor
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class TensorInfo:
     shape: Sequence[int]
     dtype: GGMLQuantizationType
     nbytes: int
-    tensor: np.ndarray[Any, Any] | None = None
+    tensor: np.ndarray[Any, Any] | LazyChunkedTensor | None = None
 
 
 @dataclass
@@ -384,7 +385,7 @@ class GGUFWriter:
         self.tensors[-1][name] = TensorInfo(shape=tensor_shape, dtype=dtype, nbytes=tensor_nbytes)
 
     def add_tensor(
-        self, name: str, tensor: np.ndarray[Any, Any], raw_shape: Sequence[int] | None = None,
+        self, name: str, tensor: np.ndarray[Any, Any] | LazyChunkedTensor, raw_shape: Sequence[int] | None = None,
         raw_dtype: GGMLQuantizationType | None = None, tensor_endianess: GGUFEndian | None = None
     ) -> None:
         # if tensor endianness is not passed, assume it's native to system

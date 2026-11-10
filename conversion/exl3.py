@@ -42,8 +42,6 @@ def exl3_block_rows(block_perm: np.ndarray, size: int) -> np.ndarray:
 
 
 def write_exl3_tensors(model: ModelBase) -> None:
-    from .base import LazyTorchTensor
-
     modules: dict[str, dict[str, str]] = {}
     for name in model.model_tensors:
         base, _, part = name.rpartition(".")
@@ -293,6 +291,8 @@ def write_exl3_ngram_rows(model: ModelBase, prefix: str, shards: dict[int, str])
 
 
 def add_exl3_metadata(model: ModelBase, quant_config: dict[str, Any]) -> None:
+    if model.exl3_codebook is None:
+        raise ValueError("EXL3 metadata requires a codebook")
     w = model.gguf_writer
     w.add_uint32(gguf.Keys.Exl3.VERSION, EXL3_CONTAINER_VERSION)
     w.add_string(gguf.Keys.Exl3.CODEBOOK, model.exl3_codebook)
