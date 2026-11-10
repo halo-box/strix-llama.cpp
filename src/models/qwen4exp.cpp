@@ -1396,7 +1396,9 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
     k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
     cb(k_raw, "indexer_k_raw", il);
 
-    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, qsa_k_inp->k_idxs, il));
+    ggml_tensor * idx_store = mctx_idx->cpy_k(ctx0, k_raw, qsa_k_inp->k_idxs, il);
+    res->add_qsa_idx_node(il, idx_store);   // the guard checks where the indexer cache is written (the shortcut range too)
+    ggml_build_forward_expand(gf, idx_store);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
