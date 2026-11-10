@@ -27,8 +27,8 @@
 // - x may be a strided 4-D tensor. In the dot kernel rows past 8 run in groups of 8, one pass over the weights per
 //   group.
 // - always T = 2 tiles per wave; the number of warps per block is chosen at launch.
-// - the GEMM path rounds only the rotated activations (W_hat is exact in f16), and only where this backend context's
-//   own F32-weight GEMM rounds both operands to f16 (exl3_gemm_products); elsewhere xh = hi + lo carries ~22 bits and
+// - the GEMM path rounds only the rotated activations (W_hat is exact in f16) at 512 or more contiguous rows
+//   (exl3_gemm_products); elsewhere xh = hi + lo carries ~22 bits and
 //   the op stays at NMSE ~1e-13 against ggml_mul_mat on the f32 W, at twice the WMMA work. In that path the WMMA f32
 //   accumulate truncates, so each k step accumulates from zero and is added in f32 (see exl3_gemm_kernel).
 // - exllamav3's fused expert kernel merges the gate/up output transform, the SwiGLU and the down input transform; here
@@ -60,7 +60,6 @@
 // SOFTWARE.
 
 #include "exl3.cuh"
-#include "mmb.cuh"
 #include "unary.cuh"
 
 #if defined(GGML_USE_EXL3)
@@ -1503,25 +1502,10 @@ static void exl3_dot_bits(const int bits, const int cb, const int M, const float
     }
 }
 
-// Products per k step on the GEMM path. W_hat is exact in f16, so the one rounding is that of xh = H(x*suh): one f16
-// product (exl3_gemm1_kernel, NMSE 3.5e-8 .. 4.7e-8 against a double sum on the Qwen3.5-4B shapes at 512 rows) or
-// hi + lo (exl3_gemm_kernel, <= 1.7e-13, twice the WMMA work), following the GEMM this context runs for an F32 weight
-// of the same shape on the same x: one product where mmb takes it (mmb_f32split_kernel, both operands rounded:
-// 7.4e-8 .. 8.5e-8 at 512 and 513 rows), two where it is f32 (MMVF, MMF or rocBLAS: 1e-14 .. 3e-12 at 1 .. 511 rows,
-// and for strided x).
-static int exl3_gemm_products(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * dst,
-        const int64_t k, const int64_t n) {
-    ggml_tensor w = {};
-    w.type  = GGML_TYPE_F32;
-    w.ne[0] = k;
-    w.ne[1] = n;
-    w.ne[2] = 1;
-    w.ne[3] = 1;
-    w.nb[0] = sizeof(float);
-    w.nb[1] = k*sizeof(float);
-    w.nb[2] = n*w.nb[1];
-    w.nb[3] = w.nb[2];
-    return ggml_cuda_mmb_supported_mm(ctx, &w, x, dst) ? 1 : 2;
+// Qwen3.5-4B / gfx1151: one product NMSE 3.5e-8 .. 4.7e-8, hi + lo <= 1.7e-13 against a double sum at 512 rows.
+// Fix the measured F32 control choice: one at >= 512 contiguous rows, two below or for strided x. MMB tuning must not change EXL3 precision.
+static int exl3_gemm_products(const int64_t rows, const bool contiguous) {
+    return contiguous && rows >= 512 ? 1 : 2;
 }
 
 bool ggml_cuda_exl3_supports_op(const int device, const ggml_tensor * op) {
@@ -1563,7 +1547,7 @@ void ggml_cuda_op_exl3_mul_mat(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     if (rows > EXL3_GEMV_ROWS && k <= EXL3_SPLIT_K && GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[ctx.device].cc)) {
         GGML_ASSERT((rows + EXL3_GEMM_BN/2 - 1)/(EXL3_GEMM_BN/2) <= 65535);
-        const bool two = exl3_gemm_products(ctx, x, dst, k, n) == 2;
+        const bool two = exl3_gemm_products(rows, ggml_is_contiguous(x)) == 2;
         ggml_cuda_pool_alloc<half>  xhi(ctx.pool(), rows*k);
         ggml_cuda_pool_alloc<half>  xlo(ctx.pool());
         ggml_cuda_pool_alloc<float> inv(ctx.pool(), rows);
@@ -1665,50 +1649,6 @@ static __global__ void __launch_bounds__(1024) exl3_mmid_route(
     }
 }
 
-// The fewest rows of an expert whose GEMM rows run one product (INT_MAX: none can, an expert holds at most one row per
-// token), so they run one exactly when ggml_mul_mat_id on an F32 stack does, which this backend runs as a ggml_mul_mat
-// per expert of a view of the stack on a contiguous copy of the rows: one f16 product (mmb_f32split_kernel) where
-// ggml_cuda_mmb_supported_mm takes that shape (from 512 rows for a view source), f32 (MMVF or rocBLAS) below.
-static int exl3_mmid_one_rows(ggml_backend_cuda_context & ctx, const int64_t k, const int64_t n, const int64_t n_tok) {
-    ggml_tensor w = {};
-    w.type  = GGML_TYPE_F32;
-    w.op    = GGML_OP_VIEW;
-    w.ne[0] = k;
-    w.ne[1] = n;
-    w.ne[2] = 1;
-    w.ne[3] = 1;
-    w.nb[0] = sizeof(float);
-    w.nb[1] = k*sizeof(float);
-    w.nb[2] = n*w.nb[1];
-    w.nb[3] = w.nb[2];
-    ggml_tensor x = w;
-    ggml_tensor d = w;
-    x.op = GGML_OP_NONE;
-    d.op = GGML_OP_NONE;
-    auto one = [&](const int64_t t) {
-        x.ne[1] = t;
-        x.nb[2] = x.nb[3] = t*x.nb[1];
-        d.ne[0] = n;
-        d.ne[1] = t;
-        d.nb[1] = n*sizeof(float);
-        d.nb[2] = d.nb[3] = t*d.nb[1];
-        return ggml_cuda_mmb_supported_mm(ctx, &w, &x, &d);
-    };
-    if (!one(n_tok)) {
-        return INT_MAX;
-    }
-    int64_t lo = 0;
-    int64_t hi = n_tok;
-    while (hi - lo > 1) {
-        const int64_t mid = (lo + hi)/2;
-        if (one(mid)) {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-    return (int) hi;
-}
 
 bool ggml_cuda_exl3_mul_mat_id_supports_op(const int device, const ggml_tensor * op) {
     const int cc = ggml_cuda_info().devices[device].cc;
@@ -1734,7 +1674,7 @@ static bool exl3_mmid_gemm(const int device, const ggml_tensor * dst) {
 }
 
 // Each row (pair) is computed as EXL3_MUL_MAT computes a row of its expert, by the dot kernel or by the GEMM with one
-// or two products per expert (exl3_mmid_one_rows); the routing runs on the device, with no host synchronization.
+// or two products per expert (exl3_gemm_products); the routing runs on the device, with no host synchronization.
 // glu: the standard F32 SwiGLU node that dst reads as x, computed by the input rotation of the GEMM path (exl3_mmid_gemm)
 static void exl3_op_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * glu) {
     const ggml_tensor * trellis = dst->src[0];
@@ -1785,7 +1725,8 @@ static void exl3_op_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ggml_cuda_pool_alloc<int> order(ctx.pool());
     ggml_cuda_pool_alloc<int> grp(ctx.pool());
     if (n_tok > 1) {
-        const int one_rows = gemm ? exl3_mmid_one_rows(ctx, k, n, n_tok) : INT_MAX;
+        // Routed rows use the measured F32 control boundary per expert; see exl3_gemm_products and the LFM2.5 table above.
+        const int one_rows = gemm && exl3_gemm_products(n_tok, true) == 1 ? 512 : INT_MAX;
         int64_t n_grp[2];
         tab.s[0] = gemm ? 16*W[0] : M;
         tab.s[1] = 16*W[1];
