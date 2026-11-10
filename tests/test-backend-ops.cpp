@@ -14588,9 +14588,11 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
         for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(F16, tv, 9, 4096, 257, G, SA_ROWS_SINGLE, 12, 1, 0, 0, 1, 0, SA_OVERFLOW));
     }
     // a NaN score in one attended cell (inf * 0 or a NaN K element): the CPU op writes 0 for the head, so must the HIP G1
-    // split-K merge (n_q 1 / 3 at n_sel 2051: many splits), the one-split G1 epilogue and G4
+    // split-K merge (n_q 1 / 3 at n_sel 2051: many splits), G4, the Vulkan split-K reduce (n_q 1 / 3) and the Vulkan cm /
+    // scalar one-split epilogues (n_q 64: n_q * n_head_kv >= 128); the HIP one-split G1 epilogue is reached by the lead
+    // cases below (n_sel 48)
     for (ggml_type t : {F16, Q8, BF16}) {
-        for (int64_t nq : {1, 3}) {
+        for (int64_t nq : {1, 3, 64}) {
             for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, G, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, SA_NANSCORE));
         }
     }

@@ -410,11 +410,14 @@ void main() {
     if (p.n_split == 1) {
         if (col < GQA) {
             const uint dst_base = stream * p.nb3 + query * p.nb2 + head * p.nb1;
-            const float inv_l = l > 0.0 ? 1.0 / l : 0.0;
+            // a row whose normaliser is not > 0 (empty, or NaN from a NaN score) is 0 (ggml.h item 5): a select of the
+            // result, not O * 0, which is NaN for the NaN accumulator such a row has; the test is on the bits (sa_l_pos)
+            const bool pos = sa_l_pos(l);
+            const float inv_l = pos ? 1.0 / l : 0.0;
             [[unroll]] for (uint t = 0; t < 16; ++t) {
                 [[unroll]] for (uint i = 0; i < 4; ++i) {
                     const uint dim = (t / 8) * 128 + 8 * (grp + 4 * i) + t % 8;
-                    data_dst[dst_base + dim] = O[t][i] * inv_l;
+                    data_dst[dst_base + dim] = pos ? O[t][i] * inv_l : 0.0;
                 }
             }
         }

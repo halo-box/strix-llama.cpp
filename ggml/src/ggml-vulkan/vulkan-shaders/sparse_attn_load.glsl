@@ -11,6 +11,14 @@
 
 #include "flash_attn_dequant.glsl"
 
+// l > 0 on the bits, for the attend epilogues (sparse_attn_cm.comp, sparse_attn.comp; sparse_attn_reduce.comp has its own
+// copy): true for a positive l (+inf included), false for 0, a negative l and NaN. The modules carry no
+// SignedZeroInfNanPreserve execution mode, so a float compare may be compiled as if l were never NaN; an integer compare
+// cannot be.
+bool sa_l_pos(const float l) {
+    return floatBitsToUint(l) - 1u < 0x7f800000u;
+}
+
 // 4 dims starting at dim d (d % 4 == 0) of the row at unit offset base
 vec4 sa_dq4_k(const uint base, const uint d) {
     if (FaTypeK == GGML_TYPE_BF16) {
