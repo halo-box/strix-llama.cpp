@@ -18,14 +18,19 @@
 //               binding range, and a shape reason for GQA / head size (both then get the CPU / --no-kv-offload remedy).
 //   vpack       under GGML_VK_SA_FORCE=vpack (cm tier) the attend's alloc size at the reserve's n_kv holds every smaller n_kv of
 //               the same n_q: a pack happens at n_kv4 < 64 n_q, so a smaller runtime n_kv can pack where the reserve did not.
+//   race        while a second backend of the same device compiles sparse-attention pipelines on demand (each compile walks
+//               ggml_vk_load_shaders again), supports_op and get_alloc_size of a fixed node, read on another thread, keep the
+//               values they had before: the tier gates never vanish during a walk. A ThreadSanitizer build also reports the
+//               unsynchronized gate access itself, whatever the values.
 //
-// Without a Vulkan backend it exits 0 ("skipped"). usage: test-sparse-attn-vk [limits|capability|rot|stress|dense|reason|vpack ...]
+// Without a Vulkan backend it exits 0 ("skipped"). usage: test-sparse-attn-vk [limits|capability|rot|stress|dense|reason|vpack|race ...]
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -36,6 +41,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 static ggml_backend_reg_t g_reg = nullptr;
@@ -652,6 +658,66 @@ static void test_vpack() {
     set_force(nullptr);
 }
 
+// ---- race ------------------------------------------------------------------------------------------------------------
+
+static void test_race() {
+    printf("race: the tier gates hold while another thread compiles pipelines on demand\n");
+    set_force(nullptr);
+    // the watched node: n_q 3 (6 workgroups, split-K on the 64-lane tiers), so its workspace depends on the tier
+    sa_shape s;
+    s.n_q = 3;
+    s.n_kv = 8192;
+    s.n_sel = 2051;
+    ggml_context * ctx = new_ctx();
+    const sa_graph g = sa_build(ctx, s);
+    const bool sup0 = ggml_backend_dev_supports_op(g_dev, g.out);
+    const size_t a0 = ggml_backend_buft_get_alloc_size(g_buft, g.out);
+    ggml_backend_t be2 = ggml_backend_dev_init(g_dev, nullptr);
+    GGML_ASSERT(be2);
+    std::atomic<bool> done { false };
+    std::atomic<int64_t> n_reads { 0 }, n_bad { 0 };
+    std::thread reader([&] {
+        while (!done.load()) {
+            const bool sup = ggml_backend_dev_supports_op(g_dev, g.out);
+            const size_t a = ggml_backend_buft_get_alloc_size(g_buft, g.out);
+            n_reads++;
+            if (sup != sup0 || a != a0) {
+                n_bad++;
+            }
+        }
+    });
+    // pipelines no earlier test compiled: each compute requests one and runs ggml_vk_load_shaders(requested) again
+    int n_compute = 0;
+    for (int rot : { 64, 128, 256 }) {
+        for (ggml_type t : { GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL }) {
+            sa_shape w;
+            w.tk = w.tv = t;
+            w.n_q = 2;
+            w.n_kv = 512;
+            w.n_sel = 64;
+            w.rot_q = rot;
+            run_ctx rc;
+            const sa_graph gw = sa_build(rc.ctx, w);
+            if (!ggml_backend_dev_supports_op(g_dev, gw.out)) {
+                continue;
+            }
+            ggml_build_forward_expand(rc.gf, gw.out);
+            GGML_ASSERT(ggml_gallocr_alloc_graph(rc.galloc, rc.gf));
+            fill_inputs(gw, w, 5);
+            GGML_ASSERT(ggml_backend_graph_compute(be2, rc.gf) == GGML_STATUS_SUCCESS);
+            n_compute++;
+        }
+    }
+    done.store(true);
+    reader.join();
+    printf("  watched node: supported %d, alloc %zu; %d computes with new pipelines, %" PRId64 " reads on the other thread, %" PRId64 " differ\n",
+           sup0, a0, n_compute, n_reads.load(), n_bad.load());
+    CHECK(n_compute > 0, "no compute ran: the test proves nothing");
+    CHECK(n_bad.load() == 0, "%" PRId64 " of %" PRId64 " reads saw another support or alloc size during a pipeline compile", n_bad.load(), n_reads.load());
+    ggml_backend_free(be2);
+    ggml_free(ctx);
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
     g_reg = ggml_backend_reg_by_name("Vulkan");
@@ -676,6 +742,7 @@ int main(int argc, char ** argv) {
     if (on("dense"))      test_dense();
     if (on("reason"))     test_reason();
     if (on("vpack"))      test_vpack();
+    if (on("race"))       test_race();
 
     ggml_backend_free(g_backend);
     printf("%s: %d failed checks\n", g_fail == 0 ? "OK" : "FAILED", g_fail);
