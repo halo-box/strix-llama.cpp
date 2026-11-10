@@ -442,6 +442,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     # supports_op rejects SPARSE_ATTN / SPARSE_ATTN_PLAN nodes whose shapes break ggml_sparse_attn's invariants (an RPC
     # server's node), on every device of the build
     llama_build_and_test(test-sparse-attn-shape-guard.cpp LINK ggml)
+    if (GGML_RPC AND NOT WIN32)
+        # the sparse-attention ops through an in-process rpc-server: alloc size per plan, supports_op of the server device
+        llama_build_and_test(test-rpc-sparse-attn.cpp LINK ggml)
+    endif()
     # the HIP gated SPARSE_ATTN fusion places an output that overlaps a read in graph memory, never in the pool (D12); host only
     llama_build_and_test(test-sparse-attn-gate-scratch.cpp LINK ggml)
     # the QSA placement guard (PLAN-v3 §10): needs a qwen4exp model on the command line (fake GPU device, forced reject, non-vacuity)
