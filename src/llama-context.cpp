@@ -15,6 +15,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -910,6 +911,72 @@ static bool qsa_trace_on() {
 }
 
 // the K / V types this device takes for this node's shape, for the "supported here" remedy of the init error
+std::vector<llama_qsa_reserve_pass_desc> llama_qsa_reserve_passes(const llama_qsa_reserve_shape & s) {
+    std::vector<llama_qsa_reserve_pass_desc> p;
+    const uint32_t n_tokens = s.n_tokens, n_seqs = s.n_seqs, n_outputs_pp = s.n_outputs_pp;
+    // the QSA reserve graphs of PLAN-v3 §7.1, in the allocating context before the sizes are recorded, and in the fit
+    // probe's per-backend max (no_alloc):
+    //  - pass A (§7.1.2): sequential positions, one output in the last row: the trim tile (n_tokens > 512) and the
+    //    incremental fast-cache route (n_tokens <= 512), which the all-zero-position reserve never builds (C15);
+    //  - pass B (§7.1.3): the dense shortcut at its largest padded n_kv (its [n_kv, n_tokens] mask, C15);
+    //  - the non-compact variant (§7.1.4) when the context serves several sequences: T = min(ub, S x 512) tokens in total,
+    //    the decision forced to non-compact at the full n_kv; the re-split bounds every runtime non-compact ubatch by T
+    // one KV stream (unified, or a single sequence): the fast cache and the trim need n_stream == 1
+    if (s.kv_unified || n_seqs == 1) {
+        if (n_tokens > 512) {
+            p.push_back({ "passA-trim", n_tokens, 1, 1, 0, 0, 0, true, true });
+        }
+        // the fast route with every row an output (llama-perplexity at ub <= 512): C15's +33280 B sit under the logits
+        const uint32_t n_fast = std::min<uint32_t>(n_tokens, 512);
+        p.push_back({ "passA-fast", n_fast, 1, std::min(n_fast, n_outputs_pp), 0, 0, LLM_GRAPH_QSA_RESERVE_FAST, true, false });
+    }
+    // the shortcut serves n_kv <= top_k + r - 1; n_kv is padded to multiples of 256 (llama_kv_cache::get_n_kv)
+    const uint32_t n_kv_b = s.width / 256 * 256;
+    const bool shortcut = n_kv_b >= 256 && n_kv_b < s.n_kv_full;
+    if (shortcut) {
+        // a stream's cells hold at least its own tokens of the ubatch, so a shortcut ubatch has at most n_kv_b tokens per
+        // stream: a 4096-token ubatch at n_kv 2048 cannot occur
+        const uint32_t n_streams = s.kv_unified ? 1 : n_seqs;
+        const uint32_t n_tok_b   = std::min(n_tokens, n_kv_b * n_streams);
+        p.push_back({ "passB", n_tok_b, n_seqs, std::min(n_tok_b, n_outputs_pp), n_kv_b, 0, 0, false, false });
+    }
+    if (s.mtp) {
+        // the MTP draft context processes prompt ubatches with no output row (W9 strict run: n_outputs = 0 on a 4096-token
+        // ubatch grew the MTP ROCm0 buffer past the pp reserve, whose graph always has >= 1 output)
+        p.push_back({ "pp-0out", n_tokens, n_seqs, 0, 0, 0, 0, false, false });
+    }
+    if (n_seqs > 1) {
+        const uint32_t T = std::min(n_tokens, s.noncompact_cap);
+        p.push_back({ "noncompact", T, n_seqs, std::max(n_seqs, std::min(T, n_outputs_pp)), 0, 0, LLM_GRAPH_QSA_RESERVE_NONCOMPACT, false, false });
+    }
+    // split KV streams with several sequences: a ubatch of one sequence (the server's prompt ubatches) is a one-stream graph
+    // of up to n_ubatch rows at the full per-stream n_kv. The graphs above all view n_seqs streams (init_full's slot info),
+    // so none of them builds it: Prove's -np 2 split run at ub8192 grew the main ROCm0 buffer 22.6 MiB past the reserve on
+    // one-sequence 8192-token ubatches (n_stream=1, n_outputs=0). Reserve the one-stream shapes of the passes above: plain,
+    // no output (the server's non-final prompt ubatches), and the trim and fast-cache routes (both need n_stream == 1).
+    if (!s.kv_unified && n_seqs > 1) {
+        p.push_back({ "1s-pp",   n_tokens, 1, n_outputs_pp, s.n_kv_full, 1, 0, false, false });
+        p.push_back({ "1s-0out", n_tokens, 1, 0,            s.n_kv_full, 1, 0, false, false });
+        if (n_tokens > 512) {
+            p.push_back({ "1s-trim", n_tokens, 1, 1, s.n_kv_full, 1, 0, true, true });
+        }
+        const uint32_t n_fast = std::min<uint32_t>(n_tokens, 512);
+        p.push_back({ "1s-fast", n_fast, 1, std::min(n_fast, n_outputs_pp), s.n_kv_full, 1, LLM_GRAPH_QSA_RESERVE_FAST, true, false });
+        // and pass B's: a one-sequence ubatch at n_kv <= n_kv_b is a one-stream shortcut graph of up to min(ub, n_kv_b)
+        // rows. Pass B views n_seqs streams with n_tok_b / n_seqs rows each, so its route is decided at that per-stream
+        // n_q (prefer_dense, qwen4exp.cpp), and on HIP a non-f16 pair is dense FA at n_q <= 127 but the AV rows + plan +
+        // SPARSE_ATTN route at n_q >= 128 (sparse-attn-attend-g1.cu): -np 8 at ub 512 reserves 64-row streams (dense)
+        // while a slot's 512-token prompt ubatch runs the AV route (its n_kv x n_tokens F32 intermediates), which no other
+        // pass builds (the 1s passes above run at n_kv_full > width: the selection route)
+        if (shortcut) {
+            const uint32_t n_tok_1 = std::min(n_tokens, n_kv_b);
+            p.push_back({ "1s-passB",      n_tok_1, 1, std::min(n_tok_1, n_outputs_pp), n_kv_b, 1, 0, false, false });
+            p.push_back({ "1s-passB-0out", n_tok_1, 1, 0,                               n_kv_b, 1, 0, false, false });
+        }
+    }
+    return p;
+}
+
 std::string llama_qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor * attn) {
     static const ggml_type types[] = { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F32,
                                        GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
@@ -1304,13 +1371,8 @@ void llama_context::sched_reserve() {
         LLAMA_LOG_INFO("%s: reserve after the pp and tg graphs, MiB:%s\n", __func__, sizes_pp_tg.c_str());
     }
 
-    // the QSA reserve graphs of PLAN-v3 §7.1, in the allocating context before the sizes are recorded below, and in the
-    // fit probe's per-backend max (no_alloc):
-    //  - pass A (§7.1.2): sequential positions, one output in the last row: the trim tile (n_tokens > 512) and the
-    //    incremental fast-cache route (n_tokens <= 512), which the all-zero-position reserve never builds (C15);
-    //  - pass B (§7.1.3): the dense shortcut at its largest padded n_kv (its [n_kv, n_tokens] mask, C15);
-    //  - the non-compact variant (§7.1.4) when the context serves several sequences: T = min(ub, S x 512) tokens in total,
-    //    the decision forced to non-compact at the full n_kv; the re-split bounds every runtime non-compact ubatch by T
+    // the QSA reserve graphs of PLAN-v3 §7.1 (llama_qsa_reserve_passes), in the allocating context before the sizes are
+    // recorded below, and in the fit probe's per-backend max (no_alloc)
     struct qsa_reserve_pass {
         const char * name;
         uint32_t n_tokens;
@@ -1320,63 +1382,39 @@ void llama_context::sched_reserve() {
         reserve_variant var;
     };
     std::vector<qsa_reserve_pass> qsa_passes;
-    llama_memory_context_ptr mctx_shortcut;
-    llama_memory_context_ptr mctx_one_stream;
+    // the reduced views of the passes (init_full_n_kv), one per (n_kv, n_stream), alive until the passes are reserved
+    std::vector<std::pair<std::pair<uint32_t, uint32_t>, llama_memory_context_ptr>> qsa_views;
     if (qsa_n_layers() > 0 && !cparams.training) {
         auto * mem_qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
         GGML_ASSERT(mem_qsa != nullptr);
         const auto & hp = model.hparams;
-        // one KV stream (unified, or a single sequence): the fast cache and the trim need n_stream == 1
-        if (cparams.kv_unified || n_seqs == 1) {
-            if (n_tokens > 512) {
-                qsa_passes.push_back({ "passA-trim", n_tokens, 1, 1, mctx.get(), { 0, true, true } });
-            }
-            // the fast route with every row an output (llama-perplexity at ub <= 512): C15's +33280 B sit under the logits
-            const uint32_t n_fast = std::min<uint32_t>(n_tokens, 512);
-            qsa_passes.push_back({ "passA-fast", n_fast, 1, std::min(n_fast, n_outputs_pp), mctx.get(), { LLM_GRAPH_QSA_RESERVE_FAST, true, false } });
-        }
-        // the shortcut serves n_kv <= top_k + r - 1; n_kv is padded to multiples of 256 (llama_kv_cache::get_n_kv)
         uint32_t width = 0;
         for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
             if (hp.dsv4_compress_ratios[il] > 0) {
                 width = std::max<uint32_t>(width, hp.indexer_top_k + hp.dsv4_compress_ratios[il] - 1);
             }
         }
-        const uint32_t n_kv_b = width / 256 * 256;
-        const uint32_t n_kv_full = mem_qsa->get_mem_attn()->get_size();
-        if (n_kv_b >= 256 && n_kv_b < n_kv_full) {
-            // a stream's cells hold at least its own tokens of the ubatch, so a shortcut ubatch has at most n_kv_b tokens per
-            // stream: a 4096-token ubatch at n_kv 2048 cannot occur
-            const uint32_t n_streams = cparams.kv_unified ? 1 : n_seqs;
-            const uint32_t n_tok_b   = std::min(n_tokens, n_kv_b * n_streams);
-            mctx_shortcut = mem_qsa->init_full_n_kv(n_kv_b);
-            qsa_passes.push_back({ "passB", n_tok_b, n_seqs, std::min(n_tok_b, n_outputs_pp), mctx_shortcut.get(), {} });
-        }
-        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-            // the MTP draft context processes prompt ubatches with no output row (W9 strict run: n_outputs = 0 on a 4096-token
-            // ubatch grew the MTP ROCm0 buffer past the pp reserve, whose graph always has >= 1 output)
-            qsa_passes.push_back({ "pp-0out", n_tokens, n_seqs, 0, mctx.get(), {} });
-        }
-        if (n_seqs > 1) {
-            const uint32_t T = std::min(n_tokens, mem_qsa->qsa_noncompact_cap(cparams.n_ubatch));
-            qsa_passes.push_back({ "noncompact", T, n_seqs, std::max(n_seqs, std::min(T, n_outputs_pp)), mctx.get(),
-                    { LLM_GRAPH_QSA_RESERVE_NONCOMPACT, false, false } });
-        }
-        // split KV streams with several sequences: a ubatch of one sequence (the server's prompt ubatches) is a one-stream graph
-        // of up to n_ubatch rows at the full per-stream n_kv. The graphs above all view n_seqs streams (init_full's slot info),
-        // so none of them builds it: Prove's -np 2 split run at ub8192 grew the main ROCm0 buffer 22.6 MiB past the reserve on
-        // one-sequence 8192-token ubatches (n_stream=1, n_outputs=0). Reserve the one-stream shapes of the passes above: plain,
-        // no output (the server's non-final prompt ubatches), and the trim and fast-cache routes (both need n_stream == 1).
-        if (!cparams.kv_unified && n_seqs > 1) {
-            mctx_one_stream = mem_qsa->init_full_n_kv(n_kv_full, 1);
-            qsa_passes.push_back({ "1s-pp",   n_tokens, 1, n_outputs_pp, mctx_one_stream.get(), {} });
-            qsa_passes.push_back({ "1s-0out", n_tokens, 1, 0,            mctx_one_stream.get(), {} });
-            if (n_tokens > 512) {
-                qsa_passes.push_back({ "1s-trim", n_tokens, 1, 1, mctx_one_stream.get(), { 0, true, true } });
+        llama_qsa_reserve_shape shape = {};
+        shape.n_tokens       = n_tokens;
+        shape.n_seqs         = n_seqs;
+        shape.n_outputs_pp   = n_outputs_pp;
+        shape.kv_unified     = cparams.kv_unified;
+        shape.mtp            = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+        shape.width          = width;
+        shape.n_kv_full      = mem_qsa->get_mem_attn()->get_size();
+        shape.noncompact_cap = mem_qsa->qsa_noncompact_cap(cparams.n_ubatch);
+        for (const auto & d : llama_qsa_reserve_passes(shape)) {
+            const llama_memory_context_i * mc = mctx.get();
+            if (d.n_kv != 0) {
+                const std::pair<uint32_t, uint32_t> key = { d.n_kv, d.n_stream };
+                auto it = std::find_if(qsa_views.begin(), qsa_views.end(), [&](const auto & e) { return e.first == key; });
+                if (it == qsa_views.end()) {
+                    qsa_views.emplace_back(key, mem_qsa->init_full_n_kv(d.n_kv, d.n_stream));
+                    it = qsa_views.end() - 1;
+                }
+                mc = it->second.get();
             }
-            const uint32_t n_fast = std::min<uint32_t>(n_tokens, 512);
-            qsa_passes.push_back({ "1s-fast", n_fast, 1, std::min(n_fast, n_outputs_pp), mctx_one_stream.get(),
-                    { LLM_GRAPH_QSA_RESERVE_FAST, true, false } });
+            qsa_passes.push_back({ d.name, d.n_tokens, d.n_seqs, d.n_outputs, mc, { d.qsa, d.seq_pos, d.last_output } });
         }
     }
     for (auto & p : qsa_passes) {

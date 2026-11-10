@@ -45,6 +45,33 @@ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_b
 // the K / V types dev takes for the shape of the SPARSE_ATTN node attn (the "supported here" list of the QSA init error)
 std::string llama_qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor * attn);
 
+// The QSA reserve graphs of PLAN-v3 §7.1 that llama_context::sched_reserve builds after the pp and tg graphs, as a pure
+// function of the context's shape (so the list is testable without a model: tests/test-qsa-reserve-passes.cpp).
+struct llama_qsa_reserve_shape {
+    uint32_t n_tokens;        // min(n_ctx, n_ubatch)
+    uint32_t n_seqs;          // n_seq_max (the reserve's n_seqs)
+    uint32_t n_outputs_pp;    // the pp reserve's n_outputs
+    bool     kv_unified;
+    bool     mtp;             // LLAMA_CONTEXT_TYPE_MTP
+    uint32_t width;           // max over the QSA layers of indexer_top_k + ratio - 1 (the shortcut serves n_kv <= width)
+    uint32_t n_kv_full;       // cells per stream of the attention cache
+    uint32_t noncompact_cap;  // qsa_noncompact_cap(n_ubatch): the T of the non-compact variant
+};
+
+struct llama_qsa_reserve_pass_desc {
+    const char * name;
+    uint32_t n_tokens;
+    uint32_t n_seqs;
+    uint32_t n_outputs;
+    uint32_t n_kv;            // 0: the context's own full view; else the view init_full_n_kv(n_kv, n_stream)
+    uint32_t n_stream;        // with n_kv != 0: 0 = every stream of the cache, else that many
+    uint32_t qsa;             // LLM_GRAPH_QSA_RESERVE_* (llama_context::reserve_variant)
+    bool     seq_pos;
+    bool     last_output;
+};
+
+std::vector<llama_qsa_reserve_pass_desc> llama_qsa_reserve_passes(const llama_qsa_reserve_shape & s);
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
