@@ -1034,6 +1034,9 @@ public:
 
     void add_qsa_node(const llm_graph_qsa_node & node) { qsa_nodes.push_back(node); }
     const std::vector<llm_graph_qsa_node> & get_qsa_nodes() const { return qsa_nodes; }
+    // the nodes of QSA layer il that read or write its indexer K cache (the guard's indexer check, llama_context::qsa_guard)
+    void add_qsa_idx_node(int il, ggml_tensor * t) { qsa_idx_nodes.emplace_back(il, t); }
+    const std::vector<std::pair<int, ggml_tensor *>> & get_qsa_idx_nodes() const { return qsa_idx_nodes; }
 
     // the QSA graph-build check (PLAN-v3 §4.3): non-empty when this graph must not be allocated; llama_decode returns an error
     void set_qsa_ubatch_error(std::string msg) { if (qsa_ubatch_error.empty()) { qsa_ubatch_error = std::move(msg); } }
@@ -1059,6 +1062,7 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::vector<llm_graph_qsa_node>   qsa_nodes;   // the attention node of every QSA layer of this graph
+    std::vector<std::pair<int, ggml_tensor *>> qsa_idx_nodes;   // (layer, node) on the indexer K cache of every QSA layer
     std::string                       qsa_ubatch_error;
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;

@@ -7,6 +7,10 @@
 //   test-qsa-guard <model.gguf> reject        a real HIP device under the test hook GGML_CUDA_SA_REJECT=1: init error
 //   test-qsa-guard <model.gguf> reject-decode the weights are loaded, the hook is set after init: llama_decode returns an
 //                                             error from the runtime guard, nothing is computed
+//   test-qsa-guard <model.gguf> fake-idx T    a fake GPU device that takes the sparse-attention ops but, as HIP, no GET_ROWS
+//                                             of IQ4_NL rows whose width is not a multiple of 256, with --cache-type-k-idx T:
+//                                             iq4_nl (128-wide indexer rows) must be an init error naming the indexer cache,
+//                                             any other T must create the context
 // Exit status 0 = the expectation held.
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -77,8 +81,14 @@ static ggml_backend_t fake_dev_init(ggml_backend_dev_t dev, const char *) {
     return b;
 }
 static ggml_backend_buffer_type_t fake_dev_buft(ggml_backend_dev_t) { return fake_buft(); }
+static bool g_fake_idx = false;   // fake-idx mode: the sparse-attention ops are taken, IQ4_NL GET_ROWS as on HIP
+
 static bool fake_dev_supports_op(ggml_backend_dev_t, const ggml_tensor * op) {
-    if (op->op == GGML_OP_SPARSE_ATTN || op->op == GGML_OP_SPARSE_ATTN_PLAN) {
+    if (!g_fake_idx && (op->op == GGML_OP_SPARSE_ATTN || op->op == GGML_OP_SPARSE_ATTN_PLAN)) {
+        return false;
+    }
+    // ggml-cuda.cu supports_op, GET_ROWS: IQ4_NL only for ne[0] % QK_K == 0
+    if (g_fake_idx && op->op == GGML_OP_GET_ROWS && op->src[0]->type == GGML_TYPE_IQ4_NL && op->src[0]->ne[0] % 256 != 0) {
         return false;
     }
     return ggml_backend_dev_supports_op(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), op);
@@ -144,7 +154,7 @@ static ggml_type type_of(const char * s) {
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.gguf pass [ctk] | fake | reject | reject-decode\n", argv[0]);
+        fprintf(stderr, "usage: %s model.gguf pass [ctk] | fake | fake-idx <type> | reject | reject-decode\n", argv[0]);
         return 2;
     }
     const std::string mode = argv[2];
@@ -159,7 +169,8 @@ int main(int argc, char ** argv) {
     mp.no_alloc = mode != "reject-decode";
 
     ggml_backend_dev_t devs[2] = { nullptr, nullptr };
-    if (mode == "fake") {
+    g_fake_idx = mode == "fake-idx";
+    if (mode == "fake" || mode == "fake-idx") {
         ggml_backend_device_register(fake_device());
         devs[0] = fake_device();
         mp.devices = devs;
@@ -178,6 +189,10 @@ int main(int argc, char ** argv) {
     cp.type_k = type;
     cp.type_v = type;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    if (mode == "fake-idx") {
+        cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
+        cp.type_k_idx = type;
+    }
 
     if (mode == "reject") {
         setenv("GGML_CUDA_SA_REJECT", "1", 1);
@@ -219,6 +234,21 @@ int main(int argc, char ** argv) {
             rc = fail("the init error does not name the remedy");
         } else {
             printf("the guard fired: %s\n", want);
+        }
+    } else if (mode == "fake-idx") {
+        if (type == GGML_TYPE_IQ4_NL) {
+            if (ctx != nullptr) {
+                rc = fail("the context must not be created: the indexer GET_ROWS would run on the CPU");
+            } else if (g_log.find("the indexer K cache (iq4_nl") == std::string::npos || g_log.find("GET_ROWS") == std::string::npos ||
+                       g_log.find("--cache-type-k-idx auto") == std::string::npos) {
+                rc = fail("the init error does not name the indexer cache, the op and the remedy");
+            } else {
+                printf("the guard fired on the iq4_nl indexer cache\n");
+            }
+        } else if (ctx == nullptr) {
+            rc = fail("context creation with this indexer type");
+        } else {
+            printf("context created with the %s indexer cache\n", ggml_type_name(type));
         }
     } else if (mode == "reject-decode") {
         if (ctx == nullptr) {
