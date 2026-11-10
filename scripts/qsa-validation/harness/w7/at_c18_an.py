@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""AT-C18 verdict: |estimate - real| <= 1 MiB per backend, main and MTP; the guard line of the probe contexts with >= 2 x QSA layers; -nkvo pins. usage: at_c18_an.py DIR"""
+"""AT-C18 verdict: |estimate - real| <= 1 MiB per backend, main and MTP; every guard line of the probe contexts with inspected >= required
+(plan + attend per sparse layer, attend per shortcut layer; 0 for a cache-only graph, which has no attention node); -nkvo pins.
+usage: at_c18_an.py DIR"""
 import json, re, sys, glob
 d = sys.argv[1]
 P = json.load(open(d + '/parsed.json'))
@@ -27,10 +29,14 @@ for f in sorted(glob.glob(d + '/srv_*.log')):
         m = re.search(r'QSA ctx=(\S+) graph=(\S+) route=(\S+) .*backend=(\S+) plan=(\d+) attend=(\d+) cpu=(\d+).*guard=(\d+)/(\d+)', line)
         if m: rows.append((phase,) + m.groups())
     probe = [r for r in rows if r[0] == 'probe']
-    gd = [int(r[8]) >= int(r[9]) for r in probe]
+    # cache-only: no plan and no attend node. Logs before the fix print its required count clamped to 1 (guard=0/1)
+    def guard_ok(r):
+        cache_only = r[3] == 'cache-only' or (int(r[5]) == 0 and int(r[6]) == 0)
+        return int(r[8]) >= (0 if cache_only else max(int(r[9]), 1))
+    gd = [guard_ok(r) for r in probe]
     nk = 'nkvo' in tag
     pins = all((int(r[7]) == int(r[6]) or r[3] == 'host-kv-copy') for r in probe) if nk else True
     ok = bool(probe) and all(gd) and pins
     fail += not ok
-    print(f"- {tag}: probe guard lines {len(probe)}, inspected >= 2 x layers: {all(gd) if gd else None}; -nkvo pins (cpu = attend, or the named route): {pins}; {'PASS' if ok else 'FAIL'}; {[r[1:] for r in probe][:2]}")
+    print(f"- {tag}: probe guard lines {len(probe)}, inspected >= required: {all(gd) if gd else None}; -nkvo pins (cpu = attend, or the named route): {pins}; {'PASS' if ok else 'FAIL'}; {[r[1:] for r in probe][:2]}")
 print('\nAT-C18 ' + ('PASS' if fail == 0 else f'FAIL ({fail})'))

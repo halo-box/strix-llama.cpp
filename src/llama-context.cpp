@@ -1104,15 +1104,17 @@ void llama_context::qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32
         const auto & n0 = nodes.front();
         const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
         const char * ctx_name = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
-        ggml_backend_t be0 = ggml_backend_sched_get_tensor_backend(sched.get(), n0.attn);
+        ggml_backend_t be0 = n0.attn ? ggml_backend_sched_get_tensor_backend(sched.get(), n0.attn) : nullptr;
         ggml_backend_dev_t dev0 = be0 ? ggml_backend_get_device(be0) : nullptr;
         const bool has_policy = dev0 && ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev0), "ggml_backend_sparse_attn_group") != nullptr;
+        // a graph without any attention node (the MTP context's no-output prompt graph stores K / V only, qsa_guard's
+        // cache_only) has nothing to place: route=cache-only, and the guard's own counts (0 required), not a clamped 1
         LLAMA_LOG_INFO("%s: QSA ctx=%s graph=%s route=%s K=%s V=%s idx=%s policy=%s backend=%s plan=%d attend=%d cpu=%d%s%s n_kv=%" PRId64 " G=%d guard=%d/%d\n",
-                __func__, ctx_name, where, n_copy > 0 ? "host-kv-copy" : n_plan > 0 ? "sparse" : "dense-shortcut",
+                __func__, ctx_name, where, n_copy > 0 ? "host-kv-copy" : n_plan > 0 ? "sparse" : n_attend > 0 ? "dense-shortcut" : "cache-only",
                 ggml_type_name(n0.type_k), ggml_type_name(n0.type_v), mem && mem->get_mem_idx() ? ggml_type_name(mem->get_mem_idx()->type_k()) : "none",
                 has_policy ? "backend" : "default", be0 ? ggml_backend_name(be0) : "none", n_plan, n_attend, n_cpu,
                 n_sched > 0 ? " shortcut=scheduler" : "", n_cpu > 0 ? " pinned-cpu" : "", n0.n_kv, n0.group, qsa_guard_last_inspected,
-                std::max(qsa_guard_last_required, 1));
+                qsa_guard_last_required);
     }
 }
 
