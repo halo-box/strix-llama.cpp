@@ -16,8 +16,10 @@
 //   reason      ggml_backend_sparse_attn_unsupported_reason names the cause: "type pair not supported" only for a K / V type
 //               outside the set (the init error then lists other types), the binding limit for a view past the device's
 //               binding range, and a shape reason for GQA / head size (both then get the CPU / --no-kv-offload remedy).
+//   vpack       under GGML_VK_SA_FORCE=vpack (cm tier) the attend's alloc size at the reserve's n_kv holds every smaller n_kv of
+//               the same n_q: a pack happens at n_kv4 < 64 n_q, so a smaller runtime n_kv can pack where the reserve did not.
 //
-// Without a Vulkan backend it exits 0 ("skipped"). usage: test-sparse-attn-vk [limits|capability|rot|stress|dense|reason ...]
+// Without a Vulkan backend it exits 0 ("skipped"). usage: test-sparse-attn-vk [limits|capability|rot|stress|dense|reason|vpack ...]
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -603,6 +605,53 @@ static void test_reason() {
     }
 }
 
+// ---- vpack -----------------------------------------------------------------------------------------------------------
+
+static void test_vpack() {
+    printf("vpack: the reserve at the largest n_kv holds the workspace of every smaller n_kv\n");
+    set_force("vpack");
+    if (std::string(vk_tier_now()) != "cm") {
+        printf("  the pack arm runs on the cm tier only (this device: %s), skipped\n", vk_tier_now());
+        set_force(nullptr);
+        return;
+    }
+    for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t n_q : { 16, 512 }) {
+            const auto alloc = [&](int64_t n_kv) {
+                ggml_context * ctx = new_ctx();
+                sa_shape s;
+                s.tk = s.tv = t;
+                s.n_q = n_q;
+                s.n_kv = n_kv;
+                s.n_sel = 2051;
+                const sa_graph g = sa_build(ctx, s);
+                const size_t a = ggml_backend_dev_supports_op(g_dev, g.out) ? ggml_backend_buft_get_alloc_size(g_buft, g.out) - ggml_nbytes(g.out) : 0;
+                ggml_free(ctx);
+                return a;
+            };
+            const int64_t n_kv_max = 131072;
+            const size_t reserve = alloc(n_kv_max);
+            size_t worst = 0;
+            int64_t worst_kv = 0;
+            for (int64_t n_kv : { (int64_t) 2052, (int64_t) 4096, (int64_t) 16384, 64 * n_q - 4, 64 * n_q, (int64_t) 65536, n_kv_max }) {
+                if (n_kv > n_kv_max || n_kv < 2052) {
+                    continue;
+                }
+                const size_t a = alloc(n_kv);
+                if (a > worst) {
+                    worst = a;
+                    worst_kv = n_kv;
+                }
+            }
+            printf("  %-4s n_q %-4d: workspace at the reserve n_kv %d = %zu B, largest at a smaller n_kv = %zu B (n_kv %d)\n",
+                   ggml_type_name(t), (int) n_q, (int) n_kv_max, reserve, worst, (int) worst_kv);
+            CHECK(reserve >= worst, "%s n_q %d: the reserve at n_kv %d (%zu B) is below the runtime workspace at n_kv %d (%zu B)",
+                  ggml_type_name(t), (int) n_q, (int) n_kv_max, reserve, (int) worst_kv, worst);
+        }
+    }
+    set_force(nullptr);
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
     g_reg = ggml_backend_reg_by_name("Vulkan");
@@ -626,6 +675,7 @@ int main(int argc, char ** argv) {
     if (on("stress"))     test_stress();
     if (on("dense"))      test_dense();
     if (on("reason"))     test_reason();
+    if (on("vpack"))      test_vpack();
 
     ggml_backend_free(g_backend);
     printf("%s: %d failed checks\n", g_fail == 0 ? "OK" : "FAILED", g_fail);
