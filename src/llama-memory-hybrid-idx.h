@@ -135,8 +135,9 @@ public:
     void qsa_commit(int il) const;
 
     // the full-cache context with the attention and indexer views limited to n_kv cells: reserve pass B (PLAN-v3 §7.1.3),
-    // the dense shortcut's graph at the largest padded n_kv it serves
-    llama_memory_context_ptr init_full_n_kv(uint32_t n_kv);
+    // the dense shortcut's graph at the largest padded n_kv it serves. n_stream > 0 also limits the views to the first
+    // n_stream streams: the one-stream reserve graphs of a split cache with several sequences (llama_context::sched_reserve)
+    llama_memory_context_ptr init_full_n_kv(uint32_t n_kv, uint32_t n_stream = 0);
 
     // PLAN-v3 §4.2 / §4.3: the compact predicate of a ubatch over the cells of kv (the attention cache at init, the
     // indexer cache at graph time), each of the ubatch's n_stream streams with the sequence ids of its own tokens;
@@ -255,8 +256,8 @@ public:
                       llama_context * lctx,
                                bool   optimize);
 
-    // a full-cache context whose attention and indexer views hold n_kv cells (reserve pass B)
-    llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv);
+    // a full-cache context whose attention and indexer views hold n_kv cells (reserve pass B) of n_stream streams (0: all)
+    llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv, uint32_t n_stream = 0);
 
     // used to create a batch processing context from a batch
     llama_memory_hybrid_idx_context(
