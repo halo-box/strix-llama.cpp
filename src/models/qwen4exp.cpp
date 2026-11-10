@@ -258,6 +258,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const std::string ple_exl3 = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "exl3r_trellis").str();
         const auto * ple_w = ml.get_weight(ple_exl3.c_str()) ? ml.get_weight(ple_exl3.c_str()) : ml.get_weight(ple_name.c_str());
         if (ml.get_weight(ple_exl3.c_str())) {
+#ifdef LLAMA_USE_EXL3
+            if (hparams.ple_head_dim != GGML_EXL3_ROW_DIM) {
+                throw std::runtime_error(format("EXL3 n-gram table '%s' has width %u, expected %d", ple_exl3.c_str(), hparams.ple_head_dim, GGML_EXL3_ROW_DIM));
+            }
+#endif
             ple_exl3_k    = (int32_t) ((ple_w->tensor->ne[0] - 1)*16/hparams.ple_head_dim);
             ple_exl3_bias = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "exl3r_bias"), { hparams.ple_head_dim, hparams.ple_n_heads }, 0);
         }
