@@ -42,6 +42,9 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// the K / V types dev takes for the shape of the SPARSE_ATTN node attn (the "supported here" list of the QSA init error)
+std::string llama_qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor * attn);
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(

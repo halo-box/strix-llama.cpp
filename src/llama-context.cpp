@@ -910,13 +910,14 @@ static bool qsa_trace_on() {
 }
 
 // the K / V types this device takes for this node's shape, for the "supported here" remedy of the init error
-static std::string qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor * attn) {
+std::string llama_qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor * attn) {
     static const ggml_type types[] = { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F32,
                                        GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
     if (attn->op != GGML_OP_SPARSE_ATTN) {
         return "";
     }
-    ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+    // two objects per type: the K tensor and the SPARSE_ATTN node (ggml_sparse_attn makes one result tensor)
+    ggml_init_params ip = { 2 * std::size(types) * ggml_tensor_overhead(), nullptr, true };
     ggml_context_ptr ctx { ggml_init(ip) };
     std::string out;
     for (const ggml_type t : types) {
@@ -946,7 +947,7 @@ static std::string qsa_unsupported_error(const llm_graph_qsa_node & n, ggml_back
             n.il, n.producer, ggml_type_name(n.type_k), ggml_type_name(n.type_v), ggml_backend_dev_name(dev),
             ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), reason.c_str());
     if (reason.rfind("type pair", 0) == 0) {
-        msg += "use another -ctk/-ctv (supported here: " + qsa_supported_types(dev, n.attn) + ")";
+        msg += "use another -ctk/-ctv (supported here: " + llama_qsa_supported_types(dev, n.attn) + ")";
     } else {
         msg += "run QSA on the CPU with -ngl 0 or --no-kv-offload, or use a HIP (RDNA3.5) or Vulkan build";
     }
