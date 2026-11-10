@@ -2667,7 +2667,9 @@ extern "C" {
     //   1. K and V elements are converted to f16 as the type's to_float value rounded to f16 (RNE, +-inf on overflow).
     //   2. q is transformed by H_q in f32 when rot_q > 0, multiplied by scale in f32 and rounded to f16.
     //   3. Scores are f32. Online softmax over the cells in ascending order: P is rounded to f16 against the running max
-    //      for PV, the normaliser l sums the unrounded f32 p, PV accumulates in f32; acc / l and H_o run in f32.
+    //      for PV, the normaliser l sums the unrounded f32 p, PV accumulates in f32; acc / l and H_o run in f32. A cell
+    //      whose score is -inf (an f16 K or q element at +-inf, item 1) has p = 0 wherever it lies, also before any finite
+    //      score (not exp(-inf - -inf) = NaN): the row is the softmax over the other cells, and 0 when every cell is -inf.
     //   4. A cell whose mask bit is 0 and every padding entry contribute nothing, whatever their stored bytes
     //      (NaN / inf included). The summation order is a pure function of the shape and of the op's inputs, so the
     //      output is deterministic run to run.

@@ -762,7 +762,7 @@ __global__ void __launch_bounds__(256) sa_attend_fixup(const sa_g4_args a, const
                     l   *= alpha;
                     mx   = sc;
                 }
-                const float p  = expf(sc - mx);
+                const float p  = sc == -INFINITY ? 0.0f : expf(sc - mx);   // a -inf score has weight 0 (ggml.h item 3)
                 const float ph = (float) __builtin_bit_cast(_Float16, sa_f2h(p));
                 l   += p;
                 acc += ph * sa_elem_f16<VT>(vbase + cell * a.v_nb1, d, a.vt_g);

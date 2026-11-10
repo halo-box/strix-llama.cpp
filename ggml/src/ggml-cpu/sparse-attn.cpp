@@ -409,7 +409,9 @@ void ggml_compute_forward_sparse_attn(const struct ggml_compute_params * params,
                         l[hr] *= alpha;
                         mx[hr] = sc[hr];
                     }
-                    const float p  = expf(sc[hr] - mx[hr]);
+                    // a -inf score has weight 0 wherever the cell lies (ggml.h item 3): at the first cell mx is still -inf and
+                    // expf(-inf - -inf) would be NaN, which made the row 0 only when such a cell came first
+                    const float p  = sc[hr] == -INFINITY ? 0.0f : expf(sc[hr] - mx[hr]);
                     const float ph = sa_round_f16(p);
                     l[hr] += p;
                     // 5. f32 PV
