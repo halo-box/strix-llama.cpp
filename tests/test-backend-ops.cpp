@@ -13512,7 +13512,7 @@ static bool sa_is_cpu(ggml_backend_t backend) {
     return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
-enum sa_special { SA_PLAIN = 0, SA_POISON = 1, SA_OVERFLOW = 2 };
+enum sa_special { SA_PLAIN = 0, SA_POISON = 1, SA_OVERFLOW = 2, SA_NANSCORE = 3 };
 
 struct test_sparse_attn : public test_case {
     const ggml_type type_k, type_v;
@@ -13540,6 +13540,7 @@ struct test_sparse_attn : public test_case {
         s += "," + VARS_TO_STR3(kv_layout, at_end, scale);
         if (special == SA_POISON) s += ",poison";
         if (special == SA_OVERFLOW) s += ",overflow";
+        if (special == SA_NANSCORE) s += ",nanscore";
         if (prblk) s += ",prblk=" + std::to_string(prblk);
         return s;
     }
@@ -13829,6 +13830,9 @@ struct test_sparse_attn : public test_case {
                 init_overflow(rows);
             }
         }
+        if (special == SA_NANSCORE && ctx_has(ctx, k_st)) {
+            init_nanscore(ctx, rows);
+        }
         if (ctx_has(ctx, sel)) {
             sa_init_sel(sel, rows);
         }
@@ -13874,6 +13878,40 @@ struct test_sparse_attn : public test_case {
             reached = (4 * (int64_t) pad_quad + 3 < kv_rows) && (sel_bits & 0x8888) == 0;
         }
         GGML_ASSERT(reached && "poison case does not reach a padded quad with a poisoned unselected cell");
+    }
+
+    // one attended cell whose score is NaN for every query that selects it: the first valid cell of query 0 (stream 0), KV
+    // head 0. f16 / q8_0 K: the whole K row NaN (poison_row). bf16 K: element 0 of the row is 1e5, which the contract turns
+    // into f16 +inf, and element 0 of every query is 0, so the score has inf * 0 = NaN. The CPU op (sparse-attn.cpp,
+    // acc / l with l NaN) writes 0 for every head of that KV head, and so must every backend and every split count: with
+    // n_q = 1, n_sel = 2051 the HIP G1 attend splits the row (sa_g1_splits), and the split-K merge must not drop the split
+    // whose normaliser is NaN (it did: a finite softmax over the other splits)
+    void init_nanscore(ggml_context * ctx, const std::vector<int32_t> & rows) {
+        int32_t c = -1;
+        for (int64_t j = 0; j < n_sel && c < 0; ++j) {
+            if (rows[(size_t) j] >= 0 && rows[(size_t) j] < n_kv) c = rows[(size_t) j];
+        }
+        GGML_ASSERT(c >= 0 && "nanscore case: query 0 selects no valid cell");
+        if (type_k == GGML_TYPE_BF16) {
+            const size_t off = kv_offset(k_st, c, 0, 0);
+            const ggml_bf16_t big = ggml_fp32_to_bf16(1.0e5f);
+            ggml_backend_tensor_set(k_st, &big, off, sizeof(big));
+            ggml_tensor * q_st = nullptr;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                if (strcmp(t->name, "q_storage") == 0) q_st = t;
+            }
+            GGML_ASSERT(q_st != nullptr && q_st->type == GGML_TYPE_F32 && rot_q == 0);
+            const float zero = 0.0f;
+            for (int64_t s = 0; s < q_st->ne[3]; ++s) {
+                for (int64_t i = 0; i < q_st->ne[2]; ++i) {
+                    for (int64_t h = 0; h < q_st->ne[1]; ++h) {
+                        ggml_backend_tensor_set(q_st, &zero, h * q_st->nb[1] + i * q_st->nb[2] + s * q_st->nb[3], sizeof(zero));
+                    }
+                }
+            }
+        } else {
+            poison_row(k_st, c, 0, 0, true);
+        }
     }
 
     // V rows of the selected cells with values past the f16 range: bf16 V (> 65504), q8_0 V (d * q > 65504),
@@ -13941,6 +13979,25 @@ struct test_sparse_attn : public test_case {
                      n_diff, got.size(), first, got[first], ref[first]);
             msg = b;
             return false;
+        }
+        if (special == SA_NANSCORE) {
+            // non-vacuity: the poisoned cell makes query 0's rows of KV head 0 zero (contract item 5), the rows of KV head 1 not
+            const int64_t n_head = n_head_kv * gqa;
+            bool zero0 = true, zero1 = true;
+            for (int64_t h = 0; h < n_head; ++h) {
+                for (int64_t d = 0; d < D; ++d) {
+                    const float x = got[(size_t) (h * D + d)];
+                    if (h < gqa) {
+                        zero0 = zero0 && x == 0.0f;
+                    } else {
+                        zero1 = zero1 && x == 0.0f;
+                    }
+                }
+            }
+            if (!zero0 || zero1) {
+                msg = std::string("nanscore: query 0 rows of KV head 0 ") + (zero0 ? "zero" : "not zero") + ", of KV head 1 " + (zero1 ? "zero" : "not zero");
+                return false;
+            }
         }
         return true;
     }
@@ -14397,6 +14454,13 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
     // V-side overflow: bf16 V > 65504, q8_0 V with d * q > 65504, f16 V with stored inf; one selected cell
     for (ggml_type tv : {BF16, Q8, F16}) {
         for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(F16, tv, 9, 4096, 257, G, SA_ROWS_SINGLE, 12, 1, 0, 0, 1, 0, SA_OVERFLOW));
+    }
+    // a NaN score in one attended cell (inf * 0 or a NaN K element): the CPU op writes 0 for the head, so must the HIP G1
+    // split-K merge (n_q 1 / 3 at n_sel 2051: many splits), the one-split G1 epilogue and G4
+    for (ggml_type t : {F16, Q8, BF16}) {
+        for (int64_t nq : {1, 3}) {
+            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, G, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, SA_NANSCORE));
+        }
     }
     // a scale that is not a power of two (the contract multiplies in f32 before the f16 rounding)
     for (ggml_type t : {F16, Q8}) test_cases.emplace_back(new test_sparse_attn(t, t, 65, 4096, 2051, 1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, SA_PLAIN, 0, 0.0883883476f));
