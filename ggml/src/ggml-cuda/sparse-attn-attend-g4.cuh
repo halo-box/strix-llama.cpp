@@ -452,10 +452,14 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
             mloc = fmaxf(mloc, __shfl_xor(mloc, 16));
             const float mnew  = fmaxf(m, mloc);
             const float alpha = mnew == -INFINITY ? 1.f : exp2f((m - mnew) * SA_L2E);
+            // fmaxf drops a NaN score, so mnew stays -inf in a step whose live cells of this row all score -inf or NaN: the
+            // exponentials are then taken against 0, so a -inf (or masked) cell gets 0 and a NaN cell keeps its NaN, which makes
+            // l NaN and the row 0 (ggml.h item 5). p = 0 there dropped the NaN: the softmax over the row's other cells
+            const float mref  = mnew == -INFINITY ? 0.f : mnew;
             float p[8], ls = 0.f;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                p[e] = mnew == -INFINITY ? 0.f : exp2f((scf[e] - mnew) * SA_L2E);
+                p[e] = exp2f((scf[e] - mref) * SA_L2E);
                 ls += p[e];
             }
             ls += __shfl_xor(ls, 16);
