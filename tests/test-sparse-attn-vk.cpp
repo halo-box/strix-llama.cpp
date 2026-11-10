@@ -13,8 +13,11 @@
 //   dense       ggml_backend_sparse_attn_prefer_dense picks the dense FLASH_ATTN_EXT only where the device's FLASH_ATTN_EXT
 //               takes the pair and only on the cm tier (its table was measured there): on a portable or scalar device, and
 //               on one without subgroup vote / shuffle, the QSA shortcut stays on the sparse op, which that tier runs.
+//   reason      ggml_backend_sparse_attn_unsupported_reason names the cause: "type pair not supported" only for a K / V type
+//               outside the set (the init error then lists other types), the binding limit for a view past the device's
+//               binding range, and a shape reason for GQA / head size (both then get the CPU / --no-kv-offload remedy).
 //
-// Without a Vulkan backend it exits 0 ("skipped"). usage: test-sparse-attn-vk [limits|capability|rot|stress|dense ...]
+// Without a Vulkan backend it exits 0 ("skipped"). usage: test-sparse-attn-vk [limits|capability|rot|stress|dense|reason ...]
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -542,6 +545,64 @@ static void test_dense() {
     set_force(nullptr);
 }
 
+// ---- reason ----------------------------------------------------------------------------------------------------------
+
+static void test_reason() {
+    printf("reason: the unsupported reason names the cause\n");
+    set_force(nullptr);
+    auto reason = (const char * (*)(ggml_backend_dev_t, const ggml_tensor *))
+        ggml_backend_reg_get_proc_address(g_reg, "ggml_backend_sparse_attn_unsupported_reason");
+    auto limit_fn = (size_t (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(g_reg, "ggml_backend_debug_vk_sa_binding_limit");
+    GGML_ASSERT(reason && limit_fn);
+    const size_t limit = limit_fn(g_backend);
+    const auto why = [&](const sa_shape & s) {
+        ggml_context * ctx = new_ctx();
+        const sa_graph g = sa_build(ctx, s);
+        const bool sup = ggml_backend_dev_supports_op(g_dev, g.out);
+        const char * w = reason(g_dev, g.out);
+        const std::string r = w ? w : "";
+        ggml_free(ctx);
+        CHECK(sup == r.empty(), "supported %d but reason '%s'", sup, r.c_str());
+        return r;
+    };
+    const auto is_type = [](const std::string & r) { return r.rfind("type pair", 0) == 0; };
+    {
+        sa_shape s;
+        const std::string r = why(s);
+        printf("  default shape: '%s'\n", r.c_str());
+        CHECK(r.empty(), "the default shape is supported on every tier");
+    }
+    {
+        sa_shape s;
+        s.tk = s.tv = GGML_TYPE_Q2_K;   // outside the nine types of the op
+        const std::string r = why(s);
+        printf("  K/V q2_K: '%s'\n", r.c_str());
+        CHECK(is_type(r), "a type outside the set must read 'type pair not supported', got '%s'", r.c_str());
+    }
+    {
+        sa_shape s;
+        s.gqa = 16;
+        const std::string r = why(s);
+        printf("  GQA 16: '%s'\n", r.c_str());
+        CHECK(!r.empty() && !is_type(r), "GQA 16 is a shape cause, not a type pair: '%s'", r.c_str());
+    }
+    {
+        // a K / V view past the binding limit: f32 rows of 2 KV heads, 2 KiB per cell (at most 2^24 cells)
+        sa_shape s;
+        s.tk = s.tv = GGML_TYPE_F32;
+        s.n_kv = std::min<int64_t>(((int64_t) (limit / 2048) + 8) / 4 * 4, (int64_t) 1 << 24);
+        s.n_q = 1;
+        if ((size_t) s.n_kv * 2048 <= limit) {
+            printf("  binding: the limit %zu needs more than 2^24 cells, skipped\n", limit);
+        } else {
+            const std::string r = why(s);
+            printf("  f32 K/V view of %zu B past the binding limit %zu: '%s'\n", (size_t) s.n_kv * 2048, limit, r.c_str());
+            CHECK(!r.empty() && !is_type(r), "a view past the binding limit is a limit cause, not a type pair: '%s'", r.c_str());
+            CHECK(r.find("limit") != std::string::npos, "the reason must name the device limit: '%s'", r.c_str());
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
     g_reg = ggml_backend_reg_by_name("Vulkan");
@@ -564,6 +625,7 @@ int main(int argc, char ** argv) {
     if (on("rot"))        test_rot();
     if (on("stress"))     test_stress();
     if (on("dense"))      test_dense();
+    if (on("reason"))     test_reason();
 
     ggml_backend_free(g_backend);
     printf("%s: %d failed checks\n", g_fail == 0 ? "OK" : "FAILED", g_fail);

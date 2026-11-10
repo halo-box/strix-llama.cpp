@@ -10931,18 +10931,33 @@ static size_t ggml_vk_sa_round_up(const vk_device & device, const size_t n) {
     return (n + a - 1) / a * a;
 }
 
-static bool ggml_vk_sa_plan_supported(const vk_device & device, const ggml_tensor * op) {
+// the reasons of ggml_backend_sparse_attn_unsupported_reason: a type cause gets the "use another -ctk/-ctv" remedy of the
+// init error, every other cause the CPU / --no-kv-offload one (src/llama-context.cpp qsa_unsupported_error)
+static const char * const VK_SA_WHY_TYPE    = "type pair not supported";
+static const char * const VK_SA_WHY_BINDING = "a binding of this shape exceeds the device limits (maxStorageBufferRange or the suballocation block)";
+
+// NULL when the plan runs on this device; otherwise why not
+static const char * ggml_vk_sa_plan_why(const vk_device & device, const ggml_tensor * op) {
     const ggml_tensor * sel = op->src[0];
     if (device->pipeline_sparse_attn_plan == nullptr || (ggml_vk_sa_force().cap_mask & 8u) != 0) {
-        return false;
+        return "Vulkan device lacks the sparse-attention plan pipeline";
     }
     if (ggml_get_op_params_i32(op, 1) != 1) {
-        return false;   // G = 4 is not a Vulkan plan (PLAN-v3 §6.3)
+        return "plan group G != 1 (Vulkan has no G = 4 plan)";   // PLAN-v3 §6.3
+    }
+    if (!ggml_is_contiguous(op)) {
+        return "plan dst not contiguous";
     }
     const size_t scratch = ggml_sparse_attn_plan_scratch_nbytes(sel->ne[0], sel->ne[1], sel->ne[3]);
-    return ggml_is_contiguous(op) &&
-           ggml_vk_sa_binding_fits(device, ggml_nbytes(sel)) && ggml_vk_sa_binding_fits(device, ggml_nbytes(op)) && ggml_vk_sa_binding_fits(device, scratch) &&
-           ggml_vk_sa_round_up(device, ggml_nbytes(op)) + scratch <= device->suballocation_block_size;
+    if (!ggml_vk_sa_binding_fits(device, ggml_nbytes(sel)) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(op)) || !ggml_vk_sa_binding_fits(device, scratch) ||
+        ggml_vk_sa_round_up(device, ggml_nbytes(op)) + scratch > device->suballocation_block_size) {
+        return VK_SA_WHY_BINDING;
+    }
+    return nullptr;
+}
+
+static bool ggml_vk_sa_plan_supported(const vk_device & device, const ggml_tensor * op) {
+    return ggml_vk_sa_plan_why(device, op) == nullptr;
 }
 
 // split count, a function of the shape alone: few workgroups cannot fill the GPU, so each row is split (the rule of the
@@ -10982,6 +10997,7 @@ struct vk_sa_selection {
     size_t partial_bytes = 0;
     size_t ws_bytes = 0;            // what this op's dispatch uses
     size_t ws_reserve_bytes = 0;    // max over every n_q' <= n_q (PLAN-v3 §5): what get_alloc_size holds
+    const char * why = nullptr;     // no pipeline: the cause (ggml_backend_sparse_attn_unsupported_reason)
 };
 
 static vk_pipeline ggml_vk_sa_pipeline(const vk_device & device, const vk_sa_key & key) {
@@ -11010,32 +11026,53 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
     const int64_t n_kv = ggml_get_op_params_i32(plan, 0);
     const int32_t rot_q = ggml_get_op_params_i32(op, 1);
     const int32_t rot_o = ggml_get_op_params_i32(op, 2);
-    if (tier == VK_SA_TIER_NONE || ggml_get_op_params_i32(plan, 1) != 1 || !ggml_vk_sa_plan_supported(device, plan)) {
+    if (tier == VK_SA_TIER_NONE) {
+        r.why = "Vulkan device lacks the pipelines of every sparse-attention tier";
         return r;
     }
-    if (q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 || !ggml_vk_sa_type_ok(k->type) || !ggml_vk_sa_type_ok(v->type) ||
-        q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || q->nb[0] != sizeof(float) ||
-        k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type) || n_kv_head < 1 || n_head % n_kv_head != 0) {
+    if ((r.why = ggml_vk_sa_plan_why(device, plan)) != nullptr) {
+        return r;
+    }
+    if (!ggml_vk_sa_type_ok(k->type) || !ggml_vk_sa_type_ok(v->type)) {
+        r.why = VK_SA_WHY_TYPE;
+        return r;
+    }
+    if (q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256) {
+        r.why = "head size is not 256";
+        return r;
+    }
+    if (q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || q->nb[0] != sizeof(float) ||
+        k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
+        r.why = "Q / dst not f32, or a K / V row not contiguous";
+        return r;
+    }
+    if (n_kv_head < 1 || n_head % n_kv_head != 0) {
+        r.why = "n_head is not a multiple of n_head_kv";
         return r;
     }
     const int64_t gqa = n_head / n_kv_head;
     if (gqa != 4 && gqa != 8 && gqa != 12) {
+        r.why = "n_head / n_head_kv not in {4, 8, 12}";
         return r;
     }
     const uint32_t unit_k = ggml_vk_sa_unit_bytes(tier, k->type), unit_v = ggml_vk_sa_unit_bytes(tier, v->type);
     for (int i = 1; i < 4; ++i) {
         if (q->nb[i] % sizeof(float) != 0 || k->nb[i] % 16 != 0 || v->nb[i] % 16 != 0 || k->nb[i] % unit_k != 0 || v->nb[i] % unit_v != 0) {
+            r.why = "a Q / K / V stride is not aligned for this tier's loaders";
             return r;
         }
     }
     if ((rot_q != 0 && rot_q != 64 && rot_q != 128 && rot_q != 256) || (rot_o != 0 && rot_o != 64 && rot_o != 128 && rot_o != 256)) {
+        r.why = "rotation size not in {0, 64, 128, 256}";
         return r;
     }
     if (rot_o != 0 && device->pipeline_fwht_inplace_f32[ggml_vk_fwht_pipeline_idx(rot_o)] == nullptr) {
-        return r;   // H_o is a dispatch of fwht.comp: no pipeline on this device (a driver gate of fwht), no support
+        r.why = "no fwht pipeline on this device for the output rotation";   // H_o is a dispatch of fwht.comp (a driver gate of fwht)
+        return r;
     }
     if (!ggml_vk_sa_binding_fits(device, ggml_nbytes(q)) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(k)) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(v)) ||
         !ggml_vk_sa_binding_fits(device, ggml_nbytes(plan)) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(op))) {
+        r.why = VK_SA_WHY_BINDING;
         return r;
     }
 
@@ -11077,6 +11114,7 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
     r.ws_reserve_bytes = pack_reserve + partial_max;
     if ((r.ws_reserve_bytes != 0 && !ggml_vk_sa_binding_fits(device, r.ws_reserve_bytes)) ||
         ggml_vk_sa_round_up(device, ggml_nbytes(op)) + r.ws_reserve_bytes > device->suballocation_block_size) {
+        r.why = VK_SA_WHY_BINDING;
         return r;
     }
 
@@ -11281,9 +11319,15 @@ static const char * ggml_backend_vk_sparse_attn_unsupported_reason(ggml_backend_
         if (ggml_backend_dev_supports_op(dev, op)) {
             return nullptr;
         }
-        return ggml_vk_sa_select(device, op).pipeline == nullptr ? "type pair not supported" : "a binding of this shape exceeds the device limits";
+        // supports_op is select's pipeline != nullptr: the cause is the select's own
+        const vk_sa_selection sel = ggml_vk_sa_select(device, op);
+        return sel.why ? sel.why : "sparse-attention shape not supported on this Vulkan device";
     }
-    return ggml_backend_dev_supports_op(dev, op) ? nullptr : "plan shape not supported on this Vulkan device";
+    if (ggml_backend_dev_supports_op(dev, op)) {
+        return nullptr;
+    }
+    const char * why = ggml_vk_sa_plan_why(device, op);
+    return why ? why : "plan shape not supported on this Vulkan device";
 }
 
 // the dst descriptor of a sparse node, and its workspace right after it (P2-19)
