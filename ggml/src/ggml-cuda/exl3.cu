@@ -122,14 +122,19 @@ struct exl3_mmid {
     int64_t      ids_nb0;
     int64_t      ids_nb1;
     int          n_used;
+    int          n_exp;
     int          ne11;      // x rows per token: 1 (broadcast over the slots) or n_used
     int64_t      tq_stride; // int16 words of one expert's trellis
     const int  * order;     // row -> pair
     const int  * grp;
 };
 
+static __device__ __forceinline__ int exl3_mmid_clamp_expert(const int e, const int n_exp) {
+    return min(max(e, 0), n_exp - 1);
+}
+
 static __device__ __forceinline__ int exl3_mmid_expert(const exl3_mmid & mm, const int p) {
-    return *(const int *) (mm.ids + (p % mm.n_used)*mm.ids_nb0 + (p / mm.n_used)*mm.ids_nb1);
+    return exl3_mmid_clamp_expert(*(const int *) (mm.ids + (p % mm.n_used)*mm.ids_nb0 + (p / mm.n_used)*mm.ids_nb1), mm.n_exp);
 }
 
 static __device__ __forceinline__ int exl3_mmid_pair(const exl3_mmid & mm, const int r) {
@@ -1615,7 +1620,8 @@ static __global__ void __launch_bounds__(1024) exl3_mmid_route(
     }
     __syncthreads();
     for (int p = threadIdx.x; p < n_pairs; p += blockDim.x) {
-        atomicAdd(&s_cnt[*(const int *) (ids + (p % n_used)*nb0 + (p / n_used)*nb1)], 1);
+        const int e = exl3_mmid_clamp_expert(*(const int *) (ids + (p % n_used)*nb0 + (p / n_used)*nb1), n_exp);
+        atomicAdd(&s_cnt[e], 1);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -1644,7 +1650,7 @@ static __global__ void __launch_bounds__(1024) exl3_mmid_route(
     }
     __syncthreads();
     for (int p = threadIdx.x; p < n_pairs; p += blockDim.x) {
-        const int e = *(const int *) (ids + (p % n_used)*nb0 + (p / n_used)*nb1);
+        const int e = exl3_mmid_clamp_expert(*(const int *) (ids + (p % n_used)*nb0 + (p / n_used)*nb1), n_exp);
         order[atomicAdd(&s_pos[e], 1)] = p;
     }
 }
@@ -1709,6 +1715,7 @@ static void exl3_op_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     mm.ids_nb0   = ids->nb[0];
     mm.ids_nb1   = ids->nb[1];
     mm.n_used    = (int) n_used;
+    mm.n_exp     = (int) n_exp;
     mm.ne11      = (int) x->ne[1];
     mm.tq_stride = trellis->ne[0]*trellis->ne[1]*trellis->ne[2];
 
