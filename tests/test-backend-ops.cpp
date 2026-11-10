@@ -1379,7 +1379,10 @@ struct test_case {
     virtual bool verify_reference(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
     // --fail-unsupported: true when this backend is expected not to support the case (the per-backend list)
     virtual bool expected_unsupported(ggml_backend_t backend) { GGML_UNUSED(backend); return false; }
-    // the weight-context tensors end at the end of their buffer (no post-graph sentinel after them)
+    // the weight-context tensors end at the end of their buffer (no post-graph sentinel after them). A buffer type may pad
+    // a tensor's allocation past ggml_nbytes (HIP: a quantized tensor's rows to MATRIX_ROW_PADDING, TAG_ALLOC_SIZE_EXPAND),
+    // so the bytes between the last tensor and the buffer's end are filled with 0xFF (NaN as the scale or element of every
+    // K / V type: a read that reaches the arithmetic makes the output NaN) and must be unchanged after the compute
     virtual bool weights_end_at_buffer_end() { return false; }
     // suite-level dispatch census (PLAN-v3 §14.1): the key families ("sa_attend/", ...) of the backend census that this
     // case dispatches. After every such case the driver adds the case's census counts to a suite total, and at the end
@@ -1413,6 +1416,37 @@ struct test_case {
                 break;
             }
         }
+    }
+
+    // weights_end_at_buffer_end: the bytes of buf past the last tensor of ctx_weights, as an I8 tensor of ctx_tail filled
+    // with 0xFF; nullptr when the last tensor ends at the buffer's end
+    static ggml_tensor * poison_weights_tail(ggml_context * ctx_weights, ggml_backend_buffer_t buf, ggml_context_ptr & ctx_tail) {
+        char * end = nullptr;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_weights); t; t = ggml_get_next_tensor(ctx_weights, t)) {
+            if (t->buffer == buf && t->data != nullptr && t->view_src == nullptr) {
+                end = std::max(end, (char *) t->data + ggml_nbytes(t));
+            }
+        }
+        char * buf_end = (char *) ggml_backend_buffer_get_base(buf) + ggml_backend_buffer_get_size(buf);
+        if (end == nullptr || end >= buf_end) {
+            return nullptr;
+        }
+        ggml_init_params p = { ggml_tensor_overhead(), nullptr, true };
+        ctx_tail.reset(ggml_init(p));
+        ggml_tensor * tail = ::ggml_new_tensor_1d(ctx_tail.get(), GGML_TYPE_I8, (int64_t) (buf_end - end));
+        ggml_set_name(tail, "weights_tail");
+        if (ggml_backend_tensor_alloc(buf, tail, end) != GGML_STATUS_SUCCESS) {
+            return nullptr;
+        }
+        std::vector<uint8_t> ff(ggml_nbytes(tail), 0xFF);
+        ggml_backend_tensor_set(tail, ff.data(), 0, ff.size());
+        return tail;
+    }
+
+    static bool weights_tail_intact(const ggml_tensor * tail) {
+        std::vector<uint8_t> b(ggml_nbytes(tail));
+        ggml_backend_tensor_get(tail, b.data(), 0, b.size());
+        return std::all_of(b.begin(), b.end(), [](uint8_t x) { return x == 0xFF; });
     }
 
     void add_sentinel(ggml_context * ctx) {
@@ -1596,6 +1630,8 @@ struct test_case {
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
         }
+        ggml_context_ptr ctx_tail;
+        ggml_tensor * weights_tail = ctx_weights && weights_end_at_buffer_end() ? poison_weights_tail(ctx_weights.get(), buf_weights.get(), ctx_tail) : nullptr;
 
         // compare
         struct callback_userdata {
@@ -1701,6 +1737,11 @@ struct test_case {
             cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                         run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                         fused_nodes_to_verify.size());
+        }
+
+        if (weights_tail && !weights_tail_intact(weights_tail)) {
+            printf("the %zu bytes past the last weight tensor were written ", ggml_nbytes(weights_tail));
+            ud.ok = false;
         }
 
         // Create test result
