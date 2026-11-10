@@ -2079,8 +2079,23 @@ private:
 
         slot.prompt_save(*prompt_cache);
 
-        if (!slot.prompt_load(*prompt_cache, task.tokens)) {
+        bool loaded = slot.prompt_load(*prompt_cache, task.tokens);
+
+        if (!loaded) {
+            // a failed restore leaves the sequence in an unknown state, so its tokens no longer describe it
             slot.prompt_clear();
+
+            // make room: purge idle slots, least recently used first, each saved to the cache.
+            // A save can evict the entry we want, so stop then.
+            const uint64_t id_wanted = prompt_cache->id_failed;
+
+            while (!loaded && prompt_cache->contains(id_wanted) && try_clear_idle_slots()) {
+                loaded = slot.prompt_load(*prompt_cache, task.tokens);
+            }
+
+            if (!loaded) {
+                slot.prompt_clear();
+            }
         }
 
         prompt_cache->update();
