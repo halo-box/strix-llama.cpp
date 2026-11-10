@@ -13896,6 +13896,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}));
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}, true));
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {13, 3}, true));
+    // Production widths: 8- and 16-warp dot paths, then GEMM tails and more than 512 rows.
+    test_cases.emplace_back(new test_exl3_mul_mat(4096, 12288, 64, 1, {1, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(9216, 2560, 64, 1, {1, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(4096, 12288, 64, 1, {33, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(12288, 4096, 64, 1, {33, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(384, 256, 64, 1, {513, 1}));
     for (int K : {1, 4, 8}) {
         test_cases.emplace_back(new test_exl3_get_rows(K, 4, 1000, 300, 17));
     }
@@ -13908,6 +13914,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the MoE down projection reading a SwiGLU: 64 tokens take the HIP GEMM path (fused), 2 tokens the dot path
     test_cases.emplace_back(new test_exl3_mul_mat_id(256, 384, 8, 32, 2, 2, 2, 64, true));
     test_cases.emplace_back(new test_exl3_mul_mat_id(256, 384, 8, 32, 2, 2, 2, 2, true));
+    // LFM2.5-8B-A1B down experts, per-slot x, on the dot path.
+    test_cases.emplace_back(new test_exl3_mul_mat_id(1792, 2048, 32, 32, 2, 4, 4, 13));
     test_cases.emplace_back(new test_exl3_get_rows(3, 1, 256, 64, 512));
 
     // glu ops
