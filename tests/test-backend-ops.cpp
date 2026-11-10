@@ -13512,7 +13512,8 @@ static bool sa_is_cpu(ggml_backend_t backend) {
     return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
-enum sa_special { SA_PLAIN = 0, SA_POISON = 1, SA_OVERFLOW = 2, SA_NANSCORE = 3 };
+// SA_LEAD_NEGINF / SA_LEAD_NAN: query 0 selects cells 0..15, whose K rows of KV head 0 score -inf / NaN (init_lead)
+enum sa_special { SA_PLAIN = 0, SA_POISON = 1, SA_OVERFLOW = 2, SA_NANSCORE = 3, SA_LEAD_NEGINF = 4, SA_LEAD_NAN = 5 };
 
 struct test_sparse_attn : public test_case {
     const ggml_type type_k, type_v;
@@ -13541,6 +13542,8 @@ struct test_sparse_attn : public test_case {
         if (special == SA_POISON) s += ",poison";
         if (special == SA_OVERFLOW) s += ",overflow";
         if (special == SA_NANSCORE) s += ",nanscore";
+        if (special == SA_LEAD_NEGINF) s += ",leadneginf";
+        if (special == SA_LEAD_NAN) s += ",leadnan";
         if (prblk) s += ",prblk=" + std::to_string(prblk);
         return s;
     }
@@ -13813,8 +13816,30 @@ struct test_sparse_attn : public test_case {
         ggml_backend_tensor_set(st, row.data(), off, rb);
     }
 
+    static constexpr int SA_LEAD_CELLS = 16;   // 4 quads: the first step of the HIP G4 / G1 and Vulkan cm attends
+    bool lead() const { return special == SA_LEAD_NEGINF || special == SA_LEAD_NAN; }
+
+    // the case's selection rows: the pattern's, and for the lead cases query 0 of stream 0 selects cells 0 .. 15 in its first
+    // 16 entries (the other entries keep the pattern's cells, at least one of them a valid cell >= 16)
+    std::vector<int32_t> case_rows() const {
+        std::vector<int32_t> rows = sa_make_rows(pattern, n_sel, n_q, n_stream, n_kv, prblk, 1);
+        if (lead()) {
+            GGML_ASSERT(n_sel > SA_LEAD_CELLS && n_kv > SA_LEAD_CELLS);
+            bool other = false;
+            for (int64_t j = 0; j < n_sel; ++j) {
+                if (j < SA_LEAD_CELLS) {
+                    rows[(size_t) j] = (int32_t) j;
+                } else {
+                    other = other || (rows[(size_t) j] >= SA_LEAD_CELLS && rows[(size_t) j] < n_kv);
+                }
+            }
+            GGML_ASSERT(other && "lead case: query 0 selects no valid cell past the lead cells");
+        }
+        return rows;
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
-        const std::vector<int32_t> rows = sa_make_rows(pattern, n_sel, n_q, n_stream, n_kv, prblk, 1);
+        const std::vector<int32_t> rows = case_rows();
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (t->op != GGML_OP_NONE || t == sel || t == k_st || t == v_st) continue;
             init_tensor_uniform(t);   // q and the sentinels
@@ -13832,6 +13857,9 @@ struct test_sparse_attn : public test_case {
         }
         if (special == SA_NANSCORE && ctx_has(ctx, k_st)) {
             init_nanscore(ctx, rows);
+        }
+        if (lead() && ctx_has(ctx, k_st)) {
+            init_lead(ctx);
         }
         if (ctx_has(ctx, sel)) {
             sa_init_sel(sel, rows);
@@ -13911,6 +13939,65 @@ struct test_sparse_attn : public test_case {
             }
         } else {
             poison_row(k_st, c, 0, 0, true);
+        }
+    }
+
+    // The lead cases: cells 0 .. 15 (4 quads, the smallest cells, so the first cells of query 0 in the ascending order of
+    // every backend, and the whole first step of query 0 in the HIP G4 / G1 attends, the first G1 chunk of split 0, and the
+    // Vulkan cm attend's first step) score -inf (SA_LEAD_NEGINF) or NaN (SA_LEAD_NAN) for every head of KV head 0, in every
+    // query that selects them. V stays finite.
+    //   -inf: K element 0 of the cell is -inf after the contract's f16 rounding (f16 -inf; bf16 / f32 -1e5; q8_0 block 0 with
+    //         d = 1000, q = -127, the other 31 q 0) and element 0 of every query row is +1 (rot_q 0), so q.k = -inf. The cell
+    //         has weight 0 wherever it lies (ggml.h item 3): the row is the softmax over the query's other cells. The CPU op
+    //         gave a row of 0 (exp(-inf - -inf) = NaN at the first cell), the HIP G4 / G1 attends that softmax.
+    //   NaN:  poison_row (NaN K values / scales). The row is 0 (item 5), also when the NaN cells fill a step whose running
+    //         max stays -inf: the HIP G4 / G1 attends took p = 0 there and wrote the softmax over the other cells.
+    void init_lead(ggml_context * ctx) {
+        GGML_ASSERT(at_end == 0 && rot_q == 0);
+        for (int32_t c = 0; c < SA_LEAD_CELLS; ++c) {
+            if (special == SA_LEAD_NAN) {
+                poison_row(k_st, c, 0, 0, true);
+                continue;
+            }
+            const size_t off = kv_offset(k_st, c, 0, 0);
+            switch (type_k) {
+                case GGML_TYPE_F16: {
+                    const uint16_t h = 0xFC00;   // f16 -inf
+                    ggml_backend_tensor_set(k_st, &h, off, sizeof(h));
+                } break;
+                case GGML_TYPE_BF16: {
+                    const ggml_bf16_t b = ggml_fp32_to_bf16(-1.0e5f);
+                    ggml_backend_tensor_set(k_st, &b, off, sizeof(b));
+                } break;
+                case GGML_TYPE_F32: {
+                    const float f = -1.0e5f;
+                    ggml_backend_tensor_set(k_st, &f, off, sizeof(f));
+                } break;
+                case GGML_TYPE_Q8_0: {
+                    std::vector<uint8_t> blk(ggml_type_size(GGML_TYPE_Q8_0), 0);
+                    const ggml_fp16_t d = ggml_fp32_to_fp16(1000.0f);
+                    memcpy(blk.data(), &d, sizeof(d));
+                    blk[sizeof(d)] = (uint8_t) (int8_t) -127;   // element 0 = -127000, -inf in f16; elements 1 .. 31 = 0
+                    ggml_backend_tensor_set(k_st, blk.data(), off, blk.size());
+                } break;
+                default:
+                    GGML_ABORT("lead -inf case: K type %s", ggml_type_name(type_k));
+            }
+        }
+        if (special == SA_LEAD_NEGINF) {
+            ggml_tensor * q_st = nullptr;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                if (strcmp(t->name, "q_storage") == 0) q_st = t;
+            }
+            GGML_ASSERT(q_st != nullptr && q_st->type == GGML_TYPE_F32);
+            const float one = 1.0f;
+            for (int64_t s = 0; s < q_st->ne[3]; ++s) {
+                for (int64_t i = 0; i < q_st->ne[2]; ++i) {
+                    for (int64_t h = 0; h < q_st->ne[1]; ++h) {
+                        ggml_backend_tensor_set(q_st, &one, h * q_st->nb[1] + i * q_st->nb[2] + s * q_st->nb[3], sizeof(one));
+                    }
+                }
+            }
         }
     }
 
@@ -13997,6 +14084,51 @@ struct test_sparse_attn : public test_case {
             if (!zero0 || zero1) {
                 msg = std::string("nanscore: query 0 rows of KV head 0 ") + (zero0 ? "zero" : "not zero") + ", of KV head 1 " + (zero1 ? "zero" : "not zero");
                 return false;
+            }
+        }
+        if (lead()) {
+            const int64_t n_head = n_head_kv * gqa;
+            bool zero0 = true, zero1 = true;   // query 0, stream 0: the heads of KV head 0, of KV head 1
+            for (int64_t h = 0; h < n_head; ++h) {
+                for (int64_t d = 0; d < D; ++d) {
+                    const float x = got[(size_t) (h * D + d)];
+                    (h < gqa ? zero0 : zero1) = (h < gqa ? zero0 : zero1) && x == 0.0f;
+                }
+            }
+            if (special == SA_LEAD_NAN && (!zero0 || zero1)) {
+                msg = std::string("leadnan: query 0 rows of KV head 0 ") + (zero0 ? "zero" : "not zero") + " (want zero), of KV head 1 " +
+                      (zero1 ? "zero" : "not zero");
+                return false;
+            }
+            if (special == SA_LEAD_NEGINF) {
+                // a -inf cell has weight 0: the heads of KV head 0 equal O_CON over the rows without cells 0 .. 15 (stream 0),
+                // bit for bit, in every query; that reference has no -inf score, so it does not share the -inf arithmetic
+                std::vector<int32_t> rows_wo = sa_read_rows(sel);
+                for (size_t j = 0; j < (size_t) (n_q * n_sel); ++j) {
+                    if (rows_wo[j] >= 0 && rows_wo[j] < SA_LEAD_CELLS) rows_wo[j] = -1;
+                }
+                const std::vector<float> ref_wo = sa_ref::attend(qv, kv, vv, rows_wo, n_sel, n_kv, scale, rot_q, rot_o,
+                                                                 std::max(1, std::min(16, (int) std::thread::hardware_concurrency())));
+                size_t n_diff = 0, first = SIZE_MAX;
+                for (int64_t i = 0; i < n_q; ++i) {
+                    for (int64_t h = 0; h < gqa; ++h) {
+                        for (int64_t d = 0; d < D; ++d) {
+                            const size_t x = (size_t) ((i * n_head + h) * D + d);
+                            if (memcmp(&got[x], &ref_wo[x], sizeof(float)) != 0) {
+                                ++n_diff;
+                                first = std::min(first, x);
+                            }
+                        }
+                    }
+                }
+                if (zero0 || n_diff != 0) {
+                    char b[256];
+                    snprintf(b, sizeof(b), "leadneginf: query 0 rows of KV head 0 %s; %zu values of KV head 0 differ from O_CON without the "
+                             "-inf cells (first at %zu: %.9g vs %.9g)", zero0 ? "zero" : "not zero", n_diff, n_diff ? first : 0,
+                             n_diff ? got[first] : 0.0f, n_diff ? ref_wo[first] : 0.0f);
+                    msg = b;
+                    return false;
+                }
             }
         }
         return true;
@@ -14460,6 +14592,18 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
     for (ggml_type t : {F16, Q8, BF16}) {
         for (int64_t nq : {1, 3}) {
             for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, G, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, SA_NANSCORE));
+        }
+    }
+    // a -inf score in the first step of a row (init_lead): query 0 selects cells 0 .. 15, whose K rows of KV head 0 score
+    // -inf (leadneginf: weight 0 wherever the cell lies, the row is the softmax over the other cells). G1 with the split-K
+    // merge (n_q 1, n_sel 2051: HIP 33 splits, Vulkan split + reduce), G1 with one HIP split (n_sel 48), G1 at n_q 66
+    // (Vulkan one split: n_q * n_head_kv >= 128), G4 with direct V (n_q 4) and packed V (n_q 66, n_kv 4096 < 64 * n_q)
+    for (ggml_type t : {F16, Q8, BF16}) {
+        for (int sp : {SA_LEAD_NEGINF}) {
+            test_cases.emplace_back(new test_sparse_attn(t, t, 1,  8192, 2051, 1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));
+            test_cases.emplace_back(new test_sparse_attn(t, t, 9,  4096, 48,   1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));
+            test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257,  1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));
+            for (int64_t nq : {4, 66}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 4096, 257, 4, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));
         }
     }
     // a scale that is not a power of two (the contract multiplies in f32 before the f16 rounding)

@@ -191,7 +191,9 @@ void main() {
 
         const float new_max = max(row_max, subgroupMax(s));
         const float old_scale = new_max == row_max ? 1.0 : exp(row_max - new_max);
-        const float weight = valid ? exp(s - new_max) : 0.0;
+        // a -inf score (an invalid key included) has weight 0 (ggml.h item 3), also in a block whose max is still -inf, where
+        // exp(-inf - -inf) is NaN; a NaN score keeps exp(NaN) = NaN whatever new_max is (item 5)
+        const float weight = s == NEG_INF ? 0.0 : exp(s - new_max);
         row_sum = row_sum * old_scale + subgroupAdd(khalf == 0 ? weight : 0.0);
         row_max = new_max;
         if (khalf == 0) {

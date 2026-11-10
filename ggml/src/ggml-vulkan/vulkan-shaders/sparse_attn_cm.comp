@@ -311,12 +311,16 @@ void main() {
         }
         mx = max(mx, subgroupShuffleXor(mx, 16));
         mx = max(mx, subgroupShuffleXor(mx, 32));
-        const float m_new = max(m, mx);   // finite: a step holds at least one live cell
-        const float corr = exp(m - m_new);
+        const float m_new = max(m, mx);
+        // m_new stays -inf in a step whose live cells all score -inf, or NaN (max may drop a NaN operand): the exponentials
+        // are then taken against 0, so a -inf cell gets weight 0 (ggml.h item 3) and a NaN cell keeps its NaN (item 5),
+        // where exp(-inf - -inf) = NaN made both NaN; corr = exp(-inf) = 0 keeps a NaN l / O (NaN * 0)
+        const float m_ref = m_new == NEG_INF ? 0.0 : m_new;
+        const float corr = exp(m - m_ref);
         float pv[4];
         float ps = 0.0;
         [[unroll]] for (uint i = 0; i < 4; ++i) {
-            pv[i] = exp(s[i] - m_new);
+            pv[i] = exp(s[i] - m_ref);
             ps += pv[i];
         }
         ps += subgroupShuffleXor(ps, 16);

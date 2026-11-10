@@ -172,7 +172,7 @@ static __global__ void __launch_bounds__(256) sa_attend_portable(const sa_portab
                         l    *= alpha;
                         mx    = x;
                     }
-                    const float p = expf(x - mx);
+                    const float p = x == -INFINITY ? 0.0f : expf(x - mx);   // a -inf score has weight 0 (ggml.h item 3)
                     l += p;
                     al[c][d] = alpha;
                     pw[c][d] = sa_h2f_bits(sa_f2h(p));

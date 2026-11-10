@@ -14,7 +14,7 @@
 //   q: H_q in f32 (scale first, then the butterflies from len 1 up, fwht.comp's order), f32 product with scale, one RNE
 //      rounding to f16; K / V: to_float in f32 as ggml-quants.c, one RNE rounding to f16; each score an f32 sum over the 256
 //      dims in sequential order; if s > m { alpha = (m == -inf) ? 0 : exp(m - s); acc *= alpha; l *= alpha; m = s };
-//      p = exp(s - m); l += p; acc += f16(p) * v; out = l > 0 ? acc / l : 0.
+//      p = (s == -inf) ? 0 : exp(s - m); l += p; acc += f16(p) * v; out = l > 0 ? acc / l : 0.
 //   The f32 <-> f16 conversions are integer code: packHalf2x16 has no rounding-mode guarantee (and RTZ lowerings exist), and
 //   the f16 storage conversions are what this tier does not require.
 //   The only arithmetic difference from the CPU op is the device exp against the host's.
@@ -265,7 +265,7 @@ void main() {
                 l = lx;
                 m = s;
             }
-            const float pc = exp(s - m);
+            const float pc = s == NEG_INF ? 0.0 : exp(s - m);   // a -inf score has weight 0 (ggml.h item 3)
             const float ph = sa_round(pc);
             precise float ln = l + pc;
             l = ln;

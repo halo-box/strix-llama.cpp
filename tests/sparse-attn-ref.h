@@ -206,7 +206,7 @@ static std::vector<float> attend(const view & q, const view & k, const view & v,
                         l[hr] *= alpha;
                         m[hr] = sc[hr];
                     }
-                    const float p  = expf(sc[hr] - m[hr]);
+                    const float p  = sc[hr] == -INFINITY ? 0.0f : expf(sc[hr] - m[hr]);   // a -inf score has weight 0 (ggml.h item 3)
                     const float ph = rh(p);
                     l[hr] += p;
                     for (int64_t d = 0; d < D; ++d) {
