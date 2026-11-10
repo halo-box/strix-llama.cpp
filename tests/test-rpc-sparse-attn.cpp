@@ -4,6 +4,9 @@
 //      client cached the size by the dst's own shape and op_params, but the workspace follows the plan's n_kv / n_sel / G
 //      and the K / V types: two nodes with one dst shape (a 37-row ubatch at n_kv 256 in the shortcut, then at n_kv 8192 on
 //      the selection rows) got the first node's size, and the server's kernels wrote past the allocation.
+//  (2) supports_op: the RPC device answers the server device's supports_op for SPARSE_ATTN / SPARSE_ATTN_PLAN. It returned
+//      true for every node, so llama's QSA placement guard passed for a server that cannot run the op (a CUDA build aborts
+//      in its compute).
 // (1) is vacuous on a device whose alloc size does not depend on the plan (the CPU): it then passes trivially.
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -133,9 +136,31 @@ int main() {
     printf("(1) %d alloc sizes compared, %d of a dst shape whose size differs from the first%s\n", n_alloc, n_differ,
            n_differ == 0 ? " (vacuous on this device)" : "");
 
+    // (2) supports_op through RPC == the server device's, for SPARSE_ATTN and its plan
+    int n_sup = 0, n_unsup = 0;
+    const std::vector<node_shape> sup = {
+        { GGML_TYPE_F16,  GGML_TYPE_F16,  9, 4096, 2051, 1 },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 9, 4096, 2051, 4 },
+        { GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 9, 4096, 2051, 1 },   // outside S: the CPU takes it, HIP and Vulkan do not
+        { GGML_TYPE_I32,  GGML_TYPE_I32,  9, 4096, 2051, 1 },   // no to_float: nobody takes it
+        { GGML_TYPE_F16,  GGML_TYPE_F16,  9, 4096, 2051, 4 },
+    };
+    for (const node_shape & s : sup) {
+        ggml_tensor * attn = build_attn(ctx, s);
+        for (ggml_tensor * t : { attn, attn->src[3] }) {
+            const bool local  = ggml_backend_dev_supports_op(dev, t);
+            const bool remote = ggml_backend_dev_supports_op(rdev, t);
+            printf("  %-17s %s/%s G %d: server device %d, through RPC %d\n", ggml_op_desc(t), ggml_type_name(s.type_k),
+                   ggml_type_name(s.type_v), s.G, (int) local, (int) remote);
+            CHECK(remote == local, "%s: RPC supports_op %d != the server device's %d", ggml_op_desc(t), (int) remote, (int) local);
+            (local ? n_sup : n_unsup)++;
+        }
+    }
+    printf("(2) supports_op compared on %d supported and %d unsupported nodes\n", n_sup, n_unsup);
+
     ggml_free(ctx);
-    printf("test-rpc-sparse-attn: %d failed checks: %s\n", g_fail, g_fail == 0 ? "OK" : "FAILED");
+    printf("test-rpc-sparse-attn: %d failed checks: %s\n", g_fail, g_fail == 0 && n_unsup > 0 ? "OK" : "FAILED");
     fflush(stdout);
     // the server thread blocks in accept(): leave without joining it
-    _exit(g_fail == 0 ? 0 : 1);
+    _exit(g_fail == 0 && n_unsup > 0 ? 0 : 1);
 }

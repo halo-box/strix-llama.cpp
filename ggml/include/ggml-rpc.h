@@ -10,8 +10,12 @@ extern "C" {
 #define RPC_PROTO_MINOR_VERSION    1
 #define RPC_PROTO_PATCH_VERSION    0
 
-// The hello only compares major/minor and deserialize does not validate op values, so a change of the op enum needs
-// at least a minor bump: 8.1 appends GGML_OP_SPARSE_ATTN_PLAN and GGML_OP_SPARSE_ATTN before GGML_OP_COUNT.
+// The oldest server minor this client talks to. The hello accepts a server of the same major whose minor is in
+// [RPC_PROTO_MIN_SERVER_MINOR_VERSION, RPC_PROTO_MINOR_VERSION]; an older server is rejected because this client may
+// send what it lacks: 8.1 appends GGML_OP_SPARSE_ATTN_PLAN and GGML_OP_SPARSE_ATTN before GGML_OP_COUNT (an 8.0 server
+// has GGML_OP_COUNT == 101 and no case for them) and adds RPC_CMD_SUPPORTS_OP (asked for those two ops). A change of
+// the op enum needs a minor bump and this floor raised to it; deserialize rejects an op value >= GGML_OP_COUNT.
+#define RPC_PROTO_MIN_SERVER_MINOR_VERSION 1
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_MINOR_VERSION");
 #endif
