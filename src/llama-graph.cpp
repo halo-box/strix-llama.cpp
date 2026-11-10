@@ -1466,6 +1466,7 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
     qsa_nodes.clear();
+    qsa_idx_nodes.clear();
     qsa_ubatch_error.clear();
     hdmd_inputs.clear();
 

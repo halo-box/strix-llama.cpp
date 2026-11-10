@@ -1505,7 +1505,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
     cb(k_raw, "indexer_k_raw", il);
 
-    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
+    {
+        ggml_tensor * idx_store = mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il);
+        res->add_qsa_idx_node(il, idx_store);   // the guard checks where the indexer cache is written and read
+        ggml_build_forward_expand(gf, idx_store);
+    }
 
     // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
@@ -1532,6 +1536,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     }
     const auto prepare_keys = [&](ggml_tensor * member_rows, ggml_tensor * block_positions, int64_t prep_blocks) {
         ggml_tensor * members = ggml_get_rows(ctx0, k_all, member_rows);
+        res->add_qsa_idx_node(il, members);
         members = ggml_reshape_4d(ctx0, members, idx_dim, r, prep_blocks, n_stream);
 
         ggml_tensor * pooled = nullptr;

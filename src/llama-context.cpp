@@ -1021,6 +1021,63 @@ static std::string qsa_unsupported_error(const llm_graph_qsa_node & n, ggml_back
     return msg;
 }
 
+// The indexer K cache of a hybrid-idx memory (--cache-type-k-idx, W11) is read and written by ordinary ops, which the
+// layer registers (llm_graph_result::add_qsa_idx_node: qwen4exp's GET_ROWS of the block members and the SET_ROWS of
+// cpy_k). A device that does not take such an op for the indexer type leaves it to the scheduler, which runs it on the
+// CPU and copies the cache view to the host for every layer and ubatch: HIP GET_ROWS of IQ4_NL needs ne[0] % 256 == 0
+// (ggml-cuda.cu supports_op) and the qwen4exp indexer row is 128 wide. The SPARSE_ATTN checks never see it. An error when
+// such a node runs on a CPU backend while the layer's indexer K storage is not a host buffer; it names the types that
+// device takes for that node. The node itself is checked, not its sources: the scheduler has replaced a source it copies.
+static std::string qsa_guard_indexer(const llm_graph_result * res, ggml_backend_sched_t sc, const llama_memory_i * memory) {
+    const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory);
+    const llama_kv_cache * kv = mem ? mem->get_mem_idx() : nullptr;
+    if (kv == nullptr) {
+        return "";
+    }
+    static const ggml_type types[] = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                                       GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
+    for (const auto & n : res->get_qsa_idx_nodes()) {
+        const ggml_tensor * st = kv->get_k_storage(n.first);
+        ggml_tensor * t = n.second;
+        if (st == nullptr || st->buffer == nullptr || t == nullptr) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(st->buffer);
+        if (ggml_backend_buft_is_host(buft)) {
+            continue;   // --no-kv-offload / -ngl 0: the cache is on the host, the CPU reads it in place
+        }
+        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sc, t);
+        if (be == nullptr || ggml_backend_dev_type(ggml_backend_get_device(be)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        // the indexer types this device takes for the same node (the GET_ROWS source / the SET_ROWS destination retyped)
+        std::string ok;
+        if (dev && (t->op == GGML_OP_GET_ROWS || t->op == GGML_OP_SET_ROWS)) {
+            ggml_init_params ip = { 2 * std::size(types) * ggml_tensor_overhead(), nullptr, true };
+            ggml_context_ptr ctx { ggml_init(ip) };
+            const ggml_tensor * base = t->op == GGML_OP_GET_ROWS ? t->src[0] : t;
+            for (const ggml_type ty : types) {
+                if (base->ne[0] % ggml_blck_size(ty) != 0) {
+                    continue;
+                }
+                ggml_tensor * a = ggml_new_tensor_4d(ctx.get(), ty, base->ne[0], base->ne[1], base->ne[2], base->ne[3]);
+                ggml_tensor * op = t->op == GGML_OP_GET_ROWS ? ggml_get_rows(ctx.get(), a, t->src[1])
+                                                             : ggml_set_rows(ctx.get(), a, t->src[1], t->src[2]);
+                if (ggml_backend_dev_supports_op(dev, op)) {
+                    ok += (ok.empty() ? "" : ", ") + std::string(ggml_type_name(ty));
+                }
+            }
+        }
+        return format("QSA layer %d: the indexer K cache (%s, on %s) is %s by %s '%s', which device %s does not take for this "
+                "type: the scheduler would run it on the CPU and copy the cache to the host every ubatch; use "
+                "--cache-type-k-idx auto%s%s", n.first, ggml_type_name(st->type), ggml_backend_buft_name(buft),
+                t->op == GGML_OP_SET_ROWS ? "written" : "read", ggml_op_name(t->op), t->name, dev ? ggml_backend_dev_name(dev) : "?",
+                ok.empty() ? "" : " or a type it takes here: ", ok.c_str());
+    }
+    return "";
+}
+
 std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * res, const char * where) {
     const auto & nodes = res->get_qsa_nodes();
     auto * sc = sched.get();
@@ -1126,6 +1183,13 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
     for (const auto & n : nodes) {
         if (n.attn && !n.plan) {
             n_inspected++;
+        }
+    }
+
+    {
+        const std::string err = qsa_guard_indexer(res, sc, memory.get());
+        if (!err.empty()) {
+            return err;
         }
     }
 
