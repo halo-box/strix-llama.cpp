@@ -3,10 +3,13 @@
 // One block of 256 threads per output row R = (s * n_q + i) * n_head + h; thread d owns dim d. The partial rows of R
 // (sa_attend_g1 with splits > 1: [splits][258] = 256 unnormalised accumulators, the split's running max m_z and its
 // normaliser l_z) are combined in split order, so the result is a pure function of the partials:
-//   M = max_z m_z;  f_z = exp(m_z - M) for the splits with l_z > 0;  out = sum_z f_z acc_z / sum_z f_z l_z  (0 if empty).
+//   M = max_z m_z;  f_z = exp(m_z - M) for the splits with l_z != 0;  out = sum_z f_z acc_z / sum_z f_z l_z  (0 unless > 0).
 // This is PR #219's decode merge arithmetic (the merge kernel of qsa-decode.cu:65-79 at 94e086847: f32, expf, the same order), with the splits whose
 // normaliser is 0 skipped by a select instead of multiplied by a 0 factor (their accumulators are 0 anyway: an empty
-// split writes zeros). The rot_o epilogue of PLAN-v3 §6.2 (W10): with rot_o != 0 the merged row is staged in shared
+// split writes zeros). A split whose normaliser is NaN (an attended cell scored NaN: inf * 0 or inf - inf in q.k, a NaN
+// K element) is kept: its NaN reaches the sum, so the row is 0, as in the CPU op (sparse-attn.cpp: l > 0 ? a / l : 0 with
+// l NaN), the one-split epilogue and G4. Skipping it (the test was l_z > 0) returned the softmax over the other splits,
+// a result that depended on the shape-only split count. The rot_o epilogue of PLAN-v3 §6.2 (W10): with rot_o != 0 the merged row is staged in shared
 // memory and H_o is applied over its consecutive blocks of rot_o dims (sa_fwht_smem of sparse-attn-fwht.cuh: the
 // arithmetic of fwht.cu) before the store; the partials themselves are unrotated (sa_attend_g1).
 
@@ -31,7 +34,7 @@ static __global__ void __launch_bounds__(256) sa_merge_splits(const float * part
     float sum = 0.0f, value = 0.0f;
     for (int z = 0; z < splits; ++z) {
         const float count = src[z * 258 + 257];
-        if (count > 0.0f) {
+        if (count != 0.0f) {   // true for NaN: a poisoned split makes the row 0 (above)
             const float factor = expf(src[z * 258 + 256] - maximum);
             value += src[z * 258 + d] * factor;
             sum   += count * factor;

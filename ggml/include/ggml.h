@@ -2671,6 +2671,8 @@ extern "C" {
     //   4. A cell whose mask bit is 0 and every padding entry contribute nothing, whatever their stored bytes
     //      (NaN / inf included). The summation order is a pure function of the shape and of the op's inputs, so the
     //      output is deterministic run to run.
+    //   5. A row whose normaliser l is not > 0 gives 0: an empty S (l = 0), and an S with a cell whose score is NaN
+    //      (inf * 0 or inf - inf in q.k, a NaN K element: l is NaN). A backend that splits a row must keep that NaN.
     GGML_API struct ggml_tensor * ggml_sparse_attn(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
