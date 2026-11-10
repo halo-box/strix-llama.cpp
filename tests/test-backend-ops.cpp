@@ -14594,12 +14594,13 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
             for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, G, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, SA_NANSCORE));
         }
     }
-    // a -inf score in the first step of a row (init_lead): query 0 selects cells 0 .. 15, whose K rows of KV head 0 score
-    // -inf (leadneginf: weight 0 wherever the cell lies, the row is the softmax over the other cells). G1 with the split-K
-    // merge (n_q 1, n_sel 2051: HIP 33 splits, Vulkan split + reduce), G1 with one HIP split (n_sel 48), G1 at n_q 66
-    // (Vulkan one split: n_q * n_head_kv >= 128), G4 with direct V (n_q 4) and packed V (n_q 66, n_kv 4096 < 64 * n_q)
+    // a -inf or NaN score in the first step of a row (init_lead): query 0 selects cells 0 .. 15, whose K rows of KV head 0
+    // score -inf (leadneginf: weight 0 wherever the cell lies, the row is the softmax over the other cells) or NaN (leadnan:
+    // the row is 0, also when the running max is still -inf). G1 with the split-K merge (n_q 1, n_sel 2051: HIP 33 splits,
+    // Vulkan split + reduce), G1 with one HIP split (n_sel 48), G1 at n_q 66 (Vulkan one split: n_q * n_head_kv >= 128),
+    // G4 with direct V (n_q 4) and packed V (n_q 66, n_kv 4096 < 64 * n_q)
     for (ggml_type t : {F16, Q8, BF16}) {
-        for (int sp : {SA_LEAD_NEGINF}) {
+        for (int sp : {SA_LEAD_NEGINF, SA_LEAD_NAN}) {
             test_cases.emplace_back(new test_sparse_attn(t, t, 1,  8192, 2051, 1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));
             test_cases.emplace_back(new test_sparse_attn(t, t, 9,  4096, 48,   1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));
             test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257,  1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));

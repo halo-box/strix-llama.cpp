@@ -311,10 +311,15 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
             local = fmaxf(local, __shfl_xor(local, 16));
             const float next  = fmaxf(maximum, local);
             const float alpha = next == -INFINITY ? 1.0f : exp2f((maximum - next) * SA_L2E);
+            // fmaxf drops a NaN score, so next stays -inf in a chunk whose cells all score -inf or NaN (the first chunk of a
+            // split included): the exponentials are then taken against 0, so a -inf (or masked) cell gets 0 and a NaN cell
+            // keeps its NaN, which makes the normaliser NaN and the row 0 (ggml.h item 5; the merge keeps a NaN split). p = 0
+            // there dropped the NaN: the softmax over the row's other cells
+            const float ref   = next == -INFINITY ? 0.0f : next;
             float sum = 0.0f;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                const float p = next == -INFINITY ? 0.0f : exp2f((score[e] - next) * SA_L2E);
+                const float p = exp2f((score[e] - ref) * SA_L2E);
                 sum += p;
                 probabilities[r][2*e + hi] = sa_f2h(p);
             }
