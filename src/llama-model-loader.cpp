@@ -795,17 +795,14 @@ llama_model_loader::llama_model_loader(
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
-        // tensors with a shape are the complete tensor set of the model (e.g. common/exl3-dir.cpp), set_tensor_data fills them
-        // tensors without one only set the type of a tensor of a virtual model (tests/test-llama-archs.cpp)
+        get_key("llama.tensor_set_complete", tensor_set_complete, false);
         const int64_t n_meta = gguf_get_n_tensors(metadata);
-        int64_t n_shaped = 0;
-        for (int64_t i = 0; i < n_meta; i++) {
-            const int64_t * ne = gguf_get_tensor_ne(metadata, i);
-            n_shaped += ne[0] > 0 && ne[1] > 0 && ne[2] > 0 && ne[3] > 0;
-        }
-        if (n_shaped > 0) {
-            if (n_shaped != n_meta) {
-                throw std::runtime_error(format("%s: %" PRId64 " of %" PRId64 " tensors in the metadata have no shape", __func__, n_meta - n_shaped, n_meta));
+        if (tensor_set_complete) {
+            for (int64_t i = 0; i < n_meta; i++) {
+                const int64_t * ne = gguf_get_tensor_ne(metadata, i);
+                if (ne[0] <= 0 || ne[1] <= 0 || ne[2] <= 0 || ne[3] <= 0) {
+                    throw std::runtime_error(format("%s: tensor '%s' in the complete tensor set has no shape", __func__, gguf_get_tensor_name(metadata, i)));
+                }
             }
             ggml_init_params params = { ggml_tensor_overhead()*(size_t) n_meta, NULL, true };
             ggml_context * ctx = ggml_init(params);
@@ -1493,7 +1490,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     };
 
     // a virtual model: no file and no tensor set, every tensor is made with the shape the model asks for
-    if (files.empty() && weights_map.empty()) {
+    if (files.empty() && !tensor_set_complete) {
         if (hparams.exl3_codebook >= 0) {
             throw std::runtime_error("EXL3 linears are only loaded from a model file or a complete tensor set");
         }

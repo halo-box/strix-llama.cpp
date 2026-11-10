@@ -1509,6 +1509,7 @@ common_exl3_dir_ptr common_exl3_dir_open(const std::string & path) {
     }
 
     d->meta = gguf_init_empty();
+    gguf_set_val_bool(d->meta, "llama.tensor_set_complete", true);
     exl3_qwen35_hparams(d->meta, hp, dir.filename().string().empty() ? dir.parent_path().filename().string() : dir.filename().string(), ftype, n_mtp);
 
     gguf_set_val_u32(d->meta, "exl3.version", 1);
