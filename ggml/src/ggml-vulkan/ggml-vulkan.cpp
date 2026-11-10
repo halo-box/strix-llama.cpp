@@ -11083,7 +11083,8 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
     if (tier == VK_SA_TIER_CM) {
         vl = f.vl >= 0 ? (vk_sa_vl) f.vl : ggml_vk_sa_default_vl(v->type);
     }
-    bool pack_possible = false;   // at the reserve (n_q' = n_q is the largest n_q' that can pack)
+    bool pack_possible = false;   // at this node's n_kv
+    const bool pack_arm = vl == VK_SA_VL_PACK;
     if (vl == VK_SA_VL_PACK) {
         const size_t bytes = (size_t) n_kv4 * n_kv_head * n_stream * pack_row;
         pack_possible = (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) &&
@@ -11106,10 +11107,22 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
         partial_max = std::max(partial_max, ggml_vk_sa_partial_bytes(nq, n_head, n_stream, ggml_vk_sa_splits(device, tier, nq, n_kv_head, n_stream, n_sel)));
     }
     r.ws_bytes = r.pack_k_bytes + r.pack_v_bytes + r.partial_bytes;
+    // the pack reserve: a runtime op of this context packs at n_kv4' < 64 n_q' with n_kv' <= n_kv and n_q' <= n_q, so the
+    // largest pack it can ask is at n_kv4' = min(n_kv4, 64 n_q - 4), not at this node's n_kv: a reserve at the full n_kv
+    // (no pack there) must still hold the pack of a smaller runtime n_kv
     size_t pack_reserve = 0;
-    if (pack_possible && n_kv4 < 64 * n_q) {
-        pack_reserve = (k->type != GGML_TYPE_F16 ? (size_t) n_kv4 * n_kv_head * n_stream * pack_row : 0) +
-                       (v->type != GGML_TYPE_F16 ? (size_t) n_kv4 * n_kv_head * n_stream * pack_row : 0);
+    if (pack_arm && (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16)) {
+        // and the largest n_kv4' whose pack binds and whose pack grid fits (the two other terms of pack_possible)
+        const size_t per_cell = (size_t) n_kv_head * n_stream * pack_row;
+        const size_t align = device->properties.limits.minStorageBufferOffsetAlignment;
+        const size_t max_bind = ggml_vk_sa_max_binding(device);
+        const int64_t n_kv4_bind = max_bind > align ? (int64_t) ((max_bind - align) / per_cell) / 4 * 4 : 0;
+        const int64_t n_kv4_grid = 64 * (int64_t) device->properties.limits.maxComputeWorkGroupCount[0];
+        const int64_t n_kv4_r = std::min({ n_kv4, 64 * n_q - 4, n_kv4_bind, n_kv4_grid });
+        const size_t bytes_r = n_kv4_r > 0 ? (size_t) n_kv4_r * per_cell : 0;
+        if (bytes_r > 0) {
+            pack_reserve = (k->type != GGML_TYPE_F16 ? bytes_r : 0) + (v->type != GGML_TYPE_F16 ? bytes_r : 0);
+        }
     }
     r.ws_reserve_bytes = pack_reserve + partial_max;
     if ((r.ws_reserve_bytes != 0 && !ggml_vk_sa_binding_fits(device, r.ws_reserve_bytes)) ||
