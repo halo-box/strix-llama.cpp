@@ -6804,7 +6804,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             if (ok) {   // what the kernel writes must not overlap anything it reads (q, k, v, plan, gate, and the V pack
                         // workspace in the node's own over-allocation). The allocator may hand the gated output the
-                        // memory of Q (dead after the attend): harmless when only the 16-bit copy is written
+                        // memory of Q (dead after the attend): harmless when only the 16-bit copy is written. An output
+                        // that overlaps a read goes to pool scratch (outside the compute buffer, so it overlaps none of
+                        // them) and one device copy moves it into place: the fusion no longer depends on where gallocr
+                        // put the MUL (Prove: the MTP server census refused 40 of 96 fusible attends on the overlap)
                 auto overlap = [](const void * a, size_t na, const void * b, size_t nb) {
                     const uintptr_t x = (uintptr_t) a, y = (uintptr_t) b; return na > 0 && nb > 0 && x < y + nb && y < x + na; };
                 size_t ws_off = 0, ws_bytes = 0;
@@ -6818,13 +6821,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     reads.push_back({ rr->data, ggml_nbytes(rr) });
                 }
                 reads.push_back({ (const char *) node->data + ws_off, ws_bytes });
+                const size_t n32 = ggml_nbytes(mul), n16 = (size_t) ggml_nelements(mul) * sizeof(uint16_t);
+                bool hazard32 = false, hazard16 = false;
                 for (const range & rd : reads) {
-                    if (store_f32 && overlap(mul->data, ggml_nbytes(mul), rd.p, rd.n)) ok = false;
-                    if (dst16 && overlap(dst16, (size_t) ggml_nelements(mul) * sizeof(uint16_t), rd.p, rd.n)) ok = false;
+                    hazard32 = hazard32 || (store_f32 && overlap(mul->data, n32, rd.p, rd.n));
+                    hazard16 = hazard16 || (dst16 && overlap(dst16, n16, rd.p, rd.n));
                 }
-            }
-            if (ok) {
-                ggml_cuda_sparse_attn_gated(*cuda_ctx, node, gate, store_f32 ? (float *) mul->data : nullptr, dst16, f16);
+                ggml_cuda_pool_alloc<float>    tmp32(cuda_ctx->pool());
+                ggml_cuda_pool_alloc<uint16_t> tmp16(cuda_ctx->pool());
+                float *    out32 = store_f32 ? (hazard32 ? tmp32.alloc(ggml_nelements(mul)) : (float *) mul->data) : nullptr;
+                uint16_t * out16 = dst16 ? (hazard16 ? tmp16.alloc(ggml_nelements(mul)) : dst16) : nullptr;
+                ggml_cuda_sparse_attn_gated(*cuda_ctx, node, gate, out32, out16, f16);
+                if (hazard32) {
+                    CUDA_CHECK(cudaMemcpyAsync(mul->data, out32, n32, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                }
+                if (hazard16) {
+                    CUDA_CHECK(cudaMemcpyAsync(dst16, out16, n16, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                }
                 return j + 2 - i;
             }
             ggml_cuda_mmb_cache_unproduce(*cuda_ctx, dst16);   // not fused: the gated output is computed (and copied) later
