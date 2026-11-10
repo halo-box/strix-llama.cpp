@@ -1031,6 +1031,11 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
     return buft_ctx->max_size;
 }
 
+// the ops whose alloc size on a server backend depends on their srcs (see the cache key below)
+static bool rpc_alloc_size_src_keyed(const int op) {
+    return op == GGML_OP_SPARSE_ATTN;
+}
+
 static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     // should we query the remote server for the actual size
     bool rpc_get = false;
@@ -1058,6 +1063,21 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         //    cached value from reservation is always >= any subsequent request
         // 3. Including src dims causes cache misses per-ubatch (e.g. growing KV cache)
         //    which blocks the main thread behind in-flight GRAPH_COMPUTE commands
+        // except for the ops whose workspace is a function of their srcs and not of the dst shape (rpc_alloc_size_src_keyed):
+        // the SPARSE_ATTN workspace past ggml_nbytes(dst) follows the plan's n_kv / n_sel / G and the K / V type and heads
+        // (HIP sa_select, Vulkan ggml_vk_sa_select), none of which is in its dst [D, n_head, n_q, n_stream] or its op_params
+        // (scale, rot_q, rot_o). Point 2 does not hold for it: a dst shape the reserve never builds (a remainder ubatch)
+        // is first cached at whatever n_kv it first runs at, and the shortcut (n_sel = n_kv) and the selection rows
+        // (n_sel = top_k + r - 1) give identical dst shapes; a cache hit then returned a workspace smaller than the server's
+        // kernels write, so gallocr placed the next tensors inside it (the server's own get_alloc_size check recomputes
+        // the size and cannot see it). Its key also holds every src's type, op, op_params, ne and nb.
+        struct alloc_size_cache_src {
+            uint32_t type;
+            uint32_t op;
+            int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+            uint64_t ne[GGML_MAX_DIMS];
+            uint64_t nb[GGML_MAX_DIMS];
+        };
         struct alloc_size_cache_key {
             uint32_t device;
             uint32_t type;
@@ -1065,6 +1085,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
             uint32_t ne[GGML_MAX_DIMS];
             uint64_t nb[GGML_MAX_DIMS];
+            alloc_size_cache_src srcs[GGML_MAX_SRC];   // all zero unless rpc_alloc_size_src_keyed
         };
 
         alloc_size_cache_key key = {};
@@ -1075,6 +1096,21 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         for (int i = 0; i < GGML_MAX_DIMS; i++) {
             key.ne[i] = (uint32_t)tensor->ne[i];
             key.nb[i] = (uint64_t)tensor->nb[i];
+        }
+        if (rpc_alloc_size_src_keyed(tensor->op)) {
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                const ggml_tensor * src = tensor->src[j];
+                if (src == nullptr) {
+                    continue;
+                }
+                key.srcs[j].type = src->type;
+                key.srcs[j].op   = src->op;
+                memcpy(key.srcs[j].op_params, src->op_params, sizeof(key.srcs[j].op_params));
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                    key.srcs[j].ne[i] = (uint64_t)src->ne[i];
+                    key.srcs[j].nb[i] = (uint64_t)src->nb[i];
+                }
+            }
         }
 
         uint64_t cache_hash = fnv_hash((const uint8_t *)&key, sizeof(key));
