@@ -9,9 +9,46 @@
 #include "ggml-cpp.h"
 
 #include <cstdio>
+#include <iterator>
 #include <string>
+#include <vector>
+
+// the comma-separated list as its entries: a type is in it only as a whole entry ("f16" is not in "bf16, q8_0": a
+// substring search found it inside "bf16", so a list without f16 passed the f16 check)
+static std::vector<std::string> split_list(const std::string & list) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos <= list.size() && !list.empty()) {
+        const size_t end = list.find(',', pos);
+        std::string item = list.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        const size_t a = item.find_first_not_of(' '), b = item.find_last_not_of(' ');
+        out.push_back(a == std::string::npos ? "" : item.substr(a, b - a + 1));
+        if (end == std::string::npos) {
+            break;
+        }
+        pos = end + 1;
+    }
+    return out;
+}
+
+static bool has_entry(const std::vector<std::string> & items, const std::string & t) {
+    for (const auto & i : items) {
+        if (i == t) {
+            return true;
+        }
+    }
+    return false;
+}
 
 int main() {
+    // the checker itself: a list with bf16 but not f16 misses f16
+    {
+        const auto items = split_list("bf16, q8_0, q4_0, f32, q4_1, q5_0, q5_1, iq4_nl");
+        if (has_entry(items, "f16") || !has_entry(items, "bf16") || !has_entry(items, "iq4_nl") || items.size() != 8) {
+            printf("test-qsa-supported-types: the list checker is wrong (f16 found in a list without it)\n");
+            return 1;
+        }
+    }
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu == nullptr) {
         printf("test-qsa-supported-types: no CPU device\n");
@@ -31,12 +68,17 @@ int main() {
     printf("supported here (CPU): '%s'\n", list.c_str());
     // the CPU op takes every type of S: the list names all nine
     const char * want[] = { "f16", "bf16", "q8_0", "q4_0", "f32", "q4_1", "q5_0", "q5_1", "iq4_nl" };
+    const std::vector<std::string> items = split_list(list);
     int missing = 0;
     for (const char * t : want) {
-        if (list.find(t) == std::string::npos) {
+        if (!has_entry(items, t)) {
             printf("  missing %s\n", t);
             missing++;
         }
+    }
+    if (items.size() != std::size(want)) {
+        printf("  %zu entries, want %zu\n", items.size(), std::size(want));
+        missing++;
     }
     printf("test-qsa-supported-types: %s\n", missing == 0 ? "OK" : "FAILED");
     return missing == 0 ? 0 : 1;
