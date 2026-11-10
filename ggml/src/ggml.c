@@ -6696,6 +6696,11 @@ struct ggml_tensor * ggml_sparse_attn_plan(
 
     ggml_set_op_params_i32(result, 0, (int32_t) n_kv);
     ggml_set_op_params_i32(result, 1, group);
+    // the selection's shape, so that a consumer's alloc size never needs this node's src (an RPC server deserializes a node's
+    // direct srcs only: the attend's plan arrives there without its sel)
+    ggml_set_op_params_i32(result, 2, (int32_t) sel->ne[0]);
+    ggml_set_op_params_i32(result, 3, (int32_t) sel->ne[1]);
+    ggml_set_op_params_i32(result, 4, (int32_t) sel->ne[3]);
 
     result->op     = GGML_OP_SPARSE_ATTN_PLAN;
     result->src[0] = sel;

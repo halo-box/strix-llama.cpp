@@ -2607,6 +2607,8 @@ extern "C" {
     //   n_groups = ceil(n_q / G); cap = round4(min(G * n_sel, ceil(n_kv / 4)))
     //   every entry past the group's real entries (the padding up to counts[s][g] and everything up to cap) holds
     //   quad = the last real quad of the group (0 for an empty group) and mask = 0; the gaps between sections are 0
+    // op_params (i32): n_kv, group, n_sel, n_q, n_stream. A backend computes a consumer's workspace from them, never from
+    // the plan's src (a node's srcs' srcs are not linked on an RPC server).
     // The sort/dedup scratch is not part of dst: ggml_sparse_attn_plan_scratch_nbytes(n_sel, n_q, n_stream)
     // = n_stream * n_q * round4(n_sel) * 4 bytes (GPU backends: in their get_alloc_size over-allocation of dst;
     // CPU: in the graph work buffer).
