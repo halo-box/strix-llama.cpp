@@ -1289,7 +1289,8 @@ public:
         const auto * attn = mctx->get_attn();
         const bool blocks = attn && qwen4exp_use_block_selection(blk_bias, ratio, n_kv,
                 params.ubatch, params.cparams, params.hparams);
-        const bool scalar = blocks && params.hparams.n_swa == 0 && mctx->qsa_scalar_visibility(params.ubatch, ratio);
+        const bool scalar = blocks && params.hparams.n_swa == 0 && (params.qsa_reserve & LLM_GRAPH_QSA_RESERVE_NONCOMPACT) == 0 &&
+                mctx->qsa_graph_compact(params.ubatch, ratio, (params.qsa_reserve & LLM_GRAPH_QSA_RESERVE_GRAPH) != 0);
         res &= (tail_idxs != nullptr) == scalar;
         res &= compact == scalar;
         if (tail_idxs) { res &= tail_idxs->ne[1] == params.ubatch.n_tokens/n_stream; }
@@ -1454,9 +1455,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const auto * attn_ctx = mctx_hyb->get_attn();
         const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, r, n_kv, ubatch, cparams, hparams);
         // the sparse op takes n_stream on ne[3] at any n_tps (PLAN-v3 §4.4)
-        // the reserve's non-compact variant (PLAN-v3 §7.1.4) forces the decision: the empty-cache reserve ubatch is compact
+        // the reserve's non-compact variant (PLAN-v3 §7.1.4) forces the decision: the empty-cache reserve ubatch is compact.
+        // Every reserve graph decides on an empty cache (LLM_GRAPH_QSA_RESERVE_GRAPH), also a reserve that runs mid-session
+        // over the live cells (sched_need_reserve), so its pp / tg graphs are the compact ones of init
         const bool force_nc = (qsa_reserve & LLM_GRAPH_QSA_RESERVE_NONCOMPACT) != 0;
-        const bool scalar = !force_nc && blocks && hparams.n_swa == 0 && mctx_hyb->qsa_scalar_visibility(ubatch, (uint32_t) r);
+        const bool scalar = !force_nc && blocks && hparams.n_swa == 0 &&
+                mctx_hyb->qsa_graph_compact(ubatch, (uint32_t) r, (qsa_reserve & LLM_GRAPH_QSA_RESERVE_GRAPH) != 0);
         // the always-on graph-build check (PLAN-v3 §4.3, no env gate): a non-compact ubatch on the selection path with more
         // than U tokens, or any non-compact ubatch in a single-sequence context (it reserves no variant, §7.1.5), is a
         // decode error; process_ubatch returns it before the graph is allocated. The reserve graphs never trigger it

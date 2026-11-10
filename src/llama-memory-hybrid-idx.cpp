@@ -326,6 +326,21 @@ int llama_memory_hybrid_idx::qsa_compact_reason(const llama_kv_cache * kv, uint3
     return QSA_COMPACT_OK;
 }
 
+int llama_memory_hybrid_idx::qsa_compact_reason_empty(uint32_t n_stream, uint32_t ratio, const llama_ubatch & ubatch) {
+    if (!ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id || n_stream == 0 || ubatch.n_tokens % n_stream != 0) {
+        return QSA_NC_INPUT;
+    }
+    static const llama_kv_cells empty;
+    const uint32_t n_tps = ubatch.n_tokens / n_stream;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const int r = qsa_compact_visibility_stream(empty, 0, ratio, ubatch, s*n_tps, n_tps);
+        if (r != QSA_COMPACT_OK) {
+            return r;
+        }
+    }
+    return QSA_COMPACT_OK;
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
     auto result = std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
     if (result->get_status() != LLAMA_MEMORY_STATUS_NO_UPDATE) { qsa_invalidate(); }
@@ -1861,6 +1876,13 @@ uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
 bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const {
     if (qsa_prefix_matches(ubatch)) { return true; }
     return qsa_compact_reason(ubatch, ratio) == QSA_COMPACT_OK;
+}
+
+bool llama_memory_hybrid_idx_context::qsa_graph_compact(const llama_ubatch & ubatch, uint32_t ratio, bool reserve) const {
+    if (!reserve) {
+        return qsa_scalar_visibility(ubatch, ratio);
+    }
+    return llama_memory_hybrid_idx::qsa_compact_reason_empty(get_n_stream(), ratio, ubatch) == QSA_COMPACT_OK;
 }
 
 int llama_memory_hybrid_idx_context::qsa_compact_reason(const llama_ubatch & ubatch, uint32_t ratio) const {

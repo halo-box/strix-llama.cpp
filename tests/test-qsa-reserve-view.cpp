@@ -47,7 +47,69 @@ static void check_views(uint32_t kv_size, uint32_t n_seq_max, bool unified) {
             (int) unified, as_idx(full)->get_n_stream(), as_idx(b)->get_n_stream(), as_idx(one)->get_n_stream());
 }
 
+// The compact decision of the reserve graphs (llama_memory_hybrid_idx_context::qsa_graph_compact, the call qwen4exp's
+// build_qsa_top_k makes with LLM_GRAPH_QSA_RESERVE_GRAPH): sched_reserve builds every reserve graph on init_full, which
+// views the live cells when a reserve runs mid-session (sched_need_reserve). The pp reserve ubatch (graph_reserve: n_seqs
+// sequences 0 .. n_seqs - 1 in one unified stream, all-zero positions, ubatch_prepare_reserve's seq ids) must get the
+// verdict it gets on the empty cache of init, whatever the cells hold: an image in one sequence next to text in another
+// (QSA_NC_2D_MULTI_SEQ), or a block shared through seq_cp (QSA_NC_SHARED_BLOCK). Runtime graphs keep the live verdict.
+static llama_ubatch reserve_ubatch(llama_batch_allocr & balloc, uint32_t n_tokens, uint32_t n_seqs) {
+    llama_ubatch u = balloc.ubatch_reserve(n_tokens / n_seqs, n_seqs);
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        for (uint32_t t = 0; t < u.n_seq_tokens; ++t) {
+            const uint32_t i = s * u.n_seq_tokens + t;
+            u.n_seq_id[i] = 1;
+            u.seq_id[i]   = &u.seq_id_unq[s];
+        }
+    }
+    return u;
+}
+
+static void check_reserve_compact(const char * name, qsa_fixture & fx, int want_live) {
+    const uint32_t r = 4;
+    auto full = fx.mem->init_full();
+    CHECK(full && full->get_status() == LLAMA_MEMORY_STATUS_SUCCESS);
+    const auto * m = as_idx(full);
+    llama_batch_allocr balloc(4);
+    for (const uint32_t n_tokens : { 4096u, 512u, 4u }) {
+        const llama_ubatch u = reserve_ubatch(balloc, n_tokens, fx.n_seq_max);
+        const int  live    = m->qsa_compact_reason(u, r);
+        const bool reserve = m->qsa_graph_compact(u, r, true);
+        const bool runtime = m->qsa_graph_compact(u, r, false);
+        fprintf(stderr, "%s: reserve ubatch of %u tokens, %u seqs: live cells %s, reserve graph %s, runtime graph %s\n", name, n_tokens,
+                fx.n_seq_max, qsa_compact_reason_name(live), reserve ? "compact" : "non-compact", runtime ? "compact" : "non-compact");
+        CHECK(live == want_live);
+        CHECK(reserve);                                    // the init verdict, whatever the live cells hold
+        CHECK(runtime == m->qsa_scalar_visibility(u, r));  // a runtime graph keeps the live verdict
+    }
+}
+
+static void check_reserve_compact_all() {
+    {   // init: the empty cache, where the reserve and live verdicts agree
+        qsa_fixture fx(8192, 4, true);
+        check_reserve_compact("empty", fx, QSA_COMPACT_OK);
+    }
+    {   // slot 0 holds an image, slot 1 text: a sequence of the stream holds 2-D cells while another has cells
+        qsa_fixture fx(8192, 4, true);
+        CHECK(fx.feed(fx.text(0, 100), 512));
+        CHECK(fx.feed(fx.image(0, 32, 32), 512));
+        CHECK(fx.feed(fx.text(0, 100), 512));
+        CHECK(fx.feed(fx.text(1, 3000), 512));
+        check_reserve_compact("image+text", fx, QSA_NC_2D_MULTI_SEQ);
+    }
+    {   // slot 1 copied slot 0 (seq_cp) when it ended inside a block (3001 tokens, ratio 4), then slot 0 went on: the block
+        // 3000 .. 3003 holds sequence 0 under {0, 1} and {0} (R1-CB, test-qsa-visibility "seqcp")
+        qsa_fixture fx(8192, 4, true);
+        CHECK(fx.feed(fx.text(0, 3001), 512));
+        fx.mem->seq_cp(0, 1, -1, -1);
+        fx.next_pos[1] = fx.next_pos[0];
+        CHECK(fx.feed(fx.text(0, 40), 512));
+        check_reserve_compact("seq_cp", fx, QSA_NC_SHARED_BLOCK);
+    }
+}
+
 int main() {
+    check_reserve_compact_all();
     check_views(4096, 2, false);
     check_views(4096, 4, false);
     check_views(4096, 2, true);
