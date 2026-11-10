@@ -36,6 +36,16 @@ int main() {
             }
         }
     }
+    // the per-context eligibility terms shared by qwen4exp_use_block_selection and the NC0 re-split
+    CHECK(qwen4exp_block_selection_eligible(true, true, 4, 2048, 0.0f, false, 256, 256), "Qwen3.8 QSA layer: not eligible");
+    CHECK(!qwen4exp_block_selection_eligible(true, false, 4, 2048, 0.0f, false, 256, 256), "non-causal: eligible");
+    CHECK(!qwen4exp_block_selection_eligible(false, true, 4, 2048, 0.0f, false, 256, 256), "no blk_bias (alibi): eligible");
+    CHECK(!qwen4exp_block_selection_eligible(true, true, 1, 2048, 0.0f, false, 256, 256), "ratio 1: eligible");
+    CHECK(!qwen4exp_block_selection_eligible(true, true, 0, 2048, 0.0f, false, 256, 256), "ratio 0: eligible");
+    CHECK(!qwen4exp_block_selection_eligible(true, true, 3, 2048, 0.0f, false, 256, 256), "top_k % ratio != 0: eligible");
+    CHECK(!qwen4exp_block_selection_eligible(true, true, 4, 2048, 8.0f, false, 256, 256), "alibi bias: eligible");
+    CHECK(!qwen4exp_block_selection_eligible(true, true, 4, 2048, 0.0f, true, 256, 256), "soft cap: eligible");
+    CHECK(!qwen4exp_block_selection_eligible(true, true, 4, 2048, 0.0f, false, 128, 256), "head 128: eligible");
     printf("test-qsa-noncompact-check: %s\n", n_fail == 0 ? "OK" : "FAILED");
     return n_fail == 0 ? 0 : 1;
 }

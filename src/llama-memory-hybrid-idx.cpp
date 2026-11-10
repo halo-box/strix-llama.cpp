@@ -1,5 +1,6 @@
 #include "llama-memory-hybrid-idx.h"
 #include "prefix.h"
+#include "models/qwen4exp-qsa-check.h"
 
 #include <algorithm>
 #include <cmath>
@@ -103,10 +104,17 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }()) {
     n_seq_max_qsa = n_seq_max;
     if (mem_idx) {
-        // NC0 (PLAN-v3 §4.3) runs the compact predicate once per distinct compress ratio of the QSA layers
-        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
-            const uint32_t r = model.hparams.dsv4_compress_ratios[il];
-            if (r > 0 && filter_idx(il) && std::find(qsa_nc_ratios.begin(), qsa_nc_ratios.end(), r) == qsa_nc_ratios.end()) {
+        // NC0 (PLAN-v3 §4.3) runs the compact predicate once per distinct compress ratio of the QSA layers where block
+        // selection can be eligible: the graph-build check (qwen4exp_qsa_noncompact_error) fails a non-compact ubatch only
+        // there; any other layer takes the TE rows on every ubatch, which the reserve's own pp / tg graphs hold, so a
+        // re-split there only cut prefill into U-token ubatches. The terms fixed per context are tested here (blk_bias:
+        // no alibi; the mask shape terms hold for every graph build), causal attention per init_batch (qsa_nc_causal)
+        const auto & hp = model.hparams;
+        for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
+            const uint32_t r = hp.dsv4_compress_ratios[il];
+            const bool eligible = qwen4exp_block_selection_eligible(!hp.use_alibi, true, r, hp.indexer_top_k, hp.f_max_alibi_bias,
+                    hp.attn_soft_cap, hp.n_embd_head_k(), hp.n_embd_head_v()) && hp.n_swa == 0;
+            if (r > 0 && filter_idx(il) && eligible && std::find(qsa_nc_ratios.begin(), qsa_nc_ratios.end(), r) == qsa_nc_ratios.end()) {
                 qsa_nc_ratios.push_back(r);
             }
         }
@@ -157,8 +165,15 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 // qsa_prefix_matches shortcut), so NC0 contains every graph-time non-compact ubatch. It reads the attention cells, the graph
 // reads the indexer cells: they are the same slots with the same edits (test-qsa-resplit asserts it after every apply)
 bool llama_memory_hybrid_idx::qsa_nc0(const llama_ubatch & ubatch, const llama_kv_cache::slot_info & sinfo) const {
+    if (!qsa_nc_causal) {
+        return false;   // block selection needs causal attention: every QSA layer takes the TE rows
+    }
     const uint32_t n_kv = get_mem_attn()->get_n_kv(sinfo);
     for (const uint32_t r : qsa_nc_ratios) {
+        // the ratio terms of qwen4exp_block_selection_eligible again, for the ratios of the test hook
+        if (r <= 1 || qsa_nc_top_k % r != 0) {
+            continue;
+        }
         if (n_kv > qsa_nc_top_k + r - 1 && qsa_compact_reason(get_mem_attn(), sinfo.n_stream(), n_kv, r, ubatch) != QSA_COMPACT_OK) {
             return true;
         }
@@ -177,7 +192,9 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
     // NC0 is evaluated for the ubatches above U of a context that serves several sequences (the others are recorded as
     // QSA_NC0_SKIPPED); it re-splits only when U < n_ubatch
     const uint32_t U = qsa_noncompact_cap(n_ubatch);
-    const bool resplit = mem_idx && n_seq_max_qsa > 1 && !qsa_nc_ratios.empty();
+    // only where block selection can be eligible (qsa_nc0): causal attention and a ratio > 1 that divides top_k
+    const bool resplit = mem_idx && n_seq_max_qsa > 1 && qsa_nc_causal &&
+        std::any_of(qsa_nc_ratios.begin(), qsa_nc_ratios.end(), [&](uint32_t r) { return r > 1 && qsa_nc_top_k % r == 0; });
 
     std::vector<uint32_t> cap;   // per ubatch index: the n_ubatch it is formed with (0 = n_ubatch)
     uint32_t i_fail_last = 0;

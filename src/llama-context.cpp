@@ -567,6 +567,9 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        if (auto * mem_qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
+            mem_qsa->qsa_set_causal_attn(cparams.causal_attn);   // the NC0 re-split applies only under causal attention
+        }
     }
 
     // reduced LM head, must exist before the graph is reserved
@@ -2194,6 +2197,10 @@ void llama_context::set_causal_attn(bool value) {
     }
 
     cparams.causal_attn = value;
+
+    if (auto * mem_qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
+        mem_qsa->qsa_set_causal_attn(value);
+    }
 
     // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph;
     // except with QSA layers: complete-block selection needs causal attention (qwen4exp_use_block_selection), so a flip

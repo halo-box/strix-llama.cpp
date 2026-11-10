@@ -17,6 +17,11 @@
 // decode step of a multi-sequence server) gets no NC0 evaluation (the predicate is an O(n_kv) host scan per ratio whose
 // result cannot matter there, because only a non-compact ubatch above U is re-split), while a prompt ubatch above U still
 // gets it; the ubatches and replays equal those of the same batch with every ubatch evaluated.
+// The ineligible phase: where block selection is not eligible (a non-causal context, a ratio-1 layer, top_k % ratio != 0)
+// every ubatch takes the TE rows that the reserve's pp graph already holds at n_ubatch, so NC0 must not re-split there.
+// Layout: -np 2 unified, seq 0 with an image next to seq 1's text (every prompt ubatch of seq 0 is non-compact,
+// QSA_NC_2D_MULTI_SEQ); a 3000-token prompt of seq 0 at n_ubatch 4096. The causal ratio-4 fixture must re-split it (the
+// control); the non-causal one, ratio 1 and ratio 3 (2048 % 3 != 0) must not, and must not evaluate NC0.
 // Pass: 0 violations over the fixed seeds, and the re-split engaged (replays > 0) on the multi-sequence layouts.
 #include "qsa-mem-fixture.h"
 
@@ -221,6 +226,38 @@ static void decode_phase() {
     }
 }
 
+static void ineligible_phase() {
+    struct variant { const char * name; bool causal; uint32_t ratio; bool want_resplit; };
+    for (const variant & V : { variant{ "causal-r4 (control)", true, 4, true }, variant{ "non-causal-r4", false, 4, false },
+                               variant{ "causal-r1", true, 1, false }, variant{ "causal-r3 (top_k % 3 != 0)", true, 3, false } }) {
+        qsa_fixture f(131072, 2, true);
+        f.mem->qsa_resplit_configure({ V.ratio }, 2048, 1);
+        f.mem->qsa_set_causal_attn(V.causal);
+        f.feed(f.text(0, 3000), 4096);
+        f.feed(f.image(0, 32, 32), 4096);
+        f.feed(f.text(1, 3000), 4096);   // past top_k + r - 1 cells
+        const uint64_t before = f.mem->qsa_n_resplit();
+        std::vector<uint32_t> n_tok;
+        const bool ok = f.feed(f.text(0, 3000), 4096, [&](const llama_memory_hybrid_idx_context *, const llama_ubatch & u, uint32_t) {
+            n_tok.push_back(u.n_tokens);
+        });
+        const uint64_t resplit = f.mem->qsa_n_resplit() - before;
+        const uint32_t evals = f.mem->qsa_last_nc0_evals();
+        uint32_t max_tok = 0;
+        for (uint32_t n : n_tok) { max_tok = std::max(max_tok, n); }
+        fprintf(stderr, "ineligible phase %s: %zu ubatches (largest %u tokens), %" PRIu64 " re-splits, %u NC0 evaluations\n",
+                V.name, n_tok.size(), max_tok, resplit, evals);
+        if (!ok) {
+            VIOL(0, "ineligible phase %s: the batch was refused", V.name);
+        } else if (V.want_resplit && resplit == 0) {
+            VIOL(7, "ineligible phase %s: the control did not re-split: the phase proves nothing", V.name);
+        } else if (!V.want_resplit && (resplit != 0 || evals != 0 || max_tok != 3000)) {
+            VIOL(7, "ineligible phase %s: %" PRIu64 " re-splits and %u NC0 evaluations (largest ubatch %u of 3000 tokens) where block "
+                    "selection is not eligible", V.name, resplit, evals, max_tok);
+        }
+    }
+}
+
 int main() {
     const char * layouts[] = { "a:single-2d", "b:seqcp", "c:layout3", "d:split-np2", "a1:np1" };
     int64_t replays_multi = 0;
@@ -284,6 +321,7 @@ int main() {
                 layout, g_batches, g_ubatches, g_nc, g_nc0, g_replays);
     }
     decode_phase();
+    ineligible_phase();
     int64_t total = 0;
     for (int k = 0; k < 8; ++k) { total += g_viol[k]; }
     printf("test-qsa-resplit: %" PRId64 " batches, %" PRId64 " ubatches, %" PRId64 " graph-time non-compact, %" PRId64 " NC0, %" PRId64 " replays (multi-sequence %" PRId64 ")\n",

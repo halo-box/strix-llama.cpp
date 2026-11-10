@@ -1109,10 +1109,9 @@ static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t 
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
     GGML_UNUSED(ubatch);
-    return blk_bias && cparams.causal_attn && ratio>1 && hparams.indexer_top_k%ratio==0 &&
-        n_kv>hparams.indexer_top_k+ratio-1 &&
-        hparams.f_max_alibi_bias==0.0f && !hparams.attn_soft_cap &&
-        hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256;
+    return qwen4exp_block_selection_eligible(blk_bias, cparams.causal_attn, ratio, hparams.indexer_top_k,
+            hparams.f_max_alibi_bias, hparams.attn_soft_cap, hparams.n_embd_head_k(), hparams.n_embd_head_v()) &&
+        n_kv>hparams.indexer_top_k+ratio-1;
 }
 
 // The shortcut attention of a QSA layer whose K buffer is on the host while its weights are on a GPU (-nkvo). AT-W7PERF (d)
