@@ -9851,10 +9851,38 @@ static int32_t ggml_backend_cuda_sparse_attn_group(ggml_backend_dev_t dev, int64
     return ggml_cuda_sparse_attn_group(device, n_q_per_stream, n_kv, type_k, type_v, shortcut);
 }
 
+// a FLASH_ATTN_EXT of the dense shortcut's shape (D 256, the qwen4exp heads, a causal f16 mask) on this device: the same
+// probe as the Vulkan policy (ggml_vk_sa_dense_fa_supported)
+static bool ggml_cuda_sa_dense_fa_supported(ggml_backend_dev_t dev, ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv) {
+    ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return false;
+    }
+    n_q  = std::max<int64_t>(n_q, 1);
+    n_kv = std::max<int64_t>(n_kv, 1);
+    ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_q, 24, 1);
+    ggml_tensor * k  = ggml_new_tensor_4d(ctx, type_k, 256, n_kv, 2, 1);
+    ggml_tensor * v  = ggml_new_tensor_4d(ctx, type_v, 256, n_kv, 2, 1);
+    ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v, m, 0.0625f, 0.0f, 0.0f);
+    const bool ok = ggml_backend_dev_supports_op(dev, fa);
+    ggml_free(ctx);
+    return ok;
+}
+
+// The gfx1151 table (ggml_cuda_sparse_attn_prefer_dense) picks the dense FLASH_ATTN_EXT, which qwen4exp then builds for the
+// n_kv <= top_k + r - 1 shortcut. A device whose FLASH_ATTN_EXT does not take the pair (a build with -DGGML_CUDA_FA=OFF:
+// GGML_CUDA_NO_FA, every FA kernel choice BEST_FATTN_KERNEL_NONE) keeps the sparse op, which its tiers run without FA;
+// the dense pick there failed the QSA guard ("no dense attention kernel for this pair on this device") although the
+// sparse route runs. test-qsa-prefer-dense checks every dense pick against the device's FLASH_ATTN_EXT.
 static bool ggml_backend_cuda_sparse_attn_prefer_dense(ggml_backend_dev_t dev, enum ggml_type type_k, enum ggml_type type_v,
                                                        int64_t n_q, int64_t n_kv) {
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
-    return ggml_cuda_sparse_attn_prefer_dense(device, type_k, type_v, n_q, n_kv);
+    if (!ggml_cuda_sparse_attn_prefer_dense(device, type_k, type_v, n_q, n_kv)) {
+        return false;
+    }
+    return ggml_cuda_sa_dense_fa_supported(dev, type_k, type_v, n_q, n_kv);
 }
 #endif // defined(GGML_USE_HIP)
 

@@ -437,6 +437,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-sparse-attn-plan-oracle.cpp LINK ggml)
     # Vulkan checks of the two ops: limits, capability gates, rotation against fwht.comp, the workspace sync rule (skips without Vulkan)
     llama_build_and_test(test-sparse-attn-vk.cpp LINK ggml)
+    # every dense pick of the QSA shortcut policy (HIP, Vulkan) is a FLASH_ATTN_EXT the device takes; skipped without the policy
+    llama_build_and_test(test-qsa-prefer-dense.cpp LINK ggml)
     # HIP checks of the in-op rotations: H_q / H_o in every tier bitwise against fwht.cu, and against the graph-side form (skips without ROCm)
     llama_build_and_test(test-sparse-attn-rot.cpp LINK ggml)
     # the SPARSE_ATTN alloc size as an RPC server computes it (the plan's own source not linked) equals the linked one, per device
