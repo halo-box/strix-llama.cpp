@@ -11,6 +11,10 @@
 //                                             of IQ4_NL rows whose width is not a multiple of 256, with --cache-type-k-idx T:
 //                                             iq4_nl (128-wide indexer rows) must be an init error naming the indexer cache,
 //                                             any other T must create the context
+//   test-qsa-guard <model.gguf> fake-idx-w T  a fake GPU device that takes the sparse-attention ops but no SET_ROWS into a T
+//                                             destination (a device whose SET_ROWS list lacks T, as HIP's lacks MXFP4), with
+//                                             --cache-type-k-idx T: an init error naming the indexer cache writer and the
+//                                             types the device takes, not the scheduler's abort
 //   test-qsa-guard <model.gguf> causal-sync  on the CPU, n_seq_max 2, unified: the hybrid-idx memory sees the context's
 //                                             causal attention (the NC0 re-split applies only under it): false after init
 //                                             with LLAMA_ATTENTION_TYPE_NON_CAUSAL, true after llama_set_causal_attn(true);
@@ -23,6 +27,7 @@
 #include "llama.h"
 #include "../src/llama-memory-hybrid-idx.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -87,9 +92,13 @@ static ggml_backend_t fake_dev_init(ggml_backend_dev_t dev, const char *) {
 }
 static ggml_backend_buffer_type_t fake_dev_buft(ggml_backend_dev_t) { return fake_buft(); }
 static bool g_fake_idx = false;   // fake-idx mode: the sparse-attention ops are taken, IQ4_NL GET_ROWS as on HIP
+static ggml_type g_fake_no_set_rows = GGML_TYPE_COUNT;   // fake-idx-w mode: no SET_ROWS into this type
 
 static bool fake_dev_supports_op(ggml_backend_dev_t, const ggml_tensor * op) {
     if (!g_fake_idx && (op->op == GGML_OP_SPARSE_ATTN || op->op == GGML_OP_SPARSE_ATTN_PLAN)) {
+        return false;
+    }
+    if (g_fake_idx && op->op == GGML_OP_SET_ROWS && op->type == g_fake_no_set_rows) {
         return false;
     }
     // ggml-cuda.cu supports_op, GET_ROWS: IQ4_NL only for ne[0] % QK_K == 0
@@ -159,7 +168,7 @@ static ggml_type type_of(const char * s) {
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.gguf pass [ctk] | fake | fake-idx <type> | reject | reject-decode | causal-sync\n", argv[0]);
+        fprintf(stderr, "usage: %s model.gguf pass [ctk] | fake | fake-idx <type> | fake-idx-w <type> | reject | reject-decode | causal-sync\n", argv[0]);
         return 2;
     }
     const std::string mode = argv[2];
@@ -178,8 +187,11 @@ int main(int argc, char ** argv) {
     }
 
     ggml_backend_dev_t devs[2] = { nullptr, nullptr };
-    g_fake_idx = mode == "fake-idx";
-    if (mode == "fake" || mode == "fake-idx") {
+    g_fake_idx = mode == "fake-idx" || mode == "fake-idx-w";
+    if (mode == "fake-idx-w") {
+        g_fake_no_set_rows = type;
+    }
+    if (mode == "fake" || mode == "fake-idx" || mode == "fake-idx-w") {
         ggml_backend_device_register(fake_device());
         devs[0] = fake_device();
         mp.devices = devs;
@@ -198,7 +210,7 @@ int main(int argc, char ** argv) {
     cp.type_k = type;
     cp.type_v = type;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    if (mode == "fake-idx") {
+    if (mode == "fake-idx" || mode == "fake-idx-w") {
         cp.type_k = cp.type_v = GGML_TYPE_Q8_0;
         cp.type_k_idx = type;
     }
@@ -263,6 +275,32 @@ int main(int argc, char ** argv) {
             rc = fail("context creation with this indexer type");
         } else {
             printf("context created with the %s indexer cache\n", ggml_type_name(type));
+        }
+    } else if (mode == "fake-idx-w") {
+        const std::string want = std::string("the indexer K cache (") + ggml_type_name(type);
+        const std::string key = " or a type it takes here: ";
+        const size_t p = g_log.find(key);
+        // the listed types, one per entry
+        std::vector<std::string> listed;
+        if (p != std::string::npos) {
+            const std::string list = g_log.substr(p + key.size(), g_log.find('\n', p) - p - key.size());
+            for (size_t b = 0; b <= list.size();) {
+                const size_t e = std::min(list.find(", ", b), list.size());
+                listed.push_back(list.substr(b, e - b));
+                b = e + 2;
+            }
+        }
+        const char * ref = type == GGML_TYPE_F16 ? "f32" : "f16";   // a type the fake device writes
+        const auto has = [&](const char * t) { return std::find(listed.begin(), listed.end(), std::string(t)) != listed.end(); };
+        if (ctx != nullptr) {
+            rc = fail("the context must not be created: no backend can write the indexer cache");
+        } else if (g_log.find(want) == std::string::npos || g_log.find("is written by SET_ROWS") == std::string::npos ||
+                   g_log.find("--cache-type-k-idx auto") == std::string::npos) {
+            rc = fail("the init error does not name the indexer cache, its writer and the remedy");
+        } else if (!has(ref) || has(ggml_type_name(type))) {
+            rc = fail("the init error does not list the types the device writes (another type in, the refused type out)");
+        } else {
+            printf("the guard fired on the %s indexer cache writer; types listed: %zu, %s among them\n", ggml_type_name(type), listed.size(), ref);
         }
     } else if (mode == "causal-sync") {
         const auto * mem = ctx ? dynamic_cast<const llama_memory_hybrid_idx *>(llama_get_memory(ctx)) : nullptr;

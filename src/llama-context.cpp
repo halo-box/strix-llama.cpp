@@ -1031,14 +1031,82 @@ static std::string qsa_unsupported_error(const llm_graph_qsa_node & n, ggml_back
 // (ggml-cuda.cu supports_op) and the qwen4exp indexer row is 128 wide. The SPARSE_ATTN checks never see it. An error when
 // such a node runs on a CPU backend while the layer's indexer K storage is not a host buffer; it names the types that
 // device takes for that node. The node itself is checked, not its sources: the scheduler has replaced a source it copies.
+//
+// The indexer types device dev takes for t, a GET_ROWS of the indexer cache (its source retyped) or the SET_ROWS that writes
+// it (its destination retyped), as a list for the error text. A SET_ROWS node holds src[0] = the rows, src[1] = the
+// indices, src[2] = the destination (ggml_set_rows), so the probe passes src[0] and src[1]: passing src[1] and src[2] gave
+// ggml_set_rows the I64 indices as the rows, and its GGML_ASSERT aborted where the error was to be returned.
+static std::string qsa_idx_types_taken(ggml_backend_dev_t dev, const ggml_tensor * t) {
+    static const ggml_type types[] = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                                       GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
+    std::string ok;
+    if (dev == nullptr || (t->op != GGML_OP_GET_ROWS && t->op != GGML_OP_SET_ROWS)) {
+        return ok;
+    }
+    ggml_init_params ip = { 2 * std::size(types) * ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    const ggml_tensor * base = t->op == GGML_OP_GET_ROWS ? t->src[0] : t;
+    for (const ggml_type ty : types) {
+        if (base->ne[0] % ggml_blck_size(ty) != 0) {
+            continue;
+        }
+        ggml_tensor * a = ggml_new_tensor_4d(ctx.get(), ty, base->ne[0], base->ne[1], base->ne[2], base->ne[3]);
+        ggml_tensor * op = t->op == GGML_OP_GET_ROWS ? ggml_get_rows(ctx.get(), a, t->src[1])
+                                                     : ggml_set_rows(ctx.get(), a, t->src[0], t->src[1]);
+        if (ggml_backend_dev_supports_op(dev, op)) {
+            ok += (ok.empty() ? "" : ", ") + std::string(ggml_type_name(ty));
+        }
+    }
+    return ok;
+}
+
+// The writer of the indexer K cache (the cpy_k SET_ROWS, registered by add_qsa_idx_node) is a view of the cache buffer, so
+// the scheduler must run it on a backend that takes both that buffer and the op. When none does,
+// ggml_backend_sched_backend_id_from_cur aborts ("pre-allocated tensor ... that cannot run the operation") before
+// qsa_guard ever sees the graph: an indexer type the device does not write (--cache-type-k-idx, type_k_idx: e.g. MXFP4 on
+// HIP, whose SET_ROWS lists f32 / f16 / bf16 / q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl) took the process down. This
+// runs on the built graph before the scheduler (graph_reserve, process_ubatch) with the scheduler's own rule
+// (ggml_backend_sched_backend_from_buffer: a backend that supports the buffer type and the op) and returns the error.
+static std::string qsa_guard_indexer_writer(const llm_graph_result * res, const llama_memory_i * memory,
+                                            const std::vector<ggml_backend_t> & backends) {
+    const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory);
+    const llama_kv_cache * kv = mem ? mem->get_mem_idx() : nullptr;
+    if (kv == nullptr) {
+        return "";
+    }
+    for (const auto & n : res->get_qsa_idx_nodes()) {
+        const ggml_tensor * t = n.second;
+        const ggml_tensor * st = kv->get_k_storage(n.first);
+        if (t == nullptr || t->op != GGML_OP_SET_ROWS || st == nullptr || st->buffer == nullptr) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(st->buffer);
+        bool placed = false;
+        for (ggml_backend_t b : backends) {
+            if (ggml_backend_supports_buft(b, buft) && ggml_backend_supports_op(b, t)) {
+                placed = true;
+                break;
+            }
+        }
+        if (placed) {
+            continue;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        const std::string ok = qsa_idx_types_taken(dev, t);
+        return format("QSA layer %d: the indexer K cache (%s, on %s) is written by SET_ROWS '%s', which device %s does not take for "
+                "this type, and no other backend can write that buffer: the scheduler cannot place the node; use "
+                "--cache-type-k-idx auto%s%s", n.first, ggml_type_name(st->type), ggml_backend_buft_name(buft), t->name,
+                dev ? ggml_backend_dev_name(dev) : "?", ok.empty() ? "" : " or a type it takes here: ", ok.c_str());
+    }
+    return "";
+}
+
 static std::string qsa_guard_indexer(const llm_graph_result * res, ggml_backend_sched_t sc, const llama_memory_i * memory) {
     const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory);
     const llama_kv_cache * kv = mem ? mem->get_mem_idx() : nullptr;
     if (kv == nullptr) {
         return "";
     }
-    static const ggml_type types[] = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
-                                       GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
     for (const auto & n : res->get_qsa_idx_nodes()) {
         const ggml_tensor * st = kv->get_k_storage(n.first);
         ggml_tensor * t = n.second;
@@ -1054,24 +1122,8 @@ static std::string qsa_guard_indexer(const llm_graph_result * res, ggml_backend_
             continue;
         }
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        // the indexer types this device takes for the same node (the GET_ROWS source / the SET_ROWS destination retyped)
-        std::string ok;
-        if (dev && (t->op == GGML_OP_GET_ROWS || t->op == GGML_OP_SET_ROWS)) {
-            ggml_init_params ip = { 2 * std::size(types) * ggml_tensor_overhead(), nullptr, true };
-            ggml_context_ptr ctx { ggml_init(ip) };
-            const ggml_tensor * base = t->op == GGML_OP_GET_ROWS ? t->src[0] : t;
-            for (const ggml_type ty : types) {
-                if (base->ne[0] % ggml_blck_size(ty) != 0) {
-                    continue;
-                }
-                ggml_tensor * a = ggml_new_tensor_4d(ctx.get(), ty, base->ne[0], base->ne[1], base->ne[2], base->ne[3]);
-                ggml_tensor * op = t->op == GGML_OP_GET_ROWS ? ggml_get_rows(ctx.get(), a, t->src[1])
-                                                             : ggml_set_rows(ctx.get(), a, t->src[1], t->src[2]);
-                if (ggml_backend_dev_supports_op(dev, op)) {
-                    ok += (ok.empty() ? "" : ", ") + std::string(ggml_type_name(ty));
-                }
-            }
-        }
+        // the indexer types this device takes for the same node
+        const std::string ok = qsa_idx_types_taken(dev, t);
         return format("QSA layer %d: the indexer K cache (%s, on %s) is %s by %s '%s', which device %s does not take for this "
                 "type: the scheduler would run it on the CPU and copy the cache to the host every ubatch; use "
                 "--cache-type-k-idx auto%s%s", n.first, ggml_type_name(st->type), ggml_backend_buft_name(buft),
@@ -2401,6 +2453,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // an indexer cache writer no backend can place makes the scheduler abort (qsa_guard_indexer_writer)
+        if (!res->get_qsa_idx_nodes().empty()) {
+            const std::string err = qsa_guard_indexer_writer(res, memory.get(), backend_ptrs);
+            if (!err.empty()) {
+                LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+
         const auto t_alloc_us = ggml_time_us();
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -3601,6 +3663,14 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+
+    // an indexer cache writer no backend can place makes the scheduler abort: the init error instead
+    if (gf && !res->get_qsa_idx_nodes().empty()) {
+        const std::string err = qsa_guard_indexer_writer(res, memory.get(), backend_ptrs);
+        if (!err.empty()) {
+            throw std::runtime_error(err);
+        }
+    }
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
