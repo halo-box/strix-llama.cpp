@@ -10,8 +10,11 @@
 //               the workspace overlaps it (dst does not, so the barrier tracker sees nothing; the sync rule is all that orders them).
 //               The test asserts that layout from tensor->data and get_alloc_size and FAILS when it does not hold; then the outputs
 //               must be memcmp-stable over 20 iterations and bitwise equal to the same graph with the tensor kept alive.
+//   dense       ggml_backend_sparse_attn_prefer_dense picks the dense FLASH_ATTN_EXT only where the device's FLASH_ATTN_EXT
+//               takes the pair and only on the cm tier (its table was measured there): on a portable or scalar device, and
+//               on one without subgroup vote / shuffle, the QSA shortcut stays on the sparse op, which that tier runs.
 //
-// Without a Vulkan backend it exits 0 ("skipped"). usage: test-sparse-attn-vk [limits|capability|rot|stress ...]
+// Without a Vulkan backend it exits 0 ("skipped"). usage: test-sparse-attn-vk [limits|capability|rot|stress|dense ...]
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -473,6 +476,72 @@ static void test_stress() {
     }
 }
 
+// ---- dense -----------------------------------------------------------------------------------------------------------
+
+// the tier this process runs: the census key of the tier's f16 attend is launchable (ggml_vk_sa_census_skip)
+static const char * vk_tier_now() {
+    auto skip = (const char * (*)(ggml_backend_t, const char *)) ggml_backend_reg_get_proc_address(g_reg, "ggml_backend_debug_dispatch_census_skip");
+    GGML_ASSERT(skip);
+    if (skip(g_backend, "sa_attend/vk/cm/direct/f16/f16") == nullptr || skip(g_backend, "sa_attend/vk/cm/staged/f16/f16") == nullptr ||
+        skip(g_backend, "sa_attend/vk/cm/pack/f16/f16") == nullptr) {
+        return "cm";
+    }
+    if (skip(g_backend, "sa_attend/vk/scalar/staged/f16/f16") == nullptr) {
+        return "scalar";
+    }
+    if (skip(g_backend, "sa_attend/vk/portable/staged/f16/f16") == nullptr) {
+        return "portable";
+    }
+    return "none";
+}
+
+// a FLASH_ATTN_EXT of the dense shortcut's shape (qwen4exp: D 256, 24 heads, 2 KV heads, causal f16 mask)
+static bool fa_supported(ggml_type tk, ggml_type tv, int64_t n_q, int64_t n_kv) {
+    ggml_context * ctx = new_ctx(1 << 20);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_q, 24, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, tk, 256, n_kv, 2, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, tv, 256, n_kv, 2, 1);
+    ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v, m, 0.0625f, 0.0f, 0.0f);
+    const bool ok = ggml_backend_dev_supports_op(g_dev, fa);
+    ggml_free(ctx);
+    return ok;
+}
+
+static void test_dense() {
+    printf("dense: the shortcut's dense pick is an op this device runs, on the tier its table was measured on\n");
+    auto prefer = (bool (*)(ggml_backend_dev_t, ggml_type, ggml_type, int64_t, int64_t))
+        ggml_backend_reg_get_proc_address(g_reg, "ggml_backend_sparse_attn_prefer_dense");
+    GGML_ASSERT(prefer);
+    const ggml_type types[] = { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL };
+    for (const char * force : { (const char *) nullptr, "scalar", "portable" }) {
+        set_force(force);
+        const std::string tier = vk_tier_now();
+        int n_dense = 0, n_cells = 0;
+        for (ggml_type tk : types) {
+            for (ggml_type tv : types) {
+                for (int64_t n_q : { 1, 8, 32, 127, 128, 511, 1024 }) {
+                    const int64_t n_kv = 2048;
+                    const bool dense = prefer(g_dev, tk, tv, n_q, n_kv);
+                    n_cells++;
+                    n_dense += dense;
+                    if (!dense) {
+                        continue;
+                    }
+                    CHECK(tier == "cm", "force %s: dense picked for %s/%s n_q %d on the %s tier (the table was measured on cm only)",
+                          force ? force : "none", ggml_type_name(tk), ggml_type_name(tv), (int) n_q, tier.c_str());
+                    CHECK(fa_supported(tk, tv, n_q, n_kv), "force %s: dense picked for %s/%s n_q %d but this device's FLASH_ATTN_EXT rejects it",
+                          force ? force : "none", ggml_type_name(tk), ggml_type_name(tv), (int) n_q);
+                }
+            }
+        }
+        printf("  force %-8s tier %-8s: dense %d of %d cells; FLASH_ATTN_EXT f16/f16 %s, q8_0/q8_0 %s\n", force ? force : "none", tier.c_str(),
+               n_dense, n_cells, fa_supported(GGML_TYPE_F16, GGML_TYPE_F16, 16, 2048) ? "supported" : "unsupported",
+               fa_supported(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 16, 2048) ? "supported" : "unsupported");
+    }
+    set_force(nullptr);
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
     g_reg = ggml_backend_reg_by_name("Vulkan");
@@ -494,6 +563,7 @@ int main(int argc, char ** argv) {
     if (on("capability")) test_capability();
     if (on("rot"))        test_rot();
     if (on("stress"))     test_stress();
+    if (on("dense"))      test_dense();
 
     ggml_backend_free(g_backend);
     printf("%s: %d failed checks\n", g_fail == 0 ? "OK" : "FAILED", g_fail);
