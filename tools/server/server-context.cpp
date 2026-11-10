@@ -2055,8 +2055,24 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                bool loaded = ret->prompt_load(*prompt_cache, task.tokens);
+
+                if (!loaded) {
+                    // the failed restore has emptied the slot's sequence, so its tokens no longer describe it
                     ret->prompt_clear();
+
+                    // a full unified KV pool has no free cells to restore into
+                    // purge idle slots, least recently used first and each saved to the cache, until the restore fits
+                    // those saves can evict the entry that is to be restored: stop then, purging more has no purpose
+                    const uint64_t id_wanted = prompt_cache->id_failed;
+
+                    while (!loaded && prompt_cache->contains(id_wanted) && try_clear_idle_slots()) {
+                        loaded = ret->prompt_load(*prompt_cache, task.tokens);
+                    }
+
+                    if (!loaded) {
+                        ret->prompt_clear();
+                    }
                 }
 
                 prompt_cache->update();
