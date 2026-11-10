@@ -1701,8 +1701,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
         const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
-        // [width, n_query, 1, n_stream], the layout of the sparse plan's rows
-        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx0, expanded, width);
+        // [width, n_query, 1, n_stream], the layout of the sparse plan's rows. The visibility of a picked cell is read from
+        // the mask (or the per-cell bias) as stored, not from expanded or the mask cast: expanded's only consumer stays the
+        // TOP_K, which the Vulkan TOPK_QSA fusion requires (qwen4exp-te.h)
+        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx0, expanded, blk_bias ? query_mask : bias, width);
         cb(sel.top_k, "indexer_top_k", il);
         qwen4exp_append_strip(ctx0, gf, selected, sel.rows);
     }

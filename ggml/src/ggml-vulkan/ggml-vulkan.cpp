@@ -21222,7 +21222,15 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
-        if (keep_pattern(topk_qsa_pattern)) {
+        // TOPK_QSA: the fused radix top-k reads the score copy, the cell blocks and the f16 mask while it writes the picks, so
+        // the chain's sources stay allocated through the TOP_K. Without that ggml-alloc may put the TOP_K output on the score
+        // copy or the mask cast once the ADD has run (an intermediate TOP_K, as build_qsa_top_k emits it), and the overlap
+        // check below disables the fusion (test-backend-ops census TOPK_QSA ...,strip=te at n_tps 1)
+        if (match_pattern(topk_qsa_pattern, first_unused)) {
+            if (params && params->add_alloc_dep) {
+                add_pattern_alloc_deps(topk_qsa_pattern, first_unused + (int) topk_qsa_pattern.size() - 1);
+            }
+            keep_pattern(topk_qsa_pattern);
             continue;
         }
         // QSA scorer chain (QSA_SCORE), prefill only: the fusion needs more than 64 query-head columns; decode keeps its order.

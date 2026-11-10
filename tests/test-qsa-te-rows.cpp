@@ -12,13 +12,17 @@
 //   PR219: the masked route's mask from the same top_k (PR219 qwen4exp.cpp build_attn_qsa, kept verbatim here:
 //          fill(-inf), set_rows of zeros at the top-k cells, + kq_mask), whose cells at 0 are the attended set.
 // Pass: for every row the set {rows >= 0} equals {j : PR219 mask[j] == 0}, rows lists no cell twice, every listed cell is
-// one top_k picked, and (host check) PR219's set equals {top_k[i] : kq_mask[top_k[i]] == 0}.
+// one top_k picked, and (host check) PR219's set equals {top_k[i] : kq_mask[top_k[i]] == 0}. Also, per strip, the use
+// counts of the graph's expanded chain are the ones the Vulkan TOPK_QSA fusion requires (ggml_vk_can_fuse_topk_qsa:
+// GET_ROWS, PERMUTE, CONT, RESHAPE, ADD one use each, the mask CPY two, its own dst included), so the production ops never
+// give expanded a second consumer (fusion_uses below).
 // usage: test-qsa-te-rows [backend name substring]
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include "../src/models/qwen4exp-te.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include <algorithm>
 #include <cmath>
@@ -187,6 +191,37 @@ struct case_t {
 
 struct stats { int64_t rows = 0, mism = 0, dup = 0, not_picked = 0, host_mism = 0, underfull = 0, dropped = 0, bias_ninf_vis = 0; };
 
+// The use counts ggml_vk_can_fuse_topk_qsa requires of the nodes it replaces (ggml-vulkan.cpp: every node before the TOP_K
+// single-use, the CPY two uses because it counts its own dst): GET_ROWS -> PERMUTE -> CONT -> ADD <- RESHAPE <- CPY, the
+// ADD feeding the TOP_K. "" when every strip's chain has them, else the first offender.
+static std::string fusion_uses(ggml_cgraph * gf, const std::vector<ggml_tensor *> & expanded) {
+    std::map<const ggml_tensor *, int> idx;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        idx[ggml_graph_node(gf, i)] = i;
+    }
+    for (ggml_tensor * add : expanded) {
+        ggml_tensor * cont    = add->src[0];
+        ggml_tensor * permute = cont ? cont->src[0] : nullptr;
+        ggml_tensor * gr      = permute ? permute->src[0] : nullptr;
+        ggml_tensor * reshape = add->src[1];
+        ggml_tensor * cpy     = reshape ? reshape->src[0] : nullptr;
+        const struct { ggml_tensor * t; ggml_op op; int32_t want; const char * what; } chain[] = {
+            { gr, GGML_OP_GET_ROWS, 1, "GET_ROWS" }, { permute, GGML_OP_PERMUTE, 1, "PERMUTE" }, { cont, GGML_OP_CONT, 1, "CONT" },
+            { cpy, GGML_OP_CPY, 2, "CPY (mask cast)" }, { reshape, GGML_OP_RESHAPE, 1, "RESHAPE" }, { add, GGML_OP_ADD, 1, "ADD (expanded)" },
+        };
+        for (const auto & e : chain) {
+            if (e.t == nullptr || e.t->op != e.op || idx.count(e.t) == 0) {
+                return std::string(e.what) + " is not in the graph where the pattern expects it";
+            }
+            const int32_t n = ggml_node_get_use_count(gf, idx[e.t]);
+            if (n != e.want) {
+                return std::string(e.what) + " has " + std::to_string(n) + " uses, the fusion needs " + std::to_string(e.want);
+            }
+        }
+    }
+    return "";
+}
+
 static void run_case(ggml_backend_t be, const char * bname, case_t & c) {
     const int64_t n_stream = (int64_t) c.streams.size();
     const int64_t n_tps = (int64_t) c.streams[0].queries.size();
@@ -245,7 +280,7 @@ static void run_case(ggml_backend_t be, const char * bname, case_t & c) {
     // the strip loop of build_qsa_top_k (non-compact, blk_bias): strip views of the bias and the mask, the score biased per
     // block, then the production ops of qwen4exp-te.h
     ggml_tensor * biased = ggml_add(ctx, t_score, t_bias);
-    std::vector<ggml_tensor *> rows_s, topk_s;
+    std::vector<ggml_tensor *> rows_s, topk_s, expanded_s;
     for (int64_t first = 0; first < n_tps; first += c.strip) {
         const int64_t n_query = std::min(c.strip, n_tps - first);
         ggml_tensor * sc = ggml_view_3d(ctx, biased, n_blocks, n_query, n_stream, biased->nb[1], biased->nb[2], first * biased->nb[1]);
@@ -254,7 +289,8 @@ static void run_case(ggml_backend_t be, const char * bname, case_t & c) {
                 first * t_mask->nb[1]);
         ggml_tensor * add = ggml_reshape_3d(ctx, ggml_cast(ctx, qm, GGML_TYPE_F32), n_kv, n_query, n_stream);
         ggml_tensor * expanded = qwen4exp_te_expand(ctx, sc, t_cblk, add);
-        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx, expanded, width);
+        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx, expanded, qm, width);
+        expanded_s.push_back(expanded);
         rows_s.push_back(sel.rows);
         topk_s.push_back(sel.top_k);
     }
@@ -286,6 +322,11 @@ static void run_case(ggml_backend_t be, const char * bname, case_t & c) {
     ggml_build_forward_expand(gf, rows);
     ggml_build_forward_expand(gf, pr219);
     ggml_build_forward_expand(gf, top_k_out);
+    const std::string uses = fusion_uses(gf, expanded_s);
+    if (!uses.empty()) {
+        printf("  [%s %s] the expanded chain cannot fuse: %s: FAIL\n", bname, c.name.c_str(), uses.c_str());
+        g_fail++;
+    }
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
         if (!ggml_backend_supports_op(be, node)) {

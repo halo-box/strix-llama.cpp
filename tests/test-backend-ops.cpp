@@ -20,6 +20,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "sparse-attn-ref.h"
+#include "../src/models/qwen4exp-te.h"
 
 #include <algorithm>
 #include <atomic>
@@ -9723,6 +9724,89 @@ struct test_topk_qsa : public test_case {
     }
 };
 
+// The non-compact strip of build_qsa_top_k as qwen4exp builds it: the production ops of src/models/qwen4exp-te.h
+// (qwen4exp_te_expand + qwen4exp_te_select) on an f16 KQ mask, the rows with -1 at the hidden cells. The Vulkan backend
+// must fuse the expanded chain into TOPK_QSA as it does test_topk_qsa (the base's single-use pattern): a second consumer
+// of expanded (the visibility gather) kept the fusion from ever firing on this route. Mask: a distinct ramp with every
+// seventh cell -inf, so the picks have no ties and some picked cells are hidden.
+struct test_qsa_te_strip : public test_case {
+    const int64_t n_blocks;
+    const int64_t n_kv;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const int     width;
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_TE_STRIP";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_blocks, n_kv, n_tps, n_stream, width) + ",strip=te";
+    }
+
+    test_qsa_te_strip(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500)
+        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width) {}
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * score = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tps, n_stream);
+        ggml_set_name(score, "score");
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+        ggml_set_name(cell_blk, "cell_blk");
+        ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+        ggml_set_name(kq_mask, "kq_mask");
+
+        // build_qsa_top_k, non-compact with blk_bias: the f16 mask cast for the add, the mask itself for the visibility
+        ggml_tensor * add = ggml_reshape_3d(ctx, ggml_cast(ctx, kq_mask, GGML_TYPE_F32), n_kv, n_tps, n_stream);
+        ggml_tensor * expanded = qwen4exp_te_expand(ctx, score, cell_blk, add);
+        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx, expanded, kq_mask, width);
+        out = sel.rows;
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (auto & v : data) { v = rand() % n_blocks; }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    for (int64_t i = 0; i < n_kv; i++) {
+                        data[r * n_kv + i] = ggml_fp32_to_fp16(i % 7 == 3 ? -INFINITY : (float) i);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t, 0.0f, 0.5f);
+            }
+        }
+    }
+
+    // the order inside a row is unspecified; compare each row of width entries as a sorted list (-1 entries included)
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t r0 = 0; r0 + width <= n; r0 += width) {
+            std::vector<int32_t> ia(a + r0, a + r0 + width), ib(b + r0, b + r0 + width);
+            std::sort(ia.begin(), ia.end());
+            std::sort(ib.begin(), ib.end());
+            diff += ia != ib ? 1.0 : 0.0;
+        }
+        return diff;
+    }
+};
+
 // qwen4exp QSA indexer scorer: MUL_MAT(pooled keys, q) -> relu -> 4-head sum (-> + block bias), the chain build_qsa_top_k
 // emits for one query strip; the Vulkan backend fuses it into one GEMM epilogue (QSA_SCORE, GGML_VK_QSA_SCORE). n_pool > n_blocks
 // scores a leading view of the pooled keys (the score_key_limits bound); q_first > 0 or q_rows > n_tps scores a strip view of a
@@ -17609,6 +17693,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
+    test_cases.emplace_back(new test_qsa_te_strip(512,  2048,  2, 1, 1500));
+    test_cases.emplace_back(new test_qsa_te_strip(256,  2048,  4, 2, 2000));
 
     // qwen4exp QSA indexer scorer (QSA_SCORE on Vulkan): K, blocks, queries, streams, bias, exact, pooled blocks, q_first, q rows
     test_cases.emplace_back(new test_qsa_score(128, 8192, 512, 1, false));                  // FN strip: 8192 blocks x 512 queries
@@ -19519,6 +19605,14 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("CONCAT_SSM_CONV_SILU", new test_ssm_conv_direct(130, 9, 1, 4), "CONCAT_SSM_CONV_SILU/2=1;CONCAT_TAIL/1=1");
     add("SNAKE",               new test_snake_fuse(GGML_TYPE_F32, { 128, 16, 1, 1 }), "SNAKE/5=1");
     add("TOPK_QSA",            new test_topk_qsa(512, 2048, 2, 1, 1500), "TOPK_QSA/7=1");
+    // the production non-compact strip (qwen4exp-te.h): the expanded chain fuses although the rows read the mask again.
+    // n_tps 1 and the split streams: the TOP_K is an intermediate there, so the fusion also needs the chain's sources kept
+    // allocated through it (graph_optimize alloc deps), else ggml-alloc reuses the score copy / mask cast for its output
+    add("TOPK_QSA",            new test_qsa_te_strip(512, 2048, 2, 1, 1500), "TOPK_QSA/7=1");
+    add("TOPK_QSA",            new test_qsa_te_strip(512, 2048, 1, 1, 1499), "TOPK_QSA/7=1");
+    add("TOPK_QSA",            new test_qsa_te_strip(256, 2048, 4, 2, 1999), "TOPK_QSA/7=1");
+    add("TOPK_QSA",            new test_topk_qsa(512, 2048, 1, 1, 1499), "TOPK_QSA/7=1");
+    add("TOPK_QSA",            new test_topk_qsa(256, 2048, 4, 2, 1999), "TOPK_QSA/7=1");
     add("QSA_EXPAND",          new test_qsa_expand(700, 9), "QSA_EXPAND/20=1");
     add("QSA_EXPAND",          new test_qsa_expand(2048, 4, 1, 2, 1), "QSA_EXPAND/21=2");
     add("QSA_SCORE",           new test_qsa_score(128, 512, 128, 1, false), "QSA_SCORE/11=1");
