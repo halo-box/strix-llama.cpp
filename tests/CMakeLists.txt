@@ -203,6 +203,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-qsa-reserve-view.cpp LINK llama)
     # the QSA reserve pass list (llama_qsa_reserve_passes) builds the one-stream shortcut graph of a split multi-sequence context
     llama_build_and_test(test-qsa-reserve-passes.cpp LINK llama)
+    # the always-on QSA graph-build check fails non-compact ubatches only where block selection is eligible
+    llama_build_and_test(test-qsa-noncompact-check.cpp)
     # PLAN-v3 W11: the indexer cache type (qwen4exp auto, GLM5_NEXT unchanged) and the session-state check of an old indexer type
     llama_build_and_test(test-qsa-idx-type.cpp LINK llama)
     # the "supported here" list of the QSA init error probes nine types without running out of its ggml context
