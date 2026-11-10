@@ -1165,7 +1165,8 @@ static void qwen4exp_qsa_check_context(llama_split_mode split_mode, uint32_t n_c
     if (split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw std::runtime_error("QSA sparse attention is not supported with --split-mode tensor: the meta backend has no SPARSE_ATTN handler; use --split-mode layer or none");
     }
-    // §4.4: the largest n_kv an op test has run (the first f16 K view >= 2 GiB, 2^21 + 4 cells); 1M+ runtime is U12
+    // §4.4: the largest n_kv of the f16 op test (the first f16 K view >= 2 GiB, 2^21 + 4 cells, its rows past byte
+    // INT32_MAX selected); the q8_0 op case at 2^22 + 4 cells checks the loaders' offsets only; 1M+ runtime is U12
     constexpr uint32_t max_n_ctx_seq = (1u << 21) + 4;
     if (n_ctx_seq > max_n_ctx_seq) {
         throw std::runtime_error(format("QSA sparse attention: n_ctx_seq = %u is above the tested maximum of %u cells", n_ctx_seq, max_n_ctx_seq));

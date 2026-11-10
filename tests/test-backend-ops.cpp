@@ -13086,6 +13086,7 @@ enum sa_rows_pattern {
     SA_ROWS_EMPTY,   // SA_ROWS_MIX, every third query row all -1
     SA_ROWS_POISON,  // cells 4*quad + c with c in {0, 1, 2} minus (query % 3) of shared quads; cell 4*quad + 3 is never selected
     SA_ROWS_SINGLE,  // one valid cell per row
+    SA_ROWS_TAIL,    // SA_ROWS_MIX with the last 4 cells of the cache (n_kv - 4 .. n_kv - 1) in the first 4 entries of every row
 };
 
 static const char * sa_rows_name(int p) {
@@ -13104,6 +13105,7 @@ static const char * sa_rows_name(int p) {
         case SA_ROWS_EMPTY:  return "empty";
         case SA_ROWS_POISON: return "poison";
         case SA_ROWS_SINGLE: return "single";
+        case SA_ROWS_TAIL:   return "tail";
     }
     return "?";
 }
@@ -13163,6 +13165,7 @@ static std::vector<int32_t> sa_make_rows(int pattern, int64_t n_sel, int64_t n_q
                     }
                 } break;
                 case SA_ROWS_MIX:
+                case SA_ROWS_TAIL:
                 case SA_ROWS_EMPTY: {
                     if (pattern == SA_ROWS_EMPTY && i % 3 == 2) {
                         break;
@@ -13181,6 +13184,9 @@ static std::vector<int32_t> sa_make_rows(int pattern, int64_t n_sel, int64_t n_q
                         } else {
                             row[j] = oob[uni(5)];
                         }
+                    }
+                    for (int64_t c = 0; pattern == SA_ROWS_TAIL && c < 4 && c < n_sel && c < n_kv; ++c) {
+                        row[c] = (int32_t) (n_kv - 4 + c);
                     }
                 } break;
                 case SA_ROWS_BLOCKS: {
@@ -13668,11 +13674,44 @@ struct test_sparse_attn : public test_case {
         return band;
     }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        if (!reach_msg.empty()) {
+            msg = reach_msg;
+            return false;
+        }
         if (!sa_is_cpu(backend) && band < 0) {
             msg = "SPARSE_ATTN band class unknown (" + band_class + ")";
             return false;
         }
         return true;
+    }
+
+    // non-vacuity of the large-cache cases: a K or V storage with bytes past INT32_MAX must have a selected cell whose row
+    // (of some KV head) ends past that byte, or a 32-bit byte offset in a loader (cell * nb1 + head * nb2 in int32) is
+    // never exercised. Set by initialize_tensors, checked on every backend by verify_engagement.
+    std::string reach_msg;
+    void check_reach(const std::vector<int32_t> & rows) {
+        reach_msg.clear();
+        for (const ggml_tensor * st : { (const ggml_tensor *) k_st, (const ggml_tensor *) v_st }) {
+            if (ggml_nbytes(st) - 1 <= (size_t) INT32_MAX) {
+                continue;
+            }
+            const size_t rb = ggml_row_size(st->type, D);
+            size_t last = 0;   // the last byte of a selected row
+            for (int64_t s = 0; s < n_stream; ++s) {
+                for (size_t j = 0; j < (size_t) (n_q * n_sel); ++j) {
+                    const int32_t c = rows[(size_t) (s * n_q * n_sel) + j];
+                    if (c < 0 || c >= n_kv) continue;
+                    for (int64_t g = 0; g < n_head_kv; ++g) {
+                        last = std::max(last, kv_offset(st, c, g, s) + rb - 1);
+                    }
+                }
+            }
+            if (last <= (size_t) INT32_MAX) {
+                reach_msg = std::string(st == k_st ? "K" : "V") + " storage of " + std::to_string(ggml_nbytes(st)) +
+                            " bytes, but no selected row reaches past byte INT32_MAX (last selected byte " + std::to_string(last) + ")";
+                return;
+            }
+        }
     }
 
     // contract value of V's element d of cell c (kv head g, stream s): to_float rounded to f16
@@ -13859,6 +13898,7 @@ struct test_sparse_attn : public test_case {
         }
         // the K/V storages live in ctx, or in ctx_weights for the at_end cases (initialize_tensors runs once per context)
         if (ctx_has(ctx, k_st)) {
+            check_reach(rows);
             init_kv(k_st, rows, 11);
             init_kv(v_st, rows, 17);
             if (special == SA_POISON) {
@@ -14532,9 +14572,13 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
         }
         for (int64_t nk : {4096, 32768, 65536, 270336}) test_cases.emplace_back(new test_sparse_attn(t, t, 9, nk, 2051, 1, SA_ROWS_MIX));
         test_cases.emplace_back(new test_sparse_attn(t, t, 1, 1048576, 2051, 1, SA_ROWS_MIX));
-        // the first f16 K view >= 2 GiB: offsets past INT32_MAX bytes
-        test_cases.emplace_back(new test_sparse_attn(t, t, 1, ((int64_t) 1 << 21) + 4, 2051, 1, SA_ROWS_MIX));
+        // the first f16 K view >= 2 GiB: offsets past INT32_MAX bytes. The rows hold the last 4 cells (SA_ROWS_TAIL), whose
+        // f16 rows end past byte 2^31 (cell 2^21 at 1024 B per cell); check_reach fails a case whose storage passes INT32_MAX
+        // without such a row (the MIX rows of this shape reached byte 2146605568 only)
+        test_cases.emplace_back(new test_sparse_attn(t, t, 1, ((int64_t) 1 << 21) + 4, 2051, 1, t == F16 ? SA_ROWS_TAIL : SA_ROWS_MIX));
     }
+    // the q8_0 K / V views past INT32_MAX bytes: 2^22 + 4 cells of 2 x 272 B (2.28 GB each), the last 4 cells selected
+    test_cases.emplace_back(new test_sparse_attn(Q8, Q8, 1, ((int64_t) 1 << 22) + 4, 2051, 1, SA_ROWS_TAIL));
     test_cases.emplace_back(new test_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, 1, 1048576, 2051, 1, SA_ROWS_MIX));
     // GQA 4, 8, 12
     for (int gqa : {4, 8, 12}) {
