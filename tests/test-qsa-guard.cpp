@@ -11,12 +11,17 @@
 //                                             of IQ4_NL rows whose width is not a multiple of 256, with --cache-type-k-idx T:
 //                                             iq4_nl (128-wide indexer rows) must be an init error naming the indexer cache,
 //                                             any other T must create the context
+//   test-qsa-guard <model.gguf> causal-sync  on the CPU, n_seq_max 2, unified: the hybrid-idx memory sees the context's
+//                                             causal attention (the NC0 re-split applies only under it): false after init
+//                                             with LLAMA_ATTENTION_TYPE_NON_CAUSAL, true after llama_set_causal_attn(true);
+//                                             and the model's QSA ratios stay NC0 ratios (the eligibility filter)
 // Exit status 0 = the expectation held.
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "llama.h"
+#include "../src/llama-memory-hybrid-idx.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -154,7 +159,7 @@ static ggml_type type_of(const char * s) {
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s model.gguf pass [ctk] | fake | fake-idx <type> | reject | reject-decode\n", argv[0]);
+        fprintf(stderr, "usage: %s model.gguf pass [ctk] | fake | fake-idx <type> | reject | reject-decode | causal-sync\n", argv[0]);
         return 2;
     }
     const std::string mode = argv[2];
@@ -167,6 +172,10 @@ int main(int argc, char ** argv) {
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 99;
     mp.no_alloc = mode != "reject-decode";
+    if (mode == "causal-sync") {
+        mp.load_mode = LLAMA_LOAD_MODE_NONE;   // no_alloc on the CPU device: nothing is mapped or read
+        mp.lazy_mode = LLAMA_LAZY_MODE_OFF;
+    }
 
     ggml_backend_dev_t devs[2] = { nullptr, nullptr };
     g_fake_idx = mode == "fake-idx";
@@ -196,6 +205,11 @@ int main(int argc, char ** argv) {
 
     if (mode == "reject") {
         setenv("GGML_CUDA_SA_REJECT", "1", 1);
+    }
+    if (mode == "causal-sync") {
+        cp.n_seq_max = 2;
+        cp.kv_unified = true;
+        cp.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
     }
 
     g_log.clear();
@@ -249,6 +263,31 @@ int main(int argc, char ** argv) {
             rc = fail("context creation with this indexer type");
         } else {
             printf("context created with the %s indexer cache\n", ggml_type_name(type));
+        }
+    } else if (mode == "causal-sync") {
+        const auto * mem = ctx ? dynamic_cast<const llama_memory_hybrid_idx *>(llama_get_memory(ctx)) : nullptr;
+        if (mem == nullptr) {
+            rc = fail("context creation with a hybrid-idx memory");
+        } else {
+            const bool at_init = mem->qsa_causal_attn();
+            llama_set_causal_attn(ctx, true);
+            const bool after_set = mem->qsa_causal_attn();
+            llama_set_causal_attn(ctx, false);
+            const bool after_unset = mem->qsa_causal_attn();
+            printf("memory causal attention: %d after a non-causal init, %d after set(true), %d after set(false)\n", at_init, after_set, after_unset);
+            if (at_init || !after_set || after_unset) {
+                rc = fail("the memory's causal attention does not follow the context");
+            }
+            // the model's QSA layers keep their NC0 ratio (Qwen3.8: ratio 4, top-k 2048, head 256): the eligibility filter
+            // must not drop a layer block selection runs on
+            std::string ratios;
+            for (uint32_t r : mem->qsa_nc0_ratios()) {
+                ratios += (ratios.empty() ? "" : ", ") + std::to_string(r);
+            }
+            printf("NC0 ratios: %s\n", ratios.empty() ? "none" : ratios.c_str());
+            if (mem->qsa_nc0_ratios().empty()) {
+                rc = fail("no NC0 ratio: the re-split would never run for this model");
+            }
         }
     } else if (mode == "reject-decode") {
         if (ctx == nullptr) {
