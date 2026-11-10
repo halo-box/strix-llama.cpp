@@ -435,6 +435,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-sparse-attn-rot.cpp LINK ggml)
     # the SPARSE_ATTN alloc size as an RPC server computes it (the plan's own source not linked) equals the linked one, per device
     llama_build_and_test(test-sparse-attn-rpc-view.cpp LINK ggml)
+    # the HIP gated SPARSE_ATTN fusion places an output that overlaps a read in graph memory, never in the pool (D12); host only
+    llama_build_and_test(test-sparse-attn-gate-scratch.cpp LINK ggml)
     # the QSA placement guard (PLAN-v3 §10): needs a qwen4exp model on the command line (fake GPU device, forced reject, non-vacuity)
     llama_build(test-qsa-guard.cpp LINK llama ggml)
     # census rows from the shipped policy, for scripts/qsa-validation/census_check.py (PLAN-v3 §14.3)
