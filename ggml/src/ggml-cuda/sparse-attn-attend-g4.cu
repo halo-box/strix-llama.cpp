@@ -215,6 +215,11 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
         r.why = "malformed SPARSE_ATTN node";
         return r;
     }
+    // the invariants of ggml_sparse_attn (K / V rows and heads the kernels read, the plan's size): a node an RPC server
+    // deserialized was never built by it, so supports_op and sa_run (an abort) must not take them for granted
+    if ((r.why = ggml_sparse_attn_shape_why(op)) != nullptr) {
+        return r;
+    }
     r.G         = ggml_get_op_params_i32(plan, 1);
     r.n_kv      = ggml_get_op_params_i32(plan, 0);
     r.n_quads   = (r.n_kv + 3) / 4;

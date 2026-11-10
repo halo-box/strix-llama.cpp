@@ -592,6 +592,9 @@ static bool sa_plan_group_compiled(const int group) {
 
 bool ggml_cuda_sparse_attn_plan_supported(int device, const ggml_tensor * op) {
     GGML_UNUSED(device);   // integer kernels without arch-specific instructions: every HIP device
+    if (ggml_sparse_attn_plan_shape_why(op) != nullptr) {   // an RPC server's node was never built by ggml_sparse_attn_plan
+        return false;
+    }
     const ggml_tensor * sel = op->src[0];
     if (sel == nullptr || sel->type != GGML_TYPE_I32 || op->type != GGML_TYPE_I8 || !ggml_is_contiguous(op)) {
         return false;

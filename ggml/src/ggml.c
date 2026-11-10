@@ -6705,6 +6705,8 @@ struct ggml_tensor * ggml_sparse_attn_plan(
     result->op     = GGML_OP_SPARSE_ATTN_PLAN;
     result->src[0] = sel;
 
+    GGML_ASSERT(ggml_sparse_attn_plan_shape_why(result) == NULL);
+
     return result;
 }
 
@@ -6760,7 +6762,92 @@ struct ggml_tensor * ggml_sparse_attn(
     result->src[2] = v;
     result->src[3] = plan;
 
+    GGML_ASSERT(ggml_sparse_attn_shape_why(result) == NULL);
+
     return result;
+}
+
+const char * ggml_sparse_attn_plan_shape_why(const struct ggml_tensor * op) {
+    if (op == NULL || op->op != GGML_OP_SPARSE_ATTN_PLAN || op->type != GGML_TYPE_I8) {
+        return "not an I8 SPARSE_ATTN_PLAN node";
+    }
+    const struct ggml_tensor * sel = op->src[0];
+    if (sel == NULL || sel->type != GGML_TYPE_I32 || sel->nb[0] != sizeof(int32_t)) {
+        return "sel missing, or not I32 with contiguous rows";
+    }
+    const int64_t n_kv  = ggml_get_op_params_i32(op, 0);
+    const int32_t group = ggml_get_op_params_i32(op, 1);
+    if (n_kv < 1 || n_kv > ((int64_t) 1 << 24) || (group != 1 && group != 4)) {
+        return "plan op_params out of range (n_kv in [1, 2^24], G in {1, 4})";
+    }
+    if (sel->ne[0] < 1 || sel->ne[1] < 1 || sel->ne[2] != 1 || sel->ne[3] < 1 || sel->ne[1] > UINT32_MAX || sel->ne[3] > UINT32_MAX ||
+        ggml_get_op_params_i32(op, 2) != sel->ne[0] || ggml_get_op_params_i32(op, 3) != sel->ne[1] || ggml_get_op_params_i32(op, 4) != sel->ne[3]) {
+        return "the plan's op_params do not name sel's shape";
+    }
+    if (ggml_nbytes(op) != ggml_sparse_attn_plan_nbytes(sel->ne[0], sel->ne[1], sel->ne[3], n_kv, group)) {
+        return "the plan's size does not match its op_params";
+    }
+    return NULL;
+}
+
+const char * ggml_sparse_attn_shape_why(const struct ggml_tensor * op) {
+    if (op == NULL || op->op != GGML_OP_SPARSE_ATTN) {
+        return "not a SPARSE_ATTN node";
+    }
+    const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * plan = op->src[3];
+    if (q == NULL || k == NULL || v == NULL || plan == NULL) {
+        return "a source of the node is missing";
+    }
+    if (plan->op != GGML_OP_SPARSE_ATTN_PLAN || plan->type != GGML_TYPE_I8) {
+        return "src[3] is not a SPARSE_ATTN_PLAN node";
+    }
+    // the plan's op_params (ggml_sparse_attn_plan): n_kv, G, then the selection's shape n_sel, n_q, n_stream
+    const int64_t n_kv     = ggml_get_op_params_i32(plan, 0);
+    const int32_t group    = ggml_get_op_params_i32(plan, 1);
+    const int64_t n_sel    = ggml_get_op_params_i32(plan, 2);
+    const int64_t n_q_p    = ggml_get_op_params_i32(plan, 3);
+    const int64_t n_strm_p = ggml_get_op_params_i32(plan, 4);
+    if (n_kv < 1 || n_kv > ((int64_t) 1 << 24) || (group != 1 && group != 4) || n_sel < 1) {
+        return "plan op_params out of range (n_kv in [1, 2^24], G in {1, 4}, n_sel >= 1)";
+    }
+    const int64_t D         = q->ne[0];
+    const int64_t n_q       = q->ne[1];
+    const int64_t n_head    = q->ne[2];
+    const int64_t n_stream  = q->ne[3];
+    const int64_t n_head_kv = k->ne[2];
+    const int64_t n_kv4     = 4 * ((n_kv + 3) / 4);
+    if (n_q < 1 || n_stream < 1 || n_q_p != n_q || n_strm_p != n_stream) {
+        return "the plan's n_q / n_stream differ from q's";
+    }
+    if (ggml_nbytes(plan) != ggml_sparse_attn_plan_nbytes(n_sel, n_q, n_stream, n_kv, group)) {
+        return "the plan's size does not match its op_params";
+    }
+    if (q->type != GGML_TYPE_F32 || q->nb[0] != sizeof(float)) {
+        return "q is not F32 with contiguous rows";
+    }
+    if (k->ne[0] != D || v->ne[0] != D) {
+        return "K / V head size differs from q's";
+    }
+    if (n_head_kv < 1 || v->ne[2] != n_head_kv || n_head % n_head_kv != 0) {
+        return "V heads differ from K heads, or n_head is not a multiple of n_head_kv";
+    }
+    if (k->ne[3] != n_stream || v->ne[3] != n_stream) {
+        return "K / V streams differ from q's";
+    }
+    if (k->nb[0] != ggml_type_size(k->type) || ggml_blck_size(k->type) <= 0 || D % ggml_blck_size(k->type) != 0 ||
+        v->nb[0] != ggml_type_size(v->type) || ggml_blck_size(v->type) <= 0 || D % ggml_blck_size(v->type) != 0) {
+        return "a K / V row is not one contiguous row of whole blocks";
+    }
+    if (k->ne[1] < n_kv4 || v->ne[1] < n_kv4) {
+        return "the K / V views hold fewer cells than 4*ceil(n_kv/4)";
+    }
+    if (!ggml_sparse_attn_rot_ok(ggml_get_op_params_i32(op, 1), D) || !ggml_sparse_attn_rot_ok(ggml_get_op_params_i32(op, 2), D)) {
+        return "rot_q / rot_o not 0, 64, 128 or 256 dividing D";
+    }
+    if (op->type != GGML_TYPE_F32 || op->ne[0] != D || op->ne[1] != n_head || op->ne[2] != n_q || op->ne[3] != n_stream) {
+        return "dst is not F32 [D, n_head, n_q, n_stream]";
+    }
+    return NULL;
 }
 
 // ggml_dsv4_hc_comb

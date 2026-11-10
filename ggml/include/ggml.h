@@ -2683,6 +2683,15 @@ extern "C" {
             int32_t               rot_q,
             int32_t               rot_o);
 
+    // The shape invariants ggml_sparse_attn asserts, checked on an existing GGML_OP_SPARSE_ATTN node: NULL when they hold,
+    // else the first one that fails. A node deserialized by an RPC server was never built by ggml_sparse_attn (its plan
+    // also arrives without its sel: only the plan's op_params are read), so every backend's supports_op and compute run
+    // this before reading K / V rows 0 .. 4*ceil(n_kv/4) - 1 and KV heads 0 .. k->ne[2] - 1.
+    GGML_API const char * ggml_sparse_attn_shape_why(const struct ggml_tensor * op);
+    // the same for a GGML_OP_SPARSE_ATTN_PLAN node and its sel (src[0], required): the op_params name sel's shape and
+    // ggml_nbytes(dst) is the layout's nbytes, so the plan kernels' reads of sel and writes of dst stay inside both
+    GGML_API const char * ggml_sparse_attn_plan_shape_why(const struct ggml_tensor * op);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

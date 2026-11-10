@@ -28,6 +28,8 @@ size_t ggml_cpu_sparse_attn_plan_work_size(const struct ggml_tensor * node, int 
 }
 
 void ggml_compute_forward_sparse_attn_plan(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    GGML_ASSERT(ggml_sparse_attn_plan_shape_why(dst) == nullptr);
+
     const struct ggml_tensor * sel = dst->src[0];
 
     const int64_t n_sel    = sel->ne[0];
@@ -293,6 +295,9 @@ size_t ggml_cpu_sparse_attn_work_size(const struct ggml_tensor * node, int n_tas
 }
 
 void ggml_compute_forward_sparse_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    // the invariants of ggml_sparse_attn: a node an RPC server deserialized was never built by it
+    GGML_ASSERT(ggml_sparse_attn_shape_why(dst) == nullptr);
+
     const ggml_tensor * q    = dst->src[0];
     const ggml_tensor * k    = dst->src[1];
     const ggml_tensor * v    = dst->src[2];

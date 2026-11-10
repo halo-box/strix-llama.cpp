@@ -11024,6 +11024,10 @@ static vk_pipeline ggml_vk_sa_pipeline(const vk_device & device, const vk_sa_key
 
 static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_tensor * op) {
     vk_sa_selection r;
+    // the invariants of ggml_sparse_attn (K / V rows and heads the shaders read): an RPC server's node was never built by it
+    if ((r.why = ggml_sparse_attn_shape_why(op)) != nullptr) {
+        return r;
+    }
     const ggml_tensor * q = op->src[0];
     const ggml_tensor * k = op->src[1];
     const ggml_tensor * v = op->src[2];
@@ -11349,7 +11353,10 @@ static const char * ggml_backend_vk_sparse_attn_unsupported_reason(ggml_backend_
     if (ggml_backend_dev_supports_op(dev, op)) {
         return nullptr;
     }
-    const char * why = ggml_vk_sa_plan_why(device, op);
+    const char * why = ggml_sparse_attn_plan_shape_why(op);
+    if (why == nullptr) {
+        why = ggml_vk_sa_plan_why(device, op);
+    }
     return why ? why : "plan shape not supported on this Vulkan device";
 }
 
@@ -22580,7 +22587,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             // the shader block size is hardcoded to head_size 64
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
         case GGML_OP_SPARSE_ATTN_PLAN:
-            return ggml_vk_sa_plan_supported(device, op);
+            return ggml_sparse_attn_plan_shape_why(op) == nullptr && ggml_vk_sa_plan_supported(device, op);
         case GGML_OP_SPARSE_ATTN:
             return ggml_vk_sa_select(device, op).pipeline != nullptr;
         case GGML_OP_LIGHTNING_INDEXER:
