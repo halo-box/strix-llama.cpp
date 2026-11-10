@@ -58,6 +58,9 @@ static int sa_force_group(void) {
 // 65536; n_q 2 .. 512; C18 protocol, two processes). Keyed by the V type (D3: (n_q, n_kv, T_v)); n_kv is mapped to the
 // nearest measured class on a log scale (boundaries at the geometric midpoints 16384, 46341, 94118); n_kv > 135168 uses
 // the 135168 class and n_q between two tested values takes the lower one's verdict (both UNPROVEN extrapolations).
+// Re-fitted on the final kernels (Prove AT-A, scripts/qsa-validation/summaries/prove_ata.md: noise p90 0.51 % over 1188
+// samples, margin 1.52 %): 15 of the 16 cells are unchanged; V q8_0 at the 135168 class drops from 96 to 64 (wikiL_p131072
+// n_q 96: t_G1 / t_G4 = 0.994, above the 0.9848 margin, so G1 no longer wins on every fixture of the class).
 // Types outside S_fast (the generic tier, W5) keep the default n_q < 128 (C1 d3, C13 d1-d2).
 bool ggml_cuda_sa_g1_beats_g4(int64_t n_q_per_stream, int64_t n_kv, ggml_type type_k, ggml_type type_v) {
     GGML_UNUSED(type_k);
@@ -65,7 +68,7 @@ bool ggml_cuda_sa_g1_beats_g4(int64_t n_q_per_stream, int64_t n_kv, ggml_type ty
     static const int64_t nq_max[4][4] = {
         { 32, 16, 16,  64 },
         { 32, 32, 16,  64 },
-        { 32, 32, 32,  96 },
+        { 32, 32, 32,  64 },
         { 32, 64, 64, 128 },
     };
     const int tv = sa_policy_type(type_v);
