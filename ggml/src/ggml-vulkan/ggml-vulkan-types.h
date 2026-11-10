@@ -63,6 +63,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <set>
 #include <unordered_map>
 #include <shared_mutex>
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 #include <future>
@@ -1093,7 +1094,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_sparse_attn_reduce;
     vk_pipeline pipeline_sparse_attn_pack[GGML_TYPE_COUNT];
     vk_pipeline pipeline_fwht_inplace_f32[5];
-    bool sa_tier_ok[3] {};
+    // the sparse-attention tier gates (ggml_vk_load_shaders): read without compile_mutex by supports_op, get_alloc_size and
+    // the dispatch, written by every load_shaders walk with the same value
+    std::atomic<bool> sa_tier_ok[3] {};
     std::map<vk_sa_key, vk_pipeline> pipeline_sparse_attn;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;

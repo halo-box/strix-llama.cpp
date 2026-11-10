@@ -4592,24 +4592,27 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_sparse_attn_reduce, "sparse_attn_reduce", sparse_attn_reduce_len, sparse_attn_reduce_data, "main", 2,
                     sizeof(vk_op_sparse_attn_reduce_push_constants), {1, 1, 1}, {}, 1, true);
             }
-            device->sa_tier_ok[VK_SA_TIER_CM] = false;
-            device->sa_tier_ok[VK_SA_TIER_SCALAR] = false;
+            // The gates are a function of the device alone, and this block runs again on every on-demand compile while
+            // supports_op / get_alloc_size / the dispatch read them without compile_mutex: they are computed here and each one
+            // stored once (an atomic store of the same value), never cleared first, so a reader can never see a tier vanish
+            // between the alloc size and the dispatch of the same node.
+            bool ok_cm = false, ok_scalar = false;
             // portable: at most 12 invocations and 2 KiB of shared memory (K and V rows in f32)
-            device->sa_tier_ok[VK_SA_TIER_PORTABLE] = lim.maxComputeWorkGroupInvocations >= 12 && lim.maxComputeSharedMemorySize >= 2048;
+            const bool ok_portable = lim.maxComputeWorkGroupInvocations >= 12 && lim.maxComputeSharedMemorySize >= 2048;
             // the 64-lane tiers read K and V through flash_attn_dequant.glsl (16-bit storage, int8 arithmetic: a Vulkan device of this backend has them)
             const bool sa_sg64 = device->subgroup_size_control
                 ? device->subgroup_min_size <= 64 && 64 <= device->subgroup_max_size
                 : device->subgroup_size == 64;
             if (sa_sg64 && device->subgroup_shuffle && device->subgroup_arithmetic && device->fp16) {
                 // Q (1 KiB per head), a K and a V block (16 KiB each), P, the block's keys, the iq4_nl table: 46,784 bytes at GQA 12
-                device->sa_tier_ok[VK_SA_TIER_SCALAR] = 64 * 12 <= lim.maxComputeWorkGroupInvocations &&
+                ok_scalar = 64 * 12 <= lim.maxComputeWorkGroupInvocations &&
                     4 * 12 * 256 + 2 * 2 * 256 * 32 + 4 * 12 * 32 + 4 * 32 + 64 <= lim.maxComputeSharedMemorySize;
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 // the RDNA3 + RADV fragment layout; Q 8,448 B, staged V 8,192 B, H_q 12,288 B, the iq4_nl table
-                device->sa_tier_ok[VK_SA_TIER_CM] = device->subgroup_ballot && device->coopmat_support && device->coopmat_support_16x16x16_f32acc &&
+                ok_cm = device->subgroup_ballot && device->coopmat_support && device->coopmat_support_16x16x16_f32acc &&
                     device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 && device->driver_id == vk::DriverId::eMesaRadv &&
                     8448 + 8192 + 12288 + 64 <= lim.maxComputeSharedMemorySize;
-                if (device->sa_tier_ok[VK_SA_TIER_CM]) {
+                if (ok_cm) {
                     static const ggml_type sa_pack_types[8] = { GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
                     for (int i = 0; i < 8; ++i) {
                         ggml_vk_create_pipeline2(device, device->pipeline_sparse_attn_pack[sa_pack_types[i]], std::string("sparse_attn_pack_") + ggml_type_name(sa_pack_types[i]),
@@ -4618,6 +4621,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 }
 #endif
             }
+            device->sa_tier_ok[VK_SA_TIER_PORTABLE].store(ok_portable, std::memory_order_relaxed);
+            device->sa_tier_ok[VK_SA_TIER_SCALAR].store(ok_scalar, std::memory_order_relaxed);
+            device->sa_tier_ok[VK_SA_TIER_CM].store(ok_cm, std::memory_order_relaxed);
             for (auto & it : device->pipeline_sparse_attn) {
                 const vk_sa_key & key = it.first;
                 const uint32_t gqa = key.gqa;
@@ -10880,7 +10886,7 @@ static vk_sa_force_t ggml_vk_sa_force() {
 
 static vk_sa_tier ggml_vk_sa_tier(const vk_device & device) {
     const vk_sa_force_t f = ggml_vk_sa_force();
-    const auto ok = [&](int t) { return device->sa_tier_ok[t] && ((f.cap_mask >> t) & 1u) == 0; };
+    const auto ok = [&](int t) { return device->sa_tier_ok[t].load(std::memory_order_relaxed) && ((f.cap_mask >> t) & 1u) == 0; };
     if (f.tier >= 0) {
         return ok(f.tier) ? (vk_sa_tier) f.tier : VK_SA_TIER_NONE;
     }
