@@ -11214,8 +11214,30 @@ static int32_t ggml_backend_vk_sparse_attn_group(ggml_backend_dev_t, int64_t, in
 // is dense where an op cell of the band has sparse below 0.98 x dense (the pre-registered rule); f16 / f16 keeps the dense FLASH_ATTN_EXT.
 // The bf16-mixed pairs stay sparse: Vulkan FLASH_ATTN_EXT does not take them (every dense arm "unsupported", L40). The e2e cells of AT-B4
 // were not run (UNPROVEN), so a band can only be flipped further by them. Other types: sparse (no measured dense cell).
-static bool ggml_backend_vk_sparse_attn_prefer_dense(ggml_backend_dev_t, enum ggml_type type_k, enum ggml_type type_v, int64_t n_q, int64_t n_kv) {
-    GGML_UNUSED(n_kv);
+// The table was measured on the cm tier (RADV RDNA3) only: another tier keeps the sparse op, which it runs, and a dense pick
+// is also dropped when this device's FLASH_ATTN_EXT does not take the pair (no subgroup vote / shuffle without coopmat2:
+// the devices the portable tier exists for), so that the shortcut never builds an attention node its device rejects.
+
+// a FLASH_ATTN_EXT of the dense shortcut's shape (D 256, the qwen4exp heads, a causal f16 mask) on this device
+static bool ggml_vk_sa_dense_fa_supported(ggml_backend_dev_t dev, ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv) {
+    ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return false;
+    }
+    n_q  = std::max<int64_t>(n_q, 1);
+    n_kv = std::max<int64_t>(n_kv, 1);
+    ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_q, 24, 1);
+    ggml_tensor * k  = ggml_new_tensor_4d(ctx, type_k, 256, n_kv, 2, 1);
+    ggml_tensor * v  = ggml_new_tensor_4d(ctx, type_v, 256, n_kv, 2, 1);
+    ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v, m, 0.0625f, 0.0f, 0.0f);
+    const bool ok = ggml_backend_dev_supports_op(dev, fa);
+    ggml_free(ctx);
+    return ok;
+}
+
+static bool ggml_backend_vk_sparse_attn_prefer_dense(ggml_backend_dev_t dev, enum ggml_type type_k, enum ggml_type type_v, int64_t n_q, int64_t n_kv) {
     auto ti = [](ggml_type t) {
         switch (t) {
             case GGML_TYPE_F16:  return 0;
@@ -11238,7 +11260,15 @@ static bool ggml_backend_vk_sparse_attn_prefer_dense(ggml_backend_dev_t, enum gg
         { { 1, 1, 1, 0, 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0 }, { 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1, 1 } },   // K q8_0
         { { 1, 1, 1, 0, 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0 }, { 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1, 1 } },   // K q4_0
     };
-    return dense[tk][tv][band];
+    if (!dense[tk][tv][band]) {
+        return false;
+    }
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+    const vk_device device = ggml_vk_get_device(ctx->device);
+    if (ggml_vk_sa_tier(device) != VK_SA_TIER_CM) {
+        return false;
+    }
+    return ggml_vk_sa_dense_fa_supported(dev, type_k, type_v, n_q, n_kv);
 }
 
 static const char * ggml_backend_vk_sparse_attn_unsupported_reason(ggml_backend_dev_t dev, const ggml_tensor * op) {
