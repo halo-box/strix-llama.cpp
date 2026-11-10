@@ -494,7 +494,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_SPARSE_ATTN_PLAN:
+            return ggml_sparse_attn_plan_shape_why(op) == nullptr;
         case GGML_OP_SPARSE_ATTN: {
+            // the invariants of ggml_sparse_attn (an RPC server's node was never built by it)
+            if (ggml_sparse_attn_shape_why(op) != nullptr) {
+                return false;
+            }
             // K/V rows are converted with the type's to_float
             for (int i = 1; i <= 2; ++i) {
                 const ggml_type t = op->src[i]->type;
