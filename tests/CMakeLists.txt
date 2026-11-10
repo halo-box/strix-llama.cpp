@@ -200,6 +200,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # hybrid-idx memory (CPU, no model file)
     llama_build_and_test(test-qsa-visibility.cpp LINK llama)
     llama_build_and_test(test-qsa-resplit.cpp LINK llama)
+    llama_build_and_test(test-qsa-reserve-view.cpp LINK llama)
     # PLAN-v3 W11: the indexer cache type (qwen4exp auto, GLM5_NEXT unchanged) and the session-state check of an old indexer type
     llama_build_and_test(test-qsa-idx-type.cpp LINK llama)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

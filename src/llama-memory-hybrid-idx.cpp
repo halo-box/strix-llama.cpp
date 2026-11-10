@@ -293,8 +293,8 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
     return std::make_unique<llama_memory_hybrid_idx_context>(this);
 }
 
-llama_memory_context_ptr llama_memory_hybrid_idx::init_full_n_kv(uint32_t n_kv) {
-    return std::make_unique<llama_memory_hybrid_idx_context>(this, n_kv);
+llama_memory_context_ptr llama_memory_hybrid_idx::init_full_n_kv(uint32_t n_kv, uint32_t n_stream) {
+    return std::make_unique<llama_memory_hybrid_idx_context>(this, n_kv, n_stream);
 }
 
 int llama_memory_hybrid_idx::qsa_compact_reason(const llama_kv_cache * kv, uint32_t n_stream, uint32_t n_kv, uint32_t ratio, const llama_ubatch & ubatch) {
@@ -1297,13 +1297,14 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     }
 }
 
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv) :
-    llama_memory_hybrid_context(mem, n_kv),
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv, uint32_t n_stream) :
+    llama_memory_hybrid_context(mem, n_kv, n_stream),
     mem(mem),
     ns_ubatch(mem->get_mem_idx() == nullptr ?
-        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
+        std::vector<uint32_t>() : std::vector<uint32_t>{ n_stream > 0 ? std::min(n_stream, mem->get_mem_idx()->get_n_stream()) :
+                                                                      mem->get_mem_idx()->get_n_stream() }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx(), n_kv)) {
+        new llama_kv_cache_context(mem->get_mem_idx(), n_kv, n_stream)) {
     if (kpool_track()) {
         mem->kpool_layout_update();
         auto st = kpool_build_sizes();

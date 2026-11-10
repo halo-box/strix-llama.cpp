@@ -1320,6 +1320,7 @@ void llama_context::sched_reserve() {
     };
     std::vector<qsa_reserve_pass> qsa_passes;
     llama_memory_context_ptr mctx_shortcut;
+    llama_memory_context_ptr mctx_one_stream;
     if (qsa_n_layers() > 0 && !cparams.training) {
         auto * mem_qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
         GGML_ASSERT(mem_qsa != nullptr);
@@ -1359,6 +1360,22 @@ void llama_context::sched_reserve() {
             const uint32_t T = std::min(n_tokens, mem_qsa->qsa_noncompact_cap(cparams.n_ubatch));
             qsa_passes.push_back({ "noncompact", T, n_seqs, std::max(n_seqs, std::min(T, n_outputs_pp)), mctx.get(),
                     { LLM_GRAPH_QSA_RESERVE_NONCOMPACT, false, false } });
+        }
+        // split KV streams with several sequences: a ubatch of one sequence (the server's prompt ubatches) is a one-stream graph
+        // of up to n_ubatch rows at the full per-stream n_kv. The graphs above all view n_seqs streams (init_full's slot info),
+        // so none of them builds it: Prove's -np 2 split run at ub8192 grew the main ROCm0 buffer 22.6 MiB past the reserve on
+        // one-sequence 8192-token ubatches (n_stream=1, n_outputs=0). Reserve the one-stream shapes of the passes above: plain,
+        // no output (the server's non-final prompt ubatches), and the trim and fast-cache routes (both need n_stream == 1).
+        if (!cparams.kv_unified && n_seqs > 1) {
+            mctx_one_stream = mem_qsa->init_full_n_kv(n_kv_full, 1);
+            qsa_passes.push_back({ "1s-pp",   n_tokens, 1, n_outputs_pp, mctx_one_stream.get(), {} });
+            qsa_passes.push_back({ "1s-0out", n_tokens, 1, 0,            mctx_one_stream.get(), {} });
+            if (n_tokens > 512) {
+                qsa_passes.push_back({ "1s-trim", n_tokens, 1, 1, mctx_one_stream.get(), { 0, true, true } });
+            }
+            const uint32_t n_fast = std::min<uint32_t>(n_tokens, 512);
+            qsa_passes.push_back({ "1s-fast", n_fast, 1, std::min(n_fast, n_outputs_pp), mctx_one_stream.get(),
+                    { LLM_GRAPH_QSA_RESERVE_FAST, true, false } });
         }
     }
     for (auto & p : qsa_passes) {

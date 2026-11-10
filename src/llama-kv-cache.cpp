@@ -3045,9 +3045,16 @@ llama_kv_cache_context::llama_kv_cache_context(
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
-        uint32_t n_kv) : llama_kv_cache_context(kv) {
+        uint32_t n_kv,
+        uint32_t n_stream) : llama_kv_cache_context(kv) {
     GGML_ASSERT(n_kv > 0);
     this->n_kv = std::min(n_kv, kv->get_size());
+    // get_k / get_v view sinfo.s1 - sinfo.s0 + 1 streams: keep the first n_stream of the dummy slot info
+    if (n_stream > 0 && n_stream < kv->get_n_stream()) {
+        sinfos[0].s1 = n_stream - 1;
+        sinfos[0].strm.resize(n_stream);
+        sinfos[0].idxs.resize(n_stream);
+    }
 }
 
 llama_kv_cache_context::llama_kv_cache_context(

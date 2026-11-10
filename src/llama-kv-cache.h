@@ -403,10 +403,12 @@ public:
     llama_kv_cache_context(
             llama_kv_cache * kv);
 
-    // used to create a full-cache context whose view holds n_kv cells (a reserve graph at a smaller n_kv)
+    // used to create a full-cache context whose view holds n_kv cells (a reserve graph at a smaller n_kv); n_stream > 0 limits
+    // the view to the first n_stream streams (a reserve graph of a ubatch holding fewer sequences than the cache has streams)
     llama_kv_cache_context(
             llama_kv_cache * kv,
-            uint32_t n_kv);
+            uint32_t n_kv,
+            uint32_t n_stream = 0);
 
     // used to create an update context
     llama_kv_cache_context(
