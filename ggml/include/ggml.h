@@ -2669,7 +2669,11 @@ extern "C" {
     //   3. Scores are f32. Online softmax over the cells in ascending order: P is rounded to f16 against the running max
     //      for PV, the normaliser l sums the unrounded f32 p, PV accumulates in f32; acc / l and H_o run in f32. A cell
     //      whose score is -inf (an f16 K or q element at +-inf, item 1) has p = 0 wherever it lies, also before any finite
-    //      score (not exp(-inf - -inf) = NaN): the row is the softmax over the other cells, and 0 when every cell is -inf.
+    //      score (not exp(-inf - -inf) = NaN): it adds nothing to l, and its V row still enters PV as 0 * v, as every
+    //      attended cell's does. With a finite V row the row is the softmax over the other cells; a +-inf or NaN element
+    //      of that V row (item 1) makes that dimension of the row NaN (0 * inf); every cell -inf gives 0 (item 5). Only
+    //      a masked cell (item 4) contributes nothing whatever its bytes: the WMMA tiers share one PV product between the
+    //      rows of a block and cannot drop a cell for one row (tests/test-sparse-attn-neginf-v.cpp).
     //   4. A cell whose mask bit is 0 and every padding entry contribute nothing, whatever their stored bytes
     //      (NaN / inf included). The summation order is a pure function of the shape and of the op's inputs, so the
     //      output is deterministic run to run.
