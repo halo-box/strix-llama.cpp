@@ -10943,8 +10943,12 @@ static const char * const VK_SA_WHY_TYPE    = "type pair not supported";
 static const char * const VK_SA_WHY_BINDING = "a binding of this shape exceeds the device limits (maxStorageBufferRange or the suballocation block)";
 
 // NULL when the plan runs on this device; otherwise why not
+// (for an attend's plan, sel may be absent: an RPC server links a node's direct srcs only, so the shape comes from the
+// plan's op_params and the binding of sel is the contiguous one; the plan node's own query has its sel)
 static const char * ggml_vk_sa_plan_why(const vk_device & device, const ggml_tensor * op) {
     const ggml_tensor * sel = op->src[0];
+    const int64_t n_sel = ggml_get_op_params_i32(op, 2), n_q = ggml_get_op_params_i32(op, 3), n_stream = ggml_get_op_params_i32(op, 4);
+    const size_t sel_bytes = sel ? ggml_nbytes(sel) : (size_t) n_sel * n_q * n_stream * sizeof(int32_t);
     if (device->pipeline_sparse_attn_plan == nullptr || (ggml_vk_sa_force().cap_mask & 8u) != 0) {
         return "Vulkan device lacks the sparse-attention plan pipeline";
     }
@@ -10954,8 +10958,8 @@ static const char * ggml_vk_sa_plan_why(const vk_device & device, const ggml_ten
     if (!ggml_is_contiguous(op)) {
         return "plan dst not contiguous";
     }
-    const size_t scratch = ggml_sparse_attn_plan_scratch_nbytes(sel->ne[0], sel->ne[1], sel->ne[3]);
-    if (!ggml_vk_sa_binding_fits(device, ggml_nbytes(sel)) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(op)) || !ggml_vk_sa_binding_fits(device, scratch) ||
+    const size_t scratch = ggml_sparse_attn_plan_scratch_nbytes(n_sel, n_q, n_stream);
+    if (!ggml_vk_sa_binding_fits(device, sel_bytes) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(op)) || !ggml_vk_sa_binding_fits(device, scratch) ||
         ggml_vk_sa_round_up(device, ggml_nbytes(op)) + scratch > device->suballocation_block_size) {
         return VK_SA_WHY_BINDING;
     }
@@ -11024,11 +11028,11 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
     const ggml_tensor * k = op->src[1];
     const ggml_tensor * v = op->src[2];
     const ggml_tensor * plan = op->src[3];
-    const ggml_tensor * sel = plan->src[0];
     const vk_sa_force_t f = ggml_vk_sa_force();
 
     const vk_sa_tier tier = ggml_vk_sa_tier(device);
-    const int64_t n_q = q->ne[1], n_head = q->ne[2], n_stream = q->ne[3], n_kv_head = k->ne[2], n_sel = sel->ne[0];
+    // n_sel from the plan's op_params, not from plan->src[0]: an RPC server's copy of this node has no sel (ggml.h)
+    const int64_t n_q = q->ne[1], n_head = q->ne[2], n_stream = q->ne[3], n_kv_head = k->ne[2], n_sel = ggml_get_op_params_i32(plan, 2);
     const int64_t n_kv = ggml_get_op_params_i32(plan, 0);
     const int32_t rot_q = ggml_get_op_params_i32(op, 1);
     const int32_t rot_o = ggml_get_op_params_i32(op, 2);

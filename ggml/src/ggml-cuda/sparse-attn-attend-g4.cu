@@ -210,7 +210,8 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
     sa_selection r = {};
     r.ok = false;
     const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * plan = op->src[3];
-    if (q == nullptr || k == nullptr || v == nullptr || plan == nullptr || plan->op != GGML_OP_SPARSE_ATTN_PLAN || plan->src[0] == nullptr) {
+    // the plan's src (sel) is not read: on an RPC server the deserialized plan has none (its op_params carry n_sel)
+    if (q == nullptr || k == nullptr || v == nullptr || plan == nullptr || plan->op != GGML_OP_SPARSE_ATTN_PLAN) {
         r.why = "malformed SPARSE_ATTN node";
         return r;
     }
@@ -221,7 +222,7 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
     r.n_head    = q->ne[2];
     r.n_stream  = q->ne[3];
     r.n_head_kv = k->ne[2];
-    r.n_sel     = plan->src[0]->ne[0];
+    r.n_sel     = ggml_get_op_params_i32(plan, 2);
     r.kt        = sa_type_id_of(k->type);
     r.vt        = sa_type_id_of(v->type);
     r.gqa_index = r.n_head_kv > 0 && r.n_head % r.n_head_kv == 0 ? sa_gqa_index(r.n_head / r.n_head_kv) : -1;
