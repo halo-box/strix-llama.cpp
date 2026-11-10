@@ -1367,6 +1367,11 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    // a whole-graph comparison (run_whole_graph) calls the callback only for the verified nodes (fusion_test_nodes, else
+    // out), and the sentinel check sits in that callback (op NONE): true also verifies every sentinel, so a write past a
+    // tensor's allocation (dst plus the backend's get_alloc_size workspace) fails the case. Opt-in: other whole-graph
+    // cases keep the old set
+    virtual bool whole_graph_checks_sentinels() { return false; }
     // engagement: when checks_engagement() is true the census of backend1 is reset right before the compare, and
     // verify_engagement FAILS the case right after it when a fused dispatch or path count is wrong
     virtual bool checks_engagement() { return false; }
@@ -1663,8 +1668,10 @@ struct test_case {
                 if (memcmp(t1_data.data(), t2_data.data(), ggml_nbytes(t1)) != 0) {
                     printf("sentinel mismatch: %s ", t1->name);
                     ud->ok = false;
-                    return true;
                 }
+                // byte equality is the whole check: a case's err() measures its outputs (test_sparse_attn's overflow
+                // measure reads an out-shaped array), not a sentinel
+                return true;
             }
 
             std::vector<float> f1 = tensor_to_float(t1);
@@ -1711,6 +1718,9 @@ struct test_case {
         std::vector<ggml_tensor *> fused_nodes_to_verify = fusion_test_nodes();
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
+        }
+        if (run_whole_graph() && whole_graph_checks_sentinels()) {
+            fused_nodes_to_verify.insert(fused_nodes_to_verify.end(), sentinels.begin(), sentinels.end());
         }
         bool cmp_ok = true;
         if (checks_engagement()) {
@@ -13549,6 +13559,9 @@ struct test_sparse_attn : public test_case {
     }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+    // the attend's allocation is ggml_nbytes(dst) plus its workspace (HIP G1 split-K partials, V pack; Vulkan split
+    // partials): a kernel write past it lands in the post-graph sentinel, which the compare must see
+    bool whole_graph_checks_sentinels() override { return true; }
     bool checks_engagement() override { return true; }
     int n_determinism_runs() override { return 2; }
     bool use_weight_context() override { return at_end != 0; }
