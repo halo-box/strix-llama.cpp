@@ -827,6 +827,12 @@ struct llama_vocab_subset {
 enum llm_graph_qsa_reserve : uint32_t {
     LLM_GRAPH_QSA_RESERVE_NONCOMPACT = 1u << 0, // §7.1.4: the compact decision is false at the reserve n_kv
     LLM_GRAPH_QSA_RESERVE_FAST       = 1u << 1, // §7.1.2: the incremental fast-cache route at n_tokens <= 512
+    // every graph of llama_context::graph_reserve: the QSA compact decision is the empty cache's (the cache of the first
+    // reserve, at init), not the live cells' (llama_memory_hybrid_idx_context::qsa_graph_compact). A reserve that runs later
+    // (sched_need_reserve: set_sampler, set_adapters_lora, set_embeddings, set_causal_attn) builds on init_full over a live
+    // cache, whose 2-D cells or seq_cp-shared blocks made its pp graph non-compact: the TE route at n_ubatch tokens, which
+    // no runtime ubatch takes (the graph-build check, PLAN-v3 §4.3) and whose [n_kv, n_ubatch] mask grew the buffers
+    LLM_GRAPH_QSA_RESERVE_GRAPH      = 1u << 2,
 };
 
 struct llm_graph_params {

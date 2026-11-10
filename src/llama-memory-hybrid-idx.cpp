@@ -322,6 +322,21 @@ int llama_memory_hybrid_idx::qsa_compact_reason(const llama_kv_cache * kv, uint3
     return QSA_COMPACT_OK;
 }
 
+int llama_memory_hybrid_idx::qsa_compact_reason_empty(uint32_t n_stream, uint32_t ratio, const llama_ubatch & ubatch) {
+    if (!ubatch.n_tokens || !ubatch.seq_id || !ubatch.n_seq_id || n_stream == 0 || ubatch.n_tokens % n_stream != 0) {
+        return QSA_NC_INPUT;
+    }
+    static const llama_kv_cells empty;
+    const uint32_t n_tps = ubatch.n_tokens / n_stream;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const int r = qsa_compact_visibility_stream(empty, 0, ratio, ubatch, s*n_tps, n_tps);
+        if (r != QSA_COMPACT_OK) {
+            return r;
+        }
+    }
+    return QSA_COMPACT_OK;
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
     auto result = std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
     if (result->get_status() != LLAMA_MEMORY_STATUS_NO_UPDATE) { qsa_invalidate(); }
@@ -1860,7 +1875,8 @@ bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & u
 uint32_t llama_memory_hybrid_idx_context::qsa_n_cells_seen() const {
     // graph reservation sizes the buffers for the route of an empty cache, as at load. With the live cells, a resident
     // image conversation next to another sequence turns the reserved worst case ([n_kv, n_ubatch] at the full cache)
-    // into the masked route, and its buffers stay allocated: +12.5 GiB with -c 524288 -ub 2048 after a restore
+    // into the non-compact route, and its buffers stay allocated: +12.5 GiB with -c 524288 -ub 2048 after a restore
+    // (measured on the masked route of #262's base; the TE rows of the non-compact route read the same [n_kv, n_ubatch] mask)
     return reserve ? 0 : get_idx()->get_n_kv();
 }
 
@@ -1885,11 +1901,22 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
     return qsa_compact_reason(ubatch, ratio) == QSA_COMPACT_OK;
 }
 
+bool llama_memory_hybrid_idx_context::qsa_graph_compact(const llama_ubatch & ubatch, uint32_t ratio, bool reserve_graph) const {
+    // a reserve graph, or any graph of a reservation context (init_full / init_full_n_kv, #262): the empty cache's verdict
+    if (!reserve_graph && !reserve) {
+        return qsa_scalar_visibility(ubatch, ratio);
+    }
+    return llama_memory_hybrid_idx::qsa_compact_reason_empty(get_n_stream(), ratio, ubatch) == QSA_COMPACT_OK;
+}
+
 int llama_memory_hybrid_idx_context::qsa_compact_reason(const llama_ubatch & ubatch, uint32_t ratio) const {
     // embedding (image) ubatches are accepted like token ubatches (PLAN-v3 §4.2 step 1); each stream with its own ids (step 2)
     if (!get_idx() || !mem || !mem->get_mem_idx()) { return QSA_NC_INPUT; }
-    // a reservation context looks at no cell (qsa_n_cells_seen): the route of an empty cache, as at load
-    return llama_memory_hybrid_idx::qsa_compact_reason(mem->get_mem_idx(), get_n_stream(), qsa_n_cells_seen(), ratio, ubatch);
+    // a reservation context (init_full / init_full_n_kv) looks at no cell: the verdict of an empty cache, as at load (#262)
+    if (reserve) {
+        return llama_memory_hybrid_idx::qsa_compact_reason_empty(get_n_stream(), ratio, ubatch);
+    }
+    return llama_memory_hybrid_idx::qsa_compact_reason(mem->get_mem_idx(), get_n_stream(), get_idx()->get_n_kv(), ratio, ubatch);
 }
 
 void llama_memory_hybrid_idx::qsa_invalidate() {

@@ -143,6 +143,8 @@ public:
     // indexer cache at graph time), each of the ubatch's n_stream streams with the sequence ids of its own tokens;
     // QSA_COMPACT_OK or the reason of qsa_compact_reason (prefix.h)
     static int qsa_compact_reason(const llama_kv_cache * kv, uint32_t n_stream, uint32_t n_kv, uint32_t ratio, const llama_ubatch & ubatch);
+    // the same predicate over an empty cache (no cell): the ubatch's own verdict (its inputs, positions and rows)
+    static int qsa_compact_reason_empty(uint32_t n_stream, uint32_t ratio, const llama_ubatch & ubatch);
 
     // the non-compact re-split (PLAN-v3 §4.3, P2-2): U = min(n_ubatch, strips x 512) tokens in total per non-compact ubatch
     static constexpr uint32_t QSA_NONCOMPACT_STRIPS = 1;
@@ -320,8 +322,13 @@ public:
     // one stream, scalar positions in range, no 2d rope extents, no block split over sequence sets
     // (qsa_scalar_visibility_cells): the compact visibility rule applies
     bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
-    // why the compact predicate rejects ubatch on the indexer cells (QSA_COMPACT_OK when it accepts), for the decode error
+    // why the compact predicate rejects ubatch on the indexer cells (QSA_COMPACT_OK when it accepts), for the decode error;
+    // a reservation context sees no cell: the verdict over an empty cache (qsa_compact_reason_empty)
     int qsa_compact_reason(const llama_ubatch & ubatch, uint32_t ratio) const;
+    // the compact decision of a graph: a runtime graph's is qsa_scalar_visibility (the live cells); a reserve graph's
+    // (LLM_GRAPH_QSA_RESERVE_GRAPH, or any graph of a reservation context) is the verdict of the same predicate over an
+    // empty cache, the cache the first reserve sees at init, so a reserve that runs later on a live cache builds the same route
+    bool qsa_graph_compact(const llama_ubatch & ubatch, uint32_t ratio, bool reserve_graph) const;
     // the re-split cap U of this memory (PLAN-v3 §4.3) and whether it serves several sequences
     uint32_t qsa_noncompact_cap(uint32_t n_ubatch) const { return mem ? mem->qsa_noncompact_cap(n_ubatch) : n_ubatch; }
     bool qsa_multi_seq() const { return mem && mem->get_n_seq_max() > 1; }
@@ -343,7 +350,8 @@ public:
 private:
     llama_memory_hybrid_idx * mem = nullptr;
 
-    // a full-cache context (init_full) only reserves graphs: its QSA route must not depend on the cells in the cache
+    // a full-cache context (init_full, init_full_n_kv) only reserves graphs: its QSA route must not depend on the cells
+    // in the cache
     const bool reserve = false;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them

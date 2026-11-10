@@ -3589,7 +3589,7 @@ ggml_cgraph * llama_context::graph_reserve(
     auto * res = gf_res_reserve.get();
 
     auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
-    gparams.qsa_reserve = variant ? variant->qsa : 0;
+    gparams.qsa_reserve = (variant ? variant->qsa : 0) | LLM_GRAPH_QSA_RESERVE_GRAPH;
 
     res->reset();
 
