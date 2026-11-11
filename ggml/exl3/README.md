@@ -171,7 +171,7 @@ decodes its rows with `ggml_exl3_get_rows` in `build_inp_embd` and in the qwen35
 refuses any other reader of a row table. A stack of experts stands for the `{k, n, E}` weight of a `MUL_MAT_ID`
 (probe `EXL3_MUL_MAT_ID`) and `build_lora_mm_id` makes `ggml_exl3_mul_mat_id` for it; the MoE expert cache is refused.
 The qwen4exp n-gram (PLE) table is decoded on the host in the PLE gather, row by row with
-`ggml_exl3_decode_ngram_row`; under `--lazy-mode on-direct` its rings are read from the file with O_DIRECT.
+`ggml_exl3_decode_ngram_row`; under `--lazy-mode on-direct` EXL3 tables default to O_DIRECT reads, and `LLAMA_PLE_DIRECT` overrides this default (`0` for page-cached reads, nonzero for O_DIRECT).
 Supported archs: qwen35, lfm2moe, qwen4exp. EXL3 weights cannot be combined with LoRA adapters,
 prism.hadamard, the MTP draft vocabulary or a virtual model of `llama_model_init_from_user` (metadata without a
 complete tensor set).

@@ -282,7 +282,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         if (ple_on_disk && ple_w) {
             llama_ple_disk::params dp;
             dp.direct_io = false; // page-cached, so qwen4exp_ple_advise's readahead advice can land
-            if (const char * e = getenv("LLAMA_PLE_DIRECT")) { dp.direct_io = atoi(e) != 0; }
             if (ple_exl3_bias) {
                 // The row cache keeps the stored rings (62 B a row at K = 3) rather than decoded rows (640 B): on
                 // Flash-Next 1.66bpw_h4_ng3 over 45k natural tokens (309k distinct rows) the default 256 MiB holds
@@ -295,6 +294,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 // 460 instead of 409 tok/s on an 8192-token prompt (479 resident), with 427 MB in the page cache.
                 dp.direct_io = true;
             }
+            if (const char * e = getenv("LLAMA_PLE_DIRECT")) { dp.direct_io = atoi(e) != 0; }
 
             ple_disk = std::make_shared<llama_ple_disk>(ml.fnames.at(ple_w->idx), ple_w->offs,
                                                         ple_w->tensor->type, ple_w->tensor->ne[0], ple_rows, dp);
