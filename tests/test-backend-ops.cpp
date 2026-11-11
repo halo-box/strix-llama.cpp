@@ -15254,362 +15254,278 @@ struct test_sparse_attn_gqa_rep : public test_sparse_attn {
     }
 };
 
+// One family of SPARSE_ATTN_PLAN / SPARSE_ATTN cases: the product of its lists, nested in the order of the fields below
+// (k, v, gqa, ns, nkv, nsel, nq, g, rows, rot, layout, at_end, special, gate). v empty: V = K. layout SA_ALT0 / SA_ALT1
+// alternates 0 / 1 over the family's cases in that order, starting at 0 / 1 (the K/V view layouts of sa_new_kv).
+// gen_only keeps the K/V pairs with a member outside S_fast (the generic tier).
+enum sa_case_kind { SA_CASE_PLAN, SA_CASE_ATTN, SA_CASE_GATED, SA_CASE_GQAREP };
+enum { SA_ALT0 = -1, SA_ALT1 = -2 };
+
+struct sa_family {
+    int kind;
+    std::vector<ggml_type> tks, tvs;
+    std::vector<int64_t> nqs, nkvs, nsels;
+    std::vector<int> gs = { 1 }, pats = { SA_ROWS_MIX }, gqas = { 12 }, nss = { 1 }, layouts, at_ends = { 0 }, specials = { SA_PLAIN }, gates = { SA_GATE_F32 };
+    std::vector<std::pair<int, int>> rots = { { 0, 0 } };
+    int prblk_ = 0;
+    float scale_ = 0.0625f;
+    bool gen_only_ = false;
+
+    explicit sa_family(int kind) : kind(kind), layouts({ kind == SA_CASE_PLAN ? 0 : 1 }) {}
+    sa_family & k(std::vector<ggml_type> x)      { tks = std::move(x); return *this; }
+    sa_family & v(std::vector<ggml_type> x)      { tvs = std::move(x); return *this; }
+    sa_family & nq(std::vector<int64_t> x)       { nqs = std::move(x); return *this; }
+    sa_family & nkv(std::vector<int64_t> x)      { nkvs = std::move(x); return *this; }
+    sa_family & nsel(std::vector<int64_t> x)     { nsels = std::move(x); return *this; }
+    sa_family & g(std::vector<int> x)            { gs = std::move(x); return *this; }
+    sa_family & rows(std::vector<int> x)         { pats = std::move(x); return *this; }
+    sa_family & gqa(std::vector<int> x)          { gqas = std::move(x); return *this; }
+    sa_family & ns(std::vector<int> x)           { nss = std::move(x); return *this; }
+    sa_family & rot(std::vector<std::pair<int, int>> x) { rots = std::move(x); return *this; }
+    sa_family & layout(std::vector<int> x)       { layouts = std::move(x); return *this; }
+    sa_family & at_end(std::vector<int> x)       { at_ends = std::move(x); return *this; }
+    sa_family & special(std::vector<int> x)      { specials = std::move(x); return *this; }
+    sa_family & gate(std::vector<int> x)         { gates = std::move(x); return *this; }
+    sa_family & prblk(int x)                     { prblk_ = x; return *this; }
+    sa_family & scale(float x)                   { scale_ = x; return *this; }
+    sa_family & gen_only()                       { gen_only_ = true; return *this; }
+};
+
+static void sa_add_family(std::vector<std::unique_ptr<test_case>> & test_cases, const sa_family & f) {
+    const std::vector<ggml_type> no_type = { GGML_TYPE_COUNT };   // the plan has no K / V
+    const bool same_kv = f.tvs.empty();
+    int alt = 0;
+    for (ggml_type tk : f.kind == SA_CASE_PLAN ? no_type : f.tks)
+    for (ggml_type tv0 : same_kv ? std::vector<ggml_type>{ GGML_TYPE_COUNT } : f.tvs)
+    for (int gqa : f.gqas)
+    for (int ns : f.nss)
+    for (int64_t nkv : f.nkvs)
+    for (int64_t nsel : f.nsels)
+    for (int64_t nq : f.nqs)
+    for (int G : f.gs)
+    for (int pat : f.pats)
+    for (const auto & r : f.rots)
+    for (int lay0 : f.layouts)
+    for (int at_end : f.at_ends)
+    for (int sp : f.specials)
+    for (int var : f.gates) {
+        const ggml_type tv = same_kv ? tk : tv0;
+        if (f.gen_only_) {
+            const auto fast = [](ggml_type t) {
+                return t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
+            };
+            if (fast(tk) && fast(tv)) {
+                continue;
+            }
+        }
+        const int lay = lay0 == SA_ALT0 ? alt++ % 2 : lay0 == SA_ALT1 ? (alt++ + 1) % 2 : lay0;
+        switch (f.kind) {
+            case SA_CASE_PLAN:
+                test_cases.emplace_back(new test_sparse_attn_plan(nq, nsel, nkv, G, ns, pat, lay));
+                break;
+            case SA_CASE_ATTN:
+                test_cases.emplace_back(new test_sparse_attn(tk, tv, nq, nkv, nsel, G, pat, gqa, ns, r.first, r.second, lay, at_end, sp,
+                                                             f.prblk_, f.scale_));
+                break;
+            case SA_CASE_GATED:
+                test_cases.emplace_back(new test_sparse_attn_gated(tk, tv, nq, nkv, nsel, gqa, ns, var, lay, r.first, r.second));
+                break;
+            case SA_CASE_GQAREP:
+                test_cases.emplace_back(new test_sparse_attn_gqa_rep(tk, tv, nq, nkv, nsel, G, gqa, ns));
+                break;
+        }
+    }
+}
+
 static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> & test_cases) {
-    const ggml_type F16 = GGML_TYPE_F16, BF16 = GGML_TYPE_BF16, Q8 = GGML_TYPE_Q8_0, Q4 = GGML_TYPE_Q4_0;
-    const ggml_type S_fast[]    = { F16, BF16, Q8, Q4 };
-    const ggml_type S_all[]     = { F16, BF16, Q8, Q4, GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
+    const ggml_type F16 = GGML_TYPE_F16, BF16 = GGML_TYPE_BF16, Q8 = GGML_TYPE_Q8_0, Q4 = GGML_TYPE_Q4_0, F32 = GGML_TYPE_F32;
+    const ggml_type Q4_1 = GGML_TYPE_Q4_1, Q5_0 = GGML_TYPE_Q5_0, Q5_1 = GGML_TYPE_Q5_1, IQ4NL = GGML_TYPE_IQ4_NL;
+    const std::vector<ggml_type> S_fast = { F16, BF16, Q8, Q4 };
+    const std::vector<ggml_type> S_gen  = { F32, Q4_1, Q5_0, Q5_1, IQ4NL };
+    const std::vector<ggml_type> S_all  = { F16, BF16, Q8, Q4, F32, Q4_1, Q5_0, Q5_1, IQ4NL };
+    const std::vector<int> G14 = { 1, 4 };
+    const int64_t K21 = ((int64_t) 1 << 21) + 4, K22 = ((int64_t) 1 << 22) + 4;
+    using P = sa_family;
+    const int PLAN = SA_CASE_PLAN, ATTN = SA_CASE_ATTN, GATED = SA_CASE_GATED, GQAREP = SA_CASE_GQAREP;
 
-    // ---- SPARSE_ATTN_PLAN (PLAN-v3 §14.1) ----
-    // n_q x n_sel x G
-    for (int64_t nq : {1, 2, 8, 127, 128, 129, 512, 513, 4096}) {
-        for (int64_t ns : {257, 2051}) {
-            if (nq == 4096 && ns == 257) continue;
-            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn_plan(nq, ns, 65536, G));
-        }
-    }
-    // n_sel 1 and 4096, shallow and deep caches
-    for (int64_t ns : {1, 4096}) {
-        for (int64_t nq : {1, 129, 513}) {
-            for (int64_t nk : {4096, 1048576}) {
-                for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn_plan(nq, ns, nk, G));
-            }
-        }
-    }
-    // every row pattern at every n_kv of §14.1 (n_kv 4: a single quad)
-    for (int64_t nk : {4, 2051, 4096, 65536, 270336, 1048576}) {
-        for (int pat : {SA_ROWS_ASC, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_NEG, SA_ROWS_OOB, SA_ROWS_ALLNEG, SA_ROWS_MIX, SA_ROWS_BLOCKS}) {
-            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn_plan(129, 257, nk, G, 1, pat));
-        }
-    }
-    // 2 streams; plain, interleaved and strided rows
-    for (int layout : {0, 1, 2}) {
-        for (int64_t nq : {8, 129}) {
-            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn_plan(nq, 257, 4096, G, 2, SA_ROWS_MIX, layout));
-        }
-    }
-    test_cases.emplace_back(new test_sparse_attn_plan(1, 1, 4, 1, 1, SA_ROWS_PERM));
-    test_cases.emplace_back(new test_sparse_attn_plan(3, 1, 4, 4, 2, SA_ROWS_PERM, 1));
-    test_cases.emplace_back(new test_sparse_attn_plan(4096, 2051, 8192, 4, 1, SA_ROWS_BLOCKS));
-    // rows longer than a block's LDS (HIP: 2 x n_sel x 4 B > 60 KiB): the global-memory rows and merge kernels
-    for (int64_t nk : {4096, 65536}) {
-        for (int pat : {SA_ROWS_ASC, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_MIX}) {
-            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn_plan(5, 9000, nk, G, 2, pat));
-        }
-    }
+    const sa_family families[] = {
+        // ---- SPARSE_ATTN_PLAN (PLAN-v3 §14.1) ----
+        // n_q x n_sel x G
+        P(PLAN).nq({1, 2, 8, 127, 128, 129, 512, 513}).nsel({257, 2051}).nkv({65536}).g(G14),
+        P(PLAN).nq({4096}).nsel({2051}).nkv({65536}).g(G14),
+        // n_sel 1 and 4096, shallow and deep caches
+        P(PLAN).nsel({1, 4096}).nq({1, 129, 513}).nkv({4096, 1048576}).g(G14),
+        // every row pattern at every n_kv of §14.1 (n_kv 4: a single quad)
+        P(PLAN).nq({129}).nsel({257}).nkv({4, 2051, 4096, 65536, 270336, 1048576}).g(G14)
+            .rows({SA_ROWS_ASC, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_NEG, SA_ROWS_OOB, SA_ROWS_ALLNEG, SA_ROWS_MIX, SA_ROWS_BLOCKS}),
+        // 2 streams; plain, interleaved and strided rows
+        P(PLAN).nq({8, 129}).nsel({257}).nkv({4096}).g(G14).ns({2}).layout({0, 1, 2}),
+        P(PLAN).nq({1}).nsel({1}).nkv({4}).rows({SA_ROWS_PERM}),
+        P(PLAN).nq({3}).nsel({1}).nkv({4}).g({4}).ns({2}).rows({SA_ROWS_PERM}).layout({1}),
+        P(PLAN).nq({4096}).nsel({2051}).nkv({8192}).g({4}).rows({SA_ROWS_BLOCKS}),
+        // rows longer than a block's LDS (HIP: 2 x n_sel x 4 B > 60 KiB): the global-memory rows and merge kernels
+        P(PLAN).nq({5}).nsel({9000}).nkv({4096, 65536}).g(G14).ns({2}).rows({SA_ROWS_ASC, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_MIX}),
 
-    // ---- SPARSE_ATTN (PLAN-v3 §14.1) ----
-    // every S x S pair (n_q 9, n_kv 4096 >= 64 * n_q: the direct-V regime); alternating K/V view layouts
-    {
-        int alt = 0;
-        for (ggml_type tk : S_all) {
-            for (ggml_type tv : S_all) {
-                test_cases.emplace_back(new test_sparse_attn(tk, tv, 9, 4096, 257, 1, SA_ROWS_MIX, 12, 1, 0, 0, alt++ % 2));
-                // n_kv < 64 * n_q on G1, one pass per query at the Vulkan split rule (n_wg 130 >= 128): the V staged / pack arms
-                test_cases.emplace_back(new test_sparse_attn(tk, tv, 65, 4096, 257, 1, SA_ROWS_MIX, 12, 1, 0, 0, alt % 2));
-            }
-        }
-    }
-    // both V-loader regimes for every S_fast pair: n_kv < 64 * n_q (n_q 129, n_kv 4096, G4) and n_kv >= 64 * n_q
-    // (n_q 9, n_kv 32768, G1), n_sel 2051
-    for (ggml_type tk : S_fast) {
-        for (ggml_type tv : S_fast) {
-            test_cases.emplace_back(new test_sparse_attn(tk, tv, 129, 4096, 2051, 4, SA_ROWS_BLOCKS));
-            test_cases.emplace_back(new test_sparse_attn(tk, tv, 9, 32768, 2051, 1, SA_ROWS_MIX));
-        }
-    }
-    // n_q >= 513 with 64 * n_q < n_kv (direct V on G4)
-    for (ggml_type t : {F16, Q8}) test_cases.emplace_back(new test_sparse_attn(t, t, 513, 65536, 2051, 4, SA_ROWS_BLOCKS));
-    // the n_q set of §14.1 (G = the HIP default n_q < 128 ? 1 : 4, and the other G for a few)
-    for (int64_t nq : {1, 2, 4, 8, 9, 64, 65, 66, 127, 128, 129, 263, 512, 513}) {
-        for (ggml_type t : {F16, Q8}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, nq < 128 ? 1 : 4, SA_ROWS_MIX));
-    }
-    for (int64_t nq : {1, 9, 127, 513}) test_cases.emplace_back(new test_sparse_attn(Q4, Q4, nq, 8192, 2051, nq < 128 ? 4 : 1, SA_ROWS_MIX));
-    test_cases.emplace_back(new test_sparse_attn(F16, F16, 4096, 8192, 2051, 4, SA_ROWS_BLOCKS));
-    // n_kv: all-visible (the shortcut, n_kv <= 2051), 2051 with views of 2052 rows ending at their buffer's end, deep
-    for (int64_t nk : {1, 17, 512, 2048, 2051}) {
-        for (ggml_type t : {F16, Q8, BF16, Q4}) test_cases.emplace_back(new test_sparse_attn(t, t, 16, nk, 2051, 1, SA_ROWS_ALLVIS));
-    }
-    for (ggml_type t : {F16, Q8}) {
-        for (int at_end : {1, 2}) {
-            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 9, 2051, 2051, G, SA_ROWS_ALLVIS, 12, 1, 0, 0, 1, at_end));
-        }
-        for (int64_t nk : {4096, 32768, 65536, 270336}) test_cases.emplace_back(new test_sparse_attn(t, t, 9, nk, 2051, 1, SA_ROWS_MIX));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 1, 1048576, 2051, 1, SA_ROWS_MIX));
+        // ---- SPARSE_ATTN (PLAN-v3 §14.1) ----
+        // every S x S pair at n_q 9 (n_kv 4096 >= 64 * n_q: the direct-V regime) and n_q 65 (n_kv < 64 * n_q on G1, one pass
+        // per query at the Vulkan split rule, n_wg 130 >= 128: the V staged / pack arms); K/V view layouts alternating
+        P(ATTN).k(S_all).v(S_all).nq({9}).nkv({4096}).nsel({257}).layout({SA_ALT0}),
+        P(ATTN).k(S_all).v(S_all).nq({65}).nkv({4096}).nsel({257}).layout({SA_ALT1}),
+        // both V-loader regimes for every S_fast pair: n_kv < 64 * n_q (n_q 129, n_kv 4096, G4) and n_kv >= 64 * n_q (n_q 9,
+        // n_kv 32768, G1), n_sel 2051
+        P(ATTN).k(S_fast).v(S_fast).nq({129}).nkv({4096}).nsel({2051}).g({4}).rows({SA_ROWS_BLOCKS}),
+        P(ATTN).k(S_fast).v(S_fast).nq({9}).nkv({32768}).nsel({2051}),
+        // n_q >= 513 with 64 * n_q < n_kv (direct V on G4)
+        P(ATTN).k({F16, Q8}).nq({513}).nkv({65536}).nsel({2051}).g({4}).rows({SA_ROWS_BLOCKS}),
+        // the n_q set of §14.1 (G = the HIP default n_q < 128 ? 1 : 4, and the other G for q4_0)
+        P(ATTN).k({F16, Q8}).nq({1, 2, 4, 8, 9, 64, 65, 66, 127}).nkv({8192}).nsel({2051}),
+        P(ATTN).k({F16, Q8}).nq({128, 129, 263, 512, 513}).nkv({8192}).nsel({2051}).g({4}),
+        P(ATTN).k({Q4}).nq({1, 9, 127}).nkv({8192}).nsel({2051}).g({4}),
+        P(ATTN).k({Q4}).nq({513}).nkv({8192}).nsel({2051}),
+        P(ATTN).k({F16}).nq({4096}).nkv({8192}).nsel({2051}).g({4}).rows({SA_ROWS_BLOCKS}),
+        // n_kv: all-visible (the shortcut, n_kv <= 2051), 2051 with views of 2052 rows ending at their buffer's end, deep
+        P(ATTN).k({F16, Q8, BF16, Q4}).nq({16}).nkv({1, 17, 512, 2048, 2051}).nsel({2051}).rows({SA_ROWS_ALLVIS}),
+        P(ATTN).k({F16, Q8}).nq({9}).nkv({2051}).nsel({2051}).g(G14).rows({SA_ROWS_ALLVIS}).at_end({1, 2}),
+        P(ATTN).k({F16, Q8}).nq({9}).nkv({4096, 32768, 65536, 270336}).nsel({2051}),
+        P(ATTN).k({F16, Q8}).nq({1}).nkv({1048576}).nsel({2051}),
         // the first f16 K view >= 2 GiB: offsets past INT32_MAX bytes. The rows hold the last 4 cells (SA_ROWS_TAIL), whose
         // f16 rows end past byte 2^31 (cell 2^21 at 1024 B per cell); check_reach fails a case whose storage passes INT32_MAX
         // without such a row (the MIX rows of this shape reached byte 2146605568 only)
-        test_cases.emplace_back(new test_sparse_attn(t, t, 1, ((int64_t) 1 << 21) + 4, 2051, 1, t == F16 ? SA_ROWS_TAIL : SA_ROWS_MIX));
-    }
-    // the q8_0 K / V views past INT32_MAX bytes: 2^22 + 4 cells of 2 x 272 B (2.28 GB each), the last 4 cells selected
-    test_cases.emplace_back(new test_sparse_attn(Q8, Q8, 1, ((int64_t) 1 << 22) + 4, 2051, 1, SA_ROWS_TAIL));
-    test_cases.emplace_back(new test_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, 1, 1048576, 2051, 1, SA_ROWS_MIX));
-    // GQA 4, 8, 12
-    for (int gqa : {4, 8, 12}) {
-        for (ggml_type t : {F16, Q8, Q4}) {
-            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 2051, G, SA_ROWS_MIX, gqa));
-        }
-    }
-    // rotations
-    for (auto r : std::vector<std::pair<int, int>>{{64, 64}, {256, 256}, {64, 0}, {0, 256}, {128, 64}}) {
-        for (ggml_type t : {F16, Q8, Q4, BF16}) test_cases.emplace_back(new test_sparse_attn(t, t, 65, 4096, 2051, 1, SA_ROWS_MIX, 12, 1, r.first, r.second));
-    }
-    // the in-op rotations on every HIP kernel family (W10): G4 with packed V (n_kv 4096 < 64 * 129) and direct V
-    // (16384), G1 with one split (n_sel 17) and with the split merge (the block above, n_sel 2051 -> 5 splits), in the
-    // qwen4exp pair (256, 64) and the other two orders; GQA 4 / 8, two streams, mixed pairs, the S_generic tier
-    for (auto r : std::vector<std::pair<int, int>>{{256, 64}, {64, 256}, {128, 128}}) {
-        for (ggml_type t : S_fast) {
-            for (int64_t nk : {4096, 16384}) test_cases.emplace_back(new test_sparse_attn(t, t, 129, nk, 257, 4, SA_ROWS_MIX, 12, 1, r.first, r.second));
-            test_cases.emplace_back(new test_sparse_attn(t, t, 1, 16384, 17, 1, SA_ROWS_MIX, 12, 1, r.first, r.second));
-        }
-    }
-    for (int gqa : {4, 8}) {
-        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(Q8, Q8, 66, 4096, 2051, G, SA_ROWS_MIX, gqa, 1, 256, 64));
-    }
-    for (int G : {1, 4}) {
-        test_cases.emplace_back(new test_sparse_attn(Q4, Q8, 65, 4096, 2051, G, SA_ROWS_MIX, 12, 2, 256, 64, 0));
-        test_cases.emplace_back(new test_sparse_attn(Q8, F16, 65, 4096, 2051, G, SA_ROWS_MIX, 12, 1, 256, 0));
-        test_cases.emplace_back(new test_sparse_attn(F16, Q4, 65, 4096, 2051, G, SA_ROWS_MIX, 12, 1, 0, 64));
-        for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL}) {
-            test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 2051, G, SA_ROWS_MIX, 12, 1, 256, 64));
-        }
-    }
-    // rotated empty rows (H_o of 0 is 0), poison with rotations, and the overflow cases with H_q (rot_o = 0: an inf output
-    // element through H_o would turn its whole block into NaN): the G4 fixup recomputes those blocks with the rotation
-    for (ggml_type t : S_fast) {
-        for (int G : {1, 4}) {
-            test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, G, SA_ROWS_EMPTY, 12, 1, 256, 64));
-            test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, G, SA_ROWS_POISON, 12, 1, 256, 64, 1, 0, SA_POISON));
-        }
-    }
-    for (ggml_type tv : {BF16, Q8, F16}) {
-        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(F16, tv, 9, 4096, 257, G, SA_ROWS_SINGLE, 12, 1, 256, 0, 1, 0, SA_OVERFLOW));
-    }
-    // 2 streams, both K/V layouts
-    for (int layout : {0, 1}) {
-        for (ggml_type t : {F16, Q8}) {
-            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 65, 4096, 2051, G, SA_ROWS_MIX, 12, 2, 0, 0, layout));
-        }
-    }
-    // empty rows, all -1 rows, permuted / duplicate rows
-    for (ggml_type t : {F16, Q8, Q4, BF16}) {
-        test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, 1, SA_ROWS_EMPTY));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, 4, SA_ROWS_EMPTY));
-    }
-    for (int pat : {SA_ROWS_ALLNEG, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_OOB}) {
-        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(Q8, F16, 33, 4096, 257, G, pat));
-    }
-    // poison (every S_fast type): NaN / inf values and scales in cells no query selects, inside attended quads and
-    // in the padding quads
-    for (ggml_type t : S_fast) {
-        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, G, SA_ROWS_POISON, 12, 1, 0, 0, 1, 0, SA_POISON));
-    }
-    // V-side overflow: bf16 V > 65504, q8_0 V with d * q > 65504, f16 V with stored inf; one selected cell
-    for (ggml_type tv : {BF16, Q8, F16}) {
-        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(F16, tv, 9, 4096, 257, G, SA_ROWS_SINGLE, 12, 1, 0, 0, 1, 0, SA_OVERFLOW));
-    }
-    // a NaN score in one attended cell (inf * 0 or a NaN K element): the CPU op writes 0 for the head, so must the HIP G1
-    // split-K merge (n_q 1 / 3 at n_sel 2051: many splits), G4, the Vulkan split-K reduce (n_q 1 / 3) and the Vulkan cm /
-    // scalar one-split epilogues (n_q 64: n_q * n_head_kv >= 128); the HIP one-split G1 epilogue is reached by the lead
-    // cases below (n_sel 48)
-    for (ggml_type t : {F16, Q8, BF16}) {
-        for (int64_t nq : {1, 3, 64}) {
-            for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, G, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, SA_NANSCORE));
-        }
-    }
-    // a -inf or NaN score in the first step of a row (init_lead): query 0 selects cells 0 .. 15, whose K rows of KV head 0
-    // score -inf (leadneginf: weight 0 wherever the cell lies, the row is the softmax over the other cells) or NaN (leadnan:
-    // the row is 0, also when the running max is still -inf). G1 with the split-K merge (n_q 1, n_sel 2051: HIP 33 splits,
-    // Vulkan split + reduce), G1 with one HIP split (n_sel 48), G1 at n_q 66 (Vulkan one split: n_q * n_head_kv >= 128),
-    // G4 with direct V (n_q 4) and packed V (n_q 66, n_kv 4096 < 64 * n_q)
-    for (ggml_type t : {F16, Q8, BF16}) {
-        for (int sp : {SA_LEAD_NEGINF, SA_LEAD_NAN}) {
-            test_cases.emplace_back(new test_sparse_attn(t, t, 1,  8192, 2051, 1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));
-            test_cases.emplace_back(new test_sparse_attn(t, t, 9,  4096, 48,   1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));
-            test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257,  1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));
-            for (int64_t nq : {4, 66}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 4096, 257, 4, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, sp));
-        }
-    }
-    // a scale that is not a power of two (the contract multiplies in f32 before the f16 rounding)
-    for (ggml_type t : {F16, Q8}) test_cases.emplace_back(new test_sparse_attn(t, t, 65, 4096, 2051, 1, SA_ROWS_MIX, 12, 1, 0, 0, 1, 0, SA_PLAIN, 0, 0.0883883476f));
+        P(ATTN).k({F16}).nq({1}).nkv({K21}).nsel({2051}).rows({SA_ROWS_TAIL}),
+        P(ATTN).k({Q8}).nq({1}).nkv({K21}).nsel({2051}),
+        // the q8_0 K / V views past INT32_MAX bytes: 2^22 + 4 cells of 2 x 272 B (2.28 GB each), the last 4 cells selected
+        P(ATTN).k({Q8}).nq({1}).nkv({K22}).nsel({2051}).rows({SA_ROWS_TAIL}),
+        P(ATTN).k({F32}).nq({1}).nkv({1048576}).nsel({2051}),
+        // GQA 4, 8, 12
+        P(ATTN).k({F16, Q8, Q4}).gqa({4, 8, 12}).nq({66}).nkv({4096}).nsel({2051}).g(G14),
+        // rotations
+        P(ATTN).k({F16, Q8, Q4, BF16}).nq({65}).nkv({4096}).nsel({2051}).rot({{64, 64}, {256, 256}, {64, 0}, {0, 256}, {128, 64}}),
+        // the in-op rotations on every HIP kernel family (W10): G4 with packed V (n_kv 4096 < 64 * 129) and direct V
+        // (16384), G1 with one split (n_sel 17) and with the split merge (the block above, n_sel 2051 -> 5 splits), in the
+        // qwen4exp pair (256, 64) and the other two orders; GQA 4 / 8, two streams, mixed pairs, the S_generic tier
+        P(ATTN).k(S_fast).nq({129}).nkv({4096, 16384}).nsel({257}).g({4}).rot({{256, 64}, {64, 256}, {128, 128}}),
+        P(ATTN).k(S_fast).nq({1}).nkv({16384}).nsel({17}).rot({{256, 64}, {64, 256}, {128, 128}}),
+        P(ATTN).k({Q8}).gqa({4, 8}).nq({66}).nkv({4096}).nsel({2051}).g(G14).rot({{256, 64}}),
+        P(ATTN).k({Q4}).v({Q8}).ns({2}).nq({65}).nkv({4096}).nsel({2051}).g(G14).rot({{256, 64}}).layout({0}),
+        P(ATTN).k({Q8}).v({F16}).nq({65}).nkv({4096}).nsel({2051}).g(G14).rot({{256, 0}}),
+        P(ATTN).k({F16}).v({Q4}).nq({65}).nkv({4096}).nsel({2051}).g(G14).rot({{0, 64}}),
+        P(ATTN).k(S_gen).nq({66}).nkv({4096}).nsel({2051}).g(G14).rot({{256, 64}}),
+        // rotated empty rows (H_o of 0 is 0), poison with rotations, and the overflow cases with H_q (rot_o = 0: an inf output
+        // element through H_o would turn its whole block into NaN): the G4 fixup recomputes those blocks with the rotation
+        P(ATTN).k(S_fast).nq({66}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_EMPTY}).rot({{256, 64}}),
+        P(ATTN).k(S_fast).nq({66}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_POISON}).rot({{256, 64}}).special({SA_POISON}),
+        P(ATTN).k({F16}).v({BF16, Q8, F16}).nq({9}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_SINGLE}).rot({{256, 0}}).special({SA_OVERFLOW}),
+        // 2 streams, both K/V layouts
+        P(ATTN).k({F16, Q8}).ns({2}).nq({65}).nkv({4096}).nsel({2051}).g(G14).layout({0, 1}),
+        // empty rows, all -1 rows, permuted / duplicate rows
+        P(ATTN).k({F16, Q8, Q4, BF16}).nq({66}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_EMPTY}),
+        P(ATTN).k({Q8}).v({F16}).nq({33}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_ALLNEG, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_OOB}),
+        // poison (every S_fast type): NaN / inf values and scales in cells no query selects, inside attended quads and
+        // in the padding quads
+        P(ATTN).k(S_fast).nq({66}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_POISON}).special({SA_POISON}),
+        // V-side overflow: bf16 V > 65504, q8_0 V with d * q > 65504, f16 V with stored inf; one selected cell
+        P(ATTN).k({F16}).v({BF16, Q8, F16}).nq({9}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_SINGLE}).special({SA_OVERFLOW}),
+        // a NaN score in one attended cell (inf * 0 or a NaN K element): the CPU op writes 0 for the head, so must the HIP G1
+        // split-K merge (n_q 1 / 3 at n_sel 2051: many splits), G4, the Vulkan split-K reduce (n_q 1 / 3) and the Vulkan cm /
+        // scalar one-split epilogues (n_q 64: n_q * n_head_kv >= 128); the HIP one-split G1 epilogue is reached by the lead
+        // cases below (n_sel 48)
+        P(ATTN).k({F16, Q8, BF16}).nq({1, 3, 64}).nkv({8192}).nsel({2051}).g(G14).special({SA_NANSCORE}),
+        // a -inf or NaN score in the first step of a row (init_lead): query 0 selects cells 0 .. 15, whose K rows of KV head 0
+        // score -inf (leadneginf: weight 0 wherever the cell lies, the row is the softmax over the other cells) or NaN (leadnan:
+        // the row is 0, also when the running max is still -inf). G1 with the split-K merge (n_q 1, n_sel 2051: HIP 33 splits,
+        // Vulkan split + reduce), G1 with one HIP split (n_sel 48), G1 at n_q 66 (Vulkan one split: n_q * n_head_kv >= 128),
+        // G4 with direct V (n_q 4) and packed V (n_q 66, n_kv 4096 < 64 * n_q)
+        P(ATTN).k({F16, Q8, BF16}).nq({1}).nkv({8192}).nsel({2051}).special({SA_LEAD_NEGINF, SA_LEAD_NAN}),
+        P(ATTN).k({F16, Q8, BF16}).nq({9}).nkv({4096}).nsel({48}).special({SA_LEAD_NEGINF, SA_LEAD_NAN}),
+        P(ATTN).k({F16, Q8, BF16}).nq({66}).nkv({4096}).nsel({257}).special({SA_LEAD_NEGINF, SA_LEAD_NAN}),
+        P(ATTN).k({F16, Q8, BF16}).nq({4, 66}).nkv({4096}).nsel({257}).g({4}).special({SA_LEAD_NEGINF, SA_LEAD_NAN}),
+        // a scale that is not a power of two (the contract multiplies in f32 before the f16 rounding)
+        P(ATTN).k({F16, Q8}).nq({65}).nkv({4096}).nsel({2051}).scale(0.0883883476f),
 
-    // ---- the QSA_*_MASKLESS shapes of #219 (deleted in W13), with their cell formulas (SA_ROWS_PR / SA_ROWS_PRBLK), including the q8_0 and mixed
-    //      K/V case list #219 added (b60447506): decode q {1, 9, 64, 512} x sel {257, 2051}; prefill 129 / 513 / 640;
-    //      130 x 32k, 200 x 64k, 70 x 64k; mixed q8_0 / f16 at 513 and 130; GQA 4 ----
-    for (ggml_type t : {F16, Q8}) {
-        for (int64_t nq : {1, 9, 64, 512}) {
-            for (int64_t ns : {257, 2051}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 4096, ns, nq < 128 ? 1 : 4, SA_ROWS_PR));
-        }
-        test_cases.emplace_back(new test_sparse_attn(t, t, 129, 4096, 257,  4, SA_ROWS_PR));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 513, 4096, 2051, 4, SA_ROWS_PR));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 640, 4096, 257,  4, SA_ROWS_PR));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 130, 32768, 2051, 4, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 7000));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 200, 65536, 2051, 4, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 15000));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 70,  65536, 2051, 1, SA_ROWS_PRBLK, 12, 1, 0, 0, 0, 0, SA_PLAIN, 16000));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 9,   4096, 257,  1, SA_ROWS_PR, 4));
-    }
-    test_cases.emplace_back(new test_sparse_attn(Q8, F16, 513, 4096, 2051, 4, SA_ROWS_PR));
-    test_cases.emplace_back(new test_sparse_attn(F16, Q8, 513, 4096, 2051, 4, SA_ROWS_PR));
-    test_cases.emplace_back(new test_sparse_attn(Q8, F16, 130, 32768, 2051, 4, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 7000));
-    test_cases.emplace_back(new test_sparse_attn(F16, F16, 130, 270336, 2051, 4, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 66000));
+        // ---- the QSA_*_MASKLESS shapes of #219 (deleted in W13), with their cell formulas (SA_ROWS_PR / SA_ROWS_PRBLK), including
+        //      the q8_0 and mixed K/V case list #219 added (b60447506): decode q {1, 9, 64, 512} x sel {257, 2051}; prefill 129 /
+        //      513 / 640; 130 x 32k, 200 x 64k, 70 x 64k; mixed q8_0 / f16 at 513 and 130; GQA 4 ----
+        P(ATTN).k({F16, Q8}).nq({1, 9, 64}).nkv({4096}).nsel({257, 2051}).rows({SA_ROWS_PR}),
+        P(ATTN).k({F16, Q8}).nq({512}).nkv({4096}).nsel({257, 2051}).g({4}).rows({SA_ROWS_PR}),
+        P(ATTN).k({F16, Q8}).nq({129, 640}).nkv({4096}).nsel({257}).g({4}).rows({SA_ROWS_PR}),
+        P(ATTN).k({F16, Q8}).nq({513}).nkv({4096}).nsel({2051}).g({4}).rows({SA_ROWS_PR}),
+        P(ATTN).k({F16, Q8}).nq({130}).nkv({32768}).nsel({2051}).g({4}).rows({SA_ROWS_PRBLK}).prblk(7000),
+        P(ATTN).k({F16, Q8}).nq({200}).nkv({65536}).nsel({2051}).g({4}).rows({SA_ROWS_PRBLK}).prblk(15000),
+        P(ATTN).k({F16, Q8}).nq({70}).nkv({65536}).nsel({2051}).rows({SA_ROWS_PRBLK}).layout({0}).prblk(16000),
+        P(ATTN).k({F16, Q8}).gqa({4}).nq({9}).nkv({4096}).nsel({257}).rows({SA_ROWS_PR}),
+        P(ATTN).k({Q8}).v({F16}).nq({513}).nkv({4096}).nsel({2051}).g({4}).rows({SA_ROWS_PR}),
+        P(ATTN).k({F16}).v({Q8}).nq({513}).nkv({4096}).nsel({2051}).g({4}).rows({SA_ROWS_PR}),
+        P(ATTN).k({Q8}).v({F16}).nq({130}).nkv({32768}).nsel({2051}).g({4}).rows({SA_ROWS_PRBLK}).prblk(7000),
+        P(ATTN).k({F16}).nq({130}).nkv({270336}).nsel({2051}).g({4}).rows({SA_ROWS_PRBLK}).prblk(66000),
 
-    // ---- the G4 attend (PLAN-v3 §13 W3): every S_fast pair x both V-loader regimes x 1 / 2 streams x GQA {4, 8, 12};
-    //      n_q 129: n_kv 4096 < 64 * 129 (packed V), n_kv 16384 >= 64 * 129 (direct V); K/V layouts alternating ----
-    {
-        int alt = 0;
-        for (ggml_type tk : S_fast) {
-            for (ggml_type tv : S_fast) {
-                for (int gqa : {4, 8, 12}) {
-                    for (int ns : {1, 2}) {
-                        for (int64_t nk : {4096, 16384}) {
-                            test_cases.emplace_back(new test_sparse_attn(tk, tv, 129, nk, 257, 4, SA_ROWS_MIX, gqa, ns, 0, 0, alt++ % 2));
-                        }
-                    }
-                }
-            }
-        }
-    }
+        // ---- the G4 attend (PLAN-v3 §13 W3): every S_fast pair x both V-loader regimes x 1 / 2 streams x GQA {4, 8, 12};
+        //      n_q 129: n_kv 4096 < 64 * 129 (packed V), n_kv 16384 >= 64 * 129 (direct V); K/V layouts alternating ----
+        P(ATTN).k(S_fast).v(S_fast).gqa({4, 8, 12}).ns({1, 2}).nkv({4096, 16384}).nq({129}).nsel({257}).g({4}).layout({SA_ALT0}),
 
-    // ---- the G1 attend (PLAN-v3 §13 W4) ----
-    // the W4 n_q set x 1 / 2 streams x every S_fast type: n_kv 8192, n_sel 2051, so the shape-only split count
-    // (sa_g1_splits: PR #219's decode rule) walks 33 (n_q 1-8), 26 (9), 5 (64, 65), 4 (66), 3 (127), 2 (263); K/V layouts
-    // alternating
-    {
-        int alt = 0;
-        for (int64_t nq : {1, 2, 4, 8, 9, 64, 65, 66, 127, 263}) {
-            for (int ns : {1, 2}) {
-                for (ggml_type t : S_fast) {
-                    test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, 1, SA_ROWS_MIX, 12, ns, 0, 0, alt++ % 2));
-                }
-            }
-        }
-    }
-    // every compiled G1 census key (sparse-attn-census.h: S_fast^2 x GQA {4, 8, 12} x the 5 split classes): n_q 1,
-    // n_kv 16384, n_sel 17 / 257 / 513 / 2051 / 4096 -> 1 / 5 / 9 / 33 / 64 splits
-    {
-        int alt = 0;
-        for (ggml_type tk : S_fast) {
-            for (ggml_type tv : S_fast) {
-                for (int gqa : {4, 8, 12}) {
-                    for (int64_t ns : {17, 257, 513, 2051, 4096}) {
-                        test_cases.emplace_back(new test_sparse_attn(tk, tv, 1, 16384, ns, 1, SA_ROWS_MIX, gqa, 1, 0, 0, alt++ % 2));
-                    }
-                }
-            }
-        }
-    }
-    // complete quads (the CB rows of a fresh cache, C5: qpb 1.001) at the decode and ub64 shapes
-    for (ggml_type t : S_fast) {
-        for (int64_t nq : {1, 64}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 65536, 2051, 1, SA_ROWS_BLOCKS));
-    }
-    // the ported #219 shapes PR219 ran through its decode kernel (R2-BOP route census: every same-type case with n_q <= 512)
-    // whose G4 variant is listed above: their G1 variants, so U34 gates the G1 kernel on every one of them
-    for (ggml_type t : {F16, Q8}) {
-        test_cases.emplace_back(new test_sparse_attn(t, t, 512, 4096, 257,  1, SA_ROWS_PR));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 512, 4096, 2051, 1, SA_ROWS_PR));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 129, 4096, 257,  1, SA_ROWS_PR));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 130, 32768, 2051, 1, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 7000));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 200, 65536, 2051, 1, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 15000));
-    }
-    test_cases.emplace_back(new test_sparse_attn(F16, F16, 130, 270336, 2051, 1, SA_ROWS_PRBLK, 12, 1, 0, 0, 1, 0, SA_PLAIN, 66000));
+        // ---- the G1 attend (PLAN-v3 §13 W4) ----
+        // the W4 n_q set x 1 / 2 streams x every S_fast type: n_kv 8192, n_sel 2051, so the shape-only split count
+        // (sa_g1_splits: PR #219's decode rule) walks 33 (n_q 1-8), 26 (9), 5 (64, 65), 4 (66), 3 (127), 2 (263); K/V layouts
+        // alternating with the type
+        P(ATTN).k({F16, Q8}).ns({1, 2}).nq({1, 2, 4, 8, 9, 64, 65, 66, 127, 263}).nkv({8192}).nsel({2051}).layout({0}),
+        P(ATTN).k({BF16, Q4}).ns({1, 2}).nq({1, 2, 4, 8, 9, 64, 65, 66, 127, 263}).nkv({8192}).nsel({2051}).layout({1}),
+        // every G1 kernel (S_fast^2 x GQA {4, 8, 12}) in the 5 split classes: n_q 1, n_kv 16384, n_sel 17 / 257 / 513 / 2051 /
+        // 4096 -> 1 / 5 / 9 / 33 / 64 splits
+        P(ATTN).k(S_fast).v(S_fast).gqa({4, 8, 12}).nq({1}).nkv({16384}).nsel({17, 257, 513, 2051, 4096}).layout({SA_ALT0}),
+        // complete quads (the CB rows of a fresh cache, C5: qpb 1.001) at the decode and ub64 shapes
+        P(ATTN).k(S_fast).nq({1, 64}).nkv({65536}).nsel({2051}).rows({SA_ROWS_BLOCKS}),
+        // the ported #219 shapes PR219 ran through its decode kernel (R2-BOP route census: every same-type case with n_q <= 512)
+        // whose G4 variant is listed above: their G1 variants, so U34 gates the G1 kernel on every one of them
+        P(ATTN).k({F16, Q8}).nq({512}).nkv({4096}).nsel({257, 2051}).rows({SA_ROWS_PR}),
+        P(ATTN).k({F16, Q8}).nq({129}).nkv({4096}).nsel({257}).rows({SA_ROWS_PR}),
+        P(ATTN).k({F16, Q8}).nq({130}).nkv({32768}).nsel({2051}).rows({SA_ROWS_PRBLK}).prblk(7000),
+        P(ATTN).k({F16, Q8}).nq({200}).nkv({65536}).nsel({2051}).rows({SA_ROWS_PRBLK}).prblk(15000),
+        P(ATTN).k({F16}).nq({130}).nkv({270336}).nsel({2051}).rows({SA_ROWS_PRBLK}).prblk(66000),
 
-    // ---- gate fusion (test_sparse_attn_gated, PLAN-v3 §14.1): every EPI = gated G4 instance (S_fast pair x V regime x
-    //      GQA), the MMB reader paths (BF16 copy with and without the F32 store, F16 copy for a dense-R2 Q8_0 weight),
-    //      2 streams, and the overlap rejection ----
-    for (ggml_type tk : S_fast) {
-        for (ggml_type tv : S_fast) {
-            for (int gqa : {4, 8, 12}) {
-                for (int64_t nk : {4096, 16384}) {
-                    test_cases.emplace_back(new test_sparse_attn_gated(tk, tv, 129, nk, 257, gqa, 1, SA_GATE_F32));
-                }
-            }
-        }
-    }
-    for (ggml_type t : {F16, Q8}) {
-        for (int var : {SA_GATE_BF16, SA_GATE_BF16_ONLY, SA_GATE_F16_ONLY}) {
-            test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 4096, 257, 12, 1, var));
-        }
-        test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 16384, 257, 12, 1, SA_GATE_F16_ONLY, 0));
-        test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 4096, 2051, 12, 2, SA_GATE_F32));
-    }
-    for (ggml_type t : {F16, Q4}) test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, 4096, 257, 12, 1, SA_GATE_REJECT));
-    // the gate fused into the rotated epilogue (W10): every S_fast type x both V regimes x the qwen4exp pair (256, 64) and
-    // (64, 256), the 16-bit reader paths and 2 streams with rotations, and the rejection with rotations
-    for (ggml_type t : S_fast) {
-        for (auto r : std::vector<std::pair<int, int>>{{256, 64}, {64, 256}}) {
-            for (int64_t nk : {4096, 16384}) {
-                test_cases.emplace_back(new test_sparse_attn_gated(t, t, 129, nk, 257, 12, 1, SA_GATE_F32, 1, r.first, r.second));
-            }
-        }
-    }
-    for (int var : {SA_GATE_BF16, SA_GATE_BF16_ONLY, SA_GATE_F16_ONLY}) {
-        test_cases.emplace_back(new test_sparse_attn_gated(Q8, Q8, 129, 4096, 257, 12, 1, var, 1, 256, 64));
-    }
-    test_cases.emplace_back(new test_sparse_attn_gated(Q4, Q8, 129, 4096, 2051, 8, 2, SA_GATE_F32, 1, 256, 64));
-    test_cases.emplace_back(new test_sparse_attn_gated(Q8, Q8, 129, 4096, 257, 12, 1, SA_GATE_REJECT, 1, 256, 64));
+        // ---- gate fusion (test_sparse_attn_gated, PLAN-v3 §14.1): every EPI = gated G4 instance (S_fast pair x V regime x
+        //      GQA), the MMB reader paths (BF16 copy with and without the F32 store, F16 copy for a dense-R2 Q8_0 weight),
+        //      2 streams, and the overlap rejection ----
+        P(GATED).k(S_fast).v(S_fast).gqa({4, 8, 12}).nkv({4096, 16384}).nq({129}).nsel({257}),
+        P(GATED).k({F16, Q8}).nq({129}).nkv({4096}).nsel({257}).gate({SA_GATE_BF16, SA_GATE_BF16_ONLY, SA_GATE_F16_ONLY}),
+        P(GATED).k({F16, Q8}).nq({129}).nkv({16384}).nsel({257}).gate({SA_GATE_F16_ONLY}).layout({0}),
+        P(GATED).k({F16, Q8}).ns({2}).nq({129}).nkv({4096}).nsel({2051}),
+        P(GATED).k({F16, Q4}).nq({129}).nkv({4096}).nsel({257}).gate({SA_GATE_REJECT}),
+        // the gate fused into the rotated epilogue (W10): every S_fast type x both V regimes x the qwen4exp pair (256, 64) and
+        // (64, 256), the 16-bit reader paths and 2 streams with rotations, and the rejection with rotations
+        P(GATED).k(S_fast).nq({129}).nkv({4096, 16384}).nsel({257}).rot({{256, 64}, {64, 256}}),
+        P(GATED).k({Q8}).nq({129}).nkv({4096}).nsel({257}).rot({{256, 64}}).gate({SA_GATE_BF16, SA_GATE_BF16_ONLY, SA_GATE_F16_ONLY}),
+        P(GATED).k({Q4}).v({Q8}).gqa({8}).ns({2}).nq({129}).nkv({4096}).nsel({2051}).rot({{256, 64}}),
+        P(GATED).k({Q8}).nq({129}).nkv({4096}).nsel({257}).rot({{256, 64}}).gate({SA_GATE_REJECT}),
 
-    // ---- the generic tier (PLAN-v3 §13 W5): every pair of S with a member outside S_fast. The S x S list above runs them
-    //      on G1 (n_q 9, n_sel 257); here: G4 in both V regimes, every generic census key, the n_q set, poison, overflow ----
-    const ggml_type S_gen[] = { GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
-    auto is_gen = [&](ggml_type t) { return std::find(std::begin(S_gen), std::end(S_gen), t) != std::end(S_gen); };
-    // G4, n_q 129: n_kv 4096 < 64 * 129 (packed V, the generic pack), n_kv 16384 >= 64 * 129 (direct V); layouts alternating
-    {
-        int alt = 0;
-        for (ggml_type tk : S_all) {
-            for (ggml_type tv : S_all) {
-                if (!is_gen(tk) && !is_gen(tv)) continue;
-                for (int64_t nk : {4096, 16384}) {
-                    test_cases.emplace_back(new test_sparse_attn(tk, tv, 129, nk, 257, 4, SA_ROWS_MIX, 12, 1, 0, 0, alt++ % 2));
-                }
-            }
-        }
-    }
-    // every generic G4 key (V regime x GQA {4, 8, 12}) with 1 / 2 streams, and every generic G1 key (GQA x the 5 split
-    // classes: n_q 1, n_kv 16384, n_sel 17 / 257 / 513 / 2051 / 4096), on mixed generic / fast pairs
-    for (auto pr : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL}, {GGML_TYPE_F32, GGML_TYPE_Q5_0}, {GGML_TYPE_Q5_1, F16}}) {
-        for (int gqa : {4, 8, 12}) {
-            for (int ns : {1, 2}) {
-                for (int64_t nk : {4096, 16384}) {
-                    test_cases.emplace_back(new test_sparse_attn(pr.first, pr.second, 129, nk, 257, 4, SA_ROWS_MIX, gqa, ns));
-                }
-            }
-        }
-    }
-    for (auto pr : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q5_0, GGML_TYPE_Q4_1}, {Q8, GGML_TYPE_F32}}) {
-        for (int gqa : {4, 8, 12}) {
-            for (int64_t ns : {17, 257, 513, 2051, 4096}) {
-                test_cases.emplace_back(new test_sparse_attn(pr.first, pr.second, 1, 16384, ns, 1, SA_ROWS_MIX, gqa));
-            }
-        }
-    }
-    // the n_q set on G1 / G4 at n_sel 2051 for every generic type (K = V), 2 streams on two of them, complete quads
-    for (ggml_type t : S_gen) {
-        for (int64_t nq : {1, 9, 66, 263}) test_cases.emplace_back(new test_sparse_attn(t, t, nq, 8192, 2051, 1, SA_ROWS_MIX));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 513, 8192, 2051, 4, SA_ROWS_MIX));
-        test_cases.emplace_back(new test_sparse_attn(t, t, 513, 65536, 2051, 4, SA_ROWS_BLOCKS));
-    }
-    for (ggml_type t : {GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL}) {
-        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 65, 4096, 2051, G, SA_ROWS_MIX, 12, 2, 0, 0, 0));
-    }
-    // poison (every generic type: NaN / inf values and scales in unselected cells and padding quads); f32 V overflow
-    for (ggml_type t : S_gen) {
-        for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(t, t, 66, 4096, 257, G, SA_ROWS_POISON, 12, 1, 0, 0, 1, 0, SA_POISON));
-    }
-    for (int G : {1, 4}) test_cases.emplace_back(new test_sparse_attn(GGML_TYPE_Q5_1, GGML_TYPE_F32, 9, 4096, 257, G, SA_ROWS_SINGLE, 12, 1, 0, 0, 1, 0, SA_OVERFLOW));
+        // ---- the generic tier (PLAN-v3 §13 W5): every pair of S with a member outside S_fast. The S x S families above run
+        //      them on G1 (n_q 9, n_sel 257); here: G4 in both V regimes, every generic kernel, the n_q set, poison, overflow ----
+        // G4, n_q 129: n_kv 4096 < 64 * 129 (packed V, the generic pack), n_kv 16384 >= 64 * 129 (direct V); layouts alternating
+        P(ATTN).k(S_all).v(S_all).gen_only().nkv({4096, 16384}).nq({129}).nsel({257}).g({4}).layout({SA_ALT0}),
+        // every generic G4 kernel (V regime x GQA {4, 8, 12}) with 1 / 2 streams, and every generic G1 kernel (GQA x the 5
+        // split classes: n_q 1, n_kv 16384, n_sel 17 / 257 / 513 / 2051 / 4096), on mixed generic / fast pairs
+        P(ATTN).k({Q4_1}).v({IQ4NL}).gqa({4, 8, 12}).ns({1, 2}).nkv({4096, 16384}).nq({129}).nsel({257}).g({4}),
+        P(ATTN).k({F32}).v({Q5_0}).gqa({4, 8, 12}).ns({1, 2}).nkv({4096, 16384}).nq({129}).nsel({257}).g({4}),
+        P(ATTN).k({Q5_1}).v({F16}).gqa({4, 8, 12}).ns({1, 2}).nkv({4096, 16384}).nq({129}).nsel({257}).g({4}),
+        P(ATTN).k({Q5_0}).v({Q4_1}).gqa({4, 8, 12}).nq({1}).nkv({16384}).nsel({17, 257, 513, 2051, 4096}),
+        P(ATTN).k({Q8}).v({F32}).gqa({4, 8, 12}).nq({1}).nkv({16384}).nsel({17, 257, 513, 2051, 4096}),
+        // the n_q set on G1 / G4 at n_sel 2051 for every generic type (K = V), 2 streams on two of them, complete quads
+        P(ATTN).k(S_gen).nq({1, 9, 66, 263}).nkv({8192}).nsel({2051}),
+        P(ATTN).k(S_gen).nq({513}).nkv({8192}).nsel({2051}).g({4}),
+        P(ATTN).k(S_gen).nq({513}).nkv({65536}).nsel({2051}).g({4}).rows({SA_ROWS_BLOCKS}),
+        P(ATTN).k({Q4_1, IQ4NL}).ns({2}).nq({65}).nkv({4096}).nsel({2051}).g(G14).layout({0}),
+        // poison (every generic type: NaN / inf values and scales in unselected cells and padding quads); f32 V overflow
+        P(ATTN).k(S_gen).nq({66}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_POISON}).special({SA_POISON}),
+        P(ATTN).k({Q5_1}).v({F32}).nq({9}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_SINGLE}).special({SA_OVERFLOW}),
 
-    // ---- GQA 4 / 8 against GQA 12 on replicated heads (PLAN-v3 §13 W5, §14.2 (c)): the fast G4 and G1 instances of every
-    //      S_fast type, one mixed pair, and the generic tier (q4_1, q5_0 / f16) ----
-    for (ggml_type t : S_fast) {
-        for (int G : {1, 4}) {
-            for (int gqa : {4, 8}) test_cases.emplace_back(new test_sparse_attn_gqa_rep(t, t, 66, 4096, 2051, G, gqa));
-        }
-    }
-    for (int gqa : {4, 8}) {
-        test_cases.emplace_back(new test_sparse_attn_gqa_rep(Q8, F16, 129, 16384, 257, 4, gqa, 2));    // direct V, 2 streams
-        test_cases.emplace_back(new test_sparse_attn_gqa_rep(Q4, BF16, 1, 16384, 2051, 1, gqa));        // G1 split-K
-        for (int G : {1, 4}) {
-            test_cases.emplace_back(new test_sparse_attn_gqa_rep(GGML_TYPE_Q4_1, GGML_TYPE_Q4_1, 66, 4096, 2051, G, gqa));
-            test_cases.emplace_back(new test_sparse_attn_gqa_rep(GGML_TYPE_Q5_0, F16, 129, 16384, 257, G, gqa));
-        }
+        // ---- GQA 4 / 8 against GQA 12 on replicated heads (PLAN-v3 §13 W5, §14.2 (c)): the fast G4 and G1 instances of every
+        //      S_fast type, one mixed pair, and the generic tier (q4_1, q5_0 / f16) ----
+        P(GQAREP).k(S_fast).gqa({4, 8}).nq({66}).nkv({4096}).nsel({2051}).g(G14),
+        P(GQAREP).k({Q8}).v({F16}).gqa({4, 8}).ns({2}).nq({129}).nkv({16384}).nsel({257}).g({4}),   // direct V, 2 streams
+        P(GQAREP).k({Q4}).v({BF16}).gqa({4, 8}).nq({1}).nkv({16384}).nsel({2051}),                     // G1 split-K
+        P(GQAREP).k({Q4_1}).gqa({4, 8}).nq({66}).nkv({4096}).nsel({2051}).g(G14),
+        P(GQAREP).k({Q5_0}).v({F16}).gqa({4, 8}).nq({129}).nkv({16384}).nsel({257}).g(G14),
+    };
+    for (const sa_family & f : families) {
+        sa_add_family(test_cases, f);
     }
 }
 
