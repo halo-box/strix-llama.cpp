@@ -46,7 +46,7 @@ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_b
 std::string llama_qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor * attn);
 
 // The QSA reserve graphs of PLAN-v3 §7.1 that llama_context::sched_reserve builds after the pp and tg graphs, as a pure
-// function of the context's shape (so the list is testable without a model: tests/test-qsa-reserve-passes.cpp).
+// function of the context's shape (so the list is testable without a model: tests/test-qsa-checks.cpp, reserve-passes).
 struct llama_qsa_reserve_shape {
     uint32_t n_tokens;        // min(n_ctx, n_ubatch)
     uint32_t n_seqs;          // n_seq_max (the reserve's n_seqs)

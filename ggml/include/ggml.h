@@ -2673,7 +2673,7 @@ extern "C" {
     //      attended cell's does. With a finite V row the row is the softmax over the other cells; a +-inf or NaN element
     //      of that V row (item 1) makes that dimension of the row NaN (0 * inf); every cell -inf gives 0 (item 5). Only
     //      a masked cell (item 4) contributes nothing whatever its bytes: the WMMA tiers share one PV product between the
-    //      rows of a block and cannot drop a cell for one row (tests/test-sparse-attn-neginf-v.cpp).
+    //      rows of a block and cannot drop a cell for one row (tests/test-sparse-attn-checks.cpp, neginf-v).
     //   4. A cell whose mask bit is 0 and every padding entry contribute nothing, whatever their stored bytes
     //      (NaN / inf included). The summation order is a pure function of the shape and of the op's inputs, so the
     //      output is deterministic run to run.

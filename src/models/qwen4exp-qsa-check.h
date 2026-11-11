@@ -3,7 +3,7 @@
 #include <cstdint>
 
 // The always-on graph-build check of a QSA layer (PLAN-v3 §4.3, no env gate), as a pure function of the layer's decision
-// (tests/test-qsa-noncompact-check.cpp). A ubatch on the complete-block selection path whose visibility is not scalar (a
+// (tests/test-qsa-checks.cpp, noncompact-check). A ubatch on the complete-block selection path whose visibility is not scalar (a
 // non-compact ubatch) takes the TE rows; the reserve covers that only for at most U tokens in a context serving several
 // sequences (the non-compact variant, §7.1.4) and not at all in a single-sequence context (§7.1.5), so such a ubatch is
 // a decode error, which process_ubatch returns before the graph is allocated.

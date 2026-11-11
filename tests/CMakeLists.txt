@@ -168,8 +168,6 @@ endif ()
 
 llama_build_and_test(test-qsa-fast.cpp)
 llama_build_and_test(test-qsa-recover.cpp)
-# the all-visible rows of the QSA shortcut (PLAN-v3 §14.1), on every backend of the build
-llama_build_and_test(test-qsa-allvis-rows.cpp)
 # the TE rows of a non-compact QSA ubatch against PR219's masked route on the R1-CB oracle layouts (PLAN-v3 W8), on every backend of the build
 llama_build_and_test(test-qsa-te-rows.cpp)
 llama_build_and_test(test-ple-disk.cpp)
@@ -199,18 +197,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # PLAN-v3 W9: the compact visibility predicate against the KQ mask, and the non-compact re-split, on the production
     # hybrid-idx memory (CPU, no model file)
     llama_build_and_test(test-qsa-visibility.cpp LINK llama)
-    # the duplicate-key term of the compact predicate reads a kept count, not a walk of every cell of the sequence
-    llama_build_and_test(test-qsa-dup-key.cpp LINK llama)
     llama_build_and_test(test-qsa-resplit.cpp LINK llama)
-    llama_build_and_test(test-qsa-reserve-view.cpp LINK llama)
-    # the QSA reserve pass list (llama_qsa_reserve_passes) builds the one-stream shortcut graph of a split multi-sequence context
-    llama_build_and_test(test-qsa-reserve-passes.cpp LINK llama)
-    # the always-on QSA graph-build check fails non-compact ubatches only where block selection is eligible
-    llama_build_and_test(test-qsa-noncompact-check.cpp)
     # PLAN-v3 W11: the indexer cache type (qwen4exp auto, GLM5_NEXT unchanged) and the session-state check of an old indexer type
     llama_build_and_test(test-qsa-idx-type.cpp LINK llama)
-    # the "supported here" list of the QSA init error probes nine types without running out of its ggml context
-    llama_build_and_test(test-qsa-supported-types.cpp LINK llama)
+    # unit checks of the llama-side QSA pieces, one ctest per section (test-qsa-checks.cpp lists them): the duplicate-key
+    # count, the reserve views, the reserve pass list, the non-compact graph-build check, the init error's type list
+    llama_build(test-qsa-checks.cpp LINK llama)
+    foreach (section dup-key reserve-view reserve-passes noncompact-check supported-types)
+        llama_test(test-qsa-checks NAME test-qsa-${section} ARGS ${section})
+    endforeach()
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -346,7 +341,7 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 # the sparse attention host reference (sparse-attn-ref.h) checks the CPU op bit for bit: no FMA contraction
-set_source_files_properties(test-backend-ops.cpp test-sparse-attn-plan-oracle.cpp test-sparse-attn-neginf-v.cpp PROPERTIES COMPILE_OPTIONS
+set_source_files_properties(test-backend-ops.cpp test-sparse-attn-plan-oracle.cpp test-sparse-attn-checks.cpp PROPERTIES COMPILE_OPTIONS
     "$<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>,$<CXX_COMPILER_ID:IntelLLVM>>:-ffp-contract=off>")
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
@@ -433,27 +428,27 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp LINK ggml)
     # the sparse attention plan against the C3 oracle (sparse-attn-ref.h), plus the over-allocation check of the two ops
     llama_build_and_test(test-sparse-attn-plan-oracle.cpp LINK ggml)
-    # ggml.h item 3: a -inf cell's non-finite V element gives NaN in that dimension (0 * v), the CPU op and O_CON agree
-    llama_build_and_test(test-sparse-attn-neginf-v.cpp LINK ggml)
     # Vulkan checks of the two ops: limits, capability gates, rotation against fwht.comp, the workspace sync rule (skips without Vulkan)
     llama_build_and_test(test-sparse-attn-vk.cpp LINK ggml)
-    # every dense pick of the QSA shortcut policy (HIP, Vulkan) is a FLASH_ATTN_EXT the device takes; skipped without the policy
-    llama_build_and_test(test-qsa-prefer-dense.cpp LINK ggml)
     # HIP checks of the in-op rotations: H_q / H_o in every tier bitwise against fwht.cu, and against the graph-side form (skips without ROCm)
     llama_build_and_test(test-sparse-attn-rot.cpp LINK ggml)
-    # the SPARSE_ATTN alloc size as an RPC server computes it (the plan's own source not linked) equals the linked one, per device
-    llama_build_and_test(test-sparse-attn-rpc-view.cpp LINK ggml)
-    # supports_op rejects SPARSE_ATTN / SPARSE_ATTN_PLAN nodes whose shapes break ggml_sparse_attn's invariants (an RPC
-    # server's node), on every device of the build
-    llama_build_and_test(test-sparse-attn-shape-guard.cpp LINK ggml)
+    # standalone checks of the two ops and the QSA graph pieces, one ctest per section (test-sparse-attn-checks.cpp lists
+    # them): ggml.h item 3 (-inf cell, non-finite V), the shape guard of supports_op and the alloc size of an RPC server's
+    # node on every device, the HIP gate-fusion output placement (host only), the dense picks of the shortcut policy, the
+    # all-visible rows on every backend
+    llama_build(test-sparse-attn-checks.cpp LINK ggml)
+    llama_test(test-sparse-attn-checks NAME test-sparse-attn-neginf-v ARGS neginf-v)
+    llama_test(test-sparse-attn-checks NAME test-sparse-attn-shape-guard ARGS shape-guard)
+    llama_test(test-sparse-attn-checks NAME test-sparse-attn-rpc-view ARGS rpc-view)
+    llama_test(test-sparse-attn-checks NAME test-sparse-attn-gate-scratch ARGS gate-scratch)
+    llama_test(test-sparse-attn-checks NAME test-qsa-prefer-dense ARGS prefer-dense)
+    llama_test(test-sparse-attn-checks NAME test-qsa-allvis-rows ARGS allvis-rows)
     if (GGML_RPC AND NOT WIN32)
         # the sparse-attention ops through an in-process rpc-server: alloc size per plan, supports_op of the server device
         llama_build_and_test(test-rpc-sparse-attn.cpp LINK ggml)
         # the RPC hello rejects a server older than the op enum this client sends
         llama_build_and_test(test-rpc-hello.cpp LINK ggml)
     endif()
-    # the HIP gated SPARSE_ATTN fusion places an output that overlaps a read in graph memory, never in the pool (D12); host only
-    llama_build_and_test(test-sparse-attn-gate-scratch.cpp LINK ggml)
     # the QSA placement guard (PLAN-v3 §10): needs a qwen4exp model on the command line (fake GPU device, forced reject, non-vacuity)
     llama_build(test-qsa-guard.cpp LINK llama ggml)
     # census rows from the shipped policy, for scripts/qsa-validation/census_check.py (PLAN-v3 §14.3)

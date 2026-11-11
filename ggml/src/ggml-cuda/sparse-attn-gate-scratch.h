@@ -6,7 +6,7 @@
 // place: it goes to graph memory that the fused subgraph leaves unwritten (the attend's own dst, the CONT and SIGMOID outputs,
 // all in the reserved compute buffer), and one device copy moves it into place; when none fits, the fusion is refused (the
 // unfused nodes run). Never pool memory: PLAN-v3 D12 (no ctx.pool() in a sparse kernel; the pool is outside the reserve, the
-// fit probe and LLAMA_STRICT_RESERVE). Host-only: tests/test-sparse-attn-gate-scratch.cpp checks it on synthetic layouts.
+// fit probe and LLAMA_STRICT_RESERVE). Host-only: tests/test-sparse-attn-checks.cpp (gate-scratch) checks it on synthetic layouts.
 
 #include <cstddef>
 #include <cstdint>
