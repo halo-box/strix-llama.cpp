@@ -16832,9 +16832,14 @@ ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buff
     return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
 }
 
+// Tensors in device buffers are placed on at least 256 B boundaries. RADV reports minStorageBufferOffsetAlignment = 4, so the
+// graph allocator placed about half of the activations 8 bytes past a 16 B boundary; the vector loads and stores of the MoE down,
+// MoE epilogue and hc kernels run several % slower there (Strix Halo, Mesa 26.2.4). Placement only: the math is unchanged.
+static constexpr size_t ggml_vk_buf_align_min = 256;
+
 size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
-    return ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    return std::max<size_t>(ctx->device->properties.limits.minStorageBufferOffsetAlignment, ggml_vk_buf_align_min);
 }
 
 size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
