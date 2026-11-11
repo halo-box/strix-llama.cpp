@@ -54,6 +54,14 @@ static uint64_t fnv1a64(const void * data, size_t n) {
     return h;
 }
 
+static void sha256_hex(const void * data, size_t n, char * out) {
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    sha256_hash(digest, (const unsigned char *) data, n);
+    for (int i = 0; i < SHA256_DIGEST_SIZE; i++) {
+        snprintf(out + 2*i, 3, "%02x", digest[i]);
+    }
+}
+
 static uint32_t xorshift32(uint32_t * s) {
     uint32_t x = *s;
     x ^= x << 13;
@@ -472,6 +480,8 @@ static int op_check_rows(ggml_backend_t be, ggml_backend_t be_ref, const struct 
             ggml_backend_tensor_get(y_op, yo, 0, ggml_nbytes(y_op));
             ggml_backend_tensor_get(y_ref, yr, 0, ggml_nbytes(y_ref));
             ggml_backend_tensor_get(y_be ? y_be : y_ref, yb, 0, ggml_nbytes(y_ref));
+            char output_sha256[2*SHA256_DIGEST_SIZE + 1];
+            sha256_hex(yo, ggml_nbytes(y_op), output_sha256);
 
             n_true = n_true < nr ? n_true : nr;
             for (int64_t r = 0; r < n_true; r++) {
@@ -495,10 +505,10 @@ static int op_check_rows(ggml_backend_t be, ggml_backend_t be_ref, const struct 
             printf("{\"case\": \"%s\", \"backend\": \"%s\", \"k\": %lld, \"n\": %lld, \"rows\": %lld, \"x_pad\": %lld, "
                    "\"nmse_op_vs_mul_mat\": %.3e, \"nmse_op_vs_f64\": %.3e, \"nmse_mul_mat_vs_f64\": %.3e, "
                    "\"nmse_be_mul_mat_vs_f64\": %.3e, \"op_over_be\": %.3f, \"f64_rows\": %lld, \"gate\": \"%s\", "
-                   "\"pass\": %s}\n",
+                   "\"output_sha256\": \"%s\", \"pass\": %s}\n",
                    label, ggml_backend_name(be), (long long) k, (long long) n, (long long) nr, (long long) x_pad, e, eo, er,
                    eb, eb > 0.0 ? eo/eb : -1.0, (long long) n_true, f32_grade ? "f32" : calibrated ? "calibrated" : "none",
-                   fail ? "false" : "true");
+                   output_sha256, fail ? "false" : "true");
             fflush(stdout);
         }
     }
@@ -578,14 +588,6 @@ static int test_op(void) {
         fprintf(stderr, "op: %d of %d cases failed\n", n_fail, n_run);
     }
     return n_fail;
-}
-
-static void sha256_hex(const void * data, size_t n, char * out) {
-    unsigned char digest[SHA256_DIGEST_SIZE];
-    sha256_hash(digest, (const unsigned char *) data, n);
-    for (int i = 0; i < SHA256_DIGEST_SIZE; i++) {
-        snprintf(out + 2*i, 3, "%02x", digest[i]);
-    }
 }
 
 static void * read_tensor(FILE * f, const struct gguf_context * gctx, const struct ggml_tensor * t) {
@@ -1440,6 +1442,7 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
 
     int fail = 1;
     const char * rows_equal = "no";
+    char output_sha256[2*SHA256_DIGEST_SIZE + 1] = "";
     double err = 1.0;
     double e_op = -1.0;
     double e_be = -1.0;
@@ -1460,6 +1463,7 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
             ggml_backend_tensor_get(out, y_id, 0, ggml_nbytes(out));
             ggml_backend_tensor_get(out_b, y_be, 0, ggml_nbytes(out_b));
             ggml_backend_tensor_get(r_out, y_ref, 0, ggml_nbytes(r_out));
+            sha256_hex(y_id, ggml_nbytes(out), output_sha256);
             err = nmse(y_id, y_ref, n*n_pairs);
 
             // double sums on the first and the last 4 pairs
@@ -1565,10 +1569,11 @@ static int test_mul_mat_id_run(ggml_backend_t be, ggml_backend_t be_ref, const i
            "\"n_used\": %lld, \"ne11\": %lld, \"tokens\": %lld, \"routing\": \"%s\", \"max_rows\": %lld, \"rows_one\": %lld, "
            "\"rows_equal_mul_mat_per_expert\": \"%s\", \"nmse_vs_mul_mat_id\": %.3e, "
            "\"nmse_op_vs_f64\": %.3e, \"nmse_be_mul_mat_id_vs_f64\": %.3e, \"op_over_be\": %.3f, "
-           "\"nmse_op_vs_f64_one\": %.3e, \"nmse_be_vs_f64_one\": %.3e, \"nmse_op_vs_f64_two\": %.3e, \"nmse_be_vs_f64_two\": %.3e, \"pass\": %s}\n",
+           "\"nmse_op_vs_f64_one\": %.3e, \"nmse_be_vs_f64_one\": %.3e, \"nmse_op_vs_f64_two\": %.3e, \"nmse_be_vs_f64_two\": %.3e, "
+           "\"output_sha256\": \"%s\", \"pass\": %s}\n",
            label, ggml_backend_name(be), (long long) k, (long long) n, (long long) n_exp, tile_words/16.0, cb, (long long) n_used,
            (long long) ne11, (long long) n_tok, skew ? "skewed" : "uniform", (long long) max_rows, (long long) rows_one, rows_equal,
-           err, e_op, e_be, e_be > 0.0 ? e_op/e_be : -1.0, e_cls[0][0], e_cls[0][1], e_cls[1][0], e_cls[1][1], fail ? "false" : "true");
+           err, e_op, e_be, e_be > 0.0 ? e_op/e_be : -1.0, e_cls[0][0], e_cls[0][1], e_cls[1][0], e_cls[1][1], output_sha256, fail ? "false" : "true");
     fflush(stdout);
     ggml_backend_buffer_free(buf);
     ggml_backend_buffer_free(bufr);
