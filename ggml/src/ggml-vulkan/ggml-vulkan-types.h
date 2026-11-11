@@ -1025,6 +1025,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_x16_g16_f16;   // f16 x, f16 gate, f16 mixed stream
     // HC_POST(_GATE) + RMS_NORM + MUL (+ CPY f16) / RMS_NORM + MUL (+ CPY f16): [has_post][out_f16]
     vk_pipeline pipeline_dsv4_hc_post_norm[2][2];
+    vk_pipeline pipeline_dsv4_hc_post_norm_inj[2];   // [has_post], f16 norm + the inject projection
+    // MoE epilogue (slot sum + shared expert) + HC_POST_GATE + RMS_NORM + MUL (+ CPY f16) (+ inject): [slot f16][f32 norm, f16 norm, f16 norm + inject]
+    vk_pipeline pipeline_dsv4_hc_moe_post_norm[2][3];
+    // HC_DEFER: the attention-side combine without its residual store [0] / storing only it [1]; the MoE epilogue that recomputes
+    // it [slot f16]
+    vk_pipeline pipeline_dsv4_hc_post_norm_inj_dm[2];
+    vk_pipeline pipeline_dsv4_hc_moe_post_norm_defer[2];
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1431,6 +1438,8 @@ struct ggml_backend_vk_context {
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     bool fused_mmid_pair_glu {};   // MUL_MAT_ID+CPY(f16) x 2 + SWIGLU: gate, up and the SwiGLU in one weight-streaming launch
     bool fused_mmid_pair_glu_f32 {};   // ... its f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU
+    bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
+    int fused_hc_moe_epi {};   // HC_MOE_EPI: number of ADD nodes (routed slot adds + the shared-expert add) in front of the HC post norm chain
     // chunked GDN with the q/k l2 norms in gdn_chunk_prep (rebuilt per graph by ggml_vk_gdn_qk_norm_prepass): the raw q/k
     // views and norm constants per GATED_DELTA_NET node, and the RMS_NORM / SCALE nodes that then do not run
     struct gdn_qk_norm { const ggml_tensor * q_raw; const ggml_tensor * k_raw; float eps; float mul; };
@@ -1455,8 +1464,19 @@ struct ggml_backend_vk_context {
     std::vector<ssm_conv_direct_match> ssm_conv_direct_matches;
     int fused_concat_tail {-1};      // current CONCAT writes only its tail (index into ssm_conv_direct_matches)
     int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
-    // set while the current node is a direct conv or a folded GDN: srcs read outside node->src for the sync tracking
-    const ggml_tensor * fused_extra_srcs[3] {};
+    // set while the current node is a direct conv, a folded GDN or the deferred MoE epilogue: srcs read outside node->src for the sync tracking
+    const ggml_tensor * fused_extra_srcs[4] {};
+    // HC_DEFER: an attention-side combine output that was not stored (a), with the inputs it is recomputed from (the residual,
+    // the block output, the raw post weights and the gate scales) and the chain's first node for a store-only replay
+    struct hc_defer_state {
+        const ggml_tensor * a = nullptr;
+        const ggml_tensor * res0 = nullptr;
+        const ggml_tensor * x = nullptr;
+        const ggml_tensor * pw = nullptr;
+        float gate_in = 1.0f, gate_out = 1.0f;
+        int node_idx = -1;
+    } hc_defer;
+    const ggml_tensor * fused_extra_dst {};   // written by the fused kernel besides the write-mask nodes (synced like them)
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
