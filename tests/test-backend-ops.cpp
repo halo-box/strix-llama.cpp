@@ -14057,7 +14057,7 @@ static void sa_init_sel(ggml_tensor * sel, const std::vector<int32_t> & rows) {
     sa_write_rows(sel, rows);
 }
 
-// Vulkan has no G = 4 plan or attend, and no K/V binding past the device limit (1 GiB, or a smaller maxStorageBufferRange)
+// Vulkan has no G = 4 plan or attend, and no K/V binding past the device limit (maxStorageBufferRange, at most 4 GiB)
 static bool sa_expected_unsupported(ggml_backend_t backend, int group, size_t k_bytes, size_t v_bytes) {
     const bool vk = strncmp(ggml_backend_name(backend), "Vulkan", 6) == 0;
     if (vk && group == 4) {

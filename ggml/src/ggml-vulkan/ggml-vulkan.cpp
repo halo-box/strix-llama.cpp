@@ -10766,11 +10766,13 @@ static bool ggml_vk_sa_binding_fits(const vk_device & device, const size_t nbyte
     return nbytes + device->properties.limits.minStorageBufferOffsetAlignment <= ggml_vk_sa_max_binding(device);
 }
 
-// test hook: the limit of one K/V binding
+// test hook: the limit of one K/V binding, the one ggml_vk_sa_binding_fits applies. The suballocation block does not bound it:
+// ggml-alloc gives a tensor larger than the block a buffer of its own.
 static size_t ggml_backend_vk_sa_binding_limit(ggml_backend_t backend) {
     const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
-    return std::min<size_t>(ggml_vk_sa_max_binding(ctx->device) - ctx->device->properties.limits.minStorageBufferOffsetAlignment,
-                            ctx->device->suballocation_block_size);
+    const size_t max_bind = ggml_vk_sa_max_binding(ctx->device);
+    const size_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    return max_bind > align ? max_bind - align : 0;
 }
 
 static size_t ggml_vk_sa_round_up(const vk_device & device, const size_t n) {
