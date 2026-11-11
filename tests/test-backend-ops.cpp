@@ -7469,7 +7469,7 @@ struct test_moe_glu_f16 : public test_case {
     // and must not run otherwise
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_PAIR_GLU")) {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_PAIR_GLU", "MUL_MAT_ID_PAIR_SWIGLU")) {
             return true;
         }
         const bool expect = (type_w == GGML_TYPE_Q4_K || type_w == GGML_TYPE_Q5_K || (type_w == GGML_TYPE_IQ3_S && n_embd % 512 == 0)) &&

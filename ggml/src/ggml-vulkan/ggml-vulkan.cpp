@@ -18594,6 +18594,9 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     if (l.rfind("TOPK_MOE_", 0) == 0 && (!dev->subgroup_arithmetic || !dev->subgroup_shuffle || !dev->subgroup_require_full_support)) {
         return "no full-subgroup arithmetic and shuffle";
     }
+    if (l == "MUL_MAT_ID_PAIR_SWIGLU" && (!dev->coopmat_rdna3_layout || !dev->pipeline_mmid_glu[0][0][0])) {
+        return "no weight-streaming MUL_MAT_ID GLU pipeline (RDNA3 + RADV + wave32 with the probed fragment layout)";
+    }
     if (l.rfind("RMS_NORM_MUL_ROPE", 0) == 0 && sizeof(vk_op_rms_norm_mul_rope_push_constants) > dev->properties.limits.maxPushConstantsSize) {
         return "push constants too small for rms_norm_mul_rope";
     }
