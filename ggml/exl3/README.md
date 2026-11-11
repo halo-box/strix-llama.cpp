@@ -113,11 +113,8 @@ kernel decodes 128-column slabs of `W_hat` into LDS once per block and k step (`
 `H` and `svh / 128` to the result in registers. The rotated activations are rounded to f16 once (one product, NMSE
 ~4e-8 against a double sum) or split into hi + lo parts (two products, f32 accumulation per k step, NMSE ~1e-13; blocks
 of 128 rows, or of 64 when the last block of 128 would be at most half full).
-The default takes the precision of the GEMM the same backend context runs for an F32 weight of the same shape: one
-product where that GEMM is mmb's `mmb_f32split_kernel` (one f16 product with both operands rounded, NMSE ~8e-8:
-from 512 rows with the mmb opt-in that llama sets, for contiguous x), two products where it is f32 (MMVF, MMF,
-rocBLAS: up to 511 rows, strided x, no mmb). RDNA4 keeps the groups of 8 for every row count. Other backends (CUDA,
-Vulkan, ...) do not support the op.
+EXL3 chooses one f16 product at >= 512 contiguous rows and hi + lo otherwise, independently of the MMB dispatcher.
+RDNA4 keeps the groups of 8 for every row count. Other backends (CUDA, Vulkan, ...) do not support the op.
 
 `ggml_exl3_mul_mat_id(ctx, trellis, x, ids, suh, svh, codebook)` (`GGML_OP_EXL3_MUL_MAT_ID`) is the EXL3
 counterpart of `ggml_mul_mat_id` for a stack of experts: x F32 `[k, ne11, n_tokens]` (ne11 = 1 broadcasts x over the
@@ -127,10 +124,8 @@ by expert and runs each expert's rows through the routines of `EXL3_MUL_MAT` in 
 synchronization: for one token every (slot) pair is a group of one row and the kernels read its expert from ids; for
 more tokens one block sorts the rows by expert and cuts each expert's rows into groups. Below 12 rows per expert on
 average the groups (up to 8 rows of one expert) run the dot kernel of `EXL3_MUL_MAT`; from 12 on RDNA3 they run its
-GEMM in groups of 32 rows (up to 32 rows per expert on average) or 64 rows. The precision follows the F32 control
-(`ggml_mul_mat_id` on an F32 stack), which on this backend runs the rows of each expert as one `ggml_mul_mat` on a
-contiguous copy: the rows of an expert with 512 rows or more (an expert in every token of a 512-token ubatch) take one
-f16 product, like the control's mmb GEMM there, in groups of 128 rows; the others hi + lo, like its f32 GEMMs.
+GEMM in groups of 32 rows (up to 32 rows per expert on average) or 64 rows.
+EXL3 chooses one f16 product for an expert with >= 512 routed rows, in groups of 128 rows, and hi + lo otherwise, independently of the MMB dispatcher.
 A warp of the GEMM whose 16 rows are past its group's last row
 skips its WMMAs, so a group costs the WMMA work of its rows rounded up to 16 (routing in a model is far from uniform:
 many experts get a few rows, a few get most). Each row is the row `EXL3_MUL_MAT` computes for that expert in the same
@@ -212,7 +207,7 @@ gives them to `llama_model_init_from_user`. The data are copied from the safeten
   (a stack of experts: all of them, one after the other).
 - The op: `test-exl3` also runs `ggml_exl3_mul_mat` against `ggml_mul_mat` on the f32 `W` of `ggml_exl3_dequantize`
   for every rate x codebook case; `test-exl3 --op-gguf FILE` does it on the first linear of each (k, n, K) of a
-  container at 1 to 513 rows (both sides of the 32-row GEMM threshold and of the 512-row mmb threshold). With
+  container at 1 to 513 rows (both sides of the 32-row GEMM threshold and of the 512-row one-product threshold). With
   `--backend NAME` first (e.g. `ROCm0`) the op runs on that backend while `ggml_mul_mat` stays on the CPU; the same
   `ggml_mul_mat` on the f32 `W` also runs on that backend (opted in to mmb as llama does). A case passes when the op
   is within NMSE 1e-10 of the CPU `ggml_mul_mat` (f32 grade), or when its NMSE against a double sum on the first rows
