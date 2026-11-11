@@ -42,7 +42,7 @@ static std::vector<ggml_backend_dev_t> sa_devices() {
     return devs;
 }
 
-// ---- neginf-v -------------------------------------------------------------------------------------------------------- A selected cell whose score is -inf has p = 0 but still enters PV as 0 * v (the WMMA tiers cannot skip a cell per row):
+// ---- neginf-v: A selected cell whose score is -inf has p = 0 but still enters PV as 0 * v (the WMMA tiers cannot skip a cell per row):
 // a non-finite V element makes that dimension NaN, every other dimension is the softmax over the other cells. Only a masked cell contributes nothing whatever its bytes. Cell 7 of KV head 0 scores -inf with V = +inf, NaN, -inf in dims 5, 9, 200; query 2 selects only -inf cells (l = 0: every dim 0). The CPU op must equal O_CON bitwise; every GPU device must match the CPU's NaN dims, and its other dims within 1e-3 of the largest |CPU| value.
 // usage: test-sparse-attn-checks neginf-v [--old-text]: --old-text checks "every dim is the softmax over the other cells" instead, and must FAIL. Exit status 0 = the checks held.
 
@@ -206,7 +206,7 @@ static int run(int argc, char ** argv) {
 
 } // namespace neginf_v
 
-// ---- shape-guard ----------------------------------------------------------------------------------------------------- An RPC server rebuilds nodes from the wire without checking that a node's shapes agree with its srcs, so supports_op must reject a node ggml_sparse_attn(_plan) would never build, or the kernels read past K / V. Every device that takes the well-formed node must reject each malformed one. Shapes only (no_alloc, no compute).
+// ---- shape-guard: An RPC server rebuilds nodes from the wire without checking that a node's shapes agree with its srcs, so supports_op must reject a node ggml_sparse_attn(_plan) would never build, or the kernels read past K / V. Every device that takes the well-formed node must reject each malformed one. Shapes only (no_alloc, no compute).
 
 namespace shape_guard {
 
@@ -356,7 +356,7 @@ static int run(int, char **) {
 
 } // namespace shape_guard
 
-// ---- rpc-view -------------------------------------------------------------------------------------------------------- An RPC server deserializes a node and its direct srcs only, so the plan (src[3]) arrives with src[0] == NULL. The SPARSE_ATTN alloc size must not depend on that missing source: on every device, for every shape it takes, the server's view must get the size of the fully linked node. Without a GPU device the CPU rows pass trivially.
+// ---- rpc-view: An RPC server deserializes a node and its direct srcs only, so the plan (src[3]) arrives with src[0] == NULL. The SPARSE_ATTN alloc size must not depend on that missing source: on every device, for every shape it takes, the server's view must get the size of the fully linked node. Without a GPU device the CPU rows pass trivially.
 
 namespace rpc_view {
 
@@ -426,7 +426,7 @@ static int run(int, char **) {
 
 } // namespace rpc_view
 
-// ---- gate-scratch ---------------------------------------------------------------------------------------------------- The output placement of the HIP gated SPARSE_ATTN fusion (sparse-attn-gate-scratch.h) on synthetic layouts of one compute buffer. No sparse kernel uses ctx.pool(), so the reserve sees every workspace: when an output lands on a tensor the kernel reads, it goes to graph memory the fusion leaves unwritten (dst, the CONT and SIGMOID outputs), or the fusion is refused. A scratch lies inside one candidate and overlaps no read, final output or other scratch. CPU only.
+// ---- gate-scratch: The output placement of the HIP gated SPARSE_ATTN fusion (sparse-attn-gate-scratch.h) on synthetic layouts of one compute buffer. No sparse kernel uses ctx.pool(), so the reserve sees every workspace: when an output lands on a tensor the kernel reads, it goes to graph memory the fusion leaves unwritten (dst, the CONT and SIGMOID outputs), or the fusion is refused. A scratch lies inside one candidate and overlaps no read, final output or other scratch. CPU only.
 
 namespace gate_scratch {
 
@@ -512,7 +512,7 @@ static int run(int, char **) {
 
 } // namespace gate_scratch
 
-// ---- prefer-dense ---------------------------------------------------------------------------------------------------- Every (K, V, n_q band) for which ggml_backend_sparse_attn_prefer_dense picks dense must be a FLASH_ATTN_EXT of the shortcut's shape that the device takes (e.g. not on a -DGGML_CUDA_FA=OFF build), or the QSA guard fails the context.
+// ---- prefer-dense: Every (K, V, n_q band) for which ggml_backend_sparse_attn_prefer_dense picks dense must be a FLASH_ATTN_EXT of the shortcut's shape that the device takes (e.g. not on a -DGGML_CUDA_FA=OFF build), or the QSA guard fails the context.
 // A backend without the policy is skipped. Exit status 0 = every dense pick is runnable.
 
 namespace prefer_dense {
@@ -570,7 +570,7 @@ static int run(int, char **) {
 
 } // namespace prefer_dense
 
-// ---- allvis-rows ----------------------------------------------------------------------------------------------------- Rows built from the KQ mask with the ops of build_qsa_rows_av must equal {j : mask = 0} per (query row, stream), with the 4-D shape [n_kv, n_tps, 1, n_stream] the plan asserts, on each backend.
+// ---- allvis-rows: Rows built from the KQ mask with the ops of build_qsa_rows_av must equal {j : mask = 0} per (query row, stream), with the 4-D shape [n_kv, n_tps, 1, n_stream] the plan asserts, on each backend.
 // usage: test-sparse-attn-checks allvis-rows [mask.bin n_kv n_q]...   (recorded f16 masks; the synthetic split-stream cases always run)
 
 namespace allvis_rows {
