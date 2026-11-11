@@ -18638,6 +18638,9 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     if (l == "RMS_NORM_SCALE" && dev->pipeline_rms_norm_scale_small_f32 == nullptr) {
         return "no small-row rms_norm_scale pipeline";
     }
+    if ((l == "GDN_QK_NORM" || l == "GDN_CONV_FOLD") && dev->pipeline_gdn_chunk_prep == nullptr) {
+        return "no chunked GDN pipeline (RDNA3 + RADV + wave32)";
+    }
     if (l == "RMS_NORM_MUL_MUL" && dev->pipeline_rms_norm_mul_mul_small_f32 == nullptr) {
         return "no small-row rms_norm_mul_mul pipeline";
     }

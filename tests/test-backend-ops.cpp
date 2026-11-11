@@ -6320,7 +6320,7 @@ struct test_gdn_conv_prefill : public test_case {
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         const bool chunk = n_tokens >= 64;
-        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_QKNORM")) {
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_QKNORM", "GDN_QK_NORM")) {
             const int64_t want = chunk ? 1 : 0;
             const int64_t n = dispatch_census_count(backend, "path:GDN_QK_NORM");
             if (n != want) {
@@ -6328,7 +6328,7 @@ struct test_gdn_conv_prefill : public test_case {
                 return false;
             }
         }
-        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_CONVFOLD")) {
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_CONVFOLD", "GDN_CONV_FOLD")) {
             // the backend folds from 32 value-head sequences up
             const bool heads_ok = (int64_t) n_v_heads * n_seqs >= 32;
             const int64_t want = chunk && !extra_reader && heads_ok ? 1 : 0;
@@ -6423,7 +6423,7 @@ struct test_gdn_qk_root : public test_case {
     std::string vars() override { return VARS_TO_STR3(n_tokens, n_k_heads, n_v_heads); }
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_QKNORM")) {
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_GDN_QKNORM", "GDN_QK_NORM")) {
             const int64_t want = n_tokens >= 64 ? 1 : 0;
             const int64_t n = dispatch_census_count(backend, "path:GDN_QK_NORM");
             if (n != want) {
