@@ -2089,7 +2089,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     }
     if (qsa) {
         qsa_node.plan = plan;
-        qsa_node.n_q  = n_q / qsa_node.n_stream;
         res->add_qsa_node(qsa_node);
     }
     cb(cur, "attn_pregate", il);
