@@ -5759,8 +5759,7 @@ void ggml_flash_attn_ext_add_top_k(
         struct ggml_tensor * top_k,
                  int64_t     n_kv_raw) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    // the kq_mask carries the selection (see ggml.h): backends may ignore top_k, so an op without a mask would attend to
-    // every key. QSA's maskless selection is GGML_OP_SPARSE_ATTN_PLAN + GGML_OP_SPARSE_ATTN
+    // backends may ignore top_k: without a mask the op would attend to every key
     GGML_ASSERT(a->src[3] != NULL);
     GGML_ASSERT(a->src[5] == NULL);
     GGML_ASSERT(top_k->type == GGML_TYPE_I32);
@@ -6696,8 +6695,7 @@ struct ggml_tensor * ggml_sparse_attn_plan(
 
     ggml_set_op_params_i32(result, 0, (int32_t) n_kv);
     ggml_set_op_params_i32(result, 1, group);
-    // the selection's shape, so that a consumer's alloc size never needs this node's src (an RPC server deserializes a node's
-    // direct srcs only: the attend's plan arrives there without its sel)
+    // the selection's shape, so that a consumer's alloc size never needs this node's src (not linked on an RPC server)
     ggml_set_op_params_i32(result, 2, (int32_t) sel->ne[0]);
     ggml_set_op_params_i32(result, 3, (int32_t) sel->ne[1]);
     ggml_set_op_params_i32(result, 4, (int32_t) sel->ne[3]);

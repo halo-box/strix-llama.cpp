@@ -1,28 +1,17 @@
-// PLAN-v3 §4.3 (P2-2, R2-RES spec): the non-compact re-split of llama_memory_hybrid_idx::init_batch, on the production memory.
-//
-// Layouts: (a) one sequence with 2-D cells at several depths; (b) R1-CB, two sequences of one unified stream with a seq_cp
-// prefix ending inside a block; (c) R1-C layout 3, images in two slots of one unified stream; (d) -np 2 split with one image
-// slot. Batches: random token batches with 1-4 sequences and 1..3 x n_ubatch tokens each, and embedding batches of images
-// with 2-D positions. Grid: n_keep_tail {0, 4} x n_ubatch {512, 1024, 4096, 8192} x S {1, 2}.
-// For every ubatch of init_batch (with its NC0 hook), applied to the real attention and indexer caches, with the graph-time
-// predicate (qsa_scalar_visibility on the indexer cells, the function build_qsa_top_k calls):
+// The non-compact re-split of llama_memory_hybrid_idx::init_batch, on the production memory.
+// Layouts: (a) one sequence with 2-D cells at several depths; (b) a seq_cp prefix ending inside a block; (c) images in two
+// sequences of one unified stream; (d) -np 2 split streams with one image. Random text and image batches over
+// n_keep_tail x n_ubatch x S. For every ubatch, with the graph-time predicate qsa_scalar_visibility:
 //   (i)   graph-NC(u) => NC0(u)
 //   (ii)  NC0(u) => u.n_tokens <= U = min(n_ubatch, S x 512)
 //   (iii) every batch token in exactly one ubatch
 //   (iv)  the last n_keep_tail tokens of every sequence share one ubatch
 //   (v)   attention cells == indexer cells after every apply
 //   (vi)  replays <= #ubatches
-// The grid runs with the test hook qsa_nc0_eval_all, so that NC0 is evaluated on every ubatch and (i) covers all of them.
-// The decode phase runs without it, as llama does: on the same layouts, a ubatch of at most U tokens (the 1-token-per-slot
-// decode step of a multi-sequence server) gets no NC0 evaluation (the predicate is an O(n_kv) host scan per ratio whose
-// result cannot matter there, because only a non-compact ubatch above U is re-split), while a prompt ubatch above U still
-// gets it; the ubatches and replays equal those of the same batch with every ubatch evaluated.
-// The ineligible phase: where block selection is not eligible (a non-causal context, a ratio-1 layer, top_k % ratio != 0)
-// every ubatch takes the TE rows that the reserve's pp graph already holds at n_ubatch, so NC0 must not re-split there.
-// Layout: -np 2 unified, seq 0 with an image next to seq 1's text (every prompt ubatch of seq 0 is non-compact,
-// QSA_NC_2D_MULTI_SEQ); a 3000-token prompt of seq 0 at n_ubatch 4096. The causal ratio-4 fixture must re-split it (the
-// control); the non-causal one, ratio 1 and ratio 3 (2048 % 3 != 0) must not, and must not evaluate NC0.
-// Pass: 0 violations over the fixed seeds, and the re-split engaged (replays > 0) on the multi-sequence layouts.
+// The grid evaluates NC0 on every ubatch (qsa_nc0_eval_all). The decode phase runs as llama does: NC0 only above U, where
+// a re-split can act, with the same ubatches and replays. The ineligible phase (non-causal, ratio 1, top_k % ratio != 0)
+// must neither re-split nor evaluate NC0: those ubatches use TE rows the reserve already sized.
+// Pass: no violation, and the re-split engaged on the multi-sequence layouts.
 #include "qsa-mem-fixture.h"
 
 #include <cinttypes>
@@ -174,17 +163,17 @@ static decode_run decode_feed(qsa_fixture & f, const std::vector<qsa_fixture::to
 static void decode_phase() {
     struct layout { const char * name; uint32_t kv, n_seq_max; bool unified; };
     for (const layout & L : { layout{ "b:unified-np4", 327680, 4, true }, layout{ "d:split-np2", 131072, 2, false } }) {
-        // two fixtures fed the same history: one with the hook (every ubatch evaluated), one as llama runs
+        // the same history with every ubatch evaluated, and as llama runs
         qsa_fixture fa(L.kv, L.n_seq_max, L.unified), fb(L.kv, L.n_seq_max, L.unified);
         for (qsa_fixture * f : { &fa, &fb }) {
             f->mem->qsa_nc0_eval_all(true);
             for (llama_seq_id s = 0; s < (llama_seq_id) L.n_seq_max; ++s) {
-                f->feed(f->text(s, 6000 + 100 * (uint32_t) s), 4096);   // past top_k + r - 1 = 2051 cells per sequence
+                f->feed(f->text(s, 6000 + 100 * (uint32_t) s), 4096);   // past top_k + r - 1 cells
             }
         }
         uint32_t evals_small = 0, evals_large = 0, ub_small = 0, ub_large = 0;
         for (int step = 0; step < 6; ++step) {
-            // a decode step (1 token per slot), and every third step a 2-slot prompt above U = 512 tokens
+            // a decode step (1 token per slot), and every third step a 2-slot prompt above U
             std::vector<qsa_fixture::tok> ta, tb;
             const bool prompt = step % 3 == 2;
             for (llama_seq_id s = 0; s < (llama_seq_id) (prompt ? 2 : L.n_seq_max); ++s) {
@@ -210,7 +199,7 @@ static void decode_phase() {
                     VIOL(7, "decode phase %s step %d: ubatch %zu of %u tokens <= U = %u was given an NC0 evaluation", L.name, step, k, b.n_tok[k], U);
                 }
             }
-            // every evaluation of the hook-free run is on a ubatch above U (replays re-form one ubatch, so at most one more)
+            // evaluations only above U (a replay re-forms one ubatch)
             if (b.evals > large + b.replays) {
                 VIOL(7, "decode phase %s step %d: %u NC0 evaluations for %u ubatches above U (%u small)", L.name, step, b.evals, large, small);
             }

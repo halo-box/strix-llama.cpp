@@ -1,12 +1,9 @@
-// Unit checks of the llama-side QSA pieces (no model file), one section per ctest (tests/CMakeLists.txt registers each
-// section under its own test name):
-//
+// Unit checks of the llama-side QSA pieces (no model file), one section per ctest:
 //   dup-key           the duplicate-key term of the compact predicate reads a kept count (src/prefix.h)
 //   reserve-view      the reserve views of the hybrid-idx memory and the reserve graphs' compact decision
 //   reserve-passes    the QSA reserve pass list builds the one-stream shortcut graph of a split multi-sequence context
 //   noncompact-check  the graph-build check fails non-compact ubatches only where block selection is eligible
 //   supported-types   the "supported here" list of the QSA init error probes nine types without running out of its context
-//
 // usage: test-qsa-checks [section]   (no section: every section)
 
 #include "qsa-mem-fixture.h"
@@ -36,24 +33,14 @@ static int g_fail = 0;
 #define CHECK0(cond) CHECK(cond, "%s", "check failed")
 
 // ---- dup-key ---------------------------------------------------------------------------------------------------------
-// The duplicate-key term of the QSA compact predicate (src/prefix.h qsa_seq_has_dup_key, QSA_NC_DUP_KEY) runs for every
-// sequence of a ubatch on every graph build and every can_reuse of a multi-sequence context (qwen4exp can_reuse ->
-// qsa_graph_compact -> qsa_compact_reason -> qsa_compact_visibility_stream). It used to walk the whole std::set of
-// (pos, cell) pairs of each such sequence: with 4 server slots sharing a long seq_cp prompt, every decode step visited
-// every shared cell 4 times. It now reads llama_kv_cells::seq_pos_n_dup, a count kept by the set's own insert / erase.
-//
-//   exact: random cell edits (pos_set + seq_add, seq_add to a used cell, seq_rm, seq_keep, rm, pos_add with removal,
-//          pos_div, set from a cp copy, reset) on a small cache with colliding positions and (y, x) extents; after every
-//          edit seq_pos_n_dup equals the count recomputed from seq_pos_get, and qsa_seq_has_dup_key equals the old full
-//          walk (kept below as the oracle) for pos_2d false and true;
-//   work:  2^20 cells shared by 4 sequences at unique positions (the seq_cp server layout), plus one sequence with an
-//          M-RoPE image: qsa_seq_has_dup_key visits 0 set entries for the 4 text sequences and still finds (or rules
-//          out) the image's duplicate keys. The timings are printed, not asserted.
-// Exit status 0 = every check held.
+// qsa_seq_has_dup_key runs per sequence on every graph build and can_reuse, so it reads the kept count
+// llama_kv_cells::seq_pos_n_dup instead of walking every shared cell of the sequence.
+//   exact: after every random cell edit, seq_pos_n_dup equals the recomputed count and qsa_seq_has_dup_key the full walk;
+//   work:  2^20 cells shared by 4 sequences: 0 set entries visited, and an image sequence's duplicate keys still found.
 
 namespace dup_key {
 
-// the walk qsa_seq_has_dup_key did before the count existed (prefix.h at e31548e7d), the oracle of the exact part
+// the full walk, the oracle of the exact part
 static bool dup_key_walk(const llama_kv_cells & cells, llama_seq_id seq, bool pos_2d) {
     const auto & sp = cells.seq_pos_get(seq);
     std::vector<std::pair<llama_pos, llama_pos>> yx;
@@ -110,7 +97,7 @@ static void test_exact() {
         const uint32_t i = rnd(N);
         const int op = rnd(10);
         if (cells.is_empty(i)) {
-            // a new cell: positions collide (range 0..63), an image cell gets a (y, x) on a 3 x 3 grid
+            // a new cell: positions collide, (y, x) on a 3 x 3 grid
             cells.pos_set(i, (llama_pos) rnd(64));
             llama_kv_cell_ext e;
             e.y = (llama_pos) rnd(3);
@@ -146,7 +133,7 @@ static void test_exact() {
         for (llama_seq_id s = 0; s < N_SEQ; ++s) { n_dup_seen += cells.seq_pos_n_dup(s) > 0; }
         check_all(cells, "exact", step);
     }
-    // a copy of the whole cache (llama_kv_cells is copied by value, e.g. the hybrid memory's simulated prepare)
+    // a copy of the whole cache (the hybrid memory's simulated prepare)
     llama_kv_cells copy = cells;
     check_all(copy, "copy", 0);
     printf("exact: 40000 edits, %d (step, sequence) pairs with a repeated position\n", n_dup_seen);
@@ -157,7 +144,7 @@ static void test_work() {
     const uint32_t N = 1u << 20;
     llama_kv_cells cells;
     cells.resize(N + 1200);
-    // 4 sequences sharing every cell at unique positions (a seq_cp prompt in a unified cache, -np 4)
+    // 4 sequences sharing every cell at unique positions (a seq_cp prompt, -np 4)
     for (uint32_t i = 0; i < N; ++i) {
         cells.pos_set(i, (llama_pos) i);
         for (llama_seq_id s = 0; s < N_SEQ; ++s) { cells.seq_add(i, s); }
@@ -219,10 +206,9 @@ static int run() {
 } // namespace dup_key
 
 // ---- reserve-view ----------------------------------------------------------------------------------------------------
-// The reserve views of the hybrid-idx memory (llama_context::sched_reserve): init_full views every stream of the cache,
-// init_full_n_kv(n_kv) limits the views to n_kv cells (reserve pass B), and init_full_n_kv(n_kv, 1) to the first stream as
-// well (the one-stream reserve graphs of a split cache with several sequences: a one-sequence ubatch there is a one-stream
-// graph, which a view of every stream cannot build; Prove's -np 2 split run at ub8192 grew past the reserve on them).
+// The reserve views of the hybrid-idx memory: init_full views every stream, init_full_n_kv(n_kv) n_kv cells of every
+// stream (pass B), init_full_n_kv(n_kv, 1) only the first stream: a one-sequence ubatch of a split cache is a one-stream
+// graph, which a view of every stream cannot reserve.
 
 namespace reserve_view {
 
@@ -263,13 +249,9 @@ static void check_views(uint32_t kv_size, uint32_t n_seq_max, bool unified) {
             (int) unified, as_idx(full)->get_n_stream(), as_idx(b)->get_n_stream(), as_idx(one)->get_n_stream());
 }
 
-// The compact decision of the reserve graphs (llama_memory_hybrid_idx_context::qsa_graph_compact, the call qwen4exp's
-// build_qsa_top_k makes with LLM_GRAPH_QSA_RESERVE_GRAPH): sched_reserve builds every reserve graph on init_full, which
-// views the live cells when a reserve runs mid-session (sched_need_reserve). The pp reserve ubatch (graph_reserve: n_seqs
-// sequences 0 .. n_seqs - 1 in one unified stream, all-zero positions, ubatch_prepare_reserve's seq ids) must get the
-// verdict it gets on the empty cache of init, whatever the cells hold: an image in one sequence next to text in another
-// (QSA_NC_2D_MULTI_SEQ), or a block shared through seq_cp (QSA_NC_SHARED_BLOCK). Runtime graphs keep the live verdict;
-// the reservation context itself (init_full) sees no cell (#262), so its own predicate gives the empty cache's verdict too.
+// qsa_graph_compact of a reserve graph: a reserve can run mid-session on the live cells, yet the pp reserve ubatch must get
+// the verdict of the empty cache, whatever the cells hold. Runtime graphs keep the live verdict. The reservation context
+// itself (init_full) sees no cell, so its own predicate gives the empty cache's verdict too.
 static llama_ubatch reserve_ubatch(llama_batch_allocr & balloc, uint32_t n_tokens, uint32_t n_seqs) {
     llama_ubatch u = balloc.ubatch_reserve(n_tokens / n_seqs, n_seqs);
     for (uint32_t s = 0; s < n_seqs; ++s) {
@@ -290,8 +272,7 @@ static void check_reserve_compact(const char * name, qsa_fixture & fx, int want_
     llama_batch_allocr balloc(4);
     for (const uint32_t n_tokens : { 4096u, 512u, 4u }) {
         const llama_ubatch u = reserve_ubatch(balloc, n_tokens, fx.n_seq_max);
-        // the live verdict: the predicate over the cells the runtime graph reads (init_full is a reservation context, which
-        // itself sees no cell since #262, so it is asked of the memory's indexer cache directly)
+        // the live verdict, asked of the memory's indexer cache: init_full is a reservation context and sees no cell
         const int  live    = llama_memory_hybrid_idx::qsa_compact_reason(fx.mem->get_mem_idx(), m->get_n_stream(),
                 m->get_idx()->get_n_kv(), r, u);
         const bool reserve = m->qsa_graph_compact(u, r, true);
@@ -301,7 +282,7 @@ static void check_reserve_compact(const char * name, qsa_fixture & fx, int want_
                 ctx_res ? "compact" : "non-compact");
         CHECK0(live == want_live);
         CHECK0(reserve);                                    // the init verdict, whatever the live cells hold
-        // #262: a reservation context sees no cell, whatever the graph flag: its predicate is the empty cache's
+        // a reservation context sees no cell, whatever the graph flag: its predicate is the empty cache's
         CHECK0(ctx_res);
         CHECK0(m->qsa_compact_reason(u, r) == QSA_COMPACT_OK);
         CHECK0(m->qsa_scalar_visibility(u, r));
@@ -313,7 +294,7 @@ static void check_reserve_compact_all() {
         qsa_fixture fx(8192, 4, true);
         check_reserve_compact("empty", fx, QSA_COMPACT_OK);
     }
-    {   // slot 0 holds an image, slot 1 text: a sequence of the stream holds 2-D cells while another has cells
+    {   // slot 0 holds an image, slot 1 text
         qsa_fixture fx(8192, 4, true);
         CHECK0(fx.feed(fx.text(0, 100), 512));
         CHECK0(fx.feed(fx.image(0, 32, 32), 512));
@@ -321,8 +302,7 @@ static void check_reserve_compact_all() {
         CHECK0(fx.feed(fx.text(1, 3000), 512));
         check_reserve_compact("image+text", fx, QSA_NC_2D_MULTI_SEQ);
     }
-    {   // slot 1 copied slot 0 (seq_cp) when it ended inside a block (3001 tokens, ratio 4), then slot 0 went on: the block
-        // 3000 .. 3003 holds sequence 0 under {0, 1} and {0} (R1-CB, test-qsa-visibility "seqcp")
+    {   // slot 1 copied slot 0 (seq_cp) ending inside a block, then slot 0 went on: the block holds two sequence sets
         qsa_fixture fx(8192, 4, true);
         CHECK0(fx.feed(fx.text(0, 3001), 512));
         fx.mem->seq_cp(0, 1, -1, -1);
@@ -345,13 +325,9 @@ static int run() {
 } // namespace reserve_view
 
 // ---- reserve-passes --------------------------------------------------------------------------------------------------
-// The QSA reserve graphs of llama_context::sched_reserve (llama_qsa_reserve_passes, PLAN-v3 §7.1) cover every graph shape a
-// runtime ubatch can build. Here: the one-stream dense-shortcut graph of a split multi-sequence context. Pass B reserves the
-// shortcut at n_kv_b over n_seqs streams, so each stream holds n_tok_b / n_seqs rows and the route of that graph is decided
-// at that per-stream n_q (prefer_dense in qwen4exp.cpp; on HIP a non-f16 pair is dense FA at n_q <= 127 and the AV rows +
-// SPARSE_ATTN route at n_q >= 128). A slot's own prompt ubatch at n_kv <= n_kv_b is a one-stream graph of up to
-// min(ub, n_kv_b) rows, which only a one-stream pass at n_kv_b builds: -np 8 at ub 512 reserved 8 x 64 rows (dense) while
-// a 512-token one-sequence ubatch ran the AV route. Pure function of the context shape: no model, no device.
+// llama_qsa_reserve_passes must reserve every graph shape a runtime ubatch can build, here the one-stream shortcut graph of a
+// split multi-sequence context: pass B splits its rows over the streams, and the shortcut's route depends on the
+// per-stream n_q, so a one-sequence ubatch of min(ub, n_kv_b) rows needs its own pass. No model, no device.
 
 namespace reserve_passes {
 
@@ -389,8 +365,7 @@ static int run() {
                     const bool split_multi = !unified && n_seqs > 1;
                     printf("ub %u np %u %s n_kv %u: %s\n", n_tokens, n_seqs, unified ? "unified" : "split", n_kv_full, names(p).c_str());
 
-                    // the one-stream graph of the shortcut: one sequence, n_stream 1, at n_kv_b, with the largest row count a
-                    // one-sequence ubatch can have there
+                    // the largest one-sequence ubatch of the shortcut
                     const uint32_t n_tok_1 = std::min(n_tokens, n_kv_b);
                     bool one_stream_b = false;
                     for (const auto & d : p) {
@@ -412,7 +387,7 @@ static int run() {
                             CHECK(d.n_kv == 0 || d.n_kv == n_kv_full, "%s: a reduced view at n_kv %u without a shortcut", d.name, d.n_kv);
                         }
                     }
-                    // the passes before this change keep their shapes (the refactor of sched_reserve into this function)
+                    // pass B and the one-stream passes
                     bool has_b = false, has_1s = false;
                     for (const auto & d : p) {
                         if (strcmp(d.name, "passB") == 0) {
@@ -438,12 +413,8 @@ static int run() {
 } // namespace reserve_passes
 
 // ---- noncompact-check ------------------------------------------------------------------------------------------------
-// The always-on QSA graph-build check (qwen4exp_qsa_noncompact_error, src/models/qwen4exp-qsa-check.h) fails only ubatches
-// that are non-compact on the complete-block selection path. Where block selection is not eligible (a non-causal context:
-// LLAMA_ATTENTION_TYPE_NON_CAUSAL or llama_set_causal_attn(ctx, false); a ratio-1 layer; top_k % ratio != 0; ...) every
-// ubatch takes the TE rows, which the reserve's own pp / tg graphs build, so decode must go on: the check tested `scalar`
-// alone (which also requires `blocks`) and failed every ubatch past the shortcut there, in a single-sequence context with
-// the self-contradictory reason 'compact'. Pure function: no model.
+// qwen4exp_qsa_noncompact_error fails only non-compact ubatches on the block selection path. Where block selection is not
+// eligible (non-causal, ratio 1, top_k % ratio != 0, ...) every ubatch takes the TE rows the reserve built: no error.
 
 namespace noncompact_check {
 
@@ -487,15 +458,12 @@ static int run() {
 } // namespace noncompact_check
 
 // ---- supported-types -------------------------------------------------------------------------------------------------
-// The "supported here" list of the QSA init error (PLAN-v3 §10, llama_qsa_supported_types in src/llama-context.cpp): it
-// probes the nine K / V types of the sparse op on the node's device. It ran out of its ggml context (16 tensor objects for
-// 9 x 2) and aborted in ggml_new_object / GGML_ASSERT(obj_new) instead of returning the list, so the designed init error
-// turned into a process abort. CPU only, no model file: the node is a no_alloc SPARSE_ATTN of the qwen4exp shape.
+// llama_qsa_supported_types probes the nine K / V types of the sparse op on the node's device; its ggml context must hold
+// 9 x 2 probe tensors, or the init error turns into an abort. CPU only, on a no_alloc SPARSE_ATTN node.
 
 namespace supported_types {
 
-// the comma-separated list as its entries: a type is in it only as a whole entry ("f16" is not in "bf16, q8_0": a
-// substring search found it inside "bf16", so a list without f16 passed the f16 check)
+// the list's entries: a type is in it only as a whole entry ("f16" is not in "bf16, q8_0")
 static std::vector<std::string> split_list(const std::string & list) {
     std::vector<std::string> out;
     size_t pos = 0;
@@ -548,7 +516,7 @@ static int run() {
 
     const std::string list = llama_qsa_supported_types(cpu, attn);
     printf("supported here (CPU): '%s'\n", list.c_str());
-    // the CPU op takes every type of S: the list names all nine
+    // the CPU op takes all nine
     const char * want[] = { "f16", "bf16", "q8_0", "q4_0", "f32", "q4_1", "q5_0", "q5_1", "iq4_nl" };
     const std::vector<std::string> items = split_list(list);
     for (const char * t : want) {

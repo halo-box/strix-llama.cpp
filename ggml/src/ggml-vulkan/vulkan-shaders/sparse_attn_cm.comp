@@ -12,22 +12,11 @@
 #include "types.glsl"
 #include "ggml_type_ids.glsl"
 
-// GGML_OP_SPARSE_ATTN, RDNA3 + RADV coopmat kernel (PLAN-v3 §6.3), derived from the coopmat selected-key FA shader of master ea5285ddf (deleted in W13): one 64-lane
-// subgroup per (query, K/V head, stream, split), register-built WMMA fragments, the same accumulator layout and the same
-// online softmax. What differs:
-//   - the cells come from the G = 1 plan: one step = 4 plan entries = 16 cells of 4 quads, in the plan's ascending quad
-//     order. A cell's mask bit selects it: a masked or padding cell gets score -inf (by select: a NaN in its K row reaches
-//     only its own row of S) and a zero V column, so a NaN or inf stored there cannot reach the output (0 * NaN = NaN in
-//     WMMA, PLAN-v3 §2.2);
-//   - K and V of any type of S through sparse_attn_load.glsl: the S_fast types with packed f16 arithmetic (sa_q8x2, sa_q4x2, sa_bf2), the others
-//     through flash_attn_dequant.glsl. V is either direct (fragments built from the loads) or staged (the step's 16 V rows converted into shared
-//     memory, then read): SA_VL, AT-B3;
-//   - split z takes the steps z, z + n_split, ... of its row, so empty splits cannot appear while a row has enough steps
-//     and the split count is a function of the shape alone;
-//   - q is rounded to f16 after the f32 product (scale * H_q q), PLAN-v3 §2.2 item 2. H_q runs in registers, the butterfly
-//     order of fwht.comp (same subgroup size, 64); ROT_Q is a spec constant, so rot 0 costs nothing. H_o is a separate
-//     dispatch of fwht.comp (ggml_vk_sparse_attn).
-//
+// GGML_OP_SPARSE_ATTN, RDNA3 + RADV coopmat kernel: one 64-lane subgroup per (query, K/V head, stream, split),
+// register-built WMMA fragments. One step = 4 plan entries = 16 cells. A masked or padding cell gets score -inf (by select)
+// and a zero V column, so a NaN or inf stored there cannot reach the output (0 * NaN = NaN in WMMA).
+// V is direct (fragments built from the loads) or staged through shared memory (SA_VL). Split z takes steps z,
+// z + n_split, ... of its row. H_q runs in registers in fwht.comp's order; H_o is a separate fwht.comp dispatch.
 // The fragment layout (A: lane L holds row L % 16, element i = column i; B: lane L holds column L % 16, element i = row i;
 // f32 accumulator: lane L holds column L % 16, rows L / 16 + 4 i) is the gfx11 layout of RADV's KHR cooperative matrix
 // lowering, which the spec does not guarantee: the host creates this pipeline for RADV on RDNA3 only.
@@ -87,8 +76,8 @@ shared uvec4 v_sh[SA_VL != 0 ? STEP * D / 8 : 1];    // the step's V rows in f16
     t_ = unpackFloat2x16(b.z); M[12] = t_.x; M[13] = t_.y; \
     t_ = unpackFloat2x16(b.w); M[14] = t_.x; M[15] = t_.y; }
 
-// 8 contiguous dims (dim 8 c8 ...) of a V row as packed f16. o is even; the window [floor((o - 2) / 4), + 3 dwords) holds the 8 bytes at o and ends
-// inside them, so the last piece of a row does not read past it.
+// 8 contiguous dims (dim 8 c8 ...) of a V row as packed f16. The 3-dword window of a quantized piece ends inside it, so
+// the last piece of a row does not read past it.
 uvec4 sa_v8(const uint vrow, const uint c8) {
     if (FaTypeV == GGML_TYPE_F16) {
         return data_v4[vrow + c8];
@@ -312,9 +301,8 @@ void main() {
         mx = max(mx, subgroupShuffleXor(mx, 16));
         mx = max(mx, subgroupShuffleXor(mx, 32));
         const float m_new = max(m, mx);
-        // m_new stays -inf in a step whose live cells all score -inf, or NaN (max may drop a NaN operand): the exponentials
-        // are then taken against 0, so a -inf cell gets weight 0 (ggml.h item 3) and a NaN cell keeps its NaN (item 5),
-        // where exp(-inf - -inf) = NaN made both NaN; corr = exp(-inf) = 0 keeps a NaN l / O (NaN * 0)
+        // while m_new is -inf the exponentials are taken against 0: a -inf cell gets weight 0 (ggml.h item 3) and a NaN
+        // cell keeps its NaN (item 5)
         const float m_ref = m_new == NEG_INF ? 0.0 : m_new;
         const float corr = exp(m - m_ref);
         float pv[4];
@@ -410,8 +398,7 @@ void main() {
     if (p.n_split == 1) {
         if (col < GQA) {
             const uint dst_base = stream * p.nb3 + query * p.nb2 + head * p.nb1;
-            // a row whose normaliser is not > 0 (empty, or NaN from a NaN score) is 0 (ggml.h item 5): a select of the
-            // result, not O * 0, which is NaN for the NaN accumulator such a row has; the test is on the bits (sa_l_pos)
+            // a row whose normaliser is not > 0 is 0 (ggml.h item 5): a select, not O * 0 (NaN for a NaN accumulator)
             const bool pos = sa_l_pos(l);
             const float inv_l = pos ? 1.0 / l : 0.0;
             [[unroll]] for (uint t = 0; t < 16; ++t) {
@@ -422,8 +409,7 @@ void main() {
             }
         }
     } else {
-        // partial: unnormalized O, then L and M per head (an empty split writes M = -FLT_MAX, not -inf, so the
-        // reduce never computes exp(-inf - -inf))
+        // partial: unnormalized O, then L and M per head (an empty split writes M = -FLT_MAX, not -inf)
         if (col < GQA) {
             const uint slot = split + p.n_split * (query + p.n_q * stream);
             const uint o_base = D * p.n_head * slot + D * head;

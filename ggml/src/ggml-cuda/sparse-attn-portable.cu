@@ -1,28 +1,9 @@
-// sa_attend_portable: the portable tier of GGML_OP_SPARSE_ATTN on HIP (PLAN-v3 §5 "HIP tier selection per arch", §6.2
-// "sparse-attn-portable.cu").
-//
-// One kernel for every HIP arch: no WMMA / MFMA, no v_permlanex16, no cross-lane operation (only __syncthreads and
-// shared memory, so neither the wave size, 32 or 64, nor the arch is assumed), every K / V type of S converted to its
-// contract f16 value by the runtime switch sa_any_elem (sparse-attn-loaders.cuh). It is what every HIP arch other than
-// RDNA3.5 runs (the WMMA tiers are selected on GGML_CUDA_CC_IS_RDNA3_5 only), and what GGML_CUDA_SA_FORCE=portable
-// selects on RDNA3.5 (the tests of PLAN-v3 §13 W5). Its speed on other archs is UNPROVEN (U15).
-//
-// Arithmetic: the CPU op's (ggml-cpu/sparse-attn.cpp, O_CON), cell by cell, with FP contraction off in the kernel (the CPU
-// TU is built with -ffp-contract=off):
-//   q f16(q * scale) (f32 product, one rounding); K / V elements f16 (sa_any_elem); each score an f32 sum over the 256
-//   dims in sequential order; per cell, in the plan's ascending cell order: if s > m { alpha = (m == -inf) ? 0 :
-//   expf(m - s); acc *= alpha; l *= alpha; m = s }; p = expf(s - m); l += p; acc += f16(p) * v; out = l > 0 ? acc / l : 0.
-//   The only arithmetic difference from the CPU op is the device expf (ocml) against the host's.
-//   Rotations (PLAN-v3 §8, D13): H_q of q (f32, before the product with scale) and H_o of acc / l through shared memory,
-//   sa_fwht_smem (sparse-attn-fwht.cuh: the arithmetic of fwht.cu and of the CPU op's sa_fwht).
-// Masked-off and padding cells are never loaded (the cells are collected from this query's mask bits), so their bytes
-// cannot reach the output (contract item 4).
-//
-// Work: block (stream, query, kv head), 256 threads, thread d owns dim d. The group's plan entries are read in batches of
-// 64; the cells this query attends are compacted in order into shared memory; each tile of 16 cells is staged (K as f32 of
-// the f16 value), the 16 x GQA scores are computed one per thread, thread h < GQA runs the online softmax of head h over
-// the tile's cells, and every thread applies the per-cell rescale and f16(p) * v to its GQA accumulators. Shared memory:
-// 12 x 257 + 16 x 257 floats + 3 x 16 x 12 floats + small = about 32 KiB.
+// sa_attend_portable: the portable tier of GGML_OP_SPARSE_ATTN, run by every HIP arch but RDNA3.5 (and under
+// GGML_CUDA_SA_FORCE=portable). No WMMA and no cross-lane operation, so neither the wave size nor the arch is assumed;
+// any K / V type of S through sa_any_elem. Arithmetic is the CPU op's, cell by cell in plan order with FP contraction off;
+// the only difference is the device expf. Masked-off cells are never loaded, so their bytes cannot reach the output.
+// Block (stream, query, kv head), thread d owns dim d: this query's cells are compacted into shared memory, then each
+// tile of 16 cells is staged, scored, run through the online softmax (thread h < GQA for head h) and accumulated.
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-census.h"
@@ -115,7 +96,7 @@ static __global__ void __launch_bounds__(256) sa_attend_portable(const sa_portab
     __syncthreads();
 
     for (int e0 = 0; e0 < n_ent; e0 += SA_P_BATCH) {
-        // this query's cells of entries e0 .. e0 + 63, compacted in plan order (ascending cells)
+        // this query's cells of the batch, compacted in plan order (ascending cells)
         uint32_t bits = 0, quad = 0;
         if (d < SA_P_BATCH && e0 + d < n_ent) {
             bits = ((uint32_t) gm[e0 + d] >> (4 * jq)) & 0xfu;
@@ -144,12 +125,11 @@ static __global__ void __launch_bounds__(256) sa_attend_portable(const sa_portab
 
         for (int t0 = 0; t0 < n_c; t0 += SA_P_TILE) {
             const int nt = min(SA_P_TILE, n_c - t0);
-            // K of the tile: element d of each cell, its contract f16 value
             for (int c = 0; c < nt; ++c) {
                 ks[c][d] = sa_h2f_bits(sa_any_elem(a.kt_g, kb + (size_t) cells[t0 + c] * a.k_nb1, d));
             }
             __syncthreads();
-            // scores: thread (cell c, head h), an f32 sum over the 256 dims in sequential order
+            // scores: thread (cell c, head h), an f32 sum over the dims in sequential order
             if (d < SA_P_TILE * r) {
                 const int c = d % SA_P_TILE, h = d / SA_P_TILE;
                 if (c < nt) {
@@ -161,7 +141,7 @@ static __global__ void __launch_bounds__(256) sa_attend_portable(const sa_portab
                 }
             }
             __syncthreads();
-            // online softmax of head h over the tile's cells, one cell at a time (the CPU op's order and branches)
+            // online softmax of head h, one cell at a time (the CPU op's order and branches)
             if (d < r) {
                 float mx = m_s[d], l = l_s[d];
                 for (int c = 0; c < nt; ++c) {

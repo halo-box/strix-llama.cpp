@@ -1,30 +1,21 @@
 #pragma once
 
-// The fast Walsh-Hadamard transform shared by fwht.cu (the GGML_HINT_SRC0_IS_HADAMARD mul_mat) and the in-op rotations
-// of GGML_OP_SPARSE_ATTN (rot_q prologue, rot_o epilogue; PLAN-v3 §8, D13, W10).
-//
-// Arithmetic (both forms below): every element is first multiplied by `scale` (the caller passes 1.0f / sqrtf(N), the
-// value fwht.cu's host code and the CPU op compute), then the butterflies run from stride 1 up to N / 2; at stride h the
-// pair (x_lo, x_hi), lo with bit h clear, becomes (x_lo + x_hi, x_lo - x_hi). This is the order and the operations of
-// ggml-cpu's sa_fwht (ggml-cpu/sparse-attn.cpp) and of the hinted mul_mat kernels, so the result is the orthonormal
-// Sylvester-Hadamard product H x. FP contraction is off inside both functions: no multiply-add is fused at any call site,
-// so the bits of the result depend only on x and scale, which is what makes the in-kernel rotations bitwise equal to
-// fwht.cu (tests/test-sparse-attn-rot.cpp).
+// Fast Walsh-Hadamard transform shared by fwht.cu and the in-op rotations of GGML_OP_SPARSE_ATTN (rot_q, rot_o).
+// x * scale (scale = 1 / sqrtf(N)), then butterflies from stride 1 up: (x_lo, x_hi) -> (x_lo + x_hi, x_lo - x_hi), the
+// order of the CPU op. FP contraction is off so the result bits depend only on x and scale: the in-kernel rotations are
+// bitwise equal to fwht.cu.
 
 #include "common.cuh"
 
-// FP contraction off for the enclosing compound statement (it must open it). clang-based compilers (HIP, MUSA, clang
-// CUDA) honour the pragma; nvcc does not know it and keeps its default (fwht.cu as before; the sparse-attention kernels
-// are HIP only)
+// FP contraction off for the enclosing compound statement (must open it); nvcc ignores the pragma (fwht.cu as before)
 #if defined(__clang__)
 #define SA_FP_CONTRACT_OFF _Pragma("clang fp contract(off)")
 #else
 #define SA_FP_CONTRACT_OFF
 #endif
 
-// fwht_block<N, WS>: one block of N elements held by the WS lanes of a warp, N / WS values per lane: value i of lane l
-// is element i * WS + l. Strides below WS are exchanged between lanes (__shfl_xor_sync), the others stay in the lane's
-// registers. All WS lanes of the warp must call it.
+// fwht_block<N, WS>: N elements over the WS lanes of a warp, value i of lane l is element i * WS + l. Strides below WS
+// go through shuffles. All WS lanes must call it.
 template <int N, int WS>
 static __device__ __forceinline__ void fwht_block(float * x, const int lane, const float scale) {
 SA_FP_CONTRACT_OFF
@@ -64,10 +55,8 @@ SA_FP_CONTRACT_OFF
     }
 }
 
-// fwht_row<D, WS>: one row of D elements held by a warp in the fwht_block layout (value i of lane l = element i * WS + l),
-// transformed over its consecutive blocks of rot elements (rot 64, 128 or 256, a multiple of WS dividing D). Block b is
-// values [b * rot / WS, (b + 1) * rot / WS) of every lane, so each block is one fwht_block call. rot is uniform over the
-// warp; any other value leaves x unchanged (the callers reject it before launch).
+// fwht_row<D, WS>: a row of D elements in the fwht_block layout, transformed over consecutive blocks of rot (64, 128 or
+// 256) elements; any other rot leaves x unchanged (rejected before launch). rot is uniform over the warp.
 template <int D, int WS>
 static __device__ __forceinline__ void fwht_row(float * x, const int lane, const int rot, const float scale) {
     static_assert(D % 256 == 0, "fwht_row: D must be a multiple of 256");
@@ -97,12 +86,9 @@ static __device__ __forceinline__ void fwht_row(float * x, const int lane, const
     }
 }
 
-// sa_fwht_smem<D>: n_rows rows of D floats in shared memory (row r at x + r * ld), each transformed in place over its
-// consecutive blocks of rot elements, by the nt threads of the block (thread t takes elements t, t + nt, ... for the
-// scaling, and pairs t, t + nt, ... of every stage). The arithmetic is fwht_block's: x * scale, then at stride h,
-// lo = x_lo + x_hi, hi = x_lo - x_hi, from h = 1 up. Every thread of the block must call it with the same arguments
-// (it synchronises before the first stage and after every stage, so the rows are complete on return). For the tiers
-// without a fixed warp layout: the portable tier (any wave size), the G4 fixup and the G1 split merge.
+// sa_fwht_smem<D>: n_rows rows of D floats in shared memory (row r at x + r * ld), transformed in place over blocks of
+// rot by the nt threads of the block, with fwht_block's arithmetic. Every thread must call it with the same arguments; it
+// syncs after every stage. For the tiers without a fixed warp layout (portable, G4 fixup, G1 merge).
 template <int D>
 static __device__ __forceinline__ void sa_fwht_smem(float * x, const int n_rows, const int ld, const int rot, const float scale,
                                                     const int t, const int nt) {
@@ -114,8 +100,7 @@ SA_FP_CONTRACT_OFF
     }
     __syncthreads();
     for (int h = 1; h < rot; h *= 2) {
-        // pair p of the stage: row p / (D / 2), lo = the (p % (D / 2))-th index of the row with bit h clear; h < rot and
-        // the blocks are aligned, so lo + h is in the same block
+        // pair p: row p / (D / 2), lo the (p % (D / 2))-th index with bit h clear; lo + h stays in the same block
         for (int p = t; p < n / 2; p += nt) {
             const int r  = p / (D / 2), pp = p % (D / 2);
             const int lo = (pp / h) * 2 * h + pp % h;

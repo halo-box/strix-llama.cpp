@@ -20,7 +20,7 @@ layout(push_constant) uniform parameter
 };
 
 #ifdef FWHT_INPLACE
-// one binding: H_o of GGML_OP_SPARSE_ATTN (no aliased descriptors); every row is read whole before it is written
+// one binding (H_o of GGML_OP_SPARSE_ATTN): every row is read whole before it is written
 layout(binding = 0, std430) buffer A { float data_a[]; };
 #define data_d data_a
 #else

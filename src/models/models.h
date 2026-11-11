@@ -2619,8 +2619,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor ** tile_out_ids = nullptr,
                            bool   cache_only = false);
 
-        // self-attention restricted to the cells that top_k names, on GGML_OP_SPARSE_ATTN pinned to backend (*attn_node
-        // gets the node); plan is the SPARSE_ATTN_PLAN of top_k
+        // GGML_OP_SPARSE_ATTN over the cells of plan, pinned to backend; *attn_node gets the node
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
@@ -2632,7 +2631,7 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il,
                     ggml_tensor ** attn_node);
 
-        // the placement and the policies of a QSA layer's attention (PLAN-v3 §5, §10), for the device of its K buffer
+        // the placement and policies of a QSA layer's attention, from the device of its K buffer
         struct qsa_policy {
             ggml_backend_dev_t dev = nullptr;   // whose policies apply
             ggml_backend_t backend = nullptr;   // where plan and attend run
@@ -2654,9 +2653,8 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
         llm_graph_input_qsa_k * qsa_k_inp = nullptr;
 
-        // score-strip views of the host inputs (KQ mask, QSA bias), keyed by input, first query and strip size (it varies
-        // with the layer's compress ratio): the scheduler gives every view of a host input its own copy, kept for the whole
-        // graph, so the layers share one view per strip
+        // strip views of the host inputs keyed by (input, first query, strip size): the scheduler copies every view of a
+        // host input for the whole graph, so the layers share one view per strip
         std::map<std::tuple<const ggml_tensor *, int64_t, int64_t>, ggml_tensor *> strip_views;
 
         // QSA: store this ubatch's raw indexer keys in the indexer cache (no selection)

@@ -1,12 +1,9 @@
 #pragma once
 
-// Where the fused gated SPARSE_ATTN writes its outputs (ggml-cuda.cu, the SPARSE_ATTN -> CONT -> SIGMOID -> MUL fusion).
-// The kernel writes the gated f32 output (o32, the MUL's memory) and / or its 16-bit copy (o16, for the next mmb reader)
-// while it reads Q, K, V, the plan, the gate and its own workspace. An output that overlaps a read cannot be written in
-// place: it goes to graph memory that the fused subgraph leaves unwritten (the attend's own dst, the CONT and SIGMOID outputs,
-// all in the reserved compute buffer), and one device copy moves it into place; when none fits, the fusion is refused (the
-// unfused nodes run). Never pool memory: PLAN-v3 D12 (no ctx.pool() in a sparse kernel; the pool is outside the reserve, the
-// fit probe). Host-only: tests/test-sparse-attn-checks.cpp (gate-scratch) checks it on synthetic layouts.
+// Where the fused gated SPARSE_ATTN writes its outputs (o32, the MUL's f32 memory, and / or o16, its 16-bit copy). An
+// output that overlaps a read cannot be written in place: it goes to graph memory the fused subgraph leaves unwritten
+// (the attend's dst, the CONT and SIGMOID outputs) and one device copy moves it; when none fits the fusion is refused.
+// Never pool memory: the pool is outside the reserved compute buffer.
 
 #include <cstddef>
 #include <cstdint>
@@ -19,7 +16,7 @@ struct ggml_cuda_sa_span {
 enum ggml_cuda_sa_gate_where {
     GGML_CUDA_SA_GATE_NONE    = 0,   // the output is not written
     GGML_CUDA_SA_GATE_DIRECT  = 1,   // written in place
-    GGML_CUDA_SA_GATE_POOL    = 2,   // pool scratch: never chosen (D12), kept so that a caller can assert it
+    GGML_CUDA_SA_GATE_POOL    = 2,   // never chosen, kept so that a caller can assert it
     GGML_CUDA_SA_GATE_SCRATCH = 3,   // written to scratch32 / scratch16 (graph memory), then copied into place
 };
 
@@ -43,8 +40,7 @@ static inline bool ggml_cuda_sa_overlaps_any(const ggml_cuda_sa_span * spans, in
     return false;
 }
 
-// reads: every range the kernel reads; o32 / o16: the outputs (n == 0 when not written); cands: memory of the graph that
-// the fusion leaves unwritten (the attend's own dst, the CONT and SIGMOID outputs)
+// reads: every range the kernel reads; o32 / o16: the outputs (n == 0 when not written); cands: unwritten graph memory
 static inline ggml_cuda_sa_gate_plan ggml_cuda_sa_gate_plan_outputs(const ggml_cuda_sa_span * reads, int n_reads,
         ggml_cuda_sa_span o32, ggml_cuda_sa_span o16, const ggml_cuda_sa_span * cands, int n_cands) {
     ggml_cuda_sa_gate_plan r = { true, GGML_CUDA_SA_GATE_NONE, GGML_CUDA_SA_GATE_NONE, nullptr, nullptr };
@@ -52,8 +48,8 @@ static inline ggml_cuda_sa_gate_plan ggml_cuda_sa_gate_plan_outputs(const ggml_c
     const bool hazard16 = o16.n > 0 && ggml_cuda_sa_overlaps_any(reads, n_reads, o16.p, o16.n);
     r.where32 = o32.n == 0 ? GGML_CUDA_SA_GATE_NONE : hazard32 ? GGML_CUDA_SA_GATE_SCRATCH : GGML_CUDA_SA_GATE_DIRECT;
     r.where16 = o16.n == 0 ? GGML_CUDA_SA_GATE_NONE : hazard16 ? GGML_CUDA_SA_GATE_SCRATCH : GGML_CUDA_SA_GATE_DIRECT;
-    // a scratch: the start of a candidate that holds the output and overlaps no read, no final output and no other scratch
-    // (the candidates can overlap each other: the SIGMOID may run in place over the CONT, the MUL over either)
+    // a scratch: a candidate that holds the output and overlaps no read, no output and no other scratch (candidates may
+    // overlap each other: SIGMOID may run in place over CONT, MUL over either)
     const auto pick = [&](size_t n, const void * other, size_t n_other) -> void * {
         for (int i = 0; i < n_cands; ++i) {
             const ggml_cuda_sa_span & c = cands[i];

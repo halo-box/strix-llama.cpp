@@ -863,7 +863,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // now emplace the ubatch
         apply_ubatch(sinfo_new, ubatch);
 
-        // the cells now hold the state this ubatch's graph will see (PLAN-v3 §4.3, NC0 hook)
+        // the cells now hold the state this ubatch's graph will see
         if (hook && !hook((uint32_t) (res.size() - 1), ubatch, sinfo_new)) {
             if (i_fail) {
                 *i_fail = (uint32_t) (res.size() - 1);
@@ -3077,7 +3077,7 @@ llama_kv_cache_context::llama_kv_cache_context(
         uint32_t n_stream) : llama_kv_cache_context(kv) {
     GGML_ASSERT(n_kv > 0);
     this->n_kv = std::min(n_kv, kv->get_size());
-    // get_k / get_v view sinfo.s1 - sinfo.s0 + 1 streams: keep the first n_stream of the dummy slot info
+    // get_k / get_v view s1 - s0 + 1 streams
     if (n_stream > 0 && n_stream < kv->get_n_stream()) {
         sinfos[0].s1 = n_stream - 1;
         sinfos[0].strm.resize(n_stream);

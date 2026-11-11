@@ -1,21 +1,10 @@
-// TE rows of a non-compact QSA ubatch (PLAN-v3 §4.1 row 4, W8 "done when"): the rows src/models/qwen4exp-te.h builds
-// must name, for every (query, stream), exactly the cells PR219's masked route attended: top_k(expanded, width) ∩ {mask == 0}.
-//
-// The layouts are a C++ port of the R1-CB oracle (r1/r1_oracle.py, itself a port of PR219 94e086847's
-// llama_memory_hybrid_idx::set_input_qsa_scan grouping and blk_bias rules and of build_qsa_top_k): a unified two-sequence
-// cache with a seq_cp prefix of L ∈ {8192, 8193, 8194, 8195} cells and 40 own cells per sequence, and two image layouts
-// (sequence 1 holds an M-RoPE image next to text, sequence 0 holds 2000 text cells; image at position 28930 = 2 mod 4 and
-// 32779 = 3 mod 4). Split streams (n_stream 2) and several score strips per ubatch are covered too.
-//
-// Per backend of the build, one graph computes, from the same inputs:
-//   new:   per strip, qwen4exp_te_expand + qwen4exp_te_select (the production ops), the strips joined along ne[1];
-//   PR219: the masked route's mask from the same top_k (PR219 qwen4exp.cpp build_attn_qsa, kept verbatim here:
-//          fill(-inf), set_rows of zeros at the top-k cells, + kq_mask), whose cells at 0 are the attended set.
-// Pass: for every row the set {rows >= 0} equals {j : PR219 mask[j] == 0}, rows lists no cell twice, every listed cell is
-// one top_k picked, and (host check) PR219's set equals {top_k[i] : kq_mask[top_k[i]] == 0}. Also, per strip, the use
-// counts of the graph's expanded chain are the ones the Vulkan TOPK_QSA fusion requires (ggml_vk_can_fuse_topk_qsa:
-// GET_ROWS, PERMUTE, CONT, RESHAPE, ADD one use each, the mask CPY two, its own dst included), so the production ops never
-// give expanded a second consumer (fusion_uses below).
+// TE rows of a non-compact QSA ubatch: the rows src/models/qwen4exp-te.h builds must name, for every (query, stream),
+// exactly the cells the masked route attends: top_k(expanded, width) intersected with {mask == 0}.
+// Layouts: two sequences sharing a seq_cp prefix of L cells around a block boundary, and an M-RoPE image at a position
+// = 2 and 3 mod 4 next to another sequence's text; split streams and several score strips per ubatch too.
+// Per backend, one graph computes the production ops per strip and, from the same top_k, the masked route's mask (fill
+// -inf, set_rows of zeros at the top-k cells, + kq_mask). Pass: per row {rows >= 0} == {j : mask[j] == 0}, no cell twice,
+// every cell picked by top_k; the expanded chain keeps the use counts the Vulkan TOPK_QSA fusion requires.
 // usage: test-qsa-te-rows [backend name substring]
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -37,11 +26,11 @@
 
 static constexpr int64_t R     = 4;
 static constexpr int64_t TOPK  = 2048;
-static constexpr int64_t WIDTH = TOPK + R - 1;   // 2051, PR219 build_qsa_top_k
+static constexpr int64_t WIDTH = TOPK + R - 1;   // build_qsa_top_k
 
 static int g_fail = 0;
 
-// one stream's cells and its queries, with the scan's arrays (r1_oracle.py Cache)
+// one stream's cells and its queries, with the scan's arrays
 struct layout {
     std::string name;
     std::vector<int64_t>  pos, x, y;
@@ -60,8 +49,8 @@ struct layout {
         return (int64_t) pos.size() - 1;
     }
 
-    // groups keyed by (position block, exact sequence set), complete groups only get a block id, in block order; every
-    // other cell maps to the spare ("dead") block (set_input_qsa_scan group_cells with two sequences present)
+    // set_input_qsa_scan grouping: a complete (position block, sequence set) group gets a block id, in block order; every
+    // other cell maps to the spare ("dead") block
     void finish(int64_t n_kv_view) {
         const int64_t n = (int64_t) pos.size();
         n_kv = n_kv_view;
@@ -130,7 +119,7 @@ struct layout {
 
 static int64_t pad256(int64_t n) { return (n + 255) / 256 * 256; }
 
-// r1_oracle.py text_case: a seq_cp prefix of L cells shared by sequences 0 and 1, then 40 own cells each; queries = own cells
+// a seq_cp prefix of L cells shared by sequences 0 and 1, then 40 own cells each; queries = own cells
 static layout text_case(int64_t L) {
     layout c;
     c.name = "text_L" + std::to_string(L);
@@ -145,10 +134,8 @@ static layout text_case(int64_t L) {
     return c;
 }
 
-// r1_oracle.py image_case: sequence 0 holds n0 text cells; sequence 1 holds n_before text cells, an image of 1036 cells at
-// position n_before (grid gh x gw, ext x/y as llama_kv_cache::apply_ubatch stores them), then n_after text cells.
-// Queries: every 3rd image cell, every 3rd text cell after the image, and the last 3 cells of sequence 0 (2000 visible
-// cells < 2051: top_k must fill the row with hidden cells, which the rows must drop)
+// sequence 0 holds n0 text cells; sequence 1 holds n_before text cells, a 1036-cell image at position n_before, then
+// n_after text cells. Sequence 0's queries see fewer than WIDTH cells: top_k picks hidden cells the rows must drop.
 static layout image_case(int64_t n_before, int64_t n_after, int64_t gh = 28, int64_t gw = 37, int64_t n0 = 2000) {
     layout c;
     c.name = "image_pos" + std::to_string(n_before);
@@ -191,9 +178,8 @@ struct case_t {
 
 struct stats { int64_t rows = 0, mism = 0, dup = 0, not_picked = 0, host_mism = 0, underfull = 0, dropped = 0, bias_ninf_vis = 0; };
 
-// The use counts ggml_vk_can_fuse_topk_qsa requires of the nodes it replaces (ggml-vulkan.cpp: every node before the TOP_K
-// single-use, the CPY two uses because it counts its own dst): GET_ROWS -> PERMUTE -> CONT -> ADD <- RESHAPE <- CPY, the
-// ADD feeding the TOP_K. "" when every strip's chain has them, else the first offender.
+// The use counts ggml_vk_can_fuse_topk_qsa requires: one per node of GET_ROWS -> PERMUTE -> CONT -> ADD <- RESHAPE, two for
+// the CPY (its own dst counts). "" when every strip's chain has them, else the first offender.
 static std::string fusion_uses(ggml_cgraph * gf, const std::vector<ggml_tensor *> & expanded) {
     std::map<const ggml_tensor *, int> idx;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
@@ -236,8 +222,7 @@ static void run_case(ggml_backend_t be, const char * bname, case_t & c) {
     const int64_t n_blocks = c.streams[0].n_blocks;
     const int64_t width = std::min<int64_t>(n_kv, WIDTH);
 
-    // host inputs: block scores (relu'd index scores, so >= 0), per-block bias, KQ mask (f16, as flash attention keeps it),
-    // cell_blk
+    // block scores are relu'd (>= 0); the KQ mask is f16, as flash attention keeps it
     std::mt19937 rng(1);
     std::uniform_real_distribution<float> uni(0.0f, 50.0f);
     std::vector<float> score((size_t) n_blocks * n_tps * n_stream), bias(score.size());
@@ -277,8 +262,7 @@ static void run_case(ggml_backend_t be, const char * bname, case_t & c) {
         ggml_set_input(t);
     }
 
-    // the strip loop of build_qsa_top_k (non-compact, blk_bias): strip views of the bias and the mask, the score biased per
-    // block, then the production ops of qwen4exp-te.h
+    // the non-compact strip loop of build_qsa_top_k
     ggml_tensor * biased = ggml_add(ctx, t_score, t_bias);
     std::vector<ggml_tensor *> rows_s, topk_s, expanded_s;
     for (int64_t first = 0; first < n_tps; first += c.strip) {
@@ -301,7 +285,7 @@ static void run_case(ggml_backend_t be, const char * bname, case_t & c) {
         top_k = ggml_concat(ctx, top_k, topk_s[i], 1);
     }
 
-    // PR219 94e086847 qwen4exp.cpp build_attn_qsa, the masked half (deleted from the model in W8), on the same top_k
+    // the masked route on the same top_k
     ggml_tensor * kq_mask_all = ggml_fill(ctx, t_mask, -INFINITY);
     kq_mask_all = ggml_view_4d(ctx, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3],
             kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);

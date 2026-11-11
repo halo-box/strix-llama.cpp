@@ -328,9 +328,8 @@ public:
         return seq_pos[seq_id];
     }
 
-    // how many cells of sequence seq_id repeat a position another cell of seq_id holds: sum over its positions of
-    // (cells at that position - 1). 0 means every position of the sequence is unique (kept up to date by seq_pos_inc /
-    // seq_pos_dec, so reading it is O(1); the QSA compact predicate reads it on every graph build, prefix.h)
+    // sum over the positions of seq_id of (cells at that position - 1), 0 = unique positions; O(1), read on every
+    // graph build by the QSA compact predicate
     uint32_t seq_pos_n_dup(llama_seq_id seq_id) const {
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
@@ -543,13 +542,11 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
-    // seq_pos_ndup[s]: the entries of seq_pos[s] whose position another entry of seq_pos[s] also holds, minus one per such
-    // position (seq_pos_n_dup). The entries of one position are adjacent in the set, so a neighbour test keeps it exact
+    // see seq_pos_n_dup; entries of one position are adjacent in the set, so a neighbour test keeps it exact
     uint32_t seq_pos_ndup[LLAMA_MAX_SEQ] = {};
 
     // helper functions for updating `seq_pos`, once cell at a time:
 
-    // another entry of the set at the position of it
     static bool seq_pos_has_twin(const std::set<std::pair<llama_pos, uint32_t>> & sp,
             std::set<std::pair<llama_pos, uint32_t>>::const_iterator it) {
         return (it != sp.begin() && std::prev(it)->first == it->first) ||

@@ -168,7 +168,7 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
-    // the saved key type of the last state read that failed the per-layer key type check, -1 when it did not
+    // saved key type of the last state read that failed the key type check, -1 otherwise
     int32_t state_read_k_type_mismatch() const { return k_type_mismatch_ref; }
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
@@ -224,9 +224,8 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
-    // prepare with a check per ubatch (PLAN-v3 §4.3, the NC0 hook): hook(i, ubatch, sinfo) runs right after ubatch i is
-    // placed, on the cells exactly as apply_ubatch leaves them at graph time; false stops the preparation, sets *i_fail = i,
-    // restores the cells and returns an empty vector
+    // hook(i, ubatch, sinfo) runs right after ubatch i is placed, on the cells as its graph will see them; false sets
+    // *i_fail = i, restores the cells and returns an empty vector
     using prepare_hook_t = std::function<bool(uint32_t, const llama_ubatch &, const slot_info &)>;
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches, const prepare_hook_t & hook, uint32_t * i_fail);
 
@@ -304,7 +303,6 @@ private:
     // SWA
     const uint32_t n_swa = 0;
 
-    // see state_read_k_type_mismatch()
     int32_t k_type_mismatch_ref = -1;
 
     // env: LLAMA_ATTN_ROT_DISABLE
@@ -407,8 +405,7 @@ public:
     llama_kv_cache_context(
             llama_kv_cache * kv);
 
-    // used to create a full-cache context whose view holds n_kv cells (a reserve graph at a smaller n_kv); n_stream > 0 limits
-    // the view to the first n_stream streams (a reserve graph of a ubatch holding fewer sequences than the cache has streams)
+    // used to create a full-cache context viewing n_kv cells and, with n_stream > 0, the first n_stream streams (reserve)
     llama_kv_cache_context(
             llama_kv_cache * kv,
             uint32_t n_kv,

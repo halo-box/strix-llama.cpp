@@ -1,10 +1,5 @@
-// GGML_OP_SPARSE_ATTN with a G = 1 plan on HIP (PLAN-v3 §6.2, D3, D9): the 48 sa_attend_g1 instances
-// (sparse-attn-attend-g1.cuh, GGML_CUDA_SA_G1_INSTANCES of sparse-attn-census.h), their launcher, the shape-only split
-// count, and the HIP work-split and shortcut policies (the procs ggml_backend_sparse_attn_group and
-// ggml_backend_sparse_attn_prefer_dense, ggml-backend.h; PLAN-v3 §5 "G and shortcut policy").
-//
-// Kernel selection, workspace and dispatch of the whole op live in sparse-attn-attend-g4.cu (sa_select), which calls
-// ggml_cuda_sa_g1_launch below for G = 1 plans and sa_merge_splits (sparse-attn-merge.cu) when the split count is > 1.
+// GGML_OP_SPARSE_ATTN with a G = 1 plan on HIP: the sa_attend_g1 instances, their launcher, the shape-only split count,
+// and the HIP group and dense-shortcut policies. Selection and dispatch of the whole op are in sparse-attn-attend-g4.cu.
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-attend-g1.cuh"
@@ -27,17 +22,9 @@ static int sa_policy_type(const ggml_type t) {
     }
 }
 
-// AT-A crossover (PLAN-v3 §16.5), fitted on the W4 kernels (scripts/qsa-validation/summaries/w4_ata.md): G1 where
-// t_G1 = plan(G1) + G1 attend (+ merge) beats t_G4 = plan(G4) + min(G4 packed + pack, G4 direct) by more than 3 x the
-// p90 run-to-run noise (p90 0.33 % over 1188 samples: margin 1 %) at every tested n_q up to the threshold, on every
-// fixture of the n_kv class (C18 wiki / rand rows at n_kv 8192 and 135168 with SYN data, SYN:1.8 plans at 32768 and
-// 65536; n_q 2 .. 512; C18 protocol, two processes). Keyed by the V type (D3: (n_q, n_kv, T_v)); n_kv is mapped to the
-// nearest measured class on a log scale (boundaries at the geometric midpoints 16384, 46341, 94118); n_kv > 135168 uses
-// the 135168 class and n_q between two tested values takes the lower one's verdict (both UNPROVEN extrapolations).
-// Re-fitted on the final kernels (Prove AT-A, scripts/qsa-validation/summaries/prove_ata.md: noise p90 0.51 % over 1188
-// samples, margin 1.52 %): 15 of the 16 cells are unchanged; V q8_0 at the 135168 class drops from 96 to 64 (wikiL_p131072
-// n_q 96: t_G1 / t_G4 = 0.994, above the 0.9848 margin, so G1 no longer wins on every fixture of the class).
-// Types outside S_fast (the generic tier, W5) keep the default n_q < 128 (C1 d3, C13 d1-d2).
+// G1 vs G4 crossover past the shortcut, measured per V type: G1 when n_q is at most the largest n_q where
+// plan(G1) + G1 attend (+ merge) beat plan(G4) + the best G4 attend by more than the noise margin on every fixture of the
+// n_kv class (classes 8192, 32768, 65536, 135168; boundaries at their geometric midpoints). Types outside S_fast: n_q < 128.
 bool ggml_cuda_sa_g1_beats_g4(int64_t n_q_per_stream, int64_t n_kv, ggml_type type_k, ggml_type type_v) {
     GGML_UNUSED(type_k);
     // largest n_q with G1: [V f16, bf16, q8_0, q4_0][n_kv class 8192, 32768, 65536, 135168]
@@ -55,17 +42,11 @@ bool ggml_cuda_sa_g1_beats_g4(int64_t n_q_per_stream, int64_t n_kv, ggml_type ty
     return n_q_per_stream <= nq_max[tv][c];
 }
 
-// The work split G of a QSA layer's plan (D3). Inputs: queries per stream, n_kv, the K / V types, and whether the layer
-// is in the dense shortcut (all-visible rows, n_kv <= top_k + r - 1), which has its own decision (P2-9).
-//
-// Past the shortcut: the two-way rule fitted by AT-A (PLAN-v3 §16.5) on the W4 kernels (ggml_cuda_sa_g1_beats_g4).
-// In the shortcut: AT-W7PERF (W7), per D4 n_q band on the all-visible rows (scripts/qsa-validation/summaries/w7_at_op.md): G1 up to n_q 32
-// (G1 / G4 time 0.13-0.72 at n_q <= 16; at n_q 32 they are within 1.0-1.12), G4 above it (G1 / G4 1.36-2.4 from n_q 64), with a noise
-// margin of 3 x p90 = 1 %. Every S_fast pair has the same crossover, so the rule does not depend on the types.
+// The work split G of a QSA layer's plan. In the dense shortcut (all-visible rows, n_kv <= top_k + r - 1): G1 up to
+// n_q 32, G4 above, the same crossover for every S_fast pair. Past it: ggml_cuda_sa_g1_beats_g4.
 int ggml_cuda_sparse_attn_group(int device, int64_t n_q_per_stream, int64_t n_kv, ggml_type type_k, ggml_type type_v, bool shortcut) {
     GGML_UNUSED(device);
-    // test switch GGML_CUDA_SA_FORCE=g1 | g4, read at every call (a process can reserve with the policy's G and run with
-    // a forced one; get_alloc_size covers both)
+    // test switch GGML_CUDA_SA_FORCE=g1 | g4, read at every call (get_alloc_size covers both G)
     if (ggml_cuda_sa_force_has("g1") || ggml_cuda_sa_force_has("g4")) {
         return ggml_cuda_sa_force_has("g4") ? 4 : 1;
     }
@@ -75,10 +56,8 @@ int ggml_cuda_sparse_attn_group(int device, int64_t n_q_per_stream, int64_t n_kv
     return ggml_cuda_sa_g1_beats_g4(n_q_per_stream, n_kv, type_k, type_v) ? 1 : 4;
 }
 
-// Dense shortcut preference (D4). f16 / f16 keeps the dense causal FLASH_ATTN_EXT; a (pair, n_q band) of another pair is dense where
-// the pre-registered AT-W7PERF rule flipped it: an op cell of the band with sparse (plan + attend, its own G) below 0.98 x dense, or an e2e
-// cell of the band whose CI upper bound is below 0.98 (scripts/qsa-validation/summaries/w7_at_op.md, w7_at_e2e.md; every e2e cell passed).
-// The n_q bands of D4: {1, 2-8, 9-32, 33-127, 128-511, 512-1023, >= 1024}.
+// Dense shortcut preference: f16 / f16 keeps the dense causal FLASH_ATTN_EXT; another pair is dense in the n_q bands
+// {1, 2-8, 9-32, 33-127, 128-511, 512-1023, >= 1024} where sparse (plan + attend) was not below 0.98 x dense.
 bool ggml_cuda_sparse_attn_prefer_dense(int device, ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv) {
     GGML_UNUSED(device);
     GGML_UNUSED(n_kv);
@@ -99,8 +78,7 @@ bool ggml_cuda_sparse_attn_prefer_dense(int device, ggml_type type_k, ggml_type 
 
 #if defined(GGML_USE_HIP)
 
-// the 96 G1 instances, in GGML_CUDA_SA_G1_INSTANCES order, two per census index i = (kt * 4 + vt) * 3 + gqa_index:
-// entry 2 * i is ROT = false (no rotation code), 2 * i + 1 ROT = true
+// two instances per census index i = (kt * 4 + vt) * 3 + gqa_index: 2 * i is ROT = false (no rotation code), 2 * i + 1 true
 #define SA_G1_FN(kt, vt, gqa) sa_attend_g1<SA_TID_##kt, SA_TID_##vt, gqa, false>, sa_attend_g1<SA_TID_##kt, SA_TID_##vt, gqa, true>,
 static const sa_g1_kernel_t sa_g1_kernels[2 * GGML_CUDA_SA_G1_N] = { GGML_CUDA_SA_G1_INSTANCES(SA_G1_FN) };
 #undef SA_G1_FN
@@ -143,7 +121,7 @@ void ggml_cuda_sa_g1_launch(cudaStream_t stream, const ggml_cuda_sa_g1_launch_pa
     a.rot_o_scale = ggml_cuda_sa_rot_scale(p.rot_o);
     a.rot_dump    = p.rot_dump;
     const int idx = (p.kt * SA_T_COUNT + p.vt) * 3 + p.gqa_index;
-    // grid: x = (stream, query, kv head) with the kv head fastest (the PR's blockIdx.x), y = split
+    // grid: x = (stream, query, kv head) with the kv head fastest, y = split
     const dim3 grid((unsigned) ((int64_t) p.n_q * p.n_stream * p.n_head_kv), (unsigned) p.splits, 1);
     const int rot = a.rot_q != 0 || a.rot_o != 0 ? 1 : 0;
     sa_g1_kernels[2 * idx + rot]<<<grid, 256, 0, stream>>>(a);

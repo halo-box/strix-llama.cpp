@@ -1,20 +1,12 @@
-// GGML_OP_SPARSE_ATTN_PLAN on the CPU against the C3 oracle (sparse-attn-ref.h: C3's std::map cpu_plan, generalised to
-// G in {1, 4} and n_stream, in the ggml.h dst layout), memcmp over the whole dst.
-//
+// GGML_OP_SPARSE_ATTN_PLAN on the CPU against the host reference (sparse-attn-ref.h), memcmp over the whole dst.
 //   test-sparse-attn-plan-oracle                          synthetic rows (ctest), plus the over-allocation check
 //   test-sparse-attn-plan-oracle [-t N] [--shuffle S] FILE...
 //                                                         captured rows: records {char name[64]; int32 n_q, ns, nk,
-//                                                         has_mask, pos0, kt;} + n_q * ns int32 (the format of C3's
-//                                                         c3_capture and C5's c5_capture), one record per QSA layer
-//
-// For captured rows it prints, per layer, the statistics C3's c3_plan prints (valid cells per query, ascending rows,
-// mean padded G4 union "union_asc"), so a recapture can be matched against C3's logs, and the memcmp verdict for G = 1
-// and G = 4 on the rows as captured and (--shuffle S) with every row shuffled by std::mt19937(S + layer) as c3_plan does.
-//
-// The over-allocation check: a buffer type whose get_alloc_size over-allocates every SPARSE_ATTN_PLAN / SPARSE_ATTN
-// node allocates a plan + attend graph through ggml-alloc (ggml_backend_buft_get_alloc_size asserts that an op which
-// over-allocates is listed in ggml_op_alloc_size_may_expand, ggml-backend.cpp), and its result must equal the one of
-// the plain CPU buffer type.
+//                                                         has_mask, pos0, kt;} + n_q * ns int32, one per QSA layer;
+//                                                         G = 1 and 4, and with --shuffle every row shuffled by
+//                                                         std::mt19937(S + layer); per-layer row statistics printed
+// Over-allocation: a buffer type that over-allocates both ops (allowed by ggml_op_alloc_size_may_expand) must give the
+// result of the plain CPU buffer type.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -220,7 +212,7 @@ int main(int argc, char ** argv) {
         while (fread(&h, sizeof(h), 1, f) == 1) {
             std::vector<int32_t> rows((size_t) h.n_q * h.ns);
             if (fread(rows.data(), 4, rows.size(), f) != rows.size()) { fprintf(stderr, "short read\n"); return 1; }
-            // the statistics c3_plan prints for a layer (c3_plan.cu:318-341)
+            // per-layer row statistics
             long long nvalid = 0; int nsorted = 0;
             for (int q = 0; q < h.n_q; ++q) {
                 int prev = -1; bool asc = true;

@@ -1,68 +1,34 @@
 #pragma once
 
-// Dispatch census of the HIP sparse-attention kernels (a test hook, not a stable API; PLAN-v3 §6.2).
+// Dispatch census of the HIP sparse-attention kernels (a test hook, not a stable API). The tables below drive both the
+// template instantiations and the host dispatch, so the reported keys cannot drift from the compiled kernels.
 //
-// Every key is generated from an instantiation table below. The same table drives the template instantiations and the
-// host dispatch of the kernel family it describes (sparse-attn-plan.cu instantiates and dispatches exactly the groups
-// of GGML_CUDA_SA_PLAN_GROUPS, the sparse-attn-attend-g4-<kt>.cu files instantiate and the dispatch of
-// sparse-attn-attend-g4.cu indexes exactly the instances of GGML_CUDA_SA_G4_INSTANCES and GGML_CUDA_SA_FIXUP_INSTANCES,
-// sparse-attn-pack.cu dispatches
-// the types of GGML_CUDA_SA_PACK_TYPES), so the list of keys the census reports cannot drift from the compiled kernels.
-//
-// Keys:
-//   sa_plan/G<g>                                one GGML_OP_SPARSE_ATTN_PLAN dispatch with group g (init + rows + merge
-//                                               kernels of sparse-attn-plan.cu)
-//   sa_attend/G4/<KT>/<VT>/<VL>/<EPI>/gqa<n>    one launch of sa_attend_g4 (sparse-attn-attend-g4.cuh): K type, V type,
-//                                               V loader (packed | direct), epilogue (plain | gated), GQA (4 | 8 | 12).
-//                                               The key of PLAN-v3 §6.2, sa_attend/G4/<KT>/<VT>/<VL>/<EPI>, is the prefix
-//                                               of its three gqa<n> instances: count("sa_attend/G4/f16/q8_0/packed/plain")
-//                                               sums them
-//   sa_fixup/G4/<KT>/<VT>/<EPI>                 one launch of sa_attend_fixup (sparse-attn-attend-g4.cuh), which follows
-//                                               every sa_attend_g4 launch and recomputes only the blocks that flagged a
-//                                               non-finite V half (it returns at once for the others)
-//   sa_pack/<VT>                                one launch of sa_pack_v (sparse-attn-pack.cu)
-//   sa_attend/G1/<KT>/<VT>/splits<c>/gqa<n>     one launch of sa_attend_g1 (sparse-attn-attend-g1.cuh): K type, V type, the
-//                                               split-count class c of the launch (1, 2-5, 6-16, 17-33, 34+: the classes of
-//                                               the PLAN-v3 §14.2 band table; the split count itself is the shape-only
-//                                               sa_g1_splits) and GQA. The key of PLAN-v3 §6.2, sa_attend/G1/<KT>/<VT>/
-//                                               splits<n>, with n the first count of the class (atoi of the segment gives
-//                                               the class's lower bound), extended by the GQA level as the G4 keys are
-//   sa_merge                                    one launch of sa_merge_splits (sparse-attn-merge.cu), which follows every
-//                                               sa_attend_g1 launch with more than one split
-//   sa_generic/G4/<VL>/gqa<n>                   one launch of the generic tier's G4 attend (sa_attend_g4<SA_T_GEN, SA_T_GEN,
-//                                               VL, plain, n>, sparse-attn-generic.cu): any K / V pair of S through the
-//                                               runtime-switch loader; V loader packed | direct (PLAN-v3 §6.2 key
-//                                               sa_generic/G<g>, extended by the V loader and the GQA level as the G4 keys)
-//   sa_generic/G1/splits<c>/gqa<n>              one launch of the generic tier's G1 attend (sa_attend_g1<SA_T_GEN, SA_T_GEN,
-//                                               n>), split class c as the sa_attend/G1 keys (followed by sa_merge when the
-//                                               split count is > 1)
-//   sa_generic/fixup                            one launch of sa_attend_fixup<SA_T_GEN, SA_T_GEN, plain> (after every
-//                                               sa_generic/G4 launch)
-//   sa_generic/pack                             one launch of sa_pack_v<SA_T_GEN> (the generic tier's packed V)
-//   sa_portable/G<g>                            one launch of the portable tier (sa_attend_portable, sparse-attn-portable.cu:
-//                                               scalar FMA, every type of S, any HIP arch) on a plan with group g. The tier
-//                                               every HIP arch other than RDNA3.5 runs, and GGML_CUDA_SA_FORCE=portable
-//   qsa_expand                                  one fused qwen4exp complete-block selection (expand.cu, matched in ggml-cuda.cu)
-//
-// The procs are returned by ggml_backend_reg_get_proc_address of the HIP backend (ggml-cuda.cu):
-//   void                 ggml_backend_debug_dispatch_census_reset(void)          clear the counts and start counting
-//   uint64_t             ggml_backend_debug_dispatch_census_count(const char *)  exactly KEY plus every KEY/... below it
-//   const char * const * ggml_backend_debug_dispatch_census_list(void)           every compiled key, NULL-terminated
-//   const char *         ggml_backend_debug_dispatch_census_skip(ggml_backend_t, const char * label)
-//                        NULL when label is a compiled key (or a prefix of one), else why HIP cannot emit it
-// Ids are recorded into HIP graphs as uint16_t (ggml_cuda_graph::census_ids).
-// Counts are launches: a dispatch counts when the host issues it, and with HIP graphs on the ids dispatched while a graph
-// is captured are recorded into the graph (ggml_cuda_graph::census_ids) and counted again at every replay (ggml-cuda.cu).
+// Keys (one count per launch):
+//   sa_plan/G<g>                                GGML_OP_SPARSE_ATTN_PLAN with group g
+//   sa_attend/G4/<KT>/<VT>/<VL>/<EPI>/gqa<n>    sa_attend_g4: VL packed | direct, EPI plain | gated, GQA 4 | 8 | 12
+//   sa_fixup/G4/<KT>/<VT>/<EPI>                 sa_attend_fixup, after every G4 launch (redoes blocks with a non-finite V)
+//   sa_pack/<VT>                                sa_pack_v
+//   sa_attend/G1/<KT>/<VT>/splits<c>/gqa<n>     sa_attend_g1, c the split-count class (1, 2-5, 6-16, 17-33, 34+;
+//                                               atoi of the segment gives the class's lower bound)
+//   sa_merge                                    sa_merge_splits, after every G1 launch with more than one split
+//   sa_generic/G4/<VL>/gqa<n>                   generic tier G4 attend (any K / V pair of S)
+//   sa_generic/G1/splits<c>/gqa<n>              generic tier G1 attend
+//   sa_generic/fixup, sa_generic/pack           generic tier fixup and V pack
+//   sa_portable/G<g>                            portable tier on a plan with group g (every HIP arch but RDNA3.5)
+//   qsa_expand                                  one fused qwen4exp complete-block selection (expand.cu)
+// A key also counts every KEY/... below it. Procs (ggml_backend_reg_get_proc_address of the HIP backend):
+//   ggml_backend_debug_dispatch_census_reset / _count(key) / _list() (NULL-terminated) / _skip(backend, label) (NULL
+//   when label is a compiled key or prefix, else why HIP cannot emit it).
+// With HIP graphs, ids dispatched during capture are stored in the graph (as uint16_t) and counted at every replay.
 
-// groups G of the plan kernels (sa_plan_merge<G>); also the G range of the HIP group policy for get_alloc_size (§2.1)
+// groups G of the plan kernels; also the G range of the HIP group policy for get_alloc_size
 #define GGML_CUDA_SA_PLAN_GROUPS(X) \
     X(1)                            \
     X(4)
 
 #define GGML_CUDA_SA_CENSUS_PLAN_KEY(g) "sa_plan/G" #g
 
-// G4 attend instances (PLAN-v3 §6.2: KT 4 x (VT, VL) 8 x EPI 2, times GQA {4, 8, 12}), K type outermost. The type
-// tokens are the ggml type names; sparse-attn-loaders.cuh maps them to the kernel's ids (SA_TID_<kt>, SA_VL_<vl>, SA_EPI_<epi>).
+// G4 attend instances, K type outermost; the tokens map to SA_TID_<kt>, SA_VL_<vl>, SA_EPI_<epi>
 #define GGML_CUDA_SA_G4_INSTANCES(X)                   \
     GGML_CUDA_SA_G4_KT_(X, f16)                        \
     GGML_CUDA_SA_G4_KT_(X, bf16)                       \
@@ -115,8 +81,7 @@
     X(q8_0)                        \
     X(q4_0)
 
-// G1 attend instances (sa_attend_g1<KT, VT, GQA>: KT 4 x VT 4 x GQA 3), K type outermost; one kernel each, dispatched
-// by sparse-attn-attend-g1.cu at index (kt * 4 + vt) * 3 + gqa_index
+// G1 attend instances, dispatched at index (kt * 4 + vt) * 3 + gqa_index
 #define GGML_CUDA_SA_G1_INSTANCES(X)                   \
     GGML_CUDA_SA_G1_KT_(X, f16)                        \
     GGML_CUDA_SA_G1_KT_(X, bf16)                       \
@@ -134,8 +99,7 @@
 
 #define GGML_CUDA_SA_G1_N 48   // KT 4 x VT 4 x GQA 3
 
-// census keys of the G1 instances: every instance x the 5 split classes (sa_g1_split_class, sparse-attn-attend-g1.cuh);
-// key id GGML_CUDA_SA_CENSUS_G1_FIRST + instance * 5 + class
+// G1 census keys: every instance x 5 split classes; id GGML_CUDA_SA_CENSUS_G1_FIRST + instance * 5 + class
 #define GGML_CUDA_SA_G1_CENSUS_(X, kt, vt, gqa)        \
     X(kt, vt, gqa, 0, "1")                             \
     X(kt, vt, gqa, 1, "2-5")                           \
@@ -145,8 +109,7 @@
 
 #define GGML_CUDA_SA_CENSUS_G1_KEY(kt, vt, gqa, cls) "sa_attend/G1/" #kt "/" #vt "/splits" cls "/gqa" #gqa
 
-// generic tier G4 instances (sa_attend_g4<SA_T_GEN, SA_T_GEN, VL, SA_EPI_PLAIN, GQA>), V loader outermost: dispatched by
-// sparse-attn-generic.cu at index vl * 3 + gqa_index (vl: SA_V_PACKED 0, SA_V_SPLITGATHER 1)
+// generic tier G4 instances, index vl * 3 + gqa_index (vl: SA_V_PACKED 0, SA_V_SPLITGATHER 1)
 #define GGML_CUDA_SA_GEN_G4_INSTANCES(X) \
     X(packed, 4)                         \
     X(packed, 8)                         \
@@ -159,8 +122,7 @@
 
 #define GGML_CUDA_SA_CENSUS_GEN_G4_KEY(vl, gqa) "sa_generic/G4/" #vl "/gqa" #gqa
 
-// generic tier G1 instances (sa_attend_g1<SA_T_GEN, SA_T_GEN, GQA>), index gqa_index; census key id
-// GGML_CUDA_SA_CENSUS_GEN_G1_FIRST + gqa_index * 5 + split class
+// generic tier G1 instances, index gqa_index; census id GGML_CUDA_SA_CENSUS_GEN_G1_FIRST + gqa_index * 5 + class
 #define GGML_CUDA_SA_GEN_G1_INSTANCES(X) \
     X(4)                                 \
     X(8)                                 \
@@ -170,7 +132,7 @@
 
 #define GGML_CUDA_SA_CENSUS_GEN_G1_KEY(gqa, cls) "sa_generic/G1/splits" cls "/gqa" #gqa
 
-// portable tier: one kernel, the plan's group a runtime argument; one key per group of GGML_CUDA_SA_PLAN_GROUPS
+// portable tier: one kernel, one key per group of GGML_CUDA_SA_PLAN_GROUPS
 #define GGML_CUDA_SA_CENSUS_PORTABLE_KEY(g) "sa_portable/G" #g
 
 enum ggml_cuda_sa_census_id {
@@ -211,25 +173,22 @@ enum ggml_cuda_sa_census_id {
     GGML_CUDA_SA_CENSUS_N,
 };
 
-// first generic G4 id: instance i of GGML_CUDA_SA_GEN_G4_INSTANCES has id GGML_CUDA_SA_CENSUS_GEN_G4_FIRST + i
 #define GGML_CUDA_SA_CENSUS_GEN_G4_FIRST GGML_CUDA_SA_CENSUS_GEN_G4_packed_4
-// first generic G1 id: instance i (gqa_index), split class c has id GGML_CUDA_SA_CENSUS_GEN_G1_FIRST + 5 * i + c
+// instance i, split class c: GGML_CUDA_SA_CENSUS_GEN_G1_FIRST + 5 * i + c
 #define GGML_CUDA_SA_CENSUS_GEN_G1_FIRST GGML_CUDA_SA_CENSUS_GEN_G1_4_c0
 static_assert(GGML_CUDA_SA_CENSUS_GEN_G1_FIRST - GGML_CUDA_SA_CENSUS_GEN_G4_FIRST == GGML_CUDA_SA_GEN_G4_N,
               "GGML_CUDA_SA_GEN_G4_INSTANCES must list GGML_CUDA_SA_GEN_G4_N instances");
 static_assert(GGML_CUDA_SA_CENSUS_GEN_FIXUP - GGML_CUDA_SA_CENSUS_GEN_G1_FIRST == 5 * GGML_CUDA_SA_GEN_G1_N,
               "GGML_CUDA_SA_GEN_G1_INSTANCES must list GGML_CUDA_SA_GEN_G1_N instances of 5 split classes each");
 
-// first G4 attend id; instance i of GGML_CUDA_SA_G4_INSTANCES has id GGML_CUDA_SA_CENSUS_G4_FIRST + i
 #define GGML_CUDA_SA_CENSUS_G4_FIRST GGML_CUDA_SA_CENSUS_G4_f16_f16_packed_plain_4
 static_assert(GGML_CUDA_SA_CENSUS_FIXUP_f16_f16_plain - GGML_CUDA_SA_CENSUS_G4_FIRST == 4 * GGML_CUDA_SA_G4_PER_KT,
               "GGML_CUDA_SA_G4_INSTANCES must list 4 K types of GGML_CUDA_SA_G4_PER_KT instances each");
-// first fixup id; instance i of GGML_CUDA_SA_FIXUP_INSTANCES has id GGML_CUDA_SA_CENSUS_FIXUP_FIRST + i
 #define GGML_CUDA_SA_CENSUS_FIXUP_FIRST GGML_CUDA_SA_CENSUS_FIXUP_f16_f16_plain
 static_assert(GGML_CUDA_SA_CENSUS_PACK_f16 - GGML_CUDA_SA_CENSUS_FIXUP_FIRST == 4 * GGML_CUDA_SA_FIXUP_PER_KT,
               "GGML_CUDA_SA_FIXUP_INSTANCES must list 4 K types of GGML_CUDA_SA_FIXUP_PER_KT instances each");
 
-// first G1 id; instance i of GGML_CUDA_SA_G1_INSTANCES, split class c has id GGML_CUDA_SA_CENSUS_G1_FIRST + 5 * i + c
+// instance i, split class c: GGML_CUDA_SA_CENSUS_G1_FIRST + 5 * i + c
 #define GGML_CUDA_SA_CENSUS_G1_FIRST GGML_CUDA_SA_CENSUS_G1_f16_f16_4_c0
 static_assert(GGML_CUDA_SA_CENSUS_MERGE - GGML_CUDA_SA_CENSUS_G1_FIRST == 5 * GGML_CUDA_SA_G1_N,
               "GGML_CUDA_SA_G1_INSTANCES must list GGML_CUDA_SA_G1_N instances of 5 split classes each");
@@ -271,5 +230,5 @@ static const char * const ggml_cuda_sa_census_keys[GGML_CUDA_SA_CENSUS_N + 1] = 
     nullptr,
 };
 
-// counts one dispatch of key id while the census is on (one relaxed load when it is off); defined in ggml-cuda.cu
+// counts one dispatch while the census is on (one relaxed load when off); defined in ggml-cuda.cu
 void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id);

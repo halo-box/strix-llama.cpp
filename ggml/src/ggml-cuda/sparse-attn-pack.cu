@@ -1,12 +1,8 @@
-// sa_pack_v<T>: V of an S_fast type (or, T = SA_T_GEN, of any type of S through the runtime switch sa_any_elem: the
-// generic tier's pack, PLAN-v3 §6.2 "4 + 1 generic") to the packed f16 layout the G4 attend reads with SA_V_PACKED (PLAN-v3 §6.2, D8).
-//
-// Layout: f16 [n_stream][n_head_kv][n_quads][256 dims][4 cells], the PR #219 tree's qsa_pack_v indexing
-// (qsa-prefill.cu: element (quad, dim) at quad * 1024 + dim * 4) with the stream and the kv head as outer dimensions, so
-// one uint2 load gives the 4 cells of an entry for one dim. Every cell 0 .. 4 * n_quads - 1 is converted (the pack is
-// O(n_kv), independent of the selection), with the conversions of sparse-attn-q8.cuh, so packed and direct V deliver the
-// same halves (non-finite halves excepted: the pack writes them as 0 and flags their quad for the exact fixup). The destination is the attend dst over-allocation (ggml_cuda_sparse_attn_get_alloc_size), never the pool
-// (D12).
+// sa_pack_v<T>: V to the packed f16 layout the G4 attend reads with SA_V_PACKED (T = SA_T_GEN: any type of S).
+// Layout f16 [n_stream][n_head_kv][n_quads][256 dims][4 cells], so one uint2 load gives the 4 cells of a quad for one
+// dim. Every cell is converted with the conversions of sparse-attn-q8.cuh, so packed and direct V give the same halves,
+// except non-finite halves: written as 0 and their quad flagged for the exact fixup. The destination is the attend's dst
+// over-allocation, never the pool.
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-census.h"
@@ -17,10 +13,8 @@
 
 static constexpr int SA_PACK_THREADS = 256;
 
-// one thread per (stream, kv head, quad, dim): 4 cells of one dim -> one ushort4; one block per (stream, kv head, quad)
-// (256 threads = the 256 dims). A non-finite half (stored inf / NaN, NaN scale, f16 overflow) is written as 0, and the
-// block writes the quad's flag (0 or 1, every quad written: no clearing needed) and, when set, ORs 1 into *any (cleared
-// before the launch): sa_attend_fixup recomputes the groups that touch a flagged quad (sparse-attn-attend-g4.cuh)
+// one block per (stream, kv head, quad), one thread per dim. Writes the quad's flag (every quad written: no clearing)
+// and ORs 1 into *any (cleared before launch) when a half is non-finite
 template <int T>
 static __global__ void __launch_bounds__(SA_PACK_THREADS) sa_pack_v(
         const char * __restrict__ v, uint16_t * __restrict__ dst, const size_t nb1, const size_t nb2, const size_t nb3,
@@ -45,7 +39,7 @@ static __global__ void __launch_bounds__(SA_PACK_THREADS) sa_pack_v(
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         uint32_t g;
-        if constexpr (T == SA_T_GEN) {   // the generic tier's pack: any type of S, f16 bits (sparse-attn-loaders.cuh)
+        if constexpr (T == SA_T_GEN) {   // generic tier: any type of S
             g = sa_any_elem(gt, in + (size_t) j * nb1, (int) d);
         } else {
             g = sa_gather_load<T>(in + (size_t) j * nb1, w, dd);

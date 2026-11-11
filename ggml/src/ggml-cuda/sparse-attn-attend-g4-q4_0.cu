@@ -1,6 +1,4 @@
-// The 96 sa_attend_g4 instances (48 census indices x ROT false / true) and the 8 sa_attend_fixup instances with K type q4_0 (GGML_CUDA_SA_G4_KT_ and
-// GGML_CUDA_SA_FIXUP_KT_ of sparse-attn-census.h), one TU per K type so the G4 instances build in parallel. Dispatched by
-// sparse-attn-attend-g4.cu through ggml_cuda_sa_g4_kernels_q4_0 and ggml_cuda_sa_fixup_kernels_q4_0.
+// The sa_attend_g4 and sa_attend_fixup instances with K type q4_0, one TU per K type so they build in parallel.
 
 #include "sparse-attn-attend-g4.cuh"
 #include "sparse-attn-census.h"

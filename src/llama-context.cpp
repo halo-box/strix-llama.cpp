@@ -568,7 +568,7 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
         if (auto * mem_qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) {
-            mem_qsa->qsa_set_causal_attn(cparams.causal_attn);   // the NC0 re-split applies only under causal attention
+            mem_qsa->qsa_set_causal_attn(cparams.causal_attn);
         }
     }
 
@@ -875,7 +875,7 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 }
 
 //
-// QSA placement guard (PLAN-v3 §10)
+// QSA placement guard
 //
 
 int llama_context::qsa_n_layers() const {
@@ -895,23 +895,19 @@ int llama_context::qsa_n_layers() const {
     return n;
 }
 
-// the K / V types this device takes for this node's shape, for the "supported here" remedy of the init error
 std::vector<llama_qsa_reserve_pass_desc> llama_qsa_reserve_passes(const llama_qsa_reserve_shape & s) {
     std::vector<llama_qsa_reserve_pass_desc> p;
     const uint32_t n_tokens = s.n_tokens, n_seqs = s.n_seqs, n_outputs_pp = s.n_outputs_pp;
-    // the QSA reserve graphs of PLAN-v3 §7.1, in the allocating context before the sizes are recorded, and in the fit
-    // probe's per-backend max (no_alloc):
-    //  - pass A (§7.1.2): sequential positions, one output in the last row: the trim tile (n_tokens > 512) and the
-    //    incremental fast-cache route (n_tokens <= 512), which the all-zero-position reserve never builds (C15);
-    //  - pass B (§7.1.3): the dense shortcut at its largest padded n_kv (its [n_kv, n_tokens] mask, C15);
-    //  - the non-compact variant (§7.1.4) when the context serves several sequences: T = min(ub, S x 512) tokens in total,
-    //    the decision forced to non-compact at the full n_kv; the re-split bounds every runtime non-compact ubatch by T
-    // one KV stream (unified, or a single sequence): the fast cache and the trim need n_stream == 1
+    // routes the plain pp / tg reserve never builds:
+    //  - pass A: sequential positions, last-row output: the trim tile (n_tokens > 512) and the fast-cache route (<= 512);
+    //  - pass B: the dense shortcut at its largest padded n_kv;
+    //  - non-compact (several sequences): T = min(ub, S x 512) tokens, the re-split bounds runtime ubatches by T
+    // the fast cache and the trim need n_stream == 1
     if (s.kv_unified || n_seqs == 1) {
         if (n_tokens > 512) {
             p.push_back({ "passA-trim", n_tokens, 1, 1, 0, 0, 0, true, true });
         }
-        // the fast route with every row an output (llama-perplexity at ub <= 512): C15's +33280 B sit under the logits
+        // the fast route with every row an output (perplexity at ub <= 512)
         const uint32_t n_fast = std::min<uint32_t>(n_tokens, 512);
         p.push_back({ "passA-fast", n_fast, 1, std::min(n_fast, n_outputs_pp), 0, 0, LLM_GRAPH_QSA_RESERVE_FAST, true, false });
     }
@@ -919,26 +915,20 @@ std::vector<llama_qsa_reserve_pass_desc> llama_qsa_reserve_passes(const llama_qs
     const uint32_t n_kv_b = s.width / 256 * 256;
     const bool shortcut = n_kv_b >= 256 && n_kv_b < s.n_kv_full;
     if (shortcut) {
-        // a stream's cells hold at least its own tokens of the ubatch, so a shortcut ubatch has at most n_kv_b tokens per
-        // stream: a 4096-token ubatch at n_kv 2048 cannot occur
+        // a shortcut ubatch has at most n_kv_b tokens per stream
         const uint32_t n_streams = s.kv_unified ? 1 : n_seqs;
         const uint32_t n_tok_b   = std::min(n_tokens, n_kv_b * n_streams);
         p.push_back({ "passB", n_tok_b, n_seqs, std::min(n_tok_b, n_outputs_pp), n_kv_b, 0, 0, false, false });
     }
     if (s.mtp) {
-        // the MTP draft context processes prompt ubatches with no output row (W9 strict run: n_outputs = 0 on a 4096-token
-        // ubatch grew the MTP ROCm0 buffer past the pp reserve, whose graph always has >= 1 output)
+        // the MTP draft context processes prompt ubatches with no output row
         p.push_back({ "pp-0out", n_tokens, n_seqs, 0, 0, 0, 0, false, false });
     }
     if (n_seqs > 1) {
         const uint32_t T = std::min(n_tokens, s.noncompact_cap);
         p.push_back({ "noncompact", T, n_seqs, std::max(n_seqs, std::min(T, n_outputs_pp)), 0, 0, LLM_GRAPH_QSA_RESERVE_NONCOMPACT, false, false });
     }
-    // split KV streams with several sequences: a ubatch of one sequence (the server's prompt ubatches) is a one-stream graph
-    // of up to n_ubatch rows at the full per-stream n_kv. The graphs above all view n_seqs streams (init_full's slot info),
-    // so none of them builds it: Prove's -np 2 split run at ub8192 grew the main ROCm0 buffer 22.6 MiB past the reserve on
-    // one-sequence 8192-token ubatches (n_stream=1, n_outputs=0). Reserve the one-stream shapes of the passes above: plain,
-    // no output (the server's non-final prompt ubatches), and the trim and fast-cache routes (both need n_stream == 1).
+    // split streams: a one-sequence ubatch is a one-stream graph, which the n_seqs-stream graphs above never build
     if (!s.kv_unified && n_seqs > 1) {
         p.push_back({ "1s-pp",   n_tokens, 1, n_outputs_pp, s.n_kv_full, 1, 0, false, false });
         p.push_back({ "1s-0out", n_tokens, 1, 0,            s.n_kv_full, 1, 0, false, false });
@@ -947,12 +937,8 @@ std::vector<llama_qsa_reserve_pass_desc> llama_qsa_reserve_passes(const llama_qs
         }
         const uint32_t n_fast = std::min<uint32_t>(n_tokens, 512);
         p.push_back({ "1s-fast", n_fast, 1, std::min(n_fast, n_outputs_pp), s.n_kv_full, 1, LLM_GRAPH_QSA_RESERVE_FAST, true, false });
-        // and pass B's: a one-sequence ubatch at n_kv <= n_kv_b is a one-stream shortcut graph of up to min(ub, n_kv_b)
-        // rows. Pass B views n_seqs streams with n_tok_b / n_seqs rows each, so its route is decided at that per-stream
-        // n_q (prefer_dense, qwen4exp.cpp), and on HIP a non-f16 pair is dense FA at n_q <= 127 but the AV rows + plan +
-        // SPARSE_ATTN route at n_q >= 128 (sparse-attn-attend-g1.cu): -np 8 at ub 512 reserves 64-row streams (dense)
-        // while a slot's 512-token prompt ubatch runs the AV route (its n_kv x n_tokens F32 intermediates), which no other
-        // pass builds (the 1s passes above run at n_kv_full > width: the selection route)
+        // and pass B's: the shortcut route depends on the per-stream n_q (prefer_dense), so pass B's n_seqs-stream graph
+        // may take a different route than a one-sequence ubatch
         if (shortcut) {
             const uint32_t n_tok_1 = std::min(n_tokens, n_kv_b);
             p.push_back({ "1s-passB",      n_tok_1, 1, std::min(n_tok_1, n_outputs_pp), n_kv_b, 1, 0, false, false });
@@ -968,7 +954,7 @@ std::string llama_qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor 
     if (attn->op != GGML_OP_SPARSE_ATTN) {
         return "";
     }
-    // two objects per type: the K tensor and the SPARSE_ATTN node (ggml_sparse_attn makes one result tensor)
+    // two objects per type: the K tensor and the SPARSE_ATTN node
     ggml_init_params ip = { 2 * std::size(types) * ggml_tensor_overhead(), nullptr, true };
     ggml_context_ptr ctx { ggml_init(ip) };
     std::string out;
@@ -982,7 +968,7 @@ std::string llama_qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor 
     return out;
 }
 
-// PLAN-v3 §10: the message names the op's device and the remedies of the cause
+// the message names the op's device and the remedies
 static std::string qsa_unsupported_error(const llm_graph_qsa_node & n, ggml_backend_dev_t dev, const ggml_tensor * op) {
     std::string reason;
     if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -1006,18 +992,8 @@ static std::string qsa_unsupported_error(const llm_graph_qsa_node & n, ggml_back
     return msg;
 }
 
-// The indexer K cache of a hybrid-idx memory (--cache-type-k-idx, W11) is read and written by ordinary ops, which the
-// layer registers (llm_graph_result::add_qsa_idx_node: qwen4exp's GET_ROWS of the block members and the SET_ROWS of
-// cpy_k). A device that does not take such an op for the indexer type leaves it to the scheduler, which runs it on the
-// CPU and copies the cache view to the host for every layer and ubatch: HIP GET_ROWS of IQ4_NL needs ne[0] % 256 == 0
-// (ggml-cuda.cu supports_op) and the qwen4exp indexer row is 128 wide. The SPARSE_ATTN checks never see it. An error when
-// such a node runs on a CPU backend while the layer's indexer K storage is not a host buffer; it names the types that
-// device takes for that node. The node itself is checked, not its sources: the scheduler has replaced a source it copies.
-//
-// The indexer types device dev takes for t, a GET_ROWS of the indexer cache (its source retyped) or the SET_ROWS that writes
-// it (its destination retyped), as a list for the error text. A SET_ROWS node holds src[0] = the rows, src[1] = the
-// indices, src[2] = the destination (ggml_set_rows), so the probe passes src[0] and src[1]: passing src[1] and src[2] gave
-// ggml_set_rows the I64 indices as the rows, and its GGML_ASSERT aborted where the error was to be returned.
+// the indexer types dev takes for t, a GET_ROWS (source retyped) or SET_ROWS (destination retyped) on the indexer cache;
+// SET_ROWS holds src[0] = rows, src[1] = indices
 static std::string qsa_idx_types_taken(ggml_backend_dev_t dev, const ggml_tensor * t) {
     static const ggml_type types[] = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
                                        GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
@@ -1042,13 +1018,8 @@ static std::string qsa_idx_types_taken(ggml_backend_dev_t dev, const ggml_tensor
     return ok;
 }
 
-// The writer of the indexer K cache (the cpy_k SET_ROWS, registered by add_qsa_idx_node) is a view of the cache buffer, so
-// the scheduler must run it on a backend that takes both that buffer and the op. When none does,
-// ggml_backend_sched_backend_id_from_cur aborts ("pre-allocated tensor ... that cannot run the operation") before
-// qsa_guard ever sees the graph: an indexer type the device does not write (--cache-type-k-idx, type_k_idx: e.g. MXFP4 on
-// HIP, whose SET_ROWS lists f32 / f16 / bf16 / q4_0 / q4_1 / q5_0 / q5_1 / q8_0 / iq4_nl) took the process down. This
-// runs on the built graph before the scheduler (graph_reserve, process_ubatch) with the scheduler's own rule
-// (ggml_backend_sched_backend_from_buffer: a backend that supports the buffer type and the op) and returns the error.
+// the indexer cache writer (SET_ROWS into the cache buffer) needs a backend taking both the buffer and the op, or the
+// scheduler aborts before qsa_guard runs: check it on the built graph with the scheduler's rule and return an error
 static std::string qsa_guard_indexer_writer(const llm_graph_result * res, const llama_memory_i * memory,
                                             const std::vector<ggml_backend_t> & backends) {
     const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory);
@@ -1097,14 +1068,13 @@ static std::string qsa_guard_indexer(const llm_graph_result * res, ggml_backend_
         }
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(st->buffer);
         if (ggml_backend_buft_is_host(buft)) {
-            continue;   // --no-kv-offload / -ngl 0: the cache is on the host, the CPU reads it in place
+            continue;   // the CPU reads a host cache in place
         }
         ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sc, t);
         if (be == nullptr || ggml_backend_dev_type(ggml_backend_get_device(be)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
             continue;
         }
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        // the indexer types this device takes for the same node
         const std::string ok = qsa_idx_types_taken(dev, t);
         return format("QSA layer %d: the indexer K cache (%s, on %s) is %s by %s '%s', which device %s does not take for this "
                 "type: the scheduler would run it on the CPU and copy the cache to the host every ubatch; use "
@@ -1119,13 +1089,12 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
     const auto & nodes = res->get_qsa_nodes();
     auto * sc = sched.get();
 
-    // the checks per layer
     int n_required = 0;
     bool cache_only = false;
     std::unordered_map<const ggml_tensor *, const llm_graph_qsa_node *> plans, attends;
     for (const auto & n : nodes) {
         if (n.attn == nullptr) {
-            cache_only = true;     // an MTP cache-only graph: no attention at all
+            cache_only = true;
             continue;
         }
         n_required += n.plan ? 2 : 1;
@@ -1141,7 +1110,6 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
             return format("QSA layer %d (%s): attention node has no backend at '%s'", n.il, n.producer, where);
         }
 
-        // the backend this route must run on
         ggml_backend_dev_t dev_want = nullptr;
         switch (n.place) {
             case LLM_QSA_PLACE_K_DEVICE:
@@ -1160,7 +1128,7 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
                 break;
         }
 
-        // a pinned node is not checked by the scheduler: an op its device does not take must never reach a compute
+        // the scheduler does not check a pinned node
         ggml_backend_dev_t dev_op = dev_want ? dev_want : dev;
         for (const ggml_tensor * op : { (const ggml_tensor *) n.plan, (const ggml_tensor *) n.attn }) {
             if (op && !ggml_backend_dev_supports_op(dev_op, op)) {
@@ -1173,7 +1141,7 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
         if (n.plan) {
             ggml_backend_t be_plan = ggml_backend_sched_get_tensor_backend(sc, n.plan);
             if (be_plan != be) {
-                return format("QSA layer %d (%s): plan on %s, attend on %s (F-W4-1: the attend reads the plan's node)", n.il, n.producer,
+                return format("QSA layer %d (%s): plan on %s, attend on %s (the attend reads the plan's node)", n.il, n.producer,
                         be_plan ? ggml_backend_name(be_plan) : "none", ggml_backend_name(be));
             }
             plans[n.plan] = &n;
@@ -1181,8 +1149,7 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
         }
     }
 
-    // llama's gf: every sparse node is registered and has a backend; each plan has exactly one consumer, its attend, with the
-    // same n_q and n_stream (not sched->graph, which also holds alloc-dep and input-copy nodes)
+    // every sparse node is registered; each plan has one consumer, its attend, with the same n_q and n_stream
     int n_inspected = 0;
     std::unordered_map<const ggml_tensor *, int> plan_users;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
@@ -1212,7 +1179,6 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
             return format("QSA layer %d: plan has %d consumers, expected 1", it.second->il, u == plan_users.end() ? 0 : u->second);
         }
     }
-    // the dense shortcut's attention nodes were each read with a non-NULL backend above
     for (const auto & n : nodes) {
         if (n.attn && !n.plan) {
             n_inspected++;
@@ -1226,7 +1192,7 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
         }
     }
 
-    // non-vacuity: a pass that looked at nothing proves nothing
+    // a pass that inspected nothing proves nothing
     const int n_layers = qsa_n_layers();
     if (!cache_only && ((int) nodes.size() != n_layers || n_inspected < n_required)) {
         return format("QSA guard inspected nothing at '%s': %d nodes with a backend, %d required, %d of %d layers registered",
@@ -1260,7 +1226,7 @@ void llama_context::qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32
             n_cpu += be == backend_cpu;
         }
     }
-    // one line per context and shape: the route, the types, where the policies come from, the pins (#219's log line, adapted)
+    // one line per context and shape: route, types, policy source, pins
     const auto & nodes = res->get_qsa_nodes();
     if (!nodes.empty()) {
         const auto & n0 = nodes.front();
@@ -1269,8 +1235,6 @@ void llama_context::qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32
         ggml_backend_t be0 = n0.attn ? ggml_backend_sched_get_tensor_backend(sched.get(), n0.attn) : nullptr;
         ggml_backend_dev_t dev0 = be0 ? ggml_backend_get_device(be0) : nullptr;
         const bool has_policy = dev0 && ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev0), "ggml_backend_sparse_attn_group") != nullptr;
-        // a graph without any attention node (the MTP context's no-output prompt graph stores K / V only, qsa_guard's
-        // cache_only) has nothing to place: route=cache-only, and the guard's own counts (0 required), not a clamped 1
         LLAMA_LOG_INFO("%s: QSA ctx=%s graph=%s route=%s K=%s V=%s idx=%s policy=%s backend=%s plan=%d attend=%d cpu=%d%s%s n_kv=%" PRId64 " G=%d guard=%d/%d\n",
                 __func__, ctx_name, where, n_copy > 0 ? "host-kv-copy" : n_plan > 0 ? "sparse" : n_attend > 0 ? "dense-shortcut" : "cache-only",
                 ggml_type_name(n0.type_k), ggml_type_name(n0.type_v), mem && mem->get_mem_idx() ? ggml_type_name(mem->get_mem_idx()->type_k()) : "none",
@@ -1349,8 +1313,7 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
-    // the fit probe (no_alloc): ggml_gallocr_reserve_n_size overwrites its sizes per graph while the real reserve grows, so the
-    // estimate is the per-backend max over every reserve graph (PLAN-v3 §7.1.7)
+    // the fit probe (no_alloc) gets sizes per graph while the real reserve grows: take the per-backend max
     const bool no_alloc = model.hparams.no_alloc;
     std::vector<size_t> probe_sizes(backend_ptrs.size(), 0);
     std::fill(backend_buf_exp_size.begin(), backend_buf_exp_size.end(), 0);
@@ -1410,8 +1373,7 @@ void llama_context::sched_reserve() {
         LLAMA_LOG_INFO("%s: reserve after the pp and tg graphs, MiB:%s\n", __func__, sizes_pp_tg.c_str());
     }
 
-    // the QSA reserve graphs of PLAN-v3 §7.1 (llama_qsa_reserve_passes), in the allocating context before the sizes are
-    // recorded below, and in the fit probe's per-backend max (no_alloc)
+    // the QSA reserve graphs (llama_qsa_reserve_passes)
     struct qsa_reserve_pass {
         const char * name;
         uint32_t n_tokens;
@@ -1421,7 +1383,7 @@ void llama_context::sched_reserve() {
         reserve_variant var;
     };
     std::vector<qsa_reserve_pass> qsa_passes;
-    // the reduced views of the passes (init_full_n_kv), one per (n_kv, n_stream), alive until the passes are reserved
+    // the reduced views of the passes, one per (n_kv, n_stream)
     std::vector<std::pair<std::pair<uint32_t, uint32_t>, llama_memory_context_ptr>> qsa_views;
     if (qsa_n_layers() > 0 && !cparams.training) {
         auto * mem_qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
@@ -1462,7 +1424,6 @@ void llama_context::sched_reserve() {
             throw std::runtime_error(format("failed to allocate the QSA reserve graph '%s'", p.name));
         }
         probe_max();
-        // the per-backend reserve after this pass (grow-only), for the reserve accounting of AT-C12 / M5
         std::string sizes_after;
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             const size_t sz = no_alloc ? probe_sizes[i] : ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
@@ -1496,8 +1457,7 @@ void llama_context::sched_reserve() {
         probe_max();
     }
 
-    // the placement guard runs on split_only graphs: ggml_backend_sched_reserve ends with a reset, after which no node has a
-    // backend (PLAN-v3 §10). One pass per reserve graph; a violation is an init error.
+    // the placement guard runs on split_only graphs (the reserve resets the backends); a violation is an init error
     if (qsa_n_layers() > 0) {
         qsa_guard_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), "pp");
         if (!cparams.training) {
@@ -2175,8 +2135,7 @@ void llama_context::set_causal_attn(bool value) {
     }
 
     // no scheduler reserve needed because graph shapes must not depend on causal_attn, a flip only rebuilds the graph;
-    // except with QSA layers: complete-block selection needs causal attention (qwen4exp_use_block_selection), so a flip
-    // moves every QSA ubatch between the compact rows and the TE rows, whose shapes the reserve must hold
+    // except with QSA: block selection needs causal attention, so a flip switches between the CB and TE rows
     if (qsa_n_layers() > 0) {
         sched_need_reserve = true;
     }
@@ -2365,14 +2324,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        // the QSA graph-build check (PLAN-v3 §4.3): an unreserved non-compact graph is never allocated
+        // an unreserved non-compact QSA graph is never allocated
         if (!res->get_qsa_ubatch_error().empty()) {
             LLAMA_LOG_ERROR("%s: %s\n", __func__, res->get_qsa_ubatch_error().c_str());
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
-        // an indexer cache writer no backend can place makes the scheduler abort (qsa_guard_indexer_writer)
+        // an indexer cache writer no backend can place makes the scheduler abort
         if (!res->get_qsa_idx_nodes().empty()) {
             const std::string err = qsa_guard_indexer_writer(res, memory.get(), backend_ptrs);
             if (!err.empty()) {
@@ -2390,7 +2349,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         t_alloc = ggml_time_us() - t_alloc_us;
 
-        // every newly built graph: a QSA node on the wrong backend is an error, never a compute (PLAN-v3 §10)
+        // a QSA node on the wrong backend is an error, never a compute
         if (!res->get_qsa_nodes().empty()) {
             const std::string err = qsa_guard(gf, res, "decode");
             if (!err.empty()) {
@@ -3519,7 +3478,7 @@ ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
         const reserve_variant * variant) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    // a reserve variant may have no output (the MTP prompt ubatch, PLAN-v3 §7.1); the plain reserves keep >= 1
+    // a reserve variant may have no output (the MTP prompt ubatch)
     GGML_ASSERT(n_outputs >= 1 || variant != nullptr);
 
     if (n_tokens % n_seqs != 0) {
@@ -3549,9 +3508,8 @@ ggml_cgraph * llama_context::graph_reserve(
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
     if (variant && variant->seq_pos) {
-        // sequential positions per sequence, text under M-RoPE as [p, p, p, 0], ending at the last cell of a stream: the
-        // reserve then takes the routes that a degenerate all-zero ubatch never takes (the trim, the fast cache) with the
-        // widest scorer qwen4exp_score_key_limits allows (a ubatch at the end of the context)
+        // sequential positions ending at the last cell of a stream: the routes an all-zero ubatch never takes (trim, fast
+        // cache), with the widest scorer
         const uint32_t n_ctx_stream = cparams.kv_unified ? cparams.n_ctx : std::max<uint32_t>(1, cparams.n_ctx / std::max<uint32_t>(1, cparams.n_seq_max));
         const llama_pos pos0 = (llama_pos) (n_ctx_stream > ubatch.n_seq_tokens ? n_ctx_stream - ubatch.n_seq_tokens : 0);
         for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {

@@ -59,8 +59,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/sparse-attn.cpp
         )
 
-    # the sparse attention reference implements its numeric contract operation by operation (ggml.h, ggml_sparse_attn):
-    # no contraction of a * b + c into a fused multiply-add (GCC's GNU-mode default is -ffp-contract=fast)
+    # the sparse attention reference follows its numeric contract operation by operation: no fused multiply-add
     set_source_files_properties(ggml-cpu/sparse-attn.cpp PROPERTIES COMPILE_OPTIONS
         "$<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>,$<CXX_COMPILER_ID:IntelLLVM>>:-ffp-contract=off>")
 

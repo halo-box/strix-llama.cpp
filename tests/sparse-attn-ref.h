@@ -1,17 +1,8 @@
 // Host references for GGML_OP_SPARSE_ATTN_PLAN and GGML_OP_SPARSE_ATTN (tests only).
-//
-// plan(): the C3 oracle. The algorithm is cpu_plan() of the C3 experiment (scripts/qsa-validation/harness/c3/c3_plan.cu,
-//   "CPU reference": one std::map<quad, mask> per group, filled with every valid cell of the group's queries, read in
-//   ascending quad order, padded to a multiple of 4), generalised from G = 4 to G in {1, 4} and to n_stream streams,
-//   and encoded in the dst layout of ggml.h (header, counts, quads, masks; the padding rule of ggml.h replaces C3's
-//   0xFFFFFFFF padding quad by the last real quad of the group). It shares no code with the ggml CPU op
-//   (ggml-cpu/sparse-attn.cpp: per-row sort/unique, then a k-way merge).
-//
-// attend(): O_CON, the numeric contract of ggml_sparse_attn (ggml.h), written as R1-M-Lab A's oracle_group(O_CON)
-//   (scripts/qsa-validation/harness/bandsop/bands_ref.h) is, generalised to any D, GQA ratio, stream count, K/V type
-//   (the type's to_float, rounded to f16) and the H_q / H_o rotations. The cells of a query come straight from its
-//   selection row (valid, sorted, unique), not from a plan. Any translation unit that includes this header and wants
-//   bit equality with the CPU op must be compiled with -ffp-contract=off (tests/CMakeLists.txt).
+// plan(): one std::map<quad, mask> per group over the group's valid cells, in the dst layout of ggml.h; it shares no code
+//   with the CPU op (per-row sort/unique, then a k-way merge).
+// attend(): the numeric contract of ggml_sparse_attn (ggml.h), cells taken straight from the selection rows. A translation
+//   unit that wants bit equality with the CPU op must be compiled with -ffp-contract=off.
 #pragma once
 
 #include "ggml.h"
@@ -206,7 +197,7 @@ static std::vector<float> attend(const view & q, const view & k, const view & v,
                         l[hr] *= alpha;
                         m[hr] = sc[hr];
                     }
-                    const float p  = sc[hr] == -INFINITY ? 0.0f : expf(sc[hr] - m[hr]);   // a -inf score has weight 0 (ggml.h item 3)
+                    const float p  = sc[hr] == -INFINITY ? 0.0f : expf(sc[hr] - m[hr]);   // a -inf score has weight 0
                     const float ph = rh(p);
                     l[hr] += p;
                     for (int64_t d = 0; d < D; ++d) {
@@ -234,8 +225,8 @@ static std::vector<float> attend(const view & q, const view & k, const view & v,
     return out;
 }
 
-// f64 oracles of PLAN-v3 §3 (R1-M-Lab A, bands_ref.h), reported only (never gated):
-//   O_C18  q = f16(f16(q) * f16(scale)), K/V = to_float rounded to f16, bf16 saturated to +-65504 first (c18_attn.cu:290)
+// f64 oracles, reported only (never gated):
+//   O_C18  q = f16(f16(q) * f16(scale)), K/V = to_float rounded to f16, bf16 saturated to +-65504 first
 //   O_PLAN q * scale in f32, K/V = to_float (no f16 rounding)
 // both with an exact f64 softmax over the row's valid cells. Computed for the queries listed in `queries` (all heads and
 // streams); returns max |gpu - ref| / max |ref| over them, against `got` ([D, n_head, n_q, n_stream] contiguous).

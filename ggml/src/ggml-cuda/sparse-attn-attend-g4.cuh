@@ -1,40 +1,20 @@
 #pragma once
 
-// sa_attend_g4<KT, VT, VL, EPI, GQA>: GGML_OP_SPARSE_ATTN with a G = 4 plan on RDNA3 WMMA (PLAN-v3 §6.2, D8, D10, D11).
-//
-// The body is PR #219's qsa3_attn_kernel (qsa-prefill.cu of 94e086847, as C18's c18_attn_kernel took it over line by
-// line: Q prologue, WMMA order, online softmax, 2 barriers per 16-cell chunk, epilogue), with:
-//   - no mask path and no runtime gate / o16 branches: EPI is a template parameter (C18: the PR kernel is 2-8.5 % slower
-//     than the same loaders without those paths);
-//   - the K / V loaders of sparse-attn-loaders.cuh: K split for every type (sa_k_loader_of), V packed (sa_pack_v) or
-//     split-gather direct (D8);
-//   - rows = 4 queries x GQA heads (GQA in {4, 8, 12}: 1, 2 or 3 WMMA row tiles of 16), streams on grid.z;
-//   - the ggml.h plan layout (padding entries repeat the last quad with mask 0: no sentinel);
-//   - the op contract (ggml.h): q * scale in f32, then f16 (the PR rounded q and scale to f16 first: identical while
-//     scale is a power of two, 1/16 for qwen4exp);
-//   - masked-off cells contribute nothing whatever their bytes (contract item 4): K / V of a cell no query of the group
-//     attends are zeroed by select, and the score of a cell the row's query does not attend is replaced by -inf. The PV
-//     WMMA is shared by the 4 queries of the group, so a V element that is not finite (a stored inf / NaN, a NaN scale,
-//     an f16 overflow of the conversion) of a cell attended by only some of them would give 0 * inf = NaN in the rows
-//     of the others. Packed V: sa_pack_v replaces every non-finite half by 0 and flags its quad; direct V: a wave whose
-//     V fragment holds a non-finite half (one packed FMA per dword detects it) takes it out of the WMMA and flags the
-//     block. sa_attend_fixup then recomputes every block that touches a flagged quad or was flagged, with the CPU op's
-//     per-cell arithmetic (p * v added only to the rows whose query attends the cell). The flags and the fixup keep the
-//     WMMA loop free of any exact-path code, which did not fit the 192 VGPRs of the GQA 12 instances (W3 resource
-//     checks);
-//   - the in-op rotations (PLAN-v3 §8, D13): rot_q != 0 replaces the Q prologue by one that reads whole query rows, one
-//     row per wave at a time, applies H_q with fwht_row (sparse-attn-fwht.cuh: the arithmetic of fwht.cu) in f32, then
-//     the f32 product with scale and the f16 rounding; rot_o != 0 replaces the epilogue store by one that takes whole
-//     output rows (acc / l, f32) from the staging tile, applies H_o with fwht_row and stores them (gated: then the
-//     sigmoid gate, as without rotation). The rotation code exists only in the ROT = true instances (rot_q and rot_o
-//     are then uniform kernel arguments, each may be 0): the ROT = false instances, which every op with rot_q = rot_o = 0
-//     runs, compile to the W9 kernels (a runtime branch in every instance cost 3.6-6 % of the rot 0 attend time on the
-//     C18 wiki rows, ~/dev/wt_lab/w10/time).
-//
-// Work: block (group g, kv head, stream), 8 waves; wave w owns dims 32w .. 32w+31. Scores: each wave computes the
-// partial scores of all rows over its 32 dims, waves w < NT (NT = GQA / 4 row tiles) reduce tile w and run the online
-// softmax for its 16 rows. Every count / quad / mask entry the kernel reads is inside the plan dst; every K / V cell it
-// reads is a cell 4 * quad + c with quad < ceil(n_kv / 4), inside the views (ggml_sparse_attn asserts the view rows).
+// sa_attend_g4<KT, VT, VL, EPI, GQA, ROT>: GGML_OP_SPARSE_ATTN with a G = 4 plan on RDNA3 WMMA. Block (group, kv head,
+// stream), 8 waves, wave w owns dims 32w .. 32w+31; rows = 4 queries x GQA heads
+// (1, 2 or 3 WMMA row tiles of 16). Each wave computes partial scores of all rows over its dims, waves w < GQA / 4 reduce
+// tile w and run the online softmax of its 16 rows. EPI (plain | gated) is a template parameter: runtime branches cost
+// several percent.
+//   - q * scale in f32, then f16;
+//   - masked-off cells contribute nothing: K / V of a cell no query of the group attends are zeroed by select, and the
+//     score of a cell the row's query does not attend is -inf;
+//   - the PV WMMA is shared by the 4 queries, so a non-finite V half of a cell attended by only some of them would give
+//     0 * inf = NaN in the others' rows. Packed V: sa_pack_v zeroes the half and flags its quad; direct V: the wave takes
+//     it out of the WMMA and flags the block. sa_attend_fixup recomputes flagged blocks with the CPU op's per-cell
+//     arithmetic; keeping the exact path out of the WMMA loop is what lets GQA 12 fit 192 VGPRs;
+//   - rotations (ROT = true instances only, so rot 0 ops pay nothing): H_q on whole query rows in f32 before the scale,
+//     H_o on whole output rows of the staging tile before the store (and before the gate).
+// Every plan entry read is inside the plan dst and every K / V cell inside the views.
 
 #if defined(GGML_USE_HIP)
 
@@ -70,36 +50,30 @@ struct sa_g4_args {
     uint16_t *       o16;       // gated: 16-bit copy of the gated output for an MMB GEMM reader (nullptr: none)
     int              o16_f16;   // 1: f16 (saturating RNE), 0: bf16 (RNE)
     uint8_t *        flags;     // direct V: [n_stream][n_groups][n_head_kv][8 waves]: 1 = the wave took a non-finite V
-                                // half out of the PV WMMA (the block is recomputed by sa_attend_fixup)
-    const uint8_t *  qflags;    // packed V: [n_stream][n_head_kv][pv_nquads]: 1 = sa_pack_v replaced a non-finite half
-                                // of that quad by 0 (nullptr for direct V)
+                                // half out of the PV WMMA
+    const uint8_t *  qflags;    // packed V: [n_stream][n_head_kv][pv_nquads]: 1 = the pack zeroed a non-finite half
     const uint32_t * qany;      // packed V: nonzero when any quad is flagged (cleared before the pack)
-    int              kt_g;      // KT / VT == SA_T_GEN (the generic tier): the ggml types of K and V (sa_any_elem)
+    int              kt_g;      // generic tier: the ggml types of K and V
     int              vt_g;
     int              rot_q;     // H_q block size (0, 64, 128 or 256): op_params[1]
     int              rot_o;     // H_o block size (0, 64, 128 or 256): op_params[2]
-    float            rot_q_scale;   // 1.0f / sqrtf(rot_q), as fwht.cu computes it (unused when rot_q == 0)
+    float            rot_q_scale;   // 1.0f / sqrtf(rot_q), as fwht.cu (unused when rot_q == 0)
     float            rot_o_scale;   // 1.0f / sqrtf(rot_o)
-    int              rot_dump;  // test switch GGML_CUDA_SA_FORCE=rot_dump (rot_q != 0): write H_q q (f32, before scale) to out
-                                // rows R and stop (tests/test-sparse-attn-rot.cpp)
+    int              rot_dump;  // test switch (rot_q != 0): write H_q q (f32, before scale) to out rows R and stop
     int              fixup_all; // test hook (GGML_CUDA_SA_FORCE=fixup): sa_attend_fixup recomputes every block
 };
 
 typedef void (*sa_g4_kernel_t)(const sa_g4_args);
 
-// the instance tables of sparse-attn-attend-g4-<kt>.cu, in GGML_CUDA_SA_G4_KT_ order (sparse-attn-census.h), two
-// instances per census index i = ((vt * 2 + vl) * 2 + epi) * 3 + gqa_index (gqa_index 0 / 1 / 2 for GQA 4 / 8 / 12): entry
+// instance tables of sparse-attn-attend-g4-<kt>.cu: two per census index i = ((vt * 2 + vl) * 2 + epi) * 3 + gqa_index,
 // 2 * i is ROT = false, 2 * i + 1 ROT = true
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_f16[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_bf16[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q8_0[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q4_0[];
 
-// waves per EU the register allocator targets: 8 (192 VGPRs) for every instance but the generic tier's GQA 12 ones, which
-// spill at that budget and get 7 (up to 209 VGPRs, no scratch), one wave of occupancy less on those two instances only:
-// the direct-V one since W5 (W5 resource checks: 1 spilled VGPR, 8 B scratch, with the conversions already moved past the
-// barriers), and the packed-V one with the rotation prologue / epilogue (ROT = true: 1 spilled VGPR, 8 B scratch at 192
-// VGPRs, ~/dev/wt_rewrite_logs/W10/tu_final.out)
+// waves per EU: 8 (192 VGPRs) for every instance but the generic tier's GQA 12 direct-V and ROT ones, which spill at
+// that budget and get 7
 template <int KT, int VL, int GQA, bool ROT>
 static constexpr int sa_g4_waves_per_eu() {
     return KT == SA_T_GEN && GQA == 12 && (VL == SA_V_SPLITGATHER || ROT) ? 7 : 8;
@@ -136,8 +110,8 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
     // Q prologue: f16(q * scale) (f32 product, one rounding), staged per wave, read back as the WMMA B fragments
     sa_v16s qf[NT][2];
     if (ROT && a.rot_q != 0) {
-        // H_q: wave w takes rows w, w + 8, ... whole (lane l holds dims 32 j + l, the fwht_row layout), transforms them in
-        // f32, and writes f16(x * scale) of dim 32 j + l into the stage of wave j (the layout the read-back expects)
+        // H_q: wave w takes rows w, w + 8, ... whole (fwht_row layout), transforms them in f32 and writes f16(x * scale)
+        // of dim 32 j + l into the stage of wave j
         uint16_t * stage0 = reinterpret_cast<uint16_t *>(&part[0][0][0]);
         for (int row = w; row < 16 * NT; row += 8) {
             const int qi = row / GQA, h = row - GQA*qi;
@@ -259,9 +233,8 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
             return;
         }
         if constexpr (KT == SA_T_GEN) {
-            // the generic tier defers the load and the runtime-switch conversion to k_fin (after the barriers, when the
-            // score fragments are dead): converting here, with the scores and the direct-V raw elements live, spilled
-            // the GQA 12 instances (W5 resource checks). kr[0] carries the cell
+            // the generic tier defers load and conversion to k_fin, after the barriers when the score fragments are dead:
+            // converting here spilled the GQA 12 instances. kr[0] carries the cell
             kr[0] = 4*b[r >> 2] + (r & 3);
         } else {
             sa_piece_load<KT>(kbase + (size_t) (4*b[r >> 2] + (r & 3)) * a.k_nb1, w, hi, kr);
@@ -318,9 +291,8 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
         for (int j = 0; j < 4; ++j) {
             uint2 v;
             if constexpr (VT == SA_T_GEN) {
-                // the generic tier gathers and converts here, after the barriers and one entry at a time: converting the
-                // 16 elements before the barriers (as the S_fast raw gather does) spilled the GQA 12 instance (W5 resource
-                // checks)
+                // the generic tier gathers and converts here, one entry at a time: doing it before the barriers spilled
+                // the GQA 12 instance
                 GGML_UNUSED(vr);
                 v = sa_any_quad4(a.vt_g, vbase, a.v_nb1, b[j], 32*w + 16*hi + r);
             } else {
@@ -436,7 +408,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
                     scf[0] += x.x; scf[1] += x.y; scf[2] += x.z; scf[3] += x.w; scf[4] += y.x; scf[5] += y.y; scf[6] += y.z; scf[7] += y.w;
                 }
             }
-            // select: a cell this row's query does not attend scores -inf (a NaN score of a poisoned cell included)
+            // select: a cell this row's query does not attend scores -inf (a poisoned cell's NaN included)
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
                 const int j = e >> 1, cc = 2*(e & 1) + hi;
@@ -452,9 +424,8 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
             mloc = fmaxf(mloc, __shfl_xor(mloc, 16));
             const float mnew  = fmaxf(m, mloc);
             const float alpha = mnew == -INFINITY ? 1.f : exp2f((m - mnew) * SA_L2E);
-            // fmaxf drops a NaN score, so mnew stays -inf in a step whose live cells of this row all score -inf or NaN: the
-            // exponentials are then taken against 0, so a -inf (or masked) cell gets 0 and a NaN cell keeps its NaN, which makes
-            // l NaN and the row 0 (ggml.h item 5). p = 0 there dropped the NaN: the softmax over the row's other cells
+            // fmaxf drops a NaN score, so mnew stays -inf in a step of only -inf / NaN scores: exponentials are then taken
+            // against 0, a -inf cell gets 0 and a NaN cell keeps its NaN, so l is NaN and the row 0 (op contract)
             const float mref  = mnew == -INFINITY ? 0.f : mnew;
             float p[8], ls = 0.f;
 #pragma unroll
@@ -511,9 +482,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
             v_fin(vr, b, m01, m23, vf);
         }
         // direct V: a non-finite V half in this wave's fragment (x * 0 + acc is NaN exactly then, one packed FMA per
-        // dword). Packed V needs no check here: sa_pack_v already replaced every non-finite half by 0 and flagged its
-        // quad, and the fixup recomputes the blocks that touch a flagged quad (W3 lab: the check costs about 4 % of the
-        // packed kernel time on the C18 rows, scripts/qsa-validation/summaries/w3_kernel_time.md)
+        // dword). Packed V needs no check: the pack already zeroed and flagged it (the check would cost ~4 %)
         if constexpr (!PACKED) {
             sa_half2 nf = sa_half2{(_Float16) 0, (_Float16) 0};
 #pragma unroll
@@ -527,9 +496,8 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
                     nf = __builtin_bit_cast(sa_half2, vv[k].w) * sa_half2{(_Float16) 0, (_Float16) 0} + nf;
                 }
             }
-            // a wave whose V fragment holds a non-finite half: the shared PV WMMA would give 0 * inf = NaN to the rows whose
-            // query does not attend that cell, so the WMMA takes the finite halves only and the block is flagged; the exact
-            // fixup kernel (sa_attend_fixup) then recomputes the flagged blocks with the CPU op's per-cell arithmetic
+            // the shared PV WMMA would give 0 * inf = NaN to rows whose query does not attend that cell: take the finite
+            // halves only and flag the block for sa_attend_fixup
             if (__builtin_expect(__ballot((__builtin_bit_cast(uint32_t, nf) & 0x7fff7fffu) != 0) != 0, 0)) {
 #pragma unroll
                 for (int t = 0; t < 2; ++t) {
@@ -584,9 +552,8 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
         }
         __syncthreads();
         if (ROT && a.rot_o != 0) {
-            // H_o: tile i is in part, element (row rr, dim 32 j + l) of the tile at ostage of wave j + rr * 32 + l. Wave w
-            // takes rows w and w + 8 whole (the fwht_row layout), transforms them in f32 and stores them (gated: then
-            // the gate, element by element, with the expression of the unrotated epilogue)
+            // H_o: tile i is in part, element (row rr, dim 32 j + l) at ostage of wave j + rr * 32 + l. Wave w takes rows
+            // w and w + 8 whole, transforms them in f32 and stores them (gated: then the gate, as unrotated)
             const float * tile = reinterpret_cast<const float *>(&part[0][0][0]);
             for (int rr = w; rr < 16; rr += 8) {
                 const int row = 16*i + rr, qi = row / GQA, h = row - GQA*qi;
@@ -631,7 +598,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
                 const size_t R = ((size_t) s * a.n_q + query) * a.n_head + (size_t) (kvh * GQA + h);
                 float4 v = *reinterpret_cast<const float4 *>(ostage + rr * 32 + dq);
                 if constexpr (EPI == SA_EPI_GATED) {
-                    // sigmoid(gate) * O with op_sigmoid's expression, as cont_sigmoid_mul_v4 and the PR's gated epilogue
+                    // sigmoid(gate) * O with op_sigmoid's expression, as cont_sigmoid_mul_v4
                     const float4 gg = *reinterpret_cast<const float4 *>(a.gate + R * a.gate_nb1 + (size_t) (32*w + dq) * 4);
                     v.x = 1.0f / (1.0f + expf(-gg.x)) * v.x;
                     v.y = 1.0f / (1.0f + expf(-gg.y)) * v.y;
@@ -658,8 +625,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
 }
 
 
-// one K / V element (dim d of a row) as its contract f16 value, widened to f32 (sparse-attn-q8.cuh conversions; the
-// generic tier: sa_any_elem of the ggml type gt)
+// one K / V element (dim d of a row) as its contract f16 value widened to f32 (generic tier: sa_any_elem of type gt)
 template <int T>
 static __device__ __forceinline__ float sa_elem_f16(const char * row, const int d, const int gt) {
     (void) gt;
@@ -682,14 +648,11 @@ static __device__ __forceinline__ float sa_elem_f16(const char * row, const int 
     }
 }
 
-// sa_attend_fixup<KT, VT, EPI>: exact recomputation of the blocks sa_attend_g4 flagged (a non-finite V half taken out of
-// its PV WMMA), with the CPU op's arithmetic (ggml-cpu/sparse-attn.cpp): per row (query, head) the cells of the group
-// that row's query attends, in the plan's ascending order, one at a time: f32 score (block sum over the 256 dims in a
-// fixed order), online softmax with expf, P rounded to f16 for PV, l summing the f32 p, f32 PV, acc / l. Same grid as
-// sa_attend_g4; a block with nothing flagged returns after one load (direct V: its 8 wave flags; packed V: the pack's
-// any-flag, and only when that is set the quad flags of its entries). Thread d owns dim d. The rotations: H_q of the
-// row's q and H_o of its output through shared memory (sa_fwht_smem, the arithmetic of fwht.cu), as sa_attend_g4.
-// a.fixup_all (test hook) recomputes every block.
+// sa_attend_fixup<KT, VT, EPI>: exact recomputation of the blocks sa_attend_g4 flagged, with the CPU op's arithmetic:
+// per row (query, head), the cells its query attends in ascending order, one at a time (f32 score, online softmax with
+// expf, P rounded to f16, f32 PV). Same grid as sa_attend_g4; an unflagged block returns after one load (direct V: its 8
+// wave flags; packed V: the any-flag, then the quad flags of its entries). Thread d owns dim d. Rotations through shared
+// memory. a.fixup_all (test hook) recomputes every block.
 template <int KT, int VT, int EPI>
 __global__ void __launch_bounds__(256) sa_attend_fixup(const sa_g4_args a, const int gqa) {
     const int d = threadIdx.x, lane = d & 31, w = d >> 5;
@@ -766,7 +729,7 @@ __global__ void __launch_bounds__(256) sa_attend_fixup(const sa_g4_args a, const
                     l   *= alpha;
                     mx   = sc;
                 }
-                const float p  = sc == -INFINITY ? 0.0f : expf(sc - mx);   // a -inf score has weight 0 (ggml.h item 3)
+                const float p  = sc == -INFINITY ? 0.0f : expf(sc - mx);   // a -inf score has weight 0
                 const float ph = (float) __builtin_bit_cast(_Float16, sa_f2h(p));
                 l   += p;
                 acc += ph * sa_elem_f16<VT>(vbase + cell * a.v_nb1, d, a.vt_g);
@@ -803,8 +766,7 @@ extern const sa_fixup_kernel_t ggml_cuda_sa_fixup_kernels_bf16[];
 extern const sa_fixup_kernel_t ggml_cuda_sa_fixup_kernels_q8_0[];
 extern const sa_fixup_kernel_t ggml_cuda_sa_fixup_kernels_q4_0[];
 
-// the generic tier's G4 instances (sparse-attn-generic.cu, GGML_CUDA_SA_GEN_G4_INSTANCES of sparse-attn-census.h):
-// sa_attend_g4<SA_T_GEN, SA_T_GEN, VL, SA_EPI_PLAIN, GQA, ROT> at index 2 * (vl * 3 + gqa_index) + ROT, and its fixup
+// the generic tier's G4 instances, index 2 * (vl * 3 + gqa_index) + ROT, and its fixup
 extern const sa_g4_kernel_t ggml_cuda_sa_gen_g4_kernels[];
 extern const sa_fixup_kernel_t ggml_cuda_sa_gen_fixup_kernel;
 

@@ -10,12 +10,9 @@
 #include "types.glsl"
 #include "ggml_type_ids.glsl"
 
-// GGML_OP_SPARSE_ATTN, scalar 64-lane tier (PLAN-v3 §6.3), derived from the scalar selected-key FA shader of master ea5285ddf (deleted in W13): 64-lane devices that are not
-// RADV RDNA3 and pass the sel gate (subgroup size 64, shuffle, arithmetic, fp16, 64 GQA invocations, 46,720 B shared at
-// GQA 12). One workgroup per (query, K/V head, stream, split), one subgroup per query head of that K/V head, so each K/V
-// row is read once per query. Cells go in blocks of BK = 8 plan entries: two lanes compute one key's dot product (half
-// the dims each), so the softmax needs two subgroup reductions per block instead of one per key. With n_split > 1, split
-// z takes the blocks z, z + n_split, ... of its row and writes a partial result (sparse_attn_reduce.comp).
+// GGML_OP_SPARSE_ATTN, scalar subgroup-64 tier. One workgroup per (query, K/V head, stream, split), one subgroup per query
+// head, so each K/V row is read once per query. Two lanes score one key (half the dims each), so the softmax needs two
+// subgroup reductions per block of keys. With n_split > 1, split z takes blocks z, z + n_split, ... and writes a partial.
 // A masked or padding cell is never loaded: its K and V stay 0 and its weight is 0.
 
 layout(constant_id = 0) const uint WORKGROUP_SIZE = 768;
@@ -46,7 +43,6 @@ layout(push_constant) uniform Parameters {
     uint n_split, n_head, n_q, n_stream, q_base;
 } p;
 
-// The pipeline is created with subgroup size 64 and head size 256 only (ggml_vk_sa_select).
 const uint HEAD_SIZE = 256;
 const uint LANES = 64;
 const uint PER_LANE = HEAD_SIZE / LANES;
@@ -191,8 +187,7 @@ void main() {
 
         const float new_max = max(row_max, subgroupMax(s));
         const float old_scale = new_max == row_max ? 1.0 : exp(row_max - new_max);
-        // a -inf score (an invalid key included) has weight 0 (ggml.h item 3), also in a block whose max is still -inf, where
-        // exp(-inf - -inf) is NaN; a NaN score keeps exp(NaN) = NaN whatever new_max is (item 5)
+        // a -inf score has weight 0 (ggml.h item 3), also while the max is still -inf; a NaN score stays NaN (item 5)
         const float weight = s == NEG_INF ? 0.0 : exp(s - new_max);
         row_sum = row_sum * old_scale + subgroupAdd(khalf == 0 ? weight : 0.0);
         row_max = new_max;
@@ -216,16 +211,14 @@ void main() {
 
     if (p.n_split == 1) {
         const uint dst_base = stream * p.nb3 + query * p.nb2 + head * p.nb1;
-        // a row whose normaliser is not > 0 (empty, or NaN from a NaN score) is 0 (ggml.h item 5): a select of the result,
-        // not acc * 0, which is NaN for the NaN accumulator such a row has; the test is on the bits (sa_l_pos)
+        // a row whose normaliser is not > 0 is 0 (ggml.h item 5): a select, not acc * 0 (NaN for a NaN accumulator)
         const bool pos = sa_l_pos(row_sum);
         const float inv_sum = pos ? 1.0 / row_sum : 0.0;
         [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {
             data_dst[dst_base + lane + i * LANES] = pos ? acc[i] * inv_sum : 0.0;
         }
     } else {
-        // partial: unnormalized O, then L and M per head (an empty split writes M = -FLT_MAX, not -inf, so the
-        // reduce never computes exp(-inf - -inf))
+        // partial: unnormalized O, then L and M per head (an empty split writes M = -FLT_MAX, not -inf)
         const uint slot = split + p.n_split * (query + p.n_q * stream);
         const uint o_base = HEAD_SIZE * p.n_head * slot + HEAD_SIZE * head;
         [[unroll]] for (uint i = 0; i < PER_LANE; ++i) {

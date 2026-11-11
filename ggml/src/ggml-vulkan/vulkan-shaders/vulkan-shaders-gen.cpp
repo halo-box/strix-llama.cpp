@@ -992,8 +992,7 @@ void process_shaders() {
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
 #endif
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
-    // GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN (PLAN-v3 §6.3). K/V of any type through spec constants; the plan, the portable tier
-    // and the reduce use no extension.
+    // GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN: K/V types through spec constants
     {
         const std::map<std::string, std::string> sa_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}};
         string_to_spv("sparse_attn_plan_rows", "sparse_attn_plan_rows.comp", {});

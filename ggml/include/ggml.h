@@ -648,7 +648,7 @@ extern "C" {
 
         GGML_OP_GLU,
 
-        // appended before GGML_OP_COUNT so that no existing op value moves (RPC: minor version bump, ggml-rpc.h)
+        // appended last so that no existing op value moves (RPC minor version bump)
         GGML_OP_SPARSE_ATTN_PLAN,
         GGML_OP_SPARSE_ATTN,
 
@@ -2591,10 +2591,10 @@ extern "C" {
     // sparse attention over per-query selection rows (two ops)
     //
     // ggml_sparse_attn_plan canonicalises per-query selection rows into a grouped attention plan. Integer only: every
-    // backend that implements it produces identical dst bytes (every byte of ggml_nbytes(dst)).
+    // backend produces identical dst bytes.
     //   S(i,s) = { c : exists j, sel[j,i,0,s] == c, 0 <= c < n_kv }
-    // (set semantics: the order of a row, duplicates, -1 and out-of-range entries are irrelevant; out-of-range values
-    // other than -1 are counted in hdr.n_bad).
+    // (set semantics: order, duplicates, -1 and out-of-range entries are irrelevant; out-of-range values other than -1
+    // are counted in hdr.n_bad).
     //
     // sel  : I32 [n_sel, n_q, 1, n_stream]; nb[0] == 4; nb[1..3] % 4 == 0; n_sel >= 1
     // n_kv : keys visible to the op (cells 0..n_kv-1 of the K/V views); 1 <= n_kv <= 2^24
@@ -2607,11 +2607,10 @@ extern "C" {
     //   n_groups = ceil(n_q / G); cap = round4(min(G * n_sel, ceil(n_kv / 4)))
     //   every entry past the group's real entries (the padding up to counts[s][g] and everything up to cap) holds
     //   quad = the last real quad of the group (0 for an empty group) and mask = 0; the gaps between sections are 0
-    // op_params (i32): n_kv, group, n_sel, n_q, n_stream. A backend computes a consumer's workspace from them, never from
-    // the plan's src (a node's srcs' srcs are not linked on an RPC server).
-    // The sort/dedup scratch is not part of dst: ggml_sparse_attn_plan_scratch_nbytes(n_sel, n_q, n_stream)
-    // = n_stream * n_q * round4(n_sel) * 4 bytes (GPU backends: in their get_alloc_size over-allocation of dst;
-    // CPU: in the graph work buffer).
+    // op_params (i32): n_kv, group, n_sel, n_q, n_stream. A consumer's workspace is computed from them, never from the
+    // plan's src (not linked on an RPC server).
+    // The sort/dedup scratch (ggml_sparse_attn_plan_scratch_nbytes = n_stream * n_q * round4(n_sel) * 4 bytes) is not
+    // part of dst: GPU backends over-allocate dst in get_alloc_size, the CPU uses the graph work buffer.
 #define GGML_SPARSE_ATTN_PLAN_MAGIC   0x50415351u // the bytes "QSAP"
 #define GGML_SPARSE_ATTN_PLAN_VERSION 1u
 
@@ -2668,17 +2667,13 @@ extern "C" {
     //   2. q is transformed by H_q in f32 when rot_q > 0, multiplied by scale in f32 and rounded to f16.
     //   3. Scores are f32. Online softmax over the cells in ascending order: P is rounded to f16 against the running max
     //      for PV, the normaliser l sums the unrounded f32 p, PV accumulates in f32; acc / l and H_o run in f32. A cell
-    //      whose score is -inf (an f16 K or q element at +-inf, item 1) has p = 0 wherever it lies, also before any finite
-    //      score (not exp(-inf - -inf) = NaN): it adds nothing to l, and its V row still enters PV as 0 * v, as every
-    //      attended cell's does. With a finite V row the row is the softmax over the other cells; a +-inf or NaN element
-    //      of that V row (item 1) makes that dimension of the row NaN (0 * inf); every cell -inf gives 0 (item 5). Only
-    //      a masked cell (item 4) contributes nothing whatever its bytes: the WMMA tiers share one PV product between the
-    //      rows of a block and cannot drop a cell for one row (tests/test-sparse-attn-checks.cpp, neginf-v).
+    //      whose score is -inf has p = 0 wherever it lies (never exp(-inf - -inf) = NaN), but its V row still enters PV
+    //      as 0 * v, so a non-finite element of that V row makes that output dimension NaN (block-shared PV products
+    //      cannot drop a cell for one row).
     //   4. A cell whose mask bit is 0 and every padding entry contribute nothing, whatever their stored bytes
-    //      (NaN / inf included). The summation order is a pure function of the shape and of the op's inputs, so the
-    //      output is deterministic run to run.
-    //   5. A row whose normaliser l is not > 0 gives 0: an empty S (l = 0), and an S with a cell whose score is NaN
-    //      (inf * 0 or inf - inf in q.k, a NaN K element: l is NaN). A backend that splits a row must keep that NaN.
+    //      (NaN / inf included). The summation order depends only on the shape and inputs: the output is deterministic.
+    //   5. A row whose normaliser l is not > 0 gives 0: an empty S or all cells -inf (l = 0), and an S with a NaN score
+    //      (l is NaN). A backend that splits a row must keep that NaN.
     GGML_API struct ggml_tensor * ggml_sparse_attn(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2689,13 +2684,12 @@ extern "C" {
             int32_t               rot_q,
             int32_t               rot_o);
 
-    // The shape invariants ggml_sparse_attn asserts, checked on an existing GGML_OP_SPARSE_ATTN node: NULL when they hold,
-    // else the first one that fails. A node deserialized by an RPC server was never built by ggml_sparse_attn (its plan
-    // also arrives without its sel: only the plan's op_params are read), so every backend's supports_op and compute run
-    // this before reading K / V rows 0 .. 4*ceil(n_kv/4) - 1 and KV heads 0 .. k->ne[2] - 1.
+    // The shape invariants ggml_sparse_attn asserts, checked on an existing node: NULL when they hold, else the first
+    // that fails. Nodes deserialized by an RPC server were never built by ggml_sparse_attn, so supports_op and compute
+    // run this before reading K / V.
     GGML_API const char * ggml_sparse_attn_shape_why(const struct ggml_tensor * op);
-    // the same for a GGML_OP_SPARSE_ATTN_PLAN node and its sel (src[0], required): the op_params name sel's shape and
-    // ggml_nbytes(dst) is the layout's nbytes, so the plan kernels' reads of sel and writes of dst stay inside both
+    // the same for a GGML_OP_SPARSE_ATTN_PLAN node and its sel (src[0]): sel's shape matches the op_params and
+    // ggml_nbytes(dst) is the layout's nbytes
     GGML_API const char * ggml_sparse_attn_plan_shape_why(const struct ggml_tensor * op);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext

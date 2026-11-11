@@ -1,18 +1,6 @@
-// The generic tier of GGML_OP_SPARSE_ATTN on HIP (PLAN-v3 §6.1 S_generic, §6.2 "sparse-attn-generic.cu"): the G4 and G1
-// WMMA attends of sparse-attn-attend-g4.cuh / sparse-attn-attend-g1.cuh instantiated with K = V = SA_T_GEN, whose loaders
-// convert every element of any type of S (f16, bf16, q8_0, q4_0, f32, q4_1, q5_0, q5_1, iq4_nl) through the runtime switch
-// sa_any_piece / sa_any_gather16 / sa_any_elem (sparse-attn-loaders.cuh), the ggml types being kernel arguments.
-//
-// It runs every K / V pair with a member outside S_fast (S_generic), and every pair under GGML_CUDA_SA_FORCE=generic.
-// Selection, workspace and dispatch: sparse-attn-attend-g4.cu (sa_select). The workspace layouts are the S_fast ones
-// (packed V f16 by sa_pack_v<SA_T_GEN> of sparse-attn-pack.cu, direct-V wave flags, G1 split partials), so get_alloc_size
-// is unchanged. The gate fusion has no generic instance (ggml_cuda_sparse_attn_gate_ok is false: the MUL runs unfused).
-//
-// Instances (census keys of sparse-attn-census.h):
-//   sa_attend_g4<SA_T_GEN, SA_T_GEN, VL, SA_EPI_PLAIN, GQA>  VL packed | direct, GQA 4 | 8 | 12   sa_generic/G4/<VL>/gqa<n>
-//   sa_attend_fixup<SA_T_GEN, SA_T_GEN, SA_EPI_PLAIN>                                             sa_generic/fixup
-//   sa_attend_g1<SA_T_GEN, SA_T_GEN, GQA>                     GQA 4 | 8 | 12                      sa_generic/G1/splits<c>/gqa<n>
-// Speed against S_fast is UNPROVEN (U8) and recorded by the W5 harness (scripts/qsa-validation/harness/w5).
+// Generic tier: the G4 and G1 WMMA attends with K = V = SA_T_GEN, whose loaders convert any type of S through a runtime
+// switch on the ggml type. Runs every K / V pair outside S_fast, and every pair under GGML_CUDA_SA_FORCE=generic.
+// Workspace layouts are the S_fast ones, so get_alloc_size is unchanged. No gated instance: the MUL runs unfused.
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-census.h"
@@ -36,8 +24,7 @@ extern const sa_g1_kernel_t ggml_cuda_sa_gen_g1_kernels[2 * GGML_CUDA_SA_GEN_G1_
 const sa_g1_kernel_t ggml_cuda_sa_gen_g1_kernels[2 * GGML_CUDA_SA_GEN_G1_N] = { GGML_CUDA_SA_GEN_G1_INSTANCES(SA_GEN_G1_FN) };
 #undef SA_GEN_G1_FN
 
-// one generic G1 launch (and its census count); the caller runs ggml_cuda_sa_merge_splits when splits > 1. Same grid and
-// arguments as ggml_cuda_sa_g1_launch (sparse-attn-attend-g1.cu), with the ggml types p.kt_g / p.vt_g
+// one generic G1 launch, same grid and arguments as ggml_cuda_sa_g1_launch with the ggml types p.kt_g / p.vt_g
 void ggml_cuda_sa_gen_g1_launch(cudaStream_t stream, const ggml_cuda_sa_g1_launch_params & p) {
     GGML_ASSERT(p.gqa_index >= 0 && p.gqa_index < GGML_CUDA_SA_GEN_G1_N);
     GGML_ASSERT(p.splits >= 1 && p.splits <= 65535);

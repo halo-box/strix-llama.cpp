@@ -1,13 +1,7 @@
-// The sparse-attention ops through the RPC backend, against an in-process rpc-server on one local device (the first GPU
-// of the build, else the CPU):
-//  (1) alloc size: the RPC buffer type's size of a SPARSE_ATTN node equals the server device's own for that node. The
-//      client cached the size by the dst's own shape and op_params, but the workspace follows the plan's n_kv / n_sel / G
-//      and the K / V types: two nodes with one dst shape (a 37-row ubatch at n_kv 256 in the shortcut, then at n_kv 8192 on
-//      the selection rows) got the first node's size, and the server's kernels wrote past the allocation.
-//  (2) supports_op: the RPC device answers the server device's supports_op for SPARSE_ATTN / SPARSE_ATTN_PLAN. It returned
-//      true for every node, so llama's QSA placement guard passed for a server that cannot run the op (a CUDA build aborts
-//      in its compute).
-// (1) is vacuous on a device whose alloc size does not depend on the plan (the CPU): it then passes trivially.
+// The sparse-attention ops through an in-process rpc-server on one local device (the first GPU, else the CPU):
+//  (1) the RPC alloc size of a SPARSE_ATTN node equals the server device's: the workspace follows the plan and the K / V
+//      types, not only the dst shape, so a size cached by dst shape is too small. Vacuous on the CPU.
+//  (2) the RPC device's supports_op equals the server device's, so the QSA placement guard sees what the server runs.
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
@@ -102,7 +96,7 @@ int main() {
     ggml_init_params ip = { 256 * ggml_tensor_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
 
-    // (1) one dst shape [256, 24, n_q, 1] per group, the plan varying: the order matters (the smaller workspace first)
+    // (1) one dst shape per group, the plan varying, the smaller workspace first
     int n_alloc = 0, n_differ = 0;
     const std::vector<std::vector<node_shape>> groups = {
         { { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 37, 256, 256, 1 },  { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 37, 8192, 2051, 1 } },
@@ -136,12 +130,12 @@ int main() {
     printf("(1) %d alloc sizes compared, %d of a dst shape whose size differs from the first%s\n", n_alloc, n_differ,
            n_differ == 0 ? " (vacuous on this device)" : "");
 
-    // (2) supports_op through RPC == the server device's, for SPARSE_ATTN and its plan
+    // (2) supports_op
     int n_sup = 0, n_unsup = 0;
     const std::vector<node_shape> sup = {
         { GGML_TYPE_F16,  GGML_TYPE_F16,  9, 4096, 2051, 1 },
         { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 9, 4096, 2051, 4 },
-        { GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 9, 4096, 2051, 1 },   // outside S: the CPU takes it, HIP and Vulkan do not
+        { GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 9, 4096, 2051, 1 },   // the CPU takes it, HIP and Vulkan do not
         { GGML_TYPE_I32,  GGML_TYPE_I32,  9, 4096, 2051, 1 },   // no to_float: nobody takes it
         { GGML_TYPE_F16,  GGML_TYPE_F16,  9, 4096, 2051, 4 },
     };

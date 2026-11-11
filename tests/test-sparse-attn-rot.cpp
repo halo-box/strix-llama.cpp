@@ -1,20 +1,11 @@
-// HIP checks of the in-op rotations of GGML_OP_SPARSE_ATTN (PLAN-v3 §8, §13 W10) that test-backend-ops cannot express:
-// the transforms are compared bit for bit with fwht.cu (a GGML_HINT_SRC0_IS_HADAMARD mul_mat on the same backend), not
-// within a band.
-//
-//   H_q    the kernel's q transform (GGML_CUDA_SA_FORCE=rot_dump: an op with rot_q != 0 writes H_q q, f32, into dst and
-//          stops) against fwht.cu of the same q;
-//   H_o    the op with rot_o against fwht.cu of the same op's rot 0 output;
-//   graph  the op with (rot_q, rot_o) against the graph-side form it replaces in qwen4exp (fwht.cu of q, the op at rot 0,
-//          fwht.cu of the output): equal bit for bit, because everything but the transforms is the rot 0 arithmetic;
-//   gated  (reported, not gated: fused and unfused gates are not claimed bit-equal, PLAN-v3 §2.2 item 4) the gate fused
-//          into the rotated epilogue against the unfused pre-W10 graph (fwht.cu between the attend and the gate).
-//
-// Shapes: G4 with packed V (n_q 65, n_kv 4096 < 64 * 65) and direct V (n_kv 16384), G1 with one split (n_q 3, n_sel 17)
-// and with the split merge (n_sel 257: 5 splits); K = V in f16, q8_0 (the fast tier) and q4_1 (the generic tier);
-// rot 64 / 128 / 256 on each side. The tier is the process's: run it once per GGML_CUDA_SA_FORCE value
-// ("", generic, portable, fixup). HIP graphs are disabled (the dump hook is read at dispatch time).
-//
+// HIP checks of the in-op rotations of GGML_OP_SPARSE_ATTN, bit for bit against fwht.cu (a GGML_HINT_SRC0_IS_HADAMARD
+// mul_mat on the same backend), which test-backend-ops cannot express:
+//   hq     the kernel's q transform (GGML_CUDA_SA_FORCE=rot_dump writes H_q q into dst) against fwht.cu of q;
+//   ho     the op with rot_o against fwht.cu of its rot 0 output;
+//   graph  the op with (rot_q, rot_o) against fwht.cu(q) -> op(rot 0) -> fwht.cu(out);
+//   gated  the gate fused into the rotated epilogue against an unfused gate: close, not claimed bitwise.
+// The kernel tier is the process's: run once per GGML_CUDA_SA_FORCE value ("", generic, portable, fixup). HIP graphs are
+// disabled (the dump hook is read at dispatch time).
 // Without a ROCm backend it exits 0 ("skipped"). usage: test-sparse-attn-rot [hq|ho|graph|gated ...]
 
 #include "ggml.h"
@@ -312,7 +303,7 @@ static void test_ho() {
     }
 }
 
-// the graph-side form W10 replaces: fwht.cu(q) -> op(rot 0) -> fwht.cu(out)
+// fwht.cu(q) -> op(rot 0) -> fwht.cu(out)
 static void test_graph() {
     printf("graph: the op with (rot_q, rot_o) against fwht.cu(q) -> op(rot 0) -> fwht.cu(out)\n");
     for (sa_shape s : shapes()) {
@@ -377,8 +368,7 @@ static void census_reset() {
     reset();
 }
 
-// reported only: the gate fused into the rotated epilogue against the unfused pre-W10 graph (the census checks that the
-// first graph ran the EPI = gated instance and the second the plain one)
+// the fused gate against fwht.cu between the attend and an unfused gate; the census checks which instance each graph ran
 static void test_gated() {
     printf("gated (report): fused gate in the rotated epilogue against fwht.cu between the attend and an unfused gate\n");
     for (sa_shape s : shapes()) {

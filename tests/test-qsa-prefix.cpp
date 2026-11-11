@@ -66,7 +66,7 @@ static void test_scalar_visibility() {
         GGML_ASSERT(!scalar(c, qsa_ubatch({{8, {0}}, {5, {1}}}, 3)));
     }
     {   // one sequence with an image (mrope: the image's cells share one position, extents past it): the cells are ranked
-        // in the mask's order, so the compact rule holds for any query of the one sequence (PLAN-v3 §4.2 step 3, rank-based)
+        // in the mask's order, so the compact rule holds for any query of the one sequence
         qsa_cells c(64); c.add(0, 6, {0});
         for (llama_pos k = 0; k < 6; ++k) { c.cells.pos_set(c.next, 6); c.cells.seq_add(c.next, 0); c.cells.ext_set(c.next, { 6 + k%3, 6 + k/3 }); ++c.next; }
         c.add(9, 12, {0});
@@ -74,7 +74,7 @@ static void test_scalar_visibility() {
         GGML_ASSERT(scalar(c, qsa_ubatch({{12, {0}}, {13, {0}}, {14, {0}}, {15, {0}}}, 4)));
         GGML_ASSERT(scalar(c, qsa_ubatch({{6, {0}}}, 4)));
         GGML_ASSERT(scalar(c, qsa_ubatch({{12, {0}}, {6, {0}}}, 4)));
-        // a text cell with the key of the image's first cell (6, 6, 6): the mask order is not total, step 4 rejects it
+        // a text cell with the key of the image's first cell (6, 6, 6): the mask order is not total, rejected
         qsa_cells g = c; g.add(6, 7, {0}); g.cells.ext_set(g.next - 1, { 6, 6 });   // apply_ubatch stores text as (p, p, p)
         GGML_ASSERT(qsa_compact_visibility_stream(g.cells, 64, 4, qsa_ubatch({{12, {0}}}, 4).u, 0, 1) == QSA_NC_DUP_KEY);
         // a position >= 2^24
@@ -83,7 +83,7 @@ static void test_scalar_visibility() {
         qsa_cells d = c; d.add(0, 3, {1});
         GGML_ASSERT(!scalar(d, qsa_ubatch({{12, {0}}}, 4)));
         GGML_ASSERT(qsa_compact_visibility_stream(d.cells, 64, 4, qsa_ubatch({{12, {0}}}, 4).u, 0, 1) == QSA_NC_2D_MULTI_SEQ);
-        // the other sequence's text ubatch stays compact: it holds no 2-D cell (step 5)
+        // the other sequence's text ubatch stays compact: it holds no 2-D cell
         GGML_ASSERT(scalar(d, qsa_ubatch({{3, {1}}}, 4)));
         // a cell shared by two sequences
         qsa_cells e = c; e.cells.seq_add(0, 1);
@@ -100,7 +100,7 @@ static void test_scalar_visibility() {
         GGML_ASSERT(scalar(c, ub));
         qsa_cells d = c; d.add(0, 2, {1});
         GGML_ASSERT(qsa_compact_visibility_stream(d.cells, 64, 4, ub.u, 0, 1) == QSA_NC_2D_MULTI_SEQ);
-        // an embedding ubatch (no token ids) is judged like a token ubatch (step 1)
+        // an embedding ubatch (no token ids) is judged like a token ubatch
         qsa_ubatch embd({{8, {0}}}, 4); embd.u.token = nullptr;
         GGML_ASSERT(scalar(c, embd));
     }

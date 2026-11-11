@@ -1,31 +1,17 @@
-// GGML_OP_SPARSE_ATTN_PLAN on HIP (PLAN-v3 §2.1, §6.2): canonicalise per-query selection rows into the grouped plan
-// whose whole dst is byte-identical to the CPU op (ggml-cpu/sparse-attn.cpp) and to the C3 oracle (tests/sparse-attn-ref.h).
-//
-// Three kernels on the op's stream, no pool allocation (D12): the sort/dedup scratch lives in the get_alloc_size
-// over-allocation of dst, right after ggml_nbytes(dst).
-//   sa_plan_init       header (n_bad = 0), the zero bytes up to off_counts and the two section gaps
-//   sa_plan_rows       one block per query row: validate (cells outside [0, n_kv) become a sentinel, values other than
-//                      -1 are counted into hdr.n_bad), and when the valid cells are not already strictly ascending with
-//                      every invalid entry after them, sort and dedup them into the row's scratch. A row that is already
-//                      in that form is not copied: its scratch row only holds the marker SA_PLAN_RAW and the merge reads
-//                      sel itself (every row of the 36 recaptured C3 layers at ub4096 d131k takes this path,
-//                      scripts/qsa-validation/summaries/w2_plan_c3.md).
-//   sa_plan_merge<G>   one block per group of G consecutive queries of a stream: G-way merge of the sorted rows by
-//                      physical quad (cell >> 2) into strictly ascending entries with the per-query cell bits, then the
-//                      padding of ggml.h up to cap. Each lane owns a quad-aligned key range (quantiles of the group's
-//                      longest row) and runs a count pass, a block scan and a write pass. 512 lanes for G = 4 (C3 "P_asc
-//                      512", the fastest variant measured: 0.733 / 0.883 ms per layer on text / random rows at ub4096
-//                      d131k), 256 for G = 1.
-// Ported from the PR #219 tree's union builder (qsa3_rows_kernel + qsa3_merge_kernel, qsa-prefill.cu:28-240, as the C3
-// harness copied them) with C3's sa_merge<ASC, 512> (scripts/qsa-validation/harness/c3/c3_plan.cu). Changes: the plan
-// is a standalone op (streams, G in {1, 4}, the ggml.h layout and padding rule, n_bad); rows with repeated cells are
-// deduplicated before the merge (by code reading, the PR merge's complete-quad shortcut would emit a quad twice for a
-// non-decreasing row such as 4,5,6,7,7, which its rows kernel passes through unsorted); the bitonic sort runs in place
-// on the row length (no power-of-two padding); the row loads are unrolled so that several are in flight per lane; rows
-// or groups too long for LDS run the same algorithms on the scratch / sel in global memory.
-//
-// Determinism: the output depends only on the set of valid cells of each query (every step is a pure function of the
-// sorted unique rows); n_bad is an integer atomicAdd, whose sum does not depend on the order.
+// GGML_OP_SPARSE_ATTN_PLAN on HIP: canonicalise per-query selection rows into the grouped plan, byte-identical to the CPU
+// op. Three kernels, no pool: the sort/dedup scratch is in dst's over-allocation, right after ggml_nbytes(dst).
+//   sa_plan_init       header (n_bad = 0), the zero bytes up to off_counts and the section gaps
+//   sa_plan_rows       one block per query row: validate (out-of-range cells become a sentinel, values other than -1 count
+//                      into n_bad) and, unless the valid cells are already strictly ascending with invalid entries after
+//                      them, sort and dedup into the row's scratch. A row already in that form is not copied: its scratch
+//                      holds the marker SA_PLAN_RAW and the merge reads sel itself (the common case).
+//   sa_plan_merge<G>   one block per group of G queries: G-way merge of the sorted rows by quad (cell >> 2) into strictly
+//                      ascending entries with per-query cell bits, then the padding up to cap. Each lane owns a
+//                      quad-aligned key range (quantiles of the longest row): count pass, block scan, write pass. 512
+//                      lanes for G = 4, 256 for G = 1.
+// Repeated cells are deduplicated before the merge (a complete-quad shortcut would otherwise
+// emit a quad twice for a row such as 4,5,6,7,7). Rows or groups too long for LDS run the same algorithms in global memory.
+// The output depends only on each query's set of valid cells; n_bad is an order-independent integer atomicAdd.
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-census.h"
@@ -699,7 +685,7 @@ void ggml_cuda_sparse_attn_plan(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
 #else // !defined(GGML_USE_HIP)
 
-// CUDA builds: no sparse-attention kernels (PLAN-v3 §6.2, D22); supports_op is false, so these are never dispatched
+// CUDA builds: no sparse-attention kernels; supports_op is false, so these are never dispatched
 bool ggml_cuda_sparse_attn_plan_supported(int device, const ggml_tensor * op) {
     GGML_UNUSED(device);
     GGML_UNUSED(op);

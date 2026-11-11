@@ -6,9 +6,8 @@
 #include "types.glsl"
 #include "ggml_type_ids.glsl"
 
-// GGML_OP_SPARSE_ATTN, the diagnostic dequant-once pack arm (PLAN-v3 §6.3, AT-B3): one K or V view -> f16 rows in the
-// attend's workspace, [256 dims][n_cells][n_head_kv][n_stream]. The attend then runs its f16 instance on the pack. One
-// invocation per cell, 64 cells per workgroup, no barrier. Selected only by GGML_VK_SA_FORCE=vpack unless AT-B3 ships it.
+// GGML_OP_SPARSE_ATTN pack arm (GGML_VK_SA_FORCE=vpack): one K or V view -> f16 rows [256][n_cells][n_head_kv][n_stream]
+// in the attend's workspace, one invocation per cell
 
 layout(constant_id = 0) const uint FaTypeK = 1;
 const uint FaTypeV = 1;

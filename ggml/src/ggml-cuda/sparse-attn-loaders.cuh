@@ -1,51 +1,33 @@
 #pragma once
 
-// K/V loaders of the HIP sparse-attention WMMA kernels (PLAN-v3 §6.2, D8, D10) and the per-type loader traits.
-//
-// Every loader delivers, for the 16 cells of one plan chunk (4 entries x 4 cells) and the 32 dims of block w of a K/V
-// row (wave w of the 8-wave G4 block owns dims 32w .. 32w+31), the f16 halves of the op contract (sparse-attn-q8.cuh):
-// the WMMA fragments are identical whichever loader produced them (C18 "Correctness": 4905 bitwise checks between
-// loader variants of the same type pair).
-//
-// K loaders (D8, C18 decision 1):
-//   SA_K_DIRECT  every lane loads the 32 dims of its key (lanes r and r + 16 duplicate the load), the PR load_k
-//   SA_K_SPLIT   every type in the G4 attend (sa_k_loader_of): lane half p loads and converts 16 of the 32 dims once ("piece" p: dims 8p..8p+7 and
-//                16+8p..16+8p+7), the halves are exchanged with v_permlanex16; no LDS. C18: split is -6.7 % against the
-//                PR's per-lane q8 K loader on wiki d131k, and +3.9 % / +5.5 % (q8_0), +2.2 % / +3.7 % (q4_0),
-//                +1.4 % / +4.3 % (bf16) against f16 K at d4k / d131k text
-// V loaders:
-//   SA_V_PACKED      the PR's packed f16 V [stream][kv head][quad][dim][4 cells] written by sa_pack_v (sparse-attn-pack.cu)
-//                    into the attend dst over-allocation; one uint2 per (dim, entry)
-//   SA_V_SPLITGATHER direct read of the cache rows: lane half p gathers dim 16p + r of block w for the 16 cells (one
-//                    element each), converts them after barrier 2 and exchanges the halves with v_permlanex16. C18: the
-//                    fastest direct V at 262k / 1M for q8_0 / q4_0 (X+X 20.34 / 24.60 ms vs packed 23.18 / 37.32), 0
-//                    scratch with split K; for f16 / bf16 it is the direct V of the CAPPED trait (below)
-//
-// Generic tier (SA_T_GEN, PLAN-v3 §6.1 S_generic, sparse-attn-generic.cu): K and V of any type of S through the runtime
-// switch sa_any_piece / sa_any_quad4 / sa_any_elem below, which convert at load (the "raw" registers already hold f16
-// halves, so sa_piece_cvt and sa_gather_pair take the f16 branch for SA_T_GEN); the loader shapes (split K, split-gather
-// or packed V in the G4 attend; split K and LDS-staged V in the G1 attend) are the S_fast ones.
-//
-// V pack-limit trait (D8, OWNER decision 2026-11-05, AT-O deferred): SA_VPACK_CAPPED = packed iff n_kv < 64 * n_q, else
-// direct (PR #219's n_q * 64 < n_kv switch, C18 decision 3); SA_VPACK_ALWAYS = packed at every n_kv (the owner's
-// alternative for f16 / bf16: +512 / +1024 MiB at c524288 / c1M, R1-C). Changing a type's row of sa_vpack_trait is the
-// one-line switch.
+// K/V loaders of the HIP sparse-attention WMMA kernels. Each delivers, for the 16 cells of a plan chunk (4 entries x 4
+// cells) and the 32 dims of block w (wave w of the G4 block owns dims 32w .. 32w+31), the contract f16 halves of
+// sparse-attn-q8.cuh, so the WMMA fragments do not depend on the loader.
+//   SA_K_DIRECT      every lane loads the 32 dims of its key (lanes r and r + 16 duplicate the load)
+//   SA_K_SPLIT       lane half p loads and converts 16 of the 32 dims once (piece p: dims 8p..8p+7, 16+8p..16+8p+7) and
+//                    the halves are exchanged with v_permlanex16; no LDS
+//   SA_V_PACKED      f16 V [stream][kv head][quad][dim][4 cells] written by sa_pack_v into the attend's dst
+//                    over-allocation; one uint2 per (dim, entry)
+//   SA_V_SPLITGATHER direct read of the cache rows: lane half p gathers dim 16p + r for the 16 cells, converts them and
+//                    exchanges the halves with v_permlanex16; no scratch
+// The generic tier (SA_T_GEN) uses the same loader shapes with the runtime switches below, which convert at load (the
+// raw registers already hold f16, so sa_piece_cvt and sa_gather_pair take the f16 branch).
+// V pack trait: SA_VPACK_CAPPED = packed iff n_kv < 64 * n_q, else direct; SA_VPACK_ALWAYS = packed at every n_kv (more
+// memory at long context).
 
 #include <cstdint>
 #include <cstddef>
 
 #include "ggml.h"
 
-// the type ids of the WMMA tiers (S_fast, PLAN-v3 §6.1); also the order of the census keys
+// the type ids of the WMMA tiers (S_fast); also the order of the census keys
 enum sa_type_id {
     SA_T_F16  = 0,
     SA_T_BF16 = 1,
     SA_T_Q8_0 = 2,
     SA_T_Q4_0 = 3,
     SA_T_COUNT,
-    // the generic tier (PLAN-v3 §6.1 S_generic, §6.2 sparse-attn-generic.cu): one instance for every K / V type of S, the
-    // ggml type a runtime kernel argument (sa_g4_args / sa_g1_args kt_g, vt_g) and every element converted by the runtime
-    // switch of sa_any_elem / sa_any_piece below
+    // the generic tier: one instance for every K / V type of S, the ggml type a kernel argument (kt_g, vt_g)
     SA_T_GEN  = 8,
 };
 
@@ -64,16 +46,13 @@ enum sa_vpack    { SA_VPACK_CAPPED = 0, SA_VPACK_ALWAYS = 1 };
 #define SA_EPI_plain   SA_EPI_PLAIN
 #define SA_EPI_gated   SA_EPI_GATED
 
-// K loader of the G4 attend: split for every type. D8 names direct for f16; C18 measured split and direct equal for
-// f16 K (Kf16X-Vf16P vs Kf16D-Vf16P: 12.43 / 12.60 ms wiki d4k, 16.32 / 16.33 wiki d131k, 38.30 / 38.80 syn 262k,
-// 48.78 / 49.04 syn 1M), and split holds 8 raw VGPRs of the next chunk's K across the barriers where direct holds the 16
-// of the converted fragment: with direct f16 K, the GQA 12 instances with a direct quantized V do not fit 192 VGPRs
-// (W3 resource checks). SA_K_DIRECT stays for the G1 tier (D9).
+// K loader of the G4 attend: split for every type. Split holds 8 raw VGPRs of the next chunk's K across the barriers where
+// direct holds 16, so the GQA 12 instances fit 192 VGPRs. SA_K_DIRECT stays for the G1 tier.
 static constexpr int sa_k_loader_of(const int t) {
     return t == SA_T_COUNT ? SA_K_DIRECT : SA_K_SPLIT;
 }
 
-// D8 V pack-limit trait, per V type (default CAPPED for every type)
+// V pack trait per V type
 static constexpr int sa_vpack_trait(const int t) {
     return t == SA_T_F16  ? SA_VPACK_CAPPED :
            t == SA_T_BF16 ? SA_VPACK_CAPPED :
@@ -89,19 +68,11 @@ static constexpr int sa_block_bytes(const int t) {
 
 #include "sparse-attn-q8.cuh"
 
-// ---- the generic tier's loader: one K / V element of any type of S (PLAN-v3 §6.1) as its contract f16 bits ----
-// The value is the CPU op's (ggml-cpu/sparse-attn.cpp sa_load_row): the type's to_float, then one RNE rounding to f16
-// (+-inf past the f16 range). Each case computes to_float exactly as ggml-quants.c does in f32 and rounds once:
-//   f16 the stored half; bf16 widened (exact) then RNE; f32 RNE;
-//   q8_0 q * d, q4_0 (q - 8) * d, q5_0 (q - 16) * d, iq4_nl kvalues_iq4nl[q] * d: the f32 product is exact (at most
-//        8 + 11 significant bits), so its RNE to f16 is the one rounding of the CPU's (and equals sa_q8x2_to_h2 /
-//        sa_q4x2_to_h2, which round the same exact product in half arithmetic);
-//   q4_1 q * d + m, q5_1 q * d + m: q * d is exact in f32, so fmaf and the CPU's mul-then-add give the same f32 value
-//        (one rounding of q * d + m), then RNE to f16.
-// Block layouts (ggml-common.h): q8_0 {d, qs[32]} 34 B; q4_0 / iq4_nl {d, qs[16]} 18 B; q4_1 {d, m, qs[16]} 20 B;
-// q5_0 {d, qh[4], qs[16]} 22 B; q5_1 {d, m, qh[4], qs[16]} 24 B. Element j of a 32-block: nibble qs[j & 15] low (j < 16)
-// or high (j >= 16), fifth bit (q5) bit j of qh (ggml-quants.c dequantize_row_q5_0: xh_1 = (qh >> (j + 12)) & 0x10 is
-// bit j + 16). Only 2-byte loads are used for the halves (blocks of 18 / 22 bytes are 2-byte aligned).
+// ---- the generic tier's loader: one K / V element of any type of S as its contract f16 bits ----
+// The type's to_float computed exactly in f32, then one RNE rounding to f16 (the CPU op's value). For q8_0 / q4_0 / q5_0
+// / iq4_nl the f32 product q * d is exact; for q4_1 / q5_1 q * d is exact, so fmaf equals the CPU's mul-then-add.
+// Element j of a 32-block: nibble qs[j & 15] low (j < 16) or high, fifth bit (q5) bit j of qh. Only 2-byte loads for the
+// halves (18 / 22-byte blocks are 2-byte aligned).
 
 static __device__ __forceinline__ float sa_h2f_bits(const uint16_t h) {
     return (float) __builtin_bit_cast(_Float16, h);
@@ -161,7 +132,7 @@ static __device__ __forceinline__ uint16_t sa_elem_t(const char * row, const int
     }
 }
 
-// the types of S (PLAN-v3 §6.1), the cases of every runtime switch below
+// the types of S, the cases of every runtime switch below
 #define SA_ANY_TYPES(X)       \
     X(GGML_TYPE_F16)          \
     X(GGML_TYPE_BF16)         \
@@ -173,8 +144,8 @@ static __device__ __forceinline__ uint16_t sa_elem_t(const char * row, const int
     X(GGML_TYPE_Q5_1)         \
     X(GGML_TYPE_IQ4_NL)
 
-// one element (dim d) of a row of ggml type gt, f16 bits; gt is uniform over the launch (a kernel argument), so the switch
-// is a scalar branch. A type outside S cannot reach a kernel (supports_op), it gives a NaN
+// one element (dim d) of a row of ggml type gt, f16 bits; gt is a kernel argument, so the switch is a scalar branch. A
+// type outside S cannot reach a kernel (supports_op); it gives a NaN
 static __device__ __forceinline__ uint16_t sa_any_elem(const int gt, const char * row, const int d) {
     switch (gt) {
 #define SA_ANY_ELEM_CASE(T) case T: return sa_elem_t<T>(row, d);

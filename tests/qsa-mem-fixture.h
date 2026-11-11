@@ -1,6 +1,5 @@
-// A qwen4exp hybrid-idx memory without weights or devices, fed through its real init_batch / apply path (PLAN-v3 W9 tests):
-// the attention cache, the indexer cache and their cells are the production objects; only the model has no layers
-// (test-qsa-prefix.cpp test_scan_foreign_image builds the memory the same way).
+// A qwen4exp hybrid-idx memory without weights or devices, fed through its real init_batch / apply path: the caches and
+// their cells are the production objects, only the model has no layers.
 #pragma once
 
 #include "../src/llama-batch.h"
@@ -32,7 +31,7 @@ struct qsa_fixture {
         mem.reset(new llama_memory_hybrid_idx(*model, GGML_TYPE_F16, GGML_TYPE_F16, false, kv_size, 1, 0, LLAMA_SWA_TYPE_NONE,
                 GGML_TYPE_F32, GGML_TYPE_F32, std::max<uint32_t>(n_seq_max, 1), n_seq_max, n_rs_seq, false, unified,
                 GGML_TYPE_F16, nullptr, nullptr, [](int32_t) { return false; }));
-        // the model has no layer: the QSA layers' ratio and top-k of Qwen3.8 Flash Next (ratio 4, top-k 2048)
+        // the model has no layer: set the QSA ratio and top-k by hand
         mem->qsa_resplit_configure({ 4 }, 2048, strips);
     }
 

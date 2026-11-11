@@ -1,24 +1,13 @@
 #version 450
 
-// GGML_OP_SPARSE_ATTN_PLAN, G = 1 (PLAN-v3 §2.1, §6.3): one workgroup per query row. The whole dst is bit-exact to the
-// CPU op (ggml-cpu/sparse-attn.cpp) and to the C3 oracle.
-//
-// Portable by construction: 32-bit loads and stores only, no subgroup operation, no 8- or 16-bit storage, a few shared
-// words. Its host gate is its own (WG invocations and (WG + WG / 16 + 2) * 4 bytes of shared memory), not the 64-lane gate of the
-// attend kernels.
-//
-// p.mode == 0 (one workgroup, first dispatch): the header and the zero bytes of dst (header padding, section gaps).
-// p.mode == 1 (one workgroup per (query, stream)), with a host barrier before it, because hdr.n_bad is a shared counter:
-//   1. each thread cleans a contiguous chunk of the row into the scratch row (invalid entries -> NONE; values other than
-//      -1 count in hdr.n_bad) and tests "strictly ascending, invalid entries last";
-//   2. when a thread found a violation, a bitonic sort of the scratch row (flip form; comparators past n_sel are dropped,
-//      which is the power-of-two network on the row padded with +inf). The sort runs in the storage buffer: n_sel is
-//      not limited by shared memory (the plan contract has no n_sel limit);
-//   3. a quad starts at a valid position whose quad differs from the previous position's; a two-level sum of the per-thread
-//      counts gives each thread its first entry; each start ORs the mask of its run (repeats of a cell fall in the run,
-//      so duplicates cost time, never bytes);
-//   4. the padding entries of the row: quad = last valid quad (or 0), mask 0 (zeroed in step 1).
-// The masks are u16 and written as whole dwords through atomicOr: two threads can own the two halves of one dword.
+// GGML_OP_SPARSE_ATTN_PLAN, G = 1, bit-exact to the CPU op. 32-bit storage only, no subgroup operation.
+// p.mode == 0 (one workgroup): the header and the zero bytes of dst.
+// p.mode == 1 (one workgroup per (query, stream), after a barrier: hdr.n_bad is a shared counter):
+//   1. clean the row into the scratch (invalid -> NONE, values other than -1 count in n_bad), test "already sorted";
+//   2. otherwise a bitonic sort of the scratch row in the storage buffer (no n_sel limit);
+//   3. a quad starts where the quad changes; a scan of per-thread counts gives each thread its first entry;
+//   4. padding entries: quad = last valid quad (or 0), mask 0.
+// The u16 masks are written as dwords through atomicOr: two threads can own the two halves of one dword.
 
 layout(constant_id = 0) const uint WG = 256;   // a power of two
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;

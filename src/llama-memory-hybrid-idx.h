@@ -37,7 +37,7 @@ public:
                  uint32_t   n_rs_seq,
                      bool   offload,
                      bool   unified,
-                            /* indexer key cache type, already resolved (llama_model_type_k_idx) */
+                            /* indexer key cache type, resolved */
                 ggml_type   type_k_idx,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -82,7 +82,6 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
-    // the indexer key cache type this memory was built with (PLAN-v3 §9)
     ggml_type get_type_k_idx() const { return type_k_idx; }
 
     // The model's indexer pool size.
@@ -134,41 +133,36 @@ public:
     void qsa_fill_updates(ggml_tensor * members, ggml_tensor * positions, ggml_tensor * rows) const;
     void qsa_commit(int il) const;
 
-    // the full-cache context with the attention and indexer views limited to n_kv cells: reserve pass B (PLAN-v3 §7.1.3),
-    // the dense shortcut's graph at the largest padded n_kv it serves. n_stream > 0 also limits the views to the first
-    // n_stream streams: the one-stream reserve graphs of a split cache with several sequences (llama_context::sched_reserve)
+    // full-cache context with the attention and indexer views limited to n_kv cells and, n_stream > 0, n_stream streams
     llama_memory_context_ptr init_full_n_kv(uint32_t n_kv, uint32_t n_stream = 0);
 
-    // PLAN-v3 §4.2 / §4.3: the compact predicate of a ubatch over the cells of kv (the attention cache at init, the
-    // indexer cache at graph time), each of the ubatch's n_stream streams with the sequence ids of its own tokens;
-    // QSA_COMPACT_OK or the reason of qsa_compact_reason (prefix.h)
+    // the compact predicate of a ubatch over the cells of kv: QSA_COMPACT_OK or the rejection reason (prefix.h)
     static int qsa_compact_reason(const llama_kv_cache * kv, uint32_t n_stream, uint32_t n_kv, uint32_t ratio, const llama_ubatch & ubatch);
-    // the same predicate over an empty cache (no cell): the ubatch's own verdict (its inputs, positions and rows)
+    // the same predicate over an empty cache
     static int qsa_compact_reason_empty(uint32_t n_stream, uint32_t ratio, const llama_ubatch & ubatch);
 
-    // the non-compact re-split (PLAN-v3 §4.3, P2-2): U = min(n_ubatch, strips x 512) tokens in total per non-compact ubatch
+    // the non-compact re-split cap: U = min(n_ubatch, strips x 512) tokens per non-compact ubatch
     static constexpr uint32_t QSA_NONCOMPACT_STRIPS = 1;
     uint32_t qsa_noncompact_cap(uint32_t n_ubatch) const { return std::min<uint32_t>(n_ubatch, qsa_nc_strips * 512); }
-    // replays of init_batch since the memory was made, and in its last call (test-qsa-resplit assert (vi))
+    // test introspection: replays of init_batch in total and in the last call
     uint64_t qsa_n_resplit() const { return n_qsa_resplit; }
     uint32_t qsa_last_replays() const { return qsa_last_n_replay; }
     // NC0 per ubatch of the last init_batch (1: init-time non-compact, 0: compact, QSA_NC0_SKIPPED: not evaluated)
     const std::vector<uint8_t> & qsa_last_nc0() const { return qsa_last_nc0_v; }
     static constexpr uint8_t QSA_NC0_SKIPPED = 2;
-    // qsa_nc0 evaluations in the last init_batch, and the test hook that evaluates NC0 on every ubatch (test-qsa-resplit)
+    // test hooks: NC0 evaluations in the last init_batch, NC0 on every ubatch
     uint32_t qsa_last_nc0_evals() const { return qsa_last_n_nc0_eval; }
     void qsa_nc0_eval_all(bool on) { qsa_nc0_all = on; }
-    // the context's causal attention (llama_context at init and on llama_set_causal_attn): block selection needs it, so
-    // NC0 never re-splits a non-causal context (every QSA ubatch takes the TE rows there)
+    // block selection needs causal attention: NC0 never re-splits a non-causal context
     void qsa_set_causal_attn(bool causal) { qsa_nc_causal = causal; }
     bool qsa_causal_attn() const { return qsa_nc_causal; }
-    // the compress ratios NC0 evaluates: the QSA layers' ratios where block selection can be eligible
+    // the QSA layers' compress ratios where block selection can be eligible
     const std::vector<uint32_t> & qsa_nc0_ratios() const { return qsa_nc_ratios; }
-    // test hook: the ratios of the QSA layers, the indexer top-k and S (default: from the model and QSA_NONCOMPACT_STRIPS)
+    // test hook
     void qsa_resplit_configure(std::vector<uint32_t> ratios, uint32_t top_k, uint32_t strips) {
         qsa_nc_ratios = std::move(ratios); qsa_nc_top_k = top_k; qsa_nc_strips = strips;
     }
-    // the rank decision of the last scan, per stream of its ubatch (test-qsa-visibility's agreement assert)
+    // the rank decision of the last scan, per stream (test introspection)
     const std::vector<uint8_t> & qsa_last_scan_ranked() const { return qsa_scan_ranked; }
     uint32_t get_n_seq_max() const { return n_seq_max_qsa; }
 
@@ -198,7 +192,6 @@ private:
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
 
-    // the message of a failed indexer-section restore (state_read)
     std::string state_read_idx_error(const char * what) const;
 
     // the indexer cache holds one key head per layer, so it needs its own hparams:
@@ -207,7 +200,7 @@ private:
 
     const ggml_type type_k_idx;
 
-    // the model's architecture, for the restore error's hint (only qwen4exp takes --cache-type-k-idx)
+    // for the restore error's hint
     const llm_arch arch;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
@@ -223,7 +216,7 @@ private:
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
 
-    // NC0 inputs (PLAN-v3 §4.3): the compress ratios of the QSA layers and the indexer top-k, and S
+    // NC0 inputs
     std::vector<uint32_t> qsa_nc_ratios;
     uint32_t qsa_nc_top_k  = 0;
     uint32_t qsa_nc_strips = QSA_NONCOMPACT_STRIPS;
@@ -235,7 +228,7 @@ private:
     bool qsa_nc0_all = false;
     bool qsa_nc_causal = true;
     mutable std::vector<uint8_t> qsa_scan_ranked;
-    // NC0(u) on the cells prepare simulated: the selection path (n_kv > top_k + r - 1) and the compact predicate rejects u
+    // NC0(u) on the cells prepare simulated: past the shortcut (n_kv > top_k + r - 1) and not compact
     bool qsa_nc0(const llama_ubatch & ubatch, const llama_kv_cache::slot_info & sinfo) const;
 };
 
@@ -271,7 +264,7 @@ public:
                       llama_context * lctx,
                                bool   optimize);
 
-    // a full-cache context whose attention and indexer views hold n_kv cells (reserve pass B) of n_stream streams (0: all)
+    // a full-cache context viewing n_kv cells of n_stream streams (0: all)
     llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem, uint32_t n_kv, uint32_t n_stream = 0);
 
     // used to create a batch processing context from a batch
@@ -329,14 +322,13 @@ public:
     // one stream, scalar positions in range, no 2d rope extents, no block split over sequence sets
     // (qsa_scalar_visibility_cells): the compact visibility rule applies
     bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
-    // why the compact predicate rejects ubatch on the indexer cells (QSA_COMPACT_OK when it accepts), for the decode error;
-    // a reservation context sees no cell: the verdict over an empty cache (qsa_compact_reason_empty)
+    // QSA_COMPACT_OK or why the compact predicate rejects ubatch on the indexer cells; a reservation context sees no cell
+    // and gives the empty cache's verdict
     int qsa_compact_reason(const llama_ubatch & ubatch, uint32_t ratio) const;
-    // the compact decision of a graph: a runtime graph's is qsa_scalar_visibility (the live cells); a reserve graph's
-    // (LLM_GRAPH_QSA_RESERVE_GRAPH, or any graph of a reservation context) is the verdict of the same predicate over an
-    // empty cache, the cache the first reserve sees at init, so a reserve that runs later on a live cache builds the same route
+    // runtime: qsa_scalar_visibility on the live cells; a reserve graph or a reservation context: the empty cache's verdict,
+    // so a later reserve on a live cache builds the same route as the first
     bool qsa_graph_compact(const llama_ubatch & ubatch, uint32_t ratio, bool reserve_graph) const;
-    // the re-split cap U of this memory (PLAN-v3 §4.3) and whether it serves several sequences
+    // the re-split cap U and whether the memory serves several sequences
     uint32_t qsa_noncompact_cap(uint32_t n_ubatch) const { return mem ? mem->qsa_noncompact_cap(n_ubatch) : n_ubatch; }
     bool qsa_multi_seq() const { return mem && mem->get_n_seq_max() > 1; }
     // scalar visibility and the cached cells form a single-sequence prefix with unique positions

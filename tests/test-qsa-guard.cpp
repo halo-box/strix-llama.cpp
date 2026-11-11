@@ -1,24 +1,15 @@
-// The QSA placement guard of PLAN-v3 §10 (W7 done-when), with the model given on the command line: nothing here allocates the
-// weights except the decode case, so the guard runs on the same no_alloc path as the -fit probe.
-//   test-qsa-guard <model.gguf> pass [ctk]    a real device: the context is created and every reserve pass inspected
-//                                             >= 2 nodes per QSA layer past the shortcut (non-vacuity count)
-//   test-qsa-guard <model.gguf> fake          a fake GPU device registered with ggml_backend_device_register that
-//                                             rejects SPARSE_ATTN: init error naming the cause and the remedy
-//   test-qsa-guard <model.gguf> reject        a real HIP device under the test switch GGML_CUDA_SA_FORCE=reject: init error
-//   test-qsa-guard <model.gguf> reject-decode the weights are loaded, the hook is set after init: llama_decode returns an
-//                                             error from the runtime guard, nothing is computed
-//   test-qsa-guard <model.gguf> fake-idx T    a fake GPU device that takes the sparse-attention ops but, as HIP, no GET_ROWS
-//                                             of IQ4_NL rows whose width is not a multiple of 256, with --cache-type-k-idx T:
-//                                             iq4_nl (128-wide indexer rows) must be an init error naming the indexer cache,
-//                                             any other T must create the context
-//   test-qsa-guard <model.gguf> fake-idx-w T  a fake GPU device that takes the sparse-attention ops but no SET_ROWS into a T
-//                                             destination (a device whose SET_ROWS list lacks T, as HIP's lacks MXFP4), with
-//                                             --cache-type-k-idx T: an init error naming the indexer cache writer and the
-//                                             types the device takes, not the scheduler's abort
-//   test-qsa-guard <model.gguf> causal-sync  on the CPU, n_seq_max 2, unified: the hybrid-idx memory sees the context's
-//                                             causal attention (the NC0 re-split applies only under it): false after init
-//                                             with LLAMA_ATTENTION_TYPE_NON_CAUSAL, true after llama_set_causal_attn(true);
-//                                             and the model's QSA ratios stay NC0 ratios (the eligibility filter)
+// The QSA placement guard, on the model given on the command line. Only reject-decode allocates the weights: the
+// others run on the no_alloc path of the -fit probe.
+//   test-qsa-guard <model.gguf> pass [ctk]    real device: the context is created, >= 2 nodes per QSA layer inspected
+//   test-qsa-guard <model.gguf> fake          fake GPU device without SPARSE_ATTN: init error naming cause and remedy
+//   test-qsa-guard <model.gguf> reject        real HIP device under GGML_CUDA_SA_FORCE=reject: init error
+//   test-qsa-guard <model.gguf> reject-decode weights loaded, switch set after init: llama_decode returns an error
+//   test-qsa-guard <model.gguf> fake-idx T    fake device without HIP's IQ4_NL GET_ROWS of widths % 256 != 0, with
+//                                             --cache-type-k-idx T: iq4_nl is an init error, any other T creates the context
+//   test-qsa-guard <model.gguf> fake-idx-w T  fake device without SET_ROWS into T: an init error naming the indexer cache
+//                                             writer and the types the device takes, not the scheduler's abort
+//   test-qsa-guard <model.gguf> causal-sync   CPU, n_seq_max 2, unified: the memory follows the context's causal flag
+//                                             (the re-split needs it), and the model keeps its NC0 ratios
 // Exit status 0 = the expectation held.
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -232,7 +223,7 @@ int main(int argc, char ** argv) {
         if (ctx == nullptr) {
             rc = fail("context creation on a real device");
         } else {
-            // the pp and tg lines of the init guard: inspected >= 2 x QSA layers past the shortcut
+            // the pp and tg lines of the init guard
             int n_lines = 0;
             size_t p = 0;
             while ((p = g_log.find("QSA ctx=main", p)) != std::string::npos) {
@@ -280,7 +271,6 @@ int main(int argc, char ** argv) {
         const std::string want = std::string("the indexer K cache (") + ggml_type_name(type);
         const std::string key = " or a type it takes here: ";
         const size_t p = g_log.find(key);
-        // the listed types, one per entry
         std::vector<std::string> listed;
         if (p != std::string::npos) {
             const std::string list = g_log.substr(p + key.size(), g_log.find('\n', p) - p - key.size());
@@ -316,8 +306,7 @@ int main(int argc, char ** argv) {
             if (at_init || !after_set || after_unset) {
                 rc = fail("the memory's causal attention does not follow the context");
             }
-            // the model's QSA layers keep their NC0 ratio (Qwen3.8: ratio 4, top-k 2048, head 256): the eligibility filter
-            // must not drop a layer block selection runs on
+            // the eligibility filter must not drop a QSA layer
             std::string ratios;
             for (uint32_t r : mem->qsa_nc0_ratios()) {
                 ratios += (ratios.empty() ? "" : ", ") + std::to_string(r);
@@ -332,7 +321,7 @@ int main(int argc, char ** argv) {
             rc = fail("context creation");
         } else {
             setenv("GGML_CUDA_SA_FORCE", "reject", 1);
-            // 256 queries: the sparse op's n_q band under the shipped prefer_dense policy of q8_0 (AT-W7PERF)
+            // 256 queries: q8_0 takes the sparse op, not the dense shortcut, at this n_q
             std::vector<llama_token> tok(256, 1);
             llama_batch b = llama_batch_get_one(tok.data(), (int32_t) tok.size());
             const int ret = llama_decode(ctx, b);

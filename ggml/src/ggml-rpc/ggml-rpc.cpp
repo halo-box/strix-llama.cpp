@@ -78,7 +78,7 @@ enum rpc_cmd {
     RPC_CMD_COMM_INIT,
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
-    RPC_CMD_SUPPORTS_OP,   // 8.1: the server device's supports_op for one node (the ops of rpc_supports_op_remote)
+    RPC_CMD_SUPPORTS_OP,   // 8.1: the server device's supports_op for one node
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -442,7 +442,6 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
 
-    // below RPC_PROTO_MIN_SERVER_MINOR_VERSION the server lacks op values or commands this client sends (ggml-rpc.h)
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION ||
         response.minor < RPC_PROTO_MIN_SERVER_MINOR_VERSION) {
         LOG_ERROR("RPC server version mismatch: %d.%d.%d (this client takes %d.%d to %d.%d)\n",
@@ -1047,10 +1046,8 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
     return buft_ctx->max_size;
 }
 
-// the ops whose support is asked from the server device (RPC_CMD_SUPPORTS_OP): the sparse-attention pair, which a server
-// backend may not take at all (a CUDA build aborts in its compute, a backend without the ops has no compute case) or not
-// for every type pair and shape. llama's QSA placement guard (llama-context.cpp qsa_guard) relies on supports_op to turn
-// that into an init error.
+// the ops whose support is asked from the server device: a server backend may lack the sparse-attention ops, or support
+// them only for some type pairs and shapes
 static bool rpc_supports_op_remote(const int op) {
     return op == GGML_OP_SPARSE_ATTN || op == GGML_OP_SPARSE_ATTN_PLAN;
 }
@@ -1087,14 +1084,9 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         //    cached value from reservation is always >= any subsequent request
         // 3. Including src dims causes cache misses per-ubatch (e.g. growing KV cache)
         //    which blocks the main thread behind in-flight GRAPH_COMPUTE commands
-        // except for the ops whose workspace is a function of their srcs and not of the dst shape (rpc_alloc_size_src_keyed):
-        // the SPARSE_ATTN workspace past ggml_nbytes(dst) follows the plan's n_kv / n_sel / G and the K / V type and heads
-        // (HIP sa_select, Vulkan ggml_vk_sa_select), none of which is in its dst [D, n_head, n_q, n_stream] or its op_params
-        // (scale, rot_q, rot_o). Point 2 does not hold for it: a dst shape the reserve never builds (a remainder ubatch)
-        // is first cached at whatever n_kv it first runs at, and the shortcut (n_sel = n_kv) and the selection rows
-        // (n_sel = top_k + r - 1) give identical dst shapes; a cache hit then returned a workspace smaller than the server's
-        // kernels write, so gallocr placed the next tensors inside it (the server's own get_alloc_size check recomputes
-        // the size and cannot see it). Its key also holds every src's type, op, op_params, ne and nb.
+        // except for rpc_alloc_size_src_keyed ops: the SPARSE_ATTN workspace follows the plan's n_kv / n_sel / G and the
+        // K / V types, none of which is in its dst shape or op_params, and point 2 does not hold for it. Its key also holds
+        // every src's type, op, op_params, ne and nb.
         struct alloc_size_cache_src {
             uint32_t type;
             uint32_t op;

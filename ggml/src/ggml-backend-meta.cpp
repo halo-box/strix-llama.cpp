@@ -1072,7 +1072,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_SPARSE_ATTN_PLAN:
             case GGML_OP_SPARSE_ATTN: {
-                // no tensor-split handler: supports_op is false for both ops, and QSA under a tensor split is an init error
+                // supports_op is false for both ops
                 GGML_ABORT("%s is not supported by the meta (tensor-split) backend", ggml_op_name(tensor->op));
             } //break;
             default: {

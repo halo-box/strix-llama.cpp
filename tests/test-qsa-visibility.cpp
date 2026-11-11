@@ -1,16 +1,8 @@
-// PLAN-v3 §4.2 proof obligation (W9): the compact visibility predicate and its limits, on the production memory.
-//
-// Each layout is built through the real init_batch / apply path of a qwen4exp hybrid-idx memory (tests/qsa-mem-fixture.h).
-// On every checked ubatch, right after its apply (the graph-time state):
-//  - the predicate's verdict is compared with the expected one (positives, and the negative cases of P2-1);
-//  - when it accepts, the scan fills the compact limits, block cells and tails (set_input_qsa_blocks, the graph's inputs),
-//    and for every row the cells they make visible ({blocks with start < tail start} x 4 cells, plus the tail cells) must
-//    equal the cells the KQ mask keeps (llama_kv_cache::set_input_kq_mask, the attention's own rule), with no duplicate;
-//  - scan/predicate agreement: on a stream whose rows' sequences hold 2-D cells, the scan ranked iff the predicate accepted
-//    (both call qsa_stream_one_seq), unless the rejection is a degenerate key.
-// The layouts are synthetic reconstructions of the recorded shapes named in PLAN-v3 §4.2 (C4 p1/p2, B65t of C19, request C
-// of L64, the R1-RES split-stream image ubatch) plus the synthetic ones (several images, back to back across a ubatch
-// boundary, image at position 0, text after images, depth > 32k, holes after seq_rm) and the negative cases.
+// The QSA compact visibility predicate on the production memory (qsa-mem-fixture.h). After each ubatch's apply:
+//  - the predicate's verdict matches the expected one;
+//  - when it accepts, the cells the compact inputs (set_input_qsa_blocks) make visible to each row equal the cells the KQ
+//    mask keeps, with no duplicate;
+//  - on a stream whose sequences hold 2-D cells, the scan ranked iff the predicate accepted (degenerate keys aside).
 #include "qsa-mem-fixture.h"
 
 #include "ggml-backend.h"
@@ -158,7 +150,7 @@ static void feed_plain(const char * name, qsa_fixture & f, const std::vector<qsa
 }
 
 int main() {
-    // C4 p1 / p2 shape (one sequence, one 32 x 32 image after a text prompt, text after it), np1
+    // one sequence: text, a 32 x 32 image, text
     {
         qsa_fixture f(16384, 1, true);
         feed_plain("c4", f, f.text(0, 2600), 512);
@@ -166,14 +158,14 @@ int main() {
         feed_check("c4-text-after", f, f.text(0, 1500), 512, EXPECT_COMPACT);
         feed_check("c4-decode", f, f.text(0, 1), 512, EXPECT_COMPACT);
     }
-    // B65t shape (C19): a deep image past 32k (depth > 32k), image ubatches of 1024 at ub1024, then text
+    // an image past position 32k, ubatches of 1024, then text
     {
         qsa_fixture f(40960, 1, true);
         feed_plain("b65t", f, f.text(0, 33000), 4096);
         feed_check("b65t-image", f, f.image(0, 24, 40), 1024, EXPECT_COMPACT);
         feed_check("b65t-text", f, f.text(0, 700), 1024, EXPECT_COMPACT);
     }
-    // request C shape (L64): five images with text between them, one sequence; two images back to back across a 512 boundary
+    // five images with text between them; two images back to back across a ubatch boundary
     {
         qsa_fixture f(32768, 1, true);
         feed_plain("reqc", f, f.text(0, 2100), 512);
@@ -181,7 +173,6 @@ int main() {
             feed_check("reqc-image", f, f.image(0, 16 + 2*k, 20), 512, EXPECT_COMPACT);
             feed_check("reqc-text", f, f.text(0, 300 + 77*k), 512, EXPECT_COMPACT);
         }
-        // one embedding batch of two images (256 + 320 tokens): the 512-token ubatch boundary falls inside the second
         auto two = f.image(0, 16, 16);
         const auto second = f.image(0, 16, 20);
         two.insert(two.end(), second.begin(), second.end());
@@ -206,7 +197,7 @@ int main() {
         feed_check("holes-image2", f, f.image(0, 10, 30), 512, EXPECT_COMPACT);
         feed_check("holes-text2", f, f.text(0, 100), 512, EXPECT_COMPACT);
     }
-    // R1-RES split-stream image ubatch: -np 2 split, slot 0 image + text, slot 1 text, a ubatch with both streams
+    // split streams: seq 0 image + text, seq 1 text, a ubatch with both streams
     {
         qsa_fixture f(16384, 2, false);
         feed_plain("split", f, f.text(0, 2500), 1024);
@@ -219,8 +210,7 @@ int main() {
         auto img = f.image(0, 16, 16);
         feed_check("split-image-stream", f, img, 1024, EXPECT_COMPACT);
     }
-    // negative (P2-1): unified stream, seq A holds an image, seq B holds text cells: A rejected (text and image), B accepted;
-    // then B's cells removed by seq_rm: A accepted again
+    // unified stream, seq A holds an image, seq B text: A rejected, B accepted; A accepted again once B is removed
     {
         qsa_fixture f(32768, 2, true);
         feed_plain("neg", f, f.text(0, 2200), 1024);
@@ -243,8 +233,8 @@ int main() {
         feed_check("neg-split-A-image", f, f.image(0, 16, 16), 512, EXPECT_COMPACT);
         feed_check("neg-split-B-text", f, f.text(1, 700), 512, EXPECT_COMPACT);
     }
-    // text only, two sequences in one unified stream (no 2-D cells): compact as today (step 5); a seq_cp prefix that ends
-    // inside a block (R1-CB, L = 8193) splits that block over two sequence sets: non-compact for both
+    // text only, two sequences in one unified stream: compact; a seq_cp prefix that ends inside a block splits it over two
+    // sequence sets: non-compact for both
     {
         qsa_fixture f(32768, 3, true);
         feed_plain("text-ms", f, f.text(0, 3000), 1024);
@@ -258,8 +248,7 @@ int main() {
         feed_check("seqcp-src", f, f.text(0, 40), 512, EXPECT_NONCOMPACT);
         feed_check("seqcp-dst", f, f.text(2, 40), 512, EXPECT_NONCOMPACT);
     }
-    // degenerate (step 4): an embedding batch may start at the last stored position (llama-batch.cpp: X <= Y for embd), so an
-    // image at t0 = X puts its first cell on the key (X, X, X) of the text cell at X: a duplicate key, non-compact
+    // an image may start at the last stored position X: its first cell has the key (X, X, X) of the text cell at X, non-compact
     {
         qsa_fixture f(8192, 1, true);
         feed_plain("dup", f, f.text(0, 3000), 1024);

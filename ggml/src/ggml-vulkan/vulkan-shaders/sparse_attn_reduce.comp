@@ -1,9 +1,7 @@
 #version 450
 
-// GGML_OP_SPARSE_ATTN, split-K merge (PLAN-v3 §6.3), from flash_attn_split_k_reduce.comp without sinks and without the
-// clamp: a V that overflows f16 gives +-inf in the output (PLAN-v3 §2.2 item 1, the overflow case of §14.1). Reductions in
-// shared memory, the splits in fixed ascending order: the result is a function of the partials alone. H_o, when asked, is a
-// separate dispatch of fwht.comp after this one.
+// GGML_OP_SPARSE_ATTN split-K merge: flash_attn_split_k_reduce.comp without sinks or clamp (an f16 overflow stays +-inf),
+// splits merged in fixed order
 
 const uint BLOCK_SIZE = 32;
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
@@ -21,9 +19,7 @@ layout(push_constant) uniform parameter {
 
 shared float tmpsh[BLOCK_SIZE];
 
-// l > 0 on the bits: true for a positive l (+inf included), false for 0, a negative l and NaN. The modules carry no
-// SignedZeroInfNanPreserve execution mode, so a float compare may be compiled as if l were never NaN; an integer compare
-// cannot be.
+// l > 0 on the bits (false for NaN): without SignedZeroInfNanPreserve a float compare may assume l is never NaN
 bool sa_l_pos(const float l) {
     return floatBitsToUint(l) - 1u < 0x7f800000u;
 }
@@ -72,9 +68,7 @@ void main() {
         barrier();
     }
     L = tmpsh[0];
-    // L is NaN when a split's normaliser is NaN (a NaN score: ggml.h item 5, "a backend that splits a row must keep that
-    // NaN"), and the row is then 0: a select of the result, not O * 0 (NaN when the poisoned split's O reached O); the test
-    // is on the bits (sa_l_pos)
+    // a NaN split normaliser makes L NaN and the row 0 (ggml.h item 5): a select, not O * 0
     const bool pos = sa_l_pos(L);
     const float inv_l = pos ? 1.0 / L : 0.0;
 

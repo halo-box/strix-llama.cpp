@@ -4463,11 +4463,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
-        // GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN (PLAN-v3 §5, §6.3). A tier's gate is what its shaders require; supports_op is
-        // true only when ggml_vk_sa_pipeline returns a pipeline (P2-16). Created on demand per (types, GQA, V variant, rotation).
+        // sparse attention: each tier's gate is what its shaders require; attend pipelines are created on demand per key
         {
             const auto & lim = device->properties.limits;
-            // the plan's own gate: 32-bit storage only, WG invocations and (WG + WG / 16 + 2) * 4 bytes of shared memory
             uint32_t plan_wg = 256;
             while (plan_wg >= 16 && (plan_wg > lim.maxComputeWorkGroupInvocations || (plan_wg + plan_wg / 16 + 2) * 4 > lim.maxComputeSharedMemorySize)) {
                 plan_wg >>= 1;
@@ -4476,28 +4474,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_sparse_attn_plan, "sparse_attn_plan_rows", sparse_attn_plan_rows_len, sparse_attn_plan_rows_data, "main", 3,
                     sizeof(vk_op_sparse_attn_plan_push_constants), {1, 1, 1}, {plan_wg}, 1, true);
             }
-            // reduce: 32 invocations, 128 bytes of shared memory, no subgroup operation
             if (lim.maxComputeWorkGroupInvocations >= 32 && lim.maxComputeSharedMemorySize >= 128) {
                 ggml_vk_create_pipeline(device, device->pipeline_sparse_attn_reduce, "sparse_attn_reduce", sparse_attn_reduce_len, sparse_attn_reduce_data, "main", 2,
                     sizeof(vk_op_sparse_attn_reduce_push_constants), {1, 1, 1}, {}, 1, true);
             }
-            // The gates are a function of the device alone, and this block runs again on every on-demand compile while
-            // supports_op / get_alloc_size / the dispatch read them without compile_mutex: they are computed here and each one
-            // stored once (an atomic store of the same value), never cleared first, so a reader can never see a tier vanish
-            // between the alloc size and the dispatch of the same node.
+            // the gates are read without compile_mutex while this block reruns on each on-demand compile: store each one
+            // (same value) and never clear it first, so a tier cannot vanish between the alloc size and the dispatch
             bool ok_cm = false, ok_scalar = false;
-            // portable: at most 12 invocations and 2 KiB of shared memory (K and V rows in f32)
             const bool ok_portable = lim.maxComputeWorkGroupInvocations >= 12 && lim.maxComputeSharedMemorySize >= 2048;
-            // the 64-lane tiers read K and V through flash_attn_dequant.glsl (16-bit storage, int8 arithmetic: a Vulkan device of this backend has them)
             const bool sa_sg64 = device->subgroup_size_control
                 ? device->subgroup_min_size <= 64 && 64 <= device->subgroup_max_size
                 : device->subgroup_size == 64;
             if (sa_sg64 && device->subgroup_shuffle && device->subgroup_arithmetic && device->fp16) {
-                // Q (1 KiB per head), a K and a V block (16 KiB each), P, the block's keys, the iq4_nl table: 46,784 bytes at GQA 12
+                // shared memory: Q, a K and a V block, P, the block's keys, the iq4_nl table at GQA 12
                 ok_scalar = 64 * 12 <= lim.maxComputeWorkGroupInvocations &&
                     4 * 12 * 256 + 2 * 2 * 256 * 32 + 4 * 12 * 32 + 4 * 32 + 64 <= lim.maxComputeSharedMemorySize;
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-                // the RDNA3 + RADV fragment layout; Q 8,448 B, staged V 8,192 B, H_q 12,288 B, the iq4_nl table
+                // the shader assumes the RDNA3 + RADV fragment layout; shared: Q, staged V, H_q, the iq4_nl table
                 ok_cm = device->subgroup_ballot && device->coopmat_support && device->coopmat_support_16x16x16_f32acc &&
                     device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 && device->driver_id == vk::DriverId::eMesaRadv &&
                     8448 + 8192 + 12288 + 64 <= lim.maxComputeSharedMemorySize;
@@ -10671,25 +10664,13 @@ static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& s
     subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-// GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN (PLAN-v3 §5, §6.3)
-//
-// Tiers, one shape-only selection (ggml_vk_sa_select) used by supports_op, get_alloc_size, the census and the dispatch:
-//   cm        sparse_attn_cm.comp        RADV RDNA3: WMMA fragments, V direct (shipped) or staged, the diagnostic pack arm (AT-B3)
-//   scalar    sparse_attn.comp           other 64-lane devices (subgroup size 64, shuffle, arithmetic, fp16, 46.8 KB shared)
-//   portable  sparse_attn_portable.comp  every other device: no subgroup operation, 32-bit storage only, 2 KiB shared
-// supports_op is true only when a pipeline exists for (op, types, tier) on this device, never a null-pipeline dispatch
-// (P2-16), and when every binding fits maxStorageBufferRange (P2-19). G = 1 only; the policies say so.
-//
-// Workspace (P2-19): SPARSE_ATTN_PLAN and SPARSE_ATTN bind dst with range ggml_nbytes(dst) and the workspace through an
-// explicit sub-buffer at round_up(nbytes, minStorageBufferOffsetAlignment); get_alloc_size includes the round-up. The barrier
-// tracker of ggml_vk_build_graph computes its ranges with ggml_nbytes, so the workspace is invisible to it (O17): each sparse
-// node starts with an unconditional ggml_vk_sync_buffers, and the passes inside a node have their own.
-//
-// GGML_VK_SA_FORCE, comma-separated, a test switch: scalar | portable | portable_sg32 (required subgroup size 32) | vdirect |
-// vstaged | vpack | rot_dump (the kernel writes H_q q to dst and stops) | no_cm | no_scalar | no_portable | no_plan (behave as
-// a device without that pipeline) | max_q=N (most queries per dispatch, the host loop for maxComputeWorkGroupCount[0]).
-// ---------------------------------------------------------------------------------------------------------------------
+// GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN. Tiers, chosen by ggml_vk_sa_select for supports_op, alloc size and dispatch:
+//   cm        sparse_attn_cm.comp        RADV RDNA3, WMMA; V direct, staged or packed to f16 (vpack, test only)
+//   scalar    sparse_attn.comp           other subgroup-64 devices
+//   portable  sparse_attn_portable.comp  every other device: no subgroup operation
+// G = 1 only. The workspace sits past ggml_nbytes(dst), where the barrier tracker cannot see it: each node syncs first.
+// GGML_VK_SA_FORCE (comma-separated test switch): scalar | portable | portable_sg32 | vdirect | vstaged | vpack |
+// rot_dump (write H_q q to dst) | no_cm | no_scalar | no_portable | no_plan | max_q=N (queries per dispatch).
 
 struct vk_sa_force_t {
     int tier = -1;
@@ -10787,7 +10768,7 @@ static bool ggml_vk_sa_binding_fits(const vk_device & device, const size_t nbyte
     return nbytes + device->properties.limits.minStorageBufferOffsetAlignment <= ggml_vk_sa_max_binding(device);
 }
 
-// test hook ("ggml_backend_debug_vk_sa_binding_limit"): the limit of one K/V binding, the expected-unsupported list of the op tests
+// test hook: the limit of one K/V binding
 static size_t ggml_backend_vk_sa_binding_limit(ggml_backend_t backend) {
     const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
     return std::min<size_t>(ggml_vk_sa_max_binding(ctx->device) - ctx->device->properties.limits.minStorageBufferOffsetAlignment,
@@ -10799,14 +10780,11 @@ static size_t ggml_vk_sa_round_up(const vk_device & device, const size_t n) {
     return (n + a - 1) / a * a;
 }
 
-// the reasons of ggml_backend_sparse_attn_unsupported_reason: a type cause gets the "use another -ctk/-ctv" remedy of the
-// init error, every other cause the CPU / --no-kv-offload one (src/llama-context.cpp qsa_unsupported_error)
 static const char * const VK_SA_WHY_TYPE    = "type pair not supported";
 static const char * const VK_SA_WHY_BINDING = "a binding of this shape exceeds the device limits (maxStorageBufferRange or the suballocation block)";
 
-// NULL when the plan runs on this device; otherwise why not
-// (for an attend's plan, sel may be absent: an RPC server links a node's direct srcs only, so the shape comes from the
-// plan's op_params and the binding of sel is the contiguous one; the plan node's own query has its sel)
+// NULL when the plan runs on this device; otherwise why not. sel may be absent (an attend's plan on an RPC server): the
+// shape then comes from the op_params
 static const char * ggml_vk_sa_plan_why(const vk_device & device, const ggml_tensor * op) {
     const ggml_tensor * sel = op->src[0];
     const int64_t n_sel = ggml_get_op_params_i32(op, 2), n_q = ggml_get_op_params_i32(op, 3), n_stream = ggml_get_op_params_i32(op, 4);
@@ -10815,7 +10793,7 @@ static const char * ggml_vk_sa_plan_why(const vk_device & device, const ggml_ten
         return "Vulkan device lacks the sparse-attention plan pipeline";
     }
     if (ggml_get_op_params_i32(op, 1) != 1) {
-        return "plan group G != 1 (Vulkan has no G = 4 plan)";   // PLAN-v3 §6.3
+        return "plan group G != 1 (Vulkan has no G = 4 plan)";
     }
     if (!ggml_is_contiguous(op)) {
         return "plan dst not contiguous";
@@ -10832,8 +10810,7 @@ static bool ggml_vk_sa_plan_supported(const vk_device & device, const ggml_tenso
     return ggml_vk_sa_plan_why(device, op) == nullptr;
 }
 
-// split count, a function of the shape alone: few workgroups cannot fill the GPU, so each row is split (the rule of the
-// selected-key FA dispatch of master ea5285ddf, deleted in W13: n_wg < 128 on the WMMA kernel and < 64 on the scalar one).
+// split count, a function of the shape alone: few workgroups cannot fill the GPU, so each row is split.
 // The portable tier never splits.
 static uint32_t ggml_vk_sa_splits(const vk_device & device, const vk_sa_tier tier, const int64_t n_q, const int64_t n_kv_head, const int64_t n_stream, const int64_t n_sel) {
     if (tier == VK_SA_TIER_PORTABLE || device->pipeline_sparse_attn_reduce == nullptr) {
@@ -10851,9 +10828,7 @@ static size_t ggml_vk_sa_partial_bytes(const int64_t n_q, const int64_t n_head, 
     return n_split > 1 ? ((size_t) 256 * n_head * n_q * n_stream * n_split + (size_t) n_head * 2 * n_q * n_stream * n_split) * sizeof(float) : 0;
 }
 
-// the V variant shipped per V type. AT-B3 (scripts/qsa-validation/summaries/w6_time.md, C11's shape, d4096, d131072, text and random): direct is faster than
-// staged for every type and cell, also for f16 (LDS staging about doubles the op). The pack arm is faster still on q8_0 and q4_0 but would put the compute
-// buffer of those types above f16's (M1), so it is not shipped: it runs under GGML_VK_SA_FORCE=vpack only.
+// direct V beats staged for every type; pack is faster on q8_0 / q4_0 but grows the compute buffer, so it is test only
 static vk_sa_vl ggml_vk_sa_default_vl(const ggml_type type_v) {
     GGML_UNUSED(type_v);
     return VK_SA_VL_DIRECT;
@@ -10868,8 +10843,8 @@ struct vk_sa_selection {
     size_t pack_k_bytes = 0, pack_v_bytes = 0;
     size_t partial_bytes = 0;
     size_t ws_bytes = 0;            // what this op's dispatch uses
-    size_t ws_reserve_bytes = 0;    // max over every n_q' <= n_q (PLAN-v3 §5): what get_alloc_size holds
-    const char * why = nullptr;     // no pipeline: the cause (ggml_backend_sparse_attn_unsupported_reason)
+    size_t ws_reserve_bytes = 0;    // max over every n_q' <= n_q: what get_alloc_size holds
+    const char * why = nullptr;     // no pipeline: the cause
 };
 
 static vk_pipeline ggml_vk_sa_pipeline(const vk_device & device, const vk_sa_key & key) {
@@ -10886,7 +10861,7 @@ static vk_pipeline ggml_vk_sa_pipeline(const vk_device & device, const vk_sa_key
 
 static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_tensor * op) {
     vk_sa_selection r;
-    // the invariants of ggml_sparse_attn (K / V rows and heads the shaders read): an RPC server's node was never built by it
+    // an RPC server's node was never built by ggml_sparse_attn
     if ((r.why = ggml_sparse_attn_shape_why(op)) != nullptr) {
         return r;
     }
@@ -10897,7 +10872,7 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
     const vk_sa_force_t f = ggml_vk_sa_force();
 
     const vk_sa_tier tier = ggml_vk_sa_tier(device);
-    // n_sel from the plan's op_params, not from plan->src[0]: an RPC server's copy of this node has no sel (ggml.h)
+    // n_sel from the plan's op_params: an RPC server's copy of this node has no sel
     const int64_t n_q = q->ne[1], n_head = q->ne[2], n_stream = q->ne[3], n_kv_head = k->ne[2], n_sel = ggml_get_op_params_i32(plan, 2);
     const int64_t n_kv = ggml_get_op_params_i32(plan, 0);
     const int32_t rot_q = ggml_get_op_params_i32(op, 1);
@@ -10943,7 +10918,7 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
         return r;
     }
     if (rot_o != 0 && device->pipeline_fwht_inplace_f32[ggml_vk_fwht_pipeline_idx(rot_o)] == nullptr) {
-        r.why = "no fwht pipeline on this device for the output rotation";   // H_o is a dispatch of fwht.comp (a driver gate of fwht)
+        r.why = "no fwht pipeline on this device for the output rotation";
         return r;
     }
     if (!ggml_vk_sa_binding_fits(device, ggml_nbytes(q)) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(k)) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(v)) ||
@@ -10952,7 +10927,6 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
         return r;
     }
 
-    // the V variant
     const int64_t n_kv4 = 4 * ((n_kv + 3) / 4);
     const size_t pack_row = (size_t) 256 * sizeof(ggml_fp16_t);
     vk_sa_vl vl = VK_SA_VL_STAGED;
@@ -10975,7 +10949,7 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
         }
     }
 
-    // the workspace: this shape's, and the largest one a smaller ubatch of this context can ask (G1 split-K is not monotonic in n_q)
+    // the workspace: this shape's, and the largest one a smaller ubatch can ask (split-K is not monotonic in n_q)
     r.n_split = ggml_vk_sa_splits(device, tier, n_q, n_kv_head, n_stream, n_sel);
     r.partial_bytes = ggml_vk_sa_partial_bytes(n_q, n_head, n_stream, r.n_split);
     size_t partial_max = r.partial_bytes;
@@ -10983,12 +10957,10 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
         partial_max = std::max(partial_max, ggml_vk_sa_partial_bytes(nq, n_head, n_stream, ggml_vk_sa_splits(device, tier, nq, n_kv_head, n_stream, n_sel)));
     }
     r.ws_bytes = r.pack_k_bytes + r.pack_v_bytes + r.partial_bytes;
-    // the pack reserve: a runtime op of this context packs at n_kv4' < 64 n_q' with n_kv' <= n_kv and n_q' <= n_q, so the
-    // largest pack it can ask is at n_kv4' = min(n_kv4, 64 n_q - 4), not at this node's n_kv: a reserve at the full n_kv
-    // (no pack there) must still hold the pack of a smaller runtime n_kv
+    // the pack reserve: a runtime op packs when n_kv4' < 64 n_q', so a reserve at the full n_kv (no pack there) must still
+    // hold the pack of a smaller n_kv, capped by the binding and grid limits
     size_t pack_reserve = 0;
     if (pack_arm && (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16)) {
-        // and the largest n_kv4' whose pack binds and whose pack grid fits (the two other terms of pack_possible)
         const size_t per_cell = (size_t) n_kv_head * n_stream * pack_row;
         const size_t align = device->properties.limits.minStorageBufferOffsetAlignment;
         const size_t max_bind = ggml_vk_sa_max_binding(device);
@@ -11023,8 +10995,7 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
     return r;
 }
 
-// get_alloc_size hook of the Vulkan buffer type. Plan: dst + its sort scratch (G = 1 only on Vulkan, PLAN-v3 §2.1). Attend: dst + the
-// largest workspace of this context's shapes. Each with the round-up of the workspace's descriptor offset.
+// dst, rounded up to the descriptor offset alignment, + the plan's sort scratch or the attend's largest workspace
 static size_t ggml_vk_sa_alloc_size(const vk_device & device, const ggml_tensor * tensor) {
     if (tensor->op == GGML_OP_SPARSE_ATTN_PLAN) {
         const ggml_tensor * sel = tensor->src[0];
@@ -11044,7 +11015,7 @@ static const char * ggml_vk_sa_vl_name(const int vl) {
 
 static const ggml_type vk_sa_types[9] = { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
 
-// census keys (PLAN-v3 §6.3): sa_plan/G1; sa_attend/vk/<tier>/<VL>/<KT>/<VT>; sa_merge/vk/splits<first of the split class>; sa_pack/vk/<T>
+// census keys: sa_plan/G1; sa_attend/vk/<tier>/<VL>/<KT>/<VT>; sa_merge/vk/splits<first of the split class>; sa_pack/vk/<T>
 static const char * const * ggml_vk_sa_census_list() {
     static const std::vector<std::string> keys = [] {
         std::vector<std::string> v = { "sa_plan/G1" };
@@ -11079,7 +11050,7 @@ static const char * const * ggml_vk_sa_census_list() {
     return ptrs.data();
 }
 
-// the class of a split count, as the band rows of PLAN-v3 §14.2 (a): 2-5, 6-16, 17-33, > 33
+// the class of a split count: 2-5, 6-16, 17-33, > 33
 static int ggml_vk_sa_split_class(const uint32_t n_split) {
     return n_split <= 5 ? 2 : n_split <= 16 ? 6 : n_split <= 33 ? 17 : 34;
 }
@@ -11132,18 +11103,11 @@ static const char * ggml_vk_sa_census_skip(const vk_device & device, const std::
 }
 
 static int32_t ggml_backend_vk_sparse_attn_group(ggml_backend_dev_t, int64_t, int64_t, enum ggml_type, enum ggml_type, bool) {
-    return 1;   // PLAN-v3 §5: Vulkan G = 1
+    return 1;
 }
 
-// Dense shortcut preference on Vulkan (D4, AT-B4 op level, PLAN-v3 §16.5): SPARSE_ATTN over all-visible rows (plan + attend, G 1) against
-// the causal FLASH_ATTN_EXT of the same pair, n_q {1, 2, 4, 8, 16, 32, 64, 127, 128, 256, 512, 1024, 2048} x n_kv {512, 1024, 2048}, all 16
-// pairs of {f16, bf16, q8_0, q4_0}, three processes, noise p90 1.25 % (scripts/qsa-validation/summaries/w7_vk_at_b4_op.md). A (pair, n_q band)
-// is dense where an op cell of the band has sparse below 0.98 x dense (the pre-registered rule); f16 / f16 keeps the dense FLASH_ATTN_EXT.
-// The bf16-mixed pairs stay sparse: Vulkan FLASH_ATTN_EXT does not take them (every dense arm "unsupported", L40). The e2e cells of AT-B4
-// were not run (UNPROVEN), so a band can only be flipped further by them. Other types: sparse (no measured dense cell).
-// The table was measured on the cm tier (RADV RDNA3) only: another tier keeps the sparse op, which it runs, and a dense pick
-// is also dropped when this device's FLASH_ATTN_EXT does not take the pair (no subgroup vote / shuffle without coopmat2:
-// the devices the portable tier exists for), so that the shortcut never builds an attention node its device rejects.
+// Dense shortcut preference: a (pair, n_q band) is dense where sparse ran slower than causal FLASH_ATTN_EXT on the cm tier.
+// Other tiers and types keep the sparse op, and a dense pick is dropped when this device's FLASH_ATTN_EXT rejects the pair.
 
 // a FLASH_ATTN_EXT of the dense shortcut's shape (D 256, the qwen4exp heads, a causal f16 mask) on this device
 static bool ggml_vk_sa_dense_fa_supported(ggml_backend_dev_t dev, ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv) {
@@ -11178,7 +11142,7 @@ static bool ggml_backend_vk_sparse_attn_prefer_dense(ggml_backend_dev_t dev, enu
     if (tk < 0 || tv < 0) {
         return false;
     }
-    // the n_q bands of D4: {1, 2-8, 9-32, 33-127, 128-511, 512-1023, >= 1024}
+    // n_q bands: {1, 2-8, 9-32, 33-127, 128-511, 512-1023, >= 1024}
     const int band = n_q <= 1 ? 0 : n_q <= 8 ? 1 : n_q <= 32 ? 2 : n_q <= 127 ? 3 : n_q <= 511 ? 4 : n_q <= 1023 ? 5 : 6;
     // [K f16, bf16, q8_0, q4_0][V f16, bf16, q8_0, q4_0][band]: 1 = dense
     static const bool dense[4][4][7] = {
@@ -11208,7 +11172,6 @@ static const char * ggml_backend_vk_sparse_attn_unsupported_reason(ggml_backend_
         if (ggml_backend_dev_supports_op(dev, op)) {
             return nullptr;
         }
-        // supports_op is select's pipeline != nullptr: the cause is the select's own
         const vk_sa_selection sel = ggml_vk_sa_select(device, op);
         return sel.why ? sel.why : "sparse-attention shape not supported on this Vulkan device";
     }
@@ -11222,7 +11185,7 @@ static const char * ggml_backend_vk_sparse_attn_unsupported_reason(ggml_backend_
     return why ? why : "plan shape not supported on this Vulkan device";
 }
 
-// the dst descriptor of a sparse node, and its workspace right after it (P2-19)
+// the workspace of a sparse node, right after its dst at the descriptor offset alignment
 static vk_subbuffer ggml_vk_sa_ws_subbuffer(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, const vk_subbuffer & dst_buf, const size_t offset, const size_t bytes) {
     const size_t off = ggml_vk_sa_round_up(ctx->device, ggml_nbytes(dst)) + offset;
     GGML_ASSERT(dst_buf.offset + off + bytes <= dst_buf.buffer->size);
@@ -11247,7 +11210,7 @@ static void ggml_vk_sparse_attn_plan(ggml_backend_vk_context * ctx, vk_context &
     const uint32_t n_disp = CEIL_DIV((uint32_t) n_q, q_per);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1 + n_disp);
 
-    // O17: the scratch is invisible to the barrier tracker of ggml_vk_build_graph
+    // the scratch is invisible to the barrier tracker of ggml_vk_build_graph
     ggml_vk_sync_buffers(ctx, subctx);
 
     const vk_subbuffer sel_buf = ggml_vk_tensor_subbuffer(ctx, sel, true);
@@ -11315,7 +11278,7 @@ static void ggml_vk_sparse_attn(ggml_backend_vk_context * ctx, vk_context & subc
         ggml_pipeline_request_descriptor_sets(ctx, fwht_o, 1);
     }
 
-    // O17: the workspace is invisible to the barrier tracker of ggml_vk_build_graph
+    // the workspace is invisible to the barrier tracker of ggml_vk_build_graph
     ggml_vk_sync_buffers(ctx, subctx);
 
     const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q, true);
@@ -11326,7 +11289,7 @@ static void ggml_vk_sparse_attn(ggml_backend_vk_context * ctx, vk_context & subc
 
     const uint32_t unit_k = ggml_vk_sa_unit_bytes(s.tier, k->type), unit_v = ggml_vk_sa_unit_bytes(s.tier, v->type);
     const uint32_t mis_k = get_misalign_bytes(ctx, k), mis_v = get_misalign_bytes(ctx, v);
-    // PLAN-v3 §2.2: compute aborts only on a misaligned base; the f16 / f32 loaders index 16-byte pieces, the bf16 one 8-byte ones
+    // the f16 / f32 loaders index 16-byte pieces, the bf16 one 8-byte ones
     GGML_ASSERT(mis_k % unit_k == 0 && mis_v % unit_v == 0);
     GGML_ASSERT(s.tier == VK_SA_TIER_PORTABLE || (k->type != GGML_TYPE_BF16 || mis_k % 8 == 0));
     GGML_ASSERT(s.tier == VK_SA_TIER_PORTABLE || (v->type != GGML_TYPE_BF16 || mis_v % 8 == 0));
@@ -21852,10 +21815,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
-        // TOPK_QSA: the fused radix top-k reads the score copy, the cell blocks and the f16 mask while it writes the picks, so
-        // the chain's sources stay allocated through the TOP_K. Without that ggml-alloc may put the TOP_K output on the score
-        // copy or the mask cast once the ADD has run (an intermediate TOP_K, as build_qsa_top_k emits it), and the overlap
-        // check below disables the fusion (test-backend-ops census TOPK_QSA ...,strip=te at n_tps 1)
+        // TOPK_QSA: the fused top-k reads the chain's sources while it writes the picks, so they stay allocated through the
+        // TOP_K; otherwise ggml-alloc may alias the TOP_K output onto them and the overlap check disables the fusion
         if (match_pattern(topk_qsa_pattern, first_unused)) {
             if (params && params->add_alloc_dep) {
                 add_pattern_alloc_deps(topk_qsa_pattern, first_unused + (int) topk_qsa_pattern.size() - 1);
@@ -23615,7 +23576,7 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     if (strcmp(name, "ggml_backend_debug_vk_sa_binding_limit") == 0) {
         return (void *) ggml_backend_vk_sa_binding_limit;
     }
-    // the sparse-attention policies (PLAN-v3 §5; ggml-backend.h)
+    // the sparse-attention policies (ggml-backend.h)
     if (strcmp(name, "ggml_backend_sparse_attn_group") == 0) {
         return (void *) (ggml_backend_sparse_attn_group_t) ggml_backend_vk_sparse_attn_group;
     }

@@ -1,28 +1,14 @@
-// Vulkan checks of GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN that test-backend-ops cannot express (PLAN-v3 §13 W6):
-//
-//   limits      per tensor, round_up(nbytes) + workspace < the buffer type's maximum and each binding <= the device's binding
-//               limit, at the reserve of -c 1048576 (n_kv 2^20), ub 512 / 4096 / 8192, 12 x 2051 keys;
-//   capability  supports_op is false, before any dispatch, when the pipeline does not exist (GGML_VK_SA_FORCE=no_<tier>), and the tier order
-//               follows what is left; a forced tier the device cannot create is unsupported, not a null-pipeline dispatch;
-//   rot         H_q in every kernel (the rot_dump hook) and H_o bitwise equal to fwht.comp (a GGML_HINT_SRC0_IS_HADAMARD mul_mat on
-//               the same backend) on the same input, rot 64 / 128 / 256, for every tier the device has;
-//   stress      gallocr places the workspace of a sparse node over a freed tensor that the preceding dispatch still reads, and only
-//               the workspace overlaps it (dst does not, so the barrier tracker sees nothing; the sync rule is all that orders them).
-//               The test asserts that layout from tensor->data and get_alloc_size and FAILS when it does not hold; then the outputs
-//               must be memcmp-stable over 20 iterations and bitwise equal to the same graph with the tensor kept alive.
-//   dense       ggml_backend_sparse_attn_prefer_dense picks the dense FLASH_ATTN_EXT only where the device's FLASH_ATTN_EXT
-//               takes the pair and only on the cm tier (its table was measured there): on a portable or scalar device, and
-//               on one without subgroup vote / shuffle, the QSA shortcut stays on the sparse op, which that tier runs.
-//   reason      ggml_backend_sparse_attn_unsupported_reason names the cause: "type pair not supported" only for a K / V type
-//               outside the set (the init error then lists other types), the binding limit for a view past the device's
-//               binding range, and a shape reason for GQA / head size (both then get the CPU / --no-kv-offload remedy).
-//   vpack       under GGML_VK_SA_FORCE=vpack (cm tier) the attend's alloc size at the reserve's n_kv holds every smaller n_kv of
-//               the same n_q: a pack happens at n_kv4 < 64 n_q, so a smaller runtime n_kv can pack where the reserve did not.
-//   race        while a second backend of the same device compiles sparse-attention pipelines on demand (each compile walks
-//               ggml_vk_load_shaders again), supports_op and get_alloc_size of a fixed node, read on another thread, keep the
-//               values they had before: the tier gates never vanish during a walk. A ThreadSanitizer build also reports the
-//               unsynchronized gate access itself, whatever the values.
-//
+// Vulkan checks of GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN that test-backend-ops cannot express:
+//   limits      every tensor and binding fits the buffer type and device limits at n_kv 2^20, ub up to 8192;
+//   capability  supports_op is false when the tier's pipeline does not exist (GGML_VK_SA_FORCE=no_<tier>), before any dispatch;
+//   rot         H_q (rot_dump hook) and H_o bitwise equal to fwht.comp, rot 64 / 128 / 256, on every tier the device has;
+//   stress      the workspace sits past nbytes(dst), so the barrier tracker cannot see it: a workspace placed over a tensor the
+//               previous dispatch still reads must be ordered by the sync rule (the layout is asserted, outputs memcmp-stable);
+//   dense       prefer_dense picks FLASH_ATTN_EXT only on the cm tier, where the device's FLASH_ATTN_EXT takes the pair;
+//   reason      ggml_backend_sparse_attn_unsupported_reason names the cause: type pair, binding limit, or shape;
+//   vpack       under GGML_VK_SA_FORCE=vpack the attend's alloc size at the reserve's n_kv covers every smaller n_kv, which
+//               may pack where the reserve did not;
+//   race        supports_op and get_alloc_size stay stable on another thread while a second backend compiles pipelines.
 // Without a Vulkan backend it exits 0 ("skipped"). usage: test-sparse-attn-vk [limits|capability|rot|stress|dense|reason|vpack|race ...]
 
 #include "ggml.h"
@@ -367,10 +353,9 @@ static void test_rot() {
 
 // ---- stress -----------------------------------------------------------------------------------------------------------
 
-// Node order: [plan] S F T S2(S) F2(F) F3(F2) R(T) <node under test> ... so that (best fit, ggml-alloc.c): S is a small block that
-//   attracts the small outputs; S, F and T are neighbours, freed by S2, F2 and R; F3 reads F2, so the tracker places a barrier there and the
-//   reads of S and F are forgotten; R reads T right before the node. The node's dst lands on what is left of S and F, and ends before T: its
-//   workspace lies inside T and no range the tracker knows overlaps dst. F holds dst's bytes (rounded up) so that this is possible.
+// Node order: [plan] S F T S2(S) F2(F) F3(F2) R(T) <node under test>. With best-fit allocation, the node's dst lands on the
+// freed S and F and ends before T, so its workspace lies inside T, which R reads right before the node; F3 is a barrier that
+// makes the tracker forget the reads of S and F. F holds dst's bytes (rounded up) so that this is possible.
 struct stress_out { std::vector<uint8_t> attend, r; bool layout = false; };
 
 static stress_out stress_run(const sa_shape & s, const bool under_test_is_plan, const bool keep_t, const int iters, int & n_unstable) {
@@ -423,8 +408,7 @@ static stress_out stress_run(const sa_shape & s, const bool under_test_is_plan, 
     const bool same = node->buffer == T->buffer;
     const bool ws_overlaps = same && nd + f_bytes < td + ggml_nbytes(T) && td < nd + node_alloc;
     const bool dst_clear = !same || nd + node_bytes <= td || td + ggml_nbytes(T) <= nd;
-    // nothing the barrier tracker still holds overlaps dst: R reads T (dst is clear of it) and writes R; F3 is the barrier before it. So the
-    // tracker asks for no barrier between R and the node, and only the sync rule orders the node's workspace after R's read of T.
+    // nothing the tracker holds overlaps dst: only the sync rule orders the workspace after R's read of T
     const auto clear_of = [&](const ggml_tensor * x) {
         const uint8_t * xd = (const uint8_t *) x->data;
         return node->buffer != x->buffer || nd + node_bytes <= xd || xd + ggml_nbytes(x) <= nd;

@@ -1,9 +1,5 @@
-// CPU forwards of GGML_OP_SPARSE_ATTN_PLAN and GGML_OP_SPARSE_ATTN (the reference of every backend, ggml.h).
-//
-// This translation unit is compiled with -ffp-contract=off (ggml-cpu/CMakeLists.txt): the attend implements the
-// numeric contract of ggml_sparse_attn operation by operation, and a fused multiply-add of `s += q * k` or
-// `acc += p * v` would round differently. Vectorisation is allowed: every vector lane performs the same scalar
-// operation in the same order (the score loop runs the r query heads of a kv head in the lanes, "vertical" SIMD).
+// CPU forwards of GGML_OP_SPARSE_ATTN_PLAN and GGML_OP_SPARSE_ATTN, the reference of every backend.
+// Compiled with -ffp-contract=off: a fused multiply-add would round differently from the ggml.h contract.
 
 #include "ops.h"
 
@@ -15,10 +11,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-
-// ---------------------------------------------------------------------------------------------------------------------
-// plan
-// ---------------------------------------------------------------------------------------------------------------------
 
 static const int32_t SA_ROW_END = INT32_MAX;   // end marker of a sorted row in the scratch (cells are < 2^24)
 
@@ -181,17 +173,11 @@ void ggml_compute_forward_sparse_attn_plan(const struct ggml_compute_params * pa
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-// attend
-// ---------------------------------------------------------------------------------------------------------------------
-
 static inline float sa_round_f16(float x) {
     return GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(x));
 }
 
-// orthonormal Sylvester-Hadamard over consecutive blocks of n values, in the operation order of ggml-cpu's
-// GGML_HINT_SRC0_IS_HADAMARD mul_mat (ggml_compute_forward_fwht: scale by 1/sqrt(n) first, then the butterflies
-// from len 1 up; its SIMD passes compute u - v as fma(v, -1, u), which is exact, so the values are identical)
+// orthonormal Sylvester-Hadamard over blocks of n values, in the operation order of ggml_compute_forward_fwht
 static void sa_fwht(float * x, int64_t D, int32_t n) {
     if (n <= 0) {
         return;
@@ -284,7 +270,6 @@ static sa_scores_t sa_scores_for(int r) {
 }
 
 static size_t sa_attend_thread_bytes(int64_t D, int64_t r) {
-    // qT [D][r], acc [r][D], tmp, krow, vrow [D], s, m, l [r]
     return GGML_PAD((size_t) (2 * D * r + 3 * D + 3 * r) * sizeof(float), CACHE_LINE_SIZE);
 }
 
@@ -295,7 +280,7 @@ size_t ggml_cpu_sparse_attn_work_size(const struct ggml_tensor * node, int n_tas
 }
 
 void ggml_compute_forward_sparse_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    // the invariants of ggml_sparse_attn: a node an RPC server deserialized was never built by it
+    // an RPC server's node was never built by ggml_sparse_attn
     GGML_ASSERT(ggml_sparse_attn_shape_why(dst) == nullptr);
 
     const ggml_tensor * q    = dst->src[0];
@@ -398,7 +383,7 @@ void ggml_compute_forward_sparse_attn(const struct ggml_compute_params * params,
                 // 4. f32 scores, sequential over d
                 scores(qT, krow, D, r, sc);
 
-                // online softmax per cell; P rounded to f16 for PV against the running max, l sums the f32 p
+                // online softmax: P rounded to f16 for PV, l sums the f32 p
                 for (int hr = 0; hr < r; ++hr) {
                     float * a = acc + hr * D;
                     if (sc[hr] > mx[hr]) {
@@ -409,8 +394,7 @@ void ggml_compute_forward_sparse_attn(const struct ggml_compute_params * params,
                         l[hr] *= alpha;
                         mx[hr] = sc[hr];
                     }
-                    // a -inf score has weight 0 wherever the cell lies (ggml.h item 3): at the first cell mx is still -inf and
-                    // expf(-inf - -inf) would be NaN, which made the row 0 only when such a cell came first
+                    // a -inf score has weight 0 (ggml.h item 3), also while mx is still -inf
                     const float p  = sc[hr] == -INFINITY ? 0.0f : expf(sc[hr] - mx[hr]);
                     const float ph = sa_round_f16(p);
                     l[hr] += p;

@@ -1,13 +1,10 @@
-// Standalone checks of GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN and of the QSA graph pieces built from ggml ops, one
-// section per ctest (tests/CMakeLists.txt registers each section under its own test name):
-//
-//   neginf-v      ggml.h item 3: a -inf cell's non-finite V element, the CPU op against O_CON and every GPU device
+// Checks of GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN and of the QSA graph pieces, one section per ctest:
+//   neginf-v      a -inf cell's non-finite V element, the CPU op against the host reference and every GPU device
 //   shape-guard   supports_op rejects nodes that break ggml_sparse_attn's shape invariants (an RPC server's nodes)
 //   rpc-view      the SPARSE_ATTN alloc size of the node an RPC server rebuilds equals the linked node's
 //   gate-scratch  the output placement of the HIP gated SPARSE_ATTN fusion (host only)
 //   prefer-dense  every dense pick of the QSA shortcut policy is a FLASH_ATTN_EXT the device takes
 //   allvis-rows   the all-visible rows of the QSA shortcut against the KQ mask, on every backend
-//
 // usage: test-sparse-attn-checks [section [args...]]   (no section: every section, without arguments)
 
 #include "ggml.h"
@@ -46,25 +43,13 @@ static std::vector<ggml_backend_dev_t> sa_devices() {
 }
 
 // ---- neginf-v --------------------------------------------------------------------------------------------------------
-// ggml.h item 3 of the ggml_sparse_attn contract, for a cell whose score is -inf and whose V row is not finite. Such a cell
-// has p = 0, adds nothing to l, and enters PV as 0 * v like every attended cell: 0 * inf and 0 * NaN are NaN, so that
-// dimension of the row is NaN, while every other dimension is the softmax over the row's other cells. Only a masked cell
-// (item 4) contributes nothing whatever its bytes. The CPU op (the reference of every backend), O_CON
-// (tests/sparse-attn-ref.h) and, by code reading, the GPU tiers (HIP G4 WMMA + fixup, G1 WMMA, portable; Vulkan cm, scalar,
-// portable) all compute 0 * v there; the WMMA tiers cannot skip a cell per row inside a shared PV product. The text before
-// this test said "the row is the softmax over the other cells" for every such cell, which no backend did for a non-finite V.
-//
-// One CPU graph (plan + attend, f16 K / V, D 256, 2 KV heads x 4, 3 queries, 40 selected cells of 64). In KV head 0 cell 7
-// has K element 0 = -inf (f16) and every query's element 0 > 0, so it scores -inf for every head of that KV head; its V row
-// holds +inf at dim 5, NaN at dim 9 and -inf at dim 200. Query 2 selects cell 7 alone (with another -inf cell, 11), so its
-// rows have l = 0. Checks, KV head 0:
-//   queries 0, 1: dims 5, 9, 200 NaN; every other dim bit-equal to O_CON over the selection without cell 7;
-//   query 2: every dim 0 (item 5, l = 0);
-// KV head 1 (cell 7 finite there): bit-equal to O_CON. The CPU op equals O_CON everywhere, NaN-aware.
-// Every GPU device of the build then runs the same graph: its NaN dims must be the CPU op's, and its other dims within
-// 1e-3 of the largest |CPU| value (the GPU tiers are not bitwise; their bitwise checks are test-backend-ops SPARSE_ATTN).
-// usage: test-sparse-attn-checks neginf-v [--old-text]: --old-text checks the statement this test replaced (every dim the softmax
-// over the other cells) and must FAIL; without it the current statement is checked. Exit status 0 = the checks held.
+// A selected cell whose score is -inf has p = 0 but still enters PV as 0 * v (the WMMA tiers cannot skip a cell per row):
+// a non-finite V element makes that dimension NaN, every other dimension is the softmax over the other cells. Only a
+// masked cell contributes nothing whatever its bytes. Cell 7 of KV head 0 scores -inf with V = +inf, NaN, -inf in dims
+// 5, 9, 200; query 2 selects only -inf cells (l = 0: every dim 0). The CPU op must equal O_CON bitwise; every
+// GPU device must match the CPU's NaN dims, and its other dims within 1e-3 of the largest |CPU| value.
+// usage: test-sparse-attn-checks neginf-v [--old-text]: --old-text checks "every dim is the softmax over the other cells"
+// instead, and must FAIL. Exit status 0 = the checks held.
 
 namespace neginf_v {
 
@@ -227,13 +212,9 @@ static int run(int argc, char ** argv) {
 } // namespace neginf_v
 
 // ---- shape-guard -----------------------------------------------------------------------------------------------------
-// supports_op of GGML_OP_SPARSE_ATTN / GGML_OP_SPARSE_ATTN_PLAN on nodes that ggml_sparse_attn(_plan) never built: an RPC
-// server rebuilds each node from the wire (deserialize_tensor checks only that a tensor lies inside its buffer, not that
-// the shapes of a node and its srcs agree), so a node whose plan n_kv exceeds its K / V views, whose V has fewer heads
-// than K, whose streams or n_q disagree, or whose plan size does not match its op_params reached the kernels, which read
-// K / V rows up to 4*ceil(n_kv/4) - 1 and heads up to k->ne[2] - 1 past the tensors. Every device of the build that takes
-// the well-formed node must reject each malformed one (ggml_sparse_attn_shape_why / ggml_sparse_attn_plan_shape_why).
-// Shapes only (no_alloc, no compute): runs on the CPU, and on HIP / Vulkan where the build has them.
+// An RPC server rebuilds nodes from the wire without checking that a node's shapes agree with its srcs, so supports_op must
+// reject a node ggml_sparse_attn(_plan) would never build, or the kernels read past K / V. Every device that takes the
+// well-formed node must reject each malformed one. Shapes only (no_alloc, no compute).
 
 namespace shape_guard {
 
@@ -386,13 +367,9 @@ static int run(int, char **) {
 } // namespace shape_guard
 
 // ---- rpc-view --------------------------------------------------------------------------------------------------------
-// The alloc size of GGML_OP_SPARSE_ATTN as an RPC server computes it (ggml-rpc.cpp rpc_server::get_alloc_size): the server
-// deserializes the node and its direct srcs only, so the plan (src[3]) arrives with its op, op_params and shape but with
-// src[0] == NULL. The workspace past ggml_nbytes(dst) must not depend on that missing source of a source: for every device of
-// the build (CPU, Vulkan, HIP) and every shape the device takes, the size of the server's view must equal the size of the
-// fully linked node. Before the fix the Vulkan select dereferenced the NULL selection (a server crash on the first query) and
-// the HIP select returned "malformed node", so its alloc size fell back to ggml_nbytes(dst) and the client reserved no
-// workspace (a kernel write past the allocation). Without such a device the CPU rows pass trivially.
+// An RPC server deserializes a node and its direct srcs only, so the plan (src[3]) arrives with src[0] == NULL. The
+// SPARSE_ATTN alloc size must not depend on that missing source: on every device, for every shape it takes, the server's
+// view must get the size of the fully linked node. Without a GPU device the CPU rows pass trivially.
 
 namespace rpc_view {
 
@@ -463,13 +440,10 @@ static int run(int, char **) {
 } // namespace rpc_view
 
 // ---- gate-scratch ----------------------------------------------------------------------------------------------------
-// The output placement of the HIP gated SPARSE_ATTN fusion (ggml/src/ggml-cuda/sparse-attn-gate-scratch.h), on synthetic
-// layouts of one compute buffer. PLAN-v3 D12: no sparse kernel uses ctx.pool(); every workspace is in the reserved compute
-// buffer, so the reserve and the fit probe see it. When gallocr puts the MUL output (or its 16-bit copy)
-// over a tensor the kernel reads (Q is dead after the attend and has the MUL's size: the common case), the output must go to
-// graph memory the fusion leaves unwritten (the attend's own dst, the CONT and SIGMOID outputs), or the fusion is refused;
-// never to pool scratch. For every layout: no output in the pool; a scratch lies inside one candidate, overlaps no read, no
-// final output and no other scratch; the fusion is refused only when no candidate fits. CPU only.
+// The output placement of the HIP gated SPARSE_ATTN fusion (sparse-attn-gate-scratch.h) on synthetic layouts of one
+// compute buffer. No sparse kernel uses ctx.pool(), so the reserve sees every workspace: when an output lands on a tensor
+// the kernel reads, it goes to graph memory the fusion leaves unwritten (dst, the CONT and SIGMOID outputs), or the fusion
+// is refused. A scratch lies inside one candidate and overlaps no read, final output or other scratch. CPU only.
 
 namespace gate_scratch {
 
@@ -489,7 +463,7 @@ static int run(int, char **) {
     // tensor slots of n32 bytes: slot(i) = i * n32
     auto slot = [&](size_t i) { return i * n32; };
     const std::vector<layout> layouts = {
-        // Prove's case: the MUL over Q (dead after the attend); no 16-bit copy
+        // the MUL over Q (dead after the attend); no 16-bit copy
         { "mul over q",                slot(0), slot(1), slot(2), slot(3), slot(4), slot(5) + n32, slot(5), slot(7), slot(8), (long) slot(0), -1, true },
         // the MUL over Q and the 16-bit copy over the gate
         { "mul over q, d16 over gate", slot(0), slot(1), slot(2), slot(3), slot(4), slot(5) + n32, slot(5), slot(7), slot(8), (long) slot(0), (long) slot(4), true },
@@ -556,14 +530,8 @@ static int run(int, char **) {
 } // namespace gate_scratch
 
 // ---- prefer-dense ----------------------------------------------------------------------------------------------------
-// The QSA shortcut's dense pick (ggml_backend_sparse_attn_prefer_dense, ggml-backend.h) must be an op the device runs: qwen4exp
-// builds the dense FLASH_ATTN_EXT for the n_kv <= top_k + r - 1 shortcut whenever the policy returns true, and the QSA guard
-// fails the context ("no dense attention kernel for this pair on this device") when the device's FLASH_ATTN_EXT does not take
-// the pair. HIP's table ignored its device: a build with -DGGML_CUDA_FA=OFF (no FLASH_ATTN_EXT at all) picked dense for f16 /
-// f16 in every n_q band and for most quantized pairs at n_q <= 127, so every first decode step failed there.
-//
-// For every device whose backend exposes the policy (HIP, Vulkan): every (K, V, n_q band) cell the policy calls dense must be a
-// FLASH_ATTN_EXT of the shortcut's shape (D 256, 24 heads, 2 KV heads, causal f16 mask) that the device's supports_op takes.
+// Every (K, V, n_q band) for which ggml_backend_sparse_attn_prefer_dense picks dense must be a FLASH_ATTN_EXT of the
+// shortcut's shape that the device takes (e.g. not on a -DGGML_CUDA_FA=OFF build), or the QSA guard fails the context.
 // A backend without the policy is skipped. Exit status 0 = every dense pick is runnable.
 
 namespace prefer_dense {
@@ -622,9 +590,8 @@ static int run(int, char **) {
 } // namespace prefer_dense
 
 // ---- allvis-rows -----------------------------------------------------------------------------------------------------
-// All-visible rows of the QSA dense-shortcut range (PLAN-v3 §4.1, §14.1; the R1-AV lab test test_allvis_rows.cpp): rows built
-// from the KQ mask with the ops of llama_model_qwen4exp::graph::build_qsa_rows_av must equal {j : mask = 0} per (query row,
-// stream), with the 4-D shape [n_kv, n_tps, 1, n_stream] the plan asserts, on each backend of the build.
+// Rows built from the KQ mask with the ops of build_qsa_rows_av must equal {j : mask = 0} per (query row, stream), with the
+// 4-D shape [n_kv, n_tps, 1, n_stream] the plan asserts, on each backend.
 // usage: test-sparse-attn-checks allvis-rows [mask.bin n_kv n_q]...   (recorded f16 masks; the synthetic split-stream cases always run)
 
 namespace allvis_rows {

@@ -563,13 +563,12 @@ static bool env_opt_in(const char * name) {
     return e != nullptr && atoi(e) != 0;
 }
 
-// --fail-unsupported: for the selected ops, a "not supported" result that is not on the backend's expected-unsupported
-// list (test_case::expected_unsupported), a missing census proc and a missing engagement opt-in are FAILs
+// --fail-unsupported: an unexpected "not supported" (test_case::expected_unsupported) or a missing census proc FAILs
 static bool g_fail_unsupported = false;
 
 // engagement asserts are opt-in (require_env) and need the census hooks; a fusion the backend says it cannot emit on
-// this device (census skip hook: GGML_VK_DISABLE_FUSION, a missing pipeline) is not asserted. Under --fail-unsupported
-// the opt-in is implied and a backend without the census hooks is asserted anyway (its counts read -1, so the check fails).
+// this device (census skip hook: GGML_VK_DISABLE_FUSION, a missing pipeline) is not asserted. --fail-unsupported implies
+// the opt-in and asserts even without census hooks (counts read -1: the check fails).
 static bool engagement_required(ggml_backend_t backend, const char * require_env, const char * fusion = nullptr) {
     if (g_fail_unsupported && census_proc(backend, "ggml_backend_debug_dispatch_census_count") == nullptr) {
         return true;
@@ -1376,31 +1375,25 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
-    // a whole-graph comparison (run_whole_graph) calls the callback only for the verified nodes (fusion_test_nodes, else
-    // out), and the sentinel check sits in that callback (op NONE): true also verifies every sentinel, so a write past a
-    // tensor's allocation (dst plus the backend's get_alloc_size workspace) fails the case. Opt-in: other whole-graph
-    // cases keep the old set
+    // run_whole_graph compares only the verified nodes; true adds the sentinels, so a write past a tensor's allocation
+    // (dst plus its get_alloc_size workspace) fails the case
     virtual bool whole_graph_checks_sentinels() { return false; }
     // engagement: when checks_engagement() is true the census of backend1 is reset right before the compare, and
     // verify_engagement FAILS the case right after it when a fused dispatch or path count is wrong
     virtual bool checks_engagement() { return false; }
     virtual bool verify_engagement(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
 
-    // determinism: eval mode computes backend1 this many times in total and memcmps the compared outputs of every run
-    // with the first; a difference FAILS the case
+    // determinism: backend1 computes this many times; every run must be memcmp-equal to the first
     virtual int n_determinism_runs() { return 1; }
-    // a host reference check of backend1's result, run after the compare (FAILS the case when it returns false)
+    // a host reference check of backend1's result after the compare; false FAILS the case
     virtual bool verify_reference(ggml_backend_t backend, std::string & msg) { GGML_UNUSED(backend); GGML_UNUSED(msg); return true; }
-    // --fail-unsupported: true when this backend is expected not to support the case (the per-backend list)
+    // --fail-unsupported: true when this backend is expected not to support the case
     virtual bool expected_unsupported(ggml_backend_t backend) { GGML_UNUSED(backend); return false; }
-    // the weight-context tensors end at the end of their buffer (no post-graph sentinel after them). A buffer type may pad
-    // a tensor's allocation past ggml_nbytes (HIP: a quantized tensor's rows to MATRIX_ROW_PADDING, TAG_ALLOC_SIZE_EXPAND),
-    // so the bytes between the last tensor and the buffer's end are filled with 0xFF (NaN as the scale or element of every
-    // K / V type: a read that reaches the arithmetic makes the output NaN) and must be unchanged after the compute
+    // the weight tensors end at their buffer's end (no sentinel after them); the buffer's padding past the last tensor is
+    // filled with 0xFF (NaN as any K / V scale or element) and must be unchanged after the compute
     virtual bool weights_end_at_buffer_end() { return false; }
-    // suite-level dispatch census (PLAN-v3 §14.1): the key families ("sa_attend/", ...) of the backend census that this
-    // case dispatches. After every such case the driver adds the case's census counts to a suite total, and at the end
-    // of the run every compiled key of those families (ggml_backend_debug_dispatch_census_list) must have been launched
+    // census key families ("sa_attend/", ...) this case dispatches: at the end of the run every compiled key of these
+    // families must have been launched by some case
     virtual std::vector<std::string> census_families() { return {}; }
 
     // nodes the scheduler runs on the second backend: backend1 then computes in several splits, as llama does
@@ -1432,8 +1425,7 @@ struct test_case {
         }
     }
 
-    // weights_end_at_buffer_end: the bytes of buf past the last tensor of ctx_weights, as an I8 tensor of ctx_tail filled
-    // with 0xFF; nullptr when the last tensor ends at the buffer's end
+    // the bytes of buf past the last weight tensor as a 0xFF-filled I8 tensor; nullptr when there are none
     static ggml_tensor * poison_weights_tail(ggml_context * ctx_weights, ggml_backend_buffer_t buf, ggml_context_ptr & ctx_tail) {
         char * end = nullptr;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx_weights); t; t = ggml_get_next_tensor(ctx_weights, t)) {
@@ -1678,8 +1670,7 @@ struct test_case {
                     printf("sentinel mismatch: %s ", t1->name);
                     ud->ok = false;
                 }
-                // byte equality is the whole check: a case's err() measures its outputs (test_sparse_attn's overflow
-                // measure reads an out-shaped array), not a sentinel
+                // byte equality is the whole check: a case's err() may assume an out-shaped array
                 return true;
             }
 
@@ -1774,7 +1765,6 @@ struct test_case {
             }
         }
         if (test_passed && n_determinism_runs() > 1 && second_backend_nodes().empty()) {
-            // the outputs of the first run, then recompute backend1's graph and memcmp
             std::vector<ggml_tensor *> det_nodes = fused_nodes_to_verify;
             if (det_nodes.empty()) {
                 det_nodes.push_back(out);
@@ -10407,11 +10397,9 @@ struct test_topk_qsa : public test_case {
     }
 };
 
-// The non-compact strip of build_qsa_top_k as qwen4exp builds it: the production ops of src/models/qwen4exp-te.h
-// (qwen4exp_te_expand + qwen4exp_te_select) on an f16 KQ mask, the rows with -1 at the hidden cells. The Vulkan backend
-// must fuse the expanded chain into TOPK_QSA as it does test_topk_qsa (the base's single-use pattern): a second consumer
-// of expanded (the visibility gather) kept the fusion from ever firing on this route. Mask: a distinct ramp with every
-// seventh cell -inf, so the picks have no ties and some picked cells are hidden.
+// The non-compact qwen4exp strip (qwen4exp_te_expand + qwen4exp_te_select of qwen4exp-te.h) on an f16 KQ mask: Vulkan
+// must fuse it into TOPK_QSA although expanded has a second consumer. Mask: a ramp with every 7th cell -inf (no ties,
+// some picked cells hidden).
 struct test_qsa_te_strip : public test_case {
     const int64_t n_blocks;
     const int64_t n_kv;
@@ -10443,7 +10431,6 @@ struct test_qsa_te_strip : public test_case {
         ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
         ggml_set_name(kq_mask, "kq_mask");
 
-        // build_qsa_top_k, non-compact with blk_bias: the f16 mask cast for the add, the mask itself for the visibility
         ggml_tensor * add = ggml_reshape_3d(ctx, ggml_cast(ctx, kq_mask, GGML_TYPE_F32), n_kv, n_tps, n_stream);
         ggml_tensor * expanded = qwen4exp_te_expand(ctx, score, cell_blk, add);
         const qwen4exp_te_sel sel = qwen4exp_te_select(ctx, expanded, kq_mask, width);
@@ -10477,7 +10464,7 @@ struct test_qsa_te_strip : public test_case {
         }
     }
 
-    // the order inside a row is unspecified; compare each row of width entries as a sorted list (-1 entries included)
+    // the order inside a row is unspecified: compare sorted rows
     double err(const float * a, const float * b, size_t n) override {
         double diff = 0.0;
         for (size_t r0 = 0; r0 + width <= n; r0 += width) {
@@ -13821,18 +13808,10 @@ struct test_topk_moe_lifetime : public test_topk_moe {
     }
 };
 
-// ---------------------------------------------------------------------------------------------------------------------
 // GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN
-//
-// test_sparse_attn_plan: the whole plan dst is compared byte for byte (err() = memcmp, max error 0) with the CPU, and
-//   verify_reference() compares it with the C3 oracle (sparse-attn-ref.h) on every backend: the plan is integer and
-//   its bytes are part of the op contract.
-// test_sparse_attn: the attend output (fusion_test_nodes = {attend}: the plan node is not NMSE-compared). On the CPU
-//   backend the error bound is 0 and verify_reference() compares it bit for bit with the O_CON host reference
-//   (sparse-attn-ref.h); on other backends the band is the NMSE row of the class the dispatch census reports
-//   (sa_band_for_backend, PLAN-v3 §14.2).
-// Both run twice on backend1 (n_determinism_runs) and must be memcmp-equal.
-// ---------------------------------------------------------------------------------------------------------------------
+// plan: byte-exact against the CPU and the host reference of sparse-attn-ref.h (its bytes are part of the op contract).
+// attend: on the CPU bit-exact against the host reference; elsewhere within the NMSE band of the dispatched kernel
+// class (sa_band_for_backend). Both must be deterministic across two runs.
 
 enum sa_rows_pattern {
     SA_ROWS_ASC,     // distinct valid cells, ascending, -1 after them
@@ -13843,8 +13822,8 @@ enum sa_rows_pattern {
     SA_ROWS_ALLNEG,  // every entry -1
     SA_ROWS_MIX,     // queries of a group draw most cells from a shared pool; permuted, duplicates, -1 and out-of-range values
     SA_ROWS_BLOCKS,  // complete quads (4 consecutive cells, quad-aligned) at random quads, ascending; -1 after them
-    SA_ROWS_PR,      // the maskless cell formula of #219's QSA_PREFILL_MASKLESS test (b60447506, test-backend-ops.cpp:11545-11574; blocks = 0)
-    SA_ROWS_PRBLK,   // the complete-block rows of the same test (blocks > 0: scattered by 7919)
+    SA_ROWS_PR,      // a fixed cell formula with -1 at the ends
+    SA_ROWS_PRBLK,   // complete blocks scattered by 7919
     SA_ROWS_ALLVIS,  // every cell 0..n_kv-1 in a random order (n_kv <= n_sel), -1 after them (the dense-shortcut rows)
     SA_ROWS_EMPTY,   // SA_ROWS_MIX, every third query row all -1
     SA_ROWS_POISON,  // cells 4*quad + c with c in {0, 1, 2} minus (query % 3) of shared quads; cell 4*quad + 3 is never selected
@@ -13878,7 +13857,6 @@ static std::vector<int32_t> sa_make_rows(int pattern, int64_t n_sel, int64_t n_q
     std::vector<int32_t> rows((size_t) (n_sel * n_q * n_stream), -1);
     std::mt19937 rng(seed * 2654435761u + (uint32_t) (n_sel * 31 + n_q * 7 + n_kv * 3 + n_stream + pattern * 101));
     auto uni = [&](int64_t n) { return (int64_t) (rng() % (uint64_t) n); };
-    // nv distinct cells of [0, n_kv), random
     auto distinct = [&](int64_t nv, std::vector<int32_t> & out) {
         out.clear();
         if (nv * 2 >= n_kv) {
@@ -13965,7 +13943,7 @@ static std::vector<int32_t> sa_make_rows(int pattern, int64_t n_sel, int64_t n_q
                             row[o++] = 4 * qd + c;
                         }
                     }
-                    // a partial last quad when there is room (the CB tail)
+                    // a partial last quad when there is room
                     for (int c = 0; o < n_sel && c < (int) (i % 4) && 4 * (n_quads - 1) + c < n_kv; ++c) {
                         row[o++] = (int32_t) (4 * (n_quads - 1) + c);
                     }
@@ -14024,7 +14002,7 @@ static std::vector<int32_t> sa_make_rows(int pattern, int64_t n_sel, int64_t n_q
     return rows;
 }
 
-// host copy of a tensor's bytes (any strides: ggml_nbytes from t->data, indexed with t->nb)
+// host copy of a tensor's bytes (any strides)
 static sa_ref::view sa_host_view(const ggml_tensor * t) {
     sa_ref::view v;
     v.type = t->type;
@@ -14050,7 +14028,6 @@ static std::vector<int32_t> sa_read_rows(const ggml_tensor * sel) {
     return rows;
 }
 
-// write rows into a (possibly strided) sel view through its storage tensor
 static void sa_write_rows(ggml_tensor * sel, const std::vector<int32_t> & rows) {
     ggml_tensor * storage = sel->view_src ? sel->view_src : sel;
     const size_t base = sel->view_src ? sel->view_offs : 0;
@@ -14089,8 +14066,7 @@ static void sa_init_sel(ggml_tensor * sel, const std::vector<int32_t> & rows) {
     sa_write_rows(sel, rows);
 }
 
-// --fail-unsupported expected-unsupported list (PLAN-v3 §6.3, §14.1): Vulkan has no G = 4 plan or attend, and no K/V
-// binding larger than the device allows: its 1 GiB buffer maximum, or a smaller maxStorageBufferRange (lavapipe: 128 MiB)
+// Vulkan has no G = 4 plan or attend, and no K/V binding past the device limit (1 GiB, or a smaller maxStorageBufferRange)
 static bool sa_expected_unsupported(ggml_backend_t backend, int group, size_t k_bytes, size_t v_bytes) {
     const bool vk = strncmp(ggml_backend_name(backend), "Vulkan", 6) == 0;
     if (vk && group == 4) {
@@ -14126,8 +14102,8 @@ struct test_sparse_attn_plan : public test_case {
         return sa_expected_unsupported(backend, group, 0, 0);
     }
     std::vector<std::string> census_families() override { return { "sa_plan/" }; }
-    // engagement (GPU backends): the compare ran exactly one "sa_plan/G<group>" dispatch and none of the other group
-    // (census keys of PLAN-v3 §6.2); required under --fail-unsupported or GGML_SA_TEST_REQUIRE_CENSUS=1
+    // GPU: exactly one "sa_plan/G<group>" dispatch and none of the other group (under --fail-unsupported or
+    // GGML_SA_TEST_REQUIRE_CENSUS=1)
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -14177,22 +14153,14 @@ struct test_sparse_attn_plan : public test_case {
     }
 };
 
-// NMSE bands of PLAN-v3 §14.2 (a), k = 2 (2 x p100 on PR-verbatim kernels), by the class the dispatch census reports:
-// (G, split count, n_sel bucket). Returns a negative value for a class without a row.
-// G4: 2 x p100 of the PR-verbatim qsa3_attn_kernel (V0 and VD, bitwise equal) against O_CON over the R2-BOP inputs
-// (PR cell formula rows: 2.04e-9 / 1.21e-9) and over the W3 case list's own inputs (2 x 40 dumps of the f16 / q8_0
-// GQA-12 cases from two test-backend-ops runs, run through R2-BOP's bands_attn TBO mode; W3 summary
-// scripts/qsa-validation/summaries/w3_prband.md): the mix / empty / poison rows of n_sel <= 257 reach p100 3.899e-9
-// (66 x 257 poison q8_0), the n_sel 2051 rows 1.206e-9 (129 x 2051 blocks q8_0). The PR rows alone set the old 1.21e-9,
-// which the PR kernel itself exceeds on the other row patterns (R2-BOP measured G4 on PR rows only).
-// G1 (census key sa_attend/G1/<KT>/<VT>/splits<class>/...: the class's first split count): the R2-BOP UNI rows of
-// PLAN-v3 §14.2 (a) (2 x p100 of the PR-verbatim decode WMMA partial + merge kernels of qsa-decode*.cu*, f16 and q8_0, 3 seeds),
-// which hold over the W4 case list's own inputs as well (88 G1 dumps through R2-BOP's bands_dec TBO mode: every class's
-// 2 x p100 below its UNI row); the classes 6-16 and > 33, which R2-BOP did not reach, measured in W4 with the same
-// harness: 6-16 = 2 x 7.90e-8 (UNI 32 x 2051 x 8192, 9 splits; 8 UNI shapes x 2 types x 3 seeds, max over the TBO dumps
-// 5.54e-8), > 33 = 2 x 8.44e-8 (TBO 1 x 4096 x 16384 f16, 64 splits; UNI max 7.77e-8 over 4 shapes x 2 types x 3 seeds).
-// Planted defects (R2-BOP d1 / d2 / d3) exceed 12.3 x p100 in both (W4 summary scripts/qsa-validation/summaries/
-// w4_bands.md).
+// NMSE band of a kernel class (G, split count, n_sel bucket); negative for a class without a row.
+// Each row is 2 x the p100 error that the original QSA kernels show against the CPU op on the cases of this file.
+// G4: one row per n_sel bucket (<= 257, > 257).
+// G1: one row per split class (1, 2-5, 6-16, 17-33, > 33), keyed by the first split count of the class.
+// n_sel <= 257 gives at most 5 splits, so the larger classes have no small-n_sel row.
+// The generic and portable tiers take the row of the reference kernel with the same G (see sa_band_for_backend).
+// A pair outside f16 / q8_0 also takes the type spread (sa_type_spread).
+// A planted defect exceeds 12 x p100 in every class, so the bands still catch real errors.
 static double sa_band_row(int G, int splits, int64_t n_sel) {
     const bool big = n_sel > 257;
     if (G == 4) {
@@ -14214,21 +14182,7 @@ static double sa_band_row(int G, int splits, int64_t n_sel) {
     return big ? 1.69e-7 : -1.0;
 }
 
-// the class of the attend dispatches the census counted since the reset: keys "sa_attend/G4/..." and
-// "sa_attend/G1/.../splits<n>" (PLAN-v3 §6.2), listed by the census proc ggml_backend_debug_dispatch_census_list
-// (a NULL-terminated array of every compiled key). Returns a negative band when the class cannot be determined.
-// The generic and portable tiers (W5) have no PR counterpart; their band follows the §14.2 (c) transfer rule "anchored on
-// O_CON vs f64 plus the nearest PR-verbatim class row x the type spread", never a row measured on the tier itself:
-//   sa_generic/G4/...              the G4 row (the same WMMA body and loader shapes as the PR's qsa3_attn_kernel; only the
-//                                  element conversion is a runtime switch)
-//   sa_generic/G1/.../splits<n>    the G1 row of that split class (the PR's decode WMMA partial body, qsa-decode-wmma.cuh)
-//   sa_portable/G<g>               the row of the PR kernel that computes the same plan G in one pass per query: G4 for a
-//                                  G = 4 plan, "G1, 1 split" for a G = 1 plan (the portable tier never splits)
-// The O_CON anchor: the CPU op is the reference of every case (bitwise equal to bands_ref.h O_CON, W1) and its contract
-// error against f64 is the W1 bound.
-// §14.2 (c) type spread: a K/V pair without its own row takes the row of its class times the measured spread (R1-A (1):
-// x1.12 at prefill (G4) and at decode n_q 512, x1.9 at decode n_q 1; the rows were measured on f16 and q8_0 pairs, which
-// differ by <= x1.06, R2-BOP)
+// rows are for f16 / q8_0 pairs; other K/V pairs widen the band by the measured type spread
 static double sa_type_spread(ggml_type tk, ggml_type tv, int G, int64_t n_q) {
     const bool measured = tk == tv && (tk == GGML_TYPE_F16 || tk == GGML_TYPE_Q8_0);
     if (measured) {
@@ -14237,6 +14191,8 @@ static double sa_type_spread(ggml_type tk, ggml_type tv, int G, int64_t n_q) {
     return G == 4 || n_q > 1 ? 1.12 : 1.9;
 }
 
+// the widest band of the attend classes the census counted since the reset (negative when a class is unknown); the
+// generic and portable tiers take the row of the reference kernel with the same G and split class
 static double sa_band_for_backend(ggml_backend_t backend, int64_t n_sel, std::string & cls) {
     cls.clear();
     typedef const char * const * (*census_list_t)(void);
@@ -14256,7 +14212,7 @@ static double sa_band_for_backend(ggml_backend_t backend, int64_t n_sel, std::st
         }
         int G = 0, splits = 1;
         if (key.rfind("sa_attend/vk/", 0) == 0) {
-            G = 1;   // Vulkan: the G1 row of the split class, sa_merge/vk/splits<n> (absent: one pass per query), PLAN-v3 §14.2 (c)
+            G = 1;   // Vulkan: the G1 row of the split class, sa_merge/vk/splits<n> (absent: one pass per query)
         } else if (key.rfind("sa_merge/vk/splits", 0) == 0) {
             G = 1;
             splits = atoi(key.c_str() + strlen("sa_merge/vk/splits"));
@@ -14328,8 +14284,7 @@ struct test_sparse_attn : public test_case {
     }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
-    // the attend's allocation is ggml_nbytes(dst) plus its workspace (HIP G1 split-K partials, V pack; Vulkan split
-    // partials): a kernel write past it lands in the post-graph sentinel, which the compare must see
+    // a write past dst + workspace lands in the post-graph sentinel
     bool whole_graph_checks_sentinels() override { return true; }
     bool checks_engagement() override { return true; }
     int n_determinism_runs() override { return 2; }
@@ -14370,9 +14325,8 @@ struct test_sparse_attn : public test_case {
         return true;
     }
 
-    // non-vacuity of the large-cache cases: a K or V storage with bytes past INT32_MAX must have a selected cell whose row
-    // (of some KV head) ends past that byte, or a 32-bit byte offset in a loader (cell * nb1 + head * nb2 in int32) is
-    // never exercised. Set by initialize_tensors, checked on every backend by verify_engagement.
+    // a K / V storage past INT32_MAX bytes must have a selected row ending past that byte, or 32-bit offset overflow in a
+    // loader is never exercised (checked in verify_engagement)
     std::string reach_msg;
     void check_reach(const std::vector<int32_t> & rows) {
         reach_msg.clear();
@@ -14399,7 +14353,7 @@ struct test_sparse_attn : public test_case {
         }
     }
 
-    // contract value of V's element d of cell c (kv head g, stream s): to_float rounded to f16
+    // V row of cell c as the contract sees it: to_float rounded to f16
     std::vector<float> v_contract_row(const sa_ref::view & vv, int64_t c, int64_t g, int64_t s) const {
         std::vector<float> r(D);
         sa_ref::load_row(vv, c, g, s, r.data());
@@ -14414,8 +14368,8 @@ struct test_sparse_attn : public test_case {
             }
             return e;
         }
-        // overflow: the set of inf positions must be the expected one (from the single selected V row), and the NMSE
-        // runs over the finite elements only (nmse() would see inf - inf = NaN, and NaN > max_err is false)
+        // overflow: the inf positions must match the single selected V row; NMSE over the finite elements only (nmse()
+        // would see inf - inf = NaN, which never exceeds max_err)
         const sa_ref::view vv = sa_host_view(v);
         const std::vector<int32_t> rows = sa_read_rows(sel);
         double sab = 0.0, saa = 0.0;
@@ -14455,7 +14409,7 @@ struct test_sparse_attn : public test_case {
     ggml_tensor * new_kv(ggml_context * ctx, ggml_type type, ggml_tensor ** storage) {
         ggml_tensor * t;
         if (kv_layout == 1) {
-            // the cache layout: [D, n_head_kv, kv_rows, n_stream], viewed as [D, kv_rows, n_head_kv, n_stream]
+            // the cache layout [D, n_head_kv, kv_rows, n_stream], viewed as [D, kv_rows, n_head_kv, n_stream]
             *storage = at_end ? ::ggml_new_tensor_4d(ctx, type, D, n_head_kv, kv_rows, n_stream)
                               : ggml_new_tensor_4d(ctx, type, D, n_head_kv, kv_rows, n_stream);
             t = ggml_permute(ctx, *storage, 0, 2, 1, 3);
@@ -14494,8 +14448,7 @@ struct test_sparse_attn : public test_case {
         return build_graph(ctx, ctx);
     }
 
-    // fill one K/V storage: uniform values over the whole tensor, or (large views) zeros plus uniform rows for the
-    // selected cells only
+    // uniform values, or for large storages zeros plus uniform rows at the selected cells only
     void init_kv(ggml_tensor * st, const std::vector<int32_t> & rows, uint32_t seed) {
         if (ggml_nbytes(st) <= ((size_t) 256 << 20)) {
             init_tensor_uniform(st);
@@ -14577,7 +14530,7 @@ struct test_sparse_attn : public test_case {
             if (t->op != GGML_OP_NONE || t == sel || t == k_st || t == v_st) continue;
             init_tensor_uniform(t);   // q and the sentinels
         }
-        // the K/V storages live in ctx, or in ctx_weights for the at_end cases (initialize_tensors runs once per context)
+        // runs once per context: K/V live in ctx_weights for the at_end cases
         if (ctx_has(ctx, k_st)) {
             check_reach(rows);
             init_kv(k_st, rows, 11);
@@ -14607,9 +14560,8 @@ struct test_sparse_attn : public test_case {
         return false;
     }
 
-    // every cell 4*quad + 3 of K and V poisoned; the rows never select it (SA_ROWS_POISON). Reach is asserted here on the
-    // plan (the C3 oracle, whose bytes equal the CPU op's, test_sparse_attn_plan): at least one group has a padded
-    // count (count % 4 != 0) and its padding quad holds a poisoned cell that no query of the group selects.
+    // poison every cell 4*quad + 3 of K and V (never selected by SA_ROWS_POISON); asserts on the reference plan that some
+    // group's padding quad holds a poisoned cell no query of the group selects
     void init_poison() {
         GGML_ASSERT(pattern == SA_ROWS_POISON);
         for (int64_t s = 0; s < n_stream; ++s) {
@@ -14636,18 +14588,14 @@ struct test_sparse_attn : public test_case {
             for (int64_t k2 = 0; k2 < n_real; ++k2) {
                 if (quads[e * L.cap + k2] == pad_quad) sel_bits |= masks[e * L.cap + k2];
             }
-            // cell 3 of the padding quad: poisoned, and no query of the group selects it
             reached = (4 * (int64_t) pad_quad + 3 < kv_rows) && (sel_bits & 0x8888) == 0;
         }
         GGML_ASSERT(reached && "poison case does not reach a padded quad with a poisoned unselected cell");
     }
 
-    // one attended cell whose score is NaN for every query that selects it: the first valid cell of query 0 (stream 0), KV
-    // head 0. f16 / q8_0 K: the whole K row NaN (poison_row). bf16 K: element 0 of the row is 1e5, which the contract turns
-    // into f16 +inf, and element 0 of every query is 0, so the score has inf * 0 = NaN. The CPU op (sparse-attn.cpp,
-    // acc / l with l NaN) writes 0 for every head of that KV head, and so must every backend and every split count: with
-    // n_q = 1, n_sel = 2051 the HIP G1 attend splits the row (sa_g1_splits), and the split-K merge must not drop the split
-    // whose normaliser is NaN (it did: a finite softmax over the other splits)
+    // a NaN score at query 0's first valid cell, KV head 0: a NaN K row, or for bf16 K element 0 = 1e5 (f16 +inf) with
+    // q element 0 = 0 (inf * 0). The row must be 0 on every backend and split count: a split-K merge must not drop the
+    // split whose normaliser is NaN
     void init_nanscore(ggml_context * ctx, const std::vector<int32_t> & rows) {
         int32_t c = -1;
         for (int64_t j = 0; j < n_sel && c < 0; ++j) {
@@ -14735,8 +14683,7 @@ struct test_sparse_attn : public test_case {
         }
     }
 
-    // V rows of the selected cells with values past the f16 range: bf16 V (> 65504), q8_0 V (d * q > 65504),
-    // f16 V (stored +-inf), f32 V (> 65504; the generic tier); rot 0 and one selected cell per row
+    // V values past the f16 range in the selected rows (stored +-inf for f16 V)
     void init_overflow(const std::vector<int32_t> & rows) {
         GGML_ASSERT(pattern == SA_ROWS_SINGLE && rot_o == 0);
         const size_t rb = ggml_row_size(type_v, D);
@@ -14757,10 +14704,9 @@ struct test_sparse_attn : public test_case {
                             const uint16_t h = big > 0 ? 0x7C00 : 0xFC00;
                             memcpy(row.data() + 2 * d, &h, 2);
                         } else if (type_v == GGML_TYPE_F32) {
-                            // f32 V past the f16 range: to_float is exact, the f16 rounding overflows to +-inf
                             memcpy(row.data() + 4 * d, &big, 4);
                         } else if (type_v == GGML_TYPE_Q8_0) {
-                            // block of d: scale 1000, element q = +-127 -> +-127000
+                            // scale 1000, q = +-127 -> +-127000
                             const size_t bs = ggml_type_size(GGML_TYPE_Q8_0);
                             uint8_t * blk = row.data() + (d / 32) * bs;
                             const ggml_fp16_t scale16 = ggml_fp32_to_fp16(1000.0f);
@@ -14776,7 +14722,7 @@ struct test_sparse_attn : public test_case {
         }
     }
 
-    // CPU: bit equality with the O_CON host reference (sparse-attn-ref.h)
+    // CPU: bit equality with the host reference
     bool verify_reference(ggml_backend_t backend, std::string & msg) override {
         if (!sa_is_cpu(backend)) {
             return true;
@@ -14802,7 +14748,7 @@ struct test_sparse_attn : public test_case {
             return false;
         }
         if (special == SA_NANSCORE) {
-            // non-vacuity: the poisoned cell makes query 0's rows of KV head 0 zero (contract item 5), the rows of KV head 1 not
+            // non-vacuity: query 0's rows of KV head 0 are zero, those of KV head 1 not
             const int64_t n_head = n_head_kv * gqa;
             bool zero0 = true, zero1 = true;
             for (int64_t h = 0; h < n_head; ++h) {
@@ -14835,8 +14781,7 @@ struct test_sparse_attn : public test_case {
                 return false;
             }
             if (special == SA_LEAD_NEGINF) {
-                // a -inf cell has weight 0: the heads of KV head 0 equal O_CON over the rows without cells 0 .. 15 (stream 0),
-                // bit for bit, in every query; that reference has no -inf score, so it does not share the -inf arithmetic
+                // KV head 0 must equal, bit for bit, the reference over the rows without cells 0 .. 15 (no -inf score there)
                 std::vector<int32_t> rows_wo = sa_read_rows(sel);
                 for (size_t j = 0; j < (size_t) (n_q * n_sel); ++j) {
                     if (rows_wo[j] >= 0 && rows_wo[j] < SA_LEAD_CELLS) rows_wo[j] = -1;
@@ -14869,8 +14814,7 @@ struct test_sparse_attn : public test_case {
     }
 };
 
-// launches counted since the census reset of the attend keys (sa_attend/...) whose epilogue segment is epi ("plain" or
-// "gated"); -1 without the census procs
+// attend launches since the census reset with epilogue epi ("plain" / "gated"); -1 without the census procs
 static int64_t sa_census_epi(ggml_backend_t backend, const char * epi) {
     typedef const char * const * (*census_list_t)(void);
     auto list = (census_list_t) census_proc(backend, "ggml_backend_debug_dispatch_census_list");
@@ -14889,14 +14833,11 @@ static int64_t sa_census_epi(ggml_backend_t backend, const char * epi) {
 }
 
 enum sa_gate_variant {
-    SA_GATE_F32,        // SPARSE_ATTN -> view -> MUL(., SIGMOID(CONT(gate))): the gated F32 output, compared
-    SA_GATE_BF16,       // + a MUL_MAT (BF16 weight) reading the gated output, which is also a graph output: the epilogue
-                        //   writes F32 and the BF16 copy the MMB GEMM reads; both outputs compared
-    SA_GATE_BF16_ONLY,  // the gated output read only by the BF16 MMB GEMM (graph_optimize marks it BF16-only): the epilogue
-                        //   writes only the BF16 copy; the GEMM output compared
-    SA_GATE_F16_ONLY,   // the same with a dense Q8_0 weight (MMB_DENSE_R2 in place, an F16 reader): only the F16 copy
-    SA_GATE_REJECT,     // the gated output allocated over Q (gallocr hands it the memory of Q, dead after the attend):
-                        //   the overlap check must refuse the fusion; the unfused graph must still be right
+    SA_GATE_F32,        // SPARSE_ATTN -> view -> MUL(., SIGMOID(CONT(gate))): the gated F32 output
+    SA_GATE_BF16,       // + a BF16 MUL_MAT reading it, both outputs: the epilogue writes F32 and a BF16 copy
+    SA_GATE_BF16_ONLY,  // the gated output read only by the BF16 GEMM: only the BF16 copy is written
+    SA_GATE_F16_ONLY,   // the same with a dense Q8_0 weight (an F16 reader): only the F16 copy
+    SA_GATE_REJECT,     // the gated output allocated over the dead Q: the overlap check must refuse the fusion
 };
 
 static const char * sa_gate_name(int v) {
@@ -14910,13 +14851,9 @@ static const char * sa_gate_name(int v) {
     return "?";
 }
 
-// test_sparse_attn_gated (PLAN-v3 §14.1, O28): the whole qwen4exp attention-gate graph after the attend, so the HIP gate
-// fusion (ggml-cuda.cu: SPARSE_ATTN -> [views] -> CONT(gate) -> SIGMOID -> MUL, the EPI = gated instance) is reached
-// through the backend's own matcher. q and the gate are interleaved per (token, head) in one tensor, as qwen4exp's
-// Qcur_full ([q | gate] per head), so the gate is a strided view. Engagement: the census must count exactly one gated
-// attend launch and no plain one (SA_GATE_REJECT: no gated launch and one plain one). With rot_q / rot_o != 0 (W10) the
-// rotations run inside the op, so the same matcher fuses the gate into the rotated epilogue (the qwen4exp graph of a
-// quantized cache).
+// the qwen4exp attention-gate graph after the attend, so the backend's matcher fuses the sigmoid gate into the attend
+// epilogue. q and the gate are interleaved per head as in qwen4exp's Qcur_full (the gate is a strided view). The census
+// must count one gated attend and no plain one (SA_GATE_REJECT: the reverse).
 struct test_sparse_attn_gated : public test_sparse_attn {
     const int variant;
     ggml_tensor * mul = nullptr, * mm = nullptr;
@@ -14958,7 +14895,7 @@ struct test_sparse_attn_gated : public test_sparse_attn {
         const int64_t n_head = n_head_kv * gqa, T = n_q * n_stream;
         ggml_tensor * gate = nullptr;
         if (variant == SA_GATE_REJECT) {
-            // q is computed (dead after the attend) and has the size of the gated output; the gate is its own input
+            // a computed q (dead after the attend) of the gated output's size
             ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, n_head, n_q, n_stream);
             ggml_set_name(q_in, "q_in");
             ggml_tensor * q_st = ggml_scale(ctx, q_in, 1.0f);
@@ -14994,7 +14931,7 @@ struct test_sparse_attn_gated : public test_sparse_attn {
         if (variant == SA_GATE_BF16) {
             ggml_set_output(mul);
         }
-        // the wo projection: BF16 weight (BF16 reader), or a dense Q8_0 weight large enough for MMB_DENSE_R2 (F16 reader)
+        // wo: BF16 weight (BF16 reader), or a dense Q8_0 weight large enough for an F16 reader
         const bool dense = variant == SA_GATE_F16_ONLY;
         ggml_tensor * w = ggml_new_tensor_2d(ctx, dense ? GGML_TYPE_Q8_0 : GGML_TYPE_BF16, D * n_head, dense ? 2560 : 128);
         ggml_set_name(w, "wo");
@@ -15007,8 +14944,7 @@ struct test_sparse_attn_gated : public test_sparse_attn {
 
     double err(const float * a, const float * b, size_t n) override {
         if (mm == nullptr || (int64_t) n != mm_elems) {
-            // the gated output: NMSE against the CPU graph (sigmoid(gate) * attend), the band of the attend's class
-            return nmse(a, b, n);
+            return nmse(a, b, n);   // the gated output: the attend's band
         }
         if (mm != nullptr && (int64_t) n == mm_elems) {
             // the GEMM output reads the 16-bit copy: its error is the activation rounding, not the attend band
@@ -15026,9 +14962,7 @@ struct test_sparse_attn_gated : public test_sparse_attn {
             return true;
         }
         const int64_t gated = sa_census_epi(backend, "gated"), plain = sa_census_epi(backend, "plain");
-        // a process whose tier has no gated instance (GGML_CUDA_SA_FORCE=generic / portable, or a HIP arch that runs the
-        // portable tier: the census skip proc excludes the fast G4 keys) computes the MUL unfused: one generic / portable
-        // attend, no fast one
+        // a tier without a gated instance (generic / portable: the fast G4 keys are skipped) leaves the MUL unfused
         auto skip = (const char * (*)(ggml_backend_t, const char *)) census_proc(backend, "ggml_backend_debug_dispatch_census_skip");
         if (skip != nullptr && skip(backend, "sa_attend/G4") != nullptr) {
             const int64_t other = dispatch_census_count(backend, "sa_generic/G4") + dispatch_census_count(backend, "sa_generic/G1") +
@@ -15050,13 +14984,9 @@ struct test_sparse_attn_gated : public test_sparse_attn {
     }
 };
 
-// test_sparse_attn_gqa_rep (PLAN-v3 §13 W5, §14.2 (c) "GQA 4/8"): the GQA 4 / 8 instance against the GQA 12 instance on
-// the same per-head data. Two attends share K, V and the plan: one with GQA r (4 or 8; the case's own heads) and one with
-// GQA 12 whose query heads replicate them (head j of kv head g of the GQA 12 query = head j % r of kv head g of the
-// GQA r query). Both outputs are compared with the CPU op (the band of the census class, as test_sparse_attn); then, on
-// the backend under test, every replicated head of the GQA 12 output must agree with its GQA r head to the GQA 12 row of
-// the class (the PLAN-v3 §14.2 row, without the type spread), and on the CPU bitwise (the per-head arithmetic of the CPU
-// op does not depend on GQA). SA_GQAREP lines report the NMSE and whether the two are bitwise equal.
+// GQA 4 / 8 against GQA 12 on the same per-head data: two attends share K, V and the plan, the GQA 12 query replicating
+// the GQA r heads (head j -> j % r). Both are compared with the CPU op; then each replicated head must match its GQA r
+// head within the class band (without type spread), bitwise on the CPU.
 struct test_sparse_attn_gqa_rep : public test_sparse_attn {
     ggml_tensor * q12 = nullptr, * q12_st = nullptr, * qr_st = nullptr, * out12 = nullptr;
 
@@ -15103,7 +15033,7 @@ struct test_sparse_attn_gqa_rep : public test_sparse_attn {
             init_tensor_uniform(t);   // the GQA r query, K, V and the sentinels
         }
         sa_init_sel(sel, rows);
-        // the GQA 12 query: head g * 12 + j = head g * gqa + j % gqa of the GQA r query, for every (query, stream)
+        // GQA 12 head g * 12 + j = GQA r head g * gqa + j % gqa
         std::vector<float> qr(ggml_nelements(qr_st)), q12v(ggml_nelements(q12_st));
         ggml_backend_tensor_get(qr_st, qr.data(), 0, ggml_nbytes(qr_st));
         for (int64_t t = 0; t < n_q * n_stream; ++t) {
@@ -15161,10 +15091,8 @@ struct test_sparse_attn_gqa_rep : public test_sparse_attn {
     }
 };
 
-// One family of SPARSE_ATTN_PLAN / SPARSE_ATTN cases: the product of its lists, nested in the order of the fields below
-// (k, v, gqa, ns, nkv, nsel, nq, g, rows, rot, layout, at_end, special, gate). v empty: V = K. layout SA_ALT0 / SA_ALT1
-// alternates 0 / 1 over the family's cases in that order, starting at 0 / 1 (the K/V view layouts of sa_new_kv).
-// gen_only keeps the K/V pairs with a member outside S_fast (the generic tier).
+// One family of cases: the product of its lists. v empty: V = K. layout SA_ALT0 / SA_ALT1 alternates the K/V layout over
+// the cases, starting at 0 / 1. gen_only keeps the K/V pairs with a member outside S_fast (the generic tier).
 enum sa_case_kind { SA_CASE_PLAN, SA_CASE_ATTN, SA_CASE_GATED, SA_CASE_GQAREP };
 enum { SA_ALT0 = -1, SA_ALT1 = -2 };
 
@@ -15256,60 +15184,47 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
     const int PLAN = SA_CASE_PLAN, ATTN = SA_CASE_ATTN, GATED = SA_CASE_GATED, GQAREP = SA_CASE_GQAREP;
 
     const sa_family families[] = {
-        // ---- SPARSE_ATTN_PLAN (PLAN-v3 §14.1) ----
-        // n_q x n_sel x G
+        // ---- SPARSE_ATTN_PLAN ----
         P(PLAN).nq({1, 2, 8, 127, 128, 129, 512, 513}).nsel({257, 2051}).nkv({65536}).g(G14),
         P(PLAN).nq({4096}).nsel({2051}).nkv({65536}).g(G14),
-        // n_sel 1 and 4096, shallow and deep caches
         P(PLAN).nsel({1, 4096}).nq({1, 129, 513}).nkv({4096, 1048576}).g(G14),
-        // every row pattern at every n_kv of §14.1 (n_kv 4: a single quad)
+        // every row pattern (n_kv 4: a single quad)
         P(PLAN).nq({129}).nsel({257}).nkv({4, 2051, 4096, 65536, 270336, 1048576}).g(G14)
             .rows({SA_ROWS_ASC, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_NEG, SA_ROWS_OOB, SA_ROWS_ALLNEG, SA_ROWS_MIX, SA_ROWS_BLOCKS}),
-        // 2 streams; plain, interleaved and strided rows
         P(PLAN).nq({8, 129}).nsel({257}).nkv({4096}).g(G14).ns({2}).layout({0, 1, 2}),
         P(PLAN).nq({1}).nsel({1}).nkv({4}).rows({SA_ROWS_PERM}),
         P(PLAN).nq({3}).nsel({1}).nkv({4}).g({4}).ns({2}).rows({SA_ROWS_PERM}).layout({1}),
         P(PLAN).nq({4096}).nsel({2051}).nkv({8192}).g({4}).rows({SA_ROWS_BLOCKS}),
-        // rows longer than a block's LDS (HIP: 2 x n_sel x 4 B > 60 KiB): the global-memory rows and merge kernels
+        // rows too long for shared memory (HIP: 2 x n_sel x 4 B > 60 KiB): the global-memory kernels
         P(PLAN).nq({5}).nsel({9000}).nkv({4096, 65536}).g(G14).ns({2}).rows({SA_ROWS_ASC, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_MIX}),
 
-        // ---- SPARSE_ATTN (PLAN-v3 §14.1) ----
-        // every S x S pair at n_q 9 (n_kv 4096 >= 64 * n_q: the direct-V regime) and n_q 65 (n_kv < 64 * n_q on G1, one pass
-        // per query at the Vulkan split rule, n_wg 130 >= 128: the V staged / pack arms); K/V view layouts alternating
+        // ---- SPARSE_ATTN ----
+        // every K/V pair, direct V (n_kv >= 64 * n_q) and staged / packed V
         P(ATTN).k(S_all).v(S_all).nq({9}).nkv({4096}).nsel({257}).layout({SA_ALT0}),
         P(ATTN).k(S_all).v(S_all).nq({65}).nkv({4096}).nsel({257}).layout({SA_ALT1}),
-        // both V-loader regimes for every S_fast pair: n_kv < 64 * n_q (n_q 129, n_kv 4096, G4) and n_kv >= 64 * n_q (n_q 9,
-        // n_kv 32768, G1), n_sel 2051
+        // both V-loader regimes for every S_fast pair at n_sel 2051
         P(ATTN).k(S_fast).v(S_fast).nq({129}).nkv({4096}).nsel({2051}).g({4}).rows({SA_ROWS_BLOCKS}),
         P(ATTN).k(S_fast).v(S_fast).nq({9}).nkv({32768}).nsel({2051}),
-        // n_q >= 513 with 64 * n_q < n_kv (direct V on G4)
         P(ATTN).k({F16, Q8}).nq({513}).nkv({65536}).nsel({2051}).g({4}).rows({SA_ROWS_BLOCKS}),
-        // the n_q set of §14.1 (G = the HIP default n_q < 128 ? 1 : 4, and the other G for q4_0)
+        // the n_q range (G = n_q < 128 ? 1 : 4, the other G for q4_0)
         P(ATTN).k({F16, Q8}).nq({1, 2, 4, 8, 9, 64, 65, 66, 127}).nkv({8192}).nsel({2051}),
         P(ATTN).k({F16, Q8}).nq({128, 129, 263, 512, 513}).nkv({8192}).nsel({2051}).g({4}),
         P(ATTN).k({Q4}).nq({1, 9, 127}).nkv({8192}).nsel({2051}).g({4}),
         P(ATTN).k({Q4}).nq({513}).nkv({8192}).nsel({2051}),
         P(ATTN).k({F16}).nq({4096}).nkv({8192}).nsel({2051}).g({4}).rows({SA_ROWS_BLOCKS}),
-        // n_kv: all-visible (the shortcut, n_kv <= 2051), 2051 with views of 2052 rows ending at their buffer's end, deep
+        // n_kv: all-visible (the dense shortcut), K/V ending at their buffer's end, deep caches
         P(ATTN).k({F16, Q8, BF16, Q4}).nq({16}).nkv({1, 17, 512, 2048, 2051}).nsel({2051}).rows({SA_ROWS_ALLVIS}),
         P(ATTN).k({F16, Q8}).nq({9}).nkv({2051}).nsel({2051}).g(G14).rows({SA_ROWS_ALLVIS}).at_end({1, 2}),
         P(ATTN).k({F16, Q8}).nq({9}).nkv({4096, 32768, 65536, 270336}).nsel({2051}),
         P(ATTN).k({F16, Q8}).nq({1}).nkv({1048576}).nsel({2051}),
-        // the first f16 K view >= 2 GiB: offsets past INT32_MAX bytes. The rows hold the last 4 cells (SA_ROWS_TAIL), whose
-        // f16 rows end past byte 2^31 (cell 2^21 at 1024 B per cell); check_reach fails a case whose storage passes INT32_MAX
-        // without such a row (the MIX rows of this shape reached byte 2146605568 only)
+        // K / V views past INT32_MAX bytes, the last cells selected (SA_ROWS_TAIL): 32-bit offset overflow
         P(ATTN).k({F16}).nq({1}).nkv({K21}).nsel({2051}).rows({SA_ROWS_TAIL}),
         P(ATTN).k({Q8}).nq({1}).nkv({K21}).nsel({2051}),
-        // the q8_0 K / V views past INT32_MAX bytes: 2^22 + 4 cells of 2 x 272 B (2.28 GB each), the last 4 cells selected
         P(ATTN).k({Q8}).nq({1}).nkv({K22}).nsel({2051}).rows({SA_ROWS_TAIL}),
         P(ATTN).k({F32}).nq({1}).nkv({1048576}).nsel({2051}),
-        // GQA 4, 8, 12
         P(ATTN).k({F16, Q8, Q4}).gqa({4, 8, 12}).nq({66}).nkv({4096}).nsel({2051}).g(G14),
-        // rotations
+        // in-op rotations: every kernel family, the qwen4exp pair (256, 64), mixed pairs, the generic tier
         P(ATTN).k({F16, Q8, Q4, BF16}).nq({65}).nkv({4096}).nsel({2051}).rot({{64, 64}, {256, 256}, {64, 0}, {0, 256}, {128, 64}}),
-        // the in-op rotations on every HIP kernel family (W10): G4 with packed V (n_kv 4096 < 64 * 129) and direct V
-        // (16384), G1 with one split (n_sel 17) and with the split merge (the block above, n_sel 2051 -> 5 splits), in the
-        // qwen4exp pair (256, 64) and the other two orders; GQA 4 / 8, two streams, mixed pairs, the S_generic tier
         P(ATTN).k(S_fast).nq({129}).nkv({4096, 16384}).nsel({257}).g({4}).rot({{256, 64}, {64, 256}, {128, 128}}),
         P(ATTN).k(S_fast).nq({1}).nkv({16384}).nsel({17}).rot({{256, 64}, {64, 256}, {128, 128}}),
         P(ATTN).k({Q8}).gqa({4, 8}).nq({66}).nkv({4096}).nsel({2051}).g(G14).rot({{256, 64}}),
@@ -15317,41 +15232,28 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
         P(ATTN).k({Q8}).v({F16}).nq({65}).nkv({4096}).nsel({2051}).g(G14).rot({{256, 0}}),
         P(ATTN).k({F16}).v({Q4}).nq({65}).nkv({4096}).nsel({2051}).g(G14).rot({{0, 64}}),
         P(ATTN).k(S_gen).nq({66}).nkv({4096}).nsel({2051}).g(G14).rot({{256, 64}}),
-        // rotated empty rows (H_o of 0 is 0), poison with rotations, and the overflow cases with H_q (rot_o = 0: an inf output
-        // element through H_o would turn its whole block into NaN): the G4 fixup recomputes those blocks with the rotation
+        // rotated empty rows, poison and overflow (rot_o = 0: an inf output through H_o would make its block NaN)
         P(ATTN).k(S_fast).nq({66}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_EMPTY}).rot({{256, 64}}),
         P(ATTN).k(S_fast).nq({66}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_POISON}).rot({{256, 64}}).special({SA_POISON}),
         P(ATTN).k({F16}).v({BF16, Q8, F16}).nq({9}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_SINGLE}).rot({{256, 0}}).special({SA_OVERFLOW}),
-        // 2 streams, both K/V layouts
         P(ATTN).k({F16, Q8}).ns({2}).nq({65}).nkv({4096}).nsel({2051}).g(G14).layout({0, 1}),
-        // empty rows, all -1 rows, permuted / duplicate rows
         P(ATTN).k({F16, Q8, Q4, BF16}).nq({66}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_EMPTY}),
         P(ATTN).k({Q8}).v({F16}).nq({33}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_ALLNEG, SA_ROWS_PERM, SA_ROWS_DUP, SA_ROWS_OOB}),
-        // poison (every S_fast type): NaN / inf values and scales in cells no query selects, inside attended quads and
-        // in the padding quads
+        // poison: NaN / inf values and scales in unselected cells of attended quads and padding quads
         P(ATTN).k(S_fast).nq({66}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_POISON}).special({SA_POISON}),
-        // V-side overflow: bf16 V > 65504, q8_0 V with d * q > 65504, f16 V with stored inf; one selected cell
+        // V values past the f16 range, one selected cell
         P(ATTN).k({F16}).v({BF16, Q8, F16}).nq({9}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_SINGLE}).special({SA_OVERFLOW}),
-        // a NaN score in one attended cell (inf * 0 or a NaN K element): the CPU op writes 0 for the head, so must the HIP G1
-        // split-K merge (n_q 1 / 3 at n_sel 2051: many splits), G4, the Vulkan split-K reduce (n_q 1 / 3) and the Vulkan cm /
-        // scalar one-split epilogues (n_q 64: n_q * n_head_kv >= 128); the HIP one-split G1 epilogue is reached by the lead
-        // cases below (n_sel 48)
+        // a NaN score in one attended cell: the head's row is 0 through every split-K merge and one-split epilogue
         P(ATTN).k({F16, Q8, BF16}).nq({1, 3, 64}).nkv({8192}).nsel({2051}).g(G14).special({SA_NANSCORE}),
-        // a -inf or NaN score in the first step of a row (init_lead): query 0 selects cells 0 .. 15, whose K rows of KV head 0
-        // score -inf (leadneginf: weight 0 wherever the cell lies, the row is the softmax over the other cells) or NaN (leadnan:
-        // the row is 0, also when the running max is still -inf). G1 with the split-K merge (n_q 1, n_sel 2051: HIP 33 splits,
-        // Vulkan split + reduce), G1 with one HIP split (n_sel 48), G1 at n_q 66 (Vulkan one split: n_q * n_head_kv >= 128),
-        // G4 with direct V (n_q 4) and packed V (n_q 66, n_kv 4096 < 64 * n_q)
+        // a -inf or NaN score over the first step of a row (init_lead), on every split class and V regime
         P(ATTN).k({F16, Q8, BF16}).nq({1}).nkv({8192}).nsel({2051}).special({SA_LEAD_NEGINF, SA_LEAD_NAN}),
         P(ATTN).k({F16, Q8, BF16}).nq({9}).nkv({4096}).nsel({48}).special({SA_LEAD_NEGINF, SA_LEAD_NAN}),
         P(ATTN).k({F16, Q8, BF16}).nq({66}).nkv({4096}).nsel({257}).special({SA_LEAD_NEGINF, SA_LEAD_NAN}),
         P(ATTN).k({F16, Q8, BF16}).nq({4, 66}).nkv({4096}).nsel({257}).g({4}).special({SA_LEAD_NEGINF, SA_LEAD_NAN}),
-        // a scale that is not a power of two (the contract multiplies in f32 before the f16 rounding)
+        // a scale that is not a power of two (multiplied in f32 before the f16 rounding)
         P(ATTN).k({F16, Q8}).nq({65}).nkv({4096}).nsel({2051}).scale(0.0883883476f),
 
-        // ---- the QSA_*_MASKLESS shapes of #219 (deleted in W13), with their cell formulas (SA_ROWS_PR / SA_ROWS_PRBLK), including
-        //      the q8_0 and mixed K/V case list #219 added (b60447506): decode q {1, 9, 64, 512} x sel {257, 2051}; prefill 129 /
-        //      513 / 640; 130 x 32k, 200 x 64k, 70 x 64k; mixed q8_0 / f16 at 513 and 130; GQA 4 ----
+        // ---- the shapes and cell formulas of the original QSA tests ----
         P(ATTN).k({F16, Q8}).nq({1, 9, 64}).nkv({4096}).nsel({257, 2051}).rows({SA_ROWS_PR}),
         P(ATTN).k({F16, Q8}).nq({512}).nkv({4096}).nsel({257, 2051}).g({4}).rows({SA_ROWS_PR}),
         P(ATTN).k({F16, Q8}).nq({129, 640}).nkv({4096}).nsel({257}).g({4}).rows({SA_ROWS_PR}),
@@ -15365,66 +15267,53 @@ static void make_test_cases_sparse_attn(std::vector<std::unique_ptr<test_case>> 
         P(ATTN).k({Q8}).v({F16}).nq({130}).nkv({32768}).nsel({2051}).g({4}).rows({SA_ROWS_PRBLK}).prblk(7000),
         P(ATTN).k({F16}).nq({130}).nkv({270336}).nsel({2051}).g({4}).rows({SA_ROWS_PRBLK}).prblk(66000),
 
-        // ---- the G4 attend (PLAN-v3 §13 W3): every S_fast pair x both V-loader regimes x 1 / 2 streams x GQA {4, 8, 12};
-        //      n_q 129: n_kv 4096 < 64 * 129 (packed V), n_kv 16384 >= 64 * 129 (direct V); K/V layouts alternating ----
+        // ---- G4: every S_fast pair x V regime x streams x GQA ----
         P(ATTN).k(S_fast).v(S_fast).gqa({4, 8, 12}).ns({1, 2}).nkv({4096, 16384}).nq({129}).nsel({257}).g({4}).layout({SA_ALT0}),
 
-        // ---- the G1 attend (PLAN-v3 §13 W4) ----
-        // the W4 n_q set x 1 / 2 streams x every S_fast type: n_kv 8192, n_sel 2051, so the shape-only split count
-        // (sa_g1_splits: PR #219's decode rule) walks 33 (n_q 1-8), 26 (9), 5 (64, 65), 4 (66), 3 (127), 2 (263); K/V layouts
-        // alternating with the type
+        // ---- G1 ----
+        // the n_q range: split counts 33 (n_q 1-8) down to 2 (263)
         P(ATTN).k({F16, Q8}).ns({1, 2}).nq({1, 2, 4, 8, 9, 64, 65, 66, 127, 263}).nkv({8192}).nsel({2051}).layout({0}),
         P(ATTN).k({BF16, Q4}).ns({1, 2}).nq({1, 2, 4, 8, 9, 64, 65, 66, 127, 263}).nkv({8192}).nsel({2051}).layout({1}),
-        // every G1 kernel (S_fast^2 x GQA {4, 8, 12}) in the 5 split classes: n_q 1, n_kv 16384, n_sel 17 / 257 / 513 / 2051 /
-        // 4096 -> 1 / 5 / 9 / 33 / 64 splits
+        // every G1 kernel in the 5 split classes (n_sel 17 .. 4096 -> 1 .. 64 splits)
         P(ATTN).k(S_fast).v(S_fast).gqa({4, 8, 12}).nq({1}).nkv({16384}).nsel({17, 257, 513, 2051, 4096}).layout({SA_ALT0}),
-        // complete quads (the CB rows of a fresh cache, C5: qpb 1.001) at the decode and ub64 shapes
+        // complete quads at the decode and ub64 shapes
         P(ATTN).k(S_fast).nq({1, 64}).nkv({65536}).nsel({2051}).rows({SA_ROWS_BLOCKS}),
-        // the ported #219 shapes PR219 ran through its decode kernel (R2-BOP route census: every same-type case with n_q <= 512)
-        // whose G4 variant is listed above: their G1 variants, so U34 gates the G1 kernel on every one of them
+        // the G1 variants of those shapes
         P(ATTN).k({F16, Q8}).nq({512}).nkv({4096}).nsel({257, 2051}).rows({SA_ROWS_PR}),
         P(ATTN).k({F16, Q8}).nq({129}).nkv({4096}).nsel({257}).rows({SA_ROWS_PR}),
         P(ATTN).k({F16, Q8}).nq({130}).nkv({32768}).nsel({2051}).rows({SA_ROWS_PRBLK}).prblk(7000),
         P(ATTN).k({F16, Q8}).nq({200}).nkv({65536}).nsel({2051}).rows({SA_ROWS_PRBLK}).prblk(15000),
         P(ATTN).k({F16}).nq({130}).nkv({270336}).nsel({2051}).rows({SA_ROWS_PRBLK}).prblk(66000),
 
-        // ---- gate fusion (test_sparse_attn_gated, PLAN-v3 §14.1): every EPI = gated G4 instance (S_fast pair x V regime x
-        //      GQA), the MMB reader paths (BF16 copy with and without the F32 store, F16 copy for a dense-R2 Q8_0 weight),
-        //      2 streams, and the overlap rejection ----
+        // ---- gate fusion: every gated G4 instance, the 16-bit reader paths, 2 streams, the overlap rejection ----
         P(GATED).k(S_fast).v(S_fast).gqa({4, 8, 12}).nkv({4096, 16384}).nq({129}).nsel({257}),
         P(GATED).k({F16, Q8}).nq({129}).nkv({4096}).nsel({257}).gate({SA_GATE_BF16, SA_GATE_BF16_ONLY, SA_GATE_F16_ONLY}),
         P(GATED).k({F16, Q8}).nq({129}).nkv({16384}).nsel({257}).gate({SA_GATE_F16_ONLY}).layout({0}),
         P(GATED).k({F16, Q8}).ns({2}).nq({129}).nkv({4096}).nsel({2051}),
         P(GATED).k({F16, Q4}).nq({129}).nkv({4096}).nsel({257}).gate({SA_GATE_REJECT}),
-        // the gate fused into the rotated epilogue (W10): every S_fast type x both V regimes x the qwen4exp pair (256, 64) and
-        // (64, 256), the 16-bit reader paths and 2 streams with rotations, and the rejection with rotations
+        // the gate fused into the rotated epilogue
         P(GATED).k(S_fast).nq({129}).nkv({4096, 16384}).nsel({257}).rot({{256, 64}, {64, 256}}),
         P(GATED).k({Q8}).nq({129}).nkv({4096}).nsel({257}).rot({{256, 64}}).gate({SA_GATE_BF16, SA_GATE_BF16_ONLY, SA_GATE_F16_ONLY}),
         P(GATED).k({Q4}).v({Q8}).gqa({8}).ns({2}).nq({129}).nkv({4096}).nsel({2051}).rot({{256, 64}}),
         P(GATED).k({Q8}).nq({129}).nkv({4096}).nsel({257}).rot({{256, 64}}).gate({SA_GATE_REJECT}),
 
-        // ---- the generic tier (PLAN-v3 §13 W5): every pair of S with a member outside S_fast. The S x S families above run
-        //      them on G1 (n_q 9, n_sel 257); here: G4 in both V regimes, every generic kernel, the n_q set, poison, overflow ----
-        // G4, n_q 129: n_kv 4096 < 64 * 129 (packed V, the generic pack), n_kv 16384 >= 64 * 129 (direct V); layouts alternating
+        // ---- the generic tier (K or V outside S_fast): G4 in both V regimes ----
         P(ATTN).k(S_all).v(S_all).gen_only().nkv({4096, 16384}).nq({129}).nsel({257}).g({4}).layout({SA_ALT0}),
-        // every generic G4 kernel (V regime x GQA {4, 8, 12}) with 1 / 2 streams, and every generic G1 kernel (GQA x the 5
-        // split classes: n_q 1, n_kv 16384, n_sel 17 / 257 / 513 / 2051 / 4096), on mixed generic / fast pairs
+        // every generic G4 kernel and every generic G1 split class, on mixed generic / fast pairs
         P(ATTN).k({Q4_1}).v({IQ4NL}).gqa({4, 8, 12}).ns({1, 2}).nkv({4096, 16384}).nq({129}).nsel({257}).g({4}),
         P(ATTN).k({F32}).v({Q5_0}).gqa({4, 8, 12}).ns({1, 2}).nkv({4096, 16384}).nq({129}).nsel({257}).g({4}),
         P(ATTN).k({Q5_1}).v({F16}).gqa({4, 8, 12}).ns({1, 2}).nkv({4096, 16384}).nq({129}).nsel({257}).g({4}),
         P(ATTN).k({Q5_0}).v({Q4_1}).gqa({4, 8, 12}).nq({1}).nkv({16384}).nsel({17, 257, 513, 2051, 4096}),
         P(ATTN).k({Q8}).v({F32}).gqa({4, 8, 12}).nq({1}).nkv({16384}).nsel({17, 257, 513, 2051, 4096}),
-        // the n_q set on G1 / G4 at n_sel 2051 for every generic type (K = V), 2 streams on two of them, complete quads
         P(ATTN).k(S_gen).nq({1, 9, 66, 263}).nkv({8192}).nsel({2051}),
         P(ATTN).k(S_gen).nq({513}).nkv({8192}).nsel({2051}).g({4}),
         P(ATTN).k(S_gen).nq({513}).nkv({65536}).nsel({2051}).g({4}).rows({SA_ROWS_BLOCKS}),
         P(ATTN).k({Q4_1, IQ4NL}).ns({2}).nq({65}).nkv({4096}).nsel({2051}).g(G14).layout({0}),
-        // poison (every generic type: NaN / inf values and scales in unselected cells and padding quads); f32 V overflow
+        // poison, f32 V overflow
         P(ATTN).k(S_gen).nq({66}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_POISON}).special({SA_POISON}),
         P(ATTN).k({Q5_1}).v({F32}).nq({9}).nkv({4096}).nsel({257}).g(G14).rows({SA_ROWS_SINGLE}).special({SA_OVERFLOW}),
 
-        // ---- GQA 4 / 8 against GQA 12 on replicated heads (PLAN-v3 §13 W5, §14.2 (c)): the fast G4 and G1 instances of every
-        //      S_fast type, one mixed pair, and the generic tier (q4_1, q5_0 / f16) ----
+        // ---- GQA 4 / 8 against GQA 12 on replicated heads ----
         P(GQAREP).k(S_fast).gqa({4, 8}).nq({66}).nkv({4096}).nsel({2051}).g(G14),
         P(GQAREP).k({Q8}).v({F16}).gqa({4, 8}).ns({2}).nq({129}).nkv({16384}).nsel({257}).g({4}),   // direct V, 2 streams
         P(GQAREP).k({Q4}).v({BF16}).gqa({4, 8}).nq({1}).nkv({16384}).nsel({2051}),                     // G1 split-K
@@ -20274,9 +20163,7 @@ static std::vector<census_case> make_census_cases_vulkan() {
     add("CONCAT_SSM_CONV_SILU", new test_ssm_conv_direct(130, 9, 1, 4), "CONCAT_SSM_CONV_SILU/2=1;CONCAT_TAIL/1=1");
     add("SNAKE",               new test_snake_fuse(GGML_TYPE_F32, { 128, 16, 1, 1 }), "SNAKE/5=1");
     add("TOPK_QSA",            new test_topk_qsa(512, 2048, 2, 1, 1500), "TOPK_QSA/7=1");
-    // the production non-compact strip (qwen4exp-te.h): the expanded chain fuses although the rows read the mask again.
-    // n_tps 1 and the split streams: the TOP_K is an intermediate there, so the fusion also needs the chain's sources kept
-    // allocated through it (graph_optimize alloc deps), else ggml-alloc reuses the score copy / mask cast for its output
+    // the qwen4exp strip; at n_tps 1 and split streams TOP_K is an intermediate, so the chain's sources must stay allocated
     add("TOPK_QSA",            new test_qsa_te_strip(512, 2048, 2, 1, 1500), "TOPK_QSA/7=1");
     add("TOPK_QSA",            new test_qsa_te_strip(512, 2048, 1, 1, 1499), "TOPK_QSA/7=1");
     add("TOPK_QSA",            new test_qsa_te_strip(256, 2048, 4, 2, 1999), "TOPK_QSA/7=1");
@@ -20468,7 +20355,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             my_end = std::min(my_begin + chunk, test_cases.size());
         };
 
-        // suite-level census accumulator (test_case::census_families): key -> launches summed over the cases
+        // census key -> launches summed over the cases (test_case::census_families)
         std::map<std::string, uint64_t> census_suite;
         std::set<std::string> census_families_run;
         std::mutex census_suite_mutex;
@@ -20493,7 +20380,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                         }
                     }
                     if (status == test_status_t::NOT_SUPPORTED && g_fail_unsupported && !test->expected_unsupported(b)) {
-                        status = test_status_t::FAIL;   // reported "not supported" above; not on this backend's expected list
+                        status = test_status_t::FAIL;   // not on this backend's expected-unsupported list
                     }
                     if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
                         continue;
@@ -20550,8 +20437,8 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             }
         }
 
-        // every compiled census key of the families the run dispatched was launched at least once (backends with the
-        // census list proc; the CPU backend has none). A key only a forced tier reaches is covered by its own forced run.
+        // every compiled census key of the dispatched families must have been launched; keys a forcing switch excludes
+        // are covered by that forced run
         bool census_ok = true;
         {
             typedef const char * const * (*census_list_t)(void);
@@ -20569,7 +20456,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                         continue;
                     }
                     if (const char * why = skip ? skip(backend, key.c_str()) : nullptr) {
-                        ++n_skipped;   // a forced run: the key belongs to another run (the first reason is printed)
+                        ++n_skipped;
                         if (n_skipped == 1) {
                             printf("  CENSUS COVERAGE: %s: keys excluded in this process, e.g. %s: %s\n", ggml_backend_name(backend), key.c_str(), why);
                         }
@@ -20585,7 +20472,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
                 for (const std::string & f : census_families_run) {
                     fam += (fam.empty() ? "" : ",") + f;
                 }
-                // a -p filter selects a subset of the cases, which cannot reach every key: reported, not gated
+                // a -p filter cannot reach every key: reported, not gated
                 const bool gated = params_filter == nullptr;
                 printf("  CENSUS COVERAGE: %s: %zu/%zu compiled keys of {%s} launched (%zu excluded by a forcing switch): %s\n",
                        ggml_backend_name(backend), n_keys - n_missing, n_keys, fam.c_str(), n_skipped,

@@ -6,8 +6,7 @@
 // wide FWHT blocks use one row per thread block with this many threads
 #define GGML_CUDA_FWHT_BLOCK_NT 256
 
-// One row per warp: the transform is fwht_block (sparse-attn-fwht.cuh), which the in-op rotations of GGML_OP_SPARSE_ATTN
-// share, so the two are bitwise equal on the same f32 input (tests/test-sparse-attn-rot.cpp).
+// One row per warp through fwht_block, shared with the SPARSE_ATTN rotations so both are bitwise equal.
 template <int N, typename T>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
 __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale) {

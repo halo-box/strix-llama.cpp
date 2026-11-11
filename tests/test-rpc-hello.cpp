@@ -1,9 +1,6 @@
-// The RPC client's hello against servers of other protocol versions (ggml-rpc.cpp negotiate_hello, ggml-rpc.h). A fake
-// server answers the HELLO with a chosen version; a forked child connects with ggml_backend_rpc_add_server. The client
-// must go on (send its next command) only for a server minor in [RPC_PROTO_MIN_SERVER_MINOR_VERSION, RPC_PROTO_MINOR_VERSION].
-// It accepted any older minor: an 8.0 server (GGML_OP_COUNT 101) then received the op values 101 / 102 of
-// GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN and crashed or computed no attention, instead of a version error.
-// No device is used.
+// The RPC client's hello against a fake server of a chosen protocol version, from a forked client. The client must go on
+// only for a server minor in [RPC_PROTO_MIN_SERVER_MINOR_VERSION, RPC_PROTO_MINOR_VERSION]: an older server does not know
+// the sparse-attention op values. No device is used.
 #include "ggml-rpc.h"
 
 #include <arpa/inet.h>
@@ -20,7 +17,7 @@
 #include <string>
 
 #ifndef RPC_PROTO_MIN_SERVER_MINOR_VERSION
-#define RPC_PROTO_MIN_SERVER_MINOR_VERSION 0   // a ggml-rpc.h without the floor: the hello accepted every older minor
+#define RPC_PROTO_MIN_SERVER_MINOR_VERSION 0   // a ggml-rpc.h without the floor
 #endif
 
 static bool recv_all(int fd, void * p, size_t n) {
@@ -126,7 +123,7 @@ int main() {
     struct { uint8_t major, minor; bool want; } cases[] = {
         { RPC_PROTO_MAJOR_VERSION, RPC_PROTO_MINOR_VERSION, true },
         { RPC_PROTO_MAJOR_VERSION, (uint8_t) (RPC_PROTO_MINOR_VERSION + 1), false },
-        // the 8.0 server of origin/master: its op enum ends at 101, before the two sparse-attention ops (ggml-rpc.h 8.1)
+        // a server without the sparse-attention ops
         { RPC_PROTO_MAJOR_VERSION, 0, false },
         { (uint8_t) (RPC_PROTO_MAJOR_VERSION - 1), RPC_PROTO_MINOR_VERSION, false },
     };

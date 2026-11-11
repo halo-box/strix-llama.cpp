@@ -1,52 +1,28 @@
 #pragma once
 
-// sa_attend_g1<KT, VT, GQA>: GGML_OP_SPARSE_ATTN with a G = 1 plan on RDNA3 WMMA (PLAN-v3 §6.2, D9, D10).
-//
-// The body is PR #219's decode WMMA partial kernel (qsa-decode-wmma.cuh of 94e086847), as C18's decode harness took it over
-// line by line (c18_dec.cu c18_dec_kernel: Q prologue, WMMA order, online softmax in wave 0, 2 barriers per 16-cell chunk
-// plus the PR's trailing one, the partial epilogue), with:
-//   - the loaders of C18 decision 2 (MEASUREMENTS.md C18 "Decode kernel"): V LDS-staged and transposed through a
-//     wave-private 1 KB slot (C18 "S", aliasing the score exchange slot of the wave) for every type; K direct per lane for
-//     f16 and q8_0 (q8_0: PR #219's decode q8 K loader, qsa-decode-wmma.cuh:63-74 of 68da4191d, kept as is, C18:
-//     Kq8_0D-Vq8_0S 3.770 ms vs Kq8_0X-Vq8_0S 3.774 at ub512 wiki d131k), K split with v_permlanex16 for q4_0 and bf16
-//     (C18 "X");
-//   - the cells come from the ggml.h G = 1 plan (one group per query: ascending quads, mask bits 0..3) instead of the PR's
-//     atomicCAS-deduplicated index rows, so the visit order is the plan's ascending cell order and the output is a
-//     function of the op's inputs (the PR's dedup kept a racing occurrence: R2-BOP, up to 18 distinct unique-id sets);
-//   - the generic tier (KT = VT = SA_T_GEN, sparse-attn-generic.cu): K split and V staged as above, every element
-//     converted at load by the runtime switch of sa_any_piece (sparse-attn-loaders.cuh) over the ggml types kt_g / vt_g;
-//   - rows = the GQA query heads of one kv head (GQA in {4, 8, 12}, padded to the 16 WMMA rows with zero q), streams and
-//     kv heads on grid.x (x = (stream, query, kv head), kv head fastest; y = split);
-//   - the op contract (ggml.h): q * scale in f32, then f16 (the PR rounded q and scale to f16 first);
-//   - masked-off and padding cells contribute nothing whatever their bytes (contract item 4): their K and V halves are
-//     never loaded (zero fragments) and their scores are -inf. All rows of a block belong to one query, so a cell is
-//     either attended by every row or by none: no row-dependent masking inside the PV WMMA is needed (the G4 fixup case
-//     cannot arise);
-//   - split-K: the shape-only split count sa_g1_splits (below); split z of a group takes the chunks
-//     [z * len, min((z + 1) * len, C)), len = ceil(C / S), of its C = counts / 4 chunks: a pure function of the plan (at
-//     most as many chunks per split as the PR's 64-key splits hold on complete-quad rows). With one split the block
-//     normalises and writes dst itself; otherwise it writes the PR partial row (256 values, max, normaliser) and
-//     sa_merge_splits (sparse-attn-merge.cu) combines the splits in a fixed order;
-//   - the in-op rotations (PLAN-v3 §8, D13): rot_q != 0 replaces the Q prologue by one that takes whole query rows (wave w
-//     the heads w and w + 8) through fwht_row (sparse-attn-fwht.cuh, the arithmetic of fwht.cu) in f32 before the f32
-//     product with scale and the f16 rounding; rot_o != 0 makes the one-split epilogue stage acc / l per head in shared
-//     memory (8 heads at a time) and store H_o of each row (fwht_row); with more splits the partials stay unrotated and
-//     sa_merge_splits applies H_o after the merge. The rotation code exists only in the ROT = true instances: the ROT =
-//     false ones, which every op without rotation runs, compile to the W9 kernels.
-//
-// Every count / quad / mask entry the kernel reads is inside the plan dst; every K / V cell it reads is a cell
-// 4 * quad + c with quad < ceil(n_kv / 4), inside the views (ggml_sparse_attn asserts the view rows). Offsets are size_t.
+// sa_attend_g1<KT, VT, GQA, ROT>: GGML_OP_SPARSE_ATTN with a G = 1 plan on RDNA3 WMMA. Block = one query and one kv
+// head: rows are its GQA query heads (padded to 16 with zero q), grid.x =
+// (stream, query, kv head) with kv head fastest, grid.y = split. Per 16-cell chunk: QK WMMA, online softmax in wave 0,
+// PV WMMA. V is LDS-staged and transposed through a wave-private 1 KB slot; K is direct per lane for f16 / q8_0, split
+// for q4_0 / bf16 / the generic tier.
+//   - cells come from the plan in ascending order, so the output is a function of the op's inputs;
+//   - q * scale in f32, then f16;
+//   - masked-off and padding cells are never loaded (zero fragments) and score -inf. All rows belong to one query, so no
+//     row-dependent masking is needed in the PV WMMA (no fixup);
+//   - split z takes chunks [z * len, min((z + 1) * len, C)), len = ceil(C / splits). One split normalises and writes dst;
+//     otherwise it writes a partial row (256 values, max, normaliser) for sa_merge_splits;
+//   - rotations (ROT = true instances only): H_q on whole query rows in f32 before the scale; H_o in the one-split
+//     epilogue (8 heads at a time through shared memory), else after the merge.
+// Every plan entry read is inside the plan dst and every K / V cell inside the views. Offsets are size_t.
 
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
 
-// ---- shape-only split count (PLAN-v3 §5 "kernel instance, V pack vs direct, split count") ----
-// PR #219's decode rule (qsa-decode.cu:134-145, step 64 for the WMMA kernel) on n_sel keys, so the G1 grid of every shape
-// is the one C18 and R2-BOP measured: up to 8 queries every split covers 64 keys; with more queries the splits get longer
-// so the grid stays near its 8-query size. The count is then clamped to the chunks the plan can hold
-// (cap / 4, cap = round4(min(n_sel, ceil(n_kv / 4))) entries of G1), so no split is empty by construction of the shape
-// alone, and to the 65535 blocks of grid.y. It depends on (n_q, n_sel, n_kv) only: never on the plan's data or a pointer.
+// ---- shape-only split count ----
+// Decode split rule on n_sel keys: up to 8 queries every split covers 64 keys, with more queries the splits get longer
+// so the grid stays near its 8-query size. Clamped to the plan's chunks (cap / 4), so no split is empty, and to grid.y.
+// It depends on (n_q, n_sel, n_kv) only, never on the plan's data.
 static inline int64_t sa_g1_splits(const int64_t n_q, const int64_t n_sel, const int64_t n_kv) {
     const int64_t step = 64;
     int64_t chunk = step;
@@ -60,22 +36,19 @@ static inline int64_t sa_g1_splits(const int64_t n_q, const int64_t n_sel, const
     return std::max<int64_t>(1, std::min(std::min(pr_splits, cap / 4), (int64_t) 65535));   // 65535: grid.y
 }
 
-// the dispatch-census split class of a split count (sparse-attn-census.h keys .../splits<class>/...): the classes of the
-// PLAN-v3 §14.2 band table (1, 2-5, 6-16, 17-33, > 33)
+// the census split class of a split count (1, 2-5, 6-16, 17-33, > 33)
 static inline int sa_g1_split_class(const int64_t splits) {
     return splits <= 1 ? 0 : splits <= 5 ? 1 : splits <= 16 ? 2 : splits <= 33 ? 3 : 4;
 }
 #define SA_G1_SPLIT_CLASSES 5
 
-// bytes of the split-K partials: [n_stream][n_q][n_head][splits][258] f32 (PR layout), none with one split
+// bytes of the split-K partials: [n_stream][n_q][n_head][splits][258] f32, none with one split
 static inline size_t sa_g1_partial_bytes(const int64_t n_q, const int64_t n_head, const int64_t n_stream, const int64_t splits) {
     return splits > 1 ? (size_t) n_stream * (size_t) n_q * (size_t) n_head * (size_t) splits * 258 * sizeof(float) : 0;
 }
 
-// the largest partial buffer any runtime G1 op with n_q' <= n_q, n_kv' <= n_kv (same n_sel, n_head, n_stream) can use:
-// splits is non-increasing in n_q (the PR target is), non-decreasing in n_kv (the clamp), and 1 for every
-// n_q >= 8 * ceil(n_sel / 64), so the loop stops there (R1-C: the G1 partials are not monotone in n_q, 65 -> 7.68 MiB,
-// 66 -> 6.24 MiB per stream at n_sel 2051)
+// the largest partial buffer any runtime G1 op with n_q' <= n_q, n_kv' <= n_kv can use. The bytes are not monotone in
+// n_q, hence the loop; splits is 1 for every n_q >= 8 * ceil(n_sel / 64), so it stops there
 static inline size_t sa_g1_partial_bytes_max(const int64_t n_q, const int64_t n_sel, const int64_t n_kv, const int64_t n_head,
                                              const int64_t n_stream) {
     size_t m = 0;
@@ -115,19 +88,18 @@ struct sa_g1_args {
     float            scale;
     float *          out;       // splits == 1: dst F32 [256, n_head, n_q, n_stream]
     float *          partial;   // splits > 1: [n_stream][n_q][n_head][splits][258]
-    int              kt_g;      // KT / VT == SA_T_GEN (the generic tier): the ggml types of K and V (sa_any_elem)
+    int              kt_g;      // generic tier: the ggml types of K and V
     int              vt_g;
     int              rot_q;     // H_q block size (0, 64, 128 or 256)
     int              rot_o;     // H_o block size; applied here with one split, by sa_merge_splits otherwise
-    float            rot_q_scale;   // 1.0f / sqrtf(rot_q), as fwht.cu computes it
+    float            rot_q_scale;   // 1.0f / sqrtf(rot_q), as fwht.cu
     float            rot_o_scale;   // 1.0f / sqrtf(rot_o)
-    int              rot_dump;  // test switch GGML_CUDA_SA_FORCE=rot_dump (rot_q != 0): write H_q q (f32) to out and stop
+    int              rot_dump;  // test switch (rot_q != 0): write H_q q (f32) to out and stop
 };
 
 typedef void (*sa_g1_kernel_t)(const sa_g1_args);
 
-// the generic tier's G1 instances (sparse-attn-generic.cu): sa_attend_g1<SA_T_GEN, SA_T_GEN, GQA, ROT> at index
-// 2 * gqa_index + ROT
+// the generic tier's G1 instances, index 2 * gqa_index + ROT
 extern const sa_g1_kernel_t ggml_cuda_sa_gen_g1_kernels[];
 
 template <int KT, int VT, int GQA, bool ROT>
@@ -137,11 +109,11 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
     NO_DEVICE_CODE;
 #else
     static_assert(GQA == 4 || GQA == 8 || GQA == 12, "GQA must be 4, 8 or 12");
-    // K direct for f16 and q8_0, split for q4_0 and bf16 (D9, C18 decision 2)
+    // K direct for f16 and q8_0, split for q4_0 and bf16
     constexpr bool K_DIRECT = KT == SA_T_F16 || KT == SA_T_Q8_0;
 
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, r = lane & 15, hi = lane >> 4;
-    // grid: x = (stream, query, kv head), kv head fastest (the PR's blockIdx.x), y = split
+    // grid: x = (stream, query, kv head), kv head fastest, y = split
     const int bq = blockIdx.x / a.n_head_kv, kvh = blockIdx.x - bq * a.n_head_kv;
     const int s = bq / a.n_q, query = bq - s * a.n_q, split = blockIdx.y;
     __shared__ union {
@@ -165,7 +137,7 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
     const char *     kb_  = a.k + (size_t) s * a.k_nb3 + (size_t) kvh * a.k_nb2;
     const char *     vb_  = a.v + (size_t) s * a.v_nb3 + (size_t) kvh * a.v_nb2;
 
-    // Q prologue: f16(q * scale) (f32 product, one rounding; the PR computed f16(q) * f16(scale)), rows >= GQA zero
+    // Q prologue: f16(q * scale) (f32 product, one rounding), rows >= GQA zero
     sa_v16s qf[2];
     if (ROT && a.rot_q != 0) {
         // H_q: wave w takes heads w and w + 8 whole (lane l holds dims 32 j + l), transforms them in f32 and writes
@@ -219,8 +191,7 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
     float maximum = -INFINITY, normalizer = 0.0f;
     for (int c = c0; c < c1; ++c) {
         // the 16 cells of chunk c: cell kk = entry 4 * c + (kk >> 2), cell 4 * quad + (kk & 3), -1 when its mask bit is
-        // clear. The 4 quads and masks of the chunk are uniform over the block (scalar loads); each lane forms the cell
-        // it loads from them (the PR read its key from the index row, ir[start + r])
+        // clear. The chunk's quads and masks are uniform over the block (scalar loads)
         const uint4 bb = *reinterpret_cast<const uint4 *>(gblk + 4 * c);
         const uint2 mm = *reinterpret_cast<const uint2 *>(gmsk + 4 * c);
         auto cell_of = [&](const int kk) -> int {
@@ -238,7 +209,6 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
                 kf[t] = sa_v16s{};
                 if (key >= 0) {
                     if constexpr (KT == SA_T_Q8_0) {
-                        // PR #219's decode q8 K loader (qsa-decode-wmma.cuh:63-74), names adapted
                         const char * blk = kb_ + (size_t) key * a.k_nb1 + 34 * w;
                         const _Float16 d = __builtin_bit_cast(_Float16, *reinterpret_cast<const uint16_t *>(blk));
                         const sa_half2 d2 = sa_half2{d, d};
@@ -261,7 +231,7 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
             const int key = cell_of(r);
             uint32_t o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             if (key >= 0) {
-                if constexpr (KT == SA_T_GEN) {   // the generic tier: converted at load (runtime type)
+                if constexpr (KT == SA_T_GEN) {   // generic tier: converted at load
                     sa_any_piece(a.kt_g, kb_ + (size_t) key * a.k_nb1, w, hi, o);
                 } else {
                     uint32_t raw[sa_piece<KT>::N];
@@ -301,8 +271,7 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
             float local = -INFINITY;
 #pragma unroll
             for (int e = 0; e < 8; ++e) {
-                // select: a cell outside the plan's mask scores -inf (a NaN score of a never-loaded cell cannot arise:
-                // its K fragment is zero, but the select keeps the rule independent of that)
+                // select: a cell outside the plan's mask scores -inf (independent of its zero K fragment)
                 if (cell_of(2*e + hi) < 0) {
                     score[e] = -INFINITY;
                 }
@@ -311,10 +280,8 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
             local = fmaxf(local, __shfl_xor(local, 16));
             const float next  = fmaxf(maximum, local);
             const float alpha = next == -INFINITY ? 1.0f : exp2f((maximum - next) * SA_L2E);
-            // fmaxf drops a NaN score, so next stays -inf in a chunk whose cells all score -inf or NaN (the first chunk of a
-            // split included): the exponentials are then taken against 0, so a -inf (or masked) cell gets 0 and a NaN cell
-            // keeps its NaN, which makes the normaliser NaN and the row 0 (ggml.h item 5; the merge keeps a NaN split). p = 0
-            // there dropped the NaN: the softmax over the row's other cells
+            // fmaxf drops a NaN score, so next stays -inf in a chunk of only -inf / NaN scores: exponentials are then taken
+            // against 0, a -inf cell gets 0 and a NaN cell keeps its NaN, so the normaliser is NaN and the row 0 (op contract)
             const float ref   = next == -INFINITY ? 0.0f : next;
             float sum = 0.0f;
 #pragma unroll
@@ -334,8 +301,8 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
         const float alpha = alpha_s[r];
         const sa_v16s pf = __builtin_bit_cast(sa_v16s, (uint4[2]){
             *(const uint4 *) &probabilities[r][0], *(const uint4 *) &probabilities[r][8]});
-        // V, LDS-staged (C18 "S"): lane l loads piece l & 1 of cell l >> 1 (coalesced), converts it once and writes it
-        // transposed into the wave's 1 KB slot (bank swizzle), the WMMA A fragment is read back with 2 x b128 per t
+        // V, LDS-staged: lane l loads piece l & 1 of cell l >> 1 (coalesced), converts it once and writes it transposed
+        // into the wave's 1 KB slot (bank swizzle); the WMMA A fragment is read back with 2 x b128 per t
         sa_v16s vf[2];
         {
             const int kk = lane >> 1, p = lane & 1;
@@ -383,14 +350,14 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
         __syncthreads();
     }
     if (a.splits == 1) {
-        // one split: normalise and write dst (the PR merge of one split computes the same acc / l: factor exp(0) = 1)
+        // one split: normalise and write dst
         if (w == 0 && hi == 0) {
             l_s[r] = normalizer;
         }
         __syncthreads();
         if (ROT && a.rot_o != 0) {
-            // H_o: 8 heads at a time, acc / l staged whole (head - h0, dim) in shared memory; wave w then transforms head
-            // h0 + w (the fwht_row layout) and stores it. The chunk loop ended on a barrier, so the union is free
+            // H_o: 8 heads at a time, acc / l staged whole in shared memory; wave w transforms head h0 + w and stores it.
+            // The chunk loop ended on a barrier, so the union is free
             for (int h0 = 0; h0 < GQA; h0 += 8) {
                 if (r >= h0 && r < h0 + 8 && r < GQA) {
                     const float l = l_s[r];

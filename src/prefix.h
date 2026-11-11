@@ -9,9 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
-// PLAN-v3 §4.2 step 3: the cells of one stream belong to at most one sequence. The non-compact scan ranks the cells in the
-// mask's (pos, y, x) order only then (llama_memory_hybrid_idx::set_input_qsa_scan), and the compact predicate accepts 2-D
-// rows only then: both call this one function, so the two cannot diverge (test-qsa-visibility asserts it per ubatch)
+// the cells of the stream belong to at most one sequence; the scan's ranking and the compact predicate share this test
 static bool qsa_stream_one_seq(const llama_kv_cells & cells) {
     int n_seq_present = 0;
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -27,14 +25,14 @@ static bool qsa_scan_ranks(const llama_kv_cells & cells, bool dup, bool pos_2d) 
     return dup && pos_2d && qsa_stream_one_seq(cells);
 }
 
-// why the compact predicate rejected a ubatch (0 = compact); the graph-build check and the re-split log the name
+// why the compact predicate rejected a ubatch (0 = compact)
 enum qsa_compact_reason {
     QSA_COMPACT_OK          = 0,
-    QSA_NC_INPUT            = 1, // the ubatch lacks positions or sequence ids, or a stream split does not divide it
-    QSA_NC_POS_RANGE        = 2, // a position outside [0, 2^24): the producer's f32 cell ids are exact only below it
-    QSA_NC_DUP_KEY          = 3, // two cells of one sequence with the same (pos, y, x) key: the mask order is not total
-    QSA_NC_2D_MULTI_SEQ     = 4, // a sequence of the stream holds 2-D cells while another sequence has cells in the stream
-    QSA_NC_SHARED_BLOCK     = 5, // a position block holds one sequence under two sequence sets (seq_cp inside the block)
+    QSA_NC_INPUT            = 1, // missing positions / sequence ids, or a bad stream split
+    QSA_NC_POS_RANGE        = 2, // a position outside [0, 2^24): f32 cell ids are exact only below it
+    QSA_NC_DUP_KEY          = 3, // two cells of one sequence share a (pos, y, x) key: the mask order is not total
+    QSA_NC_2D_MULTI_SEQ     = 4, // 2-D cells in a stream with another sequence: the scan cannot rank them
+    QSA_NC_SHARED_BLOCK     = 5, // a block holds one sequence under two sets (seq_cp): no complete group for it
 };
 
 static const char * qsa_compact_reason_name(int r) {
@@ -49,22 +47,19 @@ static const char * qsa_compact_reason_name(int r) {
     return "unknown";
 }
 
-// the mask's key of a cell: (pos, y, x) under M-RoPE (llama-kv-cache.cpp set_input_kq_mask_impl, is_2d_gt), pos alone otherwise
+// the mask's key of a cell: (pos, y, x) under M-RoPE, pos alone otherwise
 static bool qsa_key_2d(const llama_kv_cells & cells, uint32_t j) {
     return cells.ext_get(j).is_2d_gt(cells.pos_get(j), cells.pos_get(j));
 }
 
-// duplicate (pos, y, x) keys among the cells of seq: the positions come sorted from seq_pos_get, so only the cells of a
-// position that occurs more than once are compared on (y, x). A sequence with unique positions (every text sequence,
-// seq_cp copies included) is answered from the cells' duplicate count without a walk: the predicate runs on every graph
-// build and can_reuse of a multi-sequence context, and the walk visited every cell of every sequence of the ubatch there.
-// walked (test hook, test-qsa-dup-key): the set entries visited
+// duplicate (pos, y, x) keys among the cells of seq; unique positions answer in O(1) from the duplicate count, since
+// this runs on every graph build. walked (test hook): the set entries visited
 static bool qsa_seq_has_dup_key(const llama_kv_cells & cells, llama_seq_id seq, bool pos_2d, size_t * walked = nullptr) {
     if (cells.seq_pos_n_dup(seq) == 0) {
-        return false;   // no position repeats: no key can
+        return false;
     }
     if (!pos_2d) {
-        return true;    // the key is the position alone
+        return true;
     }
     const auto & sp = cells.seq_pos_get(seq);
     std::vector<std::pair<llama_pos, llama_pos>> yx;
@@ -87,17 +82,9 @@ static bool qsa_seq_has_dup_key(const llama_kv_cells & cells, llama_seq_id seq, 
     return false;
 }
 
-// compact (maskless) visibility of the tokens [i0, i0 + n) of a ubatch: one stream, its cells, its own sequence ids
-// (PLAN-v3 §4.2, D7). Each query reads the block row of its first seq id, as the attention mask does.
-//  - embedding (image) ubatches are accepted like token ubatches (step 1);
-//  - only the sequence ids of this stream's tokens count (step 2);
-//  - a sequence holding 2-D cells is compact iff the stream holds cells of that one sequence (step 3): the mask makes cell j
-//    visible to query q iff key(j) <=lex key(q) on (pos, y, x), so the visible set is a prefix of the rank order the scan
-//    builds (qsa_scan_ranks), whatever the physical cell order, and the limits are rank-based;
-//  - degenerate input (a position >= 2^24, a duplicate key) is rejected (step 4): the non-compact route reads the mask;
-//  - text ubatches in a multi-sequence unified stream stay compact when no sequence of the ubatch holds 2-D cells (step 5),
-//    unless a block holds one sequence under two sequence sets (seq_cp inside the block): it has no complete group for it,
-//    so the maskless path would drop its cells.
+// compact (maskless) visibility of the tokens [i0, i0 + n) of a ubatch on one stream: each query reads the block row of its
+// first seq id, as the mask does. 2-D cells need a one-sequence stream, where the scan's rank order makes the visible set
+// a prefix; a multi-sequence stream stays compact for text. QSA_COMPACT_OK or the reason.
 static int qsa_compact_visibility_stream(const llama_kv_cells & cells, uint32_t count, uint32_t ratio, const llama_ubatch & u,
         uint32_t i0, uint32_t n) {
     if (ratio==0 || count>cells.size() || !u.pos || !u.n_tokens || !u.n_pos || !u.seq_id || !u.n_seq_id || n==0 ||
@@ -143,7 +130,7 @@ static int qsa_compact_visibility_stream(const llama_kv_cells & cells, uint32_t 
     return QSA_COMPACT_OK;
 }
 
-// the whole ubatch on one stream (the single-stream callers and the unit tests)
+// the whole ubatch on one stream
 static bool qsa_scalar_visibility_cells(const llama_kv_cells & cells, uint32_t count, uint32_t ratio, const llama_ubatch & u) {
     return qsa_compact_visibility_stream(cells, count, ratio, u, 0, u.n_tokens) == QSA_COMPACT_OK;
 }

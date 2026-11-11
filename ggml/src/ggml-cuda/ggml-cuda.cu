@@ -87,8 +87,7 @@
 #include <vector>
 
 #if defined(GGML_USE_HIP)
-// dispatch census and HIP graphs (definitions with the census procs below): the ids dispatched while a graph is being
-// captured are recorded into it, and a replay of the graph counts them again
+// dispatch census: ids dispatched during a graph capture are recorded into the graph and counted again at every replay
 static void ggml_cuda_sa_census_capture_begin(std::vector<uint16_t> * ids);
 static void ggml_cuda_sa_census_capture_end(void);
 static void ggml_cuda_sa_census_replay(const std::vector<uint16_t> & ids);
@@ -6833,10 +6832,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // sparse-attention gate fusion (PLAN-v3 §6.2, O28): SPARSE_ATTN -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .)
-    // runs the EPI = gated G4 instance: sigmoid(gate) * O in the attend epilogue, the SPARSE_ATTN output itself is never
-    // stored. The gate rows R = (s * n_q + i) * n_head + h are read at gate->data + R * gate->nb[1], so the gate is
-    // [D, n_head, n_q, n_stream] or [D, n_head, n_q * n_stream] with contiguous heads (the qwen4exp view of Qcur_full).
+    // sparse-attention gate fusion: SPARSE_ATTN -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .) runs the gated
+    // G4 instance (sigmoid(gate) * O in the epilogue). Gate row R = (s * n_q + i) * n_head + h at gate->data + R * nb[1].
 #if defined(GGML_USE_HIP)
     if (node->op == GGML_OP_SPARSE_ATTN && (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && ggml_is_contiguous(node) &&
             ggml_cuda_sparse_attn_gate_ok(cuda_ctx->device, node)) {
@@ -6874,13 +6871,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, j + 2, mul, &f16);
                 store_f32 = !(dst16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, mul));
             }
-            if (ok) {   // what the kernel writes must not overlap anything it reads (q, k, v, plan, gate, and the V pack
-                        // workspace in the node's own over-allocation). The allocator may hand the gated output the
-                        // memory of Q (dead after the attend): harmless when only the 16-bit copy is written. An output
-                        // that overlaps a read goes to graph memory the fusion leaves unwritten (the attend's own dst,
-                        // the CONT / SIGMOID outputs: in the reserved compute buffer, never the pool, D12) and one device
-                        // copy moves it into place, so the fusion does not depend on where gallocr put the MUL (Prove: the
-                        // MTP server census refused 40 of 96 fusible attends on the overlap); no room: not fused
+            if (ok) {   // an output that overlaps a read (q, k, v, plan, gate, workspace) goes to graph memory the fusion
+                        // leaves unwritten and is copied into place, so the fusion does not depend on where gallocr put
+                        // the MUL; no room: not fused
                 size_t ws_off = 0, ws_bytes = 0;
                 ggml_cuda_sparse_attn_ws_range(cuda_ctx->device, node, &ws_off, &ws_bytes);
                 ggml_cuda_sa_span reads[6];
@@ -6919,8 +6912,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif // defined(GGML_USE_HIP)
 
-    // FA gate fusion: FLASH_ATTN_EXT (fa7) -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .): the gate in the
-    // attention epilogue; the FA output itself is never stored. QSA layers take the SPARSE_ATTN gate fusion above
+    // FA gate fusion: FLASH_ATTN_EXT (fa7) -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .), the gate in the
+    // attention epilogue. QSA layers take the SPARSE_ATTN gate fusion above
     if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_fa7_gate_ok(*cuda_ctx, node) && ggml_is_contiguous(node) &&
             (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
         int j = i + 1;
@@ -9788,15 +9781,13 @@ static void ggml_backend_cuda_set_mmb_small_batch(ggml_backend_t backend, bool e
     ((ggml_backend_cuda_context *) backend->context)->mmb_small_batch = enable;
 }
 
-// Dispatch census of the HIP sparse-attention kernels (sparse-attn-census.h): one relaxed counter per compiled key, off
-// (one relaxed load per dispatch) until ggml_backend_debug_dispatch_census_reset.
+// Dispatch census of the HIP sparse-attention kernels: one relaxed counter per compiled key, off until reset.
 #if defined(GGML_USE_HIP)
 static std::atomic<bool>     ggml_cuda_sa_census_on {false};
 static std::atomic<uint64_t> ggml_cuda_sa_census_counts[GGML_CUDA_SA_CENSUS_N];
 static_assert(GGML_CUDA_SA_CENSUS_N <= 65536, "census ids are recorded into HIP graphs as uint16_t");
 
-// the census ids of the graph this thread is capturing (recorded whether the census is on or off, so a graph captured
-// before a reset is still counted when it is replayed after it)
+// the census ids of the graph this thread is capturing (recorded even when the census is off, for a replay after a reset)
 static thread_local std::vector<uint16_t> * ggml_cuda_sa_census_capture = nullptr;
 
 void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id) {
@@ -9852,10 +9843,9 @@ static const char * const * ggml_backend_cuda_dispatch_census_list(void) {
     return ggml_cuda_sa_census_keys;
 }
 
-// NULL when label is a compiled key or a prefix of one that this process can dispatch; otherwise why this backend never
-// counts it (not a key, or excluded by a forcing switch such as GGML_CUDA_SA_FORCE)
+// NULL when label is a compiled key or a prefix of one that this process can dispatch, else why it is never counted
 static const char * ggml_backend_cuda_dispatch_census_skip(ggml_backend_t backend, const char * label) {
-    // the device decides the tier (the portable tier on HIP archs other than RDNA3.5); -1 when the backend is not given
+    // the device decides the tier; -1 when the backend is not given
     const int device = backend != nullptr && backend->context != nullptr ? ((ggml_backend_cuda_context *) backend->context)->device : -1;
     if (const char * why = ggml_cuda_sparse_attn_census_skip(device, label)) {
         return why;
@@ -9880,16 +9870,14 @@ static const char * ggml_backend_cuda_sparse_attn_unsupported_reason(ggml_backen
     return ggml_cuda_sparse_attn_unsupported_reason(device, op);
 }
 
-// sparse-attention policies of the HIP backend (PLAN-v3 §5; ggml-backend.h ggml_backend_sparse_attn_group_t,
-// ggml_backend_sparse_attn_prefer_dense_t), for the device dev of a QSA layer's K buffer (sparse-attn-attend-g1.cu)
+// sparse-attention policies of the HIP backend, for the device of a QSA layer's K buffer
 static int32_t ggml_backend_cuda_sparse_attn_group(ggml_backend_dev_t dev, int64_t n_q_per_stream, int64_t n_kv,
                                                    enum ggml_type type_k, enum ggml_type type_v, bool shortcut) {
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
     return ggml_cuda_sparse_attn_group(device, n_q_per_stream, n_kv, type_k, type_v, shortcut);
 }
 
-// a FLASH_ATTN_EXT of the dense shortcut's shape (D 256, the qwen4exp heads, a causal f16 mask) on this device: the same
-// probe as the Vulkan policy (ggml_vk_sa_dense_fa_supported)
+// a FLASH_ATTN_EXT of the dense shortcut's shape (D 256, the qwen4exp heads, a causal f16 mask) on this device
 static bool ggml_cuda_sa_dense_fa_supported(ggml_backend_dev_t dev, ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv) {
     ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
@@ -9908,11 +9896,8 @@ static bool ggml_cuda_sa_dense_fa_supported(ggml_backend_dev_t dev, ggml_type ty
     return ok;
 }
 
-// The gfx1151 table (ggml_cuda_sparse_attn_prefer_dense) picks the dense FLASH_ATTN_EXT, which qwen4exp then builds for the
-// n_kv <= top_k + r - 1 shortcut. A device whose FLASH_ATTN_EXT does not take the pair (a build with -DGGML_CUDA_FA=OFF:
-// GGML_CUDA_NO_FA, every FA kernel choice BEST_FATTN_KERNEL_NONE) keeps the sparse op, which its tiers run without FA;
-// the dense pick there failed the QSA guard ("no dense attention kernel for this pair on this device") although the
-// sparse route runs. test-qsa-prefer-dense checks every dense pick against the device's FLASH_ATTN_EXT.
+// The dense shortcut pick needs a FLASH_ATTN_EXT that takes the pair (none with -DGGML_CUDA_FA=OFF): otherwise keep the
+// sparse op, which runs without FA.
 static bool ggml_backend_cuda_sparse_attn_prefer_dense(ggml_backend_dev_t dev, enum ggml_type type_k, enum ggml_type type_v,
                                                        int64_t n_q, int64_t n_kv) {
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;

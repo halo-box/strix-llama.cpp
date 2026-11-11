@@ -23,11 +23,7 @@
 #include <unistd.h>
 #endif
 
-// AT-W7PERF (PLAN-v3 §10, §16.5): the pre-registered decisions of the -nkvo gate. Fallback (a), plan and attend on the CPU,
-// missed the gate for f16, q8_0, q4_0 and bf16 (54 of 56 cells FAIL, 0.48-0.95 of W0-lab, phase ND). Fallback (b), this host-KV copy route,
-// is the next route of the pre-registered order for those four types: it met the gate for f16, q8_0 and q4_0 (phase NDB,
-// every cell PASS or a d0 cell whose CI contains 0.98); bf16 under (b) was not measured (UNPROVEN). The other types keep
-// fallback (a): no -nkvo cell was measured for them. The shortcut pin applies to the CPU route only; AT-W7PERF (d) did not run.
+// -nkvo: pin the shortcut attention over a host K buffer to the CPU (the CPU route only)
 static constexpr bool QWEN4EXP_SHORTCUT_PIN_DEFAULT = true;
 
 // defined below, used by the graph constructor
@@ -1120,10 +1116,8 @@ static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t 
 
 // Complete-block selection: pick indexer_top_k/ratio whole blocks that lie before the query's own block and
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
-// selected rows then carry the visibility themselves, so attention runs without a mask, on GGML_OP_SPARSE_ATTN, for any
-// K / V type, on any backend and whatever -fa or -nkvo say (PLAN-v3 D5, D21; the placement is pinned, build_layer_attn).
-// Embedding (image) ubatches take it too: the single-sequence image predicate (PLAN-v3 §4.2) decides their visibility like a
-// token ubatch's; a non-compact ubatch takes the TE rows (PLAN-v3 §4.1 row 4, qwen4exp-te.h).
+// selected rows then carry the visibility themselves, so GGML_OP_SPARSE_ATTN runs without a mask, for any K / V type and
+// backend. A non-compact ubatch takes the TE rows instead (qwen4exp-te.h).
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
     GGML_UNUSED(ubatch);
@@ -1132,15 +1126,12 @@ static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n
         n_kv>hparams.indexer_top_k+ratio-1;
 }
 
-// The shortcut attention of a QSA layer whose K buffer is on the host while its weights are on a GPU (-nkvo). AT-W7PERF (d)
-// decides whether it is pinned to the CPU (PLAN-v3 §10); the measurement override is lab patch 06 (scripts/qsa-validation).
+// the shortcut attention of a QSA layer with a host K buffer and GPU weights (-nkvo): pinned to the CPU or left to the scheduler
 static bool qwen4exp_pin_shortcut() {
     return QWEN4EXP_SHORTCUT_PIN_DEFAULT;
 }
 
-// The host-KV fallback of PLAN-v3 §10, enabled per type by the AT-D4 / AT-W7PERF (c) result: plan and attend on the GPU of
-// the layer's weights, K / V copied by the scheduler (the PR219 route). The measurement override is lab patch 06
-// (scripts/qsa-validation). Only reachable when offload_kqv is off, and logged as route=host-kv-copy.
+// -nkvo: plan and attend on the layer's GPU, K / V copied by the scheduler, for the types where it beats the CPU route
 static bool qwen4exp_host_kv_copy(ggml_type type_k, ggml_type type_v) {
     auto on_grid = [](ggml_type t) {
         return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0 || t == GGML_TYPE_BF16;
@@ -1415,7 +1406,7 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
     cb(k_raw, "indexer_k_raw", il);
 
     ggml_tensor * idx_store = mctx_idx->cpy_k(ctx0, k_raw, qsa_k_inp->k_idxs, il);
-    res->add_qsa_idx_node(il, idx_store);   // the guard checks where the indexer cache is written (the shortcut range too)
+    res->add_qsa_idx_node(il, idx_store);
     ggml_build_forward_expand(gf, idx_store);
 }
 
@@ -1473,18 +1464,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         const auto * attn_ctx = mctx_hyb->get_attn();
         const bool blocks = attn_ctx && qwen4exp_use_block_selection(blk_bias, r, n_kv, ubatch, cparams, hparams);
-        // the sparse op takes n_stream on ne[3] at any n_tps (PLAN-v3 §4.4)
-        // the reserve's non-compact variant (PLAN-v3 §7.1.4) forces the decision: the empty-cache reserve ubatch is compact.
-        // Every reserve graph decides on an empty cache (LLM_GRAPH_QSA_RESERVE_GRAPH), also a reserve that runs mid-session
-        // over the live cells (sched_need_reserve), so its pp / tg graphs are the compact ones of init
+        // the non-compact reserve variant forces the decision: the empty-cache reserve ubatch is compact
         const bool force_nc = (qsa_reserve & LLM_GRAPH_QSA_RESERVE_NONCOMPACT) != 0;
         const bool scalar = !force_nc && blocks && hparams.n_swa == 0 &&
                 mctx_hyb->qsa_graph_compact(ubatch, (uint32_t) r, (qsa_reserve & LLM_GRAPH_QSA_RESERVE_GRAPH) != 0);
-        // the always-on graph-build check (PLAN-v3 §4.3, no env gate): a non-compact ubatch on the selection path with more
-        // than U tokens, or any non-compact ubatch in a single-sequence context (it reserves no variant, §7.1.5), is a
-        // decode error; process_ubatch returns it before the graph is allocated. The reserve graphs never trigger it
-        // (they are compact, and the variant has T <= U); a reused graph keeps the same compact flag (can_reuse). Only
-        // where block selection is eligible (qwen4exp_qsa_noncompact_error): elsewhere every ubatch takes the TE rows
+        // a non-compact ubatch the reserve does not cover is a decode error (qwen4exp-qsa-check.h)
         {
             const uint32_t U = mctx_hyb->qsa_noncompact_cap(cparams.n_ubatch);
             if (qwen4exp_qsa_noncompact_error(blocks, hparams.n_swa != 0, force_nc, scalar, n_kv, (int64_t) hparams.indexer_top_k + r - 1,
@@ -1530,7 +1514,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     {
         ggml_tensor * idx_store = mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il);
-        res->add_qsa_idx_node(il, idx_store);   // the guard checks where the indexer cache is written and read
+        res->add_qsa_idx_node(il, idx_store);
         ggml_build_forward_expand(gf, idx_store);
     }
 
@@ -1539,7 +1523,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
     ggml_tensor * storage = r == 4 && blk_bias && cparams.causal_attn && n_stream == 1 ? mctx_hyb->qsa_cache(ctx0, il) : nullptr;
-    // reserve pass A (PLAN-v3 §7.1.2) builds the fast-cache route the empty-cache reserve never reaches (C15: +33280 B ROCm0)
+    // the fast-cache reserve builds the route the empty-cache reserve never reaches
     const bool reserve_fast = (qsa_reserve & LLM_GRAPH_QSA_RESERVE_FAST) != 0 && n_tokens <= 512;
     ggml_tensor * cached = storage && (reserve_fast || mctx_hyb->qsa_prefix_matches(ubatch)) ? storage : nullptr;
     const bool fast_cache = cached && (reserve_fast || mctx_hyb->qsa_fast(il, ubatch));
@@ -1704,9 +1688,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             continue;
         }
 
-        // non-compact (PLAN-v3 §4.1 row 4): PR219's TE set, top_k(expanded, width), with the cells the visibility hides
-        // set to -1 (qwen4exp-te.h). cell_blk indexes every block, so the scorer is never bounded here
-        // (qwen4exp_score_key_limits returns no bound for a non-compact ubatch)
+        // non-compact: the TE rows (qwen4exp-te.h). cell_blk indexes every block, so the scorer is never bounded here
         GGML_ASSERT(score_blocks == n_blocks);
         ggml_tensor * add = bias;
         if (blk_bias) {
@@ -1720,24 +1702,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
         const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
-        // [width, n_query, 1, n_stream], the layout of the sparse plan's rows. The visibility of a picked cell is read from
-        // the mask (or the per-cell bias) as stored, not from expanded or the mask cast: expanded's only consumer stays the
-        // TOP_K, which the Vulkan TOPK_QSA fusion requires (qwen4exp-te.h)
+        // visibility from the mask as stored, so the TOP_K stays expanded's only consumer (Vulkan TOPK_QSA fusion)
         const qwen4exp_te_sel sel = qwen4exp_te_select(ctx0, expanded, blk_bias ? query_mask : bias, width);
         cb(sel.top_k, "indexer_top_k", il);
         qwen4exp_append_strip(ctx0, gf, selected, sel.rows);
     }
     ggml_tensor * top_k = qwen4exp_finish_strips(ctx0, gf, selected);
-    // the rows that feed the plan: the names of PLAN-v3 §4.5
     cb(top_k, inp->tail_idxs ? "qsa_rows_cb" : "qsa_rows_te", il);
 
     return top_k;
 }
 
-// All-visible rows of the dense-shortcut range (PLAN-v3 §4.1): cell j where the causal mask is 0, else -1, over the whole
-// mask [n_kv, n_tps, 1, n_stream]; the 4-D form is the only one that holds under split streams (R1-AV). The rows depend
-// only on the mask, which every layer shares, so they are built once per graph and each layer reads them through its own
-// view named qsa_rows_av-<il>.
+// All-visible rows of the shortcut range: cell j where the mask is 0, else -1, over the 4-D mask (split streams need it).
+// Built once per graph from the shared mask; each layer reads its own view.
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_rows_av(ggml_tensor * m, int il) {
     if (qsa_rows_av_shared == nullptr) {
         GGML_ASSERT(m->ne[2] == 1 && m->ne[1]*m->ne[3] == n_tokens && ggml_is_contiguous(m));
@@ -1754,7 +1731,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_rows_av(ggml_tensor * m, in
     return rows;
 }
 
-// the placement and the policies of a QSA layer's attention (PLAN-v3 §5, §10): the device that holds the layer's K buffer
 llama_model_qwen4exp::graph::qsa_policy llama_model_qwen4exp::graph::build_qsa_policy(ggml_tensor * k, ggml_type type_v, int il) const {
     const ggml_tensor * root = k->view_src ? k->view_src : k;
     GGML_ASSERT(root->buffer != nullptr);
@@ -1775,7 +1751,6 @@ llama_model_qwen4exp::graph::qsa_policy llama_model_qwen4exp::graph::build_qsa_p
     };
 
     ggml_backend_dev_t dev_layer = model.dev_layer(il);
-    // the layer's weights are on a GPU while its K buffer is on the host: -nkvo
     p.layer_gpu = p.host_kv && !cparams.offload_kqv && dev_layer != nullptr &&
         ggml_backend_dev_type(dev_layer) != GGML_BACKEND_DEVICE_TYPE_CPU;
     if (p.layer_gpu && qwen4exp_host_kv_copy(k->type, type_v)) {
@@ -1798,8 +1773,7 @@ llama_model_qwen4exp::graph::qsa_policy llama_model_qwen4exp::graph::build_qsa_p
     return p;
 }
 
-// SPARSE_ATTN_PLAN of the rows, on the layer's backend. The node is expanded here, right after its rows, which puts it
-// before the Q / K / V region of the layer (the OVL kind-4 region, PLAN-v3 §6.2).
+// SPARSE_ATTN_PLAN of the rows, on the layer's backend, expanded right after its rows (before the layer's Q / K / V)
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_plan(ggml_tensor * rows, const qsa_policy & p, int64_t n_kv,
         ggml_type type_k, ggml_type type_v, bool shortcut, int32_t & group, int il) {
     const int64_t n_q_per_stream = rows->ne[1];
@@ -1811,13 +1785,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_plan(ggml_tensor * rows, co
     return plan;
 }
 
-// Dense GQA self-attention restricted to the cells of the plan's rows (compact CB, non-compact TE or shortcut all-visible
-// rows), on GGML_OP_SPARSE_ATTN: the rows carry the visibility, so it needs no mask. The storage rotation of a quantized
-// cache is unchanged (k_cur / v_cur go through the hinted Hadamard mul_mat before cpy_k / cpy_v), but q's rotation and the
-// output un-rotation run inside the op (PLAN-v3 §8, D13, W10): rot_q = n_rot_k and rot_o = n_rot_v (0 for a side that is
-// not rotated), so no node sits between the attend and the sigmoid gate and the HIP gate fusion matches for quantized
-// caches too. The masked route PR219 kept for non-compact ubatches (a KQ mask unmasked at the top-k cells,
-// FLASH_ATTN_EXT + src[5]) is deleted for every backend (PLAN-v3 W8, D22).
+// Dense GQA self-attention restricted to the cells of the plan's rows, on GGML_OP_SPARSE_ATTN: the rows carry the
+// visibility, so it needs no mask. q's rotation and the output un-rotation run inside the op (rot_q, rot_o), so no node
+// sits between the attend and the sigmoid gate and the gate fusion still matches.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             q_cur,
@@ -1863,14 +1833,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
     const int64_t n_stream = k->ne[3];
-    GGML_ASSERT(v->nb[1] <= v->nb[2] && "qwen4exp's hybrid-idx cache keeps V not transposed (PLAN-v3 D21)");
-    // the layouts of build_attn_mha: [D, n_q, n_head, n_stream], [D, n_kv, n_head_kv, n_stream]
+    GGML_ASSERT(v->nb[1] <= v->nb[2] && "qwen4exp's hybrid-idx cache keeps V not transposed");
+    // [D, n_q, n_head, n_stream], [D, n_kv, n_head_kv, n_stream]
     ggml_tensor * q = ggml_view_4d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]/n_stream, n_stream,
             q_cur->nb[1], q_cur->nb[2], q_cur->nb[2]*(q_cur->ne[2]/n_stream), 0);
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-    // H_q q and H_o of the output in the op: the rotation is its own inverse, so H_o undoes the value-side rotation
+    // the rotation is its own inverse, so rot_o undoes the value-side rotation
     ggml_tensor * attn = ggml_sparse_attn(ctx0, q, k, v, plan, kq_scale, rot_q, rot_o);
     cb(attn, "qsa_attn", il);
     ggml_backend_sched_set_tensor_backend(sched, attn, backend);
@@ -1959,7 +1929,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     bool trim = false;                 // LLAMA_FN_LAST_ATTN_TRIM taken: queries for rows [q_first, n_tokens) only
     ggml_tensor * q_pos = nullptr;
 
-    // this layer's attention, for the placement guard (PLAN-v3 §10)
+    // this layer's attention, for the placement guard
     llm_graph_qsa_node qsa_node;
     ggml_tensor * plan = nullptr;
     qsa_policy policy;
@@ -1983,7 +1953,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         if (n_kv <= width) {
             build_qsa_store_k(mctx_hyb, cur, il);
             if (!cache_only) {
-                // D4: a backend policy per (pair, n_q band). Without the proc: dense for f16 / f16 only
+                // backend policy; without one, f16 keeps the dense shortcut
                 const bool dense = policy.prefer_dense ?
                     policy.prefer_dense(policy.dev, qsa_node.type_k, qsa_node.type_v, n_tokens/qsa_node.n_stream, n_kv) :
                     (qsa_node.type_k == GGML_TYPE_F16 && qsa_node.type_v == GGML_TYPE_F16);
@@ -1996,7 +1966,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                 }
             }
         } else {
-            // the trim needs the compact selection (the TE rows read the full-batch KQ mask, PLAN-v3 §4.4) and one
+            // the trim needs the compact selection (the TE rows read the full-batch KQ mask) and one
             // stream; the input set of this ratio was made by an earlier layer
             const auto it_inp = qsa_inps.find((uint32_t) r);
             if (q_first > 0 && tile_out_ids && mctx_hyb->get_n_stream() == 1 && it_inp != qsa_inps.end() && it_inp->second->compact &&
@@ -2019,7 +1989,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
             }
             top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il, trim ? q_first : 0, q_pos, cache_only);
             if (top_k) {
-                // compact CB rows or the non-compact TE rows: both carry the visibility (-1 for a hidden cell)
                 const auto it_rows = qsa_inps.find((uint32_t) r);
                 GGML_ASSERT(it_rows != qsa_inps.end());
                 plan = build_qsa_plan(top_k, policy, n_kv, qsa_node.type_k, qsa_node.type_v, false, qsa_node.group, il);
@@ -2080,7 +2049,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     if (cache_only) {
         if (qsa) {
-            qsa_node.producer = "cache";   // no attention node: the guard and the trace skip this graph
+            qsa_node.producer = "cache";   // no attention node: the guard skips this graph
             res->add_qsa_node(qsa_node);
         }
         // the K/V writes of build_attn, in its order, and nothing after them; the query has no consumer
@@ -2109,11 +2078,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                     nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
         if (qsa) {
-            // the dense shortcut's attention node: the FLASH_ATTN_EXT, or the output of the non-FA path (D21)
+            // the FLASH_ATTN_EXT, or the output of the non-FA path
             const auto & fused = res->get_fused_nodes();
             qsa_node.attn = fused.size() > n_fused ? fused.back().tensor : cur;
             if (policy.layer_gpu && policy.place != LLM_QSA_PLACE_HOST_KV_COPY) {
-                // -nkvo: AT-W7PERF (d) decides whether the shortcut attention is pinned to the CPU (§10)
                 if (qwen4exp_pin_shortcut()) {
                     ggml_backend_sched_set_tensor_backend(sched, qsa_node.attn, backend_cpu);
                 } else {

@@ -1,44 +1,23 @@
-// GGML_OP_SPARSE_ATTN on HIP: kernel selection, workspace size, supports_op and dispatch (PLAN-v3 §2.2, §5, §6.2, §7).
+// GGML_OP_SPARSE_ATTN on HIP: kernel selection, workspace size, supports_op and dispatch.
 //
-// Tiers (sa_select, PLAN-v3 §5 "HIP tier selection per arch", §6.1, §6.2):
-//   fast      the G4 WMMA attend for S_fast^2 (sa_attend_g4, sparse-attn-attend-g4.cuh; instances in
-//             sparse-attn-attend-g4-<kt>.cu) and the G1 WMMA attend for S_fast^2 (sa_attend_g1, sparse-attn-attend-g1.cuh;
-//             instances and launcher in sparse-attn-attend-g1.cu, split merge in sparse-attn-merge.cu);
-//   generic   the same two WMMA attends with the runtime-switch loader (SA_T_GEN, sparse-attn-generic.cu) for every pair
-//             of S with a member outside S_fast (f32, q4_1, q5_0, q5_1, iq4_nl);
-//   portable  the scalar attend of sparse-attn-portable.cu (any type of S, any plan G, no WMMA / cross-lane operation).
-// The WMMA tiers are selected at runtime only on RDNA3.5 (GGML_CUDA_CC_IS_RDNA3_5, the arch PR #219 gates every QSA
-// kernel to, qsa-decode.cu:85); every other HIP arch runs the portable tier (its speed there is UNPROVEN, U15). Every tier
-// applies the in-op rotations (PLAN-v3 §8, D13, W10): H_q in its Q prologue and H_o in its epilogue (the G1 split merge
-// for G1 with more than one split), with the transform of sparse-attn-fwht.cuh that fwht.cu runs, so the gate fusion
-// matches for quantized caches too (the output un-rotation no longer sits between the attend and the gate).
-//
-// One shape-only function, sa_select, decides the tier, the kernel instance and the V loader; supports_op, get_alloc_size,
-// the dispatch and the census all use it (PLAN-v3 §5 "kernel instance, V pack vs direct, split count").
-//   V loader (G4, fast and generic): the per-type pack-limit trait of sparse-attn-loaders.cuh (default CAPPED for every
-//   type, S_generic included: packed iff n_kv < 64 * n_q, n_q per stream; OWNER decision 2026-11-05).
-//   Workspace (the get_alloc_size over-allocation of dst, placed at round_up(nbytes(dst), 256); D12: no pool), G4 (fast and
-//   generic: the generic pack writes the same f16 layout), each part padded to 256 bytes:
-//     packed V: [V: ceil(n_kv / 4) quads x 2 KiB x n_head_kv x n_stream][quad flags: 1 B per (stream, kv head, quad)]
-//               [any-flag: 4 B]  (sa_pack_v: non-finite halves -> 0, flagged)
-//     direct V: [wave flags: 1 B per (stream, group, kv head, wave) = n_stream x ceil(n_q / 4) x n_head_kv x 8 B]
-//   every flag byte is written at each launch (the any-flag is cleared by a 4-byte memset before the pack), and
-//   sa_attend_fixup reads them.
-//   Workspace, G1 (fast and generic): the split-K partials [n_stream][n_q][n_head][splits][258] f32 when the shape-only
-//   split count (sa_g1_splits) is > 1, none with one split (the attend writes dst itself).
-//   Portable: no workspace.
-//   get_alloc_size takes the max over every G of the policy range ({1, 4}) and every n_q' <= n_q at this n_kv, and over
-//   every runtime n_kv' <= n_kv: under CAPPED a runtime n_kv' packs only when n_kv' < 64 * n_q, so the pack bound is
-//   min(4 * ceil(n_kv / 4), 64 * n_q) cells, the flags grow with n_q, and the G1 partials are maximised over n_q' by
-//   sa_g1_partial_bytes_max (they are not monotone in n_q, R1-C) (PLAN-v3 §5 "workspace size", §7). On a device whose
-//   tier is the portable one (another arch, or GGML_CUDA_SA_FORCE=portable) there is no workspace.
-// Test switch GGML_CUDA_SA_FORCE, comma-separated tokens. vpacked | vdirect force the G4 V loader; generic forces the
-// generic tier for every pair of S; portable forces the portable tier; g1 | g4 force the group policy; fixup makes
-// sa_attend_fixup recompute every G4 block; plan_global runs the plan's rows and merge kernels on global memory. They change
-// the kernel choice inside the backend only, never placement, and get_alloc_size follows them; the census skip proc names
-// the keys a forced process cannot dispatch. Read at every call: reject makes SPARSE_ATTN unsupported (the guard test on a
-// real HIP device); rot_dump makes an op with rot_q != 0 write H_q q (f32, before the scale) into dst instead of the
-// attention and launch nothing after the attend (test-sparse-attn-rot).
+// Tiers: fast (G4 / G1 WMMA attends for S_fast pairs), generic (the same attends with the runtime-switch loader, for
+// pairs with a member outside S_fast) and portable (scalar, any type of S, any G). The WMMA tiers run on RDNA3.5 only;
+// every other HIP arch runs the portable tier. Every tier applies the rotations itself (H_q in the Q prologue, H_o in the
+// epilogue or the G1 merge), so the gate fusion also works for quantized caches.
+// sa_select is the one shape-only function deciding tier, instance and V loader, used by supports_op, get_alloc_size,
+// the dispatch and the census. Workspace, at round_up(nbytes(dst), 256) in dst's over-allocation (never the pool), each
+// part padded to 256 bytes:
+//   G4 packed V: [V: ceil(n_kv / 4) quads x 2 KiB x n_head_kv x n_stream][quad flags: 1 B each][any-flag: 4 B]
+//   G4 direct V: [wave flags: 1 B per (stream, group, kv head, wave)]
+//   G1:          split-K partials [n_stream][n_q][n_head][splits][258] f32 when splits > 1
+//   portable:    none
+// Every flag byte is written at each launch (the any-flag is memset before the pack). get_alloc_size takes the max over
+// G in {1, 4}, n_q' <= n_q and n_kv' <= n_kv: under CAPPED a runtime op packs only when n_kv' < 64 * n_q, so the pack
+// bound is min(4 * ceil(n_kv / 4), 64 * n_q) cells.
+// Test switch GGML_CUDA_SA_FORCE, comma-separated tokens (kernel choice only, never placement; get_alloc_size follows):
+// vpacked | vdirect (G4 V loader), generic, portable (tier), g1 | g4 (group policy), fixup (recompute every G4 block),
+// plan_global (plan rows / merge on global memory), reject (SPARSE_ATTN unsupported), rot_dump (rot_q != 0: write H_q q
+// into dst and launch nothing after the attend).
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-census.h"
@@ -81,7 +60,7 @@ static int sa_type_id_of(const ggml_type t) {
     }
 }
 
-// the types of S (PLAN-v3 §6.1): S_fast and S_generic, the cases of sa_any_elem (sparse-attn-loaders.cuh)
+// the types of S: S_fast and S_generic, the cases of sa_any_elem
 static bool sa_type_in_S(const ggml_type t) {
     switch (t) {
         case GGML_TYPE_F16: case GGML_TYPE_BF16: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0:
@@ -106,8 +85,7 @@ struct sa_force_t {
     bool fixup_all;
 };
 
-// GGML_CUDA_SA_FORCE, parsed once: the V loader and the tier (g1 / g4 are the group policy's, read at every call by
-// sparse-attn-attend-g1.cu)
+// GGML_CUDA_SA_FORCE, parsed once: the V loader and the tier (g1 / g4 are read at every call)
 static const sa_force_t & sa_force(void) {
     static const sa_force_t f = [] {
         sa_force_t r = { SA_FORCE_VL_NONE, SA_FORCE_TIER_NONE, false };
@@ -152,8 +130,7 @@ static int sa_force_vl(void) {
     return sa_force().vl;
 }
 
-// the tier of HIP device `device` before the type pair is known: portable on every arch other than RDNA3.5 and under
-// GGML_CUDA_SA_FORCE=portable
+// portable on every arch other than RDNA3.5 and under GGML_CUDA_SA_FORCE=portable
 static bool sa_device_portable(const int device) {
     return !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc) || sa_force().tier == SA_FORCE_TIER_PORTABLE;
 }
@@ -171,8 +148,7 @@ static int sa_g4_vl(const int vt, const int64_t n_q, const int64_t n_kv) {
     return n_kv < 64 * n_q ? SA_V_PACKED : SA_V_SPLITGATHER;
 }
 
-// largest number of V cells the G4 pack can write for any runtime op whose shape is bounded by (n_q, n_kv): packed
-// when n_kv' < 64 * n_q' <= 64 * n_q (CAPPED), at most 4 * ceil(n_kv' / 4) cells
+// largest number of V cells the G4 pack can write for any runtime op bounded by (n_q, n_kv)
 static int64_t sa_g4_pack_cells_max(const int vt, const int64_t n_q, const int64_t n_kv) {
     const int64_t n_kv4 = 4 * ((n_kv + 3) / 4);
     switch (sa_force_vl()) {
@@ -200,7 +176,7 @@ struct sa_selection {
     int64_t splits;        // G1: shape-only split count (sa_g1_splits); 1 for G4
     size_t  partial_offset;// G1 with splits > 1: split-K partials, from dst->data
     size_t  ws_bytes;      // workspace this op uses from ws_offset
-    size_t  ws_max;        // workspace get_alloc_size reserves (max over the policy range, see the header)
+    size_t  ws_max;        // workspace get_alloc_size reserves (max over the policy range)
     const char * why;     // when !ok
 };
 
@@ -219,13 +195,12 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
     sa_selection r = {};
     r.ok = false;
     const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * plan = op->src[3];
-    // the plan's src (sel) is not read: on an RPC server the deserialized plan has none (its op_params carry n_sel)
+    // the plan's src (sel) is not read: an RPC-deserialized plan has none (op_params carry n_sel)
     if (q == nullptr || k == nullptr || v == nullptr || plan == nullptr || plan->op != GGML_OP_SPARSE_ATTN_PLAN) {
         r.why = "malformed SPARSE_ATTN node";
         return r;
     }
-    // the invariants of ggml_sparse_attn (K / V rows and heads the kernels read, the plan's size): a node an RPC server
-    // deserialized was never built by it, so supports_op and sa_run (an abort) must not take them for granted
+    // the invariants of ggml_sparse_attn: an RPC-deserialized node was never built by it, so check them here
     if ((r.why = ggml_sparse_attn_shape_why(op)) != nullptr) {
         return r;
     }
@@ -246,8 +221,7 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
         r.why = "K/V type outside S (f16, bf16, q8_0, q4_0, f32, q4_1, q5_0, q5_1, iq4_nl)";
         return r;
     }
-    // tier (PLAN-v3 §5): portable on every arch other than RDNA3.5 (and when forced); otherwise the generic tier for a pair
-    // with a member outside S_fast (and when forced), else the fast tier
+    // tier: portable on non-RDNA3.5 (and when forced), else generic for a pair outside S_fast (and when forced), else fast
     if (sa_device_portable(device)) {
         r.tier = SA_TIER_PORTABLE;
     } else if (r.kt < 0 || r.vt < 0 || sa_force().tier == SA_FORCE_TIER_GENERIC) {
@@ -256,9 +230,8 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
         r.tier = SA_TIER_FAST;
     }
 
-    // workspace bound over the policy range (G in {1, 4}) at this n_kv: the G4 packed layout at the largest pack any
-    // runtime op can need, the G4 direct layout at this n_q, and the largest G1 partials of any n_q' <= n_q (the generic
-    // tier uses the same layouts; the portable tier none)
+    // workspace bound over G in {1, 4} at this n_kv: the largest pack any runtime op can need, the direct flags at this
+    // n_q, and the largest G1 partials of any n_q' <= n_q
     r.splits = 1;
     r.ws_max = 0;
     if (r.tier != SA_TIER_PORTABLE) {
@@ -277,7 +250,7 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
         return r;
     }
     {
-        // the in-op rotations: blocks of 64, 128 or 256 of the 256 dims (fwht_row, sparse-attn-fwht.cuh)
+        // the in-op rotations: blocks of 64, 128 or 256 of the 256 dims
         const int32_t rq = ggml_get_op_params_i32(op, 1), ro = ggml_get_op_params_i32(op, 2);
         auto rot_ok = [](const int32_t x) { return x == 0 || x == 64 || x == 128 || x == 256; };
         if (!rot_ok(rq) || !rot_ok(ro)) {
@@ -332,7 +305,7 @@ bool ggml_cuda_sparse_attn_supported(int device, const ggml_tensor * op) {
         return false;
     }
     const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
-    // strides (PLAN-v3 §2.2 "Alignment"); base pointers are checked at compute
+    // strides; base pointers are checked at compute
     if (q->type != GGML_TYPE_F32 || q->nb[0] != sizeof(float) || !sa_strides_ok(q) || !sa_strides_ok(k) || !sa_strides_ok(v)) {
         return false;
     }
@@ -342,8 +315,7 @@ bool ggml_cuda_sparse_attn_supported(int device, const ggml_tensor * op) {
     if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
         return false;
     }
-    // grid (G4: (n_groups, n_head_kv, n_stream); G1: (n_stream * n_q * n_head_kv, splits)) and int indexing of queries /
-    // groups / plan entries
+    // grid limits and int indexing of queries / groups / plan entries
     const int64_t n_groups = (sel.n_q + 3) / 4;
     if (sel.n_head_kv > 65535 || sel.n_stream > 65535 || n_groups > INT_MAX || sel.n_q > INT_MAX / 4 || sel.n_head > INT_MAX) {
         return false;
@@ -388,7 +360,7 @@ const char * ggml_cuda_sparse_attn_census_skip(const int device, const char * ke
     const bool generic  = under("sa_generic/");
     const bool merge    = under("sa_merge");
     const bool portable = under("sa_portable/");
-    // the tier: the portable tier on every arch other than RDNA3.5 (device -1: not known, no arch rule) and when forced
+    // portable on every arch other than RDNA3.5 (device -1: unknown, no arch rule) and when forced
     const bool arch_portable = device >= 0 && !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc);
     if (arch_portable || sa_force().tier == SA_FORCE_TIER_PORTABLE) {
         if (fast || generic || merge) {
@@ -462,7 +434,7 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * plan = dst->src[3];
     const ggml_sparse_attn_plan_layout L = ggml_sparse_attn_plan_get_layout(sel.n_sel, sel.n_q, sel.n_stream, sel.n_kv, sel.G);
     GGML_ASSERT(ggml_nbytes(plan) == L.nbytes);
-    // compute aborts only on a misaligned base pointer (PLAN-v3 §2.2 "Alignment")
+    // compute aborts only on a misaligned base pointer
     if ((uintptr_t) q->data % 16 != 0 || (uintptr_t) k->data % 16 != 0 || (uintptr_t) v->data % 16 != 0 ||
         (uintptr_t) plan->data % 16 != 0 || (uintptr_t) dst->data % 16 != 0) {
         GGML_ABORT("SPARSE_ATTN: q / k / v / plan / dst base pointer not 16-byte aligned");
@@ -606,7 +578,7 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
 
     const int idx = ((sel.vt * SA_V_COUNT + sel.vl) * SA_EPI_COUNT + epi) * 3 + sel.gqa_index;
     GGML_ASSERT(idx >= 0 && idx < GGML_CUDA_SA_G4_PER_KT);
-    // two instances per census index: ROT = false (no rotation code: the rot 0 kernel) and ROT = true
+    // two instances per census index: ROT = false (no rotation code) and ROT = true
     const sa_g4_kernel_t kernel = sa_g4_table(sel.kt)[2 * idx + (rot_q != 0 || rot_o != 0 ? 1 : 0)];
     kernel<<<grid, 256, 0, stream>>>(a);
     ggml_cuda_sa_census_add((ggml_cuda_sa_census_id) (GGML_CUDA_SA_CENSUS_G4_FIRST + sel.kt * GGML_CUDA_SA_G4_PER_KT + idx));
@@ -614,8 +586,7 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
         return;
     }
 
-    // exact recomputation of the blocks that took a non-finite V half out of the shared PV WMMA (returns at once for
-    // the others; sparse-attn-attend-g4.cuh)
+    // exact recomputation of the blocks that took a non-finite V half out of the shared PV WMMA
     const int fidx = sel.vt * SA_EPI_COUNT + epi;
     const sa_fixup_kernel_t fixup = sa_fixup_table(sel.kt)[fidx];
     fixup<<<grid, 256, 0, stream>>>(a, (int) (sel.n_head / sel.n_head_kv));
@@ -635,7 +606,7 @@ void ggml_cuda_sparse_attn_gated(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 #else // !defined(GGML_USE_HIP)
 
-// CUDA builds: no sparse-attention kernels (PLAN-v3 §6.2, D22); supports_op is false, so these are never dispatched
+// CUDA builds: no sparse-attention kernels; supports_op is false, so these are never dispatched
 bool ggml_cuda_sparse_attn_supported(int device, const ggml_tensor * op) {
     GGML_UNUSED(device);
     GGML_UNUSED(op);

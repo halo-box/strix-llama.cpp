@@ -1,20 +1,12 @@
-// K/V element conversion of the 64-lane SPARSE_ATTN tiers (sparse_attn_cm.comp, sparse_attn.comp, sparse_attn_pack.comp):
-// flash_attn_dequant.glsl through the FaTypeK / FaTypeV spec constants, FLOAT_TYPE = float, then one rounding to f16 by
-// the f32 -> f16 conversion (RTE where the device has it, the float-controls patch of ggml_vk_create_pipeline_func).
-// PLAN-v3 §2.2: within the §14 bands, not bitwise, for this path.
-//
-// The offsets and strides are in the unit of the type (ggml_vk_sa_unit_bytes): one uvec4 (16 bytes) for f16 and f32,
-// one element (2 bytes) for bf16, one ggml block for the quantized types.
+// K/V element conversion of the 64-lane SPARSE_ATTN tiers: flash_attn_dequant.glsl through the FaTypeK / FaTypeV spec
+// constants, then one rounding to f16. Offsets and strides are in the unit of the type (ggml_vk_sa_unit_bytes).
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
 
 #include "flash_attn_dequant.glsl"
 
-// l > 0 on the bits, for the attend epilogues (sparse_attn_cm.comp, sparse_attn.comp; sparse_attn_reduce.comp has its own
-// copy): true for a positive l (+inf included), false for 0, a negative l and NaN. The modules carry no
-// SignedZeroInfNanPreserve execution mode, so a float compare may be compiled as if l were never NaN; an integer compare
-// cannot be.
+// l > 0 on the bits (false for NaN): without SignedZeroInfNanPreserve a float compare may assume l is never NaN
 bool sa_l_pos(const float l) {
     return floatBitsToUint(l) - 1u < 0x7f800000u;
 }
@@ -44,12 +36,8 @@ uint sa_pack2(const vec2 x) {
     return packFloat2x16(f16vec2(x));
 }
 
-// ---- the fast loaders of the WMMA kernel, S_fast types (sparse_attn_cm.comp) ----
-// The bit trick of the HIP loaders (ggml-cuda/sparse-attn-q8.cuh, from PR #219's qsa3_q8x2_to_h2): 0x6400 | (q + 128) is 1024 + q + 128 in half,
-// exact, so v - 1152 is q exactly, and one f16 product with the block's scale is RNE of the exact f32 product, the value the generic path computes
-// with three conversions per element. q4_0 the same with 0x6400 | q and 1032. bf16: an exact f32 widening and one RNE conversion.
-// The number of buffer loads is what these loaders are about (each is 2 uvec4 per K chunk, as f16, or 2 small loads per V piece): K reads whole
-// 16-byte lines of the row (rows are 16-byte aligned, PLAN-v3 §2.2), V a 3-dword window that ends inside its piece, so neither leaves the row.
+// fast loaders of the WMMA kernel: 0x6400 | (q + 128) is 1152 + q exactly in half, so one f16 product with the block's
+// scale is the RNE of the exact product, as in the generic path (q4_0: 0x6400 | q and 1032)
 
 uint sa_q8x2(const uint x, const f16vec2 d2) {
     const f16vec2 v = unpackFloat2x16(((x ^ 0x00800080u) & 0x00FF00FFu) | 0x64006400u);

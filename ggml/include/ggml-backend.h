@@ -228,19 +228,15 @@ extern "C" {
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
 
-    // Sparse-attention policies (GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN), resolved per backend with
-    // ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "<name>") for the device that holds the K cache.
-    // Without them a caller uses G = 1 and prefer_dense = (type_k == type_v == GGML_TYPE_F16).
-    // "ggml_backend_sparse_attn_group": the work split G (1 or 4) of the plan, for n_q_per_stream queries per stream over
-    // n_kv keys; shortcut = the all-visible rows of the dense-shortcut range (its own decision)
+    // Sparse-attention policies, resolved with ggml_backend_reg_get_proc_address(reg, "<name>") for the device that holds
+    // the K cache. Without them a caller uses G = 1 and prefer_dense = (type_k == type_v == GGML_TYPE_F16).
+    // "ggml_backend_sparse_attn_group": the plan group G (1 or 4); shortcut = the all-visible rows of the dense-shortcut range
     typedef int32_t (*ggml_backend_sparse_attn_group_t)(ggml_backend_dev_t dev, int64_t n_q_per_stream, int64_t n_kv,
                                                         enum ggml_type type_k, enum ggml_type type_v, bool shortcut);
-    // "ggml_backend_sparse_attn_prefer_dense": true when the dense causal attention is preferred over the sparse op in the
-    // dense-shortcut range
+    // "ggml_backend_sparse_attn_prefer_dense": true when dense causal attention beats the sparse op in the dense-shortcut range
     typedef bool    (*ggml_backend_sparse_attn_prefer_dense_t)(ggml_backend_dev_t dev, enum ggml_type type_k,
                                                                enum ggml_type type_v, int64_t n_q, int64_t n_kv);
-    // "ggml_backend_sparse_attn_unsupported_reason": why supports_op is false for this SPARSE_ATTN / SPARSE_ATTN_PLAN node on
-    // dev, for the init error (NULL when it is supported). Without the proc: the backend has no sparse-attention kernel.
+    // "ggml_backend_sparse_attn_unsupported_reason": why supports_op is false for this node on dev (NULL when supported).
     // A reason that names a K / V type problem starts with "type pair".
     typedef const char * (*ggml_backend_sparse_attn_unsupported_reason_t)(ggml_backend_dev_t dev, const struct ggml_tensor * op);
 

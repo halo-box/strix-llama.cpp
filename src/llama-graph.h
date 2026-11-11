@@ -823,15 +823,12 @@ struct llama_vocab_subset {
     ggml_tensor * eog = nullptr; // I32 end-of-generation ids >= n_base, always picked
 };
 
-// reserve-only QSA graph variants (PLAN-v3 §7.1): never set on a runtime graph
+// reserve-only QSA graph variants, never set on a runtime graph
 enum llm_graph_qsa_reserve : uint32_t {
-    LLM_GRAPH_QSA_RESERVE_NONCOMPACT = 1u << 0, // §7.1.4: the compact decision is false at the reserve n_kv
-    LLM_GRAPH_QSA_RESERVE_FAST       = 1u << 1, // §7.1.2: the incremental fast-cache route at n_tokens <= 512
-    // every graph of llama_context::graph_reserve: the QSA compact decision is the empty cache's (the cache of the first
-    // reserve, at init), not the live cells' (llama_memory_hybrid_idx_context::qsa_graph_compact). A reserve that runs later
-    // (sched_need_reserve: set_sampler, set_adapters_lora, set_embeddings, set_causal_attn) builds on init_full over a live
-    // cache, whose 2-D cells or seq_cp-shared blocks made its pp graph non-compact: the TE route at n_ubatch tokens, which
-    // no runtime ubatch takes (the graph-build check, PLAN-v3 §4.3) and whose [n_kv, n_ubatch] mask grew the buffers
+    LLM_GRAPH_QSA_RESERVE_NONCOMPACT = 1u << 0, // the compact decision is false at the reserve n_kv
+    LLM_GRAPH_QSA_RESERVE_FAST       = 1u << 1, // the incremental fast-cache route at n_tokens <= 512
+    // every graph_reserve graph: take the empty cache's compact decision, not the live cells' (a later reserve over a
+    // non-compact live cache would size the buffers for a TE route no runtime ubatch takes)
     LLM_GRAPH_QSA_RESERVE_GRAPH      = 1u << 2,
 };
 
@@ -886,7 +883,7 @@ struct llm_graph_params {
     llama_model_prefetch * prefetch = nullptr; // the context's llama_model::prefetch_begin state, nullptr = none
     const llama_vocab_subset * vsub = nullptr;
 
-    // reserve-only QSA graph variants (PLAN-v3 §7.1), LLM_GRAPH_QSA_RESERVE_*; 0 for every runtime graph
+    // LLM_GRAPH_QSA_RESERVE_*, 0 for every runtime graph
     uint32_t qsa_reserve = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
@@ -973,17 +970,16 @@ struct llm_graph_fused_node {
     int il;
 };
 
-// One QSA layer's attention in a built graph (PLAN-v3 §10): what the placement guard checks. A cache-only MTP graph
-// registers nothing (it has no attention node).
+// one QSA layer's attention in a built graph, checked by the placement guard
 enum llm_graph_qsa_place {
     LLM_QSA_PLACE_K_DEVICE,        // on the backend of the device that holds the layer's K buffer (CPU for a host K buffer)
-    LLM_QSA_PLACE_HOST_KV_COPY,    // the named host-KV route: K buffer on the host, nodes on the layer's GPU, K/V copied (§10)
-    LLM_QSA_PLACE_SCHEDULER,       // the shortcut attention over a host K buffer that the scheduler places (AT-W7PERF (d))
+    LLM_QSA_PLACE_HOST_KV_COPY,    // K buffer on the host, nodes on the layer's GPU, K/V copied
+    LLM_QSA_PLACE_SCHEDULER,       // the shortcut attention over a host K buffer, placed by the scheduler
 };
 
 struct llm_graph_qsa_node {
     int           il       = -1;
-    const char *  producer = "";       // av | cb | te | dense | cache (§14.3); the masked route was deleted in W8
+    const char *  producer = "";       // av | cb | te | dense | cache
     ggml_tensor * plan     = nullptr;  // GGML_OP_SPARSE_ATTN_PLAN, nullptr on the dense route
     ggml_tensor * attn     = nullptr;  // GGML_OP_SPARSE_ATTN, or the dense attention node
     ggml_tensor * k        = nullptr;  // the K cache view this attention reads
@@ -1040,11 +1036,11 @@ public:
 
     void add_qsa_node(const llm_graph_qsa_node & node) { qsa_nodes.push_back(node); }
     const std::vector<llm_graph_qsa_node> & get_qsa_nodes() const { return qsa_nodes; }
-    // the nodes of QSA layer il that read or write its indexer K cache (the guard's indexer check, llama_context::qsa_guard)
+    // nodes of QSA layer il that read or write its indexer K cache
     void add_qsa_idx_node(int il, ggml_tensor * t) { qsa_idx_nodes.emplace_back(il, t); }
     const std::vector<std::pair<int, ggml_tensor *>> & get_qsa_idx_nodes() const { return qsa_idx_nodes; }
 
-    // the QSA graph-build check (PLAN-v3 §4.3): non-empty when this graph must not be allocated; llama_decode returns an error
+    // non-empty when this graph must not be allocated; llama_decode returns an error
     void set_qsa_ubatch_error(std::string msg) { if (qsa_ubatch_error.empty()) { qsa_ubatch_error = std::move(msg); } }
     const std::string & get_qsa_ubatch_error() const { return qsa_ubatch_error; }
 
@@ -1067,8 +1063,8 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
-    std::vector<llm_graph_qsa_node>   qsa_nodes;   // the attention node of every QSA layer of this graph
-    std::vector<std::pair<int, ggml_tensor *>> qsa_idx_nodes;   // (layer, node) on the indexer K cache of every QSA layer
+    std::vector<llm_graph_qsa_node>   qsa_nodes;
+    std::vector<std::pair<int, ggml_tensor *>> qsa_idx_nodes;
     std::string                       qsa_ubatch_error;
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
@@ -1178,7 +1174,7 @@ struct llm_graph_context {
 
     const llama_vocab_subset * vsub;
 
-    const uint32_t qsa_reserve; // llm_graph_params::qsa_reserve
+    const uint32_t qsa_reserve;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

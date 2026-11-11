@@ -1,12 +1,9 @@
-// PLAN-v3 §9 / W11: the indexer key cache type of the sparse-attention memory (llama_memory_hybrid_idx), no session format change.
-//  1. llama_model_type_k_idx: qwen4exp auto maps q4_0, q4_1, q5_0, q5_1, iq4_nl to q8_0 and keeps every other type,
-//     an explicit --cache-type-k-idx wins; every other architecture (GLM5_NEXT) keeps type_k whatever is asked (O26).
-//  2. llama_model::create_memory builds the indexer cache with that type: qwen4exp main and MTP contexts, GLM5_NEXT
-//     with -ctk q4_0 keeps q4_0 (the synthetic GLM5-Next load of the W11 done-when; no GLM5-Next GGUF is on strix-002).
-//  3. Session state: a qwen4exp state written with the old q4_0 indexer is rejected by the existing per-layer key type
-//     check of llama_kv_cache, through the wrapped hybrid-idx message; same-type states (f16, q8_0, q4_0 -> auto q8_0,
-//     GLM5_NEXT q4_0) round-trip; an attention-section mismatch keeps the cache's own message (not wrapped).
-// CPU only, no model file: the caches are the production objects over a one-layer model without weights.
+// The indexer key cache type of llama_memory_hybrid_idx (CPU only, no model file):
+//  1. llama_model_type_k_idx: qwen4exp auto maps the 4/5-bit types to q8_0, an explicit --cache-type-k-idx wins; every
+//     other architecture (GLM5_NEXT) keeps type_k.
+//  2. llama_model::create_memory builds the indexer cache with that type, main and MTP contexts.
+//  3. Session state: a state with another indexer type is rejected with the hybrid-idx message; same-type states
+//     round-trip; an attention-section mismatch keeps the cache's own message.
 #include "qsa-mem-fixture.h"
 
 #include "../src/llama-cparams.h"
@@ -22,7 +19,7 @@ static int n_fail = 0;
 
 #define CHECK(cond, ...) do { if (!(cond)) { ++n_fail; fprintf(stderr, "FAIL %s:%d: %s: ", __FILE__, __LINE__, #cond); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
 
-// in-memory llama_io_* (the session file writer / reader of llama-context.cpp do the same over a FILE)
+// in-memory llama_io_*
 struct io_vec_write : llama_io_write_i {
     std::vector<uint8_t> buf;
     void write(const void * src, size_t size) override { const auto * p = (const uint8_t *) src; buf.insert(buf.end(), p, p + size); }
@@ -185,7 +182,7 @@ static std::string load_state(const std::vector<uint8_t> & buf, llm_arch arch, g
 }
 
 static void test_session() {
-    // old (W0 .. W10) qwen4exp file: -ctk q4_0 built a q4_0 indexer; this build maps it to q8_0
+    // a qwen4exp file with a q4_0 indexer: auto now gives q8_0
     const auto old_q4 = save_state(LLM_ARCH_QWEN4EXP, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
     const std::string e = load_state(old_q4, LLM_ARCH_QWEN4EXP, GGML_TYPE_Q4_0, GGML_TYPE_COUNT);
     printf("session: old qwen4exp q4_0 file -> auto: \"%s\"\n", e.c_str());
@@ -207,7 +204,6 @@ static void test_session() {
         { LLM_ARCH_GLM5_NEXT, GGML_TYPE_F16,  "glm5-next f16" },
     };
     for (const auto & r : rows) {
-        // the old build wrote type_k into the indexer, which is what auto still gives for these
         const auto buf = save_state(r.arch, r.tk, r.tk);
         n = 0;
         const std::string el = load_state(buf, r.arch, r.tk, GGML_TYPE_COUNT, &n);

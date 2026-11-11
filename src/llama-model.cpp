@@ -1120,18 +1120,15 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
 }
 
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
-// the context-level init errors of qwen4exp's QSA (PLAN-v3 §10)
 ggml_type llama_model_type_k_idx(llm_arch arch, ggml_type type_k, ggml_type type_k_idx) {
     if (arch != LLM_ARCH_QWEN4EXP) {
-        // GLM5_NEXT and every other indexer keep the -ctk type (PLAN-v3 §9, O26)
         return type_k;
     }
     if (type_k_idx != GGML_TYPE_COUNT) {
-        return type_k_idx; // --cache-type-k-idx override
+        return type_k_idx;
     }
     switch (type_k) {
-        // a sub-8-bit indexer loses selection agreement (R1-E: q4_0 indexer 0.98814 of f16's, q8_0 indexer 0.999802),
-        // so the indexer of these types is q8_0 (the other sub-8-bit types follow q4_0, PLAN-v3 U8)
+        // a sub-8-bit indexer loses selection agreement with f16, q8_0 keeps it
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -1143,7 +1140,7 @@ ggml_type llama_model_type_k_idx(llm_arch arch, ggml_type type_k, ggml_type type
     }
 }
 
-// the resolved indexer type of this model's hybrid-idx memory, checked against the indexer row and logged once per memory
+// the resolved indexer type, checked against the indexer row and logged
 static ggml_type qsa_resolve_type_k_idx(const llama_model & model, const llama_memory_params & params) {
     const ggml_type t = llama_model_type_k_idx(model.arch, params.type_k, params.type_k_idx);
     if (model.arch != LLM_ARCH_QWEN4EXP && params.type_k_idx != GGML_TYPE_COUNT && params.type_k_idx != params.type_k) {
@@ -1165,8 +1162,7 @@ static void qwen4exp_qsa_check_context(llama_split_mode split_mode, uint32_t n_c
     if (split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw std::runtime_error("QSA sparse attention is not supported with --split-mode tensor: the meta backend has no SPARSE_ATTN handler; use --split-mode layer or none");
     }
-    // §4.4: the largest n_kv of the f16 op test (the first f16 K view >= 2 GiB, 2^21 + 4 cells, its rows past byte
-    // INT32_MAX selected); the q8_0 op case at 2^22 + 4 cells checks the loaders' offsets only; 1M+ runtime is U12
+    // the largest n_kv the op tests cover (the first f16 K view >= 2 GiB)
     constexpr uint32_t max_n_ctx_seq = (1u << 21) + 4;
     if (n_ctx_seq > max_n_ctx_seq) {
         throw std::runtime_error(format("QSA sparse attention: n_ctx_seq = %u is above the tested maximum of %u cells", n_ctx_seq, max_n_ctx_seq));
@@ -3278,7 +3274,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         /* model             */ *this,
                         /* attn_type_k       */ params.type_k,
                         /* attn_type_v       */ params.type_v,
-                        /* attn_v_trans      */ false,   // PLAN-v3 D21: the sparse op reads V not transposed, whatever -fa says
+                        /* attn_v_trans      */ false,   // the sparse op reads V not transposed, whatever -fa says
                         /* attn_kv_size      */ cparams.n_ctx_seq,
                         /* attn_n_pad        */ 1,
                         /* attn_n_swa        */ hparams.n_swa,
@@ -3374,8 +3370,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx) {
-                        // PLAN-v3 D21: qwen4exp's QSA layers run the sparse op past the shortcut, which reads V not transposed,
-                        // so its cache keeps that layout whatever -fa says
+                        // the sparse op reads V not transposed, whatever -fa says
                         const bool qsa_arch = arch == LLM_ARCH_QWEN4EXP;
                         if (qsa_arch) {
                             qwen4exp_qsa_check_context(split_mode(), cparams.n_ctx_seq);

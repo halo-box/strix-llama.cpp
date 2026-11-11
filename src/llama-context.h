@@ -42,20 +42,19 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
-// the K / V types dev takes for the shape of the SPARSE_ATTN node attn (the "supported here" list of the QSA init error)
+// the K / V types dev supports for the shape of the SPARSE_ATTN node attn
 std::string llama_qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor * attn);
 
-// The QSA reserve graphs of PLAN-v3 §7.1 that llama_context::sched_reserve builds after the pp and tg graphs, as a pure
-// function of the context's shape (so the list is testable without a model: tests/test-qsa-checks.cpp, reserve-passes).
+// the QSA reserve graphs sched_reserve builds after the pp and tg graphs, a pure function of the shape (testable)
 struct llama_qsa_reserve_shape {
     uint32_t n_tokens;        // min(n_ctx, n_ubatch)
-    uint32_t n_seqs;          // n_seq_max (the reserve's n_seqs)
+    uint32_t n_seqs;          // n_seq_max
     uint32_t n_outputs_pp;    // the pp reserve's n_outputs
     bool     kv_unified;
     bool     mtp;             // LLAMA_CONTEXT_TYPE_MTP
     uint32_t width;           // max over the QSA layers of indexer_top_k + ratio - 1 (the shortcut serves n_kv <= width)
     uint32_t n_kv_full;       // cells per stream of the attention cache
-    uint32_t noncompact_cap;  // qsa_noncompact_cap(n_ubatch): the T of the non-compact variant
+    uint32_t noncompact_cap;  // qsa_noncompact_cap(n_ubatch)
 };
 
 struct llama_qsa_reserve_pass_desc {
@@ -63,9 +62,9 @@ struct llama_qsa_reserve_pass_desc {
     uint32_t n_tokens;
     uint32_t n_seqs;
     uint32_t n_outputs;
-    uint32_t n_kv;            // 0: the context's own full view; else the view init_full_n_kv(n_kv, n_stream)
-    uint32_t n_stream;        // with n_kv != 0: 0 = every stream of the cache, else that many
-    uint32_t qsa;             // LLM_GRAPH_QSA_RESERVE_* (llama_context::reserve_variant)
+    uint32_t n_kv;            // 0: the context's own full view, else init_full_n_kv(n_kv, n_stream)
+    uint32_t n_stream;        // 0 = every stream
+    uint32_t qsa;             // LLM_GRAPH_QSA_RESERVE_*
     bool     seq_pos;
     bool     last_output;
 };
@@ -293,8 +292,7 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
-    // a reserve graph other than the plain pp / tg shapes (PLAN-v3 §7.1): QSA graph flags (LLM_GRAPH_QSA_RESERVE_*),
-    // sequential positions instead of all-zero ones, and the last token of the ubatch as its one output
+    // QSA reserve flags, sequential positions instead of all-zero ones, the last token as the one output
     struct reserve_variant {
         uint32_t qsa         = 0;
         bool     seq_pos     = false;
@@ -311,14 +309,13 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
-    // QSA placement guard (PLAN-v3 §10) over llama's graph gf with the placement of the current split: every SPARSE_ATTN_PLAN,
-    // SPARSE_ATTN and QSA-layer shortcut attention node on the backend of its layer's K buffer, supported there, each plan
-    // with one consumer, and enough nodes inspected to mean something. Returns the error text, empty when it passes.
+    // QSA placement guard: every QSA plan / attention node on its layer's K buffer backend and supported there, each plan
+    // with one consumer, enough nodes inspected. Returns the error text, empty when it passes.
     std::string qsa_guard(ggml_cgraph * gf, const llm_graph_result * res, const char * where);
-    // the init guard on split_only reserve graphs of one shape; throws on a violation
+    // throws on a violation
     void qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const char * where,
             const reserve_variant * variant = nullptr);
-    // the number of QSA layers a graph of this context holds, 0 when QSA does not apply
+    // 0 when QSA does not apply
     int qsa_n_layers() const;
 
     llm_graph_params graph_params(
@@ -517,7 +514,6 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 
-    // the last QSA guard pass (qsa_guard): nodes read with a backend, nodes required
     int     qsa_guard_last_inspected = 0;
     int     qsa_guard_last_required  = 0;
 };
