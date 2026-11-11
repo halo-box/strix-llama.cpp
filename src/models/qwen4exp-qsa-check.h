@@ -2,8 +2,7 @@
 
 #include <cstdint>
 
-// The QSA graph-build check. A non-compact ubatch on the block-selection path takes the TE rows, which the reserve covers
-// only for at most U tokens in a multi-sequence context: past that it is a decode error, returned before allocation.
+// The QSA graph-build check. A non-compact ubatch on the block-selection path takes the TE rows, which the reserve covers only for at most U tokens in a multi-sequence context: past that it is a decode error, returned before allocation.
 // Layers where block selection is ineligible take the TE rows for every ubatch, the reserve included, so they never fail.
 //
 // The per-layer terms of qwen4exp_use_block_selection, shared with the NC0 re-split so it never cuts an ineligible ubatch.

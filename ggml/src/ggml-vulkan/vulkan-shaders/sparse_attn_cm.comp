@@ -12,14 +12,10 @@
 #include "types.glsl"
 #include "ggml_type_ids.glsl"
 
-// GGML_OP_SPARSE_ATTN, RDNA3 + RADV coopmat kernel: one 64-lane subgroup per (query, K/V head, stream, split),
-// register-built WMMA fragments. One step = 4 plan entries = 16 cells. A masked or padding cell gets score -inf (by select)
-// and a zero V column, so a NaN or inf stored there cannot reach the output (0 * NaN = NaN in WMMA).
-// V is direct (fragments built from the loads) or staged through shared memory (SA_VL). Split z takes steps z,
-// z + n_split, ... of its row. H_q runs in registers in fwht.comp's order; H_o is a separate fwht.comp dispatch.
+// GGML_OP_SPARSE_ATTN, RDNA3 + RADV coopmat kernel: one 64-lane subgroup per (query, K/V head, stream, split), register-built WMMA fragments. One step = 4 plan entries = 16 cells. A masked or padding cell gets score -inf (by select) and a zero V column, so a NaN or inf stored there cannot reach the output (0 * NaN = NaN in WMMA).
+// V is direct (fragments built from the loads) or staged through shared memory (SA_VL). Split z takes steps z, z + n_split, ... of its row. H_q runs in registers in fwht.comp's order; H_o is a separate fwht.comp dispatch.
 // The fragment layout (A: lane L holds row L % 16, element i = column i; B: lane L holds column L % 16, element i = row i;
-// f32 accumulator: lane L holds column L % 16, rows L / 16 + 4 i) is the gfx11 layout of RADV's KHR cooperative matrix
-// lowering, which the spec does not guarantee: the host creates this pipeline for RADV on RDNA3 only.
+// f32 accumulator: lane L holds column L % 16, rows L / 16 + 4 i) is the gfx11 layout of RADV's KHR cooperative matrix lowering, which the spec does not guarantee: the host creates this pipeline for RADV on RDNA3 only.
 
 layout(constant_id = 0) const uint GQA = 12;
 layout(constant_id = 1) const uint FaTypeK = 1;
@@ -76,8 +72,7 @@ shared uvec4 v_sh[SA_VL != 0 ? STEP * D / 8 : 1];    // the step's V rows in f16
     t_ = unpackFloat2x16(b.z); M[12] = t_.x; M[13] = t_.y; \
     t_ = unpackFloat2x16(b.w); M[14] = t_.x; M[15] = t_.y; }
 
-// 8 contiguous dims (dim 8 c8 ...) of a V row as packed f16. The 3-dword window of a quantized piece ends inside it, so
-// the last piece of a row does not read past it.
+// 8 contiguous dims (dim 8 c8 ...) of a V row as packed f16. The 3-dword window of a quantized piece ends inside it, so the last piece of a row does not read past it.
 uvec4 sa_v8(const uint vrow, const uint c8) {
     if (FaTypeV == GGML_TYPE_F16) {
         return data_v4[vrow + c8];
@@ -301,8 +296,7 @@ void main() {
         mx = max(mx, subgroupShuffleXor(mx, 16));
         mx = max(mx, subgroupShuffleXor(mx, 32));
         const float m_new = max(m, mx);
-        // while m_new is -inf the exponentials are taken against 0: a -inf cell gets weight 0 (ggml.h item 3) and a NaN
-        // cell keeps its NaN (item 5)
+        // while m_new is -inf the exponentials are taken against 0: a -inf cell gets weight 0 (ggml.h item 3) and a NaN cell keeps its NaN (item 5)
         const float m_ref = m_new == NEG_INF ? 0.0 : m_new;
         const float corr = exp(m - m_ref);
         float pv[4];
@@ -316,8 +310,7 @@ void main() {
         l = l * corr + ps;
         m = m_new;
 
-        // P^T as a B fragment: element e = key e of the step. Key e = g + 4 i sits in pv[i] of the lanes of group g,
-        // and a register of the fragment packs keys (2k, 2k+1) = groups (2(k & 1), 2(k & 1) + 1), i = k / 2.
+        // P^T as a B fragment: element e = key e of the step. Key e = g + 4 i sits in pv[i] of the lanes of group g, and a register of the fragment packs keys (2k, 2k+1) = groups (2(k & 1), 2(k & 1) + 1), i = k / 2.
         // Pair the groups with a xor-16 exchange, then trade halves with a xor-32 exchange.
         const uint own01 = packFloat2x16(f16vec2(pv[0], pv[1]));
         const uint own23 = packFloat2x16(f16vec2(pv[2], pv[3]));

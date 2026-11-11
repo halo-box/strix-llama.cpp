@@ -1,8 +1,6 @@
 #pragma once
 
-// K/V loaders of the HIP sparse-attention WMMA kernels. Each delivers, for the 16 cells of a plan chunk (4 entries x 4
-// cells) and the 32 dims of block w (wave w of the G4 block owns dims 32w .. 32w+31), the contract f16 halves of
-// sparse-attn-q8.cuh, so the WMMA fragments do not depend on the loader.
+// K/V loaders of the HIP sparse-attention WMMA kernels. Each delivers, for the 16 cells of a plan chunk (4 entries x 4 cells) and the 32 dims of block w (wave w of the G4 block owns dims 32w .. 32w+31), the contract f16 halves of sparse-attn-q8.cuh, so the WMMA fragments do not depend on the loader.
 //   SA_K_DIRECT      every lane loads the 32 dims of its key (lanes r and r + 16 duplicate the load)
 //   SA_K_SPLIT       lane half p loads and converts 16 of the 32 dims once (piece p: dims 8p..8p+7, 16+8p..16+8p+7) and
 //                    the halves are exchanged with v_permlanex16; no LDS
@@ -10,10 +8,8 @@
 //                    over-allocation; one uint2 per (dim, entry)
 //   SA_V_SPLITGATHER direct read of the cache rows: lane half p gathers dim 16p + r for the 16 cells, converts them and
 //                    exchanges the halves with v_permlanex16; no scratch
-// The generic tier (SA_T_GEN) uses the same loader shapes with the runtime switches below, which convert at load (the
-// raw registers already hold f16, so sa_piece_cvt and sa_gather_pair take the f16 branch).
-// V pack trait: SA_VPACK_CAPPED = packed iff n_kv < 64 * n_q, else direct; SA_VPACK_ALWAYS = packed at every n_kv (more
-// memory at long context).
+// The generic tier (SA_T_GEN) uses the same loader shapes with the runtime switches below, which convert at load (the raw registers already hold f16, so sa_piece_cvt and sa_gather_pair take the f16 branch).
+// V pack trait: SA_VPACK_CAPPED = packed iff n_kv < 64 * n_q, else direct; SA_VPACK_ALWAYS = packed at every n_kv (more memory at long context).
 
 #include <cstdint>
 #include <cstddef>
@@ -46,8 +42,7 @@ enum sa_vpack    { SA_VPACK_CAPPED = 0, SA_VPACK_ALWAYS = 1 };
 #define SA_EPI_plain   SA_EPI_PLAIN
 #define SA_EPI_gated   SA_EPI_GATED
 
-// K loader of the G4 attend: split for every type. Split holds 8 raw VGPRs of the next chunk's K across the barriers where
-// direct holds 16, so the GQA 12 instances fit 192 VGPRs. SA_K_DIRECT stays for the G1 tier.
+// K loader of the G4 attend: split for every type. Split holds 8 raw VGPRs of the next chunk's K across the barriers where direct holds 16, so the GQA 12 instances fit 192 VGPRs. SA_K_DIRECT stays for the G1 tier.
 static constexpr int sa_k_loader_of(const int t) {
     return t == SA_T_COUNT ? SA_K_DIRECT : SA_K_SPLIT;
 }
@@ -68,11 +63,8 @@ static constexpr int sa_block_bytes(const int t) {
 
 #include "sparse-attn-q8.cuh"
 
-// ---- the generic tier's loader: one K / V element of any type of S as its contract f16 bits ----
-// The type's to_float computed exactly in f32, then one RNE rounding to f16 (the CPU op's value). For q8_0 / q4_0 / q5_0
-// / iq4_nl the f32 product q * d is exact; for q4_1 / q5_1 q * d is exact, so fmaf equals the CPU's mul-then-add.
-// Element j of a 32-block: nibble qs[j & 15] low (j < 16) or high, fifth bit (q5) bit j of qh. Only 2-byte loads for the
-// halves (18 / 22-byte blocks are 2-byte aligned).
+// ---- the generic tier's loader: one K / V element of any type of S as its contract f16 bits ---- The type's to_float computed exactly in f32, then one RNE rounding to f16 (the CPU op's value). For q8_0 / q4_0 / q5_0 / iq4_nl the f32 product q * d is exact; for q4_1 / q5_1 q * d is exact, so fmaf equals the CPU's mul-then-add.
+// Element j of a 32-block: nibble qs[j & 15] low (j < 16) or high, fifth bit (q5) bit j of qh. Only 2-byte loads for the halves (18 / 22-byte blocks are 2-byte aligned).
 
 static __device__ __forceinline__ float sa_h2f_bits(const uint16_t h) {
     return (float) __builtin_bit_cast(_Float16, h);
@@ -144,8 +136,7 @@ static __device__ __forceinline__ uint16_t sa_elem_t(const char * row, const int
     X(GGML_TYPE_Q5_1)         \
     X(GGML_TYPE_IQ4_NL)
 
-// one element (dim d) of a row of ggml type gt, f16 bits; gt is a kernel argument, so the switch is a scalar branch. A
-// type outside S cannot reach a kernel (supports_op); it gives a NaN
+// one element (dim d) of a row of ggml type gt, f16 bits; gt is a kernel argument, so the switch is a scalar branch. A type outside S cannot reach a kernel (supports_op); it gives a NaN
 static __device__ __forceinline__ uint16_t sa_any_elem(const int gt, const char * row, const int d) {
     switch (gt) {
 #define SA_ANY_ELEM_CASE(T) case T: return sa_elem_t<T>(row, d);
@@ -155,8 +146,7 @@ static __device__ __forceinline__ uint16_t sa_any_elem(const int gt, const char 
     }
 }
 
-// piece p (dims 8p..8p+7 and 16+8p..16+8p+7) of block w (dims 32w..32w+31) of a row of type gt, as the f16 dwords of
-// sa_piece_cvt's output: out[0..3] = dims 32w+8p.., out[4..7] = dims 32w+16+8p.. (low half = the lower dim)
+// piece p (dims 8p..8p+7 and 16+8p..16+8p+7) of block w (dims 32w..32w+31) of a row of type gt, as the f16 dwords of sa_piece_cvt's output: out[0..3] = dims 32w+8p.., out[4..7] = dims 32w+16+8p.. (low half = the lower dim)
 template <int GT>
 static __device__ __forceinline__ void sa_piece_t(const char * row, const int w, const int p, uint32_t * out) {
 #pragma unroll
@@ -181,8 +171,7 @@ static __device__ __forceinline__ void sa_any_piece(const int gt, const char * r
     }
 }
 
-// the direct-V gather of the generic tier: element d of the 4 cells 4 * quad + c (c < 4) of one plan entry as two dwords of
-// f16 halves (cell c in half c), the layout sa_mask_cells takes
+// the direct-V gather of the generic tier: element d of the 4 cells 4 * quad + c (c < 4) of one plan entry as two dwords of f16 halves (cell c in half c), the layout sa_mask_cells takes
 template <int GT>
 static __device__ __forceinline__ uint2 sa_quad4_t(const char * base, const size_t nb1, const uint32_t quad, const int d) {
     const char * row = base + (size_t) (4 * quad) * nb1;
@@ -289,8 +278,7 @@ static __device__ __forceinline__ void sa_piece_cvt(const uint32_t * raw, const 
     }
 }
 
-// one V element (dim dd of block w) of a row as one raw dword for the gather loader: f16 / bf16 bits in the low half,
-// or the q8_0 byte / the q4_0 nibble's byte (pre-shifted) in the low half and the block scale d in the high half
+// one V element (dim dd of block w) of a row as one raw dword for the gather loader: f16 / bf16 bits in the low half, or the q8_0 byte / the q4_0 nibble's byte (pre-shifted) in the low half and the block scale d in the high half
 template <int T>
 static __device__ __forceinline__ uint32_t sa_gather_load(const char * row, const int w, const int dd) {
     if constexpr (T == SA_T_Q8_0) {
@@ -319,8 +307,7 @@ static __device__ __forceinline__ uint32_t sa_gather_pair(const uint32_t g0, con
     }
 }
 
-// f16 halves of the 4 cells of entry j of a chunk, each zeroed (select, not multiply) when no query of the group
-// attends the cell: mk is the entry's 16-bit mask, bit 4 * query + cell
+// f16 halves of the 4 cells of entry j of a chunk, each zeroed (select, not multiply) when no query of the group attends the cell: mk is the entry's 16-bit mask, bit 4 * query + cell
 static __device__ __forceinline__ uint2 sa_mask_cells(const uint2 v, const uint32_t mk) {
     uint32_t lo = 0, hi = 0;
     if (mk & 0x1111u) lo |= 0x0000ffffu;

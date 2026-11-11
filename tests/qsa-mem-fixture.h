@@ -1,5 +1,4 @@
-// A qwen4exp hybrid-idx memory without weights or devices, fed through its real init_batch / apply path: the caches and
-// their cells are the production objects, only the model has no layers.
+// A qwen4exp hybrid-idx memory without weights or devices, fed through its real init_batch / apply path: the caches and their cells are the production objects, only the model has no layers.
 #pragma once
 
 #include "../src/llama-batch.h"

@@ -1116,8 +1116,7 @@ static int64_t qwen4exp_score_strip(int64_t n_tokens, int64_t n_stream, int64_t 
 
 // Complete-block selection: pick indexer_top_k/ratio whole blocks that lie before the query's own block and
 // append the query's own partial block as the tail (up to ratio-1 cells), -1 where nothing is visible. The
-// selected rows then carry the visibility themselves, so GGML_OP_SPARSE_ATTN runs without a mask, for any K / V type and
-// backend. A non-compact ubatch takes the TE rows instead (qwen4exp-te.h).
+// selected rows then carry the visibility themselves, so GGML_OP_SPARSE_ATTN runs without a mask, for any K / V type and backend. A non-compact ubatch takes the TE rows instead (qwen4exp-te.h).
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t ratio, int64_t n_kv,
         const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
     GGML_UNUSED(ubatch);
@@ -1493,9 +1492,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
-        // complete-block selection lists cells with -1 sentinels (invisible blocks, empty tail slots); when the
-        // visibility is not scalar (2-D image positions in the cache, a block split over sequence sets) the
-        // block-expanded top-k with the per-block bias and the KQ mask is used instead (the TE rows, qwen4exp-te.h)
+        // complete-block selection lists cells with -1 sentinels (invisible blocks, empty tail slots); when the visibility is not scalar (2-D image positions in the cache, a block split over sequence sets) the block-expanded top-k with the per-block bias and the KQ mask is used instead (the TE rows, qwen4exp-te.h)
         if (scalar) {
             GGML_ASSERT(hparams.indexer_top_k % r == 0);
             qsa->tail_idxs = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, r-1, n_tps, n_stream);
@@ -1785,9 +1782,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_plan(ggml_tensor * rows, co
     return plan;
 }
 
-// Dense GQA self-attention restricted to the cells of the plan's rows, on GGML_OP_SPARSE_ATTN: the rows carry the
-// visibility, so it needs no mask. q's rotation and the output un-rotation run inside the op (rot_q, rot_o), so no node
-// sits between the attend and the sigmoid gate and the gate fusion still matches.
+// Dense GQA self-attention restricted to the cells of the plan's rows, on GGML_OP_SPARSE_ATTN: the rows carry the visibility, so it needs no mask. q's rotation and the output un-rotation run inside the op (rot_q, rot_o), so no node sits between the attend and the sigmoid gate and the gate fusion still matches.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
         ggml_tensor *             q_cur,
@@ -1798,8 +1793,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         float                     kq_scale,
         int                       il,
         ggml_tensor **            attn_node) {
-    // rotate k/v before they reach a quantized cache, as the dense path does; q is rotated by the op (rot_q). The indexer
-    // has already scored with its own query in build_qsa_top_k, so the rows are unaffected.
+    // rotate k/v before they reach a quantized cache, as the dense path does; q is rotated by the op (rot_q). The indexer has already scored with its own query in build_qsa_top_k, so the rows are unaffected.
     const int32_t rot_q = inp->self_k_rot ? (int32_t) inp->self_k_rot->ne[0] : 0;
     const int32_t rot_o = inp->self_v_rot ? (int32_t) inp->self_v_rot->ne[0] : 0;
     if (inp->self_k_rot) {
@@ -1966,8 +1960,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                 }
             }
         } else {
-            // the trim needs the compact selection (the TE rows read the full-batch KQ mask) and one
-            // stream; the input set of this ratio was made by an earlier layer
+            // the trim needs the compact selection (the TE rows read the full-batch KQ mask) and one stream; the input set of this ratio was made by an earlier layer
             const auto it_inp = qsa_inps.find((uint32_t) r);
             if (q_first > 0 && tile_out_ids && mctx_hyb->get_n_stream() == 1 && it_inp != qsa_inps.end() && it_inp->second->compact &&
                     q_first % qwen4exp_query_strip(n_tokens, 1) == 0) {

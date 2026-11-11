@@ -1,5 +1,4 @@
-// The QSA placement guard, on the model given on the command line. Only reject-decode allocates the weights: the
-// others run on the no_alloc path of the -fit probe.
+// The QSA placement guard, on the model given on the command line. Only reject-decode allocates the weights: the others run on the no_alloc path of the -fit probe.
 //   test-qsa-guard <model.gguf> pass [ctk]    real device: the context is created, >= 2 nodes per QSA layer inspected
 //   test-qsa-guard <model.gguf> fake          fake GPU device without SPARSE_ATTN: init error naming cause and remedy
 //   test-qsa-guard <model.gguf> reject        real HIP device under GGML_CUDA_SA_FORCE=reject: init error

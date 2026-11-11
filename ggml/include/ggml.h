@@ -2590,16 +2590,11 @@ extern "C" {
     //
     // sparse attention over per-query selection rows (two ops)
     //
-    // ggml_sparse_attn_plan canonicalises per-query selection rows into a grouped attention plan. Integer only: every
-    // backend produces identical dst bytes.
+    // ggml_sparse_attn_plan canonicalises per-query selection rows into a grouped attention plan. Integer only: every backend produces identical dst bytes.
     //   S(i,s) = { c : exists j, sel[j,i,0,s] == c, 0 <= c < n_kv }
-    // (set semantics: order, duplicates, -1 and out-of-range entries are irrelevant; out-of-range values other than -1
-    // are counted in hdr.n_bad).
+    // (set semantics: order, duplicates, -1 and out-of-range entries are irrelevant; out-of-range values other than -1 are counted in hdr.n_bad).
     //
-    // sel  : I32 [n_sel, n_q, 1, n_stream]; nb[0] == 4; nb[1..3] % 4 == 0; n_sel >= 1
-    // n_kv : keys visible to the op (cells 0..n_kv-1 of the K/V views); 1 <= n_kv <= 2^24
-    // group: G in {1, 4}: consecutive queries of one stream that share one union of quads
-    // dst  : I8 [ggml_sparse_attn_plan_nbytes(n_sel, n_q, n_stream, n_kv, group)], little-endian, offsets 256-byte aligned:
+    // sel  : I32 [n_sel, n_q, 1, n_stream]; nb[0] == 4; nb[1..3] % 4 == 0; n_sel >= 1 n_kv : keys visible to the op (cells 0..n_kv-1 of the K/V views); 1 <= n_kv <= 2^24 group: G in {1, 4}: consecutive queries of one stream that share one union of quads dst  : I8 [ggml_sparse_attn_plan_nbytes(n_sel, n_q, n_stream, n_kv, group)], little-endian, offsets 256-byte aligned:
     //   hdr    struct ggml_sparse_attn_plan_hdr (64 bytes, then zero bytes up to off_counts = 256)
     //   counts u32 [n_stream][n_groups]       entries used, padded to a multiple of 4
     //   quads  u32 [n_stream][n_groups][cap]  physical quad id = cell >> 2, strictly ascending within a group
@@ -2607,10 +2602,8 @@ extern "C" {
     //   n_groups = ceil(n_q / G); cap = round4(min(G * n_sel, ceil(n_kv / 4)))
     //   every entry past the group's real entries (the padding up to counts[s][g] and everything up to cap) holds
     //   quad = the last real quad of the group (0 for an empty group) and mask = 0; the gaps between sections are 0
-    // op_params (i32): n_kv, group, n_sel, n_q, n_stream. A consumer's workspace is computed from them, never from the
-    // plan's src (not linked on an RPC server).
-    // The sort/dedup scratch (ggml_sparse_attn_plan_scratch_nbytes = n_stream * n_q * round4(n_sel) * 4 bytes) is not
-    // part of dst: GPU backends over-allocate dst in get_alloc_size, the CPU uses the graph work buffer.
+    // op_params (i32): n_kv, group, n_sel, n_q, n_stream. A consumer's workspace is computed from them, never from the plan's src (not linked on an RPC server).
+    // The sort/dedup scratch (ggml_sparse_attn_plan_scratch_nbytes = n_stream * n_q * round4(n_sel) * 4 bytes) is not part of dst: GPU backends over-allocate dst in get_alloc_size, the CPU uses the graph work buffer.
 #define GGML_SPARSE_ATTN_PLAN_MAGIC   0x50415351u // the bytes "QSAP"
 #define GGML_SPARSE_ATTN_PLAN_VERSION 1u
 
@@ -2655,12 +2648,7 @@ extern "C" {
     //   r = n_head / n_head_kv; H_q / H_o: orthonormal Sylvester-Hadamard over consecutive blocks of rot_q / rot_o dims
     //   (0 = identity), the transform llama_mul_mat_hadamard applies; an empty S gives 0.
     //
-    // q   : F32 [D, n_q, n_head, n_stream]        nb[0] == 4, any other strides (the FLASH_ATTN_EXT q layout)
-    // k   : T_k [D, n_kv_k, n_head_kv, n_stream]   cache view (stored rotated if quantized); n_kv_k >= 4*ceil(n_kv/4)
-    // v   : T_v [D, n_kv_v, n_head_kv, n_stream]   not transposed;                           n_kv_v >= 4*ceil(n_kv/4)
-    // plan: ggml_sparse_attn_plan(sel, n_kv, G) with sel->ne[1] == n_q and sel->ne[3] == n_stream
-    // rot_q, rot_o: 0, 64, 128 or 256, dividing D
-    // dst : F32 [D, n_head, n_q, n_stream] (the FLASH_ATTN_EXT output layout)
+    // q   : F32 [D, n_q, n_head, n_stream]        nb[0] == 4, any other strides (the FLASH_ATTN_EXT q layout) k   : T_k [D, n_kv_k, n_head_kv, n_stream]   cache view (stored rotated if quantized); n_kv_k >= 4*ceil(n_kv/4) v   : T_v [D, n_kv_v, n_head_kv, n_stream]   not transposed;                           n_kv_v >= 4*ceil(n_kv/4) plan: ggml_sparse_attn_plan(sel, n_kv, G) with sel->ne[1] == n_q and sel->ne[3] == n_stream rot_q, rot_o: 0, 64, 128 or 256, dividing D dst : F32 [D, n_head, n_q, n_stream] (the FLASH_ATTN_EXT output layout)
     //
     // Numeric contract (the CPU op implements it exactly; it is the reference of every backend):
     //   1. K and V elements are converted to f16 as the type's to_float value rounded to f16 (RNE, +-inf on overflow).
@@ -2684,12 +2672,9 @@ extern "C" {
             int32_t               rot_q,
             int32_t               rot_o);
 
-    // The shape invariants ggml_sparse_attn asserts, checked on an existing node: NULL when they hold, else the first
-    // that fails. Nodes deserialized by an RPC server were never built by ggml_sparse_attn, so supports_op and compute
-    // run this before reading K / V.
+    // The shape invariants ggml_sparse_attn asserts, checked on an existing node: NULL when they hold, else the first that fails. Nodes deserialized by an RPC server were never built by ggml_sparse_attn, so supports_op and compute run this before reading K / V.
     GGML_API const char * ggml_sparse_attn_shape_why(const struct ggml_tensor * op);
-    // the same for a GGML_OP_SPARSE_ATTN_PLAN node and its sel (src[0]): sel's shape matches the op_params and
-    // ggml_nbytes(dst) is the layout's nbytes
+    // the same for a GGML_OP_SPARSE_ATTN_PLAN node and its sel (src[0]): sel's shape matches the op_params and ggml_nbytes(dst) is the layout's nbytes
     GGML_API const char * ggml_sparse_attn_plan_shape_why(const struct ggml_tensor * op);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext

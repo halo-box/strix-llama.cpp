@@ -1,16 +1,12 @@
 // The non-compact re-split of llama_memory_hybrid_idx::init_batch, on the production memory.
-// Layouts: (a) one sequence with 2-D cells at several depths; (b) a seq_cp prefix ending inside a block; (c) images in two
-// sequences of one unified stream; (d) -np 2 split streams with one image. Random text and image batches over
-// n_keep_tail x n_ubatch x S. For every ubatch, with the graph-time predicate qsa_scalar_visibility:
+// Layouts: (a) one sequence with 2-D cells at several depths; (b) a seq_cp prefix ending inside a block; (c) images in two sequences of one unified stream; (d) -np 2 split streams with one image. Random text and image batches over n_keep_tail x n_ubatch x S. For every ubatch, with the graph-time predicate qsa_scalar_visibility:
 //   (i)   graph-NC(u) => NC0(u)
 //   (ii)  NC0(u) => u.n_tokens <= U = min(n_ubatch, S x 512)
 //   (iii) every batch token in exactly one ubatch
 //   (iv)  the last n_keep_tail tokens of every sequence share one ubatch
 //   (v)   attention cells == indexer cells after every apply
 //   (vi)  replays <= #ubatches
-// The grid evaluates NC0 on every ubatch (qsa_nc0_eval_all). The decode phase runs as llama does: NC0 only above U, where
-// a re-split can act, with the same ubatches and replays. The ineligible phase (non-causal, ratio 1, top_k % ratio != 0)
-// must neither re-split nor evaluate NC0: those ubatches use TE rows the reserve already sized.
+// The grid evaluates NC0 on every ubatch (qsa_nc0_eval_all). The decode phase runs as llama does: NC0 only above U, where a re-split can act, with the same ubatches and replays. The ineligible phase (non-causal, ratio 1, top_k % ratio != 0) must neither re-split nor evaluate NC0: those ubatches use TE rows the reserve already sized.
 // Pass: no violation, and the re-split engaged on the multi-sequence layouts.
 #include "qsa-mem-fixture.h"
 

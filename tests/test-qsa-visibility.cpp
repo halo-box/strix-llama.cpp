@@ -233,8 +233,7 @@ int main() {
         feed_check("neg-split-A-image", f, f.image(0, 16, 16), 512, EXPECT_COMPACT);
         feed_check("neg-split-B-text", f, f.text(1, 700), 512, EXPECT_COMPACT);
     }
-    // text only, two sequences in one unified stream: compact; a seq_cp prefix that ends inside a block splits it over two
-    // sequence sets: non-compact for both
+    // text only, two sequences in one unified stream: compact; a seq_cp prefix that ends inside a block splits it over two sequence sets: non-compact for both
     {
         qsa_fixture f(32768, 3, true);
         feed_plain("text-ms", f, f.text(0, 3000), 1024);

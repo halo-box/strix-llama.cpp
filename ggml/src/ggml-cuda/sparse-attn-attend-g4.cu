@@ -1,23 +1,15 @@
 // GGML_OP_SPARSE_ATTN on HIP: kernel selection, workspace size, supports_op and dispatch.
 //
-// Tiers: fast (G4 / G1 WMMA attends for S_fast pairs), generic (the same attends with the runtime-switch loader, for
-// pairs with a member outside S_fast) and portable (scalar, any type of S, any G). The WMMA tiers run on RDNA3.5 only;
-// every other HIP arch runs the portable tier. Every tier applies the rotations itself (H_q in the Q prologue, H_o in the
-// epilogue or the G1 merge), so the gate fusion also works for quantized caches.
-// sa_select is the one shape-only function deciding tier, instance and V loader, used by supports_op, get_alloc_size,
-// the dispatch and the census. Workspace, at round_up(nbytes(dst), 256) in dst's over-allocation (never the pool), each
-// part padded to 256 bytes:
+// Tiers: fast (G4 / G1 WMMA attends for S_fast pairs), generic (the same attends with the runtime-switch loader, for pairs with a member outside S_fast) and portable (scalar, any type of S, any G). The WMMA tiers run on RDNA3.5 only;
+// every other HIP arch runs the portable tier. Every tier applies the rotations itself (H_q in the Q prologue, H_o in the epilogue or the G1 merge), so the gate fusion also works for quantized caches.
+// sa_select is the one shape-only function deciding tier, instance and V loader, used by supports_op, get_alloc_size, the dispatch and the census. Workspace, at round_up(nbytes(dst), 256) in dst's over-allocation (never the pool), each part padded to 256 bytes:
 //   G4 packed V: [V: ceil(n_kv / 4) quads x 2 KiB x n_head_kv x n_stream][quad flags: 1 B each][any-flag: 4 B]
 //   G4 direct V: [wave flags: 1 B per (stream, group, kv head, wave)]
 //   G1:          split-K partials [n_stream][n_q][n_head][splits][258] f32 when splits > 1
 //   portable:    none
-// Every flag byte is written at each launch (the any-flag is memset before the pack). get_alloc_size takes the max over
-// G in {1, 4}, n_q' <= n_q and n_kv' <= n_kv: under CAPPED a runtime op packs only when n_kv' < 64 * n_q, so the pack
-// bound is min(4 * ceil(n_kv / 4), 64 * n_q) cells.
+// Every flag byte is written at each launch (the any-flag is memset before the pack). get_alloc_size takes the max over G in {1, 4}, n_q' <= n_q and n_kv' <= n_kv: under CAPPED a runtime op packs only when n_kv' < 64 * n_q, so the pack bound is min(4 * ceil(n_kv / 4), 64 * n_q) cells.
 // Test switch GGML_CUDA_SA_FORCE, comma-separated tokens (kernel choice only, never placement; get_alloc_size follows):
-// vpacked | vdirect (G4 V loader), generic, portable (tier), g1 | g4 (group policy), fixup (recompute every G4 block),
-// plan_global (plan rows / merge on global memory), reject (SPARSE_ATTN unsupported), rot_dump (rot_q != 0: write H_q q
-// into dst and launch nothing after the attend).
+// vpacked | vdirect (G4 V loader), generic, portable (tier), g1 | g4 (group policy), fixup (recompute every G4 block), plan_global (plan rows / merge on global memory), reject (SPARSE_ATTN unsupported), rot_dump (rot_q != 0: write H_q q into dst and launch nothing after the attend).
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-census.h"
@@ -230,8 +222,7 @@ static sa_selection sa_select(const ggml_tensor * op, const int device) {
         r.tier = SA_TIER_FAST;
     }
 
-    // workspace bound over G in {1, 4} at this n_kv: the largest pack any runtime op can need, the direct flags at this
-    // n_q, and the largest G1 partials of any n_q' <= n_q
+    // workspace bound over G in {1, 4} at this n_kv: the largest pack any runtime op can need, the direct flags at this n_q, and the largest G1 partials of any n_q' <= n_q
     r.splits = 1;
     r.ws_max = 0;
     if (r.tier != SA_TIER_PORTABLE) {

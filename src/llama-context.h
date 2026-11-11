@@ -309,8 +309,7 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
-    // QSA placement guard: every QSA plan / attention node on its layer's K buffer backend and supported there, each plan
-    // with one consumer, enough nodes inspected. Returns the error text, empty when it passes.
+    // QSA placement guard: every QSA plan / attention node on its layer's K buffer backend and supported there, each plan with one consumer, enough nodes inspected. Returns the error text, empty when it passes.
     std::string qsa_guard(ggml_cgraph * gf, const llm_graph_result * res, const char * where);
     // throws on a violation
     void qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const char * where,

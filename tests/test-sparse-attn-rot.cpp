@@ -1,11 +1,9 @@
-// HIP checks of the in-op rotations of GGML_OP_SPARSE_ATTN, bit for bit against fwht.cu (a GGML_HINT_SRC0_IS_HADAMARD
-// mul_mat on the same backend), which test-backend-ops cannot express:
+// HIP checks of the in-op rotations of GGML_OP_SPARSE_ATTN, bit for bit against fwht.cu (a GGML_HINT_SRC0_IS_HADAMARD mul_mat on the same backend), which test-backend-ops cannot express:
 //   hq     the kernel's q transform (GGML_CUDA_SA_FORCE=rot_dump writes H_q q into dst) against fwht.cu of q;
 //   ho     the op with rot_o against fwht.cu of its rot 0 output;
 //   graph  the op with (rot_q, rot_o) against fwht.cu(q) -> op(rot 0) -> fwht.cu(out);
 //   gated  the gate fused into the rotated epilogue against an unfused gate: close, not claimed bitwise.
-// The kernel tier is the process's: run once per GGML_CUDA_SA_FORCE value ("", generic, portable, fixup). HIP graphs are
-// disabled (the dump hook is read at dispatch time).
+// The kernel tier is the process's: run once per GGML_CUDA_SA_FORCE value ("", generic, portable, fixup). HIP graphs are disabled (the dump hook is read at dispatch time).
 // Without a ROCm backend it exits 0 ("skipped"). usage: test-sparse-attn-rot [hq|ho|graph|gated ...]
 
 #include "ggml.h"
@@ -63,8 +61,7 @@ static sa_graph sa_build(ggml_context * ctx, const sa_shape & s, ggml_tensor * q
     return g;
 }
 
-// the values are drawn whether or not the graph allocated t (a graph may not use every input), so every graph of a check
-// sees the same data
+// the values are drawn whether or not the graph allocated t (a graph may not use every input), so every graph of a check sees the same data
 static void set_if_allocated(ggml_tensor * t, const void * data, size_t n) {
     if (t->buffer != nullptr) {
         ggml_backend_tensor_set(t, data, 0, n);

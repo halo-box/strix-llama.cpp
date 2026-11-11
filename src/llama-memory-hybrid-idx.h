@@ -322,11 +322,9 @@ public:
     // one stream, scalar positions in range, no 2d rope extents, no block split over sequence sets
     // (qsa_scalar_visibility_cells): the compact visibility rule applies
     bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
-    // QSA_COMPACT_OK or why the compact predicate rejects ubatch on the indexer cells; a reservation context sees no cell
-    // and gives the empty cache's verdict
+    // QSA_COMPACT_OK or why the compact predicate rejects ubatch on the indexer cells; a reservation context sees no cell and gives the empty cache's verdict
     int qsa_compact_reason(const llama_ubatch & ubatch, uint32_t ratio) const;
-    // runtime: qsa_scalar_visibility on the live cells; a reserve graph or a reservation context: the empty cache's verdict,
-    // so a later reserve on a live cache builds the same route as the first
+    // runtime: qsa_scalar_visibility on the live cells; a reserve graph or a reservation context: the empty cache's verdict, so a later reserve on a live cache builds the same route as the first
     bool qsa_graph_compact(const llama_ubatch & ubatch, uint32_t ratio, bool reserve_graph) const;
     // the re-split cap U and whether the memory serves several sequences
     uint32_t qsa_noncompact_cap(uint32_t n_ubatch) const { return mem ? mem->qsa_noncompact_cap(n_ubatch) : n_ubatch; }

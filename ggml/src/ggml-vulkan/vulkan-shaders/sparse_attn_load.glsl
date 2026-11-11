@@ -1,5 +1,4 @@
-// K/V element conversion of the 64-lane SPARSE_ATTN tiers: flash_attn_dequant.glsl through the FaTypeK / FaTypeV spec
-// constants, then one rounding to f16. Offsets and strides are in the unit of the type (ggml_vk_sa_unit_bytes).
+// K/V element conversion of the 64-lane SPARSE_ATTN tiers: flash_attn_dequant.glsl through the FaTypeK / FaTypeV spec constants, then one rounding to f16. Offsets and strides are in the unit of the type (ggml_vk_sa_unit_bytes).
 
 #define BINDING_IDX_K 0
 #define BINDING_IDX_V 1
@@ -36,8 +35,7 @@ uint sa_pack2(const vec2 x) {
     return packFloat2x16(f16vec2(x));
 }
 
-// fast loaders of the WMMA kernel: 0x6400 | (q + 128) is 1152 + q exactly in half, so one f16 product with the block's
-// scale is the RNE of the exact product, as in the generic path (q4_0: 0x6400 | q and 1032)
+// fast loaders of the WMMA kernel: 0x6400 | (q + 128) is 1152 + q exactly in half, so one f16 product with the block's scale is the RNE of the exact product, as in the generic path (q4_0: 0x6400 | q and 1032)
 
 uint sa_q8x2(const uint x, const f16vec2 d2) {
     const f16vec2 v = unpackFloat2x16(((x ^ 0x00800080u) & 0x00FF00FFu) | 0x64006400u);

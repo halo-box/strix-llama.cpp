@@ -10,8 +10,7 @@ extern "C" {
 #define RPC_PROTO_MINOR_VERSION    1
 #define RPC_PROTO_PATCH_VERSION    0
 
-// Oldest server minor this client accepts: 8.1 adds the sparse-attention ops and RPC_CMD_SUPPORTS_OP, which an older
-// server lacks. A change of the op enum needs a minor bump and this floor raised to it.
+// Oldest server minor this client accepts: 8.1 adds the sparse-attention ops and RPC_CMD_SUPPORTS_OP, which an older server lacks. A change of the op enum needs a minor bump and this floor raised to it.
 #define RPC_PROTO_MIN_SERVER_MINOR_VERSION 1
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_MINOR_VERSION");

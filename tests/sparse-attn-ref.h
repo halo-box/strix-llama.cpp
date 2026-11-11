@@ -85,8 +85,7 @@ static inline float rh(float x) {
     return ggml_fp16_to_fp32(ggml_fp32_to_fp16(x));
 }
 
-// the H_q / H_o transform: orthonormal Sylvester-Hadamard over consecutive blocks of n values (n = 0: identity),
-// scale by 1/sqrt(n) first, then the butterflies (ggml-cpu ggml_compute_forward_fwht order)
+// the H_q / H_o transform: orthonormal Sylvester-Hadamard over consecutive blocks of n values (n = 0: identity), scale by 1/sqrt(n) first, then the butterflies (ggml-cpu ggml_compute_forward_fwht order)
 static void fwht(float * x, int64_t D, int32_t n) {
     if (n <= 0) {
         return;
@@ -228,8 +227,7 @@ static std::vector<float> attend(const view & q, const view & k, const view & v,
 // f64 oracles, reported only (never gated):
 //   O_C18  q = f16(f16(q) * f16(scale)), K/V = to_float rounded to f16, bf16 saturated to +-65504 first
 //   O_PLAN q * scale in f32, K/V = to_float (no f16 rounding)
-// both with an exact f64 softmax over the row's valid cells. Computed for the queries listed in `queries` (all heads and
-// streams); returns max |gpu - ref| / max |ref| over them, against `got` ([D, n_head, n_q, n_stream] contiguous).
+// both with an exact f64 softmax over the row's valid cells. Computed for the queries listed in `queries` (all heads and streams); returns max |gpu - ref| / max |ref| over them, against `got` ([D, n_head, n_q, n_stream] contiguous).
 // Infinite or NaN reference values are skipped (the overflow case).
 enum f64_oracle { O_C18 = 0, O_PLAN = 1 };
 

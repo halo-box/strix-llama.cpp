@@ -1,5 +1,4 @@
-// GGML_OP_SPARSE_ATTN with a G = 1 plan on HIP: the sa_attend_g1 instances, their launcher, the shape-only split count,
-// and the HIP group and dense-shortcut policies. Selection and dispatch of the whole op are in sparse-attn-attend-g4.cu.
+// GGML_OP_SPARSE_ATTN with a G = 1 plan on HIP: the sa_attend_g1 instances, their launcher, the shape-only split count, and the HIP group and dense-shortcut policies. Selection and dispatch of the whole op are in sparse-attn-attend-g4.cu.
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-attend-g1.cuh"
@@ -22,9 +21,7 @@ static int sa_policy_type(const ggml_type t) {
     }
 }
 
-// G1 vs G4 crossover past the shortcut, measured per V type: G1 when n_q is at most the largest n_q where
-// plan(G1) + G1 attend (+ merge) beat plan(G4) + the best G4 attend by more than the noise margin on every fixture of the
-// n_kv class (classes 8192, 32768, 65536, 135168; boundaries at their geometric midpoints). Types outside S_fast: n_q < 128.
+// G1 vs G4 crossover past the shortcut, measured per V type: G1 when n_q is at most the largest n_q where plan(G1) + G1 attend (+ merge) beat plan(G4) + the best G4 attend by more than the noise margin on every fixture of the n_kv class (classes 8192, 32768, 65536, 135168; boundaries at their geometric midpoints). Types outside S_fast: n_q < 128.
 bool ggml_cuda_sa_g1_beats_g4(int64_t n_q_per_stream, int64_t n_kv, ggml_type type_k, ggml_type type_v) {
     GGML_UNUSED(type_k);
     // largest n_q with G1: [V f16, bf16, q8_0, q4_0][n_kv class 8192, 32768, 65536, 135168]
@@ -42,8 +39,7 @@ bool ggml_cuda_sa_g1_beats_g4(int64_t n_q_per_stream, int64_t n_kv, ggml_type ty
     return n_q_per_stream <= nq_max[tv][c];
 }
 
-// The work split G of a QSA layer's plan. In the dense shortcut (all-visible rows, n_kv <= top_k + r - 1): G1 up to
-// n_q 32, G4 above, the same crossover for every S_fast pair. Past it: ggml_cuda_sa_g1_beats_g4.
+// The work split G of a QSA layer's plan. In the dense shortcut (all-visible rows, n_kv <= top_k + r - 1): G1 up to n_q 32, G4 above, the same crossover for every S_fast pair. Past it: ggml_cuda_sa_g1_beats_g4.
 int ggml_cuda_sparse_attn_group(int device, int64_t n_q_per_stream, int64_t n_kv, ggml_type type_k, ggml_type type_v, bool shortcut) {
     GGML_UNUSED(device);
     // test switch GGML_CUDA_SA_FORCE=g1 | g4, read at every call (get_alloc_size covers both G)
@@ -56,8 +52,7 @@ int ggml_cuda_sparse_attn_group(int device, int64_t n_q_per_stream, int64_t n_kv
     return ggml_cuda_sa_g1_beats_g4(n_q_per_stream, n_kv, type_k, type_v) ? 1 : 4;
 }
 
-// Dense shortcut preference: f16 / f16 keeps the dense causal FLASH_ATTN_EXT; another pair is dense in the n_q bands
-// {1, 2-8, 9-32, 33-127, 128-511, 512-1023, >= 1024} where sparse (plan + attend) was not below 0.98 x dense.
+// Dense shortcut preference: f16 / f16 keeps the dense causal FLASH_ATTN_EXT; another pair is dense in the n_q bands {1, 2-8, 9-32, 33-127, 128-511, 512-1023, >= 1024} where sparse (plan + attend) was not below 0.98 x dense.
 bool ggml_cuda_sparse_attn_prefer_dense(int device, ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv) {
     GGML_UNUSED(device);
     GGML_UNUSED(n_kv);

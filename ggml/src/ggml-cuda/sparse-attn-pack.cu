@@ -1,8 +1,5 @@
 // sa_pack_v<T>: V to the packed f16 layout the G4 attend reads with SA_V_PACKED (T = SA_T_GEN: any type of S).
-// Layout f16 [n_stream][n_head_kv][n_quads][256 dims][4 cells], so one uint2 load gives the 4 cells of a quad for one
-// dim. Every cell is converted with the conversions of sparse-attn-q8.cuh, so packed and direct V give the same halves,
-// except non-finite halves: written as 0 and their quad flagged for the exact fixup. The destination is the attend's dst
-// over-allocation, never the pool.
+// Layout f16 [n_stream][n_head_kv][n_quads][256 dims][4 cells], so one uint2 load gives the 4 cells of a quad for one dim. Every cell is converted with the conversions of sparse-attn-q8.cuh, so packed and direct V give the same halves, except non-finite halves: written as 0 and their quad flagged for the exact fixup. The destination is the attend's dst over-allocation, never the pool.
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-census.h"
@@ -13,8 +10,7 @@
 
 static constexpr int SA_PACK_THREADS = 256;
 
-// one block per (stream, kv head, quad), one thread per dim. Writes the quad's flag (every quad written: no clearing)
-// and ORs 1 into *any (cleared before launch) when a half is non-finite
+// one block per (stream, kv head, quad), one thread per dim. Writes the quad's flag (every quad written: no clearing) and ORs 1 into *any (cleared before launch) when a half is non-finite
 template <int T>
 static __global__ void __launch_bounds__(SA_PACK_THREADS) sa_pack_v(
         const char * __restrict__ v, uint16_t * __restrict__ dst, const size_t nb1, const size_t nb2, const size_t nb3,

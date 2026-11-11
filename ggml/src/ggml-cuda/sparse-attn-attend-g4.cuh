@@ -1,10 +1,6 @@
 #pragma once
 
-// sa_attend_g4<KT, VT, VL, EPI, GQA, ROT>: GGML_OP_SPARSE_ATTN with a G = 4 plan on RDNA3 WMMA. Block (group, kv head,
-// stream), 8 waves, wave w owns dims 32w .. 32w+31; rows = 4 queries x GQA heads
-// (1, 2 or 3 WMMA row tiles of 16). Each wave computes partial scores of all rows over its dims, waves w < GQA / 4 reduce
-// tile w and run the online softmax of its 16 rows. EPI (plain | gated) is a template parameter: runtime branches cost
-// several percent.
+// sa_attend_g4<KT, VT, VL, EPI, GQA, ROT>: GGML_OP_SPARSE_ATTN with a G = 4 plan on RDNA3 WMMA. Block (group, kv head, stream), 8 waves, wave w owns dims 32w .. 32w+31; rows = 4 queries x GQA heads (1, 2 or 3 WMMA row tiles of 16). Each wave computes partial scores of all rows over its dims, waves w < GQA / 4 reduce tile w and run the online softmax of its 16 rows. EPI (plain | gated) is a template parameter: runtime branches cost several percent.
 //   - q * scale in f32, then f16;
 //   - masked-off cells contribute nothing: K / V of a cell no query of the group attends are zeroed by select, and the
 //     score of a cell the row's query does not attend is -inf;
@@ -65,15 +61,13 @@ struct sa_g4_args {
 
 typedef void (*sa_g4_kernel_t)(const sa_g4_args);
 
-// instance tables of sparse-attn-attend-g4-<kt>.cu: two per census index i = ((vt * 2 + vl) * 2 + epi) * 3 + gqa_index,
-// 2 * i is ROT = false, 2 * i + 1 ROT = true
+// instance tables of sparse-attn-attend-g4-<kt>.cu: two per census index i = ((vt * 2 + vl) * 2 + epi) * 3 + gqa_index, 2 * i is ROT = false, 2 * i + 1 ROT = true
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_f16[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_bf16[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q8_0[];
 extern const sa_g4_kernel_t ggml_cuda_sa_g4_kernels_q4_0[];
 
-// waves per EU: 8 (192 VGPRs) for every instance but the generic tier's GQA 12 direct-V and ROT ones, which spill at
-// that budget and get 7
+// waves per EU: 8 (192 VGPRs) for every instance but the generic tier's GQA 12 direct-V and ROT ones, which spill at that budget and get 7
 template <int KT, int VL, int GQA, bool ROT>
 static constexpr int sa_g4_waves_per_eu() {
     return KT == SA_T_GEN && GQA == 12 && (VL == SA_V_SPLITGATHER || ROT) ? 7 : 8;
@@ -110,8 +104,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
     // Q prologue: f16(q * scale) (f32 product, one rounding), staged per wave, read back as the WMMA B fragments
     sa_v16s qf[NT][2];
     if (ROT && a.rot_q != 0) {
-        // H_q: wave w takes rows w, w + 8, ... whole (fwht_row layout), transforms them in f32 and writes f16(x * scale)
-        // of dim 32 j + l into the stage of wave j
+        // H_q: wave w takes rows w, w + 8, ... whole (fwht_row layout), transforms them in f32 and writes f16(x * scale) of dim 32 j + l into the stage of wave j
         uint16_t * stage0 = reinterpret_cast<uint16_t *>(&part[0][0][0]);
         for (int row = w; row < 16 * NT; row += 8) {
             const int qi = row / GQA, h = row - GQA*qi;
@@ -291,8 +284,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
         for (int j = 0; j < 4; ++j) {
             uint2 v;
             if constexpr (VT == SA_T_GEN) {
-                // the generic tier gathers and converts here, one entry at a time: doing it before the barriers spilled
-                // the GQA 12 instance
+                // the generic tier gathers and converts here, one entry at a time: doing it before the barriers spilled the GQA 12 instance
                 GGML_UNUSED(vr);
                 v = sa_any_quad4(a.vt_g, vbase, a.v_nb1, b[j], 32*w + 16*hi + r);
             } else {
@@ -424,8 +416,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
             mloc = fmaxf(mloc, __shfl_xor(mloc, 16));
             const float mnew  = fmaxf(m, mloc);
             const float alpha = mnew == -INFINITY ? 1.f : exp2f((m - mnew) * SA_L2E);
-            // fmaxf drops a NaN score, so mnew stays -inf in a step of only -inf / NaN scores: exponentials are then taken
-            // against 0, a -inf cell gets 0 and a NaN cell keeps its NaN, so l is NaN and the row 0 (op contract)
+            // fmaxf drops a NaN score, so mnew stays -inf in a step of only -inf / NaN scores: exponentials are then taken against 0, a -inf cell gets 0 and a NaN cell keeps its NaN, so l is NaN and the row 0 (op contract)
             const float mref  = mnew == -INFINITY ? 0.f : mnew;
             float p[8], ls = 0.f;
 #pragma unroll
@@ -481,8 +472,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
         if constexpr (!PACKED) {
             v_fin(vr, b, m01, m23, vf);
         }
-        // direct V: a non-finite V half in this wave's fragment (x * 0 + acc is NaN exactly then, one packed FMA per
-        // dword). Packed V needs no check: the pack already zeroed and flagged it (the check would cost ~4 %)
+        // direct V: a non-finite V half in this wave's fragment (x * 0 + acc is NaN exactly then, one packed FMA per dword). Packed V needs no check: the pack already zeroed and flagged it (the check would cost ~4 %)
         if constexpr (!PACKED) {
             sa_half2 nf = sa_half2{(_Float16) 0, (_Float16) 0};
 #pragma unroll
@@ -496,8 +486,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
                     nf = __builtin_bit_cast(sa_half2, vv[k].w) * sa_half2{(_Float16) 0, (_Float16) 0} + nf;
                 }
             }
-            // the shared PV WMMA would give 0 * inf = NaN to rows whose query does not attend that cell: take the finite
-            // halves only and flag the block for sa_attend_fixup
+            // the shared PV WMMA would give 0 * inf = NaN to rows whose query does not attend that cell: take the finite halves only and flag the block for sa_attend_fixup
             if (__builtin_expect(__ballot((__builtin_bit_cast(uint32_t, nf) & 0x7fff7fffu) != 0) != 0, 0)) {
 #pragma unroll
                 for (int t = 0; t < 2; ++t) {
@@ -552,8 +541,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(sa_g4_
         }
         __syncthreads();
         if (ROT && a.rot_o != 0) {
-            // H_o: tile i is in part, element (row rr, dim 32 j + l) at ostage of wave j + rr * 32 + l. Wave w takes rows
-            // w and w + 8 whole, transforms them in f32 and stores them (gated: then the gate, as unrotated)
+            // H_o: tile i is in part, element (row rr, dim 32 j + l) at ostage of wave j + rr * 32 + l. Wave w takes rows w and w + 8 whole, transforms them in f32 and stores them (gated: then the gate, as unrotated)
             const float * tile = reinterpret_cast<const float *>(&part[0][0][0]);
             for (int rr = w; rr < 16; rr += 8) {
                 const int row = 16*i + rr, qi = row / GQA, h = row - GQA*qi;
@@ -649,10 +637,7 @@ static __device__ __forceinline__ float sa_elem_f16(const char * row, const int 
 }
 
 // sa_attend_fixup<KT, VT, EPI>: exact recomputation of the blocks sa_attend_g4 flagged, with the CPU op's arithmetic:
-// per row (query, head), the cells its query attends in ascending order, one at a time (f32 score, online softmax with
-// expf, P rounded to f16, f32 PV). Same grid as sa_attend_g4; an unflagged block returns after one load (direct V: its 8
-// wave flags; packed V: the any-flag, then the quad flags of its entries). Thread d owns dim d. Rotations through shared
-// memory. a.fixup_all (test hook) recomputes every block.
+// per row (query, head), the cells its query attends in ascending order, one at a time (f32 score, online softmax with expf, P rounded to f16, f32 PV). Same grid as sa_attend_g4; an unflagged block returns after one load (direct V: its 8 wave flags; packed V: the any-flag, then the quad flags of its entries). Thread d owns dim d. Rotations through shared memory. a.fixup_all (test hook) recomputes every block.
 template <int KT, int VT, int EPI>
 __global__ void __launch_bounds__(256) sa_attend_fixup(const sa_g4_args a, const int gqa) {
     const int d = threadIdx.x, lane = d & 31, w = d >> 5;

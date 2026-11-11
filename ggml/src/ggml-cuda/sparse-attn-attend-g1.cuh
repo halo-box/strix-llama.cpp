@@ -1,10 +1,6 @@
 #pragma once
 
-// sa_attend_g1<KT, VT, GQA, ROT>: GGML_OP_SPARSE_ATTN with a G = 1 plan on RDNA3 WMMA. Block = one query and one kv
-// head: rows are its GQA query heads (padded to 16 with zero q), grid.x =
-// (stream, query, kv head) with kv head fastest, grid.y = split. Per 16-cell chunk: QK WMMA, online softmax in wave 0,
-// PV WMMA. V is LDS-staged and transposed through a wave-private 1 KB slot; K is direct per lane for f16 / q8_0, split
-// for q4_0 / bf16 / the generic tier.
+// sa_attend_g1<KT, VT, GQA, ROT>: GGML_OP_SPARSE_ATTN with a G = 1 plan on RDNA3 WMMA. Block = one query and one kv head: rows are its GQA query heads (padded to 16 with zero q), grid.x = (stream, query, kv head) with kv head fastest, grid.y = split. Per 16-cell chunk: QK WMMA, online softmax in wave 0, PV WMMA. V is LDS-staged and transposed through a wave-private 1 KB slot; K is direct per lane for f16 / q8_0, split for q4_0 / bf16 / the generic tier.
 //   - cells come from the plan in ascending order, so the output is a function of the op's inputs;
 //   - q * scale in f32, then f16;
 //   - masked-off and padding cells are never loaded (zero fragments) and score -inf. All rows belong to one query, so no
@@ -19,9 +15,7 @@
 #include <cstdint>
 #include <cstddef>
 
-// ---- shape-only split count ----
-// Decode split rule on n_sel keys: up to 8 queries every split covers 64 keys, with more queries the splits get longer
-// so the grid stays near its 8-query size. Clamped to the plan's chunks (cap / 4), so no split is empty, and to grid.y.
+// ---- shape-only split count ---- Decode split rule on n_sel keys: up to 8 queries every split covers 64 keys, with more queries the splits get longer so the grid stays near its 8-query size. Clamped to the plan's chunks (cap / 4), so no split is empty, and to grid.y.
 // It depends on (n_q, n_sel, n_kv) only, never on the plan's data.
 static inline int64_t sa_g1_splits(const int64_t n_q, const int64_t n_sel, const int64_t n_kv) {
     const int64_t step = 64;
@@ -47,8 +41,7 @@ static inline size_t sa_g1_partial_bytes(const int64_t n_q, const int64_t n_head
     return splits > 1 ? (size_t) n_stream * (size_t) n_q * (size_t) n_head * (size_t) splits * 258 * sizeof(float) : 0;
 }
 
-// the largest partial buffer any runtime G1 op with n_q' <= n_q, n_kv' <= n_kv can use. The bytes are not monotone in
-// n_q, hence the loop; splits is 1 for every n_q >= 8 * ceil(n_sel / 64), so it stops there
+// the largest partial buffer any runtime G1 op with n_q' <= n_q, n_kv' <= n_kv can use. The bytes are not monotone in n_q, hence the loop; splits is 1 for every n_q >= 8 * ceil(n_sel / 64), so it stops there
 static inline size_t sa_g1_partial_bytes_max(const int64_t n_q, const int64_t n_sel, const int64_t n_kv, const int64_t n_head,
                                              const int64_t n_stream) {
     size_t m = 0;
@@ -140,8 +133,7 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
     // Q prologue: f16(q * scale) (f32 product, one rounding), rows >= GQA zero
     sa_v16s qf[2];
     if (ROT && a.rot_q != 0) {
-        // H_q: wave w takes heads w and w + 8 whole (lane l holds dims 32 j + l), transforms them in f32 and writes
-        // f16(x * scale) of dim 32 j + l into the stage of wave j
+        // H_q: wave w takes heads w and w + 8 whole (lane l holds dims 32 j + l), transforms them in f32 and writes f16(x * scale) of dim 32 j + l into the stage of wave j
         for (int head = w; head < 16; head += 8) {
             float x[8];
             if (head < GQA) {   // uniform over the wave
@@ -190,8 +182,7 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
     sa_v8f output[2] = {};
     float maximum = -INFINITY, normalizer = 0.0f;
     for (int c = c0; c < c1; ++c) {
-        // the 16 cells of chunk c: cell kk = entry 4 * c + (kk >> 2), cell 4 * quad + (kk & 3), -1 when its mask bit is
-        // clear. The chunk's quads and masks are uniform over the block (scalar loads)
+        // the 16 cells of chunk c: cell kk = entry 4 * c + (kk >> 2), cell 4 * quad + (kk & 3), -1 when its mask bit is clear. The chunk's quads and masks are uniform over the block (scalar loads)
         const uint4 bb = *reinterpret_cast<const uint4 *>(gblk + 4 * c);
         const uint2 mm = *reinterpret_cast<const uint2 *>(gmsk + 4 * c);
         auto cell_of = [&](const int kk) -> int {
@@ -280,8 +271,7 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
             local = fmaxf(local, __shfl_xor(local, 16));
             const float next  = fmaxf(maximum, local);
             const float alpha = next == -INFINITY ? 1.0f : exp2f((maximum - next) * SA_L2E);
-            // fmaxf drops a NaN score, so next stays -inf in a chunk of only -inf / NaN scores: exponentials are then taken
-            // against 0, a -inf cell gets 0 and a NaN cell keeps its NaN, so the normaliser is NaN and the row 0 (op contract)
+            // fmaxf drops a NaN score, so next stays -inf in a chunk of only -inf / NaN scores: exponentials are then taken against 0, a -inf cell gets 0 and a NaN cell keeps its NaN, so the normaliser is NaN and the row 0 (op contract)
             const float ref   = next == -INFINITY ? 0.0f : next;
             float sum = 0.0f;
 #pragma unroll
@@ -301,8 +291,7 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
         const float alpha = alpha_s[r];
         const sa_v16s pf = __builtin_bit_cast(sa_v16s, (uint4[2]){
             *(const uint4 *) &probabilities[r][0], *(const uint4 *) &probabilities[r][8]});
-        // V, LDS-staged: lane l loads piece l & 1 of cell l >> 1 (coalesced), converts it once and writes it transposed
-        // into the wave's 1 KB slot (bank swizzle); the WMMA A fragment is read back with 2 x b128 per t
+        // V, LDS-staged: lane l loads piece l & 1 of cell l >> 1 (coalesced), converts it once and writes it transposed into the wave's 1 KB slot (bank swizzle); the WMMA A fragment is read back with 2 x b128 per t
         sa_v16s vf[2];
         {
             const int kk = lane >> 1, p = lane & 1;

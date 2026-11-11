@@ -2653,8 +2653,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
         llm_graph_input_qsa_k * qsa_k_inp = nullptr;
 
-        // strip views of the host inputs keyed by (input, first query, strip size): the scheduler copies every view of a
-        // host input for the whole graph, so the layers share one view per strip
+        // strip views of the host inputs keyed by (input, first query, strip size): the scheduler copies every view of a host input for the whole graph, so the layers share one view per strip
         std::map<std::tuple<const ggml_tensor *, int64_t, int64_t>, ggml_tensor *> strip_views;
 
         // QSA: store this ubatch's raw indexer keys in the indexer cache (no selection)

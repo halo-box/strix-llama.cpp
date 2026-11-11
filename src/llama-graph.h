@@ -827,8 +827,7 @@ struct llama_vocab_subset {
 enum llm_graph_qsa_reserve : uint32_t {
     LLM_GRAPH_QSA_RESERVE_NONCOMPACT = 1u << 0, // the compact decision is false at the reserve n_kv
     LLM_GRAPH_QSA_RESERVE_FAST       = 1u << 1, // the incremental fast-cache route at n_tokens <= 512
-    // every graph_reserve graph: take the empty cache's compact decision, not the live cells' (a later reserve over a
-    // non-compact live cache would size the buffers for a TE route no runtime ubatch takes)
+    // every graph_reserve graph: take the empty cache's compact decision, not the live cells' (a later reserve over a non-compact live cache would size the buffers for a TE route no runtime ubatch takes)
     LLM_GRAPH_QSA_RESERVE_GRAPH      = 1u << 2,
 };
 

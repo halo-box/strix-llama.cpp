@@ -10,9 +10,7 @@
 #include "types.glsl"
 #include "ggml_type_ids.glsl"
 
-// GGML_OP_SPARSE_ATTN, scalar subgroup-64 tier. One workgroup per (query, K/V head, stream, split), one subgroup per query
-// head, so each K/V row is read once per query. Two lanes score one key (half the dims each), so the softmax needs two
-// subgroup reductions per block of keys. With n_split > 1, split z takes blocks z, z + n_split, ... and writes a partial.
+// GGML_OP_SPARSE_ATTN, scalar subgroup-64 tier. One workgroup per (query, K/V head, stream, split), one subgroup per query head, so each K/V row is read once per query. Two lanes score one key (half the dims each), so the softmax needs two subgroup reductions per block of keys. With n_split > 1, split z takes blocks z, z + n_split, ... and writes a partial.
 // A masked or padding cell is never loaded: its K and V stay 0 and its weight is 0.
 
 layout(constant_id = 0) const uint WORKGROUP_SIZE = 768;

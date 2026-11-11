@@ -104,8 +104,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }()) {
     n_seq_max_qsa = n_seq_max;
     if (mem_idx) {
-        // NC0 checks only the ratios where block selection can be eligible: elsewhere the graph-build check never fails,
-        // so a re-split would only cut prefill. Causal attention is tested per init_batch
+        // NC0 checks only the ratios where block selection can be eligible: elsewhere the graph-build check never fails, so a re-split would only cut prefill. Causal attention is tested per init_batch
         const auto & hp = model.hparams;
         for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
             const uint32_t r = hp.dsv4_compress_ratios[il];
@@ -152,8 +151,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     }
 }
 
-// NC0(u): past the shortcut and not compact on the cells prepare simulated. It omits the incremental prefix shortcut, so it
-// covers every graph-time non-compact ubatch. The attention cells it reads mirror the indexer cells the graph reads
+// NC0(u): past the shortcut and not compact on the cells prepare simulated. It omits the incremental prefix shortcut, so it covers every graph-time non-compact ubatch. The attention cells it reads mirror the indexer cells the graph reads
 bool llama_memory_hybrid_idx::qsa_nc0(const llama_ubatch & ubatch, const llama_kv_cache::slot_info & sinfo) const {
     if (!qsa_nc_causal) {
         return false;   // block selection needs causal attention

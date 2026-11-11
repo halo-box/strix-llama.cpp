@@ -937,8 +937,7 @@ std::vector<llama_qsa_reserve_pass_desc> llama_qsa_reserve_passes(const llama_qs
         }
         const uint32_t n_fast = std::min<uint32_t>(n_tokens, 512);
         p.push_back({ "1s-fast", n_fast, 1, std::min(n_fast, n_outputs_pp), s.n_kv_full, 1, LLM_GRAPH_QSA_RESERVE_FAST, true, false });
-        // and pass B's: the shortcut route depends on the per-stream n_q (prefer_dense), so pass B's n_seqs-stream graph
-        // may take a different route than a one-sequence ubatch
+        // and pass B's: the shortcut route depends on the per-stream n_q (prefer_dense), so pass B's n_seqs-stream graph may take a different route than a one-sequence ubatch
         if (shortcut) {
             const uint32_t n_tok_1 = std::min(n_tokens, n_kv_b);
             p.push_back({ "1s-passB",      n_tok_1, 1, std::min(n_tok_1, n_outputs_pp), n_kv_b, 1, 0, false, false });
@@ -1018,8 +1017,7 @@ static std::string qsa_idx_types_taken(ggml_backend_dev_t dev, const ggml_tensor
     return ok;
 }
 
-// the indexer cache writer (SET_ROWS into the cache buffer) needs a backend taking both the buffer and the op, or the
-// scheduler aborts before qsa_guard runs: check it on the built graph with the scheduler's rule and return an error
+// the indexer cache writer (SET_ROWS into the cache buffer) needs a backend taking both the buffer and the op, or the scheduler aborts before qsa_guard runs: check it on the built graph with the scheduler's rule and return an error
 static std::string qsa_guard_indexer_writer(const llm_graph_result * res, const llama_memory_i * memory,
                                             const std::vector<ggml_backend_t> & backends) {
     const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory);
@@ -3508,8 +3506,7 @@ ggml_cgraph * llama_context::graph_reserve(
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
 
     if (variant && variant->seq_pos) {
-        // sequential positions ending at the last cell of a stream: the routes an all-zero ubatch never takes (trim, fast
-        // cache), with the widest scorer
+        // sequential positions ending at the last cell of a stream: the routes an all-zero ubatch never takes (trim, fast cache), with the widest scorer
         const uint32_t n_ctx_stream = cparams.kv_unified ? cparams.n_ctx : std::max<uint32_t>(1, cparams.n_ctx / std::max<uint32_t>(1, cparams.n_seq_max));
         const llama_pos pos0 = (llama_pos) (n_ctx_stream > ubatch.n_seq_tokens ? n_ctx_stream - ubatch.n_seq_tokens : 0);
         for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {

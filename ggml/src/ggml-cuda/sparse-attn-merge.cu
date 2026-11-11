@@ -1,5 +1,4 @@
-// sa_merge_splits: deterministic split-K merge of the G1 attend. One block per output row R, thread d owns dim d; the
-// [splits][258] partials (256 accumulators, running max m_z, normaliser l_z) are combined in split order:
+// sa_merge_splits: deterministic split-K merge of the G1 attend. One block per output row R, thread d owns dim d; the [splits][258] partials (256 accumulators, running max m_z, normaliser l_z) are combined in split order:
 //   M = max_z m_z;  f_z = exp(m_z - M) for l_z != 0;  out = sum_z f_z acc_z / sum_z f_z l_z  (0 unless > 0).
 // A NaN l_z is kept so the row is 0, as in the CPU op; skipping it would make the result depend on the split count.
 // With rot_o != 0, H_o is applied to the merged row in shared memory (the partials are unrotated).

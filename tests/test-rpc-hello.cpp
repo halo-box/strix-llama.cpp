@@ -1,6 +1,4 @@
-// The RPC client's hello against a fake server of a chosen protocol version, from a forked client. The client must go on
-// only for a server minor in [RPC_PROTO_MIN_SERVER_MINOR_VERSION, RPC_PROTO_MINOR_VERSION]: an older server does not know
-// the sparse-attention op values. No device is used.
+// The RPC client's hello against a fake server of a chosen protocol version, from a forked client. The client must go on only for a server minor in [RPC_PROTO_MIN_SERVER_MINOR_VERSION, RPC_PROTO_MINOR_VERSION]: an older server does not know the sparse-attention op values. No device is used.
 #include "ggml-rpc.h"
 
 #include <arpa/inet.h>

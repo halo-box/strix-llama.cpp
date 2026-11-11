@@ -1,29 +1,24 @@
 #pragma once
 
-// HIP sparse attention (GGML_OP_SPARSE_ATTN_PLAN, GGML_OP_SPARSE_ATTN; contracts in ggml.h). HIP only: on CUDA
-// supports_op returns false for both ops.
+// HIP sparse attention (GGML_OP_SPARSE_ATTN_PLAN, GGML_OP_SPARSE_ATTN; contracts in ggml.h). HIP only: on CUDA supports_op returns false for both ops.
 
 #include "common.cuh"
 
 bool   ggml_cuda_sparse_attn_plan_supported(int device, const ggml_tensor * op);
-// ggml_nbytes(op) rounded up to the largest dst over every G of GGML_CUDA_SA_PLAN_GROUPS, plus the sort/dedup scratch
-// that the kernels place right after it
+// ggml_nbytes(op) rounded up to the largest dst over every G of GGML_CUDA_SA_PLAN_GROUPS, plus the sort/dedup scratch that the kernels place right after it
 size_t ggml_cuda_sparse_attn_plan_get_alloc_size(const ggml_tensor * op);
 void   ggml_cuda_sparse_attn_plan(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // GGML_OP_SPARSE_ATTN (sparse-attn-attend-*.cu, -pack, -merge, -generic, -portable)
 bool   ggml_cuda_sparse_attn_supported(int device, const ggml_tensor * op);
-// round_up(ggml_nbytes(op), 256) + the largest workspace any G of the policy range and any n_q' <= n_q, n_kv' <= n_kv
-// can use; ggml_nbytes(op) when no shape needs one
+// round_up(ggml_nbytes(op), 256) + the largest workspace any G of the policy range and any n_q' <= n_q, n_kv' <= n_kv can use; ggml_nbytes(op) when no shape needs one
 size_t ggml_cuda_sparse_attn_get_alloc_size(int device, const ggml_tensor * op);
 void   ggml_cuda_sparse_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
-// gate fusion: SPARSE_ATTN -> [views] -> CONT(gate) -> SIGMOID -> MUL in one gated instance. gate: F32, row
-// R = (s * n_q + i) * n_head + h. out32 (MUL output) and dst16 (16-bit copy for a GEMM reader) may be nullptr, not both
+// gate fusion: SPARSE_ATTN -> [views] -> CONT(gate) -> SIGMOID -> MUL in one gated instance. gate: F32, row R = (s * n_q + i) * n_head + h. out32 (MUL output) and dst16 (16-bit copy for a GEMM reader) may be nullptr, not both
 bool   ggml_cuda_sparse_attn_gate_ok(int device, const ggml_tensor * op);
 void   ggml_cuda_sparse_attn_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gate,
                                    float * out32, uint16_t * dst16, bool dst16_f16);
-// why census key `key` (or prefix) is never dispatched on device `device` (-1: any): a forcing switch or another tier
-// for the arch; nullptr when it can be dispatched
+// why census key `key` (or prefix) is never dispatched on device `device` (-1: any): a forcing switch or another tier for the arch; nullptr when it can be dispatched
 const char * ggml_cuda_sparse_attn_census_skip(int device, const char * key);
 
 // why _supported / _plan_supported is false for op, NULL when true
@@ -33,8 +28,7 @@ bool ggml_cuda_sa_force_has(const char * token);
 // the workspace this node uses: [dst->data + *offset, + *bytes)
 void   ggml_cuda_sparse_attn_ws_range(int device, const ggml_tensor * op, size_t * offset, size_t * bytes);
 
-// V pack: f16 [n_stream][n_head_kv][n_quads][256][4] of cells 0 .. 4 * n_quads - 1; non-finite halves written as 0 and
-// their quad flagged in qflags [n_stream][n_head_kv][n_quads] and *any (cleared first). generic: any type of S
+// V pack: f16 [n_stream][n_head_kv][n_quads][256][4] of cells 0 .. 4 * n_quads - 1; non-finite halves written as 0 and their quad flagged in qflags [n_stream][n_head_kv][n_quads] and *any (cleared first). generic: any type of S
 void   ggml_cuda_sparse_attn_pack_v(cudaStream_t stream, const ggml_tensor * v, int64_t n_quads, uint16_t * dst,
                                     uint8_t * qflags, uint32_t * any, bool generic);
 

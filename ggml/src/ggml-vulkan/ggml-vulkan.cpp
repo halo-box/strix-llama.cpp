@@ -4478,8 +4478,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_sparse_attn_reduce, "sparse_attn_reduce", sparse_attn_reduce_len, sparse_attn_reduce_data, "main", 2,
                     sizeof(vk_op_sparse_attn_reduce_push_constants), {1, 1, 1}, {}, 1, true);
             }
-            // the gates are read without compile_mutex while this block reruns on each on-demand compile: store each one
-            // (same value) and never clear it first, so a tier cannot vanish between the alloc size and the dispatch
+            // the gates are read without compile_mutex while this block reruns on each on-demand compile: store each one (same value) and never clear it first, so a tier cannot vanish between the alloc size and the dispatch
             bool ok_cm = false, ok_scalar = false;
             const bool ok_portable = lim.maxComputeWorkGroupInvocations >= 12 && lim.maxComputeSharedMemorySize >= 2048;
             const bool sa_sg64 = device->subgroup_size_control
@@ -10669,8 +10668,7 @@ static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& s
 //   scalar    sparse_attn.comp           other subgroup-64 devices
 //   portable  sparse_attn_portable.comp  every other device: no subgroup operation
 // G = 1 only. The workspace sits past ggml_nbytes(dst), where the barrier tracker cannot see it: each node syncs first.
-// GGML_VK_SA_FORCE (comma-separated test switch): scalar | portable | portable_sg32 | vdirect | vstaged | vpack |
-// rot_dump (write H_q q to dst) | no_cm | no_scalar | no_portable | no_plan | max_q=N (queries per dispatch).
+// GGML_VK_SA_FORCE (comma-separated test switch): scalar | portable | portable_sg32 | vdirect | vstaged | vpack | rot_dump (write H_q q to dst) | no_cm | no_scalar | no_portable | no_plan | max_q=N (queries per dispatch).
 
 struct vk_sa_force_t {
     int tier = -1;
@@ -10783,8 +10781,7 @@ static size_t ggml_vk_sa_round_up(const vk_device & device, const size_t n) {
 static const char * const VK_SA_WHY_TYPE    = "type pair not supported";
 static const char * const VK_SA_WHY_BINDING = "a binding of this shape exceeds the device limits (maxStorageBufferRange or the suballocation block)";
 
-// NULL when the plan runs on this device; otherwise why not. sel may be absent (an attend's plan on an RPC server): the
-// shape then comes from the op_params
+// NULL when the plan runs on this device; otherwise why not. sel may be absent (an attend's plan on an RPC server): the shape then comes from the op_params
 static const char * ggml_vk_sa_plan_why(const vk_device & device, const ggml_tensor * op) {
     const ggml_tensor * sel = op->src[0];
     const int64_t n_sel = ggml_get_op_params_i32(op, 2), n_q = ggml_get_op_params_i32(op, 3), n_stream = ggml_get_op_params_i32(op, 4);
@@ -10957,8 +10954,7 @@ static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_te
         partial_max = std::max(partial_max, ggml_vk_sa_partial_bytes(nq, n_head, n_stream, ggml_vk_sa_splits(device, tier, nq, n_kv_head, n_stream, n_sel)));
     }
     r.ws_bytes = r.pack_k_bytes + r.pack_v_bytes + r.partial_bytes;
-    // the pack reserve: a runtime op packs when n_kv4' < 64 n_q', so a reserve at the full n_kv (no pack there) must still
-    // hold the pack of a smaller n_kv, capped by the binding and grid limits
+    // the pack reserve: a runtime op packs when n_kv4' < 64 n_q', so a reserve at the full n_kv (no pack there) must still hold the pack of a smaller n_kv, capped by the binding and grid limits
     size_t pack_reserve = 0;
     if (pack_arm && (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16)) {
         const size_t per_cell = (size_t) n_kv_head * n_stream * pack_row;
@@ -21815,8 +21811,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
-        // TOPK_QSA: the fused top-k reads the chain's sources while it writes the picks, so they stay allocated through the
-        // TOP_K; otherwise ggml-alloc may alias the TOP_K output onto them and the overlap check disables the fusion
+        // TOPK_QSA: the fused top-k reads the chain's sources while it writes the picks, so they stay allocated through the TOP_K; otherwise ggml-alloc may alias the TOP_K output onto them and the overlap check disables the fusion
         if (match_pattern(topk_qsa_pattern, first_unused)) {
             if (params && params->add_alloc_dep) {
                 add_pattern_alloc_deps(topk_qsa_pattern, first_unused + (int) topk_qsa_pattern.size() - 1);

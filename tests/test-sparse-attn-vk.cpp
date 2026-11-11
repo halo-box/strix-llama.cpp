@@ -353,9 +353,7 @@ static void test_rot() {
 
 // ---- stress -----------------------------------------------------------------------------------------------------------
 
-// Node order: [plan] S F T S2(S) F2(F) F3(F2) R(T) <node under test>. With best-fit allocation, the node's dst lands on the
-// freed S and F and ends before T, so its workspace lies inside T, which R reads right before the node; F3 is a barrier that
-// makes the tracker forget the reads of S and F. F holds dst's bytes (rounded up) so that this is possible.
+// Node order: [plan] S F T S2(S) F2(F) F3(F2) R(T) <node under test>. With best-fit allocation, the node's dst lands on the freed S and F and ends before T, so its workspace lies inside T, which R reads right before the node; F3 is a barrier that makes the tracker forget the reads of S and F. F holds dst's bytes (rounded up) so that this is possible.
 struct stress_out { std::vector<uint8_t> attend, r; bool layout = false; };
 
 static stress_out stress_run(const sa_shape & s, const bool under_test_is_plan, const bool keep_t, const int iters, int & n_unstable) {

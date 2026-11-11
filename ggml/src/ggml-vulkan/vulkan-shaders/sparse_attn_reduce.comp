@@ -1,7 +1,6 @@
 #version 450
 
-// GGML_OP_SPARSE_ATTN split-K merge: flash_attn_split_k_reduce.comp without sinks or clamp (an f16 overflow stays +-inf),
-// splits merged in fixed order
+// GGML_OP_SPARSE_ATTN split-K merge: flash_attn_split_k_reduce.comp without sinks or clamp (an f16 overflow stays +-inf), splits merged in fixed order
 
 const uint BLOCK_SIZE = 32;
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;

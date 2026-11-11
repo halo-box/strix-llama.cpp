@@ -1,5 +1,4 @@
-// GGML_OP_SPARSE_ATTN_PLAN on HIP: canonicalise per-query selection rows into the grouped plan, byte-identical to the CPU
-// op. Three kernels, no pool: the sort/dedup scratch is in dst's over-allocation, right after ggml_nbytes(dst).
+// GGML_OP_SPARSE_ATTN_PLAN on HIP: canonicalise per-query selection rows into the grouped plan, byte-identical to the CPU op. Three kernels, no pool: the sort/dedup scratch is in dst's over-allocation, right after ggml_nbytes(dst).
 //   sa_plan_init       header (n_bad = 0), the zero bytes up to off_counts and the section gaps
 //   sa_plan_rows       one block per query row: validate (out-of-range cells become a sentinel, values other than -1 count
 //                      into n_bad) and, unless the valid cells are already strictly ascending with invalid entries after
@@ -9,8 +8,7 @@
 //                      ascending entries with per-query cell bits, then the padding up to cap. Each lane owns a
 //                      quad-aligned key range (quantiles of the longest row): count pass, block scan, write pass. 512
 //                      lanes for G = 4, 256 for G = 1.
-// Repeated cells are deduplicated before the merge (a complete-quad shortcut would otherwise
-// emit a quad twice for a row such as 4,5,6,7,7). Rows or groups too long for LDS run the same algorithms in global memory.
+// Repeated cells are deduplicated before the merge (a complete-quad shortcut would otherwise emit a quad twice for a row such as 4,5,6,7,7). Rows or groups too long for LDS run the same algorithms in global memory.
 // The output depends only on each query's set of valid cells; n_bad is an order-independent integer atomicAdd.
 
 #include "sparse-attn.cuh"
@@ -78,9 +76,7 @@ static __device__ __forceinline__ int sa_plan_block_scan(int * scan_s, const int
     return excl;
 }
 
-// ascending in-place sort of x[0, n) by the block (n block-uniform): bitonic network in its "flip" form, in which every
-// comparator puts the minimum at the lower index. Padding the array to the next power of two with +inf leaves the
-// padding where it is, so the comparators that touch it (partner >= n) are skipped and no padding is stored.
+// ascending in-place sort of x[0, n) by the block (n block-uniform): bitonic network in its "flip" form, in which every comparator puts the minimum at the lower index. Padding the array to the next power of two with +inf leaves the padding where it is, so the comparators that touch it (partner >= n) are skipped and no padding is stored.
 template <int NT>
 static __device__ __forceinline__ void sa_plan_sort(int * x, const int n) {
     if (n < 2) {
@@ -146,8 +142,7 @@ static __global__ void __launch_bounds__(SA_PLAN_INIT_THREADS) sa_plan_init(
 }
 
 // LDS: ent[n_sel] (the validated row) and cmp[n_sel] (its valid cells in row order, then sorted) in dynamic LDS.
-// Global (rows too long for LDS): the validated row is written to the scratch row and sorted there; repeats are marked,
-// replaced by the sentinel and the row is sorted again.
+// Global (rows too long for LDS): the validated row is written to the scratch row and sorted there; repeats are marked, replaced by the sentinel and the row is sorted again.
 template <bool LDS>
 static __global__ void __launch_bounds__(SA_PLAN_ROWS_THREADS) sa_plan_rows(const sa_plan_args a) {
     constexpr int NT = SA_PLAN_ROWS_THREADS;
@@ -270,8 +265,7 @@ static __global__ void __launch_bounds__(SA_PLAN_ROWS_THREADS) sa_plan_rows(cons
         }
     } else {
         sa_plan_sort<NT>(ent, ns);
-        // mark every repeat of its predecessor (the mark keeps the cell bits, so a neighbour reading a marked entry
-        // concurrently still compares the right cell)
+        // mark every repeat of its predecessor (the mark keeps the cell bits, so a neighbour reading a marked entry concurrently still compares the right cell)
         for (int j = tid + 1; j < ns; j += NT) {
             const int x = ent[j];
             if (x != SA_PLAN_SENT && ((x ^ ent[j - 1]) & ~SA_PLAN_DUP) == 0) {
@@ -289,9 +283,7 @@ static __global__ void __launch_bounds__(SA_PLAN_ROWS_THREADS) sa_plan_rows(cons
     }
 }
 
-// the padding of ggml.h for entries [t0, cap) of a group: quad = last, mask = 0. Entries up to the next multiple of 4 one by
-// one, then 16-byte quad stores and 8-byte mask stores (quads are 16-byte aligned at multiples of 4 entries: off_quads is a
-// multiple of 256, cap of 4 and the dst of 128; masks are 8-byte aligned there)
+// the padding of ggml.h for entries [t0, cap) of a group: quad = last, mask = 0. Entries up to the next multiple of 4 one by one, then 16-byte quad stores and 8-byte mask stores (quads are 16-byte aligned at multiples of 4 entries: off_quads is a multiple of 256, cap of 4 and the dst of 128; masks are 8-byte aligned there)
 template <int NT>
 static __device__ __forceinline__ void sa_plan_fill(uint32_t * oq, uint16_t * om, const int t0, const int cap, const uint32_t last) {
     const int t4 = min(cap, (t0 + 3) & ~3);

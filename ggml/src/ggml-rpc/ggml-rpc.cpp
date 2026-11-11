@@ -1046,8 +1046,7 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
     return buft_ctx->max_size;
 }
 
-// the ops whose support is asked from the server device: a server backend may lack the sparse-attention ops, or support
-// them only for some type pairs and shapes
+// the ops whose support is asked from the server device: a server backend may lack the sparse-attention ops, or support them only for some type pairs and shapes
 static bool rpc_supports_op_remote(const int op) {
     return op == GGML_OP_SPARSE_ATTN || op == GGML_OP_SPARSE_ATTN_PLAN;
 }
@@ -1084,9 +1083,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         //    cached value from reservation is always >= any subsequent request
         // 3. Including src dims causes cache misses per-ubatch (e.g. growing KV cache)
         //    which blocks the main thread behind in-flight GRAPH_COMPUTE commands
-        // except for rpc_alloc_size_src_keyed ops: the SPARSE_ATTN workspace follows the plan's n_kv / n_sel / G and the
-        // K / V types, none of which is in its dst shape or op_params, and point 2 does not hold for it. Its key also holds
-        // every src's type, op, op_params, ne and nb.
+        // except for rpc_alloc_size_src_keyed ops: the SPARSE_ATTN workspace follows the plan's n_kv / n_sel / G and the K / V types, none of which is in its dst shape or op_params, and point 2 does not hold for it. Its key also holds every src's type, op, op_params, ne and nb.
         struct alloc_size_cache_src {
             uint32_t type;
             uint32_t op;
@@ -1567,8 +1564,7 @@ bool rpc_server::supports_op(const rpc_msg_supports_op_req & request, rpc_msg_su
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
 
-    // only the ops the client asks about (rpc_supports_op_remote): their supports_op reads the node's and its direct
-    // srcs' types, shapes, strides and op_params, never a buffer or data
+    // only the ops the client asks about (rpc_supports_op_remote): their supports_op reads the node's and its direct srcs' types, shapes, strides and op_params, never a buffer or data
     if (!rpc_supports_op_remote((int) request.tensor.op)) {
         return true;
     }

@@ -1,9 +1,7 @@
-// sa_attend_portable: the portable tier of GGML_OP_SPARSE_ATTN, run by every HIP arch but RDNA3.5 (and under
-// GGML_CUDA_SA_FORCE=portable). No WMMA and no cross-lane operation, so neither the wave size nor the arch is assumed;
+// sa_attend_portable: the portable tier of GGML_OP_SPARSE_ATTN, run by every HIP arch but RDNA3.5 (and under GGML_CUDA_SA_FORCE=portable). No WMMA and no cross-lane operation, so neither the wave size nor the arch is assumed;
 // any K / V type of S through sa_any_elem. Arithmetic is the CPU op's, cell by cell in plan order with FP contraction off;
 // the only difference is the device expf. Masked-off cells are never loaded, so their bytes cannot reach the output.
-// Block (stream, query, kv head), thread d owns dim d: this query's cells are compacted into shared memory, then each
-// tile of 16 cells is staged, scored, run through the online softmax (thread h < GQA for head h) and accumulated.
+// Block (stream, query, kv head), thread d owns dim d: this query's cells are compacted into shared memory, then each tile of 16 cells is staged, scored, run through the online softmax (thread h < GQA for head h) and accumulated.
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-census.h"

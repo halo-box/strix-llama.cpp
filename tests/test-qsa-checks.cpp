@@ -32,9 +32,7 @@ static int g_fail = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { if (g_fail++ < 20) { printf("  FAIL %s:%d: %s: ", __FILE__, __LINE__, #cond); printf(__VA_ARGS__); printf("\n"); } } } while (0)
 #define CHECK0(cond) CHECK(cond, "%s", "check failed")
 
-// ---- dup-key ---------------------------------------------------------------------------------------------------------
-// qsa_seq_has_dup_key runs per sequence on every graph build and can_reuse, so it reads the kept count
-// llama_kv_cells::seq_pos_n_dup instead of walking every shared cell of the sequence.
+// ---- dup-key --------------------------------------------------------------------------------------------------------- qsa_seq_has_dup_key runs per sequence on every graph build and can_reuse, so it reads the kept count llama_kv_cells::seq_pos_n_dup instead of walking every shared cell of the sequence.
 //   exact: after every random cell edit, seq_pos_n_dup equals the recomputed count and qsa_seq_has_dup_key the full walk;
 //   work:  2^20 cells shared by 4 sequences: 0 set entries visited, and an image sequence's duplicate keys still found.
 
@@ -205,10 +203,7 @@ static int run() {
 
 } // namespace dup_key
 
-// ---- reserve-view ----------------------------------------------------------------------------------------------------
-// The reserve views of the hybrid-idx memory: init_full views every stream, init_full_n_kv(n_kv) n_kv cells of every
-// stream (pass B), init_full_n_kv(n_kv, 1) only the first stream: a one-sequence ubatch of a split cache is a one-stream
-// graph, which a view of every stream cannot reserve.
+// ---- reserve-view ---------------------------------------------------------------------------------------------------- The reserve views of the hybrid-idx memory: init_full views every stream, init_full_n_kv(n_kv) n_kv cells of every stream (pass B), init_full_n_kv(n_kv, 1) only the first stream: a one-sequence ubatch of a split cache is a one-stream graph, which a view of every stream cannot reserve.
 
 namespace reserve_view {
 
@@ -249,9 +244,7 @@ static void check_views(uint32_t kv_size, uint32_t n_seq_max, bool unified) {
             (int) unified, as_idx(full)->get_n_stream(), as_idx(b)->get_n_stream(), as_idx(one)->get_n_stream());
 }
 
-// qsa_graph_compact of a reserve graph: a reserve can run mid-session on the live cells, yet the pp reserve ubatch must get
-// the verdict of the empty cache, whatever the cells hold. Runtime graphs keep the live verdict. The reservation context
-// itself (init_full) sees no cell, so its own predicate gives the empty cache's verdict too.
+// qsa_graph_compact of a reserve graph: a reserve can run mid-session on the live cells, yet the pp reserve ubatch must get the verdict of the empty cache, whatever the cells hold. Runtime graphs keep the live verdict. The reservation context itself (init_full) sees no cell, so its own predicate gives the empty cache's verdict too.
 static llama_ubatch reserve_ubatch(llama_batch_allocr & balloc, uint32_t n_tokens, uint32_t n_seqs) {
     llama_ubatch u = balloc.ubatch_reserve(n_tokens / n_seqs, n_seqs);
     for (uint32_t s = 0; s < n_seqs; ++s) {
@@ -324,10 +317,7 @@ static int run() {
 
 } // namespace reserve_view
 
-// ---- reserve-passes --------------------------------------------------------------------------------------------------
-// llama_qsa_reserve_passes must reserve every graph shape a runtime ubatch can build, here the one-stream shortcut graph of a
-// split multi-sequence context: pass B splits its rows over the streams, and the shortcut's route depends on the
-// per-stream n_q, so a one-sequence ubatch of min(ub, n_kv_b) rows needs its own pass. No model, no device.
+// ---- reserve-passes -------------------------------------------------------------------------------------------------- llama_qsa_reserve_passes must reserve every graph shape a runtime ubatch can build, here the one-stream shortcut graph of a split multi-sequence context: pass B splits its rows over the streams, and the shortcut's route depends on the per-stream n_q, so a one-sequence ubatch of min(ub, n_kv_b) rows needs its own pass. No model, no device.
 
 namespace reserve_passes {
 
@@ -412,9 +402,7 @@ static int run() {
 
 } // namespace reserve_passes
 
-// ---- noncompact-check ------------------------------------------------------------------------------------------------
-// qwen4exp_qsa_noncompact_error fails only non-compact ubatches on the block selection path. Where block selection is not
-// eligible (non-causal, ratio 1, top_k % ratio != 0, ...) every ubatch takes the TE rows the reserve built: no error.
+// ---- noncompact-check ------------------------------------------------------------------------------------------------ qwen4exp_qsa_noncompact_error fails only non-compact ubatches on the block selection path. Where block selection is not eligible (non-causal, ratio 1, top_k % ratio != 0, ...) every ubatch takes the TE rows the reserve built: no error.
 
 namespace noncompact_check {
 
@@ -457,9 +445,7 @@ static int run() {
 
 } // namespace noncompact_check
 
-// ---- supported-types -------------------------------------------------------------------------------------------------
-// llama_qsa_supported_types probes the nine K / V types of the sparse op on the node's device; its ggml context must hold
-// 9 x 2 probe tensors, or the init error turns into an abort. CPU only, on a no_alloc SPARSE_ATTN node.
+// ---- supported-types ------------------------------------------------------------------------------------------------- llama_qsa_supported_types probes the nine K / V types of the sparse op on the node's device; its ggml context must hold 9 x 2 probe tensors, or the init error turns into an abort. CPU only, on a no_alloc SPARSE_ATTN node.
 
 namespace supported_types {
 

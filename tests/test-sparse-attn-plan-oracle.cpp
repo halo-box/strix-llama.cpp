@@ -5,8 +5,7 @@
 //                                                         has_mask, pos0, kt;} + n_q * ns int32, one per QSA layer;
 //                                                         G = 1 and 4, and with --shuffle every row shuffled by
 //                                                         std::mt19937(S + layer); per-layer row statistics printed
-// Over-allocation: a buffer type that over-allocates both ops (allowed by ggml_op_alloc_size_may_expand) must give the
-// result of the plain CPU buffer type.
+// Over-allocation: a buffer type that over-allocates both ops (allowed by ggml_op_alloc_size_may_expand) must give the result of the plain CPU buffer type.
 
 #include "ggml.h"
 #include "ggml-alloc.h"

@@ -1,10 +1,7 @@
-// TE rows of a non-compact QSA ubatch: the rows src/models/qwen4exp-te.h builds must name, for every (query, stream),
-// exactly the cells the masked route attends: top_k(expanded, width) intersected with {mask == 0}.
-// Layouts: two sequences sharing a seq_cp prefix of L cells around a block boundary, and an M-RoPE image at a position
-// = 2 and 3 mod 4 next to another sequence's text; split streams and several score strips per ubatch too.
+// TE rows of a non-compact QSA ubatch: the rows src/models/qwen4exp-te.h builds must name, for every (query, stream), exactly the cells the masked route attends: top_k(expanded, width) intersected with {mask == 0}.
+// Layouts: two sequences sharing a seq_cp prefix of L cells around a block boundary, and an M-RoPE image at a position = 2 and 3 mod 4 next to another sequence's text; split streams and several score strips per ubatch too.
 // Per backend, one graph computes the production ops per strip and, from the same top_k, the masked route's mask (fill
-// -inf, set_rows of zeros at the top-k cells, + kq_mask). Pass: per row {rows >= 0} == {j : mask[j] == 0}, no cell twice,
-// every cell picked by top_k; the expanded chain keeps the use counts the Vulkan TOPK_QSA fusion requires.
+// -inf, set_rows of zeros at the top-k cells, + kq_mask). Pass: per row {rows >= 0} == {j : mask[j] == 0}, no cell twice, every cell picked by top_k; the expanded chain keeps the use counts the Vulkan TOPK_QSA fusion requires.
 // usage: test-qsa-te-rows [backend name substring]
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -49,8 +46,7 @@ struct layout {
         return (int64_t) pos.size() - 1;
     }
 
-    // set_input_qsa_scan grouping: a complete (position block, sequence set) group gets a block id, in block order; every
-    // other cell maps to the spare ("dead") block
+    // set_input_qsa_scan grouping: a complete (position block, sequence set) group gets a block id, in block order; every other cell maps to the spare ("dead") block
     void finish(int64_t n_kv_view) {
         const int64_t n = (int64_t) pos.size();
         n_kv = n_kv_view;
@@ -86,8 +82,7 @@ struct layout {
         }
     }
 
-    // llama_kv_cache::set_input_kq_mask for one query: same sequence, earlier position, or the same position and, for an
-    // image query, not is_2d_gt
+    // llama_kv_cache::set_input_kq_mask for one query: same sequence, earlier position, or the same position and, for an image query, not is_2d_gt
     bool visible(const query & q, int64_t j) const {
         if (j >= (int64_t) pos.size() || !(seqs[j] & (1u << q.seq))) {
             return false;
@@ -103,8 +98,7 @@ struct layout {
         return !gt;
     }
 
-    // the blk_bias branch of set_input_qsa_scan: -inf for a block of another sequence set (and past the complete blocks),
-    // 1e9 at and after the query's tail start and for the dead block, 0 otherwise
+    // the blk_bias branch of set_input_qsa_scan: -inf for a block of another sequence set (and past the complete blocks), 1e9 at and after the query's tail start and for the dead block, 0 otherwise
     float bias(const query & q, int64_t b) const {
         if (b == dead) {
             return 1e9f;
@@ -134,8 +128,7 @@ static layout text_case(int64_t L) {
     return c;
 }
 
-// sequence 0 holds n0 text cells; sequence 1 holds n_before text cells, a 1036-cell image at position n_before, then
-// n_after text cells. Sequence 0's queries see fewer than WIDTH cells: top_k picks hidden cells the rows must drop.
+// sequence 0 holds n0 text cells; sequence 1 holds n_before text cells, a 1036-cell image at position n_before, then n_after text cells. Sequence 0's queries see fewer than WIDTH cells: top_k picks hidden cells the rows must drop.
 static layout image_case(int64_t n_before, int64_t n_after, int64_t gh = 28, int64_t gw = 37, int64_t n0 = 2000) {
     layout c;
     c.name = "image_pos" + std::to_string(n_before);
@@ -178,8 +171,7 @@ struct case_t {
 
 struct stats { int64_t rows = 0, mism = 0, dup = 0, not_picked = 0, host_mism = 0, underfull = 0, dropped = 0, bias_ninf_vis = 0; };
 
-// The use counts ggml_vk_can_fuse_topk_qsa requires: one per node of GET_ROWS -> PERMUTE -> CONT -> ADD <- RESHAPE, two for
-// the CPY (its own dst counts). "" when every strip's chain has them, else the first offender.
+// The use counts ggml_vk_can_fuse_topk_qsa requires: one per node of GET_ROWS -> PERMUTE -> CONT -> ADD <- RESHAPE, two for the CPY (its own dst counts). "" when every strip's chain has them, else the first offender.
 static std::string fusion_uses(ggml_cgraph * gf, const std::vector<ggml_tensor *> & expanded) {
     std::map<const ggml_tensor *, int> idx;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {

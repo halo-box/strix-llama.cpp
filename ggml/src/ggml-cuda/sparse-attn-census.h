@@ -1,7 +1,6 @@
 #pragma once
 
-// Dispatch census of the HIP sparse-attention kernels (a test hook, not a stable API). The tables below drive both the
-// template instantiations and the host dispatch, so the reported keys cannot drift from the compiled kernels.
+// Dispatch census of the HIP sparse-attention kernels (a test hook, not a stable API). The tables below drive both the template instantiations and the host dispatch, so the reported keys cannot drift from the compiled kernels.
 //
 // Keys (one count per launch):
 //   sa_plan/G<g>                                GGML_OP_SPARSE_ATTN_PLAN with group g

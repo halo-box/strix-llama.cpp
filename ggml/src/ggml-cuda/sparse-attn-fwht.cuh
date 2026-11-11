@@ -1,9 +1,7 @@
 #pragma once
 
 // Fast Walsh-Hadamard transform shared by fwht.cu and the in-op rotations of GGML_OP_SPARSE_ATTN (rot_q, rot_o).
-// x * scale (scale = 1 / sqrtf(N)), then butterflies from stride 1 up: (x_lo, x_hi) -> (x_lo + x_hi, x_lo - x_hi), the
-// order of the CPU op. FP contraction is off so the result bits depend only on x and scale: the in-kernel rotations are
-// bitwise equal to fwht.cu.
+// x * scale (scale = 1 / sqrtf(N)), then butterflies from stride 1 up: (x_lo, x_hi) -> (x_lo + x_hi, x_lo - x_hi), the order of the CPU op. FP contraction is off so the result bits depend only on x and scale: the in-kernel rotations are bitwise equal to fwht.cu.
 
 #include "common.cuh"
 
@@ -14,8 +12,7 @@
 #define SA_FP_CONTRACT_OFF
 #endif
 
-// fwht_block<N, WS>: N elements over the WS lanes of a warp, value i of lane l is element i * WS + l. Strides below WS
-// go through shuffles. All WS lanes must call it.
+// fwht_block<N, WS>: N elements over the WS lanes of a warp, value i of lane l is element i * WS + l. Strides below WS go through shuffles. All WS lanes must call it.
 template <int N, int WS>
 static __device__ __forceinline__ void fwht_block(float * x, const int lane, const float scale) {
 SA_FP_CONTRACT_OFF
@@ -86,9 +83,7 @@ static __device__ __forceinline__ void fwht_row(float * x, const int lane, const
     }
 }
 
-// sa_fwht_smem<D>: n_rows rows of D floats in shared memory (row r at x + r * ld), transformed in place over blocks of
-// rot by the nt threads of the block, with fwht_block's arithmetic. Every thread must call it with the same arguments; it
-// syncs after every stage. For the tiers without a fixed warp layout (portable, G4 fixup, G1 merge).
+// sa_fwht_smem<D>: n_rows rows of D floats in shared memory (row r at x + r * ld), transformed in place over blocks of rot by the nt threads of the block, with fwht_block's arithmetic. Every thread must call it with the same arguments; it syncs after every stage. For the tiers without a fixed warp layout (portable, G4 fixup, G1 merge).
 template <int D>
 static __device__ __forceinline__ void sa_fwht_smem(float * x, const int n_rows, const int ld, const int rot, const float scale,
                                                     const int t, const int nt) {

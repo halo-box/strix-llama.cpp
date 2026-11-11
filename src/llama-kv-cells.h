@@ -328,8 +328,7 @@ public:
         return seq_pos[seq_id];
     }
 
-    // sum over the positions of seq_id of (cells at that position - 1), 0 = unique positions; O(1), read on every
-    // graph build by the QSA compact predicate
+    // sum over the positions of seq_id of (cells at that position - 1), 0 = unique positions; O(1), read on every graph build by the QSA compact predicate
     uint32_t seq_pos_n_dup(llama_seq_id seq_id) const {
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);

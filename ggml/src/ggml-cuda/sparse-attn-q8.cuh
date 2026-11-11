@@ -1,8 +1,6 @@
 #pragma once
 
-// Exact K/V element -> f16 conversions: each returns the element's to_float rounded to f16 (RNE, +-inf on overflow),
-// as the CPU op and ggml_get_to_fp16_cuda do. 0x6400 | q is 1024 + q in half, exact, so the subtraction recovers q
-// exactly and the single half product q * d is the RNE of the exact product.
+// Exact K/V element -> f16 conversions: each returns the element's to_float rounded to f16 (RNE, +-inf on overflow), as the CPU op and ggml_get_to_fp16_cuda do. 0x6400 | q is 1024 + q in half, exact, so the subtraction recovers q exactly and the single half product q * d is the RNE of the exact product.
 
 #if defined(GGML_USE_HIP)
 

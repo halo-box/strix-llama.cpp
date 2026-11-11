@@ -1,17 +1,14 @@
 #pragma once
 
-// The rows of a non-compact QSA ubatch: top_k(expanded, width) with every cell the visibility hides set to -1, so
-// GGML_OP_SPARSE_ATTN needs no mask. Shared by the qwen4exp graph and the tests.
+// The rows of a non-compact QSA ubatch: top_k(expanded, width) with every cell the visibility hides set to -1, so GGML_OP_SPARSE_ATTN needs no mask. Shared by the qwen4exp graph and the tests.
 //
-// Visibility is read from the mask source (vis), not from expanded: expanded must keep the TOP_K as its only consumer,
-// or the Vulkan TOPK_QSA fusion does not fire.
+// Visibility is read from the mask source (vis), not from expanded: expanded must keep the TOP_K as its only consumer, or the Vulkan TOPK_QSA fusion does not fire.
 
 #include "ggml.h"
 
 #include <cfloat>
 
-// score: F32 [n_blocks, n_query, n_stream], per-block bias added; cell_blk: I32 [n_kv, n_stream]; add: F32
-// [n_kv, n_query, n_stream], the KQ mask or the per-cell bias. Returns F32 [n_kv, n_query, n_stream].
+// score: F32 [n_blocks, n_query, n_stream], per-block bias added; cell_blk: I32 [n_kv, n_stream]; add: F32 [n_kv, n_query, n_stream], the KQ mask or the per-cell bias. Returns F32 [n_kv, n_query, n_stream].
 static inline ggml_tensor * qwen4exp_te_expand(ggml_context * ctx, ggml_tensor * score, ggml_tensor * cell_blk,
         ggml_tensor * add) {
     ggml_tensor * expanded = ggml_get_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3)), cell_blk);
@@ -25,8 +22,7 @@ struct qwen4exp_te_sel {
 };
 
 // expanded: F32 [n_kv, n_query, n_stream], contiguous. width = min(n_kv, indexer_top_k + ratio - 1).
-// vis: the source of expanded's ADD before any cast: KQ mask (F16 / F32 [n_kv, n_query, 1, n_stream]) or per-cell bias
-// (F32 [n_kv, n_query, n_stream]), elements contiguous. A cell is visible iff vis is finite there.
+// vis: the source of expanded's ADD before any cast: KQ mask (F16 / F32 [n_kv, n_query, 1, n_stream]) or per-cell bias (F32 [n_kv, n_query, n_stream]), elements contiguous. A cell is visible iff vis is finite there.
 static inline qwen4exp_te_sel qwen4exp_te_select(ggml_context * ctx, ggml_tensor * expanded, ggml_tensor * vis, int64_t width) {
     const int64_t n_kv = expanded->ne[0], n_query = expanded->ne[1], n_stream = expanded->ne[2];
     GGML_ASSERT(expanded->type == GGML_TYPE_F32 && ggml_is_contiguous(expanded) && expanded->ne[3] == 1);

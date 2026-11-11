@@ -1,5 +1,4 @@
-// Generic tier: the G4 and G1 WMMA attends with K = V = SA_T_GEN, whose loaders convert any type of S through a runtime
-// switch on the ggml type. Runs every K / V pair outside S_fast, and every pair under GGML_CUDA_SA_FORCE=generic.
+// Generic tier: the G4 and G1 WMMA attends with K = V = SA_T_GEN, whose loaders convert any type of S through a runtime switch on the ggml type. Runs every K / V pair outside S_fast, and every pair under GGML_CUDA_SA_FORCE=generic.
 // Workspace layouts are the S_fast ones, so get_alloc_size is unchanged. No gated instance: the MUL runs unfused.
 
 #include "sparse-attn.cuh"

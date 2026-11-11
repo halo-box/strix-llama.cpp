@@ -52,8 +52,7 @@ static bool qsa_key_2d(const llama_kv_cells & cells, uint32_t j) {
     return cells.ext_get(j).is_2d_gt(cells.pos_get(j), cells.pos_get(j));
 }
 
-// duplicate (pos, y, x) keys among the cells of seq; unique positions answer in O(1) from the duplicate count, since
-// this runs on every graph build. walked (test hook): the set entries visited
+// duplicate (pos, y, x) keys among the cells of seq; unique positions answer in O(1) from the duplicate count, since this runs on every graph build. walked (test hook): the set entries visited
 static bool qsa_seq_has_dup_key(const llama_kv_cells & cells, llama_seq_id seq, bool pos_2d, size_t * walked = nullptr) {
     if (cells.seq_pos_n_dup(seq) == 0) {
         return false;
@@ -82,9 +81,7 @@ static bool qsa_seq_has_dup_key(const llama_kv_cells & cells, llama_seq_id seq, 
     return false;
 }
 
-// compact (maskless) visibility of the tokens [i0, i0 + n) of a ubatch on one stream: each query reads the block row of its
-// first seq id, as the mask does. 2-D cells need a one-sequence stream, where the scan's rank order makes the visible set
-// a prefix; a multi-sequence stream stays compact for text. QSA_COMPACT_OK or the reason.
+// compact (maskless) visibility of the tokens [i0, i0 + n) of a ubatch on one stream: each query reads the block row of its first seq id, as the mask does. 2-D cells need a one-sequence stream, where the scan's rank order makes the visible set a prefix; a multi-sequence stream stays compact for text. QSA_COMPACT_OK or the reason.
 static int qsa_compact_visibility_stream(const llama_kv_cells & cells, uint32_t count, uint32_t ratio, const llama_ubatch & u,
         uint32_t i0, uint32_t n) {
     if (ratio==0 || count>cells.size() || !u.pos || !u.n_tokens || !u.n_pos || !u.seq_id || !u.n_seq_id || n==0 ||

@@ -6832,8 +6832,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // sparse-attention gate fusion: SPARSE_ATTN -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .) runs the gated
-    // G4 instance (sigmoid(gate) * O in the epilogue). Gate row R = (s * n_q + i) * n_head + h at gate->data + R * nb[1].
+    // sparse-attention gate fusion: SPARSE_ATTN -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .) runs the gated G4 instance (sigmoid(gate) * O in the epilogue). Gate row R = (s * n_q + i) * n_head + h at gate->data + R * nb[1].
 #if defined(GGML_USE_HIP)
     if (node->op == GGML_OP_SPARSE_ATTN && (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && ggml_is_contiguous(node) &&
             ggml_cuda_sparse_attn_gate_ok(cuda_ctx->device, node)) {
@@ -6872,8 +6871,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 store_f32 = !(dst16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, mul));
             }
             if (ok) {   // an output that overlaps a read (q, k, v, plan, gate, workspace) goes to graph memory the fusion
-                        // leaves unwritten and is copied into place, so the fusion does not depend on where gallocr put
-                        // the MUL; no room: not fused
+                        // leaves unwritten and is copied into place, so the fusion does not depend on where gallocr put the MUL; no room: not fused
                 size_t ws_off = 0, ws_bytes = 0;
                 ggml_cuda_sparse_attn_ws_range(cuda_ctx->device, node, &ws_off, &ws_bytes);
                 ggml_cuda_sa_span reads[6];
@@ -6912,8 +6910,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 #endif // defined(GGML_USE_HIP)
 
-    // FA gate fusion: FLASH_ATTN_EXT (fa7) -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .), the gate in the
-    // attention epilogue. QSA layers take the SPARSE_ATTN gate fusion above
+    // FA gate fusion: FLASH_ATTN_EXT (fa7) -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .), the gate in the attention epilogue. QSA layers take the SPARSE_ATTN gate fusion above
     if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_fa7_gate_ok(*cuda_ctx, node) && ggml_is_contiguous(node) &&
             (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
         int j = i + 1;
@@ -9896,8 +9893,7 @@ static bool ggml_cuda_sa_dense_fa_supported(ggml_backend_dev_t dev, ggml_type ty
     return ok;
 }
 
-// The dense shortcut pick needs a FLASH_ATTN_EXT that takes the pair (none with -DGGML_CUDA_FA=OFF): otherwise keep the
-// sparse op, which runs without FA.
+// The dense shortcut pick needs a FLASH_ATTN_EXT that takes the pair (none with -DGGML_CUDA_FA=OFF): otherwise keep the sparse op, which runs without FA.
 static bool ggml_backend_cuda_sparse_attn_prefer_dense(ggml_backend_dev_t dev, enum ggml_type type_k, enum ggml_type type_v,
                                                        int64_t n_q, int64_t n_kv) {
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;

@@ -1,10 +1,7 @@
 #version 450
 
-// GGML_OP_SPARSE_ATTN, portable tier for devices without the coopmat or subgroup-64 pipelines: no extension, no subgroup
-// operation, no 8- or 16-bit type, 2 KiB of shared memory. One workgroup per (query, K/V head, stream), one invocation
-// per query head; cell by cell the K and V rows are converted into shared memory. It never splits.
-// Arithmetic follows the CPU op operation by operation (`precise`); only exp differs. The f32 <-> f16 conversions are
-// integer code: packHalf2x16 has no rounding-mode guarantee. Masked-off and padding cells are never loaded (item 4).
+// GGML_OP_SPARSE_ATTN, portable tier for devices without the coopmat or subgroup-64 pipelines: no extension, no subgroup operation, no 8- or 16-bit type, 2 KiB of shared memory. One workgroup per (query, K/V head, stream), one invocation per query head; cell by cell the K and V rows are converted into shared memory. It never splits.
+// Arithmetic follows the CPU op operation by operation (`precise`); only exp differs. The f32 <-> f16 conversions are integer code: packHalf2x16 has no rounding-mode guarantee. Masked-off and padding cells are never loaded (item 4).
 
 layout(constant_id = 0) const uint GQA = 12;        // also the workgroup size
 layout(constant_id = 1) const uint FaTypeK = 1;

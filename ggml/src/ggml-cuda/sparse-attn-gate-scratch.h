@@ -1,8 +1,6 @@
 #pragma once
 
-// Where the fused gated SPARSE_ATTN writes its outputs (o32, the MUL's f32 memory, and / or o16, its 16-bit copy). An
-// output that overlaps a read cannot be written in place: it goes to graph memory the fused subgraph leaves unwritten
-// (the attend's dst, the CONT and SIGMOID outputs) and one device copy moves it; when none fits the fusion is refused.
+// Where the fused gated SPARSE_ATTN writes its outputs (o32, the MUL's f32 memory, and / or o16, its 16-bit copy). An output that overlaps a read cannot be written in place: it goes to graph memory the fused subgraph leaves unwritten (the attend's dst, the CONT and SIGMOID outputs) and one device copy moves it; when none fits the fusion is refused.
 // Never pool memory: the pool is outside the reserved compute buffer.
 
 #include <cstddef>
@@ -48,8 +46,7 @@ static inline ggml_cuda_sa_gate_plan ggml_cuda_sa_gate_plan_outputs(const ggml_c
     const bool hazard16 = o16.n > 0 && ggml_cuda_sa_overlaps_any(reads, n_reads, o16.p, o16.n);
     r.where32 = o32.n == 0 ? GGML_CUDA_SA_GATE_NONE : hazard32 ? GGML_CUDA_SA_GATE_SCRATCH : GGML_CUDA_SA_GATE_DIRECT;
     r.where16 = o16.n == 0 ? GGML_CUDA_SA_GATE_NONE : hazard16 ? GGML_CUDA_SA_GATE_SCRATCH : GGML_CUDA_SA_GATE_DIRECT;
-    // a scratch: a candidate that holds the output and overlaps no read, no output and no other scratch (candidates may
-    // overlap each other: SIGMOID may run in place over CONT, MUL over either)
+    // a scratch: a candidate that holds the output and overlaps no read, no output and no other scratch (candidates may overlap each other: SIGMOID may run in place over CONT, MUL over either)
     const auto pick = [&](size_t n, const void * other, size_t n_other) -> void * {
         for (int i = 0; i < n_cands; ++i) {
             const ggml_cuda_sa_span & c = cands[i];
