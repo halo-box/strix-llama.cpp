@@ -27,30 +27,6 @@ static int sa_policy_type(const ggml_type t) {
     }
 }
 
-// GGML_CUDA_SA_FORCE (comma-separated) g1 | g4: the group policy returns that G (a test switch, PLAN-v3 §6.2; it changes
-// the G llama builds its plans with, never placement; get_alloc_size covers both G whatever the switch says, §5). Read
-// at every call, so a process can reserve with the policy's G and run with a forced one (AT-C5).
-static int sa_force_group(void) {
-    const char * e = getenv("GGML_CUDA_SA_FORCE");
-    if (e == nullptr) {
-        return 0;
-    }
-    const std::string s(e);
-    int g = 0;
-    size_t p = 0;
-    while (p <= s.size()) {
-        const size_t q = std::min(s.find(',', p), s.size());
-        const std::string tok = s.substr(p, q - p);
-        if (tok == "g1") {
-            g = 1;
-        } else if (tok == "g4") {
-            g = 4;
-        }
-        p = q + 1;
-    }
-    return g;
-}
-
 // AT-A crossover (PLAN-v3 §16.5), fitted on the W4 kernels (scripts/qsa-validation/summaries/w4_ata.md): G1 where
 // t_G1 = plan(G1) + G1 attend (+ merge) beats t_G4 = plan(G4) + min(G4 packed + pack, G4 direct) by more than 3 x the
 // p90 run-to-run noise (p90 0.33 % over 1188 samples: margin 1 %) at every tested n_q up to the threshold, on every
@@ -88,8 +64,10 @@ bool ggml_cuda_sa_g1_beats_g4(int64_t n_q_per_stream, int64_t n_kv, ggml_type ty
 // margin of 3 x p90 = 1 %. Every S_fast pair has the same crossover, so the rule does not depend on the types.
 int ggml_cuda_sparse_attn_group(int device, int64_t n_q_per_stream, int64_t n_kv, ggml_type type_k, ggml_type type_v, bool shortcut) {
     GGML_UNUSED(device);
-    if (const int f = sa_force_group()) {
-        return f;
+    // test switch GGML_CUDA_SA_FORCE=g1 | g4, read at every call (a process can reserve with the policy's G and run with
+    // a forced one; get_alloc_size covers both)
+    if (ggml_cuda_sa_force_has("g1") || ggml_cuda_sa_force_has("g4")) {
+        return ggml_cuda_sa_force_has("g4") ? 4 : 1;
     }
     if (shortcut) {
         return n_q_per_stream <= 32 ? 1 : 4;

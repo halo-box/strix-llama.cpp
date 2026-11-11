@@ -563,12 +563,9 @@ static __global__ void __launch_bounds__(sa_plan_merge_threads<G>::value) sa_pla
     }
 }
 
+// test switch GGML_CUDA_SA_FORCE=plan_global: the rows and the merge on global memory whatever their length
 static bool sa_plan_force_global() {
-    // test switch: run the rows and the merge on global memory whatever their length (both kernel variants are tested)
-    static const bool force = [] {
-        const char * e = getenv("GGML_CUDA_SA_PLAN_GLOBAL");
-        return e != nullptr && atoi(e) != 0;
-    }();
+    static const bool force = ggml_cuda_sa_force_has("plan_global");
     return force;
 }
 

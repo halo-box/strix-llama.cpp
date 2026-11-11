@@ -2,7 +2,7 @@
 // the transforms are compared bit for bit with fwht.cu (a GGML_HINT_SRC0_IS_HADAMARD mul_mat on the same backend), not
 // within a band.
 //
-//   H_q    the kernel's q transform (GGML_CUDA_SA_ROT_DUMP=1: an op with rot_q != 0 writes H_q q, f32, into dst and
+//   H_q    the kernel's q transform (GGML_CUDA_SA_FORCE=rot_dump: an op with rot_q != 0 writes H_q q, f32, into dst and
 //          stops) against fwht.cu of the same q;
 //   H_o    the op with rot_o against fwht.cu of the same op's rot 0 output;
 //   graph  the op with (rot_q, rot_o) against the graph-side form it replaces in qwen4exp (fwht.cu of q, the op at rot 0,
@@ -214,6 +214,17 @@ static std::vector<sa_shape> shapes() {
     return v;
 }
 
+// adds / removes the rot_dump token of GGML_CUDA_SA_FORCE, keeping the process's forcing tokens
+static void set_force_rot_dump(bool on) {
+    static const std::string base = getenv("GGML_CUDA_SA_FORCE") ? getenv("GGML_CUDA_SA_FORCE") : "";
+    const std::string v = on ? base + (base.empty() ? "" : ",") + "rot_dump" : base;
+    if (v.empty()) {
+        unsetenv("GGML_CUDA_SA_FORCE");
+    } else {
+        setenv("GGML_CUDA_SA_FORCE", v.c_str(), 1);
+    }
+}
+
 static void test_hq() {
     printf("hq: H_q in the kernel against fwht.cu\n");
     for (sa_shape s : shapes()) {
@@ -233,9 +244,9 @@ static void test_hq() {
                 ggml_build_forward_expand(rc.gf, g.out);
                 rc.run();
                 fill_inputs(g, s, 7);
-                setenv("GGML_CUDA_SA_ROT_DUMP", "1", 1);
+                set_force_rot_dump(true);
                 rc.compute();
-                unsetenv("GGML_CUDA_SA_ROT_DUMP");
+                set_force_rot_dump(false);
                 dump = get_bytes(g.out);
             }
             {
@@ -435,7 +446,6 @@ static void test_gated() {
 
 int main(int argc, char ** argv) {
     setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
-    unsetenv("GGML_CUDA_SA_ROT_DUMP");
     ggml_backend_load_all();
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("ROCm");
     if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {

@@ -4,7 +4,7 @@
 //                                             >= 2 nodes per QSA layer past the shortcut (non-vacuity count)
 //   test-qsa-guard <model.gguf> fake          a fake GPU device registered with ggml_backend_device_register that
 //                                             rejects SPARSE_ATTN: init error naming the cause and the remedy
-//   test-qsa-guard <model.gguf> reject        a real HIP device under the test hook GGML_CUDA_SA_REJECT=1: init error
+//   test-qsa-guard <model.gguf> reject        a real HIP device under the test switch GGML_CUDA_SA_FORCE=reject: init error
 //   test-qsa-guard <model.gguf> reject-decode the weights are loaded, the hook is set after init: llama_decode returns an
 //                                             error from the runtime guard, nothing is computed
 //   test-qsa-guard <model.gguf> fake-idx T    a fake GPU device that takes the sparse-attention ops but, as HIP, no GET_ROWS
@@ -216,7 +216,7 @@ int main(int argc, char ** argv) {
     }
 
     if (mode == "reject") {
-        setenv("GGML_CUDA_SA_REJECT", "1", 1);
+        setenv("GGML_CUDA_SA_FORCE", "reject", 1);
     }
     if (mode == "causal-sync") {
         cp.n_seq_max = 2;
@@ -251,7 +251,7 @@ int main(int argc, char ** argv) {
             }
         }
     } else if (mode == "fake" || mode == "reject") {
-        const char * want = mode == "fake" ? "no sparse-attention kernel in this backend" : "rejected by the test hook GGML_CUDA_SA_REJECT";
+        const char * want = mode == "fake" ? "no sparse-attention kernel in this backend" : "rejected by the test switch GGML_CUDA_SA_FORCE=reject";
         if (ctx != nullptr) {
             rc = fail("the context must not be created");
         } else if (g_log.find("QSA layer") == std::string::npos || g_log.find(want) == std::string::npos) {
@@ -331,7 +331,7 @@ int main(int argc, char ** argv) {
         if (ctx == nullptr) {
             rc = fail("context creation");
         } else {
-            setenv("GGML_CUDA_SA_REJECT", "1", 1);
+            setenv("GGML_CUDA_SA_FORCE", "reject", 1);
             // 256 queries: the sparse op's n_q band under the shipped prefer_dense policy of q8_0 (AT-W7PERF)
             std::vector<llama_token> tok(256, 1);
             llama_batch b = llama_batch_get_one(tok.data(), (int32_t) tok.size());
@@ -339,7 +339,7 @@ int main(int argc, char ** argv) {
             printf("llama_decode returned %d\n", ret);
             if (ret == 0) {
                 rc = fail("llama_decode must return an error");
-            } else if (g_log.find("rejected by the test hook") == std::string::npos) {
+            } else if (g_log.find("rejected by the test switch") == std::string::npos) {
                 rc = fail("the decode error does not name the cause");
             }
         }

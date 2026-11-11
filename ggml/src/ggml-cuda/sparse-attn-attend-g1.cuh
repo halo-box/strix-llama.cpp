@@ -121,7 +121,7 @@ struct sa_g1_args {
     int              rot_o;     // H_o block size; applied here with one split, by sa_merge_splits otherwise
     float            rot_q_scale;   // 1.0f / sqrtf(rot_q), as fwht.cu computes it
     float            rot_o_scale;   // 1.0f / sqrtf(rot_o)
-    int              rot_dump;  // test hook (GGML_CUDA_SA_ROT_DUMP=1, rot_q != 0): write H_q q (f32) to out and stop
+    int              rot_dump;  // test switch GGML_CUDA_SA_FORCE=rot_dump (rot_q != 0): write H_q q (f32) to out and stop
 };
 
 typedef void (*sa_g1_kernel_t)(const sa_g1_args);

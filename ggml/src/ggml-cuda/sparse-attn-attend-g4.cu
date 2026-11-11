@@ -32,14 +32,13 @@
 //   min(4 * ceil(n_kv / 4), 64 * n_q) cells, the flags grow with n_q, and the G1 partials are maximised over n_q' by
 //   sa_g1_partial_bytes_max (they are not monotone in n_q, R1-C) (PLAN-v3 §5 "workspace size", §7). On a device whose
 //   tier is the portable one (another arch, or GGML_CUDA_SA_FORCE=portable) there is no workspace.
-// Test switch GGML_CUDA_SA_FORCE (comma-separated, PLAN-v3 §6.2): vpacked | vdirect force the G4 V loader; generic forces
-// the generic tier for every pair of S; portable forces the portable tier; g1 | g4 force the group policy
-// (sparse-attn-attend-g1.cu). It changes the kernel choice inside the backend only, never placement, and get_alloc_size
-// follows it; the census skip proc names the keys a forced process (or another arch) cannot dispatch
-// (ggml_cuda_sparse_attn_census_skip). fixup makes sa_attend_fixup recompute every G4 block (its exact path, rotations
-// included, then runs on every case).
-// Test hook GGML_CUDA_SA_ROT_DUMP=1 (read at every dispatch, tests/test-sparse-attn-rot.cpp): an op with rot_q != 0 writes
-// H_q q (f32, before the product with scale) into dst instead of the attention, and launches nothing after the attend.
+// Test switch GGML_CUDA_SA_FORCE, comma-separated tokens. vpacked | vdirect force the G4 V loader; generic forces the
+// generic tier for every pair of S; portable forces the portable tier; g1 | g4 force the group policy; fixup makes
+// sa_attend_fixup recompute every G4 block; plan_global runs the plan's rows and merge kernels on global memory. They change
+// the kernel choice inside the backend only, never placement, and get_alloc_size follows them; the census skip proc names
+// the keys a forced process cannot dispatch. Read at every call: reject makes SPARSE_ATTN unsupported (the guard test on a
+// real HIP device); rot_dump makes an op with rot_q != 0 write H_q q (f32, before the scale) into dst instead of the
+// attention and launch nothing after the attend (test-sparse-attn-rot).
 
 #include "sparse-attn.cuh"
 #include "sparse-attn-census.h"
@@ -49,6 +48,22 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+
+bool ggml_cuda_sa_force_has(const char * token) {
+    const char * e = getenv("GGML_CUDA_SA_FORCE");
+    if (e == nullptr) {
+        return false;
+    }
+    const std::string s(e);
+    for (size_t p = 0; p <= s.size();) {
+        const size_t q = std::min(s.find(',', p), s.size());
+        if (s.compare(p, q - p, token) == 0) {
+            return true;
+        }
+        p = q + 1;
+    }
+    return false;
+}
 
 #if defined(GGML_USE_HIP)
 
@@ -115,10 +130,10 @@ static const sa_force_t & sa_force(void) {
                 r.tier = SA_FORCE_TIER_PORTABLE;
             } else if (tok == "fixup") {
                 r.fixup_all = true;
-            } else if (tok == "g1" || tok == "g4") {
-                // the group policy's (sparse-attn-attend-g1.cu)
+            } else if (tok == "g1" || tok == "g4" || tok == "reject" || tok == "rot_dump" || tok == "plan_global") {
+                // read at every call (ggml_cuda_sa_force_has)
             } else if (!tok.empty()) {
-                GGML_LOG_WARN("%s: GGML_CUDA_SA_FORCE: '%s' is not a forcing switch of this build (vpacked, vdirect, generic, portable, fixup, g1, g4)\n", __func__, tok.c_str());
+                GGML_LOG_WARN("%s: GGML_CUDA_SA_FORCE: '%s' is not a forcing switch of this build (vpacked, vdirect, generic, portable, fixup, g1, g4, reject, rot_dump, plan_global)\n", __func__, tok.c_str());
             }
             p = q + 1;
         }
@@ -135,12 +150,6 @@ static const sa_force_t & sa_force(void) {
 
 static int sa_force_vl(void) {
     return sa_force().vl;
-}
-
-// GGML_CUDA_SA_ROT_DUMP=1 (test hook, read at every dispatch so one process can run both arms)
-static bool sa_rot_dump(void) {
-    const char * e = getenv("GGML_CUDA_SA_ROT_DUMP");
-    return e != nullptr && atoi(e) != 0;
 }
 
 // the tier of HIP device `device` before the type pair is known: portable on every arch other than RDNA3.5 and under
@@ -314,13 +323,8 @@ static bool sa_strides_ok(const ggml_tensor * t) {
     return t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
 }
 
-bool ggml_cuda_sparse_attn_force_reject(void) {
-    const char * e = getenv("GGML_CUDA_SA_REJECT");
-    return e != nullptr && atoi(e) != 0;
-}
-
 bool ggml_cuda_sparse_attn_supported(int device, const ggml_tensor * op) {
-    if (ggml_cuda_sparse_attn_force_reject()) {
+    if (ggml_cuda_sa_force_has("reject")) {
         return false;
     }
     const sa_selection sel = sa_select(op, device);
@@ -358,8 +362,8 @@ size_t ggml_cuda_sparse_attn_get_alloc_size(int device, const ggml_tensor * op) 
 }
 
 const char * ggml_cuda_sparse_attn_unsupported_reason(int device, const ggml_tensor * op) {
-    if (ggml_cuda_sparse_attn_force_reject()) {
-        return "rejected by the test hook GGML_CUDA_SA_REJECT";
+    if (ggml_cuda_sa_force_has("reject")) {
+        return "rejected by the test switch GGML_CUDA_SA_FORCE=reject";
     }
     if (op->op != GGML_OP_SPARSE_ATTN) {
         return ggml_cuda_sparse_attn_plan_supported(device, op) ? nullptr : "plan shape not supported";
@@ -528,8 +532,8 @@ static void sa_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int
     const bool generic = sel.tier == SA_TIER_GENERIC;
     const int  rot_q   = ggml_get_op_params_i32(dst, 1);
     const int  rot_o   = ggml_get_op_params_i32(dst, 2);
-    const bool rot_dump = rot_q != 0 && sa_rot_dump();
-    GGML_ASSERT((!rot_dump || epi == SA_EPI_PLAIN) && "GGML_CUDA_SA_ROT_DUMP: plain attends only");
+    const bool rot_dump = rot_q != 0 && ggml_cuda_sa_force_has("rot_dump");
+    GGML_ASSERT((!rot_dump || epi == SA_EPI_PLAIN) && "GGML_CUDA_SA_FORCE=rot_dump: plain attends only");
 
     if (sel.tier == SA_TIER_PORTABLE) {
         GGML_ASSERT(epi == SA_EPI_PLAIN && "the gate fusion has fast G4 instances only (ggml_cuda_sparse_attn_gate_ok)");
@@ -705,10 +709,6 @@ const char * ggml_cuda_sparse_attn_census_skip(int device, const char * key) {
     GGML_UNUSED(device);
     GGML_UNUSED(key);
     return nullptr;
-}
-
-bool ggml_cuda_sparse_attn_force_reject(void) {
-    return false;
 }
 
 const char * ggml_cuda_sparse_attn_unsupported_reason(int device, const ggml_tensor * op) {

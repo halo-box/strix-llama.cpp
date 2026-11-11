@@ -31,9 +31,9 @@ void   ggml_cuda_sparse_attn_gated(ggml_backend_cuda_context & ctx, ggml_tensor 
 const char * ggml_cuda_sparse_attn_census_skip(int device, const char * key);
 
 // why ggml_cuda_sparse_attn_supported / _plan_supported is false for op, NULL when it is true (the init error, PLAN-v3 §10).
-// GGML_CUDA_SA_REJECT=1 (test hook, read at every call) makes both ops unsupported, for the guard test on a real HIP build
 const char * ggml_cuda_sparse_attn_unsupported_reason(int device, const ggml_tensor * op);
-bool ggml_cuda_sparse_attn_force_reject(void);
+// the test switch GGML_CUDA_SA_FORCE holds `token` (sparse-attn-attend-g4.cu lists the tokens)
+bool ggml_cuda_sa_force_has(const char * token);
 // the census keys of one executed plan + attend of this shape, from sa_select (ggml_backend_sparse_attn_select_dump_t)
 size_t ggml_cuda_sparse_attn_select_dump(int device, int64_t n_q, int64_t n_kv, int64_t n_stream, int64_t n_sel, ggml_type type_k, ggml_type type_v,
                                          int64_t n_head, int64_t n_head_kv, int32_t group, bool gated, char * buf, size_t size);
@@ -68,7 +68,7 @@ struct ggml_cuda_sa_g1_launch_params {
     float            scale;
     int              rot_q, rot_o;        // op_params[1], op_params[2] (rot_o: applied by the attend with one split, by
                                           // ggml_cuda_sa_merge_splits otherwise)
-    int              rot_dump;            // test hook GGML_CUDA_SA_ROT_DUMP (rot_q != 0): H_q q into out, nothing else
+    int              rot_dump;            // test switch GGML_CUDA_SA_FORCE=rot_dump (rot_q != 0): H_q q into out, nothing else
     float *          out;                 // splits == 1
     float *          partial;             // splits > 1
 };
@@ -93,7 +93,7 @@ struct ggml_cuda_sa_portable_launch_params {
     int              kt_g, vt_g;          // the ggml types of K and V
     float            scale;
     int              rot_q, rot_o;        // op_params[1], op_params[2]
-    int              rot_dump;            // test hook GGML_CUDA_SA_ROT_DUMP (rot_q != 0): H_q q into out, nothing else
+    int              rot_dump;            // test switch GGML_CUDA_SA_FORCE=rot_dump (rot_q != 0): H_q q into out, nothing else
     float *          out;                 // dst
 };
 void ggml_cuda_sa_portable_launch(cudaStream_t stream, const ggml_cuda_sa_portable_launch_params & p);

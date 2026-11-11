@@ -80,7 +80,7 @@ struct sa_g4_args {
     int              rot_o;     // H_o block size (0, 64, 128 or 256): op_params[2]
     float            rot_q_scale;   // 1.0f / sqrtf(rot_q), as fwht.cu computes it (unused when rot_q == 0)
     float            rot_o_scale;   // 1.0f / sqrtf(rot_o)
-    int              rot_dump;  // test hook (GGML_CUDA_SA_ROT_DUMP=1, rot_q != 0): write H_q q (f32, before scale) to out
+    int              rot_dump;  // test switch GGML_CUDA_SA_FORCE=rot_dump (rot_q != 0): write H_q q (f32, before scale) to out
                                 // rows R and stop (tests/test-sparse-attn-rot.cpp)
     int              fixup_all; // test hook (GGML_CUDA_SA_FORCE=fixup): sa_attend_fixup recomputes every block
 };
