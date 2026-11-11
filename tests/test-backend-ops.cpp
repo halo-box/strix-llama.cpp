@@ -13892,6 +13892,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_exl3_mul_mat(256, 384, tile_words, codebook, {1, 1}));
         test_cases.emplace_back(new test_exl3_mul_mat(256, 384, tile_words, codebook, {7, 1}));
     }
+    // K = 7: decode and the 64-row, two-product HIP GEMM tile (W = 4).
+    for (int codebook : {0, 1, 2}) {
+        test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 112, codebook, {1, 1}));
+        test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 112, codebook, {33, 1}));
+    }
     test_cases.emplace_back(new test_exl3_mul_mat(384, 256, 64, 1, {512, 1}));
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}));
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}, true));

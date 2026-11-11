@@ -1037,7 +1037,7 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
 
     uint32_t raw[CT][KT][R];
     exl3_u4  bst[B_ITEMS];
-#define EXL3_GEMM_LOAD(ks_)                                                       \
+#define EXL3_GEMM_LOAD_WEIGHTS(ks_)                                               \
     do {                                                                          \
         _Pragma("unroll")                                                         \
         for (int q = 0; q < CT; ++q) {                                            \
@@ -1050,10 +1050,18 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
                 }                                                                 \
             }                                                                     \
         }                                                                         \
+    } while (0)
+#define EXL3_GEMM_LOAD_X(ks_)                                                     \
+    do {                                                                          \
         _Pragma("unroll")                                                         \
         for (int i = 0; i < B_ITEMS; ++i) {                                       \
             bst[i] = xsrc[i][(ks_)*(BK/8)];                                       \
         }                                                                         \
+    } while (0)
+#define EXL3_GEMM_LOAD(ks_)                                                       \
+    do {                                                                          \
+        EXL3_GEMM_LOAD_WEIGHTS(ks_);                                              \
+        EXL3_GEMM_LOAD_X(ks_);                                                    \
     } while (0)
 #define EXL3_GEMM_STORE()                                                         \
     do {                                                                          \
@@ -1089,11 +1097,18 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
     EXL3_GEMM_LOAD(0);
     EXL3_GEMM_STORE();
     __syncthreads();
+    // gfx1151 / ROCm 10.1: early x loads cause 3 VGPR spill saves and 16 scratch bytes/lane for K = 7, W = 4.
+    // Keep x out of the WMMA live range; remove this split when early loads compile without spills.
+    constexpr bool late_x = bits == 7 && !ID && W == 4 && P == 2;
     for (int ks = 0; ks < n_steps; ++ks) {
         // the last step reloads itself: no branch around the prefetch. The scheduling barrier keeps the loads ahead
         // of the WMMAs: left alone the compiler sinks them to the end of the step and then waits for them (sum over
         // the 200 linears 265 ms, 254 with both barriers)
-        EXL3_GEMM_LOAD(min(ks + 1, n_steps - 1));
+        const int next = min(ks + 1, n_steps - 1);
+        EXL3_GEMM_LOAD_WEIGHTS(next);
+        if constexpr (!late_x) {
+            EXL3_GEMM_LOAD_X(next);
+        }
         __builtin_amdgcn_sched_barrier(0);
         if (active) {
             // the x fragments of the step, then two column fragments at a time over the whole step: only two partial
@@ -1138,11 +1153,16 @@ static __global__ void __launch_bounds__(32*W) exl3_gemm_kernel(
         }
         // and the decode of the next step after them, when its loads have landed
         __builtin_amdgcn_sched_barrier(0);
+        if constexpr (late_x) {
+            EXL3_GEMM_LOAD_X(next);
+        }
         __syncthreads();
         EXL3_GEMM_STORE();
         __syncthreads();
     }
 #undef EXL3_GEMM_LOAD
+#undef EXL3_GEMM_LOAD_X
+#undef EXL3_GEMM_LOAD_WEIGHTS
 #undef EXL3_GEMM_STORE
     if (!active) {
         return;
