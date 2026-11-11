@@ -1959,7 +1959,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     bool trim = false;                 // LLAMA_FN_LAST_ATTN_TRIM taken: queries for rows [q_first, n_tokens) only
     ggml_tensor * q_pos = nullptr;
 
-    // this layer's attention, for the placement guard and LLAMA_QSA_TRACE (PLAN-v3 §10, §14.3)
+    // this layer's attention, for the placement guard (PLAN-v3 §10)
     llm_graph_qsa_node qsa_node;
     ggml_tensor * plan = nullptr;
     qsa_policy policy;

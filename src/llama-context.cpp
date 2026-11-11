@@ -684,19 +684,6 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
-    qsa_trace_print();
-    {
-        // plain stderr, as qsa_trace_print: the application's log callback may already be gone
-        const char * ctx_name = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
-        const auto * mem = dynamic_cast<const llama_memory_hybrid_idx *>(memory.get());
-        if (mem != nullptr && mem->get_mem_idx() != nullptr && model.arch == LLM_ARCH_QWEN4EXP) {
-            fprintf(stderr, "LLAMA_QSA_RESPLIT ctx=%s n_qsa_resplit=%" PRIu64 " decode_errors=%" PRId64 "\n", ctx_name, mem->qsa_n_resplit(), qsa_ubatch_errors);
-        }
-        if (strict_reserve) {
-            fprintf(stderr, "LLAMA_STRICT_RESERVE ctx=%s violations=%" PRId64 " reallocs=%" PRId64 "\n", ctx_name, strict_violations, strict_reallocs);
-        }
-        fflush(stderr);
-    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -888,7 +875,7 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 }
 
 //
-// QSA placement guard and trace (PLAN-v3 §10, §14.3)
+// QSA placement guard (PLAN-v3 §10)
 //
 
 int llama_context::qsa_n_layers() const {
@@ -906,11 +893,6 @@ int llama_context::qsa_n_layers() const {
         n += hp.dsv4_compress_ratios[il] > 0 && model.layers[il].index_q_proj != nullptr;
     }
     return n;
-}
-
-static bool qsa_trace_on() {
-    static const bool on = [] { const char * e = getenv("LLAMA_QSA_TRACE"); return e != nullptr && atoi(e) != 0; }();
-    return on;
 }
 
 // the K / V types this device takes for this node's shape, for the "supported here" remedy of the init error
@@ -1159,10 +1141,6 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
             return format("QSA layer %d (%s): attention node has no backend at '%s'", n.il, n.producer, where);
         }
 
-        if (!host_kv && dev != dev_k && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            qsa_guard_cpu_launch++;
-        }
-
         // the backend this route must run on
         ggml_backend_dev_t dev_want = nullptr;
         switch (n.place) {
@@ -1257,9 +1235,6 @@ std::string llama_context::qsa_guard(ggml_cgraph * gf, const llm_graph_result * 
 
     qsa_guard_last_inspected = n_inspected;
     qsa_guard_last_required  = n_required;
-    qsa_guard_passes++;
-    qsa_guard_inspected += n_inspected;
-    qsa_guard_inspected_min = qsa_guard_inspected_min < 0 ? n_inspected : std::min(qsa_guard_inspected_min, n_inspected);
     return "";
 }
 
@@ -1303,61 +1278,6 @@ void llama_context::qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32
                 n_sched > 0 ? " shortcut=scheduler" : "", n_cpu > 0 ? " pinned-cpu" : "", n0.n_kv, n0.group, qsa_guard_last_inspected,
                 qsa_guard_last_required);
     }
-}
-
-void llama_context::qsa_trace_ubatch(const llm_graph_result * res) {
-    if (!qsa_trace_on()) {
-        return;
-    }
-    const char * ctx_name = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
-    for (const auto & n : res->get_qsa_nodes()) {
-        if (n.attn == nullptr) {
-            continue;
-        }
-        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), n.attn);
-        const bool sparse = n.plan != nullptr;
-        const bool on_cpu = be == backend_cpu;
-        char line[256];
-        snprintf(line, sizeof(line), "il=%d producer=%s n_q=%" PRId64 " n_kv=%" PRId64 " n_stream=%" PRId64 " k=%s v=%s",
-                n.il, n.producer, n.n_q, n.n_kv, n.n_stream, ggml_type_name(n.type_k), ggml_type_name(n.type_v));
-        std::string key = line;
-        key += format(" route=%s ctx=%s backend=%s G=%d", n.place == LLM_QSA_PLACE_HOST_KV_COPY ? "host-kv-copy" : sparse ? "sparse" : "dense",
-                ctx_name, be ? ggml_backend_name(be) : "none", n.group);
-        if (sparse) {
-            key += format(" n_sel=%" PRId64 " gqa=%" PRId64, n.plan->src[0]->ne[0], n.attn->src[0]->ne[2] / n.attn->src[1]->ne[2]);
-        }
-        qsa_trace_counts[key]++;
-        if (on_cpu) {
-            if (sparse) {
-                qsa_cpu_sparse_attn++;
-                qsa_cpu_sparse_plan++;
-            } else if (strcmp(n.producer, "dense") == 0) {
-                qsa_cpu_shortcut_attn++;
-            }
-        }
-    }
-}
-
-void llama_context::qsa_trace_print() const {
-    if (!qsa_trace_on() || qsa_n_layers() == 0) {
-        return;
-    }
-    // plain stderr: the application's log callback may already be gone
-    for (const auto & it : qsa_trace_counts) {
-        // the count stays right after the fields the census checker parses
-        const size_t p = it.first.find(" route=");
-        fprintf(stderr, "LLAMA_QSA_TRACE %s count=%" PRId64 "%s\n", it.first.substr(0, p).c_str(), it.second, it.first.substr(p).c_str());
-    }
-    if (qsa_cpu_sparse_attn > 0) {
-        fprintf(stderr, "QSA_CENSUS cpu:sparse_attn %" PRId64 "\n", qsa_cpu_sparse_attn);
-        fprintf(stderr, "QSA_CENSUS cpu:sparse_attn_plan %" PRId64 "\n", qsa_cpu_sparse_plan);
-    }
-    if (qsa_cpu_shortcut_attn > 0) {
-        fprintf(stderr, "QSA_CENSUS cpu:shortcut_attn %" PRId64 "\n", qsa_cpu_shortcut_attn);
-    }
-    fprintf(stderr, "LLAMA_QSA_GUARD ctx=%s passes=%d inspected=%" PRId64 " inspected_min=%d layers=%d cpu_launch=%" PRId64 "\n",
-            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main", qsa_guard_passes, qsa_guard_inspected, qsa_guard_inspected_min, qsa_n_layers(), qsa_guard_cpu_launch);
-    fflush(stderr);
 }
 
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
@@ -2448,7 +2368,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // the QSA graph-build check (PLAN-v3 §4.3): an unreserved non-compact graph is never allocated
         if (!res->get_qsa_ubatch_error().empty()) {
             LLAMA_LOG_ERROR("%s: %s\n", __func__, res->get_qsa_ubatch_error().c_str());
-            qsa_ubatch_errors++;
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
@@ -2481,10 +2400,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
         }
 
-        if (strict_reserve) {
-            strict_reserve_check(ubatch, gf, res);
-        }
-
         gf_res_prev_active = res;
     }
 
@@ -2514,8 +2429,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
-
-    qsa_trace_ubatch(res);
 
     if (ubatch.resident) {
         ggml_backend_event_record(ubatch.resident->done, ubatch.resident->consumer);
@@ -3984,51 +3897,8 @@ void llama_context::vsub_init_head(ggml_tensor * w, const llama_vocab_subset::he
     ggml_backend_tensor_set(head.scorer, data.data(), 0, data.size());
 }
 
-void llama_context::strict_reserve_check(const llama_ubatch & ubatch, ggml_cgraph * gf, const llm_graph_result * res) {
-    if (strict_seen.size() != backend_ptrs.size()) {
-        strict_seen.assign(backend_ptrs.size(), 0);
-    }
-    const char * ctx_name = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "main";
-    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-        ggml_backend_t backend = backend_ptrs[i];
-        const size_t size = ggml_backend_sched_get_buffer_size(sched.get(), backend);
-        const size_t exp  = backend_buf_exp_size[i];
-        // gallocr never shrinks: log each new high-water mark past the reserve once
-        if (size <= exp || size <= strict_seen[i]) {
-            continue;
-        }
-        strict_seen[i] = size;
-        strict_violations++;
-        // the largest nodes of this backend in the graph that grew it
-        std::vector<std::pair<size_t, const ggml_tensor *>> big;
-        for (int j = 0; j < ggml_graph_n_nodes(gf); ++j) {
-            ggml_tensor * t = ggml_graph_node(gf, j);
-            if (ggml_backend_sched_get_tensor_backend(sched.get(), t) == backend) {
-                big.emplace_back(ggml_nbytes(t), t);
-            }
-        }
-        std::sort(big.begin(), big.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
-        std::string nodes;
-        for (size_t j = 0; j < std::min<size_t>(3, big.size()); ++j) {
-            nodes += format(" %s(%s %.2f MiB)", big[j].second->name, ggml_op_desc(big[j].second), big[j].first/1024.0/1024.0);
-        }
-        std::string qsa;
-        if (!res->get_qsa_nodes().empty()) {
-            const auto & n = res->get_qsa_nodes().front();
-            qsa = format(" qsa producer=%s n_q=%" PRId64 " n_kv=%" PRId64 " n_stream=%" PRId64, n.producer, n.n_q, n.n_kv, n.n_stream);
-        }
-        LLAMA_LOG_ERROR("LLAMA_STRICT_RESERVE violation ctx=%s backend=%s buffer=%.4f MiB > reserve=%.4f MiB (+%zu B): ubatch n_tokens=%u n_seqs=%u n_outputs=%d %s%s; graph nodes=%d splits=%d; largest nodes:%s\n",
-                ctx_name, ggml_backend_name(backend), size/1024.0/1024.0, exp/1024.0/1024.0, size - exp, ubatch.n_tokens, ubatch.n_seqs_unq,
-                (int) n_outputs, ubatch.token ? "text" : "embd", qsa.c_str(), ggml_graph_n_nodes(gf), ggml_backend_sched_get_n_splits(sched.get()), nodes.c_str());
-    }
-}
-
 void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
-    if (lctx->strict_reserve) {
-        // LLAMA_STRICT_RESERVE: every re-plan is counted; the growth itself is checked after the allocation (strict_reserve_check)
-        lctx->strict_reallocs++;
-    }
 
     // reallocating after the backend assignments changed is expected, trace only the unexpected ones
     if (backend_ids_changed) {

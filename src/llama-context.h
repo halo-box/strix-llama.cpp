@@ -318,14 +318,8 @@ private:
     // the init guard on split_only reserve graphs of one shape; throws on a violation
     void qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const char * where,
             const reserve_variant * variant = nullptr);
-    // LLAMA_STRICT_RESERVE=1 (PLAN-v3 §7.1.6): after a ubatch's graph is allocated, every backend's compute buffer is at most
-    // its reserve; the first growth past it is logged with the ubatch and the largest nodes of that backend
-    void strict_reserve_check(const llama_ubatch & ubatch, ggml_cgraph * gf, const llm_graph_result * res);
     // the number of QSA layers a graph of this context holds, 0 when QSA does not apply
     int qsa_n_layers() const;
-    // LLAMA_QSA_TRACE=1: producer x route x context per executed ubatch (§14.3), printed at exit
-    void qsa_trace_ubatch(const llm_graph_result * res);
-    void qsa_trace_print() const;
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -523,22 +517,7 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 
-    // QSA guard counters (qsa_guard) and the LLAMA_QSA_TRACE accumulators
-    int     qsa_guard_passes       = 0;
-    int     qsa_guard_inspected_min = -1;
-    int64_t qsa_guard_inspected    = 0;
-    int64_t qsa_guard_cpu_launch   = 0;   // QSA-layer attention placed on the CPU while the layer's K buffer is on a GPU
-    std::map<std::string, int64_t> qsa_trace_counts;
-    int64_t qsa_cpu_sparse_attn    = 0;   // executed SPARSE_ATTN / SPARSE_ATTN_PLAN / shortcut attention nodes on the CPU
-    int64_t qsa_cpu_sparse_plan    = 0;
-    int64_t qsa_cpu_shortcut_attn  = 0;
-    int     qsa_guard_last_inspected = 0; // the last guard pass: nodes read with a backend, nodes required
+    // the last QSA guard pass (qsa_guard): nodes read with a backend, nodes required
+    int     qsa_guard_last_inspected = 0;
     int     qsa_guard_last_required  = 0;
-
-    // LLAMA_STRICT_RESERVE (PLAN-v3 §7.1.6)
-    bool    strict_reserve           = [] { const char * e = getenv("LLAMA_STRICT_RESERVE"); return e != nullptr && atoi(e) != 0; }();
-    int64_t strict_violations        = 0;
-    int64_t strict_reallocs          = 0;
-    std::vector<size_t> strict_seen;    // the largest size seen per backend past its reserve
-    int64_t qsa_ubatch_errors        = 0;  // graph-build check (PLAN-v3 §4.3)
 };

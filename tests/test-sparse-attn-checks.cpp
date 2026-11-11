@@ -465,7 +465,7 @@ static int run(int, char **) {
 // ---- gate-scratch ----------------------------------------------------------------------------------------------------
 // The output placement of the HIP gated SPARSE_ATTN fusion (ggml/src/ggml-cuda/sparse-attn-gate-scratch.h), on synthetic
 // layouts of one compute buffer. PLAN-v3 D12: no sparse kernel uses ctx.pool(); every workspace is in the reserved compute
-// buffer, so the reserve, the fit probe and LLAMA_STRICT_RESERVE see it. When gallocr puts the MUL output (or its 16-bit copy)
+// buffer, so the reserve and the fit probe see it. When gallocr puts the MUL output (or its 16-bit copy)
 // over a tensor the kernel reads (Q is dead after the attend and has the MUL's size: the common case), the output must go to
 // graph memory the fusion leaves unwritten (the attend's own dst, the CONT and SIGMOID outputs), or the fusion is refused;
 // never to pool scratch. For every layout: no output in the pool; a scratch lies inside one candidate, overlaps no read, no

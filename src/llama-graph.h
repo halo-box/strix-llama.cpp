@@ -973,8 +973,8 @@ struct llm_graph_fused_node {
     int il;
 };
 
-// One QSA layer's attention in a built graph (PLAN-v3 §10, §14.3): what the placement guard checks and what LLAMA_QSA_TRACE
-// counts per executed ubatch. A cache-only MTP graph registers nothing (it has no attention node).
+// One QSA layer's attention in a built graph (PLAN-v3 §10): what the placement guard checks. A cache-only MTP graph
+// registers nothing (it has no attention node).
 enum llm_graph_qsa_place {
     LLM_QSA_PLACE_K_DEVICE,        // on the backend of the device that holds the layer's K buffer (CPU for a host K buffer)
     LLM_QSA_PLACE_HOST_KV_COPY,    // the named host-KV route: K buffer on the host, nodes on the layer's GPU, K/V copied (§10)
