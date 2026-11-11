@@ -4661,6 +4661,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 // [f32 output] = the f32 chain (no casts), [f32 B] = f32 activations
                 CREATE_MMID_GLU(0, q4_k)
                 CREATE_MMID_GLU(1, q5_k)
+                CREATE_MMID_GLU(2, iq3_s)
 #undef CREATE_MMID_GLU
                 // streaming MUL_MAT_ID down (used only after the fragment layout probe passed): 256 features per workgroup in x
                 ggml_vk_create_pipeline(device, device->pipeline_mmid_down_q51[0], "mul_mm_id_down_q5_1_f16", mul_mm_id_down_q5_1_f16_len,
@@ -10111,6 +10112,7 @@ static int ggml_vk_mmid_glu_type_idx(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_K: return 0;
         case GGML_TYPE_Q5_K: return 1;
+        case GGML_TYPE_IQ3_S: return 2;
         default:             return -1;
     }
 }
@@ -10165,10 +10167,11 @@ static void ggml_vk_mmid_pair_glu(ggml_backend_vk_context * ctx, vk_context& sub
     ggml_vk_sync_buffers(ctx, subctx);
 
     const uint32_t xs = x->type == GGML_TYPE_F32 ? 4 : 8;   // B elements per uvec4
+    const uint32_t wu = w_g->type == GGML_TYPE_IQ3_S ? 4 : 16;   // weight units: uint for iq3_s (2-byte aligned blocks), else uvec4
     const vk_op_mmid_glu_push_constants pc = {
         M, K,
-        get_misalign_bytes(ctx, w_g) / 16, get_misalign_bytes(ctx, w_u) / 16,
-        (uint32_t) (w_g->nb[2] / 16),
+        get_misalign_bytes(ctx, w_g) / wu, get_misalign_bytes(ctx, w_u) / wu,
+        (uint32_t) (w_g->nb[2] / wu),
         get_misalign_bytes(ctx, x) / 16, (uint32_t) (x->nb[1] / ggml_type_size(x->type) / xs), (uint32_t) (x->nb[2] / ggml_type_size(x->type) / xs),
         (uint32_t) x->ne[1],
         get_misalign_bytes(ctx, glu) / (f32 ? 16 : 8),
@@ -18703,6 +18706,9 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     if (l.rfind("TOPK_MOE_", 0) == 0 && (!dev->subgroup_arithmetic || !dev->subgroup_shuffle || !dev->subgroup_require_full_support)) {
         return "no full-subgroup arithmetic and shuffle";
     }
+    if (l == "MUL_MAT_ID_PAIR_SWIGLU" && (!dev->coopmat_rdna3_layout || !dev->pipeline_mmid_glu[0][0][0])) {
+        return "no weight-streaming MUL_MAT_ID GLU pipeline (RDNA3 + RADV + wave32 with the probed fragment layout)";
+    }
     if (l.rfind("RMS_NORM_MUL_ROPE", 0) == 0 && sizeof(vk_op_rms_norm_mul_rope_push_constants) > dev->properties.limits.maxPushConstantsSize) {
         return "push constants too small for rms_norm_mul_rope";
     }
@@ -19038,6 +19044,10 @@ static bool ggml_vk_can_fuse_mmid_pair_glu(ggml_backend_vk_context * ctx, const 
         ggml_nbytes(w_a) + get_misalign_bytes(ctx, w_a) > ctx->device->properties.limits.maxStorageBufferRange ||
         ggml_nbytes(w_b) + get_misalign_bytes(ctx, w_b) > ctx->device->properties.limits.maxStorageBufferRange) {
         return reject("weight shape (K % 256, M % 128, contiguous experts)");
+    }
+    // iq3_s: the shader reads uint words, so each row (K / 256 blocks of 110 bytes) must start on a uint
+    if (w_a->type == GGML_TYPE_IQ3_S && K % 512 != 0) {
+        return reject("iq3_s rows are not uint aligned (K % 512)");
     }
     if ((x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16) || x->ne[0] != K || x->ne[2] != T ||
         (x->ne[1] != 1 && x->ne[1] != n_used) || x->ne[3] != 1 || x->nb[0] != ggml_type_size(x->type) ||

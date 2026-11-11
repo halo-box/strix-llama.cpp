@@ -1096,7 +1096,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
     vk_pipeline pipeline_count_experts;
-    vk_pipeline pipeline_mmid_glu[2][2][2];   // MUL_MAT_ID_PAIR_SWIGLU (mul_mm_id_glu.comp): [q4_K, q5_K][f32 output][f32 B]
+    vk_pipeline pipeline_mmid_glu[3][2][2];   // MUL_MAT_ID_PAIR_SWIGLU (mul_mm_id_glu.comp): [q4_K, q5_K, iq3_s][f32 output][f32 B]
     vk_pipeline pipeline_mmid_down_q51[2];   // streaming MUL_MAT_ID(+MUL)+CPY(f16) down (mul_mm_id_down.comp): [0] f16 B, [1] f32 B
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)

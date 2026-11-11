@@ -8,8 +8,13 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_cooperative_matrix : require
 
+#if defined(A_IQ3_S)
+#define DATA_A_IQ3_S
+#include "types.glsl"
+#endif
+
 // Routed MoE gate + up + SwiGLU in one launch (MUL_MAT_ID -> CPY(f16) for the up and the gate projection, then SWIGLU):
-// q4_K or q5_K (A_Q5_K) gate and up experts, f16 output = the SWIGLU's destination. OUT_F32: the f32 chain (MUL_MAT_ID x 2, then an f32
+// q4_K, q5_K (A_Q5_K) or iq3_s (A_IQ3_S) gate and up experts, f16 output = the SWIGLU's destination. OUT_F32: the f32 chain (MUL_MAT_ID x 2, then an f32
 // SWIGLU, no casts), stored as f32 with swiglu.comp's expression on the unrounded projections. Weight-streaming design (after halo-box PR #213's HIP
 // G2 kernel): at prefill every expert's rows are read once per 64-token tile, so the kernel is bound by how fast it streams
 // the weights. They go from global memory straight into registers, one 64-K stage ahead, and never touch shared memory.
@@ -29,9 +34,9 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform parameter {
     uint M;              // features per expert (n_ff), multiple of 128
     uint K;              // n_embd, multiple of 256
-    uint g_offset;       // gate weights, uvec4 units
-    uint u_offset;       // up weights, uvec4 units
-    uint stride_e;       // uvec4 per expert (M * K / 256 * BU)
+    uint g_offset;       // gate weights, uvec4 units (uint with A_IQ3_S)
+    uint u_offset;       // up weights, uvec4 units (uint with A_IQ3_S)
+    uint stride_e;       // uvec4 per expert (M * K / 256 * BU); uint per expert with A_IQ3_S
     uint b_offset;       // B, in uvec4 units
     uint b_s1;           // B stride per slot (ne11 > 1), uvec4 units
     uint b_s2;           // B stride per token, uvec4 units
@@ -42,8 +47,14 @@ layout(push_constant) uniform parameter {
     uint zero;           // always 0: keeps the f16 roundings of the unfused chain (see round16 and glu_val)
 } p;
 
+#if defined(A_IQ3_S)
+// iq3_s blocks are 110 bytes (2-byte aligned): read as uint, a row starts on a uint (host: K % 512 == 0)
+layout(binding = 0) readonly buffer WG { uint data_g[]; };
+layout(binding = 1) readonly buffer WU { uint data_u[]; };
+#else
 layout(binding = 0) readonly buffer WG { uvec4 data_g[]; };
 layout(binding = 1) readonly buffer WU { uvec4 data_u[]; };
+#endif
 layout(binding = 2) readonly buffer B  { uvec4 data_b[]; };
 #if defined(OUT_F32)
 layout(binding = 3) writeonly buffer D { vec4 data_d[]; };
@@ -59,7 +70,9 @@ layout(binding = 4) readonly buffer E  { uint data_e[]; };   // count_experts: [
 #define ACC  coopmat<float,     gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 
 #define BN 64            // tokens per tile (the count_experts row tile)
-#if defined(A_Q5_K)
+#if defined(A_IQ3_S)
+#define BU 0             // unused: rows are addressed in bytes
+#elif defined(A_Q5_K)
 #define BU 11            // uvec4 per 256-K superblock: header (d, dmin, 12 scale bytes), qh (32 bytes), qs (128 bytes)
 #else
 #define BU 9             // q4_K: header, qs (128 bytes)
@@ -103,6 +116,20 @@ void qk_frag(const uvec4 q, const uint sh, const uvec4 qh, const uint hb, const 
     }
 }
 
+#if defined(A_IQ3_S)
+// 16 K values of this lane's row -> 8 packed f16 pairs, the expression of the unfused iq3_s coopmat dequant (mul_mm_funcs.glsl).
+// q: 4 qs bytes, qh: their 4 high index bits (bits 0..3), sg: 16 sign bits, db: d * (1 + 2 * scale)
+void iq3s_frag(const uint q, const uint qh, const uint sg, const float db, out uint o[8]) {
+    [[unroll]] for (uint j = 0; j < 4; j++) {
+        const uint grid = iq3s_grid[((q >> (8 * j)) & 0xFFu) | (((qh >> j) & 1u) << 8)];
+        const vec4 v = db * vec4(unpack8(grid));
+        const uint s = sg >> (4 * j);
+        o[2 * j]     = packFloat2x16(f16vec2((s & 1u) != 0 ? -v.x : v.x, (s & 2u) != 0 ? -v.y : v.y));
+        o[2 * j + 1] = packFloat2x16(f16vec2((s & 4u) != 0 ? -v.z : v.z, (s & 8u) != 0 ? -v.w : v.w));
+    }
+}
+#endif
+
 // the unfused chain stores each projection as f16 (CPY) and the SWIGLU reads them back. RADV's NIR optimiser folds a bare
 // float(float16_t(x)) back to x, and turns a multiply followed by an f16 store into one single-rounding conversion, so the
 // fused results would miss those roundings. Measured on RADV, Mesa 26.2.4 (gfx1151) on the same pattern in other fused
@@ -136,6 +163,9 @@ void main() {
     const uint lane = gl_SubgroupInvocationID;
     const bool lo   = lane < 16;
 
+#if defined(A_IQ3_S)
+    init_iq_shmem(gl_WorkGroupSize);
+#endif
     if (tid < BN) {
         // rows past nrows reuse row 0, so the B gather stays in bounds; their results are not stored
         s_rid[tid] = data_e[p.row_ids_offset + tile * BN + (tid < nrows ? tid : 0)];
@@ -174,8 +204,25 @@ void main() {
 
     // A: this lane's row (gate for lanes 0..15, up for 16..31), BU uvec4 per 256-K superblock
     const uint feat  = gl_WorkGroupID.x * 128 + wave * 16 + (lane % 16);
+#if defined(A_IQ3_S)
+    const uint a_row = (lo ? p.g_offset : p.u_offset) + expert * p.stride_e + feat * (p.K / 512) * 55;   // 2 superblocks = 55 uint
+#else
     const uint a_row = (lo ? p.g_offset : p.u_offset) + expert * p.stride_e + feat * (p.K / 256) * BU;
-#if defined(A_Q5_K)
+#endif
+#if defined(A_IQ3_S)
+    // stage g of a superblock (byte s0 = 110 sb of the row): qs bytes 16 g .. 16 g + 15 at s0 + 2, qh bytes 2 g, 2 g + 1 at s0 + 66,
+    // sign bytes 8 g .. 8 g + 7 at s0 + 74, scale byte g at s0 + 106, d at s0. q0 = qs, q1 = (signs lo, signs hi, qh | scale << 16, d)
+// W32: the 4 bytes at a 2-byte aligned byte offset (mis = the offset is 2 mod 4)
+#define W32(A, i, mis) ((mis) ? ((A[i] >> 16) | (A[(i) + 1] << 16)) : A[i])
+#define LOAD_A_IQ3S(A, st, q0, q1) { const uint s0 = ((st) / 4) * 110, g = (st) % 4; \
+        const uint qb = s0 + 2 + 16 * g, hb = s0 + 66 + 2 * g, sb = s0 + 74 + 8 * g, cb = s0 + 106 + g; \
+        const bool qm = (qb & 2u) != 0, sm = (sb & 2u) != 0; \
+        q0 = uvec4(W32(A, a_row + qb / 4, qm), W32(A, a_row + qb / 4 + 1, qm), W32(A, a_row + qb / 4 + 2, qm), W32(A, a_row + qb / 4 + 3, qm)); \
+        q1 = uvec4(W32(A, a_row + sb / 4, sm), W32(A, a_row + sb / 4 + 1, sm), \
+                   ((A[a_row + hb / 4] >> ((hb & 2u) * 8)) & 0xFFFFu) | (((A[a_row + cb / 4] >> ((cb & 3u) * 8)) & 0xFFu) << 16), \
+                   (A[a_row + s0 / 4] >> ((s0 & 2u) * 8)) & 0xFFFFu); }
+#define LOAD_A(st, h, q0, q1, h0, h1) { h = uvec4(0); if (lo) LOAD_A_IQ3S(data_g, st, q0, q1) else LOAD_A_IQ3S(data_u, st, q0, q1) }
+#elif defined(A_Q5_K)
     // stage g of a superblock: qs bytes 32 g .. 32 g + 31 (uvec4 3 + 2 g, 4 + 2 g), and all 32 qh bytes (bits 2 g, 2 g + 1)
 #define LOAD_A(st, h, q0, q1, h0, h1) { const uint sb = (st) / 4, g = (st) % 4, ai = a_row + sb * BU; \
         if (lo) { h = data_g[ai]; h0 = data_g[ai + 1]; h1 = data_g[ai + 2]; q0 = data_g[ai + 3 + 2 * g]; q1 = data_g[ai + 4 + 2 * g]; } \
@@ -210,6 +257,15 @@ void main() {
         }
 
         // this stage: sub-blocks 2g (low nibbles of the 32 qs bytes) and 2g + 1 (high nibbles) of superblock st / 4
+#if defined(A_IQ3_S)
+        // aq1.z = qh bytes 2 g, 2 g + 1 | scale byte g << 16; aq1.w = d. Steps 0, 1 use the low scale nibble, steps 2, 3 the high one
+        const float dd = unpackHalf2x16(aq1.w).x;
+        const float db0 = dd * float(1u + 2u * ((aq1.z >> 16) & 0xFu));
+        const float db1 = dd * float(1u + 2u * ((aq1.z >> 20) & 0xFu));
+        [[unroll]] for (uint ks = 0; ks < 4; ks++) {
+            uint own[8];
+            iq3s_frag(aq0[ks], aq1.z >> (8 * (ks / 2) + 4 * (ks & 1)), aq1[ks / 2] >> (16 * (ks & 1)), ks < 2 ? db0 : db1, own);
+#else
         const uint g = st % 4;
         const vec2 dm = unpackHalf2x16(ah.x);
         const uvec2 sm0 = q4k_scale_min(ah, 2 * g);
@@ -222,6 +278,7 @@ void main() {
             uint own[8];
             qk_frag((ks & 1) == 0 ? aq0 : aq1, ks < 2 ? 0u : 4u, (ks & 1) == 0 ? aqh0 : aqh1, 2 * g + (ks < 2 ? 0u : 1u),
                     ks < 2 ? d0 : d1, ks < 2 ? m0 : m1, own);
+#endif
             MATA ag, au;
             [[unroll]] for (uint j = 0; j < 8; j++) {
                 const uint oth = subgroupShuffleXor(own[j], 16);
