@@ -93,28 +93,7 @@ size_t ggml_cuda_sa_g1_partial_bytes_max(int64_t n_q, int64_t n_sel, int64_t n_k
 void ggml_cuda_sa_g1_launch(cudaStream_t stream, const ggml_cuda_sa_g1_launch_params & p) {
     GGML_ASSERT(p.kt >= 0 && p.kt < SA_T_COUNT && p.vt >= 0 && p.vt < SA_T_COUNT && p.gqa_index >= 0 && p.gqa_index < 3);
     GGML_ASSERT(p.splits >= 1 && p.splits <= 65535);
-    sa_g1_args a = {};
-    a.q = p.q; a.q_nb1 = p.q_nb[1]; a.q_nb2 = p.q_nb[2]; a.q_nb3 = p.q_nb[3];
-    a.k = p.k; a.k_nb1 = p.k_nb[1]; a.k_nb2 = p.k_nb[2]; a.k_nb3 = p.k_nb[3];
-    a.v = p.v; a.v_nb1 = p.v_nb[1]; a.v_nb2 = p.v_nb[2]; a.v_nb3 = p.v_nb[3];
-    a.counts    = p.counts;
-    a.quads     = p.quads;
-    a.masks     = p.masks;
-    a.n_groups  = p.n_groups;
-    a.cap       = p.cap;
-    a.n_q       = p.n_q;
-    a.n_head    = p.n_head;
-    a.n_head_kv = p.n_head_kv;
-    a.n_stream  = p.n_stream;
-    a.splits    = p.splits;
-    a.scale     = p.scale;
-    a.out       = p.out;
-    a.partial   = p.partial;
-    a.rot_q       = p.rot_q;
-    a.rot_o       = p.splits == 1 ? p.rot_o : 0;   // with more splits sa_merge_splits applies H_o
-    a.rot_q_scale = ggml_cuda_sa_rot_scale(p.rot_q);
-    a.rot_o_scale = ggml_cuda_sa_rot_scale(p.rot_o);
-    a.rot_dump    = p.rot_dump;
+    sa_g1_args a = sa_g1_args_from(p);
     const int idx = (p.kt * SA_T_COUNT + p.vt) * 3 + p.gqa_index;
     // grid: x = (stream, query, kv head) with the kv head fastest, y = split
     const dim3 grid((unsigned) ((int64_t) p.n_q * p.n_stream * p.n_head_kv), (unsigned) p.splits, 1);

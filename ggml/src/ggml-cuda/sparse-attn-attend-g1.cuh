@@ -11,6 +11,8 @@
 //     epilogue (8 heads at a time through shared memory), else after the merge.
 // Every plan entry read is inside the plan dst and every K / V cell inside the views. Offsets are size_t.
 
+#include "sparse-attn.cuh"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
@@ -401,6 +403,33 @@ __global__ void __launch_bounds__(256) sa_attend_g1(const sa_g1_args a) {
         }
     }
 #endif // defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+}
+
+// the kernel arguments of one G1 launch (fast and generic tiers)
+static inline sa_g1_args sa_g1_args_from(const ggml_cuda_sa_g1_launch_params & p) {
+    sa_g1_args a = {};
+    a.q = p.q; a.q_nb1 = p.q_nb[1]; a.q_nb2 = p.q_nb[2]; a.q_nb3 = p.q_nb[3];
+    a.k = p.k; a.k_nb1 = p.k_nb[1]; a.k_nb2 = p.k_nb[2]; a.k_nb3 = p.k_nb[3];
+    a.v = p.v; a.v_nb1 = p.v_nb[1]; a.v_nb2 = p.v_nb[2]; a.v_nb3 = p.v_nb[3];
+    a.counts    = p.counts;
+    a.quads     = p.quads;
+    a.masks     = p.masks;
+    a.n_groups  = p.n_groups;
+    a.cap       = p.cap;
+    a.n_q       = p.n_q;
+    a.n_head    = p.n_head;
+    a.n_head_kv = p.n_head_kv;
+    a.n_stream  = p.n_stream;
+    a.splits    = p.splits;
+    a.scale     = p.scale;
+    a.out       = p.out;
+    a.partial   = p.partial;
+    a.rot_q       = p.rot_q;
+    a.rot_o       = p.splits == 1 ? p.rot_o : 0;   // with more splits sa_merge_splits applies H_o
+    a.rot_q_scale = ggml_cuda_sa_rot_scale(p.rot_q);
+    a.rot_o_scale = ggml_cuda_sa_rot_scale(p.rot_o);
+    a.rot_dump    = p.rot_dump;
+    return a;
 }
 
 #endif // defined(GGML_USE_HIP)
