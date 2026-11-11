@@ -1601,10 +1601,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             cb(score_keys, "indexer_k_bounded", il);
         }
         const bool whole = first == 0 && n_query == n_tps;   // one strip: the original tensors, no views
-        ggml_tensor * bias = inp->compact ? nullptr : whole ? bias_all : ggml_view_3d(ctx0, bias_all, bias_all->ne[0], n_query, n_stream,
-                bias_all->nb[1], bias_all->nb[2], first*bias_all->nb[1]);
-        ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : whole ? kq_mask : ggml_view_4d(ctx0, kq_mask,
-                n_kv, n_query, 1, n_stream, kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]);
+        // all layers use the same view, see strip_views
+        const auto strip_view = [&](ggml_tensor * src, auto make) {
+            ggml_tensor *& view = strip_views[{src, first, n_query}];
+            if (view == nullptr) {
+                view = make();
+            }
+            return view;
+        };
+        ggml_tensor * bias = inp->compact ? nullptr : whole ? bias_all : strip_view(bias_all, [&] {
+            return ggml_view_3d(ctx0, bias_all, bias_all->ne[0], n_query, n_stream,
+                    bias_all->nb[1], bias_all->nb[2], first*bias_all->nb[1]); });
+        ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : whole ? kq_mask : strip_view(kq_mask, [&] {
+            return ggml_view_4d(ctx0, kq_mask, n_kv, n_query, 1, n_stream,
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]); });
 
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
         // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
