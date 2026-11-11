@@ -9789,7 +9789,7 @@ static void ggml_backend_cuda_set_mmb_small_batch(ggml_backend_t backend, bool e
 }
 
 // Dispatch census of the HIP sparse-attention kernels (sparse-attn-census.h): one relaxed counter per compiled key, off
-// (one relaxed load per dispatch) until ggml_backend_debug_dispatch_census_reset or GGML_CUDA_DISPATCH_CENSUS_LOG=1.
+// (one relaxed load per dispatch) until ggml_backend_debug_dispatch_census_reset.
 #if defined(GGML_USE_HIP)
 static std::atomic<bool>     ggml_cuda_sa_census_on {false};
 static std::atomic<uint64_t> ggml_cuda_sa_census_counts[GGML_CUDA_SA_CENSUS_N];
@@ -9848,32 +9848,6 @@ static uint64_t ggml_backend_cuda_dispatch_census_count(const char * name) {
     return n;
 }
 
-static std::string ggml_cuda_sa_census_string(void) {
-    std::map<std::string, uint64_t> sorted;
-    for (int i = 0; i < GGML_CUDA_SA_CENSUS_N; ++i) {
-        const uint64_t c = ggml_cuda_sa_census_counts[i].load(std::memory_order_relaxed);
-        if (c > 0) {
-            sorted[ggml_cuda_sa_census_keys[i]] = c;
-        }
-    }
-    std::string out;
-    for (const auto & it : sorted) {
-        out += it.first + "=" + std::to_string(it.second) + ";";
-    }
-    return out;
-}
-
-// "KEY=count;..." for the non-zero keys in key order into buf (truncated to size, NUL-terminated); returns the full length
-static size_t ggml_backend_cuda_dispatch_census_get(char * buf, size_t size) {
-    const std::string out = ggml_cuda_sa_census_string();
-    if (buf != nullptr && size > 0) {
-        const size_t n = std::min(out.size(), size - 1);
-        memcpy(buf, out.data(), n);
-        buf[n] = '\0';
-    }
-    return out.size();
-}
-
 static const char * const * ggml_backend_cuda_dispatch_census_list(void) {
     return ggml_cuda_sa_census_keys;
 }
@@ -9894,19 +9868,6 @@ static const char * ggml_backend_cuda_dispatch_census_skip(ggml_backend_t backen
     return "not a HIP dispatch census key (ggml_backend_debug_dispatch_census_list)";
 }
 
-// GGML_CUDA_DISPATCH_CENSUS_LOG=1: count from backend registration and print the census to stderr at exit (plain stderr:
-// the application's log callback may already be gone)
-static void ggml_cuda_sa_census_print(void) {
-    fprintf(stderr, "ggml_cuda: dispatch census: %s\n", ggml_cuda_sa_census_string().c_str());
-}
-
-static void ggml_cuda_sa_census_log_init(void) {
-    const char * e = getenv("GGML_CUDA_DISPATCH_CENSUS_LOG");
-    if (e != nullptr && atoi(e) != 0) {
-        ggml_cuda_sa_census_on.store(true, std::memory_order_relaxed);
-        atexit(ggml_cuda_sa_census_print);
-    }
-}
 #else
 void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id) {
     GGML_UNUSED(id);
@@ -9917,12 +9878,6 @@ void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id) {
 static const char * ggml_backend_cuda_sparse_attn_unsupported_reason(ggml_backend_dev_t dev, const ggml_tensor * op) {
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
     return ggml_cuda_sparse_attn_unsupported_reason(device, op);
-}
-
-static size_t ggml_backend_cuda_sparse_attn_select_dump(ggml_backend_dev_t dev, int64_t n_q, int64_t n_kv, int64_t n_stream, int64_t n_sel,
-        enum ggml_type type_k, enum ggml_type type_v, int64_t n_head, int64_t n_head_kv, int32_t group, bool gated, char * buf, size_t size) {
-    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
-    return ggml_cuda_sparse_attn_select_dump(device, n_q, n_kv, n_stream, n_sel, type_k, type_v, n_head, n_head_kv, group, gated, buf, size);
 }
 
 // sparse-attention policies of the HIP backend (PLAN-v3 §5; ggml-backend.h ggml_backend_sparse_attn_group_t,
@@ -9980,17 +9935,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sparse_attn_unsupported_reason") == 0) {
         return (void *) (ggml_backend_sparse_attn_unsupported_reason_t) ggml_backend_cuda_sparse_attn_unsupported_reason;
     }
-    if (strcmp(name, "ggml_backend_sparse_attn_select_dump") == 0) {
-        return (void *) (ggml_backend_sparse_attn_select_dump_t) ggml_backend_cuda_sparse_attn_select_dump;
-    }
     if (strcmp(name, "ggml_backend_debug_dispatch_census_reset") == 0) {
         return (void *) ggml_backend_cuda_dispatch_census_reset;
     }
     if (strcmp(name, "ggml_backend_debug_dispatch_census_count") == 0) {
         return (void *) ggml_backend_cuda_dispatch_census_count;
-    }
-    if (strcmp(name, "ggml_backend_debug_dispatch_census_get") == 0) {
-        return (void *) ggml_backend_cuda_dispatch_census_get;
     }
     if (strcmp(name, "ggml_backend_debug_dispatch_census_list") == 0) {
         return (void *) ggml_backend_cuda_dispatch_census_list;
@@ -10081,9 +10030,6 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 /* .iface       = */ ggml_backend_cuda_reg_interface,
                 /* .context     = */ ctx
             };
-#if defined(GGML_USE_HIP)
-            ggml_cuda_sa_census_log_init();
-#endif // defined(GGML_USE_HIP)
         }
 
         initialized = true;

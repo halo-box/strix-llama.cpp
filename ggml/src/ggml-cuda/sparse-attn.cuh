@@ -34,9 +34,6 @@ const char * ggml_cuda_sparse_attn_census_skip(int device, const char * key);
 const char * ggml_cuda_sparse_attn_unsupported_reason(int device, const ggml_tensor * op);
 // the test switch GGML_CUDA_SA_FORCE holds `token` (sparse-attn-attend-g4.cu lists the tokens)
 bool ggml_cuda_sa_force_has(const char * token);
-// the census keys of one executed plan + attend of this shape, from sa_select (ggml_backend_sparse_attn_select_dump_t)
-size_t ggml_cuda_sparse_attn_select_dump(int device, int64_t n_q, int64_t n_kv, int64_t n_stream, int64_t n_sel, ggml_type type_k, ggml_type type_v,
-                                         int64_t n_head, int64_t n_head_kv, int32_t group, bool gated, char * buf, size_t size);
 // the workspace this node uses: [dst->data + *offset, + *bytes) (the fusion overlap check)
 void   ggml_cuda_sparse_attn_ws_range(int device, const ggml_tensor * op, size_t * offset, size_t * bytes);
 

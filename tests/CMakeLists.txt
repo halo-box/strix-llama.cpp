@@ -451,8 +451,6 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     endif()
     # the QSA placement guard (PLAN-v3 §10): needs a qwen4exp model on the command line (fake GPU device, forced reject, non-vacuity)
     llama_build(test-qsa-guard.cpp LINK llama ggml)
-    # census rows from the shipped policy, for scripts/qsa-validation/census_check.py (PLAN-v3 §14.3)
-    llama_build(test-qsa-select-dump.cpp LINK ggml)
     llama_build_and_test(test-backend-sched-ring.cpp)
 endif()
 

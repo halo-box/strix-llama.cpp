@@ -47,14 +47,12 @@
 // The procs are returned by ggml_backend_reg_get_proc_address of the HIP backend (ggml-cuda.cu):
 //   void                 ggml_backend_debug_dispatch_census_reset(void)          clear the counts and start counting
 //   uint64_t             ggml_backend_debug_dispatch_census_count(const char *)  exactly KEY plus every KEY/... below it
-//   size_t               ggml_backend_debug_dispatch_census_get(char *, size_t)  "KEY=count;..." (non-zero keys, key order)
 //   const char * const * ggml_backend_debug_dispatch_census_list(void)           every compiled key, NULL-terminated
 //   const char *         ggml_backend_debug_dispatch_census_skip(ggml_backend_t, const char * label)
 //                        NULL when label is a compiled key (or a prefix of one), else why HIP cannot emit it
 // Ids are recorded into HIP graphs as uint16_t (ggml_cuda_graph::census_ids).
 // Counts are launches: a dispatch counts when the host issues it, and with HIP graphs on the ids dispatched while a graph
 // is captured are recorded into the graph (ggml_cuda_graph::census_ids) and counted again at every replay (ggml-cuda.cu).
-// GGML_CUDA_DISPATCH_CENSUS_LOG=1 counts from backend registration and prints the census to stderr at exit.
 
 // groups G of the plan kernels (sa_plan_merge<G>); also the G range of the HIP group policy for get_alloc_size (§2.1)
 #define GGML_CUDA_SA_PLAN_GROUPS(X) \

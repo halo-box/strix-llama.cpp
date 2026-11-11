@@ -381,64 +381,6 @@ const char * ggml_cuda_sparse_attn_unsupported_reason(int device, const ggml_ten
     return sel.why;
 }
 
-// The keys sa_run launches for this shape, from the same sa_select: one plan, then the attend of the tier
-// (sparse-attn-census.h). The types and the G decide everything else, so the dummy tensors only carry shapes.
-size_t ggml_cuda_sparse_attn_select_dump(int device, int64_t n_q, int64_t n_kv, int64_t n_stream, int64_t n_sel, ggml_type type_k, ggml_type type_v,
-                                         int64_t n_head, int64_t n_head_kv, int32_t group, bool gated, char * buf, size_t size) {
-    ggml_init_params ip = { 32 * ggml_tensor_overhead(), nullptr, true };
-    ggml_context * ctx = ggml_init(ip);
-    const int64_t n_kv_rows = 4 * ((n_kv + 3) / 4);
-    ggml_tensor * sel_t = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_sel, n_q, 1, n_stream);
-    ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_q, n_head, n_stream);
-    ggml_tensor * k     = ggml_new_tensor_4d(ctx, type_k, 256, n_kv_rows, n_head_kv, n_stream);
-    ggml_tensor * v     = ggml_new_tensor_4d(ctx, type_v, 256, n_kv_rows, n_head_kv, n_stream);
-    ggml_tensor * plan  = ggml_sparse_attn_plan(ctx, sel_t, n_kv, group);
-    ggml_tensor * op    = ggml_sparse_attn(ctx, q, k, v, plan, 1.0f, 0, 0);
-    const sa_selection s = sa_select(op, device);
-    ggml_free(ctx);
-
-    static const char * const tn[SA_T_COUNT] = { "f16", "bf16", "q8_0", "q4_0" };
-    std::string out = std::string("sa_plan/G") + std::to_string(group);
-    if (s.ok) {
-        const std::string gqa = "gqa" + std::to_string(n_head / n_head_kv);
-        if (s.tier == SA_TIER_PORTABLE) {
-            out += std::string(" sa_portable/G") + std::to_string(s.G);
-        } else if (s.G == 1) {
-            const int64_t sp = s.splits;
-            const char * cls = sp <= 1 ? "1" : sp <= 5 ? "2-5" : sp <= 16 ? "6-16" : sp <= 33 ? "17-33" : "34+";
-            if (s.tier == SA_TIER_GENERIC) {
-                out += std::string(" sa_generic/G1/splits") + cls + "/" + gqa;
-            } else {
-                out += " sa_attend/G1/" + std::string(tn[s.kt]) + "/" + tn[s.vt] + "/splits" + cls + "/" + gqa;
-            }
-            if (sp > 1) {
-                out += " sa_merge";
-            }
-        } else {
-            const char * vl = s.vl == SA_V_PACKED ? "packed" : "direct";
-            if (s.tier == SA_TIER_GENERIC) {
-                out += std::string(" sa_generic/G4/") + vl + "/" + gqa + " sa_generic/fixup";
-                if (s.vl == SA_V_PACKED) {
-                    out += " sa_generic/pack";
-                }
-            } else {
-                const char * epi = gated ? "gated" : "plain";
-                out += " sa_attend/G4/" + std::string(tn[s.kt]) + "/" + tn[s.vt] + "/" + vl + "/" + epi + "/" + gqa;
-                out += " sa_fixup/G4/" + std::string(tn[s.kt]) + "/" + tn[s.vt] + "/" + epi;
-                if (s.vl == SA_V_PACKED) {
-                    out += std::string(" sa_pack/") + tn[s.vt];
-                }
-            }
-        }
-    }
-    if (buf != nullptr && size > 0) {
-        const size_t n = std::min(out.size(), size - 1);
-        memcpy(buf, out.data(), n);
-        buf[n] = '\0';
-    }
-    return out.size();
-}
-
 const char * ggml_cuda_sparse_attn_census_skip(const int device, const char * key) {
     const std::string k(key);
     auto under = [&](const char * prefix) { return k.rfind(prefix, 0) == 0; };
@@ -715,16 +657,6 @@ const char * ggml_cuda_sparse_attn_unsupported_reason(int device, const ggml_ten
     GGML_UNUSED(device);
     GGML_UNUSED(op);
     return "no sparse-attention kernel in this backend";
-}
-
-size_t ggml_cuda_sparse_attn_select_dump(int device, int64_t n_q, int64_t n_kv, int64_t n_stream, int64_t n_sel, ggml_type type_k, ggml_type type_v,
-                                         int64_t n_head, int64_t n_head_kv, int32_t group, bool gated, char * buf, size_t size) {
-    GGML_UNUSED(device); GGML_UNUSED(n_q); GGML_UNUSED(n_kv); GGML_UNUSED(n_stream); GGML_UNUSED(n_sel); GGML_UNUSED(type_k); GGML_UNUSED(type_v);
-    GGML_UNUSED(n_head); GGML_UNUSED(n_head_kv); GGML_UNUSED(group); GGML_UNUSED(gated);
-    if (buf != nullptr && size > 0) {
-        buf[0] = '\0';
-    }
-    return 0;
 }
 
 bool ggml_cuda_sparse_attn_gate_ok(int device, const ggml_tensor * op) {
