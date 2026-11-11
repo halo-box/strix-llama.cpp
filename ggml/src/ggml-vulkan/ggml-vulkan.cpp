@@ -8027,8 +8027,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     if (pipeline_pre_dq8 != nullptr) {
-        // 16-byte B loads need 8-element columns and a 16-byte aligned B binding, A and D are read / written as dwords
-        if (stride_b % 8 != 0 || y_buf_offset % 16 != 0 || x_buf_offset % 4 != 0 || d_buf_offset % 4 != 0) {
+        // B is read as 16-byte vectors relative to its binding, which starts at the tensor itself: the columns need 8-element strides,
+        // the binding offset only the device's storage-buffer alignment (an f16 activation may start 8 bytes past 16, which used to
+        // send the GEMM back to its pre-dq8 tile); A and D are read / written as dwords
+        if (stride_b % 8 != 0 || y_buf_offset % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0 ||
+            x_buf_offset % 4 != 0 || d_buf_offset % 4 != 0) {
             pipeline = pipeline_pre_dq8;   // split_k stays 1 (valid for every pipeline)
         } else {
             ggml_vk_path_census_add("MUL_MAT_DENSE_DQ8");
@@ -18654,6 +18657,10 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     // dispatch paths (not fusions): GGML_VK_DISABLE_FUSION does not turn them off
     if (l == "path:QSA_RADIX_SELECT" || l == "path:QSA_PREFILL_SELECT") {
         return dev->pipeline_topk_radix_lds ? nullptr : "no LDS radix select pipeline (subgroup arithmetic, ballot, vote, full subgroups, 50 KiB shared memory)";
+    }
+    // a GEMM path, not a fusion: GGML_VK_DISABLE_FUSION leaves it on
+    if (l == "MUL_MAT_DENSE_DQ8" && (!dev->pipeline_matmul_dq8[0][0] || !dev->pipeline_matmul_dq8[0][1])) {
+        return "no dense q8_0 x f16 GEMM pipeline (needs coopmat with an f32 accumulator, fp16 and 32-lane subgroups)";
     }
     if (dev->disable_fusion) {
         return "fusion disabled (GGML_VK_DISABLE_FUSION)";
