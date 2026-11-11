@@ -13897,6 +13897,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 112, codebook, {1, 1}));
         test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 112, codebook, {33, 1}));
     }
+    test_cases.emplace_back(new test_exl3_mul_mat(2560, 9216, 112, 1, {33, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(9216, 2560, 112, 1, {33, 1}));
     test_cases.emplace_back(new test_exl3_mul_mat(384, 256, 64, 1, {512, 1}));
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}));
     test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {5, 3}, true));
