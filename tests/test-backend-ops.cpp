@@ -14181,7 +14181,7 @@ struct test_sparse_attn_plan : public test_case {
 // (G, split count, n_sel bucket). Returns a negative value for a class without a row.
 // G4: 2 x p100 of the PR-verbatim qsa3_attn_kernel (V0 and VD, bitwise equal) against O_CON over the R2-BOP inputs
 // (PR cell formula rows: 2.04e-9 / 1.21e-9) and over the W3 case list's own inputs (2 x 40 dumps of the f16 / q8_0
-// GQA-12 cases from two test-backend-ops runs, GGML_SA_TEST_DUMP, run through R2-BOP's bands_attn TBO mode; W3 summary
+// GQA-12 cases from two test-backend-ops runs, run through R2-BOP's bands_attn TBO mode; W3 summary
 // scripts/qsa-validation/summaries/w3_prband.md): the mix / empty / poison rows of n_sel <= 257 reach p100 3.899e-9
 // (66 x 257 poison q8_0), the n_sel 2051 rows 1.206e-9 (129 x 2051 blocks q8_0). The PR rows alone set the old 1.21e-9,
 // which the PR kernel itself exceeds on the other row patterns (R2-BOP measured G4 on PR rows only).
@@ -14225,7 +14225,7 @@ static double sa_band_row(int G, int splits, int64_t n_sel) {
 //   sa_portable/G<g>               the row of the PR kernel that computes the same plan G in one pass per query: G4 for a
 //                                  G = 4 plan, "G1, 1 split" for a G = 1 plan (the portable tier never splits)
 // The O_CON anchor: the CPU op is the reference of every case (bitwise equal to bands_ref.h O_CON, W1) and its contract
-// error against f64 is the W1 bound; the GPU-vs-f64 errors are reported (GGML_SA_TEST_REPORT), not gated.
+// error against f64 is the W1 bound.
 // §14.2 (c) type spread: a K/V pair without its own row takes the row of its class times the measured spread (R1-A (1):
 // x1.12 at prefill (G4) and at decode n_q 512, x1.9 at decode n_q 1; the rows were measured on f16 and q8_0 pairs, which
 // differ by <= x1.06, R2-BOP)
@@ -14344,79 +14344,6 @@ struct test_sparse_attn : public test_case {
         return { "sa_attend/", "sa_fixup/", "sa_pack/", "sa_merge", "sa_generic/", "sa_portable/" };
     }
 
-    // GGML_SA_TEST_REPORT=1: one SA_REPORT line per compared output (backend, case, census class, band, NMSE, and the f64
-    // errors of PLAN-v3 §3: max|out - ref| / max|ref| against O_C18 and O_PLAN on up to 16 queries per stream, reported only)
-    double last_nmse = -1.0, last_f64_c18 = -1.0, last_f64_plan = -1.0;
-    static bool report_on() {
-        static const bool on = getenv("GGML_SA_TEST_REPORT") != nullptr && atoi(getenv("GGML_SA_TEST_REPORT")) != 0;
-        return on;
-    }
-    void report_f64(const float * got) {
-        last_f64_c18 = last_f64_plan = -1.0;
-        if (!report_on()) {
-            return;
-        }
-        std::vector<int64_t> qs;
-        const int64_t nq_s = std::min<int64_t>(16, n_q);
-        for (int64_t j = 0; j < nq_s; ++j) {
-            qs.push_back(nq_s > 1 ? j * (n_q - 1) / (nq_s - 1) : 0);
-        }
-        const sa_ref::view qv = sa_host_view(q), kv = sa_host_view(k), vv = sa_host_view(v);
-        const std::vector<int32_t> rows = sa_read_rows(sel);
-        last_f64_c18  = sa_ref::f64_maxrel(qv, kv, vv, rows, n_sel, n_kv, scale, rot_q, rot_o, qs, got, sa_ref::O_C18);
-        last_f64_plan = sa_ref::f64_maxrel(qv, kv, vv, rows, n_sel, n_kv, scale, rot_q, rot_o, qs, got, sa_ref::O_PLAN);
-    }
-    virtual const char * report_tag() { return "SPARSE_ATTN"; }
-
-    // GGML_SA_TEST_DUMP=<dir>: the case's inputs and both outputs in the R2-BOP "TBO" dump format (bands_ref.h
-    // next_tbo: header {n_q, n_kv, n_sel, 12, 0, 0, type_k, type_v}, Q [n_q][24][256] f32, K / V [n_kv][2][row bytes],
-    // rows [n_q][n_sel] i32, out backend1, out CPU), so the PR-verbatim G4 kernel can be run on exactly these inputs
-    // (bands_attn TBO:<file>). Written for the shapes that format holds: GQA 12, 2 kv heads, 1 stream, f16 / q8_0 K and
-    // V, n_kv % 4 == 0. The rows are written canonical (valid cells ascending and unique, then -1): the plan of a row is
-    // a function of its cell set, and the PR union builder needs no duplicate handling on them.
-    void dump_tbo(const float * a, const float * b, size_t n) {
-        const char * dir = getenv("GGML_SA_TEST_DUMP");
-        const bool fmt = (type_k == GGML_TYPE_F16 || type_k == GGML_TYPE_Q8_0) && (type_v == GGML_TYPE_F16 || type_v == GGML_TYPE_Q8_0);
-        // GGML_SA_TEST_DUMP_MAX_KV (default 65536): larger caches are not dumped (a 2^21-cell f16 dump is 4 GiB)
-        const int64_t max_kv = getenv("GGML_SA_TEST_DUMP_MAX_KV") ? atoll(getenv("GGML_SA_TEST_DUMP_MAX_KV")) : 65536;
-        if (dir == nullptr || gqa != 12 || n_head_kv != 2 || n_stream != 1 || D != 256 || n_kv % 4 != 0 || !fmt ||
-            n != (size_t) (n_q * 24 * 256) || n_kv > max_kv) {
-            return;
-        }
-        static int seq = 0;
-        char fn[1024];
-        snprintf(fn, sizeof(fn), "%s/sa_%04d.bdmp", dir, seq++);
-        FILE * f = fopen(fn, "wb");
-        GGML_ASSERT(f);
-        const int32_t h[8] = { (int32_t) n_q, (int32_t) n_kv, (int32_t) n_sel, 12, 0, 0, (int32_t) type_k, (int32_t) type_v };
-        fwrite(h, 4, 8, f);
-        const sa_ref::view qv = sa_host_view(q), kv = sa_host_view(k), vv = sa_host_view(v);
-        for (int64_t i = 0; i < n_q; ++i) {
-            for (int64_t hh = 0; hh < 24; ++hh) {
-                fwrite(qv.row(i, hh, 0), 4, 256, f);
-            }
-        }
-        for (const sa_ref::view * t : { &kv, &vv }) {
-            const size_t rb = ggml_row_size(t->type, 256);
-            for (int64_t c = 0; c < n_kv; ++c) {
-                for (int64_t g = 0; g < 2; ++g) {
-                    fwrite(t->row(c, g, 0), 1, rb, f);
-                }
-            }
-        }
-        const std::vector<int32_t> rows = sa_read_rows(sel);
-        std::vector<int32_t> canon((size_t) (n_q * n_sel), -1), cells;
-        for (int64_t i = 0; i < n_q; ++i) {
-            sa_ref::row_cells(rows.data() + (size_t) (i * n_sel), n_sel, n_kv, cells);
-            std::copy(cells.begin(), cells.end(), canon.begin() + (size_t) (i * n_sel));
-        }
-        fwrite(canon.data(), 4, canon.size(), f);
-        fwrite(a, 4, n, f);
-        fwrite(b, 4, n, f);
-        fclose(f);
-        fprintf(stderr, "SA_DUMP %s %s\n", fn, vars().c_str());
-    }
-
     double max_nmse_err() override { return 0.0; }
     double max_err(ggml_backend_t backend) override {
         if (sa_is_cpu(backend)) {
@@ -14428,11 +14355,6 @@ struct test_sparse_attn : public test_case {
                               band_class.find("sa_portable/G4") != std::string::npos ? 4 : 1;
                 band *= sa_type_spread(type_k, type_v, G, n_q);
             }
-        }
-        if (report_on()) {
-            printf("SA_REPORT backend=%s case=%s(%s) class=%s band=%.3e nmse=%.3e ratio=%.3f f64_c18=%.3e f64_plan=%.3e\n",
-                   ggml_backend_name(backend), report_tag(), vars().c_str(), band_class.c_str(), band, last_nmse,
-                   band > 0 ? last_nmse / band : -1.0, last_f64_c18, last_f64_plan);
         }
         return band;
     }
@@ -14485,14 +14407,11 @@ struct test_sparse_attn : public test_case {
     }
 
     double err(const float * a, const float * b, size_t n) override {
-        dump_tbo(a, b, n);
-        report_f64(a);
         if (special != SA_OVERFLOW) {
             double e = nmse(a, b, n);
             if (std::isnan(e)) {   // an all-zero reference (empty rows): only an identical result passes
                 e = memcmp(a, b, n * sizeof(float)) == 0 ? 0.0 : 1.0;
             }
-            last_nmse = e;
             return e;
         }
         // overflow: the set of inf positions must be the expected one (from the single selected V row), and the NMSE
@@ -14530,8 +14449,7 @@ struct test_sparse_attn : public test_case {
         if (n_inf == 0) {
             return 1.0;   // the case must produce infinities
         }
-        last_nmse = saa > 0 ? sab / saa : sab;
-        return last_nmse;
+        return saa > 0 ? sab / saa : sab;
     }
 
     ggml_tensor * new_kv(ggml_context * ctx, ggml_type type, ggml_tensor ** storage) {
@@ -15011,7 +14929,6 @@ struct test_sparse_attn_gated : public test_sparse_attn {
     std::string vars() override {
         return test_sparse_attn::vars() + ",gated=" + sa_gate_name(variant);
     }
-    const char * report_tag() override { return "SPARSE_ATTN_GATED"; }
     bool use_scheduler_allocation() override {
         return variant == SA_GATE_BF16_ONLY || variant == SA_GATE_F16_ONLY || variant == SA_GATE_REJECT;
     }
@@ -15090,19 +15007,12 @@ struct test_sparse_attn_gated : public test_sparse_attn {
 
     double err(const float * a, const float * b, size_t n) override {
         if (mm == nullptr || (int64_t) n != mm_elems) {
-            // the gated output: NMSE against the CPU graph (sigmoid(gate) * attend), the band of the attend's class. No
-            // f64 report: the f64 oracles are of the attend output (and in SA_GATE_REJECT q's memory is reused)
-            const double e = nmse(a, b, n);
-            last_nmse = e;
-            last_f64_c18 = last_f64_plan = -1.0;
-            return e;
+            // the gated output: NMSE against the CPU graph (sigmoid(gate) * attend), the band of the attend's class
+            return nmse(a, b, n);
         }
         if (mm != nullptr && (int64_t) n == mm_elems) {
             // the GEMM output reads the 16-bit copy: its error is the activation rounding, not the attend band
             const double e = nmse(a, b, n);
-            if (report_on()) {
-                printf("SA_REPORT case=SPARSE_ATTN_GATED(%s) wo_gemm nmse=%.3e tol=5e-4\n", vars().c_str(), e);
-            }
             return e <= 5e-4 ? 0.0 : 1.0;
         }
         GGML_ABORT("unreachable");
@@ -15154,7 +15064,6 @@ struct test_sparse_attn_gqa_rep : public test_sparse_attn {
         : test_sparse_attn(type_k, type_v, n_q, n_kv, n_sel, group, SA_ROWS_MIX, gqa, n_stream) {}
 
     std::string vars() override { return test_sparse_attn::vars() + ",rep12"; }
-    const char * report_tag() override { return "SPARSE_ATTN_GQAREP"; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out, out12 }; }
     int n_determinism_runs() override { return 2; }
 
@@ -15214,8 +15123,6 @@ struct test_sparse_attn_gqa_rep : public test_sparse_attn {
         if (std::isnan(e)) {
             e = memcmp(a, b, n * sizeof(float)) == 0 ? 0.0 : 1.0;
         }
-        last_nmse = e;
-        last_f64_c18 = last_f64_plan = -1.0;
         return e;
     }
 
