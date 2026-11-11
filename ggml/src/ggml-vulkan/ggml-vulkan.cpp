@@ -10687,9 +10687,8 @@ static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& s
 // node starts with an unconditional ggml_vk_sync_buffers, and the passes inside a node have their own.
 //
 // GGML_VK_SA_FORCE, comma-separated, a test switch: scalar | portable | portable_sg32 (required subgroup size 32) | vdirect |
-// vstaged | vpack | rot_dump (the test hook of test-sparse-attn-vk: the kernel writes H_q q to dst and stops).
-// GGML_VK_SA_CAP_MASK, a test switch: behave as a device without these pipelines (1 cm, 2 scalar, 4 portable, 8 plan).
-// GGML_VK_SA_MAX_Q, a test switch: most queries per dispatch (the host loop for maxComputeWorkGroupCount[0]).
+// vstaged | vpack | rot_dump (the kernel writes H_q q to dst and stops) | no_cm | no_scalar | no_portable | no_plan (behave as
+// a device without that pipeline) | max_q=N (most queries per dispatch, the host loop for maxComputeWorkGroupCount[0]).
 // ---------------------------------------------------------------------------------------------------------------------
 
 struct vk_sa_force_t {
@@ -10732,16 +10731,14 @@ static vk_sa_force_t ggml_vk_sa_force() {
                     f.vl = VK_SA_VL_PACK;
                 } else if (tok == "rot_dump") {
                     f.rot_dump = true;
+                } else if (tok == "no_cm" || tok == "no_scalar" || tok == "no_portable" || tok == "no_plan") {
+                    f.cap_mask |= tok == "no_cm" ? 1u : tok == "no_scalar" ? 2u : tok == "no_portable" ? 4u : 8u;
+                } else if (tok.rfind("max_q=", 0) == 0) {
+                    f.max_q = (uint32_t) atoi(tok.c_str() + 6);
                 } else if (!tok.empty()) {
                     GGML_ABORT("GGML_VK_SA_FORCE: unknown value '%s'", tok.c_str());
                 }
             }
-        }
-        if (const char * e = getenv("GGML_VK_SA_CAP_MASK")) {
-            f.cap_mask = (uint32_t) atoi(e);
-        }
-        if (const char * e = getenv("GGML_VK_SA_MAX_Q")) {
-            f.max_q = (uint32_t) atoi(e);
         }
         vk_sa_force_value = f;
         vk_sa_force_loaded.store(true, std::memory_order_release);

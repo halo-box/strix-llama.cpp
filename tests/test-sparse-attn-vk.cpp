@@ -2,7 +2,7 @@
 //
 //   limits      per tensor, round_up(nbytes) + workspace < the buffer type's maximum and each binding <= the device's binding
 //               limit, at the reserve of -c 1048576 (n_kv 2^20), ub 512 / 4096 / 8192, 12 x 2051 keys;
-//   capability  supports_op is false, before any dispatch, when the pipeline does not exist (GGML_VK_SA_CAP_MASK), and the tier order
+//   capability  supports_op is false, before any dispatch, when the pipeline does not exist (GGML_VK_SA_FORCE=no_<tier>), and the tier order
 //               follows what is left; a forced tier the device cannot create is unsupported, not a null-pipeline dispatch;
 //   rot         H_q in every kernel (the rot_dump hook) and H_o bitwise equal to fwht.comp (a GGML_HINT_SRC0_IS_HADAMARD mul_mat on
 //               the same backend) on the same input, rot 64 / 128 / 256, for every tier the device has;
@@ -52,9 +52,10 @@ static int g_fail = 0;
 
 #define CHECK(cond, ...) do { if (!(cond)) { printf("  FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); ++g_fail; } } while (0)
 
-static void set_force(const char * force, const char * mask = nullptr) {
-    if (force) { setenv("GGML_VK_SA_FORCE", force, 1); } else { unsetenv("GGML_VK_SA_FORCE"); }
-    if (mask)  { setenv("GGML_VK_SA_CAP_MASK", mask, 1); } else { unsetenv("GGML_VK_SA_CAP_MASK"); }
+// GGML_VK_SA_FORCE = force, then the pipelines to behave as missing (no_cm, no_scalar, no_portable, no_plan)
+static void set_force(const char * force, const char * missing = nullptr) {
+    const std::string f = std::string(force ? force : "") + (force && missing ? "," : "") + (missing ? missing : "");
+    if (!f.empty()) { setenv("GGML_VK_SA_FORCE", f.c_str(), 1); } else { unsetenv("GGML_VK_SA_FORCE"); }
     auto reload = (void (*)(void)) ggml_backend_reg_get_proc_address(g_reg, "ggml_backend_debug_env_reload");
     GGML_ASSERT(reload);
     reload();
@@ -196,26 +197,26 @@ static void test_capability() {
     printf("  default: plan %d attend %d\n", sup_plan, sup_attn);
     CHECK(sup_plan && sup_attn, "the device must run the default tiers");
 
-    set_force(nullptr, "15");
+    set_force(nullptr, "no_cm,no_scalar,no_portable,no_plan");
     CHECK(!ggml_backend_dev_supports_op(g_dev, g.plan), "plan supported with no plan pipeline");
     CHECK(!ggml_backend_dev_supports_op(g_dev, g.out), "attend supported with no pipeline at all");
-    printf("  mask 15 (no pipeline): plan %d attend %d\n", ggml_backend_dev_supports_op(g_dev, g.plan), ggml_backend_dev_supports_op(g_dev, g.out));
+    printf("  no pipeline: plan %d attend %d\n", ggml_backend_dev_supports_op(g_dev, g.plan), ggml_backend_dev_supports_op(g_dev, g.out));
 
-    set_force(nullptr, "8");
+    set_force(nullptr, "no_plan");
     CHECK(!ggml_backend_dev_supports_op(g_dev, g.plan), "plan supported with no plan pipeline");
     CHECK(!ggml_backend_dev_supports_op(g_dev, g.out), "attend supported with no plan pipeline");
 
-    set_force(nullptr, "7");
+    set_force(nullptr, "no_cm,no_scalar,no_portable");
     CHECK(ggml_backend_dev_supports_op(g_dev, g.plan), "the plan has its own gate");
     CHECK(!ggml_backend_dev_supports_op(g_dev, g.out), "attend supported with no attend pipeline");
 
-    set_force(nullptr, "3");
+    set_force(nullptr, "no_cm,no_scalar");
     CHECK(ggml_backend_dev_supports_op(g_dev, g.out), "the portable tier is left");
 
     // a forced tier whose pipeline is masked away
-    set_force("portable", "4");
+    set_force("portable", "no_portable");
     CHECK(!ggml_backend_dev_supports_op(g_dev, g.out), "forced portable with no portable pipeline");
-    set_force("scalar", "2");
+    set_force("scalar", "no_scalar");
     CHECK(!ggml_backend_dev_supports_op(g_dev, g.out), "forced scalar with no scalar pipeline");
 
     // shapes no tier takes
