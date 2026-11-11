@@ -4431,7 +4431,7 @@ struct test_mul_mat_router : public test_case {
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
         // GGML_VK_TEST_REQUIRE_ROUTER_F16H=1 asserts the f32-A dq8 GEMM took every eligible shape and no other
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_ROUTER_F16H")) {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_ROUTER_F16H", "MUL_MAT_ROUTER_F16H")) {
             return true;
         }
         const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_ROUTER_F16H");

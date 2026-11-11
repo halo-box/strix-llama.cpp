@@ -18612,6 +18612,10 @@ static size_t ggml_backend_vk_dispatch_census_get(char * buf, size_t size) {
 static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend, const char * label) {
     const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
     const vk_device & dev = ctx->device;
+    // a GEMM path, not a fusion: GGML_VK_DISABLE_FUSION leaves it on
+    if (strcmp(label, "MUL_MAT_ROUTER_F16H") == 0 && !dev->pipeline_matmul_dq8_f32) {
+        return "no f32 x f16-B dq8 GEMM pipeline (needs coopmat with an f32 accumulator, fp16 and 32-lane subgroups)";
+    }
     const std::string l = label;
     if (dev->disable_fusion) {
         return "fusion disabled (GGML_VK_DISABLE_FUSION)";
