@@ -4383,7 +4383,7 @@ struct test_mul_mat_f16b : public test_case {
             }
         }
         // GGML_VK_TEST_REQUIRE_DQ8=1 asserts the dense q8_0 x f16 GEMM (mul_mm_dq8) took every eligible shape
-        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_DQ8")) {
+        if (engagement_required(backend, "GGML_VK_TEST_REQUIRE_DQ8", "MUL_MAT_DENSE_DQ8")) {
             const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_DENSE_DQ8");
             // the shape rule of ggml-vulkan.cpp, 3/4 of a workgroup per CU taken for 40 CUs
             const bool fewrow = m <= 384 && k >= 4096 && n >= 1024;

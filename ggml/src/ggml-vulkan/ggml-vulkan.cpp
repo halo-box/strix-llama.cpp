@@ -18585,6 +18585,10 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
     const vk_device & dev = ctx->device;
     const std::string l = label;
+    // a GEMM path, not a fusion: GGML_VK_DISABLE_FUSION leaves it on
+    if (l == "MUL_MAT_DENSE_DQ8" && (!dev->pipeline_matmul_dq8[0][0] || !dev->pipeline_matmul_dq8[0][1])) {
+        return "no dense q8_0 x f16 GEMM pipeline (needs coopmat with an f32 accumulator, fp16 and 32-lane subgroups)";
+    }
     if (dev->disable_fusion) {
         return "fusion disabled (GGML_VK_DISABLE_FUSION)";
     }
