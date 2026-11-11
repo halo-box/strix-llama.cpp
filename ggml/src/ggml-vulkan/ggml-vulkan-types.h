@@ -1066,6 +1066,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_sel_f16[3];    // maskless selected-key FA, GQA 4, 8, 12 (scalar, portable)
     vk_pipeline pipeline_flash_attn_sel_cm_f16[3]; // the same on RDNA3 + RADV (WMMA, gfx11 fragment layout)
     vk_pipeline pipeline_flash_attn_sel_prep;      // cleans the selection rows for both
+    vk_pipeline pipeline_flash_attn_sel_gather[GGML_TYPE_COUNT]; // quantized K/V, few queries: selected cells -> compact f16 rows
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
