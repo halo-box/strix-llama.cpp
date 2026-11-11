@@ -850,7 +850,13 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
                 if ((cells.seq_get_all((uint32_t) j) & tail_seqs).none()) { continue; }
                 const int64_t idx=ranked ? rank[j] : cells.pos_get(j);
                 const int64_t slot=g*r+idx%r;
-                GGML_ASSERT(group_members[slot]<0 || group_members[slot]==j);
+                // Unranked (several sequences in the stream), an image's cells repeat one position, so two cells of
+                // this ubatch's sequence can land in one slot. Only the query's tail block is read below: mark the
+                // slot ambiguous (-2) instead of aborting here.
+                if (group_members[slot]==-2 || (group_members[slot]>=0 && group_members[slot]!=j)) {
+                    group_members[slot]=-2;
+                    continue;
+                }
                 group_members[slot]=(int32_t)j;
             }
         }
@@ -928,6 +934,16 @@ void llama_memory_hybrid_idx::set_input_qsa_scan(
                         if (!cells.seq_has((uint32_t)grp_first[g],seq_id)) { continue; }
                         for (int64_t slot=0;slot<q+1-tail_start;++slot) {
                             const int32_t cell=group_members[g*r+slot];
+                            if (cell==-2) {
+                                // an image ends inside the query's tail block, unranked: its cells cannot be told
+                                // apart by slot, so this one is left out of the tail (rare; never seen in tests)
+                                static bool warned = false;
+                                if (!warned) {
+                                    warned = true;
+                                    LLAMA_LOG_WARN("%s: QSA tail slot shared by image cells of one sequence; one cell left out\n", __func__);
+                                }
+                                continue;
+                            }
                             if (cell<0 || !cells.seq_has((uint32_t)cell,seq_id)) { continue; }
                             GGML_ASSERT(tail[slot]<0 || tail[slot]==cell);
                             tail[slot]=cell;
@@ -1156,6 +1172,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_st
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
     llama_memory_hybrid_context(mem),
     mem(mem),
+    reserve(true),
     // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
     // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
     ns_ubatch(mem->get_mem_idx() == nullptr ?
@@ -1687,7 +1704,14 @@ bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & u
     if (qsa_prefix_matches(ubatch) && mem->qsa_prefix_identity()) { return true; }
     if (!qsa_scalar_visibility(ubatch, ratio)) { return false; }
     const llama_seq_id seq=ubatch.seq_id[0][0];
-    return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),get_idx()->get_n_kv(),seq);
+    return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),qsa_n_cells_seen(),seq);
+}
+
+uint32_t llama_memory_hybrid_idx_context::qsa_n_cells_seen() const {
+    // graph reservation sizes the buffers for the route of an empty cache, as at load. With the live cells, a resident
+    // image conversation next to another sequence turns the reserved worst case ([n_kv, n_ubatch] at the full cache)
+    // into the masked route, and its buffers stay allocated: +12.5 GiB with -c 524288 -ub 2048 after a restore
+    return reserve ? 0 : get_idx()->get_n_kv();
 }
 
 uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
@@ -1718,14 +1742,14 @@ bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch &
         for (uint32_t s = 0; s < ns; ++s) {
             const uint32_t i0 = s*n_tps;
             if (ubatch.n_seq_id[i0]<1 || !ubatch.seq_id[i0]) { return false; }
-            if (!qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[i0][0]), get_idx()->get_n_kv(), ratio, ubatch)) {
+            if (!qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[i0][0]), qsa_n_cells_seen(), ratio, ubatch)) {
                 return false;
             }
         }
         return true;
     }
     // one stream: every seq id of the ubatch reads the same cells
-    return qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[0][0]), get_idx()->get_n_kv(), ratio, ubatch);
+    return qsa_scalar_visibility_cells(mem->get_mem_idx()->get_cells(ubatch.seq_id[0][0]), qsa_n_cells_seen(), ratio, ubatch);
 }
 
 void llama_memory_hybrid_idx::qsa_invalidate() {

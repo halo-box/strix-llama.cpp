@@ -980,6 +980,10 @@ void process_shaders() {
     string_to_spv("mul_mm_id_glu_q5_k_f32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}});
     string_to_spv("mul_mm_id_glu_q5_k_f16_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"OUT_F32", "1"}});
     string_to_spv("mul_mm_id_glu_q5_k_f32_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}, {"OUT_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_iq3_s_f16", "mul_mm_id_glu.comp", {{"A_IQ3_S", "1"}});
+    string_to_spv("mul_mm_id_glu_iq3_s_f32", "mul_mm_id_glu.comp", {{"A_IQ3_S", "1"}, {"B_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_iq3_s_f16_o32", "mul_mm_id_glu.comp", {{"A_IQ3_S", "1"}, {"OUT_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_iq3_s_f32_o32", "mul_mm_id_glu.comp", {{"A_IQ3_S", "1"}, {"B_F32", "1"}, {"OUT_F32", "1"}});
     // streaming q5_1 MUL_MAT_ID(+MUL)+CPY(f16) down, register-direct weights (RDNA3 fragment layout, wave32)
     string_to_spv("mul_mm_id_down_q5_1_f16", "mul_mm_id_down.comp", {});
     string_to_spv("mul_mm_id_down_q5_1_f32", "mul_mm_id_down.comp", {{"B_F32", "1"}});
@@ -1279,6 +1283,7 @@ void process_shaders() {
     string_to_spv("topk_nary_search_f32", "topk_nary_search.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_radix_select_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}});
     string_to_spv("qsa_expand", "qsa_expand.comp", {});
+    string_to_spv("topk_radix_lds_f32", "topk_radix_lds.comp", {});
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1392,6 +1397,8 @@ void process_shaders() {
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp), f32 and f16 output
     string_to_spv("matmul_dq8_q8_0_f16", "mul_mm_dq8.comp", {}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_d16", "mul_mm_dq8.comp", {{"D_F16", "1"}}, true, true, false);
+    // the same GEMM with an f32 A rounded to f16 on the LDS store (the qwen4exp MoE router)
+    string_to_spv("matmul_dq8_f32_f16", "mul_mm_dq8.comp", {{"A_F32", "1"}}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_hcmix", "mul_mm_dq8.comp", {{"HC_EPI", "1"}}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_hcmix_d16", "mul_mm_dq8.comp", {{"HC_EPI", "1"}, {"D_F16", "1"}}, true, true, false);
 #endif
