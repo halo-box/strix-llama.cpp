@@ -1782,10 +1782,6 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         }
     }
 
-    if (tensor->op >= (uint32_t) GGML_OP_COUNT) {
-        LOG_ERROR("[%s] invalid tensor op received: %u\n", __func__, tensor->op);
-        return nullptr;
-    }
     result->op = (ggml_op) tensor->op;
     for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
         result->op_params[i] = tensor->op_params[i];
