@@ -4416,6 +4416,44 @@ struct test_mul_mat_f16b : public test_case {
     }
 };
 
+// f32 weight x f16 activations, the qwen4exp MoE router logits [k -> m] at prefill (the f16 FFN input); an f32 B stays off the
+// f32-A dq8 GEMM (the Vulkan backend runs it as f32 x f32)
+struct test_mul_mat_router : public test_case {
+    const int m, n, k;
+    const ggml_type type_b;
+    const int boff;   // B starts boff elements into its allocation (the model's f16 activations may sit 8 bytes off 16)
+    test_mul_mat_router(int m, int n, int k, ggml_type type_b = GGML_TYPE_F16, int boff = 0) : m(m), n(n), k(k), type_b(type_b), boff(boff) {}
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ROUTER"; }
+    std::string vars() override { return VARS_TO_STR4(m, n, k, type_b) + (boff ? "," + VAR_TO_STR(boff) : std::string()); }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor *) override { return 2ull * m * n * k; }
+
+    bool checks_engagement() override { return true; }
+    bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
+        // GGML_VK_TEST_REQUIRE_ROUTER_F16H=1 asserts the f32-A dq8 GEMM took every eligible shape and no other
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_ROUTER_F16H", "MUL_MAT_ROUTER_F16H")) {
+            return true;
+        }
+        const int64_t c = dispatch_census_count(backend, "path:MUL_MAT_ROUTER_F16H");
+        // the shape rule in ggml-vulkan.cpp (ggml_vk_router_f16h_rule)
+        const bool want = type_b == GGML_TYPE_F16 && k % 64 == 0 && m >= 128 && n >= 64 && k <= 4096 && n >= 256;
+        if (c >= 0 && (c > 0) != want) {
+            msg = "MUL_MAT_ROUTER_F16H dispatches: " + std::to_string(c) + (want ? " (expected the f32-A dq8 GEMM)" : " (expected another path)");
+            return false;
+        }
+        return true;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, type_b, k, n + (boff > 0 ? 1 : 0));
+        if (boff > 0) {
+            b = ggml_view_2d(ctx, b, k, n, b->nb[1], (size_t) boff * ggml_type_size(type_b));
+        }
+        return ggml_mul_mat(ctx, a, b);
+    }
+};
+
 // NA q8_0 x f16 GEMMs on distinct weights and one f16 B, outputs summed: with NA * weight bytes past the 32 MB MALL each GEMM
 // meets a cold weight, as in a model, where a repeated single GEMM keeps its weight cached (perf mode only)
 struct test_mul_mat_f16b_cold : public test_case {
@@ -13405,6 +13443,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 320, 2048, 10240, 0, boff));
         test_cases.emplace_back(new test_mul_mat_f16b(GGML_TYPE_Q8_0, 1000, 300, 1024, 128, boff));
     }
+    // the f32 weight x f16 B GEMM on the dq8 few-row tile: the Flash-Next router (512 x 2560) at and below the default
+    // rule, ragged m and n, one K step, and shapes that stay off it (k % 64 != 0, m < 128, n < 64)
+    for (int n : {64, 77, 300, 513, 2048, 2100}) {
+        test_cases.emplace_back(new test_mul_mat_router(512, n, 2560));
+    }
+    test_cases.emplace_back(new test_mul_mat_router(1000, 2100, 1024));
+    test_cases.emplace_back(new test_mul_mat_router(200, 513, 64));
+    test_cases.emplace_back(new test_mul_mat_router(512, 2048, 2600));
+    test_cases.emplace_back(new test_mul_mat_router(96, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_router(512, 48, 2560));
+    test_cases.emplace_back(new test_mul_mat_router(512, 2048, 2560, GGML_TYPE_F32));
+    for (int boff : {4, 2}) {   // B 8 and 4 bytes past 16, as most Flash-Next layers' f16 FFN input
+        test_cases.emplace_back(new test_mul_mat_router(512, 2048, 2560, GGML_TYPE_F16, boff));
+        test_cases.emplace_back(new test_mul_mat_router(512, 2100, 2560, GGML_TYPE_F16, boff));
+    }
     // shapes the XL gate's 1/16 margin (q8_0, k >= 2048) moves from the L to the XL tile (17 L waves vs 9 XL waves on 40 CUs), one
     // with ragged m and n; the same m, n at k = 1024 and the q4_K ones keep the L tile
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
@@ -16967,6 +17020,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int n : {2048, 8192}) {
             test_cases.emplace_back(new test_mul_mat_f16b_cold(mk[0], n, mk[1], 4));
         }
+    }
+    // the Flash-Next MoE router logits (f32 512 x 2560) at ub 512 .. 8192
+    for (int n : {256, 512, 1024, 2048, 4096, 6144, 8192}) {
+        test_cases.emplace_back(new test_mul_mat_router(512, n, 2560));
     }
     // shapes the XL gate's margin moves from L to XL on 40 CUs (17..77 L waves; q8_0, k >= 2048); k = 1024 and q4_K keep L
     for (auto mnk : std::vector<std::array<int64_t, 3>>{ {3072, 6912, 1024}, {7744, 2561, 1024}, {3072, 6912, 2048}, {7744, 2561, 2048},

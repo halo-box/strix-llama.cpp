@@ -1876,6 +1876,14 @@ static bool ggml_vk_dense_dq8_fewrow(uint32_t m, uint32_t k) {
     return m <= 384 && k >= 4096;
 }
 
+// The MoE router logits GEMM (qwen4exp, f32 weight [2560 -> 512]) runs on the mul_mm_dq8.comp few-row tile (tile 1) with an f32 A
+// (A_F32) instead of the f32-A KHR coopmat matmul, for k <= 4096, n >= 256. Both round A and B to f16 and add the 16-k WMMA steps in
+// k order with f32 accumulators, so the operands are the ones the f32-A matmul uses. gfx1151, m=512 k=2560 us per GEMM (f32-A
+// matmul / tile 1): n=512 87 / 57, 1024 156 / 106, 2048 270 / 206, 4096 547 / 404, 8192 1153 / 737.
+static bool ggml_vk_router_f16h_rule(uint32_t n, uint32_t k) {
+    return k <= 4096 && n >= 256;
+}
+
 
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
@@ -2925,6 +2933,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                         ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8[1][c], "matmul_dq8_q8_0_f16_d16_" + std::to_string(c),
                                                  matmul_dq8_q8_0_f16_d16_cm1_len, matmul_dq8_q8_0_f16_d16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
                                                  { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                        if (c == 1) {   // the f32-A router GEMM on the few-row tile
+                            ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_f32, "matmul_dq8_f32_f16_1",
+                                                     matmul_dq8_f32_f16_cm1_len, matmul_dq8_f32_f16_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                                                     { t[1], t[2], 1 }, spec, 1, false, true, 32);
+                        }
                         if (c == 0) {   // HC_UP_MIX epilogue variants on tile 0 (f32 / f16 mixed stream)
                             ggml_vk_create_pipeline2(device, device->pipeline_matmul_dq8_hcmix[0], "matmul_dq8_q8_0_f16_hcmix",
                                                      matmul_dq8_q8_0_f16_hcmix_cm1_len, matmul_dq8_q8_0_f16_hcmix_cm1_data, "main", 4,
@@ -7847,6 +7860,19 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
             pipeline = pd;
         }
     }
+    // f32 weight x f16 B on the few-row tile (the MoE router, ggml_vk_router_f16h_rule): A read in place as f32
+    bool router_f16h = false;
+    if (pipeline_pre_dq8 == nullptr && src0->type == GGML_TYPE_F32 && y_kernel_type == GGML_TYPE_F16 &&
+        !quantize_y && !qx_needs_dequant && !d16 && !hcm && ggml_vk_dim01_contiguous(src0) && ne02 * ne03 == 1 && ne12 * ne13 == 1 &&
+        ne10 % 64 == 0 && ne01 >= 128 && ne11 >= 64 && ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
+        ggml_vk_router_f16h_rule((uint32_t) ne11, (uint32_t) ne10)) {
+        vk_pipeline & pd = ctx->device->pipeline_matmul_dq8_f32;
+        if (pd) {
+            pipeline_pre_dq8 = pipeline;
+            pipeline = pd;
+            router_f16h = true;
+        }
+    }
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
@@ -8029,12 +8055,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (pipeline_pre_dq8 != nullptr) {
         // B is read as 16-byte vectors relative to its binding, which starts at the tensor itself: the columns need 8-element strides,
         // the binding offset only the device's storage-buffer alignment (an f16 activation may start 8 bytes past 16, which used to
-        // send the GEMM back to its pre-dq8 tile); A and D are read / written as dwords
+        // send the GEMM back to its pre-dq8 tile); A and D are read / written as dwords (an f32 A with 16-byte loads: a 16-byte
+        // aligned A binding)
         if (stride_b % 8 != 0 || y_buf_offset % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0 ||
-            x_buf_offset % 4 != 0 || d_buf_offset % 4 != 0) {
+            x_buf_offset % (router_f16h ? 16 : 4) != 0 || d_buf_offset % 4 != 0) {
             pipeline = pipeline_pre_dq8;   // split_k stays 1 (valid for every pipeline)
+            router_f16h = false;
         } else {
-            ggml_vk_path_census_add("MUL_MAT_DENSE_DQ8");
+            ggml_vk_path_census_add(router_f16h ? "MUL_MAT_ROUTER_F16H" : "MUL_MAT_DENSE_DQ8");
         }
     }
     if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y && !y_rowstride) {
@@ -18653,6 +18681,10 @@ static size_t ggml_backend_vk_dispatch_census_get(char * buf, size_t size) {
 static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend, const char * label) {
     const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
     const vk_device & dev = ctx->device;
+    // a GEMM path, not a fusion: GGML_VK_DISABLE_FUSION leaves it on
+    if (strcmp(label, "MUL_MAT_ROUTER_F16H") == 0 && !dev->pipeline_matmul_dq8_f32) {
+        return "no f32 x f16-B dq8 GEMM pipeline (needs coopmat with an f32 accumulator, fp16 and 32-lane subgroups)";
+    }
     const std::string l = label;
     // dispatch paths (not fusions): GGML_VK_DISABLE_FUSION does not turn them off
     if (l == "path:QSA_RADIX_SELECT" || l == "path:QSA_PREFILL_SELECT") {
