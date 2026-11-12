@@ -455,3 +455,319 @@ C2 harness, greedy, 14 L/X prompts (L0-L5, X0-X7); S0-S5 are excluded as the pla
 - MTP q8_0 d1024 0.69× master is acceptance-driven (per-verify-step time within 0.8 %); one P3 cell 0.9856 (f16 gained more than q8_0); one warm-up sample at 0.87×.
 - `-ngl 0` CPU sparse op is scalar (0.70× PR219 at pp512); f16 V-pack kept CAPPED (always-pack: no e2e gain, identical KLD).
 ```
+
+## 11. Follow-up reruns and fixes (final3, 2026-11-12)
+
+**Scope.** This section reruns, as the plan's §16 prescribes, every non-deferred FAIL and every unresolved cell left above, with the generated texts saved for the MTP cells.
+- **Same head and builds:** plain PR = `~/dev/wt_rebase2/build`, master = `~/dev/wt_master50/build`, lab = `final2/lab`, llama-bench = `final2/bench/bin_{new,m50,vknew,vkm50}`.
+- **Location:** strix-002 only.
+- **Locking and watchdog:**
+  - every GPU job ran under `flock ~/gpu.lock`, one at a time, under the final2 `lib.sh` watchdog (GTT > 100e9, MemAvailable < 4 GiB, new amdgpu kernel line);
+  - it never fired: no STOP file, every job `kerr_new=0`;
+  - `journalctl -k -b` still holds only the 3 boot-time lines;
+  - peak GTT was 94.4 GB (master q8_0 MTP server and master f16 deep bench); the lowest MemAvailable was 14.8 GB (Vulkan).
+- **Logs:** `F3` = `strix-002:~/dev/wt_lab/final3`. Harness in `F3/h/`, outputs in `F3/{mtp,mtp4x,kld,perf,perf4x,vk,vk4x}/`, chain logs in `F3/*.out`.
+- **Reporting.** Every rerun is reported, including those that did not resolve. The original numbers are kept next to the new ones.
+- **No code change was made.** No defect was found in the PR code. One pre-existing issue in master's MTP draft driver was found and is reported in §11.2; it is not fixed here.
+
+### 11.1 Per-item result
+
+| item | original (final2) | rerun design | new value [95 % CI] | verdict | cause |
+|---|---|---|---|---|---|
+| **16** P5 MTP q8_0 d1024 new / master (θ 0.98) | 0.6902 [0.6713, 0.7097] FAIL; acc/draft 96/203 vs 82/295 | 4 + 4 interleaved, texts saved; no-spec references; controls at ub64, KLD, carry-over, trace | **0.6878 [0.6736, 0.7024]**; acc/draft 96/203 vs 82/295 in every process | **FAIL as written; not a regression** | The PR's q8_0 prompt prefill in the dense-shortcut range takes the sparse "av" route (master: dense FA). That flips a near-tie greedy token; master's continuation then falls into a repetitive, very draftable loop. With the same prompt route (ub64) the builds are **bit-identical** (texts, draft counts, logprobs). 7 other prompts: 1.050 [0.950, 1.148]. av-route KLD vs dense: +0.00062 ± 0.00074 |
+| **17** P5 MTP new_q8 / new_f16 d16 (θ 0.94) | 0.7467 [0.7006, 0.7976] FAIL (master 0.7447) | same campaign | **0.7401 [0.7064, 0.7758]** (master 0.7465 [0.7126, 0.7827]) | **FAIL as written; ratio artifact** | f16 and q8_0 produce different greedy texts (near-tie at token 31, on both builds). Per-verify-step time q8 / f16 = 0.998. 7 other d16 prompts: 1.009 [0.873, 1.138] |
+| **18** P3 d0 ub512 pp4096 (θ 0.99) | 0.9856 [0.9828, 0.9884] FAIL | 6 + 6 per arm (2×), 4 arms interleaved | **0.9862 [0.9841, 0.9887]** | **FAIL as written; not a q8_0 regression** | Master's own q8_0 / f16 = 1.0162 here (its f16 is the slow one in ubatches 2-8). The PR gains f16 +5.0 %, q8_0 +3.5 %; new q8_0 / new f16 = 1.0022 |
+| Stall P6(a) | 1 / 748 samples (new q8_0 tg128 ub4096 rep 1, 0.872×) | same d0 campaign, 6 + 6 | **0 / 288 new-build samples**; all new q8_0 tg128 ub4096 reps 26.28-26.55 t/s | **does not recur on the PR** | The rerun's only P6(a) sample is on **master** (pp512 ub4096, 0.713×): a host-level transient |
+| q8_0 tg128 d0 ub4096 new / master (θ 0.98) | 0.9889 [0.9566, 1.0010] RERUN | d0 campaign | **1.0034 [1.0004, 1.0080]** | **PASS** | was the stall sample |
+| P3 tg128 d0 ub4096 (θ 0.99) | 0.9899 [0.9575, 1.0028] RERUN | d0 campaign | **1.0024 [0.9986, 1.0073]** | **PASS** | was the stall sample |
+| P5 f16 tg128 d131k ub4096 (θ 0.99) | 0.9998 [0.9840, 1.0151] RERUN | 4 + 4 | **1.0023 [0.9910, 1.0160]** | **PASS** | |
+| MTP f16 d16 (θ 0.98) | 0.9991 [0.918, 1.084] RERUN | 4 + 4, then 8 + 8 | 2×: 1.0061 [0.9447, 1.0689]; 4×: **1.0026 [0.9611, 1.0457]** | **FAIL by the stopping rule** (unresolved at 4×) | Identical texts and rep-by-rep draft counts in all 16 processes. The width comes from resampling reps of different acceptance. Process-level CI 1.0026 [0.9983, 1.0073] (supplementary) |
+| MTP f16 d1024 (θ 0.98) | 0.9986 [0.978, 1.019] RERUN | 4 + 4 | **0.9997 [0.9855, 1.0137]** | **PASS** | |
+| MTP q8_0 d16 (θ 0.98) | 1.0018 [0.966, 1.040] RERUN | 4 + 4, then 8 + 8 | 2×: 0.9975 [0.9705, 1.0254]; 4×: **1.0006 [0.9826, 1.0192]** | **PASS** (at 4×) | |
+| depth d266240 f16 tg32 new / master (θ 0.99) | 1.0095 [0.9834, 1.0362] RERUN | 4 + 4 | **1.0119 [0.9930, 1.0316]** | **PASS** | |
+| depth d266240 new q8_0 / new f16 tg32 (θ 0.94) | 0.9447 [0.9169, 0.9730] RERUN (1 q8_0 process) | 4 + 4, then 8 + 8 fresh | 2×: 0.9444 [0.9263, 0.9638]; 4×: **0.9415 [0.9281, 0.9541]** | **FAIL by the stopping rule against 0.94** (PASS against the 0.90 floor PROOF-initial used; the plan's P5 depth list names only d32k / d131k) | q8_0 decode at n_kv ≈ 270k is about 6 % slower than f16 (+2.9 ms per token), the size C18 predicted. Not a master comparison |
+| Vulkan f16 d4096 ub512 pp512 (θ 0.99) | 0.998 RERUN | 4 + 4, then 8 + 8 | 2×: 0.9977 [0.9884, 1.0068]; 4×: **0.9970 [0.9907, 1.0036]** | **PASS** (at 4×) | |
+| Vulkan f16 d4096 ub4096 pp512 | 0.999 RERUN | 4 + 4 | **0.9990 [0.9911, 1.0071]** | **PASS** | |
+| Vulkan f16 d32768 ub512 pp512 | 0.999 RERUN | 4 + 4, then 8 + 8 | 2×: 0.9975 [0.9863, 1.0088]; 4×: **0.9951 [0.9871, 1.0030]** | **FAIL by the stopping rule** (optional arm) | Point estimate 0.995-0.999 in all three campaigns; a possible ≤ 0.5 % f16 Vulkan cost at 32k with 512-query ubatches, not resolved at 8 + 8 |
+| Vulkan f16 d32768 ub4096 pp512 | 1.001 RERUN | 4 + 4 | **1.0010 [0.9933, 1.0086]** | **PASS** | |
+
+**Overall after this round:**
+- **HIP gates:** of the 8 unresolved cells, 6 now PASS. Two are FAIL by the stopping rule:
+  - MTP f16 d16, where the work is token-identical and the process-level CI is [0.9983, 1.0073];
+  - depth q8_0 / f16 decode at 0.94 ± 0.01.
+- **Vulkan (optional arm):** 3 of 4 cells PASS; d32768 ub512 pp512 is FAIL by the stopping rule.
+- **The 3 non-deferred FAILs (items 16, 17, 18) stay FAIL as the gates are written.** Each has a measured cause that is not a PR regression.
+- **The stall does not recur on the PR.**
+- **No PR defect was found, and no commit was made.**
+
+### 11.2 Item 16: P5 MTP q8_0 d1024, new vs master
+
+**Original (final2, §3.5):** 0.6902 [0.6713, 0.7097], FAIL. That was 2 + 2 processes. Master accepted 96 of 203 drafted tokens per request, new 82 of 295. Per verify step: 104.64 → 105.45 ms. The texts were not saved.
+
+**Rerun design (E16, `F3/h/run_mtp.sh`, `mtp3.sh`, `mtp3.py`):**
+- Same server, flags and requests as final2 `h/mtp_perf.sh`, with every response's token ids and text saved.
+- 4 master + 4 new processes, interleaved, per main KV type (2× final2), with the 5 reps of each gate cell.
+- Each process also sent 7 extra prompts at d16 and at d1024 (corpus offsets 40000·k), 1 rep each, after the gate cells.
+- Plus no-spec greedy references with top-5 logprobs (`*_nospec_*`), and four controls:
+  - **E16b:** `-ub/-b 64`, 2 + 2 spec processes and 1 + 1 no-spec.
+  - **E16d:** KLD at c1024.
+  - **E16e:** carry-over control, 1 + 1.
+  - **Trace:** a lab-build traced run (`q8_0_lab_trace_spec_0_lab`).
+
+**Rerun value:** **0.6878 [0.6736, 0.7024], FAIL** (4 + 4).
+- Master 38.20 t/s, new 26.28.
+- Accepted / drafted per request: 96.0 / 203.0 → 82.0 / 295.0. The text is identical in all 4 processes of each build, in every rep.
+- Per verify step: 104.81 → 105.99 ms (+1.1 %).
+
+**What the saved texts show:**
+1. **The main-model output diverges, and only through the prompt-prefill route.**
+   - At d1024 the 1012-token prompt ubatch lies inside the dense-shortcut range (n_kv 1024 ≤ top_k + r − 1 = 2051).
+   - In that range, master runs every type through dense FLASH_ATTN_EXT.
+   - The PR's HIP policy (`ggml_cuda_sparse_attn_prefer_dense`) keeps dense for q8_0/q8_0 only up to n_q 127. A larger ubatch takes the sparse "av" route (all-visible rows, G4). The trace shows it: `producer=av n_q=1008 n_kv=1024 … count=8` for the 8 d1024 prompts. Every d16 ubatch and every decode / verify ubatch (n_q ≤ 12) is `dense`.
+   - f16 is dense in both builds.
+2. **Control E16b (`-ub/-b 64`).** Every prompt ubatch has n_q ≤ 64, so the PR takes dense like master. Result on all 8 d1024 prompts and on d16, in all 4 processes:
+   - token-identical texts and identical draft / accept counts in every rep (gate d1024: 81/315 and 86/280 in both builds);
+   - no-spec: bit-identical top-5 logprobs at every generated position.
+   So with the same prompt route, the PR's main model, its MTP draft context, the K/V cache and the verify path all match master exactly. There is no stale-K/V, selection or cache defect at small depth on the PR side.
+3. **Where the texts split, it is a near-tie.**
+   - No-spec q8_0 ub4096: the top-1 logprobs on the shared prefix (tokens 0-11) agree to within 0.08 nats.
+   - At token 12 master scores token 561 at −0.850 and token 364 at −0.929 (a 0.08 nat margin); the PR picks 364.
+   - In the spec run (verify batches change the numerics on both builds), the texts split at token 30 instead.
+   - From token 30, **master's continuation falls into a repeated `= = = = = = = = \n <cast name> \n = = = …` heading pattern. That pattern is very easy to draft (mean accepted length ~4).** The PR goes on with article prose.
+   - Master's own text at this cell moves just as much with the ubatch size: at ub64 it splits from master ub4096 at token 29, and accepts 81-86 / 280-315, the PR's level.
+   - This cell has swung between builds before: PR219 79/≈330 (PROOF-initial), 1dbee4d9a 93/233, master 96/203, 49a6d75ab 82/295.
+4. **Same-text acceptance is equal** (point 2). Over the 7 other d1024 prompts (supplementary, not a plan gate, `F3/mtp_x.out`):
+   - new / master q8_0 = **1.050 [0.950, 1.148]**;
+   - accepted per request summed over the 7 prompts: new 590, master 579;
+   - f16: 0.990 [0.973, 1.005].
+5. **The av route costs no measurable quality** (E16d: Signal-3.8, c1024, b/ub 1024, 12 chunks, KLD vs master f16 dense logits, `F3/kld/`):
+
+   | arm | Mean KLD | same top p |
+   |---|---|---|
+   | master f16, rerun | 0 (PPL 2.198264) | 99.984 % |
+   | new f16 | 0, identical to master | 99.984 % |
+   | master q8_0, dense | 0.017197 ± 0.000822 | 96.689 % |
+   | new q8_0, av route | 0.017824 ± 0.000945 | 96.396 % |
+   | master q8_0 ub64, dense | 0.018417 ± 0.000939 | 96.689 % |
+   | new q8_0 ub64, dense | 0.018417 ± 0.000939, bit-identical to master | 96.689 % |
+
+   - Paired per chunk: av − dense = **+0.00062 ± 0.00074** (n = 12, no difference shown).
+   - That is smaller than master's own change from ub1024 to ub64 (+0.00122 ± 0.00084).
+
+**Found on the way: a pre-existing MTP driver issue (master code, not the PR; `common/speculative.cpp` and `tools/server` are unchanged by the PR).**
+- **What it does.** `common_speculative_impl_draft_mtp` pairs the first token of each `process()` call with `pending_h`, the last hidden row of the previous call. `begin()` does not reset it.
+- **Effect.** The first MTP-context K/V row of every request's evaluated prompt part is built from the **previous request's** final hidden state. That is the whole prompt for a new prompt, or the 4 re-evaluated tokens for a cached one.
+- **Measured size.** In E16e the same d16 gate prompt, with the same greedy text, accepts 60/443 when it is the first request of a process. After other requests it accepts 66-71 of 379-414.
+- **How it shows here.** The d16 extras diverged between builds (4/7 q8_0, plus different draft counts with identical text for f16 `x_o40000_d16`) only because the preceding d1024 / d32768 request legitimately differs between the builds. In E16e each d16 prompt follows the same identical-state request, and **all 7 d16 prompts become token-identical with identical draft counts in both builds**.
+- **Why it is not the cause of the gate split.** The gate d1024 cell's first request follows the d16 cell, which is bit-identical in both builds, so it starts from the same carried state. Its split comes from the prefill route, as control E16b shows. Within each build, later reps then carry that build's own state.
+- **Recommendation.** Fix it upstream, separately from this PR: reset `pending_h` in `begin()`, or seed it from the target's hidden row at the last cached position. Not changed here.
+
+**Verdict, item 16: FAIL as written** (CI UB 0.7024 < 0.98). **Not a regression and not a PR defect.**
+- Cause: the PR's q8_0 prompt-prefill route in the dense-shortcut range (av instead of dense FA) changes a near-tie greedy token.
+- Master's continuation from that point is a repetitive, highly draftable loop.
+- On the same text the two builds are bit-identical. On other prompts the PR is at least as fast (1.050).
+- No code change.
+
+### 11.3 Item 17: P5 MTP new_q8_0 / new_f16 at d16
+
+**Original:** 0.7467 [0.7006, 0.7976] FAIL (master's own ratio 0.7447, with the same draft counts in both builds).
+
+**Rerun:** the same E16 campaign (4 + 4 per KV type).
+- **new_q8 / new_f16 = 0.7401 [0.7064, 0.7758], FAIL.**
+- Master q8 / f16 = 0.7465 [0.7126, 0.7827].
+
+**Cause: a ratio-definition artifact.** The f16 and q8_0 cells generate different texts.
+- **Kernel time.** Per verify step, q8_0 / f16 = 0.998 (new) and 0.990 (master); the decode kernels cost the same.
+- **The texts.**
+  - The d16 gate prompt's f16 and q8_0 continuations split at token 31 in both builds. No-spec f16: token 430 at −0.904 vs 1116 at −1.616. q8_0: 1116 at −1.235 vs 430 at −1.302, a near-tie flipped by the KV quantization.
+  - From there the q8_0 text drafts 443 and accepts 60 per request; the f16 text drafts 337 and accepts 77.5.
+  - Each type's text is token-identical between master and new.
+- **Other prompts.** Over the 7 other d16 prompts, new q8_0 / new f16 = **1.009 [0.873, 1.138]** (master 1.027 [0.895, 1.167]).
+- So the 0.74 belongs to that one prompt's two texts. It is not a q8_0 speed property, and it is the same on master.
+
+**Verdict, item 17: FAIL as written, not a regression.** The cell compares the draftability of two different greedy texts. A same-text form of the gate (per-verify-step time, ratio 0.998) passes.
+
+### 11.4 The 3 unresolved MTP perf cells (and the rest of the P5 MTP table, re-measured)
+
+**Design:**
+- **2× step:** the E16 campaign, 4 + 4 processes, per KV type.
+- **4× step** (`F3/h/run_mtp4x.sh`, `F3/mtp4x/`): only for cells still unresolved after 2×. 8 + 8 processes interleaved, with the d16 gate request only (the same request and 5 reps as before).
+
+| cell | final2 (2 + 2) | 2× (4 + 4) | 4× (8 + 8) | verdict |
+|---|---|---|---|---|
+| f16 d16 | 0.9991 [0.918, 1.084] RERUN | 1.0061 [0.9447, 1.0689] RERUN | 1.0026 [0.9611, 1.0457] RERUN | **FAIL by the stopping rule** (unresolved at 4×); see the note below |
+| f16 d1024 | 0.9986 [0.978, 1.019] RERUN | **0.9997 [0.9855, 1.0137]** | — | **PASS** |
+| q8_0 d16 | 1.0018 [0.966, 1.040] RERUN | 0.9975 [0.9705, 1.0254] RERUN | **1.0006 [0.9826, 1.0192]** | **PASS** |
+| f16 d32768 (was PASS) | 1.0396 [1.0021, 1.0799] | 1.0266 [0.9986, 1.0566] | — | PASS (re-confirmed) |
+| q8_0 d32768 (was PASS) | 1.1677 [1.1135, 1.2226] | 1.1560 [1.1215, 1.1896] | — | PASS (re-confirmed) |
+| new_q8 / new_f16 d1024 (θ 0.94) | 1.042 | 1.0352 [1.0172, 1.0525] | — | PASS |
+| new_q8 / new_f16 d32768 (θ 0.94) | 1.011 [0.971, 1.049] | 1.0206 [0.9907, 1.0486] | — | PASS |
+
+**Note on f16 d16.**
+- **The two builds run identical work.** In all 16 processes of the 4× step, and in both builds, the text and the rep-by-rep draft sequence are identical: reps 1-4 accept/draft 83/303, 73/365, 81/316, 73/365.
+- **Where that sequence comes from.** The rep-to-rep cycle is the `pending_h` carry-over of §11.2: each rep follows the previous one.
+- **Why the §16 CI is wide.** The statistic resamples reps within a process, which mixes reps of different acceptance (tg 21-26 t/s). That noise source is identical in both builds.
+- **Supplementary, same-text check** (bootstrap over processes only, each process's 4 reps kept whole, `F3/mtp4x_proc.out`):
+  - f16 d16: new/master 1.0026 [0.9983, 1.0073];
+  - q8_0 d16: 1.0006 [0.9995, 1.0017];
+  - verify-step speed ratio: the same values.
+- **Conclusion.** There is no kernel difference at f16 d16. The FAIL is the stopping rule meeting a cell whose noise comes from acceptance mixing, not from speed.
+
+### 11.5 Item 18: P3 ratio of ratios, d0 ub512 pp4096
+
+**Original:** 0.9856 [0.9828, 0.9884], FAIL (3 + 3 processes per arm).
+- new f16 / master = 1.0495, new q8_0 / master = 1.0344;
+- new_q8 / new_f16 = 1.0022.
+
+**Rerun design (`F3/h/perf3.sh` phase `d0`):**
+- Same binaries (`final2/bench/bin_{new,m50}`), args (`-b 4096 -ub 4096,512 -p 512,4096 -n 128 -d 0 -r 5`), C10 text and warm-up.
+- **6 + 6 processes per arm** (2×), with the 4 arms interleaved per round: m50 f16, m50 q8_0, new f16, new q8_0.
+- Analysis: `F3/h/f3an.py`, which uses perf_an.py's §16 statistic. Output in `F3/perf_d0_an.out`.
+
+**Rerun value: 0.9862 [0.9841, 0.9887], FAIL.**
+
+| quantity (d0 ub512 pp4096) | final2 | rerun (6 + 6) |
+|---|---|---|
+| (new_q8 / new_f16) / (m50_q8 / m50_f16) | 0.9856 [0.9828, 0.9884] | **0.9862 [0.9841, 0.9887]** |
+| new f16 / master f16 | 1.0495 | 1.0497 [1.0484, 1.0509] (1200.49 → 1260.13 t/s) |
+| new q8_0 / master q8_0 | 1.0344 | 1.0352 [1.0334, 1.0374] (1219.95 → 1262.93) |
+| new q8_0 / new f16 | 1.0022 | 1.0022 [1.0014, 1.0031] |
+| master q8_0 / master f16 | 1.0169 | **1.0162 [1.0140, 1.0181]** |
+
+**Explanation.**
+- **The rule divides by a reference that is faster on q8_0 than on f16.** In this cell master's own q8_0 beats master's own f16 by 1.6 %. It is the only one of master's 6 d0 cells where master q8_0 > master f16; the other 5 are 0.85-0.99.
+- **Where it happens.** The pp4096 test starts empty, so its first ubatch equals the pp512 test. Taking that ubatch out gives the rate of ubatches 2-8 (n_kv 1024-4096, n_q 512):
+
+  | | master | new |
+  |---|---|---|
+  | f16 | 1181.1 | 1247.5 t/s |
+  | q8_0 | 1205.9 | 1251.1 t/s |
+
+  - Master f16 is 2.1 % slower than master q8_0 in exactly those ubatches.
+  - The PR speeds up f16 by 5.6 % there and q8_0 by 3.8 %. That leaves the PR's q8_0 at parity with its f16 (1.003).
+- **Verdict, item 18: FAIL as written. Not a q8_0 regression and not a PR defect.**
+  - The PR's q8_0 is faster than master's q8_0 (1.035) and equal to its own f16 (1.002).
+  - The ratio-of-ratios fails because the PR's f16 gain (+5.0 %) is larger than its q8_0 gain (+3.5 %), measured against a reference whose f16 is the slow one in this band.
+  - PROOF-initial, which used PR219 as the reference, had this cell PASS.
+- No code change.
+
+### 11.6 Stall P6(a), and the d0 decode cells left unresolved
+
+**Original:**
+- 1/748 samples: `p_d0_q8_0_0_new` tg128 ub4096 rep 1 = 22.94 t/s, 0.872× its median. Rep 0 was 22.26.
+- That sample made q8_0 tg d0 ub4096 RERUN (0.9889 [0.9566, 1.0010]) and P3 tg d0 ub4096 RERUN (0.9899 [0.9575, 1.0028]).
+
+**Rerun:** the same d0 campaign, 6 + 6 processes per arm (2× the original 3 + 3), 576 timed samples, 0 processes with KFD evictions.
+
+**Does the stall recur? No.** All 6 new q8_0 processes have tg128 ub4096 samples within 26.28-26.55 t/s, rep 0 included:
+
+| process | reps 0-4 (t/s) |
+|---|---|
+| new_0 | 26.28, 26.42, 26.45, 26.44, 26.41 |
+| new_1 | 26.35, 26.53, 26.53, 26.53, 26.50 |
+| new_2 | 26.32, 26.45, 26.53, 26.48, 26.48 |
+| new_3 | 26.29, 26.41, 26.47, 26.45, 26.44 |
+| new_4 | 26.28, 26.47, 26.44, 26.45, 26.47 |
+| new_5 | 26.36, 26.55, 26.52, 26.45, 26.44 |
+
+- **P6(a) on the PR build: 0 of 288 new-build samples.**
+- **The rerun's only P6(a) sample is on master.** It is `p_d0_q8_0_4_m50`, pp512 ub4096, rep 1 = 946.2 t/s against a median of 1327.6 (0.713×), with no eviction. The same kind of isolated transient as final2's, now in the reference build. That points to a host-level event, not the PR.
+- The P6(a) rule as written ("any eviction-free sample < 0.9 × its cell median fails") would count it against the cell. It is master's sample, so it is not a PR finding.
+
+**Cells unresolved because of the stall:**
+- q8_0 tg128 d0 ub4096 new / master (θ 0.98): **1.0034 [1.0004, 1.0080] PASS**.
+- P3 tg128 d0 ub4096: **1.0024 [0.9986, 1.0073] PASS** (θ 0.99).
+- The other d0 cells all pass again, f16 and q8_0 (`F3/perf_d0_an.out`). For example: f16 tg ub4096 1.0010 [0.9992, 1.0031]; f16 pp4096 ub4096 1.0054 [0.9994, 1.0114] (θ 0.99); P3 floor 6/6 ≥ 0.9924.
+
+### 11.7 The unresolved HIP perf and depth cells
+
+**Design:**
+- Phases `d131k` and `deep` of `F3/h/perf3.sh`, with the same binaries, args and C10 text as final2.
+- d131k: 4 + 4 f16 processes (final2 had 2 + 2).
+- deep d266240: 4 master f16 + 4 new f16 + 4 new q8_0, interleaved (final2: 2 + 2 f16, 1 q8_0).
+- Output in `F3/perf_d131k_an.out` and `F3/perf_deep_an.out`.
+- Peak GTT 94.3 GB (master f16 deep); every job `kerr_new=0`; 0 eviction processes.
+
+| cell | θ | final2 | 2× rerun | verdict |
+|---|---|---|---|---|
+| P5 f16 tg128 d131072 ub4096, new / master | 0.99 | 0.9998 [0.9840, 1.0151] RERUN | **1.0023 [0.9910, 1.0160]** (23.54 → 23.59 t/s) | **PASS** |
+| depth d266240 f16 tg32, new / master | 0.99 | 1.0095 [0.9834, 1.0362] RERUN | **1.0119 [0.9930, 1.0316]** (21.41 → 21.66) | **PASS** |
+| depth d266240 new q8_0 / new f16 tg32 | 0.94 | 0.9447 [0.9169, 0.9730] RERUN (1 q8_0 process) | 0.9444 [0.9263, 0.9638] (21.66 → 20.46) | RERUN → 4× step below |
+| (re-confirmed) d266240 f16 pp4096, new / master | 0.99 | 1.0134 [1.0050, 1.0213] | 1.0095 [1.0031, 1.0159] | PASS |
+| (re-confirmed) d266240 new q8_0 / new f16 pp4096 | 0.90 | 0.9581 [0.9481, 0.9678] | 0.9568 [0.9503, 0.9631] | PASS |
+| (re-confirmed) d131072 f16, the other 5 cells | 0.99 | PASS | 1.0005-1.0731, every LB ≥ 0.9971 | PASS |
+
+**On the q8_0 / f16 decode cell at depth.**
+- The point estimate sits on the threshold in every campaign: final2 0.9447, this rerun 0.9444, PROOF-initial at d300k 0.948.
+- So q8_0 decode at n_kv ≈ 270k runs about 5.5 % slower than f16 on the PR. The gate floor is 0.94; it is not a "new vs master" cell.
+- Master q8_0 at this depth was never run (memory safety on its masked route), so there is no reference ratio.
+
+**4× step for the q8_0 / f16 decode cell** (`F3/h/perf3b.sh`, `F3/perf4x/`, `F3/perf4x_an.out`):
+- a fresh campaign of 8 new f16 + 8 new q8_0 processes, interleaved, same args (RR 3);
+- peak GTT 93.7 GB; every job `kerr_new=0`.
+
+| quantity | final2 | 2× | 4× (8 + 8) |
+|---|---|---|---|
+| new q8_0 / new f16 tg32 | 0.9447 [0.9169, 0.9730] | 0.9444 [0.9263, 0.9638] | **0.9415 [0.9281, 0.9541]** (21.77 → 20.50 t/s) |
+| new q8_0 / new f16 pp4096 | 0.9581 | 0.9568 | 0.9536 [0.9462, 0.9600] PASS |
+
+**Verdict: FAIL by the stopping rule against θ 0.94** (still unresolved at 4×). The point estimate is on the threshold in all three campaigns, and at d300k in PROOF-initial (0.948).
+- **What the plan says.** P5 names its depth cells as d32k / d131k. There new q8_0 / new f16 tg is 0.9861-0.9917, which passes. final2 applied the same 0.94 to this extra d266240 cell; PROOF-initial scored the d300k cell against the 0.90 floor (PASS).
+- **Under either reading:**
+  - q8_0 decode at n_kv ≈ 270k costs about 2.9 ms per token more than f16 (45.9 → 48.8 ms), about 6 %. This is the size the plan cites from C18 ("about +6 % at tg") when it set the 0.94 floor.
+  - It is a q8_0-vs-f16 property of the PR at extreme depth, not a regression against master. Master q8_0 was not run at this depth (memory safety), so there is no reference.
+- **Not investigated further in this round.** Where the 2.9 ms per token goes was not measured (candidates: the q8_0 G1 attend with rotation, or the indexer key cache type). This is an owner decision: accept 0.94 ± 0.01 at 266k as a known property, or ask for an op-level breakdown.
+
+### 11.8 The 4 unresolved Vulkan f16 cells (optional arm, AT-B1 θ 0.99)
+
+**Design:**
+- Phase `vk` of `F3/h/perf3.sh`: 4 + 4 processes, the final2 grid (`-b 4096 -ub 4096,512 -p 512,2048 -n 0 -d 4096,32768 -r 5`), binaries `bin_{vkm50,vknew}`, f16 only. Never bf16.
+- Then a fresh 8 + 8 campaign (`F3/h/perf3c.sh`, `F3/vk4x/`) for the cells still unresolved.
+- Lowest MemAvailable 14.75 GB; every job `kerr_new=0`; GTT back to 27 MB afterwards.
+
+| cell (f16, new / master) | final2 (2 + 2) | 2× (4 + 4) | 4× (8 + 8) | verdict |
+|---|---|---|---|---|
+| d4096 ub512 pp512 | 0.998 RERUN | 0.9977 [0.9884, 1.0068] | **0.9970 [0.9907, 1.0036]** | **PASS** |
+| d4096 ub4096 pp512 | 0.999 RERUN | **0.9990 [0.9911, 1.0071]** | (0.9982 [0.9925, 1.0038]) | **PASS** |
+| d32768 ub512 pp512 | 0.999 RERUN | 0.9975 [0.9863, 1.0088] | **0.9951 [0.9871, 1.0030]** | **FAIL by the stopping rule** |
+| d32768 ub4096 pp512 | 1.001 RERUN | **1.0010 [0.9933, 1.0086]** | (1.0003 [0.9952, 1.0056]) | **PASS** |
+| the 4 pp2048 cells (PASS in final2) | 1.000-1.003 | 0.9980-1.0041, all PASS | 0.9985-1.0035, all PASS | PASS |
+
+**On d32768 ub512 pp512.**
+- The point estimate is below 1 in all three campaigns (0.999, 0.9975, 0.9951), and every CI contains both 0.99 and 1.
+- A real f16 cost of up to about 0.5 % on Vulkan, at 32k depth with 512-query ubatches, can be neither shown nor excluded at 8 + 8.
+- It is the optional Vulkan arm. The PR's Vulkan q8_0 in the same cell is 1.67× master (§6).
+
+### 11.9 Code changes, open items, logs
+
+**Code changes: none.**
+- **No commit on `qsa-final`.** No defect was found in the PR code. Every divergence examined traces to a route-numerics difference, and with that route equalized the builds were bit-identical. Specifically:
+  - main model, MTP draft context, K/V cache and verify path at ub64;
+  - main model at d16 and f16 d1024 without spec.
+- **Pre-existing issue, not in the PR.** It is outside this PR's diff and is not fixed here: the `draft-mtp` driver's `pending_h` carries the previous request's last hidden row into the first MTP K/V row of the next request (`common/speculative.cpp`, unchanged by the PR; §11.2).
+  - Effect: MTP acceptance depends on request history (the same text accepted 60/443 vs 66-71 of 379-414 depending on the request before it).
+  - Recommended as a separate upstream fix: reset it in `begin()`, or seed it from the target's last cached hidden row.
+
+**Still open after this round (owner decisions):**
+1. **Items 16, 17, 18 stay FAIL as the gates are written.** Each has a measured non-regression cause (§11.2, §11.3, §11.5). Options: list them as known issues, or amend the gates:
+   - P5 MTP: a same-text form, or several prompts;
+   - P3: skip cells where the reference's own q8_0 / f16 > 1.
+2. **MTP f16 d16:** FAIL by the stopping rule, with token-identical work (process-level CI [0.9983, 1.0073]).
+3. **Depth d266240 new q8_0 / new f16 decode:** 0.9415 [0.9281, 0.9541] at 8 + 8. It fails against 0.94 under the stopping rule and passes against 0.90. Accept as a known about-6 % q8_0 decode cost at 266k, or ask for an op-level breakdown.
+4. **Vulkan f16 d32768 ub512 pp512:** 0.9951 [0.9871, 1.0030]. Optional arm, FAIL by the stopping rule.
+5. **The draft-mtp `pending_h` carry-over:** a separate upstream fix.
+
+**What was not done:**
+- The `-ctkd q8_0` MTP cells (not in the brief).
+- A 4× step for items 16-18: their CIs lie wholly below θ, so the rule needs no further reruns.
+
+**GPU time:** about 6.3 h (09:33-15:53).
+
+**Logs (`F3` = `strix-002:~/dev/wt_lab/final3`):**
+- **Harness:** `h/` — `lib3.sh`, `mtp3.{sh,py}`, `mtp3b.{sh,py}`, `run_mtp.sh`, `run_e16{b,d,e}.sh`, `run_mtp4x.sh`, `perf3{,b,c}.sh`, `wait_then.sh`, and the analysis scripts `mtp_an.py`, `mtp_x.py`, `mtp_proc.py`, `e16chk.py`, `f3an.py`.
+- **MTP:** `mtp/` (server logs, jsonl with token ids and text, `.watch`), `mtp4x/`, `run_mtp.out`, `run_e16{b,d,e}.out`, `run_mtp4x.out`, `run_trace.out`. The lab trace is in `mtp/q8_0_lab_trace_spec_0_lab.log`.
+- **MTP analyses:** `mtp_an.out`, `mtp_x.out`, `mtp4x_an.out`, `mtp4x_proc.out`, `e16chk.out`.
+- **KLD (E16d):** `kld/*.log`. The base logits were deleted after use.
+- **Perf:** `perf/` and `perf3.out`, with analyses `perf_d0_an.out`, `perf_d131k_an.out`, `perf_deep_an.out`; `perf4x/`, `perf3b.out`, `perf4x_an.out`.
+- **Vulkan:** `vk/`, `perf_vk_an.out`, `vk4x/`, `perf3c.out`, `perf_vk4x_an.out`.
+- **8080 server:** restored with `~/restore_master.sh` after all GPU work; `llama-master.service` active, `/health` `{"status":"ok"}`.
