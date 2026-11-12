@@ -1,0 +1,31 @@
+0.00.636.636 W model has unused tensor blk.40.attn_norm.weight (size = 8192 bytes) -- ignoring
+0.00.636.644 W model has unused tensor blk.40.post_attention_norm.weight (size = 8192 bytes) -- ignoring
+0.00.636.648 W model has unused tensor blk.40.attn_q.weight (size = 17825792 bytes) -- ignoring
+0.00.636.649 W model has unused tensor blk.40.attn_k.weight (size = 1114112 bytes) -- ignoring
+0.00.636.651 W model has unused tensor blk.40.attn_v.weight (size = 1114112 bytes) -- ignoring
+0.00.636.656 W model has unused tensor blk.40.attn_output.weight (size = 8912896 bytes) -- ignoring
+0.00.636.658 W model has unused tensor blk.40.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.636.659 W model has unused tensor blk.40.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.636.661 W model has unused tensor blk.40.ffn_gate_inp.weight (size = 1048576 bytes) -- ignoring
+0.00.636.663 W model has unused tensor blk.40.ffn_down_exps.weight (size = 285212672 bytes) -- ignoring
+0.00.636.666 W model has unused tensor blk.40.ffn_gate_exps.weight (size = 285212672 bytes) -- ignoring
+0.00.636.668 W model has unused tensor blk.40.ffn_up_exps.weight (size = 285212672 bytes) -- ignoring
+0.00.636.670 W model has unused tensor blk.40.ffn_gate_inp_shexp.weight (size = 4096 bytes) -- ignoring
+0.00.636.671 W model has unused tensor blk.40.ffn_gate_shexp.weight (size = 1114112 bytes) -- ignoring
+0.00.636.674 W model has unused tensor blk.40.ffn_up_shexp.weight (size = 1114112 bytes) -- ignoring
+0.00.636.676 W model has unused tensor blk.40.ffn_down_shexp.weight (size = 1114112 bytes) -- ignoring
+0.00.636.679 W model has unused tensor blk.40.nextn.eh_proj.weight (size = 8912896 bytes) -- ignoring
+0.00.636.681 W model has unused tensor blk.40.nextn.enorm.weight (size = 8192 bytes) -- ignoring
+0.00.636.683 W model has unused tensor blk.40.nextn.hnorm.weight (size = 8192 bytes) -- ignoring
+0.00.636.687 W model has unused tensor blk.40.nextn.shared_head_norm.weight (size = 8192 bytes) -- ignoring
+0.05.109.234 I cmn          init: llama threadpool init, n_threads = 16
+0.05.167.791 I 
+0.05.167.902 I system_info: n_threads = 16 (n_threads_batch = 16) / 32 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.05.167.918 I perplexity: tokenizing the input ..
+0.05.502.633 I perplexity: tokenization took 334.705 ms
+0.05.502.696 I perplexity: calculating perplexity over 32 chunks, n_ctx=4096, batch_size=4096, n_seq=1
+ggml_vulkan: MUL_MAT_ID f16-B path engaged
+0.07.522.769 I perplexity: 2.02 seconds per pass - ETA 1.07 minutes
+[1]6.2034,[2]6.4024,[3]5.1735,[4]5.0664,[5]5.3171,[6]5.4548,[7]5.6694,[8]5.8348,[9]5.8930,[10]5.5395,[11]5.6648,[12]5.7106,[13]5.7662,[14]5.9706,[15]5.9002,[16]5.7415,[17]5.7418,[18]5.7041,[19]5.5416,[20]5.3905,[21]5.4156,[22]5.6026,[23]5.6406,[24]5.7062,[25]5.6882,[26]5.6209,[27]5.5759,[28]5.5351,[29]5.4614,[30]5.4273,[31]5.4828,[32]5.5638,
+1.09.056.064 I Final estimate: PPL = 5.5638 +/- 0.05120
+

@@ -1,0 +1,13 @@
+0.00.746.883 W model has unused tensor per_layer_token_embd.weight (size = 28800138240 bytes) -- ignoring
+0.02.416.903 W read_raw_unsafe: Falling back to buffered IO due to Bad address
+0.10.266.886 I cmn          init: llama threadpool init, n_threads = 16
+0.10.338.062 I 
+0.10.338.226 I system_info: n_threads = 16 (n_threads_batch = 16) / 32 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.10.338.245 I perplexity: tokenizing the input ..
+0.10.634.249 I perplexity: tokenization took 295.995 ms
+0.10.634.315 I perplexity: calculating perplexity over 32 chunks, n_ctx=4096, batch_size=4096, n_seq=1
+0.15.457.856 I perplexity: 4.82 seconds per pass - ETA 2.57 minutes
+[1]1.5334,[2]2.4398,[3]2.2929,[4]2.4665,[5]2.8617,[6]3.1943,[7]3.4317,[8]3.6586,[9]3.7731,[10]3.6568,[11]3.5021,[12]3.3533,[13]3.2692,[14]3.5142,[15]3.5533,[16]3.5481,[17]3.6205,[18]3.6717,[19]3.6406,[20]3.6137,[21]3.6799,[22]3.8667,[23]3.8071,[24]3.9025,[25]3.9289,[26]3.9365,[27]3.9494,[28]3.9585,[29]3.9433,[30]3.9574,[31]4.0244,[32]4.1064,
+2.49.264.656 I Final estimate: PPL = 4.1064 +/- 0.03469
+
+2.49.266.364 W ~llama_context:    Vulkan0 compute buffer size of 4191.5200 MiB, does not match expectation of 6250.9067 MiB

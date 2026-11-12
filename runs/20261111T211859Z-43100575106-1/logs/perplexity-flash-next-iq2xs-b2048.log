@@ -1,0 +1,20 @@
+0.01.095.348 W model has unused tensor per_layer_token_embd.weight (size = 28800138240 bytes) -- ignoring
+0.14.388.379 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but fused DeepSeek V4 HC pre is assigned to device CPU (usually due to missing support)
+0.14.388.383 W resolve_fused_ops: fused DeepSeek V4 HC pre not supported, set to disabled
+0.14.395.120 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but fused DeepSeek V4 HC post is assigned to device CPU (usually due to missing support)
+0.14.395.121 W resolve_fused_ops: fused DeepSeek V4 HC post not supported, set to disabled
+0.14.398.604 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but f16 MoE activations is assigned to device CPU (usually due to missing support)
+0.14.398.605 W resolve_fused_ops: f16 MoE activations not supported, set to disabled
+0.14.402.268 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but f16 GDN output norm is assigned to device CPU (usually due to missing support)
+0.14.402.269 W resolve_fused_ops: f16 GDN output norm not supported, set to disabled
+0.14.529.447 I cmn          init: llama threadpool init, n_threads = 16
+0.14.651.251 I 
+0.14.651.410 I system_info: n_threads = 16 (n_threads_batch = 16) / 32 | ROCm : NO_VMM = 1 | FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.14.651.426 I perplexity: tokenizing the input ..
+0.14.956.211 I perplexity: tokenization took 304.776 ms
+0.14.956.614 I perplexity: calculating perplexity over 32 chunks, n_ctx=4096, batch_size=2048, n_seq=1
+0.19.347.253 I perplexity: 4.39 seconds per pass - ETA 2.33 minutes
+[1]1.5323,[2]2.4372,[3]2.2891,[4]2.4655,[5]2.8590,[6]3.1921,[7]3.4273,[8]3.6550,[9]3.7679,[10]3.6521,[11]3.4970,[12]3.3506,[13]3.2674,[14]3.5138,[15]3.5539,[16]3.5480,[17]3.6193,[18]3.6714,[19]3.6397,[20]3.6133,[21]3.6799,[22]3.8675,[23]3.8087,[24]3.9041,[25]3.9313,[26]3.9383,[27]3.9517,[28]3.9607,[29]3.9451,[30]3.9586,[31]4.0257,[32]4.1083,
+2.23.432.238 I Final estimate: PPL = 4.1083 +/- 0.03470
+
+2.23.514.090 W ~llama_context:  ROCm_Host compute buffer size of 108.1094 MiB, does not match expectation of 100.1914 MiB
