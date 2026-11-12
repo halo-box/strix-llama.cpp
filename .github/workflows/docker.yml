@@ -84,7 +84,7 @@ jobs:
             { "tag": "cpu", "dockerfile": ".devops/cpu.Dockerfile", "platforms": "linux/arm64", "full": true, "light": true, "server": true, "free_disk_space": false, "runs_on": "ubuntu-24.04-arm" },
             { "tag": "vulkan", "dockerfile": ".devops/vulkan.Dockerfile", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": false, "runs_on": "ubuntu-24.04" },
             { "tag": "vulkan", "dockerfile": ".devops/vulkan.Dockerfile", "platforms": "linux/arm64", "full": true, "light": true, "server": true, "free_disk_space": false, "runs_on": "ubuntu-24.04-arm" },
-            { "tag": "rocm", "dockerfile": ".devops/rocm.Dockerfile", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" }
+            { "tag": "rocm", "dockerfile": ".devops/rocm.Dockerfile", "rocm_docker_arch": "gfx1151", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": true, "runs_on": "ubuntu-24.04" }
           ]
           JSON
 
@@ -243,6 +243,7 @@ jobs:
             IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
             ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
             ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
+            ${{ matrix.config.rocm_docker_arch && format('ROCM_DOCKER_ARCH={0}', matrix.config.rocm_docker_arch) || '' }}
           annotations: |
             manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
             manifest:org.opencontainers.image.version=${{ needs.create_tag.outputs.source_tag }}
@@ -280,6 +281,7 @@ jobs:
             IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
             ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
             ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
+            ${{ matrix.config.rocm_docker_arch && format('ROCM_DOCKER_ARCH={0}', matrix.config.rocm_docker_arch) || '' }}
           annotations: |
             manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
             manifest:org.opencontainers.image.version=${{ needs.create_tag.outputs.source_tag }}
@@ -317,6 +319,7 @@ jobs:
             IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
             ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
             ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
+            ${{ matrix.config.rocm_docker_arch && format('ROCM_DOCKER_ARCH={0}', matrix.config.rocm_docker_arch) || '' }}
           annotations: |
             manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
             manifest:org.opencontainers.image.version=${{ needs.create_tag.outputs.source_tag }}
