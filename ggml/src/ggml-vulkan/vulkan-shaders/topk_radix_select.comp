@@ -33,7 +33,7 @@ layout (push_constant) uniform parameter {
 shared uint histo[RADIX_SIZE];
 shared uint sh_bucket;
 shared uint sh_above;
-shared uint sg_cnt[64];  // per-subgroup hit counts for the slot scan
+shared uint sg_cnt[BLOCK_SIZE];  // per-subgroup hit counts for the slot scan, sized for any subgroup size
 
 // order-preserving float -> uint mapping
 uint f2ui(float x) {
