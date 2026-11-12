@@ -27,21 +27,23 @@ Disabled 2026-11-11:
 | ci-self-hosted-kleidiai.yml | KleidiAI (ARM) |
 | build-3rd-party.yml | third-party libs, ARM64 runner only |
 | server-self-hosted.yml | server tests on CUDA and macOS runners |
+| build-cache.yml | OpenVINO toolkit cache (disabled 2026-11-12) |
 
 `models-check.yml` keeps only its in-scope jobs: `rocm`, `vulkan-nvidia` and `vulkan-amd`. Its `cuda`,
 `metal` and `webgpu-nvidia` jobs are removed.
 
 Kept: build-cpu, ci-self-hosted-cpu, build-vulkan, ci-self-hosted-vulkan, build-llamacpp-rocm,
 test-llamacpp-rocm, hip-quality-check, models-check, bench-gfx1151 (three lanes), server,
-server-sanitize, build-sanitize, build-cmake-pkg, build-cache, ui (five lanes), and the
+server-sanitize, build-sanitize, build-cmake-pkg, docker, ui (five lanes), and the
 platform-neutral checks (code-style, editorconfig, python-*, update-ops-docs, pre-tokenizer-hashes,
 check-vendor, labeler, pr-draft-label, close-issue, ai-issues, copilot-setup-steps, make-release,
 gguf-publish, nightly-failure-alert, upstream-sync-report). `bench.yml.disabled` was already disabled
 before this change.
 
-Still multi-platform on purpose: `docker.yml` publishes container images (cpu/arm64/s390x/cuda/vulkan/
-rocm/openvino); it is a publish pipeline, not a test. `winget.yml` stops itself with
-`if: github.repository_owner == 'ggml-org'`.
+`docker.yml` publishes only the `cpu` (amd64, arm64), `vulkan` (amd64, arm64) and `rocm` (amd64) images, and
+`make-release.yml` re-tags only those at a release (2026-11-12). The other images never built on this fork, and
+the job that creates the shared `server-rocm`/`server-vulkan` tags waits for every image, so no tag was created.
+`winget.yml` stops itself with `if: github.repository_owner == 'ggml-org'`.
 
 Two things to know:
 
