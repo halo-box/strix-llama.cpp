@@ -4,6 +4,7 @@
 //  2. llama_model::create_memory builds the indexer cache with that type, main and MTP contexts.
 //  3. Session state: a state with another indexer type is rejected with the hybrid-idx message; same-type states
 //     round-trip; an attention-section mismatch keeps the cache's own message.
+//  4. A restore gives the indexer cells the image 2D position of the attention cells, so the compact verdict after a restore is the one before the save.
 #include "qsa-mem-fixture.h"
 
 #include "../src/llama-cparams.h"
@@ -82,11 +83,11 @@ static void set_hparams(llama_model & model, uint32_t n_layer, uint32_t n_nextn)
     }
 }
 
-static llama_cparams make_cparams(uint32_t kv_size, llama_context_type ctx_type) {
+static llama_cparams make_cparams(uint32_t kv_size, llama_context_type ctx_type, uint32_t n_seq_max = 1) {
     llama_cparams cp = {};
     cp.n_ctx = cp.n_ctx_seq = kv_size;
     cp.n_batch = cp.n_ubatch = 64;
-    cp.n_seq_max = 1;
+    cp.n_seq_max = n_seq_max;
     cp.n_rs_seq = 0;
     cp.flash_attn = true;
     cp.offload_kqv = false;   // CPU buffers: the model has no devices
@@ -98,12 +99,12 @@ static llama_cparams make_cparams(uint32_t kv_size, llama_context_type ctx_type)
 
 // the memory llama_context would create for this model, through llama_model::create_memory
 static llama_memory_hybrid_idx * create(qsa_fixture & f, llm_arch arch, ggml_type tk, ggml_type tk_idx, llama_context_type ctx_type,
-                                        uint32_t n_layer = 1, uint32_t n_nextn = 0) {
+                                        uint32_t n_layer = 1, uint32_t n_nextn = 0, uint32_t kv_size = 256, uint32_t n_seq_max = 1) {
     f.mem.reset();
     f.model.reset(llama_model_create(arch, llama_model_default_params()));
     set_hparams(*f.model, n_layer, n_nextn);
     const llama_memory_params mp = { tk, tk, tk_idx, false, ctx_type, nullptr };
-    const llama_cparams cp = make_cparams(256, ctx_type);
+    const llama_cparams cp = make_cparams(kv_size, ctx_type, n_seq_max);
     llama_memory_i * m = f.model->create_memory(mp, cp);
     auto * h = dynamic_cast<llama_memory_hybrid_idx *>(m);
     if (!h) { delete m; }
@@ -224,11 +225,86 @@ static void test_session() {
     CHECK(e4 == "failed to restore kv cache", "attention mismatch: %s", e4.c_str());
 }
 
+// the 2D cells of seq in a cache, and the cells whose (x, y) differ from those of the same cell in ref
+static uint32_t n_2d_cells(const llama_kv_cache * kv, llama_seq_id seq) {
+    const auto & c = kv->get_cells(seq);
+    uint32_t n = 0;
+    for (uint32_t j = 0; j < c.size(); ++j) {
+        n += !c.is_empty(j) && c.seq_has(j, seq) && qsa_key_2d(c, j);
+    }
+    return n;
+}
+static uint32_t n_2d_mismatch(const llama_kv_cache * kv, const llama_kv_cache * ref, llama_seq_id seq) {
+    const auto & c = kv->get_cells(seq);
+    const auto & r = ref->get_cells(seq);
+    uint32_t n = 0;
+    for (uint32_t j = 0; j < c.size(); ++j) {
+        if (c.is_empty(j)) { continue; }
+        n += c.ext_get(j).x != r.ext_get(j).x || c.ext_get(j).y != r.ext_get(j).y;
+    }
+    return n;
+}
+
+// the compact verdict of a 10-token text ubatch of seq 0, after the cache took it
+static int next_verdict(qsa_fixture & f) {
+    int reason = -1;
+    GGML_ASSERT(f.feed(f.text(0, 10), 64, [&](const llama_memory_hybrid_idx_context * m, const llama_ubatch & ub, uint32_t) {
+        reason = m->qsa_compact_reason(ub, 4);
+    }));
+    return reason;
+}
+
+// the indexer has no rope of its own, so its saved state carries no x/y; the compact predicate and the scan's ranking read them from the indexer cells, so a restore takes them from the attention cells (same layout).
+// Slot 0 holds text, an image and text; with two slots, slot 1 holds text in the saving and in the restoring memory, as in a server.
+static void test_restore_2d() {
+    for (const uint32_t n_seq : { 1u, 2u }) {
+        qsa_fixture a(1024, n_seq, true);
+        a.mem.reset(create(a, LLM_ARCH_QWEN4EXP, GGML_TYPE_F16, GGML_TYPE_COUNT, LLAMA_CONTEXT_TYPE_DEFAULT, 1, 0, 1024, n_seq));
+        GGML_ASSERT(a.mem);
+        GGML_ASSERT(a.feed(a.text(0, 20), 64));
+        GGML_ASSERT(a.feed(a.image(0, 8, 8), 64));
+        GGML_ASSERT(a.feed(a.text(0, 20), 64));
+        if (n_seq > 1) { GGML_ASSERT(a.feed(a.text(1, 30), 64)); }
+        io_vec_write w;
+        a.mem->state_write(w, 0, 0);
+
+        qsa_fixture b(1024, n_seq, true);
+        b.mem.reset(create(b, LLM_ARCH_QWEN4EXP, GGML_TYPE_F16, GGML_TYPE_COUNT, LLAMA_CONTEXT_TYPE_DEFAULT, 1, 0, 1024, n_seq));
+        GGML_ASSERT(b.mem);
+        if (n_seq > 1) { GGML_ASSERT(b.feed(b.text(1, 30), 64)); }
+        io_vec_read r(w.buf);
+        std::string err;
+        try {
+            b.mem->state_read(r, 0, 0);
+        } catch (const std::exception & e) {
+            err = e.what();
+        }
+        CHECK(err.empty(), "n_seq %u: restore failed: %s", n_seq, err.c_str());
+        if (!err.empty()) { continue; }
+        b.next_pos[0] = a.next_pos[0];
+
+        const uint32_t n_2d_a   = n_2d_cells(a.mem->get_mem_idx(), 0);
+        const uint32_t n_2d_b   = n_2d_cells(b.mem->get_mem_idx(), 0);
+        const uint32_t n_attn_b = n_2d_cells(b.mem->get_mem_attn(), 0);
+        const uint32_t n_mis    = n_2d_mismatch(b.mem->get_mem_idx(), b.mem->get_mem_attn(), 0);
+        const int      v_a      = next_verdict(a);
+        const int      v_b      = next_verdict(b);
+        printf("restore 2d: %u slot(s): indexer 2D cells saved %u, restored %u (attention %u), x/y mismatches %u; next text ubatch %s / %s\n",
+               n_seq, n_2d_a, n_2d_b, n_attn_b, n_mis, qsa_compact_reason_name(v_a), qsa_compact_reason_name(v_b));
+        CHECK(n_2d_a > 0 && n_2d_b == n_2d_a && n_attn_b == n_2d_a, "n_seq %u: 2D cells saved %u, restored %u, attention %u",
+              n_seq, n_2d_a, n_2d_b, n_attn_b);
+        CHECK(n_mis == 0, "n_seq %u: %u indexer cells with another x/y than the attention cell", n_seq, n_mis);
+        CHECK(v_a == (n_seq > 1 ? QSA_NC_2D_MULTI_SEQ : QSA_COMPACT_OK) && v_b == v_a, "n_seq %u: verdict before %s, after the restore %s",
+              n_seq, qsa_compact_reason_name(v_a), qsa_compact_reason_name(v_b));
+    }
+}
+
 int main() {
     ggml_backend_load_all();
     test_mapping();
     test_create_memory();
     test_session();
+    test_restore_2d();
     if (n_fail) {
         printf("test-qsa-idx-type: %d FAILED\n", n_fail);
         return 1;
