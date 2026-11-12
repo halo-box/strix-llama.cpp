@@ -12352,7 +12352,7 @@ struct test_qsa_expand : public test_case {
     // GGML_VK_TEST_REQUIRE_QSA_EXPAND=1: one QSA_EXPAND dispatch per strip
     bool checks_engagement() override { return true; }
     bool verify_engagement(ggml_backend_t backend, std::string & msg) override {
-        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_EXPAND")) {
+        if (!engagement_required(backend, "GGML_VK_TEST_REQUIRE_QSA_EXPAND", "QSA_EXPAND")) {
             return true;
         }
         const int64_t n = dispatch_census_count(backend, "QSA_EXPAND"), want = strips;
