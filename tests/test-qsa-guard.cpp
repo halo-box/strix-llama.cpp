@@ -25,6 +25,19 @@
 #include <string>
 #include <vector>
 
+// setenv / unsetenv are POSIX: _putenv_s sets the variable, and removes it when the value is empty
+static void test_setenv(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 static std::string g_log;
 
 static void log_capture(ggml_log_level level, const char * text, void *) {
@@ -206,7 +219,7 @@ int main(int argc, char ** argv) {
     }
 
     if (mode == "reject") {
-        setenv("GGML_CUDA_SA_FORCE", "reject", 1);
+        test_setenv("GGML_CUDA_SA_FORCE", "reject");
     }
     if (mode == "causal-sync") {
         cp.n_seq_max = 2;
@@ -319,7 +332,7 @@ int main(int argc, char ** argv) {
         if (ctx == nullptr) {
             rc = fail("context creation");
         } else {
-            setenv("GGML_CUDA_SA_FORCE", "reject", 1);
+            test_setenv("GGML_CUDA_SA_FORCE", "reject");
             // 256 queries: q8_0 takes the sparse op, not the dense shortcut, at this n_q
             std::vector<llama_token> tok(256, 1);
             llama_batch b = llama_batch_get_one(tok.data(), (int32_t) tok.size());

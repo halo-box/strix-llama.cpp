@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <bitset>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,19 @@
 #include <set>
 #include <string>
 #include <vector>
+
+// setenv / unsetenv are POSIX: _putenv_s sets the variable, and removes it when the value is empty
+static void test_setenv(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
 
 static ggml_backend_reg_t         g_reg     = nullptr;
 static ggml_backend_dev_t         g_dev     = nullptr;
@@ -154,7 +168,7 @@ static void set_hadamards(const std::vector<ggml_tensor *> & hs) {
         const float sc = 1.0f / std::sqrt((float) r);
         for (int i = 0; i < r; ++i) {
             for (int j = 0; j < r; ++j) {
-                m[(size_t) i * r + j] = (__builtin_popcount(i & j) & 1 ? -1.0f : 1.0f) * sc;
+                m[(size_t) i * r + j] = (std::bitset<32>((unsigned) (i & j)).count() & 1 ? -1.0f : 1.0f) * sc;
             }
         }
         ggml_backend_tensor_set(h, m.data(), 0, ggml_nbytes(h));
@@ -206,11 +220,7 @@ static std::vector<sa_shape> shapes() {
 static void set_force_rot_dump(bool on) {
     static const std::string base = getenv("GGML_CUDA_SA_FORCE") ? getenv("GGML_CUDA_SA_FORCE") : "";
     const std::string v = on ? base + (base.empty() ? "" : ",") + "rot_dump" : base;
-    if (v.empty()) {
-        unsetenv("GGML_CUDA_SA_FORCE");
-    } else {
-        setenv("GGML_CUDA_SA_FORCE", v.c_str(), 1);
-    }
+    test_setenv("GGML_CUDA_SA_FORCE", v.empty() ? nullptr : v.c_str());
 }
 
 static void test_hq() {
@@ -432,7 +442,7 @@ static void test_gated() {
 }
 
 int main(int argc, char ** argv) {
-    setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+    test_setenv("GGML_CUDA_DISABLE_GRAPHS", "1");
     ggml_backend_load_all();
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("ROCm");
     if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
