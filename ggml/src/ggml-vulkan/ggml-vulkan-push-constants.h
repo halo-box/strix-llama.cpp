@@ -823,7 +823,7 @@ struct vk_op_gated_delta_net_push_constants {
 struct vk_op_exl3_rotate_push_constants {
     uint32_t k, rows, ne1, ne2;
     uint32_t s1, s2, s3, x_off;
-    uint32_t n_counters, n_used, ids_s1;
+    uint32_t n_counters, n_used, ids_s1, n_exp;
 };
 
 // exl3_rotate_split.comp: strides and offsets in floats
@@ -831,6 +831,7 @@ struct vk_op_exl3_rotate_split_push_constants {
     uint32_t k, rows, ne1, ne2;
     uint32_t s1, s2, s3, x_off;
     uint32_t zero, lo, n_used, ids_s1;
+    uint32_t n_exp;
 };
 
 // exl3_mul_mat_vec.comp, exl3_mul_mm_cm1.comp; tq_stride: uint32 words of one expert's trellis (ID)

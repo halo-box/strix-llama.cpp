@@ -7,10 +7,9 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-// EXL3 input rotation for the GEMM path (exl3_mul_mm_cm1.comp), as exl3_rotate_split in ggml-cuda/exl3.cu:
-// xh = H(x*suh) per 128 block, then per row a power of two s with max|xh|*s in [2^14, 2^15) (s = 1 for a row without a
-// finite nonzero value): hi = f16(xh*s), lo = f16(xh*s - hi) (with p.lo), inv[r] = 1/s. Rows in [rows, rows_pad) are
-// written as zeros. One workgroup of 8 wave32 per row; the rotation runs twice (max, then the stores).
+// EXL3 input rotation for the GEMM path (exl3_mul_mm_cm1.comp), as exl3_rotate_split in ggml-cuda/exl3.cu: xh = H(x*suh) per 128 block, then per row a power of two s with max|xh|*s in [2^14, 2^15) (s = 1 for a row without a finite nonzero value): hi = f16(xh*s), lo = f16(xh*s - hi) (with p.lo), inv[r] = 1/s.
+// Rows in [rows, rows_pad) are written as zeros.
+// One workgroup of 8 wave32 per row; the rotation runs twice (max, then the stores).
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -27,6 +26,7 @@ layout(push_constant) uniform parameter {
     uint lo;          // 1: write lo
     uint n_used;      // ID: slots per token
     uint ids_s1;      // ID: ids row stride in int32
+    uint n_exp;       // ID: experts (ids are clamped to [0, n_exp))
 } p;
 
 layout(binding = 0) readonly buffer X  { float     data_x[];  };
@@ -41,22 +41,7 @@ layout(binding = 6) readonly buffer ORD { uint data_ord[]; };
 
 shared float sh_max[8];
 
-void exl3_fwht128(inout float v[4], const uint lane) {
-    [[unroll]] for (uint h = 1; h < 32; h <<= 1) {
-        [[unroll]] for (uint i = 0; i < 4; ++i) {
-            const float o = subgroupShuffleXor(v[i], h);
-            v[i] = (lane & h) != 0 ? o - v[i] : v[i] + o;
-        }
-    }
-    const float a0 = v[0] + v[1];
-    const float a1 = v[0] - v[1];
-    const float a2 = v[2] + v[3];
-    const float a3 = v[2] - v[3];
-    v[0] = a0 + a2;
-    v[1] = a1 + a3;
-    v[2] = a0 - a2;
-    v[3] = a1 - a3;
-}
+#include "exl3_fwht.glsl"
 
 void main() {
     const uint r    = gl_WorkGroupID.x;
@@ -85,7 +70,7 @@ void main() {
     const uint slot = pr % p.n_used;
     const uint tok  = pr / p.n_used;
     xb = p.x_off + (slot % p.ne1)*p.s1 + tok*p.s2;
-    sb = uint(data_ids[tok*p.ids_s1 + slot])*p.k;
+    sb = uint(clamp(data_ids[tok*p.ids_s1 + slot], 0, int(p.n_exp) - 1))*p.k;
 #else
     const uint i1 = r % p.ne1;
     const uint i2 = (r / p.ne1) % p.ne2;

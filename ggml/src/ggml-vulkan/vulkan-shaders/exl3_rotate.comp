@@ -6,8 +6,9 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 
-// EXL3 input rotation, see ggml/exl3/README.md: xh[r] = H(x[r]*suh) per 128 block, f32, bit for bit the rotation of
-// ggml-cpu/exl3-ops.cpp. One wave32 per (row, 128 block). Also zeroes the dot kernel's arrival counters.
+// EXL3 input rotation, see ggml/exl3/README.md: xh[r] = H(x[r]*suh) per 128 block, f32, bit for bit the rotation of ggml-cpu/exl3-ops.cpp.
+// One wave32 per (row, 128 block).
+// Also zeroes the dot kernel's arrival counters.
 // ID: row r is (slot, token) pair ord[r] (exl3_route.comp) with the suh of its expert (EXL3_MUL_MAT_ID).
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -24,6 +25,7 @@ layout(push_constant) uniform parameter {
     uint n_counters;
     uint n_used;      // ID: slots per token
     uint ids_s1;      // ID: ids row stride in int32
+    uint n_exp;       // ID: experts (ids are clamped to [0, n_exp))
 } p;
 
 layout(binding = 0) readonly buffer X  { float     data_x[];  };
@@ -35,22 +37,7 @@ layout(binding = 4) readonly buffer IDS { int      data_ids[]; };
 layout(binding = 5) readonly buffer ORD { uint     data_ord[]; };
 #endif
 
-void exl3_fwht128(inout float v[4], const uint lane) {
-    [[unroll]] for (uint h = 1; h < 32; h <<= 1) {
-        [[unroll]] for (uint i = 0; i < 4; ++i) {
-            const float o = subgroupShuffleXor(v[i], h);
-            v[i] = (lane & h) != 0 ? o - v[i] : v[i] + o;
-        }
-    }
-    const float a0 = v[0] + v[1];
-    const float a1 = v[0] - v[1];
-    const float a2 = v[2] + v[3];
-    const float a3 = v[2] - v[3];
-    v[0] = a0 + a2;
-    v[1] = a1 + a3;
-    v[2] = a0 - a2;
-    v[3] = a1 - a3;
-}
+#include "exl3_fwht.glsl"
 
 void main() {
     const uint gid = gl_GlobalInvocationID.x;
@@ -75,7 +62,7 @@ void main() {
     const uint pr   = data_ord[r];
     const uint slot = pr % p.n_used;
     const uint tok  = pr / p.n_used;
-    const int  e    = data_ids[tok*p.ids_s1 + slot];
+    const int  e    = clamp(data_ids[tok*p.ids_s1 + slot], 0, int(p.n_exp) - 1);
     xb  = p.x_off + (slot % p.ne1)*p.s1 + tok*p.s2 + seg*128;
     sb += uint(e)*p.k;
 #else
