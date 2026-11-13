@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -2066,6 +2067,182 @@ struct backend_test_case {
     bool enabled_by_default;
 };
 
+
+// tripwire: a new field in common_params_sampling changes the struct size on the reference ABI -
+// update common_params_sampling_equal() and this value. guarded: sizeof is not portable across ABIs.
+#if defined(__x86_64__) && defined(__GLIBCXX__)
+static_assert(sizeof(common_params_sampling) == 704, "update common_params_sampling_equal");
+#endif
+
+// sampler reuse: parity with fresh init, gate coverage, and the failed-init sequence
+static void test_sampler_reuse(const test_params & params) {
+    auto * model = params.model.get();
+    GGML_ASSERT(model);
+
+    auto base_params = []() {
+        common_params_sampling sp;
+        sp.seed = 42;
+        sp.temp = 0.7f;
+        sp.top_k = 20;
+        sp.top_p = 0.95f;
+        sp.min_p = 0.05f;
+        sp.penalty_repeat = 1.05f;
+        sp.samplers = {
+            COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TEMPERATURE,
+            COMMON_SAMPLER_TYPE_TOP_P, COMMON_SAMPLER_TYPE_MIN_P,
+            COMMON_SAMPLER_TYPE_PENALTIES,
+        };
+        return sp;
+    };
+
+    // sample 16 steps, reuse, then compare 16 more steps with a fresh chain: reuse must clear the
+    // state accumulated by use (prev tokens, penalty counters), on CPU and with backend_sampling on
+    for (bool backend : { false, true }) {
+        auto sp = base_params();
+        sp.backend_sampling = backend;
+
+        std::mt19937 rng(1234);
+        std::vector<std::array<float, 8>> rows(32);
+        for (auto & row : rows) {
+            for (float & v : row) {
+                v = (float)(rng() % 1000) / 100.0f - 5.0f;
+            }
+        }
+
+        const auto sample_step = [](common_sampler * s, const std::array<float, 8> & row) {
+            llama_token_data tokens[8];
+            for (int i = 0; i < 8; ++i) {
+                tokens[i] = { i, row[i], 0.0f };
+            }
+            llama_token_data_array cand{ tokens, 8, -1, false };
+            llama_sampler_apply(common_sampler_get(s), &cand);
+            const llama_token tok = tokens[cand.selected].id;
+            common_sampler_accept(s, tok, true);
+            return tok;
+        };
+
+        auto sp_reuse = sp;
+        common_sampler_ptr reused(common_sampler_init(model, sp_reuse));
+        for (int step = 0; step < 16; ++step) {
+            sample_step(reused.get(), rows[step]);
+        }
+        GGML_ASSERT(common_sampler_reuse(reused.get(), model, sp_reuse) && "reuse of identical params must succeed");
+        std::vector<llama_token> tokens_after_reuse;
+        for (int step = 0; step < 16; ++step) {
+            tokens_after_reuse.push_back(sample_step(reused.get(), rows[16 + step]));
+        }
+
+        // reuse resets the chain to the state of a fresh init: the 16 steps after reuse, on the same
+        // rows, must equal the first 16 steps of a fresh chain
+        auto sp_fresh = sp;
+        common_sampler_ptr fresh(common_sampler_init(model, sp_fresh));
+        std::vector<llama_token> tokens_fresh;
+        for (int step = 0; step < 16; ++step) {
+            tokens_fresh.push_back(sample_step(fresh.get(), rows[16 + step]));
+        }
+
+        GGML_ASSERT(tokens_after_reuse == tokens_fresh && "reused sampler diverged from a fresh chain");
+        printf("reuse parity ok (backend_sampling = %d)\n", backend);
+    }
+
+    // backend case with a real context: register, decode, reuse, re-register the same pointer (the
+    // llama_context::set_sampler no-op), decode - a fresh chain taking the same path in a fresh
+    // context must sample the same tokens
+    {
+        auto sp = base_params();
+        sp.backend_sampling = true;
+
+        const auto run_sequence = [&](common_sampler * s, test_context & ctx) {
+            GGML_ASSERT(ctx.decode({{0, "Hello"}}));
+            llama_token t1 = llama_get_sampled_token_ith(ctx.ctx.get(), ctx.idx_for_seq(0));
+
+            auto sp2 = sp;
+            GGML_ASSERT(common_sampler_reuse(s, model, sp2) && "reuse of identical params must succeed");
+            llama_set_sampler(ctx.ctx.get(), 0, common_sampler_get(s)); // same pointer: no-op
+
+            GGML_ASSERT(ctx.decode_tokens({{0, t1}}));
+            llama_token t2 = llama_get_sampled_token_ith(ctx.ctx.get(), ctx.idx_for_seq(0));
+            return std::make_pair(t1, t2);
+        };
+
+        auto sp_reuse = sp;
+        common_sampler_ptr sampler(common_sampler_init(model, sp_reuse));
+        std::vector<llama_sampler_seq_config> configs = { { 0, common_sampler_get(sampler.get()) } };
+        test_context test_ctx(params, configs);
+        const auto tokens = run_sequence(sampler.get(), test_ctx);
+
+        auto sp_fresh = sp;
+        common_sampler_ptr fresh(common_sampler_init(model, sp_fresh));
+        std::vector<llama_sampler_seq_config> fresh_configs = { { 0, common_sampler_get(fresh.get()) } };
+        test_context fresh_ctx(params, fresh_configs);
+        const auto fresh_tokens = run_sequence(fresh.get(), fresh_ctx);
+
+        GGML_ASSERT(tokens == fresh_tokens && "backend reuse diverged from a fresh chain");
+        printf("backend reuse via test_context ok\n");
+    }
+
+    // seedless: the gate compares the raw seed, so reuse is allowed; per-instance rngs differ by design
+    {
+        auto sp = base_params();
+        sp.seed = LLAMA_DEFAULT_SEED;
+        auto sp2 = sp;
+        common_sampler_ptr sampler(common_sampler_init(model, sp));
+        GGML_ASSERT(common_sampler_reuse(sampler.get(), model, sp2));
+    }
+
+    // gate table: changing one field at a time must refuse reuse
+    {
+        using mutate_fn = std::function<void(common_params_sampling &)>;
+        const std::vector<std::pair<const char *, mutate_fn>> mutations = {
+            { "n_probs",            [](auto & p) { p.n_probs = 5; } },
+            { "seed",               [](auto & p) { p.seed = 43; } },
+            { "n_prev",             [](auto & p) { p.n_prev = 128; } },
+            { "temp",               [](auto & p) { p.temp = 0.8f; } },
+            { "top_k",              [](auto & p) { p.top_k = 40; } },
+            { "top_p",              [](auto & p) { p.top_p = 0.5f; } },
+            { "min_p",              [](auto & p) { p.min_p = 0.1f; } },
+            { "xtc_probability",    [](auto & p) { p.xtc_probability = 0.1f; } },
+            { "typ_p",              [](auto & p) { p.typ_p = 0.5f; } },
+            { "penalty_repeat",     [](auto & p) { p.penalty_repeat = 1.2f; } },
+            { "dry_multiplier",     [](auto & p) { p.dry_multiplier = 0.4f; } },
+            { "mirostat",           [](auto & p) { p.mirostat = 2; } },
+            { "samplers",           [](auto & p) { p.samplers.push_back(COMMON_SAMPLER_TYPE_XTC); } },
+            { "logit_bias",         [](auto & p) { p.logit_bias.push_back({ 1, 2.0f }); } },
+            { "generation_prompt",  [](auto & p) { p.generation_prompt = { 1, 2, 3 }; } },
+            { "grammar",            [](auto & p) { p.grammar = { COMMON_GRAMMAR_TYPE_USER, "root ::= [a-z]+" }; } },
+            { "reasoning_budget",   [](auto & p) {
+                p.reasoning_budget_enabled = true; p.reasoning_budget_tokens = 10;
+                p.reasoning_budget_start = { 1 }; p.reasoning_budget_end = { { 2 } }; } },
+            { "backend_sampling",   [](auto & p) { p.backend_sampling = !p.backend_sampling; } },
+        };
+
+        for (const auto & [name, mutate] : mutations) {
+            auto sp = base_params();
+            sp.backend_sampling = true;
+            common_sampler_ptr sampler(common_sampler_init(model, sp));
+            auto sp2 = sp;
+            mutate(sp2);
+            GGML_ASSERT(!common_sampler_reuse(sampler.get(), model, sp2) && "reuse must be refused");
+            printf("gate refuses on %s\n", name);
+        }
+    }
+
+    // failed-init sequence: a request with an invalid grammar differs in the plain fields, so the
+    // gate misses without building (and without throwing); the chain stays intact and reusable
+    {
+        auto sp = base_params();
+        sp.backend_sampling = true;
+        common_sampler_ptr sampler(common_sampler_init(model, sp));
+
+        auto sp_bad = sp;
+        sp_bad.grammar = { COMMON_GRAMMAR_TYPE_USER, "root ::= (" };
+        GGML_ASSERT(!common_sampler_reuse(sampler.get(), model, sp_bad) && "grammar change must miss the gate");
+
+        auto sp_ok = sp;
+        GGML_ASSERT(common_sampler_reuse(sampler.get(), model, sp_ok) && "chain must survive the gate miss");
+    }
+}
+
 // note: test names are "test_<suffix>" and match the function implementing them
 static const backend_test_case BACKEND_TESTS[] = {
     // single sampler
@@ -2086,6 +2263,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_mixed",                  test_mixed,                  true },
     { "test_cpu_mixed",              test_cpu_mixed,              true },
     { "test_set_sampler",            test_set_sampler,            true },
+    { "test_sampler_reuse",          test_sampler_reuse,          true },
     // multiple outputs per sequence
     { "test_multi_output_limit",                  test_multi_output_limit,               true },
     { "test_multi_output_multi_sequence_dist",    test_multi_output_multi_sequence_dist, true },
