@@ -789,3 +789,50 @@ def test_slot_restore_checkpoints_draft_kv_type_change(swa_server, ctkd_restore)
     })
     assert res.status_code == 200
     assert res.body["timings"]["prompt_n"] == n_live
+
+
+def test_slot_save_restore_draft_state(swa_server):
+    server = swa_server
+    server.model_draft_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"  # same file as the target, already in the HF cache
+    server.spec_type = "draft-simple"
+    server.start()
+
+    filename = "draft_slot1.bin"
+    prompt = "The quick brown fox jumps over the lazy dog. " * 20
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    n_prompt = res.body["timings"]["prompt_n"]
+
+    res = server.make_request("POST", "/slots/1?action=save", data={"filename": filename})
+    assert res.status_code == 200
+    n_written = res.body["n_written"]
+
+    with open(os.path.join(server.slot_save_path, filename), "rb") as f:
+        data = f.read()
+    assert n_written == len(data)
+    assert struct.pack("<I", 0x54464453) in data  # the draft state appendix, "SDFT"
+
+    # the slot and its draft context hold another conversation when the file is restored
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "An entirely different conversation about the weather in the mountains. " * 20,
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=restore", data={"filename": filename})
+    assert res.status_code == 200
+    assert res.body["n_read"] == n_written
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] < n_prompt / 4
