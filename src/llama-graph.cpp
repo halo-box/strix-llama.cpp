@@ -1628,6 +1628,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    exl3             (params.exl3),
     samplers         (params.samplers),
     mtp_draft        (params.mtp_draft),
     prefetch         (params.prefetch),
@@ -1688,6 +1689,14 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    // an EXL3 weight has no scale tensor, and LoRA adapters cannot name it
+    if (exl3) {
+        if (const auto it = exl3->linears.find(w); it != exl3->linears.end()) {
+            GGML_ASSERT(w_s == nullptr);
+            return ggml_exl3_mul_mat(ctx0, w, cur, it->second.suh, it->second.svh, hparams.exl3_codebook);
+        }
+    }
+
     cur = build_hadamard_input(w, cur);
     if (vsub != nullptr && loras->empty()) {
         // Q8_0 2560x248320 with one output is byte-exact on gfx1151 HIP (2026-10-15).
@@ -1783,6 +1792,17 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
+    // EXL3 experts: no scale tensor, no MoE cache, and LoRA adapters cannot name them
+    if (exl3) {
+        if (const auto it = exl3->linears.find(w); it != exl3->linears.end()) {
+            GGML_ASSERT(w_s == nullptr);
+            if (slots != nullptr) {
+                throw std::runtime_error("EXL3 experts cannot be used with the MoE expert cache");
+            }
+            return ggml_exl3_mul_mat_id(ctx0, w, cur, ids, it->second.suh, it->second.svh, hparams.exl3_codebook);
+        }
+    }
+
     cur = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
@@ -2429,7 +2449,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool moe_f16 = cparams.fused_moe_f16 && moe_f16_arch && il >= 0 && n_tokens >= 32 &&
         type_op == LLM_FFN_SILU && gate_exps && !gate_up_exps && !weight_before_ffn &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
-        hparams.swiglu_clamp_exp[il] <= 1e-6f && hparams.n_expert_used(il) > 1 && (!loras || loras->empty());
+        hparams.swiglu_clamp_exp[il] <= 1e-6f && hparams.n_expert_used(il) > 1 && (!loras || loras->empty()) &&
+        !(exl3 && exl3->linears.count(down_exps));   // an EXL3 down projection takes only an f32 B
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
@@ -2685,6 +2706,15 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
 }
 
+ggml_tensor * llm_graph_context::build_get_rows(ggml_tensor * table, ggml_tensor * ids) const {
+    if (exl3) {
+        if (const auto it = exl3->rows.find(table); it != exl3->rows.end()) {
+            return ggml_exl3_get_rows(ctx0, table, ids, it->second.signs, it->second.n_out);
+        }
+    }
+    return ggml_get_rows(ctx0, table, ids);
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
@@ -2730,13 +2760,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
     {
-        embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        embd0 = build_get_rows(tok_embd, inp->tokens);
         ggml_build_forward_order(gf, embd0);
 
         embd1 = inp->embd;
 
         if (has_mixed) {
-            embd2 = ggml_get_rows(ctx0, tok_embd, inp->mixed_tokens);
+            embd2 = build_get_rows(tok_embd, inp->mixed_tokens);
             ggml_build_forward_order(gf, embd2);
         }
     }

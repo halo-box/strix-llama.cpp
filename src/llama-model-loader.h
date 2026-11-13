@@ -41,8 +41,9 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
             }
 
+            // no file: a tensor set given with the metadata, its data come from set_tensor_data
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+            if (file != nullptr && (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size())) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
@@ -85,6 +86,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    bool tensor_set_complete = false;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand

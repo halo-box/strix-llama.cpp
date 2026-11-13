@@ -16,7 +16,7 @@ Primary sources for the pinned Clang 24 revision:
 
 ## Zero-spill contract and coverage
 
-`gfx1151-vgpr-baseline.json` records the schema, architecture, exact compiler identity, image digest, source revision, the minimum total unique kernel count and minimum emitted kernel count for each translation unit. The current inventory has 6,288 unique names, 6,628 TU/name copies and 154 nonempty translation units. `minimum_kernel_count` requires at least 6,288 unique names, independently of the per-TU counts. The coverage map requires at least those 6,628 emitted copies in their recorded TUs; an empty inventory or a missing or reduced TU fails. Coverage counts must be positive integers and the baseline coverage map must be nonempty. An empty or absent `kernels` map means that any positive `.vgpr_spill_count` or `.sgpr_spill_count` fails, including a single spill save.
+`gfx1151-vgpr-baseline.json` records the schema, architecture, exact compiler identity, image digest, source revision, the minimum total unique kernel count and minimum emitted kernel count for each translation unit. The current inventory has 6,734 unique names, 7,074 TU/name copies and 155 nonempty translation units, including 446 EXL3 kernels built with `GGML_EXL3=ON`. `minimum_kernel_count` requires at least 6,734 unique names, independently of the per-TU counts. The coverage map requires at least those 7,074 emitted copies in their recorded TUs; an empty inventory or a missing or reduced TU fails. Coverage counts must be positive integers and the baseline coverage map must be nonempty. An empty or absent `kernels` map means that any positive `.vgpr_spill_count` or `.sgpr_spill_count` fails, including a single spill save.
 
 The compiler identity must match exactly. Every input assembly file must target gfx1151, every kernel metadata record must include all resource fields and wave32, and duplicate TU inventories or malformed metadata fail. The gate checks the exact emitted inventory, including stubs and copies outside runtime-selected paths. It does not filter names by dispatch reachability. Missing input, a parser that matches nothing, and incomplete builds cannot pass using an empty exception map.
 
@@ -26,7 +26,7 @@ The checker retains support for explicit legacy budgets so its existing regressi
 
 ## Regenerate the coverage map
 
-Build the complete `ggml-hip` target from the proposed source with the pinned image, Release, HIP, `GPU_TARGETS=gfx1151` and `GGML_HIP_EXPORT_METRICS=On`. Use a clean build directory so stale assembly cannot supply coverage for a missing TU. Pass the directory containing all emitted `*.lto.s` files to the checker. Depending on the generator, those files can be in the build root or `ggml/src/ggml-hip`.
+Build the complete `ggml-hip` target from the proposed source with the pinned image, Release, HIP, `GPU_TARGETS=gfx1151`, `GGML_EXL3=ON` and `GGML_HIP_EXPORT_METRICS=On`. Use a clean build directory so stale assembly cannot supply coverage for a missing TU. Pass the directory containing all emitted `*.lto.s` files to the checker. Depending on the generator, those files can be in the build root or `ggml/src/ggml-hip`.
 
 After reviewing the inventory and confirming zero spills, regenerate the coverage map, total minimum and source revision:
 

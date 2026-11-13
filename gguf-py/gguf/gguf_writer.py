@@ -32,6 +32,7 @@ from .constants import (
 )
 
 from .quants import quant_shape_from_byte_shape
+from .lazy import LazyChunkedTensor
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class TensorInfo:
     shape: Sequence[int]
     dtype: GGMLQuantizationType
     nbytes: int
-    tensor: np.ndarray[Any, Any] | None = None
+    tensor: np.ndarray[Any, Any] | LazyChunkedTensor | None = None
 
 
 @dataclass
@@ -139,9 +140,15 @@ class GGUFWriter:
 
                 size = prod(shape)
 
+                # an EXL3 trellis [(E,) k/16, n/16, 16*K] int16 holds (E*) k*n weights; its scale vectors are not weights
+                if name.endswith(".exl3_trellis"):
+                    size = prod(shape[:-1]) * 256
+                elif name.endswith((".exl3_suh", ".exl3_svh")):
+                    continue
+
                 if "_exps." in name:
                     if len(shape) >= 3:
-                        expert_count = shape[-2 if ".bias" in name else -3]
+                        expert_count = shape[0] if name.endswith(".exl3_trellis") else shape[-2 if ".bias" in name else -3]
                         expert_params += (size // expert_count)
                         expert_sum += expert_count
                         n_expert_tensors += 1
@@ -378,7 +385,7 @@ class GGUFWriter:
         self.tensors[-1][name] = TensorInfo(shape=tensor_shape, dtype=dtype, nbytes=tensor_nbytes)
 
     def add_tensor(
-        self, name: str, tensor: np.ndarray[Any, Any], raw_shape: Sequence[int] | None = None,
+        self, name: str, tensor: np.ndarray[Any, Any] | LazyChunkedTensor, raw_shape: Sequence[int] | None = None,
         raw_dtype: GGMLQuantizationType | None = None, tensor_endianess: GGUFEndian | None = None
     ) -> None:
         # if tensor endianness is not passed, assume it's native to system

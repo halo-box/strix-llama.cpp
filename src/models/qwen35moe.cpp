@@ -587,7 +587,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     if (ubatch.token) {
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
-        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+        tok_embd = build_get_rows(tok_embd_w, inp->tokens);
     } else {
         tok_embd = inp->embd;
     }

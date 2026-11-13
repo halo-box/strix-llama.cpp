@@ -648,6 +648,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_EXL3_MUL_MAT,
+        GGML_OP_EXL3_GET_ROWS,
+        GGML_OP_EXL3_MUL_MAT_ID,
+
         GGML_OP_COUNT,
     };
 
@@ -2805,6 +2809,39 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // EXL3 (exllamav3) linear, see ggml/exl3/README.md: y = x W with W = diag(suh) H W_hat H diag(svh) (k x n)
+    //   trellis I16 [16*K, n/16, k/16], x F32 [k, ...], suh F16 [k], svh F16 [n] -> F32 [n, ...]
+    //   codebook: 0 = 3inst, 1 = mcg, 2 = mul1; computed only by builds with GGML_EXL3
+    GGML_API struct ggml_tensor * ggml_exl3_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
+            int                   codebook);
+
+    // EXL3 experts (MoE), the EXL3 counterpart of ggml_mul_mat_id: expert e of trellis [16*K, n/16, k/16, E] with
+    //   suh [k, E] and svh [n, E]; x F32 [k, ne11, n_tokens], ids I32 [n_used, n_tokens], ne11 divides n_used ->
+    //   F32 [n, n_used, n_tokens]; computed only by builds with GGML_EXL3
+    GGML_API struct ggml_tensor * ggml_exl3_mul_mat_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
+            int                   codebook);
+
+    // EXL3 row-ring table (quantized token embedding, see ggml/exl3/README.md): the decoded rows `ids` of `table`
+    //   table I16 [groups*(1 + 16*K), n_rows], ids I32 [n], signs F16 [256, groups] -> F32 [n_out, n], n_out <= groups*256
+    //   computed only by builds with GGML_EXL3
+    GGML_API struct ggml_tensor * ggml_exl3_get_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * signs,
+            int64_t               n_out);
 
     // custom operators
 
