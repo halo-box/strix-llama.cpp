@@ -160,6 +160,12 @@ if (Vulkan_FOUND)
     else()
         list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_TRELLIS=OFF)
     endif()
+    # same for the EXL3 SPIR-V
+    if (GGML_EXL3)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_EXL3=ON)
+    else()
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_EXL3=OFF)
+    endif()
 
     if (GGML_VULKAN_VALIDATE)
         add_compile_definitions(GGML_VULKAN_VALIDATE)

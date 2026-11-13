@@ -991,6 +991,7 @@ void process_shaders() {
     string_to_spv("coopmat_layout_check", "coopmat_layout_check.comp", {});
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
 #endif
+#ifdef GGML_USE_EXL3
     // EXL3 linears (codebook, rate and rows are specialization constants)
     string_to_spv("exl3_rotate_f32", "exl3_rotate.comp", {});
     string_to_spv("exl3_mul_mat_vec_f32", "exl3_mul_mat_vec.comp", {});
@@ -1003,6 +1004,7 @@ void process_shaders() {
     string_to_spv("exl3_mul_mm", "exl3_mul_mm_cm1.comp", {}, true, true);
     string_to_spv("exl3_mul_mm_id", "exl3_mul_mm_cm1.comp", {{"ID", "1"}}, true, true);
 #endif
+#endif // GGML_USE_EXL3
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
     string_to_spv("flash_attn_sel_f16", "flash_attn_sel.comp", {});
     string_to_spv("flash_attn_sel_prep", "flash_attn_sel_prep.comp", {});
