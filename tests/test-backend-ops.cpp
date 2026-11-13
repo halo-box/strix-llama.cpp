@@ -14668,6 +14668,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_exl3_mul_mat_id(384, 256, 1, 64, 1, 1, 1, 100));
     test_cases.emplace_back(new test_exl3_mul_mat_id(384, 256, 1, 64, 1, 1, 1, 5));
+    // the dot / GEMM switch at 8 rows per expert (128 x 8 pairs), and 2 and 4 rows per expert on the dot path, at an
+    // expert shape of 2048 x 768
+    for (int64_t n_tokens : {32, 64, 128, 129}) {
+        test_cases.emplace_back(new test_exl3_mul_mat_id(2048, 768, 128, 64, 1, 8, 8, n_tokens));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
