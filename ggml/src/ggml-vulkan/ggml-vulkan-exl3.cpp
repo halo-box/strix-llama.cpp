@@ -169,7 +169,8 @@ void ggml_vk_exl3_mul_mat_id(ggml_backend_vk_context * ctx, vk_context & subctx,
     const size_t grp_size  = GGML_PAD((size_t) g_max*3*sizeof(uint32_t), 256);
     const size_t cn_size   = GGML_PAD((size_t) std::max(n_counters, 1u)*sizeof(uint32_t), 256);
     const size_t head      = ord_size + grp_size + cn_size;
-    // one product for a prompt-sized ubatch (512 tokens or more), hi + lo below
+    // one product for a prompt-sized ubatch (512 tokens or more), hi + lo below; HIP decides per expert (one product
+    // from 512 routed rows), so at -ub 512+ most experts take one product here and hi + lo there
     const uint32_t products = ggml_vk_exl3_gemm_products(n_tokens);
     const uint32_t rows_pad = n_pairs + EXL3_MM_ROWS;
     const size_t inv_size  = GGML_PAD((size_t) rows_pad*sizeof(float), 256);
