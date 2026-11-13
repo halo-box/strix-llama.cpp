@@ -669,6 +669,9 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // unique within the cache, set by alloc()
+    uint64_t id = 0;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -693,6 +696,13 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    uint64_t id_last = 0;
+
+    // the entry the last failed load() could not restore
+    uint64_t id_failed = 0;
+
+    bool contains(uint64_t id) const;
 
     size_t size() const;
 

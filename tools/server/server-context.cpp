@@ -2055,8 +2055,24 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                bool loaded = ret->prompt_load(*prompt_cache, task.tokens);
+
+                if (!loaded) {
+                    // the failed restore has emptied the slot's sequence, so its tokens no longer describe it
                     ret->prompt_clear();
+
+                    // a full unified KV pool has no free cells to restore into
+                    // purge idle slots, least recently used first and each saved to the cache, until the restore fits
+                    // those saves can evict the entry that is to be restored: stop then, purging more has no purpose
+                    const uint64_t id_wanted = prompt_cache->id_failed;
+
+                    while (!loaded && prompt_cache->contains(id_wanted) && try_clear_idle_slots()) {
+                        loaded = ret->prompt_load(*prompt_cache, task.tokens);
+                    }
+
+                    if (!loaded) {
+                        ret->prompt_clear();
+                    }
                 }
 
                 prompt_cache->update();
@@ -2073,31 +2089,35 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
+    // the least recently used idle slot goes first, saved to the prompt cache so that it can be restored
     bool try_clear_idle_slots() {
-        bool res = false;
-
         if (!params_base.kv_unified) {
-            return res;
+            return false;
         }
 
+        server_slot * lru = nullptr;
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
-
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (lru == nullptr || slot.t_last_used <= lru->t_last_used) {
+                lru = &slot;
             }
         }
 
-        return res;
+        if (lru == nullptr) {
+            return false;
+        }
+
+        SRV_WRN("purging slot %d with %zu tokens (least recently used)\n", lru->id, lru->prompt.tokens.size());
+        if (prompt_cache) {
+            if (lru->prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
+        }
+        lru->prompt_clear();
+
+        return true;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {

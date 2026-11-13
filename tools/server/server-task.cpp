@@ -1801,6 +1801,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.id     =*/ ++id_last,
     });
 
     return &states.back();
@@ -1849,6 +1850,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
 
+                id_failed = it_best->id;
+
                 return false;
             }
 
@@ -1867,6 +1870,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
+                    id_failed = it_best->id;
+
                     return false;
                 }
 
@@ -1881,6 +1886,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     return true;
+}
+
+bool server_prompt_cache::contains(uint64_t id) const {
+    return std::any_of(states.begin(), states.end(), [id](const server_prompt_cache_state & state) {
+        return state.id == id;
+    });
 }
 
 void server_prompt_cache::update() {
