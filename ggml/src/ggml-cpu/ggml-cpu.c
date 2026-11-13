@@ -2389,6 +2389,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_SPARSE_ATTN_PLAN:
+            {
+                ggml_compute_forward_sparse_attn_plan(params, tensor);
+            } break;
+        case GGML_OP_SPARSE_ATTN:
+            {
+                ggml_compute_forward_sparse_attn(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2714,6 +2722,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_SPARSE_ATTN_PLAN: // two phases separated by a barrier: every thread takes part
+        case GGML_OP_SPARSE_ATTN:
             {
                 n_tasks = n_threads;
             } break;
@@ -3329,6 +3339,15 @@ struct ggml_cplan ggml_graph_plan(
                         // temp buffer for dequantizing lightning indexer keys
                         const int64_t ne10 = node->src[1]->ne[0];
                         cur += sizeof(float)*ne10*n_tasks;
+                    } break;
+                case GGML_OP_SPARSE_ATTN_PLAN:
+                    {
+                        // the sort/dedup rows scratch (ggml_sparse_attn_plan_scratch_nbytes) + per-thread counters
+                        cur = ggml_cpu_sparse_attn_plan_work_size(node, n_tasks);
+                    } break;
+                case GGML_OP_SPARSE_ATTN:
+                    {
+                        cur = ggml_cpu_sparse_attn_work_size(node, n_tasks);
                     } break;
                 default:
                     break;

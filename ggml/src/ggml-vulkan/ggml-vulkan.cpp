@@ -237,18 +237,39 @@ struct vk_op_flash_attn_top_k_push_constants {
 };
 static_assert(sizeof(vk_op_flash_attn_top_k_push_constants) <= 128);
 
-// shared by flash_attn_sel_prep.comp, flash_attn_sel.comp and flash_attn_sel_cm.comp
-struct vk_op_flash_attn_sel_push_constants {
-    uint32_t n_kv, n_sel, list_stride;
-    uint32_t nbq1, nbq2, nbq3;
-    uint32_t nbk1, nbk2, nbk3;
-    uint32_t nbv1, nbv2, nbv3;
-    uint32_t nbi1, nbi3;
-    uint32_t nb1, nb2, nb3;
-    float scale;
-    uint32_t n_split, chunk, n_head, n_tok, n_stream;
+// sparse_attn_plan_rows.comp
+struct vk_op_sparse_attn_plan_push_constants {
+    uint32_t mode, n_kv, n_sel, stride;
+    uint32_t nbs1, nbs3, sel_off;
+    uint32_t n_q, n_stream, cap;
+    uint32_t off_counts, off_quads, off_masks;
+    uint32_t q_base;
 };
-static_assert(sizeof(vk_op_flash_attn_sel_push_constants) <= 128);
+static_assert(sizeof(vk_op_sparse_attn_plan_push_constants) <= 128);
+
+// sparse_attn_cm.comp, sparse_attn.comp, sparse_attn_portable.comp
+struct vk_op_sparse_attn_push_constants {
+    uint32_t nbq1, nbq2, nbq3, q_off;   // float elements
+    uint32_t nbk1, nbk2, nbk3, k_off;   // the unit of the tier and K type (ggml_vk_sa_unit_bytes)
+    uint32_t nbv1, nbv2, nbv3, v_off;   // the same for V
+    uint32_t off_counts, off_quads, off_masks, cap;   // plan sections in dwords, entries per row
+    uint32_t nb1, nb2, nb3;             // dst, float elements
+    float scale;
+    float rot_scale;
+    uint32_t n_split, n_head, n_q, n_stream, q_base;
+};
+static_assert(sizeof(vk_op_sparse_attn_push_constants) <= 128);
+
+// sparse_attn_reduce.comp
+struct vk_op_sparse_attn_reduce_push_constants {
+    uint32_t D, n_head, n_q, n_stream, n_split;
+};
+
+// sparse_attn_pack.comp
+struct vk_op_sparse_attn_pack_push_constants {
+    uint32_t nb1, nb2, nb3, off;
+    uint32_t n_cells, n_head_kv;
+};
 
 // Total memory traffic of a node (dst + srcs). Used to bound command buffer
 // execution time for bandwidth-bound ops with no flops estimate (large copies,
@@ -292,6 +313,11 @@ uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const ggml_tensor * k = node->src[1];
         const ggml_tensor * v = node->src[2];
         return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
+    }
+    if (node->op == GGML_OP_SPARSE_ATTN) {
+        const ggml_tensor * q = node->src[0];
+        const ggml_tensor * sel = node->src[3]->src[0];
+        return 2ull * q->ne[1] * q->ne[2] * 2 * q->ne[0] * sel->ne[0] * q->ne[3];
     }
     return 0;
 }
@@ -1858,6 +1884,7 @@ static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b
 static bool ggml_vk_mmid_f16coopmat(ggml_type t);
 static void ggml_vk_path_census_add(const char * name);
 static bool ggml_vk_dispatch_census_enabled();
+static void ggml_vk_census_key_add(const std::string & key);
 static bool ggml_vk_dense_wave32_enabled(const vk_device& device);
 static bool ggml_vk_mmid_rega_enabled(const vk_device& device);
 static bool ggml_vk_mm_xl_ok(const ggml_backend_vk_context * ctx, ggml_type type, uint32_t m, uint32_t n, uint32_t k);
@@ -4418,6 +4445,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         for (uint32_t n : {64, 128, 256, 512, 1024}) {
             if (device->subgroup_size <= n) {
                 ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n }, 1, true, true, device->subgroup_size);
+                if (n <= 256) {   // H_o of SPARSE_ATTN: fwht.comp with one binding
+                    ggml_vk_create_pipeline(device, device->pipeline_fwht_inplace_f32[idx], "fwht_inplace_f32", fwht_inplace_f32_len, fwht_inplace_f32_data, "main", 1, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n }, 1, true, true, device->subgroup_size);
+                }
             }
             ++idx;
         }
@@ -4426,10 +4456,81 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         for (uint32_t n : {64, 128, 256, 512, 1024}) {
             const uint32_t block_size = std::min(device->subgroup_size, n);
             ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_shmem_f32", fwht_shmem_f32_len, fwht_shmem_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n }, 1);
+            if (n <= 256) {
+                ggml_vk_create_pipeline(device, device->pipeline_fwht_inplace_f32[idx], "fwht_shmem_inplace_f32", fwht_shmem_inplace_f32_len, fwht_shmem_inplace_f32_data, "main", 1, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n }, 1);
+            }
             ++idx;
         }
     }
 
+        // sparse attention: each tier's gate is what its shaders require; attend pipelines are created on demand per key
+        {
+            const auto & lim = device->properties.limits;
+            uint32_t plan_wg = 256;
+            while (plan_wg >= 16 && (plan_wg > lim.maxComputeWorkGroupInvocations || (plan_wg + plan_wg / 16 + 2) * 4 > lim.maxComputeSharedMemorySize)) {
+                plan_wg >>= 1;
+            }
+            if (plan_wg >= 16) {
+                ggml_vk_create_pipeline(device, device->pipeline_sparse_attn_plan, "sparse_attn_plan_rows", sparse_attn_plan_rows_len, sparse_attn_plan_rows_data, "main", 3,
+                    sizeof(vk_op_sparse_attn_plan_push_constants), {1, 1, 1}, {plan_wg}, 1, true);
+            }
+            if (lim.maxComputeWorkGroupInvocations >= 32 && lim.maxComputeSharedMemorySize >= 128) {
+                ggml_vk_create_pipeline(device, device->pipeline_sparse_attn_reduce, "sparse_attn_reduce", sparse_attn_reduce_len, sparse_attn_reduce_data, "main", 2,
+                    sizeof(vk_op_sparse_attn_reduce_push_constants), {1, 1, 1}, {}, 1, true);
+            }
+            // the gates are read without compile_mutex while this block reruns on each on-demand compile: store each one (same value) and never clear it first, so a tier cannot vanish between the alloc size and the dispatch
+            bool ok_cm = false, ok_scalar = false;
+            const bool ok_portable = lim.maxComputeWorkGroupInvocations >= 12 && lim.maxComputeSharedMemorySize >= 2048;
+            const bool sa_sg64 = device->subgroup_size_control
+                ? device->subgroup_min_size <= 64 && 64 <= device->subgroup_max_size
+                : device->subgroup_size == 64;
+            if (sa_sg64 && device->subgroup_shuffle && device->subgroup_arithmetic && device->fp16) {
+                // shared memory: Q, a K and a V block, P, the block's keys, the iq4_nl table at GQA 12
+                ok_scalar = 64 * 12 <= lim.maxComputeWorkGroupInvocations &&
+                    4 * 12 * 256 + 2 * 2 * 256 * 32 + 4 * 12 * 32 + 4 * 32 + 64 <= lim.maxComputeSharedMemorySize;
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                // the shader assumes the RDNA3 + RADV fragment layout; shared: Q, staged V, H_q, the iq4_nl table
+                ok_cm = device->subgroup_ballot && device->coopmat_support && device->coopmat_support_16x16x16_f32acc &&
+                    device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 && device->driver_id == vk::DriverId::eMesaRadv &&
+                    8448 + 8192 + 12288 + 64 <= lim.maxComputeSharedMemorySize;
+                if (ok_cm) {
+                    static const ggml_type sa_pack_types[8] = { GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
+                    for (int i = 0; i < 8; ++i) {
+                        ggml_vk_create_pipeline2(device, device->pipeline_sparse_attn_pack[sa_pack_types[i]], std::string("sparse_attn_pack_") + ggml_type_name(sa_pack_types[i]),
+                            sparse_attn_pack_len, sparse_attn_pack_data, "main", 3, sizeof(vk_op_sparse_attn_pack_push_constants), {1, 1, 1}, {(uint32_t) sa_pack_types[i]}, 1, true);
+                    }
+                }
+#endif
+            }
+            device->sa_tier_ok[VK_SA_TIER_PORTABLE].store(ok_portable, std::memory_order_relaxed);
+            device->sa_tier_ok[VK_SA_TIER_SCALAR].store(ok_scalar, std::memory_order_relaxed);
+            device->sa_tier_ok[VK_SA_TIER_CM].store(ok_cm, std::memory_order_relaxed);
+            for (auto & it : device->pipeline_sparse_attn) {
+                const vk_sa_key & key = it.first;
+                const uint32_t gqa = key.gqa;
+                switch (key.tier) {
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                    case VK_SA_TIER_CM:
+                        ggml_vk_create_pipeline2(device, it.second, "sparse_attn_cm", sparse_attn_cm_f16_len, sparse_attn_cm_f16_data, "main", 5,
+                            sizeof(vk_op_sparse_attn_push_constants), {1, 1, 1},
+                            {gqa, key.type_k, key.type_v, key.vl == VK_SA_VL_STAGED ? 1u : 0u, key.rot_q, key.rot_dump}, 1, true, true, 64);
+                        break;
+#endif
+                    case VK_SA_TIER_SCALAR:
+                        ggml_vk_create_pipeline2(device, it.second, "sparse_attn_scalar", sparse_attn_f16_len, sparse_attn_f16_data, "main", 5,
+                            sizeof(vk_op_sparse_attn_push_constants), {1, 1, 1},
+                            {64 * gqa, 64, gqa, key.type_k, key.type_v, key.rot_q, key.rot_dump}, 1, true, true, 64);
+                        break;
+                    case VK_SA_TIER_PORTABLE:
+                        ggml_vk_create_pipeline2(device, it.second, "sparse_attn_portable", sparse_attn_portable_len, sparse_attn_portable_data, "main", 5,
+                            sizeof(vk_op_sparse_attn_push_constants), {1, 1, 1},
+                            {gqa, key.type_k, key.type_v, key.rot_q, key.rot_dump}, 1, true, false, key.required_sg);
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
     const uint32_t cumsum_elem_per_thread = (device->vendor_id == VK_VENDOR_ID_AMD || device->vendor_id == VK_VENDOR_ID_INTEL) ? 2 : 4;
     ggml_vk_create_pipeline(device, device->pipeline_cumsum_f32,       "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 256, device->subgroup_size, cumsum_elem_per_thread }, 1, true, true, device->subgroup_size);
     ggml_vk_create_pipeline(device, device->pipeline_cumsum_small_f32, "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 128, device->subgroup_size, 1 }, 1, true, true, device->subgroup_size);
@@ -4719,54 +4820,6 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             "flash_attn_top_k_f16", flash_attn_top_k_f16_len, flash_attn_top_k_f16_data, "main", 6,
             sizeof(vk_op_flash_attn_top_k_push_constants), {1, 1, 1}, {512, device->subgroup_size}, 1, true, true,
             device->subgroup_size);
-        // maskless selected-key attention (QSA block selection). The kernels hard-code 64-lane subgroups, so the
-        // device must run them at 64 (a required size it supports, or 64 by default without size control).
-        const bool sel_sg64 = device->subgroup_size_control
-            ? device->subgroup_min_size <= 64 && 64 <= device->subgroup_max_size
-            : device->subgroup_size == 64;
-        if (sel_sg64 && device->subgroup_shuffle && device->subgroup_arithmetic && device->fp16) {
-            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_prep,
-                "flash_attn_sel_prep", flash_attn_sel_prep_len, flash_attn_sel_prep_data, "main", 2,
-                sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {}, 1, true);
-#define CREATE_SEL_GATHER(T, NAME) \
-            ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_gather[T], "flash_attn_sel_gather_" #NAME, \
-                flash_attn_sel_gather_ ## NAME ## _len, flash_attn_sel_gather_ ## NAME ## _data, "main", 4, 8 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
-            CREATE_SEL_GATHER(GGML_TYPE_F16, f16)
-            CREATE_SEL_GATHER(GGML_TYPE_Q8_0, q8_0)
-            CREATE_SEL_GATHER(GGML_TYPE_Q4_0, q4_0)
-            CREATE_SEL_GATHER(GGML_TYPE_Q4_1, q4_1)
-            CREATE_SEL_GATHER(GGML_TYPE_Q5_0, q5_0)
-            CREATE_SEL_GATHER(GGML_TYPE_Q5_1, q5_1)
-            CREATE_SEL_GATHER(GGML_TYPE_IQ4_NL, iq4_nl)
-#undef CREATE_SEL_GATHER
-            static const char * sel_names[3] = { "flash_attn_sel_f16_gqa4", "flash_attn_sel_f16_gqa8", "flash_attn_sel_f16_gqa12" };
-            for (uint32_t i = 0; i < 3; ++i) {
-                const uint32_t gqa = 4 * (i + 1);
-                // shared memory: Q (1 KiB per head), a K and a V block (16 KiB each), P and the block's keys:
-                // 46,720 bytes at GQA 12 (the selection row is read from the pre-pass output, not kept here)
-                const uint32_t sel_shmem = 4 * gqa * 256 + 2 * 2 * 256 * 32 + 4 * gqa * 32 + 4 * 32;
-                if (64 * gqa <= device->properties.limits.maxComputeWorkGroupInvocations &&
-                    sel_shmem <= device->properties.limits.maxComputeSharedMemorySize) {
-                    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_f16[i],
-                        sel_names[i], flash_attn_sel_f16_len, flash_attn_sel_f16_data, "main", 5,
-                        sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {64 * gqa, 64, gqa}, 1, true, true, 64);
-                }
-            }
-#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-            // WMMA kernel: builds its fragments with the gfx11 register layout of RADV's KHR cooperative matrix
-            // lowering, so RDNA3 + RADV only. 64 threads, 8.4 KB shared.
-            if (device->subgroup_ballot && device->coopmat_support && device->coopmat_support_16x16x16_f32acc &&
-                device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 &&
-                device->driver_id == vk::DriverId::eMesaRadv) {
-                static const char * sel_cm_names[3] = { "flash_attn_sel_cm_f16_gqa4", "flash_attn_sel_cm_f16_gqa8", "flash_attn_sel_cm_f16_gqa12" };
-                for (uint32_t i = 0; i < 3; ++i) {
-                    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_sel_cm_f16[i],
-                        sel_cm_names[i], flash_attn_sel_cm_f16_len, flash_attn_sel_cm_f16_data, "main", 5,
-                        sizeof(vk_op_flash_attn_sel_push_constants), {1, 1, 1}, {4 * (i + 1)}, 1, true, true, 64);
-                }
-            }
-#endif
-        }
         ggml_vk_create_pipeline(device, device->pipeline_flash_attn_gather_f16,
             "flash_attn_gather_f16", flash_attn_gather_f16_len, flash_attn_gather_f16_data, "main", 5,
             sizeof(vk_op_flash_attn_gather_push_constants), {1, 1, 1}, {}, 1, true, true,
@@ -10610,241 +10663,712 @@ static void ggml_vk_perf_mark_subop(ggml_backend_vk_context * ctx, vk_context& s
     subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
 }
 
-// a quantized K or V of the maskless selected-key op is dequantized to f16 first (q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl: the types
-// with a gather shader)
-static bool ggml_vk_flash_attn_sel_kv_ok(const vk_device & device, const ggml_tensor * t) {
-    if (t->type == GGML_TYPE_F16) {
-        return t->nb[0] == sizeof(ggml_fp16_t) && t->nb[1] % sizeof(ggml_fp16_t) == 0 &&
-            t->nb[2] % sizeof(ggml_fp16_t) == 0 && t->nb[3] % sizeof(ggml_fp16_t) == 0;
-    }
-    if (!device->pipeline_dequant[t->type] || !device->pipeline_flash_attn_sel_gather[t->type]) {
-        return false;
-    }
-    // f16 strides = block strides x block size: every stride must be whole blocks
-    const size_t ts = ggml_type_size(t->type);
-    return t->ne[0] % ggml_blck_size(t->type) == 0 && t->nb[0] == ts && t->nb[1] % ts == 0 && t->nb[2] % ts == 0 &&
-        t->nb[3] % ts == 0 && ggml_nbytes(t) / ts * ggml_blck_size(t->type) <= UINT32_MAX;
+// GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN. Tiers, chosen by ggml_vk_sa_select for supports_op, alloc size and dispatch:
+//   cm        sparse_attn_cm.comp        RADV RDNA3, WMMA; V direct, staged or packed to f16 (vpack, test only)
+//   scalar    sparse_attn.comp           other subgroup-64 devices
+//   portable  sparse_attn_portable.comp  every other device: no subgroup operation
+// G = 1 only. The workspace sits past ggml_nbytes(dst), where the barrier tracker cannot see it: each node syncs first.
+// GGML_VK_SA_FORCE (comma-separated test switch): scalar | portable | portable_sg32 | vdirect | vstaged | vpack | rot_dump (write H_q q to dst) | no_cm | no_scalar | no_portable | no_plan | max_q=N (queries per dispatch).
+
+struct vk_sa_force_t {
+    int tier = -1;
+    int vl = -1;
+    bool sg32 = false;
+    bool rot_dump = false;
+    uint32_t cap_mask = 0;
+    uint32_t max_q = 0;
+};
+
+static std::mutex vk_sa_force_mutex;
+static std::atomic<bool> vk_sa_force_loaded { false };
+static vk_sa_force_t vk_sa_force_value;
+
+static void ggml_vk_sa_force_reload() {
+    vk_sa_force_loaded.store(false, std::memory_order_release);
 }
 
-// maskless selected-key attention (QSA block selection): the pipeline that takes this op, or nullptr
-static vk_pipeline ggml_vk_flash_attn_sel_pipeline(const vk_device & device, const ggml_tensor * op) {
-    const ggml_tensor * q   = op->src[0];
-    const ggml_tensor * k   = op->src[1];
-    const ggml_tensor * v   = op->src[2];
-    const ggml_tensor * ids = op->src[5];
-    if (ids == nullptr || op->src[3] != nullptr || op->src[4] != nullptr || ggml_get_op_params_i32(op, 4) != 0) {
-        return nullptr;
+static vk_sa_force_t ggml_vk_sa_force() {
+    if (!vk_sa_force_loaded.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(vk_sa_force_mutex);
+        vk_sa_force_t f;
+        if (const char * e = getenv("GGML_VK_SA_FORCE")) {
+            std::stringstream ss(e);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (tok == "scalar") {
+                    f.tier = VK_SA_TIER_SCALAR;
+                } else if (tok == "portable") {
+                    f.tier = VK_SA_TIER_PORTABLE;
+                } else if (tok == "portable_sg32") {
+                    f.tier = VK_SA_TIER_PORTABLE;
+                    f.sg32 = true;
+                } else if (tok == "vdirect") {
+                    f.vl = VK_SA_VL_DIRECT;
+                } else if (tok == "vstaged") {
+                    f.vl = VK_SA_VL_STAGED;
+                } else if (tok == "vpack") {
+                    f.vl = VK_SA_VL_PACK;
+                } else if (tok == "rot_dump") {
+                    f.rot_dump = true;
+                } else if (tok == "no_cm" || tok == "no_scalar" || tok == "no_portable" || tok == "no_plan") {
+                    f.cap_mask |= tok == "no_cm" ? 1u : tok == "no_scalar" ? 2u : tok == "no_portable" ? 4u : 8u;
+                } else if (tok.rfind("max_q=", 0) == 0) {
+                    f.max_q = (uint32_t) atoi(tok.c_str() + 6);
+                } else if (!tok.empty()) {
+                    GGML_ABORT("GGML_VK_SA_FORCE: unknown value '%s'", tok.c_str());
+                }
+            }
+        }
+        vk_sa_force_value = f;
+        vk_sa_force_loaded.store(true, std::memory_order_release);
     }
-    float max_bias = 0.0f;
-    float logit_softcap = 0.0f;
-    memcpy(&max_bias,      (const float *) op->op_params + 1, sizeof(float));
-    memcpy(&logit_softcap, (const float *) op->op_params + 2, sizeof(float));
-    if (max_bias != 0.0f || logit_softcap != 0.0f || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) ||
-        q->type != GGML_TYPE_F32 || !ggml_vk_flash_attn_sel_kv_ok(device, k) || !ggml_vk_flash_attn_sel_kv_ok(device, v) ||
-        ids->type != GGML_TYPE_I32 ||
-        q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 ||
-        k->ne[1] != v->ne[1] || k->ne[2] != v->ne[2] || k->ne[3] != q->ne[3] || v->ne[3] != q->ne[3] ||
-        k->ne[2] < 1 || q->ne[2] % k->ne[2] != 0 ||
-        ids->ne[0] < 1 || ids->ne[0] > 4096 || ids->ne[1] < q->ne[1] || ids->ne[2] != 1 ||
-        (ids->ne[3] != 1 && ids->ne[3] != q->ne[3]) ||
-        q->nb[0] != sizeof(float) || ids->nb[0] != sizeof(int32_t)) {
-        return nullptr;
+    return vk_sa_force_value;
+}
+
+static vk_sa_tier ggml_vk_sa_tier(const vk_device & device) {
+    const vk_sa_force_t f = ggml_vk_sa_force();
+    const auto ok = [&](int t) { return device->sa_tier_ok[t].load(std::memory_order_relaxed) && ((f.cap_mask >> t) & 1u) == 0; };
+    if (f.tier >= 0) {
+        return ok(f.tier) ? (vk_sa_tier) f.tier : VK_SA_TIER_NONE;
     }
+    return ok(VK_SA_TIER_CM) ? VK_SA_TIER_CM : ok(VK_SA_TIER_SCALAR) ? VK_SA_TIER_SCALAR : ok(VK_SA_TIER_PORTABLE) ? VK_SA_TIER_PORTABLE : VK_SA_TIER_NONE;
+}
+
+static bool ggml_vk_sa_type_ok(const ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F16: case GGML_TYPE_BF16: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_0:
+        case GGML_TYPE_F32: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// the unit of the K/V offsets and strides in the push constants: what the tier's loaders index
+static uint32_t ggml_vk_sa_unit_bytes(const vk_sa_tier tier, const ggml_type t) {
+    if (tier == VK_SA_TIER_PORTABLE) {
+        return 1;        // byte offsets over 32-bit words
+    }
+    switch (t) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_F32:  return 16;   // uvec4 / vec4
+        case GGML_TYPE_BF16: return 2;    // one element, read as u16vec4 at a multiple of 4
+        default:             return (uint32_t) ggml_type_size(t);   // one ggml block
+    }
+}
+
+// the largest range one descriptor can have on this device; the shaders index with 32 bits
+static size_t ggml_vk_sa_max_binding(const vk_device & device) {
+    return std::min<size_t>(device->properties.limits.maxStorageBufferRange, UINT32_MAX);
+}
+
+static bool ggml_vk_sa_binding_fits(const vk_device & device, const size_t nbytes) {
+    return nbytes + device->properties.limits.minStorageBufferOffsetAlignment <= ggml_vk_sa_max_binding(device);
+}
+
+// test hook: the limit of one K/V binding, the one ggml_vk_sa_binding_fits applies. The suballocation block does not bound it:
+// ggml-alloc gives a tensor larger than the block a buffer of its own.
+static size_t ggml_backend_vk_sa_binding_limit(ggml_backend_t backend) {
+    const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
+    const size_t max_bind = ggml_vk_sa_max_binding(ctx->device);
+    const size_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    return max_bind > align ? max_bind - align : 0;
+}
+
+static size_t ggml_vk_sa_round_up(const vk_device & device, const size_t n) {
+    const size_t a = device->properties.limits.minStorageBufferOffsetAlignment;
+    return (n + a - 1) / a * a;
+}
+
+static const char * const VK_SA_WHY_TYPE    = "type pair not supported";
+static const char * const VK_SA_WHY_BINDING = "a binding of this shape exceeds the device limits (maxStorageBufferRange or the suballocation block)";
+
+// NULL when the plan runs on this device; otherwise why not. sel may be absent (an attend's plan on an RPC server): the shape then comes from the op_params
+static const char * ggml_vk_sa_plan_why(const vk_device & device, const ggml_tensor * op) {
+    const ggml_tensor * sel = op->src[0];
+    const int64_t n_sel = ggml_get_op_params_i32(op, 2), n_q = ggml_get_op_params_i32(op, 3), n_stream = ggml_get_op_params_i32(op, 4);
+    const size_t sel_bytes = sel ? ggml_nbytes(sel) : (size_t) n_sel * n_q * n_stream * sizeof(int32_t);
+    if (device->pipeline_sparse_attn_plan == nullptr || (ggml_vk_sa_force().cap_mask & 8u) != 0) {
+        return "Vulkan device lacks the sparse-attention plan pipeline";
+    }
+    if (ggml_get_op_params_i32(op, 1) != 1) {
+        return "plan group G != 1 (Vulkan has no G = 4 plan)";
+    }
+    if (!ggml_is_contiguous(op)) {
+        return "plan dst not contiguous";
+    }
+    const size_t scratch = ggml_sparse_attn_plan_scratch_nbytes(n_sel, n_q, n_stream);
+    if (!ggml_vk_sa_binding_fits(device, sel_bytes) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(op)) || !ggml_vk_sa_binding_fits(device, scratch) ||
+        ggml_vk_sa_round_up(device, ggml_nbytes(op)) + scratch > device->suballocation_block_size) {
+        return VK_SA_WHY_BINDING;
+    }
+    return nullptr;
+}
+
+static bool ggml_vk_sa_plan_supported(const vk_device & device, const ggml_tensor * op) {
+    return ggml_vk_sa_plan_why(device, op) == nullptr;
+}
+
+// split count, a function of the shape alone: few workgroups cannot fill the GPU, so each row is split.
+// The portable tier never splits.
+static uint32_t ggml_vk_sa_splits(const vk_device & device, const vk_sa_tier tier, const int64_t n_q, const int64_t n_kv_head, const int64_t n_stream, const int64_t n_sel) {
+    if (tier == VK_SA_TIER_PORTABLE || device->pipeline_sparse_attn_reduce == nullptr) {
+        return 1;
+    }
+    const int64_t min_wg = tier == VK_SA_TIER_CM ? 128 : 64;
+    const int64_t n_wg = n_q * n_kv_head * n_stream;
+    if (n_wg >= min_wg) {
+        return 1;
+    }
+    return (uint32_t) std::max<int64_t>(1, std::min((min_wg + n_wg - 1) / n_wg, (n_sel + 63) / 64));
+}
+
+static size_t ggml_vk_sa_partial_bytes(const int64_t n_q, const int64_t n_head, const int64_t n_stream, const uint32_t n_split) {
+    return n_split > 1 ? ((size_t) 256 * n_head * n_q * n_stream * n_split + (size_t) n_head * 2 * n_q * n_stream * n_split) * sizeof(float) : 0;
+}
+
+// direct V beats staged for every type; pack is faster on q8_0 / q4_0 but grows the compute buffer, so it is test only
+static vk_sa_vl ggml_vk_sa_default_vl(const ggml_type type_v) {
+    GGML_UNUSED(type_v);
+    return VK_SA_VL_DIRECT;
+}
+
+struct vk_sa_selection {
+    vk_pipeline pipeline;
+    vk_sa_tier tier = VK_SA_TIER_NONE;
+    vk_sa_vl vl = VK_SA_VL_DIRECT;
+    uint32_t n_split = 1;
+    bool pack_k = false, pack_v = false;
+    size_t pack_k_bytes = 0, pack_v_bytes = 0;
+    size_t partial_bytes = 0;
+    size_t ws_bytes = 0;            // what this op's dispatch uses
+    size_t ws_reserve_bytes = 0;    // max over every n_q' <= n_q: what get_alloc_size holds
+    const char * why = nullptr;     // no pipeline: the cause
+};
+
+static vk_pipeline ggml_vk_sa_pipeline(const vk_device & device, const vk_sa_key & key) {
+    std::lock_guard<std::mutex> guard(device->compile_mutex);
+    auto & map = device->pipeline_sparse_attn;
+    auto it = map.find(key);
+    if (it != map.end()) {
+        return it->second;
+    }
+    vk_pipeline pipeline = std::make_shared<vk_pipeline_struct>();
+    map[key] = pipeline;
+    return pipeline;
+}
+
+static vk_sa_selection ggml_vk_sa_select(const vk_device & device, const ggml_tensor * op) {
+    vk_sa_selection r;
+    // an RPC server's node was never built by ggml_sparse_attn
+    if ((r.why = ggml_sparse_attn_shape_why(op)) != nullptr) {
+        return r;
+    }
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * v = op->src[2];
+    const ggml_tensor * plan = op->src[3];
+    const vk_sa_force_t f = ggml_vk_sa_force();
+
+    const vk_sa_tier tier = ggml_vk_sa_tier(device);
+    // n_sel from the plan's op_params: an RPC server's copy of this node has no sel
+    const int64_t n_q = q->ne[1], n_head = q->ne[2], n_stream = q->ne[3], n_kv_head = k->ne[2], n_sel = ggml_get_op_params_i32(plan, 2);
+    const int64_t n_kv = ggml_get_op_params_i32(plan, 0);
+    const int32_t rot_q = ggml_get_op_params_i32(op, 1);
+    const int32_t rot_o = ggml_get_op_params_i32(op, 2);
+    if (tier == VK_SA_TIER_NONE) {
+        r.why = "Vulkan device lacks the pipelines of every sparse-attention tier";
+        return r;
+    }
+    if ((r.why = ggml_vk_sa_plan_why(device, plan)) != nullptr) {
+        return r;
+    }
+    if (!ggml_vk_sa_type_ok(k->type) || !ggml_vk_sa_type_ok(v->type)) {
+        r.why = VK_SA_WHY_TYPE;
+        return r;
+    }
+    if (q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256) {
+        r.why = "head size is not 256";
+        return r;
+    }
+    if (q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || q->nb[0] != sizeof(float) ||
+        k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
+        r.why = "Q / dst not f32, or a K / V row not contiguous";
+        return r;
+    }
+    if (n_kv_head < 1 || n_head % n_kv_head != 0) {
+        r.why = "n_head is not a multiple of n_head_kv";
+        return r;
+    }
+    const int64_t gqa = n_head / n_kv_head;
+    if (gqa != 4 && gqa != 8 && gqa != 12) {
+        r.why = "n_head / n_head_kv not in {4, 8, 12}";
+        return r;
+    }
+    const uint32_t unit_k = ggml_vk_sa_unit_bytes(tier, k->type), unit_v = ggml_vk_sa_unit_bytes(tier, v->type);
     for (int i = 1; i < 4; ++i) {
-        if (q->nb[i] % sizeof(float) || ids->nb[i] % sizeof(int32_t)) {
+        if (q->nb[i] % sizeof(float) != 0 || k->nb[i] % 16 != 0 || v->nb[i] % 16 != 0 || k->nb[i] % unit_k != 0 || v->nb[i] % unit_v != 0) {
+            r.why = "a Q / K / V stride is not aligned for this tier's loaders";
+            return r;
+        }
+    }
+    if ((rot_q != 0 && rot_q != 64 && rot_q != 128 && rot_q != 256) || (rot_o != 0 && rot_o != 64 && rot_o != 128 && rot_o != 256)) {
+        r.why = "rotation size not in {0, 64, 128, 256}";
+        return r;
+    }
+    if (rot_o != 0 && device->pipeline_fwht_inplace_f32[ggml_vk_fwht_pipeline_idx(rot_o)] == nullptr) {
+        r.why = "no fwht pipeline on this device for the output rotation";
+        return r;
+    }
+    if (!ggml_vk_sa_binding_fits(device, ggml_nbytes(q)) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(k)) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(v)) ||
+        !ggml_vk_sa_binding_fits(device, ggml_nbytes(plan)) || !ggml_vk_sa_binding_fits(device, ggml_nbytes(op))) {
+        r.why = VK_SA_WHY_BINDING;
+        return r;
+    }
+
+    const int64_t n_kv4 = 4 * ((n_kv + 3) / 4);
+    const size_t pack_row = (size_t) 256 * sizeof(ggml_fp16_t);
+    vk_sa_vl vl = VK_SA_VL_STAGED;
+    if (tier == VK_SA_TIER_CM) {
+        vl = f.vl >= 0 ? (vk_sa_vl) f.vl : ggml_vk_sa_default_vl(v->type);
+    }
+    bool pack_possible = false;   // at this node's n_kv
+    const bool pack_arm = vl == VK_SA_VL_PACK;
+    if (vl == VK_SA_VL_PACK) {
+        const size_t bytes = (size_t) n_kv4 * n_kv_head * n_stream * pack_row;
+        pack_possible = (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) &&
+                        ggml_vk_sa_binding_fits(device, bytes) && (uint64_t) (n_kv4 + 63) / 64 <= device->properties.limits.maxComputeWorkGroupCount[0];
+        const bool pack_here = pack_possible && n_kv4 < 64 * n_q;
+        r.pack_k = pack_here && k->type != GGML_TYPE_F16;
+        r.pack_v = pack_here && v->type != GGML_TYPE_F16;
+        r.pack_k_bytes = r.pack_k ? bytes : 0;
+        r.pack_v_bytes = r.pack_v ? bytes : 0;
+        if (!pack_here) {
+            vl = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 ? VK_SA_VL_DIRECT : VK_SA_VL_STAGED;
+        }
+    }
+
+    // the workspace: this shape's, and the largest one a smaller ubatch can ask (split-K is not monotonic in n_q)
+    r.n_split = ggml_vk_sa_splits(device, tier, n_q, n_kv_head, n_stream, n_sel);
+    r.partial_bytes = ggml_vk_sa_partial_bytes(n_q, n_head, n_stream, r.n_split);
+    size_t partial_max = r.partial_bytes;
+    for (int64_t nq = 1; nq <= std::min<int64_t>(n_q, 128); ++nq) {
+        partial_max = std::max(partial_max, ggml_vk_sa_partial_bytes(nq, n_head, n_stream, ggml_vk_sa_splits(device, tier, nq, n_kv_head, n_stream, n_sel)));
+    }
+    r.ws_bytes = r.pack_k_bytes + r.pack_v_bytes + r.partial_bytes;
+    // the pack reserve: a runtime op packs when n_kv4' < 64 n_q', so a reserve at the full n_kv (no pack there) must still hold the pack of a smaller n_kv, capped by the binding and grid limits
+    size_t pack_reserve = 0;
+    if (pack_arm && (k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16)) {
+        const size_t per_cell = (size_t) n_kv_head * n_stream * pack_row;
+        const size_t align = device->properties.limits.minStorageBufferOffsetAlignment;
+        const size_t max_bind = ggml_vk_sa_max_binding(device);
+        const int64_t n_kv4_bind = max_bind > align ? (int64_t) ((max_bind - align) / per_cell) / 4 * 4 : 0;
+        const int64_t n_kv4_grid = 64 * (int64_t) device->properties.limits.maxComputeWorkGroupCount[0];
+        const int64_t n_kv4_r = std::min({ n_kv4, 64 * n_q - 4, n_kv4_bind, n_kv4_grid });
+        const size_t bytes_r = n_kv4_r > 0 ? (size_t) n_kv4_r * per_cell : 0;
+        if (bytes_r > 0) {
+            pack_reserve = (k->type != GGML_TYPE_F16 ? bytes_r : 0) + (v->type != GGML_TYPE_F16 ? bytes_r : 0);
+        }
+    }
+    r.ws_reserve_bytes = pack_reserve + partial_max;
+    if ((r.ws_reserve_bytes != 0 && !ggml_vk_sa_binding_fits(device, r.ws_reserve_bytes)) ||
+        ggml_vk_sa_round_up(device, ggml_nbytes(op)) + r.ws_reserve_bytes > device->suballocation_block_size) {
+        r.why = VK_SA_WHY_BINDING;
+        return r;
+    }
+
+    vk_sa_key key = {};
+    key.tier = tier;
+    key.type_k = (uint32_t) (r.pack_k ? GGML_TYPE_F16 : k->type);
+    key.type_v = (uint32_t) (r.pack_v ? GGML_TYPE_F16 : v->type);
+    key.gqa = (uint32_t) gqa;
+    key.vl = tier == VK_SA_TIER_CM ? (vl == VK_SA_VL_STAGED ? VK_SA_VL_STAGED : VK_SA_VL_DIRECT) : VK_SA_VL_STAGED;
+    key.rot_q = (uint32_t) rot_q;
+    key.rot_dump = f.rot_dump && rot_q != 0 ? 1 : 0;
+    key.required_sg = tier == VK_SA_TIER_PORTABLE && f.sg32 && device->subgroup_size_control &&
+                      device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size ? 32 : 0;
+    r.tier = tier;
+    r.vl = vl;
+    r.pipeline = ggml_vk_sa_pipeline(device, key);
+    return r;
+}
+
+// dst, rounded up to the descriptor offset alignment, + the plan's sort scratch or the attend's largest workspace
+static size_t ggml_vk_sa_alloc_size(const vk_device & device, const ggml_tensor * tensor) {
+    if (tensor->op == GGML_OP_SPARSE_ATTN_PLAN) {
+        const ggml_tensor * sel = tensor->src[0];
+        return ggml_vk_sa_round_up(device, ggml_nbytes(tensor)) + ggml_sparse_attn_plan_scratch_nbytes(sel->ne[0], sel->ne[1], sel->ne[3]);
+    }
+    const vk_sa_selection s = ggml_vk_sa_select(device, tensor);
+    return s.ws_reserve_bytes != 0 ? ggml_vk_sa_round_up(device, ggml_nbytes(tensor)) + s.ws_reserve_bytes : ggml_nbytes(tensor);
+}
+
+static const char * ggml_vk_sa_tier_name(const int tier) {
+    return tier == VK_SA_TIER_CM ? "cm" : tier == VK_SA_TIER_SCALAR ? "scalar" : "portable";
+}
+
+static const char * ggml_vk_sa_vl_name(const int vl) {
+    return vl == VK_SA_VL_DIRECT ? "direct" : vl == VK_SA_VL_STAGED ? "staged" : "pack";
+}
+
+static const ggml_type vk_sa_types[9] = { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL };
+
+// census keys: sa_plan/G1; sa_attend/vk/<tier>/<VL>/<KT>/<VT>; sa_merge/vk/splits<first of the split class>; sa_pack/vk/<T>
+static const char * const * ggml_vk_sa_census_list() {
+    static const std::vector<std::string> keys = [] {
+        std::vector<std::string> v = { "sa_plan/G1" };
+        for (ggml_type tk : vk_sa_types) {
+            for (ggml_type tv : vk_sa_types) {
+                const std::string pair = std::string(ggml_type_name(tk)) + "/" + ggml_type_name(tv);
+                v.push_back("sa_attend/vk/cm/direct/" + pair);
+                v.push_back("sa_attend/vk/cm/staged/" + pair);
+                v.push_back("sa_attend/vk/cm/pack/" + pair);
+                v.push_back("sa_attend/vk/scalar/staged/" + pair);
+                v.push_back("sa_attend/vk/portable/staged/" + pair);
+            }
+        }
+        for (const char * c : { "2", "6", "17", "34" }) {
+            v.push_back(std::string("sa_merge/vk/splits") + c);
+        }
+        for (ggml_type t : vk_sa_types) {
+            if (t != GGML_TYPE_F16) {
+                v.push_back(std::string("sa_pack/vk/") + ggml_type_name(t));
+            }
+        }
+        return v;
+    }();
+    static const std::vector<const char *> ptrs = [] {
+        std::vector<const char *> p;
+        for (const std::string & k : keys) {
+            p.push_back(k.c_str());
+        }
+        p.push_back(nullptr);
+        return p;
+    }();
+    return ptrs.data();
+}
+
+// the class of a split count: 2-5, 6-16, 17-33, > 33
+static int ggml_vk_sa_split_class(const uint32_t n_split) {
+    return n_split <= 5 ? 2 : n_split <= 16 ? 6 : n_split <= 33 ? 17 : 34;
+}
+
+// NULL when this process can launch the key; otherwise why not (another tier or V variant, a forcing switch)
+static const char * ggml_vk_sa_census_skip(const vk_device & device, const std::string & key) {
+    const vk_sa_force_t f = ggml_vk_sa_force();
+    const vk_sa_tier tier = ggml_vk_sa_tier(device);
+    if (key == "sa_plan/G1") {
+        return device->pipeline_sparse_attn_plan != nullptr && (f.cap_mask & 8u) == 0 ? nullptr : "no plan pipeline on this device";
+    }
+    if (key.rfind("sa_plan/", 0) == 0) {
+        return "Vulkan has no G = 4 plan";
+    }
+    if (key.rfind("sa_merge/vk/splits", 0) == 0) {
+        if (tier == VK_SA_TIER_PORTABLE || tier == VK_SA_TIER_NONE) {
+            return "the portable tier never splits";
+        }
+        if (tier == VK_SA_TIER_SCALAR && key == "sa_merge/vk/splits34") {
+            return "the scalar tier splits a row at most 32 times (n_wg < 64)";
+        }
+        return nullptr;
+    }
+    if (key.rfind("sa_pack/vk/", 0) == 0) {
+        return tier == VK_SA_TIER_CM && f.vl == VK_SA_VL_PACK ? nullptr : "the pack arm runs under GGML_VK_SA_FORCE=vpack on the cm tier only";
+    }
+    if (key.rfind("sa_attend/vk/", 0) == 0) {
+        const std::string prefix = std::string("sa_attend/vk/") + ggml_vk_sa_tier_name(tier) + "/";
+        if (tier == VK_SA_TIER_NONE || key.rfind(prefix, 0) != 0) {
+            return "another tier runs on this device, or in this process";
+        }
+        if (tier != VK_SA_TIER_CM) {
             return nullptr;
         }
-    }
-    // the shader indexes with 32-bit element offsets
-    if (ggml_nbytes(k) / ggml_type_size(k->type) * ggml_blck_size(k->type) > UINT32_MAX ||
-        ggml_nbytes(v) / ggml_type_size(v->type) * ggml_blck_size(v->type) > UINT32_MAX ||
-        ggml_nbytes(q) / sizeof(float) > UINT32_MAX || ggml_nbytes(op) / sizeof(float) > UINT32_MAX) {
-        return nullptr;
-    }
-    switch (q->ne[2] / k->ne[2]) {
-        case 4:  return device->pipeline_flash_attn_sel_f16[0];
-        case 8:  return device->pipeline_flash_attn_sel_f16[1];
-        case 12: return device->pipeline_flash_attn_sel_f16[2];
-        default: return nullptr;
-    }
-}
-
-static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & subctx,
-        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, ggml_tensor * dst) {
-    vk_pipeline pipeline = ggml_vk_flash_attn_sel_pipeline(ctx->device, dst);
-    if (!pipeline) {
-        return false;
-    }
-    const ggml_tensor * ids = dst->src[5];
-    float scale = 1.0f;
-    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
-
-    const vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, q);
-    const vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx, ids);
-    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
-    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
-
-    const uint32_t n_sel = (uint32_t) ids->ne[0];
-    const uint32_t N  = (uint32_t) q->ne[1];
-    const uint32_t NS = (uint32_t) q->ne[3];
-    const uint32_t NH = (uint32_t) q->ne[2];
-    const uint32_t D  = 256;
-    // the cleaned rows: n_sel entries padded to whole 64-key blocks, then one count per row
-    const uint32_t list_stride = ROUNDUP_POW2(n_sel, 64u);
-    const size_t list_size = ((size_t) N * NS * list_stride + (size_t) N * NS) * sizeof(uint32_t);
-
-    // A quantized K or V goes to f16 in prealloc_x first. Prefill dequantizes the whole tensor once (a cell is read by
-    // many queries); few queries copy only the listed cells into compact rows.
-    const bool dequant = k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16;
-    const uint64_t compact_rows = (uint64_t) N * NS * list_stride;
-    const bool gather = dequant && compact_rows * k->ne[2] * 256 <= UINT32_MAX && compact_rows < (uint64_t) k->ne[1] * NS;
-    // f16 element strides of what the kernels read, and the bytes of each f16 copy (0 = read the tensor itself)
-    uint32_t sk[3], sv[3];
-    size_t k_f16_sz = 0, v_f16_sz = 0;
-    auto f16_view = [&](const ggml_tensor * t, uint32_t * st, size_t & sz) {
-        if (gather) {
-            st[0] = (uint32_t) (t->ne[2] * D); st[1] = D; st[2] = 0;
-            sz = compact_rows * t->ne[2] * D * sizeof(ggml_fp16_t);
-            return;
-        }
-        const size_t ts = ggml_type_size(t->type), bs = ggml_blck_size(t->type);
-        for (int i = 0; i < 3; ++i) {
-            st[i] = (uint32_t) (t->nb[i + 1] / ts * bs);
-        }
-        sz = t->type == GGML_TYPE_F16 ? 0 : ggml_nbytes(t) / ts * bs * sizeof(ggml_fp16_t);
-    };
-    f16_view(k, sk, k_f16_sz);
-    f16_view(v, sv, v_f16_sz);
-    const size_t x_align = std::max<size_t>(256, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
-    const size_t v_f16_off = ROUNDUP_POW2(k_f16_sz, x_align);
-    if (dequant) {
-        GGML_ASSERT(std::max(k_f16_sz, v_f16_sz) <= ctx->device->properties.limits.maxStorageBufferRange);
-    }
-
-    // the WMMA kernel reads K and V rows in 16-byte pieces
-    const int gqa_idx = (int) (q->ne[2] / k->ne[2]) / 4 - 1;
-    vk_pipeline pipeline_cm = ctx->device->pipeline_flash_attn_sel_cm_f16[gqa_idx];
-    bool use_cm = pipeline_cm != nullptr &&
-        (k_f16_sz ? 0 : k_buf.offset) % 16 == 0 && (v_f16_sz ? v_f16_off : v_buf.offset) % 16 == 0;
-    for (int i = 0; i < 3; ++i) {
-        use_cm = use_cm && sk[i] % 8 == 0 && sv[i] % 8 == 0;
-    }
-    // one workgroup per (query, split, K/V head) on x
-    use_cm = use_cm && (uint64_t) q->ne[1] * k->ne[2] * CEIL_DIV(ids->ne[0], 32) <= ctx->device->properties.limits.maxComputeWorkGroupCount[0];
-    if (use_cm) {
-        pipeline = pipeline_cm;
-    }
-
-    // few queries (decode) give too few workgroups to fill the GPU: split each row into whole key blocks. The
-    // WMMA kernel runs one subgroup per workgroup, the scalar one GQA subgroups.
-    const uint32_t n_wg = N * (uint32_t) k->ne[2] * NS;
-    const uint32_t min_wg = use_cm ? 128u : 64u;
-    uint32_t n_split = n_wg < min_wg ? std::min(CEIL_DIV(min_wg, n_wg), CEIL_DIV(n_sel, 64u)) : 1u;
-    const uint32_t chunk = ROUNDUP_POW2(CEIL_DIV(n_sel, std::max(n_split, 1u)), 32u); // whole key blocks
-    n_split = CEIL_DIV(n_sel, chunk);
-    const size_t split_size = n_split > 1 ? ((size_t) D * NH * N * NS * n_split + (size_t) NH * 2 * N * NS * n_split) * sizeof(float) : 0;
-    // the partials go after the rows, 256-byte aligned, then the identity rows of the gather
-    const size_t split_off = ROUNDUP_POW2(list_size, 256);
-    const size_t list2_off = ROUNDUP_POW2(split_off + split_size, 256);
-    const size_t split_k_need = gather ? list2_off + list_size : split_off + split_size;
-
-    const vk_op_flash_attn_sel_push_constants pc = {
-        (uint32_t) k->ne[1], n_sel, list_stride,
-        (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)), (uint32_t) (q->nb[3] / sizeof(float)),
-        sk[0], sk[1], sk[2],
-        sv[0], sv[1], sv[2],
-        (uint32_t) (ids->nb[1] / sizeof(int32_t)), ids->ne[3] == 1 ? 0u : (uint32_t) (ids->nb[3] / sizeof(int32_t)),
-        (uint32_t) (dst->nb[1] / sizeof(float)), (uint32_t) (dst->nb[2] / sizeof(float)), (uint32_t) (dst->nb[3] / sizeof(float)),
-        scale, n_split, chunk, NH, N, NS,
-    };
-
-    vk_pipeline prep = ctx->device->pipeline_flash_attn_sel_prep;
-    ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    if (n_split > 1) {
-        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
-    }
-    if (gather) {
-        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_sel_gather[k->type], 1);
-        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_sel_gather[v->type], 1);
-    } else {
-        for (const ggml_tensor * t : { k, v }) {
-            if (t->type != GGML_TYPE_F16) {
-                ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_dequant[t->type], 1);
+        const std::string rest = key.substr(prefix.size());
+        for (ggml_type tk : vk_sa_types) {
+            for (ggml_type tv : vk_sa_types) {
+                const std::string pair = std::string(ggml_type_name(tk)) + "/" + ggml_type_name(tv);
+                if (rest.size() > pair.size() && rest.compare(rest.size() - pair.size(), pair.size(), pair) == 0 && rest[rest.size() - pair.size() - 1] == '/') {
+                    vk_sa_vl want = f.vl >= 0 ? (vk_sa_vl) f.vl : ggml_vk_sa_default_vl(tv);
+                    if (want == VK_SA_VL_PACK && tk == GGML_TYPE_F16 && tv == GGML_TYPE_F16) {
+                        want = VK_SA_VL_DIRECT;   // nothing to pack
+                    }
+                    return rest.rfind(std::string(ggml_vk_sa_vl_name(want)) + "/", 0) == 0 ? nullptr : "another V variant runs for this pair in this process";
+                }
             }
         }
     }
-    const size_t x_need = dequant ? v_f16_off + v_f16_sz : 0;
-    if (ctx->prealloc_size_split_k < split_k_need || ctx->prealloc_size_x < x_need) {
-        ctx->prealloc_size_split_k = std::max(ctx->prealloc_size_split_k, split_k_need);
-        ctx->prealloc_size_x = std::max(ctx->prealloc_size_x, x_need);
-        ggml_vk_preallocate_buffers(ctx, subctx);
+    return "not a Vulkan sparse-attention census key";
+}
+
+static int32_t ggml_backend_vk_sparse_attn_group(ggml_backend_dev_t, int64_t, int64_t, enum ggml_type, enum ggml_type, bool) {
+    return 1;
+}
+
+// Dense shortcut preference: a (pair, n_q band) is dense where sparse ran slower than causal FLASH_ATTN_EXT on the cm tier.
+// Other tiers and types keep the sparse op, and a dense pick is dropped when this device's FLASH_ATTN_EXT rejects the pair.
+
+// a FLASH_ATTN_EXT of the dense shortcut's shape (D 256, the qwen4exp heads, a causal f16 mask) on this device
+static bool ggml_vk_sa_dense_fa_supported(ggml_backend_dev_t dev, ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv) {
+    ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return false;
     }
-    if (ctx->prealloc_split_k_need_sync || (dequant && ctx->prealloc_x_need_sync)) {
-        ggml_vk_sync_buffers(ctx, subctx);
-    }
-    const vk_subbuffer k_f16 = { ctx->prealloc_x, 0, std::max<size_t>(k_f16_sz, 1) };
-    const vk_subbuffer v_f16 = { ctx->prealloc_x, v_f16_off, std::max<size_t>(v_f16_sz, 1) };
-    // full: dequantize alongside the prep pass (no dependency between them)
-    if (dequant && !gather) {
-        if (k_f16_sz) {
-            const uint32_t nel = (uint32_t) (k_f16_sz / sizeof(ggml_fp16_t));
-            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_dequant[k->type], { k_buf, k_f16 },
-                std::vector<uint32_t>{ 0, 0, 0, 0, nel }, { nel, 1, 1 });
-            k_buf = k_f16;
+    n_q  = std::max<int64_t>(n_q, 1);
+    n_kv = std::max<int64_t>(n_kv, 1);
+    ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_q, 24, 1);
+    ggml_tensor * k  = ggml_new_tensor_4d(ctx, type_k, 256, n_kv, 2, 1);
+    ggml_tensor * v  = ggml_new_tensor_4d(ctx, type_v, 256, n_kv, 2, 1);
+    ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v, m, 0.0625f, 0.0f, 0.0f);
+    const bool ok = ggml_backend_dev_supports_op(dev, fa);
+    ggml_free(ctx);
+    return ok;
+}
+
+static bool ggml_backend_vk_sparse_attn_prefer_dense(ggml_backend_dev_t dev, enum ggml_type type_k, enum ggml_type type_v, int64_t n_q, int64_t n_kv) {
+    auto ti = [](ggml_type t) {
+        switch (t) {
+            case GGML_TYPE_F16:  return 0;
+            case GGML_TYPE_BF16: return 1;
+            case GGML_TYPE_Q8_0: return 2;
+            case GGML_TYPE_Q4_0: return 3;
+            default:             return -1;
         }
-        if (v_f16_sz) {
-            const uint32_t nel = (uint32_t) (v_f16_sz / sizeof(ggml_fp16_t));
-            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_dequant[v->type], { v_buf, v_f16 },
-                std::vector<uint32_t>{ 0, 0, 0, 0, nel }, { nel, 1, 1 });
-            v_buf = v_f16;
-        }
+    };
+    const int tk = ti(type_k), tv = ti(type_v);
+    if (tk < 0 || tv < 0) {
+        return false;
     }
-    vk_subbuffer list_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
-    ggml_vk_dispatch_pipeline(ctx, subctx, prep, { ids_buf, list_buf }, pc, { N, NS, 1 });
+    // n_q bands: {1, 2-8, 9-32, 33-127, 128-511, 512-1023, >= 1024}
+    const int band = n_q <= 1 ? 0 : n_q <= 8 ? 1 : n_q <= 32 ? 2 : n_q <= 127 ? 3 : n_q <= 511 ? 4 : n_q <= 1023 ? 5 : 6;
+    // [K f16, bf16, q8_0, q4_0][V f16, bf16, q8_0, q4_0][band]: 1 = dense
+    static const bool dense[4][4][7] = {
+        { { 1, 1, 1, 1, 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0 }, { 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1, 1 } },   // K f16
+        { { 0, 0, 0, 0, 0, 0, 0 }, { 1, 1, 1, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0 } },   // K bf16
+        { { 1, 1, 1, 0, 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0 }, { 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1, 1 } },   // K q8_0
+        { { 1, 1, 1, 0, 1, 1, 1 }, { 0, 0, 0, 0, 0, 0, 0 }, { 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1, 1 } },   // K q4_0
+    };
+    if (!dense[tk][tv][band]) {
+        return false;
+    }
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+    const vk_device device = ggml_vk_get_device(ctx->device);
+    if (ggml_vk_sa_tier(device) != VK_SA_TIER_CM) {
+        return false;
+    }
+    return ggml_vk_sa_dense_fa_supported(dev, type_k, type_v, n_q, n_kv);
+}
+
+static const char * ggml_backend_vk_sparse_attn_unsupported_reason(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+    const vk_device device = ggml_vk_get_device(ctx->device);
+    if (ggml_vk_sa_tier(device) == VK_SA_TIER_NONE) {
+        return "Vulkan device lacks the pipelines of every sparse-attention tier";
+    }
+    if (op->op == GGML_OP_SPARSE_ATTN) {
+        if (ggml_backend_dev_supports_op(dev, op)) {
+            return nullptr;
+        }
+        const vk_sa_selection sel = ggml_vk_sa_select(device, op);
+        return sel.why ? sel.why : "sparse-attention shape not supported on this Vulkan device";
+    }
+    if (ggml_backend_dev_supports_op(dev, op)) {
+        return nullptr;
+    }
+    const char * why = ggml_sparse_attn_plan_shape_why(op);
+    if (why == nullptr) {
+        why = ggml_vk_sa_plan_why(device, op);
+    }
+    return why ? why : "plan shape not supported on this Vulkan device";
+}
+
+// the workspace of a sparse node, right after its dst at the descriptor offset alignment
+static vk_subbuffer ggml_vk_sa_ws_subbuffer(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, const vk_subbuffer & dst_buf, const size_t offset, const size_t bytes) {
+    const size_t off = ggml_vk_sa_round_up(ctx->device, ggml_nbytes(dst)) + offset;
+    GGML_ASSERT(dst_buf.offset + off + bytes <= dst_buf.buffer->size);
+    GGML_ASSERT(ggml_backend_buffer_get_alloc_size(dst->buffer, dst) >= off + bytes);
+    return vk_subbuffer{ dst_buf.buffer, dst_buf.offset + off, bytes };
+}
+
+static void ggml_vk_sparse_attn_plan(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * sel = dst->src[0];
+    const int64_t n_sel = sel->ne[0], n_q = sel->ne[1], n_stream = sel->ne[3];
+    const int64_t n_kv = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) == 1);
+    const ggml_sparse_attn_plan_layout L = ggml_sparse_attn_plan_get_layout(n_sel, n_q, n_stream, n_kv, 1);
+    GGML_ASSERT(ggml_nbytes(dst) == L.nbytes);
+
+    vk_pipeline pipeline = ctx->device->pipeline_sparse_attn_plan;
+    GGML_ASSERT(pipeline != nullptr);   // supports_op
+
+    const uint32_t max_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+    const vk_sa_force_t f = ggml_vk_sa_force();
+    const uint32_t q_per = f.max_q != 0 ? std::min(f.max_q, max_x) : max_x;
+    const uint32_t n_disp = CEIL_DIV((uint32_t) n_q, q_per);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1 + n_disp);
+
+    // the scratch is invisible to the barrier tracker of ggml_vk_build_graph
     ggml_vk_sync_buffers(ctx, subctx);
-    if (gather) {
-        // K writes the identity rows, V only copies
-        const vk_subbuffer list2_buf = { ctx->prealloc_split_k, list2_off, list_size };
-        const std::array<uint32_t, 3> ggrid = { CEIL_DIV(list_stride, 4u), N * NS, 1 };
-        auto run = [&](const ggml_tensor * t, const vk_subbuffer & src, const vk_subbuffer & out, uint32_t write_list) {
-            const uint32_t u = (uint32_t) ggml_type_size(t->type);   // source strides in elements (f16) or blocks
-            const std::vector<uint32_t> gpc = { N * NS, N, list_stride, (uint32_t) t->ne[2],
-                (uint32_t) (t->nb[1] / u), (uint32_t) (t->nb[2] / u), (uint32_t) (t->nb[3] / u), write_list };
-            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_sel_gather[t->type],
-                { src, list_buf, out, list2_buf }, gpc, ggrid);
-        };
-        run(k, k_buf, k_f16, 1);
-        run(v, v_buf, v_f16, 0);
-        ggml_vk_sync_buffers(ctx, subctx);
-        k_buf = k_f16;
-        v_buf = v_f16;
-        list_buf = list2_buf;
+
+    const vk_subbuffer sel_buf = ggml_vk_tensor_subbuffer(ctx, sel, true);
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    const size_t scratch = ggml_sparse_attn_plan_scratch_nbytes(n_sel, n_q, n_stream);
+    const vk_subbuffer scr_buf = ggml_vk_sa_ws_subbuffer(ctx, dst, dst_buf, 0, scratch);
+
+    vk_op_sparse_attn_plan_push_constants pc = {
+        0, (uint32_t) n_kv, (uint32_t) n_sel, (uint32_t) GGML_PAD(n_sel, 4),
+        (uint32_t) (sel->nb[1] / sizeof(int32_t)), (uint32_t) (sel->nb[3] / sizeof(int32_t)), get_misalign_bytes(ctx, sel) / (uint32_t) sizeof(int32_t),
+        (uint32_t) n_q, (uint32_t) n_stream, (uint32_t) L.cap,
+        (uint32_t) (L.off_counts / 4), (uint32_t) (L.off_quads / 4), (uint32_t) (L.off_masks / 4),
+        0,
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { sel_buf, dst_buf, scr_buf }, pc, { 1, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);   // hdr.n_bad starts at 0 for every row
+    pc.mode = 1;
+    for (uint32_t q0 = 0; q0 < (uint32_t) n_q; q0 += q_per) {
+        pc.q_base = q0;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { sel_buf, dst_buf, scr_buf }, pc, { std::min(q_per, (uint32_t) n_q - q0), (uint32_t) n_stream, 1 });
     }
-    if (dequant) {
-        ctx->prealloc_x_need_sync = true;
-        ggml_vk_path_census_add(gather ? "FA_SEL_KV_GATHER" : "FA_SEL_KV_DEQUANT");
-        ggml_vk_perf_mark_subop(ctx, subctx, gather ? "FA_SEL_KV_GATHER (sub-op)" : "FA_SEL_KV_DEQUANT (sub-op)");
+    if (ggml_vk_dispatch_census_enabled()) {
+        ggml_vk_census_key_add("sa_plan/G1");
+    }
+}
+
+static void ggml_vk_sparse_attn(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * plan = dst->src[3];
+    const vk_device & device = ctx->device;
+
+    vk_sa_selection s = ggml_vk_sa_select(device, dst);
+    GGML_ASSERT(s.pipeline != nullptr);   // supports_op
+
+    const uint32_t N = (uint32_t) q->ne[1], NH = (uint32_t) q->ne[2], NS = (uint32_t) q->ne[3], KVH = (uint32_t) k->ne[2];
+    const int64_t n_kv = ggml_get_op_params_i32(plan, 0);
+    const int64_t n_kv4 = 4 * ((n_kv + 3) / 4);
+    const int32_t rot_q = ggml_get_op_params_i32(dst, 1);
+    const int32_t rot_o = ggml_get_op_params_i32(dst, 2);
+    const ggml_sparse_attn_plan_layout L = ggml_sparse_attn_plan_get_layout(plan->src[0]->ne[0], N, NS, n_kv, 1);
+
+    const uint32_t q_wg_per_query = s.tier == VK_SA_TIER_CM ? s.n_split * KVH : s.tier == VK_SA_TIER_SCALAR ? s.n_split : 1;
+    const uint32_t max_x = device->properties.limits.maxComputeWorkGroupCount[0] / q_wg_per_query;
+    const vk_sa_force_t f = ggml_vk_sa_force();
+    const uint32_t q_per = f.max_q != 0 ? std::min(f.max_q, max_x) : max_x;
+    GGML_ASSERT(q_per > 0);
+    const uint32_t n_disp = CEIL_DIV(N, q_per);
+
+    ggml_pipeline_request_descriptor_sets(ctx, s.pipeline, n_disp);
+    vk_pipeline pack_k = s.pack_k ? device->pipeline_sparse_attn_pack[k->type] : nullptr;
+    vk_pipeline pack_v = s.pack_v ? device->pipeline_sparse_attn_pack[v->type] : nullptr;
+    if (pack_k) {
+        ggml_pipeline_request_descriptor_sets(ctx, pack_k, 1);
+    }
+    if (pack_v) {
+        ggml_pipeline_request_descriptor_sets(ctx, pack_v, 1);
+    }
+    if (s.n_split > 1) {
+        ggml_pipeline_request_descriptor_sets(ctx, device->pipeline_sparse_attn_reduce, 1);
+    }
+    vk_pipeline fwht_o = rot_o != 0 ? device->pipeline_fwht_inplace_f32[ggml_vk_fwht_pipeline_idx(rot_o)] : nullptr;
+    if (fwht_o) {
+        ggml_pipeline_request_descriptor_sets(ctx, fwht_o, 1);
     }
 
-    // the WMMA kernel takes the K/V heads on x (next to each other), the scalar one on y
-    GGML_ASSERT(!use_cm || (uint64_t) N * n_split * k->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
-    const std::array<uint32_t, 3> grid = use_cm ? std::array<uint32_t, 3>{ N * n_split * (uint32_t) k->ne[2], 1, NS }
-                                                : std::array<uint32_t, 3>{ N * n_split, (uint32_t) k->ne[2], NS };
-    if (n_split == 1) {
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, list_buf, dst_buf }, pc, grid);
-        ctx->prealloc_split_k_need_sync = true;
-        return true;
-    }
-    const vk_subbuffer split_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, split_off);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, list_buf, split_buf }, pc, grid);
+    // the workspace is invisible to the barrier tracker of ggml_vk_build_graph
     ggml_vk_sync_buffers(ctx, subctx);
-    const vk_op_flash_attn_split_k_reduce_push_constants reduce_pc = { D, NH, N, N, NS, n_split, 0 };
-    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
-        { split_buf, q_buf, dst_buf }, reduce_pc, { NH, D, N * NS });
-    ctx->prealloc_split_k_need_sync = true;
-    return true;
+
+    const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q, true);
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k, true);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v, true);
+    const vk_subbuffer plan_buf = ggml_vk_tensor_subbuffer(ctx, plan);
+    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    const uint32_t unit_k = ggml_vk_sa_unit_bytes(s.tier, k->type), unit_v = ggml_vk_sa_unit_bytes(s.tier, v->type);
+    const uint32_t mis_k = get_misalign_bytes(ctx, k), mis_v = get_misalign_bytes(ctx, v);
+    // the f16 / f32 loaders index 16-byte pieces, the bf16 one 8-byte ones
+    GGML_ASSERT(mis_k % unit_k == 0 && mis_v % unit_v == 0);
+    GGML_ASSERT(s.tier == VK_SA_TIER_PORTABLE || (k->type != GGML_TYPE_BF16 || mis_k % 8 == 0));
+    GGML_ASSERT(s.tier == VK_SA_TIER_PORTABLE || (v->type != GGML_TYPE_BF16 || mis_v % 8 == 0));
+    GGML_ASSERT(s.tier != VK_SA_TIER_PORTABLE || (mis_k % 4 == 0 && mis_v % 4 == 0));
+    // the cm loaders index 16-byte lines of the K rows and dwords of the V rows of q8_0 and q4_0
+    GGML_ASSERT(s.tier != VK_SA_TIER_CM || ((k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_Q4_0) || mis_k % 16 == 0));
+    GGML_ASSERT(s.tier != VK_SA_TIER_CM || ((v->type != GGML_TYPE_Q8_0 && v->type != GGML_TYPE_Q4_0) || mis_v % 4 == 0));
+
+    vk_op_sparse_attn_push_constants pc = {
+        (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)), (uint32_t) (q->nb[3] / sizeof(float)), get_misalign_bytes(ctx, q) / (uint32_t) sizeof(float),
+        (uint32_t) (k->nb[1] / unit_k), (uint32_t) (k->nb[2] / unit_k), (uint32_t) (k->nb[3] / unit_k), mis_k / unit_k,
+        (uint32_t) (v->nb[1] / unit_v), (uint32_t) (v->nb[2] / unit_v), (uint32_t) (v->nb[3] / unit_v), mis_v / unit_v,
+        (uint32_t) (L.off_counts / 4), (uint32_t) (L.off_quads / 4), (uint32_t) (L.off_masks / 4), (uint32_t) L.cap,
+        (uint32_t) (dst->nb[1] / sizeof(float)), (uint32_t) (dst->nb[2] / sizeof(float)), (uint32_t) (dst->nb[3] / sizeof(float)),
+        ggml_get_op_params_f32(dst, 0),
+        rot_q != 0 ? 1.0f / std::sqrt((float) rot_q) : 1.0f,
+        s.n_split, NH, N, NS, 0,
+    };
+
+    // the pack arm: the non-f16 sides into the workspace as f16 rows, then the f16 instance on them
+    size_t ws_off = 0;
+    const auto pack_side = [&](vk_pipeline & pipeline, const ggml_tensor * t, const vk_subbuffer & src, const uint32_t mis, const size_t bytes, vk_subbuffer & bound, uint32_t & nb1, uint32_t & nb2, uint32_t & nb3, uint32_t & off) {
+        const uint32_t unit = ggml_vk_sa_unit_bytes(VK_SA_TIER_CM, t->type);
+        const vk_subbuffer out = ggml_vk_sa_ws_subbuffer(ctx, dst, dst_buf, ws_off, bytes);
+        const vk_op_sparse_attn_pack_push_constants ppc = {
+            (uint32_t) (t->nb[1] / unit), (uint32_t) (t->nb[2] / unit), (uint32_t) (t->nb[3] / unit), mis / unit, (uint32_t) n_kv4, KVH,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { out, src, src }, ppc, { (uint32_t) ((n_kv4 + 63) / 64), KVH * NS, 1 });
+        ws_off += bytes;
+        bound = out;
+        nb1 = 256 * sizeof(ggml_fp16_t) / 16;
+        nb2 = nb1 * (uint32_t) n_kv4;
+        nb3 = nb2 * KVH;
+        off = 0;
+    };
+    if (s.pack_k) {
+        pack_side(pack_k, k, k_buf, mis_k, s.pack_k_bytes, k_buf, pc.nbk1, pc.nbk2, pc.nbk3, pc.k_off);
+    }
+    if (s.pack_v) {
+        pack_side(pack_v, v, v_buf, mis_v, s.pack_v_bytes, v_buf, pc.nbv1, pc.nbv2, pc.nbv3, pc.v_off);
+    }
+    if (s.pack_k || s.pack_v) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    const bool rot_dump = f.rot_dump && rot_q != 0;   // the test hook writes H_q q to dst: nothing to merge or rotate
+    const vk_subbuffer out_buf = s.n_split > 1 && !rot_dump ? ggml_vk_sa_ws_subbuffer(ctx, dst, dst_buf, ws_off, s.partial_bytes) : dst_buf;
+    for (uint32_t q0 = 0; q0 < N; q0 += q_per) {
+        const uint32_t nq = std::min(q_per, N - q0);
+        pc.q_base = q0;
+        const std::array<uint32_t, 3> grid = s.tier == VK_SA_TIER_CM ? std::array<uint32_t, 3>{ nq * s.n_split * KVH, 1, NS }
+                                           : s.tier == VK_SA_TIER_SCALAR ? std::array<uint32_t, 3>{ nq * s.n_split, KVH, NS }
+                                                                         : std::array<uint32_t, 3>{ nq, KVH, NS };
+        ggml_vk_dispatch_pipeline(ctx, subctx, s.pipeline, { q_buf, k_buf, v_buf, plan_buf, out_buf }, pc, grid);
+    }
+
+    if (s.n_split > 1 && !rot_dump) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        const vk_op_sparse_attn_reduce_push_constants reduce_pc = { 256, NH, N, NS, s.n_split };
+        ggml_vk_dispatch_pipeline(ctx, subctx, device->pipeline_sparse_attn_reduce, { out_buf, dst_buf }, reduce_pc, { NH, 256 / 32, N * NS });
+    }
+    if (fwht_o && !rot_dump) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        const uint32_t n_rows = (uint32_t) (ggml_nelements(dst) / rot_o);
+        const vk_op_fwht_push_constants fpc = { n_rows, 0, 0, 1.0f / std::sqrt((float) rot_o) };
+        ggml_vk_dispatch_pipeline(ctx, subctx, fwht_o, { dst_buf }, fpc,
+            { std::min(CEIL_DIV(n_rows, 4u), device->properties.limits.maxComputeWorkGroupCount[0]), 1, 1 });
+    }
+
+    if (ggml_vk_dispatch_census_enabled()) {
+        ggml_vk_census_key_add(std::string("sa_attend/vk/") + ggml_vk_sa_tier_name(s.tier) + "/" + ggml_vk_sa_vl_name(s.vl) + "/" + ggml_type_name(k->type) + "/" + ggml_type_name(v->type));
+        if (s.n_split > 1) {
+            ggml_vk_census_key_add("sa_merge/vk/splits" + std::to_string(ggml_vk_sa_split_class(s.n_split)));
+        }
+        if (s.pack_k) {
+            ggml_vk_census_key_add(std::string("sa_pack/vk/") + ggml_type_name(k->type));
+        }
+        if (s.pack_v) {
+            ggml_vk_census_key_add(std::string("sa_pack/vk/") + ggml_type_name(v->type));
+        }
+    }
 }
 
 static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context & subctx,
@@ -11583,12 +12107,6 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
-    if (dst->src[5] != nullptr && mask == nullptr) {
-        // supports_op only takes a maskless selected-key op when flash_attn_sel does
-        const bool done = ggml_vk_flash_attn_sel(ctx, subctx, q, k, v, dst);
-        GGML_ASSERT(done);
-        return;
-    }
     if (ggml_vk_flash_attn_top_k(ctx, subctx, q, k, v, mask, sinks, dst)) {
         return;
     }
@@ -16884,6 +17402,16 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+    case GGML_OP_SPARSE_ATTN_PLAN:
+        ggml_vk_sparse_attn_plan(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_SPARSE_ATTN:
+        ggml_vk_sparse_attn(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_RWKV_WKV6:
         ggml_vk_rwkv_wkv6(ctx, compute_ctx, node);
 
@@ -17275,9 +17803,11 @@ size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft)
 }
 
 size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    if (tensor->op == GGML_OP_SPARSE_ATTN_PLAN || tensor->op == GGML_OP_SPARSE_ATTN) {
+        ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+        return ggml_vk_sa_alloc_size(ctx->device, tensor);
+    }
     return ggml_nbytes(tensor);
-
-    UNUSED(buft);
 }
 
 ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
@@ -19383,6 +19913,9 @@ static const char * ggml_backend_vk_dispatch_census_skip(ggml_backend_t backend,
     if (l == "MUL_MAT_DENSE_DQ8" && (!dev->pipeline_matmul_dq8[0][0] || !dev->pipeline_matmul_dq8[0][1])) {
         return "no dense q8_0 x f16 GEMM pipeline (needs coopmat with an f32 accumulator, fp16 and 32-lane subgroups)";
     }
+    if (l.rfind("sa_", 0) == 0) {
+        return ggml_vk_sa_census_skip(dev, l);
+    }
     if (dev->disable_fusion) {
         return "fusion disabled (GGML_VK_DISABLE_FUSION)";
     }
@@ -19434,6 +19967,13 @@ static void ggml_vk_dispatch_census_add(const char * label, int n_nodes) {
 // true while the census counts: a caller whose key needs work to build (a string, a name lookup) checks it first
 static bool ggml_vk_dispatch_census_enabled() {
     return vk_dispatch_census_on.load(std::memory_order_relaxed);
+}
+
+static void ggml_vk_census_key_add(const std::string & key) {
+    if (vk_dispatch_census_on.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lock(vk_dispatch_census_mutex);
+        vk_dispatch_census[key]++;
+    }
 }
 
 [[maybe_unused]] static void ggml_vk_path_census_add(const char * name) {
@@ -19515,6 +20055,12 @@ static bool ggml_vk_can_fuse_mm_cpy16(ggml_backend_vk_context * ctx, const struc
         return false;
     }
     return ggml_vk_mul_mat_f16out_ok(ctx, mm);
+}
+
+// test hook: the sparse-attention test switches (GGML_VK_SA_FORCE, GGML_VK_SA_CAP_MASK, GGML_VK_SA_MAX_Q) are read again
+// on their next use
+static void ggml_backend_vk_debug_env_reload() {
+    ggml_vk_sa_force_reload();
 }
 
 // HC_UP_MIX: the hc up GEMM (+ CPY(f16 gate)) + DSV4_HC_PRE as one int8 MMQ GEMM whose epilogue applies the gated mix bit-exactly.
@@ -21267,7 +21813,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
-        if (keep_pattern(topk_qsa_pattern)) {
+        // TOPK_QSA: the fused top-k reads the chain's sources while it writes the picks, so they stay allocated through the TOP_K; otherwise ggml-alloc may alias the TOP_K output onto them and the overlap check disables the fusion
+        if (match_pattern(topk_qsa_pattern, first_unused)) {
+            if (params && params->add_alloc_dep) {
+                add_pattern_alloc_deps(topk_qsa_pattern, first_unused + (int) topk_qsa_pattern.size() - 1);
+            }
+            keep_pattern(topk_qsa_pattern);
             continue;
         }
         // QSA scorer chain (QSA_SCORE), prefill only: the fusion needs more than 64 query-head columns; decode keeps its order.
@@ -22263,10 +22814,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 bool coopmat2 = device->coopmat2;
-                // maskless selected-key attention (src[5] without a mask): only flash_attn_sel reads the list, the dense kernel would attend to all cells
-                if (op->src[5] != nullptr && op->src[3] == nullptr) {
-                    return ggml_vk_flash_attn_sel_pipeline(device, op) != nullptr;
-                }
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
                 if ((HSK % 8) != 0 || (HSV % 8) != 0) {
@@ -22696,6 +23243,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_GATED_LINEAR_ATTN:
             // the shader block size is hardcoded to head_size 64
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
+        case GGML_OP_SPARSE_ATTN_PLAN:
+            return ggml_sparse_attn_plan_shape_why(op) == nullptr && ggml_vk_sa_plan_supported(device, op);
+        case GGML_OP_SPARSE_ATTN:
+            return ggml_vk_sa_select(device, op).pipeline != nullptr;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 const ggml_tensor * q = op->src[0];
@@ -23012,6 +23563,25 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_debug_dispatch_census_count") == 0) {
         return (void *) ggml_backend_vk_dispatch_census_count;
+    }
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_list") == 0) {
+        return (void *) ggml_vk_sa_census_list;
+    }
+    if (strcmp(name, "ggml_backend_debug_env_reload") == 0) {
+        return (void *) ggml_backend_vk_debug_env_reload;
+    }
+    if (strcmp(name, "ggml_backend_debug_vk_sa_binding_limit") == 0) {
+        return (void *) ggml_backend_vk_sa_binding_limit;
+    }
+    // the sparse-attention policies (ggml-backend.h)
+    if (strcmp(name, "ggml_backend_sparse_attn_group") == 0) {
+        return (void *) (ggml_backend_sparse_attn_group_t) ggml_backend_vk_sparse_attn_group;
+    }
+    if (strcmp(name, "ggml_backend_sparse_attn_prefer_dense") == 0) {
+        return (void *) (ggml_backend_sparse_attn_prefer_dense_t) ggml_backend_vk_sparse_attn_prefer_dense;
+    }
+    if (strcmp(name, "ggml_backend_sparse_attn_unsupported_reason") == 0) {
+        return (void *) (ggml_backend_sparse_attn_unsupported_reason_t) ggml_backend_vk_sparse_attn_unsupported_reason;
     }
     return nullptr;
 }

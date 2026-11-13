@@ -104,10 +104,6 @@
 #define GGML_CUDA_CC_IS_CDNA3(cc)   (GGML_CUDA_CC_IS_CDNA(cc) && cc >= GGML_CUDA_CC_CDNA3 && cc < GGML_CUDA_CC_CDNA4)
 #define GGML_CUDA_CC_IS_CDNA4(cc)   (GGML_CUDA_CC_IS_CDNA(cc) && cc >= GGML_CUDA_CC_CDNA4 && cc < GGML_CUDA_CC_RDNA1)
 
-// max keys of the QSA selected-key kernels: the 1M context of Qwen3.8 Flash Next with YaRN x4, not an id-space limit
-// QSA_MASKLESS_MAX_KV in qwen4exp.cpp must match, so a deeper n_kv takes the masked route instead of a refused op
-#define GGML_QSA_MAX_KEYS 1048576
-
 // Moore Threads
 #define MUSART_HMASK 40300 // MUSA rc4.3, min. ver. for half2 -> uint mask comparisons
 
@@ -1401,8 +1397,12 @@ struct ggml_cuda_graph {
         void *   node_src_data_ptrs[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+        // F16 / BF16 sources give equal pointers, ne and nb but other kernels: a type change must not replay the graph
+        int32_t  node_src_type[GGML_MAX_SRC];
     };
     std::vector<node_properties> node_props;
+    // census ids of the kernels captured into this graph, counted again at every replay
+    std::vector<uint16_t> census_ids;
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);

@@ -9,57 +9,127 @@
 #include <unordered_map>
 #include <vector>
 
-// compact (maskless) visibility: each query reads the block row of its first seq id, as the attention mask does.
-// Blocks are keyed on (sequence set, position block): a block holding one sequence under two sets (seq_cp inside the
-// block) has no complete group for it, so the maskless path would drop its cells; the masked path keeps them
-static bool qsa_scalar_visibility_cells(const llama_kv_cells & cells, uint32_t count, uint32_t ratio, const llama_ubatch & u) {
-    if (ratio==0 || count>cells.size() || !u.pos || !u.n_tokens || !u.n_pos || !u.seq_id || !u.n_seq_id) { return false; }
+// the cells of the stream belong to at most one sequence; the scan's ranking and the compact predicate share this test
+static bool qsa_stream_one_seq(const llama_kv_cells & cells) {
+    int n_seq_present = 0;
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        if (cells.seq_pos_min(s) >= 0 && ++n_seq_present > 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the scan's ranking decision: positions repeat inside a group (an M-RoPE image) and the stream holds one sequence
+static bool qsa_scan_ranks(const llama_kv_cells & cells, bool dup, bool pos_2d) {
+    return dup && pos_2d && qsa_stream_one_seq(cells);
+}
+
+// why the compact predicate rejected a ubatch (0 = compact)
+enum qsa_compact_reason {
+    QSA_COMPACT_OK          = 0,
+    QSA_NC_INPUT            = 1, // missing positions / sequence ids, or a bad stream split
+    QSA_NC_POS_RANGE        = 2, // a position outside [0, 2^24): f32 cell ids are exact only below it
+    QSA_NC_DUP_KEY          = 3, // two cells of one sequence share a (pos, y, x) key: the mask order is not total
+    QSA_NC_2D_MULTI_SEQ     = 4, // 2-D cells in a stream with another sequence: the scan cannot rank them
+    QSA_NC_SHARED_BLOCK     = 5, // a block holds one sequence under two sets (seq_cp): no complete group for it
+};
+
+static const char * qsa_compact_reason_name(int r) {
+    switch (r) {
+        case QSA_COMPACT_OK:      return "compact";
+        case QSA_NC_INPUT:        return "ubatch-input";
+        case QSA_NC_POS_RANGE:    return "position>=2^24";
+        case QSA_NC_DUP_KEY:      return "duplicate-(pos,y,x)-key";
+        case QSA_NC_2D_MULTI_SEQ: return "2-D-cells-with-another-sequence-in-the-stream";
+        case QSA_NC_SHARED_BLOCK: return "block-shared-by-two-sequence-sets";
+    }
+    return "unknown";
+}
+
+// the mask's key of a cell: (pos, y, x) under M-RoPE, pos alone otherwise
+static bool qsa_key_2d(const llama_kv_cells & cells, uint32_t j) {
+    return cells.ext_get(j).is_2d_gt(cells.pos_get(j), cells.pos_get(j));
+}
+
+// duplicate (pos, y, x) keys among the cells of seq; unique positions answer in O(1) from the duplicate count, since this runs on every graph build. walked (test hook): the set entries visited
+static bool qsa_seq_has_dup_key(const llama_kv_cells & cells, llama_seq_id seq, bool pos_2d, size_t * walked = nullptr) {
+    if (cells.seq_pos_n_dup(seq) == 0) {
+        return false;
+    }
+    if (!pos_2d) {
+        return true;
+    }
+    const auto & sp = cells.seq_pos_get(seq);
+    std::vector<std::pair<llama_pos, llama_pos>> yx;
+    for (auto it = sp.begin(); it != sp.end();) {
+        auto end = it;
+        size_t n = 0;
+        while (end != sp.end() && end->first == it->first) { ++end; ++n; }
+        if (walked) { *walked += n; }
+        if (n > 1) {
+            yx.clear();
+            for (auto c = it; c != end; ++c) {
+                const auto & e = cells.ext_get(c->second);
+                yx.emplace_back(e.y, e.x);
+            }
+            std::sort(yx.begin(), yx.end());
+            if (std::adjacent_find(yx.begin(), yx.end()) != yx.end()) { return true; }
+        }
+        it = end;
+    }
+    return false;
+}
+
+// compact (maskless) visibility of the tokens [i0, i0 + n) of a ubatch on one stream: each query reads the block row of its first seq id, as the mask does. 2-D cells need a one-sequence stream, where the scan's rank order makes the visible set a prefix; a multi-sequence stream stays compact for text. QSA_COMPACT_OK or the reason.
+static int qsa_compact_visibility_stream(const llama_kv_cells & cells, uint32_t count, uint32_t ratio, const llama_ubatch & u,
+        uint32_t i0, uint32_t n) {
+    if (ratio==0 || count>cells.size() || !u.pos || !u.n_tokens || !u.n_pos || !u.seq_id || !u.n_seq_id || n==0 ||
+            i0+n>u.n_tokens) {
+        return QSA_NC_INPUT;
+    }
+    const bool pos_2d = u.is_pos_2d();
     llama_kv_cells::seq_set_t rows;
-    for (uint32_t i=0;i<u.n_tokens;++i) {
-        if (u.n_seq_id[i]<1 || !u.seq_id[i] || u.seq_id[i][0]<0 || u.seq_id[i][0]>=LLAMA_MAX_SEQ) { return false; }
-        if (u.pos[i]<0 || u.pos[i]>=16777216) { return false; }
+    bool has_2d = false;
+    for (uint32_t i=i0;i<i0+n;++i) {
+        if (u.n_seq_id[i]<1 || !u.seq_id[i] || u.seq_id[i][0]<0 || u.seq_id[i][0]>=LLAMA_MAX_SEQ) { return QSA_NC_INPUT; }
+        if (u.pos[i]<0 || u.pos[i]>=16777216) { return QSA_NC_POS_RANGE; }
         // text under M-RoPE: the three rope axes carry the position, the fourth (unused by the visibility) is 0
         for (uint32_t axis=1;axis<u.n_pos;++axis) {
             const llama_pos p = u.pos[i+axis*u.n_tokens];
-            if (p!=u.pos[i] && !(axis==3 && p==0)) { return false; }
+            if (p!=u.pos[i] && !(axis==3 && p==0)) { has_2d = true; }
         }
         rows.set(u.seq_id[i][0]);
     }
-    // a 2-D (image) cell past its linear position can break the scalar test: the mrope mask compares 2-D extents only
-    // between a cell and a query at the same linear position. With one sequence in the cache the selection ranks the
-    // cells in the mask's own order (position, then y, then x), so such a cell is harmless unless a query of this
-    // ubatch sits at its position. Several sequences are not ranked: any 2-D cell keeps the masked path there.
     // only blocks with a shared cell can split
     std::unordered_map<llama_pos, std::vector<llama_kv_cells::seq_set_t>> shared;
-    std::vector<llama_pos> pos_2d;
-    bool one_seq = rows.count()==1;
     for (uint32_t j=0;j<count;++j) {
         if (cells.is_empty(j)) { continue; }
-        one_seq = one_seq && cells.seq_get_all(j)==rows;
         if ((cells.seq_get_all(j) & rows).none()) { continue; }
-        if (u.is_pos_2d() && cells.ext_get(j).is_2d_gt(cells.pos_get(j),cells.pos_get(j))) { pos_2d.push_back(cells.pos_get(j)); }
+        if (cells.pos_get(j)>=16777216) { return QSA_NC_POS_RANGE; }
+        if (pos_2d && !has_2d && qsa_key_2d(cells, j)) { has_2d = true; }
         if (cells.seq_get_all(j).count()>1) { shared[cells.pos_get(j)/ratio]; }
     }
-    if (!pos_2d.empty()) {
-        // the same test the selection uses to rank: no other sequence anywhere in the cache
-        for (llama_seq_id s=0;one_seq && s<LLAMA_MAX_SEQ;++s) { one_seq = rows.test(s) || cells.seq_pos_min(s)<0; }
-        if (!one_seq) { return false; }
-        std::sort(pos_2d.begin(), pos_2d.end());
-        for (uint32_t i=0;i<u.n_tokens;++i) {
-            if (std::binary_search(pos_2d.begin(), pos_2d.end(), u.pos[i])) { return false; }
-        }
+    for (llama_seq_id s=0;s<LLAMA_MAX_SEQ;++s) {
+        if (rows.test(s) && qsa_seq_has_dup_key(cells, s, pos_2d)) { return QSA_NC_DUP_KEY; }
     }
+    if (has_2d && !qsa_stream_one_seq(cells)) { return QSA_NC_2D_MULTI_SEQ; }
     for (uint32_t j=0;!shared.empty() && j<count;++j) {
         if (cells.is_empty(j) || (cells.seq_get_all(j) & rows).none()) { continue; }
         const auto it = shared.find(cells.pos_get(j)/ratio);
         if (it == shared.end()) { continue; }
         const auto & set = cells.seq_get_all(j);
         for (const auto & other : it->second) {
-            if (other != set && (other & set & rows).any()) { return false; }
+            if (other != set && (other & set & rows).any()) { return QSA_NC_SHARED_BLOCK; }
         }
         if (std::find(it->second.begin(), it->second.end(), set) == it->second.end()) { it->second.push_back(set); }
     }
-    return true;
+    return QSA_COMPACT_OK;
+}
+
+// the whole ubatch on one stream
+static bool qsa_scalar_visibility_cells(const llama_kv_cells & cells, uint32_t count, uint32_t ratio, const llama_ubatch & u) {
+    return qsa_compact_visibility_stream(cells, count, ratio, u, 0, u.n_tokens) == QSA_COMPACT_OK;
 }
 
 static bool qsa_single_sequence_prefix(const llama_kv_cells & cells, uint32_t count, llama_seq_id seq) {

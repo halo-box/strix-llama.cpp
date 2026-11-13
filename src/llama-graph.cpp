@@ -1465,6 +1465,9 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    qsa_nodes.clear();
+    qsa_idx_nodes.clear();
+    qsa_ubatch_error.clear();
     hdmd_inputs.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
@@ -1634,6 +1637,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     vsub             (params.vsub),
+    qsa_reserve      (params.qsa_reserve),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);

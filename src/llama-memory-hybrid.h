@@ -100,6 +100,9 @@ public:
     // init full
     explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
 
+    // init full with the attention view limited to n_kv cells and, with n_stream > 0, the first n_stream streams (reserve)
+    llama_memory_hybrid_context(llama_memory_hybrid * mem, uint32_t n_kv, uint32_t n_stream = 0);
+
     // init update
     explicit llama_memory_hybrid_context(
         llama_memory_hybrid * mem,

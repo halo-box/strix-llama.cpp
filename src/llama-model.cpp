@@ -1120,6 +1120,55 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
 }
 
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
+ggml_type llama_model_type_k_idx(llm_arch arch, ggml_type type_k, ggml_type type_k_idx) {
+    if (arch != LLM_ARCH_QWEN4EXP) {
+        return type_k;
+    }
+    if (type_k_idx != GGML_TYPE_COUNT) {
+        return type_k_idx;
+    }
+    switch (type_k) {
+        // a sub-8-bit indexer loses selection agreement with f16, q8_0 keeps it
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
+            return GGML_TYPE_Q8_0;
+        default:
+            return type_k;
+    }
+}
+
+// the resolved indexer type, checked against the indexer row and logged
+static ggml_type qsa_resolve_type_k_idx(const llama_model & model, const llama_memory_params & params) {
+    const ggml_type t = llama_model_type_k_idx(model.arch, params.type_k, params.type_k_idx);
+    if (model.arch != LLM_ARCH_QWEN4EXP && params.type_k_idx != GGML_TYPE_COUNT && params.type_k_idx != params.type_k) {
+        LLAMA_LOG_WARN("%s: --cache-type-k-idx %s is ignored for %s: its indexer cache keeps the K cache type %s\n",
+                __func__, ggml_type_name(params.type_k_idx), llm_arch_name(model.arch), ggml_type_name(params.type_k));
+    }
+    const uint32_t row = model.hparams.indexer_head_size;
+    if (row > 0 && row % ggml_blck_size(t) != 0) {
+        throw std::runtime_error(format("indexer K cache type %s with block size %lld does not divide the indexer head size %u",
+                    ggml_type_name(t), (long long) ggml_blck_size(t), row));
+    }
+    LLAMA_LOG_INFO("%s: indexer K cache type = %s (%s, -ctk %s)\n", __func__, ggml_type_name(t),
+            params.type_k_idx != GGML_TYPE_COUNT && model.arch == LLM_ARCH_QWEN4EXP ? "override" : "auto",
+            ggml_type_name(params.type_k));
+    return t;
+}
+
+static void qwen4exp_qsa_check_context(llama_split_mode split_mode, uint32_t n_ctx_seq) {
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::runtime_error("QSA sparse attention is not supported with --split-mode tensor: the meta backend has no SPARSE_ATTN handler; use --split-mode layer or none");
+    }
+    // the largest n_kv the op tests cover (the first f16 K view >= 2 GiB)
+    constexpr uint32_t max_n_ctx_seq = (1u << 21) + 4;
+    if (n_ctx_seq > max_n_ctx_seq) {
+        throw std::runtime_error(format("QSA sparse attention: n_ctx_seq = %u is above the tested maximum of %u cells", n_ctx_seq, max_n_ctx_seq));
+    }
+}
+
 static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
 
@@ -3031,6 +3080,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* n_rs_seq          */ cparams.n_rs_seq,
                     /* offload           */ cparams.offload_kqv,
                     /* unified           */ cparams.kv_unified,
+                    /* type_k_idx        */ qsa_resolve_type_k_idx(*this, params),
                     /* filter_attn       */ std::move(filter_attn),
                     /* filter_recr       */ std::move(filter_recr),
                     /* filter_idx        */ std::move(filter_idx));
@@ -3219,11 +3269,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_memory_hybrid_idx::layer_filter_cb f_idx =
                         [&](uint32_t il) { return il >= hparams.n_layer(); };
                     LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
+                    qwen4exp_qsa_check_context(split_mode(), cparams.n_ctx_seq);
                     return new llama_memory_hybrid_idx(
                         /* model             */ *this,
                         /* attn_type_k       */ params.type_k,
                         /* attn_type_v       */ params.type_v,
-                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_v_trans      */ false,   // the sparse op reads V not transposed, whatever -fa says
                         /* attn_kv_size      */ cparams.n_ctx_seq,
                         /* attn_n_pad        */ 1,
                         /* attn_n_swa        */ hparams.n_swa,
@@ -3235,6 +3286,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         /* n_rs_seq          */ cparams.n_rs_seq,
                         /* offload           */ cparams.offload_kqv,
                         /* unified           */ cparams.kv_unified,
+                        /* type_k_idx        */ qsa_resolve_type_k_idx(*this, params),
                         /* filter_attn       */ std::move(f_attn),
                         /* filter_recr       */ std::move(f_recr),
                         /* filter_idx        */ std::move(f_idx));
@@ -3318,12 +3370,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx) {
+                        // the sparse op reads V not transposed, whatever -fa says
+                        const bool qsa_arch = arch == LLM_ARCH_QWEN4EXP;
+                        if (qsa_arch) {
+                            qwen4exp_qsa_check_context(split_mode(), cparams.n_ctx_seq);
+                        }
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_v_trans      */ qsa_arch ? false : !cparams.flash_attn,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
@@ -3335,6 +3392,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
+                            /* type_k_idx        */ qsa_resolve_type_k_idx(*this, params),
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));

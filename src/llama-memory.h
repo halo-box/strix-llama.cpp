@@ -19,6 +19,9 @@ struct llama_memory_params {
     ggml_type type_k;
     ggml_type type_v;
 
+    // sparse-attention indexer key cache type, GGML_TYPE_COUNT = auto (llama_model_type_k_idx)
+    ggml_type type_k_idx;
+
     // use full-size SWA cache
     bool swa_full;
 

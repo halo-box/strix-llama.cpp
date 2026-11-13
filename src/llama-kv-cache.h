@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -167,6 +168,9 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    // saved key type of the last state read that failed the key type check, -1 otherwise
+    int32_t state_read_k_type_mismatch() const { return k_type_mismatch_ref; }
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     // The stream holding seq_id's cells.
@@ -219,6 +223,11 @@ public:
     // find places for the provided ubatches in the cache, returns the slot infos
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
+
+    // hook(i, ubatch, sinfo) runs right after ubatch i is placed, on the cells as its graph will see them; false sets
+    // *i_fail = i, restores the cells and returns an empty vector
+    using prepare_hook_t = std::function<bool(uint32_t, const llama_ubatch &, const slot_info &)>;
+    slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches, const prepare_hook_t & hook, uint32_t * i_fail);
 
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
@@ -293,6 +302,8 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    int32_t k_type_mismatch_ref = -1;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     uint32_t n_rot_k = 0;
@@ -393,6 +404,12 @@ public:
     // used to create a full-cache context
     llama_kv_cache_context(
             llama_kv_cache * kv);
+
+    // used to create a full-cache context viewing n_kv cells and, with n_stream > 0, the first n_stream streams (reserve)
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t n_kv,
+            uint32_t n_stream = 0);
 
     // used to create an update context
     llama_kv_cache_context(

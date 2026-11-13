@@ -80,7 +80,18 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/sparse-attn.cuh"
+#include "ggml-cuda/sparse-attn-census.h"
+#include "ggml-cuda/sparse-attn-gate-scratch.h"
 #include "ggml.h"
+#include <vector>
+
+#if defined(GGML_USE_HIP)
+// dispatch census: ids dispatched during a graph capture are recorded into the graph and counted again at every replay
+static void ggml_cuda_sa_census_capture_begin(std::vector<uint16_t> * ids);
+static void ggml_cuda_sa_census_capture_end(void);
+static void ggml_cuda_sa_census_replay(const std::vector<uint16_t> & ids);
+#endif // defined(GGML_USE_HIP)
 
 #include <algorithm>
 #include <array>
@@ -1022,6 +1033,10 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
 
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
+        : tensor->op == GGML_OP_SPARSE_ATTN_PLAN
+        ? ggml_cuda_sparse_attn_plan_get_alloc_size(tensor)   // max dst over the G range + sort/dedup scratch
+        : tensor->op == GGML_OP_SPARSE_ATTN
+        ? ggml_cuda_sparse_attn_get_alloc_size(buft_ctx->device, tensor)   // + max workspace (V pack) over G and n_q' <= n_q
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
 
@@ -2764,6 +2779,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
+        case GGML_OP_SPARSE_ATTN_PLAN:
+            ggml_cuda_sparse_attn_plan(ctx, dst);
+            break;
+        case GGML_OP_SPARSE_ATTN:
+            ggml_cuda_sparse_attn(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -2984,6 +3005,9 @@ static ggml_cuda_graph::node_properties ggml_cuda_graph_node_props(const ggml_te
             prop.node_src_data_ptrs[j] = node->src[j]->data;
             memcpy(prop.node_src_ne[j], node->src[j]->ne, sizeof(prop.node_src_ne[j]));
             memcpy(prop.node_src_nb[j], node->src[j]->nb, sizeof(prop.node_src_nb[j]));
+            prop.node_src_type[j] = (int32_t) node->src[j]->type;
+        } else {
+            prop.node_src_type[j] = -1;
         }
     }
 
@@ -6605,6 +6629,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int skip = ggml_cuda_match_qsa_expand(cgraph, i, args);
         if (skip && ggml_cuda_qsa_expand_alias_ok(args)) {
             ggml_cuda_op_qsa_expand(*cuda_ctx, args);
+            ggml_cuda_sa_census_add(GGML_CUDA_SA_CENSUS_QSA_EXPAND);
             return skip;
         }
     }
@@ -6807,10 +6832,86 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // FA gate fusion: FLASH_ATTN_EXT (fa7 or qsa prefill) -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .): the
-    // gate in the attention epilogue; the FA output itself is never stored
-    const bool fa_gate_qsa = node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_qsa_gate_ok(*cuda_ctx, node);
-    if (node->op == GGML_OP_FLASH_ATTN_EXT && (fa_gate_qsa || ggml_cuda_fa7_gate_ok(*cuda_ctx, node)) && ggml_is_contiguous(node) &&
+    // sparse-attention gate fusion: SPARSE_ATTN -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .) runs the gated G4 instance (sigmoid(gate) * O in the epilogue). Gate row R = (s * n_q + i) * n_head + h at gate->data + R * nb[1].
+#if defined(GGML_USE_HIP)
+    if (node->op == GGML_OP_SPARSE_ATTN && (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && ggml_is_contiguous(node) &&
+            ggml_cuda_sparse_attn_gate_ok(cuda_ctx->device, node)) {
+        int j = i + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) ++j;
+        if (j + 2 < cgraph->n_nodes) {
+            ggml_tensor * cont = cgraph->nodes[j], * unary = cgraph->nodes[j + 1], * mul = cgraph->nodes[j + 2];
+            const ggml_tensor * gate = cont->src[0];
+            const ggml_tensor * other = mul->op == GGML_OP_MUL ? (mul->src[0] == unary ? mul->src[1] : mul->src[0]) : nullptr;
+            const int64_t n_rows = node->ne[1] * node->ne[2] * node->ne[3];   // n_head * n_q * n_stream
+            bool ok = cont->op == GGML_OP_CONT && unary->op == GGML_OP_UNARY && ggml_get_unary_op(unary) == GGML_UNARY_OP_SIGMOID &&
+                unary->src[0] == cont && mul->op == GGML_OP_MUL && (mul->src[0] == unary || mul->src[1] == unary) && other &&
+                (other == node || other->view_src == node) && ggml_is_contiguous(other) && ggml_nelements(other) == ggml_nelements(node) &&
+                gate != nullptr && gate->type == GGML_TYPE_F32 && gate->nb[0] == sizeof(float) && gate->ne[0] == node->ne[0] &&
+                gate->ne[1] == node->ne[1] && gate->ne[2] * gate->ne[3] == node->ne[2] * node->ne[3] &&
+                (gate->ne[3] == 1 || (gate->ne[2] == node->ne[2] && gate->nb[3] == gate->nb[2] * gate->ne[2])) &&
+                gate->nb[2] == gate->nb[1] * gate->ne[1] &&
+                // the gated epilogue reads the gate in float4: 16-byte rows and base
+                ((uintptr_t) gate->data % 16) == 0 && gate->nb[1] % 16 == 0 &&
+                ggml_are_same_shape(unary, cont) && ggml_nelements(unary) == ggml_nelements(node) &&
+                ggml_are_same_shape(mul->src[0], mul->src[1]) && ggml_is_contiguous(mul) &&
+                mul->type == GGML_TYPE_F32 && ggml_nelements(mul) == ggml_nelements(node) && ggml_nrows(node) == n_rows &&
+                ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { j + 2 });
+            for (int k = 0; k < cgraph->n_nodes && ok; ++k) {   // the attend output is read only through views by the MUL
+                const ggml_tensor * t = cgraph->nodes[k];
+                if (k == i || t == mul || ggml_cuda_is_view_or_noop(t)) continue;
+                for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                    if (t->src[s] == node || t->src[s]->view_src == node) ok = false;
+                }
+            }
+            bool f16 = false;
+            uint16_t * dst16 = nullptr;
+            bool store_f32 = true;
+            if (ok) {
+                dst16 = ggml_cuda_bf16_for_mmb_reader(*cuda_ctx, cgraph, j + 2, mul, &f16);
+                store_f32 = !(dst16 && ggml_cuda_mmb_is_bf16_only(*cuda_ctx, mul));
+            }
+            if (ok) {   // an output that overlaps a read (q, k, v, plan, gate, workspace) goes to graph memory the fusion
+                        // leaves unwritten and is copied into place, so the fusion does not depend on where gallocr put the MUL; no room: not fused
+                size_t ws_off = 0, ws_bytes = 0;
+                ggml_cuda_sparse_attn_ws_range(cuda_ctx->device, node, &ws_off, &ws_bytes);
+                ggml_cuda_sa_span reads[6];
+                int n_reads = 0;
+                const ggml_tensor * gs = gate->view_src ? gate->view_src : gate;
+                for (const ggml_tensor * r : std::initializer_list<const ggml_tensor *>{ node->src[0], node->src[1], node->src[2], node->src[3], gs }) {
+                    if (!r) continue;
+                    const ggml_tensor * rr = r->view_src ? r->view_src : r;
+                    reads[n_reads++] = { rr->data, ggml_nbytes(rr) };
+                }
+                reads[n_reads++] = { (const char *) node->data + ws_off, ws_bytes };
+                const size_t n32 = ggml_nbytes(mul), n16 = (size_t) ggml_nelements(mul) * sizeof(uint16_t);
+                const ggml_cuda_sa_span o32 = { store_f32 ? mul->data : nullptr, store_f32 ? n32 : 0 };
+                const ggml_cuda_sa_span o16 = { dst16, dst16 ? n16 : 0 };
+                // the fused subgraph leaves these unwritten: the attend's own dst and the CONT / SIGMOID outputs
+                const ggml_cuda_sa_span cands[3] = { { node->data, ggml_nbytes(node) }, { cont->data, ggml_nbytes(cont) }, { unary->data, ggml_nbytes(unary) } };
+                const ggml_cuda_sa_gate_plan gp = ggml_cuda_sa_gate_plan_outputs(reads, n_reads, o32, o16, cands, 3);
+                if (gp.ok) {
+                    GGML_ASSERT(gp.where32 != GGML_CUDA_SA_GATE_POOL && gp.where16 != GGML_CUDA_SA_GATE_POOL);
+                    float *    out32 = gp.where32 == GGML_CUDA_SA_GATE_DIRECT ? (float *) mul->data :
+                                       gp.where32 == GGML_CUDA_SA_GATE_SCRATCH ? (float *) gp.scratch32 : nullptr;
+                    uint16_t * out16 = gp.where16 == GGML_CUDA_SA_GATE_DIRECT ? dst16 :
+                                       gp.where16 == GGML_CUDA_SA_GATE_SCRATCH ? (uint16_t *) gp.scratch16 : nullptr;
+                    ggml_cuda_sparse_attn_gated(*cuda_ctx, node, gate, out32, out16, f16);
+                    if (out32 && out32 != (float *) mul->data) {
+                        CUDA_CHECK(cudaMemcpyAsync(mul->data, out32, n32, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                    }
+                    if (out16 && out16 != dst16) {
+                        CUDA_CHECK(cudaMemcpyAsync(dst16, out16, n16, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                    }
+                    return j + 2 - i;
+                }
+            }
+            ggml_cuda_mmb_cache_unproduce(*cuda_ctx, dst16);   // not fused: the gated output is computed (and copied) later
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
+    // FA gate fusion: FLASH_ATTN_EXT (fa7) -> [views] -> CONT(gate view) -> SIGMOID -> MUL(attn, .), the gate in the attention epilogue. QSA layers take the SPARSE_ATTN gate fusion above
+    if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_cuda_fa7_gate_ok(*cuda_ctx, node) && ggml_is_contiguous(node) &&
             (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
         int j = i + 1;
         while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) ++j;
@@ -6822,9 +6923,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 unary->src[0] == cont && mul->op == GGML_OP_MUL && (mul->src[0] == unary || mul->src[1] == unary) && other &&
                 (other == node || other->view_src == node) && ggml_is_contiguous(other) && ggml_nelements(other) == ggml_nelements(node) &&
                 gate->type == GGML_TYPE_F32 && gate->nb[0] == sizeof(float) && gate->ne[0] == node->ne[0] && gate->ne[1] == node->ne[1] &&
-                // the gated epilogues read the gate in float4: 16-byte rows and base, and QSA takes contiguous heads
+                // the gated epilogue reads the gate in float4: 16-byte rows and base
                 ((uintptr_t) gate->data % 16) == 0 && gate->nb[1] % 16 == 0 && gate->nb[2] % 16 == 0 &&
-                (!fa_gate_qsa || gate->nb[2] == gate->nb[1] * gate->ne[1]) &&
                 gate->ne[2] == node->ne[2] && gate->ne[3] == 1 && ggml_are_same_shape(unary, cont) && ggml_is_contiguous(mul) &&
                 mul->type == GGML_TYPE_F32 && ggml_nelements(mul) == ggml_nelements(node) &&
                 ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL }, { j + 2 });
@@ -6847,7 +6947,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 auto overlap = [](const void * a, size_t na, const void * b, size_t nb) {
                     const uintptr_t x = (uintptr_t) a, y = (uintptr_t) b; return x < y + nb && y < x + na; };
                 const ggml_tensor * gs = gate->view_src ? gate->view_src : gate;
-                for (const ggml_tensor * r : std::initializer_list<const ggml_tensor *>{ node->src[0], node->src[1], node->src[2], node->src[3], node->src[5], gs }) {
+                for (const ggml_tensor * r : std::initializer_list<const ggml_tensor *>{ node->src[0], node->src[1], node->src[2], node->src[3], gs }) {
                     if (!r) continue;
                     const ggml_tensor * rr = r->view_src ? r->view_src : r;
                     if (store_f32 && overlap(mul->data, ggml_nbytes(mul), rr->data, ggml_nbytes(rr))) ok = false;
@@ -6855,14 +6955,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 }
             }
             if (ok) {
-#if defined(GGML_USE_HIP)
-                if (fa_gate_qsa) {
-                    ggml_cuda_flash_attn_ext_qsa_prefill_gated(*cuda_ctx, node, gate, store_f32 ? (float *) mul->data : nullptr, dst16, f16);
-                } else
-#endif
-                {
-                    ggml_cuda_fa7_gated(*cuda_ctx, node, gate, store_f32 ? (float *) mul->data : nullptr, dst16, f16);
-                }
+                ggml_cuda_fa7_gated(*cuda_ctx, node, gate, store_f32 ? (float *) mul->data : nullptr, dst16, f16);
                 return j + 2 - i;
             }
             ggml_cuda_mmb_cache_unproduce(*cuda_ctx, dst16);   // not fused: the gated output is computed (and copied) later
@@ -7017,7 +7110,7 @@ static void ggml_cuda_ovl_plan(ggml_backend_cuda_context * ctx, ggml_cgraph * cg
         } else if (name_is(t, "Vcur", sfx)) {
             const int iq = find(i - 16, i,     [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "Qcur_full", sfx); });
             const int ik = find(i + 1, i + 8,  [&](const ggml_tensor * u) { return u->op == GGML_OP_MUL_MAT && name_is(u, "Kcur", sfx); });
-            const int b  = find(i + 1, i + 48, [](const ggml_tensor * u) { return u->op == GGML_OP_FLASH_ATTN_EXT; });
+            const int b  = find(i + 1, i + 48, [](const ggml_tensor * u) { return u->op == GGML_OP_FLASH_ATTN_EXT || u->op == GGML_OP_SPARSE_ATTN; });
             if (iq >= 0 && ik >= 0 && b >= 0) {
                 cands.push_back({ iq + 1, b, { t, cg->nodes[ik] }, 4, false });
             }
@@ -7197,6 +7290,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_HIP)
+    if (use_cuda_graph && cuda_graph_update_required) {
+        ggml_cuda_sa_census_capture_begin(&cuda_ctx->cuda_graph(graph_key)->census_ids);
+    }
+#endif
 
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
@@ -7438,6 +7536,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+#if defined(GGML_USE_HIP)
+            ggml_cuda_sa_census_capture_end();
+#endif
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -7458,6 +7559,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+#if defined(GGML_USE_HIP)
+        if (!cuda_graph_update_required) {   // a replay: the capture above did not dispatch (and count) the kernels
+            ggml_cuda_sa_census_replay(graph->census_ids);
+        }
+#endif
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -9495,6 +9601,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_SPARSE_ATTN_PLAN:
+            return ggml_cuda_sparse_attn_plan_supported(dev_ctx->device, op);   // HIP only; false on CUDA builds
+        case GGML_OP_SPARSE_ATTN:
+            return ggml_cuda_sparse_attn_supported(dev_ctx->device, op);        // HIP only; false on CUDA builds
 
         default:
             return false;
@@ -9668,8 +9778,157 @@ static void ggml_backend_cuda_set_mmb_small_batch(ggml_backend_t backend, bool e
     ((ggml_backend_cuda_context *) backend->context)->mmb_small_batch = enable;
 }
 
+// Dispatch census of the HIP sparse-attention kernels: one relaxed counter per compiled key, off until reset.
+#if defined(GGML_USE_HIP)
+static std::atomic<bool>     ggml_cuda_sa_census_on {false};
+static std::atomic<uint64_t> ggml_cuda_sa_census_counts[GGML_CUDA_SA_CENSUS_N];
+static_assert(GGML_CUDA_SA_CENSUS_N <= 65536, "census ids are recorded into HIP graphs as uint16_t");
+
+// the census ids of the graph this thread is capturing (recorded even when the census is off, for a replay after a reset)
+static thread_local std::vector<uint16_t> * ggml_cuda_sa_census_capture = nullptr;
+
+void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id) {
+    if (ggml_cuda_sa_census_capture != nullptr) {
+        ggml_cuda_sa_census_capture->push_back((uint16_t) id);
+    }
+    if (ggml_cuda_sa_census_on.load(std::memory_order_relaxed)) {
+        ggml_cuda_sa_census_counts[id].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+static void ggml_cuda_sa_census_capture_begin(std::vector<uint16_t> * ids) {
+    ids->clear();
+    ggml_cuda_sa_census_capture = ids;
+}
+
+static void ggml_cuda_sa_census_capture_end(void) {
+    ggml_cuda_sa_census_capture = nullptr;
+}
+
+static void ggml_cuda_sa_census_replay(const std::vector<uint16_t> & ids) {
+    if (ggml_cuda_sa_census_on.load(std::memory_order_relaxed)) {
+        for (const uint16_t id : ids) {
+            ggml_cuda_sa_census_counts[id].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+static void ggml_backend_cuda_dispatch_census_reset(void) {
+    for (auto & c : ggml_cuda_sa_census_counts) {
+        c.store(0, std::memory_order_relaxed);
+    }
+    ggml_cuda_sa_census_on.store(true, std::memory_order_relaxed);
+}
+
+// key is exactly name, or name is a "/"-separated prefix of key ("sa_plan" covers "sa_plan/G1" and "sa_plan/G4")
+static bool ggml_cuda_sa_census_key_under(const char * key, const char * name) {
+    const size_t n = strlen(name);
+    return strncmp(key, name, n) == 0 && (key[n] == '\0' || key[n] == '/');
+}
+
+static uint64_t ggml_backend_cuda_dispatch_census_count(const char * name) {
+    uint64_t n = 0;
+    for (int i = 0; i < GGML_CUDA_SA_CENSUS_N; ++i) {
+        if (ggml_cuda_sa_census_key_under(ggml_cuda_sa_census_keys[i], name)) {
+            n += ggml_cuda_sa_census_counts[i].load(std::memory_order_relaxed);
+        }
+    }
+    return n;
+}
+
+static const char * const * ggml_backend_cuda_dispatch_census_list(void) {
+    return ggml_cuda_sa_census_keys;
+}
+
+// NULL when label is a compiled key or a prefix of one that this process can dispatch, else why it is never counted
+static const char * ggml_backend_cuda_dispatch_census_skip(ggml_backend_t backend, const char * label) {
+    // the device decides the tier; -1 when the backend is not given
+    const int device = backend != nullptr && backend->context != nullptr ? ((ggml_backend_cuda_context *) backend->context)->device : -1;
+    if (const char * why = ggml_cuda_sparse_attn_census_skip(device, label)) {
+        return why;
+    }
+    for (int i = 0; i < GGML_CUDA_SA_CENSUS_N; ++i) {
+        if (ggml_cuda_sa_census_key_under(ggml_cuda_sa_census_keys[i], label)) {
+            return nullptr;
+        }
+    }
+    return "not a HIP dispatch census key (ggml_backend_debug_dispatch_census_list)";
+}
+
+#else
+void ggml_cuda_sa_census_add(ggml_cuda_sa_census_id id) {
+    GGML_UNUSED(id);
+}
+#endif // defined(GGML_USE_HIP)
+
+#if defined(GGML_USE_HIP)
+static const char * ggml_backend_cuda_sparse_attn_unsupported_reason(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    return ggml_cuda_sparse_attn_unsupported_reason(device, op);
+}
+
+// sparse-attention policies of the HIP backend, for the device of a QSA layer's K buffer
+static int32_t ggml_backend_cuda_sparse_attn_group(ggml_backend_dev_t dev, int64_t n_q_per_stream, int64_t n_kv,
+                                                   enum ggml_type type_k, enum ggml_type type_v, bool shortcut) {
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    return ggml_cuda_sparse_attn_group(device, n_q_per_stream, n_kv, type_k, type_v, shortcut);
+}
+
+// a FLASH_ATTN_EXT of the dense shortcut's shape (D 256, the qwen4exp heads, a causal f16 mask) on this device
+static bool ggml_cuda_sa_dense_fa_supported(ggml_backend_dev_t dev, ggml_type type_k, ggml_type type_v, int64_t n_q, int64_t n_kv) {
+    ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return false;
+    }
+    n_q  = std::max<int64_t>(n_q, 1);
+    n_kv = std::max<int64_t>(n_kv, 1);
+    ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, n_q, 24, 1);
+    ggml_tensor * k  = ggml_new_tensor_4d(ctx, type_k, 256, n_kv, 2, 1);
+    ggml_tensor * v  = ggml_new_tensor_4d(ctx, type_v, 256, n_kv, 2, 1);
+    ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, 1);
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v, m, 0.0625f, 0.0f, 0.0f);
+    const bool ok = ggml_backend_dev_supports_op(dev, fa);
+    ggml_free(ctx);
+    return ok;
+}
+
+// The dense shortcut pick needs a FLASH_ATTN_EXT that takes the pair (none with -DGGML_CUDA_FA=OFF): otherwise keep the sparse op, which runs without FA.
+static bool ggml_backend_cuda_sparse_attn_prefer_dense(ggml_backend_dev_t dev, enum ggml_type type_k, enum ggml_type type_v,
+                                                       int64_t n_q, int64_t n_kv) {
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    if (!ggml_cuda_sparse_attn_prefer_dense(device, type_k, type_v, n_q, n_kv)) {
+        return false;
+    }
+    return ggml_cuda_sa_dense_fa_supported(dev, type_k, type_v, n_q, n_kv);
+}
+#endif // defined(GGML_USE_HIP)
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if defined(GGML_USE_HIP)
+    if (strcmp(name, "ggml_backend_sparse_attn_group") == 0) {
+        return (void *) (ggml_backend_sparse_attn_group_t) ggml_backend_cuda_sparse_attn_group;
+    }
+    if (strcmp(name, "ggml_backend_sparse_attn_prefer_dense") == 0) {
+        return (void *) (ggml_backend_sparse_attn_prefer_dense_t) ggml_backend_cuda_sparse_attn_prefer_dense;
+    }
+    if (strcmp(name, "ggml_backend_sparse_attn_unsupported_reason") == 0) {
+        return (void *) (ggml_backend_sparse_attn_unsupported_reason_t) ggml_backend_cuda_sparse_attn_unsupported_reason;
+    }
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_reset") == 0) {
+        return (void *) ggml_backend_cuda_dispatch_census_reset;
+    }
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_count") == 0) {
+        return (void *) ggml_backend_cuda_dispatch_census_count;
+    }
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_list") == 0) {
+        return (void *) ggml_backend_cuda_dispatch_census_list;
+    }
+    if (strcmp(name, "ggml_backend_debug_dispatch_census_skip") == 0) {
+        return (void *) ggml_backend_cuda_dispatch_census_skip;
+    }
+#endif // defined(GGML_USE_HIP)
     if (strcmp(name, "ggml_backend_cuda_set_mmb_enabled") == 0) {
         return (void *)ggml_backend_cuda_set_mmb_enabled;
     }

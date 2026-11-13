@@ -992,14 +992,18 @@ void process_shaders() {
     string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
 #endif
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
-    string_to_spv("flash_attn_sel_f16", "flash_attn_sel.comp", {});
-    string_to_spv("flash_attn_sel_prep", "flash_attn_sel_prep.comp", {});
-    for (const std::string t : {"f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"}) {
-        string_to_spv("flash_attn_sel_gather_" + t, "flash_attn_sel_gather.comp", {{"DATA_A_" + to_uppercase(t), "1"}});
-    }
+    // GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN: K/V types through spec constants
+    {
+        const std::map<std::string, std::string> sa_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}};
+        string_to_spv("sparse_attn_plan_rows", "sparse_attn_plan_rows.comp", {});
+        string_to_spv("sparse_attn_f16", "sparse_attn.comp", sa_dict);
+        string_to_spv("sparse_attn_portable", "sparse_attn_portable.comp", {});
+        string_to_spv("sparse_attn_reduce", "sparse_attn_reduce.comp", {});
+        string_to_spv("sparse_attn_pack", "sparse_attn_pack.comp", sa_dict);
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    string_to_spv("flash_attn_sel_cm_f16", "flash_attn_sel_cm.comp", {});
+        string_to_spv("sparse_attn_cm_f16", "sparse_attn_cm.comp", sa_dict);
 #endif
+    }
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("flash_attn_top_k_cm_f16", "flash_attn_top_k_cm.comp", {});
 #endif
@@ -1295,6 +1299,8 @@ void process_shaders() {
     string_to_spv("cross_entropy_loss_back_f32", "cross_entropy_loss_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("fwht_f32", "fwht.comp", {});
     string_to_spv("fwht_shmem_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}});
+    string_to_spv("fwht_inplace_f32", "fwht.comp", {{"FWHT_INPLACE", "1"}});
+    string_to_spv("fwht_shmem_inplace_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}, {"FWHT_INPLACE", "1"}});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});

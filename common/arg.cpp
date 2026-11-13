@@ -2487,6 +2487,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--cache-type-k-idx"}, "TYPE",
+        string_format(
+            "sparse-attention indexer key cache data type (qwen4exp; other models keep the K cache type)\n"
+            "allowed values: auto, %s\n"
+            "auto: q8_0 for a K cache of q4_0, q4_1, q5_0, q5_1 or iq4_nl, the K cache type otherwise\n"
+            "(default: auto)",
+            get_all_kv_cache_types().c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_k_idx = value == "auto" ? GGML_TYPE_COUNT : kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K_IDX"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

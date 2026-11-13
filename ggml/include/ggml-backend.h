@@ -228,6 +228,17 @@ extern "C" {
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
 
+    // Sparse-attention policies, resolved with ggml_backend_reg_get_proc_address(reg, "<name>") for the device that holds the K cache. Without them a caller uses G = 1 and prefer_dense = (type_k == type_v == GGML_TYPE_F16).
+    // "ggml_backend_sparse_attn_group": the plan group G (1 or 4); shortcut = the all-visible rows of the dense-shortcut range
+    typedef int32_t (*ggml_backend_sparse_attn_group_t)(ggml_backend_dev_t dev, int64_t n_q_per_stream, int64_t n_kv,
+                                                        enum ggml_type type_k, enum ggml_type type_v, bool shortcut);
+    // "ggml_backend_sparse_attn_prefer_dense": true when dense causal attention beats the sparse op in the dense-shortcut range
+    typedef bool    (*ggml_backend_sparse_attn_prefer_dense_t)(ggml_backend_dev_t dev, enum ggml_type type_k,
+                                                               enum ggml_type type_v, int64_t n_q, int64_t n_kv);
+    // "ggml_backend_sparse_attn_unsupported_reason": why supports_op is false for this node on dev (NULL when supported).
+    // A reason that names a K / V type problem starts with "type pair".
+    typedef const char * (*ggml_backend_sparse_attn_unsupported_reason_t)(ggml_backend_dev_t dev, const struct ggml_tensor * op);
+
     //
     // Backend registry
     //

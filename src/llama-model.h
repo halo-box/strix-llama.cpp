@@ -987,6 +987,9 @@ struct llama_model_base : public llama_model {
 
 const char * llm_type_name(llm_type type);
 
+// indexer key cache type: qwen4exp takes type_k_idx, or with auto (GGML_TYPE_COUNT) q8_0 for a sub-8-bit type_k and type_k otherwise; every other architecture takes type_k
+ggml_type llama_model_type_k_idx(llm_arch arch, ggml_type type_k, ggml_type type_k_idx);
+
 // convenience macro for loading local variables for load_tensors() in llama_model_base
 // note: cast to int64_t since we will use these for the tensor dimensions
 #define LLAMA_LOAD_LOCALS \

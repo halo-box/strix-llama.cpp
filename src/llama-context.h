@@ -42,6 +42,35 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// the K / V types dev supports for the shape of the SPARSE_ATTN node attn
+std::string llama_qsa_supported_types(ggml_backend_dev_t dev, const ggml_tensor * attn);
+
+// the QSA reserve graphs sched_reserve builds after the pp and tg graphs, a pure function of the shape (testable)
+struct llama_qsa_reserve_shape {
+    uint32_t n_tokens;        // min(n_ctx, n_ubatch)
+    uint32_t n_seqs;          // n_seq_max
+    uint32_t n_outputs_pp;    // the pp reserve's n_outputs
+    bool     kv_unified;
+    bool     mtp;             // LLAMA_CONTEXT_TYPE_MTP
+    uint32_t width;           // max over the QSA layers of indexer_top_k + ratio - 1 (the shortcut serves n_kv <= width)
+    uint32_t n_kv_full;       // cells per stream of the attention cache
+    uint32_t noncompact_cap;  // qsa_noncompact_cap(n_ubatch)
+};
+
+struct llama_qsa_reserve_pass_desc {
+    const char * name;
+    uint32_t n_tokens;
+    uint32_t n_seqs;
+    uint32_t n_outputs;
+    uint32_t n_kv;            // 0: the context's own full view, else init_full_n_kv(n_kv, n_stream)
+    uint32_t n_stream;        // 0 = every stream
+    uint32_t qsa;             // LLM_GRAPH_QSA_RESERVE_*
+    bool     seq_pos;
+    bool     last_output;
+};
+
+std::vector<llama_qsa_reserve_pass_desc> llama_qsa_reserve_passes(const llama_qsa_reserve_shape & s);
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -263,14 +292,30 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // QSA reserve flags, sequential positions instead of all-zero ones, the last token as the one output
+    struct reserve_variant {
+        uint32_t qsa         = 0;
+        bool     seq_pos     = false;
+        bool     last_output = false;
+    };
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        const reserve_variant * variant = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
     llm_graph_result * get_gf_res_prev();
+
+    // QSA placement guard: every QSA plan / attention node on its layer's K buffer backend and supported there, each plan with one consumer, enough nodes inspected. Returns the error text, empty when it passes.
+    std::string qsa_guard(ggml_cgraph * gf, const llm_graph_result * res, const char * where);
+    // throws on a violation
+    void qsa_guard_reserve(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, const char * where,
+            const reserve_variant * variant = nullptr);
+    // 0 when QSA does not apply
+    int qsa_n_layers() const;
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -467,4 +512,7 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    int     qsa_guard_last_inspected = 0;
+    int     qsa_guard_last_required  = 0;
 };

@@ -813,7 +813,15 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    return prepare(ubatches, nullptr, nullptr);
+}
+
+llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches, const prepare_hook_t & hook, uint32_t * i_fail) {
     llama_kv_cache::slot_info_vec_t res;
+
+    if (i_fail) {
+        *i_fail = UINT32_MAX;
+    }
 
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
@@ -854,6 +862,15 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // now emplace the ubatch
         apply_ubatch(sinfo_new, ubatch);
+
+        // the cells now hold the state this ubatch's graph will see
+        if (hook && !hook((uint32_t) (res.size() - 1), ubatch, sinfo_new)) {
+            if (i_fail) {
+                *i_fail = (uint32_t) (res.size() - 1);
+            }
+            success = false;
+            break;
+        }
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -2360,6 +2377,8 @@ const slot_info_vec_t *   sinfos_in) {
         sinfos_out->assign(n_stream, slot_info{});
     }
 
+    k_type_mismatch_ref = -1;
+
     if (sinfos_in && sinfos_in->size() != n_stream) {
         throw std::runtime_error("failed to restore kv cache: mirrored slot layout has the wrong stream count");
     }
@@ -2822,6 +2841,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         const int32_t k_type_i = (int32_t) k->type;
         if (k_type_i != k_type_i_ref) {
             LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
+            k_type_mismatch_ref = k_type_i_ref;
             return false;
         }
 
@@ -3048,6 +3068,20 @@ llama_kv_cache_context::llama_kv_cache_context(
     for (uint32_t s = 0; s < n_stream; ++s) {
         sinfos[0].strm.push_back(s);
         sinfos[0].idxs[s].resize(1, 0);
+    }
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        uint32_t n_kv,
+        uint32_t n_stream) : llama_kv_cache_context(kv) {
+    GGML_ASSERT(n_kv > 0);
+    this->n_kv = std::min(n_kv, kv->get_size());
+    // get_k / get_v view s1 - s0 + 1 streams
+    if (n_stream > 0 && n_stream < kv->get_n_stream()) {
+        sinfos[0].s1 = n_stream - 1;
+        sinfos[0].strm.resize(n_stream);
+        sinfos[0].idxs.resize(n_stream);
     }
 }
 

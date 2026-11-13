@@ -63,6 +63,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <set>
 #include <unordered_map>
 #include <shared_mutex>
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 #include <future>
@@ -428,6 +429,18 @@ static constexpr uint32_t FA_FLAG_MULTI_ROW    = 256;   // host only: build the 
 static constexpr uint32_t FA_FLAG_MR_LAZY      = 512;   // multi-row: skip identity O rescales
 static constexpr uint32_t FA_FLAG_MR_NOEB      = 1024;   // multi-row: no loop-end barrier
 static constexpr uint32_t FA_FLAG_MR_VPOST     = 2048;  // multi-row: V^T loads before the softmax barrier
+
+// the tiers and V variants of GGML_OP_SPARSE_ATTN on Vulkan
+enum vk_sa_tier { VK_SA_TIER_CM = 0, VK_SA_TIER_SCALAR = 1, VK_SA_TIER_PORTABLE = 2, VK_SA_TIER_NONE = 3 };
+enum vk_sa_vl { VK_SA_VL_DIRECT = 0, VK_SA_VL_STAGED = 1, VK_SA_VL_PACK = 2 };
+
+struct vk_sa_key {
+    uint32_t tier, type_k, type_v, gqa, vl, rot_q, rot_dump, required_sg;
+    bool operator<(const vk_sa_key & o) const {
+        return std::tie(tier, type_k, type_v, gqa, vl, rot_q, rot_dump, required_sg) <
+               std::tie(o.tier, o.type_k, o.type_v, o.gqa, o.vl, o.rot_q, o.rot_dump, o.required_sg);
+    }
+};
 
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
@@ -1063,10 +1076,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_cm_small_f16[LI_NH_COUNT];
     vk_pipeline pipeline_lightning_indexer_decode_cm_f16[LI_NH_COUNT];
     vk_pipeline pipeline_flash_attn_top_k_f16;
-    vk_pipeline pipeline_flash_attn_sel_f16[3];    // maskless selected-key FA, GQA 4, 8, 12 (scalar, portable)
-    vk_pipeline pipeline_flash_attn_sel_cm_f16[3]; // the same on RDNA3 + RADV (WMMA, gfx11 fragment layout)
-    vk_pipeline pipeline_flash_attn_sel_prep;      // cleans the selection rows for both
-    vk_pipeline pipeline_flash_attn_sel_gather[GGML_TYPE_COUNT]; // quantized K/V, few queries: selected cells -> compact f16 rows
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
@@ -1094,6 +1103,14 @@ struct vk_device_struct {
     vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
+    // GGML_OP_SPARSE_ATTN_PLAN / GGML_OP_SPARSE_ATTN
+    vk_pipeline pipeline_sparse_attn_plan;
+    vk_pipeline pipeline_sparse_attn_reduce;
+    vk_pipeline pipeline_sparse_attn_pack[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_fwht_inplace_f32[5];
+    // the sparse-attention tier gates: read without compile_mutex, rewritten with the same value by every load_shaders walk
+    std::atomic<bool> sa_tier_ok[3] {};
+    std::map<vk_sa_key, vk_pipeline> pipeline_sparse_attn;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 

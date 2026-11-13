@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <string>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -822,6 +823,14 @@ struct llama_vocab_subset {
     ggml_tensor * eog = nullptr; // I32 end-of-generation ids >= n_base, always picked
 };
 
+// reserve-only QSA graph variants, never set on a runtime graph
+enum llm_graph_qsa_reserve : uint32_t {
+    LLM_GRAPH_QSA_RESERVE_NONCOMPACT = 1u << 0, // the compact decision is false at the reserve n_kv
+    LLM_GRAPH_QSA_RESERVE_FAST       = 1u << 1, // the incremental fast-cache route at n_tokens <= 512
+    // every graph_reserve graph: take the empty cache's compact decision, not the live cells' (a later reserve over a non-compact live cache would size the buffers for a TE route no runtime ubatch takes)
+    LLM_GRAPH_QSA_RESERVE_GRAPH      = 1u << 2,
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -872,6 +881,9 @@ struct llm_graph_params {
 
     llama_model_prefetch * prefetch = nullptr; // the context's llama_model::prefetch_begin state, nullptr = none
     const llama_vocab_subset * vsub = nullptr;
+
+    // LLM_GRAPH_QSA_RESERVE_*, 0 for every runtime graph
+    uint32_t qsa_reserve = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -957,6 +969,28 @@ struct llm_graph_fused_node {
     int il;
 };
 
+// one QSA layer's attention in a built graph, checked by the placement guard
+enum llm_graph_qsa_place {
+    LLM_QSA_PLACE_K_DEVICE,        // on the backend of the device that holds the layer's K buffer (CPU for a host K buffer)
+    LLM_QSA_PLACE_HOST_KV_COPY,    // K buffer on the host, nodes on the layer's GPU, K/V copied
+    LLM_QSA_PLACE_SCHEDULER,       // the shortcut attention over a host K buffer, placed by the scheduler
+};
+
+struct llm_graph_qsa_node {
+    int           il       = -1;
+    const char *  producer = "";       // av | cb | te | dense | cache
+    ggml_tensor * plan     = nullptr;  // GGML_OP_SPARSE_ATTN_PLAN, nullptr on the dense route
+    ggml_tensor * attn     = nullptr;  // GGML_OP_SPARSE_ATTN, or the dense attention node
+    ggml_tensor * k        = nullptr;  // the K cache view this attention reads
+    int64_t       n_kv     = 0;
+    int64_t       n_stream = 0;
+    ggml_type     type_k   = GGML_TYPE_COUNT;
+    ggml_type     type_v   = GGML_TYPE_COUNT;
+    int32_t       group    = 0;        // G of the plan, 0 without a plan
+    bool          shortcut = false;    // n_kv <= top_k + r - 1
+    llm_graph_qsa_place place = LLM_QSA_PLACE_K_DEVICE;
+};
+
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
@@ -998,6 +1032,16 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
+    void add_qsa_node(const llm_graph_qsa_node & node) { qsa_nodes.push_back(node); }
+    const std::vector<llm_graph_qsa_node> & get_qsa_nodes() const { return qsa_nodes; }
+    // nodes of QSA layer il that read or write its indexer K cache
+    void add_qsa_idx_node(int il, ggml_tensor * t) { qsa_idx_nodes.emplace_back(il, t); }
+    const std::vector<std::pair<int, ggml_tensor *>> & get_qsa_idx_nodes() const { return qsa_idx_nodes; }
+
+    // non-empty when this graph must not be allocated; llama_decode returns an error
+    void set_qsa_ubatch_error(std::string msg) { if (qsa_ubatch_error.empty()) { qsa_ubatch_error = std::move(msg); } }
+    const std::string & get_qsa_ubatch_error() const { return qsa_ubatch_error; }
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
@@ -1017,6 +1061,9 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<llm_graph_qsa_node>   qsa_nodes;
+    std::vector<std::pair<int, ggml_tensor *>> qsa_idx_nodes;
+    std::string                       qsa_ubatch_error;
 
     std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
 
@@ -1124,6 +1171,8 @@ struct llm_graph_context {
     llm_graph_result * res;
 
     const llama_vocab_subset * vsub;
+
+    const uint32_t qsa_reserve;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

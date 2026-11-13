@@ -168,6 +168,8 @@ endif ()
 
 llama_build_and_test(test-qsa-fast.cpp)
 llama_build_and_test(test-qsa-recover.cpp)
+# TE rows of a non-compact QSA ubatch against the masked route, on every backend
+llama_build_and_test(test-qsa-te-rows.cpp)
 llama_build_and_test(test-ple-disk.cpp)
 llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
 # llama_context state tests: KV and recurrent state save, load, copy, rollback
@@ -192,6 +194,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-grammar.cpp LINK llama)
     llama_build_and_test(test-batch-alloc.cpp LINK llama)
     llama_build_and_test(test-qsa-prefix.cpp)
+    # QSA visibility predicate against the KQ mask, and the non-compact re-split (CPU, no model file)
+    llama_build_and_test(test-qsa-visibility.cpp LINK llama)
+    llama_build_and_test(test-qsa-resplit.cpp LINK llama)
+    # QSA indexer cache type and its session-state check
+    llama_build_and_test(test-qsa-idx-type.cpp LINK llama)
+    # llama-side QSA unit checks, one ctest per section
+    llama_build(test-qsa-checks.cpp LINK llama)
+    foreach (section dup-key reserve-view reserve-passes noncompact-check supported-types)
+        llama_test(test-qsa-checks NAME test-qsa-${section} ARGS ${section})
+    endforeach()
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -326,6 +338,9 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
+# sparse-attn-ref.h checks the CPU op bit for bit: no FMA contraction
+set_source_files_properties(test-backend-ops.cpp test-sparse-attn-plan-oracle.cpp test-sparse-attn-checks.cpp PROPERTIES COMPILE_OPTIONS
+    "$<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>,$<CXX_COMPILER_ID:IntelLLVM>>:-ffp-contract=off>")
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
@@ -409,6 +424,31 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp LINK ggml)
+    # Vulkan checks of the sparse attention ops (skips without Vulkan)
+    llama_build_and_test(test-sparse-attn-vk.cpp LINK ggml)
+    # HIP in-op rotations against fwht.cu (skips without ROCm)
+    llama_build_and_test(test-sparse-attn-rot.cpp LINK ggml)
+    if (NOT GGML_BACKEND_DL AND GGML_CPU)
+        # these call the CPU backend directly and cannot be built with dynamic loading
+        # sparse attention plan against the host reference, and the ops' allocation size
+        llama_build_and_test(test-sparse-attn-plan-oracle.cpp LINK ggml)
+        # sparse attention op and QSA graph checks, one ctest per section
+        llama_build(test-sparse-attn-checks.cpp LINK ggml)
+        llama_test(test-sparse-attn-checks NAME test-sparse-attn-neginf-v ARGS neginf-v)
+        llama_test(test-sparse-attn-checks NAME test-sparse-attn-shape-guard ARGS shape-guard)
+        llama_test(test-sparse-attn-checks NAME test-sparse-attn-rpc-view ARGS rpc-view)
+        llama_test(test-sparse-attn-checks NAME test-sparse-attn-gate-scratch ARGS gate-scratch)
+        llama_test(test-sparse-attn-checks NAME test-qsa-prefer-dense ARGS prefer-dense)
+        llama_test(test-sparse-attn-checks NAME test-qsa-allvis-rows ARGS allvis-rows)
+        # QSA placement guard: needs a qwen4exp model (-m MODEL)
+        llama_build(test-qsa-guard.cpp LINK llama ggml)
+    endif()
+    if (GGML_RPC AND NOT WIN32)
+        # sparse attention ops through an in-process rpc-server
+        llama_build_and_test(test-rpc-sparse-attn.cpp LINK ggml)
+        # RPC hello rejects a server older than the client's op enum
+        llama_build_and_test(test-rpc-hello.cpp LINK ggml)
+    endif()
     llama_build_and_test(test-backend-sched-ring.cpp)
 endif()
 
