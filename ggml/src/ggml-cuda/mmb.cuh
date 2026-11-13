@@ -16,6 +16,11 @@ void ggml_cuda_mmb_begin_graph(ggml_backend_cuda_context & ctx);
 // (f16: an F16 copy, saturating RNE, for the dense F16 readers; BF16 lookups never return it)
 uint16_t * ggml_cuda_mmb_cache_produce(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n, bool f16 = false);
 uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n);
+// BLAS staging copy of xn: plain RNE F16 (the F32 -> F16 conversion of the F16 cuBLAS path) in slot 0. Only
+// ggml_cuda_mmb_blas_f16_lookup returns it; the BF16 and dense F16 (saturating) lookups skip it.
+uint16_t * ggml_cuda_mmb_blas_f16_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n);
+// the BLAS staging copy of all of t (same root, data and element count), nullptr if none
+const uint16_t * ggml_cuda_mmb_blas_f16_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
 // BF16 copy of tensor t if one is cached for the current graph (consumers may read it instead of the F32 data)
 const uint16_t * ggml_cuda_mmb_cache_lookup(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
 void ggml_cuda_mmb_cache_unproduce(ggml_backend_cuda_context & ctx, const uint16_t * p);
@@ -36,6 +41,9 @@ bool ggml_cuda_mmb_is_bf16_only(ggml_backend_cuda_context & ctx, const ggml_tens
 // reader is a dense-r2 GEMM, so a producer that writes the F16 copy may skip the BF16 one. Keyed by the root tensor.
 #define MMB_F16_WANT 1
 #define MMB_F16_ONLY 2
+// HC xn (graph_optimize): every GEMM that reads it has F16 weights (the F16 cuBLAS path), and no reader takes the
+// BF16 or int8 copy. Its combine + norm writes the BLAS staging copy in their place.
+#define MMB_F16_BLAS 4
 void ggml_cuda_mmb_mark_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int bits);
 int  ggml_cuda_mmb_f16_marks(ggml_backend_cuda_context & ctx, const ggml_tensor * t);
 // reader kind of MUL_MAT node n for the dense F16 copies: 1 = dense-r2 GEMM, 0 = none
@@ -74,6 +82,3 @@ bool ggml_cuda_mmb_dq_packed(const ggml_tensor * w);
 void ggml_cuda_mmb_dense_r2_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 void ggml_cuda_mul_mat_dq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 void ggml_cuda_mmb_release_all(ggml_backend_cuda_context & ctx);
-// GGML_CUDA_OVL (bitmask, default 15 = all on; 0 = off): side streams of the intra-graph concurrency on RDNA3.5.
-//   1: GDN z region, 2: FFN shared expert region, 4: attention K/V region, 8: small-expert tier of the routed GLU
-int ggml_cuda_ovl_mask();

@@ -265,7 +265,7 @@ struct vk_matmul_pipeline_key {
     bool f16acc;
     bool d16 = false;   // stores float16_t (the MUL_MAT+CPY(f16) fusion)
     bool glu = false;   // d16 MUL_MAT_ID gate projection storing silu(gate) * up (the MUL_MAT_ID+CPY(f16)+SWIGLU fusion)
-    bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl, GGML_VK_MM_PREFETCH)
+    bool pf = false;    // register-prefetch KHR coopmat variant (mul_mm_pf_funcs.glsl)
     bool xl = false;    // the 256x256 XL tile tier of the pf variant (aligned only, ggml_vk_mm_xl_ok)
     bool hcmix = false; // the int8 MMQ hc up GEMM with the gated hc pre in its epilogue (HC_UP_MIX, mul_mmq_cm1.comp HC_EPI)
     bool qsa = false;   // the f32 x f32 KHR coopmat GEMM with the QSA scorer epilogue (QSA_SCORE, mul_mm.comp QSA_EPI)
@@ -501,6 +501,10 @@ static constexpr uint32_t num_argsort_pipelines = 11;
 static constexpr uint32_t num_topk_moe_pipelines = 10;
 
 static constexpr uint32_t num_topk_pipelines = 11;
+// QSA_RADIX_SELECT row cap: the keys of one row in shared memory (topk_radix_lds.comp MAX_COLS, 48 KiB)
+static constexpr uint32_t QSA_RADIX_SELECT_MAX_COLS = 12288;
+// QSA_PREFILL_SELECT: the same kernel with a 16 KiB key buffer, for prefill rows of up to this many values
+static constexpr uint32_t QSA_PREFILL_SELECT_SMALL_COLS = 4096;
 
 static constexpr std::initializer_list<ggml_op> topk_moe_early_softmax_norm{ GGML_OP_SOFT_MAX, GGML_OP_RESHAPE,  GGML_OP_ARGSORT,
                                                                              GGML_OP_VIEW,     GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
@@ -841,7 +845,8 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp): [f32 / f16 output][tile config], see ggml_vk_dense_dq8_cfgs
-    vk_pipeline pipeline_matmul_dq8[2][5];
+    vk_pipeline pipeline_matmul_dq8[2][2];
+    vk_pipeline pipeline_matmul_dq8_f32;   // the few-row tile with an f32 A rounded to f16 (the MoE router)
     vk_pipeline pipeline_matmul_dq8_hcmix[2];   // HC_UP_MIX epilogue, [f32 / f16 mixed stream]
     vk_pipeline pipeline_quantize_q8_1_x4;
     vk_pipeline pipeline_quantize_q8_1_x4_f16;   // f16 input (int8 MMQ with an f16 B)
@@ -996,6 +1001,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_radix_f32;
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
     vk_pipeline pipeline_qsa_expand[2];  // qwen4exp complete-block selection after TOP_K: [0] bitonic (strips), [1] rank (<= 8 rows)
+    vk_pipeline pipeline_topk_radix_lds; // QSA_RADIX_SELECT: one-dispatch top-k of <= 8 short rows, keys in LDS
+    vk_pipeline pipeline_topk_radix_lds_small; // QSA_PREFILL_SELECT: the same, keys of <= QSA_PREFILL_SELECT_SMALL_COLS
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_sum_f32;
     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
@@ -1018,6 +1025,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_gated_x16_g16_f16;   // f16 x, f16 gate, f16 mixed stream
     // HC_POST(_GATE) + RMS_NORM + MUL (+ CPY f16) / RMS_NORM + MUL (+ CPY f16): [has_post][out_f16]
     vk_pipeline pipeline_dsv4_hc_post_norm[2][2];
+    vk_pipeline pipeline_dsv4_hc_post_norm_inj[2];   // [has_post], f16 norm + the inject projection
+    // MoE epilogue (slot sum + shared expert) + HC_POST_GATE + RMS_NORM + MUL (+ CPY f16) (+ inject): [slot f16][f32 norm, f16 norm, f16 norm + inject]
+    vk_pipeline pipeline_dsv4_hc_moe_post_norm[2][3];
+    // HC_DEFER: the attention-side combine without its residual store [0] / storing only it [1]; the MoE epilogue that recomputes
+    // it [slot f16]
+    vk_pipeline pipeline_dsv4_hc_post_norm_inj_dm[2];
+    vk_pipeline pipeline_dsv4_hc_moe_post_norm_defer[2];
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1039,7 +1053,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
-    vk_pipeline pipeline_gdn_chunk_prep, pipeline_gdn_chunk_scan;   // chunked prefill form (GGML_VK_GDN_CHUNK)
+    vk_pipeline pipeline_gdn_chunk_prep, pipeline_gdn_chunk_scan;   // chunked prefill form
     vk_pipeline pipeline_coopmat_layout_check[2];  // wave32, wave64: RDNA3/RADV fragment layout probe (ggml_vk_check_coopmat_rdna3_layout)
     bool coopmat_rdna3_layout {};                   // the probe passed: the manual-fragment "_mf" and REG_A MUL_MAT_ID pipelines may be used
     uint32_t gdn_chunk_scan_nsplit = 1;   // scan workgroups per value head
@@ -1052,6 +1066,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_sel_f16[3];    // maskless selected-key FA, GQA 4, 8, 12 (scalar, portable)
     vk_pipeline pipeline_flash_attn_sel_cm_f16[3]; // the same on RDNA3 + RADV (WMMA, gfx11 fragment layout)
     vk_pipeline pipeline_flash_attn_sel_prep;      // cleans the selection rows for both
+    vk_pipeline pipeline_flash_attn_sel_gather[GGML_TYPE_COUNT]; // quantized K/V, few queries: selected cells -> compact f16 rows
     vk_pipeline pipeline_flash_attn_top_k_cm_f16;
     vk_pipeline pipeline_flash_attn_gather_f16;
     vk_pipeline pipeline_flash_attn_gather_dq[GGML_TYPE_COUNT];
@@ -1089,7 +1104,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
     vk_pipeline pipeline_count_experts;
-    vk_pipeline pipeline_mmid_glu[2][2][2];   // MUL_MAT_ID_PAIR_SWIGLU (mul_mm_id_glu.comp): [q4_K, q5_K][f32 output][f32 B]
+    vk_pipeline pipeline_mmid_glu[3][2][2];   // MUL_MAT_ID_PAIR_SWIGLU (mul_mm_id_glu.comp): [q4_K, q5_K, iq3_s][f32 output][f32 B]
     vk_pipeline pipeline_mmid_down_q51[2];   // streaming MUL_MAT_ID(+MUL)+CPY(f16) down (mul_mm_id_down.comp): [0] f16 B, [1] f32 B
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
@@ -1364,7 +1379,6 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
-    uint32_t prealloc_y_last_row_pad {};   // GGML_VK_DENSE_YPAD: row pad (elements) of the staged f16 B in prealloc_y, 0 = contiguous
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
@@ -1425,6 +1439,18 @@ struct ggml_backend_vk_context {
     bool fused_mmid_glu {};     // MUL_MAT_ID+CPY(f16)+SWIGLU: the gate GEMM stores silu(gate) * up as f16
     bool fused_mmid_pair_glu {};   // MUL_MAT_ID+CPY(f16) x 2 + SWIGLU: gate, up and the SwiGLU in one weight-streaming launch
     bool fused_mmid_pair_glu_f32 {};   // ... its f32 chain: MUL_MAT_ID x 2 + an f32 SWIGLU
+    bool fused_hc_post_norm_inj {};  // HC_POST_NORM_GATE_CPY + RESHAPE + MUL_MAT: the norm kernel also computes the inject
+    int fused_hc_moe_epi {};   // HC_MOE_EPI: number of ADD nodes (routed slot adds + the shared-expert add) in front of the HC post norm chain
+    // chunked GDN with the q/k l2 norms in gdn_chunk_prep (rebuilt per graph by ggml_vk_gdn_qk_norm_prepass): the raw q/k
+    // views and norm constants per GATED_DELTA_NET node, and the RMS_NORM / SCALE nodes that then do not run
+    struct gdn_qk_norm { const ggml_tensor * q_raw; const ggml_tensor * k_raw; float eps; float mul; };
+    std::unordered_map<const ggml_tensor *, gdn_qk_norm> gdn_qk;
+    std::unordered_set<const ggml_tensor *> gdn_qk_skip;
+    // chunked GDN with the conv + SiLU in gdn_chunk_prep / gdn_chunk_scan (ggml_vk_gdn_conv_fold_prepass):
+    // the conv input x, its state and taps and the q / k / v channel offsets per GATED_DELTA_NET node; the SSM_CONV + SILU
+    // nodes go into gdn_qk_skip
+    struct gdn_conv_fold { const ggml_tensor * x; const ggml_tensor * state; const ggml_tensor * kern; uint32_t C, qc0, kc0, vc0; };
+    std::unordered_map<const ggml_tensor *, gdn_conv_fold> gdn_cf;
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
     // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
     struct ssm_conv_direct_match {
@@ -1439,8 +1465,19 @@ struct ggml_backend_vk_context {
     std::vector<ssm_conv_direct_match> ssm_conv_direct_matches;
     int fused_concat_tail {-1};      // current CONCAT writes only its tail (index into ssm_conv_direct_matches)
     int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
-    // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
-    const ggml_tensor * fused_extra_srcs[2] {};
+    // set while the current node is a direct conv, a folded GDN or the deferred MoE epilogue: srcs read outside node->src for the sync tracking
+    const ggml_tensor * fused_extra_srcs[4] {};
+    // HC_DEFER: an attention-side combine output that was not stored (a), with the inputs it is recomputed from (the residual,
+    // the block output, the raw post weights and the gate scales) and the chain's first node for a store-only replay
+    struct hc_defer_state {
+        const ggml_tensor * a = nullptr;
+        const ggml_tensor * res0 = nullptr;
+        const ggml_tensor * x = nullptr;
+        const ggml_tensor * pw = nullptr;
+        float gate_in = 1.0f, gate_out = 1.0f;
+        int node_idx = -1;
+    } hc_defer;
+    const ggml_tensor * fused_extra_dst {};   // written by the fused kernel besides the write-mask nodes (synced like them)
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;

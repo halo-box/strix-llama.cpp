@@ -20,6 +20,7 @@ struct ggml_cuda_hc_mix_args {
     int                 hc;
     float               scale;
     float               bias;
+    const half *        gate_f16 = nullptr;   // F16 BLAS output for `gate` (same layout); `gate` itself is not written
 };
 
 struct ggml_cuda_hc_combine_args {
@@ -51,6 +52,8 @@ struct ggml_cuda_hc_combine_norm_args {
     bool                single_block = false; // alias-proof variant: one block per token, all inputs read before any store (hc <= 4)
     // BF16 stream options (HC16): a BF16 copy of xn for consumers that read it, and BF16 in-place residual / block_out
     uint16_t *          out_xn_bf16  = nullptr;
+    bool                xn16_f16     = false;    // true: out_xn_bf16 gets the RNE F16 copy of xn (the F16 BLAS staging)
+    bool                xn_q8        = true;     // false: no reader takes the int8 copy of xn
     bool                store_xn_f32 = true;     // false: every consumer reads the BF16 copy
     const uint16_t *    res_in_bf16  = nullptr;   // `residual` is BF16 in place (marked bf16-only)
     const uint16_t *    blk_in_bf16  = nullptr;

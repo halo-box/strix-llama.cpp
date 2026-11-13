@@ -3,7 +3,7 @@ shared u16vec2 row_ids[BN];
 uint _ne1;
 
 void load_row_ids(uint row_begin) {
-    // fusion_flags bit 4 (GGML_VK_MMID_ROWID_FILL): fill the slots past _ne1 with token 0, so the aligned B loads, which read
+    // fusion_flags bit 4 (the row-id fill): fill the slots past _ne1 with token 0, so the aligned B loads, which read
     // row_ids for the whole tile, gather a valid and cache-hot row instead of whatever the array held
     const uint n_slots = (p.fusion_flags & 16u) != 0 ? BN : _ne1;
     for (uint i = gl_LocalInvocationIndex; i < n_slots; i += BLOCK_SIZE) {

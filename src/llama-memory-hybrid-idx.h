@@ -265,6 +265,8 @@ public:
     bool qsa_scalar_visibility(const llama_ubatch & ubatch, uint32_t ratio) const;
     // scalar visibility and the cached cells form a single-sequence prefix with unique positions
     bool qsa_position_prefix(const llama_ubatch & ubatch, uint32_t ratio) const;
+    // the cells the two rules above look at: none in a reservation context (the route of an empty cache)
+    uint32_t qsa_n_cells_seen() const;
 
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
@@ -278,6 +280,9 @@ public:
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
+
+    // a full-cache context (init_full) only reserves graphs: its QSA route must not depend on the cells in the cache
+    const bool reserve = false;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact

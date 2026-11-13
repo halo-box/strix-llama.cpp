@@ -149,7 +149,7 @@ jobs:
 
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-          VARIANTS=("" "-cuda" "-cuda13" "-vulkan" "-rocm" "-intel" "-musa" "-openvino")
+          VARIANTS=("" "-vulkan" "-rocm")
           TYPES=("full" "light" "server")
           # the release is already created at this point, so keep going on a
           # missing image and report all of them at the end

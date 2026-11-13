@@ -1052,8 +1052,6 @@ __global__ void pack_kv(const _Float16 * __restrict__ K, const _Float16 * __rest
 
 static bool ggml_cuda_fa7_supported(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP)
-    static const bool on = getenv("GGML_FA7") ? atoi(getenv("GGML_FA7")) != 0 : true;   // GGML_FA7=0 disables it
-    if (!on) return false;
     const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3];
     if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc)) return false;
     if (!K || !V || !mask || dst->src[4] || dst->src[5] || dst->src[6] || dst->src[7]) return false;

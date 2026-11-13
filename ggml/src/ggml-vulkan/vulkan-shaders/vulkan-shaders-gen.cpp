@@ -734,7 +734,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
     }
 
     // Register-prefetch variants of the KHR coopmat matmul (mul_mm_pf_funcs.glsl), f16 and f32 B, selected at init by
-    // GGML_VK_MM_PREFETCH; dense and subgroup MUL_MAT_ID only
+    // ggml_vk_mm_prefetch_enabled; dense and subgroup MUL_MAT_ID only
     if (coopmat && !coopmat2 && !dot2 && matmul_id_type != MatMulIdType::DEFAULT) {
         for (const auto& tname : std::vector<std::string>{"q8_0", "q5_0", "q3_k", "q6_k", "q4_k", "q5_k", "iq4_xs", "iq3_xxs", "iq4_nl"}) {
             const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
@@ -755,7 +755,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
                 string_to_spv(shader_name + "_" + tname + "_f16_pf_d16", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}, {"MMID_SCALE", "1"}}), fp16, coopmat, coopmat2, f16acc);
                 string_to_spv(shader_name + "_" + tname + "_f32_pf_d16", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}, {"MMID_SCALE", "1"}}), fp16, coopmat, coopmat2, f16acc);
                 // manual-fragment twins ("_mf", COOPMAT_MANUAL_FRAG: mul_mm.comp BUF_MANUAL) of the four subgroup MUL_MAT_ID pf
-                // variants; the host takes them only after the RDNA3 fragment layout probe passed (GGML_VK_MMID_MANUAL_FRAG)
+                // variants; the host takes them only after the RDNA3 fragment layout probe passed
                 string_to_spv(shader_name + "_" + tname + "_f16_pf_mf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"COOPMAT_MANUAL_FRAG", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
                 string_to_spv(shader_name + "_" + tname + "_f32_pf_mf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"COOPMAT_MANUAL_FRAG", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
                 string_to_spv(shader_name + "_" + tname + "_f16_pf_d16_mf", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"MM_PREFETCH", "1"}, {"COOPMAT_MANUAL_FRAG", "1"}, {"LOAD_VEC_A", lva}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float16_t"}, {"D16", "1"}, {"MMID_SCALE", "1"}}), fp16, coopmat, coopmat2, f16acc);
@@ -840,7 +840,7 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
-                // multi-row prefill flash attention (GGML_VK_FA_MR): f32 accumulation only
+                // multi-row prefill flash attention: f32 accumulation only
                 if (!f16acc) {
                     string_to_spv("flash_attn_f32_f16_mr", "flash_attn_cm1_mr.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
@@ -980,6 +980,10 @@ void process_shaders() {
     string_to_spv("mul_mm_id_glu_q5_k_f32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}});
     string_to_spv("mul_mm_id_glu_q5_k_f16_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"OUT_F32", "1"}});
     string_to_spv("mul_mm_id_glu_q5_k_f32_o32", "mul_mm_id_glu.comp", {{"A_Q5_K", "1"}, {"B_F32", "1"}, {"OUT_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_iq3_s_f16", "mul_mm_id_glu.comp", {{"A_IQ3_S", "1"}});
+    string_to_spv("mul_mm_id_glu_iq3_s_f32", "mul_mm_id_glu.comp", {{"A_IQ3_S", "1"}, {"B_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_iq3_s_f16_o32", "mul_mm_id_glu.comp", {{"A_IQ3_S", "1"}, {"OUT_F32", "1"}});
+    string_to_spv("mul_mm_id_glu_iq3_s_f32_o32", "mul_mm_id_glu.comp", {{"A_IQ3_S", "1"}, {"B_F32", "1"}, {"OUT_F32", "1"}});
     // streaming q5_1 MUL_MAT_ID(+MUL)+CPY(f16) down, register-direct weights (RDNA3 fragment layout, wave32)
     string_to_spv("mul_mm_id_down_q5_1_f16", "mul_mm_id_down.comp", {});
     string_to_spv("mul_mm_id_down_q5_1_f32", "mul_mm_id_down.comp", {{"B_F32", "1"}});
@@ -990,6 +994,9 @@ void process_shaders() {
     string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
     string_to_spv("flash_attn_sel_f16", "flash_attn_sel.comp", {});
     string_to_spv("flash_attn_sel_prep", "flash_attn_sel_prep.comp", {});
+    for (const std::string t : {"f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"}) {
+        string_to_spv("flash_attn_sel_gather_" + t, "flash_attn_sel_gather.comp", {{"DATA_A_" + to_uppercase(t), "1"}});
+    }
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("flash_attn_sel_cm_f16", "flash_attn_sel_cm.comp", {});
 #endif
@@ -1279,6 +1286,7 @@ void process_shaders() {
     string_to_spv("topk_nary_search_f32", "topk_nary_search.comp", {{"A_TYPE", "float"}});
     string_to_spv("topk_radix_select_f32", "topk_radix_select.comp", {{"A_TYPE", "float"}});
     string_to_spv("qsa_expand", "qsa_expand.comp", {});
+    string_to_spv("topk_radix_lds_f32", "topk_radix_lds.comp", {});
 
     string_to_spv("argmax_f32", "argmax.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
     string_to_spv("sum_rows_f32", "sum_rows.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1297,6 +1305,15 @@ void process_shaders() {
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("dsv4_hc_post_norm_f32", "dsv4_hc_post_norm.comp", {});
     string_to_spv("dsv4_hc_post_norm_f16", "dsv4_hc_post_norm.comp", {{"OUT_F16", "1"}});
+    string_to_spv("dsv4_hc_post_norm_inj_f16", "dsv4_hc_post_norm_inj.comp", {});
+    string_to_spv("dsv4_hc_moe_post_norm_s16_f32", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s16_f16", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}, {"OUT_F16", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s16_inj", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}, {"OUT_F16", "1"}, {"INJ", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s32_f32", "dsv4_hc_moe_post_norm.comp", {});
+    string_to_spv("dsv4_hc_moe_post_norm_s32_f16", "dsv4_hc_moe_post_norm.comp", {{"OUT_F16", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s32_inj", "dsv4_hc_moe_post_norm.comp", {{"OUT_F16", "1"}, {"INJ", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s16_inj_defer", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}, {"OUT_F16", "1"}, {"INJ", "1"}, {"DEFER", "1"}});
+    string_to_spv("dsv4_hc_moe_post_norm_s32_inj_defer", "dsv4_hc_moe_post_norm.comp", {{"OUT_F16", "1"}, {"INJ", "1"}, {"DEFER", "1"}});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1383,6 +1400,8 @@ void process_shaders() {
     // dense q8_0 x f16 GEMM (mul_mm_dq8.comp), f32 and f16 output
     string_to_spv("matmul_dq8_q8_0_f16", "mul_mm_dq8.comp", {}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_d16", "mul_mm_dq8.comp", {{"D_F16", "1"}}, true, true, false);
+    // the same GEMM with an f32 A rounded to f16 on the LDS store (the qwen4exp MoE router)
+    string_to_spv("matmul_dq8_f32_f16", "mul_mm_dq8.comp", {{"A_F32", "1"}}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_hcmix", "mul_mm_dq8.comp", {{"HC_EPI", "1"}}, true, true, false);
     string_to_spv("matmul_dq8_q8_0_f16_hcmix_d16", "mul_mm_dq8.comp", {{"HC_EPI", "1"}, {"D_F16", "1"}}, true, true, false);
 #endif

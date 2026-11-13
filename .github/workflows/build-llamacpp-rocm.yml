@@ -1086,6 +1086,14 @@ jobs:
         echo "Processing operating systems: $operating_systems"
         echo "Using release tag: $TAG"
 
+        # upload-artifact does not keep file modes, so the downloaded binaries are 0644;
+        # set the execute bit again on every ELF executable before zipping
+        restore_exec_bits() {
+          find "$1" -type f -print0 | while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q '^ELF .* executable'; then chmod +x "$f"; fi
+          done
+        }
+
         # Create individual archives for each target and OS combination
         IFS=',' read -ra TARGET_ARRAY <<< "$targets"
         IFS=',' read -ra OS_ARRAY <<< "$operating_systems"
@@ -1106,6 +1114,7 @@ jobs:
 
             if [ -d "$artifact_dir" ]; then
               echo "Creating archive: ${final_archive_name}.zip"
+              restore_exec_bits "$artifact_dir"
               cd "$artifact_dir"
               zip -r "../../${final_archive_name}.zip" *
               cd ../../
@@ -1119,6 +1128,7 @@ jobs:
         for os in ubuntu windows; do
           if [ -d "./all-artifacts/llama-${os}-vulkan-x64" ]; then
             echo "Creating archive: llama-${TAG}-${os}-vulkan-x64.zip"
+            restore_exec_bits "./all-artifacts/llama-${os}-vulkan-x64"
             (cd "./all-artifacts/llama-${os}-vulkan-x64" && zip -r "../../llama-${TAG}-${os}-vulkan-x64.zip" *)
           fi
         done
@@ -1187,8 +1197,10 @@ jobs:
         echo "Files to upload: $upload_files"
 
         # Create release with GitHub CLI
+        # per-build releases never take "Latest": a curated release is marked latest by hand
         gh release create "$TAG" \
           --title "$TAG" \
+          --latest=false \
           --notes "**Build Number**: $TAG
         **Operating System(s)**: $rocm_os
         **GPU Target(s)**: $targets
