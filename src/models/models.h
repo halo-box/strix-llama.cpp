@@ -2656,6 +2656,11 @@ struct llama_model_qwen4exp : public llama_model_base {
         // strip views of the host inputs keyed by (input, first query, strip size): the scheduler copies every view of a host input for the whole graph, so the layers share one view per strip
         std::map<std::tuple<const ggml_tensor *, int64_t, int64_t>, ggml_tensor *> strip_views;
 
+        // TE rows (non-compact strips): the visibility source of a strip (its KQ mask view or per-cell bias) as rows of one
+        // element (qwen4exp_te_vis_cells), and for an F32 mask the ADD's reshape of it, shared by every layer for the same reason
+        struct te_vis_strip { ggml_tensor * cells = nullptr; ggml_tensor * add = nullptr; };
+        std::map<const ggml_tensor *, te_vis_strip> te_vis;
+
         // QSA: store this ubatch's raw indexer keys in the indexer cache (no selection)
         void build_qsa_store_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,

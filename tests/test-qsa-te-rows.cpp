@@ -263,9 +263,11 @@ static void run_case(ggml_backend_t be, const char * bname, case_t & c) {
         sc = ggml_cont(ctx, sc);
         ggml_tensor * qm = ggml_view_4d(ctx, t_mask, n_kv, n_query, 1, n_stream, t_mask->nb[1], t_mask->nb[2], t_mask->nb[3],
                 first * t_mask->nb[1]);
-        ggml_tensor * add = ggml_reshape_3d(ctx, ggml_cast(ctx, qm, GGML_TYPE_F32), n_kv, n_query, n_stream);
+        // build_qsa_top_k: the mask cast and the visibility gather both read the cells view of the strip's mask
+        ggml_tensor * vis = qwen4exp_te_vis_cells(ctx, qm);
+        ggml_tensor * add = ggml_reshape_3d(ctx, ggml_cast(ctx, vis, GGML_TYPE_F32), n_kv, n_query, n_stream);
         ggml_tensor * expanded = qwen4exp_te_expand(ctx, sc, t_cblk, add);
-        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx, expanded, qm, width);
+        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx, expanded, vis, width);
         expanded_s.push_back(expanded);
         rows_s.push_back(sel.rows);
         topk_s.push_back(sel.top_k);

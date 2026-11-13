@@ -21,26 +21,35 @@ struct qwen4exp_te_sel {
     ggml_tensor * rows  = nullptr;   // I32 [width, n_query, 1, n_stream]: the same index where vis is finite, else -1
 };
 
-// expanded: F32 [n_kv, n_query, n_stream], contiguous. width = min(n_kv, indexer_top_k + ratio - 1).
 // vis: the source of expanded's ADD before any cast: KQ mask (F16 / F32 [n_kv, n_query, 1, n_stream]) or per-cell bias (F32 [n_kv, n_query, n_stream]), elements contiguous. A cell is visible iff vis is finite there.
-static inline qwen4exp_te_sel qwen4exp_te_select(ggml_context * ctx, ggml_tensor * expanded, ggml_tensor * vis, int64_t width) {
+// Returns vis as rows of one element, F16 / F32 [1, n_kv, n_query, n_stream], the source qwen4exp_te_select gathers from.
+// The scheduler gives every view of a host input its own device copy, allocated at the start of the split: build this view once per strip and graph (not per layer), and read the mask cast of expanded's ADD through it too, so that one copy of the mask serves every layer and both reads.
+static inline ggml_tensor * qwen4exp_te_vis_cells(ggml_context * ctx, ggml_tensor * vis) {
+    GGML_ASSERT(vis != nullptr && (vis->type == GGML_TYPE_F32 || vis->type == GGML_TYPE_F16));
+    GGML_ASSERT(vis->nb[0] == ggml_type_size(vis->type));
+    const int64_t n_kv = vis->ne[0], n_query = vis->ne[1], n_stream = vis->ne[2] * vis->ne[3];
+    GGML_ASSERT(vis->ne[2] == 1 || vis->ne[3] == 1);
+    // the stream stride: ne[3] of the 4-D mask, ne[2] of the 3-D bias
+    const size_t nb_stream = vis->ne[3] == n_stream ? vis->nb[3] : vis->nb[2];
+    return ggml_view_4d(ctx, vis, 1, n_kv, n_query, n_stream, vis->nb[0], vis->nb[1], nb_stream, 0);
+}
+
+// expanded: F32 [n_kv, n_query, n_stream], contiguous. width = min(n_kv, indexer_top_k + ratio - 1).
+// vis_cells: qwen4exp_te_vis_cells of the source of expanded's ADD.
+static inline qwen4exp_te_sel qwen4exp_te_select(ggml_context * ctx, ggml_tensor * expanded, ggml_tensor * vis_cells, int64_t width) {
     const int64_t n_kv = expanded->ne[0], n_query = expanded->ne[1], n_stream = expanded->ne[2];
     GGML_ASSERT(expanded->type == GGML_TYPE_F32 && ggml_is_contiguous(expanded) && expanded->ne[3] == 1);
     GGML_ASSERT(width >= 1 && width <= n_kv);
     // the f32 index below is exact up to 2^24 cells
     GGML_ASSERT(n_kv <= ((int64_t) 1 << 24));
-    GGML_ASSERT(vis != nullptr && (vis->type == GGML_TYPE_F32 || vis->type == GGML_TYPE_F16));
-    GGML_ASSERT(vis->ne[0] == n_kv && vis->ne[1] == n_query && vis->ne[2] * vis->ne[3] == n_stream);
-    GGML_ASSERT(vis->nb[0] == ggml_type_size(vis->type));
-    // the stream stride: ne[3] of the 4-D mask, ne[2] of the 3-D bias
-    const size_t nb_stream = vis->ne[3] == n_stream ? vis->nb[3] : vis->nb[2];
+    GGML_ASSERT(vis_cells != nullptr && (vis_cells->type == GGML_TYPE_F32 || vis_cells->type == GGML_TYPE_F16));
+    GGML_ASSERT(vis_cells->ne[0] == 1 && vis_cells->ne[1] == n_kv && vis_cells->ne[2] == n_query && vis_cells->ne[3] == n_stream);
 
     qwen4exp_te_sel sel;
     sel.top_k = ggml_cont(ctx, ggml_top_k(ctx, expanded, width));
     sel.top_k = ggml_reshape_4d(ctx, sel.top_k, width, n_query, 1, n_stream);
 
-    // vis as rows of one element, gathered at the picked indices; an F16 source gives F32
-    ggml_tensor * vis_cells = ggml_view_4d(ctx, vis, 1, n_kv, n_query, n_stream, vis->nb[0], vis->nb[1], nb_stream, 0);
+    // vis gathered at the picked indices; an F16 source gives F32
     ggml_tensor * values = ggml_get_rows(ctx, vis_cells, ggml_reshape_3d(ctx, sel.top_k, width, n_query, n_stream));
     values = ggml_reshape_4d(ctx, values, width, n_query, 1, n_stream);
     // 1 for every finite value (x + FLT_MAX > 0 for any finite x > -FLT_MAX), 0 for -inf (and NaN)

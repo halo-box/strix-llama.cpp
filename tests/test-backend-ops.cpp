@@ -10425,9 +10425,14 @@ struct test_qsa_te_strip : public test_case {
         ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
         ggml_set_name(kq_mask, "kq_mask");
 
-        ggml_tensor * add = ggml_reshape_3d(ctx, ggml_cast(ctx, kq_mask, GGML_TYPE_F32), n_kv, n_tps, n_stream);
+        // build_qsa_top_k: the mask cast and the visibility gather both read the cells view of the mask
+        ggml_tensor * vis = qwen4exp_te_vis_cells(ctx, kq_mask);
+        if (gf) {
+            ggml_build_forward_expand(gf, vis);   // as build_qsa_top_k: the view node ahead of the fused chain
+        }
+        ggml_tensor * add = ggml_reshape_3d(ctx, ggml_cast(ctx, vis, GGML_TYPE_F32), n_kv, n_tps, n_stream);
         ggml_tensor * expanded = qwen4exp_te_expand(ctx, score, cell_blk, add);
-        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx, expanded, kq_mask, width);
+        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx, expanded, vis, width);
         out = sel.rows;
         ggml_set_name(out, "out");
         return out;

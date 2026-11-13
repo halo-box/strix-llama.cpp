@@ -1687,11 +1687,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // non-compact: the TE rows (qwen4exp-te.h). cell_blk indexes every block, so the scorer is never bounded here
         GGML_ASSERT(score_blocks == n_blocks);
+        // the visibility source as rows of one element, one view per strip shared by every layer (see te_vis): the
+        // scheduler copies each view of the host mask to the device, so a view per layer was a mask-sized copy per layer
+        te_vis_strip & tv = te_vis[blk_bias ? query_mask : bias];
+        if (tv.cells == nullptr) {
+            tv.cells = qwen4exp_te_vis_cells(ctx0, blk_bias ? query_mask : bias);
+            // in the graph before the expanded chain: a view node between its CONT and the mask cast would keep the
+            // chain from matching the Vulkan TOPK_QSA pattern (consecutive nodes) in the first layer that reads it
+            ggml_build_forward_expand(gf, tv.cells);
+            if (blk_bias && tv.cells->type == GGML_TYPE_F32) {
+                tv.add = ggml_reshape_3d(ctx0, tv.cells, n_kv, n_query, n_stream);
+            }
+        }
         ggml_tensor * add = bias;
         if (blk_bias) {
-            // flash attention keeps the mask in f16; the scores are f32
-            ggml_tensor * mask = query_mask->type == GGML_TYPE_F32 ? query_mask : ggml_cast(ctx0, query_mask, GGML_TYPE_F32);
-            add = ggml_reshape_3d(ctx0, mask, n_kv, n_query, n_stream);
+            // flash attention keeps the mask in f16; the scores are f32. The cast reads the shared cells view, the tensor
+            // the visibility gather reads, so both share its copy; the cast itself is per layer (the TOPK_QSA fusion
+            // needs it single-use)
+            add = tv.add ? tv.add : ggml_reshape_3d(ctx0, ggml_cast(ctx0, tv.cells, GGML_TYPE_F32), n_kv, n_query, n_stream);
         }
         ggml_tensor * expanded = qwen4exp_te_expand(ctx0, score, inp->cell_blk, add);
         cb(expanded, "indexer_score_tokens", il);
@@ -1700,7 +1713,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
         // visibility from the mask as stored, so the TOP_K stays expanded's only consumer (Vulkan TOPK_QSA fusion)
-        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx0, expanded, blk_bias ? query_mask : bias, width);
+        const qwen4exp_te_sel sel = qwen4exp_te_select(ctx0, expanded, tv.cells, width);
         cb(sel.top_k, "indexer_top_k", il);
         qwen4exp_append_strip(ctx0, gf, selected, sel.rows);
     }
