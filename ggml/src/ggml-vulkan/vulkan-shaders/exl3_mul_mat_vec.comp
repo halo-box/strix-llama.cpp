@@ -6,12 +6,11 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 
-// EXL3 dot kernel (few rows), see ggml/exl3/README.md and the HIP dot kernel in ggml-cuda/exl3.cu (adapted from
-// exllamav3's RDNA GEMV, MIT). y = H(xh W_hat) * svh/128 with xh = H(x*suh) from exl3_rotate.comp.
-// A workgroup computes T = 2 adjacent 16-column tiles for M rows, its waves splitting K. Each lane decodes its 8 weights
-// of a tile in registers to the exact fp16 codebook values and multiplies them with the f32 activations (f32
-// accumulation). The last workgroup to finish a 128-column segment applies H and svh/128 to it (arrival counters,
-// zeroed by the rotation). Wave32 only (pipelines pinned to subgroup size 32).
+// EXL3 dot kernel (few rows), see ggml/exl3/README.md and the HIP dot kernel in ggml-cuda/exl3.cu (adapted from exllamav3's RDNA GEMV, MIT). y = H(xh W_hat) * svh/128 with xh = H(x*suh) from exl3_rotate.comp.
+// A workgroup computes T = 2 adjacent 16-column tiles for M rows, its waves splitting K.
+// Each lane decodes its 8 weights of a tile in registers to the exact fp16 codebook values and multiplies them with the f32 activations (f32 accumulation).
+// The last workgroup to finish a 128-column segment applies H and svh/128 to it (arrival counters, zeroed by the rotation).
+// Wave32 only (pipelines pinned to subgroup size 32).
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
