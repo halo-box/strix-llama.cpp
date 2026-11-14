@@ -11,6 +11,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <numeric>
 #include <mutex>
 #include <thread>
@@ -568,8 +569,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         cb(e_norm, "mtp_enorm", il);
 
         // fc_embedding(e) + fc_hidden(h) is one projection of the concatenation; the converter
-        // merges the two checkpoint tensors into this single eh_proj
-        inpL = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+        // merges the two checkpoint tensors into this single eh_proj. One 2D GEMM over all streams
+        // and tokens: a 3D B would run one batched mat-vec per token, each reading the whole weight.
+        ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0);
+        eh_in = ggml_reshape_2d(ctx0, eh_in, eh_in->ne[0], hc*n_tokens);
+        inpL = build_lora_mm(layer.nextn.eh_proj, eh_in, layer.nextn.eh_proj_s);
+        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
     } else {
         cb(e_norm, "mtp_enorm", il);
 
@@ -1120,6 +1125,23 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     return { qkv_mixed, z };
 }
 
+int64_t llama_model_qwen4exp::graph::norm_gated_f16_pad(const ggml_tensor * input, int layer) {
+    // f16 output norm at prefill (fused_gdn_norm_f16; no LoRA, no bf16 or EXL3 ssm_out)
+    const ggml_tensor * w_out = model.layers[layer].ssm_out;
+    if (!(cparams.fused_gdn_norm_f16 && n_tokens >= 32 && loras->empty() && w_out != nullptr && w_out->type != GGML_TYPE_BF16 &&
+            !(exl3 && exl3->linears.count(w_out)))) {
+        return -1;
+    }
+    // LLAMA_GDN_NORM_PAD=N (as LLAMA_HC_XN_PAD): token stride value_dim + N where the packed rows all start on one DRAM
+    // channel (256 B multiples sharing a factor of 8+ with the 16 channels, Flash-Next's 48 x 256 B); one buffer per graph
+    static const int64_t pad = qwen4exp_env_pad("LLAMA_GDN_NORM_PAD");
+    const int64_t row = input->ne[0] * input->ne[1];
+    if (pad > 0 && (row * 2) % 256 == 0 && std::gcd<int64_t>(row * 2 / 256, 16) >= 8 && input->ne[3] == 1) {
+        return pad;
+    }
+    return 0;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * input,
         ggml_tensor * weights,
@@ -1128,17 +1150,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
     // f16 output norm at prefill (fused_gdn_norm_f16; no LoRA, no bf16 or EXL3 ssm_out): the chain back to back so Vulkan runs it as
     // one RMS_NORM_MUL_SIGMUL_CPY pass writing only ssm_out's f16 B (Flash-Next REAP-320: +2-3% prefill, PPL 3.7972 vs 3.7973)
-    const ggml_tensor * w_out = model.layers[layer].ssm_out;
-    if (cparams.fused_gdn_norm_f16 && n_tokens >= 32 && loras->empty() && w_out != nullptr && w_out->type != GGML_TYPE_BF16 &&
-            !(exl3 && exl3->linears.count(w_out))) {
+    const int64_t pad = norm_gated_f16_pad(input, layer);
+    if (pad >= 0) {
         ggml_build_forward_expand(gf, gate);   // gate's own view nodes go ahead of the chain
         ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
         ggml_tensor * out = ggml_mul(ctx0, normalized, ggml_sigmoid(ctx0, gate));
-        // LLAMA_GDN_NORM_PAD=N (as LLAMA_HC_XN_PAD): token stride value_dim + N where the packed rows all start on one DRAM
-        // channel (256 B multiples sharing a factor of 8+ with the 16 channels, Flash-Next's 48 x 256 B); one buffer per graph
-        static const int64_t pad = qwen4exp_env_pad("LLAMA_GDN_NORM_PAD");
         const int64_t row = out->ne[0] * out->ne[1];
-        if (pad > 0 && (row * 2) % 256 == 0 && std::gcd<int64_t>(row * 2 / 256, 16) >= 8 && out->ne[3] == 1) {
+        if (pad > 0) {
             ggml_tensor * buf = pad_buf(&gdn_norm_pad_buf, row + pad, out->ne[2], "gdn_norm_pad");
             ggml_tensor * dst = ggml_view_4d(ctx0, buf, out->ne[0], out->ne[1], out->ne[2], 1,
                     out->ne[0] * ggml_element_size(buf), buf->nb[1], buf->nb[1] * out->ne[2], 0);
@@ -1152,6 +1170,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
 
     return ggml_mul(ctx0, normalized, gated);
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated_parts(
+        ggml_tensor * out0,
+        ggml_tensor * out1,
+        ggml_tensor * weights,
+        ggml_tensor * gate,
+        int           layer) {
+    // the fused f16 path of build_norm_gated with its padded destination (the default); otherwise concatenate
+    const int64_t pad = norm_gated_f16_pad(out0, layer);
+    if (pad <= 0) {
+        return build_norm_gated(ggml_concat(ctx0, out0, out1, 2), weights, gate, layer);
+    }
+    const int64_t row = out0->ne[0] * out0->ne[1];
+
+    const int64_t t = out0->ne[2];
+    const int64_t n = t + out1->ne[2];
+
+    ggml_tensor * buf = pad_buf(&gdn_norm_pad_buf, row + pad, n, "gdn_norm_pad");
+
+    // tokens [t0, t1): norm, gate and write f16 rows into a view of base at offs (relative to base)
+    auto part = [&](ggml_tensor * x, int64_t t0, int64_t t1, ggml_tensor * base, size_t offs) {
+        ggml_tensor * g = ggml_view_4d(ctx0, gate, gate->ne[0], gate->ne[1], t1 - t0, 1, gate->nb[1], gate->nb[2], gate->nb[3], t0*gate->nb[2]);
+        ggml_build_forward_expand(gf, g);   // the gate's view nodes go ahead of the chain, as in build_norm_gated
+        ggml_tensor * normalized = build_norm(x, weights, nullptr, LLM_NORM_RMS, layer);
+        ggml_tensor * o = ggml_mul(ctx0, normalized, ggml_sigmoid(ctx0, g));
+        ggml_tensor * dst = ggml_view_4d(ctx0, base, x->ne[0], x->ne[1], t1 - t0, 1,
+                x->ne[0] * ggml_element_size(buf), buf->nb[1], buf->nb[1] * (t1 - t0), offs);
+        ggml_build_forward_expand(gf, dst);
+        return ggml_cpy(ctx0, o, dst);
+    };
+
+    // the second destination is a view of the first copy, so the copies are ordered and the result below depends on both
+    ggml_tensor * c0 = part(out0, 0, t, buf, 0);
+    ggml_tensor * c1 = part(out1, t, n, c0, t * buf->nb[1]);
+
+    // all n rows, as a view of c1 so that it depends on both copies. ggml adds a view's offset to c1's own (t rows into
+    // the buffer), so the offset passed here is minus that: the result is buf at offset 0
+    const size_t back_to_buf = (size_t) 0 - c1->view_offs;
+    return ggml_view_4d(ctx0, c1, out0->ne[0], out0->ne[1], n, 1,
+            out0->ne[0] * ggml_element_size(buf), buf->nb[1], buf->nb[1] * n, back_to_buf);
 }
 
 // Scoring strips: the scorer scratch is [n_blocks, strip] instead of [n_blocks, n_tokens], and each strip is
@@ -2121,8 +2180,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-    ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+    // With rollback slots every scan writes K = n_rs_seq + 1 state snapshots, and the K-snapshot scan has no chunked
+    // prefill form. A prompt ubatch of one sequence (no output before its last K tokens; a verify batch outputs every
+    // row) is split K tokens before its end: tokens [0, t) run the conv and the plain scan, the same graph as without
+    // slots, and the last K tokens convolve the history at t with x[t, n) and run the K-snapshot scan from the state
+    // at t. The slots get the same K states; the arithmetic per element is the same.
+    const int64_t K_slots    = (int64_t) cparams.n_rs_seq + 1;
+    bool          conv_split = cparams.n_rs_seq > 0 && n_seqs == 1 && n_seq_tokens > K_slots && ubatch.output != nullptr;
+    for (int64_t i = 0; conv_split && i < n_seq_tokens - K_slots; ++i) {
+        conv_split = ubatch.output[i] == 0;
+    }
+    const int64_t split_t    = conv_split ? n_seq_tokens - K_slots : n_seq_tokens;
+
+    ggml_tensor * conv_hist  = nullptr;
+    ggml_tensor * conv_input = conv_split
+            ? build_conv_state_split(inp, conv_states_all, qkv_mixed, conv_kernel_size - 1, conv_channels, split_t, &conv_hist, il)
+            : build_conv_state_at(inp, conv_states_all, qkv_mixed, conv_kernel_size - 1, conv_channels, il);
 
     // read the recurrent state in place when no row is copied (e3f31cf6d gave qwen35 this; qwen4exp never enabled it): the
     // per-layer GET_ROWS of the 3 MB state per token goes away, the write-back of the new state stays
@@ -2132,62 +2205,114 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
-
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
-
-    ggml_tensor * conv_qkv_mix = conv_output_silu;
-
-    int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
-
-    // Extract the convolved Q, K, V from conv_output
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            0);
-
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_k_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
-
-    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
-            ggml_row_size(conv_qkv_mix->type, head_v_dim),
-            nb1_qkv,
-            nb1_qkv * n_seq_tokens,
-            ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
-
-    cb(q_conv, "q_conv", il);
-    cb(k_conv, "k_conv", il);
-    cb(v_conv, "v_conv", il);
-
-
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // conv -> SiLU -> the q, k, v views of T tokens -> the q / k l2 norms
+    auto conv_qkv = [&](ggml_tensor * cin, int64_t T) -> std::array<ggml_tensor *, 3> {
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, cin, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
 
-    // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
-    if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
-        GGML_ASSERT(num_v_heads % num_k_heads == 0);
-        q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-        k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-    }
+        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
 
-    cb(q_conv, "q_conv_predelta", il);
-    cb(k_conv, "k_conv_predelta", il);
-    cb(v_conv, "v_conv_predelta", il);
+        ggml_tensor * conv_qkv_mix = conv_output_silu;
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+        int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
+
+        // Extract the convolved Q, K, V from conv_output
+        ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, T, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * T,
+                0);
+
+        ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, T, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * T,
+                head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+
+        ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, T, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_v_dim),
+                nb1_qkv,
+                nb1_qkv * T,
+                ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
+
+        cb(q_conv, "q_conv", il);
+        cb(k_conv, "k_conv", il);
+        cb(v_conv, "v_conv", il);
+
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+
+        // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
+        if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+            GGML_ASSERT(num_v_heads % num_k_heads == 0);
+            q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, T, n_seqs);
+            k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, T, n_seqs);
+        }
+
+        cb(q_conv, "q_conv_predelta", il);
+        cb(k_conv, "k_conv_predelta", il);
+        cb(v_conv, "v_conv_predelta", il);
+
+        return { q_conv, k_conv, v_conv };
+    };
+
+    const auto qkv0 = conv_qkv(conv_input, split_t);
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
-    // gated normalization, as self.norm(core_attn_out, z) in the reference
-    ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+    ggml_tensor * attn_out_norm = nullptr;
+    if (!conv_split) {
+        ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, qkv0[0], qkv0[1], qkv0[2], gate, beta, state, il);
+
+        // gated normalization, as self.norm(core_attn_out, z) in the reference
+        attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+    } else {
+        const int64_t t = split_t;
+        const int64_t n = n_seq_tokens;
+
+        // tokens [t0, t1) of gate or beta ([1, H_v, n, 1])
+        auto tokens = [&](ggml_tensor * x, int64_t t0, int64_t t1) {
+            return ggml_view_4d(ctx0, x, x->ne[0], x->ne[1], t1 - t0, 1, x->nb[1], x->nb[2], x->nb[3], t0 * x->nb[2]);
+        };
+
+        // tokens [0, t): the plain scan; its final state feeds the second part and is not stored
+        auto part0 = build_delta_net(qkv0[0], qkv0[1], qkv0[2], tokens(gate, 0, t), tokens(beta, 0, t), state, il);
+        cb(part0.first, "attn_output_part0", il);
+        ggml_build_forward_expand(gf, part0.first);
+
+        // tokens [t, n): conv from the history at t, then the K-snapshot scan, which writes the K rollback slots
+        ggml_tensor * cin1 = build_conv_tail_at(inp, conv_states_all, qkv_mixed, conv_hist, conv_kernel_size - 1, conv_channels, t, il);
+        const auto qkv1 = conv_qkv(cin1, K_slots);
+
+        ggml_tensor * gdn1 = ggml_gated_delta_net(ctx0, qkv1[0], qkv1[1], qkv1[2], tokens(gate, t, n), tokens(beta, t, n), part0.second, K_slots);
+        res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn1, il});
+        cb(gdn1, "gdn_out_part1", il);
+
+        const int64_t S_v    = head_v_dim;
+        const int64_t H_v    = num_v_heads;
+        const int64_t D      = S_v * S_v * H_v;
+        const int64_t score1 = S_v * H_v * K_slots;
+
+        ggml_tensor * out1 = ggml_view_4d(ctx0, gdn1, S_v, H_v, K_slots, 1,
+                ggml_row_size(gdn1->type, S_v), ggml_row_size(gdn1->type, S_v * H_v), ggml_row_size(gdn1->type, score1), 0);
+        cb(out1, "attn_output_part1", il);
+
+        // snapshot k goes to rollback slot k of this sequence's cell
+        const auto *   mctx_rs  = inp->mctx;
+        const uint32_t mem_size = mctx_rs->get_size();
+        const size_t   row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        ggml_tensor * src1 = ggml_view_3d(ctx0, gdn1, D, 1, K_slots,
+                ggml_row_size(gdn1->type, D), ggml_row_size(gdn1->type, D), ggml_row_size(gdn1->type, score1));
+        ggml_tensor * dst1 = ggml_view_3d(ctx0, ssm_states_all, D, 1, K_slots,
+                ssm_states_all->nb[1], (size_t) mem_size * row_size, (size_t) mctx_rs->get_head() * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src1, dst1));
+
+        // gated normalization of both parts, as self.norm(core_attn_out, z) in the reference
+        attn_out_norm = build_norm_gated_parts(part0.first, out1, model.layers[il].ssm_norm, z_2d, il);
+    }
 
     // a padded f16 norm output (LLAMA_GDN_NORM_PAD) is viewed, not reshaped: ssm_out reads its rows through the stride
     ggml_tensor * final_output = ggml_is_contiguous(attn_out_norm)
@@ -2842,6 +2967,87 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
         // copy the strided tail directly (no intermediate cont): this is the same node sequence as
         // llm_build_delta_net_base::build_conv_state, which the backends' fused decode paths match
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
+    }
+
+    return conv_input;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_split(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        conv_states_all,
+        ggml_tensor *        x,
+        int64_t              state_cols,
+        int64_t              channels,
+        int64_t              t,
+        ggml_tensor **       hist,
+        int                  il) {
+    const int64_t n_seqs    = ubatch.n_seqs;
+    const int64_t row_total = conv_states_all->ne[0];
+
+    GGML_ASSERT(n_seqs == 1);
+    GGML_ASSERT(state_cols * channels == row_total);
+    GGML_ASSERT(t > 0 && t < x->ne[1]);
+
+    auto it = rs_rows.find(conv_states_all);
+    if (it == rs_rows.end()) {
+        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_states_all, row_total, n_seqs)).first;
+    }
+    ggml_tensor * state = ggml_reshape_3d(ctx0, it->second, state_cols, channels, n_seqs);
+    cb(state, "conv_state_at", il);
+
+    // tokens [0, t): a prefix of x, viewed as a [C, t, 1] tensor of its own
+    ggml_tensor * x0 = ggml_view_3d(ctx0, x, x->ne[0], t, 1, x->nb[1], x->nb[1] * t, 0);
+    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x0), 0);
+    cb(conv_input, "conv_input_part0", il);
+
+    // the history at t: the last state_cols columns of the first part's concat, as a contiguous tensor
+    ggml_tensor * h = ggml_cont(ctx0, ggml_view_3d(ctx0, conv_input,
+            state_cols, channels, 1,
+            conv_input->nb[1], conv_input->nb[2],
+            ggml_row_size(conv_input->type, t)));
+    cb(h, "conv_hist_split", il);
+    ggml_build_forward_expand(gf, h);
+
+    *hist = h;
+    return conv_input;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_conv_tail_at(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        conv_states_all,
+        ggml_tensor *        x,
+        ggml_tensor *        hist,
+        int64_t              state_cols,
+        int64_t              channels,
+        int64_t              t,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    const auto kv_head = mctx_cur->get_head();
+    const int64_t n    = x->ne[1];
+
+    // tokens [t, n) after the history at t
+    ggml_tensor * x1 = ggml_view_3d(ctx0, x, x->ne[0], n - t, 1, x->nb[1], x->nb[1] * (n - t), x->nb[1] * t);
+    ggml_tensor * conv_input = ggml_concat(ctx0, hist, ggml_transpose(ctx0, x1), 0);
+    cb(conv_input, "conv_input_part1", il);
+
+    // the new conv state: the last state_cols columns, once per rollback slot as in build_conv_state_at (slot s ends s tokens
+    // earlier; the tail holds state_cols + n - t >= state_cols + n_rs_seq columns, so every slot is inside it)
+    const int64_t row_total = conv_states_all->ne[0];
+    const size_t  row_size  = ggml_row_size(conv_states_all->type, row_total);
+    const uint32_t mem_size = mctx_cur->get_size();
+
+    for (int64_t slot = 0; slot <= (int64_t) cparams.n_rs_seq; ++slot) {
+        GGML_ASSERT(conv_input->ne[0] - state_cols - slot >= 0);
+        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, 1,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols - slot));
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, 1,
+                conv_states_all->nb[1],
+                (slot * mem_size + kv_head) * row_size);
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst));
     }
 

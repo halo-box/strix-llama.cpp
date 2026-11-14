@@ -6898,6 +6898,7 @@ struct test_gated_delta_net : public test_case {
 struct test_ssm_conv_direct : public test_case {
     const int64_t channels, n_t, n_s, n_slots;
     const bool extra_reader; // a whole-concat reader besides the conv: must fall back to the full concat
+    const int64_t x_tail;    // x holds x_tail more tokens than the conv reads, read later (qwen4exp's rollback-slot split)
 
     std::vector<ggml_tensor *> verify;
 
@@ -6911,20 +6912,27 @@ struct test_ssm_conv_direct : public test_case {
     std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
 
     std::string vars() override {
-        return VARS_TO_STR5(channels, n_t, n_s, n_slots, extra_reader);
+        if (x_tail == 0) {
+            return VARS_TO_STR5(channels, n_t, n_s, n_slots, extra_reader);
+        }
+        return VARS_TO_STR6(channels, n_t, n_s, n_slots, extra_reader, x_tail);
     }
 
-    test_ssm_conv_direct(int64_t channels = 64, int64_t n_t = 7, int64_t n_s = 1, int64_t n_slots = 1, bool extra_reader = false)
-        : channels(channels), n_t(n_t), n_s(n_s), n_slots(n_slots), extra_reader(extra_reader) {}
+    test_ssm_conv_direct(int64_t channels = 64, int64_t n_t = 7, int64_t n_s = 1, int64_t n_slots = 1, bool extra_reader = false,
+            int64_t x_tail = 0)
+        : channels(channels), n_t(n_t), n_s(n_s), n_slots(n_slots), extra_reader(extra_reader), x_tail(x_tail) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         verify.clear();
         const int64_t C = channels;
         ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, n_s);
         ggml_set_name(state, "state");
-        ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_t, n_s);
+        GGML_ASSERT(x_tail == 0 || n_s == 1);
+        ggml_tensor * x_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, n_t + x_tail, n_s);
         ggml_set_name(x_src, "x_src");
-        ggml_tensor * x = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, like the qkv projection
+        ggml_tensor * x_all = ggml_scale(ctx, x_src, 0.5f); // an allocatable intermediate, like the qkv projection
+        // the conv reads tokens [0, n_t): with x_tail, a zero-offset prefix view of the longer x
+        ggml_tensor * x = x_tail == 0 ? x_all : ggml_view_3d(ctx, x_all, C, n_t, 1, x_all->nb[1], x_all->nb[1] * n_t, 0);
         ggml_tensor * kern = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
         ggml_set_name(kern, "kernel");
         ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * C, n_s * n_slots);
@@ -6958,6 +6966,16 @@ struct test_ssm_conv_direct : public test_case {
         ggml_tensor * out = ggml_silu(ctx, ggml_ssm_conv(ctx, cc, kern));
         ggml_set_name(out, "out");
         verify.push_back(out);
+        if (x_tail > 0) {
+            // the tokens past the prefix are read after the conv, as the split's second part reads them
+            ggml_tensor * rest = ggml_scale(ctx, ggml_view_3d(ctx, x_all, C, x_tail, 1, x_all->nb[1], x_all->nb[1] * x_tail,
+                    x_all->nb[1] * n_t), 3.0f);
+            if (gf) {
+                ggml_build_forward_expand(gf, out);
+                ggml_build_forward_expand(gf, rest);
+            }
+            verify.push_back(rest);
+        }
         return out;
     }
 };
@@ -17555,6 +17573,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_conv_direct(130, 8, 2, 8));         // tail reaches into the state columns
     test_cases.emplace_back(new test_ssm_conv_direct(10240, 257, 1, 1));     // Flash-Next channels
     test_cases.emplace_back(new test_ssm_conv_direct(256, 64, 1, 1, true));  // another whole-concat reader: no fusion
+    // a prefix of a longer x (the rollback-slot split's first part), with the tail read after the conv
+    test_cases.emplace_back(new test_ssm_conv_direct(130, 33, 1, 1, false, 4));
+    test_cases.emplace_back(new test_ssm_conv_direct(256, 300, 1, 4, false, 9));
+    test_cases.emplace_back(new test_ssm_conv_direct(10240, 2044, 1, 1, false, 4)); // Flash-Next, 2048-token ubatch, K = 4
     // Convolution/SiLU elided into the chunked GDN, allocated through the scheduler.
     test_cases.emplace_back(new test_gdn_conv_prefill(256, 2, 2));
     test_cases.emplace_back(new test_gdn_conv_prefill(512, 2, 4));
