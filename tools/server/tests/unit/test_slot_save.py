@@ -838,3 +838,71 @@ def test_slot_restore_checkpoints_draft_kv_type_change(swa_server, ctkd_restore)
     })
     assert res.status_code == 200
     assert res.body["timings"]["prompt_n"] == n_live
+
+# the draft state appendix on top of upstream's test_slot_restore_draft_state: the byte counts, the place of the
+# appendix in the file, and a restore into a slot that still holds another conversation
+SLOT_DRAFT_MAGIC = struct.pack("<I", 0x54464453)  # "SDFT"
+
+
+def test_slot_save_restore_draft_state_appendix(swa_server):
+    server = swa_server
+    server.model_draft_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"  # the target's own file, already in the HF cache
+    server.spec_type = "draft-simple"
+    server.start()
+
+    filename = "draft_slot1.bin"
+    prompt = "The quick brown fox jumps over the lazy dog. " * 20
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 1,
+        "n_predict": 16,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    n_prompt = res.body["timings"]["prompt_n"]
+
+    res = server.make_request("POST", "/slots/1?action=save", data={"filename": filename})
+    assert res.status_code == 200
+    n_written = res.body["n_written"]
+
+    with open(os.path.join(server.slot_save_path, filename), "rb") as f:
+        data = f.read()
+    assert n_written == len(data)
+
+    # the appendix ends the file: read it at its offset and check that it stops exactly at EOF, so a stray
+    # "SDFT" inside the state payload cannot pass for it
+    offset = data.rfind(SLOT_DRAFT_MAGIC)
+    assert offset > 0
+    pos = offset + len(SLOT_DRAFT_MAGIC)
+    version, = struct.unpack_from("<I", data, pos)
+    assert version == 1
+    pos += 4
+    for _ in range(2):  # the draft context state, then the speculative state
+        n_buf, = struct.unpack_from("<Q", data, pos)
+        pos += 8 + n_buf
+    assert pos == len(data)
+
+    # the slot and its draft context hold another conversation when the file is restored
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "An entirely different conversation about the weather in the mountains. " * 20,
+        "id_slot": 1,
+        "n_predict": 16,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=restore", data={"filename": filename})
+    assert res.status_code == 200
+    assert res.body["n_read"] == n_written
+
+    # the continuation extends the restored prompt. A slot that kept the other conversation's draft state drafts
+    # at positions that are not consecutive, which answers 500 "failed to process speculative batch"
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt + " And then it rained for three days.",
+        "id_slot": 1,
+        "n_predict": 16,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] < n_prompt / 4
