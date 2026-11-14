@@ -1723,6 +1723,12 @@ static bool ggml_vk_matmul_int_shmem_support(const vk_device& device, const std:
     return supported;
 }
 
+// exact int8 views of the ternary types (TQ1_0, TQ2_0, Q2_0, PTQ1_0) on the int8 coopmat MMQ; GGML_VK_DISABLE_MMQ_I8VIEWS turns them off
+static bool ggml_vk_mmq_i8views_enabled() {
+    static const bool enabled = getenv("GGML_VK_DISABLE_MMQ_I8VIEWS") == nullptr;
+    return enabled;
+}
+
 static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
 
     bool kscales2 = false;    // two scale sets per block
@@ -1740,6 +1746,8 @@ static bool ggml_vk_matmul_cm1_int_shmem_support(const vk_device& device, const 
             kscales2 = true;                        break;
         case GGML_TYPE_NVFP4:
             kscales2 = true; has_kvalues = true;    break;
+        case GGML_TYPE_TQ1_0: case GGML_TYPE_TQ2_0: case GGML_TYPE_Q2_0: case GGML_TYPE_PTQ1_0:
+            break;
         default:
             return false;
     }
@@ -3005,6 +3013,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                            matmul_q8_0_q8_1_hcmix_d16_cm1_len, matmul_q8_0_q8_1_hcmix_d16_cm1_data, sizeof(vk_mat_mat_hcmix_push_constants), 4);
         }
 
+        // exact int8 views of the ternary types (GGML_VK_DISABLE_MMQ_I8VIEWS turns them off); RDNA3 only until RDNA4 is measured
+        if (device->coopmat_int_support && rdna3 && ggml_vk_mmq_i8views_enabled()) {
+            cm1_create_mmq({GGML_TYPE_TQ1_0, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int, "matmul_tq1_0_q8_1", matmul_tq1_0_q8_1_cm1_len, matmul_tq1_0_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_TQ2_0, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int, "matmul_tq2_0_q8_1", matmul_tq2_0_q8_1_cm1_len, matmul_tq2_0_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
+            cm1_create_mmq({GGML_TYPE_Q2_0,  GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int, "matmul_q2_0_q8_1",  matmul_q2_0_q8_1_cm1_len,  matmul_q2_0_q8_1_cm1_data,  sizeof(vk_mat_mat_push_constants), 3);
+#ifdef GGML_USE_TRELLIS
+            cm1_create_mmq({GGML_TYPE_PTQ1_0, GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int, "matmul_ptq1_0_q8_1", matmul_ptq1_0_q8_1_cm1_len, matmul_ptq1_0_q8_1_cm1_data, sizeof(vk_mat_mat_push_constants), 3);
+#endif
+        }
+
         GGML_ASSERT(device->subgroup_ballot);
 
         cm1_create({GGML_TYPE_F32, GGML_TYPE_F32, true, false}, tc_mm, "matmul_id_subgroup_f32_f32", matmul_id_subgroup_f32_f32_cm1_len, matmul_id_subgroup_f32_f32_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
@@ -3236,6 +3254,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         X_CM1_ID_D16(GGML_TYPE_IQ3_XXS, iq3_xxs)
         X_CM1_ID_D16(GGML_TYPE_IQ3_S,   iq3_s)
 #undef X_CM1_ID_D16
+
+        // ternary views on the MUL_MAT_ID int8 MMQ (no f16-output twins: these types had no MUL_MAT_ID+CPY(f16) fusion before)
+        if (device->coopmat_int_support && rdna3 && ggml_vk_mmq_i8views_enabled()) {
+            cm1_create_mmq({GGML_TYPE_TQ1_0, GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int, "matmul_id_subgroup_tq1_0_q8_1", matmul_id_subgroup_tq1_0_q8_1_cm1_len, matmul_id_subgroup_tq1_0_q8_1_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
+            cm1_create_mmq({GGML_TYPE_TQ2_0, GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int, "matmul_id_subgroup_tq2_0_q8_1", matmul_id_subgroup_tq2_0_q8_1_cm1_len, matmul_id_subgroup_tq2_0_q8_1_cm1_data, sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
+            cm1_create_mmq({GGML_TYPE_Q2_0,  GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int, "matmul_id_subgroup_q2_0_q8_1",  matmul_id_subgroup_q2_0_q8_1_cm1_len,  matmul_id_subgroup_q2_0_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_mmq_cm1_param_count);
+        }
     } else
 #endif  // defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     {
@@ -7827,6 +7852,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         if (src1->type == GGML_TYPE_F16 && !ggml_vk_dense_f16coopmat(src0->type, (uint32_t) ne10, (uint32_t) ne11, false)) {
             ggml_vk_path_census_add("MUL_MAT_F16B_NATIVE");
         }
+    }
+    // the Q2_0 / PTQ1_0 int8 views lose to the f16 tile below 64 columns (gfx1151 pp32: -9% / -31%), so small n stays there
+    if (can_quantize_y && !d16 && !hcm && ne11 < 64 && (src0->type == GGML_TYPE_Q2_0 || src0->type == GGML_TYPE_PTQ1_0) &&
+        ctx->device->coopmat_support && ctx->device->coopmat_int_support && ctx->device->architecture == AMD_RDNA3 && ggml_vk_mmq_i8views_enabled()) {
+        can_quantize_y = false;
     }
     // HC_UP_MIX on the dense q8_0 x f16 GEMM (mul_mm_dq8.comp): B (the low-rank activations, k = 320) is converted to f16 when it is
     // f32 (n x k, small) or read in place when it is an aligned f16, instead of quantized to q8_1

@@ -15912,8 +15912,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4, 509, 2051, {2, 1}, {1, 1}));
 
     // int8 MMQ with ragged M/N: M a multiple of 4 but not of the 16/32/64/128 tiles (packed rows end mid-tile),
-    // odd M (per-element fallback), N not a multiple of the tile width
-    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL}) {
+    // odd M (per-element fallback), N not a multiple of the tile width; the ternary int8 views also get the large tile with a long K
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_NL,
+                             GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, GGML_TYPE_Q2_0,
+#ifdef GGML_USE_TRELLIS
+                             GGML_TYPE_PTQ1_0,
+#endif
+                            }) {
         for (int m : {20, 36, 132, 199}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 67, 256, {1, 1}, {1, 1}));
         }
@@ -15921,7 +15926,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 20, 67, 256));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 4, false, 132, 129, 256));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 199, 67, 256));
+        if (type_a == GGML_TYPE_TQ1_0 || type_a == GGML_TYPE_TQ2_0 || type_a == GGML_TYPE_Q2_0 || type_a == GGML_TYPE_PTQ1_0) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 300, 2304, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 4, false, 256, 67, 2304));
+        }
     }
+    // Q2_0 (64-element blocks) with K = 64 x odd: the row ends mid 128-wide K step
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 128, 129, 192, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_0, GGML_TYPE_F32, 132, 67, 64 * 37, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 8, 4, false, 128, 129, 192));
 
 #if 0
     {

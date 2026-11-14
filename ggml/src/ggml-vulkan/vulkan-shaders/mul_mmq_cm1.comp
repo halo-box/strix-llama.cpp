@@ -155,7 +155,7 @@ shared float buf_b_s[BN * BK_STEP];
 shared int8_t cm1_kvalues[16];
 #endif
 
-#if defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS) || defined(DATA_A_NVFP4)
+#if defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS) || defined(DATA_A_NVFP4) || defined(DATA_A_Q2_0) || defined(DATA_A_PTQ1_0)
 #define LOAD_VEC_A 8
 #else
 #define LOAD_VEC_A (4 * QUANT_R)
