@@ -19027,7 +19027,7 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
 // once per rollback slot) need. The graph is unchanged: other backends run
 // the same nodes. The decision is made at the concat and consumed at its SSM_CONV, so both see one answer.
 
-// decode and short verify ubatches keep the concat: nothing to save there, and the reader scan stays off that path
+// decode and short verify ubatches keep the concat at dispatch: nothing to save there
 static constexpr int64_t ssm_conv_direct_min_tokens = 8;
 
 static bool ggml_vk_ssm_conv_direct_reject(const char * why, int node) {
@@ -19107,7 +19107,8 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
         tr->nb[0] != (size_t) C * sizeof(float) || tr->nb[1] != sizeof(float) || tr->nb[2] != (size_t) C * T * sizeof(float)) {
         return ggml_vk_ssm_conv_direct_reject("x layout", i);
     }
-    if (T < ssm_conv_direct_min_tokens) {
+    // gate the token count at dispatch only: alloc deps that depend on it change the graph topology per ubatch size
+    if (runtime && T < ssm_conv_direct_min_tokens) {
         return false;
     }
     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != S || st->ne[3] != 1 || !ggml_is_contiguous(st)) {
