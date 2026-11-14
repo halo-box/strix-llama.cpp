@@ -6214,8 +6214,12 @@ struct test_exl3_mul_mat : public test_case {
     const int     codebook;
     const std::array<int64_t, 2> ne_b;
     const bool    v; // x is a strided view
+    const int64_t x_off = 0; // x view offset in floats (v only)
 
     std::string vars() override {
+        if (x_off != 0) {
+            return VARS_TO_STR7(k, n, tile_words, codebook, ne_b, v, x_off);
+        }
         return VARS_TO_STR6(k, n, tile_words, codebook, ne_b, v);
     }
 
@@ -6224,8 +6228,8 @@ struct test_exl3_mul_mat : public test_case {
     }
 
     test_exl3_mul_mat(int64_t k = 256, int64_t n = 384, int64_t tile_words = 64, int codebook = 1,
-            std::array<int64_t, 2> ne_b = {5, 1}, bool v = false)
-        : k(k), n(n), tile_words(tile_words), codebook(codebook), ne_b(ne_b), v(v) {}
+            std::array<int64_t, 2> ne_b = {5, 1}, bool v = false, int64_t x_off = 0)
+        : k(k), n(n), tile_words(tile_words), codebook(codebook), ne_b(ne_b), v(v), x_off(x_off) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * trellis = ggml_new_tensor_3d(ctx, GGML_TYPE_I16, tile_words, n/16, k/16);
@@ -6240,7 +6244,7 @@ struct test_exl3_mul_mat : public test_case {
         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, v ? k + 64 : k, ne_b[0], ne_b[1]);
         ggml_set_name(x, "x");
         if (v) {
-            x = ggml_view_3d(ctx, x, k, ne_b[0], ne_b[1], x->nb[1], x->nb[2], 0);
+            x = ggml_view_3d(ctx, x, k, ne_b[0], ne_b[1], x->nb[1], x->nb[2], x_off*sizeof(float));
             ggml_set_name(x, "x_view");
         }
 
@@ -14613,6 +14617,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_exl3_mul_mat(4096, 12288, 64, 1, {33, 1}));
     test_cases.emplace_back(new test_exl3_mul_mat(12288, 4096, 64, 1, {33, 1}));
     test_cases.emplace_back(new test_exl3_mul_mat(384, 256, 64, 1, {513, 1}));
+    // every rate x codebook at 1 and 9 rows; every row-count edge of the dot kernel (1, 2, 4, 8 per pass, groups of 8)
+    // and of a prefill path at K = 4; shapes with one k-tile per wave or fewer, many k-tiles, odd segment counts
+    for (int64_t tw : {16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128}) {
+        for (int cb : {0, 1, 2}) {
+            if (tw % 16 != 0 && cb != 2) {
+                continue;
+            }
+            test_cases.emplace_back(new test_exl3_mul_mat(256, 256, tw, cb, {1, 1}));
+            test_cases.emplace_back(new test_exl3_mul_mat(256, 256, tw, cb, {9, 1}));
+            test_cases.emplace_back(new test_exl3_mul_mat(256, 256, tw, cb, {40, 1}));
+        }
+    }
+    for (int64_t rows : {2, 3, 4, 5, 8, 16, 31, 32, 33, 48, 64, 65, 127, 128, 129, 255, 511, 512, 513}) {
+        test_cases.emplace_back(new test_exl3_mul_mat(640, 384, 64, 1, {rows, 1}));
+    }
+    test_cases.emplace_back(new test_exl3_mul_mat(128, 128, 64, 1, {1, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(128, 128, 64, 1, {100, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(4096, 128, 48, 0, {3, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(4096, 128, 48, 0, {77, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(1152, 1408, 40, 2, {2, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(1152, 1408, 40, 2, {200, 1}));
+    test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {7, 1}, true, 3));
+    test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {70, 1}, true, 5));
+    test_cases.emplace_back(new test_exl3_mul_mat(256, 384, 64, 1, {33, 2}, true));
     for (int K : {1, 4, 8}) {
         test_cases.emplace_back(new test_exl3_get_rows(K, 4, 1000, 300, 17));
     }
@@ -14628,6 +14656,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // LFM2.5-8B-A1B down experts, per-slot x, on the dot path.
     test_cases.emplace_back(new test_exl3_mul_mat_id(1792, 2048, 32, 32, 2, 4, 4, 13));
     test_cases.emplace_back(new test_exl3_get_rows(3, 1, 256, 64, 512));
+    // EXL3 experts: more rates and codebooks on both sides of the dot / GEMM switch (8 rows per expert on average),
+    // 128 experts with 8 used (decode, MTP-sized, prompt), one expert
+    for (auto [tile_words, codebook] : std::vector<std::pair<int64_t, int>>{{16, 0}, {24, 2}, {48, 1}, {80, 0}, {112, 1}, {128, 2}}) {
+        test_cases.emplace_back(new test_exl3_mul_mat_id(256, 256, 8, tile_words, codebook, 2, 1, 1));
+        test_cases.emplace_back(new test_exl3_mul_mat_id(256, 256, 8, tile_words, codebook, 2, 2, 9));
+        test_cases.emplace_back(new test_exl3_mul_mat_id(256, 256, 8, tile_words, codebook, 2, 1, 60));
+    }
+    for (int64_t n_tokens : {1, 3, 8, 33, 200, 512}) {
+        test_cases.emplace_back(new test_exl3_mul_mat_id(512, 768, 128, 64, 1, 8, n_tokens % 2 ? 1 : 8, n_tokens));
+    }
+    test_cases.emplace_back(new test_exl3_mul_mat_id(384, 256, 1, 64, 1, 1, 1, 100));
+    test_cases.emplace_back(new test_exl3_mul_mat_id(384, 256, 1, 64, 1, 1, 1, 5));
+    // the dot / GEMM switch at 8 rows per expert (128 x 8 pairs), and 2 and 4 rows per expert on the dot path, at an
+    // expert shape of 2048 x 768
+    for (int64_t n_tokens : {32, 64, 128, 129}) {
+        test_cases.emplace_back(new test_exl3_mul_mat_id(2048, 768, 128, 64, 1, 8, 8, n_tokens));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -18632,6 +18677,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // EXL3 Qwen3.5-4B ffn_up (K = 4, mcg) at decode and ubatch rows
     for (int64_t rows : { 1, 512 }) {
         test_cases.emplace_back(new test_exl3_mul_mat(2560, 9216, 64, 1, {rows, 1}));
+    }
+    // EXL3 Qwen3.5-9B ffn (K = 4, mcg) and the q4_K mat-mul of the same shapes, decode, MTP-sized and ubatch rows
+    for (int64_t rows : { 1, 4, 8, 16, 32, 33, 64, 128, 512 }) {
+        test_cases.emplace_back(new test_exl3_mul_mat(4096, 12288, 64, 1, {rows, 1}));
+        test_cases.emplace_back(new test_exl3_mul_mat(12288, 4096, 64, 1, {rows, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 12288, rows, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, rows, 12288, {1, 1}, {1, 1}));
     }
 
     return test_cases;

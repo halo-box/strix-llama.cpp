@@ -67,6 +67,7 @@ if (Vulkan_FOUND)
                              ggml-vulkan-common.h
                              ggml-vulkan-buffers.cpp
                              ggml-vulkan-debug.cpp
+                             ggml-vulkan-exl3.cpp
                             )
 
     # hide symbols, so dlclosed duplicate copies cannot interpose them
@@ -120,6 +121,11 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+
+    # EXL3 (exllamav3) linears, see ggml/exl3/README.md
+    if (GGML_EXL3)
+        target_compile_definitions(ggml-vulkan PRIVATE GGML_USE_EXL3)
+    endif()
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
@@ -154,6 +160,12 @@ if (Vulkan_FOUND)
         list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_TRELLIS=ON)
     else()
         list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_TRELLIS=OFF)
+    endif()
+    # same for the EXL3 SPIR-V
+    if (GGML_EXL3)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_EXL3=ON)
+    else()
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_EXL3=OFF)
     endif()
 
     if (GGML_VULKAN_VALIDATE)

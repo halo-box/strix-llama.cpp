@@ -5036,6 +5036,56 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+#if defined(GGML_USE_EXL3)
+    // EXL3 linears: wave32 kernels (see ggml_vk_exl3_device_ok)
+    if (ggml_vk_exl3_device_ok(device)) {
+        ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate, "exl3_rotate_f32", exl3_rotate_f32_len, exl3_rotate_f32_data,
+            "main", 4, sizeof(vk_op_exl3_rotate_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate_split, "exl3_rotate_split_f32", exl3_rotate_split_f32_len,
+            exl3_rotate_split_f32_data, "main", 5, sizeof(vk_op_exl3_rotate_split_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_exl3_route, "exl3_route_f32", exl3_route_f32_len, exl3_route_f32_data,
+            "main", 4, sizeof(vk_op_exl3_route_push_constants), {1, 1, 1}, {}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate_id, "exl3_rotate_id_f32", exl3_rotate_id_f32_len,
+            exl3_rotate_id_f32_data, "main", 6, sizeof(vk_op_exl3_rotate_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_exl3_rotate_split_id, "exl3_rotate_split_id_f32", exl3_rotate_split_id_f32_len,
+            exl3_rotate_split_id_f32_data, "main", 7, sizeof(vk_op_exl3_rotate_split_push_constants), {1, 1, 1}, {}, 1, true, true, 32);
+        static const uint32_t exl3_m[4] = { 1, 2, 4, 8 };
+        for (uint32_t ri = 0; ri < 11; ++ri) {
+            const uint32_t ka   = ri < 8 ? ri + 1 : ri - 7;
+            const uint32_t half = ri < 8 ? 0 : 1;
+            for (uint32_t cb = 0; cb < 3; ++cb) {
+                if (half && cb != 2) {
+                    continue;
+                }
+                for (uint32_t mi = 0; mi < 4; ++mi) {
+                    const std::string name = "exl3_mmv_k" + std::to_string(ka) + (half ? "h" : "") + "_cb" + std::to_string(cb) +
+                                             "_m" + std::to_string(exl3_m[mi]);
+                    ggml_vk_create_pipeline2(device, device->pipeline_exl3_mmv[ri][cb][mi], name, exl3_mul_mat_vec_f32_len,
+                        exl3_mul_mat_vec_f32_data, "main", 5, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                        {256, ka, half, cb, exl3_m[mi]}, 1, true, true, 32);
+                    ggml_vk_create_pipeline2(device, device->pipeline_exl3_mmv_id[ri][cb][mi], name + "_id", exl3_mul_mat_vec_id_f32_len,
+                        exl3_mul_mat_vec_id_f32_data, "main", 7, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                        {256, ka, half, cb, exl3_m[mi]}, 1, true, true, 32);
+                }
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+                if (ggml_vk_exl3_device_cm1(device)) {
+                    for (uint32_t pi = 0; pi < 2; ++pi) {
+                        const std::string name = "exl3_mm_k" + std::to_string(ka) + (half ? "h" : "") + "_cb" + std::to_string(cb) +
+                                                 "_p" + std::to_string(pi + 1);
+                        ggml_vk_create_pipeline2(device, device->pipeline_exl3_mm[ri][cb][pi], name, exl3_mul_mm_cm1_len,
+                            exl3_mul_mm_cm1_data, "main", 6, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                            {EXL3_MM_ROWS*2, ka, half, cb, pi + 1}, 1, true, true, 32);
+                        ggml_vk_create_pipeline2(device, device->pipeline_exl3_mm_id[ri][cb][pi], name + "_id", exl3_mul_mm_id_cm1_len,
+                            exl3_mul_mm_id_cm1_data, "main", 8, sizeof(vk_op_exl3_mmv_push_constants), {1, 1, 1},
+                            {EXL3_MM_ROWS*2, ka, half, cb, pi + 1}, 1, true, true, 32);
+                    }
+                }
+#endif
+            }
+        }
+    }
+#endif
+
     // Drop compile_mutex so other threads can walk while we compile.
     compile_lock.unlock();
 
@@ -14005,6 +14055,7 @@ static bool ggml_vk_gdn_chunk_ok(const ggml_backend_vk_context * ctx, const ggml
            k->nb[1] == q->nb[1] && k->nb[2] == q->nb[2] && k->nb[3] == q->nb[3] && v->ne[1] % q->ne[1] == 0;
 }
 
+
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     // q/k l2 norms folded into the chunk prep (ggml_vk_gdn_qk_norm_prepass): read the raw views
     const auto qk_it = ctx->gdn_qk.find(dst);
@@ -16904,6 +16955,16 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
 
+#if defined(GGML_USE_EXL3)
+    case GGML_OP_EXL3_MUL_MAT:
+        ggml_vk_exl3_mul_mat(ctx, compute_ctx, node);
+
+        break;
+    case GGML_OP_EXL3_MUL_MAT_ID:
+        ggml_vk_exl3_mul_mat_id(ctx, compute_ctx, node);
+
+        break;
+#endif
     case GGML_OP_GATED_DELTA_NET:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
 
@@ -22730,6 +22791,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return true;
             }
+#if defined(GGML_USE_EXL3)
+        case GGML_OP_EXL3_MUL_MAT:
+            return ggml_vk_exl3_supports_op(device, op);
+        case GGML_OP_EXL3_MUL_MAT_ID:
+            return ggml_vk_exl3_mul_mat_id_supports_op(device, op);
+#endif
         case GGML_OP_GATED_DELTA_NET:
             {
                 const uint32_t S_v = op->src[2]->ne[0];
