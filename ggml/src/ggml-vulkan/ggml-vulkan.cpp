@@ -3070,6 +3070,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const std::string mmid_mf_sfx = mmid_mf ? "_mf" : "";
             static const bool mf_skew = [] { const char * e = getenv("GGML_VK_TEST_MF_SKEW"); return e && atoi(e) != 0; }();
 #define MMID_MF_SPV(base, acc) (mmid_mf ? base##_mf##acc##_cm1_len : base##acc##_cm1_len), (mmid_mf ? base##_mf##acc##_cm1_data : base##acc##_cm1_data)
+            // set around the TQ2_T X_CM1_ID_PF call: those pf pipelines get spec constant 17 = 0
+            bool pf_b_full_off = false;
             // GGML_VK_MMID_B_FULL_LOG=1: per MUL_MAT_ID pf / REG_A tile, whether the shader's B_FULL condition (BN % loadstride_b == 0,
             // loadstride_b = BLOCK_SIZE * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK as in mul_mm.comp) holds, so it drops the guard, or keeps it
             auto b_full_log = [&](const std::vector<uint32_t>& wt, bool a) {
@@ -3086,8 +3088,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 if (spec.size() == 12) { spec.push_back(ggml_vk_coopmat_shmem_pad(device, wt[3])); spec.push_back(0); }   // 12, 13
                 while (spec.size() < 16) { spec.push_back(0); }                                                           // 14, 15 (REG_A off)
                 spec.push_back(mf_skew ? 1u : 0u);                                                                          // 16: MF_SKEW
-                spec.push_back(1u);                                                                                         // 17: MMID_B_FULL
-                b_full_log(wt, a);
+                spec.push_back(pf_b_full_off ? 0u : 1u);                                                                    // 17: MMID_B_FULL
+                if (!pf_b_full_off) { b_full_log(wt, a); }
                 return spec;
             };
             auto cm1_create_mmid_pf = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
@@ -3125,6 +3127,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             X_CM1_ID_PF(GGML_TYPE_IQ4_XS, iq4_xs)
             X_CM1_ID_PF(GGML_TYPE_IQ3_XXS, iq3_xxs)
             X_CM1_ID_PF(GGML_TYPE_IQ4_NL, iq4_nl)
+#ifdef GGML_USE_TRELLIS
+            // TQ2_T: MUL_MAT_ID only, built without MMID_B_FULL. The full-tile B load and the unguarded warp columns cost this tile
+            // more than they save: 512 experts / top 10, gate/up M 640 K 2560, down M 2560 K 640, 2048-token ubatch, gfx1151 RADV:
+            // gate/up 8.98 -> 7.67 ms, down 5.28 -> 4.78 ms per layer without them. Measure again when the pf B load changes.
+            pf_b_full_off = true;
+            X_CM1_ID_PF(GGML_TYPE_TQ2_T, tq2_t)
+            pf_b_full_off = false;
+#endif
 #undef X_CM1_ID_PF
             // REG_A tile for the aligned iq3_xxs / iq4_nl MUL_MAT_ID pf pipelines (keyed xl = true on the id keys): 128 threads
             // = 4 wave32 subgroups, BM 128 x BN 64, each subgroup owns WM 32 rows and all 64 columns; spec constant 15 = 3
@@ -7686,6 +7696,13 @@ static bool ggml_vk_mm_prefetch_type(ggml_type t) {
         case GGML_TYPE_Q8_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q3_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K:
         case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ4_NL:
             return true;
+#ifdef GGML_USE_TRELLIS
+        // TQ2_T takes the register-prefetch tile (mul_mm_pf_funcs.glsl) and its f16-output twin for MUL_MAT_ID only, so
+        // MUL_MAT_ID(+MUL)+CPY(f16) fuses as on the routed f16-B types. No dense TQ2_T pf pipeline is built, so dense TQ2_T
+        // falls through to the generic tiles.
+        case GGML_TYPE_TQ2_T:
+            return true;
+#endif
         default:
             return false;
     }
@@ -7712,6 +7729,12 @@ static bool ggml_vk_dense_f16coopmat(ggml_type t, uint32_t k, uint32_t n, bool b
 // the Flash-Next expert types (iq3_xxs, iq4_nl) leave int8 MMQ for the f16-B pf tile, which carries REG_A, the f16-output expert
 // store and MMID_B_FULL
 static bool ggml_vk_mmid_f16coopmat(ggml_type t) {
+#ifdef GGML_USE_TRELLIS
+    // TQ2_T has no int8 MMQ: its MUL_MAT_ID always takes the f16-B pf tile
+    if (t == GGML_TYPE_TQ2_T) {
+        return true;
+    }
+#endif
     return t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ4_NL;
 }
 
@@ -9687,7 +9710,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_path_census_add((std::string("MUL_MAT_ID_ALL:") + ggml_type_name(src0->type)).c_str());
         if (pipeline->name.find("_pf") != std::string::npos) {
             ggml_vk_path_census_add("MUL_MAT_ID_PF");
-            ggml_vk_path_census_add("MUL_MAT_ID_B_FULL");   // the pf / REG_A pipelines were built with spec constant 17 set
+            if (src0->type != GGML_TYPE_TQ2_T) {
+                ggml_vk_path_census_add("MUL_MAT_ID_B_FULL");   // the pf / REG_A pipelines were built with spec constant 17 set
+            }
             ggml_vk_path_census_add((std::string("MUL_MAT_ID_PF:") + ggml_type_name(src0->type)).c_str());
             if (pipeline->name.find("_mf") != std::string::npos) {
                 ggml_vk_path_census_add("MUL_MAT_ID_MANUAL_FRAG");
