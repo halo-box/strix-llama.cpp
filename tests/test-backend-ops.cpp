@@ -15775,6 +15775,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_I32, {256, 1, 4, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 0, 0, 0}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {256, 1, 4, 1}, {-1,-1,-1,-1}, {1, 2, 0, 3}, {0, 0, 0, 0}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {2, 2097121, 1, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {1, 64, 48, 1}, {-1,-1,-1,-1}, {0, 2, 1, 3})); // ne[0] == 1 permute
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {1, 64, 48, 1}, {-1,-1,-1,-1}, {0, 2, 1, 3})); // ne[0] == 1 permute
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {2, 2, 524281, 1}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
@@ -15840,6 +15842,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // source strides over 16 MB (24-bit DMA descriptor limit)
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {512, 8193, 2, 1}, false, {2, 1, 0, 3}));
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {256, 16385, 2, 1}, false, {0, 2, 1, 3}));
+
+    // channel swap with sizes not multiples of 32/64 tile
+    for (ggml_type type_dst : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        test_cases.emplace_back(new test_cont(type_dst, {33, 17, 5, 19}, false, {1, 2, 3, 0}));
+    }
+
+    // small channel dims and extent-1 dims
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {8, 104, 60, 13}, false, {1, 2, 3, 0}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F16, {8, 104, 60, 13}, false, {1, 2, 3, 0}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {16, 1, 50, 7}, false, {1, 2, 3, 0}));
+
+    // full reversal: contiguous src dim lands on dst dim 3
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {33, 5, 7, 9}, false, {3, 2, 1, 0}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {33, 64, 32, 16}, false, {3, 2, 1, 0}));
+
+    // permutes that move dense blocks (ne[0] stays dim 0)
+    for (ggml_type type_dst : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        test_cases.emplace_back(new test_cont(type_dst, {4, 65, 9, 2}, false, {0, 2, 1, 3}));
+    }
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F16, {64, 9, 7, 1}, false, {0, 2, 1, 3}));
+
+    // transpose with i32 and CPY with reshape
+    test_cases.emplace_back(new test_cont(GGML_TYPE_I32, {33, 17, 5, 19}, false, {1, 2, 3, 0}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {33, 17, 5, 1}, {17, 33, 5, 1}, {0, 0, 0, 0}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {8, 52, 39, 1}, {8, 39, 52, 1}, {0, 0, 0, 0}, {0, 2, 1, 3}));
 
     auto add_test_bin_bcast = [&](ggml_type type, std::array<int64_t, 4> ne, std::array<int, 4> nr, bool perm1 = false, bool src_overlap = false) {
         for (auto op : {ggml_add, ggml_sub, ggml_mul, ggml_div}) {
@@ -17700,6 +17727,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
     test_cases.emplace_back(new test_arange());
+    test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 3.0f, 3.5f, 1.0f));
+    test_cases.emplace_back(new test_arange(GGML_TYPE_F32, -10.0f, 10.0f, 0.3f));
+    for (float n : {255.0f, 256.0f, 257.0f, 1023.0f, 1024.0f, 1025.0f}) {
+        test_cases.emplace_back(new test_arange(GGML_TYPE_F32, -1.0f, -1.0f + n * 0.25f, 0.25f));
+    }
     test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, 1048576.0f, 1.0f));
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_leaky_relu());
@@ -18619,6 +18651,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
         test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n, 640, 1, true));
     }
+    for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
+        test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
+    }
+
     // delta-net conv input: conv state followed by the transposed qkv of the ubatch
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 
