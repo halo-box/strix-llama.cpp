@@ -232,7 +232,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // final mixer and the LM head to the target model it is loaded against (ctx_other)
     const bool mtp_only    = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr;
 
-    // a file from the upstream converter merges the weights that read the same input: read them as the separate ones
     auto split_merged = [&](int il) {
         const int64_t n_v_heads = hparams.ssm_dt_rank;
         const int64_t qkv_dim   = hparams.ssm_d_state * (hparams.ssm_n_group * 2 + n_v_heads);
@@ -245,6 +244,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         ml.split_weight(tn(LLM_TENSOR_SSM_BETA_ALPHA_CAT, "weight", il).str(), tn(LLM_TENSOR_SSM_BETA, "weight", il).str(), n_v_heads,
                 tn(LLM_TENSOR_SSM_ALPHA, "weight", il).str());
     };
+    for (int il = 0; il < n_layer + (int) hparams.n_layer_nextn; ++il) {
+        split_merged(il);
+    }
     const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
@@ -344,8 +346,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const int64_t value_dim  = head_v_dim * n_v_heads;
         const int64_t conv_dim   = key_dim * 2 + value_dim;
 
-        split_merged(il);
-
         // two HC modules per layer: before the token mixer, before the MoE
         layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | trunk_flags);
         layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, trunk_flags);
@@ -405,8 +405,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         auto & layer = layers[il];
 
         const int flags = ml.load_mtp ? 0 : TENSOR_SKIP;
-
-        split_merged(il);
 
         const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
