@@ -352,12 +352,13 @@ public:
 // the mask has two shapes depending on whether `rows` is used:
 //   rows != nullptr: [n_kv_rows, n_batch/n_slices, 1, n_slices]
 //   rows == nullptr: [n_kv,      n_batch/n_stream, 1, n_stream]
-// TODO: cnv is redundant (always aliases raw) except dflash overwrites it with a derived block mask [TAG_ATTN_MASK_CNV]
 struct llm_attn_mask {
     ggml_tensor * raw  = nullptr;
-    ggml_tensor * cnv  = nullptr; // same shape
     ggml_tensor * rows = nullptr; // I32 [n_kv_rows, n_slices]
     uint32_t      n_kv = 0;
+
+    // fill every token of a sequence with the mask row of its first token (dspark draft blocks)
+    bool block_uniform = false;
 };
 
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
@@ -397,7 +398,7 @@ public:
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
-    ggml_tensor * get_kq_mask() const { return self_attn_mask.cnv; }
+    ggml_tensor * get_kq_mask() const { return self_attn_mask.raw; }
 
     // the graph marks its attention with the causal-prefix hint, so a reuse needs the same answer
     bool can_reuse_causal_prefix(const llama_kv_cache_context * mctx, const llm_graph_params & params) const;
