@@ -231,6 +231,20 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // An MTP-only file carries just the draft block; a "shared" one also leaves the token embeddings, the
     // final mixer and the LM head to the target model it is loaded against (ctx_other)
     const bool mtp_only    = hparams.n_layer_nextn > 0 && ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr;
+
+    // a file from the upstream converter merges the weights that read the same input: read them as the separate ones
+    auto split_merged = [&](int il) {
+        const int64_t n_v_heads = hparams.ssm_dt_rank;
+        const int64_t qkv_dim   = hparams.ssm_d_state * (hparams.ssm_n_group * 2 + n_v_heads);
+        ml.split_weight(tn(LLM_TENSOR_HC_ATTN_DOWN_INJECT, "weight", il).str(), tn(LLM_TENSOR_HC_ATTN_DOWN, "weight", il).str(), hc_lr,
+                tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il).str());
+        ml.split_weight(tn(LLM_TENSOR_HC_FFN_DOWN_INJECT, "weight", il).str(), tn(LLM_TENSOR_HC_FFN_DOWN, "weight", il).str(), hc_lr,
+                tn(LLM_TENSOR_HC_FFN_INJECT, "weight", il).str());
+        ml.split_weight(tn(LLM_TENSOR_ATTN_QKV_GATE, "weight", il).str(), tn(LLM_TENSOR_ATTN_QKV, "weight", il).str(), qkv_dim,
+                tn(LLM_TENSOR_ATTN_GATE, "weight", il).str());
+        ml.split_weight(tn(LLM_TENSOR_SSM_BETA_ALPHA_CAT, "weight", il).str(), tn(LLM_TENSOR_SSM_BETA, "weight", il).str(), n_v_heads,
+                tn(LLM_TENSOR_SSM_ALPHA, "weight", il).str());
+    };
     const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
@@ -330,6 +344,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         const int64_t value_dim  = head_v_dim * n_v_heads;
         const int64_t conv_dim   = key_dim * 2 + value_dim;
 
+        split_merged(il);
+
         // two HC modules per layer: before the token mixer, before the MoE
         layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | trunk_flags);
         layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, trunk_flags);
@@ -389,6 +405,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         auto & layer = layers[il];
 
         const int flags = ml.load_mtp ? 0 : TENSOR_SKIP;
+
+        split_merged(il);
 
         const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
@@ -816,7 +834,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  w_down_inject,
         ggml_tensor ** inject,
         int            il) {
-    // the qwen4exp loader reads the separate hc down / inject weights only (see load_arch_tensors)
+    // the loader splits a merged hc down / inject weight into the separate ones (see load_arch_tensors)
     GGML_ASSERT(w_down_inject == nullptr);
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;

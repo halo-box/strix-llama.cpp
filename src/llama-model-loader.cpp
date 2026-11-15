@@ -1105,6 +1105,32 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
     return *weight;
 }
 
+void llama_model_loader::split_weight(const std::string & merged, const std::string & name_a, int64_t n_a, const std::string & name_b) {
+    const auto it = weights_map.find(merged);
+    if (it == weights_map.end() || weights_map.count(name_a) > 0 || weights_map.count(name_b) > 0) {
+        return;
+    }
+    const ggml_tensor * t = it->second.tensor;
+    if (ggml_n_dims(t) > 2 || n_a <= 0 || n_a >= t->ne[1]) {
+        throw std::runtime_error(format("%s: merged weight '%s' %s cannot hold %" PRId64 " rows of '%s'",
+                __func__, merged.c_str(), llama_format_tensor_shape(t).c_str(), n_a, name_a.c_str()));
+    }
+
+    ggml_init_params params = { 2*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    contexts.emplace_back(ctx);
+
+    llama_tensor_weight w = it->second;
+    weights_map.erase(it);
+    for (const auto & [name, n_rows] : { std::make_pair(name_a, n_a), std::make_pair(name_b, t->ne[1] - n_a) }) {
+        w.tensor = ggml_new_tensor_2d(ctx, t->type, t->ne[0], n_rows);
+        ggml_set_name(w.tensor, name.c_str());
+        weights_map.emplace(name, w);
+        w.offs += ggml_nbytes(w.tensor);
+    }
+    n_tensors++;
+}
+
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
     const auto * weight = get_weight(name);
     if (!weight) {

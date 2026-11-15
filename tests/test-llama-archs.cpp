@@ -9,6 +9,7 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -19,6 +20,7 @@
 #include <memory>
 #include <random>
 #include <regex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -177,6 +179,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on CPU and on the first ROCm and Vulkan devices\n");
+    LOG("  --qwen4exp-merged       Test that a Qwen4Exp file with merged shared-input weights gives the logits of the separate weights\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
@@ -1132,6 +1135,76 @@ static bool check_causal_attn_toggle(
     return ok;
 }
 
+// a qwen4exp file whose shared-input weights are merged as the upstream converter writes them gives the same logits
+static int test_qwen4exp_merged(const size_t seed, const float stdev) {
+    gguf_context_ptr meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    llama_model_ptr model = get_model(meta.get(), nullptr, seed, stdev, {});
+    const std::string path_sep = get_tmp_gguf_path();
+    const std::string path_mrg = get_tmp_gguf_path();
+    llama_model_save_to_file(model.get(), path_sep.c_str());
+    model.reset();
+
+    ggml_context * ctx_data = nullptr;
+    gguf_context_ptr in(gguf_init_from_file(path_sep.c_str(), { false, &ctx_data }));
+    GGML_ASSERT(in && ctx_data != nullptr);
+    ggml_context_ptr ctx_data_ptr(ctx_data);
+    ggml_context_ptr ctx_mrg(ggml_init({ ggml_get_mem_size(ctx_data), nullptr, false }));
+
+    const std::vector<std::array<const char *, 3>> merges = {
+        {{ "hc_attn_down", "hc_attn_inject", "hc_attn_down_inject" }},
+        {{ "hc_ffn_down",  "hc_ffn_inject",  "hc_ffn_down_inject"  }},
+        {{ "attn_qkv",     "attn_gate",      "attn_qkv_gate"       }},
+        {{ "ssm_beta",     "ssm_alpha",      "ssm_beta_alpha"      }},
+    };
+    gguf_context_ptr out(gguf_init_empty());
+    gguf_set_kv(out.get(), in.get());
+    std::set<std::string> merged_parts;
+    int n_merged = 0;
+    for (int64_t i = 0; i < gguf_get_n_tensors(in.get()); i++) {
+        const std::string name = gguf_get_tensor_name(in.get(), i);
+        if (merged_parts.count(name) > 0) {
+            continue;
+        }
+        ggml_tensor * t = ggml_get_tensor(ctx_data, name.c_str());
+        int il = -1;
+        char part[64] = {};
+        if (sscanf(name.c_str(), "blk.%d.%63[a-z_].weight", &il, part) == 2) {
+            for (const auto & m : merges) {
+                ggml_tensor * b = ggml_get_tensor(ctx_data, string_format("blk.%d.%s.weight", il, m[1]).c_str());
+                if (strcmp(part, m[0]) != 0 || b == nullptr) {
+                    continue;
+                }
+                ggml_tensor * ab = ggml_new_tensor_2d(ctx_mrg.get(), t->type, t->ne[0], t->ne[1] + b->ne[1]);
+                ggml_set_name(ab, string_format("blk.%d.%s.weight", il, m[2]).c_str());
+                memcpy(ab->data, t->data, ggml_nbytes(t));
+                memcpy((char *) ab->data + ggml_nbytes(t), b->data, ggml_nbytes(b));
+                merged_parts.insert(ggml_get_name(b));
+                t = ab;
+                n_merged++;
+                break;
+            }
+        }
+        gguf_add_tensor(out.get(), t);
+    }
+    GGML_ASSERT(n_merged > 0);
+    gguf_write_to_file(out.get(), path_mrg.c_str(), false);
+
+    std::vector<std::vector<float>> logits;
+    for (const std::string & path : { path_sep, path_mrg }) {
+        FILE * file = fopen(path.c_str(), "rb");
+        GGML_ASSERT(file != nullptr);
+        auto mc = get_model_and_ctx(nullptr, file, seed, stdev, {});
+        const std::vector<llama_token> tokens = get_tokens(16, llama_vocab_n_tokens(llama_model_get_vocab(mc.first.get())), seed);
+        logits.push_back(get_logits(mc.first.get(), mc.second.get(), tokens));
+        fclose(file);
+        std::filesystem::remove(path);
+    }
+    GGML_ASSERT(logits[0].size() == logits[1].size());
+    GGML_ASSERT(memcmp(logits[0].data(), logits[1].data(), logits[0].size()*sizeof(float)) == 0);
+    LOG("PASS: Qwen4Exp with %d merged shared-input weights gives the logits of the separate weights\n", n_merged);
+    return 0;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_FLINT:
@@ -1943,6 +2016,7 @@ int main(int argc, char ** argv) {
     std::string out;
     const char * target_backend = nullptr;
     bool mtp_cache_only = false;
+    bool qwen4exp_merged = false;
     bool kv_shift = false;
 
     int verbosity = LOG_LEVEL_ERROR;
@@ -1972,6 +2046,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--mtp-cache-only") == 0) {
             mtp_cache_only = true;
+        } else if (strcmp(argv[i], "--qwen4exp-merged") == 0) {
+            qwen4exp_merged = true;
         } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--seed") == 0) {
             if (i + 1 < argc) {
                 seed = std::stoull(argv[++i]);
@@ -2032,6 +2108,9 @@ int main(int argc, char ** argv) {
     try {
         if (mtp_cache_only) {
             return test_mtp_cache_only(seed, stdev);
+        }
+        if (qwen4exp_merged) {
+            return test_qwen4exp_merged(seed, stdev);
         }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);

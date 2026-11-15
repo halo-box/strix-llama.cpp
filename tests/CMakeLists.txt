@@ -236,6 +236,7 @@ endif()
 
 llama_build(test-llama-archs.cpp)
 llama_test(test-llama-archs NAME test-qwen4exp-mtp-cache-only ARGS --mtp-cache-only -s 1234)
+llama_test(test-llama-archs NAME test-qwen4exp-merged-weights ARGS --qwen4exp-merged -s 1234)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
