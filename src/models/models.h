@@ -1360,24 +1360,33 @@ struct llama_model_deepseek4 : public llama_model_base {
         // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
         ggml_tensor * build_hc_mean(ggml_tensor * x) const;
 
-        // returns the collapsed input and fills the post / comb weights
-        ggml_tensor * build_hc_pre(
+        // all outputs of the hc mix builders:
+        //   build_hc_pre   - cur is the collapsed input, post / comb feed build_hc_post
+        //   build_hc_mixes - pre is the pre weights, post / comb feed build_hc_post
+        struct hc_pre {
+            ggml_tensor * cur;
+            ggml_tensor * post;
+            ggml_tensor * comb;
+        };
+
+        struct hc_mixes {
+            ggml_tensor * pre;
+            ggml_tensor * post;
+            ggml_tensor * comb;
+        };
+
+        hc_pre build_hc_pre(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base,
-                ggml_tensor ** post,
-                ggml_tensor ** comb,
                 int il) const;
 
-        // returns the pre weights and fills post / comb
-        ggml_tensor * build_hc_mixes(
+        hc_mixes build_hc_mixes(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base,
-                ggml_tensor ** post,
-                ggml_tensor ** comb,
                 int il) const;
 
         ggml_tensor * build_hc_post(
@@ -2265,12 +2274,16 @@ struct llama_model_hy_v4 : public llama_model_base {
         // iHC (independent Hyper-Connections): pre reduces the hc streams to one and returns the
         // per-stream post gates, post writes the sublayer output back into the streams, head
         // collapses the streams before the final norm.
-        ggml_tensor * build_hc_pre(
+        struct hc_pre {
+            ggml_tensor * cur;   // the collapsed stream
+            ggml_tensor * post;  // per-stream post gates, feeds build_hc_post
+        };
+
+        hc_pre build_hc_pre(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base,
-                ggml_tensor ** post,
                 int il) const;
 
         ggml_tensor * build_hc_post(
@@ -2303,12 +2316,18 @@ struct llama_model_hy_v4 : public llama_model_base {
                 ggml_tensor * inp_pos,
                 int il) const;
 
-        ggml_tensor * build_attention_dsa(
+        // the attention output and the top-k to carry to the following "shared" layers
+        struct attn_dsa {
+            ggml_tensor * cur;
+            ggml_tensor * top_k;
+        };
+
+        attn_dsa build_attention_dsa(
                 const llama_model & model,
                 llm_graph_input_attn_k_dsa * inp_attn_dsa,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                ggml_tensor ** last_top_k,
+                ggml_tensor * last_top_k,
                 float kq_scale,
                 int il) const;
     };
@@ -3020,14 +3039,18 @@ struct llama_model_glm5_next : public llama_model_base {
         // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
         ggml_tensor * build_hc_mean(ggml_tensor * x) const;
 
-        // returns the collapsed input and fills the post / comb weights
-        ggml_tensor * build_hc_pre(
+        // all outputs of the hc mix builder: cur is the collapsed input, post / comb feed build_hc_post
+        struct hc_pre {
+            ggml_tensor * cur;
+            ggml_tensor * post;
+            ggml_tensor * comb;
+        };
+
+        hc_pre build_hc_pre(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base,
-                ggml_tensor ** post,
-                ggml_tensor ** comb,
                 int il) const;
 
         ggml_tensor * build_hc_post(
@@ -3053,9 +3076,15 @@ struct llama_model_glm5_next : public llama_model_base {
         ggml_tensor * build_kpool_select(ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
                                          const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il);
 
-        ggml_tensor * build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
-                                      const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
-                                      llm_graph_input_kpool * inp_kpool, ggml_tensor ** prev_sel, int il);
+        // attention output (cur) and the selection to carry to the next shared layer (sel)
+        struct dsa_out {
+            ggml_tensor * cur;
+            ggml_tensor * sel;
+        };
+
+        dsa_out build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
+                                const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
+                                llm_graph_input_kpool * inp_kpool, ggml_tensor * prev_sel, int il);
 
     };
 
