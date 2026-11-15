@@ -405,10 +405,13 @@ static void ggml_cuda_mul_mat_q_impl(
 
     // Fused gate/up/GLU: src0 is the up weight, dst the GLU output.
     const ggml_tensor * fusion_gate = fusion ? fusion->gate : nullptr;
+    ggml_cuda_mm_fusion_args_device fusion_device = {};
     if (fusion) {
-        // TODO MoE support
-        GGML_ASSERT(fusion_gate && !ids && !swiglu && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
+        GGML_ASSERT(fusion_gate && !swiglu && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
         GGML_ASSERT(fusion_gate->type == src0->type && ggml_are_same_shape(fusion_gate, src0) && ggml_are_same_stride(fusion_gate, src0));
+        fusion_device.gate      = fusion_gate->data;
+        fusion_device.glu_op    = fusion->glu_op;
+        fusion_device.glu_limit = fusion->glu_limit;
     }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
@@ -546,13 +549,6 @@ static void ggml_cuda_mul_mat_q_impl(
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
-        ggml_cuda_mm_fusion_args_device fusion_device = {};
-        if (fusion_gate) {
-            fusion_device.gate      = fusion_gate->data;
-            fusion_device.glu_op    = fusion->glu_op;
-            fusion_device.glu_limit = fusion->glu_limit;
-        }
-
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
@@ -647,7 +643,7 @@ static void ggml_cuda_mul_mat_q_impl(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, J_best};
+        ne12, J_best, fusion_device};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
