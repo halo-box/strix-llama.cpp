@@ -3312,7 +3312,7 @@ uint32_t llama_context::graph_max_nodes() const {
     }
 
     if (vsub) {
-        res += 32 + 8*std::min(n_tokens, cparams.n_outputs_max);
+        res += 32 + 8*std::min(cparams.n_ubatch, cparams.n_outputs_max);
     }
     return res;
 }
