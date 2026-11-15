@@ -612,7 +612,7 @@ static void test_reasoning_budget_end_match() {
     {
         const std::vector<llama_tokens> end_nl = {{103, 101}, {101}};
 
-        auto * sampler = common_reasoning_budget_init(nullptr, start, end_nl, {103, 101}, 0, REASONING_BUDGET_IDLE);
+        auto * sampler = common_reasoning_budget_init(nullptr, start, end_nl, {103, 101}, {}, {}, 0, 0, REASONING_BUDGET_IDLE);
 
         llama_sampler_accept(sampler, 100); // FORCING
         llama_sampler_accept(sampler, 101); // end tag from the prompt, DONE
