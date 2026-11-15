@@ -25,7 +25,7 @@ static __global__ void flash_attn_ext_vec(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
-        const int  * KV_rows_ptr,
+        GGML_FATTN_KV_ROWS_PARAM
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -40,7 +40,8 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const GGML_FATTN_NB32_T nb32, const int64_t nb33) {
+    GGML_FATTN_KV_ROWS_LOCAL
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;

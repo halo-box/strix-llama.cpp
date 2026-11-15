@@ -18,6 +18,18 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+#if defined(GGML_USE_HIP)
+#define GGML_FATTN_KV_ROWS_PARAM
+#define GGML_FATTN_KV_ROWS_ARG(x)
+#define GGML_FATTN_KV_ROWS_LOCAL constexpr const int * KV_rows_ptr = nullptr;
+#define GGML_FATTN_NB32_T int32_t
+#else
+#define GGML_FATTN_KV_ROWS_PARAM const int * __restrict__ KV_rows_ptr,
+#define GGML_FATTN_KV_ROWS_ARG(x) x,
+#define GGML_FATTN_KV_ROWS_LOCAL
+#define GGML_FATTN_NB32_T int64_t
+#endif // defined(GGML_USE_HIP)
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -25,7 +37,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
-        const int  * __restrict__ KV_rows,
+        GGML_FATTN_KV_ROWS_PARAM
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -40,7 +52,7 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
+                            const int32_t nb31, const GGML_FATTN_NB32_T nb32, const int64_t nb33);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1323,7 +1335,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        kv_rows ? (const int *) kv_rows->data : nullptr,
+        GGML_FATTN_KV_ROWS_ARG(kv_rows ? (const int *) kv_rows->data : nullptr)
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
