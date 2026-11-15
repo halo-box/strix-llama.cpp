@@ -18,6 +18,7 @@
 #include "htp/get-rows-ops.h"
 #include "htp/glu-ops.h"
 #include "htp/im2col-ops.h"
+#include "htp/lightning-indexer-ops.h"
 #include "htp/matmul-ops.h"
 #include "htp/pad-ops.h"
 #include "htp/pool-ops.h"
@@ -29,6 +30,7 @@
 #include "htp/solve-tri-ops.h"
 #include "htp/ssm-conv.h"
 #include "htp/sum-rows-ops.h"
+#include "htp/top-k-mask-ops.h"
 #include "htp/unary-ops.h"
 #include "htp/upscale-ops.h"
 

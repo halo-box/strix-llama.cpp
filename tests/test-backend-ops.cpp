@@ -15144,6 +15144,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k_mask(type, 256, 0, 0, 16, 0, false, 32));
         test_cases.emplace_back(new test_top_k_mask(type, 1001, 0, 0, 64, 0, false, 7, 1, 3));
         test_cases.emplace_back(new test_top_k_mask(type, 4096, 0, 0, 2048, 0, false, 5));
+        // one row, no blocks, fewer than 128 picks: no read past the pick list
+        test_cases.emplace_back(new test_top_k_mask(type, 1001, 0, 0, 16, 3, false, 1));
+        test_cases.emplace_back(new test_top_k_mask(type, 256, 0, 0, 40, 0, true, 1));
+        // one row (single-row kernel) with each optional input combination: no score and no extra, blocks only, blocks and extra without score
+        test_cases.emplace_back(new test_top_k_mask(type, 512, 0, 0, 16, 0, false, 1));
+        test_cases.emplace_back(new test_top_k_mask(type, 1024, 4, 200, 32, 0, false, 1));
+        test_cases.emplace_back(new test_top_k_mask(type, 1024, 4, 200, 32, 5, false, 1));
         // cells with scores and extra cells
         test_cases.emplace_back(new test_top_k_mask(type, 512, 0, 0, 32, 5, true, 9));
         // blocks picked per head, the mask broadcast over the heads
@@ -18675,6 +18682,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true));       // synthetic, Qwen4-Exp kernel without the gate chain
     }
 
+    // Qwen3.8-Flash-Next pooled indexer prefill.
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_Q4_0));
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
