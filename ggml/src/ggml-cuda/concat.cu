@@ -196,7 +196,9 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
 
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
-    if (dim == 0 && src1->ne[0] >= 32 && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
+    // tile kernel from 2 tokens: below 32 the generic kernel ran one block per channel for a few elements each
+    // (gfx1151, qwen4exp conv-state concat at 2-16 tokens: 24.5 -> 7.9 us; a 1-token transpose is contiguous and keeps the 3.7 us contiguous kernel)
+    if (dim == 0 && src1->ne[0] >= 2 && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1 &&
             src0->nb[0] == sizeof(T) && src0->nb[1] == src0->ne[0] * sizeof(T) &&
             src1->nb[1] == sizeof(T) && src1->nb[0] == src1->ne[1] * sizeof(T) &&
             dst->nb[0] == sizeof(T) && dst->nb[1] == dst->ne[0] * sizeof(T) &&
