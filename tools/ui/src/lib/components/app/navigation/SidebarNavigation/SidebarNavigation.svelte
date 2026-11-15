@@ -7,6 +7,8 @@
 		DialogConversationDelete,
 		DialogConversationRename,
 		DialogDiscoverModels,
+		DialogGroup,
+		DialogGroupPicker,
 		DialogMcpServers,
 		DialogSearch,
 		DialogSettingsChat,
@@ -56,6 +58,9 @@
 	let dockTimeout: ReturnType<typeof setTimeout> | undefined;
 
 	const isOnMobile = $derived(deviceStore.isMobile);
+	const isHiddenByChatForm = $derived(
+		isOnMobile && uiStore.isComposerExpanded && !uiStore.isSidebarExpanded
+	);
 	const alwaysShowOnDesktop = $derived(settingsStore.config.alwaysShowSidebarOnDesktop as boolean);
 	// the collapsed sidebar shows only its logo until it is peeked at, which fades the rest in
 	const isStripHidden = $derived(!uiStore.isSidebarExpanded && !isOnMobile && !isPeeking);
@@ -499,7 +504,7 @@
 	function handleSidebarAction(action: SidebarAction): void {
 		switch (action) {
 			case SidebarAction.NEW_CHAT:
-				afterMobileClose(() => void conversationsStore.openNewChat());
+				afterMobileClose(() => void conversationsStore.openNewChat({ inNewTab: true }));
 
 				break;
 			case SidebarAction.SEARCH:
@@ -544,9 +549,13 @@
 				'md:bg-muted/60 md:backdrop-blur-xl max-md:shadow-md',
 			isFloating && 'md:-mr-[calc(var(--sidebar-width)-3rem)]',
 			isStripHidden && 'md:pointer-events-none',
+			// on a phone the expanded chat form fills the screen, so the logo button over
+			// its corner fades away (and goes inert) until the form collapses
+			'max-md:transition-opacity',
+			isHiddenByChatForm && 'opacity-0',
 			uiStore.isSidebarExpanded && 'is-expanded'
 		]}
-		inert={isOnMobile && !uiStore.isSidebarExpanded}
+		inert={isHiddenByChatForm || (isOnMobile && !uiStore.isSidebarExpanded)}
 		onfocusin={peek}
 		onfocusout={handleAsideFocusOut}
 		onmouseleave={() => (isPeeking = false)}
@@ -699,6 +708,10 @@
 <DialogMcpServers bind:open={mcpDialogOpen} />
 
 <DialogDiscoverModels bind:open={uiStore.discoverModelsOpen} />
+
+<DialogGroup />
+
+<DialogGroupPicker />
 
 <ModelsManagerModelDrawer />
 
