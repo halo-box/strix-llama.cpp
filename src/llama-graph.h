@@ -1334,7 +1334,7 @@ struct llm_graph_context {
 
     // rows `ids` of an embedding table; an EXL3 row-ring table is decoded by EXL3_GET_ROWS
     ggml_tensor * build_get_rows(ggml_tensor * table, ggml_tensor * ids) const;
-    // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_embd_state_src()),
+    // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_ctx_state_src()),
     // or uploaded from ubatch.embd_state
     ggml_tensor * build_inp_embd_state(llm_graph_input_embd_h * inp, int64_t n_embd_state) const;
 

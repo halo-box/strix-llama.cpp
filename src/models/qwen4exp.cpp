@@ -505,7 +505,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params)
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
-    // the target h rows: a device buffer of the target (see llama_set_embd_state_src), else uploaded; the resident
+    // the target h rows: a device buffer of the target (see llama_set_ctx_state_src), else uploaded; the resident
     // hand-over binds the uploaded input leaf to its own buffer instead (the two are not enabled together)
     inp->h = build_inp_embd_state(inp.get(), hparams.n_embd_out());
     GGML_ASSERT(!ubatch.resident || inp->h_rows == nullptr);
