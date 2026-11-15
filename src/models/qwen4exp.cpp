@@ -465,21 +465,21 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
-        return std::make_unique<graph_mtp>(*this, params);
+        return std::make_unique<graph_mtp>(params);
     }
     // a draft-only file may still carry a mixer under output_hc_*, so test the trunk itself
     if (hc_head_norm == nullptr || layers.empty() || layers[0].hc_attn_norm == nullptr) {
         throw std::runtime_error("this model is an MTP draft head without a trunk; "
                                  "load it as a draft of its target model (-md), not on its own");
     }
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 // ref: PR 27739 (JJJYmmm), reconciled against this tree's hyper-connection helpers.
 // The draft is one block: embedding and handed-over hidden state are each normed, joined
 // and projected, then run through the same attention and FFN the trunk uses.
-llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
-    : graph(model, params, true) {
+llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params)
+    : graph(params, true) {
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "qwen4exp MTP supports a single block");
     ASSERT_EMBD_OR_TOKEN(ubatch);
 
@@ -957,11 +957,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
 }
 
 // members only: graph_mtp builds a single block instead of the trunk
-llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params, bool) :
-    llm_build_delta_net_base(params), model(model) {}
+llama_model_qwen4exp::graph::graph(const llm_graph_params & params, bool) :
+    llm_build_delta_net_base(params) {}
 
-llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_build_delta_net_base(params), model(model) {
+llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
+    llm_build_delta_net_base(params) {
     const int64_t hc = hparams.dsv4_hc_mult;
 
     GGML_ASSERT(hparams.n_embd_head_v() == hparams.n_embd_head_k());

@@ -3291,6 +3291,7 @@ llm_graph_params llama_context::graph_params(
                           llm_graph_type   gtype) const {
     return {
         /*.arch        =*/ model.arch,
+        /*.model       =*/ &model,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
