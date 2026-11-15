@@ -2112,8 +2112,8 @@ static __global__ void flash_attn_ext_f16(
 
     // Skip unused kernel variants for faster compilation:
 #if defined(__gfx1151__)
-    // The WMMA selector excludes D40, D72 and D192 and requires more than 16 columns for D256.
-    if constexpr (DKQ == 40 || DKQ == 72 || DKQ == 192 || (DKQ == 256 && ncols1*ncols2 == 16)) {
+    // The WMMA selector excludes D40, D72, D192 and sparse (NVIDIA / CDNA only) and requires more than 16 columns for D256.
+    if constexpr (DKQ == 40 || DKQ == 72 || DKQ == 192 || (DKQ == 256 && ncols1*ncols2 == 16) || use_sparse) {
         NO_DEVICE_CODE;
         return;
     }
