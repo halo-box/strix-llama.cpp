@@ -5,6 +5,7 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "log.h"
+#include "../src/llama-ext.h" // the fork resident NextN hand-over (C++ API)
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
