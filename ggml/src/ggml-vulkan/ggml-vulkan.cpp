@@ -22321,7 +22321,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         params && params->add_alloc_dep) {
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * g = graph->nodes[i];
-            if (g->op != GGML_OP_GATED_DELTA_NET || g->src[2]->ne[2] < ggml_vk_gdn_chunk_min) {
+            if (g->op != GGML_OP_GATED_DELTA_NET) {
                 continue;
             }
             for (int s = 0; s < 2; ++s) {
