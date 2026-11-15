@@ -56,6 +56,8 @@ struct llama_cparams {
     bool auto_fmoe16;
     bool fused_gdn_norm_f16; // qwen4exp GDN output norm stored as f16 at prefill (the ssm_out GEMM's B, written by the backend's fused norm)
     bool auto_fgdnn16;
+    bool fused_top_k_mask;   // use fused top-k sparse attention mask
+    bool auto_ftkm;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
