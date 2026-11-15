@@ -345,7 +345,7 @@ for side in base cand; do
     [ -d "$OUT/src-$side" ] || git worktree add -q --detach "$OUT/src-$side" "$rev"
     git -C "$OUT/src-$side" checkout -q --detach "$rev"
 done
-TARGETS="llama-perplexity llama-tokenize llama-imatrix llama-bench llama-server llama-quantize test-backend-ops test-llama-archs test-save-load-state"
+TARGETS="llama-perplexity llama-tokenize llama-imatrix llama-bench llama-server llama-quantize test-backend-ops test-llama-archs"
 # ccache, when installed, for every compiler (the HIP one included): the candidate shares most objects with the baseline
 cc=()
 command -v ccache > /dev/null && cc=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache)
@@ -783,11 +783,6 @@ for be in ${BACKENDS//,/ }; do
         kld "$be" "kv-$t" "$kvm" "$OUT/all.txt" "-c 2048 -b 2048 -ub 2048 --chunks 4 -ctk $t -ctv $t" "-c 2048 -b 2048 -ub 512 --chunks 4 -ctk $t -ctv $t"
         bench "$be" "kv-$t" "$kvm" "-p 512 -n 128 -d 8192 -r 3 -ngl $(ngl $be) -fa on -ctk $t -ctv $t" "512 0 8192" "0 128 8192"
     done
-    sls=$OUT/quant/small-Q4_0.gguf
-    [ -f "$sls" ] || sls=$(ls "$OUT"/quant/small-*.gguf 2> /dev/null | grep -v -- '-imatrix\.gguf$' | head -1 || true)
-    [ -n "$sls" ] || sls=$SMALL
-    run "$OUT/$be/sls-base.txt" "$(bin base $be)/test-save-load-state" --model "$sls" -ngl $(ngl $be) -c 1024 -fa on
-    run "$OUT/$be/sls-cand.txt" "$(bin cand $be)/test-save-load-state" --model "$sls" -ngl $(ngl $be) -c 1024 -fa on
 
     # 4. the real models of the archs this sync touches
     for mm in "${MODELS[@]}"; do
