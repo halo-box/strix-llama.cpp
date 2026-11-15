@@ -1097,9 +1097,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         }
 
         if (fixup) {
-            write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J, glu_op, glu_limit);
+            write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J, glu_op, glu_limit, x_scale, gate_scale);
         } else {
-            write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j, glu_op, glu_limit);
+            write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j, glu_op, glu_limit, x_scale, gate_scale);
         }
         return;
     }
@@ -1564,7 +1564,7 @@ static __global__ void mul_mat_q_routed_compact(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, false>
             (x, nullptr, offset_x, y + offset_y, ids_dst_shared, dst + it * I, nullptr, y_scale_tile,
-             GGML_GLU_OP_SWIGLU, 0.0f, stride_row_x, ncols_y, stride_col_dst,
+             GGML_GLU_OP_SWIGLU, 0.0f, nullptr, nullptr, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
     }
 }
