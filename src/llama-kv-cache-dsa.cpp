@@ -21,7 +21,6 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
                      bool   unified,
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter_mla,
@@ -33,7 +32,7 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
 
     kv_mla = std::make_unique<llama_kv_cache>(
             model, no_alloc, model.hparams, type_k, type_v,
-            v_trans, offload, unified, kv_size, n_seq_max, n_pad,
+            v_trans, offload, unified, kv_size, n_seq_max,
             n_swa, swa_type, nullptr, filter_mla, reuse, nullptr);
 
     // we use llama_kv_cache for caching indexer keys
@@ -53,7 +52,7 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     // forcing the much slower decomposed indexer path
     kv_lid = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams_lid, GGML_TYPE_F16, type_v,
-            v_trans, offload, unified, kv_size, n_seq_max, n_pad,
+            v_trans, offload, unified, kv_size, n_seq_max,
             n_swa, swa_type, nullptr, filter_lid, reuse, nullptr);
 }
 
