@@ -2202,8 +2202,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         res->add_fused_node({LLM_FUSED_OP_GDN_NORM_F16, cur, il});
     }
 
-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
-
     return cur;
 }
 
