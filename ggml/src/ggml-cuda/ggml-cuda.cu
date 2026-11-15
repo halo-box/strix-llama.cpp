@@ -25,7 +25,6 @@
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
-#include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fp8.cuh"
@@ -2967,7 +2966,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_dup(ctx, dst);
             break;
         case GGML_OP_ADD:
-        case GGML_OP_ADD1: // TODO: more efficient implementation
             ggml_cuda_op_add(ctx, dst);
             break;
         case GGML_OP_ADD_ID:
@@ -3161,9 +3159,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 break;
         case GGML_OP_DIAG:
             ggml_cuda_op_diag(ctx, dst);
-            break;
-        case GGML_OP_DIAG_MASK_INF:
-            ggml_cuda_op_diag_mask_inf(ctx, dst);
             break;
         case GGML_OP_SOFT_MAX:
             ggml_cuda_op_soft_max(ctx, dst);
@@ -10155,7 +10150,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_ADD_ID:
-        case GGML_OP_ADD1:
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_SIN:
@@ -10201,8 +10195,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->ne[1] % 128 == 0;
         }
         case GGML_OP_CONT:
-            return true;
-        case GGML_OP_DIAG_MASK_INF:
             return true;
         case GGML_OP_SOFT_MAX:
             return true;
