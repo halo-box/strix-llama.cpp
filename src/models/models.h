@@ -2676,6 +2676,18 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * gate,
                             int   layer);
 
+        // build_norm_gated of a scan that came back in two parts (the rollback-slot split): the two outputs are normed
+        // straight into the padded f16 destination instead of being concatenated first
+        ggml_tensor * build_norm_gated_parts(
+                    ggml_tensor * out0,
+                    ggml_tensor * out1,
+                    ggml_tensor * weights,
+                    ggml_tensor * gate,
+                            int   layer);
+
+        // the fused f16 prefill path of build_norm_gated for this output: -1 = not taken, 0 = unpadded, else the row padding
+        int64_t norm_gated_f16_pad(const ggml_tensor * input, int layer);
+
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
@@ -2692,6 +2704,29 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
+                            int   il);
+
+        // the delta-net conv history split at token t (the rollback-slot split): returns the concat over tokens [0, t),
+        // which has the same form as an unsplit one, and the history at t as a contiguous [state_cols, C, 1] copy in hist;
+        // build_conv_tail_at concatenates it with tokens [t, n) and writes the conv rollback slots
+        ggml_tensor * build_conv_state_split(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                        int64_t   t,
+                    ggml_tensor ** hist,
+                            int   il);
+
+        ggml_tensor * build_conv_tail_at(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * conv_states_all,
+                    ggml_tensor * x,
+                    ggml_tensor * hist,
+                        int64_t   state_cols,
+                        int64_t   channels,
+                        int64_t   t,
                             int   il);
 
         ggml_tensor * build_inp_ple(

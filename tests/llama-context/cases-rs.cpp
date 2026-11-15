@@ -17,6 +17,120 @@
 // exceeds n_ubatch: each seq's replay spans several ubatches while its rollback restore is
 // still pending. Compared against a reference context that never advanced past the rollback
 // point and decodes the identical replay batch.
+// a prompt ubatch wider than n_rs_seq + 1 per sequence, with only each sequence's last row as output, may be split by the
+// model when it holds one sequence (qwen4exp: plain scan over all but the last n_rs_seq + 1 tokens); the rollback slots
+// it leaves must replay as those of the same prompt decoded with every row as output, which no model splits. With two
+// sequences in the ubatch the model keeps the unsplit path, and the same must hold.
+struct case_rollback_wide_prompt : ctx_test {
+    const uint32_t n_seqs;
+
+    explicit case_rollback_wide_prompt(uint32_t n_seqs = 1) : n_seqs(n_seqs) {}
+
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return n_seqs == 1 ? "rollback_wide_prompt" : "rollback_wide_prompt_2seq"; }
+
+    const char * description() const override {
+        return "rollback after a wide prompt ubatch replays as after the same ubatch with every row as output";
+    }
+
+    case_result run(model_run & mr) const override {
+        const llama_vocab * vocab   = llama_model_get_vocab(mr.model);
+        const int           n_vocab = llama_vocab_n_tokens(vocab);
+
+        constexpr uint32_t n_extra = 16;
+
+        // one ubatch holds every sequence's whole prompt
+        const auto make_rs_ctx = [&]() {
+            ctx_opts opts;
+            opts.n_seq_max = n_seqs;
+            opts.n_rs_seq  = 8;
+            opts.n_batch   = n_seqs * (8 + 1 + n_extra);
+            opts.n_ubatch  = n_seqs * (8 + 1 + n_extra);
+            return mr.ctx(opts);
+        };
+
+        llama_context_ptr probe = make_rs_ctx();
+        if (!probe) {
+            return case_result::fail();
+        }
+        const uint32_t n_rs_seq = llama_n_rs_seq(probe.get());
+        if (n_rs_seq == 0) {
+            return case_result::skip("n_rs_seq is disabled");
+        }
+        probe.reset();
+
+        const llama_pos n_prompt = (llama_pos) (n_rs_seq + 1 + n_extra);
+        const auto tok = [&](uint32_t seq, llama_pos pos) {
+            return gen_token(n_vocab, (llama_seq_id) seq, pos);
+        };
+
+        // rolled-back logits are compared across two different prompt graphs: allow rounding, not a wrong state
+        constexpr float nmse_eps = 1e-6f;
+
+        for (const uint32_t n_rollback : { 1u, 3u, n_rs_seq }) {
+            llama_context_ptr ctx_last = make_rs_ctx(); // prompt outputs only its last row: may be split
+            llama_context_ptr ctx_all  = make_rs_ctx(); // every row is an output: never split
+            if (!ctx_last || !ctx_all) {
+                return case_result::fail();
+            }
+
+            common_batch batch_last(ctx_last.get());
+            common_batch batch_all(ctx_all.get());
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                for (llama_pos pos = 0; pos < n_prompt; ++pos) {
+                    batch_last.add(tok(s, pos), pos, (llama_seq_id) s, pos + 1 == n_prompt);
+                    batch_all.add(tok(s, pos), pos, (llama_seq_id) s, true);
+                }
+            }
+            if (llama_process(ctx_last.get(), LLAMA_PROCESS_TYPE_DECODE, batch_last.get()) != 0 ||
+                llama_process(ctx_all.get(),  LLAMA_PROCESS_TYPE_DECODE, batch_all.get())  != 0) {
+                TLOG_ERR("%s: failed to decode the prompt\n", __func__);
+                return case_result::fail();
+            }
+
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                const int32_t i_last = (int32_t) (s * n_prompt + n_prompt - 1); // batch index of the sequence's last row
+                const float * a = llama_get_logits_ith(ctx_last.get(), i_last);
+                const float * b = llama_get_logits_ith(ctx_all.get(), i_last);
+                if (a == nullptr || b == nullptr) {
+                    TLOG_ERR("%s: missing prompt logits\n", __func__);
+                    return case_result::fail();
+                }
+                const logits_diff diff = compare_logits(a, b, n_vocab);
+                CTX_REQUIRE(diff.nmse() <= nmse_eps,
+                        "prompt logits mismatch for seq " + std::to_string(s) + ", nmse " + std::to_string(diff.nmse()));
+            }
+
+            const llama_pos rollback_pos = n_prompt - (llama_pos) n_rollback;
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_last.get()), (llama_seq_id) s, rollback_pos, -1) ||
+                    !llama_memory_seq_rm(llama_get_memory(ctx_all.get()),  (llama_seq_id) s, rollback_pos, -1)) {
+                    TLOG_ERR("%s: rollback of %u failed\n", __func__, n_rollback);
+                    return case_result::fail();
+                }
+            }
+
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                for (uint32_t i = 0; i < n_rollback; ++i) {
+                    const llama_pos pos = rollback_pos + i;
+                    if (!decode_one(ctx_last.get(), tok(s, pos), pos, (llama_seq_id) s) ||
+                        !decode_one(ctx_all.get(),  tok(s, pos), pos, (llama_seq_id) s)) {
+                        TLOG_ERR("%s: replay failed at position %d\n", __func__, pos);
+                        return case_result::fail();
+                    }
+                    const logits_diff diff = compare_logits(llama_get_logits_ith(ctx_last.get(), 0), llama_get_logits_ith(ctx_all.get(), 0), n_vocab);
+                    CTX_REQUIRE(diff.nmse() <= nmse_eps,
+                            "replay after a rollback of " + std::to_string(n_rollback) + " mismatches for seq " + std::to_string(s) +
+                            " at position " + std::to_string(pos) + ", nmse " + std::to_string(diff.nmse()));
+                }
+            }
+        }
+
+        return case_result::pass();
+    }
+};
+
 struct case_multi_seq_split_replay : ctx_test {
     test_group group() const override { return TEST_GROUP_RS; }
 
@@ -397,6 +511,8 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
+    cases.push_back(std::make_unique<case_rollback_wide_prompt>(1));
+    cases.push_back(std::make_unique<case_rollback_wide_prompt>(2));
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 
