@@ -1149,6 +1149,12 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
+#if defined(GGML_USE_HIP)
+static constexpr bool ggml_cuda_mmq_col_tiles_inner = false;
+#else
+static constexpr bool ggml_cuda_mmq_col_tiles_inner = true;
+#endif // defined(GGML_USE_HIP)
+
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
@@ -1203,8 +1209,8 @@ static __global__ void mul_mat_q(
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
         const int zt = tmp2.y;
-        const int jt = blockIdx.x;
-        const int it = blockIdx.y;
+        const int jt = ggml_cuda_mmq_col_tiles_inner ? blockIdx.x : blockIdx.y;
+        const int it = ggml_cuda_mmq_col_tiles_inner ? blockIdx.y : blockIdx.x;
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1822,7 +1828,7 @@ static void launch_mul_mat_q_tile(ggml_backend_cuda_context & ctx, const mmq_arg
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
     const int ntzw = args.nchannels_y * args.nsamples_y;
     // Column tiles innermost so that the concurrently running blocks share the same tile of x and read it from L2.
-    const dim3 block_nums_xy_tiling(ntx, nty, ntzw);
+    const dim3 block_nums_xy_tiling = ggml_cuda_mmq_col_tiles_inner ? dim3(ntx, nty, ntzw) : dim3(nty, ntx, ntzw);
 
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
     GGML_ASSERT(args.nsamples_y  % args.nsamples_x  == 0);
@@ -1857,7 +1863,7 @@ static void launch_mul_mat_q_tile(ggml_backend_cuda_context & ctx, const mmq_arg
     }
 
     if (has_fusion || !config.stream_k) {
-        GGML_ASSERT(nty <= 65535); // gridDim.y limit
+        GGML_ASSERT((ggml_cuda_mmq_col_tiles_inner ? nty : ntx) <= 65535); // gridDim.y limit
         mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
              (const float *) args.fusion.x_scale, (const float *) args.fusion.gate_scale,
