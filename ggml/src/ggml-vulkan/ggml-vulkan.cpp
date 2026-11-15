@@ -7243,20 +7243,49 @@ void ggml_vk_matmul(
     ctx->prealloc_split_k_need_sync = true;
 }
 
-static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
+static bool ggml_vk_src1_prec_allows_q8(const ggml_tensor * dst) {
+    switch (ggml_prec_get_src(dst, 1)) {
+        case GGML_PREC_UNDEFINED:
+        case GGML_PREC_Q8:
+        case GGML_PREC_Q4:
+            return true;
+        case GGML_PREC_F32:
+        case GGML_PREC_BF16:
+        case GGML_PREC_F16:
+            return false;
+    }
+    return false;
+}
+
+static bool ggml_vk_prec_allows_f16acc(ggml_prec prec) {
+    switch (prec) {
+        case GGML_PREC_F32:
+        case GGML_PREC_BF16:
+            return false;
+        case GGML_PREC_UNDEFINED:
+        case GGML_PREC_F16:
+        case GGML_PREC_Q8:
+        case GGML_PREC_Q4:
+            return true;
+    }
+    return false;
+}
+
+static bool ggml_vk_get_mul_mat_mat_f16acc(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec acc_prec) {
     if (src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16) return false;
     if (src1_type == GGML_TYPE_Q8_1) return false;
+    const bool prec_allows_f16 = ggml_vk_prec_allows_f16acc(acc_prec);
     if (src0_type == GGML_TYPE_F16) {
-        return prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support);
+        return prec_allows_f16 && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support);
     }
     // quant types
     if (ctx->device->coopmat2) {
-        return prec == GGML_PREC_DEFAULT;
+        return prec_allows_f16;
     }
     if (ctx->device->coopmat_support) {
-        return ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT;
+        return ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec_allows_f16;
     }
-    return ctx->device->fp16 && prec == GGML_PREC_DEFAULT;
+    return ctx->device->fp16 && prec_allows_f16;
 }
 
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
@@ -7821,7 +7850,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // a row-strided f16 B (the padded hc xn) is read in place through stride_b, or quantized from its rows
     const bool y_rowstride = src0->type != GGML_TYPE_BF16 && !ctx->device->coopmat2 && ggml_vk_f16_rowstride(src1);
     bool can_quantize_y = (ctx->device->integer_dot_product || ctx->device->coopmat_int_support) &&
-                          (src1->type == GGML_TYPE_F32 || f16_y) && (ggml_is_contiguous(src1) || y_rowstride) && (ne11 * ne10) % 4 == 0;
+                          (src1->type == GGML_TYPE_F32 || f16_y) && (ggml_is_contiguous(src1) || y_rowstride) && (ne11 * ne10) % 4 == 0 &&
+                          ggml_vk_src1_prec_allows_q8(dst);
     // the routed types (ggml_vk_dense_f16coopmat) leave the int8 path for the f16-B KHR coopmat matmul (not for the f16-out fusion,
     // which exists on the int8 path only)
     if (can_quantize_y && !d16 && !hcm && ggml_vk_mm_prefetch_enabled(ctx->device) &&
@@ -7847,7 +7877,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
     const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
-                                        (ggml_prec)dst->op_params[0], false, can_quantize_y, prefer_f16_b);
+                                        ggml_prec_get_acc(dst), false, can_quantize_y, prefer_f16_b);
     // an f16 output and the HC_UP_MIX epilogue exist only on the int8 MMQ path; every fallback below would write f32 into the f16 buffer
     GGML_ASSERT(!(d16 || hcm) || y_kernel_type == GGML_TYPE_Q8_1 || (hc_dq8 && y_kernel_type == GGML_TYPE_F16));
 
@@ -7856,7 +7886,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool y_needs_reformat = !quantize_y && ((!ggml_vk_dim01_contiguous(src1) && !y_rowstride) || y_kernel_type != src1->type);
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
-        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], false,
+        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst), false,
                                              d16 || (hcm && !hc_dq8 && od->type == GGML_TYPE_F16), false, hcm && !hc_dq8);
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
@@ -7864,7 +7894,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (qx_needs_dequant) {
         // dequant src0 to f16
-        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, (ggml_prec)dst->op_params[0]);
+        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, ggml_prec_get_acc(dst));
     }
 
     GGML_ASSERT(mmp_map != nullptr);
@@ -7880,7 +7910,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // XL tier of the register-prefetch pipelines (aligned, dense, quantized A on the f16-B coopmat path only)
     if (aligned && !quantize_y && !qx_needs_dequant && !d16 && ggml_vk_mm_prefetch_type(src0->type) &&
         ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mm_xl_ok(ctx, src0->type, ne01, ne11, ne10)) {
-        const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0]);
+        const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst));
         vk_matmul_pipeline_key kx{src0->type, y_kernel_type, false, f16acc, false, false, true, true};
         auto itx = ctx->device->pipeline_matmul.find(kx);
         if (itx == ctx->device->pipeline_matmul.end() || itx->second.empty()) {
@@ -8306,7 +8336,7 @@ static void ggml_vk_mul_mat_vec_q_f16_cols(ggml_backend_vk_context * ctx, vk_con
     // A chunk quantizes only its own columns (q8_1 blocks never span columns when ne10 % 32 == 0).
     const bool chunk = col0 > 0 || ncols < (uint32_t) src1->ne[1];
     bool quantize_y = allow_quantize_y && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 &&
-                      (!chunk || ne10 % 32 == 0) && ggml_vk_should_use_mmvq(ctx->device, ne01, exact_batch ? 1 : ne11, ne10, src0->type);
+                      (!chunk || ne10 % 32 == 0) && (swap_inputs || ggml_vk_src1_prec_allows_q8(dst)) && ggml_vk_should_use_mmvq(ctx->device, ne01, exact_batch ? 1 : ne11, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -9537,7 +9567,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // an f16 B (the f16 MoE activations) is quantized to q8_1 straight from f16 (ggml_vk_mmq_f16_y_enabled)
     const bool f16_y = src1->type == GGML_TYPE_F16 && ggml_vk_mmq_f16_y_enabled(ctx->device) && ctx->device->pipeline_quantize_q8_1_x4_f16 != nullptr;
     bool can_quantize_y = ctx->device->integer_dot_product && (src1->type == GGML_TYPE_F32 || f16_y) &&
-                                ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
+                                ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst);
     // the routed expert types (ggml_vk_mmid_f16coopmat) leave int8 MMQ for the f16-B pf tile (with the f16-output store on the
     // pf d16 twins)
     if (can_quantize_y && !glu && ggml_vk_mm_prefetch_enabled(ctx->device) && ggml_vk_mmid_f16coopmat(src0->type)) {
@@ -9555,7 +9585,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                            ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 &&
                            // only take the f16-B path if a pipeline exists for this src0 type
                            // (e.g. Q2_0 has none); otherwise fall through to the normal f32-B path.
-                           ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_F16, (ggml_prec)dst->op_params[0], true, d16, glu) != nullptr;
+                           ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, GGML_TYPE_F16, ggml_prec_get_acc(dst), true, d16, glu) != nullptr;
     if (mmid_f16b) {
         static bool mmid_f16b_logged = false;
         if (!mmid_f16b_logged) {
@@ -9565,13 +9595,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
-                                        (ggml_prec)dst->op_params[0], true, can_quantize_y, prefer_f16_b || mmid_f16b, d16, glu);
+                                        ggml_prec_get_acc(dst), true, can_quantize_y, prefer_f16_b || mmid_f16b, d16, glu);
 
     const bool quantize_y   = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel = y_kernel_type == GGML_TYPE_F32;
 
     const std::vector<vk_matmul_pipeline_pair>* mmp_map =
-        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, (ggml_prec)dst->op_params[0], true, d16, glu);
+        ggml_vk_get_mul_mat_mat_pipeline_map(ctx, src0->type, y_kernel_type, ggml_prec_get_acc(dst), true, d16, glu);
 
     const bool qx_needs_dequant = mmp_map == nullptr || x_non_contig;
     // an f16 output exists only for these pipeline families (int8 MMQ, the KHR f32-B IQ twins, the pf twins with an f32 or f16 B);
@@ -9580,7 +9610,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     if (qx_needs_dequant) {
         // dequant src0 to f16
-        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, (ggml_prec)dst->op_params[0], true);
+        mmp_map = ggml_vk_get_mul_mat_mat_pipeline_map(ctx, f16_type, y_kernel_type, ggml_prec_get_acc(dst), true);
     }
 
     GGML_ASSERT(mmp_map != nullptr);
@@ -9651,7 +9681,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             rega_reject("tile selector did not pick the medium tile for the rows per expert");
         } else {
             const ggml_type tb = y_kernel_type;   // the B type this GEMM runs with (master's ggml_vk_mul_mat_b_type)
-            const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, tb, (ggml_prec)dst->op_params[0]);
+            const bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0->type, tb, ggml_prec_get_acc(dst));
             vk_matmul_pipeline_key kr{src0->type, tb, true, f16acc, d16, false, true, true};
             auto itr = ctx->device->pipeline_matmul.find(kr);
             if (itr == ctx->device->pipeline_matmul.end() || itr->second.empty()) { kr.f16acc = !f16acc; itr = ctx->device->pipeline_matmul.find(kr); }
@@ -9976,7 +10006,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
+    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_src1_prec_allows_q8(dst) && ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
 
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
@@ -11616,7 +11646,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     uint32_t workgroups_y = (uint32_t)neq2;
     uint32_t workgroups_z = (uint32_t)neq3;
 
-    const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
+    const bool f32acc = !ctx->device->fp16 || !ggml_vk_prec_allows_f16acc(ggml_prec_get_acc(dst)) || k->type == GGML_TYPE_BF16;
 
     // For prefill with quantized K/V, dequantize+transpose K/V once into a per-head-contiguous
     // f16 scratch and run the f16 FA path, instead of the coopmat1 shader re-dequantizing the
@@ -22170,9 +22200,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         // If there's not enough shared memory for row_ids and the result tile, fallback to CPU
                         return false;
                     }
-                    if (ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
-                        return false;
-                    }
                     // the mat-vec MUL_MAT_ID (at most 8 tokens) has no f16-B pipeline for quantized experts
                     if (op->src[1]->type == GGML_TYPE_F16 && ggml_is_quantized(src0_type) && op->src[2]->ne[1] <= 8) {
                         return false;
@@ -22188,6 +22215,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                     }
 #endif
+                }
+                if (ggml_prec_get_src(op, 1) == GGML_PREC_F32) {
+                    return false;
                 }
                 switch (src0_type) {
                     case GGML_TYPE_F32:
