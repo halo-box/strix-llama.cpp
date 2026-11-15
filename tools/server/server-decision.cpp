@@ -26,6 +26,9 @@ static const int RECURSIVE_LIMIT = 128;
 // a longer state keeps its head and its tail
 static const size_t DECISION_H2O_MAX_STATE_TOKENS = 32000;
 
+// the recursive functions of this file walk request JSON, a deeper value would overflow the stack
+static const int RECURSIVE_LIMIT = 128;
+
 static std::string decision_meta_str(const llama_model * model, const std::string & key) {
     char buf[256];
     const int32_t n = llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf));
@@ -684,6 +687,9 @@ static void decision_py_str(std::string & out, const std::string & s, bool ensur
 
 // json.dumps() of Python: indent < 0 is no indent, keys stay in their order
 static void decision_py_dump(std::string & out, const json & val, int indent, int level, const std::string & item_sep, const std::string & key_sep, bool ensure_ascii) {
+    if (level >= RECURSIVE_LIMIT) {
+        throw std::invalid_argument("JSON is nested more than " + std::to_string(RECURSIVE_LIMIT) + " levels deep");
+    }
     const auto newline = [&](int lvl) {
         return indent < 0 ? std::string() : "\n" + std::string(indent * lvl, ' ');
     };
