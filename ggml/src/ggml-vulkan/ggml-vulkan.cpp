@@ -10696,9 +10696,10 @@ static void ggml_vk_mmid_down_stream(ggml_backend_vk_context * ctx, vk_context& 
                                                   (uint32_t) (ids->nb[0] / ggml_type_size(ids->type)),
                                                   (uint32_t) (ids->nb[1] / ggml_type_size(ids->type)),
                                                   (uint32_t) (get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
-                                                  n_as, 0, 0, mmid_down_stream_bn, (uint32_t) row_ids_offset };
+                                                  n_as, 0, 0, mmid_down_stream_bn, (uint32_t) row_ids_offset,
+                                                  0, 0, 0 };
         init_pushconst_fastdiv(pc);
-        ggml_vk_dispatch_pipeline(ctx, subctx, count_experts, { ggml_vk_tensor_subbuffer(ctx, ids, true), expert_buf }, pc, { 1, 1, 1 });
+        ggml_vk_dispatch_pipeline(ctx, subctx, count_experts, { ggml_vk_tensor_subbuffer(ctx, ids, true), expert_buf, expert_buf }, pc, { 1, 1, 1 });
     }
     ggml_vk_sync_buffers(ctx, subctx);
 
@@ -10776,9 +10777,10 @@ static void ggml_vk_mmid_pair_glu(ggml_backend_vk_context * ctx, vk_context& sub
                                                   (uint32_t) (ids->nb[0] / ggml_type_size(ids->type)),
                                                   (uint32_t) (ids->nb[1] / ggml_type_size(ids->type)),
                                                   (uint32_t) (get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
-                                                  n_as, 0, 0, mmid_pair_glu_bn, (uint32_t) row_ids_offset };
+                                                  n_as, 0, 0, mmid_pair_glu_bn, (uint32_t) row_ids_offset,
+                                                  0, 0, 0 };
         init_pushconst_fastdiv(pc);
-        ggml_vk_dispatch_pipeline(ctx, subctx, count_experts, { ggml_vk_tensor_subbuffer(ctx, ids, true), expert_buf }, pc, { 1, 1, 1 });
+        ggml_vk_dispatch_pipeline(ctx, subctx, count_experts, { ggml_vk_tensor_subbuffer(ctx, ids, true), expert_buf, expert_buf }, pc, { 1, 1, 1 });
     }
     ggml_vk_sync_buffers(ctx, subctx);
 
