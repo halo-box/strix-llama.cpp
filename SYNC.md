@@ -36,13 +36,13 @@ Reverting a sync merge removes the content but keeps the ancestry: `git merge-ba
 says the upstream commits are merged. A later `git merge upstream/master` then skips them and
 puts newer upstream code on an older tree.
 
-`scripts/upstream-sync.base` holds the upstream commit whose content is really in the fork.
-`skills/upstream-sync/scripts/sync.sh merge` merges from that base and updates the file in the merge
-commit. Since the revert of #155 it is 86ea01d05 (2026-09-29), while `git merge-base` says
-71ad0590f (2026-10-08).
+For that case `skills/upstream-sync/scripts/sync.sh merge` reads `scripts/upstream-sync.base`, the
+upstream commit whose content is really in the fork, merges from it and updates the file in the merge
+commit. Without the file it falls back to `git merge-base`.
 
-Once the content base is past 71ad0590f, history and content agree again. Then delete the file:
-`sync.sh` falls back to `git merge-base`, and a plain `git merge upstream/master` is safe again.
+The file is gone since the 2026-10-15 rewrite of `master`: it replayed the fork on upstream
+e467e5b5e, so `git merge-base` is the real content base again. Create the file again only after
+a sync is reverted.
 
 ## When a PR + squash was unavoidable
 
