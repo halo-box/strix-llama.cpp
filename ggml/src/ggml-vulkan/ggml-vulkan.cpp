@@ -19051,7 +19051,7 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
 // once per rollback slot) need. The graph is unchanged: other backends run
 // the same nodes. The decision is made at the concat and consumed at its SSM_CONV, so both see one answer.
 
-// decode and short verify ubatches keep the concat: nothing to save there, and the reader scan stays off that path
+// decode and short verify ubatches keep the concat at dispatch: nothing to save there
 static constexpr int64_t ssm_conv_direct_min_tokens = 8;
 
 static bool ggml_vk_ssm_conv_direct_reject(const char * why, int node) {
@@ -19106,9 +19106,10 @@ static bool ggml_vk_conv_whole(const ggml_tensor * s, const ggml_tensor * cc) {
     return s == cc || (s && s->view_src == cc && s->view_offs == 0 && ggml_nelements(s) == ggml_nelements(cc) && ggml_is_contiguous(s));
 }
 
-// Structural match at a CONCAT node. With runtime = true it also checks the allocated addresses: the SiLU output
-// must not overlap anything the direct conv reads, and nothing between the concat and the SiLU may write x or
-// the state (graph_optimize asks the allocator to keep both alive, this is the check that it did).
+// Structural match at a CONCAT node. With runtime = true it also gates the token count (ssm_conv_direct_min_tokens)
+// and checks the allocated addresses: the SiLU output must not overlap anything the direct conv reads, and nothing
+// between the concat and the SiLU may write x or the state (graph_optimize asks the allocator to keep both alive,
+// this is the check that it did).
 static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i,
                                           ggml_backend_vk_context::ssm_conv_direct_match & m, bool runtime) {
     const ggml_tensor * cc = cgraph->nodes[i];
@@ -19131,7 +19132,8 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
         tr->nb[0] != (size_t) C * sizeof(float) || tr->nb[1] != sizeof(float) || tr->nb[2] != (size_t) C * T * sizeof(float)) {
         return ggml_vk_ssm_conv_direct_reject("x layout", i);
     }
-    if (T < ssm_conv_direct_min_tokens) {
+    // gate the token count at dispatch only: alloc deps that depend on it change the graph topology per ubatch size
+    if (runtime && T < ssm_conv_direct_min_tokens) {
         return false;
     }
     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != S || st->ne[3] != 1 || !ggml_is_contiguous(st)) {
