@@ -830,8 +830,6 @@ struct llama_vocab_subset {
 };
 
 struct llm_graph_params {
-    llm_arch arch = LLM_ARCH_UNKNOWN;
-
     const llama_model * model = nullptr;
 
     llama_hparams hparams;
@@ -959,7 +957,7 @@ struct llm_graph_params {
             mtp_draft == other.mtp_draft &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&
-            arch  == other.arch  &&
+            model == other.model &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
@@ -1085,8 +1083,6 @@ struct llm_graph_amax_src1 {
 
 struct llm_graph_context {
     const llama_model & model;
-
-    const llm_arch arch;
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
@@ -1321,6 +1317,12 @@ struct llm_graph_context {
     // rows `ids` of an embedding table; an EXL3 row-ring table is decoded by EXL3_GET_ROWS
     ggml_tensor * build_get_rows(ggml_tensor * table, ggml_tensor * ids) const;
     ggml_tensor * build_inp_pos() const;
+
+    // applies the RoPE of layer il, cur is returned as is if the layer has none
+    ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il) const;
+
+    // same, for the lightning indexer
+    ggml_tensor * build_rope_indexer(ggml_tensor * cur, ggml_tensor * pos, int il) const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
