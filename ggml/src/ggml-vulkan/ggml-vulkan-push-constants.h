@@ -290,6 +290,9 @@ struct vk_op_count_experts_push_constants {
     uint32_t ne00L;
     uint32_t row_tile_size;
     uint32_t row_ids_offset;
+    uint32_t ne0_dst;
+    uint32_t stride_dst;
+    uint32_t batch_stride_dst;
 };
 
 // mul_mm_id_glu.comp (MUL_MAT_ID_PAIR_SWIGLU); offsets and strides in the units of each binding
