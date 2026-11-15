@@ -3070,7 +3070,6 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const std::string mmid_mf_sfx = mmid_mf ? "_mf" : "";
             static const bool mf_skew = [] { const char * e = getenv("GGML_VK_TEST_MF_SKEW"); return e && atoi(e) != 0; }();
 #define MMID_MF_SPV(base, acc) (mmid_mf ? base##_mf##acc##_cm1_len : base##acc##_cm1_len), (mmid_mf ? base##_mf##acc##_cm1_data : base##acc##_cm1_data)
-            // set around the TQ2_T X_CM1_ID_PF call: those pf pipelines get spec constant 17 = 0
             bool pf_b_full_off = false;
             // GGML_VK_MMID_B_FULL_LOG=1: per MUL_MAT_ID pf / REG_A tile, whether the shader's B_FULL condition (BN % loadstride_b == 0,
             // loadstride_b = BLOCK_SIZE * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK as in mul_mm.comp) holds, so it drops the guard, or keeps it
