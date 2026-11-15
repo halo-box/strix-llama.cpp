@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <numeric>
 
 //
 // llama_kv_cache_dsa
@@ -45,6 +46,9 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     hparams_lid.n_embd_head_k_full = model.hparams.indexer_head_size;
     hparams_lid.rope_type          = LLAMA_ROPE_TYPE_NEOX;
 
+    // KV sharing applies to the MLA cache only, each indexer owns its keys
+    std::iota(hparams_lid.kv_source_impl.begin(), hparams_lid.kv_source_impl.end(), 0);
+
     LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
     // keep indexer keys f16 regardless of type_k: the fused indexer kernels read
@@ -53,7 +57,7 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams_lid, GGML_TYPE_F16, type_v,
             v_trans, offload, unified, kv_size, n_seq_max,
-            n_swa, swa_type, nullptr, filter_lid, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter_lid, nullptr, nullptr);
 }
 
 void llama_kv_cache_dsa::clear(bool data) {

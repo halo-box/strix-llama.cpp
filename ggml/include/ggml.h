@@ -381,6 +381,8 @@ extern "C" {
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
 
+    typedef struct { uint8_t bits; } ggml_fp8_e4m3_t;
+
     struct ggml_object;
     struct ggml_context;
     struct ggml_cgraph;
@@ -430,6 +432,7 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
+        GGML_TYPE_F8_E4M3 = 43,
         // ROCmFPx experimental AMD-native formats. These are kept in a high ID
         // range so upstream type IDs stay free for future ggml types.
         GGML_TYPE_Q4_0_ROCMFP4      = 100, // ROCmFP4 experimental UE4M3 scales + packed AMD FP4 blocks
@@ -443,7 +446,7 @@ extern "C" {
         GGML_TYPE_Q2_0_ROCMFPX      = 107, // ROCmFPx experimental 2-bit S40 codebook + dual UE4M3 scales
         // Prism-private ternary at group size 128, ported from PrismML-Eng/llama.cpp
         // (Ternary-Bonsai GGUFs). High id so it slots above upstream types; type_traits
-        // is sized to COUNT with 43..99 and 108..142 unused (100..107 are ROCmFPx). PQ2_0 (142) is deliberately not ported:
+        // is sized to COUNT with 44..99 and 108..142 unused (100..107 are ROCmFPx). PQ2_0 (142) is deliberately not ported:
         // it has no Vulkan kernels upstream of us either.
         GGML_TYPE_PTQ1_0  = 143,
         // Trellis-coded 2.125 bpw (QTIP-style bitshift trellis, L=16 K=8 V=4, hashed
@@ -533,6 +536,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_TQP5   = 133, // except 1d tensors (pair trellis K=5, group 128)
         GGML_FTYPE_MOSTLY_TQP6   = 134, // except 1d tensors (pair trellis K=6, group 128)
         GGML_FTYPE_MOSTLY_TQP7   = 135, // except 1d tensors (pair trellis K=7, group 128)
+        GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
     };
 
     // available tensor operations:
