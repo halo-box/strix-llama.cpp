@@ -137,3 +137,17 @@ void ggml_cuda_op_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 // out = other + src * sigmoid(gate[row]) (gate: one value per row)
 void ggml_cuda_op_sigmoid_gate_mul_add(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * src,
         const ggml_tensor * other, ggml_tensor * out);
+__device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float gate, float up, float limit) {
+    switch (op) {
+        case GGML_GLU_OP_SWIGLU:
+            return up * ggml_cuda_op_silu_single(gate);
+        case GGML_GLU_OP_GEGLU:
+            return up * ggml_cuda_op_gelu_single(gate);
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_cuda_op_swiglu_oai_single(gate, up);
+        case GGML_GLU_OP_SWIGLU_CLAMP:
+            return ggml_cuda_op_swiglu_clamp_single(gate, up, limit);
+        default:
+            return up * gate;
+    }
+}
