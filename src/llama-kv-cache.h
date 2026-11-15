@@ -260,6 +260,7 @@ public:
 
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // true if the KQ mask of ubatch is the plain index-causal one (key j visible to query i of its stream iff j <= i):
     // causal, no SWA or ALiBi, and in every stream the n_kv cells hold that stream's tokens of ubatch, one sequence,
@@ -478,6 +479,7 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
 
     // see llama_kv_cache::is_causal_prefix()
     bool is_causal_prefix(const llama_ubatch & ubatch, bool causal_attn) const;
