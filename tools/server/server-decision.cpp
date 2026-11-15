@@ -26,9 +26,6 @@ static const int RECURSIVE_LIMIT = 128;
 // a longer state keeps its head and its tail
 static const size_t DECISION_H2O_MAX_STATE_TOKENS = 32000;
 
-// the recursive functions of this file walk request JSON, a deeper value would overflow the stack
-static const int RECURSIVE_LIMIT = 128;
-
 static std::string decision_meta_str(const llama_model * model, const std::string & key) {
     char buf[256];
     const int32_t n = llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf));
