@@ -2234,7 +2234,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);
     if (final_output->type == GGML_TYPE_F16) {
-        res->add_fused_node({LLM_FUSED_OP_GDN_NORM_F16, cur, il});
+        res->add_fused_node({LLM_FUSED_OP_GDN_NORM_F16, cur->op == GGML_OP_MUL ? cur->src[0] : cur, il});
     }
 
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
