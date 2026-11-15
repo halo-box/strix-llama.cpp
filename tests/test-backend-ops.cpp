@@ -14513,6 +14513,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_cpy16(t, tb, 8, 4, false, 640, 130,  512));
         }
     }
+#ifdef GGML_USE_TRELLIS
+    // TQ2_T: the f16-output twins of its MUL_MAT_ID pf tile (built without MMID_B_FULL), f32 and f16 B, exact and ragged tiles,
+    // more than one tile per expert
+    for (ggml_type tb : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_TQ2_T, tb, 8, 4, true,  256,  64,  640));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_TQ2_T, tb, 8, 4, false, 256,  64,  640));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_TQ2_T, tb, 8, 4, true,  200,  70, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_TQ2_T, tb, 8, 4, false, 640, 130,  512));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_TQ2_T, tb, 16, 8, true,  640, 513, 2048));
+        test_cases.emplace_back(new test_mul_mat_id_cpy16(GGML_TYPE_TQ2_T, tb, 16, 8, false, 2048, 300, 640));
+    }
+    // TQ2_T MUL_MAT_ID pf tile with f16 and f32 B
+    for (int64_t n : {16, 63, 129, 513}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ2_T, GGML_TYPE_F16, 16, 8, false, 640, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ2_T, GGML_TYPE_F32, 16, 8, true, 2048, n, 640));
+    }
+    // m <= 8 takes the unaligned pf pipeline, which runs the non-prefetch A load (8 or fewer tokens take mat-vec instead)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ2_T, GGML_TYPE_F16, 16, 8, false, 8, 64, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ2_T, GGML_TYPE_F32, 16, 8, true,  8, 64, 640));
+#endif
     // q5_1 streaming down: several 256-feature workgroups, tile edges (9, 63, 64, 65, 129 rows), f32 / f16 B
     for (ggml_type tb : {GGML_TYPE_F32, GGML_TYPE_F16}) {
         for (int64_t n : {9, 63, 64, 65, 129}) {
