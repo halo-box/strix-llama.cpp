@@ -1159,6 +1159,19 @@ static int test_qwen4exp_merged(const size_t seed, const float stdev) {
     gguf_context_ptr out(gguf_init_empty());
     gguf_set_kv(out.get(), in.get());
     std::set<std::string> merged_parts;
+    for (int64_t i = 0; i < gguf_get_n_tensors(in.get()); i++) {
+        const std::string name = gguf_get_tensor_name(in.get(), i);
+        int il = -1;
+        char part[64] = {};
+        if (sscanf(name.c_str(), "blk.%d.%63[a-z_]", &il, part) == 2 && name == string_format("blk.%d.%s.weight", il, part)) {
+            for (const auto & m : merges) {
+                const std::string b = string_format("blk.%d.%s.weight", il, m[1]);
+                if (strcmp(part, m[0]) == 0 && ggml_get_tensor(ctx_data, b.c_str()) != nullptr) {
+                    merged_parts.insert(b);
+                }
+            }
+        }
+    }
     int n_merged = 0;
     for (int64_t i = 0; i < gguf_get_n_tensors(in.get()); i++) {
         const std::string name = gguf_get_tensor_name(in.get(), i);
@@ -1178,7 +1191,6 @@ static int test_qwen4exp_merged(const size_t seed, const float stdev) {
                 ggml_set_name(ab, string_format("blk.%d.%s.weight", il, m[2]).c_str());
                 memcpy(ab->data, t->data, ggml_nbytes(t));
                 memcpy((char *) ab->data + ggml_nbytes(t), b->data, ggml_nbytes(b));
-                merged_parts.insert(ggml_get_name(b));
                 t = ab;
                 n_merged++;
                 break;
