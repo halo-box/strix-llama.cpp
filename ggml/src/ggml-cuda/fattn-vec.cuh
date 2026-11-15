@@ -54,7 +54,12 @@ static __global__ void flash_attn_ext_vec(
     GGML_UNUSED(KV_rows_ptr);
 
     // Skip unused kernel variants for faster compilation:
-    if (use_logit_softcap && !(D == 128 || D == 256)) {
+#if defined(GGML_USE_HIP)
+    constexpr bool fp8_kv = type_K == GGML_TYPE_F8_E4M3 || type_V == GGML_TYPE_F8_E4M3;
+#else
+    constexpr bool fp8_kv = false;
+#endif // defined(GGML_USE_HIP)
+    if (fp8_kv || (use_logit_softcap && !(D == 128 || D == 256))) {
         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,

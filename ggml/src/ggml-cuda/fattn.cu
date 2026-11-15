@@ -582,8 +582,13 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
-        case GGML_TYPE_F8_E4M3:
             return true;
+        case GGML_TYPE_F8_E4M3:
+#if defined(GGML_USE_HIP)
+            return false;
+#else
+            return true;
+#endif // defined(GGML_USE_HIP)
         default:
             return false;
     }
@@ -701,6 +706,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (kv_rows) {
             return BEST_FATTN_KERNEL_NONE;
         }
+#if defined(GGML_USE_HIP)
+        return BEST_FATTN_KERNEL_NONE;
+#endif // defined(GGML_USE_HIP)
         // the logit softcap kernels are compiled for these head sizes only
         float logit_softcap;
         memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));

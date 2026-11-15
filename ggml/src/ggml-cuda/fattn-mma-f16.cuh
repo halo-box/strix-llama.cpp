@@ -2065,6 +2065,12 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
            (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8);
 }
 
+#if defined(GGML_USE_HIP)
+static constexpr bool ggml_cuda_fattn_mma_kv_rows_available = false;
+#else
+static constexpr bool ggml_cuda_fattn_mma_kv_rows_available = true;
+#endif // defined(GGML_USE_HIP)
+
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_ext_f16(
@@ -2105,8 +2111,8 @@ static __global__ void flash_attn_ext_f16(
 
     // Skip unused kernel variants for faster compilation:
 #if defined(__gfx1151__)
-    // The WMMA selector excludes D192 and requires more than 16 columns for D256.
-    if constexpr (DKQ == 192 || (DKQ == 256 && ncols1*ncols2 == 16)) {
+    // The WMMA selector excludes D40, D72 and D192 and requires more than 16 columns for D256.
+    if constexpr (DKQ == 40 || DKQ == 72 || DKQ == 192 || (DKQ == 256 && ncols1*ncols2 == 16)) {
         NO_DEVICE_CODE;
         return;
     }
@@ -2208,13 +2214,13 @@ static __global__ void flash_attn_ext_f16(
         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
         const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
         const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
-            (const half *) (mask + nb33*(sequence % ne33) + nb32*(zt_Q % ne32));
+            (const half *) (mask + nb33*(sequence % ne33) + (ggml_cuda_fattn_mma_kv_rows_available ? nb32*(zt_Q % ne32) : 0));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
         const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 :
-                                  KV_rows_ptr ? KV_rows_ptr + int64_t(sequence)*ne11 : nullptr;
+                                  ggml_cuda_fattn_mma_kv_rows_available && KV_rows_ptr ? KV_rows_ptr + int64_t(sequence)*ne11 : nullptr;
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
@@ -2258,13 +2264,13 @@ static __global__ void flash_attn_ext_f16(
     const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
     const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
     const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
-        (const half *) (mask + nb33*(sequence % ne33) + nb32*(zt_Q % ne32));
+        (const half *) (mask + nb33*(sequence % ne33) + (ggml_cuda_fattn_mma_kv_rows_available ? nb32*(zt_Q % ne32) : 0));
     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
 
     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
     const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 :
-                              KV_rows_ptr ? KV_rows_ptr + int64_t(sequence)*ne11 : nullptr;
+                              ggml_cuda_fattn_mma_kv_rows_available && KV_rows_ptr ? KV_rows_ptr + int64_t(sequence)*ne11 : nullptr;
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
