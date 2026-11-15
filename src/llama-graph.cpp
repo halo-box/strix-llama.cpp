@@ -1711,12 +1711,13 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         }
     }
 
-    cur = build_hadamard_input(w, cur);
+    // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
+    ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     if (vsub != nullptr && loras->empty()) {
         // Q8_0 2560x248320 with one output is byte-exact on gfx1151 HIP (2026-10-15).
         // Keep LoRA and other output widths full until their picked logits pass the byte comparison.
         const auto it = vsub->heads.find(w);
-        if (it != vsub->heads.end() && ggml_n_dims(cur) <= 2 && cur->ne[1] == 1 && (w_s == nullptr || ggml_nelements(w_s) == 1)) {
+        if (it != vsub->heads.end() && ggml_n_dims(cur_mm) <= 2 && cur_mm->ne[1] == 1 && (w_s == nullptr || ggml_nelements(w_s) == 1)) {
             const llama_vocab_subset::head & head = it->second;
 
             const int64_t n_embd    = w->ne[0];
@@ -1735,12 +1736,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 }
             };
 
-            ggml_tensor * logits = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w, n_embd, n_base, w->nb[1], 0), cur);
+            ggml_tensor * logits = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w, n_embd, n_base, w->nb[1], 0), cur_mm);
             set_prec(logits);
             logits = ggml_concat(ctx0, logits, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab - n_base, n_outputs), -INFINITY), 0);
 
             // score the other ids in vocab order so top_k returns token ids, end-of-generation ids always win
-            ggml_tensor * scores = ggml_mul_mat(ctx0, head.scorer, ggml_mul_mat(ctx0, head.basis, cur));
+            ggml_tensor * scores = ggml_mul_mat(ctx0, head.scorer, ggml_mul_mat(ctx0, head.basis, cur_mm));
             scores = ggml_concat(ctx0, ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_base, n_outputs), -INFINITY), scores, 0);
             if (vsub->eog != nullptr) {
                 const int64_t n_eog = vsub->eog->ne[0];
@@ -1751,7 +1752,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
             ggml_tensor * as     = ggml_reshape_3d(ctx0, w, n_embd, 1, n_vocab);
             ggml_tensor * ids    = ggml_top_k(ctx0, ggml_view_1d(ctx0, scores, n_vocab, 0), n_dyn);
-            ggml_tensor * cur_i  = ggml_view_3d(ctx0, cur, n_embd, 1, 1, cur->nb[1], cur->nb[1], 0);
+            ggml_tensor * cur_i  = ggml_view_3d(ctx0, cur_mm, n_embd, 1, 1, cur_mm->nb[1], cur_mm->nb[1], 0);
             ggml_tensor * picked = ggml_mul_mat_id(ctx0, as, cur_i, ggml_reshape_2d(ctx0, ids, n_dyn, 1));
             set_prec(picked);
             logits = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, n_vocab, n_outputs), picked, ggml_reshape_2d(ctx0, ids, n_dyn, n_outputs));
@@ -1765,7 +1766,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         }
     }
 
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -1818,7 +1819,10 @@ llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
     constexpr float k_ln_2   = 0.6931471805599453f;
 
     ggml_tensor * e;
-    e = ggml_scale(ctx0, amax, 1.0f/32768.0f);
+    // note: this can technically be:
+    // e = ggml_scale(ctx0, amax, 1.0f/32768.0f);
+    // but we leave x32 headroom for the F16 sums of 32 values in Q8 activation blocks
+    e = ggml_scale(ctx0, amax, 1.0f/1024.0f);
     e = ggml_log  (ctx0, e);
     e = ggml_scale(ctx0, e, k_log2_e);
     e = ggml_ceil (ctx0, e);
@@ -1851,11 +1855,12 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         }
     }
 
-    cur = build_hadamard_input(w, cur);
+    // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
+    ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
-        ggml_mul_mat_id(ctx0, w, cur, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+        ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
+        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2668,7 +2673,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         //       ref: https://github.com/ggml-org/llama.cpp/pull/30656#issuecomment-6269597922
         llm_graph_amax_src1 amax_src1 = { nullptr, nullptr };
 
-        if (arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM) {
+        if (arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_FLINT) {
             amax_src1 = build_amax_src1_f16(cur);
             cur = amax_src1.res;
         }
