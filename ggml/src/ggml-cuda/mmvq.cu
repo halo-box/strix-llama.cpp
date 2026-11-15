@@ -929,18 +929,26 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
             const int bq8_offset = 2*QR6_K*(kqs/(QI6_K/2)) + (kqs%(QI6_K/2))/(QI6_K/4);
             const int scale_offset = (QI6_K/4)*(kqs/(QI6_K/2)) + (kqs%(QI6_K/2))/(QI6_K/8);
             const int vh_shift = 2*((kqs%(QI6_K/2))/(QI6_K/4));
-            const int vl = get_int_b2(bx->ql, kqs);
-            const int vh = get_int_b2(bx->qh, (QI6_K/4)*(kqs/(QI6_K/2)) + kqs%(QI6_K/4)) >> vh_shift;
+            int vl[VDR_Q6_K_Q8_1_MMVQ];
+            int vh[VDR_Q6_K_Q8_1_MMVQ];
+#pragma unroll
+            for (int k = 0; k < VDR_Q6_K_Q8_1_MMVQ; ++k) {
+                vl[k] = get_int_b2(bx->ql, kqs + k);
+                vh[k] = get_int_b2(bx->qh, (QI6_K/4)*(kqs/(QI6_K/2)) + kqs%(QI6_K/4) + k) >> vh_shift;
+            }
             const int8_t * scales = bx->scales + scale_offset;
             const float dx = bx->d;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const block_q8_1 * by = &y[j*stride_col_y + kby];
-                int u[QR6_K];
+                int u[VDR_Q6_K_Q8_1_MMVQ*QR6_K];
                 float d8[QR6_K];
 #pragma unroll
                 for (int i = 0; i < QR6_K; ++i) {
-                    u[i]  = get_int_b4(by[bq8_offset + 2*i].qs, kqs % QI8_1);
+#pragma unroll
+                    for (int k = 0; k < VDR_Q6_K_Q8_1_MMVQ; ++k) {
+                        u[VDR_Q6_K_Q8_1_MMVQ*i + k] = get_int_b4(by[bq8_offset + 2*i].qs, kqs % QI8_1 + k);
+                    }
                     d8[i] = __low2float(by[bq8_offset + 2*i].ds);
                 }
                 tmp[j] += vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, dx, d8);
@@ -3242,7 +3250,7 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
 
     ggml_cuda_pool_alloc<block_q8_1> y_q8(ctx.pool(), n_used * nblocks);
     quantize_row_q8_1_cuda(
-        (const float *) y->data, nullptr, y_q8.get(), w->type,
+        (const float *) y->data, y_q8.get(),
         ncols,
         y->nb[1] / sizeof(float), y->nb[2] / sizeof(float), y->nb[3] / sizeof(float),
         y->ne[0], y->ne[1], y->ne[2], y->ne[3], ctx.stream());
