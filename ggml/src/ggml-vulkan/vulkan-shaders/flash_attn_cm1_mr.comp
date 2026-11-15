@@ -161,7 +161,6 @@ void main() {
     const uint32_t sm_row = tid / 4;
     const uint32_t sm_seg = tid % 4;
     const uint32_t sm_tok = ROW_TOK(sm_row);
-    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
     float Mf = NEG_FLT_MAX_OVER_2;
     float Lf = 0.0;
 

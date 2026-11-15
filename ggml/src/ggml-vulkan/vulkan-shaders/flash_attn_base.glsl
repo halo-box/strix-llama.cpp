@@ -38,6 +38,10 @@ const bool NAN_SAFE_V       = (Flags & 64) != 0;
 // coopmat1 P x V B-operand fragment is one contiguous 32-byte run per lane instead of 16 kv-strided halves.
 // coopmat1 only, f16 V, aligned, no shmem staging and no NAN_SAFE_V (both stage V rows from the row-major layout).
 const bool V_TRANSPOSED     = (Flags & 128) != 0;
+// Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
+#define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
+// Lowest finite f16, mask value for inactive sparse KV slots
+#define NEG_FLT16_MAX -65504.0
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
