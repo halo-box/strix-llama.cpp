@@ -7172,22 +7172,22 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
             }
             // Cap the split at 8x. Unless k is huge this is a lot of overhead.
             split_k = std::min(split_k, 8u);
-
-            // ggml_vk_matmul will align the splits to be a multiple of 256.
-            // If this rounded up size would cause the last split to be empty,
-            // then reduce the split count.
-            while (true) {
-                if (split_k == 1) {
-                    break;
-                }
-                uint32_t k_split = CEIL_DIV(k, split_k);
-                k_split = ROUNDUP_POW2(k_split, 256);
-                if (k_split * (split_k - 1) < k) {
-                    break;
-                }
-                split_k--;
-            }
         }
+    }
+
+    // ggml_vk_matmul will align the splits to be a multiple of 256.
+    // If this rounded up size would cause the last split to be empty,
+    // then reduce the split count.
+    while (true) {
+        if (split_k == 1) {
+            break;
+        }
+        uint32_t k_split = CEIL_DIV(k, split_k);
+        k_split = ROUNDUP_POW2(k_split, 256);
+        if (k_split * (split_k - 1) < k) {
+            break;
+        }
+        split_k--;
     }
 
     return split_k;
