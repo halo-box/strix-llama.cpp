@@ -1791,13 +1791,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         int                       il) {
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
     // has already scored with its own query in build_qsa_top_k, so top_k is unaffected.
-    if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    if (inp->self_k_rot[il]) {
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot[il]);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot[il]);
     }
 
-    if (inp->self_v_rot) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    if (inp->self_v_rot[il]) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot[il]);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -1830,8 +1830,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor * v = mctx_cur->get_v(ctx0, il);
         ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, nullptr, nullptr, nullptr, 0, kq_scale, il, top_k, 0);
         cb(cur, "kqv_out", il);
-        if (inp->self_v_rot) {
-            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        if (inp->self_v_rot[il]) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
         }
         return cur;
     }
@@ -1873,8 +1873,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
-    if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    if (inp->self_v_rot[il]) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
     }
 
     return cur;
@@ -2050,11 +2050,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     if (cache_only) {
         // the K/V writes of build_attn, in its order, and nothing after them; the query has no consumer
-        if (inp->self_k_rot) {
-            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+        if (inp->self_k_rot[il]) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot[il]);
         }
-        if (inp->self_v_rot) {
-            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+        if (inp->self_v_rot[il]) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot[il]);
         }
         ggml_build_forward_expand(gf, Vcur);
         ggml_build_forward_expand(gf, Kcur);
