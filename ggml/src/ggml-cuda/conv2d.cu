@@ -180,7 +180,6 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
     const int                  end            = int(int64_t(tiles) * (split + 1) / split_k) * BK;
     for (int k0 = begin; k0 < end; k0 += BK) {
         if (k_total % 8 == 0 && uintptr_t(weight) % 16 == 0) {
-#pragma unroll
             for (int i = tid; i < BM * BK / 8; i += nthreads) {
                 const int  row = i / (BK / 8), col = 8 * (i % (BK / 8));
                 const int4 v                 = m0 + row < oc && k0 + col < k_total ?
