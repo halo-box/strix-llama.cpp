@@ -1168,7 +1168,7 @@ static int test_qwen4exp_merged(const size_t seed, const float stdev) {
         ggml_tensor * t = ggml_get_tensor(ctx_data, name.c_str());
         int il = -1;
         char part[64] = {};
-        if (sscanf(name.c_str(), "blk.%d.%63[a-z_].weight", &il, part) == 2) {
+        if (sscanf(name.c_str(), "blk.%d.%63[a-z_]", &il, part) == 2 && name == string_format("blk.%d.%s.weight", il, part)) {
             for (const auto & m : merges) {
                 ggml_tensor * b = ggml_get_tensor(ctx_data, string_format("blk.%d.%s.weight", il, m[1]).c_str());
                 if (strcmp(part, m[0]) != 0 || b == nullptr) {
