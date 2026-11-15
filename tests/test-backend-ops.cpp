@@ -9583,7 +9583,7 @@ struct test_rope : public test_case {
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
         } else if (v == 2) {
-            // second-half slice along dim 0 (mimics build_rope_2d in clip.cpp).
+            // second-half slice along dim 0 (mimics build_rope_2d in tools/mtmd/mtmd-graph.cpp).
             // The non-zero view offset (ne_a[0] * elem_size) often produces a
             // non-aligned buffer offset, which exercises backends' alignment paths.
             auto ne = ne_a; ne[0] *= 2;
@@ -9690,6 +9690,13 @@ struct test_rope : public test_case {
                 }
             }
         }
+    }
+
+    double max_nmse_err() override {
+        // the f32 rotation angle of a position below n_ctx carries a rounding error of up to n_ctx*FLT_EPSILON radians
+        // backends compute the angle with different rounding sequences, so their agreement is bounded by that error
+        const double eps_theta = n_ctx * FLT_EPSILON;
+        return std::max(test_case::max_nmse_err(), eps_theta * eps_theta);
     }
 
     double max_maa_err() override {
