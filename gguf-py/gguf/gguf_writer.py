@@ -1408,6 +1408,9 @@ class GGUFWriter:
     def add_decision_max_head_tokens(self, value: int) -> None:
         self.add_uint32(Keys.Decision.MAX_HEAD_TOKENS.format(arch=self.arch), value)
 
+    def add_decision_labels(self, labels: Sequence[str]) -> None:
+        self.add_array(Keys.Decision.LABELS.format(arch=self.arch), labels)
+
     def add_decision_temperature(self, name: str, value: float) -> None:
         self.add_float32(Keys.Decision.TEMPERATURE.format(arch=self.arch, name=name), value)
 
@@ -1476,6 +1479,12 @@ class GGUFWriter:
 
     def add_vision_preproc_image_size(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.PREPROC_IMAGE_SIZE, value)
+
+    def add_vision_preproc_tile_size(self, value: int) -> None:
+        self.add_uint32(Keys.ClipVision.PREPROC_TILE_SIZE, value)
+
+    def add_vision_preproc_max_pixels_tolerance(self, value: float) -> None:
+        self.add_float32(Keys.ClipVision.PREPROC_MAX_PIXELS_TOLERANCE, value)
 
     def add_vision_projector_query_side(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.Projector.QUERY_SIDE, value)
