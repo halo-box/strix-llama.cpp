@@ -1828,7 +1828,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_tensor * q = q_cur;
         ggml_tensor * k = mctx_cur->get_k(ctx0, il);
         ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-        ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, nullptr, nullptr, nullptr, 0, kq_scale, il, top_k, 0);
+        ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, nullptr, nullptr, nullptr, nullptr, 0, kq_scale, il, top_k, 0);
         cb(cur, "kqv_out", il);
         if (inp->self_v_rot[il]) {
             cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot[il]);
@@ -1868,8 +1868,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // TODO: enable sparse attention when we are ready
     // ref: https://github.com/ggml-org/llama.cpp/pull/27970
-    //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il, top_k, 0);
+    //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, nullptr, top_k->ne[0], kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, nullptr, 0, kq_scale, il, top_k, 0);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

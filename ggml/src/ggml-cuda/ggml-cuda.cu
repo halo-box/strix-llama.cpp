@@ -7169,7 +7169,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 auto overlap = [](const void * a, size_t na, const void * b, size_t nb) {
                     const uintptr_t x = (uintptr_t) a, y = (uintptr_t) b; return x < y + nb && y < x + na; };
                 const ggml_tensor * gs = gate->view_src ? gate->view_src : gate;
-                for (const ggml_tensor * r : std::initializer_list<const ggml_tensor *>{ node->src[0], node->src[1], node->src[2], node->src[3], node->src[5], gs }) {
+                for (const ggml_tensor * r : std::initializer_list<const ggml_tensor *>{ node->src[0], node->src[1], node->src[2], node->src[3], node->src[5], node->src[6], gs }) {
                     if (!r) continue;
                     const ggml_tensor * rr = r->view_src ? r->view_src : r;
                     if (store_f32 && overlap(mul->data, ggml_nbytes(mul), rr->data, ggml_nbytes(rr))) ok = false;

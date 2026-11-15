@@ -10698,7 +10698,7 @@ static vk_pipeline ggml_vk_flash_attn_sel_pipeline(const vk_device & device, con
     const ggml_tensor * q   = op->src[0];
     const ggml_tensor * k   = op->src[1];
     const ggml_tensor * v   = op->src[2];
-    const ggml_tensor * ids = op->src[5];
+    const ggml_tensor * ids = op->src[6];
     if (ids == nullptr || op->src[3] != nullptr || op->src[4] != nullptr || ggml_get_op_params_i32(op, 4) != 0) {
         return nullptr;
     }
@@ -10742,7 +10742,7 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
     if (!pipeline) {
         return false;
     }
-    const ggml_tensor * ids = dst->src[5];
+    const ggml_tensor * ids = dst->src[6];
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
@@ -10917,7 +10917,7 @@ static bool ggml_vk_flash_attn_sel(ggml_backend_vk_context * ctx, vk_context & s
 static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
         const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
-    const ggml_tensor * top_k = dst->src[5];
+    const ggml_tensor * top_k = dst->src[6];
     // The sparse shaders read f16 only. Serve a quantised cache by dequantising it once into
     // the f16 scratch, the same pass the dense path uses. K and V are the same tensor here, so
     // one pass covers both. Without this a quantised cache declines to dense FA, which costs
@@ -11289,7 +11289,7 @@ static uint32_t ggml_vk_fa_union_estimate(ggml_backend_vk_context * ctx, uint32_
 static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_context & subctx,
         const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
         const ggml_tensor * mask, ggml_tensor * dst, vk_fa_compact_state & st) {
-    const ggml_tensor * top_k = dst->src[5];
+    const ggml_tensor * top_k = dst->src[6];
     // K/V type: the gather relocates rows verbatim and never reads a value out of them, so it
     // does not have to be f16 - it has to be a type whose row is a whole number of 4-byte words,
     // and one flash-attention has a NATIVE shader for. The dequant/contiguize pass is disabled
@@ -11650,7 +11650,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     assert(dst->type == GGML_TYPE_F32);
     assert(q->type == GGML_TYPE_F32);
-    if (dst->src[5] != nullptr && mask == nullptr) {
+    if (dst->src[6] != nullptr && mask == nullptr) {
         // supports_op only takes a maskless selected-key op when flash_attn_sel does
         const bool done = ggml_vk_flash_attn_sel(ctx, subctx, q, k, v, dst);
         GGML_ASSERT(done);
@@ -11823,10 +11823,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
-    // Selected-key attention (src[5]) may name any cell, so masked keys must not leak NaN/inf from V; dense
+    // Selected-key attention (src[6]) may name any cell, so masked keys must not leak NaN/inf from V; dense
     // attention relies on the KV cache zeroing freed cells. GGML_VK_FA_NAN_SAFE=1 also protects unified multi-sequence caches.
     static const bool fa_nan_safe_all = [] { const char * e = getenv("GGML_VK_FA_NAN_SAFE"); return e && atoi(e) != 0; }();
-    const bool nan_safe_v = mask != nullptr && (dst->src[5] != nullptr || fa_nan_safe_all);
+    const bool nan_safe_v = mask != nullptr && (dst->src[6] != nullptr || fa_nan_safe_all);
 
     const bool radv_rdna3 = ctx->device->driver_id == vk::DriverId::eMesaRadv &&
                             ctx->device->architecture == vk_device_architecture::AMD_RDNA3;
@@ -22356,9 +22356,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+                if (op->src[5] != nullptr) {
+                    return false;
+                }
                 bool coopmat2 = device->coopmat2;
-                // maskless selected-key attention (src[5] without a mask): only flash_attn_sel reads the list, the dense kernel would attend to all cells
-                if (op->src[5] != nullptr && op->src[3] == nullptr) {
+                // maskless selected-key attention (src[6] without a mask): only flash_attn_sel reads the list, the dense kernel would attend to all cells
+                if (op->src[6] != nullptr && op->src[3] == nullptr) {
                     return ggml_vk_flash_attn_sel_pipeline(device, op) != nullptr;
                 }
                 uint32_t HSK = op->src[1]->ne[0];
