@@ -371,6 +371,7 @@ class Keys:
         DNA_AUTO_TAGS        = "tokenizer.ggml.dna_auto_tags"
         ADD_PREFIX           = "tokenizer.ggml.add_space_prefix"
         REMOVE_EXTRA_WS      = "tokenizer.ggml.remove_extra_whitespaces"
+        CLEAN_SPACES         = "tokenizer.ggml.clean_spaces"
         PRECOMPILED_CHARSMAP = "tokenizer.ggml.precompiled_charsmap"
         SUPPRESS_TOKENS      = "tokenizer.ggml.suppress_tokens"
         HF_JSON              = "tokenizer.huggingface.json"
@@ -382,6 +383,8 @@ class Keys:
         NORMALIZER_NFC           = "tokenizer.ggml.normalizer.nfc"
         NORMALIZER_LOWERCASE     = "tokenizer.ggml.normalizer.lowercase"
         NORMALIZER_STRIP_ACCENTS = "tokenizer.ggml.normalizer.strip_accents"
+        # Metaspace constants
+        METASPACE_PREPEND_SCHEME = "tokenizer.ggml.metaspace.prepend_scheme"
         # FIM/Infill special tokens constants
         FIM_PRE_ID           = "tokenizer.ggml.fim_pre_token_id"
         FIM_SUF_ID           = "tokenizer.ggml.fim_suf_token_id"
