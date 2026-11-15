@@ -683,6 +683,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
         case GGML_TYPE_TQP7:
             return dequantize_tq_cuda<GGML_TYPE_TQP7>;
 #endif
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_F16:
@@ -761,6 +763,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_TQP7:
             return dequantize_tq_cuda<GGML_TYPE_TQP7>;
 #endif
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -836,6 +840,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
         case GGML_TYPE_TQP7:
             return dequantize_tq_cuda<GGML_TYPE_TQP7>;
 #endif
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cont_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
@@ -863,6 +869,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
 #ifdef GGML_USE_TRELLIS
@@ -902,6 +910,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, nv_bfloat16>;
 #ifdef GGML_USE_TRELLIS
@@ -941,6 +951,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_F8_E4M3:
+            return convert_unary_cuda<ggml_fp8_e4m3_t>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
 #ifdef GGML_USE_TRELLIS
