@@ -767,6 +767,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
@@ -825,6 +827,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
+
+            // stop after an EOG like the greedy verifier: later draft tokens are not output but would stay in the context
+            if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
+                break;
+            }
             continue;
         }
 
