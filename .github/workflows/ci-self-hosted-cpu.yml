@@ -47,7 +47,7 @@ env:
 
 jobs:
   cpu-x64-high-perf:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted, Linux, X64, CPU]
 
     steps:
       - name: Clone
