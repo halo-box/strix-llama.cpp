@@ -19082,9 +19082,10 @@ static bool ggml_vk_conv_whole(const ggml_tensor * s, const ggml_tensor * cc) {
     return s == cc || (s && s->view_src == cc && s->view_offs == 0 && ggml_nelements(s) == ggml_nelements(cc) && ggml_is_contiguous(s));
 }
 
-// Structural match at a CONCAT node. With runtime = true it also checks the allocated addresses: the SiLU output
-// must not overlap anything the direct conv reads, and nothing between the concat and the SiLU may write x or
-// the state (graph_optimize asks the allocator to keep both alive, this is the check that it did).
+// Structural match at a CONCAT node. With runtime = true it also gates the token count (ssm_conv_direct_min_tokens)
+// and checks the allocated addresses: the SiLU output must not overlap anything the direct conv reads, and nothing
+// between the concat and the SiLU may write x or the state (graph_optimize asks the allocator to keep both alive,
+// this is the check that it did).
 static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i,
                                           ggml_backend_vk_context::ssm_conv_direct_match & m, bool runtime) {
     const ggml_tensor * cc = cgraph->nodes[i];
