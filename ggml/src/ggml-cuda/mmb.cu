@@ -2051,6 +2051,8 @@ static int64_t mmb_min_t_for(const ggml_backend_cuda_context & ctx, ggml_type ty
 
 bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
+    const ggml_prec prec_src1 = ggml_prec_get_src(dst, 1);
+    if (prec_src1 == GGML_PREC_BF16 || prec_src1 == GGML_PREC_F32) return false;
     const bool quant = mmb_quant_type_dense(src0->type);
     const bool bf16w = src0->type == GGML_TYPE_BF16;
     const bool f32w  = src0->type == GGML_TYPE_F32;
