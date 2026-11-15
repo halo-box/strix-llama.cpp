@@ -1110,7 +1110,7 @@ void ggml_cuda_op_norm_rope_multi(ggml_backend_cuda_context & ctx, ggml_tensor *
     memcpy(&sections.v,  (const int32_t *) rope->op_params + 11, sizeof(int)*4);
     const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
     rope_corr_dims corr_dims;
-    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(rope), corr_dims.v);
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
     const float * ff = rope->src[2] ? (const float *) rope->src[2]->data : nullptr;
     const int total = (int) ggml_nrows(x);
