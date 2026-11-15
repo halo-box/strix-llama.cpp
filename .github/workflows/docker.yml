@@ -65,7 +65,7 @@ jobs:
 
   prepare_matrices:
     name: Prepare Docker matrices
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       build_matrix: ${{ steps.matrices.outputs.build_matrix }}
       merge_matrix: ${{ steps.matrices.outputs.merge_matrix }}
@@ -384,7 +384,7 @@ jobs:
   merge_arch_tags:
     name: Create shared tags from digests
     needs: [prepare_matrices, push_to_registry, create_tag]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
