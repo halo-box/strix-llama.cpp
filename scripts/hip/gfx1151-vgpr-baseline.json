@@ -26,7 +26,6 @@
     "cross-entropy-loss": 4,
     "cumsum": 86,
     "diag": 2,
-    "diagmask": 1,
     "dsv4-hc": 5,
     "exl3": 446,
     "expand": 1,
@@ -167,70 +166,70 @@
     "sgpr_lane_spill_slower": "ROCm 10.1 / clang 24 spills these SGPRs to VGPR lanes (no scratch). Spill-free variants with unchanged output exist (a sched_barrier between the flash-attention KQ, softmax and VKQ phases; an 8-row unroll of the KV_max mask scan), but a 2026-11-01 kernel-time A/B against master on gfx1151 measured them slower: D64 16x2 +21% at KV 4096, D64 8x4 +3-10% at KV 512-2048, D128 32x2 +4%, softcap D128 4x8 / 8x4 and D256 4x8 / 8x4 +1-6%, KV_max<64> +3-5% at 1024-4096 query rows. Remove a budget when its kernel has a spill-free variant that is not slower."
   },
   "kernels": {
-    "_ZL18flash_attn_ext_f16ILi128ELi128ELi16ELi2ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+    "_ZL18flash_attn_ext_f16ILi128ELi128ELi16ELi2ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiS3_PfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiill": {
       "vgprs": 210,
       "spill_stores": 0,
       "scratch_bytes": 0,
       "sgpr_spills": 5,
       "reason": "sgpr_lane_spill"
     },
-    "_ZL18flash_attn_ext_f16ILi128ELi128ELi32ELi2ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+    "_ZL18flash_attn_ext_f16ILi128ELi128ELi32ELi2ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiS3_PfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiill": {
       "vgprs": 246,
       "spill_stores": 0,
       "scratch_bytes": 0,
       "sgpr_spills": 19,
       "reason": "sgpr_lane_spill_slower"
     },
-    "_ZL18flash_attn_ext_f16ILi128ELi128ELi32ELi2ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+    "_ZL18flash_attn_ext_f16ILi128ELi128ELi32ELi2ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiS3_PfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiill": {
       "vgprs": 253,
       "spill_stores": 0,
       "scratch_bytes": 0,
       "sgpr_spills": 5,
       "reason": "sgpr_lane_spill"
     },
-    "_ZL18flash_attn_ext_f16ILi128ELi128ELi4ELi8ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+    "_ZL18flash_attn_ext_f16ILi128ELi128ELi4ELi8ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiS3_PfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiill": {
       "vgprs": 216,
       "spill_stores": 0,
       "scratch_bytes": 0,
       "sgpr_spills": 1,
       "reason": "sgpr_lane_spill_slower"
     },
-    "_ZL18flash_attn_ext_f16ILi128ELi128ELi8ELi4ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+    "_ZL18flash_attn_ext_f16ILi128ELi128ELi8ELi4ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiS3_PfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiill": {
       "vgprs": 213,
       "spill_stores": 0,
       "scratch_bytes": 0,
       "sgpr_spills": 1,
       "reason": "sgpr_lane_spill_slower"
     },
-    "_ZL18flash_attn_ext_f16ILi256ELi256ELi4ELi8ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+    "_ZL18flash_attn_ext_f16ILi256ELi256ELi4ELi8ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiS3_PfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiill": {
       "vgprs": 256,
       "spill_stores": 0,
       "scratch_bytes": 0,
       "sgpr_spills": 1,
       "reason": "sgpr_lane_spill_slower"
     },
-    "_ZL18flash_attn_ext_f16ILi256ELi256ELi8ELi4ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+    "_ZL18flash_attn_ext_f16ILi256ELi256ELi8ELi4ELb1ELb0ELb0EEvPKcS1_S1_S1_S1_PKiS3_PfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiill": {
       "vgprs": 256,
       "spill_stores": 0,
       "scratch_bytes": 0,
       "sgpr_spills": 1,
       "reason": "sgpr_lane_spill_slower"
     },
-    "_ZL18flash_attn_ext_f16ILi64ELi64ELi16ELi2ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+    "_ZL18flash_attn_ext_f16ILi64ELi64ELi16ELi2ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiS3_PfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiill": {
       "vgprs": 239,
       "spill_stores": 0,
       "scratch_bytes": 0,
       "sgpr_spills": 6,
       "reason": "sgpr_lane_spill_slower"
     },
-    "_ZL18flash_attn_ext_f16ILi64ELi64ELi4ELi8ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+    "_ZL18flash_attn_ext_f16ILi64ELi64ELi4ELi8ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiS3_PfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiill": {
       "vgprs": 247,
       "spill_stores": 0,
       "scratch_bytes": 0,
       "sgpr_spills": 6,
       "reason": "sgpr_lane_spill"
     },
-    "_ZL18flash_attn_ext_f16ILi64ELi64ELi8ELi4ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiPfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiiil": {
+    "_ZL18flash_attn_ext_f16ILi64ELi64ELi8ELi4ELb0ELb0ELb0EEvPKcS1_S1_S1_S1_PKiS3_PfP15HIP_vector_typeIfLj2EEffffjfiS5_IjLj3EEiiiiiiiiiiiliiliiiill": {
       "vgprs": 247,
       "spill_stores": 0,
       "scratch_bytes": 0,
