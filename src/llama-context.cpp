@@ -1893,6 +1893,9 @@ bool llama_context::h_nextn_dev_alloc() {
     if (h_nextn_backend == nullptr) {
         return fail("no device backend for the model output");
     }
+    if (strncmp(ggml_backend_name(h_nextn_backend), "Vulkan", 6) == 0) {
+        return fail("Vulkan MTP decode is faster with the host rows");
+    }
 
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead(),
