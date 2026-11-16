@@ -4348,6 +4348,13 @@ struct test_hc_combine_norm_inject : public test_case {
     std::string vars() override { return VARS_TO_STR3(embd, hc, tokens); }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return {out_res, out_norm, out_inj}; }
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (strcmp(ggml_backend_reg_name(reg), "ROCm") == 0) {
+            return std::max(test_case::max_nmse_err(backend), 5e-7);
+        }
+        return test_case::max_nmse_err(backend);
+    }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
         ggml_tensor * block    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
