@@ -326,3 +326,17 @@ inline void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     }
 }
 
+
+#if defined(GGML_USE_EXL3)
+// EXL3 ops (ggml-vulkan-exl3.cpp)
+#define EXL3_MM_ROWS      128u          // GEMM workgroup: 8 wave32 of 16 rows x 128 columns (4 or 16 waves: slower on gfx1151)
+#define EXL3_MAX_EXPERTS  1024          // exl3_route.comp MAX_E
+#define EXL3_ROUTE_SHMEM  (3*EXL3_MAX_EXPERTS*4 + 4)   // exl3_route.comp shared memory in bytes
+#define EXL3_MM_SHMEM     (2*128*20*4)                 // exl3_mul_mm_cm1.comp SH_SIZE in bytes (two W_hat slabs)
+bool ggml_vk_exl3_device_ok(const vk_device & device);
+bool ggml_vk_exl3_device_cm1(const vk_device & device);
+bool ggml_vk_exl3_supports_op(const vk_device & device, const ggml_tensor * op);
+bool ggml_vk_exl3_mul_mat_id_supports_op(const vk_device & device, const ggml_tensor * op);
+void ggml_vk_exl3_mul_mat(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst);
+void ggml_vk_exl3_mul_mat_id(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst);
+#endif
