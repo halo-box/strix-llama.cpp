@@ -180,6 +180,7 @@ static void usage(char ** argv) {
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on CPU and on the first ROCm and Vulkan devices\n");
     LOG("  --qwen4exp-merged       Test that a Qwen4Exp file with merged shared-input weights gives the logits of the separate weights\n");
+    LOG("  --qwen35-merged         The same for a Qwen3.5 file\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
@@ -1135,9 +1136,9 @@ static bool check_causal_attn_toggle(
     return ok;
 }
 
-// a qwen4exp file whose shared-input weights are merged as the upstream converter writes them gives the same logits
-static int test_qwen4exp_merged(const size_t seed, const float stdev) {
-    gguf_context_ptr meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+// a qwen35 / qwen4exp file whose shared-input weights are merged as the upstream converter writes them gives the same logits
+static int test_merged_weights(const llm_arch arch, const size_t seed, const float stdev) {
+    gguf_context_ptr meta = get_gguf_ctx(arch, true);
     llama_model_ptr model = get_model(meta.get(), nullptr, seed, stdev, {});
     const std::string path_sep = get_tmp_gguf_path();
     const std::string path_mrg = get_tmp_gguf_path();
@@ -1213,7 +1214,7 @@ static int test_qwen4exp_merged(const size_t seed, const float stdev) {
     }
     GGML_ASSERT(logits[0].size() == logits[1].size());
     GGML_ASSERT(memcmp(logits[0].data(), logits[1].data(), logits[0].size()*sizeof(float)) == 0);
-    LOG("PASS: Qwen4Exp with %d merged shared-input weights gives the logits of the separate weights\n", n_merged);
+    LOG("PASS: %s with %d merged shared-input weights gives the logits of the separate weights\n", llm_arch_name(arch), n_merged);
     return 0;
 }
 
@@ -2029,6 +2030,7 @@ int main(int argc, char ** argv) {
     const char * target_backend = nullptr;
     bool mtp_cache_only = false;
     bool qwen4exp_merged = false;
+    bool qwen35_merged = false;
     bool kv_shift = false;
 
     int verbosity = LOG_LEVEL_ERROR;
@@ -2060,6 +2062,8 @@ int main(int argc, char ** argv) {
             mtp_cache_only = true;
         } else if (strcmp(argv[i], "--qwen4exp-merged") == 0) {
             qwen4exp_merged = true;
+        } else if (strcmp(argv[i], "--qwen35-merged") == 0) {
+            qwen35_merged = true;
         } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--seed") == 0) {
             if (i + 1 < argc) {
                 seed = std::stoull(argv[++i]);
@@ -2122,7 +2126,10 @@ int main(int argc, char ** argv) {
             return test_mtp_cache_only(seed, stdev);
         }
         if (qwen4exp_merged) {
-            return test_qwen4exp_merged(seed, stdev);
+            return test_merged_weights(LLM_ARCH_QWEN4EXP, seed, stdev);
+        }
+        if (qwen35_merged) {
+            return test_merged_weights(LLM_ARCH_QWEN35, seed, stdev);
         }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);

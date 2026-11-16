@@ -126,6 +126,15 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
     };
 
+    const int64_t n_v_heads = hparams.ssm_dt_rank;
+    const int64_t qkv_dim   = hparams.ssm_d_state * (hparams.ssm_n_group * 2 + n_v_heads);
+    for (int i = 0; i < n_layer_all; ++i) {
+        ml.split_weight(tn(LLM_TENSOR_ATTN_QKV_GATE, "weight", i).str(), tn(LLM_TENSOR_ATTN_QKV, "weight", i).str(), qkv_dim,
+                tn(LLM_TENSOR_ATTN_GATE, "weight", i).str());
+        ml.split_weight(tn(LLM_TENSOR_SSM_BETA_ALPHA_CAT, "weight", i).str(), tn(LLM_TENSOR_SSM_BETA, "weight", i).str(), n_v_heads,
+                tn(LLM_TENSOR_SSM_ALPHA, "weight", i).str());
+    }
+
     for (int i = 0; i < n_layer; ++i) {
         load_block_trunk(i, trunk_flags);
     }
