@@ -557,16 +557,41 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
 #define A_ROW_IB(r) ((r) * p.stride_a / BK)
 #endif
 
+#if defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS)
+// K and k_split are multiples of 256, so a 256-value block type never has a k step past end_k
+#define PREFETCH_A_STEPS(blk)                                                                   \
+            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
+                pre_a[li * BK_STEP + ks] = block_a_load(ib + ks, loadr_a);                      \
+            }
+#elif defined(MUL_MAT_ID)
+// a branch around the A loads costs MUL_MAT_ID 25-45 % on gfx1151 (Q8_0 / Q4_0, n 32-256); the select costs ~1 %
+#define PREFETCH_A_STEPS(blk)                                                                   \
+            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
+                /* a k step past end_k re-reads an in-bounds block; B is zero there */           \
+                const uint ib_k = ((blk) + ks * BK < end_k) ? (ib + ks) : ib;                   \
+                pre_a[li * BK_STEP + ks] = block_a_load(ib_k, loadr_a);                         \
+            }
+#else
+#define PREFETCH_A_STEPS(blk)                                                                   \
+            if ((blk) + BK_STEP * BK <= end_k) {                                                \
+                [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                              \
+                    pre_a[li * BK_STEP + ks] = block_a_load(ib + ks, loadr_a);                  \
+                }                                                                               \
+            } else {                                                                            \
+                [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                              \
+                    /* a k step past end_k re-reads an in-bounds block; B is zero there */       \
+                    const uint ib_k = ((blk) + ks * BK < end_k) ? (ib + ks) : ib;               \
+                    pre_a[li * BK_STEP + ks] = block_a_load(ib_k, loadr_a);                     \
+                }                                                                               \
+            }
+#endif
+
 #define PREFETCH_BLOCK(blk)                                                                     \
     [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
         const uint buf_ib = loadc_a + li * loadstride_a;                                        \
         if (buf_ib < BM) {                                                                      \
             const uint ib = pos_a_ib + A_ROW_IB(buf_ib);                                        \
-            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
-                /* a k step past end_k re-reads an in-bounds block; its scale is zeroed below */ \
-                const uint ib_k = ((blk) + ks * BK < end_k) ? (ib + ks) : ib;                   \
-                pre_a[li * BK_STEP + ks] = block_a_load(ib_k, loadr_a);                         \
-            }                                                                                   \
+            PREFETCH_A_STEPS(blk)                                                               \
         }                                                                                       \
     }                                                                                           \
     [[unroll]] for (uint li = 0; li < B_LOADS; li++) {                                          \
@@ -585,8 +610,8 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
         const uint buf_ib = loadc_a + li * loadstride_a;                                        \
         if (buf_ib < BM) {                                                                      \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
-                const bool in_bounds = (blk) + ks * BK < end_k;                                 \
-                block_a_to_shmem(pre_a[li * BK_STEP + ks], buf_ib, ks, loadr_a, in_bounds);     \
+                /* past end_k the clamped A block is finite and the B data and scale are zero */  \
+                block_a_to_shmem(pre_a[li * BK_STEP + ks], buf_ib, ks, loadr_a, true);          \
             }                                                                                   \
         }                                                                                       \
     }                                                                                           \

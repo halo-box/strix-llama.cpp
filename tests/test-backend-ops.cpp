@@ -17722,6 +17722,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 2, false, 1024, n, 256));
         }
     }
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4}) {
+        for (int64_t k : {160, 224, 288}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 128, k, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 2, false, 256, 128, k));
+        }
+    }
 
 
                     }

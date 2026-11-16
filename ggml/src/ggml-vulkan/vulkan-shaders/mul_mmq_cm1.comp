@@ -539,6 +539,7 @@ void main() {
     }
 
 #undef PREFETCH_BLOCK
+#undef PREFETCH_A_STEPS
 #undef STORE_BLOCK_TO_LDS
 #undef B_IB_CALC
 
