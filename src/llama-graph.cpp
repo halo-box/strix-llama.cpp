@@ -4214,11 +4214,14 @@ ggml_tensor * llm_graph_context::build_rs(
     if (inplace_mode != LLM_RS_INPLACE_NONE) {
         // the same nodes whether or not the mapping is the identity, only their sizes and sources differ, so a graph
         // never needs a reallocation the reserve did not plan for. With the identity the ubatch states are already in
-        // place and are read from the cache rows (the gather skipped them); otherwise from the gathered copy.
-        // Not expanded here, so the view stays next to its consumer.
-        output_states = inplace_mode == LLM_RS_INPLACE_IDENTITY ?
-            ggml_view_2d(ctx0, states,     state_size, n_seqs, states->nb[1],     rs_head*states->nb[1]) :
-            ggml_view_2d(ctx0, states_all, state_size, n_seqs, states_all->nb[1], 0);
+        // place and are read from the cache rows (the gather skipped them); otherwise from the gathered copy. Both
+        // views are in the graph for both mappings: a backend that reorders the graph places a view of the cache and
+        // a view of the gather differently, so a graph with only the one it reads would change the node order.
+        ggml_tensor * states_cache  = ggml_view_2d(ctx0, states,     state_size, n_seqs, states->nb[1],     rs_head*states->nb[1]);
+        ggml_tensor * states_gather = ggml_view_2d(ctx0, states_all, state_size, std::min<int64_t>(n_seqs, states_all->ne[1]), states_all->nb[1], 0);
+        ggml_build_forward_expand(gf, states_cache);
+        ggml_build_forward_expand(gf, states_gather);
+        output_states = inplace_mode == LLM_RS_INPLACE_IDENTITY ? states_cache : states_gather;
     } else {
         output_states = get_state_rows ?
             get_state_rows(ctx0, states, state_copy_main) :
