@@ -3511,6 +3511,7 @@ static ggml_cuda_graph::node_properties ggml_cuda_graph_node_props(const ggml_te
             prop.node_src_data_ptrs[j] = node->src[j]->data;
             memcpy(prop.node_src_ne[j], node->src[j]->ne, sizeof(prop.node_src_ne[j]));
             memcpy(prop.node_src_nb[j], node->src[j]->nb, sizeof(prop.node_src_nb[j]));
+            prop.node_src_type[j] = node->src[j]->type;
         }
     }
 

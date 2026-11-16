@@ -320,6 +320,7 @@ llama_build_and_test(test-chat-template.cpp  LABEL behavior)
 llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp  LABEL behavior)
 llama_build_and_test(test-sched-view-scratch.cpp LINK ggml)
+llama_build_and_test(test-graph-src-type.cpp LINK ggml)
 # Vulkan fused-path exactness: the engagement asserts need the int8 MMQ / f16-output pipelines, which lavapipe and many
 # non-AMD devices lack, so it is not registered as a test (run it manually on a device that has the paths)
 llama_build(test-vk-exact.cpp LINK ggml)
