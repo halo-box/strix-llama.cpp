@@ -818,8 +818,7 @@ void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t siz
 }
 
 static size_t ggml_vk_staging_size_n(const vk_device & device, const std::vector<vk_buffer_region> & regions) {
-    size_t total = 0;
-    size_t max   = 0;
+    size_t max = 0;
     for (const auto & r : regions) {
         vk_buffer pinned;
         size_t pinned_offset;
@@ -827,10 +826,9 @@ static size_t ggml_vk_staging_size_n(const vk_device & device, const std::vector
         if (pinned != nullptr) {
             continue;
         }
-        total += r.size;
         max = std::max(max, r.size);
     }
-    return std::max(max, std::min(total, (size_t) device->suballocation_block_size));
+    return max;
 }
 
 // returns number of regions recorded, stops when staging is full
