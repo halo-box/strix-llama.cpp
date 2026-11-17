@@ -9862,6 +9862,21 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                ggml_is_contiguous(src0) && (ggml_is_contiguous(src1) || ggml_vk_f16_rowstride(src1)) && ggml_is_contiguous(dst) &&
                get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, src1) == 0 && get_misalign_bytes(ctx, dst) == 0) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
+    } else if (ctx->num_additional_fused_ops == 0 && !ggml_vk_mul_mat_exact_batch(dst) &&
+               src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] * src1->ne[3] > 1 && dst->ne[1] > 1 &&
+               dst->ne[1] * dst->ne[2] * dst->ne[3] <= ggml_vk_mul_mat_vec_max_cols(ctx->device) &&
+               ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+        const int64_t n = dst->ne[1] * dst->ne[2] * dst->ne[3];
+        const std::array<int64_t, 4> ne1 = { src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3] }, ned = { dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3] };
+        const std::array<size_t, 4>  nb1 = { src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3] }, nbd = { dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3] };
+        src1->ne[1] = n; src1->ne[2] = 1; src1->ne[3] = 1; src1->nb[2] = src1->nb[3] = n * src1->nb[1];
+        dst->ne[1]  = n; dst->ne[2]  = 1; dst->ne[3]  = 1; dst->nb[2]  = dst->nb[3]  = n * dst->nb[1];
+        ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+        for (int i = 0; i < 4; ++i) {
+            src1->ne[i] = ne1[i]; src1->nb[i] = nb1[i];
+            dst->ne[i]  = ned[i]; dst->nb[i]  = nbd[i];
+        }
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= ggml_vk_mul_mat_vec_max_cols(ctx->device) && src1->ne[2] * src1->ne[3] == 1) ||
