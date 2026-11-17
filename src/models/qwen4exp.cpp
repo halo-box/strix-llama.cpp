@@ -330,6 +330,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
         // an FP8 table keeps its checkpoint bytes, so its per-tensor scale is applied after the gather
         per_layer_tok_embd_s = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "scale"), { 1 }, TENSOR_NOT_REQUIRED);
+        if (per_layer_tok_embd_s && per_layer_tok_embd_s->type != GGML_TYPE_F32) {
+            throw std::runtime_error(format("%s must be F32", per_layer_tok_embd_s->name));
+        }
     }
 
     // keep walking the trunk of an MTP-only file so the per-layer bookkeeping still runs, with its tensors absent
@@ -2896,7 +2899,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
         emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
     }
     if (model.per_layer_tok_embd_s) {
-        emb = ggml_mul(ctx0, emb, model.per_layer_tok_embd_s);
+        emb = ggml_scale(ctx0, emb, model.per_layer_tok_embd_scale);
     }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
