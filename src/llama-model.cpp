@@ -34,6 +34,8 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <tuple>
+#include <fstream>
 #include <mutex>
 #include <numeric>
 #include <regex>
@@ -1270,7 +1272,8 @@ struct llama_model::impl {
 
     // MTP draft vocabulary subsets by (n_keep, buffer type), alive while a context holds one
     std::mutex mtp_draft_mutex;
-    std::map<std::pair<int32_t, ggml_backend_buffer_type_t>, std::weak_ptr<const llama_mtp_draft_vocab>> mtp_draft_cache;
+    // key: n_keep, buffer type, the sorted ids of a vocabulary file (empty = ids < n_keep)
+    std::map<std::tuple<int32_t, ggml_backend_buffer_type_t, std::vector<int32_t>>, std::weak_ptr<const llama_mtp_draft_vocab>> mtp_draft_cache;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -2888,7 +2891,8 @@ static bool mtp_draft_vocab_ids_follow_merge_order(const llama_vocab & vocab, st
     return true;
 }
 
-std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(int32_t n_keep, const llama_model * head_src) const {
+std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(int32_t n_keep, const llama_model * head_src,
+        const std::string & ids_file) const {
     if (n_keep <= 0) {
         return nullptr;
     }
@@ -2921,30 +2925,79 @@ std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(in
         return nullptr;
     }
 
+    // the ids of ids_file, read before the lock: the first n_keep distinct ids, one per line ('#' lines and blank lines skipped)
+    std::vector<int32_t> file_ids;
+    if (!ids_file.empty()) {
+        std::ifstream f(ids_file);
+        if (!f) {
+            LLAMA_LOG_ERROR("%s: mtp_draft_vocab_file %s cannot be read, drafting over the full vocabulary\n", __func__, ids_file.c_str());
+            return nullptr;
+        }
+        std::vector<uint8_t> seen(n_vocab, 0);
+        std::string line;
+        while ((int32_t) file_ids.size() < n_keep && std::getline(f, line)) {
+            const size_t b = line.find_first_not_of(" \t\r");
+            if (b == std::string::npos || line[b] == '#') {
+                continue;
+            }
+            const size_t e = line.find_last_not_of(" \t\r");
+            const std::string tok = line.substr(b, e - b + 1);
+            char * end = nullptr;
+            const long t = std::strtol(tok.c_str(), &end, 10);
+            if (end != tok.c_str() + tok.size() || t < 0 || t >= n_vocab) {
+                LLAMA_LOG_ERROR("%s: mtp_draft_vocab_file %s: '%s' is not a token id, drafting over the full vocabulary\n", __func__,
+                        ids_file.c_str(), tok.c_str());
+                return nullptr;
+            }
+            if (!seen[t]) {
+                seen[t] = 1;
+                file_ids.push_back((int32_t) t);
+            }
+        }
+        if (file_ids.empty()) {
+            LLAMA_LOG_ERROR("%s: mtp_draft_vocab_file %s holds no token ids, drafting over the full vocabulary\n", __func__, ids_file.c_str());
+            return nullptr;
+        }
+        if ((int32_t) file_ids.size() < n_keep) {
+            LLAMA_LOG_WARN("%s: mtp_draft_vocab = %d, but %s holds only %zu distinct token ids\n", __func__, n_keep, ids_file.c_str(),
+                    file_ids.size());
+        }
+        std::sort(file_ids.begin(), file_ids.end());
+    }
+
     const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(out->buffer);
 
-    // the lock covers the build, so that contexts created at the same time with the same n_keep share one subset
+    // the lock covers the build, so that contexts created at the same time with the same subset share one
     std::lock_guard<std::mutex> lock(pimpl->mtp_draft_mutex);
 
     auto & cache = pimpl->mtp_draft_cache;
     for (auto it = cache.begin(); it != cache.end(); ) {
         it = it->second.expired() ? cache.erase(it) : std::next(it);
     }
-    const auto key = std::make_pair(n_keep, buft);
+    const auto key = std::make_tuple(n_keep, buft, file_ids);
     if (auto it = cache.find(key); it != cache.end()) {
         return it->second.lock();
     }
 
-    std::string why;
-    if (!mtp_draft_vocab_ids_follow_merge_order(vocab, why)) {
-        LLAMA_LOG_ERROR("%s: mtp_draft_vocab = %d ignored: %s\n", __func__, n_keep, why.c_str());
-        return nullptr;
+    std::vector<uint8_t> keep(n_vocab, 0);
+    if (!file_ids.empty()) {
+        for (int32_t t : file_ids) {
+            keep[t] = 1;
+        }
+        LLAMA_LOG_INFO("%s: mtp_draft_vocab = %d: %zu token ids from %s\n", __func__, n_keep, file_ids.size(), ids_file.c_str());
+    } else {
+        std::string why;
+        if (!mtp_draft_vocab_ids_follow_merge_order(vocab, why)) {
+            LLAMA_LOG_ERROR("%s: mtp_draft_vocab = %d ignored: %s\n", __func__, n_keep, why.c_str());
+            return nullptr;
+        }
+        std::fill(keep.begin(), keep.begin() + n_keep, 1);
     }
     std::vector<int64_t> ids;
     ids.reserve(n_vocab);
     for (int t = 0; t < n_vocab; ++t) {
         const int attr = (int) vocab.token_get_attr(t);
-        if (t < n_keep || (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
+        if (keep[t] || (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
             ids.push_back(t);
         }
     }
@@ -2970,8 +3023,8 @@ std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(in
     res->ctx.reset(ggml_init(ip));
     res->head = ggml_new_tensor_2d(res->ctx.get(), out->type, out->ne[0], n_sel);
     res->ids  = ggml_new_tensor_1d(res->ctx.get(), GGML_TYPE_I64, n_sel);
-    ggml_format_name(res->head, "mtp_draft_head_%d", n_keep);
-    ggml_format_name(res->ids,  "mtp_draft_ids_%d",  n_keep);
+    ggml_format_name(res->head, file_ids.empty() ? "mtp_draft_head_%d" : "mtp_draft_head_file_%d", n_keep);
+    ggml_format_name(res->ids,  file_ids.empty() ? "mtp_draft_ids_%d"  : "mtp_draft_ids_file_%d",  n_keep);
     res->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(res->ctx.get(), buft));
     if (!res->buf) {
         LLAMA_LOG_ERROR("%s: mtp_draft_vocab = %d: buffer allocation failed, drafting over the full vocabulary\n", __func__, n_keep);

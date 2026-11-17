@@ -382,6 +382,8 @@ struct common_params_speculative_draft {
 
     // MTP only: draft over token ids < N plus control tokens (0 = full vocabulary)
     int32_t mtp_vocab = 0;
+    // MTP only, with mtp_vocab = N > 0: the first N token ids of this file (one per line) instead of ids < N
+    std::string mtp_vocab_file;
     // MTP only (7a, Gufo #603): stop the draft chain before a token whose inclusion drops the product of the drafts' top-1
     // probabilities below this (0 = off); the first draft token is always kept. Width-only: the emitted stream is unchanged
     // (hi5/ITEM7-DRAFT-POLICY.md section 1) when the verify batch computes each row as the one-row decode does.

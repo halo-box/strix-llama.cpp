@@ -1266,6 +1266,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         if (spec_mtp) {
             cparams_dft.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
             cparams_dft.mtp_draft_vocab = params.speculative.draft.mtp_vocab;
+            cparams_dft.mtp_draft_vocab_file = params.speculative.draft.mtp_vocab_file.empty() ? nullptr : params.speculative.draft.mtp_vocab_file.c_str();
         }
         cparams_dft.n_rs_seq = 0;
 

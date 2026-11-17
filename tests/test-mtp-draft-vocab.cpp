@@ -32,9 +32,10 @@
 struct mtp_ctx {
     int32_t        n_vocab_draft; // requested mtp_draft_vocab
     llama_context_ptr ctx;
+    std::string    ids_file;      // requested mtp_draft_vocab_file (empty = ids < N)
 };
 
-static llama_context_ptr make_ctx(llama_model * model, int32_t n_vocab_draft) {
+static llama_context_ptr make_ctx(llama_model * model, int32_t n_vocab_draft, const std::string & ids_file = "") {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = 256;
     cparams.n_batch         = 16;
@@ -42,6 +43,7 @@ static llama_context_ptr make_ctx(llama_model * model, int32_t n_vocab_draft) {
     cparams.n_seq_max       = 1;
     cparams.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
     cparams.mtp_draft_vocab = n_vocab_draft;
+    cparams.mtp_draft_vocab_file = ids_file.empty() ? nullptr : ids_file.c_str();
     cparams.n_rs_seq        = 0;
     llama_context_ptr ctx(llama_init_from_model(model, cparams));
     if (ctx) {
@@ -60,6 +62,35 @@ static std::vector<uint8_t> draft_mask(const llama_vocab * vocab, int32_t n) {
     for (int32_t t = 0; t < n_vocab; ++t) {
         const int attr = (int) llama_vocab_get_attr(vocab, t);
         mask[(size_t) t] = t < n || (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED));
+    }
+    return mask;
+}
+
+// a test ids file: a fixed pseudo-random order of all token ids, so its first N ids are not the ids < N
+static std::vector<int32_t> file_ids(int32_t n_vocab) {
+    std::vector<int32_t> ids(n_vocab);
+    for (int32_t t = 0; t < n_vocab; ++t) {
+        ids[t] = t;
+    }
+    std::mt19937 rng(42);
+    std::shuffle(ids.begin(), ids.end(), rng);
+    return ids;
+}
+
+// mask of a context that reads its ids from the test ids file
+static std::vector<uint8_t> draft_mask_file(const llama_vocab * vocab, int32_t n) {
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<uint8_t> mask = draft_mask(vocab, 0);
+    if (n <= 0 || n >= n_vocab) {
+        return mask;
+    }
+    const std::vector<int32_t> ids = file_ids(n_vocab);
+    for (int32_t t = 0; t < n_vocab; ++t) {
+        const int attr = (int) llama_vocab_get_attr(vocab, t);
+        mask[(size_t) t] = (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0;
+    }
+    for (int32_t i = 0; i < n; ++i) {
+        mask[(size_t) ids[i]] = 1;
     }
     return mask;
 }
@@ -151,9 +182,11 @@ static bool run_interleaved(llama_model * model, const std::string & name, std::
             }
         }
         for (size_t i = 0; i < ctxs.size(); ++i) {
+            const bool from_file = !ctxs[i].ids_file.empty();
             const std::string label = name + " step " + std::to_string(step) + " ctx " + std::string(1, char('A' + i)) +
-                                      " (N=" + std::to_string(ctxs[i].n_vocab_draft) + ")";
-            ok &= check_logits(label, logits[i], draft_mask(vocab, ctxs[i].n_vocab_draft),
+                                      " (N=" + std::to_string(ctxs[i].n_vocab_draft) + (from_file ? ", file" : "") + ")";
+            ok &= check_logits(label, logits[i],
+                               from_file ? draft_mask_file(vocab, ctxs[i].n_vocab_draft) : draft_mask(vocab, ctxs[i].n_vocab_draft),
                                ref && ctxs[i].n_vocab_draft != 0 ? *ref : std::vector<float>());
         }
     }
@@ -201,6 +234,23 @@ static bool test_concurrent(llama_model * model, int32_t n1, int32_t n2) {
     return run_interleaved(model, name, ctxs, 2);
 }
 
+// contexts with the same N, one over ids < N and one over the first N ids of a file, alive at the same time
+static bool test_file(llama_model * model, int32_t n, const std::string & path) {
+    const std::string name = "file " + std::to_string(n);
+    fprintf(stderr, "%s:\n", name.c_str());
+    std::vector<mtp_ctx> ctxs;
+    ctxs.push_back({ n, make_ctx(model, n, path), path });
+    ctxs.push_back({ n, make_ctx(model, n), "" });
+    ctxs.push_back({ 0, make_ctx(model, 0), "" });
+    for (const auto & c : ctxs) {
+        if (!c.ctx) {
+            fprintf(stderr, "failed to create context\n");
+            return false;
+        }
+    }
+    return run_interleaved(model, name, ctxs, 2);
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -237,6 +287,22 @@ int main(int argc, char ** argv) {
     ok &= test_concurrent(model.get(), n1, n2);            // simultaneous creation
     // a subset freed with its last context and requested again
     ok &= test_sequential(model.get(), { n2 }, true);
+
+    // ids from a file: the first N ids of a fixed shuffle of the vocabulary
+    {
+        const std::string path = "test-mtp-draft-vocab-ids-" + std::to_string((long long) std::random_device{}()) + ".txt";
+        FILE * f = fopen(path.c_str(), "w");
+        if (!f) {
+            fprintf(stderr, "cannot write %s\n", path.c_str());
+            return 1;
+        }
+        for (int32_t t : file_ids(n_vocab)) {
+            fprintf(f, "%d\n", t);
+        }
+        fclose(f);
+        ok &= test_file(model.get(), n2, path);
+        std::remove(path.c_str());
+    }
 
     fprintf(stderr, "%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

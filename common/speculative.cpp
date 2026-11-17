@@ -2843,9 +2843,13 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    if (spec_mtp && params.speculative.draft.mtp_vocab <= 0 && !params.speculative.draft.mtp_vocab_file.empty()) {
+        LOG_WRN("%s: --spec-draft-mtp-vocab-file has no effect without --spec-draft-mtp-vocab N\n", __func__);
+    }
     if (spec_mtp) {
         cparams.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
         cparams.mtp_draft_vocab = params.speculative.draft.mtp_vocab;
+        cparams.mtp_draft_vocab_file = params.speculative.draft.mtp_vocab_file.empty() ? nullptr : params.speculative.draft.mtp_vocab_file.c_str();
     }
 
     // the draft context holds as many tokens per sequence as the target context

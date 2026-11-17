@@ -672,7 +672,8 @@ llama_context::llama_context(
         // the draft vocabulary subset belongs to this context; contexts that ask for the same N share one copy
         if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.mtp_draft_vocab > 0) {
             mtp_draft = model.mtp_draft_vocab_get(params.mtp_draft_vocab,
-                    cparams.ctx_other ? &cparams.ctx_other->get_model() : nullptr);
+                    cparams.ctx_other ? &cparams.ctx_other->get_model() : nullptr,
+                    params.mtp_draft_vocab_file ? params.mtp_draft_vocab_file : "");
             if (mtp_draft) {
                 cparams.mtp_draft_vocab = mtp_draft->n_keep;
             }
@@ -4626,6 +4627,7 @@ llama_context_params llama_context_default_params() {
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.mtp_draft_vocab             =*/ 0,
+        /*.mtp_draft_vocab_file        =*/ nullptr,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

@@ -711,8 +711,9 @@ struct llama_exl3 {
     std::unordered_map<const ggml_tensor *, llama_exl3_rows>   rows;    // row table -> signs
 };
 
-// MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep
-// plus control and user-defined tokens. Immutable once built. Contexts that request the same n_keep share one.
+// MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep, or
+// for the first n_keep ids of mtp_draft_vocab_file, plus control and user-defined tokens. Immutable once built. Contexts that
+// request the same n_keep and the same file ids share one.
 struct llama_mtp_draft_vocab {
     int32_t n_keep = 0;
 
@@ -913,7 +914,8 @@ struct llama_model {
     // draft vocabulary subset for mtp_draft_vocab = n_keep, built on first request and freed with the last context
     // holding it; nullptr if the subset cannot be used with this model (thread-safe)
     // head_src: the model whose LM head a head-less (shared) draft borrows, used only when this model has no output
-    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep, const llama_model * head_src = nullptr) const;
+    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep, const llama_model * head_src = nullptr,
+            const std::string & ids_file = "") const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
