@@ -482,7 +482,7 @@ bool server_http_context::init_listener(const common_params & params) {
     };
 
     //
-    // Web UI setup
+    // Llama Chat setup
     //
 
     // stats dashboard: a single self-contained page, independent of the chat UI
