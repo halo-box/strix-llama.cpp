@@ -2677,7 +2677,7 @@ llama_split_mode llama_model::split_mode() const {
 }
 
 bool llama_model::graph_depends_on_n_tokens() const {
-    return arch == LLM_ARCH_QWEN4EXP;
+    return arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE;
 }
 
 bool llama_model::no_alloc() const {
