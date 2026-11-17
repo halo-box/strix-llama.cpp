@@ -367,7 +367,7 @@ build() {  # <be> <source dir> <build dir> <log>
 }
 declare -A BASE_CACHE   # <be> -> the cache directory of its baseline build, when it has one
 for be in ${BACKENDS//,/ }; do
-    mapfile -t fl < <(flags $be)
+    mapfile -t fl < <(flags $be; echo -DLLAMA_USE_PREBUILT_UI=OFF)
     for side in base cand; do
         echo "build $side $be"
         st=$OUT/logs/build-$side-$be.status
