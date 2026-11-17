@@ -210,7 +210,7 @@ ui/apps/chat/        →  build  →  build/ui/apps/chat/dist/
 ### SvelteKit Configuration
 
 ```javascript
-// svelte.config.js
+// vite.config.ts - options passed to sveltekit({ ... })
 adapter: adapter({
   pages: '../../../build/ui/apps/chat/dist',      // Output directory
   assets: '../../../build/ui/apps/chat/dist',     // Static assets
@@ -364,7 +364,7 @@ Components are organized in `app/` (application-specific) and `ui/` (shadcn-svel
 | `DialogConfirmation`           | Generic confirmation for destructive actions             |
 | `DialogConversationRename`     | Edit conversation title                                  |
 
-**Server/Model Components** (`app/server/`, `app/models/`):
+**Server/Model Components** (`app/servers/`, `app/models/`):
 
 | Component                           | Responsibility                                                                                                |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------- |
