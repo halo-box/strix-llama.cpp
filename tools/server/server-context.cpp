@@ -5780,6 +5780,9 @@ static json get_res_dashboard_info(const server_context_meta & meta, const commo
         }
         if (spec.draft.mtp_vocab > 0) {
             jspec["mtp_vocab"] = spec.draft.mtp_vocab;
+            if (!spec.draft.mtp_vocab_file.empty()) {
+                jspec["mtp_vocab_file"] = std::filesystem::path(spec.draft.mtp_vocab_file).filename().string();
+            }
         }
     }
 

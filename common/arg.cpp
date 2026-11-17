@@ -4330,6 +4330,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_VOCAB"));
     add_opt(common_arg(
+        {"--spec-draft-mtp-vocab-file"}, "FNAME",
+        "MTP, with --spec-draft-mtp-vocab N: draft over the first N token ids listed in FNAME (one per line, e.g. ranked by "
+        "how often the model emits them) plus control tokens, instead of ids < N",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_vocab_file = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_VOCAB_FILE"));
+    add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {

@@ -403,6 +403,7 @@ extern "C" {
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
         int32_t  mtp_draft_vocab;       // MTP contexts only: draft over token ids < N plus control tokens (0 = full vocabulary) [EXPERIMENTAL]
+        const char * mtp_draft_vocab_file; // MTP contexts only, with mtp_draft_vocab = N > 0: draft over the first N token ids listed in this file (one per line) plus control tokens, instead of ids < N (NULL = off) [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
