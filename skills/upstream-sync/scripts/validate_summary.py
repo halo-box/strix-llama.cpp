@@ -225,6 +225,12 @@ def kld(be, label):
         return FAIL, None, None      # the candidate crashed or timed out, even after printing its metrics
     if c is None or r is None:
         return INC, None, None
+    if os.path.exists(os.path.join(out, be, "kld", label + ".truth")):
+        ok = (all(math.isfinite(v) for v in c.values()) and c["top"] >= r["top"] - TOP_P_DROP and c["kld"] <= KLD_FACTOR * r["kld"] + KLD_ABS
+              and abs(c["ratio"] - r["ratio"]) <= PPL_RATIO)
+        if not ok:
+            return FAIL, c, r
+        return (PASS if c["kld"] <= QUANT_REL * r["kld"] + KLD_ABS else INC), c, r
     # the PPL ratio only where the reference has it near 1: on a model this bad (a 1-bit 0.8B, PPL about 1e6) the
     # stored baseline logits no longer give its PPL, and the base against itself is already far from 1. KLD and top p judge
     ppl_ok = abs(c["ratio"] - 1.0) <= PPL_RATIO or abs(r["ratio"] - 1.0) > PPL_RATIO
@@ -425,8 +431,10 @@ def main():
     emit("Corpus sha256 in `corpus.sha256`. Thresholds: `Same top p` >= reference - %.1f points, `Mean KLD` <= %.0f x reference + %g, "
          "`PPL(Q)/PPL(base)` within 1 +/- %.2f (a KLD above the reference is INCOMPLETE until the PR explains it); speed: a slowdown "
          "above %d%% fails, or is INCOMPLETE when it is within the summed standard deviations of base and candidate (rerun or explain). "
-         "The reference is the base build against itself with a smaller ubatch."
-         % (TOP_P_DROP, KLD_FACTOR, KLD_ABS, PPL_RATIO, SPEED_REL * 100))
+         "The reference is the base build against itself with a smaller ubatch. The small models (quant matrices, KV cache types) "
+         "are scored against F32 logits of their source model on the CPU instead: the reference is the base build against them, "
+         "a `Mean KLD` above %.2f x the reference + %g is INCOMPLETE, and the PPL ratio must be within %.2f of the reference's."
+         % (TOP_P_DROP, KLD_FACTOR, KLD_ABS, PPL_RATIO, SPEED_REL * 100, QUANT_REL, KLD_ABS, PPL_RATIO))
     resets = (read(os.path.join(out, "gpu-resets.txt")) or "").strip()
     if resets and resets != "0":
         emit()

@@ -429,10 +429,38 @@ model_id() {
     echo "$n"
     if [ "$n" -lt 4294967296 ]; then sha256sum < "$1"; else { head -c 1048576 "$1"; tail -c 1048576 "$1"; } | sha256sum; fi
 }
-kld() {  # <be> <label> <model> <text> <args> <reference args>
+f32_model() {  # <be> <name> <source model>
+    local f=$OUT/truth/$2-F32.gguf
+    if [ ! -s "$f" ]; then
+        mkdir -p "$OUT/truth"
+        run "$OUT/truth/$2-F32.log" "$(bin base $1)/llama-quantize" "$3" "$f.part" F32
+        grep -x 'EXIT=[0-9]*' "$OUT/truth/$2-F32.log" > /dev/null || { [ -s "$f.part" ] && mv "$f.part" "$f"; } || true
+        rm -f "$f.part"
+    fi
+    echo "$f"
+}
+
+truth() {  # <be> <name> <source model> <text> <args>
+    local m t
+    m=$(f32_model "$1" "$2" "$3")
+    t=$OUT/truth/$2-$(echo "$5" | sha256sum | cut -c1-16)
+    if [ -s "$m" ] && { [ ! -s "$t.kld" ] || grep -x 'EXIT=[0-9]*' "$t.txt" > /dev/null; }; then
+        run "$t.txt" "$(bin base $1)/llama-perplexity" -m "$m" -dev none -ngl 0 -fa off -ctk f32 -ctv f32 $5 -f "$4" --kl-divergence-base "$t.kld"
+    fi
+    if [ -s "$t.kld" ] && ! grep -x 'EXIT=[0-9]*' "$t.txt" > /dev/null; then echo "$t.kld"; fi
+}
+
+kld() {  # <be> <label> <model> <text> <args> <reference args> [<F32 CPU logits>]
     local be=$1 d=$OUT/$1/kld/$2 k=$OUT/$1/kld/$2.kld
     # an array: a model path with spaces stays one argument (<args> are options only, split on purpose)
     local o=(-m "$3" -ngl "$(ngl $1)" -fa on -ctk f16 -ctv f16)
+    rm -f "$d.truth"
+    if [ -n "${7:-}" ]; then
+        run "$d-ref.txt"  "$(bin base $be)/llama-perplexity" "${o[@]}" $5 --kl-divergence-base "$7" --kl-divergence
+        run "$d-cand.txt" "$(bin cand $be)/llama-perplexity" "${o[@]}" $5 --kl-divergence-base "$7" --kl-divergence
+        echo "$7" > "$d.truth"
+        return
+    fi
     run "$d-base.txt" "$(bin base $be)/llama-perplexity" "${o[@]}" $5 -f "$4" --kl-divergence-base "$k"
     run "$d-cand.txt" "$(bin cand $be)/llama-perplexity" "${o[@]}" $5 --kl-divergence-base "$k" --kl-divergence
     # the reference (the baseline against itself, another ubatch) depends only on the baseline build, the model, the
@@ -561,8 +589,9 @@ srckld() {  # <be> <name> <source model> <type> <base file> <cand file>
 # a small model in every quant type of <types>: both quantizers (same file or not), then KLD and speed on the file of the
 # baseline quantizer. <name>: small or moe, the prefix of every file; the rest of the arguments go to llama-quantize.
 quants() {  # <be> <name> <model> <source type> <types> [quantize options...]
-    local be=$1 n=$2 m=$3 st=$4 types=$5 q f c sb sc
+    local be=$1 n=$2 m=$3 st=$4 types=$5 q f c sb sc tk
     shift 5
+    tk=$(truth "$be" "$n" "$m" "$OUT/all.txt" "-c 512 -b 512 -ub 512 --chunks 8")
     for q in $types; do
         f=$OUT/quant/$n-$q.gguf c=$OUT/quant/cand-$n-$q.gguf
         if [ "$q" = "$st" ]; then
@@ -581,7 +610,7 @@ quants() {  # <be> <name> <model> <source type> <types> [quantize options...]
             rm -f "$f.part" "$c" "$c.part"
         fi
         [ -f "$f" ] || { echo "$be: no $n $q file from the base quantizer, skip its KLD and bench"; continue; }
-        kld "$be" "$n-$q" "$f" "$OUT/all.txt" "-c 512 -b 512 -ub 512 --chunks 8" "-c 512 -b 512 -ub 128 --chunks 8"
+        kld "$be" "$n-$q" "$f" "$OUT/all.txt" "-c 512 -b 512 -ub 512 --chunks 8" "-c 512 -b 512 -ub 128 --chunks 8" "$tk"
         bench "$be" "$n-$q" "$f" "-p 512 -n 128 -r 3 -ngl $(ngl $be) -fa on" "512 0 0" "0 128 0"
     done
     rm -f "$OUT/quant/$n-src.kld"   # the logits of srckld(): about 1 GB
@@ -782,8 +811,9 @@ for be in ${BACKENDS//,/ }; do
     # the small model with a quantized KV cache: K and V of the same type (the later -ctk / -ctv win over kld's f16)
     kvm=$SMALL
     echo "$be: KV cache types"
+    kvt=$(truth "$be" small "$kvm" "$OUT/all.txt" "-c 2048 -b 2048 -ub 2048 --chunks 4")
     for t in $KV_TYPES; do
-        kld "$be" "kv-$t" "$kvm" "$OUT/all.txt" "-c 2048 -b 2048 -ub 2048 --chunks 4 -ctk $t -ctv $t" "-c 2048 -b 2048 -ub 512 --chunks 4 -ctk $t -ctv $t"
+        kld "$be" "kv-$t" "$kvm" "$OUT/all.txt" "-c 2048 -b 2048 -ub 2048 --chunks 4 -ctk $t -ctv $t" "-c 2048 -b 2048 -ub 512 --chunks 4 -ctk $t -ctv $t" "$kvt"
         bench "$be" "kv-$t" "$kvm" "-p 512 -n 128 -d 8192 -r 3 -ngl $(ngl $be) -fa on -ctk $t -ctv $t" "512 0 8192" "0 128 8192"
     done
 
@@ -810,6 +840,7 @@ for be in ${BACKENDS//,/ }; do
     done
     report_pr "Running: $be done, $(date -u '+%F %H:%M') UTC."
 done
+rm -rf "$OUT/truth"
 
 report_pr
 echo
