@@ -4796,7 +4796,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--tts-lang"}, "FNAME",
         "language (ISO 639-1) for audio generation\n"
-        "see tts/README.md for per-model usage notes",
+        "see docs/multimodal/tts.md for per-model usage notes",
         [](common_params & params, const std::string & value) {
             params.tts_lang = value;
         }
@@ -4804,7 +4804,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--tts-voice"}, "VOICE",
         "voice for audio generation (model-dependent)\n"
-        "see tts/README.md for per-model usage notes",
+        "see docs/multimodal/tts.md for per-model usage notes",
         [](common_params & params, const std::string & value) {
             params.tts_voice = value;
         }
