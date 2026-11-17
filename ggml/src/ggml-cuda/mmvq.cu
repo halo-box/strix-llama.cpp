@@ -1566,13 +1566,13 @@ static __device__ __forceinline__ float mmvq_fq_block_sum(const float * v, const
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
         // offset 16: a_i = x_i + x_{i^16}, x_{i^16} lives two lanes over
-        a[k] = v[k] + __shfl_xor_sync(0xffffffff, v[k], 2, width);
+        a[k] = v[k] + ggml_cuda_shfl_xor(v[k], 2, width);
     }
     float b[8];
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
         // offset 8: b_i = a_i + a_{i^8}, one lane over
-        b[k] = a[k] + __shfl_xor_sync(0xffffffff, a[k], 1, width);
+        b[k] = a[k] + ggml_cuda_shfl_xor(a[k], 1, width);
     }
     float c[4];
 #pragma unroll
@@ -1758,10 +1758,10 @@ static __global__ void mul_mat_vec_q_fq(
                 for (int k = 0; k < 8; ++k) {
                     ss = fmaf(v[k], v[k], ss);
                 }
-                ss += __shfl_xor_sync(0xffffffff, ss, 1, warp_size);
-                ss += __shfl_xor_sync(0xffffffff, ss, 2, warp_size);
-                ss += __shfl_xor_sync(0xffffffff, ss, 4, warp_size);
-                ss += __shfl_xor_sync(0xffffffff, ss, 8, warp_size);
+                ss += ggml_cuda_shfl_xor(ss, 1, warp_size);
+                ss += ggml_cuda_shfl_xor(ss, 2, warp_size);
+                ss += ggml_cuda_shfl_xor(ss, 4, warp_size);
+                ss += ggml_cuda_shfl_xor(ss, 8, warp_size);
                 const float rms_scale = rsqrtf(ss / 128.0f + fusion.y_eps);
                 const float * z = (const float *) fusion.y_gate + ib*QK8_1 + sub*8;
                 const float * w = (const float *) fusion.y_norm_w + (ib*QK8_1 + sub*8) % 128;
@@ -1789,8 +1789,8 @@ static __global__ void mul_mat_vec_q_fq(
             for (int k = 1; k < 8; ++k) {
                 amax = fmaxf(amax, fabsf(v[k]));
             }
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, warp_size));
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, warp_size));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 1, warp_size));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 2, warp_size));
 
             const float sum = mmvq_fq_needs_sum(type) ? mmvq_fq_block_sum(v, warp_size) : 0.0f;
 
@@ -2114,8 +2114,8 @@ static __global__ void mul_mat_vec_fq_group(
             for (int k = 1; k < 8; ++k) {
                 amax = fmaxf(amax, fabsf(v[k]));
             }
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, warp_size));
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, warp_size));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 1, warp_size));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 2, warp_size));
 
             const float d = amax / 127.0f;
             int q[8];

@@ -975,7 +975,7 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
 // registers. NeoX pairing (p, p + n_dims/2) with n_dims % 64 == 0 keeps both elements of a pair in the same lane.
 static __device__ __forceinline__ float nrm_xor_tree(float v) {
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) { v += __shfl_xor_sync(0xffffffff, v, off, 32); }
+    for (int off = 16; off > 0; off >>= 1) { v += ggml_cuda_shfl_xor(v, off, 32); }
     return v;
 }
 

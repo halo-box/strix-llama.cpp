@@ -28,7 +28,7 @@ static __global__ __launch_bounds__(128) void qsa_decode_partial(
 #pragma unroll
         for (int d = 0; d < 8; ++d) { dot = fmaf(qv[d], __half2float(kr[lane + d*32]), dot); }
 #pragma unroll
-        for (int delta = 16; delta > 0; delta >>= 1) { dot += __shfl_xor_sync(0xffffffff, dot, delta, 32); }
+        for (int delta = 16; delta > 0; delta >>= 1) { dot += ggml_cuda_shfl_xor(dot, delta, 32); }
         const float score = dot*scale + bias;
         const float next = fmaxf(mx, score);
         const float alpha = expf(mx - next), weight = expf(score - next);
