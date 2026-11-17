@@ -345,7 +345,7 @@ for side in base cand; do
     [ -d "$OUT/src-$side" ] || git worktree add -q --detach "$OUT/src-$side" "$rev"
     git -C "$OUT/src-$side" checkout -q --detach "$rev"
 done
-TARGETS="llama-perplexity llama-tokenize llama-imatrix llama-bench llama-server llama-quantize test-backend-ops test-llama-archs"
+TARGETS="llama-perplexity llama-tokenize llama-imatrix llama-bench llama-server llama-quantize test-backend-ops test-llama-archs test-llama-context"
 # ccache, when installed, for every compiler (the HIP one included): the candidate shares most objects with the baseline
 cc=()
 command -v ccache > /dev/null && cc=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache)
@@ -738,6 +738,9 @@ for be in ${BACKENDS//,/ }; do
         sed -i 's/\x1b\[[0-9;]*m//g' "$OUT/$be/archs-$t.txt"
     done
     keep "$be" archs-base.txt "Summary:"
+    for t in base cand; do
+        run "$OUT/$be/sls-$t.txt" "$(bin $t $be)/test-llama-context" -m "$SMALL" -dev "$(dev $be)"
+    done
 
     # 3. the small model in every quant type: logits, speed, and whether the quantizer output changed
     why=$(quants_skip "$be")

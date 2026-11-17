@@ -101,7 +101,7 @@ def backends_passed(text):
 def archs_run(text):
     """test-llama-archs rows (arch, device, Dense/MoE) that ran, OK or FAIL: a skipped arch prints SKIP and is not counted"""
     rows = re.findall(r"^\|\s*(\S+)\|\s*([^|]*?)\s*\|\s*(Dense|MoE)\|\s*(OK|FAIL)\b", ANSI.sub("", text), re.M)
-    return {r[:3] for r in rows}
+    return {(r[0], re.sub(r"\s*\([^()]*\)$", "", r[1]), r[2]) for r in rows}
 
 
 def failing(text):
@@ -463,7 +463,7 @@ def main():
         else:
             st, note = FAIL, "fails on the candidate only"
         statuses.append(st)
-        rows.append(("test-save-load-state (small model)", st, note))
+        rows.append(("test-llama-context (small model)", st, note))
 
         # every quant asked for in the manifest: a missing result is INCOMPLETE, never left out
         quant_tables = []
@@ -522,7 +522,7 @@ def main():
 
         mem_rows = [mem_row("test-backend-ops", [k("ops-base.txt")], [k("ops-cand.txt")], gate=False),
                     mem_row("test-llama-archs", [k("archs-base.txt")], [k("archs-cand.txt")]),
-                    mem_row("test-save-load-state", [k("sls-base.txt")], [k("sls-cand.txt")])]
+                    mem_row("test-llama-context", [k("sls-base.txt")], [k("sls-cand.txt")])]
         for f in sorted(glob.glob(k("kld", "*-cand.txt"))):
             label = os.path.basename(f)[:-len("-cand.txt")]
             mem_rows.append(mem_row("perplexity " + label, [k("kld", label + "-base.txt")], [f]))
