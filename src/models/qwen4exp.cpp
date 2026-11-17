@@ -328,6 +328,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         if (ple_quant) {
             ple_exl3_k = (int32_t) ((ple_w->tensor->ne[0] - 1)*16/hparams.ple_head_dim);
         }
+        // an FP8 table keeps its checkpoint bytes, so its per-tensor scale is applied after the gather
+        per_layer_tok_embd_s = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "scale"), { 1 }, TENSOR_NOT_REQUIRED);
     }
 
     // keep walking the trunk of an MTP-only file so the per-layer bookkeeping still runs, with its tensors absent
@@ -2892,6 +2894,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     if (rows != nullptr) {
         // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
         emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    }
+    if (model.per_layer_tok_embd_s) {
+        emb = ggml_mul(ctx0, emb, model.per_layer_tok_embd_s);
     }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
