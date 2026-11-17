@@ -573,7 +573,7 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
             }
 #else
 #define PREFETCH_A_STEPS(blk)                                                                   \
-            if ((blk) + BK_STEP * BK <= end_k) {                                                \
+            if (BM > 32 && (blk) + BK_STEP * BK <= end_k) {                                     \
                 [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                              \
                     pre_a[li * BK_STEP + ks] = block_a_load(ib + ks, loadr_a);                  \
                 }                                                                               \
