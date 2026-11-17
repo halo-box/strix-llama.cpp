@@ -967,8 +967,9 @@ static int test_mtp_cache_only(const size_t seed, const float stdev) {
 }
 
 static std::string get_tmp_gguf_path() {
+    static const std::string run = std::to_string(std::random_device{}());
     static size_t id = 0;
-    return (std::filesystem::temp_directory_path() / ("test-llama-archs-" + std::to_string(++id) + ".gguf")).string();
+    return (std::filesystem::temp_directory_path() / ("test-llama-archs-" + run + "-" + std::to_string(++id) + ".gguf")).string();
 }
 
 static llama_model_ptr get_model(
