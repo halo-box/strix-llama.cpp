@@ -101,7 +101,7 @@ def backends_passed(text):
 def archs_run(text):
     """test-llama-archs rows (arch, device, Dense/MoE) that ran, OK or FAIL: a skipped arch prints SKIP and is not counted"""
     rows = re.findall(r"^\|\s*(\S+)\|\s*([^|]*?)\s*\|\s*(Dense|MoE)\|\s*(OK|FAIL)\b", ANSI.sub("", text), re.M)
-    return {(r[0], re.sub(r"\s*\([^()]*\)$", "", r[1]), r[2]) for r in rows}
+    return {(r[0], re.sub(r"\s*\((?:ROCm|Vulkan|CUDA|Metal|SYCL|CPU)\d*\)$", "", r[1]), r[2]) for r in rows}
 
 
 def failing(text):
