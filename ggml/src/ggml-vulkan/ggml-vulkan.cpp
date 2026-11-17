@@ -17637,6 +17637,17 @@ enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t buffer
     return GGML_STATUS_SUCCESS;
 }
 
+static void ggml_vk_wait_compute_idle(const vk_device & device) {
+    vk_queue_handle * h = device->compute_queue->handle.get();
+    std::unique_lock<std::mutex> device_guard;
+    if (h->device_submit_mutex) {
+        device_guard = std::unique_lock<std::mutex>(*h->device_submit_mutex);
+    }
+    h->lock();
+    h->queue.waitIdle();
+    h->unlock();
+}
+
 void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_memset_tensor(" << buffer << ", " << tensor << ", " << value << ", " << offset << ", " << size << ")");
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
@@ -17647,6 +17658,7 @@ void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_ten
     }
 
     uint32_t val32 = (uint32_t)value * 0x01010101;
+    ggml_vk_wait_compute_idle(buf->device);
     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
 }
 
@@ -17716,6 +17728,10 @@ bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_
         vk_buffer src_buf = src_buf_ctx->dev_buffer;
         vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
 
+        ggml_vk_wait_compute_idle(src_buf->device);
+        if (dst_buf->device != src_buf->device) {
+            ggml_vk_wait_compute_idle(dst_buf->device);
+        }
         ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
 
         return true;
@@ -17767,6 +17783,14 @@ bool ggml_backend_vk_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer, const ggm
         regions[i] = { ggml_vk_tensor_dev_buffer(dsts[i]), vk_tensor_offset(dsts[i]) + dsts[i]->view_offs,
                        ggml_vk_tensor_dev_buffer(srcs[i]), vk_tensor_offset(srcs[i]) + srcs[i]->view_offs, ggml_nbytes(srcs[i]) };
     }
+    for (size_t i = 0; i < n_tensors; i++) {
+        if (i == 0 || regions[i].src->device != regions[0].src->device) {
+            ggml_vk_wait_compute_idle(regions[i].src->device);
+        }
+        if (regions[i].dst->device != regions[i].src->device) {
+            ggml_vk_wait_compute_idle(regions[i].dst->device);
+        }
+    }
     ggml_vk_buffer_copy_n(regions.data(), n_tensors);
     return true;
 
@@ -17776,6 +17800,7 @@ bool ggml_backend_vk_buffer_cpy_tensor_n(ggml_backend_buffer_t buffer, const ggm
 void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
+    ggml_vk_wait_compute_idle(ctx->dev_buffer->device);
     ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
 }
 
