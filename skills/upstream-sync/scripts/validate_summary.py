@@ -226,8 +226,8 @@ def kld(be, label):
     if c is None or r is None:
         return INC, None, None
     if os.path.exists(os.path.join(out, be, "kld", label + ".truth")):
-        ok = (all(math.isfinite(v) for v in c.values()) and c["top"] >= r["top"] - TOP_P_DROP and c["kld"] <= KLD_FACTOR * r["kld"] + KLD_ABS
-              and abs(c["ratio"] - r["ratio"]) <= PPL_RATIO)
+        ok = (all(math.isfinite(v) for v in c.values()) and c["ratio"] > 0 and c["kld"] <= KLD_FACTOR * r["kld"] + KLD_ABS
+              and math.log(c["ratio"] / r["ratio"]) <= PPL_RATIO)
         if not ok:
             return FAIL, c, r
         return (PASS if c["kld"] <= QUANT_REL * r["kld"] + KLD_ABS else INC), c, r
@@ -433,8 +433,9 @@ def main():
          "above %d%% fails, or is INCOMPLETE when it is within the summed standard deviations of base and candidate (rerun or explain). "
          "The reference is the base build against itself with a smaller ubatch. The small models (quant matrices, KV cache types) "
          "are scored against F32 logits of their source model on the CPU instead: the reference is the base build against them, "
-         "a `Mean KLD` above %.2f x the reference + %g is INCOMPLETE, and the PPL ratio must be within %.2f of the reference's."
-         % (TOP_P_DROP, KLD_FACTOR, KLD_ABS, PPL_RATIO, SPEED_REL * 100, QUANT_REL, KLD_ABS, PPL_RATIO))
+         "a `Mean KLD` above %.2f x the reference + %g is INCOMPLETE, the PPL ratio may be at most %d%% above the reference's, and "
+         "`Same top p` is not judged (near 90%% there, one token in the text moves it)."
+         % (TOP_P_DROP, KLD_FACTOR, KLD_ABS, PPL_RATIO, SPEED_REL * 100, QUANT_REL, KLD_ABS, round(PPL_RATIO * 100)))
     resets = (read(os.path.join(out, "gpu-resets.txt")) or "").strip()
     if resets and resets != "0":
         emit()
