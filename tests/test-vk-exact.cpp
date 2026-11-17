@@ -567,6 +567,9 @@ static int run(ggml_backend_t be, bool fusion) {
         case_mmid_mul(be, GGML_TYPE_IQ3_XXS, 2560, 768, 32, 10, nt, false);   // routed f16-B pf, f32 B
         case_mmid_mul(be, GGML_TYPE_IQ3_XXS, 2560, 768, 32, 10, nt, true);    // routed f16-B pf, f16 B
         case_mmid_mul(be, GGML_TYPE_Q6_K,    2560, 768, 32, 10, nt, true);
+#ifdef GGML_USE_TRELLIS
+        case_mmid_mul(be, GGML_TYPE_TQ2_T,   2560, 640, 32, 10, nt, true);    // TQ2_T pf, no MMID_B_FULL
+#endif
     }
     case_mmid_mul(be, GGML_TYPE_Q4_K, 2048, 512, 32, 8, 512, false);          // 35B down
     for (int64_t nt : { 2048, 130 }) {
