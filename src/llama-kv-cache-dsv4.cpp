@@ -38,6 +38,18 @@ static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
     ggml_backend_tensor_memset(tensor, 0, stream*stream_size, stream_size);
 }
 
+static void dsv4_zero_tensor_stream_rows(ggml_tensor * tensor, uint32_t stream, uint32_t r0) {
+    GGML_ASSERT(ggml_is_contiguous(tensor));
+    GGML_ASSERT(tensor->ne[3] == 1);
+    GGML_ASSERT(stream < (uint32_t) tensor->ne[2]);
+
+    const uint32_t n_rows = (uint32_t) tensor->ne[1];
+    if (r0 >= n_rows) {
+        return;
+    }
+    ggml_backend_tensor_memset(tensor, 0, stream*tensor->nb[2] + r0*tensor->nb[1], (n_rows - r0)*tensor->nb[1]);
+}
+
 static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size) {
     if (pos_max < 0) {
         return 0;
@@ -1617,6 +1629,16 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         const bool res = kv_raw->seq_rm(seq_id, p0, p1);
         if (res) {
             rs_idx[seq_id] = (uint32_t) rollback;
+
+            const std::pair<llama_kv_cache *, const llama_dsv4_comp_state *> comps[] = {
+                { kv_csa.get(), csa_state.get() }, { kv_hca.get(), hca_state.get() }, { kv_lid.get(), lid_state.get() },
+            };
+            for (const auto & [kv, state] : comps) {
+                const uint32_t r0 = dsv4_state_n_used_k_rows(p0 - 1, state->get_ratio(), kv->get_size());
+                for (uint32_t il : kv->get_layer_ids()) {
+                    dsv4_zero_tensor_stream_rows(kv->get_k_storage(il), (uint32_t) seq_id, r0);
+                }
+            }
         }
 
         return res;
