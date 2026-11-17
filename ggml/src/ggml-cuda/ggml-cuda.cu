@@ -4362,6 +4362,22 @@ static bool ggml_cuda_try_topk_moe(ggml_backend_cuda_context & ctx, const ggml_c
 //     -> gated_delta_net -> cpy(new state -> cache) -> rms_norm -> mul(norm weight)
 // for one sequence with S == 128 and at most 8 tokens and rollback slots.
 // Returns the number of nodes to skip after the concat (0 when the pattern does not match).
+// GGML_CUDA_FUSE_GDN_DECODE_T=0: do not match the SET_ROWS rollback store (speculative verify, n_rs_seq > 0)
+static bool ggml_cuda_gdn_decode_rollback_enabled() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_CUDA_FUSE_GDN_DECODE_T");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return on;
+}
+
+// GGML_CUDA_FUSE_GDN_DECODE_T1=1: also match the rollback store at one token. Off by default: the single-token rollback
+// form keeps the existing path until the fused one-token store has been verified on a model end to end
+static bool ggml_cuda_gdn_decode_rollback_t1_enabled() {
+    const char * env = getenv("GGML_CUDA_FUSE_GDN_DECODE_T1");
+    return env != nullptr && atoi(env) != 0;
+}
+
 static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_decode_args & args) {
     const ggml_tensor * concat = cgraph->nodes[node_idx];
     if (concat->op != GGML_OP_CONCAT || concat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(concat, 0) != 0) {
@@ -4402,16 +4418,41 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     // at the logical ops (in particular idx[10] is still the gated delta net).
     int qk_mode = -1; // -1: undecided, 0: L2_NORM, 1: RMS_NORM + SCALE
     const ggml_tensor * qk_scale[2] = { nullptr, nullptr };
+    // build_conv_state_store with rollback slots (n_rs_seq > 0) stores the conv windows as
+    //   s_slot_rev = CPY_I32(SCALE(ARANGE(0, K, 1), -1, K - 1)); SET_ROWS(slots, windows(concat), VIEW(s_slot_rev, K - Kw .. K))
+    // instead of the per-slot CPYs. The fused kernel writes the same windows into the same slots, so the four nodes
+    // take position 0 (the SET_ROWS stands for the conv store) and the slot order is checked below.
+    const ggml_tensor * rb_arange = nullptr, * rb_scale = nullptr, * rb_cast = nullptr, * rb_set = nullptr;
     for (int j = node_idx + 1; j < cgraph->n_nodes && found < n_ops; ) {
         const ggml_tensor * t = cgraph->nodes[j];
         if (ggml_cuda_is_view_or_noop(t)) {
             ++j;
             continue;
         }
+        if (found == 0 && t->op == GGML_OP_ARANGE && ggml_cuda_gdn_decode_rollback_enabled()) {
+            int jj = j;
+            auto next_compute = [&]() -> const ggml_tensor * {
+                for (++jj; jj < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[jj]); ++jj) {}
+                return jj < cgraph->n_nodes ? cgraph->nodes[jj] : nullptr;
+            };
+            rb_arange = t;
+            rb_scale  = next_compute();
+            rb_cast   = next_compute();
+            rb_set    = next_compute();
+            if (!rb_scale || !rb_cast || !rb_set || rb_set->op != GGML_OP_SET_ROWS || rb_set->type != GGML_TYPE_F32) {
+                return 0;
+            }
+            n[0]   = rb_set;
+            idx[0] = jj;
+            last   = jj;
+            found  = 1;
+            j      = jj + 1;
+            continue;
+        }
         if (t->type != GGML_TYPE_F32) {
             return 0;
         }
-        if (found == 1 && t->op == GGML_OP_CPY) {
+        if (found == 1 && t->op == GGML_OP_CPY && !rb_set) {
             if (n_conv_cpy == 8) {
                 return 0;
             }
@@ -4501,17 +4542,57 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     };
 
     const int64_t K = ggml_get_op_params_i32(gdn, 0);
-    if (K < n_tokens || K > 8 || n_conv_cpy != K) {
+    if (K < n_tokens || K > 8 || (!rb_set && n_conv_cpy != K)) {
         return 0;
     }
 
+    float * conv_out_base = nullptr;
+    int64_t conv_slot_stride = 0;
+    if (rb_set) {
+        // slot order {Kw-1, ..., 0} with Kw = min(n_tokens, K) = n_tokens: window w (columns n - (Kw - 1) + w ...)
+        // goes to slot Kw - 1 - w, i.e. slot s holds the window that starts at column n_tokens - s, which is what
+        // the fused kernel writes for token n_tokens - 1 - s. Slots n_tokens..K-1 stay unwritten (conv_fill_tail off).
+        const int64_t Kw = n_tokens;
+        if (n_tokens == 1 && !ggml_cuda_gdn_decode_rollback_t1_enabled()) {
+            return 0;
+        }
+        // ggml_set_rows(a, b, c) keeps src[0] = b (rows), src[1] = c (indices), src[2] = a (destination)
+        const ggml_tensor * windows = rb_set->src[0];
+        const ggml_tensor * order   = rb_set->src[1];
+        const ggml_tensor * slots   = rb_set->src[2];
+        float ar[3], sc[2];
+        memcpy(ar, rb_arange->op_params, sizeof(ar));
+        memcpy(sc, rb_scale->op_params, sizeof(sc));
+        const bool ok =
+            rb_arange->type == GGML_TYPE_F32 && rb_arange->ne[0] == K && ar[0] == 0.0f && ar[1] == (float) K && ar[2] == 1.0f &&
+            rb_scale->op == GGML_OP_SCALE && rb_scale->type == GGML_TYPE_F32 && rb_scale->src[0] == rb_arange &&
+            sc[0] == -1.0f && sc[1] == (float) (K - 1) &&
+            rb_cast->op == GGML_OP_CPY && rb_cast->type == GGML_TYPE_I32 && rb_cast->src[0] == rb_scale && rb_cast->ne[0] == K &&
+            order && order->type == GGML_TYPE_I32 && ggml_nelements(order) == Kw && order->nb[0] == sizeof(int32_t) &&
+            is_view_of(order, rb_cast, (K - Kw) * sizeof(int32_t)) &&
+            windows && windows->type == GGML_TYPE_F32 && is_view_of(windows, concat, (n_tokens - (Kw - 1)) * sizeof(float)) &&
+            windows->ne[0] == d_conv - 1 && windows->ne[1] == Kw && windows->ne[2] == C && windows->ne[3] == 1 &&
+            windows->nb[0] == sizeof(float) && windows->nb[1] == sizeof(float) && windows->nb[2] == concat->nb[1] &&
+            slots && slots->type == GGML_TYPE_F32 && slots->data != nullptr && slots->view_src != nullptr &&
+            ggml_is_contiguous(slots->view_src) &&
+            slots->ne[0] == d_conv - 1 && slots->ne[1] == K && slots->ne[2] == C && slots->ne[3] == 1 &&
+            slots->nb[0] == sizeof(float) && slots->nb[2] == (d_conv - 1) * sizeof(float) &&
+            slots->nb[1] % sizeof(float) == 0 && (int64_t) slots->nb[1] >= (d_conv - 1) * C * (int64_t) sizeof(float) &&
+            rb_set->data == slots->data &&
+            (rb_arange->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && (rb_scale->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+            (rb_cast->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+        if (!ok) {
+            return 0;
+        }
+        conv_out_base    = (float *) slots->data;
+        conv_slot_stride = slots->nb[1] / sizeof(float);
+    } else {
     const ggml_tensor * conv_dst = conv_cpy[0]->src[1];
     for (int k = 1; k < n_conv_cpy; ++k) {
         if (conv_cpy[k]->src[1]->view_offs < conv_dst->view_offs) {
             conv_dst = conv_cpy[k]->src[1];
         }
     }
-    int64_t conv_slot_stride = 0;
     if (K > 1) {
         const ggml_tensor * cache = conv_dst->view_src;
         if (!cache || cache->ne[0] != (d_conv - 1) * C || cache->ne[1] < K || cache->ne[1] % K != 0 || !ggml_is_contiguous(cache)) {
@@ -4534,6 +4615,8 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
             return 0;
         }
         conv_slots |= 1u << slot;
+    }
+    conv_out_base = (float *) conv_dst->data;
     }
 
     // ssm_conv(concat, weight [d_conv, C]) without bias, then silu
@@ -4626,8 +4709,17 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     // The first kernel writes only the two cache rows: the state row may alias the gathered input row (in-place
     // update, every block reads its head before writing it) and the conv row must not alias any external input
     // of the range. The final output is written by a second kernel after all inputs have been consumed.
-    for (int k = 0; k < n_conv_cpy; ++k) {
-        const ggml_tensor * out = conv_cpy[k]->src[1];
+    const ggml_tensor * conv_outs[8];
+    int n_conv_outs = 0;
+    if (rb_set) {
+        conv_outs[n_conv_outs++] = rb_set->src[2];
+    } else {
+        for (int k = 0; k < n_conv_cpy; ++k) {
+            conv_outs[n_conv_outs++] = conv_cpy[k]->src[1];
+        }
+    }
+    for (int k = 0; k < n_conv_outs; ++k) {
+        const ggml_tensor * out = conv_outs[k];
         for (int j = node_idx; j <= last; ++j) {
             const ggml_tensor * t = cgraph->nodes[j];
             for (int si = 0; si < GGML_MAX_SRC; ++si) {
@@ -4651,7 +4743,9 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     args.qkv_stride     = qkv_t->nb[1] / sizeof(float);
     args.conv_w         = (const float *) ssm_conv->src[1]->data;
     args.conv_bias      = 0.0f;
-    args.conv_state_out = (float *) conv_dst->data;
+    args.conv_state_out = conv_out_base;
+    args.conv_fill_tail = rb_set == nullptr;
+    args.softplus_log1p = rb_set != nullptr;
     args.alpha          = (const float *) add->src[0]->data;
     args.dt_bias        = (const float *) add->src[1]->data;
     args.ssm_a          = (const float *) mul_a->src[1]->data;
@@ -4690,7 +4784,7 @@ static int ggml_cuda_try_gdn_decode_fusion(const ggml_cgraph * cgraph, int node_
     // Include view nodes in the count even though they are not compute nodes.
     for (int j = node_idx; j <= last; ++j) {
         if (std::find(conv_cpy, conv_cpy + n_conv_cpy, cgraph->nodes[j]) != conv_cpy + n_conv_cpy ||
-            j == idx[11] || j == idx[13]) {
+            cgraph->nodes[j] == rb_set || j == idx[11] || j == idx[13]) {
             continue;
         }
         const ggml_tensor * candidate = cgraph->nodes[j];

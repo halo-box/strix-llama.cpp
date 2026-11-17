@@ -2071,6 +2071,16 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
     const int thread = warp * warp_size + lane;
     const int hk     = h % args.H_k;               // key/query head (fastmodulo(h_idx, neqk1) in gated_delta_net_cuda)
 
+    // 2-8 tokens (speculative verify) run in this one launch: the block owns value head h for every token, keeps its
+    // state shard in registers from token to token and takes each token's conv window straight from the inputs
+    // (concat column t + j: the old conv state for t + j < D_CONV - 1, else qkv token t + j - (D_CONV - 1)). These
+    // are the values the per-token launches read back from the slots the previous token wrote, so every token
+    // computes exactly what a single-token step on that state does. Token t writes rollback slot n_tokens - 1 - t.
+    float s_shard[cols_per_warp][rows_per_lane];
+
+    for (int t = 0; t < args.n_tokens; ++t) {
+    const int slot = (int) args.n_tokens - 1 - t;
+
     // 1. causal conv + SiLU for this head's q, k and v channels; shift the conv state (CPY conv_state_last)
     if (thread < 3 * S) {
         const int part = thread / S;               // 0: q, 1: k, 2: v
@@ -2081,10 +2091,11 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
         float x[D_CONV];
         float w[D_CONV];
 #pragma unroll
-        for (int j = 0; j < D_CONV - 1; j++) {
-            x[j] = args.conv_state_in[ch * (D_CONV - 1) + j];
+        for (int j = 0; j < D_CONV; j++) {
+            const int col = t + j;   // column of the concat [conv state, qkv tokens]
+            x[j] = col < D_CONV - 1 ? args.conv_state_in[ch * (D_CONV - 1) + col]
+                                    : args.qkv[ch * args.qkv_stride + (int64_t) (col - (D_CONV - 1)) * args.qkv_token_stride];
         }
-        x[D_CONV - 1] = args.qkv[ch * args.qkv_stride];
 #pragma unroll
         for (int j = 0; j < D_CONV; j++) {
             w[j] = args.conv_w[ch * D_CONV + j];
@@ -2109,9 +2120,10 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
 
         // q/k channels are shared by H_v/H_k value heads: the first one writes the conv state
         if (part == 2 || h == hk) {
+            float * conv_out = args.conv_state_out + (int64_t) slot * args.conv_slot_stride;
 #pragma unroll
             for (int j = 0; j < D_CONV - 1; j++) {
-                args.conv_state_out[ch * (D_CONV - 1) + j] = x[j + 1];
+                conv_out[ch * (D_CONV - 1) + j] = x[j + 1];
             }
         }
     }
@@ -2168,16 +2180,17 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
     }
 
     // gate = softplus(alpha + dt_bias) * A, beta = sigmoid(beta): scalar per head, computed by every thread
-    const float alpha_biased = args.alpha[h] + args.dt_bias[h];
-    const float gate         = gdn_decode_softplus(alpha_biased) * args.ssm_a[h];
-    const float beta_val     = gdn_decode_sigmoid(args.beta[h]);
+    const float alpha_biased = args.alpha[(int64_t) t * args.H_v + h] + args.dt_bias[h];
+    const float softplus     = args.softplus_log1p ? ((alpha_biased > 20.0f) ? alpha_biased : log1pf(expf(alpha_biased)))
+                                                   : gdn_decode_softplus(alpha_biased);
+    const float gate         = softplus * args.ssm_a[h];
+    const float beta_val     = gdn_decode_sigmoid(args.beta[(int64_t) t * args.H_v + h]);
     const float g_val        = expf(gate);
     __syncthreads();
 
     // 3. recurrence (gated_delta_net_cuda), cols_per_warp state columns per warp
     {
-        const float * state_in  = args.state_cache + (int64_t) args.state_ids[0] * args.state_row_stride + (int64_t) h * S * S;
-        float *       state_out = args.state_out + (int64_t) h * S * S;
+        float *       state_out = args.state_out + (int64_t) slot * args.state_slot_stride + (int64_t) h * S * S;
         const int     colw      = warp * cols_per_warp;
 
         float k_reg[rows_per_lane];
@@ -2188,12 +2201,14 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
             q_reg[r] = q_n[r * warp_size + lane];
         }
 
-        float s_shard[cols_per_warp][rows_per_lane];
+        if (t == 0) {
+            const float * state_in = args.state_cache + (int64_t) args.state_ids[0] * args.state_row_stride + (int64_t) h * S * S;
 #pragma unroll
-        for (int c = 0; c < cols_per_warp; c++) {
+            for (int c = 0; c < cols_per_warp; c++) {
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                s_shard[c][r] = state_in[(colw + c) * S + r * warp_size + lane];
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[c][r] = state_in[(colw + c) * S + r * warp_size + lane];
+                }
             }
         }
 
@@ -2241,8 +2256,9 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
     // 4. pre-norm attention output to the scratch buffer (the gated rms norm runs as a second kernel: its
     //    destination may alias inputs of this kernel that other blocks are still reading)
     if (thread < S) {
-        args.attn_out[(int64_t) h * S + thread] = attn[thread];
+        args.attn_out[((int64_t) t * args.H_v + h) * S + thread] = attn[thread];
     }
+    } // tokens
 }
 
 // rms_norm_f32<128, true>: per-warp partial sums, then the second-level butterfly of block_reduce over
@@ -2254,7 +2270,7 @@ gdn_decode_norm_cuda(const float * attn, const float * norm_w, float * out, cons
     static_assert(S == 4 * warp_size);
     __shared__ float red[4];
 
-    const int h    = blockIdx.x;
+    const int h    = blockIdx.x + blockIdx.y * gridDim.x;   // token-major rows [S, H_v, n_tokens]
     const int tid  = threadIdx.x;
     const int warp = tid / warp_size;
     const int lane = tid % warp_size;
@@ -2285,33 +2301,16 @@ void ggml_cuda_op_gdn_decode_fused_prenorm(ggml_backend_cuda_context & ctx, cons
     const dim3 grid(args.H_v, 1, 1);
     const dim3 block(32, 32, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, ctx.stream());
-    if (args.n_tokens == 1 && args.K == 1) {
-        ggml_cuda_kernel_launch(gdn_decode_fused_cuda<128, 4>, launch_params, args);
-        return;
-    }
-
     GGML_ASSERT(args.n_tokens >= 1 && args.n_tokens <= args.K && args.K <= 8);
-    const int64_t conv_elems = (args.d_conv - 1) * args.S * (2 * args.H_k + args.H_v);
-    for (int64_t slot = args.n_tokens; slot < args.K; ++slot) {
-        CUDA_CHECK(cudaMemcpyAsync(args.conv_state_out + slot * args.conv_slot_stride, args.conv_state_in,
-            conv_elems * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
-    }
-    for (int64_t t = 0; t < args.n_tokens; ++t) {
-        const int64_t slot = args.n_tokens - 1 - t;
-        ggml_cuda_gdn_decode_args step = args;
-        step.qkv += t * args.qkv_token_stride;
-        step.alpha += t * args.H_v;
-        step.beta += t * args.H_v;
-        step.conv_state_out += slot * args.conv_slot_stride;
-        step.state_out += slot * args.state_slot_stride;
-        step.attn_out += t * args.S * args.H_v;
-        if (t > 0) {
-            step.conv_state_in = args.conv_state_out + (slot + 1) * args.conv_slot_stride;
-            step.state_cache = args.state_out + (slot + 1) * args.state_slot_stride;
-            step.state_row_stride = 0;
+    if (args.conv_fill_tail) {
+        // the per-slot CPY store also writes slots n_tokens..K-1 with the old conv state (window at column 0)
+        const int64_t conv_elems = (args.d_conv - 1) * args.S * (2 * args.H_k + args.H_v);
+        for (int64_t slot = args.n_tokens; slot < args.K; ++slot) {
+            CUDA_CHECK(cudaMemcpyAsync(args.conv_state_out + slot * args.conv_slot_stride, args.conv_state_in,
+                conv_elems * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
         }
-        ggml_cuda_kernel_launch(gdn_decode_fused_cuda<128, 4>, launch_params, step);
     }
+    ggml_cuda_kernel_launch(gdn_decode_fused_cuda<128, 4>, launch_params, args);
 }
 
 void ggml_cuda_op_gdn_decode_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_decode_args & args_in) {
@@ -2326,13 +2325,11 @@ void ggml_cuda_op_gdn_decode_fused_gated(ggml_backend_cuda_context & ctx, const 
     args.attn_out = attn.get();
     ggml_cuda_op_gdn_decode_fused_prenorm(ctx, args, attn.get());
 
-    const dim3 grid(args.H_v, 1, 1);
+    // one launch for every token (grid.y): each thread reads its own element of the scratch and of z before it
+    // writes the same element of the output, and the scratch is private, so the tokens do not interfere
+    const dim3 grid(args.H_v, args.n_tokens, 1);
     const dim3 norm_block(128, 1, 1);
     const ggml_cuda_kernel_launch_params norm_params = ggml_cuda_kernel_launch_params(grid, norm_block, 0, ctx.stream());
-    // Read all token inputs before the norm output can reuse their storage.
-    for (int64_t t = 0; t < args.n_tokens; ++t) {
-        const int64_t offset = t * args.S * args.H_v;
-        ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get() + offset, args.norm_w,
-            (z ? gated_out : args.out) + offset, args.eps_rms, z ? z + offset : nullptr);
-    }
+    ggml_cuda_kernel_launch(gdn_decode_norm_cuda<128>, norm_params, attn.get(), args.norm_w,
+        z ? gated_out : args.out, args.eps_rms, z);
 }
