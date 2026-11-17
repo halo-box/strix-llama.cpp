@@ -1027,6 +1027,7 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     bool no_alloc() const;
+    bool graph_depends_on_n_tokens() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

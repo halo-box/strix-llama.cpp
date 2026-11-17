@@ -293,6 +293,8 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    void reserve_token_ranges(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_tokens_max);
+
     llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(

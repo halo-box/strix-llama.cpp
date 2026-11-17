@@ -1082,6 +1082,10 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    if (!cparams.training && !model.no_alloc() && model.graph_depends_on_n_tokens()) {
+        reserve_token_ranges(mctx.get(), n_seqs, n_tokens);
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -3382,6 +3386,50 @@ static void ubatch_prepare_reserve(
             ubatch.output[s * n_seq_tokens + t] = true;
             ++n_outputs_set;
         }
+    }
+}
+
+void llama_context::reserve_token_ranges(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_tokens_max) {
+    const uint32_t n_seqs_probe = cparams.kv_unified ? 1 : n_seqs;
+    const uint32_t k_max = n_tokens_max / n_seqs_probe;
+    const auto n_graph_nodes = [&](uint32_t k) {
+        const uint32_t n = k*n_seqs_probe;
+        return graph_reserve(n, n_seqs_probe, std::min(n, cparams.n_outputs_max), mctx, true) ? ggml_backend_sched_get_n_graph_nodes(sched.get()) : -1;
+    };
+
+    static constexpr int max_ranges = 8;
+    uint32_t lo = 1;
+    for (int r = 0; r < max_ranges && lo <= k_max; ++r) {
+        const int key = n_graph_nodes(lo);
+        if (key < 0) {
+            return;
+        }
+        uint32_t hi = k_max;
+        if (n_graph_nodes(hi) != key) {
+            uint32_t a = lo;
+            while (hi - a > 1) {
+                const uint32_t mid = a + (hi - a) / 2;
+                if (n_graph_nodes(mid) == key) {
+                    a = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            hi = a;
+        }
+        if (lo > 1 || hi < k_max) {
+            const uint32_t n_hi = hi*n_seqs_probe;
+            LLAMA_LOG_DEBUG("%s: n_tokens %u..%u: %d scheduled nodes\n", __func__, lo*n_seqs_probe, n_hi, key);
+            if (!graph_reserve(n_hi, n_seqs_probe, std::min(n_hi, cparams.n_outputs_max), mctx)) {
+                return;
+            }
+            const uint32_t n_tok_seqs = (n_hi / n_seqs) * n_seqs;
+            if (n_seqs_probe < n_seqs && n_tok_seqs >= lo*n_seqs_probe &&
+                !graph_reserve(n_tok_seqs, n_seqs, std::min(n_tok_seqs, cparams.n_outputs_max), mctx)) {
+                return;
+            }
+        }
+        lo = hi + 1;
     }
 }
 

@@ -2194,7 +2194,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+static void dbg_dump_graph(ggml_backend_sched_t sched, const char * tag) {
+    const char * d = getenv("DBG_DUMPG"); if (!d) return;
+    static int n = 0; char path[512]; snprintf(path, sizeof(path), "%s/g%04d-%s.txt", d, n++, tag);
+    FILE * f = fopen(path, "w"); if (!f) return;
+    for (int i = 0; i < sched->graph.n_nodes; i++) { ggml_tensor * t = sched->graph.nodes[i];
+        fprintf(f, "%d %s %s %zu %s %lld,%lld,%lld,%lld\n", i, ggml_op_desc(t), t->name, ggml_nbytes(t), t->view_src ? "V" : "-", (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]); }
+    fclose(f);
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    dbg_dump_graph(sched, "alloc");
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -2214,7 +2224,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    if (backend_ids_changed || !ggml_gallocr_alloc_graph_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -2247,11 +2257,12 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
-        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+        dbg_dump_graph(sched, "reserve");
+    if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
             return false;
         }
-        if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        if (!ggml_gallocr_alloc_graph_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
         }
@@ -2656,6 +2667,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    dbg_dump_graph(sched, "reserve");
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
@@ -2844,6 +2856,11 @@ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_ba
     GGML_ASSERT(sched);
     sched->callback_realloc = callback;
     sched->callback_realloc_user_data = user_data;
+}
+
+int ggml_backend_sched_get_n_graph_nodes(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->graph.n_nodes;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

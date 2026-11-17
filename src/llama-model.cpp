@@ -2676,6 +2676,10 @@ llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
 }
 
+bool llama_model::graph_depends_on_n_tokens() const {
+    return arch == LLM_ARCH_QWEN4EXP;
+}
+
 bool llama_model::no_alloc() const {
     return params.no_alloc;
 }
