@@ -18,8 +18,30 @@
 #if !defined(_WIN32)
 #include <cerrno>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <unistd.h>
+#if !defined(__wasi__)
+#include <sys/mman.h>
+#endif
+
+static void * ple_map_anon(size_t len) {
+#if defined(__wasi__)
+    GGML_UNUSED(len);
+    errno = ENOTSUP;
+    return nullptr;
+#else
+    void * m = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    return m == MAP_FAILED ? nullptr : m;
+#endif
+}
+
+static void ple_unmap(void * p, size_t len) {
+#if defined(__wasi__)
+    GGML_UNUSED(p);
+    GGML_UNUSED(len);
+#else
+    munmap(p, len);
+#endif
+}
 #endif
 
 struct llama_ple_disk::impl {
@@ -157,7 +179,7 @@ struct llama_ple_disk::impl {
             full_loader.join();
         }
         if (full_map) {
-            munmap(full_map, full_len);
+            ple_unmap(full_map, full_len);
         }
         {
             std::lock_guard<std::mutex> lk(pm);
@@ -180,8 +202,8 @@ struct llama_ple_disk::impl {
         const off_t  a0   = (off_t) offs & ~(off_t) (pg - 1);
         const size_t need = (size_t) ((off_t) offs - a0) + (size_t) nrows * rs;
         full_len = ((need + (2u << 20) - 1) / (2u << 20)) * (2u << 20);
-        void * m = mmap(nullptr, full_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (m == MAP_FAILED) {
+        void * m = ple_map_anon(full_len);
+        if (m == nullptr) {
             LLAMA_LOG_WARN("llama_ple_disk: preload mmap of %zu bytes failed (%s)\n", full_len, strerror(errno));
             full_len = 0;
             return;
