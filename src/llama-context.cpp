@@ -1082,8 +1082,13 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    std::vector<uint32_t> range_ends;
     if (!cparams.training && !model.no_alloc() && model.graph_depends_on_n_tokens()) {
-        reserve_token_ranges(mctx.get(), n_seqs, n_tokens);
+        range_ends = reserve_token_ranges(mctx.get(), n_seqs, n_tokens);
+    }
+
+    if (!cparams.training && !model.no_alloc()) {
+        reserve_qsa_routes(mctx.get(), n_tokens, range_ends);
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -3393,7 +3398,7 @@ static void ubatch_prepare_reserve(
     }
 }
 
-void llama_context::reserve_token_ranges(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_tokens_max) {
+std::vector<uint32_t> llama_context::reserve_token_ranges(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_tokens_max) {
     const uint32_t n_seqs_probe = cparams.kv_unified ? 1 : n_seqs;
     const uint32_t k_max = n_tokens_max / n_seqs_probe;
     const auto n_graph_nodes = [&](uint32_t k) {
@@ -3401,12 +3406,13 @@ void llama_context::reserve_token_ranges(const llama_memory_context_i * mctx, ui
         return graph_reserve(n, n_seqs_probe, std::min(n, cparams.n_outputs_max), mctx, true) ? ggml_backend_sched_get_n_graph_nodes(sched.get()) : -1;
     };
 
+    std::vector<uint32_t> ends;
     static constexpr int max_ranges = 8;
     uint32_t lo = 1;
     for (int r = 0; r < max_ranges && lo <= k_max; ++r) {
         const int key = n_graph_nodes(lo);
         if (key < 0) {
-            return;
+            return ends;
         }
         uint32_t hi = k_max;
         if (n_graph_nodes(hi) != key) {
@@ -3425,23 +3431,50 @@ void llama_context::reserve_token_ranges(const llama_memory_context_i * mctx, ui
             const uint32_t n_hi = hi*n_seqs_probe;
             LLAMA_LOG_DEBUG("%s: n_tokens %u..%u: %d scheduled nodes\n", __func__, lo*n_seqs_probe, n_hi, key);
             if (!graph_reserve(n_hi, n_seqs_probe, std::min(n_hi, cparams.n_outputs_max), mctx)) {
-                return;
+                return ends;
             }
+            ends.push_back(n_hi);
             const uint32_t n_tok_seqs = (n_hi / n_seqs) * n_seqs;
             if (n_seqs_probe < n_seqs && n_tok_seqs >= lo*n_seqs_probe &&
                 !graph_reserve(n_tok_seqs, n_seqs, std::min(n_tok_seqs, cparams.n_outputs_max), mctx)) {
-                return;
+                return ends;
             }
         }
         lo = hi + 1;
+    }
+    return ends;
+}
+
+void llama_context::reserve_qsa_routes(llama_memory_context_i * mctx, uint32_t n_tokens_max, const std::vector<uint32_t> & range_ends) {
+    auto * qsa = dynamic_cast<llama_memory_hybrid_idx_context *>(mctx);
+    if (!qsa || !qsa->qsa_incremental()) {
+        return;
+    }
+    using route = llama_memory_hybrid_idx_context::qsa_route;
+    for (const route r : { route::prefix, route::fast }) {
+        const uint32_t n_max = r == route::fast ? std::min<uint32_t>(n_tokens_max, 512) : n_tokens_max;
+        std::vector<uint32_t> sizes = { 1, n_max };
+        for (const uint32_t n : range_ends) {
+            if (n < n_max) {
+                sizes.push_back(n);
+            }
+        }
+        qsa->set_qsa_reserve_route(r);
+        for (const uint32_t n : sizes) {
+            for (const uint32_t n_outputs : { 0u, std::min(n, cparams.n_outputs_max) }) {
+                if (!graph_reserve(n, 1, n_outputs, mctx)) {
+                    qsa->set_qsa_reserve_route(route::live);
+                    throw std::runtime_error("failed to allocate compute buffers for the incremental QSA graph");
+                }
+            }
+        }
+        qsa->set_qsa_reserve_route(route::live);
     }
 }
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
-
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);

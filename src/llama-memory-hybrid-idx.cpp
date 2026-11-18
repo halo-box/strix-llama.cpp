@@ -1722,7 +1722,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa_blocks(
 
 bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch, uint32_t ratio) const {
     // a tracked prefix past an image is ranked: its blocks are not position blocks, so the scoring bound does not apply
-    if (qsa_prefix_matches(ubatch) && mem->qsa_prefix_identity()) { return true; }
+    if (qsa_prefix_matches(ubatch) && (qsa_reserve_route != qsa_route::live || mem->qsa_prefix_identity())) { return true; }
     if (!qsa_scalar_visibility(ubatch, ratio)) { return false; }
     const llama_seq_id seq=ubatch.seq_id[0][0];
     return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),qsa_n_cells_seen(),seq);
@@ -1851,10 +1851,14 @@ bool llama_memory_hybrid_idx::qsa_fast(int il, const llama_ubatch & u) const {
     // per layer moved the scheduler's input-count split cuts, and the CUDA backend dropped the BF16
     // residual mark of any residual whose next combine landed across a cut (fixed there, see
     // mmb_res16_pending). Larger ubatches are untested; QSA_FAST_MAX=127 restores the old limit.
-    static const int max_tokens = getenv("QSA_FAST_MAX") ? atoi(getenv("QSA_FAST_MAX")) : 512;
-    return qsa_prefix_matches(u) && int(u.n_tokens) <= max_tokens && u.n_tokens <= 512 && qsa_keys.at(il) &&
+    return qsa_prefix_matches(u) && qsa_fast_fits(il, u.n_tokens) &&
         qsa_ready.at(il) >= int64_t(qsa_prefix.previous_blocks) &&
         qsa_prefix.complete() >= size_t((u.n_tokens+3)/4+1);
+}
+
+bool llama_memory_hybrid_idx::qsa_fast_fits(int il, uint32_t n_tokens) const {
+    static const int max_tokens = getenv("QSA_FAST_MAX") ? atoi(getenv("QSA_FAST_MAX")) : 512;
+    return int(n_tokens) <= max_tokens && n_tokens <= 512 && qsa_keys.at(il);
 }
 
 ggml_tensor * llama_memory_hybrid_idx::qsa_cache(ggml_context * ctx, int il, int64_t blocks) const {
