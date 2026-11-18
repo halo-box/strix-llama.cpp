@@ -18158,6 +18158,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Empty src0
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {0, 64, 1, 1}, 33, 0, 16));
 
+    // qwen4exp conv-state concat at decode and MTP-verify widths: state [3 x 10240] ++ transpose(qkv_mixed [10240 x n_tokens]),
+    // below the transposed kernel's token minimum
+    for (int64_t n_tokens : { 1, 2, 4, 7, 8, 16 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, n_tokens, 0, 16));
+    }
+
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));
@@ -19388,6 +19394,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // qwen4exp conv-state concat per layer at decode (1 row), MTP verify (2-4 rows) and the transposed kernel's token minimum
+    for (int64_t n_tokens : { 1, 2, 4, 8, 16, 32 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, n_tokens, 0, 16));
+    }
 
     // qwen4exp complete-block selection (TOP_K + the chain QSA_EXPAND fuses) at the Flash-Next d32k shape: one 512-row
     // strip and decode rows. Perf mode repeats only the final CONCAT, so read the chain's time with GGML_VK_PERF_LOGGER
