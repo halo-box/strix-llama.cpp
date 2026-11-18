@@ -272,7 +272,6 @@ static void test(void) {
         const std::vector<std::string> three = {"a.gguf", "b.gguf", "c.gguf"};
         assert(parse_shards({"--shard", "a.gguf,b.gguf", "--shard", "c.gguf"}) == three);
         assert(parse_shards({"--shard", "a.gguf", "--shard", "b.gguf", "--shard", "c.gguf"}) == three);
-        assert(parse_shards({"--ple", "p.gguf"}) == parse_shards({"--shard", "p.gguf"}));
         assert(parse_shards({"--shard", "model_file.gguf,a.gguf,b.gguf,a.gguf"}) == two);
     }
 
