@@ -1028,11 +1028,8 @@ static bool ggml_gallocr_reserve_n_plan(
 
     // GGML_ALLOC_DRY_RUN=1: print the planned size of every buffer this reserve would allocate and fail the reserve instead
     // of allocating (a sweep checks a reuse delay's size against its cap without risking the allocation)
-    static int dry_run = -1;
-    if (dry_run < 0) {
-        const char * e = getenv("GGML_ALLOC_DRY_RUN");
-        dry_run = e != NULL && atoi(e) != 0;
-    }
+    const char * dry_run_env = getenv("GGML_ALLOC_DRY_RUN");
+    const bool dry_run = dry_run_env != NULL && atoi(dry_run_env) != 0;
     bool dry_run_hit = false;
 
     // reallocate buffers if needed
