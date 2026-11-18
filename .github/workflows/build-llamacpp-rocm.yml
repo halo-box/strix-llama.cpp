@@ -940,6 +940,15 @@ jobs:
     - name: Install Ninja
       run: choco install ninja
 
+    - name: Checkout CI actions
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: .github/actions
+        path: ci
+
+    - name: Visual Studio clang when the STL needs it
+      uses: ./ci/.github/actions/windows-vs-clang
+
     - name: Build Llama.cpp + Vulkan
       shell: cmd
       run: |
