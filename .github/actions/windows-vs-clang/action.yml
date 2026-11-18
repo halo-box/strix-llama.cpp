@@ -1,0 +1,22 @@
+name: "Windows - Prefer the Visual Studio clang"
+description: "Put the clang that Visual Studio installs with its STL first on PATH, when it exists and is clang 20 or newer"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Prefer the Visual Studio clang
+      shell: pwsh
+      run: |
+        $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        $bin = if ($vs) { Join-Path $vs 'VC\Tools\Llvm\x64\bin' } else { '' }
+        $major = 0
+        if ($bin -and (Test-Path (Join-Path $bin 'clang.exe'))) {
+          $version = & (Join-Path $bin 'clang.exe') --version | Select-Object -First 1
+          if ($version -match 'clang version (\d+)\.') { $major = [int]$Matches[1] }
+          Write-Output "Visual Studio clang: $version"
+        }
+        if ($major -ge 20) {
+          Add-Content $env:GITHUB_PATH $bin
+        } else {
+          Write-Output "No Visual Studio clang 20 or newer, keeping: $((& clang --version | Select-Object -First 1))"
+        }

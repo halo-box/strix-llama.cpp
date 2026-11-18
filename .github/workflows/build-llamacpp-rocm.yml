@@ -940,6 +940,9 @@ jobs:
     - name: Install Ninja
       run: choco install ninja
 
+    - name: Prefer the Visual Studio clang
+      uses: ./llama.cpp/.github/actions/windows-vs-clang
+
     - name: Build Llama.cpp + Vulkan
       shell: cmd
       run: |

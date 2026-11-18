@@ -208,6 +208,9 @@ jobs:
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
 
+      - name: Prefer the Visual Studio clang
+        uses: ./.github/actions/windows-vs-clang
+
       - name: Install Ninja
         id: install_ninja
         run: |

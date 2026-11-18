@@ -140,13 +140,14 @@ jobs:
           source .venv/Scripts/activate
           pip install -r requirements/requirements-convert_hf_to_gguf.txt
 
+      - name: Prefer the Visual Studio clang
+        uses: ./.github/actions/windows-vs-clang
+
       - name: Build
         id: cmake_build
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          set "PATH=%VCINSTALLDIR%Tools\Llvm\x64\bin;%PATH%"
-          clang --version
           cmake -B build -G "Ninja Multi-Config" ^
             -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DCMAKE_BUILD_TYPE=Release ^
