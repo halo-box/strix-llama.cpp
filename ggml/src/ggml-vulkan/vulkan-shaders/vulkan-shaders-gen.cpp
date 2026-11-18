@@ -1031,31 +1031,35 @@ void process_shaders() {
     // Norms
     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
-    string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
-    string_to_spv("rms_norm_mul_add_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
+    for (bool use_subgroups : {false, true}) {
+        const std::string suffix = use_subgroups ? "_subgroup" : "";
+        const auto rms_dict = merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", use_subgroups ? "1" : "0"}});
+        string_to_spv("rms_norm_f32" + suffix, "rms_norm.comp", rms_dict);
+        string_to_spv("rms_norm_mul_add_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_ADD_FUSION", "1"}}));
+        string_to_spv("rms_norm_set_rows_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"RMS_NORM_SET_ROWS_FUSION", "1"}}));
+        string_to_spv("rms_norm_set_rows_f32_f16" + suffix, "rms_norm.comp", merge_maps({{"D_TYPE", "float16_t"}, {"D_F16", "1"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}, rms_dict)); // keep rms_dict last so 'merge_maps' overwrites the value for key 'D_TYPE'
+        string_to_spv("rms_norm_mul_rope_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
+        string_to_spv("rms_norm_mul_rope_f32_f16" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float16_t"}, {"ROPE_D_F16", "1"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
+    }
     string_to_spv("rms_norm_mul_add_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
-    string_to_spv("rms_norm_set_rows_f32_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}));
-    string_to_spv("rms_norm_set_rows_f32_f16", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}));
     string_to_spv("rms_norm_small_f32", "rms_norm_small.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_small_f32_f16", "rms_norm_small.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float16_t"}, {"D_F16", "1"}}));
     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
-    string_to_spv("rms_norm_mul_rope_f32_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
-    string_to_spv("rms_norm_mul_rope_f32_f16", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"ROPE_D_F16", "1"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
-    string_to_spv("cpy_f32_f32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("cpy_32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
-    string_to_spv("cpy_f16_f16", "copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
+    string_to_spv("cpy_16", "copy.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("cpy_f16_f32", "copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
     string_to_spv("cpy_f32_bf16","copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}});
     string_to_spv("cpy_bf16_f32","copy.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "float"}, {"DATA_A_BF16", "1"}});
     string_to_spv("cpy_bf16_f16","copy.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "float16_t"}, {"DATA_A_BF16", "1"}});
-    string_to_spv("contig_cpy_f32_f32", "contig_copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("contig_cpy_32", "contig_copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
     string_to_spv("contig_cpy_f32_i32", "contig_copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "int"}});
     string_to_spv("contig_cpy_i32_f32", "contig_copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
     string_to_spv("contig_cpy_f32_f16", "contig_copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
-    string_to_spv("contig_cpy_f16_f16", "contig_copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
+    string_to_spv("contig_cpy_16", "contig_copy.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("contig_cpy_f16_f32", "contig_copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
     string_to_spv("contig_cpy_f32_bf16","contig_copy.comp",{{"A_TYPE", "float"}, {"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}});
     string_to_spv("contig_cpy_bf16_f32","contig_copy.comp",{{"A_TYPE", "uint16_t"}, {"D_TYPE", "float"}, {"DATA_A_BF16", "1"}});
@@ -1123,6 +1127,7 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
     string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
+    string_to_spv("fa_prefill", "flash_attn_prefill.comp", {}, true, true, false, false);
 #endif
 
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
@@ -1155,6 +1160,8 @@ void process_shaders() {
     string_to_spv("concat_i16", "concat.comp", {{"A_TYPE", "uint16_t"}, {"B_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("concat_i32", "concat.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
     string_to_spv("concat_i64", "concat.comp", {{"A_TYPE", "uvec2"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "uvec2"}});
+    string_to_spv("concat_transpose_i8", "concat_transpose.comp", {{"A_TYPE", "uint8_t"}, {"B_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
+    string_to_spv("concat_transpose_i16", "concat_transpose.comp", {{"A_TYPE", "uint16_t"}, {"B_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("concat_transpose_i32", "concat_transpose.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
 
     string_to_spv("upscale_f32", "upscale.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
@@ -1258,8 +1265,6 @@ void process_shaders() {
 
     string_to_spv("silu_back_f32",  "silu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 
-    string_to_spv("diag_mask_inf_f32", "diag_mask_inf.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
-
     string_to_spv("soft_max_f32", "soft_max.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("soft_max_f32_f16", "soft_max.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}}));
     string_to_spv("soft_max_back_f32", "soft_max_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
@@ -1300,8 +1305,10 @@ void process_shaders() {
     string_to_spv("sum_f32", "sum.comp", {});
     string_to_spv("cross_entropy_loss_f32", "cross_entropy_loss.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cross_entropy_loss_back_f32", "cross_entropy_loss_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
-    string_to_spv("fwht_f32", "fwht.comp", {});
-    string_to_spv("fwht_shmem_f32", "fwht.comp", {{"FWHT_SHMEM", "1"}});
+    string_to_spv("fwht_f32", "fwht.comp", {{"A_TYPE", "float"}});
+    string_to_spv("fwht_shmem_f32", "fwht.comp", {{"A_TYPE", "float"}, {"FWHT_SHMEM", "1"}});
+    string_to_spv("fwht_f16", "fwht.comp", {{"A_TYPE", "float16_t"}});
+    string_to_spv("fwht_shmem_f16", "fwht.comp", {{"A_TYPE", "float16_t"}, {"FWHT_SHMEM", "1"}});
     string_to_spv("count_equal_i32", "count_equal.comp", merge_maps(base_dict, {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}}));
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
@@ -1321,6 +1328,8 @@ void process_shaders() {
     string_to_spv("dsv4_hc_moe_post_norm_s32_inj", "dsv4_hc_moe_post_norm.comp", {{"OUT_F16", "1"}, {"INJ", "1"}});
     string_to_spv("dsv4_hc_moe_post_norm_s16_inj_defer", "dsv4_hc_moe_post_norm.comp", {{"SLOT_F16", "1"}, {"OUT_F16", "1"}, {"INJ", "1"}, {"DEFER", "1"}});
     string_to_spv("dsv4_hc_moe_post_norm_s32_inj_defer", "dsv4_hc_moe_post_norm.comp", {{"OUT_F16", "1"}, {"INJ", "1"}, {"DEFER", "1"}});
+    string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"MASK_TYPE", "uint16_t"}});
+    string_to_spv("top_k_mask_f32", "top_k_mask.comp", {{"MASK_TYPE", "uint"}});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));

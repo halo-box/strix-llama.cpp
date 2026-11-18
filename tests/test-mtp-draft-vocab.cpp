@@ -69,25 +69,23 @@ static bool decode_step(llama_model * model, llama_context * ctx, llama_pos pos,
     const int32_t n_embd  = llama_model_n_embd_out(model);
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
-    llama_batch batch = llama_batch_init(1, n_embd, 1);
-    batch.token = (llama_token *) malloc(sizeof(llama_token));
-
+    std::vector<float> state(n_embd);
     std::mt19937 rng(1000 + pos);
     std::normal_distribution<float> dist(0.0f, 1.0f);
     for (int32_t i = 0; i < n_embd; ++i) {
-        batch.embd[i] = dist(rng);
+        state[i] = dist(rng);
     }
-    batch.token[0]     = (llama_token) ((pos * 7919 + 13) % 30000);
-    batch.pos[0]       = pos;
-    batch.n_seq_id[0]  = 1;
-    batch.seq_id[0][0] = 0;
-    batch.logits[0]    = 1;
-    batch.n_tokens     = 1;
 
-    const int rc = llama_decode(ctx, batch);
-    llama_batch_free(batch);
+    llama_batch_ext * batch = llama_batch_ext_init(ctx);
+    const int32_t idx = llama_batch_ext_add_token(batch, 0, (llama_token) ((pos * 7919 + 13) % 30000));
+    llama_batch_ext_set_pos(batch, idx, &pos);
+    llama_batch_ext_set_embd_state(batch, idx, { state.data(), 1, (size_t) n_embd });
+    llama_batch_ext_set_output_logits(batch, idx, true);
+
+    const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+    llama_batch_ext_free(batch);
     if (rc != 0) {
-        fprintf(stderr, "llama_decode failed: %d\n", rc);
+        fprintf(stderr, "llama_process failed: %d\n", rc);
         return false;
     }
     const float * logits = llama_get_logits_ith(ctx, -1);

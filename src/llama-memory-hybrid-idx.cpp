@@ -1,15 +1,10 @@
 #include "llama-memory-hybrid-idx.h"
 #include "prefix.h"
 
-#include <algorithm>
-#include <cmath>
-#include <type_traits>
-
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-model.h"
-
 
 #include <algorithm>
 #include <cassert>
@@ -18,6 +13,7 @@
 #include <cstring>
 #include <iterator>
 #include <stdexcept>
+#include <type_traits>
 
 // A qwen4exp MTP context is built with a recurrent filter that matches nothing (the nextn layer is not recurrent) so
 // it can carry an indexer cache for sparse draft attention. Skip the recurrent child there: an empty recurrent cache
@@ -61,12 +57,12 @@ static bool qsa_selected_key_supported(ggml_backend_dev_t dev, const llama_hpara
 
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
+                     bool   no_alloc,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
-                 uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                             /* recurrent */
@@ -84,7 +80,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     const layer_filter_cb & filter_idx) :
     llama_memory_hybrid(
         model,
-        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+        no_alloc,
+        type_k, type_v, v_trans, kv_size, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
@@ -107,8 +104,8 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
+            model, no_alloc, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            kv_size, n_seq_max, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {
     if (mem_idx) {
@@ -1125,16 +1122,28 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
-        if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
-                sq.pos_min == sp.begin()->first) {
-            for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
+        // an append (POS_CLEAN) or an edit after pos_min keeps every cell and pool before the stale position
+        // speculative decoding edits the end of the sequence on each rejected draft, a full rebuild there costs O(n_ctx) per step
+        const llama_pos stale = mem_idx_stale[s];
+        bool keep = !sq.cells.empty() && !sp.empty() && sq.pos_min == sp.begin()->first && stale > sq.pos_min;
+        if (keep) {
+            if (stale != POS_CLEAN) {
+                const auto cut = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(stale, uint32_t(0)));
+                sq.cells.erase(cut, sq.cells.end());
+                while (!sq.pools.empty() && sq.pools.back() + kpool > sq.cells.size()) {
+                    sq.pools.pop_back();
+                }
+                sq.j_next = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
+            }
+            auto it = stale == POS_CLEAN ? sp.upper_bound(sq.cells.back()) : sp.lower_bound(std::make_pair(stale, uint32_t(0)));
+            for (; it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
             }
+            keep = sq.cells.size() == sp.size();
         }
 
-        // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
-        // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        // a new sequence, an edit at or before pos_min, or cells that do not match: group the whole sequence again
+        if (!keep) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
@@ -1473,7 +1482,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
-    GGML_ASSERT(new_pool_idxs->ne[0] == (int64_t) kpool && new_pool_idxs->ne[1] == (int64_t) n_new_g);
+    GGML_ASSERT(ggml_nelements(new_pool_idxs) == (int64_t) kpool*n_new_g);
     // the graph always scatters the fresh pooled keys back into the cache, see build_qsa_sel
     GGML_ASSERT(new_pool_rep != nullptr && ggml_backend_buffer_is_host(new_pool_rep->buffer));
     GGML_ASSERT(new_pool_rep->ne[0] == (int64_t) n_new_g);

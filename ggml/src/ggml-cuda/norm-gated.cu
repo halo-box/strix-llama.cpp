@@ -4,7 +4,7 @@
 // One wave per row, with the same reduction tree as the block-per-row norm.
 static __device__ __forceinline__ float xor_tree(float v) {
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) { v += __shfl_xor_sync(0xffffffff, v, off, 32); }
+    for (int off = 16; off > 0; off >>= 1) { v += ggml_cuda_shfl_xor(v, off, 32); }
     return v;
 }
 template <bool GATE>

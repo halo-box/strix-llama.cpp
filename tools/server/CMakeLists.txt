@@ -17,6 +17,8 @@ add_library(${TARGET} STATIC
     server-decision.h
     server-context.cpp
     server-context.h
+    server-realtime.cpp
+    server-realtime.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
@@ -25,6 +27,8 @@ add_library(${TARGET} STATIC
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    server-slot-sched.cpp
+    server-slot-sched.h
 )
 
 if (BUILD_SHARED_LIBS)
@@ -34,6 +38,7 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE vendor::hash)
 
 # stats dashboard page (GET /dashboard), embedded as a byte array
 
@@ -59,10 +64,14 @@ set(TARGET llama-server-impl)
 add_library(${TARGET}
     ${DASHBOARD_HTML_HPP}
     server.cpp
+    server-connect.cpp
+    server-connect.h
     server-http.cpp
     server-http.h
     server-models.cpp
     server-models.h
+    server-models-sched.cpp
+    server-models-sched.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 

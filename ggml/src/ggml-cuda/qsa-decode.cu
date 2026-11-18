@@ -28,7 +28,7 @@ static __global__ __launch_bounds__(128) void qsa_decode_partial(
 #pragma unroll
         for (int d = 0; d < 8; ++d) { dot = fmaf(qv[d], __half2float(kr[lane + d*32]), dot); }
 #pragma unroll
-        for (int delta = 16; delta > 0; delta >>= 1) { dot += __shfl_xor_sync(0xffffffff, dot, delta, 32); }
+        for (int delta = 16; delta > 0; delta >>= 1) { dot += ggml_cuda_shfl_xor(dot, delta, 32); }
         const float score = dot*scale + bias;
         const float next = fmaxf(mx, score);
         const float alpha = expf(mx - next), weight = expf(score - next);
@@ -83,9 +83,9 @@ bool ggml_cuda_flash_attn_ext_qsa_decode_supported(ggml_backend_cuda_context & c
 }
 bool ggml_cuda_flash_attn_ext_qsa_decode_supported_dev(int device, const ggml_tensor * dst) {
     if (!GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) { return false; }
-    const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];
+    const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[6];
     // the mask is optional: the launcher and both kernels take a null mask (visibility from the index rows alone)
-    if (!q || !k || !v || !ids || dst->src[4] || dst->src[6] || dst->src[7] || ggml_get_op_params_i32(dst, 4) != 0) { return false; }
+    if (!q || !k || !v || !ids || dst->src[4] || dst->src[5] || dst->src[7] || ggml_get_op_params_i32(dst, 4) != 0) { return false; }
     float bias, cap;
     memcpy(&bias, (const char *) dst->op_params + 4, 4);
     memcpy(&cap, (const char *) dst->op_params + 8, 4);
@@ -124,7 +124,7 @@ static __global__ void qsa_decode_unique_ids(const char * input, size_t stride, 
 }
 
 void ggml_cuda_flash_attn_ext_qsa_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[5];
+    const auto * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * m = dst->src[3], * ids = dst->src[6];
     ggml_cuda_pool_alloc<int> unique_ids(ctx.pool(), size_t(ids->ne[0])*q->ne[1]);
     qsa_decode_unique_ids<<<q->ne[1],256,0,ctx.stream()>>>((const char *)ids->data,ids->nb[1],unique_ids.get(),ids->ne[0],k->ne[1]);
     const bool wmma = q->ne[2] == 12*k->ne[2] && k->nb[1]%16 == 0 &&

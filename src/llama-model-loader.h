@@ -234,6 +234,9 @@ struct llama_model_loader {
 
     const llama_tensor_weight & require_weight(const char * name) const;
 
+    // read a merged weight [a | b] (the rows of a, then those of b) as the separate weights a and b
+    void split_weight(const std::string & merged, const std::string & name_a, int64_t n_a, const std::string & name_b);
+
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;

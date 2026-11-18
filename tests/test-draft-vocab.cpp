@@ -93,19 +93,23 @@ static int run(llama_model * model, uint32_t n_dynamic, int32_t n_expect, bool q
 
     llama_pos pos = 0;
     for (const auto & outputs : steps) {
-        llama_batch batch = llama_batch_init((int32_t) outputs.size(), 0, 1);
-        for (size_t i = 0; i < outputs.size(); ++i) {
-            batch.token   [i]    = (llama_token) ((7919*pos + 13) % n_vocab);
-            batch.pos     [i]    = pos++;
-            batch.n_seq_id[i]    = 1;
-            batch.seq_id  [i][0] = 0;
-            batch.logits  [i]    = outputs[i];
-        }
-        batch.n_tokens = (int32_t) outputs.size();
+        const llama_pos pos0 = pos;
+        pos += (llama_pos) outputs.size();
+        const auto decode = [&](llama_context * ctx) {
+            llama_batch_ext * batch = llama_batch_ext_init(ctx);
+            for (size_t i = 0; i < outputs.size(); ++i) {
+                const llama_pos p   = pos0 + (llama_pos) i;
+                const int32_t   idx = llama_batch_ext_add_token(batch, 0, (llama_token) ((7919*p + 13) % n_vocab));
+                llama_batch_ext_set_pos(batch, idx, &p);
+                llama_batch_ext_set_output_logits(batch, idx, outputs[i]);
+            }
+            const int32_t rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+            llama_batch_ext_free(batch);
+            return rc;
+        };
 
-        if (llama_decode(ctx_full, batch) != 0 || llama_decode(ctx_dyn, batch) != 0) {
+        if (decode(ctx_full) != 0 || decode(ctx_dyn) != 0) {
             fprintf(stderr, "%s: decode failed\n", __func__);
-            llama_batch_free(batch);
             return n_fail + 1;
         }
 
@@ -156,8 +160,6 @@ static int run(llama_model * model, uint32_t n_dynamic, int32_t n_expect, bool q
                 }
             }
         }
-
-        llama_batch_free(batch);
     }
 
     llama_free(ctx_dyn);

@@ -26,7 +26,6 @@
     "cross-entropy-loss": 4,
     "cumsum": 86,
     "diag": 2,
-    "diagmask": 1,
     "dsv4-hc": 5,
     "exl3": 446,
     "expand": 1,

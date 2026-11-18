@@ -34,10 +34,6 @@ static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
             return false;
     }
 }
-
-static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
-    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
-}
 #endif
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -136,7 +132,7 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA3_5;
 #elif defined(RDNA3_0)
     return MMVQ_PARAMETERS_RDNA3_0;
-#elif defined(RDNA2)
+#elif defined(RDNA2) || defined(RDNA4_M)
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
@@ -159,7 +155,7 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
         return MMVQ_PARAMETERS_RDNA3_5;
     }
-    if (GGML_CUDA_CC_IS_RDNA2(cc)) {
+    if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
         return MMVQ_PARAMETERS_RDNA2;
     }
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -316,6 +312,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        cc = ggml_cuda_highest_compiled_arch(cc);
         if (cc == GGML_CUDA_CC_PASCAL || cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
             return MMVQ_MAX_BATCH_SIZE;
         }
@@ -330,7 +327,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
         if (GGML_CUDA_CC_IS_RDNA4(cc)) {
             return get_mmvq_mmid_max_batch_rdna4(type);
         }
-        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc)) {
             return get_mmvq_mmid_max_batch_rdna3(type);
         }
         if (GGML_CUDA_CC_IS_RDNA1(cc) || GGML_CUDA_CC_IS_RDNA2(cc)) {
@@ -412,6 +409,14 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        switch (type) { // tuned on Radeon 8060S (gfx1151)
+            case GGML_TYPE_Q8_0:
+                return ne11 <= 6;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {
@@ -463,7 +468,7 @@ template <ggml_type type>
 static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #if defined(RDNA4)
     return get_mmvq_mmid_max_batch_rdna4(type);
-#elif defined(RDNA3)
+#elif defined(RDNA3) || defined(RDNA4_M)
     return get_mmvq_mmid_max_batch_rdna3(type);
 #elif defined(RDNA2) || defined(RDNA1)
     return get_mmvq_mmid_max_batch_rdna1_rdna2(type);
@@ -502,10 +507,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
         switch (ncols_dst) {
             case 1:
+                return 2;
             case 2:
             case 3:
+                return type == GGML_TYPE_Q3_K ? 1 : 2;
             case 4:
-                return 2;
+                return type == GGML_TYPE_Q6_K? 1 : 2;
             case 5:
             case 6:
             case 7:
@@ -930,18 +937,26 @@ static __global__ void mul_mat_vec_q4_columns_rdna3_5(
             const int bq8_offset = 2*QR6_K*(kqs/(QI6_K/2)) + (kqs%(QI6_K/2))/(QI6_K/4);
             const int scale_offset = (QI6_K/4)*(kqs/(QI6_K/2)) + (kqs%(QI6_K/2))/(QI6_K/8);
             const int vh_shift = 2*((kqs%(QI6_K/2))/(QI6_K/4));
-            const int vl = get_int_b2(bx->ql, kqs);
-            const int vh = get_int_b2(bx->qh, (QI6_K/4)*(kqs/(QI6_K/2)) + kqs%(QI6_K/4)) >> vh_shift;
+            int vl[VDR_Q6_K_Q8_1_MMVQ];
+            int vh[VDR_Q6_K_Q8_1_MMVQ];
+#pragma unroll
+            for (int k = 0; k < VDR_Q6_K_Q8_1_MMVQ; ++k) {
+                vl[k] = get_int_b2(bx->ql, kqs + k);
+                vh[k] = get_int_b2(bx->qh, (QI6_K/4)*(kqs/(QI6_K/2)) + kqs%(QI6_K/4) + k) >> vh_shift;
+            }
             const int8_t * scales = bx->scales + scale_offset;
             const float dx = bx->d;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const block_q8_1 * by = &y[j*stride_col_y + kby];
-                int u[QR6_K];
+                int u[VDR_Q6_K_Q8_1_MMVQ*QR6_K];
                 float d8[QR6_K];
 #pragma unroll
                 for (int i = 0; i < QR6_K; ++i) {
-                    u[i]  = get_int_b4(by[bq8_offset + 2*i].qs, kqs % QI8_1);
+#pragma unroll
+                    for (int k = 0; k < VDR_Q6_K_Q8_1_MMVQ; ++k) {
+                        u[VDR_Q6_K_Q8_1_MMVQ*i + k] = get_int_b4(by[bq8_offset + 2*i].qs, kqs % QI8_1 + k);
+                    }
                     d8[i] = __low2float(by[bq8_offset + 2*i].ds);
                 }
                 tmp[j] += vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, dx, d8);
@@ -1161,14 +1176,34 @@ static __global__ void mul_mat_vec_iq3_s_grid_rdna3_5(
     GGML_UNUSED(stride_col_dst);
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+// Low bit types load few weight bytes per thread, a second row per block shares the q8_1 loads and adds memory parallelism.
+static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
-                return small_k ? nwarps : 1;
+                if (small_k) {
+                    return nwarps;
+                }
+                if (table_id == MMVQ_PARAMETERS_GB10) {
+                    return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
+                }
+                return table_id == MMVQ_PARAMETERS_GENERIC && mmvq_two_rows_ncols1(type) ? 2 : 1;
             case 2:
             case 3:
             case 4:
@@ -1219,7 +1254,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -1331,16 +1366,17 @@ static __global__ void mul_mat_vec_q(
 #if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
         // start the next iterations' weight loads early
         if constexpr (mmvq_should_prefetch(type)) {
-            constexpr int pf_dist = 2; // loop iterations, not blocks
+            // loop iterations, not blocks; q3_K and q6_K keep the distance in blocks they had with vdr 1
+            constexpr int pf_dist = type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K ? 1 : 2;
             const int kbx_pf = kbx + pf_dist*blocks_per_iter;
             if (kbx_pf < blocks_per_row_x) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
                     const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
-                    mmvq_prefetch_l2((const char *) vx + off);
+                    ggml_cuda_prefetch_l2((const char *) vx + off);
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            mmvq_prefetch_l2((const char *) vgate + off);
+                            ggml_cuda_prefetch_l2((const char *) vgate + off);
                         }
                     }
                 }
@@ -1538,13 +1574,13 @@ static __device__ __forceinline__ float mmvq_fq_block_sum(const float * v, const
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
         // offset 16: a_i = x_i + x_{i^16}, x_{i^16} lives two lanes over
-        a[k] = v[k] + __shfl_xor_sync(0xffffffff, v[k], 2, width);
+        a[k] = v[k] + ggml_cuda_shfl_xor(v[k], 2, width);
     }
     float b[8];
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
         // offset 8: b_i = a_i + a_{i^8}, one lane over
-        b[k] = a[k] + __shfl_xor_sync(0xffffffff, a[k], 1, width);
+        b[k] = a[k] + ggml_cuda_shfl_xor(a[k], 1, width);
     }
     float c[4];
 #pragma unroll
@@ -1730,10 +1766,10 @@ static __global__ void mul_mat_vec_q_fq(
                 for (int k = 0; k < 8; ++k) {
                     ss = fmaf(v[k], v[k], ss);
                 }
-                ss += __shfl_xor_sync(0xffffffff, ss, 1, warp_size);
-                ss += __shfl_xor_sync(0xffffffff, ss, 2, warp_size);
-                ss += __shfl_xor_sync(0xffffffff, ss, 4, warp_size);
-                ss += __shfl_xor_sync(0xffffffff, ss, 8, warp_size);
+                ss += ggml_cuda_shfl_xor(ss, 1, warp_size);
+                ss += ggml_cuda_shfl_xor(ss, 2, warp_size);
+                ss += ggml_cuda_shfl_xor(ss, 4, warp_size);
+                ss += ggml_cuda_shfl_xor(ss, 8, warp_size);
                 const float rms_scale = rsqrtf(ss / 128.0f + fusion.y_eps);
                 const float * z = (const float *) fusion.y_gate + ib*QK8_1 + sub*8;
                 const float * w = (const float *) fusion.y_norm_w + (ib*QK8_1 + sub*8) % 128;
@@ -1761,8 +1797,8 @@ static __global__ void mul_mat_vec_q_fq(
             for (int k = 1; k < 8; ++k) {
                 amax = fmaxf(amax, fabsf(v[k]));
             }
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, warp_size));
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, warp_size));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 1, warp_size));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 2, warp_size));
 
             const float sum = mmvq_fq_needs_sum(type) ? mmvq_fq_block_sum(v, warp_size) : 0.0f;
 
@@ -2086,8 +2122,8 @@ static __global__ void mul_mat_vec_fq_group(
             for (int k = 1; k < 8; ++k) {
                 amax = fmaxf(amax, fabsf(v[k]));
             }
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, warp_size));
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, warp_size));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 1, warp_size));
+            amax = fmaxf(amax, ggml_cuda_shfl_xor(amax, 2, warp_size));
 
             const float d = amax / 127.0f;
             int q[8];
@@ -2427,7 +2463,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -3222,7 +3258,7 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
 
     ggml_cuda_pool_alloc<block_q8_1> y_q8(ctx.pool(), n_used * nblocks);
     quantize_row_q8_1_cuda(
-        (const float *) y->data, nullptr, y_q8.get(), w->type,
+        (const float *) y->data, y_q8.get(),
         ncols,
         y->nb[1] / sizeof(float), y->nb[2] / sizeof(float), y->nb[3] / sizeof(float),
         y->ne[0], y->ne[1], y->ne[2], y->ne[3], ctx.stream());
@@ -3352,7 +3388,7 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

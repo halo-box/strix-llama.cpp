@@ -929,6 +929,7 @@ static __global__ void flash_attn_tile(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        GGML_FATTN_KV_ROWS_PARAM
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -943,7 +944,8 @@ static __global__ void flash_attn_tile(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const GGML_FATTN_NB32_T nb32, const int64_t nb33) {
+    GGML_FATTN_KV_ROWS_LOCAL
 #ifdef FLASH_ATTN_AVAILABLE
 #if defined(__gfx1151__) && !defined(GGML_CUDA_FATTN_VGPR192)
     // The gfx1151 launcher replaces this copy with the dedicated factory.
@@ -967,6 +969,7 @@ static __global__ void flash_attn_tile(
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+    GGML_UNUSED(KV_rows_ptr);
 
     // Skip unused kernel variants for faster compilation:
 
@@ -1003,7 +1006,7 @@ static __global__ void flash_attn_tile(
     const char  * K_data = K + nb13*sequence + nb12*(head0 / gqa_ratio);
     const char  * V_data = V + nb23*sequence + nb22*(head0 / gqa_ratio);
 
-    const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
+    const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33) + nb32*(head0 % ne32)) : nullptr;
 
     const int stride_mask = nb31 / sizeof(half);
 
@@ -1118,7 +1121,7 @@ static __global__ void flash_attn_tile(
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
-        while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
+        while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, q8_0_KV>
                 (Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
@@ -1295,7 +1298,7 @@ static __global__ void flash_attn_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
@@ -1453,7 +1456,8 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
     const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // a mask with a head dimension is not shared by the Q heads of a K/V head
+    const bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if constexpr (DKQ == 320) {
         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.

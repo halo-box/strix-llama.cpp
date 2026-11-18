@@ -94,6 +94,9 @@ float ggml_table_f32_e8m0_half[1 << 8];
 // precomputed f32 table for ue4m3 (1 KB) (simd-mappings.h)
 float ggml_table_f32_ue4m3[1 << 8];
 
+// Signed FP8 needs its own table: UE4M3 ignores the sign, halves values for NVFP4, and maps NaN to zero.
+float ggml_table_f32_f8_e4m3[1 << 8];
+
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
     int sve_cnt;
@@ -389,8 +392,8 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_F16] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp16,
-        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f16,
-        .vec_dot_type             = GGML_TYPE_F16,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f16_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q1_0] = {
@@ -542,6 +545,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_nvfp4,
         .vec_dot                  = ggml_vec_dot_nvfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_F8_E4M3] = {
+        .from_float               = quantize_row_f8_e4m3,
+        .vec_dot                  = ggml_vec_dot_f8_e4m3_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {
@@ -985,7 +994,7 @@ static void ggml_init_arm_arch_features(void) {}
 #endif
 #endif // __ARM_ARCH
 
-#if defined(__riscv) && defined(__riscv_v_intrinsic)
+#if defined(__riscv) && defined(__riscv_v)
 #include <riscv_vector.h>
 static void ggml_init_riscv_arch_features(void) {
     ggml_riscv_arch_features.rvv_vlen = __riscv_vlenb();
@@ -1523,9 +1532,12 @@ void ggml_compute_forward_mul_mat(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
-    ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
-    int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
+    enum ggml_type    const vec_dot_type     = type_traits_cpu[src0->type].vec_dot_type;
+    ggml_from_float_t const from_float       = type_traits_cpu[vec_dot_type].from_float;
+    int64_t           const vec_dot_num_rows = type_traits_cpu[src0->type].nrows;
+
+    // TODO: a more efficient F16 x F16 path can be used here if ggml_prec_get_src(dst, 1) allows converting src1 to F16
+    //       the code needs to be refactored to enable this (src1 is currently converted based on vec_dot_type alone)
 
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
@@ -1757,8 +1769,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     const enum ggml_type type = src0->type;
 
-    ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
-    enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
+    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1825,8 +1837,11 @@ static void ggml_compute_forward_mul_mat_id(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
-    ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
+    enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+    ggml_from_float_t const from_float   = type_traits_cpu[vec_dot_type].from_float;
+
+    // TODO: a more efficient F16 x F16 path can be used here if ggml_prec_get_src(dst, 1) allows converting src1 to F16
+    //       the code needs to be refactored to enable this (src1 is currently converted based on vec_dot_type alone)
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
@@ -1925,7 +1940,12 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                assert(i02 == -1 || (i02 >= 0 && i02 < n_as));
+
+                if (i02 == -1) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 matrix_row_counts[i02] += 1;
             }
@@ -1941,6 +1961,10 @@ static void ggml_compute_forward_mul_mat_id(
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+
+                if (i02 == -1) {
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
@@ -2049,10 +2073,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_ADD_ID:
             {
                 ggml_compute_forward_add_id(params, tensor);
-            } break;
-        case GGML_OP_ADD1:
-            {
-                ggml_compute_forward_add1(params, tensor);
             } break;
         case GGML_OP_ACC:
             {
@@ -2193,14 +2213,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_DIAG:
             {
                 ggml_compute_forward_diag(params, tensor);
-            } break;
-        case GGML_OP_DIAG_MASK_INF:
-            {
-                ggml_compute_forward_diag_mask_inf(params, tensor);
-            } break;
-        case GGML_OP_DIAG_MASK_ZERO:
-            {
-                ggml_compute_forward_diag_mask_zero(params, tensor);
             } break;
         case GGML_OP_SOFT_MAX:
             {
@@ -2393,6 +2405,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_TOP_K_MASK:
+            {
+                ggml_compute_forward_top_k_mask(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2573,7 +2589,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONT:
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
-        case GGML_OP_ADD1:
         case GGML_OP_ACC:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
@@ -2600,6 +2615,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_TOP_K_MASK:
             {
                 n_tasks = n_threads;
             } break;
@@ -2694,8 +2710,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = 1;
             } break;
-        case GGML_OP_DIAG_MASK_ZERO:
-        case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_SOFT_MAX_BACK:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
@@ -3179,9 +3193,8 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_ADD:
                 case GGML_OP_ADD_ID:
-                case GGML_OP_ADD1:
                     {
-                        if (ggml_is_quantized(node->src[0]->type)) {
+                        if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F8_E4M3) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
                     } break;
@@ -3231,7 +3244,7 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
-                        if (ggml_is_quantized(node->src[0]->type) ||
+                        if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F8_E4M3 ||
                             node->src[0]->type == GGML_TYPE_F16) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
                         }
@@ -3263,8 +3276,8 @@ struct ggml_cplan ggml_graph_plan(
                         if ((node->src[0]->type == GGML_TYPE_F16 ||
                              node->src[0]->type == GGML_TYPE_BF16) &&
                             node->src[1]->type == GGML_TYPE_F32) {
+                            cur += sizeof(float)*ne10*ne11;
                             cur += sizeof(ggml_fp16_t)*ne00*ne01*ne02;
-                            cur += sizeof(ggml_fp16_t)*ne10*ne11;
                         } else if (node->src[0]->type == GGML_TYPE_F32 &&
                                    node->src[1]->type == GGML_TYPE_F32) {
                             cur += sizeof(float)*ne00*ne01*ne02;
@@ -3293,8 +3306,8 @@ struct ggml_cplan ggml_graph_plan(
                         GGML_ASSERT(node->src[0]->type == GGML_TYPE_F16 || node->src[0]->type == GGML_TYPE_F32);
                         GGML_ASSERT(node->src[1]->type == GGML_TYPE_F32);
 
+                        cur += sizeof(float) * ne10 * ne11 * ne12 * ne13;
                         cur += ggml_type_size(node->src[0]->type) * ne00 * ne01 * ne02 * ne03;
-                        cur += ggml_type_size(node->src[0]->type) * ne10 * ne11 * ne12 * ne13;
 
                     } break;
                 case GGML_OP_TOP_K:
@@ -3316,9 +3329,9 @@ struct ggml_cplan ggml_graph_plan(
                         size_t n_chunks = n_tasks;
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
-                        // selected-key rows (src[5]) are gathered per thread after the decode partials
-                        if (node->src[5]) {
-                            decode += sizeof(float)*n_tasks*CACHE_LINE_SIZE_F32 + sizeof(int32_t)*n_tasks*node->src[5]->ne[0];
+                        // selected-key rows (src[6]) are gathered per thread after the decode partials
+                        if (node->src[6]) {
+                            decode += sizeof(float)*n_tasks*CACHE_LINE_SIZE_F32 + sizeof(int32_t)*n_tasks*node->src[6]->ne[0];
                         }
 
                         cur += MAX(prefill, decode);
@@ -3869,7 +3882,7 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
         _mm_storeu_ps(y + i, y_vec);
     }
 
-#elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfhmin)
+#elif defined(__riscv_v) && defined(__riscv_zvfhmin)
     // calculate step size
     const int epr = __riscv_vsetvlmax_e16m2();
     const int step = epr * 2;
@@ -3939,7 +3952,7 @@ void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
                                         (const __m128i *)(x + i))),
                                 16)));
     }
-#elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfbfmin)
+#elif defined(__riscv_v) && defined(__riscv_zvfbfmin)
     // calculate step size
     const int epr = __riscv_vsetvlmax_e16m2();
     const int step = epr * 2;
@@ -4059,7 +4072,7 @@ int ggml_cpu_has_arm_fma(void) {
 }
 
 int ggml_cpu_has_riscv_v(void) {
-#if defined(__riscv_v_intrinsic)
+#if defined(__riscv_v)
     return 1;
 #else
     return 0;
@@ -4067,7 +4080,7 @@ int ggml_cpu_has_riscv_v(void) {
 }
 
 int ggml_cpu_get_rvv_vlen(void) {
-#if defined(__riscv) && defined(__riscv_v_intrinsic)
+#if defined(__riscv) && defined(__riscv_v)
     return ggml_riscv_arch_features.rvv_vlen;
 #else
     return 0;
@@ -4230,6 +4243,7 @@ void ggml_cpu_init(void) {
             // initialize UE4M3 table (256 entries)
             for (int i = 0; i < (1 << 8); ++i) {
                 ggml_table_f32_ue4m3[i] = ggml_ue4m3_to_fp32(i);
+                ggml_table_f32_f8_e4m3[i] = ggml_f8_e4m3_to_fp32(i);
             }
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);

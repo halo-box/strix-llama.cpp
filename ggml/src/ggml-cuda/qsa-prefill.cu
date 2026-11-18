@@ -543,8 +543,8 @@ bool ggml_cuda_flash_attn_ext_qsa_prefill_supported(ggml_backend_cuda_context & 
     return ggml_cuda_flash_attn_ext_qsa_prefill_supported_dev(ctx.device, dst);
 }
 bool ggml_cuda_flash_attn_ext_qsa_prefill_supported_dev(int device, const ggml_tensor * dst) {
-    const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
-    if (!q || !k || !v || !ids || dst->src[4] || ggml_get_op_params_i32(dst, 4) != 0 ||
+    const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[6];
+    if (!q || !k || !v || !ids || dst->src[4] || dst->src[5] || ggml_get_op_params_i32(dst, 4) != 0 ||
             !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) return false;
     float bias, softcap; memcpy(&bias, (const char *) dst->op_params+4, 4); memcpy(&softcap, (const char *) dst->op_params+8, 4);
     // the mask is optional: a maskless op relies on the index rows naming only visible cells (-1 elsewhere)
@@ -577,7 +577,7 @@ static __global__ void qsa_pack_v(const char * src, uint16_t * dst, size_t nb1, 
 // out32 / dst16 (either may be null) receive the attention output, or sigmoid(gate) * output when gate is set
 static void qsa_prefill_impl1(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gate, float * out32,
         uint16_t * dst16, const bool dst16_f16) {
-    const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[5];
+    const auto * q=dst->src[0], * k=dst->src[1], * v=dst->src[2], * m=dst->src[3], * ids=dst->src[6];
     float scale; memcpy(&scale, dst->op_params, 4);
     const int n_q = (int) q->ne[1], ns = (int) ids->ne[0], nk = (int) k->ne[1];
     // K is read direct (32 B row reads) and only V is packed, unless the attention is small against the cache
@@ -633,7 +633,7 @@ static void qsa_prefill_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         qsa_prefill_impl1(ctx, dst, gate, out32, dst16, dst16_f16);
         return;
     }
-    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * ids = dst->src[5];
+    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * ids = dst->src[6];
     const int64_t n_q = q->ne[1], hq = q->ne[2];
     for (int64_t s = 0; s < ns; ++s) {
         ggml_tensor qs = *q, ks = *k, vs = *v, is = *ids, ds = *dst;
@@ -642,7 +642,7 @@ static void qsa_prefill_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
         vs.data = (char *) v->data + s*v->nb[3];     vs.ne[3] = 1;
         is.data = (char *) ids->data + s*ids->nb[3]; is.ne[3] = 1;
         ds.data = (char *) dst->data + s*dst->nb[3]; ds.ne[3] = 1;
-        ds.src[0] = &qs; ds.src[1] = &ks; ds.src[2] = &vs; ds.src[5] = &is;
+        ds.src[0] = &qs; ds.src[1] = &ks; ds.src[2] = &vs; ds.src[6] = &is;
         // rows of the gated outputs and of the gate are (query, head) pairs, n_q * hq per stream
         const size_t rows = (size_t) s * n_q * hq;
         ggml_tensor gs;

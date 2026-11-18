@@ -97,7 +97,7 @@ static void test_scalar_visibility() {
 static void test_scan_foreign_image() {
     std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN4EXP, llama_model_default_params()));
     model->hparams = {};
-    llama_memory_hybrid_idx mem(*model, GGML_TYPE_F16, GGML_TYPE_F16, false, 64, 1, 0, LLAMA_SWA_TYPE_NONE,
+    llama_memory_hybrid_idx mem(*model, false, GGML_TYPE_F16, GGML_TYPE_F16, false, 64, 0, LLAMA_SWA_TYPE_NONE,
                                GGML_TYPE_F32, GGML_TYPE_F32, 4, 3, 0, false, true,
                                nullptr, nullptr, [](int32_t) { return false; });
     auto & cells = const_cast<llama_kv_cells &>(mem.get_mem_idx()->get_cells(0));
