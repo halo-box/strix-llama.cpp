@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { ExternalLink } from '@lucide/svelte';
 	import { Button } from '@ggml-org/llama-ui/ui/button';
+	import { ExternalLink } from '@lucide/svelte';
 	import { KeyboardShortcutInfo } from '#lib/components/app/index.ts';
 	import {
 		ICON_CLASS_DEFAULT,

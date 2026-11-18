@@ -5,10 +5,14 @@ import {
 	SHORTCUT_SEARCH,
 	SHORTCUT_SETTINGS
 } from './keyboard-shortcuts.constants';
-import { MCP_SERVERS_ROUTE_ID, MODELS_ROUTE_ID, SETTINGS_ROUTE_ID } from './routes.constants';
+import {
+	MCP_SERVERS_ROUTE_ID,
+	MODELS_ROUTE_ID,
+	SERVER_DASHBOARD_URL,
+	SETTINGS_ROUTE_ID
+} from './routes.constants';
 import { Gauge, Search, Settings, SquarePen } from '@lucide/svelte';
 import McpLogo from '#lib/components/app/mcp/McpLogo.svelte';
-import { SERVER_DASHBOARD_URL } from './routes.constants';
 import { SidebarAction, ToolSource } from '#lib/enums/index.ts';
 import type { DesktopIconStripItem } from '#lib/types/index.ts';
 
