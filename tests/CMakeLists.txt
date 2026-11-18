@@ -431,6 +431,9 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
                          ${PROJECT_SOURCE_DIR}/ggml/rocmfpx/rocmfp2_reference.c
                          NAME test-rocmfp2-reference)
     target_include_directories(test-rocmfp2-reference PRIVATE ${PROJECT_SOURCE_DIR}/ggml/rocmfpx)
+    if (NOT MSVC)
+        target_compile_options(test-rocmfp2-reference PRIVATE -ffp-contract=off)
+    endif()
     if (GGML_EXL3)
         # EXL3 decode self-test, kept next to the decoder under ggml/exl3
         llama_build_and_test(${PROJECT_SOURCE_DIR}/ggml/exl3/test_exl3.c NAME test-exl3 LINK ggml vendor::hash)
