@@ -140,7 +140,7 @@ jobs:
           source .venv/Scripts/activate
           pip install -r requirements/requirements-convert_hf_to_gguf.txt
 
-      - name: Prefer the Visual Studio clang
+      - name: Visual Studio clang when the STL needs it
         uses: ./.github/actions/windows-vs-clang
 
       - name: Build

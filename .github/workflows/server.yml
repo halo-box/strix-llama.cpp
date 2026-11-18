@@ -175,7 +175,7 @@ jobs:
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
-      - name: Prefer the Visual Studio clang
+      - name: Visual Studio clang when the STL needs it
         uses: ./.github/actions/windows-vs-clang
 
       - name: Build

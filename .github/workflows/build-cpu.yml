@@ -183,7 +183,7 @@ jobs:
           $lib =  $(join-path $msvc 'bin\Hostx64\x64\lib.exe')
           & $lib /machine:x64 "/def:${env:RUNNER_TEMP}/openblas/lib/libopenblas.def" "/out:${env:RUNNER_TEMP}/openblas/lib/openblas.lib" /name:openblas.dll
 
-      - name: Prefer the Visual Studio clang
+      - name: Visual Studio clang when the STL needs it
         uses: ./.github/actions/windows-vs-clang
 
       - name: Install Ninja

@@ -1,22 +1,22 @@
-name: "Windows - Prefer the Visual Studio clang"
-description: "Put the clang that Visual Studio installs with its STL first on PATH, when it exists and is clang 20 or newer"
+name: "Windows - Visual Studio clang when the STL needs it"
+description: "Put the clang that Visual Studio installs with its STL first on PATH when the clang on PATH is older than that STL accepts"
 
 runs:
   using: "composite"
   steps:
-    - name: Prefer the Visual Studio clang
+    - name: Visual Studio clang when the STL needs it
       shell: pwsh
       run: |
+        $major = { param($exe) if ((& $exe --version | Select-Object -First 1) -match 'clang version (\d+)\.') { [int]$Matches[1] } else { 0 } }
         $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-        $bin = if ($vs) { Join-Path $vs 'VC\Tools\Llvm\x64\bin' } else { '' }
-        $major = 0
-        if ($bin -and (Test-Path (Join-Path $bin 'clang.exe'))) {
-          $version = & (Join-Path $bin 'clang.exe') --version | Select-Object -First 1
-          if ($version -match 'clang version (\d+)\.') { $major = [int]$Matches[1] }
-          Write-Output "Visual Studio clang: $version"
-        }
-        if ($major -ge 20) {
+        $tools = (Get-Content (Join-Path $vs 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt') -Raw).Trim()
+        $yvals = Join-Path $vs "VC\Tools\MSVC\$tools\include\yvals_core.h"
+        $need = if ((Get-Content $yvals -Raw) -match 'expected Clang (\d+)(\.\d+\.\d+)? or newer') { [int]$Matches[1] } else { 0 }
+        $have = & $major clang
+        $bin = Join-Path $vs 'VC\Tools\Llvm\x64\bin'
+        Write-Output "MSVC $tools STL needs clang $need, clang on PATH is $have"
+        if ($have -lt $need) {
+          if (-not (Test-Path (Join-Path $bin 'clang.exe'))) { throw "no Visual Studio clang in $bin" }
+          Write-Output "using $bin (clang $(& $major (Join-Path $bin 'clang.exe')))"
           Add-Content $env:GITHUB_PATH $bin
-        } else {
-          Write-Output "No Visual Studio clang 20 or newer, keeping: $((& clang --version | Select-Object -First 1))"
         }
