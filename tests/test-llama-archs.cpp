@@ -1143,7 +1143,7 @@ static bool check_causal_attn_toggle(
 }
 
 // a qwen35 / qwen4exp file whose shared-input weights are merged as the upstream converter writes them gives the same logits
-static int test_merged_weights(const llm_arch arch, const size_t seed, const float stdev) {
+static int test_merged_weights(const llm_arch arch, const char * arch_name, const size_t seed, const float stdev) {
     gguf_context_ptr meta = get_gguf_ctx(arch, true);
     llama_model_ptr model = get_model(meta.get(), nullptr, seed, stdev, {});
     const std::string path_sep = get_tmp_gguf_path();
@@ -1220,7 +1220,7 @@ static int test_merged_weights(const llm_arch arch, const size_t seed, const flo
     }
     GGML_ASSERT(logits[0].size() == logits[1].size());
     GGML_ASSERT(memcmp(logits[0].data(), logits[1].data(), logits[0].size()*sizeof(float)) == 0);
-    LOG("PASS: %s with %d merged shared-input weights gives the logits of the separate weights\n", llm_arch_name(arch), n_merged);
+    LOG("PASS: %s with %d merged shared-input weights gives the logits of the separate weights\n", arch_name, n_merged);
     return 0;
 }
 
@@ -2197,10 +2197,10 @@ int main(int argc, char ** argv) {
             return test_mtp_cache_only(seed, stdev);
         }
         if (qwen4exp_merged) {
-            return test_merged_weights(LLM_ARCH_QWEN4EXP, seed, stdev);
+            return test_merged_weights(LLM_ARCH_QWEN4EXP, "qwen4exp", seed, stdev);
         }
         if (qwen35_merged) {
-            return test_merged_weights(LLM_ARCH_QWEN35, seed, stdev);
+            return test_merged_weights(LLM_ARCH_QWEN35, "qwen35", seed, stdev);
         }
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
