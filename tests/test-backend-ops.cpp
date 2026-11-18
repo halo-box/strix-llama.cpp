@@ -10786,6 +10786,7 @@ struct test_top_k_stable_ties : public test_top_k {
         return 0.0;
     }
 
+    using test_top_k::max_err;
     double max_err(ggml_backend_t backend) override {
         const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
         // Other backends may legitimately choose a different subset of equal-valued columns.
@@ -10807,7 +10808,7 @@ struct test_top_k_exact_set : public test_top_k {
         return test_top_k::vars() + ",visible=" + std::to_string(visible) + (step ? ",step=" + std::to_string(step) : "") + ",exact_set=1";
     }
 
-    void initialize_tensors(ggml_context * ctx) override {
+    void initialize_tensors(ggml_context *) override {
         std::default_random_engine rng(0xbeef);
         std::uniform_int_distribution<int> dist(0, std::max<int>(1, (int) (visible / 8)));
         std::vector<float> data(ggml_nelements(input));
@@ -10846,6 +10847,7 @@ struct test_top_k_exact_set : public test_top_k {
     }
 
     // the tie rule is Vulkan's (and ROCm's radix); other backends may pick another subset of equal values
+    using test_top_k::max_err;
     double max_err(ggml_backend_t backend) override {
         const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
         return strcmp(reg, "Vulkan") == 0 ? 0.0 : double(k * ne[1]);
