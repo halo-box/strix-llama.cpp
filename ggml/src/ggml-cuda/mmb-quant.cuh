@@ -277,6 +277,30 @@ template <> struct mmb_ms3<32 + GGML_TYPE_IQ2_XXS> {
         w1 = mmb_iq2_dec8(g[f[2] >> 8], lo, hi, mmb_ksigns((f[0] >> (14 * pc + 7)) & 127));
     }
 };
+// IQ3_S on the register-operand routed GLU kernel: a lane's 16 weights of 32-block q, piece pc, are the two 8-weight
+// grid groups il = 2 pc, 2 pc + 1 (one 4-byte qs read, the block's qh, their two sign bytes, the 32-block's scale
+// nibble pre-selected in fetch). decode() is mmb_lb<IQ3_S>::decode twice: the same fp32 d * (1 + 2 ls) and
+// mmb_grid8_bf16 -> the same bf16 weights as the LDS-tile path, bit-identical.
+template <> struct mmb_ms3<32 + GGML_TYPE_IQ3_S> {
+    static constexpr bool ok = true; using grid_t = uint32_t; static constexpr int N = 512, NR = 3;
+    static __device__ __forceinline__ grid_t entry(const int i) { return iq3s_grid[i]; }
+    static __device__ __forceinline__ void fetch(const uint8_t * row, const int ks, const int q, const int pc, uint32_t (&f)[NR]) {
+        const block_iq3_s * x = (const block_iq3_s *) row + (ks * 64) / QK_K;
+        const int ib = ((ks * 64) % QK_K) / 32 + q;   // ib % 2 == q: the scale nibble is a lane constant
+        const uint16_t * qs = (const uint16_t *) (x->qs + 8 * ib + 4 * pc);
+        f[0] = qs[0] | ((uint32_t) qs[1] << 16);
+        f[1] = x->qh[ib] | ((uint32_t) x->signs[4 * ib + 2 * pc] << 8) | ((uint32_t) x->signs[4 * ib + 2 * pc + 1] << 16) |
+               ((uint32_t) ((x->scales[ib / 2] >> (4 * q)) & 0xf) << 24);
+        f[2] = *(const uint16_t *) &x->d;
+    }
+    static __device__ __forceinline__ void decode(const grid_t * g, const uint32_t (&f)[NR], const int pc, uint4 & w0, uint4 & w1) {
+        const float d = mmb_h2f((uint16_t) f[2]) * (1 + 2 * (int) (f[1] >> 24));
+        const uint32_t qh = f[1] & 0xff;
+        const int il0 = 2 * pc, il1 = 2 * pc + 1;
+        w0 = mmb_grid8_bf16(g[(f[0] & 0xff) | ((qh << (8 - 2 * il0)) & 256)], g[((f[0] >> 8) & 0xff) | ((qh << (7 - 2 * il0)) & 256)], d, (f[1] >> 8) & 0xff);
+        w1 = mmb_grid8_bf16(g[((f[0] >> 16) & 0xff) | ((qh << (8 - 2 * il1)) & 256)], g[(f[0] >> 24) | ((qh << (7 - 2 * il1)) & 256)], d, (f[1] >> 16) & 0xff);
+    }
+};
 
 // F16: store F16 instead of BF16 weights (IQ1_M only)
 template <ggml_type TYPE, bool F16 = false>

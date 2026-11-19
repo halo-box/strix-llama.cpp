@@ -1003,7 +1003,7 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
 
 // BF16 grid types of the big GLU tier that take mmb_routed_glu_ms_kernel
 static constexpr bool mmb_glu_ms_type(const int wtype) {
-    return wtype == 32 + GGML_TYPE_IQ2_S || wtype == 32 + GGML_TYPE_IQ2_XXS;
+    return wtype == 32 + GGML_TYPE_IQ2_S || wtype == 32 + GGML_TYPE_IQ2_XXS || wtype == 32 + GGML_TYPE_IQ3_S;
 }
 
 // D = W X^T on 32-bit operand registers. Bit-identical to the X W^T orientation of mmb_tile_gemm (transposed): measured
@@ -1044,7 +1044,7 @@ mmb_routed_glu_ms_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __rest
     NO_DEVICE_CODE;
 #else
     using LBT = mmb_ms3<WTYPE>;
-    static_assert(LBT::ok && mmb_glu_ms_type(WTYPE), "3-value IQ2 grid types only");
+    static_assert(LBT::ok && mmb_glu_ms_type(WTYPE), "grid types with an mmb_ms3 decoder only");
     constexpr int BM = 64, BN = 128, TN = BN / 16, BSZ = BN * MMB_LDS_STRIDE, B_ITEMS = BN * 8 / MMB_NT;
     static_assert(2 * BSZ * 2 >= 4 * TN * 8 * 32 * 4, "the epilogue's fp32 exchange reuses Bs");
     __shared__ __align__(16) uint16_t Bs[2 * BSZ];
