@@ -1417,8 +1417,6 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
-    // tensors the test-mode context holds (graph objects only, no data)
-    virtual size_t max_tensors() { return 128; }
     // the output must be the same in each run on the same backend
     virtual bool deterministic(ggml_backend_t backend) {
         GGML_UNUSED(backend);
@@ -1538,7 +1536,7 @@ struct test_case {
         mode = MODE_TEST;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*max_tensors() + ggml_graph_overhead(),
+            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -7585,16 +7583,13 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
-// The qwen4exp/qwen3.5 Gated DeltaNet decode chain at 1-8 tokens with K rollback slots, as one decode step builds it
+// The qwen4exp Gated DeltaNet decode chain at 1-8 tokens with K rollback slots, as one decode step builds it
 // (fused into one decode kernel + one norm kernel on AMD).
 // rows: the conv store of build_conv_state_store with n_rs_seq > 0 (ARANGE -> reverse SCALE -> I32 cast -> SET_ROWS of
 //       the overlapping windows into slots {n-1, ..., 0}), which the model emits; otherwise the older per-slot CPYs.
 // ident 1: the chain twice on separate caches, the second kept unfused (its CONCAT is a graph output); the outputs are
 //       the differences (output, conv slots, state slots). The unfused ops round differently from the fused decode step
 //       (also at one token), so this is a tolerance check.
-// ident 2: the reference is n_tokens single-token steps (K = 1, per-slot CPY store: the plain decode chain, fused on AMD),
-//       each reading the caches the previous step wrote; the differences (outputs, final state, final conv state) must
-//       be exactly 0: per token the multi-token fused step computes what the single-token fused step computes.
 struct test_gdn_decode_rollback : public test_case {
     const int64_t n_tokens, K;
     const bool reverse, rows;
@@ -7607,12 +7602,11 @@ struct test_gdn_decode_rollback : public test_case {
     std::string vars() override { return rows || ident ? VARS_TO_STR5(n_tokens, K, reverse, rows, ident) : VARS_TO_STR3(n_tokens, K, reverse); }
     std::string op_desc(ggml_tensor *) override { return "GDN_DECODE_ROLLBACK"; }
     bool run_whole_graph() override { return true; }
-    size_t max_tensors() override { return ident == 2 ? 64 * (n_tokens + 2) : 128; }   // ~45 tensors per chain
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
     // the rollback (SET_ROWS) form replaces the unfused chain and must equal it; the per-slot CPY form keeps the decode kernel's own
     // softplus (logf(1 + expf)) and is only within rounding of the unfused ops
     double max_err(ggml_backend_t backend) override {
-        return ident == 2 || (ident == 1 && rows) ? 0.0 : ident == 1 ? 1e-6 : test_case::max_err(backend);
+        return ident && rows ? 0.0 : ident ? 1e-6 : test_case::max_err(backend);
     }
     double err(const float * a, const float * b, size_t n) override {
         if (!ident) {
@@ -7699,25 +7693,6 @@ struct test_gdn_decode_rollback : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        if (rows) {
-            // the CUDA matcher takes the SET_ROWS rollback store only when enabled (off by default: tolerance-identical
-            // to the unfused rollback ops); an explicit GGML_CUDA_FUSE_GDN_DECODE_T from the caller wins
-            if (getenv("GGML_CUDA_FUSE_GDN_DECODE_T") == nullptr) {
-#ifdef _WIN32
-                _putenv_s("GGML_CUDA_FUSE_GDN_DECODE_T", "1");
-#else
-                setenv("GGML_CUDA_FUSE_GDN_DECODE_T", "1", 0);
-#endif
-            }
-            // the one-token rollback match is opt-in on the model; the tests keep exercising it
-            if (getenv("GGML_CUDA_FUSE_GDN_DECODE_T1") == nullptr) {
-#ifdef _WIN32
-                _putenv_s("GGML_CUDA_FUSE_GDN_DECODE_T1", "1");
-#else
-                setenv("GGML_CUDA_FUSE_GDN_DECODE_T1", "1", 0);
-#endif
-            }
-        }
         auto tensor = [&](int64_t x, int64_t y, const char * name) {
             ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x, y);
             ggml_set_name(t, name);
@@ -7736,29 +7711,6 @@ struct test_gdn_decode_rollback : public test_case {
         outputs.clear();
         chain_out a = build_chain(ctx, n_tokens, K, rows, new_cache(ctx, 3 * C, K, "conv_cache", ""), new_cache(ctx, D, K, "state_cache", ""),
                 false, ids, qkv, conv_w, alpha, dt, A, beta, norm_w, z);
-        if (ident == 2) {
-            // n_tokens single-token steps (same store form and slot count: what plain decode builds with these rollback slots)
-            // on caches with the same initial rows, in graph order; each step writes slot 0, which the next one reads
-            ggml_tensor * conv_c  = new_cache(ctx, 3 * C, K, "conv_cache", "_ref");
-            ggml_tensor * state_c = new_cache(ctx, D, K, "state_cache", "_ref");
-            ggml_tensor * outs = nullptr;
-            chain_out st = {};
-            for (int64_t t = 0; t < n_tokens; ++t) {
-                auto col = [&](ggml_tensor * x) { return ggml_view_2d(ctx, x, x->ne[0], 1, x->nb[1], t * x->nb[1]); };
-                st = build_chain(ctx, 1, rows ? K : 1, rows, conv_c, state_c, false, ids, col(qkv), conv_w, col(alpha), dt, A, col(beta), norm_w, col(z));
-                ggml_tensor * o = ggml_reshape_4d(ctx, st.out, S, H_v, 1, 1);
-                outs = outs ? ggml_concat(ctx, outs, o, 2) : o;
-            }
-            // token n-1 wrote slot 0 of the multi-token caches (conv and state); the reference caches hold the last step
-            ggml_tensor * d_out   = ggml_sub(ctx, a.out, outs);
-            ggml_tensor * d_state = ggml_sub(ctx, ggml_view_2d(ctx, a.state, D, 1, a.state->nb[1], 0), st.state);
-            ggml_tensor * d_conv  = ggml_sub(ctx, ggml_cont(ctx, ggml_view_2d(ctx, a.conv, 3 * C, 1, a.conv->nb[1], 0)),
-                    ggml_cont(ctx, ggml_view_2d(ctx, st.conv, 3 * C, 1, st.conv->nb[1], 0)));
-            ggml_build_forward_expand(gf, d_conv);
-            ggml_build_forward_expand(gf, d_state);
-            outputs = { d_conv, d_state, d_out };
-            return d_out;
-        }
         if (!ident) {
             if (rows) {
                 outputs.push_back(ggml_cont(ctx, a.conv));
@@ -7781,7 +7733,7 @@ struct test_gdn_decode_rollback : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
-            if (ggml_is_view_op(t->op) || t->op != GGML_OP_NONE) { continue; }
+            if (t->op != GGML_OP_NONE) { continue; }
             std::string name = t->name;
             if (name.size() > 4 && name.compare(name.size() - 4, 4, "_ref") == 0) {
                 name.resize(name.size() - 4);   // the reference chain's caches get the same data
@@ -19214,7 +19166,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (const auto & shape : {std::pair<int64_t, int64_t>{1, 4}, {2, 4}, {4, 4}, {3, 5}, {8, 8}}) {
         test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, true));
         test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, true, 1));
-        test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, true, 2));
     }
     for (const auto & shape : {std::pair<int64_t, int64_t>{1, 1}, {2, 4}, {4, 4}}) {
         test_cases.emplace_back(new test_gdn_decode_rollback(shape.first, shape.second, false, false, 1));

@@ -2028,7 +2028,7 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Fused Qwen3.5/3.6 Gated DeltaNet decode step (n_tokens == 1, n_seqs == 1, S == 128): one block per value
+// Fused Qwen3.5/3.6 Gated DeltaNet decode step (1-8 tokens of one sequence, S == 128): one block per value
 // head computes the causal conv + SiLU of its q/k/v channels (writing the shifted conv state back into the
 // cache), the q/k L2 norms, the gate (softplus) and beta (sigmoid), the recurrence with the new state written
 // straight into the cache, and the gated RMS norm of the attention output. This replaces 14 graph nodes
@@ -2036,7 +2036,8 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
 //
 // Every op is spelled with the same operation order and FMA contraction as the kernels it replaces
 // (ssm_conv_f32, l2_norm_dual_f32_s128, unary/binary elementwise, gated_delta_net_cuda, rms_norm_f32<128>),
-// so the outputs are bit-identical to the unfused graph. When args.qk_rms_scale is set, the q/k norms
+// so the SET_ROWS rollback form gives the bits of the unfused graph; the per-slot CPY form keeps this kernel's own
+// softplus (logf(1 + expf(x)) against the unfused log1pf(expf(x))). When args.qk_rms_scale is set, the q/k norms
 // replay rms_norm_f32<256, false> + scale_f32 (the qwen4exp build_gdn_l2_norm form) with the same thread
 // layout, reduction tree and single-rounding products.
 
@@ -2079,185 +2080,185 @@ gdn_decode_fused_cuda(const ggml_cuda_gdn_decode_args args) {
     float s_shard[cols_per_warp][rows_per_lane];
 
     for (int t = 0; t < args.n_tokens; ++t) {
-    const int slot = (int) args.n_tokens - 1 - t;
+        const int slot = (int) args.n_tokens - 1 - t;
 
-    // 1. causal conv + SiLU for this head's q, k and v channels; shift the conv state (CPY conv_state_last)
-    if (thread < 3 * S) {
-        const int part = thread / S;               // 0: q, 1: k, 2: v
-        const int i    = thread % S;
-        const int c    = part == 0 ? hk * S : part == 1 ? args.H_k * S + hk * S : 2 * args.H_k * S + h * S;
-        const int ch   = c + i;
+        // 1. causal conv + SiLU for this head's q, k and v channels; shift the conv state (CPY conv_state_last)
+        if (thread < 3 * S) {
+            const int part = thread / S;               // 0: q, 1: k, 2: v
+            const int i    = thread % S;
+            const int c    = part == 0 ? hk * S : part == 1 ? args.H_k * S + hk * S : 2 * args.H_k * S + h * S;
+            const int ch   = c + i;
 
-        float x[D_CONV];
-        float w[D_CONV];
-#pragma unroll
-        for (int j = 0; j < D_CONV; j++) {
-            const int col = t + j;   // column of the concat [conv state, qkv tokens]
-            x[j] = col < D_CONV - 1 ? args.conv_state_in[ch * (D_CONV - 1) + col]
-                                    : args.qkv[ch * args.qkv_stride + (int64_t) (col - (D_CONV - 1)) * args.qkv_token_stride];
-        }
-#pragma unroll
-        for (int j = 0; j < D_CONV; j++) {
-            w[j] = args.conv_w[ch * D_CONV + j];
-        }
-
-        // ssm_conv_f32: fma chain from 0, then the (zero) bias add, then SiLU
-        float sumf = fmaf(x[0], w[0], 0.0f);
-#pragma unroll
-        for (int j = 1; j < D_CONV; j++) {
-            sumf = fmaf(x[j], w[j], sumf);
-        }
-        sumf += args.conv_bias;
-        const float y = ggml_cuda_op_silu_single(sumf);
-
-        if (part == 0) {
-            q_c[i] = y;
-        } else if (part == 1) {
-            k_c[i] = y;
-        } else {
-            v_c[i] = y;
-        }
-
-        // q/k channels are shared by H_v/H_k value heads: the first one writes the conv state
-        if (part == 2 || h == hk) {
-            float * conv_out = args.conv_state_out + (int64_t) slot * args.conv_slot_stride;
-#pragma unroll
-            for (int j = 0; j < D_CONV - 1; j++) {
-                conv_out[ch * (D_CONV - 1) + j] = x[j + 1];
+            float x[D_CONV];
+            float w[D_CONV];
+    #pragma unroll
+            for (int j = 0; j < D_CONV; j++) {
+                const int col = t + j;   // column of the concat [conv state, qkv tokens]
+                x[j] = col < D_CONV - 1 ? args.conv_state_in[ch * (D_CONV - 1) + col]
+                                        : args.qkv[ch * args.qkv_stride + (int64_t) (col - (D_CONV - 1)) * args.qkv_token_stride];
             }
-        }
-    }
-    __syncthreads();
-
-    // 2. q/k norm: l2_norm_dual_f32_s128 for q (warp 0) and k (warp 1), or, when the graph uses the
-    //    qwen4exp build_gdn_l2_norm representation RMS_NORM(x, eps) -> SCALE(mul, add), the exact
-    //    replay of the dispatched rms_norm_f32<256, false> + scale_f32 pair
-    if (!args.qk_rms_scale) {
-        if (warp < 2) {
-            const float * x = warp == 0 ? q_c : k_c;
-            float *       y = warp == 0 ? q_n : k_n;
-            float tmp = 0.0f;
-#pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                const float xi = x[r * warp_size + lane];
-                tmp = fmaf(xi, xi, tmp);
+    #pragma unroll
+            for (int j = 0; j < D_CONV; j++) {
+                w[j] = args.conv_w[ch * D_CONV + j];
             }
-            tmp = gdn_warp_reduce_sum<warp_size>(tmp);
-            const float scale = rsqrtf(fmaxf(tmp, args.eps_l2 * args.eps_l2));
-#pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                y[r * warp_size + lane] = scale * x[r * warp_size + lane];
+
+            // ssm_conv_f32: fma chain from 0, then the (zero) bias add, then SiLU
+            float sumf = fmaf(x[0], w[0], 0.0f);
+    #pragma unroll
+            for (int j = 1; j < D_CONV; j++) {
+                sumf = fmaf(x[j], w[j], sumf);
             }
-        }
-    } else {
-        // rms_norm_f32<256, false>: 128 elements over 128 lanes (4 warps, one element per lane; warps 4..7
-        // of the standalone 256-thread block hold exact zeros that drop out of the tree), the warp
-        // butterfly (xor 16/8/4/2/1), the cross-warp tree ((v0 + v2) + (v1 + v3)), mean = sum / 128,
-        // scale = rsqrtf(mean + eps), dst = scale * x; then scale_f32: dst = mul * dst + add. The standalone
-        // scale_f32 compiles its mul+add to a single FMA (v_fma_f32 in the RDNA3.5 build), so the same
-        // contraction is spelled explicitly here.
-        const int iqk = warp < 4 ? 0 : 1;
-        if (warp < 8) {
-            const float * x  = iqk == 0 ? q_c : k_c;
-            const float   xi = x[(warp & 3) * warp_size + lane];
-            float part = fmaf(xi, xi, 0.0f);
-            part = warp_reduce_sum<warp_size>(part);
-            if (lane == 0) {
-                qk_red[warp] = part;
+            sumf += args.conv_bias;
+            const float y = ggml_cuda_op_silu_single(sumf);
+
+            if (part == 0) {
+                q_c[i] = y;
+            } else if (part == 1) {
+                k_c[i] = y;
+            } else {
+                v_c[i] = y;
             }
-        }
-        __syncthreads();
-        const float total = iqk == 0 ? (qk_red[0] + qk_red[2]) + (qk_red[1] + qk_red[3])
-                                     : (qk_red[4] + qk_red[6]) + (qk_red[5] + qk_red[7]);
-        const float scale = rsqrtf(total / (float) args.S + args.qk_rms_eps[iqk]);
-        if (warp < 8) {
-            const float * x = iqk == 0 ? q_c : k_c;
-            float *       y = iqk == 0 ? q_n : k_n;
-            const int     i = (warp & 3) * warp_size + lane;
-            const float rms = scale * x[i];
-            y[i] = fmaf(args.qk_scale_mul[iqk], rms, args.qk_scale_add[iqk]);
-        }
-    }
 
-    // gate = softplus(alpha + dt_bias) * A, beta = sigmoid(beta): scalar per head, computed by every thread
-    const float alpha_biased = args.alpha[(int64_t) t * args.H_v + h] + args.dt_bias[h];
-    const float softplus     = args.softplus_log1p ? ((alpha_biased > 20.0f) ? alpha_biased : log1pf(expf(alpha_biased)))
-                                                   : gdn_decode_softplus(alpha_biased);
-    const float gate         = softplus * args.ssm_a[h];
-    const float beta_val     = gdn_decode_sigmoid(args.beta[(int64_t) t * args.H_v + h]);
-    const float g_val        = expf(gate);
-    __syncthreads();
-
-    // 3. recurrence (gated_delta_net_cuda), cols_per_warp state columns per warp
-    {
-        float *       state_out = args.state_out + (int64_t) slot * args.state_slot_stride + (int64_t) h * S * S;
-        const int     colw      = warp * cols_per_warp;
-
-        float k_reg[rows_per_lane];
-        float q_reg[rows_per_lane];
-#pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            k_reg[r] = k_n[r * warp_size + lane];
-            q_reg[r] = q_n[r * warp_size + lane];
-        }
-
-        if (t == 0) {
-            const float * state_in = args.state_cache + (int64_t) args.state_ids[0] * args.state_row_stride + (int64_t) h * S * S;
-#pragma unroll
-            for (int c = 0; c < cols_per_warp; c++) {
-#pragma unroll
-                for (int r = 0; r < rows_per_lane; r++) {
-                    s_shard[c][r] = state_in[(colw + c) * S + r * warp_size + lane];
+            // q/k channels are shared by H_v/H_k value heads: the first one writes the conv state
+            if (part == 2 || h == hk) {
+                float * conv_out = args.conv_state_out + (int64_t) slot * args.conv_slot_stride;
+    #pragma unroll
+                for (int j = 0; j < D_CONV - 1; j++) {
+                    conv_out[ch * (D_CONV - 1) + j] = x[j + 1];
                 }
             }
         }
+        __syncthreads();
 
-        // same explicit contractions as gated_delta_net_tiled_cuda (bit-identical to gated_delta_net_cuda)
-        float attn_col[cols_per_warp];
-#pragma unroll
-        for (int c = 0; c < cols_per_warp; c++) {
-            float kv_shard = 0.0f;
-#pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                kv_shard = fmaf(s_shard[c][r], k_reg[r], kv_shard);
+        // 2. q/k norm: l2_norm_dual_f32_s128 for q (warp 0) and k (warp 1), or, when the graph uses the
+        //    qwen4exp build_gdn_l2_norm representation RMS_NORM(x, eps) -> SCALE(mul, add), the exact
+        //    replay of the dispatched rms_norm_f32<256, false> + scale_f32 pair
+        if (!args.qk_rms_scale) {
+            if (warp < 2) {
+                const float * x = warp == 0 ? q_c : k_c;
+                float *       y = warp == 0 ? q_n : k_n;
+                float tmp = 0.0f;
+    #pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const float xi = x[r * warp_size + lane];
+                    tmp = fmaf(xi, xi, tmp);
+                }
+                tmp = gdn_warp_reduce_sum<warp_size>(tmp);
+                const float scale = rsqrtf(fmaxf(tmp, args.eps_l2 * args.eps_l2));
+    #pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    y[r * warp_size + lane] = scale * x[r * warp_size + lane];
+                }
             }
-            const float kv_col = gdn_warp_reduce_sum<warp_size>(kv_shard);
-
-            const float delta_col = fmaf(-g_val, kv_col, v_c[colw + c]) * beta_val;
-
-            float attn_partial = 0.0f;
-#pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                s_shard[c][r] = fmaf(g_val, s_shard[c][r], k_reg[r] * delta_col);
-                attn_partial  = fmaf(s_shard[c][r], q_reg[r], attn_partial);
+        } else {
+            // rms_norm_f32<256, false>: 128 elements over 128 lanes (4 warps, one element per lane; warps 4..7
+            // of the standalone 256-thread block hold exact zeros that drop out of the tree), the warp
+            // butterfly (xor 16/8/4/2/1), the cross-warp tree ((v0 + v2) + (v1 + v3)), mean = sum / 128,
+            // scale = rsqrtf(mean + eps), dst = scale * x; then scale_f32: dst = mul * dst + add. The standalone
+            // scale_f32 compiles its mul+add to a single FMA (v_fma_f32 in the RDNA3.5 build), so the same
+            // contraction is spelled explicitly here.
+            const int iqk = warp < 4 ? 0 : 1;
+            if (warp < 8) {
+                const float * x  = iqk == 0 ? q_c : k_c;
+                const float   xi = x[(warp & 3) * warp_size + lane];
+                float part = fmaf(xi, xi, 0.0f);
+                part = warp_reduce_sum<warp_size>(part);
+                if (lane == 0) {
+                    qk_red[warp] = part;
+                }
             }
-            attn_col[c] = gdn_warp_reduce_sum<warp_size>(attn_partial);
+            __syncthreads();
+            const float total = iqk == 0 ? (qk_red[0] + qk_red[2]) + (qk_red[1] + qk_red[3])
+                                         : (qk_red[4] + qk_red[6]) + (qk_red[5] + qk_red[7]);
+            const float scale = rsqrtf(total / (float) args.S + args.qk_rms_eps[iqk]);
+            if (warp < 8) {
+                const float * x = iqk == 0 ? q_c : k_c;
+                float *       y = iqk == 0 ? q_n : k_n;
+                const int     i = (warp & 3) * warp_size + lane;
+                const float rms = scale * x[i];
+                y[i] = fmaf(args.qk_scale_mul[iqk], rms, args.qk_scale_add[iqk]);
+            }
         }
 
-        if (lane < cols_per_warp) {
-            float a = attn_col[0];
-#pragma unroll
-            for (int c = 1; c < cols_per_warp; c++) {
-                a = lane == c ? attn_col[c] : a;
-            }
-            attn[colw + lane] = a * args.scale;
-        }
+        // gate = softplus(alpha + dt_bias) * A, beta = sigmoid(beta): scalar per head, computed by every thread
+        const float alpha_biased = args.alpha[(int64_t) t * args.H_v + h] + args.dt_bias[h];
+        const float softplus     = args.softplus_log1p ? ((alpha_biased > 20.0f) ? alpha_biased : log1pf(expf(alpha_biased)))
+                                                       : gdn_decode_softplus(alpha_biased);
+        const float gate         = softplus * args.ssm_a[h];
+        const float beta_val     = gdn_decode_sigmoid(args.beta[(int64_t) t * args.H_v + h]);
+        const float g_val        = expf(gate);
+        __syncthreads();
 
-#pragma unroll
-        for (int c = 0; c < cols_per_warp; c++) {
-#pragma unroll
+        // 3. recurrence (gated_delta_net_cuda), cols_per_warp state columns per warp
+        {
+            float *       state_out = args.state_out + (int64_t) slot * args.state_slot_stride + (int64_t) h * S * S;
+            const int     colw      = warp * cols_per_warp;
+
+            float k_reg[rows_per_lane];
+            float q_reg[rows_per_lane];
+    #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                state_out[(colw + c) * S + r * warp_size + lane] = s_shard[c][r];
+                k_reg[r] = k_n[r * warp_size + lane];
+                q_reg[r] = q_n[r * warp_size + lane];
+            }
+
+            if (t == 0) {
+                const float * state_in = args.state_cache + (int64_t) args.state_ids[0] * args.state_row_stride + (int64_t) h * S * S;
+    #pragma unroll
+                for (int c = 0; c < cols_per_warp; c++) {
+    #pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        s_shard[c][r] = state_in[(colw + c) * S + r * warp_size + lane];
+                    }
+                }
+            }
+
+            // same explicit contractions as gated_delta_net_tiled_cuda (bit-identical to gated_delta_net_cuda)
+            float attn_col[cols_per_warp];
+    #pragma unroll
+            for (int c = 0; c < cols_per_warp; c++) {
+                float kv_shard = 0.0f;
+    #pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    kv_shard = fmaf(s_shard[c][r], k_reg[r], kv_shard);
+                }
+                const float kv_col = gdn_warp_reduce_sum<warp_size>(kv_shard);
+
+                const float delta_col = fmaf(-g_val, kv_col, v_c[colw + c]) * beta_val;
+
+                float attn_partial = 0.0f;
+    #pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[c][r] = fmaf(g_val, s_shard[c][r], k_reg[r] * delta_col);
+                    attn_partial  = fmaf(s_shard[c][r], q_reg[r], attn_partial);
+                }
+                attn_col[c] = gdn_warp_reduce_sum<warp_size>(attn_partial);
+            }
+
+            if (lane < cols_per_warp) {
+                float a = attn_col[0];
+    #pragma unroll
+                for (int c = 1; c < cols_per_warp; c++) {
+                    a = lane == c ? attn_col[c] : a;
+                }
+                attn[colw + lane] = a * args.scale;
+            }
+
+    #pragma unroll
+            for (int c = 0; c < cols_per_warp; c++) {
+    #pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    state_out[(colw + c) * S + r * warp_size + lane] = s_shard[c][r];
+                }
             }
         }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    // 4. pre-norm attention output to the scratch buffer (the gated rms norm runs as a second kernel: its
-    //    destination may alias inputs of this kernel that other blocks are still reading)
-    if (thread < S) {
-        args.attn_out[((int64_t) t * args.H_v + h) * S + thread] = attn[thread];
-    }
+        // 4. pre-norm attention output to the scratch buffer (the gated rms norm runs as a second kernel: its
+        //    destination may alias inputs of this kernel that other blocks are still reading)
+        if (thread < S) {
+            args.attn_out[((int64_t) t * args.H_v + h) * S + thread] = attn[thread];
+        }
     } // tokens
 }
 
