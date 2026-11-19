@@ -123,6 +123,8 @@ public:
     void qsa_invalidate();
     bool qsa_prefix_matches(const llama_ubatch & ubatch) const;
     bool qsa_fast(int il, const llama_ubatch & ubatch) const;
+    bool qsa_incremental() const { return incremental_qsa; }
+    bool qsa_fast_fits(int il, uint32_t n_tokens) const;
     bool qsa_selected_key_attn() const { return selected_key_attn; }
     // the tracked prefix is position-ordered (no image in it): rank == position
     bool qsa_prefix_identity() const { return qsa_prefix.identity(); }
@@ -231,8 +233,18 @@ public:
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
 
-    bool qsa_prefix_matches(const llama_ubatch & u) const { return mem && mem->qsa_prefix_matches(u); }
-    bool qsa_fast(int il, const llama_ubatch & u) const { return mem && mem->qsa_fast(il, u); }
+    enum class qsa_route { live, prefix, fast };
+    void set_qsa_reserve_route(qsa_route route) { GGML_ASSERT(reserve || route == qsa_route::live); qsa_reserve_route = route; }
+    bool qsa_incremental() const { return mem && mem->qsa_incremental(); }
+
+    bool qsa_prefix_matches(const llama_ubatch & u) const {
+        if (qsa_reserve_route != qsa_route::live) { return qsa_incremental(); }
+        return mem && mem->qsa_prefix_matches(u);
+    }
+    bool qsa_fast(int il, const llama_ubatch & u) const {
+        if (qsa_reserve_route != qsa_route::live) { return qsa_reserve_route == qsa_route::fast && mem->qsa_fast_fits(il, u.n_tokens); }
+        return mem && mem->qsa_fast(il, u);
+    }
     bool qsa_selected_key_attn() const { return mem && mem->qsa_selected_key_attn(); }
     // cells the block metadata must cover: the KV view is sized by occupied cells, but a cache whose positions
     // run ahead of its cells (an MTP draft never receives the image cells an M-RoPE image pins to one position)
@@ -284,6 +296,8 @@ private:
 
     // a full-cache context (init_full) only reserves graphs: its QSA route must not depend on the cells in the cache
     const bool reserve = false;
+
+    qsa_route qsa_reserve_route = qsa_route::live;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact
