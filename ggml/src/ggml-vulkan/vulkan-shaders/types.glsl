@@ -504,10 +504,25 @@ uint tq1_0_trit(uint qbyte, uint t) {
     return ((((qbyte * ((POW3_PACKED >> (7u * (4u - t))) & 0x7Fu)) & 255u) * 3u) >> 8);
 }
 
+#if defined(DATA_A_TQ1_0) || defined(DATA_A_PTQ1_0)
+// 3^t for t in [0,4], the multiplier of tq1_0_trit (the int8 MMQ loaders shift one byte pair by it)
+uint tq1_0_pow3(uint t) {
+    return (((1u << 28) | (3u << 21) | (9u << 14) | (27u << 7) | 81u) >> (7u * (4u - t))) & 0x7Fu;
+}
+#endif
+
 #if defined(DATA_A_TQ1_0)
+// the 54-byte block is only 2-byte aligned: qs and qh as 26 halfwords, then d
+struct block_tq1_0_packed16
+{
+    uint16_t q[26];
+    float16_t d;
+};
+
 #define QUANT_K QUANT_K_TQ1_0
 #define QUANT_R 1
 #define A_TYPE block_tq1_0
+#define A_TYPE_PACKED16 block_tq1_0_packed16
 #define DATA_A_QUANT_K
 #endif
 
