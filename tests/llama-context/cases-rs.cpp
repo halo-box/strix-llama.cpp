@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -329,6 +330,41 @@ struct case_rollback : ctx_test {
             CTX_REQUIRE(diff.nmse() <= nmse_eps,
                     "dirty-ctx logits mismatch at position " + std::to_string(pos) + ", nmse " + std::to_string(diff.nmse()));
         }
+
+#if !defined(_WIN32)
+        // The same checkpoint written to an unlinked file (--ctx-checkpoints-dir) and read back from it.
+        {
+            const size_t n_tgt = ckpt.size_tgt();
+            const std::string dir = std::filesystem::temp_directory_path().string();
+            CTX_REQUIRE(ckpt.spill(dir), "writing the checkpoint to " + dir + " failed");
+            CTX_REQUIRE(ckpt.data_tgt.empty() && ckpt.size_tgt() == n_tgt && ckpt.size_mem() == ckpt.data_spec.size(),
+                    "a written checkpoint still holds its state in memory");
+
+            llama_context_ptr ctx_file = make_rs_ctx();
+            if (!ctx_file) {
+                return case_result::fail();
+            }
+            CTX_REQUIRE(ckpt.load_tgt(ctx_file.get(), 0, 0), "loading the checkpoint from its file failed");
+
+            for (uint32_t i = 0; i < n_rollback; ++i) {
+                const llama_pos pos = rollback_pos + i;
+                if (!decode_one(ctx_file.get(), tokens[pos], pos)) {
+                    TLOG_ERR("%s: file replay failed at position %d\n", __func__, pos);
+                    return case_result::fail();
+                }
+
+                const float * logits_file = llama_get_logits_ith(ctx_file.get(), 0);
+                if (logits_file == nullptr) {
+                    TLOG_ERR("%s: missing file logits at position %d\n", __func__, pos);
+                    return case_result::fail();
+                }
+
+                const logits_diff diff = compare_logits(logits_src_replay[i].data(), logits_file, n_vocab);
+                CTX_REQUIRE(diff.nmse() <= nmse_eps,
+                        "file-ctx logits mismatch at position " + std::to_string(pos) + ", nmse " + std::to_string(diff.nmse()));
+            }
+        }
+#endif
 
         TLOG_INF("%s: recurrent rollback checkpoint restored successfully\n", __func__);
 
