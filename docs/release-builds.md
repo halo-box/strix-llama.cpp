@@ -20,10 +20,10 @@ artifact layout, so tools that consume their releases can consume these ones too
   `BUILD_SHARED_LIBS=ON`.
 - Each zip also holds the ROCm runtime libraries it needs (hipBLAS, rocBLAS, hipBLASLt and their kernel
   libraries). On Linux, RPATH is set to `$ORIGIN`, so the zip runs without a system ROCm install.
-- ROCm is pinned to `10.1.0a20260910`, the last 10.1 nightly on `nightly.repo.amd.com`, because halo-box HIP work
-  is built and tested on 10.1 and there is no stable 10.1 tarball yet. A manual run with `rocm_version=latest` uses
-  the newest nightly instead. If AMD removes the pinned tarball from the index, the ROCm jobs fail until the pin
-  moves.
+- ROCm is pinned to the stable TheRock release `10.2.0` from `stable.repo.amd.com`. A manual run can pass another
+  stable version, a nightly version string such as `10.1.0a20260910` (taken from `nightly.repo.amd.com`), or
+  `rocm_version=latest` for the newest nightly. If AMD removes the pinned tarball from the index, the ROCm jobs fail
+  until the pin moves.
 - Releases are tagged `b1000`, `b1001` and so on, counting up. This numbering does not collide with the `b1xxxx`
   tags carried over from upstream llama.cpp.
 - The release notes record the build number, targets, ROCm version, source commit (5 characters) and build date.
