@@ -91,6 +91,65 @@ static void test_dist_singleton_rng() {
     llama_sampler_free(control);
 }
 
+static void test_dist_keyed() {
+    // values of TensorFold v0.6.0 engine/exact_sampling.py: -log(-log(uniform(seed, position, id)))
+    GGML_ASSERT(llama_sampler_dist_keyed_gumbel(7, 3, 11) == 0.1932354989938676);
+    GGML_ASSERT(llama_sampler_dist_keyed_gumbel(4242, 100000, 151643) == -0.5575777577417728);
+
+    const std::vector<float> probs = { 0.1f, 0.2f, 0.3f, 0.4f };
+    std::vector<float> logits;
+    for (float p : probs) {
+        logits.push_back(logf(p));
+    }
+
+    llama_sampler * smpl = llama_sampler_init_dist_keyed(1234);
+    llama_sampler * copy = nullptr;
+
+    const int n = 200000;
+    std::vector<int> counts(probs.size(), 0);
+    std::vector<llama_token> first;
+    for (int i = 0; i < n; ++i) {
+        const llama_token id = sample_dist(smpl, logits);
+        double best = -INFINITY;
+        llama_token want = -1;
+        for (llama_token t = 0; t < (llama_token) logits.size(); ++t) {
+            const double s = logits[t] + llama_sampler_dist_keyed_gumbel(1234, i, t);
+            if (s > best) {
+                best = s;
+                want = t;
+            }
+        }
+        GGML_ASSERT(id == want);
+        if (i < 64) {
+            first.push_back(id);
+        }
+        counts[id]++;
+        llama_sampler_accept(smpl, id);
+        if (i == 31) {
+            copy = llama_sampler_clone(smpl);
+        }
+    }
+    for (size_t t = 0; t < probs.size(); ++t) {
+        GGML_ASSERT(fabs((double) counts[t] / n - probs[t]) < 0.005);
+    }
+
+    for (int i = 32; i < 64; ++i) {
+        const llama_token id = sample_dist(copy, logits);
+        GGML_ASSERT(id == first[i]);
+        llama_sampler_accept(copy, id);
+    }
+
+    llama_sampler_reset(smpl);
+    for (int i = 0; i < 64; ++i) {
+        const llama_token id = sample_dist(smpl, logits);
+        GGML_ASSERT(id == first[i]);
+        llama_sampler_accept(smpl, id);
+    }
+
+    llama_sampler_free(copy);
+    llama_sampler_free(smpl);
+}
+
 static void test_temp(const std::vector<float> & probs, const std::vector<float> & probs_expected, float temp) {
     sampler_tester tester(probs, probs_expected);
 
@@ -339,6 +398,7 @@ int main(void) {
     ggml_time_init();
 
     test_dist_singleton_rng();
+    test_dist_keyed();
 
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);

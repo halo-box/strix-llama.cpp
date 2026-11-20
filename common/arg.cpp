@@ -4464,17 +4464,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
     add_opt(common_arg(
-        {"--spec-draft-sampling"}, "{greedy,probabilistic}",
+        {"--spec-draft-sampling"}, "{greedy,probabilistic,keyed}",
         string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "
-                      "the target verify by rejection sampling (default: %s)",
-                      params.speculative.draft.probabilistic ? "probabilistic" : "greedy"),
+                      "the target verify by rejection sampling, keyed has the target draw by Gumbel-max with noise keyed "
+                      "by seed, position and token, and the DFlash2 draft adds the same noise (default: %s)",
+                      params.speculative.draft.probabilistic ? "probabilistic" : params.sampling.dist_keyed ? "keyed" : "greedy"),
         [](common_params & params, const std::string & value) {
             if (value == "greedy") {
                 params.speculative.draft.probabilistic = false;
+                params.sampling.dist_keyed = false;
             } else if (value == "probabilistic") {
                 params.speculative.draft.probabilistic = true;
+                params.sampling.dist_keyed = false;
+            } else if (value == "keyed") {
+                params.speculative.draft.probabilistic = false;
+                params.sampling.dist_keyed = true;
             } else {
-                throw std::invalid_argument("invalid value, must be one of: greedy, probabilistic");
+                throw std::invalid_argument("invalid value, must be one of: greedy, probabilistic, keyed");
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
