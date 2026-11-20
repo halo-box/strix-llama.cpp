@@ -3457,6 +3457,9 @@ void llama_context::reserve_qsa_routes(llama_memory_context_i * mctx, uint32_t n
         return;
     }
     using route = llama_memory_hybrid_idx_context::qsa_route;
+    // one sequence per KV stream, as reserve_token_ranges probes: with a non-unified cache the graph splits the tokens across
+    // n_seq_max streams, so the reservation needs a multiple of that (graph_reserve rounds n_tokens up)
+    const uint32_t n_seqs = cparams.kv_unified ? 1 : cparams.n_seq_max;
     for (const route r : { route::prefix, route::fast }) {
         const uint32_t n_max = r == route::fast ? std::min<uint32_t>(n_tokens_max, 512) : n_tokens_max;
         std::vector<uint32_t> sizes = { 1, n_max };
@@ -3468,7 +3471,7 @@ void llama_context::reserve_qsa_routes(llama_memory_context_i * mctx, uint32_t n
         qsa->set_qsa_reserve_route(r);
         for (const uint32_t n : sizes) {
             for (const uint32_t n_outputs : { 0u, std::min(n, cparams.n_outputs_max) }) {
-                if (!graph_reserve(n, 1, n_outputs, mctx)) {
+                if (!graph_reserve(n, n_seqs, n_outputs, mctx)) {
                     qsa->set_qsa_reserve_route(route::live);
                     throw std::runtime_error("failed to allocate compute buffers for the incremental QSA graph");
                 }
