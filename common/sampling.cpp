@@ -433,7 +433,8 @@ struct common_sampler * common_sampler_init(
             const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
                 ((params.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && params.temp == 0.0f && params.dynatemp_range == 0.0f) ||
                  (params.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && params.top_k == 1));
-            samplers.push_back(greedy ? llama_sampler_init_greedy() : llama_sampler_init_dist(params.seed));
+            samplers.push_back(greedy ? llama_sampler_init_greedy() :
+                    params.dist_keyed ? llama_sampler_init_dist_keyed(params.seed) : llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));

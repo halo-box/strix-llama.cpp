@@ -260,6 +260,7 @@ struct common_params_sampling {
     bool    ignore_eos         = false;
     bool    no_perf            = false;  // disable performance metrics
     bool    timing_per_token   = false;
+    bool    dist_keyed         = false;  // draw with dist-keyed instead of dist, so a drafter can predict the draw
 
     uint64_t user_sampling_config = 0; // bitfield to track user-specified samplers
 

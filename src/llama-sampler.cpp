@@ -1421,6 +1421,122 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
     );
 }
 
+// dist-keyed: the keyed Gumbel draw of TensorFold v0.6.0 (ashhart/TensorFold, Apache-2.0, engine/exact_sampling.py)
+
+static uint64_t llama_sampler_keyed_mix(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+double llama_sampler_dist_keyed_gumbel(uint32_t seed, int64_t pos, llama_token id) {
+    uint64_t x = llama_sampler_keyed_mix((uint64_t) seed + 0x9E3779B97F4A7C15ull);
+    x = llama_sampler_keyed_mix(x ^ ((uint64_t) pos * 0xD1B54A32D192ED03ull));
+    x = llama_sampler_keyed_mix(x ^ (uint64_t) (uint32_t) id);
+    const double u = (double) (x >> 11) * 0x1.0p-53 + 0x1.0p-54;
+    return -std::log(-std::log(u));
+}
+
+struct llama_sampler_dist_keyed {
+    const uint32_t seed;
+          uint32_t seed_cur;
+          int64_t  pos;
+};
+
+static const char * llama_sampler_dist_keyed_name(const struct llama_sampler * /*smpl*/) {
+    return "dist-keyed";
+}
+
+static void llama_sampler_dist_keyed_accept(struct llama_sampler * smpl, llama_token /*token*/) {
+    ((llama_sampler_dist_keyed *) smpl->ctx)->pos++;
+}
+
+static void llama_sampler_dist_keyed_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    const auto * ctx = (const llama_sampler_dist_keyed *) smpl->ctx;
+
+    if (cur_p->size == 0) {
+        cur_p->selected = -1;
+        return;
+    }
+
+    float max_l = cur_p->data[0].logit;
+    for (size_t i = 1; i < cur_p->size; ++i) {
+        max_l = std::max(max_l, cur_p->data[i].logit);
+    }
+
+    double sum = 0.0;
+    double best = -INFINITY;
+    size_t selected = 0;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const auto & td = cur_p->data[i];
+        const double score = (double) td.logit + llama_sampler_dist_keyed_gumbel(ctx->seed_cur, ctx->pos, td.id);
+        if (score > best || (score == best && td.id < cur_p->data[selected].id)) {
+            best = score;
+            selected = i;
+        }
+        cur_p->data[i].p = expf(td.logit - max_l);
+        sum += cur_p->data[i].p;
+    }
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cur_p->data[i].p /= sum;
+    }
+    cur_p->selected = selected;
+}
+
+static void llama_sampler_dist_keyed_reset(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_dist_keyed *) smpl->ctx;
+    ctx->seed_cur = get_rng_seed(ctx->seed);
+    ctx->pos = 0;
+}
+
+static struct llama_sampler * llama_sampler_dist_keyed_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_dist_keyed *) smpl->ctx;
+    auto * result = llama_sampler_init_dist_keyed(ctx->seed);
+    auto * result_ctx = (llama_sampler_dist_keyed *) result->ctx;
+    result_ctx->seed_cur = ctx->seed_cur;
+    result_ctx->pos      = ctx->pos;
+    return result;
+}
+
+static void llama_sampler_dist_keyed_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_dist_keyed *) smpl->ctx;
+}
+
+static void llama_sampler_dist_keyed_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
+    const auto * src_ctx = (const llama_sampler_dist_keyed *) src->ctx;
+    auto       * dst_ctx = (llama_sampler_dist_keyed *) dst->ctx;
+    dst_ctx->seed_cur = src_ctx->seed_cur;
+    dst_ctx->pos      = src_ctx->pos;
+}
+
+static struct llama_sampler_i llama_sampler_dist_keyed_i = {
+    /* .name              = */ llama_sampler_dist_keyed_name,
+    /* .accept            = */ llama_sampler_dist_keyed_accept,
+    /* .apply             = */ llama_sampler_dist_keyed_apply,
+    /* .reset             = */ llama_sampler_dist_keyed_reset,
+    /* .clone             = */ llama_sampler_dist_keyed_clone,
+    /* .free              = */ llama_sampler_dist_keyed_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ llama_sampler_dist_keyed_copy_state,
+};
+
+struct llama_sampler * llama_sampler_init_dist_keyed(uint32_t seed) {
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_dist_keyed_i,
+        /* .ctx   = */ new llama_sampler_dist_keyed {
+            /* .seed     = */ seed,
+            /* .seed_cur = */ get_rng_seed(seed),
+            /* .pos      = */ 0,
+        }
+    );
+}
+
 void llama_sampler_backend_begin(llama_sampler * sampler) {
     GGML_ASSERT(sampler != nullptr);
 

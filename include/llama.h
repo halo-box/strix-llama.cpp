@@ -1540,6 +1540,14 @@ extern "C" {
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
 
+    /// @details Same distribution as dist, drawn by Gumbel-max with noise keyed by (seed, position, token id).
+    /// The position is the count of tokens accepted since reset. A drafter that knows the seed can add the same noise.
+    /// seed == LLAMA_DEFAULT_SEED to use a random seed.
+    LLAMA_API struct llama_sampler * llama_sampler_init_dist_keyed(uint32_t seed);
+
+    /// The Gumbel noise that dist_keyed adds to token id at position pos.
+    LLAMA_API double llama_sampler_dist_keyed_gumbel(uint32_t seed, int64_t pos, llama_token id);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);

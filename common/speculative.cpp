@@ -1746,8 +1746,22 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
                 const int32_t top_k = selector_top_k;
                 const float * scores = row + top_k + (size_t) predecessor * top_k;
 
-                predecessor = (int32_t) std::distance(scores,
-                        std::max_element(scores, scores + top_k));
+                if (dp.keyed && !sample) {
+                    // the target's keyed noise is known ahead, so the walk follows its draw: TensorFold v0.6.0
+                    // (ashhart/TensorFold, Apache-2.0) draft_tree.py weighs it 0.7 into the draft scores
+                    double best = -INFINITY;
+                    for (int32_t k = 0; k < top_k; ++k) {
+                        const double s = scores[k] / dp.temp +
+                            0.7 * llama_sampler_dist_keyed_gumbel(dp.seed, dp.pos0 + i, (llama_token) row[k]);
+                        if (s > best) {
+                            best = s;
+                            predecessor = k;
+                        }
+                    }
+                } else {
+                    predecessor = (int32_t) std::distance(scores,
+                            std::max_element(scores, scores + top_k));
+                }
                 if (params.p_min > 0.0f || sample) {
                     // softmax(scores / temp) at the argmax, i.e. 1 / sum(exp((s_k - s_max) / temp))
                     probs.resize(top_k);

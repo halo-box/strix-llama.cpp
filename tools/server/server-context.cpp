@@ -2282,6 +2282,10 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
+            // the drafter adds the keyed noise of the seed the target draws with, so pick a random seed here
+            if (task.params.sampling.dist_keyed && task.params.sampling.seed == LLAMA_DEFAULT_SEED) {
+                task.params.sampling.seed = std::random_device{}();
+            }
             try {
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {
@@ -4157,6 +4161,7 @@ private:
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .keyed    = */ slot.task->params.sampling.dist_keyed && slot.task->params.sampling.temp > 0.0f,
                         };
 
                         drafting.push_back(&slot);
