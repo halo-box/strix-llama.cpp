@@ -3284,6 +3284,8 @@ uint32_t llama_context::graph_max_nodes() const {
     if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
         model.arch == LLM_ARCH_HRM_TEXT) {
         res = std::max<uint32_t>(1024u, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_QWEN4EXP) {
+        res = std::max<uint32_t>(cparams.n_ubatch * 40u, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_METIS16 ||
@@ -3293,7 +3295,6 @@ uint32_t llama_context::graph_max_nodes() const {
         model.arch == LLM_ARCH_ZONOS3 ||
         model.arch == LLM_ARCH_CLEF ||
         model.arch == LLM_ARCH_CLOVER_MOE ||
-        model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_DEEPSEEK41 ||
         model.arch == LLM_ARCH_XING4_0 ||

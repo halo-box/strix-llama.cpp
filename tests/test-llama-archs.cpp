@@ -179,6 +179,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --mtp-cache-only        Test Qwen4Exp MTP cache growth on CPU and on the first ROCm and Vulkan devices\n");
+    LOG("  --qwen4exp-long-ctx     Test that Qwen4Exp main and MTP contexts reserve at a long context and a large ubatch\n");
     LOG("  --qwen4exp-merged       Test that a Qwen4Exp file with merged shared-input weights gives the logits of the separate weights\n");
     LOG("  --qwen35-merged         The same for a Qwen3.5 file\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
@@ -849,8 +850,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
-// dev == nullptr: CPU
-static void test_mtp_cache_only_dev(ggml_backend_dev_t dev, const size_t seed, const float stdev) {
+static gguf_context_ptr get_qwen4exp_mtp_meta(const uint32_t n_idx_head) {
     gguf_context_ptr meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
     const uint32_t sections[] = { 8, 8, 0, 0 };
     gguf_set_val_u32(meta.get(), "qwen4exp.nextn_predict_layers", 1);
@@ -862,10 +862,16 @@ static void test_mtp_cache_only_dev(ggml_backend_dev_t dev, const size_t seed, c
     gguf_set_val_u32(meta.get(), "qwen4exp.attention.value_length", 32);
     gguf_set_val_u32(meta.get(), "qwen4exp.rope.dimension_count", 32);
     gguf_set_arr_data(meta.get(), "qwen4exp.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
-    gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.head_count", 1);
+    gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.head_count", n_idx_head);
     gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.key_length", 32);
     gguf_set_val_u32(meta.get(), "qwen4exp.attention.indexer.top_k", 8);
     gguf_set_arr_data(meta.get(), "qwen4exp.ple.layers", GGUF_TYPE_UINT32, nullptr, 0);
+    return meta;
+}
+
+// dev == nullptr: CPU
+static void test_mtp_cache_only_dev(ggml_backend_dev_t dev, const size_t seed, const float stdev) {
+    gguf_context_ptr meta = get_qwen4exp_mtp_meta(1);
 
     ggml_backend_dev_t devices[] = { dev, nullptr };
     llama_model_params mp = llama_model_default_params();
@@ -963,6 +969,38 @@ static int test_mtp_cache_only(const size_t seed, const float stdev) {
             }
         }
     }
+    return 0;
+}
+
+// the QSA scorer splits a long-context ubatch into query strips, so the graph grows with n_ubatch and n_ctx
+static int test_qwen4exp_long_ctx(const size_t seed, const float stdev) {
+    gguf_context_ptr meta = get_qwen4exp_mtp_meta(32);
+    ggml_backend_dev_t devices[] = { nullptr };
+    llama_model_params mp = llama_model_default_params();
+    mp.devices = devices;
+    mp.n_gpu_layers = 0;
+    mp.use_extra_bufts = false;
+    mp.load_mtp = true;
+    mp.progress_callback = silent_model_load_progress;
+    tensor_data_params data = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, &data, mp));
+    GGML_ASSERT(model);
+
+    for (const llama_context_type type : { LLAMA_CONTEXT_TYPE_DEFAULT, LLAMA_CONTEXT_TYPE_MTP }) {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 563200;
+        cp.n_batch = cp.n_ubatch = 4096;
+        cp.n_seq_max = 1;
+        cp.n_threads = cp.n_threads_batch = 4;
+        cp.ctx_type = type;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+        cp.rope_freq_scale = 1.0f/2.2f;
+        cp.yarn_orig_ctx = 262144;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
+        GGML_ASSERT(ctx);
+    }
+    LOG("PASS: Qwen4Exp main and MTP contexts reserve at n_ctx 563200, n_ubatch 4096\n");
     return 0;
 }
 
@@ -2101,6 +2139,7 @@ int main(int argc, char ** argv) {
     const char * target_backend = nullptr;
     bool mtp_cache_only = false;
     bool qwen4exp_merged = false;
+    bool qwen4exp_long_ctx = false;
     bool qwen35_merged = false;
     bool kv_shift = false;
 
@@ -2131,6 +2170,8 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[i], "--mtp-cache-only") == 0) {
             mtp_cache_only = true;
+        } else if (strcmp(argv[i], "--qwen4exp-long-ctx") == 0) {
+            qwen4exp_long_ctx = true;
         } else if (strcmp(argv[i], "--qwen4exp-merged") == 0) {
             qwen4exp_merged = true;
         } else if (strcmp(argv[i], "--qwen35-merged") == 0) {
@@ -2195,6 +2236,9 @@ int main(int argc, char ** argv) {
     try {
         if (mtp_cache_only) {
             return test_mtp_cache_only(seed, stdev);
+        }
+        if (qwen4exp_long_ctx) {
+            return test_qwen4exp_long_ctx(seed, stdev);
         }
         if (qwen4exp_merged) {
             return test_merged_weights(LLM_ARCH_QWEN4EXP, "qwen4exp", seed, stdev);
