@@ -1,6 +1,7 @@
 #include "common.h"
 #include "http.h"
 #include "server-http.h"
+#include "../../hooks/server/include/server-hooks.h" // HOOK(server-http-include)
 #include "server-common.h"
 #include "ui.h"
 
@@ -331,6 +332,7 @@ bool server_http_context::init_listener(const common_params & params) {
         for (const llama_ui_asset & a : llama_ui_get_assets()) {
             paths.insert("/" + a.name);
         }
+        server_hooks_public_paths(paths); // HOOK(server-public-paths)
         return paths;
     }();
 

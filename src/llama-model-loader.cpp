@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "../hooks/llama/include/llama-hook-points.h" // HOOK(loader-include)
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1524,7 +1525,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    llama_hook_mmap_ranges(*this, idx, lazy.for_file(idx))); // HOOK(mmap-ranges)
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

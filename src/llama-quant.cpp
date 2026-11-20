@@ -1,4 +1,5 @@
 #include "llama-impl.h"
+#include "../hooks/llama/include/llama-hook-points.h" // HOOK(quant-include)
 #include "llama-model.h"
 #include "llama-model-loader.h"
 #include "llama-ext.h"
@@ -846,6 +847,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         new_type = tensor_type_fallback(qs, tensor, new_type);
     }
 
+    new_type = llama_hook_quant_type(params, tensor, new_type); // HOOK(quant-type)
     return new_type;
 }
 

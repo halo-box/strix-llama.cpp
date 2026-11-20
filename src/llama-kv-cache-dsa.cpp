@@ -1,4 +1,5 @@
 #include "llama-kv-cache-dsa.h"
+#include "../hooks/llama/include/llama-hook-points.h" // HOOK(kv-dsa-include)
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -50,6 +51,7 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
 
     LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+    type_k = llama_hook_kv_type(model, "dsa-lid", type_k); // HOOK(kv-type-dsa)
     kv_lid = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams_lid, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max,

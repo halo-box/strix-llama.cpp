@@ -12,6 +12,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
+#include "../hooks/common/include/common-hooks.h" // HOOK(common-include)
 
 #include <algorithm>
 #include <cinttypes>
@@ -4832,6 +4833,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    common_hooks_args(ctx_arg, add_opt); // HOOK(common-args)
     return ctx_arg;
 }
 

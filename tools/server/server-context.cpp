@@ -12,6 +12,7 @@
 #include "server-schema.h"
 #include "server-slot-sched.h"
 #include "server-stream.h"
+#include "../../hooks/server/include/server-hooks.h" // HOOK(server-include)
 
 #include "build-info.h"
 #include "common.h"
@@ -680,6 +681,7 @@ struct server_slot {
 
             callback_on_reset(*this);
 
+            server_hooks_on_slot_release(id); // HOOK(server-slot-release)
             reset();
 
             callback_on_release(id);
@@ -2026,6 +2028,7 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        server_hooks_on_task_launch(slot.id, slot.ctx_tgt, task); // HOOK(server-task-launch)
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
@@ -2061,6 +2064,7 @@ private:
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
+        server_hooks_on_slot_start(slot.id, slot.task->id, slot.ctx_tgt, slot.task->params.hooks_data); // HOOK(server-slot-start)
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
     }
@@ -2076,6 +2080,7 @@ private:
         }
         slot.has_next_token = true;
 
+        if (!server_hooks_on_token(slot.id, result.tok, token_str)) slot.has_next_token = false; // HOOK(server-token)
         // check if there is incomplete UTF-8 character at the end
         bool incomplete = validate_utf8(slot.generated.text) < slot.generated.text.size();
 
@@ -3481,6 +3486,7 @@ private:
     }
 
     void update_slots() {
+        server_hooks_on_update([this] { common_json s = common_json::array(); for (const auto & slot : slots) { s.push_back(slot.to_json(true)); } return s; }); // HOOK(server-update)
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4989,6 +4995,7 @@ private:
             res = std::min(res, params_base.kv_unified_per_slot);
         }
 
+        if (const int n = server_hooks_n_ctx_max(model_tgt, params_base); n > 0) return std::min(res, n); // HOOK(server-n-ctx-max)
         return std::min(res, llama_model_n_ctx_train(model_tgt));
     }
 

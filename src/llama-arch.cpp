@@ -2,6 +2,7 @@
 
 #include "llama-ext.h"
 #include "llama-impl.h"
+#include "../hooks/llama/include/llama-hook-points.h" // HOOK(arch-include)
 
 #include <map>
 #include <vector>
@@ -1335,6 +1336,7 @@ LLM_TN_IMPL::LLM_TN_IMPL(llm_arch arch, llm_tensor tensor, const char * suffix, 
 
 std::string LLM_TN_IMPL::str() const {
     if (LLM_TENSOR_NAMES.find(tensor) == LLM_TENSOR_NAMES.end()) {
+        if (std::string name; llama_hook_tensor_str(*this, name)) return name; // HOOK(tensor-name)
         GGML_ABORT("unknown tensor name for tensor id %d", static_cast<int>(tensor));
     }
 
@@ -1375,6 +1377,7 @@ llm_arch llm_arch_from_string(const std::string & name) {
 }
 
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor) {
+    if (const llm_tensor_info * info = llama_hook_tensor_info(tensor)) return *info; // HOOK(tensor-info)
     return LLM_TENSOR_INFOS.at(tensor);
 }
 

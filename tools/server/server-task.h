@@ -96,6 +96,7 @@ struct task_params {
 
     std::map<int, float> lora; // mapping adapter ID -> scale
 
+    common_json hooks_data; // HOOK(server-task-params): request data kept by the server hooks
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
 

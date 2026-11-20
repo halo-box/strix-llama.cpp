@@ -2075,6 +2075,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
         for (int i = 0; i < sched->n_backends; i++) {
+            if (GGML_HOOK_SKIP_REALLOC_SYNC(sched->backends[i])) continue; // HOOK(sched-realloc-sync)
             ggml_backend_synchronize(sched->backends[i]);
         }
 

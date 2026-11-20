@@ -13,6 +13,7 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#include "../hooks/llama/include/llama-hook-points.h" // HOOK(context-include)
 
 #include <algorithm>
 #include <cinttypes>
@@ -735,6 +736,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
         cparams.auto_ftkm = false;
     }
+    llama_hook_resolve_fused_ops(*this, mctx, n_seqs); // HOOK(fused-ops)
 }
 
 static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
@@ -835,6 +837,7 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
     resolve_fused_ops(mctx.get(), n_seqs);
+    llama_hook_sched_reserve(*this, mctx.get(), n_seqs, n_tokens); // HOOK(sched-reserve)
 
     // reserve worst-case graph
     int n_splits_pp        = -1;
@@ -1878,6 +1881,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    llama_hook_ubatch_done(*this, ubatch, status); // HOOK(ubatch-done)
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2945,6 +2949,7 @@ uint32_t llama_context::graph_max_nodes() const {
         res *= 4;
     }
 
+    res += llama_hook_graph_extra_nodes(*this); // HOOK(graph-max-nodes)
     return res;
 }
 

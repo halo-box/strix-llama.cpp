@@ -1,4 +1,5 @@
 #include "llama-kv-cache-dsv4.h"
+#include "../hooks/llama/include/llama-hook-points.h" // HOOK(kv-dsv4-include)
 
 #include "ggml-backend.h"
 #include "llama-impl.h"
@@ -1388,6 +1389,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, ratio_csa));
 
+    type_k = llama_hook_kv_type(model, "dsv4-lid", type_k); // HOOK(kv-type-dsv4)
     kv_lid = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams_lid, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_csa), 256u), n_seq_max,

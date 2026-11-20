@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "../hooks/llama/include/llama-hook-points.h" // HOOK(kv-include)
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -425,6 +426,7 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
 }
 
 void llama_kv_cache::clear(bool data) {
+    { llama_hook_kv_ev ev{ LLAMA_HOOK_KV_CLEAR }; ev.data = data; llama_hook_kv_event(this, ev); } // HOOK(kv-clear)
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -438,6 +440,7 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    { llama_hook_kv_ev ev{ LLAMA_HOOK_KV_SEQ_RM }; ev.seq_id = seq_id; ev.p0 = p0; ev.p1 = p1; llama_hook_kv_event(this, ev); } // HOOK(kv-seq-rm)
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -495,6 +498,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    { llama_hook_kv_ev ev{ LLAMA_HOOK_KV_SEQ_CP }; ev.seq_id = seq_id_src; ev.seq_id_dst = seq_id_dst; ev.p0 = p0; ev.p1 = p1; llama_hook_kv_event(this, ev); } // HOOK(kv-seq-cp)
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -587,6 +591,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    { llama_hook_kv_ev ev{ LLAMA_HOOK_KV_SEQ_KEEP }; ev.seq_id = seq_id; llama_hook_kv_event(this, ev); } // HOOK(kv-seq-keep)
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -614,6 +619,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    { llama_hook_kv_ev ev{ LLAMA_HOOK_KV_SEQ_ADD }; ev.seq_id = seq_id; ev.p0 = p0; ev.p1 = p1; ev.shift = shift; llama_hook_kv_event(this, ev); } // HOOK(kv-seq-add)
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -664,6 +670,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    { llama_hook_kv_ev ev{ LLAMA_HOOK_KV_SEQ_DIV }; ev.seq_id = seq_id; ev.p0 = p0; ev.p1 = p1; ev.d = d; llama_hook_kv_event(this, ev); } // HOOK(kv-seq-div)
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -863,6 +870,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
     if (!sc_info.empty()) {
         assert(n_stream > 1 && "stream copy should never happen with a single stream");
+        { llama_hook_kv_ev ev{ LLAMA_HOOK_KV_STREAM_COPY }; ev.sc_info = &sc_info; llama_hook_kv_event(this, ev); } // HOOK(kv-stream-copy)
 
         llama_synchronize(lctx);
 
@@ -1223,6 +1231,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+    { llama_hook_kv_ev ev{ LLAMA_HOOK_KV_APPLY_UBATCH }; ev.sinfo = &sinfo; ev.ubatch = &ubatch; llama_hook_kv_event(this, ev); } // HOOK(kv-apply-ubatch)
 }
 
 bool llama_kv_cache::get_can_shift() const {

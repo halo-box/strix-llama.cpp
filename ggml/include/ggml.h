@@ -217,6 +217,7 @@ extern "C" {
     // NOTE: always add types at the end of the enum to keep backward compatibility
     enum ggml_type {
         GGML_TYPE_F32     = 0,
+        GGML_TYPE_HOOKS_RANGE_ = 255, // HOOK(type-range): ids >= 100 are hook types
         GGML_TYPE_F16     = 1,
         GGML_TYPE_Q4_0    = 2,
         GGML_TYPE_Q4_1    = 3,
@@ -2811,4 +2812,11 @@ extern "C" {
 
 #ifdef  __cplusplus
 }
+#endif
+
+// HOOK(types): ggml types of the hooks
+#if defined(__has_include)
+#if __has_include("../../hooks/ggml/include/ggml-hook-points.h")
+#include "../../hooks/ggml/include/ggml-hook-points.h"
+#endif
 #endif

@@ -2,6 +2,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "../../hooks/common/include/common-hooks.h" // HOOK(quantize-include)
 #include "imatrix-loader.h"
 
 #include "gguf.h"
@@ -31,7 +32,7 @@ struct quant_option {
     std::string desc;
 };
 
-static const std::vector<quant_option> QUANT_OPTIONS = {
+static std::vector<quant_option> QUANT_OPTIONS = { // HOOK(quantize-options): not const, the hooks add types
     { "Q1_0",     LLAMA_FTYPE_MOSTLY_Q1_0,     " 1.125 bpw quantization",           },
     { "Q2_0",     LLAMA_FTYPE_MOSTLY_Q2_0,     " 2.25 bpw quantization (group 64)",  },
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
@@ -393,6 +394,7 @@ static bool parse_layer_prune(const char * data, std::vector<int> & prune_layers
 int llama_quantize(int argc, char ** argv);
 
 int llama_quantize(int argc, char ** argv) {
+    common_hooks_quant_ftypes([](const char * name, llama_ftype ftype, const char * desc) { QUANT_OPTIONS.push_back({ name, ftype, desc }); }); // HOOK(quantize-ftypes)
     std::setlocale(LC_NUMERIC, "C");
     if (argc < 3) {
         usage(argv[0]);

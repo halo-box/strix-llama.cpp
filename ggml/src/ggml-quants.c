@@ -5656,6 +5656,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             break;
         default:
             {
+                { bool ok = false; if (GGML_HOOK_TYPE_VALIDATE(type, data, nbytes, &ok)) return ok; } // HOOK(type-validate)
                 fprintf(stderr, "%s: invalid type %d\n", __func__, type);
                 return false;
             }

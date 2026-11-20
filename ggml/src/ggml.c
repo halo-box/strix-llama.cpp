@@ -637,6 +637,7 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 }
 
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+    GGML_HOOK_TYPE_TRAITS // HOOK(type-traits)
     [GGML_TYPE_I8] = {
         .type_name                = "i8",
         .blck_size                = 1,
@@ -8071,6 +8072,7 @@ size_t ggml_quantize_chunk(
                 memcpy((uint8_t *)dst + start * elemsize, src + start, result);
             } break;
         default:
+            if (GGML_HOOK_TYPE_QUANTIZE(type, src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, &result)) break; // HOOK(type-quantize)
             assert(false);
     }
 

@@ -1,6 +1,7 @@
 #include "server-common.h"
 #include "http.h"
 #include "server-models.h"
+#include "../../hooks/server/include/server-hooks.h" // HOOK(server-models-include)
 #include "server-context.h"
 #include "server-stream.h"
 
@@ -880,6 +881,7 @@ void server_models::load_models() {
     auto apply_hidden = [&]() {
         for (auto & [name, inst] : mapping) {
             inst.meta.hidden = hidden_models.count(name) > 0;
+            if (server_hooks_model_hidden(inst.meta.preset)) inst.meta.hidden = true; // HOOK(server-model-hidden)
         }
     };
     // update_args() injects HOST/PORT/ALIAS/LOG_COLORS, so strip them before comparing presets
