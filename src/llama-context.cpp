@@ -3281,9 +3281,15 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes() const {
     uint32_t res;
-    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT ||
-        model.arch == LLM_ARCH_HRM_TEXT) {
-        res = std::max<uint32_t>(1024u, 64u * model.n_tensors());
+    // the fork's per-token graph work (qwen4exp indexer score strips, which also multiply with the context length,
+    // the Kimi / HRM stacks) still grows with the ubatch, so size it from the context's n_ubatch, not from n_tokens
+    const uint32_t n_ubatch = cparams.n_ubatch;
+    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_KIMI_K31 || model.arch == LLM_ARCH_GLM5_NEXT) {
+        // the n_ubatch*40 budget below is exhausted at ubatch 3840
+        res = std::max<uint32_t>(n_ubatch * 160, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_HRM_TEXT) {
+        // the 128-slot looped graph needs roughly one stack per token budget
+        res = std::max<uint32_t>(n_ubatch * 80, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_METIS16 ||
@@ -3303,7 +3309,7 @@ uint32_t llama_context::graph_max_nodes() const {
         model.arch == LLM_ARCH_MINIMAX_M3 ||
         model.arch == LLM_ARCH_HY_V4 ||
         model.arch == LLM_ARCH_INKLING2) {
-        res = std::max<uint32_t>(1024u, 32u * model.n_tensors());
+        res = std::max<uint32_t>(std::max<uint32_t>(1024u, n_ubatch * 40), 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
         // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft.
