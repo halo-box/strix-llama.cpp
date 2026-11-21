@@ -67,7 +67,8 @@ struct server_prompt_cache_state {
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt->size();
+            // --cache-ram counts memory: a checkpoint written to --ctx-checkpoints-dir holds its state in a file
+            res += ckpt->size_mem();
         }
 
         return res;

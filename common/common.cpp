@@ -55,6 +55,9 @@
 #else
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <cerrno>
+#include <cstdlib>
+#include <fcntl.h>
 #endif
 
 #if !defined(_WIN32)
@@ -2421,12 +2424,62 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+common_prompt_checkpoint_file::~common_prompt_checkpoint_file() {
+#if !defined(_WIN32)
+    if (fd >= 0) {
+        close(fd);
+    }
+#endif
+}
+
+#if !defined(_WIN32)
+static bool ckpt_file_write(int fd, const uint8_t * src, size_t size, off_t offset) {
+    while (size > 0) {
+        const ssize_t n = pwrite(fd, src, size, offset);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        src += n; size -= n; offset += n;
+    }
+    return true;
+}
+
+static bool ckpt_file_read(int fd, uint8_t * dst, size_t size, off_t offset) {
+    while (size > 0) {
+        const ssize_t n = pread(fd, dst, size, offset);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        dst += n; size -= n; offset += n;
+    }
+    return true;
+}
+#endif
+
+size_t common_prompt_checkpoint::size_tgt() const {
+    return file ? file_size_tgt : data_tgt.size();
+}
+
+size_t common_prompt_checkpoint::size_dft() const {
+    return file ? file_size_dft : data_dft.size();
+}
+
 size_t common_prompt_checkpoint::size() const {
+    return size_tgt() + size_dft() + data_spec.size();
+}
+
+size_t common_prompt_checkpoint::size_mem() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
 
 bool common_prompt_checkpoint::empty() const {
-    return data_tgt.empty();
+    return size_tgt() == 0;
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2438,6 +2491,73 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+
+    file.reset();
+    file_size_tgt = file_size_dft = 0;
+}
+
+bool common_prompt_checkpoint::spill(const std::string & dir) {
+#if defined(_WIN32)
+    GGML_UNUSED(dir);
+    return false;
+#else
+    if (file || (data_tgt.empty() && data_dft.empty())) {
+        return true;
+    }
+
+    std::string path = dir + "/llama-ckpt-XXXXXX";
+    // O_CLOEXEC at creation: a child process spawned by another thread must never inherit the descriptor
+    const int fd = mkostemp(path.data(), O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    // the descriptor keeps the file; nothing is left behind when it is closed, even after a crash
+    if (unlink(path.c_str()) != 0) {
+        close(fd);
+        return false;
+    }
+
+    auto f = std::make_shared<common_prompt_checkpoint_file>();
+    f->fd = fd;
+    if (!ckpt_file_write(fd, data_tgt.data(), data_tgt.size(), 0) ||
+        !ckpt_file_write(fd, data_dft.data(), data_dft.size(), data_tgt.size())) {
+        return false;
+    }
+
+    file          = std::move(f);
+    file_size_tgt = data_tgt.size();
+    file_size_dft = data_dft.size();
+
+    // give the memory back
+    common_state_data().swap(data_tgt);
+    common_state_data().swap(data_dft);
+
+    return true;
+#endif
+}
+
+bool common_prompt_checkpoint::copy_tgt(uint8_t * dst) const {
+#if !defined(_WIN32)
+    if (file) {
+        return ckpt_file_read(file->fd, dst, file_size_tgt, 0);
+    }
+#endif
+    if (!data_tgt.empty()) {
+        memcpy(dst, data_tgt.data(), data_tgt.size());
+    }
+    return true;
+}
+
+bool common_prompt_checkpoint::copy_dft(uint8_t * dst) const {
+#if !defined(_WIN32)
+    if (file) {
+        return ckpt_file_read(file->fd, dst, file_size_dft, file_size_tgt); // the draft state follows the target's
+    }
+#endif
+    if (!data_dft.empty()) {
+        memcpy(dst, data_dft.data(), data_dft.size());
+    }
+    return true;
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2459,6 +2579,7 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
+    GGML_ASSERT(!file && "update of a spilled context checkpoint");
     data_tgt.resize(ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
@@ -2477,6 +2598,7 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
+    GGML_ASSERT(!file && "update of a spilled context checkpoint");
     data_dft.resize(ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
@@ -2491,6 +2613,14 @@ bool common_prompt_checkpoint::load_tgt(
         llama_state_seq_flags flags) const {
     if (ctx == nullptr) {
         return true;
+    }
+
+    if (file && file_size_tgt > 0) {
+        std::vector<uint8_t> buf(file_size_tgt);
+        if (!copy_tgt(buf.data())) {
+            return false;
+        }
+        return llama_state_seq_set_data_ext(ctx, buf.data(), buf.size(), seq_id, flags) == buf.size();
     }
 
     if (data_tgt.empty()) {
@@ -2509,6 +2639,14 @@ bool common_prompt_checkpoint::load_dft(
         return true;
     }
 
+    if (file && file_size_dft > 0) {
+        std::vector<uint8_t> buf(file_size_dft);
+        if (!copy_dft(buf.data())) {
+            return false;
+        }
+        return llama_state_seq_set_data_ext(ctx, buf.data(), buf.size(), seq_id, flags) == buf.size();
+    }
+
     if (data_dft.empty()) {
         return true;
     }
@@ -2519,9 +2657,17 @@ bool common_prompt_checkpoint::load_dft(
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
+    file_size_tgt = 0;
+    if (file && file_size_dft == 0) {
+        file.reset();
+    }
 }
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
+    file_size_dft = 0;
+    if (file && file_size_tgt == 0) {
+        file.reset();
+    }
 }

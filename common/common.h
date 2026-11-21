@@ -10,6 +10,7 @@
 
 #include <array>
 #include <list>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -730,8 +731,11 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    std::string ctx_checkpoints_dir;     // context checkpoints beyond ctx_checkpoints_ram_mib go to unlinked files here
+    int32_t ctx_checkpoints_ram_mib = 8192; // with ctx_checkpoints_dir: checkpoint memory kept before the oldest are written
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+
 
     // llama-connect params
     bool        server_connect      = false;
@@ -1401,6 +1405,13 @@ struct common_no_init_allocator : std::allocator<T> {
 // sequence state data, filled by llama_state_seq_get_data_ext()
 using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
 
+// the target and draft state of a context checkpoint moved out of memory by common_prompt_checkpoint::spill()
+struct common_prompt_checkpoint_file {
+    int fd = -1; // an unlinked file: closing the last descriptor (or a crash) frees it
+
+    ~common_prompt_checkpoint_file();
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1417,7 +1428,26 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
+    // (optional) data_tgt and data_dft after spill(): they are empty, and the state is in this file
+    // copies of the checkpoint share the file, the last one closes it
+    std::shared_ptr<common_prompt_checkpoint_file> file;
+    size_t file_size_tgt = 0;
+    size_t file_size_dft = 0;
+
+    // the size of the state, in memory or in the file
     size_t size() const;
+    size_t size_tgt() const;
+    size_t size_dft() const;
+
+    // the bytes held in memory: a spilled target and draft state do not count
+    size_t size_mem() const;
+
+    // moves data_tgt and data_dft into an unlinked file in dir; false if that failed (the data stays in memory)
+    bool spill(const std::string & dir);
+
+    // copy the target / draft state, from memory or from the file, to dst (size_tgt() / size_dft() bytes)
+    bool copy_tgt(uint8_t * dst) const;
+    bool copy_dft(uint8_t * dst) const;
 
     bool empty() const;
     void clear();
