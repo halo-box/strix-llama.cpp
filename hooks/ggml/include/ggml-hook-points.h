@@ -30,17 +30,62 @@ static_assert(GGML_TYPE_COUNT_UPSTREAM <= GGML_TYPE_HOOKS_FIRST, "upstream ggml 
 _Static_assert(GGML_TYPE_COUNT_UPSTREAM <= GGML_TYPE_HOOKS_FIRST, "upstream ggml types reach the hook type ids");
 #endif
 
-// X(NAME, ID, type_name, blck_size, type_size, is_quantized, to_float, from_float_ref,
-//   cpu_from_float, cpu_vec_dot, cpu_vec_dot_type, cpu_nrows)
-// The functions are named here and declared by the files that expand the hook points (ggml.c, ggml-cpu.c), or below.
-// Quantize and validate functions: ggml_hook_type_<type_name>_quantize / _validate, see ggml-hooks-types.c.
+// X(NAME, ID, type_name, blck_size, type_size, vec_dot_type, cpu_nrows)
+// The block layouts are in hooks/ggml/types/ggml-common-ext.h. Sizes are literals here, because ggml.h cannot see
+// the block structs; hooks/ggml/types/types.c checks them against sizeof.
+// The codecs of each type are called through wrappers named ggml_hook_type_<type_name>_<function> (types.c, cpu/types-cpu.c).
 #define GGML_HOOK_TYPES_LIST(X) \
-    X(Q8_0_HOOK_EXAMPLE, 100, "q8_0_hook_example", QK8_0, sizeof(block_q8_0), true, dequantize_row_q8_0, quantize_row_q8_0_ref, \
-      quantize_row_q8_0, ggml_vec_dot_q8_0_q8_0, GGML_TYPE_Q8_0, 1)
+    X(Q4_0_ROCMFP4,      100, q4_0_rocmfp4,       32, 18, GGML_TYPE_Q8_0, 1) \
+    X(Q4_0_ROCMFP4_FAST, 101, q4_0_rocmfp4_fast,  32, 17, GGML_TYPE_Q8_0, 1) \
+    X(Q6_0_ROCMFPX,      102, q6_0_rocmfpx,       32, 26, GGML_TYPE_Q8_0, 1) \
+    X(Q8_0_ROCMFPX,      103, q8_0_rocmfpx,       32, 33, GGML_TYPE_Q8_0, 1) \
+    X(Q3_0_ROCMFPX,      104, q3_0_rocmfpx,       32, 14, GGML_TYPE_Q8_0, 1) \
+    X(Q2_0_ROCMFPX,      107, q2_0_rocmfpx,       32, 10, GGML_TYPE_Q8_0, 1) \
+    X(PTQ1_0,            143, ptq1_0,            128, 28, GGML_TYPE_Q8_0, 1) \
+    X(TQ2_T,             144, tq2_t,             128, 34, GGML_TYPE_Q8_0, 1) \
+    X(TQK6,              145, tqk6,              128, 26, GGML_TYPE_Q8_0, 1) \
+    X(TQK7,              146, tqk7,              128, 30, GGML_TYPE_Q8_0, 1) \
+    X(TQP5,              147, tqp5,              128, 42, GGML_TYPE_Q8_0, 1) \
+    X(TQP6,              148, tqp6,              128, 50, GGML_TYPE_Q8_0, 1) \
+    X(TQP7,              149, tqp7,              128, 58, GGML_TYPE_Q8_0, 1) \
+    X(Q8_0_HOOK_EXAMPLE, 159, q8_0_hook_example,  32, 34, GGML_TYPE_Q8_0, 1)
 
-#define GGML_HOOK_TYPE_ID(NAME, ID, ...) static const enum ggml_type GGML_TYPE_##NAME = (enum ggml_type) (ID);
+// the type ids, the same values as in the fork (GGUF files store them). GGML_HOOK_TYPES_LIST checks each one.
+#define GGML_TYPE_Q4_0_ROCMFP4      ((enum ggml_type) 100)
+#define GGML_TYPE_Q4_0_ROCMFP4_FAST ((enum ggml_type) 101)
+#define GGML_TYPE_Q6_0_ROCMFPX      ((enum ggml_type) 102)
+#define GGML_TYPE_Q8_0_ROCMFPX      ((enum ggml_type) 103)
+#define GGML_TYPE_Q3_0_ROCMFPX      ((enum ggml_type) 104)
+#define GGML_TYPE_Q2_0_ROCMFPX      ((enum ggml_type) 107)
+#define GGML_TYPE_PTQ1_0            ((enum ggml_type) 143)
+#define GGML_TYPE_TQ2_T             ((enum ggml_type) 144)
+#define GGML_TYPE_TQK6              ((enum ggml_type) 145)
+#define GGML_TYPE_TQK7              ((enum ggml_type) 146)
+#define GGML_TYPE_TQP5              ((enum ggml_type) 147)
+#define GGML_TYPE_TQP6              ((enum ggml_type) 148)
+#define GGML_TYPE_TQP7              ((enum ggml_type) 149)
+#define GGML_TYPE_Q8_0_HOOK_EXAMPLE ((enum ggml_type) 159)
+#define GGML_HOOK_TYPE_ID(NAME, ID, ...) _Static_assert((int) GGML_TYPE_##NAME == ID, "id of " #NAME);
+#ifndef __cplusplus
 GGML_HOOK_TYPES_LIST(GGML_HOOK_TYPE_ID)
+#endif
 #undef GGML_HOOK_TYPE_ID
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+// wrappers of the codecs: ggml-base (types.c) and each CPU variant (cpu/types-cpu.c)
+#define GGML_HOOK_TYPE_FNS(NAME, ID, TNAME, ...) \
+    GGML_API void ggml_hook_type_##TNAME##_to_float(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k); \
+    GGML_API void ggml_hook_type_##TNAME##_from_float_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k); \
+    void ggml_hook_type_##TNAME##_cpu_from_float(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k); \
+    void ggml_hook_type_##TNAME##_cpu_vec_dot(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT x, size_t bx, \
+                                              const void * GGML_RESTRICT y, size_t by, int nrc);
+GGML_HOOK_TYPES_LIST(GGML_HOOK_TYPE_FNS)
+#undef GGML_HOOK_TYPE_FNS
+#ifdef __cplusplus
+}
+#endif
 
 static inline bool ggml_hook_type_is_hook(enum ggml_type type) {
     return (int) type >= GGML_TYPE_HOOKS_FIRST;
@@ -49,23 +94,22 @@ static inline bool ggml_hook_type_is_hook(enum ggml_type type) {
 #ifdef __cplusplus
 extern "C" {
 #endif
-// implemented in hooks/ggml/src/ggml-hooks-types.c (ggml-base). Return false if the type is not a hook type.
+// implemented in hooks/ggml/types/types.c (ggml-base). Return false if the type is not a hook type.
 GGML_API bool ggml_hook_type_quantize(enum ggml_type type, const float * src, void * dst, int64_t nrows, int64_t n_per_row, const float * imatrix, size_t * result);
 GGML_API bool ggml_hook_type_validate(enum ggml_type type, const void * data, size_t nbytes, bool * ok);
 #ifdef __cplusplus
 }
 #endif
 
-// ids between the upstream types and the hook types get a name, for the loops over every type
-#define GGML_HOOK_TYPE_TRAITS_ENTRY(NAME, ID, TNAME, BLK, SIZE, QUANT, TO_F, FROM_REF, ...) \
-    [ID] = { .type_name = TNAME, .blck_size = BLK, .type_size = SIZE, .is_quantized = QUANT, \
-             .to_float = (ggml_to_float_t) TO_F, .from_float_ref = (ggml_from_float_t) FROM_REF },
-#define GGML_HOOK_TYPE_TRAITS \
-    [GGML_TYPE_COUNT_UPSTREAM ... GGML_TYPE_HOOKS_FIRST - 1] = { .type_name = "unused" }, \
-    GGML_HOOK_TYPES_LIST(GGML_HOOK_TYPE_TRAITS_ENTRY)
+#define GGML_HOOK_TYPE_TRAITS_ENTRY(NAME, ID, TNAME, BLK, SIZE, ...) \
+    [ID] = { .type_name = #TNAME, .blck_size = BLK, .type_size = SIZE, .is_quantized = true, \
+             .to_float = ggml_hook_type_##TNAME##_to_float, .from_float_ref = ggml_hook_type_##TNAME##_from_float_ref },
+// unused ids stay empty, like the removed upstream types (Q4_2, ...)
+#define GGML_HOOK_TYPE_TRAITS GGML_HOOK_TYPES_LIST(GGML_HOOK_TYPE_TRAITS_ENTRY)
 
-#define GGML_HOOK_TYPE_TRAITS_CPU_ENTRY(NAME, ID, TNAME, BLK, SIZE, QUANT, TO_F, FROM_REF, CPU_FROM, CPU_DOT, CPU_DOT_TYPE, CPU_NROWS) \
-    [ID] = { .from_float = (ggml_from_float_t) CPU_FROM, .vec_dot = (ggml_vec_dot_t) CPU_DOT, .vec_dot_type = CPU_DOT_TYPE, .nrows = CPU_NROWS },
+#define GGML_HOOK_TYPE_TRAITS_CPU_ENTRY(NAME, ID, TNAME, BLK, SIZE, DOT_TYPE, NROWS) \
+    [ID] = { .from_float = ggml_hook_type_##TNAME##_cpu_from_float, .vec_dot = ggml_hook_type_##TNAME##_cpu_vec_dot, \
+             .vec_dot_type = DOT_TYPE, .nrows = NROWS },
 #define GGML_HOOK_TYPE_TRAITS_CPU GGML_HOOK_TYPES_LIST(GGML_HOOK_TYPE_TRAITS_CPU_ENTRY)
 
 #define GGML_HOOK_TYPE_QUANTIZE(type, src, dst, nrows, n_per_row, imatrix, result) ggml_hook_type_quantize(type, src, dst, nrows, n_per_row, imatrix, result)
@@ -76,6 +120,7 @@ GGML_API bool ggml_hook_type_validate(enum ggml_type type, const void * data, si
 #ifdef __cplusplus
 extern "C" {
 #endif
+struct ggml_backend;
 GGML_API bool ggml_hook_skip_realloc_sync(struct ggml_backend * backend);
 #ifdef __cplusplus
 }

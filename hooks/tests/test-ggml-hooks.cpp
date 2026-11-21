@@ -191,7 +191,6 @@ static void test_types() {
     const ggml_type t = GGML_TYPE_Q8_0_HOOK_EXAMPLE;
     check(std::string(ggml_type_name(t)) == "q8_0_hook_example", "type name");
     check(ggml_blck_size(t) == ggml_blck_size(GGML_TYPE_Q8_0) && ggml_type_size(t) == ggml_type_size(GGML_TYPE_Q8_0) && ggml_is_quantized(t), "block and type size");
-    check(std::string(ggml_type_name((ggml_type) 60)) == "unused", "ids between upstream and hook types are named");
 
     const int64_t k = 256, m = 64, n = 5;
     std::vector<float> wf(k * m), x(k * n);
