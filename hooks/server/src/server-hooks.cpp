@@ -1,7 +1,6 @@
 #include "server-hooks.h"
 
 #include "server-context.h"
-#include "server-http.h"
 #include "server-task.h"
 
 #include <mutex>
@@ -128,14 +127,13 @@ SERVER_HOOK_WRAP task_params __wrap__ZN13server_schema22eval_llama_cmpl_schemaEP
     return params;
 }
 
-extern "C" bool __real__ZN19server_http_context5startEv(server_http_context * self);
-SERVER_HOOK_WRAP bool __wrap__ZN19server_http_context5startEv(server_http_context * self) {
+// the routes of the hooks, called by the wrapper of server_http_context::start (server-hooks-http.cpp)
+void server_hooks_register_routes(server_http_context & http) {
     for (const auto & h : all()) {
         if (h.register_routes) {
-            h.register_routes(*self);
+            h.register_routes(http);
         }
     }
-    return __real__ZN19server_http_context5startEv(self);
 }
 
 extern "C" bool __real__ZN14server_context10load_modelER13common_params(server_context * self, common_params & params);

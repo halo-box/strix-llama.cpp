@@ -28,16 +28,20 @@ if (TARGET llama-common)
         _Z25common_speculative_acceptP18common_speculativeit)
 endif()
 
-# server: callbacks and routes (hooks/server/handlers)
+# server: callbacks and routes (hooks/server/handlers). The registry and the slot callbacks are in server-context;
+# the handlers and the HTTP side are in llama-server-impl, which has server-http.cpp
 if (TARGET server-context)
-    file(GLOB HOOKS_SERVER_UNITS CONFIGURE_DEPENDS ${HOOKS_DIR}/server/handlers/*.cpp)
     target_include_directories(server-context PUBLIC ${HOOKS_DIR}/server/include)
-    hooks_link(server-context UNITS ${HOOKS_DIR}/server/src/server-hooks.cpp ${HOOKS_SERVER_UNITS})
+    hooks_link(server-context UNITS ${HOOKS_DIR}/server/src/server-hooks.cpp)
     hooks_wrap(server-context SYMBOLS
         _ZN13server_schema22eval_llama_cmpl_schemaEPK11llama_vocabRK13common_paramsRKSt6vectorI16llama_logit_biasSaIS7_EERK11common_json
-        _ZN19server_http_context5startEv
         _ZN14server_context10load_modelER13common_params
         _ZN14server_contextD1Ev)
+endif()
+if (TARGET llama-server-impl)
+    file(GLOB HOOKS_SERVER_UNITS CONFIGURE_DEPENDS ${HOOKS_DIR}/server/handlers/*.cpp)
+    hooks_link(llama-server-impl UNITS ${HOOKS_DIR}/server/src/server-hooks-http.cpp ${HOOKS_SERVER_UNITS})
+    hooks_wrap(llama-server-impl SYMBOLS _ZN19server_http_context5startEv)
 endif()
 
 # tests, not built by default: cmake --build build --target test-llama-hooks

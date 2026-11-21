@@ -1,0 +1,11 @@
+# Ledger of the port: what happened to each fork change that is not kept as it is. Checked by hooks/tools/check-port.py.
+#   <status> <path>[:<upstream line of the hunk>] <reason>
+# status: adapted (kept in a changed form), restored (upstream code kept, no fork behavior lost), variant (the fork
+# version is a hook variant), dropped (not kept), pending (not ported yet)
+
+adapted  ggml/src/ggml-quants.c:4        include paths of rocmfp4.h and rocmfpx.h, now under hooks/ggml/types
+adapted  ggml/src/ggml-quants.h:7        include paths of rocmfp4.h and rocmfpx.h, now under hooks/ggml/types
+restored ggml/src/ggml-cpu/arch/x86/quants.c:864  (const char *) casts on two _mm_prefetch calls of the q4_0 kernel: same generated code; upstream rewrote these lines after 9048bad8d
+restored ggml/src/ggml-cpu/arch/x86/quants.c:882  same, two more casts
+adapted  ggml/include/ggml.h:263         the fork type ids, with their comments, as defines in hooks/ggml/include/ggml-hook-points.h; GGML_TYPE_COUNT is 160 there
+adapted  ggml/include/ggml.h:317         the fork ftype ids, with their comments, as defines in hooks/ggml/include/ggml-hook-points.h

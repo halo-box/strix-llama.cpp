@@ -187,3 +187,35 @@ bool ggml_hook_type_validate(enum ggml_type type, const void * data, size_t nbyt
     *ok = validate(type, data, nbytes);
     return true;
 }
+
+// the fork cases of ggml_ftype_to_ggml_type (ggml/src/ggml.c after upstream line 1442, fork 1fe05fa45). Upstream
+// asserts on an ftype it does not know: the wrapper answers for the fork ftypes and calls upstream for the others.
+enum ggml_type __real_ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
+GGML_API enum ggml_type __wrap_ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
+enum ggml_type __wrap_ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
+    enum ggml_type wtype = GGML_TYPE_COUNT;
+    switch ((int) ftype) {
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4:
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN:
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT:
+            wtype = GGML_TYPE_Q4_0_ROCMFP4; break;
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST:
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT:
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX:
+        case GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN:
+            wtype = GGML_TYPE_Q4_0_ROCMFP4_FAST; break;
+        case GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX:  wtype = GGML_TYPE_Q3_0_ROCMFPX; break;
+        case GGML_FTYPE_MOSTLY_Q2_0_ROCMFPX:  wtype = GGML_TYPE_Q2_0_ROCMFPX; break;
+        case GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX:  wtype = GGML_TYPE_Q6_0_ROCMFPX; break;
+        case GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX:  wtype = GGML_TYPE_Q8_0_ROCMFPX; break;
+        case GGML_FTYPE_MOSTLY_PTQ1_0:        wtype = GGML_TYPE_PTQ1_0; break;
+        case GGML_FTYPE_MOSTLY_TQ2_T:         wtype = GGML_TYPE_TQ2_T; break;
+        case GGML_FTYPE_MOSTLY_TQK6:         wtype = GGML_TYPE_TQK6; break;
+        case GGML_FTYPE_MOSTLY_TQK7:         wtype = GGML_TYPE_TQK7; break;
+        case GGML_FTYPE_MOSTLY_TQP5:         wtype = GGML_TYPE_TQP5; break;
+        case GGML_FTYPE_MOSTLY_TQP6:         wtype = GGML_TYPE_TQP6; break;
+        case GGML_FTYPE_MOSTLY_TQP7:         wtype = GGML_TYPE_TQP7; break;
+        default: return __real_ggml_ftype_to_ggml_type(ftype);
+    }
+    return wtype;
+}
