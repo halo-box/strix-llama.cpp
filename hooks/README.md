@@ -32,6 +32,7 @@ ggml/                       ggml-base registry, backend wrapper, CPU/CUDA/Vulkan
 llama/fork-src, fork-include  the fork libllama (fork_llama)
 apps/                       the fork common, tools, example and tests (fork_tools)
 python/                     the fork converter
+ui/                         the fork check of the UI assets (HOOK(ui-assets))
 fork-files/                 the fork version of the files that are not built here
   src/fork-sched/           the fork scheduler, graph allocator and sanitizer (fork_sched)
 llama/                      libllama hooks (models/, passes/ globbed), common and server wiring
@@ -86,9 +87,11 @@ switch selects it. Upstream stays the default.
   - `fork_cuda_graph` (switch, off): the fork `graph_optimize` and `graph_compute` replace the upstream ones.
 - Vulkan: `ggml/fork-vulkan` is the fork `ggml/src/ggml-vulkan` with its shaders (`hooks/tools/import-fork-vulkan.py`).
   The fork device uses the upstream instance and logical device, so both read the same buffers and share the queues.
-  `fork_vk_node` (on) and `fork_vk_graph` (switch, off) work as on HIP.
+  `fork_vk_node` (on) works as on HIP. With `fork_vk_graph` (switch, off) the upstream devices become the fork
+  devices: buffers, backends and events are all fork objects (`hooks/ggml/fork-vulkan/README.md`).
 - A backend extension can replace `graph_compute` and `graph_optimize` (`replace_graph_compute`,
-  `replace_graph_optimize`): the switches above use them, so no allocation dependency is added for the whole graph.
+  `replace_graph_optimize`, used by `fork_cuda_graph`) or any device function when the wrapper installs a device
+  (`device_install`, used by `fork_vk_graph`).
 - libllama: `llama/fork-src` is the fork `src/`, `llama/fork-include` the fork `include/`
   (`hooks/tools/import-fork-llama.py`). `fork_llama` (switch, off) sends the public API to the fork libllama; the
   generated `llama/src/llama-fork-dispatch.cpp` calls one side.
@@ -96,6 +99,9 @@ switch selects it. Upstream stays the default.
   (`hooks/tools/import-fork-apps.py`). `fork_tools` (switch, off) runs the fork tools from the upstream programs.
 - Tests: `apps/fork-tests` holds the fork tests that are new or changed, built as `test-<name>-fork`
   (`cmake --build build --target hooks-fork-tests`). The upstream tests are unchanged.
+- UI assets: the prebuilt archives after about b12500 are split builds, which the upstream check of
+  `scripts/ui-assets.cmake` refuses. `HOOK(ui-assets)` includes `ui/ui-assets-hooks.cmake` (the fork check) through a
+  file that only hooks builds write next to the UI build.
 - Files that are not built here: `python/` is the fork converter with its `conversion/` and `gguf-py/`
   (`python3 hooks/python/convert_hf_to_gguf.py`); `fork-files/<path>` keeps the fork version of the docs, CI
   workflows, UI sources, scripts and repository files, not active (`hooks/tools/import-fork-files.py`).

@@ -923,8 +923,6 @@ variant  ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:1106  fork_v
 variant  ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:1110  fork_vk_graph: the fork version in hooks/ggml/fork-vulkan, upstream by default
 variant  ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:1118  fork_vk_graph: the fork version in hooks/ggml/fork-vulkan, upstream by default
 variant  ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp:1361  fork_vk_graph: the fork version in hooks/ggml/fork-vulkan, upstream by default
-# known issue of fork_vk_graph (off by default): test-backend-ops Vulkan0 faults or fails in ADD_ID, CONT, IM2COL_3D, MUL_MAT_ADD,
-# ROPE_SET_ROWS, TOP_K (GATED_DELTA_NET over tolerance), which the fork binary passes. See hooks/ggml/fork-vulkan/README.md.
 
 # libllama: the fork src/ and include/ in hooks/llama/fork-src and fork-include (namespace ggml_fork), dispatcher hooks/llama/src/llama-fork-dispatch.cpp
 adapted  src/llama-context.cpp:112         the EXL3 op checks of the graph: ggml_fork_op(), the EXL3 ops are custom nodes
@@ -1481,11 +1479,11 @@ variant  scripts/hip/gcn-cdna-vgpr-check.py:3  the fork version in hooks/fork-fi
 variant  scripts/hip/gcn-cdna-vgpr-check.py:7  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
 variant  scripts/hip/gcn-cdna-vgpr-check.py:67  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
 variant  scripts/hip/gcn-cdna-vgpr-check.py:71  the fork version in hooks/fork-files/scripts/hip/gcn-cdna-vgpr-check.py, not active; the upstream file stays
-variant  scripts/ui-assets.cmake:44  the fork version in hooks/fork-files/scripts/ui-assets.cmake, not active; the upstream file stays
-variant  scripts/ui-assets.cmake:101  the fork version in hooks/fork-files/scripts/ui-assets.cmake, not active; the upstream file stays
-variant  scripts/ui-assets.cmake:103  the fork version in hooks/fork-files/scripts/ui-assets.cmake, not active; the upstream file stays
-variant  scripts/ui-assets.cmake:128  the fork version in hooks/fork-files/scripts/ui-assets.cmake, not active; the upstream file stays
-variant  scripts/ui-assets.cmake:131  the fork version in hooks/fork-files/scripts/ui-assets.cmake, not active; the upstream file stays
+adapted  scripts/ui-assets.cmake:44  the fork validation of split UI builds: HOOK(ui-assets) includes hooks/ui/ui-assets-hooks.cmake
+adapted  scripts/ui-assets.cmake:101  the fork validation of split UI builds: HOOK(ui-assets) includes hooks/ui/ui-assets-hooks.cmake
+adapted  scripts/ui-assets.cmake:103  the fork validation of split UI builds: HOOK(ui-assets) includes hooks/ui/ui-assets-hooks.cmake
+adapted  scripts/ui-assets.cmake:128  the fork validation of split UI builds: HOOK(ui-assets) includes hooks/ui/ui-assets-hooks.cmake
+adapted  scripts/ui-assets.cmake:131  the fork validation of split UI builds: HOOK(ui-assets) includes hooks/ui/ui-assets-hooks.cmake
 variant  tests/test-alloc.cpp:384  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
 variant  tests/test-arg-parser.cpp:275  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged
 variant  tests/test-backend-ops.cpp:84  the fork test in hooks/apps/fork-tests (test-<name>-fork), the upstream test unchanged

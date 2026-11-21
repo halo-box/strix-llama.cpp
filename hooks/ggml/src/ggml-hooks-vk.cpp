@@ -142,7 +142,16 @@ vk_pipeline ggml_hook_vk_pipeline(ggml_backend_vk_context * ctx, const char * na
 // Backends created without the registry (ggml_backend_{name}_init): the upstream function is renamed in its file
 // (hooks_rename, ggml-hooks.cmake). This one installs the wrapper of the registry and wraps the new backend.
 extern "C" { GGML_BACKEND_API ggml_backend_t ggml_backend_vk_init__upstream(size_t dev_num); }
+// the fork backend of fork_vk_graph (kernels/vulkan/fork-vulkan.cpp), when it is built and the switch is on
+__attribute__((weak)) ggml_backend_t ggml_hook_vk_replace_init(size_t dev_num);
+
 ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
+    if (ggml_hook_vk_replace_init) {
+        ggml_hook_install(ggml_backend_vk_reg());
+        if (ggml_backend_t b = ggml_hook_vk_replace_init(dev_num)) {
+            return b; // another implementation of the backend: not wrapped
+        }
+    }
     ggml_backend_t backend = ggml_backend_vk_init__upstream(dev_num);
     ggml_hook_install(ggml_backend_vk_reg());
     ggml_hook_wrap_backend(backend);

@@ -44,6 +44,7 @@ struct ggml_hook_dev {
 
 // defined in ggml-backend-impl.h
 struct ggml_backend_graph_optimize_params;
+struct ggml_backend_device_i;
 
 // backend contexts, defined by the upstream backends
 struct ggml_compute_params;
@@ -118,6 +119,9 @@ struct ggml_hook_backend_ext {
     bool (*skip_realloc_sync)(ggml_backend_t backend) = nullptr;
     // another implementation of the backend: return true to compute the graph instead of upstream and the hook kernels
     bool (*replace_graph_compute)(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_status * status) = nullptr;
+    // when the wrapper installs a device, after its own functions: another implementation of the device can replace
+    // any function of iface (the live interface of dev)
+    void (*device_install)(ggml_backend_dev_t dev, ggml_backend_device_i * iface) = nullptr;
     // return true to optimize the graph instead of upstream (the graph_optimize callbacks still run after)
     bool (*replace_graph_optimize)(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) = nullptr;
 };

@@ -120,3 +120,9 @@ endif()
 if (LLAMA_HOOKS_FORK_LLAMA)
     include(${HOOKS_DIR}/apps/fork-apps.cmake)
 endif()
+
+# the UI assets: HOOK(ui-assets) in scripts/ui-assets.cmake includes this file of the UI build, when it exists
+if (TARGET llama-ui)
+    get_target_property(ui_bin llama-ui BINARY_DIR)
+    file(WRITE ${ui_bin}/hooks-ui-assets.cmake "include(\"${HOOKS_DIR}/ui/ui-assets-hooks.cmake\")\n")
+endif()

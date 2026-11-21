@@ -16,10 +16,16 @@ hand: `hooks/tools/import-fork-vulkan.py <fork ref> <upstream base>` regenerates
 
 Hooks files: `fork-hooks.h` (included at the end of `ggml-vulkan-types.h`), this file.
 
-Known issue: with `fork_vk_graph`, `test-backend-ops -b Vulkan0` faults (GPUVM) or fails in ADD_ID, CONT, IM2COL_3D,
-MUL_MAT_ADD, ROPE_SET_ROWS and TOP_K, and GATED_DELTA_NET exceeds its tolerance; the fork binary passes them. Every
-other op passes, and a gpt-oss-20b perplexity run matches the fork binary. The default path is not affected.
+The bridge is `hooks/ggml/kernels/vulkan/fork-vulkan.cpp`.
 
-The bridge is `hooks/ggml/kernels/vulkan/fork-vulkan.cpp`: a fork backend per upstream backend, the `fork_vk_node` kernel
-and the `fork_vk_graph` switch. A barrier on the queue puts the fork work after the upstream work before it, and the
-synchronize of the upstream backend also waits for the fork backend.
+- `fork_vk_node` (on): a fork backend per upstream backend computes the nodes that upstream refuses. A barrier on the
+  queue puts the fork work after the upstream work before it, and the synchronize of the upstream backend also waits
+  for the fork backend. The fork `vk_device_struct` has another layout than the upstream one, and the fork code reaches
+  the device through the buffers (`buffer->device`): while a fork node is recorded, the upstream buffers it uses point
+  at the fork device of the same index, then get their upstream device back.
+- `fork_vk_graph` (switch, off): the upstream devices take the fork device functions (`device_install`; the device
+  contexts have the same layout), so the buffer types, backends and events are the fork ones and point at the upstream
+  device. The fork code only sees fork objects, as in a fork build. Hook kernels do not apply in this mode.
+  `test-backend-ops -b Vulkan0` passes in full with the fork test program (49334 cases). The upstream test program
+  passes except GATED_DELTA_NET with head size 128 and 64 tokens or more: the fork chunked kernel stays under 5e-7, the
+  tolerance the fork test sets for it, above the 1e-7 of the upstream test.

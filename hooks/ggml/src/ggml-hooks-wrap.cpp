@@ -606,6 +606,11 @@ void ggml_hook_install(ggml_backend_reg_t reg) {
             dev->iface.get_memory    = wrap_get_memory;
             dev->iface.get_props     = wrap_get_props;
             dev->iface.init_backend  = wrap_init_backend;
+            for (const auto * e : exts_of(drv->backend)) {
+                if (e->device_install) {
+                    e->device_install(dev, &dev->iface);
+                }
+            }
         }
         GGML_LOG_DEBUG("ggml-hooks: wrapped %s, %zu device(s)\n", name, n_dev);
     }

@@ -27,3 +27,8 @@ size_t ggml_hook_vk_backend_index(ggml_backend_t backend) {
 ggml_backend_dev_t ggml_hook_vk_upstream_dev(size_t device) {
     return ggml_backend_reg_dev_get(ggml_backend_vk_reg(), device);
 }
+
+// a device buffer of the upstream backend (not a host buffer)
+bool ggml_hook_vk_upstream_buffer_is_vk(ggml_backend_buffer_t buffer) {
+    return ggml_backend_buffer_is_vk(buffer);
+}

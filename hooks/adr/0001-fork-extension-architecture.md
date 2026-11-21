@@ -66,13 +66,14 @@ is not wrapped, and that failure has no link error.
 **3. Hook points (a few marked lines in upstream files).** Where no seam exists. Each line carries a `HOOK(name)`
 marker and is listed in `hooks/HOOKS.txt`, which a tool checks against the upstream diff:
 
-- ggml: the types (enum range, a header include, the two trait tables, quantize and validate) and the scheduler sync
-  before a re-reserve;
+- ggml: the types (enum range, a header include, the two trait tables, quantize and validate), the check of
+  unassigned type ids in the GGUF loader, and the scheduler sync before a re-reserve;
 - libllama: KV cache operations (virtual calls), graph reserve, fused op probes, end of a ubatch, graph node budget,
   tensor names, indexer KV types, mmap prefetch ranges, quantization types;
 - CLI arguments and llama-quantize types;
 - server: slot start, token, slot release, task launch, update, context size, usage, public paths, hidden presets,
   and a task field for request data.
+- build: the check of the prebuilt UI assets (`scripts/ui-assets.cmake` runs in `cmake -P` mode).
 
 **Kernels.** A kernel or fusion may call upstream launchers and templates, and may reuse upstream shaders with other
 specialization constants. We copy an upstream kernel only to change code inside it. A copy records its source file
@@ -107,7 +108,7 @@ Positive:
   take our nodes away.
 - A fusion can cover any set of nodes in a backend split, and the nodes do not need to be consecutive.
 - Kernels can reuse upstream launchers and templates, so upstream improvements to them carry over.
-- The hook points are 61 lines in 19 files (`hooks/HOOKS.txt`), most of them one line each. Their number is the fixed
+- The hook points are 63 lines in 21 files (`hooks/HOOKS.txt`), most of them one line each. Their number is the fixed
   cost of an upstream update.
 - Without `CMAKE_PROJECT_INCLUDE`, the same tree builds as pure upstream, for comparisons.
 
