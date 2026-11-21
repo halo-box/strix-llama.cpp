@@ -85,6 +85,9 @@ switch selects it. Upstream stays the default.
   `fork_vk_node` (on) and `fork_vk_graph` (switch, off) work as on HIP.
 - A backend extension can replace `graph_compute` and `graph_optimize` (`replace_graph_compute`,
   `replace_graph_optimize`): the switches above use them, so no allocation dependency is added for the whole graph.
+- libllama: `llama/fork-src` is the fork `src/`, `llama/fork-include` the fork `include/`
+  (`hooks/tools/import-fork-llama.py`). `fork_llama` (switch, off) sends the public API to the fork libllama; the
+  generated `llama/src/llama-fork-dispatch.cpp` calls one side.
 - Upstream files that the hooks must reach inside are compiled through a hooks file that includes them
   (`ggml/src/ggml-backend-upstream.cpp`, `ggml/src/ggml-cuda-upstream.cu`); the original is marked as a header.
 

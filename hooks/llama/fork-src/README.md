@@ -1,0 +1,21 @@
+# fork-src
+
+The fork `src/` (libllama), built into the upstream libllama. `fork-include` is the fork `include/`. Do not edit the
+copied files by hand: `hooks/tools/import-fork-llama.py <fork ref> <upstream base>` regenerates them and the
+dispatcher.
+
+- Each file is the fork file inside `namespace ggml_fork`, closed around every `#include`. The ggml types it names are
+  the global ones (forward declarations at the top of each file), the llama types are the fork ones. The headers of
+  `fork-include` have C++ linkage, so the fork API is a separate set of symbols.
+- `fork_llama` (`GGML_HOOKS=+fork_llama`, off, read once): `hooks/llama/src/llama-fork-dispatch.cpp` (generated) defines
+  every function of `llama.h`; it calls the fork one, or the upstream one renamed `*__upstream` in its file (or
+  `*__hooks` for the functions that the libllama hooks define). The argument types have the same layout in both trees
+  except `llama_model_params` and `llama_context_params`, converted by field; the fork-only fields keep their defaults.
+  `llama-fork-api.h` declares the fork-only functions (`llama_set_eval_callback`), which do nothing without the switch.
+- The `llama-ext.h` functions that common and the tools use go through `llama-fork-ext-dispatch.cpp` and
+  `fork-ext-bridge.cpp`.
+- Adapted lines carry `hooks:`: the EXL3 op checks (`ggml_fork_op()`, `fork-hooks.h`) and the explicit global calls of
+  functions that are in the namespace here.
+
+With `GGML_HOOKS=+fork_llama,+fork_cuda_graph,+fork_sched`, gpt-oss-20b gives the perplexity and speed of the fork
+binary on gfx1151.
