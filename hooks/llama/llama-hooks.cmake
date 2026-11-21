@@ -115,3 +115,8 @@ if (TARGET test-quantize-fns)
     target_compile_definitions(test-quantize-fns-hooks PRIVATE GGML_USE_TRELLIS)
     target_compile_features(test-quantize-fns-hooks PRIVATE cxx_std_17)
 endif()
+
+# the fork tools (hooks/apps)
+if (LLAMA_HOOKS_FORK_LLAMA)
+    include(${HOOKS_DIR}/apps/fork-apps.cmake)
+endif()

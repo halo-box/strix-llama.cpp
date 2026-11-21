@@ -88,6 +88,8 @@ switch selects it. Upstream stays the default.
 - libllama: `llama/fork-src` is the fork `src/`, `llama/fork-include` the fork `include/`
   (`hooks/tools/import-fork-llama.py`). `fork_llama` (switch, off) sends the public API to the fork libllama; the
   generated `llama/src/llama-fork-dispatch.cpp` calls one side.
+- Tools: `apps/` holds the fork common, mtmd, server, llama-bench, quantize and the example speculative-prefill
+  (`hooks/tools/import-fork-apps.py`). `fork_tools` (switch, off) runs the fork tools from the upstream programs.
 - Upstream files that the hooks must reach inside are compiled through a hooks file that includes them
   (`ggml/src/ggml-backend-upstream.cpp`, `ggml/src/ggml-cuda-upstream.cu`); the original is marked as a header.
 
