@@ -148,6 +148,10 @@ bool wrap_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     if (ggml_hook_has_kernels(rs->drv.backend) && ggml_hook_find_op(&ds->info, op)) {
         return true;
     }
+    // the custom ops of the hooks (EXL3): only hook kernels compute them
+    if (ggml_hook_is_hook_custom(op)) {
+        return false;
+    }
     // upstream does not know the hook types: only the CPU matrix multiplication uses their CPU traits
     if (uses_hook_type(op)) {
         const bool cpu_mul_mat = rs->drv.backend == GGML_HOOK_BACKEND_CPU && (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&

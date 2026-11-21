@@ -163,6 +163,60 @@ GGML_API bool ggml_hook_skip_realloc_sync(struct ggml_backend * backend);
 #endif
 #define GGML_HOOK_SKIP_REALLOC_SYNC(backend) ggml_hook_skip_realloc_sync(backend)
 
+// EXL3 ops of the fork: the declarations of ggml/include/ggml.h (after upstream line 2500, fork 1fe05fa45), verbatim.
+// The nodes are GGML_OP_CUSTOM nodes (hooks/ggml/exl3/ggml-exl3-ops.c): the fork op ids GGML_OP_EXL3_* are not
+// ggml ops here. ggml_hook_exl3_op() tells which EXL3 op a node is; only hook kernels compute them.
+#ifdef __cplusplus
+extern "C" {
+#endif
+    // EXL3 (exllamav3) linear, see ggml/exl3/README.md: y = x W with W = diag(suh) H W_hat H diag(svh) (k x n)
+    //   trellis I16 [16*K, n/16, k/16], x F32 [k, ...], suh F16 [k], svh F16 [n] -> F32 [n, ...]
+    //   codebook: 0 = 3inst, 1 = mcg, 2 = mul1; computed only by builds with GGML_EXL3
+    GGML_API struct ggml_tensor * ggml_exl3_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
+            int                   codebook);
+
+    // EXL3 experts (MoE), the EXL3 counterpart of ggml_mul_mat_id: expert e of trellis [16*K, n/16, k/16, E] with
+    //   suh [k, E] and svh [n, E]; x F32 [k, ne11, n_tokens], ids I32 [n_used, n_tokens], ne11 divides n_used ->
+    //   F32 [n, n_used, n_tokens]; computed only by builds with GGML_EXL3
+    GGML_API struct ggml_tensor * ggml_exl3_mul_mat_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * trellis,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * suh,
+            struct ggml_tensor  * svh,
+            int                   codebook);
+
+    // EXL3 row-ring table (quantized token embedding, see ggml/exl3/README.md): the decoded rows `ids` of `table`
+    //   table I16 [groups*(1 + 16*K), n_rows], ids I32 [n], signs F16 [256, groups] -> F32 [n_out, n], n_out <= groups*256
+    //   computed only by builds with GGML_EXL3
+    GGML_API struct ggml_tensor * ggml_exl3_get_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * signs,
+            int64_t               n_out);
+
+enum ggml_hook_exl3_op_kind {
+    GGML_HOOK_EXL3_NONE,
+    GGML_HOOK_EXL3_MUL_MAT,     // GGML_OP_EXL3_MUL_MAT of the fork
+    GGML_HOOK_EXL3_GET_ROWS,    // GGML_OP_EXL3_GET_ROWS of the fork
+    GGML_HOOK_EXL3_MUL_MAT_ID,  // GGML_OP_EXL3_MUL_MAT_ID of the fork
+};
+GGML_API enum ggml_hook_exl3_op_kind ggml_hook_exl3_op(const struct ggml_tensor * t);
+// the i32 parameter of the fork op (op_params[0] there: the codebook, or n_out for GET_ROWS)
+GGML_API int32_t ggml_hook_exl3_param(const struct ggml_tensor * t);
+// any custom op of the hooks: no backend computes it unless a hook kernel takes it
+GGML_API bool ggml_hook_is_hook_custom(const struct ggml_tensor * t);
+#ifdef __cplusplus
+}
+#endif
+
 #else
 
 #define GGML_HOOK_TYPE_TRAITS

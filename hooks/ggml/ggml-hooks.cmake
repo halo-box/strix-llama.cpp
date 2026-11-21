@@ -7,7 +7,12 @@ get_target_property(GGML_HOOKS_GGML_SRC ggml-base SOURCE_DIR) # ggml/src
 # registry and generic backend wrapper: in ggml-base, shared by all backends, tests and plugins
 target_sources(ggml-base PRIVATE ${GGML_HOOKS_DIR}/src/ggml-hooks-registry.cpp ${GGML_HOOKS_DIR}/src/ggml-hooks-wrap.cpp
                                  ${GGML_HOOKS_DIR}/types/types.c ${GGML_HOOKS_DIR}/types/ggml-quants-ext.c
-                                 ${GGML_HOOKS_DIR}/types/rocmfp4/rocmfp4.c ${GGML_HOOKS_DIR}/types/rocmfpx/rocmfpx.c)
+                                 ${GGML_HOOKS_DIR}/types/rocmfp4/rocmfp4.c ${GGML_HOOKS_DIR}/types/rocmfpx/rocmfpx.c
+                                 ${GGML_HOOKS_DIR}/exl3/ggml-exl3-ops.c)
+# EXL3: the decoder library of the fork, as ggml/src/CMakeLists.txt of the fork
+if (GGML_EXL3)
+    target_sources(ggml-base PRIVATE ${GGML_HOOKS_DIR}/exl3/exl3.c)
+endif()
 target_include_directories(ggml-base PUBLIC $<BUILD_INTERFACE:${GGML_HOOKS_DIR}/include>)
 target_include_directories(ggml-base PRIVATE ${GGML_HOOKS_DIR}/types)
 # hooks enabled, for every user of ggml: ggml-hook-points.h (included by ggml.h) and the headers included by the
@@ -40,7 +45,15 @@ if (GGML_CPU)
             target_include_directories(${target} PRIVATE ${GGML_HOOKS_GGML_SRC}/ggml-cpu ${GGML_HOOKS_DIR}/types)
             # CPU traits of the hook types (C files: the trait table of ggml-cpu.c references them, static links keep them)
             target_sources(${target} PRIVATE ${GGML_HOOK_CPU_TYPES})
-            hooks_link(${target} UNITS ${GGML_HOOKS_DIR}/src/ggml-hooks-cpu.cpp ${GGML_HOOK_CPU_KERNELS})
+            set(units ${GGML_HOOKS_DIR}/src/ggml-hooks-cpu.cpp ${GGML_HOOK_CPU_KERNELS})
+            if (GGML_EXL3)
+                # as ggml/src/ggml-cpu/CMakeLists.txt of the fork
+                target_compile_definitions(${target} PRIVATE GGML_USE_EXL3)
+                target_sources(${target} PRIVATE ${GGML_HOOKS_DIR}/kernels/cpu-exl3/exl3-ops.cpp)
+                list(APPEND units ${GGML_HOOKS_DIR}/kernels/cpu-exl3/fork-exl3-cpu.cpp)
+            endif()
+            hooks_link(${target} UNITS ${units})
+            hooks_rename(${target} SOURCE ${GGML_HOOKS_GGML_SRC}/ggml-cpu/ggml-cpu.cpp SYMBOLS ggml_backend_cpu_init)
         endif()
     endforeach()
 endif()
@@ -54,6 +67,7 @@ foreach (target ggml-cuda ggml-hip ggml-musa)
     endif()
     target_include_directories(${target} PRIVATE ${GGML_HOOKS_GGML_SRC}/ggml-cuda)
     hooks_link(${target} UNITS ${GGML_HOOK_CUDA_SOURCES})
+    hooks_rename(${target} SOURCE ${GGML_HOOKS_GGML_SRC}/ggml-cuda/ggml-cuda.cu SYMBOLS ggml_backend_cuda_init)
     if (target STREQUAL "ggml-hip")
         set_source_files_properties(${GGML_HOOK_CUDA_SOURCES} TARGET_DIRECTORY ggml-hip PROPERTIES LANGUAGE HIP)
     elseif (target STREQUAL "ggml-musa")
@@ -90,6 +104,7 @@ if (TARGET ggml-vulkan)
     add_dependencies(ggml-vulkan hooks-vk-shaders)
     target_include_directories(ggml-vulkan PRIVATE ${GGML_HOOKS_GGML_SRC}/ggml-vulkan ${gen_dir})
     hooks_link(ggml-vulkan UNITS ${GGML_HOOKS_DIR}/src/ggml-hooks-vk.cpp ${GGML_HOOK_VK_KERNELS})
+    hooks_rename(ggml-vulkan SOURCE ${GGML_HOOKS_GGML_SRC}/ggml-vulkan/ggml-vulkan.cpp SYMBOLS ggml_backend_vk_init)
 endif()
 
 # tests: cmake --build build --target test-ggml-hooks
@@ -98,3 +113,11 @@ target_link_libraries(test-ggml-hooks PRIVATE ggml)
 target_compile_features(test-ggml-hooks PRIVATE cxx_std_17)
 # the test declares a backend extension: it needs the registrar of the executable
 hooks_link(test-ggml-hooks UNITS)
+
+# the EXL3 decode self-test of the fork (tests/CMakeLists.txt of the fork), next to the decoder
+if (GGML_EXL3 AND TARGET vendor::hash)
+    add_executable(test-exl3 ${GGML_HOOKS_DIR}/exl3/test_exl3.c)
+    target_link_libraries(test-exl3 PRIVATE ggml vendor::hash)
+    target_include_directories(test-exl3 PRIVATE ${GGML_HOOKS_DIR}/exl3 ${CMAKE_SOURCE_DIR}/vendor)
+    add_test(NAME test-exl3 COMMAND test-exl3)
+endif()

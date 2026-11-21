@@ -138,3 +138,13 @@ vk_pipeline ggml_hook_vk_pipeline(ggml_backend_vk_context * ctx, const char * na
     c = { ctx->device, p };
     return p;
 }
+
+// Backends created without the registry (ggml_backend_{name}_init): the upstream function is renamed in its file
+// (hooks_rename, ggml-hooks.cmake). This one installs the wrapper of the registry and wraps the new backend.
+extern "C" { GGML_BACKEND_API ggml_backend_t ggml_backend_vk_init__upstream(size_t dev_num); }
+ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
+    ggml_backend_t backend = ggml_backend_vk_init__upstream(dev_num);
+    ggml_hook_install(ggml_backend_vk_reg());
+    ggml_hook_wrap_backend(backend);
+    return backend;
+}

@@ -98,3 +98,13 @@ constexpr ggml_hook_driver driver = {
 GGML_HOOK_REGISTER_DRIVER(driver);
 
 } // namespace
+
+// Backends created without the registry (ggml_backend_{name}_init): the upstream function is renamed in its file
+// (hooks_rename, ggml-hooks.cmake). This one installs the wrapper of the registry and wraps the new backend.
+extern "C" { GGML_BACKEND_API ggml_backend_t ggml_backend_cpu_init__upstream(void); }
+ggml_backend_t ggml_backend_cpu_init(void) {
+    ggml_backend_t backend = ggml_backend_cpu_init__upstream();
+    ggml_hook_install(ggml_backend_cpu_reg());
+    ggml_hook_wrap_backend(backend);
+    return backend;
+}

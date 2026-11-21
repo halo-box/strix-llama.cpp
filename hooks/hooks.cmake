@@ -11,6 +11,9 @@ if (MSVC OR APPLE)
 endif()
 
 set(HOOKS_DIR ${CMAKE_CURRENT_LIST_DIR})
+
+# options of the fork (ggml/CMakeLists.txt of the fork)
+option(GGML_EXL3                            "ggml: build the EXL3 (exllamav3) trellis decoder" OFF)
 include(${HOOKS_DIR}/cmake/hooks-link.cmake)
 
 function(hooks_setup)

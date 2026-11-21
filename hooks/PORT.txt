@@ -55,3 +55,26 @@ adapted  ggml/src/ggml.c:8043                the quantize cases of the trellis t
 adapted  ggml/src/ggml.c:1442                the ftype cases: ggml_ftype_to_ggml_type of types.c, upstream renamed (hooks_rename)
 adapted  ggml/src/ggml-quants.c:5531         the validate cases of the ROCm types: ggml_hook_type_validate (HOOK(type-validate)), types.c
 adapted  ggml/src/ggml-quants.c:5604         the validate cases of the trellis types: same
+
+# EXL3 (hooks/ggml/exl3, hooks/ggml/kernels/cpu-exl3)
+adapted  ggml/include/ggml.h:431             the op ids GGML_OP_EXL3_*: EXL3 nodes are GGML_OP_CUSTOM nodes, ggml_hook_exl3_op() gives the kind (ggml-exl3-ops.c)
+adapted  ggml/src/ggml.c:1114                the op names of the EXL3 ops: custom nodes are named CUSTOM
+restored ggml/src/ggml.c:1117                static_assert(GGML_OP_COUNT == 102) of the fork: the upstream op count stays, no new op id
+adapted  ggml/src/ggml.c:1227                the op symbols of the EXL3 ops: same
+restored ggml/src/ggml.c:1230                same static_assert
+adapted  ggml/src/ggml.c:6547                the EXL3 builders, the fork bodies in ggml-exl3-ops.c; result->op = GGML_OP_EXL3_* becomes a custom node, op_params[0] moves to slot 6
+adapted  ggml/src/ggml-cpu/exl3-ops.cpp:0    copied to hooks/ggml/kernels/cpu-exl3: the include path and the op parameter (ggml_hook_exl3_param) differ, nothing else
+adapted  ggml/src/ggml-cpu/ggml-cpu.c:2159   the compute dispatch of the EXL3 ops: hook kernels fork_cpu_exl3_* (fork-exl3-cpu.cpp)
+adapted  ggml/src/ggml-cpu/ggml-cpu.c:2502   n_tasks = n_threads of the EXL3 ops: the custom nodes have n_tasks = GGML_N_TASKS_MAX
+adapted  ggml/src/ggml-cpu/ggml-cpu.c:3050   the work size of the EXL3 ops: cpu_work_size of the hook kernels, the same fork functions
+adapted  ggml/src/ggml-cpu/ggml-cpu.cpp:8    the exl3-ops.h include: fork-exl3-cpu.cpp
+adapted  ggml/src/ggml-cpu/ggml-cpu.cpp:484  supports_op of the EXL3 ops: the supports of the hook kernels, the same fork functions; the backend wrapper refuses them without GGML_EXL3
+adapted  ggml/src/ggml-cpu/CMakeLists.txt:91 GGML_EXL3 sources and GGML_USE_EXL3 of each CPU variant: hooks/ggml/ggml-hooks.cmake
+adapted  ggml/src/CMakeLists.txt:204         exl3.c in ggml-base with GGML_EXL3: hooks/ggml/ggml-hooks.cmake
+adapted  ggml/src/CMakeLists.txt:202         rocmfp4.c and rocmfpx.c in ggml-base: hooks/ggml/ggml-hooks.cmake
+adapted  ggml/CMakeLists.txt:190             GGML_TRELLIS and GGML_EXL3: GGML_EXL3 is declared by hooks/hooks.cmake; there is no GGML_TRELLIS, the trellis types always have their CPU kernels and the backend wrapper refuses them where no kernel exists
+adapted  ggml/src/CMakeLists.txt:226         GGML_USE_TRELLIS: same, no option
+pending  ggml/src/CMakeLists.txt:234         the OpenMP installer of LLVM 22 on Windows: upstream sets these variables unconditionally and the hooks are off with MSVC; with the build and CI stage
+pending  ggml/src/CMakeLists.txt:236         same
+pending  ggml/src/CMakeLists.txt:245         same
+pending  ggml/src/CMakeLists.txt:249         same
