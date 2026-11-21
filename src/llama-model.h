@@ -1084,6 +1084,9 @@ struct llama_model {
     virtual void prefetch_begin(std::unique_ptr<llama_model_prefetch> & /*state*/, const llama_batch & /*batch*/, uint32_t /*n_ubatch*/) const {}
     virtual void prefetch_end(llama_model_prefetch * /*state*/) const {}
 
+    // optional, runs after the scale pass
+    virtual void post_arch_tensors(llama_model_loader &) {}
+
 protected:
     llama_model_params params;
 
