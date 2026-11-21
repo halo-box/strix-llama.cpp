@@ -17064,7 +17064,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // exact batches wide enough for the per-type MMQ crossover of ggml_cuda_should_use_mmvq on RDNA3.5
-    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
         for (int64_t n : {5, 7, 8}) {
             test_cases.emplace_back(new test_mul_mat_exact_batch(type_a, 8192, n, 5120));
         }
