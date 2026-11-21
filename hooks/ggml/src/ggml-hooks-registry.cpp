@@ -264,8 +264,14 @@ void publish(ggml_hook_registry & r) {
         if (e.removed || !maybe_enabled(r, e)) {
             continue;
         }
-        auto & list = e.k.kind == GGML_HOOK_KIND_OP ? snap->ops[e.k.backend][e.k.op] : snap->fusions[e.k.backend][e.k.op];
-        list.push_back(&e);
+        if (e.k.op == GGML_OP_COUNT) {
+            for (int op = 0; op < GGML_OP_COUNT; ++op) { // a kernel for every op
+                (e.k.kind == GGML_HOOK_KIND_OP ? snap->ops : snap->fusions)[e.k.backend][op].push_back(&e);
+            }
+        } else {
+            auto & list = e.k.kind == GGML_HOOK_KIND_OP ? snap->ops[e.k.backend][e.k.op] : snap->fusions[e.k.backend][e.k.op];
+            list.push_back(&e);
+        }
         snap->any[e.k.backend] = true;
     }
     for (int b = 0; b < GGML_HOOK_BACKEND_COUNT; ++b) {
@@ -342,7 +348,7 @@ const ggml_hook_snapshot * snapshot() {
 } // namespace
 
 static bool kernel_valid(const ggml_hook_kernel * k) {
-    if (!k->name || k->backend < 0 || k->backend >= GGML_HOOK_BACKEND_COUNT || k->op < 0 || k->op >= GGML_OP_COUNT) {
+    if (!k->name || k->backend < 0 || k->backend >= GGML_HOOK_BACKEND_COUNT || k->op < 0 || k->op > GGML_OP_COUNT) {
         return false;
     }
     if ((k->kind == GGML_HOOK_KIND_OP && !k->supports) || (k->kind == GGML_HOOK_KIND_FUSION && !k->match)) {
@@ -432,6 +438,10 @@ void ggml_hook_unregister_module(const void * module) {
 
 bool ggml_hook_has_kernels(ggml_hook_backend backend) {
     return snapshot()->any[backend];
+}
+
+const void * ggml_hook_kernels_state(void) {
+    return snapshot();
 }
 
 const ggml_hook_kernel * ggml_hook_find_op(const ggml_hook_dev * dev, const ggml_tensor * node) {

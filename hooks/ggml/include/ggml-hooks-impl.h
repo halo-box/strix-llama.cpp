@@ -49,6 +49,9 @@ GGML_API void ggml_hook_register_section(int kind, const void * const * begin, c
 // wrap reg if a driver matches it. Safe to call many times, from any thread.
 GGML_API void ggml_hook_install(ggml_backend_reg_t reg);
 
+// changes whenever the set of active kernels changes (registration, GGML_HOOKS rules, ggml_hook_kernel_set_enabled)
+GGML_API const void * ggml_hook_kernels_state(void);
+
 // wrap a backend created without the device interface (ggml_backend_cpu_init, ...). Its registry must be installed.
 GGML_API void ggml_hook_wrap_backend(ggml_backend_t backend);
 

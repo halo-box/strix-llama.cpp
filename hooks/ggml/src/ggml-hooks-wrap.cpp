@@ -283,15 +283,42 @@ ggml_cgraph graph_view(ggml_cgraph * g, int i0, int i1) {
     return v;
 }
 
+// a graph that no kernel took, by uid: when it comes back (graph reuse), upstream computes it without the scan
+struct untaken_graph {
+    ggml_backend_t backend = nullptr;
+    uint64_t       uid     = 0;
+    const void *   state   = nullptr;
+    std::string    arch;
+};
+
+untaken_graph & untaken_slot(ggml_backend_t backend) {
+    static thread_local untaken_graph slots[8];
+    return slots[((uintptr_t) backend >> 4) % 8];
+}
+
 ggml_status cut_compute(reg_state * rs, const dev_state * ds, ggml_backend_t backend, ggml_cgraph * cgraph) {
     const ggml_hook_driver & drv = rs->drv;
+    untaken_graph & seen = untaken_slot(backend);
+    const void * state = ggml_hook_kernels_state();
+    if (cgraph->uid != 0 && seen.backend == backend && seen.uid == cgraph->uid && seen.state == state &&
+            seen.arch == ggml_hook_model_arch()) {
+        return rs->orig_backend.graph_compute(backend, cgraph);
+    }
     int  seg_start = 0;
     bool in_run    = false;
+    bool in_run_any = false; // a hook kernel ran or a node was marked computed
 
     auto flush = [&](int end) -> ggml_status {
         if (in_run) {
             drv.end(backend, false);
             in_run = false;
+        }
+        if (seg_start == 0 && end == cgraph->n_nodes && !in_run_any) {
+            // no hook kernel ran: the graph itself, with its uid (the CUDA graph cache of upstream checks it)
+            if (cgraph->uid != 0) {
+                seen = { backend, cgraph->uid, state, ggml_hook_model_arch() };
+            }
+            return rs->orig_backend.graph_compute(backend, cgraph);
         }
         if (end > seg_start) {
             ggml_cgraph v = graph_view(cgraph, seg_start, end);
@@ -328,6 +355,7 @@ ggml_status cut_compute(reg_state * rs, const dev_state * ds, ggml_backend_t bac
             }
         }
 
+        in_run_any = true;
         if (computed) {
             seg_start = i + 1;
             continue;

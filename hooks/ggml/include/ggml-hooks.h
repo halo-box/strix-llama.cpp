@@ -77,7 +77,7 @@ struct ggml_hook_kernel {
     const char *          name     = nullptr;
     ggml_hook_backend     backend  = GGML_HOOK_BACKEND_CPU;
     ggml_hook_kind        kind     = GGML_HOOK_KIND_OP;
-    ggml_op               op       = GGML_OP_NONE; // op of the node, or of the first node of a fusion
+    ggml_op               op       = GGML_OP_NONE; // op of the node, or of the first node of a fusion; GGML_OP_COUNT: every op
     int                   priority = 0;            // higher wins
     bool                  enabled_by_default = true;
     ggml_hook_supports_fn supports = nullptr; // GGML_HOOK_KIND_OP

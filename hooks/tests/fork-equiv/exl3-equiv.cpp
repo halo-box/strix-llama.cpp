@@ -1,4 +1,4 @@
-// Digests of the EXL3 ops on the CPU (builds with GGML_EXL3=ON). Built against the fork master and this branch.
+// Digests of the EXL3 ops on a backend, the CPU by default (builds with GGML_EXL3=ON). Built against the fork master and this branch.
 // The inputs are a fixed pseudo-random pattern: every trellis word decodes, so the digests compare the kernels.
 
 #include "ggml.h"
@@ -84,12 +84,17 @@ static void run(const std::string & name, const std::function<ggml_tensor *(ggml
     ggml_free(ctx);
 }
 
-int main() {
+// usage: exl3-equiv [backend name], the CPU by default
+int main(int argc, char ** argv) {
     ggml_backend_load_all();
-    cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
-        ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu)), "ggml_backend_set_n_threads");
-    set_n_threads(cpu, 4);
+    if (argc > 1) {
+        cpu = ggml_backend_init_by_name(argv[1], nullptr);
+    } else {
+        cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        auto set_n_threads = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu)), "ggml_backend_set_n_threads");
+        set_n_threads(cpu, 4);
+    }
 
     const int64_t k = 256, n = 384;
     for (int cb = 0; cb <= 2; ++cb) {

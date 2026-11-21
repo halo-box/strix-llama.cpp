@@ -14,6 +14,13 @@ set(HOOKS_DIR ${CMAKE_CURRENT_LIST_DIR})
 
 # options of the fork (ggml/CMakeLists.txt of the fork)
 option(GGML_EXL3                            "ggml: build the EXL3 (exllamav3) trellis decoder" OFF)
+
+# the fork builds gfx1151 when no HIP arch is given (ggml/src/ggml-hip/CMakeLists.txt of the fork). Empty: the upstream
+# default (every arch of the ROCm install).
+set(GGML_HOOKS_HIP_DEFAULT_ARCH "gfx1151" CACHE STRING "hooks: HIP arch when GPU_TARGETS and CMAKE_HIP_ARCHITECTURES are not set")
+if (GGML_HIP AND GGML_HOOKS_HIP_DEFAULT_ARCH AND NOT DEFINED CMAKE_HIP_ARCHITECTURES AND NOT GPU_TARGETS AND NOT AMDGPU_TARGETS)
+    set(CMAKE_HIP_ARCHITECTURES ${GGML_HOOKS_HIP_DEFAULT_ARCH})
+endif()
 include(${HOOKS_DIR}/cmake/hooks-link.cmake)
 
 function(hooks_setup)

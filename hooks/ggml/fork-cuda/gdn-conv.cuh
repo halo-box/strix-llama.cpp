@@ -1,0 +1,23 @@
+// hooks: ggml/src/ggml-cuda/gdn-conv.cuh of the fork (1fe05fa45, upstream 9048bad8d, new in the fork), verbatim inside
+// namespace ggml_fork. Adapted lines carry "hooks:".
+#pragma once
+#include "common.cuh"
+namespace ggml_fork { // hooks: the fork code is namespaced, see hooks/ggml/fork-cuda/README.md
+
+// Gated DeltaNet prefill convolution: concat(history, x^T) -> ssm_conv -> SiLU. On a match the concat writes only
+// the columns its tail copies read and one kernel computes the SiLU output straight from the history and x.
+struct ggml_cuda_gdn_conv_match {
+    int concat_idx = -1, conv_idx = -1;
+    const ggml_tensor * x = nullptr;      // [C, T] F32 contiguous
+    const ggml_tensor * state = nullptr;  // [3, C] F32 contiguous
+    const ggml_tensor * concat = nullptr; // [T+3, C] F32
+    const ggml_tensor * w = nullptr;      // [4, C] F32
+    ggml_tensor * out = nullptr;          // SiLU output [C, T]
+    int64_t C = 0, T = 0, tail_from = 0;
+    int64_t S = 1;                        // sequences: x, state, concat and out hold S blocks of the shapes above
+};
+bool ggml_cuda_gdn_conv_match_at_concat(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv_match & m);
+bool ggml_cuda_gdn_conv_match_at_conv(const ggml_cgraph * cgraph, int j, ggml_cuda_gdn_conv_match & m);
+void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
+void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
+} // namespace ggml_fork
